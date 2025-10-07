@@ -12,7 +12,10 @@ from openhands.runtime.plugins.jupyter.execute_server import JupyterKernel
 from openhands.runtime.plugins.requirement import Plugin, PluginRequirement
 from openhands.runtime.utils import find_available_tcp_port
 from openhands.utils.shutdown_listener import should_continue
+from openhands.runtime.plugins.jupyter.direct_jupyter import DirectJupyterRequirement, DirectJupyterPlugin
 
+# make sure it has no overlap with other port ranges defined in singularity_runtime.py
+KERNEL_GATEWAY_PORT_RANGE = (45000, 49999)
 
 @dataclass
 class JupyterRequirement(PluginRequirement):
@@ -29,7 +32,7 @@ class JupyterPlugin(Plugin):
     async def initialize(
         self, username: str, kernel_id: str = 'openhands-default'
     ) -> None:
-        self.kernel_gateway_port = find_available_tcp_port(40000, 49999)
+        self.kernel_gateway_port = find_available_tcp_port(KERNEL_GATEWAY_PORT_RANGE[0], KERNEL_GATEWAY_PORT_RANGE[1])
         self.kernel_id = kernel_id
         is_local_runtime = os.environ.get('LOCAL_RUNTIME_MODE') == '1'
         is_windows = sys.platform == 'win32'
@@ -56,13 +59,16 @@ class JupyterPlugin(Plugin):
                 )
             # The correct environment is ensured by the PATH in LocalRuntime.
             poetry_prefix = f'cd {code_repo_path}\n'
+        loopback_ip = os.environ.get('LOOPBACK_IP')
+        if not loopback_ip:
+            raise RuntimeError('LOOPBACK_IP environment variable is not set')
 
         if is_windows:
             # Windows-specific command format
             jupyter_launch_command = (
                 f'cd /d "{code_repo_path}" && '
                 'poetry run jupyter kernelgateway '
-                '--KernelGatewayApp.ip=0.0.0.0 '
+                f'--KernelGatewayApp.ip={loopback_ip} '
                 f'--KernelGatewayApp.port={self.kernel_gateway_port}'
             )
             logger.debug(f'Jupyter launch command (Windows): {jupyter_launch_command}')
@@ -106,7 +112,7 @@ class JupyterPlugin(Plugin):
                 f"{prefix}/bin/bash << 'EOF'\n"
                 f'{poetry_prefix}'
                 'poetry run jupyter kernelgateway '
-                '--KernelGatewayApp.ip=0.0.0.0 '
+                f'--KernelGatewayApp.ip={loopback_ip} '
                 f'--KernelGatewayApp.port={self.kernel_gateway_port}\n'
                 'EOF'
             )
@@ -141,6 +147,9 @@ class JupyterPlugin(Plugin):
 
     async def _run(self, action: Action) -> IPythonRunCellObservation:
         """Internal method to run a code cell in the jupyter kernel."""
+        loopback_ip = os.environ.get('LOOPBACK_IP')
+        if not loopback_ip:
+            raise RuntimeError('LOOPBACK_IP environment variable is not set')
         if not isinstance(action, IPythonRunCellAction):
             raise ValueError(
                 f'Jupyter plugin only supports IPythonRunCellAction, but got {action}'
@@ -148,7 +157,7 @@ class JupyterPlugin(Plugin):
 
         if not hasattr(self, 'kernel'):
             self.kernel = JupyterKernel(
-                f'localhost:{self.kernel_gateway_port}', self.kernel_id
+                f'{loopback_ip}:{self.kernel_gateway_port}', self.kernel_id
             )
 
         if not self.kernel.initialized:

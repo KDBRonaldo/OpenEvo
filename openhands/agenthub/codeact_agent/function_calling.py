@@ -51,7 +51,9 @@ def combine_thought(action: Action, thought: str) -> Action:
 
 
 def response_to_actions(
-    response: ModelResponse, mcp_tool_names: list[str] | None = None
+    response: ModelResponse,
+    mcp_tool_names: list[str] | None = None,
+    timeout: float | None = None,
 ) -> list[Action]:
     actions: list[Action] = []
     assert len(response.choices) == 1, 'Only one choice is supported for now'
@@ -94,11 +96,16 @@ def response_to_actions(
                 # Set hard timeout if provided
                 if 'timeout' in arguments:
                     try:
-                        action.set_hard_timeout(float(arguments['timeout']))
+                        if timeout:
+                            action.set_hard_timeout(min(float(arguments['timeout']), timeout))
+                        else:
+                            action.set_hard_timeout(float(arguments['timeout']))
                     except ValueError as e:
                         raise FunctionCallValidationError(
                             f"Invalid float passed to 'timeout' argument: {arguments['timeout']}"
                         ) from e
+                elif timeout:
+                    action.set_hard_timeout(timeout)
 
             # ================================================
             # IPythonTool (Jupyter)
@@ -109,6 +116,8 @@ def response_to_actions(
                         f'Missing required argument "code" in tool call {tool_call.function.name}'
                     )
                 action = IPythonRunCellAction(code=arguments['code'])
+                if timeout:
+                    action.set_hard_timeout(timeout)
             elif tool_call.function.name == 'delegate_to_browsing_agent':
                 action = AgentDelegateAction(
                     agent='BrowsingAgent',
@@ -235,12 +244,17 @@ def response_to_actions(
             )
             actions.append(action)
     else:
-        actions.append(
-            MessageAction(
-                content=str(assistant_msg.content) if assistant_msg.content else '',
-                wait_for_response=True,
-            )
+        action = MessageAction(
+            content=str(assistant_msg.content) if assistant_msg.content else '',
+            wait_for_response=True,
         )
+        action.tool_call_metadata = ToolCallMetadata(
+                tool_call_id='',
+                function_name='',
+                model_response=response,
+                total_calls_in_response=0,
+        )
+        actions.append(action)
 
     # Add response id to actions
     # This will ensure we can match both actions without tool calls (e.g. MessageAction)

@@ -41,6 +41,16 @@ class SandboxConfig(BaseModel):
         trusted_dirs: List of directories that can be trusted to run the OpenHands CLI.
         vscode_port: The port to use for VSCode. If None, a random port will be chosen.
             This is useful when deploying OpenHands in a remote machine where you need to expose a specific port.
+        run_as_fakeroot: Whether to run the container runtime with fakeroot privileges.
+            When True, processes inside the container will appear to run as root (UID 0) without requiring
+            actual root privileges on the host system. This is particularly useful for:
+            - Singularity/Apptainer containers where you need simulated root access
+            - Package installations that require root privileges
+            - Security isolation while maintaining compatibility with root-expecting applications
+            Default is False for backward compatibility and security.
+        volumes: Volume mounts for the container runtime.
+        isolate_network: Whether to isolate the network for container runtimes (e.g., Singularity).
+            When True, the container will be run without network access for better security isolation.
     """
 
     remote_runtime_api_url: str | None = Field(default='http://localhost:8000')
@@ -80,9 +90,17 @@ class SandboxConfig(BaseModel):
     selected_repo: str | None = Field(default=None)
     trusted_dirs: list[str] = Field(default_factory=list)
     vscode_port: int | None = Field(default=None)
+    run_as_fakeroot: bool = Field(
+        default=False,
+        description="Whether to run the container runtime with fakeroot privileges. When enabled, processes inside the container will appear to run as root (UID 0) without requiring actual root privileges on the host system. This is particularly useful for Singularity/Apptainer containers and package installations that require root privileges.",
+    )
     volumes: str | None = Field(
         default=None,
         description="Volume mounts in the format 'host_path:container_path[:mode]', e.g. '/my/host/dir:/workspace:rw'. Multiple mounts can be specified using commas, e.g. '/path1:/workspace/path1,/path2:/workspace/path2:ro'",
+    )
+    isolate_network: bool = Field(
+        default=False,
+        description="Whether to isolate the network for container runtimes (e.g., Singularity). When True, the container will be run with only local network access for better security isolation.",
     )
 
     model_config = {'extra': 'forbid'}

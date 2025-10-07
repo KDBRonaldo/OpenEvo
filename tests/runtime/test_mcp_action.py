@@ -3,7 +3,10 @@
 import json
 import os
 import socket
+import subprocess
 import time
+import uuid
+from pathlib import Path
 
 import docker
 import pytest
@@ -106,6 +109,76 @@ def sse_mcp_docker_server():
             log_streamer.close()
 
 
+@pytest.fixture
+def sse_mcp_singularity_server():
+    """Start the SSE MCP server using Singularity instead of Docker.
+
+    This mirrors the Docker-based fixture but runs the `supercorp/supergateway` image
+    via Singularity, exposing an SSE endpoint on a random available host port.
+    """
+    # Ensure Singularity is available
+    try:
+        subprocess.run(
+            ['singularity', '--version'], check=True, capture_output=True, text=True
+        )
+    except Exception:
+        pytest.skip('Singularity is not available on this system')
+
+    image_ref = 'docker://supercorp/supergateway'
+
+    # Find a free port
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(('', 0))
+        host_port = s.getsockname()[1]
+
+    # In Singularity, the container shares the host network namespace,
+    # so we bind the server directly to the randomly chosen host_port.
+    container_internal_port = host_port
+
+    # Command line mirrors the Docker args passed to the image entrypoint
+    run_cmd = [
+        'singularity',
+        'run',
+        image_ref,
+        '--stdio',
+        'npx -y @modelcontextprotocol/server-filesystem /tmp',
+        '--port',
+        str(container_internal_port),
+        '--baseUrl',
+        f'http://localhost:{host_port}',
+    ]
+
+    proc: subprocess.Popen[str] | None = None
+    try:
+        logger.info(
+            f'Starting Singularity container {image_ref} with command: {" ".join(run_cmd)}',
+            extra={'msg_type': 'ACTION'},
+        )
+        proc = subprocess.Popen(
+            run_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+
+        # Give the server time to initialize
+        time.sleep(10)
+
+        yield {'url': f'http://localhost:{host_port}/sse'}
+    finally:
+        if proc is not None:
+            logger.info('Stopping Singularity-based MCP server...')
+            try:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+            except Exception as e:
+                logger.error(f'Error stopping Singularity MCP server: {e}')
+
+
 def test_default_activated_tools():
     project_root = os.path.dirname(openhands.__file__)
     mcp_config_path = os.path.join(project_root, 'runtime', 'mcp', 'config.json')
@@ -130,7 +203,7 @@ async def test_fetch_mcp_via_stdio(temp_dir, runtime_cls, run_as_openhands):
     )
 
     # Test browser server
-    action_cmd = CmdRunAction(command='python3 -m http.server 8000 > server.log 2>&1 &')
+    action_cmd = CmdRunAction(command='python3 -m http.server 9000 > server.log 2>&1 &')
     logger.info(action_cmd, extra={'msg_type': 'ACTION'})
     obs = runtime.run_action(action_cmd)
     logger.info(obs, extra={'msg_type': 'OBSERVATION'})
@@ -145,7 +218,7 @@ async def test_fetch_mcp_via_stdio(temp_dir, runtime_cls, run_as_openhands):
     logger.info(obs, extra={'msg_type': 'OBSERVATION'})
     assert obs.exit_code == 0
 
-    mcp_action = MCPAction(name='fetch', arguments={'url': 'http://localhost:8000'})
+    mcp_action = MCPAction(name='fetch', arguments={'url': 'http://localhost:9000'})
     obs = await runtime.call_tool_mcp(mcp_action)
     logger.info(obs, extra={'msg_type': 'OBSERVATION'})
     assert isinstance(obs, MCPObservation), (
@@ -158,7 +231,7 @@ async def test_fetch_mcp_via_stdio(temp_dir, runtime_cls, run_as_openhands):
     assert result_json['content'][0]['type'] == 'text'
     assert (
         result_json['content'][0]['text']
-        == 'Contents of http://localhost:8000/:\n---\n\n* <server.log>\n\n---'
+        == 'Contents of http://localhost:9000/:\n---\n\n* <server.log>\n\n---'
     )
 
     runtime.close()
@@ -166,11 +239,16 @@ async def test_fetch_mcp_via_stdio(temp_dir, runtime_cls, run_as_openhands):
 
 @pytest.mark.asyncio
 async def test_filesystem_mcp_via_sse(
-    temp_dir, runtime_cls, run_as_openhands, sse_mcp_docker_server
+    temp_dir, runtime_cls, run_as_openhands, sse_mcp_singularity_server
 ):
-    sse_server_info = sse_mcp_docker_server
+    sse_server_info = sse_mcp_singularity_server
     sse_url = sse_server_info['url']
     runtime = None
+    # Create a unique marker file in /tmp (visible to the SSE filesystem server)
+    marker_dir = Path('/tmp') / f'mcp_test_{uuid.uuid4().hex}'
+    marker_dir.mkdir(parents=True, exist_ok=True)
+    marker_file = marker_dir / 'probe.txt'
+    marker_file.write_text('ok')
     try:
         mcp_sse_server_config = MCPSSEServerConfig(url=sse_url)
         override_mcp_config = MCPConfig(sse_servers=[mcp_sse_server_config])
@@ -181,27 +259,46 @@ async def test_filesystem_mcp_via_sse(
             override_mcp_config=override_mcp_config,
         )
 
-        mcp_action = MCPAction(name='list_directory', arguments={'path': '.'})
+        mcp_action = MCPAction(
+            name='list_directory', arguments={'path': str(marker_dir)}
+        )
         obs = await runtime.call_tool_mcp(mcp_action)
         logger.info(obs, extra={'msg_type': 'OBSERVATION'})
         assert isinstance(obs, MCPObservation), (
             'The observation should be a MCPObservation.'
         )
-        assert '[FILE] .dockerenv' in obs.content
 
+        data = json.loads(obs.content)
+        print(obs.content)
+        # assert not data['isError']
+        text = next((c['text'] for c in data['content'] if c['type'] == 'text'), '')
+        print(f'text: {text}')
+        assert f'[FILE] {marker_file.name}' in text
     finally:
         if runtime:
             runtime.close()
+        # Cleanup
+        try:
+            marker_file.unlink(missing_ok=True)
+            marker_dir.rmdir()
+        except Exception:
+            pass
         # Container and log_streamer cleanup is handled by the sse_mcp_docker_server fixture
 
 
 @pytest.mark.asyncio
 async def test_both_stdio_and_sse_mcp(
-    temp_dir, runtime_cls, run_as_openhands, sse_mcp_docker_server
+    temp_dir, runtime_cls, run_as_openhands, sse_mcp_singularity_server
 ):
-    sse_server_info = sse_mcp_docker_server
+    sse_server_info = sse_mcp_singularity_server
     sse_url = sse_server_info['url']
     runtime = None
+    # Create a unique marker file in /tmp (visible to the SSE filesystem server)
+    marker_dir = Path('/tmp') / f'mcp_test_{uuid.uuid4().hex}'
+    marker_dir.mkdir(parents=True, exist_ok=True)
+    marker_file = marker_dir / 'probe.txt'
+    marker_file.write_text('ok')
+
     try:
         mcp_sse_server_config = MCPSSEServerConfig(url=sse_url)
 
@@ -221,18 +318,24 @@ async def test_both_stdio_and_sse_mcp(
         )
 
         # ======= Test SSE server =======
-        mcp_action_sse = MCPAction(name='list_directory', arguments={'path': '.'})
+        mcp_action_sse = MCPAction(
+            name='list_directory', arguments={'path': str(marker_dir)}
+        )
         obs_sse = await runtime.call_tool_mcp(mcp_action_sse)
         logger.info(obs_sse, extra={'msg_type': 'OBSERVATION'})
         assert isinstance(obs_sse, MCPObservation), (
             'The observation should be a MCPObservation.'
         )
-        assert '[FILE] .dockerenv' in obs_sse.content
+        data = json.loads(obs_sse.content)
+        assert not data['isError']
+        text = next((c['text'] for c in data['content'] if c['type'] == 'text'), '')
+        print(f'text: {text}')
+        assert f'[FILE] {marker_file.name}' in text
 
         # ======= Test stdio server =======
         # Test browser server
         action_cmd_http = CmdRunAction(
-            command='python3 -m http.server 8000 > server.log 2>&1 &'
+            command='python3 -m http.server 9000 > server.log 2>&1 &'
         )
         logger.info(action_cmd_http, extra={'msg_type': 'ACTION'})
         obs_http = runtime.run_action(action_cmd_http)
@@ -249,7 +352,7 @@ async def test_both_stdio_and_sse_mcp(
         assert obs_cat.exit_code == 0
 
         mcp_action_fetch = MCPAction(
-            name='fetch', arguments={'url': 'http://localhost:8000'}
+            name='fetch', arguments={'url': 'http://localhost:9000'}
         )
         obs_fetch = await runtime.call_tool_mcp(mcp_action_fetch)
         logger.info(obs_fetch, extra={'msg_type': 'OBSERVATION'})
@@ -263,12 +366,17 @@ async def test_both_stdio_and_sse_mcp(
         assert result_json['content'][0]['type'] == 'text'
         assert (
             result_json['content'][0]['text']
-            == 'Contents of http://localhost:8000/:\n---\n\n* <server.log>\n\n---'
+            == 'Contents of http://localhost:9000/:\n---\n\n* <server.log>\n\n---'
         )
     finally:
         if runtime:
             runtime.close()
-        # SSE Docker container cleanup is handled by the sse_mcp_docker_server fixture
+        # Cleanup
+        try:
+            marker_file.unlink(missing_ok=True)
+            marker_dir.rmdir()
+        except Exception:
+            pass
 
 
 @pytest.mark.asyncio
@@ -282,7 +390,7 @@ async def test_microagent_and_one_stdio_mcp_in_config(
             command='npx',
             args=[
                 '@modelcontextprotocol/server-filesystem',
-                '/',
+                '/tmp',
             ],
         )
         override_mcp_config = MCPConfig(stdio_servers=[filesystem_config])
@@ -303,19 +411,30 @@ async def test_microagent_and_one_stdio_mcp_in_config(
         updated_config = runtime.get_mcp_config([fetch_config])
         logger.info(f'updated_config: {updated_config}')
 
+        # Create a unique marker file in /tmp (visible to the SSE filesystem server)
+        # create the file via CMDAction
+        action_cmd_touch = CmdRunAction(command='touch /tmp/probe.txt')
+        logger.info(action_cmd_touch, extra={'msg_type': 'ACTION'})
+        obs_touch = runtime.run_action(action_cmd_touch)
+        logger.info(obs_touch, extra={'msg_type': 'OBSERVATION'})
+        assert obs_touch.exit_code == 0
+
         # ======= Test the stdio server in the config =======
-        mcp_action_sse = MCPAction(name='list_directory', arguments={'path': '/'})
+        mcp_action_sse = MCPAction(name='list_directory', arguments={'path': '/tmp'})
         obs_sse = await runtime.call_tool_mcp(mcp_action_sse)
         logger.info(obs_sse, extra={'msg_type': 'OBSERVATION'})
         assert isinstance(obs_sse, MCPObservation), (
             'The observation should be a MCPObservation.'
         )
-        assert '[FILE] .dockerenv' in obs_sse.content
+        data = json.loads(obs_sse.content)
+        text = next((c['text'] for c in data['content'] if c['type'] == 'text'), '')
+        print(f'text: {text}')
+        assert '[FILE] probe.txt' in text
 
         # ======= Test the stdio server added by the microagent =======
         # Test browser server
         action_cmd_http = CmdRunAction(
-            command='python3 -m http.server 8000 > server.log 2>&1 &'
+            command='python3 -m http.server 9000 > server.log 2>&1 &'
         )
         logger.info(action_cmd_http, extra={'msg_type': 'ACTION'})
         obs_http = runtime.run_action(action_cmd_http)
@@ -332,7 +451,7 @@ async def test_microagent_and_one_stdio_mcp_in_config(
         assert obs_cat.exit_code == 0
 
         mcp_action_fetch = MCPAction(
-            name='fetch', arguments={'url': 'http://localhost:8000'}
+            name='fetch', arguments={'url': 'http://localhost:9000'}
         )
         obs_fetch = await runtime.call_tool_mcp(mcp_action_fetch)
         logger.info(obs_fetch, extra={'msg_type': 'OBSERVATION'})
@@ -346,7 +465,7 @@ async def test_microagent_and_one_stdio_mcp_in_config(
         assert result_json['content'][0]['type'] == 'text'
         assert (
             result_json['content'][0]['text']
-            == 'Contents of http://localhost:8000/:\n---\n\n* <server.log>\n\n---'
+            == 'Contents of http://localhost:9000/:\n---\n\n* <server.log>\n\n---'
         )
     finally:
         if runtime:

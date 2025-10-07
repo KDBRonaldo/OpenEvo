@@ -5,6 +5,12 @@ if TYPE_CHECKING:
     from openhands.controller.agent import Agent
 
 
+from datetime import timedelta
+
+from mcp import ClientSession
+from mcp.client.sse import sse_client
+from mcp.client.streamable_http import streamablehttp_client
+
 from openhands.core.config.mcp_config import (
     MCPConfig,
     MCPSHTTPServerConfig,
@@ -210,6 +216,168 @@ async def call_tool_mcp(mcp_clients: list[MCPClient], action: MCPAction) -> Obse
     )
 
 
+async def execute_mcp_action_from_config(
+    mcp_config: MCPConfig, action: MCPAction, conversation_id: str | None = None
+) -> Observation:
+    """Connect to MCP servers one-by-one and execute the action on the first
+    server that provides the requested tool, using ephemeral per-call sessions.
+    All context managers are entered/exited in the same task to avoid anyio
+    cancel-scope mismatches.
+    """
+    import asyncio
+
+    # Lazy imports to avoid circular deps and optional runtime costs
+    try:
+        from anyio import ClosedResourceError, EndOfStream  # type: ignore
+    except Exception:  # pragma: no cover - anyio always present in runtime
+        ClosedResourceError = type('ClosedResourceError', (), {})  # type: ignore
+        EndOfStream = type('EndOfStream', (), {})  # type: ignore
+    from openhands.events.observation import ErrorObservation
+
+    def _is_retryable(exc: BaseException) -> bool:
+        """Classify transient/disconnect errors as retryable.
+
+        - anyio ClosedResourceError / EndOfStream during SSE writes
+        - asyncio.CancelledError (from cancel scopes/timeouts during I/O)
+        - asyncio.TimeoutError
+        - ExceptionGroup containing any of the above
+        """
+        # Handle exception groups (Python 3.11+)
+        if hasattr(exc, 'exceptions') and isinstance(exc, BaseException):  # type: ignore[unreachable]
+            try:
+                for sub in exc.exceptions:  # type: ignore[attr-defined]
+                    if _is_retryable(sub):
+                        return True
+            except Exception as iter_err:
+                logger.debug(
+                    f'Unexpected error while checking retryable sub-exception: {iter_err}'
+                )
+
+        if isinstance(exc, (asyncio.CancelledError, asyncio.TimeoutError)):
+            return True
+        # anyio types
+        if isinstance(exc, (ClosedResourceError, EndOfStream)):
+            return True
+
+        # Fallback: string match for wrapped ClosedResourceError
+        msg = str(exc)
+        return 'ClosedResourceError' in msg or 'EndOfStream' in msg
+
+    # Build prioritized lists: try SSE first (local router/external SSE), then SHTTP
+    sse_servers = list(mcp_config.sse_servers)
+    shttp_servers = list(getattr(mcp_config, 'shttp_servers', []) or [])
+    last_error: BaseException | None = None
+    last_error_retryable = False
+
+    # Try SSE servers
+    for server in sse_servers:
+        try:
+            headers = {}
+            if server.api_key:
+                headers = {
+                    'Authorization': f'Bearer {server.api_key}',
+                    's': server.api_key,
+                    'X-Session-API-Key': server.api_key,
+                }
+            if conversation_id:
+                headers['X-OpenHands-Conversation-ID'] = conversation_id
+
+            # Ephemeral connection and session in a single task
+            async with sse_client(
+                url=server.url, headers=headers or None, timeout=30.0
+            ) as (read_stream, write_stream):
+                async with ClientSession(
+                    read_stream,
+                    write_stream,
+                    read_timeout_seconds=timedelta(seconds=30),
+                ) as session:
+                    await session.initialize()
+                    tools_resp = await session.list_tools()
+                    tool_names = [t.name for t in tools_resp.tools]
+                    if action.name not in tool_names:
+                        continue
+                    response = await session.call_tool(
+                        name=action.name, arguments=action.arguments
+                    )
+                    return MCPObservation(
+                        content=json.dumps(response.model_dump(mode='json')),
+                        name=action.name,
+                        arguments=action.arguments,
+                    )
+        except asyncio.CancelledError as e:
+            last_error = e
+            last_error_retryable = True
+            continue
+        except Exception as e:
+            last_error = e
+            last_error_retryable = _is_retryable(e)
+            continue
+
+    # Try SHTTP servers
+    for server in shttp_servers:
+        try:
+            headers = {}
+            if server.api_key:
+                headers = {
+                    'Authorization': f'Bearer {server.api_key}',
+                    's': server.api_key,
+                    'X-Session-API-Key': server.api_key,
+                }
+            if conversation_id:
+                headers['X-OpenHands-Conversation-ID'] = conversation_id
+
+            timeout_delta = timedelta(seconds=30)
+            sse_read_timeout_delta = timedelta(seconds=300)
+
+            async with streamablehttp_client(
+                url=server.url,
+                headers=headers if headers else None,
+                timeout=timeout_delta,
+                sse_read_timeout=sse_read_timeout_delta,
+            ) as (read_stream, write_stream, _):
+                async with ClientSession(
+                    read_stream,
+                    write_stream,
+                    read_timeout_seconds=timeout_delta,
+                ) as session:
+                    await session.initialize()
+                    tools_resp = await session.list_tools()
+                    tool_names = [t.name for t in tools_resp.tools]
+                    if action.name not in tool_names:
+                        continue
+                    response = await session.call_tool(
+                        name=action.name, arguments=action.arguments
+                    )
+                    return MCPObservation(
+                        content=json.dumps(response.model_dump(mode='json')),
+                        name=action.name,
+                        arguments=action.arguments,
+                    )
+        except asyncio.CancelledError as e:
+            last_error = e
+            last_error_retryable = True
+            continue
+        except Exception as e:
+            last_error = e
+            last_error_retryable = _is_retryable(e)
+            continue
+
+    if last_error is not None:
+        # Return a structured observation so the agent can decide to retry.
+        error_id = 'MCP_RETRYABLE_ERROR' if last_error_retryable else 'MCP_ERROR'
+        message = (
+            f'MCP endpoint error while executing tool {action.name}: '
+            f'{type(last_error).__name__}: {last_error}. '
+            f'{"This looks transient; you can retry." if last_error_retryable else ""}'
+        ).strip()
+        return ErrorObservation(content=message, error_id=error_id)
+
+    return ErrorObservation(
+        content=f'No MCP servers available to execute tool: {action.name}',
+        error_id='MCP_NO_SERVER',
+    )
+
+
 async def add_mcp_tools_to_agent(
     agent: 'Agent', runtime: Runtime, memory: 'Memory', app_config: OpenHandsConfig
 ):
@@ -229,25 +397,80 @@ async def add_mcp_tools_to_agent(
     )
 
     extra_stdio_servers = []
+    extra_shttp_servers: list[MCPSHTTPServerConfig] = []
 
     # Add microagent MCP tools if available
-    mcp_config: MCPConfig = app_config.mcp
     microagent_mcp_configs = memory.get_microagent_mcp_tools()
-    for mcp_config in microagent_mcp_configs:
-        if mcp_config.sse_servers:
+
+    for micro_mcp_config in microagent_mcp_configs:
+        if micro_mcp_config.sse_servers:
             logger.warning(
                 'Microagent MCP config contains SSE servers, it is not yet supported.'
             )
 
-        if mcp_config.stdio_servers:
-            for stdio_server in mcp_config.stdio_servers:
+        if micro_mcp_config.stdio_servers:
+            for stdio_server in micro_mcp_config.stdio_servers:
                 # Check if this stdio server is already in the config
                 if stdio_server not in extra_stdio_servers:
                     extra_stdio_servers.append(stdio_server)
                     logger.info(f'Added microagent stdio server: {stdio_server.name}')
 
-    # Add the runtime as another MCP server
+        # Also collect SHTTP servers from microagents for parity
+        if (
+            hasattr(micro_mcp_config, 'shttp_servers')
+            and micro_mcp_config.shttp_servers
+        ):
+            for shttp_server in micro_mcp_config.shttp_servers:
+                # Deduplicate by (url, api_key)
+                if not any(
+                    (s.url == shttp_server.url and s.api_key == shttp_server.api_key)
+                    for s in extra_shttp_servers
+                ):
+                    extra_shttp_servers.append(shttp_server)
+                    logger.info(
+                        f'Added microagent SHTTP server: {getattr(shttp_server, "url", "<unknown>")}'
+                    )
+
+    # Also include stdio servers from app_config.mcp for parity
+    if hasattr(app_config, 'mcp') and getattr(app_config, 'mcp') is not None:
+        base_mcp: MCPConfig = app_config.mcp
+        if base_mcp.stdio_servers:
+            for stdio_server in base_mcp.stdio_servers:
+                if stdio_server not in extra_stdio_servers:
+                    extra_stdio_servers.append(stdio_server)
+        if hasattr(base_mcp, 'shttp_servers') and base_mcp.shttp_servers:
+            for shttp_server in base_mcp.shttp_servers:  # type: ignore[attr-defined]
+                if not any(
+                    (s.url == shttp_server.url and s.api_key == shttp_server.api_key)
+                    for s in extra_shttp_servers
+                ):
+                    extra_shttp_servers.append(shttp_server)
+
+    # Add the runtime as another MCP server (merges stdio servers and adds runtime SSE)
     updated_mcp_config = runtime.get_mcp_config(extra_stdio_servers)
+
+    # Merge in extra SHTTP servers (if any) so downstream fetch includes them
+    if extra_shttp_servers:
+        # Ensure attribute exists
+        current_shttp = list(getattr(updated_mcp_config, 'shttp_servers', []) or [])
+        for server in extra_shttp_servers:
+            if not any(
+                (s.url == server.url and s.api_key == server.api_key)
+                for s in current_shttp
+            ):
+                current_shttp.append(server)
+        try:
+            updated_mcp_config.shttp_servers = current_shttp  # type: ignore[attr-defined]
+        except Exception:
+            # If model is frozen or attribute missing, fall back to constructing a new config
+            try:
+                updated_mcp_config = MCPConfig(
+                    sse_servers=updated_mcp_config.sse_servers,
+                    stdio_servers=updated_mcp_config.stdio_servers,
+                )
+                updated_mcp_config.shttp_servers = current_shttp  # type: ignore[attr-defined]
+            except Exception as e:
+                logger.warning(f'Failed to merge SHTTP servers into MCP config: {e}')
 
     # Fetch the MCP tools
     mcp_tools = await fetch_mcp_tools_from_config(updated_mcp_config)

@@ -33,10 +33,16 @@ from openhands.memory.condenser.condenser import Condensation, View
 from openhands.memory.conversation_memory import ConversationMemory
 from openhands.runtime.plugins import (
     AgentSkillsRequirement,
-    JupyterRequirement,
+    DirectJupyterRequirement,
     PluginRequirement,
 )
 from openhands.utils.prompt import PromptManager
+from openhands.core.exceptions import (
+    AgentFormatError,
+    AgentEndThinkError,
+    AgentToolCallError,
+    AgentLengthError,
+)
 
 
 class CodeActAgent(Agent):
@@ -65,7 +71,7 @@ class CodeActAgent(Agent):
         # AgentSkillsRequirement provides a lot of Python functions,
         # and it needs to be initialized before Jupyter for Jupyter to use those functions.
         AgentSkillsRequirement(),
-        JupyterRequirement(),
+        DirectJupyterRequirement(),
     ]
 
     def __init__(
@@ -83,11 +89,13 @@ class CodeActAgent(Agent):
         self.pending_actions: deque['Action'] = deque()
         self.reset()
         self.tools = self._get_tools()
-
         # Create a ConversationMemory instance
-        self.conversation_memory = ConversationMemory(self.config, self.prompt_manager)
+        self.system_prompt_template = self.config.system_prompt_template
+        logger.debug(f'Using system prompt template: {self.system_prompt_template}')
 
+        self.conversation_memory = ConversationMemory(self.config, self.prompt_manager)
         self.condenser = Condenser.from_config(self.config.condenser)
+
         logger.debug(f'Using condenser: {type(self.condenser)}')
 
     @property
@@ -95,6 +103,7 @@ class CodeActAgent(Agent):
         if self._prompt_manager is None:
             self._prompt_manager = PromptManager(
                 prompt_dir=os.path.join(os.path.dirname(__file__), 'prompts'),
+                system_prompt_template=self.system_prompt_template,
             )
 
         return self._prompt_manager
@@ -163,6 +172,22 @@ class CodeActAgent(Agent):
         latest_user_message = state.get_last_user_message()
         if latest_user_message and latest_user_message.content.strip() == '/exit':
             return AgentFinishAction()
+
+        format_error = state.get_last_agent_format_error()
+        if format_error and isinstance(format_error, str):
+            if format_error == 'length':
+                raise AgentLengthError("LLM did not format the response properly")
+            elif format_error == 'tool_call':
+                raise AgentToolCallError("LLM did not format the tool call properly")
+            elif format_error != '':
+                logger.error(f"Unknown format error: {format_error}, continue")
+
+        # check if last thought is properly ended
+        # reuse stuck in loop error to exit agent loop
+        if self.config.ensure_thinking_end_properly:
+            latest_agent_thought = state.get_last_agent_thought()
+            if latest_agent_thought and '<think>' in latest_agent_thought and '</think>' not in latest_agent_thought:
+                raise AgentEndThinkError("LLM does not end properly reasoning properly")
 
         # Condense the events from the state. If we get a view we'll pass those
         # to the conversation manager for processing, but if we get a condensation
@@ -268,4 +293,5 @@ class CodeActAgent(Agent):
         return codeact_function_calling.response_to_actions(
             response,
             mcp_tool_names=list(self.mcp_tools.keys()),
+            timeout=self.config.action_timeout,
         )

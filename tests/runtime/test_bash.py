@@ -41,11 +41,32 @@ def get_platform_command(linux_cmd, windows_cmd):
     return windows_cmd if is_windows() else linux_cmd
 
 
+def _get_python_command(runtime):
+    """Get the appropriate Python command (python or python3) for the container."""
+    # Try python first, then python3 if python doesn't exist
+    test_python = CmdRunAction(command='python --version')
+    obs = runtime.run_action(test_python)
+    if obs.exit_code == 0:
+        return 'python'
+
+    # If python failed, try python3
+    test_python3 = CmdRunAction(command='python3 --version')
+    obs = runtime.run_action(test_python3)
+    if obs.exit_code == 0:
+        return 'python3'
+
+    # If both failed, default to python (will likely fail but maintains existing behavior)
+    return 'python'
+
+
 def test_bash_server(temp_dir, runtime_cls, run_as_openhands):
     runtime, config = _load_runtime(temp_dir, runtime_cls, run_as_openhands)
     try:
+        # Get the appropriate Python command for this container
+        python_cmd = _get_python_command(runtime)
+
         # Use python -u for unbuffered output, potentially helping capture initial output on Windows
-        action = CmdRunAction(command='python -u -m http.server 8081')
+        action = CmdRunAction(command=f'{python_cmd} -u -m http.server 8088')
         action.set_hard_timeout(1)
         obs = runtime.run_action(action)
         logger.info(obs, extra={'msg_type': 'OBSERVATION'})
@@ -103,7 +124,7 @@ def test_bash_server(temp_dir, runtime_cls, run_as_openhands):
             assert config.workspace_mount_path_in_sandbox in obs.metadata.working_dir
 
         # run it again!
-        action = CmdRunAction(command='python -u -m http.server 8081')
+        action = CmdRunAction(command=f'{python_cmd} -u -m http.server 8088')
         action.set_hard_timeout(1)
         obs = runtime.run_action(action)
         logger.info(obs, extra={'msg_type': 'OBSERVATION'})
@@ -117,10 +138,13 @@ def test_bash_server(temp_dir, runtime_cls, run_as_openhands):
 
 def test_bash_background_server(temp_dir, runtime_cls, run_as_openhands):
     runtime, config = _load_runtime(temp_dir, runtime_cls, run_as_openhands)
-    server_port = 8081
+    server_port = 8088
     try:
+        # Get the appropriate Python command for this container
+        python_cmd = _get_python_command(runtime)
+
         # Start the server, expect it to timeout (run in background manner)
-        action = CmdRunAction(f'python3 -m http.server {server_port} &')
+        action = CmdRunAction(f'{python_cmd} -m http.server {server_port} &')
         obs = runtime.run_action(action)
         logger.info(obs, extra={'msg_type': 'OBSERVATION'})
         assert isinstance(obs, CmdOutputObservation)
@@ -189,8 +213,8 @@ def test_bash_background_server(temp_dir, runtime_cls, run_as_openhands):
         _close_test_runtime(runtime)
 
 
-def test_multiline_commands(temp_dir, runtime_cls):
-    runtime, config = _load_runtime(temp_dir, runtime_cls)
+def test_multiline_commands(temp_dir, runtime_cls, run_as_openhands):
+    runtime, config = _load_runtime(temp_dir, runtime_cls, run_as_openhands)
     try:
         if is_windows():
             # Windows PowerShell version using backticks for line continuation
@@ -263,7 +287,7 @@ def test_no_ps2_in_output(temp_dir, runtime_cls, run_as_openhands):
 @pytest.mark.skipif(
     is_windows(), reason='Test uses Linux-specific bash loops and sed commands'
 )
-def test_multiline_command_loop(temp_dir, runtime_cls):
+def test_multiline_command_loop(temp_dir, runtime_cls, run_as_openhands):
     # https://github.com/All-Hands-AI/OpenHands/issues/3143
     init_cmd = """mkdir -p _modules && \
 for month in {01..04}; do
@@ -277,7 +301,7 @@ done && echo "created files"
     mv "$file" "$new_date"
 done && echo "success"
 """
-    runtime, config = _load_runtime(temp_dir, runtime_cls)
+    runtime, config = _load_runtime(temp_dir, runtime_cls, run_as_openhands)
     try:
         obs = _run_cmd_action(runtime, init_cmd)
         assert obs.exit_code == 0, 'The exit code should be 0.'
@@ -500,8 +524,8 @@ def test_run_as_user_correct_home_dir(temp_dir, runtime_cls, run_as_openhands):
         _close_test_runtime(runtime)
 
 
-def test_multi_cmd_run_in_single_line(temp_dir, runtime_cls):
-    runtime, config = _load_runtime(temp_dir, runtime_cls)
+def test_multi_cmd_run_in_single_line(temp_dir, runtime_cls, run_as_openhands):
+    runtime, config = _load_runtime(temp_dir, runtime_cls, run_as_openhands)
     try:
         if is_windows():
             # Windows PowerShell version using semicolon
@@ -519,8 +543,8 @@ def test_multi_cmd_run_in_single_line(temp_dir, runtime_cls):
         _close_test_runtime(runtime)
 
 
-def test_stateful_cmd(temp_dir, runtime_cls):
-    runtime, config = _load_runtime(temp_dir, runtime_cls)
+def test_stateful_cmd(temp_dir, runtime_cls, run_as_openhands):
+    runtime, config = _load_runtime(temp_dir, runtime_cls, run_as_openhands)
     try:
         if is_windows():
             # Windows PowerShell version
@@ -565,8 +589,8 @@ def test_stateful_cmd(temp_dir, runtime_cls):
         _close_test_runtime(runtime)
 
 
-def test_failed_cmd(temp_dir, runtime_cls):
-    runtime, config = _load_runtime(temp_dir, runtime_cls)
+def test_failed_cmd(temp_dir, runtime_cls, run_as_openhands):
+    runtime, config = _load_runtime(temp_dir, runtime_cls, run_as_openhands)
     try:
         obs = _run_cmd_action(runtime, 'non_existing_command')
         assert obs.exit_code != 0, 'The exit code should not be 0 for a failed command.'
@@ -580,8 +604,8 @@ def _create_test_file(host_temp_dir):
         f.write('Hello, World!')
 
 
-def test_copy_single_file(temp_dir, runtime_cls):
-    runtime, config = _load_runtime(temp_dir, runtime_cls)
+def test_copy_single_file(temp_dir, runtime_cls, run_as_openhands):
+    runtime, config = _load_runtime(temp_dir, runtime_cls, run_as_openhands)
     try:
         sandbox_dir = config.workspace_mount_path_in_sandbox
         sandbox_file = os.path.join(sandbox_dir, 'test_file.txt')
@@ -619,8 +643,8 @@ def _create_host_test_dir_with_files(test_dir):
         f.write('File 2 content')
 
 
-def test_copy_directory_recursively(temp_dir, runtime_cls):
-    runtime, config = _load_runtime(temp_dir, runtime_cls)
+def test_copy_directory_recursively(temp_dir, runtime_cls, run_as_openhands):
+    runtime, config = _load_runtime(temp_dir, runtime_cls, run_as_openhands)
 
     sandbox_dir = config.workspace_mount_path_in_sandbox
     try:
@@ -668,8 +692,8 @@ def test_copy_directory_recursively(temp_dir, runtime_cls):
         _close_test_runtime(runtime)
 
 
-def test_copy_to_non_existent_directory(temp_dir, runtime_cls):
-    runtime, config = _load_runtime(temp_dir, runtime_cls)
+def test_copy_to_non_existent_directory(temp_dir, runtime_cls, run_as_openhands):
+    runtime, config = _load_runtime(temp_dir, runtime_cls, run_as_openhands)
     try:
         sandbox_dir = config.workspace_mount_path_in_sandbox
         _create_test_file(temp_dir)
@@ -684,8 +708,8 @@ def test_copy_to_non_existent_directory(temp_dir, runtime_cls):
         _close_test_runtime(runtime)
 
 
-def test_overwrite_existing_file(temp_dir, runtime_cls):
-    runtime, config = _load_runtime(temp_dir, runtime_cls)
+def test_overwrite_existing_file(temp_dir, runtime_cls, run_as_openhands):
+    runtime, config = _load_runtime(temp_dir, runtime_cls, run_as_openhands)
     try:
         sandbox_dir = config.workspace_mount_path_in_sandbox
         sandbox_file = os.path.join(sandbox_dir, 'test_file.txt')
@@ -748,8 +772,8 @@ def test_overwrite_existing_file(temp_dir, runtime_cls):
         _close_test_runtime(runtime)
 
 
-def test_copy_non_existent_file(temp_dir, runtime_cls):
-    runtime, config = _load_runtime(temp_dir, runtime_cls)
+def test_copy_non_existent_file(temp_dir, runtime_cls, run_as_openhands):
+    runtime, config = _load_runtime(temp_dir, runtime_cls, run_as_openhands)
     try:
         sandbox_dir = config.workspace_mount_path_in_sandbox
         with pytest.raises(FileNotFoundError):
@@ -764,8 +788,8 @@ def test_copy_non_existent_file(temp_dir, runtime_cls):
         _close_test_runtime(runtime)
 
 
-def test_copy_from_directory(temp_dir, runtime_cls):
-    runtime, config = _load_runtime(temp_dir, runtime_cls)
+def test_copy_from_directory(temp_dir, runtime_cls, run_as_openhands):
+    runtime, config = _load_runtime(temp_dir, runtime_cls, run_as_openhands)
     sandbox_dir = config.workspace_mount_path_in_sandbox
     try:
         temp_dir_copy = os.path.join(temp_dir, 'test_dir')
@@ -787,10 +811,13 @@ def test_copy_from_directory(temp_dir, runtime_cls):
         _close_test_runtime(runtime)
 
 
+# skip if run_as_openhands is True, since it will use the host user to run the test
 @pytest.mark.skipif(
-    is_windows(), reason='Test uses Linux-specific file permissions and sudo commands'
+    is_windows()
+    or os.getenv('RUN_AS_OPENHANDS', 'True').lower() not in ['true', '1', 'yes'],
+    reason='Test uses Linux-specific file permissions and sudo commands',
 )
-def test_git_operation(temp_dir, runtime_cls):
+def test_git_operation(temp_dir, runtime_cls, run_as_openhands):
     # do not mount workspace, since workspace mount by tests will be owned by root
     # while the user_id we get via os.getuid() is different from root
     # which causes permission issues
@@ -799,7 +826,7 @@ def test_git_operation(temp_dir, runtime_cls):
         use_workspace=False,
         runtime_cls=runtime_cls,
         # Need to use non-root user to expose issues
-        run_as_openhands=True,
+        run_as_openhands=run_as_openhands,
     )
     # this will happen if permission of runtime is not properly configured
     # fatal: detected dubious ownership in repository at config.workspace_mount_path_in_sandbox
@@ -869,7 +896,9 @@ def test_git_operation(temp_dir, runtime_cls):
 def test_python_version(temp_dir, runtime_cls, run_as_openhands):
     runtime, config = _load_runtime(temp_dir, runtime_cls, run_as_openhands)
     try:
-        obs = runtime.run_action(CmdRunAction(command='python --version'))
+        # Get the appropriate Python command for this container
+        python_cmd = _get_python_command(runtime)
+        obs = runtime.run_action(CmdRunAction(command=f'{python_cmd} --version'))
 
         assert isinstance(obs, CmdOutputObservation), (
             'The observation should be a CmdOutputObservation.'
@@ -1092,6 +1121,11 @@ def test_command_backslash(temp_dir, runtime_cls, run_as_openhands):
             'find /tmp/test_dir -type f -exec grep -l "implemented_function" {} \\;'
         )
         obs = runtime.run_action(action)
+        # import time
+
+        # time.sleep(5)
+        # action = CmdRunAction('')
+        # obs = runtime.run_action(action)
         logger.info(obs, extra={'msg_type': 'OBSERVATION'})
         assert obs.exit_code == 0
         assert '/tmp/test_dir/file_1.txt' in obs.content
@@ -1362,12 +1396,15 @@ def test_empty_command_errors(temp_dir, runtime_cls, run_as_openhands):
 def test_python_interactive_input(temp_dir, runtime_cls, run_as_openhands):
     runtime, config = _load_runtime(temp_dir, runtime_cls, run_as_openhands)
     try:
+        # Get the appropriate Python command for this container
+        python_cmd = _get_python_command(runtime)
+
         # Test Python program that asks for input - same for both platforms
         python_script = """name = input('Enter your name: '); age = input('Enter your age: '); print(f'Hello {name}, you are {age} years old')"""
 
         # Start Python with the interactive script
         # For both platforms we can use the same command
-        obs = runtime.run_action(CmdRunAction(f'python -c "{python_script}"'))
+        obs = runtime.run_action(CmdRunAction(f'{python_cmd} -c "{python_script}"'))
         logger.info(obs, extra={'msg_type': 'OBSERVATION'})
         assert 'Enter your name:' in obs.content
         assert obs.metadata.exit_code == -1  # -1 indicates command is still running
@@ -1400,11 +1437,14 @@ def test_python_interactive_input_without_set_input(
 ):
     runtime, config = _load_runtime(temp_dir, runtime_cls, run_as_openhands)
     try:
+        # Get the appropriate Python command for this container
+        python_cmd = _get_python_command(runtime)
+
         # Test Python program that asks for input
         python_script = """name = input('Enter your name: '); age = input('Enter your age: '); print(f'Hello {name}, you are {age} years old')"""
 
         # Start Python with the interactive script
-        obs = runtime.run_action(CmdRunAction(f'python -c "{python_script}"'))
+        obs = runtime.run_action(CmdRunAction(f'{python_cmd} -c "{python_script}"'))
         logger.info(obs, extra={'msg_type': 'OBSERVATION'})
         assert 'Enter your name:' in obs.content
         assert obs.metadata.exit_code == -1  # -1 indicates command is still running

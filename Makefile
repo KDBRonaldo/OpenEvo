@@ -191,6 +191,10 @@ lint-backend:
 	@echo "$(YELLOW)Running linters...$(RESET)"
 	@poetry run pre-commit run --files openhands/**/* evaluation/**/* tests/**/* --show-diff-on-failure --config $(PRE_COMMIT_CONFIG_PATH)
 
+lint-scripts:
+	@echo "$(YELLOW)Running linters for scripts...$(RESET)"
+	@poetry run pre-commit run --files scripts/**/* --show-diff-on-failure --config $(PRE_COMMIT_CONFIG_PATH)
+
 lint-frontend:
 	@echo "$(YELLOW)Running linters for frontend...$(RESET)"
 	@cd frontend && npm run lint
@@ -198,6 +202,7 @@ lint-frontend:
 lint:
 	@$(MAKE) -s lint-frontend
 	@$(MAKE) -s lint-backend
+	@$(MAKE) -s lint-scripts
 
 test-frontend:
 	@echo "$(YELLOW)Running tests for frontend...$(RESET)"

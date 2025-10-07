@@ -290,8 +290,11 @@ class ExecuteHandler(tornado.web.RequestHandler):
 
 
 def make_app() -> tornado.web.Application:
+    loopback_ip = os.environ.get('LOOPBACK_IP')
+    if not loopback_ip:
+        raise RuntimeError('LOOPBACK_IP environment variable is not set')
     jupyter_kernel = JupyterKernel(
-        f'localhost:{os.environ.get("JUPYTER_GATEWAY_PORT", "8888")}',
+        f'{loopback_ip}:{os.environ.get("JUPYTER_GATEWAY_PORT", "8888")}',
         os.environ.get('JUPYTER_GATEWAY_KERNEL_ID', 'default'),
     )
     asyncio.get_event_loop().run_until_complete(jupyter_kernel.initialize())

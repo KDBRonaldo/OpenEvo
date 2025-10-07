@@ -1,6 +1,7 @@
 from openhands.controller.state.state import State
 from openhands.core.logger import openhands_logger as logger
 from openhands.events.action.action import Action
+from openhands.events.action.agent import AgentThinkAction
 from openhands.events.action.commands import IPythonRunCellAction
 from openhands.events.action.empty import NullAction
 from openhands.events.action.message import MessageAction
@@ -406,3 +407,261 @@ class StuckDetector:
         else:
             # this is the default comparison
             return obj1 == obj2
+
+
+class StrictStuckDetector(StuckDetector):
+    def is_stuck(self, headless_mode: bool = True) -> bool:
+        if not headless_mode:
+            # In interactive mode, only look at history after the last user message
+            last_user_msg_idx = -1
+            for i, event in enumerate(reversed(self.state.history)):
+                if (
+                    isinstance(event, MessageAction)
+                    and event.source == EventSource.USER
+                ):
+                    last_user_msg_idx = len(self.state.history) - i - 1
+                    break
+
+            history_to_check = self.state.history[last_user_msg_idx + 1 :]
+        else:
+            # In headless mode, look at all history
+            history_to_check = self.state.history
+
+        # Filter out user messages and null events
+        filtered_history = [
+            event
+            for event in history_to_check
+            if not (
+                # Filter works elegantly in both modes:
+                # - In headless: actively filters out user messages from full history
+                # - In non-headless: no-op since we already sliced after last user message
+                (isinstance(event, MessageAction) and event.source == EventSource.USER)
+                # there might be some NullAction or NullObservation in the history at least for now
+                or isinstance(event, (NullAction, NullObservation))
+            )
+        ]
+
+        # it takes 2 actions minimum to detect a loop, otherwise nothing to do here
+        if len(filtered_history) < 2:
+            return False
+
+        # prepare the last 2 actions and observations, to check them out
+        last_actions: list[Event] = []
+        last_observations: list[Event] = []
+
+        # retrieve the last four actions and observations starting from the end of history, wherever they are
+        for event in reversed(filtered_history):
+            if isinstance(event, Action) and len(last_actions) < 2:
+                last_actions.append(event)
+            elif isinstance(event, Observation) and len(last_observations) < 2:
+                last_observations.append(event)
+
+            if len(last_actions) == 2 and len(last_observations) == 2:
+                break
+
+        if self._is_stuck_useless_action(last_actions):
+            return True
+
+        # scenario 1: same action, same observation
+        if self._is_stuck_repeating_action_observation(last_actions, last_observations):
+            return True
+
+        # scenario 2: same action, errors
+        if self._is_stuck_repeating_action_error(last_actions, last_observations):
+            return True
+
+        # scenario 3: monologue
+        if self._is_stuck_monologue(filtered_history):
+            return True
+
+        # scenario 4: action, observation pattern on the last four steps
+        if len(filtered_history) >= 6:
+            if self._is_stuck_action_observation_pattern(filtered_history):
+                return True
+
+        return False
+
+    def _is_stuck_useless_action(self, last_actions: list[Event]) -> bool:
+        # scenario 5: useless action
+        # check if the last action is a useless action
+        for action in last_actions:
+            if isinstance(action, MessageAction) or isinstance(
+                action, AgentThinkAction
+            ):
+                continue
+            else:
+                logger.warning('Repeated useless action detected')
+                return False
+        return True
+
+    def _is_stuck_repeating_action_observation(
+        self, last_actions: list[Event], last_observations: list[Event]
+    ) -> bool:
+        # scenario 1: same action, same observation
+        # it takes 2 actions and 2 observations to detect a loop
+        # assert len(last_actions) == 2 and len(last_observations) == 2
+
+        # Check for a loop of 2 identical action-observation pairs
+        if len(last_actions) == 2 and len(last_observations) == 2:
+            actions_equal = all(
+                self._eq_no_pid(last_actions[0], action) for action in last_actions
+            )
+            observations_equal = all(
+                self._eq_no_pid(last_observations[0], observation)
+                for observation in last_observations
+            )
+
+            if actions_equal and observations_equal:
+                logger.warning('Action, Observation loop detected')
+                return True
+
+        return False
+
+    def _is_stuck_repeating_action_error(
+        self, last_actions: list[Event], last_observations: list[Event]
+    ) -> bool:
+        # scenario 2: same action, errors
+        if all(self._eq_no_pid(last_actions[0], action) for action in last_actions):
+            # and the last three observations are all errors?
+            if all(isinstance(obs, ErrorObservation) for obs in last_observations):
+                logger.warning('Action, ErrorObservation loop detected')
+                return True
+            # or, are the last three observations all IPythonRunCellObservation with SyntaxError?
+            elif all(
+                isinstance(obs, IPythonRunCellObservation) for obs in last_observations
+            ):
+                warning = 'Action, IPythonRunCellObservation loop detected'
+                for error_message in self.SYNTAX_ERROR_MESSAGES:
+                    if error_message.startswith(
+                        'SyntaxError: unterminated string literal (detected at line'
+                    ):
+                        if self._check_for_consistent_line_error(
+                            [
+                                obs
+                                for obs in last_observations
+                                if isinstance(obs, IPythonRunCellObservation)
+                            ],
+                            error_message,
+                        ):
+                            logger.warning(warning)
+                            return True
+                    elif error_message in (
+                        'SyntaxError: invalid syntax. Perhaps you forgot a comma?',
+                        'SyntaxError: incomplete input',
+                    ) and self._check_for_consistent_invalid_syntax(
+                        [
+                            obs
+                            for obs in last_observations
+                            if isinstance(obs, IPythonRunCellObservation)
+                        ],
+                        error_message,
+                    ):
+                        logger.warning(warning)
+                        return True
+        return False
+
+    def _check_for_consistent_invalid_syntax(
+        self, observations: list[IPythonRunCellObservation], error_message: str
+    ) -> bool:
+        first_lines = []
+        valid_observations = []
+
+        for obs in observations:
+            content = obs.content
+            lines = content.strip().split('\n')
+
+            if len(lines) < 6:  # 6 because a real syntax error has at least 6 lines
+                return False
+
+            line1 = lines[0].strip()
+            if not line1.startswith('Cell In[1], line'):
+                return False
+
+            first_lines.append(line1)  # Store the first line of each observation
+
+            # Check last three lines
+            if (
+                lines[-1].startswith('[Jupyter Python interpreter:')
+                and lines[-2].startswith('[Jupyter current working directory:')
+                and error_message in lines[-3]
+            ):
+                valid_observations.append(obs)
+
+        # Check if:
+        # 1. All first lines are identical
+        # 2. We have exactly 2 valid observations
+        # 3. The error message line is identical in all valid observations
+        return (
+            len(set(first_lines)) == 1
+            and len(valid_observations) == 2
+            and len(
+                set(
+                    obs.content.strip().split('\n')[:-2][-1]
+                    for obs in valid_observations
+                )
+            )
+            == 1
+        )
+
+    def _check_for_consistent_line_error(
+        self, observations: list[IPythonRunCellObservation], error_message: str
+    ) -> bool:
+        error_lines = []
+
+        for obs in observations:
+            content = obs.content
+            lines = content.strip().split('\n')
+
+            if len(lines) < 3:
+                return False
+
+            last_lines = lines[-3:]
+
+            # Check if the last two lines are our own
+            if not (
+                last_lines[-2].startswith('[Jupyter current working directory:')
+                and last_lines[-1].startswith('[Jupyter Python interpreter:')
+            ):
+                return False
+
+            # Check for the error message in the 3rd-to-last line
+            if error_message in last_lines[-3]:
+                error_lines.append(last_lines[-3])
+
+        # Check if we found the error message in all 2 observations
+        # and the 3rd-to-last line is identical across all occurrences
+        return len(error_lines) == 2 and len(set(error_lines)) == 1
+
+    def _is_stuck_monologue(self, filtered_history: list[Event]) -> bool:
+        # scenario 3: monologue
+        # check for repeated MessageActions with source=AGENT
+        # see if the agent is engaged in a good old monologue, telling itself the same thing over and over
+        agent_message_actions = [
+            (i, event)
+            for i, event in enumerate(filtered_history)
+            if isinstance(event, MessageAction) and event.source == EventSource.AGENT
+        ]
+
+        # last two message actions will do for this check
+        if len(agent_message_actions) >= 2:
+            last_agent_message_actions = agent_message_actions[-2:]
+
+            if all(
+                (last_agent_message_actions[0][1] == action[1])
+                for action in last_agent_message_actions
+            ):
+                # check if there are any observations between the repeated MessageActions
+                # then it's not yet a loop, maybe it can recover
+                start_index = last_agent_message_actions[0][0]
+                end_index = last_agent_message_actions[-1][0]
+
+                has_observation_between = False
+                for event in filtered_history[start_index + 1 : end_index]:
+                    if isinstance(event, Observation):
+                        has_observation_between = True
+                        break
+
+                if not has_observation_between:
+                    logger.warning('Repeated MessageAction with source=AGENT detected')
+                    return True
+        return False

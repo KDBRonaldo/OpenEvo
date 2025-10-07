@@ -1,8 +1,9 @@
 from typing import Any, Callable
 
+from litellm.exceptions import ContextWindowExceededError  # noqa
 from tenacity import (
     retry,
-    retry_if_exception_type,
+    retry_if_exception,
     stop_after_attempt,
     wait_exponential,
 )
@@ -54,12 +55,30 @@ class RetryMixin:
                             f'LLMNoResponseError detected with temperature={current_temp}, keeping original temperature'
                         )
 
+        def should_retry_exception(e: Exception) -> bool:
+            error_str = str(e).lower()
+
+            # 🚫 Skip retry if these patterns are in the error message or it's a ContextWindowExceededError
+            if (
+                'contextwindowexceedederror' in error_str
+                or 'prompt is too long' in error_str
+                or 'exceed context limit' in error_str
+                or 'please reduce the length' in error_str
+                or isinstance(e, ContextWindowExceededError)
+            ):
+                return False  # ❌ Do not retry
+
+            # ✅ Retry only if it's one of the allowed types
+            return isinstance(e, retry_exceptions)
+
         retry_decorator: Callable = retry(
             before_sleep=before_sleep,
             stop=stop_after_attempt(num_retries) | stop_if_should_exit(),
             reraise=True,
             retry=(
-                retry_if_exception_type(retry_exceptions)
+                retry_if_exception(
+                    should_retry_exception
+                )  # changed from retry_if_exception_type to custom function
             ),  # retry only for these types
             wait=wait_exponential(
                 multiplier=retry_multiplier,

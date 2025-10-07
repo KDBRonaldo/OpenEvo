@@ -62,11 +62,16 @@ class VSCodePlugin(Plugin):
                 f'Port {self.vscode_port} is not available. VSCode plugin will be disabled.'
             )
             return
+
+        loopback_ip = os.environ.get('LOOPBACK_IP')
+        if not loopback_ip:
+            raise RuntimeError('LOOPBACK_IP environment variable is not set')
+
         cmd = (
             f"su - {username} -s /bin/bash << 'EOF'\n"
             f'sudo chown -R {username}:{username} /openhands/.openvscode-server\n'
             'cd /workspace\n'
-            f'exec /openhands/.openvscode-server/bin/openvscode-server --host 0.0.0.0 --connection-token {self.vscode_connection_token} --port {self.vscode_port} --disable-workspace-trust\n'
+            f'exec /openhands/.openvscode-server/bin/openvscode-server --host {loopback_ip} --connection-token {self.vscode_connection_token} --port {self.vscode_port} --disable-workspace-trust\n'
             'EOF'
         )
 

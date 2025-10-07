@@ -257,6 +257,11 @@ class EventStream(EventStore):
             try:
                 # This will raise any exception that occurred during callback execution
                 fut.result()
+            except asyncio.CancelledError:
+                # Suppress cancellation errors during shutdown - this is expected
+                logger.info(
+                    f'Event callback {callback_id} for subscriber {subscriber_id} was cancelled'
+                )
             except Exception as e:
                 logger.error(
                     f'Error in event callback {callback_id} for subscriber {subscriber_id}: {str(e)}',

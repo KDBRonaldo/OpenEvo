@@ -1,146 +1,161 @@
-<a name="readme-top"></a>
+# ProRLAgent Server: A Scalable Multi-turn Rollout Infrastructure for RL Agents Training
 
-<div align="center">
-  <img src="./docs/static/img/logo.png" alt="Logo" width="200">
-  <h1 align="center">OpenHands: Code Less, Make More</h1>
-</div>
+## ☁️ Introduction
 
+ProRLAgent Server is a scalable multi-turn rollout system for training and evaluating RL agents. Built on top of OpenHands, it offers high concurrency and a pluggable handler interface to support diverse agent tasks.
 
-<div align="center">
-  <a href="https://github.com/All-Hands-AI/OpenHands/graphs/contributors"><img src="https://img.shields.io/github/contributors/All-Hands-AI/OpenHands?style=for-the-badge&color=blue" alt="Contributors"></a>
-  <a href="https://github.com/All-Hands-AI/OpenHands/stargazers"><img src="https://img.shields.io/github/stars/All-Hands-AI/OpenHands?style=for-the-badge&color=blue" alt="Stargazers"></a>
-  <a href="https://github.com/All-Hands-AI/OpenHands/blob/main/LICENSE"><img src="https://img.shields.io/github/license/All-Hands-AI/OpenHands?style=for-the-badge&color=blue" alt="MIT License"></a>
-  <br/>
-  <a href="https://join.slack.com/t/openhands-ai/shared_invite/zt-34zm4j0gj-Qz5kRHoca8DFCbqXPS~f_A"><img src="https://img.shields.io/badge/Slack-Join%20Us-red?logo=slack&logoColor=white&style=for-the-badge" alt="Join our Slack community"></a>
-  <a href="https://discord.gg/ESHStjSjD4"><img src="https://img.shields.io/badge/Discord-Join%20Us-purple?logo=discord&logoColor=white&style=for-the-badge" alt="Join our Discord community"></a>
-  <a href="https://github.com/All-Hands-AI/OpenHands/blob/main/CREDITS.md"><img src="https://img.shields.io/badge/Project-Credits-blue?style=for-the-badge&color=FFE165&logo=github&logoColor=white" alt="Credits"></a>
-  <br/>
-  <a href="https://docs.all-hands.dev/usage/getting-started"><img src="https://img.shields.io/badge/Documentation-000?logo=googledocs&logoColor=FFE165&style=for-the-badge" alt="Check out the documentation"></a>
-  <a href="https://arxiv.org/abs/2407.16741"><img src="https://img.shields.io/badge/Paper%20on%20Arxiv-000?logoColor=FFE165&logo=arxiv&style=for-the-badge" alt="Paper on Arxiv"></a>
-  <a href="https://docs.google.com/spreadsheets/d/1wOUdFCMyY6Nt0AIqF705KN4JKOWgeI4wUGUP60krXXs/edit?gid=0#gid=0"><img src="https://img.shields.io/badge/Benchmark%20score-000?logoColor=FFE165&logo=huggingface&style=for-the-badge" alt="Evaluation Benchmark Score"></a>
-  <hr>
-</div>
+- **Decoupled RL Training & Rollouts:** rollouts run as a service; any RL trainer can consume the outputs.
+- **High concurrency:**  execute large-scale jobs with LLM load balancing.
+- **Pluggable AgentHandler:**  customize for different tasks and agents.
+- **Lifecycle management:**  built-in support for status tracking, queuing, timeouts, and cleanup.
+- **Token-in / Token-out:** communicate in tokens to maintain turn alignment and ensure stable training.
 
-Welcome to OpenHands (formerly OpenDevin), a platform for software development agents powered by AI.
+## 💻 Quick Start
 
-OpenHands agents can do anything a human developer can: modify code, run commands, browse the web,
-call APIs, and yes—even copy code snippets from StackOverflow.
-
-Learn more at [docs.all-hands.dev](https://docs.all-hands.dev), or [sign up for OpenHands Cloud](https://app.all-hands.dev) to get started.
-
-> [!IMPORTANT]
-> Using OpenHands for work? We'd love to chat! Fill out
-> [this short form](https://docs.google.com/forms/d/e/1FAIpQLSet3VbGaz8z32gW9Wm-Grl4jpt5WgMXPgJ4EDPVmCETCBpJtQ/viewform)
-> to join our Design Partner program, where you'll get early access to commercial features and the opportunity to provide input on our product roadmap.
-
-![App screenshot](./docs/static/img/screenshot.png)
-
-## ☁️ OpenHands Cloud
-The easiest way to get started with OpenHands is on [OpenHands Cloud](https://app.all-hands.dev),
-which comes with $50 in free credits for new users.
-
-## 💻 Running OpenHands Locally
-
-OpenHands can also run on your local system using Docker.
-See the [Running OpenHands](https://docs.all-hands.dev/usage/installation) guide for
-system requirements and more information.
-
-> [!WARNING]
-> On a public network? See our [Hardened Docker Installation Guide](https://docs.all-hands.dev/usage/runtimes/docker#hardened-docker-installation)
-> to secure your deployment by restricting network binding and implementing additional security measures.
-
+1) Install dependencies
 
 ```bash
-docker pull docker.all-hands.dev/all-hands-ai/runtime:0.40-nikolaik
-
-docker run -it --rm --pull=always \
-    -e SANDBOX_RUNTIME_CONTAINER_IMAGE=docker.all-hands.dev/all-hands-ai/runtime:0.40-nikolaik \
-    -e LOG_ALL_EVENTS=true \
-    -v /var/run/docker.sock:/var/run/docker.sock \
-    -v ~/.openhands-state:/.openhands-state \
-    -p 3000:3000 \
-    --add-host host.docker.internal:host-gateway \
-    --name openhands-app \
-    docker.all-hands.dev/all-hands-ai/openhands:0.40
+poetry install --with dev,test,runtime,evaluation
+INSTALL_DOCKER=0 make -f Makefile.singularity build
 ```
 
-You'll find OpenHands running at [http://localhost:3000](http://localhost:3000)!
+2) Start the VLLM server with your desired Hugging Face model:
 
-When you open the application, you'll be asked to choose an LLM provider and add an API key.
-[Anthropic's Claude Sonnet 4](https://www.anthropic.com/api) (`anthropic/claude-sonnet-4-20250514`)
-works best, but you have [many options](https://docs.all-hands.dev/usage/llms).
-
-## 💡 Other ways to run OpenHands
-
-> [!CAUTION]
-> OpenHands is meant to be run by a single user on their local workstation.
-> It is not appropriate for multi-tenant deployments where multiple users share the same instance. There is no built-in authentication, isolation, or scalability.
->
-> If you're interested in running OpenHands in a multi-tenant environment, please
-> [get in touch with us](https://docs.google.com/forms/d/e/1FAIpQLSet3VbGaz8z32gW9Wm-Grl4jpt5WgMXPgJ4EDPVmCETCBpJtQ/viewform)
-> for advanced deployment options.
-
-You can also [connect OpenHands to your local filesystem](https://docs.all-hands.dev/usage/runtimes/docker#connecting-to-your-filesystem),
-run OpenHands in a scriptable [headless mode](https://docs.all-hands.dev/usage/how-to/headless-mode),
-interact with it via a [friendly CLI](https://docs.all-hands.dev/usage/how-to/cli-mode),
-or run it on tagged issues with [a github action](https://docs.all-hands.dev/usage/how-to/github-action).
-
-Visit [Running OpenHands](https://docs.all-hands.dev/usage/installation) for more information and setup instructions.
-
-If you want to modify the OpenHands source code, check out [Development.md](https://github.com/All-Hands-AI/OpenHands/blob/main/Development.md).
-
-Having issues? The [Troubleshooting Guide](https://docs.all-hands.dev/usage/troubleshooting) can help.
-
-## 📖 Documentation
-  <a href="https://deepwiki.com/All-Hands-AI/OpenHands"><img src="https://deepwiki.com/badge.svg" alt="Ask DeepWiki" title="Autogenerated Documentation by DeepWiki"></a>
-
-To learn more about the project, and for tips on using OpenHands,
-check out our [documentation](https://docs.all-hands.dev/usage/getting-started).
-
-There you'll find resources on how to use different LLM providers,
-troubleshooting resources, and advanced configuration options.
-
-## 🤝 How to Join the Community
-
-OpenHands is a community-driven project, and we welcome contributions from everyone. We do most of our communication
-through Slack, so this is the best place to start, but we also are happy to have you contact us on Discord or Github:
-
-- [Join our Slack workspace](https://join.slack.com/t/openhands-ai/shared_invite/zt-34zm4j0gj-Qz5kRHoca8DFCbqXPS~f_A) - Here we talk about research, architecture, and future development.
-- [Join our Discord server](https://discord.gg/ESHStjSjD4) - This is a community-run server for general discussion, questions, and feedback.
-- [Read or post Github Issues](https://github.com/All-Hands-AI/OpenHands/issues) - Check out the issues we're working on, or add your own ideas.
-
-See more about the community in [COMMUNITY.md](./COMMUNITY.md) or find details on contributing in [CONTRIBUTING.md](./CONTRIBUTING.md).
-
-## 📈 Progress
-
-See the monthly OpenHands roadmap [here](https://github.com/orgs/All-Hands-AI/projects/1) (updated at the maintainer's meeting at the end of each month).
-
-<p align="center">
-  <a href="https://star-history.com/#All-Hands-AI/OpenHands&Date">
-    <img src="https://api.star-history.com/svg?repos=All-Hands-AI/OpenHands&type=Date" width="500" alt="Star History Chart">
-  </a>
-</p>
-
-## 📜 License
-
-Distributed under the MIT License. See [`LICENSE`](./LICENSE) for more information.
-
-## 🙏 Acknowledgements
-
-OpenHands is built by a large number of contributors, and every contribution is greatly appreciated! We also build upon other open source projects, and we are deeply thankful for their work.
-
-For a list of open source projects and licenses used in OpenHands, please see our [CREDITS.md](./CREDITS.md) file.
-
-## 📚 Cite
-
+```bash
+vllm serve path_to_hf_model
 ```
-@misc{openhands,
-      title={{OpenHands: An Open Platform for AI Software Developers as Generalist Agents}},
-      author={Xingyao Wang and Boxuan Li and Yufan Song and Frank F. Xu and Xiangru Tang and Mingchen Zhuge and Jiayi Pan and Yueqi Song and Bowen Li and Jaskirat Singh and Hoang H. Tran and Fuqiang Li and Ren Ma and Mingzhang Zheng and Bill Qian and Yanjun Shao and Niklas Muennighoff and Yizhe Zhang and Binyuan Hui and Junyang Lin and Robert Brennan and Hao Peng and Heng Ji and Graham Neubig},
-      year={2024},
-      eprint={2407.16741},
-      archivePrefix={arXiv},
-      primaryClass={cs.SE},
-      url={https://arxiv.org/abs/2407.16741},
+
+Replace `path_to_hf_model` with the actual path to your Hugging Face model.
+
+Example:
+```bash
+vllm serve /path/Qwen3-8B --enable-auto-tool-choice --tool-call-parser hermes --reasoning-parser deepseek_r1 --host 127.0.0.1 --port 8000
+```
+
+3) Pull singularity sandboxs for SWE tasks
+
+```bash
+python scripts/pull_swe_images.py --parquet-file /path/to/train.parquet --dest-dir /some/dir
+export OH_RUNTIME_SINGULARITY_IMAGE_REPO=/path/to/singularity_images
+```
+
+4) Start the async evaluation server (FastAPI)
+
+This command starts the FastAPI-based async evaluation server and listens on the given host/port.
+It exposes /start, /process, and /status endpoints, and uses --max-init-workers/--max-run-workers and --timeout to control concurrency and time limits.
+
+```bash
+python scripts/start_server.py --host 0.0.0.0 --port 8006 --max-init-workers 64 --max-run-workers 64 --timeout 300
+```
+
+5) Test the server (HTTP I/O)
+
+Quick try: send a task to `/process` and read the JSON result.
+
+Input (request body):
+- `instance`: the task info (must include `data_source` and any fields your handler needs)
+- `sampling_params`: optional LLM/agent settings (e.g., `temperature`, `top_p`, `max_tokens`)
+- `job_id` (optional): your own identifier
+
+Example:
+
+```bash
+curl -s -X POST http://localhost:8006/process \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "instance": {
+      "data_source": "swebench",
+      "instance_id": "repo__issue__hash",
+      "trajectory_id": "t0",
+      "patch": "",
+      "metadata": {}
+    },
+    "sampling_params": {"temperature": 0.3, "top_p": 0.95}
+  }'
+```
+
+Output (response body):
+
+```json
+{
+  "resolved": true,
+  "report": {"pass@1": 0.0, "details": {"...": "..."}},
+  "timing": {"init": 2.1, "run": 41.3, "eval": 5.2, "others": 1.4, "timeout": 300.0}
 }
 ```
+
+## 💻 Add a New Task/Handler
+
+To add a new task:
+
+- Implement an `AgentHandler` with `name`, `init(job_details, ...)`, `run(job_details, ...)`, and `eval(job_details, ...)`.
+- Register it in the registry so that `instance["data_source"] == name` routes requests to your handler.
+- Provide a `final_result(job_details)` function for result shaping.
+- Ensure your handler returns a consistent result schema and handles timeouts/errors.
+
+Minimal sketch:
+
+```python
+from openhands.nvidia.registry import AgentHandler, register_agent_handler
+
+class MyTaskHandler(AgentHandler):
+    @property
+    def name(self) -> str: return "my_task"
+    async def init(self, job_details, sid=None, **kwargs):
+        return runtime, metadata, config
+    async def run(self, job_details, sid=None, **kwargs):
+        return {"git_patch": "...", "messages": []}
+    async def eval(self, job_details, sid=None, allow_skip=True, reward=None):
+        return {"report": {"resolved": True}}
+
+register_agent_handler(MyTaskHandler())
+```
+
+Then submit requests with `{"data_source": "my_task", ...}` in the `instance`.
+
+## 💻 Run unit tests
+Example:
+```bash
+TEST_RUNTIME=singularity RUN_AS_OPENHANDS=False PYTHONPATH='.' pytest tests/runtime/test_browsing.py -v -s
+```
+
+### Important Environment Variables
+
+#### Image Storage Location
+**`OH_RUNTIME_SINGULARITY_IMAGE_REPO`** - Specifies the directory where Singularity runtime images will be stored.
+```bash
+OH_RUNTIME_SINGULARITY_IMAGE_REPO=/path/to/singularity_images
+```
+
+#### Network Isolation
+**`SANDBOX_ISOLATE_NETWORK`** - Controls whether to run the container in an isolated network environment for enhanced security.
+```bash
+SANDBOX_ISOLATE_NETWORK=true
+```
+
+#### Fakeroot Execution
+**`SANDBOX_RUN_AS_FAKEROOT`** - Enables running the container with fakeroot privileges, allowing processes to appear as root without requiring actual root access on the host system. Note: This is typically not needed when running on SLURM clusters.
+```bash
+SANDBOX_RUN_AS_FAKEROOT=true
+```
+
+## 📄 Documentation
+
+More module READMEs (click to open):
+
+- [`openhands/README.md`](openhands/README.md)
+- [`openhands/nvidia/README.md`](openhands/nvidia/README.md)
+- [`openhands/llm/nvidia/README.md`](openhands/llm/nvidia/README.md)
+- [`scripts/README.md`](scripts/README.md)
+- [`tests/nvidia/README.md`](tests/nvidia/README.md)
+
+## 💡 Current Results
+
+<p align="center">
+  <img src="NVIDIA_Assets/finish.jpg" width="45%" />
+  <img src="NVIDIA_Assets/pass1.jpg" width="45%" />
+  <img src="NVIDIA_Assets/verifier.jpg" width="50%" />
+</p>
+
+To validate the functionality of the ProRLAgent servers, we conducted proof-of-concept experiments on software engineering (SWE) tasks by integrating the server with the Verl reinforcement learning (RL) framework. Specifically, we used swe-gym along with a subset of the R2E-gym dataset, comprising a total of 800 training instances, to perform GRPO training. Our experiments were carried out on the Qwen3-4B-Instruct model and evaluated on the SWE-Bench-Verified benchmark. The results demonstrate a performance improvement, with accuracy increasing from **15.0%** to **20.4%**.
+

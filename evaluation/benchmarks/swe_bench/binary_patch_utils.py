@@ -15,7 +15,7 @@ def remove_binary_diffs(patch_text):
     """
     lines = patch_text.splitlines()
     cleaned_lines = []
-    block = []
+    block: list[str] = []
     is_binary_block = False
 
     for line in lines:

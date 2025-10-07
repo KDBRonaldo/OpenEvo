@@ -9,7 +9,12 @@ mcp_tools:
   stdio_servers:
     - name: "fetch"
       command: "uvx"
-      args: ["mcp-server-fetch"]
+      args: ["mcp-server-fetch", "--ignore-robots-txt"]
+    - name: "tavily"
+      command: "npx"
+      args: ["-y", "tavily-mcp@latest"]
+      env:
+        TAVILY_API_KEY: ${TAVILY_API_KEY}
 # We leave the body empty because MCP tools will automatically add the
 # tool description for LLMs in tool calls, so there's no need to add extra descriptions.
 ---

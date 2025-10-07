@@ -47,7 +47,7 @@ def create_runtime(
         The created Runtime instance (not yet connected or initialized).
     """
     # if sid is provided on the command line, use it as the name of the event stream
-    # otherwise generate it on the basis of the configured jwt_secret
+    # otherwise generate it on the basis of the configured session_secret
     # we can do this better, this is just so that the sid is retrieved when we want to restore the session
     session_id = sid or generate_sid(config)
 
@@ -219,9 +219,11 @@ def create_controller(
 
 
 def generate_sid(config: OpenHandsConfig, session_name: str | None = None) -> str:
-    """Generate a session id based on the session name and the jwt secret."""
+    """Generate a session id based on the session name and the session secret."""
     session_name = session_name or str(uuid.uuid4())
-    jwt_secret = config.jwt_secret
+    session_secret = config.session_secret
 
-    hash_str = hashlib.sha256(f'{session_name}{jwt_secret}'.encode('utf-8')).hexdigest()
+    hash_str = hashlib.sha256(
+        f'{session_name}{session_secret}'.encode('utf-8')
+    ).hexdigest()
     return f'{session_name}-{hash_str[:16]}'

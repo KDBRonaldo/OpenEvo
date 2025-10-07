@@ -256,7 +256,7 @@ class SensitiveDataFilter(logging.Filter):
             'aws_secret_access_key',
             'e2b_api_key',
             'github_token',
-            'jwt_secret',
+            'session_secret',
             'modal_api_token_id',
             'modal_api_token_secret',
             'llm_api_key',

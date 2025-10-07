@@ -1,6 +1,7 @@
 import os
 from dataclasses import dataclass, field
 from itertools import islice
+from typing import Optional
 
 from jinja2 import Template
 
@@ -52,9 +53,13 @@ class PromptManager:
     def __init__(
         self,
         prompt_dir: str,
+        system_prompt_template: Optional[str] = None,
     ):
         self.prompt_dir: str = prompt_dir
-        self.system_template: Template = self._load_template('system_prompt')
+        if system_prompt_template is None:
+            self.system_template: Template = self._load_template('system_prompt')
+        else:
+            self.system_template: Template = self._load_template(system_prompt_template)
         self.user_template: Template = self._load_template('user_prompt')
         self.additional_info_template: Template = self._load_template('additional_info')
         self.microagent_info_template: Template = self._load_template('microagent_info')

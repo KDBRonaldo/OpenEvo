@@ -54,6 +54,9 @@ class BrowserEnv:
         retry=tenacity.retry_if_exception_type(BrowserInitException),
     )
     def init_browser(self) -> None:
+        if self.browsergym_eval_env == 'skip':
+            logger.debug('Skipping browser env initialization.')
+            return
         logger.debug('Starting browser env...')
         try:
             self.process = multiprocessing.Process(target=self.browser_process)
@@ -205,6 +208,9 @@ class BrowserEnv:
         return False
 
     def close(self) -> None:
+        if self.browsergym_eval_env == 'skip':
+            return
+
         if not self.process.is_alive():
             return
         try:

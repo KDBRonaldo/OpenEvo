@@ -32,12 +32,7 @@ def split_bash_commands(commands: str) -> list[str]:
         AttributeError,
     ):
         # Added AttributeError to catch 'str' object has no attribute 'kind' error (issue #8369)
-        logger.debug(
-            f'Failed to parse bash commands\n'
-            f'[input]: {commands}\n'
-            f'[warning]: {traceback.format_exc()}\n'
-            f'The original command will be returned as is.'
-        )
+        logger.debug(f'Complex bash command will be executed as-is: {commands[:100]}...')
         # If parsing fails, return the original commands
         return [commands]
 
@@ -235,7 +230,7 @@ class BashSession:
         self.pane.send_keys(
             f'export PROMPT_COMMAND=\'export PS1="{self.PS1}"\'; export PS2=""'
         )
-        time.sleep(0.1)  # Wait for command to take effect
+        self._wait_for_command_processing()  # Wait for command to take effect
         self._clear_screen()
 
         # Store the last command for interactive input handling
@@ -283,8 +278,28 @@ class BashSession:
     def _clear_screen(self) -> None:
         """Clear the tmux pane screen and history."""
         self.pane.send_keys('C-l', enter=False)
-        time.sleep(0.1)
+        self._wait_for_command_processing()
         self.pane.cmd('clear-history')
+
+    def _wait_for_command_processing(self) -> None:
+        """Wait for tmux to process the sent keys properly.
+        tmux wait-for synchronization (most reliable, default)
+        """
+        try:
+            # Use tmux's built-in synchronization - most reliable method
+            # This creates a unique channel per pane to avoid conflicts
+            sync_channel = f"openhands-sync-{self.pane.pane_id}"
+
+            # Lock the channel, then unlock it after a minimal delay
+            # This ensures tmux has processed our previous send-keys command
+            self.pane.cmd('wait-for', '-L', sync_channel)
+            time.sleep(0.005)  # Minimal delay for processing
+            self.pane.cmd('wait-for', '-U', sync_channel)
+            return
+        except Exception as e:
+            logger.debug(f'Tmux wait-for failed {e}')
+            raise e
+
 
     def _get_command_output(
         self,
@@ -588,6 +603,8 @@ class BashSession:
                     command,
                     enter=not is_special_key,
                 )
+        # Wait for tmux to process the command properly
+        self._wait_for_command_processing()
 
         # Loop until the command completes or times out
         while should_continue():

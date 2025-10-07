@@ -488,7 +488,7 @@ def test_invalid_toml_format(monkeypatch, temp_toml_file, default_config):
 
     load_from_toml(default_config, temp_toml_file)
     load_from_env(default_config, os.environ)
-    default_config.jwt_secret = None  # prevent leak
+    default_config.session_secret = None  # prevent leak
     for llm in default_config.llms.values():
         llm.api_key = None  # prevent leak
     assert default_config.get_llm_config().model == 'gpt-5-turbo-1106'
@@ -991,7 +991,7 @@ def test_api_keys_repr_str():
         llms={'llm': llm_config},
         agents={'agent': agent_config},
         e2b_api_key='my_e2b_api_key',
-        jwt_secret='my_jwt_secret',
+        session_secret='my_session_secret',
         modal_api_token_id='my_modal_api_token_id',
         modal_api_token_secret='my_modal_api_token_secret',
         runloop_api_key='my_runloop_api_key',
@@ -999,8 +999,8 @@ def test_api_keys_repr_str():
     )
     assert 'my_e2b_api_key' not in repr(app_config)
     assert 'my_e2b_api_key' not in str(app_config)
-    assert 'my_jwt_secret' not in repr(app_config)
-    assert 'my_jwt_secret' not in str(app_config)
+    assert 'my_session_secret' not in repr(app_config)
+    assert 'my_session_secret' not in str(app_config)
     assert 'my_modal_api_token_id' not in repr(app_config)
     assert 'my_modal_api_token_id' not in str(app_config)
     assert 'my_modal_api_token_secret' not in repr(app_config)

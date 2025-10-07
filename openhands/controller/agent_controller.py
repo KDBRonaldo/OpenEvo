@@ -26,7 +26,7 @@ from litellm.exceptions import (  # noqa
 from openhands.controller.agent import Agent
 from openhands.controller.replay import ReplayManager
 from openhands.controller.state.state import State, TrafficControlState
-from openhands.controller.stuck import StuckDetector
+from openhands.controller.stuck import StrictStuckDetector, StuckDetector
 from openhands.core.config import AgentConfig, LLMConfig
 from openhands.core.exceptions import (
     AgentStuckInLoopError,
@@ -170,7 +170,10 @@ class AgentController:
         self._initial_max_budget_per_task = max_budget_per_task
 
         # stuck helper
-        self._stuck_detector = StuckDetector(self.state)
+        if self.agent.config.strict_loop_detector:
+            self._stuck_detector: StuckDetector = StrictStuckDetector(self.state)
+        else:
+            self._stuck_detector = StuckDetector(self.state)
         self.status_callback = status_callback
 
         # replay-related

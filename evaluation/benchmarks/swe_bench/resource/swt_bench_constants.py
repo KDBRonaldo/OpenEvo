@@ -1,4 +1,5 @@
 # Based on https://github.com/logic-star-ai/swt-bench/blob/master/src/constants.py
+# type: ignore
 
 # Constants - Installation Specifications
 MAP_VERSION_TO_INSTALL_SKLEARN = {

@@ -1,3 +1,4 @@
+# type: ignore
 import asyncio
 import copy
 import json
@@ -70,16 +71,16 @@ AGENT_CLS_TO_FAKE_USER_RESPONSE_FN = {
 }
 
 
-def _get_swebench_workspace_dir_name(instance: pd.Series) -> str:
-    return f'{instance.repo}__{instance.version}'.replace('/', '__')
+def _get_swebench_workspace_dir_name(instance: pd.Series | dict) -> str:
+    return f'{instance['repo']}__{instance['version']}'.replace('/', '__')
 
 
-def get_instruction(instance: pd.Series, metadata: EvalMetadata) -> MessageAction:
+def get_instruction(instance: pd.Series | dict, metadata: EvalMetadata) -> MessageAction:
     workspace_dir_name = _get_swebench_workspace_dir_name(instance)
-    mode = metadata.details['mode']
+    mode = metadata.details['mode'] if metadata.details else 'default'  # type: ignore
     if mode.startswith('swt'):
         test_instructions = (
-            f'The following command can be used to run the tests: `{list(MAP_REPO_TO_TEST_FRAMEWORK_VERBOSE[instance.repo].values())[0]}`. Make sure they fail in the expected way.\n'
+            f'The following command can be used to run the tests: `{list(MAP_REPO_TO_TEST_FRAMEWORK_VERBOSE[instance['repo']].values())[0]}`. Make sure they fail in the expected way.\n'
             if mode.endswith('ci')
             else ''
         )
@@ -90,7 +91,7 @@ def get_instruction(instance: pd.Series, metadata: EvalMetadata) -> MessageActio
 I've uploaded a python code repository in the directory {workspace_dir_name}. Consider the following issue description:
 
 <issue_description>
-{instance.problem_statement}
+{instance['problem_statement']}
 </issue_description>
 
 
@@ -105,6 +106,12 @@ Follow these steps to reproduce the issue:
 {test_instructions}Your thinking should be thorough and so it's fine if it's very long.
 """
     else:
+        # Decide FINAL REVIEW sentence based on the dataset kind
+        final_review_line = (
+            "6. FINAL REVIEW: Carefully re-read the problem description and compare your changes with the base commit."
+            if instance.get("data_kind") == "r2egym" or instance.get("data_kind") == "swesmith"
+            else f"6. FINAL REVIEW: Carefully re-read the problem description and compare your changes with the base commit {instance['base_commit']}."
+        )
         instruction = f"""
 <uploaded_files>
 /workspace/{workspace_dir_name}
@@ -113,7 +120,7 @@ Follow these steps to reproduce the issue:
 I've uploaded a python code repository in the directory {workspace_dir_name}. Consider the following issue description:
 
 <issue_description>
-{instance.problem_statement}
+{instance['problem_statement']}
 </issue_description>
 
 Can you help me implement the necessary changes to the repository so that the requirements specified in the <issue_description> are met?
@@ -121,54 +128,49 @@ I've already taken care of all changes to any of the test files described in the
 Also the development Python environment is already set up for you (i.e., all dependencies already installed), so you don't need to install other packages.
 Your task is to make the minimal changes to non-test files in the /workspace/{workspace_dir_name} directory to ensure the <issue_description> is satisfied.
 
-Follow these phases to resolve the issue:
+Follow these steps to resolve the issue:
 
-Phase 1. READING: read the problem and reword it in clearer terms
-   1.1 If there are code or config snippets. Express in words any best practices or conventions in them.
-   1.2 Hightlight message errors, method names, variables, file names, stack traces, and technical details.
-   1.3 Explain the problem in clear terms.
-   1.4 Enumerate the steps to reproduce the problem.
-   1.5 Hightlight any best practices to take into account when testing and fixing the issue
+1. EXPLORATION: First, thoroughly explore the repository structure using tools like `find` and `grep`.
+   - Identify all files mentioned in the problem statement
+   - Locate where the issue occurs in the codebase
+   - Understand the surrounding context and dependencies
+   - Use `grep` to search for relevant functions, classes, or error messages
 
-Phase 2. RUNNING: install and run the tests on the repository
-   2.1 Follow the readme
-   2.2 Install the environment and anything needed
-   2.2 Iterate and figure out how to run the tests
+2. ANALYSIS: Based on your exploration, think carefully about the problem and propose 2-5 possible approaches to fix the issue.
+   - Analyze the root cause of the problem
+   - Consider trade-offs between different solutions
+   - Select the most promising approach and explain your reasoning
 
-Phase 3. EXPLORATION: find the files that are related to the problem and possible solutions
-   3.1 Use `grep` to search for relevant methods, classes, keywords and error messages.
-   3.2 Identify all files related to the problem statement.
-   3.3 Propose the methods and files to fix the issue and explain why.
-   3.4 From the possible file locations, select the most likely location to fix the issue.
+3. IMPLEMENTATION: Edit the source code to implement your chosen solution.
+   - Make minimal, focused changes to fix the issue
+   - Use the `str_replace_editor` tool to edit the source code.
 
-Phase 4. TEST CREATION: before implementing any fix, create a script to reproduce and verify the issue.
-   4.1 Look at existing test files in the repository to understand the test format/structure.
-   4.2 Create a minimal reproduction script that reproduces the located issue.
-   4.3 Run the reproduction script to confirm you are reproducing the issue.
-   4.4 Adjust the reproduction script as necessary.
+4. TEST CREATION: After implementing the fix, create a script to reproduce and verify the issue.
+   - Look at existing test files in the repository to understand the test format/structure
+   - Create a minimal reproduction script that demonstrates the issue
+   - Run your script to confirm the error exists
 
-Phase 5. FIX ANALYSIS: state clearly the problem and how to fix it
-   5.1 State clearly what the problem is.
-   5.2 State clearly where the problem is located.
-   5.3 State clearly how the test reproduces the issue.
-   5.4 State clearly the best practices to take into account in the fix.
-   5.5 State clearly how to fix the problem.
+5. VERIFICATION: Test your implementation thoroughly.
+   - Run your reproduction script to verify the fix works
+   - Add edge cases to your test script to ensure comprehensive coverage
+   - Run existing tests related to the modified code to ensure you haven't broken anything. Use `grep` to look at existing test files to find relevant tests.
+   - Avoid running the all the tests and only select tests that you think are relevant when running `pytest`
 
-Phase 6. FIX IMPLEMENTATION: Edit the source code to implement your chosen solution.
-   6.1 Make minimal, focused changes to fix the issue.
+{final_review_line}
+   - Ensure you've fully addressed all requirements
+   - Run any tests in the repository related to:
+     * The issue you are fixing
+     * The files you modified
+     * The functions you changed
+   - If any tests fail, revise your implementation until all tests pass
 
-Phase 7. VERIFICATION: Test your implementation thoroughly.
-   7.1 Run your reproduction script to verify the fix works.
-   7.2 Add edge cases to your test script to ensure comprehensive coverage.
-   7.3 Run existing tests related to the modified code to ensure you haven't broken anything.
-
-8. FINAL REVIEW: Carefully re-read the problem description and compare your changes with the base commit {instance['base_commit']}.
-   8.1 Ensure you've fully addressed all requirements.
-   8.2 Run any tests in the repository related to:
-     8.2.1 The issue you are fixing
-     8.2.2 The files you modified
-     8.2.3 The functions you changed
-   8.3 If any tests fail, revise your implementation until all tests pass
+Important Guidelines:
+    - Do not install additional packages. Avoid using `pip install` or `conda install` to install packages.
+    - When running `pytest`, do not run all the tests. Only run the tests that are related to the issue you are fixing.
+    - When using `execute_bash` to run commands, avoid long-running commands. Always set a timeout, preferably 10 seconds, and no more than 30 seconds.
+    - Use `C-c` to interrupt long-running commands and set `is_input` to `true`.
+    - Avoid running the same command more than once. If a command failed, try to fix and change the command or run a entirely different command.
+    - Use `str_replace_editor` tool to edit the source code.
 
 Be thorough in your exploration, testing, and reasoning. It's fine if your thinking process is lengthy - quality and completeness are more important than brevity.
 """
@@ -218,13 +220,13 @@ def get_instance_docker_image(
 
 
 def get_config(
-    instance: pd.Series,
+    instance: pd.Series | dict,
     metadata: EvalMetadata,
 ) -> OpenHandsConfig:
     # We use a different instance image for the each instance of swe-bench eval
-    use_swebench_official_image = 'swe-gym' not in metadata.dataset.lower()
+    use_swebench_official_image = 'swe-gym' not in (metadata.dataset or '').lower()  # type: ignore
     base_container_image = get_instance_docker_image(
-        instance['instance_id'],
+        instance['instance_id'],  # type: ignore
         swebench_official_image=use_swebench_official_image,
     )
     logger.info(
@@ -240,8 +242,8 @@ def get_config(
     # Add platform to the sandbox config to solve issue 4401
     sandbox_config.platform = 'linux/amd64'
     sandbox_config.remote_runtime_resource_factor = get_instance_resource_factor(
-        dataset_name=metadata.dataset,
-        instance_id=instance['instance_id'],
+        dataset_name=metadata.dataset or 'swebench',  # type: ignore
+        instance_id=instance['instance_id'],  # type: ignore
     )
 
     config = OpenHandsConfig(
@@ -273,7 +275,7 @@ def get_config(
 
 def initialize_runtime(
     runtime: Runtime,
-    instance: pd.Series,  # this argument is not required
+    instance: pd.Series | dict,  # this argument is not required
     metadata: EvalMetadata,
 ):
     """Initialize the runtime for the agent.
@@ -290,7 +292,7 @@ def initialize_runtime(
     action = CmdRunAction(
         command=f"""echo 'export SWE_INSTANCE_ID={instance['instance_id']}' >> ~/.bashrc && echo 'export PIP_CACHE_DIR=~/.cache/pip' >> ~/.bashrc && echo "alias git='git --no-pager'" >> ~/.bashrc && git config --global core.pager "" && git config --global diff.binary false"""
     )
-    action.set_hard_timeout(600)
+    action.set_hard_timeout(5)
     logger.info(action, extra={'msg_type': 'ACTION'})
     obs = runtime.run_action(action)
     logger.info(obs, extra={'msg_type': 'OBSERVATION'})
@@ -300,7 +302,7 @@ def initialize_runtime(
     )
 
     action = CmdRunAction(command="""export USER=$(whoami); echo USER=${USER} """)
-    action.set_hard_timeout(600)
+    action.set_hard_timeout(5)
     logger.info(action, extra={'msg_type': 'ACTION'})
     obs = runtime.run_action(action)
     logger.info(obs, extra={'msg_type': 'OBSERVATION'})
@@ -311,7 +313,7 @@ def initialize_runtime(
 
     # inject the instance info
     action = CmdRunAction(command='mkdir -p /swe_util/eval_data/instances')
-    action.set_hard_timeout(600)
+    action.set_hard_timeout(5)
     logger.info(action, extra={'msg_type': 'ACTION'})
     obs = runtime.run_action(action)
     logger.info(obs, extra={'msg_type': 'OBSERVATION'})
@@ -341,14 +343,14 @@ def initialize_runtime(
         )
 
     action = CmdRunAction(command='cat ~/.bashrc')
-    action.set_hard_timeout(600)
+    action.set_hard_timeout(5)
     logger.info(action, extra={'msg_type': 'ACTION'})
     obs = runtime.run_action(action)
     logger.info(obs, extra={'msg_type': 'OBSERVATION'})
     assert_and_raise(obs.exit_code == 0, f'Failed to cat ~/.bashrc: {str(obs)}')
 
     action = CmdRunAction(command='source ~/.bashrc')
-    action.set_hard_timeout(600)
+    action.set_hard_timeout(30)
     logger.info(action, extra={'msg_type': 'ACTION'})
     obs = runtime.run_action(action)
     logger.info(obs, extra={'msg_type': 'OBSERVATION'})
@@ -357,7 +359,7 @@ def initialize_runtime(
     assert_and_raise(obs.exit_code == 0, f'Failed to source ~/.bashrc: {str(obs)}')
 
     action = CmdRunAction(command='source /swe_util/instance_swe_entry.sh')
-    action.set_hard_timeout(600)
+    action.set_hard_timeout(30)
     logger.info(action, extra={'msg_type': 'ACTION'})
     obs = runtime.run_action(action)
     logger.info(obs, extra={'msg_type': 'OBSERVATION'})
@@ -367,7 +369,7 @@ def initialize_runtime(
     )
 
     action = CmdRunAction(command=f'cd /workspace/{workspace_dir_name}')
-    action.set_hard_timeout(600)
+    action.set_hard_timeout(5)
     logger.info(action, extra={'msg_type': 'ACTION'})
     obs = runtime.run_action(action)
     logger.info(obs, extra={'msg_type': 'OBSERVATION'})
@@ -377,7 +379,7 @@ def initialize_runtime(
     )
 
     action = CmdRunAction(command='git reset --hard')
-    action.set_hard_timeout(600)
+    action.set_hard_timeout(5)
     logger.info(action, extra={'msg_type': 'ACTION'})
     obs = runtime.run_action(action)
     logger.info(obs, extra={'msg_type': 'OBSERVATION'})
@@ -386,7 +388,7 @@ def initialize_runtime(
     action = CmdRunAction(
         command='for remote_name in $(git remote); do git remote remove "${remote_name}"; done'
     )
-    action.set_hard_timeout(600)
+    action.set_hard_timeout(5)
     logger.info(action, extra={'msg_type': 'ACTION'})
     obs = runtime.run_action(action)
     logger.info(obs, extra={'msg_type': 'OBSERVATION'})
@@ -411,16 +413,15 @@ def initialize_runtime(
 
         for command in setup_commands:
             action = CmdRunAction(command=command)
-            action.set_hard_timeout(600)
+            action.set_hard_timeout(5)
             logger.info(action, extra={'msg_type': 'ACTION'})
             obs = runtime.run_action(action)
             logger.info(obs, extra={'msg_type': 'OBSERVATION'})
 
-    if 'multimodal' not in metadata.dataset.lower():
-        # Only for non-multimodal datasets, we need to activate the testbed environment for Python
-        # SWE-Bench multimodal datasets are not using the testbed environment
+    # Only enforce testbed python for swebench datasets; r2egym images may not include testbed env
+    if 'multimodal' not in metadata.dataset.lower() and 'r2egym' not in metadata.dataset.lower():
         action = CmdRunAction(command='which python')
-        action.set_hard_timeout(600)
+        action.set_hard_timeout(5)
         logger.info(action, extra={'msg_type': 'ACTION'})
         obs = runtime.run_action(action)
         logger.info(obs, extra={'msg_type': 'OBSERVATION'})
@@ -429,6 +430,27 @@ def initialize_runtime(
             f'Expected to find python interpreter from testbed, but got: {str(obs)}',
         )
 
+    if "swesmith" in metadata.dataset.lower() and metadata.details.get("is_inference", False):
+        bug_patch = metadata.details['bug_patch']
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            patch_path = os.path.join(tmp_dir, "patch.diff")
+            with open(patch_path, "w") as f:
+                f.write(bug_patch)
+            runtime.copy_to(patch_path, "/tmp")
+        apply_cmd = (
+            "cd /testbed && "
+            f"(git apply -v /tmp/patch.diff && echo '{APPLY_PATCH_PASS}' || "
+            f"(echo 'Failed to apply patch with git apply, trying with patch command...' && "
+            f"(patch --batch --fuzz=5 -p1 -i /tmp/patch.diff && echo '{APPLY_PATCH_PASS}' || "
+            f"echo '{APPLY_PATCH_FAIL}')))"
+        )
+        action = CmdRunAction(command=apply_cmd)
+        action.set_hard_timeout(60)
+        obs = runtime.run_action(action)
+        assert isinstance(obs, CmdOutputObservation)
+        patch_result = obs.content
+
     logger.info('-' * 30)
     logger.info('END Runtime Initialization Fn')
     logger.info('-' * 30)
@@ -436,7 +458,7 @@ def initialize_runtime(
 
 def complete_runtime(
     runtime: Runtime,
-    instance: pd.Series,  # this argument is not required, but it is used to get the workspace_dir_name
+    instance: pd.Series | dict,  # this argument is not required, but it is used to get the workspace_dir_name
 ) -> dict[str, Any]:
     """Complete the runtime for the agent.
 
@@ -451,7 +473,7 @@ def complete_runtime(
     workspace_dir_name = _get_swebench_workspace_dir_name(instance)
 
     action = CmdRunAction(command=f'cd /workspace/{workspace_dir_name}')
-    action.set_hard_timeout(600)
+    action.set_hard_timeout(5)
     logger.info(action, extra={'msg_type': 'ACTION'})
     obs = runtime.run_action(action)
     logger.info(obs, extra={'msg_type': 'OBSERVATION'})
@@ -460,13 +482,13 @@ def complete_runtime(
         # The previous command is still running
         # We need to kill previous command
         logger.info('The previous command is still running, trying to kill it...')
-        action = CmdRunAction(command='C-c')
+        action = CmdRunAction(command='C-c', is_input=True)
         obs = runtime.run_action(action)
         logger.info(obs, extra={'msg_type': 'OBSERVATION'})
 
         # Then run the command again
         action = CmdRunAction(command=f'cd /workspace/{workspace_dir_name}')
-        action.set_hard_timeout(600)
+        action.set_hard_timeout(5)
         logger.info(action, extra={'msg_type': 'ACTION'})
         obs = runtime.run_action(action)
         logger.info(obs, extra={'msg_type': 'OBSERVATION'})
@@ -475,13 +497,13 @@ def complete_runtime(
         # The previous command is still running
         # We need to kill previous command
         logger.info('The previous command is still running, trying to ctrl+z it...')
-        action = CmdRunAction(command='C-z')
+        action = CmdRunAction(command='C-z', is_input=True)
         obs = runtime.run_action(action)
         logger.info(obs, extra={'msg_type': 'OBSERVATION'})
 
         # Then run the command again
         action = CmdRunAction(command=f'cd /workspace/{workspace_dir_name}')
-        action.set_hard_timeout(600)
+        action.set_hard_timeout(5)
         logger.info(action, extra={'msg_type': 'ACTION'})
         obs = runtime.run_action(action)
         logger.info(obs, extra={'msg_type': 'OBSERVATION'})
@@ -492,7 +514,7 @@ def complete_runtime(
     )
 
     action = CmdRunAction(command='git config --global core.pager ""')
-    action.set_hard_timeout(600)
+    action.set_hard_timeout(5)
     logger.info(action, extra={'msg_type': 'ACTION'})
     obs = runtime.run_action(action)
     logger.info(obs, extra={'msg_type': 'OBSERVATION'})
@@ -503,7 +525,7 @@ def complete_runtime(
 
     # First check for any git repositories in subdirectories
     action = CmdRunAction(command='find . -type d -name .git -not -path "./.git"')
-    action.set_hard_timeout(600)
+    action.set_hard_timeout(5)
     logger.info(action, extra={'msg_type': 'ACTION'})
     obs = runtime.run_action(action)
     logger.info(obs, extra={'msg_type': 'OBSERVATION'})
@@ -517,7 +539,7 @@ def complete_runtime(
         # Remove all .git directories in subdirectories
         for git_dir in git_dirs:
             action = CmdRunAction(command=f'rm -rf "{git_dir}"')
-            action.set_hard_timeout(600)
+            action.set_hard_timeout(5)
             logger.info(action, extra={'msg_type': 'ACTION'})
             obs = runtime.run_action(action)
             logger.info(obs, extra={'msg_type': 'OBSERVATION'})
@@ -528,7 +550,7 @@ def complete_runtime(
 
     # add all files
     action = CmdRunAction(command='git add -A')
-    action.set_hard_timeout(600)
+    action.set_hard_timeout(30)
     logger.info(action, extra={'msg_type': 'ACTION'})
     obs = runtime.run_action(action)
     logger.info(obs, extra={'msg_type': 'OBSERVATION'})
@@ -539,7 +561,7 @@ def complete_runtime(
 
     # Remove binary files from git staging
     action = CmdRunAction(command=remove_binary_files_from_git())
-    action.set_hard_timeout(600)
+    action.set_hard_timeout(30)
     logger.info(action, extra={'msg_type': 'ACTION'})
     obs = runtime.run_action(action)
     logger.info(obs, extra={'msg_type': 'OBSERVATION'})
@@ -551,10 +573,19 @@ def complete_runtime(
     n_retries = 0
     git_patch = None
     while n_retries < 5:
-        action = CmdRunAction(
-            command=f'git diff --no-color --cached {instance["base_commit"]} > patch.diff'
-        )
-        action.set_hard_timeout(max(300 + 100 * n_retries, 600))
+        if instance.get("data_kind") == "r2egym":
+            action = CmdRunAction(
+                command=f'git diff --no-color --cached {instance["old_commit"]} > patch.diff'
+            )
+        elif instance.get("data_kind") == "swesmith":
+            action = CmdRunAction(
+                command=f'git diff --no-color --cached {instance["commit"]} > patch.diff'
+            )
+        else:
+            action = CmdRunAction(
+                command=f'git diff --no-color --cached {instance["base_commit"]} > patch.diff'
+            )
+        action.set_hard_timeout(max(30 + 20 * n_retries, 100))
         logger.info(action, extra={'msg_type': 'ACTION'})
         obs = runtime.run_action(action)
         logger.info(obs, extra={'msg_type': 'OBSERVATION'})
@@ -563,7 +594,7 @@ def complete_runtime(
             if obs.exit_code == 0:
                 # Read the patch file
                 action = FileReadAction(path='patch.diff')
-                action.set_hard_timeout(max(300 + 100 * n_retries, 600))
+                action.set_hard_timeout(max(30 + 20 * n_retries, 100))
                 logger.info(action, extra={'msg_type': 'ACTION'})
                 obs = runtime.run_action(action)
                 logger.info(obs, extra={'msg_type': 'OBSERVATION'})
@@ -574,7 +605,7 @@ def complete_runtime(
                     # Fall back to cat "patch.diff" to get the patch
                     assert 'File could not be decoded as utf-8' in obs.content
                     action = CmdRunAction(command='cat patch.diff')
-                    action.set_hard_timeout(max(300 + 100 * n_retries, 600))
+                    action.set_hard_timeout(max(30 + 20 * n_retries, 100))
                     logger.info(action, extra={'msg_type': 'ACTION'})
                     obs = runtime.run_action(action)
                     assert isinstance(obs, CmdOutputObservation) and obs.exit_code == 0
@@ -604,7 +635,7 @@ def complete_runtime(
 
 
 def process_instance(
-    instance: pd.Series,
+    instance: pd.Series | dict,
     metadata: EvalMetadata,
     reset_logger: bool = True,
     runtime_failure_count: int = 0,
@@ -614,9 +645,9 @@ def process_instance(
     # Setup the logger properly, so you can run multi-processing to parallelize the evaluation
     if reset_logger:
         log_dir = os.path.join(metadata.eval_output_dir, 'infer_logs')
-        reset_logger_for_multiprocessing(logger, instance.instance_id, log_dir)
+        reset_logger_for_multiprocessing(logger, instance['instance_id'], log_dir)
     else:
-        logger.info(f'Starting evaluation for instance {instance.instance_id}.')
+        logger.info(f'Starting evaluation for instance {instance['instance_id']}.')
 
     # Increase resource_factor with increasing attempt_id
     if runtime_failure_count > 0:
@@ -625,7 +656,7 @@ def process_instance(
             8,
         )
         logger.warning(
-            f'This is the {runtime_failure_count + 1}th attempt for instance {instance.instance_id}, setting resource factor to {config.sandbox.remote_runtime_resource_factor}'
+            f'This is the {runtime_failure_count + 1}th attempt for instance {instance['instance_id']}, setting resource factor to {config.sandbox.remote_runtime_resource_factor}'
         )
 
     metadata = copy.deepcopy(metadata)
@@ -663,7 +694,7 @@ def process_instance(
         return_val = complete_runtime(runtime, instance)
         git_patch = return_val['git_patch']
         logger.info(
-            f'Got git diff for instance {instance.instance_id}:\n--------\n{git_patch}\n--------'
+            f'Got git diff for instance {instance['instance_id']}:\n--------\n{git_patch}\n--------'
         )
     finally:
         runtime.close()
@@ -692,9 +723,9 @@ def process_instance(
             '\n\n<image_urls>' + '\n'.join(message_action.image_urls) + '</image_urls>'
         )
     output = EvalOutput(
-        instance_id=instance.instance_id,
+        instance_id=instance['instance_id'],
         instruction=instruction,
-        instance=instance.to_dict(),  # SWE Bench specific
+        instance=instance,  # SWE Bench specific
         test_result=test_result,
         metadata=metadata,
         history=histories,

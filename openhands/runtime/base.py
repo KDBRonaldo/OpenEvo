@@ -55,7 +55,7 @@ from openhands.microagent import (
     load_microagents_from_dir,
 )
 from openhands.runtime.plugins import (
-    JupyterRequirement,
+    DirectJupyterRequirement,
     PluginRequirement,
     VSCodeRequirement,
 )
@@ -208,7 +208,7 @@ class Runtime(FileEditRuntimeMixin):
         env_vars = {key.upper(): value for key, value in env_vars.items()}
 
         # Add env vars to the IPython shell (if Jupyter is used)
-        if any(isinstance(plugin, JupyterRequirement) for plugin in self.plugins):
+        if any(isinstance(plugin, DirectJupyterRequirement) for plugin in self.plugins):
             code = 'import os\n'
             for key, value in env_vars.items():
                 # Note: json.dumps gives us nice escaping for free

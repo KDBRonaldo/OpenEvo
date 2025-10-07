@@ -14,10 +14,15 @@ from openhands.runtime.base import Runtime
 from openhands.runtime.impl.cli.cli_runtime import CLIRuntime
 from openhands.runtime.impl.daytona.daytona_runtime import DaytonaRuntime
 from openhands.runtime.impl.docker.docker_runtime import DockerRuntime
+from openhands.runtime.impl.enroot.enroot_runtime import EnrootRuntime
 from openhands.runtime.impl.local.local_runtime import LocalRuntime
 from openhands.runtime.impl.remote.remote_runtime import RemoteRuntime
 from openhands.runtime.impl.runloop.runloop_runtime import RunloopRuntime
-from openhands.runtime.plugins import AgentSkillsRequirement, JupyterRequirement
+from openhands.runtime.impl.singularity.singularity_runtime import SingularityRuntime
+from openhands.runtime.plugins import (
+    AgentSkillsRequirement,
+    DirectJupyterRequirement,
+)
 from openhands.storage import get_file_store
 from openhands.utils.async_utils import call_async_from_sync
 
@@ -136,6 +141,10 @@ def get_runtime_classes() -> list[type[Runtime]]:
         return [DaytonaRuntime]
     elif runtime.lower() == 'cli':
         return [CLIRuntime]
+    elif runtime.lower() == 'enroot':
+        return [EnrootRuntime]
+    elif runtime.lower() == 'singularity':
+        return [SingularityRuntime]
     else:
         raise ValueError(f'Invalid runtime: {runtime}')
 
@@ -223,7 +232,7 @@ def _load_runtime(
 
     # AgentSkills need to be initialized **before** Jupyter
     # otherwise Jupyter will not access the proper dependencies installed by AgentSkills
-    plugins = [AgentSkillsRequirement(), JupyterRequirement()]
+    plugins = [AgentSkillsRequirement(), DirectJupyterRequirement()]
 
     config = load_openhands_config()
     config.run_as_openhands = run_as_openhands

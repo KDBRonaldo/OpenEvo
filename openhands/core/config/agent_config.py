@@ -43,6 +43,13 @@ class AgentConfig(BaseModel):
     )
     extended: ExtendedConfig = Field(default_factory=lambda: ExtendedConfig({}))
     """Extended configuration for the agent."""
+    ensure_thinking_end_properly: bool = Field(default=False)
+    """If true agent will raise and error if the thinking content is not properly ended. This should only be used for training (non token level generation)."""
+    strict_loop_detector: bool = Field(default=False)
+    """If true agent will raise and error using StrictStuckDetector. This should be true for training."""
+    action_timeout: float | None = Field(default=None)
+    """The timeout for an action in seconds. If None, the action will not timeout and default to 300 seconds."""
+    system_prompt_template: str | None = Field(default=None)
 
     model_config = {'extra': 'forbid'}
 

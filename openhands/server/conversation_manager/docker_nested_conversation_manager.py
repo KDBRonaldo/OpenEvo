@@ -347,8 +347,8 @@ class DockerNestedConversationManager(ConversationManager):
         return nested_url
 
     def _get_session_api_key_for_conversation(self, conversation_id: str):
-        jwt_secret = self.config.jwt_secret.get_secret_value()  # type:ignore
-        conversation_key = f'{jwt_secret}:{conversation_id}'.encode()
+        session_secret = self.config.session_secret.get_secret_value()  # type:ignore
+        conversation_key = f'{session_secret}:{conversation_id}'.encode()
         session_api_key = (
             urlsafe_b64encode(hashlib.sha256(conversation_key).digest())
             .decode()

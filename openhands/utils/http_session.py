@@ -18,6 +18,14 @@ class HttpSession:
 
     _is_closed: bool = False
     headers: MutableMapping[str, str] = field(default_factory=dict)
+    _client: httpx.Client = field(default_factory=lambda: CLIENT)
+
+    @classmethod
+    def create_uds_session(cls, socket_path: str) -> 'HttpSession':
+        """Create a new HttpSession with UDS transport."""
+        transport = httpx.HTTPTransport(uds=socket_path)
+        client = httpx.Client(transport=transport)
+        return cls(_client=client)
 
     def request(self, *args, **kwargs):
         if self._is_closed:
@@ -28,7 +36,7 @@ class HttpSession:
         headers = kwargs.get('headers') or {}
         headers = {**self.headers, **headers}
         kwargs['headers'] = headers
-        return CLIENT.request(*args, **kwargs)
+        return self._client.request(*args, **kwargs)
 
     def stream(self, *args, **kwargs):
         if self._is_closed:
@@ -39,7 +47,7 @@ class HttpSession:
         headers = kwargs.get('headers') or {}
         headers = {**self.headers, **headers}
         kwargs['headers'] = headers
-        return CLIENT.stream(*args, **kwargs)
+        return self._client.stream(*args, **kwargs)
 
     def get(self, *args, **kwargs):
         return self.request('GET', *args, **kwargs)

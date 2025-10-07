@@ -84,8 +84,8 @@
 # Name of the default agent
 #default_agent = "CodeActAgent"
 
-# JWT secret for authentication
-#jwt_secret = ""
+# Session secret for authentication
+#session_secret = ""
 
 # Restrict file types for file uploads
 #file_uploads_restrict_file_types = false
@@ -329,6 +329,19 @@ classpath = "my_package.my_module.MyCustomAgent"
 # e.g. '/my/host/dir:/workspace:rw'
 # Multiple mounts can be specified using commas
 # e.g. '/path1:/workspace/path1,/path2:/workspace/path2:ro'
+
+# Run container with fakeroot privileges
+# When true, processes inside the container will appear to run as root (UID 0) without requiring
+# actual root privileges on the host system. This is particularly useful for:
+# - Singularity/Apptainer containers where you need simulated root access
+# - Package installations that require root privileges
+# - Security isolation while maintaining compatibility with root-expecting applications
+# Note: This is typically not needed when running on SLURM clusters
+#run_as_fakeroot = false
+
+# Isolate network for container runtimes (e.g., Singularity)
+# When true, the container will be run without network access for better security isolation
+#isolate_network = false
 
 # Configure volumes under the [sandbox] section:
 # [sandbox]

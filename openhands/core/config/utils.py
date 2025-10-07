@@ -34,7 +34,7 @@ from openhands.storage import get_file_store
 from openhands.storage.files import FileStore
 from openhands.utils.import_utils import get_impl
 
-JWT_SECRET = '.jwt_secret'
+SESSION_SECRET = '.session_secret'
 load_dotenv()
 
 
@@ -292,13 +292,13 @@ def load_from_toml(cfg: OpenHandsConfig, toml_file: str = 'config.toml') -> None
             logger.openhands_logger.warning(f'Unknown section [{key}] in {toml_file}')
 
 
-def get_or_create_jwt_secret(file_store: FileStore) -> str:
+def get_or_create_session_secret(file_store: FileStore) -> str:
     try:
-        jwt_secret = file_store.read(JWT_SECRET)
-        return jwt_secret
+        session_secret = file_store.read(SESSION_SECRET)
+        return session_secret
     except FileNotFoundError:
         new_secret = uuid4().hex
-        file_store.write(JWT_SECRET, new_secret)
+        file_store.write(SESSION_SECRET, new_secret)
         return new_secret
 
 
@@ -377,9 +377,9 @@ def finalize_config(cfg: OpenHandsConfig) -> None:
     if cfg.cache_dir:
         pathlib.Path(cfg.cache_dir).mkdir(parents=True, exist_ok=True)
 
-    if not cfg.jwt_secret:
-        cfg.jwt_secret = SecretStr(
-            get_or_create_jwt_secret(
+    if not cfg.session_secret:
+        cfg.session_secret = SecretStr(
+            get_or_create_session_secret(
                 get_file_store(cfg.file_store, cfg.file_store_path)
             )
         )

@@ -38,7 +38,12 @@ def create_app() -> FastAPI:
         """
         # Security check: Only allow requests from localhost
         client_host = request.client.host if request.client else None
-        if client_host not in ['127.0.0.1', 'localhost', '::1']:
+        # all loopback IPs are allowed
+        if (
+            client_host is not None
+            and client_host not in ['localhost', '::1']
+            and not client_host.startswith('127.')
+        ):
             return HTMLResponse(
                 content='<h1>Access Denied</h1><p>This endpoint is only accessible from localhost</p>',
                 status_code=403,
@@ -83,9 +88,12 @@ def start_file_viewer_server(port: int) -> tuple[str, threading.Thread]:
     Returns:
         Tuple[str, threading.Thread]: The server URL and the thread object.
     """
-
+    loopback_ip = os.environ.get('LOOPBACK_IP')
+    if loopback_ip:
+        server_url = f'http://{loopback_ip}:{port}'
+    else:
+        raise RuntimeError('LOOPBACK_IP environment variable is not set')
     # Save the server URL to a file
-    server_url = f'http://localhost:{port}'
     port_path = '/tmp/oh-server-url'
     os.makedirs(os.path.dirname(port_path), exist_ok=True)
     with open(port_path, 'w') as f:
@@ -95,7 +103,7 @@ def start_file_viewer_server(port: int) -> tuple[str, threading.Thread]:
     logger.info(f'Starting file viewer server on port {port}')
 
     app = create_app()
-    config = Config(app=app, host='127.0.0.1', port=port, log_level='error')
+    config = Config(app=app, host=loopback_ip, port=port, log_level='error')
     server = Server(config=config)
 
     # Run the server in a new thread

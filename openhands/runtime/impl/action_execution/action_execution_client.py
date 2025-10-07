@@ -52,7 +52,12 @@ from openhands.utils.tenacity_stop import stop_if_should_exit
 
 def _is_retryable_error(exception):
     return isinstance(
-        exception, (httpx.RemoteProtocolError, httpcore.RemoteProtocolError)
+        exception,
+        (
+            httpx.RemoteProtocolError,
+            httpcore.RemoteProtocolError,
+            httpx.ConnectError,  # UDS not ready yet
+        ),
     )
 
 
@@ -76,7 +81,9 @@ class ActionExecutionClient(Runtime):
         user_id: str | None = None,
         git_provider_tokens: PROVIDER_TOKEN_TYPE | None = None,
     ):
-        self.session = HttpSession()
+        # Create UDS session instead of regular HTTP session
+        socket_path = self._get_uds_socket_path(sid)
+        self.session = HttpSession.create_uds_session(socket_path)
         self.action_semaphore = threading.Semaphore(1)  # Ensure one action at a time
         self._runtime_closed: bool = False
         self._vscode_token: str | None = None  # initial dummy value
@@ -94,9 +101,14 @@ class ActionExecutionClient(Runtime):
             git_provider_tokens,
         )
 
+    def _get_uds_socket_path(self, sid: str) -> str:
+        """Get the UDS socket path for the given session ID."""
+        return f'/tmp/runtime/{sid}.sock'
+
     @property
     def action_execution_server_url(self) -> str:
-        raise NotImplementedError('Action execution server URL is not implemented')
+        # Return a dummy HTTP URL for request routing - UDS transport handles the actual connection
+        return 'http://uds-server'
 
     @retry(
         retry=retry_if_exception(_is_retryable_error),
@@ -406,7 +418,7 @@ class ActionExecutionClient(Runtime):
                 'POST',
                 f'{self.action_execution_server_url}/update_mcp_server',
                 json=stdio_tools,
-                timeout=10,
+                timeout=100,
             )
             result = response.json()
             if response.status_code != 200:
@@ -432,13 +444,18 @@ class ActionExecutionClient(Runtime):
             self.log('debug', 'No new stdio servers to update')
 
         if len(self._last_updated_mcp_stdio_servers) > 0:
-            # We should always include the runtime as an MCP server whenever there's > 0 stdio servers
-            updated_mcp_config.sse_servers.append(
+            # Add the runtime as an SSE server using the dedicated MCP HTTP endpoint
+            mcp_sse_url = f"{self.action_execution_server_url}/sse"
+
+            # Prioritize the runtime SSE server first to reduce connection issues with external servers
+            updated_mcp_config.sse_servers.insert(
+                0,
                 MCPSSEServerConfig(
-                    url=self.action_execution_server_url.rstrip('/') + '/sse',
+                    url=mcp_sse_url,
                     api_key=self.session_api_key,
                 )
             )
+            self.log('debug', f'Added runtime MCP SSE server at {mcp_sse_url}')
 
         return updated_mcp_config
 
@@ -453,8 +470,7 @@ class ActionExecutionClient(Runtime):
             return ErrorObservation('MCP functionality is not available on Windows')
 
         # Import here to avoid circular imports
-        from openhands.mcp.utils import call_tool_mcp as call_tool_mcp_handler
-        from openhands.mcp.utils import create_mcp_clients
+        from openhands.mcp.utils import execute_mcp_action_from_config
 
         # Get the updated MCP config
         updated_mcp_config = self.get_mcp_config()
@@ -463,18 +479,8 @@ class ActionExecutionClient(Runtime):
             f'Creating MCP clients with servers: {updated_mcp_config.sse_servers}',
         )
 
-        # Create clients for this specific operation
-        mcp_clients = await create_mcp_clients(updated_mcp_config.sse_servers, updated_mcp_config.shttp_servers, self.sid)
-
-        # Call the tool and return the result
-        # No need for try/finally since disconnect() is now just resetting state
-        result = await call_tool_mcp_handler(mcp_clients, action)
-
-        # Reset client state (no active connections to worry about)
-        for client in mcp_clients:
-            await client.disconnect()
-
-        return result
+        # Execute action by connecting to servers sequentially and short-circuiting.
+        return await execute_mcp_action_from_config(updated_mcp_config, action, self.sid)
 
     def close(self) -> None:
         # Make sure we don't close the session multiple times

@@ -18,7 +18,8 @@ class MCPClient(BaseModel):
     """
 
     session: Optional[ClientSession] = None
-    exit_stack: AsyncExitStack = AsyncExitStack()
+    # Use a per-instance AsyncExitStack to avoid cross-task cancellation issues
+    exit_stack: AsyncExitStack = Field(default_factory=AsyncExitStack)
     description: str = 'MCP client tools for server interaction'
     tools: list[MCPClientTool] = Field(default_factory=list)
     tool_map: dict[str, MCPClientTool] = Field(default_factory=dict)
@@ -31,7 +32,7 @@ class MCPClient(BaseModel):
         server_url: str,
         api_key: str | None = None,
         conversation_id: str | None = None,
-        timeout: float = 30.0,
+        timeout: float = 90.0,
     ) -> None:
         """Connect to an MCP server using SSE transport.
 
@@ -43,6 +44,8 @@ class MCPClient(BaseModel):
             raise ValueError('Server URL is required.')
         if self.session:
             await self.disconnect()
+        # Always start with a fresh exit stack for a new connection
+        self.exit_stack = AsyncExitStack()
 
         try:
             # Use asyncio.wait_for to enforce the timeout
@@ -78,8 +81,11 @@ class MCPClient(BaseModel):
                 )
                 await self._initialize_and_list_tools()
 
-            # Apply timeout to the entire connection process
-            await asyncio.wait_for(connect_with_timeout(), timeout=timeout)
+            # Apply timeout to the entire connection process, shielding against
+            # cancellation leaks from underlying libraries
+            await asyncio.wait_for(
+                asyncio.shield(connect_with_timeout()), timeout=timeout
+            )
         except asyncio.TimeoutError:
             logger.error(
                 f'Connection to {server_url} timed out after {timeout} seconds'
@@ -145,6 +151,8 @@ class MCPClient(BaseModel):
             raise ValueError('Server URL is required.')
         if self.session:
             await self.disconnect()
+        # Always start with a fresh exit stack for a new connection
+        self.exit_stack = AsyncExitStack()
 
         try:
             # Use asyncio.wait_for to enforce the timeout
@@ -184,8 +192,11 @@ class MCPClient(BaseModel):
                 )
                 await self._initialize_and_list_tools()
 
-            # Apply timeout to the entire connection process
-            await asyncio.wait_for(connect_with_timeout(), timeout=timeout)
+            # Apply timeout to the entire connection process, shielding against
+            # cancellation leaks from underlying libraries
+            await asyncio.wait_for(
+                asyncio.shield(connect_with_timeout()), timeout=timeout
+            )
         except asyncio.TimeoutError:
             logger.error(
                 f'Connection to {server_url} timed out after {timeout} seconds'
@@ -199,16 +210,34 @@ class MCPClient(BaseModel):
 
     async def disconnect(self) -> None:
         """Disconnect from the MCP server and clean up resources."""
-        if self.session:
+        try:
+            # Always rely on the exit stack to unwind resources in LIFO order
+            # (ClientSession followed by transport context). Avoid closing the
+            # session directly to prevent double-close or cancel-scope issues.
+            await asyncio.shield(self.exit_stack.aclose())
+        except RuntimeError as e:
+            # Special handling for anyio task context mismatch errors
+            if "cancel scope in a different task" in str(e):
+                logger.debug(f'Ignoring anyio task context mismatch: {str(e)}')
+            else:
+                logger.error(f'RuntimeError during disconnect: {str(e)}')
+        except Exception as e:
+            # Swallow disconnect-time errors; we are tearing down anyway.
+            logger.error(f'Error during disconnect: {str(e)}')
+        finally:
+            # If exit/teardown triggered task cancellation (e.g., via anyio cancel scopes),
+            # clear it so subsequent awaits in this task are not cancelled.
             try:
-                # Close the session first
-                if hasattr(self.session, 'close'):
-                    await self.session.close()
-                # Then close the exit stack
-                await self.exit_stack.aclose()
-            except Exception as e:
-                logger.error(f'Error during disconnect: {str(e)}')
-            finally:
-                self.session = None
-                self.tools = []
-                logger.info('Disconnected from MCP server')
+                task = asyncio.current_task()
+                if task is not None:
+                    while task.cancelling():
+                        task.uncancel()
+            except Exception:
+                # Best-effort; ignore if environment/runtime doesn't support uncancel
+                pass
+            self.session = None
+            self.tools = []
+            self.tool_map = {}
+            # Reinitialize a fresh exit stack for future connections
+            self.exit_stack = AsyncExitStack()
+            logger.info('Disconnected from MCP server')

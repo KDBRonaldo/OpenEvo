@@ -100,7 +100,7 @@ def test_sensitive_env_vars_masking(test_handler):
         'AWS_SECRET_ACCESS_KEY': 'AWS_SECRET_ACCESS_KEY_VALUE',
         'E2B_API_KEY': 'E2B_API_KEY_VALUE',
         'GITHUB_TOKEN': 'GITHUB_TOKEN_VALUE',
-        'JWT_SECRET': 'JWT_SECRET_VALUE',
+        'SESSION_SECRET': 'SESSION_SECRET_VALUE',
     }
 
     with patch.dict('openhands.core.logger.os.environ', environ, clear=True):

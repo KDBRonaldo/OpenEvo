@@ -9,7 +9,6 @@ import argparse
 import asyncio
 import base64
 import json
-import logging
 import mimetypes
 import os
 import shutil
@@ -21,21 +20,28 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from zipfile import ZipFile
 
+from anyio import ClosedResourceError, EndOfStream
 from binaryornot.check import is_binary
 from fastapi import Depends, FastAPI, HTTPException, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.security import APIKeyHeader
 from mcpm import MCPRouter, RouterConfig
+from mcpm.router.router import RouterSseTransport
 from mcpm.router.router import logger as mcp_router_logger
 from openhands_aci.editor.editor import OHEditor
 from openhands_aci.editor.exceptions import ToolError
 from openhands_aci.editor.results import ToolResult
 from openhands_aci.utils.diff import get_diff
 from pydantic import BaseModel
+from starlette.applications import Starlette
 from starlette.background import BackgroundTask
 from starlette.exceptions import HTTPException as StarletteHTTPException
-from uvicorn import run
+from starlette.middleware import Middleware
+from starlette.middleware.cors import CORSMiddleware
+from starlette.routing import Mount
+from uvicorn.config import Config
+from uvicorn.server import Server
 
 from openhands.core.exceptions import BrowserUnavailableException
 from openhands.core.logger import openhands_logger as logger
@@ -63,10 +69,15 @@ from openhands.events.serialization import event_from_dict, event_to_dict
 from openhands.runtime.browser import browse
 from openhands.runtime.browser.browser_env import BrowserEnv
 from openhands.runtime.file_viewer_server import start_file_viewer_server
-from openhands.runtime.plugins import ALL_PLUGINS, JupyterPlugin, Plugin, VSCodePlugin
-from openhands.runtime.utils import find_available_tcp_port
+from openhands.runtime.plugins import (
+    ALL_PLUGINS,
+    DirectJupyterPlugin,
+    Plugin,
+    VSCodePlugin,
+)
 from openhands.runtime.utils.async_bash import AsyncBashSession
 from openhands.runtime.utils.bash import BashSession
+from openhands.runtime.utils.efficient_bash import EfficientBashSession
 from openhands.runtime.utils.files import insert_lines, read_lines
 from openhands.runtime.utils.log_capture import capture_logs
 from openhands.runtime.utils.memory_monitor import MemoryMonitor
@@ -187,7 +198,7 @@ class ActionExecutor:
         if _updated_user_id is not None:
             self.user_id = _updated_user_id
 
-        self.bash_session: BashSession | 'WindowsPowershellSession' | None = None  # type: ignore[name-defined]
+        self.bash_session: BashSession | EfficientBashSession | None = None  # type: ignore[name-defined]
         self.lock = asyncio.Lock()
         self.plugins: dict[str, Plugin] = {}
         self.file_editor = OHEditor(workspace_root=self._initial_cwd)
@@ -234,6 +245,7 @@ class ActionExecutor:
 
     async def _ensure_browser_ready(self):
         """Ensure the browser is ready for use."""
+
         if self.browser is None:
             if self.browser_init_task is None:
                 # Start browser initialization if it hasn't been started
@@ -267,7 +279,8 @@ class ActionExecutor:
                 max_memory_mb=self.max_memory_gb * 1024 if self.max_memory_gb else None,
             )
         else:
-            self.bash_session = BashSession(
+            self.bash_session = EfficientBashSession(
+                # self.bash_session = BashSession(
                 work_dir=self._initial_cwd,
                 username=self.username,
                 no_change_timeout_seconds=int(
@@ -278,9 +291,12 @@ class ActionExecutor:
             self.bash_session.initialize()
         logger.debug('Bash session initialized')
 
-        # Start browser initialization in the background
-        self.browser_init_task = asyncio.create_task(self._init_browser_async())
-        logger.debug('Browser initialization started in background')
+        if self.browsergym_eval_env == 'skip':
+            logger.debug('Skipping browser initialization')
+            self.browser_init_task = None
+        else:
+            self.browser_init_task = asyncio.create_task(self._init_browser_async())
+            logger.debug('Browser initialization started in background')
 
         await wait_all(
             (self._init_plugin(plugin) for plugin in self.plugins_to_load),
@@ -292,7 +308,7 @@ class ActionExecutor:
         # TODO: refactor AgentSkills to be part of JupyterPlugin
         # AFTER ServerRuntime is deprecated
         logger.debug('Initializing AgentSkills')
-        if 'agent_skills' in self.plugins and 'jupyter' in self.plugins:
+        if 'agent_skills' in self.plugins and 'direct_jupyter' in self.plugins:
             obs = await self.run_ipython(
                 IPythonRunCellAction(
                     code='from openhands.runtime.plugins.agent_skills.agentskills import *\n'
@@ -316,7 +332,7 @@ class ActionExecutor:
         self.plugins[plugin.name] = plugin
         logger.debug(f'Initializing plugin: {plugin.name}')
 
-        if isinstance(plugin, JupyterPlugin):
+        if isinstance(plugin, DirectJupyterPlugin):
             # Escape backslashes in Windows path
             cwd = self.bash_session.cwd.replace('\\', '/')
             await self.run_ipython(
@@ -399,7 +415,10 @@ class ActionExecutor:
                 return obs
 
             assert self.bash_session is not None
-            obs = await call_sync_from_async(self.bash_session.execute, action)
+            if isinstance(self.bash_session, EfficientBashSession):
+                obs = await self.bash_session.execute(action)  # type: ignore
+            else:
+                obs = await call_sync_from_async(self.bash_session.execute, action)
             return obs
         except Exception as e:
             logger.error(f'Error running command: {e}')
@@ -407,8 +426,8 @@ class ActionExecutor:
 
     async def run_ipython(self, action: IPythonRunCellAction) -> Observation:
         assert self.bash_session is not None
-        if 'jupyter' in self.plugins:
-            _jupyter_plugin: JupyterPlugin = self.plugins['jupyter']  # type: ignore
+        if 'direct_jupyter' in self.plugins:
+            _jupyter_plugin: DirectJupyterPlugin = self.plugins['direct_jupyter']  # type: ignore
             # This is used to make AgentSkills in Jupyter aware of the
             # current working directory in Bash
             jupyter_cwd = getattr(self, '_jupyter_cwd', None)
@@ -439,7 +458,7 @@ class ActionExecutor:
             return obs
         else:
             raise RuntimeError(
-                'JupyterRequirement not found. Unable to run IPython action.'
+                'Direct JupyterRequirement not found. Unable to run IPython action.'
             )
 
     def _resolve_path(self, path: str, working_dir: str) -> str:
@@ -598,6 +617,8 @@ class ActionExecutor:
         )
 
     async def browse(self, action: BrowseURLAction) -> Observation:
+        if self.browsergym_eval_env == 'skip':
+            return ErrorObservation('Browser functionality is disabled.')
         if self.browser is None:
             return ErrorObservation(
                 'Browser functionality is not supported on Windows.'
@@ -606,6 +627,8 @@ class ActionExecutor:
         return await browse(action, self.browser, self.initial_cwd)
 
     async def browse_interactive(self, action: BrowseInteractiveAction) -> Observation:
+        if self.browsergym_eval_env == 'skip':
+            return ErrorObservation('Browser functionality is disabled.')
         if self.browser is None:
             return ErrorObservation(
                 'Browser functionality is not supported on Windows.'
@@ -644,9 +667,11 @@ if __name__ == '__main__':
 
     # Start the file viewer server in a separate thread
     logger.info('Starting file viewer server')
-    _file_viewer_port = find_available_tcp_port(
-        min_port=args.port + 1, max_port=min(args.port + 1024, 65535)
-    )
+    _file_viewer_port_env = os.environ.get('FILE_VIEWER_PORT')
+    if _file_viewer_port_env:
+        _file_viewer_port = int(_file_viewer_port_env)
+    else:
+        raise RuntimeError('FILE_VIEWER_PORT environment variable is not set')
     server_url, _ = start_file_viewer_server(port=_file_viewer_port)
     logger.info(f'File viewer server started at {server_url}')
 
@@ -659,13 +684,19 @@ if __name__ == '__main__':
 
     client: ActionExecutor | None = None
     mcp_router: MCPRouter | None = None
-    MCP_ROUTER_PROFILE_PATH = os.path.join(
+    mcp_http_server: Server | None = None
+    # Use a session-scoped MCP router profile file to avoid cross-runtime conflicts
+    DEFAULT_MCP_ROUTER_PROFILE_PATH = os.path.join(
         os.path.dirname(__file__), 'mcp', 'config.json'
+    )
+    SESSION_ID_FOR_MCP = os.environ.get('OPENHANDS_SESSION_ID', 'default')
+    MCP_ROUTER_PROFILE_PATH = os.path.join(
+        '/tmp', f'openhands_mcp_config_{SESSION_ID_FOR_MCP}.json'
     )
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        global client, mcp_router
+        global client, mcp_router, mcp_http_server
         logger.info('Initializing ActionExecutor...')
         client = ActionExecutor(
             plugins_to_load,
@@ -680,12 +711,27 @@ if __name__ == '__main__':
         # Check if we're on Windows
         is_windows = sys.platform == 'win32'
 
-        # Initialize and mount MCP Router (skip on Windows)
+        # Initialize MCP Router and start separate HTTP server (skip on Windows)
         if is_windows:
             logger.info('Skipping MCP Router initialization on Windows')
             mcp_router = None
+            mcp_http_server = None
         else:
             logger.info('Initializing MCP Router...')
+            # Ensure per-session MCP router profile exists; initialize from default if needed
+            if not os.path.exists(MCP_ROUTER_PROFILE_PATH):
+                try:
+                    shutil.copy(
+                        DEFAULT_MCP_ROUTER_PROFILE_PATH, MCP_ROUTER_PROFILE_PATH
+                    )
+                    logger.info(
+                        f'Initialized MCP router profile for session at {MCP_ROUTER_PROFILE_PATH}'
+                    )
+                except Exception as e:
+                    logger.error(
+                        f'Failed to initialize MCP router profile: {e}', exc_info=True
+                    )
+                    raise
             mcp_router = MCPRouter(
                 profile_path=MCP_ROUTER_PROFILE_PATH,
                 router_config=RouterConfig(
@@ -693,41 +739,129 @@ if __name__ == '__main__':
                     auth_enabled=bool(SESSION_API_KEY),
                 ),
             )
+            # Ensure the router is fully initialized so aggregated_server has
+            # the necessary initialization options in older mcpm versions.
+            # Newer mcpm versions may not require or expose initialization_options,
+            # but initialize_router() remains safe and idempotent.
+            await mcp_router.initialize_router()
             allowed_origins = ['*']
-            sse_app = await mcp_router.get_sse_server_app(
-                allow_origins=allowed_origins, include_lifespan=False
+            # Build SSE Starlette app manually to ensure proper ASGI callables
+            api_key = (
+                None
+                if not mcp_router.router_config.auth_enabled
+                else mcp_router.router_config.api_key
             )
+            sse_transport = RouterSseTransport('/messages/', api_key=api_key)
 
-        # Only mount SSE app if MCP Router is initialized (not on Windows)
-        if mcp_router is not None:
-            # Check for route conflicts before mounting
-            main_app_routes = {route.path for route in app.routes}
-            sse_app_routes = {route.path for route in sse_app.routes}
-            conflicting_routes = main_app_routes.intersection(sse_app_routes)
+            async def sse_asgi(scope, receive, send):
+                try:
+                    async with sse_transport.connect_sse(
+                        scope,
+                        receive,
+                        send,
+                    ) as (read_stream, write_stream):
+                        # Wrapper try for generic exceptions only (no except* here)
+                        try:
+                            # Dedicated inner try that only uses except* for disconnection cases
+                            try:
+                                server = mcp_router.aggregated_server
+                                # Backward/forward compatibility across mcpm versions:
+                                # - Older versions require passing initialization_options
+                                # - Newer versions may not expose it and accept (read, write)
+                                try:
+                                    init_opts = server.initialization_options  # type: ignore[attr-defined]
+                                    await server.run(
+                                        read_stream,
+                                        write_stream,
+                                        init_opts,
+                                    )
+                                except AttributeError:
+                                    await server.run(
+                                        read_stream,
+                                        write_stream,
+                                    )
+                            except* (ClosedResourceError, EndOfStream):
+                                # Client disconnected while server was running; benign
+                                logger.debug(
+                                    'SSE server run ended due to disconnect (ClosedResourceError/EndOfStream).'
+                                )
+                        except Exception as e:
+                            # Log unexpected exceptions to aid debugging but prevent crashing the app
+                            logger.error(
+                                f'SSE server encountered an error: {e}', exc_info=True
+                            )
+                except* (ClosedResourceError, EndOfStream):
+                    # Client disconnected; safe to ignore
+                    logger.debug(
+                        'SSE connection closed by client or ended (ClosedResourceError/EndOfStream).'
+                    )
 
-            if conflicting_routes:
-                logger.error(f'Route conflicts detected: {conflicting_routes}')
-                raise RuntimeError(
-                    f'Cannot mount SSE app - conflicting routes found: {conflicting_routes}'
+            middleware = []
+            if allowed_origins is not None:
+                middleware.append(
+                    Middleware(
+                        CORSMiddleware,
+                        allow_origins=allowed_origins,
+                        allow_methods=['*'],
+                        allow_headers=['*'],
+                    )
                 )
 
-            app.mount('/', sse_app)
-            logger.info(
-                f'Mounted MCP Router SSE app at root path with allowed origins: {allowed_origins}'
+            mcp_http_app = Starlette(
+                debug=False,
+                middleware=middleware,
+                routes=[
+                    Mount('/sse', app=sse_asgi),
+                    Mount('/messages/', app=sse_transport.handle_post_message),
+                ],
             )
 
-            # Additional debug logging
-            if logger.isEnabledFor(logging.DEBUG):
-                logger.debug('Main app routes:')
-                for route in main_app_routes:
-                    logger.debug(f'  {route}')
-                logger.debug('MCP SSE server app routes:')
-                for route in sse_app_routes:
-                    logger.debug(f'  {route}')
+            # MCP HTTP server configuration
+            LOOPBACK_IP = os.environ.get('LOOPBACK_IP', '127.0.0.1')
+            MCP_HTTP_PORT = int(os.environ.get('MCP_HTTP_PORT', '8080'))
+
+            # Start MCP HTTP server in background
+            mcp_http_config = Config(
+                app=mcp_http_app,
+                host=LOOPBACK_IP,
+                port=MCP_HTTP_PORT,
+                log_level='error',
+            )
+            mcp_http_server = Server(mcp_http_config)
+
+            # Start the MCP HTTP server in a background task
+            async def start_mcp_http_server():
+                try:
+                    if mcp_http_server is not None:
+                        logger.info('MCP HTTP server task starting...')
+                        await mcp_http_server.serve()
+                except Exception as e:
+                    logger.error(f'MCP HTTP server failed to start: {e}', exc_info=True)
+
+            # Create task but don't await it - let it run in background
+            mcp_http_task = asyncio.create_task(start_mcp_http_server())
+            logger.info(
+                f'Started MCP HTTP server task at http://{LOOPBACK_IP}:{MCP_HTTP_PORT}'
+            )
+
+            # Give the server a moment to start up
+            await asyncio.sleep(0.1)
+            logger.info('Lifespan initialization complete, yielding control...')
 
         yield
 
         # Clean up & release the resources
+        logger.info('Shutting down MCP HTTP server...')
+        mcp_http_task.cancel()
+        if mcp_http_server:
+            try:
+                mcp_http_server.should_exit = True
+                logger.info('MCP HTTP server shutdown successfully.')
+            except Exception as e:
+                logger.error(f'Error shutting down MCP HTTP server: {e}', exc_info=True)
+        else:
+            logger.info('MCP HTTP server instance not found for shutdown.')
+
         logger.info('Shutting down MCP Router...')
         if mcp_router:
             try:
@@ -1080,4 +1214,20 @@ if __name__ == '__main__':
             return JSONResponse(content=[])
 
     logger.debug(f'Starting action execution API on port {args.port}')
-    run(app, host='0.0.0.0', port=args.port)
+
+    # Create UDS socket path using session_id
+    session_id = os.environ.get('OPENHANDS_SESSION_ID', 'default')
+    socket_dir = '/tmp/runtime'
+    os.makedirs(socket_dir, exist_ok=True)
+    socket_path = f'{socket_dir}/{session_id}.sock'
+
+    # Remove existing socket file if it exists
+    if os.path.exists(socket_path):
+        os.unlink(socket_path)
+
+    logger.info(f'Starting action execution API on UDS socket: {socket_path}')
+
+    # Run with UDS socket instead of TCP
+    config = Config(app=app, uds=socket_path, log_level='error')
+    server = Server(config)
+    server.run()
