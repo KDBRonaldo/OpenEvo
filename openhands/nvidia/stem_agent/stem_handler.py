@@ -11,7 +11,7 @@ from openhands.nvidia.utils import (
     final_result as utils_final_result,
 )
 
-from openhands.nvidia.stem_agent.stem_utils import (
+from openhands.nvidia.stem_agent.stem_utils import (  # type: ignore[attr-defined]
     initialize_agents as stem_initialize_agents,
     run_agent as stem_run_agent,
     evaluate_agent as stem_evaluate_agent,

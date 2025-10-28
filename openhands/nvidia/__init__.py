@@ -1,8 +1,8 @@
 from openhands.nvidia.gui_agent.gui_handler import GuiAgentHandler
 from openhands.nvidia.math_coder.math_code_handler import CodeHandler, MathHandler
 from openhands.nvidia.math_coder.prorl_handler import ProRLHandler
-from openhands.nvidia.stem_agent.stem_handler import STEMHandler
 from openhands.nvidia.registry import add_name_mapping, register_agent_handler
+from openhands.nvidia.stem_agent.stem_handler import STEMHandler
 from openhands.nvidia.swe_agent.swe_agent_handler import SweAgentHandler
 
 register_agent_handler(SweAgentHandler())

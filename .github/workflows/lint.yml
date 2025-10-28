@@ -16,27 +16,6 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # Run lint on the frontend code
-  lint-frontend:
-    name: Lint frontend
-    runs-on: blacksmith-4vcpu-ubuntu-2204
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install Node.js 20
-        uses: useblacksmith/setup-node@v5
-        with:
-          node-version: 20
-      - name: Install dependencies
-        run: |
-          cd frontend
-          npm install --frozen-lockfile
-      - name: Lint, TypeScript compilation, and translation checks
-        run: |
-          cd frontend
-          npm run lint
-          npm run make-i18n && tsc
-          npm run check-translation-completeness
-
   # Run lint on the python code
   lint-python:
     name: Lint python

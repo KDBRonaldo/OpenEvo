@@ -217,7 +217,7 @@ class MCPClient(BaseModel):
             await asyncio.shield(self.exit_stack.aclose())
         except RuntimeError as e:
             # Special handling for anyio task context mismatch errors
-            if "cancel scope in a different task" in str(e):
+            if 'cancel scope in a different task' in str(e):
                 logger.debug(f'Ignoring anyio task context mismatch: {str(e)}')
             else:
                 logger.error(f'RuntimeError during disconnect: {str(e)}')

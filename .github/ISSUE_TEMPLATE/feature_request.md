@@ -1,6 +1,6 @@
 ---
 name: Feature Request or Enhancement
-about: Suggest an idea for an OpenHands feature or enhancement
+about: Suggest an idea for an ProRL-Agent-Server feature or enhancement
 title: ''
 labels: 'enhancement'
 assignees: ''

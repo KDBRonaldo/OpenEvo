@@ -1,18 +1,18 @@
-import asyncio
 import argparse
+import asyncio
 
 import numpy as np
 import pandas as pd
 
 from openhands.core.config.llm_config import LLMConfig
 from openhands.core.logger import openhands_logger as logger
+from openhands.nvidia.registry import JobDetails
+from openhands.nvidia.reward import Reward
 from openhands.nvidia.stem_agent.stem_utils import (
     evaluate_agent,
     initialize_agents,
     run_agent,
 )
-from openhands.nvidia.registry import JobDetails
-from openhands.nvidia.reward import Reward
 from openhands.nvidia.timer import PausableTimer
 
 
@@ -34,7 +34,8 @@ async def run(instance):
 
     # test reward server
     test_reward = await reward.get_reward(
-        instance, '<think> fake thought </think> something something \\boxed{D} \n\n something else'
+        instance,
+        '<think> fake thought </think> something something \\boxed{D} \n\n something else',
     )
     logger.info(f'Test reward: {test_reward}')
 

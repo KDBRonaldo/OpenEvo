@@ -2,19 +2,17 @@
 import argparse
 import json
 import os
-import sys
 from pathlib import Path
-import hashlib
 
+from openhands.nvidia.async_server import OpenHandsServer
 from openhands.nvidia.logger import nvidia_logger as logger
 from openhands.nvidia.utils import get_instance_id
-from openhands.nvidia.async_server import OpenHandsServer
 
-SINGULARITY_IMAGE_PATH = "/lustre/fsw/portfolios/llmservice/users/shaokunz/project/OpenHands_internal/singularity_images_oh/oh_v0.40.0_8me96m20iqt6tw9p_t5sffwjb6stny0ze.sif"
+SINGULARITY_IMAGE_PATH = '/lustre/fsw/portfolios/llmservice/users/shaokunz/project/OpenHands_internal/singularity_images_oh/oh_v0.40.0_8me96m20iqt6tw9p_t5sffwjb6stny0ze.sif'
 
 DEFAULT_SAMPLING_PARAMS = {
     'model': 'openai/gpt-4.1-mini',
-    'api_key': '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',
+    'api_key': '',
     'modify_params': False,
     'log_completions': False,
     'native_tool_calling': True,
@@ -22,6 +20,7 @@ DEFAULT_SAMPLING_PARAMS = {
     # 'top_p': 0.9,
     'max_iterations': 5,
 }
+
 
 def build_mock_gui_instances(num: int = 3) -> list[dict]:
     """Create a few simple GUI tasks for demo purposes."""
@@ -36,10 +35,12 @@ def build_mock_gui_instances(num: int = 3) -> list[dict]:
     instances: list[dict] = []
     for i, t in enumerate(tasks[:num]):
         s = dict(t)
-        s['instance_id'] = get_instance_id({
-            'data_source': s['data_source'],
-            'extra_info': {'split': 'mock', 'index': i, 'name': 'gui_demo'},
-        })
+        s['instance_id'] = get_instance_id(
+            {
+                'data_source': s['data_source'],
+                'extra_info': {'split': 'mock', 'index': i, 'name': 'gui_demo'},
+            }
+        )
         instances.append(s)
     return instances
 
@@ -85,19 +86,28 @@ def evaluate(args):
 
 
 def parse_args():
-    p = argparse.ArgumentParser('Simple GUI tasks with OpenHands server (sequential, in-process)')
+    p = argparse.ArgumentParser(
+        'Simple GUI tasks with OpenHands server (sequential, in-process)'
+    )
     p.add_argument('--output', default='eval_results_gui.jsonl')
     p.add_argument('--llm-addresses', nargs='+', default=['https://api.openai.com/v1'])
     p.add_argument('--num-instances', type=int, default=1)
-    p.add_argument('--sampling-params', default='', help='JSON string to merge into default sampling params')
+    p.add_argument(
+        '--sampling-params',
+        default='',
+        help='JSON string to merge into default sampling params',
+    )
     return p.parse_args()
+
 
 if __name__ == '__main__':
     args = parse_args()
     logger.info(f'Args: {args}')
 
     # Optional: set container runtime env if using Singularity runtime
-    os.environ['OH_RUNTIME_SINGULARITY_IMAGE_REPO'] = str(Path(SINGULARITY_IMAGE_PATH).parent)
+    os.environ['OH_RUNTIME_SINGULARITY_IMAGE_REPO'] = str(
+        Path(SINGULARITY_IMAGE_PATH).parent
+    )
     os.environ['SANDBOX_RUNTIME_CONTAINER_IMAGE'] = SINGULARITY_IMAGE_PATH
 
     evaluate(args)

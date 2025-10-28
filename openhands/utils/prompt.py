@@ -59,7 +59,7 @@ class PromptManager:
         if system_prompt_template is None:
             self.system_template: Template = self._load_template('system_prompt')
         else:
-            self.system_template: Template = self._load_template(system_prompt_template)
+            self.system_template = self._load_template(system_prompt_template)
         self.user_template: Template = self._load_template('user_prompt')
         self.additional_info_template: Template = self._load_template('additional_info')
         self.microagent_info_template: Template = self._load_template('microagent_info')

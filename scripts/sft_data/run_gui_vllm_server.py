@@ -23,6 +23,7 @@ DEFAULT_SAMPLING_PARAMS = {
     'max_iterations': 5,
 }
 
+
 def build_mock_gui_instances(num: int = 3) -> list[dict]:
     """Create a few simple GUI tasks for demo purposes."""
     tasks = [

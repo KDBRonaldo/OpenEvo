@@ -5,49 +5,6 @@ on:
     types: [labeled]
 
 jobs:
-  # Frontend lint fixes
-  lint-fix-frontend:
-    if: github.event.label.name == 'lint-fix'
-    name: Fix frontend linting issues
-    runs-on: blacksmith-4vcpu-ubuntu-2204
-    permissions:
-      contents: write
-      pull-requests: write
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.head_ref }}
-          repository: ${{ github.event.pull_request.head.repo.full_name }}
-          fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Install Node.js 20
-        uses: useblacksmith/setup-node@v5
-        with:
-          node-version: 20
-      - name: Install frontend dependencies
-        run: |
-          cd frontend
-          npm install --frozen-lockfile
-      - name: Fix frontend lint issues
-        run: |
-          cd frontend
-          npm run lint:fix
-
-      # Commit and push changes if any
-      - name: Check for changes
-        id: git-check
-        run: |
-          git diff --quiet || echo "changes=true" >> $GITHUB_OUTPUT
-      - name: Commit and push if there are changes
-        if: steps.git-check.outputs.changes == 'true'
-        run: |
-          git config --local user.email "openhands@all-hands.dev"
-          git config --local user.name "OpenHands Bot"
-          git add -A
-          git commit -m "🤖 Auto-fix frontend linting issues"
-          git push
-
   # Python lint fixes
   lint-fix-python:
     if: github.event.label.name == 'lint-fix'

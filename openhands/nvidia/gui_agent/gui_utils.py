@@ -390,6 +390,7 @@ def get_config(
     sandbox_config = get_default_sandbox_config_for_eval()
     # Ensure general-purpose browsing (no fixed benchmark env)
     sandbox_config.browsergym_eval_env = None
+    sandbox_config.runtime_container_image = os.environ.get('SANDBOX_RUNTIME_CONTAINER_IMAGE', None)
     # Browsing often benefits from host networking for external access
     # Keep the default as-is; caller environment may override via env vars
 

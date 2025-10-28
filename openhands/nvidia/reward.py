@@ -1,27 +1,28 @@
+import asyncio
 import heapq
 import json
-import threading
-
-import aiohttp
-import asyncio
-from openai import AsyncOpenAI
-from openhands.nvidia.logger import nvidia_logger as logger
-from . import llm_judge
 import os
 import random
+import threading
+from typing import cast
+
+import aiohttp
+from openai import AsyncOpenAI
+
+from openhands.nvidia.logger import nvidia_logger as logger
+
+from . import llm_judge
+
 # Client pool for LLM judge to avoid repeated client creation
 _client_pool = {}
 _client_pool_lock = asyncio.Lock()
 
-async def _get_client_from_pool(base_url, api_key):
 
+async def _get_client_from_pool(base_url, api_key):
     """Get or create a client from the pool based on base_url and api_key."""
     async with _client_pool_lock:
         if base_url not in _client_pool:
-            _client_pool[base_url] = AsyncOpenAI(
-                base_url=base_url,
-                api_key=api_key
-            )
+            _client_pool[base_url] = AsyncOpenAI(base_url=base_url, api_key=api_key)
         return _client_pool[base_url]
 
 
@@ -51,39 +52,50 @@ class Reward:
             raise ValueError(
                 f'Invalid reward_model type: {type(instance["reward_model"])}'
             )
-        extra_info = instance.get('extra_info', None)
+        instance.get('extra_info', None)
 
         if data_source == 'stem':
             try:
-                if isinstance(instance["prompt"], list):
-                    question = instance["prompt"][0]["content"]
-                elif isinstance(instance["prompt"], str):
-                    question = json.loads(instance["prompt"])[0]["content"]
+                if isinstance(instance['prompt'], list):
+                    question = instance['prompt'][0]['content']
+                elif isinstance(instance['prompt'], str):
+                    question = json.loads(instance['prompt'])[0]['content']
                 else:
                     raise ValueError(f'Invalid prompt type: {type(instance["prompt"])}')
-                metadata = {
-                    "reference_answer": ground_truth,
-                    "extract_box": True
-                }
+                metadata = {'reference_answer': ground_truth, 'extract_box': True}
 
                 # Get base_url from environment variable, support list format
-                base_url_env = os.getenv("OPENAI_BASE_URL", "https://integrate.api.nvidia.com/v1")
+                base_url_env = os.getenv(
+                    'OPENAI_BASE_URL', 'https://integrate.api.nvidia.com/v1'
+                )
                 # Parse as comma-separated list and randomly select one
-                base_url_list = [url.strip() for url in base_url_env.split(',') if url.strip()]
-                base_url = random.choice(base_url_list) if len(base_url_list) > 1 else base_url_list[0]
+                base_url_list = [
+                    url.strip() for url in base_url_env.split(',') if url.strip()
+                ]
+                base_url = (
+                    random.choice(base_url_list)
+                    if len(base_url_list) > 1
+                    else base_url_list[0]
+                )
 
                 sampling_params = {
-                    "model": os.getenv("OPENAI_MODEL", "meta/llama-3.3-70b-instruct"),
-                    "temperature": float(os.getenv("OPENAI_TEMPERATURE", "0.0")),
-                    "top_p": float(os.getenv("OPENAI_TOP_P", "0.7")),
-                    "top_k": int(os.getenv("OPENAI_TOP_K", "-1")),
-                    "max_tokens": int(os.getenv("OPENAI_MAX_TOKENS", "1024")),
-                    "max_model_len": int(os.getenv("OPENAI_MAX_MODEL_LEN", "8192"))
+                    'model': os.getenv('OPENAI_MODEL', 'meta/llama-3.3-70b-instruct'),
+                    'temperature': float(os.getenv('OPENAI_TEMPERATURE', '0.0')),
+                    'top_p': float(os.getenv('OPENAI_TOP_P', '0.7')),
+                    'top_k': int(os.getenv('OPENAI_TOP_K', '-1')),
+                    'max_tokens': int(os.getenv('OPENAI_MAX_TOKENS', '1024')),
+                    'max_model_len': int(os.getenv('OPENAI_MAX_MODEL_LEN', '8192')),
                 }
-                client = await _get_client_from_pool(base_url, os.getenv("OPENAI_API_KEY", ""))
-                res = await llm_judge.compute_score(question, solution_str, metadata, sampling_params, client)
-                logger.debug(f'data_source: {data_source}, ground_truth: {ground_truth}, solution_str: {solution_str}, res: {res}')
-                
+                client = await _get_client_from_pool(
+                    base_url, os.getenv('OPENAI_API_KEY', '')
+                )
+                res = await llm_judge.compute_score(
+                    question, solution_str, metadata, sampling_params, client
+                )
+                logger.debug(
+                    f'data_source: {data_source}, ground_truth: {ground_truth}, solution_str: {solution_str}, res: {res}'
+                )
+
             except Exception as e:
                 logger.error(f'Error: {e}')
                 logger.info(
@@ -102,20 +114,26 @@ class Reward:
 
             if data_source == 'reasoning_gym':
                 try:
+                    entry = None
+                    task = None
+                    reward_model_value = instance['reward_model']
+                    rm_dict = cast(dict, reward_model_value)
+                    entry = rm_dict['entry']
+                    task = rm_dict['reasoning_task']
                     async with session.post(
                         f'http://{ip}:8288/score',
                         json={
                             'answer': solution_str,
-                            'entry': extra_info['reward_model']['entry'],
-                            'task': extra_info['reward_model']['reasoning_task'],
+                            'entry': entry,
+                            'task': task,
                         },
-                    ) as res:
-                        res = await res.json()
-                        res = res['score']
+                    ) as response:
+                        result = await response.json()
+                        res = result['score']
                 except Exception as e:
                     logger.error(f'Error: {e}, ip: {ip}')
                     logger.info(
-                        f'answer: {solution_str[:10]}, task: {extra_info["reward_model"]["reasoning_task"]}, entry: {extra_info["reward_model"]["entry"]}'[
+                        f'answer: {solution_str[:10]}, task: {task}, entry: {entry}'[
                             :100
                         ]
                     )
@@ -129,9 +147,9 @@ class Reward:
                             'ground_truth': ground_truth,
                             'data_source': data_source,
                         },
-                    ) as res:
-                        res = await res.json()
-                        res = res['score']
+                    ) as response:
+                        result = await response.json()
+                        res = result['score']
                 except Exception as e:
                     logger.error(f'Error: {e}, ip: {ip}')
                     logger.info(
@@ -146,9 +164,6 @@ class Reward:
 
         # TODO: add llm_as_judge reward
 
-        if isinstance(res, (int, float, bool)):
-            score = float(res)
-        else:
-            score = float(res[0])
+        score = float(res)
 
         return {'resolved': score > 0.99, 'reward': score}

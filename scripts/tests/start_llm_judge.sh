@@ -85,7 +85,7 @@ for ((i = 0; i < vllm_nodes; i++)); do
     node_i=${vllm_nodes_array[$i]}
     port=$((VLLM_PORT + i))
     echo "Starting vLLM server on node $node_i with port $port"
-    
+
     srun --nodes=1 --ntasks=1 -w $node_i -o "$RESULTS_DIR/vllm-server-%j-node-$i.out" -e "$RESULTS_DIR/vllm-server-%j-node-$i.err" --no-container-mount-home --container-image="$container_name" $MOUNTS bash -c \
     "cd /verl && vllm serve \
         $VLLM_MODEL \
@@ -106,7 +106,7 @@ echo "Waiting for vLLM servers to start..."
 for ((i = 0; i < vllm_nodes; i++)); do
     node_i=${vllm_nodes_array[$i]}
     port=$((VLLM_PORT + i))
-    
+
     echo "Checking vLLM server on $node_i:$port..."
     while ! curl -s --connect-timeout 5 --max-time 10 "http://$node_i:$port/health" > /dev/null 2>&1; do
         echo "vLLM server on $node_i:$port not ready yet, waiting..."
