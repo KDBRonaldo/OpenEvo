@@ -18,6 +18,8 @@
   make lint
   ```
 
+- All contributions to this repository must be made under the Apache License, Version 2.0 (Apache-2.0) only. Do not submit contributions under the MIT license or any other license. 
+
 - Avoid introducing unnecessary complexity into existing code so that maintainability and readability are preserved.
 
 - Try to keep pull requests (PRs) as concise as possible:
