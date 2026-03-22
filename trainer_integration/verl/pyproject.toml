@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "verl_custom"
+version = "0.1.0"
+description = "Custom extensions for verl"
+requires-python = ">=3.8"
+
+[tool.setuptools.packages.find]
+include = ["verl_custom*"]
+
+[tool.setuptools.package-data]
+verl_custom = ["**/*.yaml"]
