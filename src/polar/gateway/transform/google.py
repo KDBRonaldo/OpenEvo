@@ -1,0 +1,507 @@
+"""Google Generative AI API transformer with tool-call support."""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass
+from typing import Any
+
+from polar.gateway.transform.base import BaseTransformer
+
+
+@dataclass
+class _GoogleToolCallState:
+    call_id: str = ""
+    name: str = ""
+    arguments: str = ""
+
+
+class _GoogleStreamState:
+    """Accumulate streamed OpenAI tool-call deltas into Google response parts."""
+
+    def __init__(self, transformer: "GoogleTransformer") -> None:
+        self._transformer = transformer
+        self._tool_calls: dict[int, _GoogleToolCallState] = {}
+        self._finish_reason: str | None = None
+        self._usage: dict[str, Any] | None = None
+        self._emitted_tool_calls = False
+
+    def process_chunk(
+        self,
+        chunk: dict[str, Any],
+        *,
+        is_first: bool = False,
+    ) -> list[dict[str, Any]]:
+        del is_first
+
+        choices = chunk.get("choices", [])
+        if not choices:
+            usage = chunk.get("usage")
+            if isinstance(usage, dict):
+                self._usage = usage
+            return []
+
+        choice = choices[0]
+        delta = choice.get("delta", {}) or {}
+        usage = chunk.get("usage")
+        if isinstance(usage, dict):
+            self._usage = usage
+
+        parts: list[dict[str, Any]] = []
+        content = delta.get("content")
+        if isinstance(content, str) and content:
+            parts.append({"text": content})
+
+        for tool_call in self._transformer._normalize_tool_call_deltas(
+            delta.get("tool_calls")
+        ):
+            tool_index = tool_call.get("index", 0)
+            if not isinstance(tool_index, int):
+                tool_index = 0
+            state = self._tool_calls.setdefault(tool_index, _GoogleToolCallState())
+
+            if isinstance(tool_call.get("id"), str) and tool_call["id"]:
+                state.call_id = tool_call["id"]
+
+            function = tool_call.get("function", {})
+            if isinstance(function, dict):
+                name = function.get("name")
+                if isinstance(name, str) and name:
+                    state.name += name
+
+                arguments = function.get("arguments")
+                if isinstance(arguments, str) and arguments:
+                    state.arguments += arguments
+                elif arguments not in (None, ""):
+                    state.arguments += json.dumps(arguments)
+
+        finish_reason = choice.get("finish_reason")
+        if isinstance(finish_reason, str) and finish_reason:
+            self._finish_reason = finish_reason
+
+        if parts:
+            return [self._transformer._build_stream_response(parts, usage=self._usage)]
+
+        if self._finish_reason and self._tool_calls and not self._emitted_tool_calls:
+            self._emitted_tool_calls = True
+            tool_parts = [
+                self._transformer._tool_call_part(
+                    name=state.name,
+                    arguments=state.arguments,
+                    call_id=state.call_id,
+                )
+                for _, state in sorted(self._tool_calls.items())
+                if state.name
+            ]
+            if tool_parts:
+                return [
+                    self._transformer._build_stream_response(
+                        tool_parts,
+                        finish_reason=self._finish_reason,
+                        usage=self._usage,
+                    )
+                ]
+
+        return []
+
+    def finalize(self) -> list[dict[str, Any]]:
+        if self._tool_calls and not self._emitted_tool_calls:
+            self._emitted_tool_calls = True
+            tool_parts = [
+                self._transformer._tool_call_part(
+                    name=state.name,
+                    arguments=state.arguments,
+                    call_id=state.call_id,
+                )
+                for _, state in sorted(self._tool_calls.items())
+                if state.name
+            ]
+            if tool_parts:
+                return [
+                    self._transformer._build_stream_response(
+                        tool_parts,
+                        finish_reason=self._finish_reason,
+                        usage=self._usage,
+                    )
+                ]
+        return []
+
+
+class GoogleTransformer(BaseTransformer):
+    """Transform between Google Generative AI and OpenAI API formats."""
+
+    ROLE_MAP = {"user": "user", "model": "assistant"}
+    FINISH_REASON_MAP_REVERSE = {
+        "stop": "STOP",
+        "length": "MAX_TOKENS",
+        "content_filter": "SAFETY",
+        "tool_calls": "STOP",
+    }
+
+    def transform_request(self, body: dict[str, Any]) -> dict[str, Any]:
+        messages: list[dict[str, Any]] = []
+        config = body.get("config")
+        config_section = config if isinstance(config, dict) else {}
+
+        system_instruction = body.get("systemInstruction") or config_section.get(
+            "systemInstruction"
+        )
+        if isinstance(system_instruction, dict):
+            system_text = self._extract_text_from_parts(system_instruction.get("parts", []))
+            if system_text:
+                messages.append({"role": "system", "content": system_text})
+
+        for content in body.get("contents", []):
+            messages.extend(self._convert_content_to_messages(content))
+
+        result: dict[str, Any] = {"messages": messages}
+
+        gen_config: dict[str, Any] = {}
+        for source in (
+            config_section.get("generationConfig"),
+            body.get("generationConfig"),
+        ):
+            if isinstance(source, dict):
+                gen_config.update(source)
+        if not gen_config and config_section:
+            gen_config = config_section
+
+        if "maxOutputTokens" in gen_config:
+            result["max_tokens"] = gen_config["maxOutputTokens"]
+        if "temperature" in gen_config:
+            result["temperature"] = gen_config["temperature"]
+        if "topP" in gen_config:
+            result["top_p"] = gen_config["topP"]
+        if "stopSequences" in gen_config:
+            result["stop"] = gen_config["stopSequences"]
+
+        if body.get("_streaming", False):
+            result["stream"] = True
+
+        # SGLang rejects tool_choice without a non-empty tools list; bind
+        # the pair so one can't be forwarded without the other.
+        tools = self._convert_tools(
+            body.get("tools") or config_section.get("tools") or []
+        )
+        if tools:
+            result["tools"] = tools
+            tool_choice = self._convert_tool_choice(
+                body.get("toolConfig") or config_section.get("toolConfig") or {}
+            )
+            if tool_choice is not None:
+                result["tool_choice"] = tool_choice
+
+        return self._enhance_for_training(
+            result,
+            body.get("_polar_model_served"),
+        )
+
+    def transform_response(
+        self,
+        response: dict[str, Any],
+        original_request: dict[str, Any],
+    ) -> dict[str, Any]:
+        del original_request
+
+        candidates = []
+        for i, choice in enumerate(response.get("choices", [])):
+            message = choice.get("message", {})
+            parts = []
+            content = message.get("content")
+            if content:
+                parts.append({"text": content})
+            parts.extend(self._tool_call_parts_from_message(message))
+
+            finish_reason = choice.get("finish_reason", "stop")
+            google_finish = self.FINISH_REASON_MAP_REVERSE.get(finish_reason, "STOP")
+
+            candidates.append(
+                {
+                    "content": {"parts": parts, "role": "model"},
+                    "finishReason": google_finish,
+                    "index": i,
+                    "safetyRatings": [],
+                }
+            )
+
+        usage = response.get("usage", {})
+        result = {
+            "candidates": candidates,
+            "usageMetadata": {
+                "promptTokenCount": usage.get("prompt_tokens", 0),
+                "candidatesTokenCount": usage.get("completion_tokens", 0),
+                "totalTokenCount": usage.get("total_tokens", 0),
+            },
+        }
+        function_calls = self._response_function_calls(candidates)
+        if function_calls:
+            result["functionCalls"] = function_calls
+        return result
+
+    def transform_stream_chunk(
+        self,
+        chunk: dict[str, Any],
+        original_request: dict[str, Any],
+        is_first: bool = False,
+    ) -> dict[str, Any]:
+        del original_request, is_first
+
+        candidates = []
+        for choice in chunk.get("choices", []):
+            delta = choice.get("delta", {}) or {}
+            parts = []
+            content = delta.get("content")
+            if content:
+                parts.append({"text": content})
+            for tool_call in self._normalize_tool_call_deltas(delta.get("tool_calls")):
+                function = tool_call.get("function", {})
+                parts.append(
+                    self._tool_call_part(
+                        name=str(function.get("name") or ""),
+                        arguments=function.get("arguments", ""),
+                        call_id=str(tool_call.get("id") or ""),
+                    )
+                )
+
+            candidate: dict[str, Any] = {
+                "content": {"parts": parts, "role": "model"},
+                "index": choice.get("index", 0),
+            }
+            finish_reason = choice.get("finish_reason")
+            if finish_reason:
+                candidate["finishReason"] = self.FINISH_REASON_MAP_REVERSE.get(
+                    finish_reason, "STOP"
+                )
+            candidates.append(candidate)
+
+        result: dict[str, Any] = {"candidates": candidates}
+        usage = chunk.get("usage")
+        if usage:
+            result["usageMetadata"] = {
+                "promptTokenCount": usage.get("prompt_tokens", 0),
+                "candidatesTokenCount": usage.get("completion_tokens", 0),
+                "totalTokenCount": usage.get("total_tokens", 0),
+            }
+        function_calls = self._response_function_calls(candidates)
+        if function_calls:
+            result["functionCalls"] = function_calls
+        return result
+
+    def create_stream_state(self, original_request: dict[str, Any]) -> _GoogleStreamState:
+        del original_request
+        return _GoogleStreamState(self)
+
+    def is_streaming_request(self, body: dict[str, Any]) -> bool:
+        return body.get("_streaming", False)
+
+    def _convert_content_to_messages(self, content: Any) -> list[dict[str, Any]]:
+        if not isinstance(content, dict):
+            return []
+
+        parts = content.get("parts", [])
+        role = content.get("role", "user")
+        openai_role = self.ROLE_MAP.get(role, "user")
+        messages: list[dict[str, Any]] = []
+        text_parts: list[str] = []
+        tool_calls: list[dict[str, Any]] = []
+        tool_messages: list[dict[str, Any]] = []
+
+        for part in parts:
+            if isinstance(part, str):
+                text_parts.append(part)
+                continue
+            if not isinstance(part, dict):
+                continue
+            if "text" in part and isinstance(part["text"], str):
+                text_parts.append(part["text"])
+                continue
+            if "functionCall" in part and isinstance(part["functionCall"], dict):
+                function_call = part["functionCall"]
+                tool_calls.append(
+                    {
+                        "id": function_call.get("id")
+                        or function_call.get("call_id")
+                        or "",
+                        "type": "function",
+                        "function": {
+                            "name": function_call.get("name", ""),
+                            "arguments": json.dumps(function_call.get("args", {})),
+                        },
+                    }
+                )
+                continue
+            if "functionResponse" in part and isinstance(part["functionResponse"], dict):
+                function_response = part["functionResponse"]
+                tool_messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": function_response.get("id")
+                        or function_response.get("call_id")
+                        or function_response.get("name", ""),
+                        "content": json.dumps(function_response.get("response", {})),
+                    }
+                )
+
+        if openai_role == "assistant":
+            if text_parts or tool_calls:
+                assistant_message: dict[str, Any] = {
+                    "role": "assistant",
+                    "content": "\n".join(text_parts),
+                }
+                if tool_calls:
+                    assistant_message["tool_calls"] = tool_calls
+                messages.append(assistant_message)
+        else:
+            if text_parts:
+                messages.append({"role": "user", "content": "\n".join(text_parts)})
+            messages.extend(tool_messages)
+
+        return messages
+
+    def _convert_tools(self, google_tools: list[Any]) -> list[dict[str, Any]]:
+        openai_tools: list[dict[str, Any]] = []
+        for tool in google_tools:
+            if not isinstance(tool, dict):
+                continue
+            declarations = tool.get("functionDeclarations") or tool.get(
+                "function_declarations"
+            )
+            if not isinstance(declarations, list):
+                continue
+            for declaration in declarations:
+                if not isinstance(declaration, dict):
+                    continue
+                name = declaration.get("name")
+                if not isinstance(name, str) or not name:
+                    continue
+                function: dict[str, Any] = {"name": name}
+                description = declaration.get("description")
+                if isinstance(description, str) and description:
+                    function["description"] = description
+                parameters = declaration.get("parameters")
+                if isinstance(parameters, dict):
+                    function["parameters"] = parameters
+                openai_tools.append({"type": "function", "function": function})
+        return openai_tools
+
+    def _convert_tool_choice(self, tool_config: Any) -> Any | None:
+        if not isinstance(tool_config, dict):
+            return None
+        function_calling_config = tool_config.get("functionCallingConfig") or tool_config.get(
+            "function_calling_config"
+        )
+        if not isinstance(function_calling_config, dict):
+            return None
+
+        mode = str(function_calling_config.get("mode", "")).upper()
+        allowed_names = function_calling_config.get("allowedFunctionNames") or function_calling_config.get(
+            "allowed_function_names"
+        )
+        if mode == "NONE":
+            return "none"
+        if mode in {"ANY", "VALIDATED"}:
+            if isinstance(allowed_names, list) and len(allowed_names) == 1:
+                allowed_name = allowed_names[0]
+                if isinstance(allowed_name, str) and allowed_name:
+                    return {"type": "function", "function": {"name": allowed_name}}
+            return "required"
+        return None
+
+    def _tool_call_parts_from_message(self, message: dict[str, Any]) -> list[dict[str, Any]]:
+        parts: list[dict[str, Any]] = []
+        for tool_call in message.get("tool_calls", []) or []:
+            if not isinstance(tool_call, dict):
+                continue
+            function = tool_call.get("function", {})
+            if not isinstance(function, dict):
+                continue
+            name = function.get("name")
+            if not isinstance(name, str) or not name:
+                continue
+            parts.append(
+                self._tool_call_part(
+                    name=name,
+                    arguments=function.get("arguments", ""),
+                    call_id=str(tool_call.get("id") or ""),
+                )
+            )
+        return parts
+
+    def _tool_call_part(self, *, name: str, arguments: Any, call_id: str) -> dict[str, Any]:
+        function_call: dict[str, Any] = {
+            "name": name,
+            "args": self._parse_arguments(arguments),
+        }
+        if call_id:
+            function_call["id"] = call_id
+        return {"functionCall": function_call}
+
+    def _parse_arguments(self, arguments: Any) -> Any:
+        if isinstance(arguments, (dict, list, int, float, bool)) or arguments is None:
+            return arguments if arguments is not None else {}
+        if not isinstance(arguments, str):
+            return {"value": arguments}
+        stripped = arguments.strip()
+        if not stripped:
+            return {}
+        try:
+            return json.loads(stripped)
+        except json.JSONDecodeError:
+            return {"raw": stripped}
+
+    def _normalize_tool_call_deltas(self, tool_calls: Any) -> list[dict[str, Any]]:
+        if isinstance(tool_calls, list):
+            return [tool_call for tool_call in tool_calls if isinstance(tool_call, dict)]
+        if isinstance(tool_calls, dict):
+            return [tool_calls]
+        return []
+
+    def _build_stream_response(
+        self,
+        parts: list[dict[str, Any]],
+        *,
+        finish_reason: str | None = None,
+        usage: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        candidate: dict[str, Any] = {
+            "content": {"parts": parts, "role": "model"},
+            "index": 0,
+        }
+        if finish_reason:
+            candidate["finishReason"] = self.FINISH_REASON_MAP_REVERSE.get(
+                finish_reason, "STOP"
+            )
+        result: dict[str, Any] = {"candidates": [candidate]}
+        if usage:
+            result["usageMetadata"] = {
+                "promptTokenCount": usage.get("prompt_tokens", 0),
+                "candidatesTokenCount": usage.get("completion_tokens", 0),
+                "totalTokenCount": usage.get("total_tokens", 0),
+            }
+        function_calls = self._response_function_calls(result["candidates"])
+        if function_calls:
+            result["functionCalls"] = function_calls
+        return result
+
+    def _response_function_calls(self, candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        function_calls: list[dict[str, Any]] = []
+        for candidate in candidates:
+            content = candidate.get("content", {})
+            if not isinstance(content, dict):
+                continue
+            for part in content.get("parts", []) or []:
+                if not isinstance(part, dict):
+                    continue
+                function_call = part.get("functionCall")
+                if isinstance(function_call, dict):
+                    function_calls.append(function_call)
+        return function_calls
+
+    def _extract_text_from_parts(self, parts: list) -> str:
+        texts = []
+        for part in parts:
+            if isinstance(part, dict) and "text" in part:
+                texts.append(part["text"])
+            elif isinstance(part, str):
+                texts.append(part)
+        return "\n".join(texts)

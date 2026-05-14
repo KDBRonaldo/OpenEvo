@@ -1,0 +1,77 @@
+from __future__ import annotations
+
+import asyncio
+
+from polar.trajectory.builder.per_request import PerRequestBuilder
+from polar.trajectory.models import CompletionRecord, CompletionSession
+
+
+def test_per_request_builder_returns_error_for_empty_session() -> None:
+    session = CompletionSession(
+        session_id="session-1",
+        metadata={"group_id": "g1", "policy_version": 7},
+    )
+
+    trajectory = asyncio.run(PerRequestBuilder().build(session))
+
+    assert trajectory.status == "ERROR"
+    assert trajectory.error == "no completions"
+    assert trajectory.metadata["builder"] == "per_request"
+    assert trajectory.metadata["group_id"] == "g1"
+    assert trajectory.metadata["policy_version"] == 7
+    assert trajectory.traces == []
+
+
+def test_per_request_builder_emits_one_trace_per_completion() -> None:
+    session = CompletionSession(
+        session_id="session-1",
+        task_id="task-1",
+        model_requested="requested",
+        model_used="served",
+        api_type="openai_chat",
+        metadata={"rollout_step": 3},
+        completions=[
+            CompletionRecord(
+                completion_id="completion-1",
+                request={
+                    "messages": [{"role": "user", "content": "Say hi"}],
+                    "tools": [{"type": "function", "function": {"name": "lookup"}}],
+                },
+                response={
+                    "choices": [
+                        {
+                            "input_token_ids": [1, 2],
+                            "token_ids": [3, 4],
+                            "message": {"role": "assistant", "content": "Hi"},
+                            "finish_reason": "stop",
+                            "logprobs": {
+                                "content": [
+                                    {"token_id": 3, "logprob": -0.1},
+                                    {"token_id": 4, "logprob": -0.2},
+                                ]
+                            },
+                        }
+                    ]
+                },
+                metadata={"completion_metadata": True},
+            )
+        ],
+    )
+
+    trajectory = asyncio.run(PerRequestBuilder().build(session))
+
+    assert trajectory.status == "COMPLETED"
+    assert trajectory.metadata["record_count"] == 1
+    assert trajectory.metadata["trace_count"] == 1
+    assert trajectory.metadata["rollout_step"] == 3
+    trace = trajectory.traces[0]
+    assert trace.prompt_ids == [1, 2]
+    assert trace.response_ids == [3, 4]
+    assert trace.loss_mask == [1, 1]
+    assert trace.prompt_messages == [{"role": "user", "content": "Say hi"}]
+    assert trace.response_messages == [{"role": "assistant", "content": "Hi"}]
+    assert trace.tools == [{"type": "function", "function": {"name": "lookup"}}]
+    assert trace.response_logprobs == [
+        {"token_id": 3, "logprob": -0.1},
+        {"token_id": 4, "logprob": -0.2},
+    ]

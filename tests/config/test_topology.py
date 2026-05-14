@@ -1,0 +1,97 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+import yaml
+
+from polar.config import TopologyConfig
+
+
+def _write_yaml(path: Path, data: dict) -> Path:
+    path.write_text(yaml.safe_dump(data))
+    return path
+
+
+def test_topology_defaults_public_urls_and_rollout_url(tmp_path: Path) -> None:
+    path = _write_yaml(
+        tmp_path / "topology.yaml",
+        {
+            "rollout": {
+                "host": "0.0.0.0",
+                "port": 8080,
+            },
+            "gateway": {
+                "nodes": [
+                    {
+                        "id": "node-a",
+                        "host": "0.0.0.0",
+                        "port": 8100,
+                    }
+                ],
+            },
+        },
+    )
+
+    topology = TopologyConfig.load(path)
+
+    assert topology.rollout.public_url == "http://127.0.0.1:8080"
+    assert topology.gateway.nodes[0].public_url == "http://127.0.0.1:8100"
+    assert topology.gateway.rollout_server_url == topology.rollout.public_url
+
+
+def test_topology_rejects_unknown_keys(tmp_path: Path) -> None:
+    path = _write_yaml(
+        tmp_path / "topology.yaml",
+        {
+            "rollout": {"unexpected": True},
+            "gateway": {
+                "nodes": [
+                    {
+                        "id": "node-a",
+                        "public_url": "http://127.0.0.1:8100",
+                    }
+                ],
+            },
+        },
+    )
+
+    with pytest.raises(ValueError, match="unexpected"):
+        TopologyConfig.load(path)
+
+
+def test_select_gateway_requires_node_id_for_multi_node_topology(tmp_path: Path) -> None:
+    path = _write_yaml(
+        tmp_path / "topology.yaml",
+        {
+            "gateway": {
+                "nodes": [
+                    {"id": "node-a", "public_url": "http://127.0.0.1:8100"},
+                    {"id": "node-b", "public_url": "http://127.0.0.1:8101"},
+                ],
+            },
+        },
+    )
+    topology = TopologyConfig.load(path)
+
+    with pytest.raises(ValueError, match="--node-id"):
+        topology.select_gateway_node()
+
+    assert topology.select_gateway_node("node-b").port == 8081
+
+
+def test_duplicate_gateway_node_ids_are_rejected(tmp_path: Path) -> None:
+    path = _write_yaml(
+        tmp_path / "topology.yaml",
+        {
+            "gateway": {
+                "nodes": [
+                    {"id": "node-a", "public_url": "http://127.0.0.1:8100"},
+                    {"id": "node-a", "public_url": "http://127.0.0.1:8101"},
+                ],
+            },
+        },
+    )
+
+    with pytest.raises(ValueError, match="Duplicate gateway node id"):
+        TopologyConfig.load(path)
