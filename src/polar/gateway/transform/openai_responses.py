@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from typing import Any, Optional
 
 from polar.gateway.transform.base import BaseTransformer
+from polar.gateway.transform.images import openai_responses_input_content_to_chat
 
 
 @dataclass
@@ -41,22 +42,26 @@ class ResponsesStreamState:
         events: list[dict[str, Any]] = []
 
         if is_first:
-            events.append({
-                "type": "response.created",
-                "response": {
-                    "id": self.response_id,
-                    "object": "response",
-                    "status": "in_progress",
-                    "model": self.model,
-                    "output": [],
-                    "usage": self.usage.copy(),
-                },
-            })
+            events.append(
+                {
+                    "type": "response.created",
+                    "response": {
+                        "id": self.response_id,
+                        "object": "response",
+                        "status": "in_progress",
+                        "model": self.model,
+                        "output": [],
+                        "usage": self.usage.copy(),
+                    },
+                }
+            )
 
         usage = chunk.get("usage")
         if isinstance(usage, dict):
             self.usage["input_tokens"] = usage.get("prompt_tokens", self.usage["input_tokens"])
-            self.usage["output_tokens"] = usage.get("completion_tokens", self.usage["output_tokens"])
+            self.usage["output_tokens"] = usage.get(
+                "completion_tokens", self.usage["output_tokens"]
+            )
             self.usage["total_tokens"] = usage.get("total_tokens", self.usage["total_tokens"])
 
         choices = chunk.get("choices", [])
@@ -72,31 +77,37 @@ class ResponsesStreamState:
                 self.text_started = True
                 self.output_index_offset = 1
                 message_id = f"msg_{uuid.uuid4().hex[:24]}"
-                events.append({
-                    "type": "response.output_item.added",
-                    "output_index": 0,
-                    "item": {
-                        "type": "message",
-                        "id": message_id,
-                        "role": "assistant",
-                        "status": "in_progress",
-                        "content": [],
-                    },
-                })
-                events.append({
-                    "type": "response.content_part.added",
-                    "output_index": 0,
-                    "content_index": 0,
-                    "part": {"type": "output_text", "text": ""},
-                })
+                events.append(
+                    {
+                        "type": "response.output_item.added",
+                        "output_index": 0,
+                        "item": {
+                            "type": "message",
+                            "id": message_id,
+                            "role": "assistant",
+                            "status": "in_progress",
+                            "content": [],
+                        },
+                    }
+                )
+                events.append(
+                    {
+                        "type": "response.content_part.added",
+                        "output_index": 0,
+                        "content_index": 0,
+                        "part": {"type": "output_text", "text": ""},
+                    }
+                )
 
             self.text_content += content
-            events.append({
-                "type": "response.output_text.delta",
-                "output_index": 0,
-                "content_index": 0,
-                "delta": content,
-            })
+            events.append(
+                {
+                    "type": "response.output_text.delta",
+                    "output_index": 0,
+                    "content_index": 0,
+                    "delta": content,
+                }
+            )
 
         tool_calls_delta = delta.get("tool_calls") or []
         if not isinstance(tool_calls_delta, list):
@@ -137,31 +148,37 @@ class ResponsesStreamState:
             if tool_state.name and not tool_state.started:
                 tool_state.started = True
                 tool_state.fc_id = f"fc_{uuid.uuid4().hex[:24]}"
-                events.append({
-                    "type": "response.output_item.added",
-                    "output_index": output_index,
-                    "item": {
-                        "type": "function_call",
-                        "id": tool_state.fc_id,
-                        "call_id": tool_state.call_id,
-                        "name": tool_state.name,
-                        "arguments": "",
-                        "status": "in_progress",
-                    },
-                })
+                events.append(
+                    {
+                        "type": "response.output_item.added",
+                        "output_index": output_index,
+                        "item": {
+                            "type": "function_call",
+                            "id": tool_state.fc_id,
+                            "call_id": tool_state.call_id,
+                            "name": tool_state.name,
+                            "arguments": "",
+                            "status": "in_progress",
+                        },
+                    }
+                )
 
                 if tool_state.arguments:
-                    events.append({
+                    events.append(
+                        {
+                            "type": "response.function_call_arguments.delta",
+                            "output_index": output_index,
+                            "delta": tool_state.arguments,
+                        }
+                    )
+            elif tool_state.started and arguments_str:
+                events.append(
+                    {
                         "type": "response.function_call_arguments.delta",
                         "output_index": output_index,
-                        "delta": tool_state.arguments,
-                    })
-            elif tool_state.started and arguments_str:
-                events.append({
-                    "type": "response.function_call_arguments.delta",
-                    "output_index": output_index,
-                    "delta": arguments_str,
-                })
+                        "delta": arguments_str,
+                    }
+                )
 
         return events
 
@@ -172,22 +189,26 @@ class ResponsesStreamState:
         events: list[dict[str, Any]] = []
 
         if self.text_started:
-            events.append({
-                "type": "response.content_part.done",
-                "output_index": 0,
-                "content_index": 0,
-                "part": {"type": "output_text", "text": self.text_content},
-            })
-            events.append({
-                "type": "response.output_item.done",
-                "output_index": 0,
-                "item": {
-                    "type": "message",
-                    "role": "assistant",
-                    "status": "completed",
-                    "content": [{"type": "output_text", "text": self.text_content}],
-                },
-            })
+            events.append(
+                {
+                    "type": "response.content_part.done",
+                    "output_index": 0,
+                    "content_index": 0,
+                    "part": {"type": "output_text", "text": self.text_content},
+                }
+            )
+            events.append(
+                {
+                    "type": "response.output_item.done",
+                    "output_index": 0,
+                    "item": {
+                        "type": "message",
+                        "role": "assistant",
+                        "status": "completed",
+                        "content": [{"type": "output_text", "text": self.text_content}],
+                    },
+                }
+            )
 
         for tool_index in sorted(self.tool_calls):
             tool_state = self.tool_calls[tool_index]
@@ -195,56 +216,66 @@ class ResponsesStreamState:
                 continue
 
             output_index = self.output_index_offset + tool_index
-            events.append({
-                "type": "response.function_call_arguments.done",
-                "output_index": output_index,
-                "arguments": tool_state.arguments,
-            })
-            events.append({
-                "type": "response.output_item.done",
-                "output_index": output_index,
-                "item": {
-                    "type": "function_call",
-                    "id": tool_state.fc_id or f"fc_{uuid.uuid4().hex[:24]}",
-                    "call_id": tool_state.call_id,
-                    "name": tool_state.name,
+            events.append(
+                {
+                    "type": "response.function_call_arguments.done",
+                    "output_index": output_index,
                     "arguments": tool_state.arguments,
-                    "status": "completed",
-                },
-            })
+                }
+            )
+            events.append(
+                {
+                    "type": "response.output_item.done",
+                    "output_index": output_index,
+                    "item": {
+                        "type": "function_call",
+                        "id": tool_state.fc_id or f"fc_{uuid.uuid4().hex[:24]}",
+                        "call_id": tool_state.call_id,
+                        "name": tool_state.name,
+                        "arguments": tool_state.arguments,
+                        "status": "completed",
+                    },
+                }
+            )
 
         output: list[dict[str, Any]] = []
         if self.text_started:
-            output.append({
-                "type": "message",
-                "role": "assistant",
-                "status": "completed",
-                "content": [{"type": "output_text", "text": self.text_content}],
-            })
+            output.append(
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [{"type": "output_text", "text": self.text_content}],
+                }
+            )
         for tool_index in sorted(self.tool_calls):
             tool_state = self.tool_calls[tool_index]
             if tool_state.started:
-                output.append({
-                    "type": "function_call",
-                    "id": tool_state.fc_id or f"fc_{uuid.uuid4().hex[:24]}",
-                    "call_id": tool_state.call_id,
-                    "name": tool_state.name,
-                    "arguments": tool_state.arguments,
-                    "status": "completed",
-                })
+                output.append(
+                    {
+                        "type": "function_call",
+                        "id": tool_state.fc_id or f"fc_{uuid.uuid4().hex[:24]}",
+                        "call_id": tool_state.call_id,
+                        "name": tool_state.name,
+                        "arguments": tool_state.arguments,
+                        "status": "completed",
+                    }
+                )
 
-        events.append({
-            "type": "response.completed",
-            "response": {
-                "id": self.response_id,
-                "object": "response",
-                "created_at": int(time.time()),
-                "status": "completed",
-                "model": self.model,
-                "output": output,
-                "usage": self.usage.copy(),
-            },
-        })
+        events.append(
+            {
+                "type": "response.completed",
+                "response": {
+                    "id": self.response_id,
+                    "object": "response",
+                    "created_at": int(time.time()),
+                    "status": "completed",
+                    "model": self.model,
+                    "output": output,
+                    "usage": self.usage.copy(),
+                },
+            }
+        )
         self.completed = True
         return events
 
@@ -307,32 +338,38 @@ class OpenAIResponsesTransformer(BaseTransformer):
 
         content = message.get("content")
         if content:
-            output_items.append({
-                "type": "message",
-                "role": "assistant",
-                "status": "completed",
-                "content": [{"type": "output_text", "text": content}],
-            })
+            output_items.append(
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [{"type": "output_text", "text": content}],
+                }
+            )
 
         for tc in message.get("tool_calls") or []:
             func = tc.get("function", {})
             name = func.get("name", "")
             if name in ("shell", "execute", "run_command"):
-                output_items.append({
-                    "type": "local_shell_call",
-                    "call_id": tc.get("id", ""),
-                    "status": "completed",
-                    "action": {"type": "execute", "command": func.get("arguments", "{}")},
-                })
+                output_items.append(
+                    {
+                        "type": "local_shell_call",
+                        "call_id": tc.get("id", ""),
+                        "status": "completed",
+                        "action": {"type": "execute", "command": func.get("arguments", "{}")},
+                    }
+                )
             else:
-                output_items.append({
-                    "type": "function_call",
-                    "id": f"fc_{uuid.uuid4().hex[:24]}",
-                    "call_id": tc.get("id", ""),
-                    "name": name,
-                    "arguments": func.get("arguments", "{}"),
-                    "status": "completed",
-                })
+                output_items.append(
+                    {
+                        "type": "function_call",
+                        "id": f"fc_{uuid.uuid4().hex[:24]}",
+                        "call_id": tc.get("id", ""),
+                        "name": name,
+                        "arguments": func.get("arguments", "{}"),
+                        "status": "completed",
+                    }
+                )
 
         usage = response.get("usage", {})
         return {
@@ -375,21 +412,40 @@ class OpenAIResponsesTransformer(BaseTransformer):
         messages: list[dict[str, Any]] = []
         pending_tool_calls: list[dict[str, Any]] = []
         pending_tool_outputs: list[dict[str, Any]] = []
+        pending_input_content: list[dict[str, Any]] = []
 
         for item in items:
             item_type = item.get("type")
 
-            if item_type == "message":
+            if item_type in {"input_text", "input_image"}:
                 if pending_tool_calls or pending_tool_outputs:
-                    messages.extend(self._flush_tool_block(pending_tool_calls, pending_tool_outputs))
+                    messages.extend(
+                        self._flush_tool_block(pending_tool_calls, pending_tool_outputs)
+                    )
+                    pending_tool_calls = []
+                    pending_tool_outputs = []
+                pending_input_content.append(item)
+                continue
+
+            if item_type == "message":
+                if pending_input_content:
+                    messages.extend(self._flush_input_content(pending_input_content))
+                    pending_input_content = []
+                if pending_tool_calls or pending_tool_outputs:
+                    messages.extend(
+                        self._flush_tool_block(pending_tool_calls, pending_tool_outputs)
+                    )
                     pending_tool_calls = []
                     pending_tool_outputs = []
 
                 role = item.get("role", "user")
-                content = self._extract_text_from_content(item.get("content", ""))
+                content = openai_responses_input_content_to_chat(item.get("content", ""))
                 messages.append({"role": role, "content": content})
 
             elif item_type == "function_call":
+                if pending_input_content:
+                    messages.extend(self._flush_input_content(pending_input_content))
+                    pending_input_content = []
                 if pending_tool_outputs:
                     messages.extend(
                         self._flush_tool_block(
@@ -399,23 +455,27 @@ class OpenAIResponsesTransformer(BaseTransformer):
                     )
                     pending_tool_calls = []
                     pending_tool_outputs = []
-                pending_tool_calls.append({
-                    "id": item.get("call_id", f"call_{uuid.uuid4().hex[:24]}"),
-                    "type": "function",
-                    "function": {
-                        "name": item.get("name", ""),
-                        "arguments": item.get("arguments", "{}"),
-                    },
-                })
+                pending_tool_calls.append(
+                    {
+                        "id": item.get("call_id", f"call_{uuid.uuid4().hex[:24]}"),
+                        "type": "function",
+                        "function": {
+                            "name": item.get("name", ""),
+                            "arguments": item.get("arguments", "{}"),
+                        },
+                    }
+                )
 
             elif item_type == "function_call_output":
-                pending_tool_outputs.append({
-                    "role": "tool",
-                    "tool_call_id": item.get("call_id", ""),
-                    "content": item.get("output", ""),
-                })
+                if pending_input_content:
+                    messages.extend(self._flush_input_content(pending_input_content))
+                    pending_input_content = []
+                pending_tool_outputs.extend(self._function_call_output_messages(item))
 
             else:
+                if pending_input_content:
+                    messages.extend(self._flush_input_content(pending_input_content))
+                    pending_input_content = []
                 if pending_tool_calls or pending_tool_outputs:
                     messages.extend(
                         self._flush_tool_block(
@@ -425,14 +485,82 @@ class OpenAIResponsesTransformer(BaseTransformer):
                     )
                     pending_tool_calls = []
                     pending_tool_outputs = []
-                message = self._convert_response_item_to_message(item)
-                if message:
-                    messages.append(message)
+                converted = self._convert_response_item_to_message(item)
+                if isinstance(converted, list):
+                    messages.extend(converted)
+                elif converted:
+                    messages.append(converted)
+
+        if pending_input_content:
+            messages.extend(self._flush_input_content(pending_input_content))
 
         if pending_tool_calls or pending_tool_outputs:
             messages.extend(self._flush_tool_block(pending_tool_calls, pending_tool_outputs))
 
         return messages
+
+    def _function_call_output_messages(self, item: dict[str, Any]) -> list[dict[str, Any]]:
+        output = self._function_call_output_content(item.get("output", ""))
+        converted_content = openai_responses_input_content_to_chat(output)
+        messages = [
+            {
+                "role": "tool",
+                "tool_call_id": item.get("call_id", ""),
+                "content": self._flatten_function_call_output(output),
+            }
+        ]
+
+        image_parts = self._image_parts(converted_content)
+        if image_parts:
+            messages.append({"role": "user", "content": image_parts})
+        return messages
+
+    def _function_call_output_content(self, output: Any) -> Any:
+        if isinstance(output, dict):
+            if self._is_responses_content_block(output):
+                return [output]
+            for key in ("output", "body", "content"):
+                if key in output:
+                    return self._function_call_output_content(output[key])
+        return output
+
+    def _flatten_function_call_output(self, output: Any) -> str:
+        if isinstance(output, str):
+            return output
+        if isinstance(output, list):
+            parts = []
+            for block in output:
+                if isinstance(block, str):
+                    parts.append(block)
+                elif isinstance(block, dict):
+                    if block.get("type") in {"input_text", "output_text", "text"}:
+                        text = block.get("text")
+                        if isinstance(text, str):
+                            parts.append(text)
+            return "\n".join(parts)
+        if isinstance(output, dict):
+            return json.dumps(output)
+        return str(output) if output is not None else ""
+
+    def _image_parts(self, content: Any) -> list[dict[str, Any]]:
+        if not isinstance(content, list):
+            return []
+        return [
+            part for part in content if isinstance(part, dict) and part.get("type") == "image_url"
+        ]
+
+    def _is_responses_content_block(self, block: dict[str, Any]) -> bool:
+        return block.get("type") in {
+            "input_text",
+            "output_text",
+            "text",
+            "input_image",
+            "image_url",
+        }
+
+    def _flush_input_content(self, content_parts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        content = openai_responses_input_content_to_chat(content_parts)
+        return [{"role": "user", "content": content}] if content else []
 
     def _flush_tool_block(
         self,
@@ -441,35 +569,30 @@ class OpenAIResponsesTransformer(BaseTransformer):
     ) -> list[dict[str, Any]]:
         messages: list[dict[str, Any]] = []
         if tool_calls:
-            messages.append({
-                "role": "assistant",
-                "content": None,
-                "tool_calls": list(tool_calls),
-            })
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": list(tool_calls),
+                }
+            )
         messages.extend(tool_outputs)
         return messages
 
-    def _convert_response_item_to_message(self, item: dict[str, Any]) -> Optional[dict[str, Any]]:
+    def _convert_response_item_to_message(
+        self,
+        item: dict[str, Any],
+    ) -> Optional[dict[str, Any] | list[dict[str, Any]]]:
         item_type = item.get("type", "")
 
         if item_type == "message":
             role = item.get("role", "user")
-            content_items = item.get("content", [])
-            text_parts = []
-            for c in content_items if isinstance(content_items, list) else []:
-                if isinstance(c, dict) and c.get("type") in ("input_text", "output_text", "text"):
-                    text_parts.append(c.get("text", ""))
-            if text_parts:
-                return {"role": role, "content": "\n".join(text_parts)}
+            content = openai_responses_input_content_to_chat(item.get("content", []))
+            if content:
+                return {"role": role, "content": content}
 
         elif item_type == "function_call_output":
-            output = item.get("output", {})
-            output_str = output.get("output", "") if isinstance(output, dict) else str(output)
-            return {
-                "role": "tool",
-                "tool_call_id": item.get("call_id", ""),
-                "content": output_str,
-            }
+            return self._function_call_output_messages(item)
 
         # Fallback: plain {role, content} dict
         if not item_type and "role" in item and "content" in item:
@@ -478,14 +601,9 @@ class OpenAIResponsesTransformer(BaseTransformer):
             if isinstance(content, str):
                 return {"role": role, "content": content}
             if isinstance(content, list):
-                text_parts = []
-                for c in content:
-                    if isinstance(c, dict) and c.get("type") in ("input_text", "output_text", "text"):
-                        text_parts.append(c.get("text", ""))
-                    elif isinstance(c, str):
-                        text_parts.append(c)
-                if text_parts:
-                    return {"role": role, "content": "\n".join(text_parts)}
+                converted = openai_responses_input_content_to_chat(content)
+                if converted:
+                    return {"role": role, "content": converted}
 
         return None
 
@@ -519,17 +637,6 @@ class OpenAIResponsesTransformer(BaseTransformer):
             converted.append({"type": "function", "function": func_def})
 
         return converted
-
-    def _extract_text_from_content(self, content: Any) -> str:
-        if isinstance(content, str):
-            return content
-        if isinstance(content, list):
-            parts = []
-            for block in content:
-                if isinstance(block, dict) and block.get("type") in ("input_text", "output_text", "text"):
-                    parts.append(block.get("text", ""))
-            return "\n".join(parts) if parts else ""
-        return str(content) if content else ""
 
     def _make_error_response(self, message: str) -> dict[str, Any]:
         return {

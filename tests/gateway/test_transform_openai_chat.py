@@ -2,57 +2,83 @@ from __future__ import annotations
 
 from polar.gateway.transform.openai_chat import OpenAIChatTransformer
 
+IMAGE_URL = "data:image/png;base64,abc123"
 
-def test_qwen_chat_request_merges_developer_role_and_enables_training_fields() -> None:
+
+def test_openai_chat_request_preserves_fields_and_image_content() -> None:
     transformer = OpenAIChatTransformer()
 
-    transformed = transformer.transform_request(
-        {
-            "_polar_model_served": "Qwen/Qwen3.5-4B",
-            "model": "client-visible-model",
-            "messages": [
-                {"role": "developer", "content": "Use short answers."},
-                {"role": "system", "content": "Be precise."},
-                {"role": "user", "content": "2+2?"},
-            ],
-            "chat_template_kwargs": {"foo": "bar"},
-        }
-    )
+    body = {
+        "_polar_model_served": "Qwen/Qwen3.5-4B",
+        "model": "client-visible-model",
+        "messages": [
+            {"role": "developer", "content": "Use short answers."},
+            {"role": "system", "content": "Be precise."},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Count stars."},
+                    {"type": "image_url", "image_url": {"url": IMAGE_URL, "detail": "low"}},
+                ],
+            },
+        ],
+        "max_tokens": 64,
+        "temperature": 0.2,
+        "top_p": 0.9,
+        "stream": True,
+        "stop": ["END"],
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "write_answer",
+                    "description": "Write the answer",
+                    "parameters": {"type": "object"},
+                },
+            }
+        ],
+        "tool_choice": "auto",
+        "chat_template_kwargs": {"foo": "bar"},
+    }
+
+    transformed = transformer.transform_request(body)
 
     assert "_polar_model_served" not in transformed
-    assert transformed["logprobs"] is True
-    assert transformed["chat_template_kwargs"] == {"foo": "bar", "enable_thinking": False}
+    assert transformed["model"] == "client-visible-model"
     assert transformed["messages"] == [
         {"role": "system", "content": "Use short answers.\n\nBe precise."},
-        {"role": "user", "content": "2+2?"},
+        body["messages"][2],
     ]
-
-
-def test_non_qwen_chat_request_keeps_roles_but_adds_logprobs() -> None:
-    transformer = OpenAIChatTransformer()
-
-    transformed = transformer.transform_request(
-        {
-            "_polar_model_served": "meta/llama",
-            "messages": [{"role": "developer", "content": "Style rule."}],
-        }
-    )
-
-    assert transformed["messages"] == [{"role": "developer", "content": "Style rule."}]
+    assert transformed["max_tokens"] == 64
+    assert transformed["temperature"] == 0.2
+    assert transformed["top_p"] == 0.9
+    assert transformed["stream"] is True
+    assert transformed["stop"] == ["END"]
+    assert transformed["tools"] == body["tools"]
+    assert transformed["tool_choice"] == "auto"
     assert transformed["logprobs"] is True
+    assert transformed["chat_template_kwargs"] == {"foo": "bar", "enable_thinking": False}
 
 
-def test_chat_response_preserves_original_requested_model() -> None:
+def test_openai_chat_response_and_stream_preserve_requested_model() -> None:
     transformer = OpenAIChatTransformer()
+    upstream = {
+        "id": "chatcmpl-1",
+        "model": "served-model",
+        "choices": [{"message": {"content": "Done"}, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6},
+    }
 
-    response = transformer.transform_response(
-        {"id": "cmpl-1", "model": "served-model"},
-        {"model": "requested-model"},
-    )
+    response = transformer.transform_response(upstream, {"model": "requested-model"})
     stream_chunk = transformer.transform_stream_chunk(
-        {"id": "cmpl-1", "model": "served-model"},
+        {
+            "id": "chatcmpl-1",
+            "model": "served-model",
+            "choices": [{"delta": {"content": "D"}}],
+        },
         {"model": "requested-model"},
     )
 
-    assert response["model"] == "requested-model"
+    assert response == {**upstream, "model": "requested-model"}
     assert stream_chunk["model"] == "requested-model"
+    assert stream_chunk["choices"][0]["delta"]["content"] == "D"

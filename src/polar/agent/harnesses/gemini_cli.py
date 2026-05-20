@@ -48,7 +48,10 @@ class GeminiCliHarness(BaseHarness):
 
     def run_steps(self, instruction: str) -> list[ExecInput]:
         escaped = shlex.quote(instruction)
-        env: dict[str, str] = {**self.env}
+        env: dict[str, str] = {
+            "GEMINI_CLI_TRUST_WORKSPACE": "true",
+            **self.env,
+        }
 
         # --approval-mode=yolo is the documented replacement for the legacy
         # --yolo flag (both currently work but --yolo is listed as deprecated

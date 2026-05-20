@@ -48,7 +48,6 @@ logger = logging.getLogger(__name__)
 # finish_reasons where the model emitted the natural end-of-turn token itself.
 _NATURAL_STOP_REASONS = frozenset({"stop", "tool_calls", "stop_sequence"})
 
-_GROUPING_IGNORED_ROLES = frozenset({"tool"})
 
 
 # ---------------------------------------------------------------------------
@@ -87,13 +86,11 @@ def _expand_messages_for_grouping(message: dict[str, Any]) -> list[dict[str, Any
 
 def _is_grouping_noise_message(message: dict[str, Any]) -> bool:
     role = message.get("role")
-    if role in _GROUPING_IGNORED_ROLES:
+    if role in ["tool"]:
         return True
     if role == "assistant" and message.get("tool_calls"):
         return False
     content = _flatten_message_content(message.get("content")).strip()
-    if role == "assistant" and content.startswith("<think>"):
-        return True
     if role == "assistant" and not content and not message.get("tool_calls"):
         return True
     return False

@@ -7,6 +7,11 @@ from dataclasses import dataclass
 from typing import Any
 
 from polar.gateway.transform.base import BaseTransformer
+from polar.gateway.transform.images import (
+    google_content_parts_to_openai_chat,
+    google_part_to_openai_chat,
+    openai_chat_content_to_google_parts,
+)
 
 
 @dataclass
@@ -25,6 +30,7 @@ class _GoogleStreamState:
         self._finish_reason: str | None = None
         self._usage: dict[str, Any] | None = None
         self._emitted_tool_calls = False
+        self._emitted_finish_reason = False
 
     def process_chunk(
         self,
@@ -76,11 +82,22 @@ class _GoogleStreamState:
                     state.arguments += json.dumps(arguments)
 
         finish_reason = choice.get("finish_reason")
-        if isinstance(finish_reason, str) and finish_reason:
-            self._finish_reason = finish_reason
+        current_finish_reason = (
+            finish_reason if isinstance(finish_reason, str) and finish_reason else None
+        )
+        if current_finish_reason:
+            self._finish_reason = current_finish_reason
 
         if parts:
-            return [self._transformer._build_stream_response(parts, usage=self._usage)]
+            if current_finish_reason:
+                self._emitted_finish_reason = True
+            return [
+                self._transformer._build_stream_response(
+                    parts,
+                    finish_reason=current_finish_reason,
+                    usage=self._usage,
+                )
+            ]
 
         if self._finish_reason and self._tool_calls and not self._emitted_tool_calls:
             self._emitted_tool_calls = True
@@ -94,6 +111,8 @@ class _GoogleStreamState:
                 if state.name
             ]
             if tool_parts:
+                if self._finish_reason:
+                    self._emitted_finish_reason = True
                 return [
                     self._transformer._build_stream_response(
                         tool_parts,
@@ -101,6 +120,16 @@ class _GoogleStreamState:
                         usage=self._usage,
                     )
                 ]
+
+        if current_finish_reason and not self._emitted_finish_reason:
+            self._emitted_finish_reason = True
+            return [
+                self._transformer._build_stream_response(
+                    [],
+                    finish_reason=current_finish_reason,
+                    usage=self._usage,
+                )
+            ]
 
         return []
 
@@ -117,6 +146,8 @@ class _GoogleStreamState:
                 if state.name
             ]
             if tool_parts:
+                if self._finish_reason:
+                    self._emitted_finish_reason = True
                 return [
                     self._transformer._build_stream_response(
                         tool_parts,
@@ -208,8 +239,8 @@ class GoogleTransformer(BaseTransformer):
             message = choice.get("message", {})
             parts = []
             content = message.get("content")
-            if content:
-                parts.append({"text": content})
+            if content or isinstance(content, list):
+                parts.extend(openai_chat_content_to_google_parts(content))
             parts.extend(self._tool_call_parts_from_message(message))
 
             finish_reason = choice.get("finish_reason", "stop")
@@ -302,18 +333,22 @@ class GoogleTransformer(BaseTransformer):
         role = content.get("role", "user")
         openai_role = self.ROLE_MAP.get(role, "user")
         messages: list[dict[str, Any]] = []
-        text_parts: list[str] = []
+        user_parts: list[dict[str, Any]] = []
         tool_calls: list[dict[str, Any]] = []
         tool_messages: list[dict[str, Any]] = []
 
         for part in parts:
             if isinstance(part, str):
-                text_parts.append(part)
+                user_parts.append({"type": "text", "text": part})
                 continue
             if not isinstance(part, dict):
                 continue
             if "text" in part and isinstance(part["text"], str):
-                text_parts.append(part["text"])
+                user_parts.append({"type": "text", "text": part["text"]})
+                continue
+            image_part = google_part_to_openai_chat(part)
+            if image_part:
+                user_parts.append(image_part)
                 continue
             if "functionCall" in part and isinstance(part["functionCall"], dict):
                 function_call = part["functionCall"]
@@ -343,17 +378,21 @@ class GoogleTransformer(BaseTransformer):
                 )
 
         if openai_role == "assistant":
-            if text_parts or tool_calls:
+            message_content = google_content_parts_to_openai_chat(parts)
+            if message_content or tool_calls:
                 assistant_message: dict[str, Any] = {
                     "role": "assistant",
-                    "content": "\n".join(text_parts),
+                    "content": message_content,
                 }
                 if tool_calls:
                     assistant_message["tool_calls"] = tool_calls
                 messages.append(assistant_message)
         else:
-            if text_parts:
-                messages.append({"role": "user", "content": "\n".join(text_parts)})
+            if user_parts:
+                messages.append({
+                    "role": "user",
+                    "content": google_content_parts_to_openai_chat(parts),
+                })
             messages.extend(tool_messages)
 
         return messages
@@ -378,9 +417,14 @@ class GoogleTransformer(BaseTransformer):
                 description = declaration.get("description")
                 if isinstance(description, str) and description:
                     function["description"] = description
-                parameters = declaration.get("parameters")
-                if isinstance(parameters, dict):
-                    function["parameters"] = parameters
+                parameters = (
+                    declaration.get("parameters")
+                    or declaration.get("parametersJsonSchema")
+                    or declaration.get("parameters_json_schema")
+                )
+                if not isinstance(parameters, dict):
+                    parameters = {"type": "object", "properties": {}}
+                function["parameters"] = parameters
                 openai_tools.append({"type": "function", "function": function})
         return openai_tools
 

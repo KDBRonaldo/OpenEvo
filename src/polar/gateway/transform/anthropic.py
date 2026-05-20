@@ -13,6 +13,10 @@ from dataclasses import dataclass
 from typing import Any, Optional
 
 from polar.gateway.transform.base import BaseTransformer
+from polar.gateway.transform.images import (
+    anthropic_content_to_openai_chat,
+    openai_chat_content_to_anthropic_blocks,
+)
 
 # Claude Code SDK leaks `x-anthropic-billing-header: ...cch=<hash>;` as the
 # first line of the system prompt. The cch= hash changes per request, so
@@ -58,19 +62,21 @@ class AnthropicStreamState:
         events: list[dict[str, Any]] = []
 
         if is_first:
-            events.append({
-                "type": "message_start",
-                "message": {
-                    "id": self.message_id,
-                    "type": "message",
-                    "role": "assistant",
-                    "content": [],
-                    "model": self.model,
-                    "stop_reason": None,
-                    "stop_sequence": None,
-                    "usage": {"input_tokens": 0, "output_tokens": 0},
-                },
-            })
+            events.append(
+                {
+                    "type": "message_start",
+                    "message": {
+                        "id": self.message_id,
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [],
+                        "model": self.model,
+                        "stop_reason": None,
+                        "stop_sequence": None,
+                        "usage": {"input_tokens": 0, "output_tokens": 0},
+                    },
+                }
+            )
 
         usage = chunk.get("usage", {})
         if usage:
@@ -90,11 +96,13 @@ class AnthropicStreamState:
         if content:
             if not self.text_block_started:
                 events.append(self._open_text_block())
-            events.append({
-                "type": "content_block_delta",
-                "index": self.text_block_index,
-                "delta": {"type": "text_delta", "text": content},
-            })
+            events.append(
+                {
+                    "type": "content_block_delta",
+                    "index": self.text_block_index,
+                    "delta": {"type": "text_delta", "text": content},
+                }
+            )
 
         tool_call_deltas = delta.get("tool_calls") or []
         if not isinstance(tool_call_deltas, list):
@@ -118,25 +126,31 @@ class AnthropicStreamState:
         for tool_index in sorted(self.tool_calls):
             tool_state = self.tool_calls[tool_index]
             if tool_state.started and tool_state.anthropic_index is not None:
-                events.append({
-                    "type": "content_block_stop",
-                    "index": tool_state.anthropic_index,
-                })
+                events.append(
+                    {
+                        "type": "content_block_stop",
+                        "index": tool_state.anthropic_index,
+                    }
+                )
 
         if not self.any_block_started:
             empty_index = self.next_block_index
-            events.append({
-                "type": "content_block_start",
-                "index": empty_index,
-                "content_block": {"type": "text", "text": ""},
-            })
+            events.append(
+                {
+                    "type": "content_block_start",
+                    "index": empty_index,
+                    "content_block": {"type": "text", "text": ""},
+                }
+            )
             events.append({"type": "content_block_stop", "index": empty_index})
 
-        events.append({
-            "type": "message_delta",
-            "delta": {"stop_reason": self.stop_reason, "stop_sequence": None},
-            "usage": {"output_tokens": self.output_tokens},
-        })
+        events.append(
+            {
+                "type": "message_delta",
+                "delta": {"stop_reason": self.stop_reason, "stop_sequence": None},
+                "usage": {"output_tokens": self.output_tokens},
+            }
+        )
         events.append({"type": "message_stop"})
 
         self.completed = True
@@ -203,36 +217,42 @@ class AnthropicStreamState:
             self.next_block_index += 1
             self.any_block_started = True
 
-            events.append({
-                "type": "content_block_start",
-                "index": tool_state.anthropic_index,
-                "content_block": {
-                    "type": "tool_use",
-                    "id": tool_state.id,
-                    "name": tool_state.name,
-                    "input": {},
-                },
-            })
+            events.append(
+                {
+                    "type": "content_block_start",
+                    "index": tool_state.anthropic_index,
+                    "content_block": {
+                        "type": "tool_use",
+                        "id": tool_state.id,
+                        "name": tool_state.name,
+                        "input": {},
+                    },
+                }
+            )
 
             if tool_state.buffered_arguments:
-                events.append({
+                events.append(
+                    {
+                        "type": "content_block_delta",
+                        "index": tool_state.anthropic_index,
+                        "delta": {
+                            "type": "input_json_delta",
+                            "partial_json": tool_state.buffered_arguments,
+                        },
+                    }
+                )
+                tool_state.buffered_arguments = ""
+        elif tool_state.started and args_str and tool_state.anthropic_index is not None:
+            events.append(
+                {
                     "type": "content_block_delta",
                     "index": tool_state.anthropic_index,
                     "delta": {
                         "type": "input_json_delta",
-                        "partial_json": tool_state.buffered_arguments,
+                        "partial_json": args_str,
                     },
-                })
-                tool_state.buffered_arguments = ""
-        elif tool_state.started and args_str and tool_state.anthropic_index is not None:
-            events.append({
-                "type": "content_block_delta",
-                "index": tool_state.anthropic_index,
-                "delta": {
-                    "type": "input_json_delta",
-                    "partial_json": args_str,
-                },
-            })
+                }
+            )
 
         return events
 
@@ -313,18 +333,20 @@ class AnthropicTransformer(BaseTransformer):
 
         content = []
         text = message.get("content")
-        if text:
-            content.append({"type": "text", "text": text})
+        if text or (isinstance(text, list) and text):
+            content.extend(openai_chat_content_to_anthropic_blocks(text))
 
         for tool_call in message.get("tool_calls") or []:
-            content.append({
-                "type": "tool_use",
-                "id": tool_call.get("id", f"toolu_{uuid.uuid4().hex[:24]}"),
-                "name": tool_call.get("function", {}).get("name", ""),
-                "input": self._parse_json_safe(
-                    tool_call.get("function", {}).get("arguments", "{}")
-                ),
-            })
+            content.append(
+                {
+                    "type": "tool_use",
+                    "id": tool_call.get("id", f"toolu_{uuid.uuid4().hex[:24]}"),
+                    "name": tool_call.get("function", {}).get("name", ""),
+                    "input": self._parse_json_safe(
+                        tool_call.get("function", {}).get("arguments", "{}")
+                    ),
+                }
+            )
 
         finish_reason = choice.get("finish_reason", "stop")
         stop_reason = self.FINISH_TO_STOP_REASON.get(finish_reason, "end_turn")
@@ -383,7 +405,9 @@ class AnthropicTransformer(BaseTransformer):
             return {"role": role, "content": str(content)}
 
         # Check for mixed content: tool_result blocks + other content
-        tool_results = [c for c in content if isinstance(c, dict) and c.get("type") == "tool_result"]
+        tool_results = [
+            c for c in content if isinstance(c, dict) and c.get("type") == "tool_result"
+        ]
         tool_uses = [c for c in content if isinstance(c, dict) and c.get("type") == "tool_use"]
         text_blocks = [c for c in content if isinstance(c, dict) and c.get("type") == "text"]
 
@@ -398,14 +422,16 @@ class AnthropicTransformer(BaseTransformer):
                     if block.get("type") == "text":
                         text_parts.append(block.get("text", ""))
                     elif block.get("type") == "tool_use":
-                        tool_calls.append({
-                            "id": block.get("id", f"call_{uuid.uuid4().hex[:24]}"),
-                            "type": "function",
-                            "function": {
-                                "name": block.get("name", ""),
-                                "arguments": json.dumps(block.get("input", {})),
-                            },
-                        })
+                        tool_calls.append(
+                            {
+                                "id": block.get("id", f"call_{uuid.uuid4().hex[:24]}"),
+                                "type": "function",
+                                "function": {
+                                    "name": block.get("name", ""),
+                                    "arguments": json.dumps(block.get("input", {})),
+                                },
+                            }
+                        )
             msg_dict: dict[str, Any] = {
                 "role": "assistant",
                 "content": "\n".join(text_parts) if text_parts else None,
@@ -418,11 +444,20 @@ class AnthropicTransformer(BaseTransformer):
         if role == "user" and tool_results:
             # Each tool_result becomes a tool message
             for tr in tool_results:
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tr.get("tool_use_id", ""),
-                    "content": self._flatten_content(tr.get("content", "")),
-                })
+                tool_content = tr.get("content", "")
+                converted_content = anthropic_content_to_openai_chat(tool_content)
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tr.get("tool_use_id", ""),
+                        "content": self._flatten_content(converted_content),
+                    }
+                )
+                # OpenAI tool messages stay text-only; images are sent as a
+                # follow-up user message, so mixed text/image order is not preserved.
+                image_parts = self._image_parts(converted_content)
+                if image_parts:
+                    messages.append({"role": "user", "content": image_parts})
 
             # Any extra user text should come after the tool results.
             text_parts = [b.get("text", "") for b in text_blocks if b.get("text")]
@@ -430,8 +465,8 @@ class AnthropicTransformer(BaseTransformer):
                 messages.append({"role": "user", "content": "\n".join(text_parts)})
             return messages if messages else None
 
-        # Regular content blocks — flatten to string
-        return {"role": role, "content": self._flatten_content(content)}
+        # Regular content blocks — keep images when present.
+        return {"role": role, "content": anthropic_content_to_openai_chat(content)}
 
     def _flatten_content(self, content: Any) -> str:
         if isinstance(content, str):
@@ -449,17 +484,26 @@ class AnthropicTransformer(BaseTransformer):
             return "\n".join(parts)
         return str(content)
 
+    def _image_parts(self, content: Any) -> list[dict[str, Any]]:
+        if not isinstance(content, list):
+            return []
+        return [
+            part for part in content if isinstance(part, dict) and part.get("type") == "image_url"
+        ]
+
     def _transform_tools_to_openai(self, tools: list[dict]) -> list[dict]:
         result = []
         for tool in tools:
-            result.append({
-                "type": "function",
-                "function": {
-                    "name": tool.get("name", ""),
-                    "description": tool.get("description", ""),
-                    "parameters": tool.get("input_schema", {}),
-                },
-            })
+            result.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": tool.get("name", ""),
+                        "description": tool.get("description", ""),
+                        "parameters": tool.get("input_schema", {}),
+                    },
+                }
+            )
         return result
 
     def _transform_tool_choice_to_openai(self, tool_choice: Any) -> Any:
