@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 import hashlib
@@ -11,10 +12,11 @@ import os
 from datetime import datetime, timezone
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from polar.config import GatewayNodeConfig, TopologyConfig
+from polar.gateway.completion_writer import CompletionWriter
 from polar.gateway.detection import APIType, detect, extract_model
 from polar.gateway.node import GatewayNodeManager
 from polar.gateway.proxy import (
@@ -37,6 +39,7 @@ from polar.gateway.session import (
 from polar.gateway.storage import SessionStore
 from polar.gateway.transform import TransformManager
 from polar.gateway.transform.base import BaseTransformer
+from polar.platform.events import SSE_HEADERS, EventBus
 from polar.rollout.models import SessionDispatchRequest, SessionDispatchResponse, SessionStatus
 from polar.runtime.models import RuntimeSpec
 from polar.trajectory.registry import default_builder_registry, default_evaluator_registry
@@ -59,6 +62,8 @@ class GatewayState:
     transform_manager: TransformManager
     session_registry: SessionRegistry
     node_manager: GatewayNodeManager
+    completion_writer: CompletionWriter
+    event_bus: EventBus
 
 
 _state: GatewayState | None = None
@@ -76,11 +81,22 @@ def configure_server(topology_path: str = "topology.yaml", *, node_id: str | Non
 def _build_state(topology: TopologyConfig, node_id: str | None) -> GatewayState:
     node = topology.select_gateway_node(node_id)
     sglang = SGLangClient(node.sglang_base_url)
-    storage = SessionStore()
+    persistence_config = topology.gateway.completion_persistence
+    save_dir = topology.rollout.save_dir
+    completion_writer = CompletionWriter(
+        save_dir=save_dir if save_dir else None,
+        max_field_bytes=persistence_config.max_field_bytes,
+        queue_size=persistence_config.queue_size,
+        enabled=persistence_config.enabled and bool(save_dir),
+    )
+    storage = SessionStore(completion_writer=completion_writer)
     transform_manager = TransformManager()
     session_registry = SessionRegistry()
     builder_registry = default_builder_registry()
     evaluator_registry = default_evaluator_registry()
+    event_bus = EventBus()
+    # Wrap session_registry methods to emit events on state changes.
+    _wrap_registry_for_events(session_registry, event_bus)
     node_manager = GatewayNodeManager(
         node_id=node.id,
         gateway_url=node.public_url,
@@ -103,7 +119,51 @@ def _build_state(topology: TopologyConfig, node_id: str | None) -> GatewayState:
         transform_manager=transform_manager,
         session_registry=session_registry,
         node_manager=node_manager,
+        completion_writer=completion_writer,
+        event_bus=event_bus,
     )
+
+
+def _wrap_registry_for_events(registry: SessionRegistry, bus: EventBus) -> None:
+    """Monkey-patch set_status / set_result so changes emit events to the bus."""
+    original_set_status = registry.set_status
+    original_set_result = registry.set_result
+
+    def _bus_publish(event_type: str, payload: dict[str, Any]) -> None:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        bus.publish_threadsafe(loop, event_type, payload)
+
+    def patched_set_status(session_id: str, status: str):
+        info = original_set_status(session_id, status)
+        if info is not None:
+            _bus_publish(
+                "session.state_changed",
+                {
+                    "session_id": session_id,
+                    "task_id": info.task_id,
+                    "status": status,
+                },
+            )
+        return info
+
+    def patched_set_result(session_id: str, result):
+        info = original_set_result(session_id, result)
+        if info is not None:
+            _bus_publish(
+                "session.state_changed",
+                {
+                    "session_id": session_id,
+                    "task_id": info.task_id,
+                    "status": str(info.status),
+                },
+            )
+        return info
+
+    registry.set_status = patched_set_status  # type: ignore[assignment]
+    registry.set_result = patched_set_result  # type: ignore[assignment]
 
 
 def get_state() -> GatewayState:
@@ -121,6 +181,7 @@ def get_state() -> GatewayState:
 @asynccontextmanager
 async def _lifespan(_: FastAPI):
     state = get_state()
+    await state.completion_writer.start()
     await state.node_manager.start()
     try:
         yield
@@ -128,6 +189,7 @@ async def _lifespan(_: FastAPI):
         await state.node_manager.close()
         await state.sglang.close()
         state.storage.close()
+        await state.completion_writer.close()
 
 
 app = FastAPI(title="Polar Gateway", version="0.1.0", lifespan=_lifespan)
@@ -392,6 +454,69 @@ async def resume_sglang_generation():
     status = await get_state().sglang.resume_generation()
     logger.info("Resumed SGLang generation proxy")
     return status
+
+
+@app.get("/sessions")
+async def list_sessions(
+    status: str | None = Query(default=None),
+    task_id: str | None = Query(default=None),
+    limit: int = Query(default=200, ge=1, le=1000),
+) -> dict[str, Any]:
+    """List sessions on this gateway (active + recently terminal)."""
+    state = get_state()
+    active = state.session_registry.active_sessions()
+    rows: list[dict[str, Any]] = []
+    for entry in active:
+        if status and entry.get("status") != status:
+            continue
+        if task_id and entry.get("task_id") != task_id:
+            continue
+        metadata = state.storage.get_session_metadata(entry["session_id"]) or {}
+        rows.append({
+            **entry,
+            "completion_count": int(metadata.get("completion_count") or 0),
+            "model_requested": metadata.get("model_requested"),
+            "model_used": metadata.get("model_used"),
+            "api_type": metadata.get("api_type"),
+            "created_at": metadata.get("created_at"),
+            "node_id": state.node.id,
+        })
+    return {"sessions": rows[:limit], "node_id": state.node.id}
+
+
+@app.get("/sessions/{session_id}/completions")
+async def list_session_completions(session_id: str) -> dict[str, Any]:
+    """In-memory completions for an active or recently-completed session."""
+    state = get_state()
+    try:
+        safe = clean_session_id(session_id)
+    except InvalidSessionIdError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if safe is None:
+        raise HTTPException(status_code=400, detail="Session id required")
+    completions = state.storage.get_completions(safe)
+    return {
+        "session_id": safe,
+        "completions": completions,
+        "node_id": state.node.id,
+    }
+
+
+@app.get("/events")
+async def stream_events(request: Request):
+    state = get_state()
+
+    async def iterator():
+        async for chunk in state.event_bus.stream_events(heartbeat_seconds=15.0):
+            if await request.is_disconnected():
+                break
+            yield chunk
+
+    return StreamingResponse(
+        iterator(),
+        media_type="text/event-stream",
+        headers=SSE_HEADERS,
+    )
 
 
 @app.post("/sessions", response_model=SessionCreateResponse | SessionDispatchResponse)

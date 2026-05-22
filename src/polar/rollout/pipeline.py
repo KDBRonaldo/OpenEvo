@@ -12,6 +12,7 @@ from pathlib import Path
 
 import httpx
 
+from polar.platform.events import EventBus
 from polar.rollout.balancer import NodeScheduler
 from polar.rollout.models import SessionContext, SessionDispatchRequest, SessionResult, SessionStatus
 from polar.trajectory.models import Trajectory
@@ -40,18 +41,24 @@ class Pipeline:
         scheduler: NodeScheduler,
         dispatch_poll_interval_seconds: float = 1.0,
         callback_grace_seconds: float = 180.0,
+        event_bus: EventBus | None = None,
     ) -> None:
         self.callback_url = callback_url.rstrip("/")
         self.save_dir = Path(save_dir) if save_dir else None
         self.scheduler = scheduler
         self.dispatch_poll_interval_seconds = dispatch_poll_interval_seconds
         self.callback_grace_seconds = callback_grace_seconds
+        self.event_bus = event_bus
 
         self._client: httpx.AsyncClient | None = None
         self._started = False
         self._lifecycle_lock = asyncio.Lock()
         self._pending: dict[str, asyncio.Future[SessionResult]] = {}
         self._pending_lock = asyncio.Lock()
+
+    async def _emit(self, event_type: str, payload: dict) -> None:
+        if self.event_bus is not None:
+            await self.event_bus.publish(event_type, payload)
 
     async def start(self) -> None:
         async with self._lifecycle_lock:
@@ -117,9 +124,22 @@ class Pipeline:
             self._pending[session.session_id] = future
 
         session.timer.mark("dispatch", "started")
+        await self._emit(
+            "session.state_changed",
+            {"task_id": session.task_id, "session_id": session.session_id, "status": "DISPATCHING"},
+        )
         try:
             dispatch_request = await self._dispatch_session(session)
             session.timer.mark("dispatch", "finished")
+            await self._emit(
+                "session.state_changed",
+                {
+                    "task_id": session.task_id,
+                    "session_id": session.session_id,
+                    "status": "REGISTERED",
+                    "node_id": session.node_id,
+                },
+            )
             result = await self._wait_for_result(session, dispatch_request, future)
         except TimeoutError as exc:
             logger.warning("Session %s timed out in rollout pipeline", session.session_id)

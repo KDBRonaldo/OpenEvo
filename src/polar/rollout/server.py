@@ -7,9 +7,11 @@ import os
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.responses import StreamingResponse
 
 from polar.config import RolloutServiceConfig, TopologyConfig
+from polar.platform.events import SSE_HEADERS, EventBus
 from polar.rollout.balancer import NodeScheduler
 from polar.rollout.manager import RolloutManager
 from polar.rollout.models import (
@@ -38,6 +40,7 @@ class RolloutState:
     scheduler: NodeScheduler
     pipeline: Pipeline
     manager: RolloutManager
+    event_bus: EventBus
 
 
 _state: RolloutState | None = None
@@ -53,20 +56,23 @@ def configure_server(topology_path: str = "topology.yaml") -> None:
 def _build_state(topology: TopologyConfig) -> RolloutState:
     rollout = topology.rollout
     scheduler = NodeScheduler(bootstrap_nodes=topology.bootstrap_nodes)
+    event_bus = EventBus()
     pipeline = Pipeline(
         callback_url=f"{rollout.public_url}/callbacks/session_result",
         save_dir=rollout.save_dir,
         scheduler=scheduler,
         dispatch_poll_interval_seconds=rollout.dispatch_poll_interval_seconds,
         callback_grace_seconds=rollout.callback_grace_seconds,
+        event_bus=event_bus,
     )
-    manager = RolloutManager(pipeline=pipeline, scheduler=scheduler)
+    manager = RolloutManager(pipeline=pipeline, scheduler=scheduler, event_bus=event_bus)
     return RolloutState(
         topology=topology,
         rollout=rollout,
         scheduler=scheduler,
         pipeline=pipeline,
         manager=manager,
+        event_bus=event_bus,
     )
 
 
@@ -165,6 +171,53 @@ async def drain_node(node_id: str):
 async def session_result_callback(result: SessionResult):
     await get_state().pipeline.accept_callback_result(result)
     return {"status": "accepted"}
+
+
+@app.get("/tasks")
+async def list_tasks(
+    status: str | None = Query(default=None),
+    harness: str | None = Query(default=None),
+    since: float | None = Query(default=None),
+    limit: int = Query(default=200, ge=1, le=1000),
+):
+    """List tasks tracked in-memory by RolloutManager."""
+    state = get_state()
+    tasks = state.manager.list_tasks()
+    if status:
+        tasks = [t for t in tasks if t["status"] == status]
+    if harness:
+        tasks = [t for t in tasks if t.get("harness") == harness]
+    if since is not None:
+        tasks = [t for t in tasks if (t.get("updated_at") or 0) >= since]
+    tasks.sort(key=lambda t: (t.get("updated_at") or 0), reverse=True)
+    return {"tasks": tasks[:limit]}
+
+
+@app.get("/tasks/{task_id}/sessions")
+async def list_task_sessions(task_id: str):
+    """Per-session summaries for a task currently in memory."""
+    state = get_state()
+    sessions = state.manager.list_sessions_for(task_id)
+    if sessions is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return {"task_id": task_id, "sessions": sessions}
+
+
+@app.get("/events")
+async def stream_events(request: Request):
+    state = get_state()
+
+    async def iterator():
+        async for chunk in state.event_bus.stream_events(heartbeat_seconds=15.0):
+            if await request.is_disconnected():
+                break
+            yield chunk
+
+    return StreamingResponse(
+        iterator(),
+        media_type="text/event-stream",
+        headers=SSE_HEADERS,
+    )
 
 
 def serve(topology_path: str = "topology.yaml", *, log_level: str = "info") -> None:

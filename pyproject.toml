@@ -54,7 +54,10 @@ where = ["src"]
 include = ["polar*", "slime_bridge*"]
 
 [tool.setuptools.package-data]
-polar = ["**/README.md"]
+polar = [
+    "**/README.md",
+    "platform/web/dist/**/*",
+]
 slime_bridge = ["README.md"]
 
 [tool.pytest.ini_options]

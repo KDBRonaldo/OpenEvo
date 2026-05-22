@@ -15,6 +15,8 @@ import yaml
 
 from polar.config import TopologyConfig
 from polar.gateway.server import serve as serve_gateway
+from polar.platform.cli import add_subcommand as add_platform_subcommand
+from polar.platform.cli import handle as handle_platform
 from polar.rollout.server import serve as serve_rollout
 
 
@@ -35,6 +37,8 @@ def build_parser() -> argparse.ArgumentParser:
         default="topology.yaml",
         help="Path to topology.yaml",
     )
+
+    add_platform_subcommand(subparsers)
 
     gateway_parser = subparsers.add_parser(
         "serve_gateway",
@@ -114,6 +118,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "serve_gateway":
             serve_gateway(args.config, node_id=args.node_id)
             return 0
+        if args.command == "dashboard":
+            return handle_platform(args)
         if args.command == "submit":
             return _handle_submit(args)
         if args.command == "status":

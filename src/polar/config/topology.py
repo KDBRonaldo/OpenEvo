@@ -72,10 +72,19 @@ class GatewayNodeConfig(_StrictModel):
         return self.sglang.base_url
 
 
+class _CompletionPersistenceConfig(_StrictModel):
+    enabled: bool = True
+    max_field_bytes: int = Field(default=1 * 1024 * 1024, gt=0)
+    queue_size: int = Field(default=1024, gt=0)
+
+
 class GatewayConfig(_StrictModel):
     heartbeat_interval_seconds: int = Field(default=30, gt=0)
     rollout_server_url: str | None = None
     nodes: tuple[GatewayNodeConfig, ...] = Field(min_length=1)
+    completion_persistence: _CompletionPersistenceConfig = Field(
+        default_factory=_CompletionPersistenceConfig
+    )
 
     @field_validator("rollout_server_url")
     @classmethod

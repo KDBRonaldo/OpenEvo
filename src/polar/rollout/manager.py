@@ -8,13 +8,16 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, field
+from typing import Any
 
 import httpx
 
+from polar.platform.events import EventBus
 from polar.rollout.balancer import NodeScheduler
 from polar.rollout.models import (
     SessionContext,
     SessionResult,
+    SessionStatus,
     TaskRequest,
     TaskResult,
     TaskStatus,
@@ -32,8 +35,40 @@ class _TaskRecord:
     status: str
     total_sessions: int
     completed_sessions: int = 0
+    errored_sessions: int = 0
+    harness: str | None = None
+    model: str | None = None
+    created_at: float = field(default_factory=time.time)
+    updated_at: float = field(default_factory=time.time)
     results: list[SessionResult] = field(default_factory=list)
     result_paths: list[str] = field(default_factory=list)
+    session_states: dict[str, str] = field(default_factory=dict)
+
+
+def _harness_from_request(request: TaskRequest) -> str | None:
+    if request.agent and request.agent.harness:
+        return request.agent.harness
+    return None
+
+
+def _model_from_request(request: TaskRequest) -> str | None:
+    if request.agent and request.agent.model_name:
+        return request.agent.model_name
+    return None
+
+
+def _mean_reward(results: list[SessionResult]) -> float | None:
+    rewards: list[float] = []
+    for r in results:
+        traces = r.trajectory.traces
+        if traces and traces[-1].reward is not None:
+            try:
+                rewards.append(float(traces[-1].reward))
+            except (TypeError, ValueError):
+                pass
+    if not rewards:
+        return None
+    return sum(rewards) / len(rewards)
 
 
 class RolloutManager:
@@ -44,14 +79,28 @@ class RolloutManager:
         *,
         pipeline: Pipeline,
         scheduler: NodeScheduler,
+        event_bus: EventBus | None = None,
     ) -> None:
         self.pipeline = pipeline
         self.scheduler = scheduler
+        self.event_bus = event_bus or EventBus()
         self._tasks: dict[str, _TaskRecord] = {}
         self._lock = threading.RLock()
+        self._loop: asyncio.AbstractEventLoop | None = None
+
+    def _emit(self, event_type: str, payload: dict[str, Any]) -> None:
+        loop = self._loop
+        if loop is None:
+            try:
+                loop = asyncio.get_running_loop()
+                self._loop = loop
+            except RuntimeError:
+                return
+        self.event_bus.publish_threadsafe(loop, event_type, payload)
 
     async def submit_task(self, request: TaskRequest) -> str:
         """Register a task and run it in the background. Returns task_id immediately."""
+        self._loop = asyncio.get_running_loop()
         with self._lock:
             existing = self._tasks.get(request.task_id)
             if existing is not None and existing.status == "running":
@@ -60,7 +109,19 @@ class RolloutManager:
                 task_id=request.task_id,
                 status="running",
                 total_sessions=request.num_samples,
+                harness=_harness_from_request(request),
+                model=_model_from_request(request),
             )
+        self._emit(
+            "task.created",
+            {
+                "task_id": request.task_id,
+                "status": "running",
+                "harness": _harness_from_request(request),
+                "model": _model_from_request(request),
+                "num_samples": request.num_samples,
+            },
+        )
         asyncio.create_task(self._run_task_background(request))
         return request.task_id
 
@@ -71,7 +132,16 @@ class RolloutManager:
             logger.info("Task %s completed with %d results", request.task_id, len(result.results))
         except Exception:
             logger.exception("Background task %s failed", request.task_id)
+            self._emit("task.completed", {"task_id": request.task_id, "status": "failed"})
             return
+        self._emit(
+            "task.completed",
+            {
+                "task_id": request.task_id,
+                "status": result.status,
+                "completed_sessions": len(result.results),
+            },
+        )
         if request.callback_url:
             await self._post_callback(request.callback_url, result)
 
@@ -92,6 +162,18 @@ class RolloutManager:
                 exc_info=True,
             )
 
+    def session_state_changed(self, task_id: str, session_id: str, status: str) -> None:
+        """Hook invoked from the pipeline whenever a session changes state."""
+        with self._lock:
+            record = self._tasks.get(task_id)
+            if record is not None:
+                record.session_states[session_id] = status
+                record.updated_at = time.time()
+        self._emit(
+            "session.state_changed",
+            {"task_id": task_id, "session_id": session_id, "status": status},
+        )
+
     async def _execute_task(self, request: TaskRequest) -> TaskResult:
         sessions = [
             SessionContext(
@@ -108,28 +190,45 @@ class RolloutManager:
             with self._lock:
                 record = self._tasks[request.task_id]
                 record.completed_sessions += 1
+                if result.status in {SessionStatus.ERROR, SessionStatus.TIMEOUT}:
+                    record.errored_sessions += 1
                 record.results.append(result)
+                record.updated_at = time.time()
+                record.session_states[result.session_id] = str(result.status)
                 if result_path is not None:
                     record.result_paths.append(result_path)
+            self._emit(
+                "session.state_changed",
+                {
+                    "task_id": result.task_id,
+                    "session_id": result.session_id,
+                    "status": str(result.status),
+                },
+            )
+            self._emit(
+                "task.updated",
+                {
+                    "task_id": request.task_id,
+                    "completed_sessions": record.completed_sessions,
+                    "total_sessions": record.total_sessions,
+                },
+            )
 
         try:
             results = await self.pipeline.run_batch(sessions, on_result=_on_result)
         except Exception:
             with self._lock:
                 self._tasks[request.task_id].status = "failed"
+                self._tasks[request.task_id].updated_at = time.time()
             raise
 
         ordered_results = list(results)
-        # `_on_result` accumulated `result_paths` live as sessions completed; that
-        # list is the single source of truth. The final task result reorders the
-        # per-session results into dispatch order but does not rebuild paths.
         with self._lock:
             record = self._tasks[request.task_id]
             record.status = "completed"
             record.completed_sessions = len(ordered_results)
             record.results = ordered_results
-            # Preserve whatever order _on_result filled in; the caller only cares
-            # that every session's path is present, not about ordering.
+            record.updated_at = time.time()
             result_paths = list(record.result_paths)
 
         return TaskResult(
@@ -152,6 +251,54 @@ class RolloutManager:
                 results=list(record.results),
                 result_paths=list(record.result_paths),
             )
+
+    def list_tasks(self) -> list[dict[str, Any]]:
+        with self._lock:
+            out: list[dict[str, Any]] = []
+            for record in self._tasks.values():
+                out.append({
+                    "task_id": record.task_id,
+                    "status": record.status,
+                    "harness": record.harness,
+                    "model": record.model,
+                    "num_samples": record.total_sessions,
+                    "completed_sessions": record.completed_sessions,
+                    "errored_sessions": record.errored_sessions,
+                    "mean_reward": _mean_reward(record.results),
+                    "created_at": record.created_at,
+                    "updated_at": record.updated_at,
+                    "source": "live",
+                })
+            return out
+
+    def list_sessions_for(self, task_id: str) -> list[dict[str, Any]] | None:
+        with self._lock:
+            record = self._tasks.get(task_id)
+            if record is None:
+                return None
+            existing = {r.session_id: r for r in record.results}
+            out: list[dict[str, Any]] = []
+            for session_id, status in record.session_states.items():
+                result = existing.get(session_id)
+                if result is not None:
+                    traces = result.trajectory.traces
+                    reward = traces[-1].reward if traces else None
+                    out.append({
+                        "session_id": result.session_id,
+                        "task_id": result.task_id,
+                        "status": str(result.status),
+                        "node_id": result.node_id,
+                        "reward": reward,
+                        "timing": result.timing.model_dump(),
+                        "error": result.error,
+                    })
+                else:
+                    out.append({
+                        "session_id": session_id,
+                        "task_id": task_id,
+                        "status": status,
+                    })
+            return out
 
     def status(self) -> dict[str, object]:
         with self._lock:

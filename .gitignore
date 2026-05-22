@@ -116,3 +116,7 @@ glm/
 # Generated documentation
 docs/_build/
 /site
+
+# Dashboard frontend build artifacts
+web/node_modules/
+web/dist/

@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
+from polar.gateway.completion_writer import CompletionWriter
 from polar.trajectory.models import CompletionRecord, CompletionSession
 
 
@@ -27,13 +28,28 @@ class _SessionState:
 class SessionStore:
     """Thread-safe in-memory storage for active gateway sessions."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, completion_writer: CompletionWriter | None = None) -> None:
         self._lock = threading.RLock()
         self._sessions: dict[str, _SessionState] = {}
+        self._completion_writer = completion_writer
 
     def close(self) -> None:
         with self._lock:
             self._sessions.clear()
+
+    def list_active_sessions(self) -> list[dict[str, Any]]:
+        with self._lock:
+            return [
+                self._metadata_payload_locked(state)
+                for state in self._sessions.values()
+            ]
+
+    def get_completions(self, session_id: str) -> list[dict[str, Any]]:
+        with self._lock:
+            state = self._sessions.get(session_id)
+            if state is None:
+                return []
+            return [c.model_dump(mode="json") for c in state.completions]
 
     def ensure_session(
         self,
@@ -98,7 +114,29 @@ class SessionStore:
             )
             state.completions.append(record)
             state.completion_count = len(state.completions)
-            return record.completion_id
+            effective_task_id = state.task_id
+
+        # Off the hot path: best-effort persist to disk.
+        if self._completion_writer is not None:
+            self._completion_writer.enqueue(
+                task_id=effective_task_id,
+                session_id=session_id,
+                completion_id=record.completion_id,
+                record={
+                    "completion_id": record.completion_id,
+                    "timestamp": record.timestamp,
+                    "session_id": session_id,
+                    "task_id": effective_task_id,
+                    "api_type": api_type,
+                    "model_requested": model_requested,
+                    "model_used": effective_model_used,
+                    "original_request": original_request or {},
+                    "transformed_request": request,
+                    "response": response,
+                    "metadata": dict(metadata or {}),
+                },
+            )
+        return record.completion_id
 
     def get_session_metadata(self, session_id: str) -> dict[str, Any] | None:
         """Return session metadata if present."""

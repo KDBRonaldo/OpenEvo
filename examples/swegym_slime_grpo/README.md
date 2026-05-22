@@ -8,6 +8,10 @@ ports, and harness settings are intentionally kept in the executable scripts and
 YAML files. Treat those files as the source of truth, since the configuration is
 expected to change as the example evolves.
 
+## Installation
+
+Follow [Slime bridge installation guide](../../src/slime_bridge/README.md#slime-installation) to install the proper versions of Slime and Megatron.
+
 ## Quick Start
 
 ```bash

@@ -27,28 +27,39 @@
 
 ## Installation
 
+#### Install the **Rollout Server** (Polar): 
 ```bash
 uv venv
 uv pip install -e .
 ```
 
-SGLang is installed and launched separately.
-
+#### Install the **Inference Server** (SGLang):
 ```bash
 uv pip install --prerelease=allow sglang==0.5.10
 bash scripts/patch/patch_sglang.sh
 ```
+The patch applies necessary TITO and prompt token id emission on pinned `sglang` version. We'll remove this once upstream supports go through. `vllm` integration is on the way.
 
-For SWE-bench evaluation support:
+#### Polar is trainer agnostic. So choice of **Trainer** and **Training Backend** are highly flexible given Polar's server boundaries.
+
+Currently, we provide a demo-purpose [Slime](https://github.com/THUDM/slime) integration in [Slime bridge installation guide](src/slime_bridge/README.md#slime-installation).
+
+
+#### (Optional) For SWE-bench official evaluation harness:
 
 ```bash
 uv pip install -e ".[swebench]"
 ```
 
-**Polar** itself is trainer agnostic. Currently, we provide a demo-purpose [Slime](https://github.com/THUDM/slime) integration in [Slime bridge installation guide](src/slime_bridge/README.md#slime-installation).
+#### (Optional) To enable **polar dashboard** UI, build the frontend once.
+
+```bash
+cd web && npm install && npm run build
+```
 
 
-## Quick Start
+
+## Usage Guide
 
 - ⭐ [Choose your Agent Harness](src/polar/agent/README.md): pick a built-in harness, or use the generic shell harness with wrapped agents.
 - 🚀 [Trajectory Construction and Eval](src/polar/trajectory/README.md): See [builder](src/polar/trajectory/builder/README.md) and
@@ -58,19 +69,32 @@ uv pip install -e ".[swebench]"
 
 
 
+## CLI Interface
+
+A typical local run uses five commands. Each takes the same `topology.yaml`.
+
+```
+polar serve_rollout   -c topology.yaml                            # central orchestrator (port 8080)
+polar serve_gateway   -c topology.yaml --node-id <node>           # one per gateway node (port 8100+)
+polar dashboard       -c topology.yaml [--port 8090]              # observability & monitoring dashboard
+polar submit          <task.json|yaml> -c topology.yaml           # submit a task and tail it
+polar status          -c topology.yaml                            # one-shot health / topology check
+```
+
 ## Examples
 
-- [Calculator](examples/calculator/README.md): minimal smoke test without extra runtime dependency.
+- [Calculator](examples/calculator/README.md): minimal smoke test.
+- [Count Stars](examples/count_stars/README.md): minimal test for VLM.
 - [SWE-bench Verified](examples/swebench_verified/README.md): benchmark-style
   evaluation on SWE-bench Verified tasks.
 - [SWE-Gym Slime GRPO](examples/swegym_slime_grpo/README.md): training
   path that connects Polar rollouts to Slime.
 
 <p align="center">
-  <img src="assets/swegym_grpo_training_curves.png" alt="Polar rollout architecture" width="760" />
+  <img src="assets/swegym_grpo_training_curves.png" alt="Polar rollout architecture" width="660" />
 </p>
 
-This project is under early development. We are actively adding new examples for different tasks / models on diverse hardware setups. **Contributions are welcome!**
+This project is under active development. We are adding new examples for different tasks / models on diverse hardware setups. **Contributions are welcome!**
 
 
 
@@ -84,7 +108,7 @@ Our development goal for **Polar** is low-intrusion and neutral, finding the low
 
 - [x] Initial release & tech report.
 - [x] Slime bridge & RL example.
-- [ ] CUA (VLM / VLA) Support.
+- [x] CUA (VLM / VLA) Support.
 - [ ] More built-in evaluators (eg. self distillation with textual feedback).
 - [ ] vLLM dual inference support.
 - [ ] More trainer bridges (NemoRL, VERL, etc.).
