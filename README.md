@@ -4,6 +4,7 @@
 
 <p align="center">
 <a href="https://www.apache.org/licenses/LICENSE-2.0"><img src="https://img.shields.io/badge/License-Apache%202.0-green.svg" alt="Apache 2.0 License" /></a>
+<a href="https://arxiv.org/pdf/2605.24220"><img src="https://img.shields.io/badge/📄_Tech_Report-orange?style=flat-square" alt="Tech Report" /></a>
 <!-- <a href="https://www.python.org/downloads/release/python-3100/"><img src="https://img.shields.io/badge/python-3.10+-blue.svg" alt="Python 3.11+" /></a> -->
 <!-- <a href="https://github.com/NVIDIA-NeMo/ProRL-Agent-Server/stargazers/"><img src="https://img.shields.io/github/stars/NVIDIA-NeMo/ProRL-Agent-Server.svg?style=social&label=Star" alt="GitHub Stars" /></a> -->
 
@@ -12,9 +13,9 @@
 
 **Polar** is a RL rollout framework for real-world agent harnesses.
 
-1. **Harness as Environment.** Bring your agent harnesses as RL-ready environments without code change.
-2. **Smart Rollout Pipeline.** Save GPU hours with Polar's parallel rollout staging & runtime prewarm.
-3. **Rollout as a Service.** Server mode by design -- scaling Async RL with any training frameworks.
+1. **Harness as Environment.** Bring your agent **harnesses as RL-ready environments** without code change.
+2. **Smart Rollout Pipeline.** Save GPU hours with Polar's parallel **Rollout Staging & Runtime Pooling**.
+3. **Rollout as a Service.** Server mode by design -- **scaling Async RL with any training frameworks**.
 
 
 ## Architecture Overview
@@ -22,36 +23,36 @@
   <img src="assets/polar_arch.svg" alt="Polar rollout architecture" width="860"/>
 </p>
 
-*The Rollout Server manages and dispatches client requests into distributed Gateway Nodes, which asynchronously prepare runtime, execute agents, build trajectories and evaluate them. Agent harnesses are listened by a proxy that sits between agnostic agent execution processes and local inference servers.*
+*The Rollout Server manages and dispatches client requests into distributed Gateway Nodes, which asynchronously prepare runtime, execute agents, build trajectories and evaluate them. Agent harnesses are listened by a proxy that sits between agnostic agent execution processes and inference servers.*
 
 
 ## Installation
 
-#### Install the **Rollout Server** (Polar): 
+#### 🟩 Install the **Rollout Server** (Polar): 
 ```bash
 uv venv
 uv pip install -e .
 ```
 
-#### Install the **Inference Server** (SGLang):
+#### 🟩 Install the **Inference Server** (SGLang):
 ```bash
 uv pip install --prerelease=allow sglang==0.5.10
 bash scripts/patch/patch_sglang.sh
 ```
 The patch applies necessary TITO and prompt token id emission on pinned `sglang` version. We'll remove this once upstream supports go through. `vllm` integration is on the way.
 
-#### Polar is trainer agnostic. So choice of **Trainer** and **Training Backend** are highly flexible given Polar's server boundaries.
+#### 🟩 Polar is trainer agnostic. So choice of **Trainer** and **Training Backend** are highly flexible given Polar's server boundaries.
 
 Currently, we provide a demo-purpose [Slime](https://github.com/THUDM/slime) integration in [Slime bridge installation guide](src/slime_bridge/README.md#slime-installation).
 
 
-#### (Optional) For SWE-bench official evaluation harness:
+#### 🟩 (Optional) For SWE-bench official evaluation harness:
 
 ```bash
 uv pip install -e ".[swebench]"
 ```
 
-#### (Optional) To enable **polar dashboard** UI, build the frontend once.
+#### 🟩 (Optional) To enable **polar dashboard** UI, build the frontend once.
 
 ```bash
 cd web && npm install && npm run build
@@ -82,7 +83,6 @@ polar status          -c topology.yaml                            # one-shot hea
 ```
 
 ## Examples
-
 - [Calculator](examples/calculator/README.md): minimal smoke test.
 - [Count Stars](examples/count_stars/README.md): minimal test for VLM.
 - [SWE-bench Verified](examples/swebench_verified/README.md): benchmark-style
@@ -94,7 +94,7 @@ polar status          -c topology.yaml                            # one-shot hea
   <img src="assets/swegym_grpo_training_curves.png" alt="Polar rollout architecture" width="660" />
 </p>
 
-This project is under active development. We are adding new examples for different tasks / models on diverse hardware setups. **Contributions are welcome!**
+🟩 We are adding new examples for different tasks / models on diverse hardware setups. **Contributions are welcome!**
 
 
 
@@ -126,6 +126,15 @@ Our development goal for **Polar** is low-intrusion and neutral, finding the low
 > [!IMPORTANT]
 > If you find it useful, please consider citing our work:
 ```md
+@article{xu2026polar,
+  title={Polar: Agentic RL on Any Harness at Scale},
+  author={Xu, Binfeng and Zhang, Hao and Zhang, Shaokun and Han, Songyang and Liu, Mingjie and Hu, Jian and Diao, Shizhe and Jin, Zhenghui and Zou, Yunheng and Demoret, Michael and Kautz, Jan and Dong, Yi},
+  journal={arXiv preprint arXiv:2605.24220},
+  year={2026}
+}
+```
+
+```md
 @article{zhang2026prorl,
   title={ProRL Agent: Rollout-as-a-Service for RL Training of Multi-Turn LLM Agents},
   author={Zhang, Hao and Liu, Mingjie and Zhang, Shaokun and Han, Songyang and Hu, Jian and Jin, Zhenghui and Zhang, Yuchi and Diao, Shizhe and Lu, Ximing and Xu, Binfeng and others},
@@ -133,4 +142,3 @@ Our development goal for **Polar** is low-intrusion and neutral, finding the low
   year={2026}
 }
 ```
-
