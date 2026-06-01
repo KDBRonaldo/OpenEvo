@@ -30,29 +30,41 @@
 
 #### 🟩 Install the **Rollout Server** (Polar): 
 ```bash
-uv venv
+uv venv --python 3.13
 uv pip install -e .
+source .venv/bin/activate
 ```
 
-#### 🟩 Install the **Inference Server** (SGLang):
+### 🟩 Install the **Inference Server** (SGLang or vLLM):
+
+Pick one (that your trainer supports). Avoid installing both under the same environment given dependency conflicts.
+
+**vLLM**
 ```bash
-uv pip install --prerelease=allow sglang==0.5.10
+uv pip install vllm --torch-backend=auto
+```
+
+**SGLang**
+```bash
+uv pip install --prerelease=allow sglang==0.5.10 torch==2.9.1+cu128
 bash scripts/patch/patch_sglang.sh
 ```
-The patch applies necessary TITO and prompt token id emission on pinned `sglang` version. We'll remove this once upstream supports go through. `vllm` integration is on the way.
+The patch applies necessary TITO and prompt token id emission on the pinned `sglang` version. We'll remove this once upstream support goes through.
 
-#### 🟩 Polar is trainer agnostic. So choice of **Trainer** and **Training Backend** are highly flexible given Polar's server boundaries.
+### 🟩 Install your favorite **Training Framework**:
+
+Polar is trainer agnostic. So choice of **Trainer** and **Training Backend** are highly flexible given Polar's HTTP server boundaries.
 
 Currently, we provide a demo-purpose [Slime](https://github.com/THUDM/slime) integration in [Slime bridge installation guide](src/slime_bridge/README.md#slime-installation).
 
 
-#### 🟩 (Optional) For SWE-bench official evaluation harness:
+#### (Optional) For SWE-bench official evaluation harness:
 
 ```bash
 uv pip install -e ".[swebench]"
 ```
 
-#### 🟩 (Optional) To enable **polar dashboard** UI, build the frontend once.
+#### (Optional) To enable **polar dashboard** UI, build the frontend once.
 
 ```bash
 cd web && npm install && npm run build
@@ -62,7 +74,7 @@ cd web && npm install && npm run build
 
 ## Usage Guide
 
-- ⭐ [Choose your Agent Harness](src/polar/agent/README.md): pick a built-in harness, or use the generic shell harness with wrapped agents.
+- ⭐ [Choose your Agent Harness](src/polar/agent/README.md): Express your agent using the generic `shell` harness, or pick a preset shortcut.
 - 🚀 [Trajectory Construction and Eval](src/polar/trajectory/README.md): See [builder](src/polar/trajectory/builder/README.md) and
   [evaluator](src/polar/trajectory/evaluator/README.md) guides for registered strategies.
 - 🔧 [Deployment Topology](src/polar/config/README.md): configure the Polar service.
@@ -110,7 +122,7 @@ Our development goal for **Polar** is low-intrusion and neutral, finding the low
 - [x] Slime bridge & RL example.
 - [x] CUA (VLM / VLA) Support.
 - [ ] More built-in evaluators (eg. self distillation with textual feedback).
-- [ ] vLLM dual inference support.
+- [x] vLLM dual inference support.
 - [ ] More trainer bridges (NemoRL, VERL, etc.).
 
 </td>

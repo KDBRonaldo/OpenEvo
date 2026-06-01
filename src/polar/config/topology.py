@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import socket
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlparse
 
 import yaml
@@ -19,13 +19,14 @@ class _StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
 
-class _SGLangConfig(_StrictModel):
+class _InferenceConfig(_StrictModel):
+    engine: Literal["sglang", "vllm"] = "sglang"
     base_url: str = "http://127.0.0.1:8000"
 
     @field_validator("base_url")
     @classmethod
     def _validate_url(cls, value: str) -> str:
-        return _normalize_http_url(value, "gateway.nodes[].sglang.base_url")
+        return _normalize_http_url(value, "gateway.nodes[].inference.base_url")
 
 
 class GatewayNodeConfig(_StrictModel):
@@ -34,7 +35,7 @@ class GatewayNodeConfig(_StrictModel):
     port: int = Field(default=8081, ge=1, le=65535)
     public_url: str
     model_served: str = ""
-    sglang: _SGLangConfig = Field(default_factory=_SGLangConfig)
+    inference: _InferenceConfig = Field(default_factory=_InferenceConfig)
     max_init_workers: int = Field(default=4, gt=0)
     max_run_workers: int = Field(default=2, gt=0)
     max_postrun_workers: int = Field(default=4, gt=0)
@@ -68,8 +69,12 @@ class GatewayNodeConfig(_StrictModel):
         return _normalize_http_url(value, "gateway.nodes[].public_url")
 
     @property
-    def sglang_base_url(self) -> str:
-        return self.sglang.base_url
+    def inference_base_url(self) -> str:
+        return self.inference.base_url
+
+    @property
+    def engine(self) -> str:
+        return self.inference.engine
 
 
 class _CompletionPersistenceConfig(_StrictModel):

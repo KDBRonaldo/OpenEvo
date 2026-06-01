@@ -1,110 +1,65 @@
 # Calculator Example
 
-This is a small end-to-end Polar rollout example. Each agent gets a tiny
-`calculator.py` file with parser stubs, edits it, and the evaluator runs
-`python3 test_calculator.py`.
+The smallest end-to-end Polar run. Each harness gets a tiny `calculator.py`
+with parser stubs, edits it, and the evaluator runs `python3 test_calculator.py`.
+Use it as a quick smoke test that rollout, gateway, runtime, harness execution,
+and evaluation all work together.
 
-Use this example when you want a quick local check that rollout, gateway,
-runtime setup, harness execution, and evaluation still work together.
+## Prerequisites
 
-The topology setup is used on 4 x B200 GPUs. Adjust based on your hardware.
+Install **Polar** and **vLLM** as described in the [top-level README](../../README.md#installation).
+This example uses 1 node 8×B200 — two vLLM servers (tensor-parallel 4 each).
+Adjust the setup and topology for your hardware.
 
-## What It Runs
+## Quick Start
 
-- rollout server on `:8080`
-- two gateway nodes on `:8100` and `:8101`
-- two local SGLang backends on `:8000` and `:8001`
-- one shared runtime image: `polar-localhost-calculator:latest`
-- six harnesses: `claude_code`, `codex`, `gemini_cli`, `opencode`, `pi`,
-  `qwen_code`
-
-The default scripts use Docker. Apptainer is also supported with
-`--backend apptainer`.
-
-## Setup
-
-From the repo root:
-
-```bash
-uv venv
-uv pip install -e .
-uv pip install --prerelease=allow sglang==0.5.10
-bash scripts/patch/patch_sglang.sh
-```
-
-Build the runtime image once:
+### 1. Build the runtime image (once)
 
 ```bash
 uv run python examples/calculator/build_image.py
 ```
 
-## Start Services
-
-Start two SGLang servers, one per GPU group:
+### 2. Start two vLLM servers
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 uv run python -m sglang.launch_server \
-  --model-path Qwen/Qwen3.5-4B \
-  --host 0.0.0.0 \
-  --port 8000 \
-  --tool-call-parser qwen3_coder \
-  --reasoning-parser qwen3 \
-  --mem-fraction-static 0.7 \
-  --context-length 262144 \
-  --trust-remote-code
+CUDA_VISIBLE_DEVICES=0,1,2,3 uv run vllm serve Qwen/Qwen3.6-27B --port 8000 \
+  --tensor-parallel-size 4 --max-model-len 262144 \
+  --reasoning-parser qwen3 --enable-auto-tool-choice --tool-call-parser qwen3_coder
+
+CUDA_VISIBLE_DEVICES=4,5,6,7 uv run vllm serve Qwen/Qwen3.6-27B --port 8001 \
+  --tensor-parallel-size 4 --max-model-len 262144 \
+  --reasoning-parser qwen3 --enable-auto-tool-choice --tool-call-parser qwen3_coder
 ```
 
-```bash
-CUDA_VISIBLE_DEVICES=1 uv run python -m sglang.launch_server \
-  --model-path Qwen/Qwen3.5-4B \
-  --host 0.0.0.0 \
-  --port 8001 \
-  --tool-call-parser qwen3_coder \
-  --reasoning-parser qwen3 \
-  --mem-fraction-static 0.7 \
-  --context-length 262144 \
-  --trust-remote-code
-```
-
-Start Polar:
+### 3. Start Polar Servers
 
 ```bash
 uv run polar serve_rollout -c examples/calculator/topology.yaml
-```
-
-```bash
 uv run polar serve_gateway -c examples/calculator/topology.yaml --node-id localhost-node-01
-```
-
-```bash
 uv run polar serve_gateway -c examples/calculator/topology.yaml --node-id localhost-node-02
 ```
 
-## Run
+### 4. Run
 
-Run every harness:
-
-```bash
-uv run python examples/calculator/submit_all.py
-```
-
-Run one harness:
+Submits example harness at once and prints a reward comparison:
 
 ```bash
-uv run python examples/calculator/submit_calculator_task.py claude_code
+uv run python examples/calculator/run.py
 ```
 
-Use Apptainer instead of Docker:
+Use Apptainer instead of Docker with `--backend apptainer`.
+
+### 5. (Optional) Watch in the dashboard
 
 ```bash
-uv run python examples/calculator/submit_all.py --backend apptainer
+uv run polar dashboard -c examples/calculator/topology.yaml
 ```
 
-Results are written under:
+Open <http://127.0.0.1:8090> to inspect live tasks, sessions, trajectories,
+and evaluations.
 
-```text
-examples/calculator/batches/<timestamp>/
-```
+<p align="center">
+  <img src="../../assets/dashboard_calculator.png" alt="Calculator dashboard" width="400">
+  <img src="../../assets/dashboard_trajectory.png" alt="Trajectory view" width="400">
+</p>
 
-Each harness directory contains `request.json`, `response.json`, and
-`summary.json`.

@@ -29,6 +29,8 @@ class TaskSummary:
     completed_sessions: int = 0
     errored_sessions: int = 0
     mean_reward: float | None = None
+    mean_traces: float | None = None
+    mean_completions: float | None = None
     created_at: float | None = None
     updated_at: float | None = None
     save_dir_path: str = ""
@@ -45,6 +47,8 @@ class TaskSummary:
             "completed_sessions": self.completed_sessions,
             "errored_sessions": self.errored_sessions,
             "mean_reward": self.mean_reward,
+            "mean_traces": self.mean_traces,
+            "mean_completions": self.mean_completions,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "save_dir_path": self.save_dir_path,
@@ -184,6 +188,8 @@ def _scan_task_dir(task_dir: Path) -> TaskSummary | None:
         summary.num_samples = int(index.get("num_samples") or 0)
         summary.completed_sessions = int(index.get("completed_sessions") or 0)
         summary.mean_reward = index.get("mean_reward")
+        summary.mean_traces = index.get("mean_traces")
+        summary.mean_completions = index.get("mean_completions")
         if index.get("created_at") is not None:
             try:
                 summary.created_at = float(index["created_at"])
@@ -198,6 +204,8 @@ def _scan_task_dir(task_dir: Path) -> TaskSummary | None:
 
     # No index file — fall back to scanning each session file.
     rewards: list[float] = []
+    trace_counts: list[int] = []
+    completion_counts: list[int] = []
     completed = 0
     errored = 0
     earliest = summary.created_at
@@ -216,6 +224,11 @@ def _scan_task_dir(task_dir: Path) -> TaskSummary | None:
         reward = _trace_reward(data)
         if reward is not None:
             rewards.append(reward)
+        traj = data.get("trajectory") or {}
+        traces = traj.get("traces") or []
+        trace_counts.append(len(traces))
+        record_count = (traj.get("metadata") or {}).get("record_count")
+        completion_counts.append(int(record_count) if isinstance(record_count, int) else len(traces))
         try:
             mtime = session_path.stat().st_mtime
             ctime = session_path.stat().st_ctime
@@ -236,6 +249,10 @@ def _scan_task_dir(task_dir: Path) -> TaskSummary | None:
     summary.completed_sessions = completed
     summary.errored_sessions = errored
     summary.mean_reward = sum(rewards) / len(rewards) if rewards else None
+    summary.mean_traces = sum(trace_counts) / len(trace_counts) if trace_counts else None
+    summary.mean_completions = (
+        sum(completion_counts) / len(completion_counts) if completion_counts else None
+    )
     summary.created_at = earliest
     summary.updated_at = latest
     if completed + errored == len(session_files) and session_files:

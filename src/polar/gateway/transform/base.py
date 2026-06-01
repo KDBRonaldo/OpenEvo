@@ -1,4 +1,4 @@
-"""Base transformer interface with SGLang request enhancement."""
+"""Base transformer interface with inference-backend request enhancement."""
 
 from __future__ import annotations
 
@@ -9,13 +9,13 @@ from typing import Any
 class BaseTransformer(ABC):
     """Abstract base class for API transformers.
 
-    Transforms requests from source API format to OpenAI format (for SGLang),
-    and transforms responses back to source API format.
+    Transforms requests from source API format to OpenAI format (for the
+    inference backend), and transforms responses back to source API format.
     """
 
     @abstractmethod
     def transform_request(self, body: dict[str, Any]) -> dict[str, Any]:
-        """Transform request body to OpenAI/SGLang format."""
+        """Transform request body to OpenAI format for the inference backend."""
         pass
 
     @abstractmethod
@@ -46,13 +46,29 @@ class BaseTransformer(ABC):
         return None
 
     @staticmethod
-    def _is_qwen_model(model_name: str | None) -> bool:
+    def _is_qwen35_model(model_name: str | None) -> bool:
         if not model_name:
             return False
-        return "qwen" in model_name.lower()
+        return "qwen3.5" in model_name.lower()
 
     @staticmethod
-    def _merge_developer_role(request: dict[str, Any]) -> dict[str, Any]:
+    def _content_to_text(content: Any) -> str:
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts: list[str] = []
+            for block in content:
+                if isinstance(block, str):
+                    parts.append(block)
+                elif isinstance(block, dict):
+                    text = block.get("text")
+                    if isinstance(text, str):
+                        parts.append(text)
+            return "\n".join(parts)
+        return str(content) if content else ""
+
+    @classmethod
+    def _merge_developer_role(cls, request: dict[str, Any]) -> dict[str, Any]:
         """Rename 'developer' role to 'system' and merge all system messages into one."""
         messages = request.get("messages")
         if not isinstance(messages, list):
@@ -69,34 +85,39 @@ class BaseTransformer(ABC):
         non_system: list[Any] = []
         for msg in normalized:
             if isinstance(msg, dict) and msg.get("role") == "system":
-                content = msg.get("content", "")
-                text = content if isinstance(content, str) else str(content) if content else ""
+                text = cls._content_to_text(msg.get("content", ""))
                 if text:
                     system_parts.append(text)
             else:
                 non_system.append(msg)
 
-        if len(system_parts) > 1:
-            request["messages"] = [{"role": "system", "content": "\n\n".join(system_parts)}, *non_system]
+        if system_parts:
+            request["messages"] = [
+                {"role": "system", "content": "\n\n".join(system_parts)},
+                *non_system,
+            ]
         else:
-            request["messages"] = normalized
+            request["messages"] = non_system
         return request
 
-    def _enhance_for_training(
+    def _normalize_request(
         self,
         request: dict[str, Any],
         model_name: str | None = None,
     ) -> dict[str, Any]:
-        """Apply model compatibility fixes and request fields needed for training."""
+        """Normalize the OpenAI request: drop internal keys, merge system roles,
+        and apply per-model template fixes. Training-signal params (logprobs,
+        token ids) are added later by the inference engine.
+        """
         request.pop("_polar_model_served", None)
 
-        if self._is_qwen_model(model_name):
-            # Qwen chat templates do not support the developer role and need
-            # to be thinking disabled.
-            request = self._merge_developer_role(request)
+        request = self._merge_developer_role(request)
+
+        if self._is_qwen35_model(model_name):
+            # Qwen3.5 outputs tool calls inside thinking; disable thinking.
+            # https://www.reddit.com/r/LocalLLaMA/comments/1sccqt2/i_think_i_got_solutions_for_qwen_35_tool_call_in/
             chat_template_kwargs = dict(request.get("chat_template_kwargs") or {})
             chat_template_kwargs.setdefault("enable_thinking", False)
             request["chat_template_kwargs"] = chat_template_kwargs
 
-        request["logprobs"] = True
         return request

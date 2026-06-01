@@ -45,7 +45,8 @@ export function Dashboard() {
                 <th className="px-3 py-2">task_id</th>
                 <th className="px-3 py-2">status</th>
                 <th className="px-3 py-2">harness</th>
-                <th className="px-3 py-2">reward</th>
+                <th className="px-3 py-2">reward (avg)</th>
+                <th className="px-3 py-2">trace / completion</th>
                 <th className="px-3 py-2">progress</th>
                 <th className="px-3 py-2">updated</th>
               </tr>
@@ -64,6 +65,11 @@ export function Dashboard() {
                   <td className="px-3 py-2 text-xs">{task.harness ?? "—"}</td>
                   <td className="px-3 py-2 text-xs font-mono">
                     {formatReward(task.mean_reward)}
+                  </td>
+                  <td className="px-3 py-2 text-xs font-mono">
+                    {task.mean_traces != null ? task.mean_traces.toFixed(1) : "—"}
+                    {" / "}
+                    {task.mean_completions != null ? task.mean_completions.toFixed(1) : "—"}
                   </td>
                   <td className="px-3 py-2 text-xs">
                     {task.completed_sessions}/{task.num_samples}

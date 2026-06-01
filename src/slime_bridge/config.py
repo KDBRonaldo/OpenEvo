@@ -208,7 +208,8 @@ def render_topology_template(topology_path: str | Path, args: Any) -> dict[str, 
                     "port": node.port,
                     "public_url": node.public_url,
                     "model_served": node.model_served,
-                    "sglang": {
+                    "inference": {
+                        "engine": "sglang",
                         "base_url": router_url,
                     },
                     "max_init_workers": node.max_init_workers,

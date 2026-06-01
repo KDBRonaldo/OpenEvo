@@ -91,13 +91,14 @@ ipython_config.py
 # PyPI config
 .pypirc
 
-# Project-local outputs
+# Project local
 *.log
 *.out
 *.pkl
 batches/
 wandb/
 checkpoints/
+models/
 experiments/
 rollout_results/
 outputs/
@@ -114,7 +115,7 @@ Megatron-LM/
 glm/
 
 # Generated documentation
-docs/_build/
+docs/
 /site
 
 # Dashboard frontend build artifacts

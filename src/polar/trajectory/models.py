@@ -96,7 +96,7 @@ class Trace(BaseModel):
     response_messages: list[dict[str, Any]] = Field(default_factory=list)
     tools: list[dict[str, Any]] | None = None
     finish_reason: str | None = None
-    response_logprobs: list[dict[str, Any]] | None = None
+    response_logprobs: list[float] | None = None
     reward: float | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
 
@@ -112,9 +112,14 @@ class Trace(BaseModel):
         return normalized
 
     @model_validator(mode="after")
-    def _validate_loss_mask_length(self) -> "Trace":
+    def _validate_response_lengths(self) -> "Trace":
         if self.loss_mask and len(self.loss_mask) != len(self.response_ids):
             raise ValueError("loss_mask length must match response_ids length")
+        if (
+            self.response_logprobs is not None
+            and len(self.response_logprobs) != len(self.response_ids)
+        ):
+            raise ValueError("response_logprobs length must match response_ids length")
         return self
 
 

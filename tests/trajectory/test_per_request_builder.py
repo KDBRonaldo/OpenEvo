@@ -71,7 +71,4 @@ def test_per_request_builder_emits_one_trace_per_completion() -> None:
     assert trace.prompt_messages == [{"role": "user", "content": "Say hi"}]
     assert trace.response_messages == [{"role": "assistant", "content": "Hi"}]
     assert trace.tools == [{"type": "function", "function": {"name": "lookup"}}]
-    assert trace.response_logprobs == [
-        {"token_id": 3, "logprob": -0.1},
-        {"token_id": 4, "logprob": -0.2},
-    ]
+    assert trace.response_logprobs == [-0.1, -0.2]

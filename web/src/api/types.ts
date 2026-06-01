@@ -7,6 +7,8 @@ export interface TaskSummary {
   completed_sessions: number;
   errored_sessions?: number;
   mean_reward?: number | null;
+  mean_traces?: number | null;
+  mean_completions?: number | null;
   created_at?: number | null;
   updated_at?: number | null;
   save_dir_path?: string;
@@ -93,7 +95,8 @@ export interface TopologyPayload {
     port: number;
     gateway_url: string;
     model_served: string;
-    sglang_base_url: string;
+    engine: string;
+    inference_base_url: string;
     max_init_workers: number;
     max_run_workers: number;
     max_postrun_workers: number;

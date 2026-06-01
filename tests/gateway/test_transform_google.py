@@ -19,7 +19,19 @@ def test_google_request_maps_all_fields_and_image_input_to_chat() -> None:
                     "maxOutputTokens": 128,
                     "temperature": 0.2,
                     "topP": 0.9,
+                    "topK": 40,
+                    "candidateCount": 2,
+                    "presencePenalty": 0.1,
+                    "frequencyPenalty": 0.2,
+                    "seed": 123,
+                    "logprobs": 4,
                     "stopSequences": ["END"],
+                    "responseMimeType": "application/json",
+                    "responseSchema": {
+                        "type": "OBJECT",
+                        "properties": {"answer": {"type": "STRING"}},
+                        "required": ["answer"],
+                    },
                 },
                 "tools": [
                     {
@@ -116,7 +128,24 @@ def test_google_request_maps_all_fields_and_image_input_to_chat() -> None:
     assert transformed["max_tokens"] == 128
     assert transformed["temperature"] == 0.2
     assert transformed["top_p"] == 0.9
+    assert transformed["top_k"] == 40
+    assert transformed["n"] == 2
+    assert transformed["presence_penalty"] == 0.1
+    assert transformed["frequency_penalty"] == 0.2
+    assert transformed["seed"] == 123
+    assert transformed["top_logprobs"] == 4
     assert transformed["stop"] == ["END"]
+    assert transformed["response_format"] == {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "google_response",
+            "schema": {
+                "type": "object",
+                "properties": {"answer": {"type": "string"}},
+                "required": ["answer"],
+            },
+        },
+    }
     assert transformed["stream"] is True
     assert transformed["tools"] == [
         {
@@ -132,8 +161,164 @@ def test_google_request_maps_all_fields_and_image_input_to_chat() -> None:
         "type": "function",
         "function": {"name": "write_answer"},
     }
-    assert transformed["logprobs"] is True
     assert transformed["chat_template_kwargs"]["enable_thinking"] is False
+
+
+def test_google_request_maps_tool_choice_modes() -> None:
+    transformer = GoogleTransformer()
+    base_body = {
+        "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+        "tools": [
+            {
+                "functionDeclarations": [
+                    {"name": "lookup", "parametersJsonSchema": {"type": "object"}}
+                ]
+            }
+        ],
+    }
+
+    assert (
+        transformer.transform_request(
+            {
+                **base_body,
+                "toolConfig": {"functionCallingConfig": {"mode": "NONE"}},
+            }
+        )["tool_choice"]
+        == "none"
+    )
+    assert (
+        transformer.transform_request(
+            {
+                **base_body,
+                "toolConfig": {"functionCallingConfig": {"mode": "ANY"}},
+            }
+        )["tool_choice"]
+        == "required"
+    )
+    assert transformer.transform_request(
+        {
+            **base_body,
+            "toolConfig": {
+                "functionCallingConfig": {
+                    "mode": "ANY",
+                    "allowedFunctionNames": ["lookup"],
+                }
+            },
+        }
+    )["tool_choice"] == {"type": "function", "function": {"name": "lookup"}}
+
+
+def test_google_request_maps_system_instruction_and_system_content_role() -> None:
+    transformer = GoogleTransformer()
+
+    transformed = transformer.transform_request(
+        {
+            "systemInstruction": "Top-level system.",
+            "contents": [
+                {"role": "system", "parts": [{"text": "Inline system."}]},
+                {"role": "user", "parts": [{"text": "Hi"}]},
+            ],
+        }
+    )
+
+    assert transformed["messages"] == [
+        {"role": "system", "content": "Top-level system.\n\nInline system."},
+        {"role": "user", "content": "Hi"},
+    ]
+
+
+def test_google_request_maps_multi_turn_reasoning_and_parallel_tools() -> None:
+    transformer = GoogleTransformer()
+
+    transformed = transformer.transform_request(
+        {
+            "contents": [
+                {"role": "user", "parts": [{"text": "Plan and call tools."}]},
+                {
+                    "role": "model",
+                    "parts": [
+                        {
+                            "thought": True,
+                            "text": "Need two independent lookups.",
+                            "thoughtSignature": "sig-1",
+                        },
+                        {
+                            "functionCall": {
+                                "id": "call-a",
+                                "name": "lookup",
+                                "args": {"q": "a"},
+                            }
+                        },
+                        {
+                            "functionCall": {
+                                "id": "call-b",
+                                "name": "lookup",
+                                "args": {"q": "b"},
+                            }
+                        },
+                    ],
+                },
+                {
+                    "role": "user",
+                    "parts": [
+                        {
+                            "functionResponse": {
+                                "id": "call-a",
+                                "name": "lookup",
+                                "response": {"text": "A"},
+                            }
+                        },
+                        {
+                            "functionResponse": {
+                                "id": "call-b",
+                                "name": "lookup",
+                                "response": {"text": "B"},
+                            }
+                        },
+                    ],
+                },
+                {
+                    "role": "model",
+                    "parts": [
+                        {
+                            "thought": True,
+                            "text": "Combine both results.",
+                            "thoughtSignature": "sig-2",
+                        },
+                        {"text": "A and B"},
+                    ],
+                },
+            ]
+        }
+    )
+
+    assert transformed["messages"] == [
+        {"role": "user", "content": "Plan and call tools."},
+        {
+            "role": "assistant",
+            "content": "",
+            "reasoning_content": "Need two independent lookups.",
+            "tool_calls": [
+                {
+                    "id": "call-a",
+                    "type": "function",
+                    "function": {"name": "lookup", "arguments": '{"q": "a"}'},
+                },
+                {
+                    "id": "call-b",
+                    "type": "function",
+                    "function": {"name": "lookup", "arguments": '{"q": "b"}'},
+                },
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call-a", "content": '{"text": "A"}'},
+        {"role": "tool", "tool_call_id": "call-b", "content": '{"text": "B"}'},
+        {
+            "role": "assistant",
+            "content": "A and B",
+            "reasoning_content": "Combine both results.",
+        },
+    ]
 
 
 def test_google_response_maps_openai_content_tools_finish_and_usage_back() -> None:
@@ -297,3 +482,105 @@ def test_google_stream_state_emits_finish_only_text_event() -> None:
         "candidatesTokenCount": 2,
         "totalTokenCount": 6,
     }
+
+
+def test_google_response_maps_extended_finish_reasons() -> None:
+    transformer = GoogleTransformer()
+
+    stop_seq = transformer.transform_response(
+        {
+            "choices": [
+                {"message": {"content": "x"}, "finish_reason": "stop_sequence"}
+            ],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        },
+        {},
+    )
+    assert stop_seq["candidates"][0]["finishReason"] == "STOP"
+
+    unknown = transformer.transform_response(
+        {
+            "choices": [
+                {"message": {"content": "x"}, "finish_reason": "weird_reason"}
+            ],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        },
+        {},
+    )
+    # Unknown finish reasons fall through to STOP rather than crashing.
+    assert unknown["candidates"][0]["finishReason"] == "STOP"
+
+
+def test_google_response_preserves_cached_usage_tokens() -> None:
+    transformer = GoogleTransformer()
+
+    response = transformer.transform_response(
+        {
+            "choices": [{"message": {"content": "x"}, "finish_reason": "stop"}],
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 2,
+                "total_tokens": 12,
+                "prompt_tokens_details": {"cached_tokens": 5},
+            },
+        },
+        {},
+    )
+
+    assert response["usageMetadata"]["cachedContentTokenCount"] == 5
+
+
+def test_google_request_drops_server_side_tools() -> None:
+    transformer = GoogleTransformer()
+    transformed = transformer.transform_request(
+        {
+            "contents": [{"role": "user", "parts": [{"text": "search"}]}],
+            "tools": [
+                {
+                    "functionDeclarations": [
+                        {"name": "lookup", "parameters": {"type": "object"}}
+                    ]
+                },
+                {"googleSearch": {}},
+                {"codeExecution": {}},
+                {"urlContext": {}},
+            ],
+        }
+    )
+
+    # googleSearch, codeExecution, urlContext are server-side built-ins
+    # without functionDeclarations; only the custom function survives.
+    assert transformed["tools"] == [
+        {
+            "type": "function",
+            "function": {"name": "lookup", "parameters": {"type": "object"}},
+        }
+    ]
+
+
+def test_google_direct_stream_chunk_handles_reasoning_content() -> None:
+    transformer = GoogleTransformer()
+
+    transformed = transformer.transform_stream_chunk(
+        {
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {
+                        "reasoning_content": "Think first.",
+                        "content": "Then answer.",
+                    },
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {"prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6},
+        },
+        {},
+        is_first=True,
+    )
+
+    candidate = transformed["candidates"][0]
+    assert candidate["content"]["parts"][0]["thought"] is True
+    assert candidate["content"]["parts"][0]["text"] == "Think first."
+    assert candidate["content"]["parts"][1] == {"text": "Then answer."}
+    assert candidate["finishReason"] == "STOP"

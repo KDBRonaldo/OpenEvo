@@ -46,10 +46,7 @@ def test_session_result_to_samples_converts_trace_to_slime_like_sample(monkeypat
         loss_mask=[1, 0],
         prompt_messages=[{"role": "user", "content": "Say hi"}],
         response_messages=[{"role": "assistant", "content": "Hi"}],
-        response_logprobs=[
-            {"token_id": 3, "logprob": -0.1},
-            {"token_id": 4, "logprob": -0.2},
-        ],
+        response_logprobs=[-0.1, -0.2],
         reward=1.0,
         metadata={"group_id": "group-1"},
     )

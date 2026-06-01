@@ -1,49 +1,45 @@
 # SWE-bench Verified Example
 
-Evaluate Polar agent harnesses on the full [SWE-bench Verified](https://huggingface.co/datasets/princeton-nlp/SWE-bench_Verified) benchmark (500 human-validated tasks).
+Evaluate Polar agent harnesses on [SWE-bench Verified](https://huggingface.co/datasets/princeton-nlp/SWE-bench_Verified)
+(500 human-validated tasks). Each task runs an agent inside a per-instance
+container at the repo's `base_commit`, then grades the patch with the official
+`swebench` harness.
 
-Each task runs an agent inside a per-instance container with the repo at `base_commit`, then grades the resulting patch via `swebench.harness.grading`.
+## Prerequisites
 
-The topology setup is used on 4 x B200 GPUs. Adjust based on your hardware.
-
-## Installation
+Install **Polar** + the SWE-bench extra and **vLLM** as described in the
+[top-level README](../../README.md#installation):
 
 ```bash
-uv venv
 uv pip install -e ".[swebench]"
-uv pip install --prerelease=allow sglang==0.5.10
-bash scripts/patch/patch_sglang.sh
 ```
+
+This example assumes 1 node **8×B200** — two vLLM servers (tensor-parallel 4 each).
 
 ## Quick Start
 
-### 1. Start SGLang backends
+### 1. Build runtime images
+
+Each runtime image layers Node.js on the per-instance SWE-bench image; harness
+CLIs install at task time during the **INIT** stage. Build a subset first:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1 uv run python -m sglang.launch_server \
-   --model-path Qwen/Qwen3.5-4B \
-   --host 0.0.0.0 \
-   --port 8000 \
-   --tp-size 2 \
-   --tool-call-parser qwen3_coder \
-   --reasoning-parser qwen3 \
-   --mem-fraction-static 0.7 \
-   --context-length 262144 \
-   --trust-remote-code
-
-CUDA_VISIBLE_DEVICES=2,3 uv run python -m sglang.launch_server \
-   --model-path Qwen/Qwen3.5-4B \
-   --host 0.0.0.0 \
-   --port 8001 \
-   --tp-size 2 \
-   --tool-call-parser qwen3_coder \
-   --reasoning-parser qwen3 \
-   --mem-fraction-static 0.7 \
-   --context-length 262144 \
-   --trust-remote-code
+uv run python examples/swebench_verified/build_images.py --max-tasks 10   # or no flag for all 500
 ```
 
-### 2. Start Polar services
+### 2. Start two vLLM servers
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 vllm serve Qwen/Qwen3.6-27B --port 8000 \
+  --tensor-parallel-size 4 --max-model-len 262144 \
+  --reasoning-parser qwen3 --enable-auto-tool-choice --tool-call-parser qwen3_coder
+
+CUDA_VISIBLE_DEVICES=4,5,6,7 vllm serve Qwen/Qwen3.6-27B --port 8001 \
+  --tensor-parallel-size 4 --max-model-len 262144 \
+  --reasoning-parser qwen3 --enable-auto-tool-choice --tool-call-parser qwen3_coder
+```
+
+### 3. Start Polar
 
 ```bash
 uv run polar serve_rollout -c examples/swebench_verified/topology.yaml
@@ -51,32 +47,29 @@ uv run polar serve_gateway -c examples/swebench_verified/topology.yaml --node-id
 uv run polar serve_gateway -c examples/swebench_verified/topology.yaml --node-id localhost-node-02
 ```
 
-### 3. Build runtime images
-
-```bash
-# Build all 500
-uv run python examples/swebench_verified/build_images.py
-
-# Or build a subset
-uv run python examples/swebench_verified/build_images.py --max-tasks 10
-```
-
 ### 4. Submit tasks
 
-```bash
-# Run all 500 tasks for pass@1
-uv run python examples/swebench_verified/submit_swebench_tasks.py \
-  --harness claude_code \
-  --topology examples/swebench_verified/topology.yaml \
-  --runtime-backend docker \
-  --num-samples 1 \
-  --max-tasks 10
+Pick a harness and how many tasks to run; the resolved-rate summary prints to
+the console when the batch finishes. Supported harnesses: `claude_code`, `codex`, `opencode`, `qwen_code`.
 
-# pass@8 for first 10 tasks
-uv run python examples/swebench_verified/submit_swebench_tasks.py \
-  --harness claude_code \
-  --topology examples/swebench_verified/topology.yaml \
-  --runtime-backend docker \
-  --num-samples 8 \
-  --max-tasks 10
+
+```bash
+# pass@1 over the first 10 tasks
+uv run python examples/swebench_verified/submit_swebench_tasks.py --harness claude_code --max-tasks 10
+
+# pass@8 over the first 10 tasks
+uv run python examples/swebench_verified/submit_swebench_tasks.py --harness claude_code --max-tasks 10 --num-samples 8
+
+# a single instance
+uv run python examples/swebench_verified/submit_swebench_tasks.py --harness codex --instance-id django__django-15098
 ```
+
+Use Apptainer instead of Docker with `--runtime-backend apptainer`.
+
+### 5. (Optional) Watch in the dashboard
+
+```bash
+uv run polar dashboard -c examples/swebench_verified/topology.yaml
+```
+
+Open <http://127.0.0.1:8090> for per-task patches, trajectories, and grading.

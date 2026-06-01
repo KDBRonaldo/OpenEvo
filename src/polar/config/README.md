@@ -1,29 +1,72 @@
 # Configuration
 
-`polar.config` loads one topology file that describes the rollout server and
-all gateway nodes.
+`polar.config` loads and validates the single `topology.yaml` that describes a
+whole Polar deployment: one **rollout** server plus one or more **gateway**
+nodes (each with its own inference backend). `TopologyConfig.load()` is the entry
+point every `polar` command uses.
 
-## Main Files
+## Mental model
 
-- `topology.py`: Pydantic models for rollout and gateway configuration.
+One file, two halves:
+
+- `rollout:` — the central orchestrator that clients submit tasks to.
+- `gateway:` — the worker fleet. `gateway.nodes[]` is a list; each entry is an
+  independent gateway process with its own ports, worker pools, and inference
+  endpoint.
+
+The schema is **strict and immutable**: unknown keys are rejected
+(`extra="forbid"`, so a typo fails fast) and every model is frozen after load.
+Convenience defaulting fills the gaps — a blank `public_url` is derived from
+`host:port` (mapping `0.0.0.0`/`::` → `127.0.0.1`), and `gateway.rollout_server_url`
+falls back to `rollout.public_url` when omitted.
+
+## Main files
+
+- `topology.py`: the Pydantic models (`TopologyConfig`, `RolloutServiceConfig`,
+  `GatewayConfig`, `GatewayNodeConfig`), `load()`, and the URL/selection helpers.
 - `__init__.py`: package exports.
 
-## Topology Schema
+## Schema
 
-The top-level fields are:
+**`rollout`** — `RolloutServiceConfig`
 
-- `rollout`: host, port, public URL, save directory, dispatch polling, and
-  callback timing.
-- `gateway`: heartbeat interval, optional rollout URL override, and gateway
-  node list.
-- `gateway.nodes[]`: node id, host, port, public URL, served model name, worker
-  limits, SGLang endpoint, and optional default runtime.
+| field | type | default |
+|---|---|---|
+| `host` | str | `0.0.0.0` |
+| `port` | int | `8080` |
+| `public_url` | str | derived from `host:port` |
+| `save_dir` | str? | `None` (no result persistence) |
+| `dispatch_poll_interval_seconds` | float | `1.0` |
+| `callback_grace_seconds` | float | `120.0` |
 
-Unknown keys are rejected so removed or misspelled options fail early.
+**`gateway`** — `GatewayConfig`
 
-## Example Topology
+| field | type | default |
+|---|---|---|
+| `heartbeat_interval_seconds` | int | `30` |
+| `rollout_server_url` | str? | `rollout.public_url` |
+| `nodes` | list | **required**, ≥1, unique ids |
+| `completion_persistence` | block | `enabled` |
 
-A topology file declares one rollout server and one or more gateway nodes:
+`completion_persistence` controls the async on-disk capture of model calls:
+`enabled` (`true`), `max_field_bytes` (`1048576`), `queue_size` (`1024`).
+
+**`gateway.nodes[]`** — `GatewayNodeConfig`
+
+| field | type | default |
+|---|---|---|
+| `id` | str | hostname (must be unique) |
+| `host` / `port` | str / int | `0.0.0.0` / `8081` |
+| `public_url` | str | derived from `host:port` |
+| `model_served` | str | `""` |
+| `inference.engine` | `sglang` \| `vllm` | `sglang` |
+| `inference.base_url` | str | `http://127.0.0.1:8000` |
+| `max_init_workers` | int | `4` |
+| `max_run_workers` | int | `2` |
+| `max_postrun_workers` | int | `4` |
+| `default_runtime` | `RuntimeSpec`? | `None` |
+
+## Example
 
 ```yaml
 rollout:
@@ -43,23 +86,18 @@ gateway:
       max_init_workers: 8
       max_run_workers: 4
       max_postrun_workers: 4
-      sglang:
+      inference:
+        engine: sglang   # or vllm
         base_url: http://127.0.0.1:8000
 ```
 
-## Public URL Rules
+## Reachable URLs and multi-node
 
-`public_url` values must be reachable by the caller:
+`public_url`s must be reachable by whoever calls them: the rollout server calls
+each node's `public_url`; each node calls back to `rollout_server_url` and its
+own `inference.base_url`. Locally the derived `127.0.0.1` URLs work; for
+multi-host deployments set explicit reachable URLs.
 
-- The rollout server calls each gateway node's `public_url`.
-- Gateway nodes call the rollout server callback URL.
-- Each gateway calls its configured `sglang.base_url`.
-
-When `public_url` is omitted or empty, Polar derives a local URL from host and
-port. For multi-node deployments, set explicit reachable URLs.
-
-## Multi-Node Selection
-
-`polar serve_gateway` needs `--node-id` when the topology contains more than one
-gateway node. This prevents a gateway process from accidentally starting with
-the wrong SGLang endpoint or worker limits.
+`polar serve_gateway` requires `--node-id` when the topology has more than one
+node, so a gateway process always starts with the right ports, worker limits,
+and inference endpoint.

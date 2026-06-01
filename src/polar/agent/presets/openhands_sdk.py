@@ -1,4 +1,9 @@
-"""OpenHands SDK harness — lightweight SDK-based agent."""
+"""OpenHands SDK harness — https://github.com/OpenHands/software-agent-sdk
+
+Unlike the CLI presets, OpenHands ships as a Python SDK, so this preset writes a
+small embedded runner script that builds the SDK agent and points its LLM at the
+gateway (LLM_BASE_URL=$OPENAI_BASE_URL). Same idea, different launch shape.
+"""
 
 from __future__ import annotations
 

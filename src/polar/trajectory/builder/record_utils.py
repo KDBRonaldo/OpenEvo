@@ -27,12 +27,20 @@ def _extract_response_ids(response: dict[str, Any], choice: dict[str, Any]) -> l
     return []
 
 
-def _extract_response_logprobs(choice: dict[str, Any]) -> list[dict[str, Any]] | None:
+def _extract_response_logprobs(choice: dict[str, Any]) -> list[float] | None:
+    """Sampled-token logprob per position, aligned 1:1 with response_ids.
+
+    The token id is intentionally dropped -- it is already in ``response_ids``
+    at the same index; only the float is needed for training.
+    """
     logprobs = choice.get("logprobs")
     if isinstance(logprobs, dict):
         content = logprobs.get("content")
         if isinstance(content, list):
-            return [deepcopy(item) for item in content if isinstance(item, dict)]
+            return [
+                float(item.get("logprob", 0.0)) if isinstance(item, dict) else 0.0
+                for item in content
+            ]
     return None
 
 

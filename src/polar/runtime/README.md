@@ -1,33 +1,57 @@
 # Runtime Backends
 
-`polar.runtime` provides isolated sandboxes for agent sessions.
+`polar.runtime` gives each rollout session its own **sandbox** — one container
+(Docker or Apptainer) that lives for the whole session. The gateway uses it to
+run the prepare recipe, execute the agent and evaluator commands, move files in
+and out, then tear it down.
 
-## Main Files
+## Mental model
 
-- `models.py`: `RuntimeSpec`, `PrepareAction`, `ExecInput`, and `ExecResult`.
-- `base.py`: runtime backend contract.
-- `docker.py`: Docker runtime implementation.
-- `apptainer.py`: Apptainer runtime implementation.
-- `factory.py`: backend lookup.
+- **One `RuntimeSpec` → one container**, shared across the init → run → eval
+  stages of a session.
+- The host session directory is **bind-mounted** to a fixed in-container path,
+  `/polar/session` (`RUNTIME_SESSION_DIR`). Uploads/downloads under that path
+  are plain host-side file copies (fast); paths outside it fall back to
+  `docker cp` / `tar` streaming.
+- Commands run in a login shell (`bash -lc`) with working directory
+  `cwd or spec.workdir or /polar/session`.
+- The factory verifies the chosen backend actually supports what the spec asks
+  for (GPUs, CPU/memory limits, internet-off) before building it.
 
-## Runtime Contract
+## Main files
 
-A runtime backend prepares files and directories, executes commands, exposes a
-workspace, and cleans up after the session. It should hide container-specific
-details from agent harnesses and evaluators.
+- `models.py`: `RuntimeSpec`, `PrepareAction`, `ExecInput`, `ExecResult`.
+- `base.py`: the `BaseRuntime` contract, the `/polar/session` path constants, and
+  the bind-mount copy helpers.
+- `docker.py`: `DockerRuntime` — the default backend.
+- `apptainer.py`: `ApptainerRuntime` — daemonless, for clusters.
+- `factory.py`: backend lookup + capability validation; also loads a custom
+  backend via `RuntimeSpec.import_path`.
 
-## Prepare Steps
+## The contract
 
-`RuntimeSpec.prepare` and `RuntimeSpec.eval_prepare` accept ordered actions:
+A backend implements `start`, `stop`, `exec`, `upload_file`, `upload_dir`,
+`download_file`, `download_dir` (plus `cancel`), hiding container details from
+harnesses and evaluators. Well-known in-container paths (from `base.py`) are
+`/polar/session` and, under it, `artifacts/`, `logs/`, `logs/agent/`,
+`logs/eval/`, and `eval_artifacts/`.
 
-- `upload_file`: copy one host file into the runtime.
-- `upload_dir`: copy one host directory into the runtime.
-- `exec`: run a command inside the runtime.
+## Prepare recipe
 
-Prepare steps run before the agent. Eval-prepare steps run before evaluation
-when an evaluator needs extra setup.
+`RuntimeSpec.prepare` and `RuntimeSpec.eval_prepare` are ordered lists of
+`PrepareAction` steps:
 
-## Docker And Apptainer
+- `upload_file`: copy one host file in.
+- `upload_dir`: copy one host directory in.
+- `exec`: run a command inside the container.
 
-Docker is the default backend for local examples. Apptainer is supported for
-clusters where container execution must avoid Docker daemon access.
+`prepare` runs before the agent. `eval_prepare` runs before evaluation — and if
+it's omitted, the eval runtime simply replays `prepare`.
+
+## Docker vs Apptainer
+
+Docker is the default for local examples and supports `--cpus` / `--memory`
+limits. Apptainer is daemonless (good for clusters that forbid the Docker
+socket), uses a host-backed overlay, and exposes GPUs with `--nv`. Both
+bind-mount the session directory and run commands via `bash -lc`, so harnesses
+and evaluators behave the same on either.

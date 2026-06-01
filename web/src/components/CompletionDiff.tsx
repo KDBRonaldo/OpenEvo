@@ -46,8 +46,8 @@ export function CompletionDiff({ completion }: Props) {
       {open && (
         <div className="grid grid-cols-1 gap-3 border-t border-slate-200 p-3 md:grid-cols-2">
           <Panel title="Raw client request (original API format)" value={originalRequest} />
-          <Panel title="Transformed SGLang request" value={transformedRequest} />
-          <Panel title="SGLang response" value={response} />
+          <Panel title="Transformed request" value={transformedRequest} />
+          <Panel title="Inference engine response" value={response} />
           <Panel title="Metadata" value={completion.metadata ?? {}} />
         </div>
       )}

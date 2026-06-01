@@ -1,33 +1,47 @@
 # API Transforms
 
-`polar.gateway.transform` keeps agent-facing APIs stable while adding the fields
-needed for trainable SGLang completions.
+`polar.gateway.transform` is the adapter layer inside the proxy. It converts each
+intercepted request from its native API (Anthropic / OpenAI Chat / OpenAI
+Responses / Google) into **OpenAI Chat Completions** for the served model, then
+converts the response back — so every agent sees the API shape it expects while
+one backend serves them all.
 
-## Main Files
+## Mental model
 
-- `base.py`: common transformer interface and training request enhancement.
-- `openai_chat.py`: OpenAI Chat Completions passthrough and response repair.
-- `openai_responses.py`: OpenAI Responses conversion and streaming events.
-- `anthropic.py`: Anthropic-style request and response conversion.
-- `google.py`: Google-style request and response conversion.
-- `__init__.py`: transformer registry by detected API type.
+- **One transformer per API type**, selected by `TransformManager` from the
+  detected `APIType`. OpenAI Chat is near-passthrough; Anthropic / Responses /
+  Google fully restructure messages, tools, and system prompts.
+- The canonical internal format is **OpenAI Chat Completions**.
+- Shared request normalization lives in `base.py` (`_normalize_request`): merge
+  `developer`→`system` roles, drop internal keys, and for Qwen3.5 models force
+  `enable_thinking=False`. Training-signal params (`logprobs`, token ids) and all
+  backend-specific request/response handling live in the gateway's `engine.py`,
+  not here.
+- The model swap to the served model happens in the proxy (`server.py`);
+  transformers carry the requested model through and **restore it on the
+  response**, so clients still see the name they asked for.
 
-## Responsibilities
+## Main files
 
-Request transforms:
-
-- Preserve the user-requested model for agent compatibility.
-- Forward to the served model expected by the gateway when needed.
-- Add training fields such as logprobs.
-- Normalize API-specific message shapes before proxying.
-
-Response transforms:
-
-- Return a shape the agent harness expects.
-- Preserve tool calls, text chunks, finish reasons, and streaming events.
-- Keep original requested model names where clients depend on them.
+- `base.py`: the transformer interface + shared training enhancement (role
+  merge, logprobs, Qwen3.5 thinking-off).
+- `openai_chat.py`: near-passthrough (e.g. `max_completion_tokens`→`max_tokens`).
+- `openai_responses.py`: OpenAI Responses ↔ Chat, including reasoning items and
+  shell/function tools (used by Codex).
+- `anthropic.py`: Anthropic Messages ↔ Chat — tool_use/tool_result and
+  Claude-Code header handling.
+- `google.py`: Gemini `generateContent` ↔ Chat — functionDeclarations / Call /
+  Response.
+- `images.py`: cross-API image and document content normalization.
+- `reasoning.py`: round-trips reasoning content across the per-API thinking /
+  signature shapes.
+- `__init__.py`: the `APIType` → transformer registry.
 
 ## Streaming
 
-Streaming transforms operate chunk by chunk. They must preserve event ordering
-and emit terminal events that client SDKs expect.
+Each non-OpenAI transformer carries stream state so it can emit a correctly
+ordered SSE sequence (open block → deltas → close). In practice the gateway
+calls the backend once and drives the transformer with a single chunk +
+finalize (see the synthetic-streaming note in the
+[gateway README](../README.md)), so this machinery turns one complete response
+into the event stream a client SDK expects.

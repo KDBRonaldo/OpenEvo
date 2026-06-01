@@ -9,19 +9,23 @@ from polar._imports import import_subclass
 
 def _builtin_harness_map() -> dict[str, type[BaseHarness]]:
     """Lazy import to avoid circular imports at module level."""
-    from polar.agent.harnesses.claude_code import ClaudeCodeHarness
-    from polar.agent.harnesses.codex import CodexHarness
-    from polar.agent.harnesses.gemini_cli import GeminiCliHarness
-    from polar.agent.harnesses.openhands_sdk import OpenHandsSdkHarness
-    from polar.agent.harnesses.opencode import OpenCodeHarness
-    from polar.agent.harnesses.pi import PiHarness
-    from polar.agent.harnesses.qwen_code import QwenCodeHarness
-    from polar.agent.harnesses.shell import ShellHarness
+    from polar.agent.presets.claude_code import ClaudeCodeHarness
+    from polar.agent.presets.codex import CodexHarness
+    from polar.agent.presets.gemini_cli import GeminiCliHarness
+    from polar.agent.presets.hermes import HermesHarness
+    from polar.agent.presets.openclaw import OpenClawHarness
+    from polar.agent.presets.openhands_sdk import OpenHandsSdkHarness
+    from polar.agent.presets.opencode import OpenCodeHarness
+    from polar.agent.presets.pi import PiHarness
+    from polar.agent.presets.qwen_code import QwenCodeHarness
+    from polar.agent.presets.shell import ShellHarness
 
     return {
         "claude_code": ClaudeCodeHarness,
         "codex": CodexHarness,
         "gemini_cli": GeminiCliHarness,
+        "hermes": HermesHarness,
+        "openclaw": OpenClawHarness,
         "openhands_sdk": OpenHandsSdkHarness,
         "opencode": OpenCodeHarness,
         "pi": PiHarness,

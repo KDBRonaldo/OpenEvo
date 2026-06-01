@@ -260,7 +260,7 @@ def _build_topology_lines(
             reachable=bool(status),
         )
         gateway_label = _gateway_label(node.id)
-        inference_label = _endpoint_label("inference", node.sglang_base_url)
+        inference_label = _endpoint_label(node.engine, node.inference_base_url)
         lines.append(f"{branch} {gateway_label} [{badge}] ── {inference_label}")
     return lines
 

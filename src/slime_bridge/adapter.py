@@ -94,7 +94,7 @@ def _build_sample(
     max_tokens: int | None = None,
 ) -> Any | None:
     prompt_ids = list(trace.prompt_ids)
-    response_ids = list(trace.response_ids) or _response_ids_from_logprobs(trace)
+    response_ids = list(trace.response_ids)
 
     if not prompt_ids or not response_ids:
         logger.warning(
@@ -281,23 +281,10 @@ def _extract_rollout_log_probs(
             f"{len(logprobs)} != response length {response_len}"
         )
 
-    values: list[float] = []
-    for pos, (entry, mask_value) in enumerate(zip(logprobs, loss_mask, strict=True)):
-        if not isinstance(entry, dict):
-            if mask_value:
-                raise RolloutLogprobError(
-                    f"Session {session_id} trace {trace_index}: logprob entry {pos} "
-                    "is not a mapping"
-                )
-            values.append(0.0)
-            continue
-        if mask_value and "logprob" not in entry:
-            raise RolloutLogprobError(
-                f"Session {session_id} trace {trace_index}: trainable token {pos} "
-                "is missing logprob"
-            )
-        values.append(float(entry.get("logprob", 0.0)))
-    return values
+    # response_logprobs is one float per response token (interstitials are 0.0,
+    # masked out by loss_mask); the builder guarantees trainable tokens carry
+    # their real sampled logprob.
+    return [float(value) for value in logprobs]
 
 
 def _loss_mask_from_trace(
@@ -322,16 +309,6 @@ def _loss_mask_from_trace(
             f"{len(mask)} != response length {response_len}"
         )
     return [1 if int(value) else 0 for value in mask]
-
-
-def _response_ids_from_logprobs(trace: "Trace") -> list[int]:
-    if not trace.response_logprobs:
-        return []
-    return [
-        int(item["token_id"])
-        for item in trace.response_logprobs
-        if isinstance(item, dict) and item.get("token_id") is not None
-    ]
 
 
 def _load_sample_type() -> Any:

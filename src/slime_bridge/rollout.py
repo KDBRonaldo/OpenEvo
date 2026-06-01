@@ -113,7 +113,7 @@ def update_policy_version(args: Any, policy_version: int) -> None:
 
 
 def prepare_policy_update(args: Any, policy_version: int) -> None:
-    """Optional hook called by Slime before overlapping SGLang weight sync."""
+    """Optional hook called by Slime before overlapping inference weight sync."""
     logger.info("Preparing Polar bridge for policy_version=%s weight update", policy_version)
     with _worker_lock:
         worker = _global_async_worker
@@ -135,7 +135,7 @@ def prepare_policy_update(args: Any, policy_version: int) -> None:
 
 
 def finish_policy_update(args: Any, policy_version: int) -> None:
-    """Optional hook called by Slime after overlapping SGLang weight sync."""
+    """Optional hook called by Slime after overlapping inference weight sync."""
     try:
         _resume_gateway_generation(args)
     finally:
@@ -171,11 +171,11 @@ def _pause_gateway_generation(args: Any) -> None:
     request_timeout = max(timeout_seconds + 5.0, 10.0)
     with httpx.Client(timeout=request_timeout) as client:
         response = client.post(
-            f"{gateway_url}/admin/sglang/pause",
+            f"{gateway_url}/admin/inference/pause",
             params={"timeout_seconds": timeout_seconds},
         )
         response.raise_for_status()
-        logger.info("Paused Polar gateway generation for SGLang weight update: %s", response.json())
+        logger.info("Paused Polar gateway generation for inference weight update: %s", response.json())
 
 
 def _resume_gateway_generation(args: Any) -> None:
@@ -185,9 +185,9 @@ def _resume_gateway_generation(args: Any) -> None:
 
     request_timeout = float(getattr(args, "polar_gateway_control_timeout", 30.0))
     with httpx.Client(timeout=max(request_timeout, 5.0)) as client:
-        response = client.post(f"{gateway_url}/admin/sglang/resume")
+        response = client.post(f"{gateway_url}/admin/inference/resume")
         response.raise_for_status()
-        logger.info("Resumed Polar gateway generation after SGLang weight update: %s", response.json())
+        logger.info("Resumed Polar gateway generation after inference weight update: %s", response.json())
 
 
 # ---------------------------------------------------------------------------

@@ -12,6 +12,10 @@ from polar.gateway.transform.images import (
     google_part_to_openai_chat,
     openai_chat_content_to_google_parts,
 )
+from polar.gateway.transform.reasoning import (
+    extract_reasoning_from_gemini_parts,
+    make_signature,
+)
 
 
 @dataclass
@@ -54,6 +58,15 @@ class _GoogleStreamState:
             self._usage = usage
 
         parts: list[dict[str, Any]] = []
+        reasoning = delta.get("reasoning_content")
+        if isinstance(reasoning, str) and reasoning:
+            parts.append(
+                {
+                    "thought": True,
+                    "text": reasoning,
+                    "thoughtSignature": make_signature(reasoning),
+                }
+            )
         content = delta.get("content")
         if isinstance(content, str) and content:
             parts.append({"text": content})
@@ -161,12 +174,13 @@ class _GoogleStreamState:
 class GoogleTransformer(BaseTransformer):
     """Transform between Google Generative AI and OpenAI API formats."""
 
-    ROLE_MAP = {"user": "user", "model": "assistant"}
+    ROLE_MAP = {"user": "user", "model": "assistant", "system": "system", "developer": "system"}
     FINISH_REASON_MAP_REVERSE = {
         "stop": "STOP",
         "length": "MAX_TOKENS",
         "content_filter": "SAFETY",
         "tool_calls": "STOP",
+        "stop_sequence": "STOP",
     }
 
     def transform_request(self, body: dict[str, Any]) -> dict[str, Any]:
@@ -174,18 +188,22 @@ class GoogleTransformer(BaseTransformer):
         config = body.get("config")
         config_section = config if isinstance(config, dict) else {}
 
-        system_instruction = body.get("systemInstruction") or config_section.get(
-            "systemInstruction"
+        system_instruction = (
+            body.get("systemInstruction")
+            or body.get("system_instruction")
+            or config_section.get("systemInstruction")
+            or config_section.get("system_instruction")
         )
-        if isinstance(system_instruction, dict):
-            system_text = self._extract_text_from_parts(system_instruction.get("parts", []))
-            if system_text:
-                messages.append({"role": "system", "content": system_text})
+        system_text = self._extract_system_instruction_text(system_instruction)
+        if system_text:
+            messages.append({"role": "system", "content": system_text})
 
         for content in body.get("contents", []):
             messages.extend(self._convert_content_to_messages(content))
 
         result: dict[str, Any] = {"messages": messages}
+        if "model" in body:
+            result["model"] = body["model"]
 
         gen_config: dict[str, Any] = {}
         for source in (
@@ -203,11 +221,34 @@ class GoogleTransformer(BaseTransformer):
             result["temperature"] = gen_config["temperature"]
         if "topP" in gen_config:
             result["top_p"] = gen_config["topP"]
+        if "topK" in gen_config:
+            result["top_k"] = gen_config["topK"]
         if "stopSequences" in gen_config:
             result["stop"] = gen_config["stopSequences"]
+        if "candidateCount" in gen_config:
+            result["n"] = gen_config["candidateCount"]
+        if "presencePenalty" in gen_config:
+            result["presence_penalty"] = gen_config["presencePenalty"]
+        if "frequencyPenalty" in gen_config:
+            result["frequency_penalty"] = gen_config["frequencyPenalty"]
+        if "seed" in gen_config:
+            result["seed"] = gen_config["seed"]
+        if "logprobs" in gen_config:
+            result["top_logprobs"] = gen_config["logprobs"]
+
+        response_format = self._convert_response_format(gen_config)
+        if response_format is not None:
+            result["response_format"] = response_format
 
         if body.get("_streaming", False):
             result["stream"] = True
+
+        # Gemini `thinkingConfig.includeThoughts: true` → enable_thinking.
+        thinking_cfg = gen_config.get("thinkingConfig") or config_section.get("thinkingConfig")
+        if isinstance(thinking_cfg, dict) and thinking_cfg.get("includeThoughts"):
+            chat_template_kwargs = dict(result.get("chat_template_kwargs") or {})
+            chat_template_kwargs["enable_thinking"] = True
+            result["chat_template_kwargs"] = chat_template_kwargs
 
         # SGLang rejects tool_choice without a non-empty tools list; bind
         # the pair so one can't be forwarded without the other.
@@ -222,10 +263,71 @@ class GoogleTransformer(BaseTransformer):
             if tool_choice is not None:
                 result["tool_choice"] = tool_choice
 
-        return self._enhance_for_training(
+        return self._normalize_request(
             result,
             body.get("_polar_model_served"),
         )
+
+    def _convert_response_format(self, gen_config: dict[str, Any]) -> dict[str, Any] | None:
+        response_format_cfg = gen_config.get("responseFormat")
+        if isinstance(response_format_cfg, dict):
+            text_format = response_format_cfg.get("text")
+            if isinstance(text_format, dict):
+                mime_type = text_format.get("mimeType")
+                if self._is_json_mime_type(mime_type):
+                    schema = text_format.get("schema")
+                    return self._chat_response_format_from_schema(schema)
+
+        mime_type = gen_config.get("responseMimeType")
+        if not self._is_json_mime_type(mime_type):
+            return None
+
+        schema = (
+            gen_config.get("responseJsonSchema")
+            or gen_config.get("_responseJsonSchema")
+            or gen_config.get("responseSchema")
+        )
+        return self._chat_response_format_from_schema(schema)
+
+    @staticmethod
+    def _is_json_mime_type(value: Any) -> bool:
+        if not isinstance(value, str):
+            return False
+        return value.lower() == "application/json" or value.upper() == "APPLICATION_JSON"
+
+    def _chat_response_format_from_schema(self, schema: Any) -> dict[str, Any]:
+        if isinstance(schema, dict) and schema:
+            return {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "google_response",
+                    "schema": self._normalize_google_schema(schema),
+                },
+            }
+        return {"type": "json_object"}
+
+    def _normalize_google_schema(self, schema: dict[str, Any]) -> dict[str, Any]:
+        normalized: dict[str, Any] = {}
+        for key, value in schema.items():
+            if key == "type" and isinstance(value, str):
+                normalized[key] = value.lower()
+            elif key == "properties" and isinstance(value, dict):
+                normalized[key] = {
+                    prop_name: self._normalize_google_schema(prop_schema)
+                    if isinstance(prop_schema, dict)
+                    else prop_schema
+                    for prop_name, prop_schema in value.items()
+                }
+            elif key == "items" and isinstance(value, dict):
+                normalized[key] = self._normalize_google_schema(value)
+            elif key in {"anyOf", "oneOf", "allOf"} and isinstance(value, list):
+                normalized[key] = [
+                    self._normalize_google_schema(item) if isinstance(item, dict) else item
+                    for item in value
+                ]
+            else:
+                normalized[key] = value
+        return normalized
 
     def transform_response(
         self,
@@ -238,6 +340,15 @@ class GoogleTransformer(BaseTransformer):
         for i, choice in enumerate(response.get("choices", [])):
             message = choice.get("message", {})
             parts = []
+            reasoning = message.get("reasoning_content")
+            if isinstance(reasoning, str) and reasoning:
+                parts.append(
+                    {
+                        "thought": True,
+                        "text": reasoning,
+                        "thoughtSignature": make_signature(reasoning),
+                    }
+                )
             content = message.get("content")
             if content or isinstance(content, list):
                 parts.extend(openai_chat_content_to_google_parts(content))
@@ -256,13 +367,17 @@ class GoogleTransformer(BaseTransformer):
             )
 
         usage = response.get("usage", {})
+        usage_metadata = {
+            "promptTokenCount": usage.get("prompt_tokens", 0),
+            "candidatesTokenCount": usage.get("completion_tokens", 0),
+            "totalTokenCount": usage.get("total_tokens", 0),
+        }
+        cached_tokens = self._cached_prompt_tokens(usage)
+        if cached_tokens:
+            usage_metadata["cachedContentTokenCount"] = cached_tokens
         result = {
             "candidates": candidates,
-            "usageMetadata": {
-                "promptTokenCount": usage.get("prompt_tokens", 0),
-                "candidatesTokenCount": usage.get("completion_tokens", 0),
-                "totalTokenCount": usage.get("total_tokens", 0),
-            },
+            "usageMetadata": usage_metadata,
         }
         function_calls = self._response_function_calls(candidates)
         if function_calls:
@@ -281,6 +396,15 @@ class GoogleTransformer(BaseTransformer):
         for choice in chunk.get("choices", []):
             delta = choice.get("delta", {}) or {}
             parts = []
+            reasoning_chunk = delta.get("reasoning_content")
+            if isinstance(reasoning_chunk, str) and reasoning_chunk:
+                parts.append(
+                    {
+                        "thought": True,
+                        "text": reasoning_chunk,
+                        "thoughtSignature": make_signature(reasoning_chunk),
+                    }
+                )
             content = delta.get("content")
             if content:
                 parts.append({"text": content})
@@ -379,14 +503,21 @@ class GoogleTransformer(BaseTransformer):
 
         if openai_role == "assistant":
             message_content = google_content_parts_to_openai_chat(parts)
-            if message_content or tool_calls:
+            reasoning_text = extract_reasoning_from_gemini_parts(parts)
+            if message_content or tool_calls or reasoning_text:
                 assistant_message: dict[str, Any] = {
                     "role": "assistant",
                     "content": message_content,
                 }
+                if reasoning_text:
+                    assistant_message["reasoning_content"] = reasoning_text
                 if tool_calls:
                     assistant_message["tool_calls"] = tool_calls
                 messages.append(assistant_message)
+        elif openai_role == "system":
+            system_text = self._extract_text_from_parts(parts)
+            if system_text:
+                messages.append({"role": "system", "content": system_text})
         else:
             if user_parts:
                 messages.append({
@@ -438,9 +569,9 @@ class GoogleTransformer(BaseTransformer):
             return None
 
         mode = str(function_calling_config.get("mode", "")).upper()
-        allowed_names = function_calling_config.get("allowedFunctionNames") or function_calling_config.get(
-            "allowed_function_names"
-        )
+        allowed_names = function_calling_config.get(
+            "allowedFunctionNames"
+        ) or function_calling_config.get("allowed_function_names")
         if mode == "NONE":
             return "none"
         if mode in {"ANY", "VALIDATED"}:
@@ -549,3 +680,21 @@ class GoogleTransformer(BaseTransformer):
             elif isinstance(part, str):
                 texts.append(part)
         return "\n".join(texts)
+
+    def _extract_system_instruction_text(self, system_instruction: Any) -> str:
+        if isinstance(system_instruction, str):
+            return system_instruction
+        if isinstance(system_instruction, dict):
+            return self._extract_text_from_parts(system_instruction.get("parts", []))
+        if isinstance(system_instruction, list):
+            return self._extract_text_from_parts(system_instruction)
+        return ""
+
+    def _cached_prompt_tokens(self, usage: dict[str, Any]) -> int:
+        details = usage.get("prompt_tokens_details")
+        if isinstance(details, dict):
+            cached = details.get("cached_tokens")
+            if isinstance(cached, int):
+                return cached
+        cached = usage.get("cached_tokens")
+        return cached if isinstance(cached, int) else 0

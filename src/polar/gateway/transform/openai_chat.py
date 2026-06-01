@@ -12,7 +12,9 @@ class OpenAIChatTransformer(BaseTransformer):
 
     def transform_request(self, body: dict[str, Any]) -> dict[str, Any]:
         result = body.copy()
-        return self._enhance_for_training(
+        if "max_tokens" not in result and "max_completion_tokens" in result:
+            result["max_tokens"] = result["max_completion_tokens"]
+        return self._normalize_request(
             result,
             body.get("_polar_model_served"),
         )

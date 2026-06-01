@@ -1,4 +1,4 @@
-"""Live topology view: rollout + gateways + SGLang + worker pools."""
+"""Live topology view: rollout + gateways + inference engine + worker pools."""
 
 from __future__ import annotations
 
@@ -17,7 +17,8 @@ def _node_view(node) -> dict[str, Any]:
         "port": node.port,
         "gateway_url": node.public_url,
         "model_served": node.model_served,
-        "sglang_base_url": node.sglang_base_url,
+        "engine": node.engine,
+        "inference_base_url": node.inference_base_url,
         "max_init_workers": node.max_init_workers,
         "max_run_workers": node.max_run_workers,
         "max_postrun_workers": node.max_postrun_workers,

@@ -9,11 +9,16 @@ trainer needs, without introducing tokenization drift.
 
 Design in two stages:
 
-1. **Grouping** — detect which completions belong to the same append-only
-   agent chain.  A cheap message-level key is used as an O(1) index, and a
-   strict token-prefix check (``C_{k+1}.prompt_ids`` must start with
-   ``C_k.prompt_ids``) is the final arbiter.  Completions whose tokens
-   diverge start a fresh chain instead of silently polluting an existing one.
+1. **Grouping** — route each completion to the chain it append-extends, tested
+   purely on tokens: a completion joins the chain whose last prompt is a prefix
+   of it (``C_k.prompt_ids`` is a prefix of ``C_{k+1}.prompt_ids``).  This routes
+   correctly even when parallel agents / sub-agents interleave (each has a
+   distinct prompt prefix), and is robust to BPE re-tokenization because it
+   compares only server-tokenized prompts, whose shared prefix is stable across
+   the special-token generation-prompt boundary.  We never compare the *sampled*
+   ``response_ids`` (those can re-tokenize in the next prompt, e.g.
+   ``[fish, ing]`` → ``[fishing]``); a completion that extends no open chain
+   starts a fresh one.
 
 2. **Finalization** — walk each chain and build a merged token stream:
 
@@ -28,14 +33,11 @@ Design in two stages:
    - Interstitial slots get synthesized logprobs and a zero ``loss_mask``;
      sampled assistant slots keep their real logprobs and a one ``loss_mask``.
 
-See ``docs/prefix_merging_algorithm.md`` for a full walkthrough with
-examples, invariants, and edge cases.
 """
 
 from __future__ import annotations
 
 import logging
-from collections import defaultdict, deque
 from copy import deepcopy
 from typing import Any
 
@@ -47,85 +49,6 @@ logger = logging.getLogger(__name__)
 
 # finish_reasons where the model emitted the natural end-of-turn token itself.
 _NATURAL_STOP_REASONS = frozenset({"stop", "tool_calls", "stop_sequence"})
-
-
-
-# ---------------------------------------------------------------------------
-# Message-level grouping helpers — used to detect which completions belong
-# to the same agentic chain (C_{i+1}'s prompt == C_i's prompt + response).
-# ---------------------------------------------------------------------------
-
-
-def _flatten_message_content(content: Any) -> str:
-    """Extract text from a message content field (string or content-part array)."""
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        return "".join(
-            item.get("text", "")
-            for item in content
-            if isinstance(item, dict) and item.get("type") == "text"
-        )
-    return str(content) if content is not None else ""
-
-
-def _expand_messages_for_grouping(message: dict[str, Any]) -> list[dict[str, Any]]:
-    role = message.get("role")
-    if role != "assistant" or not message.get("tool_calls"):
-        return [message]
-
-    expanded: list[dict[str, Any]] = []
-    content = message.get("content")
-    if content not in (None, "", []):
-        expanded.append({"role": role, "content": content})
-    expanded.append(
-        {"role": role, "content": None, "tool_calls": message.get("tool_calls")}
-    )
-    return expanded
-
-
-def _is_grouping_noise_message(message: dict[str, Any]) -> bool:
-    role = message.get("role")
-    if role in ["tool"]:
-        return True
-    if role == "assistant" and message.get("tool_calls"):
-        return False
-    content = _flatten_message_content(message.get("content")).strip()
-    if role == "assistant" and not content and not message.get("tool_calls"):
-        return True
-    return False
-
-
-def _normalize_messages(messages: list[dict[str, Any]]) -> str:
-    """Flatten a message list into a deterministic key string.
-
-    Format: ``role:content<SEP>role:content<SEP>...``
-    """
-    parts = []
-    for msg in messages:
-        role = msg.get("role", "")
-        if role == "assistant" and msg.get("tool_calls"):
-            content = ""
-        else:
-            content = _flatten_message_content(msg.get("content"))
-        parts.append(f"{role}:{content}")
-    return "<SEP>".join(parts)
-
-
-def _grouping_key(messages: list[dict[str, Any]]) -> str:
-    """Normalize the structural conversation context used for chaining.
-
-    Tool-result messages are omitted because they are harness artifacts that
-    appear between assistant turns in the next request prompt.
-    """
-    return _normalize_messages(
-        [
-            expanded_message
-            for message in messages
-            for expanded_message in _expand_messages_for_grouping(message)
-            if not _is_grouping_noise_message(expanded_message)
-        ],
-    )
 
 
 class PrefixMergingBuilder(BaseTrajectoryBuilder):
@@ -165,26 +88,17 @@ class PrefixMergingBuilder(BaseTrajectoryBuilder):
             )
 
         chains: list[list[CompletionRecord]] = []
-        waiting_chains: dict[str, deque[int]] = defaultdict(deque)
+        chain_tips: list[list[int]] = []  # last completion's prompt_ids, per chain
 
         for completion in session.completions:
-            trace = build_trace_from_completion(completion)
-            prompt_key = _grouping_key(trace.prompt_messages)
-            chain_idx = self._pop_compatible_chain(
-                prompt_key=prompt_key,
-                prompt_ids=trace.prompt_ids,
-                chains=chains,
-                waiting_chains=waiting_chains,
-            )
-
-            if chain_idx is not None:
-                chains[chain_idx].append(completion)
-            else:
+            prompt_ids = build_trace_from_completion(completion).prompt_ids
+            chain_idx = self._find_extendable_chain(prompt_ids, chain_tips)
+            if chain_idx is None:
                 chain_idx = len(chains)
-                chains.append([completion])
-
-            next_key = _grouping_key(trace.prompt_messages + trace.response_messages)
-            waiting_chains[next_key].append(chain_idx)
+                chains.append([])
+                chain_tips.append([])
+            chains[chain_idx].append(completion)
+            chain_tips[chain_idx] = prompt_ids
 
         stats: dict[str, int] = {
             "chains_total": len(chains),
@@ -233,7 +147,7 @@ class PrefixMergingBuilder(BaseTrajectoryBuilder):
 
         prompt_ids = list(first_trace.prompt_ids)
         stream_ids: list[int] = list(prompt_ids)
-        response_slots: list[dict[str, Any] | None] = []
+        response_slots: list[float | None] = []
         loss_mask: list[int] = []
         response_messages: list[dict[str, Any]] = []
 
@@ -312,7 +226,7 @@ class PrefixMergingBuilder(BaseTrajectoryBuilder):
             stats["chains_reconstructed_truncated"] += 1
 
         response_ids = stream_ids[len(prompt_ids):]
-        response_logprobs = self._finalize_logprobs(response_slots, response_ids)
+        response_logprobs = self._finalize_logprobs(response_slots)
         last_kept_trace = build_trace_from_completion(chain[kept - 1])
 
         return Trace(
@@ -385,7 +299,7 @@ class PrefixMergingBuilder(BaseTrajectoryBuilder):
     def _append_response_tokens(
         trace: Trace,
         stream_ids: list[int],
-        response_slots: list[dict[str, Any] | None],
+        response_slots: list[float | None],
         loss_mask: list[int],
     ) -> None:
         """Append a completion's response_ids and parallel logprob slots."""
@@ -397,20 +311,18 @@ class PrefixMergingBuilder(BaseTrajectoryBuilder):
         loss_mask.extend(trace_loss_mask)
         logprobs = trace.response_logprobs or []
         for pos in range(len(response_ids)):
-            entry = logprobs[pos] if pos < len(logprobs) else None
-            response_slots.append(deepcopy(entry) if isinstance(entry, dict) else None)
+            value = logprobs[pos] if pos < len(logprobs) else None
+            response_slots.append(float(value) if isinstance(value, (int, float)) else None)
 
     @staticmethod
     def _finalize_logprobs(
-        slots: list[dict[str, Any] | None],
-        response_ids: list[int],
-    ) -> list[dict[str, Any]] | None:
+        slots: list[float | None],
+    ) -> list[float] | None:
+        # Interstitial slots (tool results, chat glue) get 0.0; loss_mask=0
+        # makes the trainer ignore them.
         if not any(slot is not None for slot in slots):
             return None
-        return [
-            slot if slot is not None else {"token_id": response_ids[i], "logprob": 0.0}
-            for i, slot in enumerate(slots)
-        ]
+        return [slot if slot is not None else 0.0 for slot in slots]
 
     @staticmethod
     def _chain_metadata(chain: list[CompletionRecord]) -> dict[str, Any]:
@@ -420,49 +332,30 @@ class PrefixMergingBuilder(BaseTrajectoryBuilder):
         return merged
 
     @staticmethod
-    def _pop_compatible_chain(
-        *,
-        prompt_key: str,
+    def _find_extendable_chain(
         prompt_ids: list[int],
-        chains: list[list[CompletionRecord]],
-        waiting_chains: dict[str, deque[int]],
+        chain_tips: list[list[int]],
     ) -> int | None:
-        """Pop a waiting chain that matches both at message-key and token levels.
+        """Return the open chain this completion append-extends, else None.
 
-        The message-level key (produced by ``_grouping_key``) is only a
-        *necessary* condition for joining a chain.  Its normalization drops
-        tool messages and empty/``<think>`` assistants — both of which can
-        hide genuine token-level divergence (cache-control shifts, tools
-        schema rewrites, ``<system-reminder>`` injections).
-
-        The *sufficient* condition is the strict append-only token-prefix
-        invariant: ``C_{k+1}.prompt_ids`` must start with ``C_k.prompt_ids``.
-        Enforcing this at chain-join time means a completion whose raw
-        tokenization diverges from the waiting chain's tail starts its own
-        new chain, instead of being silently appended (only to be dropped
-        later in finalization).
-
-        Scans candidates in FIFO order; returns the first compatible index
-        and pops it.  Returns None if no candidate passes the token check.
+        A completion continues a chain iff its prompt begins with that chain's
+        last prompt (``tip`` is a token-prefix of ``prompt_ids``).  This routes
+        completions to the right chain even when parallel agents / sub-agents
+        interleave — each conversation has a distinct prompt prefix — and
+        tolerates the just-finished turn being re-serialized in history (tool-call
+        argument reformatting, whitespace), since that divergence falls *after*
+        the prompt.  The compared prefix is two server-side tokenizations of the
+        same text, so BPE re-tokenization of the sampled response never enters
+        the decision.  On overlap the longest matching tip wins (most advanced
+        chain).
         """
-        queue = waiting_chains.get(prompt_key)
-        if not queue:
-            return None
-        for pos, chain_idx in enumerate(queue):
-            last_trace = build_trace_from_completion(chains[chain_idx][-1])
-            last_pids = last_trace.prompt_ids
-            if (
-                not prompt_ids
-                or not last_pids
-                or len(prompt_ids) < len(last_pids)
-                or prompt_ids[: len(last_pids)] != last_pids
-            ):
-                continue
-            del queue[pos]
-            if not queue:
-                waiting_chains.pop(prompt_key, None)
-            return chain_idx
-        return None
+        best_idx: int | None = None
+        best_len = -1
+        for idx, tip in enumerate(chain_tips):
+            n = len(tip)
+            if n > best_len and 0 < n <= len(prompt_ids) and prompt_ids[:n] == tip:
+                best_idx, best_len = idx, n
+        return best_idx
 
 
 def _top_level_scheduler_metadata(metadata: dict[str, Any]) -> dict[str, Any]:

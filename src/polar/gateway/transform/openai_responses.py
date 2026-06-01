@@ -14,6 +14,10 @@ from typing import Any, Optional
 
 from polar.gateway.transform.base import BaseTransformer
 from polar.gateway.transform.images import openai_responses_input_content_to_chat
+from polar.gateway.transform.reasoning import (
+    encrypt_reasoning,
+    extract_reasoning_from_responses_item,
+)
 
 
 @dataclass
@@ -33,9 +37,14 @@ class ResponsesStreamState:
         self.model = model
         self.text_started = False
         self.text_content = ""
+        self.message_output_index = 0
         self.output_index_offset = 0
         self.tool_calls: dict[int, _ResponsesToolCallState] = {}
         self.usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+        self.reasoning_started = False
+        self.reasoning_closed = False
+        self.reasoning_content = ""
+        self.reasoning_id = ""
         self.completed = False
 
     def process_chunk(self, chunk: dict[str, Any], is_first: bool = False) -> list[dict[str, Any]]:
@@ -71,16 +80,59 @@ class ResponsesStreamState:
         choice = choices[0]
         delta = choice.get("delta", {}) or {}
 
-        content = delta.get("content")
-        if content:
-            if not self.text_started:
-                self.text_started = True
-                self.output_index_offset = 1
-                message_id = f"msg_{uuid.uuid4().hex[:24]}"
+        # Reasoning item must come first so the harness sees the chain-of-thought
+        # before any output_text or function_call items.
+        reasoning_delta = delta.get("reasoning_content")
+        if isinstance(reasoning_delta, str) and reasoning_delta:
+            if not self.reasoning_started:
+                self.reasoning_started = True
+                self.reasoning_id = f"rs_{uuid.uuid4().hex[:24]}"
                 events.append(
                     {
                         "type": "response.output_item.added",
                         "output_index": 0,
+                        "item": {
+                            "type": "reasoning",
+                            "id": self.reasoning_id,
+                            "summary": [],
+                            "content": [],
+                            "status": "in_progress",
+                        },
+                    }
+                )
+                events.append(
+                    {
+                        "type": "response.reasoning_summary_part.added",
+                        "item_id": self.reasoning_id,
+                        "output_index": 0,
+                        "summary_index": 0,
+                        "part": {"type": "summary_text", "text": ""},
+                    }
+                )
+            self.reasoning_content += reasoning_delta
+            events.append(
+                {
+                    "type": "response.reasoning_summary_text.delta",
+                    "item_id": self.reasoning_id,
+                    "output_index": 0,
+                    "summary_index": 0,
+                    "delta": reasoning_delta,
+                }
+            )
+
+        content = delta.get("content")
+        if content:
+            # Close reasoning before opening message.
+            events.extend(self._close_reasoning())
+            if not self.text_started:
+                self.text_started = True
+                self.message_output_index = 1 if self.reasoning_started else 0
+                self.output_index_offset = self.message_output_index + 1
+                message_id = f"msg_{uuid.uuid4().hex[:24]}"
+                events.append(
+                    {
+                        "type": "response.output_item.added",
+                        "output_index": self.message_output_index,
                         "item": {
                             "type": "message",
                             "id": message_id,
@@ -93,7 +145,7 @@ class ResponsesStreamState:
                 events.append(
                     {
                         "type": "response.content_part.added",
-                        "output_index": 0,
+                        "output_index": self.message_output_index,
                         "content_index": 0,
                         "part": {"type": "output_text", "text": ""},
                     }
@@ -103,7 +155,7 @@ class ResponsesStreamState:
             events.append(
                 {
                     "type": "response.output_text.delta",
-                    "output_index": 0,
+                    "output_index": self.message_output_index,
                     "content_index": 0,
                     "delta": content,
                 }
@@ -112,6 +164,12 @@ class ResponsesStreamState:
         tool_calls_delta = delta.get("tool_calls") or []
         if not isinstance(tool_calls_delta, list):
             tool_calls_delta = [tool_calls_delta]
+
+        if tool_calls_delta and self.reasoning_started and not self.reasoning_closed:
+            events.extend(self._close_reasoning())
+            if not self.text_started:
+                # No text — tools come immediately after reasoning.
+                self.output_index_offset = 1
 
         for tool_call in tool_calls_delta:
             if not isinstance(tool_call, dict):
@@ -188,11 +246,14 @@ class ResponsesStreamState:
 
         events: list[dict[str, Any]] = []
 
+        # Close reasoning if it never got closed by content/tools.
+        events.extend(self._close_reasoning())
+
         if self.text_started:
             events.append(
                 {
                     "type": "response.content_part.done",
-                    "output_index": 0,
+                    "output_index": self.message_output_index,
                     "content_index": 0,
                     "part": {"type": "output_text", "text": self.text_content},
                 }
@@ -200,7 +261,7 @@ class ResponsesStreamState:
             events.append(
                 {
                     "type": "response.output_item.done",
-                    "output_index": 0,
+                    "output_index": self.message_output_index,
                     "item": {
                         "type": "message",
                         "role": "assistant",
@@ -239,6 +300,17 @@ class ResponsesStreamState:
             )
 
         output: list[dict[str, Any]] = []
+        if self.reasoning_started:
+            output.append(
+                {
+                    "type": "reasoning",
+                    "id": self.reasoning_id,
+                    "summary": [{"type": "summary_text", "text": self.reasoning_content}],
+                    "content": [{"type": "reasoning_text", "text": self.reasoning_content}],
+                    "encrypted_content": encrypt_reasoning(self.reasoning_content),
+                    "status": "completed",
+                }
+            )
         if self.text_started:
             output.append(
                 {
@@ -279,6 +351,39 @@ class ResponsesStreamState:
         self.completed = True
         return events
 
+    def _close_reasoning(self) -> list[dict[str, Any]]:
+        if not self.reasoning_started or self.reasoning_closed:
+            return []
+        self.reasoning_closed = True
+        return [
+            {
+                "type": "response.reasoning_summary_text.done",
+                "item_id": self.reasoning_id,
+                "output_index": 0,
+                "summary_index": 0,
+                "text": self.reasoning_content,
+            },
+            {
+                "type": "response.reasoning_summary_part.done",
+                "item_id": self.reasoning_id,
+                "output_index": 0,
+                "summary_index": 0,
+                "part": {"type": "summary_text", "text": self.reasoning_content},
+            },
+            {
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {
+                    "type": "reasoning",
+                    "id": self.reasoning_id,
+                    "summary": [{"type": "summary_text", "text": self.reasoning_content}],
+                    "content": [{"type": "reasoning_text", "text": self.reasoning_content}],
+                    "encrypted_content": encrypt_reasoning(self.reasoning_content),
+                    "status": "completed",
+                },
+            },
+        ]
+
 
 class OpenAIResponsesTransformer(BaseTransformer):
     """Transform OpenAI Responses API to/from SGLang chat completions."""
@@ -297,6 +402,8 @@ class OpenAIResponsesTransformer(BaseTransformer):
             messages.extend(self._convert_input_items_to_messages(input_data))
 
         result: dict[str, Any] = {"messages": messages}
+        if "model" in body:
+            result["model"] = body["model"]
 
         if "max_tokens" in body:
             result["max_tokens"] = body["max_tokens"]
@@ -306,8 +413,27 @@ class OpenAIResponsesTransformer(BaseTransformer):
             result["temperature"] = body["temperature"]
         if "top_p" in body:
             result["top_p"] = body["top_p"]
+        if "top_logprobs" in body:
+            result["top_logprobs"] = body["top_logprobs"]
+        if "parallel_tool_calls" in body:
+            result["parallel_tool_calls"] = body["parallel_tool_calls"]
         if "stream" in body:
             result["stream"] = body["stream"]
+
+        text_cfg = body.get("text")
+        if isinstance(text_cfg, dict):
+            response_format = self._response_format_from_text_config(text_cfg)
+            if response_format is not None:
+                result["response_format"] = response_format
+
+        # Responses `reasoning` request param → enable_thinking.
+        reasoning_cfg = body.get("reasoning")
+        if isinstance(reasoning_cfg, dict) and self._reasoning_config_enables_thinking(
+            reasoning_cfg
+        ):
+            chat_template_kwargs = dict(result.get("chat_template_kwargs") or {})
+            chat_template_kwargs["enable_thinking"] = True
+            result["chat_template_kwargs"] = chat_template_kwargs
 
         # SGLang rejects tool_choice without a non-empty tools list; bind
         # the pair so one can't be forwarded without the other.
@@ -315,12 +441,43 @@ class OpenAIResponsesTransformer(BaseTransformer):
         if tools:
             result["tools"] = tools
             if "tool_choice" in body:
-                result["tool_choice"] = body["tool_choice"]
+                result["tool_choice"] = self._tool_choice_to_openai_chat(
+                    body["tool_choice"]
+                )
 
-        return self._enhance_for_training(
+        return self._normalize_request(
             result,
             body.get("_polar_model_served"),
         )
+
+    def _response_format_from_text_config(
+        self,
+        text_cfg: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        format_cfg = text_cfg.get("format")
+        if not isinstance(format_cfg, dict):
+            return None
+
+        format_type = format_cfg.get("type")
+        if format_type == "text":
+            return None
+        if format_type == "json_object":
+            return {"type": "json_object"}
+        if format_type != "json_schema":
+            return None
+
+        json_schema = format_cfg.get("json_schema")
+        if isinstance(json_schema, dict):
+            return {"type": "json_schema", "json_schema": json_schema}
+
+        converted = {
+            key: format_cfg[key]
+            for key in ("name", "description", "schema", "strict")
+            if key in format_cfg
+        }
+        if not converted:
+            return None
+        return {"type": "json_schema", "json_schema": converted}
 
     def transform_response(
         self,
@@ -335,6 +492,19 @@ class OpenAIResponsesTransformer(BaseTransformer):
         message = choice.get("message", {})
 
         output_items: list[dict[str, Any]] = []
+
+        reasoning = message.get("reasoning_content")
+        if isinstance(reasoning, str) and reasoning:
+            output_items.append(
+                {
+                    "type": "reasoning",
+                    "id": f"rs_{uuid.uuid4().hex[:24]}",
+                    "summary": [{"type": "summary_text", "text": reasoning}],
+                    "content": [{"type": "reasoning_text", "text": reasoning}],
+                    "encrypted_content": encrypt_reasoning(reasoning),
+                    "status": "completed",
+                }
+            )
 
         content = message.get("content")
         if content:
@@ -351,14 +521,7 @@ class OpenAIResponsesTransformer(BaseTransformer):
             func = tc.get("function", {})
             name = func.get("name", "")
             if name in ("shell", "execute", "run_command"):
-                output_items.append(
-                    {
-                        "type": "local_shell_call",
-                        "call_id": tc.get("id", ""),
-                        "status": "completed",
-                        "action": {"type": "execute", "command": func.get("arguments", "{}")},
-                    }
-                )
+                output_items.append(self._local_shell_call_from_tool_call(tc))
             else:
                 output_items.append(
                     {
@@ -372,6 +535,14 @@ class OpenAIResponsesTransformer(BaseTransformer):
                 )
 
         usage = response.get("usage", {})
+        response_usage = {
+            "input_tokens": usage.get("prompt_tokens", 0),
+            "output_tokens": usage.get("completion_tokens", 0),
+            "total_tokens": usage.get("total_tokens", 0),
+        }
+        cached_tokens = self._cached_prompt_tokens(usage)
+        if cached_tokens:
+            response_usage["input_tokens_details"] = {"cached_tokens": cached_tokens}
         return {
             "id": response.get("id", f"resp_{uuid.uuid4().hex}"),
             "object": "response",
@@ -379,11 +550,7 @@ class OpenAIResponsesTransformer(BaseTransformer):
             "status": "completed",
             "model": original_request.get("model", response.get("model", "unknown")),
             "output": output_items,
-            "usage": {
-                "input_tokens": usage.get("prompt_tokens", 0),
-                "output_tokens": usage.get("completion_tokens", 0),
-                "total_tokens": usage.get("total_tokens", 0),
-            },
+            "usage": response_usage,
         }
 
     def create_stream_state(self, original_request: dict[str, Any]) -> ResponsesStreamState:
@@ -413,17 +580,48 @@ class OpenAIResponsesTransformer(BaseTransformer):
         pending_tool_calls: list[dict[str, Any]] = []
         pending_tool_outputs: list[dict[str, Any]] = []
         pending_input_content: list[dict[str, Any]] = []
+        pending_reasoning: str = ""
 
         for item in items:
             item_type = item.get("type")
 
-            if item_type in {"input_text", "input_image"}:
-                if pending_tool_calls or pending_tool_outputs:
+            if item_type == "reasoning":
+                # A new reasoning item starts a new turn block. If the prior
+                # block already has its function_call_output, flush it now so
+                # this reasoning attaches to the NEXT function_call, not the
+                # previous one. (Otherwise codex's per-fc reasoning gets
+                # accumulated and dumped onto the wrong assistant message,
+                # breaking the prefix_merging chain.)
+                if pending_tool_outputs:
                     messages.extend(
-                        self._flush_tool_block(pending_tool_calls, pending_tool_outputs)
+                        self._flush_tool_block(
+                            pending_tool_calls,
+                            pending_tool_outputs,
+                            pending_reasoning,
+                        )
                     )
                     pending_tool_calls = []
                     pending_tool_outputs = []
+                    pending_reasoning = ""
+                reasoning_text = extract_reasoning_from_responses_item(item)
+                if reasoning_text:
+                    pending_reasoning = (
+                        f"{pending_reasoning}\n{reasoning_text}"
+                        if pending_reasoning
+                        else reasoning_text
+                    )
+                continue
+
+            if item_type in {"input_text", "input_image"}:
+                if pending_tool_calls or pending_tool_outputs:
+                    messages.extend(
+                        self._flush_tool_block(
+                            pending_tool_calls, pending_tool_outputs, pending_reasoning
+                        )
+                    )
+                    pending_tool_calls = []
+                    pending_tool_outputs = []
+                    pending_reasoning = ""
                 pending_input_content.append(item)
                 continue
 
@@ -433,14 +631,21 @@ class OpenAIResponsesTransformer(BaseTransformer):
                     pending_input_content = []
                 if pending_tool_calls or pending_tool_outputs:
                     messages.extend(
-                        self._flush_tool_block(pending_tool_calls, pending_tool_outputs)
+                        self._flush_tool_block(
+                            pending_tool_calls, pending_tool_outputs, pending_reasoning
+                        )
                     )
                     pending_tool_calls = []
                     pending_tool_outputs = []
+                    pending_reasoning = ""
 
                 role = item.get("role", "user")
                 content = openai_responses_input_content_to_chat(item.get("content", ""))
-                messages.append({"role": role, "content": content})
+                msg: dict[str, Any] = {"role": role, "content": content}
+                if role == "assistant" and pending_reasoning:
+                    msg["reasoning_content"] = pending_reasoning
+                    pending_reasoning = ""
+                messages.append(msg)
 
             elif item_type == "function_call":
                 if pending_input_content:
@@ -451,10 +656,12 @@ class OpenAIResponsesTransformer(BaseTransformer):
                         self._flush_tool_block(
                             pending_tool_calls,
                             pending_tool_outputs,
+                            pending_reasoning,
                         )
                     )
                     pending_tool_calls = []
                     pending_tool_outputs = []
+                    pending_reasoning = ""
                 pending_tool_calls.append(
                     {
                         "id": item.get("call_id", f"call_{uuid.uuid4().hex[:24]}"),
@@ -466,11 +673,34 @@ class OpenAIResponsesTransformer(BaseTransformer):
                     }
                 )
 
+            elif item_type in {"local_shell_call", "shell_call"}:
+                if pending_input_content:
+                    messages.extend(self._flush_input_content(pending_input_content))
+                    pending_input_content = []
+                if pending_tool_outputs:
+                    messages.extend(
+                        self._flush_tool_block(
+                            pending_tool_calls,
+                            pending_tool_outputs,
+                            pending_reasoning,
+                        )
+                    )
+                    pending_tool_calls = []
+                    pending_tool_outputs = []
+                    pending_reasoning = ""
+                pending_tool_calls.append(self._local_shell_call_to_tool_call(item))
+
             elif item_type == "function_call_output":
                 if pending_input_content:
                     messages.extend(self._flush_input_content(pending_input_content))
                     pending_input_content = []
                 pending_tool_outputs.extend(self._function_call_output_messages(item))
+
+            elif item_type in {"local_shell_call_output", "shell_call_output"}:
+                if pending_input_content:
+                    messages.extend(self._flush_input_content(pending_input_content))
+                    pending_input_content = []
+                pending_tool_outputs.extend(self._local_shell_output_messages(item))
 
             else:
                 if pending_input_content:
@@ -481,10 +711,12 @@ class OpenAIResponsesTransformer(BaseTransformer):
                         self._flush_tool_block(
                             pending_tool_calls,
                             pending_tool_outputs,
+                            pending_reasoning,
                         )
                     )
                     pending_tool_calls = []
                     pending_tool_outputs = []
+                    pending_reasoning = ""
                 converted = self._convert_response_item_to_message(item)
                 if isinstance(converted, list):
                     messages.extend(converted)
@@ -495,7 +727,22 @@ class OpenAIResponsesTransformer(BaseTransformer):
             messages.extend(self._flush_input_content(pending_input_content))
 
         if pending_tool_calls or pending_tool_outputs:
-            messages.extend(self._flush_tool_block(pending_tool_calls, pending_tool_outputs))
+            messages.extend(
+                self._flush_tool_block(
+                    pending_tool_calls, pending_tool_outputs, pending_reasoning
+                )
+            )
+            pending_reasoning = ""
+
+        # Trailing reasoning with no following assistant message: synthesize one.
+        if pending_reasoning:
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "reasoning_content": pending_reasoning,
+                }
+            )
 
         return messages
 
@@ -514,6 +761,94 @@ class OpenAIResponsesTransformer(BaseTransformer):
         if image_parts:
             messages.append({"role": "user", "content": image_parts})
         return messages
+
+    def _local_shell_call_to_tool_call(self, item: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "id": item.get("call_id") or item.get("id") or f"call_{uuid.uuid4().hex[:24]}",
+            "type": "function",
+            "function": {
+                "name": "shell",
+                "arguments": self._local_shell_action_to_arguments(item.get("action")),
+            },
+        }
+
+    def _local_shell_output_messages(self, item: dict[str, Any]) -> list[dict[str, Any]]:
+        call_id = item.get("call_id") or item.get("id") or ""
+        return self._function_call_output_messages(
+            {"call_id": call_id, "output": item.get("output", "")}
+        )
+
+    def _local_shell_action_to_arguments(self, action: Any) -> str:
+        if isinstance(action, str):
+            return action
+        if not isinstance(action, dict):
+            return "{}"
+
+        command = action.get("command")
+        if isinstance(command, str):
+            stripped = command.strip()
+            if stripped.startswith(("{", "[")):
+                try:
+                    json.loads(stripped)
+                    return stripped
+                except json.JSONDecodeError:
+                    pass
+            return json.dumps({"cmd": command})
+
+        commands = action.get("commands")
+        if isinstance(commands, list):
+            command_values = [cmd for cmd in commands if isinstance(cmd, str)]
+            args: dict[str, Any]
+            if len(command_values) == 1:
+                args = {"cmd": command_values[0]}
+            else:
+                args = {"commands": command_values}
+            for key in ("timeout_ms", "max_output_length"):
+                if key in action:
+                    args[key] = action[key]
+            return json.dumps(args)
+
+        args = {key: value for key, value in action.items() if key != "type"}
+        return json.dumps(args) if args else "{}"
+
+    def _local_shell_call_from_tool_call(self, tool_call: dict[str, Any]) -> dict[str, Any]:
+        function = tool_call.get("function", {})
+        arguments = function.get("arguments", "{}") if isinstance(function, dict) else "{}"
+        call_id = tool_call.get("id", "")
+        return {
+            "type": "local_shell_call",
+            "id": f"lsh_{uuid.uuid4().hex[:24]}",
+            "call_id": call_id,
+            "status": "completed",
+            "action": self._local_shell_action_from_arguments(arguments),
+        }
+
+    def _local_shell_action_from_arguments(self, arguments: Any) -> dict[str, Any]:
+        parsed: Any = None
+        if isinstance(arguments, str):
+            try:
+                parsed = json.loads(arguments)
+            except json.JSONDecodeError:
+                parsed = None
+        elif isinstance(arguments, dict):
+            parsed = arguments
+
+        if isinstance(parsed, dict):
+            commands = parsed.get("commands")
+            if isinstance(commands, list):
+                action = {"commands": [cmd for cmd in commands if isinstance(cmd, str)]}
+            else:
+                command = parsed.get("cmd") or parsed.get("command")
+                action = {"commands": [command]} if isinstance(command, str) else {}
+            for key in ("timeout_ms", "max_output_length"):
+                if key in parsed:
+                    action[key] = parsed[key]
+            if action.get("commands"):
+                return action
+
+        if isinstance(arguments, str) and arguments:
+            return {"commands": [arguments]}
+        return {"commands": []}
 
     def _function_call_output_content(self, output: Any) -> Any:
         if isinstance(output, dict):
@@ -566,16 +901,18 @@ class OpenAIResponsesTransformer(BaseTransformer):
         self,
         tool_calls: list[dict[str, Any]],
         tool_outputs: list[dict[str, Any]],
+        reasoning: str = "",
     ) -> list[dict[str, Any]]:
         messages: list[dict[str, Any]] = []
         if tool_calls:
-            messages.append(
-                {
-                    "role": "assistant",
-                    "content": None,
-                    "tool_calls": list(tool_calls),
-                }
-            )
+            assistant_msg: dict[str, Any] = {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": list(tool_calls),
+            }
+            if reasoning:
+                assistant_msg["reasoning_content"] = reasoning
+            messages.append(assistant_msg)
         messages.extend(tool_outputs)
         return messages
 
@@ -614,6 +951,39 @@ class OpenAIResponsesTransformer(BaseTransformer):
                 converted.append({"type": "function", "function": tool["function"]})
                 continue
 
+            tool_type = tool.get("type")
+            if tool_type in {"shell", "local_shell"}:
+                converted.append(
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "shell",
+                            "description": tool.get(
+                                "description", "Run shell commands in the local workspace."
+                            ),
+                            "parameters": {
+                                "type": "object",
+                                "properties": {
+                                    "cmd": {"type": "string"},
+                                    "commands": {
+                                        "type": "array",
+                                        "items": {"type": "string"},
+                                    },
+                                    "timeout_ms": {"type": "number"},
+                                    "max_output_length": {"type": "number"},
+                                },
+                            },
+                        },
+                    }
+                )
+                continue
+
+            # Drop server-side tool types Polar can't dispatch (web_search,
+            # file_search, computer_use, mcp, code_interpreter, image_generation,
+            # custom, etc.). Only client-side functions/shell are convertible.
+            if tool_type and tool_type != "function":
+                continue
+
             name = tool.get("name") or tool.get("id", "")
             if not name:
                 continue
@@ -637,6 +1007,44 @@ class OpenAIResponsesTransformer(BaseTransformer):
             converted.append({"type": "function", "function": func_def})
 
         return converted
+
+    def _tool_choice_to_openai_chat(self, tool_choice: Any) -> Any:
+        if isinstance(tool_choice, str):
+            if tool_choice == "shell":
+                return {"type": "function", "function": {"name": "shell"}}
+            return tool_choice
+
+        if not isinstance(tool_choice, dict):
+            return tool_choice
+
+        choice_type = tool_choice.get("type")
+        if choice_type == "function":
+            function = tool_choice.get("function")
+            if isinstance(function, dict):
+                return tool_choice
+            name = tool_choice.get("name")
+            if isinstance(name, str) and name:
+                return {"type": "function", "function": {"name": name}}
+        if choice_type in {"shell", "local_shell"}:
+            return {"type": "function", "function": {"name": "shell"}}
+        return tool_choice
+
+    def _reasoning_config_enables_thinking(self, reasoning_cfg: dict[str, Any]) -> bool:
+        if not reasoning_cfg:
+            return False
+        effort = reasoning_cfg.get("effort")
+        if isinstance(effort, str) and effort.lower() == "none":
+            return False
+        return True
+
+    def _cached_prompt_tokens(self, usage: dict[str, Any]) -> int:
+        details = usage.get("prompt_tokens_details")
+        if isinstance(details, dict):
+            cached = details.get("cached_tokens")
+            if isinstance(cached, int):
+                return cached
+        cached = usage.get("cached_tokens")
+        return cached if isinstance(cached, int) else 0
 
     def _make_error_response(self, message: str) -> dict[str, Any]:
         return {

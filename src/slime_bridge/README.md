@@ -1,34 +1,61 @@
 # Slime Bridge
 
-`slime_bridge` connects Slime rollout calls to a running Polar rollout service.
-It is intentionally kept outside the core `polar` package namespace because
-Slime, Ray, Megatron, and training dependencies are installed separately.
+`slime_bridge` connects [Slime](https://github.com/THUDM/slime)'s RL training
+loop to a running Polar rollout server over HTTP. It lives **outside** the
+`polar` package because Slime, Ray, Megatron, and torch are installed separately
+— Polar depends on none of them.
 
-## Main Files
+## How it fits
 
-- `config.py`: bridge configuration helpers.
-- `rollout.py`: async worker lifecycle, task submission, policy update
-  coordination, and Slime-facing rollout functions.
-- `_messages.py`: prompt and message conversion.
-- `adapter.py`: conversion from Polar session results to Slime-like samples.
-- `data_source.py`: Slime data source integration.
-- `reward.py`: reward helpers.
-- `reward_post_process.py`: reward normalization after rollout.
+Slime calls one entry point, `generate_rollout_polar_async`, wired in via
+`--rollout-function-path`. From there the bridge:
 
-## What The Bridge Owns
+- submits async task batches to `polar_rollout_url` (or a node derived from
+  `polar_topology_path`) and collects each result through a local callback
+  listener with a polling safety net;
+- tracks rollout ids and policy versions, stamps `{group_id, policy_version,
+  rollout_step}` onto every task, and **drops groups that drift too far
+  off-policy** (`max_off_policy_steps`) while keeping async admission bounded
+  (`max_async_level`);
+- **pauses/resumes gateway generation** around weight updates (the gateway's
+  `/admin/inference/pause` + `/resume`) when overlap is enabled;
+- converts each Polar `Trajectory` back into Slime `Sample`s (one per trace,
+  grouped so the reward post-processor treats them as one trajectory), dropping
+  empty or oversized traces;
+- normalizes rewards GRPO-style per group and zeroes out failed/aborted
+  trajectories.
 
-- Convert Slime samples and prompt messages into Polar task requests.
-- Submit async batches to `polar_rollout_url`.
-- Track rollout ids, policy versions, and scheduler metadata.
-- Pause and resume gateway generation during configured weight update windows.
-- Convert Polar trajectories back into sample objects expected by Slime.
-- Normalize or filter rewards for failed and oversized trajectories.
+## Main files
 
-## Slime Installation
+- `config.py`: `PolarSlimeConfig` + `resolve_polar_slime_config`; also renders the
+  task payload, the instruction, and the topology that points gateways at Slime's
+  SGLang router.
+- `rollout.py`: the async worker (submit → callback/poll → convert), the
+  evaluation path, policy-update coordination, the acceptance filters, and the
+  Slime entry point.
+- `_messages.py`: prompt/message flattening shared by rollout + adapter.
+- `adapter.py`: convert a Polar `SessionResult` into Slime `Sample`s.
+- `data_source.py`: `CeilEpochRolloutDataSourceWithBuffer` — rounds the epoch
+  length up so the dataset tail isn't skipped.
+- `reward.py`: reward hook that reads the reward Polar already embedded.
+- `reward_post_process.py`: trajectory-aware, group-normalized reward shaping.
 
-Install Slime from the THUDM git checkout, not from the unrelated PyPI `slime`
-package. The SWE-Gym Slime GRPO example uses `launch_e2e.sh` to automate this
-setup; the manual equivalent from the repository root is:
+## What the bridge owns
+
+- Turn Slime samples + prompts into Polar task requests and submit async batches.
+- Track rollout ids / policy versions; drop off-policy-stale groups; bound async
+  admission.
+- Filter unusable groups (zero trainable tokens, too few completed samples,
+  logprob errors) with per-category metrics.
+- Pause/resume gateway generation during weight-update windows.
+- Convert Polar trajectories back into Slime samples; normalize and zero rewards.
+- Run the evaluation path over `eval_datasets` and emit W&B metrics.
+
+## Slime installation
+
+Install Slime from the THUDM git checkout (not the unrelated PyPI `slime`
+package). The SWE-Gym Slime GRPO example automates this with `launch_e2e.sh`; the
+manual equivalent from the repository root is:
 
 ```bash
 git clone --branch v0.2.4 --depth 1 https://github.com/THUDM/slime.git slime
@@ -41,8 +68,6 @@ uv pip install -e Megatron-LM
 bash scripts/patch/patch_slime.sh slime
 ```
 
-Use `SLIME_DIR=/path/to/slime` and `MEGATRON_DIR=/path/to/Megatron-LM` when
-working with existing checkouts outside the repository root.
-
-The Slime training environment is expected to provide heavy dependencies such
-as `torch`. Polar does not add those dependencies for the first beta release.
+Use `SLIME_DIR=/path/to/slime` and `MEGATRON_DIR=/path/to/Megatron-LM` for
+checkouts outside the repository root. The Slime training environment provides
+the heavy dependencies (e.g. `torch`); Polar does not add them.

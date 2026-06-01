@@ -28,9 +28,15 @@ def parse_data_url(url: str) -> tuple[str, str] | None:
     return mime_type, match.group("data")
 
 
+# OpenAI's image_url.detail only accepts these values; vLLM rejects anything
+# else. Harnesses send their own (e.g. codex's "original"), so drop unknowns
+# rather than forward a value that 400s the whole image request.
+_VALID_IMAGE_DETAILS = frozenset({"auto", "low", "high"})
+
+
 def openai_image_url_block(url: str, *, detail: Any = None) -> dict[str, Any]:
     image_url: dict[str, Any] = {"url": url}
-    if isinstance(detail, str) and detail:
+    if isinstance(detail, str) and detail in _VALID_IMAGE_DETAILS:
         image_url["detail"] = detail
     return {"type": "image_url", "image_url": image_url}
 
@@ -140,8 +146,40 @@ def anthropic_content_to_openai_chat(content: Any) -> str | list[dict[str, Any]]
             image = anthropic_image_to_openai_chat(block)
             if image:
                 parts.append(image)
+            continue
+        if block_type == "document":
+            text = anthropic_document_to_text(block)
+            if text:
+                parts.append(openai_text_block(text))
 
     return openai_content_from_text_and_images(parts)
+
+
+def anthropic_document_to_text(block: dict[str, Any]) -> str:
+    """Extract text from an Anthropic `document` block.
+
+    Handles `source.type == "text"` and `source.type == "content"`. Base64
+    PDFs are dropped — SGLang can't render binary docs through the chat
+    template.
+    """
+    source = block.get("source")
+    if not isinstance(source, dict):
+        return ""
+    source_type = source.get("type")
+    if source_type == "text":
+        data = source.get("data")
+        return data if isinstance(data, str) else ""
+    if source_type == "content":
+        inner = source.get("content")
+        if isinstance(inner, list):
+            pieces: list[str] = []
+            for inner_block in inner:
+                if isinstance(inner_block, dict) and inner_block.get("type") == "text":
+                    text = inner_block.get("text")
+                    if isinstance(text, str):
+                        pieces.append(text)
+            return "\n".join(pieces)
+    return ""
 
 
 def anthropic_image_to_openai_chat(block: dict[str, Any]) -> dict[str, Any] | None:
@@ -172,6 +210,10 @@ def google_content_parts_to_openai_chat(parts: Any) -> str | list[dict[str, Any]
             openai_parts.append(openai_text_block(part))
             continue
         if not isinstance(part, dict):
+            continue
+
+        # Thought parts are reasoning_content, not user-visible content.
+        if part.get("thought") is True:
             continue
 
         text = part.get("text")

@@ -71,6 +71,25 @@ def _mean_reward(results: list[SessionResult]) -> float | None:
     return sum(rewards) / len(rewards)
 
 
+def _mean_traces(results: list[SessionResult]) -> float | None:
+    """Average number of traces per session for the task."""
+    if not results:
+        return None
+    counts = [len(r.trajectory.traces) for r in results]
+    return sum(counts) / len(counts)
+
+
+def _mean_completions(results: list[SessionResult]) -> float | None:
+    """Average number of raw completions (LLM requests) per session."""
+    if not results:
+        return None
+    counts = [
+        int(r.trajectory.metadata.get("record_count") or len(r.trajectory.traces))
+        for r in results
+    ]
+    return sum(counts) / len(counts)
+
+
 class RolloutManager:
     """Manage the lifecycle of rollout sessions for a single submitted task."""
 
@@ -265,6 +284,8 @@ class RolloutManager:
                     "completed_sessions": record.completed_sessions,
                     "errored_sessions": record.errored_sessions,
                     "mean_reward": _mean_reward(record.results),
+                    "mean_traces": _mean_traces(record.results),
+                    "mean_completions": _mean_completions(record.results),
                     "created_at": record.created_at,
                     "updated_at": record.updated_at,
                     "source": "live",

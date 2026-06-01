@@ -7,6 +7,7 @@ import pytest
 from slime_bridge.config import (
     render_instruction,
     render_task_payload,
+    render_topology_template,
     resolve_polar_slime_config,
     resolve_sglang_router_base_url,
 )
@@ -119,3 +120,24 @@ def test_render_instruction_uses_optional_template() -> None:
 def test_resolve_sglang_router_base_url_requires_both_ip_and_port() -> None:
     assert resolve_sglang_router_base_url(_args()) == "http://127.0.0.1:30000"
     assert resolve_sglang_router_base_url(_args(sglang_router_port=None)) is None
+
+
+def test_render_topology_template_emits_inference_block(tmp_path) -> None:
+    topology_path = tmp_path / "topology.yaml"
+    topology_path.write_text(
+        """
+rollout: {host: 127.0.0.1, port: 8080, public_url: http://127.0.0.1:8080}
+gateway:
+  nodes:
+    - id: n1
+      host: 127.0.0.1
+      port: 8100
+      public_url: http://127.0.0.1:8100
+      model_served: Qwen/Qwen3.5-4B
+      inference: {engine: sglang, base_url: http://127.0.0.1:8000}
+""".strip()
+    )
+    rendered = render_topology_template(str(topology_path), _args())
+    node = rendered["gateway"]["nodes"][0]
+    assert node["inference"] == {"engine": "sglang", "base_url": "http://127.0.0.1:30000"}
+    assert "sglang" not in node

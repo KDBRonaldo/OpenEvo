@@ -17,6 +17,10 @@ from polar.gateway.transform.images import (
     anthropic_content_to_openai_chat,
     openai_chat_content_to_anthropic_blocks,
 )
+from polar.gateway.transform.reasoning import (
+    extract_reasoning_from_anthropic_content,
+    make_signature,
+)
 
 # Claude Code SDK leaks `x-anthropic-billing-header: ...cch=<hash>;` as the
 # first line of the system prompt. The cch= hash changes per request, so
@@ -52,6 +56,9 @@ class AnthropicStreamState:
         self.next_block_index = 0
         self.text_block_index: int | None = None
         self.text_block_started = False
+        self.thinking_block_index: int | None = None
+        self.thinking_block_started = False
+        self.thinking_buffer = ""
         self.tool_calls: dict[int, _AnthropicToolCallState] = {}
         self.stop_reason = "end_turn"
         self.output_tokens = 0
@@ -92,8 +99,25 @@ class AnthropicStreamState:
         if finish_reason:
             self.stop_reason = self.finish_to_stop_reason.get(finish_reason, "end_turn")
 
+        # Thinking blocks must precede text and tool_use per Anthropic spec.
+        reasoning = delta.get("reasoning_content")
+        if reasoning:
+            if not self.thinking_block_started:
+                events.append(self._open_thinking_block())
+            events.append(
+                {
+                    "type": "content_block_delta",
+                    "index": self.thinking_block_index,
+                    "delta": {"type": "thinking_delta", "thinking": reasoning},
+                }
+            )
+            self.thinking_buffer += reasoning
+
         content = delta.get("content")
         if content:
+            thinking_stop = self._close_thinking_block()
+            if thinking_stop:
+                events.extend(thinking_stop)
             if not self.text_block_started:
                 events.append(self._open_text_block())
             events.append(
@@ -118,6 +142,10 @@ class AnthropicStreamState:
             return []
 
         events: list[dict[str, Any]] = []
+
+        thinking_stop = self._close_thinking_block()
+        if thinking_stop:
+            events.extend(thinking_stop)
 
         text_stop = self._close_text_block()
         if text_stop:
@@ -176,6 +204,36 @@ class AnthropicStreamState:
         self.text_block_index = None
         return event
 
+    def _open_thinking_block(self) -> dict[str, Any]:
+        self.thinking_block_started = True
+        self.thinking_block_index = self.next_block_index
+        self.next_block_index += 1
+        self.any_block_started = True
+        return {
+            "type": "content_block_start",
+            "index": self.thinking_block_index,
+            "content_block": {"type": "thinking", "thinking": "", "signature": ""},
+        }
+
+    def _close_thinking_block(self) -> list[dict[str, Any]] | None:
+        if not self.thinking_block_started or self.thinking_block_index is None:
+            return None
+        idx = self.thinking_block_index
+        events = [
+            {
+                "type": "content_block_delta",
+                "index": idx,
+                "delta": {
+                    "type": "signature_delta",
+                    "signature": make_signature(self.thinking_buffer),
+                },
+            },
+            {"type": "content_block_stop", "index": idx},
+        ]
+        self.thinking_block_started = False
+        self.thinking_block_index = None
+        return events
+
     def _process_tool_call(self, tool_call_delta: dict[str, Any]) -> list[dict[str, Any]]:
         events: list[dict[str, Any]] = []
 
@@ -208,6 +266,10 @@ class AnthropicStreamState:
             tool_state.buffered_arguments += args_str
 
         if tool_state.name and not tool_state.started:
+            thinking_stop = self._close_thinking_block()
+            if thinking_stop:
+                events.extend(thinking_stop)
+
             text_stop = self._close_text_block()
             if text_stop:
                 events.append(text_stop)
@@ -264,7 +326,8 @@ class AnthropicTransformer(BaseTransformer):
         "stop": "end_turn",
         "length": "max_tokens",
         "tool_calls": "tool_use",
-        "content_filter": "end_turn",
+        "content_filter": "refusal",
+        "stop_sequence": "stop_sequence",
     }
 
     def transform_request(self, body: dict[str, Any]) -> dict[str, Any]:
@@ -293,15 +356,29 @@ class AnthropicTransformer(BaseTransformer):
             "messages": messages,
             "max_tokens": body.get("max_tokens", 4096),
         }
+        if "model" in body:
+            result["model"] = body["model"]
 
         if "temperature" in body:
             result["temperature"] = body["temperature"]
         if "top_p" in body:
             result["top_p"] = body["top_p"]
+        if "top_k" in body:
+            result["top_k"] = body["top_k"]
         if "stop_sequences" in body:
             result["stop"] = body["stop_sequences"]
         if body.get("stream", False):
             result["stream"] = True
+
+        # Anthropic `thinking` request param → enable_thinking on chat template.
+        thinking_cfg = body.get("thinking")
+        if isinstance(thinking_cfg, dict) and thinking_cfg.get("type") in {
+            "enabled",
+            "adaptive",
+        }:
+            chat_template_kwargs = dict(result.get("chat_template_kwargs") or {})
+            chat_template_kwargs["enable_thinking"] = True
+            result["chat_template_kwargs"] = chat_template_kwargs
 
         # Tools. Claude Code sometimes sends tools=[] on compaction/summary
         # turns; forwarding tool_choice without a non-empty tools list makes
@@ -314,7 +391,7 @@ class AnthropicTransformer(BaseTransformer):
                     body.get("tool_choice", {"type": "auto"})
                 )
 
-        return self._enhance_for_training(
+        return self._normalize_request(
             result,
             body.get("_polar_model_served"),
         )
@@ -332,6 +409,16 @@ class AnthropicTransformer(BaseTransformer):
         message = choice.get("message", {})
 
         content = []
+        reasoning = message.get("reasoning_content")
+        if isinstance(reasoning, str) and reasoning:
+            content.append(
+                {
+                    "type": "thinking",
+                    "thinking": reasoning,
+                    "signature": make_signature(reasoning),
+                }
+            )
+
         text = message.get("content")
         if text or (isinstance(text, list) and text):
             content.extend(openai_chat_content_to_anthropic_blocks(text))
@@ -351,6 +438,7 @@ class AnthropicTransformer(BaseTransformer):
         finish_reason = choice.get("finish_reason", "stop")
         stop_reason = self.FINISH_TO_STOP_REASON.get(finish_reason, "end_turn")
         usage = response.get("usage", {})
+        anthropic_usage = self._usage_to_anthropic(usage)
 
         if not content:
             content.append({"type": "text", "text": ""})
@@ -363,10 +451,7 @@ class AnthropicTransformer(BaseTransformer):
             "model": original_request.get("model", "claude-3"),
             "stop_reason": stop_reason,
             "stop_sequence": None,
-            "usage": {
-                "input_tokens": usage.get("prompt_tokens", 0),
-                "output_tokens": usage.get("completion_tokens", 0),
-            },
+            "usage": anthropic_usage,
         }
 
     def create_stream_state(self, original_request: dict[str, Any]) -> AnthropicStreamState:
@@ -413,6 +498,11 @@ class AnthropicTransformer(BaseTransformer):
 
         messages = []
 
+        # Assistant `thinking` blocks → reasoning_content (kept for replay).
+        reasoning_text = ""
+        if role == "assistant":
+            reasoning_text = extract_reasoning_from_anthropic_content(content)
+
         # Handle assistant messages with tool_use blocks
         if role == "assistant" and tool_uses:
             tool_calls = []
@@ -436,6 +526,8 @@ class AnthropicTransformer(BaseTransformer):
                 "role": "assistant",
                 "content": "\n".join(text_parts) if text_parts else None,
             }
+            if reasoning_text:
+                msg_dict["reasoning_content"] = reasoning_text
             if tool_calls:
                 msg_dict["tool_calls"] = tool_calls
             return msg_dict
@@ -446,11 +538,19 @@ class AnthropicTransformer(BaseTransformer):
             for tr in tool_results:
                 tool_content = tr.get("content", "")
                 converted_content = anthropic_content_to_openai_chat(tool_content)
+                text_content = self._flatten_content(converted_content)
+                # Anthropic marks failed tool results with is_error=true.
+                # Surface this to the model so it can see the call failed
+                # rather than treating the payload as normal output.
+                if tr.get("is_error"):
+                    text_content = (
+                        f"[Tool Error] {text_content}" if text_content else "[Tool Error]"
+                    )
                 messages.append(
                     {
                         "role": "tool",
                         "tool_call_id": tr.get("tool_use_id", ""),
-                        "content": self._flatten_content(converted_content),
+                        "content": text_content,
                     }
                 )
                 # OpenAI tool messages stay text-only; images are sent as a
@@ -466,7 +566,13 @@ class AnthropicTransformer(BaseTransformer):
             return messages if messages else None
 
         # Regular content blocks — keep images when present.
-        return {"role": role, "content": anthropic_content_to_openai_chat(content)}
+        result: dict[str, Any] = {
+            "role": role,
+            "content": anthropic_content_to_openai_chat(content),
+        }
+        if role == "assistant" and reasoning_text:
+            result["reasoning_content"] = reasoning_text
+        return result
 
     def _flatten_content(self, content: Any) -> str:
         if isinstance(content, str):
@@ -494,11 +600,24 @@ class AnthropicTransformer(BaseTransformer):
     def _transform_tools_to_openai(self, tools: list[dict]) -> list[dict]:
         result = []
         for tool in tools:
+            # Anthropic server tools (web_search_*, code_execution_*) carry an
+            # explicit `type` and have no `input_schema`. SGLang can't dispatch
+            # them, so drop rather than forwarding a stub function tool.
+            tool_type = tool.get("type")
+            if (
+                tool_type
+                and tool_type not in ("custom", "function")
+                and "input_schema" not in tool
+            ):
+                continue
+            name = tool.get("name")
+            if not isinstance(name, str) or not name:
+                continue
             result.append(
                 {
                     "type": "function",
                     "function": {
-                        "name": tool.get("name", ""),
+                        "name": name,
                         "description": tool.get("description", ""),
                         "parameters": tool.get("input_schema", {}),
                     },
@@ -513,6 +632,8 @@ class AnthropicTransformer(BaseTransformer):
                 return "auto"
             elif tc_type == "any":
                 return "required"
+            elif tc_type == "none":
+                return "none"
             elif tc_type == "tool":
                 return {
                     "type": "function",
@@ -525,6 +646,32 @@ class AnthropicTransformer(BaseTransformer):
             return json.loads(s)
         except (json.JSONDecodeError, TypeError):
             return {}
+
+    def _usage_to_anthropic(self, usage: dict[str, Any]) -> dict[str, Any]:
+        prompt_tokens = usage.get("prompt_tokens", 0)
+        completion_tokens = usage.get("completion_tokens", 0)
+        cache_read = self._cached_prompt_tokens(usage)
+        input_tokens = max(prompt_tokens - cache_read, 0) if cache_read else prompt_tokens
+
+        result: dict[str, Any] = {
+            "input_tokens": input_tokens,
+            "output_tokens": completion_tokens,
+        }
+        if cache_read:
+            result["cache_read_input_tokens"] = cache_read
+        cache_creation = usage.get("cache_creation_input_tokens")
+        if isinstance(cache_creation, int) and cache_creation:
+            result["cache_creation_input_tokens"] = cache_creation
+        return result
+
+    def _cached_prompt_tokens(self, usage: dict[str, Any]) -> int:
+        details = usage.get("prompt_tokens_details")
+        if isinstance(details, dict):
+            cached = details.get("cached_tokens")
+            if isinstance(cached, int):
+                return cached
+        cached = usage.get("cached_tokens")
+        return cached if isinstance(cached, int) else 0
 
     def _error_response(self, message: str) -> dict[str, Any]:
         return {

@@ -1,4 +1,9 @@
-"""HTTP client for forwarding requests to SGLang with SSE streaming support."""
+"""HTTP client for forwarding requests to an OpenAI-compatible inference server.
+
+Backend differences (request params, response shape) are isolated in the
+``InferenceEngine`` strategy this client holds; the HTTP/streaming/pause logic
+here is backend-agnostic.
+"""
 
 from __future__ import annotations
 
@@ -8,6 +13,8 @@ import logging
 from typing import Any
 
 import httpx
+
+from polar.gateway.engine import InferenceEngine
 
 logger = logging.getLogger(__name__)
 
@@ -48,19 +55,21 @@ class UpstreamTransportError(UpstreamError):
     """Raised for connection and transport failures."""
 
 
-class SGLangClient:
-    """Direct httpx client to SGLang's OpenAI-compatible API.
+class InferenceClient:
+    """Direct httpx client to an inference server's OpenAI-compatible API.
 
     Per-call bound comes from the session's remaining-timeout budget
     (`_await_with_budget` at the gateway node). The internal httpx timeout
-    is a high liveness ceiling so that a stuck SGLang can't pin a request
-    past the session deadline.
+    is a high liveness ceiling so that a stuck engine can't pin a request
+    past the session deadline. The ``engine`` strategy injects backend-specific
+    request params and canonicalizes responses.
     """
 
     _LIVENESS_TIMEOUT_SECONDS = 900.0
 
-    def __init__(self, base_url: str):
+    def __init__(self, base_url: str, engine: InferenceEngine):
         self.base_url = base_url.rstrip("/")
+        self.engine = engine
         self._client: httpx.AsyncClient | None = None
         self._generation_paused = False
         self._inflight_generations = 0
@@ -106,10 +115,12 @@ class SGLangClient:
         """Non-streaming chat completion. Returns the full JSON response."""
         await self._acquire_generation_slot()
         client = await self._get_client()
-        request_copy = request.copy()
+        from copy import deepcopy
+
+        request_copy = deepcopy(request)
         request_copy.pop("stream", None)
         request_copy["stream"] = False
-
+        request_copy = self.engine.prepare_request(request_copy)
         try:
             resp = await client.post(
                 "/v1/chat/completions",
@@ -122,7 +133,7 @@ class SGLangClient:
             await self._release_generation_slot()
 
         await self._raise_for_status(resp)
-        return resp.json()
+        return self.engine.normalize_response(resp.json())
 
     async def _acquire_generation_slot(self) -> None:
         async with self._generation_condition:
@@ -135,7 +146,7 @@ class SGLangClient:
             self._generation_condition.notify_all()
 
     async def pause_generation(self, *, timeout_seconds: float = 300.0) -> dict[str, Any]:
-        """Block new generation requests and wait for current SGLang calls to drain."""
+        """Block new generation requests and wait for current inference calls to drain."""
         async with self._generation_condition:
             self._generation_paused = True
             self._generation_condition.notify_all()
@@ -156,6 +167,7 @@ class SGLangClient:
             "paused": self._generation_paused,
             "inflight": self._inflight_generations,
             "base_url": self.base_url,
+            "engine": self.engine.name,
         }
 
     async def list_models(self) -> dict[str, Any]:

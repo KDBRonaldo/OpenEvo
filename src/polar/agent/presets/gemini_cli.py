@@ -67,6 +67,9 @@ class GeminiCliHarness(BaseHarness):
         return [
             ExecInput(
                 command=(
+                    # The gateway injects GOOGLE_API_KEY / GOOGLE_API_URL; the
+                    # Gemini CLI reads GEMINI_API_KEY / GOOGLE_GEMINI_BASE_URL,
+                    # so map one onto the other to route calls at the proxy.
                     'export GEMINI_API_KEY="$GOOGLE_API_KEY" '
                     'GOOGLE_GEMINI_BASE_URL="$GOOGLE_API_URL" && '
                     f"gemini {flags_str} --prompt={escaped} "

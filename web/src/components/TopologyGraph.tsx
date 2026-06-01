@@ -81,8 +81,8 @@ export function TopologyGraph({ topology, isLoading }: Props) {
 
               <div className="mt-3 border-t border-slate-200 pt-2 text-xs">
                 <div className="flex items-center justify-between">
-                  <span className="text-slate-500">SGLang</span>
-                  <span className="font-mono">{gw.sglang_base_url}</span>
+                  <span className="text-slate-500">{(gw.engine || "engine").toUpperCase()}</span>
+                  <span className="font-mono">{gw.inference_base_url}</span>
                 </div>
                 <div className="flex items-center justify-between">
                   <span className="text-slate-500">model</span>

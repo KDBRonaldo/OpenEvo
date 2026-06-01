@@ -15,6 +15,6 @@ gateway:
       max_run_workers: 16
       max_postrun_workers: 16
       model_served: Qwen/Qwen3.5-4B
-      sglang:
-        # run.sh/launch_e2e.sh render this to the host-reachable router URL.
-        base_url: http://127.0.0.1:9000
+      inference:
+        engine: sglang
+        base_url: ${SGLANG_ROUTER_BASE_URL}

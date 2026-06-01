@@ -66,7 +66,8 @@ gateway:
       max_run_workers: 4
       max_postrun_workers: 4
       model_served: Qwen/Qwen3.5-4B
-      sglang:
+      inference:
+        engine: sglang
         base_url: http://127.0.0.1:9000
 """.strip()
     )

@@ -18,9 +18,10 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from polar.config import GatewayNodeConfig, TopologyConfig
 from polar.gateway.completion_writer import CompletionWriter
 from polar.gateway.detection import APIType, detect, extract_model
+from polar.gateway.engine import get_engine
 from polar.gateway.node import GatewayNodeManager
 from polar.gateway.proxy import (
-    SGLangClient,
+    InferenceClient,
     UpstreamError,
     UpstreamHTTPError,
     UpstreamTimeoutError,
@@ -57,7 +58,7 @@ logger = logging.getLogger(__name__)
 class GatewayState:
     topology: TopologyConfig
     node: GatewayNodeConfig
-    sglang: SGLangClient
+    inference: InferenceClient
     storage: SessionStore
     transform_manager: TransformManager
     session_registry: SessionRegistry
@@ -80,7 +81,7 @@ def configure_server(topology_path: str = "topology.yaml", *, node_id: str | Non
 
 def _build_state(topology: TopologyConfig, node_id: str | None) -> GatewayState:
     node = topology.select_gateway_node(node_id)
-    sglang = SGLangClient(node.sglang_base_url)
+    inference = InferenceClient(node.inference_base_url, get_engine(node.engine))
     persistence_config = topology.gateway.completion_persistence
     save_dir = topology.rollout.save_dir
     completion_writer = CompletionWriter(
@@ -114,7 +115,7 @@ def _build_state(topology: TopologyConfig, node_id: str | None) -> GatewayState:
     return GatewayState(
         topology=topology,
         node=node,
-        sglang=sglang,
+        inference=inference,
         storage=storage,
         transform_manager=transform_manager,
         session_registry=session_registry,
@@ -187,7 +188,7 @@ async def _lifespan(_: FastAPI):
         yield
     finally:
         await state.node_manager.close()
-        await state.sglang.close()
+        await state.inference.close()
         state.storage.close()
         await state.completion_writer.close()
 
@@ -399,7 +400,7 @@ def format_stream_output(
 async def list_models():
     state = get_state()
     try:
-        return await state.sglang.list_models()
+        return await state.inference.list_models()
     except Exception as exc:
         logger.error("Failed to list models: %s", exc)
         return JSONResponse({"error": str(exc)}, status_code=502)
@@ -410,14 +411,14 @@ async def health():
     state = get_state()
     metrics = await state.node_manager.stage_metrics()
     try:
-        upstream = await state.sglang.health()
+        upstream = await state.inference.health()
     except Exception as exc:
         upstream = {"status": "error", "error": str(exc)}
     return {
         "status": "ok",
         "node_id": state.node.id,
         "gateway_url": state.node.public_url,
-        "sglang": upstream,
+        "inference": upstream,
         "metrics": metrics.model_dump(mode="json"),
         "active_status_counts": state.session_registry.active_status_counts(),
         "active_sessions": state.session_registry.active_sessions(),
@@ -427,32 +428,32 @@ async def health():
     }
 
 
-@app.get("/admin/sglang/status")
-async def sglang_generation_status():
-    return get_state().sglang.generation_status()
+@app.get("/admin/inference/status")
+async def inference_generation_status():
+    return get_state().inference.generation_status()
 
 
-@app.post("/admin/sglang/pause")
-async def pause_sglang_generation(timeout_seconds: float = 300.0):
+@app.post("/admin/inference/pause")
+async def pause_inference_generation(timeout_seconds: float = 300.0):
     state = get_state()
     try:
-        status = await state.sglang.pause_generation(timeout_seconds=timeout_seconds)
+        status = await state.inference.pause_generation(timeout_seconds=timeout_seconds)
     except TimeoutError as exc:
         raise HTTPException(
             status_code=504,
-            detail=f"Timed out waiting for SGLang requests to drain after {timeout_seconds}s",
+            detail=f"Timed out waiting for inference requests to drain after {timeout_seconds}s",
         ) from exc
     logger.info(
-        "Paused SGLang generation proxy for weight update; inflight=%s",
+        "Paused inference generation proxy for weight update; inflight=%s",
         status["inflight"],
     )
     return status
 
 
-@app.post("/admin/sglang/resume")
-async def resume_sglang_generation():
-    status = await get_state().sglang.resume_generation()
-    logger.info("Resumed SGLang generation proxy")
+@app.post("/admin/inference/resume")
+async def resume_inference_generation():
+    status = await get_state().inference.resume_generation()
+    logger.info("Resumed inference generation proxy")
     return status
 
 
@@ -679,7 +680,7 @@ async def _handle_non_streaming(
 ) -> JSONResponse:
     state = get_state()
     try:
-        response = await state.sglang.completion(openai_request)
+        response = await state.inference.completion(openai_request)
     except UpstreamError as exc:
         logger.warning("Non-streaming upstream error for session %s: %s", session_id, exc)
         return _upstream_error_response(api_type, exc)
@@ -714,7 +715,7 @@ async def _handle_streaming(
     non_stream_request = {k: v for k, v in openai_request.items() if k != "stream_options"}
     non_stream_request["stream"] = False
     try:
-        response = await state.sglang.completion(non_stream_request)
+        response = await state.inference.completion(non_stream_request)
     except UpstreamError as exc:
         logger.warning("Upstream error for streaming session %s: %s", session_id, exc)
         return _upstream_error_response(api_type, exc)
