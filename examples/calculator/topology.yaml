@@ -29,3 +29,18 @@ gateway:
       inference:
         engine: vllm
         base_url: http://127.0.0.1:8001
+
+# Optional: enable the Evolution Backend control plane.
+# Start it with:
+#   uv run polar-evolution serve --host 127.0.0.1 --port 8200
+# evolution:
+#   enabled: true
+#   backend_url: http://127.0.0.1:8200
+#   context:
+#     target_dir: /polar/session/evolution
+#     timeout_seconds: 10
+#     fail_open: true
+#   event_export:
+#     enabled: true
+#     timeout_seconds: 10
+#     fail_open: true
