@@ -1,0 +1,139 @@
+from __future__ import annotations
+
+import json
+import math
+from pathlib import Path
+from typing import Any
+from urllib.parse import unquote, urlparse
+
+from polar_evolution.models import ArtifactType, ContextResolveRequest
+
+
+def _json_object(value: object) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    try:
+        parsed = json.loads(str(value or "{}"))
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    if not isinstance(parsed, dict):
+        return {}
+    return parsed
+
+
+def _compatibility_object(value: object) -> dict[str, Any] | None:
+    if value is None:
+        return {}
+    if isinstance(value, dict):
+        return value
+    try:
+        parsed = json.loads(str(value))
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    return parsed
+
+
+def _string_items(value: object) -> list[str] | None:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    if not isinstance(value, list | tuple | set):
+        return None
+
+    items: list[str] = []
+    for item in value:
+        if not isinstance(item, str):
+            return None
+        items.append(item)
+    return items
+
+
+def artifact_matches(request: ContextResolveRequest, row: dict[str, object]) -> bool:
+    compatibility = _compatibility_object(row.get("compatibility_json"))
+    if compatibility is None:
+        return False
+
+    task_tags = _string_items(request.metadata.get("task_tags"))
+    required_tags = _string_items(compatibility.get("task_tags"))
+    if task_tags is None or required_tags is None:
+        return False
+    if required_tags and not set(task_tags).intersection(required_tags):
+        return False
+
+    compatible_base_models = _string_items(compatibility.get("base_model"))
+    if compatible_base_models is None:
+        return False
+    if compatible_base_models:
+        if request.base_model not in compatible_base_models:
+            return False
+
+    harnesses = _string_items(compatibility.get("agent_harness"))
+    if harnesses is None:
+        return False
+    harness = request.agent.get("harness")
+    if harnesses and harness not in harnesses:
+        return False
+    return True
+
+
+def read_file_uri_text(uri: str) -> str:
+    parsed = urlparse(uri)
+    if parsed.scheme != "file":
+        return ""
+    path = Path(unquote(parsed.path))
+    if not path.is_file():
+        return ""
+    try:
+        return path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return ""
+
+
+def artifact_score(row: dict[str, object]) -> float:
+    scores = _json_object(row.get("scores_json"))
+    for key in ("quality", "heldout_reward_delta"):
+        if key not in scores:
+            continue
+        try:
+            score = float(scores[key])
+        except (TypeError, ValueError):
+            return 0.0
+        if math.isfinite(score):
+            return score
+        return 0.0
+    return 0.0
+
+
+def sort_candidates(rows: list[dict[str, object]]) -> list[dict[str, object]]:
+    return sorted(
+        rows,
+        key=lambda row: (
+            artifact_score(row),
+            str(row.get("created_at") or ""),
+            str(row.get("artifact_id") or ""),
+        ),
+        reverse=True,
+    )
+
+
+def artifact_type(row: dict[str, object]) -> ArtifactType:
+    return ArtifactType(str(row["type"]))
+
+
+def artifact_manifest(row: dict[str, object]) -> dict[str, Any]:
+    manifest_path = row.get("manifest_path")
+    if not manifest_path:
+        return {}
+    try:
+        payload = json.loads(Path(str(manifest_path)).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    manifest = payload.get("manifest")
+    if not isinstance(manifest, dict):
+        return {}
+    return manifest

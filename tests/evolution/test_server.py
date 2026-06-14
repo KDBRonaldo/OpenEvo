@@ -124,6 +124,56 @@ def test_register_artifact_route_uses_sync_handler(tmp_path):
     assert inspect.iscoroutinefunction(route.endpoint) is False
 
 
+def test_context_resolve_route_uses_sync_handler_and_persists_context(tmp_path):
+    app = create_app(db_path=tmp_path / "evolution.db", artifact_root=tmp_path / "artifacts")
+    memory_file = tmp_path / "memory.md"
+    memory_file.write_text("Prefer table-driven parser tests.", encoding="utf-8")
+
+    with TestClient(app) as client:
+        artifact_response = client.post(
+            "/v1/artifacts",
+            json={
+                "type": "text_memory",
+                "name": "route memory",
+                "uri": memory_file.as_uri(),
+                "compatibility": {"task_tags": "calculator", "agent_harness": "codex"},
+                "scores": {"quality": 0.7},
+                "tags": ["calculator"],
+                "promoted": True,
+            },
+        )
+        context_response = client.post(
+            "/v1/contexts/resolve",
+            json={
+                "task_id": "task_route",
+                "instruction": "fix parser",
+                "agent": {"harness": "codex"},
+                "metadata": {"task_tags": ["calculator"]},
+            },
+        )
+
+    assert artifact_response.status_code == 200
+    assert context_response.status_code == 200
+    artifact_id = artifact_response.json()["artifact_id"]
+    body = context_response.json()
+    assert body["context_id"].startswith("ctx_")
+    assert body["memory"]["artifact_ids"] == [artifact_id]
+    assert "table-driven parser" in body["memory"]["rendered_text"]
+
+    with app.state.store.connect() as conn:
+        context_row = conn.execute(
+            "SELECT * FROM contexts WHERE context_id = ?",
+            (body["context_id"],),
+        ).fetchone()
+
+    assert context_row is not None
+    assert json.loads(context_row["selected_artifact_ids_json"]) == [artifact_id]
+    route = next(
+        route for route in app.routes if getattr(route, "path", None) == "/v1/contexts/resolve"
+    )
+    assert inspect.iscoroutinefunction(route.endpoint) is False
+
+
 def test_register_artifact_route_rejects_non_finite_metadata_without_writes(tmp_path):
     app = create_app(db_path=tmp_path / "evolution.db", artifact_root=tmp_path / "artifacts")
 

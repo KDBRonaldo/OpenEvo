@@ -9,7 +9,12 @@ import sqlite3
 import pytest
 
 import polar_evolution.store as store_module
-from polar_evolution.models import ArtifactRegisterRequest, ArtifactState, ArtifactType
+from polar_evolution.models import (
+    ArtifactRegisterRequest,
+    ArtifactState,
+    ArtifactType,
+    ContextResolveRequest,
+)
 from polar_evolution.store import EvolutionStore
 
 
@@ -267,3 +272,279 @@ def test_register_artifact_retries_collision_without_touching_existing_manifest(
     assert json.loads(second_manifest_path.read_text(encoding="utf-8"))["manifest"] == {
         "content_path": "second.md"
     }
+
+
+def test_context_resolver_selects_memory_skill_and_adapter(tmp_path):
+    store = EvolutionStore(db_path=tmp_path / "evolution.db", artifact_root=tmp_path / "artifacts")
+    store.initialize()
+    memory_file = tmp_path / "memory.md"
+    memory_file.write_text("Use recursive descent for parser tasks.", encoding="utf-8")
+    memory = store.register_artifact(
+        ArtifactRegisterRequest(
+            type=ArtifactType.TEXT_MEMORY,
+            name="parser memory",
+            uri=memory_file.as_uri(),
+            compatibility={"task_tags": ["calculator"], "agent_harness": ["codex"]},
+            scores={"quality": 0.9},
+            tags=["calculator"],
+            promoted=True,
+        )
+    )
+    skill = store.register_artifact(
+        ArtifactRegisterRequest(
+            type=ArtifactType.SKILL_BUNDLE,
+            name="parser skill",
+            uri="file:///tmp/skills/parser",
+            compatibility={"task_tags": ["calculator"]},
+            scores={"quality": 0.8},
+            tags=["calculator"],
+            promoted=True,
+        )
+    )
+    adapter = store.register_artifact(
+        ArtifactRegisterRequest(
+            type=ArtifactType.PARAMETRIC_MEMORY,
+            name="parser lora",
+            uri="file:///tmp/adapters/parser",
+            manifest={"adapter_format": "lora", "base_model": "Qwen/Qwen3.6-27B"},
+            compatibility={"base_model": "Qwen/Qwen3.6-27B", "task_tags": ["calculator"]},
+            scores={"heldout_reward_delta": 0.1},
+            tags=["calculator"],
+            promoted=True,
+        )
+    )
+    inactive_memory = store.register_artifact(
+        ArtifactRegisterRequest(
+            type=ArtifactType.TEXT_MEMORY,
+            name="draft parser memory",
+            uri=memory_file.as_uri(),
+            compatibility={"task_tags": ["calculator"]},
+            scores={"quality": 1.0},
+            tags=["calculator"],
+            promoted=False,
+        )
+    )
+    incompatible_skill = store.register_artifact(
+        ArtifactRegisterRequest(
+            type=ArtifactType.SKILL_BUNDLE,
+            name="sorting skill",
+            uri="file:///tmp/skills/sorting",
+            compatibility={"task_tags": ["sorting"]},
+            scores={"quality": 1.0},
+            tags=["sorting"],
+            promoted=True,
+        )
+    )
+
+    context = store.resolve_context(
+        ContextResolveRequest(
+            task_id="task_1",
+            instruction="fix calculator parser",
+            agent={"harness": "codex"},
+            base_model="Qwen/Qwen3.6-27B",
+            metadata={"task_tags": ["calculator"]},
+        )
+    )
+
+    assert context.context_id.startswith("ctx_")
+    assert memory.artifact_id in context.memory["artifact_ids"]
+    assert inactive_memory.artifact_id not in context.memory["artifact_ids"]
+    assert "recursive descent" in context.memory["rendered_text"]
+    assert context.skills[0]["artifact_id"] == skill.artifact_id
+    assert incompatible_skill.artifact_id not in {
+        item["artifact_id"] for item in context.skills
+    }
+    assert context.adapter_merge_spec.adapters[0]["artifact_id"] == adapter.artifact_id
+    assert inactive_memory.artifact_id not in context.selection["artifact_ids"]
+    assert incompatible_skill.artifact_id not in context.selection["artifact_ids"]
+
+    with store.connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM contexts WHERE context_id = ?",
+            (context.context_id,),
+        ).fetchone()
+
+    assert row is not None
+    assert json.loads(row["selected_artifact_ids_json"]) == context.selection["artifact_ids"]
+    assert json.loads(row["response_json"])["context_id"] == context.context_id
+    snapshot_path = tmp_path / "artifacts" / "contexts" / f"{context.context_id}.json"
+    snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    assert snapshot["request"]["task_id"] == "task_1"
+    assert snapshot["response"]["selection"]["artifact_ids"] == context.selection["artifact_ids"]
+
+
+def test_context_resolver_skips_unreadable_text_memory(tmp_path):
+    store = EvolutionStore(db_path=tmp_path / "evolution.db", artifact_root=tmp_path / "artifacts")
+    store.initialize()
+    missing_memory = store.register_artifact(
+        ArtifactRegisterRequest(
+            type=ArtifactType.TEXT_MEMORY,
+            name="missing memory",
+            uri=(tmp_path / "missing.md").as_uri(),
+            compatibility={"task_tags": ["calculator"]},
+            scores={"quality": 1.0},
+            tags=["calculator"],
+            promoted=True,
+        )
+    )
+
+    context = store.resolve_context(
+        ContextResolveRequest(
+            task_id="task_missing_memory",
+            instruction="fix calculator parser",
+            metadata={"task_tags": ["calculator"]},
+        )
+    )
+
+    assert context.memory["artifact_ids"] == []
+    assert context.memory["rendered_text"] == ""
+    assert missing_memory.artifact_id not in context.selection["artifact_ids"]
+
+
+def test_context_resolver_requires_declared_base_model_and_harness(tmp_path):
+    store = EvolutionStore(db_path=tmp_path / "evolution.db", artifact_root=tmp_path / "artifacts")
+    store.initialize()
+    memory_file = tmp_path / "harness-memory.md"
+    memory_file.write_text("Use codex-specific parser heuristics.", encoding="utf-8")
+    harness_memory = store.register_artifact(
+        ArtifactRegisterRequest(
+            type=ArtifactType.TEXT_MEMORY,
+            name="codex memory",
+            uri=memory_file.as_uri(),
+            compatibility={"task_tags": ["calculator"], "agent_harness": "codex"},
+            scores={"quality": 0.7},
+            tags=["calculator"],
+            promoted=True,
+        )
+    )
+    adapter = store.register_artifact(
+        ArtifactRegisterRequest(
+            type=ArtifactType.PARAMETRIC_MEMORY,
+            name="qwen parser lora",
+            uri="file:///tmp/adapters/qwen-parser",
+            manifest={"adapter_format": "lora", "base_model": "Qwen/Qwen3.6-27B"},
+            compatibility={"base_model": "Qwen/Qwen3.6-27B", "task_tags": ["calculator"]},
+            scores={"heldout_reward_delta": 0.2},
+            tags=["calculator"],
+            promoted=True,
+        )
+    )
+
+    missing_context = store.resolve_context(
+        ContextResolveRequest(
+            task_id="task_missing_constraints",
+            instruction="fix calculator parser",
+            metadata={"task_tags": ["calculator"]},
+        )
+    )
+    mismatched_context = store.resolve_context(
+        ContextResolveRequest(
+            task_id="task_mismatched_constraints",
+            instruction="fix calculator parser",
+            agent={"harness": "other"},
+            base_model="other/model",
+            metadata={"task_tags": ["calculator"]},
+        )
+    )
+    matching_context = store.resolve_context(
+        ContextResolveRequest(
+            task_id="task_matching_constraints",
+            instruction="fix calculator parser",
+            agent={"harness": "codex"},
+            base_model="Qwen/Qwen3.6-27B",
+            metadata={"task_tags": ["calculator"]},
+        )
+    )
+
+    assert harness_memory.artifact_id not in missing_context.memory["artifact_ids"]
+    assert adapter.artifact_id not in missing_context.selection["artifact_ids"]
+    assert missing_context.adapter_merge_spec.adapters == []
+    assert missing_context.adapter_merge_spec.merge_mode == "reference_only"
+
+    assert harness_memory.artifact_id not in mismatched_context.memory["artifact_ids"]
+    assert adapter.artifact_id not in mismatched_context.selection["artifact_ids"]
+    assert mismatched_context.adapter_merge_spec.adapters == []
+
+    assert harness_memory.artifact_id in matching_context.memory["artifact_ids"]
+    assert adapter.artifact_id in matching_context.selection["artifact_ids"]
+    assert matching_context.adapter_merge_spec.adapters[0]["artifact_id"] == adapter.artifact_id
+
+
+def test_context_resolver_counts_memory_separators_against_limit(tmp_path):
+    store = EvolutionStore(db_path=tmp_path / "evolution.db", artifact_root=tmp_path / "artifacts")
+    store.initialize()
+    first_file = tmp_path / "first-memory.md"
+    second_file = tmp_path / "second-memory.md"
+    first_file.write_text("AAAA", encoding="utf-8")
+    second_file.write_text("BBBB", encoding="utf-8")
+    first_memory = store.register_artifact(
+        ArtifactRegisterRequest(
+            type=ArtifactType.TEXT_MEMORY,
+            name="first memory",
+            uri=first_file.as_uri(),
+            compatibility={"task_tags": ["calculator"]},
+            scores={"quality": 0.9},
+            tags=["calculator"],
+            promoted=True,
+        )
+    )
+    second_memory = store.register_artifact(
+        ArtifactRegisterRequest(
+            type=ArtifactType.TEXT_MEMORY,
+            name="second memory",
+            uri=second_file.as_uri(),
+            compatibility={"task_tags": ["calculator"]},
+            scores={"quality": 0.8},
+            tags=["calculator"],
+            promoted=True,
+        )
+    )
+
+    context = store.resolve_context(
+        ContextResolveRequest(
+            task_id="task_memory_budget",
+            instruction="fix calculator parser",
+            metadata={"task_tags": ["calculator"]},
+            limits={"max_memory_chars": 7},
+        )
+    )
+
+    assert context.memory["rendered_text"] == "AAAA\n\nB"
+    assert len(context.memory["rendered_text"]) == 7
+    assert context.memory["artifact_ids"] == [first_memory.artifact_id, second_memory.artifact_id]
+
+
+def test_context_resolver_skips_malformed_stored_compatibility_json(tmp_path):
+    store = EvolutionStore(db_path=tmp_path / "evolution.db", artifact_root=tmp_path / "artifacts")
+    store.initialize()
+    memory_file = tmp_path / "malformed-compatibility-memory.md"
+    memory_file.write_text("This should not be selected.", encoding="utf-8")
+    memory = store.register_artifact(
+        ArtifactRegisterRequest(
+            type=ArtifactType.TEXT_MEMORY,
+            name="malformed compatibility memory",
+            uri=memory_file.as_uri(),
+            compatibility={"task_tags": ["calculator"]},
+            scores={"quality": 0.9},
+            tags=["calculator"],
+            promoted=True,
+        )
+    )
+    with store.connect() as conn:
+        conn.execute(
+            "UPDATE artifacts SET compatibility_json = ? WHERE artifact_id = ?",
+            ("{not valid json", memory.artifact_id),
+        )
+        conn.commit()
+
+    context = store.resolve_context(
+        ContextResolveRequest(
+            task_id="task_malformed_compatibility",
+            instruction="fix calculator parser",
+            metadata={"task_tags": ["calculator"]},
+        )
+    )
+
+    assert context.memory["artifact_ids"] == []
+    assert context.memory["rendered_text"] == ""
+    assert memory.artifact_id not in context.selection["artifact_ids"]

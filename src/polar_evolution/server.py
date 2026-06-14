@@ -8,6 +8,8 @@ from fastapi import FastAPI, HTTPException
 from polar_evolution.models import (
     ArtifactRegisterRequest,
     ArtifactResponse,
+    ContextResolveRequest,
+    ContextResolveResponse,
     DatasetCreateRequest,
     DatasetCreateResponse,
     EventIngestRequest,
@@ -49,6 +51,13 @@ def create_app(*, db_path: str | Path, artifact_root: str | Path) -> FastAPI:
     def register_artifact(request: ArtifactRegisterRequest) -> ArtifactResponse:
         try:
             return store.register_artifact(request)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/v1/contexts/resolve", response_model=ContextResolveResponse)
+    def resolve_context(request: ContextResolveRequest) -> ContextResolveResponse:
+        try:
+            return store.resolve_context(request)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 

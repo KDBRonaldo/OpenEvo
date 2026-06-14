@@ -8,13 +8,23 @@ from pathlib import Path
 import sqlite3
 from typing import Any, Iterator
 
+from polar_evolution.context import (
+    artifact_manifest,
+    artifact_matches,
+    artifact_type,
+    read_file_uri_text,
+    sort_candidates,
+)
 from polar_evolution.files import ArtifactFileStore
 from polar_evolution.ids import new_id
 from polar_evolution.models import (
+    AdapterMergeSpec,
     ArtifactRegisterRequest,
     ArtifactResponse,
     ArtifactState,
     ArtifactType,
+    ContextResolveRequest,
+    ContextResolveResponse,
     DatasetCreateRequest,
     DatasetCreateResponse,
     EventIngestRequest,
@@ -117,6 +127,7 @@ CREATE TABLE IF NOT EXISTS contexts (
 
 MAX_ARTIFACT_ID_ATTEMPTS = 10
 MAX_DATASET_ID_ATTEMPTS = 10
+MAX_CONTEXT_ID_ATTEMPTS = 10
 DEFAULT_HEARTBEAT_LEASE_SECONDS = 600
 ACTIVE_JOB_STATES = {str(JobState.CLAIMED), str(JobState.RUNNING)}
 
@@ -357,6 +368,154 @@ class EvolutionStore:
                 promoted=request_payload["promoted"],
             )
         raise RuntimeError("could not allocate unique artifact id")
+
+    def _promoted_artifact_rows(self) -> list[dict[str, object]]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM artifacts
+                WHERE promoted = 1 AND state IN (?, ?)
+                """,
+                (str(ArtifactState.ACTIVE), str(ArtifactState.EXPERIMENTAL)),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def resolve_context(self, request: ContextResolveRequest) -> ContextResolveResponse:
+        raw_payload = request.model_dump(mode="python")
+        _validate_finite_floats(raw_payload, "request")
+
+        rows = [
+            row
+            for row in self._promoted_artifact_rows()
+            if artifact_matches(request, row)
+        ]
+        rows = sort_candidates(rows)
+
+        selected_memory: list[dict[str, object]] = []
+        rendered_parts: list[str] = []
+        memory_chars = 0
+        skills: list[dict[str, object]] = []
+        adapters: list[dict[str, object]] = []
+        selected_ids: list[str] = []
+
+        for row in rows:
+            kind = artifact_type(row)
+            artifact_id = str(row["artifact_id"])
+            if kind == ArtifactType.TEXT_MEMORY and memory_chars < request.limits.max_memory_chars:
+                text = read_file_uri_text(str(row["uri"]))
+                separator_chars = 2 if rendered_parts else 0
+                remaining = request.limits.max_memory_chars - memory_chars - separator_chars
+                if not text or remaining <= 0:
+                    continue
+                clipped = text[:remaining]
+                rendered_parts.append(clipped)
+                memory_chars += separator_chars + len(clipped)
+                selected_memory.append({"artifact_id": artifact_id, "name": row["name"]})
+                selected_ids.append(artifact_id)
+            elif kind == ArtifactType.SKILL_BUNDLE and len(skills) < request.limits.max_skill_bundles:
+                skills.append(
+                    {
+                        "artifact_id": artifact_id,
+                        "name": row["name"],
+                        "uri": row["uri"],
+                    }
+                )
+                selected_ids.append(artifact_id)
+            elif kind == ArtifactType.PARAMETRIC_MEMORY and len(adapters) < request.limits.max_adapters:
+                manifest = artifact_manifest(row)
+                adapter_format = manifest.get("adapter_format")
+                if not isinstance(adapter_format, str) or not adapter_format:
+                    adapter_format = "lora"
+                adapters.append(
+                    {
+                        "artifact_id": artifact_id,
+                        "adapter_id": row["name"],
+                        "uri": row["uri"],
+                        "weight": 1.0,
+                        "format": adapter_format,
+                    }
+                )
+                selected_ids.append(artifact_id)
+
+        for _ in range(MAX_CONTEXT_ID_ATTEMPTS):
+            context_id = new_id("ctx")
+            response = ContextResolveResponse(
+                context_id=context_id,
+                memory={
+                    "artifact_ids": [str(item["artifact_id"]) for item in selected_memory],
+                    "rendered_text": "\n\n".join(rendered_parts),
+                },
+                skills=skills,
+                adapter_merge_spec=AdapterMergeSpec(
+                    base_model=request.base_model,
+                    merge_mode="runtime_lora" if adapters else "reference_only",
+                    adapters=adapters,
+                ),
+                selection={
+                    "artifact_ids": selected_ids,
+                    "reasons": ["matched promoted compatible artifacts"],
+                },
+            )
+            request_payload = request.model_dump(mode="json")
+            response_payload = response.model_dump(mode="json")
+            request_json = _json_dumps(request_payload)
+            response_json = _json_dumps(response_payload)
+            selected_ids_json = _json_dumps(selected_ids)
+            snapshot_path = self.files.context_snapshot_path(context_id)
+            snapshot_created = False
+            with self.connect() as conn:
+                try:
+                    conn.execute("BEGIN IMMEDIATE")
+                    existing = conn.execute(
+                        "SELECT 1 FROM contexts WHERE context_id = ?",
+                        (context_id,),
+                    ).fetchone()
+                    if existing is not None or snapshot_path.exists():
+                        conn.rollback()
+                        continue
+                    conn.execute(
+                        """
+                        INSERT INTO contexts (
+                            context_id, created_at, request_json, response_json,
+                            selected_artifact_ids_json
+                        )
+                        VALUES (?, ?, ?, ?, ?)
+                        """,
+                        (
+                            context_id,
+                            utc_now_iso(),
+                            request_json,
+                            response_json,
+                            selected_ids_json,
+                        ),
+                    )
+                    try:
+                        _write_json_strict_exclusive(
+                            self.files,
+                            snapshot_path,
+                            {
+                                "request": request_payload,
+                                "response": response_payload,
+                            },
+                        )
+                    except FileExistsError:
+                        conn.rollback()
+                        continue
+                    snapshot_created = True
+                    conn.commit()
+                except Exception:
+                    try:
+                        conn.rollback()
+                    except sqlite3.Error:
+                        pass
+                    if snapshot_created:
+                        try:
+                            snapshot_path.unlink(missing_ok=True)
+                        except OSError:
+                            pass
+                    raise
+            return response
+        raise RuntimeError("could not allocate unique context id")
 
     def create_job(self, request: JobCreateRequest) -> JobCreateResponse:
         raw_payload = request.model_dump(mode="python")
