@@ -37,9 +37,12 @@ def test_create_dataset_filters_events(tmp_path):
             event_type="polar.session_completed",
             source_event_id="session:good",
             task_id="task_good",
+            session_id="session_good",
             status="COMPLETED",
             reward=1.0,
             policy_version="policy_1",
+            rollout_step=7,
+            base_model="Qwen/Qwen3.6-27B",
             payload={"session_result": {"trajectory": {"traces": [{"reward": 1.0}]}}},
         )
     )
@@ -109,6 +112,7 @@ def test_create_dataset_filters_events(tmp_path):
         tmp_path / "artifacts" / "datasets" / response.dataset_id / "manifest.json"
     ).resolve()
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    records_path = manifest_path.parent / "records.jsonl"
     assert manifest == {
         "dataset_id": response.dataset_id,
         "name": "good_policy_1",
@@ -124,7 +128,44 @@ def test_create_dataset_filters_events(tmp_path):
         "event_ids": [good_event.event_id],
         "event_count": 1,
         "trace_count": 1,
+        "records_path": "records.jsonl",
+        "records_uri": records_path.as_uri(),
     }
+    records = [
+        json.loads(line)
+        for line in records_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert records == [
+        {
+            "event_id": good_event.event_id,
+            "source": "polar",
+            "event_type": "polar.session_completed",
+            "source_event_id": "session:good",
+            "created_at": records[0]["created_at"],
+            "ingested_at": records[0]["ingested_at"],
+            "task_id": "task_good",
+            "session_id": "session_good",
+            "policy_version": "policy_1",
+            "rollout_step": 7,
+            "agent_harness": None,
+            "agent_model": None,
+            "base_model": "Qwen/Qwen3.6-27B",
+            "status": "COMPLETED",
+            "reward": 1.0,
+            "trace_count": 1,
+            "traces": [{"reward": 1.0}],
+            "payload": {
+                "session_result": {
+                    "trajectory": {
+                        "traces": [
+                            {"reward": 1.0},
+                        ],
+                    },
+                },
+            },
+        }
+    ]
 
     assert artifact_row is not None
     assert artifact_row["type"] == "dataset"
@@ -134,6 +175,16 @@ def test_create_dataset_filters_events(tmp_path):
     assert json.loads(artifact_row["compatibility_json"]) == {"purpose": "skill_distillation"}
     assert json.loads(artifact_row["tags_json"]) == ["skill_distillation"]
     assert artifact_row["promoted"] == 1
+    worker_manifest_path = Path(artifact_row["uri"].removeprefix("file://"))
+    worker_manifest = json.loads(worker_manifest_path.read_text(encoding="utf-8"))
+    worker_records_path = worker_manifest_path.parent / worker_manifest["records_path"]
+    worker_records = [
+        json.loads(line)
+        for line in worker_records_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert worker_records[0]["event_id"] == good_event.event_id
+    assert worker_records[0]["traces"] == [{"reward": 1.0}]
 
 
 def test_create_dataset_rejects_non_finite_query_without_writes(tmp_path):
@@ -156,6 +207,7 @@ def test_create_dataset_rejects_non_finite_query_without_writes(tmp_path):
     assert dataset_count == 0
     assert artifact_count == 0
     assert not list((tmp_path / "artifacts" / "datasets").glob("*/manifest.json"))
+    assert not list((tmp_path / "artifacts" / "datasets").glob("*/records.jsonl"))
 
 
 def test_create_dataset_rejects_task_tags_query_without_writes(tmp_path):
@@ -189,6 +241,7 @@ def test_create_dataset_rejects_task_tags_query_without_writes(tmp_path):
     assert dataset_event_count == 0
     assert artifact_count == 0
     assert not list((tmp_path / "artifacts" / "datasets").glob("*/manifest.json"))
+    assert not list((tmp_path / "artifacts" / "datasets").glob("*/records.jsonl"))
     assert not list((tmp_path / "artifacts" / "artifacts" / "datasets").glob("*/manifest.json"))
 
 
@@ -220,7 +273,9 @@ def test_create_dataset_retries_id_collision_without_overwriting_manifest(tmp_pa
         DatasetCreateRequest(name="first", purpose="skill_distillation")
     )
     first_manifest_path = tmp_path / "artifacts" / "datasets" / "ds_collision" / "manifest.json"
+    first_records_path = tmp_path / "artifacts" / "datasets" / "ds_collision" / "records.jsonl"
     first_manifest_before = first_manifest_path.read_text(encoding="utf-8")
+    first_records_before = first_records_path.read_text(encoding="utf-8")
 
     second_response = store.create_dataset(
         DatasetCreateRequest(name="second", purpose="skill_distillation")
@@ -229,9 +284,12 @@ def test_create_dataset_retries_id_collision_without_overwriting_manifest(tmp_pa
     assert first_response.dataset_id == "ds_collision"
     assert second_response.dataset_id == "ds_retry"
     assert first_manifest_path.read_text(encoding="utf-8") == first_manifest_before
+    assert first_records_path.read_text(encoding="utf-8") == first_records_before
     assert json.loads(first_manifest_before)["name"] == "first"
     second_manifest_path = tmp_path / "artifacts" / "datasets" / "ds_retry" / "manifest.json"
+    second_records_path = tmp_path / "artifacts" / "datasets" / "ds_retry" / "records.jsonl"
     assert json.loads(second_manifest_path.read_text(encoding="utf-8"))["name"] == "second"
+    assert second_records_path.exists()
 
 
 def test_create_dataset_stops_selecting_events_after_trace_limit(tmp_path):
@@ -393,6 +451,9 @@ def test_create_dataset_cleans_up_dataset_and_artifact_when_backfill_fails(
     dataset_manifest_path = (
         tmp_path / "artifacts" / "datasets" / "ds_backfill_failure" / "manifest.json"
     )
+    dataset_records_path = (
+        tmp_path / "artifacts" / "datasets" / "ds_backfill_failure" / "records.jsonl"
+    )
     artifact_manifest_path = (
         tmp_path
         / "artifacts"
@@ -424,6 +485,7 @@ def test_create_dataset_cleans_up_dataset_and_artifact_when_backfill_fails(
     assert artifact_count == 0
     assert artifact_lineage_count == 0
     assert not dataset_manifest_path.exists()
+    assert not dataset_records_path.exists()
     assert not artifact_manifest_path.exists()
 
 
@@ -479,6 +541,7 @@ def test_create_dataset_rejects_missing_payload_file_before_writes(tmp_path):
     assert dataset_event_count == 0
     assert artifact_count == 0
     assert not list((tmp_path / "artifacts" / "datasets").glob("*/manifest.json"))
+    assert not list((tmp_path / "artifacts" / "datasets").glob("*/records.jsonl"))
     assert not list((tmp_path / "artifacts" / "artifacts" / "datasets").glob("*/manifest.json"))
 
 
@@ -515,6 +578,7 @@ def test_create_dataset_rejects_corrupt_payload_json_before_writes(tmp_path):
     assert dataset_event_count == 0
     assert artifact_count == 0
     assert not list((tmp_path / "artifacts" / "datasets").glob("*/manifest.json"))
+    assert not list((tmp_path / "artifacts" / "datasets").glob("*/records.jsonl"))
     assert not list((tmp_path / "artifacts" / "artifacts" / "datasets").glob("*/manifest.json"))
 
 
@@ -533,7 +597,7 @@ def test_job_claim_heartbeat_and_complete(tmp_path):
         JobCreateRequest(
             method="mock_lora",
             job_type="parametric_memory_train",
-            input_artifact_ids=[dataset.artifact_id],
+            input_artifact_ids=[dataset.artifact_id, dataset.artifact_id],
             config={"base_model": "Qwen/Qwen3.6-27B"},
         )
     )
@@ -578,8 +642,52 @@ def test_job_claim_heartbeat_and_complete(tmp_path):
             "SELECT state, error FROM jobs WHERE job_id = ?",
             (job.job_id,),
         ).fetchone()
+        lineage_rows = conn.execute(
+            """
+            SELECT parent_artifact_id, child_artifact_id, relation
+            FROM artifact_lineage
+            WHERE child_artifact_id = ?
+            """,
+            (complete["artifact_ids"][0],),
+        ).fetchall()
     assert row["state"] == "succeeded"
     assert row["error"] is None
+    assert [
+        (lineage["parent_artifact_id"], lineage["child_artifact_id"], lineage["relation"])
+        for lineage in lineage_rows
+    ] == [(dataset.artifact_id, complete["artifact_ids"][0], "job_input")]
+
+
+def test_create_job_rejects_missing_input_artifact_ids_without_writes(tmp_path):
+    store = EvolutionStore(db_path=tmp_path / "evolution.db", artifact_root=tmp_path / "artifacts")
+    store.initialize()
+    existing = store.register_artifact(
+        ArtifactRegisterRequest(
+            type=ArtifactType.DATASET,
+            name="dataset",
+            uri="file:///tmp/dataset.json",
+        )
+    )
+
+    with pytest.raises(ValueError, match="unknown input artifact_id.*art_missing"):
+        store.create_job(
+            JobCreateRequest(
+                method="mock",
+                job_type="text_memory_mining",
+                input_artifact_ids=[existing.artifact_id, "art_missing"],
+            )
+        )
+
+    empty_input_job = store.create_job(
+        JobCreateRequest(method="mock", job_type="text_memory_mining")
+    )
+
+    with store.connect() as conn:
+        jobs = conn.execute("SELECT job_id, input_artifact_ids_json FROM jobs").fetchall()
+
+    assert [(job["job_id"], json.loads(job["input_artifact_ids_json"])) for job in jobs] == [
+        (empty_input_job.job_id, [])
+    ]
 
 
 def test_job_failure_records_error(tmp_path):
@@ -772,10 +880,91 @@ def test_complete_job_invalid_artifact_marks_failed_and_cleans_registered_artifa
     assert not list((tmp_path / "artifacts" / "artifacts" / "text_memory").glob("*/manifest.json"))
 
 
+def test_complete_job_rejects_legacy_missing_input_artifact_and_cleans_outputs(tmp_path):
+    store = EvolutionStore(db_path=tmp_path / "evolution.db", artifact_root=tmp_path / "artifacts")
+    store.initialize()
+    job_id = "job_legacy_missing_input"
+    missing_artifact_id = "art_missing_legacy"
+    now = store_module.utc_now_iso()
+    with store.connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO jobs (
+                job_id, job_type, method, state, priority, created_at,
+                updated_at, input_artifact_ids_json, config_json, attempt_count
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                job_id,
+                "text_memory_mining",
+                "mock",
+                str(JobState.PENDING),
+                100,
+                now,
+                now,
+                json.dumps([missing_artifact_id]),
+                "{}",
+                0,
+            ),
+        )
+        conn.commit()
+    claim = store.claim_job(
+        WorkerClaimRequest(worker_id="worker_1", capabilities=["text_memory_mining"])
+    )
+    assert claim.job is not None
+    assert claim.job.job_id == job_id
+    assert claim.job.input_artifacts == []
+
+    with pytest.raises(ValueError, match=rf"unknown input artifact_id.*{missing_artifact_id}"):
+        store.complete_job(
+            job_id,
+            WorkerCompleteRequest(
+                lease_id=claim.job.lease_id,
+                artifacts=[
+                    ArtifactRegisterRequest(
+                        type=ArtifactType.TEXT_MEMORY,
+                        name="partial",
+                        uri="file:///tmp/partial.md",
+                    )
+                ],
+            ),
+        )
+
+    with store.connect() as conn:
+        job_row = conn.execute(
+            "SELECT state, error, lease_id, lease_expires_at FROM jobs WHERE job_id = ?",
+            (job_id,),
+        ).fetchone()
+        artifact_count = conn.execute("SELECT COUNT(*) FROM artifacts").fetchone()[0]
+        lineage_count = conn.execute("SELECT COUNT(*) FROM artifact_lineage").fetchone()[0]
+
+    assert job_row["state"] == "failed"
+    assert missing_artifact_id in job_row["error"]
+    assert job_row["lease_id"] is None
+    assert job_row["lease_expires_at"] is None
+    assert artifact_count == 0
+    assert lineage_count == 0
+    assert not list((tmp_path / "artifacts" / "artifacts" / "text_memory").glob("*/manifest.json"))
+
+
 def test_complete_job_final_update_failure_marks_failed_and_cleans_artifacts(tmp_path):
     store = EvolutionStore(db_path=tmp_path / "evolution.db", artifact_root=tmp_path / "artifacts")
     store.initialize()
-    job = store.create_job(JobCreateRequest(method="mock", job_type="text_memory_mining"))
+    dataset = store.register_artifact(
+        ArtifactRegisterRequest(
+            type=ArtifactType.DATASET,
+            name="dataset",
+            uri="file:///tmp/dataset.json",
+        )
+    )
+    job = store.create_job(
+        JobCreateRequest(
+            method="mock",
+            job_type="text_memory_mining",
+            input_artifact_ids=[dataset.artifact_id],
+        )
+    )
     claim = store.claim_job(WorkerClaimRequest(worker_id="worker_1", capabilities=["text_memory_mining"]))
     assert claim.job is not None
     with store.connect() as conn:
@@ -812,10 +1001,15 @@ def test_complete_job_final_update_failure_marks_failed_and_cleans_artifacts(tmp
             (job.job_id,),
         ).fetchone()
         artifact_count = conn.execute("SELECT COUNT(*) FROM artifacts").fetchone()[0]
+        lineage_count = conn.execute(
+            "SELECT COUNT(*) FROM artifact_lineage WHERE parent_artifact_id = ?",
+            (dataset.artifact_id,),
+        ).fetchone()[0]
 
     assert job_row["state"] == "failed"
     assert "forced job succeed failure" in job_row["error"]
-    assert artifact_count == 0
+    assert artifact_count == 1
+    assert lineage_count == 0
     assert not list((tmp_path / "artifacts" / "artifacts" / "text_memory").glob("*/manifest.json"))
 
 

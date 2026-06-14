@@ -539,6 +539,23 @@ def test_backend_event_dataset_job_context_flow(tmp_path):
     assert claimed_job["job_id"] == job_id
     assert claimed_job["input_artifacts"][0]["artifact_id"] == dataset_artifact_id
     assert claimed_job["input_artifacts"][0]["type"] == "dataset"
+    dataset_manifest_path = Path(claimed_job["input_artifacts"][0]["uri"].removeprefix("file://"))
+    dataset_manifest = json.loads(dataset_manifest_path.read_text(encoding="utf-8"))
+    dataset_records_path = dataset_manifest_path.parent / dataset_manifest["records_path"]
+    dataset_records = [
+        json.loads(line)
+        for line in dataset_records_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert dataset_records[0]["event_id"] == event_body["event_id"]
+    assert dataset_records[0]["task_id"] == "task_calculator"
+    assert dataset_records[0]["traces"] == [
+        {
+            "observation": "Calculate 2 + 2 exactly.",
+            "action": "2 + 2 = 4",
+            "reward": 1.0,
+        }
+    ]
     assert complete_body["state"] == "succeeded"
     assert memory_artifact_id.startswith("art_")
     assert memory_artifact_id in context_body["memory"]["artifact_ids"]

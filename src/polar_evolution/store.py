@@ -198,6 +198,29 @@ def _write_json_strict_exclusive(
     return path
 
 
+def _write_jsonl_strict_exclusive(
+    files: ArtifactFileStore,
+    path: Path,
+    records: list[dict[str, Any]],
+) -> Path:
+    path = path.resolve()
+    if files.root != path and files.root not in path.parents:
+        raise ValueError(f"path escapes artifact root: {path}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with path.open("x", encoding="utf-8") as handle:
+            for record in records:
+                handle.write(_json_dumps(record))
+                handle.write("\n")
+    except FileExistsError:
+        raise
+    except Exception:
+        if path.exists():
+            path.unlink(missing_ok=True)
+        raise
+    return path
+
+
 class EvolutionStore:
     def __init__(self, *, db_path: str | Path, artifact_root: str | Path) -> None:
         self.db_path = Path(db_path)
@@ -521,36 +544,65 @@ class EvolutionStore:
         raw_payload = request.model_dump(mode="python")
         _validate_finite_floats(raw_payload["config"], "config")
         request_payload = request.model_dump(mode="json")
-        input_artifact_ids_json = _json_dumps(request_payload["input_artifact_ids"])
+        input_artifact_ids = request_payload["input_artifact_ids"]
+        input_artifact_ids_json = _json_dumps(input_artifact_ids)
         config_json = _json_dumps(request_payload["config"])
 
         job_id = new_id("job")
         now = utc_now_iso()
         with self.connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO jobs (
-                    job_id, job_type, method, state, priority, created_at,
-                    updated_at, input_artifact_ids_json, config_json,
-                    attempt_count
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                self._validate_input_artifacts_exist(conn, input_artifact_ids)
+                conn.execute(
+                    """
+                    INSERT INTO jobs (
+                        job_id, job_type, method, state, priority, created_at,
+                        updated_at, input_artifact_ids_json, config_json,
+                        attempt_count
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        job_id,
+                        request_payload["job_type"],
+                        request_payload["method"],
+                        str(JobState.PENDING),
+                        request_payload["priority"],
+                        now,
+                        now,
+                        input_artifact_ids_json,
+                        config_json,
+                        0,
+                    ),
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    job_id,
-                    request_payload["job_type"],
-                    request_payload["method"],
-                    str(JobState.PENDING),
-                    request_payload["priority"],
-                    now,
-                    now,
-                    input_artifact_ids_json,
-                    config_json,
-                    0,
-                ),
-            )
-            conn.commit()
+                conn.commit()
+            except Exception:
+                try:
+                    conn.rollback()
+                except sqlite3.Error:
+                    pass
+                raise
         return JobCreateResponse(job_id=job_id, state=JobState.PENDING)
+
+    def _validate_input_artifacts_exist(
+        self,
+        conn: sqlite3.Connection,
+        artifact_ids: list[str],
+    ) -> None:
+        unique_ids = list(dict.fromkeys(artifact_ids))
+        if not unique_ids:
+            return
+        rows = conn.execute(
+            "SELECT artifact_id FROM artifacts WHERE artifact_id IN (%s)"
+            % ",".join("?" for _ in unique_ids),
+            unique_ids,
+        ).fetchall()
+        existing_ids = {str(row["artifact_id"]) for row in rows}
+        missing_ids = [artifact_id for artifact_id in unique_ids if artifact_id not in existing_ids]
+        if missing_ids:
+            label = "artifact_id" if len(missing_ids) == 1 else "artifact_ids"
+            raise ValueError(f"unknown input {label}: {', '.join(missing_ids)}")
 
     def claim_job(self, request: WorkerClaimRequest) -> WorkerClaimResponse:
         now_dt = datetime.now(UTC)
@@ -775,7 +827,21 @@ class EvolutionStore:
             with self.connect() as conn:
                 try:
                     conn.execute("BEGIN IMMEDIATE")
-                    self._assert_job_lease(conn, job_id, request.lease_id)
+                    job_row = self._assert_job_lease(conn, job_id, request.lease_id)
+                    input_artifact_ids = json.loads(str(job_row["input_artifact_ids_json"]))
+                    unique_input_artifact_ids = list(dict.fromkeys(input_artifact_ids))
+                    self._validate_input_artifacts_exist(conn, unique_input_artifact_ids)
+                    for input_artifact_id in unique_input_artifact_ids:
+                        for output_artifact_id in registered_artifact_ids:
+                            conn.execute(
+                                """
+                                INSERT OR IGNORE INTO artifact_lineage (
+                                    parent_artifact_id, child_artifact_id, relation
+                                )
+                                VALUES (?, ?, ?)
+                                """,
+                                (input_artifact_id, output_artifact_id, "job_input"),
+                            )
                     conn.execute(
                         """
                         UPDATE jobs
@@ -931,7 +997,7 @@ class EvolutionStore:
             (*params, request.limits.max_events),
         ).fetchall()
 
-    def _trace_count_for_event_row(self, row: dict[str, Any]) -> int:
+    def _read_event_payload_file(self, row: dict[str, Any]) -> dict[str, Any]:
         event_id = str(row["event_id"])
         payload_path = Path(str(row["payload_path"]))
         try:
@@ -946,20 +1012,50 @@ class EvolutionStore:
             ) from exc
 
         if not isinstance(payload, dict):
-            return 0
-        event_payload = payload.get("payload")
-        if not isinstance(event_payload, dict):
-            return 0
+            return {}
+        return payload
+
+    def _traces_from_event_payload(self, event_payload: dict[str, Any]) -> list[Any]:
         session_result = event_payload.get("session_result")
         if not isinstance(session_result, dict):
-            return 0
+            return []
         trajectory = session_result.get("trajectory")
         if not isinstance(trajectory, dict):
-            return 0
+            return []
         traces = trajectory.get("traces")
         if not isinstance(traces, list):
-            return 0
-        return len(traces)
+            return []
+        return traces
+
+    def _dataset_record_for_event_row(self, row: dict[str, Any]) -> dict[str, Any]:
+        payload = self._read_event_payload_file(row)
+        event_payload = payload.get("payload")
+        if not isinstance(event_payload, dict):
+            event_payload = {}
+        traces = self._traces_from_event_payload(event_payload)
+        return {
+            "event_id": row["event_id"],
+            "source": row["source"],
+            "event_type": row["event_type"],
+            "source_event_id": row["source_event_id"],
+            "created_at": row["created_at"],
+            "ingested_at": row["ingested_at"],
+            "task_id": row["task_id"],
+            "session_id": row["session_id"],
+            "policy_version": row["policy_version"],
+            "rollout_step": row["rollout_step"],
+            "agent_harness": row["agent_harness"],
+            "agent_model": row["agent_model"],
+            "base_model": row["base_model"],
+            "status": row["status"],
+            "reward": row["reward"],
+            "trace_count": len(traces),
+            "traces": traces,
+            "payload": event_payload,
+        }
+
+    def _trace_count_for_event_row(self, row: dict[str, Any]) -> int:
+        return int(self._dataset_record_for_event_row(row)["trace_count"])
 
     def create_dataset(self, request: DatasetCreateRequest) -> DatasetCreateResponse:
         raw_payload = request.model_dump(mode="python")
@@ -974,18 +1070,22 @@ class EvolutionStore:
         with self.connect() as conn:
             rows = [dict(row) for row in self._event_rows_for_dataset(conn, request)]
 
-        trace_count = 0
         event_ids: list[str] = []
+        dataset_records: list[dict[str, Any]] = []
+        trace_count = 0
         for row in rows:
             if trace_count >= request.limits.max_traces:
                 break
-            trace_count += self._trace_count_for_event_row(row)
-            event_ids.append(str(row["event_id"]))
+            record = self._dataset_record_for_event_row(row)
+            trace_count += int(record["trace_count"])
+            event_ids.append(str(record["event_id"]))
+            dataset_records.append(record)
 
         for _ in range(MAX_DATASET_ID_ATTEMPTS):
             dataset_id = new_id("ds")
             created_at = utc_now_iso()
             manifest_path = self.files.dataset_manifest_path(dataset_id)
+            records_path = manifest_path.with_name("records.jsonl")
             manifest = {
                 "dataset_id": dataset_id,
                 "name": request_payload["name"],
@@ -995,10 +1095,13 @@ class EvolutionStore:
                 "event_ids": event_ids,
                 "event_count": len(event_ids),
                 "trace_count": trace_count,
+                "records_path": records_path.name,
+                "records_uri": records_path.as_uri(),
             }
             _validate_finite_floats(manifest, "manifest")
 
             manifest_created = False
+            records_created = False
             with self.connect() as conn:
                 try:
                     conn.execute("BEGIN IMMEDIATE")
@@ -1006,7 +1109,7 @@ class EvolutionStore:
                         "SELECT 1 FROM datasets WHERE dataset_id = ?",
                         (dataset_id,),
                     ).fetchone()
-                    if existing is not None or manifest_path.exists():
+                    if existing is not None or manifest_path.exists() or records_path.exists():
                         conn.rollback()
                         continue
                     conn.execute(
@@ -1036,16 +1139,25 @@ class EvolutionStore:
                     )
                     try:
                         _write_json_strict_exclusive(self.files, manifest_path, manifest)
+                        manifest_created = True
+                        _write_jsonl_strict_exclusive(self.files, records_path, dataset_records)
+                        records_created = True
                     except FileExistsError:
                         conn.rollback()
+                        if manifest_created:
+                            manifest_path.unlink(missing_ok=True)
                         continue
-                    manifest_created = True
                     conn.commit()
                 except Exception:
                     try:
                         conn.rollback()
                     except sqlite3.Error:
                         pass
+                    if records_created:
+                        try:
+                            records_path.unlink(missing_ok=True)
+                        except OSError:
+                            pass
                     if manifest_created:
                         try:
                             manifest_path.unlink(missing_ok=True)
@@ -1138,6 +1250,7 @@ class EvolutionStore:
             conn.commit()
 
         dataset_manifest_path.unlink(missing_ok=True)
+        dataset_manifest_path.with_name("records.jsonl").unlink(missing_ok=True)
         if artifact_manifest_path is not None:
             artifact_manifest_path.unlink(missing_ok=True)
 
