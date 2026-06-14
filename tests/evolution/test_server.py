@@ -429,6 +429,122 @@ def test_job_route_claim_heartbeat_and_complete(tmp_path):
     assert artifact_count == 1
 
 
+def test_backend_event_dataset_job_context_flow(tmp_path):
+    app = create_app(db_path=tmp_path / "evolution.db", artifact_root=tmp_path / "artifacts")
+    memory_file = tmp_path / "calculator-memory.md"
+    memory_file.write_text("Prefer exact arithmetic for calculator tasks.", encoding="utf-8")
+
+    with TestClient(app) as client:
+        event_response = client.post(
+            "/v1/events",
+            json={
+                "source": "polar",
+                "event_type": "polar.session_completed",
+                "source_event_id": "session:backend-flow",
+                "task_id": "task_calculator",
+                "session_id": "session_backend_flow",
+                "status": "COMPLETED",
+                "reward": 1.0,
+                "policy_version": "policy_1",
+                "payload": {
+                    "session_result": {
+                        "trajectory": {
+                            "traces": [
+                                {
+                                    "observation": "Calculate 2 + 2 exactly.",
+                                    "action": "2 + 2 = 4",
+                                    "reward": 1.0,
+                                }
+                            ]
+                        }
+                    }
+                },
+            },
+        )
+        assert event_response.status_code == 200, event_response.text
+        event_body = event_response.json()
+        dataset_response = client.post(
+            "/v1/datasets",
+            json={
+                "name": "calculator_policy_1",
+                "purpose": "text_memory_mining",
+                "query": {
+                    "event_types": ["polar.session_completed"],
+                    "status": ["COMPLETED"],
+                    "reward_min": 0.8,
+                    "policy_version": "policy_1",
+                },
+            },
+        )
+        assert dataset_response.status_code == 200, dataset_response.text
+        dataset_body = dataset_response.json()
+        dataset_artifact_id = dataset_body["artifact_id"]
+        job_create_response = client.post(
+            "/v1/jobs",
+            json={
+                "method": "mock_memory",
+                "job_type": "text_memory_mining",
+                "input_artifact_ids": [dataset_artifact_id],
+            },
+        )
+        assert job_create_response.status_code == 200, job_create_response.text
+        job_create_body = job_create_response.json()
+        job_id = job_create_body["job_id"]
+        claim_response = client.post(
+            "/v1/jobs/claim",
+            json={"worker_id": "worker_1", "capabilities": ["text_memory_mining"]},
+        )
+        assert claim_response.status_code == 200, claim_response.text
+        claim_body = claim_response.json()
+        claimed_job = claim_body["job"]
+        assert claimed_job is not None, claim_response.text
+        lease_id = claimed_job["lease_id"]
+        complete_response = client.post(
+            f"/v1/jobs/{job_id}/complete",
+            json={
+                "lease_id": lease_id,
+                "artifacts": [
+                    {
+                        "type": "text_memory",
+                        "name": "calculator memory",
+                        "uri": memory_file.as_uri(),
+                        "compatibility": {
+                            "task_tags": ["calculator"],
+                            "base_model": "Qwen/Qwen3.6-27B",
+                        },
+                        "tags": ["calculator"],
+                        "promoted": True,
+                    }
+                ],
+            },
+        )
+        assert complete_response.status_code == 200, complete_response.text
+        complete_body = complete_response.json()
+        memory_artifact_id = complete_body["artifact_ids"][0]
+        context_response = client.post(
+            "/v1/contexts/resolve",
+            json={
+                "task_id": "task_calculator",
+                "instruction": "Solve the calculator task.",
+                "base_model": "Qwen/Qwen3.6-27B",
+                "metadata": {"task_tags": ["calculator"]},
+            },
+        )
+        assert context_response.status_code == 200, context_response.text
+        context_body = context_response.json()
+
+    assert event_body["ingested"] is True
+    assert dataset_body["event_count"] == 1
+    assert dataset_artifact_id.startswith("art_")
+    assert claimed_job["job_id"] == job_id
+    assert claimed_job["input_artifacts"][0]["artifact_id"] == dataset_artifact_id
+    assert claimed_job["input_artifacts"][0]["type"] == "dataset"
+    assert complete_body["state"] == "succeeded"
+    assert memory_artifact_id.startswith("art_")
+    assert memory_artifact_id in context_body["memory"]["artifact_ids"]
+    assert "Prefer exact arithmetic" in context_body["memory"]["rendered_text"]
+
+
 def test_job_route_invalid_lease_returns_422(tmp_path):
     app = create_app(db_path=tmp_path / "evolution.db", artifact_root=tmp_path / "artifacts")
 
