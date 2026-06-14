@@ -202,3 +202,88 @@ def test_duplicate_gateway_node_ids_are_rejected(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="Duplicate gateway node id"):
         TopologyConfig.load(path)
+
+
+def test_topology_loads_optional_evolution_config(tmp_path: Path) -> None:
+    config_path = tmp_path / "topology.yaml"
+    config_path.write_text(
+        """
+rollout:
+  host: 127.0.0.1
+  port: 8080
+gateway:
+  nodes:
+    - id: node-a
+      host: 127.0.0.1
+      port: 8100
+      model_served: Qwen/Qwen3.6-27B
+      inference:
+        engine: vllm
+        base_url: http://127.0.0.1:8000
+evolution:
+  enabled: true
+  backend_url: http://127.0.0.1:8200
+  context:
+    target_dir: /polar/session/evolution
+    timeout_seconds: 3
+    fail_open: true
+  event_export:
+    enabled: true
+    timeout_seconds: 4
+    fail_open: true
+""".strip()
+    )
+
+    topology = TopologyConfig.load(config_path)
+
+    assert topology.evolution is not None
+    assert topology.evolution.enabled is True
+    assert topology.evolution.backend_url == "http://127.0.0.1:8200"
+    assert topology.evolution.context.target_dir == "/polar/session/evolution"
+    assert topology.evolution.context.timeout_seconds == 3
+    assert topology.evolution.event_export.timeout_seconds == 4
+
+
+def test_invalid_evolution_backend_url_is_rejected(tmp_path: Path) -> None:
+    path = _write_yaml(
+        tmp_path / "topology.yaml",
+        {
+            "gateway": {
+                "nodes": [{"id": "node-a", "public_url": "http://127.0.0.1:8100"}]
+            },
+            "evolution": {"backend_url": "not-a-url"},
+        },
+    )
+
+    with pytest.raises(ValueError, match="evolution.backend_url"):
+        TopologyConfig.load(path)
+
+
+def test_blank_evolution_context_target_dir_is_rejected(tmp_path: Path) -> None:
+    path = _write_yaml(
+        tmp_path / "topology.yaml",
+        {
+            "gateway": {
+                "nodes": [{"id": "node-a", "public_url": "http://127.0.0.1:8100"}]
+            },
+            "evolution": {"context": {"target_dir": "   "}},
+        },
+    )
+
+    with pytest.raises(ValueError, match="evolution.context.target_dir"):
+        TopologyConfig.load(path)
+
+
+def test_unknown_evolution_context_key_is_rejected(tmp_path: Path) -> None:
+    path = _write_yaml(
+        tmp_path / "topology.yaml",
+        {
+            "gateway": {
+                "nodes": [{"id": "node-a", "public_url": "http://127.0.0.1:8100"}]
+            },
+            "evolution": {"context": {"unexpected": True}},
+        },
+    )
+
+    with pytest.raises(ValueError, match="unexpected"):
+        TopologyConfig.load(path)

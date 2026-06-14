@@ -1,6 +1,9 @@
 """Shared configuration helpers for Polar."""
 
 from polar.config.topology import (
+    EvolutionConfig,
+    EvolutionContextConfig,
+    EvolutionEventExportConfig,
     GatewayConfig,
     GatewayNodeConfig,
     RolloutServiceConfig,
@@ -8,6 +11,9 @@ from polar.config.topology import (
 )
 
 __all__ = [
+    "EvolutionConfig",
+    "EvolutionContextConfig",
+    "EvolutionEventExportConfig",
     "GatewayConfig",
     "GatewayNodeConfig",
     "RolloutServiceConfig",

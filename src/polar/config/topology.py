@@ -83,6 +83,40 @@ class _CompletionPersistenceConfig(_StrictModel):
     queue_size: int = Field(default=1024, gt=0)
 
 
+class EvolutionContextConfig(_StrictModel):
+    target_dir: str = "/polar/session/evolution"
+    timeout_seconds: float = Field(default=10.0, gt=0)
+    fail_open: bool = True
+
+    @field_validator("target_dir")
+    @classmethod
+    def _strip_target_dir(cls, value: str) -> str:
+        text = str(value).strip()
+        if not text:
+            raise ValueError("evolution.context.target_dir must be a non-empty string")
+        return text
+
+
+class EvolutionEventExportConfig(_StrictModel):
+    enabled: bool = True
+    timeout_seconds: float = Field(default=10.0, gt=0)
+    fail_open: bool = True
+
+
+class EvolutionConfig(_StrictModel):
+    enabled: bool = False
+    backend_url: str = "http://127.0.0.1:8200"
+    context: EvolutionContextConfig = Field(default_factory=EvolutionContextConfig)
+    event_export: EvolutionEventExportConfig = Field(
+        default_factory=EvolutionEventExportConfig
+    )
+
+    @field_validator("backend_url")
+    @classmethod
+    def _validate_backend_url(cls, value: str) -> str:
+        return _normalize_http_url(value, "evolution.backend_url")
+
+
 class GatewayConfig(_StrictModel):
     heartbeat_interval_seconds: int = Field(default=30, gt=0)
     rollout_server_url: str | None = None
@@ -152,6 +186,7 @@ class RolloutServiceConfig(_StrictModel):
 class TopologyConfig(_StrictModel):
     rollout: RolloutServiceConfig = Field(default_factory=RolloutServiceConfig)
     gateway: GatewayConfig
+    evolution: EvolutionConfig | None = None
     path: Path | None = None
 
     @classmethod
