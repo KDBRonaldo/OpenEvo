@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import json
+from pathlib import Path
 import sqlite3
 
 import pytest
 
 from polar_evolution.files import ArtifactFileStore
+from polar_evolution.models import EventIngestRequest
 from polar_evolution.store import EvolutionStore
 
 
@@ -190,3 +193,75 @@ def test_artifact_manifest_path_rejects_empty_or_unknown_type(tmp_path, artifact
 
     with pytest.raises(ValueError, match="unknown artifact type"):
         files.artifact_manifest_path(artifact_type, "artifact-1")
+
+
+def test_ingest_event_is_idempotent(tmp_path):
+    db_path = tmp_path / "evolution.db"
+    store = EvolutionStore(db_path=db_path, artifact_root=tmp_path / "artifacts")
+    store.initialize()
+    created_at = datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
+    request = EventIngestRequest(
+        source="polar",
+        event_type="polar.session_completed",
+        source_event_id="session:abc",
+        created_at=created_at,
+        task_id="task_1",
+        session_id="abc",
+        agent={"harness": "codex", "model_name": "gpt-5.4"},
+        base_model="Qwen/Qwen3.6-27B",
+        reward=1.0,
+        status="COMPLETED",
+        payload={"session_result": {"session_id": "abc"}},
+    )
+
+    first = store.ingest_event(request)
+    second = store.ingest_event(request)
+
+    assert first.event_id == second.event_id
+    assert first.ingested is True
+    assert first.duplicate is False
+    assert second.ingested is False
+    assert second.duplicate is True
+
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("SELECT * FROM events").fetchall()
+
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["event_id"] == first.event_id
+    assert row["created_at"] == "2026-01-02T03:04:05Z"
+    assert row["agent_harness"] == "codex"
+    assert row["agent_model"] == "gpt-5.4"
+
+    payload_path = Path(row["payload_path"])
+    assert payload_path.exists()
+    assert json.loads(payload_path.read_text(encoding="utf-8")) == request.model_dump(mode="json")
+
+
+def test_ingest_event_normalizes_non_string_agent_metadata(tmp_path):
+    db_path = tmp_path / "evolution.db"
+    store = EvolutionStore(db_path=db_path, artifact_root=tmp_path / "artifacts")
+    store.initialize()
+    request = EventIngestRequest(
+        source="polar",
+        event_type="polar.session_completed",
+        source_event_id="session:abc",
+        agent={
+            "harness": {"name": "codex", "version": 2},
+            "model_name": ["gpt-5.4", "fallback"],
+        },
+    )
+
+    response = store.ingest_event(request)
+
+    assert response.ingested is True
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT agent_harness, agent_model FROM events WHERE event_id = ?",
+            (response.event_id,),
+        ).fetchone()
+
+    assert row["agent_harness"] == '{"name": "codex", "version": 2}'
+    assert row["agent_model"] == '["gpt-5.4", "fallback"]'

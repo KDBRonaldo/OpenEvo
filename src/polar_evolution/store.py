@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+import json
 from pathlib import Path
 import sqlite3
-from typing import Iterator
+from typing import Any, Iterator
 
 from polar_evolution.files import ArtifactFileStore
+from polar_evolution.ids import new_id
+from polar_evolution.models import EventIngestRequest, EventIngestResponse
+from polar_evolution.time import utc_now_iso
 
 
 SCHEMA = """
@@ -93,6 +97,17 @@ CREATE TABLE IF NOT EXISTS contexts (
 """
 
 
+def _text_metadata(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    try:
+        return json.dumps(value, sort_keys=True)
+    except TypeError:
+        return str(value)
+
+
 class EvolutionStore:
     def __init__(self, *, db_path: str | Path, artifact_root: str | Path) -> None:
         self.db_path = Path(db_path)
@@ -104,6 +119,64 @@ class EvolutionStore:
         with self.connect() as conn:
             conn.executescript(SCHEMA)
             conn.commit()
+
+    def ingest_event(self, request: EventIngestRequest) -> EventIngestResponse:
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            existing = conn.execute(
+                """
+                SELECT event_id FROM events
+                WHERE source = ? AND event_type = ? AND source_event_id = ?
+                """,
+                (request.source, request.event_type, request.source_event_id),
+            ).fetchone()
+            if existing is not None:
+                conn.rollback()
+                return EventIngestResponse(
+                    event_id=str(existing["event_id"]),
+                    ingested=False,
+                    duplicate=True,
+                )
+
+            event_id = new_id("evt")
+            request_payload = json.loads(json.dumps(request.model_dump(mode="json")))
+            created_at = request_payload["created_at"] or utc_now_iso()
+            ingested_at = utc_now_iso()
+            payload_path = self.files.event_payload_path(event_id)
+            self.files.write_json(payload_path, request_payload)
+            agent_harness = _text_metadata(request.agent.get("harness"))
+            agent_model = _text_metadata(request.agent.get("model_name"))
+            conn.execute(
+                """
+                INSERT INTO events (
+                    event_id, source, event_type, source_event_id, created_at,
+                    ingested_at, task_id, session_id, policy_version,
+                    rollout_step, agent_harness, agent_model, base_model,
+                    status, reward, payload_path
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    event_id,
+                    request.source,
+                    request.event_type,
+                    request.source_event_id,
+                    created_at,
+                    ingested_at,
+                    request.task_id,
+                    request.session_id,
+                    request.policy_version,
+                    request.rollout_step,
+                    agent_harness,
+                    agent_model,
+                    request.base_model,
+                    request.status,
+                    request.reward,
+                    str(payload_path),
+                ),
+            )
+            conn.commit()
+            return EventIngestResponse(event_id=event_id, ingested=True, duplicate=False)
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
