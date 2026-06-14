@@ -3,9 +3,14 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 
-from polar_evolution.models import EventIngestRequest, EventIngestResponse
+from polar_evolution.models import (
+    ArtifactRegisterRequest,
+    ArtifactResponse,
+    EventIngestRequest,
+    EventIngestResponse,
+)
 from polar_evolution.store import EvolutionStore
 
 
@@ -30,5 +35,12 @@ def create_app(*, db_path: str | Path, artifact_root: str | Path) -> FastAPI:
     @app.post("/v1/events", response_model=EventIngestResponse)
     def ingest_event(request: EventIngestRequest) -> EventIngestResponse:
         return store.ingest_event(request)
+
+    @app.post("/v1/artifacts", response_model=ArtifactResponse)
+    def register_artifact(request: ArtifactRegisterRequest) -> ArtifactResponse:
+        try:
+            return store.register_artifact(request)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     return app
