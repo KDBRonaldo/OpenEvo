@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import shutil
 from contextlib import suppress
@@ -11,6 +12,7 @@ from tempfile import mkdtemp
 
 import httpx
 
+from polar.config import EvolutionConfig
 from polar.gateway.dispatcher import (
     DispatcherSnapshot,
     ManagedSession,
@@ -36,12 +38,62 @@ from polar.runtime.factory import create_runtime
 from polar.runtime.models import ExecInput, RuntimeSpec
 from polar.trajectory.models import EvalResult, EvaluatorSpec, StrategySpec, Trajectory
 from polar.trajectory.registry import StrategyRegistry
+from polar_evolution.client import EvolutionClient
 
 logger = logging.getLogger(__name__)
 
 
 class GatewayExecutionTimeout(TimeoutError):
     """Raised when a session exhausts its shared gateway execution budget."""
+
+
+async def write_evolution_context_files(
+    *,
+    runtime: BaseRuntime,
+    context: dict,
+    host_dir: Path,
+    target_dir: str,
+) -> dict[str, str]:
+    evolution_dir = host_dir / ".polar_evolution_upload"
+    if evolution_dir.exists():
+        shutil.rmtree(evolution_dir)
+    skills_dir = evolution_dir / "skills"
+    skills_dir.mkdir(parents=True, exist_ok=True)
+    context_path = evolution_dir / "context.json"
+    memory_path = evolution_dir / "memory.md"
+    adapters_path = evolution_dir / "adapters.json"
+
+    context_path.write_text(
+        json.dumps(context, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    memory_path.write_text(
+        str((context.get("memory") or {}).get("rendered_text") or ""),
+        encoding="utf-8",
+    )
+    adapters_path.write_text(
+        json.dumps(context.get("adapter_merge_spec") or {}, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+
+    await runtime.upload_file(str(context_path), f"{target_dir}/context.json")
+    await runtime.upload_file(str(memory_path), f"{target_dir}/memory.md")
+    await runtime.upload_file(str(adapters_path), f"{target_dir}/adapters.json")
+    await runtime.upload_dir(str(skills_dir), f"{target_dir}/skills")
+
+    return {
+        "POLAR_EVOLUTION_CONTEXT": f"{target_dir}/context.json",
+        "POLAR_MEMORY_FILE": f"{target_dir}/memory.md",
+        "POLAR_SKILLS_DIR": f"{target_dir}/skills",
+        "POLAR_ADAPTER_MERGE_SPEC": f"{target_dir}/adapters.json",
+    }
+
+
+def _existing_evolution_metadata(metadata: dict) -> dict:
+    existing = metadata.get("evolution")
+    if isinstance(existing, dict):
+        return dict(existing)
+    return {}
 
 
 class GatewayNodeManager:
@@ -63,6 +115,9 @@ class GatewayNodeManager:
         session_base_dir: str | None = None,
         rollout_server_url: str | None = None,
         heartbeat_interval_seconds: int = 30,
+        model_served: str | None = None,
+        evolution: EvolutionConfig | None = None,
+        evolution_client: EvolutionClient | None = None,
     ) -> None:
         self.node_id = node_id
         self.gateway_url = gateway_url.rstrip("/")
@@ -75,6 +130,9 @@ class GatewayNodeManager:
         self.evaluators = evaluators
         self.default_runtime = default_runtime
         self._session_base_dir = session_base_dir
+        self.model_served = model_served
+        self.evolution = evolution
+        self.evolution_client = evolution_client
         self._client = httpx.AsyncClient(timeout=30.0)
         self._dispatcher = SessionDispatcher(
             max_init_workers=max_init_workers,
@@ -109,6 +167,9 @@ class GatewayNodeManager:
             await self._control_client.aclose()
             self._control_client = None
         await self._dispatcher.stop()
+        if self.evolution_client is not None:
+            await self.evolution_client.close()
+            self.evolution_client = None
         await self._client.aclose()
 
     async def _register_with_rollout_server(self) -> None:
@@ -317,6 +378,14 @@ class GatewayNodeManager:
             self._start_eval_prewarm(managed)
             harness = self._resolve_agent_harness(request)
 
+            evolution_env = await self._resolve_and_inject_evolution_context(
+                managed,
+                harness,
+            )
+            if evolution_env:
+                harness.env.update(evolution_env)
+                request.agent.env.update(evolution_env)
+
             # Setup
             await self._await_with_budget(harness.setup(runtime), managed)
 
@@ -353,6 +422,64 @@ class GatewayNodeManager:
 
     def _resolve_agent_harness(self, request: SessionDispatchRequest) -> BaseHarness:
         return create_harness(request.agent)
+
+    async def _resolve_and_inject_evolution_context(
+        self,
+        managed: ManagedSession,
+        harness: BaseHarness,
+    ) -> dict[str, str]:
+        request = managed.request
+        if (
+            self.evolution is None
+            or not self.evolution.enabled
+            or self.evolution_client is None
+        ):
+            return {}
+        if managed.runtime is None:
+            return {}
+        payload = {
+            "task_id": request.task_id,
+            "instruction": request.instruction,
+            "agent": request.agent.model_dump(mode="json"),
+            "base_model": self.model_served,
+            "policy_version": request.metadata.get("policy_version"),
+            "rollout_step": request.metadata.get("rollout_step"),
+            "metadata": dict(request.metadata),
+        }
+        try:
+            context = await self._await_with_budget(
+                self.evolution_client.resolve_context(payload),
+                managed,
+            )
+            env = await self._await_with_budget(
+                write_evolution_context_files(
+                    runtime=managed.runtime,
+                    context=context,
+                    host_dir=managed.session_dir,
+                    target_dir=self.evolution.context.target_dir,
+                ),
+                managed,
+            )
+            request.metadata["evolution"] = {
+                **_existing_evolution_metadata(request.metadata),
+                "context_id": context.get("context_id"),
+                "context_injected": True,
+            }
+            return env
+        except Exception as exc:
+            if not self.evolution.context.fail_open:
+                raise
+            request.metadata["evolution"] = {
+                **_existing_evolution_metadata(request.metadata),
+                "context_injected": False,
+                "error": str(exc),
+            }
+            logger.warning(
+                "Evolution context resolution failed for session %s: %s",
+                request.session_id,
+                exc,
+            )
+            return {}
 
     async def _run_exec_inputs(
         self,

@@ -42,6 +42,7 @@ from polar.gateway.transform.base import BaseTransformer
 from polar.platform.events import SSE_HEADERS, EventBus
 from polar.rollout.models import SessionDispatchRequest, SessionDispatchResponse, SessionStatus
 from polar.trajectory.registry import default_builder_registry, default_evaluator_registry
+from polar_evolution.client import EvolutionClient
 
 logging.basicConfig(
     level=logging.INFO,
@@ -109,6 +110,16 @@ def _build_state(topology: TopologyConfig, node_id: str | None) -> GatewayState:
         default_runtime=node.default_runtime,
         rollout_server_url=topology.gateway.rollout_server_url or None,
         heartbeat_interval_seconds=topology.gateway.heartbeat_interval_seconds,
+        model_served=node.model_served,
+        evolution=topology.evolution,
+        evolution_client=(
+            EvolutionClient(
+                topology.evolution.backend_url,
+                timeout_seconds=topology.evolution.context.timeout_seconds,
+            )
+            if topology.evolution is not None and topology.evolution.enabled
+            else None
+        ),
     )
     return GatewayState(
         topology=topology,
