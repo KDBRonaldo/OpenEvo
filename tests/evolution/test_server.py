@@ -6,7 +6,9 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 import httpx
+import pytest
 
+from polar_evolution.client import EvolutionClient
 from polar_evolution.server import create_app
 from polar_evolution.worker import EvolutionWorkerClient
 
@@ -172,6 +174,75 @@ def test_context_resolve_route_uses_sync_handler_and_persists_context(tmp_path):
         route for route in app.routes if getattr(route, "path", None) == "/v1/contexts/resolve"
     )
     assert inspect.iscoroutinefunction(route.endpoint) is False
+
+
+@pytest.mark.asyncio
+async def test_evolution_client_resolve_context_with_mock_transport():
+    payload = {
+        "task_id": "task_1",
+        "instruction": "solve",
+        "agent": {"harness": "codex"},
+        "base_model": "Qwen/Qwen3.6-27B",
+    }
+
+    async def handler(request):
+        assert request.method == "POST"
+        assert request.url.path == "/v1/contexts/resolve"
+        assert json.loads(request.content) == payload
+        return httpx.Response(
+            200,
+            json={
+                "context_id": "ctx_test",
+                "memory": {"artifact_ids": [], "rendered_text": ""},
+                "skills": [],
+                "adapter_merge_spec": {
+                    "base_model": "Qwen/Qwen3.6-27B",
+                    "merge_mode": "reference_only",
+                    "adapters": [],
+                },
+                "selection": {},
+            },
+        )
+
+    client = EvolutionClient(
+        "http://evolution.test",
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        context = await client.resolve_context(payload)
+    finally:
+        await client.close()
+
+    assert context["context_id"] == "ctx_test"
+
+
+@pytest.mark.asyncio
+async def test_evolution_client_export_event_with_mock_transport():
+    payload = {
+        "source": "polar",
+        "event_type": "polar.session_completed",
+        "source_event_id": "session:client-test",
+        "task_id": "task_1",
+        "payload": {"reward": 1.0},
+    }
+    response_body = {"event_id": "evt_test", "ingested": True, "duplicate": False}
+
+    async def handler(request):
+        assert request.method == "POST"
+        assert request.url.path == "/v1/events"
+        assert json.loads(request.content) == payload
+        return httpx.Response(200, json=response_body)
+
+    client = EvolutionClient(
+        "http://evolution.test",
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        event = await client.export_event(payload)
+    finally:
+        await client.close()
+
+    assert event == response_body
 
 
 def test_register_artifact_route_rejects_non_finite_metadata_without_writes(tmp_path):
