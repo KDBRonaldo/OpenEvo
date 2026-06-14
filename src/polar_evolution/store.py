@@ -13,6 +13,9 @@ from polar_evolution.models import (
     ArtifactRegisterRequest,
     ArtifactResponse,
     ArtifactState,
+    ArtifactType,
+    DatasetCreateRequest,
+    DatasetCreateResponse,
     EventIngestRequest,
     EventIngestResponse,
 )
@@ -104,6 +107,7 @@ CREATE TABLE IF NOT EXISTS contexts (
 """
 
 MAX_ARTIFACT_ID_ATTEMPTS = 10
+MAX_DATASET_ID_ATTEMPTS = 10
 
 
 def _text_metadata(value: Any) -> str | None:
@@ -327,6 +331,243 @@ class EvolutionStore:
                 promoted=request_payload["promoted"],
             )
         raise RuntimeError("could not allocate unique artifact id")
+
+    def _event_rows_for_dataset(
+        self,
+        conn: sqlite3.Connection,
+        request: DatasetCreateRequest,
+    ) -> list[sqlite3.Row]:
+        clauses: list[str] = []
+        params: list[object] = []
+        if request.query.event_types:
+            clauses.append(
+                "event_type IN (%s)" % ",".join("?" for _ in request.query.event_types)
+            )
+            params.extend(request.query.event_types)
+        if request.query.status:
+            clauses.append("status IN (%s)" % ",".join("?" for _ in request.query.status))
+            params.extend(request.query.status)
+        if request.query.reward_min is not None:
+            clauses.append("reward >= ?")
+            params.append(request.query.reward_min)
+        if request.query.policy_version:
+            clauses.append("policy_version = ?")
+            params.append(request.query.policy_version)
+        where = " AND ".join(clauses) if clauses else "1 = 1"
+        return conn.execute(
+            f"SELECT * FROM events WHERE {where} ORDER BY ingested_at, event_id LIMIT ?",
+            (*params, request.limits.max_events),
+        ).fetchall()
+
+    def _trace_count_for_event_row(self, row: dict[str, Any]) -> int:
+        event_id = str(row["event_id"])
+        payload_path = Path(str(row["payload_path"]))
+        try:
+            payload_text = payload_path.read_text(encoding="utf-8")
+        except FileNotFoundError as exc:
+            raise ValueError(f"event {event_id} payload file is missing: {payload_path}") from exc
+        try:
+            payload = json.loads(payload_text)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"event {event_id} payload file is not valid JSON: {payload_path}"
+            ) from exc
+
+        if not isinstance(payload, dict):
+            return 0
+        event_payload = payload.get("payload")
+        if not isinstance(event_payload, dict):
+            return 0
+        session_result = event_payload.get("session_result")
+        if not isinstance(session_result, dict):
+            return 0
+        trajectory = session_result.get("trajectory")
+        if not isinstance(trajectory, dict):
+            return 0
+        traces = trajectory.get("traces")
+        if not isinstance(traces, list):
+            return 0
+        return len(traces)
+
+    def create_dataset(self, request: DatasetCreateRequest) -> DatasetCreateResponse:
+        raw_payload = request.model_dump(mode="python")
+        _validate_finite_floats(raw_payload["query"], "query")
+        _validate_finite_floats(raw_payload["limits"], "limits")
+        if request.query.task_tags:
+            raise ValueError("query.task_tags is not supported until events store task tags")
+
+        request_payload = request.model_dump(mode="json")
+        query_json = _json_dumps(request_payload["query"])
+
+        with self.connect() as conn:
+            rows = [dict(row) for row in self._event_rows_for_dataset(conn, request)]
+
+        trace_count = 0
+        event_ids: list[str] = []
+        for row in rows:
+            if trace_count >= request.limits.max_traces:
+                break
+            trace_count += self._trace_count_for_event_row(row)
+            event_ids.append(str(row["event_id"]))
+
+        for _ in range(MAX_DATASET_ID_ATTEMPTS):
+            dataset_id = new_id("ds")
+            created_at = utc_now_iso()
+            manifest_path = self.files.dataset_manifest_path(dataset_id)
+            manifest = {
+                "dataset_id": dataset_id,
+                "name": request_payload["name"],
+                "purpose": request_payload["purpose"],
+                "query": request_payload["query"],
+                "limits": request_payload["limits"],
+                "event_ids": event_ids,
+                "event_count": len(event_ids),
+                "trace_count": trace_count,
+            }
+            _validate_finite_floats(manifest, "manifest")
+
+            manifest_created = False
+            with self.connect() as conn:
+                try:
+                    conn.execute("BEGIN IMMEDIATE")
+                    existing = conn.execute(
+                        "SELECT 1 FROM datasets WHERE dataset_id = ?",
+                        (dataset_id,),
+                    ).fetchone()
+                    if existing is not None or manifest_path.exists():
+                        conn.rollback()
+                        continue
+                    conn.execute(
+                        """
+                        INSERT INTO datasets (
+                            dataset_id, name, purpose, state, created_at, query_json,
+                            manifest_path, event_count, trace_count, artifact_id
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            dataset_id,
+                            request_payload["name"],
+                            request_payload["purpose"],
+                            "active",
+                            created_at,
+                            query_json,
+                            str(manifest_path),
+                            len(event_ids),
+                            trace_count,
+                            None,
+                        ),
+                    )
+                    conn.executemany(
+                        "INSERT INTO dataset_events (dataset_id, event_id) VALUES (?, ?)",
+                        [(dataset_id, event_id) for event_id in event_ids],
+                    )
+                    try:
+                        _write_json_strict_exclusive(self.files, manifest_path, manifest)
+                    except FileExistsError:
+                        conn.rollback()
+                        continue
+                    manifest_created = True
+                    conn.commit()
+                except Exception:
+                    try:
+                        conn.rollback()
+                    except sqlite3.Error:
+                        pass
+                    if manifest_created:
+                        try:
+                            manifest_path.unlink(missing_ok=True)
+                        except OSError:
+                            pass
+                    raise
+
+            try:
+                artifact = self.register_artifact(
+                    ArtifactRegisterRequest(
+                        type=ArtifactType.DATASET,
+                        name=request.name,
+                        uri=manifest_path.as_uri(),
+                        manifest=manifest,
+                        lineage={"event_ids": event_ids},
+                        compatibility={"purpose": request.purpose},
+                        tags=[request.purpose],
+                        promoted=True,
+                    )
+                )
+            except Exception:
+                self._cleanup_dataset_create_failure(dataset_id, manifest_path)
+                raise
+
+            try:
+                self._backfill_dataset_artifact_id(dataset_id, artifact.artifact_id)
+            except Exception:
+                self._cleanup_dataset_create_failure(
+                    dataset_id,
+                    manifest_path,
+                    artifact_id=artifact.artifact_id,
+                )
+                raise
+
+            return DatasetCreateResponse(
+                dataset_id=dataset_id,
+                artifact_id=artifact.artifact_id,
+                event_count=len(event_ids),
+                trace_count=trace_count,
+            )
+        raise RuntimeError("could not allocate unique dataset id")
+
+    def _backfill_dataset_artifact_id(self, dataset_id: str, artifact_id: str) -> None:
+        with self.connect() as conn:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                conn.execute(
+                    "UPDATE datasets SET artifact_id = ? WHERE dataset_id = ?",
+                    (artifact_id, dataset_id),
+                )
+                conn.commit()
+            except Exception:
+                try:
+                    conn.rollback()
+                except sqlite3.Error:
+                    pass
+                raise
+
+    def _cleanup_dataset_create_failure(
+        self,
+        dataset_id: str,
+        dataset_manifest_path: Path,
+        *,
+        artifact_id: str | None = None,
+    ) -> None:
+        artifact_manifest_path: Path | None = None
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            if artifact_id is not None:
+                artifact_manifest_path = self.files.artifact_manifest_path(
+                    str(ArtifactType.DATASET),
+                    artifact_id,
+                )
+                artifact_row = conn.execute(
+                    "SELECT manifest_path FROM artifacts WHERE artifact_id = ?",
+                    (artifact_id,),
+                ).fetchone()
+                if artifact_row is not None:
+                    artifact_manifest_path = Path(str(artifact_row["manifest_path"]))
+                conn.execute(
+                    """
+                    DELETE FROM artifact_lineage
+                    WHERE parent_artifact_id = ? OR child_artifact_id = ?
+                    """,
+                    (artifact_id, artifact_id),
+                )
+                conn.execute("DELETE FROM artifacts WHERE artifact_id = ?", (artifact_id,))
+            conn.execute("DELETE FROM dataset_events WHERE dataset_id = ?", (dataset_id,))
+            conn.execute("DELETE FROM datasets WHERE dataset_id = ?", (dataset_id,))
+            conn.commit()
+
+        dataset_manifest_path.unlink(missing_ok=True)
+        if artifact_manifest_path is not None:
+            artifact_manifest_path.unlink(missing_ok=True)
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:

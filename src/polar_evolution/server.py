@@ -8,6 +8,8 @@ from fastapi import FastAPI, HTTPException
 from polar_evolution.models import (
     ArtifactRegisterRequest,
     ArtifactResponse,
+    DatasetCreateRequest,
+    DatasetCreateResponse,
     EventIngestRequest,
     EventIngestResponse,
 )
@@ -40,6 +42,13 @@ def create_app(*, db_path: str | Path, artifact_root: str | Path) -> FastAPI:
     def register_artifact(request: ArtifactRegisterRequest) -> ArtifactResponse:
         try:
             return store.register_artifact(request)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/v1/datasets", response_model=DatasetCreateResponse)
+    def create_dataset(request: DatasetCreateRequest) -> DatasetCreateResponse:
+        try:
+            return store.create_dataset(request)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
