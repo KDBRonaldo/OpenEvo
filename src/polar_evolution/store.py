@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from datetime import UTC, datetime, timedelta
 import json
 import math
 from pathlib import Path
@@ -18,6 +19,14 @@ from polar_evolution.models import (
     DatasetCreateResponse,
     EventIngestRequest,
     EventIngestResponse,
+    JobCreateRequest,
+    JobCreateResponse,
+    JobState,
+    WorkerClaimRequest,
+    WorkerClaimResponse,
+    WorkerCompleteRequest,
+    WorkerFailRequest,
+    WorkerHeartbeatRequest,
 )
 from polar_evolution.time import utc_now_iso
 
@@ -108,6 +117,12 @@ CREATE TABLE IF NOT EXISTS contexts (
 
 MAX_ARTIFACT_ID_ATTEMPTS = 10
 MAX_DATASET_ID_ATTEMPTS = 10
+DEFAULT_HEARTBEAT_LEASE_SECONDS = 600
+ACTIVE_JOB_STATES = {str(JobState.CLAIMED), str(JobState.RUNNING)}
+
+
+class JobLeaseError(ValueError):
+    pass
 
 
 def _text_metadata(value: Any) -> str | None:
@@ -137,6 +152,17 @@ def _validate_finite_floats(value: Any, path: str) -> None:
     if isinstance(value, list | tuple):
         for index, child in enumerate(value):
             _validate_finite_floats(child, f"{path}[{index}]")
+
+
+def _utc_dt_to_iso(value: datetime) -> str:
+    return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
+
+
+def _parse_utc_iso(value: str) -> datetime:
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
 
 
 def _write_json_strict_exclusive(
@@ -331,6 +357,393 @@ class EvolutionStore:
                 promoted=request_payload["promoted"],
             )
         raise RuntimeError("could not allocate unique artifact id")
+
+    def create_job(self, request: JobCreateRequest) -> JobCreateResponse:
+        raw_payload = request.model_dump(mode="python")
+        _validate_finite_floats(raw_payload["config"], "config")
+        request_payload = request.model_dump(mode="json")
+        input_artifact_ids_json = _json_dumps(request_payload["input_artifact_ids"])
+        config_json = _json_dumps(request_payload["config"])
+
+        job_id = new_id("job")
+        now = utc_now_iso()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO jobs (
+                    job_id, job_type, method, state, priority, created_at,
+                    updated_at, input_artifact_ids_json, config_json,
+                    attempt_count
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    job_id,
+                    request_payload["job_type"],
+                    request_payload["method"],
+                    str(JobState.PENDING),
+                    request_payload["priority"],
+                    now,
+                    now,
+                    input_artifact_ids_json,
+                    config_json,
+                    0,
+                ),
+            )
+            conn.commit()
+        return JobCreateResponse(job_id=job_id, state=JobState.PENDING)
+
+    def claim_job(self, request: WorkerClaimRequest) -> WorkerClaimResponse:
+        now_dt = datetime.now(UTC)
+        lease_expires_at = _utc_dt_to_iso(now_dt + timedelta(seconds=request.lease_seconds))
+        where = "state = ?"
+        params: list[object] = [str(JobState.PENDING)]
+        if request.capabilities:
+            where += f" AND job_type IN ({','.join('?' for _ in request.capabilities)})"
+            params.extend(request.capabilities)
+
+        with self.connect() as conn:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                self._requeue_expired_jobs(conn, now_dt)
+                row = conn.execute(
+                    f"""
+                    SELECT * FROM jobs
+                    WHERE {where}
+                    ORDER BY priority DESC, created_at ASC, job_id ASC
+                    LIMIT 1
+                    """,
+                    params,
+                ).fetchone()
+                if row is None:
+                    conn.rollback()
+                    return WorkerClaimResponse(job=None)
+
+                lease_id = new_id("lease")
+                cursor = conn.execute(
+                    """
+                    UPDATE jobs
+                    SET state = ?, claimed_by = ?, lease_id = ?, lease_expires_at = ?,
+                        updated_at = ?, attempt_count = attempt_count + 1
+                    WHERE job_id = ? AND state = ?
+                    """,
+                    (
+                        str(JobState.CLAIMED),
+                        request.worker_id,
+                        lease_id,
+                        lease_expires_at,
+                        utc_now_iso(),
+                        row["job_id"],
+                        str(JobState.PENDING),
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    conn.rollback()
+                    return WorkerClaimResponse(job=None)
+                conn.commit()
+            except Exception:
+                try:
+                    conn.rollback()
+                except sqlite3.Error:
+                    pass
+                raise
+
+        return WorkerClaimResponse(
+            job={
+                "job_id": row["job_id"],
+                "lease_id": lease_id,
+                "job_type": row["job_type"],
+                "method": row["method"],
+                "input_artifacts": self._worker_claim_input_artifacts(
+                    json.loads(str(row["input_artifact_ids_json"]))
+                ),
+                "config": json.loads(str(row["config_json"])),
+                "priority": row["priority"],
+                "state": JobState.CLAIMED,
+            }
+        )
+
+    def _requeue_expired_jobs(self, conn: sqlite3.Connection, now: datetime) -> None:
+        rows = conn.execute(
+            """
+            SELECT job_id, lease_expires_at
+            FROM jobs
+            WHERE state IN (?, ?) AND lease_expires_at IS NOT NULL
+            """,
+            (str(JobState.CLAIMED), str(JobState.RUNNING)),
+        ).fetchall()
+        now = now.astimezone(UTC)
+        for row in rows:
+            try:
+                lease_expires_at = _parse_utc_iso(str(row["lease_expires_at"]))
+            except ValueError:
+                conn.execute(
+                    """
+                    UPDATE jobs
+                    SET state = ?, claimed_by = NULL, lease_id = NULL,
+                        lease_expires_at = NULL, updated_at = ?, error = ?
+                    WHERE job_id = ?
+                    """,
+                    (
+                        str(JobState.FAILED),
+                        utc_now_iso(),
+                        f"invalid lease_expires_at: {row['lease_expires_at']}",
+                        row["job_id"],
+                    ),
+                )
+                continue
+            if lease_expires_at <= now:
+                conn.execute(
+                    """
+                    UPDATE jobs
+                    SET state = ?, claimed_by = NULL, lease_id = NULL,
+                        lease_expires_at = NULL, updated_at = ?,
+                        error = COALESCE(error, ?)
+                    WHERE job_id = ?
+                    """,
+                    (
+                        str(JobState.PENDING),
+                        utc_now_iso(),
+                        f"lease expired at {_utc_dt_to_iso(lease_expires_at)}",
+                        row["job_id"],
+                    ),
+                )
+
+    def _worker_claim_input_artifacts(self, artifact_ids: list[str]) -> list[dict[str, Any]]:
+        artifacts: list[dict[str, Any]] = []
+        with self.connect() as conn:
+            for artifact_id in artifact_ids:
+                artifact = conn.execute(
+                    "SELECT artifact_id, type, uri, name FROM artifacts WHERE artifact_id = ?",
+                    (artifact_id,),
+                ).fetchone()
+                if artifact is not None:
+                    artifacts.append(
+                        {
+                            "artifact_id": artifact["artifact_id"],
+                            "type": artifact["type"],
+                            "uri": artifact["uri"],
+                            "name": artifact["name"],
+                        }
+                    )
+        return artifacts
+
+    def _assert_job_lease(
+        self,
+        conn: sqlite3.Connection,
+        job_id: str,
+        lease_id: str,
+    ) -> sqlite3.Row:
+        row = conn.execute("SELECT * FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
+        if row is None:
+            raise JobLeaseError(f"unknown job: {job_id}")
+        if row["state"] not in ACTIVE_JOB_STATES or row["lease_id"] != lease_id:
+            raise JobLeaseError(f"invalid lease for job: {job_id}")
+
+        lease_expires_at = row["lease_expires_at"]
+        if lease_expires_at is not None:
+            try:
+                expires_at = _parse_utc_iso(str(lease_expires_at))
+            except ValueError as exc:
+                raise JobLeaseError(f"invalid lease_expires_at for job: {job_id}") from exc
+            if expires_at <= datetime.now(UTC):
+                raise JobLeaseError(f"lease expired for job: {job_id}")
+        return row
+
+    def heartbeat_job(
+        self,
+        job_id: str,
+        request: WorkerHeartbeatRequest,
+    ) -> dict[str, object]:
+        if request.progress is not None:
+            _validate_finite_floats(request.progress, "progress")
+
+        lease_expires_at = _utc_dt_to_iso(
+            datetime.now(UTC) + timedelta(seconds=DEFAULT_HEARTBEAT_LEASE_SECONDS)
+        )
+        with self.connect() as conn:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                self._assert_job_lease(conn, job_id, request.lease_id)
+                conn.execute(
+                    """
+                    UPDATE jobs
+                    SET state = ?, updated_at = ?, lease_expires_at = ?
+                    WHERE job_id = ?
+                    """,
+                    (str(JobState.RUNNING), utc_now_iso(), lease_expires_at, job_id),
+                )
+                conn.commit()
+            except Exception:
+                try:
+                    conn.rollback()
+                except sqlite3.Error:
+                    pass
+                raise
+        return {
+            "job_id": job_id,
+            "state": str(JobState.RUNNING),
+            "progress": request.progress,
+            "lease_expires_at": lease_expires_at,
+        }
+
+    def complete_job(
+        self,
+        job_id: str,
+        request: WorkerCompleteRequest,
+    ) -> dict[str, object]:
+        raw_payload = request.model_dump(mode="python")
+        _validate_finite_floats(raw_payload["report"], "report")
+
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                self._assert_job_lease(conn, job_id, request.lease_id)
+                conn.rollback()
+            except Exception:
+                try:
+                    conn.rollback()
+                except sqlite3.Error:
+                    pass
+                raise
+
+        registered_artifact_ids: list[str] = []
+        try:
+            for artifact_request in request.artifacts:
+                artifact = self.register_artifact(artifact_request)
+                registered_artifact_ids.append(artifact.artifact_id)
+
+            with self.connect() as conn:
+                try:
+                    conn.execute("BEGIN IMMEDIATE")
+                    self._assert_job_lease(conn, job_id, request.lease_id)
+                    conn.execute(
+                        """
+                        UPDATE jobs
+                        SET state = ?, updated_at = ?, claimed_by = NULL, lease_id = NULL,
+                            lease_expires_at = NULL, error = NULL
+                        WHERE job_id = ?
+                        """,
+                        (str(JobState.SUCCEEDED), utc_now_iso(), job_id),
+                    )
+                    conn.commit()
+                except Exception:
+                    try:
+                        conn.rollback()
+                    except sqlite3.Error:
+                        pass
+                    raise
+        except JobLeaseError as exc:
+            if registered_artifact_ids:
+                try:
+                    self._cleanup_registered_artifacts(registered_artifact_ids)
+                except Exception as cleanup_exc:
+                    exc.add_note(f"artifact cleanup failed: {cleanup_exc}")
+            raise
+        except Exception as exc:
+            cleanup_error: Exception | None = None
+            if registered_artifact_ids:
+                try:
+                    self._cleanup_registered_artifacts(registered_artifact_ids)
+                except Exception as cleanup_exc:
+                    cleanup_error = cleanup_exc
+            try:
+                self._record_job_completion_failure(job_id, request.lease_id, error=exc)
+            except Exception as record_exc:
+                exc.add_note(f"job failure recording failed: {record_exc}")
+            if cleanup_error is not None:
+                exc.add_note(f"artifact cleanup failed: {cleanup_error}")
+            raise
+
+        return {
+            "job_id": job_id,
+            "state": str(JobState.SUCCEEDED),
+            "artifact_ids": registered_artifact_ids,
+        }
+
+    def fail_job(self, job_id: str, request: WorkerFailRequest) -> dict[str, object]:
+        next_state = JobState.PENDING if request.retryable else JobState.FAILED
+        error = request.error
+        with self.connect() as conn:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                self._assert_job_lease(conn, job_id, request.lease_id)
+                conn.execute(
+                    """
+                    UPDATE jobs
+                    SET state = ?, updated_at = ?, claimed_by = NULL, lease_id = NULL,
+                        lease_expires_at = NULL, error = ?
+                    WHERE job_id = ?
+                    """,
+                    (str(next_state), utc_now_iso(), error, job_id),
+                )
+                conn.commit()
+            except Exception:
+                try:
+                    conn.rollback()
+                except sqlite3.Error:
+                    pass
+                raise
+        return {"job_id": job_id, "state": str(next_state), "error": error}
+
+    def _cleanup_registered_artifacts(self, artifact_ids: list[str]) -> None:
+        for artifact_id in artifact_ids:
+            artifact_manifest_path: Path | None = None
+            with self.connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                artifact_row = conn.execute(
+                    "SELECT type, manifest_path FROM artifacts WHERE artifact_id = ?",
+                    (artifact_id,),
+                ).fetchone()
+                if artifact_row is not None:
+                    artifact_manifest_path = Path(str(artifact_row["manifest_path"]))
+                    conn.execute(
+                        """
+                        DELETE FROM artifact_lineage
+                        WHERE parent_artifact_id = ? OR child_artifact_id = ?
+                        """,
+                        (artifact_id, artifact_id),
+                    )
+                    conn.execute("DELETE FROM artifacts WHERE artifact_id = ?", (artifact_id,))
+                conn.commit()
+            if artifact_manifest_path is not None:
+                artifact_manifest_path.unlink(missing_ok=True)
+
+    def _record_job_completion_failure(
+        self,
+        job_id: str,
+        lease_id: str,
+        *,
+        error: BaseException,
+    ) -> None:
+        message = str(error) or error.__class__.__name__
+        with self.connect() as conn:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                conn.execute(
+                    """
+                    UPDATE jobs
+                    SET state = ?, updated_at = ?, claimed_by = NULL, lease_id = NULL,
+                        lease_expires_at = NULL, error = ?
+                    WHERE job_id = ? AND lease_id = ? AND state IN (?, ?)
+                    """,
+                    (
+                        str(JobState.FAILED),
+                        utc_now_iso(),
+                        message,
+                        job_id,
+                        lease_id,
+                        str(JobState.CLAIMED),
+                        str(JobState.RUNNING),
+                    ),
+                )
+                conn.commit()
+            except Exception:
+                try:
+                    conn.rollback()
+                except sqlite3.Error:
+                    pass
+                raise
 
     def _event_rows_for_dataset(
         self,

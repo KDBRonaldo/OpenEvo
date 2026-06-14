@@ -12,6 +12,13 @@ from polar_evolution.models import (
     DatasetCreateResponse,
     EventIngestRequest,
     EventIngestResponse,
+    JobCreateRequest,
+    JobCreateResponse,
+    WorkerClaimRequest,
+    WorkerClaimResponse,
+    WorkerCompleteRequest,
+    WorkerFailRequest,
+    WorkerHeartbeatRequest,
 )
 from polar_evolution.store import EvolutionStore
 
@@ -49,6 +56,38 @@ def create_app(*, db_path: str | Path, artifact_root: str | Path) -> FastAPI:
     def create_dataset(request: DatasetCreateRequest) -> DatasetCreateResponse:
         try:
             return store.create_dataset(request)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/v1/jobs", response_model=JobCreateResponse)
+    def create_job(request: JobCreateRequest) -> JobCreateResponse:
+        try:
+            return store.create_job(request)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/v1/jobs/claim", response_model=WorkerClaimResponse)
+    def claim_job(request: WorkerClaimRequest) -> WorkerClaimResponse:
+        return store.claim_job(request)
+
+    @app.post("/v1/jobs/{job_id}/heartbeat")
+    def heartbeat_job(job_id: str, request: WorkerHeartbeatRequest) -> dict[str, object]:
+        try:
+            return store.heartbeat_job(job_id, request)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/v1/jobs/{job_id}/complete")
+    def complete_job(job_id: str, request: WorkerCompleteRequest) -> dict[str, object]:
+        try:
+            return store.complete_job(job_id, request)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/v1/jobs/{job_id}/fail")
+    def fail_job(job_id: str, request: WorkerFailRequest) -> dict[str, object]:
+        try:
+            return store.fail_job(job_id, request)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 

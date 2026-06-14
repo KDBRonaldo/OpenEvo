@@ -5,8 +5,10 @@ import json
 from pathlib import Path
 
 from fastapi.testclient import TestClient
+import httpx
 
 from polar_evolution.server import create_app
+from polar_evolution.worker import EvolutionWorkerClient
 
 
 def test_health_reports_artifact_root(tmp_path):
@@ -252,3 +254,233 @@ def test_create_dataset_route_uses_sync_handler(tmp_path):
     route = next(route for route in app.routes if getattr(route, "path", None) == "/v1/datasets")
 
     assert inspect.iscoroutinefunction(route.endpoint) is False
+
+
+def test_job_route_claim_heartbeat_and_complete(tmp_path):
+    app = create_app(db_path=tmp_path / "evolution.db", artifact_root=tmp_path / "artifacts")
+
+    with TestClient(app) as client:
+        create_response = client.post(
+            "/v1/jobs",
+            json={"method": "mock", "job_type": "text_memory_mining"},
+        )
+        job_id = create_response.json()["job_id"]
+        claim_response = client.post(
+            "/v1/jobs/claim",
+            json={"worker_id": "worker_1", "capabilities": ["text_memory_mining"]},
+        )
+        lease_id = claim_response.json()["job"]["lease_id"]
+        heartbeat_response = client.post(
+            f"/v1/jobs/{job_id}/heartbeat",
+            json={"lease_id": lease_id, "progress": 0.5, "message": "halfway"},
+        )
+        complete_response = client.post(
+            f"/v1/jobs/{job_id}/complete",
+            json={
+                "lease_id": lease_id,
+                "artifacts": [
+                    {
+                        "type": "text_memory",
+                        "name": "route memory",
+                        "uri": "file:///tmp/route-memory.md",
+                    }
+                ],
+            },
+        )
+
+    assert create_response.status_code == 200
+    assert claim_response.status_code == 200
+    assert heartbeat_response.status_code == 200
+    assert heartbeat_response.json()["state"] == "running"
+    assert complete_response.status_code == 200
+    body = complete_response.json()
+    assert body["state"] == "succeeded"
+    assert body["artifact_ids"][0].startswith("art_")
+
+    with app.state.store.connect() as conn:
+        job_row = conn.execute(
+            "SELECT state FROM jobs WHERE job_id = ?",
+            (job_id,),
+        ).fetchone()
+        artifact_count = conn.execute("SELECT COUNT(*) FROM artifacts").fetchone()[0]
+
+    assert job_row["state"] == "succeeded"
+    assert artifact_count == 1
+
+
+def test_job_route_invalid_lease_returns_422(tmp_path):
+    app = create_app(db_path=tmp_path / "evolution.db", artifact_root=tmp_path / "artifacts")
+
+    with TestClient(app) as client:
+        create_response = client.post(
+            "/v1/jobs",
+            json={"method": "mock", "job_type": "text_memory_mining"},
+        )
+        job_id = create_response.json()["job_id"]
+        client.post(
+            "/v1/jobs/claim",
+            json={"worker_id": "worker_1", "capabilities": ["text_memory_mining"]},
+        )
+        fail_response = client.post(
+            f"/v1/jobs/{job_id}/fail",
+            json={"lease_id": "lease_wrong", "error": "wrong worker", "retryable": False},
+        )
+
+    assert fail_response.status_code == 422
+    assert "invalid lease" in fail_response.json()["detail"]
+    with app.state.store.connect() as conn:
+        job_row = conn.execute(
+            "SELECT state, error FROM jobs WHERE job_id = ?",
+            (job_id,),
+        ).fetchone()
+
+    assert job_row["state"] == "claimed"
+    assert job_row["error"] is None
+
+
+def test_job_route_invalid_completion_marks_failed_without_artifacts(tmp_path):
+    app = create_app(db_path=tmp_path / "evolution.db", artifact_root=tmp_path / "artifacts")
+
+    with TestClient(app, raise_server_exceptions=False) as client:
+        create_response = client.post(
+            "/v1/jobs",
+            json={"method": "mock", "job_type": "text_memory_mining"},
+        )
+        job_id = create_response.json()["job_id"]
+        claim_response = client.post(
+            "/v1/jobs/claim",
+            json={"worker_id": "worker_1", "capabilities": ["text_memory_mining"]},
+        )
+        lease_id = claim_response.json()["job"]["lease_id"]
+        complete_response = client.post(
+            f"/v1/jobs/{job_id}/complete",
+            content=f"""
+            {{
+                "lease_id": "{lease_id}",
+                "artifacts": [
+                    {{
+                        "type": "text_memory",
+                        "name": "invalid route memory",
+                        "uri": "file:///tmp/invalid-route-memory.md",
+                        "scores": {{"quality": NaN}}
+                    }}
+                ]
+            }}
+            """.encode(),
+            headers={"content-type": "application/json"},
+        )
+
+    assert complete_response.status_code == 422
+    assert "non-finite float" in complete_response.json()["detail"]
+    with app.state.store.connect() as conn:
+        job_row = conn.execute(
+            "SELECT state, error FROM jobs WHERE job_id = ?",
+            (job_id,),
+        ).fetchone()
+        artifact_count = conn.execute("SELECT COUNT(*) FROM artifacts").fetchone()[0]
+
+    assert job_row["state"] == "failed"
+    assert "non-finite float" in job_row["error"]
+    assert artifact_count == 0
+    assert not list((tmp_path / "artifacts" / "artifacts" / "text_memory").glob("*/manifest.json"))
+
+
+def test_job_routes_use_sync_handlers(tmp_path):
+    app = create_app(db_path=tmp_path / "evolution.db", artifact_root=tmp_path / "artifacts")
+
+    for path in (
+        "/v1/jobs",
+        "/v1/jobs/claim",
+        "/v1/jobs/{job_id}/heartbeat",
+        "/v1/jobs/{job_id}/complete",
+        "/v1/jobs/{job_id}/fail",
+    ):
+        route = next(route for route in app.routes if getattr(route, "path", None) == path)
+        assert inspect.iscoroutinefunction(route.endpoint) is False
+
+
+def test_worker_client_posts_job_protocol_methods():
+    requests: list[tuple[str, str, dict[str, object]]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content.decode())
+        requests.append((request.method, request.url.path, payload))
+        if request.url.path == "/v1/jobs/claim":
+            return httpx.Response(
+                200,
+                json={
+                    "job": {
+                        "job_id": "job_1",
+                        "lease_id": "lease_1",
+                        "job_type": "text_memory_mining",
+                        "method": "mock",
+                        "input_artifacts": [],
+                        "config": {},
+                    }
+                },
+            )
+        return httpx.Response(200, json={"ok": True})
+
+    transport = httpx.MockTransport(handler)
+    with EvolutionWorkerClient("http://evolution.test", transport=transport) as worker:
+        claim = worker.claim(
+            "worker_1",
+            ["text_memory_mining"],
+            lease_seconds=30,
+        )
+        heartbeat = worker.heartbeat("job_1", "lease_1", progress=0.5, message="halfway")
+        complete = worker.complete(
+            "job_1",
+            "lease_1",
+            artifacts=[
+                {
+                    "type": "text_memory",
+                    "name": "client memory",
+                    "uri": "file:///tmp/client-memory.md",
+                }
+            ],
+            report={"ok": True},
+        )
+        failed = worker.fail("job_2", "lease_2", "worker command failed", retryable=False)
+
+    assert claim is not None
+    assert claim["job_id"] == "job_1"
+    assert heartbeat == {"ok": True}
+    assert complete == {"ok": True}
+    assert failed == {"ok": True}
+    assert requests == [
+        (
+            "POST",
+            "/v1/jobs/claim",
+            {
+                "worker_id": "worker_1",
+                "capabilities": ["text_memory_mining"],
+                "lease_seconds": 30,
+            },
+        ),
+        (
+            "POST",
+            "/v1/jobs/job_1/heartbeat",
+            {"lease_id": "lease_1", "progress": 0.5, "message": "halfway"},
+        ),
+        (
+            "POST",
+            "/v1/jobs/job_1/complete",
+            {
+                "lease_id": "lease_1",
+                "artifacts": [
+                    {
+                        "type": "text_memory",
+                        "name": "client memory",
+                        "uri": "file:///tmp/client-memory.md",
+                    }
+                ],
+                "report": {"ok": True},
+            },
+        ),
+        (
+            "POST",
+            "/v1/jobs/job_2/fail",
+            {"lease_id": "lease_2", "error": "worker command failed", "retryable": False},
+        ),
+    ]
