@@ -9,6 +9,7 @@ import shutil
 from contextlib import suppress
 from pathlib import Path
 from tempfile import mkdtemp
+from typing import Any
 
 import httpx
 
@@ -36,7 +37,7 @@ from polar.rollout.timer import StageTimer
 from polar.runtime.base import BaseRuntime
 from polar.runtime.factory import create_runtime
 from polar.runtime.models import ExecInput, RuntimeSpec
-from polar.trajectory.models import EvalResult, EvaluatorSpec, StrategySpec, Trajectory
+from polar.trajectory.models import EvalResult, EvaluatorSpec, StrategySpec, Trace, Trajectory
 from polar.trajectory.registry import StrategyRegistry
 from polar_evolution.client import EvolutionClient
 
@@ -94,6 +95,50 @@ def _existing_evolution_metadata(metadata: dict) -> dict:
     if isinstance(existing, dict):
         return dict(existing)
     return {}
+
+
+def build_evolution_session_event(result: SessionResult) -> dict:
+    metadata = dict(result.metadata or {})
+    trajectory_metadata = dict(result.trajectory.metadata or {})
+    return {
+        "source": "polar",
+        "event_type": "polar.session_completed",
+        "source_event_id": f"session:{result.session_id}",
+        "task_id": result.task_id,
+        "session_id": result.session_id,
+        "policy_version": _metadata_value(
+            metadata,
+            trajectory_metadata,
+            "policy_version",
+        ),
+        "rollout_step": _metadata_value(
+            metadata,
+            trajectory_metadata,
+            "rollout_step",
+        ),
+        "agent": metadata.get("agent") or {},
+        "base_model": trajectory_metadata.get("model_used"),
+        "reward": _mean_trace_reward(result.trajectory.traces),
+        "status": str(result.status),
+        "payload": {"session_result": result.model_dump(mode="json")},
+    }
+
+
+def _metadata_value(
+    metadata: dict[str, Any],
+    fallback_metadata: dict[str, Any],
+    key: str,
+) -> Any:
+    if key in metadata and metadata[key] is not None:
+        return metadata[key]
+    return fallback_metadata.get(key)
+
+
+def _mean_trace_reward(traces: list[Trace]) -> float | None:
+    rewards = [trace.reward for trace in traces if trace.reward is not None]
+    if not rewards:
+        return None
+    return float(sum(rewards) / len(rewards))
 
 
 class GatewayNodeManager:
@@ -481,6 +526,30 @@ class GatewayNodeManager:
             )
             return {}
 
+    async def _export_evolution_event(self, result: SessionResult) -> None:
+        if (
+            self.evolution is None
+            or not self.evolution.enabled
+            or not self.evolution.event_export.enabled
+            or self.evolution_client is None
+        ):
+            return
+        try:
+            await asyncio.wait_for(
+                self.evolution_client.export_event(
+                    build_evolution_session_event(result)
+                ),
+                timeout=self.evolution.event_export.timeout_seconds,
+            )
+        except Exception as exc:
+            if not self.evolution.event_export.fail_open:
+                raise
+            logger.warning(
+                "Evolution event export failed for session %s: %s",
+                result.session_id,
+                exc,
+            )
+
     async def _run_exec_inputs(
         self,
         runtime: BaseRuntime,
@@ -673,6 +742,7 @@ class GatewayNodeManager:
                 }
             )
             self.session_registry.set_result(request.session_id, normalized)
+            await self._export_evolution_event(normalized)
             self.storage.delete_session(request.session_id)
             if await self._push_result(request.callback_url, normalized):
                 # Rollout server has acked; free the heavy payload but keep

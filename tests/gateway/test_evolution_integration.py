@@ -10,11 +10,21 @@ from polar.agent.base import BaseHarness
 from polar.agent.models import AgentSpec
 from polar.config import EvolutionConfig
 from polar.gateway.dispatcher import ManagedSession
-from polar.gateway.node import GatewayNodeManager, write_evolution_context_files
-from polar.rollout.models import SessionDispatchRequest
+from polar.gateway.node import (
+    GatewayNodeManager,
+    build_evolution_session_event,
+    write_evolution_context_files,
+)
+from polar.rollout.models import (
+    SessionDispatchRequest,
+    SessionResult,
+    SessionStatus,
+    SessionTiming,
+)
 from polar.rollout.timer import StageTimer
 from polar.runtime.base import BaseRuntime
 from polar.runtime.models import ExecInput, ExecResult, RuntimeSpec
+from polar.trajectory.models import Trajectory
 
 
 class FakeHarness(BaseHarness):
@@ -35,20 +45,373 @@ class RunStepHarness(BaseHarness):
 
 
 class FakeEvolutionClient:
-    def __init__(self, context: dict | None = None, error: Exception | None = None) -> None:
+    def __init__(
+        self,
+        context: dict | None = None,
+        error: Exception | None = None,
+        export_error: Exception | None = None,
+        export_delay: float = 0.0,
+        calls: list[str] | None = None,
+    ) -> None:
         self.context = context or {
             "context_id": "ctx_1",
             "memory": {"rendered_text": "Remember parser precedence."},
             "adapter_merge_spec": {"merge_mode": "reference_only"},
         }
         self.error = error
+        self.export_error = export_error
+        self.export_delay = export_delay
+        self.calls = calls
         self.payloads: list[dict] = []
+        self.exported_events: list[dict] = []
 
     async def resolve_context(self, payload: dict) -> dict:
         self.payloads.append(payload)
         if self.error is not None:
             raise self.error
         return self.context
+
+    async def export_event(self, payload: dict) -> dict:
+        if self.calls is not None:
+            self.calls.append("export")
+        self.exported_events.append(payload)
+        if self.export_delay:
+            await asyncio.sleep(self.export_delay)
+        if self.export_error is not None:
+            raise self.export_error
+        return {"accepted": True}
+
+
+def test_build_evolution_session_event():
+    result = SessionResult(
+        session_id="ses_1",
+        task_id="task_1",
+        status=SessionStatus.COMPLETED,
+        trajectory=Trajectory(
+            status="COMPLETED",
+            traces=[],
+            metadata={"model_used": "Qwen/Qwen3.6-27B"},
+        ),
+        timing=SessionTiming(),
+        node_id="node-a",
+        metadata={"policy_version": "policy_1", "rollout_step": 4},
+    )
+
+    event = build_evolution_session_event(result)
+
+    assert event["source"] == "polar"
+    assert event["event_type"] == "polar.session_completed"
+    assert event["source_event_id"] == "session:ses_1"
+    assert event["policy_version"] == "policy_1"
+    assert event["rollout_step"] == 4
+    assert event["payload"]["session_result"]["session_id"] == "ses_1"
+
+
+def test_build_evolution_session_event_preserves_explicit_falsey_metadata():
+    result = SessionResult(
+        session_id="ses_1",
+        task_id="task_1",
+        status=SessionStatus.COMPLETED,
+        trajectory=Trajectory(
+            status="COMPLETED",
+            traces=[],
+            metadata={
+                "model_used": "Qwen/Qwen3.6-27B",
+                "policy_version": "trajectory_policy",
+                "rollout_step": 9,
+            },
+        ),
+        timing=SessionTiming(),
+        node_id="node-a",
+        metadata={"policy_version": "", "rollout_step": 0},
+    )
+
+    event = build_evolution_session_event(result)
+
+    assert event["policy_version"] == ""
+    assert event["rollout_step"] == 0
+
+
+def _session_result(
+    *,
+    session_id: str = "ses_1",
+    metadata: dict | None = None,
+) -> SessionResult:
+    return SessionResult(
+        session_id=session_id,
+        task_id="task_1",
+        status=SessionStatus.COMPLETED,
+        trajectory=Trajectory(
+            status="COMPLETED",
+            traces=[],
+            metadata={"model_used": "Qwen/Qwen3.6-27B"},
+        ),
+        timing=SessionTiming(),
+        node_id="node-a",
+        metadata=metadata or {"policy_version": "policy_1", "rollout_step": 4},
+    )
+
+
+@pytest.mark.asyncio
+async def test_export_evolution_event_sends_built_event_when_enabled():
+    client = FakeEvolutionClient()
+    manager = GatewayNodeManager.__new__(GatewayNodeManager)
+    manager.evolution = EvolutionConfig(enabled=True)
+    manager.evolution_client = client
+
+    await manager._export_evolution_event(_session_result())
+
+    assert len(client.exported_events) == 1
+    assert client.exported_events[0]["event_type"] == "polar.session_completed"
+    assert client.exported_events[0]["source_event_id"] == "session:ses_1"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "evolution",
+    [
+        EvolutionConfig(enabled=False),
+        EvolutionConfig(enabled=True, event_export={"enabled": False}),
+    ],
+)
+async def test_export_evolution_event_skips_when_disabled(evolution):
+    client = FakeEvolutionClient()
+    manager = GatewayNodeManager.__new__(GatewayNodeManager)
+    manager.evolution = evolution
+    manager.evolution_client = client
+
+    await manager._export_evolution_event(_session_result())
+
+    assert client.exported_events == []
+
+
+@pytest.mark.asyncio
+async def test_export_evolution_event_fail_open_returns(caplog):
+    client = FakeEvolutionClient(export_error=RuntimeError("backend down"))
+    manager = GatewayNodeManager.__new__(GatewayNodeManager)
+    manager.evolution = EvolutionConfig(
+        enabled=True,
+        event_export={"fail_open": True},
+    )
+    manager.evolution_client = client
+
+    await manager._export_evolution_event(_session_result())
+
+    assert client.exported_events
+    assert "Evolution event export failed for session ses_1" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_export_evolution_event_fail_closed_raises():
+    client = FakeEvolutionClient(export_error=RuntimeError("backend down"))
+    manager = GatewayNodeManager.__new__(GatewayNodeManager)
+    manager.evolution = EvolutionConfig(
+        enabled=True,
+        event_export={"fail_open": False},
+    )
+    manager.evolution_client = client
+
+    with pytest.raises(RuntimeError, match="backend down"):
+        await manager._export_evolution_event(_session_result())
+
+
+@pytest.mark.asyncio
+async def test_export_evolution_event_timeout_fail_open_returns(caplog):
+    client = FakeEvolutionClient(export_delay=0.2)
+    manager = GatewayNodeManager.__new__(GatewayNodeManager)
+    manager.evolution = EvolutionConfig(
+        enabled=True,
+        event_export={"fail_open": True, "timeout_seconds": 0.01},
+    )
+    manager.evolution_client = client
+
+    started = asyncio.get_running_loop().time()
+    await manager._export_evolution_event(_session_result())
+    elapsed = asyncio.get_running_loop().time() - started
+
+    assert elapsed < 0.15
+    assert client.exported_events
+    assert "Evolution event export failed for session ses_1" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_export_evolution_event_timeout_fail_closed_raises():
+    client = FakeEvolutionClient(export_delay=0.2)
+    manager = GatewayNodeManager.__new__(GatewayNodeManager)
+    manager.evolution = EvolutionConfig(
+        enabled=True,
+        event_export={"fail_open": False, "timeout_seconds": 0.01},
+    )
+    manager.evolution_client = client
+
+    started = asyncio.get_running_loop().time()
+    with pytest.raises(TimeoutError):
+        await manager._export_evolution_event(_session_result())
+    elapsed = asyncio.get_running_loop().time() - started
+
+    assert elapsed < 0.15
+    assert client.exported_events
+
+
+class RecordingSessionRegistry:
+    def __init__(self, calls: list[str]) -> None:
+        self.calls = calls
+        self.results: list[SessionResult] = []
+        self.cleared: list[str] = []
+
+    def set_result(self, session_id: str, result: SessionResult) -> None:
+        self.calls.append("set_result")
+        self.results.append(result)
+
+    def clear_result_payload(self, session_id: str) -> None:
+        self.calls.append("clear_result_payload")
+        self.cleared.append(session_id)
+
+
+class RecordingStorage:
+    def __init__(self, calls: list[str]) -> None:
+        self.calls = calls
+        self.deleted: list[str] = []
+
+    def delete_session(self, session_id: str) -> None:
+        self.calls.append("delete_session")
+        self.deleted.append(session_id)
+
+
+def _postrun_manager(
+    *,
+    calls: list[str],
+    evolution: EvolutionConfig | None = None,
+    evolution_client: FakeEvolutionClient | None = None,
+):
+    manager = GatewayNodeManager.__new__(GatewayNodeManager)
+    manager.node_id = "node-a"
+    manager.evolution = evolution
+    manager.evolution_client = evolution_client
+    manager.session_registry = RecordingSessionRegistry(calls)
+    manager.storage = RecordingStorage(calls)
+
+    async def run_postrun_steps(managed):
+        calls.append("postrun_steps")
+
+    async def drain_eval_prewarm_task(managed):
+        calls.append("drain_eval")
+        return None
+
+    async def push_result(callback_url, result):
+        calls.append("callback_push")
+        return True
+
+    async def remove_session_dir(session_dir, session_id):
+        calls.append("remove_session_dir")
+
+    manager._run_postrun_steps = run_postrun_steps
+    manager._drain_eval_prewarm_task = drain_eval_prewarm_task
+    manager._push_result = push_result
+    manager._remove_session_dir_best_effort = remove_session_dir
+    return manager
+
+
+def _managed_postrun_session(tmp_path, result: SessionResult) -> ManagedSession:
+    return ManagedSession(
+        request=SessionDispatchRequest(
+            session_id=result.session_id,
+            task_id=result.task_id,
+            instruction="Do work.",
+            remaining_timeout_seconds=60,
+            agent=AgentSpec(harness="fake"),
+            callback_url="http://rollout.test/callback",
+        ),
+        timer=StageTimer(),
+        session_dir=tmp_path,
+        artifacts_dir=tmp_path / "artifacts",
+        final_result=result,
+    )
+
+
+@pytest.mark.asyncio
+async def test_handle_postrun_exports_after_set_result_before_cleanup_and_callback(
+    tmp_path,
+):
+    calls: list[str] = []
+    client = FakeEvolutionClient(calls=calls)
+    manager = _postrun_manager(
+        calls=calls,
+        evolution=EvolutionConfig(enabled=True),
+        evolution_client=client,
+    )
+
+    await manager._handle_postrun(_managed_postrun_session(tmp_path, _session_result()))
+
+    assert calls == [
+        "postrun_steps",
+        "drain_eval",
+        "set_result",
+        "export",
+        "delete_session",
+        "callback_push",
+        "clear_result_payload",
+        "remove_session_dir",
+    ]
+    assert client.exported_events[0]["source_event_id"] == "session:ses_1"
+
+
+@pytest.mark.asyncio
+async def test_handle_postrun_fail_open_export_error_still_cleans_and_callbacks(
+    tmp_path,
+):
+    calls: list[str] = []
+    client = FakeEvolutionClient(
+        export_error=RuntimeError("backend down"),
+        calls=calls,
+    )
+    manager = _postrun_manager(
+        calls=calls,
+        evolution=EvolutionConfig(enabled=True, event_export={"fail_open": True}),
+        evolution_client=client,
+    )
+
+    await manager._handle_postrun(_managed_postrun_session(tmp_path, _session_result()))
+
+    assert calls == [
+        "postrun_steps",
+        "drain_eval",
+        "set_result",
+        "export",
+        "delete_session",
+        "callback_push",
+        "clear_result_payload",
+        "remove_session_dir",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_handle_postrun_fail_closed_export_error_skips_delete_and_callback(
+    tmp_path,
+):
+    calls: list[str] = []
+    client = FakeEvolutionClient(
+        export_error=RuntimeError("backend down"),
+        calls=calls,
+    )
+    manager = _postrun_manager(
+        calls=calls,
+        evolution=EvolutionConfig(enabled=True, event_export={"fail_open": False}),
+        evolution_client=client,
+    )
+
+    with pytest.raises(RuntimeError, match="backend down"):
+        await manager._handle_postrun(
+            _managed_postrun_session(tmp_path, _session_result())
+        )
+
+    assert calls == [
+        "postrun_steps",
+        "drain_eval",
+        "set_result",
+        "export",
+        "remove_session_dir",
+    ]
 
 
 class FakeRuntime:
