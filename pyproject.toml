@@ -33,6 +33,7 @@ swebench = [
 
 [project.scripts]
 polar = "polar.cli:main"
+polar-evolution = "polar_evolution.cli:main"
 
 [dependency-groups]
 dev = [
@@ -51,7 +52,7 @@ package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
-include = ["polar*", "slime_bridge*"]
+include = ["polar*", "slime_bridge*", "polar_evolution*"]
 
 [tool.setuptools.package-data]
 polar = [
