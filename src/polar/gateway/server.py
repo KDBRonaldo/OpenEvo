@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-import hashlib
 import json
 import logging
 import os
@@ -42,7 +41,6 @@ from polar.gateway.transform import TransformManager
 from polar.gateway.transform.base import BaseTransformer
 from polar.platform.events import SSE_HEADERS, EventBus
 from polar.rollout.models import SessionDispatchRequest, SessionDispatchResponse, SessionStatus
-from polar.runtime.models import RuntimeSpec
 from polar.trajectory.registry import default_builder_registry, default_evaluator_registry
 
 logging.basicConfig(

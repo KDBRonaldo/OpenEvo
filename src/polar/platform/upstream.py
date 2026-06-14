@@ -30,7 +30,7 @@ class UpstreamClient:
     async def start(self) -> None:
         async with self._lock:
             if self._client is None:
-                self._client = httpx.AsyncClient(timeout=self._timeout)
+                self._client = httpx.AsyncClient(timeout=self._timeout, trust_env=False)
 
     async def close(self) -> None:
         async with self._lock:

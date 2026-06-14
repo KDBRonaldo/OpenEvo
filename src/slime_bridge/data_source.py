@@ -6,7 +6,9 @@ import math
 
 try:
     from slime.rollout.data_source import RolloutDataSourceWithBuffer
-except ImportError as _SLIME_IMPORT_ERROR:
+except ImportError as exc:
+    _SLIME_IMPORT_ERROR = exc
+
     class RolloutDataSourceWithBuffer:  # type: ignore[no-redef]
         def __init__(self, *args, **kwargs) -> None:
             raise ImportError(
