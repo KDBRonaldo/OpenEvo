@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import tomllib
 from pathlib import Path
 
 import pytest
 
-from polar.agent.models import AgentSpec
+from polar.agent.models import AgentSpec, MCPServerSpec
 from polar.agent.presets.claude_code import ClaudeCodeHarness
 from polar.agent.presets.codex import CodexHarness
 from polar.agent.presets.openhands_sdk import OpenHandsSdkHarness
@@ -66,6 +67,14 @@ class RecordingRuntime(BaseRuntime):
         return None
 
 
+def _codex_config_toml(commands: list[str]) -> str:
+    marker = "config.toml << 'POLARCFG'\n"
+    for command in commands:
+        if marker in command:
+            return command.split(marker, 1)[1].rsplit("\nPOLARCFG", 1)[0]
+    raise AssertionError("Codex config.toml write command not found")
+
+
 @pytest.mark.asyncio
 async def test_codex_setup_installs_static_and_evolution_skills(tmp_path):
     harness = CodexHarness(
@@ -83,6 +92,90 @@ async def test_codex_setup_installs_static_and_evolution_skills(tmp_path):
     joined = "\n".join(copy_commands)
     assert "cp -r /polar/static-skills/* $HOME/.agents/skills/" in joined
     assert "cp -r /polar/session/evolution/skills/* $HOME/.agents/skills/" in joined
+
+
+@pytest.mark.asyncio
+async def test_codex_setup_overwrites_config_without_mcp_servers(tmp_path):
+    harness = CodexHarness(
+        AgentSpec(
+            harness="codex",
+            env={"CODEX_HOME": "/polar/session/preauthenticated-codex"},
+        )
+    )
+    runtime = RecordingRuntime(tmp_path)
+
+    await harness.setup(runtime)
+
+    joined = "\n".join(runtime.commands)
+    assert "cat > /polar/session/preauthenticated-codex/config.toml" in joined
+    assert '[mcp_servers."' not in joined
+
+
+@pytest.mark.asyncio
+async def test_codex_setup_uses_configured_codex_home_for_mcp_servers(tmp_path):
+    harness = CodexHarness(
+        AgentSpec(
+            harness="codex",
+            env={"CODEX_HOME": "/polar/session/preauthenticated-codex"},
+            mcp_servers=[
+                MCPServerSpec(
+                    name="repo-tools",
+                    transport="stdio",
+                    command="python",
+                    args=["-m", "repo_tools"],
+                )
+            ],
+        )
+    )
+    runtime = RecordingRuntime(tmp_path)
+
+    await harness.setup(runtime)
+
+    joined = "\n".join(runtime.commands)
+    assert "mkdir -p /polar/session/preauthenticated-codex" in joined
+    assert "cat > /polar/session/preauthenticated-codex/config.toml" in joined
+    assert "cat > /polar/session/.codex/config.toml" not in joined
+    assert '[mcp_servers."repo-tools"]' in joined
+
+
+@pytest.mark.asyncio
+async def test_codex_setup_escapes_mcp_config_toml_strings(tmp_path):
+    server_name = 'repo"tools\\alpha'
+    remote_server_name = "remote.server"
+    command = 'python"tool'
+    args = ["-m", "repo\\tools", 'flag "quoted"']
+    url = 'https://example.test/mcp?label="x"&path=repo\\tools'
+    harness = CodexHarness(
+        AgentSpec(
+            harness="codex",
+            mcp_servers=[
+                MCPServerSpec(
+                    name=server_name,
+                    transport="stdio",
+                    command=command,
+                    args=args,
+                ),
+                MCPServerSpec(
+                    name=remote_server_name,
+                    transport="streamable-http",
+                    url=url,
+                ),
+            ],
+        )
+    )
+    runtime = RecordingRuntime(tmp_path)
+
+    await harness.setup(runtime)
+
+    config = tomllib.loads(_codex_config_toml(runtime.commands))
+    assert config["mcp_servers"][server_name] == {
+        "command": command,
+        "args": args,
+    }
+    assert config["mcp_servers"][remote_server_name] == {
+        "url": url,
+        "type": "streamable-http",
+    }
 
 
 def test_codex_run_steps_defaults_to_proxy_auth_mode():

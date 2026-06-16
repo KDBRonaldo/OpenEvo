@@ -9,6 +9,9 @@ import sqlite3
 import pytest
 
 import polar_evolution.store as store_module
+from polar.gateway.node import build_evolution_session_event
+from polar.rollout.models import SessionResult, SessionStatus, SessionTiming
+from polar.trajectory.models import Trace, Trajectory
 from polar_evolution.models import (
     ArtifactRegisterRequest,
     ArtifactType,
@@ -108,9 +111,10 @@ def test_create_dataset_filters_events(tmp_path):
     assert [row["event_id"] for row in dataset_event_rows] == [good_event.event_id]
 
     manifest_path = Path(dataset_row["manifest_path"])
-    assert manifest_path == (
-        tmp_path / "artifacts" / "datasets" / response.dataset_id / "manifest.json"
-    ).resolve()
+    assert (
+        manifest_path
+        == (tmp_path / "artifacts" / "datasets" / response.dataset_id / "manifest.json").resolve()
+    )
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     records_path = manifest_path.parent / "records.jsonl"
     assert manifest == {
@@ -185,6 +189,97 @@ def test_create_dataset_filters_events(tmp_path):
     ]
     assert worker_records[0]["event_id"] == good_event.event_id
     assert worker_records[0]["traces"] == [{"reward": 1.0}]
+
+
+def test_create_dataset_accepts_subscription_transcript_trajectory_event(tmp_path):
+    store = EvolutionStore(db_path=tmp_path / "evolution.db", artifact_root=tmp_path / "artifacts")
+    store.initialize()
+    session_result = SessionResult(
+        session_id="session_sub",
+        task_id="task_sub",
+        status=SessionStatus.COMPLETED,
+        trajectory=Trajectory(
+            status="COMPLETED",
+            metadata={
+                "builder": "agent_transcript",
+                "capture_mode": "transcript",
+                "token_level_metrics_available": False,
+                "trace_count": 1,
+            },
+            traces=[
+                Trace(
+                    prompt_messages=[{"role": "user", "content": "Do work."}],
+                    response_messages=[
+                        {"role": "assistant", "content": "Used subscription mode."}
+                    ],
+                    finish_reason="transcript",
+                    metadata={
+                        "capture_mode": "transcript",
+                        "token_level_metrics_available": False,
+                        "transcript_path": "/tmp/session/logs/agent/step.00.stdout.log",
+                    },
+                )
+            ],
+        ),
+        timing=SessionTiming(),
+        node_id="node-a",
+        metadata={
+            "policy_version": "policy_sub",
+            "rollout_step": 5,
+            "agent": {"harness": "codex", "model_name": "gpt-5.5"},
+        },
+    )
+    event = store.ingest_event(
+        EventIngestRequest.model_validate(build_evolution_session_event(session_result))
+    )
+
+    response = store.create_dataset(
+        DatasetCreateRequest(
+            name="subscription_transcript",
+            purpose="memory_mining",
+            query={
+                "event_types": ["polar.session_completed"],
+                "status": ["COMPLETED"],
+                "policy_version": "policy_sub",
+            },
+        )
+    )
+
+    assert response.event_count == 1
+    assert response.trace_count == 1
+
+    with store.connect() as conn:
+        dataset_row = conn.execute(
+            "SELECT * FROM datasets WHERE dataset_id = ?",
+            (response.dataset_id,),
+        ).fetchone()
+
+    manifest_path = Path(dataset_row["manifest_path"])
+    records_path = manifest_path.parent / "records.jsonl"
+    records = [
+        json.loads(line)
+        for line in records_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+    assert records[0]["event_id"] == event.event_id
+    assert records[0]["agent_harness"] == "codex"
+    assert records[0]["agent_model"] == "gpt-5.5"
+    assert records[0]["trace_count"] == 1
+    trace = records[0]["traces"][0]
+    assert trace["prompt_messages"] == [{"role": "user", "content": "Do work."}]
+    assert trace["response_messages"] == [
+        {"role": "assistant", "content": "Used subscription mode."}
+    ]
+    assert trace["response_ids"] == []
+    assert trace["loss_mask"] == []
+    assert trace["response_logprobs"] is None
+    assert trace["metadata"]["capture_mode"] == "transcript"
+    assert trace["metadata"]["token_level_metrics_available"] is False
+    assert (
+        records[0]["payload"]["session_result"]["trajectory"]["metadata"]["builder"]
+        == "agent_transcript"
+    )
 
 
 def test_create_dataset_rejects_non_finite_query_without_writes(tmp_path):
@@ -302,9 +397,7 @@ def test_create_dataset_stops_selecting_events_after_trace_limit(tmp_path):
             source_event_id="session:first",
             status="COMPLETED",
             payload={
-                "session_result": {
-                    "trajectory": {"traces": [{"reward": 1.0}, {"reward": 0.9}]}
-                }
+                "session_result": {"trajectory": {"traces": [{"reward": 1.0}, {"reward": 0.9}]}}
             },
         )
     )
@@ -366,9 +459,7 @@ def test_create_dataset_keeps_single_event_that_exceeds_trace_limit(tmp_path):
             status="COMPLETED",
             payload={
                 "session_result": {
-                    "trajectory": {
-                        "traces": [{"reward": 1.0}, {"reward": 0.9}, {"reward": 0.8}]
-                    }
+                    "trajectory": {"traces": [{"reward": 1.0}, {"reward": 0.9}, {"reward": 0.8}]}
                 }
             },
         )
@@ -694,7 +785,9 @@ def test_job_failure_records_error(tmp_path):
     store = EvolutionStore(db_path=tmp_path / "evolution.db", artifact_root=tmp_path / "artifacts")
     store.initialize()
     job = store.create_job(JobCreateRequest(method="mock", job_type="text_memory_mining"))
-    claim = store.claim_job(WorkerClaimRequest(worker_id="worker_1", capabilities=["text_memory_mining"]))
+    claim = store.claim_job(
+        WorkerClaimRequest(worker_id="worker_1", capabilities=["text_memory_mining"])
+    )
     assert claim.job is not None
 
     result = store.fail_job(
@@ -738,7 +831,9 @@ def test_job_lease_mismatch_is_rejected_without_state_change(tmp_path):
     store = EvolutionStore(db_path=tmp_path / "evolution.db", artifact_root=tmp_path / "artifacts")
     store.initialize()
     job = store.create_job(JobCreateRequest(method="mock", job_type="text_memory_mining"))
-    claim = store.claim_job(WorkerClaimRequest(worker_id="worker_1", capabilities=["text_memory_mining"]))
+    claim = store.claim_job(
+        WorkerClaimRequest(worker_id="worker_1", capabilities=["text_memory_mining"])
+    )
     assert claim.job is not None
 
     with pytest.raises(ValueError, match="invalid lease"):
@@ -824,7 +919,9 @@ def test_heartbeat_renews_lease_expiration(tmp_path):
 
     result = store.heartbeat_job(
         job.job_id,
-        WorkerHeartbeatRequest(lease_id=claim.job.lease_id, progress=0.25, message="still running"),
+        WorkerHeartbeatRequest(
+            lease_id=claim.job.lease_id, progress=0.25, message="still running"
+        ),
     )
 
     with store.connect() as conn:
@@ -841,7 +938,9 @@ def test_complete_job_invalid_artifact_marks_failed_and_cleans_registered_artifa
     store = EvolutionStore(db_path=tmp_path / "evolution.db", artifact_root=tmp_path / "artifacts")
     store.initialize()
     job = store.create_job(JobCreateRequest(method="mock", job_type="text_memory_mining"))
-    claim = store.claim_job(WorkerClaimRequest(worker_id="worker_1", capabilities=["text_memory_mining"]))
+    claim = store.claim_job(
+        WorkerClaimRequest(worker_id="worker_1", capabilities=["text_memory_mining"])
+    )
     assert claim.job is not None
 
     with pytest.raises(ValueError, match="non-finite float"):
@@ -965,7 +1064,9 @@ def test_complete_job_final_update_failure_marks_failed_and_cleans_artifacts(tmp
             input_artifact_ids=[dataset.artifact_id],
         )
     )
-    claim = store.claim_job(WorkerClaimRequest(worker_id="worker_1", capabilities=["text_memory_mining"]))
+    claim = store.claim_job(
+        WorkerClaimRequest(worker_id="worker_1", capabilities=["text_memory_mining"])
+    )
     assert claim.job is not None
     with store.connect() as conn:
         conn.execute(
@@ -1033,9 +1134,13 @@ def test_complete_job_expired_final_lease_cleans_artifacts_without_failing_job(
 
     def expire_lease_after_register(request: ArtifactRegisterRequest):
         artifact = original_register_artifact(request)
-        expired_at = (datetime.now(UTC) - timedelta(seconds=1)).isoformat().replace(
-            "+00:00",
-            "Z",
+        expired_at = (
+            (datetime.now(UTC) - timedelta(seconds=1))
+            .isoformat()
+            .replace(
+                "+00:00",
+                "Z",
+            )
         )
         with store.connect() as conn:
             conn.execute(

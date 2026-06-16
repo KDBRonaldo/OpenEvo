@@ -6,10 +6,23 @@ Builders convert a captured `CompletionSession` into a `Trajectory` of trainable
 ## Main files
 
 - `base.py`: the builder contract (`async build(session) -> Trajectory`).
+- `agent_transcript.py`: one tokenless trace from an agent stdout transcript.
 - `per_request.py`: one trace per completion.
 - `prefix_merging.py`: stitch an append-only agent chain into one token-level trace.
 - `record_utils.py`: helpers to pull messages, token ids, logprobs, and metadata
   out of a completion record.
+
+## `agent_transcript`
+
+`agent_transcript` 是不经过 Polar proxy 的 harness run 的 fallback builder，
+例如 Codex subscription auth mode。它读取 `agent_result.metadata.log_dir` 和
+`last_step`，加载 `step.xx.stdout.log`，并生成一个包含 transcript message 的
+`Trace`。
+
+它不会创建 token-level 训练数据。生成的 trace 中 `response_ids` 为空，
+`loss_mask` 为空，`response_logprobs=None`。trajectory 和 trace metadata 会设置
+`capture_mode="transcript"` 和 `token_level_metrics_available=false`，因此下游
+RL 代码可以过滤它，而 skill/memory evolution 仍然可以使用 transcript。
 
 ## `per_request`
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import shlex
 
 from polar.agent.base import BaseHarness
@@ -29,8 +30,12 @@ class CodexHarness(BaseHarness):
         # expand in docker exec -e.
         self._codex_home = f"{RUNTIME_SESSION_DIR}/.codex"
 
+    def _codex_home_path(self) -> str:
+        return _nonempty_env_path(self.env.get("CODEX_HOME")) or self._codex_home
+
     async def setup(self, runtime: BaseRuntime) -> None:
-        await runtime.exec(f"mkdir -p {self._codex_home}")
+        codex_home = self._codex_home_path()
+        await runtime.exec(f"mkdir -p {shlex.quote(codex_home)}")
 
         # Host-uploaded files keep the host UID, which blocks codex's
         # exec_command-based edits (cat/tee/open) on a non-root container
@@ -41,23 +46,21 @@ class CodexHarness(BaseHarness):
             f'sudo chown -R "$(id -u):$(id -g)" {shlex.quote(workdir)} 2>/dev/null || true'
         )
 
-        # Register MCP servers via TOML config
-        if self.mcp_servers:
-            toml_lines: list[str] = []
-            for server in self.mcp_servers:
-                toml_lines.append(f'[mcp_servers."{server.name}"]')
-                if server.transport == "stdio":
-                    toml_lines.append(f'command = "{server.command}"')
-                    if server.args:
-                        args_str = ", ".join(f'"{a}"' for a in server.args)
-                        toml_lines.append(f"args = [{args_str}]")
-                else:
-                    toml_lines.append(f'url = "{server.url}"')
-                    toml_lines.append(f'type = "{server.transport}"')
-            toml_content = "\n".join(toml_lines)
-            await runtime.exec(
-                f"cat > {self._codex_home}/config.toml << 'POLARCFG'\n{toml_content}\nPOLARCFG"
-            )
+        toml_lines: list[str] = []
+        for server in self.mcp_servers:
+            toml_lines.append(f"[mcp_servers.{_toml_string(server.name)}]")
+            if server.transport == "stdio":
+                toml_lines.append(f"command = {_toml_string(server.command or '')}")
+                if server.args:
+                    args_str = ", ".join(_toml_string(arg) for arg in server.args)
+                    toml_lines.append(f"args = [{args_str}]")
+            else:
+                toml_lines.append(f"url = {_toml_string(server.url or '')}")
+                toml_lines.append(f"type = {_toml_string(server.transport)}")
+        toml_content = "\n".join(toml_lines)
+        await runtime.exec(
+            f"cat > {shlex.quote(codex_home)}/config.toml << 'POLARCFG'\n{toml_content}\nPOLARCFG"
+        )
 
         # Copy skills
         for skills_path in self.effective_skill_paths():
@@ -74,7 +77,7 @@ class CodexHarness(BaseHarness):
             subscription_aliases=(self._AUTH_MODE_CHATGPT_SUBSCRIPTION,),
         )
 
-        codex_home = self.env.get("CODEX_HOME") or self._codex_home
+        codex_home = self._codex_home_path()
         env: dict[str, str] = {
             **self.env,
             "CODEX_HOME": codex_home,
@@ -148,3 +151,14 @@ def _cli_model_name(model_name: str | None) -> str:
         if model.startswith(prefix):
             return model[len(prefix) :]
     return model
+
+
+def _nonempty_env_path(value: str | None) -> str | None:
+    if value is None:
+        return None
+    stripped = value.strip()
+    return stripped or None
+
+
+def _toml_string(value: str) -> str:
+    return json.dumps(value, ensure_ascii=False)

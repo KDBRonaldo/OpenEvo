@@ -40,7 +40,14 @@ from polar.rollout.timer import StageTimer
 from polar.runtime.base import BaseRuntime
 from polar.runtime.factory import create_runtime
 from polar.runtime.models import ExecInput, RuntimeSpec
-from polar.trajectory.models import EvalResult, EvaluatorSpec, StrategySpec, Trace, Trajectory
+from polar.trajectory.models import (
+    CompletionSession,
+    EvalResult,
+    EvaluatorSpec,
+    StrategySpec,
+    Trace,
+    Trajectory,
+)
 from polar.trajectory.registry import StrategyRegistry
 from polar_evolution.agent_system import normalize_agent_system_target_path
 from polar_evolution.client import EvolutionClient
@@ -329,6 +336,23 @@ def _mean_trace_reward(traces: list[Trace]) -> float | None:
     if not rewards:
         return None
     return float(sum(rewards) / len(rewards))
+
+
+def _completion_session_with_agent_metadata(
+    completion_session: CompletionSession,
+    request: SessionDispatchRequest,
+    agent_result: AgentRunResult | None,
+) -> CompletionSession:
+    metadata = {
+        **dict(completion_session.metadata),
+        **dict(request.metadata),
+        "agent_harness": request.agent.harness,
+        "agent_model_name": request.agent.model_name,
+        "agent_instruction": request.instruction,
+    }
+    if agent_result is not None:
+        metadata["agent_result"] = agent_result.model_dump(mode="json")
+    return completion_session.model_copy(update={"metadata": metadata})
 
 
 class GatewayNodeManager:
@@ -951,10 +975,31 @@ class GatewayNodeManager:
         self.session_registry.set_status(request.session_id, SessionStatus.BUILDING)
         managed.timer.mark("build", "started")
         try:
+            initial_agent_result = (
+                agent_result if request.builder.strategy == "agent_transcript" else None
+            )
             trajectory = await self._await_with_budget(
-                asyncio.to_thread(self._build_trajectory, request),
+                asyncio.to_thread(
+                    self._build_trajectory,
+                    request,
+                    agent_result=initial_agent_result,
+                ),
                 managed,
             )
+            if self._should_build_agent_transcript_fallback(
+                request,
+                agent_result,
+                trajectory,
+            ):
+                trajectory = await self._await_with_budget(
+                    asyncio.to_thread(
+                        self._build_trajectory,
+                        request,
+                        agent_result=agent_result,
+                        builder_spec=StrategySpec(strategy="agent_transcript"),
+                    ),
+                    managed,
+                )
         finally:
             managed.timer.mark("build", "finished")
 
@@ -1005,15 +1050,49 @@ class GatewayNodeManager:
             metadata=dict(request.metadata),
         )
 
-    def _build_trajectory(self, request: SessionDispatchRequest) -> Trajectory:
+    def _build_trajectory(
+        self,
+        request: SessionDispatchRequest,
+        *,
+        agent_result: AgentRunResult | None = None,
+        builder_spec: StrategySpec | None = None,
+    ) -> Trajectory:
         completion_session = self.storage.load_completion_session(request.session_id)
-        builder = self.builders.create(request.builder)
+        effective_builder_spec = builder_spec or request.builder
+        if effective_builder_spec.strategy == "agent_transcript":
+            completion_session = _completion_session_with_agent_metadata(
+                completion_session,
+                request,
+                agent_result,
+            )
+        builder = self.builders.create(effective_builder_spec)
         result = builder.build(completion_session)
         if asyncio.iscoroutine(result):
             trajectory = asyncio.run(result)
         else:
             trajectory = result
         return Trajectory.model_validate(trajectory)
+
+    @staticmethod
+    def _should_build_agent_transcript_fallback(
+        request: SessionDispatchRequest,
+        agent_result: AgentRunResult,
+        trajectory: Trajectory,
+    ) -> bool:
+        if trajectory.error != "no completions":
+            return False
+        if request.builder.strategy == "agent_transcript":
+            return False
+        if request.agent.harness != "codex":
+            return False
+        settings = request.agent.settings
+        auth_mode = str(settings.get("auth_mode") or "proxy").lower()
+        if auth_mode not in {"subscription", "chatgpt_subscription"}:
+            return False
+        capture_mode = str(settings.get("capture_mode") or "transcript").lower()
+        if capture_mode not in {"transcript", "agent_transcript"}:
+            return False
+        return bool(agent_result.metadata)
 
     async def _run_eval(
         self,

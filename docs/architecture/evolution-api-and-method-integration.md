@@ -24,6 +24,22 @@ training 或评估。算法只需要遵守两个边界：
 - 输入边界：通过 datasets、input artifacts 和 `job.config` 获取数据和配置。
 - 输出边界：注册 typed artifacts，并提供 `manifest`、`compatibility`、`scores`。
 
+## Trajectory 输入形态
+
+Evolution 方法读取 dataset 或 session event 时，需要先判断 trajectory 的 capture
+形态：
+
+- Polar proxy 模式会产生 token-level traces。`response_ids`、`loss_mask` 和
+  `response_logprobs` 可用于 RL 或偏好优化等 token-level 训练。
+- Codex subscription 模式不经过 Polar proxy，无法捕捉 completion records。Gateway
+  会在无 completion 时从 agent stdout transcript 构造 `agent_transcript` trajectory。
+  这类 trajectory 明确设置 `capture_mode=transcript` 和
+  `token_level_metrics_available=false`，并且不会伪造 token ids/logprobs。
+
+因此，skill/memory/agent-system evolution 可以把 transcript trajectory 当作行为记录、
+反思材料或 memory mining 输入；需要 token-level metric 的 RL 方法必须过滤掉
+`token_level_metrics_available=false` 的 traces，或要求任务使用 Polar proxy capture。
+
 ## 核心 API
 
 | API | 用途 |

@@ -7,7 +7,8 @@ from pathlib import Path
 import pytest
 
 from polar.agent.base import BaseHarness
-from polar.agent.models import AgentSpec
+from polar.agent.models import AgentRunResult, AgentSpec
+from polar.agent.presets.codex import CodexHarness
 from polar.config import EvolutionConfig
 from polar.gateway.dispatcher import ManagedSession
 from polar.gateway.node import (
@@ -25,7 +26,8 @@ from polar.rollout.models import (
 from polar.rollout.timer import StageTimer
 from polar.runtime.base import BaseRuntime
 from polar.runtime.models import ExecInput, ExecResult, RuntimeSpec
-from polar.trajectory.models import Trajectory
+from polar.trajectory.models import CompletionRecord, CompletionSession, Trajectory
+from polar.trajectory.registry import default_builder_registry
 
 
 class FakeHarness(BaseHarness):
@@ -279,6 +281,38 @@ class RecordingStorage:
         self.deleted.append(session_id)
 
 
+class EmptyCompletionStorage:
+    def load_completion_session(self, session_id: str) -> CompletionSession:
+        return CompletionSession(session_id=session_id, metadata={"source": "subscription"})
+
+
+class OneCompletionStorage:
+    def load_completion_session(self, session_id: str) -> CompletionSession:
+        return CompletionSession(
+            session_id=session_id,
+            metadata={"source": "proxy"},
+            completions=[
+                CompletionRecord(
+                    completion_id="completion_1",
+                    request={"messages": [{"role": "user", "content": "Do work."}]},
+                    response={
+                        "choices": [
+                            {
+                                "input_token_ids": [1, 2],
+                                "token_ids": [3],
+                                "message": {
+                                    "role": "assistant",
+                                    "content": "Done.",
+                                },
+                                "logprobs": {"content": [{"token_id": 3, "logprob": -0.1}]},
+                            }
+                        ]
+                    },
+                )
+            ],
+        )
+
+
 def _postrun_manager(
     *,
     calls: list[str],
@@ -439,6 +473,7 @@ class BindMountRuntime(BaseRuntime):
             session_dir=session_dir,
         )
         self.exec_envs: list[dict[str, str]] = []
+        self.exec_commands: list[str] = []
 
     @property
     def runtime_id(self) -> str:
@@ -458,6 +493,7 @@ class BindMountRuntime(BaseRuntime):
         env: dict[str, str] | None = None,
         timeout_sec: float | None = None,
     ) -> ExecResult:
+        self.exec_commands.append(command)
         self.exec_envs.append(dict(env or {}))
         return ExecResult(return_code=0)
 
@@ -941,6 +977,174 @@ async def test_handle_run_passes_evolution_env_to_runtime_exec(tmp_path, monkeyp
     )
     assert runtime.exec_envs[-1]["POLAR_MEMORY_FILE"] == ("/polar/session/evolution/memory.md")
     assert request.agent.env["POLAR_SKILLS_DIR"] == "/polar/session/evolution/skills"
+
+
+@pytest.mark.asyncio
+async def test_handle_run_codex_subscription_auth_mode_unsets_polar_proxy_env(
+    tmp_path,
+    monkeypatch,
+):
+    runtime = BindMountRuntime(tmp_path)
+    manager = GatewayNodeManager.__new__(GatewayNodeManager)
+    manager.evolution = EvolutionConfig(enabled=False)
+    manager.evolution_client = None
+    manager.gateway_url = "http://gateway.test"
+    manager.default_runtime = None
+    request = SessionDispatchRequest(
+        session_id="session_1",
+        task_id="task_1",
+        instruction="Do work.",
+        remaining_timeout_seconds=60,
+        agent=AgentSpec(
+            harness="codex",
+            model_name="gpt-5.5",
+            settings={"auth_mode": "subscription"},
+            env={"CODEX_HOME": "/polar/session/preauthenticated-codex"},
+        ),
+        metadata={},
+    )
+    harness = CodexHarness(request.agent)
+    monkeypatch.setattr(manager, "_resolve_agent_harness", lambda _: harness)
+    managed = ManagedSession(
+        request=request,
+        timer=StageTimer(),
+        session_dir=tmp_path,
+        artifacts_dir=tmp_path / "artifacts",
+        runtime=runtime,
+    )
+    managed.execution_deadline = asyncio.get_running_loop().time() + 60
+
+    await manager._handle_run(managed)
+
+    codex_commands = [command for command in runtime.exec_commands if "codex exec" in command]
+    assert len(codex_commands) == 1
+    command = codex_commands[0]
+    assert command.startswith("env ")
+    for key in (
+        "OPENAI_BASE_URL",
+        "OPENAI_API_KEY",
+        "ANTHROPIC_BASE_URL",
+        "ANTHROPIC_API_KEY",
+        "GOOGLE_API_URL",
+        "GOOGLE_API_KEY",
+        "GEMINI_API_KEY",
+        "GOOGLE_GEMINI_BASE_URL",
+    ):
+        assert f"-u {key}" in command
+    assert 'model_provider="harness_proxy"' not in command
+    assert "model_providers.harness_proxy" not in command
+    assert "auth.json" not in command
+    assert "--model gpt-5.5" in command
+    assert runtime.exec_envs[-1]["OPENAI_BASE_URL"] == "http://gateway.test/v1"
+    assert runtime.exec_envs[-1]["OPENAI_API_KEY"] == "session_1"
+    assert runtime.exec_envs[-1]["CODEX_HOME"] == "/polar/session/preauthenticated-codex"
+
+
+@pytest.mark.asyncio
+async def test_codex_subscription_without_proxy_completions_builds_transcript_trajectory(
+    tmp_path,
+):
+    log_dir = tmp_path / "logs" / "agent"
+    log_dir.mkdir(parents=True)
+    (log_dir / "step.00.stdout.log").write_text(
+        json.dumps(
+            {
+                "type": "message",
+                "message": {"role": "assistant", "content": "Used subscription mode."},
+            }
+        ),
+        encoding="utf-8",
+    )
+    manager = GatewayNodeManager.__new__(GatewayNodeManager)
+    manager.node_id = "node-a"
+    manager.storage = EmptyCompletionStorage()
+    manager.builders = default_builder_registry()
+    manager.session_registry = SessionRegistry()
+    manager.session_registry.register("session_1", task_id="task_1")
+    request = SessionDispatchRequest(
+        session_id="session_1",
+        task_id="task_1",
+        instruction="Do work.",
+        remaining_timeout_seconds=60,
+        agent=AgentSpec(
+            harness="codex",
+            settings={"auth_mode": "subscription"},
+        ),
+        metadata={},
+    )
+    managed = ManagedSession(
+        request=request,
+        timer=StageTimer(),
+        session_dir=tmp_path,
+        artifacts_dir=tmp_path / "artifacts",
+        agent_result=AgentRunResult(
+            status="completed",
+            return_code=0,
+            metadata={"log_dir": str(log_dir), "last_step": 0},
+        ),
+    )
+    managed.execution_deadline = asyncio.get_running_loop().time() + 60
+
+    result = await manager._build_session_result(managed)
+
+    assert result.status == "COMPLETED"
+    assert result.error is None
+    assert result.trajectory.status == "COMPLETED"
+    assert result.trajectory.error is None
+    assert result.trajectory.metadata["builder"] == "agent_transcript"
+    assert result.trajectory.metadata["capture_mode"] == "transcript"
+    assert result.trajectory.metadata["token_level_metrics_available"] is False
+    trace = result.trajectory.traces[0]
+    assert trace.prompt_messages == [{"role": "user", "content": "Do work."}]
+    assert trace.response_messages == [{"role": "assistant", "content": "Used subscription mode."}]
+    assert trace.response_ids == []
+    assert trace.response_logprobs is None
+
+
+@pytest.mark.asyncio
+async def test_proxy_completion_path_does_not_inject_agent_metadata_into_task_metadata(
+    tmp_path,
+):
+    manager = GatewayNodeManager.__new__(GatewayNodeManager)
+    manager.node_id = "node-a"
+    manager.storage = OneCompletionStorage()
+    manager.builders = default_builder_registry()
+    manager.session_registry = SessionRegistry()
+    manager.session_registry.register("session_1", task_id="task_1")
+    request = SessionDispatchRequest(
+        session_id="session_1",
+        task_id="task_1",
+        instruction="Do work.",
+        remaining_timeout_seconds=60,
+        agent=AgentSpec(
+            harness="codex",
+            settings={"auth_mode": "proxy"},
+            env={"OPENAI_API_KEY": "secret"},
+        ),
+        metadata={"policy_version": "policy_1"},
+    )
+    managed = ManagedSession(
+        request=request,
+        timer=StageTimer(),
+        session_dir=tmp_path,
+        artifacts_dir=tmp_path / "artifacts",
+        agent_result=AgentRunResult(
+            status="completed",
+            return_code=0,
+            metadata={"log_dir": str(tmp_path / "logs" / "agent"), "last_step": 0},
+        ),
+    )
+    managed.execution_deadline = asyncio.get_running_loop().time() + 60
+
+    result = await manager._build_session_result(managed)
+
+    assert result.status == "COMPLETED"
+    assert result.trajectory.metadata["builder"] == "per_request"
+    assert result.trajectory.metadata["task_metadata"] == {"source": "proxy"}
+    assert "agent" not in result.trajectory.metadata["task_metadata"]
+    assert "agent_result" not in result.trajectory.metadata["task_metadata"]
+    assert result.trajectory.traces[0].response_ids == [3]
+    assert result.trajectory.traces[0].response_logprobs == [-0.1]
 
 
 @pytest.mark.asyncio

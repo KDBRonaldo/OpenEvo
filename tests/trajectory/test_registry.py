@@ -42,8 +42,19 @@ def test_strategy_registry_rejects_non_subclasses() -> None:
 def test_default_builder_registry_exposes_built_in_builders() -> None:
     registry = default_builder_registry()
 
-    assert registry.list_strategies() == ["per_request", "prefix_merging"]
-    assert registry.create(StrategySpec(strategy="per_request")).__class__.__name__ == "PerRequestBuilder"
+    assert registry.list_strategies() == [
+        "agent_transcript",
+        "per_request",
+        "prefix_merging",
+    ]
+    assert (
+        registry.create(StrategySpec(strategy="per_request")).__class__.__name__
+        == "PerRequestBuilder"
+    )
+    assert (
+        registry.create(StrategySpec(strategy="agent_transcript")).__class__.__name__
+        == "AgentTranscriptBuilder"
+    )
 
 
 def test_unknown_strategy_raises_clear_error() -> None:

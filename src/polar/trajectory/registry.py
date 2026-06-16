@@ -27,8 +27,7 @@ class StrategyRegistry(Generic[T]):
             factory = self._import_class(factory)
         if not (isinstance(factory, type) and issubclass(factory, self._base_type)):
             raise TypeError(
-                f"factory must be a subclass of {self._base_type.__name__}, "
-                f"got {factory!r}"
+                f"factory must be a subclass of {self._base_type.__name__}, got {factory!r}"
             )
         self._factories[name] = factory
 
@@ -58,12 +57,14 @@ class StrategyRegistry(Generic[T]):
 def default_builder_registry() -> StrategyRegistry:
     """Pre-populated registry with built-in trajectory builders."""
     from polar.trajectory.builder import (
+        AgentTranscriptBuilder,
         BaseTrajectoryBuilder,
         PerRequestBuilder,
         PrefixMergingBuilder,
     )
 
     registry: StrategyRegistry[BaseTrajectoryBuilder] = StrategyRegistry(BaseTrajectoryBuilder)
+    registry.register("agent_transcript", AgentTranscriptBuilder)
     registry.register("per_request", PerRequestBuilder)
     registry.register("prefix_merging", PrefixMergingBuilder)
     return registry
@@ -83,5 +84,3 @@ def default_evaluator_registry() -> StrategyRegistry:
     registry.register("swebench_harness", SwebenchHarnessEvaluator)
     registry.register("test_on_output", TestOnOutputEvaluator)
     return registry
-
-

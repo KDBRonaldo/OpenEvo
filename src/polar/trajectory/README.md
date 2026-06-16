@@ -40,6 +40,19 @@ reward onto the traces and sends the result back.
 - `Trajectory`: `status` (one of `COMPLETED` / `TIMEOUT` / `ERROR`), `traces`
   (zero or more), `metadata`, `error`.
 
+## Transcript-only trajectories
+
+Codex subscription 模式可以不经过 Polar proxy 运行，因此不会产生
+`CompletionRecord` 或 token-level metric。当该模式结束时没有捕获到 completion，
+gateway 会 fallback 到 `agent_transcript` builder，并从
+`logs/agent/step.xx.stdout.log` 重建一个不带 token metric 的 trace。
+
+这个 trace 保留 `prompt_messages` / `response_messages`，但 `response_ids`、
+`loss_mask` 和 `response_logprobs` 为空。metadata 会设置
+`capture_mode="transcript"` 和 `token_level_metrics_available=false`。这类
+trajectory 适合 skill、memory、agent-system evolution 或 transcript-level
+evaluation；token-level RL 应只消费 proxy 捕获的 traces。
+
 ## Reward attachment
 
 An evaluator returns an `EvalResult` with an `outcome_reward` and/or per-trace
@@ -52,6 +65,6 @@ entry per trace (otherwise the session is marked `ERROR`); a single
 Register new builders/evaluators in `registry.py`, or reference any
 `BaseTrajectoryBuilder` / `BaseTrajectoryEvaluator` subclass directly by
 `"module:ClassName"`. Keep strategy names stable — task files and Slime configs
-refer to them by string. Registered out of the box: builders `per_request`,
-`prefix_merging`; evaluators `session_completed`, `test_on_output`,
-`swebench_harness`.
+refer to them by string. Registered out of the box: builders `agent_transcript`,
+`per_request`, `prefix_merging`; evaluators `session_completed`,
+`test_on_output`, `swebench_harness`.
