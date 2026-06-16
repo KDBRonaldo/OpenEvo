@@ -24,11 +24,46 @@ def test_sglang_engine_requests_logprobs_and_passes_through() -> None:
     assert engine.normalize_response(response) is response
 
 
+def test_sglang_applies_runtime_lora_adapter_spec_to_model_name() -> None:
+    request = {"model": "Qwen/Qwen3.6-27B", "messages": []}
+    out = SGLangEngine().apply_adapter_merge_spec(
+        request,
+        {
+            "merge_mode": "runtime_lora",
+            "adapters": [{"adapter_id": "parser-memory"}],
+        },
+    )
+    assert out is request
+    assert out["model"] == "Qwen/Qwen3.6-27B:parser-memory"
+
+
+def test_sglang_ignores_reference_only_adapter_spec() -> None:
+    request = {"model": "Qwen/Qwen3.6-27B", "messages": []}
+    SGLangEngine().apply_adapter_merge_spec(
+        request,
+        {"merge_mode": "reference_only", "adapters": [{"adapter_id": "ignored"}]},
+    )
+    assert request["model"] == "Qwen/Qwen3.6-27B"
+
+
 def test_vllm_prepare_request_requests_token_ids_and_logprobs() -> None:
     out = VLLMEngine().prepare_request({"messages": [], "logprobs": True})
     assert out["logprobs"] is True
     assert out["return_token_ids"] is True
     assert out["top_logprobs"] == 0
+
+
+def test_vllm_applies_runtime_lora_adapter_spec_to_model_name() -> None:
+    request = {"model": "Qwen/Qwen3.6-27B", "messages": []}
+    out = VLLMEngine().apply_adapter_merge_spec(
+        request,
+        {
+            "merge_mode": "runtime_lora",
+            "adapters": [{"adapter_id": "parser-memory"}],
+        },
+    )
+    assert out is request
+    assert out["model"] == "parser-memory"
 
 
 def test_vllm_prepare_request_keeps_explicit_top_logprobs() -> None:

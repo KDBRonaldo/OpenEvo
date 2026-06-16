@@ -120,6 +120,19 @@ class SessionRegistry:
                 info.last_activity = _utcnow()
             return info
 
+    def update_metadata(
+        self,
+        session_id: str,
+        metadata: dict[str, Any],
+    ) -> SessionInfo | None:
+        with self._lock:
+            info = self._sessions.get(session_id)
+            if info is None:
+                return None
+            info.metadata = {**(info.metadata or {}), **metadata}
+            info.last_activity = _utcnow()
+            return info
+
     def set_result(self, session_id: str, result: SessionResult) -> SessionInfo | None:
         with self._lock:
             info = self._sessions.get(session_id)

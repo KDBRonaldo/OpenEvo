@@ -61,14 +61,17 @@ def test_register_artifact_persists_manifest(tmp_path):
     assert row["promoted"] == 1
 
     manifest_path = Path(row["manifest_path"])
-    assert manifest_path == (
-        tmp_path
-        / "artifacts"
-        / "artifacts"
-        / "text_memory"
-        / artifact.artifact_id
-        / "manifest.json"
-    ).resolve()
+    assert (
+        manifest_path
+        == (
+            tmp_path
+            / "artifacts"
+            / "artifacts"
+            / "text_memory"
+            / artifact.artifact_id
+            / "manifest.json"
+        ).resolve()
+    )
     assert json.loads(manifest_path.read_text(encoding="utf-8")) == {
         "artifact_id": artifact.artifact_id,
         "type": "text_memory",
@@ -106,12 +109,8 @@ def test_register_artifact_normalizes_nested_json_metadata(tmp_path):
         ).fetchone()
 
     assert row is not None
-    assert json.loads(row["lineage_json"]) == {
-        "source": {"created_at": "2026-06-14T12:30:45Z"}
-    }
-    assert json.loads(row["compatibility_json"]) == {
-        "window": {"after": "2026-06-14T12:30:45Z"}
-    }
+    assert json.loads(row["lineage_json"]) == {"source": {"created_at": "2026-06-14T12:30:45Z"}}
+    assert json.loads(row["compatibility_json"]) == {"window": {"after": "2026-06-14T12:30:45Z"}}
 
     manifest_path = Path(row["manifest_path"])
     assert json.loads(manifest_path.read_text(encoding="utf-8"))["manifest"] == {
@@ -177,12 +176,7 @@ def test_register_artifact_cleans_up_manifest_on_db_failure(tmp_path, monkeypatc
     store.initialize()
     monkeypatch.setattr(store_module, "new_id", lambda prefix: f"{prefix}_forced")
     manifest_path = (
-        tmp_path
-        / "artifacts"
-        / "artifacts"
-        / "text_memory"
-        / "art_forced"
-        / "manifest.json"
+        tmp_path / "artifacts" / "artifacts" / "text_memory" / "art_forced" / "manifest.json"
     ).resolve()
 
     with store.connect() as conn:
@@ -274,6 +268,62 @@ def test_register_artifact_retries_collision_without_touching_existing_manifest(
     }
 
 
+def test_register_agent_system_normalizes_target_path(tmp_path):
+    store = EvolutionStore(db_path=tmp_path / "evolution.db", artifact_root=tmp_path / "artifacts")
+    store.initialize()
+    agent_system_file = tmp_path / "repo.md"
+    agent_system_file.write_text("Use repository conventions.", encoding="utf-8")
+
+    artifact = store.register_artifact(
+        ArtifactRegisterRequest(
+            type=ArtifactType.AGENT_SYSTEM,
+            name="openhands repo instructions",
+            uri=agent_system_file.as_uri(),
+            manifest={"target_path": "./.openhands/microagents/repo.md"},
+            promoted=True,
+        )
+    )
+
+    assert artifact.manifest["target_path"] == ".openhands/microagents/repo.md"
+    manifest_path = (
+        tmp_path
+        / "artifacts"
+        / "artifacts"
+        / "agent_system"
+        / artifact.artifact_id
+        / "manifest.json"
+    )
+    stored = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert stored["manifest"]["target_path"] == ".openhands/microagents/repo.md"
+
+
+@pytest.mark.parametrize(
+    "target_path",
+    ["", "../AGENTS.md", "nested/../AGENTS.md", "/tmp/AGENTS.md"],
+)
+def test_register_agent_system_rejects_unsafe_target_path(tmp_path, target_path):
+    store = EvolutionStore(db_path=tmp_path / "evolution.db", artifact_root=tmp_path / "artifacts")
+    store.initialize()
+    agent_system_file = tmp_path / "AGENTS.md"
+    agent_system_file.write_text("Use repository conventions.", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="target_path"):
+        store.register_artifact(
+            ArtifactRegisterRequest(
+                type=ArtifactType.AGENT_SYSTEM,
+                name="unsafe instructions",
+                uri=agent_system_file.as_uri(),
+                manifest={"target_path": target_path},
+                promoted=True,
+            )
+        )
+
+    with store.connect() as conn:
+        artifact_count = conn.execute("SELECT COUNT(*) FROM artifacts").fetchone()[0]
+
+    assert artifact_count == 0
+
+
 def test_context_resolver_selects_memory_skill_and_adapter(tmp_path):
     store = EvolutionStore(db_path=tmp_path / "evolution.db", artifact_root=tmp_path / "artifacts")
     store.initialize()
@@ -301,12 +351,33 @@ def test_context_resolver_selects_memory_skill_and_adapter(tmp_path):
             promoted=True,
         )
     )
+    agent_system_file = tmp_path / "AGENTS.md"
+    agent_system_file.write_text(
+        "Always inspect the repository conventions before changing code.",
+        encoding="utf-8",
+    )
+    agent_system = store.register_artifact(
+        ArtifactRegisterRequest(
+            type=ArtifactType.AGENT_SYSTEM,
+            name="codex agent instructions",
+            uri=agent_system_file.as_uri(),
+            manifest={"target_path": "AGENTS.md"},
+            compatibility={"task_tags": ["calculator"], "agent_harness": ["codex"]},
+            scores={"quality": 0.85},
+            tags=["calculator"],
+            promoted=True,
+        )
+    )
     adapter = store.register_artifact(
         ArtifactRegisterRequest(
             type=ArtifactType.PARAMETRIC_MEMORY,
-            name="parser lora",
+            name="Qwen parser LoRA adapter",
             uri="file:///tmp/adapters/parser",
-            manifest={"adapter_format": "lora", "base_model": "Qwen/Qwen3.6-27B"},
+            manifest={
+                "adapter_id": "parser-memory",
+                "adapter_format": "lora",
+                "base_model": "Qwen/Qwen3.6-27B",
+            },
             compatibility={"base_model": "Qwen/Qwen3.6-27B", "task_tags": ["calculator"]},
             scores={"heldout_reward_delta": 0.1},
             tags=["calculator"],
@@ -351,10 +422,12 @@ def test_context_resolver_selects_memory_skill_and_adapter(tmp_path):
     assert inactive_memory.artifact_id not in context.memory["artifact_ids"]
     assert "recursive descent" in context.memory["rendered_text"]
     assert context.skills[0]["artifact_id"] == skill.artifact_id
-    assert incompatible_skill.artifact_id not in {
-        item["artifact_id"] for item in context.skills
-    }
+    assert incompatible_skill.artifact_id not in {item["artifact_id"] for item in context.skills}
+    assert context.agent_system["artifact_ids"] == [agent_system.artifact_id]
+    assert "repository conventions" in context.agent_system["rendered_text"]
+    assert context.agent_system["target_path"] == "AGENTS.md"
     assert context.adapter_merge_spec.adapters[0]["artifact_id"] == adapter.artifact_id
+    assert context.adapter_merge_spec.adapters[0]["adapter_id"] == "parser-memory"
     assert inactive_memory.artifact_id not in context.selection["artifact_ids"]
     assert incompatible_skill.artifact_id not in context.selection["artifact_ids"]
 
@@ -371,6 +444,44 @@ def test_context_resolver_selects_memory_skill_and_adapter(tmp_path):
     snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
     assert snapshot["request"]["task_id"] == "task_1"
     assert snapshot["response"]["selection"]["artifact_ids"] == context.selection["artifact_ids"]
+
+
+def test_context_resolver_skips_legacy_agent_system_with_unsafe_target_path(tmp_path):
+    store = EvolutionStore(db_path=tmp_path / "evolution.db", artifact_root=tmp_path / "artifacts")
+    store.initialize()
+    agent_system_file = tmp_path / "AGENTS.md"
+    agent_system_file.write_text("Use repository conventions.", encoding="utf-8")
+    agent_system = store.register_artifact(
+        ArtifactRegisterRequest(
+            type=ArtifactType.AGENT_SYSTEM,
+            name="legacy unsafe instructions",
+            uri=agent_system_file.as_uri(),
+            manifest={"target_path": "AGENTS.md"},
+            compatibility={"agent_harness": ["codex"]},
+            scores={"quality": 0.9},
+            promoted=True,
+        )
+    )
+    with store.connect() as conn:
+        row = conn.execute(
+            "SELECT manifest_path FROM artifacts WHERE artifact_id = ?",
+            (agent_system.artifact_id,),
+        ).fetchone()
+    manifest_path = Path(row["manifest_path"])
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    payload["manifest"]["target_path"] = "pyproject.toml"
+    manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    context = store.resolve_context(
+        ContextResolveRequest(
+            task_id="task_unsafe_agent_system",
+            instruction="fix parser",
+            agent={"harness": "codex"},
+        )
+    )
+
+    assert context.agent_system["artifact_ids"] == []
+    assert agent_system.artifact_id not in context.selection["artifact_ids"]
 
 
 def test_context_resolver_skips_unreadable_text_memory(tmp_path):

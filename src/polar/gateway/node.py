@@ -5,11 +5,14 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
+import shlex
 import shutil
 from contextlib import suppress
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from tempfile import mkdtemp
 from typing import Any
+from urllib.parse import unquote, urlparse
 
 import httpx
 
@@ -39,9 +42,12 @@ from polar.runtime.factory import create_runtime
 from polar.runtime.models import ExecInput, RuntimeSpec
 from polar.trajectory.models import EvalResult, EvaluatorSpec, StrategySpec, Trace, Trajectory
 from polar.trajectory.registry import StrategyRegistry
+from polar_evolution.agent_system import normalize_agent_system_target_path
 from polar_evolution.client import EvolutionClient
 
 logger = logging.getLogger(__name__)
+
+_SAFE_SKILL_NAME_RE = re.compile(r"[^A-Za-z0-9_.-]+")
 
 
 class GatewayExecutionTimeout(TimeoutError):
@@ -59,10 +65,27 @@ async def write_evolution_context_files(
     if evolution_dir.exists():
         shutil.rmtree(evolution_dir)
     skills_dir = evolution_dir / "skills"
+    agent_system_targets_dir = evolution_dir / "agent_system_targets"
     skills_dir.mkdir(parents=True, exist_ok=True)
+    agent_system_targets_dir.mkdir(parents=True, exist_ok=True)
     context_path = evolution_dir / "context.json"
     memory_path = evolution_dir / "memory.md"
+    agent_system_path = evolution_dir / "agent_system.md"
     adapters_path = evolution_dir / "adapters.json"
+
+    _stage_evolution_skill_bundles(context, skills_dir)
+    agent_system_text = _agent_system_rendered_text(context)
+    agent_system_env: dict[str, str] = {}
+    if agent_system_text:
+        agent_system_env["POLAR_AGENT_SYSTEM_FILE"] = f"{target_dir}/agent_system.md"
+        agent_system_env.update(
+            await _stage_evolution_agent_system(
+                runtime=runtime,
+                context=context,
+                targets_dir=agent_system_targets_dir,
+                rendered=agent_system_text,
+            )
+        )
 
     context_path.write_text(
         json.dumps(context, indent=2, sort_keys=True),
@@ -72,6 +95,10 @@ async def write_evolution_context_files(
         str((context.get("memory") or {}).get("rendered_text") or ""),
         encoding="utf-8",
     )
+    agent_system_path.write_text(
+        agent_system_text,
+        encoding="utf-8",
+    )
     adapters_path.write_text(
         json.dumps(context.get("adapter_merge_spec") or {}, indent=2, sort_keys=True),
         encoding="utf-8",
@@ -79,15 +106,178 @@ async def write_evolution_context_files(
 
     await runtime.upload_file(str(context_path), f"{target_dir}/context.json")
     await runtime.upload_file(str(memory_path), f"{target_dir}/memory.md")
+    if agent_system_text:
+        await runtime.upload_file(str(agent_system_path), f"{target_dir}/agent_system.md")
     await runtime.upload_file(str(adapters_path), f"{target_dir}/adapters.json")
     await runtime.upload_dir(str(skills_dir), f"{target_dir}/skills")
 
-    return {
+    env = {
         "POLAR_EVOLUTION_CONTEXT": f"{target_dir}/context.json",
         "POLAR_MEMORY_FILE": f"{target_dir}/memory.md",
         "POLAR_SKILLS_DIR": f"{target_dir}/skills",
         "POLAR_ADAPTER_MERGE_SPEC": f"{target_dir}/adapters.json",
     }
+    env.update(agent_system_env)
+    return env
+
+
+def _stage_evolution_skill_bundles(context: dict, skills_dir: Path) -> None:
+    skills = context.get("skills") or []
+    if not isinstance(skills, list):
+        return
+    for index, skill in enumerate(skills):
+        if not isinstance(skill, dict):
+            continue
+        try:
+            source = _artifact_file_uri_path(skill.get("uri"))
+            if source is None:
+                raise ValueError("skill artifact URI is not a file:// URI")
+            if not source.exists():
+                raise FileNotFoundError(f"skill artifact path does not exist: {source}")
+            dest = skills_dir / _safe_skill_dir_name(skill, index)
+            if source.is_dir():
+                shutil.copytree(source, dest)
+            else:
+                dest.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, dest / source.name)
+            (dest / "artifact.json").write_text(
+                json.dumps(skill, indent=2, sort_keys=True),
+                encoding="utf-8",
+            )
+        except Exception as exc:
+            warning = (
+                "Skipped evolution skill artifact "
+                f"{skill.get('artifact_id') or skill.get('name') or index}: {exc}"
+            )
+            logger.warning(warning)
+            context.setdefault("warnings", []).append(warning)
+
+
+async def _stage_evolution_agent_system(
+    *,
+    runtime: BaseRuntime,
+    context: dict,
+    targets_dir: Path,
+    rendered: str,
+) -> dict[str, str]:
+    agent_system = context.get("agent_system") or {}
+    if not isinstance(agent_system, dict):
+        return {}
+
+    target_specs = _agent_system_target_specs(agent_system, rendered)
+    target_root = _agent_system_target_root(runtime)
+    remote_targets: list[str] = []
+    agents_md_target: str | None = None
+    for index, spec in enumerate(target_specs):
+        try:
+            target_path = PurePosixPath(
+                normalize_agent_system_target_path(spec.get("target_path"))
+            )
+        except ValueError as exc:
+            warning = f"Skipped evolution agent system target {index}: {exc}"
+            logger.warning(warning)
+            context.setdefault("warnings", []).append(warning)
+            continue
+
+        target_text = str(spec.get("rendered_text") or rendered)
+        local_target = targets_dir / Path(*PurePosixPath(target_path).parts)
+        local_target.parent.mkdir(parents=True, exist_ok=True)
+        local_target.write_text(target_text, encoding="utf-8")
+        remote_target = (target_root / target_path).as_posix()
+        remote_parent = PurePosixPath(remote_target).parent.as_posix()
+        if remote_parent not in ("", "."):
+            await runtime.exec(f"mkdir -p {shlex.quote(remote_parent)}")
+        await runtime.upload_file(str(local_target), remote_target)
+        remote_targets.append(remote_target)
+        if target_path.name == "AGENTS.md" and agents_md_target is None:
+            agents_md_target = remote_target
+
+    if not remote_targets:
+        return {}
+    env = {
+        "POLAR_AGENT_SYSTEM_TARGET": remote_targets[0],
+        "POLAR_AGENT_SYSTEM_TARGETS": json.dumps(remote_targets),
+    }
+    if agents_md_target is not None:
+        env["POLAR_AGENTS_MD"] = agents_md_target
+    return env
+
+
+def _agent_system_rendered_text(context: dict) -> str:
+    agent_system = context.get("agent_system") or {}
+    if not isinstance(agent_system, dict):
+        return ""
+    return str(agent_system.get("rendered_text") or "")
+
+
+def _agent_system_target_root(runtime: BaseRuntime) -> PurePosixPath:
+    workdir = getattr(getattr(runtime, "spec", None), "workdir", None)
+    if isinstance(workdir, str) and workdir.strip():
+        return PurePosixPath(workdir.strip())
+    runtime_session_dir = getattr(runtime, "runtime_session_dir", "/polar/session")
+    return PurePosixPath(str(runtime_session_dir))
+
+
+def _agent_system_target_specs(
+    agent_system: dict[str, Any],
+    rendered: str,
+) -> list[dict[str, Any]]:
+    targets = agent_system.get("targets")
+    if isinstance(targets, list) and targets:
+        grouped: dict[str, list[str]] = {}
+        for target in targets:
+            if not isinstance(target, dict):
+                continue
+            target_path = (
+                target.get("target_path") or agent_system.get("target_path") or "AGENTS.md"
+            )
+            grouped.setdefault(str(target_path), []).append(
+                str(target.get("rendered_text") or rendered)
+            )
+        if grouped:
+            return [
+                {"target_path": target_path, "rendered_text": "\n\n".join(parts)}
+                for target_path, parts in grouped.items()
+            ]
+    return [
+        {
+            "target_path": agent_system.get("target_path") or "AGENTS.md",
+            "rendered_text": rendered,
+        }
+    ]
+
+
+def _artifact_file_uri_path(uri: Any) -> Path | None:
+    if not isinstance(uri, str) or not uri:
+        return None
+    parsed = urlparse(uri)
+    if parsed.scheme != "file":
+        return None
+    if parsed.netloc and parsed.netloc not in ("", "localhost"):
+        raise ValueError(f"unsupported file URI host for evolution artifact: {uri}")
+    return Path(unquote(parsed.path))
+
+
+def _safe_skill_dir_name(skill: dict, index: int) -> str:
+    raw = skill.get("artifact_id") or skill.get("name") or f"skill-{index}"
+    normalized = _SAFE_SKILL_NAME_RE.sub("-", str(raw)).strip(".-")
+    return normalized or f"skill-{index}"
+
+
+def _instruction_with_evolution_context(instruction: str, context: dict) -> str:
+    agent_system = str((context.get("agent_system") or {}).get("rendered_text") or "").strip()
+    memory = str((context.get("memory") or {}).get("rendered_text") or "").strip()
+    if not agent_system and not memory:
+        return instruction
+    parts: list[str] = []
+    if agent_system:
+        parts.append(
+            f"Use the following evolved agent system instructions for this task:\n{agent_system}"
+        )
+    if memory:
+        parts.append(f"Use the following long-term memory for this task:\n{memory}")
+    parts.append(f"Task:\n{instruction}")
+    return "\n\n".join(parts)
 
 
 def _existing_evolution_metadata(metadata: dict) -> dict:
@@ -448,7 +638,9 @@ class GatewayNodeManager:
             # Don't set final_result — let _handle_postrun build a partial
             # trajectory from the completions captured so far.
             managed.agent_result = AgentRunResult(
-                status="timeout", return_code=-1, error=str(exc),
+                status="timeout",
+                return_code=-1,
+                error=str(exc),
             )
         except Exception as exc:
             if managed.cancel_requested:
@@ -474,11 +666,7 @@ class GatewayNodeManager:
         harness: BaseHarness,
     ) -> dict[str, str]:
         request = managed.request
-        if (
-            self.evolution is None
-            or not self.evolution.enabled
-            or self.evolution_client is None
-        ):
+        if self.evolution is None or not self.evolution.enabled or self.evolution_client is None:
             return {}
         if managed.runtime is None:
             return {}
@@ -505,11 +693,28 @@ class GatewayNodeManager:
                 ),
                 managed,
             )
-            request.metadata["evolution"] = {
+            request.instruction = _instruction_with_evolution_context(
+                request.instruction,
+                context,
+            )
+            adapter_merge_spec = context.get("adapter_merge_spec")
+            if isinstance(adapter_merge_spec, dict):
+                request.metadata["adapter_merge_spec"] = adapter_merge_spec
+            evolution_metadata = {
                 **_existing_evolution_metadata(request.metadata),
                 "context_id": context.get("context_id"),
                 "context_injected": True,
             }
+            request.metadata["evolution"] = evolution_metadata
+            registry_metadata: dict[str, Any] = {"evolution": evolution_metadata}
+            if isinstance(adapter_merge_spec, dict):
+                registry_metadata["adapter_merge_spec"] = adapter_merge_spec
+            session_registry = getattr(self, "session_registry", None)
+            if session_registry is not None:
+                session_registry.update_metadata(
+                    request.session_id,
+                    registry_metadata,
+                )
             return env
         except Exception as exc:
             if not self.evolution.context.fail_open:
@@ -536,9 +741,7 @@ class GatewayNodeManager:
             return
         try:
             await asyncio.wait_for(
-                self.evolution_client.export_event(
-                    build_evolution_session_event(result)
-                ),
+                self.evolution_client.export_event(build_evolution_session_event(result)),
                 timeout=self.evolution.event_export.timeout_seconds,
             )
         except Exception as exc:
@@ -563,9 +766,7 @@ class GatewayNodeManager:
 
         for i, step in enumerate(steps):
             if managed.cancel_requested:
-                return AgentRunResult(
-                    status="failed", return_code=-1, error="cancelled"
-                )
+                return AgentRunResult(status="failed", return_code=-1, error="cancelled")
             merged_env = {**env, **(step.env or {})}
             result = await runtime.exec(
                 step.command,
@@ -573,9 +774,7 @@ class GatewayNodeManager:
                 env=merged_env,
                 timeout_sec=self._remaining_budget(managed),
             )
-            self._write_exec_log(
-                log_dir, f"step.{i:02d}", result.stdout, result.stderr
-            )
+            self._write_exec_log(log_dir, f"step.{i:02d}", result.stdout, result.stderr)
             if result.return_code == -1:
                 return AgentRunResult(
                     status="timeout",
@@ -608,13 +807,9 @@ class GatewayNodeManager:
             return
         if managed.eval_prewarm_task is not None:
             return
-        managed.eval_prewarm_task = asyncio.create_task(
-            self._prepare_eval_runtime(managed)
-        )
+        managed.eval_prewarm_task = asyncio.create_task(self._prepare_eval_runtime(managed))
 
-    async def _prepare_eval_runtime(
-        self, managed: ManagedSession
-    ) -> BaseRuntime | None:
+    async def _prepare_eval_runtime(self, managed: ManagedSession) -> BaseRuntime | None:
         """Create and prepare a fresh runtime for the evaluator. Returns None on failure."""
         request = managed.request
         runtime_spec = self._resolve_runtime_spec(request)
@@ -622,9 +817,7 @@ class GatewayNodeManager:
         eval_artifacts_dir = eval_session_dir / "artifacts"
         eval_artifacts_dir.mkdir(parents=True, exist_ok=True)
 
-        eval_runtime = create_runtime(
-            runtime_spec, f"{request.session_id}-eval", eval_session_dir
-        )
+        eval_runtime = create_runtime(runtime_spec, f"{request.session_id}-eval", eval_session_dir)
         try:
             await self._await_with_budget(eval_runtime.start(), managed)
             eval_actions = (
@@ -655,9 +848,7 @@ class GatewayNodeManager:
                 await eval_runtime.stop()
             return None
 
-    async def _acquire_prepared_eval_runtime(
-        self, managed: ManagedSession
-    ) -> BaseRuntime | None:
+    async def _acquire_prepared_eval_runtime(self, managed: ManagedSession) -> BaseRuntime | None:
         """Await the prewarm task and return its runtime, if any."""
         task = managed.eval_prewarm_task
         if task is None:
@@ -671,9 +862,7 @@ class GatewayNodeManager:
                 "timed out waiting for a fresh evaluator runtime"
             ) from exc
 
-    async def _drain_eval_prewarm_task(
-        self, managed: ManagedSession
-    ) -> BaseRuntime | None:
+    async def _drain_eval_prewarm_task(self, managed: ManagedSession) -> BaseRuntime | None:
         """Resolve the prewarm task during teardown. Cancel if still running."""
         task = managed.eval_prewarm_task
         if task is None:
@@ -718,9 +907,7 @@ class GatewayNodeManager:
                 )
             if managed.runtime is not None:
                 stop_tasks.append(
-                    self._stop_runtime_best_effort(
-                        managed.runtime, request.session_id, "runtime"
-                    )
+                    self._stop_runtime_best_effort(managed.runtime, request.session_id, "runtime")
                 )
             if stop_tasks:
                 await asyncio.gather(*stop_tasks, return_exceptions=True)
@@ -749,9 +936,7 @@ class GatewayNodeManager:
                 # status/task_id visible for debugging via the polling endpoint.
                 self.session_registry.clear_result_payload(request.session_id)
         finally:
-            await self._remove_session_dir_best_effort(
-                managed.session_dir, request.session_id
-            )
+            await self._remove_session_dir_best_effort(managed.session_dir, request.session_id)
 
     async def _build_session_result(self, managed: ManagedSession) -> SessionResult:
         request = managed.request
@@ -919,10 +1104,9 @@ class GatewayNodeManager:
                 for trace, reward in zip(traces, eval_result.trace_rewards)
             ]
         elif eval_result.outcome_reward is not None and traces:
-            # Broadcast trajectory-level reward 
+            # Broadcast trajectory-level reward
             traces = [
-                trace.model_copy(update={"reward": eval_result.outcome_reward})
-                for trace in traces
+                trace.model_copy(update={"reward": eval_result.outcome_reward}) for trace in traces
             ]
 
         eval_metadata = {
@@ -1046,7 +1230,9 @@ class GatewayNodeManager:
             metadata=dict(request.metadata),
         )
 
-    def _cancelled_result(self, request: SessionDispatchRequest, timer: StageTimer) -> SessionResult:
+    def _cancelled_result(
+        self, request: SessionDispatchRequest, timer: StageTimer
+    ) -> SessionResult:
         return self._error_result(request, timer, "session cancelled")
 
     async def _push_result(self, callback_url: str | None, result: SessionResult) -> bool:
@@ -1104,8 +1290,7 @@ class GatewayNodeManager:
         if managed.execution_deadline is not None:
             return
         managed.execution_deadline = (
-            asyncio.get_running_loop().time()
-            + managed.request.remaining_timeout_seconds
+            asyncio.get_running_loop().time() + managed.request.remaining_timeout_seconds
         )
 
     async def _run_postrun_steps(self, managed: ManagedSession) -> None:

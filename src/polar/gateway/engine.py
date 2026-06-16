@@ -55,6 +55,14 @@ class InferenceEngine(ABC):
         """
         return response
 
+    def apply_adapter_merge_spec(
+        self,
+        request: dict[str, Any],
+        merge_spec: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        """Apply a session-scoped adapter merge spec to this request if supported."""
+        return request
+
 
 class SGLangEngine(InferenceEngine):
     """Canonical backend: it emits Polar's training shape with no per-request or
@@ -64,6 +72,20 @@ class SGLangEngine(InferenceEngine):
     """
 
     name = "sglang"
+
+    def apply_adapter_merge_spec(
+        self,
+        request: dict[str, Any],
+        merge_spec: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        adapter_id = _runtime_lora_adapter_id(merge_spec)
+        if adapter_id is None:
+            return request
+        base_model = str(request.get("model") or merge_spec.get("base_model") or "").strip()
+        if not base_model:
+            return request
+        request["model"] = f"{base_model}:{adapter_id}"
+        return request
 
 
 class VLLMEngine(InferenceEngine):
@@ -77,6 +99,16 @@ class VLLMEngine(InferenceEngine):
     """
 
     name = "vllm"
+
+    def apply_adapter_merge_spec(
+        self,
+        request: dict[str, Any],
+        merge_spec: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        adapter_id = _runtime_lora_adapter_id(merge_spec)
+        if adapter_id is not None:
+            request["model"] = adapter_id
+        return request
 
     def prepare_request(self, request: dict[str, Any]) -> dict[str, Any]:
         request = super().prepare_request(request)  # logprobs=True
@@ -128,6 +160,24 @@ class VLLMEngine(InferenceEngine):
         for entry, token_id in zip(content, token_ids):
             if isinstance(entry, dict):
                 entry.setdefault("token_id", token_id)
+
+
+def _runtime_lora_adapter_id(merge_spec: dict[str, Any] | None) -> str | None:
+    if not isinstance(merge_spec, dict):
+        return None
+    if merge_spec.get("merge_mode") != "runtime_lora":
+        return None
+    adapters = merge_spec.get("adapters")
+    if not isinstance(adapters, list):
+        return None
+    for adapter in adapters:
+        if not isinstance(adapter, dict):
+            continue
+        for key in ("adapter_id", "name", "artifact_id"):
+            value = adapter.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return None
 
 
 _ENGINES: dict[str, type[InferenceEngine]] = {

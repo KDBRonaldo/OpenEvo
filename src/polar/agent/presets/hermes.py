@@ -30,10 +30,10 @@ class HermesHarness(BaseHarness):
     """
 
     async def setup(self, runtime: BaseRuntime) -> None:
-        if self.skills_path:
+        for skills_path in self.effective_skill_paths():
             await runtime.exec(
                 f"mkdir -p {_HERMES_HOME}/skills && "
-                f"cp -r {shlex.quote(self.skills_path)}/* "
+                f"cp -r {shlex.quote(skills_path)}/* "
                 f"{_HERMES_HOME}/skills/ 2>/dev/null || true"
             )
 

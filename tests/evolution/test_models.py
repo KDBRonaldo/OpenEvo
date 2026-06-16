@@ -71,6 +71,7 @@ def test_context_resolve_request_defaults_limits():
     )
 
     assert request.limits.max_memory_chars == 12000
+    assert request.limits.max_agent_system_chars == 12000
     assert request.limits.max_skill_bundles == 4
     assert request.limits.max_adapters == 2
 
@@ -99,6 +100,7 @@ def test_worker_claim_request_and_enums():
 
     assert request.lease_seconds == 600
     assert ArtifactType.PARAMETRIC_MEMORY == "parametric_memory"
+    assert ArtifactType.AGENT_SYSTEM == "agent_system"
     assert JobState.PENDING == "pending"
 
 

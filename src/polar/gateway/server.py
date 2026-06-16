@@ -654,6 +654,11 @@ async def proxy_request(request: Request, path: str):
     transformed_body["_polar_model_served"] = state.node.model_served
     openai_request = transformer.transform_request(transformed_body)
     openai_request["model"] = state.node.model_served
+    _apply_session_adapter_merge_spec(
+        openai_request,
+        session_info=session_info,
+        engine=state.inference.engine,
+    )
     is_streaming = openai_request.get("stream", False)
 
     if is_streaming:
@@ -674,6 +679,33 @@ async def proxy_request(request: Request, path: str):
         session_id,
         original_model=original_model,
         session_info=session_info,
+    )
+
+
+def _adapter_merge_spec_from_session(session_info: Any | None) -> dict[str, Any] | None:
+    metadata = getattr(session_info, "metadata", None)
+    if not isinstance(metadata, dict):
+        return None
+    spec = metadata.get("adapter_merge_spec")
+    if isinstance(spec, dict):
+        return spec
+    evolution = metadata.get("evolution")
+    if isinstance(evolution, dict):
+        spec = evolution.get("adapter_merge_spec")
+        if isinstance(spec, dict):
+            return spec
+    return None
+
+
+def _apply_session_adapter_merge_spec(
+    openai_request: dict[str, Any],
+    *,
+    session_info: Any | None,
+    engine: Any,
+) -> dict[str, Any]:
+    return engine.apply_adapter_merge_spec(
+        openai_request,
+        _adapter_merge_spec_from_session(session_info),
     )
 
 

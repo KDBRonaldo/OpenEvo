@@ -33,6 +33,16 @@ class BaseHarness(ABC):
         Override to install packages, write config files, etc.
         """
 
+    def effective_skill_paths(self) -> list[str]:
+        """Return static and evolution-provided skill roots in load order."""
+        paths: list[str] = []
+        if self.skills_path:
+            paths.append(self.skills_path)
+        evolution_skills = self.env.get("POLAR_SKILLS_DIR")
+        if evolution_skills:
+            paths.append(evolution_skills)
+        return paths
+
     @abstractmethod
     def run_steps(self, instruction: str) -> list[ExecInput]:
         """Return the ordered list of commands to execute the agent task."""

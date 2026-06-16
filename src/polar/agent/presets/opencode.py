@@ -67,10 +67,10 @@ class OpenCodeHarness(BaseHarness):
         )
 
         # Copy skills
-        if self.skills_path:
+        for skills_path in self.effective_skill_paths():
             await runtime.exec(
                 f"mkdir -p {self._config_dir}/skills && "
-                f"cp -r {shlex.quote(self.skills_path)}/* {self._config_dir}/skills/ 2>/dev/null || true"
+                f"cp -r {shlex.quote(skills_path)}/* {self._config_dir}/skills/ 2>/dev/null || true"
             )
 
     def run_steps(self, instruction: str) -> list[ExecInput]:

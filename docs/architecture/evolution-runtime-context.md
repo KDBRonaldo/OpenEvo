@@ -1,0 +1,205 @@
+# Evolution Runtime Context（演化运行时上下文）
+
+本文说明 Evolution Backend 选出的 artifacts 如何在一个正在运行的 Polar session
+中真正可用。
+
+Runtime context 的注入发生在 gateway session 被 dispatch 之后、agent harness
+`setup()` 之前。这个时机允许 Polar 在 agent 启动前 staging skills 和 memory，
+同时 backend 仍然可以基于真实 task、agent、policy、rollout step 和 served model
+选择上下文。
+
+## 端到端流程
+
+```mermaid
+sequenceDiagram
+    participant R as Rollout Server
+    participant G as GatewayNodeManager
+    participant E as Evolution Backend
+    participant RT as Runtime
+    participant H as Agent Harness
+    participant P as Gateway Proxy
+    participant M as SGLang / vLLM
+
+    R->>G: dispatch session
+    G->>RT: start runtime + prepare
+    G->>E: resolve_context(task, agent, base_model, metadata)
+    E-->>G: memory, agent_system, skill bundle URIs, adapter_merge_spec
+    G->>RT: upload context.json, memory.md, agent_system.md, adapters.json, skills/
+    G->>RT: write AGENTS.md / harness-specific text target
+    G->>G: adapter_merge_spec 写入 session metadata
+    G->>H: setup(runtime)，harness env 中包含 POLAR_SKILLS_DIR
+    G->>H: run_steps(agent-system/memory-prefixed instruction)
+    H->>P: LLM request
+    P->>P: 读取 session adapter_merge_spec
+    P->>M: 带 engine-specific adapter model 的请求
+    M-->>P: response
+    P-->>H: transformed response
+```
+
+## Runtime 文件和环境变量
+
+`write_evolution_context_files()` 会把选出的 context staging 到 session runtime
+的目标目录下。默认目标目录是 `/polar/session/evolution`。
+
+| Runtime path | Env var | 作用 |
+|---|---|---|
+| `/polar/session/evolution/context.json` | `POLAR_EVOLUTION_CONTEXT` | 完整 resolved context，包括 warnings |
+| `/polar/session/evolution/memory.md` | `POLAR_MEMORY_FILE` | 渲染后的自然语言 memory |
+| `/polar/session/evolution/agent_system.md` | `POLAR_AGENT_SYSTEM_FILE` | 渲染后的 agent system 文本 |
+| `<runtime workdir>/AGENTS.md` 或 manifest 指定相对路径 | `POLAR_AGENT_SYSTEM_TARGET` | 第一个成功写出的 harness-specific instruction 文件 |
+| `<runtime workdir>/...` target 列表 | `POLAR_AGENT_SYSTEM_TARGETS` | JSON string，包含所有成功写出的 agent system targets |
+| `<runtime workdir>/AGENTS.md` | `POLAR_AGENTS_MD` | 仅当实际 target basename 是 `AGENTS.md` 时设置 |
+| `/polar/session/evolution/skills/` | `POLAR_SKILLS_DIR` | staged skill bundle directories |
+| `/polar/session/evolution/adapters.json` | `POLAR_ADAPTER_MERGE_SPEC` | custom runtimes/tools 可读取的 adapter merge spec |
+
+`agent_system` 和自然语言 memory 也会被 prepend 到 agent instruction：
+
+```text
+Use the following evolved agent system instructions for this task:
+<rendered agent system>
+
+Use the following long-term memory for this task:
+<rendered memory>
+
+Task:
+<original task instruction>
+```
+
+文件/env 路径仍然保留，方便自定义 harness 直接读取 memory 或 agent system 文本。
+
+## Agent System Text Updates
+
+`agent_system` artifact 表示对 agent system prompt 或 harness-specific 指令文件的演化。
+它的 URI 必须指向 `file://` 文本文件，manifest 可以包含：
+
+```json
+{
+  "target_path": "AGENTS.md"
+}
+```
+
+`target_path` 是 `runtime.spec.workdir` 下的相对路径；如果 runtime 没有配置 workdir，
+则相对 `/polar/session`。当前允许的目标是明确的 harness instruction 文件：
+
+- `AGENTS.md` 或 `agents.md`：Codex/通用 repository instruction。
+- `.openhands/microagents/*.md`：OpenHands repository microagent。
+- `CLAUDE.md`、`GEMINI.md`：对应 harness 的 repository-level 指令文件。
+
+Backend 注册和 Gateway staging 都会拒绝空路径、绝对路径、包含 `..` 的路径，以及
+allowlist 外的相对路径，避免 evolution artifact 覆盖任意 workdir 文件。一个 context
+可以包含多个 `agent_system.targets`；gateway 会分别写出对应目标，并把拼接后的文本写到
+`POLAR_AGENT_SYSTEM_FILE`。即使所有 harness target 都因为安全校验失败被跳过，
+canonical `agent_system.md` 仍会被写出并且 instruction prepend 仍然生效。
+
+## Skill Bundle Staging
+
+```mermaid
+flowchart LR
+    ContextSkill[skill_bundle artifact]
+    FileURI[file:// URI]
+    StageDir["host .polar_evolution_upload/skills/<safe-name>"]
+    RuntimeDir["/polar/session/evolution/skills/<safe-name>"]
+    HarnessSkillDir[Agent-specific skill dir]
+
+    ContextSkill --> FileURI --> StageDir --> RuntimeDir --> HarnessSkillDir
+```
+
+支持的 skill artifacts 是 `file://` URIs，指向以下两种之一：
+
+- 包含 `SKILL.md` 的目录；
+- 单个 skill 文件。
+
+坏掉的 skill artifact 会被逐个跳过，并记录到 `context.json["warnings"]`。陈旧或
+非 file URI 的 skill 不会再导致 memory 或 adapter context 被整体丢弃。
+
+## Harness 消费方式
+
+`BaseHarness.effective_skill_paths()` 会返回静态 `agent.skills_path`，以及在存在
+evolution context 时返回 `POLAR_SKILLS_DIR`。
+
+Copy-based harness 会先复制静态 skills，再复制 evolution skills。因此如果目录名
+重复，evolution bundle 会覆盖静态 skill：
+
+```mermaid
+flowchart TB
+    Static[agent.skills_path]
+    Evolution[POLAR_SKILLS_DIR]
+    Target[Agent skill home]
+
+    Static --> Target
+    Evolution --> Target
+```
+
+OpenHands 按 path 加载 skills，并保留第一个重复 name。因此 Polar 会把
+`SKILL_PATHS` 设置为 evolution 在前：
+
+```text
+SKILL_PATHS=/polar/session/evolution/skills:/polar/static-skills
+```
+
+## Parametric Memory Runtime 路径
+
+Parametric memory 表示为 `parametric_memory` artifact。它的 manifest 应包含：
+
+```json
+{
+  "adapter_id": "parser-memory",
+  "base_model": "Qwen/Qwen3.6-27B",
+  "adapter_format": "lora"
+}
+```
+
+Context resolver 会把选中的 parametric artifacts 转成：
+
+```json
+{
+  "base_model": "Qwen/Qwen3.6-27B",
+  "merge_mode": "runtime_lora",
+  "adapters": [
+    {
+      "artifact_id": "art_...",
+      "adapter_id": "parser-memory",
+      "uri": "file:///path/to/adapter",
+      "weight": 1.0,
+      "format": "lora"
+    }
+  ]
+}
+```
+
+Gateway 会把这个 spec 写入 `SessionRegistry.metadata`，这样 proxy 在收到模型请求
+时可以使用它。
+
+## Engine-Specific Adapter Injection
+
+```mermaid
+flowchart TB
+    Spec[adapter_merge_spec]
+    Mode{merge_mode == runtime_lora?}
+    Adapter[第一个 adapter_id]
+    Engine{Gateway engine}
+    SGLang["request.model = base_model:adapter_id"]
+    VLLM["request.model = adapter_id"]
+    Noop[保持请求不变]
+
+    Spec --> Mode
+    Mode -- no --> Noop
+    Mode -- yes --> Adapter --> Engine
+    Engine -- sglang --> SGLang
+    Engine -- vllm --> VLLM
+```
+
+这里做的是 request-level LoRA selection，不是物理合并权重。serving backend 必须
+已经加载对应 adapter，或在这条代码路径之外支持 dynamic adapter loading。
+
+## 失败语义
+
+- Evolution backend 不可用：
+  - 遵循 `evolution.context.fail_open`；当 fail-open 为 true 时，session 会在没有
+    evolution context 的情况下继续。
+- 坏 skill artifact：
+  - 跳过并记录 warning；memory 和 adapter context 仍然生效。
+- 坏 agent system target path：
+  - 跳过该目标并记录 warning；其他 target、memory、skills 和 adapters 仍然生效。
+- 没有选中 adapter：
+  - `merge_mode` 为 `reference_only`；proxy 保持 served base model 不变。

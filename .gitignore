@@ -117,7 +117,9 @@ Megatron-LM/
 glm/
 
 # Generated documentation
-docs/
+docs/*
+!docs/architecture/
+!docs/architecture/*.md
 /site
 
 # Dashboard frontend build artifacts

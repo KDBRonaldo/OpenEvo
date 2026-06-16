@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field
 class ArtifactType(StrEnum):
     TEXT_MEMORY = "text_memory"
     SKILL_BUNDLE = "skill_bundle"
+    AGENT_SYSTEM = "agent_system"
     PARAMETRIC_MEMORY = "parametric_memory"
     DATASET = "dataset"
     REPORT = "report"
@@ -169,6 +170,7 @@ class WorkerFailRequest(BaseModel):
 
 class ContextLimits(BaseModel):
     max_memory_chars: int = Field(default=12000, ge=0)
+    max_agent_system_chars: int = Field(default=12000, ge=0)
     max_skill_bundles: int = Field(default=4, ge=0)
     max_adapters: int = Field(default=2, ge=0)
 
@@ -193,6 +195,7 @@ class AdapterMergeSpec(BaseModel):
 class ContextResolveResponse(BaseModel):
     context_id: str
     memory: dict[str, Any] = Field(default_factory=dict)
+    agent_system: dict[str, Any] = Field(default_factory=dict)
     skills: list[dict[str, Any]] = Field(default_factory=list)
     adapter_merge_spec: AdapterMergeSpec = Field(default_factory=AdapterMergeSpec)
     selection: dict[str, Any] = Field(default_factory=dict)

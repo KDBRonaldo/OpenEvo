@@ -8,6 +8,7 @@ from pathlib import Path
 import sqlite3
 from typing import Any, Iterator
 
+from polar_evolution.agent_system import normalize_agent_system_target_path
 from polar_evolution.context import (
     artifact_manifest,
     artifact_matches,
@@ -298,6 +299,12 @@ class EvolutionStore:
 
         request_payload = request.model_dump(mode="json")
         artifact_type = str(request_payload["type"])
+        if artifact_type == str(ArtifactType.AGENT_SYSTEM):
+            manifest = dict(request_payload["manifest"])
+            manifest["target_path"] = normalize_agent_system_target_path(
+                manifest.get("target_path")
+            )
+            request_payload["manifest"] = manifest
         lineage_json = _json_dumps(request_payload["lineage"])
         compatibility_json = _json_dumps(request_payload["compatibility"])
         scores_json = _json_dumps(request_payload["scores"])
@@ -407,16 +414,15 @@ class EvolutionStore:
         raw_payload = request.model_dump(mode="python")
         _validate_finite_floats(raw_payload, "request")
 
-        rows = [
-            row
-            for row in self._promoted_artifact_rows()
-            if artifact_matches(request, row)
-        ]
+        rows = [row for row in self._promoted_artifact_rows() if artifact_matches(request, row)]
         rows = sort_candidates(rows)
 
         selected_memory: list[dict[str, object]] = []
         rendered_parts: list[str] = []
         memory_chars = 0
+        selected_agent_system: list[dict[str, object]] = []
+        agent_system_parts: list[str] = []
+        agent_system_chars = 0
         skills: list[dict[str, object]] = []
         adapters: list[dict[str, object]] = []
         selected_ids: list[str] = []
@@ -435,7 +441,38 @@ class EvolutionStore:
                 memory_chars += separator_chars + len(clipped)
                 selected_memory.append({"artifact_id": artifact_id, "name": row["name"]})
                 selected_ids.append(artifact_id)
-            elif kind == ArtifactType.SKILL_BUNDLE and len(skills) < request.limits.max_skill_bundles:
+            elif (
+                kind == ArtifactType.AGENT_SYSTEM
+                and agent_system_chars < request.limits.max_agent_system_chars
+            ):
+                text = read_file_uri_text(str(row["uri"]))
+                separator_chars = 2 if agent_system_parts else 0
+                remaining = (
+                    request.limits.max_agent_system_chars - agent_system_chars - separator_chars
+                )
+                if not text or remaining <= 0:
+                    continue
+                clipped = text[:remaining]
+                manifest = artifact_manifest(row)
+                try:
+                    target_path = normalize_agent_system_target_path(manifest.get("target_path"))
+                except ValueError:
+                    continue
+                agent_system_parts.append(clipped)
+                agent_system_chars += separator_chars + len(clipped)
+                selected_agent_system.append(
+                    {
+                        "artifact_id": artifact_id,
+                        "name": row["name"],
+                        "target_path": target_path,
+                        "rendered_text": clipped,
+                    }
+                )
+                selected_ids.append(artifact_id)
+            elif (
+                kind == ArtifactType.SKILL_BUNDLE
+                and len(skills) < request.limits.max_skill_bundles
+            ):
                 skills.append(
                     {
                         "artifact_id": artifact_id,
@@ -444,15 +481,21 @@ class EvolutionStore:
                     }
                 )
                 selected_ids.append(artifact_id)
-            elif kind == ArtifactType.PARAMETRIC_MEMORY and len(adapters) < request.limits.max_adapters:
+            elif (
+                kind == ArtifactType.PARAMETRIC_MEMORY
+                and len(adapters) < request.limits.max_adapters
+            ):
                 manifest = artifact_manifest(row)
                 adapter_format = manifest.get("adapter_format")
                 if not isinstance(adapter_format, str) or not adapter_format:
                     adapter_format = "lora"
+                adapter_id = manifest.get("adapter_id")
+                if not isinstance(adapter_id, str) or not adapter_id.strip():
+                    adapter_id = row["name"]
                 adapters.append(
                     {
                         "artifact_id": artifact_id,
-                        "adapter_id": row["name"],
+                        "adapter_id": adapter_id,
                         "uri": row["uri"],
                         "weight": 1.0,
                         "format": adapter_format,
@@ -467,6 +510,16 @@ class EvolutionStore:
                 memory={
                     "artifact_ids": [str(item["artifact_id"]) for item in selected_memory],
                     "rendered_text": "\n\n".join(rendered_parts),
+                },
+                agent_system={
+                    "artifact_ids": [str(item["artifact_id"]) for item in selected_agent_system],
+                    "rendered_text": "\n\n".join(agent_system_parts),
+                    "target_path": (
+                        selected_agent_system[0]["target_path"]
+                        if selected_agent_system
+                        else "AGENTS.md"
+                    ),
+                    "targets": selected_agent_system,
                 },
                 skills=skills,
                 adapter_merge_spec=AdapterMergeSpec(
@@ -599,7 +652,9 @@ class EvolutionStore:
             unique_ids,
         ).fetchall()
         existing_ids = {str(row["artifact_id"]) for row in rows}
-        missing_ids = [artifact_id for artifact_id in unique_ids if artifact_id not in existing_ids]
+        missing_ids = [
+            artifact_id for artifact_id in unique_ids if artifact_id not in existing_ids
+        ]
         if missing_ids:
             label = "artifact_id" if len(missing_ids) == 1 else "artifact_ids"
             raise ValueError(f"unknown input {label}: {', '.join(missing_ids)}")
@@ -978,9 +1033,7 @@ class EvolutionStore:
         clauses: list[str] = []
         params: list[object] = []
         if request.query.event_types:
-            clauses.append(
-                "event_type IN (%s)" % ",".join("?" for _ in request.query.event_types)
-            )
+            clauses.append("event_type IN (%s)" % ",".join("?" for _ in request.query.event_types))
             params.extend(request.query.event_types)
         if request.query.status:
             clauses.append("status IN (%s)" % ",".join("?" for _ in request.query.status))

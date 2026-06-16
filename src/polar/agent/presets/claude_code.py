@@ -7,6 +7,11 @@ import shlex
 
 from polar.agent.base import BaseHarness
 from polar.agent.models import AgentSpec
+from polar.agent.presets._subscription import (
+    AUTH_MODE_SUBSCRIPTION,
+    command_with_unset_proxy_env,
+    normalize_auth_mode,
+)
 from polar.runtime.base import BaseRuntime, RUNTIME_AGENT_LOG_DIR, RUNTIME_SESSION_DIR
 from polar.runtime.models import ExecInput
 
@@ -14,14 +19,20 @@ from polar.runtime.models import ExecInput
 class ClaudeCodeHarness(BaseHarness):
     """Run Claude Code CLI in non-interactive mode."""
 
+    _AUTH_MODE_CLAUDE_SUBSCRIPTION = "claude_subscription"
+
     def __init__(self, agent_spec: AgentSpec) -> None:
         super().__init__(agent_spec)
         # Absolute path outside the workspace — $HOME won't expand in docker
         # exec -e, and a literal "$HOME" dir would get swept into git add -A.
         self._config_dir = f"{RUNTIME_SESSION_DIR}/.claude"
 
+    def _effective_config_dir(self) -> str:
+        return self.env.get("CLAUDE_CONFIG_DIR") or self._config_dir
+
     async def setup(self, runtime: BaseRuntime) -> None:
-        await runtime.exec(f"mkdir -p {self._config_dir}")
+        config_dir = self._effective_config_dir()
+        await runtime.exec(f"mkdir -p {shlex.quote(config_dir)}")
 
         # Register MCP servers
         if self.mcp_servers:
@@ -40,18 +51,23 @@ class ClaudeCodeHarness(BaseHarness):
             config = {"mcpServers": mcp_config}
             config_json = json.dumps(config)
             await runtime.exec(
-                f"cat > {self._config_dir}/.claude.json << 'POLARCFG'\n{config_json}\nPOLARCFG"
+                f"cat > {shlex.quote(config_dir)}/.claude.json << 'POLARCFG'\n{config_json}\nPOLARCFG"
             )
 
         # Copy skills
-        if self.skills_path:
+        for skills_path in self.effective_skill_paths():
             await runtime.exec(
-                f"mkdir -p {self._config_dir}/skills && "
-                f"cp -r {shlex.quote(self.skills_path)}/* {self._config_dir}/skills/ 2>/dev/null || true"
+                f"mkdir -p {shlex.quote(config_dir)}/skills && "
+                f"cp -r {shlex.quote(skills_path)}/* {shlex.quote(config_dir)}/skills/ 2>/dev/null || true"
             )
 
     def run_steps(self, instruction: str) -> list[ExecInput]:
         escaped = shlex.quote(instruction)
+        auth_mode = normalize_auth_mode(
+            self.settings.get("auth_mode"),
+            harness="claude_code",
+            subscription_aliases=(self._AUTH_MODE_CLAUDE_SUBSCRIPTION,),
+        )
 
         flags: list[str] = [
             "--verbose",
@@ -72,9 +88,10 @@ class ClaudeCodeHarness(BaseHarness):
                 flags.append(f"{cli} {shlex.quote(str(value))}")
 
         flags_str = " ".join(flags)
+        config_dir = self._effective_config_dir()
         env: dict[str, str] = {
             **self.env,
-            "CLAUDE_CONFIG_DIR": self._config_dir,
+            "CLAUDE_CONFIG_DIR": config_dir,
             # Allow --dangerously-skip-permissions / bypassPermissions inside
             "IS_SANDBOX": "1",
             # Suppress Statsig / telemetry calls that the CLI otherwise makes
@@ -99,12 +116,16 @@ class ClaudeCodeHarness(BaseHarness):
             ):
                 env[alias] = self.model_name
 
+        command = (
+            f"claude {flags_str}{model_flag} -p {escaped} "
+            f"2>&1 | tee {RUNTIME_AGENT_LOG_DIR}/claude-code.txt"
+        )
+        if auth_mode == AUTH_MODE_SUBSCRIPTION:
+            command = command_with_unset_proxy_env(command)
+
         return [
             ExecInput(
-                command=(
-                    f"claude {flags_str}{model_flag} -p {escaped} "
-                    f"2>&1 | tee {RUNTIME_AGENT_LOG_DIR}/claude-code.txt"
-                ),
+                command=command,
                 env=env,
             )
         ]

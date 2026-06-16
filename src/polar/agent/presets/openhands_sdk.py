@@ -52,9 +52,12 @@ class OpenHandsSdkHarness(BaseHarness):
             ]
             env["MCP_SERVERS_JSON"] = json.dumps(servers)
 
-        # Pass skills path
-        if self.skills_path:
-            env["SKILL_PATHS"] = self.skills_path
+        # Pass skill roots
+        skill_paths = self.effective_skill_paths()
+        if self.env.get("POLAR_SKILLS_DIR"):
+            skill_paths = list(reversed(skill_paths))
+        if skill_paths:
+            env["SKILL_PATHS"] = ":".join(skill_paths)
 
         # Map settings to env
         for key, env_key in [

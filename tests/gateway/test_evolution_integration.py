@@ -15,6 +15,7 @@ from polar.gateway.node import (
     build_evolution_session_event,
     write_evolution_context_files,
 )
+from polar.gateway.session import SessionRegistry
 from polar.rollout.models import (
     SessionDispatchRequest,
     SessionResult,
@@ -401,9 +402,7 @@ async def test_handle_postrun_fail_closed_export_error_skips_delete_and_callback
     )
 
     with pytest.raises(RuntimeError, match="backend down"):
-        await manager._handle_postrun(
-            _managed_postrun_session(tmp_path, _session_result())
-        )
+        await manager._handle_postrun(_managed_postrun_session(tmp_path, _session_result()))
 
     assert calls == [
         "postrun_steps",
@@ -415,10 +414,14 @@ async def test_handle_postrun_fail_closed_export_error_skips_delete_and_callback
 
 
 class FakeRuntime:
-    def __init__(self) -> None:
+    def __init__(self, *, workdir: str | None = None) -> None:
+        self.spec = RuntimeSpec(image="runtime:latest", workdir=workdir)
+        self.runtime_session_dir = "/polar/session"
         self.uploads: dict[str, str] = {}
+        self.exec_commands: list[str] = []
 
     async def exec(self, command, **kwargs):
+        self.exec_commands.append(command)
         return None
 
     async def upload_file(self, source, target):
@@ -479,6 +482,10 @@ async def test_write_evolution_context_files(tmp_path):
     context = {
         "context_id": "ctx_1",
         "memory": {"rendered_text": "Remember parser precedence."},
+        "agent_system": {
+            "rendered_text": "Prefer repository-local conventions.",
+            "target_path": "AGENTS.md",
+        },
         "skills": [],
         "adapter_merge_spec": {
             "base_model": "Qwen/Qwen3.6-27B",
@@ -496,22 +503,50 @@ async def test_write_evolution_context_files(tmp_path):
     )
 
     assert (
-        json.loads(runtime.uploads["/polar/session/evolution/context.json"])[
-            "context_id"
-        ]
+        json.loads(runtime.uploads["/polar/session/evolution/context.json"])["context_id"]
         == "ctx_1"
     )
-    assert runtime.uploads["/polar/session/evolution/memory.md"] == (
-        "Remember parser precedence."
+    assert runtime.uploads["/polar/session/evolution/memory.md"] == ("Remember parser precedence.")
+    assert runtime.uploads["/polar/session/evolution/agent_system.md"] == (
+        "Prefer repository-local conventions."
     )
+    assert runtime.uploads["/polar/session/AGENTS.md"] == ("Prefer repository-local conventions.")
     assert (
-        json.loads(runtime.uploads["/polar/session/evolution/adapters.json"])[
-            "merge_mode"
-        ]
+        json.loads(runtime.uploads["/polar/session/evolution/adapters.json"])["merge_mode"]
         == "reference_only"
     )
     assert env["POLAR_EVOLUTION_CONTEXT"] == "/polar/session/evolution/context.json"
     assert env["POLAR_MEMORY_FILE"] == "/polar/session/evolution/memory.md"
+    assert env["POLAR_AGENT_SYSTEM_FILE"] == "/polar/session/evolution/agent_system.md"
+    assert env["POLAR_AGENT_SYSTEM_TARGET"] == "/polar/session/AGENTS.md"
+    assert json.loads(env["POLAR_AGENT_SYSTEM_TARGETS"]) == ["/polar/session/AGENTS.md"]
+    assert env["POLAR_AGENTS_MD"] == "/polar/session/AGENTS.md"
+
+
+@pytest.mark.asyncio
+async def test_write_evolution_context_files_uses_runtime_workdir_for_agent_system_target(
+    tmp_path,
+):
+    runtime = FakeRuntime(workdir="/workspace/repo")
+    context = {
+        "context_id": "ctx_1",
+        "agent_system": {
+            "rendered_text": "Prefer repository-local conventions.",
+            "target_path": "AGENTS.md",
+        },
+    }
+
+    env = await write_evolution_context_files(
+        runtime=runtime,
+        context=context,
+        host_dir=tmp_path,
+        target_dir="/polar/session/evolution",
+    )
+
+    assert runtime.uploads["/workspace/repo/AGENTS.md"] == ("Prefer repository-local conventions.")
+    assert env["POLAR_AGENT_SYSTEM_TARGET"] == "/workspace/repo/AGENTS.md"
+    assert env["POLAR_AGENTS_MD"] == "/workspace/repo/AGENTS.md"
+    assert "mkdir -p /workspace/repo" in runtime.exec_commands
 
 
 @pytest.mark.asyncio
@@ -520,6 +555,10 @@ async def test_write_evolution_context_files_avoids_bind_mount_same_file(tmp_pat
     context = {
         "context_id": "ctx_1",
         "memory": {"rendered_text": "Remember parser precedence."},
+        "agent_system": {
+            "rendered_text": "Use OpenHands repository microagents.",
+            "target_path": ".openhands/microagents/repo.md",
+        },
         "adapter_merge_spec": {"merge_mode": "reference_only"},
     }
 
@@ -530,17 +569,134 @@ async def test_write_evolution_context_files_avoids_bind_mount_same_file(tmp_pat
         target_dir="/polar/session/evolution",
     )
 
-    assert json.loads((tmp_path / "evolution" / "context.json").read_text())[
-        "context_id"
-    ] == "ctx_1"
-    assert (tmp_path / "evolution" / "memory.md").read_text() == (
-        "Remember parser precedence."
+    assert (
+        json.loads((tmp_path / "evolution" / "context.json").read_text())["context_id"] == "ctx_1"
     )
-    assert json.loads((tmp_path / "evolution" / "adapters.json").read_text())[
-        "merge_mode"
-    ] == "reference_only"
+    assert (tmp_path / "evolution" / "memory.md").read_text() == ("Remember parser precedence.")
+    assert (tmp_path / "evolution" / "agent_system.md").read_text() == (
+        "Use OpenHands repository microagents."
+    )
+    assert (tmp_path / ".openhands" / "microagents" / "repo.md").read_text() == (
+        "Use OpenHands repository microagents."
+    )
+    assert (
+        json.loads((tmp_path / "evolution" / "adapters.json").read_text())["merge_mode"]
+        == "reference_only"
+    )
     assert (tmp_path / "evolution" / "skills").is_dir()
     assert env["POLAR_EVOLUTION_CONTEXT"] == "/polar/session/evolution/context.json"
+    assert env["POLAR_AGENT_SYSTEM_TARGET"] == ("/polar/session/.openhands/microagents/repo.md")
+    assert json.loads(env["POLAR_AGENT_SYSTEM_TARGETS"]) == [
+        "/polar/session/.openhands/microagents/repo.md"
+    ]
+    assert "POLAR_AGENTS_MD" not in env
+
+
+@pytest.mark.asyncio
+async def test_write_evolution_context_files_skips_unsafe_agent_system_target_but_uploads_canonical(
+    tmp_path,
+):
+    runtime = FakeRuntime()
+    context = {
+        "context_id": "ctx_1",
+        "agent_system": {
+            "rendered_text": "Do not overwrite project config.",
+            "target_path": "pyproject.toml",
+        },
+    }
+
+    env = await write_evolution_context_files(
+        runtime=runtime,
+        context=context,
+        host_dir=tmp_path,
+        target_dir="/polar/session/evolution",
+    )
+
+    assert runtime.uploads["/polar/session/evolution/agent_system.md"] == (
+        "Do not overwrite project config."
+    )
+    assert "/polar/session/pyproject.toml" not in runtime.uploads
+    assert env["POLAR_AGENT_SYSTEM_FILE"] == "/polar/session/evolution/agent_system.md"
+    assert "POLAR_AGENT_SYSTEM_TARGET" not in env
+    assert "POLAR_AGENT_SYSTEM_TARGETS" not in env
+    assert "warnings" in json.loads(runtime.uploads["/polar/session/evolution/context.json"])
+
+
+@pytest.mark.asyncio
+async def test_write_evolution_context_files_stages_skill_bundle_artifacts(tmp_path):
+    skill_source = tmp_path / "source_skill"
+    skill_source.mkdir()
+    (skill_source / "SKILL.md").write_text(
+        "---\nname: parser-memory\n---\nRemember parser precedence.",
+        encoding="utf-8",
+    )
+    runtime = BindMountRuntime(tmp_path)
+    context = {
+        "context_id": "ctx_1",
+        "skills": [
+            {
+                "artifact_id": "artifact skill/1",
+                "name": "Parser Memory",
+                "uri": skill_source.as_uri(),
+            }
+        ],
+    }
+
+    await write_evolution_context_files(
+        runtime=runtime,
+        context=context,
+        host_dir=tmp_path,
+        target_dir="/polar/session/evolution",
+    )
+
+    staged_skill = tmp_path / "evolution" / "skills" / "artifact-skill-1"
+    assert (staged_skill / "SKILL.md").read_text(encoding="utf-8") == (
+        "---\nname: parser-memory\n---\nRemember parser precedence."
+    )
+    manifest = json.loads((staged_skill / "artifact.json").read_text(encoding="utf-8"))
+    assert manifest["artifact_id"] == "artifact skill/1"
+    assert manifest["uri"] == skill_source.as_uri()
+
+
+@pytest.mark.asyncio
+async def test_write_evolution_context_files_skips_bad_skill_without_dropping_memory(
+    tmp_path,
+):
+    runtime = BindMountRuntime(tmp_path)
+    context = {
+        "context_id": "ctx_1",
+        "memory": {"rendered_text": "Remember parser precedence."},
+        "skills": [
+            {
+                "artifact_id": "bad_skill",
+                "name": "Bad Skill",
+                "uri": "https://example.invalid/skills/bad",
+            }
+        ],
+        "adapter_merge_spec": {
+            "base_model": "Qwen/Qwen3.6-27B",
+            "merge_mode": "runtime_lora",
+            "adapters": [{"adapter_id": "parser-memory"}],
+        },
+    }
+
+    await write_evolution_context_files(
+        runtime=runtime,
+        context=context,
+        host_dir=tmp_path,
+        target_dir="/polar/session/evolution",
+    )
+
+    assert (tmp_path / "evolution" / "memory.md").read_text(encoding="utf-8") == (
+        "Remember parser precedence."
+    )
+    assert (
+        json.loads((tmp_path / "evolution" / "adapters.json").read_text())["merge_mode"]
+        == "runtime_lora"
+    )
+    written_context = json.loads((tmp_path / "evolution" / "context.json").read_text())
+    assert "warnings" in written_context
+    assert "bad_skill" in written_context["warnings"][0]
 
 
 @pytest.mark.asyncio
@@ -594,6 +750,53 @@ async def test_resolve_and_inject_evolution_context_updates_metadata_and_returns
         "context_id": "ctx_1",
         "context_injected": True,
     }
+
+
+@pytest.mark.asyncio
+async def test_resolve_and_inject_evolution_context_updates_session_registry_adapter_spec(
+    tmp_path,
+):
+    runtime = FakeRuntime()
+    context = {
+        "context_id": "ctx_1",
+        "adapter_merge_spec": {
+            "base_model": "Qwen/Qwen3.6-27B",
+            "merge_mode": "runtime_lora",
+            "adapters": [{"adapter_id": "parser-memory"}],
+        },
+    }
+    client = FakeEvolutionClient(context=context)
+    registry = SessionRegistry()
+    registry.register("session_1", task_id="task_1", metadata={"source": "test"})
+    manager = GatewayNodeManager.__new__(GatewayNodeManager)
+    manager.evolution = EvolutionConfig(enabled=True)
+    manager.evolution_client = client
+    manager.model_served = "Qwen/Qwen3.6-27B"
+    manager.session_registry = registry
+    request = SessionDispatchRequest(
+        session_id="session_1",
+        task_id="task_1",
+        instruction="Fix parser precedence.",
+        remaining_timeout_seconds=60,
+        agent=AgentSpec(harness="fake"),
+        metadata={},
+    )
+    managed = ManagedSession(
+        request=request,
+        timer=StageTimer(),
+        session_dir=tmp_path,
+        artifacts_dir=tmp_path / "artifacts",
+        runtime=runtime,
+    )
+    managed.execution_deadline = asyncio.get_running_loop().time() + 60
+
+    await manager._resolve_and_inject_evolution_context(managed, FakeHarness())
+
+    info = registry.get("session_1")
+    assert info is not None
+    assert info.metadata is not None
+    assert info.metadata["adapter_merge_spec"] == context["adapter_merge_spec"]
+    assert info.metadata["evolution"]["context_id"] == "ctx_1"
 
 
 @pytest.mark.asyncio
@@ -734,10 +937,121 @@ async def test_handle_run_passes_evolution_env_to_runtime_exec(tmp_path, monkeyp
     assert managed.agent_result.status == "completed"
     assert runtime.exec_envs[-1]["EXISTING"] == "1"
     assert (
-        runtime.exec_envs[-1]["POLAR_EVOLUTION_CONTEXT"]
-        == "/polar/session/evolution/context.json"
+        runtime.exec_envs[-1]["POLAR_EVOLUTION_CONTEXT"] == "/polar/session/evolution/context.json"
     )
-    assert runtime.exec_envs[-1]["POLAR_MEMORY_FILE"] == (
-        "/polar/session/evolution/memory.md"
-    )
+    assert runtime.exec_envs[-1]["POLAR_MEMORY_FILE"] == ("/polar/session/evolution/memory.md")
     assert request.agent.env["POLAR_SKILLS_DIR"] == "/polar/session/evolution/skills"
+
+
+@pytest.mark.asyncio
+async def test_handle_run_prepends_rendered_memory_to_agent_instruction(tmp_path, monkeypatch):
+    class InstructionHarness(RunStepHarness):
+        def __init__(self, agent_spec: AgentSpec) -> None:
+            super().__init__(agent_spec)
+            self.instructions: list[str] = []
+
+        def run_steps(self, instruction: str) -> list[ExecInput]:
+            self.instructions.append(instruction)
+            return [ExecInput(command="echo run")]
+
+    runtime = BindMountRuntime(tmp_path)
+    client = FakeEvolutionClient(
+        context={
+            "context_id": "ctx_1",
+            "memory": {"rendered_text": "Always preserve parser precedence."},
+        }
+    )
+    manager = GatewayNodeManager.__new__(GatewayNodeManager)
+    manager.evolution = EvolutionConfig(enabled=True)
+    manager.evolution_client = client
+    manager.model_served = "served-model"
+    manager.gateway_url = "http://gateway.test"
+    manager.default_runtime = None
+    request = SessionDispatchRequest(
+        session_id="session_1",
+        task_id="task_1",
+        instruction="Do work.",
+        remaining_timeout_seconds=60,
+        agent=AgentSpec(harness="fake"),
+        metadata={},
+    )
+    harness = InstructionHarness(request.agent)
+    monkeypatch.setattr(manager, "_resolve_agent_harness", lambda _: harness)
+    managed = ManagedSession(
+        request=request,
+        timer=StageTimer(),
+        session_dir=tmp_path,
+        artifacts_dir=tmp_path / "artifacts",
+        runtime=runtime,
+    )
+    managed.execution_deadline = asyncio.get_running_loop().time() + 60
+
+    await manager._handle_run(managed)
+
+    assert harness.instructions == [
+        (
+            "Use the following long-term memory for this task:\n"
+            "Always preserve parser precedence.\n\n"
+            "Task:\nDo work."
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_handle_run_prepends_agent_system_before_memory(tmp_path, monkeypatch):
+    class InstructionHarness(RunStepHarness):
+        def __init__(self, agent_spec: AgentSpec) -> None:
+            super().__init__(agent_spec)
+            self.instructions: list[str] = []
+
+        def run_steps(self, instruction: str) -> list[ExecInput]:
+            self.instructions.append(instruction)
+            return [ExecInput(command="echo run")]
+
+    runtime = BindMountRuntime(tmp_path)
+    client = FakeEvolutionClient(
+        context={
+            "context_id": "ctx_1",
+            "agent_system": {
+                "rendered_text": "Prefer repository-local conventions.",
+                "target_path": "AGENTS.md",
+            },
+            "memory": {"rendered_text": "Always preserve parser precedence."},
+        }
+    )
+    manager = GatewayNodeManager.__new__(GatewayNodeManager)
+    manager.evolution = EvolutionConfig(enabled=True)
+    manager.evolution_client = client
+    manager.model_served = "served-model"
+    manager.gateway_url = "http://gateway.test"
+    manager.default_runtime = None
+    request = SessionDispatchRequest(
+        session_id="session_1",
+        task_id="task_1",
+        instruction="Do work.",
+        remaining_timeout_seconds=60,
+        agent=AgentSpec(harness="fake"),
+        metadata={},
+    )
+    harness = InstructionHarness(request.agent)
+    monkeypatch.setattr(manager, "_resolve_agent_harness", lambda _: harness)
+    managed = ManagedSession(
+        request=request,
+        timer=StageTimer(),
+        session_dir=tmp_path,
+        artifacts_dir=tmp_path / "artifacts",
+        runtime=runtime,
+    )
+    managed.execution_deadline = asyncio.get_running_loop().time() + 60
+
+    await manager._handle_run(managed)
+
+    assert harness.instructions == [
+        (
+            "Use the following evolved agent system instructions for this task:\n"
+            "Prefer repository-local conventions.\n\n"
+            "Use the following long-term memory for this task:\n"
+            "Always preserve parser precedence.\n\n"
+            "Task:\nDo work."
+        )
+    ]

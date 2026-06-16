@@ -79,6 +79,7 @@ cd web && npm install && npm run build
   [evaluator](src/polar/trajectory/evaluator/README.md) guides for registered strategies.
 - 🔧 [Deployment Topology](src/polar/config/README.md): configure the Polar service.
 - ▶️ [Request for Rollout](src/polar/rollout/README.md): client side task submission via rollout API.
+- 🧭 [架构文档](docs/architecture/README.md): Polar 系统图、gateway/runtime 流程，以及 skill/memory evolution backend 文档。
 
 
 

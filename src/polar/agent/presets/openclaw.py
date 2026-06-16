@@ -32,10 +32,10 @@ class OpenClawHarness(BaseHarness):
         # folders ("main" agent dir) that the embedded `--local` run expects.
         await runtime.exec("openclaw setup --workspace . </dev/null")
 
-        if self.skills_path:
+        for skills_path in self.effective_skill_paths():
             await runtime.exec(
                 "mkdir -p $HOME/.openclaw/skills && "
-                f"cp -r {shlex.quote(self.skills_path)}/* "
+                f"cp -r {shlex.quote(skills_path)}/* "
                 "$HOME/.openclaw/skills/ 2>/dev/null || true"
             )
 

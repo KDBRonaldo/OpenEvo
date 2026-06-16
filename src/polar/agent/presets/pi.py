@@ -28,10 +28,10 @@ class PiHarness(BaseHarness):
     async def setup(self, runtime: BaseRuntime) -> None:
         await runtime.exec(f"mkdir -p {self._AGENT_DIR}")
 
-        if self.skills_path:
+        for skills_path in self.effective_skill_paths():
             await runtime.exec(
                 f"mkdir -p {self._AGENT_DIR}/skills && "
-                f"cp -r {shlex.quote(self.skills_path)}/* {self._AGENT_DIR}/skills/ 2>/dev/null || true"
+                f"cp -r {shlex.quote(skills_path)}/* {self._AGENT_DIR}/skills/ 2>/dev/null || true"
             )
 
     def run_steps(self, instruction: str) -> list[ExecInput]:
