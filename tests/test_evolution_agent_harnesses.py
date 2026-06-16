@@ -197,7 +197,7 @@ def test_codex_run_steps_subscription_auth_mode_uses_existing_login_state():
         AgentSpec(
             harness="codex",
             model_name="gpt-5.5",
-            settings={"auth_mode": "subscription"},
+            settings={"auth_mode": "subscription", "capture_mode": "transcript"},
             env={"CODEX_HOME": "/polar/session/preauthenticated-codex"},
         )
     )
@@ -218,12 +218,24 @@ def test_codex_run_steps_subscription_auth_mode_uses_existing_login_state():
     assert step.env["CODEX_HOME"] == "/polar/session/preauthenticated-codex"
 
 
+def test_codex_subscription_auth_mode_requires_transcript_capture_option():
+    harness = CodexHarness(
+        AgentSpec(
+            harness="codex",
+            settings={"auth_mode": "subscription"},
+        )
+    )
+
+    with pytest.raises(ValueError, match="capture_mode"):
+        harness.run_steps("Do work.")
+
+
 def test_codex_run_steps_keeps_chatgpt_subscription_auth_mode_alias():
     harness = CodexHarness(
         AgentSpec(
             harness="codex",
             model_name="gpt-5.5",
-            settings={"auth_mode": "chatgpt_subscription"},
+            settings={"auth_mode": "chatgpt_subscription", "capture_mode": "transcript"},
         )
     )
 
@@ -250,7 +262,7 @@ def test_claude_run_steps_subscription_auth_mode_uses_existing_login_state():
         AgentSpec(
             harness="claude_code",
             model_name="opus",
-            settings={"auth_mode": "subscription"},
+            settings={"auth_mode": "subscription", "capture_mode": "transcript"},
         )
     )
 
@@ -266,6 +278,18 @@ def test_claude_run_steps_subscription_auth_mode_uses_existing_login_state():
     assert step.env is not None
     assert step.env["CLAUDE_CONFIG_DIR"] == "/polar/session/.claude"
     assert step.env["ANTHROPIC_MODEL"] == "opus"
+
+
+def test_claude_subscription_auth_mode_requires_transcript_capture_option():
+    harness = ClaudeCodeHarness(
+        AgentSpec(
+            harness="claude_code",
+            settings={"auth_mode": "subscription"},
+        )
+    )
+
+    with pytest.raises(ValueError, match="capture_mode"):
+        harness.run_steps("Do work.")
 
 
 def test_claude_run_steps_defaults_to_proxy_auth_mode():

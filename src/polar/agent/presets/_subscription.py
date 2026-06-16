@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from polar.agent.capture import TRANSCRIPT_CAPTURE_MODES, transcript_capture_enabled
+
 AUTH_MODE_PROXY = "proxy"
 AUTH_MODE_SUBSCRIPTION = "subscription"
 
@@ -22,13 +24,20 @@ def normalize_auth_mode(
     *,
     harness: str,
     subscription_aliases: tuple[str, ...] = (),
+    capture_mode: object = None,
 ) -> str:
     """Normalize a harness auth mode setting to proxy or subscription."""
 
     mode = str(raw_mode or AUTH_MODE_PROXY)
     if mode in subscription_aliases:
-        return AUTH_MODE_SUBSCRIPTION
+        mode = AUTH_MODE_SUBSCRIPTION
     if mode in {AUTH_MODE_PROXY, AUTH_MODE_SUBSCRIPTION}:
+        if mode == AUTH_MODE_SUBSCRIPTION and not transcript_capture_enabled(capture_mode):
+            accepted_capture_modes = ", ".join(repr(value) for value in TRANSCRIPT_CAPTURE_MODES)
+            raise ValueError(
+                f"{harness} settings.auth_mode='subscription' requires "
+                f"settings.capture_mode to be one of: {accepted_capture_modes}"
+            )
         return mode
     accepted = ", ".join(
         repr(value) for value in (AUTH_MODE_PROXY, AUTH_MODE_SUBSCRIPTION, *subscription_aliases)

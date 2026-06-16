@@ -998,7 +998,7 @@ async def test_handle_run_codex_subscription_auth_mode_unsets_polar_proxy_env(
         agent=AgentSpec(
             harness="codex",
             model_name="gpt-5.5",
-            settings={"auth_mode": "subscription"},
+            settings={"auth_mode": "subscription", "capture_mode": "transcript"},
             env={"CODEX_HOME": "/polar/session/preauthenticated-codex"},
         ),
         metadata={},
@@ -1068,7 +1068,7 @@ async def test_codex_subscription_without_proxy_completions_builds_transcript_tr
         remaining_timeout_seconds=60,
         agent=AgentSpec(
             harness="codex",
-            settings={"auth_mode": "subscription"},
+            settings={"auth_mode": "subscription", "capture_mode": "transcript"},
         ),
         metadata={},
     )
@@ -1099,6 +1099,115 @@ async def test_codex_subscription_without_proxy_completions_builds_transcript_tr
     assert trace.response_messages == [{"role": "assistant", "content": "Used subscription mode."}]
     assert trace.response_ids == []
     assert trace.response_logprobs is None
+
+
+@pytest.mark.asyncio
+async def test_transcript_capture_mode_fallback_is_not_codex_specific(
+    tmp_path,
+):
+    log_dir = tmp_path / "logs" / "agent"
+    log_dir.mkdir(parents=True)
+    (log_dir / "step.00.stdout.log").write_text(
+        json.dumps(
+            {
+                "type": "message",
+                "message": {
+                    "role": "assistant",
+                    "content": "Used non-Codex transcript mode.",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    manager = GatewayNodeManager.__new__(GatewayNodeManager)
+    manager.node_id = "node-a"
+    manager.storage = EmptyCompletionStorage()
+    manager.builders = default_builder_registry()
+    manager.session_registry = SessionRegistry()
+    manager.session_registry.register("session_1", task_id="task_1")
+    request = SessionDispatchRequest(
+        session_id="session_1",
+        task_id="task_1",
+        instruction="Do work.",
+        remaining_timeout_seconds=60,
+        agent=AgentSpec(
+            harness="claude_code",
+            settings={"capture_mode": "transcript"},
+        ),
+        metadata={},
+    )
+    managed = ManagedSession(
+        request=request,
+        timer=StageTimer(),
+        session_dir=tmp_path,
+        artifacts_dir=tmp_path / "artifacts",
+        agent_result=AgentRunResult(
+            status="completed",
+            return_code=0,
+            metadata={"log_dir": str(log_dir), "last_step": 0},
+        ),
+    )
+    managed.execution_deadline = asyncio.get_running_loop().time() + 60
+
+    result = await manager._build_session_result(managed)
+
+    assert result.status == "COMPLETED"
+    assert result.trajectory.metadata["builder"] == "agent_transcript"
+    assert result.trajectory.metadata["capture_mode"] == "transcript"
+    assert result.trajectory.traces[0].response_messages == [
+        {"role": "assistant", "content": "Used non-Codex transcript mode."}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_transcript_fallback_requires_explicit_capture_mode(tmp_path):
+    log_dir = tmp_path / "logs" / "agent"
+    log_dir.mkdir(parents=True)
+    (log_dir / "step.00.stdout.log").write_text(
+        json.dumps(
+            {
+                "type": "message",
+                "message": {"role": "assistant", "content": "Should not be used."},
+            }
+        ),
+        encoding="utf-8",
+    )
+    manager = GatewayNodeManager.__new__(GatewayNodeManager)
+    manager.node_id = "node-a"
+    manager.storage = EmptyCompletionStorage()
+    manager.builders = default_builder_registry()
+    manager.session_registry = SessionRegistry()
+    manager.session_registry.register("session_1", task_id="task_1")
+    request = SessionDispatchRequest(
+        session_id="session_1",
+        task_id="task_1",
+        instruction="Do work.",
+        remaining_timeout_seconds=60,
+        agent=AgentSpec(
+            harness="codex",
+            settings={"auth_mode": "subscription"},
+        ),
+        metadata={},
+    )
+    managed = ManagedSession(
+        request=request,
+        timer=StageTimer(),
+        session_dir=tmp_path,
+        artifacts_dir=tmp_path / "artifacts",
+        agent_result=AgentRunResult(
+            status="completed",
+            return_code=0,
+            metadata={"log_dir": str(log_dir), "last_step": 0},
+        ),
+    )
+    managed.execution_deadline = asyncio.get_running_loop().time() + 60
+
+    result = await manager._build_session_result(managed)
+
+    assert result.status == "ERROR"
+    assert result.trajectory.metadata["builder"] == "per_request"
+    assert result.trajectory.error == "no completions"
+    assert result.trajectory.traces == []
 
 
 @pytest.mark.asyncio

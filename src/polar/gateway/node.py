@@ -25,6 +25,7 @@ from polar.gateway.dispatcher import (
 )
 from polar.gateway.session import SessionRegistry
 from polar.gateway.storage import SessionStore
+from polar.agent.capture import transcript_capture_enabled
 from polar.agent.base import BaseHarness
 from polar.agent.factory import create_harness
 from polar.agent.models import AgentRunResult
@@ -1083,14 +1084,8 @@ class GatewayNodeManager:
             return False
         if request.builder.strategy == "agent_transcript":
             return False
-        if request.agent.harness != "codex":
-            return False
         settings = request.agent.settings
-        auth_mode = str(settings.get("auth_mode") or "proxy").lower()
-        if auth_mode not in {"subscription", "chatgpt_subscription"}:
-            return False
-        capture_mode = str(settings.get("capture_mode") or "transcript").lower()
-        if capture_mode not in {"transcript", "agent_transcript"}:
+        if not transcript_capture_enabled(settings.get("capture_mode")):
             return False
         return bool(agent_result.metadata)
 

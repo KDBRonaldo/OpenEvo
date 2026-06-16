@@ -67,6 +67,7 @@ class ClaudeCodeHarness(BaseHarness):
             self.settings.get("auth_mode"),
             harness="claude_code",
             subscription_aliases=(self._AUTH_MODE_CLAUDE_SUBSCRIPTION,),
+            capture_mode=self.settings.get("capture_mode"),
         )
 
         flags: list[str] = [

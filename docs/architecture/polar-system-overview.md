@@ -4,8 +4,9 @@ Polar 是面向真实 agent harness 的 rollout-as-a-service 框架。它通过�
 准备好的 runtime 中启动 agent，并在 agent 与 inference server 之间放置
 gateway proxy，使 agent 尽量不需要为 Polar 改代码。proxy 会捕获模型调用，
 并把这些调用转成 RL training 可消费的 token-level trajectory。对于不经过
-Polar proxy 的订阅模式 harness，Polar 只保证 transcript-level trajectory，
-不伪造 token id、logprob 或 token-level metric。
+Polar proxy 的纯文本 capture 模式，Polar 只保证 transcript-level trajectory，
+不伪造 token id、logprob 或 token-level metric。订阅登录只是某些 harness 的
+auth 方式；它必须显式开启 transcript capture 后才允许运行。
 
 ## 组件图
 
@@ -118,15 +119,14 @@ Polar 当前区分两类 capture：
 | 模式 | 入口 | 产物 | 适合用途 |
 |---|---|---|---|
 | Polar proxy capture | agent 请求 `OPENAI_BASE_URL` / `ANTHROPIC_BASE_URL` / Gemini proxy | `CompletionSession`，包含请求、响应、token ids、logprobs | token-level RL、policy gradient、需要 loss mask 的训练 |
-| Subscription transcript capture | Codex `auth_mode=subscription` / `chatgpt_subscription`，不经过 Polar proxy | `agent_transcript` trajectory，来自 `logs/agent/step.xx.stdout.log` | skill/memory/agent-system evolution、行为回放、非 token-level 评估 |
+| Pure-text transcript capture | `agent.settings.capture_mode="transcript"`；可配合订阅登录或其他不走 proxy 的 harness | `agent_transcript` trajectory，来自 `logs/agent/step.xx.stdout.log` | skill/memory/agent-system evolution、行为回放、非 token-level 评估 |
 
-Codex subscription 模式会显式 unset Polar proxy 相关环境变量，并使用已有
-`CODEX_HOME` 登录态运行；其中 `config.toml` 每次 session 都由 Polar 重新生成并
-覆盖，避免宿主机或预认证目录中的 Codex 配置影响 Polar 任务。因此 gateway 捕捉不到
-completion records。post-run 阶段如果发现该模式没有 proxy completion，会自动
-fallback 到 `agent_transcript` builder，从 agent stdout transcript 构造 trajectory。这个 trajectory 的
-`Trace.response_ids`、`Trace.loss_mask`、`Trace.response_logprobs` 为空，并在
-trajectory/trace metadata 中设置：
+纯文本 transcript capture 是显式选项，而不是某个 harness 的隐式行为。Gateway
+只有在 `agent.settings.capture_mode="transcript"` 或等价 transcript capture mode
+开启、且本次 run 没有 proxy completion records 时，才会 fallback 到
+`agent_transcript` builder，从 agent stdout transcript 构造 trajectory。这个
+trajectory 的 `Trace.response_ids`、`Trace.loss_mask`、`Trace.response_logprobs`
+为空，并在 trajectory/trace metadata 中设置：
 
 ```json
 {
@@ -135,9 +135,16 @@ trajectory/trace metadata 中设置：
 }
 ```
 
-后续 skill/memory evolution 可以消费这类 transcript trajectory；token-level RL
-训练必须过滤掉 `token_level_metrics_available=false` 的 traces，或要求任务走
-Polar proxy 模式。
+后续 skill/memory/agent-system evolution 可以消费这类 transcript trajectory；
+token-level RL 训练必须过滤掉 `token_level_metrics_available=false` 的 traces，
+或要求任务走 Polar proxy 模式。
+
+如果 harness 选择 `auth_mode="subscription"` 或 harness-specific subscription
+alias，它必须同时设置 transcript capture mode。Codex subscription 模式会显式
+unset Polar proxy 相关环境变量，并使用已有 `CODEX_HOME` 登录态运行；其中
+`config.toml` 每次 session 都由 Polar 重新生成并覆盖，避免宿主机或预认证目录中的
+Codex 配置影响 Polar 任务。其他订阅式 harness 也应遵守同样边界：订阅负责 auth，
+transcript capture 负责 evolution 可消费的行为记录。
 
 ## 主要模块
 

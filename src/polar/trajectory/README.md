@@ -42,10 +42,15 @@ reward onto the traces and sends the result back.
 
 ## Transcript-only trajectories
 
-Codex subscription 模式可以不经过 Polar proxy 运行，因此不会产生
-`CompletionRecord` 或 token-level metric。当该模式结束时没有捕获到 completion，
-gateway 会 fallback 到 `agent_transcript` builder，并从
-`logs/agent/step.xx.stdout.log` 重建一个不带 token metric 的 trace。
+Transcript-only trajectory 是纯文本 evolution capture 模式的产物。调用方必须
+显式设置 `agent.settings.capture_mode="transcript"` 或等价 transcript capture
+mode；当 run 结束时没有捕获到 `CompletionRecord`，gateway 才会 fallback 到
+`agent_transcript` builder，并从 `logs/agent/step.xx.stdout.log` 重建一个不带
+token metric 的 trace。
+
+Subscription auth 只是某些 harness 的登录方式，不会自动开启 transcript capture。
+使用 `auth_mode="subscription"` 或 harness-specific subscription alias 时，harness
+必须同时看到 transcript capture mode，否则应拒绝运行。
 
 这个 trace 保留 `prompt_messages` / `response_messages`，但 `response_ids`、
 `loss_mask` 和 `response_logprobs` 为空。metadata 会设置

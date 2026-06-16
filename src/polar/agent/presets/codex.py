@@ -75,6 +75,7 @@ class CodexHarness(BaseHarness):
             self.settings.get("auth_mode"),
             harness="codex",
             subscription_aliases=(self._AUTH_MODE_CHATGPT_SUBSCRIPTION,),
+            capture_mode=self.settings.get("capture_mode"),
         )
 
         codex_home = self._codex_home_path()
