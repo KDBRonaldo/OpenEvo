@@ -242,6 +242,17 @@ Runtime 消费：
 
 Issue 应包含：
 
+- Issue label：必须明确标注以下 9 种 GitHub issue label 中的一个或多个；如果涉及多类，
+  写主 label 并说明次要 label：
+  - `bug`：Something isn't working。
+  - `documentation`：Improvements or additions to documentation。
+  - `duplicate`：This issue or pull request already exists。
+  - `enhancement`：New feature or request。
+  - `good first issue`：Good for newcomers。
+  - `help wanted`：Extra attention is needed。
+  - `invalid`：This doesn't seem right。
+  - `question`：Further information is requested。
+  - `wontfix`：This will not be worked on。
 - 背景和触发场景。
 - 当前行为。
 - 期望行为。
@@ -294,8 +305,8 @@ Issue 应包含：
 当前 issue-first、PR resolves issue 和 docs-required 是仓库协作约定。要把它们变成自动或
 半自动机制，建议分层实现：
 
-1. Issue template：在 `.github/ISSUE_TEMPLATE/` 中提供 bug 和 feature 模板，强制填写
-   背景、当前行为、期望行为、复现方式和验收标准。
+1. Issue template：在 `.github/ISSUE_TEMPLATE/` 中提供模板，强制填写 issue label、
+   背景、当前行为、期望行为、复现方式和验收标准；label 值只能来自上面列出的 9 种。
 2. PR template：在 `.github/pull_request_template.md` 中加入 checklist：
    - linked issue：`Fixes #...`、`Closes #...`、`Resolves #...` 或 `Part of #...`。
    - docs updated：列出更新的文档路径，或解释为什么不需要文档变化。
