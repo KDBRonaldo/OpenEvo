@@ -40,3 +40,43 @@ adapter merge specs 的形式返回给 trainer 和 inference infrastructure。
 ```sh
 uv run polar-evolution worker --base-url http://127.0.0.1:8200 --once
 ```
+
+## Terminal Bench 离线 transcript bridge
+
+Terminal Bench 可以继续由 Harbor/EvoLab 和官方 verifier 执行。若只想让 Polar
+负责后续 skill、memory 或 agent-system evolution，可先把 Harbor/EvoLab 的 trial
+或 job 目录转换成 Polar event JSONL：
+
+```sh
+uv run polar-evolution terminal-bench-events \
+  --input /tmp/evolab-tb21-run/<job-or-trial-dir> \
+  --output /tmp/tb21-events.jsonl
+```
+
+也可以直接写入本地 EvolutionStore 并创建 dataset artifact：
+
+```sh
+uv run polar-evolution terminal-bench-dataset \
+  --input /tmp/evolab-tb21-run/<job-or-trial-dir> \
+  --db /tmp/polar-tb21/evolution.db \
+  --artifact-root /tmp/polar-tb21/artifacts \
+  --name tb21_round0 \
+  --purpose agent_system_reflection \
+  --policy-version tb21-round0 \
+  --output /tmp/polar-tb21/dataset.json
+```
+
+该 bridge 读取非 oracle 产物：
+
+- `result.json`
+- `agent/instruction.txt`
+- `agent/stdout.txt`
+- `agent/stderr.txt`
+- `agent/evolab_lab/terminal_bench_report.md`
+- `verifier/reward.txt`
+- `verifier/ctrf.json`
+- `verifier/test-stdout.txt`
+
+输出 event 使用 `event_type="polar.session_completed"`，trajectory metadata 显式设置
+`capture_mode="transcript"` 和 `token_level_metrics_available=false`。它不会把
+`config.agent.env`、API key、oracle solution 或 reference patch 写入 event。
