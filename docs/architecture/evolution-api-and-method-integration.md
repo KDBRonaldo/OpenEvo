@@ -44,6 +44,46 @@ Evolution 方法读取 dataset 或 session event 时，需要先判断 trajector
 反思材料或 memory mining 输入；需要 token-level metric 的 RL 方法必须过滤掉
 `token_level_metrics_available=false` 的 traces，或要求任务使用 Polar proxy capture。
 
+### 外部 harness 的离线 transcript 输入
+
+不由 Polar gateway 直接启动的 harness 也可以进入 pure-text evolution path。以
+Terminal Bench + Harbor/EvoLab 为例，官方 verifier 仍负责执行和打分，离线 bridge 只把
+trial/job 目录中的非 oracle 产物转换成 Polar events：
+
+```sh
+uv run polar-evolution terminal-bench-events \
+  --input /tmp/evolab-tb21-run/<job-or-trial-dir> \
+  --output /tmp/tb21-events.jsonl
+```
+
+本地实验可以跳过 HTTP backend，直接写 SQLite store 并生成 dataset artifact：
+
+```sh
+uv run polar-evolution terminal-bench-dataset \
+  --input /tmp/evolab-tb21-run/<job-or-trial-dir> \
+  --db /tmp/polar-tb21/evolution.db \
+  --artifact-root /tmp/polar-tb21/artifacts \
+  --name tb21_round0 \
+  --purpose agent_system_reflection \
+  --policy-version tb21-round0
+```
+
+转换后的 event 使用 `event_type="polar.session_completed"`，其 trajectory 由
+`terminal_bench_transcript_bridge` 构造，metadata 必须包含：
+
+```json
+{
+  "capture_mode": "transcript",
+  "token_level_metrics_available": false
+}
+```
+
+bridge 可以读取 agent instruction、stdout/stderr、EvoLab 生成的
+`terminal_bench_report.md`、verifier reward、CTRF summary 和 verifier stdout 摘要。它
+不能读取或写入 oracle solution、reference patch，也不能把 `config.agent.env` 中的 API key
+等敏感值带入 event payload。后续 orchestrator 可把这些 JSONL events ingest 到
+Evolution Backend，再创建 dataset 和 `agent_system_reflector` job。
+
 ## 核心 API
 
 | API | 用途 |
