@@ -1,0 +1,72 @@
+name: Change request
+description: Track a bug, enhancement, documentation update, or workflow change.
+title: "[change]: "
+labels: []
+body:
+  - type: dropdown
+    id: primary_label
+    attributes:
+      label: Primary label
+      description: Choose the main GitHub label for this issue.
+      options:
+        - bug
+        - documentation
+        - duplicate
+        - enhancement
+        - good first issue
+        - help wanted
+        - invalid
+        - question
+        - wontfix
+    validations:
+      required: true
+  - type: input
+    id: secondary_labels
+    attributes:
+      label: Secondary labels
+      description: Optional. List any other applicable labels from the allowed label set.
+      placeholder: "documentation, enhancement"
+  - type: textarea
+    id: background
+    attributes:
+      label: Background and trigger
+      description: What prompted this issue?
+    validations:
+      required: true
+  - type: textarea
+    id: current_behavior
+    attributes:
+      label: Current behavior
+      description: What happens today?
+    validations:
+      required: true
+  - type: textarea
+    id: expected_behavior
+    attributes:
+      label: Expected behavior
+      description: What should happen instead?
+    validations:
+      required: true
+  - type: textarea
+    id: impact
+    attributes:
+      label: Impact
+      description: Which users, APIs, runtime paths, artifacts, or workflows are affected?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction, logs, or sample data
+      description: Include commands, logs, input snippets, or links where possible.
+      render: shell
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: How will maintainers know this is resolved?
+      placeholder: |
+        - [ ] Focused tests cover the changed behavior.
+        - [ ] Relevant docs are updated.
+    validations:
+      required: true

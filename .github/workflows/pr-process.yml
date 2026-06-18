@@ -1,0 +1,35 @@
+name: PR process checks
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened, ready_for_review]
+
+jobs:
+  process-checks:
+    name: issue and docs warnings
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Collect PR metadata
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          Path("pr_body.md").write_text(os.environ.get("PR_BODY") or "", encoding="utf-8")
+          PY
+          git diff --name-only "$BASE_SHA" "$HEAD_SHA" > changed_files.txt
+      - name: Check PR process expectations
+        run: |
+          python3 scripts/ci/check_pr_process.py \
+            --pr-body-file pr_body.md \
+            --changed-files-file changed_files.txt
