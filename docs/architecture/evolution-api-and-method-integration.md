@@ -163,6 +163,80 @@ Backend 和 gateway 都会拒绝空路径、绝对路径、包含 `..` 的路径
 Gateway 总会把文本写到 `POLAR_AGENT_SYSTEM_FILE`；如果 target path 通过安全检查，也会写到
 runtime workdir 下，并设置 `POLAR_AGENT_SYSTEM_TARGET` / `POLAR_AGENT_SYSTEM_TARGETS`。
 
+内置 reference worker 提供两个 agent-system 相关方法：
+
+- `agent_system`：把 `job.config.agent_system_markdown` 或 `job.config.content` 直接打包成
+  `agent_system` artifact，适合人工 curated 文本或 smoke test。
+- `agent_system_reflector`：消费 dataset artifact，把历史 trajectories/transcripts 中的成功
+  和失败样本交给 LLM 生成新的 instruction 文本，默认写入 `agents.md`。
+
+`agent_system_reflector` 不固定模型；调用方必须在 `job.config.reflector_llm.model` 中指定
+reflector model。默认 provider 是 `openai_chat`：`base_url` 默认读取
+`OPENAI_BASE_URL`，否则使用 `https://api.openai.com/v1`；API key 可直接传入
+`reflector_llm.api_key`，或通过 `api_key_env` 从环境变量读取，默认
+`OPENAI_API_KEY`。如果只有 Codex subscription 登录态，可以设置
+`reflector_llm.provider="codex_cli"`，worker 会调用本机 `codex exec`，清除代理 API
+key/base-url 环境变量，并使用 `reflector_llm.codex_home` 指定的 Codex 登录目录。该 nested
+Codex run 会忽略用户 config、使用 `--ephemeral`、`--sandbox read-only`、
+`--ask-for-approval never`，并禁用 `shell_tool`，因为 dataset transcripts 属于不可信
+prompt 内容。该方法不做 promotion 评估，
+推荐把产出 artifact 先保持 `promoted=false`，通过离线评估或 A/B rollout 后再 promotion。
+
+示例 job：
+
+```json
+{
+  "job_type": "agent_system_reflector",
+  "method": "agent_system_reflector",
+  "input_artifact_ids": ["art_dataset"],
+  "config": {
+    "name": "codex SWE reflections",
+    "target_path": "agents.md",
+    "max_records": 20,
+    "reflector_llm": {
+      "provider": "openai_chat",
+      "model": "gpt-4.1-mini",
+      "base_url": "https://api.openai.com/v1",
+      "api_key_env": "OPENAI_API_KEY",
+      "temperature": 0.2,
+      "max_tokens": 2000
+    },
+    "compatibility": {"agent_harness": ["codex"], "task_tags": ["swe"]},
+    "scores": {"quality": 0.5},
+    "promoted": false
+  }
+}
+```
+
+输出 manifest 会包含 source dataset、record count、reflected record count、success count 和
+failure count，以及 `reflector_provider` / `reflector_model`；lineage 会记录
+`method=agent_system_reflector` 和所有 input artifact IDs。
+
+## Golden-standard evaluator
+
+有 ground truth 的任务应把评估放在 evolution orchestration 层，而不是放进某个具体
+method。共享实现位于 `polar_evolution.golden_standard`，负责：
+
+- 读取 JSON / JSONL golden records；
+- 按 article-scoped sequence matching 计算 TP/FP/FN、precision、recall、F1 和重复预测；
+- 生成脱敏的 methodology feedback；
+- 对生成的 agent-system 文本做 held-out literal 泄漏检查。
+
+推荐数据流：
+
+1. rollout agent 的 workspace 只包含任务允许的 evidence，例如 `input/`；
+2. rollout 完成后，orchestrator 在 workspace 外读取 ground truth 和 agent 输出；
+3. raw evaluation 写入实验 artifact/log，不进入后续 agent workspace；
+4. 只有脱敏 feedback 写入 event payload，例如
+   `payload.session_result.metadata.evolution_feedback.golden_standard`；
+5. evolution methods 从 dataset records 读取 `evolution_feedback`，把它当作通用训练信号。
+
+脱敏 feedback 只能描述方法论缺口，例如 over-inclusion、under-extraction、component
+boundary、coverage pass；不能包含 exact sequence、source filename、source sheet、
+row number、article title 或 reference record。这样 evaluator 可以被 text memory、
+skill、agent-system、parametric 之外的后续方法共享，同时避免每个 method 重复解析大型
+ground truth。
+
 ### `parametric_memory`
 
 参数化长期记忆，例如 LoRA/adapter。URI 指向 adapter 目录或远端引用。

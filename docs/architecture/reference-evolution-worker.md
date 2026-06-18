@@ -48,6 +48,7 @@ METHOD_REGISTRY = {
     "text_memory": text_memory,
     "skill_bundle": skill_bundle,
     "agent_system": agent_system,
+    "agent_system_reflector": agent_system_reflector,
     "parametric_memory_register": parametric_memory_register,
 }
 ```
@@ -159,6 +160,118 @@ flowchart LR
 被哪些 task tags、agent harness 或 base model 选中；例如 Codex 专用的 `AGENTS.md`
 通常应设置 `{"agent_harness": ["codex"]}`。
 
+## Method: `agent_system_reflector`
+
+用途：从 dataset 中的历史轨迹调用 LLM 生成新的 agent-system instruction 文件。这个方法
+默认使用 OpenAI-compatible Chat Completions API，也可以通过 `codex_cli` provider 使用
+Codex subscription 登录态；SOTA reflector 仍可以在专用 research worker 中替换它，只要返回
+同样的 `agent_system` artifact contract。
+
+输入：
+
+- 一个类型为 `dataset` 的 input artifact；
+- dataset URI 指向 `file://` manifest；
+- manifest 指向 `records.jsonl`，records 中可以包含 token-level traces 或 transcript
+  traces；
+- records 可以包含通用 evolution feedback，例如
+  `payload.session_result.metadata.evolution_feedback.golden_standard`。这类 feedback
+  应由 orchestration 层的共享 evaluator 预先生成，method 只消费脱敏摘要；
+- 可选旧 `agent_system` input artifact，或 `job.config.base_agent_system_markdown`、
+  `job.config.agent_system_markdown`、`job.config.content` 作为 base text；
+- 必填 `job.config.reflector_llm.model`，指定 reflector 使用的模型；
+- 可选 `job.config.reflector_llm.provider`，默认 `openai_chat`，也支持 `codex_cli`；
+- 可选 `job.config.reflector_llm.base_url`，默认读取 `OPENAI_BASE_URL`，否则使用
+  `https://api.openai.com/v1`；
+- 可选 `job.config.reflector_llm.api_key`，或通过 `api_key_env` 指定环境变量，默认
+  `OPENAI_API_KEY`；
+- `provider=codex_cli` 时可选 `codex_home` 和 `codex_bin`；worker 会清除
+  OpenAI/Anthropic/Google proxy API 环境变量，避免把 subscription run 误接到 proxy；
+  nested Codex run 会忽略用户 config、使用 `--ephemeral`、`--sandbox read-only`、
+  `--ask-for-approval never`，并禁用 `shell_tool`，因为 dataset transcripts 属于不可信
+  prompt 内容；
+- 可选 `temperature`、`max_tokens` 和 `timeout_seconds`；
+- 可选 `job.config.target_path`，默认 `agents.md`；
+- 可选 `job.config.max_records`，限制 reflector 汇总的 records 数。
+
+输出：
+
+- `ArtifactRegisterRequest(type=agent_system)`；
+- `uri=file://.../<target_path>`；
+- manifest 包含 source dataset ID、record count、reflected record count、success count
+  和 failure count，以及 `reflector_provider` / `reflector_model`；
+- lineage 包含 `method=agent_system_reflector` 和所有 input artifact IDs。
+
+```mermaid
+flowchart TB
+    DatasetArtifact[dataset artifact]
+    Manifest[manifest.json]
+    Records[records.jsonl]
+    BaseAgentSystem[optional previous agent_system]
+    Reflector[LLM reflector prompt]
+    Model[openai_chat or codex_cli LLM provider]
+    TargetFile["agents.md / harness-specific path"]
+    Artifact[agent_system artifact]
+
+    DatasetArtifact --> Manifest --> Records --> Reflector
+    BaseAgentSystem --> Reflector
+    Reflector --> Model --> TargetFile --> Artifact
+```
+
+方法会先把成功样本、失败样本和通用 evolution feedback 压缩成 prompt，上下文包含
+task、session、status、reward、prompt、observed/failure signal，以及由上游 evaluator
+写入的脱敏反馈，然后要求 LLM 返回完整 Markdown instruction 文件。
+它不负责评估生成结果，也不会默认 promotion。需要上线到 context resolver 时，应通过 job
+config 设置 `promoted=true`，并配合 `compatibility` 限制适用 harness、task tags 或 base
+model。
+
+### Shared golden-standard feedback
+
+有 ground truth 的任务不要让 `agent_system_reflector` 直接读取 reference answers。应由
+orchestrator 或独立 evaluator 先调用 `polar_evolution.golden_standard`：
+
+- 在 agent workspace 外比较最终输出和 golden records；
+- 保存 raw metrics 供离线分析；
+- 只把脱敏 methodology feedback 写入 dataset event；
+- 对生成的 `agents.md` / `AGENTS.md` 运行泄漏检查，禁止 exact sequence、source
+  filename、source sheet、row number、article title 或 reference record 进入 agent
+  system。
+
+这样同一份 golden-standard evaluation 可以被多个 evolution methods 复用，避免每个
+method 重复读取大型 ground truth，也避免把评估答案泄漏给下一轮 rollout agent。
+
+示例 config：
+
+```json
+{
+  "reflector_llm": {
+    "provider": "openai_chat",
+    "model": "gpt-4.1-mini",
+    "base_url": "https://api.openai.com/v1",
+    "api_key_env": "OPENAI_API_KEY",
+    "temperature": 0.2,
+    "max_tokens": 2000,
+    "timeout_seconds": 30
+  },
+  "target_path": "agents.md",
+  "promoted": false
+}
+```
+
+Codex subscription provider 示例：
+
+```json
+{
+  "reflector_llm": {
+    "provider": "codex_cli",
+    "model": "gpt-5.4",
+    "codex_home": "/root/.codex",
+    "timeout_seconds": 900
+  },
+  "target_path": "agents.md",
+  "promoted": false
+}
+```
+
 ## Method: `parametric_memory_register`
 
 用途：把已有 LoRA/adapter 注册为 parametric memory。它不训练 adapters。
@@ -201,6 +314,7 @@ polar-evolution worker
   --capability text_memory
   --capability skill_bundle
   --capability agent_system
+  --capability agent_system_reflector
   --artifact-root .polar_evolution
   --once
   --sleep-seconds 5
@@ -210,7 +324,7 @@ polar-evolution worker
 如果不传 `--capability`，worker 默认使用内置 method names。也可以传逗号分隔的值：
 
 ```sh
-uv run polar-evolution worker --capability text_memory,skill_bundle,agent_system
+uv run polar-evolution worker --capability text_memory,skill_bundle,agent_system,agent_system_reflector
 ```
 
 ## 添加 Research Method
