@@ -187,8 +187,7 @@ Codex subscription 登录态；SOTA reflector 仍可以在专用 research worker
 - `provider=codex_cli` 时可选 `codex_home` 和 `codex_bin`；worker 会清除
   OpenAI/Anthropic/Google proxy API 环境变量，避免把 subscription run 误接到 proxy；
   nested Codex run 会忽略用户 config、使用 `--ephemeral`、`--sandbox read-only`、
-  `--ask-for-approval never`，并禁用 `shell_tool`，因为 dataset transcripts 属于不可信
-  prompt 内容；
+  并禁用 `shell_tool`，因为 dataset transcripts 属于不可信 prompt 内容；
 - 可选 `temperature`、`max_tokens` 和 `timeout_seconds`；
 - 可选 `job.config.target_path`，默认 `agents.md`；
 - 可选 `job.config.max_records`，限制 reflector 汇总的 records 数。

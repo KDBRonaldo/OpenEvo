@@ -613,8 +613,7 @@ def test_agent_system_reflector_can_use_codex_cli_subscription_provider(tmp_path
     assert "--dangerously-bypass-approvals-and-sandbox" not in captured["args"]
     assert "--ignore-user-config" in captured["args"]
     assert "--ephemeral" in captured["args"]
-    assert "--ask-for-approval" in captured["args"]
-    assert captured["args"][captured["args"].index("--ask-for-approval") + 1] == "never"
+    assert "--ask-for-approval" not in captured["args"]
     assert "--sandbox" in captured["args"]
     assert captured["args"][captured["args"].index("--sandbox") + 1] == "read-only"
     assert "--disable" in captured["args"]

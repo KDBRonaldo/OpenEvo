@@ -1,0 +1,64 @@
+name: Issue labels
+
+on:
+  issues:
+    types: [opened, edited]
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  apply-form-labels:
+    name: apply issue form labels
+    if: github.event.issue.pull_request == null
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Collect issue body
+        env:
+          ISSUE_BODY: ${{ github.event.issue.body }}
+        run: |
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          Path("issue_body.md").write_text(os.environ.get("ISSUE_BODY") or "", encoding="utf-8")
+          PY
+      - name: Extract selected labels
+        id: labels
+        env:
+          CURRENT_LABELS_JSON: ${{ toJson(github.event.issue.labels) }}
+        run: |
+          python3 scripts/ci/issue_form_labels.py \
+            --issue-body-file issue_body.md \
+            --current-labels-json "$CURRENT_LABELS_JSON" \
+            --github-output "$GITHUB_OUTPUT"
+      - name: Apply selected labels
+        uses: actions/github-script@v7
+        env:
+          LABELS_TO_ADD_JSON: ${{ steps.labels.outputs.labels_to_add }}
+          LABELS_TO_REMOVE_JSON: ${{ steps.labels.outputs.labels_to_remove }}
+        with:
+          script: |
+            const labelsToAdd = JSON.parse(process.env.LABELS_TO_ADD_JSON || "[]");
+            const labelsToRemove = JSON.parse(process.env.LABELS_TO_REMOVE_JSON || "[]");
+            for (const name of labelsToRemove) {
+              await github.rest.issues.removeLabel({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                name,
+              });
+            }
+            if (labelsToAdd.length > 0) {
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                labels: labelsToAdd,
+              });
+            }

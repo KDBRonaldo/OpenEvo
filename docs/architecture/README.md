@@ -21,6 +21,8 @@ Markdown 预览器中直接渲染。
 - [Reference Evolution Worker（参考演化 Worker）](reference-evolution-worker.md)
   - 内置 reference methods：`text_memory`、`skill_bundle`、
     `agent_system`、`parametric_memory_register`。
+- [PR Process Checks](pr-process-checks.md)
+  - Issue/PR 模板和 warning 级 issue-link、docs-change 检查。
 
 ## 高层系统图
 

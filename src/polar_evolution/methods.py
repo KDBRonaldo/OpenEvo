@@ -464,8 +464,6 @@ def _generate_agent_system_reflection_with_codex_cli(
             "--json",
             "--ignore-user-config",
             "--ephemeral",
-            "--ask-for-approval",
-            "never",
             "--sandbox",
             "read-only",
             "--disable",

@@ -178,8 +178,7 @@ reflector model。默认 provider 是 `openai_chat`：`base_url` 默认读取
 `reflector_llm.provider="codex_cli"`，worker 会调用本机 `codex exec`，清除代理 API
 key/base-url 环境变量，并使用 `reflector_llm.codex_home` 指定的 Codex 登录目录。该 nested
 Codex run 会忽略用户 config、使用 `--ephemeral`、`--sandbox read-only`、
-`--ask-for-approval never`，并禁用 `shell_tool`，因为 dataset transcripts 属于不可信
-prompt 内容。该方法不做 promotion 评估，
+并禁用 `shell_tool`，因为 dataset transcripts 属于不可信 prompt 内容。该方法不做 promotion 评估，
 推荐把产出 artifact 先保持 `promoted=false`，通过离线评估或 A/B rollout 后再 promotion。
 
 示例 job：
