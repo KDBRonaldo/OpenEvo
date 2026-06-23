@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from polar_evolution.terminal_bench_per_task import (
     ArtifactMaterializer,
     EvolutionArtifact,
@@ -43,18 +45,28 @@ def test_skill_and_memory_materializers_are_explicitly_skipped(tmp_path: Path):
         method="skill_bundle",
         source_dataset_artifact_ids=[],
     )
-    memory = EvolutionArtifact(
-        artifact_type="memory",
-        artifact_id="art-memory",
-        path=tmp_path / "memory.md",
+    text_memory = EvolutionArtifact(
+        artifact_type="text_memory",
+        artifact_id="art-text-memory",
+        path=tmp_path / "text_memory.md",
         task_id="fix-git",
         round=1,
         method="text_memory",
         source_dataset_artifact_ids=[],
     )
+    parametric_memory = EvolutionArtifact(
+        artifact_type="parametric_memory",
+        artifact_id="art-param-memory",
+        path=tmp_path / "parametric_memory.md",
+        task_id="fix-git",
+        round=1,
+        method="parametric_memory",
+        source_dataset_artifact_ids=[],
+    )
 
     assert materializer.materialize(skill) == {}
-    assert materializer.materialize(memory) == {}
+    assert materializer.materialize(text_memory) == {}
+    assert materializer.materialize(parametric_memory) == {}
     assert materializer.skipped == [
         {
             "artifact_id": "art-skill",
@@ -62,9 +74,14 @@ def test_skill_and_memory_materializers_are_explicitly_skipped(tmp_path: Path):
             "reason": "skill_bundle materialization is not implemented for Harbor Codex runs",
         },
         {
-            "artifact_id": "art-memory",
-            "artifact_type": "memory",
-            "reason": "memory materialization is not implemented for Harbor Codex runs",
+            "artifact_id": "art-text-memory",
+            "artifact_type": "text_memory",
+            "reason": "text_memory materialization is not implemented for Harbor Codex runs",
+        },
+        {
+            "artifact_id": "art-param-memory",
+            "artifact_type": "parametric_memory",
+            "reason": "parametric_memory materialization is not implemented for Harbor Codex runs",
         },
     ]
 
@@ -121,6 +138,67 @@ def test_discover_agent_system_artifact_path_reads_worker_manifest(tmp_path: Pat
     assert artifact.artifact_id == "art-agent"
     assert artifact.path == content
     assert artifact.source_dataset_artifact_ids == ["dataset-r0"]
+
+
+def test_discover_agent_system_artifact_path_decodes_spaces_in_file_uri(tmp_path: Path):
+    content = tmp_path / "workers with spaces" / "job-1" / "agent system" / "agents.md"
+    content.parent.mkdir(parents=True)
+    content.write_text("rules\n", encoding="utf-8")
+
+    artifact = discover_agent_system_artifact_path(
+        [
+            {
+                "artifact_id": "art-agent",
+                "type": "agent_system",
+                "uri": content.resolve().as_uri(),
+                "manifest": {"method": "agent_system_reflector"},
+            }
+        ],
+        task_id="fix-git",
+        round_number=1,
+        job_payload={"job": {"input_artifact_ids": []}},
+    )
+
+    assert artifact.path == content
+
+
+def test_discover_agent_system_artifact_path_rejects_missing_artifact_id(tmp_path: Path):
+    content = tmp_path / "agents.md"
+    content.write_text("rules\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="artifact_id"):
+        discover_agent_system_artifact_path(
+            [
+                {
+                    "type": "agent_system",
+                    "uri": content.resolve().as_uri(),
+                    "manifest": {"method": "agent_system_reflector"},
+                }
+            ],
+            task_id="fix-git",
+            round_number=1,
+            job_payload={"job": {"input_artifact_ids": []}},
+        )
+
+
+def test_discover_agent_system_artifact_path_rejects_non_list_input_artifact_ids(tmp_path: Path):
+    content = tmp_path / "agents.md"
+    content.write_text("rules\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="input_artifact_ids"):
+        discover_agent_system_artifact_path(
+            [
+                {
+                    "artifact_id": "art-agent",
+                    "type": "agent_system",
+                    "uri": content.resolve().as_uri(),
+                    "manifest": {"method": "agent_system_reflector"},
+                }
+            ],
+            task_id="fix-git",
+            round_number=1,
+            job_payload={"job": {"input_artifact_ids": "dataset-r0"}},
+        )
 
 
 def test_summarize_transition_classifies_pass_fail_changes():

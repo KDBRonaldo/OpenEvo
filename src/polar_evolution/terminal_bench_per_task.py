@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 import json
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote, urlparse
 
 
 @dataclass(frozen=True)
@@ -24,21 +25,12 @@ class ArtifactMaterializer:
     def materialize(self, artifact: EvolutionArtifact) -> dict[str, str]:
         if artifact.artifact_type == "agent_system":
             return {"agent_system_path": str(artifact.path)}
-        if artifact.artifact_type == "skill_bundle":
+        if artifact.artifact_type in {"skill_bundle", "text_memory", "parametric_memory", "memory"}:
             self.skipped.append(
                 {
                     "artifact_id": artifact.artifact_id,
                     "artifact_type": artifact.artifact_type,
-                    "reason": "skill_bundle materialization is not implemented for Harbor Codex runs",
-                }
-            )
-            return {}
-        if artifact.artifact_type == "memory":
-            self.skipped.append(
-                {
-                    "artifact_id": artifact.artifact_id,
-                    "artifact_type": artifact.artifact_type,
-                    "reason": "memory materialization is not implemented for Harbor Codex runs",
+                    "reason": f"{artifact.artifact_type} materialization is not implemented for Harbor Codex runs",
                 }
             )
             return {}
@@ -92,25 +84,41 @@ def discover_agent_system_artifact_path(
     round_number: int,
     job_payload: dict[str, Any],
 ) -> EvolutionArtifact:
+    job = job_payload.get("job")
+    if not isinstance(job, dict):
+        raise ValueError("job_payload['job'] must be a dict")
+    input_artifact_ids = job.get("input_artifact_ids")
+    if not isinstance(input_artifact_ids, list):
+        raise ValueError("job_payload['job']['input_artifact_ids'] must be a list")
+
     for artifact in completed_artifacts:
         if artifact.get("type") != "agent_system":
             continue
         uri = artifact.get("uri")
-        if not isinstance(uri, str) or not uri.startswith("file://"):
+        if not isinstance(uri, str):
             raise ValueError(f"agent_system artifact has unsupported uri: {uri!r}")
+        parsed = urlparse(uri)
+        if parsed.scheme != "file":
+            raise ValueError(f"agent_system artifact has unsupported uri: {uri!r}")
+        if parsed.netloc not in {"", "localhost"}:
+            raise ValueError(f"agent_system artifact has unsupported file URI host: {uri!r}")
+        path_text = unquote(parsed.path)
+        if not path_text:
+            raise ValueError(f"agent_system artifact has empty path in uri: {uri!r}")
         manifest = artifact.get("manifest")
         if not isinstance(manifest, dict):
             manifest = {}
+        artifact_id = artifact.get("artifact_id")
+        if not isinstance(artifact_id, str) or not artifact_id.strip():
+            raise ValueError("completed agent_system artifact missing required artifact_id")
         return EvolutionArtifact(
             artifact_type="agent_system",
-            artifact_id=str(artifact["artifact_id"]),
-            path=Path(uri.removeprefix("file://")),
+            artifact_id=artifact_id,
+            path=Path(path_text),
             task_id=task_id,
             round=round_number,
             method=str(manifest.get("method") or "agent_system_reflector"),
-            source_dataset_artifact_ids=list(
-                job_payload.get("job", {}).get("input_artifact_ids", [])
-            ),
+            source_dataset_artifact_ids=list(input_artifact_ids),
         )
     raise ValueError("completed job did not produce an agent_system artifact")
 
