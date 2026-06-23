@@ -90,6 +90,8 @@ def discover_agent_system_artifact_path(
     input_artifact_ids = job.get("input_artifact_ids")
     if not isinstance(input_artifact_ids, list):
         raise ValueError("job_payload['job']['input_artifact_ids'] must be a list")
+    if any(not isinstance(artifact_id, str) for artifact_id in input_artifact_ids):
+        raise ValueError("job_payload['job']['input_artifact_ids'] must contain only strings")
 
     for artifact in completed_artifacts:
         if artifact.get("type") != "agent_system":

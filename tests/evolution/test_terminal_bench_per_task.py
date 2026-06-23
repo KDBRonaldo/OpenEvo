@@ -201,6 +201,26 @@ def test_discover_agent_system_artifact_path_rejects_non_list_input_artifact_ids
         )
 
 
+def test_discover_agent_system_artifact_path_rejects_non_string_input_artifact_ids(tmp_path: Path):
+    content = tmp_path / "agents.md"
+    content.write_text("rules\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="input_artifact_ids"):
+        discover_agent_system_artifact_path(
+            [
+                {
+                    "artifact_id": "art-agent",
+                    "type": "agent_system",
+                    "uri": content.resolve().as_uri(),
+                    "manifest": {"method": "agent_system_reflector"},
+                }
+            ],
+            task_id="fix-git",
+            round_number=1,
+            job_payload={"job": {"input_artifact_ids": [None, 42, "dataset-r0"]}},
+        )
+
+
 def test_summarize_transition_classifies_pass_fail_changes():
     assert summarize_transition(0.0, 1.0) == "fail_to_pass"
     assert summarize_transition(1.0, 0.0) == "pass_to_fail"
