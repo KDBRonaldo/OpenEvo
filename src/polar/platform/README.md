@@ -5,7 +5,7 @@ plus a single FastAPI service that proxies (read-only) to the rollout server and
 gateway nodes and reads finished tasks straight off disk.
 
 Launch it with `polar dashboard -c topology.yaml [--port 8090]` (see the
-[top-level README](../../../README.md#cli-interface)). Defaults: binds
+[Polar README](../../../README.polar.md#cli-interface)). Defaults: binds
 `127.0.0.1:8090`; the rollout URL and `save_dir` come from the topology (override
 with `--rollout-url` / `--save-dir`).
 
