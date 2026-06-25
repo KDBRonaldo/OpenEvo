@@ -190,6 +190,7 @@ def _read_text_if_exists(path: Path) -> str:
 def _extract_transcript(trial_dir: Path, *, max_transcript_chars: int) -> dict[str, Any]:
     candidates = [
         trial_dir / "agent" / "stdout.txt",
+        trial_dir / "agent" / "codex.txt",
         trial_dir / "agent" / "evolab_lab" / "terminal_bench_report.md",
         trial_dir / "agent" / "evolab_lab" / "final_artifacts.jsonl",
         trial_dir / "agent" / "evolab_lab" / "context_summary.json",

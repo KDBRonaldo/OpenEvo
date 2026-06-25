@@ -5,12 +5,20 @@ import json
 from pathlib import Path
 import sys
 import time
+from typing import Any
+from urllib.parse import unquote, urlparse
 
+from polar_evolution.agent_system import DEFAULT_AGENT_SYSTEM_TARGET_PATH
 from polar_evolution.methods import METHOD_REGISTRY
-from polar_evolution.models import DatasetCreateRequest
+from polar_evolution.models import DatasetCreateRequest, EventIngestRequest, JobCreateRequest
 from polar_evolution.server import create_app
 from polar_evolution.store import EvolutionStore
 from polar_evolution.terminal_bench_bridge import build_terminal_bench_events
+from polar_evolution.terminal_bench_per_task import (
+    DEFAULT_TERMINAL_BENCH_PACKAGE_ROOT,
+    run_per_task_evolution,
+    run_per_task_evolution_dry_run,
+)
 from polar_evolution.worker import EvolutionWorkerClient, run_once
 
 
@@ -44,7 +52,9 @@ def build_parser() -> argparse.ArgumentParser:
         "terminal-bench-dataset",
         help="Ingest Terminal Bench Harbor/EvoLab results into a local Polar dataset.",
     )
-    tb_dataset.add_argument("--input", required=True, help="Terminal Bench trial or job directory.")
+    tb_dataset.add_argument(
+        "--input", required=True, help="Terminal Bench trial or job directory."
+    )
     tb_dataset.add_argument("--db", default=".polar_evolution/evolution.db")
     tb_dataset.add_argument("--artifact-root", default=".polar_evolution")
     tb_dataset.add_argument("--name", required=True)
@@ -55,6 +65,117 @@ def build_parser() -> argparse.ArgumentParser:
     tb_dataset.add_argument("--output", help="Output JSON summary path. Defaults to stdout.")
     tb_dataset.add_argument("--max-transcript-chars", type=int, default=60000)
     tb_dataset.add_argument("--max-verifier-stdout-chars", type=int, default=12000)
+    tb_job = subparsers.add_parser(
+        "terminal-bench-agent-system-job",
+        help=("Ingest Terminal Bench results and create an audited agent-system reflector job."),
+    )
+    tb_job.add_argument(
+        "--input",
+        action="append",
+        default=[],
+        help="Terminal Bench trial or job directory to ingest. Can be repeated.",
+    )
+    tb_job.add_argument("--db", default=".polar_evolution/evolution.db")
+    tb_job.add_argument("--artifact-root", default=".polar_evolution")
+    tb_job.add_argument(
+        "--dataset-artifact-id",
+        action="append",
+        default=[],
+        help="Existing dataset artifact id to use as job input. Can be repeated.",
+    )
+    tb_job.add_argument(
+        "--dataset-name",
+        help="Dataset name when --input is provided.",
+    )
+    tb_job.add_argument("--purpose", default="agent_system_reflection")
+    tb_job.add_argument("--policy-version")
+    tb_job.add_argument("--rollout-step", type=int)
+    tb_job.add_argument("--status", action="append", default=["COMPLETED"])
+    tb_job.add_argument("--output", help="Output JSON summary path. Defaults to stdout.")
+    tb_job.add_argument("--max-transcript-chars", type=int, default=60000)
+    tb_job.add_argument("--max-verifier-stdout-chars", type=int, default=12000)
+    tb_job.add_argument(
+        "--method",
+        choices=[
+            "auto",
+            "agent_system_reflector",
+            "agent_system_history_reflector",
+            "agent_system_pareto_reflector",
+            "agent_system_gepa_reflector",
+        ],
+        default="auto",
+    )
+    tb_job.add_argument("--candidate-count", type=int)
+    tb_job.add_argument("--mutation-strategy", action="append", default=[])
+    tb_job.add_argument("--target-path", default=DEFAULT_AGENT_SYSTEM_TARGET_PATH)
+    tb_job.add_argument("--job-name")
+    tb_job.add_argument("--priority", type=int, default=100)
+    tb_job.add_argument("--max-records", type=int)
+    tb_job.add_argument("--reflector-provider", default="openai_chat")
+    tb_job.add_argument("--reflector-model", required=True)
+    tb_job.add_argument("--reflector-base-url")
+    tb_job.add_argument("--reflector-api-key-env")
+    tb_job.add_argument("--codex-home")
+    tb_job.add_argument("--temperature", type=float)
+    tb_job.add_argument("--max-tokens", type=int)
+    tb_job.add_argument("--reflector-timeout-seconds", type=float)
+    tb_job.add_argument("--audit-max-repair-attempts", type=int, default=2)
+    tb_job.add_argument(
+        "--audit-forbidden-literal",
+        action="append",
+        default=[],
+        help="Additional exact literal that the generated agent system must not contain.",
+    )
+    tb_job.add_argument(
+        "--no-auto-forbidden-literals",
+        action="store_true",
+        help="Do not derive forbidden literals from structured protected metadata.",
+    )
+    tb_per_task = subparsers.add_parser(
+        "terminal-bench-per-task-evolution",
+        help="Run or plan per-task Terminal Bench evolution.",
+    )
+    tb_per_task.add_argument("--task-root", required=True)
+    tb_per_task.add_argument("--task-id", action="append", default=[], required=True)
+    tb_per_task.add_argument("--run-root", required=True)
+    tb_per_task.add_argument("--baseline-root")
+    tb_per_task.add_argument(
+        "--terminal-bench-package-root",
+        default=str(DEFAULT_TERMINAL_BENCH_PACKAGE_ROOT),
+    )
+    tb_per_task.add_argument("--model", required=True)
+    tb_per_task.add_argument("--reflector-model", required=True)
+    tb_per_task.add_argument(
+        "--reflector-provider",
+        choices=["codex_cli", "openai_chat"],
+        default="codex_cli",
+    )
+    tb_per_task.add_argument("--codex-home")
+    tb_per_task.add_argument(
+        "--agent-system-method",
+        choices=[
+            "auto",
+            "agent_system_reflector",
+            "agent_system_history_reflector",
+            "agent_system_pareto_reflector",
+            "agent_system_gepa_reflector",
+        ],
+        default="auto",
+    )
+    tb_per_task.add_argument("--gepa-candidate-count", type=int, default=1)
+    tb_per_task.add_argument("--gepa-generations", type=int, default=1)
+    tb_per_task.add_argument("--reflector-timeout-seconds", type=float, default=180.0)
+    tb_per_task.add_argument("--rounds", type=int, default=1)
+    tb_per_task.add_argument(
+        "--artifact-type",
+        action="append",
+        default=None,
+        choices=["agent_system", "skill_bundle", "memory"],
+    )
+    tb_per_task.add_argument("--env-json", default="{}")
+    tb_per_task.add_argument("--verifier-env", action="append", default=[])
+    tb_per_task.add_argument("--dry-run", action="store_true")
+    tb_per_task.add_argument("--output", required=True)
     return parser
 
 
@@ -149,7 +270,434 @@ def main(argv: list[str] | None = None) -> int:
         }
         _write_json_output(payload, args.output)
         return 0
+    if args.command == "terminal-bench-agent-system-job":
+        payload = _create_terminal_bench_agent_system_job(args)
+        _write_json_output(payload, args.output)
+        return 0
+    if args.command == "terminal-bench-per-task-evolution":
+        artifact_types = args.artifact_type or ["agent_system"]
+        if args.dry_run:
+            payload = run_per_task_evolution_dry_run(
+                task_root=Path(args.task_root),
+                task_ids=args.task_id,
+                run_root=Path(args.run_root),
+                model=args.model,
+                reflector_model=args.reflector_model,
+                reflector_provider=args.reflector_provider,
+                reflector_timeout_seconds=args.reflector_timeout_seconds,
+                terminal_bench_package_root=Path(args.terminal_bench_package_root),
+                agent_system_method=args.agent_system_method,
+                gepa_candidate_count=args.gepa_candidate_count,
+                gepa_generations=args.gepa_generations,
+                rounds=args.rounds,
+                artifact_types=artifact_types,
+            )
+            _write_json_output(payload, args.output)
+            return 0
+        if not args.baseline_root:
+            raise ValueError(
+                "terminal-bench-per-task-evolution requires --baseline-root unless --dry-run is used"
+            )
+        if artifact_types != ["agent_system"]:
+            raise ValueError("live per-task evolution currently supports only agent_system")
+        try:
+            parsed_env_json = json.loads(args.env_json)
+        except json.JSONDecodeError as exc:
+            raise ValueError("--env-json must be valid JSON") from exc
+        if not isinstance(parsed_env_json, dict):
+            raise ValueError("--env-json must decode to a JSON object")
+        payload = run_per_task_evolution(
+            task_root=Path(args.task_root),
+            task_ids=args.task_id,
+            run_root=Path(args.run_root),
+            baseline_root=Path(args.baseline_root),
+            model=args.model,
+            reflector_model=args.reflector_model,
+            reflector_provider=args.reflector_provider,
+            reflector_timeout_seconds=args.reflector_timeout_seconds,
+            codex_home=args.codex_home,
+            terminal_bench_package_root=Path(args.terminal_bench_package_root),
+            agent_system_method=args.agent_system_method,
+            gepa_candidate_count=args.gepa_candidate_count,
+            gepa_generations=args.gepa_generations,
+            rounds=args.rounds,
+            env_json={str(key): str(value) for key, value in parsed_env_json.items()},
+            verifier_env=_parse_key_value_entries(args.verifier_env),
+        )
+        _write_json_output(payload, args.output)
+        return 0
     raise ValueError(f"Unknown command: {args.command}")
+
+
+def _create_terminal_bench_agent_system_job(args: argparse.Namespace) -> dict[str, Any]:
+    if not args.input and not args.dataset_artifact_id:
+        raise ValueError(
+            "terminal-bench-agent-system-job requires --input or --dataset-artifact-id"
+        )
+    if args.input and not args.dataset_name:
+        raise ValueError("terminal-bench-agent-system-job requires --dataset-name with --input")
+    if args.input and not args.policy_version:
+        raise ValueError("terminal-bench-agent-system-job requires --policy-version with --input")
+
+    store = EvolutionStore(db_path=Path(args.db), artifact_root=Path(args.artifact_root))
+    store.initialize()
+
+    events: list[EventIngestRequest] = []
+    for input_path in args.input:
+        events.extend(
+            build_terminal_bench_events(
+                input_path,
+                max_transcript_chars=args.max_transcript_chars,
+                max_verifier_stdout_chars=args.max_verifier_stdout_chars,
+                policy_version=args.policy_version,
+                rollout_step=args.rollout_step,
+            )
+        )
+
+    ingested_events = []
+    for event in events:
+        response = store.ingest_event(event)
+        ingested_events.append(
+            {
+                "event_id": response.event_id,
+                "ingested": response.ingested,
+                "duplicate": response.duplicate,
+                "task_id": event.task_id,
+                "session_id": event.session_id,
+            }
+        )
+
+    dataset_payload: dict[str, Any] | None = None
+    input_artifact_ids = list(args.dataset_artifact_id)
+    if events:
+        dataset = store.create_dataset(
+            DatasetCreateRequest(
+                name=args.dataset_name,
+                purpose=args.purpose,
+                query={
+                    "event_types": ["polar.session_completed"],
+                    "status": args.status,
+                    "policy_version": args.policy_version,
+                },
+            )
+        )
+        dataset_payload = {
+            "dataset_id": dataset.dataset_id,
+            "artifact_id": dataset.artifact_id,
+            "name": args.dataset_name,
+            "purpose": args.purpose,
+            "event_count": dataset.event_count,
+            "trace_count": dataset.trace_count,
+            "manifest_uri": _artifact_uri(store, dataset.artifact_id),
+        }
+        input_artifact_ids.append(dataset.artifact_id)
+
+    method = _terminal_bench_job_method(args.method, input_artifact_ids)
+    config = _terminal_bench_agent_system_job_config(
+        args,
+        store=store,
+        input_artifact_ids=input_artifact_ids,
+        events=events,
+    )
+    job = store.create_job(
+        JobCreateRequest(
+            method=method,
+            job_type=method,
+            input_artifact_ids=input_artifact_ids,
+            config=config,
+            priority=args.priority,
+        )
+    )
+    return {
+        "ingested_events": ingested_events,
+        "dataset": dataset_payload,
+        "job": {
+            "job_id": job.job_id,
+            "state": str(job.state),
+            "job_type": method,
+            "method": method,
+            "input_artifact_ids": input_artifact_ids,
+            "config": config,
+        },
+    }
+
+
+def _terminal_bench_job_method(method: str, input_artifact_ids: list[str]) -> str:
+    if method != "auto":
+        return method
+    if len(input_artifact_ids) > 1:
+        return "agent_system_history_reflector"
+    return "agent_system_reflector"
+
+
+def _terminal_bench_agent_system_job_config(
+    args: argparse.Namespace,
+    *,
+    store: EvolutionStore,
+    input_artifact_ids: list[str],
+    events: list[EventIngestRequest],
+) -> dict[str, Any]:
+    reflector_llm = _terminal_bench_reflector_llm_config(args)
+    forbidden_literals = _terminal_bench_forbidden_literal_map(args.audit_forbidden_literal)
+    if not args.no_auto_forbidden_literals:
+        _merge_forbidden_literal_map(
+            forbidden_literals,
+            _terminal_bench_forbidden_literals_from_events(events),
+        )
+        _merge_forbidden_literal_map(
+            forbidden_literals,
+            _terminal_bench_forbidden_literals_from_dataset_artifacts(
+                store,
+                input_artifact_ids,
+            ),
+        )
+    config: dict[str, Any] = {
+        "name": args.job_name or "Terminal Bench agent-system reflection",
+        "target_path": args.target_path,
+        "reflector_llm": reflector_llm,
+        "agent_system_audit": {
+            "max_repair_attempts": args.audit_max_repair_attempts,
+            "forbidden_literals": _unique_forbidden_literal_map(forbidden_literals),
+        },
+        "compatibility": {
+            "agent_harness": ["terminal-bench-harbor"],
+            "task_tags": _terminal_bench_task_tags(store, input_artifact_ids, events),
+        },
+        "scores": {"quality": 0.0},
+        "promoted": False,
+    }
+    if args.max_records is not None:
+        config["max_records"] = args.max_records
+    if args.candidate_count is not None:
+        config["candidate_count"] = args.candidate_count
+    if args.mutation_strategy:
+        config["mutation_strategies"] = list(args.mutation_strategy)
+    return config
+
+
+def _terminal_bench_task_tags(
+    store: EvolutionStore,
+    input_artifact_ids: list[str],
+    events: list[EventIngestRequest],
+) -> list[str]:
+    tags = ["terminal-bench"]
+    task_ids: list[str] = []
+    for event in events:
+        _append_nonempty_text(task_ids, event.task_id)
+    for artifact_id in input_artifact_ids:
+        manifest_path = _file_uri_to_path(_artifact_uri(store, artifact_id))
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        records_path = _dataset_records_path(manifest_path, manifest)
+        for line in records_path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            record = json.loads(line)
+            if isinstance(record, dict):
+                _append_nonempty_text(task_ids, record.get("task_id"))
+    for task_id in _unique_nonempty_text(task_ids):
+        tags.append(f"terminal-bench:{task_id}")
+    return tags
+
+
+def _terminal_bench_reflector_llm_config(args: argparse.Namespace) -> dict[str, Any]:
+    config: dict[str, Any] = {
+        "provider": args.reflector_provider,
+        "model": args.reflector_model,
+    }
+    optional_fields = {
+        "base_url": args.reflector_base_url,
+        "api_key_env": args.reflector_api_key_env,
+        "codex_home": args.codex_home,
+        "temperature": args.temperature,
+        "max_tokens": args.max_tokens,
+        "timeout_seconds": args.reflector_timeout_seconds,
+    }
+    for key, value in optional_fields.items():
+        if value is not None:
+            config[key] = value
+    return config
+
+
+def _terminal_bench_forbidden_literals_from_events(
+    events: list[EventIngestRequest],
+) -> dict[str, list[str]]:
+    literals: dict[str, list[str]] = {}
+    for event in events:
+        payload = event.payload.get("session_result")
+        if isinstance(payload, dict):
+            _append_terminal_bench_payload_literals(literals, payload)
+    return _unique_forbidden_literal_map(literals)
+
+
+def _terminal_bench_forbidden_literals_from_dataset_artifacts(
+    store: EvolutionStore,
+    artifact_ids: list[str],
+) -> dict[str, list[str]]:
+    literals: dict[str, list[str]] = {}
+    for artifact_id in artifact_ids:
+        manifest_path = _file_uri_to_path(_artifact_uri(store, artifact_id))
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        records_path = _dataset_records_path(manifest_path, manifest)
+        for line in records_path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            record = json.loads(line)
+            if isinstance(record, dict):
+                payload = record.get("payload")
+                if isinstance(payload, dict):
+                    session_result = payload.get("session_result")
+                    if isinstance(session_result, dict):
+                        _append_terminal_bench_payload_literals(literals, session_result)
+    return _unique_forbidden_literal_map(literals)
+
+
+def _dataset_records_path(manifest_path: Path, artifact_manifest: dict[str, Any]) -> Path:
+    dataset_manifest = artifact_manifest.get("manifest")
+    if not isinstance(dataset_manifest, dict):
+        dataset_manifest = artifact_manifest
+    records_uri = dataset_manifest.get("records_uri")
+    if isinstance(records_uri, str) and records_uri.startswith("file://"):
+        return _file_uri_to_path(records_uri)
+    records_path = dataset_manifest.get("records_path") or "records.jsonl"
+    return manifest_path.parent / str(records_path)
+
+
+def _file_uri_to_path(uri: str) -> Path:
+    parsed = urlparse(uri)
+    if parsed.scheme != "file":
+        raise ValueError(f"expected file URI, got: {uri}")
+    return Path(unquote(parsed.path))
+
+
+def _append_terminal_bench_payload_literals(
+    literals: dict[str, list[str]],
+    session_result: dict[str, Any],
+) -> None:
+    _append_structured_forbidden_literals(literals, session_result)
+
+
+_STRUCTURED_FORBIDDEN_LITERAL_KEY_ALIASES = {
+    "article_id": "article_ids",
+    "article_ids": "article_ids",
+    "article_title": "article_titles",
+    "article_titles": "article_titles",
+    "forbidden_literals": "terminal_bench",
+    "leakage_basis": "terminal_bench",
+    "sequence": "sequences",
+    "sequences": "sequences",
+    "source_file": "source_files",
+    "source_files": "source_files",
+    "source_row": "source_rows",
+    "source_rows": "source_rows",
+    "source_sheet": "source_sheets",
+    "source_sheets": "source_sheets",
+}
+
+
+def _append_structured_forbidden_literals(
+    literals: dict[str, list[str]],
+    value: Any,
+    *,
+    protected_kind: str | None = None,
+) -> None:
+    if isinstance(value, str):
+        if protected_kind:
+            _append_forbidden_literal(literals, protected_kind, value)
+        return
+    if isinstance(value, int | float) and not isinstance(value, bool):
+        if protected_kind:
+            _append_forbidden_literal(literals, protected_kind, str(value))
+        return
+    if isinstance(value, list):
+        for item in value:
+            _append_structured_forbidden_literals(
+                literals,
+                item,
+                protected_kind=protected_kind,
+            )
+        return
+    if not isinstance(value, dict):
+        return
+    for key, nested in value.items():
+        normalized_key = str(key).strip().lower().replace("-", "_")
+        nested_kind = _STRUCTURED_FORBIDDEN_LITERAL_KEY_ALIASES.get(
+            normalized_key,
+            protected_kind,
+        )
+        _append_structured_forbidden_literals(
+            literals,
+            nested,
+            protected_kind=nested_kind,
+        )
+
+
+def _terminal_bench_forbidden_literal_map(
+    explicit_literals: list[str],
+) -> dict[str, list[str]]:
+    literals: dict[str, list[str]] = {}
+    for literal in explicit_literals:
+        _append_text_literal(literals.setdefault("terminal_bench", []), literal)
+    return literals
+
+
+def _merge_forbidden_literal_map(
+    target: dict[str, list[str]],
+    source: dict[str, list[str]],
+) -> None:
+    for key, values in source.items():
+        target.setdefault(key, []).extend(values)
+
+
+def _append_forbidden_literal(
+    literals: dict[str, list[str]],
+    kind: str,
+    value: Any,
+) -> None:
+    if not isinstance(value, str):
+        return
+    text = value.strip()
+    if text:
+        literals.setdefault(kind, []).append(text)
+
+
+def _unique_forbidden_literal_map(
+    values: dict[str, list[str]],
+) -> dict[str, list[str]]:
+    return {
+        key: unique
+        for key, unique in (
+            (key, _unique_nonempty_text(items)) for key, items in values.items()
+        )
+        if unique
+    }
+
+
+def _append_nonempty_text(literals: list[str], value: Any) -> None:
+    if not isinstance(value, str):
+        return
+    text = value.strip()
+    if text:
+        literals.append(text)
+
+
+def _append_text_literal(literals: list[str], value: Any) -> None:
+    if not isinstance(value, str):
+        return
+    text = value.strip()
+    if len(text) >= 6:
+        literals.append(text)
+
+
+def _unique_nonempty_text(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    unique: list[str] = []
+    for value in values:
+        text = value.strip() if isinstance(value, str) else ""
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        unique.append(text)
+    return unique
 
 
 def _parse_capabilities(values: list[str]) -> list[str]:
@@ -157,6 +705,16 @@ def _parse_capabilities(values: list[str]) -> list[str]:
     for value in values:
         capabilities.extend(item.strip() for item in value.split(",") if item.strip())
     return capabilities or list(METHOD_REGISTRY)
+
+
+def _parse_key_value_entries(entries: list[str]) -> dict[str, str]:
+    parsed: dict[str, str] = {}
+    for entry in entries:
+        key, sep, value = entry.partition("=")
+        if not sep or not key:
+            raise ValueError(f"expected KEY=VALUE entry, got {entry!r}")
+        parsed[key] = value
+    return parsed
 
 
 def _artifact_uri(store: EvolutionStore, artifact_id: str) -> str:

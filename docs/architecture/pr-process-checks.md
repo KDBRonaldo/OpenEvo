@@ -1,7 +1,7 @@
 # PR Process Checks
 
 This repository follows the issue-first and documentation-sync expectations in
-`agents.md`. The first automated layer is intentionally non-blocking.
+`AGENTS.md`. The first automated layer is intentionally non-blocking.
 
 ## Templates
 

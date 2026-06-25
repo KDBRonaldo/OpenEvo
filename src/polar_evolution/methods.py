@@ -12,7 +12,10 @@ from urllib.parse import unquote, urlparse
 
 import httpx
 
-from polar_evolution.agent_system import normalize_agent_system_target_path
+from polar_evolution.agent_system import (
+    DEFAULT_AGENT_SYSTEM_TARGET_PATH,
+    normalize_agent_system_target_path,
+)
 from polar_evolution.models import (
     ArtifactRegisterRequest,
     ArtifactType,
@@ -158,7 +161,9 @@ def agent_system_reflector(
 
     name = str(job.config.get("name") or f"{dataset.name or dataset.artifact_id} reflector")
     target_path = Path(
-        normalize_agent_system_target_path(job.config.get("target_path") or "agents.md")
+        normalize_agent_system_target_path(
+            job.config.get("target_path") or DEFAULT_AGENT_SYSTEM_TARGET_PATH
+        )
     )
     output_dir = artifact_root / "workers" / job.job_id / "agent_system_reflector"
     output_path = output_dir / target_path
@@ -174,10 +179,13 @@ def agent_system_reflector(
         base_text=base_text,
     )
     llm_config = _reflector_llm_config(job)
-    output_path.write_text(
-        _ensure_trailing_newline(_generate_agent_system_reflection(reflection_prompt, llm_config)),
-        encoding="utf-8",
+    agent_system_markdown, audit_report = _generate_audited_agent_system_reflection(
+        reflection_prompt,
+        llm_config,
+        job=job,
+        manifests=[manifest],
     )
+    output_path.write_text(_ensure_trailing_newline(agent_system_markdown), encoding="utf-8")
 
     success_count = sum(1 for record in reflected_records if record["kind"] == "success")
     failure_count = sum(1 for record in reflected_records if record["kind"] == "failure")
@@ -204,6 +212,7 @@ def agent_system_reflector(
                 "method": "agent_system_reflector",
                 "reflector_provider": llm_config["provider"],
                 "reflector_model": llm_config["model"],
+                "agent_system_audit": audit_report,
             },
             lineage=lineage,
             compatibility=_dict_config(job.config.get("compatibility")),
@@ -212,6 +221,409 @@ def agent_system_reflector(
             promoted=bool(job.config.get("promoted", False)),
         )
     ]
+
+
+def agent_system_history_reflector(
+    job: WorkerClaimedJob,
+    artifact_root: Path,
+) -> list[ArtifactRegisterRequest]:
+    dataset_artifacts = _input_artifacts(job, ArtifactType.DATASET)
+    if not dataset_artifacts:
+        raise ValueError(
+            "agent_system_history_reflector requires at least one dataset artifact"
+        )
+
+    max_records_per_round = _int_config(job.config.get("max_records_per_round"), 8)
+    rounds = _history_reflection_rounds(
+        dataset_artifacts,
+        max_records_per_round=max_records_per_round,
+    )
+
+    name = str(
+        job.config.get("name")
+        or f"{dataset_artifacts[-1].name or dataset_artifacts[-1].artifact_id} history reflector"
+    )
+    target_path = Path(
+        normalize_agent_system_target_path(
+            job.config.get("target_path") or DEFAULT_AGENT_SYSTEM_TARGET_PATH
+        )
+    )
+    output_dir = artifact_root / "workers" / job.job_id / "agent_system_history_reflector"
+    output_path = output_dir / target_path
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    base_text = _agent_system_reflector_base_text(job)
+    reflection_prompt = _render_agent_system_history_reflection_prompt(
+        job=job,
+        rounds=rounds,
+        base_text=base_text,
+    )
+    llm_config = _reflector_llm_config(job)
+    agent_system_markdown, audit_report = _generate_audited_agent_system_reflection(
+        reflection_prompt,
+        llm_config,
+        job=job,
+        manifests=[history_round["manifest"] for history_round in rounds],
+    )
+    output_path.write_text(_ensure_trailing_newline(agent_system_markdown), encoding="utf-8")
+
+    reflected_records = [
+        record for history_round in rounds for record in history_round["reflected_records"]
+    ]
+    success_count = sum(1 for record in reflected_records if record["kind"] == "success")
+    failure_count = sum(1 for record in reflected_records if record["kind"] == "failure")
+    latest_round = rounds[-1]
+    best_round = _best_history_round(rounds)
+    dataset_ids = [history_round["artifact"].artifact_id for history_round in rounds]
+    lineage = {
+        **_dict_config(job.config.get("lineage")),
+        "method": "agent_system_history_reflector",
+        "input_artifact_ids": _input_artifact_ids(job),
+        "source_dataset_artifact_ids": dataset_ids,
+    }
+    return [
+        ArtifactRegisterRequest(
+            type=ArtifactType.AGENT_SYSTEM,
+            name=name,
+            uri=output_path.resolve().as_uri(),
+            manifest={
+                "content_path": target_path.as_posix(),
+                "target_path": target_path.as_posix(),
+                "source_dataset_artifact_ids": dataset_ids,
+                "source_dataset_uris": [
+                    history_round["artifact"].uri for history_round in rounds
+                ],
+                "round_count": len(rounds),
+                "record_count": sum(len(history_round["records"]) for history_round in rounds),
+                "reflected_record_count": len(reflected_records),
+                "success_count": success_count,
+                "failure_count": failure_count,
+                "method": "agent_system_history_reflector",
+                "latest_round": latest_round["round"],
+                "latest_f1": latest_round["metrics"].get("f1"),
+                "best_round": best_round["round"],
+                "best_f1": best_round["metrics"].get("f1"),
+                "reflector_provider": llm_config["provider"],
+                "reflector_model": llm_config["model"],
+                "agent_system_audit": audit_report,
+            },
+            lineage=lineage,
+            compatibility=_dict_config(job.config.get("compatibility")),
+            scores=_scores_config(job.config.get("scores")),
+            tags=_string_list(job.config.get("tags")),
+            promoted=bool(job.config.get("promoted", False)),
+        )
+    ]
+
+
+def agent_system_pareto_reflector(
+    job: WorkerClaimedJob,
+    artifact_root: Path,
+) -> list[ArtifactRegisterRequest]:
+    dataset_artifacts = _input_artifacts(job, ArtifactType.DATASET)
+    if not dataset_artifacts:
+        raise ValueError(
+            "agent_system_pareto_reflector requires at least one dataset artifact"
+        )
+
+    max_records_per_round = _int_config(job.config.get("max_records_per_round"), 8)
+    rounds = _history_reflection_rounds(
+        dataset_artifacts,
+        max_records_per_round=max_records_per_round,
+    )
+    strategies = _pareto_candidate_strategies(job)
+    llm_config = _reflector_llm_config(job)
+    base_text = _agent_system_reflector_base_text(job)
+
+    name = str(
+        job.config.get("name")
+        or f"{dataset_artifacts[-1].name or dataset_artifacts[-1].artifact_id} pareto reflector"
+    )
+    target_path = Path(
+        normalize_agent_system_target_path(
+            job.config.get("target_path") or DEFAULT_AGENT_SYSTEM_TARGET_PATH
+        )
+    )
+    output_dir = artifact_root / "workers" / job.job_id / "agent_system_pareto_reflector"
+    candidates_dir = output_dir / "candidates"
+    candidates_dir.mkdir(parents=True, exist_ok=True)
+
+    manifests = [history_round["manifest"] for history_round in rounds]
+    candidates: list[dict[str, Any]] = []
+    for index, strategy in enumerate(strategies, start=1):
+        prompt = _render_agent_system_pareto_candidate_prompt(
+            job=job,
+            rounds=rounds,
+            base_text=base_text,
+            strategy=strategy,
+            index=index,
+            total=len(strategies),
+        )
+        markdown, audit_report = _generate_audited_agent_system_reflection(
+            prompt,
+            llm_config,
+            job=job,
+            manifests=manifests,
+        )
+        candidate_path = candidates_dir / f"{index:02d}-{_slug(strategy)}.md"
+        candidate_path.write_text(_ensure_trailing_newline(markdown), encoding="utf-8")
+        evaluation = _pareto_candidate_evaluation(job, strategy, index=index)
+        static_score = _agent_system_static_guardrail_score(markdown)
+        gate_failures = _pareto_candidate_gate_failures(
+            job=job,
+            rounds=rounds,
+            candidate_evaluation=evaluation,
+            static_score=static_score,
+        )
+        candidates.append(
+            {
+                "index": index,
+                "strategy": strategy,
+                "markdown_path": candidate_path,
+                "audit": audit_report,
+                "evaluation": evaluation,
+                "static_score": static_score,
+                "gate_failures": gate_failures,
+                "gate_passed": not gate_failures,
+                "selection_score": _pareto_candidate_selection_score(
+                    evaluation=evaluation,
+                    static_score=static_score,
+                    gate_failures=gate_failures,
+                ),
+            }
+        )
+
+    selected = _select_pareto_candidate(candidates)
+    output_path = output_dir / target_path
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    selected_markdown = Path(selected["markdown_path"]).read_text(encoding="utf-8")
+    output_path.write_text(_ensure_trailing_newline(selected_markdown), encoding="utf-8")
+
+    best_round = _best_history_round(rounds)
+    latest_round = rounds[-1]
+    dataset_ids = [history_round["artifact"].artifact_id for history_round in rounds]
+    selected_summary = _pareto_candidate_manifest_summary(selected)
+    archive = {
+        "method": "agent_system_pareto_reflector",
+        "job_id": job.job_id,
+        "round_count": len(rounds),
+        "best_round": best_round["round"],
+        "best_metrics": best_round["metrics"],
+        "latest_round": latest_round["round"],
+        "latest_metrics": latest_round["metrics"],
+        "selected_candidate": selected_summary,
+        "candidates": [
+            _pareto_candidate_report(candidate, output_dir=output_dir)
+            for candidate in candidates
+        ],
+        "promotion_gate": _pareto_promotion_gate_report(job, selected),
+    }
+    archive_path = output_dir / "candidate_archive.json"
+    archive_path.write_text(
+        json.dumps(archive, indent=2, sort_keys=True, allow_nan=False) + "\n",
+        encoding="utf-8",
+    )
+
+    gate_report = _pareto_promotion_gate_report(job, selected)
+    lineage = {
+        **_dict_config(job.config.get("lineage")),
+        "method": "agent_system_pareto_reflector",
+        "input_artifact_ids": _input_artifact_ids(job),
+        "source_dataset_artifact_ids": dataset_ids,
+    }
+    return [
+        ArtifactRegisterRequest(
+            type=ArtifactType.AGENT_SYSTEM,
+            name=name,
+            uri=output_path.resolve().as_uri(),
+            manifest={
+                "content_path": target_path.as_posix(),
+                "target_path": target_path.as_posix(),
+                "source_dataset_artifact_ids": dataset_ids,
+                "source_dataset_uris": [
+                    history_round["artifact"].uri for history_round in rounds
+                ],
+                "round_count": len(rounds),
+                "candidate_count": len(candidates),
+                "method": "agent_system_pareto_reflector",
+                "best_round": best_round["round"],
+                "best_f1": best_round["metrics"].get("f1"),
+                "latest_round": latest_round["round"],
+                "latest_f1": latest_round["metrics"].get("f1"),
+                "selected_candidate": selected_summary,
+                "promotion_gate": gate_report,
+                "archive_path": "candidate_archive.json",
+                "reflector_provider": llm_config["provider"],
+                "reflector_model": llm_config["model"],
+            },
+            lineage=lineage,
+            compatibility=_dict_config(job.config.get("compatibility")),
+            scores=_pareto_selected_scores(selected, job=job),
+            tags=_string_list(job.config.get("tags")),
+            promoted=bool(job.config.get("promoted", False)) and gate_report["passed"],
+        ),
+        ArtifactRegisterRequest(
+            type=ArtifactType.REPORT,
+            name=f"{name} candidate archive",
+            uri=archive_path.resolve().as_uri(),
+            manifest={
+                "content_path": "candidate_archive.json",
+                "method": "agent_system_pareto_reflector",
+                "candidate_count": len(candidates),
+                "selected_candidate": selected_summary,
+            },
+            lineage=lineage,
+            compatibility=_dict_config(job.config.get("compatibility")),
+            tags=_string_list(job.config.get("tags")),
+            promoted=False,
+        ),
+    ]
+
+
+def agent_system_gepa_reflector(
+    job: WorkerClaimedJob,
+    artifact_root: Path,
+) -> list[ArtifactRegisterRequest]:
+    dataset_artifacts = _input_artifacts(job, ArtifactType.DATASET)
+    if not dataset_artifacts:
+        raise ValueError(
+            "agent_system_gepa_reflector requires at least one dataset artifact"
+        )
+
+    max_records_per_round = _int_config(job.config.get("max_records_per_round"), 8)
+    rounds = _history_reflection_rounds(
+        dataset_artifacts,
+        max_records_per_round=max_records_per_round,
+    )
+    strategies = _gepa_mutation_strategies(job)
+    llm_config = _reflector_llm_config(job)
+    base_text = _agent_system_reflector_base_text(job)
+    target_path = Path(
+        normalize_agent_system_target_path(
+            job.config.get("target_path") or DEFAULT_AGENT_SYSTEM_TARGET_PATH
+        )
+    )
+    name = str(
+        job.config.get("name")
+        or f"{dataset_artifacts[-1].name or dataset_artifacts[-1].artifact_id} GEPA reflector"
+    )
+    output_dir = artifact_root / "workers" / job.job_id / "agent_system_gepa_reflector"
+    candidates_dir = output_dir / "candidates"
+    candidates_dir.mkdir(parents=True, exist_ok=True)
+
+    manifests = [history_round["manifest"] for history_round in rounds]
+    best_round = _best_history_round(rounds)
+    latest_round = rounds[-1]
+    dataset_ids = [history_round["artifact"].artifact_id for history_round in rounds]
+    lineage = {
+        **_dict_config(job.config.get("lineage")),
+        "method": "agent_system_gepa_reflector",
+        "input_artifact_ids": _input_artifact_ids(job),
+        "source_dataset_artifact_ids": dataset_ids,
+    }
+
+    artifacts: list[ArtifactRegisterRequest] = []
+    archive_candidates: list[dict[str, Any]] = []
+    for index, strategy in enumerate(strategies, start=1):
+        prompt = _render_agent_system_gepa_candidate_prompt(
+            job=job,
+            rounds=rounds,
+            base_text=base_text,
+            strategy=strategy,
+            index=index,
+            total=len(strategies),
+        )
+        markdown, audit_report = _generate_audited_agent_system_reflection(
+            prompt,
+            llm_config,
+            job=job,
+            manifests=manifests,
+        )
+        candidate_dir = candidates_dir / f"{index:02d}-{_slug(strategy)}"
+        candidate_path = candidate_dir / target_path
+        candidate_path.parent.mkdir(parents=True, exist_ok=True)
+        candidate_path.write_text(_ensure_trailing_newline(markdown), encoding="utf-8")
+        static_score = _agent_system_static_guardrail_score(markdown)
+        manifest = {
+            "content_path": target_path.as_posix(),
+            "target_path": target_path.as_posix(),
+            "source_dataset_artifact_ids": dataset_ids,
+            "source_dataset_uris": [
+                history_round["artifact"].uri for history_round in rounds
+            ],
+            "round_count": len(rounds),
+            "candidate_count": len(strategies),
+            "candidate_index": index,
+            "candidate_strategy": strategy,
+            "method": "agent_system_gepa_reflector",
+            "best_round": best_round["round"],
+            "best_f1": best_round["metrics"].get("f1"),
+            "latest_round": latest_round["round"],
+            "latest_f1": latest_round["metrics"].get("f1"),
+            "static_guardrail_score": static_score,
+            "agent_system_audit": audit_report,
+            "reflector_provider": llm_config["provider"],
+            "reflector_model": llm_config["model"],
+        }
+        artifacts.append(
+            ArtifactRegisterRequest(
+                type=ArtifactType.AGENT_SYSTEM,
+                name=f"{name} candidate {index}: {strategy}",
+                uri=candidate_path.resolve().as_uri(),
+                manifest=manifest,
+                lineage=lineage,
+                compatibility=_dict_config(job.config.get("compatibility")),
+                scores={
+                    **_scores_config(job.config.get("scores")),
+                    "static_guardrail_score": float(static_score),
+                },
+                tags=_string_list(job.config.get("tags")),
+                promoted=False,
+            )
+        )
+        archive_candidates.append(
+            {
+                "index": index,
+                "strategy": strategy,
+                "markdown_path": candidate_path.relative_to(output_dir).as_posix(),
+                "static_score": static_score,
+                "audit": audit_report,
+            }
+        )
+
+    archive = {
+        "method": "agent_system_gepa_reflector",
+        "job_id": job.job_id,
+        "candidate_count": len(strategies),
+        "round_count": len(rounds),
+        "best_round": best_round["round"],
+        "best_metrics": best_round["metrics"],
+        "latest_round": latest_round["round"],
+        "latest_metrics": latest_round["metrics"],
+        "candidates": archive_candidates,
+    }
+    archive_path = output_dir / "gepa_candidate_archive.json"
+    archive_path.write_text(
+        json.dumps(archive, indent=2, sort_keys=True, allow_nan=False) + "\n",
+        encoding="utf-8",
+    )
+    artifacts.append(
+        ArtifactRegisterRequest(
+            type=ArtifactType.REPORT,
+            name=f"{name} GEPA candidate archive",
+            uri=archive_path.resolve().as_uri(),
+            manifest={
+                "content_path": "gepa_candidate_archive.json",
+                "method": "agent_system_gepa_reflector",
+                "candidate_count": len(strategies),
+            },
+            lineage=lineage,
+            compatibility=_dict_config(job.config.get("compatibility")),
+            tags=_string_list(job.config.get("tags")),
+            promoted=False,
+        )
+    )
+    return artifacts
 
 
 def parametric_memory_register(
@@ -268,8 +680,22 @@ METHOD_REGISTRY: dict[str, EvolutionMethod] = {
     "skill_bundle": skill_bundle,
     "agent_system": agent_system,
     "agent_system_reflector": agent_system_reflector,
+    "agent_system_history_reflector": agent_system_history_reflector,
+    "agent_system_pareto_reflector": agent_system_pareto_reflector,
+    "agent_system_gepa_reflector": agent_system_gepa_reflector,
     "parametric_memory_register": parametric_memory_register,
 }
+
+
+def _input_artifacts(
+    job: WorkerClaimedJob,
+    artifact_type: ArtifactType,
+) -> list[WorkerClaimInputArtifact]:
+    return [
+        artifact
+        for artifact in job.input_artifacts
+        if artifact.type == artifact_type or artifact.type == artifact_type.value
+    ]
 
 
 def _first_input_artifact(
@@ -396,9 +822,611 @@ def _render_agent_system_reflection_prompt(
             "- Turn repeated failure signals into explicit checks before editing.",
             "- Prefer focused verification tied to the changed behavior before broad cleanup.",
             "",
+            "## Agent-System Rule Quality Gate",
+            "",
+            "- Do not copy exact held-out literals, source filenames, source sheet names, row numbers, article titles, answer counts, sequences, or reference records.",
+            "- Each methodology rule should be general across task instances but concrete enough to include a trigger, action, and validation check.",
+            "- Replace slogans such as broad coverage reminders with executable checks, for example recursive file-level source inventory, general structured evidence formats such as tables/spreadsheets/CSV/TSV/XLS/XLSX/supplementary files, and per-source final validation when the task involves package-like inputs.",
+            "",
         ]
     )
     return "\n".join(lines)
+
+
+def _history_reflection_rounds(
+    dataset_artifacts: list[WorkerClaimInputArtifact],
+    *,
+    max_records_per_round: int,
+) -> list[dict[str, Any]]:
+    rounds: list[dict[str, Any]] = []
+    for index, dataset in enumerate(dataset_artifacts, start=1):
+        manifest_path = _file_uri_to_path(dataset.uri)
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        records = _read_dataset_records(manifest_path, manifest)
+        reflected_records = _reflection_records(
+            records,
+            max_records=max_records_per_round,
+        )
+        rounds.append(
+            {
+                "artifact": dataset,
+                "manifest": manifest,
+                "records": records,
+                "reflected_records": reflected_records,
+                "round": _history_round_number(manifest, records=records, default=index),
+                "metrics": _history_metrics(manifest, records=records),
+            }
+        )
+    return sorted(rounds, key=lambda history_round: history_round["round"])
+
+
+def _render_agent_system_history_reflection_prompt(
+    *,
+    job: WorkerClaimedJob,
+    rounds: list[dict[str, Any]],
+    base_text: str,
+) -> str:
+    lines: list[str] = []
+    if base_text.strip():
+        lines.extend([base_text.strip(), ""])
+    else:
+        lines.extend(
+            [
+                "# Evolved Agent System",
+                "",
+                "Follow repository-local conventions and preserve task-specific learnings.",
+                "",
+            ]
+        )
+
+    best_round = _best_history_round(rounds)
+    latest_round = rounds[-1]
+    lines.extend(
+        [
+            "## Multi-Round Evolution History",
+            "",
+            f"- job_id: {job.job_id}",
+            f"- round_count: {len(rounds)}",
+            f"- best_round: Round {best_round['round']} f1={_format_metric(best_round['metrics'].get('f1'))}",
+            f"- latest_round: Round {latest_round['round']} f1={_format_metric(latest_round['metrics'].get('f1'))}",
+            "- reflector_goal: preserve stable improvements, recover regressions, and update methodology rather than memorizing held-out records.",
+            "",
+        ]
+    )
+
+    previous_metrics: dict[str, float | None] | None = None
+    for history_round in rounds:
+        metrics = history_round["metrics"]
+        delta_f1 = _metric_delta(metrics.get("f1"), None if previous_metrics is None else previous_metrics.get("f1"))
+        delta_recall = _metric_delta(
+            metrics.get("recall"),
+            None if previous_metrics is None else previous_metrics.get("recall"),
+        )
+        delta_precision = _metric_delta(
+            metrics.get("precision"),
+            None if previous_metrics is None else previous_metrics.get("precision"),
+        )
+        status = _round_delta_status(delta_f1)
+        lines.extend(
+            [
+                f"### Round {history_round['round']}",
+                "",
+                f"- dataset_artifact_id: {history_round['artifact'].artifact_id}",
+                f"- dataset_name: {history_round['manifest'].get('name') or history_round['artifact'].name or 'unknown'}",
+                f"- agent_system_artifact_id: {history_round['manifest'].get('agent_system_artifact_id') or 'unknown'}",
+                (
+                    "- metrics: "
+                    f"precision={_format_metric(metrics.get('precision'))} "
+                    f"recall={_format_metric(metrics.get('recall'))} "
+                    f"f1={_format_metric(metrics.get('f1'))} "
+                    f"tp={_format_count(metrics.get('true_positive'))} "
+                    f"fp={_format_count(metrics.get('false_positive'))} "
+                    f"fn={_format_count(metrics.get('false_negative'))} "
+                    f"duplicates={_format_count(metrics.get('duplicate_predictions'))}"
+                ),
+                (
+                    "- delta_from_previous: "
+                    f"delta_precision={_format_delta(delta_precision)} "
+                    f"delta_recall={_format_delta(delta_recall)} "
+                    f"delta_f1={_format_delta(delta_f1)} "
+                    f"status={status}"
+                ),
+                f"- reflected_record_count: {len(history_round['reflected_records'])}",
+                "",
+            ]
+        )
+        _append_round_reflection_sections(lines, history_round)
+        previous_metrics = metrics
+
+    lines.extend(
+        [
+            "## History-Aware Operating Rules",
+            "",
+            "- Preserve stable improvements from better rounds before adding new rules.",
+            "- Compare each proposed rule against earlier rounds; do not keep a rule that explains a later regression unless it also has stronger counter-evidence.",
+            "- Treat negative metric deltas as regression evidence and identify which methodology changed or disappeared.",
+            "- Use shared evaluator feedback only as sanitized methodology guidance; do not copy exact held-out literals, article titles, row identifiers, filenames, or tables.",
+            "- Prefer rules that improve component boundaries, canonical article/package identifiers, other task-provided source identifiers, deduplication, and final-output discipline across rounds.",
+            "",
+            "## Agent-System Rule Quality Gate",
+            "",
+            "- Do not copy exact held-out literals, source filenames, source sheet names, row numbers, article titles, answer counts, sequences, or reference records.",
+            "- Each methodology rule should be general across task instances but concrete enough to include a trigger, action, and validation check.",
+            "- Replace slogans such as broad coverage reminders with executable checks, for example recursive file-level source inventory, general structured evidence formats such as tables/spreadsheets/CSV/TSV/XLS/XLSX/supplementary files, and per-source final validation when the task involves package-like inputs.",
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _append_round_reflection_sections(
+    lines: list[str],
+    history_round: dict[str, Any],
+) -> None:
+    reflected_records = history_round["reflected_records"]
+    success_records = [record for record in reflected_records if record["kind"] == "success"]
+    failure_records = [record for record in reflected_records if record["kind"] == "failure"]
+    other_records = [record for record in reflected_records if record["kind"] == "observation"]
+    feedback_records = [record for record in reflected_records if record.get("evolution_feedback")]
+
+    round_label = f"Round {history_round['round']}"
+    _append_reflection_section(lines, f"{round_label} Successful Patterns", success_records, "observed")
+    _append_reflection_section(lines, f"{round_label} Failures To Avoid", failure_records, "failure_signal")
+    _append_reflection_section(lines, f"{round_label} Additional Observations", other_records, "observed")
+    _append_shared_evolution_feedback_section(lines, feedback_records)
+
+
+def _history_round_number(
+    manifest: dict[str, Any],
+    *,
+    records: list[dict[str, Any]] | None = None,
+    default: int,
+) -> int:
+    for key in ("round", "round_number", "evolution_round", "iteration"):
+        value = manifest.get(key)
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            continue
+    for record in records or []:
+        metadata = _record_session_metadata(record)
+        for key in ("round", "round_number", "evolution_round", "iteration"):
+            value = metadata.get(key)
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                continue
+        value = record.get("rollout_step")
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            pass
+        policy_version = record.get("policy_version")
+        if isinstance(policy_version, str):
+            match = re.search(r"(?:round|iteration)[-_ ]*(\d+)", policy_version, re.IGNORECASE)
+            if match:
+                return int(match.group(1))
+    return default
+
+
+def _history_metrics(
+    manifest: dict[str, Any],
+    *,
+    records: list[dict[str, Any]] | None = None,
+) -> dict[str, float | None]:
+    metrics = manifest.get("metrics")
+    if not isinstance(metrics, dict):
+        metrics = manifest.get("summary")
+    if not isinstance(metrics, dict):
+        metrics = {}
+    parsed = {
+        "precision": _metric_float(metrics, "precision"),
+        "recall": _metric_float(metrics, "recall"),
+        "f1": _metric_float(metrics, "f1"),
+        "true_positive": _metric_float(metrics, "true_positive", "tp"),
+        "false_positive": _metric_float(metrics, "false_positive", "fp"),
+        "false_negative": _metric_float(metrics, "false_negative", "fn"),
+        "duplicate_predictions": _metric_float(metrics, "duplicate_predictions", "duplicates"),
+    }
+    if any(value is not None for value in parsed.values()):
+        return parsed
+    return _history_metrics_from_records(records or [])
+
+
+def _record_session_metadata(record: dict[str, Any]) -> dict[str, Any]:
+    payload = record.get("payload")
+    if isinstance(payload, dict):
+        session_result = payload.get("session_result")
+        if isinstance(session_result, dict):
+            metadata = session_result.get("metadata")
+            if isinstance(metadata, dict):
+                return metadata
+    return {}
+
+
+def _history_metrics_from_records(records: list[dict[str, Any]]) -> dict[str, float | None]:
+    metrics: dict[str, float | None] = {
+        "precision": None,
+        "recall": None,
+        "f1": None,
+        "true_positive": None,
+        "false_positive": None,
+        "false_negative": None,
+        "duplicate_predictions": None,
+    }
+    for record in records:
+        feedback = _record_evolution_feedback(record)
+        aggregate_line = _aggregate_fit_line(feedback)
+        if not aggregate_line:
+            continue
+        for key in ("precision", "recall", "f1"):
+            value = _metric_from_text(aggregate_line, key)
+            if value is not None:
+                metrics[key] = value
+        if any(metrics[key] is not None for key in ("precision", "recall", "f1")):
+            return metrics
+    return metrics
+
+
+def _aggregate_fit_line(feedback: str) -> str:
+    match = re.search(r"Aggregate fit:[^\n\r]*", feedback)
+    return match.group(0) if match else ""
+
+
+def _metric_from_text(text: str, key: str) -> float | None:
+    match = re.search(rf"\b{re.escape(key)}=([-+]?\d+(?:\.\d+)?)", text)
+    if not match:
+        return None
+    try:
+        return float(match.group(1))
+    except ValueError:
+        return None
+
+
+def _metric_float(metrics: dict[str, Any], *keys: str) -> float | None:
+    for key in keys:
+        value = metrics.get(key)
+        if isinstance(value, int | float):
+            return float(value)
+        if isinstance(value, str):
+            try:
+                return float(value)
+            except ValueError:
+                continue
+    return None
+
+
+def _best_history_round(rounds: list[dict[str, Any]]) -> dict[str, Any]:
+    return max(
+        rounds,
+        key=lambda history_round: (
+            history_round["metrics"].get("f1")
+            if history_round["metrics"].get("f1") is not None
+            else float("-inf")
+        ),
+    )
+
+
+def _metric_delta(current: float | None, previous: float | None) -> float | None:
+    if current is None or previous is None:
+        return None
+    return current - previous
+
+
+def _round_delta_status(delta_f1: float | None) -> str:
+    if delta_f1 is None:
+        return "baseline"
+    if delta_f1 < -0.01:
+        return "regression"
+    if delta_f1 > 0.01:
+        return "improvement"
+    return "stable"
+
+
+def _format_metric(value: float | None) -> str:
+    return "unknown" if value is None else f"{value:.3f}"
+
+
+def _format_count(value: float | None) -> str:
+    return "unknown" if value is None else str(int(value))
+
+
+def _format_delta(value: float | None) -> str:
+    return "n/a" if value is None else f"{value:+.3f}"
+
+
+def _pareto_candidate_strategies(job: WorkerClaimedJob) -> list[str]:
+    configured = job.config.get("candidate_strategies")
+    if isinstance(configured, list):
+        strategies = [str(item).strip() for item in configured if str(item).strip()]
+        if strategies:
+            return strategies
+    count = _int_config(job.config.get("candidate_count"), 3)
+    defaults = [
+        "precision_guarded",
+        "recall_recovery",
+        "provenance_guarded",
+        "anti_regression",
+        "balanced_pareto",
+    ]
+    return defaults[: max(1, min(count, len(defaults)))]
+
+
+def _render_agent_system_pareto_candidate_prompt(
+    *,
+    job: WorkerClaimedJob,
+    rounds: list[dict[str, Any]],
+    base_text: str,
+    strategy: str,
+    index: int,
+    total: int,
+) -> str:
+    history_prompt = _render_agent_system_history_reflection_prompt(
+        job=job,
+        rounds=rounds,
+        base_text=base_text,
+    )
+    return (
+        f"{history_prompt}\n"
+        "## Pareto Candidate Generation\n\n"
+        "Use all historical trajectories, round-level metric deltas, and sanitized "
+        "shared evaluator feedback to propose one candidate AGENTS.md update. "
+        "This backend will generate multiple candidates, audit them, and let a "
+        "promotion gate select the candidate; do not assume this candidate will "
+        "be accepted automatically.\n\n"
+        f"- Candidate index: {index} of {total}\n"
+        f"- Candidate strategy: {strategy}\n"
+        "- Promotion gate: prefer candidates that preserve the best prior round, "
+        "avoid coverage collapse, avoid over-generation, preserve task-provided "
+        "canonical source identifiers, and do not copy held-out literals or task "
+        "answers.\n"
+        "- Candidate requirements: write general methodology, not task answers; each "
+        "rule should include a trigger, an action, and a validation check.\n\n"
+        "Return only the candidate Markdown agent-system instruction file."
+    )
+
+
+def _gepa_mutation_strategies(job: WorkerClaimedJob) -> list[str]:
+    configured = job.config.get("mutation_strategies")
+    if isinstance(configured, list):
+        strategies = [str(item).strip() for item in configured if str(item).strip()]
+        if strategies:
+            return strategies
+    count = _int_config(job.config.get("candidate_count"), 3)
+    defaults = [
+        "failure_targeted",
+        "verification_gate",
+        "preservation_gate",
+        "anti_regression",
+        "edge_case_corpus",
+    ]
+    return defaults[: max(1, min(count, len(defaults)))]
+
+
+def _render_agent_system_gepa_candidate_prompt(
+    *,
+    job: WorkerClaimedJob,
+    rounds: list[dict[str, Any]],
+    base_text: str,
+    strategy: str,
+    index: int,
+    total: int,
+) -> str:
+    history_prompt = _render_agent_system_history_reflection_prompt(
+        job=job,
+        rounds=rounds,
+        base_text=base_text,
+    )
+    return (
+        f"{history_prompt}\n"
+        "## GEPA Candidate Mutation\n\n"
+        "Generate one candidate AGENTS.md mutation for a GEPA-style optimizer. "
+        "Use trajectory evidence, verifier failure text, and sanitized evaluator "
+        "feedback to create concrete methodology rules. This candidate will be "
+        "evaluated externally against the task verifier, so optimize for behavior "
+        "that can be executed and checked rather than for sounding comprehensive.\n\n"
+        f"- Candidate index: {index} of {total}\n"
+        f"- Mutation strategy: {strategy}\n"
+        "- Reflection rule: each added instruction must name a trigger, an action, "
+        "and a validation check.\n"
+        "- Leakage rule: do not copy exact held-out literals, filenames, source row "
+        "numbers, task answers, or verifier-specific hidden records.\n"
+        "- Selection rule: prefer candidates that directly address observed verifier "
+        "failures while preserving successful prior behavior.\n\n"
+        "Return only the candidate Markdown agent-system instruction file."
+    )
+
+
+def _pareto_candidate_evaluation(
+    job: WorkerClaimedJob,
+    strategy: str,
+    *,
+    index: int,
+) -> dict[str, float]:
+    evaluations = job.config.get("candidate_evaluations")
+    value: Any = None
+    if isinstance(evaluations, dict):
+        value = evaluations.get(strategy)
+        if value is None:
+            value = evaluations.get(str(index))
+    elif isinstance(evaluations, list) and 0 <= index - 1 < len(evaluations):
+        value = evaluations[index - 1]
+    if not isinstance(value, dict):
+        return {}
+
+    parsed: dict[str, float] = {}
+    for key in (
+        "precision",
+        "recall",
+        "f1",
+        "true_positive",
+        "false_positive",
+        "false_negative",
+        "duplicate_predictions",
+        "prediction_to_reference_ratio",
+        "predicted_to_gold_ratio",
+        "output_ratio",
+    ):
+        number = _float_config(value.get(key), None)
+        if number is not None:
+            parsed[key] = number
+    return parsed
+
+
+def _pareto_candidate_gate_failures(
+    *,
+    job: WorkerClaimedJob,
+    rounds: list[dict[str, Any]],
+    candidate_evaluation: dict[str, float],
+    static_score: float,
+) -> list[str]:
+    gate = _dict_config(job.config.get("promotion_gate"))
+    failures: list[str] = []
+    if gate.get("requires_external_evaluation") and not candidate_evaluation:
+        failures.append("missing_external_evaluation")
+
+    max_ratio = _float_config(gate.get("max_prediction_to_reference_ratio"), None)
+    ratio = _candidate_prediction_ratio(candidate_evaluation)
+    if max_ratio is not None and ratio is not None and ratio > max_ratio:
+        failures.append("prediction_to_reference_ratio")
+
+    best_f1 = _best_history_round(rounds)["metrics"].get("f1")
+    candidate_f1 = candidate_evaluation.get("f1")
+    max_regression = _float_config(gate.get("max_f1_regression"), 0.01)
+    if (
+        best_f1 is not None
+        and candidate_f1 is not None
+        and max_regression is not None
+        and candidate_f1 < best_f1 - max_regression
+    ):
+        failures.append("f1_regression")
+
+    for metric_name in ("precision", "recall", "f1"):
+        minimum = _float_config(gate.get(f"min_{metric_name}"), None)
+        value = candidate_evaluation.get(metric_name)
+        if minimum is not None and value is not None and value < minimum:
+            failures.append(f"{metric_name}_below_minimum")
+
+    min_static_score = _float_config(gate.get("min_static_score"), None)
+    if min_static_score is not None and static_score < min_static_score:
+        failures.append("static_guardrail_score")
+
+    return list(dict.fromkeys(failures))
+
+
+def _candidate_prediction_ratio(candidate_evaluation: dict[str, float]) -> float | None:
+    for key in (
+        "prediction_to_reference_ratio",
+        "predicted_to_gold_ratio",
+        "output_ratio",
+    ):
+        value = candidate_evaluation.get(key)
+        if value is not None:
+            return value
+    return None
+
+
+def _agent_system_static_guardrail_score(text: str) -> float:
+    normalized = text.lower()
+    score = 0.0
+    actionable_count = sum(
+        1 for line in _agent_system_rule_lines(text) if _is_actionable_rule(line)
+    )
+    score += min(actionable_count, 3)
+    guardrail_groups = [
+        {"canonical", "source-id", "source id", "article_id", "article id"},
+        {"provenance", "evidence", "source"},
+        {"recursive", "inventory", "every file", "input root"},
+        {"precision", "false positive", "over-generation", "unsupported"},
+        {"recall", "coverage", "false negative", "collapse"},
+        {"verify", "validate", "audit", "check"},
+        {"leakage", "held-out", "literal", "answer"},
+        {"spreadsheet", "workbook", "csv", "tsv", "xls", "xlsx", "table"},
+    ]
+    for group in guardrail_groups:
+        if any(term in normalized for term in group):
+            score += 1
+    return score
+
+
+def _pareto_candidate_selection_score(
+    *,
+    evaluation: dict[str, float],
+    static_score: float,
+    gate_failures: list[str],
+) -> float:
+    if evaluation:
+        score = (
+            evaluation.get("f1", 0.0) * 1000
+            + evaluation.get("precision", 0.0) * 100
+            + evaluation.get("recall", 0.0) * 10
+        )
+    else:
+        score = static_score
+    if gate_failures:
+        score -= 100000 + len(gate_failures) * 1000
+    return score
+
+
+def _select_pareto_candidate(candidates: list[dict[str, Any]]) -> dict[str, Any]:
+    if not candidates:
+        raise ValueError("agent_system_pareto_reflector generated no candidates")
+    return max(candidates, key=lambda candidate: candidate["selection_score"])
+
+
+def _pareto_candidate_manifest_summary(candidate: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "index": candidate["index"],
+        "strategy": candidate["strategy"],
+        "evaluation": candidate["evaluation"],
+        "static_score": candidate["static_score"],
+        "gate_passed": candidate["gate_passed"],
+        "gate_failures": candidate["gate_failures"],
+        "selection_score": candidate["selection_score"],
+    }
+
+
+def _pareto_candidate_report(
+    candidate: dict[str, Any],
+    *,
+    output_dir: Path,
+) -> dict[str, Any]:
+    summary = _pareto_candidate_manifest_summary(candidate)
+    summary["markdown_path"] = Path(candidate["markdown_path"]).relative_to(output_dir).as_posix()
+    summary["audit"] = candidate["audit"]
+    return summary
+
+
+def _pareto_promotion_gate_report(
+    job: WorkerClaimedJob,
+    selected: dict[str, Any],
+) -> dict[str, Any]:
+    gate = _dict_config(job.config.get("promotion_gate"))
+    return {
+        "passed": selected["gate_passed"],
+        "failures": selected["gate_failures"],
+        "selected_strategy": selected["strategy"],
+        "requires_external_evaluation": bool(gate.get("requires_external_evaluation", False)),
+        "max_prediction_to_reference_ratio": _float_config(
+            gate.get("max_prediction_to_reference_ratio"),
+            None,
+        ),
+        "max_f1_regression": _float_config(gate.get("max_f1_regression"), 0.01),
+    }
+
+
+def _pareto_selected_scores(
+    selected: dict[str, Any],
+    *,
+    job: WorkerClaimedJob,
+) -> dict[str, float]:
+    scores = _scores_config(job.config.get("scores"))
+    for key in ("precision", "recall", "f1"):
+        value = selected["evaluation"].get(key)
+        if value is not None:
+            scores[f"candidate_{key}"] = float(value)
+    scores["static_guardrail_score"] = float(selected["static_score"])
+    return scores
 
 
 def _generate_agent_system_reflection(prompt: str, llm_config: dict[str, Any]) -> str:
@@ -408,6 +1436,54 @@ def _generate_agent_system_reflection(prompt: str, llm_config: dict[str, Any]) -
     if provider == _REFLECTOR_PROVIDER_OPENAI_CHAT:
         return _generate_agent_system_reflection_with_openai_chat(prompt, llm_config)
     raise ValueError(f"Unsupported agent_system_reflector LLM provider: {provider}")
+
+
+def _generate_audited_agent_system_reflection(
+    prompt: str,
+    llm_config: dict[str, Any],
+    *,
+    job: WorkerClaimedJob,
+    manifests: list[dict[str, Any]],
+) -> tuple[str, dict[str, Any]]:
+    audit_config = _agent_system_audit_config(job)
+    if audit_config.get("enabled") is False:
+        return _generate_agent_system_reflection(prompt, llm_config), {
+            "enabled": False,
+            "repair_count": 0,
+            "finding_count": 0,
+        }
+
+    max_repairs = _int_config(audit_config.get("max_repair_attempts"), 2)
+    forbidden_literals = _agent_system_forbidden_literals(job, manifests)
+    content = _generate_agent_system_reflection(prompt, llm_config)
+    findings = _audit_agent_system_markdown(
+        content,
+        forbidden_literals=forbidden_literals,
+    )
+    repair_count = 0
+    while findings and repair_count < max_repairs:
+        repair_prompt = _render_agent_system_audit_repair_prompt(
+            original_prompt=prompt,
+            candidate_markdown=content,
+            findings=findings,
+            forbidden_literals=forbidden_literals,
+        )
+        content = _generate_agent_system_reflection(repair_prompt, llm_config)
+        repair_count += 1
+        findings = _audit_agent_system_markdown(
+            content,
+            forbidden_literals=forbidden_literals,
+        )
+
+    if findings:
+        finding_summary = "; ".join(finding["message"] for finding in findings[:5])
+        raise ValueError(f"agent_system_reflector output failed audit: {finding_summary}")
+
+    return content, {
+        "enabled": True,
+        "repair_count": repair_count,
+        "finding_count": 0,
+    }
 
 
 def _generate_agent_system_reflection_with_openai_chat(
@@ -508,7 +1584,9 @@ def _codex_cli_reflector_prompt(prompt: str) -> str:
         "Do not include explanations, code fences, or surrounding commentary.\n\n"
         "You are a reflector for an agent system. Read prior task trajectories, "
         "preserve useful existing instructions, and produce a concise Markdown "
-        "agent-system instruction file.\n\n"
+        "agent-system instruction file. Every new methodology rule should be general "
+        "enough to transfer across tasks and concrete enough to describe a trigger, "
+        "an action, and a validation check.\n\n"
         f"{prompt}"
     )
 
@@ -541,6 +1619,472 @@ def _chat_completion_content(payload: Any) -> str:
     if isinstance(text, str):
         return text
     return ""
+
+
+def _agent_system_audit_config(job: WorkerClaimedJob) -> dict[str, Any]:
+    value = job.config.get("agent_system_audit")
+    return value if isinstance(value, dict) else {}
+
+
+def _agent_system_forbidden_literals(
+    job: WorkerClaimedJob,
+    manifests: list[dict[str, Any]],
+) -> list[tuple[str, str]]:
+    literals: list[tuple[str, str]] = []
+    for source in (job.config, _agent_system_audit_config(job), *manifests):
+        _collect_forbidden_literals(source, literals)
+    return _unique_forbidden_literals(literals)
+
+
+_FORBIDDEN_LITERAL_KEYS = {
+    "article_id",
+    "article_ids",
+    "article_title",
+    "article_titles",
+    "source_file",
+    "source_files",
+    "source_sheet",
+    "source_sheets",
+    "source_row",
+    "source_rows",
+    "sequence",
+    "sequences",
+}
+
+
+def _collect_forbidden_literals(
+    value: Any,
+    literals: list[tuple[str, str]],
+    *,
+    kind: str = "literal",
+    protected_context: bool = False,
+) -> None:
+    if isinstance(value, str):
+        text = value.strip()
+        if text:
+            literals.append((kind, text))
+        return
+    if isinstance(value, int | float) and not isinstance(value, bool):
+        if protected_context or kind != "literal":
+            literals.append((kind, str(value)))
+        return
+    if isinstance(value, list):
+        for item in value:
+            _collect_forbidden_literals(
+                item,
+                literals,
+                kind=kind,
+                protected_context=protected_context,
+            )
+        return
+    if not isinstance(value, dict):
+        return
+
+    for key in ("forbidden_literals", "leakage_basis"):
+        nested = value.get(key)
+        if nested is not None:
+            _collect_forbidden_literals(
+                nested,
+                literals,
+                kind=kind,
+                protected_context=True,
+            )
+    for key, nested in value.items():
+        if key in {"forbidden_literals", "leakage_basis"}:
+            continue
+        normalized_key = str(key).strip().lower().replace("-", "_")
+        if normalized_key in _FORBIDDEN_LITERAL_KEYS:
+            _collect_forbidden_literals(
+                nested,
+                literals,
+                kind=normalized_key,
+                protected_context=True,
+            )
+        elif protected_context:
+            _collect_forbidden_literals(
+                nested,
+                literals,
+                kind=kind,
+                protected_context=True,
+            )
+
+
+def _unique_forbidden_literals(literals: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    seen: set[tuple[str, str]] = set()
+    unique: list[tuple[str, str]] = []
+    for kind, literal in literals:
+        text = literal.strip()
+        if not text:
+            continue
+        key = (kind, text.lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append((kind, text))
+    return unique
+
+
+def _audit_agent_system_markdown(
+    text: str,
+    *,
+    forbidden_literals: list[tuple[str, str]],
+) -> list[dict[str, str]]:
+    findings: list[dict[str, str]] = []
+    if not text.strip():
+        return [{"code": "empty_output", "message": "agent-system output is empty"}]
+    findings.extend(_forbidden_literal_findings(text, forbidden_literals))
+    findings.extend(_actionability_findings(text))
+    return findings
+
+
+def _forbidden_literal_findings(
+    text: str,
+    forbidden_literals: list[tuple[str, str]],
+) -> list[dict[str, str]]:
+    findings: list[dict[str, str]] = []
+    haystack = text.lower()
+    sequence_haystack = _normalize_dna_literal(text)
+    for kind, literal in forbidden_literals:
+        if _literal_too_short(kind, literal):
+            continue
+        if _forbidden_literal_found(
+            text=text,
+            haystack=haystack,
+            sequence_haystack=sequence_haystack,
+            kind=kind,
+            literal=literal,
+        ):
+            findings.append(
+                {
+                    "code": "forbidden_literal",
+                    "message": f"forbidden literal copied from protected evaluation data ({kind})",
+                }
+            )
+    return _unique_findings(findings)
+
+
+def _literal_too_short(kind: str, literal: str) -> bool:
+    if "sequence" in kind:
+        return len(_normalize_dna_literal(literal)) < 20
+    if "row" in kind:
+        return not re.fullmatch(r"\d+", literal.strip())
+    return len(literal.strip()) < 6
+
+
+def _forbidden_literal_found(
+    *,
+    text: str,
+    haystack: str,
+    sequence_haystack: str,
+    kind: str,
+    literal: str,
+) -> bool:
+    if "sequence" in kind:
+        sequence = _normalize_dna_literal(literal)
+        return bool(sequence and sequence in sequence_haystack)
+    if "row" in kind:
+        row = literal.strip()
+        return (
+            re.search(
+                rf"\b(?:source[_\s-]*row|row)\s*(?:[:=#]\s*)?{re.escape(row)}\b",
+                text,
+                flags=re.IGNORECASE,
+            )
+            is not None
+        )
+    return literal.lower() in haystack
+
+
+def _normalize_dna_literal(value: str) -> str:
+    return re.sub(r"\s+", "", value).upper()
+
+
+def _actionability_findings(text: str) -> list[dict[str, str]]:
+    findings: list[dict[str, str]] = []
+    rule_lines = _agent_system_rule_lines(text)
+    if not any(_is_actionable_rule(line) for line in rule_lines):
+        findings.append(
+            {
+                "code": "missing_actionable_rule",
+                "message": "agent-system rules must include at least one concrete trigger, action, and validation check",
+            }
+        )
+
+    for line in rule_lines:
+        if _is_slogan_rule(line):
+            findings.append(
+                {
+                    "code": "slogan_rule",
+                    "message": f"rule is too generic to execute: {_redact_for_finding(line)}",
+                }
+            )
+
+    if _mentions_source_coverage(text) and not _has_actionable_source_coverage_rule(text):
+        findings.append(
+            {
+                "code": "source_coverage_not_actionable",
+                "message": (
+                    "coverage rules must include recursive file-level source discovery, named "
+                    "structured evidence formats, and a per-package or per-source validation check"
+                ),
+            }
+        )
+    return _unique_findings(findings)
+
+
+def _agent_system_rule_lines(text: str) -> list[str]:
+    lines: list[str] = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if re.fullmatch(r"[-*_]+", line):
+            continue
+        if line.startswith(("- ", "* ")):
+            line = line[2:].strip()
+        elif re.match(r"^\d+[.)]\s+", line):
+            line = re.sub(r"^\d+[.)]\s+", "", line).strip()
+        lines.append(line)
+    return lines
+
+
+def _is_actionable_rule(line: str) -> bool:
+    normalized = line.lower()
+    has_action = _contains_any(
+        normalized,
+        {
+            "audit",
+            "check",
+            "compare",
+            "confirm",
+            "deduplicate",
+            "enumerate",
+            "group",
+            "inspect",
+            "inventory",
+            "list",
+            "normalize",
+            "parse",
+            "read",
+            "reject",
+            "remove",
+            "run",
+            "scan",
+            "use",
+            "preserve",
+            "investigate",
+            "validate",
+            "verify",
+            "walk",
+        },
+    )
+    has_trigger_or_validation = _contains_any(
+        normalized,
+        {
+            "after",
+            "before",
+            "when",
+            "if",
+            "unless",
+            "until",
+            "finalizing",
+            "finishing",
+            "validation",
+            "verification",
+            "regression",
+            "regressions",
+            "failure",
+            "failures",
+            "round",
+            "rounds",
+            "check",
+            "audit",
+            "confirm",
+            "verify",
+        },
+    )
+    return has_action and has_trigger_or_validation
+
+
+def _is_slogan_rule(line: str) -> bool:
+    normalized = line.lower()
+    if _is_actionable_rule(line) and len(normalized.split()) >= 12:
+        return False
+    return bool(
+        re.search(
+            r"\b("
+            r"perform a coverage pass|review all (?:allowed )?sources|review every allowed source|"
+            r"balance precision and recall|improve coverage|be careful|avoid mistakes|"
+            r"use reflected lessons|preserve useful learnings"
+            r")\b",
+            normalized,
+        )
+    )
+
+
+def _mentions_source_coverage(text: str) -> bool:
+    normalized = text.lower()
+    source_terms = (
+        r"source|sources|package|packages|bundle|bundles|component|components|"
+        r"inventory|inventories"
+    )
+    patterns = [
+        r"\bsource[-\s]*coverage\b",
+        rf"\bcoverage\s+(?:pass|check|checks|rule|rules|audit|against)\b[^\n.]*\b(?:{source_terms})\b",
+        rf"\b(?:{source_terms})\b[^\n.]*\bcoverage\b",
+        r"\b(source bundle|source bundles|all allowed sources|every allowed source|"
+        r"all sources|eligible component classes|source checklist|allowed bundle|"
+        r"allowed bundles)\b",
+    ]
+    return any(re.search(pattern, normalized) for pattern in patterns)
+
+
+def _has_actionable_source_coverage_rule(text: str) -> bool:
+    normalized = text.lower()
+    has_inventory = _has_file_level_inventory_rule(normalized)
+    has_source_scope = _contains_any_term(
+        normalized,
+        {
+            "allowed input",
+            "input root",
+            "source root",
+            "package",
+            "article",
+            "directory",
+            "bundle",
+        },
+    )
+    has_structured_evidence = _contains_any_term(
+        normalized,
+        {
+            "table",
+            "tables",
+            "spreadsheet",
+            "spreadsheets",
+            "workbook",
+            "workbooks",
+            "csv",
+            "tsv",
+            "xlsx",
+            "xls",
+            "supplement",
+            "supplementary",
+        },
+    )
+    has_validation = _contains_any(
+        normalized,
+        {"verify", "confirm", "audit", "check", "before finalizing", "before finishing"},
+    )
+    return has_inventory and has_source_scope and has_structured_evidence and has_validation
+
+
+def _has_file_level_inventory_rule(text: str) -> bool:
+    if _contains_any_term(text, {"recursive", "recursively", "walk"}):
+        return True
+    return (
+        re.search(
+            r"\b(?:inventory|list|enumerate|scan)\s+(?:all\s+|every\s+|allowed\s+|source\s+)?files?\b",
+            text,
+        )
+        is not None
+        or re.search(r"\b(?:all|every|allowed|source)\s+files?\s+(?:under|in|within)\b", text)
+        is not None
+        or re.search(r"\bevery\s+file\b", text) is not None
+    )
+
+
+def _contains_any_term(text: str, needles: set[str]) -> bool:
+    return any(_contains_term(text, needle) for needle in needles)
+
+
+def _contains_term(text: str, needle: str) -> bool:
+    if re.search(r"[^a-z0-9_]", needle):
+        return needle in text
+    return re.search(rf"\b{re.escape(needle)}\b", text) is not None
+
+
+def _contains_any(text: str, needles: set[str]) -> bool:
+    return any(needle in text for needle in needles)
+
+
+def _unique_findings(findings: list[dict[str, str]]) -> list[dict[str, str]]:
+    seen: set[tuple[str, str]] = set()
+    unique: list[dict[str, str]] = []
+    for finding in findings:
+        key = (finding["code"], finding["message"])
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(finding)
+    return unique
+
+
+def _redact_for_finding(text: str) -> str:
+    return _snippet(text, limit=160)
+
+
+def _render_agent_system_audit_repair_prompt(
+    *,
+    original_prompt: str,
+    candidate_markdown: str,
+    findings: list[dict[str, str]],
+    forbidden_literals: list[tuple[str, str]],
+) -> str:
+    redacted_candidate = _redact_forbidden_literals(candidate_markdown, forbidden_literals)
+    lines = [
+        "Return only the revised Markdown agent-system instruction file.",
+        "",
+        "The previous agent-system audit found issues. Revise the Markdown so it passes these requirements:",
+    ]
+    for finding in findings:
+        lines.append(f"- {finding['message']}")
+    lines.extend(
+        [
+            "",
+            "Rules for the revision:",
+            "- Keep methodology general across tasks; do not name protected titles, exact source files, sheet names, row numbers, answer counts, sequences, or reference records.",
+            "- Replace generic slogans with rules that include a trigger, a concrete action, and a validation check.",
+            "- For source-coverage rules, describe recursive file-level inventory under the allowed input root, general structured evidence formats such as tables/spreadsheets/CSV/TSV/XLS/XLSX/supplementary files, and validation without naming task-specific files.",
+            "",
+            "Original reflection context:",
+            original_prompt,
+            "",
+            "Candidate Markdown with protected literals redacted:",
+            redacted_candidate,
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _redact_forbidden_literals(
+    text: str,
+    forbidden_literals: list[tuple[str, str]],
+) -> str:
+    redacted = text
+    for index, (kind, literal) in enumerate(forbidden_literals, 1):
+        if _literal_too_short(kind, literal):
+            continue
+        placeholder = f"[REDACTED_{kind.upper()}_{index}]"
+        if "sequence" in kind:
+            redacted = _redact_sequence_literal(redacted, literal, placeholder)
+        elif "row" in kind:
+            redacted = re.sub(
+                rf"\b(?:source[_\s-]*row|row)\s*(?:[:=#]\s*)?{re.escape(literal.strip())}\b",
+                placeholder,
+                redacted,
+                flags=re.IGNORECASE,
+            )
+        else:
+            redacted = re.sub(re.escape(literal), placeholder, redacted, flags=re.IGNORECASE)
+    return redacted
+
+
+def _redact_sequence_literal(text: str, literal: str, placeholder: str) -> str:
+    sequence = _normalize_dna_literal(literal)
+    if not sequence:
+        return text
+    pattern = r"\s*".join(re.escape(base) for base in sequence)
+    return re.sub(pattern, placeholder, text, flags=re.IGNORECASE)
 
 
 def _append_reflection_section(
@@ -617,6 +2161,13 @@ def _reflection_record(record: dict[str, Any]) -> dict[str, str] | None:
             transcript = metadata.get("transcript")
             if isinstance(transcript, str) and transcript.strip():
                 failure_signal = failure_signal or transcript.strip()
+            verifier_feedback = _verifier_feedback_summary(metadata.get("verifier"))
+            if verifier_feedback:
+                failure_signal = (
+                    f"{failure_signal}\n{verifier_feedback}".strip()
+                    if failure_signal
+                    else verifier_feedback
+                )
 
     payload_summary = _record_summary(record)
     if not observed and payload_summary:
@@ -634,9 +2185,38 @@ def _reflection_record(record: dict[str, Any]) -> dict[str, str] | None:
         "reward": "" if reward is None else str(reward),
         "prompt": _snippet(prompt),
         "observed": _snippet(observed),
-        "failure_signal": _snippet(failure_signal),
+        "failure_signal": _snippet(failure_signal, limit=2000),
         "evolution_feedback": _snippet(evolution_feedback, limit=2000),
     }
+
+
+def _verifier_feedback_summary(verifier: Any) -> str:
+    if not isinstance(verifier, dict):
+        return ""
+    lines: list[str] = []
+    summary = verifier.get("summary")
+    if isinstance(summary, dict) and summary:
+        parts = [
+            f"{key}={value}"
+            for key, value in summary.items()
+            if isinstance(key, str) and isinstance(value, int | float | str)
+        ]
+        if parts:
+            lines.append("verifier_summary: " + " ".join(parts))
+    failed_tests = verifier.get("failed_tests")
+    if isinstance(failed_tests, list):
+        for failed_test in failed_tests[:5]:
+            if not isinstance(failed_test, dict):
+                continue
+            name = failed_test.get("name")
+            message = failed_test.get("message")
+            name_text = name.strip() if isinstance(name, str) else "unknown_failed_test"
+            message_text = message.strip() if isinstance(message, str) else ""
+            if message_text:
+                lines.append(f"failed_test: {name_text}: {message_text}")
+            else:
+                lines.append(f"failed_test: {name_text}")
+    return "\n".join(lines)
 
 
 def _reflection_kind(status: Any, reward: float | None) -> str:
@@ -911,7 +2491,7 @@ def _optional_int(value: Any) -> int | None:
     return parsed if parsed > 0 else None
 
 
-def _float_config(value: Any, default: float) -> float:
+def _float_config(value: Any, default: float | None) -> float | None:
     try:
         return float(value)
     except (TypeError, ValueError):

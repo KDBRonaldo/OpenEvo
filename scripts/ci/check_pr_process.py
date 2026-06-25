@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Warn when PR process expectations from agents.md are missing.
+"""Warn when PR process expectations from AGENTS.md are missing.
 
 The default mode is non-blocking: warnings are printed and the process exits 0.
 Pass --strict to make missing expectations fail CI once the project is ready.
@@ -73,7 +73,7 @@ def is_docs_like(path: str) -> bool:
         normalized.startswith("docs/")
         or normalized.startswith(".github/ISSUE_TEMPLATE/")
         or normalized == ".github/pull_request_template.md"
-        or normalized == "agents.md"
+        or normalized == "AGENTS.md"
         or name == "README.md"
         or name.endswith(".md")
         or name.endswith(".rst")
@@ -100,7 +100,7 @@ def find_process_warnings(pr_body: str, changed_files: list[str]) -> list[str]:
         has_docs_change(changed_files) or has_docs_explanation(pr_body)
     ):
         warnings.append(
-            "Non-documentation changes should include docs/README/agents.md updates, "
+            "Non-documentation changes should include docs/README/AGENTS.md updates, "
             "or explain `No docs needed:` in the PR body."
         )
 

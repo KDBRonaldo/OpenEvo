@@ -49,6 +49,8 @@ METHOD_REGISTRY = {
     "skill_bundle": skill_bundle,
     "agent_system": agent_system,
     "agent_system_reflector": agent_system_reflector,
+    "agent_system_history_reflector": agent_system_history_reflector,
+    "agent_system_pareto_reflector": agent_system_pareto_reflector,
     "parametric_memory_register": parametric_memory_register,
 }
 ```
@@ -189,15 +191,20 @@ Codex subscription 登录态；SOTA reflector 仍可以在专用 research worker
   nested Codex run 会忽略用户 config、使用 `--ephemeral`、`--sandbox read-only`、
   并禁用 `shell_tool`，因为 dataset transcripts 属于不可信 prompt 内容；
 - 可选 `temperature`、`max_tokens` 和 `timeout_seconds`；
-- 可选 `job.config.target_path`，默认 `agents.md`；
-- 可选 `job.config.max_records`，限制 reflector 汇总的 records 数。
+- 可选 `job.config.target_path`，默认 `AGENTS.md`；
+- 可选 `job.config.max_records`，限制 reflector 汇总的 records 数；
+- 可选 `job.config.agent_system_audit`，控制生成后文本审计。默认最多启用两次自动
+  repair retry；可以传入 `forbidden_literals` / `leakage_basis`，用于禁止 exact
+  article title、source filename、sheet、row、sequence 等 protected literals 进入
+  `AGENTS.md`。
 
 输出：
 
 - `ArtifactRegisterRequest(type=agent_system)`；
 - `uri=file://.../<target_path>`；
 - manifest 包含 source dataset ID、record count、reflected record count、success count
-  和 failure count，以及 `reflector_provider` / `reflector_model`；
+  和 failure count，以及 `reflector_provider` / `reflector_model` 和
+  `agent_system_audit`；
 - lineage 包含 `method=agent_system_reflector` 和所有 input artifact IDs。
 
 ```mermaid
@@ -208,7 +215,7 @@ flowchart TB
     BaseAgentSystem[optional previous agent_system]
     Reflector[LLM reflector prompt]
     Model[openai_chat or codex_cli LLM provider]
-    TargetFile["agents.md / harness-specific path"]
+    TargetFile["AGENTS.md / harness-specific path"]
     Artifact[agent_system artifact]
 
     DatasetArtifact --> Manifest --> Records --> Reflector
@@ -219,9 +226,77 @@ flowchart TB
 方法会先把成功样本、失败样本和通用 evolution feedback 压缩成 prompt，上下文包含
 task、session、status、reward、prompt、observed/failure signal，以及由上游 evaluator
 写入的脱敏反馈，然后要求 LLM 返回完整 Markdown instruction 文件。
-它不负责评估生成结果，也不会默认 promotion。需要上线到 context resolver 时，应通过 job
-config 设置 `promoted=true`，并配合 `compatibility` 限制适用 harness、task tags 或 base
-model。
+它不负责评估新 instruction 的任务效果，也不会默认 promotion；但会对生成的
+agent-system 文本做轻量 audit。Audit 会阻止 protected literal 泄漏，并要求 rule
+不是空泛 slogan：至少要有可执行的 trigger、action 和 validation check。对于 coverage
+类规则，audit 要求规则说明 recursive file-level source discovery、通用结构化 evidence 格式和最终
+per-source/per-package validation。若首次生成失败，worker 会把 redacted candidate 和
+audit findings 发回同一 reflector model，最多重写两次；仍失败则 job 报错。需要上线到
+context resolver 时，应通过 job config 设置 `promoted=true`，并配合 `compatibility`
+限制适用 harness、task tags 或 base model。
+
+## Method: `agent_system_history_reflector`
+
+用途：从多轮 evolution dataset 中调用 LLM 生成新的 agent-system instruction 文件。它是
+`agent_system_reflector` 的 history-aware 版本，适合在第 2 轮之后使用：reflector 同时看到
+每轮 agent trajectory、共享 evaluator feedback、指标和相邻轮次 delta，从而保留已验证的
+改进并分析 regression，而不是只根据最近一轮改写 `AGENTS.md`。
+
+输入：
+
+- 一个或多个类型为 `dataset` 的 input artifacts，每个 dataset 表示一轮 rollout / eval；
+- dataset manifest 应尽量包含 `round` 或 `round_number`，缺失时按 input artifact 顺序编号；
+- dataset manifest 可包含 `agent_system_artifact_id`，用于记录该轮使用的 agent-system；
+- dataset manifest 可包含 `metrics` 或 `summary`，字段包括 `precision`、`recall`、`f1`、
+  `true_positive` / `tp`、`false_positive` / `fp`、`false_negative` / `fn`、
+  `duplicate_predictions` / `duplicates`；
+- 如果 manifest 缺少 `round` 或 metrics，method 会从 record metadata 中的 `round` /
+  `rollout_step` / `policy_version` 回退推断轮次，并从脱敏 golden feedback 的
+  `Aggregate fit: precision=..., recall=..., f1=...` 回退提取聚合指标；
+- records 与 `agent_system_reflector` 一样，可以包含 traces/transcripts 和脱敏的
+  `evolution_feedback`；
+- 可选旧 `agent_system` input artifact，或 `job.config.base_agent_system_markdown`、
+  `job.config.agent_system_markdown`、`job.config.content` 作为 base text。推荐传入当前
+  best agent-system，而不是只传 latest；
+- LLM 配置与 `agent_system_reflector` 相同，必须指定 `job.config.reflector_llm.model`；
+- 可选 `job.config.max_records_per_round`，默认每轮最多汇总 8 条 records；
+- 可选 `job.config.target_path`，默认 `AGENTS.md`；
+- 可选 `job.config.agent_system_audit`，语义与 `agent_system_reflector` 相同。
+
+输出：
+
+- `ArtifactRegisterRequest(type=agent_system)`；
+- `uri=file://.../<target_path>`；
+- manifest 包含 `source_dataset_artifact_ids`、`round_count`、总 `record_count`、
+  `reflected_record_count`、`success_count`、`failure_count`、`latest_round` /
+  `latest_f1`、`best_round` / `best_f1`，以及 `reflector_provider` /
+  `reflector_model` 和 `agent_system_audit`；
+- lineage 包含 `method=agent_system_history_reflector`、所有 input artifact IDs 和
+  `source_dataset_artifact_ids`。
+
+Prompt 数据流：
+
+```mermaid
+flowchart TB
+    Round1["dataset round 1"]
+    Round2["dataset round 2"]
+    RoundN["dataset round N"]
+    Base["best/previous agent_system"]
+    Summary["round summaries + metric deltas"]
+    Reflector["history-aware LLM reflector"]
+    TargetFile["AGENTS.md / harness-specific path"]
+
+    Round1 --> Summary
+    Round2 --> Summary
+    RoundN --> Summary
+    Base --> Reflector
+    Summary --> Reflector --> TargetFile
+```
+
+这个方法仍然不读取 raw ground truth，也不默认 promotion。Ground-truth evaluator 应在
+orchestration 层产生脱敏 feedback 和 metrics；history reflector 只根据这些共享信号更新
+方法论。典型用法是在 Round 3 后传入 Round 1、Round 2、Round 3 的 dataset artifacts，
+并把 Round 2 或离线验证最好的 agent-system artifact 作为 base text。
 
 ### Shared golden-standard feedback
 
@@ -231,7 +306,7 @@ orchestrator 或独立 evaluator 先调用 `polar_evolution.golden_standard`：
 - 在 agent workspace 外比较最终输出和 golden records；
 - 保存 raw metrics 供离线分析；
 - 只把脱敏 methodology feedback 写入 dataset event；
-- 对生成的 `agents.md` / `AGENTS.md` 运行泄漏检查，禁止 exact sequence、source
+- 对生成的 `AGENTS.md` / `agents.md` 运行泄漏检查，禁止 exact sequence、source
   filename、source sheet、row number、article title 或 reference record 进入 agent
   system。
 
@@ -251,7 +326,7 @@ method 重复读取大型 ground truth，也避免把评估答案泄漏给下一
     "max_tokens": 2000,
     "timeout_seconds": 30
   },
-  "target_path": "agents.md",
+  "target_path": "AGENTS.md",
   "promoted": false
 }
 ```
@@ -266,10 +341,44 @@ Codex subscription provider 示例：
     "codex_home": "/root/.codex",
     "timeout_seconds": 900
   },
-  "target_path": "agents.md",
+  "target_path": "AGENTS.md",
   "promoted": false
 }
 ```
+
+## Method: `agent_system_pareto_reflector`
+
+用途：从多轮 evolution dataset 中生成多个候选 agent-system instruction，并用
+promotion gate 选择一个候选。它用于替代“reflector 直接覆盖 latest `AGENTS.md`”的流程：
+reflector 负责提出候选，shared evaluator / orchestration layer 负责给候选分数，worker
+只做安全审计、退化门控和 archive 注册。
+
+输入：
+
+- 一个或多个类型为 `dataset` 的 input artifacts，语义与
+  `agent_system_history_reflector` 相同；
+- 可选旧 `agent_system` input artifact，或 `job.config.base_agent_system_markdown` 作为
+  base text；
+- 必填 `job.config.reflector_llm.model`；
+- 可选 `job.config.candidate_strategies`，默认生成 precision、recall、provenance 等多个
+  策略候选；
+- 可选 `job.config.candidate_evaluations`，由外部 paired evaluator 写入每个 candidate 的
+  `precision`、`recall`、`f1` 和 `prediction_to_reference_ratio` 等指标；
+- 可选 `job.config.promotion_gate`，例如 `max_prediction_to_reference_ratio`、
+  `max_f1_regression`、`min_precision`、`min_recall`、`requires_external_evaluation`。
+
+输出：
+
+- 一个 `agent_system` artifact，内容是 gate 选中的候选；
+- 一个 `report` artifact，`candidate_archive.json` 记录所有候选、审计结果、外部分数、
+  gate failures 和 selected candidate；
+- agent-system manifest 包含 `candidate_count`、`selected_candidate`、
+  `promotion_gate`、`best_round` / `latest_round` 和 archive path。
+
+这个方法不会读取 raw ground truth。若需要真正 paired evaluation，pipeline 应先对每个候选
+跑 rollout/evaluator，再把脱敏指标写回 `candidate_evaluations`。没有外部分数时，method
+只能用静态 guardrail score 排序；若不希望静态排序自动 promotion，可设置
+`promotion_gate.requires_external_evaluation=true` 或保持 `promoted=false`。
 
 ## Method: `parametric_memory_register`
 
@@ -314,6 +423,8 @@ polar-evolution worker
   --capability skill_bundle
   --capability agent_system
   --capability agent_system_reflector
+  --capability agent_system_history_reflector
+  --capability agent_system_pareto_reflector
   --artifact-root .polar_evolution
   --once
   --sleep-seconds 5
@@ -323,7 +434,7 @@ polar-evolution worker
 如果不传 `--capability`，worker 默认使用内置 method names。也可以传逗号分隔的值：
 
 ```sh
-uv run polar-evolution worker --capability text_memory,skill_bundle,agent_system,agent_system_reflector
+uv run polar-evolution worker --capability text_memory,skill_bundle,agent_system,agent_system_reflector,agent_system_history_reflector,agent_system_pareto_reflector
 ```
 
 ## 添加 Research Method
