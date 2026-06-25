@@ -84,6 +84,97 @@ def text_memory(job: WorkerClaimedJob, artifact_root: Path) -> list[ArtifactRegi
     ]
 
 
+def text_memory_reflector(
+    job: WorkerClaimedJob,
+    artifact_root: Path,
+) -> list[ArtifactRegisterRequest]:
+    dataset = _first_input_artifact(job, ArtifactType.DATASET)
+    if dataset is None:
+        raise ValueError("text_memory_reflector requires an input dataset artifact")
+
+    manifest_path = _file_uri_to_path(dataset.uri)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    records = _read_dataset_records(manifest_path, manifest)
+    reflected_records = _reflection_records(
+        records,
+        max_records=_int_config(job.config.get("max_records"), 20),
+    )
+    prior_memory_texts = _text_memory_reflector_base_texts(job)
+
+    reflection_prompt = _render_text_memory_reflection_prompt(
+        job=job,
+        dataset=dataset,
+        manifest=manifest,
+        records=records,
+        reflected_records=reflected_records,
+        prior_memory_texts=prior_memory_texts,
+    )
+    reflection_prompt = _redact_generic_reflector_prompt(
+        reflection_prompt,
+        job=job,
+        manifests=[manifest],
+    )
+    llm_config = _reflector_llm_config(job)
+    memory_markdown = _generate_reflector_markdown(
+        reflection_prompt,
+        llm_config,
+        system_message=(
+            "You are a reflector for text memory. Read prior task trajectories and "
+            "produce concise reusable Markdown memory. Return only memory.md content."
+        ),
+        codex_prompt=_codex_cli_text_memory_reflector_prompt(reflection_prompt),
+        error_context="text_memory_reflector",
+        temp_prefix="polar-text-memory-reflector-",
+    )
+    memory_markdown, audit_report = _guard_generic_reflector_output(
+        memory_markdown,
+        job=job,
+        manifests=[manifest],
+    )
+
+    output_dir = artifact_root / "workers" / job.job_id / "text_memory_reflector"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    memory_path = output_dir / "memory.md"
+    memory_path.write_text(_ensure_trailing_newline(memory_markdown), encoding="utf-8")
+
+    success_count = sum(1 for record in reflected_records if record["kind"] == "success")
+    failure_count = sum(1 for record in reflected_records if record["kind"] == "failure")
+    lineage = {
+        **_dict_config(job.config.get("lineage")),
+        "method": "text_memory_reflector",
+        "input_artifact_ids": _input_artifact_ids(job),
+        "source_dataset_artifact_id": dataset.artifact_id,
+    }
+    return [
+        ArtifactRegisterRequest(
+            type=ArtifactType.TEXT_MEMORY,
+            name=str(
+                job.config.get("name")
+                or f"{dataset.name or dataset.artifact_id} reflected memory"
+            ),
+            uri=memory_path.resolve().as_uri(),
+            manifest={
+                "content_path": "memory.md",
+                "method": "text_memory_reflector",
+                "source_dataset_artifact_id": dataset.artifact_id,
+                "source_dataset_uri": dataset.uri,
+                "record_count": len(records),
+                "reflected_record_count": len(reflected_records),
+                "success_count": success_count,
+                "failure_count": failure_count,
+                "reflector_provider": llm_config["provider"],
+                "reflector_model": llm_config["model"],
+                "reflection_audit": audit_report,
+            },
+            lineage=lineage,
+            compatibility=_dict_config(job.config.get("compatibility")),
+            scores=_scores_config(job.config.get("scores")),
+            tags=_string_list(job.config.get("tags")),
+            promoted=bool(job.config.get("promoted", False)),
+        )
+    ]
+
+
 def skill_bundle(job: WorkerClaimedJob, artifact_root: Path) -> list[ArtifactRegisterRequest]:
     name = str(job.config.get("name") or f"{job.job_id}-skill")
     output_dir = artifact_root / "workers" / job.job_id / "skill_bundle" / _slug(name)
@@ -104,6 +195,102 @@ def skill_bundle(job: WorkerClaimedJob, artifact_root: Path) -> list[ArtifactReg
             name=name,
             uri=output_dir.resolve().as_uri(),
             manifest={"entrypoint": "SKILL.md", "files": ["SKILL.md"]},
+            tags=_string_list(job.config.get("tags")),
+            promoted=bool(job.config.get("promoted", False)),
+        )
+    ]
+
+
+def skill_bundle_reflector(
+    job: WorkerClaimedJob,
+    artifact_root: Path,
+) -> list[ArtifactRegisterRequest]:
+    dataset = _first_input_artifact(job, ArtifactType.DATASET)
+    if dataset is None:
+        raise ValueError("skill_bundle_reflector requires an input dataset artifact")
+
+    manifest_path = _file_uri_to_path(dataset.uri)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    records = _read_dataset_records(manifest_path, manifest)
+    reflected_records = _reflection_records(
+        records,
+        max_records=_int_config(job.config.get("max_records"), 20),
+    )
+    base_text, base_skill_artifact = _skill_bundle_reflector_base(job)
+
+    reflection_prompt = _render_skill_bundle_reflection_prompt(
+        job=job,
+        dataset=dataset,
+        manifest=manifest,
+        records=records,
+        reflected_records=reflected_records,
+        base_text=base_text,
+    )
+    reflection_prompt = _redact_generic_reflector_prompt(
+        reflection_prompt,
+        job=job,
+        manifests=[manifest],
+    )
+    llm_config = _reflector_llm_config(job)
+    skill_markdown = _generate_reflector_markdown(
+        reflection_prompt,
+        llm_config,
+        system_message=(
+            "You are a reflector for a Codex skill bundle. Read prior task trajectories "
+            "and produce the SKILL.md entrypoint. Return only SKILL.md content."
+        ),
+        codex_prompt=_codex_cli_skill_bundle_reflector_prompt(reflection_prompt),
+        error_context="skill_bundle_reflector",
+        temp_prefix="polar-skill-bundle-reflector-",
+    )
+    skill_markdown, audit_report = _guard_generic_reflector_output(
+        skill_markdown,
+        job=job,
+        manifests=[manifest],
+    )
+
+    name = str(
+        job.config.get("name") or f"{dataset.name or dataset.artifact_id} reflected skill"
+    )
+    output_dir = artifact_root / "workers" / job.job_id / "skill_bundle_reflector" / _slug(name)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    skill_path = output_dir / "SKILL.md"
+    skill_path.write_text(_ensure_trailing_newline(skill_markdown), encoding="utf-8")
+
+    success_count = sum(1 for record in reflected_records if record["kind"] == "success")
+    failure_count = sum(1 for record in reflected_records if record["kind"] == "failure")
+    lineage = {
+        **_dict_config(job.config.get("lineage")),
+        "method": "skill_bundle_reflector",
+        "input_artifact_ids": _input_artifact_ids(job),
+        "source_dataset_artifact_id": dataset.artifact_id,
+    }
+    manifest_payload = {
+        "entrypoint": "SKILL.md",
+        "files": ["SKILL.md"],
+        "method": "skill_bundle_reflector",
+        "source_dataset_artifact_id": dataset.artifact_id,
+        "source_dataset_uri": dataset.uri,
+        "record_count": len(records),
+        "reflected_record_count": len(reflected_records),
+        "success_count": success_count,
+        "failure_count": failure_count,
+        "reflector_provider": llm_config["provider"],
+        "reflector_model": llm_config["model"],
+        "reflection_audit": audit_report,
+    }
+    if base_skill_artifact is not None:
+        manifest_payload["base_skill_bundle_artifact_id"] = base_skill_artifact.artifact_id
+
+    return [
+        ArtifactRegisterRequest(
+            type=ArtifactType.SKILL_BUNDLE,
+            name=name,
+            uri=output_dir.resolve().as_uri(),
+            manifest=manifest_payload,
+            lineage=lineage,
+            compatibility=_dict_config(job.config.get("compatibility")),
+            scores=_scores_config(job.config.get("scores")),
             tags=_string_list(job.config.get("tags")),
             promoted=bool(job.config.get("promoted", False)),
         )
@@ -677,7 +864,9 @@ def parametric_memory_register(
 
 METHOD_REGISTRY: dict[str, EvolutionMethod] = {
     "text_memory": text_memory,
+    "text_memory_reflector": text_memory_reflector,
     "skill_bundle": skill_bundle,
+    "skill_bundle_reflector": skill_bundle_reflector,
     "agent_system": agent_system,
     "agent_system_reflector": agent_system_reflector,
     "agent_system_history_reflector": agent_system_history_reflector,
@@ -768,6 +957,109 @@ def _record_summary(record: dict[str, Any]) -> str:
                 if isinstance(value, str) and value.strip():
                     return value.strip()
     return ""
+
+
+def _render_text_memory_reflection_prompt(
+    *,
+    job: WorkerClaimedJob,
+    dataset: WorkerClaimInputArtifact,
+    manifest: dict[str, Any],
+    records: list[dict[str, Any]],
+    reflected_records: list[dict[str, str]],
+    prior_memory_texts: list[str],
+) -> str:
+    success_records = [record for record in reflected_records if record["kind"] == "success"]
+    failure_records = [record for record in reflected_records if record["kind"] == "failure"]
+    other_records = [record for record in reflected_records if record["kind"] == "observation"]
+    feedback_records = [record for record in reflected_records if record.get("evolution_feedback")]
+
+    lines = [
+        "# Text Memory Reflection Context",
+        "",
+        "Write reusable task memory as Markdown. The memory should help future rollouts "
+        "by capturing reusable task memory, recurring failure modes, and validation habits.",
+        "",
+        f"- job_id: {job.job_id}",
+        f"- dataset_artifact_id: {dataset.artifact_id}",
+        f"- dataset_name: {manifest.get('name') or dataset.name or 'unknown'}",
+        f"- record_count: {len(records)}",
+        f"- reflected_record_count: {len(reflected_records)}",
+        "",
+    ]
+    if prior_memory_texts:
+        lines.extend(["## Existing Text Memory", ""])
+        for index, memory_text in enumerate(prior_memory_texts, start=1):
+            lines.extend([f"### Memory {index}", "", memory_text.strip(), ""])
+    _append_reflection_section(lines, "Successful Patterns", success_records, "observed")
+    _append_reflection_section(lines, "Failures To Remember", failure_records, "failure_signal")
+    _append_reflection_section(lines, "Additional Observations", other_records, "observed")
+    _append_shared_evolution_feedback_section(lines, feedback_records)
+    lines.extend(
+        [
+            "## Output Contract",
+            "",
+            "- Return only the Markdown for memory.md.",
+            "- Keep the memory concise and reusable across related task instances.",
+            "- Convert concrete trajectory evidence into general checks, validation habits, "
+            "and failure reminders.",
+            "- Do not copy held-out answers, article titles, exact source rows, exact expected "
+            "outputs, or verifier-private records.",
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _render_skill_bundle_reflection_prompt(
+    *,
+    job: WorkerClaimedJob,
+    dataset: WorkerClaimInputArtifact,
+    manifest: dict[str, Any],
+    records: list[dict[str, Any]],
+    reflected_records: list[dict[str, str]],
+    base_text: str,
+) -> str:
+    success_records = [record for record in reflected_records if record["kind"] == "success"]
+    failure_records = [record for record in reflected_records if record["kind"] == "failure"]
+    other_records = [record for record in reflected_records if record["kind"] == "observation"]
+    feedback_records = [record for record in reflected_records if record.get("evolution_feedback")]
+
+    lines = [
+        "# Skill Bundle Reflection Context",
+        "",
+        "Write a Codex skill bundle entrypoint. For this first implementation, return "
+        "only the Markdown content for SKILL.md.",
+        "",
+        f"- job_id: {job.job_id}",
+        f"- dataset_artifact_id: {dataset.artifact_id}",
+        f"- dataset_name: {manifest.get('name') or dataset.name or 'unknown'}",
+        f"- record_count: {len(records)}",
+        f"- reflected_record_count: {len(reflected_records)}",
+        "",
+    ]
+    if base_text.strip():
+        lines.extend(["## Existing Skill Bundle", "", base_text.strip(), ""])
+    _append_reflection_section(lines, "Successful Patterns", success_records, "observed")
+    _append_reflection_section(lines, "Failures To Avoid", failure_records, "failure_signal")
+    _append_reflection_section(lines, "Additional Observations", other_records, "observed")
+    _append_shared_evolution_feedback_section(lines, feedback_records)
+    lines.extend(
+        [
+            "## Output Contract",
+            "",
+            "- Return only SKILL.md content; do not wrap it in a code fence.",
+            "- Include YAML frontmatter with name and description when useful.",
+            "- Make the skill trigger-oriented: state when to use it, what to inspect, "
+            "what helper checks to run, and what final validation proves completion.",
+            "- Tools are part of the skill bundle. If a future version needs helper scripts, "
+            "describe the helper behavior in SKILL.md rather than creating a separate "
+            "tool artifact type.",
+            "- Do not copy held-out answers, article titles, exact source rows, exact expected "
+            "outputs, or verifier-private records.",
+            "",
+        ]
+    )
+    return "\n".join(lines)
 
 
 def _render_agent_system_reflection_prompt(
@@ -1430,12 +1722,45 @@ def _pareto_selected_scores(
 
 
 def _generate_agent_system_reflection(prompt: str, llm_config: dict[str, Any]) -> str:
+    return _generate_reflector_markdown(
+        prompt,
+        llm_config,
+        system_message=(
+            "You are a reflector for an agent system. Read prior task trajectories, "
+            "preserve useful existing instructions, and produce a concise Markdown "
+            "agent-system instruction file. Return only the Markdown file content."
+        ),
+        codex_prompt=_codex_cli_reflector_prompt(prompt),
+        error_context="agent_system_reflector",
+        temp_prefix="polar-agent-system-reflector-",
+    )
+
+
+def _generate_reflector_markdown(
+    prompt: str,
+    llm_config: dict[str, Any],
+    *,
+    system_message: str,
+    codex_prompt: str,
+    error_context: str,
+    temp_prefix: str,
+) -> str:
     provider = llm_config["provider"]
     if provider == _REFLECTOR_PROVIDER_CODEX_CLI:
-        return _generate_agent_system_reflection_with_codex_cli(prompt, llm_config)
+        return _generate_agent_system_reflection_with_codex_cli(
+            llm_config,
+            prompt_input=codex_prompt,
+            error_context=error_context,
+            temp_prefix=temp_prefix,
+        )
     if provider == _REFLECTOR_PROVIDER_OPENAI_CHAT:
-        return _generate_agent_system_reflection_with_openai_chat(prompt, llm_config)
-    raise ValueError(f"Unsupported agent_system_reflector LLM provider: {provider}")
+        return _generate_agent_system_reflection_with_openai_chat(
+            prompt,
+            llm_config,
+            system_message=system_message,
+            error_context=error_context,
+        )
+    raise ValueError(f"Unsupported {error_context} LLM provider: {provider}")
 
 
 def _generate_audited_agent_system_reflection(
@@ -1489,17 +1814,16 @@ def _generate_audited_agent_system_reflection(
 def _generate_agent_system_reflection_with_openai_chat(
     prompt: str,
     llm_config: dict[str, Any],
+    *,
+    system_message: str,
+    error_context: str,
 ) -> str:
     payload: dict[str, Any] = {
         "model": llm_config["model"],
         "messages": [
             {
                 "role": "system",
-                "content": (
-                    "You are a reflector for an agent system. Read prior task trajectories, "
-                    "preserve useful existing instructions, and produce a concise Markdown "
-                    "agent-system instruction file. Return only the Markdown file content."
-                ),
+                "content": system_message,
             },
             {"role": "user", "content": prompt},
         ],
@@ -1523,15 +1847,18 @@ def _generate_agent_system_reflection_with_openai_chat(
         response.raise_for_status()
     content = _chat_completion_content(response.json())
     if not content.strip():
-        raise ValueError("agent_system_reflector LLM returned empty content")
+        raise ValueError(f"{error_context} LLM returned empty content")
     return content.strip()
 
 
 def _generate_agent_system_reflection_with_codex_cli(
-    prompt: str,
     llm_config: dict[str, Any],
+    *,
+    prompt_input: str,
+    error_context: str,
+    temp_prefix: str,
 ) -> str:
-    with tempfile.TemporaryDirectory(prefix="polar-agent-system-reflector-") as tmp:
+    with tempfile.TemporaryDirectory(prefix=temp_prefix) as tmp:
         tmpdir = Path(tmp)
         output_path = tmpdir / "last-message.md"
         args = [
@@ -1553,7 +1880,6 @@ def _generate_agent_system_reflection_with_codex_cli(
             str(llm_config["model"]),
             "-",
         ]
-        prompt_input = _codex_cli_reflector_prompt(prompt)
         try:
             subprocess.run(
                 args,
@@ -1568,13 +1894,13 @@ def _generate_agent_system_reflection_with_codex_cli(
             stderr = (exc.stderr or "").strip()
             stdout = (exc.stdout or "").strip()
             detail = stderr or stdout or f"exit code {exc.returncode}"
-            raise ValueError(f"agent_system_reflector codex_cli failed: {detail}") from exc
+            raise ValueError(f"{error_context} codex_cli failed: {detail}") from exc
         except subprocess.TimeoutExpired as exc:
-            raise ValueError("agent_system_reflector codex_cli timed out") from exc
+            raise ValueError(f"{error_context} codex_cli timed out") from exc
 
         content = output_path.read_text(encoding="utf-8") if output_path.exists() else ""
     if not content.strip():
-        raise ValueError("agent_system_reflector codex_cli returned empty content")
+        raise ValueError(f"{error_context} codex_cli returned empty content")
     return content.strip()
 
 
@@ -1587,6 +1913,30 @@ def _codex_cli_reflector_prompt(prompt: str) -> str:
         "agent-system instruction file. Every new methodology rule should be general "
         "enough to transfer across tasks and concrete enough to describe a trigger, "
         "an action, and a validation check.\n\n"
+        f"{prompt}"
+    )
+
+
+def _codex_cli_text_memory_reflector_prompt(prompt: str) -> str:
+    return (
+        "Return only the Markdown memory.md file. "
+        "Do not include explanations, code fences, or surrounding commentary.\n\n"
+        "You are a reflector for text memory. Read prior task trajectories and produce "
+        "concise reusable memory for future sessions. Focus on recurring failure modes, "
+        "successful task habits, and validation checks that transfer across tasks. "
+        "Do not copy exact held-out literals or task answers.\n\n"
+        f"{prompt}"
+    )
+
+
+def _codex_cli_skill_bundle_reflector_prompt(prompt: str) -> str:
+    return (
+        "Return only SKILL.md content for a Codex skill bundle. "
+        "Do not include explanations, code fences, or surrounding commentary.\n\n"
+        "You are a reflector for a Codex skill bundle. Read prior task trajectories "
+        "and produce a concise skill entrypoint with a clear trigger, workflow, and "
+        "verification guidance. Do not create a separate tool artifact type and do "
+        "not copy exact held-out literals or task answers.\n\n"
         f"{prompt}"
     )
 
@@ -1634,6 +1984,54 @@ def _agent_system_forbidden_literals(
     for source in (job.config, _agent_system_audit_config(job), *manifests):
         _collect_forbidden_literals(source, literals)
     return _unique_forbidden_literals(literals)
+
+
+def _redact_generic_reflector_prompt(
+    prompt: str,
+    *,
+    job: WorkerClaimedJob,
+    manifests: list[dict[str, Any]],
+) -> str:
+    forbidden_literals = _agent_system_forbidden_literals(job, manifests)
+    if not forbidden_literals:
+        return prompt
+    return _redact_forbidden_literals(prompt, forbidden_literals)
+
+
+def _guard_generic_reflector_output(
+    markdown: str,
+    *,
+    job: WorkerClaimedJob,
+    manifests: list[dict[str, Any]],
+) -> tuple[str, dict[str, Any]]:
+    forbidden_literals = _agent_system_forbidden_literals(job, manifests)
+    findings = _forbidden_literal_findings(markdown, forbidden_literals)
+    if not findings:
+        return (
+            markdown,
+            {
+                "finding_count": 0,
+                "redaction_count": 0,
+                "remaining_finding_count": 0,
+                "findings": [],
+            },
+        )
+
+    redacted = _redact_forbidden_literals(markdown, forbidden_literals)
+    remaining_findings = _forbidden_literal_findings(redacted, forbidden_literals)
+    if remaining_findings:
+        raise ValueError(
+            "reflector output still contains protected literals after redaction"
+        )
+    return (
+        redacted,
+        {
+            "finding_count": len(findings),
+            "redaction_count": 1,
+            "remaining_finding_count": 0,
+            "findings": findings,
+        },
+    )
 
 
 _FORBIDDEN_LITERAL_KEYS = {
@@ -2263,16 +2661,60 @@ def _agent_system_reflector_base_text(job: WorkerClaimedJob) -> str:
         value = job.config.get(key)
         if isinstance(value, str) and value.strip():
             return value.strip()
-    for artifact in job.input_artifacts:
+    for artifact in reversed(job.input_artifacts):
         if (
             artifact.type == ArtifactType.AGENT_SYSTEM
             or artifact.type == ArtifactType.AGENT_SYSTEM.value
         ):
-            try:
-                return _file_uri_to_path(artifact.uri).read_text(encoding="utf-8").strip()
-            except (OSError, ValueError, UnicodeDecodeError):
-                continue
+            text = _read_input_artifact_text(artifact)
+            if text:
+                return text
     return ""
+
+
+def _text_memory_reflector_base_texts(job: WorkerClaimedJob) -> list[str]:
+    texts: list[str] = []
+    for artifact in job.input_artifacts:
+        if (
+            artifact.type == ArtifactType.TEXT_MEMORY
+            or artifact.type == ArtifactType.TEXT_MEMORY.value
+        ):
+            text = _read_input_artifact_text(artifact)
+            if text:
+                texts.append(text)
+    return texts
+
+
+def _skill_bundle_reflector_base(
+    job: WorkerClaimedJob,
+) -> tuple[str, WorkerClaimInputArtifact | None]:
+    for key in ("base_skill_markdown", "skill_markdown", "content"):
+        value = job.config.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip(), None
+    for artifact in reversed(job.input_artifacts):
+        if (
+            artifact.type == ArtifactType.SKILL_BUNDLE
+            or artifact.type == ArtifactType.SKILL_BUNDLE.value
+        ):
+            text = _read_input_artifact_text(artifact, directory_entrypoint="SKILL.md")
+            if text:
+                return text, artifact
+    return "", None
+
+
+def _read_input_artifact_text(
+    artifact: WorkerClaimInputArtifact,
+    *,
+    directory_entrypoint: str | None = None,
+) -> str:
+    try:
+        path = _file_uri_to_path(artifact.uri)
+        if directory_entrypoint and path.is_dir():
+            path = path / directory_entrypoint
+        return path.read_text(encoding="utf-8").strip()
+    except (OSError, ValueError, UnicodeDecodeError):
+        return ""
 
 
 def _reflector_llm_config(job: WorkerClaimedJob) -> dict[str, Any]:

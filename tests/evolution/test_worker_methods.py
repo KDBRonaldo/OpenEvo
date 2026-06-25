@@ -9,7 +9,7 @@ import httpx
 import pytest
 
 from polar_evolution.cli import _parse_capabilities
-from polar_evolution.methods import _audit_agent_system_markdown, run_method
+from polar_evolution.methods import METHOD_REGISTRY, _audit_agent_system_markdown, run_method
 from polar_evolution.models import ArtifactType, ContextResolveRequest, WorkerClaimedJob
 from polar_evolution.store import EvolutionStore
 from polar_evolution.worker import run_once
@@ -398,6 +398,371 @@ def test_skill_bundle_method_writes_skill_markdown(tmp_path):
         "# Calculator Helper\n\nUse exact arithmetic.\n"
     )
     assert artifact.manifest["entrypoint"] == "SKILL.md"
+
+
+def test_text_memory_reflector_writes_llm_memory_from_dataset(tmp_path, monkeypatch):
+    captured = _patch_reflector_llm(
+        monkeypatch,
+        content=(
+            "# Reusable Task Memory\n\n"
+            "- When fixing parser behavior, add a regression test before editing.\n"
+            "- Before finalizing, run the focused verification that covers the changed path.\n"
+        ),
+    )
+    job = _job(
+        "text_memory_reflector",
+        tmp_path,
+        input_artifacts=[_reflector_dataset_artifact(tmp_path)],
+        config={
+            "name": "reflected-memory",
+            "reflector_llm": {
+                "model": "reflector-model",
+                "base_url": "http://reflector.test/v1",
+                "api_key": "test-key",
+            },
+            "tags": ["swe"],
+            "promoted": True,
+        },
+    )
+
+    artifacts = run_method(job, artifact_root=tmp_path / "artifacts")
+
+    artifact = artifacts[0]
+    assert artifact.type == ArtifactType.TEXT_MEMORY
+    assert artifact.name == "reflected-memory"
+    assert artifact.promoted is True
+    assert artifact.tags == ["swe"]
+    assert artifact.manifest["content_path"] == "memory.md"
+    assert artifact.manifest["method"] == "text_memory_reflector"
+    assert artifact.manifest["source_dataset_artifact_id"] == "art_dataset_reflector"
+    assert artifact.manifest["record_count"] == 2
+    assert artifact.manifest["reflected_record_count"] == 2
+    assert artifact.manifest["reflector_provider"] == "openai_chat"
+    assert artifact.manifest["reflector_model"] == "reflector-model"
+    assert artifact.lineage["method"] == "text_memory_reflector"
+    assert artifact.lineage["input_artifact_ids"] == ["art_dataset_reflector"]
+
+    memory_path = Path(artifact.uri.removeprefix("file://"))
+    assert memory_path.name == "memory.md"
+    assert memory_path.read_text(encoding="utf-8") == (
+        "# Reusable Task Memory\n\n"
+        "- When fixing parser behavior, add a regression test before editing.\n"
+        "- Before finalizing, run the focused verification that covers the changed path.\n"
+    )
+
+    prompt = captured["json"]["messages"][1]["content"]
+    assert "text memory" in captured["json"]["messages"][0]["content"]
+    assert "reusable task memory" in prompt
+    assert "recurring failure modes" in prompt
+    assert "validation habits" in prompt
+    assert "Fix the parser precedence bug." in prompt
+    assert "pytest failed after an unverified edit" in prompt
+
+
+def test_text_memory_reflector_includes_prior_text_memory_in_prompt(
+    tmp_path,
+    monkeypatch,
+):
+    captured = _patch_reflector_llm(
+        monkeypatch,
+        content="# Updated Memory\n\n- Preserve prior validation habits.\n",
+    )
+    memory_round1 = tmp_path / "memory-round1.md"
+    memory_round1.write_text(
+        "# Round 1 Memory\n\n- Inventory files before extraction.\n",
+        encoding="utf-8",
+    )
+    memory_round2 = tmp_path / "memory-round2.md"
+    memory_round2.write_text(
+        "# Round 2 Memory\n\n- Verify output counts against source coverage.\n",
+        encoding="utf-8",
+    )
+    job = _job(
+        "text_memory_reflector",
+        tmp_path,
+        input_artifacts=[
+            _reflector_dataset_artifact(tmp_path),
+            {
+                "artifact_id": "art_memory_round_1",
+                "type": "text_memory",
+                "uri": memory_round1.as_uri(),
+                "name": "round 1 memory",
+            },
+            {
+                "artifact_id": "art_memory_round_2",
+                "type": "text_memory",
+                "uri": memory_round2.as_uri(),
+                "name": "round 2 memory",
+            },
+        ],
+        config={
+            "name": "reflected-memory",
+            "reflector_llm": {
+                "model": "reflector-model",
+                "base_url": "http://reflector.test/v1",
+                "api_key": "test-key",
+            },
+        },
+    )
+
+    artifact = run_method(job, artifact_root=tmp_path / "artifacts")[0]
+
+    prompt = captured["json"]["messages"][1]["content"]
+    assert "## Existing Text Memory" in prompt
+    assert "# Round 1 Memory" in prompt
+    assert "Inventory files before extraction" in prompt
+    assert "# Round 2 Memory" in prompt
+    assert "Verify output counts against source coverage" in prompt
+    assert artifact.lineage["input_artifact_ids"] == [
+        "art_dataset_reflector",
+        "art_memory_round_1",
+        "art_memory_round_2",
+    ]
+
+
+def test_text_memory_reflector_redacts_forbidden_output_literals(
+    tmp_path,
+    monkeypatch,
+):
+    _patch_reflector_llm(
+        monkeypatch,
+        content=(
+            "# Leaky Memory\n\n"
+            "- Secret Heldout Paper requires values from golden_source.xlsx.\n"
+        ),
+    )
+    job = _job(
+        "text_memory_reflector",
+        tmp_path,
+        input_artifacts=[_reflector_dataset_artifact(tmp_path)],
+        config={
+            "reflector_llm": {
+                "model": "reflector-model",
+                "base_url": "http://reflector.test/v1",
+                "api_key": "test-key",
+            },
+            "agent_system_audit": {
+                "forbidden_literals": {
+                    "article_titles": ["Secret Heldout Paper"],
+                    "source_files": ["golden_source.xlsx"],
+                }
+            },
+            "promoted": True,
+        },
+    )
+
+    artifact = run_method(job, artifact_root=tmp_path / "artifacts")[0]
+
+    memory = Path(artifact.uri.removeprefix("file://")).read_text(encoding="utf-8")
+    assert "Secret Heldout Paper" not in memory
+    assert "golden_source.xlsx" not in memory
+    assert "[REDACTED_ARTICLE_TITLES_" in memory
+    assert "[REDACTED_SOURCE_FILES_" in memory
+    assert artifact.manifest["reflection_audit"]["finding_count"] >= 1
+    assert artifact.manifest["reflection_audit"]["redaction_count"] == 1
+
+
+def test_skill_bundle_reflector_writes_llm_skill_from_dataset_and_base(
+    tmp_path,
+    monkeypatch,
+):
+    captured = _patch_reflector_llm(
+        monkeypatch,
+        content=(
+            "---\n"
+            "name: verification-habits\n"
+            "description: Use when editing parser or packaging code.\n"
+            "---\n\n"
+            "# Verification Habits\n\n"
+            "Run the focused regression before finalizing parser or packaging changes.\n"
+        ),
+    )
+    base_dir = tmp_path / "base-skill"
+    base_dir.mkdir()
+    (base_dir / "SKILL.md").write_text(
+        "# Base Skill\n\nKeep regression tests close to the changed behavior.\n",
+        encoding="utf-8",
+    )
+    job = _job(
+        "skill_bundle_reflector",
+        tmp_path,
+        input_artifacts=[
+            _reflector_dataset_artifact(tmp_path),
+            {
+                "artifact_id": "art_previous_skill",
+                "type": "skill_bundle",
+                "uri": base_dir.as_uri(),
+                "name": "previous skill",
+            },
+        ],
+        config={
+            "name": "verification-habits",
+            "reflector_llm": {
+                "model": "reflector-model",
+                "base_url": "http://reflector.test/v1",
+                "api_key": "test-key",
+            },
+        },
+    )
+
+    artifacts = run_method(job, artifact_root=tmp_path / "artifacts")
+
+    artifact = artifacts[0]
+    assert artifact.type == ArtifactType.SKILL_BUNDLE
+    assert artifact.name == "verification-habits"
+    assert artifact.manifest["entrypoint"] == "SKILL.md"
+    assert artifact.manifest["files"] == ["SKILL.md"]
+    assert artifact.manifest["method"] == "skill_bundle_reflector"
+    assert artifact.manifest["source_dataset_artifact_id"] == "art_dataset_reflector"
+    assert artifact.manifest["record_count"] == 2
+    assert artifact.manifest["reflected_record_count"] == 2
+    assert artifact.manifest["reflector_provider"] == "openai_chat"
+    assert artifact.manifest["reflector_model"] == "reflector-model"
+    assert artifact.lineage["method"] == "skill_bundle_reflector"
+    assert artifact.lineage["input_artifact_ids"] == [
+        "art_dataset_reflector",
+        "art_previous_skill",
+    ]
+
+    bundle_path = Path(artifact.uri.removeprefix("file://"))
+    assert bundle_path.is_dir()
+    assert (bundle_path / "SKILL.md").read_text(encoding="utf-8") == (
+        "---\n"
+        "name: verification-habits\n"
+        "description: Use when editing parser or packaging code.\n"
+        "---\n\n"
+        "# Verification Habits\n\n"
+        "Run the focused regression before finalizing parser or packaging changes.\n"
+    )
+
+    prompt = captured["json"]["messages"][1]["content"]
+    assert "Codex skill bundle" in captured["json"]["messages"][0]["content"]
+    assert "Codex skill bundle" in prompt
+    assert "SKILL.md" in prompt
+    assert "# Base Skill" in prompt
+    assert "Fix the package import bug." in prompt
+
+
+def test_skill_bundle_reflector_uses_latest_prior_skill_as_base(
+    tmp_path,
+    monkeypatch,
+):
+    captured = _patch_reflector_llm(
+        monkeypatch,
+        content=(
+            "---\n"
+            "name: latest-skill\n"
+            "description: Use latest skill base.\n"
+            "---\n"
+        ),
+    )
+    old_dir = tmp_path / "old-skill"
+    old_dir.mkdir()
+    (old_dir / "SKILL.md").write_text(
+        "# Old Skill\n\nDo not preserve stale round-one behavior.\n",
+        encoding="utf-8",
+    )
+    latest_dir = tmp_path / "latest-skill"
+    latest_dir.mkdir()
+    (latest_dir / "SKILL.md").write_text(
+        "# Latest Skill\n\nPreserve the round-two validation checklist.\n",
+        encoding="utf-8",
+    )
+    job = _job(
+        "skill_bundle_reflector",
+        tmp_path,
+        input_artifacts=[
+            _reflector_dataset_artifact(tmp_path),
+            {
+                "artifact_id": "art_old_skill",
+                "type": "skill_bundle",
+                "uri": old_dir.as_uri(),
+                "name": "old skill",
+            },
+            {
+                "artifact_id": "art_latest_skill",
+                "type": "skill_bundle",
+                "uri": latest_dir.as_uri(),
+                "name": "latest skill",
+            },
+        ],
+        config={
+            "name": "latest-skill",
+            "reflector_llm": {
+                "model": "reflector-model",
+                "base_url": "http://reflector.test/v1",
+                "api_key": "test-key",
+            },
+        },
+    )
+
+    artifact = run_method(job, artifact_root=tmp_path / "artifacts")[0]
+
+    prompt = captured["json"]["messages"][1]["content"]
+    assert "# Latest Skill" in prompt
+    assert "round-two validation checklist" in prompt
+    assert "# Old Skill" not in prompt
+    assert "stale round-one behavior" not in prompt
+    assert artifact.lineage["input_artifact_ids"] == [
+        "art_dataset_reflector",
+        "art_old_skill",
+        "art_latest_skill",
+    ]
+    assert artifact.manifest["base_skill_bundle_artifact_id"] == "art_latest_skill"
+
+
+def test_skill_bundle_reflector_redacts_forbidden_output_literals(
+    tmp_path,
+    monkeypatch,
+):
+    _patch_reflector_llm(
+        monkeypatch,
+        content=(
+            "---\n"
+            "name: leaky-skill\n"
+            "description: Use for Secret Heldout Paper.\n"
+            "---\n\n"
+            "# Leaky Skill\n\n"
+            "Inspect golden_source.xlsx before finalizing.\n"
+        ),
+    )
+    job = _job(
+        "skill_bundle_reflector",
+        tmp_path,
+        input_artifacts=[_reflector_dataset_artifact(tmp_path)],
+        config={
+            "name": "leaky-skill",
+            "reflector_llm": {
+                "model": "reflector-model",
+                "base_url": "http://reflector.test/v1",
+                "api_key": "test-key",
+            },
+            "agent_system_audit": {
+                "forbidden_literals": {
+                    "article_titles": ["Secret Heldout Paper"],
+                    "source_files": ["golden_source.xlsx"],
+                }
+            },
+            "promoted": True,
+        },
+    )
+
+    artifact = run_method(job, artifact_root=tmp_path / "artifacts")[0]
+
+    skill = (Path(artifact.uri.removeprefix("file://")) / "SKILL.md").read_text(
+        encoding="utf-8"
+    )
+    assert "Secret Heldout Paper" not in skill
+    assert "golden_source.xlsx" not in skill
+    assert "[REDACTED_ARTICLE_TITLES_" in skill
+    assert "[REDACTED_SOURCE_FILES_" in skill
+    assert artifact.manifest["reflection_audit"]["finding_count"] >= 1
+    assert artifact.manifest["reflection_audit"]["redaction_count"] == 1
+
+
+def test_reflector_methods_are_registered():
+    assert METHOD_REGISTRY["text_memory_reflector"]
+    assert METHOD_REGISTRY["skill_bundle_reflector"]
 
 
 def test_agent_system_method_writes_harness_instruction_file(tmp_path):
@@ -1147,6 +1512,86 @@ def test_agent_system_history_reflector_uses_round_history_and_deltas(
     ]
 
 
+def test_agent_system_history_reflector_uses_latest_prior_agent_system_base(
+    tmp_path,
+    monkeypatch,
+):
+    captured = _patch_reflector_llm(monkeypatch)
+    old_path = tmp_path / "round1-agents.md"
+    old_path.write_text(
+        "# Old Agent System\n\nDo not preserve stale round-one instructions.\n",
+        encoding="utf-8",
+    )
+    latest_path = tmp_path / "round2-agents.md"
+    latest_path.write_text(
+        "# Latest Agent System\n\nPreserve round-two provenance validation.\n",
+        encoding="utf-8",
+    )
+    round1 = _history_round_dataset_artifact(
+        tmp_path,
+        round_number=1,
+        precision=0.25,
+        recall=0.60,
+        f1=0.35,
+        record={
+            "event_id": "evt_round1",
+            "task_id": "task_round1",
+            "session_id": "session_round1",
+            "status": "COMPLETED",
+            "reward": 0.35,
+        },
+    )
+    round2 = _history_round_dataset_artifact(
+        tmp_path,
+        round_number=2,
+        precision=0.40,
+        recall=0.80,
+        f1=0.53,
+        record={
+            "event_id": "evt_round2",
+            "task_id": "task_round2",
+            "session_id": "session_round2",
+            "status": "COMPLETED",
+            "reward": 0.53,
+        },
+    )
+    job = _job(
+        "agent_system_history_reflector",
+        tmp_path,
+        input_artifacts=[
+            round1,
+            round2,
+            {
+                "artifact_id": "agent_system_round_1",
+                "type": "agent_system",
+                "uri": old_path.as_uri(),
+                "name": "round 1 agent system",
+            },
+            {
+                "artifact_id": "agent_system_round_2",
+                "type": "agent_system",
+                "uri": latest_path.as_uri(),
+                "name": "round 2 agent system",
+            },
+        ],
+        config={
+            "reflector_llm": {
+                "model": "reflector-model",
+                "base_url": "http://reflector.test/v1",
+                "api_key": "secret",
+            },
+        },
+    )
+
+    run_method(job, artifact_root=tmp_path / "artifacts")
+
+    prompt = captured["json"]["messages"][1]["content"]
+    assert "# Latest Agent System" in prompt
+    assert "round-two provenance validation" in prompt
+    assert "# Old Agent System" not in prompt
+    assert "stale round-one instructions" not in prompt
+
+
 def test_agent_system_history_reflector_rejects_missing_dataset(tmp_path):
     job = _job("agent_system_history_reflector", tmp_path)
 
@@ -1591,7 +2036,9 @@ def test_parametric_memory_register_preserves_configured_adapter_id(tmp_path):
 def test_parse_capabilities_defaults_to_reference_job_types():
     assert _parse_capabilities([]) == [
         "text_memory",
+        "text_memory_reflector",
         "skill_bundle",
+        "skill_bundle_reflector",
         "agent_system",
         "agent_system_reflector",
         "agent_system_history_reflector",

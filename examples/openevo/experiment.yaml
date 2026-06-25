@@ -1,0 +1,17 @@
+version: 1
+experiment:
+  name: biology-components
+agent:
+  preset: codex
+  model: gpt-5.1-codex-mini
+  auth: subscription
+  settings:
+    capture_mode: transcript
+runtime:
+  image: my-task-image:latest
+tasks:
+  - id: component-extraction-train
+    instruction: >
+      Extract biological components from the provided article set. Produce one
+      final file that lists the canonical article id for each extracted component.
+    workspace: /root/codex54minitest/five_article_agentic_workflow_subset

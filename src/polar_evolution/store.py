@@ -14,6 +14,7 @@ from polar_evolution.context import (
     artifact_matches,
     artifact_type,
     read_file_uri_text,
+    requested_context_artifact_ids,
     sort_candidates,
 )
 from polar_evolution.files import ArtifactFileStore
@@ -414,7 +415,13 @@ class EvolutionStore:
         raw_payload = request.model_dump(mode="python")
         _validate_finite_floats(raw_payload, "request")
 
-        rows = [row for row in self._promoted_artifact_rows() if artifact_matches(request, row)]
+        requested_artifact_ids = requested_context_artifact_ids(request)
+        rows = [
+            row
+            for row in self._promoted_artifact_rows()
+            if _artifact_id_allowed(row, requested_artifact_ids)
+            and artifact_matches(request, row)
+        ]
         rows = sort_candidates(rows)
 
         selected_memory: list[dict[str, object]] = []
@@ -529,7 +536,11 @@ class EvolutionStore:
                 ),
                 selection={
                     "artifact_ids": selected_ids,
-                    "reasons": ["matched promoted compatible artifacts"],
+                    "reasons": [
+                        "matched requested promoted compatible artifacts"
+                        if requested_artifact_ids is not None
+                        else "matched promoted compatible artifacts"
+                    ],
                 },
             )
             request_payload = request.model_dump(mode="json")
@@ -1315,3 +1326,15 @@ class EvolutionStore:
             yield conn
         finally:
             conn.close()
+
+
+def _artifact_id_allowed(
+    row: dict[str, object],
+    requested_artifact_ids: set[str] | None,
+) -> bool:
+    if requested_artifact_ids is None:
+        return True
+    if artifact_type(row) == ArtifactType.PARAMETRIC_MEMORY:
+        return True
+    artifact_id = row.get("artifact_id")
+    return isinstance(artifact_id, str) and artifact_id in requested_artifact_ids

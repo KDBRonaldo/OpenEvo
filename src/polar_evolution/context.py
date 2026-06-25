@@ -51,6 +51,19 @@ def _string_items(value: object) -> list[str] | None:
     return items
 
 
+def requested_context_artifact_ids(request: ContextResolveRequest) -> set[str] | None:
+    evolution_metadata = request.metadata.get("evolution")
+    if not isinstance(evolution_metadata, dict):
+        return None
+
+    if "context_artifact_ids" not in evolution_metadata:
+        return None
+    values = _string_items(evolution_metadata.get("context_artifact_ids"))
+    if values is None:
+        return set()
+    return {value for value in values if value}
+
+
 def artifact_matches(request: ContextResolveRequest, row: dict[str, object]) -> bool:
     compatibility = _compatibility_object(row.get("compatibility_json"))
     if compatibility is None:

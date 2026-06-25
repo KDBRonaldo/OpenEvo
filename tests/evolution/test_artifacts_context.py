@@ -446,6 +446,68 @@ def test_context_resolver_selects_memory_skill_and_adapter(tmp_path):
     assert snapshot["response"]["selection"]["artifact_ids"] == context.selection["artifact_ids"]
 
 
+def test_context_resolver_honors_explicit_context_artifact_ids(tmp_path):
+    store = EvolutionStore(db_path=tmp_path / "evolution.db", artifact_root=tmp_path / "artifacts")
+    store.initialize()
+    old_memory_file = tmp_path / "old-memory.md"
+    old_memory_file.write_text("Old round advice.", encoding="utf-8")
+    old_memory = store.register_artifact(
+        ArtifactRegisterRequest(
+            type=ArtifactType.TEXT_MEMORY,
+            name="old memory",
+            uri=old_memory_file.as_uri(),
+            compatibility={"task_tags": ["openevo_run_task:run-1:task-a"]},
+            scores={"quality": 0.9},
+            promoted=True,
+        )
+    )
+    latest_memory_file = tmp_path / "latest-memory.md"
+    latest_memory_file.write_text("Latest round advice.", encoding="utf-8")
+    latest_memory = store.register_artifact(
+        ArtifactRegisterRequest(
+            type=ArtifactType.TEXT_MEMORY,
+            name="latest memory",
+            uri=latest_memory_file.as_uri(),
+            compatibility={"task_tags": ["openevo_run_task:run-1:task-a"]},
+            scores={"quality": 0.8},
+            promoted=True,
+        )
+    )
+    adapter_dir = tmp_path / "adapter"
+    adapter_dir.mkdir()
+    adapter = store.register_artifact(
+        ArtifactRegisterRequest(
+            type=ArtifactType.PARAMETRIC_MEMORY,
+            name="parser adapter",
+            uri=adapter_dir.as_uri(),
+            manifest={"adapter_id": "parser-memory", "adapter_format": "lora"},
+            compatibility={
+                "base_model": ["gpt-5.1-codex-mini"],
+                "task_tags": ["openevo_run_task:run-1:task-a"],
+            },
+            scores={"quality": 0.7},
+            promoted=True,
+        )
+    )
+
+    context = store.resolve_context(
+        ContextResolveRequest(
+            task_id="task-a",
+            instruction="continue task",
+            base_model="gpt-5.1-codex-mini",
+            metadata={
+                "task_tags": ["openevo_run_task:run-1:task-a"],
+                "evolution": {"context_artifact_ids": [latest_memory.artifact_id]},
+            },
+        )
+    )
+
+    assert context.memory["artifact_ids"] == [latest_memory.artifact_id]
+    assert "Latest round advice" in context.memory["rendered_text"]
+    assert old_memory.artifact_id not in context.selection["artifact_ids"]
+    assert context.adapter_merge_spec.adapters[0]["artifact_id"] == adapter.artifact_id
+
+
 def test_context_resolver_skips_legacy_agent_system_with_unsafe_target_path(tmp_path):
     store = EvolutionStore(db_path=tmp_path / "evolution.db", artifact_root=tmp_path / "artifacts")
     store.initialize()

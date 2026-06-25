@@ -48,9 +48,10 @@ Main components:
 - **Evaluators**: task-level evaluators live outside specific methods. For
   ground-truth tasks, they produce sanitized method feedback and leakage guards
   instead of exposing raw answers to the reflector.
-- **Runtime injection**: promoted artifacts are resolved by compatibility and
-  staged into the next agent session, for example as `AGENTS.md` for Codex or as
-  Terminal Bench Harbor agent instructions.
+- **Runtime injection**: promoted artifacts are resolved by explicit context IDs
+  plus compatibility filters, then staged into the next agent session, for
+  example as `AGENTS.md` for Codex or as Terminal Bench Harbor agent
+  instructions.
 
 ## Implemented Algorithms
 
@@ -62,8 +63,70 @@ Main components:
 | `agent_system_pareto_reflector` | `agent_system` | implemented | Generates multiple strategy candidates, records a candidate archive, and applies promotion gates. |
 | `agent_system_gepa_reflector` | `agent_system` | implemented | GEPA-style closed-loop candidate generation for per-task evolution. |
 | `text_memory` | `text_memory` | implemented | Distills successful records into Markdown memory. |
+| `text_memory_reflector` | `text_memory` | implemented | LLM-based reflector that turns trajectories into reusable Markdown memory. |
 | `skill_bundle` | `skill_bundle` | implemented | Registers harness-loadable skill directories. |
+| `skill_bundle_reflector` | `skill_bundle` | implemented | LLM-based reflector that writes a Codex `SKILL.md`; helper tools are represented as files inside the skill bundle. |
 | `parametric_memory_register` | `parametric_memory` | implemented | Registers external adapter artifacts for later trainer/inference use. |
+
+## OpenEvo Runner
+
+`openevo run` is the user-facing experiment wrapper for ordinary Polar tasks. It
+uses technical defaults for service URLs and evolution methods. A task with a
+workspace must also name the runtime image because Polar cannot upload a
+workspace into an implicit/default runtime:
+
+```yaml
+version: 1
+experiment:
+  name: biology-components
+agent:
+  preset: codex
+  model: gpt-5.1-codex-mini
+  auth: subscription
+  settings:
+    capture_mode: transcript
+runtime:
+  image: my-task-image:latest
+tasks:
+  - id: component-extraction-train
+    instruction: Extract biological components into final_components.json.
+    workspace: /root/codex54minitest/five_article_agentic_workflow_subset
+```
+
+Task IDs are used as rollout polling URL path segments, so they must be stable
+slugs and cannot contain `/`.
+
+Defaults:
+
+- `rollout.url`: `$OPENEVO_ROLLOUT_URL` or `http://127.0.0.1:8080`
+- `evolution.backend_url`: `$OPENEVO_EVOLUTION_URL` or `http://127.0.0.1:8200`
+- `evolution.rounds`: `1`
+- `runtime.kind`: `docker`; `runtime.workdir`: `/polar/session/workspace`
+- `runtime.image`: required when any task sets `workspace`, or when overriding
+  runtime fields such as `runtime.env`, `runtime.kind`, or `runtime.workdir`
+- enabled artifacts: `text_memory_reflector`, `skill_bundle_reflector`, and
+  agent-system `auto`
+- subscription agents use sandboxed `codex_cli` reflection by default; proxy
+  agents use OpenAI-compatible chat reflection by default
+- subscription agents require explicit transcript capture. Supported
+  `agent.settings.capture_mode` values include `transcript`, `agent_transcript`,
+  and `pure_text`.
+
+Useful commands:
+
+```bash
+openevo run examples/openevo/experiment.yaml --dry-run --json
+openevo run examples/openevo/experiment.yaml --rounds 3 --output-dir runs/biology
+openevo run examples/openevo/experiment.yaml --task-id task-a --task-id task-b
+```
+
+Without `--output-dir`, live runs write summaries and worker artifacts under a
+run-scoped directory: `.openevo/runs/<experiment>/<run_id>/`.
+
+Terminal Bench can use this runner by expressing each benchmark case as an
+explicit task entry. A task generator is intentionally left out of the first
+version; tool evolution is handled as helper files inside `skill_bundle`
+artifacts rather than as a separate artifact type.
 
 Shared infrastructure that is already implemented:
 
@@ -109,8 +172,8 @@ Key interpretation:
   summaries.
 - Add a stable biology 5-train/23-test split runner with canonical article-id
   mapping in the task description rather than hidden pipeline state.
-- Extend per-task Terminal Bench evolution beyond `agent_system` to `skill_bundle`
-  and `text_memory`.
+- Add a Terminal Bench task-list generator on top of the new `openevo run`
+  config, while keeping explicit task entries as the stable interchange format.
 - Add promotion policies that combine paired evaluator scores, leakage audit,
   regression limits, and candidate diversity.
 - Improve transcript capture fidelity for external harnesses while preserving the
@@ -125,6 +188,8 @@ Key interpretation:
 ## Entry Points
 
 - Backend CLI and worker code: `src/polar_evolution/`
+- User-facing experiment runner: `src/openevo/`
+- Minimal runner config: `examples/openevo/experiment.yaml`
 - Evolution method implementations: `src/polar_evolution/methods.py`
 - Golden-standard evaluator: `src/polar_evolution/golden_standard.py`
 - Terminal Bench bridge: `src/polar_evolution/terminal_bench_bridge.py`
