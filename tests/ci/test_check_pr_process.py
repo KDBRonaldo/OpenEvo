@@ -90,7 +90,7 @@ def test_docs_only_change_does_not_need_docs_explanation() -> None:
 
     warnings = checker.find_process_warnings(
         "Resolves #123",
-        ["agents.md", ".github/pull_request_template.md"],
+        ["AGENTS.md", ".github/pull_request_template.md"],
     )
 
     assert warnings == []

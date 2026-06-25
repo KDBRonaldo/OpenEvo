@@ -2,11 +2,17 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from urllib.parse import unquote
 
 import pytest
 
-from polar_evolution.cli import main
-from polar_evolution.models import DatasetCreateRequest
+from polar_evolution.cli import (
+    _terminal_bench_forbidden_literals_from_dataset_artifacts,
+    _terminal_bench_forbidden_literals_from_events,
+    _terminal_bench_task_tags,
+    main,
+)
+from polar_evolution.models import DatasetCreateRequest, EventIngestRequest, WorkerClaimRequest
 from polar_evolution.store import EvolutionStore
 from polar_evolution.terminal_bench_bridge import (
     TerminalBenchBridgeError,
@@ -126,6 +132,27 @@ def test_build_terminal_bench_event_uses_report_when_stdout_is_empty(tmp_path):
     ]
 
 
+def test_build_terminal_bench_event_uses_codex_log_when_stdout_is_empty(tmp_path):
+    trial_dir = _write_trial(
+        tmp_path,
+        stdout="",
+        stderr="",
+        report=None,
+        codex='{"type":"agent_message","text":"Created /app/filter.py"}\n',
+    )
+
+    [event] = build_terminal_bench_events(trial_dir)
+
+    trace = event.payload["session_result"]["trajectory"]["traces"][0]
+    assert trace["response_messages"] == [
+        {
+            "role": "assistant",
+            "content": '{"type":"agent_message","text":"Created /app/filter.py"}\n',
+        }
+    ]
+    assert trace["metadata"]["transcript_sources"] == ["agent/codex.txt"]
+
+
 def test_build_terminal_bench_event_rejects_missing_transcript_text(tmp_path):
     trial_dir = _write_trial(tmp_path, stdout="", stderr="", report=None)
 
@@ -219,12 +246,296 @@ def test_terminal_bench_dataset_cli_ingests_events_and_creates_dataset(tmp_path)
     assert records[0]["traces"][0]["metadata"]["token_level_metrics_available"] is False
 
 
+def test_terminal_bench_agent_system_job_cli_creates_audited_reflector_job(tmp_path):
+    trial_dir = _write_trial(
+        tmp_path / "job",
+        stdout="Recovered the lost git commit.\n",
+        stderr="",
+    )
+    output_path = tmp_path / "job.json"
+    db_path = tmp_path / "polar.db"
+    artifact_root = tmp_path / "polar_artifacts"
+
+    exit_code = main(
+        [
+            "terminal-bench-agent-system-job",
+            "--input",
+            str(trial_dir.parent),
+            "--db",
+            str(db_path),
+            "--artifact-root",
+            str(artifact_root),
+            "--dataset-name",
+            "tb21_round0",
+            "--policy-version",
+            "tb21-round0",
+            "--reflector-provider",
+            "codex_cli",
+            "--reflector-model",
+            "gpt-5.4",
+            "--codex-home",
+            "/tmp/codex-home",
+            "--output",
+            str(output_path),
+        ]
+    )
+
+    assert exit_code == 0
+    payload = json.loads(output_path.read_text(encoding="utf-8"))
+    dataset_artifact_id = payload["dataset"]["artifact_id"]
+    assert payload["job"]["method"] == "agent_system_reflector"
+    assert payload["job"]["input_artifact_ids"] == [dataset_artifact_id]
+    assert payload["job"]["config"]["reflector_llm"] == {
+        "provider": "codex_cli",
+        "model": "gpt-5.4",
+        "codex_home": "/tmp/codex-home",
+    }
+    assert payload["job"]["config"]["compatibility"] == {
+        "agent_harness": ["terminal-bench-harbor"],
+        "task_tags": ["terminal-bench", "terminal-bench:fix-git"],
+    }
+    assert payload["job"]["config"]["target_path"] == "AGENTS.md"
+    audit = payload["job"]["config"]["agent_system_audit"]
+    assert audit["max_repair_attempts"] == 2
+    assert audit["forbidden_literals"] == {}
+
+    store = EvolutionStore(db_path=db_path, artifact_root=artifact_root)
+    claimed = store.claim_job(
+        WorkerClaimRequest(
+            worker_id="test-worker",
+            capabilities=["agent_system_reflector"],
+        )
+    )
+    assert claimed.job is not None
+    assert claimed.job.method == "agent_system_reflector"
+    assert claimed.job.input_artifacts[0].artifact_id == dataset_artifact_id
+    assert claimed.job.config == payload["job"]["config"]
+
+
+def test_terminal_bench_agent_system_job_cli_requires_policy_version_with_input(tmp_path):
+    trial_dir = _write_trial(
+        tmp_path / "job",
+        stdout="Recovered the lost git commit.\n",
+        stderr="",
+    )
+
+    with pytest.raises(ValueError, match="requires --policy-version with --input"):
+        main(
+            [
+                "terminal-bench-agent-system-job",
+                "--input",
+                str(trial_dir.parent),
+                "--db",
+                str(tmp_path / "polar.db"),
+                "--artifact-root",
+                str(tmp_path / "polar_artifacts"),
+                "--dataset-name",
+                "tb21_round0",
+                "--reflector-model",
+                "gpt-5.4",
+            ]
+        )
+
+
+def test_terminal_bench_agent_system_job_cli_uses_history_method_for_multiple_datasets(
+    tmp_path,
+):
+    db_path = tmp_path / "polar.db"
+    artifact_root = tmp_path / "polar_artifacts"
+    store = EvolutionStore(db_path=db_path, artifact_root=artifact_root)
+    store.initialize()
+
+    first_trial = _write_trial(
+        tmp_path / "round1",
+        stdout="Left generated file in the wrong directory.\n",
+        stderr="",
+    )
+    second_trial = _write_trial(
+        tmp_path / "round2",
+        stdout="Fixed output path but missed hidden verifier checks.\n",
+        stderr="",
+    )
+    first_artifact_id = _ingest_terminal_bench_dataset(
+        store,
+        first_trial,
+        name="tb21_round1",
+        policy_version="tb21-round1",
+    )
+    second_artifact_id = _ingest_terminal_bench_dataset(
+        store,
+        second_trial,
+        name="tb21_round2",
+        policy_version="tb21-round2",
+    )
+    output_path = tmp_path / "history_job.json"
+
+    exit_code = main(
+        [
+            "terminal-bench-agent-system-job",
+            "--db",
+            str(db_path),
+            "--artifact-root",
+            str(artifact_root),
+            "--dataset-artifact-id",
+            first_artifact_id,
+            "--dataset-artifact-id",
+            second_artifact_id,
+            "--reflector-model",
+            "gpt-5.4",
+            "--output",
+            str(output_path),
+        ]
+    )
+
+    assert exit_code == 0
+    payload = json.loads(output_path.read_text(encoding="utf-8"))
+    assert payload["dataset"] is None
+    assert payload["ingested_events"] == []
+    assert payload["job"]["method"] == "agent_system_history_reflector"
+    assert payload["job"]["input_artifact_ids"] == [first_artifact_id, second_artifact_id]
+    assert payload["job"]["config"]["reflector_llm"] == {
+        "provider": "openai_chat",
+        "model": "gpt-5.4",
+    }
+    assert payload["job"]["config"]["compatibility"]["task_tags"] == [
+        "terminal-bench",
+        "terminal-bench:fix-git",
+    ]
+    forbidden_literals = payload["job"]["config"]["agent_system_audit"][
+        "forbidden_literals"
+    ]
+    assert forbidden_literals == {}
+
+
+def test_terminal_bench_task_tags_preserve_short_task_ids_from_events(tmp_path):
+    store = EvolutionStore(db_path=tmp_path / "polar.db", artifact_root=tmp_path / "artifacts")
+    tags = _terminal_bench_task_tags(
+        store,
+        [],
+        [
+            EventIngestRequest(
+                source="terminal_bench.harbor",
+                event_type="polar.session_completed",
+                source_event_id="event-1",
+                task_id="git",
+            )
+        ],
+    )
+
+    assert tags == ["terminal-bench", "terminal-bench:git"]
+
+
+def test_terminal_bench_auto_forbidden_literals_ignore_public_task_context(tmp_path):
+    trial_dir = _write_trial(
+        tmp_path / "job",
+        stdout="Recovered the lost git commit.\n",
+        stderr="",
+        ctrf={
+            "results": {
+                "summary": {"tests": 1, "passed": 0, "failed": 1, "skipped": 0},
+                "tests": [
+                    {
+                        "name": "test_outputs.py::test_layout_file",
+                        "status": "failed",
+                        "message": "layout file missing",
+                    }
+                ],
+            }
+        },
+    )
+    [event] = build_terminal_bench_events(trial_dir)
+
+    forbidden_literals = _terminal_bench_forbidden_literals_from_events([event])
+
+    serialized = json.dumps(forbidden_literals, sort_keys=True)
+    assert "fix-git" not in serialized
+    assert "fix-git__abc123" not in serialized
+    assert "Find the missing git changes." not in serialized
+    assert "layout file missing" not in serialized
+
+
+def test_terminal_bench_dataset_artifact_structured_forbidden_literals_are_decoded(
+    tmp_path,
+):
+    db_path = tmp_path / "polar.db"
+    artifact_root = tmp_path / "polar artifacts"
+    store = EvolutionStore(db_path=db_path, artifact_root=artifact_root)
+    store.initialize()
+
+    trial_dir = _write_trial(
+        tmp_path / "job",
+        stdout="Recovered the lost git commit.\n",
+        stderr="",
+    )
+    artifact_id = _ingest_terminal_bench_dataset(
+        store,
+        trial_dir,
+        name="tb21_round0",
+        policy_version="tb21-round0",
+    )
+    with store.connect() as conn:
+        artifact_row = conn.execute(
+            "SELECT uri FROM artifacts WHERE artifact_id = ?",
+            (artifact_id,),
+        ).fetchone()
+    assert artifact_row is not None
+    manifest_path = Path(unquote(artifact_row["uri"].removeprefix("file://")))
+    records_path = manifest_path.parent / "records.jsonl"
+    [record] = [
+        json.loads(line)
+        for line in records_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    record["payload"]["session_result"]["metadata"]["leakage_basis"] = {
+        "source_files": ["heldout answer sheet.xlsx"],
+        "article_title": "Secret Heldout Paper",
+        "source_rows": [12],
+    }
+    records_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+
+    forbidden_literals = _terminal_bench_forbidden_literals_from_dataset_artifacts(
+        store,
+        [artifact_id],
+    )
+
+    assert forbidden_literals["source_files"] == ["heldout answer sheet.xlsx"]
+    assert forbidden_literals["article_titles"] == ["Secret Heldout Paper"]
+    assert forbidden_literals["source_rows"] == ["12"]
+    serialized = json.dumps(forbidden_literals, sort_keys=True)
+    assert "fix-git" not in serialized
+    assert "fix-git__abc123" not in serialized
+
+
+def _ingest_terminal_bench_dataset(
+    store: EvolutionStore,
+    trial_dir: Path,
+    *,
+    name: str,
+    policy_version: str,
+) -> str:
+    for event in build_terminal_bench_events(trial_dir, policy_version=policy_version):
+        store.ingest_event(event)
+    dataset = store.create_dataset(
+        DatasetCreateRequest(
+            name=name,
+            purpose="agent_system_reflection",
+            query={
+                "event_types": ["polar.session_completed"],
+                "status": ["COMPLETED"],
+                "policy_version": policy_version,
+            },
+        )
+    )
+    return dataset.artifact_id
+
+
 def _write_trial(
     root: Path,
     *,
     stdout: str,
     stderr: str,
     report: str | None = "# Terminal Bench Report\n",
+    codex: str = "",
     ctrf: dict | None = None,
     verifier_stdout: str = "",
 ) -> Path:
@@ -238,6 +549,7 @@ def _write_trial(
     )
     (trial_dir / "agent" / "stdout.txt").write_text(stdout, encoding="utf-8")
     (trial_dir / "agent" / "stderr.txt").write_text(stderr, encoding="utf-8")
+    (trial_dir / "agent" / "codex.txt").write_text(codex, encoding="utf-8")
     if report is not None:
         (trial_dir / "agent" / "evolab_lab" / "terminal_bench_report.md").write_text(
             report,

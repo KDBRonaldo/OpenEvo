@@ -68,6 +68,28 @@ uv run polar-evolution terminal-bench-dataset \
   --policy-version tb21-round0
 ```
 
+如果下一步就是 agent-system evolution，可以直接生成 audited reflector job：
+
+```sh
+uv run polar-evolution terminal-bench-agent-system-job \
+  --input /tmp/evolab-tb21-run/<job-or-trial-dir> \
+  --db /tmp/polar-tb21/evolution.db \
+  --artifact-root /tmp/polar-tb21/artifacts \
+  --dataset-name tb21_round0 \
+  --policy-version tb21-round0 \
+  --reflector-provider codex_cli \
+  --reflector-model gpt-5.4 \
+  --codex-home /path/to/codex-home
+```
+
+该命令会复用同一个 offline bridge ingest events，创建 dataset artifact，然后创建
+`agent_system_reflector` job。为了避免本地 DB 中不同轮次的 completed events 被混入，
+`--input` 模式必须显式传 `--policy-version`。也可以跳过 ingest、直接传一个或多个已有
+`--dataset-artifact-id`；当输入 dataset artifact 超过一个时，`--method auto` 会创建
+`agent_system_history_reflector` job。显式 `--method agent_system_reflector`、
+`--method agent_system_history_reflector` 或 `--method agent_system_pareto_reflector`
+可覆盖这个选择。
+
 转换后的 event 使用 `event_type="polar.session_completed"`，其 trajectory 由
 `terminal_bench_transcript_bridge` 构造，metadata 必须包含：
 
@@ -81,8 +103,13 @@ uv run polar-evolution terminal-bench-dataset \
 bridge 可以读取 agent instruction、stdout/stderr、EvoLab 生成的
 `terminal_bench_report.md`、verifier reward、CTRF summary 和 verifier stdout 摘要。它
 不能读取或写入 oracle solution、reference patch，也不能把 `config.agent.env` 中的 API key
-等敏感值带入 event payload。后续 orchestrator 可把这些 JSONL events ingest 到
-Evolution Backend，再创建 dataset 和 `agent_system_reflector` job。
+等敏感值带入 event payload。Terminal Bench agent-system job 默认只从结构化 protected
+metadata（例如 `leakage_basis` / `forbidden_literals`、article title/id、source
+file/sheet/row、sequence）派生 `agent_system_audit.forbidden_literals`；公开 task id、
+trial name、task instruction、task path 和 verifier failed-test 摘要会作为可学习上下文保留，
+不会自动加入 forbidden list。额外 protected literal 可通过 `--audit-forbidden-literal` 传入。
+后续 orchestrator 仍可把这些 JSONL events ingest 到 Evolution Backend，再按普通
+`POST /v1/jobs` 路径创建自定义 job。
 
 ## 核心 API
 
@@ -203,12 +230,17 @@ Backend 和 gateway 都会拒绝空路径、绝对路径、包含 `..` 的路径
 Gateway 总会把文本写到 `POLAR_AGENT_SYSTEM_FILE`；如果 target path 通过安全检查，也会写到
 runtime workdir 下，并设置 `POLAR_AGENT_SYSTEM_TARGET` / `POLAR_AGENT_SYSTEM_TARGETS`。
 
-内置 reference worker 提供两个 agent-system 相关方法：
+内置 reference worker 提供四个 agent-system 相关方法：
 
 - `agent_system`：把 `job.config.agent_system_markdown` 或 `job.config.content` 直接打包成
   `agent_system` artifact，适合人工 curated 文本或 smoke test。
 - `agent_system_reflector`：消费 dataset artifact，把历史 trajectories/transcripts 中的成功
-  和失败样本交给 LLM 生成新的 instruction 文本，默认写入 `agents.md`。
+  和失败样本交给 LLM 生成新的 instruction 文本，默认写入 `AGENTS.md`。
+- `agent_system_history_reflector`：消费多个 round-level dataset artifacts 和可选 best /
+  previous agent-system artifact，把多轮 trajectories、共享 evaluator feedback、每轮 metrics
+  以及相邻轮次 delta 汇总给 LLM，生成 history-aware 的下一版 instruction 文本。
+- `agent_system_pareto_reflector`：消费多个 round-level dataset artifacts，生成多个候选
+  instruction，写出 candidate archive，并根据外部 evaluator 分数和退化门控选择一个候选。
 
 `agent_system_reflector` 不固定模型；调用方必须在 `job.config.reflector_llm.model` 中指定
 reflector model。默认 provider 是 `openai_chat`：`base_url` 默认读取
@@ -221,6 +253,15 @@ Codex run 会忽略用户 config、使用 `--ephemeral`、`--sandbox read-only`�
 并禁用 `shell_tool`，因为 dataset transcripts 属于不可信 prompt 内容。该方法不做 promotion 评估，
 推荐把产出 artifact 先保持 `promoted=false`，通过离线评估或 A/B rollout 后再 promotion。
 
+三个 reflector 方法都会对生成的 agent-system 文本做轻量 audit。默认 audit 会要求
+`AGENTS.md` 中的方法论规则不是空泛口号，而是包含 trigger、action 和 validation check；
+如果规则提到 source/package/bundle coverage，还必须描述 recursive file-level source
+discovery、通用结构化 evidence 格式和 per-source/per-package final validation。调用方也可以通过
+`job.config.agent_system_audit.forbidden_literals` 或 `leakage_basis` 传入 protected
+literals，禁止 exact article title、source filename、sheet、row、sequence 等进入
+agent-system。首次生成失败时 worker 会把 redacted candidate 和 audit findings 发回同一
+reflector model，默认最多重写两次；重写后仍失败则 job 报错。
+
 示例 job：
 
 ```json
@@ -230,7 +271,7 @@ Codex run 会忽略用户 config、使用 `--ephemeral`、`--sandbox read-only`�
   "input_artifact_ids": ["art_dataset"],
   "config": {
     "name": "codex SWE reflections",
-    "target_path": "agents.md",
+    "target_path": "AGENTS.md",
     "max_records": 20,
     "reflector_llm": {
       "provider": "openai_chat",
@@ -240,6 +281,13 @@ Codex run 会忽略用户 config、使用 `--ephemeral`、`--sandbox read-only`�
       "temperature": 0.2,
       "max_tokens": 2000
     },
+    "agent_system_audit": {
+      "max_repair_attempts": 2,
+      "forbidden_literals": {
+        "article_titles": ["held-out title, if the shared evaluator provides one"],
+        "source_files": ["held-out source filename, if available"]
+      }
+    },
     "compatibility": {"agent_harness": ["codex"], "task_tags": ["swe"]},
     "scores": {"quality": 0.5},
     "promoted": false
@@ -248,8 +296,29 @@ Codex run 会忽略用户 config、使用 `--ephemeral`、`--sandbox read-only`�
 ```
 
 输出 manifest 会包含 source dataset、record count、reflected record count、success count 和
-failure count，以及 `reflector_provider` / `reflector_model`；lineage 会记录
-`method=agent_system_reflector` 和所有 input artifact IDs。
+failure count，以及 `reflector_provider` / `reflector_model` 和 `agent_system_audit`；
+lineage 会记录 `method=agent_system_reflector` 和所有 input artifact IDs。
+
+`agent_system_history_reflector` 使用同一套 `reflector_llm` 配置和安全约束，但输入可以包含
+多个 dataset artifacts。每个 dataset manifest 应尽量写入 `round` 或 `round_number`、
+该轮 `agent_system_artifact_id`，以及 `metrics` / `summary` 中的 `precision`、`recall`、
+`f1`、TP/FP/FN 和 duplicate counts。Prompt 会按 round 排序，显示每轮指标和
+`delta_from_previous`，并把负向 F1 delta 标为 regression。输出 manifest 额外包含
+`source_dataset_artifact_ids`、`round_count`、`latest_round` / `latest_f1`、`best_round` /
+`best_f1` 和 `agent_system_audit`。典型流程是在第 3 轮后把 Round 1..3 的 dataset
+artifacts 与 Round 2 或离线验证最优 agent-system artifact 一起传入，避免只根据 latest
+regression 改写方法论。
+如果旧 dataset manifest 没有 round 或 metrics，method 会从 record metadata 的
+`round` / `rollout_step` / `policy_version` 和脱敏 golden feedback 的 `Aggregate fit`
+行回退提取这些信号。
+
+`agent_system_pareto_reflector` 使用同一套 history 输入，但不会让 LLM 单次覆盖
+`AGENTS.md`。它按 `job.config.candidate_strategies` 生成多个候选，分别运行泄漏和可执行性
+audit，然后把 `candidate_archive.json` 注册成 `report` artifact。若 pipeline 已经对候选跑过
+paired evaluation，可把每个候选的 `precision`、`recall`、`f1` 和
+`prediction_to_reference_ratio` 写入 `job.config.candidate_evaluations`；promotion gate 可用
+`max_prediction_to_reference_ratio`、`max_f1_regression`、`min_precision`、`min_recall` 和
+`requires_external_evaluation` 防止 coverage collapse、爆量输出或低精度候选晋级。
 
 ## Golden-standard evaluator
 

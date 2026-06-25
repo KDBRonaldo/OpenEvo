@@ -9,7 +9,7 @@ import httpx
 import pytest
 
 from polar_evolution.cli import _parse_capabilities
-from polar_evolution.methods import run_method
+from polar_evolution.methods import _audit_agent_system_markdown, run_method
 from polar_evolution.models import ArtifactType, ContextResolveRequest, WorkerClaimedJob
 from polar_evolution.store import EvolutionStore
 from polar_evolution.worker import run_once
@@ -211,6 +211,51 @@ def _golden_feedback_dataset_artifact(tmp_path: Path) -> dict[str, Any]:
     }
 
 
+def _history_round_dataset_artifact(
+    tmp_path: Path,
+    *,
+    round_number: int,
+    precision: float,
+    recall: float,
+    f1: float,
+    record: dict[str, Any],
+) -> dict[str, Any]:
+    dataset_dir = tmp_path / f"history-round-{round_number}"
+    dataset_dir.mkdir()
+    records_path = dataset_dir / "records.jsonl"
+    records_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+    manifest_path = dataset_dir / "manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "dataset_id": f"ds_history_round_{round_number}",
+                "name": f"history round {round_number}",
+                "round": round_number,
+                "agent_system_artifact_id": f"agent_system_round_{round_number}",
+                "records_path": "records.jsonl",
+                "records_uri": records_path.as_uri(),
+                "event_count": 1,
+                "metrics": {
+                    "precision": precision,
+                    "recall": recall,
+                    "f1": f1,
+                    "true_positive": int(f1 * 1000),
+                    "false_positive": int((1 - precision) * 1000),
+                    "false_negative": int((1 - recall) * 1000),
+                    "duplicate_predictions": round_number,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    return {
+        "artifact_id": f"art_history_round_{round_number}",
+        "type": "dataset",
+        "uri": manifest_path.as_uri(),
+        "name": f"history round {round_number}",
+    }
+
+
 def _job(
     method: str,
     tmp_path: Path,
@@ -230,9 +275,21 @@ def _job(
 
 def _patch_reflector_llm(
     monkeypatch: pytest.MonkeyPatch,
-    content: str = "# Evolved Agent System\n\nUse reflected lessons.",
+    content: str = (
+        "# Evolved Agent System\n\n"
+        "- Before finalizing, verify the reflected rules against the task constraints."
+    ),
+) -> dict[str, Any]:
+    return _patch_reflector_llm_sequence(monkeypatch, [content])
+
+
+def _patch_reflector_llm_sequence(
+    monkeypatch: pytest.MonkeyPatch,
+    contents: list[str],
 ) -> dict[str, Any]:
     captured: dict[str, Any] = {}
+    captured["requests"] = []
+    responses = list(contents)
 
     class FakeClient:
         def __init__(self, **kwargs: Any) -> None:
@@ -251,12 +308,17 @@ def _patch_reflector_llm(
             headers: dict[str, str],
             json: dict[str, Any],
         ) -> httpx.Response:
+            if responses:
+                response_content = responses.pop(0)
+            else:
+                response_content = contents[-1]
             captured["url"] = url
             captured["headers"] = headers
             captured["json"] = json
+            captured["requests"].append({"url": url, "headers": headers, "json": json})
             return httpx.Response(
                 200,
-                json={"choices": [{"message": {"content": content}}]},
+                json={"choices": [{"message": {"content": response_content}}]},
                 request=httpx.Request("POST", url),
             )
 
@@ -424,6 +486,8 @@ def test_agent_system_reflector_writes_agents_md_from_dataset_trajectories(
             "- observed: Added a regression test first.\n"
             "- prompt: Fix the package import bug.\n"
             "- failure_signal: pytest failed after an unverified edit\n"
+            "- Before finalizing parser or packaging changes, verify the reflected rule "
+            "against the focused regression test.\n"
         ),
     )
     job = _job(
@@ -642,7 +706,13 @@ def test_agent_system_reflector_can_use_codex_cli_subscription_provider(tmp_path
 def test_agent_system_reflector_preserves_existing_agent_system_as_base(tmp_path, monkeypatch):
     _patch_reflector_llm(
         monkeypatch,
-        content="# Base Agent System\n\nKeep changes minimal.\n\n## Reflections From Prior Trajectories",
+        content=(
+            "# Base Agent System\n\n"
+            "Keep changes minimal.\n\n"
+            "- Before changing an existing base instruction, verify it still applies to "
+            "the current task constraints.\n\n"
+            "## Reflections From Prior Trajectories"
+        ),
     )
     base_path = tmp_path / "base-agents.md"
     base_path.write_text("# Base Agent System\n\nKeep changes minimal.\n", encoding="utf-8")
@@ -670,7 +740,7 @@ def test_agent_system_reflector_preserves_existing_agent_system_as_base(tmp_path
 
     artifact = run_method(job, artifact_root=tmp_path / "artifacts")[0]
 
-    assert artifact.manifest["target_path"] == "agents.md"
+    assert artifact.manifest["target_path"] == "AGENTS.md"
     assert artifact.promoted is False
     assert artifact.lineage["input_artifact_ids"] == [
         "art_dataset_reflector",
@@ -690,6 +760,791 @@ def test_agent_system_reflector_rejects_missing_dataset(tmp_path):
         assert "agent_system_reflector requires an input dataset artifact" in str(exc)
     else:
         raise AssertionError("expected ValueError")
+
+
+def test_agent_system_reflector_repairs_forbidden_literal_leakage(
+    tmp_path,
+    monkeypatch,
+):
+    captured = _patch_reflector_llm_sequence(
+        monkeypatch,
+        [
+            (
+                "# Leaky Agent System\n\n"
+                "- For Secret Heldout Paper, inspect golden_source.xlsx before extraction."
+            ),
+            (
+                "# Repaired Agent System\n\n"
+                "- For multi-file extraction tasks, before extraction recursively inventory "
+                "the allowed input root, group files by package and extension, inspect "
+                "structured evidence such as tables or workbooks when present, and before "
+                "finalizing verify that every package has inspected evidence or an explicit "
+                "allowed-evidence exclusion reason."
+            ),
+        ],
+    )
+    job = _job(
+        "agent_system_reflector",
+        tmp_path,
+        input_artifacts=[_reflector_dataset_artifact(tmp_path)],
+        config={
+            "reflector_llm": {
+                "model": "reflector-model",
+                "base_url": "http://reflector.test/v1",
+                "api_key": "secret",
+            },
+            "agent_system_audit": {
+                "forbidden_literals": {
+                    "article_titles": ["Secret Heldout Paper"],
+                    "source_files": ["golden_source.xlsx"],
+                }
+            },
+        },
+    )
+
+    artifact = run_method(job, artifact_root=tmp_path / "artifacts")[0]
+
+    text = Path(artifact.uri.removeprefix("file://")).read_text(encoding="utf-8")
+    assert "Secret Heldout Paper" not in text
+    assert "golden_source.xlsx" not in text
+    assert "recursively inventory the allowed input root" in text
+    assert len(captured["requests"]) == 2
+    repair_prompt = captured["requests"][1]["json"]["messages"][1]["content"]
+    assert "agent-system audit found issues" in repair_prompt
+    assert "forbidden literal" in repair_prompt
+    assert artifact.manifest["agent_system_audit"]["repair_count"] == 1
+    assert artifact.manifest["agent_system_audit"]["finding_count"] == 0
+
+
+def test_agent_system_reflector_repairs_wrapped_literals_and_numeric_rows(
+    tmp_path,
+    monkeypatch,
+):
+    captured = _patch_reflector_llm_sequence(
+        monkeypatch,
+        [
+            (
+                "# Leaky Agent System\n\n"
+                "- Before finalizing, inspect row 12 and copy SecretWrappedLiteral."
+            ),
+            (
+                "# Repaired Agent System\n\n"
+                "- For structured extraction tasks, before finalizing recursively inventory "
+                "the allowed input root, inspect tables or workbooks for eligible records, "
+                "and verify every emitted record has allowed evidence without naming "
+                "protected rows or literals."
+            ),
+        ],
+    )
+    job = _job(
+        "agent_system_reflector",
+        tmp_path,
+        input_artifacts=[_reflector_dataset_artifact(tmp_path)],
+        config={
+            "reflector_llm": {
+                "model": "reflector-model",
+                "base_url": "http://reflector.test/v1",
+                "api_key": "secret",
+            },
+            "agent_system_audit": {
+                "forbidden_literals": {
+                    "terminal_bench": ["SecretWrappedLiteral"],
+                    "source_rows": [12],
+                }
+            },
+        },
+    )
+
+    artifact = run_method(job, artifact_root=tmp_path / "artifacts")[0]
+
+    text = Path(artifact.uri.removeprefix("file://")).read_text(encoding="utf-8")
+    assert "SecretWrappedLiteral" not in text
+    assert "row 12" not in text
+    assert len(captured["requests"]) == 2
+    repair_prompt = captured["requests"][1]["json"]["messages"][1]["content"]
+    assert "[REDACTED_LITERAL_" in repair_prompt
+    assert "[REDACTED_SOURCE_ROWS_" in repair_prompt
+    assert artifact.manifest["agent_system_audit"]["repair_count"] == 1
+
+
+def test_agent_system_history_reflector_repairs_slogan_coverage_rules(
+    tmp_path,
+    monkeypatch,
+):
+    captured = _patch_reflector_llm_sequence(
+        monkeypatch,
+        [
+            (
+                "# History-Aware Agent System\n\n"
+                "- When sources are package-like or split across files, make a source "
+                "checklist before finalizing and review every allowed bundle once; "
+                "validate by confirming no eligible source bundle was skipped.\n"
+                "- Balance precision and recall."
+            ),
+            (
+                "# History-Aware Agent System\n\n"
+                "- For package-style extraction tasks, before extraction recursively "
+                "inventory every file under the allowed input root, group files by package "
+                "and extension, inspect structured evidence formats such as markdown "
+                "tables, spreadsheets, CSV, TSV, XLS, or XLSX when present, and before "
+                "finalizing verify each package has inspected source evidence or an "
+                "explicit exclusion reason.\n"
+                "- Before writing final records, run a precision pass that removes "
+                "unsupported candidates and then verify every included item has allowed "
+                "evidence and satisfies the requested component boundary."
+            ),
+        ],
+    )
+    round1 = _history_round_dataset_artifact(
+        tmp_path,
+        round_number=1,
+        precision=0.26,
+        recall=0.68,
+        f1=0.38,
+        record={
+            "event_id": "evt_round1",
+            "task_id": "task_biology_round1",
+            "session_id": "session_round1",
+            "status": "COMPLETED",
+            "reward": 0.38,
+            "payload": {"summary": "Round 1 found broad source coverage."},
+        },
+    )
+    round2 = _history_round_dataset_artifact(
+        tmp_path,
+        round_number=2,
+        precision=0.33,
+        recall=1.0,
+        f1=0.49,
+        record={
+            "event_id": "evt_round2",
+            "task_id": "task_biology_round2",
+            "session_id": "session_round2",
+            "status": "COMPLETED",
+            "reward": 0.49,
+            "payload": {"summary": "Round 2 improved after checking tables."},
+        },
+    )
+    job = _job(
+        "agent_system_history_reflector",
+        tmp_path,
+        input_artifacts=[round1, round2],
+        config={
+            "reflector_llm": {
+                "model": "reflector-model",
+                "base_url": "http://reflector.test/v1",
+                "api_key": "secret",
+            }
+        },
+    )
+
+    artifact = run_method(job, artifact_root=tmp_path / "artifacts")[0]
+
+    text = Path(artifact.uri.removeprefix("file://")).read_text(encoding="utf-8")
+    assert "Perform a coverage pass across every allowed source bundle" not in text
+    assert "recursively inventory every file under the allowed input root" in text
+    assert "XLSX" in text
+    assert "verify each package has inspected source evidence" in text
+    assert len(captured["requests"]) == 2
+    repair_prompt = captured["requests"][1]["json"]["messages"][1]["content"]
+    assert "coverage rules must include recursive file-level source discovery" in repair_prompt
+    assert artifact.manifest["agent_system_audit"]["repair_count"] == 1
+    assert artifact.manifest["agent_system_audit"]["finding_count"] == 0
+
+
+def test_agent_system_audit_rejects_abstract_source_checklist_without_file_inventory():
+    text = (
+        "# Agent System\n\n"
+        "## Coverage and Precision Checks\n"
+        "- When sources are package-like or split across files, make a source checklist "
+        "before finalizing and review every allowed bundle once; validate by confirming "
+        "no eligible source bundle was skipped.\n"
+        "- When a source has multiple candidate component classes or sections, perform "
+        "a structured pass over each relevant section instead of stopping at the first "
+        "match; validate by confirming no allowed component class from that source was "
+        "silently omitted.\n"
+    )
+
+    findings = _audit_agent_system_markdown(text, forbidden_literals=[])
+
+    assert any(finding["code"] == "source_coverage_not_actionable" for finding in findings)
+
+
+def test_agent_system_audit_requires_recursive_file_level_source_inventory():
+    text = (
+        "# Agent System\n\n"
+        "- When sources come in multiple files or bundles, enumerate every allowed "
+        "source package before extraction, review each package for eligible records, "
+        "and verify no allowed package was skipped.\n"
+        "- When a source contains multiple tables or supplementary structures, inspect "
+        "each relevant structured section that could hold eligible records, extract "
+        "from all qualifying sections, and verify coverage against the package inventory.\n"
+    )
+
+    findings = _audit_agent_system_markdown(text, forbidden_literals=[])
+
+    assert any(finding["code"] == "source_coverage_not_actionable" for finding in findings)
+
+
+def test_agent_system_audit_does_not_treat_test_coverage_as_source_coverage():
+    text = (
+        "# Agent System\n\n"
+        "- When changing executable behavior, run regression coverage for touched "
+        "paths and verify the relevant tests pass before finalizing.\n"
+    )
+
+    findings = _audit_agent_system_markdown(text, forbidden_literals=[])
+
+    assert not any(
+        finding["code"] == "source_coverage_not_actionable" for finding in findings
+    )
+
+
+def test_agent_system_history_reflector_uses_round_history_and_deltas(
+    tmp_path,
+    monkeypatch,
+):
+    captured = _patch_reflector_llm(
+        monkeypatch,
+        content=(
+            "# History-Aware Agent System\n\n"
+            "Preserve stable rules from improving rounds and investigate regressions."
+        ),
+    )
+    base_path = tmp_path / "round2-agents.md"
+    base_path.write_text(
+        "# Round 2 Agent System\n\n"
+        "Preserve canonical article ids and reduce over-extraction.\n",
+        encoding="utf-8",
+    )
+    round1 = _history_round_dataset_artifact(
+        tmp_path,
+        round_number=1,
+        precision=0.26,
+        recall=0.68,
+        f1=0.38,
+        record={
+            "event_id": "evt_round1",
+            "task_id": "task_biology_round1",
+            "session_id": "session_round1",
+            "status": "COMPLETED",
+            "reward": 0.38,
+            "payload": {
+                "session_result": {
+                    "metadata": {
+                        "evolution_feedback": {
+                            "golden_standard": "Round 1 recovered broad coverage."
+                        }
+                    }
+                }
+            },
+        },
+    )
+    round2 = _history_round_dataset_artifact(
+        tmp_path,
+        round_number=2,
+        precision=0.33,
+        recall=1.0,
+        f1=0.49,
+        record={
+            "event_id": "evt_round2",
+            "task_id": "task_biology_round2",
+            "session_id": "session_round2",
+            "status": "COMPLETED",
+            "reward": 0.49,
+            "payload": {
+                "summary": "Round 2 found almost all gold records after article-id remap."
+            },
+        },
+    )
+    round3 = _history_round_dataset_artifact(
+        tmp_path,
+        round_number=3,
+        precision=0.22,
+        recall=0.68,
+        f1=0.33,
+        record={
+            "event_id": "evt_round3",
+            "task_id": "task_biology_round3",
+            "session_id": "session_round3",
+            "status": "COMPLETED",
+            "reward": 0.33,
+            "payload": {
+                "session_result": {
+                    "metadata": {
+                        "evolution_feedback": {
+                            "golden_standard": (
+                                "Regression: one component-heavy article dropped to zero true "
+                                "positives while another over-generated."
+                            )
+                        }
+                    }
+                }
+            },
+        },
+    )
+    job = _job(
+        "agent_system_history_reflector",
+        tmp_path,
+        input_artifacts=[
+            round1,
+            round2,
+            round3,
+            {
+                "artifact_id": "agent_system_round_2",
+                "type": "agent_system",
+                "uri": base_path.as_uri(),
+                "name": "round 2 agent system",
+            },
+        ],
+        config={
+            "name": "history-aware-reflector",
+            "target_path": "AGENTS.md",
+            "max_records_per_round": 2,
+            "reflector_llm": {
+                "model": "reflector-model",
+                "base_url": "http://reflector.test/v1",
+                "api_key": "secret",
+            },
+        },
+    )
+
+    artifact = run_method(job, artifact_root=tmp_path / "artifacts")[0]
+
+    prompt = captured["json"]["messages"][1]["content"]
+    assert "# Round 2 Agent System" in prompt
+    assert "## Multi-Round Evolution History" in prompt
+    assert "Round 1" in prompt
+    assert "f1=0.380" in prompt
+    assert "Round 2" in prompt
+    assert "delta_f1=+0.110" in prompt
+    assert "Round 3" in prompt
+    assert "delta_f1=-0.160" in prompt
+    assert "regression" in prompt.lower()
+    assert "Round 1 recovered broad coverage." in prompt
+    assert "one component-heavy article dropped to zero true positives" in prompt
+    assert "preserve stable improvements" in prompt.lower()
+    assert "canonical article/package identifiers" in prompt
+    assert artifact.type == ArtifactType.AGENT_SYSTEM
+    assert artifact.name == "history-aware-reflector"
+    assert artifact.manifest["method"] == "agent_system_history_reflector"
+    assert artifact.manifest["round_count"] == 3
+    assert artifact.manifest["source_dataset_artifact_ids"] == [
+        "art_history_round_1",
+        "art_history_round_2",
+        "art_history_round_3",
+    ]
+    assert artifact.manifest["best_round"] == 2
+    assert artifact.manifest["latest_round"] == 3
+    assert artifact.manifest["best_f1"] == 0.49
+    assert artifact.manifest["latest_f1"] == 0.33
+    assert artifact.lineage["method"] == "agent_system_history_reflector"
+    assert artifact.lineage["input_artifact_ids"] == [
+        "art_history_round_1",
+        "art_history_round_2",
+        "art_history_round_3",
+        "agent_system_round_2",
+    ]
+
+
+def test_agent_system_history_reflector_rejects_missing_dataset(tmp_path):
+    job = _job("agent_system_history_reflector", tmp_path)
+
+    try:
+        run_method(job, artifact_root=tmp_path / "artifacts")
+    except ValueError as exc:
+        assert "agent_system_history_reflector requires at least one dataset artifact" in str(exc)
+    else:
+        raise AssertionError("expected ValueError")
+
+
+def test_agent_system_history_reflector_infers_round_and_metrics_from_records(
+    tmp_path,
+    monkeypatch,
+):
+    captured = _patch_reflector_llm(monkeypatch)
+    dataset_dir = tmp_path / "history-record-metadata"
+    dataset_dir.mkdir()
+    records_path = dataset_dir / "records.jsonl"
+    records_path.write_text(
+        json.dumps(
+            {
+                "event_id": "evt_round_metadata",
+                "task_id": "task_biology_round_metadata",
+                "session_id": "session_round_metadata",
+                "status": "COMPLETED",
+                "reward": 1.0,
+                "payload": {
+                    "session_result": {
+                        "metadata": {
+                            "round": 2,
+                            "evolution_feedback": {
+                                "golden_standard": (
+                                    "## Shared Golden Standard Evaluation (Sanitized)\n\n"
+                                    "- Aggregate fit: precision=0.123, recall=0.456, "
+                                    "f1=0.234, prediction/reference ratio=1.23x, "
+                                    "duplicate rate=0.010."
+                                )
+                            },
+                        }
+                    }
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    manifest_path = dataset_dir / "manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "dataset_id": "ds_history_record_metadata",
+                "name": "history record metadata",
+                "records_path": "records.jsonl",
+                "records_uri": records_path.as_uri(),
+                "event_count": 1,
+            }
+        ),
+        encoding="utf-8",
+    )
+    job = _job(
+        "agent_system_history_reflector",
+        tmp_path,
+        input_artifacts=[
+            {
+                "artifact_id": "art_history_record_metadata",
+                "type": "dataset",
+                "uri": manifest_path.as_uri(),
+                "name": "history record metadata",
+            }
+        ],
+        config={
+            "reflector_llm": {
+                "model": "reflector-model",
+                "base_url": "http://reflector.test/v1",
+                "api_key": "secret",
+            }
+        },
+    )
+
+    artifact = run_method(job, artifact_root=tmp_path / "artifacts")[0]
+
+    prompt = captured["json"]["messages"][1]["content"]
+    assert "### Round 2" in prompt
+    assert "precision=0.123" in prompt
+    assert "recall=0.456" in prompt
+    assert "f1=0.234" in prompt
+    assert artifact.manifest["latest_round"] == 2
+    assert artifact.manifest["latest_f1"] == 0.234
+
+
+def test_agent_system_pareto_reflector_selects_candidate_with_external_gate(
+    tmp_path,
+    monkeypatch,
+):
+    captured = _patch_reflector_llm_sequence(
+        monkeypatch,
+        [
+            (
+                "# Precision Candidate\n\n"
+                "- Before finalizing an extraction task, run a precision check that "
+                "rejects unsupported rows and verify each kept record has source evidence."
+            ),
+            (
+                "# Recall Candidate\n\n"
+                "- Before finalizing a package-like extraction task, recursively inventory "
+                "every file under the allowed input root, inspect tables, spreadsheets, "
+                "CSV, TSV, XLS, and XLSX sources, and verify every package has a coverage "
+                "decision."
+            ),
+                (
+                    "# Provenance Candidate\n\n"
+                    "- When task inputs are grouped by package or article, before extraction "
+                    "build a canonical source-id map from each top-level input directory to "
+                    "itself, use only those ids in final records, and before finalizing verify "
+                    "every record's source id is in that map.\n"
+                    "- Before extracting from package-like sources, recursively inventory "
+                    "every file under the allowed input root, inspect structured evidence "
+                    "formats such as tables, spreadsheets, CSV, TSV, XLS, and XLSX, and "
+                    "verify every package has inspected evidence or an exclusion reason.\n"
+                    "- Before accepting table-derived records, compare precision and recall "
+                    "risks, remove unsupported candidates, and verify output volume is within "
+                    "the task's expected source coverage rather than a raw DNA-cell dump."
+                ),
+        ],
+    )
+    round1 = _history_round_dataset_artifact(
+        tmp_path,
+        round_number=1,
+        precision=0.26,
+        recall=0.68,
+        f1=0.38,
+        record={
+            "event_id": "evt_round1",
+            "task_id": "task_biology_round1",
+            "session_id": "session_round1",
+            "status": "COMPLETED",
+            "reward": 0.38,
+            "payload": {"summary": "Round 1 had incomplete article coverage."},
+        },
+    )
+    round2 = _history_round_dataset_artifact(
+        tmp_path,
+        round_number=2,
+        precision=0.33,
+        recall=0.998,
+        f1=0.494,
+        record={
+            "event_id": "evt_round2",
+            "task_id": "task_biology_round2",
+            "session_id": "session_round2",
+            "status": "COMPLETED",
+            "reward": 0.494,
+            "payload": {"summary": "Round 2 improved after preserving article ids."},
+        },
+    )
+    round3 = _history_round_dataset_artifact(
+        tmp_path,
+        round_number=3,
+        precision=0.22,
+        recall=0.679,
+        f1=0.335,
+        record={
+            "event_id": "evt_round3",
+            "task_id": "task_biology_round3",
+            "session_id": "session_round3",
+            "status": "COMPLETED",
+            "reward": 0.335,
+            "payload": {"summary": "Round 3 regressed with coverage collapse."},
+        },
+    )
+    job = _job(
+        "agent_system_pareto_reflector",
+        tmp_path,
+        input_artifacts=[round1, round2, round3],
+        config={
+            "name": "pareto-reflector",
+            "candidate_strategies": [
+                "precision_guarded",
+                "recall_recovery",
+                "provenance_guarded",
+            ],
+            "candidate_evaluations": {
+                "precision_guarded": {
+                    "precision": 0.36,
+                    "recall": 0.82,
+                    "f1": 0.50,
+                    "prediction_to_reference_ratio": 2.0,
+                },
+                "recall_recovery": {
+                    "precision": 0.09,
+                    "recall": 1.0,
+                    "f1": 0.60,
+                    "prediction_to_reference_ratio": 20.0,
+                },
+                "provenance_guarded": {
+                    "precision": 0.40,
+                    "recall": 0.88,
+                    "f1": 0.55,
+                    "prediction_to_reference_ratio": 2.5,
+                },
+            },
+            "promotion_gate": {
+                "max_prediction_to_reference_ratio": 5.0,
+                "max_f1_regression": 0.0,
+            },
+            "reflector_llm": {
+                "model": "reflector-model",
+                "base_url": "http://reflector.test/v1",
+                "api_key": "secret",
+            },
+            "promoted": True,
+        },
+    )
+
+    artifacts = run_method(job, artifact_root=tmp_path / "artifacts")
+
+    agent_system_artifact = next(
+        artifact for artifact in artifacts if artifact.type == ArtifactType.AGENT_SYSTEM
+    )
+    report_artifact = next(artifact for artifact in artifacts if artifact.type == ArtifactType.REPORT)
+    text = Path(agent_system_artifact.uri.removeprefix("file://")).read_text(encoding="utf-8")
+    assert text.startswith("# Provenance Candidate")
+    assert agent_system_artifact.promoted is True
+    assert agent_system_artifact.manifest["method"] == "agent_system_pareto_reflector"
+    assert agent_system_artifact.manifest["candidate_count"] == 3
+    assert agent_system_artifact.manifest["selected_candidate"]["strategy"] == "provenance_guarded"
+    assert agent_system_artifact.manifest["promotion_gate"]["passed"] is True
+    assert agent_system_artifact.manifest["best_round"] == 2
+    assert agent_system_artifact.manifest["latest_round"] == 3
+    assert agent_system_artifact.lineage["method"] == "agent_system_pareto_reflector"
+    assert agent_system_artifact.lineage["input_artifact_ids"] == [
+        "art_history_round_1",
+        "art_history_round_2",
+        "art_history_round_3",
+    ]
+
+    prompts = [request["json"]["messages"][1]["content"] for request in captured["requests"]]
+    assert len(prompts) == 3
+    assert "all historical trajectories" in prompts[0]
+    assert "Candidate strategy: precision_guarded" in prompts[0]
+    assert "Candidate strategy: recall_recovery" in prompts[1]
+    assert "Candidate strategy: provenance_guarded" in prompts[2]
+    assert "Promotion gate" in prompts[2]
+    assert "coverage collapse" in prompts[2]
+
+    report = json.loads(Path(report_artifact.uri.removeprefix("file://")).read_text())
+    assert report["selected_candidate"]["strategy"] == "provenance_guarded"
+    rejected = {candidate["strategy"]: candidate for candidate in report["candidates"]}
+    assert "prediction_to_reference_ratio" in rejected["recall_recovery"]["gate_failures"]
+
+
+def test_agent_system_pareto_reflector_requires_history_dataset(tmp_path):
+    job = _job("agent_system_pareto_reflector", tmp_path)
+
+    try:
+        run_method(job, artifact_root=tmp_path / "artifacts")
+    except ValueError as exc:
+        assert "agent_system_pareto_reflector requires at least one dataset artifact" in str(exc)
+    else:
+        raise AssertionError("expected ValueError")
+
+
+def test_agent_system_gepa_reflector_generates_mutation_pool_from_verifier_feedback(
+    tmp_path,
+    monkeypatch,
+):
+    captured = _patch_reflector_llm_sequence(
+        monkeypatch,
+        [
+            (
+                "# Preservation Candidate\n\n"
+                "- When modifying HTML sanitizers, before finalizing run a clean-HTML "
+                "preservation corpus covering forms, semantic tags, media tags, empty "
+                "elements, and entity-heavy text; validate that the sanitized output "
+                "does not reorder benign attributes or rewrite entities for clean files."
+            ),
+            (
+                "# XSS Corpus Candidate\n\n"
+                "- When removing executable HTML, before finalizing run a malformed-XSS "
+                "corpus covering namespaced scripts, encoded javascript URLs, data URLs, "
+                "meta refresh, CSS URL payloads, and malformed event-handler tags; "
+                "validate that no executable surface remains."
+            ),
+        ],
+    )
+    failure_round = _history_round_dataset_artifact(
+        tmp_path,
+        round_number=1,
+        precision=0.0,
+        recall=0.0,
+        f1=0.0,
+        record={
+            "event_id": "evt_filter_failure",
+            "task_id": "filter-js-from-html",
+            "session_id": "filter-js-from-html__failure",
+            "status": "COMPLETED",
+            "reward": 0.0,
+            "traces": [
+                {
+                    "prompt_messages": [
+                        {"role": "user", "content": "Create an HTML JavaScript filter."}
+                    ],
+                    "response_messages": [
+                        {
+                            "role": "assistant",
+                            "content": "Used narrow text transformations and smoke tests.",
+                        }
+                    ],
+                    "metadata": {
+                        "verifier": {
+                            "summary": {"tests": 2, "passed": 0, "failed": 2},
+                            "failed_tests": [
+                                {
+                                    "name": "test_clean_html_unchanged",
+                                    "message": (
+                                        "clean HTML files were reformatted, benign "
+                                        "attributes were reordered, and entities changed"
+                                    ),
+                                },
+                                {
+                                    "name": "test_filter_blocks_xss",
+                                    "message": (
+                                        "malformed XSS vectors such as iframe onload and "
+                                        "encoded javascript URLs remained executable"
+                                    ),
+                                },
+                            ],
+                        }
+                    },
+                }
+            ],
+            "payload": {
+                "session_result": {
+                    "metadata": {
+                        "terminal_bench": {
+                            "trial_name": "filter-js-from-html__failure",
+                        },
+                    }
+                }
+            },
+        },
+    )
+    job = _job(
+        "agent_system_gepa_reflector",
+        tmp_path,
+        input_artifacts=[failure_round],
+        config={
+            "name": "gepa-reflector",
+            "candidate_count": 2,
+            "mutation_strategies": ["preservation_gate", "xss_corpus"],
+            "reflector_llm": {
+                "model": "reflector-model",
+                "base_url": "http://reflector.test/v1",
+                "api_key": "secret",
+            },
+            "promoted": True,
+        },
+    )
+
+    artifacts = run_method(job, artifact_root=tmp_path / "artifacts")
+
+    agent_system_artifacts = [
+        artifact for artifact in artifacts if artifact.type == ArtifactType.AGENT_SYSTEM
+    ]
+    report_artifact = next(artifact for artifact in artifacts if artifact.type == ArtifactType.REPORT)
+    assert len(agent_system_artifacts) == 2
+    assert [artifact.manifest["candidate_strategy"] for artifact in agent_system_artifacts] == [
+        "preservation_gate",
+        "xss_corpus",
+    ]
+    assert agent_system_artifacts[0].manifest["method"] == "agent_system_gepa_reflector"
+    assert agent_system_artifacts[0].manifest["candidate_count"] == 2
+    assert agent_system_artifacts[0].lineage["method"] == "agent_system_gepa_reflector"
+    assert agent_system_artifacts[0].promoted is False
+
+    candidate_texts = [
+        Path(artifact.uri.removeprefix("file://")).read_text(encoding="utf-8")
+        for artifact in agent_system_artifacts
+    ]
+    assert candidate_texts[0].startswith("# Preservation Candidate")
+    assert candidate_texts[1].startswith("# XSS Corpus Candidate")
+
+    prompts = [request["json"]["messages"][1]["content"] for request in captured["requests"]]
+    assert len(prompts) == 2
+    assert "GEPA Candidate Mutation" in prompts[0]
+    assert "Mutation strategy: preservation_gate" in prompts[0]
+    assert "clean HTML files were reformatted" in prompts[0]
+    assert "Mutation strategy: xss_corpus" in prompts[1]
+    assert "encoded javascript URLs" in prompts[1]
+
+    report = json.loads(Path(report_artifact.uri.removeprefix("file://")).read_text())
+    assert report["method"] == "agent_system_gepa_reflector"
+    assert report["candidate_count"] == 2
+    assert [candidate["strategy"] for candidate in report["candidates"]] == [
+        "preservation_gate",
+        "xss_corpus",
+    ]
 
 
 def test_parametric_memory_register_returns_adapter_artifact(tmp_path):
@@ -739,6 +1594,9 @@ def test_parse_capabilities_defaults_to_reference_job_types():
         "skill_bundle",
         "agent_system",
         "agent_system_reflector",
+        "agent_system_history_reflector",
+        "agent_system_pareto_reflector",
+        "agent_system_gepa_reflector",
         "parametric_memory_register",
     ]
 

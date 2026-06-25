@@ -311,7 +311,7 @@ Issue 应包含：
    - linked issue：`Fixes #...`、`Closes #...`、`Resolves #...` 或 `Part of #...`。
    - docs updated：列出更新的文档路径，或解释为什么不需要文档变化。
    - tests run：列出 focused tests 和结果。
-3. CI docs check：脚本检查非纯文档 PR 是否包含 `docs/`、`README.md`、`agents.md` 或模块文档变化；
+3. CI docs check：脚本检查非纯文档 PR 是否包含 `docs/`、`README.md`、`AGENTS.md` 或模块文档变化；
    如果没有，则要求 PR body 包含明确的 `No docs needed:` 说明。
 4. CI issue link check：脚本检查 PR body 是否包含 issue reference。对纯本地实验、机械格式化或
    明确标注的 no-issue 小改可以允许维护者 override。
