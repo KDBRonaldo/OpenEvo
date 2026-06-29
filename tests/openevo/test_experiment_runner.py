@@ -35,7 +35,7 @@ def _config(**overrides: object) -> ExperimentConfig:
     return ExperimentConfig.model_validate(payload)
 
 
-def test_dry_run_emits_three_evolution_jobs_per_task_round() -> None:
+def test_dry_run_emits_default_evolution_jobs_per_task_round() -> None:
     plan = dry_run_experiment(_config(), rounds_override=2)
 
     rounds = plan["tasks"][0]["rounds"]
@@ -69,6 +69,39 @@ def test_dry_run_shows_multi_round_context_placeholders() -> None:
         "<dataset_artifact:component-extraction-train:round-1>",
         "<dataset_artifact:component-extraction-train:round-0>",
         "<agent_system_artifact:component-extraction-train:round-0>",
+    ]
+
+
+def test_dry_run_tracks_parametric_memory_placeholders_when_enabled() -> None:
+    plan = dry_run_experiment(
+        _config(
+            artifacts={
+                "text_memory": {"enabled": True},
+                "parametric_memory": {
+                    "enabled": True,
+                    "config": {
+                        "adapter_uri": "file:///adapters/parser-memory",
+                        "base_model": "gpt-5.1-codex-mini",
+                    },
+                },
+                "skill_bundle": {"enabled": False},
+                "agent_system": {"enabled": False},
+            }
+        ),
+        rounds_override=2,
+    )
+
+    round_0, round_1 = plan["tasks"][0]["rounds"]
+
+    assert [job["method"] for job in round_0["evolution_jobs"]] == [
+        "text_memory_reflector",
+        "parametric_memory_register",
+    ]
+    assert round_1["rollout_payload"]["metadata"]["evolution"][
+        "context_artifact_ids"
+    ] == [
+        "<text_memory_artifact:component-extraction-train:round-0>",
+        "<parametric_memory_artifact:component-extraction-train:round-0>",
     ]
 
 
@@ -500,6 +533,48 @@ def test_live_runner_rollouts_use_only_latest_evolved_artifacts(
         "skill_bundle_reflector-artifact-2",
         "agent_system_history_reflector-artifact-1",
     ]
+
+
+def test_live_runner_tracks_latest_parametric_memory_artifacts(tmp_path: Path) -> None:
+    rollout = FakeRolloutClient()
+    worker = UniqueArtifactWorkerRunner()
+
+    result = run_experiment(
+        _config(
+            artifacts={
+                "text_memory": {"enabled": True},
+                "parametric_memory": {
+                    "enabled": True,
+                    "config": {
+                        "adapter_uri": "file:///adapters/parser-memory",
+                        "base_model": "gpt-5.1-codex-mini",
+                    },
+                },
+                "skill_bundle": {"enabled": False},
+                "agent_system": {"enabled": False},
+            }
+        ),
+        rounds_override=2,
+        output_dir=tmp_path / "run",
+        rollout_client=rollout,
+        evolution_client=FakeEvolutionClient(),
+        worker_runner=worker,
+        poll_interval_seconds=0.0,
+        max_poll_attempts=1,
+    )
+
+    second_context = rollout.submitted[1]["metadata"]["evolution"][
+        "context_artifact_ids"
+    ]
+
+    assert result["status"] == "completed"
+    assert second_context == [
+        "text_memory_reflector-artifact-1",
+        "parametric_memory_register-artifact-1",
+    ]
+    assert result["tasks"][0]["rounds"][0]["artifact_ids"][
+        "parametric_memory"
+    ] == ["parametric_memory_register-artifact-1"]
 
 
 def test_live_runner_snapshots_round_artifact_ids(tmp_path: Path) -> None:
@@ -3526,9 +3601,9 @@ class FakeEvolutionClient:
         artifact_type = (
             "text_memory"
             if "text-memory" in artifact_id
+            else "parametric_memory"
+            if "parametric-memory" in artifact_id or "parametric_memory" in artifact_id
             else "skill_bundle"
-            if "skill-bundle" in artifact_id
-            else "agent_system"
         )
         return {
             "artifact_id": artifact_id,
@@ -3560,6 +3635,7 @@ class FakeWorkerRunner:
         method = capability.rsplit(":", maxsplit=1)[-1]
         artifact_id = {
             "text_memory_reflector": "artifact-text-memory",
+            "parametric_memory_register": "artifact-parametric-memory",
             "skill_bundle_reflector": "artifact-skill-bundle",
             "agent_system_reflector": "artifact-agent-system",
             "agent_system_history_reflector": "artifact-agent-system-history",

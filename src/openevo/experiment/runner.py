@@ -96,6 +96,7 @@ def _empty_context_artifact_ids() -> dict[str, list[str]]:
     return {
         "dataset": [],
         "text_memory": [],
+        "parametric_memory": [],
         "skill_bundle": [],
         "agent_system": [],
     }
@@ -182,18 +183,8 @@ def _run_compiled_experiment(
     any_pending_review = False
     run_id = compiled.run_id or uuid4().hex
     for task in compiled.tasks:
-        history_context_artifact_ids: dict[str, list[str]] = {
-            "dataset": [],
-            "text_memory": [],
-            "skill_bundle": [],
-            "agent_system": [],
-        }
-        rollout_context_artifact_ids: dict[str, list[str]] = {
-            "dataset": [],
-            "text_memory": [],
-            "skill_bundle": [],
-            "agent_system": [],
-        }
+        history_context_artifact_ids = _empty_context_artifact_ids()
+        rollout_context_artifact_ids = _empty_context_artifact_ids()
         round_results: list[dict[str, Any]] = []
         for round_index in range(compiled.round_count):
             rollout_payload = task.rollout_payload_for_round(
@@ -237,12 +228,7 @@ def _run_compiled_experiment(
             prior_context_artifact_ids = {
                 key: list(value) for key, value in history_context_artifact_ids.items()
             }
-            next_rollout_context_artifact_ids: dict[str, list[str]] = {
-                "dataset": [],
-                "text_memory": [],
-                "skill_bundle": [],
-                "agent_system": [],
-            }
+            next_rollout_context_artifact_ids = _empty_context_artifact_ids()
             round_failed = False
             for spec in compiled.evolution_methods_for_round(round_index):
                 job_payload = task.evolution_job_payloads_for_round(
