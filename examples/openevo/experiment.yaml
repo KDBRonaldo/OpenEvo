@@ -9,6 +9,15 @@ agent:
     capture_mode: transcript
 runtime:
   image: my-task-image:latest
+evolution:
+  rounds: 3
+  # Keep disabled for the smallest local smoke test. Use mode: human or mode: llm
+  # to require review before evolved artifacts enter later rollouts.
+  promotion_gate:
+    mode: none
+    # For mode: human, auto uses a terminal prompt when available and otherwise
+    # falls back to decision files under promotion_reviews/.
+    human_input: auto
 tasks:
   - id: component-extraction-train
     instruction: >

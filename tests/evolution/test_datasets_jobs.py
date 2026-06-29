@@ -17,8 +17,11 @@ from polar_evolution.models import (
     ArtifactType,
     DatasetCreateRequest,
     EventIngestRequest,
+    HumanFeedbackCreateRequest,
     JobCreateRequest,
     JobState,
+    ReviewClaimRequest,
+    ReviewRequestCreateRequest,
     WorkerClaimRequest,
     WorkerCompleteRequest,
     WorkerFailRequest,
@@ -189,6 +192,645 @@ def test_create_dataset_filters_events(tmp_path):
     ]
     assert worker_records[0]["event_id"] == good_event.event_id
     assert worker_records[0]["traces"] == [{"reward": 1.0}]
+
+
+def test_create_dataset_sanitizes_validated_human_feedback(tmp_path):
+    store = EvolutionStore(db_path=tmp_path / "evolution.db", artifact_root=tmp_path / "artifacts")
+    store.initialize()
+    event = store.ingest_event(
+        EventIngestRequest(
+            source="polar",
+            event_type="polar.session_completed",
+            source_event_id="session:human-feedback",
+            task_id="task_human_feedback",
+            session_id="session_human_feedback",
+            status="COMPLETED",
+            reward=0.4,
+            payload={
+                "session_result": {
+                    "trajectory": {"traces": [{"reward": 0.4}]},
+                    "metadata": {
+                        "evolution_feedback": {
+                            "human": [
+                                {
+                                    "feedback_id": "hfb_keep",
+                                    "status": "available_for_evolution",
+                                    "normalized_payload": {
+                                        "decision": "revise",
+                                        "confidence": 0.85,
+                                        "score": 0.72,
+                                        "observed_issues": [
+                                            "Still encourages unbounded repository search.",
+                                            {
+                                                "text": "Nested typed issue.",
+                                                "rationale": "Nested raw rationale must not leak.",
+                                                "raw_payload": {"secret": "nested-secret"},
+                                            },
+                                        ],
+                                        "suggested_changes": [
+                                            "Add a bounded source inventory step.",
+                                            ["nested raw change must not leak"],
+                                        ],
+                                        "risks": ["May overfit to the review packet."],
+                                        "validation_checks": ["Run timeout-heavy tasks."],
+                                        "labels": ["bounded-search"],
+                                        "raw_payload": {"approved": False},
+                                    },
+                                    "raw_payload": {"approved": False},
+                                    "rationale": "Do not leak this reviewer note.",
+                                },
+                                {
+                                    "feedback_id": "hfb_invalid_score",
+                                    "status": "available_for_evolution",
+                                    "normalized_payload": {
+                                        "decision": "approve",
+                                        "score": 1.5,
+                                        "observed_issues": [
+                                            "Invalid score should not be stringified."
+                                        ],
+                                    },
+                                },
+                                {
+                                    "feedback_id": "hfb_drop",
+                                    "status": "rejected_invalid",
+                                    "normalized_payload": {
+                                        "decision": "approve",
+                                        "observed_issues": ["invalid item"],
+                                    },
+                                },
+                                {
+                                    "feedback_id": "hfb_missing_status",
+                                    "normalized_payload": {
+                                        "decision": "revise",
+                                        "observed_issues": ["missing-status issue"],
+                                    },
+                                },
+                                {
+                                    "feedback_id": "hfb_non_string_status",
+                                    "status": {"state": "available_for_evolution"},
+                                    "normalized_payload": {
+                                        "decision": "revise",
+                                        "observed_issues": ["non-string-status issue"],
+                                    },
+                                },
+                                {
+                                    "feedback_id": "hfb_submitted",
+                                    "status": "submitted",
+                                    "normalized_payload": {
+                                        "decision": "revise",
+                                        "observed_issues": ["submitted issue"],
+                                    },
+                                },
+                                {
+                                    "feedback_id": "hfb_validated",
+                                    "status": "validated",
+                                    "normalized_payload": {
+                                        "decision": "revise",
+                                        "observed_issues": ["validated issue"],
+                                    },
+                                },
+                                {
+                                    "feedback_id": "hfb_consumed",
+                                    "status": "consumed",
+                                    "normalized_payload": {
+                                        "decision": "revise",
+                                        "observed_issues": ["consumed issue"],
+                                    },
+                                },
+                            ]
+                        }
+                    },
+                }
+            },
+        )
+    )
+
+    response = store.create_dataset(
+        DatasetCreateRequest(
+            name="human_feedback_dataset",
+            purpose="agent_system_evolution",
+            query={
+                "event_types": ["polar.session_completed"],
+                "status": ["COMPLETED"],
+            },
+        )
+    )
+
+    with store.connect() as conn:
+        dataset_row = conn.execute(
+            "SELECT * FROM datasets WHERE dataset_id = ?",
+            (response.dataset_id,),
+        ).fetchone()
+    manifest_path = Path(dataset_row["manifest_path"])
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    records_path = manifest_path.parent / manifest["records_path"]
+    records = [
+        json.loads(line)
+        for line in records_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+    assert [record["event_id"] for record in records] == [event.event_id]
+    human_feedback = (
+        records[0]["payload"]["session_result"]["metadata"]["evolution_feedback"]["human"]
+    )
+    assert human_feedback == [
+        {
+            "feedback_id": "hfb_keep",
+            "status": "available_for_evolution",
+            "decision": "revise",
+            "confidence": 0.85,
+            "score": 0.72,
+            "observed_issues": ["Still encourages unbounded repository search."],
+            "suggested_changes": ["Add a bounded source inventory step."],
+            "risks": ["May overfit to the review packet."],
+            "validation_checks": ["Run timeout-heavy tasks."],
+            "labels": ["bounded-search"],
+        },
+        {
+            "feedback_id": "hfb_invalid_score",
+            "status": "available_for_evolution",
+            "decision": "approve",
+            "observed_issues": ["Invalid score should not be stringified."],
+        }
+    ]
+    assert "raw_payload" not in json.dumps(records[0], sort_keys=True)
+    assert "Do not leak this reviewer note." not in json.dumps(records[0], sort_keys=True)
+    assert "Nested raw rationale must not leak." not in json.dumps(records[0], sort_keys=True)
+    assert "nested-secret" not in json.dumps(records[0], sort_keys=True)
+    assert "nested raw change must not leak" not in json.dumps(records[0], sort_keys=True)
+    assert "missing-status issue" not in json.dumps(records[0], sort_keys=True)
+    assert "non-string-status issue" not in json.dumps(records[0], sort_keys=True)
+    assert "submitted issue" not in json.dumps(records[0], sort_keys=True)
+    assert "validated issue" not in json.dumps(records[0], sort_keys=True)
+    assert "consumed issue" not in json.dumps(records[0], sort_keys=True)
+
+
+def test_create_dataset_merges_human_feedback_alias(tmp_path):
+    store = EvolutionStore(db_path=tmp_path / "evolution.db", artifact_root=tmp_path / "artifacts")
+    store.initialize()
+    event = store.ingest_event(
+        EventIngestRequest(
+            source="polar",
+            event_type="polar.session_completed",
+            source_event_id="session:human-feedback-alias",
+            task_id="task_human_feedback_alias",
+            session_id="session_human_feedback_alias",
+            status="COMPLETED",
+            reward=0.5,
+            payload={
+                "session_result": {
+                    "trajectory": {"traces": [{"reward": 0.5}]},
+                    "metadata": {
+                        "evolution_feedback": {
+                            "human": [],
+                            "human_feedback": [
+                                {
+                                    "feedback_id": "hfb_alias",
+                                    "status": "available_for_evolution",
+                                    "normalized_payload": {
+                                        "decision": "revise",
+                                        "observed_issues": ["alias feedback survives"],
+                                    },
+                                }
+                            ],
+                        }
+                    },
+                }
+            },
+        )
+    )
+
+    response = store.create_dataset(
+        DatasetCreateRequest(
+            name="human_feedback_alias_dataset",
+            purpose="agent_system_evolution",
+            query={
+                "event_types": ["polar.session_completed"],
+                "status": ["COMPLETED"],
+            },
+        )
+    )
+
+    with store.connect() as conn:
+        dataset_row = conn.execute(
+            "SELECT * FROM datasets WHERE dataset_id = ?",
+            (response.dataset_id,),
+        ).fetchone()
+    manifest_path = Path(dataset_row["manifest_path"])
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    records_path = manifest_path.parent / manifest["records_path"]
+    records = [
+        json.loads(line)
+        for line in records_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+    assert [record["event_id"] for record in records] == [event.event_id]
+    evolution_feedback = records[0]["payload"]["session_result"]["metadata"]["evolution_feedback"]
+    assert evolution_feedback == {
+        "human": [
+            {
+                "feedback_id": "hfb_alias",
+                "status": "available_for_evolution",
+                "decision": "revise",
+                "observed_issues": ["alias feedback survives"],
+            }
+        ]
+    }
+
+
+def test_create_dataset_canonicalizes_human_feedback_from_session_result_aliases(tmp_path):
+    store = EvolutionStore(db_path=tmp_path / "evolution.db", artifact_root=tmp_path / "artifacts")
+    store.initialize()
+    event = store.ingest_event(
+        EventIngestRequest(
+            source="polar",
+            event_type="polar.session_completed",
+            source_event_id="session:human-feedback-session-alias",
+            task_id="task_human_feedback_session_alias",
+            session_id="session_human_feedback_session_alias",
+            status="COMPLETED",
+            reward=0.6,
+            payload={
+                "human_feedback": [
+                    {
+                        "feedback_id": "hfb_payload_alias",
+                        "status": "available_for_evolution",
+                        "normalized_payload": {
+                            "decision": "revise",
+                            "observed_issues": ["payload alias survives"],
+                        },
+                        "raw_payload": {"secret": "payload-secret"},
+                    }
+                ],
+                "session_result": {
+                    "human_feedback": [
+                        {
+                            "feedback_id": "hfb_session_alias",
+                            "status": "available_for_evolution",
+                            "normalized_payload": {
+                                "decision": "revise",
+                                "observed_issues": [
+                                    "session result alias survives",
+                                    {
+                                        "text": "nested safe text ignored",
+                                        "rationale": "nested raw rationale",
+                                    },
+                                ],
+                            },
+                            "raw_payload": {"secret": "session-secret"},
+                            "rationale": "raw session rationale",
+                        }
+                    ],
+                    "metadata": {
+                        "human": [
+                            {
+                                "feedback_id": "hfb_session_alias",
+                                "status": "available_for_evolution",
+                                "normalized_payload": {
+                                    "decision": "revise",
+                                    "suggested_changes": ["metadata merge suggestion"],
+                                    "risks": ["metadata merge risk"],
+                                },
+                            },
+                            {
+                                "feedback_id": "hfb_metadata_human",
+                                "status": "available_for_evolution",
+                                "normalized_payload": {
+                                    "decision": "revise",
+                                    "observed_issues": ["metadata human alias survives"],
+                                },
+                                "raw_payload": {"secret": "metadata-secret"},
+                                "rationale": "raw metadata rationale",
+                            }
+                        ]
+                    },
+                    "trajectory": {"traces": [{"reward": 0.6}]},
+                },
+            },
+        )
+    )
+
+    response = store.create_dataset(
+        DatasetCreateRequest(
+            name="human_feedback_session_alias_dataset",
+            purpose="agent_system_evolution",
+            query={
+                "event_types": ["polar.session_completed"],
+                "status": ["COMPLETED"],
+            },
+        )
+    )
+
+    with store.connect() as conn:
+        dataset_row = conn.execute(
+            "SELECT * FROM datasets WHERE dataset_id = ?",
+            (response.dataset_id,),
+        ).fetchone()
+    manifest_path = Path(dataset_row["manifest_path"])
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    records_path = manifest_path.parent / manifest["records_path"]
+    records = [
+        json.loads(line)
+        for line in records_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+    assert [record["event_id"] for record in records] == [event.event_id]
+    payload = records[0]["payload"]
+    session_result = payload["session_result"]
+    assert "human_feedback" not in payload
+    assert "human_feedback" not in session_result
+    assert "human" not in session_result["metadata"]
+    assert session_result["metadata"]["evolution_feedback"] == {
+        "human": [
+            {
+                "feedback_id": "hfb_payload_alias",
+                "status": "available_for_evolution",
+                "decision": "revise",
+                "observed_issues": ["payload alias survives"],
+            },
+            {
+                "feedback_id": "hfb_session_alias",
+                "status": "available_for_evolution",
+                "decision": "revise",
+                "observed_issues": ["session result alias survives"],
+                "suggested_changes": ["metadata merge suggestion"],
+                "risks": ["metadata merge risk"],
+            },
+            {
+                "feedback_id": "hfb_metadata_human",
+                "status": "available_for_evolution",
+                "decision": "revise",
+                "observed_issues": ["metadata human alias survives"],
+            },
+        ]
+    }
+    rendered_record = json.dumps(records[0], sort_keys=True)
+    assert "raw_payload" not in rendered_record
+    assert "payload-secret" not in rendered_record
+    assert "session-secret" not in rendered_record
+    assert "metadata-secret" not in rendered_record
+    assert "raw session rationale" not in rendered_record
+    assert "raw metadata rationale" not in rendered_record
+    assert "nested raw rationale" not in rendered_record
+
+
+@pytest.mark.parametrize(
+    "shared_feedback",
+    [
+        "Shared evaluator guidance survives.",
+        ["Shared list guidance survives.", "Shared second item survives."],
+    ],
+)
+def test_create_dataset_preserves_non_mapping_metadata_evolution_feedback(
+    tmp_path,
+    shared_feedback,
+):
+    store = EvolutionStore(db_path=tmp_path / "evolution.db", artifact_root=tmp_path / "artifacts")
+    store.initialize()
+    event = store.ingest_event(
+        EventIngestRequest(
+            source="polar",
+            event_type="polar.session_completed",
+            source_event_id=f"session:shared-feedback-{type(shared_feedback).__name__}",
+            task_id="task_shared_feedback",
+            session_id="session_shared_feedback",
+            status="COMPLETED",
+            reward=0.7,
+            payload={
+                "session_result": {
+                    "metadata": {
+                        "evolution_feedback": shared_feedback,
+                        "human_feedback": [
+                            {
+                                "feedback_id": "hfb_shared_preserved",
+                                "status": "available_for_evolution",
+                                "decision": "revise",
+                                "observed_issues": ["human alias survives shared feedback"],
+                            }
+                        ],
+                    },
+                    "trajectory": {"traces": [{"reward": 0.7}]},
+                },
+            },
+        )
+    )
+
+    response = store.create_dataset(
+        DatasetCreateRequest(
+            name=f"shared_feedback_{type(shared_feedback).__name__}",
+            purpose="agent_system_evolution",
+            query={
+                "event_types": ["polar.session_completed"],
+                "status": ["COMPLETED"],
+            },
+        )
+    )
+
+    with store.connect() as conn:
+        dataset_row = conn.execute(
+            "SELECT * FROM datasets WHERE dataset_id = ?",
+            (response.dataset_id,),
+        ).fetchone()
+    manifest_path = Path(dataset_row["manifest_path"])
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    records_path = manifest_path.parent / manifest["records_path"]
+    records = [
+        json.loads(line)
+        for line in records_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+    assert [record["event_id"] for record in records] == [event.event_id]
+    evolution_feedback = records[0]["payload"]["session_result"]["metadata"]["evolution_feedback"]
+    assert evolution_feedback["shared"] == shared_feedback
+    assert evolution_feedback["human"] == [
+        {
+            "feedback_id": "hfb_shared_preserved",
+            "status": "available_for_evolution",
+            "decision": "revise",
+            "observed_issues": ["human alias survives shared feedback"],
+        }
+    ]
+    assert "human_feedback" not in records[0]["payload"]["session_result"]["metadata"]
+
+
+def test_create_dataset_redacts_secrets_from_human_feedback_strings(tmp_path):
+    store = EvolutionStore(db_path=tmp_path / "evolution.db", artifact_root=tmp_path / "artifacts")
+    store.initialize()
+    event = store.ingest_event(
+        EventIngestRequest(
+            source="polar",
+            event_type="polar.session_completed",
+            source_event_id="session:redacted-human-feedback",
+            task_id="task_redacted_feedback",
+            session_id="session_redacted_feedback",
+            status="COMPLETED",
+            reward=0.8,
+            payload={
+                "session_result": {
+                    "metadata": {
+                        "evolution_feedback": {
+                            "human": [
+                                {
+                                    "feedback_id": "hfb_redacted",
+                                    "status": "available_for_evolution",
+                                    "decision": "revise",
+                                    "observed_issues": [
+                                        "ordinary issue text survives",
+                                        (
+                                            "Credentialed URL "
+                                            "https://reviewer:tok_secret@example.com/path"
+                                            "?secret=query_secret#frag"
+                                        ),
+                                        (
+                                            "Credentialed URL with at sign "
+                                            "https://user:p@ss@example.com/path"
+                                        ),
+                                    ],
+                                    "suggested_changes": [
+                                        "Set token=tok_123 and api_key=key_456",
+                                        (
+                                            "Fetch signed URL "
+                                            "https://example.com/download"
+                                            "?X-Amz-Signature=signed-dataset"
+                                            "&AWSAccessKeyId=dataset-access"
+                                            "#signed-fragment"
+                                        ),
+                                        "Fetch short URL https://example.com/download?sig=shortsig",
+                                        (
+                                            "Fetch object "
+                                            "s3://bucket/key?X-Amz-Signature=s3-dataset"
+                                            "#s3-fragment"
+                                        ),
+                                        "Fetch custom polar+artifact://host/path?secret=query-secret#frag",
+                                        "Inspect file:///home/ziyi/.ssh/id_rsa",
+                                        "Inspect /tmp/polar-secret.txt",
+                                        "Inspect /etc/passwd",
+                                        "Inspect /mnt/data/secret.txt",
+                                        "Inspect /gpfs/projects/private/key.txt",
+                                        "Inspect /Users/alice/key.pem",
+                                        "Inspect /secret.txt",
+                                        "Inspect /workspace/prod/key.pem",
+                                        "Inspect /app/secret.txt",
+                                        "Inspect /polar/session/evolution/memory.md",
+                                        "Call route /api/v1/feedback",
+                                        "Probe endpoint /healthz",
+                                        "Call reviews route /v1/reviews",
+                                        r"Open C:\Users\alice\secret.txt",
+                                        r"Open C:\Program Files\secret.txt",
+                                        r"Open C:\Users\Alice Smith\secret.txt",
+                                        r"Open \\server\share\secret.txt",
+                                        "Open C:/Users/Alice/secret.txt",
+                                        "Check postgres://alice:pg_secret@example.com/db",
+                                        "Clone ssh://bob:ssh_secret@example.com/repo",
+                                    ],
+                                    "risks": [
+                                        "password=hunter2 secret=rawsecret",
+                                        "api_key: sk-dataset-colon token: tok-dataset-colon",
+                                        "OPENAI_API_KEY=sk-dataset-env",
+                                        "password: dataset-password secret: dataset-secret",
+                                        "Authorization: Bearer sk-dataset-bearer",
+                                        "AWS_ACCESS_KEY_ID=AKIA_DATASET_ACCESS",
+                                        "access_key_id: AKIA_DATASET_COLON",
+                                        "AWS_SECRET_ACCESS_KEY=dataset-aws-secret",
+                                    ],
+                                    "labels": ["safe-label"],
+                                }
+                            ]
+                        }
+                    },
+                    "trajectory": {"traces": [{"reward": 0.8}]},
+                },
+            },
+        )
+    )
+
+    response = store.create_dataset(
+        DatasetCreateRequest(
+            name="redacted_human_feedback",
+            purpose="agent_system_evolution",
+            query={
+                "event_types": ["polar.session_completed"],
+                "status": ["COMPLETED"],
+            },
+        )
+    )
+
+    with store.connect() as conn:
+        dataset_row = conn.execute(
+            "SELECT * FROM datasets WHERE dataset_id = ?",
+            (response.dataset_id,),
+        ).fetchone()
+    manifest_path = Path(dataset_row["manifest_path"])
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    records_path = manifest_path.parent / manifest["records_path"]
+    records = [
+        json.loads(line)
+        for line in records_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+    assert [record["event_id"] for record in records] == [event.event_id]
+    rendered_record = json.dumps(records[0], sort_keys=True)
+    assert "ordinary issue text survives" in rendered_record
+    assert "safe-label" in rendered_record
+    assert "tok_secret" not in rendered_record
+    assert "query_secret" not in rendered_record
+    assert "p@ss" not in rendered_record
+    assert "https://user:p@ss@example.com/path" not in rendered_record
+    assert "https://ss@example.com/path" not in rendered_record
+    assert "tok_123" not in rendered_record
+    assert "key_456" not in rendered_record
+    assert "signed-dataset" not in rendered_record
+    assert "dataset-access" not in rendered_record
+    assert "shortsig" not in rendered_record
+    assert "s3-dataset" not in rendered_record
+    assert "s3-fragment" not in rendered_record
+    assert "query-secret" not in rendered_record
+    assert "signed-fragment" not in rendered_record
+    assert "X-Amz-Signature" not in rendered_record
+    assert "AWSAccessKeyId" not in rendered_record
+    assert "sig=shortsig" not in rendered_record
+    assert "alice" not in rendered_record
+    assert "pg_secret" not in rendered_record
+    assert "postgres://alice:pg_secret@example.com/db" not in rendered_record
+    assert "bob" not in rendered_record
+    assert "ssh_secret" not in rendered_record
+    assert "ssh://bob:ssh_secret@example.com/repo" not in rendered_record
+    assert "hunter2" not in rendered_record
+    assert "rawsecret" not in rendered_record
+    assert "sk-dataset-colon" not in rendered_record
+    assert "tok-dataset-colon" not in rendered_record
+    assert "sk-dataset-env" not in rendered_record
+    assert "dataset-password" not in rendered_record
+    assert "dataset-secret" not in rendered_record
+    assert "sk-dataset-bearer" not in rendered_record
+    assert "AKIA_DATASET_ACCESS" not in rendered_record
+    assert "AKIA_DATASET_COLON" not in rendered_record
+    assert "dataset-aws-secret" not in rendered_record
+    assert "file://" not in rendered_record
+    assert "/home/ziyi/.ssh/id_rsa" not in rendered_record
+    assert "/tmp/polar-secret.txt" not in rendered_record
+    assert "/etc/passwd" not in rendered_record
+    assert "/mnt/data/secret.txt" not in rendered_record
+    assert "/gpfs/projects/private/key.txt" not in rendered_record
+    assert "/Users/alice/key.pem" not in rendered_record
+    assert "/secret.txt" not in rendered_record
+    assert "/workspace/prod/key.pem" not in rendered_record
+    assert "/app/secret.txt" not in rendered_record
+    assert "/polar/session/evolution/memory.md" not in rendered_record
+    assert "/api/v1/feedback" not in rendered_record
+    assert "/healthz" not in rendered_record
+    assert "/v1/reviews" not in rendered_record
+    assert r"C:\Users\alice\secret.txt" not in rendered_record
+    assert "Program Files" not in rendered_record
+    assert "Alice Smith" not in rendered_record
+    assert "server" not in rendered_record
+    assert "share" not in rendered_record
+    assert "C:/Users/Alice/secret.txt" not in rendered_record
 
 
 def test_create_dataset_accepts_subscription_transcript_trajectory_event(tmp_path):
@@ -747,6 +1389,127 @@ def test_job_claim_heartbeat_and_complete(tmp_path):
         (lineage["parent_artifact_id"], lineage["child_artifact_id"], lineage["relation"])
         for lineage in lineage_rows
     ] == [(dataset.artifact_id, complete["artifact_ids"][0], "job_input")]
+
+
+def test_complete_job_honors_unpromoted_job_config(tmp_path):
+    store = EvolutionStore(db_path=tmp_path / "evolution.db", artifact_root=tmp_path / "artifacts")
+    store.initialize()
+    job = store.create_job(
+        JobCreateRequest(
+            method="text_memory_reflector",
+            job_type="text_memory_mining",
+            config={"promoted": False},
+        )
+    )
+    claim = store.claim_job(
+        WorkerClaimRequest(
+            worker_id="worker_1",
+            capabilities=["text_memory_mining"],
+            lease_seconds=60,
+        )
+    )
+    assert claim.job is not None
+
+    complete = store.complete_job(
+        job.job_id,
+        WorkerCompleteRequest(
+            lease_id=claim.job.lease_id,
+            artifacts=[
+                ArtifactRegisterRequest(
+                    type=ArtifactType.TEXT_MEMORY,
+                    name="worker-promoted-memory",
+                    uri="file:///tmp/memory.md",
+                    promoted=True,
+                )
+            ],
+        ),
+    )
+
+    artifact = store.get_artifact(str(complete["artifact_ids"][0]))
+
+    assert artifact.promoted is False
+
+
+def test_complete_job_records_feedback_applications_for_consumed_human_feedback(tmp_path):
+    store = EvolutionStore(db_path=tmp_path / "evolution.db", artifact_root=tmp_path / "artifacts")
+    store.initialize()
+    review = store.create_review_request(
+        ReviewRequestCreateRequest(
+            review_type="promotion",
+            artifact_ids=["art_candidate"],
+            packet={"questions": ["Approve?"]},
+        )
+    )
+    store.claim_review_request(review.review_id, ReviewClaimRequest(reviewer_id="alice"))
+    feedback = store.submit_human_feedback(
+        review.review_id,
+        HumanFeedbackCreateRequest(
+            reviewer_id="alice",
+            decision="revise",
+            suggested_changes=["Use bounded source inventory."],
+        ),
+    )
+    job = store.create_job(
+        JobCreateRequest(
+            method="agent_system_history_reflector",
+            job_type="agent_system",
+            config={"promoted": False},
+        )
+    )
+    claim = store.claim_job(
+        WorkerClaimRequest(
+            worker_id="worker_1",
+            capabilities=["agent_system"],
+            lease_seconds=60,
+        )
+    )
+    assert claim.job is not None
+
+    complete = store.complete_job(
+        job.job_id,
+        WorkerCompleteRequest(
+            lease_id=claim.job.lease_id,
+            artifacts=[
+                ArtifactRegisterRequest(
+                    type=ArtifactType.AGENT_SYSTEM,
+                    name="feedback-aware-agent-system",
+                    uri="file:///tmp/AGENTS.md",
+                    manifest={
+                        "target_path": "AGENTS.md",
+                        "method": "spoofed_manifest_method",
+                        "human_feedback_ids": [
+                            feedback.feedback_id,
+                            "hfb_external_dataset_feedback",
+                        ],
+                        "human_feedback_application_summary": (
+                            "Applied feedback from memory.md?signature=relative-secret#frag "
+                            "and ?signature=relative-query-secret#frag with "
+                            "bearer:summary-token."
+                        ),
+                    },
+                    promoted=True,
+                )
+            ],
+        ),
+    )
+
+    artifact_id = str(complete["artifact_ids"][0])
+    applications = store.list_feedback_applications(feedback_id=feedback.feedback_id)
+    updated_feedback = store.list_human_feedback(review_id=review.review_id)[0]
+
+    assert complete["state"] == "succeeded"
+    assert updated_feedback.status == "consumed"
+    assert len(applications) == 1
+    assert applications[0].feedback_id == feedback.feedback_id
+    assert applications[0].target_type == "prompt_seed"
+    assert applications[0].target_id == artifact_id
+    assert applications[0].consumed_by_method == "agent_system_history_reflector"
+    assert applications[0].consumed_in_job_id == job.job_id
+    assert "relative-secret" not in applications[0].effect_summary
+    assert "relative-query-secret" not in applications[0].effect_summary
+    assert "summary-token" not in applications[0].effect_summary
+    assert "memory.md?<redacted>" in applications[0].effect_summary
+    assert "[REDACTED]" in applications[0].effect_summary
 
 
 def test_create_job_rejects_missing_input_artifact_ids_without_writes(tmp_path):

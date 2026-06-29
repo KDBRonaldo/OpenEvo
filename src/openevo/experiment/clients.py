@@ -18,6 +18,31 @@ class EvolutionClientProtocol(Protocol):
 
     def create_job(self, payload: dict[str, Any]) -> dict[str, Any]: ...
 
+    def get_artifact(self, artifact_id: str) -> dict[str, Any]: ...
+
+    def update_artifact_promotion(
+        self,
+        artifact_id: str,
+        *,
+        promoted: bool,
+    ) -> dict[str, Any]: ...
+
+    def create_review_request(self, payload: dict[str, Any]) -> dict[str, Any]: ...
+
+    def list_review_requests(self, **filters: Any) -> list[dict[str, Any]]: ...
+
+    def submit_human_feedback(
+        self,
+        review_id: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]: ...
+
+    def list_human_feedback(self, *, review_id: str) -> list[dict[str, Any]]: ...
+
+    def create_feedback_application(self, payload: dict[str, Any]) -> dict[str, Any]: ...
+
+    def create_human_query_decision(self, payload: dict[str, Any]) -> dict[str, Any]: ...
+
 
 class RolloutHttpClient:
     def __init__(
@@ -113,4 +138,93 @@ class EvolutionHttpClient:
         result = response.json()
         if not isinstance(result, dict):
             raise ValueError("evolution job response was not a JSON object")
+        return result
+
+    def get_artifact(self, artifact_id: str) -> dict[str, Any]:
+        encoded_artifact_id = quote(artifact_id, safe="")
+        response = self._client.get(f"{self.base_url}/v1/artifacts/{encoded_artifact_id}")
+        response.raise_for_status()
+        result = response.json()
+        if not isinstance(result, dict):
+            raise ValueError("evolution artifact response was not a JSON object")
+        return result
+
+    def update_artifact_promotion(
+        self,
+        artifact_id: str,
+        *,
+        promoted: bool,
+    ) -> dict[str, Any]:
+        encoded_artifact_id = quote(artifact_id, safe="")
+        response = self._client.patch(
+            f"{self.base_url}/v1/artifacts/{encoded_artifact_id}/promotion",
+            json={"promoted": promoted},
+        )
+        response.raise_for_status()
+        result = response.json()
+        if not isinstance(result, dict):
+            raise ValueError("evolution artifact promotion response was not a JSON object")
+        return result
+
+    def create_review_request(self, payload: dict[str, Any]) -> dict[str, Any]:
+        response = self._client.post(f"{self.base_url}/v1/reviews", json=payload)
+        response.raise_for_status()
+        result = response.json()
+        if not isinstance(result, dict):
+            raise ValueError("evolution review response was not a JSON object")
+        return result
+
+    def list_review_requests(self, **filters: Any) -> list[dict[str, Any]]:
+        params = {key: value for key, value in filters.items() if value is not None}
+        response = self._client.get(f"{self.base_url}/v1/reviews", params=params)
+        response.raise_for_status()
+        result = response.json()
+        if not isinstance(result, list):
+            raise ValueError("evolution review list response was not a JSON array")
+        return result
+
+    def submit_human_feedback(
+        self,
+        review_id: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        encoded_review_id = quote(review_id, safe="")
+        response = self._client.post(
+            f"{self.base_url}/v1/reviews/{encoded_review_id}/feedback",
+            json=payload,
+        )
+        response.raise_for_status()
+        result = response.json()
+        if not isinstance(result, dict):
+            raise ValueError("evolution human feedback response was not a JSON object")
+        return result
+
+    def list_human_feedback(self, *, review_id: str) -> list[dict[str, Any]]:
+        encoded_review_id = quote(review_id, safe="")
+        response = self._client.get(
+            f"{self.base_url}/v1/reviews/{encoded_review_id}/feedback"
+        )
+        response.raise_for_status()
+        result = response.json()
+        if not isinstance(result, list):
+            raise ValueError("evolution human feedback list response was not a JSON array")
+        return result
+
+    def create_feedback_application(self, payload: dict[str, Any]) -> dict[str, Any]:
+        response = self._client.post(
+            f"{self.base_url}/v1/feedback-applications",
+            json=payload,
+        )
+        response.raise_for_status()
+        result = response.json()
+        if not isinstance(result, dict):
+            raise ValueError("evolution feedback application response was not a JSON object")
+        return result
+
+    def create_human_query_decision(self, payload: dict[str, Any]) -> dict[str, Any]:
+        response = self._client.post(f"{self.base_url}/v1/query-decisions", json=payload)
+        response.raise_for_status()
+        result = response.json()
+        if not isinstance(result, dict):
+            raise ValueError("evolution query decision response was not a JSON object")
         return result

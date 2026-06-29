@@ -4,7 +4,7 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class ArtifactType(StrEnum):
@@ -22,6 +22,74 @@ class ArtifactState(StrEnum):
     EXPERIMENTAL = "experimental"
     DEPRECATED = "deprecated"
     BROKEN = "broken"
+
+
+class ReviewType(StrEnum):
+    PROMOTION = "promotion"
+    COMPARISON = "comparison"
+    CRITIQUE = "critique"
+    ANNOTATION = "annotation"
+    VALIDATION = "validation"
+    QUERY_POLICY_AUDIT = "query_policy_audit"
+
+
+class ReviewStatus(StrEnum):
+    CREATED = "created"
+    QUEUED = "queued"
+    ASSIGNED = "assigned"
+    IN_REVIEW = "in_review"
+    SUBMITTED = "submitted"
+    VALIDATED = "validated"
+    ADJUDICATED = "adjudicated"
+    RESOLVED = "resolved"
+    STALE = "stale"
+    NEEDS_REVISION = "needs_revision"
+    REJECTED_INVALID = "rejected_invalid"
+    CONFLICT = "conflict"
+    ARCHIVED_ONLY = "archived_only"
+
+
+class HumanFeedbackStatus(StrEnum):
+    SUBMITTED = "submitted"
+    VALIDATED = "validated"
+    NORMALIZED = "normalized"
+    REJECTED_INVALID = "rejected_invalid"
+    REDACTED = "redacted"
+    INDEXED = "indexed"
+    AVAILABLE_FOR_EVOLUTION = "available_for_evolution"
+    ARCHIVED_ONLY = "archived_only"
+    CONSUMED = "consumed"
+
+
+class HumanFeedbackDecision(StrEnum):
+    APPROVE = "approve"
+    REJECT = "reject"
+    REVISE = "revise"
+    ABSTAIN = "abstain"
+    PREFER_A = "prefer_a"
+    PREFER_B = "prefer_b"
+    TIE = "tie"
+    COMMENT_ONLY = "comment_only"
+
+
+class HumanQueryDecision(StrEnum):
+    ASK_HUMAN = "ask_human"
+    ASK_LLM = "ask_llm"
+    AUTO_PROMOTE = "auto_promote"
+    AUTO_REJECT = "auto_reject"
+    RUN_MORE_EVAL = "run_more_eval"
+    DEFER = "defer"
+
+
+class FeedbackApplicationTargetType(StrEnum):
+    PROMOTION_DECISION = "promotion_decision"
+    PROMPT_SEED = "prompt_seed"
+    MUTATION_CONSTRAINT = "mutation_constraint"
+    NEGATIVE_CONSTRAINT = "negative_constraint"
+    VALIDATION_CHECK = "validation_check"
+    RANKING_SIGNAL = "ranking_signal"
+    DATASET_RECORD = "dataset_record"
+    AUDIT_NOTE = "audit_note"
 
 
 class JobState(StrEnum):
@@ -80,6 +148,10 @@ class ArtifactResponse(BaseModel):
     scores: dict[str, float] = Field(default_factory=dict)
     tags: list[str] = Field(default_factory=list)
     promoted: bool = False
+
+
+class ArtifactPromotionUpdateRequest(BaseModel):
+    promoted: bool
 
 
 class DatasetQuery(BaseModel):
@@ -199,3 +271,172 @@ class ContextResolveResponse(BaseModel):
     skills: list[dict[str, Any]] = Field(default_factory=list)
     adapter_merge_spec: AdapterMergeSpec = Field(default_factory=AdapterMergeSpec)
     selection: dict[str, Any] = Field(default_factory=dict)
+
+
+class ReviewPacket(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    trusted_metadata: dict[str, Any] = Field(default_factory=dict)
+    untrusted_artifact_excerpts: list[dict[str, Any]] = Field(default_factory=list)
+    promotion_support: dict[str, Any] = Field(default_factory=dict)
+    questions: list[str] = Field(default_factory=list)
+
+    def __getitem__(self, key: str) -> Any:
+        return self.model_dump(mode="python")[key]
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return self.model_dump(mode="python").get(key, default)
+
+
+class ReviewPacketResponse(BaseModel):
+    packet_id: str
+    packet_hash: str
+    packet: ReviewPacket = Field(default_factory=ReviewPacket)
+    created_at: str
+
+
+class ReviewRequestCreateRequest(BaseModel):
+    review_type: ReviewType
+    artifact_ids: list[str] = Field(default_factory=list)
+    candidate_ids: list[str] = Field(default_factory=list)
+    job_id: str | None = None
+    task_id: str | None = None
+    round_index: int | None = None
+    method: str | None = None
+    artifact_type: str | None = None
+    packet: ReviewPacket = Field(default_factory=ReviewPacket)
+    artifact_hashes: dict[str, str] = Field(default_factory=dict)
+    query_decision_id: str | None = None
+    query_decision: dict[str, Any] | None = None
+    priority: int = 100
+
+    @model_validator(mode="after")
+    def _require_review_target(self) -> "ReviewRequestCreateRequest":
+        if not any(str(item).strip() for item in self.artifact_ids) and not any(
+            str(item).strip() for item in self.candidate_ids
+        ):
+            raise ValueError("review request must include artifact_ids or candidate_ids")
+        return self
+
+
+class ReviewRequestResponse(BaseModel):
+    review_id: str
+    review_type: ReviewType
+    status: ReviewStatus
+    artifact_ids: list[str] = Field(default_factory=list)
+    candidate_ids: list[str] = Field(default_factory=list)
+    job_id: str | None = None
+    task_id: str | None = None
+    round_index: int | None = None
+    method: str | None = None
+    artifact_type: str | None = None
+    packet_id: str
+    packet_hash: str
+    packet: ReviewPacket = Field(default_factory=ReviewPacket)
+    artifact_hashes: dict[str, str] = Field(default_factory=dict)
+    query_decision_id: str | None = None
+    assigned_to: str | None = None
+    reviewer_role: str | None = None
+    adjudication_rationale: str | None = None
+    priority: int = 100
+    created_at: str
+    updated_at: str
+
+
+class ReviewClaimRequest(BaseModel):
+    reviewer_id: str = Field(min_length=1)
+    reviewer_role: str | None = None
+
+
+class HumanFeedbackCreateRequest(BaseModel):
+    reviewer_id: str = Field(min_length=1)
+    reviewer_role: str | None = None
+    decision: HumanFeedbackDecision
+    score: float | None = Field(default=None, ge=0.0, le=1.0)
+    confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+    rationale: str | None = None
+    observed_issues: list[str] = Field(default_factory=list)
+    suggested_changes: list[str] = Field(default_factory=list)
+    risks: list[str] = Field(default_factory=list)
+    validation_checks: list[str] = Field(default_factory=list)
+    labels: list[str] = Field(default_factory=list)
+    raw_payload: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("score", "confidence", mode="before")
+    @classmethod
+    def _reject_boolean_contract_scores(cls, value: object) -> object:
+        if isinstance(value, bool):
+            raise ValueError("boolean values are not valid numeric contract scores")
+        return value
+
+
+class HumanFeedbackResponse(BaseModel):
+    feedback_id: str
+    review_id: str
+    reviewer_id: str
+    reviewer_role: str | None = None
+    status: HumanFeedbackStatus
+    decision: HumanFeedbackDecision
+    score: float | None = None
+    confidence: float | None = None
+    rationale: str = ""
+    normalized_payload: dict[str, Any] = Field(default_factory=dict)
+    created_at: str
+
+
+class ReviewAdjudicationRequest(BaseModel):
+    status: ReviewStatus = ReviewStatus.ADJUDICATED
+    rationale: str | None = None
+
+
+class FeedbackApplicationCreateRequest(BaseModel):
+    feedback_id: str = Field(min_length=1)
+    target_type: FeedbackApplicationTargetType
+    target_id: str = Field(min_length=1)
+    consumed_by_method: str = Field(min_length=1)
+    consumed_in_job_id: str | None = None
+    effect_summary: str = Field(min_length=1)
+
+
+class FeedbackApplicationResponse(BaseModel):
+    application_id: str
+    feedback_id: str
+    target_type: FeedbackApplicationTargetType
+    target_id: str
+    consumed_by_method: str
+    consumed_in_job_id: str | None = None
+    effect_summary: str
+    created_at: str
+
+
+class HumanQueryDecisionCreateRequest(BaseModel):
+    artifact_ids: list[str] = Field(default_factory=list)
+    candidate_ids: list[str] = Field(default_factory=list)
+    task_id: str | None = None
+    round_index: int | None = None
+    method: str | None = None
+    decision: HumanQueryDecision
+    reason_codes: list[str] = Field(default_factory=list)
+    estimated_value_of_information: float | None = Field(default=None, ge=0.0)
+    estimated_human_cost: float | None = Field(default=None, ge=0.0)
+    budget_context: dict[str, Any] = Field(default_factory=dict)
+
+
+class HumanQueryDecisionResponse(BaseModel):
+    query_decision_id: str
+    artifact_ids: list[str] = Field(default_factory=list)
+    candidate_ids: list[str] = Field(default_factory=list)
+    task_id: str | None = None
+    round_index: int | None = None
+    method: str | None = None
+    decision: HumanQueryDecision
+    reason_codes: list[str] = Field(default_factory=list)
+    estimated_value_of_information: float | None = None
+    estimated_human_cost: float | None = None
+    budget_context: dict[str, Any] = Field(default_factory=dict)
+    actual_latency_seconds: float | None = None
+    feedback_changed_promotion: bool | None = None
+    feedback_changed_next_candidate: bool | None = None
+    downstream_delta: float | None = None
+    review_id: str | None = None
+    created_at: str

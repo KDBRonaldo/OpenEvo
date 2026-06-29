@@ -86,6 +86,54 @@ def test_register_artifact_persists_manifest(tmp_path):
     }
 
 
+def test_update_artifact_promotion_controls_context_selection(tmp_path):
+    store = EvolutionStore(db_path=tmp_path / "evolution.db", artifact_root=tmp_path / "artifacts")
+    store.initialize()
+    memory_path = tmp_path / "memory.md"
+    memory_path.write_text("remember this", encoding="utf-8")
+
+    artifact = store.register_artifact(
+        ArtifactRegisterRequest(
+            type=ArtifactType.TEXT_MEMORY,
+            name="pending memory",
+            uri=memory_path.as_uri(),
+            manifest={"content_path": "memory.md"},
+            compatibility={"task_tags": ["calculator"]},
+            promoted=False,
+        )
+    )
+
+    missing_context = store.resolve_context(
+        ContextResolveRequest(
+            task_id="calculator",
+            instruction="Solve.",
+            metadata={"task_tags": ["calculator"]},
+        )
+    )
+    assert missing_context.memory["artifact_ids"] == []
+
+    promoted = store.update_artifact_promotion(artifact.artifact_id, promoted=True)
+
+    assert promoted.promoted is True
+    matching_context = store.resolve_context(
+        ContextResolveRequest(
+            task_id="calculator",
+            instruction="Solve.",
+            metadata={"task_tags": ["calculator"]},
+        )
+    )
+    assert matching_context.memory["artifact_ids"] == [artifact.artifact_id]
+
+    with store.connect() as conn:
+        row = conn.execute(
+            "SELECT promoted, manifest_path FROM artifacts WHERE artifact_id = ?",
+            (artifact.artifact_id,),
+        ).fetchone()
+    assert row["promoted"] == 1
+    manifest = json.loads(Path(row["manifest_path"]).read_text(encoding="utf-8"))
+    assert manifest["promoted"] is True
+
+
 def test_register_artifact_normalizes_nested_json_metadata(tmp_path):
     store = EvolutionStore(db_path=tmp_path / "evolution.db", artifact_root=tmp_path / "artifacts")
     store.initialize()

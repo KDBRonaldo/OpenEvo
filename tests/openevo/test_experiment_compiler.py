@@ -218,6 +218,90 @@ def test_evolution_job_payloads_include_ordered_methods_and_reflector_llm() -> N
     }
 
 
+def test_evolution_jobs_are_unpromoted_when_promotion_gate_is_enabled() -> None:
+    compiled = compile_experiment(
+        _config(
+            evolution={
+                "promotion_gate": {
+                    "mode": "llm",
+                    "min_score": 0.8,
+                }
+            }
+        )
+    )
+
+    jobs = compiled.evolution_job_payloads_for_round(
+        0,
+        dataset_artifact_id="dataset_artifact_1",
+        context_artifact_ids=[],
+    )
+
+    assert all(job["config"]["promoted"] is False for job in jobs)
+    assert jobs[0]["config"]["promotion_gate"]["mode"] == "llm"
+    assert jobs[0]["config"]["promotion_contract"] == {
+        "required": True,
+        "fields": [
+            "trajectory_findings",
+            "proposed_changes",
+            "expected_benefits",
+            "risks",
+            "validation_checks",
+        ],
+    }
+
+
+def test_promotion_gate_accepts_human_input_mode() -> None:
+    compiled = compile_experiment(
+        _config(
+            evolution={
+                "promotion_gate": {
+                    "mode": "human",
+                    "human_input": "tui",
+                }
+            }
+        )
+    )
+
+    jobs = compiled.tasks[0].evolution_job_payloads_for_round(
+        0,
+        compiled.evolution_methods_for_round(0),
+        dataset_artifact_id="dataset_artifact_1",
+        context_artifact_ids=[],
+    )
+
+    assert compiled.promotion_gate["human_input"] == "tui"
+    assert jobs[0]["config"]["promotion_gate"]["human_input"] == "tui"
+
+
+def test_evolution_job_payloads_do_not_persist_promotion_llm_secrets() -> None:
+    compiled = compile_experiment(
+        _config(
+            evolution={
+                "promotion_gate": {
+                    "mode": "llm",
+                    "min_score": 0.8,
+                    "llm": {
+                        "provider": "openai_chat",
+                        "model": "reviewer-model",
+                        "api_key": "secret-reviewer-key",
+                        "base_url": "http://reviewer.test/v1",
+                    },
+                }
+            }
+        )
+    )
+
+    jobs = compiled.evolution_job_payloads_for_round(
+        0,
+        dataset_artifact_id="dataset_artifact_1",
+        context_artifact_ids=[],
+    )
+
+    assert "secret-reviewer-key" in str(compiled.promotion_gate)
+    assert "secret-reviewer-key" not in str(jobs)
+    assert "llm" not in jobs[0]["config"]["promotion_gate"]
+
+
 def test_evolution_job_compatibility_uses_single_task_scoped_tag() -> None:
     config = _config(
         tasks=[

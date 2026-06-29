@@ -123,7 +123,16 @@ trial name、task instruction、task path 和 verifier failed-test 摘要会作�
 | `POST /v1/jobs/{job_id}/complete` | Worker 提交 artifacts |
 | `POST /v1/jobs/{job_id}/fail` | Worker 标记失败 |
 | `POST /v1/artifacts` | 直接注册外部 artifact |
+| `GET /v1/artifacts/{artifact_id}` | 读取 artifact metadata 和 manifest |
+| `PATCH /v1/artifacts/{artifact_id}/promotion` | 切换 artifact 的 promoted 状态，body 必须显式包含 `promoted` |
 | `POST /v1/contexts/resolve` | Gateway 为新 session 解析可注入 context |
+| `POST /v1/reviews` | 创建 durable HITL review request 和 immutable review packet |
+| `GET /v1/reviews` / `GET /v1/reviews/{review_id}` | 查询 pending/resolved review request |
+| `POST /v1/reviews/{review_id}/claim` | 标记 reviewer claim / in-review |
+| `POST /v1/reviews/{review_id}/feedback` | 提交 typed human feedback |
+| `POST /v1/reviews/{review_id}/adjudicate` / `resolve` / `mark-stale` | 记录 adjudication、resolved 或 stale lifecycle 状态 |
+| `POST /v1/query-decisions` | 记录本轮为什么询问或不询问 human |
+| `POST /v1/feedback-applications` | 记录 human feedback 被后续方法或 promotion decision 消费 |
 
 `job_type` 是 claim selector，`method` 是 worker 内部执行的算法名。reference worker 默认让
 二者同名，例如 `job_type=agent_system, method=agent_system`。专用 research worker 可以用
@@ -158,6 +167,112 @@ Worker complete 和 direct artifact registration 都使用同一类 artifact pay
 - `compatibility`：context resolver 的过滤条件；为空表示全局匹配。
 - `scores`：resolver 排序依据，目前优先使用 `quality`，其次 `heldout_reward_delta`。
 - `promoted`：只有 promoted 且 active/experimental 的 artifacts 会进入 context resolve。
+- `manifest.promotion_support`：启用 runner/backend promotion gate 时，算法应写入
+  `trajectory_findings`、`proposed_changes`、`expected_benefits`、`risks` 和
+  `validation_checks`。Gate 会先评估这些材料，并读取 bounded `file://` artifact 内容摘录
+  放入 review packet，再决定是否调用 backend promotion API。Backend 会强制
+  `job.config.promoted=false` 的输出保持 unpromoted，即使 worker 提交了 `promoted=true`。
+  Runner 只会从本次运行的 artifact output root 读取摘录；指向该 root 外部的 `file://` URI
+  会在 packet 中标记为 unavailable。发给 LLM reviewer 的 packet 会 sanitize artifact
+  metadata 中的 URI 字段，移除 top-level 和 nested manifest URI value 的 userinfo、
+  fragment 和 query string，包括 relative URI reference 上的 query；LLM reviewer 的
+  `score` 必须存在且是有限的 `0..1` 数值，缺失或非数值 score 会拒绝。
+  Promotion API 要求 `PATCH /v1/artifacts/{artifact_id}/promotion` body 显式包含
+  `{"promoted": true}` 或 `{"promoted": false}`；空 body 不会默认 promote。一个 method
+  输出多个候选 artifact 时，gate 可以只 approve 其中一部分；human gate 会先写完同一
+  review set 的所有 packet，再用一个共享 `decision_timeout_seconds` 窗口等待全部 decision
+  文件，partial/malformed decision JSON 会继续保持 pending 直到写入合法 decision 或超时；
+  `human_input=auto` 在 stdin/stdout 都是 TTY 时用 terminal prompt 直接询问 approve/reject/
+  comment，否则回退到 decision files。`human_input=file` 强制文件模式，`human_input=tui`
+  要求 terminal prompt；human decision 的 `score` 可选，但如果提供也必须是有限的 `0..1`
+  数值。Human decision 还可以携带 `human_feedback`，其中可包含 `observed_issues`、
+  `suggested_changes`、`risks` 和 `validation_checks`；这些 insight 会进入 promotion review
+  记录，但不会替代 `approved` 的 promotion 判定。Runner 只 promotion 通过的候选。如果
+  gated job 没有产出目标 artifact type，gate 会以 `missing_target_artifact` 拒绝。
+
+## HITL Review Lifecycle
+
+Human promotion gate 不只是本地 approve/reject 机制。Backend 会把 review packet、
+human feedback、query decision 和 feedback application 当作 durable lifecycle objects
+保存，runner 可以在异步 review 时停在 `pending_review`，由后续 orchestrator 在 reviewer
+提交 feedback 后恢复 promotion 或继续 evolution。
+
+Runner 行为：
+
+- `human_input=file` / `human_input=tui` / `human_input=auto` 仍然保留。没有 backend
+  review API 或 query-decision API 的旧 client 会继续使用本地 packet、decision file 和
+  terminal prompt 路径。
+- 当 evolution client 支持 `create_review_request` 时，runner 会把本地 packet 转成 backend
+  review request。Review request 是异步对象；`decision_timeout_seconds=0` 时 runner 可写出
+  packet、创建 backend review，然后以 `pending_review` 结束当前 run。创建 request 时必须为
+  被 review 的 artifact ID 写入 `sha256:` 前缀的 `artifact_hashes`，用于把 feedback 绑定到
+  reviewer 实际看到的 artifact metadata/content 摘要。
+  Backend 会在计算 `packet_hash` 和持久化 `packet_json` 前递归 sanitize packet，包括 extra
+  fields、nested artifact URI/path fields、userinfo URL、query/fragment token 和 secret-like
+  key/value；GET/list review API 只返回 sanitized packet。
+- Runner 会在 review request payload 中嵌入一个 deterministic query-decision payload；
+  支持该字段的 backend 会在 `POST /v1/reviews` 同一事务中创建 query decision、创建 review
+  request，并把返回的 `query_decision_id` 写入 review response。当前策略固定为：
+
+```json
+{
+  "decision": "ask_human",
+  "reason_codes": ["promotion_gate_targeted", "human_gate"],
+  "estimated_value_of_information": null,
+  "estimated_human_cost": null,
+  "budget_context": {}
+}
+```
+
+`artifact_ids`、`candidate_ids`、`task_id`、`round_index` 和 `method` 来自 review packet。
+如果 backend review request 创建失败，runner 保留本地 pending review，并在 review 记录上写入
+backend failure metadata；因为 query decision 在 review-create transaction 内创建，不会留下
+已创建但未链接 review 的孤立 query decision。旧 backend 如果忽略 `query_decision` 字段，仍可
+创建 review request，但不会记录 query-decision log。后续可以把这个 deterministic payload 替换成
+learned / budgeted policy，但当前实现是 fully deterministic `ask_human` policy。
+
+Typed feedback contract：
+
+- `HumanFeedback` 至少包含 `feedback_id`、`review_id`、`reviewer_id`、`decision`、
+  `status`、`raw_payload` 和 `normalized_payload`。可复用的状态是
+  `available_for_evolution`；`rejected_invalid`、`archived_only` 或 stale review feedback 只保留
+  audit，不进入 evolution signal。
+- typed 字段包括 `score`、`confidence`、`rationale`、`observed_issues`、
+  `suggested_changes`、`risks`、`validation_checks`、`labels` 和 preference/pairwise 结果。
+  `score` 和 `confidence` 接受 0..1 的 int/float，但拒绝 JSON boolean，避免 `true`/`false`
+  被强制转换成 `1.0`/`0.0`。Raw reviewer payload 只能用于审计；未来 agent 和 worker methods
+  只能消费 normalized/redacted payload。
+- Promotion resume 只从 post-review request 状态消费 available feedback，例如
+  `submitted`、`validated`、`adjudicated` 和 `resolved`。`queued`、`in_review` 等 pre-submission
+  状态保持 `pending_review`；`stale`、`rejected_invalid`、`archived_only` 等 invalid/archive
+  状态不能 promotion。Resume 还必须确认 request 中每个 targeted artifact 的
+  `artifact_hashes[artifact_id]` 存在且匹配当前 artifact/review hash；缺失 hash 保持
+  `pending_review`，hash mismatch 作为 stale review 拒绝，不会应用已有 approve feedback。
+- Backend 在 feedback 进入 `available_for_evolution` 前 sanitize `normalized_payload`，包括
+  `rationale`、`observed_issues`、`suggested_changes`、`risks`、`validation_checks` 和
+  `labels`。`raw_payload` 仍只作为 audit storage，不会通过 feedback GET/list 或 resume
+  输出暴露。
+- Dataset 物化会把 sanitized human feedback 放在
+  `payload.session_result.metadata.evolution_feedback.human`，不会暴露 raw payload、secret、
+  credentialed URI、raw ground truth 或 protected evaluator literals。
+- 消费 human feedback 的 worker method 应在 artifact manifest/lineage 中记录
+  `human_feedback_ids` 和 `human_feedback_count`。如果 method 在 prompt、candidate archive 或
+  promotion support 中 disclosure 了共享 feedback，也要把这个事实写入 manifest/report，便于审计。
+- `FeedbackApplication` 记录 downstream consumption，例如 promotion decision、prompt seed、
+  mutation constraint、negative constraint、validation check、ranking signal 或 dataset record。
+  Worker 完成 job 并注册带有 `manifest.human_feedback_ids` 的 artifact 时，backend 会为本
+  backend 已知且可消费的 feedback id 自动创建 application 记录，`target_id` 指向输出 artifact，
+  `consumed_in_job_id` 指向当前 job；外部 dataset 携带但本 backend 不认识的 feedback id 不阻塞
+  artifact 注册。
+  没有 application 记录时，系统不能声称某条 human feedback 改变了后续 evolution。
+
+当前限制：
+
+- 还没有 RLHF、reward model、DPO/PPO 或 learned query policy；human feedback 是 typed
+  evolution signal，不是 token-level training target。
+- Query policy 还不会估算真实 value-of-information / cost，也不会按 reviewer budget 排队。
+- Raw reviewer payload、未 redacted freeform 文本和 reviewer 看到的 untrusted artifact excerpt
+  不应暴露给未来 agents；只允许 normalized/redacted feedback 进入 dataset 和 method prompt。
 
 ## Artifact 类型
 
@@ -296,8 +411,8 @@ reflector model，默认最多重写两次；重写后仍失败则 job 报错。
 ```
 
 输出 manifest 会包含 source dataset、record count、reflected record count、success count 和
-failure count，以及 `reflector_provider` / `reflector_model` 和 `agent_system_audit`；
-lineage 会记录 `method=agent_system_reflector` 和所有 input artifact IDs。
+failure count，以及 `reflector_provider` / `reflector_model`、`agent_system_audit` 和
+`promotion_support`；lineage 会记录 `method=agent_system_reflector` 和所有 input artifact IDs。
 
 `agent_system_history_reflector` 使用同一套 `reflector_llm` 配置和安全约束，但输入可以包含
 多个 dataset artifacts。每个 dataset manifest 应尽量写入 `round` 或 `round_number`、

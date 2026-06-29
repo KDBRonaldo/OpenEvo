@@ -10,7 +10,13 @@ import pytest
 
 from polar_evolution.cli import _parse_capabilities
 from polar_evolution.methods import METHOD_REGISTRY, _audit_agent_system_markdown, run_method
-from polar_evolution.models import ArtifactType, ContextResolveRequest, WorkerClaimedJob
+from polar_evolution.models import (
+    ArtifactType,
+    ContextResolveRequest,
+    DatasetCreateRequest,
+    EventIngestRequest,
+    WorkerClaimedJob,
+)
 from polar_evolution.store import EvolutionStore
 from polar_evolution.worker import run_once
 
@@ -1512,6 +1518,463 @@ def test_agent_system_history_reflector_uses_round_history_and_deltas(
     ]
 
 
+def test_agent_system_history_reflector_consumes_human_feedback(
+    tmp_path,
+    monkeypatch,
+):
+    captured = _patch_reflector_llm(
+        monkeypatch,
+        content=(
+            "# Human Feedback Aware Agent System\n\n"
+            "Add bounded source inventory checks from prior human review."
+        ),
+    )
+    round1 = _history_round_dataset_artifact(
+        tmp_path,
+        round_number=1,
+        precision=0.2,
+        recall=0.6,
+        f1=0.3,
+        record={
+            "event_id": "evt_human_review",
+            "task_id": "task_human_review",
+            "session_id": "session_human_review",
+            "status": "COMPLETED",
+            "reward": 0.3,
+            "evolution_feedback": {
+                "feedback_id": "hfb_direct_record_feedback",
+                "status": "available_for_evolution",
+                "decision": "evaluator-summary",
+                "observed_issues": ["Direct evaluator feedback should stay generic."],
+            },
+            "human": [
+                {
+                    "feedback_id": "hfb_record_human",
+                    "status": "available_for_evolution",
+                    "decision": "revise",
+                    "score": 1.5,
+                    "observed_issues": ["Record-level human alias survives."],
+                    "raw_payload": {"secret": "record-human-secret"},
+                }
+            ],
+            "human_feedback": [
+                {
+                    "feedback_id": "hfb_bounded_search",
+                    "status": "available_for_evolution",
+                    "decision": "revise",
+                    "suggested_changes": ["Record-level merge suggestion."],
+                    "labels": ["record-merge"],
+                }
+            ],
+            "payload": {
+                "session_result": {
+                    "metadata": {
+                        "evolution_feedback": {
+                            "golden_standard": "Non-human aggregate remains visible.",
+                            "review_summary": "Safe shared evaluator note survives.",
+                            "raw_payload": {
+                                "secret": "shared-raw-secret",
+                                "path": "/secret.txt",
+                            },
+                            "rationale": (
+                                "Shared rationale leaks /secret.txt and "
+                                "Authorization: Bearer shared-bearer"
+                            ),
+                            "debug": {
+                                "authorization": "Authorization: Bearer shared-bearer",
+                                "AWS_ACCESS_KEY_ID": "AKIA_SHARED_ACCESS",
+                                "access_key_id": "AKIA_SHARED_COLON",
+                                "signed_url": (
+                                    "https://example.com/download"
+                                    "?X-Amz-Signature=shared-sig#frag"
+                                ),
+                                "file_path": "/secret.txt",
+                                "workspace_path": "/workspace/prod/key.pem",
+                                "app_path": "/app/secret.txt",
+                                "polar_path": "/polar/session/evolution/memory.md",
+                                "windows_program_path": r"C:\Program Files\secret.txt",
+                                "windows_user_path": r"C:\Users\Alice Smith\secret.txt",
+                                "unc_path": r"\\server\share\secret.txt",
+                                "safe_route": (
+                                    "Keep route /api/v1/feedback, /healthz, "
+                                    "and /v1/reviews."
+                                ),
+                                "safe_detail": "Nested safe shared detail survives.",
+                            },
+                            "review_feedback": {
+                                "status": "submitted",
+                                "observed_issues": [
+                                    "Submitted shared review feedback must not render."
+                                ],
+                            },
+                            "statusless_review_feedback": {
+                                "observed_issues": [
+                                    "Statusless shared review feedback must not render."
+                                ],
+                            },
+                            "stateful_summary": {
+                                "status": "submitted",
+                                "summary": "Premature reviewer summary must not render.",
+                            },
+                            "available_stateful_summary": {
+                                "status": "available_for_evolution",
+                                "summary": "Available evaluator summary survives.",
+                            },
+                            "reviewer_rationale": "Reviewer rationale must not render.",
+                            "adjudication_rationale": (
+                                "Adjudication rationale must not render."
+                            ),
+                            "human": [
+                                {
+                                    "feedback_id": "hfb_bounded_search",
+                                    "status": "available_for_evolution",
+                                    "decision": "revise",
+                                    "confidence": 0.9,
+                                    "score": 0.67,
+                                    "observed_issues": [
+                                        "Still encourages unbounded repository search.",
+                                        "Do not log Authorization: Bearer sk-prompt-bearer",
+                                        "Do not log Bearer standalone-prompt-bearer",
+                                        "Do not log AWS_ACCESS_KEY_ID=AKIA_PROMPT_ACCESS",
+                                        "Do not log AKIASTANDALONEPROMPT",
+                                        "Do not log access_key_id: AKIA_PROMPT_COLON",
+                                        {
+                                            "text": "Nested typed issue.",
+                                            "rationale": "Nested method rationale must not leak.",
+                                            "raw_payload": {"secret": "nested-method-secret"},
+                                        },
+                                    ],
+                                    "suggested_changes": [
+                                        "Add a bounded source inventory step.",
+                                        (
+                                            "Avoid signed URL "
+                                            "https://example.com/download"
+                                            "?X-Amz-Signature=signed-prompt"
+                                            "&AWSAccessKeyId=prompt-access"
+                                            "#signed-fragment"
+                                        ),
+                                        "Avoid short URL https://example.com/download?sig=prompt-sig",
+                                        (
+                                            "Avoid object "
+                                            "s3://bucket/key?X-Amz-Signature=s3-prompt"
+                                            "#s3-fragment"
+                                        ),
+                                        "Avoid custom polar+artifact://host/path?secret=query-secret#frag",
+                                        (
+                                            "Avoid credentialed URL "
+                                            "https://reviewer:prompt_token@example.com/path"
+                                            "?secret=prompt_query_secret#frag"
+                                        ),
+                                        (
+                                            "Avoid credentialed URL with at sign "
+                                            "https://user:p@ss@example.com/path"
+                                        ),
+                                        "Avoid postgres://alice:prompt_pg_secret@example.com/db",
+                                        ["nested method change must not leak"],
+                                    ],
+                                    "risks": [
+                                        "May overfit to one review packet.",
+                                        "Do not log password=prompt_password",
+                                        "Do not log api_key: sk-prompt-colon",
+                                        "Do not log token: tok-prompt-colon",
+                                        "Do not log secret: prompt-secret-colon",
+                                        "Do not log OPENAI_API_KEY=sk-prompt-env",
+                                        "Do not clone ssh://bob:prompt_ssh_secret@example.com/repo",
+                                    ],
+                                    "validation_checks": [
+                                        "Run timeout-heavy tasks.",
+                                        "Do not log AWS_SECRET_ACCESS_KEY=prompt-aws-secret",
+                                        "Do not inspect file:///tmp/prompt-secret.txt",
+                                        "Do not inspect /secret.txt",
+                                        "Do not inspect /tmp/polar-secret.txt",
+                                        "Do not inspect /etc/passwd",
+                                        "Do not inspect /mnt/data/secret.txt",
+                                        "Do not inspect /scratch/alice/.aws/credentials",
+                                        "Do not inspect /Users/alice/key.pem",
+                                        r"Do not open C:\Users\alice\secret.txt",
+                                        "Do not open C:/Users/Alice/secret.txt",
+                                    ],
+                                    "labels": ["bounded-search"],
+                                    "raw_payload": {"approved": False},
+                                    "rationale": "Do not leak raw reviewer prose.",
+                                },
+                                {
+                                    "feedback_id": "hfb_missing_status",
+                                    "decision": "revise",
+                                    "observed_issues": ["missing-status prompt issue"],
+                                },
+                                {
+                                    "feedback_id": "hfb_non_string_status",
+                                    "status": ["available_for_evolution"],
+                                    "decision": "revise",
+                                    "observed_issues": ["non-string-status prompt issue"],
+                                },
+                                {
+                                    "feedback_id": "hfb_submitted",
+                                    "status": "submitted",
+                                    "decision": "revise",
+                                    "observed_issues": ["submitted prompt issue"],
+                                },
+                                {
+                                    "feedback_id": "hfb_validated",
+                                    "status": "validated",
+                                    "decision": "revise",
+                                    "observed_issues": ["validated prompt issue"],
+                                },
+                                {
+                                    "feedback_id": "hfb_consumed",
+                                    "status": "consumed",
+                                    "decision": "revise",
+                                    "observed_issues": ["consumed prompt issue"],
+                                }
+                            ]
+                        }
+                    }
+                }
+            },
+        },
+    )
+    job = _job(
+        "agent_system_history_reflector",
+        tmp_path,
+        input_artifacts=[round1],
+        config={
+            "name": "history-human-feedback",
+            "reflector_llm": {
+                "model": "reflector-model",
+                "base_url": "http://reflector.test/v1",
+                "api_key": "secret",
+            },
+            "promotion_support": {
+                "trajectory_findings": ["Configured reviewer finding stays visible."]
+            },
+        },
+    )
+
+    artifact = run_method(job, artifact_root=tmp_path / "artifacts")[0]
+
+    prompt = captured["json"]["messages"][1]["content"]
+    assert "Human feedback signals" in prompt
+    assert "hfb_bounded_search" in prompt
+    assert "hfb_record_human" in prompt
+    assert "status=available_for_evolution" in prompt
+    assert "decision=revise" in prompt
+    assert "score=0.670" in prompt
+    assert "score=1.500" not in prompt
+    assert "Still encourages unbounded repository search." in prompt
+    assert prompt.count("Still encourages unbounded repository search.") == 1
+    assert "Record-level human alias survives." in prompt
+    assert "Record-level merge suggestion." in prompt
+    assert prompt.count("Direct evaluator feedback should stay generic.") == 1
+    assert "Feedback Id: hfb_direct_record_feedback" in prompt
+    assert "Add a bounded source inventory step." in prompt
+    assert "prompt_token" not in prompt
+    assert "prompt_query_secret" not in prompt
+    assert "signed-prompt" not in prompt
+    assert "prompt-access" not in prompt
+    assert "prompt-sig" not in prompt
+    assert "s3-prompt" not in prompt
+    assert "s3-fragment" not in prompt
+    assert "query-secret" not in prompt
+    assert "signed-fragment" not in prompt
+    assert "X-Amz-Signature" not in prompt
+    assert "AWSAccessKeyId" not in prompt
+    assert "sig=prompt-sig" not in prompt
+    assert "p@ss" not in prompt
+    assert "https://user:p@ss@example.com/path" not in prompt
+    assert "https://ss@example.com/path" not in prompt
+    assert "alice" not in prompt
+    assert "prompt_pg_secret" not in prompt
+    assert "postgres://alice:prompt_pg_secret@example.com/db" not in prompt
+    assert "bob" not in prompt
+    assert "prompt_ssh_secret" not in prompt
+    assert "ssh://bob:prompt_ssh_secret@example.com/repo" not in prompt
+    assert "prompt_password" not in prompt
+    assert "sk-prompt-colon" not in prompt
+    assert "tok-prompt-colon" not in prompt
+    assert "prompt-secret-colon" not in prompt
+    assert "sk-prompt-env" not in prompt
+    assert "sk-prompt-bearer" not in prompt
+    assert "standalone-prompt-bearer" not in prompt
+    assert "AKIA_PROMPT_ACCESS" not in prompt
+    assert "AKIASTANDALONEPROMPT" not in prompt
+    assert "AKIA_PROMPT_COLON" not in prompt
+    assert "prompt-aws-secret" not in prompt
+    assert "file://" not in prompt
+    assert "/tmp/prompt-secret.txt" not in prompt
+    assert "/tmp/polar-secret.txt" not in prompt
+    assert "/etc/passwd" not in prompt
+    assert "/mnt/data/secret.txt" not in prompt
+    assert "/scratch/alice/.aws/credentials" not in prompt
+    assert "/Users/alice/key.pem" not in prompt
+    assert "/secret.txt" not in prompt
+    assert "/workspace/prod/key.pem" not in prompt
+    assert "/app/secret.txt" not in prompt
+    assert "/polar/session/evolution/memory.md" not in prompt
+    assert r"C:\Users\alice\secret.txt" not in prompt
+    assert "Program Files" not in prompt
+    assert "Alice Smith" not in prompt
+    assert "server" not in prompt
+    assert "C:/Users/Alice/secret.txt" not in prompt
+    assert "/api/v1/feedback" not in prompt
+    assert "/healthz" not in prompt
+    assert "/v1/reviews" not in prompt
+    assert "Non-human aggregate remains visible." in prompt
+    assert "Safe shared evaluator note survives." in prompt
+    assert "Nested safe shared detail survives." in prompt
+    assert "raw_payload" not in prompt
+    assert "shared-raw-secret" not in prompt
+    assert "Shared rationale leaks" not in prompt
+    assert "shared-bearer" not in prompt
+    assert "AKIA_SHARED_ACCESS" not in prompt
+    assert "AKIA_SHARED_COLON" not in prompt
+    assert "shared-sig" not in prompt
+    assert "Submitted shared review feedback must not render." not in prompt
+    assert "Statusless shared review feedback must not render." not in prompt
+    assert "Premature reviewer summary must not render." not in prompt
+    assert "Status: submitted" not in prompt
+    assert "Available evaluator summary survives." in prompt
+    assert "Reviewer rationale must not render." not in prompt
+    assert "Adjudication rationale must not render." not in prompt
+    assert "record-human-secret" not in prompt
+    assert "Do not leak raw reviewer prose." not in prompt
+    assert "Nested method rationale must not leak." not in prompt
+    assert "nested-method-secret" not in prompt
+    assert "nested method change must not leak" not in prompt
+    assert "missing-status prompt issue" not in prompt
+    assert "non-string-status prompt issue" not in prompt
+    assert "status=submitted" not in prompt
+    assert "submitted prompt issue" not in prompt
+    assert "status=validated" not in prompt
+    assert "validated prompt issue" not in prompt
+    assert "status=consumed" not in prompt
+    assert "consumed prompt issue" not in prompt
+    assert artifact.manifest["human_feedback_ids"] == [
+        "hfb_record_human",
+        "hfb_bounded_search",
+    ]
+    assert artifact.manifest["human_feedback_count"] == 2
+    assert artifact.manifest["shared_evolution_feedback_ids"] == [
+        "hfb_direct_record_feedback"
+    ]
+    assert artifact.manifest["shared_evolution_feedback_count"] == 1
+    assert (
+        "Configured reviewer finding stays visible."
+        in artifact.manifest["promotion_support"]["trajectory_findings"]
+    )
+    assert (
+        "Included 2 human feedback item(s) from prior reviews."
+        in artifact.manifest["promotion_support"]["trajectory_findings"]
+    )
+    assert (
+        "Included 1 shared evolution feedback item(s) from prior evaluator signals."
+        in artifact.manifest["promotion_support"]["trajectory_findings"]
+    )
+
+
+def test_agent_system_history_reflector_consumes_store_sanitized_human_feedback(
+    tmp_path,
+    monkeypatch,
+):
+    captured = _patch_reflector_llm(
+        monkeypatch,
+        content=(
+            "# Store Sanitized Feedback Agent System\n\n"
+            "- When repository scanning risks timeout, before extraction build a bounded "
+            "source inventory and validate that the final answer cites only inventoried "
+            "inputs."
+        ),
+    )
+    store = EvolutionStore(db_path=tmp_path / "evolution.db", artifact_root=tmp_path / "store")
+    store.initialize()
+    store.ingest_event(
+        EventIngestRequest(
+            source="polar",
+            event_type="polar.session_completed",
+            source_event_id="session:store-human-feedback",
+            task_id="task_store_human_feedback",
+            session_id="session_store_human_feedback",
+            status="COMPLETED",
+            reward=0.6,
+            payload={
+                "session_result": {
+                    "trajectory": {"traces": [{"reward": 0.6}]},
+                    "metadata": {
+                        "evolution_feedback": {
+                            "human": [
+                                {
+                                    "feedback_id": "hfb_store_available",
+                                    "status": "available_for_evolution",
+                                    "normalized_payload": {
+                                        "decision": "revise",
+                                        "confidence": 0.8,
+                                        "observed_issues": [
+                                            "Reviewer saw unbounded source scanning."
+                                        ],
+                                        "suggested_changes": [
+                                            "Add an inventory cap before extraction."
+                                        ],
+                                    },
+                                    "raw_payload": {"approved": False},
+                                }
+                            ]
+                        }
+                    },
+                }
+            },
+        )
+    )
+    dataset = store.create_dataset(
+        DatasetCreateRequest(
+            name="store-human-feedback",
+            purpose="agent_system_evolution",
+            query={
+                "event_types": ["polar.session_completed"],
+                "status": ["COMPLETED"],
+            },
+        )
+    )
+    with store.connect() as conn:
+        dataset_row = conn.execute(
+            "SELECT * FROM datasets WHERE dataset_id = ?",
+            (dataset.dataset_id,),
+        ).fetchone()
+        artifact_row = conn.execute(
+            "SELECT * FROM artifacts WHERE artifact_id = ?",
+            (dataset.artifact_id,),
+        ).fetchone()
+    dataset_artifact = {
+        "artifact_id": dataset.artifact_id,
+        "type": "dataset",
+        "uri": artifact_row["uri"],
+        "name": dataset_row["name"],
+    }
+    job = _job(
+        "agent_system_history_reflector",
+        tmp_path,
+        input_artifacts=[dataset_artifact],
+        config={
+            "name": "store-sanitized-history-feedback",
+            "reflector_llm": {
+                "model": "reflector-model",
+                "base_url": "http://reflector.test/v1",
+                "api_key": "secret",
+            },
+        },
+    )
+
+    artifact = run_method(job, artifact_root=tmp_path / "artifacts")[0]
+
+    prompt = captured["json"]["messages"][1]["content"]
+    assert "Human feedback signals" in prompt
+    assert "hfb_store_available" in prompt
+    assert "Reviewer saw unbounded source scanning." in prompt
+    assert "Add an inventory cap before extraction." in prompt
+    assert "raw_payload" not in prompt
+    assert artifact.manifest["human_feedback_ids"] == ["hfb_store_available"]
+    assert artifact.manifest["human_feedback_count"] == 1
+
+
 def test_agent_system_history_reflector_uses_latest_prior_agent_system_base(
     tmp_path,
     monkeypatch,
@@ -1745,7 +2208,28 @@ def test_agent_system_pareto_reflector_selects_candidate_with_external_gate(
             "session_id": "session_round2",
             "status": "COMPLETED",
             "reward": 0.494,
-            "payload": {"summary": "Round 2 improved after preserving article ids."},
+            "payload": {
+                "summary": "Round 2 improved after preserving article ids.",
+                "session_result": {
+                    "metadata": {
+                        "evolution_feedback": {
+                            "human": [
+                                {
+                                    "feedback_id": "hfb_pareto_bounded",
+                                    "status": "available_for_evolution",
+                                    "decision": "revise",
+                                    "observed_issues": [
+                                        "Pareto reviewer saw article-id drift."
+                                    ],
+                                    "suggested_changes": [
+                                        "Preserve canonical source ids in each candidate."
+                                    ],
+                                }
+                            ]
+                        }
+                    }
+                },
+            },
         },
     )
     round3 = _history_round_dataset_artifact(
@@ -1803,6 +2287,9 @@ def test_agent_system_pareto_reflector_selects_candidate_with_external_gate(
                 "base_url": "http://reflector.test/v1",
                 "api_key": "secret",
             },
+            "promotion_support": {
+                "trajectory_findings": ["Configured Pareto finding stays visible."]
+            },
             "promoted": True,
         },
     )
@@ -1822,6 +2309,16 @@ def test_agent_system_pareto_reflector_selects_candidate_with_external_gate(
     assert agent_system_artifact.manifest["promotion_gate"]["passed"] is True
     assert agent_system_artifact.manifest["best_round"] == 2
     assert agent_system_artifact.manifest["latest_round"] == 3
+    assert agent_system_artifact.manifest["human_feedback_ids"] == ["hfb_pareto_bounded"]
+    assert agent_system_artifact.manifest["human_feedback_count"] == 1
+    assert (
+        "Configured Pareto finding stays visible."
+        in agent_system_artifact.manifest["promotion_support"]["trajectory_findings"]
+    )
+    assert (
+        "Included 1 human feedback item(s) from prior reviews."
+        in agent_system_artifact.manifest["promotion_support"]["trajectory_findings"]
+    )
     assert agent_system_artifact.lineage["method"] == "agent_system_pareto_reflector"
     assert agent_system_artifact.lineage["input_artifact_ids"] == [
         "art_history_round_1",
@@ -1837,9 +2334,16 @@ def test_agent_system_pareto_reflector_selects_candidate_with_external_gate(
     assert "Candidate strategy: provenance_guarded" in prompts[2]
     assert "Promotion gate" in prompts[2]
     assert "coverage collapse" in prompts[2]
+    assert all("Human feedback signals" in prompt for prompt in prompts)
+    assert all("hfb_pareto_bounded" in prompt for prompt in prompts)
+    assert all("Pareto reviewer saw article-id drift." in prompt for prompt in prompts)
 
     report = json.loads(Path(report_artifact.uri.removeprefix("file://")).read_text())
     assert report["selected_candidate"]["strategy"] == "provenance_guarded"
+    assert report_artifact.manifest["human_feedback_ids"] == ["hfb_pareto_bounded"]
+    assert report_artifact.manifest["human_feedback_count"] == 1
+    assert report["human_feedback_ids"] == ["hfb_pareto_bounded"]
+    assert report["human_feedback_count"] == 1
     rejected = {candidate["strategy"]: candidate for candidate in report["candidates"]}
     assert "prediction_to_reference_ratio" in rejected["recall_recovery"]["gate_failures"]
 
@@ -1967,6 +2471,13 @@ def test_agent_system_gepa_reflector_generates_mutation_pool_from_verifier_feedb
     assert agent_system_artifacts[0].manifest["candidate_count"] == 2
     assert agent_system_artifacts[0].lineage["method"] == "agent_system_gepa_reflector"
     assert agent_system_artifacts[0].promoted is False
+    for artifact in agent_system_artifacts:
+        support = artifact.manifest["promotion_support"]
+        assert support["trajectory_findings"]
+        assert support["proposed_changes"]
+        assert support["expected_benefits"]
+        assert support["risks"]
+        assert support["validation_checks"]
 
     candidate_texts = [
         Path(artifact.uri.removeprefix("file://")).read_text(encoding="utf-8")
@@ -1990,6 +2501,89 @@ def test_agent_system_gepa_reflector_generates_mutation_pool_from_verifier_feedb
         "preservation_gate",
         "xss_corpus",
     ]
+
+
+def test_agent_system_gepa_reflector_consumes_human_feedback(
+    tmp_path,
+    monkeypatch,
+):
+    captured = _patch_reflector_llm_sequence(
+        monkeypatch,
+        ["# Bounded Search Candidate\n\n- Add bounded inventory checks."],
+    )
+    failure_round = _history_round_dataset_artifact(
+        tmp_path,
+        round_number=1,
+        precision=0.0,
+        recall=0.0,
+        f1=0.0,
+        record={
+            "event_id": "evt_gepa_human_feedback",
+            "task_id": "task_gepa_human_feedback",
+            "session_id": "session_gepa_human_feedback",
+            "status": "COMPLETED",
+            "reward": 0.0,
+            "payload": {
+                "session_result": {
+                    "metadata": {
+                        "evolution_feedback": {
+                            "human": [
+                                {
+                                    "feedback_id": "hfb_gepa_bounded",
+                                    "status": "available_for_evolution",
+                                    "decision": "revise",
+                                    "confidence": 0.75,
+                                    "observed_issues": [
+                                        "Candidate still scans the full repository."
+                                    ],
+                                    "suggested_changes": [
+                                        "Prefer a bounded source inventory mutation."
+                                    ],
+                                    "risks": ["Could miss hidden inputs."],
+                                    "validation_checks": ["Run budget-stress tasks."],
+                                    "labels": ["gepa", "bounded-search"],
+                                    "raw_payload": {"approved": False},
+                                }
+                            ]
+                        }
+                    }
+                }
+            },
+        },
+    )
+    job = _job(
+        "agent_system_gepa_reflector",
+        tmp_path,
+        input_artifacts=[failure_round],
+        config={
+            "name": "gepa-human-feedback",
+            "candidate_count": 1,
+            "mutation_strategies": ["bounded_inventory"],
+            "reflector_llm": {
+                "model": "reflector-model",
+                "base_url": "http://reflector.test/v1",
+                "api_key": "secret",
+            },
+        },
+    )
+
+    artifacts = run_method(job, artifact_root=tmp_path / "artifacts")
+
+    agent_system_artifact = next(
+        artifact for artifact in artifacts if artifact.type == ArtifactType.AGENT_SYSTEM
+    )
+    prompt = captured["requests"][0]["json"]["messages"][1]["content"]
+    assert "Human feedback signals" in prompt
+    assert "hfb_gepa_bounded" in prompt
+    assert "Candidate still scans the full repository." in prompt
+    assert "Prefer a bounded source inventory mutation." in prompt
+    assert "raw_payload" not in prompt
+    assert agent_system_artifact.manifest["human_feedback_ids"] == ["hfb_gepa_bounded"]
+    assert agent_system_artifact.manifest["human_feedback_count"] == 1
+    assert (
+        "Included 1 human feedback item(s) from prior reviews."
+        in agent_system_artifact.manifest["promotion_support"]["trajectory_findings"]
+    )
 
 
 def test_parametric_memory_register_returns_adapter_artifact(tmp_path):

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import subprocess
@@ -37,6 +38,81 @@ _REFLECTOR_PROXY_ENV_VARS = (
     "GEMINI_API_KEY",
     "GOOGLE_GEMINI_BASE_URL",
 )
+_PROMOTION_SUPPORT_FIELDS = (
+    "trajectory_findings",
+    "proposed_changes",
+    "expected_benefits",
+    "risks",
+    "validation_checks",
+)
+_HUMAN_FEEDBACK_LIST_FIELDS = (
+    "observed_issues",
+    "suggested_changes",
+    "risks",
+    "validation_checks",
+    "labels",
+)
+_HUMAN_FEEDBACK_AVAILABLE_STATUS = "available_for_evolution"
+_HUMAN_FEEDBACK_SUMMARY_LIMIT = 8
+_HUMAN_FEEDBACK_VALUES_PER_FIELD_LIMIT = 4
+_CREDENTIAL_URI_RE = re.compile(
+    r"\b[A-Za-z][A-Za-z0-9+.-]*://\S*@\S+",
+    re.IGNORECASE,
+)
+_URI_QUERY_FRAGMENT_RE = re.compile(
+    r"\b([A-Za-z][A-Za-z0-9+.-]*://[^\s?#]+)[?#]\S*",
+    re.IGNORECASE,
+)
+_FILE_URI_RE = re.compile(r"\bfile://\S+", re.IGNORECASE)
+_POSIX_ABSOLUTE_PATH_RE = re.compile(r"(?<![\w:/])/(?!/)(?:[^\s,;:/]+/)*[^\s,;]+")
+_WINDOWS_UNC_PATH_RE = re.compile(
+    r"\\\\[^\s\\/:*?\"<>|,;]+\\(?:[^\\/:*?\"<>|\r\n,;]+\\)*[^\s\\/:*?\"<>|,;]+"
+)
+_WINDOWS_ABSOLUTE_PATH_RE = re.compile(
+    r"\b[A-Za-z]:[\\/](?:[^\\/:*?\"<>|\r\n,;]+[\\/])*[^\s\\/:*?\"<>|,;]+"
+)
+_SECRET_ASSIGNMENT_RE = re.compile(
+    r"\b[A-Za-z0-9_]*(?:"
+    r"api[_-]?key|access[_-]?key(?:[_-]?id)?|accesskeyid|token|password|secret|"
+    r"authorization"
+    r")[A-Za-z0-9_]*\s*[:=]\s*(?:bearer|basic)?\s*[^\s,;]+",
+    re.IGNORECASE,
+)
+_BEARER_VALUE_RE = re.compile(
+    r"\bBearer\s+[A-Za-z0-9._~+/=-]+",
+    re.IGNORECASE,
+)
+_AWS_ACCESS_KEY_RE = re.compile(r"\b(?:AKIA|ASIA)[A-Z0-9]{12,}\b")
+_EVOLUTION_FEEDBACK_UNSAFE_KEYS = {
+    "human",
+    "human_feedback",
+    "raw_payload",
+    "raw_payloads",
+    "rationale",
+    "status",
+}
+_EVOLUTION_FEEDBACK_UNSAFE_KEY_FRAGMENTS = (
+    "api_key",
+    "apikey",
+    "access_key",
+    "accesskey",
+    "rationale",
+    "token",
+    "password",
+    "secret",
+    "authorization",
+)
+_EVOLUTION_FEEDBACK_LIKE_KEYS = {
+    "confidence",
+    "decision",
+    "feedback_id",
+    "labels",
+    "observed_issues",
+    "risks",
+    "score",
+    "suggested_changes",
+    "validation_checks",
+}
 
 
 class UnknownEvolutionMethodError(ValueError):
@@ -165,6 +241,32 @@ def text_memory_reflector(
                 "reflector_provider": llm_config["provider"],
                 "reflector_model": llm_config["model"],
                 "reflection_audit": audit_report,
+                "promotion_support": _reflector_promotion_support(
+                    job,
+                    method="text_memory_reflector",
+                    artifact_kind="text_memory",
+                    dataset_ids=[dataset.artifact_id],
+                    record_count=len(records),
+                    reflected_record_count=len(reflected_records),
+                    success_count=success_count,
+                    failure_count=failure_count,
+                    proposed_changes=[
+                        "Update reusable text memory from recurring observations in the "
+                        "selected trajectories."
+                    ],
+                    expected_benefits=[
+                        "Improve later rollouts by preserving task-relevant facts, "
+                        "pitfalls, and validation reminders observed in prior runs."
+                    ],
+                    risks=[
+                        "Memory may overfit the sampled trajectories or preserve a "
+                        "task-specific shortcut if the review packet is not checked."
+                    ],
+                    validation_checks=[
+                        "Verify that the memory is grounded in observed trajectories "
+                        "and does not encode held-out answers or brittle file names."
+                    ],
+                ),
             },
             lineage=lineage,
             compatibility=_dict_config(job.config.get("compatibility")),
@@ -278,6 +380,32 @@ def skill_bundle_reflector(
         "reflector_provider": llm_config["provider"],
         "reflector_model": llm_config["model"],
         "reflection_audit": audit_report,
+        "promotion_support": _reflector_promotion_support(
+            job,
+            method="skill_bundle_reflector",
+            artifact_kind="skill_bundle",
+            dataset_ids=[dataset.artifact_id],
+            record_count=len(records),
+            reflected_record_count=len(reflected_records),
+            success_count=success_count,
+            failure_count=failure_count,
+            proposed_changes=[
+                "Update the skill entrypoint with reusable workflow guidance distilled "
+                "from the selected trajectories."
+            ],
+            expected_benefits=[
+                "Improve repeat task execution by packaging learned checks and "
+                "workflow steps as a loadable skill."
+            ],
+            risks=[
+                "The skill can become too broad or too task-specific if it copies "
+                "incidental trajectory details."
+            ],
+            validation_checks=[
+                "Review SKILL.md for concrete triggers, actions, and validation "
+                "checks that transfer beyond a single held-out answer."
+            ],
+        ),
     }
     if base_skill_artifact is not None:
         manifest_payload["base_skill_bundle_artifact_id"] = base_skill_artifact.artifact_id
@@ -400,6 +528,32 @@ def agent_system_reflector(
                 "reflector_provider": llm_config["provider"],
                 "reflector_model": llm_config["model"],
                 "agent_system_audit": audit_report,
+                "promotion_support": _reflector_promotion_support(
+                    job,
+                    method="agent_system_reflector",
+                    artifact_kind="agent_system",
+                    dataset_ids=[dataset.artifact_id],
+                    record_count=len(records),
+                    reflected_record_count=len(reflected_records),
+                    success_count=success_count,
+                    failure_count=failure_count,
+                    proposed_changes=[
+                        "Update the agent-system instructions with methodology "
+                        "changes inferred from observed success and failure traces."
+                    ],
+                    expected_benefits=[
+                        "Improve future rollouts by turning trajectory-level failures "
+                        "into concrete operating rules and validation checks."
+                    ],
+                    risks=[
+                        "Agent-system rules may overgeneralize from a small trajectory "
+                        "sample or hard-code task-specific literals."
+                    ],
+                    validation_checks=[
+                        "Check that each new rule has a trigger, action, and validation "
+                        "step and avoids held-out answer leakage."
+                    ],
+                ),
             },
             lineage=lineage,
             compatibility=_dict_config(job.config.get("compatibility")),
@@ -457,11 +611,25 @@ def agent_system_history_reflector(
     reflected_records = [
         record for history_round in rounds for record in history_round["reflected_records"]
     ]
+    records = [record for history_round in rounds for record in history_round["records"]]
+    human_feedback = _human_feedback_from_records(records)
+    shared_feedback_ids = _shared_evolution_feedback_ids_from_records(records)
     success_count = sum(1 for record in reflected_records if record["kind"] == "success")
     failure_count = sum(1 for record in reflected_records if record["kind"] == "failure")
     latest_round = rounds[-1]
     best_round = _best_history_round(rounds)
     dataset_ids = [history_round["artifact"].artifact_id for history_round in rounds]
+    extra_findings = [
+        f"Best prior round was {best_round['round']} with f1="
+        f"{best_round['metrics'].get('f1')}; latest round was "
+        f"{latest_round['round']} with f1={latest_round['metrics'].get('f1')}."
+    ]
+    if human_feedback:
+        extra_findings.append(
+            f"Included {len(human_feedback)} human feedback item(s) from prior reviews."
+        )
+    if shared_feedback_ids:
+        extra_findings.append(_shared_evolution_feedback_inclusion_finding(shared_feedback_ids))
     lineage = {
         **_dict_config(job.config.get("lineage")),
         "method": "agent_system_history_reflector",
@@ -490,9 +658,41 @@ def agent_system_history_reflector(
                 "latest_f1": latest_round["metrics"].get("f1"),
                 "best_round": best_round["round"],
                 "best_f1": best_round["metrics"].get("f1"),
+                "human_feedback_ids": _human_feedback_ids(human_feedback),
+                "human_feedback_count": len(human_feedback),
+                "shared_evolution_feedback_ids": shared_feedback_ids,
+                "shared_evolution_feedback_count": len(shared_feedback_ids),
                 "reflector_provider": llm_config["provider"],
                 "reflector_model": llm_config["model"],
                 "agent_system_audit": audit_report,
+                "promotion_support": _reflector_promotion_support(
+                    job,
+                    method="agent_system_history_reflector",
+                    artifact_kind="agent_system",
+                    dataset_ids=dataset_ids,
+                    record_count=sum(len(history_round["records"]) for history_round in rounds),
+                    reflected_record_count=len(reflected_records),
+                    success_count=success_count,
+                    failure_count=failure_count,
+                    extra_findings=extra_findings,
+                    proposed_changes=[
+                        "Revise the agent-system instructions using all available "
+                        "round histories, preserving improving behaviors and avoiding "
+                        "regressions observed in later rounds."
+                    ],
+                    expected_benefits=[
+                        "Improve stability by comparing multiple rounds instead of "
+                        "reflecting only the most recent trajectory batch."
+                    ],
+                    risks=[
+                        "The update may collapse coverage or overfit to the best round "
+                        "unless regression risks are explicitly checked."
+                    ],
+                    validation_checks=[
+                        "Compare against the best prior round and reject changes that "
+                        "lack concrete regression-prevention checks."
+                    ],
+                ),
             },
             lineage=lineage,
             compatibility=_dict_config(job.config.get("compatibility")),
@@ -589,6 +789,17 @@ def agent_system_pareto_reflector(
     best_round = _best_history_round(rounds)
     latest_round = rounds[-1]
     dataset_ids = [history_round["artifact"].artifact_id for history_round in rounds]
+    records = [record for history_round in rounds for record in history_round["records"]]
+    reflected_record_count = sum(
+        len(history_round["reflected_records"])
+        for history_round in rounds
+    )
+    human_feedback = _human_feedback_from_records(records)
+    shared_feedback_ids = _shared_evolution_feedback_ids_from_records(records)
+    extra_findings = [
+        f"Selected candidate strategy {selected['strategy']} from "
+        f"{len(candidates)} candidates.",
+    ]
     selected_summary = _pareto_candidate_manifest_summary(selected)
     archive = {
         "method": "agent_system_pareto_reflector",
@@ -599,6 +810,10 @@ def agent_system_pareto_reflector(
         "latest_round": latest_round["round"],
         "latest_metrics": latest_round["metrics"],
         "selected_candidate": selected_summary,
+        "human_feedback_ids": _human_feedback_ids(human_feedback),
+        "human_feedback_count": len(human_feedback),
+        "shared_evolution_feedback_ids": shared_feedback_ids,
+        "shared_evolution_feedback_count": len(shared_feedback_ids),
         "candidates": [
             _pareto_candidate_report(candidate, output_dir=output_dir)
             for candidate in candidates
@@ -612,6 +827,16 @@ def agent_system_pareto_reflector(
     )
 
     gate_report = _pareto_promotion_gate_report(job, selected)
+    extra_findings.append(
+        f"Promotion gate passed={gate_report['passed']} failures="
+        f"{gate_report['failures']}."
+    )
+    if human_feedback:
+        extra_findings.append(
+            f"Included {len(human_feedback)} human feedback item(s) from prior reviews."
+        )
+    if shared_feedback_ids:
+        extra_findings.append(_shared_evolution_feedback_inclusion_finding(shared_feedback_ids))
     lineage = {
         **_dict_config(job.config.get("lineage")),
         "method": "agent_system_pareto_reflector",
@@ -640,8 +865,37 @@ def agent_system_pareto_reflector(
                 "selected_candidate": selected_summary,
                 "promotion_gate": gate_report,
                 "archive_path": "candidate_archive.json",
+                "human_feedback_ids": _human_feedback_ids(human_feedback),
+                "human_feedback_count": len(human_feedback),
+                "shared_evolution_feedback_ids": shared_feedback_ids,
+                "shared_evolution_feedback_count": len(shared_feedback_ids),
                 "reflector_provider": llm_config["provider"],
                 "reflector_model": llm_config["model"],
+                "promotion_support": _reflector_promotion_support(
+                    job,
+                    method="agent_system_pareto_reflector",
+                    artifact_kind="agent_system",
+                    dataset_ids=dataset_ids,
+                    record_count=sum(len(history_round["records"]) for history_round in rounds),
+                    reflected_record_count=reflected_record_count,
+                    extra_findings=extra_findings,
+                    proposed_changes=[
+                        "Promote the selected Pareto candidate after comparing "
+                        "candidate quality, static guardrails, and regression risk."
+                    ],
+                    expected_benefits=[
+                        "Reduce single-candidate reflector regressions by requiring "
+                        "candidate comparison before promotion."
+                    ],
+                    risks=[
+                        "Candidate ranking can still overfit noisy external metrics or "
+                        "underweight recall/precision tradeoffs."
+                    ],
+                    validation_checks=[
+                        "Inspect the candidate archive, selected strategy, gate "
+                        "failures, and external metrics before approving promotion."
+                    ],
+                ),
             },
             lineage=lineage,
             compatibility=_dict_config(job.config.get("compatibility")),
@@ -658,6 +912,10 @@ def agent_system_pareto_reflector(
                 "method": "agent_system_pareto_reflector",
                 "candidate_count": len(candidates),
                 "selected_candidate": selected_summary,
+                "human_feedback_ids": _human_feedback_ids(human_feedback),
+                "human_feedback_count": len(human_feedback),
+                "shared_evolution_feedback_ids": shared_feedback_ids,
+                "shared_evolution_feedback_count": len(shared_feedback_ids),
             },
             lineage=lineage,
             compatibility=_dict_config(job.config.get("compatibility")),
@@ -702,6 +960,15 @@ def agent_system_gepa_reflector(
     best_round = _best_history_round(rounds)
     latest_round = rounds[-1]
     dataset_ids = [history_round["artifact"].artifact_id for history_round in rounds]
+    reflected_records = [
+        record for history_round in rounds for record in history_round["reflected_records"]
+    ]
+    records = [record for history_round in rounds for record in history_round["records"]]
+    human_feedback = _human_feedback_from_records(records)
+    shared_feedback_ids = _shared_evolution_feedback_ids_from_records(records)
+    success_count = sum(1 for record in reflected_records if record["kind"] == "success")
+    failure_count = sum(1 for record in reflected_records if record["kind"] == "failure")
+    record_count = sum(len(history_round["records"]) for history_round in rounds)
     lineage = {
         **_dict_config(job.config.get("lineage")),
         "method": "agent_system_gepa_reflector",
@@ -731,6 +998,20 @@ def agent_system_gepa_reflector(
         candidate_path.parent.mkdir(parents=True, exist_ok=True)
         candidate_path.write_text(_ensure_trailing_newline(markdown), encoding="utf-8")
         static_score = _agent_system_static_guardrail_score(markdown)
+        extra_findings = [
+            f"Generated GEPA candidate {index} of {len(strategies)} using "
+            f"mutation strategy {strategy}.",
+            f"Static guardrail score for this candidate is {static_score}.",
+            f"Best prior round was {best_round['round']} with f1="
+            f"{best_round['metrics'].get('f1')}; latest round was "
+            f"{latest_round['round']} with f1={latest_round['metrics'].get('f1')}.",
+        ]
+        if human_feedback:
+            extra_findings.append(
+                f"Included {len(human_feedback)} human feedback item(s) from prior reviews."
+            )
+        if shared_feedback_ids:
+            extra_findings.append(_shared_evolution_feedback_inclusion_finding(shared_feedback_ids))
         manifest = {
             "content_path": target_path.as_posix(),
             "target_path": target_path.as_posix(),
@@ -748,9 +1029,41 @@ def agent_system_gepa_reflector(
             "latest_round": latest_round["round"],
             "latest_f1": latest_round["metrics"].get("f1"),
             "static_guardrail_score": static_score,
+            "human_feedback_ids": _human_feedback_ids(human_feedback),
+            "human_feedback_count": len(human_feedback),
+            "shared_evolution_feedback_ids": shared_feedback_ids,
+            "shared_evolution_feedback_count": len(shared_feedback_ids),
             "agent_system_audit": audit_report,
             "reflector_provider": llm_config["provider"],
             "reflector_model": llm_config["model"],
+            "promotion_support": _reflector_promotion_support(
+                job,
+                method="agent_system_gepa_reflector",
+                artifact_kind="agent_system",
+                dataset_ids=dataset_ids,
+                record_count=record_count,
+                reflected_record_count=len(reflected_records),
+                success_count=success_count,
+                failure_count=failure_count,
+                extra_findings=extra_findings,
+                proposed_changes=[
+                    f"Promote the GEPA candidate generated by the {strategy} mutation "
+                    "strategy if its instructions address the observed verifier "
+                    "failures without hard-coding task outputs."
+                ],
+                expected_benefits=[
+                    "Improve targeted failure recovery by reviewing multiple mutation "
+                    "strategies as separate candidate artifacts."
+                ],
+                risks=[
+                    "Candidate mutations may overfit one verifier failure mode or "
+                    "regress already-passing behaviors if promoted without review."
+                ],
+                validation_checks=[
+                    "Inspect the candidate text, verifier failure evidence, audit "
+                    "report, and any follow-up evaluator score before promotion."
+                ],
+            ),
         }
         artifacts.append(
             ArtifactRegisterRequest(
@@ -803,6 +1116,10 @@ def agent_system_gepa_reflector(
                 "content_path": "gepa_candidate_archive.json",
                 "method": "agent_system_gepa_reflector",
                 "candidate_count": len(strategies),
+                "human_feedback_ids": _human_feedback_ids(human_feedback),
+                "human_feedback_count": len(human_feedback),
+                "shared_evolution_feedback_ids": shared_feedback_ids,
+                "shared_evolution_feedback_count": len(shared_feedback_ids),
             },
             lineage=lineage,
             compatibility=_dict_config(job.config.get("compatibility")),
@@ -1229,6 +1546,14 @@ def _render_agent_system_history_reflection_prompt(
         )
         _append_round_reflection_sections(lines, history_round)
         previous_metrics = metrics
+
+    human_feedback_summary = _render_human_feedback_summary(
+        _human_feedback_from_records(
+            [record for history_round in rounds for record in history_round["records"]]
+        )
+    )
+    if human_feedback_summary:
+        lines.extend([human_feedback_summary, ""])
 
     lines.extend(
         [
@@ -1719,6 +2044,110 @@ def _pareto_selected_scores(
             scores[f"candidate_{key}"] = float(value)
     scores["static_guardrail_score"] = float(selected["static_score"])
     return scores
+
+
+def _reflector_promotion_support(
+    job: WorkerClaimedJob,
+    *,
+    method: str,
+    artifact_kind: str,
+    dataset_ids: list[str],
+    record_count: int,
+    reflected_record_count: int | None = None,
+    success_count: int | None = None,
+    failure_count: int | None = None,
+    extra_findings: list[str] | None = None,
+    proposed_changes: list[str],
+    expected_benefits: list[str],
+    risks: list[str],
+    validation_checks: list[str],
+) -> dict[str, list[str]]:
+    findings = [
+        (
+            f"{method} reviewed {record_count} records from "
+            f"{len(dataset_ids)} dataset artifact(s): {', '.join(dataset_ids)}."
+        )
+    ]
+    if reflected_record_count is not None:
+        findings.append(f"Selected {reflected_record_count} records for reflection.")
+    if success_count is not None or failure_count is not None:
+        findings.append(
+            f"Selected trajectory mix: {success_count or 0} success records and "
+            f"{failure_count or 0} failure records."
+        )
+    if extra_findings:
+        findings.extend(extra_findings)
+
+    support = {
+        "trajectory_findings": findings,
+        "proposed_changes": proposed_changes,
+        "expected_benefits": expected_benefits,
+        "risks": risks,
+        "validation_checks": validation_checks,
+    }
+    configured = _dict_config(job.config.get("promotion_support"))
+    for field in _PROMOTION_SUPPORT_FIELDS:
+        value = configured.get(field)
+        if _promotion_support_field_present(value):
+            support[field] = _promotion_support_values(value)
+    if extra_findings:
+        for finding in extra_findings:
+            if (
+                _is_feedback_inclusion_finding(finding)
+                and finding not in support["trajectory_findings"]
+            ):
+                support["trajectory_findings"].append(finding)
+    support.setdefault("proposed_changes", []).append(
+        f"Artifact kind under review: {artifact_kind}."
+    )
+    return support
+
+
+def _is_human_feedback_inclusion_finding(value: str) -> bool:
+    return (
+        value.startswith("Included ")
+        and " human feedback item(s) from prior reviews." in value
+    )
+
+
+def _is_shared_evolution_feedback_inclusion_finding(value: str) -> bool:
+    return (
+        value.startswith("Included ")
+        and " shared evolution feedback item(s) from prior evaluator signals." in value
+    )
+
+
+def _is_feedback_inclusion_finding(value: str) -> bool:
+    return _is_human_feedback_inclusion_finding(
+        value
+    ) or _is_shared_evolution_feedback_inclusion_finding(value)
+
+
+def _shared_evolution_feedback_inclusion_finding(feedback_ids: list[str]) -> str:
+    return (
+        f"Included {len(feedback_ids)} shared evolution feedback item(s) "
+        "from prior evaluator signals."
+    )
+
+
+def _promotion_support_field_present(value: object) -> bool:
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, list | tuple):
+        return any(_promotion_support_field_present(item) for item in value)
+    return value is not None
+
+
+def _promotion_support_values(value: object) -> list[str]:
+    if isinstance(value, str):
+        return [value.strip()] if value.strip() else []
+    if isinstance(value, list | tuple):
+        return [
+            str(item).strip()
+            for item in value
+            if str(item).strip()
+        ]
+    return [str(value)]
 
 
 def _generate_agent_system_reflection(prompt: str, llm_config: dict[str, Any]) -> str:
@@ -2525,6 +2954,264 @@ def _append_shared_evolution_feedback_section(
     lines.append("")
 
 
+def _human_feedback_from_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    feedback: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for record in records:
+        for value in _candidate_human_feedback_values(record):
+            for item in _human_feedback_from_value(value):
+                feedback_id = item.get("feedback_id")
+                if isinstance(feedback_id, str) and feedback_id:
+                    existing = next(
+                        (
+                            candidate
+                            for candidate in feedback
+                            if candidate.get("feedback_id") == feedback_id
+                        ),
+                        None,
+                    )
+                    if existing is not None:
+                        _merge_human_feedback_item(existing, item)
+                        continue
+                    seen.add(feedback_id)
+                    feedback.append(item)
+                    continue
+                dedupe_key = json.dumps(item, sort_keys=True)
+                if dedupe_key in seen:
+                    continue
+                seen.add(dedupe_key)
+                feedback.append(item)
+    return feedback
+
+
+def _merge_human_feedback_item(
+    target: dict[str, Any],
+    source: dict[str, Any],
+) -> None:
+    target["status"] = _HUMAN_FEEDBACK_AVAILABLE_STATUS
+    for field in ("feedback_id", "decision", "confidence", "score"):
+        if field not in target and source.get(field) not in (None, "", []):
+            target[field] = source[field]
+    for field in _HUMAN_FEEDBACK_LIST_FIELDS:
+        values = source.get(field)
+        if not isinstance(values, list):
+            continue
+        target_values = target.setdefault(field, [])
+        if not isinstance(target_values, list):
+            continue
+        for value in values:
+            if isinstance(value, str) and value not in target_values:
+                target_values.append(value)
+
+
+def _candidate_human_feedback_values(record: dict[str, Any]) -> list[Any]:
+    values: list[Any] = []
+    _append_explicit_human_feedback_values(values, record)
+    payload = record.get("payload")
+    if isinstance(payload, dict):
+        _append_explicit_human_feedback_values(values, payload)
+        session_result = payload.get("session_result")
+        if isinstance(session_result, dict):
+            _append_explicit_human_feedback_values(values, session_result)
+            metadata = session_result.get("metadata")
+            if isinstance(metadata, dict):
+                _append_explicit_human_feedback_values(values, metadata)
+    return values
+
+
+def _append_explicit_human_feedback_values(values: list[Any], mapping: dict[str, Any]) -> None:
+    values.append(mapping.get("human"))
+    values.append(mapping.get("human_feedback"))
+    evolution_feedback = mapping.get("evolution_feedback")
+    if isinstance(evolution_feedback, dict):
+        values.append(evolution_feedback.get("human"))
+        values.append(evolution_feedback.get("human_feedback"))
+
+
+def _human_feedback_from_value(value: Any) -> list[dict[str, Any]]:
+    if isinstance(value, list):
+        feedback: list[dict[str, Any]] = []
+        for item in value:
+            feedback.extend(_human_feedback_from_value(item))
+        return feedback
+    if not isinstance(value, dict):
+        return []
+
+    feedback: list[dict[str, Any]] = []
+    for key in ("human", "human_feedback"):
+        if key in value:
+            feedback.extend(_human_feedback_from_value(value[key]))
+    item = _sanitize_human_feedback_item(value)
+    if item:
+        feedback.append(item)
+    return feedback
+
+
+def _sanitize_human_feedback_item(item: dict[str, Any]) -> dict[str, Any]:
+    status = item.get("status")
+    if status != _HUMAN_FEEDBACK_AVAILABLE_STATUS:
+        return {}
+
+    source = item.get("normalized_payload")
+    if not isinstance(source, dict):
+        source = item
+
+    sanitized: dict[str, Any] = {"status": _HUMAN_FEEDBACK_AVAILABLE_STATUS}
+    feedback_id = item.get("feedback_id") or source.get("feedback_id")
+    if isinstance(feedback_id, str) and feedback_id.strip():
+        sanitized["feedback_id"] = _snippet(_redact_human_feedback_text(feedback_id), limit=96)
+    decision = source.get("decision")
+    if isinstance(decision, str) and decision.strip():
+        sanitized["decision"] = _snippet(_redact_human_feedback_text(decision), limit=64)
+    confidence = source.get("confidence")
+    if isinstance(confidence, int | float):
+        sanitized["confidence"] = float(confidence)
+    score = _bounded_human_feedback_score(source.get("score"))
+    if score is None and source is not item:
+        score = _bounded_human_feedback_score(item.get("score"))
+    if score is not None:
+        sanitized["score"] = score
+    for field in _HUMAN_FEEDBACK_LIST_FIELDS:
+        values = _human_feedback_string_list(source.get(field))
+        if values:
+            sanitized[field] = values
+    return sanitized
+
+
+def _human_feedback_string_list(value: Any) -> list[str]:
+    if isinstance(value, str):
+        text = _snippet(_redact_human_feedback_text(value), limit=240)
+        return [text] if text else []
+    if isinstance(value, list | tuple):
+        values: list[str] = []
+        for item in value[:_HUMAN_FEEDBACK_VALUES_PER_FIELD_LIMIT]:
+            if not isinstance(item, str):
+                continue
+            text = _snippet(_redact_human_feedback_text(item), limit=240)
+            if text:
+                values.append(text)
+        return values
+    return []
+
+
+def _bounded_human_feedback_score(value: Any) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    score = float(value)
+    if not math.isfinite(score) or score < 0.0 or score > 1.0:
+        return None
+    return score
+
+
+def _redact_human_feedback_text(value: str) -> str:
+    text = value.strip()
+    if not text:
+        return ""
+    text = _CREDENTIAL_URI_RE.sub("[REDACTED_URI]", text)
+    text = _URI_QUERY_FRAGMENT_RE.sub(lambda match: match.group(1), text)
+    text = _FILE_URI_RE.sub("[REDACTED_FILE_URI]", text)
+    text = _POSIX_ABSOLUTE_PATH_RE.sub(_redact_posix_path_match, text)
+    text = _WINDOWS_UNC_PATH_RE.sub("[REDACTED_FILE_PATH]", text)
+    text = _WINDOWS_ABSOLUTE_PATH_RE.sub("[REDACTED_FILE_PATH]", text)
+    text = _SECRET_ASSIGNMENT_RE.sub("[REDACTED_SECRET]", text)
+    text = _BEARER_VALUE_RE.sub("[REDACTED_SECRET]", text)
+    text = _AWS_ACCESS_KEY_RE.sub("[REDACTED_SECRET]", text)
+    return text.strip()
+
+
+def _redact_posix_path_match(match: re.Match[str]) -> str:
+    return "[REDACTED_FILE_PATH]"
+
+
+def _render_human_feedback_summary(feedback: list[dict[str, Any]]) -> str:
+    if not feedback:
+        return ""
+
+    lines = ["## Human feedback signals", ""]
+    for item in feedback[:_HUMAN_FEEDBACK_SUMMARY_LIMIT]:
+        parts: list[str] = []
+        feedback_id = item.get("feedback_id")
+        if isinstance(feedback_id, str) and feedback_id:
+            parts.append(f"feedback_id={feedback_id}")
+        status = item.get("status")
+        if status == _HUMAN_FEEDBACK_AVAILABLE_STATUS:
+            parts.append(f"status={status}")
+        decision = item.get("decision")
+        if isinstance(decision, str) and decision:
+            parts.append(f"decision={decision}")
+        confidence = item.get("confidence")
+        if isinstance(confidence, int | float):
+            parts.append(f"confidence={float(confidence):.3f}")
+        score = _bounded_human_feedback_score(item.get("score"))
+        if score is not None:
+            parts.append(f"score={score:.3f}")
+        labels = item.get("labels")
+        if isinstance(labels, list) and labels:
+            parts.append("labels=" + ", ".join(str(label) for label in labels))
+        lines.append("- " + (" ".join(parts) if parts else "human feedback"))
+        for field in (
+            "observed_issues",
+            "suggested_changes",
+            "risks",
+            "validation_checks",
+        ):
+            values = item.get(field)
+            if isinstance(values, list) and values:
+                lines.append(f"  - {field}: " + "; ".join(str(value) for value in values))
+    if len(feedback) > _HUMAN_FEEDBACK_SUMMARY_LIMIT:
+        remaining = len(feedback) - _HUMAN_FEEDBACK_SUMMARY_LIMIT
+        lines.append(f"- {remaining} additional human feedback item(s) omitted.")
+    return "\n".join(lines)
+
+
+def _human_feedback_ids(feedback: list[dict[str, Any]]) -> list[str]:
+    ids: list[str] = []
+    for item in feedback:
+        feedback_id = item.get("feedback_id")
+        if isinstance(feedback_id, str) and feedback_id and feedback_id not in ids:
+            ids.append(feedback_id)
+    return ids
+
+
+def _shared_evolution_feedback_ids_from_records(records: list[dict[str, Any]]) -> list[str]:
+    ids: list[str] = []
+    for record in records:
+        for value in _candidate_evolution_feedback_values(record):
+            for feedback_id in _shared_evolution_feedback_ids_from_value(value):
+                if feedback_id not in ids:
+                    ids.append(feedback_id)
+    return ids
+
+
+def _shared_evolution_feedback_ids_from_value(value: Any) -> list[str]:
+    if isinstance(value, list):
+        ids: list[str] = []
+        for item in value:
+            for feedback_id in _shared_evolution_feedback_ids_from_value(item):
+                if feedback_id not in ids:
+                    ids.append(feedback_id)
+        return ids
+    if not isinstance(value, dict):
+        return []
+    rendered = _render_evolution_feedback_value(value)
+    if not rendered:
+        return []
+
+    ids: list[str] = []
+    feedback_id = value.get("feedback_id")
+    if isinstance(feedback_id, str) and feedback_id.strip():
+        sanitized_id = _snippet(_redact_human_feedback_text(feedback_id), limit=96)
+        if sanitized_id:
+            ids.append(sanitized_id)
+    for key, item in value.items():
+        if not _shared_evolution_feedback_key_safe(key):
+            continue
+        for nested_id in _shared_evolution_feedback_ids_from_value(item):
+            if nested_id not in ids:
+                ids.append(nested_id)
+    return ids
+
+
 def _reflection_records(
     records: list[dict[str, Any]],
     *,
@@ -2784,11 +3471,12 @@ def _record_reward(record: dict[str, Any]) -> float | None:
 
 
 def _record_evolution_feedback(record: dict[str, Any]) -> str:
+    rendered_values: list[str] = []
     for value in _candidate_evolution_feedback_values(record):
         rendered = _render_evolution_feedback_value(value)
         if rendered:
-            return rendered
-    return ""
+            rendered_values.append(rendered)
+    return "\n".join(rendered_values)
 
 
 def _candidate_evolution_feedback_values(record: dict[str, Any]) -> list[Any]:
@@ -2807,10 +3495,16 @@ def _candidate_evolution_feedback_values(record: dict[str, Any]) -> list[Any]:
 
 def _render_evolution_feedback_value(value: Any) -> str:
     if isinstance(value, str) and value.strip():
-        return value.strip()
+        return _snippet(_redact_human_feedback_text(value), limit=240)
     if isinstance(value, dict):
+        if _shared_evolution_feedback_stateful_mapping(value):
+            status = value.get("status")
+            if status != _HUMAN_FEEDBACK_AVAILABLE_STATUS:
+                return ""
         parts: list[str] = []
         for key in sorted(value):
+            if not _shared_evolution_feedback_key_safe(key):
+                continue
             rendered = _render_evolution_feedback_value(value[key])
             if rendered:
                 title = str(key).replace("_", " ").title()
@@ -2820,6 +3514,24 @@ def _render_evolution_feedback_value(value: Any) -> str:
         parts = [_render_evolution_feedback_value(item) for item in value]
         return "\n".join(part for part in parts if part)
     return ""
+
+
+def _shared_evolution_feedback_key_safe(key: Any) -> bool:
+    normalized = str(key).strip().lower().replace("-", "_")
+    if normalized in _EVOLUTION_FEEDBACK_UNSAFE_KEYS:
+        return False
+    return not any(
+        fragment in normalized for fragment in _EVOLUTION_FEEDBACK_UNSAFE_KEY_FRAGMENTS
+    )
+
+
+def _shared_evolution_feedback_stateful_mapping(value: dict[str, Any]) -> bool:
+    if "status" in value:
+        return True
+    return any(
+        str(key).strip().lower().replace("-", "_") in _EVOLUTION_FEEDBACK_LIKE_KEYS
+        for key in value
+    )
 
 
 def _string_field(value: Any, default: str) -> str:

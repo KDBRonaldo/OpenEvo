@@ -118,6 +118,82 @@ def test_register_artifact_route(tmp_path):
     }
 
 
+def test_artifact_promotion_routes_update_backend_state(tmp_path):
+    app = create_app(db_path=tmp_path / "evolution.db", artifact_root=tmp_path / "artifacts")
+
+    with TestClient(app) as client:
+        registered = client.post(
+            "/v1/artifacts",
+            json={
+                "type": "text_memory",
+                "name": "pending memory",
+                "uri": "file:///tmp/memory.md",
+                "manifest": {"content_path": "memory.md"},
+                "promoted": False,
+            },
+        ).json()
+        artifact_id = registered["artifact_id"]
+
+        initial = client.get(f"/v1/artifacts/{artifact_id}")
+        empty_patch = client.patch(
+            f"/v1/artifacts/{artifact_id}/promotion",
+            json={},
+        )
+        after_empty_patch = client.get(f"/v1/artifacts/{artifact_id}")
+        promoted = client.patch(
+            f"/v1/artifacts/{artifact_id}/promotion",
+            json={"promoted": True},
+        )
+        fetched = client.get(f"/v1/artifacts/{artifact_id}")
+
+    assert initial.status_code == 200
+    assert initial.json()["promoted"] is False
+    assert empty_patch.status_code == 422
+    assert after_empty_patch.status_code == 200
+    assert after_empty_patch.json()["promoted"] is False
+    assert promoted.status_code == 200
+    assert promoted.json()["promoted"] is True
+    assert fetched.status_code == 200
+    assert fetched.json()["promoted"] is True
+
+
+def test_human_feedback_route_rejects_boolean_score_and_confidence(tmp_path):
+    app = create_app(db_path=tmp_path / "evolution.db", artifact_root=tmp_path / "artifacts")
+
+    with TestClient(app) as client:
+        review = client.post(
+            "/v1/reviews",
+            json={
+                "review_type": "promotion",
+                "artifact_ids": ["art_a"],
+                "packet": {"questions": ["Approve?"]},
+            },
+        ).json()
+        claim = client.post(
+            f"/v1/reviews/{review['review_id']}/claim",
+            json={"reviewer_id": "alice"},
+        )
+        score_response = client.post(
+            f"/v1/reviews/{review['review_id']}/feedback",
+            json={"reviewer_id": "alice", "decision": "approve", "score": True},
+        )
+        confidence_response = client.post(
+            f"/v1/reviews/{review['review_id']}/feedback",
+            json={
+                "reviewer_id": "alice",
+                "decision": "approve",
+                "confidence": False,
+            },
+        )
+        listed = client.get(f"/v1/reviews/{review['review_id']}/feedback")
+
+    assert claim.status_code == 200
+    assert score_response.status_code == 422
+    assert confidence_response.status_code == 422
+    assert listed.status_code == 200
+    assert listed.json() == []
+
+
 def test_register_artifact_route_uses_sync_handler(tmp_path):
     app = create_app(db_path=tmp_path / "evolution.db", artifact_root=tmp_path / "artifacts")
 
@@ -243,6 +319,213 @@ async def test_evolution_client_export_event_with_mock_transport():
         await client.close()
 
     assert event == response_body
+
+
+@pytest.mark.asyncio
+async def test_evolution_client_hitl_review_methods_with_mock_transport():
+    review_payload = {
+        "review_type": "promotion",
+        "artifact_ids": ["art_a"],
+        "packet": {"questions": ["Approve?"]},
+    }
+    feedback_payload = {
+        "reviewer_id": "alice",
+        "decision": "approve",
+        "raw_payload": {"approved": True},
+    }
+    expectations = [
+        (
+            "POST",
+            "/v1/reviews",
+            "",
+            review_payload,
+            {"review_id": "rev_1", "status": "queued"},
+        ),
+        (
+            "GET",
+            "/v1/reviews/rev_1",
+            "",
+            None,
+            {"review_id": "rev_1", "status": "queued"},
+        ),
+        (
+            "GET",
+            "/v1/reviews",
+            "status=queued",
+            None,
+            [{"review_id": "rev_1", "status": "queued"}],
+        ),
+        (
+            "GET",
+            "/v1/review-packets/rpacket_1",
+            "",
+            None,
+            {"packet_id": "rpacket_1", "packet": {"questions": ["Approve?"]}},
+        ),
+        (
+            "GET",
+            "/v1/review-packets",
+            "",
+            None,
+            [{"packet_id": "rpacket_1", "packet": {"questions": ["Approve?"]}}],
+        ),
+        (
+            "POST",
+            "/v1/reviews/rev_1/claim",
+            "",
+            {"reviewer_id": "alice", "reviewer_role": "maintainer"},
+            {"review_id": "rev_1", "status": "in_review"},
+        ),
+        (
+            "POST",
+            "/v1/reviews/rev_1/feedback",
+            "",
+            feedback_payload,
+            {"feedback_id": "hfb_1", "status": "available_for_evolution"},
+        ),
+        (
+            "GET",
+            "/v1/reviews/rev_1/feedback",
+            "",
+            None,
+            [{"feedback_id": "hfb_1", "status": "available_for_evolution"}],
+        ),
+        (
+            "POST",
+            "/v1/reviews/rev_1/adjudicate",
+            "",
+            {"status": "adjudicated"},
+            {"review_id": "rev_1", "status": "adjudicated"},
+        ),
+        (
+            "POST",
+            "/v1/reviews/rev_1/resolve",
+            "",
+            None,
+            {"review_id": "rev_1", "status": "resolved"},
+        ),
+        (
+            "POST",
+            "/v1/reviews/rev_1/mark-stale",
+            "",
+            None,
+            {"review_id": "rev_1", "status": "stale"},
+        ),
+        (
+            "POST",
+            "/v1/query-decisions",
+            "",
+            {"decision": "ask_human"},
+            {"query_decision_id": "hqd_1", "decision": "ask_human"},
+        ),
+        (
+            "GET",
+            "/v1/query-decisions/hqd_1",
+            "",
+            None,
+            {"query_decision_id": "hqd_1", "decision": "ask_human"},
+        ),
+        (
+            "POST",
+            "/v1/feedback-applications",
+            "",
+            {
+                "feedback_id": "hfb_1",
+                "target_type": "prompt_seed",
+                "target_id": "job_next",
+                "consumed_by_method": "reflector",
+                "effect_summary": "Used feedback.",
+            },
+            {"application_id": "hfa_1", "feedback_id": "hfb_1"},
+        ),
+        (
+            "GET",
+            "/v1/feedback-applications",
+            "feedback_id=hfb_1",
+            None,
+            [{"application_id": "hfa_1", "feedback_id": "hfb_1"}],
+        ),
+    ]
+
+    async def handler(request):
+        method, path, query, body, response_body = expectations.pop(0)
+        assert request.method == method
+        assert request.url.path == path
+        assert request.url.query.decode() == query
+        if body is not None:
+            assert json.loads(request.content) == body
+        return httpx.Response(200, json=response_body)
+
+    client = EvolutionClient(
+        "http://evolution.test",
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        assert await client.create_review_request(review_payload) == {
+            "review_id": "rev_1",
+            "status": "queued",
+        }
+        assert await client.get_review_request("rev_1") == {
+            "review_id": "rev_1",
+            "status": "queued",
+        }
+        assert await client.list_review_requests(status="queued") == [
+            {"review_id": "rev_1", "status": "queued"}
+        ]
+        assert await client.get_review_packet("rpacket_1") == {
+            "packet_id": "rpacket_1",
+            "packet": {"questions": ["Approve?"]},
+        }
+        assert await client.list_review_packets() == [
+            {"packet_id": "rpacket_1", "packet": {"questions": ["Approve?"]}}
+        ]
+        assert await client.claim_review_request(
+            "rev_1",
+            {"reviewer_id": "alice", "reviewer_role": "maintainer"},
+        ) == {"review_id": "rev_1", "status": "in_review"}
+        assert await client.submit_human_feedback("rev_1", feedback_payload) == {
+            "feedback_id": "hfb_1",
+            "status": "available_for_evolution",
+        }
+        assert await client.list_human_feedback("rev_1") == [
+            {"feedback_id": "hfb_1", "status": "available_for_evolution"}
+        ]
+        assert await client.adjudicate_review_request(
+            "rev_1",
+            {"status": "adjudicated"},
+        ) == {"review_id": "rev_1", "status": "adjudicated"}
+        assert await client.resolve_review_request("rev_1") == {
+            "review_id": "rev_1",
+            "status": "resolved",
+        }
+        assert await client.mark_review_stale("rev_1") == {
+            "review_id": "rev_1",
+            "status": "stale",
+        }
+        assert await client.create_human_query_decision({"decision": "ask_human"}) == {
+            "query_decision_id": "hqd_1",
+            "decision": "ask_human",
+        }
+        assert await client.get_human_query_decision("hqd_1") == {
+            "query_decision_id": "hqd_1",
+            "decision": "ask_human",
+        }
+        assert await client.create_feedback_application(
+            {
+                "feedback_id": "hfb_1",
+                "target_type": "prompt_seed",
+                "target_id": "job_next",
+                "consumed_by_method": "reflector",
+                "effect_summary": "Used feedback.",
+            }
+        ) == {"application_id": "hfa_1", "feedback_id": "hfb_1"}
+        assert await client.list_feedback_applications(feedback_id="hfb_1") == [
+            {"application_id": "hfa_1", "feedback_id": "hfb_1"}
+        ]
+    finally:
+        await client.close()
+
+    assert expectations == []
 
 
 def test_register_artifact_route_rejects_non_finite_metadata_without_writes(tmp_path):

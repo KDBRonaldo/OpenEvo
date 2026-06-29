@@ -2,11 +2,14 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
+import hashlib
 import json
 import math
 from pathlib import Path
+import re
 import sqlite3
 from typing import Any, Iterator
+from urllib.parse import urlparse, urlunparse
 
 from polar_evolution.agent_system import normalize_agent_system_target_path
 from polar_evolution.context import (
@@ -20,6 +23,7 @@ from polar_evolution.context import (
 from polar_evolution.files import ArtifactFileStore
 from polar_evolution.ids import new_id
 from polar_evolution.models import (
+    ArtifactPromotionUpdateRequest,
     AdapterMergeSpec,
     ArtifactRegisterRequest,
     ArtifactResponse,
@@ -31,9 +35,23 @@ from polar_evolution.models import (
     DatasetCreateResponse,
     EventIngestRequest,
     EventIngestResponse,
+    FeedbackApplicationCreateRequest,
+    FeedbackApplicationResponse,
+    FeedbackApplicationTargetType,
+    HumanFeedbackCreateRequest,
+    HumanFeedbackResponse,
+    HumanFeedbackStatus,
+    HumanQueryDecisionCreateRequest,
+    HumanQueryDecisionResponse,
     JobCreateRequest,
     JobCreateResponse,
     JobState,
+    ReviewAdjudicationRequest,
+    ReviewClaimRequest,
+    ReviewPacketResponse,
+    ReviewRequestCreateRequest,
+    ReviewRequestResponse,
+    ReviewStatus,
     WorkerClaimRequest,
     WorkerClaimResponse,
     WorkerCompleteRequest,
@@ -125,6 +143,80 @@ CREATE TABLE IF NOT EXISTS contexts (
     response_json TEXT NOT NULL,
     selected_artifact_ids_json TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS review_packets (
+    packet_id TEXT PRIMARY KEY,
+    packet_hash TEXT NOT NULL UNIQUE,
+    packet_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS review_requests (
+    review_id TEXT PRIMARY KEY,
+    review_type TEXT NOT NULL,
+    status TEXT NOT NULL,
+    artifact_ids_json TEXT NOT NULL,
+    candidate_ids_json TEXT NOT NULL,
+    job_id TEXT,
+    task_id TEXT,
+    round_index INTEGER,
+    method TEXT,
+    artifact_type TEXT,
+    packet_id TEXT NOT NULL,
+    packet_hash TEXT NOT NULL,
+    artifact_hashes_json TEXT NOT NULL,
+    query_decision_id TEXT,
+    assigned_to TEXT,
+    reviewer_role TEXT,
+    adjudication_rationale TEXT,
+    priority INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS human_feedback (
+    feedback_id TEXT PRIMARY KEY,
+    review_id TEXT NOT NULL,
+    reviewer_id TEXT NOT NULL,
+    reviewer_role TEXT,
+    status TEXT NOT NULL,
+    decision TEXT NOT NULL,
+    score REAL,
+    confidence REAL,
+    rationale TEXT NOT NULL,
+    raw_payload_json TEXT NOT NULL,
+    normalized_payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS feedback_applications (
+    application_id TEXT PRIMARY KEY,
+    feedback_id TEXT NOT NULL,
+    target_type TEXT NOT NULL,
+    target_id TEXT NOT NULL,
+    consumed_by_method TEXT NOT NULL,
+    consumed_in_job_id TEXT,
+    effect_summary TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS human_query_decisions (
+    query_decision_id TEXT PRIMARY KEY,
+    artifact_ids_json TEXT NOT NULL,
+    candidate_ids_json TEXT NOT NULL,
+    task_id TEXT,
+    round_index INTEGER,
+    method TEXT,
+    decision TEXT NOT NULL,
+    reason_codes_json TEXT NOT NULL,
+    estimated_value_of_information REAL,
+    estimated_human_cost REAL,
+    budget_context_json TEXT NOT NULL,
+    actual_latency_seconds REAL,
+    feedback_changed_promotion INTEGER,
+    feedback_changed_next_candidate INTEGER,
+    downstream_delta REAL,
+    review_id TEXT,
+    created_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_review_requests_query_decision_id_unique
+ON review_requests(query_decision_id)
+WHERE query_decision_id IS NOT NULL;
 """
 
 MAX_ARTIFACT_ID_ATTEMPTS = 10
@@ -151,6 +243,10 @@ def _text_metadata(value: Any) -> str | None:
 
 def _json_dumps(value: Any, *, indent: int | None = None) -> str:
     return json.dumps(value, indent=indent, sort_keys=True, allow_nan=False)
+
+
+def _canonical_json_hash(payload: dict[str, Any]) -> str:
+    return "sha256:" + hashlib.sha256(_json_dumps(payload).encode("utf-8")).hexdigest()
 
 
 def _validate_finite_floats(value: Any, path: str) -> None:
@@ -223,6 +319,653 @@ def _write_jsonl_strict_exclusive(
     return path
 
 
+def _normalize_feedback_payload(
+    request: HumanFeedbackCreateRequest,
+    *,
+    reviewer_role: str | None = None,
+) -> dict[str, Any]:
+    normalized: dict[str, Any] = {"decision": request.decision}
+    if request.score is not None:
+        normalized["score"] = request.score
+    if request.confidence is not None:
+        normalized["confidence"] = request.confidence
+    if request.rationale:
+        normalized["rationale"] = request.rationale
+    if reviewer_role:
+        normalized["reviewer_role"] = reviewer_role
+    for field in (
+        "observed_issues",
+        "suggested_changes",
+        "risks",
+        "validation_checks",
+        "labels",
+    ):
+        value = getattr(request, field)
+        if value:
+            normalized[field] = value
+    return normalized
+
+
+_HUMAN_FEEDBACK_DATASET_STATUSES = {
+    HumanFeedbackStatus.AVAILABLE_FOR_EVOLUTION.value,
+}
+_HUMAN_FEEDBACK_LIST_FIELDS = (
+    "observed_issues",
+    "suggested_changes",
+    "risks",
+    "validation_checks",
+    "labels",
+)
+_LOCAL_ARTIFACT_URI_LABEL = "[LOCAL_ARTIFACT_URI]"
+_LOCAL_ARTIFACT_PATH_LABEL = "[LOCAL_ARTIFACT_PATH]"
+_REDACTED_LABEL = "[REDACTED]"
+_URI_RE = re.compile(
+    r"\b[A-Za-z][A-Za-z0-9+.-]*://(?:<redacted>|[^\s\"'<>])+",
+    re.IGNORECASE,
+)
+_RELATIVE_URI_REF_RE = re.compile(
+    r"(?<![\w:/])(?:[A-Za-z0-9._~!$&'()*+,;=@%-]+/)*"
+    r"[A-Za-z0-9._~!$&'()*+,;=@%-]+[?#](?:<redacted>|[^\s\"'<>])+"
+)
+_QUERY_OR_FRAGMENT_REF_RE = re.compile(
+    r"(?<![\w])(?:[?#](?:<redacted>|[^\s\"'<>])+)"
+)
+_POSIX_ABSOLUTE_PATH_RE = re.compile(r"(?<![\w:/])/(?!/)(?:[^\s,;:/]+/)*[^\s,;]+")
+_WINDOWS_UNC_PATH_RE = re.compile(
+    r"\\\\[^\s\\/:*?\"<>|,;]+\\(?:[^\\/:*?\"<>|\r\n,;]+\\)*[^\s\\/:*?\"<>|,;]+"
+)
+_WINDOWS_ABSOLUTE_PATH_RE = re.compile(
+    r"\b[A-Za-z]:[\\/](?:[^\\/:*?\"<>|\r\n,;]+[\\/])*[^\s\\/:*?\"<>|,;]+"
+)
+_SECRET_ASSIGNMENT_RE = re.compile(
+    r"\b[A-Za-z0-9_]*(?:"
+    r"api[_-]?key|access[_-]?key(?:[_-]?id)?|accesskeyid|token|password|secret|"
+    r"authorization"
+    r")[A-Za-z0-9_]*\s*[:=]\s*(?:bearer|basic)?\s*[^\s,;]+",
+    re.IGNORECASE,
+)
+_SENSITIVE_KEY_RE = re.compile(
+    r"(api[_-]?key|access[_-]?key(?:[_-]?id)?|accesskeyid|token|password|secret|"
+    r"authorization)",
+    re.IGNORECASE,
+)
+_AUTHORIZATION_VALUE_RE = re.compile(
+    r"\bAuthorization\s*:\s*(?:Bearer|Basic)?\s*[^\s,;]+",
+    re.IGNORECASE,
+)
+_BEARER_VALUE_RE = re.compile(
+    r"\bBearer\s+[A-Za-z0-9._~+/=-]+",
+    re.IGNORECASE,
+)
+_SENSITIVE_SCHEME_VALUE_RE = re.compile(
+    r"\b(?:bearer|basic)\s*:\s*[^\s,;]+",
+    re.IGNORECASE,
+)
+_AWS_ACCESS_KEY_RE = re.compile(r"\b(?:AKIA|ASIA)[A-Z0-9]{12,}\b")
+
+
+def _sanitize_review_boundary_payload(value: Any, *, uri_context: bool = False) -> Any:
+    if isinstance(value, dict):
+        sanitized: dict[str, Any] = {}
+        for key, child in value.items():
+            text_key = str(key)
+            sanitized_key = _sanitize_review_boundary_key(text_key)
+            if not sanitized_key:
+                continue
+            if _SENSITIVE_KEY_RE.search(text_key):
+                sanitized[sanitized_key] = _REDACTED_LABEL
+                continue
+            sanitized[sanitized_key] = _sanitize_review_boundary_payload(
+                child,
+                uri_context=uri_context or _is_uri_field_key(text_key),
+            )
+        return sanitized
+    if isinstance(value, list):
+        return [
+            _sanitize_review_boundary_payload(item, uri_context=uri_context)
+            for item in value
+        ]
+    if isinstance(value, tuple):
+        return [
+            _sanitize_review_boundary_payload(item, uri_context=uri_context)
+            for item in value
+        ]
+    if isinstance(value, str):
+        return _sanitize_review_boundary_text(value, uri_context=uri_context)
+    return value
+
+
+def _sanitize_review_boundary_key(key: str) -> str:
+    text = key.strip()
+    if not text:
+        return ""
+    if _looks_like_absolute_local_path(text):
+        return _LOCAL_ARTIFACT_PATH_LABEL
+    if _looks_like_uri_reference(text):
+        return _sanitize_uri_reference(text)
+    return _sanitize_review_boundary_text(text)
+
+
+def _sanitize_review_target_ids(values: Any) -> list[str]:
+    if not isinstance(values, list):
+        return []
+    sanitized: list[str] = []
+    for value in values:
+        if not isinstance(value, str):
+            continue
+        text = _sanitize_review_metadata_text(value)
+        if text:
+            sanitized.append(text)
+    return sanitized
+
+
+def _sanitize_review_artifact_hashes(value: Any) -> dict[str, str]:
+    if not isinstance(value, dict):
+        return {}
+    sanitized: dict[str, str] = {}
+    for key, child in value.items():
+        if not isinstance(key, str) or not isinstance(child, str):
+            continue
+        sanitized_key = _sanitize_review_metadata_text(key)
+        sanitized_value = _sanitize_review_metadata_text(child)
+        if sanitized_key and sanitized_value:
+            sanitized[sanitized_key] = sanitized_value
+    return sanitized
+
+
+def _sanitize_review_metadata_text(value: str) -> str:
+    text = value.strip()
+    if not text:
+        return ""
+    if _looks_like_absolute_local_path(text):
+        return _LOCAL_ARTIFACT_PATH_LABEL
+    if _has_sensitive_uri_scheme(text):
+        return _REDACTED_LABEL
+    if _looks_like_uri_reference(text):
+        return _sanitize_uri_reference(text)
+    return _sanitize_review_boundary_text(text)
+
+
+def _has_sensitive_uri_scheme(value: str) -> bool:
+    parsed = urlparse(value.strip())
+    return _is_sensitive_uri_scheme(parsed.scheme)
+
+
+def _is_sensitive_uri_scheme(scheme: str) -> bool:
+    normalized = scheme.lower()
+    if not normalized:
+        return False
+    return normalized in {"bearer", "basic"} or bool(
+        _SENSITIVE_KEY_RE.search(normalized)
+    )
+
+
+def _is_uri_field_key(key: object) -> bool:
+    text = str(key).strip().lower()
+    normalized = re.sub(r"[^a-z0-9]+", "_", text)
+    parts = [part for part in normalized.split("_") if part]
+    if any(part in {"uri", "uris", "url", "urls", "path", "paths"} for part in parts):
+        return True
+    return text.endswith(("uri", "uris", "url", "urls", "path", "paths"))
+
+
+def _sanitize_review_boundary_text(value: str, *, uri_context: bool = False) -> str:
+    text = value.strip()
+    if not text:
+        return ""
+    if uri_context and _looks_like_absolute_local_path(text):
+        return _LOCAL_ARTIFACT_PATH_LABEL
+    if uri_context and _looks_like_uri_reference(text):
+        return _sanitize_uri_reference(text)
+    text = _URI_RE.sub(_sanitize_uri_match, text)
+    text = _RELATIVE_URI_REF_RE.sub(_sanitize_relative_uri_match, text)
+    text = _QUERY_OR_FRAGMENT_REF_RE.sub("<redacted>", text)
+    text = _POSIX_ABSOLUTE_PATH_RE.sub(_redact_posix_path_match, text)
+    text = _WINDOWS_UNC_PATH_RE.sub(_LOCAL_ARTIFACT_PATH_LABEL, text)
+    text = _WINDOWS_ABSOLUTE_PATH_RE.sub(_LOCAL_ARTIFACT_PATH_LABEL, text)
+    text = _AUTHORIZATION_VALUE_RE.sub(_REDACTED_LABEL, text)
+    text = _BEARER_VALUE_RE.sub(_REDACTED_LABEL, text)
+    text = _SENSITIVE_SCHEME_VALUE_RE.sub(_REDACTED_LABEL, text)
+    text = _SECRET_ASSIGNMENT_RE.sub(_REDACTED_LABEL, text)
+    text = _AWS_ACCESS_KEY_RE.sub(_REDACTED_LABEL, text)
+    return text.strip()
+
+
+def _sanitize_uri_match(match: re.Match[str]) -> str:
+    return _sanitize_uri_reference(match.group(0).rstrip(".,);]"))
+
+
+def _sanitize_relative_uri_match(match: re.Match[str]) -> str:
+    candidate = match.group(0).rstrip(".,);]")
+    if _looks_like_uri_reference(candidate):
+        return _sanitize_uri_reference(candidate)
+    return match.group(0)
+
+
+def _sanitize_uri_reference(uri: str) -> str:
+    parsed = urlparse(uri)
+    if _is_sensitive_uri_scheme(parsed.scheme):
+        return _REDACTED_LABEL
+    if parsed.scheme == "file":
+        return _LOCAL_ARTIFACT_URI_LABEL
+    host = parsed.hostname or ""
+    try:
+        port = parsed.port
+    except ValueError:
+        port = None
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    netloc = f"{host}:{port}" if port is not None else host
+    query = "<redacted>" if parsed.query or parsed.fragment else ""
+    return urlunparse(
+        (
+            parsed.scheme,
+            netloc,
+            parsed.path,
+            parsed.params,
+            query,
+            "",
+        )
+    )
+
+
+def _looks_like_uri_reference(value: str) -> bool:
+    stripped = value.strip()
+    if not stripped or any(char.isspace() for char in stripped):
+        return False
+    parsed = urlparse(stripped)
+    return bool(
+        (parsed.scheme and (parsed.netloc or parsed.path))
+        or parsed.netloc
+        or ((parsed.query or parsed.fragment) and parsed.path)
+    )
+
+
+def _looks_like_absolute_local_path(value: str) -> bool:
+    stripped = value.strip()
+    if not stripped or any(char in stripped for char in "\r\n\x00"):
+        return False
+    if _WINDOWS_UNC_PATH_RE.fullmatch(stripped) or _WINDOWS_ABSOLUTE_PATH_RE.fullmatch(
+        stripped
+    ):
+        return True
+    return stripped.startswith("/")
+
+
+def _redact_human_feedback_text(value: str) -> str:
+    return _sanitize_review_boundary_text(value)
+
+
+def _redact_posix_path_match(match: re.Match[str]) -> str:
+    return _LOCAL_ARTIFACT_PATH_LABEL
+
+
+def _sanitize_human_feedback_for_dataset(value: Any) -> list[dict[str, Any]]:
+    if isinstance(value, dict):
+        items = [value]
+    elif isinstance(value, list):
+        items = [item for item in value if isinstance(item, dict)]
+    else:
+        return []
+
+    sanitized_items: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for item in items:
+        status = item.get("status")
+        if not isinstance(status, str) or status not in _HUMAN_FEEDBACK_DATASET_STATUSES:
+            continue
+        source = item.get("normalized_payload")
+        if not isinstance(source, dict):
+            source = item
+        sanitized: dict[str, Any] = {}
+        feedback_id = item.get("feedback_id") or source.get("feedback_id")
+        if isinstance(feedback_id, str) and feedback_id.strip():
+            sanitized["feedback_id"] = _redact_human_feedback_text(feedback_id)
+        sanitized["status"] = HumanFeedbackStatus.AVAILABLE_FOR_EVOLUTION.value
+        decision = source.get("decision")
+        if isinstance(decision, str) and decision.strip():
+            sanitized["decision"] = _redact_human_feedback_text(decision)
+        confidence = source.get("confidence")
+        if isinstance(confidence, int | float):
+            sanitized["confidence"] = float(confidence)
+        score = _bounded_human_feedback_score(source.get("score"))
+        if score is None and source is not item:
+            score = _bounded_human_feedback_score(item.get("score"))
+        if score is not None:
+            sanitized["score"] = score
+        for field in _HUMAN_FEEDBACK_LIST_FIELDS:
+            values = _string_list_for_dataset_feedback(source.get(field))
+            if values:
+                sanitized[field] = values
+        if sanitized:
+            dedupe_key = str(sanitized.get("feedback_id") or json.dumps(sanitized, sort_keys=True))
+            if dedupe_key in seen_ids:
+                continue
+            seen_ids.add(dedupe_key)
+            sanitized_items.append(sanitized)
+    return sanitized_items
+
+
+def _string_list_for_dataset_feedback(value: Any) -> list[str]:
+    if isinstance(value, str):
+        text = _redact_human_feedback_text(value)
+        return [text] if text else []
+    if isinstance(value, list | tuple):
+        values: list[str] = []
+        for item in value:
+            if not isinstance(item, str):
+                continue
+            text = _redact_human_feedback_text(item)
+            if text:
+                values.append(text)
+        return values
+    return []
+
+
+def _string_list(value: Any) -> list[str]:
+    if isinstance(value, str):
+        text = value.strip()
+        return [text] if text else []
+    if isinstance(value, list | tuple):
+        return [item.strip() for item in value if isinstance(item, str) and item.strip()]
+    return []
+
+
+def _feedback_application_target_type(manifest: dict[str, Any]) -> str:
+    value = str(
+        manifest.get("human_feedback_application_target_type")
+        or manifest.get("feedback_application_target_type")
+        or FeedbackApplicationTargetType.PROMPT_SEED.value
+    ).strip()
+    allowed = {item.value for item in FeedbackApplicationTargetType}
+    return value if value in allowed else FeedbackApplicationTargetType.PROMPT_SEED.value
+
+
+def _feedback_application_effect_summary(
+    manifest: dict[str, Any],
+    *,
+    artifact: ArtifactResponse,
+    method: str,
+) -> str:
+    value = manifest.get("human_feedback_application_summary") or manifest.get(
+        "feedback_application_summary"
+    )
+    if isinstance(value, str) and value.strip():
+        return value
+    return (
+        f"Consumed human feedback while running {method} to produce "
+        f"{artifact.type} artifact {artifact.artifact_id}."
+    )
+
+
+def _bounded_human_feedback_score(value: Any) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    score = float(value)
+    if not math.isfinite(score) or score < 0.0 or score > 1.0:
+        return None
+    return score
+
+
+def _add_sanitized_human_feedback(
+    sanitized: list[dict[str, Any]],
+    seen: set[str],
+    value: Any,
+) -> None:
+    for item in _sanitize_human_feedback_for_dataset(value):
+        feedback_id = item.get("feedback_id")
+        if isinstance(feedback_id, str) and feedback_id:
+            existing = next(
+                (
+                    candidate
+                    for candidate in sanitized
+                    if candidate.get("feedback_id") == feedback_id
+                ),
+                None,
+            )
+            if existing is not None:
+                _merge_sanitized_human_feedback(existing, item)
+                continue
+            seen.add(feedback_id)
+            sanitized.append(item)
+            continue
+        dedupe_key = json.dumps(item, sort_keys=True)
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        sanitized.append(item)
+
+
+def _merge_sanitized_human_feedback(
+    target: dict[str, Any],
+    source: dict[str, Any],
+) -> None:
+    target["status"] = HumanFeedbackStatus.AVAILABLE_FOR_EVOLUTION.value
+    for field in ("feedback_id", "decision", "confidence", "score"):
+        if field not in target and source.get(field) not in (None, "", []):
+            target[field] = source[field]
+    for field in _HUMAN_FEEDBACK_LIST_FIELDS:
+        values = source.get(field)
+        if not isinstance(values, list):
+            continue
+        target_values = target.setdefault(field, [])
+        if not isinstance(target_values, list):
+            continue
+        for value in values:
+            if isinstance(value, str) and value not in target_values:
+                target_values.append(value)
+
+
+def _pop_human_feedback_aliases(
+    mapping: dict[str, Any],
+    sanitized: list[dict[str, Any]],
+    seen: set[str],
+    *,
+    keys: tuple[str, ...],
+) -> None:
+    for key in keys:
+        if key in mapping:
+            _add_sanitized_human_feedback(sanitized, seen, mapping.pop(key))
+
+
+def _sanitize_evolution_feedback_mapping(
+    value: Any,
+    sanitized: list[dict[str, Any]],
+    seen: set[str],
+) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    _pop_human_feedback_aliases(value, sanitized, seen, keys=("human", "human_feedback"))
+    return value
+
+
+def _sanitize_human_feedback_in_event_payload(event_payload: dict[str, Any]) -> None:
+    sanitized: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    _pop_human_feedback_aliases(event_payload, sanitized, seen, keys=("human", "human_feedback"))
+    _sanitize_evolution_feedback_mapping(
+        event_payload.get("evolution_feedback"),
+        sanitized,
+        seen,
+    )
+
+    session_result = event_payload.get("session_result")
+    if isinstance(session_result, dict):
+        _pop_human_feedback_aliases(
+            session_result,
+            sanitized,
+            seen,
+            keys=("human", "human_feedback"),
+        )
+        _sanitize_evolution_feedback_mapping(
+            session_result.get("evolution_feedback"),
+            sanitized,
+            seen,
+        )
+        metadata = session_result.get("metadata")
+        if isinstance(metadata, dict):
+            _pop_human_feedback_aliases(
+                metadata,
+                sanitized,
+                seen,
+                keys=("human", "human_feedback"),
+            )
+            _sanitize_evolution_feedback_mapping(
+                metadata.get("evolution_feedback"),
+                sanitized,
+                seen,
+            )
+
+    if sanitized:
+        if not isinstance(session_result, dict):
+            session_result = {}
+            event_payload["session_result"] = session_result
+        metadata = session_result.get("metadata")
+        if not isinstance(metadata, dict):
+            metadata = {}
+            session_result["metadata"] = metadata
+        existing_evolution_feedback = metadata.get("evolution_feedback")
+        if isinstance(existing_evolution_feedback, dict):
+            evolution_feedback = existing_evolution_feedback
+        else:
+            evolution_feedback = {}
+            if _non_empty_evolution_feedback_value(existing_evolution_feedback):
+                evolution_feedback["shared"] = existing_evolution_feedback
+            metadata["evolution_feedback"] = evolution_feedback
+        evolution_feedback["human"] = sanitized
+    else:
+        if isinstance(session_result, dict):
+            metadata = session_result.get("metadata")
+            if isinstance(metadata, dict):
+                evolution_feedback = metadata.get("evolution_feedback")
+                if isinstance(evolution_feedback, dict):
+                    evolution_feedback.pop("human", None)
+
+
+def _non_empty_evolution_feedback_value(value: Any) -> bool:
+    if isinstance(value, dict) or value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, list | tuple | set):
+        return bool(value)
+    return True
+
+
+_REVIEW_STATUSES = {status.value for status in ReviewStatus}
+_ADJUDICATION_TRANSITIONS = {
+    ReviewStatus.SUBMITTED.value: {
+        ReviewStatus.VALIDATED.value,
+        ReviewStatus.ADJUDICATED.value,
+        ReviewStatus.NEEDS_REVISION.value,
+        ReviewStatus.REJECTED_INVALID.value,
+    },
+    ReviewStatus.VALIDATED.value: {
+        ReviewStatus.ADJUDICATED.value,
+        ReviewStatus.CONFLICT.value,
+    },
+    ReviewStatus.ADJUDICATED.value: {ReviewStatus.ARCHIVED_ONLY.value},
+}
+_RESOLVABLE_REVIEW_STATUSES = {
+    ReviewStatus.SUBMITTED.value,
+    ReviewStatus.VALIDATED.value,
+    ReviewStatus.ADJUDICATED.value,
+    ReviewStatus.NEEDS_REVISION.value,
+    ReviewStatus.REJECTED_INVALID.value,
+    ReviewStatus.CONFLICT.value,
+}
+_STALEABLE_REVIEW_STATUSES = {
+    ReviewStatus.CREATED.value,
+    ReviewStatus.QUEUED.value,
+    ReviewStatus.SUBMITTED.value,
+}
+_CONSUMABLE_FEEDBACK_STATUSES = {
+    HumanFeedbackStatus.AVAILABLE_FOR_EVOLUTION.value,
+    HumanFeedbackStatus.CONSUMED.value,
+}
+_ACTIVE_FEEDBACK_STATUSES = (
+    HumanFeedbackStatus.SUBMITTED.value,
+    HumanFeedbackStatus.VALIDATED.value,
+    HumanFeedbackStatus.NORMALIZED.value,
+    HumanFeedbackStatus.REDACTED.value,
+    HumanFeedbackStatus.INDEXED.value,
+    HumanFeedbackStatus.AVAILABLE_FOR_EVOLUTION.value,
+)
+
+
+def _require_review_transition(
+    row: sqlite3.Row,
+    *,
+    review_id: str,
+    action: str,
+    allowed_statuses: set[str],
+) -> str:
+    status = str(row["status"])
+    if status not in allowed_statuses:
+        raise ValueError(f"cannot {action} review {review_id} from status {status}")
+    return status
+
+
+def _archive_active_feedback(
+    conn: sqlite3.Connection,
+    *,
+    review_id: str,
+    status: HumanFeedbackStatus,
+) -> None:
+    conn.execute(
+        """
+        UPDATE human_feedback
+        SET status = ?
+        WHERE review_id = ?
+          AND status IN (?, ?, ?, ?, ?, ?)
+        """,
+        (status.value, review_id, *_ACTIVE_FEEDBACK_STATUSES),
+    )
+
+
+def _insert_human_query_decision_row(
+    conn: sqlite3.Connection,
+    *,
+    query_decision_id: str,
+    request_payload: dict[str, Any],
+    review_id: str | None,
+    created_at: str,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO human_query_decisions (
+            query_decision_id, artifact_ids_json, candidate_ids_json,
+            task_id, round_index, method, decision, reason_codes_json,
+            estimated_value_of_information, estimated_human_cost,
+            budget_context_json, actual_latency_seconds,
+            feedback_changed_promotion, feedback_changed_next_candidate,
+            downstream_delta, review_id, created_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            query_decision_id,
+            _json_dumps(request_payload["artifact_ids"]),
+            _json_dumps(request_payload["candidate_ids"]),
+            request_payload["task_id"],
+            request_payload["round_index"],
+            request_payload["method"],
+            request_payload["decision"],
+            _json_dumps(request_payload["reason_codes"]),
+            request_payload["estimated_value_of_information"],
+            request_payload["estimated_human_cost"],
+            _json_dumps(request_payload["budget_context"]),
+            None,
+            None,
+            None,
+            None,
+            review_id,
+            created_at,
+        ),
+    )
+
+
 class EvolutionStore:
     def __init__(self, *, db_path: str | Path, artifact_root: str | Path) -> None:
         self.db_path = Path(db_path)
@@ -233,7 +976,786 @@ class EvolutionStore:
         self.files.initialize()
         with self.connect() as conn:
             conn.executescript(SCHEMA)
+            self._ensure_schema(conn)
             conn.commit()
+
+    def _ensure_schema(self, conn: sqlite3.Connection) -> None:
+        review_columns = {
+            str(row["name"])
+            for row in conn.execute("PRAGMA table_info(review_requests)").fetchall()
+        }
+        if "adjudication_rationale" not in review_columns:
+            conn.execute("ALTER TABLE review_requests ADD COLUMN adjudication_rationale TEXT")
+        conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_review_requests_query_decision_id_unique
+            ON review_requests(query_decision_id)
+            WHERE query_decision_id IS NOT NULL
+            """
+        )
+        conn.execute(
+            """
+            DELETE FROM feedback_applications
+            WHERE rowid NOT IN (
+                SELECT MIN(rowid)
+                FROM feedback_applications
+                GROUP BY
+                    feedback_id,
+                    target_type,
+                    target_id,
+                    consumed_by_method,
+                    COALESCE(consumed_in_job_id, '')
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_feedback_applications_natural_key_unique
+            ON feedback_applications(
+                feedback_id,
+                target_type,
+                target_id,
+                consumed_by_method,
+                COALESCE(consumed_in_job_id, '')
+            )
+            """
+        )
+
+    def create_review_request(
+        self,
+        request: ReviewRequestCreateRequest,
+    ) -> ReviewRequestResponse:
+        raw_payload = request.model_dump(mode="python")
+        _validate_finite_floats(raw_payload, "request")
+        request_payload = request.model_dump(mode="json")
+        inline_query_decision = request_payload.get("query_decision")
+        inline_query_decision_payload: dict[str, Any] | None = None
+        if inline_query_decision is not None:
+            if request_payload["query_decision_id"] is not None:
+                raise ValueError(
+                    "review request cannot include both query_decision and query_decision_id"
+                )
+            inline_request = HumanQueryDecisionCreateRequest.model_validate(
+                inline_query_decision
+            )
+            _validate_finite_floats(
+                inline_request.model_dump(mode="python"),
+                "query_decision",
+            )
+            inline_query_decision_payload = inline_request.model_dump(mode="json")
+        packet = _sanitize_review_boundary_payload(request_payload["packet"])
+        request_payload["packet"] = packet
+        packet_hash = _canonical_json_hash(packet)
+        packet_json = _json_dumps(packet)
+        request_payload["artifact_ids"] = _sanitize_review_target_ids(
+            request_payload["artifact_ids"]
+        )
+        request_payload["candidate_ids"] = _sanitize_review_target_ids(
+            request_payload["candidate_ids"]
+        )
+        request_payload["artifact_hashes"] = _sanitize_review_artifact_hashes(
+            request_payload["artifact_hashes"]
+        )
+        artifact_ids_json = _json_dumps(request_payload["artifact_ids"])
+        candidate_ids_json = _json_dumps(request_payload["candidate_ids"])
+        artifact_hashes_json = _json_dumps(request_payload["artifact_hashes"])
+        review_id = new_id("rev")
+        now = utc_now_iso()
+
+        with self.connect() as conn:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                if inline_query_decision_payload is not None:
+                    query_decision_id = new_id("hqd")
+                    _insert_human_query_decision_row(
+                        conn,
+                        query_decision_id=query_decision_id,
+                        request_payload=inline_query_decision_payload,
+                        review_id=review_id,
+                        created_at=now,
+                    )
+                    request_payload["query_decision_id"] = query_decision_id
+                if (
+                    request_payload["query_decision_id"] is not None
+                    and inline_query_decision_payload is None
+                ):
+                    query_row = conn.execute(
+                        """
+                        SELECT query_decision_id, review_id
+                        FROM human_query_decisions
+                        WHERE query_decision_id = ?
+                        """,
+                        (request_payload["query_decision_id"],),
+                    ).fetchone()
+                    if query_row is None:
+                        raise ValueError(
+                            f"unknown query decision: {request_payload['query_decision_id']}"
+                        )
+                    if query_row["review_id"] is not None:
+                        raise ValueError(
+                            f"query decision already linked to review: {query_row['review_id']}"
+                        )
+                    existing_review = conn.execute(
+                        """
+                        SELECT review_id
+                        FROM review_requests
+                        WHERE query_decision_id = ?
+                        """,
+                        (request_payload["query_decision_id"],),
+                    ).fetchone()
+                    if existing_review is not None:
+                        raise ValueError(
+                            "query decision already linked to review: "
+                            f"{existing_review['review_id']}"
+                        )
+                packet_row = conn.execute(
+                    "SELECT packet_id FROM review_packets WHERE packet_hash = ?",
+                    (packet_hash,),
+                ).fetchone()
+                if packet_row is None:
+                    packet_id = new_id("rpacket")
+                    conn.execute(
+                        """
+                        INSERT INTO review_packets (
+                            packet_id, packet_hash, packet_json, created_at
+                        )
+                        VALUES (?, ?, ?, ?)
+                        """,
+                        (packet_id, packet_hash, packet_json, now),
+                    )
+                else:
+                    packet_id = str(packet_row["packet_id"])
+
+                conn.execute(
+                    """
+                    INSERT INTO review_requests (
+                        review_id, review_type, status, artifact_ids_json,
+                        candidate_ids_json, job_id, task_id, round_index, method,
+                        artifact_type, packet_id, packet_hash, artifact_hashes_json,
+                        query_decision_id, assigned_to, reviewer_role,
+                        adjudication_rationale, priority, created_at, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        review_id,
+                        request_payload["review_type"],
+                        ReviewStatus.QUEUED.value,
+                        artifact_ids_json,
+                        candidate_ids_json,
+                        request_payload["job_id"],
+                        request_payload["task_id"],
+                        request_payload["round_index"],
+                        request_payload["method"],
+                        request_payload["artifact_type"],
+                        packet_id,
+                        packet_hash,
+                        artifact_hashes_json,
+                        request_payload["query_decision_id"],
+                        None,
+                        None,
+                        None,
+                        request_payload["priority"],
+                        now,
+                        now,
+                    ),
+                )
+                if request_payload["query_decision_id"] is not None:
+                    conn.execute(
+                        """
+                        UPDATE human_query_decisions
+                        SET review_id = ?
+                        WHERE query_decision_id = ?
+                        """,
+                        (review_id, request_payload["query_decision_id"]),
+                    )
+                conn.commit()
+            except Exception:
+                try:
+                    conn.rollback()
+                except sqlite3.Error:
+                    pass
+                raise
+        return self.get_review_request(review_id)
+
+    def get_review_packet(self, packet_id: str) -> ReviewPacketResponse:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT *
+                FROM review_packets
+                WHERE packet_id = ?
+                """,
+                (packet_id,),
+            ).fetchone()
+        if row is None:
+            raise ValueError(f"unknown review packet: {packet_id}")
+        return _review_packet_response_from_row(row)
+
+    def list_review_packets(self) -> list[ReviewPacketResponse]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT *
+                FROM review_packets
+                ORDER BY created_at ASC, packet_id ASC
+                """
+            ).fetchall()
+        return [_review_packet_response_from_row(row) for row in rows]
+
+    def get_review_request(self, review_id: str) -> ReviewRequestResponse:
+        with self.connect() as conn:
+            row = self._review_request_row(conn, review_id)
+        if row is None:
+            raise ValueError(f"unknown review: {review_id}")
+        return _review_request_response_from_row(row)
+
+    def list_review_requests(
+        self,
+        *,
+        status: str | None = None,
+        task_id: str | None = None,
+        assigned_to: str | None = None,
+    ) -> list[ReviewRequestResponse]:
+        clauses: list[str] = []
+        params: list[object] = []
+        if status is not None:
+            clauses.append("rr.status = ?")
+            params.append(status)
+        if task_id is not None:
+            clauses.append("rr.task_id = ?")
+            params.append(task_id)
+        if assigned_to is not None:
+            clauses.append("rr.assigned_to = ?")
+            params.append(assigned_to)
+        where = "WHERE " + " AND ".join(clauses) if clauses else ""
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT rr.*, rp.packet_json
+                FROM review_requests rr
+                JOIN review_packets rp ON rp.packet_id = rr.packet_id
+                {where}
+                ORDER BY rr.priority DESC, rr.created_at ASC, rr.review_id ASC
+                """,
+                params,
+            ).fetchall()
+        return [_review_request_response_from_row(row) for row in rows]
+
+    def claim_review_request(
+        self,
+        review_id: str,
+        request: ReviewClaimRequest,
+    ) -> ReviewRequestResponse:
+        now = utc_now_iso()
+        with self.connect() as conn:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                row = self._review_request_row(conn, review_id)
+                if row is None:
+                    raise ValueError(f"unknown review: {review_id}")
+                _require_review_transition(
+                    row,
+                    review_id=review_id,
+                    action="claim",
+                    allowed_statuses={ReviewStatus.QUEUED.value, ReviewStatus.IN_REVIEW.value},
+                )
+                reviewer_role = request.reviewer_role
+                if row["status"] == ReviewStatus.IN_REVIEW.value:
+                    assigned_to = row["assigned_to"]
+                    if assigned_to is not None and assigned_to != request.reviewer_id:
+                        raise ValueError(
+                            f"review already claimed by another reviewer: {review_id}"
+                        )
+                    existing_role = row["reviewer_role"]
+                    if (
+                        existing_role is not None
+                        and request.reviewer_role is not None
+                        and existing_role != request.reviewer_role
+                    ):
+                        raise ValueError(
+                            f"review already claimed with a different reviewer role: {review_id}"
+                        )
+                    reviewer_role = existing_role or request.reviewer_role
+                conn.execute(
+                    """
+                    UPDATE review_requests
+                    SET status = ?, assigned_to = ?, reviewer_role = ?, updated_at = ?
+                    WHERE review_id = ?
+                    """,
+                    (
+                        ReviewStatus.IN_REVIEW.value,
+                        request.reviewer_id,
+                        reviewer_role,
+                        now,
+                        review_id,
+                    ),
+                )
+                conn.commit()
+            except Exception:
+                try:
+                    conn.rollback()
+                except sqlite3.Error:
+                    pass
+                raise
+        return self.get_review_request(review_id)
+
+    def submit_human_feedback(
+        self,
+        review_id: str,
+        request: HumanFeedbackCreateRequest,
+    ) -> HumanFeedbackResponse:
+        raw_payload = request.model_dump(mode="python")
+        _validate_finite_floats(raw_payload, "request")
+        request_payload = request.model_dump(mode="json")
+        raw_payload_json = _json_dumps(request_payload["raw_payload"])
+        feedback_id = new_id("hfb")
+        now = utc_now_iso()
+        status = HumanFeedbackStatus.AVAILABLE_FOR_EVOLUTION.value
+
+        with self.connect() as conn:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                review_row = self._review_request_row(conn, review_id)
+                if review_row is None:
+                    raise ValueError(f"unknown review: {review_id}")
+                _require_review_transition(
+                    review_row,
+                    review_id=review_id,
+                    action="submit feedback for",
+                    allowed_statuses={ReviewStatus.IN_REVIEW.value},
+                )
+                assigned_to = review_row["assigned_to"]
+                if assigned_to is not None and assigned_to != request_payload["reviewer_id"]:
+                    raise ValueError(f"review claimed by a different reviewer: {review_id}")
+                effective_reviewer_role = request_payload["reviewer_role"]
+                claimed_reviewer_role = review_row["reviewer_role"]
+                if claimed_reviewer_role is not None:
+                    if (
+                        request_payload["reviewer_role"] is not None
+                        and request_payload["reviewer_role"] != claimed_reviewer_role
+                    ):
+                        raise ValueError(
+                            f"feedback reviewer role does not match claimed role: {review_id}"
+                        )
+                    effective_reviewer_role = str(claimed_reviewer_role)
+                normalized_payload = _sanitize_review_boundary_payload(
+                    _normalize_feedback_payload(
+                        request,
+                        reviewer_role=effective_reviewer_role,
+                    )
+                )
+                if not isinstance(normalized_payload, dict):
+                    normalized_payload = {}
+                stored_rationale = _sanitize_review_boundary_text(
+                    request_payload["rationale"] or ""
+                )
+                normalized_payload_json = _json_dumps(normalized_payload)
+                conn.execute(
+                    """
+                    INSERT INTO human_feedback (
+                        feedback_id, review_id, reviewer_id, reviewer_role, status,
+                        decision, score, confidence, rationale, raw_payload_json,
+                        normalized_payload_json, created_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        feedback_id,
+                        review_id,
+                        request_payload["reviewer_id"],
+                        effective_reviewer_role,
+                        status,
+                        request_payload["decision"],
+                        request_payload["score"],
+                        request_payload["confidence"],
+                        stored_rationale,
+                        raw_payload_json,
+                        normalized_payload_json,
+                        now,
+                    ),
+                )
+                conn.execute(
+                    """
+                    UPDATE review_requests
+                    SET status = ?, updated_at = ?
+                    WHERE review_id = ?
+                    """,
+                    (ReviewStatus.SUBMITTED.value, now, review_id),
+                )
+                conn.commit()
+            except Exception:
+                try:
+                    conn.rollback()
+                except sqlite3.Error:
+                    pass
+                raise
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM human_feedback WHERE feedback_id = ?",
+                (feedback_id,),
+            ).fetchone()
+        if row is None:
+            raise ValueError(f"unknown feedback: {feedback_id}")
+        return _human_feedback_response_from_row(row)
+
+    def list_human_feedback(
+        self,
+        *,
+        review_id: str | None = None,
+    ) -> list[HumanFeedbackResponse]:
+        with self.connect() as conn:
+            if review_id is not None:
+                if self._review_request_row(conn, review_id) is None:
+                    raise ValueError(f"unknown review: {review_id}")
+                rows = conn.execute(
+                    """
+                    SELECT * FROM human_feedback
+                    WHERE review_id = ?
+                    ORDER BY created_at ASC, feedback_id ASC
+                    """,
+                    (review_id,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT * FROM human_feedback
+                    ORDER BY created_at ASC, feedback_id ASC
+                    """
+                ).fetchall()
+        return [_human_feedback_response_from_row(row) for row in rows]
+
+    def adjudicate_review_request(
+        self,
+        review_id: str,
+        request: ReviewAdjudicationRequest,
+    ) -> ReviewRequestResponse:
+        target_status = str(request.status)
+        rationale = (
+            None
+            if request.rationale is None
+            else _sanitize_review_boundary_text(request.rationale)
+        )
+        now = utc_now_iso()
+        with self.connect() as conn:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                row = self._review_request_row(conn, review_id)
+                if row is None:
+                    raise ValueError(f"unknown review: {review_id}")
+                current_status = str(row["status"])
+                allowed_targets = _ADJUDICATION_TRANSITIONS.get(current_status, set())
+                if target_status not in allowed_targets:
+                    raise ValueError(
+                        f"cannot adjudicate review {review_id} from status "
+                        f"{current_status} to {target_status}"
+                    )
+                conn.execute(
+                    """
+                    UPDATE review_requests
+                    SET status = ?, adjudication_rationale = ?, updated_at = ?
+                    WHERE review_id = ?
+                    """,
+                    (target_status, rationale, now, review_id),
+                )
+                if target_status == ReviewStatus.REJECTED_INVALID.value:
+                    _archive_active_feedback(
+                        conn,
+                        review_id=review_id,
+                        status=HumanFeedbackStatus.REJECTED_INVALID,
+                    )
+                elif target_status == ReviewStatus.ARCHIVED_ONLY.value:
+                    _archive_active_feedback(
+                        conn,
+                        review_id=review_id,
+                        status=HumanFeedbackStatus.ARCHIVED_ONLY,
+                    )
+                conn.commit()
+            except Exception:
+                try:
+                    conn.rollback()
+                except sqlite3.Error:
+                    pass
+                raise
+        return self.get_review_request(review_id)
+
+    def resolve_review_request(self, review_id: str) -> ReviewRequestResponse:
+        now = utc_now_iso()
+        with self.connect() as conn:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                row = self._review_request_row(conn, review_id)
+                if row is None:
+                    raise ValueError(f"unknown review: {review_id}")
+                _require_review_transition(
+                    row,
+                    review_id=review_id,
+                    action="resolve",
+                    allowed_statuses=_RESOLVABLE_REVIEW_STATUSES,
+                )
+                conn.execute(
+                    """
+                    UPDATE review_requests
+                    SET status = ?, updated_at = ?
+                    WHERE review_id = ?
+                    """,
+                    (ReviewStatus.RESOLVED.value, now, review_id),
+                )
+                conn.commit()
+            except Exception:
+                try:
+                    conn.rollback()
+                except sqlite3.Error:
+                    pass
+                raise
+        return self.get_review_request(review_id)
+
+    def mark_review_stale(self, review_id: str) -> ReviewRequestResponse:
+        now = utc_now_iso()
+        with self.connect() as conn:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                row = self._review_request_row(conn, review_id)
+                if row is None:
+                    raise ValueError(f"unknown review: {review_id}")
+                status = str(row["status"])
+                if status not in _STALEABLE_REVIEW_STATUSES:
+                    raise ValueError(
+                        f"cannot mark review {review_id} stale from status {status}"
+                    )
+                conn.execute(
+                    """
+                    UPDATE review_requests
+                    SET status = ?, updated_at = ?
+                    WHERE review_id = ?
+                    """,
+                    (ReviewStatus.STALE.value, now, review_id),
+                )
+                conn.execute(
+                    """
+                    UPDATE human_feedback
+                    SET status = ?
+                    WHERE review_id = ?
+                      AND status IN (?, ?)
+                    """,
+                    (
+                        HumanFeedbackStatus.ARCHIVED_ONLY.value,
+                        review_id,
+                        HumanFeedbackStatus.AVAILABLE_FOR_EVOLUTION.value,
+                        HumanFeedbackStatus.CONSUMED.value,
+                    ),
+                )
+                conn.commit()
+            except Exception:
+                try:
+                    conn.rollback()
+                except sqlite3.Error:
+                    pass
+                raise
+        return self.get_review_request(review_id)
+
+    def create_feedback_application(
+        self,
+        request: FeedbackApplicationCreateRequest,
+    ) -> FeedbackApplicationResponse:
+        request_payload = request.model_dump(mode="json")
+        for key in ("target_id", "consumed_by_method", "consumed_in_job_id"):
+            value = request_payload.get(key)
+            if isinstance(value, str):
+                request_payload[key] = _sanitize_review_metadata_text(value)
+        request_payload["effect_summary"] = _sanitize_review_boundary_text(
+            request_payload["effect_summary"]
+        )
+        application_id = new_id("hfa")
+        now = utc_now_iso()
+        with self.connect() as conn:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                feedback_row = self._feedback_row(conn, request.feedback_id)
+                if feedback_row is None:
+                    raise ValueError(f"unknown feedback: {request.feedback_id}")
+                if feedback_row["status"] not in _CONSUMABLE_FEEDBACK_STATUSES:
+                    raise ValueError(f"feedback is not available for evolution: {request.feedback_id}")
+                review_row = conn.execute(
+                    """
+                    SELECT status
+                    FROM review_requests
+                    WHERE review_id = ?
+                    """,
+                    (feedback_row["review_id"],),
+                ).fetchone()
+                if review_row is None:
+                    raise ValueError(f"unknown review: {feedback_row['review_id']}")
+                if review_row["status"] in {
+                    ReviewStatus.STALE.value,
+                    ReviewStatus.REJECTED_INVALID.value,
+                    ReviewStatus.ARCHIVED_ONLY.value,
+                }:
+                    raise ValueError(
+                        f"feedback parent review is not available for evolution: {request.feedback_id}"
+                    )
+                existing_application = conn.execute(
+                    """
+                    SELECT *
+                    FROM feedback_applications
+                    WHERE feedback_id = ?
+                      AND target_type = ?
+                      AND target_id = ?
+                      AND consumed_by_method = ?
+                      AND COALESCE(consumed_in_job_id, '') = COALESCE(?, '')
+                    """,
+                    (
+                        request_payload["feedback_id"],
+                        request_payload["target_type"],
+                        request_payload["target_id"],
+                        request_payload["consumed_by_method"],
+                        request_payload["consumed_in_job_id"],
+                    ),
+                ).fetchone()
+                if existing_application is not None:
+                    if existing_application["effect_summary"] != request_payload["effect_summary"]:
+                        raise ValueError(
+                            "feedback application already exists with a different effect summary: "
+                            f"{request.feedback_id}"
+                        )
+                    conn.commit()
+                    return _feedback_application_response_from_row(existing_application)
+                conn.execute(
+                    """
+                    INSERT INTO feedback_applications (
+                        application_id, feedback_id, target_type, target_id,
+                        consumed_by_method, consumed_in_job_id, effect_summary,
+                        created_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        application_id,
+                        request_payload["feedback_id"],
+                        request_payload["target_type"],
+                        request_payload["target_id"],
+                        request_payload["consumed_by_method"],
+                        request_payload["consumed_in_job_id"],
+                        request_payload["effect_summary"],
+                        now,
+                    ),
+                )
+                if feedback_row["status"] == HumanFeedbackStatus.AVAILABLE_FOR_EVOLUTION.value:
+                    conn.execute(
+                        """
+                        UPDATE human_feedback
+                        SET status = ?
+                        WHERE feedback_id = ?
+                        """,
+                        (HumanFeedbackStatus.CONSUMED.value, request.feedback_id),
+                    )
+                conn.commit()
+            except Exception:
+                try:
+                    conn.rollback()
+                except sqlite3.Error:
+                    pass
+                raise
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM feedback_applications WHERE application_id = ?",
+                (application_id,),
+            ).fetchone()
+        if row is None:
+            raise ValueError(f"unknown feedback application: {application_id}")
+        return _feedback_application_response_from_row(row)
+
+    def list_feedback_applications(
+        self,
+        *,
+        feedback_id: str | None = None,
+    ) -> list[FeedbackApplicationResponse]:
+        with self.connect() as conn:
+            if feedback_id is not None:
+                if self._feedback_row(conn, feedback_id) is None:
+                    raise ValueError(f"unknown feedback: {feedback_id}")
+                rows = conn.execute(
+                    """
+                    SELECT * FROM feedback_applications
+                    WHERE feedback_id = ?
+                    ORDER BY created_at ASC, application_id ASC
+                    """,
+                    (feedback_id,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT * FROM feedback_applications
+                    ORDER BY created_at ASC, application_id ASC
+                    """
+                ).fetchall()
+        return [_feedback_application_response_from_row(row) for row in rows]
+
+    def create_human_query_decision(
+        self,
+        request: HumanQueryDecisionCreateRequest,
+    ) -> HumanQueryDecisionResponse:
+        raw_payload = request.model_dump(mode="python")
+        _validate_finite_floats(raw_payload, "request")
+        request_payload = request.model_dump(mode="json")
+        query_decision_id = new_id("hqd")
+        now = utc_now_iso()
+        with self.connect() as conn:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                _insert_human_query_decision_row(
+                    conn,
+                    query_decision_id=query_decision_id,
+                    request_payload=request_payload,
+                    review_id=None,
+                    created_at=now,
+                )
+                conn.commit()
+            except Exception:
+                try:
+                    conn.rollback()
+                except sqlite3.Error:
+                    pass
+                raise
+        return self.get_human_query_decision(query_decision_id)
+
+    def get_human_query_decision(
+        self,
+        query_decision_id: str,
+    ) -> HumanQueryDecisionResponse:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM human_query_decisions WHERE query_decision_id = ?",
+                (query_decision_id,),
+            ).fetchone()
+        if row is None:
+            raise ValueError(f"unknown query decision: {query_decision_id}")
+        return _human_query_decision_response_from_row(row)
+
+    def _review_request_row(
+        self,
+        conn: sqlite3.Connection,
+        review_id: str,
+    ) -> sqlite3.Row | None:
+        return conn.execute(
+            """
+            SELECT rr.*, rp.packet_json
+            FROM review_requests rr
+            JOIN review_packets rp ON rp.packet_id = rr.packet_id
+            WHERE rr.review_id = ?
+            """,
+            (review_id,),
+        ).fetchone()
+
+    def _feedback_row(
+        self,
+        conn: sqlite3.Connection,
+        feedback_id: str,
+    ) -> sqlite3.Row | None:
+        return conn.execute(
+            "SELECT * FROM human_feedback WHERE feedback_id = ?",
+            (feedback_id,),
+        ).fetchone()
 
     def ingest_event(self, request: EventIngestRequest) -> EventIngestResponse:
         with self.connect() as conn:
@@ -399,6 +1921,78 @@ class EvolutionStore:
                 promoted=request_payload["promoted"],
             )
         raise RuntimeError("could not allocate unique artifact id")
+
+    def get_artifact(self, artifact_id: str) -> ArtifactResponse:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM artifacts WHERE artifact_id = ?",
+                (artifact_id,),
+            ).fetchone()
+        if row is None:
+            raise ValueError(f"unknown artifact: {artifact_id}")
+        return _artifact_response_from_row(row)
+
+    def update_artifact_promotion(
+        self,
+        artifact_id: str,
+        *,
+        promoted: bool,
+    ) -> ArtifactResponse:
+        with self.connect() as conn:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute(
+                    "SELECT * FROM artifacts WHERE artifact_id = ?",
+                    (artifact_id,),
+                ).fetchone()
+                if row is None:
+                    raise ValueError(f"unknown artifact: {artifact_id}")
+                manifest_path = Path(str(row["manifest_path"]))
+                try:
+                    manifest_payload = json.loads(
+                        manifest_path.read_text(encoding="utf-8")
+                    )
+                except FileNotFoundError as exc:
+                    raise ValueError(
+                        f"artifact {artifact_id} manifest file is missing: {manifest_path}"
+                    ) from exc
+                except json.JSONDecodeError as exc:
+                    raise ValueError(
+                        f"artifact {artifact_id} manifest file is not valid JSON: "
+                        f"{manifest_path}"
+                    ) from exc
+                if not isinstance(manifest_payload, dict):
+                    raise ValueError(
+                        f"artifact {artifact_id} manifest file is not a JSON object: "
+                        f"{manifest_path}"
+                    )
+                manifest_payload["promoted"] = bool(promoted)
+                manifest_path.write_text(
+                    _json_dumps(manifest_payload, indent=2),
+                    encoding="utf-8",
+                )
+                conn.execute(
+                    "UPDATE artifacts SET promoted = ? WHERE artifact_id = ?",
+                    (1 if promoted else 0, artifact_id),
+                )
+                conn.commit()
+            except Exception:
+                try:
+                    conn.rollback()
+                except sqlite3.Error:
+                    pass
+                raise
+        return self.get_artifact(artifact_id)
+
+    def update_artifact_promotion_from_request(
+        self,
+        artifact_id: str,
+        request: ArtifactPromotionUpdateRequest,
+    ) -> ArtifactResponse:
+        return self.update_artifact_promotion(
+            artifact_id,
+            promoted=request.promoted,
+        )
 
     def _promoted_artifact_rows(self) -> list[dict[str, object]]:
         with self.connect() as conn:
@@ -872,10 +2466,14 @@ class EvolutionStore:
         raw_payload = request.model_dump(mode="python")
         _validate_finite_floats(raw_payload["report"], "report")
 
+        force_unpromoted_outputs = False
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
-                self._assert_job_lease(conn, job_id, request.lease_id)
+                job_row = self._assert_job_lease(conn, job_id, request.lease_id)
+                job_config = json.loads(str(job_row["config_json"]))
+                if isinstance(job_config, dict):
+                    force_unpromoted_outputs = job_config.get("promoted") is False
                 conn.rollback()
             except Exception:
                 try:
@@ -885,10 +2483,17 @@ class EvolutionStore:
                 raise
 
         registered_artifact_ids: list[str] = []
+        registered_artifacts: list[ArtifactResponse] = []
         try:
             for artifact_request in request.artifacts:
-                artifact = self.register_artifact(artifact_request)
+                request_to_register = (
+                    artifact_request.model_copy(update={"promoted": False})
+                    if force_unpromoted_outputs
+                    else artifact_request
+                )
+                artifact = self.register_artifact(request_to_register)
                 registered_artifact_ids.append(artifact.artifact_id)
+                registered_artifacts.append(artifact)
 
             with self.connect() as conn:
                 try:
@@ -908,6 +2513,14 @@ class EvolutionStore:
                                 """,
                                 (input_artifact_id, output_artifact_id, "job_input"),
                             )
+                    method = str(job_row["method"])
+                    for artifact in registered_artifacts:
+                        self._materialize_feedback_applications_for_artifact(
+                            conn,
+                            artifact=artifact,
+                            job_id=job_id,
+                            method=method,
+                        )
                     conn.execute(
                         """
                         UPDATE jobs
@@ -951,6 +2564,102 @@ class EvolutionStore:
             "state": str(JobState.SUCCEEDED),
             "artifact_ids": registered_artifact_ids,
         }
+
+    def _materialize_feedback_applications_for_artifact(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        artifact: ArtifactResponse,
+        job_id: str,
+        method: str,
+    ) -> None:
+        feedback_ids = _string_list(artifact.manifest.get("human_feedback_ids"))
+        if not feedback_ids:
+            return
+        target_type = _feedback_application_target_type(artifact.manifest)
+        consumed_by_method = method
+        effect_summary = _feedback_application_effect_summary(
+            artifact.manifest,
+            artifact=artifact,
+            method=consumed_by_method,
+        )
+        now = utc_now_iso()
+        for feedback_id in dict.fromkeys(feedback_ids):
+            feedback_row = self._feedback_row(conn, feedback_id)
+            if feedback_row is None:
+                continue
+            if feedback_row["status"] not in _CONSUMABLE_FEEDBACK_STATUSES:
+                continue
+            review_row = conn.execute(
+                """
+                SELECT status
+                FROM review_requests
+                WHERE review_id = ?
+                """,
+                (feedback_row["review_id"],),
+            ).fetchone()
+            if review_row is None or review_row["status"] in {
+                ReviewStatus.STALE.value,
+                ReviewStatus.REJECTED_INVALID.value,
+                ReviewStatus.ARCHIVED_ONLY.value,
+            }:
+                continue
+            request_payload = {
+                "feedback_id": feedback_id,
+                "target_type": target_type,
+                "target_id": _sanitize_review_metadata_text(artifact.artifact_id),
+                "consumed_by_method": _sanitize_review_metadata_text(consumed_by_method),
+                "consumed_in_job_id": _sanitize_review_metadata_text(job_id),
+                "effect_summary": _sanitize_review_boundary_text(effect_summary),
+            }
+            existing_application = conn.execute(
+                """
+                SELECT 1
+                FROM feedback_applications
+                WHERE feedback_id = ?
+                  AND target_type = ?
+                  AND target_id = ?
+                  AND consumed_by_method = ?
+                  AND COALESCE(consumed_in_job_id, '') = COALESCE(?, '')
+                """,
+                (
+                    request_payload["feedback_id"],
+                    request_payload["target_type"],
+                    request_payload["target_id"],
+                    request_payload["consumed_by_method"],
+                    request_payload["consumed_in_job_id"],
+                ),
+            ).fetchone()
+            if existing_application is None:
+                conn.execute(
+                    """
+                    INSERT INTO feedback_applications (
+                        application_id, feedback_id, target_type, target_id,
+                        consumed_by_method, consumed_in_job_id, effect_summary,
+                        created_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        new_id("hfa"),
+                        request_payload["feedback_id"],
+                        request_payload["target_type"],
+                        request_payload["target_id"],
+                        request_payload["consumed_by_method"],
+                        request_payload["consumed_in_job_id"],
+                        request_payload["effect_summary"],
+                        now,
+                    ),
+                )
+            if feedback_row["status"] == HumanFeedbackStatus.AVAILABLE_FOR_EVOLUTION.value:
+                conn.execute(
+                    """
+                    UPDATE human_feedback
+                    SET status = ?
+                    WHERE feedback_id = ?
+                    """,
+                    (HumanFeedbackStatus.CONSUMED.value, feedback_id),
+                )
 
     def fail_job(self, job_id: str, request: WorkerFailRequest) -> dict[str, object]:
         next_state = JobState.PENDING if request.retryable else JobState.FAILED
@@ -1096,6 +2805,7 @@ class EvolutionStore:
         event_payload = payload.get("payload")
         if not isinstance(event_payload, dict):
             event_payload = {}
+        _sanitize_human_feedback_in_event_payload(event_payload)
         traces = self._traces_from_event_payload(event_payload)
         return {
             "event_id": row["event_id"],
@@ -1338,3 +3048,118 @@ def _artifact_id_allowed(
         return True
     artifact_id = row.get("artifact_id")
     return isinstance(artifact_id, str) and artifact_id in requested_artifact_ids
+
+
+def _artifact_response_from_row(row: sqlite3.Row) -> ArtifactResponse:
+    manifest_path = Path(str(row["manifest_path"]))
+    manifest_payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest = manifest_payload.get("manifest") if isinstance(manifest_payload, dict) else {}
+    if not isinstance(manifest, dict):
+        manifest = {}
+    return ArtifactResponse(
+        artifact_id=str(row["artifact_id"]),
+        type=row["type"],
+        name=str(row["name"]),
+        version=int(row["version"]),
+        state=row["state"],
+        uri=str(row["uri"]),
+        manifest=manifest,
+        compatibility=json.loads(str(row["compatibility_json"])),
+        scores=json.loads(str(row["scores_json"])),
+        tags=json.loads(str(row["tags_json"])),
+        promoted=bool(row["promoted"]),
+    )
+
+
+def _review_request_response_from_row(row: sqlite3.Row) -> ReviewRequestResponse:
+    return ReviewRequestResponse(
+        review_id=str(row["review_id"]),
+        review_type=str(row["review_type"]),
+        status=str(row["status"]),
+        artifact_ids=json.loads(str(row["artifact_ids_json"])),
+        candidate_ids=json.loads(str(row["candidate_ids_json"])),
+        job_id=row["job_id"],
+        task_id=row["task_id"],
+        round_index=row["round_index"],
+        method=row["method"],
+        artifact_type=row["artifact_type"],
+        packet_id=str(row["packet_id"]),
+        packet_hash=str(row["packet_hash"]),
+        packet=json.loads(str(row["packet_json"])),
+        artifact_hashes=json.loads(str(row["artifact_hashes_json"])),
+        query_decision_id=row["query_decision_id"],
+        assigned_to=row["assigned_to"],
+        reviewer_role=row["reviewer_role"],
+        adjudication_rationale=row["adjudication_rationale"],
+        priority=int(row["priority"]),
+        created_at=str(row["created_at"]),
+        updated_at=str(row["updated_at"]),
+    )
+
+
+def _review_packet_response_from_row(row: sqlite3.Row) -> ReviewPacketResponse:
+    return ReviewPacketResponse(
+        packet_id=str(row["packet_id"]),
+        packet_hash=str(row["packet_hash"]),
+        packet=json.loads(str(row["packet_json"])),
+        created_at=str(row["created_at"]),
+    )
+
+
+def _human_feedback_response_from_row(row: sqlite3.Row) -> HumanFeedbackResponse:
+    return HumanFeedbackResponse(
+        feedback_id=str(row["feedback_id"]),
+        review_id=str(row["review_id"]),
+        reviewer_id=str(row["reviewer_id"]),
+        reviewer_role=row["reviewer_role"],
+        status=str(row["status"]),
+        decision=str(row["decision"]),
+        score=row["score"],
+        confidence=row["confidence"],
+        rationale=str(row["rationale"]),
+        normalized_payload=json.loads(str(row["normalized_payload_json"])),
+        created_at=str(row["created_at"]),
+    )
+
+
+def _feedback_application_response_from_row(row: sqlite3.Row) -> FeedbackApplicationResponse:
+    return FeedbackApplicationResponse(
+        application_id=str(row["application_id"]),
+        feedback_id=str(row["feedback_id"]),
+        target_type=str(row["target_type"]),
+        target_id=str(row["target_id"]),
+        consumed_by_method=str(row["consumed_by_method"]),
+        consumed_in_job_id=row["consumed_in_job_id"],
+        effect_summary=str(row["effect_summary"]),
+        created_at=str(row["created_at"]),
+    )
+
+
+def _human_query_decision_response_from_row(row: sqlite3.Row) -> HumanQueryDecisionResponse:
+    feedback_changed_promotion = row["feedback_changed_promotion"]
+    feedback_changed_next_candidate = row["feedback_changed_next_candidate"]
+    return HumanQueryDecisionResponse(
+        query_decision_id=str(row["query_decision_id"]),
+        artifact_ids=json.loads(str(row["artifact_ids_json"])),
+        candidate_ids=json.loads(str(row["candidate_ids_json"])),
+        task_id=row["task_id"],
+        round_index=row["round_index"],
+        method=row["method"],
+        decision=str(row["decision"]),
+        reason_codes=json.loads(str(row["reason_codes_json"])),
+        estimated_value_of_information=row["estimated_value_of_information"],
+        estimated_human_cost=row["estimated_human_cost"],
+        budget_context=json.loads(str(row["budget_context_json"])),
+        actual_latency_seconds=row["actual_latency_seconds"],
+        feedback_changed_promotion=(
+            None if feedback_changed_promotion is None else bool(feedback_changed_promotion)
+        ),
+        feedback_changed_next_candidate=(
+            None
+            if feedback_changed_next_candidate is None
+            else bool(feedback_changed_next_candidate)
+        ),
+        downstream_delta=row["downstream_delta"],
+        review_id=row["review_id"],
+        created_at=str(row["created_at"]),
+    )

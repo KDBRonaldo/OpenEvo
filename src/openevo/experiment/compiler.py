@@ -5,7 +5,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from openevo.experiment.models import ExperimentConfig, TaskConfig
+from openevo.experiment.models import (
+    ExperimentConfig,
+    PROMOTION_SUPPORT_FIELDS,
+    TaskConfig,
+)
 
 _EVOLUTION_ORDER = ("text_memory", "skill_bundle", "agent_system")
 _ROLLOUT_CONTEXT_ARTIFACT_TYPES = _EVOLUTION_ORDER
@@ -44,6 +48,7 @@ class CompiledTask:
     agent: dict[str, Any]
     runtime: dict[str, Any] | None
     metadata: dict[str, Any]
+    promotion_gate: dict[str, Any]
 
     def policy_version_for_round(self, round_index: int) -> str:
         self._validate_round_index(round_index)
@@ -124,7 +129,10 @@ class CompiledTask:
                 "name": f"{self.task_id}:{spec.artifact_type}:round-{round_index}",
                 "experiment_id": self.experiment_id,
                 "experiment_name": self.experiment_name,
-                "promoted": True,
+                "promoted": not _promotion_gate_targets_artifact(
+                    self.promotion_gate,
+                    spec.artifact_type,
+                ),
                 "task_id": self.task_id,
                 "task_tags": self._task_tags(),
                 "round_index": round_index,
@@ -141,6 +149,14 @@ class CompiledTask:
                     "agent_harness": [str(self.agent.get("harness") or "")],
                 },
             }
+            if _promotion_gate_targets_artifact(self.promotion_gate, spec.artifact_type):
+                payload["config"]["promotion_gate"] = _worker_visible_promotion_gate(
+                    self.promotion_gate
+                )
+                payload["config"]["promotion_contract"] = {
+                    "required": bool(self.promotion_gate.get("require_support", True)),
+                    "fields": list(PROMOTION_SUPPORT_FIELDS),
+                }
             jobs.append(payload)
         return jobs
 
@@ -172,6 +188,7 @@ class CompiledExperiment:
     evolution_backend_url: str
     tasks: list[CompiledTask]
     reflector_llm: dict[str, str]
+    promotion_gate: dict[str, Any]
     _config: ExperimentConfig
 
     def evolution_methods_for_round(self, round_index: int) -> list[CompiledEvolutionMethodSpec]:
@@ -250,10 +267,12 @@ def compile_experiment(
                 agent=agent,
                 runtime=_runtime_for_task(runtime, task, config_path=config_path),
                 metadata=dict(task.metadata),
+                promotion_gate=_promotion_gate(config),
             )
             for task in selected_tasks
         ],
         reflector_llm=_reflector_llm(config),
+        promotion_gate=_promotion_gate(config),
         _config=config,
     )
 
@@ -396,6 +415,33 @@ def _reflector_llm(config: ExperimentConfig) -> dict[str, str]:
         else "openai_chat"
     )
     return {"provider": provider, "model": config.agent.model}
+
+
+def _promotion_gate(config: ExperimentConfig) -> dict[str, Any]:
+    gate = config.evolution.promotion_gate.model_dump(mode="json")
+    if not gate.get("llm"):
+        gate["llm"] = _reflector_llm(config)
+    return gate
+
+
+def _worker_visible_promotion_gate(promotion_gate: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        str(key): value
+        for key, value in promotion_gate.items()
+        if key != "llm"
+    }
+
+
+def _promotion_gate_targets_artifact(
+    promotion_gate: Mapping[str, Any],
+    artifact_type: str,
+) -> bool:
+    if promotion_gate.get("mode") == "none":
+        return False
+    artifact_types = promotion_gate.get("artifact_types")
+    if not isinstance(artifact_types, Sequence) or isinstance(artifact_types, str):
+        return False
+    return artifact_type in artifact_types
 
 
 def _validate_round_index(round_index: int, round_count: int) -> None:

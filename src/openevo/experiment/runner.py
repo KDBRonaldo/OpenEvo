@@ -15,6 +15,13 @@ from openevo.experiment.clients import EvolutionClientProtocol, EvolutionHttpCli
 from openevo.experiment.clients import RolloutClientProtocol, RolloutHttpClient
 from openevo.experiment.compiler import CompiledExperiment, compile_experiment
 from openevo.experiment.models import ExperimentConfig
+from openevo.experiment.promotion import (
+    PromotionReviewer,
+    artifact_hashes_from_review_packet,
+    evaluate_promotion_gate,
+    review_request_payload_from_packet,
+    sanitize_review_text,
+)
 
 WorkerRunner = Callable[..., list[dict[str, Any]]]
 
@@ -103,6 +110,7 @@ def run_experiment(
     rollout_client: RolloutClientProtocol | None = None,
     evolution_client: EvolutionClientProtocol | None = None,
     worker_runner: WorkerRunner | None = None,
+    promotion_reviewer: PromotionReviewer | None = None,
     poll_interval_seconds: float = 2.0,
     max_poll_attempts: int = 1800,
 ) -> dict[str, Any]:
@@ -136,6 +144,8 @@ def run_experiment(
             evolution_client=evolution,
             worker_runner=worker_runner,
             artifact_root=artifact_root,
+            output_root=output_root,
+            promotion_reviewer=promotion_reviewer,
             poll_interval_seconds=poll_interval_seconds,
             max_poll_attempts=max_poll_attempts,
         )
@@ -147,11 +157,12 @@ def run_experiment(
 
     summary_path = output_root / "summary.json"
     result["summary_path"] = str(summary_path)
+    public_result = _strip_internal_fields(result)
     summary_path.write_text(
-        json.dumps(result, indent=2, sort_keys=True, allow_nan=False) + "\n",
+        json.dumps(public_result, indent=2, sort_keys=True, allow_nan=False) + "\n",
         encoding="utf-8",
     )
-    return result
+    return public_result
 
 
 def _run_compiled_experiment(
@@ -161,11 +172,14 @@ def _run_compiled_experiment(
     evolution_client: EvolutionClientProtocol,
     worker_runner: WorkerRunner | None,
     artifact_root: Path,
+    output_root: Path,
+    promotion_reviewer: PromotionReviewer | None,
     poll_interval_seconds: float,
     max_poll_attempts: int,
 ) -> dict[str, Any]:
     task_results: list[dict[str, Any]] = []
     any_failure = False
+    any_pending_review = False
     run_id = compiled.run_id or uuid4().hex
     for task in compiled.tasks:
         history_context_artifact_ids: dict[str, list[str]] = {
@@ -278,12 +292,63 @@ def _run_compiled_experiment(
                     else "missing_artifacts"
                 )
                 if worker_status == "succeeded":
+                    approved_artifact_ids = list(artifact_ids)
+                    promotion_status = "skipped"
+                    promotion_reviews: list[dict[str, Any]] = []
+                    if _promotion_gate_targets_artifact(
+                        compiled.promotion_gate,
+                        spec.artifact_type,
+                    ):
+                        artifacts = [
+                            evolution_client.get_artifact(artifact_id)
+                            for artifact_id in artifact_ids
+                        ]
+                        _demote_already_promoted_artifacts(evolution_client, artifacts)
+                        promotion_result = evaluate_promotion_gate(
+                            gate_config=compiled.promotion_gate,
+                            artifact_type=spec.artifact_type,
+                            method=spec.method,
+                            task_id=task.task_id,
+                            round_index=round_index,
+                            job_id=created_job_id,
+                            job_payload=job_payload,
+                            artifacts=artifacts,
+                            output_root=output_root,
+                            content_roots=[artifact_root],
+                            reviewer=promotion_reviewer,
+                        )
+                        approved_artifact_ids = list(
+                            promotion_result["approved_artifact_ids"]
+                        )
+                        promotion_status = str(promotion_result["status"])
+                        promotion_reviews = list(promotion_result["reviews"])
+                        _create_backend_promotion_reviews(
+                            evolution_client,
+                            promotion_reviews,
+                        )
+                        if promotion_status in {"approved", "partially_approved"}:
+                            for artifact_id in approved_artifact_ids:
+                                evolution_client.update_artifact_promotion(
+                                    artifact_id,
+                                    promoted=True,
+                                )
+                        elif promotion_status == "pending_review":
+                            any_pending_review = True
+                            round_failed = True
+                        else:
+                            any_failure = True
+                            round_failed = True
+
                     history_context_artifact_ids.setdefault(spec.artifact_type, []).extend(
-                        artifact_ids
+                        approved_artifact_ids
                     )
                     next_rollout_context_artifact_ids[spec.artifact_type] = list(
-                        artifact_ids
+                        approved_artifact_ids
                     )
+                else:
+                    approved_artifact_ids = []
+                    promotion_status = "not_applicable"
+                    promotion_reviews = []
                 round_result["jobs"].append(
                     {
                         "artifact_type": spec.artifact_type,
@@ -294,6 +359,9 @@ def _run_compiled_experiment(
                         "worker_error": worker_error,
                         "unexpected_job_ids": unexpected_job_ids,
                         "artifact_ids": artifact_ids,
+                        "approved_artifact_ids": approved_artifact_ids,
+                        "promotion_status": promotion_status,
+                        "promotion_reviews": promotion_reviews,
                     }
                 )
                 if round_failed:
@@ -309,7 +377,13 @@ def _run_compiled_experiment(
         task_results.append({"task_id": task.task_id, "rounds": round_results})
     return {
         "mode": "run",
-        "status": "failed" if any_failure else "completed",
+        "status": (
+            "failed"
+            if any_failure
+            else "pending_review"
+            if any_pending_review
+            else "completed"
+        ),
         "experiment_id": compiled.experiment_id,
         "experiment_name": compiled.experiment_name,
         "run_id": compiled.run_id,
@@ -361,6 +435,113 @@ def _snapshot_context_artifact_ids(
         artifact_type: list(artifact_ids)
         for artifact_type, artifact_ids in context_artifact_ids.items()
     }
+
+
+def _promotion_gate_targets_artifact(
+    promotion_gate: dict[str, Any],
+    artifact_type: str,
+) -> bool:
+    if promotion_gate.get("mode") == "none":
+        return False
+    artifact_types = promotion_gate.get("artifact_types")
+    if not isinstance(artifact_types, list):
+        return False
+    return artifact_type in artifact_types
+
+
+def _demote_already_promoted_artifacts(
+    evolution_client: EvolutionClientProtocol,
+    artifacts: list[dict[str, Any]],
+) -> None:
+    for artifact in artifacts:
+        artifact_id = artifact.get("artifact_id")
+        if artifact.get("promoted") is not True or not isinstance(artifact_id, str):
+            continue
+        demoted_artifact = evolution_client.update_artifact_promotion(
+            artifact_id,
+            promoted=False,
+        )
+        artifact.update(demoted_artifact)
+
+
+def _create_backend_promotion_reviews(
+    evolution_client: EvolutionClientProtocol,
+    promotion_reviews: list[dict[str, Any]],
+) -> None:
+    create_review_request = getattr(evolution_client, "create_review_request", None)
+    if not callable(create_review_request):
+        return
+    for review in promotion_reviews:
+        if review.get("status") != "pending_review":
+            continue
+        review_path = review.get("_review_path") or review.get("review_path")
+        if not isinstance(review_path, str) or not review_path:
+            continue
+        packet = json.loads(Path(review_path).read_text(encoding="utf-8"))
+        if not isinstance(packet, dict):
+            raise ValueError(f"promotion review packet was not a JSON object: {review_path}")
+        artifact_hashes = artifact_hashes_from_review_packet(packet)
+        review_payload = review_request_payload_from_packet(
+            packet,
+            artifact_hashes=artifact_hashes,
+        )
+        review_payload["query_decision"] = _human_query_decision_payload_from_review_payload(
+            review_payload
+        )
+        try:
+            backend_review = create_review_request(review_payload)
+            if not isinstance(backend_review, dict):
+                raise ValueError("evolution review response was not a JSON object")
+        except Exception as exc:  # noqa: BLE001
+            review["backend_review_status"] = "failed"
+            review["backend_review_error"] = sanitize_review_text(exc, limit=500)
+            continue
+        review["backend_review_status"] = "created"
+        for key in ("review_id", "packet_id", "packet_hash"):
+            value = backend_review.get(key)
+            if isinstance(value, str) and value:
+                review[key] = value
+        query_decision_id = backend_review.get("query_decision_id")
+        if isinstance(query_decision_id, str) and query_decision_id:
+            review["query_decision_id"] = query_decision_id
+            review["backend_query_decision_status"] = "created"
+        else:
+            review["backend_query_decision_status"] = "unavailable"
+
+
+def _strip_internal_fields(value: object) -> object:
+    if isinstance(value, dict):
+        return {
+            key: _strip_internal_fields(child)
+            for key, child in value.items()
+            if not str(key).startswith("_")
+        }
+    if isinstance(value, list):
+        return [_strip_internal_fields(item) for item in value]
+    return value
+
+
+def _human_query_decision_payload_from_review_payload(
+    review_payload: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "artifact_ids": _string_list(review_payload.get("artifact_ids")),
+        "candidate_ids": _string_list(review_payload.get("candidate_ids")),
+        "task_id": review_payload.get("task_id"),
+        "round_index": review_payload.get("round_index"),
+        "method": review_payload.get("method"),
+        "decision": "ask_human",
+        "reason_codes": ["promotion_gate_targeted", "human_gate"],
+        "estimated_value_of_information": None,
+        "estimated_human_cost": None,
+        "budget_context": {},
+    }
+
+
+def _string_list(value: object) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, str) and item]
 
 
 def _safe_path_component(value: str) -> str:

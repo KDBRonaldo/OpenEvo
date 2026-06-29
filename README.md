@@ -111,6 +111,80 @@ Defaults:
 - subscription agents require explicit transcript capture. Supported
   `agent.settings.capture_mode` values include `transcript`, `agent_transcript`,
   and `pure_text`.
+- `evolution.promotion_gate.mode`: `none` by default. Set it to `human` or `llm`
+  to keep evolved artifacts unpromoted until a runner/backend-level gate approves
+  them.
+
+Promotion gates run after an evolution worker registers artifacts and before
+OpenEvo adds those artifact IDs to the next rollout. With a gate enabled, jobs
+are created with `promoted=false`; approved artifacts are promoted through the
+backend artifact API. Algorithms are expected to put support material in
+`manifest.promotion_support`:
+
+```yaml
+evolution:
+  rounds: 3
+  promotion_gate:
+    mode: human
+    human_input: auto
+    # For mode: llm, also set min_score and llm.model.
+    artifact_types: [agent_system, skill_bundle, text_memory]
+    require_support: true
+    max_artifact_content_chars: 12000
+```
+
+Required support fields are `trajectory_findings`, `proposed_changes`,
+`expected_benefits`, `risks`, and `validation_checks`. Built-in reflectors write
+these fields automatically; custom algorithms should make them specific to the
+trajectory problems they found and the changes they made. The backend forces
+outputs from jobs with `config.promoted=false` to remain unpromoted even if a
+worker submits `promoted=true`. The human gate writes review packets under
+`promotion_reviews/`; for multi-candidate jobs it writes every packet in the
+review set before waiting for `<artifact_id>.decision.json` files containing
+`{"approved": true}` plus an optional finite `0 <= score <= 1`. The wait is
+bounded by one shared `decision_timeout_seconds` window for the full review set
+and polls every `decision_poll_interval_seconds`; malformed or partially written
+decision JSON stays pending until a valid decision appears or the timeout
+expires. Set the timeout to `0` to emit packets and return `pending_review`
+immediately. `human_input: auto` uses an interactive terminal prompt when stdin
+and stdout are TTYs, and otherwise falls back to decision files; set
+`human_input: file` to force file review or `human_input: tui` to require a
+terminal prompt. Human decisions can also include structured `human_feedback`
+with `observed_issues`, `suggested_changes`, `risks`, and `validation_checks`;
+the gate preserves this feedback in promotion reviews for later inspection or
+follow-up evolution, while promotion still depends on `approved` and the score
+contract.
+When the evolution backend exposes HITL review APIs, the runner also creates
+durable asynchronous review requests. If query-decision recording is available,
+the runner embeds the current deterministic `ask_human` policy payload in the
+review request so the backend can create and link the `query_decision_id`
+atomically. Validated, redacted feedback can later enter datasets as
+`evolution_feedback.human` and be consumed by methods; raw reviewer payloads stay
+audit-only. Backend review APIs sanitize packets before
+hashing/storage and sanitize normalized feedback before it becomes available for
+resume or evolution; resume applies feedback only when the review request artifact
+hash still matches the current artifact. See
+`docs/architecture/evolution-backend.md` and
+`docs/architecture/evolution-api-and-method-integration.md` for the full HITL
+lifecycle.
+Review packets include a bounded `file://` artifact content excerpt, so human and
+LLM reviewers can inspect the generated `memory.md`, `AGENTS.md`, or `SKILL.md`
+content alongside the support material. The runner only reads artifact content
+from its artifact output root; `file://` URIs outside that root are marked
+unavailable in the review packet. Review packets sanitize artifact metadata URI
+and absolute local path fields before they are sent to an LLM reviewer or backend
+review API, removing local `file://` paths, userinfo, fragments, and query
+strings from top-level and nested manifest URI values, including relative URI
+references. The LLM gate sends the sanitized review packet to the configured
+reviewer and requires `approved=true` plus a
+present numeric score satisfying finite `0 <= score <= 1` and
+`score >= min_score`; missing or non-numeric scores are rejected. Promotion
+updates must call `PATCH /v1/artifacts/{artifact_id}/promotion` with an explicit
+`{"promoted": true}` or `{"promoted": false}` body; empty payloads are rejected.
+If a method emits multiple candidate artifacts, the gate can partially approve
+the set: approved candidates are promoted and rejected candidates are left
+unpromoted. If a gated job produces no artifact of the expected type, the gate
+rejects it as `missing_target_artifact`.
 
 Useful commands:
 
@@ -174,8 +248,8 @@ Key interpretation:
   mapping in the task description rather than hidden pipeline state.
 - Add a Terminal Bench task-list generator on top of the new `openevo run`
   config, while keeping explicit task entries as the stable interchange format.
-- Add promotion policies that combine paired evaluator scores, leakage audit,
-  regression limits, and candidate diversity.
+- Extend runner/backend promotion policies with paired evaluator scores, leakage
+  audit, regression limits, and candidate diversity.
 - Improve transcript capture fidelity for external harnesses while preserving the
   no-oracle/no-secret boundary.
 - Support multi-round evolution from all historical trajectories, not only the

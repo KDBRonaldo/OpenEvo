@@ -11,6 +11,19 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from polar.agent.capture import TRANSCRIPT_CAPTURE_MODES, transcript_capture_enabled
 
 _SUBSCRIPTION_AUTH_MODES = {"subscription", "chatgpt_subscription"}
+PROMOTION_SUPPORT_FIELDS = [
+    "trajectory_findings",
+    "proposed_changes",
+    "expected_benefits",
+    "risks",
+    "validation_checks",
+]
+PROMOTABLE_ARTIFACT_TYPES = [
+    "text_memory",
+    "skill_bundle",
+    "agent_system",
+    "parametric_memory",
+]
 
 
 class _StrictModel(BaseModel):
@@ -107,6 +120,34 @@ class EvolutionWorkerConfig(_StrictModel):
     mode: Literal["local_once"] = "local_once"
 
 
+class PromotionGateConfig(_StrictModel):
+    mode: Literal["none", "human", "llm"] = "none"
+    human_input: Literal["auto", "file", "tui"] = "auto"
+    artifact_types: list[
+        Literal["text_memory", "skill_bundle", "agent_system", "parametric_memory"]
+    ] = Field(default_factory=lambda: list(PROMOTABLE_ARTIFACT_TYPES))
+    review_dir: str | None = None
+    decision_dir: str | None = None
+    min_score: float = Field(default=0.7, ge=0.0, le=1.0)
+    require_support: bool = True
+    max_artifact_content_chars: int = Field(default=12000, ge=0)
+    decision_timeout_seconds: float = Field(default=300.0, ge=0.0)
+    decision_poll_interval_seconds: float = Field(default=2.0, gt=0.0)
+    llm: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("artifact_types")
+    @classmethod
+    def _dedupe_artifact_types(cls, value: list[str]) -> list[str]:
+        return list(dict.fromkeys(value))
+
+    @field_validator("review_dir", "decision_dir")
+    @classmethod
+    def _strip_dir(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        return _strip_non_empty(value, f"evolution.promotion_gate.{info.field_name}")
+
+
 class EvolutionConfig(_StrictModel):
     backend_url: str = Field(
         default_factory=lambda: os.environ.get(
@@ -116,6 +157,7 @@ class EvolutionConfig(_StrictModel):
     )
     rounds: int = Field(default=1, ge=1)
     worker: EvolutionWorkerConfig = Field(default_factory=EvolutionWorkerConfig)
+    promotion_gate: PromotionGateConfig = Field(default_factory=PromotionGateConfig)
 
     @field_validator("backend_url")
     @classmethod
