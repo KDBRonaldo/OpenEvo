@@ -112,6 +112,71 @@ async def test_codex_setup_overwrites_config_without_mcp_servers(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_codex_setup_preserves_native_memory_by_default(tmp_path):
+    harness = CodexHarness(
+        AgentSpec(
+            harness="codex",
+            env={"CODEX_HOME": "/polar/session/preauthenticated-codex"},
+        )
+    )
+    runtime = RecordingRuntime(tmp_path)
+
+    await harness.setup(runtime)
+
+    joined = "\n".join(runtime.commands)
+    assert "/polar/session/preauthenticated-codex/config.toml" in joined
+    assert "/memories" not in joined
+    assert "memories_" not in joined
+    assert "auth.json" not in joined
+
+
+@pytest.mark.asyncio
+async def test_codex_setup_clears_native_memory_when_requested(tmp_path):
+    harness = CodexHarness(
+        AgentSpec(
+            harness="codex",
+            settings={"native_memory_policy": "clear"},
+            env={"CODEX_HOME": "/polar/session/preauthenticated-codex"},
+        )
+    )
+    runtime = RecordingRuntime(tmp_path)
+
+    await harness.setup(runtime)
+
+    cleanup_commands = [
+        command
+        for command in runtime.commands
+        if "/memories" in command or "memories_" in command
+    ]
+    assert len(cleanup_commands) == 1
+    cleanup = cleanup_commands[0]
+    assert cleanup.startswith("rm -rf -- ")
+    assert "/polar/session/preauthenticated-codex/memories" in cleanup
+    assert "/polar/session/preauthenticated-codex/memories_*.sqlite" in cleanup
+    assert "/polar/session/preauthenticated-codex/memories_*.sqlite-shm" in cleanup
+    assert "/polar/session/preauthenticated-codex/memories_*.sqlite-wal" in cleanup
+    assert "auth.json" not in cleanup
+    assert "state_" not in cleanup
+    assert "logs_" not in cleanup
+    assert "history.jsonl" not in cleanup
+    assert "session_index.jsonl" not in cleanup
+
+
+@pytest.mark.asyncio
+async def test_codex_setup_rejects_unknown_native_memory_policy(tmp_path):
+    harness = CodexHarness(
+        AgentSpec(
+            harness="codex",
+            settings={"native_memory_policy": "wipe"},
+        )
+    )
+    runtime = RecordingRuntime(tmp_path)
+
+    with pytest.raises(ValueError, match="native_memory_policy"):
+        await harness.setup(runtime)
+
+
+@pytest.mark.asyncio
 async def test_codex_setup_uses_configured_codex_home_for_mcp_servers(tmp_path):
     harness = CodexHarness(
         AgentSpec(

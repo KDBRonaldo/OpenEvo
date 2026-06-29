@@ -17,6 +17,14 @@ from polar.runtime.base import BaseRuntime, RUNTIME_AGENT_LOG_DIR, RUNTIME_SESSI
 from polar.runtime.models import ExecInput
 
 
+_NATIVE_MEMORY_POLICY_PRESERVE = "preserve"
+_NATIVE_MEMORY_POLICY_CLEAR = "clear"
+_NATIVE_MEMORY_POLICIES = {
+    _NATIVE_MEMORY_POLICY_PRESERVE,
+    _NATIVE_MEMORY_POLICY_CLEAR,
+}
+
+
 class CodexHarness(BaseHarness):
     """Run OpenAI Codex CLI in non-interactive mode."""
 
@@ -36,6 +44,8 @@ class CodexHarness(BaseHarness):
     async def setup(self, runtime: BaseRuntime) -> None:
         codex_home = self._codex_home_path()
         await runtime.exec(f"mkdir -p {shlex.quote(codex_home)}")
+        if _native_memory_policy(self.settings) == _NATIVE_MEMORY_POLICY_CLEAR:
+            await runtime.exec(_clear_native_memory_command(codex_home))
 
         # Host-uploaded files keep the host UID, which blocks codex's
         # exec_command-based edits (cat/tee/open) on a non-root container
@@ -159,6 +169,29 @@ def _nonempty_env_path(value: str | None) -> str | None:
         return None
     stripped = value.strip()
     return stripped or None
+
+
+def _native_memory_policy(settings: dict[str, object]) -> str:
+    raw_policy = settings.get("native_memory_policy")
+    if raw_policy is None:
+        return _NATIVE_MEMORY_POLICY_PRESERVE
+    if not isinstance(raw_policy, str):
+        raise ValueError("native_memory_policy must be 'preserve' or 'clear'")
+    policy = raw_policy.strip()
+    if policy not in _NATIVE_MEMORY_POLICIES:
+        raise ValueError("native_memory_policy must be 'preserve' or 'clear'")
+    return policy
+
+
+def _clear_native_memory_command(codex_home: str) -> str:
+    quoted_home = shlex.quote(codex_home)
+    return (
+        "rm -rf -- "
+        f"{quoted_home}/memories "
+        f"{quoted_home}/memories_*.sqlite "
+        f"{quoted_home}/memories_*.sqlite-shm "
+        f"{quoted_home}/memories_*.sqlite-wal"
+    )
 
 
 def _toml_string(value: str) -> str:
