@@ -303,7 +303,11 @@ def _compile_method_spec(
         if not config.artifacts.parametric_memory.enabled:
             return None
         method = config.artifacts.parametric_memory.method
-        base_config.update(config.artifacts.parametric_memory.config)
+        base_config.update(
+            key_value
+            for key_value in config.artifacts.parametric_memory.config.items()
+            if key_value[0] != "reflector_llm"
+        )
     elif artifact_type == "skill_bundle":
         if not config.artifacts.skill_bundle.enabled:
             return None

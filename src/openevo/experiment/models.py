@@ -81,12 +81,15 @@ class AgentConfig(_StrictModel):
                 "subscription agents require transcript capture; "
                 f"settings.capture_mode must be one of: {accepted}"
             )
-        native_memory_policy = self.settings.get("native_memory_policy")
-        if native_memory_policy is not None and (
-            not isinstance(native_memory_policy, str)
-            or native_memory_policy not in _NATIVE_MEMORY_POLICIES
-        ):
-            raise ValueError("agent.settings.native_memory_policy must be 'preserve' or 'clear'")
+        if "native_memory_policy" in self.settings:
+            native_memory_policy = self.settings["native_memory_policy"]
+            if (
+                not isinstance(native_memory_policy, str)
+                or native_memory_policy not in _NATIVE_MEMORY_POLICIES
+            ):
+                raise ValueError(
+                    "agent.settings.native_memory_policy must be 'preserve' or 'clear'"
+                )
         return self
 
 

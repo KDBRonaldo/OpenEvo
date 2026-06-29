@@ -167,6 +167,21 @@ def test_agent_native_memory_policy_rejects_unknown_value() -> None:
         raise AssertionError("expected ValueError")
 
 
+def test_agent_native_memory_policy_rejects_explicit_null() -> None:
+    try:
+        _config(
+            agent={
+                "preset": "codex",
+                "model": "gpt-5.1-codex-mini",
+                "settings": {"native_memory_policy": None},
+            }
+        )
+    except ValueError as exc:
+        assert "native_memory_policy" in str(exc)
+    else:
+        raise AssertionError("expected ValueError")
+
+
 def test_relative_workspace_resolves_from_config_file(tmp_path: Path) -> None:
     config_dir = tmp_path / "configs"
     config_dir.mkdir()
@@ -237,6 +252,28 @@ def test_evolution_methods_include_parametric_memory_when_enabled() -> None:
     assert specs[1].config["adapter_uri"] == "file:///adapters/parser-memory"
     assert specs[1].config["base_model"] == "gpt-5.1-codex-mini"
     assert specs[1].config["adapter_id"] == "parser-memory"
+    assert "reflector_llm" not in specs[1].config
+
+
+def test_parametric_memory_config_drops_user_reflector_llm() -> None:
+    compiled = compile_experiment(
+        _config(
+            artifacts={
+                "parametric_memory": {
+                    "enabled": True,
+                    "config": {
+                        "adapter_uri": "file:///adapters/parser-memory",
+                        "reflector_llm": {"provider": "bad", "model": "bad"},
+                    },
+                },
+            }
+        )
+    )
+
+    specs = compiled.evolution_methods_for_round(0)
+
+    assert specs[1].artifact_type == "parametric_memory"
+    assert specs[1].config["adapter_uri"] == "file:///adapters/parser-memory"
     assert "reflector_llm" not in specs[1].config
 
 
