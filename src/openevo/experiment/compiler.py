@@ -11,7 +11,7 @@ from openevo.experiment.models import (
     TaskConfig,
 )
 
-_EVOLUTION_ORDER = ("text_memory", "skill_bundle", "agent_system")
+_EVOLUTION_ORDER = ("text_memory", "parametric_memory", "skill_bundle", "agent_system")
 _ROLLOUT_CONTEXT_ARTIFACT_TYPES = _EVOLUTION_ORDER
 _SUBSCRIPTION_AUTH_MODES = {"subscription", "chatgpt_subscription"}
 
@@ -293,19 +293,27 @@ def _compile_method_spec(
     round_index: int,
     reflector_llm: dict[str, str],
 ) -> CompiledEvolutionMethodSpec | None:
-    base_config: dict[str, Any] = {"reflector_llm": dict(reflector_llm)}
+    base_config: dict[str, Any] = {}
     if artifact_type == "text_memory":
         if not config.artifacts.text_memory.enabled:
             return None
         method = config.artifacts.text_memory.method
+        base_config["reflector_llm"] = dict(reflector_llm)
+    elif artifact_type == "parametric_memory":
+        if not config.artifacts.parametric_memory.enabled:
+            return None
+        method = config.artifacts.parametric_memory.method
+        base_config.update(config.artifacts.parametric_memory.config)
     elif artifact_type == "skill_bundle":
         if not config.artifacts.skill_bundle.enabled:
             return None
         method = config.artifacts.skill_bundle.method
+        base_config["reflector_llm"] = dict(reflector_llm)
     elif artifact_type == "agent_system":
         if not config.artifacts.agent_system.enabled:
             return None
         method = _resolve_agent_system_method(config.artifacts.agent_system.method, round_index)
+        base_config["reflector_llm"] = dict(reflector_llm)
         base_config["target_path"] = config.artifacts.agent_system.target_path
     else:
         raise ValueError(f"Unsupported artifact_type: {artifact_type}")

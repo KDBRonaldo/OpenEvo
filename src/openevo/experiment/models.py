@@ -11,6 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from polar.agent.capture import TRANSCRIPT_CAPTURE_MODES, transcript_capture_enabled
 
 _SUBSCRIPTION_AUTH_MODES = {"subscription", "chatgpt_subscription"}
+_NATIVE_MEMORY_POLICIES = {"preserve", "clear"}
 PROMOTION_SUPPORT_FIELDS = [
     "trajectory_findings",
     "proposed_changes",
@@ -80,6 +81,12 @@ class AgentConfig(_StrictModel):
                 "subscription agents require transcript capture; "
                 f"settings.capture_mode must be one of: {accepted}"
             )
+        native_memory_policy = self.settings.get("native_memory_policy")
+        if native_memory_policy is not None and (
+            not isinstance(native_memory_policy, str)
+            or native_memory_policy not in _NATIVE_MEMORY_POLICIES
+        ):
+            raise ValueError("agent.settings.native_memory_policy must be 'preserve' or 'clear'")
         return self
 
 
@@ -186,6 +193,17 @@ class TextMemoryArtifactConfig(_StrictModel):
         return _strip_non_empty(value, "artifacts.text_memory.method")
 
 
+class ParametricMemoryArtifactConfig(_StrictModel):
+    enabled: bool = False
+    method: str = "parametric_memory_register"
+    config: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("method")
+    @classmethod
+    def _strip_method(cls, value: str) -> str:
+        return _strip_non_empty(value, "artifacts.parametric_memory.method")
+
+
 class SkillBundleArtifactConfig(_StrictModel):
     enabled: bool = True
     method: str = "skill_bundle_reflector"
@@ -199,6 +217,9 @@ class SkillBundleArtifactConfig(_StrictModel):
 class ArtifactControls(_StrictModel):
     agent_system: AgentSystemArtifactConfig = Field(default_factory=AgentSystemArtifactConfig)
     text_memory: TextMemoryArtifactConfig = Field(default_factory=TextMemoryArtifactConfig)
+    parametric_memory: ParametricMemoryArtifactConfig = Field(
+        default_factory=ParametricMemoryArtifactConfig
+    )
     skill_bundle: SkillBundleArtifactConfig = Field(default_factory=SkillBundleArtifactConfig)
 
 
