@@ -3044,8 +3044,6 @@ def _artifact_id_allowed(
 ) -> bool:
     if requested_artifact_ids is None:
         return True
-    if artifact_type(row) == ArtifactType.PARAMETRIC_MEMORY:
-        return True
     artifact_id = row.get("artifact_id")
     return isinstance(artifact_id, str) and artifact_id in requested_artifact_ids
 
