@@ -1173,6 +1173,9 @@ def parametric_memory_register(
             name=str(job.config.get("name") or adapter_id),
             uri=adapter_uri,
             manifest=manifest,
+            lineage=_dict_config(job.config.get("lineage")),
+            compatibility=_dict_config(job.config.get("compatibility")),
+            scores=_scores_config(job.config.get("scores")),
             tags=_string_list(job.config.get("tags")),
             promoted=bool(job.config.get("promoted", False)),
         )
