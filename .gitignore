@@ -120,6 +120,19 @@ glm/
 docs/*
 !docs/architecture/
 !docs/architecture/*.md
+!docs/dev/
+!docs/dev/*.md
+!docs/report/
+!docs/report/*
+!docs/superpowers/
+docs/superpowers/*
+!docs/superpowers/plans/
+docs/superpowers/plans/*
+!docs/superpowers/plans/*.md
+!docs/superpowers/specs/
+docs/superpowers/specs/*
+!docs/superpowers/specs/*.md
+!docs/superpowers/specs/*.png
 /site
 
 # Dashboard frontend build artifacts

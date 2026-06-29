@@ -1,7 +1,7 @@
 # HITL Feedback Lifecycle Design
 
 Date: 2026-06-27
-
+![alt text](image-1.png)
 ## Context
 
 Polar/OpenEvo currently has a runner/backend promotion gate that can ask a human
