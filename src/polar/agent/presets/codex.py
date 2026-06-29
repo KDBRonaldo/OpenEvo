@@ -187,9 +187,7 @@ def _clear_native_memory_command(codex_home: str) -> str:
     return (
         "rm -rf -- "
         f"{quoted_home}/memories "
-        f"{quoted_home}/memories_*.sqlite "
-        f"{quoted_home}/memories_*.sqlite-shm "
-        f"{quoted_home}/memories_*.sqlite-wal"
+        f"{quoted_home}/memories_*.sqlite*"
     )
 
 

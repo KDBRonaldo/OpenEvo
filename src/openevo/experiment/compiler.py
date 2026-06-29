@@ -124,6 +124,12 @@ class CompiledTask:
             )
             input_artifact_ids = [dataset_artifact_id, *context_ids]
             payload = spec.job_payload(input_artifact_ids)
+            compatibility = _job_compatibility(
+                spec,
+                payload["config"],
+                task_tags=self._task_tags(),
+                agent_harness=str(self.agent.get("harness") or ""),
+            )
             payload["config"] = {
                 **payload["config"],
                 "name": f"{self.task_id}:{spec.artifact_type}:round-{round_index}",
@@ -144,10 +150,7 @@ class CompiledTask:
                     "policy_version": policy_version,
                     "input_artifact_ids": input_artifact_ids,
                 },
-                "compatibility": {
-                    "task_tags": self._task_tags(),
-                    "agent_harness": [str(self.agent.get("harness") or "")],
-                },
+                "compatibility": compatibility,
             }
             if _promotion_gate_targets_artifact(self.promotion_gate, spec.artifact_type):
                 payload["config"]["promotion_gate"] = _worker_visible_promotion_gate(
@@ -176,6 +179,32 @@ class CompiledTask:
         if self.run_id:
             return [f"openevo_run_task:{self.run_id}:{self.task_id}"]
         return [f"openevo_task:{self.experiment_name}:{self.task_id}"]
+
+
+def _job_compatibility(
+    spec: CompiledEvolutionMethodSpec,
+    config: Mapping[str, Any],
+    *,
+    task_tags: list[str],
+    agent_harness: str,
+) -> dict[str, Any]:
+    compatibility: dict[str, Any] = {}
+    if spec.artifact_type == "parametric_memory":
+        configured = config.get("compatibility")
+        if isinstance(configured, Mapping):
+            compatibility.update(configured)
+
+    compatibility.update(
+        {
+            "task_tags": task_tags,
+            "agent_harness": [agent_harness],
+        }
+    )
+    if spec.artifact_type == "parametric_memory":
+        base_model = config.get("base_model")
+        if isinstance(base_model, str) and base_model:
+            compatibility["base_model"] = [base_model]
+    return compatibility
 
 
 @dataclass(frozen=True)

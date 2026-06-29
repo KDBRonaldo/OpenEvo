@@ -152,9 +152,7 @@ async def test_codex_setup_clears_native_memory_when_requested(tmp_path):
     cleanup = cleanup_commands[0]
     assert cleanup.startswith("rm -rf -- ")
     assert "/polar/session/preauthenticated-codex/memories" in cleanup
-    assert "/polar/session/preauthenticated-codex/memories_*.sqlite" in cleanup
-    assert "/polar/session/preauthenticated-codex/memories_*.sqlite-shm" in cleanup
-    assert "/polar/session/preauthenticated-codex/memories_*.sqlite-wal" in cleanup
+    assert "/polar/session/preauthenticated-codex/memories_*.sqlite*" in cleanup
     assert "auth.json" not in cleanup
     assert "state_" not in cleanup
     assert "logs_" not in cleanup

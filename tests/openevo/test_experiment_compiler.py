@@ -428,6 +428,48 @@ def test_evolution_job_compatibility_uses_single_task_scoped_tag() -> None:
     ]
 
 
+def test_parametric_memory_job_compatibility_preserves_base_model_and_task_scope() -> None:
+    compiled = compile_experiment(
+        _config(
+            artifacts={
+                "text_memory": {"enabled": False},
+                "parametric_memory": {
+                    "enabled": True,
+                    "method": "parametric_memory_register",
+                    "config": {
+                        "adapter_uri": "file:///adapters/parser-memory",
+                        "base_model": "gpt-5.1-codex-mini",
+                        "adapter_id": "parser-memory",
+                        "compatibility": {
+                            "base_model": ["wrong-model"],
+                            "task_tags": ["wrong-task"],
+                            "agent_harness": ["wrong-harness"],
+                            "capability": ["component-extraction"],
+                        },
+                    },
+                },
+                "skill_bundle": {"enabled": False},
+                "agent_system": {"enabled": False},
+            }
+        )
+    )
+
+    jobs = compiled.evolution_job_payloads_for_round(
+        0,
+        dataset_artifact_id="dataset_artifact_1",
+    )
+
+    assert len(jobs) == 1
+    assert jobs[0]["method"] == "parametric_memory_register"
+    compatibility = jobs[0]["config"]["compatibility"]
+    assert compatibility["base_model"] == ["gpt-5.1-codex-mini"]
+    assert compatibility["task_tags"] == [
+        "openevo_task:biology-components:component-extraction-train"
+    ]
+    assert compatibility["agent_harness"] == ["codex"]
+    assert compatibility["capability"] == ["component-extraction"]
+
+
 def test_history_agent_system_jobs_include_prior_dataset_artifacts() -> None:
     compiled = compile_experiment(_config(), rounds_override=2)
 
