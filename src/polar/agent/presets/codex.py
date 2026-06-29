@@ -177,10 +177,9 @@ def _native_memory_policy(settings: dict[str, object]) -> str:
         return _NATIVE_MEMORY_POLICY_PRESERVE
     if not isinstance(raw_policy, str):
         raise ValueError("native_memory_policy must be 'preserve' or 'clear'")
-    policy = raw_policy.strip()
-    if policy not in _NATIVE_MEMORY_POLICIES:
+    if raw_policy not in _NATIVE_MEMORY_POLICIES:
         raise ValueError("native_memory_policy must be 'preserve' or 'clear'")
-    return policy
+    return raw_policy
 
 
 def _clear_native_memory_command(codex_home: str) -> str:

@@ -177,6 +177,20 @@ async def test_codex_setup_rejects_unknown_native_memory_policy(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_codex_setup_rejects_native_memory_policy_with_whitespace(tmp_path):
+    harness = CodexHarness(
+        AgentSpec(
+            harness="codex",
+            settings={"native_memory_policy": " clear "},
+        )
+    )
+    runtime = RecordingRuntime(tmp_path)
+
+    with pytest.raises(ValueError, match="native_memory_policy"):
+        await harness.setup(runtime)
+
+
+@pytest.mark.asyncio
 async def test_codex_setup_uses_configured_codex_home_for_mcp_servers(tmp_path):
     harness = CodexHarness(
         AgentSpec(
