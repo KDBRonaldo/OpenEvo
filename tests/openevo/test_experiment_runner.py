@@ -3553,6 +3553,16 @@ def test_local_worker_runner_returns_recorded_failures(
     assert result == [{"job_id": "job-1", "state": "failed", "error": "reflector crashed"}]
 
 
+def test_fake_evolution_client_infers_agent_system_and_parametric_memory_types() -> None:
+    client = FakeEvolutionClient()
+
+    assert client.get_artifact("artifact-agent-system")["type"] == "agent_system"
+    assert (
+        client.get_artifact("artifact-parametric-memory")["type"]
+        == "parametric_memory"
+    )
+
+
 class FakeRolloutClient:
     def __init__(self) -> None:
         self.submitted: list[dict[str, Any]] = []
@@ -3604,6 +3614,8 @@ class FakeEvolutionClient:
             else "parametric_memory"
             if "parametric-memory" in artifact_id or "parametric_memory" in artifact_id
             else "skill_bundle"
+            if "skill-bundle" in artifact_id
+            else "agent_system"
         )
         return {
             "artifact_id": artifact_id,
