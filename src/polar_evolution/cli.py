@@ -16,6 +16,9 @@ from polar_evolution.store import EvolutionStore
 from polar_evolution.terminal_bench_bridge import build_terminal_bench_events
 from polar_evolution.terminal_bench_per_task import (
     DEFAULT_TERMINAL_BENCH_PACKAGE_ROOT,
+    TerminalBenchTaskGroup,
+    run_group_evolution,
+    run_group_evolution_dry_run,
     run_per_task_evolution,
     run_per_task_evolution_dry_run,
 )
@@ -176,6 +179,53 @@ def build_parser() -> argparse.ArgumentParser:
     tb_per_task.add_argument("--verifier-env", action="append", default=[])
     tb_per_task.add_argument("--dry-run", action="store_true")
     tb_per_task.add_argument("--output", required=True)
+    tb_group = subparsers.add_parser(
+        "terminal-bench-group-evolution",
+        help="Run or plan shared Terminal Bench evolution for one task group.",
+    )
+    tb_group.add_argument("--task-root", required=True)
+    tb_group.add_argument("--group-id", required=True)
+    tb_group.add_argument("--task-id", action="append", default=[], required=True)
+    tb_group.add_argument("--objective", choices=["macro_mean_reward"], default="macro_mean_reward")
+    tb_group.add_argument("--run-root", required=True)
+    tb_group.add_argument("--baseline-root")
+    tb_group.add_argument(
+        "--terminal-bench-package-root",
+        default=str(DEFAULT_TERMINAL_BENCH_PACKAGE_ROOT),
+    )
+    tb_group.add_argument("--model", required=True)
+    tb_group.add_argument("--reflector-model", required=True)
+    tb_group.add_argument(
+        "--reflector-provider",
+        choices=["codex_cli", "openai_chat"],
+        default="codex_cli",
+    )
+    tb_group.add_argument("--codex-home")
+    tb_group.add_argument(
+        "--agent-system-method",
+        choices=[
+            "auto",
+            "agent_system_reflector",
+            "agent_system_history_reflector",
+            "agent_system_pareto_reflector",
+            "agent_system_gepa_reflector",
+        ],
+        default="auto",
+    )
+    tb_group.add_argument("--gepa-candidate-count", type=int, default=1)
+    tb_group.add_argument("--gepa-generations", type=int, default=1)
+    tb_group.add_argument("--reflector-timeout-seconds", type=float, default=180.0)
+    tb_group.add_argument("--rounds", type=int, default=1)
+    tb_group.add_argument(
+        "--artifact-type",
+        action="append",
+        default=None,
+        choices=["agent_system", "skill_bundle", "memory"],
+    )
+    tb_group.add_argument("--env-json", default="{}")
+    tb_group.add_argument("--verifier-env", action="append", default=[])
+    tb_group.add_argument("--dry-run", action="store_true")
+    tb_group.add_argument("--output", required=True)
     return parser
 
 
@@ -326,7 +376,71 @@ def main(argv: list[str] | None = None) -> int:
         )
         _write_json_output(payload, args.output)
         return 0
+    if args.command == "terminal-bench-group-evolution":
+        artifact_types = args.artifact_type or ["agent_system"]
+        group = _terminal_bench_cli_group(args)
+        if args.dry_run:
+            payload = run_group_evolution_dry_run(
+                task_root=Path(args.task_root),
+                groups=[group],
+                run_root=Path(args.run_root),
+                model=args.model,
+                reflector_model=args.reflector_model,
+                reflector_provider=args.reflector_provider,
+                reflector_timeout_seconds=args.reflector_timeout_seconds,
+                terminal_bench_package_root=Path(args.terminal_bench_package_root),
+                agent_system_method=args.agent_system_method,
+                gepa_candidate_count=args.gepa_candidate_count,
+                gepa_generations=args.gepa_generations,
+                rounds=args.rounds,
+                artifact_types=artifact_types,
+            )
+            _write_json_output(payload, args.output)
+            return 0
+        if not args.baseline_root:
+            raise ValueError(
+                "terminal-bench-group-evolution requires --baseline-root unless --dry-run is used"
+            )
+        if artifact_types != ["agent_system"]:
+            raise ValueError("live group evolution currently supports only agent_system")
+        try:
+            parsed_env_json = json.loads(args.env_json)
+        except json.JSONDecodeError as exc:
+            raise ValueError("--env-json must be valid JSON") from exc
+        if not isinstance(parsed_env_json, dict):
+            raise ValueError("--env-json must decode to a JSON object")
+        payload = run_group_evolution(
+            task_root=Path(args.task_root),
+            groups=[group],
+            run_root=Path(args.run_root),
+            baseline_root=Path(args.baseline_root),
+            model=args.model,
+            reflector_model=args.reflector_model,
+            reflector_provider=args.reflector_provider,
+            reflector_timeout_seconds=args.reflector_timeout_seconds,
+            codex_home=args.codex_home,
+            terminal_bench_package_root=Path(args.terminal_bench_package_root),
+            agent_system_method=args.agent_system_method,
+            gepa_candidate_count=args.gepa_candidate_count,
+            gepa_generations=args.gepa_generations,
+            rounds=args.rounds,
+            env_json={str(key): str(value) for key, value in parsed_env_json.items()},
+            verifier_env=_parse_key_value_entries(args.verifier_env),
+        )
+        _write_json_output(payload, args.output)
+        return 0
     raise ValueError(f"Unknown command: {args.command}")
+
+
+def _terminal_bench_cli_group(args: argparse.Namespace) -> TerminalBenchTaskGroup:
+    task_ids = list(args.task_id)
+    if len(task_ids) < 2:
+        raise ValueError("terminal-bench-group-evolution requires at least two --task-id values")
+    return TerminalBenchTaskGroup(
+        group_id=args.group_id,
+        task_ids=task_ids,
+        objective=args.objective,
+    )
 
 
 def _create_terminal_bench_agent_system_job(args: argparse.Namespace) -> dict[str, Any]:

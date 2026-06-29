@@ -38,6 +38,13 @@ DEFAULT_TERMINAL_BENCH_EXTRA_DOCKER_COMPOSE = [
 
 
 @dataclass(frozen=True)
+class TerminalBenchTaskGroup:
+    group_id: str
+    task_ids: list[str]
+    objective: str = "macro_mean_reward"
+
+
+@dataclass(frozen=True)
 class EvolutionArtifact:
     artifact_type: str
     artifact_id: str
@@ -165,6 +172,27 @@ def _default_evolved_trial_locator(task_id: str, round_number: int, run_root: Pa
         raise FileNotFoundError(
             "no evolved Terminal Bench trial found under "
             f"{round_root} for task {task_id!r} round {round_number}"
+        )
+    return max(candidates, key=lambda path: (path.stat().st_mtime_ns, path.as_posix()))
+
+
+def _default_group_evolved_trial_locator(
+    group_id: str,
+    task_id: str,
+    round_number: int,
+    run_root: Path,
+    search_root: Path | None = None,
+) -> Path:
+    round_root = search_root or run_root / "groups" / group_id / f"r{round_number}"
+    candidates = [
+        path
+        for path in round_root.rglob(f"{task_id}__*")
+        if path.is_dir() and (path / "result.json").is_file()
+    ]
+    if not candidates:
+        raise FileNotFoundError(
+            "no evolved Terminal Bench trial found under "
+            f"{round_root} for group {group_id!r} task {task_id!r} round {round_number}"
         )
     return max(candidates, key=lambda path: (path.stat().st_mtime_ns, path.as_posix()))
 
@@ -439,6 +467,49 @@ def run_per_task_evolution_dry_run(
     }
 
 
+def run_group_evolution_dry_run(
+    *,
+    task_root: Path,
+    groups: list[TerminalBenchTaskGroup],
+    run_root: Path,
+    model: str,
+    reflector_model: str,
+    reflector_provider: str,
+    reflector_timeout_seconds: float | None,
+    terminal_bench_package_root: Path = DEFAULT_TERMINAL_BENCH_PACKAGE_ROOT,
+    agent_system_method: str,
+    gepa_candidate_count: int,
+    gepa_generations: int,
+    rounds: int,
+    artifact_types: list[str],
+) -> dict[str, Any]:
+    validated_groups = [_validate_task_group(group) for group in groups]
+    return {
+        "dry_run": True,
+        "mode": "group",
+        "task_root": str(task_root),
+        "run_root": str(run_root),
+        "model": model,
+        "reflector_model": reflector_model,
+        "reflector_provider": reflector_provider,
+        "reflector_timeout_seconds": reflector_timeout_seconds,
+        "terminal_bench_package_root": str(terminal_bench_package_root),
+        "agent_system_method": agent_system_method,
+        "gepa_candidate_count": gepa_candidate_count,
+        "gepa_generations": gepa_generations,
+        "groups": [
+            {
+                "group_id": group.group_id,
+                "task_ids": list(group.task_ids),
+                "objective": group.objective,
+                "rounds": rounds,
+                "artifact_types": artifact_types,
+            }
+            for group in validated_groups
+        ],
+    }
+
+
 def run_per_task_evolution(
     *,
     task_root: Path,
@@ -672,6 +743,298 @@ def run_per_task_evolution(
     return summary
 
 
+def run_group_evolution(
+    *,
+    task_root: Path,
+    groups: list[TerminalBenchTaskGroup],
+    run_root: Path,
+    baseline_root: Path,
+    model: str,
+    reflector_model: str,
+    reflector_provider: str = "codex_cli",
+    reflector_timeout_seconds: float | None = None,
+    codex_home: str | None = None,
+    terminal_bench_package_root: Path = DEFAULT_TERMINAL_BENCH_PACKAGE_ROOT,
+    agent_system_method: str = "auto",
+    gepa_candidate_count: int = 1,
+    gepa_generations: int = 1,
+    rounds: int,
+    env_json: dict[str, str],
+    verifier_env: dict[str, str],
+    command_runner=_default_command_runner,
+    worker_runner=_run_worker_once_local,
+    evolved_trial_locator=None,
+) -> dict[str, Any]:
+    validated_groups = [_validate_task_group(group) for group in groups]
+    summary = {
+        "dry_run": False,
+        "mode": "group",
+        "task_root": str(task_root),
+        "run_root": str(run_root),
+        "baseline_root": str(baseline_root),
+        "model": model,
+        "reflector_model": reflector_model,
+        "reflector_provider": reflector_provider,
+        "reflector_timeout_seconds": reflector_timeout_seconds,
+        "terminal_bench_package_root": str(terminal_bench_package_root),
+        "agent_system_method": agent_system_method,
+        "gepa_candidate_count": gepa_candidate_count,
+        "gepa_generations": gepa_generations,
+        "groups": [],
+    }
+
+    for group in validated_groups:
+        task_ids = list(group.task_ids)
+        baseline_trials_by_task = {
+            task_id: _find_baseline_trial(baseline_root, task_id) for task_id in task_ids
+        }
+        baseline_rewards_by_task = {
+            task_id: _trial_reward(baseline_trials_by_task[task_id]) for task_id in task_ids
+        }
+        group_summary = {
+            "group_id": group.group_id,
+            "task_ids": task_ids,
+            "objective": group.objective,
+            "baseline_trials": {
+                task_id: str(baseline_trials_by_task[task_id]) for task_id in task_ids
+            },
+            "baseline_rewards": dict(baseline_rewards_by_task),
+            "rounds": [],
+        }
+        group_store_root = run_root / "groups" / group.group_id / "evolution"
+        db_path = group_store_root / "evolution.db"
+        artifact_root = group_store_root / "artifacts"
+        input_trials_by_task = dict(baseline_trials_by_task)
+        previous_rewards_by_task = dict(baseline_rewards_by_task)
+        previous_dataset_artifact_ids: list[str] = []
+        effective_gepa_generations = (
+            max(1, gepa_generations) if agent_system_method == "agent_system_gepa_reflector" else 1
+        )
+
+        def locate_evolved_trial(
+            task_id: str,
+            round_number: int,
+            search_root: Path,
+        ) -> Path:
+            if evolved_trial_locator is not None:
+                return evolved_trial_locator(task_id, round_number, run_root)
+            return _default_group_evolved_trial_locator(
+                group.group_id,
+                task_id,
+                round_number,
+                run_root,
+                search_root=search_root,
+            )
+
+        for round_number in range(1, rounds + 1):
+            round_root = run_root / "groups" / group.group_id / f"r{round_number}"
+            round_root.mkdir(parents=True, exist_ok=True)
+            generation_input_trials = [
+                input_trials_by_task[task_id] for task_id in task_ids
+            ]
+            round_dataset_artifact_ids: list[str] = []
+            round_generation_summaries: list[dict[str, Any]] = []
+            round_candidate_results: list[dict[str, Any]] = []
+            round_history_dataset_ids = list(previous_dataset_artifact_ids)
+
+            for generation_number in range(1, effective_gepa_generations + 1):
+                generation_root = (
+                    round_root
+                    if effective_gepa_generations == 1
+                    else round_root / f"g{generation_number}"
+                )
+                generation_root.mkdir(parents=True, exist_ok=True)
+                job_output_path = generation_root / "agent_system_job.json"
+                job_command = _create_agent_system_job_command(
+                    task_id=group.group_id,
+                    round_number=round_number,
+                    input_trial_dirs=generation_input_trials,
+                    previous_dataset_artifact_ids=round_history_dataset_ids,
+                    agent_system_method=agent_system_method,
+                    gepa_candidate_count=gepa_candidate_count,
+                    gepa_generation=(
+                        generation_number if effective_gepa_generations > 1 else None
+                    ),
+                    db_path=db_path,
+                    artifact_root=artifact_root,
+                    reflector_model=reflector_model,
+                    reflector_provider=reflector_provider,
+                    reflector_timeout_seconds=reflector_timeout_seconds,
+                    codex_home=codex_home,
+                    output_path=job_output_path,
+                )
+                command_runner(job_command)
+
+                job_payload = json.loads(job_output_path.read_text(encoding="utf-8"))
+                if not isinstance(job_payload, dict):
+                    raise ValueError(f"expected job payload object JSON in {job_output_path}")
+
+                dataset_payload = job_payload.get("dataset")
+                dataset_artifact_id: str | None = None
+                if isinstance(dataset_payload, dict):
+                    raw_dataset_artifact_id = dataset_payload.get("artifact_id")
+                    if (
+                        isinstance(raw_dataset_artifact_id, str)
+                        and raw_dataset_artifact_id.strip()
+                    ):
+                        dataset_artifact_id = raw_dataset_artifact_id
+                        round_history_dataset_ids.append(dataset_artifact_id)
+                        round_dataset_artifact_ids.append(dataset_artifact_id)
+
+                completed_artifacts = worker_runner(db_path=db_path, artifact_root=artifact_root)
+                agent_system_artifacts = discover_agent_system_artifact_paths(
+                    completed_artifacts,
+                    task_id=group.group_id,
+                    round_number=round_number,
+                    job_payload=job_payload,
+                )
+                generation_candidate_results: list[dict[str, Any]] = []
+                for candidate_position, artifact in enumerate(
+                    agent_system_artifacts,
+                    start=1,
+                ):
+                    materializer = ArtifactMaterializer()
+                    agent_kwargs = materializer.materialize(artifact)
+                    candidate_index = _artifact_candidate_index(
+                        artifact,
+                        candidate_position,
+                    )
+                    generation_suffix = (
+                        "" if effective_gepa_generations == 1 else f"-g{generation_number}"
+                    )
+                    candidate_suffix = (
+                        "" if len(agent_system_artifacts) == 1 else f"-c{candidate_index}"
+                    )
+                    task_trials: dict[str, Path] = {}
+                    task_rewards: dict[str, float | None] = {}
+                    for task_position, task_id in enumerate(task_ids, start=1):
+                        candidate_task_job_name = (
+                            f"{group.group_id}-r{round_number}"
+                            f"{generation_suffix}{candidate_suffix}"
+                            f"-t{task_position}-{_safe_path_component(task_id)}"
+                        )
+                        candidate_task_jobs_dir = (
+                            generation_root / "harbor_jobs" / candidate_task_job_name
+                        )
+                        harbor_command = build_harbor_command(
+                            job_name=candidate_task_job_name,
+                            task_root=task_root,
+                            task_id=task_id,
+                            jobs_dir=candidate_task_jobs_dir,
+                            model=model,
+                            env_json=env_json,
+                            agent_kwargs=agent_kwargs,
+                            verifier_env=verifier_env,
+                            n_concurrent=1,
+                            extra_docker_compose=_terminal_bench_extra_docker_compose(
+                                terminal_bench_package_root
+                            ),
+                        )
+                        command_runner(harbor_command, cwd=terminal_bench_package_root)
+                        evolved_trial = locate_evolved_trial(
+                            task_id,
+                            round_number,
+                            candidate_task_jobs_dir,
+                        )
+                        task_trials[task_id] = evolved_trial
+                        task_rewards[task_id] = _trial_reward(evolved_trial)
+                    score = _aggregate_group_score(task_rewards, group.objective)
+                    generation_candidate_results.append(
+                        {
+                            "artifact": artifact,
+                            "materializer": materializer,
+                            "task_trials": task_trials,
+                            "task_rewards": task_rewards,
+                            "score": score,
+                            "generation": generation_number,
+                        }
+                    )
+
+                round_candidate_results.extend(generation_candidate_results)
+                round_generation_summaries.append(
+                    {
+                        "generation": generation_number,
+                        "input_trials": [str(path) for path in generation_input_trials],
+                        "dataset_artifact_id": dataset_artifact_id,
+                        "candidate_trials": [
+                            _group_candidate_trial_summary(
+                                result,
+                                position,
+                                task_ids=task_ids,
+                                include_generation=False,
+                            )
+                            for position, result in enumerate(
+                                generation_candidate_results,
+                                start=1,
+                            )
+                        ],
+                    }
+                )
+                generation_input_trials = [
+                    result["task_trials"][task_id]
+                    for result in generation_candidate_results
+                    for task_id in task_ids
+                ]
+
+            best_candidate = _select_best_group_candidate_result(round_candidate_results)
+            artifact = best_candidate["artifact"]
+            materializer = best_candidate["materializer"]
+            task_trials = best_candidate["task_trials"]
+            task_rewards = best_candidate["task_rewards"]
+            score = best_candidate["score"]
+
+            round_summary = {
+                "round": round_number,
+                "input_trials": {
+                    task_id: str(input_trials_by_task[task_id]) for task_id in task_ids
+                },
+                "task_trials": {
+                    task_id: str(task_trials[task_id]) for task_id in task_ids
+                },
+                "task_rewards": dict(task_rewards),
+                "score": score,
+                "transitions": {
+                    task_id: summarize_transition(
+                        previous_rewards_by_task.get(task_id),
+                        task_rewards.get(task_id),
+                    )
+                    for task_id in task_ids
+                },
+                "artifact": {
+                    "artifact_id": artifact.artifact_id,
+                    "artifact_type": artifact.artifact_type,
+                    "path": str(artifact.path),
+                    "method": artifact.method,
+                    "source_dataset_artifact_ids": artifact.source_dataset_artifact_ids,
+                },
+                "skipped_artifacts": list(materializer.skipped),
+                "candidate_trials": [
+                    _group_candidate_trial_summary(
+                        result,
+                        position,
+                        task_ids=task_ids,
+                        include_generation=effective_gepa_generations > 1,
+                    )
+                    for position, result in enumerate(round_candidate_results, start=1)
+                ],
+            }
+            if round_dataset_artifact_ids:
+                round_summary["dataset_artifact_id"] = round_dataset_artifact_ids[0]
+                round_summary["dataset_artifact_ids"] = list(round_dataset_artifact_ids)
+                previous_dataset_artifact_ids = list(round_history_dataset_ids)
+            if effective_gepa_generations > 1:
+                round_summary["gepa_generations"] = len(round_generation_summaries)
+                round_summary["generations"] = round_generation_summaries
+
+            group_summary["rounds"].append(round_summary)
+            input_trials_by_task = dict(task_trials)
+            previous_rewards_by_task = dict(task_rewards)
+
+        summary["groups"].append(group_summary)
+
+    return summary
+
+
 def discover_agent_system_artifact_path(
     completed_artifacts: list[dict[str, Any]],
     *,
@@ -755,6 +1118,19 @@ def _select_best_candidate_result(candidate_results: list[dict[str, Any]]) -> di
     )
 
 
+def _select_best_group_candidate_result(candidate_results: list[dict[str, Any]]) -> dict[str, Any]:
+    if not candidate_results:
+        raise ValueError("no group candidate trials were evaluated")
+    return max(
+        candidate_results,
+        key=lambda result: (
+            float("-inf") if result["score"] is None else float(result["score"]),
+            int(result.get("generation", 0)),
+            -_artifact_candidate_index(result["artifact"], 0),
+        ),
+    )
+
+
 def _candidate_trial_summary(
     result: dict[str, Any],
     position: int,
@@ -768,6 +1144,33 @@ def _candidate_trial_summary(
         "strategy": _artifact_candidate_strategy(artifact),
         "reward": result["reward"],
         "trial_dir": str(result["trial_dir"]),
+    }
+    if include_generation:
+        summary["generation"] = int(result.get("generation", 0))
+    return summary
+
+
+def _group_candidate_trial_summary(
+    result: dict[str, Any],
+    position: int,
+    *,
+    task_ids: list[str],
+    include_generation: bool = False,
+) -> dict[str, Any]:
+    artifact = result["artifact"]
+    task_rewards = result["task_rewards"]
+    task_trials = result["task_trials"]
+    summary = {
+        "candidate_index": _artifact_candidate_index(artifact, position),
+        "artifact_id": artifact.artifact_id,
+        "strategy": _artifact_candidate_strategy(artifact),
+        "score": result["score"],
+        "task_rewards": {
+            task_id: task_rewards[task_id] for task_id in task_ids
+        },
+        "task_trials": {
+            task_id: str(task_trials[task_id]) for task_id in task_ids
+        },
     }
     if include_generation:
         summary["generation"] = int(result.get("generation", 0))
@@ -798,6 +1201,49 @@ def _manifest_candidate_index(manifest: dict[str, Any]) -> int | None:
 def _manifest_candidate_strategy(manifest: dict[str, Any]) -> str | None:
     value = manifest.get("candidate_strategy")
     return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+def _validate_task_group(group: TerminalBenchTaskGroup) -> TerminalBenchTaskGroup:
+    group_id = group.group_id.strip()
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", group_id):
+        raise ValueError(
+            "Terminal Bench group_id must start with an alphanumeric character "
+            "and contain only alphanumeric characters, '.', '_' or '-'"
+        )
+    task_ids = [task_id.strip() for task_id in group.task_ids if task_id.strip()]
+    if len(task_ids) < 2:
+        raise ValueError(
+            f"Terminal Bench group {group_id!r} requires at least two task_id values"
+        )
+    if len(set(task_ids)) != len(task_ids):
+        raise ValueError(f"Terminal Bench group {group_id!r} contains duplicate task_id values")
+    if group.objective != "macro_mean_reward":
+        raise ValueError(f"unsupported Terminal Bench group objective: {group.objective!r}")
+    return TerminalBenchTaskGroup(
+        group_id=group_id,
+        task_ids=task_ids,
+        objective=group.objective,
+    )
+
+
+def _safe_path_component(value: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "-", value.strip()).strip(".-_")
+    if not cleaned:
+        raise ValueError(f"cannot derive a safe path component from {value!r}")
+    return cleaned
+
+
+def _aggregate_group_score(
+    task_rewards: dict[str, float | None],
+    objective: str,
+) -> float | None:
+    if objective != "macro_mean_reward":
+        raise ValueError(f"unsupported Terminal Bench group objective: {objective!r}")
+    if not task_rewards:
+        raise ValueError("group score requires at least one task reward")
+    if any(reward is None for reward in task_rewards.values()):
+        return None
+    return sum(float(reward) for reward in task_rewards.values()) / len(task_rewards)
 
 
 def summarize_transition(before: float | None, after: float | None) -> str:

@@ -12,11 +12,13 @@ from polar_evolution.models import ArtifactRegisterRequest, ArtifactType
 from polar_evolution.terminal_bench_per_task import (
     ArtifactMaterializer,
     EvolutionArtifact,
+    TerminalBenchTaskGroup,
     _find_baseline_trial,
     _run_worker_once_local,
     _trial_reward,
     build_harbor_command,
     discover_agent_system_artifact_path,
+    run_group_evolution,
     run_per_task_evolution,
     summarize_transition,
 )
@@ -763,6 +765,465 @@ def test_gepa_orchestration_feeds_candidate_feedback_into_next_generation(
     assert [trial["generation"] for trial in round_summary["candidate_trials"]] == [1, 1, 2, 2]
 
 
+def test_group_evolution_evaluates_candidate_pool_across_tasks_and_selects_macro_mean(
+    tmp_path: Path,
+):
+    task_ids = ["task-a", "task-b"]
+    baseline_root = tmp_path / "baseline"
+    for task_id in task_ids:
+        baseline = baseline_root / f"{task_id}__base"
+        (baseline / "agent").mkdir(parents=True)
+        (baseline / "verifier").mkdir()
+        (baseline / "result.json").write_text(
+            json.dumps(
+                {
+                    "trial_name": f"{task_id}__base",
+                    "task_name": task_id,
+                    "status": "COMPLETED",
+                    "verifier_result": {"rewards": {"reward": 0.0}},
+                }
+            ),
+            encoding="utf-8",
+        )
+        (baseline / "agent" / "stdout.txt").write_text("baseline failed\n", encoding="utf-8")
+        (baseline / "verifier" / "reward.txt").write_text("0.0\n", encoding="utf-8")
+
+    candidate_trials = [
+        tmp_path / "run" / "candidate-1" / "task-a__c1",
+        tmp_path / "run" / "candidate-1" / "task-b__c1",
+        tmp_path / "run" / "candidate-2" / "task-a__c2",
+        tmp_path / "run" / "candidate-2" / "task-b__c2",
+    ]
+    rewards = [1.0, 0.0, 1.0, 1.0]
+    for trial, task_id, reward in zip(
+        candidate_trials,
+        ["task-a", "task-b", "task-a", "task-b"],
+        rewards,
+    ):
+        (trial / "agent").mkdir(parents=True)
+        (trial / "verifier").mkdir()
+        (trial / "result.json").write_text(
+            json.dumps(
+                {
+                    "trial_name": trial.name,
+                    "task_name": task_id,
+                    "status": "COMPLETED",
+                    "verifier_result": {"rewards": {"reward": reward}},
+                }
+            ),
+            encoding="utf-8",
+        )
+        (trial / "agent" / "stdout.txt").write_text("candidate completed\n", encoding="utf-8")
+        (trial / "verifier" / "reward.txt").write_text(f"{reward}\n", encoding="utf-8")
+
+    commands: list[list[str]] = []
+
+    def fake_run_command(command, cwd=None):
+        del cwd
+        commands.append(command)
+        if "terminal-bench-agent-system-job" in command:
+            job_path = Path(command[command.index("--output") + 1])
+            job_path.parent.mkdir(parents=True, exist_ok=True)
+            job_path.write_text(
+                json.dumps(
+                    {
+                        "dataset": {"artifact_id": "dataset-group-r0"},
+                        "job": {"input_artifact_ids": ["dataset-group-r0"]},
+                    }
+                ),
+                encoding="utf-8",
+            )
+        return {}
+
+    def fake_worker_runner(*, db_path, artifact_root):
+        del db_path, artifact_root
+        agent_paths = [tmp_path / "AGENTS-c1.md", tmp_path / "AGENTS-c2.md"]
+        for index, path in enumerate(agent_paths, start=1):
+            path.write_text(f"# Group Candidate {index}\n", encoding="utf-8")
+        return [
+            {
+                "artifact_id": "art-agent-c1",
+                "type": "agent_system",
+                "uri": agent_paths[0].resolve().as_uri(),
+                "manifest": {
+                    "method": "agent_system_gepa_reflector",
+                    "candidate_index": 1,
+                    "candidate_strategy": "preserve",
+                },
+            },
+            {
+                "artifact_id": "art-agent-c2",
+                "type": "agent_system",
+                "uri": agent_paths[1].resolve().as_uri(),
+                "manifest": {
+                    "method": "agent_system_gepa_reflector",
+                    "candidate_index": 2,
+                    "candidate_strategy": "repair",
+                },
+            },
+        ]
+
+    trial_iter = iter(candidate_trials)
+
+    summary = run_group_evolution(
+        task_root=tmp_path / "tasks",
+        groups=[
+            TerminalBenchTaskGroup(
+                group_id="failed-set",
+                task_ids=task_ids,
+                objective="macro_mean_reward",
+            )
+        ],
+        run_root=tmp_path / "run",
+        baseline_root=baseline_root,
+        model="gpt-5.5",
+        reflector_model="gpt-5.5",
+        rounds=1,
+        env_json={},
+        verifier_env={},
+        agent_system_method="agent_system_gepa_reflector",
+        gepa_candidate_count=2,
+        command_runner=fake_run_command,
+        worker_runner=fake_worker_runner,
+        evolved_trial_locator=lambda task_id, round_number, run_root: next(trial_iter),
+    )
+
+    job_command = next(
+        command for command in commands if "terminal-bench-agent-system-job" in command
+    )
+    job_inputs = [job_command[index + 1] for index, part in enumerate(job_command) if part == "--input"]
+    assert job_inputs == [
+        str(baseline_root / "task-a__base"),
+        str(baseline_root / "task-b__base"),
+    ]
+    assert job_command[job_command.index("--dataset-name") + 1] == "failed-set_r0"
+    assert job_command[job_command.index("--policy-version") + 1] == "tb21-failed-set-r0"
+
+    harbor_commands = [command for command in commands if command[:2] == ["harbor", "run"]]
+    assert len(harbor_commands) == 4
+    assert [
+        command[command.index("--include-task-name") + 1] for command in harbor_commands
+    ] == ["task-a", "task-b", "task-a", "task-b"]
+    assert "agent_system_path=" + str(tmp_path / "AGENTS-c1.md") in harbor_commands[0]
+    assert "agent_system_path=" + str(tmp_path / "AGENTS-c1.md") in harbor_commands[1]
+    assert "agent_system_path=" + str(tmp_path / "AGENTS-c2.md") in harbor_commands[2]
+    assert "agent_system_path=" + str(tmp_path / "AGENTS-c2.md") in harbor_commands[3]
+
+    group_summary = summary["groups"][0]
+    assert group_summary["group_id"] == "failed-set"
+    assert group_summary["baseline_rewards"] == {"task-a": 0.0, "task-b": 0.0}
+    round_summary = group_summary["rounds"][0]
+    assert round_summary["score"] == 1.0
+    assert round_summary["artifact"]["artifact_id"] == "art-agent-c2"
+    assert round_summary["candidate_trials"] == [
+        {
+            "candidate_index": 1,
+            "artifact_id": "art-agent-c1",
+            "strategy": "preserve",
+            "score": 0.5,
+            "task_rewards": {"task-a": 1.0, "task-b": 0.0},
+            "task_trials": {
+                "task-a": str(candidate_trials[0]),
+                "task-b": str(candidate_trials[1]),
+            },
+        },
+        {
+            "candidate_index": 2,
+            "artifact_id": "art-agent-c2",
+            "strategy": "repair",
+            "score": 1.0,
+            "task_rewards": {"task-a": 1.0, "task-b": 1.0},
+            "task_trials": {
+                "task-a": str(candidate_trials[2]),
+                "task-b": str(candidate_trials[3]),
+            },
+        },
+    ]
+
+
+def test_group_evolution_feeds_selected_group_trials_into_next_round(
+    tmp_path: Path,
+):
+    task_ids = ["task-a", "task-b"]
+    baseline_root = tmp_path / "baseline"
+    for task_id in task_ids:
+        baseline = baseline_root / f"{task_id}__base"
+        (baseline / "agent").mkdir(parents=True)
+        (baseline / "verifier").mkdir()
+        (baseline / "result.json").write_text(
+            json.dumps(
+                {
+                    "trial_name": f"{task_id}__base",
+                    "task_name": task_id,
+                    "status": "COMPLETED",
+                    "verifier_result": {"rewards": {"reward": 0.0}},
+                }
+            ),
+            encoding="utf-8",
+        )
+        (baseline / "verifier" / "reward.txt").write_text("0.0\n", encoding="utf-8")
+
+    candidate_trials = [
+        tmp_path / "run" / "candidate-r1-c1" / "task-a__r1c1",
+        tmp_path / "run" / "candidate-r1-c1" / "task-b__r1c1",
+        tmp_path / "run" / "candidate-r1-c2" / "task-a__r1c2",
+        tmp_path / "run" / "candidate-r1-c2" / "task-b__r1c2",
+        tmp_path / "run" / "candidate-r2-c1" / "task-a__r2c1",
+        tmp_path / "run" / "candidate-r2-c1" / "task-b__r2c1",
+        tmp_path / "run" / "candidate-r2-c2" / "task-a__r2c2",
+        tmp_path / "run" / "candidate-r2-c2" / "task-b__r2c2",
+    ]
+    for trial, task_id, reward in zip(
+        candidate_trials,
+        ["task-a", "task-b", "task-a", "task-b", "task-a", "task-b", "task-a", "task-b"],
+        [0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0],
+    ):
+        (trial / "agent").mkdir(parents=True)
+        (trial / "verifier").mkdir()
+        (trial / "result.json").write_text(
+            json.dumps(
+                {
+                    "trial_name": trial.name,
+                    "task_name": task_id,
+                    "status": "COMPLETED",
+                    "verifier_result": {"rewards": {"reward": reward}},
+                }
+            ),
+            encoding="utf-8",
+        )
+        (trial / "verifier" / "reward.txt").write_text(f"{reward}\n", encoding="utf-8")
+
+    commands: list[list[str]] = []
+    job_counter = 0
+
+    def fake_run_command(command, cwd=None):
+        del cwd
+        nonlocal job_counter
+        commands.append(command)
+        if "terminal-bench-agent-system-job" in command:
+            job_counter += 1
+            dataset_id = f"dataset-r{job_counter}"
+            prior_ids = [
+                command[index + 1]
+                for index, part in enumerate(command)
+                if part == "--dataset-artifact-id"
+            ]
+            job_path = Path(command[command.index("--output") + 1])
+            job_path.parent.mkdir(parents=True, exist_ok=True)
+            job_path.write_text(
+                json.dumps(
+                    {
+                        "dataset": {"artifact_id": dataset_id},
+                        "job": {"input_artifact_ids": [*prior_ids, dataset_id]},
+                    }
+                ),
+                encoding="utf-8",
+            )
+        return {}
+
+    worker_call = 0
+
+    def fake_worker_runner(*, db_path, artifact_root):
+        del db_path, artifact_root
+        nonlocal worker_call
+        worker_call += 1
+        artifacts = []
+        for candidate_index, strategy in enumerate(["preserve", "repair"], start=1):
+            path = tmp_path / f"AGENTS-r{worker_call}-c{candidate_index}.md"
+            path.write_text(f"# Round {worker_call} candidate {candidate_index}\n", encoding="utf-8")
+            artifacts.append(
+                {
+                    "artifact_id": f"art-agent-r{worker_call}-c{candidate_index}",
+                    "type": "agent_system",
+                    "uri": path.resolve().as_uri(),
+                    "manifest": {
+                        "method": "agent_system_gepa_reflector",
+                        "candidate_index": candidate_index,
+                        "candidate_strategy": strategy,
+                    },
+                }
+            )
+        return artifacts
+
+    trial_iter = iter(candidate_trials)
+
+    summary = run_group_evolution(
+        task_root=tmp_path / "tasks",
+        groups=[TerminalBenchTaskGroup(group_id="failed-set", task_ids=task_ids)],
+        run_root=tmp_path / "run",
+        baseline_root=baseline_root,
+        model="gpt-5.5",
+        reflector_model="gpt-5.5",
+        rounds=2,
+        env_json={},
+        verifier_env={},
+        agent_system_method="agent_system_gepa_reflector",
+        gepa_candidate_count=2,
+        command_runner=fake_run_command,
+        worker_runner=fake_worker_runner,
+        evolved_trial_locator=lambda task_id, round_number, run_root: next(trial_iter),
+    )
+
+    job_commands = [
+        command for command in commands if "terminal-bench-agent-system-job" in command
+    ]
+    assert len(job_commands) == 2
+    second_inputs = [
+        job_commands[1][index + 1]
+        for index, part in enumerate(job_commands[1])
+        if part == "--input"
+    ]
+    assert second_inputs == [str(candidate_trials[2]), str(candidate_trials[3])]
+    second_dataset_ids = [
+        job_commands[1][index + 1]
+        for index, part in enumerate(job_commands[1])
+        if part == "--dataset-artifact-id"
+    ]
+    assert second_dataset_ids == ["dataset-r1"]
+    assert summary["groups"][0]["rounds"][0]["dataset_artifact_ids"] == ["dataset-r1"]
+    assert summary["groups"][0]["rounds"][1]["dataset_artifact_ids"] == ["dataset-r2"]
+
+
+def test_group_evolution_uses_candidate_task_specific_jobs_dirs_for_default_locator(
+    tmp_path: Path,
+):
+    task_ids = ["task-a", "task-b"]
+    baseline_root = tmp_path / "baseline"
+    for task_id in task_ids:
+        baseline = baseline_root / f"{task_id}__base"
+        (baseline / "agent").mkdir(parents=True)
+        (baseline / "verifier").mkdir()
+        (baseline / "result.json").write_text(
+            json.dumps(
+                {
+                    "trial_name": f"{task_id}__base",
+                    "task_name": task_id,
+                    "status": "COMPLETED",
+                    "verifier_result": {"rewards": {"reward": 0.0}},
+                }
+            ),
+            encoding="utf-8",
+        )
+        (baseline / "verifier" / "reward.txt").write_text("0.0\n", encoding="utf-8")
+
+    commands: list[list[str]] = []
+    rewards_by_agent_and_task = {
+        ("AGENTS-c1.md", "task-a"): 1.0,
+        ("AGENTS-c1.md", "task-b"): 0.0,
+        ("AGENTS-c2.md", "task-a"): 1.0,
+        ("AGENTS-c2.md", "task-b"): 1.0,
+    }
+
+    def fake_run_command(command, cwd=None):
+        del cwd
+        commands.append(command)
+        if "terminal-bench-agent-system-job" in command:
+            job_path = Path(command[command.index("--output") + 1])
+            job_path.parent.mkdir(parents=True, exist_ok=True)
+            job_path.write_text(
+                json.dumps(
+                    {
+                        "dataset": {"artifact_id": "dataset-r1"},
+                        "job": {"input_artifact_ids": ["dataset-r1"]},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            return {}
+        if command[:2] == ["harbor", "run"]:
+            task_id = command[command.index("--include-task-name") + 1]
+            jobs_dir = Path(command[command.index("--jobs-dir") + 1])
+            agent_path = next(
+                part.removeprefix("agent_system_path=")
+                for part in command
+                if part.startswith("agent_system_path=")
+            )
+            reward = rewards_by_agent_and_task[(Path(agent_path).name, task_id)]
+            trial = jobs_dir / f"{task_id}__{Path(agent_path).stem}"
+            (trial / "agent").mkdir(parents=True)
+            (trial / "verifier").mkdir()
+            (trial / "result.json").write_text(
+                json.dumps(
+                    {
+                        "trial_name": trial.name,
+                        "task_name": task_id,
+                        "status": "COMPLETED",
+                        "verifier_result": {"rewards": {"reward": reward}},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (trial / "verifier" / "reward.txt").write_text(f"{reward}\n", encoding="utf-8")
+        return {}
+
+    def fake_worker_runner(*, db_path, artifact_root):
+        del db_path, artifact_root
+        paths = [tmp_path / "AGENTS-c1.md", tmp_path / "AGENTS-c2.md"]
+        for path in paths:
+            path.write_text(f"# {path.stem}\n", encoding="utf-8")
+        return [
+            {
+                "artifact_id": "art-agent-c1",
+                "type": "agent_system",
+                "uri": paths[0].resolve().as_uri(),
+                "manifest": {
+                    "method": "agent_system_gepa_reflector",
+                    "candidate_index": 1,
+                    "candidate_strategy": "preserve",
+                },
+            },
+            {
+                "artifact_id": "art-agent-c2",
+                "type": "agent_system",
+                "uri": paths[1].resolve().as_uri(),
+                "manifest": {
+                    "method": "agent_system_gepa_reflector",
+                    "candidate_index": 2,
+                    "candidate_strategy": "repair",
+                },
+            },
+        ]
+
+    summary = run_group_evolution(
+        task_root=tmp_path / "tasks",
+        groups=[TerminalBenchTaskGroup(group_id="failed-set", task_ids=task_ids)],
+        run_root=tmp_path / "run",
+        baseline_root=baseline_root,
+        model="gpt-5.5",
+        reflector_model="gpt-5.5",
+        rounds=1,
+        env_json={},
+        verifier_env={},
+        agent_system_method="agent_system_gepa_reflector",
+        gepa_candidate_count=2,
+        command_runner=fake_run_command,
+        worker_runner=fake_worker_runner,
+    )
+
+    harbor_commands = [command for command in commands if command[:2] == ["harbor", "run"]]
+    jobs_dirs = [command[command.index("--jobs-dir") + 1] for command in harbor_commands]
+    assert len(jobs_dirs) == 4
+    assert len(set(jobs_dirs)) == 4
+    assert summary["groups"][0]["rounds"][0]["artifact"]["artifact_id"] == "art-agent-c2"
+    assert summary["groups"][0]["rounds"][0]["candidate_trials"][0]["score"] == 0.5
+    assert summary["groups"][0]["rounds"][0]["candidate_trials"][1]["score"] == 1.0
+
+
+def test_group_evolution_rejects_single_task_group(tmp_path: Path):
+    with pytest.raises(ValueError, match="at least two task_id values"):
+        run_group_evolution(
+            task_root=tmp_path / "tasks",
+            groups=[TerminalBenchTaskGroup(group_id="failed-set", task_ids=["task-a"])],
+            run_root=tmp_path / "run",
+            baseline_root=tmp_path / "baseline",
+            model="gpt-5.5",
+            reflector_model="gpt-5.5",
+            rounds=1,
+            env_json={},
+            verifier_env={},
+        )
+
+
 def test_per_task_evolution_passes_reflector_timeout_to_agent_system_job(
     tmp_path: Path,
 ):
@@ -1060,3 +1521,125 @@ def test_terminal_bench_per_task_evolution_cli_live_mode_parses_env_and_writes_o
     assert captured["env_json"] == {"NO_PROXY": "localhost"}
     assert captured["verifier_env"] == {"UV_NO_INDEX": "1"}
     assert json.loads(output.read_text(encoding="utf-8")) == {"mode": "live", "tasks": []}
+
+
+def test_terminal_bench_group_evolution_cli_dry_run_writes_plan(tmp_path: Path):
+    output = tmp_path / "summary.json"
+    run_root = tmp_path / "run"
+
+    exit_code = main(
+        [
+            "terminal-bench-group-evolution",
+            "--task-root",
+            "/root/datasets/terminal-bench-2-1/tasks",
+            "--group-id",
+            "failed-set",
+            "--task-id",
+            "task-a",
+            "--task-id",
+            "task-b",
+            "--run-root",
+            str(run_root),
+            "--model",
+            "gpt-5.5",
+            "--reflector-model",
+            "gpt-5.5",
+            "--agent-system-method",
+            "agent_system_gepa_reflector",
+            "--gepa-candidate-count",
+            "2",
+            "--gepa-generations",
+            "3",
+            "--rounds",
+            "2",
+            "--dry-run",
+            "--output",
+            str(output),
+        ]
+    )
+
+    assert exit_code == 0
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert payload["dry_run"] is True
+    assert payload["mode"] == "group"
+    assert payload["groups"] == [
+        {
+            "group_id": "failed-set",
+            "task_ids": ["task-a", "task-b"],
+            "objective": "macro_mean_reward",
+            "rounds": 2,
+            "artifact_types": ["agent_system"],
+        }
+    ]
+    assert payload["agent_system_method"] == "agent_system_gepa_reflector"
+    assert payload["gepa_candidate_count"] == 2
+    assert payload["gepa_generations"] == 3
+
+
+def test_terminal_bench_group_evolution_cli_live_mode_parses_env_and_writes_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    output = tmp_path / "summary.json"
+    captured: dict[str, object] = {}
+
+    def fake_run_group_evolution(**kwargs):
+        captured.update(kwargs)
+        return {"mode": "group", "groups": []}
+
+    monkeypatch.setattr(cli_module, "run_group_evolution", fake_run_group_evolution)
+
+    exit_code = main(
+        [
+            "terminal-bench-group-evolution",
+            "--task-root",
+            "/root/datasets/terminal-bench-2-1/tasks",
+            "--group-id",
+            "failed-set",
+            "--task-id",
+            "task-a",
+            "--task-id",
+            "task-b",
+            "--run-root",
+            str(tmp_path / "run"),
+            "--baseline-root",
+            str(tmp_path / "baseline"),
+            "--terminal-bench-package-root",
+            "/tmp/terminal-bench-package",
+            "--model",
+            "gpt-5.5",
+            "--reflector-model",
+            "gpt-5.5",
+            "--reflector-provider",
+            "openai_chat",
+            "--codex-home",
+            "/tmp/codex-home",
+            "--objective",
+            "macro_mean_reward",
+            "--gepa-generations",
+            "2",
+            "--env-json",
+            '{"NO_PROXY":"localhost"}',
+            "--verifier-env",
+            "UV_NO_INDEX=1",
+            "--output",
+            str(output),
+        ]
+    )
+
+    assert exit_code == 0
+    assert captured["groups"] == [
+        TerminalBenchTaskGroup(
+            group_id="failed-set",
+            task_ids=["task-a", "task-b"],
+            objective="macro_mean_reward",
+        )
+    ]
+    assert captured["baseline_root"] == tmp_path / "baseline"
+    assert captured["terminal_bench_package_root"] == Path("/tmp/terminal-bench-package")
+    assert captured["reflector_provider"] == "openai_chat"
+    assert captured["codex_home"] == "/tmp/codex-home"
+    assert captured["gepa_generations"] == 2
+    assert captured["env_json"] == {"NO_PROXY": "localhost"}
+    assert captured["verifier_env"] == {"UV_NO_INDEX": "1"}
+    assert json.loads(output.read_text(encoding="utf-8")) == {"mode": "group", "groups": []}

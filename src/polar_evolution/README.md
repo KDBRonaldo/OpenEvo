@@ -95,6 +95,41 @@ After its candidates run through Harbor and the official verifier, generation
 baseline dataset artifact in history. Later generations repeat that loop and
 the runner selects the best-scoring candidate trial across the whole round.
 
+### Group-level Terminal Bench evolution
+
+Use group mode when a configurable set of Terminal Bench tasks should evolve
+one shared `agent_system` artifact. This is different from per-task mode:
+multiple `--task-id` values in per-task mode still create independent
+per-task loops, while group mode creates one group loop and evaluates every
+candidate artifact across every task in the group.
+
+```bash
+uv run polar-evolution terminal-bench-group-evolution \
+  --task-root /root/datasets/terminal-bench-2-1/tasks \
+  --group-id tb21-failed-hard \
+  --task-id train-fasttext \
+  --task-id vulnerable-secret \
+  --task-id sam-cell-seg \
+  --baseline-root /tmp/tb21-baseline/jobs \
+  --run-root /tmp/tb21-group-evolution \
+  --model gpt-5.5 \
+  --reflector-model gpt-5.5 \
+  --agent-system-method agent_system_gepa_reflector \
+  --gepa-candidate-count 2 \
+  --gepa-generations 2 \
+  --objective macro_mean_reward \
+  --rounds 1 \
+  --output /tmp/tb21-group-evolution/summary.json
+```
+
+The first group-level objective is `macro_mean_reward`. For each generation,
+the runner creates one agent-system job from all current group trial inputs.
+Each candidate `AGENTS.md` is then injected into every task in the group, and
+the candidate score is the unweighted mean of those task rewards. The selected
+candidate's per-task trial outputs become the next round's inputs. The summary
+contains `groups[].rounds[].candidate_trials[]` with per-task trial paths,
+per-task rewards, aggregate score, and the selected artifact.
+
 ```sh
 uv run polar-evolution terminal-bench-events \
   --input /tmp/evolab-tb21-run/<job-or-trial-dir> \
