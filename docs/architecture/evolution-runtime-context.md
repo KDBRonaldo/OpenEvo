@@ -167,6 +167,11 @@ Context resolver 会把选中的 parametric artifacts 转成：
 }
 ```
 
+Parametric memory participates in the same explicit context allowlist as
+textual memory, skills, and agent-system artifacts. If an OpenEvo rollout passes
+`context_artifact_ids`, only listed adapter artifacts are converted into
+`adapter_merge_spec`.
+
 Gateway 会把这个 spec 写入 `SessionRegistry.metadata`，这样 proxy 在收到模型请求
 时可以使用它。
 

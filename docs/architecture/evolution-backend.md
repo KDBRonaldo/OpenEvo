@@ -203,6 +203,12 @@ flowchart TB
 ```
 
 Compatibility 目前会考虑 task metadata、agent harness 和 base model。
+When `metadata.evolution.context_artifact_ids` is present, context resolution
+treats it as a strict allowlist for every artifact type, including
+`parametric_memory`. This is required for controlled ablations because promoted
+compatible artifacts from other runs must not be injected unless the rollout
+explicitly selected them.
+
 `agent_system` artifact 的 manifest 可以声明 `target_path`，例如 `AGENTS.md` 或
 `.openhands/microagents/repo.md`。注册时会规范化并校验这个路径：必须是 allowlist
 中的 harness instruction 相对路径，不能为空、不能是绝对路径，也不能包含 `..`。
