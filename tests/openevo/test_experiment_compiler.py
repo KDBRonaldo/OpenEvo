@@ -136,6 +136,52 @@ def test_rollout_metadata_uses_sanitized_agent_summary() -> None:
     assert "secret-env-token" not in str(payload["metadata"])
 
 
+def test_agent_native_memory_policy_is_preserved_in_rollout_settings() -> None:
+    compiled = compile_experiment(
+        _config(
+            agent={
+                "preset": "codex",
+                "model": "gpt-5.1-codex-mini",
+                "settings": {"native_memory_policy": "clear"},
+            }
+        )
+    )
+
+    payload = compiled.tasks[0].rollout_payload_for_round(0, context_artifact_ids=[])
+
+    assert payload["agent"]["settings"]["native_memory_policy"] == "clear"
+
+
+def test_agent_native_memory_policy_rejects_unknown_value() -> None:
+    try:
+        _config(
+            agent={
+                "preset": "codex",
+                "model": "gpt-5.1-codex-mini",
+                "settings": {"native_memory_policy": "wipe"},
+            }
+        )
+    except ValueError as exc:
+        assert "native_memory_policy" in str(exc)
+    else:
+        raise AssertionError("expected ValueError")
+
+
+def test_agent_native_memory_policy_rejects_explicit_null() -> None:
+    try:
+        _config(
+            agent={
+                "preset": "codex",
+                "model": "gpt-5.1-codex-mini",
+                "settings": {"native_memory_policy": None},
+            }
+        )
+    except ValueError as exc:
+        assert "native_memory_policy" in str(exc)
+    else:
+        raise AssertionError("expected ValueError")
+
+
 def test_relative_workspace_resolves_from_config_file(tmp_path: Path) -> None:
     config_dir = tmp_path / "configs"
     config_dir.mkdir()
@@ -164,7 +210,7 @@ def test_relative_workspace_resolves_from_config_file(tmp_path: Path) -> None:
     assert payload["runtime"]["prepare"][0]["source"] == str(workspace.resolve())
 
 
-def test_evolution_methods_are_ordered_text_memory_skill_bundle_agent_system() -> None:
+def test_evolution_methods_default_to_text_memory_skill_bundle_agent_system() -> None:
     compiled = compile_experiment(_config())
 
     assert [spec.artifact_type for spec in compiled.evolution_methods_for_round(0)] == [
@@ -172,6 +218,63 @@ def test_evolution_methods_are_ordered_text_memory_skill_bundle_agent_system() -
         "skill_bundle",
         "agent_system",
     ]
+
+
+def test_evolution_methods_include_parametric_memory_when_enabled() -> None:
+    compiled = compile_experiment(
+        _config(
+            artifacts={
+                "text_memory": {"enabled": True},
+                "parametric_memory": {
+                    "enabled": True,
+                    "method": "parametric_memory_register",
+                    "config": {
+                        "adapter_uri": "file:///adapters/parser-memory",
+                        "base_model": "gpt-5.1-codex-mini",
+                        "adapter_id": "parser-memory",
+                    },
+                },
+                "skill_bundle": {"enabled": True},
+                "agent_system": {"enabled": True},
+            }
+        )
+    )
+
+    specs = compiled.evolution_methods_for_round(0)
+
+    assert [spec.artifact_type for spec in specs] == [
+        "text_memory",
+        "parametric_memory",
+        "skill_bundle",
+        "agent_system",
+    ]
+    assert specs[1].method == "parametric_memory_register"
+    assert specs[1].config["adapter_uri"] == "file:///adapters/parser-memory"
+    assert specs[1].config["base_model"] == "gpt-5.1-codex-mini"
+    assert specs[1].config["adapter_id"] == "parser-memory"
+    assert "reflector_llm" not in specs[1].config
+
+
+def test_parametric_memory_config_drops_user_reflector_llm() -> None:
+    compiled = compile_experiment(
+        _config(
+            artifacts={
+                "parametric_memory": {
+                    "enabled": True,
+                    "config": {
+                        "adapter_uri": "file:///adapters/parser-memory",
+                        "reflector_llm": {"provider": "bad", "model": "bad"},
+                    },
+                },
+            }
+        )
+    )
+
+    specs = compiled.evolution_methods_for_round(0)
+
+    assert specs[1].artifact_type == "parametric_memory"
+    assert specs[1].config["adapter_uri"] == "file:///adapters/parser-memory"
+    assert "reflector_llm" not in specs[1].config
 
 
 def test_agent_system_auto_resolves_by_round() -> None:
@@ -325,6 +428,48 @@ def test_evolution_job_compatibility_uses_single_task_scoped_tag() -> None:
     ]
 
 
+def test_parametric_memory_job_compatibility_preserves_base_model_and_task_scope() -> None:
+    compiled = compile_experiment(
+        _config(
+            artifacts={
+                "text_memory": {"enabled": False},
+                "parametric_memory": {
+                    "enabled": True,
+                    "method": "parametric_memory_register",
+                    "config": {
+                        "adapter_uri": "file:///adapters/parser-memory",
+                        "base_model": "gpt-5.1-codex-mini",
+                        "adapter_id": "parser-memory",
+                        "compatibility": {
+                            "base_model": ["wrong-model"],
+                            "task_tags": ["wrong-task"],
+                            "agent_harness": ["wrong-harness"],
+                            "capability": ["component-extraction"],
+                        },
+                    },
+                },
+                "skill_bundle": {"enabled": False},
+                "agent_system": {"enabled": False},
+            }
+        )
+    )
+
+    jobs = compiled.evolution_job_payloads_for_round(
+        0,
+        dataset_artifact_id="dataset_artifact_1",
+    )
+
+    assert len(jobs) == 1
+    assert jobs[0]["method"] == "parametric_memory_register"
+    compatibility = jobs[0]["config"]["compatibility"]
+    assert compatibility["base_model"] == ["gpt-5.1-codex-mini"]
+    assert compatibility["task_tags"] == [
+        "openevo_task:biology-components:component-extraction-train"
+    ]
+    assert compatibility["agent_harness"] == ["codex"]
+    assert compatibility["capability"] == ["component-extraction"]
+
+
 def test_history_agent_system_jobs_include_prior_dataset_artifacts() -> None:
     compiled = compile_experiment(_config(), rounds_override=2)
 
@@ -353,10 +498,14 @@ def test_rollout_context_excludes_internal_dataset_history() -> None:
         context_artifact_ids={
             "dataset": ["dataset_artifact_0"],
             "text_memory": ["memory_0"],
+            "parametric_memory": ["adapter_0"],
         },
     )
 
-    assert payload["metadata"]["evolution"]["context_artifact_ids"] == ["memory_0"]
+    assert payload["metadata"]["evolution"]["context_artifact_ids"] == [
+        "memory_0",
+        "adapter_0",
+    ]
 
 
 def test_rollout_payload_emits_explicit_empty_context_selection() -> None:

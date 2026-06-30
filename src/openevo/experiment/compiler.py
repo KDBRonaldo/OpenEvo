@@ -11,7 +11,7 @@ from openevo.experiment.models import (
     TaskConfig,
 )
 
-_EVOLUTION_ORDER = ("text_memory", "skill_bundle", "agent_system")
+_EVOLUTION_ORDER = ("text_memory", "parametric_memory", "skill_bundle", "agent_system")
 _ROLLOUT_CONTEXT_ARTIFACT_TYPES = _EVOLUTION_ORDER
 _SUBSCRIPTION_AUTH_MODES = {"subscription", "chatgpt_subscription"}
 
@@ -124,6 +124,12 @@ class CompiledTask:
             )
             input_artifact_ids = [dataset_artifact_id, *context_ids]
             payload = spec.job_payload(input_artifact_ids)
+            compatibility = _job_compatibility(
+                spec,
+                payload["config"],
+                task_tags=self._task_tags(),
+                agent_harness=str(self.agent.get("harness") or ""),
+            )
             payload["config"] = {
                 **payload["config"],
                 "name": f"{self.task_id}:{spec.artifact_type}:round-{round_index}",
@@ -144,10 +150,7 @@ class CompiledTask:
                     "policy_version": policy_version,
                     "input_artifact_ids": input_artifact_ids,
                 },
-                "compatibility": {
-                    "task_tags": self._task_tags(),
-                    "agent_harness": [str(self.agent.get("harness") or "")],
-                },
+                "compatibility": compatibility,
             }
             if _promotion_gate_targets_artifact(self.promotion_gate, spec.artifact_type):
                 payload["config"]["promotion_gate"] = _worker_visible_promotion_gate(
@@ -176,6 +179,32 @@ class CompiledTask:
         if self.run_id:
             return [f"openevo_run_task:{self.run_id}:{self.task_id}"]
         return [f"openevo_task:{self.experiment_name}:{self.task_id}"]
+
+
+def _job_compatibility(
+    spec: CompiledEvolutionMethodSpec,
+    config: Mapping[str, Any],
+    *,
+    task_tags: list[str],
+    agent_harness: str,
+) -> dict[str, Any]:
+    compatibility: dict[str, Any] = {}
+    if spec.artifact_type == "parametric_memory":
+        configured = config.get("compatibility")
+        if isinstance(configured, Mapping):
+            compatibility.update(configured)
+
+    compatibility.update(
+        {
+            "task_tags": task_tags,
+            "agent_harness": [agent_harness],
+        }
+    )
+    if spec.artifact_type == "parametric_memory":
+        base_model = config.get("base_model")
+        if isinstance(base_model, str) and base_model:
+            compatibility["base_model"] = [base_model]
+    return compatibility
 
 
 @dataclass(frozen=True)
@@ -293,19 +322,31 @@ def _compile_method_spec(
     round_index: int,
     reflector_llm: dict[str, str],
 ) -> CompiledEvolutionMethodSpec | None:
-    base_config: dict[str, Any] = {"reflector_llm": dict(reflector_llm)}
+    base_config: dict[str, Any] = {}
     if artifact_type == "text_memory":
         if not config.artifacts.text_memory.enabled:
             return None
         method = config.artifacts.text_memory.method
+        base_config["reflector_llm"] = dict(reflector_llm)
+    elif artifact_type == "parametric_memory":
+        if not config.artifacts.parametric_memory.enabled:
+            return None
+        method = config.artifacts.parametric_memory.method
+        base_config.update(
+            key_value
+            for key_value in config.artifacts.parametric_memory.config.items()
+            if key_value[0] != "reflector_llm"
+        )
     elif artifact_type == "skill_bundle":
         if not config.artifacts.skill_bundle.enabled:
             return None
         method = config.artifacts.skill_bundle.method
+        base_config["reflector_llm"] = dict(reflector_llm)
     elif artifact_type == "agent_system":
         if not config.artifacts.agent_system.enabled:
             return None
         method = _resolve_agent_system_method(config.artifacts.agent_system.method, round_index)
+        base_config["reflector_llm"] = dict(reflector_llm)
         base_config["target_path"] = config.artifacts.agent_system.target_path
     else:
         raise ValueError(f"Unsupported artifact_type: {artifact_type}")

@@ -553,7 +553,28 @@ def test_context_resolver_honors_explicit_context_artifact_ids(tmp_path):
     assert context.memory["artifact_ids"] == [latest_memory.artifact_id]
     assert "Latest round advice" in context.memory["rendered_text"]
     assert old_memory.artifact_id not in context.selection["artifact_ids"]
-    assert context.adapter_merge_spec.adapters[0]["artifact_id"] == adapter.artifact_id
+    assert context.adapter_merge_spec.adapters == []
+    assert adapter.artifact_id not in context.selection["artifact_ids"]
+
+    adapter_context = store.resolve_context(
+        ContextResolveRequest(
+            task_id="task-a",
+            instruction="continue task",
+            base_model="gpt-5.1-codex-mini",
+            metadata={
+                "task_tags": ["openevo_run_task:run-1:task-a"],
+                "evolution": {
+                    "context_artifact_ids": [
+                        latest_memory.artifact_id,
+                        adapter.artifact_id,
+                    ]
+                },
+            },
+        )
+    )
+
+    assert adapter_context.memory["artifact_ids"] == [latest_memory.artifact_id]
+    assert adapter_context.adapter_merge_spec.adapters[0]["artifact_id"] == adapter.artifact_id
 
 
 def test_context_resolver_skips_legacy_agent_system_with_unsafe_target_path(tmp_path):

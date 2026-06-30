@@ -85,13 +85,31 @@ agent:
   auth: subscription
   settings:
     capture_mode: transcript
+    native_memory_policy: preserve
 runtime:
   image: my-task-image:latest
 tasks:
   - id: component-extraction-train
     instruction: Extract biological components into final_components.json.
     workspace: /root/codex54minitest/five_article_agentic_workflow_subset
+artifacts:
+  text_memory:
+    enabled: true
+    method: text_memory_reflector
+  parametric_memory:
+    enabled: false
+    method: parametric_memory_register
+    config: {}
+  skill_bundle:
+    enabled: false
+  agent_system:
+    enabled: false
 ```
+
+`native_memory_policy` controls harness-native memory only. For Codex, `clear`
+removes `CODEX_HOME/memories/` and `CODEX_HOME/memories_*.sqlite*` while keeping
+subscription auth state. Polar evolution memory is controlled separately through
+`artifacts.text_memory` and `artifacts.parametric_memory`.
 
 Task IDs are used as rollout polling URL path segments, so they must be stable
 slugs and cannot contain `/`.

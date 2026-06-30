@@ -2627,6 +2627,35 @@ def test_parametric_memory_register_preserves_configured_adapter_id(tmp_path):
     assert artifacts[0].manifest["adapter_id"] == "parser-memory"
 
 
+def test_parametric_memory_register_preserves_routing_metadata(tmp_path):
+    adapter_dir = tmp_path / "adapter"
+    adapter_dir.mkdir()
+    job = _job(
+        "parametric_memory_register",
+        tmp_path,
+        config={
+            "adapter_uri": adapter_dir.as_uri(),
+            "base_model": "Qwen/Qwen3.6-27B",
+            "compatibility": {
+                "base_model": ["Qwen/Qwen3.6-27B"],
+                "task_tags": ["terminal-bench"],
+            },
+            "lineage": {"input_artifact_ids": ["dataset_1"]},
+            "scores": {"quality": 0.82, "heldout_reward_delta": 0.1},
+        },
+    )
+
+    artifacts = run_method(job, artifact_root=tmp_path / "artifacts")
+
+    artifact = artifacts[0]
+    assert artifact.compatibility == {
+        "base_model": ["Qwen/Qwen3.6-27B"],
+        "task_tags": ["terminal-bench"],
+    }
+    assert artifact.lineage == {"input_artifact_ids": ["dataset_1"]}
+    assert artifact.scores == {"quality": 0.82, "heldout_reward_delta": 0.1}
+
+
 def test_parse_capabilities_defaults_to_reference_job_types():
     assert _parse_capabilities([]) == [
         "text_memory",
