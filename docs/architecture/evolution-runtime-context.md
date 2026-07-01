@@ -170,10 +170,18 @@ Context resolver 会把选中的 parametric artifacts 转成：
 Parametric memory participates in the same explicit context allowlist as
 textual memory, skills, and agent-system artifacts. If an OpenEvo rollout passes
 `context_artifact_ids`, only listed adapter artifacts are converted into
-`adapter_merge_spec`.
+`adapter_merge_spec`. It is only selected for proxy/local inference requests: if
+the context request carries subscription auth in `agent.settings.auth_mode`,
+`agent.auth`, `metadata.auth_mode`, or `metadata.evolution.auth_mode`, the
+resolver skips `parametric_memory` artifacts and returns an empty adapter spec.
 
 Gateway 会把这个 spec 写入 `SessionRegistry.metadata`，这样 proxy 在收到模型请求
 时可以使用它。
+
+这条路径只在 proxy/local inference 模式下生效。Gateway/proxy 需要能改写请求模型名或
+adapter 选择字段，并且 serving backend 必须已经加载对应 adapter，或支持外部 dynamic
+adapter loading。Subscription harness 直连外部订阅模型服务，不能消费
+`adapter_merge_spec`；这类运行仍可消费 textual memory、skills 和 agent-system artifacts。
 
 ## Engine-Specific Adapter Injection
 

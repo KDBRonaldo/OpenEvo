@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 from dataclasses import dataclass, field
 import json
 from pathlib import Path
@@ -16,7 +17,10 @@ from polar_evolution.models import (
     WorkerHeartbeatRequest,
 )
 from polar_evolution.store import EvolutionStore
-from polar_evolution.terminal_bench_bridge import build_terminal_bench_events
+from polar_evolution.terminal_bench_bridge import (
+    TerminalBenchBridgeError,
+    build_terminal_bench_events,
+)
 
 LOCAL_WORKER_LEASE_SECONDS = 24 * 60 * 60
 DEFAULT_TERMINAL_BENCH_PACKAGE_ROOT = Path("/root/EvoLabCore-terminal-bench-task-package")
@@ -64,11 +68,11 @@ class ArtifactMaterializer:
     def materialize(self, artifact: EvolutionArtifact) -> dict[str, str]:
         if artifact.artifact_type == "agent_system":
             return {"agent_system_path": str(artifact.path)}
+        if artifact.artifact_type in {"text_memory", "memory"}:
+            return {"memory_path": str(artifact.path)}
         if artifact.artifact_type in {
             "skill_bundle",
-            "text_memory",
             "parametric_memory",
-            "memory",
         }:
             self.skipped.append(
                 {
@@ -92,6 +96,7 @@ def build_harbor_command(
     agent_kwargs: dict[str, str],
     verifier_env: dict[str, str],
     n_concurrent: int,
+    n_attempts: int = 1,
     environment_import_path: str | None = DEFAULT_TERMINAL_BENCH_ENVIRONMENT_IMPORT_PATH,
     extra_docker_compose: list[Path] | None = None,
     preserve_environment: bool = True,
@@ -113,7 +118,7 @@ def build_harbor_command(
             "--include-task-name",
             task_id,
             "--n-attempts",
-            "1",
+            str(max(1, int(n_attempts))),
             "--n-concurrent",
             str(n_concurrent),
             "--agent-import-path",
@@ -148,12 +153,79 @@ def build_harbor_command(
     return command
 
 
+def _normalize_terminal_bench_artifact_type(artifact_type: str) -> str:
+    normalized = artifact_type.strip()
+    if normalized == "memory":
+        return "text_memory"
+    return normalized
+
+
+def _single_live_artifact_type(artifact_types: list[str] | None) -> str:
+    normalized = [
+        _normalize_terminal_bench_artifact_type(artifact_type)
+        for artifact_type in (artifact_types or ["agent_system"])
+    ]
+    if any(artifact_type == "parametric_memory" for artifact_type in normalized):
+        raise ValueError("Terminal Bench Codex subscription runs do not support parametric_memory")
+    if len(normalized) != 1:
+        raise ValueError("live Terminal Bench evolution requires exactly one artifact type")
+    if normalized[0] not in {"agent_system", "text_memory"}:
+        raise ValueError(
+            "live Terminal Bench evolution currently supports only agent_system or text_memory"
+        )
+    return normalized[0]
+
+
 def _terminal_bench_extra_docker_compose(package_root: Path) -> list[Path]:
     harbor_root = package_root / "task_packages" / "terminal_bench_v1" / "harbor"
     return [
         harbor_root / "pull-never.yaml",
         harbor_root / "docker-cp-host-network.yaml",
     ]
+
+
+def _agent_init_supports_kwarg(agent_path: Path, keyword: str) -> bool:
+    try:
+        module = ast.parse(agent_path.read_text(encoding="utf-8"), filename=str(agent_path))
+    except (OSError, SyntaxError):
+        return False
+    for node in module.body:
+        if not isinstance(node, ast.ClassDef) or node.name != "EvoLabHarborAgent":
+            continue
+        for item in node.body:
+            if not isinstance(item, ast.FunctionDef) or item.name != "__init__":
+                continue
+            args = item.args
+            if args.kwarg is not None:
+                return True
+            parameters = [*args.posonlyargs, *args.args, *args.kwonlyargs]
+            return any(parameter.arg == keyword for parameter in parameters)
+    return False
+
+
+def _ensure_terminal_bench_package_supports_artifact_type(
+    package_root: Path,
+    artifact_type: str,
+) -> None:
+    if artifact_type != "text_memory":
+        return
+    agent_path = package_root / "task_packages" / "terminal_bench_v1" / "harbor_agent.py"
+    if not _agent_init_supports_kwarg(agent_path, "memory_path"):
+        raise ValueError(
+            "Terminal Bench text_memory runs require EvoLabHarborAgent to accept "
+            f"`memory_path`; checked {agent_path}"
+        )
+
+
+def _should_preflight_terminal_bench_package(
+    *,
+    terminal_bench_package_root: Path,
+    command_runner,
+) -> bool:
+    return (
+        command_runner is _default_command_runner
+        or terminal_bench_package_root != DEFAULT_TERMINAL_BENCH_PACKAGE_ROOT
+    )
 
 
 def _default_command_runner(command: list[str], cwd: Path | None = None) -> dict[str, Any]:
@@ -174,6 +246,31 @@ def _default_evolved_trial_locator(task_id: str, round_number: int, run_root: Pa
             f"{round_root} for task {task_id!r} round {round_number}"
         )
     return max(candidates, key=lambda path: (path.stat().st_mtime_ns, path.as_posix()))
+
+
+def _locate_evolved_attempt_trials(*, task_id: str, job_root: Path) -> list[Path]:
+    candidates = [
+        path
+        for path in job_root.glob(f"{task_id}__*")
+        if path.is_dir() and (path / "result.json").is_file()
+    ]
+    if not candidates:
+        raise FileNotFoundError(
+            f"no evolved Terminal Bench attempts found under {job_root} for task {task_id!r}"
+        )
+    return sorted(candidates, key=_attempt_trial_sort_key)
+
+
+def _attempt_trial_sort_key(path: Path) -> tuple[int, str | int, str]:
+    result_path = path / "result.json"
+    try:
+        payload = json.loads(result_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        payload = {}
+    started_at = payload.get("started_at") if isinstance(payload, dict) else None
+    if isinstance(started_at, str) and started_at.strip():
+        return (0, started_at, path.as_posix())
+    return (1, path.stat().st_mtime_ns, path.as_posix())
 
 
 def _default_group_evolved_trial_locator(
@@ -238,6 +335,13 @@ def _trial_reward(trial_dir: Path) -> float | None:
     return _fallback_trial_reward(trial_dir)
 
 
+def _attempt_reward(trial_dir: Path) -> float | None:
+    try:
+        return _trial_reward(trial_dir)
+    except TerminalBenchBridgeError:
+        return None
+
+
 def _create_agent_system_job_command(
     *,
     task_id: str,
@@ -295,6 +399,58 @@ def _create_agent_system_job_command(
         command.extend(["--input", str(input_trial_dir)])
     if method == "agent_system_gepa_reflector":
         command.extend(["--candidate-count", str(gepa_candidate_count)])
+    if codex_home:
+        command.extend(["--codex-home", codex_home])
+    for artifact_id in previous_dataset_artifact_ids:
+        command.extend(["--dataset-artifact-id", artifact_id])
+    command.extend(["--output", str(output_path)])
+    return command
+
+
+def _create_text_memory_job_command(
+    *,
+    task_id: str,
+    round_number: int,
+    input_trial_dirs: list[Path],
+    previous_dataset_artifact_ids: list[str],
+    memory_method: str,
+    db_path: Path,
+    artifact_root: Path,
+    reflector_model: str,
+    reflector_provider: str,
+    reflector_timeout_seconds: float | None,
+    codex_home: str | None,
+    output_path: Path,
+) -> list[str]:
+    if not input_trial_dirs:
+        raise ValueError("text memory job command requires at least one input trial")
+    input_round = round_number - 1
+    command = [
+        "uv",
+        "run",
+        "polar-evolution",
+        "terminal-bench-text-memory-job",
+        "--db",
+        str(db_path),
+        "--artifact-root",
+        str(artifact_root),
+        "--dataset-name",
+        f"{task_id}_r{input_round}",
+        "--policy-version",
+        f"tb21-{task_id}-r{input_round}",
+        "--method",
+        memory_method,
+        "--job-name",
+        f"tb21-{task_id}-r{round_number}",
+        "--reflector-provider",
+        reflector_provider,
+        "--reflector-model",
+        reflector_model,
+    ]
+    if reflector_timeout_seconds is not None:
+        command.extend(["--reflector-timeout-seconds", str(reflector_timeout_seconds)])
+    for input_trial_dir in input_trial_dirs:
+        command.extend(["--input", str(input_trial_dir)])
     if codex_home:
         command.extend(["--codex-home", codex_home])
     for artifact_id in previous_dataset_artifact_ids:
@@ -443,10 +599,12 @@ def run_per_task_evolution_dry_run(
     reflector_timeout_seconds: float | None,
     terminal_bench_package_root: Path = DEFAULT_TERMINAL_BENCH_PACKAGE_ROOT,
     agent_system_method: str,
+    memory_method: str = "text_memory_expel_reflector",
     gepa_candidate_count: int,
     gepa_generations: int,
     rounds: int,
     artifact_types: list[str],
+    n_attempts: int = 1,
 ) -> dict[str, Any]:
     return {
         "dry_run": True,
@@ -458,8 +616,10 @@ def run_per_task_evolution_dry_run(
         "reflector_timeout_seconds": reflector_timeout_seconds,
         "terminal_bench_package_root": str(terminal_bench_package_root),
         "agent_system_method": agent_system_method,
+        "memory_method": memory_method,
         "gepa_candidate_count": gepa_candidate_count,
         "gepa_generations": gepa_generations,
+        "n_attempts": max(1, int(n_attempts)),
         "tasks": [
             {"task_id": task_id, "rounds": rounds, "artifact_types": artifact_types}
             for task_id in task_ids
@@ -523,9 +683,12 @@ def run_per_task_evolution(
     codex_home: str | None = None,
     terminal_bench_package_root: Path = DEFAULT_TERMINAL_BENCH_PACKAGE_ROOT,
     agent_system_method: str = "auto",
+    memory_method: str = "text_memory_expel_reflector",
     gepa_candidate_count: int = 1,
     gepa_generations: int = 1,
     rounds: int,
+    artifact_types: list[str] | None = None,
+    n_attempts: int = 1,
     env_json: dict[str, str],
     verifier_env: dict[str, str],
     command_runner=_default_command_runner,
@@ -543,10 +706,26 @@ def run_per_task_evolution(
         "reflector_timeout_seconds": reflector_timeout_seconds,
         "terminal_bench_package_root": str(terminal_bench_package_root),
         "agent_system_method": agent_system_method,
+        "memory_method": memory_method,
         "gepa_candidate_count": gepa_candidate_count,
         "gepa_generations": gepa_generations,
+        "n_attempts": max(1, int(n_attempts)),
+        "artifact_types": [
+            _normalize_terminal_bench_artifact_type(artifact_type)
+            for artifact_type in (artifact_types or ["agent_system"])
+        ],
         "tasks": [],
     }
+    selected_artifact_type = _single_live_artifact_type(artifact_types)
+    attempt_count = max(1, int(n_attempts))
+    if _should_preflight_terminal_bench_package(
+        terminal_bench_package_root=terminal_bench_package_root,
+        command_runner=command_runner,
+    ):
+        _ensure_terminal_bench_package_supports_artifact_type(
+            terminal_bench_package_root,
+            selected_artifact_type,
+        )
 
     for task_id in task_ids:
         baseline_trial = _find_baseline_trial(baseline_root, task_id)
@@ -564,7 +743,12 @@ def run_per_task_evolution(
         previous_reward = baseline_reward
         previous_dataset_artifact_ids: list[str] = []
         effective_gepa_generations = (
-            max(1, gepa_generations) if agent_system_method == "agent_system_gepa_reflector" else 1
+            max(1, gepa_generations)
+            if (
+                selected_artifact_type == "agent_system"
+                and agent_system_method == "agent_system_gepa_reflector"
+            )
+            else 1
         )
 
         for round_number in range(1, rounds + 1):
@@ -583,25 +767,42 @@ def run_per_task_evolution(
                     else round_root / f"g{generation_number}"
                 )
                 generation_root.mkdir(parents=True, exist_ok=True)
-                job_output_path = generation_root / "agent_system_job.json"
-                job_command = _create_agent_system_job_command(
-                    task_id=task_id,
-                    round_number=round_number,
-                    input_trial_dirs=generation_input_trials,
-                    previous_dataset_artifact_ids=round_history_dataset_ids,
-                    agent_system_method=agent_system_method,
-                    gepa_candidate_count=gepa_candidate_count,
-                    gepa_generation=(
-                        generation_number if effective_gepa_generations > 1 else None
-                    ),
-                    db_path=db_path,
-                    artifact_root=artifact_root,
-                    reflector_model=reflector_model,
-                    reflector_provider=reflector_provider,
-                    reflector_timeout_seconds=reflector_timeout_seconds,
-                    codex_home=codex_home,
-                    output_path=job_output_path,
-                )
+                if selected_artifact_type == "agent_system":
+                    job_output_path = generation_root / "agent_system_job.json"
+                    job_command = _create_agent_system_job_command(
+                        task_id=task_id,
+                        round_number=round_number,
+                        input_trial_dirs=generation_input_trials,
+                        previous_dataset_artifact_ids=round_history_dataset_ids,
+                        agent_system_method=agent_system_method,
+                        gepa_candidate_count=gepa_candidate_count,
+                        gepa_generation=(
+                            generation_number if effective_gepa_generations > 1 else None
+                        ),
+                        db_path=db_path,
+                        artifact_root=artifact_root,
+                        reflector_model=reflector_model,
+                        reflector_provider=reflector_provider,
+                        reflector_timeout_seconds=reflector_timeout_seconds,
+                        codex_home=codex_home,
+                        output_path=job_output_path,
+                    )
+                else:
+                    job_output_path = generation_root / "text_memory_job.json"
+                    job_command = _create_text_memory_job_command(
+                        task_id=task_id,
+                        round_number=round_number,
+                        input_trial_dirs=generation_input_trials,
+                        previous_dataset_artifact_ids=round_history_dataset_ids,
+                        memory_method=memory_method,
+                        db_path=db_path,
+                        artifact_root=artifact_root,
+                        reflector_model=reflector_model,
+                        reflector_provider=reflector_provider,
+                        reflector_timeout_seconds=reflector_timeout_seconds,
+                        codex_home=codex_home,
+                        output_path=job_output_path,
+                    )
                 command_runner(job_command)
 
                 job_payload = json.loads(job_output_path.read_text(encoding="utf-8"))
@@ -621,15 +822,16 @@ def run_per_task_evolution(
                         round_dataset_artifact_ids.append(dataset_artifact_id)
 
                 completed_artifacts = worker_runner(db_path=db_path, artifact_root=artifact_root)
-                agent_system_artifacts = discover_agent_system_artifact_paths(
+                evolution_artifacts = discover_evolution_artifact_paths(
                     completed_artifacts,
+                    artifact_type=selected_artifact_type,
                     task_id=task_id,
                     round_number=round_number,
                     job_payload=job_payload,
                 )
                 generation_candidate_results: list[dict[str, Any]] = []
                 for candidate_position, artifact in enumerate(
-                    agent_system_artifacts,
+                    evolution_artifacts,
                     start=1,
                 ):
                     materializer = ArtifactMaterializer()
@@ -642,12 +844,10 @@ def run_per_task_evolution(
                         "" if effective_gepa_generations == 1 else f"-g{generation_number}"
                     )
                     candidate_suffix = (
-                        "" if len(agent_system_artifacts) == 1 else f"-c{candidate_index}"
+                        "" if len(evolution_artifacts) == 1 else f"-c{candidate_index}"
                     )
                     harbor_command = build_harbor_command(
-                        job_name=(
-                            f"{task_id}-r{round_number}{generation_suffix}{candidate_suffix}"
-                        ),
+                        job_name=f"{task_id}-r{round_number}{generation_suffix}{candidate_suffix}",
                         task_root=task_root,
                         task_id=task_id,
                         jobs_dir=generation_root / "harbor_jobs",
@@ -656,19 +856,49 @@ def run_per_task_evolution(
                         agent_kwargs=agent_kwargs,
                         verifier_env=verifier_env,
                         n_concurrent=1,
+                        n_attempts=attempt_count,
                         extra_docker_compose=_terminal_bench_extra_docker_compose(
                             terminal_bench_package_root
                         ),
                     )
                     command_runner(harbor_command, cwd=terminal_bench_package_root)
-                    evolved_trial = evolved_trial_locator(task_id, round_number, run_root)
-                    reward = _trial_reward(evolved_trial)
+                    harbor_job_name = harbor_command[
+                        harbor_command.index("--job-name") + 1
+                    ]
+                    if attempt_count == 1:
+                        attempt_trials = [
+                            evolved_trial_locator(task_id, round_number, run_root)
+                        ]
+                    else:
+                        attempt_trials = _locate_evolved_attempt_trials(
+                            task_id=task_id,
+                            job_root=generation_root / "harbor_jobs" / harbor_job_name,
+                        )
+                    attempts = [
+                        {
+                            "attempt_index": attempt_index,
+                            "trial_dir": attempt_trial,
+                            "reward": _attempt_reward(attempt_trial),
+                        }
+                        for attempt_index, attempt_trial in enumerate(
+                            attempt_trials,
+                            start=1,
+                        )
+                    ]
+                    best_attempt = _select_best_attempt(attempts)
+                    evolved_trial = best_attempt["trial_dir"]
+                    reward = best_attempt["reward"]
                     generation_candidate_results.append(
                         {
                             "artifact": artifact,
                             "materializer": materializer,
                             "trial_dir": evolved_trial,
                             "reward": reward,
+                            "attempts": attempts,
+                            "pass_at_k": any(
+                                _reward_passed(attempt.get("reward"))
+                                for attempt in attempts[:attempt_count]
+                            ),
                             "generation": generation_number,
                         }
                     )
@@ -717,6 +947,17 @@ def run_per_task_evolution(
                 },
                 "skipped_artifacts": list(materializer.skipped),
             }
+            if len(best_candidate.get("attempts") or []) > 1:
+                round_summary["attempt_count"] = len(best_candidate["attempts"])
+                round_summary["attempts"] = [
+                    {
+                        "attempt_index": attempt["attempt_index"],
+                        "reward": attempt["reward"],
+                        "trial_dir": str(attempt["trial_dir"]),
+                    }
+                    for attempt in best_candidate["attempts"]
+                ]
+                round_summary["pass_at_k"] = bool(best_candidate.get("pass_at_k", False))
             if len(round_candidate_results) > 1:
                 round_summary["candidate_trials"] = [
                     _candidate_trial_summary(
@@ -739,6 +980,17 @@ def run_per_task_evolution(
             previous_reward = reward
 
         summary["tasks"].append(task_summary)
+
+    if selected_artifact_type == "text_memory":
+        summary["memory_benchmark"] = build_memory_benchmark_summary(
+            model=model,
+            auth_mode="subscription",
+            memory_backend=memory_method,
+            baseline_pass_at_1=_baseline_pass_at_1_from_tasks(summary["tasks"]),
+            baseline_pass_at_5=None,
+            attempts_by_task=_memory_attempts_by_task(summary["tasks"]),
+            total_tasks=len(summary["tasks"]),
+        )
 
     return summary
 
@@ -1057,6 +1309,24 @@ def discover_agent_system_artifact_paths(
     round_number: int,
     job_payload: dict[str, Any],
 ) -> list[EvolutionArtifact]:
+    return discover_evolution_artifact_paths(
+        completed_artifacts,
+        artifact_type="agent_system",
+        task_id=task_id,
+        round_number=round_number,
+        job_payload=job_payload,
+    )
+
+
+def discover_evolution_artifact_paths(
+    completed_artifacts: list[dict[str, Any]],
+    *,
+    artifact_type: str,
+    task_id: str,
+    round_number: int,
+    job_payload: dict[str, Any],
+) -> list[EvolutionArtifact]:
+    normalized_artifact_type = _normalize_terminal_bench_artifact_type(artifact_type)
     job = job_payload.get("job")
     if not isinstance(job, dict):
         raise ValueError("job_payload['job'] must be a dict")
@@ -1068,33 +1338,44 @@ def discover_agent_system_artifact_paths(
 
     discovered: list[EvolutionArtifact] = []
     for artifact in completed_artifacts:
-        if artifact.get("type") != "agent_system":
+        if _normalize_terminal_bench_artifact_type(str(artifact.get("type") or "")) != (
+            normalized_artifact_type
+        ):
             continue
         uri = artifact.get("uri")
         if not isinstance(uri, str):
-            raise ValueError(f"agent_system artifact has unsupported uri: {uri!r}")
+            raise ValueError(f"{normalized_artifact_type} artifact has unsupported uri: {uri!r}")
         parsed = urlparse(uri)
         if parsed.scheme != "file":
-            raise ValueError(f"agent_system artifact has unsupported uri: {uri!r}")
+            raise ValueError(f"{normalized_artifact_type} artifact has unsupported uri: {uri!r}")
         if parsed.netloc not in {"", "localhost"}:
-            raise ValueError(f"agent_system artifact has unsupported file URI host: {uri!r}")
+            raise ValueError(
+                f"{normalized_artifact_type} artifact has unsupported file URI host: {uri!r}"
+            )
         path_text = unquote(parsed.path)
         if not path_text:
-            raise ValueError(f"agent_system artifact has empty path in uri: {uri!r}")
+            raise ValueError(
+                f"{normalized_artifact_type} artifact has empty path in uri: {uri!r}"
+            )
         manifest = artifact.get("manifest")
         if not isinstance(manifest, dict):
             manifest = {}
         artifact_id = artifact.get("artifact_id")
         if not isinstance(artifact_id, str) or not artifact_id.strip():
-            raise ValueError("completed agent_system artifact missing required artifact_id")
+            raise ValueError(
+                f"completed {normalized_artifact_type} artifact missing required artifact_id"
+            )
         discovered.append(
             EvolutionArtifact(
-                artifact_type="agent_system",
+                artifact_type=normalized_artifact_type,
                 artifact_id=artifact_id,
                 path=Path(path_text),
                 task_id=task_id,
                 round=round_number,
-                method=str(manifest.get("method") or "agent_system_reflector"),
+                method=str(
+                    manifest.get("method")
+                    or _default_terminal_bench_artifact_method(normalized_artifact_type)
+                ),
                 source_dataset_artifact_ids=list(input_artifact_ids),
                 candidate_index=_manifest_candidate_index(manifest),
                 candidate_strategy=_manifest_candidate_strategy(manifest),
@@ -1102,7 +1383,13 @@ def discover_agent_system_artifact_paths(
         )
     if discovered:
         return discovered
-    raise ValueError("completed job did not produce an agent_system artifact")
+    raise ValueError(f"completed job did not produce a {normalized_artifact_type} artifact")
+
+
+def _default_terminal_bench_artifact_method(artifact_type: str) -> str:
+    if artifact_type == "text_memory":
+        return "text_memory_expel_reflector"
+    return "agent_system_reflector"
 
 
 def _select_best_candidate_result(candidate_results: list[dict[str, Any]]) -> dict[str, Any]:
@@ -1114,6 +1401,18 @@ def _select_best_candidate_result(candidate_results: list[dict[str, Any]]) -> di
             float("-inf") if result["reward"] is None else float(result["reward"]),
             int(result.get("generation", 0)),
             -_artifact_candidate_index(result["artifact"], 0),
+        ),
+    )
+
+
+def _select_best_attempt(attempts: list[dict[str, Any]]) -> dict[str, Any]:
+    if not attempts:
+        raise ValueError("no Terminal Bench attempts were evaluated")
+    return max(
+        attempts,
+        key=lambda attempt: (
+            float("-inf") if attempt["reward"] is None else float(attempt["reward"]),
+            -int(attempt["attempt_index"]),
         ),
     )
 
@@ -1147,6 +1446,17 @@ def _candidate_trial_summary(
     }
     if include_generation:
         summary["generation"] = int(result.get("generation", 0))
+    if len(result.get("attempts") or []) > 1:
+        summary["attempt_count"] = len(result["attempts"])
+        summary["attempts"] = [
+            {
+                "attempt_index": attempt["attempt_index"],
+                "reward": attempt["reward"],
+                "trial_dir": str(attempt["trial_dir"]),
+            }
+            for attempt in result["attempts"]
+        ]
+        summary["pass_at_k"] = bool(result.get("pass_at_k", False))
     return summary
 
 
@@ -1256,3 +1566,122 @@ def summarize_transition(before: float | None, after: float | None) -> str:
     if not before_passed and after_passed:
         return "fail_to_pass"
     return "fail_to_fail"
+
+
+def build_memory_benchmark_summary(
+    *,
+    model: str,
+    auth_mode: str,
+    memory_backend: str,
+    baseline_pass_at_1: dict[str, int],
+    baseline_pass_at_5: dict[str, int] | None,
+    attempts_by_task: dict[str, list[dict[str, Any]]],
+    total_tasks: int,
+) -> dict[str, Any]:
+    pass_at_1 = 0
+    pass_at_5 = 0
+    transitions: dict[str, dict[str, Any]] = {}
+    for task_id, attempts in attempts_by_task.items():
+        first_attempt = attempts[0] if attempts else {}
+        first_reward = first_attempt.get("reward")
+        baseline_reward = first_attempt.get("baseline_reward")
+        best_reward = _best_attempt_reward(attempts[:5])
+        if _reward_passed(first_reward):
+            pass_at_1 += 1
+        if any(_reward_passed(attempt.get("reward")) for attempt in attempts[:5]):
+            pass_at_5 += 1
+        transitions[task_id] = {
+            "transition": summarize_transition(
+                float(baseline_reward) if isinstance(baseline_reward, int | float) else None,
+                best_reward,
+            ),
+            "artifact_ids": sorted(
+                {
+                    str(attempt["artifact_id"])
+                    for attempt in attempts
+                    if isinstance(attempt.get("artifact_id"), str)
+                }
+            ),
+            "attempt_count": len(attempts),
+            "rewards": [attempt.get("reward") for attempt in attempts],
+        }
+    return {
+        "benchmark": "terminal-bench-2.1",
+        "model": model,
+        "auth_mode": auth_mode,
+        "memory_backend": memory_backend,
+        "enabled_artifacts": ["text_memory"],
+        "disabled_artifacts": ["skill_bundle", "agent_system", "parametric_memory"],
+        "baseline": {
+            "pass_at_1": dict(baseline_pass_at_1),
+            "pass_at_5": dict(baseline_pass_at_5) if baseline_pass_at_5 is not None else None,
+        },
+        "evolved": {
+            "pass_at_1": {"passed": pass_at_1, "total": total_tasks},
+            "pass_at_5": {"passed": pass_at_5, "total": total_tasks},
+        },
+        "task_transitions": transitions,
+    }
+
+
+def _baseline_pass_at_1_from_tasks(tasks: list[dict[str, Any]]) -> dict[str, int]:
+    return {
+        "passed": sum(1 for task in tasks if _reward_passed(task.get("baseline_reward"))),
+        "total": len(tasks),
+    }
+
+
+def _memory_attempts_by_task(tasks: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    attempts_by_task: dict[str, list[dict[str, Any]]] = {}
+    for task in tasks:
+        task_id = str(task.get("task_id") or "")
+        if not task_id:
+            continue
+        rounds = task.get("rounds")
+        if not isinstance(rounds, list) or not rounds:
+            attempts_by_task[task_id] = []
+            continue
+        latest_round = rounds[-1]
+        baseline_reward = task.get("baseline_reward")
+        artifact = latest_round.get("artifact") if isinstance(latest_round, dict) else {}
+        raw_attempts = latest_round.get("attempts") if isinstance(latest_round, dict) else None
+        if isinstance(raw_attempts, list) and raw_attempts:
+            attempts_by_task[task_id] = [
+                {
+                    **attempt,
+                    "baseline_reward": baseline_reward,
+                    "artifact_id": artifact.get("artifact_id")
+                    if isinstance(artifact, dict)
+                    else None,
+                    "artifact_path": artifact.get("path") if isinstance(artifact, dict) else None,
+                }
+                for attempt in raw_attempts
+                if isinstance(attempt, dict)
+            ]
+        else:
+            attempts_by_task[task_id] = [
+                {
+                    "attempt_index": 1,
+                    "reward": latest_round.get("reward"),
+                    "trial_dir": latest_round.get("trial_dir"),
+                    "baseline_reward": baseline_reward,
+                    "artifact_id": artifact.get("artifact_id")
+                    if isinstance(artifact, dict)
+                    else None,
+                    "artifact_path": artifact.get("path") if isinstance(artifact, dict) else None,
+                }
+            ]
+    return attempts_by_task
+
+
+def _reward_passed(value: object) -> bool:
+    return isinstance(value, int | float) and float(value) >= 1.0
+
+
+def _best_attempt_reward(attempts: list[dict[str, Any]]) -> float | None:
+    rewards = [
+        float(reward)
+        for attempt in attempts
+        if isinstance((reward := attempt.get("reward")), int | float)
+    ]
+    return max(rewards) if rewards else None

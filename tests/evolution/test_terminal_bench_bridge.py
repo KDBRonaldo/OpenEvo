@@ -407,6 +407,132 @@ def test_terminal_bench_agent_system_job_cli_uses_history_method_for_multiple_da
     assert forbidden_literals == {}
 
 
+def test_terminal_bench_text_memory_job_cli_places_new_dataset_before_history(
+    tmp_path,
+):
+    db_path = tmp_path / "polar.db"
+    artifact_root = tmp_path / "polar_artifacts"
+    store = EvolutionStore(db_path=db_path, artifact_root=artifact_root)
+    store.initialize()
+
+    prior_trial = _write_trial(
+        tmp_path / "prior",
+        stdout="Edited files without focused validation.\n",
+        stderr="",
+    )
+    prior_artifact_id = _ingest_terminal_bench_dataset(
+        store,
+        prior_trial,
+        name="tb21_round0",
+        policy_version="tb21-round0",
+    )
+    new_trial = _write_trial(
+        tmp_path / "new",
+        stdout="Ran the focused verifier before final response.\n",
+        stderr="",
+    )
+    output_path = tmp_path / "text_memory_job.json"
+
+    exit_code = main(
+        [
+            "terminal-bench-text-memory-job",
+            "--input",
+            str(new_trial.parent),
+            "--db",
+            str(db_path),
+            "--artifact-root",
+            str(artifact_root),
+            "--dataset-artifact-id",
+            prior_artifact_id,
+            "--dataset-name",
+            "tb21_round1",
+            "--policy-version",
+            "tb21-round1",
+            "--reflector-provider",
+            "codex_cli",
+            "--reflector-model",
+            "gpt-5.5",
+            "--method",
+            "text_memory_expel_reflector",
+            "--output",
+            str(output_path),
+        ]
+    )
+
+    assert exit_code == 0
+    payload = json.loads(output_path.read_text(encoding="utf-8"))
+    new_artifact_id = payload["dataset"]["artifact_id"]
+    assert payload["job"]["method"] == "text_memory_expel_reflector"
+    assert payload["job"]["input_artifact_ids"] == [new_artifact_id, prior_artifact_id]
+    assert payload["job"]["config"]["reflector_llm"] == {
+        "provider": "codex_cli",
+        "model": "gpt-5.5",
+    }
+    assert payload["job"]["config"]["compatibility"] == {
+        "agent_harness": ["terminal-bench-harbor"],
+        "task_tags": ["terminal-bench", "terminal-bench:fix-git"],
+    }
+    assert payload["job"]["config"]["promoted"] is False
+    assert payload["job"]["config"]["scores"] == {"quality": 0.0}
+
+    store = EvolutionStore(db_path=db_path, artifact_root=artifact_root)
+    claimed = store.claim_job(
+        WorkerClaimRequest(
+            worker_id="test-worker",
+            capabilities=["text_memory_expel_reflector"],
+        )
+    )
+    assert claimed.job is not None
+    assert claimed.job.input_artifacts[0].artifact_id == new_artifact_id
+    assert claimed.job.input_artifacts[1].artifact_id == prior_artifact_id
+
+
+def test_terminal_bench_text_memory_job_cli_includes_error_trials_by_default(
+    tmp_path,
+):
+    db_path = tmp_path / "polar.db"
+    artifact_root = tmp_path / "polar_artifacts"
+    trial_dir = _write_trial(
+        tmp_path / "job",
+        stdout="",
+        stderr="",
+        codex='{"type":"agent_message","text":"I tried recovery but the shell timed out."}\n',
+        verifier_stdout="agent errored before verifier could pass\n",
+    )
+    result_path = trial_dir / "result.json"
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    result["exception_info"] = {"exception_message": "agent execution failed"}
+    result_path.write_text(json.dumps(result), encoding="utf-8")
+    output_path = tmp_path / "text_memory_error_job.json"
+
+    exit_code = main(
+        [
+            "terminal-bench-text-memory-job",
+            "--input",
+            str(trial_dir.parent),
+            "--db",
+            str(db_path),
+            "--artifact-root",
+            str(artifact_root),
+            "--dataset-name",
+            "tb21_error_round",
+            "--policy-version",
+            "tb21-error-round",
+            "--reflector-provider",
+            "codex_cli",
+            "--reflector-model",
+            "gpt-5.5",
+            "--output",
+            str(output_path),
+        ]
+    )
+
+    assert exit_code == 0
+    payload = json.loads(output_path.read_text(encoding="utf-8"))
+    assert payload["dataset"]["event_count"] == 1
+    assert payload["dataset"]["trace_count"] == 1
+
+
 def test_terminal_bench_task_tags_preserve_short_task_ids_from_events(tmp_path):
     store = EvolutionStore(db_path=tmp_path / "polar.db", artifact_root=tmp_path / "artifacts")
     tags = _terminal_bench_task_tags(

@@ -54,6 +54,8 @@ def test_minimal_yaml_loads_with_defaults(tmp_path: Path) -> None:
     assert config.artifacts.agent_system.enabled is True
     assert config.artifacts.agent_system.method == "auto"
     assert config.artifacts.agent_system.target_path == "AGENTS.md"
+    assert config.artifacts.parametric_memory.enabled is False
+    assert config.artifacts.parametric_memory.method == "parametric_memory_register"
     assert config.tasks[0].id == "component-extraction-train"
 
 
@@ -136,6 +138,31 @@ def test_subscription_agents_accept_transcript_capture_aliases(capture_mode: str
     config = ExperimentConfig.model_validate(payload)
 
     assert config.agent.settings["capture_mode"] == capture_mode
+
+
+def test_subscription_agents_cannot_enable_parametric_memory() -> None:
+    payload = _minimal_payload()
+    payload["agent"] = {
+        "preset": "codex",
+        "model": "gpt-5.1-codex-mini",
+        "auth": "subscription",
+        "settings": {"capture_mode": "transcript"},
+    }
+    payload["artifacts"] = {
+        "text_memory": {"enabled": True},
+        "parametric_memory": {
+            "enabled": True,
+            "config": {
+                "adapter_uri": "file:///adapters/parser-memory",
+                "base_model": "Qwen/Qwen3.6-35B-A3B",
+            },
+        },
+        "skill_bundle": {"enabled": False},
+        "agent_system": {"enabled": False},
+    }
+
+    with pytest.raises(ValidationError, match="parametric_memory requires proxy"):
+        ExperimentConfig.model_validate(payload)
 
 
 def test_agent_settings_auth_mode_must_match_agent_auth() -> None:

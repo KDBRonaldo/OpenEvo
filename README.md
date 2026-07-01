@@ -64,9 +64,11 @@ Main components:
 | `agent_system_gepa_reflector` | `agent_system` | implemented | GEPA-style closed-loop candidate generation for per-task evolution. |
 | `text_memory` | `text_memory` | implemented | Distills successful records into Markdown memory. |
 | `text_memory_reflector` | `text_memory` | implemented | LLM-based reflector that turns trajectories into reusable Markdown memory. |
+| `text_memory_expel_reflector` | `text_memory` | implemented | ExpeL/Reflexion-style memory synthesis with required Do/Avoid/Validate sections. |
 | `skill_bundle` | `skill_bundle` | implemented | Registers harness-loadable skill directories. |
 | `skill_bundle_reflector` | `skill_bundle` | implemented | LLM-based reflector that writes a Codex `SKILL.md`; helper tools are represented as files inside the skill bundle. |
 | `parametric_memory_register` | `parametric_memory` | implemented | Registers external adapter artifacts for later trainer/inference use. |
+| `parametric_memory_lora_sft` | `parametric_memory` | implemented | Exports successful trajectories to SFT JSONL, invokes an external LoRA trainer, and registers the adapter. |
 
 ## OpenEvo Runner
 
@@ -95,7 +97,7 @@ tasks:
 artifacts:
   text_memory:
     enabled: true
-    method: text_memory_reflector
+    method: text_memory_expel_reflector
   parametric_memory:
     enabled: false
     method: parametric_memory_register
@@ -111,6 +113,43 @@ removes `CODEX_HOME/memories/` and `CODEX_HOME/memories_*.sqlite*` while keeping
 subscription auth state. Polar evolution memory is controlled separately through
 `artifacts.text_memory` and `artifacts.parametric_memory`.
 
+Textual memory is rendered into the agent instruction and works in both
+proxy/local inference runs and transcript-only subscription runs. Parametric
+memory requires proxy/local inference because subscription harnesses cannot
+select serving-time adapters. Subscription experiment config rejects
+`parametric_memory`, and context resolution skips adapter artifacts when the
+request auth mode is subscription. To test parametric memory, use
+`agent.auth: proxy` and enable only the memory artifact controls needed for the
+ablation:
+
+```yaml
+agent:
+  preset: codex
+  auth: proxy
+  model: Qwen/Qwen3.6-35B-A3B
+artifacts:
+  text_memory:
+    enabled: true
+  parametric_memory:
+    enabled: true
+    method: parametric_memory_lora_sft
+    config:
+      base_model: Qwen/Qwen3.6-35B-A3B
+      output_adapter_id: memory-lora
+      trainer:
+        command: python
+        args:
+          - /opt/polar/train_lora.py
+          - --train-file
+          - "{training_dataset}"
+          - --output-dir
+          - "{adapter_dir}"
+  skill_bundle:
+    enabled: false
+  agent_system:
+    enabled: false
+```
+
 Task IDs are used as rollout polling URL path segments, so they must be stable
 slugs and cannot contain `/`.
 
@@ -123,7 +162,7 @@ Defaults:
 - `runtime.image`: required when any task sets `workspace`, or when overriding
   runtime fields such as `runtime.env`, `runtime.kind`, or `runtime.workdir`
 - enabled artifacts: `text_memory_reflector`, `skill_bundle_reflector`, and
-  agent-system `auto`
+  agent-system `auto`; `parametric_memory` is available but disabled by default
 - subscription agents use sandboxed `codex_cli` reflection by default; proxy
   agents use OpenAI-compatible chat reflection by default
 - subscription agents require explicit transcript capture. Supported

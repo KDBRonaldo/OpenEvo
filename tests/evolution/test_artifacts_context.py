@@ -711,6 +711,20 @@ def test_context_resolver_requires_declared_base_model_and_harness(tmp_path):
     assert adapter.artifact_id in matching_context.selection["artifact_ids"]
     assert matching_context.adapter_merge_spec.adapters[0]["artifact_id"] == adapter.artifact_id
 
+    subscription_context = store.resolve_context(
+        ContextResolveRequest(
+            task_id="task_subscription_constraints",
+            instruction="fix calculator parser",
+            agent={"settings": {"auth_mode": "subscription"}},
+            base_model="Qwen/Qwen3.6-27B",
+            metadata={"task_tags": ["calculator"]},
+        )
+    )
+
+    assert adapter.artifact_id not in subscription_context.selection["artifact_ids"]
+    assert subscription_context.adapter_merge_spec.adapters == []
+    assert subscription_context.adapter_merge_spec.merge_mode == "reference_only"
+
 
 def test_context_resolver_counts_memory_separators_against_limit(tmp_path):
     store = EvolutionStore(db_path=tmp_path / "evolution.db", artifact_root=tmp_path / "artifacts")

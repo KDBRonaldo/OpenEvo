@@ -264,6 +264,14 @@ class ExperimentConfig(_StrictModel):
         task_ids = [task.id for task in self.tasks]
         if len(task_ids) != len(set(task_ids)):
             raise ValueError("tasks[].id values must be unique")
+        if (
+            self.artifacts.parametric_memory.enabled
+            and self.agent.auth in _SUBSCRIPTION_AUTH_MODES
+        ):
+            raise ValueError(
+                "artifacts.parametric_memory requires proxy/local inference auth; "
+                "subscription runs can use text_memory but cannot apply parametric adapters"
+            )
         if self.runtime.image is None and any(task.workspace for task in self.tasks):
             raise ValueError(
                 "runtime.image is required when tasks[].workspace is set; "

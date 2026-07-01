@@ -165,6 +165,208 @@ def _reflector_dataset_artifact(tmp_path: Path) -> dict[str, Any]:
     }
 
 
+def _parametric_dataset_artifact(
+    tmp_path: Path,
+    records: list[dict[str, Any]],
+    *,
+    artifact_id: str = "art_dataset_parametric",
+) -> dict[str, Any]:
+    dataset_dir = tmp_path / artifact_id
+    dataset_dir.mkdir()
+    records_path = dataset_dir / "records.jsonl"
+    records_path.write_text(
+        "".join(json.dumps(record) + "\n" for record in records),
+        encoding="utf-8",
+    )
+    manifest_path = dataset_dir / "manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "dataset_id": f"ds_{artifact_id}",
+                "name": f"{artifact_id} dataset",
+                "records_path": "records.jsonl",
+                "records_uri": records_path.as_uri(),
+                "event_count": len(records),
+            }
+        ),
+        encoding="utf-8",
+    )
+    return {
+        "artifact_id": artifact_id,
+        "type": "dataset",
+        "uri": manifest_path.as_uri(),
+        "name": f"{artifact_id} dataset",
+    }
+
+
+def _expel_memory_dataset_artifact(tmp_path: Path) -> dict[str, Any]:
+    dataset_dir = tmp_path / "expel-memory-dataset"
+    dataset_dir.mkdir()
+    records_path = dataset_dir / "records.jsonl"
+    records_path.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "event_id": "evt_success",
+                        "task_id": "tb_pass_task",
+                        "session_id": "session_success",
+                        "status": "COMPLETED",
+                        "reward": 1.0,
+                        "traces": [
+                            {
+                                "prompt_messages": [
+                                    {"role": "user", "content": "Repair the CLI test failure."}
+                                ],
+                                "response_messages": [
+                                    {
+                                        "role": "assistant",
+                                        "content": (
+                                            "Inspected failing tests first, changed the parser, "
+                                            "then reran the exact focused test."
+                                        ),
+                                    }
+                                ],
+                                "metadata": {
+                                    "capture_mode": "transcript",
+                                    "token_level_metrics_available": False,
+                                },
+                            }
+                        ],
+                    }
+                ),
+                json.dumps(
+                    {
+                        "event_id": "evt_failure",
+                        "task_id": "tb_fail_task",
+                        "session_id": "session_failure",
+                        "status": "COMPLETED",
+                        "reward": 0.0,
+                        "traces": [
+                            {
+                                "prompt_messages": [
+                                    {"role": "user", "content": "Fix the package test."}
+                                ],
+                                "response_messages": [
+                                    {
+                                        "role": "assistant",
+                                        "content": (
+                                            "Edited multiple files and gave a final answer "
+                                            "without rerunning pytest."
+                                        ),
+                                    }
+                                ],
+                                "metadata": {
+                                    "capture_mode": "transcript",
+                                    "token_level_metrics_available": False,
+                                    "transcript": "verifier failed after missing validation",
+                                },
+                            }
+                        ],
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    manifest_path = dataset_dir / "manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "dataset_id": "ds_expel",
+                "name": "expel memory dataset",
+                "records_path": "records.jsonl",
+                "records_uri": records_path.as_uri(),
+                "event_count": 2,
+                "trace_count": 2,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return {
+        "artifact_id": "art_dataset_expel",
+        "type": "dataset",
+        "uri": manifest_path.as_uri(),
+        "name": "expel memory dataset",
+    }
+
+
+def _expel_history_dataset_artifact(tmp_path: Path) -> dict[str, Any]:
+    dataset_dir = tmp_path / "expel-history-dataset"
+    dataset_dir.mkdir()
+    records_path = dataset_dir / "records.jsonl"
+    records_path.write_text(
+        json.dumps(
+            {
+                "event_id": "evt_history",
+                "task_id": "tb_history_task",
+                "session_id": "session_history",
+                "status": "COMPLETED",
+                "reward": 1.0,
+                "traces": [
+                    {
+                        "prompt_messages": [
+                            {"role": "user", "content": "Recover the hidden G-code text."}
+                        ],
+                        "response_messages": [
+                            {
+                                "role": "assistant",
+                                "content": (
+                                    "Inspected extrusion geometry instead of relying on slicer "
+                                    "comments."
+                                ),
+                            }
+                        ],
+                        "metadata": {
+                            "capture_mode": "transcript",
+                            "token_level_metrics_available": False,
+                        },
+                    }
+                ],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    manifest_path = dataset_dir / "manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "dataset_id": "ds_expel_history",
+                "name": "expel history dataset",
+                "records_path": "records.jsonl",
+                "records_uri": records_path.as_uri(),
+                "event_count": 1,
+                "trace_count": 1,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return {
+        "artifact_id": "art_dataset_expel_history",
+        "type": "dataset",
+        "uri": manifest_path.as_uri(),
+        "name": "expel history dataset",
+    }
+
+
+def _prior_text_memory_artifact(tmp_path: Path) -> dict[str, Any]:
+    memory_path = tmp_path / "prior-memory.md"
+    memory_path.write_text(
+        "# Terminal Bench Textual Memory\n\n"
+        "## Do\n"
+        "- Run a broad test suite before inspecting the focused failure.\n",
+        encoding="utf-8",
+    )
+    return {
+        "artifact_id": "art_prior_memory",
+        "type": "text_memory",
+        "uri": memory_path.as_uri(),
+        "name": "prior memory",
+    }
+
+
 def _golden_feedback_dataset_artifact(tmp_path: Path) -> dict[str, Any]:
     dataset_dir = tmp_path / "golden-feedback-dataset"
     dataset_dir.mkdir()
@@ -463,6 +665,131 @@ def test_text_memory_reflector_writes_llm_memory_from_dataset(tmp_path, monkeypa
     assert "validation habits" in prompt
     assert "Fix the parser precedence bug." in prompt
     assert "pytest failed after an unverified edit" in prompt
+
+
+def test_text_memory_expel_reflector_writes_structured_memory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured = _patch_reflector_llm(
+        monkeypatch,
+        "# Terminal Bench Textual Memory\n\n"
+        "## Do\n"
+        "- Run the exact failing test before broad cleanup because the successful trace did that.\n\n"
+        "## Avoid\n"
+        "- Do not give a final answer without rerunning pytest because the failed trace skipped validation.\n\n"
+        "## Validate\n"
+        "- Rerun the focused verifier command before final response.\n\n"
+        "## When Applicable\n"
+        "- Applies when a task has a failing test or verifier output.\n\n"
+        "## Retired Or Superseded\n"
+        "- Retire broad-first testing when a focused failing test is available.\n",
+    )
+    job = _job(
+        "text_memory_expel_reflector",
+        tmp_path,
+        input_artifacts=[
+            _expel_memory_dataset_artifact(tmp_path),
+            _expel_history_dataset_artifact(tmp_path),
+            _prior_text_memory_artifact(tmp_path),
+        ],
+        config={
+            "name": "expel-memory",
+            "reflector_llm": {
+                "model": "reflector-model",
+                "base_url": "http://reflector.test/v1",
+                "api_key": "test-key",
+            },
+            "compatibility": {"task_tags": ["terminal-bench"]},
+            "scores": {"quality": 0.4},
+            "tags": ["terminal-bench"],
+            "promoted": True,
+        },
+    )
+
+    [artifact] = run_method(job, artifact_root=tmp_path / "artifacts")
+
+    assert artifact.type == ArtifactType.TEXT_MEMORY
+    assert artifact.name == "expel-memory"
+    assert artifact.promoted is True
+    assert artifact.compatibility == {"task_tags": ["terminal-bench"]}
+    assert artifact.scores == {"quality": 0.4}
+    assert artifact.tags == ["terminal-bench"]
+    assert artifact.manifest["content_path"] == "memory.md"
+    assert artifact.manifest["method"] == "text_memory_expel_reflector"
+    assert artifact.manifest["source_dataset_artifact_id"] == "art_dataset_expel"
+    assert artifact.manifest["source_dataset_artifact_ids"] == [
+        "art_dataset_expel",
+        "art_dataset_expel_history",
+    ]
+    assert artifact.manifest["record_count"] == 3
+    assert artifact.manifest["reflected_record_count"] == 3
+    assert artifact.manifest["success_count"] == 2
+    assert artifact.manifest["failure_count"] == 1
+    assert artifact.manifest["prior_memory_count"] == 1
+    assert artifact.manifest["required_sections"] == [
+        "Do",
+        "Avoid",
+        "Validate",
+        "When Applicable",
+        "Retired Or Superseded",
+    ]
+    assert artifact.lineage["method"] == "text_memory_expel_reflector"
+    assert artifact.lineage["input_artifact_ids"] == [
+        "art_dataset_expel",
+        "art_dataset_expel_history",
+        "art_prior_memory",
+    ]
+    assert artifact.lineage["source_dataset_artifact_ids"] == [
+        "art_dataset_expel",
+        "art_dataset_expel_history",
+    ]
+
+    memory_path = Path(artifact.uri.removeprefix("file://"))
+    memory = memory_path.read_text(encoding="utf-8")
+    assert memory.endswith("\n")
+    for section in artifact.manifest["required_sections"]:
+        assert f"## {section}" in memory
+    assert "focused verifier" in memory
+
+    prompt = captured["json"]["messages"][1]["content"]
+    assert "ExpeL" in prompt
+    assert "## Existing Text Memory" in prompt
+    assert "Run a broad test suite" in prompt
+    assert "tb_pass_task" in prompt
+    assert "art_dataset_expel_history" in prompt
+    assert "tb_history_task" in prompt
+    assert "extrusion geometry" in prompt
+    assert "verifier failed after missing validation" in prompt
+    assert "## Do" in prompt
+    assert "## Avoid" in prompt
+
+
+def test_text_memory_expel_reflector_rejects_missing_required_sections(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_reflector_llm(
+        monkeypatch,
+        "# Terminal Bench Textual Memory\n\n"
+        "## Do\n"
+        "- Rerun the exact test.\n",
+    )
+    job = _job(
+        "text_memory_expel_reflector",
+        tmp_path,
+        input_artifacts=[_expel_memory_dataset_artifact(tmp_path)],
+        config={
+            "reflector_llm": {
+                "model": "reflector-model",
+                "base_url": "http://reflector.test/v1",
+                "api_key": "test-key",
+            },
+        },
+    )
+
+    with pytest.raises(ValueError, match="missing required memory sections"):
+        run_method(job, artifact_root=tmp_path / "artifacts")
 
 
 def test_text_memory_reflector_includes_prior_text_memory_in_prompt(
@@ -2586,6 +2913,387 @@ def test_agent_system_gepa_reflector_consumes_human_feedback(
     )
 
 
+def test_parametric_memory_lora_sft_exports_dataset_and_registers_adapter(tmp_path: Path):
+    trainer_script = tmp_path / "fake_trainer.py"
+    trainer_script.write_text(
+        "from pathlib import Path\n"
+        "import argparse\n"
+        "parser = argparse.ArgumentParser()\n"
+        "parser.add_argument('--train-file')\n"
+        "parser.add_argument('--output-dir')\n"
+        "args = parser.parse_args()\n"
+        "Path(args.output_dir).mkdir(parents=True, exist_ok=True)\n"
+        "(Path(args.output_dir) / 'adapter_config.json').write_text('{}')\n",
+        encoding="utf-8",
+    )
+    job = _job(
+        "parametric_memory_lora_sft",
+        tmp_path,
+        input_artifacts=[_reflector_dataset_artifact(tmp_path)],
+        config={
+            "name": "terminal-bench-lora-memory",
+            "base_model": "Qwen/Qwen3.6-35B-A3B",
+            "output_adapter_id": "tb-memory-lora",
+            "trainer": {
+                "command": "python",
+                "args": [
+                    str(trainer_script),
+                    "--train-file",
+                    "{training_dataset}",
+                    "--output-dir",
+                    "{adapter_dir}",
+                ],
+            },
+            "compatibility": {"task_tags": ["terminal-bench"]},
+            "scores": {"quality": 0.1},
+            "promoted": True,
+        },
+    )
+
+    [artifact] = run_method(job, artifact_root=tmp_path / "artifacts")
+
+    assert artifact.type == ArtifactType.PARAMETRIC_MEMORY
+    assert artifact.name == "terminal-bench-lora-memory"
+    adapter_path = Path(artifact.uri.removeprefix("file://"))
+    assert (adapter_path / "adapter_config.json").is_file()
+    train_path = (
+        tmp_path
+        / "artifacts"
+        / "workers"
+        / job.job_id
+        / "parametric_memory_lora_sft"
+        / "training.jsonl"
+    )
+    training_lines = [
+        json.loads(line) for line in train_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert training_lines
+    assert all("messages" in line for line in training_lines)
+    assert artifact.manifest["method"] == "parametric_memory_lora_sft"
+    assert artifact.manifest["adapter_id"] == "tb-memory-lora"
+    assert artifact.manifest["base_model"] == "Qwen/Qwen3.6-35B-A3B"
+    assert artifact.manifest["adapter_format"] == "lora"
+    assert artifact.manifest["training_record_count"] == len(training_lines)
+    assert artifact.compatibility == {
+        "base_model": ["Qwen/Qwen3.6-35B-A3B"],
+        "task_tags": ["terminal-bench"],
+    }
+    assert artifact.scores == {"quality": 0.1}
+    assert artifact.promoted is True
+
+
+def test_parametric_memory_lora_sft_exports_every_successful_trace(tmp_path: Path):
+    trainer_script = tmp_path / "fake_trainer.py"
+    trainer_script.write_text(
+        "from pathlib import Path\n"
+        "import argparse\n"
+        "parser = argparse.ArgumentParser()\n"
+        "parser.add_argument('--train-file')\n"
+        "parser.add_argument('--output-dir')\n"
+        "args = parser.parse_args()\n"
+        "Path(args.output_dir).mkdir(parents=True, exist_ok=True)\n"
+        "(Path(args.output_dir) / 'adapter_config.json').write_text('{}')\n",
+        encoding="utf-8",
+    )
+    dataset = _parametric_dataset_artifact(
+        tmp_path,
+        [
+            {
+                "event_id": "evt_multi_trace",
+                "task_id": "task_multi_trace",
+                "session_id": "session_multi_trace",
+                "status": "COMPLETED",
+                "reward": 1.0,
+                "traces": [
+                    {
+                        "prompt_messages": [{"role": "user", "content": "First call"}],
+                        "response_messages": [
+                            {"role": "assistant", "content": "First response"}
+                        ],
+                    },
+                    {
+                        "prompt_messages": [{"role": "user", "content": "Second call"}],
+                        "response_messages": [
+                            {"role": "assistant", "content": "Second response"}
+                        ],
+                    },
+                ],
+            },
+            {
+                "event_id": "evt_failure",
+                "task_id": "task_failure",
+                "session_id": "session_failure",
+                "status": "ERROR",
+                "reward": 0.0,
+                "traces": [
+                    {
+                        "prompt_messages": [{"role": "user", "content": "Failed call"}],
+                        "response_messages": [
+                            {"role": "assistant", "content": "Failed response"}
+                        ],
+                    }
+                ],
+            },
+        ],
+    )
+    job = _job(
+        "parametric_memory_lora_sft",
+        tmp_path,
+        input_artifacts=[dataset],
+        config={
+            "base_model": "Qwen/Qwen3.6-35B-A3B",
+            "trainer": {
+                "command": "python",
+                "args": [
+                    str(trainer_script),
+                    "--train-file",
+                    "{training_dataset}",
+                    "--output-dir",
+                    "{adapter_dir}",
+                ],
+            },
+        },
+    )
+
+    [artifact] = run_method(job, artifact_root=tmp_path / "artifacts")
+
+    train_path = (
+        tmp_path
+        / "artifacts"
+        / "workers"
+        / job.job_id
+        / "parametric_memory_lora_sft"
+        / "training.jsonl"
+    )
+    training_lines = [
+        json.loads(line) for line in train_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert [line["metadata"]["trace_index"] for line in training_lines] == [0, 1]
+    assert "First call" in training_lines[0]["messages"][0]["content"]
+    assert "Second call" in training_lines[1]["messages"][0]["content"]
+    assert all("Failed" not in json.dumps(line) for line in training_lines)
+    assert artifact.manifest["training_record_count"] == 2
+    assert artifact.compatibility == {"base_model": ["Qwen/Qwen3.6-35B-A3B"]}
+
+
+def test_parametric_memory_lora_sft_requires_trainer_placeholders(tmp_path: Path):
+    trainer_script = tmp_path / "fake_trainer.py"
+    trainer_script.write_text("print('unused')\n", encoding="utf-8")
+    job = _job(
+        "parametric_memory_lora_sft",
+        tmp_path,
+        input_artifacts=[_reflector_dataset_artifact(tmp_path)],
+        config={
+            "base_model": "Qwen/Qwen3.6-35B-A3B",
+            "trainer": {"command": "python", "args": [str(trainer_script)]},
+        },
+    )
+
+    with pytest.raises(ValueError, match=r"requires .*training_dataset.*adapter_dir"):
+        run_method(job, artifact_root=tmp_path / "artifacts")
+
+
+def test_parametric_memory_lora_sft_requires_base_model(tmp_path: Path):
+    job = _job(
+        "parametric_memory_lora_sft",
+        tmp_path,
+        input_artifacts=[_reflector_dataset_artifact(tmp_path)],
+        config={
+            "trainer": {
+                "command": "python",
+                "args": ["{training_dataset}", "{adapter_dir}"],
+            },
+        },
+    )
+
+    with pytest.raises(ValueError, match="requires base_model"):
+        run_method(job, artifact_root=tmp_path / "artifacts")
+
+
+def test_parametric_memory_lora_sft_requires_successful_records(tmp_path: Path):
+    dataset = _parametric_dataset_artifact(
+        tmp_path,
+        [
+            {
+                "event_id": "evt_failure",
+                "task_id": "task_failure",
+                "session_id": "session_failure",
+                "status": "ERROR",
+                "reward": 0.0,
+                "traces": [
+                    {
+                        "prompt_messages": [{"role": "user", "content": "Failed call"}],
+                        "response_messages": [
+                            {"role": "assistant", "content": "Failed response"}
+                        ],
+                    }
+                ],
+            }
+        ],
+    )
+    job = _job(
+        "parametric_memory_lora_sft",
+        tmp_path,
+        input_artifacts=[dataset],
+        config={
+            "base_model": "Qwen/Qwen3.6-35B-A3B",
+            "trainer": {
+                "command": "python",
+                "args": ["{training_dataset}", "{adapter_dir}"],
+            },
+        },
+    )
+
+    with pytest.raises(ValueError, match="no successful training records"):
+        run_method(job, artifact_root=tmp_path / "artifacts")
+
+
+def test_parametric_memory_lora_sft_requires_list_trainer_args(tmp_path: Path):
+    job = _job(
+        "parametric_memory_lora_sft",
+        tmp_path,
+        input_artifacts=[_reflector_dataset_artifact(tmp_path)],
+        config={
+            "base_model": "Qwen/Qwen3.6-35B-A3B",
+            "trainer": {
+                "command": "python",
+                "args": "--train-file {training_dataset} --output-dir {adapter_dir}",
+            },
+        },
+    )
+
+    with pytest.raises(ValueError, match="trainer.args must be a list"):
+        run_method(job, artifact_root=tmp_path / "artifacts")
+
+
+def test_parametric_memory_lora_sft_requires_trainer_output_adapter(tmp_path: Path):
+    trainer_script = tmp_path / "fake_noop_trainer.py"
+    trainer_script.write_text("import sys\nsys.exit(0)\n", encoding="utf-8")
+    job = _job(
+        "parametric_memory_lora_sft",
+        tmp_path,
+        input_artifacts=[_reflector_dataset_artifact(tmp_path)],
+        config={
+            "base_model": "Qwen/Qwen3.6-35B-A3B",
+            "trainer": {
+                "command": "python",
+                "args": [
+                    str(trainer_script),
+                    "{training_dataset}",
+                    "{adapter_dir}",
+                ],
+            },
+        },
+    )
+
+    with pytest.raises(ValueError, match="trainer did not produce adapter directory"):
+        run_method(job, artifact_root=tmp_path / "artifacts")
+
+
+def test_parametric_memory_lora_sft_reports_trainer_nonzero_exit(tmp_path: Path):
+    trainer_script = tmp_path / "fake_failing_trainer.py"
+    trainer_script.write_text("import sys\nsys.exit(3)\n", encoding="utf-8")
+    job = _job(
+        "parametric_memory_lora_sft",
+        tmp_path,
+        input_artifacts=[_reflector_dataset_artifact(tmp_path)],
+        config={
+            "base_model": "Qwen/Qwen3.6-35B-A3B",
+            "trainer": {
+                "command": "python",
+                "args": [str(trainer_script), "{training_dataset}", "{adapter_dir}"],
+            },
+        },
+    )
+
+    with pytest.raises(ValueError, match="exit code 3"):
+        run_method(job, artifact_root=tmp_path / "artifacts")
+
+
+def test_parametric_memory_lora_sft_rejects_invalid_adapter_output(tmp_path: Path):
+    trainer_script = tmp_path / "fake_invalid_trainer.py"
+    trainer_script.write_text(
+        "from pathlib import Path\n"
+        "import sys\n"
+        "train_file, output_dir = sys.argv[1], sys.argv[2]\n"
+        "Path(output_dir).mkdir(parents=True, exist_ok=True)\n"
+        "(Path(output_dir) / 'notes.txt').write_text(Path(train_file).read_text())\n",
+        encoding="utf-8",
+    )
+    job = _job(
+        "parametric_memory_lora_sft",
+        tmp_path,
+        input_artifacts=[_reflector_dataset_artifact(tmp_path)],
+        config={
+            "base_model": "Qwen/Qwen3.6-35B-A3B",
+            "trainer": {
+                "command": "python",
+                "args": [str(trainer_script), "{training_dataset}", "{adapter_dir}"],
+            },
+        },
+    )
+
+    with pytest.raises(ValueError, match="missing adapter_config.json"):
+        run_method(job, artifact_root=tmp_path / "artifacts")
+
+
+def test_parametric_memory_lora_sft_cleans_stale_adapter_output(tmp_path: Path):
+    trainer_script = tmp_path / "fake_noop_trainer.py"
+    trainer_script.write_text("import sys\nsys.exit(0)\n", encoding="utf-8")
+    job = _job(
+        "parametric_memory_lora_sft",
+        tmp_path,
+        input_artifacts=[_reflector_dataset_artifact(tmp_path)],
+        config={
+            "base_model": "Qwen/Qwen3.6-35B-A3B",
+            "trainer": {
+                "command": "python",
+                "args": [str(trainer_script), "{training_dataset}", "{adapter_dir}"],
+            },
+        },
+    )
+    stale_adapter_dir = (
+        tmp_path
+        / "artifacts"
+        / "workers"
+        / job.job_id
+        / "parametric_memory_lora_sft"
+        / "adapter"
+    )
+    stale_adapter_dir.mkdir(parents=True)
+    (stale_adapter_dir / "adapter_config.json").write_text("{}", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="trainer did not produce adapter directory"):
+        run_method(job, artifact_root=tmp_path / "artifacts")
+
+    assert not stale_adapter_dir.exists()
+
+
+def test_parametric_memory_lora_sft_trainer_timeout(tmp_path: Path):
+    trainer_script = tmp_path / "fake_hanging_trainer.py"
+    trainer_script.write_text(
+        "import time\n"
+        "time.sleep(5)\n",
+        encoding="utf-8",
+    )
+    job = _job(
+        "parametric_memory_lora_sft",
+        tmp_path,
+        input_artifacts=[_reflector_dataset_artifact(tmp_path)],
+        config={
+            "base_model": "Qwen/Qwen3.6-35B-A3B",
+            "trainer": {
+                "command": "python",
+                "args": [str(trainer_script), "{training_dataset}", "{adapter_dir}"],
+                "timeout_seconds": 0.1,
+            },
+        },
+    )
+
+    with pytest.raises(ValueError, match="trainer timed out"):
+        run_method(job, artifact_root=tmp_path / "artifacts")
+
+
 def test_parametric_memory_register_returns_adapter_artifact(tmp_path):
     adapter_dir = tmp_path / "adapter"
     adapter_dir.mkdir()
@@ -2606,6 +3314,7 @@ def test_parametric_memory_register_returns_adapter_artifact(tmp_path):
     assert artifact.manifest["base_model"] == "Qwen/Qwen3.6-27B"
     assert artifact.manifest["adapter_format"] == "lora"
     assert artifact.manifest["adapter_id"] == "adapter"
+    assert artifact.compatibility == {"base_model": ["Qwen/Qwen3.6-27B"]}
 
 
 def test_parametric_memory_register_preserves_configured_adapter_id(tmp_path):
@@ -2656,10 +3365,28 @@ def test_parametric_memory_register_preserves_routing_metadata(tmp_path):
     assert artifact.scores == {"quality": 0.82, "heldout_reward_delta": 0.1}
 
 
+def test_parametric_memory_rejects_mismatched_base_model_compatibility(tmp_path):
+    adapter_dir = tmp_path / "adapter"
+    adapter_dir.mkdir()
+    job = _job(
+        "parametric_memory_register",
+        tmp_path,
+        config={
+            "adapter_uri": adapter_dir.as_uri(),
+            "base_model": "Qwen/Qwen3.6-27B",
+            "compatibility": {"base_model": ["other/model"]},
+        },
+    )
+
+    with pytest.raises(ValueError, match="compatibility.base_model"):
+        run_method(job, artifact_root=tmp_path / "artifacts")
+
+
 def test_parse_capabilities_defaults_to_reference_job_types():
     assert _parse_capabilities([]) == [
         "text_memory",
         "text_memory_reflector",
+        "text_memory_expel_reflector",
         "skill_bundle",
         "skill_bundle_reflector",
         "agent_system",
@@ -2668,6 +3395,7 @@ def test_parse_capabilities_defaults_to_reference_job_types():
         "agent_system_pareto_reflector",
         "agent_system_gepa_reflector",
         "parametric_memory_register",
+        "parametric_memory_lora_sft",
     ]
 
 

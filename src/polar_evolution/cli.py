@@ -134,6 +134,65 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Do not derive forbidden literals from structured protected metadata.",
     )
+    tb_memory_job = subparsers.add_parser(
+        "terminal-bench-text-memory-job",
+        help="Ingest Terminal Bench results and create a text-memory reflector job.",
+    )
+    tb_memory_job.add_argument(
+        "--input",
+        action="append",
+        default=[],
+        help="Terminal Bench trial or job directory to ingest. Can be repeated.",
+    )
+    tb_memory_job.add_argument("--db", default=".polar_evolution/evolution.db")
+    tb_memory_job.add_argument("--artifact-root", default=".polar_evolution")
+    tb_memory_job.add_argument(
+        "--dataset-artifact-id",
+        action="append",
+        default=[],
+        help="Existing dataset artifact id to use as job input. Can be repeated.",
+    )
+    tb_memory_job.add_argument(
+        "--dataset-name",
+        help="Dataset name when --input is provided.",
+    )
+    tb_memory_job.add_argument("--purpose", default="text_memory_reflection")
+    tb_memory_job.add_argument("--policy-version")
+    tb_memory_job.add_argument("--rollout-step", type=int)
+    tb_memory_job.add_argument("--status", action="append", default=["COMPLETED", "ERROR"])
+    tb_memory_job.add_argument("--output", help="Output JSON summary path. Defaults to stdout.")
+    tb_memory_job.add_argument("--max-transcript-chars", type=int, default=60000)
+    tb_memory_job.add_argument("--max-verifier-stdout-chars", type=int, default=12000)
+    tb_memory_job.add_argument(
+        "--method",
+        choices=[
+            "text_memory_reflector",
+            "text_memory_expel_reflector",
+        ],
+        default="text_memory_expel_reflector",
+    )
+    tb_memory_job.add_argument("--job-name")
+    tb_memory_job.add_argument("--priority", type=int, default=100)
+    tb_memory_job.add_argument("--max-records", type=int)
+    tb_memory_job.add_argument("--reflector-provider", default="openai_chat")
+    tb_memory_job.add_argument("--reflector-model", required=True)
+    tb_memory_job.add_argument("--reflector-base-url")
+    tb_memory_job.add_argument("--reflector-api-key-env")
+    tb_memory_job.add_argument("--codex-home")
+    tb_memory_job.add_argument("--temperature", type=float)
+    tb_memory_job.add_argument("--max-tokens", type=int)
+    tb_memory_job.add_argument("--reflector-timeout-seconds", type=float)
+    tb_memory_job.add_argument(
+        "--audit-forbidden-literal",
+        action="append",
+        default=[],
+        help="Additional exact literal that the generated memory must not contain.",
+    )
+    tb_memory_job.add_argument(
+        "--no-auto-forbidden-literals",
+        action="store_true",
+        help="Do not derive forbidden literals from structured protected metadata.",
+    )
     tb_per_task = subparsers.add_parser(
         "terminal-bench-per-task-evolution",
         help="Run or plan per-task Terminal Bench evolution.",
@@ -167,13 +226,22 @@ def build_parser() -> argparse.ArgumentParser:
     )
     tb_per_task.add_argument("--gepa-candidate-count", type=int, default=1)
     tb_per_task.add_argument("--gepa-generations", type=int, default=1)
+    tb_per_task.add_argument(
+        "--memory-method",
+        choices=[
+            "text_memory_reflector",
+            "text_memory_expel_reflector",
+        ],
+        default="text_memory_expel_reflector",
+    )
     tb_per_task.add_argument("--reflector-timeout-seconds", type=float, default=180.0)
     tb_per_task.add_argument("--rounds", type=int, default=1)
+    tb_per_task.add_argument("--n-attempts", type=int, default=1)
     tb_per_task.add_argument(
         "--artifact-type",
         action="append",
         default=None,
-        choices=["agent_system", "skill_bundle", "memory"],
+        choices=["agent_system", "skill_bundle", "memory", "text_memory", "parametric_memory"],
     )
     tb_per_task.add_argument("--env-json", default="{}")
     tb_per_task.add_argument("--verifier-env", action="append", default=[])
@@ -220,7 +288,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--artifact-type",
         action="append",
         default=None,
-        choices=["agent_system", "skill_bundle", "memory"],
+        choices=["agent_system", "skill_bundle", "memory", "text_memory", "parametric_memory"],
     )
     tb_group.add_argument("--env-json", default="{}")
     tb_group.add_argument("--verifier-env", action="append", default=[])
@@ -324,8 +392,12 @@ def main(argv: list[str] | None = None) -> int:
         payload = _create_terminal_bench_agent_system_job(args)
         _write_json_output(payload, args.output)
         return 0
+    if args.command == "terminal-bench-text-memory-job":
+        payload = _create_terminal_bench_text_memory_job(args)
+        _write_json_output(payload, args.output)
+        return 0
     if args.command == "terminal-bench-per-task-evolution":
-        artifact_types = args.artifact_type or ["agent_system"]
+        artifact_types = _normalize_terminal_bench_artifact_types(args.artifact_type)
         if args.dry_run:
             payload = run_per_task_evolution_dry_run(
                 task_root=Path(args.task_root),
@@ -337,10 +409,12 @@ def main(argv: list[str] | None = None) -> int:
                 reflector_timeout_seconds=args.reflector_timeout_seconds,
                 terminal_bench_package_root=Path(args.terminal_bench_package_root),
                 agent_system_method=args.agent_system_method,
+                memory_method=args.memory_method,
                 gepa_candidate_count=args.gepa_candidate_count,
                 gepa_generations=args.gepa_generations,
                 rounds=args.rounds,
                 artifact_types=artifact_types,
+                n_attempts=args.n_attempts,
             )
             _write_json_output(payload, args.output)
             return 0
@@ -348,8 +422,7 @@ def main(argv: list[str] | None = None) -> int:
             raise ValueError(
                 "terminal-bench-per-task-evolution requires --baseline-root unless --dry-run is used"
             )
-        if artifact_types != ["agent_system"]:
-            raise ValueError("live per-task evolution currently supports only agent_system")
+        _validate_terminal_bench_live_artifact_types(artifact_types)
         try:
             parsed_env_json = json.loads(args.env_json)
         except json.JSONDecodeError as exc:
@@ -368,16 +441,19 @@ def main(argv: list[str] | None = None) -> int:
             codex_home=args.codex_home,
             terminal_bench_package_root=Path(args.terminal_bench_package_root),
             agent_system_method=args.agent_system_method,
+            memory_method=args.memory_method,
             gepa_candidate_count=args.gepa_candidate_count,
             gepa_generations=args.gepa_generations,
             rounds=args.rounds,
+            artifact_types=artifact_types,
+            n_attempts=args.n_attempts,
             env_json={str(key): str(value) for key, value in parsed_env_json.items()},
             verifier_env=_parse_key_value_entries(args.verifier_env),
         )
         _write_json_output(payload, args.output)
         return 0
     if args.command == "terminal-bench-group-evolution":
-        artifact_types = args.artifact_type or ["agent_system"]
+        artifact_types = _normalize_terminal_bench_artifact_types(args.artifact_type)
         group = _terminal_bench_cli_group(args)
         if args.dry_run:
             payload = run_group_evolution_dry_run(
@@ -401,8 +477,7 @@ def main(argv: list[str] | None = None) -> int:
             raise ValueError(
                 "terminal-bench-group-evolution requires --baseline-root unless --dry-run is used"
             )
-        if artifact_types != ["agent_system"]:
-            raise ValueError("live group evolution currently supports only agent_system")
+        _validate_terminal_bench_group_live_artifact_types(artifact_types)
         try:
             parsed_env_json = json.loads(args.env_json)
         except json.JSONDecodeError as exc:
@@ -430,6 +505,35 @@ def main(argv: list[str] | None = None) -> int:
         _write_json_output(payload, args.output)
         return 0
     raise ValueError(f"Unknown command: {args.command}")
+
+
+def _normalize_terminal_bench_artifact_types(values: list[str] | None) -> list[str]:
+    raw_values = values or ["agent_system"]
+    normalized: list[str] = []
+    for value in raw_values:
+        artifact_type = value.strip()
+        if artifact_type == "memory":
+            artifact_type = "text_memory"
+        normalized.append(artifact_type)
+    return normalized
+
+
+def _validate_terminal_bench_live_artifact_types(artifact_types: list[str]) -> None:
+    if any(artifact_type == "parametric_memory" for artifact_type in artifact_types):
+        raise ValueError("Terminal Bench Codex subscription runs do not support parametric_memory")
+    if len(artifact_types) != 1:
+        raise ValueError("live Terminal Bench evolution requires exactly one artifact type")
+    if artifact_types[0] not in {"agent_system", "text_memory"}:
+        raise ValueError(
+            "live Terminal Bench evolution currently supports only agent_system or text_memory"
+        )
+
+
+def _validate_terminal_bench_group_live_artifact_types(artifact_types: list[str]) -> None:
+    if any(artifact_type == "parametric_memory" for artifact_type in artifact_types):
+        raise ValueError("Terminal Bench Codex subscription runs do not support parametric_memory")
+    if artifact_types != ["agent_system"]:
+        raise ValueError("live group evolution currently supports only agent_system")
 
 
 def _terminal_bench_cli_group(args: argparse.Namespace) -> TerminalBenchTaskGroup:
@@ -536,6 +640,101 @@ def _create_terminal_bench_agent_system_job(args: argparse.Namespace) -> dict[st
     }
 
 
+def _create_terminal_bench_text_memory_job(args: argparse.Namespace) -> dict[str, Any]:
+    if not args.input and not args.dataset_artifact_id:
+        raise ValueError(
+            "terminal-bench-text-memory-job requires --input or --dataset-artifact-id"
+        )
+    if args.input and not args.dataset_name:
+        raise ValueError("terminal-bench-text-memory-job requires --dataset-name with --input")
+    if args.input and not args.policy_version:
+        raise ValueError("terminal-bench-text-memory-job requires --policy-version with --input")
+
+    store = EvolutionStore(db_path=Path(args.db), artifact_root=Path(args.artifact_root))
+    store.initialize()
+
+    events: list[EventIngestRequest] = []
+    for input_path in args.input:
+        events.extend(
+            build_terminal_bench_events(
+                input_path,
+                max_transcript_chars=args.max_transcript_chars,
+                max_verifier_stdout_chars=args.max_verifier_stdout_chars,
+                policy_version=args.policy_version,
+                rollout_step=args.rollout_step,
+            )
+        )
+
+    ingested_events = []
+    for event in events:
+        response = store.ingest_event(event)
+        ingested_events.append(
+            {
+                "event_id": response.event_id,
+                "ingested": response.ingested,
+                "duplicate": response.duplicate,
+                "task_id": event.task_id,
+                "session_id": event.session_id,
+            }
+        )
+
+    dataset_payload: dict[str, Any] | None = None
+    previous_input_artifact_ids = list(args.dataset_artifact_id)
+    input_artifact_ids: list[str] = []
+    if events:
+        dataset = store.create_dataset(
+            DatasetCreateRequest(
+                name=args.dataset_name,
+                purpose=args.purpose,
+                query={
+                    "event_types": ["polar.session_completed"],
+                    "status": args.status,
+                    "policy_version": args.policy_version,
+                },
+            )
+        )
+        dataset_payload = {
+            "dataset_id": dataset.dataset_id,
+            "artifact_id": dataset.artifact_id,
+            "name": args.dataset_name,
+            "purpose": args.purpose,
+            "event_count": dataset.event_count,
+            "trace_count": dataset.trace_count,
+            "manifest_uri": _artifact_uri(store, dataset.artifact_id),
+        }
+        input_artifact_ids.append(dataset.artifact_id)
+    input_artifact_ids.extend(previous_input_artifact_ids)
+
+    method = args.method
+    config = _terminal_bench_text_memory_job_config(
+        args,
+        store=store,
+        input_artifact_ids=input_artifact_ids,
+        events=events,
+    )
+    job = store.create_job(
+        JobCreateRequest(
+            method=method,
+            job_type=method,
+            input_artifact_ids=input_artifact_ids,
+            config=config,
+            priority=args.priority,
+        )
+    )
+    return {
+        "ingested_events": ingested_events,
+        "dataset": dataset_payload,
+        "job": {
+            "job_id": job.job_id,
+            "state": str(job.state),
+            "job_type": method,
+            "method": method,
+            "input_artifact_ids": input_artifact_ids,
+            "config": config,
+        },
+    }
+
+
 def _terminal_bench_job_method(method: str, input_artifact_ids: list[str]) -> str:
     if method != "auto":
         return method
@@ -586,6 +785,43 @@ def _terminal_bench_agent_system_job_config(
         config["candidate_count"] = args.candidate_count
     if args.mutation_strategy:
         config["mutation_strategies"] = list(args.mutation_strategy)
+    return config
+
+
+def _terminal_bench_text_memory_job_config(
+    args: argparse.Namespace,
+    *,
+    store: EvolutionStore,
+    input_artifact_ids: list[str],
+    events: list[EventIngestRequest],
+) -> dict[str, Any]:
+    reflector_llm = _terminal_bench_reflector_llm_config(args)
+    forbidden_literals = _terminal_bench_forbidden_literal_map(args.audit_forbidden_literal)
+    if not args.no_auto_forbidden_literals:
+        _merge_forbidden_literal_map(
+            forbidden_literals,
+            _terminal_bench_forbidden_literals_from_events(events),
+        )
+        _merge_forbidden_literal_map(
+            forbidden_literals,
+            _terminal_bench_forbidden_literals_from_dataset_artifacts(
+                store,
+                input_artifact_ids,
+            ),
+        )
+    config: dict[str, Any] = {
+        "name": args.job_name or "Terminal Bench text-memory reflection",
+        "reflector_llm": reflector_llm,
+        "forbidden_literals": _unique_forbidden_literal_map(forbidden_literals),
+        "compatibility": {
+            "agent_harness": ["terminal-bench-harbor"],
+            "task_tags": _terminal_bench_task_tags(store, input_artifact_ids, events),
+        },
+        "scores": {"quality": 0.0},
+        "promoted": False,
+    }
+    if args.max_records is not None:
+        config["max_records"] = args.max_records
     return config
 
 

@@ -18,6 +18,7 @@ from polar_evolution.context import (
     artifact_type,
     read_file_uri_text,
     requested_context_artifact_ids,
+    request_uses_subscription_auth,
     sort_candidates,
 )
 from polar_evolution.files import ArtifactFileStore
@@ -2086,6 +2087,8 @@ class EvolutionStore:
                 kind == ArtifactType.PARAMETRIC_MEMORY
                 and len(adapters) < request.limits.max_adapters
             ):
+                if request_uses_subscription_auth(request):
+                    continue
                 manifest = artifact_manifest(row)
                 adapter_format = manifest.get("adapter_format")
                 if not isinstance(adapter_format, str) or not adapter_format:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -17,7 +18,9 @@ from polar_evolution.terminal_bench_per_task import (
     _run_worker_once_local,
     _trial_reward,
     build_harbor_command,
+    build_memory_benchmark_summary,
     discover_agent_system_artifact_path,
+    discover_evolution_artifact_paths,
     run_group_evolution,
     run_per_task_evolution,
     summarize_transition,
@@ -44,7 +47,49 @@ def test_agent_system_materializer_sets_harbor_kwargs(tmp_path: Path):
     assert kwargs == {"agent_system_path": str(artifact_path)}
 
 
-def test_skill_and_memory_materializers_are_explicitly_skipped(tmp_path: Path):
+def test_text_memory_materializer_sets_harbor_kwargs(tmp_path: Path):
+    artifact_path = tmp_path / "memory.md"
+    artifact_path.write_text("## Do\n- Run focused tests.\n", encoding="utf-8")
+    materializer = ArtifactMaterializer()
+
+    kwargs = materializer.materialize(
+        EvolutionArtifact(
+            artifact_type="text_memory",
+            artifact_id="art-text-memory",
+            path=artifact_path,
+            task_id="fix-git",
+            round=1,
+            method="text_memory_expel_reflector",
+            source_dataset_artifact_ids=["dataset-r0"],
+        )
+    )
+
+    assert kwargs == {"memory_path": str(artifact_path)}
+    assert materializer.skipped == []
+
+
+def test_legacy_memory_materializer_alias_sets_harbor_kwargs(tmp_path: Path):
+    artifact_path = tmp_path / "memory.md"
+    artifact_path.write_text("## Do\n- Run focused tests.\n", encoding="utf-8")
+    materializer = ArtifactMaterializer()
+
+    kwargs = materializer.materialize(
+        EvolutionArtifact(
+            artifact_type="memory",
+            artifact_id="art-memory",
+            path=artifact_path,
+            task_id="fix-git",
+            round=1,
+            method="text_memory_expel_reflector",
+            source_dataset_artifact_ids=["dataset-r0"],
+        )
+    )
+
+    assert kwargs == {"memory_path": str(artifact_path)}
+    assert materializer.skipped == []
+
+
+def test_skill_and_parametric_memory_materializers_are_explicitly_skipped(tmp_path: Path):
     materializer = ArtifactMaterializer()
     skill = EvolutionArtifact(
         artifact_type="skill_bundle",
@@ -53,15 +98,6 @@ def test_skill_and_memory_materializers_are_explicitly_skipped(tmp_path: Path):
         task_id="fix-git",
         round=1,
         method="skill_bundle",
-        source_dataset_artifact_ids=[],
-    )
-    text_memory = EvolutionArtifact(
-        artifact_type="text_memory",
-        artifact_id="art-text-memory",
-        path=tmp_path / "text_memory.md",
-        task_id="fix-git",
-        round=1,
-        method="text_memory",
         source_dataset_artifact_ids=[],
     )
     parametric_memory = EvolutionArtifact(
@@ -75,18 +111,12 @@ def test_skill_and_memory_materializers_are_explicitly_skipped(tmp_path: Path):
     )
 
     assert materializer.materialize(skill) == {}
-    assert materializer.materialize(text_memory) == {}
     assert materializer.materialize(parametric_memory) == {}
     assert materializer.skipped == [
         {
             "artifact_id": "art-skill",
             "artifact_type": "skill_bundle",
             "reason": "skill_bundle materialization is not implemented for Harbor Codex runs",
-        },
-        {
-            "artifact_id": "art-text-memory",
-            "artifact_type": "text_memory",
-            "reason": "text_memory materialization is not implemented for Harbor Codex runs",
         },
         {
             "artifact_id": "art-param-memory",
@@ -136,6 +166,24 @@ def test_build_harbor_command_includes_agent_system_path_and_subscription_env():
     assert 'env_json={"NO_PROXY":"localhost"}' in command
     assert "--verifier-env" in command
     assert "UV_NO_INDEX=1" in command
+
+
+def test_build_harbor_command_accepts_multiple_attempts():
+    command = build_harbor_command(
+        job_name="tb21-evolved-fix-git-r1",
+        task_root=Path("/root/datasets/terminal-bench-2-1/tasks"),
+        task_id="fix-git",
+        jobs_dir=Path("/tmp/tb21/fix-git/r1/harbor_jobs"),
+        model="gpt-5.5",
+        env_json={},
+        agent_kwargs={"memory_path": "/tmp/memory.md"},
+        verifier_env={},
+        n_concurrent=1,
+        n_attempts=5,
+    )
+
+    assert command[command.index("--n-attempts") + 1] == "5"
+    assert "memory_path=/tmp/memory.md" in command
 
 
 def test_discover_agent_system_artifact_path_reads_worker_manifest(tmp_path: Path):
@@ -189,6 +237,45 @@ def test_discover_agent_system_artifact_path_decodes_spaces_in_file_uri(tmp_path
     )
 
     assert artifact.path == content
+
+
+def test_discover_evolution_artifact_paths_reads_text_memory(tmp_path: Path):
+    content = tmp_path / "workers" / "job-1" / "text_memory_expel_reflector" / "memory.md"
+    content.parent.mkdir(parents=True)
+    content.write_text("## Do\n- Run focused tests.\n", encoding="utf-8")
+    job_payload = {
+        "job": {
+            "input_artifact_ids": ["dataset-r0"],
+        }
+    }
+    completed_artifacts = [
+        {
+            "artifact_id": "art-memory",
+            "type": "text_memory",
+            "uri": content.resolve().as_uri(),
+            "manifest": {"method": "text_memory_expel_reflector"},
+        }
+    ]
+
+    artifacts = discover_evolution_artifact_paths(
+        completed_artifacts,
+        artifact_type="text_memory",
+        task_id="fix-git",
+        round_number=1,
+        job_payload=job_payload,
+    )
+
+    assert artifacts == [
+        EvolutionArtifact(
+            artifact_type="text_memory",
+            artifact_id="art-memory",
+            path=content,
+            task_id="fix-git",
+            round=1,
+            method="text_memory_expel_reflector",
+            source_dataset_artifact_ids=["dataset-r0"],
+        )
+    ]
 
 
 def test_discover_agent_system_artifact_path_rejects_missing_artifact_id(tmp_path: Path):
@@ -257,6 +344,45 @@ def test_summarize_transition_classifies_pass_fail_changes():
     assert summarize_transition(0.0, 0.0) == "fail_to_fail"
 
 
+def test_memory_benchmark_summary_counts_pass_at_1_and_pass_at_5() -> None:
+    summary = build_memory_benchmark_summary(
+        model="gpt-5.5",
+        auth_mode="subscription",
+        memory_backend="text_memory_expel_reflector",
+        baseline_pass_at_1={"passed": 64, "total": 89},
+        baseline_pass_at_5={"passed": 80, "total": 89},
+        attempts_by_task={
+            "task-a": [
+                {"reward": 0.0, "baseline_reward": 0.0, "artifact_id": "memory-1"},
+                {"reward": 1.0, "baseline_reward": 0.0, "artifact_id": "memory-1"},
+            ],
+            "task-b": [
+                {"reward": 1.0, "baseline_reward": 1.0, "artifact_id": "memory-2"},
+            ],
+            "task-c": [
+                {"reward": 0.0, "baseline_reward": 0.0, "artifact_id": "memory-3"},
+                {"reward": 0.0, "baseline_reward": 0.0, "artifact_id": "memory-3"},
+            ],
+        },
+        total_tasks=3,
+    )
+
+    assert summary["benchmark"] == "terminal-bench-2.1"
+    assert summary["enabled_artifacts"] == ["text_memory"]
+    assert summary["disabled_artifacts"] == [
+        "skill_bundle",
+        "agent_system",
+        "parametric_memory",
+    ]
+    assert summary["baseline"]["pass_at_1"] == {"passed": 64, "total": 89}
+    assert summary["baseline"]["pass_at_5"] == {"passed": 80, "total": 89}
+    assert summary["evolved"]["pass_at_1"] == {"passed": 1, "total": 3}
+    assert summary["evolved"]["pass_at_5"] == {"passed": 2, "total": 3}
+    assert summary["task_transitions"]["task-a"]["transition"] == "fail_to_pass"
+    assert summary["task_transitions"]["task-a"]["artifact_ids"] == ["memory-1"]
+    assert summary["task_transitions"]["task-c"]["transition"] == "fail_to_fail"
+
+
 def test_terminal_bench_per_task_evolution_cli_dry_run_writes_plan(tmp_path: Path):
     output = tmp_path / "summary.json"
     run_root = tmp_path / "run"
@@ -314,7 +440,7 @@ def test_terminal_bench_per_task_evolution_cli_respects_explicit_artifact_type(
             "--reflector-model",
             "gpt-5.5",
             "--artifact-type",
-            "memory",
+            "text_memory",
             "--dry-run",
             "--output",
             str(output),
@@ -327,10 +453,404 @@ def test_terminal_bench_per_task_evolution_cli_respects_explicit_artifact_type(
         {
             "task_id": "fix-git",
             "rounds": 1,
-            "artifact_types": ["memory"],
+            "artifact_types": ["text_memory"],
         }
     ]
     assert not run_root.exists()
+
+
+def test_orchestration_can_run_text_memory_only_across_rounds(tmp_path: Path):
+    baseline = tmp_path / "baseline" / "fix-git__abc"
+    (baseline / "agent").mkdir(parents=True)
+    (baseline / "verifier").mkdir()
+    (baseline / "result.json").write_text(
+        json.dumps(
+            {
+                "trial_name": "fix-git__abc",
+                "task_name": "fix-git",
+                "status": "COMPLETED",
+                "verifier_result": {"rewards": {"reward": 0.0}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (baseline / "agent" / "stdout.txt").write_text("missed the target branch\n", encoding="utf-8")
+    (baseline / "verifier" / "reward.txt").write_text("0.0\n", encoding="utf-8")
+
+    evolved_trials = []
+    for round_number in [1, 2]:
+        evolved_trial = (
+            tmp_path / "run" / "harbor" / f"fix-git-r{round_number}" / f"fix-git__r{round_number}"
+        )
+        evolved_trials.append(evolved_trial)
+        (evolved_trial / "agent").mkdir(parents=True)
+        (evolved_trial / "verifier").mkdir()
+        (evolved_trial / "result.json").write_text(
+            json.dumps(
+                {
+                    "trial_name": f"fix-git__r{round_number}",
+                    "task_name": "fix-git",
+                    "status": "COMPLETED",
+                    "verifier_result": {"rewards": {"reward": 1.0}},
+                }
+            ),
+            encoding="utf-8",
+        )
+        (evolved_trial / "agent" / "stdout.txt").write_text("fixed it\n", encoding="utf-8")
+        (evolved_trial / "verifier" / "reward.txt").write_text("1.0\n", encoding="utf-8")
+
+    memory_path = tmp_path / "memory.md"
+    memory_path.write_text("## Do\n- Inspect branches before editing.\n", encoding="utf-8")
+    commands: list[list[str]] = []
+
+    def fake_run_command(command, cwd=None):
+        del cwd
+        commands.append(command)
+        if "terminal-bench-text-memory-job" in command:
+            job_name = command[command.index("--job-name") + 1]
+            round_number = 1 if job_name == "tb21-fix-git-r1" else 2
+            previous_ids = [
+                command[index + 1]
+                for index, part in enumerate(command)
+                if part == "--dataset-artifact-id"
+            ]
+            dataset_id = f"dataset-r{round_number - 1}"
+            job_path = Path(command[command.index("--output") + 1])
+            job_path.parent.mkdir(parents=True, exist_ok=True)
+            job_path.write_text(
+                json.dumps(
+                    {
+                        "dataset": {"artifact_id": dataset_id},
+                        "job": {"input_artifact_ids": [dataset_id, *previous_ids]},
+                    }
+                ),
+                encoding="utf-8",
+            )
+        return {}
+
+    def fake_worker_runner(*, db_path, artifact_root):
+        del db_path, artifact_root
+        return [
+            {
+                "artifact_id": "art-memory",
+                "type": "text_memory",
+                "uri": memory_path.resolve().as_uri(),
+                "manifest": {"method": "text_memory_expel_reflector"},
+            }
+        ]
+
+    summary = run_per_task_evolution(
+        task_root=tmp_path / "tasks",
+        task_ids=["fix-git"],
+        run_root=tmp_path / "run",
+        baseline_root=baseline.parent,
+        model="gpt-5.5",
+        reflector_model="gpt-5.5",
+        rounds=2,
+        artifact_types=["text_memory"],
+        env_json={},
+        verifier_env={},
+        command_runner=fake_run_command,
+        worker_runner=fake_worker_runner,
+        evolved_trial_locator=lambda task_id, round_number, run_root: evolved_trials[
+            round_number - 1
+        ],
+    )
+
+    job_commands = [
+        command for command in commands if "terminal-bench-text-memory-job" in command
+    ]
+    assert len(job_commands) == 2
+    assert job_commands[0][job_commands[0].index("--method") + 1] == (
+        "text_memory_expel_reflector"
+    )
+    assert "--dataset-artifact-id" not in job_commands[0]
+    assert [
+        job_commands[1][index + 1]
+        for index, part in enumerate(job_commands[1])
+        if part == "--dataset-artifact-id"
+    ] == ["dataset-r0"]
+    harbor_commands = [command for command in commands if command[:2] == ["harbor", "run"]]
+    assert len(harbor_commands) == 2
+    for harbor_command in harbor_commands:
+        assert f"memory_path={memory_path}" in harbor_command
+        assert not any("agent_system_path=" in part for part in harbor_command)
+    rounds = summary["tasks"][0]["rounds"]
+    assert [round_summary["transition"] for round_summary in rounds] == [
+        "fail_to_pass",
+        "pass_to_pass",
+    ]
+    assert [round_summary["artifact"]["artifact_type"] for round_summary in rounds] == [
+        "text_memory",
+        "text_memory",
+    ]
+    assert rounds[1]["dataset_artifact_ids"] == ["dataset-r1"]
+
+
+def test_text_memory_orchestration_records_pass_at_5_attempts(tmp_path: Path):
+    baseline = tmp_path / "baseline" / "fix-git__abc"
+    (baseline / "agent").mkdir(parents=True)
+    (baseline / "verifier").mkdir()
+    (baseline / "result.json").write_text(
+        json.dumps(
+            {
+                "trial_name": "fix-git__abc",
+                "task_name": "fix-git",
+                "status": "COMPLETED",
+                "verifier_result": {"rewards": {"reward": 0.0}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (baseline / "agent" / "stdout.txt").write_text("failed\n", encoding="utf-8")
+    (baseline / "verifier" / "reward.txt").write_text("0.0\n", encoding="utf-8")
+    memory_path = tmp_path / "memory.md"
+    memory_path.write_text("## Do\n- Verify the fixed behavior.\n", encoding="utf-8")
+    attempt_specs = [
+        ("fix-git__attempt2", 1.0, "2026-06-30T00:00:02Z", 10),
+        ("fix-git__attempt1", 0.0, "2026-06-30T00:00:01Z", 20),
+        ("fix-git__attempt3", 0.0, "2026-06-30T00:00:03Z", 30),
+        ("fix-git__attempt4", 0.0, "2026-06-30T00:00:04Z", 40),
+        ("fix-git__attempt5", 0.0, "2026-06-30T00:00:05Z", 50),
+    ]
+    rewards = [0.0, 1.0, 0.0, 0.0, 0.0]
+    commands: list[list[str]] = []
+
+    def fake_run_command(command, cwd=None):
+        del cwd
+        commands.append(command)
+        if "terminal-bench-text-memory-job" in command:
+            job_path = Path(command[command.index("--output") + 1])
+            job_path.parent.mkdir(parents=True, exist_ok=True)
+            job_path.write_text(
+                json.dumps(
+                    {
+                        "dataset": {"artifact_id": "dataset-r0"},
+                        "job": {"input_artifact_ids": ["dataset-r0"]},
+                    }
+                ),
+                encoding="utf-8",
+            )
+        elif command[:2] == ["harbor", "run"]:
+            jobs_dir = Path(command[command.index("--jobs-dir") + 1])
+            job_name = command[command.index("--job-name") + 1]
+            for trial_name, reward, started_at, directory_mtime in attempt_specs:
+                trial = jobs_dir / job_name / trial_name
+                (trial / "agent").mkdir(parents=True)
+                (trial / "verifier").mkdir()
+                (trial / "result.json").write_text(
+                    json.dumps(
+                        {
+                            "trial_name": trial_name,
+                            "task_name": "fix-git",
+                            "started_at": started_at,
+                            "status": "COMPLETED",
+                            "verifier_result": {"rewards": {"reward": reward}},
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                (trial / "agent" / "stdout.txt").write_text("attempt\n", encoding="utf-8")
+                (trial / "verifier" / "reward.txt").write_text(f"{reward}\n", encoding="utf-8")
+                os.utime(trial, (directory_mtime, directory_mtime))
+        return {}
+
+    def fake_worker_runner(*, db_path, artifact_root):
+        del db_path, artifact_root
+        return [
+            {
+                "artifact_id": "art-memory",
+                "type": "text_memory",
+                "uri": memory_path.resolve().as_uri(),
+                "manifest": {"method": "text_memory_expel_reflector"},
+            }
+        ]
+
+    summary = run_per_task_evolution(
+        task_root=tmp_path / "tasks",
+        task_ids=["fix-git"],
+        run_root=tmp_path / "run",
+        baseline_root=baseline.parent,
+        model="gpt-5.5",
+        reflector_model="gpt-5.5",
+        rounds=1,
+        artifact_types=["text_memory"],
+        n_attempts=5,
+        env_json={},
+        verifier_env={},
+        command_runner=fake_run_command,
+        worker_runner=fake_worker_runner,
+    )
+
+    harbor_command = next(command for command in commands if command[:2] == ["harbor", "run"])
+    assert harbor_command[harbor_command.index("--n-attempts") + 1] == "5"
+    [round_summary] = summary["tasks"][0]["rounds"]
+    assert round_summary["reward"] == 1.0
+    assert round_summary["pass_at_k"] is True
+    assert [attempt["reward"] for attempt in round_summary["attempts"]] == rewards
+    assert round_summary["attempts"][2]["attempt_index"] == 3
+    assert summary["memory_benchmark"]["baseline"]["pass_at_1"] == {"passed": 0, "total": 1}
+    assert summary["memory_benchmark"]["baseline"]["pass_at_5"] is None
+    assert summary["memory_benchmark"]["evolved"]["pass_at_1"] == {"passed": 0, "total": 1}
+    assert summary["memory_benchmark"]["evolved"]["pass_at_5"] == {"passed": 1, "total": 1}
+    assert (
+        summary["memory_benchmark"]["task_transitions"]["fix-git"]["transition"]
+        == "fail_to_pass"
+    )
+
+
+def test_text_memory_orchestration_tolerates_errored_attempts_without_transcript(
+    tmp_path: Path,
+):
+    baseline = tmp_path / "baseline" / "regex-chess__abc"
+    (baseline / "agent").mkdir(parents=True)
+    (baseline / "verifier").mkdir()
+    (baseline / "result.json").write_text(
+        json.dumps(
+            {
+                "trial_name": "regex-chess__abc",
+                "task_name": "regex-chess",
+                "status": "COMPLETED",
+                "verifier_result": {"rewards": {"reward": 0.0}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (baseline / "agent" / "stdout.txt").write_text("failed\n", encoding="utf-8")
+    (baseline / "verifier" / "reward.txt").write_text("0.0\n", encoding="utf-8")
+    memory_path = tmp_path / "memory.md"
+    memory_path.write_text("## Do\n- Validate legality.\n", encoding="utf-8")
+
+    commands: list[list[str]] = []
+
+    def fake_run_command(command, cwd=None):
+        del cwd
+        commands.append(command)
+        if "terminal-bench-text-memory-job" in command:
+            job_path = Path(command[command.index("--output") + 1])
+            job_path.parent.mkdir(parents=True, exist_ok=True)
+            job_path.write_text(
+                json.dumps(
+                    {
+                        "dataset": {"artifact_id": "dataset-r0"},
+                        "job": {"input_artifact_ids": ["dataset-r0"]},
+                    }
+                ),
+                encoding="utf-8",
+            )
+        elif command[:2] == ["harbor", "run"]:
+            jobs_dir = Path(command[command.index("--jobs-dir") + 1])
+            job_name = command[command.index("--job-name") + 1]
+            for index, reward in enumerate([0.0, 1.0, None, None, None], start=1):
+                trial_name = f"regex-chess__attempt{index}"
+                trial = jobs_dir / job_name / trial_name
+                (trial / "agent").mkdir(parents=True)
+                (trial / "result.json").write_text(
+                    json.dumps(
+                        {
+                            "trial_name": trial_name,
+                            "task_name": "regex-chess",
+                            "started_at": f"2026-07-01T00:00:0{index}Z",
+                            "status": "ERROR" if reward is None else "COMPLETED",
+                            "exception_info": (
+                                {"type": "NonZeroAgentExitCodeError"}
+                                if reward is None
+                                else None
+                            ),
+                            "verifier_result": (
+                                {"rewards": {"reward": reward}}
+                                if reward is not None
+                                else None
+                            ),
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                if reward is not None:
+                    (trial / "verifier").mkdir()
+                    (trial / "agent" / "stdout.txt").write_text(
+                        "attempt\n",
+                        encoding="utf-8",
+                    )
+                    (trial / "verifier" / "reward.txt").write_text(
+                        f"{reward}\n",
+                        encoding="utf-8",
+                    )
+        return {}
+
+    def fake_worker_runner(*, db_path, artifact_root):
+        del db_path, artifact_root
+        return [
+            {
+                "artifact_id": "art-memory",
+                "type": "text_memory",
+                "uri": memory_path.resolve().as_uri(),
+                "manifest": {"method": "text_memory_expel_reflector"},
+            }
+        ]
+
+    summary = run_per_task_evolution(
+        task_root=tmp_path / "tasks",
+        task_ids=["regex-chess"],
+        run_root=tmp_path / "run",
+        baseline_root=baseline.parent,
+        model="gpt-5.5",
+        reflector_model="gpt-5.5",
+        rounds=1,
+        artifact_types=["text_memory"],
+        n_attempts=5,
+        env_json={},
+        verifier_env={},
+        command_runner=fake_run_command,
+        worker_runner=fake_worker_runner,
+    )
+
+    [round_summary] = summary["tasks"][0]["rounds"]
+    assert [attempt["reward"] for attempt in round_summary["attempts"]] == [
+        0.0,
+        1.0,
+        None,
+        None,
+        None,
+    ]
+    assert round_summary["reward"] == 1.0
+    assert round_summary["pass_at_k"] is True
+    assert summary["memory_benchmark"]["evolved"]["pass_at_1"] == {
+        "passed": 0,
+        "total": 1,
+    }
+    assert summary["memory_benchmark"]["evolved"]["pass_at_5"] == {
+        "passed": 1,
+        "total": 1,
+    }
+
+
+def test_text_memory_orchestration_requires_harbor_memory_path_support(tmp_path: Path):
+    package_root = tmp_path / "terminal-bench-package"
+    agent_path = package_root / "task_packages" / "terminal_bench_v1" / "harbor_agent.py"
+    agent_path.parent.mkdir(parents=True)
+    agent_path.write_text(
+        "class EvoLabHarborAgent:\n"
+        "    def __init__(self, *, mode=None, env_json=None):\n"
+        "        pass\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="memory_path"):
+        run_per_task_evolution(
+            task_root=tmp_path / "tasks",
+            task_ids=["fix-git"],
+            run_root=tmp_path / "run",
+            baseline_root=tmp_path / "missing-baseline",
+            model="gpt-5.5",
+            reflector_model="gpt-5.5",
+            rounds=1,
+            artifact_types=["text_memory"],
+            terminal_bench_package_root=package_root,
+            env_json={},
+            verifier_env={},
+            command_runner=lambda command, cwd=None: {},
+        )
 
 
 def test_one_round_orchestration_uses_existing_baseline_and_runs_harbor(tmp_path: Path):
@@ -1435,14 +1955,14 @@ def test_parse_key_value_entries_rejects_invalid_entry():
         _parse_key_value_entries(["BROKEN"])
 
 
-def test_terminal_bench_per_task_evolution_cli_live_mode_requires_agent_system_only(
+def test_terminal_bench_per_task_evolution_cli_live_mode_rejects_parametric_memory(
     tmp_path: Path,
 ):
     output = tmp_path / "summary.json"
 
     with pytest.raises(
         ValueError,
-        match="live per-task evolution currently supports only agent_system",
+        match="Terminal Bench Codex subscription runs do not support parametric_memory",
     ):
         main(
             [
@@ -1460,7 +1980,7 @@ def test_terminal_bench_per_task_evolution_cli_live_mode_requires_agent_system_o
                 "--reflector-model",
                 "gpt-5.5",
                 "--artifact-type",
-                "memory",
+                "parametric_memory",
                 "--output",
                 str(output),
             ]
@@ -1518,8 +2038,52 @@ def test_terminal_bench_per_task_evolution_cli_live_mode_parses_env_and_writes_o
     assert captured["reflector_provider"] == "openai_chat"
     assert captured["codex_home"] == "/tmp/codex-home"
     assert captured["gepa_generations"] == 2
+    assert captured["artifact_types"] == ["agent_system"]
     assert captured["env_json"] == {"NO_PROXY": "localhost"}
     assert captured["verifier_env"] == {"UV_NO_INDEX": "1"}
+    assert json.loads(output.read_text(encoding="utf-8")) == {"mode": "live", "tasks": []}
+
+
+def test_terminal_bench_per_task_evolution_cli_live_mode_allows_text_memory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    output = tmp_path / "summary.json"
+    captured: dict[str, object] = {}
+
+    def fake_run_per_task_evolution(**kwargs):
+        captured.update(kwargs)
+        return {"mode": "live", "tasks": []}
+
+    monkeypatch.setattr(cli_module, "run_per_task_evolution", fake_run_per_task_evolution)
+
+    exit_code = main(
+        [
+            "terminal-bench-per-task-evolution",
+            "--task-root",
+            "/root/datasets/terminal-bench-2-1/tasks",
+            "--task-id",
+            "fix-git",
+            "--run-root",
+            str(tmp_path / "run"),
+            "--baseline-root",
+            str(tmp_path / "baseline"),
+            "--model",
+            "gpt-5.5",
+            "--reflector-model",
+            "gpt-5.5",
+            "--artifact-type",
+            "text_memory",
+            "--memory-method",
+            "text_memory_reflector",
+            "--output",
+            str(output),
+        ]
+    )
+
+    assert exit_code == 0
+    assert captured["artifact_types"] == ["text_memory"]
+    assert captured["memory_method"] == "text_memory_reflector"
     assert json.loads(output.read_text(encoding="utf-8")) == {"mode": "live", "tasks": []}
 
 
@@ -1643,3 +2207,39 @@ def test_terminal_bench_group_evolution_cli_live_mode_parses_env_and_writes_outp
     assert captured["env_json"] == {"NO_PROXY": "localhost"}
     assert captured["verifier_env"] == {"UV_NO_INDEX": "1"}
     assert json.loads(output.read_text(encoding="utf-8")) == {"mode": "group", "groups": []}
+
+
+def test_terminal_bench_group_evolution_cli_live_mode_rejects_parametric_memory(
+    tmp_path: Path,
+):
+    output = tmp_path / "summary.json"
+
+    with pytest.raises(
+        ValueError,
+        match="Terminal Bench Codex subscription runs do not support parametric_memory",
+    ):
+        main(
+            [
+                "terminal-bench-group-evolution",
+                "--task-root",
+                "/root/datasets/terminal-bench-2-1/tasks",
+                "--group-id",
+                "failed-set",
+                "--task-id",
+                "task-a",
+                "--task-id",
+                "task-b",
+                "--run-root",
+                str(tmp_path / "run"),
+                "--baseline-root",
+                str(tmp_path / "baseline"),
+                "--model",
+                "gpt-5.5",
+                "--reflector-model",
+                "gpt-5.5",
+                "--artifact-type",
+                "parametric_memory",
+                "--output",
+                str(output),
+            ]
+        )

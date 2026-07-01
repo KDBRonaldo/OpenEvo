@@ -46,12 +46,17 @@ research worker 处理的 jobs 永久失败掉。
 ```python
 METHOD_REGISTRY = {
     "text_memory": text_memory,
+    "text_memory_reflector": text_memory_reflector,
+    "text_memory_expel_reflector": text_memory_expel_reflector,
     "skill_bundle": skill_bundle,
+    "skill_bundle_reflector": skill_bundle_reflector,
     "agent_system": agent_system,
     "agent_system_reflector": agent_system_reflector,
     "agent_system_history_reflector": agent_system_history_reflector,
     "agent_system_pareto_reflector": agent_system_pareto_reflector,
+    "agent_system_gepa_reflector": agent_system_gepa_reflector,
     "parametric_memory_register": parametric_memory_register,
+    "parametric_memory_lora_sft": parametric_memory_lora_sft,
 }
 ```
 
@@ -100,6 +105,43 @@ flowchart TB
 内置 renderer 会提取稳定字段，例如 task id、session id、status、reward 和短的
 payload summary。Research workers 可以替换为 clustering、reflection、
 distillation 或其他 memory mining 方法，只要返回相同 artifact type 即可。
+
+## Method: `text_memory_reflector` / `text_memory_expel_reflector`
+
+用途：从 dataset 中的历史轨迹调用 LLM 生成可复用 Markdown memory。两者都产出
+`text_memory` artifact；`text_memory_expel_reflector` 在普通 reflection prompt 之上使用
+ExpeL/Reflexion-style synthesis，并要求输出包含这些二级标题：
+
+- `## Do`
+- `## Avoid`
+- `## Validate`
+- `## When Applicable`
+- `## Retired Or Superseded`
+
+输入：
+
+- 一个或多个类型为 `dataset` 的 input artifact；
+- 可选旧 `text_memory` input artifact，作为可保留或淘汰的 prior memory；
+- 必填 `job.config.reflector_llm.model`；
+- 可选 `job.config.reflector_llm.provider`，默认 `openai_chat`，也支持 `codex_cli`；
+- 可选 `job.config.max_records`、`compatibility`、`scores`、`tags` 和 `promoted`。
+
+输出：
+
+- `ArtifactRegisterRequest(type=text_memory)`；
+- `uri=file://.../memory.md`；
+- manifest 包含 `method`、source dataset IDs、record/reflected record counts、
+  success/failure counts、prior memory count 和 `promotion_support`。所有 input
+  artifact IDs 仍记录在 lineage 中，便于追踪 prior memory artifact。
+
+`text_memory` 会作为文本 prepend 到 agent instruction，因此 subscription transcript runs
+和 proxy/local inference runs 都能消费。方法仍必须避免把 held-out answers、oracle
+records、reference patches 或 verifier-private literals 写入 memory。
+
+Terminal Bench text-memory jobs 默认纳入 `COMPLETED` 和 `ERROR` transcript
+events。失败轨迹是 textual memory 的有效输入，因为它们通常提供可复用的
+`Avoid` 和 `Validate` 规则；这不改变 `text_memory` 的 runtime 形态，它仍只是注入到
+agent instruction 的 Markdown。
 
 ## Method: `skill_bundle`
 
@@ -383,6 +425,8 @@ reflector 负责提出候选，shared evaluator / orchestration layer 负责给�
 ## Method: `parametric_memory_register`
 
 用途：把已有 LoRA/adapter 注册为 parametric memory。它不训练 adapters。
+注册后的 artifact 只在 proxy/local inference runtime 中可用于 request-level adapter
+selection；subscription harness 不能消费 parametric adapters。
 
 输入：
 
@@ -411,7 +455,45 @@ flowchart TB
 
 `adapter_id` 是 serving-time name，应该匹配 SGLang 或 vLLM 加载 adapter 时使用的
 名字。artifact display `name` 可以和 adapter ID 相同，但 runtime selection 会优先
-使用 manifest `adapter_id`。
+使用 manifest `adapter_id`。若 `job.config.compatibility.base_model` 未设置，method 会自动
+写入 `[base_model]`；若显式设置但不包含当前 `base_model`，job 会失败，避免 adapter
+被不兼容模型选中。
+
+## Method: `parametric_memory_lora_sft`
+
+用途：把 successful trajectory records 导出成 SFT JSONL，调用外部 LoRA/adapter trainer，
+并把 trainer 产出的 adapter 目录注册为 `parametric_memory`。Reference worker 只定义
+训练编排 contract，不内置具体 trainer。
+
+输入：
+
+- 至少一个类型为 `dataset` 的 input artifact；
+- `job.config.base_model`，或 `job.config.manifest.base_model` / `job.config.context.base_model`；
+- `job.config.trainer.command`，必须是可执行文件名或路径；
+- `job.config.trainer.args`，必须包含 `{training_dataset}` 和 `{adapter_dir}` 占位符；
+- 可选 `job.config.trainer.timeout_seconds`，默认 600 秒，必须为正数；
+- 可选 `job.config.output_adapter_id`、`adapter_format`、`compatibility`、`scores`、
+  `tags`、`promoted`；
+- 可选旧 `parametric_memory` input artifact，当前只记录在 manifest，后续 trainer 可以用
+  lineage 决定是否做继续训练。
+
+输出：
+
+- worker output 目录下的 `training.jsonl`，每行形如
+  `{"messages": [...], "metadata": {...}}`，只包含成功轨迹；同一个 successful record 中
+  多个可训练 trace 会分别导出为多行；
+- `trainer.stdout.txt` 和 `trainer.stderr.txt`，用于排障；
+- `ArtifactRegisterRequest(type=parametric_memory)`；
+- `uri=file://.../adapter`，该目录会在 trainer 执行前清理旧内容，并且 trainer 必须写出
+  至少一个文件；
+- 对默认 `adapter_format=lora`，adapter 目录必须包含 `adapter_config.json`；
+- manifest 包含 `adapter_id`、`base_model`、`adapter_format`、training dataset path、
+  record count、source dataset IDs 和 prior parametric-memory IDs。
+
+该 artifact 只适用于 proxy/local inference runtime。Subscription harness 直连外部模型
+服务，不能选择 OpenEvo 训练出的 adapter；上层 experiment config 和 Terminal Bench
+Codex subscription runner 都应拒绝启用 `parametric_memory`，context resolver 也会在
+subscription request 中跳过已存在的 parametric-memory artifact。
 
 ## CLI Options
 
@@ -425,6 +507,11 @@ polar-evolution worker
   --capability agent_system_reflector
   --capability agent_system_history_reflector
   --capability agent_system_pareto_reflector
+  --capability agent_system_gepa_reflector
+  --capability text_memory_reflector
+  --capability text_memory_expel_reflector
+  --capability parametric_memory_register
+  --capability parametric_memory_lora_sft
   --artifact-root .polar_evolution
   --once
   --sleep-seconds 5
@@ -434,7 +521,7 @@ polar-evolution worker
 如果不传 `--capability`，worker 默认使用内置 method names。也可以传逗号分隔的值：
 
 ```sh
-uv run polar-evolution worker --capability text_memory,skill_bundle,agent_system,agent_system_reflector,agent_system_history_reflector,agent_system_pareto_reflector
+uv run polar-evolution worker --capability text_memory,skill_bundle,agent_system,agent_system_reflector,agent_system_history_reflector,agent_system_pareto_reflector,text_memory_expel_reflector,parametric_memory_lora_sft
 ```
 
 ## 添加 Research Method

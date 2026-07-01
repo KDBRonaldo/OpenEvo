@@ -62,6 +62,25 @@ gateway URL into their config files because they don't read `OPENAI_BASE_URL`;
 explain each piece — that glue is the *only* reason a preset is more than five
 lines.
 
+### Codex native memory
+
+The Codex preset stores Codex CLI state under `CODEX_HOME`, defaulting to
+`/polar/session/.codex` inside the runtime. OpenEvo preserves that state by
+default. To start a Codex run without native Codex memory, set:
+
+```yaml
+agent:
+  harness: codex
+  settings:
+    native_memory_policy: clear
+```
+
+This removes `CODEX_HOME/memories/` and `CODEX_HOME/memories_*.sqlite*` during
+harness setup, while leaving auth and config files such as `auth.json` and
+`config.toml` in place. OpenEvo textual memory remains separate: selected
+`text_memory` artifacts are staged as `POLAR_MEMORY_FILE` and prepended to the
+agent instruction.
+
 ## The harness contract
 
 A harness receives the task instruction, a runtime execution helper, the model

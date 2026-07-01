@@ -50,9 +50,11 @@ Terminal Bench 可以继续由 Harbor/EvoLab 和官方 verifier 执行。若只�
 ### Per-task Terminal Bench evolution
 
 Use this mode when each Terminal Bench task should evolve independently. The
-first supported artifact type is `agent_system`; `skill_bundle` and `memory`
-are represented in the runner interface for future support, but live Harbor
-materialization currently supports only `agent_system`.
+live Harbor runner supports one evolved artifact type per invocation:
+`agent_system` or `text_memory`. `skill_bundle` remains represented in the
+runner interface for future support. `parametric_memory` is rejected on this
+Codex subscription path because adapters can only be selected by proxy/local
+inference serving.
 
 ```bash
 uv run polar-evolution terminal-bench-per-task-evolution \
@@ -70,6 +72,39 @@ uv run polar-evolution terminal-bench-per-task-evolution \
   --verifier-env UV_DOWNLOAD_URL=http://172.17.0.8:8765 \
   --output /tmp/tb21-per-task-evolution/summary.json
 ```
+
+To run the memory-only ablation for Terminal Bench, keep skill, agent-system,
+and parametric-memory evolution disabled by selecting only `text_memory`.
+The default memory method is `text_memory_expel_reflector`:
+
+```bash
+uv run polar-evolution terminal-bench-per-task-evolution \
+  --task-root /root/datasets/terminal-bench-2-1/tasks \
+  --task-id fix-git \
+  --baseline-root /tmp/tb21-baseline/jobs \
+  --run-root /tmp/tb21-text-memory \
+  --model gpt-5.5 \
+  --reflector-model gpt-5.5 \
+  --artifact-type text_memory \
+  --memory-method text_memory_expel_reflector \
+  --n-attempts 5 \
+  --rounds 1 \
+  --output /tmp/tb21-text-memory/summary.json
+```
+
+The summary includes pass@1/pass@5 and task-level reward transitions under
+`memory_benchmark`, with `enabled_artifacts=["text_memory"]` and the other
+evolution artifact types listed as disabled. `--n-attempts 5` runs five Harbor
+trials with the selected memory artifact and records each attempt. The runner
+passes the selected memory artifact as `memory_path` to Harbor; the installed
+Harbor/EvoLab task package must support that argument for live injection. Text
+memory runs check this before launching Harbor and fail fast when the installed
+agent package cannot consume `memory_path`. Baseline pass@1 is computed from the
+selected baseline trials; baseline pass@5 is unavailable for task-local runs
+unless the experiment provides a matching multi-attempt baseline source.
+Text-memory dataset construction includes both `COMPLETED` and `ERROR` Terminal
+Bench events by default so failed transcripts can become `Avoid` and `Validate`
+memory. Agent-system dataset construction remains completed-only by default.
 
 To run closed-loop GEPA-style agent-system evolution for each task, select the
 GEPA reflector and set the per-round generation count:
@@ -178,6 +213,27 @@ uv run polar-evolution terminal-bench-agent-system-job \
   --dataset-artifact-id art_round2 \
   --reflector-model gpt-5.4
 ```
+
+如果目标是 text-memory-only evolution，可以创建对应的 memory reflector job：
+
+```sh
+uv run polar-evolution terminal-bench-text-memory-job \
+  --input /tmp/evolab-tb21-run/<job-or-trial-dir> \
+  --db /tmp/polar-tb21/evolution.db \
+  --artifact-root /tmp/polar-tb21/artifacts \
+  --dataset-name tb21_memory_round0 \
+  --policy-version tb21-memory-round0 \
+  --method text_memory_expel_reflector \
+  --reflector-provider codex_cli \
+  --reflector-model gpt-5.5 \
+  --codex-home /path/to/codex-home \
+  --output /tmp/polar-tb21/text-memory-job.json
+```
+
+该命令同样只消费 transcript dataset，不要求 token-level logprobs，并且默认纳入
+`COMPLETED` 和 `ERROR` Terminal Bench events。这样失败轨迹也能贡献 textual memory。
+`text_memory` artifact 可用于 subscription 和 proxy/local inference；`parametric_memory`
+artifact 仍只适用于 proxy/local inference。
 
 若要使用多候选、带 promotion gate 和 candidate archive 的 agent-system evolution
 算法，可显式指定：

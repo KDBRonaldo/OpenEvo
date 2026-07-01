@@ -297,6 +297,14 @@ Typed feedback contract：
 ```
 
 Gateway 会把选中的 memory 写到 `POLAR_MEMORY_FILE`，并 prepend 到 agent instruction。
+该路径只依赖 rendered text，因此对 proxy/local inference 和 transcript-only subscription
+harness 都生效。内置 reference worker 提供三条 text-memory 方法：
+
+- `text_memory`：把 dataset records 渲染成简单 Markdown，主要用于 smoke test；
+- `text_memory_reflector`：调用 LLM 从成功/失败 trajectories 中生成 reusable memory；
+- `text_memory_expel_reflector`：使用 ExpeL/Reflexion-style synthesis，要求输出包含
+  `## Do`、`## Avoid`、`## Validate`、`## When Applicable` 和
+  `## Retired Or Superseded`，适合 Terminal Bench memory-only ablation。
 
 ### `skill_bundle`
 
@@ -484,7 +492,31 @@ ground truth。
 ```
 
 Context resolver 会把它转成 `adapter_merge_spec`。Gateway/proxy 当前做 request-level
-adapter selection，不做物理权重合并。
+adapter selection，不做物理权重合并。Parametric memory 只适用于 proxy/local inference
+运行：serving backend 必须能按 request 选择或加载对应 adapter。Subscription harness 直连
+外部模型服务，不能应用 OpenEvo 产生的 adapter，因此 experiment config 会拒绝在 subscription
+auth 下启用 `artifacts.parametric_memory`，context resolver 也会在 request 的 agent
+settings 或 metadata 标记 subscription auth 时跳过 `parametric_memory` artifacts。
+
+内置 reference worker 提供两条 parametric-memory 方法：
+
+- `parametric_memory_register`：注册已有 adapter URI，不负责训练；
+- `parametric_memory_lora_sft`：从 successful trajectories 导出 SFT JSONL，调用外部 trainer，
+  并注册 trainer 产出的 adapter 目录。
+
+两条方法都会要求 `base_model`，并确保 `compatibility.base_model` 包含该模型；如果调用方没有
+显式设置 compatibility，method 会自动写入 `[base_model]`。`parametric_memory_lora_sft`
+的 trainer contract 是：
+
+- `job.config.trainer.command` 指向可执行 trainer；
+- `job.config.trainer.args` 必须包含 `{training_dataset}` 和 `{adapter_dir}` 占位符；
+- `job.config.trainer.timeout_seconds` 默认 600 秒；
+- trainer 执行前会清理旧 adapter 目录；
+- 默认 `adapter_format=lora` 时，adapter 目录必须包含 `adapter_config.json`。
+
+Reference worker 只定义训练编排和 artifact contract；具体 LoRA trainer、serving backend
+的 adapter 加载方式，以及长训练过程中的续约/heartbeat 扩展，应由本地 inference/training
+infrastructure 提供。
 
 ## Context Resolve Contract
 

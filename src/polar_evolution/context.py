@@ -8,6 +8,8 @@ from urllib.parse import unquote, urlparse
 
 from polar_evolution.models import ArtifactType, ContextResolveRequest
 
+_SUBSCRIPTION_AUTH_MODES = {"subscription", "chatgpt_subscription"}
+
 
 def _json_object(value: object) -> dict[str, Any]:
     if isinstance(value, dict):
@@ -51,6 +53,39 @@ def _string_items(value: object) -> list[str] | None:
     return items
 
 
+def _normalized_text(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().lower()
+    return normalized or None
+
+
+def request_auth_mode(request: ContextResolveRequest) -> str | None:
+    settings = request.agent.get("settings")
+    if isinstance(settings, dict):
+        value = _normalized_text(settings.get("auth_mode"))
+        if value:
+            return value
+
+    for value in (
+        request.agent.get("auth"),
+        request.agent.get("auth_mode"),
+        request.metadata.get("auth_mode"),
+    ):
+        normalized = _normalized_text(value)
+        if normalized:
+            return normalized
+
+    evolution_metadata = request.metadata.get("evolution")
+    if isinstance(evolution_metadata, dict):
+        return _normalized_text(evolution_metadata.get("auth_mode"))
+    return None
+
+
+def request_uses_subscription_auth(request: ContextResolveRequest) -> bool:
+    return request_auth_mode(request) in _SUBSCRIPTION_AUTH_MODES
+
+
 def requested_context_artifact_ids(request: ContextResolveRequest) -> set[str] | None:
     evolution_metadata = request.metadata.get("evolution")
     if not isinstance(evolution_metadata, dict):
@@ -89,6 +124,14 @@ def artifact_matches(request: ContextResolveRequest, row: dict[str, object]) -> 
     harness = request.agent.get("harness")
     if harnesses and harness not in harnesses:
         return False
+
+    auth_modes = _string_items(compatibility.get("auth_mode"))
+    if auth_modes is None:
+        return False
+    if auth_modes:
+        auth_mode = request_auth_mode(request)
+        if auth_mode is None or auth_mode not in {mode.lower() for mode in auth_modes}:
+            return False
     return True
 
 

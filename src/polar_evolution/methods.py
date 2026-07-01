@@ -4,6 +4,7 @@ import json
 import math
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 from collections.abc import Callable
@@ -51,6 +52,13 @@ _HUMAN_FEEDBACK_LIST_FIELDS = (
     "risks",
     "validation_checks",
     "labels",
+)
+_TEXT_MEMORY_EXPEL_REQUIRED_SECTIONS = (
+    "Do",
+    "Avoid",
+    "Validate",
+    "When Applicable",
+    "Retired Or Superseded",
 )
 _HUMAN_FEEDBACK_AVAILABLE_STATUS = "available_for_evolution"
 _HUMAN_FEEDBACK_SUMMARY_LIMIT = 8
@@ -265,6 +273,146 @@ def text_memory_reflector(
                     validation_checks=[
                         "Verify that the memory is grounded in observed trajectories "
                         "and does not encode held-out answers or brittle file names."
+                    ],
+                ),
+            },
+            lineage=lineage,
+            compatibility=_dict_config(job.config.get("compatibility")),
+            scores=_scores_config(job.config.get("scores")),
+            tags=_string_list(job.config.get("tags")),
+            promoted=bool(job.config.get("promoted", False)),
+        )
+    ]
+
+
+def text_memory_expel_reflector(
+    job: WorkerClaimedJob,
+    artifact_root: Path,
+) -> list[ArtifactRegisterRequest]:
+    dataset_artifacts = _input_artifacts(job, ArtifactType.DATASET)
+    if not dataset_artifacts:
+        raise ValueError("text_memory_expel_reflector requires an input dataset artifact")
+    dataset = dataset_artifacts[0]
+
+    manifests: list[dict[str, Any]] = []
+    records: list[dict[str, Any]] = []
+    for dataset_artifact in dataset_artifacts:
+        manifest_path = _file_uri_to_path(dataset_artifact.uri)
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifests.append(manifest)
+        records.extend(_read_dataset_records(manifest_path, manifest))
+    source_dataset_artifact_ids = [artifact.artifact_id for artifact in dataset_artifacts]
+    source_dataset_uris = [artifact.uri for artifact in dataset_artifacts]
+    manifest = {
+        "name": manifests[0].get("name") or dataset.name or "combined text memory dataset",
+        "source_dataset_artifact_ids": source_dataset_artifact_ids,
+        "source_dataset_uris": source_dataset_uris,
+        "dataset_count": len(dataset_artifacts),
+    }
+    reflected_records = _reflection_records(
+        records,
+        max_records=_int_config(job.config.get("max_records"), 20),
+    )
+    prior_memory_texts = _text_memory_reflector_base_texts(job)
+
+    reflection_prompt = _render_text_memory_expel_reflection_prompt(
+        job=job,
+        dataset=dataset,
+        manifest=manifest,
+        records=records,
+        reflected_records=reflected_records,
+        prior_memory_texts=prior_memory_texts,
+    )
+    reflection_prompt = _redact_generic_reflector_prompt(
+        reflection_prompt,
+        job=job,
+        manifests=manifests,
+    )
+    llm_config = _reflector_llm_config(job)
+    memory_markdown = _generate_reflector_markdown(
+        reflection_prompt,
+        llm_config,
+        system_message=(
+            "You are an ExpeL/Reflexion-style reflector for text memory. Read prior "
+            "task trajectories and produce structured reusable Markdown memory. "
+            "Return only memory.md content with the required sections."
+        ),
+        codex_prompt=_codex_cli_text_memory_reflector_prompt(reflection_prompt),
+        error_context="text_memory_expel_reflector",
+        temp_prefix="polar-text-memory-expel-reflector-",
+    )
+    memory_markdown, audit_report = _guard_generic_reflector_output(
+        memory_markdown,
+        job=job,
+        manifests=manifests,
+    )
+    _require_text_memory_expel_sections(memory_markdown)
+
+    output_dir = artifact_root / "workers" / job.job_id / "text_memory_expel_reflector"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    memory_path = output_dir / "memory.md"
+    memory_path.write_text(_ensure_trailing_newline(memory_markdown), encoding="utf-8")
+
+    success_count = sum(1 for record in reflected_records if record["kind"] == "success")
+    failure_count = sum(1 for record in reflected_records if record["kind"] == "failure")
+    lineage = {
+        **_dict_config(job.config.get("lineage")),
+        "method": "text_memory_expel_reflector",
+        "input_artifact_ids": _input_artifact_ids(job),
+        "source_dataset_artifact_id": dataset.artifact_id,
+        "source_dataset_artifact_ids": source_dataset_artifact_ids,
+    }
+    required_sections = list(_TEXT_MEMORY_EXPEL_REQUIRED_SECTIONS)
+    return [
+        ArtifactRegisterRequest(
+            type=ArtifactType.TEXT_MEMORY,
+            name=str(
+                job.config.get("name")
+                or f"{dataset.name or dataset.artifact_id} ExpeL reflected memory"
+            ),
+            uri=memory_path.resolve().as_uri(),
+            manifest={
+                "content_path": "memory.md",
+                "method": "text_memory_expel_reflector",
+                "source_dataset_artifact_id": dataset.artifact_id,
+                "source_dataset_uri": dataset.uri,
+                "source_dataset_artifact_ids": source_dataset_artifact_ids,
+                "source_dataset_uris": source_dataset_uris,
+                "record_count": len(records),
+                "reflected_record_count": len(reflected_records),
+                "success_count": success_count,
+                "failure_count": failure_count,
+                "prior_memory_count": len(prior_memory_texts),
+                "required_sections": required_sections,
+                "reflector_provider": llm_config["provider"],
+                "reflector_model": llm_config["model"],
+                "reflection_audit": audit_report,
+                "promotion_support": _reflector_promotion_support(
+                    job,
+                    method="text_memory_expel_reflector",
+                    artifact_kind="text_memory",
+                    dataset_ids=source_dataset_artifact_ids,
+                    record_count=len(records),
+                    reflected_record_count=len(reflected_records),
+                    success_count=success_count,
+                    failure_count=failure_count,
+                    proposed_changes=[
+                        "Update structured ExpeL-style text memory from recurring "
+                        "successes, failures, validation habits, and superseded advice "
+                        "in the selected trajectories."
+                    ],
+                    expected_benefits=[
+                        "Improve later rollouts by separating actions to repeat, "
+                        "failure modes to avoid, validation checks, conditional "
+                        "guidance, and retired memory."
+                    ],
+                    risks=[
+                        "Memory may overfit the sampled trajectories or preserve stale "
+                        "advice if the retired section is not reviewed."
+                    ],
+                    validation_checks=[
+                        "Verify that each required section is present, grounded in "
+                        "observed trajectories, and free of protected held-out literals."
                     ],
                 ),
             },
@@ -1166,6 +1314,7 @@ def parametric_memory_register(
         manifest["adapter_id"] = adapter_id
         manifest["base_model"] = base_model
         manifest["adapter_format"] = adapter_format
+    compatibility = _parametric_memory_compatibility(job, base_model)
 
     return [
         ArtifactRegisterRequest(
@@ -1174,7 +1323,94 @@ def parametric_memory_register(
             uri=adapter_uri,
             manifest=manifest,
             lineage=_dict_config(job.config.get("lineage")),
-            compatibility=_dict_config(job.config.get("compatibility")),
+            compatibility=compatibility,
+            scores=_scores_config(job.config.get("scores")),
+            tags=_string_list(job.config.get("tags")),
+            promoted=bool(job.config.get("promoted", False)),
+        )
+    ]
+
+
+def parametric_memory_lora_sft(
+    job: WorkerClaimedJob,
+    artifact_root: Path,
+) -> list[ArtifactRegisterRequest]:
+    dataset_artifacts = _input_artifacts(job, ArtifactType.DATASET)
+    if not dataset_artifacts:
+        raise ValueError("parametric_memory_lora_sft requires at least one dataset artifact")
+    base_model = _find_base_model(job)
+    if not base_model:
+        raise ValueError("parametric_memory_lora_sft requires base_model")
+    trainer = job.config.get("trainer")
+    if not isinstance(trainer, dict):
+        raise ValueError("parametric_memory_lora_sft requires trainer config")
+    command = trainer.get("command")
+    if not isinstance(command, str) or not command.strip():
+        raise ValueError("parametric_memory_lora_sft requires trainer.command")
+    timeout_seconds = _float_config(trainer.get("timeout_seconds"), 600.0)
+    if timeout_seconds is None or timeout_seconds <= 0:
+        raise ValueError("parametric_memory_lora_sft trainer.timeout_seconds must be positive")
+
+    output_dir = artifact_root / "workers" / job.job_id / "parametric_memory_lora_sft"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    training_path = output_dir / "training.jsonl"
+    training_records = _write_parametric_memory_training_jsonl(
+        dataset_artifacts,
+        training_path,
+    )
+    if not training_records:
+        raise ValueError("parametric_memory_lora_sft found no successful training records")
+
+    adapter_id = str(
+        job.config.get("output_adapter_id") or _slug(str(job.config.get("name") or job.job_id))
+    )
+    adapter_dir = output_dir / "adapter"
+    if adapter_dir.exists():
+        shutil.rmtree(adapter_dir)
+    _run_parametric_memory_trainer(
+        command=command.strip(),
+        args=trainer.get("args"),
+        training_dataset=training_path,
+        adapter_dir=adapter_dir,
+        cwd=output_dir,
+        timeout_seconds=timeout_seconds,
+    )
+    if not adapter_dir.is_dir() or not any(adapter_dir.iterdir()):
+        raise ValueError("parametric_memory_lora_sft trainer did not produce adapter directory")
+
+    adapter_format = str(job.config.get("adapter_format") or "lora")
+    if adapter_format == "lora" and not (adapter_dir / "adapter_config.json").is_file():
+        raise ValueError("parametric_memory_lora_sft adapter directory missing adapter_config.json")
+    compatibility = _parametric_memory_compatibility(job, base_model)
+    dataset_ids = [artifact.artifact_id for artifact in dataset_artifacts]
+    prior_adapter_ids = [
+        artifact.artifact_id
+        for artifact in _input_artifacts(job, ArtifactType.PARAMETRIC_MEMORY)
+    ]
+    manifest = {
+        "method": "parametric_memory_lora_sft",
+        "adapter_id": adapter_id,
+        "base_model": base_model,
+        "adapter_format": adapter_format,
+        "training_dataset_path": training_path.relative_to(output_dir).as_posix(),
+        "training_record_count": len(training_records),
+        "trainer_command": command.strip(),
+        "source_dataset_artifact_ids": dataset_ids,
+        "prior_parametric_memory_artifact_ids": prior_adapter_ids,
+    }
+    return [
+        ArtifactRegisterRequest(
+            type=ArtifactType.PARAMETRIC_MEMORY,
+            name=str(job.config.get("name") or adapter_id),
+            uri=adapter_dir.resolve().as_uri(),
+            manifest=manifest,
+            lineage={
+                **_dict_config(job.config.get("lineage")),
+                "method": "parametric_memory_lora_sft",
+                "input_artifact_ids": _input_artifact_ids(job),
+                "source_dataset_artifact_ids": dataset_ids,
+            },
+            compatibility=compatibility,
             scores=_scores_config(job.config.get("scores")),
             tags=_string_list(job.config.get("tags")),
             promoted=bool(job.config.get("promoted", False)),
@@ -1185,6 +1421,7 @@ def parametric_memory_register(
 METHOD_REGISTRY: dict[str, EvolutionMethod] = {
     "text_memory": text_memory,
     "text_memory_reflector": text_memory_reflector,
+    "text_memory_expel_reflector": text_memory_expel_reflector,
     "skill_bundle": skill_bundle,
     "skill_bundle_reflector": skill_bundle_reflector,
     "agent_system": agent_system,
@@ -1193,6 +1430,7 @@ METHOD_REGISTRY: dict[str, EvolutionMethod] = {
     "agent_system_pareto_reflector": agent_system_pareto_reflector,
     "agent_system_gepa_reflector": agent_system_gepa_reflector,
     "parametric_memory_register": parametric_memory_register,
+    "parametric_memory_lora_sft": parametric_memory_lora_sft,
 }
 
 
@@ -1232,6 +1470,161 @@ def _read_dataset_records(manifest_path: Path, manifest: dict[str, Any]) -> list
             if isinstance(record, dict):
                 records.append(record)
     return records
+
+
+def _write_parametric_memory_training_jsonl(
+    dataset_artifacts: list[WorkerClaimInputArtifact],
+    output_path: Path,
+) -> list[dict[str, Any]]:
+    training_records: list[dict[str, Any]] = []
+    for dataset in dataset_artifacts:
+        manifest_path = _file_uri_to_path(dataset.uri)
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if not isinstance(manifest, dict):
+            continue
+        records = _read_dataset_records(manifest_path, manifest)
+        for record in records:
+            reward = _record_reward(record)
+            if _reflection_kind(record.get("status"), reward) != "success":
+                continue
+            for trace_index, messages in _sft_message_sets_from_record(record):
+                training_records.append(
+                    {
+                        "messages": messages,
+                        "metadata": {
+                            "dataset_artifact_id": dataset.artifact_id,
+                            "dataset_name": manifest.get("name") or dataset.name,
+                            "event_id": record.get("event_id"),
+                            "task_id": record.get("task_id"),
+                            "session_id": record.get("session_id"),
+                            "trace_index": trace_index,
+                            "reward": reward,
+                            "status": record.get("status"),
+                        },
+                    }
+                )
+
+    output_path.write_text(
+        "".join(
+            json.dumps(record, sort_keys=True, ensure_ascii=False) + "\n"
+            for record in training_records
+        ),
+        encoding="utf-8",
+    )
+    return training_records
+
+
+def _sft_message_sets_from_record(
+    record: dict[str, Any],
+) -> list[tuple[int, list[dict[str, str]]]]:
+    traces = record.get("traces")
+    if not isinstance(traces, list):
+        return []
+    message_sets: list[tuple[int, list[dict[str, str]]]] = []
+    for trace_index, trace in enumerate(traces):
+        if not isinstance(trace, dict):
+            continue
+        prompt_messages = _sft_messages(trace.get("prompt_messages"), default_role="user")
+        response_messages = _sft_messages(
+            trace.get("response_messages"),
+            default_role="assistant",
+        )
+        if prompt_messages and response_messages:
+            message_sets.append((trace_index, [*prompt_messages, *response_messages]))
+    return message_sets
+
+
+def _sft_messages(value: Any, *, default_role: str) -> list[dict[str, str]]:
+    if not isinstance(value, list):
+        return []
+    messages: list[dict[str, str]] = []
+    for message in value:
+        if not isinstance(message, dict):
+            continue
+        role = message.get("role")
+        if not isinstance(role, str) or not role.strip():
+            role = default_role
+        content = _content_text(message.get("content"))
+        if content:
+            messages.append({"role": role.strip(), "content": content})
+    return messages
+
+
+def _run_parametric_memory_trainer(
+    *,
+    command: str,
+    args: Any,
+    training_dataset: Path,
+    adapter_dir: Path,
+    cwd: Path,
+    timeout_seconds: float,
+) -> None:
+    if args is None:
+        raw_args: list[Any] = []
+    elif isinstance(args, list):
+        raw_args = args
+    else:
+        raise ValueError("parametric_memory_lora_sft trainer.args must be a list")
+
+    missing_placeholders = [
+        placeholder
+        for placeholder in ("{training_dataset}", "{adapter_dir}")
+        if not any(placeholder in str(arg) for arg in raw_args)
+    ]
+    if missing_placeholders:
+        raise ValueError(
+            "parametric_memory_lora_sft trainer requires "
+            "{training_dataset} and {adapter_dir} placeholders"
+        )
+
+    replacements = {
+        "{training_dataset}": str(training_dataset),
+        "{adapter_dir}": str(adapter_dir),
+    }
+    rendered_args: list[str] = []
+    for arg in raw_args:
+        rendered = str(arg)
+        for placeholder, value in replacements.items():
+            rendered = rendered.replace(placeholder, value)
+        rendered_args.append(rendered)
+
+    try:
+        completed = subprocess.run(
+            [command, *rendered_args],
+            cwd=cwd,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired as exc:
+        (cwd / "trainer.stdout.txt").write_text(
+            _subprocess_output_text(exc.stdout),
+            encoding="utf-8",
+        )
+        (cwd / "trainer.stderr.txt").write_text(
+            _subprocess_output_text(exc.stderr),
+            encoding="utf-8",
+        )
+        raise ValueError(
+            "parametric_memory_lora_sft trainer timed out after "
+            f"{timeout_seconds:g} seconds"
+        ) from exc
+    (cwd / "trainer.stdout.txt").write_text(completed.stdout, encoding="utf-8")
+    (cwd / "trainer.stderr.txt").write_text(completed.stderr, encoding="utf-8")
+    if completed.returncode != 0:
+        raise ValueError(
+            "parametric_memory_lora_sft trainer failed with exit code "
+            f"{completed.returncode}"
+        )
+
+
+def _subprocess_output_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode(errors="replace")
+    return str(value)
 
 
 def _render_memory_markdown(
@@ -1292,6 +1685,15 @@ def _render_text_memory_reflection_prompt(
     failure_records = [record for record in reflected_records if record["kind"] == "failure"]
     other_records = [record for record in reflected_records if record["kind"] == "observation"]
     feedback_records = [record for record in reflected_records if record.get("evolution_feedback")]
+    source_dataset_ids = manifest.get("source_dataset_artifact_ids")
+    if (
+        isinstance(source_dataset_ids, list)
+        and source_dataset_ids
+        and all(isinstance(item, str) for item in source_dataset_ids)
+    ):
+        dataset_id_lines = [f"- dataset_artifact_ids: {', '.join(source_dataset_ids)}"]
+    else:
+        dataset_id_lines = [f"- dataset_artifact_id: {dataset.artifact_id}"]
 
     lines = [
         "# Text Memory Reflection Context",
@@ -1300,7 +1702,7 @@ def _render_text_memory_reflection_prompt(
         "by capturing reusable task memory, recurring failure modes, and validation habits.",
         "",
         f"- job_id: {job.job_id}",
-        f"- dataset_artifact_id: {dataset.artifact_id}",
+        *dataset_id_lines,
         f"- dataset_name: {manifest.get('name') or dataset.name or 'unknown'}",
         f"- record_count: {len(records)}",
         f"- reflected_record_count: {len(reflected_records)}",
@@ -1328,6 +1730,56 @@ def _render_text_memory_reflection_prompt(
         ]
     )
     return "\n".join(lines)
+
+
+def _render_text_memory_expel_reflection_prompt(
+    *,
+    job: WorkerClaimedJob,
+    dataset: WorkerClaimInputArtifact,
+    manifest: dict[str, Any],
+    records: list[dict[str, Any]],
+    reflected_records: list[dict[str, str]],
+    prior_memory_texts: list[str],
+) -> str:
+    base_prompt = _render_text_memory_reflection_prompt(
+        job=job,
+        dataset=dataset,
+        manifest=manifest,
+        records=records,
+        reflected_records=reflected_records,
+        prior_memory_texts=prior_memory_texts,
+    )
+    required_section_lines = [
+        f"- `## {section}`" for section in _TEXT_MEMORY_EXPEL_REQUIRED_SECTIONS
+    ]
+    return "\n".join(
+        [
+            base_prompt.rstrip(),
+            "",
+            "## ExpeL / Reflexion Memory Synthesis",
+            "",
+            "Use an ExpeL-style process: compare successful and failed trajectories, "
+            "extract lessons that transfer across future tasks, and retire advice that "
+            "is contradicted or superseded by newer evidence. Treat prior text memory as "
+            "candidate memory, not as ground truth.",
+            "",
+            "## Output Contract",
+            "",
+            "- Return only memory.md content; do not wrap it in a code fence.",
+            "- Write structured textual memory with these exact level-2 headings:",
+            *required_section_lines,
+            "- `## Do` contains reusable actions that helped successful trajectories.",
+            "- `## Avoid` contains recurring failure modes and stale behaviors to prevent.",
+            "- `## Validate` contains concrete verification checks before final response.",
+            "- `## When Applicable` contains conditional triggers for applying the memory.",
+            "- `## Retired Or Superseded` names prior memory or habits that should no "
+            "longer be followed.",
+            "- Ground every item in the supplied trajectories or existing memory.",
+            "- Do not copy held-out answers, article titles, exact source rows, exact "
+            "expected outputs, or verifier-private records.",
+            "",
+        ]
+    )
 
 
 def _render_skill_bundle_reflection_prompt(
@@ -2466,6 +2918,23 @@ def _guard_generic_reflector_output(
     )
 
 
+def _require_text_memory_expel_sections(markdown: str) -> None:
+    missing = [
+        section
+        for section in _TEXT_MEMORY_EXPEL_REQUIRED_SECTIONS
+        if not re.search(
+            rf"^##\s+{re.escape(section)}\s*#*\s*$",
+            markdown,
+            flags=re.MULTILINE,
+        )
+    ]
+    if missing:
+        raise ValueError(
+            "text_memory_expel_reflector missing required memory sections: "
+            + ", ".join(missing)
+        )
+
+
 _FORBIDDEN_LITERAL_KEYS = {
     "article_id",
     "article_ids",
@@ -3576,6 +4045,26 @@ def _find_base_model(job: WorkerClaimedJob) -> str | None:
         if isinstance(value, str) and value.strip():
             return value
     return None
+
+
+def _parametric_memory_compatibility(
+    job: WorkerClaimedJob,
+    base_model: str,
+) -> dict[str, Any]:
+    compatibility = _dict_config(job.config.get("compatibility"))
+    configured_base_model = compatibility.get("base_model")
+    if configured_base_model is None:
+        compatibility["base_model"] = [base_model]
+        return compatibility
+
+    compatible_base_models = _string_list(configured_base_model)
+    if base_model not in compatible_base_models:
+        raise ValueError(
+            "parametric_memory compatibility.base_model must include trained base_model "
+            f"{base_model!r}"
+        )
+    compatibility["base_model"] = compatible_base_models
+    return compatibility
 
 
 def _adapter_id(job: WorkerClaimedJob, adapter_uri: str) -> str:
