@@ -126,7 +126,7 @@ def build_vllm_command(
         if not adapter_id or adapter_path is None:
             raise ValueError("adapter_id and adapter_path must be provided together")
 
-    selected_gpus = list(gpus or DEFAULT_VLLM_GPUS)
+    selected_gpus = list(DEFAULT_VLLM_GPUS if gpus is None else gpus)
     if not selected_gpus:
         raise ValueError("at least one GPU must be selected")
     effective_tensor_parallel_size = (

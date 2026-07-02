@@ -128,6 +128,11 @@ def test_build_vllm_command_rejects_tensor_parallel_size_larger_than_gpus() -> N
         )
 
 
+def test_build_vllm_command_rejects_empty_gpu_list() -> None:
+    with pytest.raises(ValueError, match="at least one GPU"):
+        build_vllm_command(gpus=[])
+
+
 def test_local_parametric_dry_run_reports_matrix_and_disabled_artifacts(
     tmp_path: Path,
 ) -> None:
