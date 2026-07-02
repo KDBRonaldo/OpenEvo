@@ -1354,9 +1354,13 @@ def parametric_memory_lora_sft(
     output_dir = artifact_root / "workers" / job.job_id / "parametric_memory_lora_sft"
     output_dir.mkdir(parents=True, exist_ok=True)
     training_path = output_dir / "training.jsonl"
+    training_projection = _parametric_memory_training_projection(
+        job.config.get("training_projection")
+    )
     training_records = _write_parametric_memory_training_jsonl(
         dataset_artifacts,
         training_path,
+        training_projection=training_projection,
     )
     if not training_records:
         raise ValueError("parametric_memory_lora_sft found no successful training records")
@@ -1394,6 +1398,7 @@ def parametric_memory_lora_sft(
         "adapter_format": adapter_format,
         "training_dataset_path": training_path.relative_to(output_dir).as_posix(),
         "training_record_count": len(training_records),
+        "training_projection": training_projection,
         "trainer_command": command.strip(),
         "source_dataset_artifact_ids": dataset_ids,
         "prior_parametric_memory_artifact_ids": prior_adapter_ids,
@@ -1475,6 +1480,8 @@ def _read_dataset_records(manifest_path: Path, manifest: dict[str, Any]) -> list
 def _write_parametric_memory_training_jsonl(
     dataset_artifacts: list[WorkerClaimInputArtifact],
     output_path: Path,
+    *,
+    training_projection: dict[str, Any],
 ) -> list[dict[str, Any]]:
     training_records: list[dict[str, Any]] = []
     for dataset in dataset_artifacts:
@@ -1487,7 +1494,10 @@ def _write_parametric_memory_training_jsonl(
             reward = _record_reward(record)
             if _reflection_kind(record.get("status"), reward) != "success":
                 continue
-            for trace_index, messages in _sft_message_sets_from_record(record):
+            for trace_index, messages in _sft_message_sets_from_record(
+                record,
+                training_projection=training_projection,
+            ):
                 training_records.append(
                     {
                         "messages": messages,
@@ -1516,6 +1526,8 @@ def _write_parametric_memory_training_jsonl(
 
 def _sft_message_sets_from_record(
     record: dict[str, Any],
+    *,
+    training_projection: dict[str, Any],
 ) -> list[tuple[int, list[dict[str, str]]]]:
     traces = record.get("traces")
     if not isinstance(traces, list):
@@ -1529,9 +1541,61 @@ def _sft_message_sets_from_record(
             trace.get("response_messages"),
             default_role="assistant",
         )
+        response_messages = _project_sft_response_messages(
+            response_messages,
+            training_projection=training_projection,
+        )
         if prompt_messages and response_messages:
             message_sets.append((trace_index, [*prompt_messages, *response_messages]))
     return message_sets
+
+
+def _parametric_memory_training_projection(value: Any) -> dict[str, Any]:
+    if value is None:
+        return {"type": "full_trace"}
+    if not isinstance(value, dict):
+        raise ValueError("parametric_memory_lora_sft training_projection must be a dict")
+
+    projection_type = value.get("type") or "full_trace"
+    if projection_type == "full_trace":
+        return {"type": "full_trace"}
+    if projection_type == "response_tail":
+        response_tail_chars = value.get("response_tail_chars")
+        if response_tail_chars is None:
+            raise ValueError(
+                "parametric_memory_lora_sft response_tail projection requires "
+                "response_tail_chars"
+            )
+        response_tail_chars = int(response_tail_chars)
+        if response_tail_chars <= 0:
+            raise ValueError(
+                "parametric_memory_lora_sft response_tail_chars must be positive"
+            )
+        return {
+            "type": "response_tail",
+            "response_tail_chars": response_tail_chars,
+        }
+    raise ValueError(
+        "parametric_memory_lora_sft unsupported training_projection.type: "
+        f"{projection_type!r}"
+    )
+
+
+def _project_sft_response_messages(
+    response_messages: list[dict[str, str]],
+    *,
+    training_projection: dict[str, Any],
+) -> list[dict[str, str]]:
+    if training_projection.get("type") != "response_tail":
+        return response_messages
+
+    response_tail_chars = int(training_projection["response_tail_chars"])
+    projected: list[dict[str, str]] = []
+    for message in response_messages:
+        content = message["content"][-response_tail_chars:].strip()
+        if content:
+            projected.append({"role": message["role"], "content": content})
+    return projected
 
 
 def _sft_messages(value: Any, *, default_role: str) -> list[dict[str, str]]:

@@ -472,6 +472,11 @@ flowchart TB
 - `job.config.trainer.command`，必须是可执行文件名或路径；
 - `job.config.trainer.args`，必须包含 `{training_dataset}` 和 `{adapter_dir}` 占位符；
 - 可选 `job.config.trainer.timeout_seconds`，默认 600 秒，必须为正数；
+- 可选 `job.config.training_projection`，控制 successful trace 到 SFT JSONL 的投影。
+  默认 `{"type": "full_trace"}` 会保留完整 prompt/response messages；
+  `{"type": "response_tail", "response_tail_chars": N}` 会保留 prompt messages，并把
+  assistant response content 截为最后 `N` 个字符，适合长 Terminal Bench transcript 中
+  最终成功动作位于尾部的训练集；
 - 可选 `job.config.output_adapter_id`、`adapter_format`、`compatibility`、`scores`、
   `tags`、`promoted`；
 - 可选旧 `parametric_memory` input artifact，当前只记录在 manifest，后续 trainer 可以用
@@ -488,7 +493,7 @@ flowchart TB
   至少一个文件；
 - 对默认 `adapter_format=lora`，adapter 目录必须包含 `adapter_config.json`；
 - manifest 包含 `adapter_id`、`base_model`、`adapter_format`、training dataset path、
-  record count、source dataset IDs 和 prior parametric-memory IDs。
+  record count、`training_projection`、source dataset IDs 和 prior parametric-memory IDs。
 
 该 artifact 只适用于 proxy/local inference runtime。Subscription harness 直连外部模型
 服务，不能选择 OpenEvo 训练出的 adapter；上层 experiment config 和 Terminal Bench

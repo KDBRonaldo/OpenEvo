@@ -194,6 +194,10 @@ backend method is `parametric_memory_lora_sft`: it exports successful trajectory
 traces to `training.jsonl`, invokes an external trainer with
 `{training_dataset}` and `{adapter_dir}`, and registers a `parametric_memory`
 artifact only after the trainer writes a valid LoRA adapter directory.
+Long successful transcripts can be projected before SFT export with
+`job.config.training_projection`. The current built-in projection is
+`{"type": "response_tail", "response_tail_chars": N}`, which keeps the final
+assistant action window while preserving the original prompt messages.
 This is the path expected for OpenEvo deployments backed by a local inference
 server: the proxy can select a request-level LoRA adapter, while subscription
 mode cannot.
@@ -263,6 +267,8 @@ uv run polar-evolution terminal-bench-parametric-memory-job \
   --trainer-arg '{training_dataset}' \
   --trainer-arg --output-dir \
   --trainer-arg '{adapter_dir}' \
+  --training-projection response_tail \
+  --training-response-tail-chars 4096 \
   --run-worker \
   --output /tmp/tb21-parametric-memory/job.json
 ```
@@ -288,17 +294,24 @@ uv run polar-evolution terminal-bench-local-parametric-memory-eval \
   --manage-server \
   --n-attempts 5 \
   --max-output-tokens 4096 \
+  --tool-result-prompt-max-chars 2048 \
   --verifier-python-install-mirror http://172.17.0.8:8765/python-build-standalone \
   --output /tmp/tb21-parametric-memory/local-eval/summary.json
 ```
 
 The summary reports `baseline`, `parametric_memory`, `delta`, and the
-`max_output_tokens` cap used for both conditions. The default cap is `4096`;
-for smoke tests on slower local Qwen/vLLM servers, lower it explicitly, for
-example `--max-output-tokens 1536`, so long reasoning completions do not consume
-the entire GPU window. Many Terminal Bench verifiers run `uvx -p ...`, which can
-download managed Python even when wheel dependencies are local. When a local
-Python-build mirror is available, pass `--verifier-python-install-mirror`; the
-runner records the resulting verifier environment in the summary for
-reproducibility. Treat controlled-subset results as subset evidence until the
-same path is run over full Terminal Bench 2.1.
+`max_output_tokens` and `tool_result_prompt_max_chars` caps used for both
+conditions. The default output-token cap is `4096`; for smoke tests on slower
+local Qwen/vLLM servers, lower it explicitly, for example
+`--max-output-tokens 1536`, so long reasoning completions do not consume the
+entire GPU window. `--tool-result-prompt-max-chars` sets
+`EVOLAB_TB_TOOL_RESULT_PROMPT_MAX_CHARS` for the Harbor agent. It only affects
+runtime behavior when the installed Terminal Bench/EvoLab package honors that
+environment variable; otherwise the value is still recorded in the summary as a
+preflight signal that the package needs the matching support. Many Terminal
+Bench verifiers run `uvx -p ...`, which can download managed Python even when
+wheel dependencies are local. When a local Python-build mirror is available,
+pass `--verifier-python-install-mirror`; the runner records the resulting
+verifier environment in the summary for reproducibility. Treat controlled-subset
+results as subset evidence until the same path is run over full Terminal Bench
+2.1.

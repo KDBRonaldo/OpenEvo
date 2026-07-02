@@ -55,6 +55,7 @@ def test_build_evolab_harbor_env_sets_openai_chat_endpoint(
         base_env={"PATH": "/usr/bin"},
         server_url="http://127.0.0.1:8000/v1",
         model="tb-parametric-memory",
+        tool_result_prompt_max_chars=2048,
     )
 
     assert env["PATH"] == "/usr/bin"
@@ -65,6 +66,7 @@ def test_build_evolab_harbor_env_sets_openai_chat_endpoint(
     assert env["OPENAI_API_KEY"] == "dummy-local-key"
     assert env["EVOLAB_TB_MODE"] == "direct_solver"
     assert env["EVOLAB_TB_MAX_OUTPUT_TOKENS"] == "4096"
+    assert env["EVOLAB_TB_TOOL_RESULT_PROMPT_MAX_CHARS"] == "2048"
 
 
 def test_build_evolab_harbor_env_empty_base_does_not_inherit_host_env(
@@ -168,6 +170,7 @@ def test_local_parametric_dry_run_reports_matrix_and_disabled_artifacts(
         adapter_id="tb-parametric-memory",
         server_url="http://127.0.0.1:8000/v1",
         n_attempts=5,
+        tool_result_prompt_max_chars=2048,
         manage_server=True,
     )
 
@@ -182,6 +185,7 @@ def test_local_parametric_dry_run_reports_matrix_and_disabled_artifacts(
     ]
     assert payload["conditions"][0]["model"] == "Qwen/Qwen3.6-35B-A3B"
     assert payload["conditions"][1]["model"] == "tb-parametric-memory"
+    assert payload["tool_result_prompt_max_chars"] == 2048
 
 
 def test_run_local_parametric_memory_eval_compares_baseline_and_adapter(
@@ -242,6 +246,7 @@ def test_run_local_parametric_memory_eval_compares_baseline_and_adapter(
         server_url="http://127.0.0.1:8000/v1",
         n_attempts=2,
         max_output_tokens=1536,
+        tool_result_prompt_max_chars=2048,
         verifier_env={},
         command_runner=fake_command_runner,
         manage_server=False,
@@ -265,6 +270,7 @@ def test_run_local_parametric_memory_eval_compares_baseline_and_adapter(
     assert envs[1]["EVOLAB_TB_MODEL"] == "tb-parametric-memory"
     assert all(env["EVOLAB_TB_MODE"] == "direct_solver" for env in envs)
     assert all(env["EVOLAB_TB_MAX_OUTPUT_TOKENS"] == "1536" for env in envs)
+    assert all(env["EVOLAB_TB_TOOL_RESULT_PROMPT_MAX_CHARS"] == "2048" for env in envs)
 
 
 def test_run_local_parametric_memory_eval_scores_only_requested_attempts(
@@ -571,6 +577,8 @@ def test_terminal_bench_local_parametric_cli_dry_run_writes_output(
             "5",
             "--max-output-tokens",
             "1536",
+            "--tool-result-prompt-max-chars",
+            "2048",
             "--manage-server",
             "--dry-run",
             "--output",
@@ -588,6 +596,7 @@ def test_terminal_bench_local_parametric_cli_dry_run_writes_output(
         "parametric_memory",
     ]
     assert payload["max_output_tokens"] == 1536
+    assert payload["tool_result_prompt_max_chars"] == 2048
 
 
 def test_terminal_bench_local_parametric_cli_dry_run_records_verifier_env(
@@ -727,6 +736,10 @@ def test_terminal_bench_parametric_memory_job_creates_lora_sft_job(
             "--output-dir",
             "--trainer-arg",
             "{adapter_dir}",
+            "--training-projection",
+            "response_tail",
+            "--training-response-tail-chars",
+            "4096",
             "--output",
             str(output),
         ]
@@ -737,6 +750,10 @@ def test_terminal_bench_parametric_memory_job_creates_lora_sft_job(
     assert payload["job"]["method"] == "parametric_memory_lora_sft"
     assert payload["job"]["config"]["base_model"] == "Qwen/Qwen3.6-35B-A3B"
     assert payload["job"]["config"]["output_adapter_id"] == "tb-parametric-memory"
+    assert payload["job"]["config"]["training_projection"] == {
+        "type": "response_tail",
+        "response_tail_chars": 4096,
+    }
     assert payload["job"]["config"]["trainer"]["command"] == "python"
     assert "{training_dataset}" in payload["job"]["config"]["trainer"]["args"]
     assert "{adapter_dir}" in payload["job"]["config"]["trainer"]["args"]

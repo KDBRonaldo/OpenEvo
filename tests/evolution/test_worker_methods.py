@@ -3076,6 +3076,93 @@ def test_parametric_memory_lora_sft_exports_every_successful_trace(tmp_path: Pat
     assert artifact.compatibility == {"base_model": ["Qwen/Qwen3.6-35B-A3B"]}
 
 
+def test_parametric_memory_lora_sft_can_project_response_tail(tmp_path: Path):
+    trainer_script = tmp_path / "fake_trainer.py"
+    trainer_script.write_text(
+        "from pathlib import Path\n"
+        "import argparse\n"
+        "parser = argparse.ArgumentParser()\n"
+        "parser.add_argument('--train-file')\n"
+        "parser.add_argument('--output-dir')\n"
+        "args = parser.parse_args()\n"
+        "Path(args.output_dir).mkdir(parents=True, exist_ok=True)\n"
+        "(Path(args.output_dir) / 'adapter_config.json').write_text('{}')\n",
+        encoding="utf-8",
+    )
+    dataset = _parametric_dataset_artifact(
+        tmp_path,
+        [
+            {
+                "event_id": "evt_tail_projection",
+                "task_id": "task_tail_projection",
+                "session_id": "session_tail_projection",
+                "status": "COMPLETED",
+                "reward": 1.0,
+                "traces": [
+                    {
+                        "prompt_messages": [
+                            {"role": "user", "content": "Recover the password."}
+                        ],
+                        "response_messages": [
+                            {
+                                "role": "assistant",
+                                "content": (
+                                    "early exploration that overflowed context\n"
+                                    "cat /tmp/large-file\n"
+                                    "FINAL_WRITE recovered_passwords.txt"
+                                ),
+                            }
+                        ],
+                    }
+                ],
+            }
+        ],
+    )
+    job = _job(
+        "parametric_memory_lora_sft",
+        tmp_path,
+        input_artifacts=[dataset],
+        config={
+            "base_model": "Qwen/Qwen3.6-35B-A3B",
+            "training_projection": {
+                "type": "response_tail",
+                "response_tail_chars": 36,
+            },
+            "trainer": {
+                "command": "python",
+                "args": [
+                    str(trainer_script),
+                    "--train-file",
+                    "{training_dataset}",
+                    "--output-dir",
+                    "{adapter_dir}",
+                ],
+            },
+        },
+    )
+
+    [artifact] = run_method(job, artifact_root=tmp_path / "artifacts")
+
+    train_path = (
+        tmp_path
+        / "artifacts"
+        / "workers"
+        / job.job_id
+        / "parametric_memory_lora_sft"
+        / "training.jsonl"
+    )
+    [training_line] = [
+        json.loads(line) for line in train_path.read_text(encoding="utf-8").splitlines()
+    ]
+    response_message = training_line["messages"][-1]
+    assert response_message["content"] == "FINAL_WRITE recovered_passwords.txt"
+    assert "early exploration" not in json.dumps(training_line)
+    assert artifact.manifest["training_projection"] == {
+        "type": "response_tail",
+        "response_tail_chars": 36,
+    }
+
+
 def test_parametric_memory_lora_sft_requires_trainer_placeholders(tmp_path: Path):
     trainer_script = tmp_path / "fake_trainer.py"
     trainer_script.write_text("print('unused')\n", encoding="utf-8")

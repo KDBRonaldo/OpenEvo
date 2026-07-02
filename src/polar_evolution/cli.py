@@ -237,6 +237,17 @@ def build_parser() -> argparse.ArgumentParser:
     tb_parametric_job.add_argument("--trainer-command", required=True)
     tb_parametric_job.add_argument("--trainer-arg", action="append", default=[])
     tb_parametric_job.add_argument("--trainer-timeout-seconds", type=float, default=3600.0)
+    tb_parametric_job.add_argument(
+        "--training-projection",
+        choices=["full_trace", "response_tail"],
+        default="full_trace",
+        help="Projection applied when exporting successful traces to SFT JSONL.",
+    )
+    tb_parametric_job.add_argument(
+        "--training-response-tail-chars",
+        type=int,
+        help="Response tail size used with --training-projection response_tail.",
+    )
     tb_parametric_job.add_argument("--run-worker", action="store_true")
     tb_parametric_job.add_argument("--job-name")
     tb_parametric_job.add_argument("--priority", type=int, default=100)
@@ -370,6 +381,14 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=DEFAULT_LOCAL_PARAMETRIC_MAX_OUTPUT_TOKENS,
         help="Maximum output tokens per local Terminal Bench solver completion.",
+    )
+    tb_local_parametric.add_argument(
+        "--tool-result-prompt-max-chars",
+        type=int,
+        help=(
+            "Optional maximum tool-result characters that the Terminal Bench "
+            "EvoLab agent may add back into the model prompt."
+        ),
     )
     tb_local_parametric.add_argument("--manage-server", action="store_true")
     tb_local_parametric.add_argument("--server-timeout-seconds", type=float, default=600.0)
@@ -529,6 +548,7 @@ def main(argv: list[str] | None = None) -> int:
                 server_url=args.server_url,
                 n_attempts=args.n_attempts,
                 max_output_tokens=args.max_output_tokens,
+                tool_result_prompt_max_chars=args.tool_result_prompt_max_chars,
                 manage_server=args.manage_server,
                 verifier_env=verifier_env,
                 auth_mode=args.auth_mode,
@@ -547,6 +567,7 @@ def main(argv: list[str] | None = None) -> int:
             server_url=args.server_url,
             n_attempts=args.n_attempts,
             max_output_tokens=args.max_output_tokens,
+            tool_result_prompt_max_chars=args.tool_result_prompt_max_chars,
             verifier_env=verifier_env,
             manage_server=args.manage_server,
             server_timeout_seconds=args.server_timeout_seconds,
@@ -995,6 +1016,16 @@ def _create_terminal_bench_parametric_memory_job(args: argparse.Namespace) -> di
     }
     if args.max_records is not None:
         config["max_records"] = args.max_records
+    if args.training_projection == "response_tail":
+        if args.training_response_tail_chars is None:
+            raise ValueError(
+                "terminal-bench-parametric-memory-job requires "
+                "--training-response-tail-chars with response_tail projection"
+            )
+        config["training_projection"] = {
+            "type": "response_tail",
+            "response_tail_chars": args.training_response_tail_chars,
+        }
 
     job = store.create_job(
         JobCreateRequest(

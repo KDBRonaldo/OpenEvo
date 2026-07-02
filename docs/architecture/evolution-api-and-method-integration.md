@@ -511,6 +511,9 @@ settings 或 metadata 标记 subscription auth 时跳过 `parametric_memory` art
 - `job.config.trainer.command` 指向可执行 trainer；
 - `job.config.trainer.args` 必须包含 `{training_dataset}` 和 `{adapter_dir}` 占位符；
 - `job.config.trainer.timeout_seconds` 默认 600 秒；
+- `job.config.training_projection` 默认 `{"type": "full_trace"}`；也可以设为
+  `{"type": "response_tail", "response_tail_chars": N}`，在保留 prompt messages 的同时只把
+  assistant response 尾部导出到 SFT JSONL，用于避免长工具输出 transcript 掩盖最终成功动作；
 - trainer 执行前会清理旧 adapter 目录；
 - 默认 `adapter_format=lora` 时，adapter 目录必须包含 `adapter_config.json`。
 
