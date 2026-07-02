@@ -434,3 +434,49 @@ def test_managed_vllm_server_does_not_mask_body_exception_when_sigkill_group_is_
 
     assert local_parametric.signal.SIGTERM in calls["signals"]
     assert local_parametric.signal.SIGKILL in calls["signals"]
+
+
+def test_managed_vllm_server_does_not_mask_body_exception_when_sigkill_wait_times_out(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: dict[str, object] = {"signals": []}
+
+    class FakeProcess:
+        pid = 4242
+        returncode = None
+
+        def poll(self) -> None:
+            return None
+
+        def wait(self, timeout: float | None = None) -> int:
+            calls["signals"].append("wait")
+            raise local_parametric.subprocess.TimeoutExpired("vllm", timeout)
+
+    fake_process = FakeProcess()
+
+    def fake_popen(command, *, cwd, env, stdout, stderr, start_new_session):
+        return fake_process
+
+    def fake_killpg(pid: int, kill_signal: int) -> None:
+        calls["signals"].append(kill_signal)
+
+    monkeypatch.setattr(local_parametric.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(local_parametric, "wait_for_openai_server", lambda **kwargs: None)
+    monkeypatch.setattr(local_parametric.os, "killpg", fake_killpg)
+
+    spec = local_parametric.build_vllm_command()
+
+    with pytest.raises(RuntimeError, match="body failed"):
+        with local_parametric.managed_vllm_server(
+            spec=spec,
+            run_root=tmp_path,
+            server_url="http://127.0.0.1:8000/v1",
+            expected_model="Qwen/Qwen3.6-35B-A3B",
+            timeout_seconds=1.0,
+        ):
+            raise RuntimeError("body failed")
+
+    assert local_parametric.signal.SIGTERM in calls["signals"]
+    assert local_parametric.signal.SIGKILL in calls["signals"]
+    assert calls["signals"].count("wait") == 2

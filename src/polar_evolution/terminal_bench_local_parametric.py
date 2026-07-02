@@ -313,7 +313,10 @@ def _terminate_process_group(
     except ProcessLookupError:
         pass
 
-    process.wait(timeout=wait_timeout_seconds)
+    try:
+        process.wait(timeout=wait_timeout_seconds)
+    except subprocess.TimeoutExpired:
+        pass
 
 
 @contextmanager
