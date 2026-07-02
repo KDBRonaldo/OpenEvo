@@ -1953,33 +1953,44 @@ def _parametric_memory_corrective_projection_stage(
             "stage.repeat must be positive"
         )
     target_tool_call = value.get("target_tool_call")
-    if not isinstance(target_tool_call, dict):
+    target_assistant_message = value.get("target_assistant_message")
+    if isinstance(target_tool_call, dict) == isinstance(target_assistant_message, dict):
         raise ValueError(
             "parametric_memory_lora_sft terminal_bench_corrective_tool_call_policy "
-            "stage requires target_tool_call"
-        )
-    target_tool_name = target_tool_call.get("name")
-    target_tool_arguments = target_tool_call.get("arguments")
-    if not isinstance(target_tool_name, str) or not target_tool_name.strip():
-        raise ValueError(
-            "parametric_memory_lora_sft terminal_bench_corrective_tool_call_policy "
-            "stage.target_tool_call.name must be a non-empty string"
-        )
-    if not isinstance(target_tool_arguments, dict):
-        raise ValueError(
-            "parametric_memory_lora_sft terminal_bench_corrective_tool_call_policy "
-            "stage.target_tool_call.arguments must be a dict"
+            "stage requires exactly one of target_tool_call or "
+            "target_assistant_message"
         )
     projection = {
         "name": name.strip(),
         "input_contains": _string_list(value.get("input_contains")),
         "max_examples": max_examples,
         "repeat": repeat,
-        "target_tool_call": {
+    }
+    if isinstance(target_tool_call, dict):
+        target_tool_name = target_tool_call.get("name")
+        target_tool_arguments = target_tool_call.get("arguments")
+        if not isinstance(target_tool_name, str) or not target_tool_name.strip():
+            raise ValueError(
+                "parametric_memory_lora_sft terminal_bench_corrective_tool_call_policy "
+                "stage.target_tool_call.name must be a non-empty string"
+            )
+        if not isinstance(target_tool_arguments, dict):
+            raise ValueError(
+                "parametric_memory_lora_sft terminal_bench_corrective_tool_call_policy "
+                "stage.target_tool_call.arguments must be a dict"
+            )
+        projection["target_tool_call"] = {
             "name": target_tool_name.strip(),
             "arguments": target_tool_arguments,
-        },
-    }
+        }
+    else:
+        target_content = target_assistant_message.get("content")
+        if not isinstance(target_content, str) or not target_content.strip():
+            raise ValueError(
+                "parametric_memory_lora_sft terminal_bench_corrective_tool_call_policy "
+                "stage.target_assistant_message.content must be a non-empty string"
+            )
+        projection["target_assistant_message"] = {"content": target_content.strip()}
     max_input_tool_messages = value.get("max_input_tool_messages")
     if max_input_tool_messages is not None:
         max_input_tool_messages = int(max_input_tool_messages)
@@ -2162,7 +2173,8 @@ def _terminal_bench_corrective_tool_call_policy_message_sets(
     message_sets: list[tuple[int, list[dict[str, Any]], dict[str, Any]]] = []
     for stage_index, stage in enumerate(projection_stages):
         input_contains = stage.get("input_contains") or []
-        target_tool_call = stage["target_tool_call"]
+        target_tool_call = stage.get("target_tool_call")
+        target_assistant_message = stage.get("target_assistant_message")
         max_examples = int(stage["max_examples"])
         repeat = int(stage.get("repeat", 1))
         exported_examples = 0
@@ -2193,9 +2205,8 @@ def _terminal_bench_corrective_tool_call_policy_message_sets(
                         "polar-train-corrective-tool-call-"
                         f"{stage_index}-{exported_examples}-{repeat_index}"
                     )
-                messages = [
-                    *input_messages,
-                    {
+                if isinstance(target_tool_call, dict):
+                    target_message = {
                         "role": "assistant",
                         "content": "",
                         "tool_calls": [
@@ -2205,8 +2216,13 @@ def _terminal_bench_corrective_tool_call_policy_message_sets(
                                 call_id=call_id,
                             )
                         ],
-                    },
-                ]
+                    }
+                else:
+                    target_message = {
+                        "role": "assistant",
+                        "content": str(target_assistant_message["content"]),
+                    }
+                messages = [*input_messages, target_message]
                 exported_metadata = {
                     "source_llm_call_index": llm_call_index,
                     "source_step_index": source_metadata.get("step_index"),

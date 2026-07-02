@@ -528,10 +528,12 @@ settings 或 metadata 标记 subscription auth 时跳过 `parametric_memory` art
   records，并可用 `input_contains` 过滤 prefix；长 prefix 可用 `max_input_tool_messages`
   保留最近 N 条 tool result，以避免 LoRA trainer 在长上下文上 OOM。这一路径用于修正本地
   推理策略，不改变默认 successful-only SFT 导出；也可以设置 `stages` 列表，把多个
-  corrective next-tool-call 目标放在同一 projection 中。每个 stage 支持 `name`、
-  `target_tool_call`、`input_contains`、`max_examples`、`repeat` 和
-  `max_input_tool_messages`，worker 会按 stage 独立扫描 saved `llm_calls`，并给导出的
-  JSONL metadata 标记 stage 和 repeat index；`password-recovery` short-target 本地
+  corrective 目标放在同一 projection 中。每个 stage 支持 `name`、二选一的
+  `target_tool_call` 或 `target_assistant_message`、`input_contains`、`max_examples`、
+  `repeat` 和 `max_input_tool_messages`，worker 会按 stage 独立扫描 saved
+  `llm_calls`，并给导出的 JSONL metadata 标记 stage 和 repeat index。
+  `target_assistant_message` 会导出不带 `tool_calls` 的普通 assistant message，用于训练
+  `tb_collect_result` 之后的 finish/stop 行为；`password-recovery` short-target 本地
   smoke 可以使用
   `{"type": "terminal_bench_password_recovery_shorttarget_recipe", "target_command": "..."}`
   展开成同样的 staged corrective projection。该 recipe 只改变训练 JSONL 投影配置，

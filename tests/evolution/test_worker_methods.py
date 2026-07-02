@@ -3906,6 +3906,135 @@ def test_parametric_memory_lora_sft_corrective_projection_can_export_weighted_st
     assert artifact.manifest["training_projection"]["stages"][1]["repeat"] == 2
 
 
+def test_parametric_memory_lora_sft_corrective_projection_can_export_finish_message(
+    tmp_path: Path,
+):
+    trainer_script = tmp_path / "fake_trainer.py"
+    trainer_script.write_text(
+        "from pathlib import Path\n"
+        "import argparse\n"
+        "parser = argparse.ArgumentParser()\n"
+        "parser.add_argument('--train-file')\n"
+        "parser.add_argument('--output-dir')\n"
+        "args = parser.parse_args()\n"
+        "Path(args.output_dir).mkdir(parents=True, exist_ok=True)\n"
+        "(Path(args.output_dir) / 'adapter_config.json').write_text('{}')\n",
+        encoding="utf-8",
+    )
+    dataset = _parametric_dataset_artifact(
+        tmp_path,
+        [
+            {
+                "event_id": "evt_corrective_finish",
+                "task_id": "terminal-bench/password-recovery",
+                "session_id": "password-recovery__finish",
+                "status": "ERROR",
+                "reward": 1.0,
+                "traces": [
+                    {
+                        "metadata": {
+                            "llm_calls": [
+                                {
+                                    "input_messages": [
+                                        {
+                                            "role": "system",
+                                            "content": "Use Terminal Bench tools.",
+                                        },
+                                        {
+                                            "role": "user",
+                                            "content": "Recover launchcode.txt.",
+                                        },
+                                        {
+                                            "role": "tool",
+                                            "name": "tb_collect_result",
+                                            "tool_call_id": "call-collect",
+                                            "content": (
+                                                "collected result for "
+                                                "terminal-bench-task"
+                                            ),
+                                        },
+                                    ],
+                                    "metadata": {
+                                        "step_index": 7,
+                                        "tool_specs": [
+                                            {
+                                                "name": "tb_exec",
+                                                "description": "Run a command.",
+                                                "parameters_schema": {
+                                                    "type": "object",
+                                                    "properties": {
+                                                        "task_id": {"type": "string"},
+                                                        "command": {"type": "string"},
+                                                    },
+                                                    "required": ["task_id", "command"],
+                                                },
+                                            }
+                                        ],
+                                    },
+                                }
+                            ],
+                        },
+                    }
+                ],
+            }
+        ],
+    )
+    finish_content = "The recovered-password file has been written and collected."
+    job = _job(
+        "parametric_memory_lora_sft",
+        tmp_path,
+        input_artifacts=[dataset],
+        config={
+            "base_model": "Qwen/Qwen3.6-35B-A3B",
+            "training_projection": {
+                "type": "terminal_bench_corrective_tool_call_policy",
+                "stages": [
+                    {
+                        "name": "finish_after_collect",
+                        "input_contains": ["collected result for terminal-bench-task"],
+                        "max_examples": 1,
+                        "target_assistant_message": {
+                            "content": finish_content,
+                        },
+                    },
+                ],
+            },
+            "trainer": {
+                "command": "python",
+                "args": [
+                    str(trainer_script),
+                    "--train-file",
+                    "{training_dataset}",
+                    "--output-dir",
+                    "{adapter_dir}",
+                ],
+            },
+        },
+    )
+
+    [artifact] = run_method(job, artifact_root=tmp_path / "artifacts")
+
+    train_path = (
+        tmp_path
+        / "artifacts"
+        / "workers"
+        / job.job_id
+        / "parametric_memory_lora_sft"
+        / "training.jsonl"
+    )
+    [training_line] = [
+        json.loads(line) for line in train_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert training_line["metadata"]["projection_stage"] == "finish_after_collect"
+    assert training_line["messages"][-1] == {
+        "role": "assistant",
+        "content": finish_content,
+    }
+    assert artifact.manifest["training_projection"]["stages"][0][
+        "target_assistant_message"
+    ] == {"content": finish_content}
+
+
 def test_parametric_memory_lora_sft_password_recovery_recipe_exports_mixed_records(
     tmp_path: Path,
 ):

@@ -491,10 +491,12 @@ flowchart TB
   zero-reward records 进入训练；长 prefix 可用 `max_input_tool_messages` 只保留最近 N 条
   tool result，用于本地推理 adapter 的 corrective SFT；该 projection 也支持
   `{"type": "terminal_bench_corrective_tool_call_policy", "stages": [...]}`，每个 stage 可设置
-  `name`、`target_tool_call`、`input_contains`、`max_examples`、`repeat` 和
-  `max_input_tool_messages`。worker 会按 stage 独立扫描 `llm_calls`，并在 `repeat > 1`
-  时导出加权重复样本，JSONL metadata 会记录 `projection_stage`、
-  `projection_stage_index` 和 `projection_repeat_index`；也可以设为
+  `name`、二选一的 `target_tool_call` 或 `target_assistant_message`、
+  `input_contains`、`max_examples`、`repeat` 和 `max_input_tool_messages`。worker 会按
+  stage 独立扫描 `llm_calls`，并在 `repeat > 1` 时导出加权重复样本，JSONL metadata
+  会记录 `projection_stage`、`projection_stage_index` 和
+  `projection_repeat_index`。`target_assistant_message` 导出不带 `tool_calls` 的普通
+  assistant message，用于训练 `tb_collect_result` 后的 finish/stop 行为；也可以设为
   `{"type": "terminal_bench_password_recovery_shorttarget_recipe", "target_command": "..."}`
   让 worker 生成同样的 staged corrective projection。该 recipe 面向本地 Qwen
   `password-recovery` short-target smoke，默认用 `static-terminal-bench-harbor` 匹配

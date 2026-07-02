@@ -225,13 +225,16 @@ and only the most recent tool-result messages when the trainer cannot fit the
 full prefix.
 For stage-aware corrective SFT, set
 `{"type": "terminal_bench_corrective_tool_call_policy", "stages": [...]}`.
-Each stage has `name`, `target_tool_call`, optional `input_contains`,
-`max_examples` (default 64), `repeat` (default 1), and optional
-`max_input_tool_messages`. The exporter scans the saved `llm_calls` separately
-for each stage, emits repeated weighted samples when `repeat > 1`, and records
-`projection_stage`, `projection_stage_index`, and `projection_repeat_index` in
-each JSONL line's metadata. The CLI accepts repeated
-`--training-corrective-stage-json` objects for this form.
+Each stage has `name`, exactly one of `target_tool_call` or
+`target_assistant_message`, optional `input_contains`, `max_examples` (default
+64), `repeat` (default 1), and optional `max_input_tool_messages`. The exporter
+scans the saved `llm_calls` separately for each stage, emits repeated weighted
+samples when `repeat > 1`, and records `projection_stage`,
+`projection_stage_index`, and `projection_repeat_index` in each JSONL line's
+metadata. Use `target_assistant_message` to teach finish behavior after a
+terminal tool such as `tb_collect_result`; it emits a normal assistant message
+with no `tool_calls`. The CLI accepts repeated `--training-corrective-stage-json`
+objects for this form.
 For the `password-recovery` local Qwen smoke, the higher-level
 `terminal_bench_password_recovery_shorttarget_recipe` projection expands to
 the same staged corrective contract. It emits a `read_task` target from the
@@ -432,6 +435,23 @@ had baseline `0/1`, parametric memory `1/1`, and delta `+1.0` pass@1/pass@k.
 The treatment trial recorded verifier reward `1.0` but also an
 `AgentTimeoutError` after a later slow command, so this is positive smoke
 evidence for the adapter effect, not a polished policy behavior.
+
+Two later finish-behavior experiments added `target_assistant_message` stages
+to train a normal assistant response after `tb_collect_result`. The exporter
+worked as intended and the generated JSONL was leak-free, but the policy effect
+was negative in the current recipe. `/tmp/tb21-parametric-memory-finish-real-20260702-222144`
+trained 82 records, including 16 `finish_after_collect` and 24
+`collect_result_after_report` samples; eval produced baseline `0/1`,
+parametric memory `0/1`, and the treatment called `tb_collect_result` at step 0.
+`/tmp/tb21-parametric-memory-solvefinish-real-20260702-230201` restored the
+solve-heavy mix to 104 records (`read_task=24`, `short_exec_after_read=48`,
+`run_tests_after_count=20`, `correct_back_to_short_exec=4`,
+`finish_after_collect=8`) and included `ERROR` status trajectories so reward-1
+timeout runs were not filtered out. It still evaluated at baseline `0/1`,
+parametric memory `0/1`; the treatment did `tb_read_task`, then prematurely
+called `tb_collect_result`, then stopped after one `tb_exec`. Treat
+`target_assistant_message` as a framework mechanism for future stop/finish
+methods, not as the current best `password-recovery` recipe.
 
 Evaluate baseline local Qwen and adapter local Qwen against the same subset:
 
