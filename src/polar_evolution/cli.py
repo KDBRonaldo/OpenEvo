@@ -244,9 +244,10 @@ def build_parser() -> argparse.ArgumentParser:
             "response_tail",
             "terminal_bench_final_actions",
             "terminal_bench_tool_call_policy",
+            "terminal_bench_corrective_tool_call_policy",
         ],
         default="full_trace",
-        help="Projection applied when exporting successful traces to SFT JSONL.",
+        help="Projection applied when exporting traces to SFT JSONL.",
     )
     tb_parametric_job.add_argument(
         "--training-response-tail-chars",
@@ -304,6 +305,45 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Derive a direct tb_exec write command from password-recovery successful "
             "transcripts when using terminal_bench_tool_call_policy."
+        ),
+    )
+    tb_parametric_job.add_argument(
+        "--training-corrective-input-contains",
+        action="append",
+        default=[],
+        help=(
+            "Substring that must appear in a compact real LLM-call prefix exported "
+            "with terminal_bench_corrective_tool_call_policy. Can be repeated."
+        ),
+    )
+    tb_parametric_job.add_argument(
+        "--training-corrective-max-examples",
+        type=int,
+        default=64,
+        help=(
+            "Maximum real LLM-call prefixes to export per trace with "
+            "terminal_bench_corrective_tool_call_policy."
+        ),
+    )
+    tb_parametric_job.add_argument(
+        "--training-corrective-max-input-tool-messages",
+        type=int,
+        help=(
+            "Keep only the last N tool-result input messages in each real prefix "
+            "exported with terminal_bench_corrective_tool_call_policy."
+        ),
+    )
+    tb_parametric_job.add_argument(
+        "--training-corrective-target-command",
+        help=(
+            "Target tb_exec command for terminal_bench_corrective_tool_call_policy."
+        ),
+    )
+    tb_parametric_job.add_argument(
+        "--training-corrective-target-task-id",
+        default="terminal-bench-task",
+        help=(
+            "Target task_id argument for terminal_bench_corrective_tool_call_policy."
         ),
     )
     tb_parametric_job.add_argument("--run-worker", action="store_true")
@@ -1010,6 +1050,10 @@ def _create_terminal_bench_parametric_memory_job(args: argparse.Namespace) -> di
                 input_path,
                 max_transcript_chars=args.max_transcript_chars,
                 max_verifier_stdout_chars=args.max_verifier_stdout_chars,
+                include_llm_calls=(
+                    args.training_projection
+                    == "terminal_bench_corrective_tool_call_policy"
+                ),
                 policy_version=args.policy_version,
                 rollout_step=args.rollout_step,
             )
@@ -1102,6 +1146,29 @@ def _create_terminal_bench_parametric_memory_job(args: argparse.Namespace) -> di
                 args.training_tool_call_derive_password_recovery_command
             ),
         }
+    if args.training_projection == "terminal_bench_corrective_tool_call_policy":
+        if not args.training_corrective_target_command:
+            raise ValueError(
+                "terminal-bench-parametric-memory-job requires "
+                "--training-corrective-target-command with "
+                "terminal_bench_corrective_tool_call_policy"
+            )
+        config["training_projection"] = {
+            "type": "terminal_bench_corrective_tool_call_policy",
+            "input_contains": list(args.training_corrective_input_contains),
+            "max_examples": args.training_corrective_max_examples,
+            "target_tool_call": {
+                "name": "tb_exec",
+                "arguments": {
+                    "task_id": args.training_corrective_target_task_id,
+                    "command": args.training_corrective_target_command,
+                },
+            },
+        }
+        if args.training_corrective_max_input_tool_messages is not None:
+            config["training_projection"]["max_input_tool_messages"] = (
+                args.training_corrective_max_input_tool_messages
+            )
 
     job = store.create_job(
         JobCreateRequest(

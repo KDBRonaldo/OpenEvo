@@ -485,6 +485,11 @@ flowchart TB
   `assistant.tool_calls`、`tool` response messages 和 top-level `tools` 的 Qwen SFT records，
   让本地 vLLM/Qwen parametric-memory adapter 学习真实 `tb_read_task`/`tb_exec` 工具调用形态。
   使用该 projection 的 trainer 必须把 record-level `tools` 传给 tokenizer chat template；
+  `{"type": "terminal_bench_corrective_tool_call_policy", "target_tool_call": {...}}`
+  会从 trace metadata 中 opt-in 保存的 compact `llm_calls` 导出真实失败 prefix 的监督
+  next tool-call。它可使用 `input_contains` 选择特定工具输出后的 prefix，并允许 failed 或
+  zero-reward records 进入训练；长 prefix 可用 `max_input_tool_messages` 只保留最近 N 条
+  tool result，用于本地推理 adapter 的 corrective SFT；
 - 可选 `job.config.output_adapter_id`、`adapter_format`、`compatibility`、`scores`、
   `tags`、`promoted`；
 - 可选旧 `parametric_memory` input artifact，当前只记录在 manifest，后续 trainer 可以用
@@ -493,8 +498,9 @@ flowchart TB
 输出：
 
 - worker output 目录下的 `training.jsonl`，每行形如
-  `{"messages": [...], "metadata": {...}}`，只包含成功轨迹；同一个 successful record 中
-  多个可训练 trace 会分别导出为多行；
+  `{"messages": [...], "metadata": {...}}`。默认 projection 只包含成功轨迹；同一个
+  successful record 中多个可训练 trace 会分别导出为多行。`terminal_bench_corrective_tool_call_policy`
+  是例外，它可以从 failed/zero-reward records 导出真实 prefix 的纠偏样本；
 - `trainer.stdout.txt` 和 `trainer.stderr.txt`，用于排障；
 - `ArtifactRegisterRequest(type=parametric_memory)`；
 - `uri=file://.../adapter`，该目录会在 trainer 执行前清理旧内容，并且 trainer 必须写出

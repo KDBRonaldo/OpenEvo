@@ -1407,7 +1407,7 @@ def parametric_memory_lora_sft(
         training_projection=training_projection,
     )
     if not training_records:
-        raise ValueError("parametric_memory_lora_sft found no successful training records")
+        raise ValueError("parametric_memory_lora_sft found no training records")
 
     adapter_id = str(
         job.config.get("output_adapter_id") or _slug(str(job.config.get("name") or job.job_id))
@@ -1536,7 +1536,11 @@ def _write_parametric_memory_training_jsonl(
         records = _read_dataset_records(manifest_path, manifest)
         for record in records:
             reward = _record_reward(record)
-            if _reflection_kind(record.get("status"), reward) != "success":
+            if not _parametric_memory_record_is_training_source(
+                record,
+                reward,
+                training_projection=training_projection,
+            ):
                 continue
             for trace_index, messages, extra_fields in _sft_message_sets_from_record(
                 record,
@@ -1555,6 +1559,9 @@ def _write_parametric_memory_training_jsonl(
                         "status": record.get("status"),
                     },
                 }
+                extra_metadata = extra_fields.pop("metadata", None)
+                if isinstance(extra_metadata, dict):
+                    training_record["metadata"].update(extra_metadata)
                 training_record.update(extra_fields)
                 training_records.append(training_record)
 
@@ -1566,6 +1573,17 @@ def _write_parametric_memory_training_jsonl(
         encoding="utf-8",
     )
     return training_records
+
+
+def _parametric_memory_record_is_training_source(
+    record: dict[str, Any],
+    reward: float | None,
+    *,
+    training_projection: dict[str, Any],
+) -> bool:
+    if training_projection.get("type") == "terminal_bench_corrective_tool_call_policy":
+        return True
+    return _reflection_kind(record.get("status"), reward) == "success"
 
 
 def _sft_message_sets_from_record(
@@ -1585,6 +1603,15 @@ def _sft_message_sets_from_record(
             trace.get("response_messages"),
             default_role="assistant",
         )
+        if training_projection.get("type") == "terminal_bench_corrective_tool_call_policy":
+            message_sets.extend(
+                _terminal_bench_corrective_tool_call_policy_message_sets(
+                    trace_index,
+                    trace=trace,
+                    training_projection=training_projection,
+                )
+            )
+            continue
         if training_projection.get("type") == "terminal_bench_tool_call_policy":
             message_sets.extend(
                 _terminal_bench_tool_call_policy_message_sets(
@@ -1665,6 +1692,51 @@ def _parametric_memory_training_projection(value: Any) -> dict[str, Any]:
                 value.get("exclude_command_contains")
             ),
         }
+    if projection_type == "terminal_bench_corrective_tool_call_policy":
+        max_examples = int(value.get("max_examples", 64))
+        if max_examples <= 0:
+            raise ValueError(
+                "parametric_memory_lora_sft terminal_bench_corrective_tool_call_policy "
+                "max_examples must be positive"
+            )
+        target_tool_call = value.get("target_tool_call")
+        if not isinstance(target_tool_call, dict):
+            raise ValueError(
+                "parametric_memory_lora_sft terminal_bench_corrective_tool_call_policy "
+                "requires target_tool_call"
+            )
+        target_tool_name = target_tool_call.get("name")
+        target_tool_arguments = target_tool_call.get("arguments")
+        if not isinstance(target_tool_name, str) or not target_tool_name.strip():
+            raise ValueError(
+                "parametric_memory_lora_sft terminal_bench_corrective_tool_call_policy "
+                "target_tool_call.name must be a non-empty string"
+            )
+        if not isinstance(target_tool_arguments, dict):
+            raise ValueError(
+                "parametric_memory_lora_sft terminal_bench_corrective_tool_call_policy "
+                "target_tool_call.arguments must be a dict"
+            )
+        projection = {
+            "type": "terminal_bench_corrective_tool_call_policy",
+            "input_contains": _string_list(value.get("input_contains")),
+            "max_examples": max_examples,
+            "target_tool_call": {
+                "name": target_tool_name.strip(),
+                "arguments": target_tool_arguments,
+            },
+        }
+        max_input_tool_messages = value.get("max_input_tool_messages")
+        if max_input_tool_messages is not None:
+            max_input_tool_messages = int(max_input_tool_messages)
+            if max_input_tool_messages <= 0:
+                raise ValueError(
+                    "parametric_memory_lora_sft "
+                    "terminal_bench_corrective_tool_call_policy "
+                    "max_input_tool_messages must be positive"
+                )
+            projection["max_input_tool_messages"] = max_input_tool_messages
+        return projection
     raise ValueError(
         "parametric_memory_lora_sft unsupported training_projection.type: "
         f"{projection_type!r}"
@@ -1814,6 +1886,135 @@ def _terminal_bench_tool_call_policy_commands(
         if command and command not in commands:
             commands.append(command)
     return commands
+
+
+def _terminal_bench_corrective_tool_call_policy_message_sets(
+    trace_index: int,
+    *,
+    trace: dict[str, Any],
+    training_projection: dict[str, Any],
+) -> list[tuple[int, list[dict[str, Any]], dict[str, Any]]]:
+    metadata = trace.get("metadata")
+    if not isinstance(metadata, dict):
+        return []
+    llm_calls = metadata.get("llm_calls")
+    if not isinstance(llm_calls, list):
+        return []
+
+    input_contains = training_projection.get("input_contains") or []
+    target_tool_call = training_projection["target_tool_call"]
+    max_examples = int(training_projection["max_examples"])
+    message_sets: list[tuple[int, list[dict[str, Any]], dict[str, Any]]] = []
+    for llm_call_index, llm_call in enumerate(llm_calls):
+        if len(message_sets) >= max_examples:
+            break
+        if not isinstance(llm_call, dict):
+            continue
+        input_messages = _terminal_bench_corrective_input_messages(
+            llm_call.get("input_messages"),
+            max_tool_messages=training_projection.get("max_input_tool_messages"),
+        )
+        if not input_messages:
+            continue
+        haystack = json.dumps(input_messages, ensure_ascii=False, sort_keys=True)
+        if input_contains and not all(needle in haystack for needle in input_contains):
+            continue
+        source_metadata = llm_call.get("metadata")
+        if not isinstance(source_metadata, dict):
+            source_metadata = {}
+        messages = [
+            *input_messages,
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    _terminal_bench_tool_call(
+                        str(target_tool_call["name"]),
+                        dict(target_tool_call["arguments"]),
+                        call_id="polar-train-corrective-tool-call",
+                    )
+                ],
+            },
+        ]
+        message_sets.append(
+            (
+                trace_index,
+                messages,
+                {
+                    "tools": _terminal_bench_openai_tools_from_specs(
+                        source_metadata.get("tool_specs")
+                    ),
+                    "metadata": {
+                        "source_llm_call_index": llm_call_index,
+                        "source_step_index": source_metadata.get("step_index"),
+                    },
+                },
+            )
+        )
+    return message_sets
+
+
+def _terminal_bench_corrective_input_messages(
+    value: Any,
+    *,
+    max_tool_messages: Any = None,
+) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    messages: list[dict[str, Any]] = []
+    for message in value:
+        if not isinstance(message, dict):
+            continue
+        role = message.get("role")
+        if not isinstance(role, str) or not role.strip():
+            continue
+        content = message.get("content")
+        if content is None:
+            content = ""
+        compact: dict[str, Any] = {
+            "role": role.strip(),
+            "content": str(content),
+        }
+        name = message.get("name")
+        if isinstance(name, str) and name.strip():
+            compact["name"] = name.strip()
+        tool_call_id = message.get("tool_call_id")
+        if isinstance(tool_call_id, str) and tool_call_id.strip():
+            compact["tool_call_id"] = tool_call_id.strip()
+        messages.append(compact)
+    if max_tool_messages is None:
+        return messages
+    max_tool_messages = int(max_tool_messages)
+    tool_indexes = [
+        index for index, message in enumerate(messages) if message.get("role") == "tool"
+    ]
+    keep_tool_indexes = set(tool_indexes[-max_tool_messages:])
+    return [
+        message
+        for index, message in enumerate(messages)
+        if message.get("role") != "tool" or index in keep_tool_indexes
+    ]
+
+
+def _terminal_bench_openai_tools_from_specs(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    tools: list[dict[str, Any]] = []
+    for spec in value:
+        if not isinstance(spec, dict):
+            continue
+        name = spec.get("name")
+        if not isinstance(name, str) or not name.strip():
+            continue
+        function: dict[str, Any] = {"name": name.strip()}
+        description = spec.get("description")
+        if isinstance(description, str):
+            function["description"] = description
+        parameters = spec.get("parameters_schema")
+        if isinstance(parameters, dict):
+            function["parameters"] = parameters
+        tools.append({"type": "function", "function": function})
+    return tools
 
 
 def _derive_password_recovery_command(prompt_text: str, response_text: str) -> str | None:

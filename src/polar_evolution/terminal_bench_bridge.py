@@ -12,6 +12,8 @@ from polar_evolution.models import EventIngestRequest
 DEFAULT_MAX_TRANSCRIPT_CHARS = 60000
 DEFAULT_MAX_VERIFIER_STDOUT_CHARS = 12000
 DEFAULT_MAX_FAILED_TESTS = 20
+DEFAULT_MAX_LLM_CALLS = 64
+DEFAULT_MAX_LLM_CALL_MESSAGE_CHARS = 4096
 
 
 class TerminalBenchBridgeError(ValueError):
@@ -24,6 +26,9 @@ def build_terminal_bench_events(
     max_transcript_chars: int = DEFAULT_MAX_TRANSCRIPT_CHARS,
     max_verifier_stdout_chars: int = DEFAULT_MAX_VERIFIER_STDOUT_CHARS,
     max_failed_tests: int = DEFAULT_MAX_FAILED_TESTS,
+    include_llm_calls: bool = False,
+    max_llm_calls: int = DEFAULT_MAX_LLM_CALLS,
+    max_llm_call_message_chars: int = DEFAULT_MAX_LLM_CALL_MESSAGE_CHARS,
     policy_version: str | None = None,
     rollout_step: int | None = None,
 ) -> list[EventIngestRequest]:
@@ -41,6 +46,9 @@ def build_terminal_bench_events(
             max_transcript_chars=max_transcript_chars,
             max_verifier_stdout_chars=max_verifier_stdout_chars,
             max_failed_tests=max_failed_tests,
+            include_llm_calls=include_llm_calls,
+            max_llm_calls=max_llm_calls,
+            max_llm_call_message_chars=max_llm_call_message_chars,
             policy_version=policy_version,
             rollout_step=rollout_step,
         )
@@ -54,6 +62,9 @@ def _build_trial_event(
     max_transcript_chars: int,
     max_verifier_stdout_chars: int,
     max_failed_tests: int,
+    include_llm_calls: bool,
+    max_llm_calls: int,
+    max_llm_call_message_chars: int,
     policy_version: str | None,
     rollout_step: int | None,
 ) -> EventIngestRequest:
@@ -67,10 +78,22 @@ def _build_trial_event(
     reward = _extract_reward(result, trial_dir)
     status = _infer_status(result)
     instruction = _read_text_if_exists(trial_dir / "agent" / "instruction.txt").strip()
-    transcript = _extract_transcript(
-        trial_dir,
-        max_transcript_chars=max_transcript_chars,
-    )
+    llm_calls: list[dict[str, Any]] = []
+    if include_llm_calls:
+        llm_calls = _extract_compact_llm_calls(
+            trial_dir,
+            max_calls=max_llm_calls,
+            max_message_chars=max_llm_call_message_chars,
+        )
+    try:
+        transcript = _extract_transcript(
+            trial_dir,
+            max_transcript_chars=max_transcript_chars,
+        )
+    except TerminalBenchBridgeError:
+        if not llm_calls:
+            raise
+        transcript = {"text": "", "sources": []}
     verifier = _extract_verifier_feedback(
         trial_dir,
         result,
@@ -89,6 +112,8 @@ def _build_trial_event(
         trace_metadata["stderr"] = _truncate_text(stderr_text, max_verifier_stdout_chars)
     if result.get("exception_info") is not None:
         trace_metadata["exception_info"] = result.get("exception_info")
+    if llm_calls:
+        trace_metadata["llm_calls"] = llm_calls
 
     trajectory = {
         "status": status,
@@ -107,9 +132,11 @@ def _build_trial_event(
                 "prompt_messages": (
                     [{"role": "user", "content": instruction}] if instruction else []
                 ),
-                "response_messages": [
-                    {"role": "assistant", "content": transcript["text"]},
-                ],
+                "response_messages": (
+                    [{"role": "assistant", "content": transcript["text"]}]
+                    if transcript["text"]
+                    else []
+                ),
                 "finish_reason": "transcript",
                 "response_logprobs": None,
                 "reward": reward,
@@ -204,6 +231,118 @@ def _extract_transcript(trial_dir: Path, *, max_transcript_chars: int) -> dict[s
                 "sources": [_relative_to_trial(candidate, trial_dir)],
             }
     raise TerminalBenchBridgeError(f"no transcript text found in {trial_dir}")
+
+
+def _extract_compact_llm_calls(
+    trial_dir: Path,
+    *,
+    max_calls: int,
+    max_message_chars: int,
+) -> list[dict[str, Any]]:
+    if max_calls <= 0 or max_message_chars <= 0:
+        return []
+    calls_path = (
+        trial_dir
+        / "agent"
+        / "evolab_lab"
+        / ".evolab"
+        / "registries"
+        / "trajectory"
+        / "llm_calls.jsonl"
+    )
+    if not calls_path.is_file():
+        return []
+
+    compact_calls: list[dict[str, Any]] = []
+    for line in calls_path.read_text(encoding="utf-8", errors="replace").splitlines():
+        if len(compact_calls) >= max_calls:
+            break
+        if not line.strip():
+            continue
+        try:
+            raw_call = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(raw_call, dict):
+            continue
+
+        input_messages = _compact_llm_messages(
+            raw_call.get("input_messages"),
+            max_message_chars=max_message_chars,
+        )
+        if not input_messages:
+            continue
+        compact_call: dict[str, Any] = {"input_messages": input_messages}
+        model = _text_or_none(raw_call.get("model"))
+        if model:
+            compact_call["model"] = model
+        metadata = _compact_llm_call_metadata(raw_call.get("metadata"))
+        if metadata:
+            compact_call["metadata"] = metadata
+        compact_calls.append(compact_call)
+    return compact_calls
+
+
+def _compact_llm_messages(value: Any, *, max_message_chars: int) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    messages: list[dict[str, Any]] = []
+    for message in value:
+        if not isinstance(message, dict):
+            continue
+        role = _text_or_none(message.get("role"))
+        if not role:
+            continue
+        content = message.get("content")
+        if content is None:
+            content = ""
+        compact: dict[str, Any] = {
+            "role": role,
+            "content": _truncate_text(str(content), max_message_chars),
+        }
+        name = _text_or_none(message.get("name"))
+        if name:
+            compact["name"] = name
+        tool_call_id = _text_or_none(message.get("tool_call_id"))
+        if tool_call_id:
+            compact["tool_call_id"] = tool_call_id
+        messages.append(compact)
+    return messages
+
+
+def _compact_llm_call_metadata(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    metadata: dict[str, Any] = {}
+    for key in ("step_index", "runtime_stage", "role", "task_id"):
+        item = value.get(key)
+        if item is not None:
+            metadata[key] = item
+    tool_specs = _compact_tool_specs(value.get("tool_specs"))
+    if tool_specs:
+        metadata["tool_specs"] = tool_specs
+    return metadata
+
+
+def _compact_tool_specs(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    specs: list[dict[str, Any]] = []
+    for spec in value:
+        if not isinstance(spec, dict):
+            continue
+        name = _text_or_none(spec.get("name"))
+        if not name:
+            continue
+        compact: dict[str, Any] = {"name": name}
+        description = _text_or_none(spec.get("description"))
+        if description:
+            compact["description"] = description
+        parameters_schema = spec.get("parameters_schema")
+        if isinstance(parameters_schema, dict):
+            compact["parameters_schema"] = parameters_schema
+        specs.append(compact)
+    return specs
 
 
 def _extract_reward(result: dict[str, Any], trial_dir: Path) -> float | None:

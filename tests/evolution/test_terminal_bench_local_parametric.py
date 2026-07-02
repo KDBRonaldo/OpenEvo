@@ -910,6 +910,124 @@ def test_terminal_bench_parametric_memory_job_accepts_tool_call_policy_projectio
     }
 
 
+def test_terminal_bench_parametric_memory_job_accepts_corrective_tool_call_policy_projection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output = tmp_path / "job.json"
+    input_trial = tmp_path / "trial"
+    (input_trial / "agent").mkdir(parents=True)
+    (input_trial / "verifier").mkdir()
+    trajectory_dir = input_trial / "agent" / "evolab_lab" / ".evolab" / "registries" / "trajectory"
+    trajectory_dir.mkdir(parents=True)
+    (trajectory_dir / "llm_calls.jsonl").write_text(
+        json.dumps(
+            {
+                "model": "Qwen/Qwen3.6-35B-A3B",
+                "input_messages": [
+                    {"role": "system", "content": "Use tb_read_task first."},
+                    {"role": "tool", "content": '{"stdout": "PASSWORD=8XDP..."}'},
+                ],
+                "metadata": {
+                    "step_index": 12,
+                    "tool_specs": [
+                        {
+                            "name": "tb_exec",
+                            "description": "Run a command.",
+                            "parameters_schema": {
+                                "type": "object",
+                                "properties": {"command": {"type": "string"}},
+                                "required": ["command"],
+                            },
+                        }
+                    ],
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (input_trial / "result.json").write_text(
+        json.dumps(
+            {
+                "trial_name": "password-recovery__failed",
+                "task_name": "password-recovery",
+                "status": "COMPLETED",
+                "verifier_result": {"rewards": {"reward": 0.0}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (input_trial / "agent" / "stdout.txt").write_text("budget exceeded\n", encoding="utf-8")
+    (input_trial / "verifier" / "reward.txt").write_text("0.0\n", encoding="utf-8")
+
+    exit_code = main(
+        [
+            "terminal-bench-parametric-memory-job",
+            "--input",
+            str(input_trial),
+            "--status",
+            "COMPLETED",
+            "--db",
+            str(tmp_path / "evolution.db"),
+            "--artifact-root",
+            str(tmp_path / "artifacts"),
+            "--dataset-name",
+            "tb21-parametric-password-recovery-corrective",
+            "--policy-version",
+            "tb21-qwen-local-password-recovery-corrective",
+            "--base-model",
+            "Qwen/Qwen3.6-35B-A3B",
+            "--adapter-id",
+            "tb-parametric-memory",
+            "--trainer-command",
+            "python",
+            "--trainer-arg",
+            "/opt/train_lora.py",
+            "--trainer-arg",
+            "--train-file",
+            "--trainer-arg",
+            "{training_dataset}",
+            "--trainer-arg",
+            "--output-dir",
+            "--trainer-arg",
+            "{adapter_dir}",
+            "--training-projection",
+            "terminal_bench_corrective_tool_call_policy",
+            "--training-corrective-input-contains",
+            "PASSWORD=.*",
+            "--training-corrective-max-examples",
+            "3",
+            "--training-corrective-max-input-tool-messages",
+            "4",
+            "--training-corrective-target-command",
+            "printf '%s\\n' 8XDP5Q2RT9ZK7VB3BV4WW54 > /app/recovered_passwords.txt",
+            "--output",
+            str(output),
+        ]
+    )
+
+    assert exit_code == 0
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert payload["dataset"]["event_count"] == 1
+    assert payload["job"]["config"]["training_projection"] == {
+        "type": "terminal_bench_corrective_tool_call_policy",
+        "input_contains": ["PASSWORD=.*"],
+        "max_examples": 3,
+        "max_input_tool_messages": 4,
+        "target_tool_call": {
+            "name": "tb_exec",
+            "arguments": {
+                "task_id": "terminal-bench-task",
+                "command": (
+                    "printf '%s\\n' 8XDP5Q2RT9ZK7VB3BV4WW54 "
+                    "> /app/recovered_passwords.txt"
+                ),
+            },
+        },
+    }
+
+
 def test_terminal_bench_parametric_memory_job_can_run_local_worker_once(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

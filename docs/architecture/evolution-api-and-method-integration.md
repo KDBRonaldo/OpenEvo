@@ -521,6 +521,13 @@ settings 或 metadata 标记 subscription auth 时跳过 `parametric_memory` art
   `{"type": "terminal_bench_tool_call_policy", "max_commands": N}`，导出带
   `assistant.tool_calls` 和 top-level `tools` 的 SFT records，使 Qwen chat template 渲染出
   vLLM `qwen3_xml` parser 期望的 `<tool_call>` XML；
+  对 local failed rollout 的纠偏训练可以设为
+  `{"type": "terminal_bench_corrective_tool_call_policy", "target_tool_call": {...}}`。
+  该 projection 使用 opt-in 保存到 trace metadata 的 compact `llm_calls`，从真实
+  `system/user/tool...` prefix 导出监督 next tool-call。它可以消费 failed/zero-reward
+  records，并可用 `input_contains` 过滤 prefix；长 prefix 可用 `max_input_tool_messages`
+  保留最近 N 条 tool result，以避免 LoRA trainer 在长上下文上 OOM。这一路径用于修正本地
+  推理策略，不改变默认 successful-only SFT 导出；
 - trainer 执行前会清理旧 adapter 目录；
 - 默认 `adapter_format=lora` 时，adapter 目录必须包含 `adapter_config.json`。
 

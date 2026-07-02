@@ -210,6 +210,19 @@ so SFT can train the same `<tool_call>` XML shape that vLLM's `qwen3_xml`
 parser expects. The trainer must pass each record's `tools` value into
 `tokenizer.apply_chat_template`; otherwise the SFT prompt will not match the
 runtime tool prompt.
+If this does not affect the live policy, use
+`{"type": "terminal_bench_corrective_tool_call_policy", ...}`. This opt-in path
+stores compact real `llm_calls.jsonl` prefixes in the dataset and exports a
+supervised next-tool-call from those exact prefixes. It can train from failed or
+zero-reward records, because the point is to correct a known bad local rollout
+state rather than imitate only successful transcripts. The projection requires a
+`target_tool_call` and can filter prefixes with `input_contains`; exported
+records again include top-level `tools` and require trainer-side
+`apply_chat_template(..., tools=record["tools"])` support. Real failed prefixes
+can exceed 13k tokens, so use `max_input_tool_messages` or the CLI
+`--training-corrective-max-input-tool-messages` to keep the system/user prompt
+and only the most recent tool-result messages when the trainer cannot fit the
+full prefix.
 This is the path expected for OpenEvo deployments backed by a local inference
 server: the proxy can select a request-level LoRA adapter, while subscription
 mode cannot.
@@ -285,6 +298,34 @@ uv run polar-evolution terminal-bench-parametric-memory-job \
   --training-tool-call-derive-password-recovery-command \
   --run-worker \
   --output /tmp/tb21-parametric-memory/job.json
+```
+
+To train a corrective adapter from a failed local trajectory prefix, point the
+job at the failed Harbor trial, choose the corrective projection, and provide
+the target `tb_exec` command to learn from that exact prefix:
+
+```sh
+uv run polar-evolution terminal-bench-parametric-memory-job \
+  --input /tmp/tb21-parametric-memory-password-toolpolicy-20260702-110343/local-eval-password-toolpolicy-2048/baseline/harbor_jobs/baseline-password-recovery/password-recovery__AzMbthq \
+  --db /tmp/tb21-parametric-memory-corrective/evolution.db \
+  --artifact-root /tmp/tb21-parametric-memory-corrective/artifacts \
+  --dataset-name tb21-parametric-memory-password-corrective \
+  --policy-version tb21-qwen36-local-password-corrective \
+  --status COMPLETED \
+  --base-model Qwen/Qwen3.6-35B-A3B \
+  --adapter-id tb-parametric-memory-password-corrective \
+  --trainer-command /root/evolab-vllm/bin/python \
+  --trainer-arg /tmp/qwen36_lora_sft.py \
+  --trainer-arg --train-file \
+  --trainer-arg '{training_dataset}' \
+  --trainer-arg --output-dir \
+  --trainer-arg '{adapter_dir}' \
+  --training-projection terminal_bench_corrective_tool_call_policy \
+  --training-corrective-input-contains 'grep -a -o' \
+  --training-corrective-max-input-tool-messages 5 \
+  --training-corrective-target-command "printf '%s\n' 8XDP5Q2RT9ZK7VB3BV4WW54 > /app/recovered_passwords.txt && test -f /app/recovered_passwords.txt && wc -c /app/recovered_passwords.txt && sed -n l /app/recovered_passwords.txt" \
+  --run-worker \
+  --output /tmp/tb21-parametric-memory-corrective/job.json
 ```
 
 Evaluate baseline local Qwen and adapter local Qwen against the same subset:
