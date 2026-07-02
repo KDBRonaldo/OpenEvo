@@ -543,6 +543,10 @@ polar-evolution worker
 uv run polar-evolution worker --capability text_memory,skill_bundle,agent_system,agent_system_reflector,agent_system_history_reflector,agent_system_pareto_reflector,text_memory_expel_reflector,parametric_memory_lora_sft
 ```
 
+Worker heartbeat 会续租 job lease，但不会缩短 claim 时已经获得的更长 lease。这样本地
+one-shot worker 可以为长时间运行的 `parametric_memory_lora_sft` trainer 使用较长 claim
+lease，并在 trainer 结束后正常 heartbeat 和 complete job。
+
 ## 添加 Research Method
 
 1. 添加一个接收 `WorkerClaimedJob` 和 `artifact_root` 的 method function。
