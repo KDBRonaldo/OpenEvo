@@ -547,6 +547,14 @@ records，trainer 必须把 record-level `tools` 传给 `tokenizer.apply_chat_te
 `base_model.model.model.language_model.layers.*`，并在 summary 中记录 source adapter path、
 serving adapter path、rewrite 名称和改写 key 数。它不改变 evolution artifact 的原始 URI。
 
+本地 parametric-memory eval 还会把 solver output budget 作为 serving contract 记录并传给
+Harbor/EvoLab agent。`requested_max_output_tokens` 是 CLI 请求值，实际
+`EVOLAB_TB_MAX_OUTPUT_TOKENS` 和 summary `max_output_tokens` 会被
+`context_reserve_tokens` clamp；默认 `context_window_tokens=16384`、
+`context_reserve_tokens=1536`，并且 managed vLLM server 使用同一个
+`context_window_tokens` 作为 `--max-model-len`。这样可以避免长 Terminal Bench tool-use
+transcript 在后续 turn 中让 `input_tokens + max_output_tokens` 超过 serving window。
+
 Reference worker 只定义训练编排和 artifact contract；具体 LoRA trainer、serving backend
 的 adapter 加载方式，以及长训练过程中的续约/heartbeat 扩展，应由本地 inference/training
 infrastructure 提供。

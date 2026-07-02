@@ -530,6 +530,12 @@ Serving contract:
   prepared serving adapter path、rewrite 名称和改写 key 数。
 - 该 rewrite 是 serving-time 兼容层，不改变 evolution artifact 的原始 URI。只有使用 vLLM
   managed server 的本地评估需要它；其他 serving backend 应按自身 adapter key contract 处理。
+- 本地 eval 会记录 `requested_max_output_tokens` 和实际传给 Harbor agent 的
+  `max_output_tokens`。实际值会被 `context_reserve_tokens` clamp；默认
+  `context_window_tokens=16384`、`context_reserve_tokens=1536`。Managed vLLM server 使用同一个
+  `context_window_tokens` 作为 `--max-model-len`，并把 context budget 通过
+  `EVOLAB_TB_CONTEXT_WINDOW_TOKENS`、`EVOLAB_TB_CONTEXT_RESERVE_TOKENS` 暴露给支持新版 contract 的
+  Terminal Bench/EvoLab package。
 
 该 artifact 只适用于 proxy/local inference runtime。Subscription harness 直连外部模型
 服务，不能选择 OpenEvo 训练出的 adapter；上层 experiment config 和 Terminal Bench

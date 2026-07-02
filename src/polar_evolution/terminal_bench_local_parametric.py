@@ -33,6 +33,8 @@ LOCAL_PARAMETRIC_AUTH_MODES = {"local", "proxy"}
 DEFAULT_VLLM_EXECUTABLE = "/root/evolab-vllm/bin/vllm"
 DEFAULT_VLLM_GPUS = ["1", "2", "3", "4"]
 DEFAULT_LOCAL_PARAMETRIC_MAX_OUTPUT_TOKENS = 4096
+DEFAULT_LOCAL_PARAMETRIC_CONTEXT_WINDOW_TOKENS = 16384
+DEFAULT_LOCAL_PARAMETRIC_CONTEXT_RESERVE_TOKENS = 1536
 ADAPTER_KEY_REWRITE_NONE = "none"
 ADAPTER_KEY_REWRITE_QWEN35_MOE_VLLM_LANGUAGE_MODEL = (
     "qwen3_5_moe_vllm_language_model"
@@ -165,12 +167,21 @@ def build_evolab_harbor_env(
     server_url: str,
     model: str,
     max_output_tokens: int = DEFAULT_LOCAL_PARAMETRIC_MAX_OUTPUT_TOKENS,
+    context_window_tokens: int = DEFAULT_LOCAL_PARAMETRIC_CONTEXT_WINDOW_TOKENS,
+    context_reserve_tokens: int = DEFAULT_LOCAL_PARAMETRIC_CONTEXT_RESERVE_TOKENS,
     tool_result_prompt_max_chars: int | None = None,
 ) -> dict[str, str]:
+    context_window, context_reserve, output_tokens = _local_parametric_context_budget(
+        max_output_tokens=max_output_tokens,
+        context_window_tokens=context_window_tokens,
+        context_reserve_tokens=context_reserve_tokens,
+    )
     env = dict(os.environ if base_env is None else base_env)
     env["EVOLAB_TB_LLM_API"] = "openai-chat-completions"
     env["EVOLAB_TB_MODE"] = "direct_solver"
-    env["EVOLAB_TB_MAX_OUTPUT_TOKENS"] = str(max(1, int(max_output_tokens)))
+    env["EVOLAB_TB_CONTEXT_WINDOW_TOKENS"] = str(context_window)
+    env["EVOLAB_TB_CONTEXT_RESERVE_TOKENS"] = str(context_reserve)
+    env["EVOLAB_TB_MAX_OUTPUT_TOKENS"] = str(output_tokens)
     if tool_result_prompt_max_chars is not None:
         env["EVOLAB_TB_TOOL_RESULT_PROMPT_MAX_CHARS"] = str(
             max(1, int(tool_result_prompt_max_chars))
@@ -602,6 +613,8 @@ def run_local_parametric_memory_eval_dry_run(
     n_attempts: int,
     manage_server: bool,
     max_output_tokens: int = DEFAULT_LOCAL_PARAMETRIC_MAX_OUTPUT_TOKENS,
+    context_window_tokens: int = DEFAULT_LOCAL_PARAMETRIC_CONTEXT_WINDOW_TOKENS,
+    context_reserve_tokens: int = DEFAULT_LOCAL_PARAMETRIC_CONTEXT_RESERVE_TOKENS,
     tool_result_prompt_max_chars: int | None = None,
     verifier_env: dict[str, str] | None = None,
     auth_mode: str = "local",
@@ -609,7 +622,12 @@ def run_local_parametric_memory_eval_dry_run(
 ) -> dict[str, Any]:
     auth_mode = _validate_auth_mode(auth_mode)
     key_rewrite = _validate_adapter_key_rewrite(adapter_key_rewrite)
-    output_token_cap = max(1, int(max_output_tokens))
+    requested_output_token_cap = max(1, int(max_output_tokens))
+    context_window, context_reserve, output_token_cap = _local_parametric_context_budget(
+        max_output_tokens=requested_output_token_cap,
+        context_window_tokens=context_window_tokens,
+        context_reserve_tokens=context_reserve_tokens,
+    )
     tool_result_prompt_cap = _optional_positive_int(tool_result_prompt_max_chars)
     effective_verifier_env = dict(verifier_env or {})
     conditions = [
@@ -632,7 +650,10 @@ def run_local_parametric_memory_eval_dry_run(
         "base_model": model,
         "server_url": server_url,
         "n_attempts": max(1, int(n_attempts)),
+        "requested_max_output_tokens": requested_output_token_cap,
         "max_output_tokens": output_token_cap,
+        "context_window_tokens": context_window,
+        "context_reserve_tokens": context_reserve,
         "tool_result_prompt_max_chars": tool_result_prompt_cap,
         "manage_server": manage_server,
         "adapter_key_rewrite": key_rewrite,
@@ -671,6 +692,8 @@ def run_local_parametric_memory_eval(
     server_url: str = "http://127.0.0.1:8000/v1",
     n_attempts: int = 1,
     max_output_tokens: int = DEFAULT_LOCAL_PARAMETRIC_MAX_OUTPUT_TOKENS,
+    context_window_tokens: int = DEFAULT_LOCAL_PARAMETRIC_CONTEXT_WINDOW_TOKENS,
+    context_reserve_tokens: int = DEFAULT_LOCAL_PARAMETRIC_CONTEXT_RESERVE_TOKENS,
     tool_result_prompt_max_chars: int | None = None,
     verifier_env: dict[str, str] | None = None,
     command_runner: CommandRunner = _default_command_runner,
@@ -692,7 +715,12 @@ def run_local_parametric_memory_eval(
         adapter_key_rewrite=key_rewrite,
     )
     attempt_count = max(1, int(n_attempts))
-    output_token_cap = max(1, int(max_output_tokens))
+    requested_output_token_cap = max(1, int(max_output_tokens))
+    context_window, context_reserve, output_token_cap = _local_parametric_context_budget(
+        max_output_tokens=requested_output_token_cap,
+        context_window_tokens=context_window_tokens,
+        context_reserve_tokens=context_reserve_tokens,
+    )
     tool_result_prompt_cap = _optional_positive_int(tool_result_prompt_max_chars)
     effective_verifier_env = dict(verifier_env or {})
     conditions = [
@@ -718,6 +746,8 @@ def run_local_parametric_memory_eval(
             server_url=server_url,
             n_attempts=attempt_count,
             max_output_tokens=output_token_cap,
+            context_window_tokens=context_window,
+            context_reserve_tokens=context_reserve,
             tool_result_prompt_max_chars=tool_result_prompt_cap,
             verifier_env=effective_verifier_env,
             command_runner=command_runner,
@@ -741,7 +771,10 @@ def run_local_parametric_memory_eval(
         "base_model": model,
         "server_url": server_url,
         "n_attempts": attempt_count,
+        "requested_max_output_tokens": requested_output_token_cap,
         "max_output_tokens": output_token_cap,
+        "context_window_tokens": context_window,
+        "context_reserve_tokens": context_reserve,
         "tool_result_prompt_max_chars": tool_result_prompt_cap,
         "manage_server": manage_server,
         "adapter_key_rewrite": key_rewrite,
@@ -780,6 +813,21 @@ def _optional_positive_int(value: int | None) -> int | None:
     return max(1, int(value))
 
 
+def _local_parametric_context_budget(
+    *,
+    max_output_tokens: int,
+    context_window_tokens: int,
+    context_reserve_tokens: int,
+) -> tuple[int, int, int]:
+    context_window = max(1, int(context_window_tokens))
+    context_reserve = min(
+        max(1, int(context_reserve_tokens)),
+        max(1, context_window - 1),
+    )
+    output_tokens = min(max(1, int(max_output_tokens)), context_reserve)
+    return context_window, context_reserve, output_tokens
+
+
 def _run_local_parametric_condition(
     *,
     condition: LocalParametricCondition,
@@ -791,6 +839,8 @@ def _run_local_parametric_condition(
     server_url: str,
     n_attempts: int,
     max_output_tokens: int,
+    context_window_tokens: int,
+    context_reserve_tokens: int,
     tool_result_prompt_max_chars: int | None,
     verifier_env: dict[str, str],
     command_runner: CommandRunner,
@@ -813,6 +863,7 @@ def _run_local_parametric_condition(
                 port=port,
                 vllm_executable=vllm_executable,
                 gpus=gpus,
+                max_model_len=context_window_tokens,
             ),
             run_root=condition_root,
             server_url=server_url,
@@ -833,6 +884,8 @@ def _run_local_parametric_condition(
                 server_url=server_url,
                 n_attempts=n_attempts,
                 max_output_tokens=max_output_tokens,
+                context_window_tokens=context_window_tokens,
+                context_reserve_tokens=context_reserve_tokens,
                 tool_result_prompt_max_chars=tool_result_prompt_max_chars,
                 verifier_env=verifier_env,
                 command_runner=command_runner,
@@ -880,6 +933,7 @@ def _build_condition_vllm_command(
     port: int,
     vllm_executable: str,
     gpus: list[str] | None,
+    max_model_len: int,
 ) -> BuiltVLLMCommand:
     if condition.adapter_id and condition.adapter_path is not None:
         return build_vllm_command(
@@ -888,6 +942,7 @@ def _build_condition_vllm_command(
             port=port,
             vllm_executable=vllm_executable,
             gpus=gpus,
+            max_model_len=max_model_len,
             adapter_id=condition.adapter_id,
             adapter_path=condition.adapter_path,
         )
@@ -897,6 +952,7 @@ def _build_condition_vllm_command(
         port=port,
         vllm_executable=vllm_executable,
         gpus=gpus,
+        max_model_len=max_model_len,
     )
 
 
@@ -910,6 +966,8 @@ def _run_local_parametric_task(
     server_url: str,
     n_attempts: int,
     max_output_tokens: int,
+    context_window_tokens: int,
+    context_reserve_tokens: int,
     tool_result_prompt_max_chars: int | None,
     verifier_env: dict[str, str],
     command_runner: CommandRunner,
@@ -929,6 +987,8 @@ def _run_local_parametric_task(
         server_url=server_url,
         model=condition.model,
         max_output_tokens=max_output_tokens,
+        context_window_tokens=context_window_tokens,
+        context_reserve_tokens=context_reserve_tokens,
         tool_result_prompt_max_chars=tool_result_prompt_max_chars,
     )
     command_runner(command, cwd=terminal_bench_package_root, env=env)

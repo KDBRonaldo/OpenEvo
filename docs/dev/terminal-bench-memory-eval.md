@@ -247,9 +247,11 @@ Harbor agent. This disables EvoLab's task-local memory, prompt overlay, skill
 graph, dynamic replanning, and insight-memory paths inside the Terminal Bench
 harness so the treatment variable is the serving-time adapter. The Harbor CLI
 still uses `mode=evolab` because the agent talks to an OpenAI-compatible local
-endpoint. It also caps `EVOLAB_TB_MAX_OUTPUT_TOKENS` at `4096`, which keeps
-long direct-solver prompts inside the Qwen3.6 16k-token serving window during
-later tool-heavy turns.
+endpoint. The runner records the requested solver output cap and the effective
+cap passed as `EVOLAB_TB_MAX_OUTPUT_TOKENS`. By default the requested cap is
+`4096`, but it is clamped by `--context-reserve-tokens` default `1536` to avoid
+vLLM 400 errors when long direct-solver prompts approach the Qwen3.6 16k-token
+serving window during later tool-heavy turns.
 
 Use `--auth-mode local` or `--auth-mode proxy` for local/proxy inference modes;
 neither is subscription mode. The selected auth mode is recorded in the
@@ -358,17 +360,23 @@ uv run polar-evolution terminal-bench-local-parametric-memory-eval \
   --manage-server \
   --n-attempts 5 \
   --max-output-tokens 4096 \
+  --context-window-tokens 16384 \
+  --context-reserve-tokens 1536 \
   --tool-result-prompt-max-chars 2048 \
   --verifier-python-install-mirror http://172.17.0.8:8765/python-build-standalone \
   --output /tmp/tb21-parametric-memory/local-eval/summary.json
 ```
 
 The summary reports `baseline`, `parametric_memory`, `delta`, and the
-`max_output_tokens` and `tool_result_prompt_max_chars` caps used for both
-conditions. The default output-token cap is `4096`; for smoke tests on slower
-local Qwen/vLLM servers, lower it explicitly, for example
-`--max-output-tokens 1536`, so long reasoning completions do not consume the
-entire GPU window. `--tool-result-prompt-max-chars` sets
+`requested_max_output_tokens`, effective `max_output_tokens`,
+`context_window_tokens`, `context_reserve_tokens`, and
+`tool_result_prompt_max_chars` caps used for both conditions. The default
+requested output-token cap is `4096`, but the effective cap is clamped to the
+default context reserve `1536`; increase `--context-reserve-tokens` only when
+the serving context window and prompt growth leave enough room. For smoke tests
+on slower local Qwen/vLLM servers, lower `--max-output-tokens` explicitly, for
+example `--max-output-tokens 1024`. `--context-window-tokens` also drives
+managed vLLM `--max-model-len`. `--tool-result-prompt-max-chars` sets
 `EVOLAB_TB_TOOL_RESULT_PROMPT_MAX_CHARS` for the Harbor agent. It only affects
 runtime behavior when the installed Terminal Bench/EvoLab package honors that
 environment variable; otherwise the value is still recorded in the summary as a

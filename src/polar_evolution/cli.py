@@ -18,6 +18,8 @@ from polar_evolution.terminal_bench_local_parametric import (
     ADAPTER_KEY_REWRITE_CHOICES,
     ADAPTER_KEY_REWRITE_NONE,
     DEFAULT_LOCAL_MODEL,
+    DEFAULT_LOCAL_PARAMETRIC_CONTEXT_RESERVE_TOKENS,
+    DEFAULT_LOCAL_PARAMETRIC_CONTEXT_WINDOW_TOKENS,
     DEFAULT_LOCAL_PARAMETRIC_ADAPTER_ID,
     DEFAULT_LOCAL_PARAMETRIC_MAX_OUTPUT_TOKENS,
     DEFAULT_VLLM_EXECUTABLE,
@@ -494,6 +496,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="Maximum output tokens per local Terminal Bench solver completion.",
     )
     tb_local_parametric.add_argument(
+        "--context-window-tokens",
+        type=int,
+        default=DEFAULT_LOCAL_PARAMETRIC_CONTEXT_WINDOW_TOKENS,
+        help=(
+            "Serving context window used for local parametric-memory evaluation "
+            "and managed vLLM --max-model-len."
+        ),
+    )
+    tb_local_parametric.add_argument(
+        "--context-reserve-tokens",
+        type=int,
+        default=DEFAULT_LOCAL_PARAMETRIC_CONTEXT_RESERVE_TOKENS,
+        help=(
+            "Maximum solver output budget reserved inside the context window. "
+            "--max-output-tokens is clamped to this value."
+        ),
+    )
+    tb_local_parametric.add_argument(
         "--tool-result-prompt-max-chars",
         type=int,
         help=(
@@ -659,6 +679,8 @@ def main(argv: list[str] | None = None) -> int:
                 server_url=args.server_url,
                 n_attempts=args.n_attempts,
                 max_output_tokens=args.max_output_tokens,
+                context_window_tokens=args.context_window_tokens,
+                context_reserve_tokens=args.context_reserve_tokens,
                 tool_result_prompt_max_chars=args.tool_result_prompt_max_chars,
                 manage_server=args.manage_server,
                 verifier_env=verifier_env,
@@ -679,6 +701,8 @@ def main(argv: list[str] | None = None) -> int:
             server_url=args.server_url,
             n_attempts=args.n_attempts,
             max_output_tokens=args.max_output_tokens,
+            context_window_tokens=args.context_window_tokens,
+            context_reserve_tokens=args.context_reserve_tokens,
             tool_result_prompt_max_chars=args.tool_result_prompt_max_chars,
             verifier_env=verifier_env,
             manage_server=args.manage_server,

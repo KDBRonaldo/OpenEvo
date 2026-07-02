@@ -65,8 +65,25 @@ def test_build_evolab_harbor_env_sets_openai_chat_endpoint(
     assert env["AIGOCODE_GPT_BASE_URL"] == "http://127.0.0.1:8000/v1"
     assert env["OPENAI_API_KEY"] == "dummy-local-key"
     assert env["EVOLAB_TB_MODE"] == "direct_solver"
-    assert env["EVOLAB_TB_MAX_OUTPUT_TOKENS"] == "4096"
+    assert env["EVOLAB_TB_CONTEXT_WINDOW_TOKENS"] == "16384"
+    assert env["EVOLAB_TB_CONTEXT_RESERVE_TOKENS"] == "1536"
+    assert env["EVOLAB_TB_MAX_OUTPUT_TOKENS"] == "1536"
     assert env["EVOLAB_TB_TOOL_RESULT_PROMPT_MAX_CHARS"] == "2048"
+
+
+def test_build_evolab_harbor_env_clamps_output_tokens_to_context_reserve() -> None:
+    env = build_evolab_harbor_env(
+        base_env={},
+        server_url="http://127.0.0.1:8000/v1",
+        model="tb-parametric-memory",
+        max_output_tokens=4096,
+        context_window_tokens=32768,
+        context_reserve_tokens=1024,
+    )
+
+    assert env["EVOLAB_TB_CONTEXT_WINDOW_TOKENS"] == "32768"
+    assert env["EVOLAB_TB_CONTEXT_RESERVE_TOKENS"] == "1024"
+    assert env["EVOLAB_TB_MAX_OUTPUT_TOKENS"] == "1024"
 
 
 def test_build_evolab_harbor_env_empty_base_does_not_inherit_host_env(
@@ -185,6 +202,10 @@ def test_local_parametric_dry_run_reports_matrix_and_disabled_artifacts(
     ]
     assert payload["conditions"][0]["model"] == "Qwen/Qwen3.6-35B-A3B"
     assert payload["conditions"][1]["model"] == "tb-parametric-memory"
+    assert payload["requested_max_output_tokens"] == 4096
+    assert payload["max_output_tokens"] == 1536
+    assert payload["context_window_tokens"] == 16384
+    assert payload["context_reserve_tokens"] == 1536
     assert payload["tool_result_prompt_max_chars"] == 2048
 
 
@@ -246,6 +267,7 @@ def test_run_local_parametric_memory_eval_compares_baseline_and_adapter(
         server_url="http://127.0.0.1:8000/v1",
         n_attempts=2,
         max_output_tokens=1536,
+        context_reserve_tokens=1536,
         tool_result_prompt_max_chars=2048,
         verifier_env={},
         command_runner=fake_command_runner,
@@ -270,6 +292,8 @@ def test_run_local_parametric_memory_eval_compares_baseline_and_adapter(
     assert envs[1]["EVOLAB_TB_MODEL"] == "tb-parametric-memory"
     assert all(env["EVOLAB_TB_MODE"] == "direct_solver" for env in envs)
     assert all(env["EVOLAB_TB_MAX_OUTPUT_TOKENS"] == "1536" for env in envs)
+    assert all(env["EVOLAB_TB_CONTEXT_WINDOW_TOKENS"] == "16384" for env in envs)
+    assert all(env["EVOLAB_TB_CONTEXT_RESERVE_TOKENS"] == "1536" for env in envs)
     assert all(env["EVOLAB_TB_TOOL_RESULT_PROMPT_MAX_CHARS"] == "2048" for env in envs)
 
 
