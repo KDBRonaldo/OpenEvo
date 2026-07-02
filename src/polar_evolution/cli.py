@@ -617,6 +617,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     tb_local_parametric.add_argument("--verifier-env", action="append", default=[])
     tb_local_parametric.add_argument(
+        "--agent-env",
+        action="append",
+        default=[],
+        help=(
+            "Terminal-Bench EvoLab agent environment override in KEY=VALUE form. "
+            "Only EVOLAB_TB_* package knobs are accepted by the local "
+            "parametric-memory runner."
+        ),
+    )
+    tb_local_parametric.add_argument(
         "--verifier-python-install-mirror",
         help=(
             "Optional UV_PYTHON_INSTALL_MIRROR value for Terminal Bench verifier "
@@ -765,6 +775,7 @@ def main(argv: list[str] | None = None) -> int:
             args.verifier_env,
             python_install_mirror=args.verifier_python_install_mirror,
         )
+        agent_env = _parse_key_value_entries(args.agent_env)
         if args.dry_run:
             payload = run_local_parametric_memory_eval_dry_run(
                 task_root=Path(args.task_root),
@@ -781,6 +792,7 @@ def main(argv: list[str] | None = None) -> int:
                 tool_result_prompt_max_chars=args.tool_result_prompt_max_chars,
                 manage_server=args.manage_server,
                 verifier_env=verifier_env,
+                agent_env=agent_env,
                 auth_mode=args.auth_mode,
                 adapter_key_rewrite=args.adapter_key_rewrite,
             )
@@ -802,6 +814,7 @@ def main(argv: list[str] | None = None) -> int:
             context_reserve_tokens=args.context_reserve_tokens,
             tool_result_prompt_max_chars=args.tool_result_prompt_max_chars,
             verifier_env=verifier_env,
+            agent_env=agent_env,
             manage_server=args.manage_server,
             server_timeout_seconds=args.server_timeout_seconds,
             vllm_executable=args.vllm_executable,

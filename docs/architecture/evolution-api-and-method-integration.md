@@ -564,6 +564,13 @@ Harbor/EvoLab agent。`requested_max_output_tokens` 是 CLI 请求值，实际
 `context_reserve_tokens=1536`，并且 managed vLLM server 使用同一个
 `context_window_tokens` 作为 `--max-model-len`。这样可以避免长 Terminal Bench tool-use
 transcript 在后续 turn 中让 `input_tokens + max_output_tokens` 超过 serving window。
+需要打开 Terminal-Bench/EvoLab 包级 direct-solver 行为开关时，使用
+`terminal-bench-local-parametric-memory-eval --agent-env KEY=VALUE`。该接口只允许
+`EVOLAB_TB_*` key，并拒绝覆盖 OpenEvo 控制的模型、模式和 token-budget 环境变量；summary
+中记录 redacted `agent_env`。例如 stop-after-success 这类 guard 可以通过未来包级
+`EVOLAB_TB_REQUIRE_SUCCESSFUL_COLLECT=1` 和
+`EVOLAB_TB_DIRECT_SOLVER_COMPLETION_GUARD=successful_collect` 打开，但具体 guard
+语义由安装的 Terminal-Bench/EvoLab package 实现，不属于 evolution artifact contract。
 
 Reference worker 只定义训练编排和 artifact contract；具体 LoRA trainer、serving backend
 的 adapter 加载方式，以及长训练过程中的续约/heartbeat 扩展，应由本地 inference/training

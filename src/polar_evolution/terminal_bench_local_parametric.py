@@ -62,6 +62,16 @@ _SECRET_ENV_MARKERS = (
     "cookie",
     "credential",
 )
+_AGENT_ENV_PREFIX = "EVOLAB_TB_"
+_CONTROLLED_AGENT_ENV_KEYS = {
+    "EVOLAB_TB_CONTEXT_RESERVE_TOKENS",
+    "EVOLAB_TB_CONTEXT_WINDOW_TOKENS",
+    "EVOLAB_TB_LLM_API",
+    "EVOLAB_TB_MAX_OUTPUT_TOKENS",
+    "EVOLAB_TB_MODE",
+    "EVOLAB_TB_MODEL",
+    "EVOLAB_TB_TOOL_RESULT_PROMPT_MAX_CHARS",
+}
 
 
 @dataclass(frozen=True)
@@ -170,6 +180,7 @@ def build_evolab_harbor_env(
     context_window_tokens: int = DEFAULT_LOCAL_PARAMETRIC_CONTEXT_WINDOW_TOKENS,
     context_reserve_tokens: int = DEFAULT_LOCAL_PARAMETRIC_CONTEXT_RESERVE_TOKENS,
     tool_result_prompt_max_chars: int | None = None,
+    agent_env: dict[str, str] | None = None,
 ) -> dict[str, str]:
     context_window, context_reserve, output_tokens = _local_parametric_context_budget(
         max_output_tokens=max_output_tokens,
@@ -190,7 +201,24 @@ def build_evolab_harbor_env(
     env["OPENAI_BASE_URL"] = server_url
     env["AIGOCODE_GPT_BASE_URL"] = server_url
     env["OPENAI_API_KEY"] = "dummy-local-key"
+    env.update(_validated_agent_env(agent_env or {}))
     return env
+
+
+def _validated_agent_env(agent_env: dict[str, str]) -> dict[str, str]:
+    validated: dict[str, str] = {}
+    for key, value in agent_env.items():
+        if not key.startswith(_AGENT_ENV_PREFIX):
+            raise ValueError(
+                "agent_env entries must use the EVOLAB_TB_ prefix; "
+                f"got {key!r}"
+            )
+        if key in _CONTROLLED_AGENT_ENV_KEYS:
+            raise ValueError(
+                f"agent_env cannot override controlled local parametric setting {key!r}"
+            )
+        validated[key] = str(value)
+    return validated
 
 
 def _path_with_executable_parent(executable: str, base_path: str | None) -> str | None:
@@ -617,6 +645,7 @@ def run_local_parametric_memory_eval_dry_run(
     context_reserve_tokens: int = DEFAULT_LOCAL_PARAMETRIC_CONTEXT_RESERVE_TOKENS,
     tool_result_prompt_max_chars: int | None = None,
     verifier_env: dict[str, str] | None = None,
+    agent_env: dict[str, str] | None = None,
     auth_mode: str = "local",
     adapter_key_rewrite: str = ADAPTER_KEY_REWRITE_NONE,
 ) -> dict[str, Any]:
@@ -630,6 +659,7 @@ def run_local_parametric_memory_eval_dry_run(
     )
     tool_result_prompt_cap = _optional_positive_int(tool_result_prompt_max_chars)
     effective_verifier_env = dict(verifier_env or {})
+    effective_agent_env = _validated_agent_env(dict(agent_env or {}))
     conditions = [
         LocalParametricCondition(name="baseline", model=model),
         LocalParametricCondition(
@@ -658,6 +688,7 @@ def run_local_parametric_memory_eval_dry_run(
         "manage_server": manage_server,
         "adapter_key_rewrite": key_rewrite,
         "verifier_env": _redacted_env(effective_verifier_env),
+        "agent_env": _redacted_env(effective_agent_env),
         "enabled_artifacts": ["parametric_memory"],
         "disabled_artifacts": list(DEFAULT_LOCAL_PARAMETRIC_DISABLED_ARTIFACTS),
         "conditions": [
@@ -696,6 +727,7 @@ def run_local_parametric_memory_eval(
     context_reserve_tokens: int = DEFAULT_LOCAL_PARAMETRIC_CONTEXT_RESERVE_TOKENS,
     tool_result_prompt_max_chars: int | None = None,
     verifier_env: dict[str, str] | None = None,
+    agent_env: dict[str, str] | None = None,
     command_runner: CommandRunner = _default_command_runner,
     manage_server: bool = True,
     server_timeout_seconds: float = 600.0,
@@ -723,6 +755,7 @@ def run_local_parametric_memory_eval(
     )
     tool_result_prompt_cap = _optional_positive_int(tool_result_prompt_max_chars)
     effective_verifier_env = dict(verifier_env or {})
+    effective_agent_env = _validated_agent_env(dict(agent_env or {}))
     conditions = [
         LocalParametricCondition(name="baseline", model=model),
         LocalParametricCondition(
@@ -750,6 +783,7 @@ def run_local_parametric_memory_eval(
             context_reserve_tokens=context_reserve,
             tool_result_prompt_max_chars=tool_result_prompt_cap,
             verifier_env=effective_verifier_env,
+            agent_env=effective_agent_env,
             command_runner=command_runner,
             manage_server=manage_server,
             server_timeout_seconds=server_timeout_seconds,
@@ -779,6 +813,7 @@ def run_local_parametric_memory_eval(
         "manage_server": manage_server,
         "adapter_key_rewrite": key_rewrite,
         "verifier_env": _redacted_env(effective_verifier_env),
+        "agent_env": _redacted_env(effective_agent_env),
         "enabled_artifacts": ["parametric_memory"],
         "disabled_artifacts": list(DEFAULT_LOCAL_PARAMETRIC_DISABLED_ARTIFACTS),
         "conditions": condition_summaries,
@@ -843,6 +878,7 @@ def _run_local_parametric_condition(
     context_reserve_tokens: int,
     tool_result_prompt_max_chars: int | None,
     verifier_env: dict[str, str],
+    agent_env: dict[str, str],
     command_runner: CommandRunner,
     manage_server: bool,
     server_timeout_seconds: float,
@@ -888,6 +924,7 @@ def _run_local_parametric_condition(
                 context_reserve_tokens=context_reserve_tokens,
                 tool_result_prompt_max_chars=tool_result_prompt_max_chars,
                 verifier_env=verifier_env,
+                agent_env=agent_env,
                 command_runner=command_runner,
             )
             for task_id in task_ids
@@ -970,6 +1007,7 @@ def _run_local_parametric_task(
     context_reserve_tokens: int,
     tool_result_prompt_max_chars: int | None,
     verifier_env: dict[str, str],
+    agent_env: dict[str, str],
     command_runner: CommandRunner,
 ) -> dict[str, Any]:
     job_name = f"{condition.name}-{task_id}"
@@ -990,6 +1028,7 @@ def _run_local_parametric_task(
         context_window_tokens=context_window_tokens,
         context_reserve_tokens=context_reserve_tokens,
         tool_result_prompt_max_chars=tool_result_prompt_max_chars,
+        agent_env=agent_env,
     )
     command_runner(command, cwd=terminal_bench_package_root, env=env)
 

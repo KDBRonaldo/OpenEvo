@@ -101,6 +101,39 @@ def test_build_evolab_harbor_env_empty_base_does_not_inherit_host_env(
     assert env["EVOLAB_TB_LLM_API"] == "openai-chat-completions"
 
 
+def test_build_evolab_harbor_env_applies_agent_env_knobs() -> None:
+    env = build_evolab_harbor_env(
+        base_env={},
+        server_url="http://127.0.0.1:8000/v1",
+        model="tb-parametric-memory",
+        agent_env={
+            "EVOLAB_TB_REQUIRE_SUCCESSFUL_COLLECT": "1",
+            "EVOLAB_TB_DIRECT_SOLVER_COMPLETION_GUARD": "successful_collect",
+        },
+    )
+
+    assert env["EVOLAB_TB_REQUIRE_SUCCESSFUL_COLLECT"] == "1"
+    assert env["EVOLAB_TB_DIRECT_SOLVER_COMPLETION_GUARD"] == "successful_collect"
+
+
+def test_build_evolab_harbor_env_rejects_unsafe_agent_env() -> None:
+    with pytest.raises(ValueError, match="EVOLAB_TB_"):
+        build_evolab_harbor_env(
+            base_env={},
+            server_url="http://127.0.0.1:8000/v1",
+            model="tb-parametric-memory",
+            agent_env={"OPENAI_API_KEY": "secret"},
+        )
+
+    with pytest.raises(ValueError, match="controlled"):
+        build_evolab_harbor_env(
+            base_env={},
+            server_url="http://127.0.0.1:8000/v1",
+            model="tb-parametric-memory",
+            agent_env={"EVOLAB_TB_MODEL": "other-model"},
+        )
+
+
 def test_build_vllm_command_baseline_and_lora() -> None:
     baseline = build_vllm_command(
         model="Qwen/Qwen3.6-35B-A3B",
@@ -188,6 +221,7 @@ def test_local_parametric_dry_run_reports_matrix_and_disabled_artifacts(
         server_url="http://127.0.0.1:8000/v1",
         n_attempts=5,
         tool_result_prompt_max_chars=2048,
+        agent_env={"EVOLAB_TB_REQUIRE_SUCCESSFUL_COLLECT": "1"},
         manage_server=True,
     )
 
@@ -207,6 +241,7 @@ def test_local_parametric_dry_run_reports_matrix_and_disabled_artifacts(
     assert payload["context_window_tokens"] == 16384
     assert payload["context_reserve_tokens"] == 1536
     assert payload["tool_result_prompt_max_chars"] == 2048
+    assert payload["agent_env"] == {"EVOLAB_TB_REQUIRE_SUCCESSFUL_COLLECT": "1"}
 
 
 def test_run_local_parametric_memory_eval_compares_baseline_and_adapter(
@@ -270,6 +305,7 @@ def test_run_local_parametric_memory_eval_compares_baseline_and_adapter(
         context_reserve_tokens=1536,
         tool_result_prompt_max_chars=2048,
         verifier_env={},
+        agent_env={"EVOLAB_TB_REQUIRE_SUCCESSFUL_COLLECT": "1"},
         command_runner=fake_command_runner,
         manage_server=False,
     )
@@ -295,6 +331,7 @@ def test_run_local_parametric_memory_eval_compares_baseline_and_adapter(
     assert all(env["EVOLAB_TB_CONTEXT_WINDOW_TOKENS"] == "16384" for env in envs)
     assert all(env["EVOLAB_TB_CONTEXT_RESERVE_TOKENS"] == "1536" for env in envs)
     assert all(env["EVOLAB_TB_TOOL_RESULT_PROMPT_MAX_CHARS"] == "2048" for env in envs)
+    assert all(env["EVOLAB_TB_REQUIRE_SUCCESSFUL_COLLECT"] == "1" for env in envs)
 
 
 def test_run_local_parametric_memory_eval_scores_only_requested_attempts(
@@ -879,6 +916,39 @@ def test_terminal_bench_local_parametric_cli_dry_run_records_verifier_env(
     assert payload["verifier_env"] == {
         "UV_NO_INDEX": "1",
         "UV_PYTHON_INSTALL_MIRROR": "http://172.17.0.8:8765/python-build-standalone",
+    }
+
+
+def test_terminal_bench_local_parametric_cli_dry_run_records_agent_env(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "summary.json"
+    exit_code = main(
+        [
+            "terminal-bench-local-parametric-memory-eval",
+            "--task-root",
+            "/root/datasets/terminal-bench-2-1/tasks",
+            "--task-id",
+            "regex-log",
+            "--run-root",
+            str(tmp_path / "run"),
+            "--adapter-path",
+            str(tmp_path / "adapter"),
+            "--agent-env",
+            "EVOLAB_TB_REQUIRE_SUCCESSFUL_COLLECT=1",
+            "--agent-env",
+            "EVOLAB_TB_DIRECT_SOLVER_COMPLETION_GUARD=successful_collect",
+            "--dry-run",
+            "--output",
+            str(output),
+        ]
+    )
+
+    assert exit_code == 0
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert payload["agent_env"] == {
+        "EVOLAB_TB_DIRECT_SOLVER_COMPLETION_GUARD": "successful_collect",
+        "EVOLAB_TB_REQUIRE_SUCCESSFUL_COLLECT": "1",
     }
 
 
@@ -1742,6 +1812,8 @@ def test_terminal_bench_local_parametric_cli_live_invokes_runner(
             "proxy",
             "--verifier-env",
             "UV_NO_INDEX=1",
+            "--agent-env",
+            "EVOLAB_TB_REQUIRE_SUCCESSFUL_COLLECT=1",
             "--output",
             str(output),
         ]
@@ -1755,6 +1827,7 @@ def test_terminal_bench_local_parametric_cli_live_invokes_runner(
     assert captured["port"] == 8011
     assert captured["auth_mode"] == "proxy"
     assert captured["verifier_env"] == {"UV_NO_INDEX": "1"}
+    assert captured["agent_env"] == {"EVOLAB_TB_REQUIRE_SUCCESSFUL_COLLECT": "1"}
     assert json.loads(output.read_text(encoding="utf-8")) == {
         "dry_run": False,
         "conditions": [],

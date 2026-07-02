@@ -275,6 +275,17 @@ cap passed as `EVOLAB_TB_MAX_OUTPUT_TOKENS`. By default the requested cap is
 vLLM 400 errors when long direct-solver prompts approach the Qwen3.6 16k-token
 serving window during later tool-heavy turns.
 
+Use repeated `--agent-env KEY=VALUE` entries to pass Terminal-Bench/EvoLab
+package behavior knobs into the direct-solver agent process. OpenEvo only
+accepts `EVOLAB_TB_*` keys here and rejects fields that it controls directly
+such as `EVOLAB_TB_MODEL`, `EVOLAB_TB_MODE`, and token-budget settings. This is
+the intended bridge for package-level guards such as a future
+`EVOLAB_TB_REQUIRE_SUCCESSFUL_COLLECT=1` +
+`EVOLAB_TB_DIRECT_SOLVER_COMPLETION_GUARD=successful_collect` stop-after-success
+mode. OpenEvo records the redacted `agent_env` block in dry-run and live
+summaries, but the guard semantics must be implemented by the installed
+Terminal-Bench/EvoLab package.
+
 Use `--auth-mode local` or `--auth-mode proxy` for local/proxy inference modes;
 neither is subscription mode. The selected auth mode is recorded in the
 summary. `--server-url` selects the OpenAI-compatible endpoint. With
@@ -478,6 +489,8 @@ uv run polar-evolution terminal-bench-local-parametric-memory-eval \
   --context-window-tokens 16384 \
   --context-reserve-tokens 1536 \
   --tool-result-prompt-max-chars 2048 \
+  --agent-env EVOLAB_TB_REQUIRE_SUCCESSFUL_COLLECT=1 \
+  --agent-env EVOLAB_TB_DIRECT_SOLVER_COMPLETION_GUARD=successful_collect \
   --verifier-python-install-mirror http://172.17.0.8:8765/python-build-standalone \
   --output /tmp/tb21-parametric-memory/local-eval/summary.json
 ```
@@ -485,7 +498,8 @@ uv run polar-evolution terminal-bench-local-parametric-memory-eval \
 The summary reports `baseline`, `parametric_memory`, `delta`, and the
 `requested_max_output_tokens`, effective `max_output_tokens`,
 `context_window_tokens`, `context_reserve_tokens`, and
-`tool_result_prompt_max_chars` caps used for both conditions. The default
+`tool_result_prompt_max_chars` caps used for both conditions, plus redacted
+`agent_env` package knobs when supplied. The default
 requested output-token cap is `4096`, but the effective cap is clamped to the
 default context reserve `1536`; increase `--context-reserve-tokens` only when
 the serving context window and prompt growth leave enough room. For smoke tests
