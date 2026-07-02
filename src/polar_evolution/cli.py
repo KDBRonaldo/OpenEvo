@@ -14,6 +14,13 @@ from polar_evolution.models import DatasetCreateRequest, EventIngestRequest, Job
 from polar_evolution.server import create_app
 from polar_evolution.store import EvolutionStore
 from polar_evolution.terminal_bench_bridge import build_terminal_bench_events
+from polar_evolution.terminal_bench_local_parametric import (
+    DEFAULT_LOCAL_MODEL,
+    DEFAULT_LOCAL_PARAMETRIC_ADAPTER_ID,
+    DEFAULT_VLLM_EXECUTABLE,
+    run_local_parametric_memory_eval,
+    run_local_parametric_memory_eval_dry_run,
+)
 from polar_evolution.terminal_bench_per_task import (
     DEFAULT_TERMINAL_BENCH_PACKAGE_ROOT,
     TerminalBenchTaskGroup,
@@ -294,6 +301,39 @@ def build_parser() -> argparse.ArgumentParser:
     tb_group.add_argument("--verifier-env", action="append", default=[])
     tb_group.add_argument("--dry-run", action="store_true")
     tb_group.add_argument("--output", required=True)
+    tb_local_parametric = subparsers.add_parser(
+        "terminal-bench-local-parametric-memory-eval",
+        help="Run or plan local Terminal Bench parametric-memory evaluation.",
+    )
+    tb_local_parametric.add_argument("--task-root", required=True)
+    tb_local_parametric.add_argument("--task-id", action="append", default=[], required=True)
+    tb_local_parametric.add_argument("--run-root", required=True)
+    tb_local_parametric.add_argument(
+        "--terminal-bench-package-root",
+        default=str(DEFAULT_TERMINAL_BENCH_PACKAGE_ROOT),
+    )
+    tb_local_parametric.add_argument("--model", default=DEFAULT_LOCAL_MODEL)
+    tb_local_parametric.add_argument("--adapter-path", required=True)
+    tb_local_parametric.add_argument(
+        "--adapter-id",
+        default=DEFAULT_LOCAL_PARAMETRIC_ADAPTER_ID,
+    )
+    tb_local_parametric.add_argument("--adapter-artifact-id")
+    tb_local_parametric.add_argument("--server-url", default="http://127.0.0.1:8000/v1")
+    tb_local_parametric.add_argument("--server-port", type=int, default=8000)
+    tb_local_parametric.add_argument("--vllm-executable", default=DEFAULT_VLLM_EXECUTABLE)
+    tb_local_parametric.add_argument("--gpu", action="append", default=[])
+    tb_local_parametric.add_argument("--n-attempts", type=int, default=1)
+    tb_local_parametric.add_argument("--manage-server", action="store_true")
+    tb_local_parametric.add_argument("--server-timeout-seconds", type=float, default=600.0)
+    tb_local_parametric.add_argument(
+        "--auth-mode",
+        choices=["local", "proxy", "subscription"],
+        default="local",
+    )
+    tb_local_parametric.add_argument("--verifier-env", action="append", default=[])
+    tb_local_parametric.add_argument("--dry-run", action="store_true")
+    tb_local_parametric.add_argument("--output", required=True)
     return parser
 
 
@@ -394,6 +434,43 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == "terminal-bench-text-memory-job":
         payload = _create_terminal_bench_text_memory_job(args)
+        _write_json_output(payload, args.output)
+        return 0
+    if args.command == "terminal-bench-local-parametric-memory-eval":
+        if args.auth_mode == "subscription":
+            raise ValueError("parametric_memory requires local or proxy auth")
+        if args.dry_run:
+            payload = run_local_parametric_memory_eval_dry_run(
+                task_root=Path(args.task_root),
+                task_ids=args.task_id,
+                run_root=Path(args.run_root),
+                model=args.model,
+                adapter_path=Path(args.adapter_path),
+                adapter_id=args.adapter_id,
+                server_url=args.server_url,
+                n_attempts=args.n_attempts,
+                manage_server=args.manage_server,
+            )
+            _write_json_output(payload, args.output)
+            return 0
+        payload = run_local_parametric_memory_eval(
+            task_root=Path(args.task_root),
+            task_ids=args.task_id,
+            run_root=Path(args.run_root),
+            terminal_bench_package_root=Path(args.terminal_bench_package_root),
+            model=args.model,
+            adapter_path=Path(args.adapter_path),
+            adapter_id=args.adapter_id,
+            adapter_artifact_id=args.adapter_artifact_id,
+            server_url=args.server_url,
+            n_attempts=args.n_attempts,
+            verifier_env=_parse_key_value_entries(args.verifier_env),
+            manage_server=args.manage_server,
+            server_timeout_seconds=args.server_timeout_seconds,
+            vllm_executable=args.vllm_executable,
+            gpus=args.gpu or None,
+            port=args.server_port,
+        )
         _write_json_output(payload, args.output)
         return 0
     if args.command == "terminal-bench-per-task-evolution":

@@ -6,7 +6,9 @@ from types import SimpleNamespace
 
 import pytest
 
+import polar_evolution.cli as cli_module
 import polar_evolution.terminal_bench_local_parametric as local_parametric
+from polar_evolution.cli import main
 from polar_evolution.terminal_bench_local_parametric import (
     DEFAULT_LOCAL_PARAMETRIC_DISABLED_ARTIFACTS,
     build_evolab_harbor_env,
@@ -520,6 +522,130 @@ def test_wait_for_openai_server_disables_host_proxy_env(
     )
 
     assert calls["kwargs"]["trust_env"] is False
+
+
+def test_terminal_bench_local_parametric_cli_dry_run_writes_output(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "summary.json"
+    exit_code = main(
+        [
+            "terminal-bench-local-parametric-memory-eval",
+            "--task-root",
+            "/root/datasets/terminal-bench-2-1/tasks",
+            "--task-id",
+            "train-fasttext",
+            "--task-id",
+            "query-optimize",
+            "--run-root",
+            str(tmp_path / "run"),
+            "--model",
+            "Qwen/Qwen3.6-35B-A3B",
+            "--adapter-path",
+            str(tmp_path / "adapter"),
+            "--adapter-id",
+            "tb-parametric-memory",
+            "--server-url",
+            "http://127.0.0.1:8000/v1",
+            "--n-attempts",
+            "5",
+            "--manage-server",
+            "--dry-run",
+            "--output",
+            str(output),
+        ]
+    )
+
+    assert exit_code == 0
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert payload["dry_run"] is True
+    assert payload["enabled_artifacts"] == ["parametric_memory"]
+    assert payload["disabled_artifacts"] == ["text_memory", "skill_bundle", "agent_system"]
+    assert [condition["name"] for condition in payload["conditions"]] == [
+        "baseline",
+        "parametric_memory",
+    ]
+
+
+def test_terminal_bench_local_parametric_cli_rejects_subscription_auth(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(ValueError, match="requires local or proxy auth"):
+        main(
+            [
+                "terminal-bench-local-parametric-memory-eval",
+                "--task-root",
+                "/root/datasets/terminal-bench-2-1/tasks",
+                "--task-id",
+                "query-optimize",
+                "--run-root",
+                str(tmp_path / "run"),
+                "--model",
+                "Qwen/Qwen3.6-35B-A3B",
+                "--adapter-path",
+                str(tmp_path / "adapter"),
+                "--auth-mode",
+                "subscription",
+                "--output",
+                str(tmp_path / "summary.json"),
+            ]
+        )
+
+
+def test_terminal_bench_local_parametric_cli_live_invokes_runner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output = tmp_path / "summary.json"
+    captured: dict[str, object] = {}
+
+    def fake_runner(**kwargs):
+        captured.update(kwargs)
+        return {"dry_run": False, "conditions": []}
+
+    monkeypatch.setattr(cli_module, "run_local_parametric_memory_eval", fake_runner)
+
+    exit_code = main(
+        [
+            "terminal-bench-local-parametric-memory-eval",
+            "--task-root",
+            "/root/datasets/terminal-bench-2-1/tasks",
+            "--task-id",
+            "query-optimize",
+            "--run-root",
+            str(tmp_path / "run"),
+            "--terminal-bench-package-root",
+            "/tmp/terminal-bench-package",
+            "--model",
+            "Qwen/Qwen3.6-35B-A3B",
+            "--adapter-path",
+            str(tmp_path / "adapter"),
+            "--adapter-artifact-id",
+            "art-parametric",
+            "--gpu",
+            "1",
+            "--gpu",
+            "2",
+            "--server-port",
+            "8011",
+            "--verifier-env",
+            "UV_NO_INDEX=1",
+            "--output",
+            str(output),
+        ]
+    )
+
+    assert exit_code == 0
+    assert captured["task_ids"] == ["query-optimize"]
+    assert captured["terminal_bench_package_root"] == Path("/tmp/terminal-bench-package")
+    assert captured["adapter_artifact_id"] == "art-parametric"
+    assert captured["gpus"] == ["1", "2"]
+    assert captured["port"] == 8011
+    assert captured["verifier_env"] == {"UV_NO_INDEX": "1"}
+    assert json.loads(output.read_text(encoding="utf-8")) == {
+        "dry_run": False,
+        "conditions": [],
+    }
 
 
 def test_managed_vllm_server_does_not_mask_body_exception_when_process_group_is_gone(
