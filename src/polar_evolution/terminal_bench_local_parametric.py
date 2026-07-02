@@ -1,9 +1,17 @@
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
+import json
 import os
 from pathlib import Path
+import signal
+import subprocess
+import time
 from typing import Any
+
+import httpx
 
 from polar_evolution.terminal_bench_per_task import (
     DEFAULT_TERMINAL_BENCH_ENVIRONMENT_IMPORT_PATH,
@@ -181,6 +189,127 @@ def build_vllm_command(
             ]
         )
     return BuiltVLLMCommand(command=command, env={"CUDA_VISIBLE_DEVICES": visible_gpus})
+
+
+def _redacted_env(env: dict[str, str]) -> dict[str, str]:
+    redacted: dict[str, str] = {}
+    for key in sorted(env):
+        normalized_key = key.lower()
+        if (
+            "key" in normalized_key
+            or "token" in normalized_key
+            or "secret" in normalized_key
+        ):
+            redacted[key] = "<redacted>"
+        else:
+            redacted[key] = env[key]
+    return redacted
+
+
+def wait_for_openai_server(
+    *,
+    server_url: str,
+    expected_model: str,
+    timeout_seconds: float,
+    poll_interval_seconds: float = 1.0,
+) -> None:
+    deadline = time.monotonic() + timeout_seconds
+    last_error: Exception | None = None
+
+    while True:
+        try:
+            with httpx.Client(base_url=server_url, timeout=5.0) as client:
+                models_response = client.get("/models")
+                models_response.raise_for_status()
+                model_ids = {
+                    model["id"]
+                    for model in models_response.json().get("data", [])
+                    if isinstance(model, dict) and isinstance(model.get("id"), str)
+                }
+                if expected_model not in model_ids:
+                    raise ValueError(
+                        f"OpenAI server did not expose expected model "
+                        f"{expected_model!r}; available models: {sorted(model_ids)!r}"
+                    )
+
+                completion_response = client.post(
+                    "/chat/completions",
+                    json={
+                        "model": expected_model,
+                        "messages": [{"role": "user", "content": "ping"}],
+                        "max_tokens": 1,
+                    },
+                )
+                completion_response.raise_for_status()
+                return
+        except ValueError:
+            raise
+        except (httpx.HTTPError, OSError) as exc:
+            last_error = exc
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"Timed out waiting for OpenAI server at {server_url!r}"
+                ) from last_error
+            time.sleep(min(poll_interval_seconds, max(0.0, deadline - time.monotonic())))
+
+
+@contextmanager
+def managed_vllm_server(
+    *,
+    spec: BuiltVLLMCommand,
+    run_root: Path,
+    server_url: str,
+    expected_model: str,
+    timeout_seconds: float,
+) -> Iterator[dict[str, Any]]:
+    vllm_root = run_root / "vllm"
+    vllm_root.mkdir(parents=True, exist_ok=True)
+    stdout_path = vllm_root / "stdout.log"
+    stderr_path = vllm_root / "stderr.log"
+    metadata_path = vllm_root / "server.json"
+
+    env = dict(os.environ)
+    env.update(spec.env)
+    stdout_handle = stdout_path.open("w")
+    stderr_handle = stderr_path.open("w")
+    process: subprocess.Popen[Any] | None = None
+
+    try:
+        process = subprocess.Popen(
+            spec.command,
+            cwd=run_root,
+            env=env,
+            stdout=stdout_handle,
+            stderr=stderr_handle,
+            start_new_session=True,
+        )
+        metadata: dict[str, Any] = {
+            "pid": process.pid,
+            "command": list(spec.command),
+            "env": _redacted_env(spec.env),
+            "server_url": server_url,
+            "expected_model": expected_model,
+            "stdout_path": str(stdout_path),
+            "stderr_path": str(stderr_path),
+        }
+        metadata_path.write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n")
+
+        wait_for_openai_server(
+            server_url=server_url,
+            expected_model=expected_model,
+            timeout_seconds=timeout_seconds,
+        )
+        yield metadata
+    finally:
+        stdout_handle.close()
+        stderr_handle.close()
+        if process is not None and process.poll() is None:
+            os.killpg(process.pid, signal.SIGTERM)
+            try:
+                process.wait(timeout=10.0)
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait(timeout=10.0)
 
 
 def run_local_parametric_memory_eval_dry_run(
