@@ -205,11 +205,21 @@ OpenAI-compatible local/proxy endpoint. It does not use Codex subscription.
 Keep `text_memory`, `skill_bundle`, and `agent_system` evolution disabled for a
 controlled parametric-memory comparison.
 
+The local parametric-memory runner sets `EVOLAB_TB_MODE=direct_solver` for the
+Harbor agent. This disables EvoLab's task-local memory, prompt overlay, skill
+graph, dynamic replanning, and insight-memory paths inside the Terminal Bench
+harness so the treatment variable is the serving-time adapter. The Harbor CLI
+still uses `mode=evolab` because the agent talks to an OpenAI-compatible local
+endpoint.
+
 Use `--auth-mode local` or `--auth-mode proxy` for local/proxy inference modes;
 neither is subscription mode. The selected auth mode is recorded in the
 summary. `--server-url` selects the OpenAI-compatible endpoint. With
 `--manage-server`, the command starts and stops vLLM locally; without it, the
-command targets an already-running endpoint.
+command targets an already-running endpoint. When `--manage-server` receives an
+absolute vLLM executable path, the runner prepends that executable's directory
+to the server `PATH`, so vLLM subprocesses can find venv-local helpers such as
+`ninja` during FlashInfer JIT startup.
 
 Repeated `--trainer-arg` values are preserved as trainer arguments, including
 values that begin with `--`. For example, `--trainer-arg --train-file` passes

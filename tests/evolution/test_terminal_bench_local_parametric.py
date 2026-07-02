@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -62,6 +63,7 @@ def test_build_evolab_harbor_env_sets_openai_chat_endpoint(
     assert env["OPENAI_BASE_URL"] == "http://127.0.0.1:8000/v1"
     assert env["AIGOCODE_GPT_BASE_URL"] == "http://127.0.0.1:8000/v1"
     assert env["OPENAI_API_KEY"] == "dummy-local-key"
+    assert env["EVOLAB_TB_MODE"] == "direct_solver"
 
 
 def test_build_evolab_harbor_env_empty_base_does_not_inherit_host_env(
@@ -111,6 +113,20 @@ def test_build_vllm_command_baseline_and_lora() -> None:
     assert "--enable-lora" in adapter.command
     assert "--lora-modules" in adapter.command
     assert "tb-parametric-memory=/tmp/adapter" in adapter.command
+
+
+def test_build_vllm_command_prefixes_absolute_executable_bin_to_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+
+    spec = build_vllm_command(vllm_executable="/root/evolab-vllm/bin/vllm")
+
+    assert spec.env["PATH"].split(os.pathsep)[:3] == [
+        "/root/evolab-vllm/bin",
+        "/usr/bin",
+        "/bin",
+    ]
 
 
 def test_build_vllm_command_derives_tensor_parallel_size_from_gpus() -> None:
@@ -245,6 +261,7 @@ def test_run_local_parametric_memory_eval_compares_baseline_and_adapter(
     assert all("mode=evolab" in command for command in commands)
     assert envs[0]["EVOLAB_TB_MODEL"] == "Qwen/Qwen3.6-35B-A3B"
     assert envs[1]["EVOLAB_TB_MODEL"] == "tb-parametric-memory"
+    assert all(env["EVOLAB_TB_MODE"] == "direct_solver" for env in envs)
 
 
 def test_run_local_parametric_memory_eval_scores_only_requested_attempts(

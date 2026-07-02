@@ -132,11 +132,23 @@ def build_evolab_harbor_env(
 ) -> dict[str, str]:
     env = dict(os.environ if base_env is None else base_env)
     env["EVOLAB_TB_LLM_API"] = "openai-chat-completions"
+    env["EVOLAB_TB_MODE"] = "direct_solver"
     env["EVOLAB_TB_MODEL"] = model
     env["OPENAI_BASE_URL"] = server_url
     env["AIGOCODE_GPT_BASE_URL"] = server_url
     env["OPENAI_API_KEY"] = "dummy-local-key"
     return env
+
+
+def _path_with_executable_parent(executable: str, base_path: str | None) -> str | None:
+    executable_path = Path(executable)
+    if not executable_path.is_absolute():
+        return None
+    executable_parent = str(executable_path.parent)
+    path_parts = [
+        part for part in (base_path or "").split(os.pathsep) if part and part != executable_parent
+    ]
+    return os.pathsep.join([executable_parent, *path_parts])
 
 
 def build_vllm_command(
@@ -210,7 +222,11 @@ def build_vllm_command(
                 f"{adapter_id}={adapter_path}",
             ]
         )
-    return BuiltVLLMCommand(command=command, env={"CUDA_VISIBLE_DEVICES": visible_gpus})
+    env = {"CUDA_VISIBLE_DEVICES": visible_gpus}
+    executable_path = _path_with_executable_parent(vllm_executable, os.environ.get("PATH"))
+    if executable_path is not None:
+        env["PATH"] = executable_path
+    return BuiltVLLMCommand(command=command, env=env)
 
 
 def _redacted_env(env: dict[str, str]) -> dict[str, str]:
