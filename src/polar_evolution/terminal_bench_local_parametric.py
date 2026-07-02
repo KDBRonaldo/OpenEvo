@@ -16,6 +16,9 @@ import httpx
 from polar_evolution.terminal_bench_per_task import (
     DEFAULT_TERMINAL_BENCH_ENVIRONMENT_IMPORT_PATH,
     DEFAULT_TERMINAL_BENCH_EXTRA_DOCKER_COMPOSE,
+    DEFAULT_TERMINAL_BENCH_PACKAGE_ROOT,
+    _attempt_reward,
+    _locate_evolved_attempt_trials,
 )
 
 DEFAULT_LOCAL_MODEL = "Qwen/Qwen3.6-35B-A3B"
@@ -52,6 +55,13 @@ class LocalParametricCondition:
 class BuiltVLLMCommand:
     command: list[str]
     env: dict[str, str]
+
+
+CommandRunner = Callable[..., Any]
+
+
+def _default_command_runner(command, *, cwd=None, env=None):
+    return subprocess.run(command, cwd=cwd, env=env, check=True)
 
 
 def build_local_harbor_command(
@@ -435,4 +445,245 @@ def run_local_parametric_memory_eval_dry_run(
             }
             for condition in conditions
         ],
+    }
+
+
+def run_local_parametric_memory_eval(
+    *,
+    task_root: Path,
+    task_ids: list[str],
+    run_root: Path,
+    terminal_bench_package_root: Path = DEFAULT_TERMINAL_BENCH_PACKAGE_ROOT,
+    model: str = DEFAULT_LOCAL_MODEL,
+    adapter_path: Path,
+    adapter_id: str = DEFAULT_LOCAL_PARAMETRIC_ADAPTER_ID,
+    adapter_artifact_id: str | None = None,
+    server_url: str,
+    n_attempts: int = 1,
+    verifier_env: dict[str, str] | None = None,
+    command_runner: CommandRunner = _default_command_runner,
+    manage_server: bool = True,
+    server_timeout_seconds: float = 600.0,
+    vllm_executable: str = DEFAULT_VLLM_EXECUTABLE,
+    gpus: list[str] | None = None,
+    port: int = 8000,
+) -> dict[str, Any]:
+    _validate_adapter_path(adapter_path)
+    attempt_count = max(1, int(n_attempts))
+    conditions = [
+        LocalParametricCondition(name="baseline", model=model),
+        LocalParametricCondition(
+            name="parametric_memory",
+            model=adapter_id,
+            adapter_id=adapter_id,
+            adapter_path=adapter_path,
+        ),
+    ]
+    condition_summaries = [
+        _run_local_parametric_condition(
+            condition=condition,
+            task_root=task_root,
+            task_ids=task_ids,
+            run_root=run_root,
+            terminal_bench_package_root=terminal_bench_package_root,
+            base_model=model,
+            server_url=server_url,
+            n_attempts=attempt_count,
+            verifier_env=dict(verifier_env or {}),
+            command_runner=command_runner,
+            manage_server=manage_server,
+            server_timeout_seconds=server_timeout_seconds,
+            vllm_executable=vllm_executable,
+            gpus=gpus,
+            port=port,
+            adapter_artifact_id=adapter_artifact_id,
+        )
+        for condition in conditions
+    ]
+    baseline, treatment = condition_summaries
+    return {
+        "dry_run": False,
+        "benchmark": "terminal-bench-2.1",
+        "auth_mode": "local",
+        "task_root": str(task_root),
+        "run_root": str(run_root),
+        "terminal_bench_package_root": str(terminal_bench_package_root),
+        "base_model": model,
+        "server_url": server_url,
+        "n_attempts": attempt_count,
+        "manage_server": manage_server,
+        "enabled_artifacts": ["parametric_memory"],
+        "disabled_artifacts": list(DEFAULT_LOCAL_PARAMETRIC_DISABLED_ARTIFACTS),
+        "conditions": condition_summaries,
+        "delta": {
+            "pass_at_1": (
+                treatment["pass_at_1"]["passed"] - baseline["pass_at_1"]["passed"]
+            ),
+            "pass_at_k": (
+                treatment["pass_at_k"]["passed"] - baseline["pass_at_k"]["passed"]
+            ),
+        },
+    }
+
+
+def _validate_adapter_path(adapter_path: Path) -> None:
+    if str(adapter_path) in {"", "."}:
+        raise ValueError("adapter_path must be a non-empty path")
+
+
+def _run_local_parametric_condition(
+    *,
+    condition: LocalParametricCondition,
+    task_root: Path,
+    task_ids: list[str],
+    run_root: Path,
+    terminal_bench_package_root: Path,
+    base_model: str,
+    server_url: str,
+    n_attempts: int,
+    verifier_env: dict[str, str],
+    command_runner: CommandRunner,
+    manage_server: bool,
+    server_timeout_seconds: float,
+    vllm_executable: str,
+    gpus: list[str] | None,
+    port: int,
+    adapter_artifact_id: str | None,
+) -> dict[str, Any]:
+    condition_root = run_root / condition.name
+    jobs_dir = condition_root / "harbor_jobs"
+    condition_root.mkdir(parents=True, exist_ok=True)
+
+    if manage_server:
+        server_context = managed_vllm_server(
+            spec=_build_condition_vllm_command(
+                condition=condition,
+                base_model=base_model,
+                port=port,
+                vllm_executable=vllm_executable,
+                gpus=gpus,
+            ),
+            run_root=condition_root,
+            server_url=server_url,
+            expected_model=condition.model,
+            timeout_seconds=server_timeout_seconds,
+        )
+    else:
+        server_context = _unmanaged_server_context()
+
+    with server_context as server_metadata:
+        task_results = [
+            _run_local_parametric_task(
+                condition=condition,
+                task_root=task_root,
+                task_id=task_id,
+                jobs_dir=jobs_dir,
+                terminal_bench_package_root=terminal_bench_package_root,
+                server_url=server_url,
+                n_attempts=n_attempts,
+                verifier_env=verifier_env,
+                command_runner=command_runner,
+            )
+            for task_id in task_ids
+        ]
+
+    pass_at_1 = sum(1 for task in task_results if task["pass_at_1"])
+    pass_at_k = sum(1 for task in task_results if task["pass_at_k"])
+    summary: dict[str, Any] = {
+        "name": condition.name,
+        "model": condition.model,
+        "jobs_dir": str(jobs_dir),
+        "pass_at_1": {"passed": pass_at_1, "total": len(task_results)},
+        "pass_at_k": {"passed": pass_at_k, "total": len(task_results), "k": n_attempts},
+        "tasks": task_results,
+    }
+    if server_metadata is not None:
+        summary["server"] = server_metadata
+    if condition.adapter_id and condition.adapter_path is not None:
+        summary["adapter"] = {
+            "artifact_id": adapter_artifact_id,
+            "adapter_id": condition.adapter_id,
+            "adapter_path": str(condition.adapter_path),
+        }
+    return summary
+
+
+@contextmanager
+def _unmanaged_server_context() -> Iterator[None]:
+    yield None
+
+
+def _build_condition_vllm_command(
+    *,
+    condition: LocalParametricCondition,
+    base_model: str,
+    port: int,
+    vllm_executable: str,
+    gpus: list[str] | None,
+) -> BuiltVLLMCommand:
+    if condition.adapter_id and condition.adapter_path is not None:
+        return build_vllm_command(
+            model=base_model,
+            served_model_name=condition.adapter_id,
+            port=port,
+            vllm_executable=vllm_executable,
+            gpus=gpus,
+            adapter_id=condition.adapter_id,
+            adapter_path=condition.adapter_path,
+        )
+    return build_vllm_command(
+        model=base_model,
+        served_model_name=base_model,
+        port=port,
+        vllm_executable=vllm_executable,
+        gpus=gpus,
+    )
+
+
+def _run_local_parametric_task(
+    *,
+    condition: LocalParametricCondition,
+    task_root: Path,
+    task_id: str,
+    jobs_dir: Path,
+    terminal_bench_package_root: Path,
+    server_url: str,
+    n_attempts: int,
+    verifier_env: dict[str, str],
+    command_runner: CommandRunner,
+) -> dict[str, Any]:
+    job_name = f"{condition.name}-{task_id}"
+    command = build_local_harbor_command(
+        job_name=job_name,
+        task_root=task_root,
+        task_id=task_id,
+        jobs_dir=jobs_dir,
+        model=condition.model,
+        verifier_env=verifier_env,
+        n_attempts=n_attempts,
+    )
+    env = build_evolab_harbor_env(
+        base_env=os.environ,
+        server_url=server_url,
+        model=condition.model,
+    )
+    command_runner(command, cwd=terminal_bench_package_root, env=env)
+
+    trials = _locate_evolved_attempt_trials(task_id=task_id, job_root=jobs_dir / job_name)
+    attempts = [
+        {
+            "trial_dir": str(trial),
+            "reward": reward,
+            "passed": reward is not None and reward >= 1.0,
+        }
+        for trial in trials
+        for reward in [_attempt_reward(trial)]
+    ]
+    return {
+        "task_id": task_id,
+        "job_name": job_name,
+        "job_root": str(jobs_dir / job_name),
+        "attempts": attempts,
+        "pass_at_1": bool(attempts and attempts[0]["passed"]),
+        "pass_at_k": any(attempt["passed"] for attempt in attempts),
     }

@@ -12,6 +12,7 @@ from polar_evolution.terminal_bench_local_parametric import (
     build_evolab_harbor_env,
     build_local_harbor_command,
     build_vllm_command,
+    run_local_parametric_memory_eval,
     run_local_parametric_memory_eval_dry_run,
 )
 
@@ -162,6 +163,159 @@ def test_local_parametric_dry_run_reports_matrix_and_disabled_artifacts(
     ]
     assert payload["conditions"][0]["model"] == "Qwen/Qwen3.6-35B-A3B"
     assert payload["conditions"][1]["model"] == "tb-parametric-memory"
+
+
+def test_run_local_parametric_memory_eval_compares_baseline_and_adapter(
+    tmp_path: Path,
+) -> None:
+    commands: list[list[str]] = []
+    envs: list[dict[str, str]] = []
+
+    def fake_command_runner(command, *, cwd=None, env=None):
+        del cwd
+        commands.append(command)
+        envs.append(dict(env or {}))
+        jobs_dir = Path(command[command.index("--jobs-dir") + 1])
+        job_name = command[command.index("--job-name") + 1]
+        model = command[command.index("--model") + 1]
+        task_id = command[command.index("--include-task-name") + 1]
+        reward = 1.0 if model == "tb-parametric-memory" else 0.0
+        for attempt_index in range(1, 3):
+            trial = jobs_dir / job_name / f"{task_id}__attempt{attempt_index}"
+            (trial / "agent").mkdir(parents=True)
+            (trial / "verifier").mkdir()
+            (trial / "result.json").write_text(
+                json.dumps(
+                    {
+                        "trial_name": trial.name,
+                        "task_name": task_id,
+                        "started_at": f"2026-07-02T00:00:0{attempt_index}Z",
+                        "status": "COMPLETED",
+                        "verifier_result": {"rewards": {"reward": reward}},
+                        "agent_result": {
+                            "metadata": {
+                                "terminal_bench_harbor_agent": {
+                                    "model_name": model,
+                                    "task_id": task_id,
+                                }
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (trial / "agent" / "stdout.txt").write_text("done\n", encoding="utf-8")
+            (trial / "verifier" / "reward.txt").write_text(
+                f"{reward}\n",
+                encoding="utf-8",
+            )
+        return {}
+
+    summary = run_local_parametric_memory_eval(
+        task_root=tmp_path / "tasks",
+        task_ids=["query-optimize"],
+        run_root=tmp_path / "run",
+        terminal_bench_package_root=tmp_path / "terminal-bench-package",
+        model="Qwen/Qwen3.6-35B-A3B",
+        adapter_path=tmp_path / "adapter",
+        adapter_id="tb-parametric-memory",
+        adapter_artifact_id="art-parametric",
+        server_url="http://127.0.0.1:8000/v1",
+        n_attempts=2,
+        verifier_env={},
+        command_runner=fake_command_runner,
+        manage_server=False,
+    )
+
+    assert [condition["name"] for condition in summary["conditions"]] == [
+        "baseline",
+        "parametric_memory",
+    ]
+    baseline, treatment = summary["conditions"]
+    assert baseline["pass_at_1"] == {"passed": 0, "total": 1}
+    assert baseline["pass_at_k"] == {"passed": 0, "total": 1, "k": 2}
+    assert treatment["pass_at_1"] == {"passed": 1, "total": 1}
+    assert treatment["pass_at_k"] == {"passed": 1, "total": 1, "k": 2}
+    assert summary["delta"]["pass_at_1"] == 1
+    assert summary["delta"]["pass_at_k"] == 1
+    assert treatment["adapter"]["artifact_id"] == "art-parametric"
+    assert treatment["adapter"]["adapter_id"] == "tb-parametric-memory"
+    assert all("mode=evolab" in command for command in commands)
+    assert envs[0]["EVOLAB_TB_MODEL"] == "Qwen/Qwen3.6-35B-A3B"
+    assert envs[1]["EVOLAB_TB_MODEL"] == "tb-parametric-memory"
+
+
+def test_run_local_parametric_memory_eval_requires_adapter_path(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="adapter_path"):
+        run_local_parametric_memory_eval(
+            task_root=tmp_path / "tasks",
+            task_ids=["query-optimize"],
+            run_root=tmp_path / "run",
+            adapter_path=Path(),
+            server_url="http://127.0.0.1:8000/v1",
+        )
+
+
+def test_run_local_parametric_memory_eval_manages_baseline_and_adapter_servers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    servers: list[dict[str, object]] = []
+
+    @local_parametric.contextmanager
+    def fake_managed_vllm_server(**kwargs):
+        servers.append(kwargs)
+        yield {"server_url": kwargs["server_url"], "expected_model": kwargs["expected_model"]}
+
+    def fake_command_runner(command, *, cwd=None, env=None):
+        jobs_dir = Path(command[command.index("--jobs-dir") + 1])
+        job_name = command[command.index("--job-name") + 1]
+        task_id = command[command.index("--include-task-name") + 1]
+        model = command[command.index("--model") + 1]
+        reward = 1.0 if model == "tb-parametric-memory" else 0.0
+        trial = jobs_dir / job_name / f"{task_id}__attempt1"
+        (trial / "agent").mkdir(parents=True)
+        (trial / "verifier").mkdir()
+        (trial / "result.json").write_text(
+            json.dumps(
+                {
+                    "trial_name": trial.name,
+                    "task_name": task_id,
+                    "status": "COMPLETED",
+                    "verifier_result": {"rewards": {"reward": reward}},
+                }
+            ),
+            encoding="utf-8",
+        )
+        return {}
+
+    monkeypatch.setattr(local_parametric, "managed_vllm_server", fake_managed_vllm_server)
+
+    run_local_parametric_memory_eval(
+        task_root=tmp_path / "tasks",
+        task_ids=["query-optimize"],
+        run_root=tmp_path / "run",
+        model="Qwen/Qwen3.6-35B-A3B",
+        adapter_path=tmp_path / "adapter",
+        adapter_id="tb-parametric-memory",
+        server_url="http://127.0.0.1:8000/v1",
+        n_attempts=1,
+        verifier_env={},
+        command_runner=fake_command_runner,
+        manage_server=True,
+        gpus=["0"],
+        vllm_executable="vllm",
+    )
+
+    assert [server["expected_model"] for server in servers] == [
+        "Qwen/Qwen3.6-35B-A3B",
+        "tb-parametric-memory",
+    ]
+    baseline_spec = servers[0]["spec"]
+    treatment_spec = servers[1]["spec"]
+    assert "--enable-lora" not in baseline_spec.command
+    assert "--enable-lora" in treatment_spec.command
+    assert f"tb-parametric-memory={tmp_path / 'adapter'}" in treatment_spec.command
 
 
 def test_redacted_env_redacts_secret_values() -> None:
