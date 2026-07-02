@@ -100,7 +100,7 @@ def build_evolab_harbor_env(
     server_url: str,
     model: str,
 ) -> dict[str, str]:
-    env = dict(base_env or os.environ)
+    env = dict(os.environ if base_env is None else base_env)
     env["EVOLAB_TB_LLM_API"] = "openai-chat-completions"
     env["EVOLAB_TB_MODEL"] = model
     env["OPENAI_BASE_URL"] = server_url
@@ -114,7 +114,7 @@ def build_vllm_command(
     model: str = DEFAULT_LOCAL_MODEL,
     served_model_name: str = DEFAULT_LOCAL_MODEL,
     port: int = 8000,
-    tensor_parallel_size: int = 4,
+    tensor_parallel_size: int | None = None,
     gpu_memory_utilization: float = 0.75,
     max_model_len: int = 16384,
     vllm_executable: str = DEFAULT_VLLM_EXECUTABLE,
@@ -126,7 +126,22 @@ def build_vllm_command(
         if not adapter_id or adapter_path is None:
             raise ValueError("adapter_id and adapter_path must be provided together")
 
-    visible_gpus = ",".join(gpus or DEFAULT_VLLM_GPUS)
+    selected_gpus = list(gpus or DEFAULT_VLLM_GPUS)
+    if not selected_gpus:
+        raise ValueError("at least one GPU must be selected")
+    effective_tensor_parallel_size = (
+        len(selected_gpus) if tensor_parallel_size is None else int(tensor_parallel_size)
+    )
+    if effective_tensor_parallel_size < 1:
+        raise ValueError("tensor_parallel_size must be at least 1")
+    if len(selected_gpus) < effective_tensor_parallel_size:
+        raise ValueError(
+            "tensor_parallel_size cannot exceed selected GPU count: "
+            f"tensor_parallel_size={effective_tensor_parallel_size}, "
+            f"gpus={len(selected_gpus)}"
+        )
+
+    visible_gpus = ",".join(selected_gpus)
     command = [
         vllm_executable,
         "serve",
@@ -138,7 +153,7 @@ def build_vllm_command(
         "--served-model-name",
         served_model_name,
         "--tensor-parallel-size",
-        str(tensor_parallel_size),
+        str(effective_tensor_parallel_size),
         "--gpu-memory-utilization",
         str(gpu_memory_utilization),
         "--max-model-len",

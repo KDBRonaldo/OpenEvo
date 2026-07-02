@@ -58,6 +58,21 @@ def test_build_evolab_harbor_env_sets_openai_chat_endpoint(
     assert env["OPENAI_API_KEY"] == "dummy-local-key"
 
 
+def test_build_evolab_harbor_env_empty_base_does_not_inherit_host_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("POLAR_SENTINEL_HOST_ENV", "host-value")
+
+    env = build_evolab_harbor_env(
+        base_env={},
+        server_url="http://127.0.0.1:8000/v1",
+        model="tb-parametric-memory",
+    )
+
+    assert "POLAR_SENTINEL_HOST_ENV" not in env
+    assert env["EVOLAB_TB_LLM_API"] == "openai-chat-completions"
+
+
 def test_build_vllm_command_baseline_and_lora() -> None:
     baseline = build_vllm_command(
         model="Qwen/Qwen3.6-35B-A3B",
@@ -90,6 +105,27 @@ def test_build_vllm_command_baseline_and_lora() -> None:
     assert "--enable-lora" in adapter.command
     assert "--lora-modules" in adapter.command
     assert "tb-parametric-memory=/tmp/adapter" in adapter.command
+
+
+def test_build_vllm_command_derives_tensor_parallel_size_from_gpus() -> None:
+    spec = build_vllm_command(
+        model="Qwen/Qwen3.6-35B-A3B",
+        served_model_name="Qwen/Qwen3.6-35B-A3B",
+        gpus=["0", "1"],
+    )
+
+    assert spec.env["CUDA_VISIBLE_DEVICES"] == "0,1"
+    assert spec.command[spec.command.index("--tensor-parallel-size") + 1] == "2"
+
+
+def test_build_vllm_command_rejects_tensor_parallel_size_larger_than_gpus() -> None:
+    with pytest.raises(ValueError, match="tensor_parallel_size"):
+        build_vllm_command(
+            model="Qwen/Qwen3.6-35B-A3B",
+            served_model_name="Qwen/Qwen3.6-35B-A3B",
+            gpus=["0", "1"],
+            tensor_parallel_size=4,
+        )
 
 
 def test_local_parametric_dry_run_reports_matrix_and_disabled_artifacts(
