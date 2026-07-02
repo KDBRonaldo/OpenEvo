@@ -3718,6 +3718,414 @@ def test_parametric_memory_lora_sft_corrective_projection_can_keep_recent_tool_m
     assert artifact.manifest["training_projection"]["max_input_tool_messages"] == 1
 
 
+def test_parametric_memory_lora_sft_corrective_projection_can_export_weighted_stages(
+    tmp_path: Path,
+):
+    trainer_script = tmp_path / "fake_trainer.py"
+    trainer_script.write_text(
+        "from pathlib import Path\n"
+        "import argparse\n"
+        "parser = argparse.ArgumentParser()\n"
+        "parser.add_argument('--train-file')\n"
+        "parser.add_argument('--output-dir')\n"
+        "args = parser.parse_args()\n"
+        "Path(args.output_dir).mkdir(parents=True, exist_ok=True)\n"
+        "(Path(args.output_dir) / 'adapter_config.json').write_text('{}')\n",
+        encoding="utf-8",
+    )
+    dataset = _parametric_dataset_artifact(
+        tmp_path,
+        [
+            {
+                "event_id": "evt_corrective_stages",
+                "task_id": "terminal-bench/password-recovery",
+                "session_id": "password-recovery__failed",
+                "status": "COMPLETED",
+                "reward": 0.0,
+                "traces": [
+                    {
+                        "metadata": {
+                            "llm_calls": [
+                                {
+                                    "input_messages": [
+                                        {
+                                            "role": "system",
+                                            "content": "Use tb_read_task first.",
+                                        },
+                                        {
+                                            "role": "user",
+                                            "content": "Instruction: recover launchcode.txt",
+                                        },
+                                    ],
+                                    "metadata": {
+                                        "step_index": 0,
+                                        "tool_specs": [
+                                            {
+                                                "name": "tb_read_task",
+                                                "description": "Read the task.",
+                                                "parameters_schema": {
+                                                    "type": "object",
+                                                    "properties": {
+                                                        "task_id": {"type": "string"}
+                                                    },
+                                                    "required": ["task_id"],
+                                                },
+                                            },
+                                            {
+                                                "name": "tb_exec",
+                                                "description": "Run a command.",
+                                                "parameters_schema": {
+                                                    "type": "object",
+                                                    "properties": {
+                                                        "task_id": {"type": "string"},
+                                                        "command": {"type": "string"},
+                                                    },
+                                                    "required": ["task_id", "command"],
+                                                },
+                                            },
+                                        ],
+                                    },
+                                },
+                                {
+                                    "input_messages": [
+                                        {
+                                            "role": "system",
+                                            "content": "Use tb_read_task first.",
+                                        },
+                                        {
+                                            "role": "user",
+                                            "content": "Instruction: recover launchcode.txt",
+                                        },
+                                        {
+                                            "role": "tool",
+                                            "name": "tb_read_task",
+                                            "tool_call_id": "call-read",
+                                            "content": (
+                                                "task_yaml: password starts with 8XD "
+                                                "and ends with W54"
+                                            ),
+                                        },
+                                    ],
+                                    "metadata": {"step_index": 1},
+                                },
+                            ],
+                        },
+                    }
+                ],
+            }
+        ],
+    )
+    job = _job(
+        "parametric_memory_lora_sft",
+        tmp_path,
+        input_artifacts=[dataset],
+        config={
+            "base_model": "Qwen/Qwen3.6-35B-A3B",
+            "training_projection": {
+                "type": "terminal_bench_corrective_tool_call_policy",
+                "stages": [
+                    {
+                        "name": "read_task",
+                        "input_contains": ["recover launchcode.txt"],
+                        "max_examples": 1,
+                        "target_tool_call": {
+                            "name": "tb_read_task",
+                            "arguments": {"task_id": "terminal-bench-task"},
+                        },
+                    },
+                    {
+                        "name": "short_exec_after_read",
+                        "input_contains": ["starts with 8XD", "ends with W54"],
+                        "max_examples": 1,
+                        "repeat": 2,
+                        "target_tool_call": {
+                            "name": "tb_exec",
+                            "arguments": {
+                                "task_id": "terminal-bench-task",
+                                "command": (
+                                    "grep -ao '8XD[A-Z0-9]*' disk "
+                                    "> /app/recovered_passwords.txt;true"
+                                ),
+                            },
+                        },
+                    },
+                ],
+            },
+            "trainer": {
+                "command": "python",
+                "args": [
+                    str(trainer_script),
+                    "--train-file",
+                    "{training_dataset}",
+                    "--output-dir",
+                    "{adapter_dir}",
+                ],
+            },
+        },
+    )
+
+    [artifact] = run_method(job, artifact_root=tmp_path / "artifacts")
+
+    train_path = (
+        tmp_path
+        / "artifacts"
+        / "workers"
+        / job.job_id
+        / "parametric_memory_lora_sft"
+        / "training.jsonl"
+    )
+    training_lines = [
+        json.loads(line) for line in train_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert len(training_lines) == 3
+    assert [
+        line["metadata"]["projection_stage"]
+        for line in training_lines
+    ] == [
+        "read_task",
+        "short_exec_after_read",
+        "short_exec_after_read",
+    ]
+    assert [line["metadata"]["projection_repeat_index"] for line in training_lines] == [
+        0,
+        0,
+        1,
+    ]
+    assert (
+        training_lines[0]["messages"][-1]["tool_calls"][0]["function"]["name"]
+        == "tb_read_task"
+    )
+    assert (
+        training_lines[1]["messages"][-1]["tool_calls"][0]["function"]["name"]
+        == "tb_exec"
+    )
+    assert (
+        training_lines[2]["messages"][-1]["tool_calls"][0]["function"]["arguments"]
+        == training_lines[1]["messages"][-1]["tool_calls"][0]["function"]["arguments"]
+    )
+    assert artifact.manifest["training_projection"]["stages"][1]["repeat"] == 2
+
+
+def test_parametric_memory_lora_sft_password_recovery_recipe_exports_mixed_records(
+    tmp_path: Path,
+):
+    trainer_script = tmp_path / "fake_trainer.py"
+    trainer_script.write_text(
+        "from pathlib import Path\n"
+        "import argparse\n"
+        "parser = argparse.ArgumentParser()\n"
+        "parser.add_argument('--train-file')\n"
+        "parser.add_argument('--output-dir')\n"
+        "args = parser.parse_args()\n"
+        "Path(args.output_dir).mkdir(parents=True, exist_ok=True)\n"
+        "(Path(args.output_dir) / 'adapter_config.json').write_text('{}')\n",
+        encoding="utf-8",
+    )
+    target_command = "derive-short-target > /app/recovered_passwords.txt"
+    dataset = _parametric_dataset_artifact(
+        tmp_path,
+        [
+            {
+                "event_id": "evt_password_recipe",
+                "task_id": "terminal-bench/password-recovery",
+                "session_id": "password-recovery__failed",
+                "status": "COMPLETED",
+                "reward": 0.0,
+                "traces": [
+                    {
+                        "metadata": {
+                            "llm_calls": [
+                                {
+                                    "input_messages": [
+                                        {
+                                            "role": "system",
+                                            "content": "Use Terminal Bench tools.",
+                                        },
+                                        {
+                                            "role": "user",
+                                            "content": (
+                                                "static-terminal-bench-harbor: "
+                                                "inspect the task before acting."
+                                            ),
+                                        },
+                                    ],
+                                    "metadata": {
+                                        "step_index": 0,
+                                        "tool_specs": [
+                                            {
+                                                "name": "tb_read_task",
+                                                "description": "Read task.",
+                                                "parameters_schema": {
+                                                    "type": "object",
+                                                    "properties": {
+                                                        "task_id": {"type": "string"}
+                                                    },
+                                                    "required": ["task_id"],
+                                                },
+                                            },
+                                            {
+                                                "name": "tb_exec",
+                                                "description": "Run a command.",
+                                                "parameters_schema": {
+                                                    "type": "object",
+                                                    "properties": {
+                                                        "task_id": {"type": "string"},
+                                                        "command": {"type": "string"},
+                                                    },
+                                                    "required": ["task_id", "command"],
+                                                },
+                                            },
+                                        ],
+                                    },
+                                },
+                                {
+                                    "input_messages": [
+                                        {
+                                            "role": "system",
+                                            "content": "Use Terminal Bench tools.",
+                                        },
+                                        {
+                                            "role": "user",
+                                            "content": (
+                                                "static-terminal-bench-harbor: "
+                                                "inspect the task before acting."
+                                            ),
+                                        },
+                                        {
+                                            "role": "tool",
+                                            "name": "tb_read_task",
+                                            "tool_call_id": "call-read",
+                                            "content": (
+                                                "Task asks for /app/recovered_passwords.txt "
+                                                "and gives prefix/suffix constraints."
+                                            ),
+                                        },
+                                    ],
+                                    "metadata": {"step_index": 1},
+                                },
+                                {
+                                    "input_messages": [
+                                        {
+                                            "role": "system",
+                                            "content": "Use Terminal Bench tools.",
+                                        },
+                                        {
+                                            "role": "user",
+                                            "content": (
+                                                "static-terminal-bench-harbor: "
+                                                "inspect the task before acting."
+                                            ),
+                                        },
+                                        {
+                                            "role": "tool",
+                                            "name": "tb_read_task",
+                                            "tool_call_id": "call-read",
+                                            "content": (
+                                                "Task asks for /app/recovered_passwords.txt "
+                                                "and gives prefix/suffix constraints."
+                                            ),
+                                        },
+                                        {
+                                            "role": "tool",
+                                            "name": "tb_exec",
+                                            "tool_call_id": "call-drift",
+                                            "content": "Dummy entry from an unrelated grep.",
+                                        },
+                                    ],
+                                    "metadata": {"step_index": 2},
+                                },
+                            ],
+                        },
+                    }
+                ],
+            }
+        ],
+    )
+    job = _job(
+        "parametric_memory_lora_sft",
+        tmp_path,
+        input_artifacts=[dataset],
+        config={
+            "base_model": "Qwen/Qwen3.6-35B-A3B",
+            "training_projection": {
+                "type": "terminal_bench_password_recovery_shorttarget_recipe",
+                "target_command": target_command,
+                "target_task_id": "terminal-bench-task",
+                "read_task_max_examples": 1,
+                "after_read_max_examples": 1,
+                "after_read_repeat": 2,
+                "correction_input_contains": ["Dummy entry"],
+                "correction_max_examples": 1,
+                "correction_repeat": 1,
+                "max_input_tool_messages": 2,
+            },
+            "trainer": {
+                "command": "python",
+                "args": [
+                    str(trainer_script),
+                    "--train-file",
+                    "{training_dataset}",
+                    "--output-dir",
+                    "{adapter_dir}",
+                ],
+            },
+        },
+    )
+
+    [artifact] = run_method(job, artifact_root=tmp_path / "artifacts")
+
+    train_path = (
+        tmp_path
+        / "artifacts"
+        / "workers"
+        / job.job_id
+        / "parametric_memory_lora_sft"
+        / "training.jsonl"
+    )
+    training_lines = [
+        json.loads(line) for line in train_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert len(training_lines) == 4
+    assert [
+        line["metadata"]["projection_stage"]
+        for line in training_lines
+    ] == [
+        "read_task",
+        "short_exec_after_read",
+        "short_exec_after_read",
+        "correct_back_to_short_exec",
+    ]
+    assert [
+        line["messages"][-1]["tool_calls"][0]["function"]["name"]
+        for line in training_lines
+    ] == ["tb_read_task", "tb_exec", "tb_exec", "tb_exec"]
+    assert (
+        training_lines[1]["messages"][-1]["tool_calls"][0]["function"]["arguments"]
+        == {
+            "task_id": "terminal-bench-task",
+            "command": target_command,
+        }
+    )
+    assert "Dummy entry" in json.dumps(training_lines[-1], ensure_ascii=False)
+    assert artifact.manifest["training_projection"]["recipe"] == {
+        "type": "terminal_bench_password_recovery_shorttarget_recipe",
+        "target_command": target_command,
+        "target_task_id": "terminal-bench-task",
+        "read_task_input_contains": ["static-terminal-bench-harbor"],
+        "after_read_input_contains": ["recovered_passwords.txt"],
+        "correction_input_contains": ["Dummy entry"],
+        "read_task_max_examples": 1,
+        "after_read_max_examples": 1,
+        "after_read_repeat": 2,
+        "correction_max_examples": 1,
+        "correction_repeat": 1,
+        "max_input_tool_messages": 2,
+    }
+    assert artifact.manifest["training_projection"]["stages"][2]["name"] == (
+        "correct_back_to_short_exec"
+    )
+
+
 def test_parametric_memory_lora_sft_requires_trainer_placeholders(tmp_path: Path):
     trainer_script = tmp_path / "fake_trainer.py"
     trainer_script.write_text("print('unused')\n", encoding="utf-8")

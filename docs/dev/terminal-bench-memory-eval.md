@@ -223,6 +223,25 @@ can exceed 13k tokens, so use `max_input_tool_messages` or the CLI
 `--training-corrective-max-input-tool-messages` to keep the system/user prompt
 and only the most recent tool-result messages when the trainer cannot fit the
 full prefix.
+For stage-aware corrective SFT, set
+`{"type": "terminal_bench_corrective_tool_call_policy", "stages": [...]}`.
+Each stage has `name`, `target_tool_call`, optional `input_contains`,
+`max_examples` (default 64), `repeat` (default 1), and optional
+`max_input_tool_messages`. The exporter scans the saved `llm_calls` separately
+for each stage, emits repeated weighted samples when `repeat > 1`, and records
+`projection_stage`, `projection_stage_index`, and `projection_repeat_index` in
+each JSONL line's metadata. The CLI accepts repeated
+`--training-corrective-stage-json` objects for this form.
+For the `password-recovery` local Qwen smoke, the higher-level
+`terminal_bench_password_recovery_shorttarget_recipe` projection expands to
+the same staged corrective contract. It emits a `read_task` target from the
+initial Harbor prompt, repeated `short_exec_after_read` targets after the task
+read output, and an optional `correct_back_to_short_exec` target when
+`correction_input_contains` is supplied. The recipe defaults to matching
+`static-terminal-bench-harbor` for the read stage and `recovered_passwords.txt`
+for the after-read stage; the target command still must be provided explicitly
+and should derive `/app/recovered_passwords.txt` from task files rather than
+embed a protected answer.
 For Qwen chat-template SFT, the trainer must not derive the loss mask by
 tokenizing the full conversation and a generation prefix independently and then
 masking by prefix token count. BPE can merge the prompt-ending newline with the
@@ -310,9 +329,10 @@ uv run polar-evolution terminal-bench-parametric-memory-job \
   --output /tmp/tb21-parametric-memory/job.json
 ```
 
-To train a corrective adapter from a failed local trajectory prefix, point the
+To train a corrective adapter from failed local trajectory prefixes, point the
 job at the failed Harbor trial, choose the corrective projection, and provide
-the target `tb_exec` command to learn from that exact prefix:
+one or more staged next-tool-call targets. Keep target commands bounded and
+avoid embedding protected task answers in docs or reusable configs:
 
 ```sh
 uv run polar-evolution terminal-bench-parametric-memory-job \
@@ -331,12 +351,87 @@ uv run polar-evolution terminal-bench-parametric-memory-job \
   --trainer-arg --output-dir \
   --trainer-arg '{adapter_dir}' \
   --training-projection terminal_bench_corrective_tool_call_policy \
-  --training-corrective-input-contains 'grep -a -o' \
-  --training-corrective-max-input-tool-messages 5 \
-  --training-corrective-target-command "printf '%s\n' 8XDP5Q2RT9ZK7VB3BV4WW54 > /app/recovered_passwords.txt && test -f /app/recovered_passwords.txt && wc -c /app/recovered_passwords.txt && sed -n l /app/recovered_passwords.txt" \
+  --training-corrective-stage-json '{"name":"read_task","input_contains":["static-terminal-bench-harbor"],"target_tool_call":{"name":"tb_read_task","arguments":{"task_id":"terminal-bench-task"}}}' \
+  --training-corrective-stage-json '{"name":"short_exec_after_read","input_contains":["recovered_passwords.txt"],"max_examples":64,"repeat":6,"max_input_tool_messages":5,"target_tool_call":{"name":"tb_exec","arguments":{"task_id":"terminal-bench-task","command":"<bounded command that derives /app/recovered_passwords.txt from task files>"}}}' \
   --run-worker \
   --output /tmp/tb21-parametric-memory-corrective/job.json
 ```
+
+The equivalent first-class recipe form is less error-prone for the
+`password-recovery` short-target smoke:
+
+```sh
+uv run polar-evolution terminal-bench-parametric-memory-job \
+  --input /tmp/tb21-parametric-memory-password-toolpolicy-20260702-110343/local-eval-password-toolpolicy-2048/baseline/harbor_jobs/baseline-password-recovery/password-recovery__AzMbthq \
+  --db /tmp/tb21-parametric-memory-corrective/evolution.db \
+  --artifact-root /tmp/tb21-parametric-memory-corrective/artifacts \
+  --dataset-name tb21-parametric-memory-password-recipe \
+  --policy-version tb21-qwen36-local-password-recipe \
+  --status COMPLETED \
+  --base-model Qwen/Qwen3.6-35B-A3B \
+  --adapter-id tb-parametric-memory-password-recipe \
+  --trainer-command /root/evolab-vllm/bin/python \
+  --trainer-arg /tmp/qwen36_lora_sft.py \
+  --trainer-arg --train-file \
+  --trainer-arg '{training_dataset}' \
+  --trainer-arg --output-dir \
+  --trainer-arg '{adapter_dir}' \
+  --training-projection terminal_bench_password_recovery_shorttarget_recipe \
+  --training-recipe-target-command '<bounded command that derives /app/recovered_passwords.txt from task files>' \
+  --training-recipe-after-read-repeat 6 \
+  --training-recipe-correction-input-contains 'Dummy entry' \
+  --training-recipe-max-input-tool-messages 5 \
+  --run-worker \
+  --output /tmp/tb21-parametric-memory-corrective/job.json
+```
+
+The first successful real local parametric-memory smoke used this stage-aware
+short-target setup on `password-recovery`. A command-only Harbor smoke confirmed
+the bounded derivation strategy at
+`/tmp/tb21-parametric-memory-password-shorttarget-smoke-20260702-180114`
+(`reward=1.0`). Training then used 28 corrective records
+(`read_task`, repeated `short_exec_after_read`, and correction-back examples)
+with `Qwen/Qwen3.6-35B-A3B`, LoRA rank 8, and 84 SFT steps. The controlled
+one-task local eval at
+`/tmp/tb21-parametric-memory-password-shorttarget-eval-20260702-181502`
+had baseline `0/1`, parametric memory `1/1`, and delta `+1.0` pass@1/pass@k.
+The vLLM log confirmed the adapter was loaded. Treat this as a one-task
+hand-built projection validation, not a full Terminal-Bench 2.1 result.
+
+Two follow-up runs drove the same idea through the committed framework path,
+using `terminal-bench-parametric-memory-job --run-worker` to ingest the failed
+trial, export staged corrective JSONL, train the LoRA adapter, register a
+`parametric_memory` artifact, rewrite the adapter for Qwen3.6 MoE vLLM serving,
+and run `terminal-bench-local-parametric-memory-eval`:
+
+- `/tmp/tb21-parametric-memory-staged-framework-20260702-184506`: 25 records
+  (`read_task` once, four `short_exec_after_read` prefixes repeated six times),
+  75 SFT steps, artifact `art_ff63382e8930464a`. Eval result was baseline
+  `0/1`, parametric memory `0/1`, delta `0`. The adapter served successfully,
+  but the first `tb_exec` drifted to unrelated UUID/discovery commands and did
+  not write `/app/recovered_passwords.txt`.
+- `/tmp/tb21-parametric-memory-staged-afterread-20260702-191729`: 25 records
+  (`read_task` once, only the immediate after-read prefix repeated 24 times),
+  75 SFT steps, artifact `art_1a53d92856904d0e`. Eval result was baseline
+  `0/1`, parametric memory `0/1`, delta `0`. This narrower dataset overfit
+  badly: the first `tb_read_task` call produced malformed repeated task-id
+  arguments.
+
+The current evidence is therefore: the framework can now run the staged
+parametric-memory training and serving loop end-to-end, but the reliable
+one-task performance gain still comes from the hand-built mixed short-target
+record set. The first-class short-target recipe now captures that mixed
+read/after-read/correction shape in config. A follow-up recipe-backed framework
+run at `/tmp/tb21-parametric-memory-recipe-framework-20260702-195641` ingested
+three local failed/error trajectories, exported 23 records (`read_task=3`,
+`short_exec_after_read=18`, `correct_back_to_short_exec=2`), trained 84 LoRA
+steps, and registered artifact `art_731ae1e1ca4d4e57`. The controlled
+one-task local eval at
+`/tmp/tb21-parametric-memory-recipe-framework-20260702-195641/local-eval-retry`
+had baseline `0/1`, parametric memory `1/1`, and delta `+1.0` pass@1/pass@k.
+The treatment trial recorded verifier reward `1.0` but also an
+`AgentTimeoutError` after a later slow command, so this is positive smoke
+evidence for the adapter effect, not a polished policy behavior.
 
 Evaluate baseline local Qwen and adapter local Qwen against the same subset:
 

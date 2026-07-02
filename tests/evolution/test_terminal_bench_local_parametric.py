@@ -1309,6 +1309,318 @@ def test_terminal_bench_parametric_memory_job_accepts_corrective_tool_call_polic
     }
 
 
+def test_terminal_bench_parametric_memory_job_accepts_corrective_stage_json(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "job.json"
+    input_trial = tmp_path / "trial"
+    (input_trial / "agent").mkdir(parents=True)
+    (input_trial / "verifier").mkdir()
+    trajectory_dir = input_trial / "agent" / "evolab_lab" / ".evolab" / "registries" / "trajectory"
+    trajectory_dir.mkdir(parents=True)
+    (trajectory_dir / "llm_calls.jsonl").write_text(
+        json.dumps(
+            {
+                "model": "Qwen/Qwen3.6-35B-A3B",
+                "input_messages": [
+                    {"role": "system", "content": "Use tb_read_task first."},
+                    {"role": "user", "content": "Instruction: recover launchcode.txt"},
+                ],
+                "metadata": {
+                    "step_index": 0,
+                    "tool_specs": [
+                        {
+                            "name": "tb_read_task",
+                            "description": "Read task.",
+                            "parameters_schema": {
+                                "type": "object",
+                                "properties": {"task_id": {"type": "string"}},
+                                "required": ["task_id"],
+                            },
+                        }
+                    ],
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (input_trial / "result.json").write_text(
+        json.dumps(
+            {
+                "trial_name": "password-recovery__failed",
+                "task_name": "password-recovery",
+                "status": "COMPLETED",
+                "verifier_result": {"rewards": {"reward": 0.0}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (input_trial / "agent" / "stdout.txt").write_text("budget exceeded\n", encoding="utf-8")
+    (input_trial / "verifier" / "reward.txt").write_text("0.0\n", encoding="utf-8")
+
+    exit_code = main(
+        [
+            "terminal-bench-parametric-memory-job",
+            "--input",
+            str(input_trial),
+            "--status",
+            "COMPLETED",
+            "--db",
+            str(tmp_path / "evolution.db"),
+            "--artifact-root",
+            str(tmp_path / "artifacts"),
+            "--dataset-name",
+            "tb21-parametric-password-recovery-stages",
+            "--policy-version",
+            "tb21-qwen-local-password-recovery-stages",
+            "--base-model",
+            "Qwen/Qwen3.6-35B-A3B",
+            "--adapter-id",
+            "tb-parametric-memory",
+            "--trainer-command",
+            "python",
+            "--trainer-arg",
+            "/opt/train_lora.py",
+            "--trainer-arg",
+            "--train-file",
+            "--trainer-arg",
+            "{training_dataset}",
+            "--trainer-arg",
+            "--output-dir",
+            "--trainer-arg",
+            "{adapter_dir}",
+            "--training-projection",
+            "terminal_bench_corrective_tool_call_policy",
+            "--training-corrective-stage-json",
+            json.dumps(
+                {
+                    "name": "read_task",
+                    "input_contains": ["recover launchcode.txt"],
+                    "target_tool_call": {
+                        "name": "tb_read_task",
+                        "arguments": {"task_id": "terminal-bench-task"},
+                    },
+                }
+            ),
+            "--training-corrective-stage-json",
+            json.dumps(
+                {
+                    "name": "short_exec_after_read",
+                    "input_contains": ["starts with 8XD"],
+                    "max_examples": 2,
+                    "repeat": 6,
+                    "target_tool_call": {
+                        "name": "tb_exec",
+                        "arguments": {
+                            "task_id": "terminal-bench-task",
+                            "command": "grep -ao '8XD[A-Z0-9]*' disk;true",
+                        },
+                    },
+                }
+            ),
+            "--output",
+            str(output),
+        ]
+    )
+
+    assert exit_code == 0
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert payload["dataset"]["event_count"] == 1
+    assert payload["job"]["config"]["training_projection"] == {
+        "type": "terminal_bench_corrective_tool_call_policy",
+        "stages": [
+            {
+                "name": "read_task",
+                "input_contains": ["recover launchcode.txt"],
+                "max_examples": 64,
+                "repeat": 1,
+                "target_tool_call": {
+                    "name": "tb_read_task",
+                    "arguments": {"task_id": "terminal-bench-task"},
+                },
+            },
+            {
+                "name": "short_exec_after_read",
+                "input_contains": ["starts with 8XD"],
+                "max_examples": 2,
+                "repeat": 6,
+                "target_tool_call": {
+                    "name": "tb_exec",
+                    "arguments": {
+                        "task_id": "terminal-bench-task",
+                        "command": "grep -ao '8XD[A-Z0-9]*' disk;true",
+                    },
+                },
+            },
+        ],
+    }
+
+
+def test_terminal_bench_parametric_memory_job_accepts_password_recovery_recipe(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "job.json"
+    input_trial = tmp_path / "trial"
+    (input_trial / "agent").mkdir(parents=True)
+    (input_trial / "verifier").mkdir()
+    trajectory_dir = input_trial / "agent" / "evolab_lab" / ".evolab" / "registries" / "trajectory"
+    trajectory_dir.mkdir(parents=True)
+    (trajectory_dir / "llm_calls.jsonl").write_text(
+        json.dumps(
+            {
+                "model": "Qwen/Qwen3.6-35B-A3B",
+                "input_messages": [
+                    {"role": "system", "content": "Use Terminal Bench tools."},
+                    {
+                        "role": "user",
+                        "content": "static-terminal-bench-harbor password-recovery",
+                    },
+                ],
+                "metadata": {
+                    "step_index": 0,
+                    "tool_specs": [
+                        {
+                            "name": "tb_read_task",
+                            "description": "Read task.",
+                            "parameters_schema": {
+                                "type": "object",
+                                "properties": {"task_id": {"type": "string"}},
+                                "required": ["task_id"],
+                            },
+                        }
+                    ],
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (input_trial / "result.json").write_text(
+        json.dumps(
+            {
+                "trial_name": "password-recovery__failed",
+                "task_name": "password-recovery",
+                "status": "COMPLETED",
+                "verifier_result": {"rewards": {"reward": 0.0}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (input_trial / "agent" / "stdout.txt").write_text("budget exceeded\n", encoding="utf-8")
+    (input_trial / "verifier" / "reward.txt").write_text("0.0\n", encoding="utf-8")
+
+    exit_code = main(
+        [
+            "terminal-bench-parametric-memory-job",
+            "--input",
+            str(input_trial),
+            "--status",
+            "COMPLETED",
+            "--db",
+            str(tmp_path / "evolution.db"),
+            "--artifact-root",
+            str(tmp_path / "artifacts"),
+            "--dataset-name",
+            "tb21-parametric-password-recovery-recipe",
+            "--policy-version",
+            "tb21-qwen-local-password-recovery-recipe",
+            "--base-model",
+            "Qwen/Qwen3.6-35B-A3B",
+            "--adapter-id",
+            "tb-parametric-memory",
+            "--trainer-command",
+            "python",
+            "--trainer-arg",
+            "/opt/train_lora.py",
+            "--trainer-arg",
+            "--train-file",
+            "--trainer-arg",
+            "{training_dataset}",
+            "--trainer-arg",
+            "--output-dir",
+            "--trainer-arg",
+            "{adapter_dir}",
+            "--training-projection",
+            "terminal_bench_password_recovery_shorttarget_recipe",
+            "--training-recipe-target-command",
+            "derive-short-target > /app/recovered_passwords.txt",
+            "--training-recipe-after-read-repeat",
+            "2",
+            "--training-recipe-correction-input-contains",
+            "Dummy entry",
+            "--training-recipe-correction-repeat",
+            "1",
+            "--training-recipe-max-input-tool-messages",
+            "2",
+            "--output",
+            str(output),
+        ]
+    )
+
+    assert exit_code == 0
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert payload["dataset"]["event_count"] == 1
+    assert payload["job"]["config"]["training_projection"] == {
+        "type": "terminal_bench_corrective_tool_call_policy",
+        "recipe": {
+            "type": "terminal_bench_password_recovery_shorttarget_recipe",
+            "target_command": "derive-short-target > /app/recovered_passwords.txt",
+            "target_task_id": "terminal-bench-task",
+            "read_task_input_contains": ["static-terminal-bench-harbor"],
+            "after_read_input_contains": ["recovered_passwords.txt"],
+            "correction_input_contains": ["Dummy entry"],
+            "read_task_max_examples": 1,
+            "after_read_max_examples": 1,
+            "after_read_repeat": 2,
+            "correction_max_examples": 1,
+            "correction_repeat": 1,
+            "max_input_tool_messages": 2,
+        },
+        "stages": [
+            {
+                "name": "read_task",
+                "input_contains": ["static-terminal-bench-harbor"],
+                "max_examples": 1,
+                "repeat": 1,
+                "max_input_tool_messages": 2,
+                "target_tool_call": {
+                    "name": "tb_read_task",
+                    "arguments": {"task_id": "terminal-bench-task"},
+                },
+            },
+            {
+                "name": "short_exec_after_read",
+                "input_contains": ["recovered_passwords.txt"],
+                "max_examples": 1,
+                "repeat": 2,
+                "max_input_tool_messages": 2,
+                "target_tool_call": {
+                    "name": "tb_exec",
+                    "arguments": {
+                        "task_id": "terminal-bench-task",
+                        "command": "derive-short-target > /app/recovered_passwords.txt",
+                    },
+                },
+            },
+            {
+                "name": "correct_back_to_short_exec",
+                "input_contains": ["Dummy entry"],
+                "max_examples": 1,
+                "repeat": 1,
+                "max_input_tool_messages": 2,
+                "target_tool_call": {
+                    "name": "tb_exec",
+                    "arguments": {
+                        "task_id": "terminal-bench-task",
+                        "command": "derive-short-target > /app/recovered_passwords.txt",
+                    },
+                },
+            },
+        ],
+    }
+
+
 def test_terminal_bench_parametric_memory_job_can_run_local_worker_once(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

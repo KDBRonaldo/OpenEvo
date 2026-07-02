@@ -1692,7 +1692,27 @@ def _parametric_memory_training_projection(value: Any) -> dict[str, Any]:
                 value.get("exclude_command_contains")
             ),
         }
+    if projection_type == "terminal_bench_password_recovery_shorttarget_recipe":
+        return _parametric_memory_password_recovery_shorttarget_recipe(value)
     if projection_type == "terminal_bench_corrective_tool_call_policy":
+        stages = value.get("stages")
+        if stages is not None:
+            if not isinstance(stages, list) or not stages:
+                raise ValueError(
+                    "parametric_memory_lora_sft "
+                    "terminal_bench_corrective_tool_call_policy stages "
+                    "must be a non-empty list"
+                )
+            return {
+                "type": "terminal_bench_corrective_tool_call_policy",
+                "stages": [
+                    _parametric_memory_corrective_projection_stage(
+                        stage,
+                        stage_index=stage_index,
+                    )
+                    for stage_index, stage in enumerate(stages)
+                ],
+            }
         max_examples = int(value.get("max_examples", 64))
         if max_examples <= 0:
             raise ValueError(
@@ -1741,6 +1761,236 @@ def _parametric_memory_training_projection(value: Any) -> dict[str, Any]:
         "parametric_memory_lora_sft unsupported training_projection.type: "
         f"{projection_type!r}"
     )
+
+
+def _parametric_memory_password_recovery_shorttarget_recipe(
+    value: dict[str, Any],
+) -> dict[str, Any]:
+    target_command = value.get("target_command")
+    if not isinstance(target_command, str) or not target_command.strip():
+        raise ValueError(
+            "parametric_memory_lora_sft "
+            "terminal_bench_password_recovery_shorttarget_recipe "
+            "requires target_command"
+        )
+    target_command = target_command.strip()
+    target_task_id = value.get("target_task_id", "terminal-bench-task")
+    if not isinstance(target_task_id, str) or not target_task_id.strip():
+        raise ValueError(
+            "parametric_memory_lora_sft "
+            "terminal_bench_password_recovery_shorttarget_recipe "
+            "target_task_id must be a non-empty string"
+        )
+    target_task_id = target_task_id.strip()
+
+    read_task_input_contains = _string_list_or_default(
+        value.get("read_task_input_contains"),
+        ["static-terminal-bench-harbor"],
+    )
+    after_read_input_contains = _string_list_or_default(
+        value.get("after_read_input_contains"),
+        ["recovered_passwords.txt"],
+    )
+    correction_input_contains = _string_list(value.get("correction_input_contains"))
+    read_task_max_examples = _positive_int_config(
+        value.get("read_task_max_examples", 1),
+        field_name=(
+            "terminal_bench_password_recovery_shorttarget_recipe "
+            "read_task_max_examples"
+        ),
+    )
+    after_read_max_examples = _positive_int_config(
+        value.get("after_read_max_examples", 1),
+        field_name=(
+            "terminal_bench_password_recovery_shorttarget_recipe "
+            "after_read_max_examples"
+        ),
+    )
+    after_read_repeat = _positive_int_config(
+        value.get("after_read_repeat", 6),
+        field_name=(
+            "terminal_bench_password_recovery_shorttarget_recipe "
+            "after_read_repeat"
+        ),
+    )
+    correction_max_examples = _positive_int_config(
+        value.get("correction_max_examples", 1),
+        field_name=(
+            "terminal_bench_password_recovery_shorttarget_recipe "
+            "correction_max_examples"
+        ),
+    )
+    correction_repeat = _positive_int_config(
+        value.get("correction_repeat", 1),
+        field_name=(
+            "terminal_bench_password_recovery_shorttarget_recipe "
+            "correction_repeat"
+        ),
+    )
+    max_input_tool_messages = value.get("max_input_tool_messages")
+    if max_input_tool_messages is not None:
+        max_input_tool_messages = _positive_int_config(
+            max_input_tool_messages,
+            field_name=(
+                "terminal_bench_password_recovery_shorttarget_recipe "
+                "max_input_tool_messages"
+            ),
+        )
+
+    recipe: dict[str, Any] = {
+        "type": "terminal_bench_password_recovery_shorttarget_recipe",
+        "target_command": target_command,
+        "target_task_id": target_task_id,
+        "read_task_input_contains": read_task_input_contains,
+        "after_read_input_contains": after_read_input_contains,
+        "correction_input_contains": correction_input_contains,
+        "read_task_max_examples": read_task_max_examples,
+        "after_read_max_examples": after_read_max_examples,
+        "after_read_repeat": after_read_repeat,
+        "correction_max_examples": correction_max_examples,
+        "correction_repeat": correction_repeat,
+    }
+    if max_input_tool_messages is not None:
+        recipe["max_input_tool_messages"] = max_input_tool_messages
+
+    stages: list[dict[str, Any]] = [
+        {
+            "name": "read_task",
+            "input_contains": read_task_input_contains,
+            "max_examples": read_task_max_examples,
+            "repeat": 1,
+            "target_tool_call": {
+                "name": "tb_read_task",
+                "arguments": {"task_id": target_task_id},
+            },
+        },
+        {
+            "name": "short_exec_after_read",
+            "input_contains": after_read_input_contains,
+            "max_examples": after_read_max_examples,
+            "repeat": after_read_repeat,
+            "target_tool_call": {
+                "name": "tb_exec",
+                "arguments": {
+                    "task_id": target_task_id,
+                    "command": target_command,
+                },
+            },
+        },
+    ]
+    if correction_input_contains:
+        stages.append(
+            {
+                "name": "correct_back_to_short_exec",
+                "input_contains": correction_input_contains,
+                "max_examples": correction_max_examples,
+                "repeat": correction_repeat,
+                "target_tool_call": {
+                    "name": "tb_exec",
+                    "arguments": {
+                        "task_id": target_task_id,
+                        "command": target_command,
+                    },
+                },
+            }
+        )
+    if max_input_tool_messages is not None:
+        for stage in stages:
+            stage["max_input_tool_messages"] = max_input_tool_messages
+
+    return {
+        "type": "terminal_bench_corrective_tool_call_policy",
+        "recipe": recipe,
+        "stages": [
+            _parametric_memory_corrective_projection_stage(
+                stage,
+                stage_index=stage_index,
+            )
+            for stage_index, stage in enumerate(stages)
+        ],
+    }
+
+
+def _positive_int_config(value: Any, *, field_name: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise ValueError(f"parametric_memory_lora_sft {field_name} must be positive")
+    return parsed
+
+
+def _string_list_or_default(value: Any, default: list[str]) -> list[str]:
+    if value is None:
+        return list(default)
+    return _string_list(value)
+
+
+def _parametric_memory_corrective_projection_stage(
+    value: Any,
+    *,
+    stage_index: int,
+) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError(
+            "parametric_memory_lora_sft terminal_bench_corrective_tool_call_policy "
+            "stage must be a dict"
+        )
+    name = value.get("name") or f"stage_{stage_index}"
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError(
+            "parametric_memory_lora_sft terminal_bench_corrective_tool_call_policy "
+            "stage.name must be a non-empty string"
+        )
+    max_examples = int(value.get("max_examples", 64))
+    if max_examples <= 0:
+        raise ValueError(
+            "parametric_memory_lora_sft terminal_bench_corrective_tool_call_policy "
+            "stage.max_examples must be positive"
+        )
+    repeat = int(value.get("repeat", 1))
+    if repeat <= 0:
+        raise ValueError(
+            "parametric_memory_lora_sft terminal_bench_corrective_tool_call_policy "
+            "stage.repeat must be positive"
+        )
+    target_tool_call = value.get("target_tool_call")
+    if not isinstance(target_tool_call, dict):
+        raise ValueError(
+            "parametric_memory_lora_sft terminal_bench_corrective_tool_call_policy "
+            "stage requires target_tool_call"
+        )
+    target_tool_name = target_tool_call.get("name")
+    target_tool_arguments = target_tool_call.get("arguments")
+    if not isinstance(target_tool_name, str) or not target_tool_name.strip():
+        raise ValueError(
+            "parametric_memory_lora_sft terminal_bench_corrective_tool_call_policy "
+            "stage.target_tool_call.name must be a non-empty string"
+        )
+    if not isinstance(target_tool_arguments, dict):
+        raise ValueError(
+            "parametric_memory_lora_sft terminal_bench_corrective_tool_call_policy "
+            "stage.target_tool_call.arguments must be a dict"
+        )
+    projection = {
+        "name": name.strip(),
+        "input_contains": _string_list(value.get("input_contains")),
+        "max_examples": max_examples,
+        "repeat": repeat,
+        "target_tool_call": {
+            "name": target_tool_name.strip(),
+            "arguments": target_tool_arguments,
+        },
+    }
+    max_input_tool_messages = value.get("max_input_tool_messages")
+    if max_input_tool_messages is not None:
+        max_input_tool_messages = int(max_input_tool_messages)
+        if max_input_tool_messages <= 0:
+            raise ValueError(
+                "parametric_memory_lora_sft "
+                "terminal_bench_corrective_tool_call_policy "
+                "stage.max_input_tool_messages must be positive"
+            )
+        projection["max_input_tool_messages"] = max_input_tool_messages
+    return projection
 
 
 def _project_sft_response_messages(
@@ -1901,56 +2151,85 @@ def _terminal_bench_corrective_tool_call_policy_message_sets(
     if not isinstance(llm_calls, list):
         return []
 
-    input_contains = training_projection.get("input_contains") or []
-    target_tool_call = training_projection["target_tool_call"]
-    max_examples = int(training_projection["max_examples"])
+    stages = training_projection.get("stages")
+    if isinstance(stages, list):
+        projection_stages = stages
+        include_stage_metadata = True
+    else:
+        projection_stages = [training_projection]
+        include_stage_metadata = False
+
     message_sets: list[tuple[int, list[dict[str, Any]], dict[str, Any]]] = []
-    for llm_call_index, llm_call in enumerate(llm_calls):
-        if len(message_sets) >= max_examples:
-            break
-        if not isinstance(llm_call, dict):
-            continue
-        input_messages = _terminal_bench_corrective_input_messages(
-            llm_call.get("input_messages"),
-            max_tool_messages=training_projection.get("max_input_tool_messages"),
-        )
-        if not input_messages:
-            continue
-        haystack = json.dumps(input_messages, ensure_ascii=False, sort_keys=True)
-        if input_contains and not all(needle in haystack for needle in input_contains):
-            continue
-        source_metadata = llm_call.get("metadata")
-        if not isinstance(source_metadata, dict):
-            source_metadata = {}
-        messages = [
-            *input_messages,
-            {
-                "role": "assistant",
-                "content": "",
-                "tool_calls": [
-                    _terminal_bench_tool_call(
-                        str(target_tool_call["name"]),
-                        dict(target_tool_call["arguments"]),
-                        call_id="polar-train-corrective-tool-call",
-                    )
-                ],
-            },
-        ]
-        message_sets.append(
-            (
-                trace_index,
-                messages,
-                {
-                    "tools": _terminal_bench_openai_tools_from_specs(
-                        source_metadata.get("tool_specs")
-                    ),
-                    "metadata": {
-                        "source_llm_call_index": llm_call_index,
-                        "source_step_index": source_metadata.get("step_index"),
-                    },
-                },
+    for stage_index, stage in enumerate(projection_stages):
+        input_contains = stage.get("input_contains") or []
+        target_tool_call = stage["target_tool_call"]
+        max_examples = int(stage["max_examples"])
+        repeat = int(stage.get("repeat", 1))
+        exported_examples = 0
+        for llm_call_index, llm_call in enumerate(llm_calls):
+            if exported_examples >= max_examples:
+                break
+            if not isinstance(llm_call, dict):
+                continue
+            input_messages = _terminal_bench_corrective_input_messages(
+                llm_call.get("input_messages"),
+                max_tool_messages=stage.get("max_input_tool_messages"),
             )
-        )
+            if not input_messages:
+                continue
+            haystack = json.dumps(input_messages, ensure_ascii=False, sort_keys=True)
+            if input_contains and not all(needle in haystack for needle in input_contains):
+                continue
+            source_metadata = llm_call.get("metadata")
+            if not isinstance(source_metadata, dict):
+                source_metadata = {}
+            tools = _terminal_bench_openai_tools_from_specs(
+                source_metadata.get("tool_specs")
+            )
+            for repeat_index in range(repeat):
+                call_id = "polar-train-corrective-tool-call"
+                if include_stage_metadata:
+                    call_id = (
+                        "polar-train-corrective-tool-call-"
+                        f"{stage_index}-{exported_examples}-{repeat_index}"
+                    )
+                messages = [
+                    *input_messages,
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            _terminal_bench_tool_call(
+                                str(target_tool_call["name"]),
+                                dict(target_tool_call["arguments"]),
+                                call_id=call_id,
+                            )
+                        ],
+                    },
+                ]
+                exported_metadata = {
+                    "source_llm_call_index": llm_call_index,
+                    "source_step_index": source_metadata.get("step_index"),
+                }
+                if include_stage_metadata:
+                    exported_metadata.update(
+                        {
+                            "projection_stage": stage["name"],
+                            "projection_stage_index": stage_index,
+                            "projection_repeat_index": repeat_index,
+                        }
+                    )
+                message_sets.append(
+                    (
+                        trace_index,
+                        messages,
+                        {
+                            "tools": tools,
+                            "metadata": exported_metadata,
+                        },
+                    )
+                )
+            exported_examples += 1
     return message_sets
 
 

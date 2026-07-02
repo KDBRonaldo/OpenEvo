@@ -489,7 +489,17 @@ flowchart TB
   会从 trace metadata 中 opt-in 保存的 compact `llm_calls` 导出真实失败 prefix 的监督
   next tool-call。它可使用 `input_contains` 选择特定工具输出后的 prefix，并允许 failed 或
   zero-reward records 进入训练；长 prefix 可用 `max_input_tool_messages` 只保留最近 N 条
-  tool result，用于本地推理 adapter 的 corrective SFT；
+  tool result，用于本地推理 adapter 的 corrective SFT；该 projection 也支持
+  `{"type": "terminal_bench_corrective_tool_call_policy", "stages": [...]}`，每个 stage 可设置
+  `name`、`target_tool_call`、`input_contains`、`max_examples`、`repeat` 和
+  `max_input_tool_messages`。worker 会按 stage 独立扫描 `llm_calls`，并在 `repeat > 1`
+  时导出加权重复样本，JSONL metadata 会记录 `projection_stage`、
+  `projection_stage_index` 和 `projection_repeat_index`；也可以设为
+  `{"type": "terminal_bench_password_recovery_shorttarget_recipe", "target_command": "..."}`
+  让 worker 生成同样的 staged corrective projection。该 recipe 面向本地 Qwen
+  `password-recovery` short-target smoke，默认用 `static-terminal-bench-harbor` 匹配
+  read-task prefix、用 `recovered_passwords.txt` 匹配 after-read prefix，并在配置了
+  `correction_input_contains` 时额外导出 `correct_back_to_short_exec` 样本；
 - 可选 `job.config.output_adapter_id`、`adapter_format`、`compatibility`、`scores`、
   `tags`、`promoted`；
 - 可选旧 `parametric_memory` input artifact，当前只记录在 manifest，后续 trainer 可以用

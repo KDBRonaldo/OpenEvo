@@ -9,7 +9,7 @@ from typing import Any
 from urllib.parse import unquote, urlparse
 
 from polar_evolution.agent_system import DEFAULT_AGENT_SYSTEM_TARGET_PATH
-from polar_evolution.methods import METHOD_REGISTRY
+from polar_evolution.methods import METHOD_REGISTRY, _parametric_memory_training_projection
 from polar_evolution.models import DatasetCreateRequest, EventIngestRequest, JobCreateRequest
 from polar_evolution.server import create_app
 from polar_evolution.store import EvolutionStore
@@ -249,6 +249,7 @@ def build_parser() -> argparse.ArgumentParser:
             "terminal_bench_final_actions",
             "terminal_bench_tool_call_policy",
             "terminal_bench_corrective_tool_call_policy",
+            "terminal_bench_password_recovery_shorttarget_recipe",
         ],
         default="full_trace",
         help="Projection applied when exporting traces to SFT JSONL.",
@@ -349,6 +350,92 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Target task_id argument for terminal_bench_corrective_tool_call_policy."
         ),
+    )
+    tb_parametric_job.add_argument(
+        "--training-corrective-stage-json",
+        action="append",
+        default=[],
+        help=(
+            "JSON object for one terminal_bench_corrective_tool_call_policy stage. "
+            "Can be repeated and takes precedence over the single target-command flags."
+        ),
+    )
+    tb_parametric_job.add_argument(
+        "--training-recipe-target-command",
+        help=(
+            "Target tb_exec command for "
+            "terminal_bench_password_recovery_shorttarget_recipe."
+        ),
+    )
+    tb_parametric_job.add_argument(
+        "--training-recipe-target-task-id",
+        default="terminal-bench-task",
+        help=(
+            "Target task_id argument for "
+            "terminal_bench_password_recovery_shorttarget_recipe."
+        ),
+    )
+    tb_parametric_job.add_argument(
+        "--training-recipe-read-task-input-contains",
+        action="append",
+        default=[],
+        help=(
+            "Substring filter for the read-task recipe stage. Defaults to the "
+            "Terminal Bench Harbor marker when omitted. Can be repeated."
+        ),
+    )
+    tb_parametric_job.add_argument(
+        "--training-recipe-after-read-input-contains",
+        action="append",
+        default=[],
+        help=(
+            "Substring filter for the after-read recipe stage. Defaults to "
+            "recovered_passwords.txt when omitted. Can be repeated."
+        ),
+    )
+    tb_parametric_job.add_argument(
+        "--training-recipe-correction-input-contains",
+        action="append",
+        default=[],
+        help=(
+            "Substring filter enabling the optional correction recipe stage. "
+            "Can be repeated."
+        ),
+    )
+    tb_parametric_job.add_argument(
+        "--training-recipe-read-task-max-examples",
+        type=int,
+        default=1,
+        help="Maximum read-task recipe examples to export per trace.",
+    )
+    tb_parametric_job.add_argument(
+        "--training-recipe-after-read-max-examples",
+        type=int,
+        default=1,
+        help="Maximum after-read recipe examples to export per trace.",
+    )
+    tb_parametric_job.add_argument(
+        "--training-recipe-after-read-repeat",
+        type=int,
+        default=6,
+        help="Repeat count for each after-read recipe example.",
+    )
+    tb_parametric_job.add_argument(
+        "--training-recipe-correction-max-examples",
+        type=int,
+        default=1,
+        help="Maximum optional correction recipe examples to export per trace.",
+    )
+    tb_parametric_job.add_argument(
+        "--training-recipe-correction-repeat",
+        type=int,
+        default=1,
+        help="Repeat count for each optional correction recipe example.",
+    )
+    tb_parametric_job.add_argument(
+        "--training-recipe-max-input-tool-messages",
+        type=int,
+        help="Keep only the last N tool-result input messages in recipe stages.",
     )
     tb_parametric_job.add_argument("--run-worker", action="store_true")
     tb_parametric_job.add_argument("--job-name")
@@ -555,6 +642,16 @@ def _normalize_cli_argv(argv: list[str]) -> list[str]:
         normalized.append(item)
         index += 1
     return normalized
+
+
+def _json_object(value: str) -> dict[str, Any]:
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise ValueError("expected valid JSON object") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError("expected JSON object")
+    return parsed
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1091,7 +1188,10 @@ def _create_terminal_bench_parametric_memory_job(args: argparse.Namespace) -> di
                 max_verifier_stdout_chars=args.max_verifier_stdout_chars,
                 include_llm_calls=(
                     args.training_projection
-                    == "terminal_bench_corrective_tool_call_policy"
+                    in {
+                        "terminal_bench_corrective_tool_call_policy",
+                        "terminal_bench_password_recovery_shorttarget_recipe",
+                    }
                 ),
                 policy_version=args.policy_version,
                 rollout_step=args.rollout_step,
@@ -1186,28 +1286,74 @@ def _create_terminal_bench_parametric_memory_job(args: argparse.Namespace) -> di
             ),
         }
     if args.training_projection == "terminal_bench_corrective_tool_call_policy":
-        if not args.training_corrective_target_command:
+        if args.training_corrective_stage_json:
+            config["training_projection"] = _parametric_memory_training_projection(
+                {
+                    "type": "terminal_bench_corrective_tool_call_policy",
+                    "stages": [
+                        _json_object(stage_json)
+                        for stage_json in args.training_corrective_stage_json
+                    ],
+                }
+            )
+        elif not args.training_corrective_target_command:
             raise ValueError(
                 "terminal-bench-parametric-memory-job requires "
                 "--training-corrective-target-command with "
                 "terminal_bench_corrective_tool_call_policy"
             )
-        config["training_projection"] = {
-            "type": "terminal_bench_corrective_tool_call_policy",
-            "input_contains": list(args.training_corrective_input_contains),
-            "max_examples": args.training_corrective_max_examples,
-            "target_tool_call": {
-                "name": "tb_exec",
-                "arguments": {
-                    "task_id": args.training_corrective_target_task_id,
-                    "command": args.training_corrective_target_command,
+        else:
+            config["training_projection"] = {
+                "type": "terminal_bench_corrective_tool_call_policy",
+                "input_contains": list(args.training_corrective_input_contains),
+                "max_examples": args.training_corrective_max_examples,
+                "target_tool_call": {
+                    "name": "tb_exec",
+                    "arguments": {
+                        "task_id": args.training_corrective_target_task_id,
+                        "command": args.training_corrective_target_command,
+                    },
                 },
-            },
-        }
-        if args.training_corrective_max_input_tool_messages is not None:
-            config["training_projection"]["max_input_tool_messages"] = (
-                args.training_corrective_max_input_tool_messages
+            }
+            if args.training_corrective_max_input_tool_messages is not None:
+                config["training_projection"]["max_input_tool_messages"] = (
+                    args.training_corrective_max_input_tool_messages
+                )
+    if args.training_projection == "terminal_bench_password_recovery_shorttarget_recipe":
+        if not args.training_recipe_target_command:
+            raise ValueError(
+                "terminal-bench-parametric-memory-job requires "
+                "--training-recipe-target-command with "
+                "terminal_bench_password_recovery_shorttarget_recipe"
             )
+        recipe_projection: dict[str, Any] = {
+            "type": "terminal_bench_password_recovery_shorttarget_recipe",
+            "target_command": args.training_recipe_target_command,
+            "target_task_id": args.training_recipe_target_task_id,
+            "read_task_max_examples": args.training_recipe_read_task_max_examples,
+            "after_read_max_examples": args.training_recipe_after_read_max_examples,
+            "after_read_repeat": args.training_recipe_after_read_repeat,
+            "correction_input_contains": list(
+                args.training_recipe_correction_input_contains
+            ),
+            "correction_max_examples": args.training_recipe_correction_max_examples,
+            "correction_repeat": args.training_recipe_correction_repeat,
+        }
+        if args.training_recipe_read_task_input_contains:
+            recipe_projection["read_task_input_contains"] = list(
+                args.training_recipe_read_task_input_contains
+            )
+        if args.training_recipe_after_read_input_contains:
+            recipe_projection["after_read_input_contains"] = list(
+                args.training_recipe_after_read_input_contains
+            )
+        if args.training_recipe_max_input_tool_messages is not None:
+            recipe_projection["max_input_tool_messages"] = (
+                args.training_recipe_max_input_tool_messages
+            )
+        config["training_projection"] = _parametric_memory_training_projection(
+            recipe_projection
+        )
 
     job = store.create_job(
         JobCreateRequest(
