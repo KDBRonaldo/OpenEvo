@@ -24,6 +24,7 @@ from polar_evolution.terminal_bench_local_parametric import (
 from polar_evolution.terminal_bench_per_task import (
     DEFAULT_TERMINAL_BENCH_PACKAGE_ROOT,
     TerminalBenchTaskGroup,
+    _run_worker_once_local,
     run_group_evolution,
     run_group_evolution_dry_run,
     run_per_task_evolution,
@@ -200,6 +201,45 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Do not derive forbidden literals from structured protected metadata.",
     )
+    tb_parametric_job = subparsers.add_parser(
+        "terminal-bench-parametric-memory-job",
+        help="Ingest Terminal Bench results and create a parametric-memory LoRA SFT job.",
+    )
+    tb_parametric_job.add_argument(
+        "--input",
+        action="append",
+        default=[],
+        help="Terminal Bench trial or job directory to ingest. Can be repeated.",
+    )
+    tb_parametric_job.add_argument(
+        "--dataset-artifact-id",
+        action="append",
+        default=[],
+        help="Existing dataset artifact id to use as job input. Can be repeated.",
+    )
+    tb_parametric_job.add_argument("--db", default=".polar_evolution/evolution.db")
+    tb_parametric_job.add_argument("--artifact-root", default=".polar_evolution")
+    tb_parametric_job.add_argument("--dataset-name")
+    tb_parametric_job.add_argument("--purpose", default="parametric_memory_lora_sft")
+    tb_parametric_job.add_argument("--policy-version")
+    tb_parametric_job.add_argument("--rollout-step", type=int)
+    tb_parametric_job.add_argument("--status", action="append", default=["COMPLETED"])
+    tb_parametric_job.add_argument("--output", help="Output JSON summary path. Defaults to stdout.")
+    tb_parametric_job.add_argument("--max-transcript-chars", type=int, default=60000)
+    tb_parametric_job.add_argument("--max-verifier-stdout-chars", type=int, default=12000)
+    tb_parametric_job.add_argument("--base-model", required=True)
+    tb_parametric_job.add_argument(
+        "--adapter-id",
+        default=DEFAULT_LOCAL_PARAMETRIC_ADAPTER_ID,
+    )
+    tb_parametric_job.add_argument("--adapter-format", default="lora")
+    tb_parametric_job.add_argument("--trainer-command", required=True)
+    tb_parametric_job.add_argument("--trainer-arg", action="append", default=[])
+    tb_parametric_job.add_argument("--trainer-timeout-seconds", type=float, default=3600.0)
+    tb_parametric_job.add_argument("--run-worker", action="store_true")
+    tb_parametric_job.add_argument("--job-name")
+    tb_parametric_job.add_argument("--priority", type=int, default=100)
+    tb_parametric_job.add_argument("--max-records", type=int)
     tb_per_task = subparsers.add_parser(
         "terminal-bench-per-task-evolution",
         help="Run or plan per-task Terminal Bench evolution.",
@@ -337,8 +377,25 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _normalize_cli_argv(argv: list[str]) -> list[str]:
+    if not argv or argv[0] != "terminal-bench-parametric-memory-job":
+        return list(argv)
+    normalized: list[str] = []
+    index = 0
+    while index < len(argv):
+        item = argv[index]
+        if item == "--trainer-arg" and index + 1 < len(argv):
+            normalized.append(f"--trainer-arg={argv[index + 1]}")
+            index += 2
+            continue
+        normalized.append(item)
+        index += 1
+    return normalized
+
+
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    raw_argv = sys.argv[1:] if argv is None else argv
+    args = build_parser().parse_args(_normalize_cli_argv(raw_argv))
     if args.command == "serve":
         import uvicorn
 
@@ -434,6 +491,10 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == "terminal-bench-text-memory-job":
         payload = _create_terminal_bench_text_memory_job(args)
+        _write_json_output(payload, args.output)
+        return 0
+    if args.command == "terminal-bench-parametric-memory-job":
+        payload = _create_terminal_bench_parametric_memory_job(args)
         _write_json_output(payload, args.output)
         return 0
     if args.command == "terminal-bench-local-parametric-memory-eval":
@@ -812,6 +873,135 @@ def _create_terminal_bench_text_memory_job(args: argparse.Namespace) -> dict[str
             "config": config,
         },
     }
+
+
+def _create_terminal_bench_parametric_memory_job(args: argparse.Namespace) -> dict[str, Any]:
+    if not args.input and not args.dataset_artifact_id:
+        raise ValueError(
+            "terminal-bench-parametric-memory-job requires --input or --dataset-artifact-id"
+        )
+    if args.input and not args.dataset_name:
+        raise ValueError(
+            "terminal-bench-parametric-memory-job requires --dataset-name with --input"
+        )
+    if args.input and not args.policy_version:
+        raise ValueError(
+            "terminal-bench-parametric-memory-job requires --policy-version with --input"
+        )
+
+    missing_placeholders = [
+        placeholder
+        for placeholder in ("{training_dataset}", "{adapter_dir}")
+        if not any(placeholder in str(arg) for arg in args.trainer_arg)
+    ]
+    if missing_placeholders:
+        raise ValueError(
+            "terminal-bench-parametric-memory-job trainer args require "
+            "{training_dataset} and {adapter_dir} placeholders"
+        )
+
+    store = EvolutionStore(db_path=Path(args.db), artifact_root=Path(args.artifact_root))
+    store.initialize()
+
+    events: list[EventIngestRequest] = []
+    for input_path in args.input:
+        events.extend(
+            build_terminal_bench_events(
+                input_path,
+                max_transcript_chars=args.max_transcript_chars,
+                max_verifier_stdout_chars=args.max_verifier_stdout_chars,
+                policy_version=args.policy_version,
+                rollout_step=args.rollout_step,
+            )
+        )
+
+    ingested_events = []
+    for event in events:
+        response = store.ingest_event(event)
+        ingested_events.append(
+            {
+                "event_id": response.event_id,
+                "ingested": response.ingested,
+                "duplicate": response.duplicate,
+                "task_id": event.task_id,
+                "session_id": event.session_id,
+            }
+        )
+
+    dataset_payload: dict[str, Any] | None = None
+    input_artifact_ids = list(args.dataset_artifact_id)
+    if events:
+        dataset = store.create_dataset(
+            DatasetCreateRequest(
+                name=args.dataset_name,
+                purpose=args.purpose,
+                query={
+                    "event_types": ["polar.session_completed"],
+                    "status": args.status,
+                    "policy_version": args.policy_version,
+                },
+            )
+        )
+        dataset_payload = {
+            "dataset_id": dataset.dataset_id,
+            "artifact_id": dataset.artifact_id,
+            "name": args.dataset_name,
+            "purpose": args.purpose,
+            "event_count": dataset.event_count,
+            "trace_count": dataset.trace_count,
+            "manifest_uri": _artifact_uri(store, dataset.artifact_id),
+        }
+        input_artifact_ids.append(dataset.artifact_id)
+
+    method = "parametric_memory_lora_sft"
+    config: dict[str, Any] = {
+        "name": args.job_name or "Terminal Bench parametric-memory LoRA SFT",
+        "base_model": args.base_model,
+        "output_adapter_id": args.adapter_id,
+        "adapter_format": args.adapter_format,
+        "trainer": {
+            "command": args.trainer_command,
+            "args": list(args.trainer_arg),
+            "timeout_seconds": args.trainer_timeout_seconds,
+        },
+        "compatibility": {
+            "agent_harness": ["terminal-bench-harbor"],
+            "task_tags": _terminal_bench_task_tags(store, input_artifact_ids, events),
+            "base_model": [args.base_model],
+        },
+        "scores": {"quality": 0.0},
+        "promoted": False,
+    }
+    if args.max_records is not None:
+        config["max_records"] = args.max_records
+
+    job = store.create_job(
+        JobCreateRequest(
+            method=method,
+            job_type=method,
+            input_artifact_ids=input_artifact_ids,
+            config=config,
+            priority=args.priority,
+        )
+    )
+    payload: dict[str, Any] = {
+        "ingested_events": ingested_events,
+        "dataset": dataset_payload,
+        "job": {
+            "job_id": job.job_id,
+            "state": str(job.state),
+            "job_type": method,
+            "method": method,
+            "input_artifact_ids": input_artifact_ids,
+            "config": config,
+        },
+    }
+    if args.run_worker:
+        payload["completed_artifacts"] = _run_worker_once_local(
+            db_path=Path(args.db),
+            artifact_root=Path(args.artifact_root),
+        )
+    return payload
 
 
 def _terminal_bench_job_method(method: str, input_artifact_ids: list[str]) -> str:

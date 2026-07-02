@@ -620,6 +620,157 @@ def test_terminal_bench_local_parametric_cli_rejects_subscription_auth(
         )
 
 
+def test_terminal_bench_parametric_memory_job_creates_lora_sft_job(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output = tmp_path / "job.json"
+    input_trial = tmp_path / "trial"
+    (input_trial / "agent").mkdir(parents=True)
+    (input_trial / "verifier").mkdir()
+    (input_trial / "result.json").write_text(
+        json.dumps(
+            {
+                "trial_name": "query-optimize__success",
+                "task_name": "query-optimize",
+                "status": "COMPLETED",
+                "verifier_result": {"rewards": {"reward": 1.0}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (input_trial / "agent" / "stdout.txt").write_text("solved\n", encoding="utf-8")
+    (input_trial / "verifier" / "reward.txt").write_text("1.0\n", encoding="utf-8")
+
+    exit_code = main(
+        [
+            "terminal-bench-parametric-memory-job",
+            "--input",
+            str(input_trial),
+            "--db",
+            str(tmp_path / "evolution.db"),
+            "--artifact-root",
+            str(tmp_path / "artifacts"),
+            "--dataset-name",
+            "tb21-parametric-query-optimize",
+            "--policy-version",
+            "tb21-qwen-local-query-optimize",
+            "--base-model",
+            "Qwen/Qwen3.6-35B-A3B",
+            "--adapter-id",
+            "tb-parametric-memory",
+            "--trainer-command",
+            "python",
+            "--trainer-arg",
+            "/opt/train_lora.py",
+            "--trainer-arg",
+            "--train-file",
+            "--trainer-arg",
+            "{training_dataset}",
+            "--trainer-arg",
+            "--output-dir",
+            "--trainer-arg",
+            "{adapter_dir}",
+            "--output",
+            str(output),
+        ]
+    )
+
+    assert exit_code == 0
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert payload["job"]["method"] == "parametric_memory_lora_sft"
+    assert payload["job"]["config"]["base_model"] == "Qwen/Qwen3.6-35B-A3B"
+    assert payload["job"]["config"]["output_adapter_id"] == "tb-parametric-memory"
+    assert payload["job"]["config"]["trainer"]["command"] == "python"
+    assert "{training_dataset}" in payload["job"]["config"]["trainer"]["args"]
+    assert "{adapter_dir}" in payload["job"]["config"]["trainer"]["args"]
+    assert (
+        "terminal-bench:query-optimize"
+        in payload["job"]["config"]["compatibility"]["task_tags"]
+    )
+
+
+def test_terminal_bench_parametric_memory_job_can_run_local_worker_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output = tmp_path / "job.json"
+    input_trial = tmp_path / "trial"
+    adapter_dir = tmp_path / "adapter"
+    adapter_dir.mkdir()
+    (adapter_dir / "adapter_config.json").write_text("{}", encoding="utf-8")
+    (input_trial / "agent").mkdir(parents=True)
+    (input_trial / "verifier").mkdir()
+    (input_trial / "result.json").write_text(
+        json.dumps(
+            {
+                "trial_name": "query-optimize__success",
+                "task_name": "query-optimize",
+                "status": "COMPLETED",
+                "verifier_result": {"rewards": {"reward": 1.0}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (input_trial / "agent" / "stdout.txt").write_text("solved\n", encoding="utf-8")
+    (input_trial / "verifier" / "reward.txt").write_text("1.0\n", encoding="utf-8")
+
+    def fake_run_worker_once_local(*, db_path: Path, artifact_root: Path):
+        assert db_path == tmp_path / "evolution.db"
+        assert artifact_root == tmp_path / "artifacts"
+        return [
+            {
+                "artifact_id": "art-parametric",
+                "type": "parametric_memory",
+                "uri": adapter_dir.as_uri(),
+                "manifest": {
+                    "adapter_id": "tb-parametric-memory",
+                    "base_model": "Qwen/Qwen3.6-35B-A3B",
+                    "adapter_format": "lora",
+                },
+            }
+        ]
+
+    monkeypatch.setattr(cli_module, "_run_worker_once_local", fake_run_worker_once_local)
+
+    exit_code = main(
+        [
+            "terminal-bench-parametric-memory-job",
+            "--input",
+            str(input_trial),
+            "--db",
+            str(tmp_path / "evolution.db"),
+            "--artifact-root",
+            str(tmp_path / "artifacts"),
+            "--dataset-name",
+            "tb21-parametric-query-optimize",
+            "--policy-version",
+            "tb21-qwen-local-query-optimize",
+            "--base-model",
+            "Qwen/Qwen3.6-35B-A3B",
+            "--adapter-id",
+            "tb-parametric-memory",
+            "--trainer-command",
+            "python",
+            "--trainer-arg",
+            "{training_dataset}",
+            "--trainer-arg",
+            "{adapter_dir}",
+            "--run-worker",
+            "--output",
+            str(output),
+        ]
+    )
+
+    assert exit_code == 0
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert payload["completed_artifacts"][0]["artifact_id"] == "art-parametric"
+    assert (
+        payload["completed_artifacts"][0]["manifest"]["adapter_id"]
+        == "tb-parametric-memory"
+    )
+
+
 def test_terminal_bench_local_parametric_cli_live_invokes_runner(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
