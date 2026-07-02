@@ -434,10 +434,12 @@ def run_local_parametric_memory_eval_dry_run(
     n_attempts: int,
     manage_server: bool,
     max_output_tokens: int = DEFAULT_LOCAL_PARAMETRIC_MAX_OUTPUT_TOKENS,
+    verifier_env: dict[str, str] | None = None,
     auth_mode: str = "local",
 ) -> dict[str, Any]:
     auth_mode = _validate_auth_mode(auth_mode)
     output_token_cap = max(1, int(max_output_tokens))
+    effective_verifier_env = dict(verifier_env or {})
     conditions = [
         LocalParametricCondition(name="baseline", model=model),
         LocalParametricCondition(
@@ -458,6 +460,7 @@ def run_local_parametric_memory_eval_dry_run(
         "n_attempts": max(1, int(n_attempts)),
         "max_output_tokens": output_token_cap,
         "manage_server": manage_server,
+        "verifier_env": _redacted_env(effective_verifier_env),
         "enabled_artifacts": ["parametric_memory"],
         "disabled_artifacts": list(DEFAULT_LOCAL_PARAMETRIC_DISABLED_ARTIFACTS),
         "conditions": [
@@ -499,6 +502,7 @@ def run_local_parametric_memory_eval(
     auth_mode = _validate_auth_mode(auth_mode)
     attempt_count = max(1, int(n_attempts))
     output_token_cap = max(1, int(max_output_tokens))
+    effective_verifier_env = dict(verifier_env or {})
     conditions = [
         LocalParametricCondition(name="baseline", model=model),
         LocalParametricCondition(
@@ -519,7 +523,7 @@ def run_local_parametric_memory_eval(
             server_url=server_url,
             n_attempts=attempt_count,
             max_output_tokens=output_token_cap,
-            verifier_env=dict(verifier_env or {}),
+            verifier_env=effective_verifier_env,
             command_runner=command_runner,
             manage_server=manage_server,
             server_timeout_seconds=server_timeout_seconds,
@@ -543,6 +547,7 @@ def run_local_parametric_memory_eval(
         "n_attempts": attempt_count,
         "max_output_tokens": output_token_cap,
         "manage_server": manage_server,
+        "verifier_env": _redacted_env(effective_verifier_env),
         "enabled_artifacts": ["parametric_memory"],
         "disabled_artifacts": list(DEFAULT_LOCAL_PARAMETRIC_DISABLED_ARTIFACTS),
         "conditions": condition_summaries,

@@ -590,6 +590,39 @@ def test_terminal_bench_local_parametric_cli_dry_run_writes_output(
     assert payload["max_output_tokens"] == 1536
 
 
+def test_terminal_bench_local_parametric_cli_dry_run_records_verifier_env(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "summary.json"
+    exit_code = main(
+        [
+            "terminal-bench-local-parametric-memory-eval",
+            "--task-root",
+            "/root/datasets/terminal-bench-2-1/tasks",
+            "--task-id",
+            "regex-log",
+            "--run-root",
+            str(tmp_path / "run"),
+            "--adapter-path",
+            str(tmp_path / "adapter"),
+            "--verifier-env",
+            "UV_NO_INDEX=1",
+            "--verifier-python-install-mirror",
+            "http://172.17.0.8:8765/python-build-standalone",
+            "--dry-run",
+            "--output",
+            str(output),
+        ]
+    )
+
+    assert exit_code == 0
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert payload["verifier_env"] == {
+        "UV_NO_INDEX": "1",
+        "UV_PYTHON_INSTALL_MIRROR": "http://172.17.0.8:8765/python-build-standalone",
+    }
+
+
 def test_terminal_bench_local_parametric_cli_dry_run_records_proxy_auth(
     tmp_path: Path,
 ) -> None:
@@ -850,6 +883,48 @@ def test_terminal_bench_local_parametric_cli_live_invokes_runner(
     assert json.loads(output.read_text(encoding="utf-8")) == {
         "dry_run": False,
         "conditions": [],
+    }
+
+
+def test_terminal_bench_local_parametric_cli_adds_python_install_mirror(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output = tmp_path / "summary.json"
+    captured: dict[str, object] = {}
+
+    def fake_runner(**kwargs):
+        captured.update(kwargs)
+        return {"dry_run": False, "conditions": []}
+
+    monkeypatch.setattr(cli_module, "run_local_parametric_memory_eval", fake_runner)
+
+    exit_code = main(
+        [
+            "terminal-bench-local-parametric-memory-eval",
+            "--task-root",
+            "/root/datasets/terminal-bench-2-1/tasks",
+            "--task-id",
+            "regex-log",
+            "--run-root",
+            str(tmp_path / "run"),
+            "--model",
+            "Qwen/Qwen3.6-35B-A3B",
+            "--adapter-path",
+            str(tmp_path / "adapter"),
+            "--verifier-env",
+            "UV_NO_INDEX=1",
+            "--verifier-python-install-mirror",
+            "http://172.17.0.8:8765/python-build-standalone",
+            "--output",
+            str(output),
+        ]
+    )
+
+    assert exit_code == 0
+    assert captured["verifier_env"] == {
+        "UV_NO_INDEX": "1",
+        "UV_PYTHON_INSTALL_MIRROR": "http://172.17.0.8:8765/python-build-standalone",
     }
 
 

@@ -379,6 +379,13 @@ def build_parser() -> argparse.ArgumentParser:
         default="local",
     )
     tb_local_parametric.add_argument("--verifier-env", action="append", default=[])
+    tb_local_parametric.add_argument(
+        "--verifier-python-install-mirror",
+        help=(
+            "Optional UV_PYTHON_INSTALL_MIRROR value for Terminal Bench verifier "
+            "uvx Python downloads."
+        ),
+    )
     tb_local_parametric.add_argument("--dry-run", action="store_true")
     tb_local_parametric.add_argument("--output", required=True)
     return parser
@@ -507,6 +514,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "terminal-bench-local-parametric-memory-eval":
         if args.auth_mode == "subscription":
             raise ValueError("parametric_memory requires local or proxy auth")
+        verifier_env = _local_parametric_verifier_env(
+            args.verifier_env,
+            python_install_mirror=args.verifier_python_install_mirror,
+        )
         if args.dry_run:
             payload = run_local_parametric_memory_eval_dry_run(
                 task_root=Path(args.task_root),
@@ -519,6 +530,7 @@ def main(argv: list[str] | None = None) -> int:
                 n_attempts=args.n_attempts,
                 max_output_tokens=args.max_output_tokens,
                 manage_server=args.manage_server,
+                verifier_env=verifier_env,
                 auth_mode=args.auth_mode,
             )
             _write_json_output(payload, args.output)
@@ -535,7 +547,7 @@ def main(argv: list[str] | None = None) -> int:
             server_url=args.server_url,
             n_attempts=args.n_attempts,
             max_output_tokens=args.max_output_tokens,
-            verifier_env=_parse_key_value_entries(args.verifier_env),
+            verifier_env=verifier_env,
             manage_server=args.manage_server,
             server_timeout_seconds=args.server_timeout_seconds,
             vllm_executable=args.vllm_executable,
@@ -1343,6 +1355,17 @@ def _parse_key_value_entries(entries: list[str]) -> dict[str, str]:
             raise ValueError(f"expected KEY=VALUE entry, got {entry!r}")
         parsed[key] = value
     return parsed
+
+
+def _local_parametric_verifier_env(
+    entries: list[str],
+    *,
+    python_install_mirror: str | None,
+) -> dict[str, str]:
+    env = _parse_key_value_entries(entries)
+    if python_install_mirror:
+        env.setdefault("UV_PYTHON_INSTALL_MIRROR", python_install_mirror)
+    return env
 
 
 def _artifact_uri(store: EvolutionStore, artifact_id: str) -> str:

@@ -288,6 +288,7 @@ uv run polar-evolution terminal-bench-local-parametric-memory-eval \
   --manage-server \
   --n-attempts 5 \
   --max-output-tokens 4096 \
+  --verifier-python-install-mirror http://172.17.0.8:8765/python-build-standalone \
   --output /tmp/tb21-parametric-memory/local-eval/summary.json
 ```
 
@@ -295,5 +296,9 @@ The summary reports `baseline`, `parametric_memory`, `delta`, and the
 `max_output_tokens` cap used for both conditions. The default cap is `4096`;
 for smoke tests on slower local Qwen/vLLM servers, lower it explicitly, for
 example `--max-output-tokens 1536`, so long reasoning completions do not consume
-the entire GPU window. Treat controlled-subset results as subset evidence until
-the same path is run over full Terminal Bench 2.1.
+the entire GPU window. Many Terminal Bench verifiers run `uvx -p ...`, which can
+download managed Python even when wheel dependencies are local. When a local
+Python-build mirror is available, pass `--verifier-python-install-mirror`; the
+runner records the resulting verifier environment in the summary for
+reproducibility. Treat controlled-subset results as subset evidence until the
+same path is run over full Terminal Bench 2.1.
