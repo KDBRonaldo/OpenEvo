@@ -458,7 +458,7 @@ def run_local_parametric_memory_eval(
     adapter_path: Path,
     adapter_id: str = DEFAULT_LOCAL_PARAMETRIC_ADAPTER_ID,
     adapter_artifact_id: str | None = None,
-    server_url: str,
+    server_url: str = "http://127.0.0.1:8000/v1",
     n_attempts: int = 1,
     verifier_env: dict[str, str] | None = None,
     command_runner: CommandRunner = _default_command_runner,
@@ -679,11 +679,12 @@ def _run_local_parametric_task(
         for trial in trials
         for reward in [_attempt_reward(trial)]
     ]
+    scored_attempts = attempts[:n_attempts]
     return {
         "task_id": task_id,
         "job_name": job_name,
         "job_root": str(jobs_dir / job_name),
         "attempts": attempts,
         "pass_at_1": bool(attempts and attempts[0]["passed"]),
-        "pass_at_k": any(attempt["passed"] for attempt in attempts),
+        "pass_at_k": any(attempt["passed"] for attempt in scored_attempts),
     }

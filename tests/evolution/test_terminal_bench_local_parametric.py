@@ -245,6 +245,52 @@ def test_run_local_parametric_memory_eval_compares_baseline_and_adapter(
     assert envs[1]["EVOLAB_TB_MODEL"] == "tb-parametric-memory"
 
 
+def test_run_local_parametric_memory_eval_scores_only_requested_attempts(
+    tmp_path: Path,
+) -> None:
+    def fake_command_runner(command, *, cwd=None, env=None):
+        del cwd, env
+        jobs_dir = Path(command[command.index("--jobs-dir") + 1])
+        job_name = command[command.index("--job-name") + 1]
+        task_id = command[command.index("--include-task-name") + 1]
+        for attempt_index, reward in enumerate([0.0, 0.0, 1.0], start=1):
+            trial = jobs_dir / job_name / f"{task_id}__attempt{attempt_index}"
+            (trial / "agent").mkdir(parents=True)
+            (trial / "verifier").mkdir()
+            (trial / "result.json").write_text(
+                json.dumps(
+                    {
+                        "trial_name": trial.name,
+                        "task_name": task_id,
+                        "started_at": f"2026-07-02T00:00:0{attempt_index}Z",
+                        "status": "COMPLETED",
+                        "verifier_result": {"rewards": {"reward": reward}},
+                    }
+                ),
+                encoding="utf-8",
+            )
+        return {}
+
+    summary = run_local_parametric_memory_eval(
+        task_root=tmp_path / "tasks",
+        task_ids=["query-optimize"],
+        run_root=tmp_path / "run",
+        terminal_bench_package_root=tmp_path / "terminal-bench-package",
+        adapter_path=tmp_path / "adapter",
+        server_url="http://127.0.0.1:8000/v1",
+        n_attempts=2,
+        verifier_env={},
+        command_runner=fake_command_runner,
+        manage_server=False,
+    )
+
+    baseline = summary["conditions"][0]
+    task = baseline["tasks"][0]
+    assert len(task["attempts"]) == 3
+    assert task["pass_at_k"] is False
+    assert baseline["pass_at_k"] == {"passed": 0, "total": 1, "k": 2}
+
+
 def test_run_local_parametric_memory_eval_requires_adapter_path(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="adapter_path"):
         run_local_parametric_memory_eval(
@@ -252,7 +298,6 @@ def test_run_local_parametric_memory_eval_requires_adapter_path(tmp_path: Path) 
             task_ids=["query-optimize"],
             run_root=tmp_path / "run",
             adapter_path=Path(),
-            server_url="http://127.0.0.1:8000/v1",
         )
 
 
