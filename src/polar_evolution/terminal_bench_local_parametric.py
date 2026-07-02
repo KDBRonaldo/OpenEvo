@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 import json
@@ -27,6 +27,17 @@ DEFAULT_LOCAL_PARAMETRIC_DISABLED_ARTIFACTS = [
 ]
 DEFAULT_VLLM_EXECUTABLE = "/root/evolab-vllm/bin/vllm"
 DEFAULT_VLLM_GPUS = ["1", "2", "3", "4"]
+_SECRET_ENV_MARKERS = (
+    "key",
+    "token",
+    "secret",
+    "password",
+    "pass",
+    "auth",
+    "authorization",
+    "cookie",
+    "credential",
+)
 
 
 @dataclass(frozen=True)
@@ -195,15 +206,26 @@ def _redacted_env(env: dict[str, str]) -> dict[str, str]:
     redacted: dict[str, str] = {}
     for key in sorted(env):
         normalized_key = key.lower()
-        if (
-            "key" in normalized_key
-            or "token" in normalized_key
-            or "secret" in normalized_key
-        ):
+        if any(marker in normalized_key for marker in _SECRET_ENV_MARKERS):
             redacted[key] = "<redacted>"
         else:
             redacted[key] = env[key]
     return redacted
+
+
+def _raise_if_process_exited(
+    *,
+    process_poll: Callable[[], int | None] | None,
+    process_exit_message: Callable[[int], str] | None,
+) -> None:
+    if process_poll is None:
+        return
+    return_code = process_poll()
+    if return_code is None:
+        return
+    if process_exit_message is None:
+        raise RuntimeError(f"process exited during startup with return code {return_code}")
+    raise RuntimeError(process_exit_message(return_code))
 
 
 def wait_for_openai_server(
@@ -212,11 +234,17 @@ def wait_for_openai_server(
     expected_model: str,
     timeout_seconds: float,
     poll_interval_seconds: float = 1.0,
+    process_poll: Callable[[], int | None] | None = None,
+    process_exit_message: Callable[[int], str] | None = None,
 ) -> None:
     deadline = time.monotonic() + timeout_seconds
     last_error: Exception | None = None
 
     while True:
+        _raise_if_process_exited(
+            process_poll=process_poll,
+            process_exit_message=process_exit_message,
+        )
         try:
             with httpx.Client(base_url=server_url, timeout=5.0) as client:
                 models_response = client.get("/models")
@@ -232,6 +260,10 @@ def wait_for_openai_server(
                         f"{expected_model!r}; available models: {sorted(model_ids)!r}"
                     )
 
+                _raise_if_process_exited(
+                    process_poll=process_poll,
+                    process_exit_message=process_exit_message,
+                )
                 completion_response = client.post(
                     "/chat/completions",
                     json={
@@ -246,11 +278,42 @@ def wait_for_openai_server(
             raise
         except (httpx.HTTPError, OSError) as exc:
             last_error = exc
+            _raise_if_process_exited(
+                process_poll=process_poll,
+                process_exit_message=process_exit_message,
+            )
             if time.monotonic() >= deadline:
                 raise TimeoutError(
                     f"Timed out waiting for OpenAI server at {server_url!r}"
                 ) from last_error
             time.sleep(min(poll_interval_seconds, max(0.0, deadline - time.monotonic())))
+
+
+def _terminate_process_group(
+    process: subprocess.Popen[Any],
+    *,
+    wait_timeout_seconds: float = 10.0,
+) -> None:
+    if process.poll() is not None:
+        return
+
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+
+    try:
+        process.wait(timeout=wait_timeout_seconds)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+    process.wait(timeout=wait_timeout_seconds)
 
 
 @contextmanager
@@ -298,18 +361,18 @@ def managed_vllm_server(
             server_url=server_url,
             expected_model=expected_model,
             timeout_seconds=timeout_seconds,
+            process_poll=process.poll,
+            process_exit_message=lambda return_code: (
+                "vLLM server exited during startup with return code "
+                f"{return_code}; stdout={stdout_path}; stderr={stderr_path}"
+            ),
         )
         yield metadata
     finally:
         stdout_handle.close()
         stderr_handle.close()
-        if process is not None and process.poll() is None:
-            os.killpg(process.pid, signal.SIGTERM)
-            try:
-                process.wait(timeout=10.0)
-            except subprocess.TimeoutExpired:
-                os.killpg(process.pid, signal.SIGKILL)
-                process.wait(timeout=10.0)
+        if process is not None:
+            _terminate_process_group(process)
 
 
 def run_local_parametric_memory_eval_dry_run(
