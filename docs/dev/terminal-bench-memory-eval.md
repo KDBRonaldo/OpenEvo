@@ -198,6 +198,11 @@ Long successful transcripts can be projected before SFT export with
 `job.config.training_projection`. The current built-in projection is
 `{"type": "response_tail", "response_tail_chars": N}`, which keeps the final
 assistant action window while preserving the original prompt messages.
+For Codex-style Terminal Bench JSONL transcripts, use
+`{"type": "terminal_bench_final_actions", "max_events": N, "max_output_chars": M}`
+to parse completed command/message events and train only on the last bounded
+terminal actions. This keeps durable solution actions, checksums, and final
+file writes without letting large intermediate tool outputs dominate SFT.
 This is the path expected for OpenEvo deployments backed by a local inference
 server: the proxy can select a request-level LoRA adapter, while subscription
 mode cannot.
@@ -267,8 +272,9 @@ uv run polar-evolution terminal-bench-parametric-memory-job \
   --trainer-arg '{training_dataset}' \
   --trainer-arg --output-dir \
   --trainer-arg '{adapter_dir}' \
-  --training-projection response_tail \
-  --training-response-tail-chars 4096 \
+  --training-projection terminal_bench_final_actions \
+  --training-final-action-max-events 8 \
+  --training-final-action-output-chars 2000 \
   --run-worker \
   --output /tmp/tb21-parametric-memory/job.json
 ```

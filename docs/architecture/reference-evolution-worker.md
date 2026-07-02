@@ -477,6 +477,10 @@ flowchart TB
   `{"type": "response_tail", "response_tail_chars": N}` 会保留 prompt messages，并把
   assistant response content 截为最后 `N` 个字符，适合长 Terminal Bench transcript 中
   最终成功动作位于尾部的训练集；
+  `{"type": "terminal_bench_final_actions", "max_events": N, "max_output_chars": M}`
+  会解析 Codex-style JSONL transcript 中的 `item.completed` command/message events，只保留
+  最后 N 个事件，并把每个 command output 限制在 M 个字符以内，适合 tool-heavy Terminal
+  Bench 轨迹中最终成功动作被大型中间输出稀释的训练集；
 - 可选 `job.config.output_adapter_id`、`adapter_format`、`compatibility`、`scores`、
   `tags`、`promoted`；
 - 可选旧 `parametric_memory` input artifact，当前只记录在 manifest，后续 trainer 可以用

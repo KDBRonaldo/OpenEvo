@@ -1575,6 +1575,24 @@ def _parametric_memory_training_projection(value: Any) -> dict[str, Any]:
             "type": "response_tail",
             "response_tail_chars": response_tail_chars,
         }
+    if projection_type == "terminal_bench_final_actions":
+        max_events = int(value.get("max_events", 8))
+        max_output_chars = int(value.get("max_output_chars", 2000))
+        if max_events <= 0:
+            raise ValueError(
+                "parametric_memory_lora_sft terminal_bench_final_actions "
+                "max_events must be positive"
+            )
+        if max_output_chars <= 0:
+            raise ValueError(
+                "parametric_memory_lora_sft terminal_bench_final_actions "
+                "max_output_chars must be positive"
+            )
+        return {
+            "type": "terminal_bench_final_actions",
+            "max_events": max_events,
+            "max_output_chars": max_output_chars,
+        }
     raise ValueError(
         "parametric_memory_lora_sft unsupported training_projection.type: "
         f"{projection_type!r}"
@@ -1586,7 +1604,14 @@ def _project_sft_response_messages(
     *,
     training_projection: dict[str, Any],
 ) -> list[dict[str, str]]:
-    if training_projection.get("type") != "response_tail":
+    projection_type = training_projection.get("type")
+    if projection_type == "terminal_bench_final_actions":
+        return _project_terminal_bench_final_action_messages(
+            response_messages,
+            max_events=int(training_projection["max_events"]),
+            max_output_chars=int(training_projection["max_output_chars"]),
+        )
+    if projection_type != "response_tail":
         return response_messages
 
     response_tail_chars = int(training_projection["response_tail_chars"])
@@ -1596,6 +1621,122 @@ def _project_sft_response_messages(
         if content:
             projected.append({"role": message["role"], "content": content})
     return projected
+
+
+def _project_terminal_bench_final_action_messages(
+    response_messages: list[dict[str, str]],
+    *,
+    max_events: int,
+    max_output_chars: int,
+) -> list[dict[str, str]]:
+    projected: list[dict[str, str]] = []
+    for message in response_messages:
+        content = _render_terminal_bench_final_actions(
+            message["content"],
+            max_events=max_events,
+            max_output_chars=max_output_chars,
+        )
+        if content:
+            projected.append({"role": message["role"], "content": content})
+        else:
+            projected.append(message)
+    return projected
+
+
+def _render_terminal_bench_final_actions(
+    content: str,
+    *,
+    max_events: int,
+    max_output_chars: int,
+) -> str | None:
+    events = _terminal_bench_action_events(content, max_output_chars=max_output_chars)
+    if not events:
+        return None
+
+    lines = ["Terminal Bench final actions:"]
+    for event in events[-max_events:]:
+        if event["kind"] == "command":
+            lines.extend(
+                [
+                    "",
+                    "COMMAND:",
+                    event["command"],
+                    f"EXIT_CODE: {event['exit_code']}",
+                    f"STATUS: {event['status']}",
+                ]
+            )
+            if event["output"]:
+                lines.extend(["OUTPUT:", event["output"]])
+        elif event["kind"] == "agent_message":
+            lines.extend(["", "AGENT:", event["text"]])
+    return "\n".join(lines).strip()
+
+
+def _terminal_bench_action_events(
+    content: str,
+    *,
+    max_output_chars: int,
+) -> list[dict[str, str]]:
+    events: list[dict[str, str]] = []
+    for line in content.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        try:
+            event = json.loads(stripped)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict) or event.get("type") != "item.completed":
+            continue
+        item = event.get("item")
+        if not isinstance(item, dict):
+            continue
+        item_type = item.get("type")
+        if item_type == "command_execution":
+            command = _coerce_text(item.get("command")).strip()
+            if not command:
+                continue
+            events.append(
+                {
+                    "kind": "command",
+                    "command": command,
+                    "exit_code": _coerce_text(item.get("exit_code")),
+                    "status": _coerce_text(item.get("status")),
+                    "output": _bounded_terminal_bench_output(
+                        _coerce_text(item.get("aggregated_output")),
+                        max_output_chars=max_output_chars,
+                    ),
+                }
+            )
+        elif item_type == "agent_message":
+            text = _coerce_text(item.get("text") or item.get("content")).strip()
+            if text:
+                events.append({"kind": "agent_message", "text": text})
+    return events
+
+
+def _bounded_terminal_bench_output(
+    output: str,
+    *,
+    max_output_chars: int,
+) -> str:
+    output = output.strip()
+    if len(output) <= max_output_chars:
+        return output
+    half = max_output_chars // 2
+    return (
+        output[:half].rstrip()
+        + "\n...[truncated]...\n"
+        + output[-(max_output_chars - half) :].lstrip()
+    )
+
+
+def _coerce_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    return str(value)
 
 
 def _sft_messages(value: Any, *, default_role: str) -> list[dict[str, str]]:

@@ -3163,6 +3163,147 @@ def test_parametric_memory_lora_sft_can_project_response_tail(tmp_path: Path):
     }
 
 
+def test_parametric_memory_lora_sft_can_project_terminal_bench_final_actions(
+    tmp_path: Path,
+):
+    trainer_script = tmp_path / "fake_trainer.py"
+    trainer_script.write_text(
+        "from pathlib import Path\n"
+        "import argparse\n"
+        "parser = argparse.ArgumentParser()\n"
+        "parser.add_argument('--train-file')\n"
+        "parser.add_argument('--output-dir')\n"
+        "args = parser.parse_args()\n"
+        "Path(args.output_dir).mkdir(parents=True, exist_ok=True)\n"
+        "(Path(args.output_dir) / 'adapter_config.json').write_text('{}')\n",
+        encoding="utf-8",
+    )
+    early_command = {
+        "type": "item.completed",
+        "item": {
+            "type": "command_execution",
+            "command": "cat /tmp/large-file",
+            "exit_code": 0,
+            "status": "completed",
+            "aggregated_output": "noise " * 100,
+        },
+    }
+    final_checksum = {
+        "type": "item.completed",
+        "item": {
+            "type": "command_execution",
+            "command": "node - <<'NODE'\nconsole.log('33 b0725dc4')\nNODE",
+            "exit_code": 0,
+            "status": "completed",
+            "aggregated_output": "33 b0725dc4\n",
+        },
+    }
+    final_write = {
+        "type": "item.completed",
+        "item": {
+            "type": "command_execution",
+            "command": (
+                "printf '%s\\n' '8XDP5Q2RT9ZK7VB3BV4WW54' "
+                "> /app/recovered_passwords.txt"
+            ),
+            "exit_code": 0,
+            "status": "completed",
+            "aggregated_output": "wrote recovered_passwords.txt successfully\n",
+        },
+    }
+    final_message = {
+        "type": "item.completed",
+        "item": {
+            "type": "agent_message",
+            "text": "Recovered and wrote the password.",
+        },
+    }
+    dataset = _parametric_dataset_artifact(
+        tmp_path,
+        [
+            {
+                "event_id": "evt_final_actions",
+                "task_id": "task_final_actions",
+                "session_id": "session_final_actions",
+                "status": "COMPLETED",
+                "reward": 1.0,
+                "traces": [
+                    {
+                        "prompt_messages": [
+                            {"role": "user", "content": "Recover the password."}
+                        ],
+                        "response_messages": [
+                            {
+                                "role": "assistant",
+                                "content": "\n".join(
+                                    json.dumps(event)
+                                    for event in [
+                                        early_command,
+                                        final_checksum,
+                                        final_write,
+                                        final_message,
+                                    ]
+                                ),
+                            }
+                        ],
+                    }
+                ],
+            }
+        ],
+    )
+    job = _job(
+        "parametric_memory_lora_sft",
+        tmp_path,
+        input_artifacts=[dataset],
+        config={
+            "base_model": "Qwen/Qwen3.6-35B-A3B",
+            "training_projection": {
+                "type": "terminal_bench_final_actions",
+                "max_events": 3,
+                "max_output_chars": 32,
+            },
+            "trainer": {
+                "command": "python",
+                "args": [
+                    str(trainer_script),
+                    "--train-file",
+                    "{training_dataset}",
+                    "--output-dir",
+                    "{adapter_dir}",
+                ],
+            },
+        },
+    )
+
+    [artifact] = run_method(job, artifact_root=tmp_path / "artifacts")
+
+    train_path = (
+        tmp_path
+        / "artifacts"
+        / "workers"
+        / job.job_id
+        / "parametric_memory_lora_sft"
+        / "training.jsonl"
+    )
+    [training_line] = [
+        json.loads(line) for line in train_path.read_text(encoding="utf-8").splitlines()
+    ]
+    response_message = training_line["messages"][-1]
+    assert response_message["role"] == "assistant"
+    assert response_message["content"].startswith("Terminal Bench final actions:")
+    assert "cat /tmp/large-file" not in response_message["content"]
+    assert "b0725dc4" in response_message["content"]
+    assert "8XDP5Q2RT9ZK7VB3BV4WW54" in response_message["content"]
+    assert "/app/recovered_passwords.txt" in response_message["content"]
+    assert "Recovered and wrote the password." in response_message["content"]
+    assert len(response_message["content"]) < 1000
+    assert artifact.manifest["training_projection"] == {
+        "type": "terminal_bench_final_actions",
+        "max_events": 3,
+        "max_output_chars": 32,
+    }
+
+
 def test_parametric_memory_lora_sft_requires_trainer_placeholders(tmp_path: Path):
     trainer_script = tmp_path / "fake_trainer.py"
     trainer_script.write_text("print('unused')\n", encoding="utf-8")

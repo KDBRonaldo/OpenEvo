@@ -239,7 +239,7 @@ def build_parser() -> argparse.ArgumentParser:
     tb_parametric_job.add_argument("--trainer-timeout-seconds", type=float, default=3600.0)
     tb_parametric_job.add_argument(
         "--training-projection",
-        choices=["full_trace", "response_tail"],
+        choices=["full_trace", "response_tail", "terminal_bench_final_actions"],
         default="full_trace",
         help="Projection applied when exporting successful traces to SFT JSONL.",
     )
@@ -247,6 +247,24 @@ def build_parser() -> argparse.ArgumentParser:
         "--training-response-tail-chars",
         type=int,
         help="Response tail size used with --training-projection response_tail.",
+    )
+    tb_parametric_job.add_argument(
+        "--training-final-action-max-events",
+        type=int,
+        default=8,
+        help=(
+            "Maximum completed command/message events to keep with "
+            "--training-projection terminal_bench_final_actions."
+        ),
+    )
+    tb_parametric_job.add_argument(
+        "--training-final-action-output-chars",
+        type=int,
+        default=2000,
+        help=(
+            "Maximum command output excerpt length with "
+            "--training-projection terminal_bench_final_actions."
+        ),
     )
     tb_parametric_job.add_argument("--run-worker", action="store_true")
     tb_parametric_job.add_argument("--job-name")
@@ -1025,6 +1043,12 @@ def _create_terminal_bench_parametric_memory_job(args: argparse.Namespace) -> di
         config["training_projection"] = {
             "type": "response_tail",
             "response_tail_chars": args.training_response_tail_chars,
+        }
+    if args.training_projection == "terminal_bench_final_actions":
+        config["training_projection"] = {
+            "type": "terminal_bench_final_actions",
+            "max_events": args.training_final_action_max_events,
+            "max_output_chars": args.training_final_action_output_chars,
         }
 
     job = store.create_job(

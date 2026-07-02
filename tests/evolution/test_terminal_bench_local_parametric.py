@@ -763,6 +763,77 @@ def test_terminal_bench_parametric_memory_job_creates_lora_sft_job(
     )
 
 
+def test_terminal_bench_parametric_memory_job_accepts_final_actions_projection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output = tmp_path / "job.json"
+    input_trial = tmp_path / "trial"
+    (input_trial / "agent").mkdir(parents=True)
+    (input_trial / "verifier").mkdir()
+    (input_trial / "result.json").write_text(
+        json.dumps(
+            {
+                "trial_name": "password-recovery__success",
+                "task_name": "password-recovery",
+                "status": "COMPLETED",
+                "verifier_result": {"rewards": {"reward": 1.0}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (input_trial / "agent" / "stdout.txt").write_text("solved\n", encoding="utf-8")
+    (input_trial / "verifier" / "reward.txt").write_text("1.0\n", encoding="utf-8")
+
+    exit_code = main(
+        [
+            "terminal-bench-parametric-memory-job",
+            "--input",
+            str(input_trial),
+            "--db",
+            str(tmp_path / "evolution.db"),
+            "--artifact-root",
+            str(tmp_path / "artifacts"),
+            "--dataset-name",
+            "tb21-parametric-password-recovery",
+            "--policy-version",
+            "tb21-qwen-local-password-recovery",
+            "--base-model",
+            "Qwen/Qwen3.6-35B-A3B",
+            "--adapter-id",
+            "tb-parametric-memory",
+            "--trainer-command",
+            "python",
+            "--trainer-arg",
+            "/opt/train_lora.py",
+            "--trainer-arg",
+            "--train-file",
+            "--trainer-arg",
+            "{training_dataset}",
+            "--trainer-arg",
+            "--output-dir",
+            "--trainer-arg",
+            "{adapter_dir}",
+            "--training-projection",
+            "terminal_bench_final_actions",
+            "--training-final-action-max-events",
+            "8",
+            "--training-final-action-output-chars",
+            "2000",
+            "--output",
+            str(output),
+        ]
+    )
+
+    assert exit_code == 0
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert payload["job"]["config"]["training_projection"] == {
+        "type": "terminal_bench_final_actions",
+        "max_events": 8,
+        "max_output_chars": 2000,
+    }
+
+
 def test_terminal_bench_parametric_memory_job_can_run_local_worker_once(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
