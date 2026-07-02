@@ -287,9 +287,13 @@ uv run polar-evolution terminal-bench-local-parametric-memory-eval \
   --server-port 8000 \
   --manage-server \
   --n-attempts 5 \
+  --max-output-tokens 4096 \
   --output /tmp/tb21-parametric-memory/local-eval/summary.json
 ```
 
-The summary reports `baseline`, `parametric_memory`, and `delta`. Treat this as
-controlled-subset evidence until the same path is run over full Terminal Bench
-2.1.
+The summary reports `baseline`, `parametric_memory`, `delta`, and the
+`max_output_tokens` cap used for both conditions. The default cap is `4096`;
+for smoke tests on slower local Qwen/vLLM servers, lower it explicitly, for
+example `--max-output-tokens 1536`, so long reasoning completions do not consume
+the entire GPU window. Treat controlled-subset results as subset evidence until
+the same path is run over full Terminal Bench 2.1.

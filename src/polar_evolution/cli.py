@@ -17,6 +17,7 @@ from polar_evolution.terminal_bench_bridge import build_terminal_bench_events
 from polar_evolution.terminal_bench_local_parametric import (
     DEFAULT_LOCAL_MODEL,
     DEFAULT_LOCAL_PARAMETRIC_ADAPTER_ID,
+    DEFAULT_LOCAL_PARAMETRIC_MAX_OUTPUT_TOKENS,
     DEFAULT_VLLM_EXECUTABLE,
     run_local_parametric_memory_eval,
     run_local_parametric_memory_eval_dry_run,
@@ -364,6 +365,12 @@ def build_parser() -> argparse.ArgumentParser:
     tb_local_parametric.add_argument("--vllm-executable", default=DEFAULT_VLLM_EXECUTABLE)
     tb_local_parametric.add_argument("--gpu", action="append", default=[])
     tb_local_parametric.add_argument("--n-attempts", type=int, default=1)
+    tb_local_parametric.add_argument(
+        "--max-output-tokens",
+        type=int,
+        default=DEFAULT_LOCAL_PARAMETRIC_MAX_OUTPUT_TOKENS,
+        help="Maximum output tokens per local Terminal Bench solver completion.",
+    )
     tb_local_parametric.add_argument("--manage-server", action="store_true")
     tb_local_parametric.add_argument("--server-timeout-seconds", type=float, default=600.0)
     tb_local_parametric.add_argument(
@@ -510,6 +517,7 @@ def main(argv: list[str] | None = None) -> int:
                 adapter_id=args.adapter_id,
                 server_url=args.server_url,
                 n_attempts=args.n_attempts,
+                max_output_tokens=args.max_output_tokens,
                 manage_server=args.manage_server,
                 auth_mode=args.auth_mode,
             )
@@ -526,6 +534,7 @@ def main(argv: list[str] | None = None) -> int:
             adapter_artifact_id=args.adapter_artifact_id,
             server_url=args.server_url,
             n_attempts=args.n_attempts,
+            max_output_tokens=args.max_output_tokens,
             verifier_env=_parse_key_value_entries(args.verifier_env),
             manage_server=args.manage_server,
             server_timeout_seconds=args.server_timeout_seconds,

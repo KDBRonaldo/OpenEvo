@@ -241,6 +241,7 @@ def test_run_local_parametric_memory_eval_compares_baseline_and_adapter(
         adapter_artifact_id="art-parametric",
         server_url="http://127.0.0.1:8000/v1",
         n_attempts=2,
+        max_output_tokens=1536,
         verifier_env={},
         command_runner=fake_command_runner,
         manage_server=False,
@@ -263,7 +264,7 @@ def test_run_local_parametric_memory_eval_compares_baseline_and_adapter(
     assert envs[0]["EVOLAB_TB_MODEL"] == "Qwen/Qwen3.6-35B-A3B"
     assert envs[1]["EVOLAB_TB_MODEL"] == "tb-parametric-memory"
     assert all(env["EVOLAB_TB_MODE"] == "direct_solver" for env in envs)
-    assert all(env["EVOLAB_TB_MAX_OUTPUT_TOKENS"] == "4096" for env in envs)
+    assert all(env["EVOLAB_TB_MAX_OUTPUT_TOKENS"] == "1536" for env in envs)
 
 
 def test_run_local_parametric_memory_eval_scores_only_requested_attempts(
@@ -568,6 +569,8 @@ def test_terminal_bench_local_parametric_cli_dry_run_writes_output(
             "http://127.0.0.1:8000/v1",
             "--n-attempts",
             "5",
+            "--max-output-tokens",
+            "1536",
             "--manage-server",
             "--dry-run",
             "--output",
@@ -584,6 +587,7 @@ def test_terminal_bench_local_parametric_cli_dry_run_writes_output(
         "baseline",
         "parametric_memory",
     ]
+    assert payload["max_output_tokens"] == 1536
 
 
 def test_terminal_bench_local_parametric_cli_dry_run_records_proxy_auth(

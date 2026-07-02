@@ -31,7 +31,7 @@ DEFAULT_LOCAL_PARAMETRIC_DISABLED_ARTIFACTS = [
 LOCAL_PARAMETRIC_AUTH_MODES = {"local", "proxy"}
 DEFAULT_VLLM_EXECUTABLE = "/root/evolab-vllm/bin/vllm"
 DEFAULT_VLLM_GPUS = ["1", "2", "3", "4"]
-DEFAULT_LOCAL_PARAMETRIC_MAX_OUTPUT_TOKENS = "4096"
+DEFAULT_LOCAL_PARAMETRIC_MAX_OUTPUT_TOKENS = 4096
 _SECRET_ENV_MARKERS = (
     "key",
     "token",
@@ -130,11 +130,12 @@ def build_evolab_harbor_env(
     base_env: dict[str, str] | None = None,
     server_url: str,
     model: str,
+    max_output_tokens: int = DEFAULT_LOCAL_PARAMETRIC_MAX_OUTPUT_TOKENS,
 ) -> dict[str, str]:
     env = dict(os.environ if base_env is None else base_env)
     env["EVOLAB_TB_LLM_API"] = "openai-chat-completions"
     env["EVOLAB_TB_MODE"] = "direct_solver"
-    env["EVOLAB_TB_MAX_OUTPUT_TOKENS"] = DEFAULT_LOCAL_PARAMETRIC_MAX_OUTPUT_TOKENS
+    env["EVOLAB_TB_MAX_OUTPUT_TOKENS"] = str(max(1, int(max_output_tokens)))
     env["EVOLAB_TB_MODEL"] = model
     env["OPENAI_BASE_URL"] = server_url
     env["AIGOCODE_GPT_BASE_URL"] = server_url
@@ -432,9 +433,11 @@ def run_local_parametric_memory_eval_dry_run(
     server_url: str,
     n_attempts: int,
     manage_server: bool,
+    max_output_tokens: int = DEFAULT_LOCAL_PARAMETRIC_MAX_OUTPUT_TOKENS,
     auth_mode: str = "local",
 ) -> dict[str, Any]:
     auth_mode = _validate_auth_mode(auth_mode)
+    output_token_cap = max(1, int(max_output_tokens))
     conditions = [
         LocalParametricCondition(name="baseline", model=model),
         LocalParametricCondition(
@@ -453,6 +456,7 @@ def run_local_parametric_memory_eval_dry_run(
         "base_model": model,
         "server_url": server_url,
         "n_attempts": max(1, int(n_attempts)),
+        "max_output_tokens": output_token_cap,
         "manage_server": manage_server,
         "enabled_artifacts": ["parametric_memory"],
         "disabled_artifacts": list(DEFAULT_LOCAL_PARAMETRIC_DISABLED_ARTIFACTS),
@@ -481,6 +485,7 @@ def run_local_parametric_memory_eval(
     adapter_artifact_id: str | None = None,
     server_url: str = "http://127.0.0.1:8000/v1",
     n_attempts: int = 1,
+    max_output_tokens: int = DEFAULT_LOCAL_PARAMETRIC_MAX_OUTPUT_TOKENS,
     verifier_env: dict[str, str] | None = None,
     command_runner: CommandRunner = _default_command_runner,
     manage_server: bool = True,
@@ -493,6 +498,7 @@ def run_local_parametric_memory_eval(
     _validate_adapter_path(adapter_path)
     auth_mode = _validate_auth_mode(auth_mode)
     attempt_count = max(1, int(n_attempts))
+    output_token_cap = max(1, int(max_output_tokens))
     conditions = [
         LocalParametricCondition(name="baseline", model=model),
         LocalParametricCondition(
@@ -512,6 +518,7 @@ def run_local_parametric_memory_eval(
             base_model=model,
             server_url=server_url,
             n_attempts=attempt_count,
+            max_output_tokens=output_token_cap,
             verifier_env=dict(verifier_env or {}),
             command_runner=command_runner,
             manage_server=manage_server,
@@ -534,6 +541,7 @@ def run_local_parametric_memory_eval(
         "base_model": model,
         "server_url": server_url,
         "n_attempts": attempt_count,
+        "max_output_tokens": output_token_cap,
         "manage_server": manage_server,
         "enabled_artifacts": ["parametric_memory"],
         "disabled_artifacts": list(DEFAULT_LOCAL_PARAMETRIC_DISABLED_ARTIFACTS),
@@ -573,6 +581,7 @@ def _run_local_parametric_condition(
     base_model: str,
     server_url: str,
     n_attempts: int,
+    max_output_tokens: int,
     verifier_env: dict[str, str],
     command_runner: CommandRunner,
     manage_server: bool,
@@ -613,6 +622,7 @@ def _run_local_parametric_condition(
                 terminal_bench_package_root=terminal_bench_package_root,
                 server_url=server_url,
                 n_attempts=n_attempts,
+                max_output_tokens=max_output_tokens,
                 verifier_env=verifier_env,
                 command_runner=command_runner,
             )
@@ -681,6 +691,7 @@ def _run_local_parametric_task(
     terminal_bench_package_root: Path,
     server_url: str,
     n_attempts: int,
+    max_output_tokens: int,
     verifier_env: dict[str, str],
     command_runner: CommandRunner,
 ) -> dict[str, Any]:
@@ -698,6 +709,7 @@ def _run_local_parametric_task(
         base_env=os.environ,
         server_url=server_url,
         model=condition.model,
+        max_output_tokens=max_output_tokens,
     )
     command_runner(command, cwd=terminal_bench_package_root, env=env)
 
