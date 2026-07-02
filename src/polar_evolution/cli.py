@@ -450,6 +450,7 @@ def main(argv: list[str] | None = None) -> int:
                 server_url=args.server_url,
                 n_attempts=args.n_attempts,
                 manage_server=args.manage_server,
+                auth_mode=args.auth_mode,
             )
             _write_json_output(payload, args.output)
             return 0
@@ -470,6 +471,7 @@ def main(argv: list[str] | None = None) -> int:
             vllm_executable=args.vllm_executable,
             gpus=args.gpu or None,
             port=args.server_port,
+            auth_mode=args.auth_mode,
         )
         _write_json_output(payload, args.output)
         return 0

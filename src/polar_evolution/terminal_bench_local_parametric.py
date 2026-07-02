@@ -28,6 +28,7 @@ DEFAULT_LOCAL_PARAMETRIC_DISABLED_ARTIFACTS = [
     "skill_bundle",
     "agent_system",
 ]
+LOCAL_PARAMETRIC_AUTH_MODES = {"local", "proxy"}
 DEFAULT_VLLM_EXECUTABLE = "/root/evolab-vllm/bin/vllm"
 DEFAULT_VLLM_GPUS = ["1", "2", "3", "4"]
 _SECRET_ENV_MARKERS = (
@@ -413,7 +414,9 @@ def run_local_parametric_memory_eval_dry_run(
     server_url: str,
     n_attempts: int,
     manage_server: bool,
+    auth_mode: str = "local",
 ) -> dict[str, Any]:
+    auth_mode = _validate_auth_mode(auth_mode)
     conditions = [
         LocalParametricCondition(name="baseline", model=model),
         LocalParametricCondition(
@@ -426,7 +429,7 @@ def run_local_parametric_memory_eval_dry_run(
     return {
         "dry_run": True,
         "benchmark": "terminal-bench-2.1",
-        "auth_mode": "local",
+        "auth_mode": auth_mode,
         "task_root": str(task_root),
         "run_root": str(run_root),
         "base_model": model,
@@ -467,8 +470,10 @@ def run_local_parametric_memory_eval(
     vllm_executable: str = DEFAULT_VLLM_EXECUTABLE,
     gpus: list[str] | None = None,
     port: int = 8000,
+    auth_mode: str = "local",
 ) -> dict[str, Any]:
     _validate_adapter_path(adapter_path)
+    auth_mode = _validate_auth_mode(auth_mode)
     attempt_count = max(1, int(n_attempts))
     conditions = [
         LocalParametricCondition(name="baseline", model=model),
@@ -504,7 +509,7 @@ def run_local_parametric_memory_eval(
     return {
         "dry_run": False,
         "benchmark": "terminal-bench-2.1",
-        "auth_mode": "local",
+        "auth_mode": auth_mode,
         "task_root": str(task_root),
         "run_root": str(run_root),
         "terminal_bench_package_root": str(terminal_bench_package_root),
@@ -529,6 +534,15 @@ def run_local_parametric_memory_eval(
 def _validate_adapter_path(adapter_path: Path) -> None:
     if str(adapter_path) in {"", "."}:
         raise ValueError("adapter_path must be a non-empty path")
+
+
+def _validate_auth_mode(auth_mode: str) -> str:
+    if auth_mode not in LOCAL_PARAMETRIC_AUTH_MODES:
+        raise ValueError(
+            "parametric_memory requires local or proxy auth: "
+            f"auth_mode={auth_mode!r}"
+        )
+    return auth_mode
 
 
 def _run_local_parametric_condition(

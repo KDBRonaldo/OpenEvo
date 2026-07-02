@@ -567,6 +567,34 @@ def test_terminal_bench_local_parametric_cli_dry_run_writes_output(
     ]
 
 
+def test_terminal_bench_local_parametric_cli_dry_run_records_proxy_auth(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "summary.json"
+    exit_code = main(
+        [
+            "terminal-bench-local-parametric-memory-eval",
+            "--task-root",
+            "/root/datasets/terminal-bench-2-1/tasks",
+            "--task-id",
+            "query-optimize",
+            "--run-root",
+            str(tmp_path / "run"),
+            "--adapter-path",
+            str(tmp_path / "adapter"),
+            "--auth-mode",
+            "proxy",
+            "--dry-run",
+            "--output",
+            str(output),
+        ]
+    )
+
+    assert exit_code == 0
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert payload["auth_mode"] == "proxy"
+
+
 def test_terminal_bench_local_parametric_cli_rejects_subscription_auth(
     tmp_path: Path,
 ) -> None:
@@ -628,6 +656,8 @@ def test_terminal_bench_local_parametric_cli_live_invokes_runner(
             "2",
             "--server-port",
             "8011",
+            "--auth-mode",
+            "proxy",
             "--verifier-env",
             "UV_NO_INDEX=1",
             "--output",
@@ -641,6 +671,7 @@ def test_terminal_bench_local_parametric_cli_live_invokes_runner(
     assert captured["adapter_artifact_id"] == "art-parametric"
     assert captured["gpus"] == ["1", "2"]
     assert captured["port"] == 8011
+    assert captured["auth_mode"] == "proxy"
     assert captured["verifier_env"] == {"UV_NO_INDEX": "1"}
     assert json.loads(output.read_text(encoding="utf-8")) == {
         "dry_run": False,
