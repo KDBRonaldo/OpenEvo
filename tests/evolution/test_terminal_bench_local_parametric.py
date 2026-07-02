@@ -288,6 +288,41 @@ def test_wait_for_openai_server_rejects_missing_expected_model(
         )
 
 
+def test_wait_for_openai_server_disables_host_proxy_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: dict[str, object] = {}
+
+    class FakeClient:
+        def __init__(self, **kwargs) -> None:
+            calls["kwargs"] = kwargs
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args) -> None:
+            return None
+
+        def get(self, path: str):
+            return SimpleNamespace(
+                raise_for_status=lambda: None,
+                json=lambda: {"data": [{"id": "tb-parametric-memory"}]},
+            )
+
+        def post(self, path: str, json: dict):
+            return SimpleNamespace(raise_for_status=lambda: None, json=lambda: {})
+
+    monkeypatch.setattr(local_parametric.httpx, "Client", FakeClient)
+
+    local_parametric.wait_for_openai_server(
+        server_url="http://127.0.0.1:8000/v1",
+        expected_model="tb-parametric-memory",
+        timeout_seconds=0.01,
+    )
+
+    assert calls["kwargs"]["trust_env"] is False
+
+
 def test_managed_vllm_server_does_not_mask_body_exception_when_process_group_is_gone(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -476,6 +511,52 @@ def test_managed_vllm_server_does_not_mask_body_exception_when_sigkill_wait_time
             timeout_seconds=1.0,
         ):
             raise RuntimeError("body failed")
+
+    assert local_parametric.signal.SIGTERM in calls["signals"]
+    assert local_parametric.signal.SIGKILL in calls["signals"]
+    assert calls["signals"].count("wait") == 2
+
+
+def test_managed_vllm_server_reports_teardown_timeout_when_body_succeeds(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: dict[str, object] = {"signals": []}
+
+    class FakeProcess:
+        pid = 4242
+        returncode = None
+
+        def poll(self) -> None:
+            return None
+
+        def wait(self, timeout: float | None = None) -> int:
+            calls["signals"].append("wait")
+            raise local_parametric.subprocess.TimeoutExpired("vllm", timeout)
+
+    fake_process = FakeProcess()
+
+    def fake_popen(command, *, cwd, env, stdout, stderr, start_new_session):
+        return fake_process
+
+    def fake_killpg(pid: int, kill_signal: int) -> None:
+        calls["signals"].append(kill_signal)
+
+    monkeypatch.setattr(local_parametric.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(local_parametric, "wait_for_openai_server", lambda **kwargs: None)
+    monkeypatch.setattr(local_parametric.os, "killpg", fake_killpg)
+
+    spec = local_parametric.build_vllm_command()
+
+    with pytest.raises(RuntimeError, match="vLLM teardown.*process group.*timeout"):
+        with local_parametric.managed_vllm_server(
+            spec=spec,
+            run_root=tmp_path,
+            server_url="http://127.0.0.1:8000/v1",
+            expected_model="Qwen/Qwen3.6-35B-A3B",
+            timeout_seconds=1.0,
+        ):
+            pass
 
     assert local_parametric.signal.SIGTERM in calls["signals"]
     assert local_parametric.signal.SIGKILL in calls["signals"]

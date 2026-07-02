@@ -246,7 +246,11 @@ def wait_for_openai_server(
             process_exit_message=process_exit_message,
         )
         try:
-            with httpx.Client(base_url=server_url, timeout=5.0) as client:
+            with httpx.Client(
+                base_url=server_url,
+                timeout=5.0,
+                trust_env=False,
+            ) as client:
                 models_response = client.get("/models")
                 models_response.raise_for_status()
                 model_ids = {
@@ -293,9 +297,9 @@ def _terminate_process_group(
     process: subprocess.Popen[Any],
     *,
     wait_timeout_seconds: float = 10.0,
-) -> None:
+) -> RuntimeError | None:
     if process.poll() is not None:
-        return
+        return None
 
     try:
         os.killpg(process.pid, signal.SIGTERM)
@@ -304,7 +308,7 @@ def _terminate_process_group(
 
     try:
         process.wait(timeout=wait_timeout_seconds)
-        return
+        return None
     except subprocess.TimeoutExpired:
         pass
 
@@ -316,7 +320,11 @@ def _terminate_process_group(
     try:
         process.wait(timeout=wait_timeout_seconds)
     except subprocess.TimeoutExpired:
-        pass
+        return RuntimeError(
+            "vLLM teardown for process group "
+            f"{process.pid} hit timeout after SIGKILL"
+        )
+    return None
 
 
 @contextmanager
@@ -339,6 +347,7 @@ def managed_vllm_server(
     stdout_handle = stdout_path.open("w")
     stderr_handle = stderr_path.open("w")
     process: subprocess.Popen[Any] | None = None
+    original_exception = False
 
     try:
         process = subprocess.Popen(
@@ -371,11 +380,16 @@ def managed_vllm_server(
             ),
         )
         yield metadata
+    except BaseException:
+        original_exception = True
+        raise
     finally:
         stdout_handle.close()
         stderr_handle.close()
         if process is not None:
-            _terminate_process_group(process)
+            teardown_error = _terminate_process_group(process)
+            if teardown_error is not None and not original_exception:
+                raise teardown_error
 
 
 def run_local_parametric_memory_eval_dry_run(
