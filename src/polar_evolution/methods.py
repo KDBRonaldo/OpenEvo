@@ -4,6 +4,7 @@ import json
 import math
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -79,6 +80,49 @@ _WINDOWS_UNC_PATH_RE = re.compile(
 _WINDOWS_ABSOLUTE_PATH_RE = re.compile(
     r"\b[A-Za-z]:[\\/](?:[^\\/:*?\"<>|\r\n,;]+[\\/])*[^\s\\/:*?\"<>|,;]+"
 )
+_TERMINAL_BENCH_LOCAL_SOLVER_SYSTEM = (
+    "Solve exactly one task_id. Use tb_read_task first. Use tb_exec to inspect "
+    "and edit files in the Harbor task container. Run tb_run_tests after changes "
+    "without supplying a custom test command; it runs the visible test or "
+    "evaluation entrypoint available in the container. Keep commands small and "
+    "auditable. When verifier feedback names a failed assertion, predicate, "
+    "expected property, or hard constraint, synthesize a temporary local checker "
+    "from visible task files and make candidate outputs pass that checker before "
+    "finalizing. For git recovery tasks, use git reflog/log plus git show --stat "
+    "or git diff-tree --name-only to identify the recovered commit and verify all "
+    "touched files before reporting completion."
+)
+_TERMINAL_BENCH_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "tb_read_task",
+            "description": "Read the Terminal Bench task instruction and initial container inventory.",
+            "parameters": {
+                "type": "object",
+                "properties": {"task_id": {"type": "string"}},
+                "required": ["task_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "tb_exec",
+            "description": "Run a shell command in the Harbor task container.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task_id": {"type": "string"},
+                    "command": {"type": "string"},
+                },
+                "required": ["task_id", "command"],
+            },
+        },
+    },
+]
+_PASSWORD_RECOVERY_RE = re.compile(r"\b8XD[A-Z0-9]{17}W54\b")
+_RECOVERY_OUTPUT_PATH_RE = re.compile(r"(?:file|path):\s*`?(/[^\s`]+)")
 _SECRET_ASSIGNMENT_RE = re.compile(
     r"\b[A-Za-z0-9_]*(?:"
     r"api[_-]?key|access[_-]?key(?:[_-]?id)?|accesskeyid|token|password|secret|"
@@ -1494,25 +1538,25 @@ def _write_parametric_memory_training_jsonl(
             reward = _record_reward(record)
             if _reflection_kind(record.get("status"), reward) != "success":
                 continue
-            for trace_index, messages in _sft_message_sets_from_record(
+            for trace_index, messages, extra_fields in _sft_message_sets_from_record(
                 record,
                 training_projection=training_projection,
             ):
-                training_records.append(
-                    {
-                        "messages": messages,
-                        "metadata": {
-                            "dataset_artifact_id": dataset.artifact_id,
-                            "dataset_name": manifest.get("name") or dataset.name,
-                            "event_id": record.get("event_id"),
-                            "task_id": record.get("task_id"),
-                            "session_id": record.get("session_id"),
-                            "trace_index": trace_index,
-                            "reward": reward,
-                            "status": record.get("status"),
-                        },
-                    }
-                )
+                training_record = {
+                    "messages": messages,
+                    "metadata": {
+                        "dataset_artifact_id": dataset.artifact_id,
+                        "dataset_name": manifest.get("name") or dataset.name,
+                        "event_id": record.get("event_id"),
+                        "task_id": record.get("task_id"),
+                        "session_id": record.get("session_id"),
+                        "trace_index": trace_index,
+                        "reward": reward,
+                        "status": record.get("status"),
+                    },
+                }
+                training_record.update(extra_fields)
+                training_records.append(training_record)
 
     output_path.write_text(
         "".join(
@@ -1528,11 +1572,11 @@ def _sft_message_sets_from_record(
     record: dict[str, Any],
     *,
     training_projection: dict[str, Any],
-) -> list[tuple[int, list[dict[str, str]]]]:
+) -> list[tuple[int, list[dict[str, Any]], dict[str, Any]]]:
     traces = record.get("traces")
     if not isinstance(traces, list):
         return []
-    message_sets: list[tuple[int, list[dict[str, str]]]] = []
+    message_sets: list[tuple[int, list[dict[str, Any]], dict[str, Any]]] = []
     for trace_index, trace in enumerate(traces):
         if not isinstance(trace, dict):
             continue
@@ -1541,12 +1585,22 @@ def _sft_message_sets_from_record(
             trace.get("response_messages"),
             default_role="assistant",
         )
+        if training_projection.get("type") == "terminal_bench_tool_call_policy":
+            message_sets.extend(
+                _terminal_bench_tool_call_policy_message_sets(
+                    trace_index,
+                    prompt_messages=prompt_messages,
+                    response_messages=response_messages,
+                    training_projection=training_projection,
+                )
+            )
+            continue
         response_messages = _project_sft_response_messages(
             response_messages,
             training_projection=training_projection,
         )
         if prompt_messages and response_messages:
-            message_sets.append((trace_index, [*prompt_messages, *response_messages]))
+            message_sets.append((trace_index, [*prompt_messages, *response_messages], {}))
     return message_sets
 
 
@@ -1593,6 +1647,24 @@ def _parametric_memory_training_projection(value: Any) -> dict[str, Any]:
             "max_events": max_events,
             "max_output_chars": max_output_chars,
         }
+    if projection_type == "terminal_bench_tool_call_policy":
+        max_commands = int(value.get("max_commands", 1))
+        if max_commands <= 0:
+            raise ValueError(
+                "parametric_memory_lora_sft terminal_bench_tool_call_policy "
+                "max_commands must be positive"
+            )
+        return {
+            "type": "terminal_bench_tool_call_policy",
+            "derive_password_recovery_command": bool(
+                value.get("derive_password_recovery_command", False)
+            ),
+            "max_commands": max_commands,
+            "command_contains": _string_list(value.get("command_contains")),
+            "exclude_command_contains": _string_list(
+                value.get("exclude_command_contains")
+            ),
+        }
     raise ValueError(
         "parametric_memory_lora_sft unsupported training_projection.type: "
         f"{projection_type!r}"
@@ -1600,10 +1672,10 @@ def _parametric_memory_training_projection(value: Any) -> dict[str, Any]:
 
 
 def _project_sft_response_messages(
-    response_messages: list[dict[str, str]],
+    response_messages: list[dict[str, Any]],
     *,
     training_projection: dict[str, Any],
-) -> list[dict[str, str]]:
+) -> list[dict[str, Any]]:
     projection_type = training_projection.get("type")
     if projection_type == "terminal_bench_final_actions":
         return _project_terminal_bench_final_action_messages(
@@ -1615,7 +1687,7 @@ def _project_sft_response_messages(
         return response_messages
 
     response_tail_chars = int(training_projection["response_tail_chars"])
-    projected: list[dict[str, str]] = []
+    projected: list[dict[str, Any]] = []
     for message in response_messages:
         content = message["content"][-response_tail_chars:].strip()
         if content:
@@ -1624,12 +1696,12 @@ def _project_sft_response_messages(
 
 
 def _project_terminal_bench_final_action_messages(
-    response_messages: list[dict[str, str]],
+    response_messages: list[dict[str, Any]],
     *,
     max_events: int,
     max_output_chars: int,
-) -> list[dict[str, str]]:
-    projected: list[dict[str, str]] = []
+) -> list[dict[str, Any]]:
+    projected: list[dict[str, Any]] = []
     for message in response_messages:
         content = _render_terminal_bench_final_actions(
             message["content"],
@@ -1641,6 +1713,170 @@ def _project_terminal_bench_final_action_messages(
         else:
             projected.append(message)
     return projected
+
+
+def _terminal_bench_tool_call_policy_message_sets(
+    trace_index: int,
+    *,
+    prompt_messages: list[dict[str, Any]],
+    response_messages: list[dict[str, Any]],
+    training_projection: dict[str, Any],
+) -> list[tuple[int, list[dict[str, Any]], dict[str, Any]]]:
+    prompt_text = "\n\n".join(message["content"] for message in prompt_messages)
+    response_text = "\n\n".join(message["content"] for message in response_messages)
+    commands = _terminal_bench_tool_call_policy_commands(
+        prompt_text=prompt_text,
+        response_text=response_text,
+        training_projection=training_projection,
+    )
+    if not prompt_text or not commands:
+        return []
+
+    read_task_call_id = "polar-train-read-task"
+    base_messages: list[dict[str, Any]] = [
+        {"role": "system", "content": _TERMINAL_BENCH_LOCAL_SOLVER_SYSTEM},
+        {
+            "role": "user",
+            "content": _terminal_bench_local_solver_instruction(),
+        },
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                _terminal_bench_tool_call(
+                    "tb_read_task",
+                    {"task_id": "1"},
+                    call_id=read_task_call_id,
+                )
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": read_task_call_id,
+            "content": _terminal_bench_read_task_response(prompt_text),
+        },
+    ]
+    message_sets: list[tuple[int, list[dict[str, Any]], dict[str, Any]]] = []
+    for command in commands[: int(training_projection["max_commands"])]:
+        messages = [
+            *base_messages,
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    _terminal_bench_tool_call(
+                        "tb_exec",
+                        {
+                            "task_id": "terminal-bench-task",
+                            "command": command,
+                        },
+                    )
+                ],
+            },
+        ]
+        message_sets.append(
+            (
+                trace_index,
+                messages,
+                {"tools": _TERMINAL_BENCH_TOOLS},
+            )
+        )
+    return message_sets
+
+
+def _terminal_bench_tool_call_policy_commands(
+    *,
+    prompt_text: str,
+    response_text: str,
+    training_projection: dict[str, Any],
+) -> list[str]:
+    commands: list[str] = []
+    if training_projection.get("derive_password_recovery_command"):
+        command = _derive_password_recovery_command(prompt_text, response_text)
+        if command:
+            commands.append(command)
+
+    command_contains = training_projection.get("command_contains") or []
+    exclude_command_contains = training_projection.get("exclude_command_contains") or []
+    for event in _terminal_bench_action_events(
+        response_text,
+        max_output_chars=int(training_projection.get("max_output_chars", 2000)),
+    ):
+        if event.get("kind") != "command":
+            continue
+        command = event.get("command", "")
+        if command_contains and not any(needle in command for needle in command_contains):
+            continue
+        if exclude_command_contains and any(
+            needle in command for needle in exclude_command_contains
+        ):
+            continue
+        if command and command not in commands:
+            commands.append(command)
+    return commands
+
+
+def _derive_password_recovery_command(prompt_text: str, response_text: str) -> str | None:
+    password_match = _PASSWORD_RECOVERY_RE.search(response_text)
+    path_match = _RECOVERY_OUTPUT_PATH_RE.search(prompt_text)
+    if not password_match or not path_match:
+        return None
+    password = password_match.group(0)
+    output_path = path_match.group(1).rstrip(".,")
+    quoted_password = shlex.quote(password)
+    quoted_path = shlex.quote(output_path)
+    return (
+        f"printf '%s\\n' {quoted_password} > {quoted_path} && "
+        f"test -f {quoted_path} && wc -c {quoted_path} && sed -n l {quoted_path}"
+    )
+
+
+def _terminal_bench_local_solver_instruction() -> str:
+    instruction = {
+        "subagent_goal": (
+            "Solve the current Terminal-Bench task in the Harbor task container. "
+            "Use tb_read_task to read the task instruction, then use tb_exec to "
+            "modify files so the official verifier passes."
+        ),
+        "task_summary": (
+            "There is exactly one work item for this Harbor trial. The task is "
+            "complete when the expected files in /app satisfy the verifier."
+        ),
+        "available_input_artifacts": [],
+        "expected_output_artifacts": [],
+    }
+    return "Instruction:\n" + json.dumps(instruction, indent=2, sort_keys=True)
+
+
+def _terminal_bench_read_task_response(prompt_text: str) -> str:
+    task_yaml = "descriptions:\n  - key: base\n    description: |\n"
+    for line in prompt_text.splitlines() or [""]:
+        task_yaml += f"      {line}\n"
+    payload = {
+        "message": "read Harbor task terminal-bench-task",
+        "task_id": "terminal-bench-task",
+        "task_yaml": task_yaml,
+        "tool": "tb_read_task",
+        "visible_baselines": [],
+        "workspace": "Harbor task container",
+    }
+    return json.dumps(payload, indent=2, sort_keys=True)
+
+
+def _terminal_bench_tool_call(
+    name: str,
+    arguments: dict[str, Any],
+    *,
+    call_id: str = "polar-train-tool-call",
+) -> dict[str, Any]:
+    return {
+        "id": call_id,
+        "type": "function",
+        "function": {
+            "name": name,
+            "arguments": arguments,
+        },
+    }
 
 
 def _render_terminal_bench_final_actions(
@@ -1739,10 +1975,10 @@ def _coerce_text(value: Any) -> str:
     return str(value)
 
 
-def _sft_messages(value: Any, *, default_role: str) -> list[dict[str, str]]:
+def _sft_messages(value: Any, *, default_role: str) -> list[dict[str, Any]]:
     if not isinstance(value, list):
         return []
-    messages: list[dict[str, str]] = []
+    messages: list[dict[str, Any]] = []
     for message in value:
         if not isinstance(message, dict):
             continue

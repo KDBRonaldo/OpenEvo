@@ -239,7 +239,12 @@ def build_parser() -> argparse.ArgumentParser:
     tb_parametric_job.add_argument("--trainer-timeout-seconds", type=float, default=3600.0)
     tb_parametric_job.add_argument(
         "--training-projection",
-        choices=["full_trace", "response_tail", "terminal_bench_final_actions"],
+        choices=[
+            "full_trace",
+            "response_tail",
+            "terminal_bench_final_actions",
+            "terminal_bench_tool_call_policy",
+        ],
         default="full_trace",
         help="Projection applied when exporting successful traces to SFT JSONL.",
     )
@@ -264,6 +269,41 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Maximum command output excerpt length with "
             "--training-projection terminal_bench_final_actions."
+        ),
+    )
+    tb_parametric_job.add_argument(
+        "--training-tool-call-max-commands",
+        type=int,
+        default=1,
+        help=(
+            "Maximum tb_exec commands to export with --training-projection "
+            "terminal_bench_tool_call_policy."
+        ),
+    )
+    tb_parametric_job.add_argument(
+        "--training-tool-call-command-contains",
+        action="append",
+        default=[],
+        help=(
+            "Substring filter for commands exported with terminal_bench_tool_call_policy. "
+            "Can be repeated."
+        ),
+    )
+    tb_parametric_job.add_argument(
+        "--training-tool-call-exclude-command-contains",
+        action="append",
+        default=[],
+        help=(
+            "Substring exclusion filter for commands exported with "
+            "terminal_bench_tool_call_policy. Can be repeated."
+        ),
+    )
+    tb_parametric_job.add_argument(
+        "--training-tool-call-derive-password-recovery-command",
+        action="store_true",
+        help=(
+            "Derive a direct tb_exec write command from password-recovery successful "
+            "transcripts when using terminal_bench_tool_call_policy."
         ),
     )
     tb_parametric_job.add_argument("--run-worker", action="store_true")
@@ -1049,6 +1089,18 @@ def _create_terminal_bench_parametric_memory_job(args: argparse.Namespace) -> di
             "type": "terminal_bench_final_actions",
             "max_events": args.training_final_action_max_events,
             "max_output_chars": args.training_final_action_output_chars,
+        }
+    if args.training_projection == "terminal_bench_tool_call_policy":
+        config["training_projection"] = {
+            "type": "terminal_bench_tool_call_policy",
+            "max_commands": args.training_tool_call_max_commands,
+            "command_contains": list(args.training_tool_call_command_contains),
+            "exclude_command_contains": list(
+                args.training_tool_call_exclude_command_contains
+            ),
+            "derive_password_recovery_command": (
+                args.training_tool_call_derive_password_recovery_command
+            ),
         }
 
     job = store.create_job(

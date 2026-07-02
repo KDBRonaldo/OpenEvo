@@ -203,6 +203,13 @@ For Codex-style Terminal Bench JSONL transcripts, use
 to parse completed command/message events and train only on the last bounded
 terminal actions. This keeps durable solution actions, checksums, and final
 file writes without letting large intermediate tool outputs dominate SFT.
+For local Qwen/vLLM tool-use experiments, prefer
+`{"type": "terminal_bench_tool_call_policy", "max_commands": N}`. It exports
+Qwen chat-template `assistant.tool_calls` records plus a top-level `tools` list
+so SFT can train the same `<tool_call>` XML shape that vLLM's `qwen3_xml`
+parser expects. The trainer must pass each record's `tools` value into
+`tokenizer.apply_chat_template`; otherwise the SFT prompt will not match the
+runtime tool prompt.
 This is the path expected for OpenEvo deployments backed by a local inference
 server: the proxy can select a request-level LoRA adapter, while subscription
 mode cannot.
@@ -272,9 +279,10 @@ uv run polar-evolution terminal-bench-parametric-memory-job \
   --trainer-arg '{training_dataset}' \
   --trainer-arg --output-dir \
   --trainer-arg '{adapter_dir}' \
-  --training-projection terminal_bench_final_actions \
-  --training-final-action-max-events 8 \
-  --training-final-action-output-chars 2000 \
+  --training-projection terminal_bench_tool_call_policy \
+  --training-tool-call-max-commands 1 \
+  --training-tool-call-command-contains recovered_passwords.txt \
+  --training-tool-call-derive-password-recovery-command \
   --run-worker \
   --output /tmp/tb21-parametric-memory/job.json
 ```

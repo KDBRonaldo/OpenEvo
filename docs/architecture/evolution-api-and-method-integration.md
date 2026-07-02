@@ -517,6 +517,10 @@ settings 或 metadata 标记 subscription auth 时跳过 `parametric_memory` art
   对 Codex-style Terminal Bench JSONL transcript，也可以设为
   `{"type": "terminal_bench_final_actions", "max_events": N, "max_output_chars": M}`，
   只导出最后 N 个 completed command/message events，并限制单个 command output 片段长度；
+  local Qwen/vLLM tool-use 训练可以设为
+  `{"type": "terminal_bench_tool_call_policy", "max_commands": N}`，导出带
+  `assistant.tool_calls` 和 top-level `tools` 的 SFT records，使 Qwen chat template 渲染出
+  vLLM `qwen3_xml` parser 期望的 `<tool_call>` XML；
 - trainer 执行前会清理旧 adapter 目录；
 - 默认 `adapter_format=lora` 时，adapter 目录必须包含 `adapter_config.json`。
 

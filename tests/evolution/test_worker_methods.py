@@ -3304,6 +3304,132 @@ def test_parametric_memory_lora_sft_can_project_terminal_bench_final_actions(
     }
 
 
+def test_parametric_memory_lora_sft_can_project_terminal_bench_tool_call_policy(
+    tmp_path: Path,
+):
+    trainer_script = tmp_path / "fake_trainer.py"
+    trainer_script.write_text(
+        "from pathlib import Path\n"
+        "import argparse\n"
+        "parser = argparse.ArgumentParser()\n"
+        "parser.add_argument('--train-file')\n"
+        "parser.add_argument('--output-dir')\n"
+        "args = parser.parse_args()\n"
+        "Path(args.output_dir).mkdir(parents=True, exist_ok=True)\n"
+        "(Path(args.output_dir) / 'adapter_config.json').write_text('{}')\n",
+        encoding="utf-8",
+    )
+    final_write = {
+        "type": "item.completed",
+        "item": {
+            "type": "command_execution",
+            "command": (
+                "printf '%s\\n' '8XDP5Q2RT9ZK7VB3BV4WW54' "
+                "> /app/recovered_passwords.txt"
+            ),
+            "exit_code": 0,
+            "status": "completed",
+            "aggregated_output": "wrote recovered_passwords.txt successfully\n",
+        },
+    }
+    dataset = _parametric_dataset_artifact(
+        tmp_path,
+        [
+            {
+                "event_id": "evt_tool_call_policy",
+                "task_id": "terminal-bench/password-recovery",
+                "session_id": "password-recovery__tool_policy",
+                "status": "COMPLETED",
+                "reward": 1.0,
+                "traces": [
+                    {
+                        "prompt_messages": [
+                            {
+                                "role": "user",
+                                "content": (
+                                    "Recover the PASSWORD from launchcode.txt. "
+                                    "It starts with \"8XD\" and ends with \"W54\". "
+                                    "Write each matching password to the file: "
+                                    "/app/recovered_passwords.txt"
+                                ),
+                            }
+                        ],
+                        "response_messages": [
+                            {
+                                "role": "assistant",
+                                "content": json.dumps(final_write),
+                            }
+                        ],
+                    }
+                ],
+            }
+        ],
+    )
+    job = _job(
+        "parametric_memory_lora_sft",
+        tmp_path,
+        input_artifacts=[dataset],
+        config={
+            "base_model": "Qwen/Qwen3.6-35B-A3B",
+            "training_projection": {
+                "type": "terminal_bench_tool_call_policy",
+                "derive_password_recovery_command": True,
+                "max_commands": 1,
+            },
+            "trainer": {
+                "command": "python",
+                "args": [
+                    str(trainer_script),
+                    "--train-file",
+                    "{training_dataset}",
+                    "--output-dir",
+                    "{adapter_dir}",
+                ],
+            },
+        },
+    )
+
+    [artifact] = run_method(job, artifact_root=tmp_path / "artifacts")
+
+    train_path = (
+        tmp_path
+        / "artifacts"
+        / "workers"
+        / job.job_id
+        / "parametric_memory_lora_sft"
+        / "training.jsonl"
+    )
+    [training_line] = [
+        json.loads(line) for line in train_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert [tool["function"]["name"] for tool in training_line["tools"]] == [
+        "tb_read_task",
+        "tb_exec",
+    ]
+    messages = training_line["messages"]
+    assert [message["role"] for message in messages] == [
+        "system",
+        "user",
+        "assistant",
+        "tool",
+        "assistant",
+    ]
+    assert messages[2]["tool_calls"][0]["function"]["name"] == "tb_read_task"
+    assert "launchcode.txt" in messages[3]["content"]
+    final_call = messages[4]["tool_calls"][0]["function"]
+    assert final_call["name"] == "tb_exec"
+    assert final_call["arguments"]["task_id"] == "terminal-bench-task"
+    assert "8XDP5Q2RT9ZK7VB3BV4WW54" in final_call["arguments"]["command"]
+    assert "/app/recovered_passwords.txt" in final_call["arguments"]["command"]
+    assert artifact.manifest["training_projection"] == {
+        "type": "terminal_bench_tool_call_policy",
+        "derive_password_recovery_command": True,
+        "max_commands": 1,
+        "command_contains": [],
+        "exclude_command_contains": [],
+    }
+
+
 def test_parametric_memory_lora_sft_requires_trainer_placeholders(tmp_path: Path):
     trainer_script = tmp_path / "fake_trainer.py"
     trainer_script.write_text("print('unused')\n", encoding="utf-8")

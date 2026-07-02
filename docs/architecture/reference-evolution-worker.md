@@ -481,6 +481,10 @@ flowchart TB
   会解析 Codex-style JSONL transcript 中的 `item.completed` command/message events，只保留
   最后 N 个事件，并把每个 command output 限制在 M 个字符以内，适合 tool-heavy Terminal
   Bench 轨迹中最终成功动作被大型中间输出稀释的训练集；
+  `{"type": "terminal_bench_tool_call_policy", "max_commands": N}` 会导出包含
+  `assistant.tool_calls`、`tool` response messages 和 top-level `tools` 的 Qwen SFT records，
+  让本地 vLLM/Qwen parametric-memory adapter 学习真实 `tb_read_task`/`tb_exec` 工具调用形态。
+  使用该 projection 的 trainer 必须把 record-level `tools` 传给 tokenizer chat template；
 - 可选 `job.config.output_adapter_id`、`adapter_format`、`compatibility`、`scores`、
   `tags`、`promoted`；
 - 可选旧 `parametric_memory` input artifact，当前只记录在 manifest，后续 trainer 可以用
