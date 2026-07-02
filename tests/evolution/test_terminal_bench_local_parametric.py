@@ -64,6 +64,7 @@ def test_build_evolab_harbor_env_sets_openai_chat_endpoint(
     assert env["AIGOCODE_GPT_BASE_URL"] == "http://127.0.0.1:8000/v1"
     assert env["OPENAI_API_KEY"] == "dummy-local-key"
     assert env["EVOLAB_TB_MODE"] == "direct_solver"
+    assert env["EVOLAB_TB_MAX_OUTPUT_TOKENS"] == "4096"
 
 
 def test_build_evolab_harbor_env_empty_base_does_not_inherit_host_env(
@@ -262,6 +263,7 @@ def test_run_local_parametric_memory_eval_compares_baseline_and_adapter(
     assert envs[0]["EVOLAB_TB_MODEL"] == "Qwen/Qwen3.6-35B-A3B"
     assert envs[1]["EVOLAB_TB_MODEL"] == "tb-parametric-memory"
     assert all(env["EVOLAB_TB_MODE"] == "direct_solver" for env in envs)
+    assert all(env["EVOLAB_TB_MAX_OUTPUT_TOKENS"] == "4096" for env in envs)
 
 
 def test_run_local_parametric_memory_eval_scores_only_requested_attempts(

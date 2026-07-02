@@ -210,7 +210,9 @@ Harbor agent. This disables EvoLab's task-local memory, prompt overlay, skill
 graph, dynamic replanning, and insight-memory paths inside the Terminal Bench
 harness so the treatment variable is the serving-time adapter. The Harbor CLI
 still uses `mode=evolab` because the agent talks to an OpenAI-compatible local
-endpoint.
+endpoint. It also caps `EVOLAB_TB_MAX_OUTPUT_TOKENS` at `4096`, which keeps
+long direct-solver prompts inside the Qwen3.6 16k-token serving window during
+later tool-heavy turns.
 
 Use `--auth-mode local` or `--auth-mode proxy` for local/proxy inference modes;
 neither is subscription mode. The selected auth mode is recorded in the

@@ -31,6 +31,7 @@ DEFAULT_LOCAL_PARAMETRIC_DISABLED_ARTIFACTS = [
 LOCAL_PARAMETRIC_AUTH_MODES = {"local", "proxy"}
 DEFAULT_VLLM_EXECUTABLE = "/root/evolab-vllm/bin/vllm"
 DEFAULT_VLLM_GPUS = ["1", "2", "3", "4"]
+DEFAULT_LOCAL_PARAMETRIC_MAX_OUTPUT_TOKENS = "4096"
 _SECRET_ENV_MARKERS = (
     "key",
     "token",
@@ -133,6 +134,7 @@ def build_evolab_harbor_env(
     env = dict(os.environ if base_env is None else base_env)
     env["EVOLAB_TB_LLM_API"] = "openai-chat-completions"
     env["EVOLAB_TB_MODE"] = "direct_solver"
+    env["EVOLAB_TB_MAX_OUTPUT_TOKENS"] = DEFAULT_LOCAL_PARAMETRIC_MAX_OUTPUT_TOKENS
     env["EVOLAB_TB_MODEL"] = model
     env["OPENAI_BASE_URL"] = server_url
     env["AIGOCODE_GPT_BASE_URL"] = server_url
