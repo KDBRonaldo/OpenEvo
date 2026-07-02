@@ -391,6 +391,232 @@ def test_run_local_parametric_memory_eval_manages_baseline_and_adapter_servers(
     assert f"tb-parametric-memory={tmp_path / 'adapter'}" in treatment_spec.command
 
 
+def test_run_local_parametric_memory_eval_rewrites_adapter_keys_for_managed_vllm(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter_dir = tmp_path / "adapter"
+    adapter_dir.mkdir()
+    (adapter_dir / "adapter_config.json").write_text("{}", encoding="utf-8")
+    (adapter_dir / "adapter_model.safetensors").write_bytes(b"fake")
+
+    loaded_state = {
+        "base_model.model.model.layers.11.self_attn.q_proj.lora_A.weight": object(),
+        "base_model.model.model.layers.11.self_attn.q_proj.lora_B.weight": object(),
+        "base_model.model.lm_head.lora_A.weight": object(),
+    }
+    saved_state: dict[str, object] = {}
+    prepared_adapter_path = (
+        tmp_path
+        / "run"
+        / "prepared_adapters"
+        / "tb-parametric-memory"
+        / "qwen3_5_moe_vllm_language_model"
+        / "adapter"
+    )
+
+    def fake_load_safetensors(path: Path) -> local_parametric.RawSafetensorsFile:
+        assert path == prepared_adapter_path / "adapter_model.safetensors"
+        return local_parametric.RawSafetensorsFile(header=dict(loaded_state), payload=b"payload")
+
+    def fake_save_safetensors(raw_file: local_parametric.RawSafetensorsFile, path: Path) -> None:
+        saved_state.update(raw_file.header)
+        path.write_bytes(b"rewritten")
+
+    monkeypatch.setattr(
+        local_parametric,
+        "_load_safetensors_file",
+        fake_load_safetensors,
+    )
+    monkeypatch.setattr(
+        local_parametric,
+        "_save_safetensors_file",
+        fake_save_safetensors,
+    )
+
+    servers: list[dict[str, object]] = []
+
+    @local_parametric.contextmanager
+    def fake_managed_vllm_server(**kwargs):
+        servers.append(kwargs)
+        yield {"server_url": kwargs["server_url"], "expected_model": kwargs["expected_model"]}
+
+    def fake_command_runner(command, *, cwd=None, env=None):
+        del cwd, env
+        jobs_dir = Path(command[command.index("--jobs-dir") + 1])
+        job_name = command[command.index("--job-name") + 1]
+        task_id = command[command.index("--include-task-name") + 1]
+        trial = jobs_dir / job_name / f"{task_id}__attempt1"
+        trial.mkdir(parents=True)
+        (trial / "result.json").write_text(
+            json.dumps(
+                {
+                    "trial_name": trial.name,
+                    "task_name": task_id,
+                    "status": "COMPLETED",
+                    "verifier_result": {"rewards": {"reward": 0.0}},
+                }
+            ),
+            encoding="utf-8",
+        )
+        return {}
+
+    monkeypatch.setattr(local_parametric, "managed_vllm_server", fake_managed_vllm_server)
+
+    summary = run_local_parametric_memory_eval(
+        task_root=tmp_path / "tasks",
+        task_ids=["password-recovery"],
+        run_root=tmp_path / "run",
+        terminal_bench_package_root=tmp_path / "terminal-bench-package",
+        model="Qwen/Qwen3.6-35B-A3B",
+        adapter_path=adapter_dir,
+        adapter_id="tb-parametric-memory",
+        server_url="http://127.0.0.1:8000/v1",
+        n_attempts=1,
+        verifier_env={},
+        command_runner=fake_command_runner,
+        manage_server=True,
+        gpus=["0"],
+        vllm_executable="vllm",
+        adapter_key_rewrite="qwen3_5_moe_vllm_language_model",
+    )
+
+    rewritten_key = (
+        "base_model.model.model.language_model.layers.11.self_attn.q_proj.lora_A.weight"
+    )
+    assert rewritten_key in saved_state
+    assert "base_model.model.model.layers.11.self_attn.q_proj.lora_A.weight" not in saved_state
+    assert "base_model.model.lm_head.lora_A.weight" in saved_state
+
+    treatment_spec = servers[1]["spec"]
+    assert f"tb-parametric-memory={prepared_adapter_path}" in treatment_spec.command
+    assert summary["adapter_key_rewrite"] == "qwen3_5_moe_vllm_language_model"
+    assert summary["conditions"][1]["adapter"]["source_adapter_path"] == str(adapter_dir)
+    assert summary["conditions"][1]["adapter"]["adapter_path"] == str(prepared_adapter_path)
+    assert summary["conditions"][1]["adapter"]["rewritten_key_count"] == 2
+
+
+def test_prepare_serving_adapter_rejects_rewrite_that_matches_no_keys(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter_dir = tmp_path / "adapter"
+    adapter_dir.mkdir()
+    (adapter_dir / "adapter_config.json").write_text("{}", encoding="utf-8")
+    (adapter_dir / "adapter_model.safetensors").write_bytes(b"fake")
+
+    monkeypatch.setattr(
+        local_parametric,
+        "_load_safetensors_file",
+        lambda path: local_parametric.RawSafetensorsFile(
+            header={"base_model.model.model.embed_tokens.weight": object()},
+            payload=b"payload",
+        ),
+    )
+
+    def fail_if_saved(raw_file: local_parametric.RawSafetensorsFile, path: Path) -> None:
+        raise AssertionError("no-op adapter rewrite should not save a new safetensors file")
+
+    monkeypatch.setattr(local_parametric, "_save_safetensors_file", fail_if_saved)
+
+    with pytest.raises(ValueError, match="did not rewrite any adapter keys"):
+        local_parametric.prepare_serving_adapter(
+            adapter_path=adapter_dir,
+            run_root=tmp_path / "run",
+            adapter_id="tb-parametric-memory",
+            adapter_key_rewrite="qwen3_5_moe_vllm_language_model",
+        )
+
+
+def test_prepare_serving_adapter_rewrites_safetensors_header_without_torch(
+    tmp_path: Path,
+) -> None:
+    adapter_dir = tmp_path / "adapter"
+    adapter_dir.mkdir()
+    (adapter_dir / "adapter_config.json").write_text("{}", encoding="utf-8")
+    payload = b"\x01\x02\x03\x04"
+    header = {
+        "__metadata__": {"format": "pt"},
+        "base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight": {
+            "dtype": "F16",
+            "shape": [1, 1],
+            "data_offsets": [0, 2],
+        },
+        "base_model.model.lm_head.lora_A.weight": {
+            "dtype": "F16",
+            "shape": [1, 1],
+            "data_offsets": [2, 4],
+        },
+    }
+    header_bytes = json.dumps(header, separators=(",", ":")).encode("utf-8")
+    (adapter_dir / "adapter_model.safetensors").write_bytes(
+        len(header_bytes).to_bytes(8, "little") + header_bytes + payload
+    )
+
+    prepared = local_parametric.prepare_serving_adapter(
+        adapter_path=adapter_dir,
+        run_root=tmp_path / "run",
+        adapter_id="tb-parametric-memory",
+        adapter_key_rewrite="qwen3_5_moe_vllm_language_model",
+    )
+
+    rewritten_bytes = (prepared.adapter_path / "adapter_model.safetensors").read_bytes()
+    rewritten_header_length = int.from_bytes(rewritten_bytes[:8], "little")
+    rewritten_header = json.loads(rewritten_bytes[8 : 8 + rewritten_header_length])
+    rewritten_payload = rewritten_bytes[8 + rewritten_header_length :]
+
+    assert prepared.rewritten_key_count == 1
+    assert rewritten_header["__metadata__"] == {"format": "pt"}
+    assert (
+        "base_model.model.model.language_model.layers.0.self_attn.q_proj.lora_A.weight"
+        in rewritten_header
+    )
+    assert (
+        "base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight"
+        not in rewritten_header
+    )
+    assert "base_model.model.lm_head.lora_A.weight" in rewritten_header
+    assert rewritten_payload == payload
+
+
+def test_prepare_serving_adapter_rejects_adapter_key_rewrite_collisions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter_dir = tmp_path / "adapter"
+    adapter_dir.mkdir()
+    (adapter_dir / "adapter_config.json").write_text("{}", encoding="utf-8")
+    (adapter_dir / "adapter_model.safetensors").write_bytes(b"fake")
+
+    monkeypatch.setattr(
+        local_parametric,
+        "_load_safetensors_file",
+        lambda path: local_parametric.RawSafetensorsFile(
+            header={
+                "base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight": object(),
+                (
+                    "base_model.model.model.language_model.layers.0.self_attn."
+                    "q_proj.lora_A.weight"
+                ): object(),
+            },
+            payload=b"payload",
+        ),
+    )
+
+    def fail_if_saved(raw_file: local_parametric.RawSafetensorsFile, path: Path) -> None:
+        raise AssertionError("colliding adapter rewrite should not save a safetensors file")
+
+    monkeypatch.setattr(local_parametric, "_save_safetensors_file", fail_if_saved)
+
+    with pytest.raises(ValueError, match="would overwrite adapter key"):
+        local_parametric.prepare_serving_adapter(
+            adapter_path=adapter_dir,
+            run_root=tmp_path / "run",
+            adapter_id="tb-parametric-memory",
+            adapter_key_rewrite="qwen3_5_moe_vllm_language_model",
+        )
+
+
 def test_redacted_env_redacts_secret_values() -> None:
     redacted = local_parametric._redacted_env(
         {
@@ -658,6 +884,37 @@ def test_terminal_bench_local_parametric_cli_dry_run_records_proxy_auth(
     assert exit_code == 0
     payload = json.loads(output.read_text(encoding="utf-8"))
     assert payload["auth_mode"] == "proxy"
+
+
+def test_terminal_bench_local_parametric_cli_dry_run_records_adapter_key_rewrite(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "summary.json"
+    exit_code = main(
+        [
+            "terminal-bench-local-parametric-memory-eval",
+            "--task-root",
+            "/root/datasets/terminal-bench-2-1/tasks",
+            "--task-id",
+            "password-recovery",
+            "--run-root",
+            str(tmp_path / "run"),
+            "--adapter-path",
+            str(tmp_path / "adapter"),
+            "--adapter-key-rewrite",
+            "qwen3_5_moe_vllm_language_model",
+            "--dry-run",
+            "--output",
+            str(output),
+        ]
+    )
+
+    assert exit_code == 0
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert payload["adapter_key_rewrite"] == "qwen3_5_moe_vllm_language_model"
+    assert payload["conditions"][1]["adapter_key_rewrite"] == (
+        "qwen3_5_moe_vllm_language_model"
+    )
 
 
 def test_terminal_bench_local_parametric_cli_rejects_subscription_auth(

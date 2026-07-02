@@ -531,6 +531,22 @@ settings 或 metadata 标记 subscription auth 时跳过 `parametric_memory` art
 - trainer 执行前会清理旧 adapter 目录；
 - 默认 `adapter_format=lora` 时，adapter 目录必须包含 `adapter_config.json`。
 
+使用 chat-template trainer 时，trainer 还必须保证第一个 generated response token 参与
+loss。不要分别 tokenize 完整 conversation 和 generation prefix 后仅按 prefix token 数切
+mask；BPE 可能把 prompt 末尾 token 和 response 开头 token 合并。推荐做法是 render full
+text 和 generation prefix，确认 full 以 prefix 开头，再分别用 `add_special_tokens=False`
+tokenize prefix 与 suffix，拼接 token ids，并只 mask prefix ids。对 Qwen/vLLM tool-use
+records，trainer 必须把 record-level `tools` 传给 `tokenizer.apply_chat_template`，使训练
+格式和 runtime 的 `qwen3_xml` parser 一致。
+
+本地 vLLM eval 提供 serving-time adapter 兼容层：对 Qwen3.5/Qwen3.6 MoE PEFT LoRA，可在
+`terminal-bench-local-parametric-memory-eval` 中使用
+`--adapter-key-rewrite qwen3_5_moe_vllm_language_model`。该选项复制原始 adapter 到
+`run_root/prepared_adapters/...`，把 `base_model.model.model.layers.*` safetensors key
+改写为 vLLM language-model-only wrapper 期望的
+`base_model.model.model.language_model.layers.*`，并在 summary 中记录 source adapter path、
+serving adapter path、rewrite 名称和改写 key 数。它不改变 evolution artifact 的原始 URI。
+
 Reference worker 只定义训练编排和 artifact contract；具体 LoRA trainer、serving backend
 的 adapter 加载方式，以及长训练过程中的续约/heartbeat 扩展，应由本地 inference/training
 infrastructure 提供。

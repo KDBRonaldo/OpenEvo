@@ -15,6 +15,8 @@ from polar_evolution.server import create_app
 from polar_evolution.store import EvolutionStore
 from polar_evolution.terminal_bench_bridge import build_terminal_bench_events
 from polar_evolution.terminal_bench_local_parametric import (
+    ADAPTER_KEY_REWRITE_CHOICES,
+    ADAPTER_KEY_REWRITE_NONE,
     DEFAULT_LOCAL_MODEL,
     DEFAULT_LOCAL_PARAMETRIC_ADAPTER_ID,
     DEFAULT_LOCAL_PARAMETRIC_MAX_OUTPUT_TOKENS,
@@ -468,6 +470,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--adapter-id",
         default=DEFAULT_LOCAL_PARAMETRIC_ADAPTER_ID,
     )
+    tb_local_parametric.add_argument(
+        "--adapter-key-rewrite",
+        choices=ADAPTER_KEY_REWRITE_CHOICES,
+        default=ADAPTER_KEY_REWRITE_NONE,
+        help=(
+            "Optional serving-time adapter key rewrite. Use "
+            "qwen3_5_moe_vllm_language_model for PEFT adapters trained on "
+            "Qwen3.5/Qwen3.6 MoE whose vLLM language model lives under "
+            "language_model.model.*."
+        ),
+    )
     tb_local_parametric.add_argument("--adapter-artifact-id")
     tb_local_parametric.add_argument("--server-url", default="http://127.0.0.1:8000/v1")
     tb_local_parametric.add_argument("--server-port", type=int, default=8000)
@@ -650,6 +663,7 @@ def main(argv: list[str] | None = None) -> int:
                 manage_server=args.manage_server,
                 verifier_env=verifier_env,
                 auth_mode=args.auth_mode,
+                adapter_key_rewrite=args.adapter_key_rewrite,
             )
             _write_json_output(payload, args.output)
             return 0
@@ -673,6 +687,7 @@ def main(argv: list[str] | None = None) -> int:
             gpus=args.gpu or None,
             port=args.server_port,
             auth_mode=args.auth_mode,
+            adapter_key_rewrite=args.adapter_key_rewrite,
         )
         _write_json_output(payload, args.output)
         return 0

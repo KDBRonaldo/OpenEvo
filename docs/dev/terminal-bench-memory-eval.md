@@ -223,6 +223,14 @@ can exceed 13k tokens, so use `max_input_tool_messages` or the CLI
 `--training-corrective-max-input-tool-messages` to keep the system/user prompt
 and only the most recent tool-result messages when the trainer cannot fit the
 full prefix.
+For Qwen chat-template SFT, the trainer must not derive the loss mask by
+tokenizing the full conversation and a generation prefix independently and then
+masking by prefix token count. BPE can merge the prompt-ending newline with the
+response-starting newline, masking out the first generated token. Instead,
+render the full text, verify it starts with the generation prefix, tokenize the
+prefix and suffix separately with `add_special_tokens=False`, concatenate those
+ids, and mask only the prefix ids. This keeps the first response token under
+loss and is required for the adapter to affect free generation.
 This is the path expected for OpenEvo deployments backed by a local inference
 server: the proxy can select a request-level LoRA adapter, while subscription
 mode cannot.
@@ -341,6 +349,7 @@ uv run polar-evolution terminal-bench-local-parametric-memory-eval \
   --adapter-path /tmp/tb21-parametric-memory/artifacts/workers/<job-id>/parametric_memory_lora_sft/adapter \
   --adapter-id tb-parametric-memory \
   --adapter-artifact-id <artifact-id> \
+  --adapter-key-rewrite qwen3_5_moe_vllm_language_model \
   --gpu 1 \
   --gpu 2 \
   --gpu 3 \
@@ -370,3 +379,15 @@ pass `--verifier-python-install-mirror`; the runner records the resulting
 verifier environment in the summary for reproducibility. Treat controlled-subset
 results as subset evidence until the same path is run over full Terminal Bench
 2.1.
+
+Use `--adapter-key-rewrite qwen3_5_moe_vllm_language_model` when the adapter is
+a PEFT LoRA trained against Hugging Face `Qwen3_5MoeForConditionalGeneration`
+or the Qwen3.6 MoE alias but served through vLLM's language-model-only
+`Qwen3_5MoeForConditionalGeneration` wrapper. vLLM 0.21.0 maps LoRA keys under
+`language_model.model.layers.*`, while the PEFT trainer writes
+`base_model.model.model.layers.*`. The runner copies the adapter under
+`run_root/prepared_adapters/<adapter-id>/<rewrite>/adapter`, rewrites only the
+safetensors key prefixes, and records both the source and serving adapter paths
+plus the rewritten key count in the summary. Treat `rewritten_key_count=0` as a
+configuration error; without this rewrite, vLLM can expose the adapter model id
+while the generated logits remain unchanged.

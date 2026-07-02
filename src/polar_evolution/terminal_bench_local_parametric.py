@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
+import shutil
 import signal
 import subprocess
 import time
@@ -32,6 +33,22 @@ LOCAL_PARAMETRIC_AUTH_MODES = {"local", "proxy"}
 DEFAULT_VLLM_EXECUTABLE = "/root/evolab-vllm/bin/vllm"
 DEFAULT_VLLM_GPUS = ["1", "2", "3", "4"]
 DEFAULT_LOCAL_PARAMETRIC_MAX_OUTPUT_TOKENS = 4096
+ADAPTER_KEY_REWRITE_NONE = "none"
+ADAPTER_KEY_REWRITE_QWEN35_MOE_VLLM_LANGUAGE_MODEL = (
+    "qwen3_5_moe_vllm_language_model"
+)
+ADAPTER_KEY_REWRITE_CHOICES = [
+    ADAPTER_KEY_REWRITE_NONE,
+    ADAPTER_KEY_REWRITE_QWEN35_MOE_VLLM_LANGUAGE_MODEL,
+]
+_ADAPTER_KEY_REWRITE_PREFIXES = {
+    ADAPTER_KEY_REWRITE_QWEN35_MOE_VLLM_LANGUAGE_MODEL: (
+        (
+            "base_model.model.model.layers.",
+            "base_model.model.model.language_model.layers.",
+        ),
+    ),
+}
 _SECRET_ENV_MARKERS = (
     "key",
     "token",
@@ -51,12 +68,29 @@ class LocalParametricCondition:
     model: str
     adapter_id: str | None = None
     adapter_path: Path | None = None
+    source_adapter_path: Path | None = None
+    adapter_key_rewrite: str = ADAPTER_KEY_REWRITE_NONE
+    adapter_rewritten_key_count: int = 0
 
 
 @dataclass(frozen=True)
 class BuiltVLLMCommand:
     command: list[str]
     env: dict[str, str]
+
+
+@dataclass(frozen=True)
+class PreparedServingAdapter:
+    adapter_path: Path
+    source_adapter_path: Path
+    key_rewrite: str
+    rewritten_key_count: int = 0
+
+
+@dataclass(frozen=True)
+class RawSafetensorsFile:
+    header: dict[str, Any]
+    payload: bytes
 
 
 CommandRunner = Callable[..., Any]
@@ -235,6 +269,135 @@ def build_vllm_command(
     if executable_path is not None:
         env["PATH"] = executable_path
     return BuiltVLLMCommand(command=command, env=env)
+
+
+def prepare_serving_adapter(
+    *,
+    adapter_path: Path,
+    run_root: Path,
+    adapter_id: str,
+    adapter_key_rewrite: str = ADAPTER_KEY_REWRITE_NONE,
+) -> PreparedServingAdapter:
+    key_rewrite = _validate_adapter_key_rewrite(adapter_key_rewrite)
+    source_adapter_path = adapter_path
+    if key_rewrite == ADAPTER_KEY_REWRITE_NONE:
+        return PreparedServingAdapter(
+            adapter_path=source_adapter_path,
+            source_adapter_path=source_adapter_path,
+            key_rewrite=key_rewrite,
+        )
+
+    prepared_adapter_path = (
+        run_root
+        / "prepared_adapters"
+        / _safe_adapter_path_component(adapter_id)
+        / key_rewrite
+        / "adapter"
+    )
+    if prepared_adapter_path.exists():
+        shutil.rmtree(prepared_adapter_path)
+    prepared_adapter_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(source_adapter_path, prepared_adapter_path)
+    rewritten_key_count = _rewrite_adapter_safetensors_keys(
+        prepared_adapter_path / "adapter_model.safetensors",
+        key_rewrite=key_rewrite,
+    )
+    return PreparedServingAdapter(
+        adapter_path=prepared_adapter_path,
+        source_adapter_path=source_adapter_path,
+        key_rewrite=key_rewrite,
+        rewritten_key_count=rewritten_key_count,
+    )
+
+
+def _safe_adapter_path_component(adapter_id: str) -> str:
+    normalized = "".join(
+        char if char.isalnum() or char in {"-", "_", "."} else "-"
+        for char in adapter_id.strip()
+    ).strip("-._")
+    return normalized or "adapter"
+
+
+def _validate_adapter_key_rewrite(adapter_key_rewrite: str | None) -> str:
+    key_rewrite = adapter_key_rewrite or ADAPTER_KEY_REWRITE_NONE
+    if key_rewrite not in ADAPTER_KEY_REWRITE_CHOICES:
+        raise ValueError(
+            "unsupported adapter_key_rewrite: "
+            f"{key_rewrite!r}; expected one of {ADAPTER_KEY_REWRITE_CHOICES!r}"
+        )
+    return key_rewrite
+
+
+def _rewrite_adapter_safetensors_keys(
+    adapter_model_path: Path,
+    *,
+    key_rewrite: str,
+) -> int:
+    if not adapter_model_path.is_file():
+        raise ValueError(
+            "adapter key rewrite requires adapter_model.safetensors at "
+            f"{adapter_model_path}"
+        )
+    prefix_rewrites = _ADAPTER_KEY_REWRITE_PREFIXES[key_rewrite]
+    raw_file = _load_safetensors_file(adapter_model_path)
+    rewritten_state: dict[str, Any] = {}
+    rewritten_key_count = 0
+    for key, value in raw_file.header.items():
+        if key == "__metadata__":
+            rewritten_state[key] = value
+            continue
+        new_key = key
+        for source_prefix, target_prefix in prefix_rewrites:
+            if new_key.startswith(source_prefix):
+                new_key = target_prefix + new_key[len(source_prefix) :]
+                break
+        if new_key != key:
+            rewritten_key_count += 1
+        if new_key in rewritten_state:
+            raise ValueError(
+                "adapter key rewrite would overwrite adapter key "
+                f"{new_key!r}; check the adapter key layout before serving"
+            )
+        rewritten_state[new_key] = value
+    if rewritten_key_count == 0:
+        raise ValueError(
+            "adapter key rewrite did not rewrite any adapter keys; "
+            f"check that {adapter_model_path} matches the selected rewrite "
+            f"{key_rewrite!r}"
+        )
+    _save_safetensors_file(
+        RawSafetensorsFile(header=rewritten_state, payload=raw_file.payload),
+        adapter_model_path,
+    )
+    return rewritten_key_count
+
+
+def _load_safetensors_file(path: Path) -> RawSafetensorsFile:
+    try:
+        contents = path.read_bytes()
+        header_length = int.from_bytes(contents[:8], "little")
+        header_end = 8 + header_length
+        header = json.loads(contents[8:header_end])
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            f"adapter key rewrite could not parse safetensors header at {path}"
+        ) from exc
+    if len(contents) < 8 or header_end > len(contents) or not isinstance(header, dict):
+        raise ValueError(
+            f"adapter key rewrite could not parse safetensors header at {path}"
+        )
+    return RawSafetensorsFile(header=header, payload=contents[header_end:])
+
+
+def _save_safetensors_file(raw_file: RawSafetensorsFile, path: Path) -> None:
+    header = json.dumps(
+        raw_file.header,
+        ensure_ascii=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    # Safetensors data_offsets are relative to the payload start, so key-only
+    # header rewrites can preserve the tensor payload bytes unchanged.
+    path.write_bytes(len(header).to_bytes(8, "little") + header + raw_file.payload)
 
 
 def _redacted_env(env: dict[str, str]) -> dict[str, str]:
@@ -442,8 +605,10 @@ def run_local_parametric_memory_eval_dry_run(
     tool_result_prompt_max_chars: int | None = None,
     verifier_env: dict[str, str] | None = None,
     auth_mode: str = "local",
+    adapter_key_rewrite: str = ADAPTER_KEY_REWRITE_NONE,
 ) -> dict[str, Any]:
     auth_mode = _validate_auth_mode(auth_mode)
+    key_rewrite = _validate_adapter_key_rewrite(adapter_key_rewrite)
     output_token_cap = max(1, int(max_output_tokens))
     tool_result_prompt_cap = _optional_positive_int(tool_result_prompt_max_chars)
     effective_verifier_env = dict(verifier_env or {})
@@ -454,6 +619,8 @@ def run_local_parametric_memory_eval_dry_run(
             model=adapter_id,
             adapter_id=adapter_id,
             adapter_path=adapter_path,
+            source_adapter_path=adapter_path,
+            adapter_key_rewrite=key_rewrite,
         ),
     ]
     return {
@@ -468,6 +635,7 @@ def run_local_parametric_memory_eval_dry_run(
         "max_output_tokens": output_token_cap,
         "tool_result_prompt_max_chars": tool_result_prompt_cap,
         "manage_server": manage_server,
+        "adapter_key_rewrite": key_rewrite,
         "verifier_env": _redacted_env(effective_verifier_env),
         "enabled_artifacts": ["parametric_memory"],
         "disabled_artifacts": list(DEFAULT_LOCAL_PARAMETRIC_DISABLED_ARTIFACTS),
@@ -477,6 +645,12 @@ def run_local_parametric_memory_eval_dry_run(
                 "model": condition.model,
                 "adapter_id": condition.adapter_id,
                 "adapter_path": str(condition.adapter_path) if condition.adapter_path else None,
+                "source_adapter_path": (
+                    str(condition.source_adapter_path)
+                    if condition.source_adapter_path
+                    else None
+                ),
+                "adapter_key_rewrite": condition.adapter_key_rewrite,
                 "task_ids": list(task_ids),
             }
             for condition in conditions
@@ -506,9 +680,17 @@ def run_local_parametric_memory_eval(
     gpus: list[str] | None = None,
     port: int = 8000,
     auth_mode: str = "local",
+    adapter_key_rewrite: str = ADAPTER_KEY_REWRITE_NONE,
 ) -> dict[str, Any]:
     _validate_adapter_path(adapter_path)
     auth_mode = _validate_auth_mode(auth_mode)
+    key_rewrite = _validate_adapter_key_rewrite(adapter_key_rewrite)
+    prepared_adapter = prepare_serving_adapter(
+        adapter_path=adapter_path,
+        run_root=run_root,
+        adapter_id=adapter_id,
+        adapter_key_rewrite=key_rewrite,
+    )
     attempt_count = max(1, int(n_attempts))
     output_token_cap = max(1, int(max_output_tokens))
     tool_result_prompt_cap = _optional_positive_int(tool_result_prompt_max_chars)
@@ -519,7 +701,10 @@ def run_local_parametric_memory_eval(
             name="parametric_memory",
             model=adapter_id,
             adapter_id=adapter_id,
-            adapter_path=adapter_path,
+            adapter_path=prepared_adapter.adapter_path,
+            source_adapter_path=prepared_adapter.source_adapter_path,
+            adapter_key_rewrite=prepared_adapter.key_rewrite,
+            adapter_rewritten_key_count=prepared_adapter.rewritten_key_count,
         ),
     ]
     condition_summaries = [
@@ -559,6 +744,7 @@ def run_local_parametric_memory_eval(
         "max_output_tokens": output_token_cap,
         "tool_result_prompt_max_chars": tool_result_prompt_cap,
         "manage_server": manage_server,
+        "adapter_key_rewrite": key_rewrite,
         "verifier_env": _redacted_env(effective_verifier_env),
         "enabled_artifacts": ["parametric_memory"],
         "disabled_artifacts": list(DEFAULT_LOCAL_PARAMETRIC_DISABLED_ARTIFACTS),
@@ -671,6 +857,13 @@ def _run_local_parametric_condition(
             "artifact_id": adapter_artifact_id,
             "adapter_id": condition.adapter_id,
             "adapter_path": str(condition.adapter_path),
+            "source_adapter_path": (
+                str(condition.source_adapter_path)
+                if condition.source_adapter_path
+                else str(condition.adapter_path)
+            ),
+            "adapter_key_rewrite": condition.adapter_key_rewrite,
+            "rewritten_key_count": condition.adapter_rewritten_key_count,
         }
     return summary
 

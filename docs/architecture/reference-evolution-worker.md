@@ -509,6 +509,28 @@ flowchart TB
 - manifest 包含 `adapter_id`、`base_model`、`adapter_format`、training dataset path、
   record count、`training_projection`、source dataset IDs 和 prior parametric-memory IDs。
 
+Trainer contract:
+
+- 使用 chat template SFT 时，trainer 必须确保第一个 generated response token 参与 loss。
+  不要分别 tokenize 完整 conversation 和 generation prefix 后仅用 prefix token 数切 mask；
+  BPE 可能把 prompt 末尾换行和 response 开头换行合并，导致首个 response token 被误 mask。
+  推荐流程是 render full text 和 generation prefix，确认 full 以 prefix 开头，然后分别
+  `add_special_tokens=False` tokenize prefix 和 suffix，拼接 token ids，并只 mask prefix ids。
+- 对 Qwen/vLLM tool-use records，trainer 必须把 top-level `tools` 传入
+  `tokenizer.apply_chat_template(..., tools=record["tools"])`，否则训练格式不会匹配 runtime 的
+  `qwen3_xml` tool parser。
+
+Serving contract:
+
+- `terminal-bench-local-parametric-memory-eval` 可用
+  `--adapter-key-rewrite qwen3_5_moe_vllm_language_model` 为 Qwen3.5/Qwen3.6 MoE PEFT LoRA
+  生成 vLLM-compatible adapter 副本。该 rewrite 把
+  `base_model.model.model.layers.*` key 映射为 vLLM language-model-only wrapper 期望的
+  `base_model.model.model.language_model.layers.*` key；summary 会记录 source adapter path、
+  prepared serving adapter path、rewrite 名称和改写 key 数。
+- 该 rewrite 是 serving-time 兼容层，不改变 evolution artifact 的原始 URI。只有使用 vLLM
+  managed server 的本地评估需要它；其他 serving backend 应按自身 adapter key contract 处理。
+
 该 artifact 只适用于 proxy/local inference runtime。Subscription harness 直连外部模型
 服务，不能选择 OpenEvo 训练出的 adapter；上层 experiment config 和 Terminal Bench
 Codex subscription runner 都应拒绝启用 `parametric_memory`，context resolver 也会在
