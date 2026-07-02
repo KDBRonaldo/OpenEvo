@@ -197,3 +197,87 @@ artifact only after the trainer writes a valid LoRA adapter directory.
 This is the path expected for OpenEvo deployments backed by a local inference
 server: the proxy can select a request-level LoRA adapter, while subscription
 mode cannot.
+
+### Local Qwen/vLLM Evaluation Path
+
+Parametric-memory evaluation uses Harbor `mode=evolab` with an
+OpenAI-compatible local/proxy endpoint. It does not use Codex subscription.
+Keep `text_memory`, `skill_bundle`, and `agent_system` evolution disabled for a
+controlled parametric-memory comparison.
+
+Use `--auth-mode local` or `--auth-mode proxy` for local/proxy inference modes;
+neither is subscription mode. The selected auth mode is recorded in the
+summary. `--server-url` selects the OpenAI-compatible endpoint. With
+`--manage-server`, the command starts and stops vLLM locally; without it, the
+command targets an already-running endpoint.
+
+Repeated `--trainer-arg` values are preserved as trainer arguments, including
+values that begin with `--`. For example, `--trainer-arg --train-file` passes
+`--train-file` through to the trainer command.
+
+Preflight the local model, vLLM install, and GPU state:
+
+```sh
+du -sh /root/.cache/huggingface/hub/models--Qwen--Qwen3.6-35B-A3B
+/root/evolab-vllm/bin/vllm --version
+nvidia-smi --query-gpu=index,name,memory.used,memory.total,utilization.gpu --format=csv,noheader,nounits
+```
+
+The first controlled subset is:
+
+```text
+train-fasttext
+query-optimize
+make-mips-interpreter
+```
+
+Create a parametric-memory job from successful Terminal Bench trajectories and
+run the local worker once:
+
+```sh
+uv run polar-evolution terminal-bench-parametric-memory-job \
+  --input /tmp/tb21-text-memory-train-fasttext-20260701-073824/run/tasks/train-fasttext/r1/harbor_jobs/train-fasttext-r1/train-fasttext__attempt1 \
+  --input /tmp/tb21-text-memory-query-optimize-20260701-021002/run/tasks/query-optimize/r1/harbor_jobs/query-optimize-r1/query-optimize__attempt1 \
+  --input /tmp/tb21-text-memory-mips-interpreter-20260701-040524/run/tasks/make-mips-interpreter/r1/harbor_jobs/make-mips-interpreter-r1/make-mips-interpreter__attempt2 \
+  --db /tmp/tb21-parametric-memory/evolution.db \
+  --artifact-root /tmp/tb21-parametric-memory/artifacts \
+  --dataset-name tb21-parametric-memory-subset \
+  --policy-version tb21-qwen36-local-parametric-memory \
+  --base-model Qwen/Qwen3.6-35B-A3B \
+  --adapter-id tb-parametric-memory \
+  --trainer-command python \
+  --trainer-arg /path/to/train_lora.py \
+  --trainer-arg --train-file \
+  --trainer-arg '{training_dataset}' \
+  --trainer-arg --output-dir \
+  --trainer-arg '{adapter_dir}' \
+  --run-worker \
+  --output /tmp/tb21-parametric-memory/job.json
+```
+
+Evaluate baseline local Qwen and adapter local Qwen against the same subset:
+
+```sh
+uv run polar-evolution terminal-bench-local-parametric-memory-eval \
+  --task-root /root/datasets/terminal-bench-2-1/tasks \
+  --task-id train-fasttext \
+  --task-id query-optimize \
+  --task-id make-mips-interpreter \
+  --run-root /tmp/tb21-parametric-memory/local-eval \
+  --model Qwen/Qwen3.6-35B-A3B \
+  --adapter-path /tmp/tb21-parametric-memory/artifacts/workers/<job-id>/parametric_memory_lora_sft/adapter \
+  --adapter-id tb-parametric-memory \
+  --adapter-artifact-id <artifact-id> \
+  --gpu 1 \
+  --gpu 2 \
+  --gpu 3 \
+  --gpu 4 \
+  --server-port 8000 \
+  --manage-server \
+  --n-attempts 5 \
+  --output /tmp/tb21-parametric-memory/local-eval/summary.json
+```
+
+The summary reports `baseline`, `parametric_memory`, and `delta`. Treat this as
+controlled-subset evidence until the same path is run over full Terminal Bench
+2.1.
