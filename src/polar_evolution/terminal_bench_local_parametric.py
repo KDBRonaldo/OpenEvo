@@ -20,6 +20,7 @@ from polar_evolution.terminal_bench_per_task import (
     DEFAULT_TERMINAL_BENCH_PACKAGE_ROOT,
     _attempt_reward,
     _locate_evolved_attempt_trials,
+    _terminal_bench_extra_docker_compose,
 )
 
 DEFAULT_LOCAL_MODEL = "Qwen/Qwen3.6-35B-A3B"
@@ -208,6 +209,14 @@ def build_evolab_harbor_env(
     env["OPENAI_API_KEY"] = "dummy-local-key"
     env.update(_validated_agent_env(agent_env or {}))
     return env
+
+
+def _prepend_terminal_bench_package_pythonpath(env: dict[str, str], package_root: Path) -> None:
+    entries = [str(package_root / "src"), str(package_root)]
+    existing = env.get("PYTHONPATH")
+    if existing:
+        entries.append(existing)
+    env["PYTHONPATH"] = os.pathsep.join(entries)
 
 
 def _validated_agent_env(agent_env: dict[str, str]) -> dict[str, str]:
@@ -1047,6 +1056,9 @@ def _run_local_parametric_task(
         model=condition.model,
         verifier_env=verifier_env,
         n_attempts=n_attempts,
+        extra_docker_compose=_terminal_bench_extra_docker_compose(
+            terminal_bench_package_root
+        ),
     )
     env = build_evolab_harbor_env(
         base_env=os.environ,
@@ -1059,6 +1071,7 @@ def _run_local_parametric_task(
         tool_result_prompt_max_chars=tool_result_prompt_max_chars,
         agent_env=agent_env,
     )
+    _prepend_terminal_bench_package_pythonpath(env, terminal_bench_package_root)
     command_runner(command, cwd=terminal_bench_package_root, env=env)
 
     trials = _locate_evolved_attempt_trials(task_id=task_id, job_root=jobs_dir / job_name)

@@ -579,6 +579,11 @@ transcript 在后续 turn 中让 `input_tokens + max_output_tokens` 超过 servi
 可见测试入口，应通过同一 `--agent-env` 机制显式提供任务可见的
 `EVOLAB_TB_TEST_COMMAND`。具体 guard
 语义由安装的 Terminal-Bench/EvoLab package 实现，不属于 evolution artifact contract。
+当显式传入 `--terminal-bench-package-root` 时，本地 parametric-memory eval 会把该目录的
+`src` 和 package root prepend 到 Harbor 子进程的 `PYTHONPATH`，并使用同一 package root
+下的 Terminal-Bench Docker compose override 文件。这样 worktree 中的 EvoLab runtime
+guard、task package 和 Harbor compose 配置会作为一个一致版本生效，而不是只改变 Harbor
+命令的 working directory。
 
 Reference worker 只定义训练编排和 artifact contract；具体 LoRA trainer、serving backend
 的 adapter 加载方式，以及长训练过程中的续约/heartbeat 扩展，应由本地 inference/training

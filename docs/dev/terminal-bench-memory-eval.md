@@ -553,8 +553,21 @@ runtime-stop attempt at
 kept the same baseline `0/1` and parametric memory `1/1` reward result, but the
 treatment still ended with `AgentTimeoutError`; the auto-tested `tb_exec`
 signals passed, while dynamic runtime stopping did not yet terminate the agent
-cleanly. Treat the current harness guard as positive controlled reward evidence
-and as an evaluation aid, not yet as a polished stop-policy solution.
+cleanly. That run was later traced to the Harbor process importing the default
+`/root/EvoLabCore-terminal-bench-task-package` EvoLab package instead of the
+selected `--terminal-bench-package-root` worktree, so the static completion guard
+opt-in fix was not active in the subprocess. After prepending the selected
+package root to Harbor `PYTHONPATH` and using its compose files, the fixed
+launcher run at
+`/tmp/tb21-parametric-memory-v2-autostop-fixed-launcher-20260703-064752/local-eval-auto-tested-exec`
+recorded baseline `0/1`, parametric memory `1/1`, and delta `+1.0`
+pass@1/pass@k with no Harbor exceptions. The treatment used only two tool calls
+(`tb_read_task`, then one successful auto-tested `tb_exec`) and the dynamic
+runtime stopped cleanly in the same second as the successful `tb_exec`
+(`73.2s` EvoLab round, `1m49s` Harbor job). This is the current best controlled
+evidence that the v2 parametric memory adapter improves `password-recovery`
+under the local Qwen3.6 MoE backend when paired with the harness-side
+auto-tested exec guard.
 
 Evaluate baseline local Qwen and adapter local Qwen against the same subset:
 

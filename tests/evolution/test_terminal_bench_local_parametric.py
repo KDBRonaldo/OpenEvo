@@ -265,11 +265,13 @@ def test_run_local_parametric_memory_eval_compares_baseline_and_adapter(
 ) -> None:
     commands: list[list[str]] = []
     envs: list[dict[str, str]] = []
+    cwds: list[Path | None] = []
+    package_root = tmp_path / "terminal-bench-package"
 
     def fake_command_runner(command, *, cwd=None, env=None):
-        del cwd
         commands.append(command)
         envs.append(dict(env or {}))
+        cwds.append(cwd)
         jobs_dir = Path(command[command.index("--jobs-dir") + 1])
         job_name = command[command.index("--job-name") + 1]
         model = command[command.index("--model") + 1]
@@ -310,7 +312,7 @@ def test_run_local_parametric_memory_eval_compares_baseline_and_adapter(
         task_root=tmp_path / "tasks",
         task_ids=["query-optimize"],
         run_root=tmp_path / "run",
-        terminal_bench_package_root=tmp_path / "terminal-bench-package",
+        terminal_bench_package_root=package_root,
         model="Qwen/Qwen3.6-35B-A3B",
         adapter_path=tmp_path / "adapter",
         adapter_id="tb-parametric-memory",
@@ -349,6 +351,33 @@ def test_run_local_parametric_memory_eval_compares_baseline_and_adapter(
     assert all(env["EVOLAB_TB_LLM_TEMPERATURE"] == "0.0" for env in envs)
     assert all(env["EVOLAB_TB_TOOL_RESULT_PROMPT_MAX_CHARS"] == "2048" for env in envs)
     assert all(env["EVOLAB_TB_REQUIRE_SUCCESSFUL_COLLECT"] == "1" for env in envs)
+    assert all(cwd == package_root for cwd in cwds)
+    pythonpath_prefix = f"{package_root / 'src'}:{package_root}"
+    assert all(env["PYTHONPATH"].startswith(pythonpath_prefix) for env in envs)
+    compose_paths = [
+        command[index + 1]
+        for command in commands
+        for index, token in enumerate(command)
+        if token == "--extra-docker-compose"
+    ]
+    assert compose_paths == [
+        str(package_root / "task_packages" / "terminal_bench_v1" / "harbor" / "pull-never.yaml"),
+        str(
+            package_root
+            / "task_packages"
+            / "terminal_bench_v1"
+            / "harbor"
+            / "docker-cp-host-network.yaml"
+        ),
+        str(package_root / "task_packages" / "terminal_bench_v1" / "harbor" / "pull-never.yaml"),
+        str(
+            package_root
+            / "task_packages"
+            / "terminal_bench_v1"
+            / "harbor"
+            / "docker-cp-host-network.yaml"
+        ),
+    ]
 
 
 def test_run_local_parametric_memory_eval_scores_only_requested_attempts(
