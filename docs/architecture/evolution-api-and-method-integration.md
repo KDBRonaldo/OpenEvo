@@ -570,9 +570,14 @@ transcript 在后续 turn 中让 `input_tokens + max_output_tokens` 超过 servi
 需要打开 Terminal-Bench/EvoLab 包级 direct-solver 行为开关时，使用
 `terminal-bench-local-parametric-memory-eval --agent-env KEY=VALUE`。该接口只允许
 `EVOLAB_TB_*` key，并拒绝覆盖 OpenEvo 控制的模型、模式和 token-budget 环境变量；summary
-中记录 redacted `agent_env`。例如 stop-after-success 这类 guard 可以通过未来包级
+中记录 redacted `agent_env`。例如 stop-after-success 这类 guard 可以通过包级
 `EVOLAB_TB_REQUIRE_SUCCESSFUL_COLLECT=1` 和
-`EVOLAB_TB_DIRECT_SOLVER_COMPLETION_GUARD=successful_collect` 打开，但具体 guard
+`EVOLAB_TB_DIRECT_SOLVER_COMPLETION_GUARD=successful_collect` 打开；solve-focused adapter
+实验也可以用包级
+`EVOLAB_TB_DIRECT_SOLVER_COMPLETION_GUARD=successful_auto_tested_exec` 在成功 `tb_exec` 后
+自动运行固定测试，并只在测试通过时让 `tb_exec` 满足 runtime completion guard；如果任务没有
+可见测试入口，应通过同一 `--agent-env` 机制显式提供任务可见的
+`EVOLAB_TB_TEST_COMMAND`。具体 guard
 语义由安装的 Terminal-Bench/EvoLab package 实现，不属于 evolution artifact contract。
 
 Reference worker 只定义训练编排和 artifact contract；具体 LoRA trainer、serving backend

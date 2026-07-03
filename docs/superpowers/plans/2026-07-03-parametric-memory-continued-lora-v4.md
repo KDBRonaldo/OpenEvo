@@ -251,8 +251,8 @@ uv run polar-evolution terminal-bench-local-parametric-memory-eval \
   --verifier-env UV_FIND_LINKS=http://172.17.0.8:8765/wheels \
   --verifier-env UV_NO_INDEX=1 \
   --verifier-python-install-mirror http://172.17.0.8:8765/python-build-standalone \
-  --agent-env EVOLAB_TB_REQUIRE_SUCCESSFUL_COLLECT=1 \
-  --agent-env EVOLAB_TB_DIRECT_SOLVER_COMPLETION_GUARD=successful_collect \
+  --agent-env EVOLAB_TB_DIRECT_SOLVER_COMPLETION_GUARD=successful_auto_tested_exec \
+  --agent-env 'EVOLAB_TB_TEST_COMMAND=test -s /app/recovered_passwords.txt' \
   --output /tmp/tb21-parametric-memory-continued-v4-<timestamp>/local-eval-successguard/summary.json
 ```
 

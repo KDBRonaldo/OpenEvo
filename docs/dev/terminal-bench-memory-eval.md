@@ -283,12 +283,16 @@ Use repeated `--agent-env KEY=VALUE` entries to pass Terminal-Bench/EvoLab
 package behavior knobs into the direct-solver agent process. OpenEvo only
 accepts `EVOLAB_TB_*` keys here and rejects fields that it controls directly
 such as `EVOLAB_TB_MODEL`, `EVOLAB_TB_MODE`, and token-budget settings. This is
-the intended bridge for package-level guards such as a future
+the intended bridge for package-level guards such as
 `EVOLAB_TB_REQUIRE_SUCCESSFUL_COLLECT=1` +
 `EVOLAB_TB_DIRECT_SOLVER_COMPLETION_GUARD=successful_collect` stop-after-success
-mode. OpenEvo records the redacted `agent_env` block in dry-run and live
-summaries, but the guard semantics must be implemented by the installed
-Terminal-Bench/EvoLab package.
+mode. For solve-focused adapters that create the task artifact but do not
+reliably call the finish tools, use package-level
+`EVOLAB_TB_DIRECT_SOLVER_COMPLETION_GUARD=successful_auto_tested_exec`; that
+mode runs fixed tests after successful `tb_exec` calls and only lets `tb_exec`
+count as successful when those tests pass. OpenEvo records the redacted
+`agent_env` block in dry-run and live summaries, but the guard semantics must be
+implemented by the installed Terminal-Bench/EvoLab package.
 
 Use `--auth-mode local` or `--auth-mode proxy` for local/proxy inference modes;
 neither is subscription mode. The selected auth mode is recorded in the
@@ -535,6 +539,23 @@ curriculum, separate adapters/routing for solve vs finish states, or a
 harness-side deterministic validation/collect guard while keeping the v2
 parametric adapter focused on the fast solve action.
 
+A harness-side auto-tested exec guard was then tested with the v2 solve-focused
+adapter rather than mixing finish behavior into the same LoRA. Because
+`password-recovery` has no visible `/tests` or `/app` test entrypoint, the
+useful controlled guard must provide a task-visible test command:
+`EVOLAB_TB_TEST_COMMAND='test -s /app/recovered_passwords.txt'`. The best run
+at
+`/tmp/tb21-parametric-memory-v2-autotested-visible-20260703-050759/local-eval-auto-tested-exec`
+recorded baseline `0/1`, parametric memory `1/1`, and delta `+1.0`
+pass@1/pass@k with no Harbor exception stats in either condition. A follow-up
+runtime-stop attempt at
+`/tmp/tb21-parametric-memory-v2-autostop-20260703-054159/local-eval-auto-tested-exec`
+kept the same baseline `0/1` and parametric memory `1/1` reward result, but the
+treatment still ended with `AgentTimeoutError`; the auto-tested `tb_exec`
+signals passed, while dynamic runtime stopping did not yet terminate the agent
+cleanly. Treat the current harness guard as positive controlled reward evidence
+and as an evaluation aid, not yet as a polished stop-policy solution.
+
 Evaluate baseline local Qwen and adapter local Qwen against the same subset:
 
 ```sh
@@ -562,8 +583,8 @@ uv run polar-evolution terminal-bench-local-parametric-memory-eval \
   --tool-result-prompt-max-chars 2048 \
   --solver-temperature 0.0 \
   --vllm-generation-config vllm \
-  --agent-env EVOLAB_TB_REQUIRE_SUCCESSFUL_COLLECT=1 \
-  --agent-env EVOLAB_TB_DIRECT_SOLVER_COMPLETION_GUARD=successful_collect \
+  --agent-env EVOLAB_TB_DIRECT_SOLVER_COMPLETION_GUARD=successful_auto_tested_exec \
+  --agent-env 'EVOLAB_TB_TEST_COMMAND=test -s /app/recovered_passwords.txt' \
   --verifier-python-install-mirror http://172.17.0.8:8765/python-build-standalone/releases/download \
   --output /tmp/tb21-parametric-memory/local-eval/summary.json
 ```
