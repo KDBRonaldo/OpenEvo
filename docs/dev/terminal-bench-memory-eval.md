@@ -464,6 +464,20 @@ called `tb_collect_result`, then stopped after one `tb_exec`. Treat
 `target_assistant_message` as a framework mechanism for future stop/finish
 methods, not as the current best `password-recovery` recipe.
 
+A follow-up local smoke at
+`/tmp/tb21-parametric-memory-recipe-framework-20260702-195641/local-eval-successguard`
+used the recipe adapter `art_731ae1e1ca4d4e57` with the OpenEvo
+`--agent-env` bridge and a locally patched Terminal-Bench/EvoLab package guard:
+`EVOLAB_TB_REQUIRE_SUCCESSFUL_COLLECT=1` and
+`EVOLAB_TB_DIRECT_SOLVER_COMPLETION_GUARD=successful_collect`. The summary
+recorded baseline `0/1`, parametric memory `0/1`, and delta `0`. Baseline
+failed after 15 tool calls without tests. The treatment loaded the adapter and
+entered the direct solver, but did not reach `tb_run_tests` or
+`tb_collect_result`; it generated slow `tb_exec` commands and ended with reward
+`0.0` plus an `AgentTimeoutError`. This run shows the environment bridge and
+package guard are not enough to recover performance when the adapter's command
+policy drifts to slow enumeration before the validation/collect phase.
+
 Evaluate baseline local Qwen and adapter local Qwen against the same subset:
 
 ```sh
