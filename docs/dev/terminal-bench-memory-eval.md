@@ -478,6 +478,24 @@ entered the direct solver, but did not reach `tb_run_tests` or
 package guard are not enough to recover performance when the adapter's command
 policy drifts to slow enumeration before the validation/collect phase.
 
+The next local eval made the local parametric path deterministic by passing
+solver temperature `0.0` to the Terminal-Bench EvoLab package and starting
+managed vLLM with `--generation-config vllm`, so Qwen's model
+`generation_config.json` no longer overrides serving defaults with sampled
+`top_k/top_p` behavior. Using the stronger fast-target v2 adapter
+`art_476b4c85b1c44a2b`, the run at
+`/tmp/tb21-parametric-memory-fasttarget-v2-deterministic-20260703-013446/local-eval-successguard`
+recorded baseline `0/1`, parametric memory `1/1`, and delta `+1.0`
+pass@1/pass@k. The treatment server metadata confirmed
+`--generation-config vllm`, LoRA key rewrite
+`qwen3_5_moe_vllm_language_model`, and 80 rewritten adapter keys. This is the
+current best controlled local evidence that parametric memory can improve the
+`password-recovery` task under a local Qwen3.6 MoE backend. It is still not a
+polished policy: the treatment wrote a verifier-passing artifact but later
+ended with `AgentTimeoutError` instead of cleanly calling
+`tb_run_tests`/`tb_collect_result` and stopping. Future parametric-memory
+methods should train that validation/finish boundary explicitly.
+
 Evaluate baseline local Qwen and adapter local Qwen against the same subset:
 
 ```sh
@@ -503,6 +521,8 @@ uv run polar-evolution terminal-bench-local-parametric-memory-eval \
   --context-window-tokens 16384 \
   --context-reserve-tokens 1536 \
   --tool-result-prompt-max-chars 2048 \
+  --solver-temperature 0.0 \
+  --vllm-generation-config vllm \
   --agent-env EVOLAB_TB_REQUIRE_SUCCESSFUL_COLLECT=1 \
   --agent-env EVOLAB_TB_DIRECT_SOLVER_COMPLETION_GUARD=successful_collect \
   --verifier-python-install-mirror http://172.17.0.8:8765/python-build-standalone/releases/download \
@@ -512,8 +532,9 @@ uv run polar-evolution terminal-bench-local-parametric-memory-eval \
 The summary reports `baseline`, `parametric_memory`, `delta`, and the
 `requested_max_output_tokens`, effective `max_output_tokens`,
 `context_window_tokens`, `context_reserve_tokens`, and
-`tool_result_prompt_max_chars` caps used for both conditions, plus redacted
-`agent_env` package knobs when supplied. The default
+`tool_result_prompt_max_chars` caps used for both conditions, plus
+`solver_temperature`, `vllm_generation_config`, and redacted `agent_env`
+package knobs when supplied. The default
 requested output-token cap is `4096`, but the effective cap is clamped to the
 default context reserve `1536`; increase `--context-reserve-tokens` only when
 the serving context window and prompt growth leave enough room. For smoke tests
@@ -523,7 +544,11 @@ managed vLLM `--max-model-len`. `--tool-result-prompt-max-chars` sets
 `EVOLAB_TB_TOOL_RESULT_PROMPT_MAX_CHARS` for the Harbor agent. It only affects
 runtime behavior when the installed Terminal Bench/EvoLab package honors that
 environment variable; otherwise the value is still recorded in the summary as a
-preflight signal that the package needs the matching support. Many Terminal
+preflight signal that the package needs the matching support. The same package
+must honor `EVOLAB_TB_LLM_TEMPERATURE` for `--solver-temperature` to affect
+OpenAI-compatible chat-completion requests. `--vllm-generation-config vllm` is
+the managed-server default so model-local generation configs do not silently
+turn a controlled adapter eval into sampled decoding. Many Terminal
 Bench verifiers run `uvx -p ...`, which can download managed Python even when
 wheel dependencies are local. When a local Python-build mirror is available,
 pass `--verifier-python-install-mirror` with the uv-compatible

@@ -22,6 +22,8 @@ from polar_evolution.terminal_bench_local_parametric import (
     DEFAULT_LOCAL_PARAMETRIC_CONTEXT_WINDOW_TOKENS,
     DEFAULT_LOCAL_PARAMETRIC_ADAPTER_ID,
     DEFAULT_LOCAL_PARAMETRIC_MAX_OUTPUT_TOKENS,
+    DEFAULT_LOCAL_PARAMETRIC_SOLVER_TEMPERATURE,
+    DEFAULT_VLLM_GENERATION_CONFIG,
     DEFAULT_VLLM_EXECUTABLE,
     run_local_parametric_memory_eval,
     run_local_parametric_memory_eval_dry_run,
@@ -601,6 +603,25 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     tb_local_parametric.add_argument(
+        "--solver-temperature",
+        type=float,
+        default=DEFAULT_LOCAL_PARAMETRIC_SOLVER_TEMPERATURE,
+        help=(
+            "Temperature passed to the Terminal Bench EvoLab solver. The "
+            "local parametric-memory runner defaults to 0.0 for deterministic "
+            "adapter evaluation."
+        ),
+    )
+    tb_local_parametric.add_argument(
+        "--vllm-generation-config",
+        default=DEFAULT_VLLM_GENERATION_CONFIG,
+        help=(
+            "Value passed to managed vLLM --generation-config. The default "
+            "'vllm' prevents model generation_config.json from overriding "
+            "sampling defaults."
+        ),
+    )
+    tb_local_parametric.add_argument(
         "--tool-result-prompt-max-chars",
         type=int,
         help=(
@@ -789,6 +810,8 @@ def main(argv: list[str] | None = None) -> int:
                 max_output_tokens=args.max_output_tokens,
                 context_window_tokens=args.context_window_tokens,
                 context_reserve_tokens=args.context_reserve_tokens,
+                solver_temperature=args.solver_temperature,
+                vllm_generation_config=args.vllm_generation_config,
                 tool_result_prompt_max_chars=args.tool_result_prompt_max_chars,
                 manage_server=args.manage_server,
                 verifier_env=verifier_env,
@@ -812,6 +835,8 @@ def main(argv: list[str] | None = None) -> int:
             max_output_tokens=args.max_output_tokens,
             context_window_tokens=args.context_window_tokens,
             context_reserve_tokens=args.context_reserve_tokens,
+            solver_temperature=args.solver_temperature,
+            vllm_generation_config=args.vllm_generation_config,
             tool_result_prompt_max_chars=args.tool_result_prompt_max_chars,
             verifier_env=verifier_env,
             agent_env=agent_env,

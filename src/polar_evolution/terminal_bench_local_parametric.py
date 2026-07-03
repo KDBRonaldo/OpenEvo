@@ -35,6 +35,8 @@ DEFAULT_VLLM_GPUS = ["1", "2", "3", "4"]
 DEFAULT_LOCAL_PARAMETRIC_MAX_OUTPUT_TOKENS = 4096
 DEFAULT_LOCAL_PARAMETRIC_CONTEXT_WINDOW_TOKENS = 16384
 DEFAULT_LOCAL_PARAMETRIC_CONTEXT_RESERVE_TOKENS = 1536
+DEFAULT_LOCAL_PARAMETRIC_SOLVER_TEMPERATURE = 0.0
+DEFAULT_VLLM_GENERATION_CONFIG = "vllm"
 ADAPTER_KEY_REWRITE_NONE = "none"
 ADAPTER_KEY_REWRITE_QWEN35_MOE_VLLM_LANGUAGE_MODEL = (
     "qwen3_5_moe_vllm_language_model"
@@ -67,6 +69,7 @@ _CONTROLLED_AGENT_ENV_KEYS = {
     "EVOLAB_TB_CONTEXT_RESERVE_TOKENS",
     "EVOLAB_TB_CONTEXT_WINDOW_TOKENS",
     "EVOLAB_TB_LLM_API",
+    "EVOLAB_TB_LLM_TEMPERATURE",
     "EVOLAB_TB_MAX_OUTPUT_TOKENS",
     "EVOLAB_TB_MODE",
     "EVOLAB_TB_MODEL",
@@ -179,6 +182,7 @@ def build_evolab_harbor_env(
     max_output_tokens: int = DEFAULT_LOCAL_PARAMETRIC_MAX_OUTPUT_TOKENS,
     context_window_tokens: int = DEFAULT_LOCAL_PARAMETRIC_CONTEXT_WINDOW_TOKENS,
     context_reserve_tokens: int = DEFAULT_LOCAL_PARAMETRIC_CONTEXT_RESERVE_TOKENS,
+    solver_temperature: float = DEFAULT_LOCAL_PARAMETRIC_SOLVER_TEMPERATURE,
     tool_result_prompt_max_chars: int | None = None,
     agent_env: dict[str, str] | None = None,
 ) -> dict[str, str]:
@@ -193,6 +197,7 @@ def build_evolab_harbor_env(
     env["EVOLAB_TB_CONTEXT_WINDOW_TOKENS"] = str(context_window)
     env["EVOLAB_TB_CONTEXT_RESERVE_TOKENS"] = str(context_reserve)
     env["EVOLAB_TB_MAX_OUTPUT_TOKENS"] = str(output_tokens)
+    env["EVOLAB_TB_LLM_TEMPERATURE"] = str(float(solver_temperature))
     if tool_result_prompt_max_chars is not None:
         env["EVOLAB_TB_TOOL_RESULT_PROMPT_MAX_CHARS"] = str(
             max(1, int(tool_result_prompt_max_chars))
@@ -240,6 +245,7 @@ def build_vllm_command(
     tensor_parallel_size: int | None = None,
     gpu_memory_utilization: float = 0.75,
     max_model_len: int = 16384,
+    generation_config: str = DEFAULT_VLLM_GENERATION_CONFIG,
     vllm_executable: str = DEFAULT_VLLM_EXECUTABLE,
     gpus: list[str] | None = None,
     adapter_id: str | None = None,
@@ -281,6 +287,8 @@ def build_vllm_command(
         str(gpu_memory_utilization),
         "--max-model-len",
         str(max_model_len),
+        "--generation-config",
+        generation_config,
         "--dtype",
         "bfloat16",
         "--reasoning-parser",
@@ -643,6 +651,8 @@ def run_local_parametric_memory_eval_dry_run(
     max_output_tokens: int = DEFAULT_LOCAL_PARAMETRIC_MAX_OUTPUT_TOKENS,
     context_window_tokens: int = DEFAULT_LOCAL_PARAMETRIC_CONTEXT_WINDOW_TOKENS,
     context_reserve_tokens: int = DEFAULT_LOCAL_PARAMETRIC_CONTEXT_RESERVE_TOKENS,
+    solver_temperature: float = DEFAULT_LOCAL_PARAMETRIC_SOLVER_TEMPERATURE,
+    vllm_generation_config: str = DEFAULT_VLLM_GENERATION_CONFIG,
     tool_result_prompt_max_chars: int | None = None,
     verifier_env: dict[str, str] | None = None,
     agent_env: dict[str, str] | None = None,
@@ -658,6 +668,7 @@ def run_local_parametric_memory_eval_dry_run(
         context_reserve_tokens=context_reserve_tokens,
     )
     tool_result_prompt_cap = _optional_positive_int(tool_result_prompt_max_chars)
+    solver_temperature_value = float(solver_temperature)
     effective_verifier_env = dict(verifier_env or {})
     effective_agent_env = _validated_agent_env(dict(agent_env or {}))
     conditions = [
@@ -684,6 +695,8 @@ def run_local_parametric_memory_eval_dry_run(
         "max_output_tokens": output_token_cap,
         "context_window_tokens": context_window,
         "context_reserve_tokens": context_reserve,
+        "solver_temperature": solver_temperature_value,
+        "vllm_generation_config": vllm_generation_config,
         "tool_result_prompt_max_chars": tool_result_prompt_cap,
         "manage_server": manage_server,
         "adapter_key_rewrite": key_rewrite,
@@ -725,6 +738,8 @@ def run_local_parametric_memory_eval(
     max_output_tokens: int = DEFAULT_LOCAL_PARAMETRIC_MAX_OUTPUT_TOKENS,
     context_window_tokens: int = DEFAULT_LOCAL_PARAMETRIC_CONTEXT_WINDOW_TOKENS,
     context_reserve_tokens: int = DEFAULT_LOCAL_PARAMETRIC_CONTEXT_RESERVE_TOKENS,
+    solver_temperature: float = DEFAULT_LOCAL_PARAMETRIC_SOLVER_TEMPERATURE,
+    vllm_generation_config: str = DEFAULT_VLLM_GENERATION_CONFIG,
     tool_result_prompt_max_chars: int | None = None,
     verifier_env: dict[str, str] | None = None,
     agent_env: dict[str, str] | None = None,
@@ -754,6 +769,7 @@ def run_local_parametric_memory_eval(
         context_reserve_tokens=context_reserve_tokens,
     )
     tool_result_prompt_cap = _optional_positive_int(tool_result_prompt_max_chars)
+    solver_temperature_value = float(solver_temperature)
     effective_verifier_env = dict(verifier_env or {})
     effective_agent_env = _validated_agent_env(dict(agent_env or {}))
     conditions = [
@@ -781,6 +797,8 @@ def run_local_parametric_memory_eval(
             max_output_tokens=output_token_cap,
             context_window_tokens=context_window,
             context_reserve_tokens=context_reserve,
+            solver_temperature=solver_temperature_value,
+            vllm_generation_config=vllm_generation_config,
             tool_result_prompt_max_chars=tool_result_prompt_cap,
             verifier_env=effective_verifier_env,
             agent_env=effective_agent_env,
@@ -809,6 +827,8 @@ def run_local_parametric_memory_eval(
         "max_output_tokens": output_token_cap,
         "context_window_tokens": context_window,
         "context_reserve_tokens": context_reserve,
+        "solver_temperature": solver_temperature_value,
+        "vllm_generation_config": vllm_generation_config,
         "tool_result_prompt_max_chars": tool_result_prompt_cap,
         "manage_server": manage_server,
         "adapter_key_rewrite": key_rewrite,
@@ -876,6 +896,8 @@ def _run_local_parametric_condition(
     max_output_tokens: int,
     context_window_tokens: int,
     context_reserve_tokens: int,
+    solver_temperature: float,
+    vllm_generation_config: str,
     tool_result_prompt_max_chars: int | None,
     verifier_env: dict[str, str],
     agent_env: dict[str, str],
@@ -900,6 +922,7 @@ def _run_local_parametric_condition(
                 vllm_executable=vllm_executable,
                 gpus=gpus,
                 max_model_len=context_window_tokens,
+                generation_config=vllm_generation_config,
             ),
             run_root=condition_root,
             server_url=server_url,
@@ -922,6 +945,7 @@ def _run_local_parametric_condition(
                 max_output_tokens=max_output_tokens,
                 context_window_tokens=context_window_tokens,
                 context_reserve_tokens=context_reserve_tokens,
+                solver_temperature=solver_temperature,
                 tool_result_prompt_max_chars=tool_result_prompt_max_chars,
                 verifier_env=verifier_env,
                 agent_env=agent_env,
@@ -971,6 +995,7 @@ def _build_condition_vllm_command(
     vllm_executable: str,
     gpus: list[str] | None,
     max_model_len: int,
+    generation_config: str,
 ) -> BuiltVLLMCommand:
     if condition.adapter_id and condition.adapter_path is not None:
         return build_vllm_command(
@@ -980,6 +1005,7 @@ def _build_condition_vllm_command(
             vllm_executable=vllm_executable,
             gpus=gpus,
             max_model_len=max_model_len,
+            generation_config=generation_config,
             adapter_id=condition.adapter_id,
             adapter_path=condition.adapter_path,
         )
@@ -990,6 +1016,7 @@ def _build_condition_vllm_command(
         vllm_executable=vllm_executable,
         gpus=gpus,
         max_model_len=max_model_len,
+        generation_config=generation_config,
     )
 
 
@@ -1005,6 +1032,7 @@ def _run_local_parametric_task(
     max_output_tokens: int,
     context_window_tokens: int,
     context_reserve_tokens: int,
+    solver_temperature: float,
     tool_result_prompt_max_chars: int | None,
     verifier_env: dict[str, str],
     agent_env: dict[str, str],
@@ -1027,6 +1055,7 @@ def _run_local_parametric_task(
         max_output_tokens=max_output_tokens,
         context_window_tokens=context_window_tokens,
         context_reserve_tokens=context_reserve_tokens,
+        solver_temperature=solver_temperature,
         tool_result_prompt_max_chars=tool_result_prompt_max_chars,
         agent_env=agent_env,
     )

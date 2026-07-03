@@ -68,6 +68,7 @@ def test_build_evolab_harbor_env_sets_openai_chat_endpoint(
     assert env["EVOLAB_TB_CONTEXT_WINDOW_TOKENS"] == "16384"
     assert env["EVOLAB_TB_CONTEXT_RESERVE_TOKENS"] == "1536"
     assert env["EVOLAB_TB_MAX_OUTPUT_TOKENS"] == "1536"
+    assert env["EVOLAB_TB_LLM_TEMPERATURE"] == "0.0"
     assert env["EVOLAB_TB_TOOL_RESULT_PROMPT_MAX_CHARS"] == "2048"
 
 
@@ -84,6 +85,17 @@ def test_build_evolab_harbor_env_clamps_output_tokens_to_context_reserve() -> No
     assert env["EVOLAB_TB_CONTEXT_WINDOW_TOKENS"] == "32768"
     assert env["EVOLAB_TB_CONTEXT_RESERVE_TOKENS"] == "1024"
     assert env["EVOLAB_TB_MAX_OUTPUT_TOKENS"] == "1024"
+
+
+def test_build_evolab_harbor_env_allows_explicit_solver_temperature() -> None:
+    env = build_evolab_harbor_env(
+        base_env={},
+        server_url="http://127.0.0.1:8000/v1",
+        model="tb-parametric-memory",
+        solver_temperature=0.2,
+    )
+
+    assert env["EVOLAB_TB_LLM_TEMPERATURE"] == "0.2"
 
 
 def test_build_evolab_harbor_env_empty_base_does_not_inherit_host_env(
@@ -150,6 +162,7 @@ def test_build_vllm_command_baseline_and_lora() -> None:
         "serve",
         "Qwen/Qwen3.6-35B-A3B",
     ]
+    assert baseline.command[baseline.command.index("--generation-config") + 1] == "vllm"
     assert "--enable-lora" not in baseline.command
 
     adapter = build_vllm_command(
@@ -166,6 +179,7 @@ def test_build_vllm_command_baseline_and_lora() -> None:
     assert "--enable-lora" in adapter.command
     assert "--lora-modules" in adapter.command
     assert "tb-parametric-memory=/tmp/adapter" in adapter.command
+    assert adapter.command[adapter.command.index("--generation-config") + 1] == "vllm"
 
 
 def test_build_vllm_command_prefixes_absolute_executable_bin_to_path(
@@ -240,6 +254,8 @@ def test_local_parametric_dry_run_reports_matrix_and_disabled_artifacts(
     assert payload["max_output_tokens"] == 1536
     assert payload["context_window_tokens"] == 16384
     assert payload["context_reserve_tokens"] == 1536
+    assert payload["solver_temperature"] == 0.0
+    assert payload["vllm_generation_config"] == "vllm"
     assert payload["tool_result_prompt_max_chars"] == 2048
     assert payload["agent_env"] == {"EVOLAB_TB_REQUIRE_SUCCESSFUL_COLLECT": "1"}
 
@@ -330,6 +346,7 @@ def test_run_local_parametric_memory_eval_compares_baseline_and_adapter(
     assert all(env["EVOLAB_TB_MAX_OUTPUT_TOKENS"] == "1536" for env in envs)
     assert all(env["EVOLAB_TB_CONTEXT_WINDOW_TOKENS"] == "16384" for env in envs)
     assert all(env["EVOLAB_TB_CONTEXT_RESERVE_TOKENS"] == "1536" for env in envs)
+    assert all(env["EVOLAB_TB_LLM_TEMPERATURE"] == "0.0" for env in envs)
     assert all(env["EVOLAB_TB_TOOL_RESULT_PROMPT_MAX_CHARS"] == "2048" for env in envs)
     assert all(env["EVOLAB_TB_REQUIRE_SUCCESSFUL_COLLECT"] == "1" for env in envs)
 
