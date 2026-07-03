@@ -1736,8 +1736,20 @@ def _local_parametric_verifier_env(
 ) -> dict[str, str]:
     env = _parse_key_value_entries(entries)
     if python_install_mirror:
-        env.setdefault("UV_PYTHON_INSTALL_MIRROR", python_install_mirror)
+        env.setdefault(
+            "UV_PYTHON_INSTALL_MIRROR",
+            _local_parametric_python_install_mirror(python_install_mirror),
+        )
     return env
+
+
+def _local_parametric_python_install_mirror(value: str) -> str:
+    mirror = value.rstrip("/")
+    if mirror.endswith("/releases/download"):
+        return mirror
+    if mirror.endswith("/python-build-standalone"):
+        return f"{mirror}/releases/download"
+    return mirror
 
 
 def _artifact_uri(store: EvolutionStore, artifact_id: str) -> str:

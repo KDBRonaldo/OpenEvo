@@ -915,7 +915,41 @@ def test_terminal_bench_local_parametric_cli_dry_run_records_verifier_env(
     payload = json.loads(output.read_text(encoding="utf-8"))
     assert payload["verifier_env"] == {
         "UV_NO_INDEX": "1",
-        "UV_PYTHON_INSTALL_MIRROR": "http://172.17.0.8:8765/python-build-standalone",
+        "UV_PYTHON_INSTALL_MIRROR": (
+            "http://172.17.0.8:8765/python-build-standalone/releases/download"
+        ),
+    }
+
+
+def test_terminal_bench_local_parametric_cli_preserves_python_install_mirror_download_base(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "summary.json"
+    exit_code = main(
+        [
+            "terminal-bench-local-parametric-memory-eval",
+            "--task-root",
+            "/root/datasets/terminal-bench-2-1/tasks",
+            "--task-id",
+            "regex-log",
+            "--run-root",
+            str(tmp_path / "run"),
+            "--adapter-path",
+            str(tmp_path / "adapter"),
+            "--verifier-python-install-mirror",
+            "http://172.17.0.8:8765/python-build-standalone/releases/download",
+            "--dry-run",
+            "--output",
+            str(output),
+        ]
+    )
+
+    assert exit_code == 0
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert payload["verifier_env"] == {
+        "UV_PYTHON_INSTALL_MIRROR": (
+            "http://172.17.0.8:8765/python-build-standalone/releases/download"
+        )
     }
 
 
@@ -1872,7 +1906,9 @@ def test_terminal_bench_local_parametric_cli_adds_python_install_mirror(
     assert exit_code == 0
     assert captured["verifier_env"] == {
         "UV_NO_INDEX": "1",
-        "UV_PYTHON_INSTALL_MIRROR": "http://172.17.0.8:8765/python-build-standalone",
+        "UV_PYTHON_INSTALL_MIRROR": (
+            "http://172.17.0.8:8765/python-build-standalone/releases/download"
+        ),
     }
 
 

@@ -505,7 +505,7 @@ uv run polar-evolution terminal-bench-local-parametric-memory-eval \
   --tool-result-prompt-max-chars 2048 \
   --agent-env EVOLAB_TB_REQUIRE_SUCCESSFUL_COLLECT=1 \
   --agent-env EVOLAB_TB_DIRECT_SOLVER_COMPLETION_GUARD=successful_collect \
-  --verifier-python-install-mirror http://172.17.0.8:8765/python-build-standalone \
+  --verifier-python-install-mirror http://172.17.0.8:8765/python-build-standalone/releases/download \
   --output /tmp/tb21-parametric-memory/local-eval/summary.json
 ```
 
@@ -526,10 +526,12 @@ environment variable; otherwise the value is still recorded in the summary as a
 preflight signal that the package needs the matching support. Many Terminal
 Bench verifiers run `uvx -p ...`, which can download managed Python even when
 wheel dependencies are local. When a local Python-build mirror is available,
-pass `--verifier-python-install-mirror`; the runner records the resulting
-verifier environment in the summary for reproducibility. Treat controlled-subset
-results as subset evidence until the same path is run over full Terminal Bench
-2.1.
+pass `--verifier-python-install-mirror` with the uv-compatible
+`.../python-build-standalone/releases/download` base; if the local mirror root
+ends at `.../python-build-standalone`, the runner normalizes it to that download
+base. The runner records the resulting verifier environment in the summary for
+reproducibility. Treat controlled-subset results as subset evidence until the
+same path is run over full Terminal Bench 2.1.
 
 Use `--adapter-key-rewrite qwen3_5_moe_vllm_language_model` when the adapter is
 a PEFT LoRA trained against Hugging Face `Qwen3_5MoeForConditionalGeneration`
