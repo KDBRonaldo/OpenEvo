@@ -530,8 +530,11 @@ settings 或 metadata 标记 subscription auth 时跳过 `parametric_memory` art
   推理策略，不改变默认 successful-only SFT 导出；也可以设置 `stages` 列表，把多个
   corrective 目标放在同一 projection 中。每个 stage 支持 `name`、二选一的
   `target_tool_call` 或 `target_assistant_message`、`input_contains`、`max_examples`、
-  `repeat` 和 `max_input_tool_messages`，worker 会按 stage 独立扫描 saved
-  `llm_calls`，并给导出的 JSONL metadata 标记 stage 和 repeat index。
+  `repeat`、`max_input_tool_messages` 和 `synthetic_tool_results`，worker 会按 stage
+  独立扫描 saved `llm_calls`，并给导出的 JSONL metadata 标记 stage 和 repeat index。
+  `synthetic_tool_results` 只追加到导出的 SFT prefix 中，用于补齐真实 rollout 没有到达的
+  finish-boundary context，例如 synthetic `tb_run_tests` result 后监督
+  `tb_collect_result`。
   `target_assistant_message` 会导出不带 `tool_calls` 的普通 assistant message，用于训练
   `tb_collect_result` 之后的 finish/stop 行为；`password-recovery` short-target 本地
   smoke 可以使用

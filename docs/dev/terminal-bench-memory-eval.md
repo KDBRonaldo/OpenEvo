@@ -227,9 +227,13 @@ For stage-aware corrective SFT, set
 `{"type": "terminal_bench_corrective_tool_call_policy", "stages": [...]}`.
 Each stage has `name`, exactly one of `target_tool_call` or
 `target_assistant_message`, optional `input_contains`, `max_examples` (default
-64), `repeat` (default 1), and optional `max_input_tool_messages`. The exporter
-scans the saved `llm_calls` separately for each stage, emits repeated weighted
-samples when `repeat > 1`, and records `projection_stage`,
+64), `repeat` (default 1), optional `max_input_tool_messages`, and optional
+`synthetic_tool_results`. Synthetic tool results are appended only to the
+exported SFT prefix before the target assistant action; they are useful for
+finish-boundary records such as "tests passed -> collect result -> stop" when a
+real rollout never reached that later prefix. The exporter scans the saved
+`llm_calls` separately for each stage, emits repeated weighted samples when
+`repeat > 1`, and records `projection_stage`,
 `projection_stage_index`, and `projection_repeat_index` in each JSONL line's
 metadata. Use `target_assistant_message` to teach finish behavior after a
 terminal tool such as `tb_collect_result`; it emits a normal assistant message
@@ -495,6 +499,22 @@ polished policy: the treatment wrote a verifier-passing artifact but later
 ended with `AgentTimeoutError` instead of cleanly calling
 `tb_run_tests`/`tb_collect_result` and stopping. Future parametric-memory
 methods should train that validation/finish boundary explicitly.
+
+The first synthetic finish-boundary attempt added
+`synthetic_tool_results` stages to train `tb_run_tests -> tb_collect_result ->
+Done` from real post-`tb_exec` prefixes. The v3 run at
+`/tmp/tb21-parametric-memory-finishboundary-v3-20260703-023546` exported 624
+records (`read_task=16`, `fast_exec_after_read=168`,
+`correct_drift_to_fast_exec=44`, `run_tests_after_recovered_file=176`,
+`collect_after_synthetic_tests=132`, `finish_after_synthetic_collect=88`),
+trained 260 LoRA steps, and registered artifact `art_e4b6e377d25c4d20`. The
+deterministic success-guard eval recorded baseline `0/1`, parametric memory
+`0/1`, and delta `0`; the treatment still produced `tb_read_task` followed by
+repeated `tb_exec` calls, never `tb_run_tests` or `tb_collect_result`, and ended
+with `AgentTimeoutError`. Treat this as a negative method result: synthetic
+finish prefixes are available for future methods, but this heavy
+finish-boundary mix weakened the fast-command behavior instead of producing a
+clean validation/collect/stop policy.
 
 Evaluate baseline local Qwen and adapter local Qwen against the same subset:
 

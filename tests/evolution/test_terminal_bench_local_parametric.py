@@ -1531,6 +1531,13 @@ def test_terminal_bench_parametric_memory_job_accepts_corrective_stage_json(
                     "input_contains": ["starts with 8XD"],
                     "max_examples": 2,
                     "repeat": 6,
+                    "synthetic_tool_results": [
+                        {
+                            "name": "tb_run_tests",
+                            "tool_call_id": "call-tests",
+                            "content": '{"status": "passed"}',
+                        }
+                    ],
                     "target_tool_call": {
                         "name": "tb_exec",
                         "arguments": {
@@ -1566,6 +1573,13 @@ def test_terminal_bench_parametric_memory_job_accepts_corrective_stage_json(
                 "input_contains": ["starts with 8XD"],
                 "max_examples": 2,
                 "repeat": 6,
+                "synthetic_tool_results": [
+                    {
+                        "name": "tb_run_tests",
+                        "tool_call_id": "call-tests",
+                        "content": '{"status": "passed"}',
+                    }
+                ],
                 "target_tool_call": {
                     "name": "tb_exec",
                     "arguments": {

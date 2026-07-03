@@ -2001,7 +2001,57 @@ def _parametric_memory_corrective_projection_stage(
                 "stage.max_input_tool_messages must be positive"
             )
         projection["max_input_tool_messages"] = max_input_tool_messages
+    synthetic_tool_results = _parametric_memory_synthetic_tool_results(
+        value.get("synthetic_tool_results")
+    )
+    if synthetic_tool_results:
+        projection["synthetic_tool_results"] = synthetic_tool_results
     return projection
+
+
+def _parametric_memory_synthetic_tool_results(value: Any) -> list[dict[str, str]]:
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ValueError(
+            "parametric_memory_lora_sft terminal_bench_corrective_tool_call_policy "
+            "stage.synthetic_tool_results must be a list"
+        )
+    results: list[dict[str, str]] = []
+    for index, item in enumerate(value):
+        if not isinstance(item, dict):
+            raise ValueError(
+                "parametric_memory_lora_sft terminal_bench_corrective_tool_call_policy "
+                "stage.synthetic_tool_results entries must be dicts"
+            )
+        name = item.get("name")
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError(
+                "parametric_memory_lora_sft terminal_bench_corrective_tool_call_policy "
+                "stage.synthetic_tool_results.name must be a non-empty string"
+            )
+        content = item.get("content")
+        if not isinstance(content, str):
+            raise ValueError(
+                "parametric_memory_lora_sft terminal_bench_corrective_tool_call_policy "
+                "stage.synthetic_tool_results.content must be a string"
+            )
+        tool_call_id = item.get("tool_call_id")
+        if tool_call_id is None:
+            tool_call_id = f"polar-train-synthetic-tool-result-{index}"
+        if not isinstance(tool_call_id, str) or not tool_call_id.strip():
+            raise ValueError(
+                "parametric_memory_lora_sft terminal_bench_corrective_tool_call_policy "
+                "stage.synthetic_tool_results.tool_call_id must be a non-empty string"
+            )
+        results.append(
+            {
+                "name": name.strip(),
+                "tool_call_id": tool_call_id.strip(),
+                "content": content,
+            }
+        )
+    return results
 
 
 def _project_sft_response_messages(
@@ -2175,6 +2225,7 @@ def _terminal_bench_corrective_tool_call_policy_message_sets(
         input_contains = stage.get("input_contains") or []
         target_tool_call = stage.get("target_tool_call")
         target_assistant_message = stage.get("target_assistant_message")
+        synthetic_tool_results = stage.get("synthetic_tool_results") or []
         max_examples = int(stage["max_examples"])
         repeat = int(stage.get("repeat", 1))
         exported_examples = 0
@@ -2222,7 +2273,12 @@ def _terminal_bench_corrective_tool_call_policy_message_sets(
                         "role": "assistant",
                         "content": str(target_assistant_message["content"]),
                     }
-                messages = [*input_messages, target_message]
+                synthetic_messages = [
+                    {"role": "tool", **dict(tool_result)}
+                    for tool_result in synthetic_tool_results
+                    if isinstance(tool_result, dict)
+                ]
+                messages = [*input_messages, *synthetic_messages, target_message]
                 exported_metadata = {
                     "source_llm_call_index": llm_call_index,
                     "source_step_index": source_metadata.get("step_index"),
