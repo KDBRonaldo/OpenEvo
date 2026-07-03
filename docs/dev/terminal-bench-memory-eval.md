@@ -516,6 +516,25 @@ finish prefixes are available for future methods, but this heavy
 finish-boundary mix weakened the fast-command behavior instead of producing a
 clean validation/collect/stop policy.
 
+A continued-LoRA v4 attempt tested whether starting from the best fast-target
+v2 adapter could preserve the fast command while adding only a small finish
+boundary update. The temporary resume trainer loaded all 80 tensors from v2
+artifact `art_476b4c85b1c44a2b`, then trained 80 additional steps at lower
+learning rate on 318 replay-heavy records at
+`/tmp/tb21-parametric-memory-continued-v4-20260703-034807`
+(`read_task=18`, `fast_exec_after_read=192`,
+`correct_drift_to_fast_exec=44`, `run_tests_after_grep_context=32`,
+`collect_after_synthetic_tests=16`, `finish_after_synthetic_collect=16`).
+The deterministic success-guard eval again recorded baseline `0/1`,
+parametric memory `0/1`, and delta `0`. The treatment did not keep the v2 fast
+trajectory; it repeatedly called `tb_read_task` and never reached `tb_exec`,
+`tb_run_tests`, or `tb_collect_result`. This negative result suggests that
+small continued-LoRA updates can still destabilize the tool-call policy. Future
+finish-boundary work should either use a much more explicit action-state
+curriculum, separate adapters/routing for solve vs finish states, or a
+harness-side deterministic validation/collect guard while keeping the v2
+parametric adapter focused on the fast solve action.
+
 Evaluate baseline local Qwen and adapter local Qwen against the same subset:
 
 ```sh
