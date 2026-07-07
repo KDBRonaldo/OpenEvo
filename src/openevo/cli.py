@@ -26,6 +26,7 @@ from openevo.science import (
 )
 from openevo.sidecar import (
     build_sidecar_science_plan,
+    create_sidecar_app,
     load_remote_profile_config,
 )
 
@@ -152,6 +153,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Remote executor transport to use. Defaults to dry-run.",
     )
     bootstrap_parser.add_argument("--json", action="store_true", help="Print JSON output.")
+    serve_parser = sidecar_subparsers.add_parser(
+        "serve",
+        help="Run the local OpenEvo Desktop sidecar API.",
+    )
+    serve_parser.add_argument("--host", default="127.0.0.1", help="Host to bind.")
+    serve_parser.add_argument("--port", type=int, default=3766, help="Port to bind.")
     return parser
 
 
@@ -240,6 +247,8 @@ def _handle_sidecar(args: argparse.Namespace) -> int:
         return _handle_sidecar_execute(args)
     if args.sidecar_command == "bootstrap":
         return _handle_sidecar_bootstrap(args)
+    if args.sidecar_command == "serve":
+        return _handle_sidecar_serve(args)
     raise ValueError(f"Unknown sidecar command: {args.sidecar_command}")
 
 
@@ -288,6 +297,17 @@ def _handle_sidecar_bootstrap(args: argparse.Namespace) -> int:
         return 0 if report.ready else 1
     print(yaml.safe_dump(result, sort_keys=True), end="")
     return 0 if report.ready else 1
+
+
+def _handle_sidecar_serve(args: argparse.Namespace) -> int:
+    _run_sidecar_server(create_sidecar_app(), host=args.host, port=args.port)
+    return 0
+
+
+def _run_sidecar_server(app, *, host: str, port: int) -> None:
+    import uvicorn
+
+    uvicorn.run(app, host=host, port=port)
 
 
 def _sidecar_transport(args: argparse.Namespace, profile):

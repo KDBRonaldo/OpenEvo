@@ -113,6 +113,21 @@ out of the default flow. It displays the remote profile, proxy settings, Science
 Project summary, bootstrap paths, lifecycle readiness, and evolution timeline
 using the same concepts as the Python contracts.
 
+### Local Sidecar API
+
+OpenEvo Desktop starts a local sidecar API with
+`openevo sidecar serve --host 127.0.0.1 --port 3766`.
+
+The first endpoint is `GET /openevo-api/desktop/shell`. It returns typed shell
+status for the `/openevo` route and keeps the same subscription transcript
+semantics as the Python sidecar contracts: token-level metrics remain false in
+subscription mode, bootstrap readiness is represented separately from
+informational readiness notes, and no direct model API call is made.
+
+This slice does not let the HTTP API start SSH bootstrap, vLLM, Polar gateway,
+rollout, or evolution worker processes. Those operations remain behind the
+existing CLI and remote lifecycle contracts until a supervisor is added.
+
 ## CLI
 
 The initial user-visible CLI for this slice is:

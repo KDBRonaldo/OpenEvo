@@ -13,7 +13,8 @@ import {
   ShieldCheck,
   Upload,
 } from "lucide-react";
-import type { ReactNode } from "react";
+import { useEffect, useState, type ReactNode } from "react";
+import { fetchOpenEvoDesktopShellModel } from "../api/openevo";
 import {
   type EvolutionStepState,
   type RemoteServiceState,
@@ -36,8 +37,24 @@ const evolutionTone: Record<EvolutionStepState, string> = {
 };
 
 export function OpenEvoDesktop() {
-  const model = getOpenEvoDesktopShellModel();
+  const [model, setModel] = useState(() => getOpenEvoDesktopShellModel());
   const summary = getOpenEvoTimelineSummary(model);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    fetchOpenEvoDesktopShellModel()
+      .then((nextModel) => {
+        if (!cancelled) {
+          setModel(nextModel);
+        }
+      })
+      .catch(() => undefined);
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   return (
     <div className="space-y-5">

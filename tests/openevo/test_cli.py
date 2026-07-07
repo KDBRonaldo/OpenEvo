@@ -458,3 +458,26 @@ def test_cli_sidecar_bootstrap_transport_ssh_uses_ssh_transport(
     payload = json.loads(capsys.readouterr().out)
     assert payload["ready"] is True
     assert _CliRecordingSshTransport.profiles[0].id == "science-team"
+
+
+def test_cli_sidecar_serve_invokes_runner(monkeypatch) -> None:
+    calls = []
+
+    def fake_runner(app, *, host: str, port: int) -> None:
+        calls.append((app.title, host, port))
+
+    monkeypatch.setattr("openevo.cli._run_sidecar_server", fake_runner)
+
+    exit_code = main(
+        [
+            "sidecar",
+            "serve",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "3766",
+        ]
+    )
+
+    assert exit_code == 0
+    assert calls == [("OpenEvo Desktop Sidecar", "127.0.0.1", 3766)]
