@@ -404,6 +404,14 @@ def test_services_endpoint_starts_after_bootstrap_and_refreshes_status() -> None
     ]
     assert any("polar serve_rollout" in command for command in transport.commands)
     assert any("polar serve_gateway" in command for command in transport.commands)
+    assert any(
+        "polar serve_rollout --config" in command
+        for command in transport.commands
+    )
+    assert any(
+        "polar serve_gateway --config" in command
+        for command in transport.commands
+    )
     services = {service["id"]: service for service in payload["status"]["services"]}
     assert services["openevo-backend"] == {
         "id": "openevo-backend",

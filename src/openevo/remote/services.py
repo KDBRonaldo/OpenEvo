@@ -272,7 +272,7 @@ def build_remote_services_plan(bootstrap_plan: RemoteBootstrapPlan) -> RemoteSer
                 label="Rollout server",
                 command=_daemon_command(
                     "rollout",
-                    ["polar", "serve_rollout", topology_path],
+                    ["polar", "serve_rollout", "--config", topology_path],
                     log_dir=log_dir,
                     pid_dir=pid_dir,
                 ),
@@ -290,6 +290,7 @@ def build_remote_services_plan(bootstrap_plan: RemoteBootstrapPlan) -> RemoteSer
                     [
                         "polar",
                         "serve_gateway",
+                        "--config",
                         topology_path,
                         "--node-id",
                         "desktop-node",
