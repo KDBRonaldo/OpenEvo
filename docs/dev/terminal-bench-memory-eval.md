@@ -1045,6 +1045,20 @@ more gcode SFT variants, fix the local Qwen direct-solver bootstrap so the
 runtime task id is explicit or defaulted consistently; the artifact-path guard
 can only repair supported `tb_exec` commands after a tool call exists.
 
+A local Terminal-Bench/EvoLab package patch then prepended the concrete task id
+to the direct-solver task resources and `TerminalSolveAgent` system prompt. The
+rerun at
+`/tmp/tb21-task-local-parametric-gcode-pathbound-guard-20260707/eval-gcode-qwen35-pathbound-repair-taskid-r8-s140`
+used the same adapter and guard settings and again scored baseline pass@1/pass@k
+`0/1`, parametric-memory pass@1/pass@k `0/1`, delta `0`. The prompt fix worked
+for the first failure layer: the treatment's first model call emitted
+`tb_read_task({"task_id":"terminal-bench-task"})` instead of stalling before any
+tool call. The second model call, after the real task description had been read,
+still produced no `tb_exec`; Harbor recorded the final assistant message as
+`{"error":"empty_model_response"}`, and the official verifier failed because
+`/app/out.txt` was never created. This isolates the next method problem as
+post-`tb_read_task` action generation, not task-id discovery or LoRA serving.
+
 For `password-recovery`, a Qwen3.5-9B local LoRA smoke was trained from the
 existing failed/successful tool-policy trajectory at
 `/tmp/tb21-parametric-memory-password-toolpolicy-20260702-110343/local-eval-password-toolpolicy-2048/baseline/harbor_jobs/baseline-password-recovery/password-recovery__AzMbthq`.
