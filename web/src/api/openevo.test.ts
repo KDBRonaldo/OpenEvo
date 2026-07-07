@@ -3,6 +3,7 @@ import {
   activateOpenEvoProjectConfig,
   fetchOpenEvoProjectConfigs,
   fetchOpenEvoDesktopShellModel,
+  fetchOpenEvoRunArtifacts,
   pollOpenEvoRunStatus,
   runOpenEvoBootstrap,
   runOpenEvoServices,
@@ -373,6 +374,56 @@ describe("OpenEvo sidecar client", () => {
     expect(calls[1].headers.get("X-OpenEvo-Sidecar-Token")).toBe("poll-token");
   });
 
+  it("maps run artifact summary after terminal runs", async () => {
+    const calls: Array<{ path: string; headers: Headers; method: string }> = [];
+    const shellPayload = sidecarShellPayload("artifact-token");
+    vi.spyOn(globalThis, "fetch").mockImplementation(
+      async (input, init) => {
+        const path = String(input);
+        calls.push({
+          path,
+          headers: new Headers(init?.headers),
+          method: init?.method ?? "GET",
+        });
+        if (path === "/openevo-api/desktop/shell") {
+          return jsonResponse(shellPayload);
+        }
+        if (path === "/openevo-api/desktop/run/artifacts") {
+          return jsonResponse(sidecarRunArtifactsPayload());
+        }
+        return new Response("not found", { status: 404 });
+      },
+    );
+
+    await fetchOpenEvoDesktopShellModel();
+    const artifacts = await fetchOpenEvoRunArtifacts();
+
+    expect(artifacts.runId).toBe("run_20260707170000000000");
+    expect(artifacts.summaryStatus).toBe("completed");
+    expect(artifacts.experimentId).toBe("biology-components");
+    expect(artifacts.tasks[0]?.taskId).toBe("folding-baseline");
+    expect(artifacts.tasks[0]?.rounds[0]?.roundIndex).toBe(0);
+    expect(artifacts.tasks[0]?.rounds[0]?.artifactIds.skill_bundle).toEqual([
+      "artifact-skill-bundle",
+    ]);
+    expect(artifacts.tasks[0]?.rounds[0]?.jobs[0]).toEqual({
+      artifactType: "text_memory",
+      method: "text_memory_reflector",
+      workerStatus: "succeeded",
+      artifactIds: ["artifact-text-memory"],
+      approvedArtifactIds: ["artifact-text-memory"],
+      promotionStatus: "approved",
+    });
+    expect(calls).toHaveLength(2);
+    expect(calls[1]).toMatchObject({
+      path: "/openevo-api/desktop/run/artifacts",
+      method: "GET",
+    });
+    expect(calls[1].headers.get("X-OpenEvo-Sidecar-Token")).toBe(
+      "artifact-token",
+    );
+  });
+
   it("sends the sidecar mutation token on project config requests", async () => {
     const calls: Array<{ path: string; headers: Headers; body: any }> = [];
     const shellPayload = sidecarShellPayload("config-token");
@@ -618,6 +669,47 @@ function sidecarRunReport({
     experiment_snapshot: "/home/alice/.openevo/runs/protein/folding/experiment.json",
     started_at: "2026-07-07T16:00:00+00:00",
     finished_at: state === "running" ? null : "2026-07-07T17:01:00+00:00",
+  };
+}
+
+function sidecarRunArtifactsPayload() {
+  return {
+    run_id: "run_20260707170000000000",
+    output_dir:
+      "/home/alice/.openevo/runs/protein/folding/runs/run_20260707170000000000",
+    summary_status: "completed",
+    experiment_id: "biology-components",
+    experiment_name: "Biology Components",
+    round_count: 1,
+    tasks: [
+      {
+        task_id: "folding-baseline",
+        rounds: [
+          {
+            round_index: 0,
+            policy_version: "policy-r0",
+            rollout_status: "completed",
+            dataset_status: "ready",
+            artifact_ids: {
+              dataset: ["dataset-artifact-1"],
+              text_memory: ["artifact-text-memory"],
+              skill_bundle: ["artifact-skill-bundle"],
+              agent_system: ["artifact-agent-system"],
+            },
+            jobs: [
+              {
+                artifact_type: "text_memory",
+                method: "text_memory_reflector",
+                worker_status: "succeeded",
+                artifact_ids: ["artifact-text-memory"],
+                approved_artifact_ids: ["artifact-text-memory"],
+                promotion_status: "approved",
+              },
+            ],
+          },
+        ],
+      },
+    ],
   };
 }
 

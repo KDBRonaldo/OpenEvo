@@ -1680,6 +1680,183 @@ def test_run_status_endpoint_requires_launched_run() -> None:
     assert response.json()["detail"] == "No Desktop run has been launched."
 
 
+def test_run_artifacts_endpoint_requires_config_backed_session() -> None:
+    client = TestClient(create_sidecar_app())
+    token = _sidecar_token(client)
+
+    response = client.get(
+        "/openevo-api/desktop/run/artifacts",
+        headers={"X-OpenEvo-Sidecar-Token": token},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == (
+        "Desktop run artifacts require a config-backed sidecar session."
+    )
+
+
+def test_run_artifacts_endpoint_requires_launched_run() -> None:
+    project = ScienceProjectConfig.model_validate(_science_project_payload())
+    profile = _remote_profile()
+    client = TestClient(
+        create_sidecar_app_for_project(
+            project,
+            profile,
+            transport_factory=lambda _profile: _ApiDryRunTransport(),
+        )
+    )
+    token = _sidecar_token(client)
+
+    response = client.get(
+        "/openevo-api/desktop/run/artifacts",
+        headers={"X-OpenEvo-Sidecar-Token": token},
+    )
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "No Desktop run has been launched."
+
+
+def test_run_artifacts_endpoint_rejects_active_run() -> None:
+    project = ScienceProjectConfig.model_validate(_science_project_payload())
+    profile = _remote_profile()
+    transport = _BlockingRunTransport()
+    client = TestClient(
+        create_sidecar_app_for_project(
+            project,
+            profile,
+            transport_factory=lambda _profile: transport,
+        )
+    )
+    token = _sidecar_token(client)
+    headers = {"X-OpenEvo-Sidecar-Token": token}
+    _prepare_workspace_bootstrap_and_services(client, headers)
+
+    launch = client.post("/openevo-api/desktop/run", headers=headers)
+    assert transport.run_started.wait(timeout=5)
+    response = client.get("/openevo-api/desktop/run/artifacts", headers=headers)
+    transport.run_release.set()
+    _wait_latest_run_state(client, headers, "succeeded")
+
+    assert launch.status_code == 200
+    assert response.status_code == 409
+    assert response.json()["detail"] == (
+        "Desktop run artifacts require a terminal run."
+    )
+
+
+def test_run_artifacts_endpoint_reads_latest_run_summary() -> None:
+    project = ScienceProjectConfig.model_validate(_science_project_payload())
+    profile = _remote_profile()
+    transport = _RunArtifactsTransport(_sample_run_summary())
+    client = TestClient(
+        create_sidecar_app_for_project(
+            project,
+            profile,
+            transport_factory=lambda _profile: transport,
+        )
+    )
+    token = _sidecar_token(client)
+    headers = {"X-OpenEvo-Sidecar-Token": token}
+    _prepare_workspace_bootstrap_and_services(client, headers)
+    launch = client.post("/openevo-api/desktop/run", headers=headers)
+    terminal = _wait_latest_run_state(client, headers, "succeeded")
+
+    response = client.get("/openevo-api/desktop/run/artifacts", headers=headers)
+
+    assert launch.status_code == 200
+    assert terminal["run"]["ready"] is True
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["run_id"] == launch.json()["run"]["id"]
+    assert payload["output_dir"] == launch.json()["run"]["output_dir"]
+    assert payload["summary_status"] == "completed"
+    assert payload["experiment_id"] == "biology-components"
+    assert payload["tasks"] == [
+        {
+            "task_id": "folding-baseline",
+            "rounds": [
+                {
+                    "round_index": 0,
+                    "policy_version": "policy-r0",
+                    "rollout_status": "completed",
+                    "dataset_status": "ready",
+                    "artifact_ids": {
+                        "dataset": ["dataset-artifact-1"],
+                        "text_memory": ["artifact-text-memory"],
+                        "skill_bundle": ["artifact-skill-bundle"],
+                        "agent_system": ["artifact-agent-system"],
+                    },
+                    "jobs": [
+                        {
+                            "artifact_type": "text_memory",
+                            "method": "text_memory_reflector",
+                            "worker_status": "succeeded",
+                            "artifact_ids": ["artifact-text-memory"],
+                            "approved_artifact_ids": ["artifact-text-memory"],
+                            "promotion_status": "skipped",
+                        },
+                        {
+                            "artifact_type": "skill_bundle",
+                            "method": "skill_bundle_reflector",
+                            "worker_status": "succeeded",
+                            "artifact_ids": ["artifact-skill-bundle"],
+                            "approved_artifact_ids": ["artifact-skill-bundle"],
+                            "promotion_status": "approved",
+                        },
+                    ],
+                }
+            ],
+        }
+    ]
+    assert any("summary.json" in command for command in transport.commands)
+
+
+def test_run_artifacts_endpoint_reports_remote_summary_failure() -> None:
+    project = ScienceProjectConfig.model_validate(_science_project_payload())
+    profile = _remote_profile()
+    transport = _MissingRunArtifactsTransport()
+    client = TestClient(
+        create_sidecar_app_for_project(
+            project,
+            profile,
+            transport_factory=lambda _profile: transport,
+        )
+    )
+    token = _sidecar_token(client)
+    headers = {"X-OpenEvo-Sidecar-Token": token}
+    _prepare_workspace_bootstrap_and_services(client, headers)
+    client.post("/openevo-api/desktop/run", headers=headers)
+    _wait_latest_run_state(client, headers, "succeeded")
+
+    response = client.get("/openevo-api/desktop/run/artifacts", headers=headers)
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "OpenEvo run summary not found."
+
+
+def test_run_artifacts_endpoint_reports_remote_read_failure() -> None:
+    project = ScienceProjectConfig.model_validate(_science_project_payload())
+    profile = _remote_profile()
+    transport = _BrokenRunArtifactsTransport()
+    client = TestClient(
+        create_sidecar_app_for_project(
+            project,
+            profile,
+            transport_factory=lambda _profile: transport,
+        )
+    )
+    token = _sidecar_token(client)
+    headers = {"X-OpenEvo-Sidecar-Token": token}
+    _prepare_workspace_bootstrap_and_services(client, headers)
+    client.post("/openevo-api/desktop/run", headers=headers)
+    _wait_latest_run_state(client, headers, "succeeded")
+
+    response = client.get("/openevo-api/desktop/run/artifacts", headers=headers)
+
+    assert response.status_code == 502
+    assert response.json()["detail"] == "python3: command not found"
+
+
 def test_run_response_schema_has_structured_report_contract() -> None:
     client = TestClient(create_sidecar_app())
 
@@ -1819,6 +1996,57 @@ def _wait_latest_run_state(
     raise AssertionError(f"latest run did not reach {expected_state}")
 
 
+def _sample_run_summary() -> dict:
+    return {
+        "mode": "run",
+        "status": "completed",
+        "experiment_id": "biology-components",
+        "experiment_name": "Biology Components",
+        "run_id": "compiled-run-id",
+        "round_count": 1,
+        "tasks": [
+            {
+                "task_id": "folding-baseline",
+                "rounds": [
+                    {
+                        "round_index": 0,
+                        "policy_version": "policy-r0",
+                        "rollout_status": "completed",
+                        "dataset_status": "ready",
+                        "artifact_ids": {
+                            "dataset": ["dataset-artifact-1"],
+                            "text_memory": ["artifact-text-memory"],
+                            "skill_bundle": ["artifact-skill-bundle"],
+                            "agent_system": ["artifact-agent-system"],
+                        },
+                        "jobs": [
+                            {
+                                "artifact_type": "text_memory",
+                                "method": "text_memory_reflector",
+                                "worker_status": "succeeded",
+                                "artifact_ids": ["artifact-text-memory"],
+                                "approved_artifact_ids": ["artifact-text-memory"],
+                                "promotion_status": "skipped",
+                                "worker_results": [{"large": "not returned"}],
+                            },
+                            {
+                                "artifact_type": "skill_bundle",
+                                "method": "skill_bundle_reflector",
+                                "worker_status": "succeeded",
+                                "artifact_ids": ["artifact-skill-bundle"],
+                                "approved_artifact_ids": ["artifact-skill-bundle"],
+                                "promotion_status": "approved",
+                                "job": {"large": "not returned"},
+                            },
+                        ],
+                    }
+                ],
+            }
+        ],
+        "summary_path": "/remote/run/summary.json",
+    }
+
+
 class _ApiDryRunTransport:
     def __init__(self) -> None:
         self.uploads: list[tuple[str, str]] = []
@@ -1895,6 +2123,95 @@ class _FailingRunTransport(_ApiDryRunTransport):
                 command=command,
                 return_code=2,
                 stderr="run failed",
+            )
+        return super().run(
+            command,
+            cwd=cwd,
+            env=env,
+            timeout_seconds=timeout_seconds,
+        )
+
+
+class _RunArtifactsTransport(_ApiDryRunTransport):
+    def __init__(self, summary: dict) -> None:
+        super().__init__()
+        self.summary = summary
+
+    def run(
+        self,
+        command: str,
+        *,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        timeout_seconds: float = 30.0,
+    ) -> RemoteCommandResult:
+        if command.startswith('PATH="$HOME/.local/bin:$PATH" openevo run '):
+            self.commands.append(command)
+            self.run_calls.append((command, cwd, timeout_seconds))
+            return RemoteCommandResult(command=command, return_code=0, stdout="ok")
+        if "summary.json" in command:
+            self.commands.append(command)
+            self.run_calls.append((command, cwd, timeout_seconds))
+            return RemoteCommandResult(
+                command=command,
+                return_code=0,
+                stdout=json.dumps(self.summary),
+            )
+        return super().run(
+            command,
+            cwd=cwd,
+            env=env,
+            timeout_seconds=timeout_seconds,
+        )
+
+
+class _MissingRunArtifactsTransport(_RunArtifactsTransport):
+    def __init__(self) -> None:
+        super().__init__(_sample_run_summary())
+
+    def run(
+        self,
+        command: str,
+        *,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        timeout_seconds: float = 30.0,
+    ) -> RemoteCommandResult:
+        if "summary.json" in command:
+            self.commands.append(command)
+            self.run_calls.append((command, cwd, timeout_seconds))
+            return RemoteCommandResult(
+                command=command,
+                return_code=2,
+                stderr="OpenEvo run summary not found.",
+            )
+        return super().run(
+            command,
+            cwd=cwd,
+            env=env,
+            timeout_seconds=timeout_seconds,
+        )
+
+
+class _BrokenRunArtifactsTransport(_RunArtifactsTransport):
+    def __init__(self) -> None:
+        super().__init__(_sample_run_summary())
+
+    def run(
+        self,
+        command: str,
+        *,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        timeout_seconds: float = 30.0,
+    ) -> RemoteCommandResult:
+        if "summary.json" in command:
+            self.commands.append(command)
+            self.run_calls.append((command, cwd, timeout_seconds))
+            return RemoteCommandResult(
+                command=command,
+                return_code=127,
+                stderr="python3: command not found",
             )
         return super().run(
             command,
