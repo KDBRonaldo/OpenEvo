@@ -267,7 +267,17 @@ provide rollout, gateway, trajectory, and evolution backend runtime modules.
 The legacy `polar` and `polar-evolution` console scripts remain available for
 developer and backend workflows.
 
-For the local Desktop entrypoint:
+For the local Desktop launcher:
+
+```bash
+openevo desktop open
+```
+
+This starts the local sidecar server, opens `/openevo` in the browser, and
+falls back to a free local port if the default port is already occupied. Use
+`--no-browser` for headless environments.
+
+For an exact-port server entrypoint:
 
 ```bash
 openevo desktop serve --host 127.0.0.1 --port 3766

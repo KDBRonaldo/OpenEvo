@@ -6,6 +6,7 @@ from pathlib import Path
 
 import yaml
 
+from openevo import cli as openevo_cli
 from openevo.cli import main
 from openevo.remote import RemoteCommandResult
 from openevo.sidecar import RemoteProfileConfig
@@ -895,6 +896,251 @@ def test_cli_desktop_serve_rejects_incomplete_static_root(
     assert exit_code == 1
     assert runner_calls == []
     assert "assets" in capsys.readouterr().err
+
+
+def test_cli_desktop_open_opens_browser_and_runs_desktop_app(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    launcher_calls = []
+    desktop_calls = []
+
+    class FakeApp:
+        title = "OpenEvo Desktop Sidecar"
+
+    def fake_create_sidecar_app(**kwargs):
+        return FakeApp()
+
+    def fake_create_desktop_app(app, *, static_root=None):
+        desktop_calls.append((app, static_root))
+        return app
+
+    def fake_launcher(app, *, host: str, port: int, sock, url: str, open_browser: bool):
+        launcher_calls.append((app, host, port, sock.getsockname()[1], url, open_browser))
+        sock.close()
+
+    monkeypatch.setattr("openevo.cli.create_sidecar_app", fake_create_sidecar_app)
+    monkeypatch.setattr("openevo.cli.create_desktop_app", fake_create_desktop_app)
+    monkeypatch.setattr("openevo.cli._run_desktop_open_server", fake_launcher)
+    static_root = _desktop_static_root(tmp_path)
+
+    exit_code = main(
+        [
+            "desktop",
+            "open",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "3777",
+            "--static-root",
+            str(static_root),
+        ]
+    )
+
+    assert exit_code == 0
+    assert launcher_calls == [
+        (
+            desktop_calls[0][0],
+            "127.0.0.1",
+            3777,
+            3777,
+            "http://127.0.0.1:3777/openevo",
+            True,
+        )
+    ]
+    assert desktop_calls[0][1] == static_root
+
+
+def test_cli_desktop_open_no_browser_suppresses_browser_open(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    launcher_calls = []
+
+    class FakeApp:
+        title = "OpenEvo Desktop Sidecar"
+
+    monkeypatch.setattr("openevo.cli.create_sidecar_app", lambda **kwargs: FakeApp())
+    monkeypatch.setattr(
+        "openevo.cli.create_desktop_app",
+        lambda app, *, static_root=None: app,
+    )
+    monkeypatch.setattr(
+        "openevo.cli._run_desktop_open_server",
+        lambda app, *, host, port, sock, url, open_browser: (
+            launcher_calls.append((host, port, url, open_browser)),
+            sock.close(),
+        ),
+    )
+
+    exit_code = main(
+        [
+            "desktop",
+            "open",
+            "--no-browser",
+            "--port",
+            "3778",
+            "--static-root",
+            str(_desktop_static_root(tmp_path)),
+        ]
+    )
+
+    assert exit_code == 0
+    assert launcher_calls == [("127.0.0.1", 3778, "http://127.0.0.1:3778/openevo", False)]
+
+
+def test_cli_desktop_open_falls_back_when_preferred_port_is_occupied(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    import socket
+
+    launcher_calls = []
+
+    class FakeApp:
+        title = "OpenEvo Desktop Sidecar"
+
+    monkeypatch.setattr("openevo.cli.create_sidecar_app", lambda **kwargs: FakeApp())
+    monkeypatch.setattr(
+        "openevo.cli.create_desktop_app",
+        lambda app, *, static_root=None: app,
+    )
+    monkeypatch.setattr(
+        "openevo.cli._run_desktop_open_server",
+        lambda app, *, host, port, sock, url, open_browser: (
+            launcher_calls.append((host, port, sock.getsockname()[1], url, open_browser)),
+            sock.close(),
+        ),
+    )
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as occupied:
+        occupied.bind(("127.0.0.1", 0))
+        occupied.listen(1)
+        occupied_port = occupied.getsockname()[1]
+
+        exit_code = main(
+            [
+                "desktop",
+                "open",
+                "--port",
+                str(occupied_port),
+                "--static-root",
+                str(_desktop_static_root(tmp_path)),
+            ]
+        )
+
+    assert exit_code == 0
+    host, port, socket_port, url, open_browser = launcher_calls[0]
+    assert host == "127.0.0.1"
+    assert port == socket_port
+    assert port != occupied_port
+    assert url == f"http://127.0.0.1:{port}/openevo"
+    assert open_browser is True
+
+
+def test_cli_desktop_open_port_zero_uses_reportable_ephemeral_port(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    launcher_calls = []
+
+    class FakeApp:
+        title = "OpenEvo Desktop Sidecar"
+
+    monkeypatch.setattr("openevo.cli.create_sidecar_app", lambda **kwargs: FakeApp())
+    monkeypatch.setattr(
+        "openevo.cli.create_desktop_app",
+        lambda app, *, static_root=None: app,
+    )
+    monkeypatch.setattr(
+        "openevo.cli._run_desktop_open_server",
+        lambda app, *, host, port, sock, url, open_browser: (
+            launcher_calls.append((port, sock.getsockname()[1], url)),
+            sock.close(),
+        ),
+    )
+
+    exit_code = main(
+        [
+            "desktop",
+            "open",
+            "--port",
+            "0",
+            "--static-root",
+            str(_desktop_static_root(tmp_path)),
+        ]
+    )
+
+    assert exit_code == 0
+    port, socket_port, url = launcher_calls[0]
+    assert port == socket_port
+    assert port > 0
+    assert url == f"http://127.0.0.1:{port}/openevo"
+
+
+def test_run_desktop_open_server_opens_browser_after_port_readiness(monkeypatch) -> None:
+    events = []
+
+    class FakeServer:
+        should_exit = False
+
+    class FakeThread:
+        def is_alive(self) -> bool:
+            return True
+
+    fake_server = FakeServer()
+    fake_thread = FakeThread()
+
+    monkeypatch.setattr(
+        "openevo.cli._create_uvicorn_server",
+        lambda app, *, host, port: fake_server,
+    )
+    monkeypatch.setattr(
+        "openevo.cli._start_uvicorn_thread",
+        lambda server, *, sock: events.append("start") or fake_thread,
+    )
+    monkeypatch.setattr(
+        "openevo.cli._wait_for_desktop_url",
+        lambda *, url, thread: events.append("ready"),
+    )
+    monkeypatch.setattr("openevo.cli._open_desktop_url", lambda url: events.append("open"))
+    monkeypatch.setattr(
+        "openevo.cli._join_desktop_server_thread",
+        lambda thread, timeout=None: events.append("join"),
+    )
+
+    openevo_cli._run_desktop_open_server(
+        object(),
+        host="127.0.0.1",
+        port=3766,
+        sock=object(),
+        url="http://127.0.0.1:3766/openevo",
+        open_browser=True,
+    )
+
+    assert events == ["start", "ready", "open", "join"]
+
+
+def test_desktop_open_http_probe_requires_http_response() -> None:
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        sock.listen(1)
+        port = sock.getsockname()[1]
+
+        assert not openevo_cli._can_fetch_desktop_url(
+            f"http://127.0.0.1:{port}/openevo"
+        )
+
+
+def test_desktop_open_url_uses_loopback_for_wildcard_hosts() -> None:
+    assert openevo_cli._desktop_url(host="0.0.0.0", port=3766) == (
+        "http://127.0.0.1:3766/openevo"
+    )
+    assert openevo_cli._desktop_url(host="::", port=3766) == (
+        "http://[::1]:3766/openevo"
+    )
 
 
 def test_pyproject_packages_openevo_desktop_web_assets() -> None:

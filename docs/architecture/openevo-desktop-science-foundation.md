@@ -122,14 +122,26 @@ modules. The `openevo`, `polar`, and `polar-evolution` console scripts remain
 declared from the same distribution so existing backend workflows keep working
 while the user-facing package identity is OpenEvo.
 
-The release-shaped local entrypoint is:
+The release-shaped local launcher is:
+
+```bash
+openevo desktop open
+```
+
+This starts the same local FastAPI/uvicorn process, opens `/openevo` in the
+user browser, and falls back to an available local port if the preferred port is
+occupied. `--no-browser` keeps the server-only behavior for headless or scripted
+environments.
+
+The exact-port server entrypoint remains:
 
 ```bash
 openevo desktop serve --host 127.0.0.1 --port 3766
 ```
 
-This starts one local FastAPI/uvicorn process. The same process serves the
-packaged Desktop SPA at `/openevo` and the sidecar API at `/openevo-api/*`.
+Both commands serve the packaged Desktop SPA at `/openevo` and the sidecar API
+at `/openevo-api/*`. `desktop serve` preserves exact-port behavior for tests,
+integrations, and power users.
 The root path `/` redirects to `/openevo`. The packaged asset set is built in
 OpenEvo-only mode, so users do not see the shared Polar dashboard navigation.
 The local server still returns the SPA for compatibility routes `/tasks`,

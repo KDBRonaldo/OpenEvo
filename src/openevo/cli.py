@@ -179,6 +179,20 @@ def build_parser() -> argparse.ArgumentParser:
         "--static-root",
         help="Override the packaged OpenEvo Desktop static asset directory.",
     )
+    desktop_open_parser = desktop_subparsers.add_parser(
+        "open",
+        help="Open the packaged OpenEvo Desktop UI in a browser.",
+    )
+    _add_desktop_serve_arguments(desktop_open_parser)
+    desktop_open_parser.add_argument(
+        "--static-root",
+        help="Override the packaged OpenEvo Desktop static asset directory.",
+    )
+    desktop_open_parser.add_argument(
+        "--no-browser",
+        action="store_true",
+        help="Start the Desktop server without opening a browser.",
+    )
     return parser
 
 
@@ -303,6 +317,8 @@ def _handle_sidecar(args: argparse.Namespace) -> int:
 def _handle_desktop(args: argparse.Namespace) -> int:
     if args.desktop_command == "serve":
         return _handle_desktop_serve(args)
+    if args.desktop_command == "open":
+        return _handle_desktop_open(args)
     raise ValueError(f"Unknown desktop command: {args.desktop_command}")
 
 
@@ -360,12 +376,33 @@ def _handle_sidecar_serve(args: argparse.Namespace) -> int:
 
 
 def _handle_desktop_serve(args: argparse.Namespace) -> int:
-    app = _build_sidecar_serve_app(args, command_name="desktop serve")
-    static_root = Path(args.static_root).expanduser() if args.static_root else None
-    app = create_desktop_app(app, static_root=static_root)
+    app = _build_desktop_app(args, command_name="desktop serve")
     print(f"OpenEvo Desktop: http://{args.host}:{args.port}/openevo", file=sys.stderr)
     _run_sidecar_server(app, host=args.host, port=args.port)
     return 0
+
+
+def _handle_desktop_open(args: argparse.Namespace) -> int:
+    app = _build_desktop_app(args, command_name="desktop open")
+    sock = _bind_desktop_open_socket(host=args.host, preferred_port=args.port)
+    port = int(sock.getsockname()[1])
+    url = _desktop_url(host=args.host, port=port)
+    print(f"OpenEvo Desktop: {url}", file=sys.stderr)
+    _run_desktop_open_server(
+        app,
+        host=args.host,
+        port=port,
+        sock=sock,
+        url=url,
+        open_browser=not args.no_browser,
+    )
+    return 0
+
+
+def _build_desktop_app(args: argparse.Namespace, *, command_name: str):
+    app = _build_sidecar_serve_app(args, command_name=command_name)
+    static_root = Path(args.static_root).expanduser() if args.static_root else None
+    return create_desktop_app(app, static_root=static_root)
 
 
 def _build_sidecar_serve_app(args: argparse.Namespace, *, command_name: str):
@@ -396,6 +433,131 @@ def _run_sidecar_server(app, *, host: str, port: int) -> None:
     import uvicorn
 
     uvicorn.run(app, host=host, port=port)
+
+
+def _run_desktop_open_server(
+    app,
+    *,
+    host: str,
+    port: int,
+    sock,
+    url: str,
+    open_browser: bool,
+) -> None:
+    server = _create_uvicorn_server(app, host=host, port=port)
+    thread = _start_uvicorn_thread(server, sock=sock)
+    try:
+        _wait_for_desktop_url(url=url, thread=thread)
+        if open_browser:
+            _open_desktop_url(url)
+        _join_desktop_server_thread(thread)
+    except (KeyboardInterrupt, TimeoutError):
+        server.should_exit = True
+        _join_desktop_server_thread(thread, timeout=5.0)
+        raise
+
+
+def _create_uvicorn_server(app, *, host: str, port: int):
+    import uvicorn
+
+    config = uvicorn.Config(app, host=host, port=port)
+    return uvicorn.Server(config)
+
+
+def _start_uvicorn_thread(server, *, sock):
+    import threading
+
+    thread = threading.Thread(
+        target=server.run,
+        kwargs={"sockets": [sock]},
+        name="openevo-desktop-server",
+    )
+    thread.start()
+    return thread
+
+
+def _join_desktop_server_thread(thread, timeout: float | None = None) -> None:
+    thread.join(timeout=timeout)
+
+
+def _wait_for_desktop_url(*, url: str, thread) -> None:
+    import time
+
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline:
+        if _can_fetch_desktop_url(url):
+            return
+        if not thread.is_alive():
+            raise TimeoutError("OpenEvo Desktop server exited before it became ready")
+        time.sleep(0.05)
+    raise TimeoutError(f"OpenEvo Desktop server did not become ready at {url}")
+
+
+def _can_fetch_desktop_url(url: str) -> bool:
+    import http.client
+    from urllib.parse import urlsplit
+
+    parsed = urlsplit(url)
+    if parsed.scheme != "http" or parsed.hostname is None or parsed.port is None:
+        return False
+    path = parsed.path or "/"
+    if parsed.query:
+        path = f"{path}?{parsed.query}"
+    connection = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=0.2)
+    try:
+        connection.request("GET", path)
+        response = connection.getresponse()
+        response.read()
+        return response.status < 500
+    except OSError:
+        return False
+    finally:
+        connection.close()
+
+
+def _bind_desktop_open_socket(*, host: str, preferred_port: int):
+    if preferred_port > 0:
+        try:
+            return _bind_server_socket(host=host, port=preferred_port)
+        except OSError:
+            pass
+    return _bind_server_socket(host=host, port=0)
+
+
+def _bind_server_socket(*, host: str, port: int):
+    import socket
+
+    family = socket.AF_INET6 if ":" in host else socket.AF_INET
+    sock = socket.socket(family, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        sock.bind((host, port))
+        sock.listen(socket.SOMAXCONN)
+    except OSError:
+        sock.close()
+        raise
+    return sock
+
+
+def _desktop_url(*, host: str, port: int) -> str:
+    browser_host = _desktop_browser_host(host)
+    return f"http://{browser_host}:{port}/openevo"
+
+
+def _desktop_browser_host(host: str) -> str:
+    if host in {"", "0.0.0.0"}:
+        return "127.0.0.1"
+    if host == "::":
+        return "[::1]"
+    if ":" in host and not host.startswith("["):
+        return f"[{host}]"
+    return host
+
+
+def _open_desktop_url(url: str) -> None:
+    import webbrowser
+
+    webbrowser.open(url)
 
 
 def _sidecar_transport(args: argparse.Namespace, profile):
