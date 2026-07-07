@@ -183,7 +183,7 @@ def build_parser() -> argparse.ArgumentParser:
         "open",
         help="Open the packaged OpenEvo Desktop UI in a browser.",
     )
-    _add_desktop_serve_arguments(desktop_open_parser)
+    _add_desktop_serve_arguments(desktop_open_parser, transport_default="ssh")
     desktop_open_parser.add_argument(
         "--static-root",
         help="Override the packaged OpenEvo Desktop static asset directory.",
@@ -196,7 +196,11 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _add_desktop_serve_arguments(parser: argparse.ArgumentParser) -> None:
+def _add_desktop_serve_arguments(
+    parser: argparse.ArgumentParser,
+    *,
+    transport_default: str = "dry-run",
+) -> None:
     parser.add_argument("--host", default="127.0.0.1", help="Host to bind.")
     parser.add_argument("--port", type=int, default=3766, help="Port to bind.")
     parser.add_argument(
@@ -210,8 +214,11 @@ def _add_desktop_serve_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--transport",
         choices=("dry-run", "ssh"),
-        default="dry-run",
-        help="Remote executor transport used by sidecar mutating endpoints.",
+        default=transport_default,
+        help=(
+            "Remote executor transport used by sidecar mutating endpoints. "
+            f"Defaults to {transport_default}."
+        ),
     )
     parser.add_argument(
         "--desktop-config-root",
