@@ -373,6 +373,13 @@ Smoke evidence on 2026-07-07:
   step, and produced a `parametric_memory` artifact with
   `adapter_config.json`, `adapter_model.safetensors`, and
   `trainer_diagnostics.json`. The diagnostic loss was `1.2177761793136597`.
+- Local eval smoke at
+  `/tmp/tb21-task-local-parametric-eval-smoke-20260707/train-fasttext-qwen35-9b-live`
+  used managed vLLM on GPU 6 with `Qwen/Qwen3.5-9B`, `n_attempts=1`, and the
+  one-step adapter above. Baseline pass@1 was `0/1`; parametric-memory pass@1
+  was `0/1`; delta was `0`. This verifies the baseline/treatment local eval
+  plumbing and LoRA serving path, but it is not performance evidence for the
+  method because the adapter was trained for only one step on one record.
 
 Create a parametric-memory job from successful Terminal Bench trajectories and
 run the local worker once:
