@@ -1117,6 +1117,49 @@ later drifts into malformed tool-call JSON, so this is strong single-task
 positive evidence for pass@5 under the guarded local setup, not a solved
 general parametric-memory method.
 
+A stricter correction-aware follow-up trained from local Harbor/Qwen failures
+instead of only Codex command transcripts. The pool at
+`/tmp/tb21-task-local-parametric-gcode-local-correction-20260707/local_correction_pool.jsonl`
+combined five failed local baseline attempts from the pass@5 run above with one
+successful Codex reference row. The dry-run at
+`/tmp/tb21-task-local-parametric-gcode-local-correction-20260707/dryrun`
+exported 12 task-local records: five base live-replay prefixes, five
+`tb_run_tests` correction prefixes, and two `tb_collect_result` correction
+prefixes. All records were filtered to the required final artifact path
+`/app/out.txt`; the command literal is intentionally not reproduced in this
+dev note.
+
+Training at
+`/tmp/tb21-task-local-parametric-gcode-local-correction-20260707/train-gcode-qwen35-local-correction-r8-s120`
+used Qwen3.5-9B on GPU 6 with LoRA rank 8, alpha 16, max length 4096, and
+120 SFT steps. The registered artifact was
+`tb-parametric-memory-gcode-local-correction-r8-s120` with
+`training_record_count=12`; trainer diagnostics recorded losses moving from
+about `1.24`, `1.33`, `1.29` at the start to roughly `6.5e-05` at the end. The
+paired local eval at
+`/tmp/tb21-task-local-parametric-gcode-local-correction-20260707/eval-gcode-qwen35-local-correction-r8-s120`
+used the clean Terminal-Bench/EvoLab package PR #34, managed vLLM on GPU 6,
+deterministic decoding, `--vllm-generation-config vllm`,
+`--artifact-path-guard repair`, and `--required-artifact-path /app/out.txt`.
+Only `parametric_memory` was enabled; `text_memory`, `skill_bundle`, and
+`agent_system` were disabled. The official verifier summary scored baseline
+pass@1/pass@k `0/1`, parametric-memory pass@1/pass@k `1/1`, delta `+1`, with
+no Harbor errors. The treatment server command included LoRA serving while the
+baseline server did not, and GPU 6 was released after the run.
+
+This is better method evidence than the earlier Codex-only SFT variants because
+the supervised prefixes include real local failed model calls and correction
+points. It still has an important caveat: the treatment's final official reward
+was `1.0`, but the latest internal visible `tb_run_tests` artifact remained
+failed with exit code 127 because the task package had no visible test
+entrypoint. The treatment executed 10 `tb_exec` calls, and the shared guard
+repaired five supported fragile printf writes with
+`normalize_required_artifact_printf_write`; baseline executed 14 `tb_exec`
+calls with no repairs and official reward `0.0`. Treat this as positive
+single-task official-verifier evidence for correction-aware local parametric
+memory plus the same execution guard, not as a clean finish-policy result or a
+Terminal Bench 2.1 aggregate claim.
+
 For `password-recovery`, a Qwen3.5-9B local LoRA smoke was trained from the
 existing failed/successful tool-policy trajectory at
 `/tmp/tb21-parametric-memory-password-toolpolicy-20260702-110343/local-eval-password-toolpolicy-2048/baseline/harbor_jobs/baseline-password-recovery/password-recovery__AzMbthq`.
