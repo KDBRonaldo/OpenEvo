@@ -98,15 +98,17 @@ openevo sidecar bootstrap science.yaml --remote-profile remote.yaml --transport 
 ```
 
 That command prepares the remote run directory, writes `experiment.json` and
-`bootstrap.json`, checks subscription-mode Codex readiness, pulls the runtime
-image, and prefetches the HF model for managed local inference.
+`bootstrap.json`, checks or installs the remote user-site `openevo` CLI, checks
+subscription-mode Codex readiness, pulls the runtime image, and prefetches the
+HF model for managed local inference.
 
 ## Limitations
 
 This foundation still does not include:
 
 - local credential vault or keychain integration;
-- host-wide remote dependency installation or repair;
+- host-wide remote dependency installation or repair beyond bootstrap's
+  user-site `openevo` and `huggingface_hub` installs;
 - Docker daemon or Compose lifecycle management;
 - vLLM/model-serving lifecycle management;
 - remote OpenEvo backend startup;

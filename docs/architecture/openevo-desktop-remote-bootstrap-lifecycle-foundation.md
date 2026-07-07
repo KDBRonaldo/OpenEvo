@@ -70,6 +70,7 @@ The current builder emits idempotent remote steps:
 | `ensure_state_root` | Creates the per-run state directory. |
 | `write_experiment_snapshot` | Writes `<state_root>/experiment.json`. |
 | `write_bootstrap_manifest` | Writes `<state_root>/bootstrap.json`. |
+| `ensure_openevo_cli` | Ensures the remote user can run `openevo`; installs or upgrades the `openevo` Python package with `python3 -m pip install --user --upgrade openevo` when the command is absent or `openevo --help` fails. |
 | `check_codex_cli` | Subscription mode only; verifies `codex --version`. |
 | `check_codex_subscription` | Subscription mode only; verifies `~/.codex/auth.json`. |
 | `docker_pull_runtime` | Pulls the runtime image declared by the compiled experiment. |
@@ -109,6 +110,16 @@ Networked bootstrap steps receive `proxy_env` from `RemoteProfileConfig.proxy`.
 This includes standard `HTTP_PROXY`, `HTTPS_PROXY`, lowercase variants,
 `NO_PROXY`, `PIP_INDEX_URL`, `HF_ENDPOINT`, `HF_HOME`, and user-provided
 `extra_env`.
+
+The `ensure_openevo_cli` step is intentionally user-scoped. It adds
+`~/.local/bin` to the process PATH while checking for `openevo`, installs into
+the remote user's site packages when the command is missing or its help check
+fails, and leaves host-wide Python or shell configuration untouched. Later run
+commands also prepend `~/.local/bin` so the console script created by
+`pip --user` can be found without editing shell profiles.
+Bootstrap reports sanitize stdout and stderr from remote steps before storing
+them, redacting configured proxy/PIP credentials and URL userinfo while
+preserving enough command failure text for diagnosis.
 
 This is intentionally process-scoped. Bootstrap does not configure the Docker
 daemon, systemd units, registry mirrors, host-wide pip config, or shell profile
@@ -167,6 +178,8 @@ This slice intentionally does not implement:
 - Docker, NVIDIA driver, CUDA, or system package installation;
 - sudo, systemd, or daemon configuration;
 - Docker daemon proxy or registry mirror repair;
+- full Python dependency repair beyond the user-site `openevo` and
+  `huggingface_hub` installs attempted by bootstrap;
 - vLLM startup, health management, or dynamic adapter loading;
 - physical LoRA merge or request-level adapter lifecycle changes;
 - credential vault or keychain integration;

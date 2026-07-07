@@ -326,6 +326,12 @@ Desktop also keeps the most recent bootstrap report in the same area. It renders
 failed or warning bootstrap steps. Long commands, paths, proxy URLs, and stderr
 snippets are wrapped in the panel so remote dependency and setup failures remain
 readable in the app.
+Bootstrap includes a user-scoped OpenEvo CLI check: if `openevo` is missing on
+the remote command PATH plus `~/.local/bin`, it runs
+`python3 -m pip install --user --upgrade openevo` with the configured remote
+proxy/PIP environment. It then validates `openevo --help`; if that check fails,
+bootstrap attempts one user-site upgrade and validates again before reporting
+the failure.
 
 `POST /openevo-api/desktop/run` launches the configured Science task after
 workspace and bootstrap readiness. It is available only for config-backed
@@ -336,8 +342,11 @@ latest bootstrap report contains both `prepared_paths.experiment_snapshot` and
 paths:
 
 ```bash
-openevo run <experiment_snapshot> --output-dir <state_root>/runs/<run-id> --json
+PATH="$HOME/.local/bin:$PATH" openevo run <experiment_snapshot> --output-dir <state_root>/runs/<run-id> --json
 ```
+
+The PATH prefix lets the run use the console script created by bootstrap's
+remote user-site install without changing the remote user's shell profile.
 
 The sidecar supervises that command as a background job in the local sidecar
 process. `POST /openevo-api/desktop/run` records a `run_<timestamp>` id, stores

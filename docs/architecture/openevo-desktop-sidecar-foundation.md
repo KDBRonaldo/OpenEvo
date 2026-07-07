@@ -144,7 +144,8 @@ This foundation slice does not include:
 
 - real SSH/SFTP transport;
 - local credential vault or keychain integration;
-- remote installation or dependency repair;
+- full remote installation or dependency repair beyond later bootstrap layers'
+  user-site Python package checks;
 - Docker daemon or Docker Compose lifecycle management;
 - vLLM/model serving lifecycle management;
 - runtime image build/push/upload;

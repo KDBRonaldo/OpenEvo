@@ -1196,7 +1196,7 @@ def test_run_endpoint_launches_after_workspace_and_bootstrap() -> None:
     experiment_snapshot = bootstrap["report"]["prepared_paths"]["experiment_snapshot"]
     output_dir = f"{state_root}/runs/{payload['run']['id']}"
     expected_command = (
-        f"openevo run {experiment_snapshot} "
+        f'PATH="$HOME/.local/bin:$PATH" openevo run {experiment_snapshot} '
         f"--output-dir {output_dir} --json"
     )
     assert payload["run"]["id"].startswith("run_")
@@ -1577,7 +1577,7 @@ class _FailingRunTransport(_ApiDryRunTransport):
         env: dict[str, str] | None = None,
         timeout_seconds: float = 30.0,
     ) -> RemoteCommandResult:
-        if command.startswith("openevo run "):
+        if command.startswith('PATH="$HOME/.local/bin:$PATH" openevo run '):
             self.commands.append(command)
             return RemoteCommandResult(
                 command=command,
@@ -1645,7 +1645,7 @@ class _BlockingRunTransport(_ApiDryRunTransport):
         env: dict[str, str] | None = None,
         timeout_seconds: float = 30.0,
     ) -> RemoteCommandResult:
-        if command.startswith("openevo run "):
+        if command.startswith('PATH="$HOME/.local/bin:$PATH" openevo run '):
             self.commands.append(command)
             self.run_started.set()
             if not self.run_release.wait(timeout=5):

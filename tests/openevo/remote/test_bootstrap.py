@@ -99,6 +99,36 @@ class RaisingTransport(RecordingTransport):
         raise TimeoutError("timed out")
 
 
+class LeakyCliInstallFailureTransport(RecordingTransport):
+    def __init__(self, *, failing_command: str) -> None:
+        super().__init__()
+        self.failing_command = failing_command
+
+    def run(
+        self,
+        command: str,
+        *,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        timeout_seconds: float = 30.0,
+    ) -> RemoteCommandResult:
+        self.commands.append((command, cwd, env, timeout_seconds))
+        if command == self.failing_command:
+            return RemoteCommandResult(
+                command=command,
+                return_code=13,
+                stdout=(
+                    "Looking in indexes: "
+                    "https://pip-user:pip-secret@pypi.example/simple"
+                ),
+                stderr=(
+                    "Proxy http://proxy-user:proxy-secret@127.0.0.1:7890 "
+                    "failed for https://other-user:other-secret@example.test/pkg"
+                ),
+            )
+        return RemoteCommandResult(command=command, return_code=0, stdout="ok")
+
+
 def _step(**overrides) -> RemoteBootstrapStep:
     payload = {
         "id": "ensure_state_dir",
@@ -270,6 +300,28 @@ def test_build_remote_bootstrap_plan_derives_subscription_steps() -> None:
         "/home/alice/.openevo/runs/protein-design/folding-baseline/experiment.json"
         in steps_by_id["write_experiment_snapshot"].command
     )
+    assert steps_by_id["ensure_openevo_cli"].kind == (
+        RemoteBootstrapStepKind.CHECK_COMMAND
+    )
+    assert steps_by_id["ensure_openevo_cli"].required is True
+    assert steps_by_id["ensure_openevo_cli"].network is True
+    assert steps_by_id["ensure_openevo_cli"].remediation_kind == "openevo_install"
+    assert steps_by_id["ensure_openevo_cli"].env["HTTPS_PROXY"] == (
+        "http://127.0.0.1:7890"
+    )
+    assert "'pip'" in steps_by_id["ensure_openevo_cli"].command
+    assert "'install'" in steps_by_id["ensure_openevo_cli"].command
+    assert "'--user'" in steps_by_id["ensure_openevo_cli"].command
+    assert "'--upgrade'" in steps_by_id["ensure_openevo_cli"].command
+    assert "'--no-input'" in steps_by_id["ensure_openevo_cli"].command
+    assert "'--disable-pip-version-check'" in (
+        steps_by_id["ensure_openevo_cli"].command
+    )
+    assert "'openevo'" in steps_by_id["ensure_openevo_cli"].command
+    assert "['openevo', '--help']" in steps_by_id["ensure_openevo_cli"].command
+    assert "except subprocess.CalledProcessError as exc:" in (
+        steps_by_id["ensure_openevo_cli"].command
+    )
     assert steps_by_id["write_bootstrap_manifest"].kind == (
         RemoteBootstrapStepKind.WRITE_FILE
     )
@@ -420,6 +472,52 @@ def test_execute_remote_bootstrap_plan_stops_after_required_step_failure() -> No
     assert report.steps[-1].return_code == 17
     assert report.steps[-1].stderr == "failed"
     assert report.next_actions == ("Resolve failed bootstrap steps and rerun.",)
+
+
+def test_execute_remote_bootstrap_plan_reports_sanitized_openevo_install_failure() -> (
+    None
+):
+    plan = build_remote_bootstrap_plan(
+        build_sidecar_science_plan(
+            _project(),
+            _profile(
+                proxy={
+                    "https_proxy": "http://proxy-user:proxy-secret@127.0.0.1:7890",
+                    "pip_index_url": (
+                        "https://pip-user:pip-secret@pypi.example/simple"
+                    ),
+                }
+            ),
+        )
+    )
+    failing_command = {step.id: step.command for step in plan.steps}[
+        "ensure_openevo_cli"
+    ]
+
+    report = execute_remote_bootstrap_plan(
+        plan,
+        LeakyCliInstallFailureTransport(failing_command=failing_command),
+        run_remote_preflight=False,
+    )
+
+    assert report.ready is False
+    assert report.steps[-1].id == "ensure_openevo_cli"
+    assert report.steps[-1].status == RemoteBootstrapStepStatus.FAIL
+    assert report.steps[-1].return_code == 13
+    assert report.steps[-1].remediation_kind == "openevo_install"
+    assert "[REDACTED]" in report.steps[-1].stdout
+    assert "[REDACTED]" in report.steps[-1].stderr
+    assert "example.test/pkg" in report.steps[-1].stderr
+    for leaked in (
+        "pip-secret",
+        "proxy-secret",
+        "other-secret",
+        "pip-user:pip-secret",
+        "proxy-user:proxy-secret",
+        "other-user:other-secret",
+    ):
+        assert leaked not in report.steps[-1].stdout
+        assert leaked not in report.steps[-1].stderr
 
 
 def test_execute_remote_bootstrap_plan_reports_step_exception() -> None:

@@ -948,7 +948,8 @@ def _initial_run_status(
     run_id = "run_" + datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S%f")
     output_dir = posixpath.join(state_root, "runs", run_id)
     command = (
-        f"openevo run {shlex.quote(experiment_snapshot)} "
+        f'PATH="$HOME/.local/bin:$PATH" openevo run '
+        f"{shlex.quote(experiment_snapshot)} "
         f"--output-dir {shlex.quote(output_dir)} --json"
     )
     return OpenEvoDesktopRunStatus(

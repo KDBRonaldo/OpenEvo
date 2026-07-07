@@ -29,6 +29,27 @@ if TYPE_CHECKING:
     from openevo.sidecar import SidecarSciencePlan
 
 
+_URL_USERINFO_RE = re.compile(
+    r"(?P<prefix>\b[A-Za-z][A-Za-z0-9+.-]*://)(?P<userinfo>[^\s/@]+@)"
+)
+_URL_QUERY_RE = re.compile(
+    r"(?P<prefix>\b[A-Za-z][A-Za-z0-9+.-]*://[^\s?#]+)\?(?P<query>[^\s#]+)"
+    r"(?P<fragment>#[^\s]*)?"
+)
+_SENSITIVE_ENV_KEY_PARTS = (
+    "AUTH",
+    "CREDENTIAL",
+    "INDEX_URL",
+    "KEY",
+    "PASS",
+    "PASSWORD",
+    "PROXY",
+    "SECRET",
+    "TOKEN",
+)
+_REDACTED = "[REDACTED]"
+
+
 class _StrictFrozenModel(BaseModel):
     model_config = ConfigDict(
         extra="forbid",
@@ -292,6 +313,17 @@ def build_remote_bootstrap_plan(plan: SidecarSciencePlan) -> RemoteBootstrapPlan
             remediation_kind="openevo_retry",
             manifest={"path": manifest_path},
         ),
+        RemoteBootstrapStep(
+            id="ensure_openevo_cli",
+            kind=RemoteBootstrapStepKind.CHECK_COMMAND,
+            command=_openevo_cli_install_command(),
+            env=proxy_env,
+            timeout_seconds=300.0,
+            network=True,
+            required=True,
+            remediation_kind="openevo_install",
+            manifest={"package": "openevo"},
+        ),
     ]
 
     if _uses_codex_subscription(experiment_snapshot):
@@ -501,6 +533,67 @@ def _hf_snapshot_download_command(model: str) -> str:
     )
 
 
+def _openevo_cli_install_command() -> str:
+    return "\n".join(
+        [
+            "python3 - <<'PY'",
+            "import os",
+            "import shutil",
+            "import subprocess",
+            "import sys",
+            "",
+            "env = os.environ.copy()",
+            "user_bin = os.path.expanduser('~/.local/bin')",
+            "os.makedirs(user_bin, exist_ok=True)",
+            "env['PATH'] = user_bin + os.pathsep + env.get('PATH', '')",
+            "",
+            "def run_command(args):",
+            "    try:",
+            (
+                "        return subprocess.run(args, check=True, env=env, "
+                "stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)"
+            ),
+            "    except subprocess.CalledProcessError as exc:",
+            "        return exc",
+            "",
+            "def fail(label, result):",
+            (
+                "    print(f'{label} failed with exit code "
+                "{result.returncode}', file=sys.stderr)"
+            ),
+            "    if result.stdout:",
+            "        print(f'{label} stdout:\\n{result.stdout}', file=sys.stderr)",
+            "    if result.stderr:",
+            "        print(f'{label} stderr:\\n{result.stderr}', file=sys.stderr)",
+            "    raise SystemExit(result.returncode or 1)",
+            "",
+            "def install_openevo():",
+            (
+                "    return run_command([sys.executable, '-m', 'pip', "
+                "'--disable-pip-version-check', 'install', '--user', "
+                "'--upgrade', '--no-input', 'openevo'])"
+            ),
+            "",
+            "def check_openevo():",
+            "    return run_command(['openevo', '--help'])",
+            "",
+            "if shutil.which('openevo', path=env.get('PATH')) is None:",
+            "    install = install_openevo()",
+            "    if install.returncode != 0:",
+            "        fail('openevo install', install)",
+            "check = check_openevo()",
+            "if check.returncode != 0:",
+            "    repair = install_openevo()",
+            "    if repair.returncode != 0:",
+            "        fail('openevo repair', repair)",
+            "    check = check_openevo()",
+            "    if check.returncode != 0:",
+            "        fail('openevo check', check)",
+            "PY",
+        ]
+    )
+
+
 def _thaw_json(value: object) -> object:
     if isinstance(value, Mapping):
         return {key: _thaw_json(item) for key, item in value.items()}
@@ -526,7 +619,7 @@ def _execute_bootstrap_step(
             timeout_seconds=step.timeout_seconds,
         )
     except Exception as exc:
-        message = str(exc)
+        message = _sanitize_bootstrap_text(str(exc), step.env)
         return RemoteBootstrapStepExecution(
             id=step.id,
             kind=step.kind,
@@ -548,8 +641,8 @@ def _execute_bootstrap_step(
             required=step.required,
             remediation_kind=step.remediation_kind,
             return_code=result.return_code,
-            stdout=result.stdout,
-            stderr=result.stderr,
+            stdout=_sanitize_bootstrap_text(result.stdout, step.env),
+            stderr=_sanitize_bootstrap_text(result.stderr, step.env),
         )
 
     status = (
@@ -566,9 +659,39 @@ def _execute_bootstrap_step(
         required=step.required,
         remediation_kind=step.remediation_kind,
         return_code=result.return_code,
-        stdout=result.stdout,
-        stderr=result.stderr,
+        stdout=_sanitize_bootstrap_text(result.stdout, step.env),
+        stderr=_sanitize_bootstrap_text(result.stderr, step.env),
     )
+
+
+def _sanitize_bootstrap_text(value: str, env: Mapping[str, str]) -> str:
+    if not value:
+        return ""
+    sanitized = value
+    for secret in _bootstrap_redaction_values(env):
+        sanitized = sanitized.replace(secret, _REDACTED)
+    sanitized = _URL_USERINFO_RE.sub(r"\g<prefix>[REDACTED]@", sanitized)
+    sanitized = _URL_QUERY_RE.sub(
+        lambda match: (
+            f"{match.group('prefix')}?<redacted>{match.group('fragment') or ''}"
+        ),
+        sanitized,
+    )
+    return sanitized
+
+
+def _bootstrap_redaction_values(env: Mapping[str, str]) -> list[str]:
+    values: list[str] = []
+    for key, value in env.items():
+        text = value.strip()
+        if len(text) < 4:
+            continue
+        key_upper = key.upper()
+        if any(part in key_upper for part in _SENSITIVE_ENV_KEY_PARTS):
+            values.append(text)
+        elif _URL_USERINFO_RE.search(text):
+            values.append(text)
+    return sorted(set(values), key=len, reverse=True)
 
 
 def _preflight_exception_report(exc: Exception) -> PreflightReport:

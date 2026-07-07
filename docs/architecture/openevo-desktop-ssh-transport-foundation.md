@@ -8,8 +8,9 @@ preflight commands and prepare task workspaces on a remote GPU server through
 system OpenSSH and rsync.
 
 This is still not the full remote backend. It does not start a long-running
-remote daemon, install dependencies, manage Docker Compose, manage vLLM, or
-perform Desktop UI orchestration.
+remote daemon, manage Docker Compose, manage vLLM, or perform Desktop UI
+orchestration. Remote dependency installation is limited to the bootstrap
+layer's user-site Python package checks.
 
 ## CLI Contract
 
@@ -139,7 +140,8 @@ This slice does not include:
 - password or passphrase vault integration;
 - OpenSSH config editing;
 - Windows-specific rsync packaging;
-- automatic remote dependency installation or repair;
+- host-wide remote dependency installation or repair beyond bootstrap's
+  user-site `openevo` and `huggingface_hub` installs;
 - remote sidecar daemon startup;
 - Docker daemon, Docker Compose, or vLLM lifecycle management;
 - dynamic adapter/model lifecycle;
