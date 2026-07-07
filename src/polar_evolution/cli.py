@@ -648,9 +648,10 @@ def build_parser() -> argparse.ArgumentParser:
         default=ADAPTER_KEY_REWRITE_NONE,
         help=(
             "Optional serving-time adapter key rewrite. Use "
-            "qwen3_5_moe_vllm_language_model for PEFT adapters trained on "
-            "Qwen3.5/Qwen3.6 MoE whose vLLM language model lives under "
-            "language_model.model.*."
+            "qwen3_5_vllm_language_model for Qwen3.5/Qwen3.6 PEFT adapters "
+            "served by vLLM --language-model-only, where train-time layer keys "
+            "must be rewritten under language_model.layers.*. The older "
+            "qwen3_5_moe_vllm_language_model alias is still accepted."
         ),
     )
     tb_local_parametric.add_argument("--adapter-artifact-id")

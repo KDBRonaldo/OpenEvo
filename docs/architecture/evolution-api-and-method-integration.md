@@ -569,13 +569,15 @@ suffix，确保最终目标仍被训练。该模式适合 final write 依赖依�
 Terminal Bench recipe。该路径用于本地/proxy inference 的 parametric-memory ablation，
 不适用于 Codex subscription serving。
 
-本地 vLLM eval 提供 serving-time adapter 兼容层：对 Qwen3.5/Qwen3.6 MoE PEFT LoRA，可在
+本地 vLLM eval 提供 serving-time adapter 兼容层：对通过 vLLM
+`--language-model-only` 服务的 Qwen3.5/Qwen3.6 PEFT LoRA，可在
 `terminal-bench-local-parametric-memory-eval` 中使用
-`--adapter-key-rewrite qwen3_5_moe_vllm_language_model`。该选项复制原始 adapter 到
+`--adapter-key-rewrite qwen3_5_vllm_language_model`。该选项复制原始 adapter 到
 `run_root/prepared_adapters/...`，把 `base_model.model.model.layers.*` safetensors key
 改写为 vLLM language-model-only wrapper 期望的
 `base_model.model.model.language_model.layers.*`，并在 summary 中记录 source adapter path、
 serving adapter path、rewrite 名称和改写 key 数。它不改变 evolution artifact 的原始 URI。
+旧的 `qwen3_5_moe_vllm_language_model` 名称仍作为兼容 alias 接受。
 
 本地 parametric-memory eval 还会把 solver output budget 作为 serving contract 记录并传给
 Harbor/EvoLab agent。`requested_max_output_tokens` 是 CLI 请求值，实际

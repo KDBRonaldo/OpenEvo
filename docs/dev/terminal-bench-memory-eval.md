@@ -800,11 +800,35 @@ again completed cleanly with baseline pass@1 `0/1`, parametric-memory pass@1
 the LoRA module was mounted. However, the baseline and treatment tool-call
 sequences were exactly identical for all 25 calls, starting with
 `tb_read_task(static-node-0)`, `tb_exec("ls -la")`, and repeated shallow
-inspection of `*.bin` files. This makes the current Qwen3.5
-`password-recovery` negative result a method-alignment failure rather than a
-serving/runtime failure: the adapter is loaded and overfits the tiny training
-set by loss, but it does not move deterministic Qwen3.5 tool-call decoding
-toward the recipe under vLLM.
+inspection of `*.bin` files. A direct single-prefix probe against training
+record 1 then isolated the failure: under HF/PEFT, the base Qwen3.5 model
+emitted the exploratory `ls -la /app/varsea/` call while the adapter emitted
+the trained `find varsea/disks` recovery command. Serving the same adapter
+through vLLM without an adapter key rewrite exposed the adapter model id but
+produced the same `ls -la` output as the base model. After rewriting the
+adapter keys for vLLM `--language-model-only`, the direct vLLM probe split as
+expected: base emitted `ls -la`, treatment emitted the trained recovery
+command. Treat the paired eval above as a serving-compatibility negative, not a
+method-performance negative; rerun it with
+`--adapter-key-rewrite qwen3_5_vllm_language_model` before interpreting the
+Qwen3.5 `password-recovery` delta.
+
+The rerun at
+`/tmp/tb21-parametric-memory-qwen35-password-staticnode-20260707-eval-rewrite`
+used the same static-node adapter with
+`--adapter-key-rewrite qwen3_5_vllm_language_model`; the summary recorded
+64 rewritten keys, baseline pass@1 `0/1`, parametric-memory pass@1 `0/1`, and
+delta `0`. This run confirms the serving fix reaches the full Terminal-Bench
+harness: the treatment no longer matches the baseline tool-call sequence and
+vLLM logs show LoRA kernels in use. The remaining failure is method/schema
+alignment. After `tb_read_task`, the adapter emitted a `tb_exec` call whose
+arguments were captured as `_raw_arguments` without the required `task_id`;
+the agent then failed on a vLLM/OpenAI-compatible 400
+`Unterminated string starting at: line 1 column 13`. The generated command also
+drifted from the trained `varsea/disks` and `8XD...W54` pattern toward
+`varsea/disconnected` and numeric fragments. Treat this as evidence that the
+Qwen3.5 static-node adapter is active but not yet a usable task-local memory
+method.
 
 Evaluate baseline local Qwen and adapter local Qwen against the same subset:
 
@@ -819,7 +843,7 @@ uv run polar-evolution terminal-bench-local-parametric-memory-eval \
   --adapter-path /tmp/tb21-parametric-memory/artifacts/workers/<job-id>/parametric_memory_lora_sft/adapter \
   --adapter-id tb-parametric-memory \
   --adapter-artifact-id <artifact-id> \
-  --adapter-key-rewrite qwen3_5_moe_vllm_language_model \
+  --adapter-key-rewrite qwen3_5_vllm_language_model \
   --gpu 1 \
   --gpu 2 \
   --gpu 3 \
@@ -870,14 +894,16 @@ base. The runner records the resulting verifier environment in the summary for
 reproducibility. Treat controlled-subset results as subset evidence until the
 same path is run over full Terminal Bench 2.1.
 
-Use `--adapter-key-rewrite qwen3_5_moe_vllm_language_model` when the adapter is
-a PEFT LoRA trained against Hugging Face `Qwen3_5MoeForConditionalGeneration`
-or the Qwen3.6 MoE alias but served through vLLM's language-model-only
-`Qwen3_5MoeForConditionalGeneration` wrapper. vLLM 0.21.0 maps LoRA keys under
-`language_model.model.layers.*`, while the PEFT trainer writes
-`base_model.model.model.layers.*`. The runner copies the adapter under
-`run_root/prepared_adapters/<adapter-id>/<rewrite>/adapter`, rewrites only the
-safetensors key prefixes, and records both the source and serving adapter paths
-plus the rewritten key count in the summary. Treat `rewritten_key_count=0` as a
-configuration error; without this rewrite, vLLM can expose the adapter model id
-while the generated logits remain unchanged.
+Use `--adapter-key-rewrite qwen3_5_vllm_language_model` when a Qwen3.5/Qwen3.6
+PEFT LoRA is served through vLLM's `--language-model-only` wrapper. This applies
+to both dense Qwen3.5 local models and Qwen3.5/Qwen3.6 MoE aliases in vLLM
+0.21.0: the PEFT trainer writes `base_model.model.model.layers.*`, while vLLM
+expects the effective language-model LoRA keys under
+`base_model.model.model.language_model.layers.*`. The runner copies the adapter
+under `run_root/prepared_adapters/<adapter-id>/<rewrite>/adapter`, rewrites only
+the safetensors key prefixes, and records both the source and serving adapter
+paths plus the rewritten key count in the summary. Treat `rewritten_key_count=0`
+as a configuration error; without this rewrite, vLLM can expose the adapter
+model id while the generated logits remain unchanged. The older
+`qwen3_5_moe_vllm_language_model` spelling is still accepted as a compatibility
+alias for existing scripts and summaries.

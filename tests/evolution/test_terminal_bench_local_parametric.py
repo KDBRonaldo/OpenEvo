@@ -714,6 +714,57 @@ def test_prepare_serving_adapter_rewrites_safetensors_header_without_torch(
     assert rewritten_payload == payload
 
 
+def test_prepare_serving_adapter_accepts_qwen35_vllm_language_model_alias(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter_dir = tmp_path / "adapter"
+    adapter_dir.mkdir()
+    (adapter_dir / "adapter_config.json").write_text("{}", encoding="utf-8")
+    (adapter_dir / "adapter_model.safetensors").write_bytes(b"fake")
+
+    saved_state: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        local_parametric,
+        "_load_safetensors_file",
+        lambda path: local_parametric.RawSafetensorsFile(
+            header={
+                "base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight": object(),
+            },
+            payload=b"payload",
+        ),
+    )
+
+    def fake_save_safetensors(raw_file: local_parametric.RawSafetensorsFile, path: Path) -> None:
+        saved_state.update(raw_file.header)
+        path.write_bytes(b"rewritten")
+
+    monkeypatch.setattr(local_parametric, "_save_safetensors_file", fake_save_safetensors)
+
+    prepared = local_parametric.prepare_serving_adapter(
+        adapter_path=adapter_dir,
+        run_root=tmp_path / "run",
+        adapter_id="tb-parametric-memory",
+        adapter_key_rewrite="qwen3_5_vllm_language_model",
+    )
+
+    assert prepared.key_rewrite == "qwen3_5_vllm_language_model"
+    assert prepared.rewritten_key_count == 1
+    assert prepared.adapter_path == (
+        tmp_path
+        / "run"
+        / "prepared_adapters"
+        / "tb-parametric-memory"
+        / "qwen3_5_vllm_language_model"
+        / "adapter"
+    )
+    assert (
+        "base_model.model.model.language_model.layers.0.self_attn.q_proj.lora_A.weight"
+        in saved_state
+    )
+
+
 def test_prepare_serving_adapter_rejects_adapter_key_rewrite_collisions(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

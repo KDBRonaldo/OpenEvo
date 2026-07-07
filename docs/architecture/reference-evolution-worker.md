@@ -590,11 +590,13 @@ because the worker invokes the trainer from the artifact output directory.
 Serving contract:
 
 - `terminal-bench-local-parametric-memory-eval` 可用
-  `--adapter-key-rewrite qwen3_5_moe_vllm_language_model` 为 Qwen3.5/Qwen3.6 MoE PEFT LoRA
-  生成 vLLM-compatible adapter 副本。该 rewrite 把
+  `--adapter-key-rewrite qwen3_5_vllm_language_model` 为通过 vLLM
+  `--language-model-only` 服务的 Qwen3.5/Qwen3.6 PEFT LoRA 生成 vLLM-compatible adapter
+  副本。该 rewrite 把
   `base_model.model.model.layers.*` key 映射为 vLLM language-model-only wrapper 期望的
   `base_model.model.model.language_model.layers.*` key；summary 会记录 source adapter path、
-  prepared serving adapter path、rewrite 名称和改写 key 数。
+  prepared serving adapter path、rewrite 名称和改写 key 数。旧的
+  `qwen3_5_moe_vllm_language_model` 名称仍作为兼容 alias 接受。
 - 该 rewrite 是 serving-time 兼容层，不改变 evolution artifact 的原始 URI。只有使用 vLLM
   managed server 的本地评估需要它；其他 serving backend 应按自身 adapter key contract 处理。
 - 本地 eval 会记录 `requested_max_output_tokens` 和实际传给 Harbor agent 的
