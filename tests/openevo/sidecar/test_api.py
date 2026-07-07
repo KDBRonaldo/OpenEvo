@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Event
@@ -870,26 +871,34 @@ def test_run_endpoint_launches_after_workspace_and_bootstrap() -> None:
     payload = response.json()
     state_root = bootstrap["report"]["prepared_paths"]["state_root"]
     experiment_snapshot = bootstrap["report"]["prepared_paths"]["experiment_snapshot"]
-    output_dir = f"{state_root}/runs/latest"
+    output_dir = f"{state_root}/runs/{payload['run']['id']}"
     expected_command = (
         f"openevo run {experiment_snapshot} "
         f"--output-dir {output_dir} --json"
     )
-    assert payload["run"]["ready"] is True
-    assert payload["run"]["status"] == "pass"
+    assert payload["run"]["id"].startswith("run_")
+    assert payload["run"]["state"] == "running"
+    assert payload["run"]["ready"] is False
+    assert payload["run"]["finished_at"] is None
     assert payload["run"]["command"] == expected_command
     assert payload["run"]["output_dir"] == output_dir
     assert payload["run"]["experiment_snapshot"] == experiment_snapshot
+
+    terminal = _wait_latest_run_state(client, headers, "succeeded")
     assert payload["run"]["command"] in transport.commands
     assert transport.run_calls[-1] == (expected_command, state_root, 86400.0)
-    services = {service["id"]: service for service in payload["status"]["services"]}
+    assert terminal["run"]["ready"] is True
+    assert terminal["run"]["return_code"] == 0
+    assert terminal["run"]["stdout"] == "ok"
+    assert terminal["run"]["finished_at"] is not None
+    services = {service["id"]: service for service in terminal["status"]["services"]}
     assert services["openevo-backend"] == {
         "id": "openevo-backend",
         "label": "OpenEvo backend",
         "state": "ready",
         "detail": "Last run completed",
     }
-    evolution = {step["id"]: step for step in payload["status"]["evolution"]}
+    evolution = {step["id"]: step for step in terminal["status"]["evolution"]}
     assert evolution["transcript"]["state"] == "complete"
     assert evolution["transcript"]["detail"] == "Run completed and transcript captured"
 
@@ -912,10 +921,12 @@ def test_run_endpoint_preserves_command_failure_status() -> None:
     response = client.post("/openevo-api/desktop/run", headers=headers)
 
     assert response.status_code == 200
-    payload = response.json()
+    assert response.json()["run"]["state"] == "running"
+    payload = _wait_latest_run_state(client, headers, "failed")
     assert payload["run"]["ready"] is False
-    assert payload["run"]["status"] == "fail"
+    assert payload["run"]["return_code"] == 2
     assert payload["run"]["stderr"] == "run failed"
+    assert payload["run"]["finished_at"] is not None
     services = {service["id"]: service for service in payload["status"]["services"]}
     assert services["openevo-backend"] == {
         "id": "openevo-backend",
@@ -940,19 +951,109 @@ def test_run_endpoint_rejects_concurrent_runs() -> None:
     headers = {"X-OpenEvo-Sidecar-Token": token}
     _prepare_workspace_and_bootstrap(client, headers)
 
-    with ThreadPoolExecutor(max_workers=1) as executor:
-        first = executor.submit(
-            client.post,
-            "/openevo-api/desktop/run",
-            headers=headers,
-        )
-        assert transport.run_started.wait(timeout=5)
-        second = client.post("/openevo-api/desktop/run", headers=headers)
-        transport.run_release.set()
+    first = client.post("/openevo-api/desktop/run", headers=headers)
+    assert transport.run_started.wait(timeout=5)
+    second = client.post("/openevo-api/desktop/run", headers=headers)
+    transport.run_release.set()
 
+    assert first.status_code == 200
     assert second.status_code == 409
     assert second.json()["detail"] == "Desktop run launch is already running."
-    assert first.result(timeout=5).status_code == 200
+    assert _wait_latest_run_state(client, headers, "succeeded")["run"]["ready"] is True
+
+
+def test_run_status_endpoint_returns_latest_running_report() -> None:
+    project = ScienceProjectConfig.model_validate(_science_project_payload())
+    profile = _remote_profile()
+    transport = _BlockingRunTransport()
+    client = TestClient(
+        create_sidecar_app_for_project(
+            project,
+            profile,
+            transport_factory=lambda _profile: transport,
+        )
+    )
+    token = _sidecar_token(client)
+    headers = {"X-OpenEvo-Sidecar-Token": token}
+    bootstrap = _prepare_workspace_and_bootstrap(client, headers)
+
+    launch = client.post("/openevo-api/desktop/run", headers=headers)
+    assert transport.run_started.wait(timeout=5)
+    poll = client.get("/openevo-api/desktop/run", headers=headers)
+    transport.run_release.set()
+
+    assert launch.status_code == 200
+    assert poll.status_code == 200
+    assert poll.json()["run"]["id"] == launch.json()["run"]["id"]
+    assert poll.json()["run"]["state"] == "running"
+    assert poll.json()["run"]["ready"] is False
+    assert poll.json()["run"]["finished_at"] is None
+    state_root = bootstrap["report"]["prepared_paths"]["state_root"]
+    assert poll.json()["run"]["output_dir"] == (
+        f"{state_root}/runs/{launch.json()['run']['id']}"
+    )
+    services = {service["id"]: service for service in poll.json()["status"]["services"]}
+    assert services["openevo-backend"]["state"] == "running"
+    evolution = {step["id"]: step for step in poll.json()["status"]["evolution"]}
+    assert evolution["transcript"]["state"] == "running"
+
+
+def test_run_status_endpoint_rejects_missing_sidecar_token() -> None:
+    project = ScienceProjectConfig.model_validate(_science_project_payload())
+    profile = _remote_profile()
+    client = TestClient(
+        create_sidecar_app_for_project(
+            project,
+            profile,
+            transport_factory=lambda _profile: _ApiDryRunTransport(),
+        )
+    )
+
+    response = client.get("/openevo-api/desktop/run")
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Invalid OpenEvo sidecar token."
+
+
+def test_run_status_endpoint_rejects_invalid_sidecar_token() -> None:
+    project = ScienceProjectConfig.model_validate(_science_project_payload())
+    profile = _remote_profile()
+    client = TestClient(
+        create_sidecar_app_for_project(
+            project,
+            profile,
+            transport_factory=lambda _profile: _ApiDryRunTransport(),
+        )
+    )
+
+    response = client.get(
+        "/openevo-api/desktop/run",
+        headers={"X-OpenEvo-Sidecar-Token": "wrong-token"},
+    )
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Invalid OpenEvo sidecar token."
+
+
+def test_run_status_endpoint_requires_launched_run() -> None:
+    project = ScienceProjectConfig.model_validate(_science_project_payload())
+    profile = _remote_profile()
+    client = TestClient(
+        create_sidecar_app_for_project(
+            project,
+            profile,
+            transport_factory=lambda _profile: _ApiDryRunTransport(),
+        )
+    )
+    token = _sidecar_token(client)
+
+    response = client.get(
+        "/openevo-api/desktop/run",
+        headers={"X-OpenEvo-Sidecar-Token": token},
+    )
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "No Desktop run has been launched."
 
 
 def test_run_response_schema_has_structured_report_contract() -> None:
@@ -962,11 +1063,12 @@ def test_run_response_schema_has_structured_report_contract() -> None:
 
     response_schema = schema["components"]["schemas"]["OpenEvoDesktopRunResponse"]
     run_ref = response_schema["properties"]["run"]["$ref"]
-    assert run_ref == "#/components/schemas/OpenEvoDesktopRunReport"
-    run_schema = schema["components"]["schemas"]["OpenEvoDesktopRunReport"]
+    assert run_ref == "#/components/schemas/OpenEvoDesktopRunStatus"
+    run_schema = schema["components"]["schemas"]["OpenEvoDesktopRunStatus"]
     assert set(run_schema["required"]) == {
+        "id",
+        "state",
         "ready",
-        "status",
         "command",
         "return_code",
         "stdout",
@@ -974,8 +1076,13 @@ def test_run_response_schema_has_structured_report_contract() -> None:
         "output_dir",
         "experiment_snapshot",
         "started_at",
+        "finished_at",
     }
-    assert run_schema["properties"]["status"]["enum"] == ["pass", "fail"]
+    assert run_schema["properties"]["state"]["enum"] == [
+        "running",
+        "succeeded",
+        "failed",
+    ]
     assert run_schema["properties"]["output_dir"]["type"] == "string"
 
 
@@ -1059,6 +1166,21 @@ def _prepare_workspace_and_bootstrap(
     bootstrap = client.post("/openevo-api/desktop/bootstrap", headers=headers)
     assert bootstrap.status_code == 200
     return bootstrap.json()
+
+
+def _wait_latest_run_state(
+    client: TestClient,
+    headers: dict[str, str],
+    expected_state: str,
+) -> dict:
+    for _ in range(50):
+        response = client.get("/openevo-api/desktop/run", headers=headers)
+        assert response.status_code == 200
+        payload = response.json()
+        if payload["run"]["state"] == expected_state:
+            return payload
+        time.sleep(0.05)
+    raise AssertionError(f"latest run did not reach {expected_state}")
 
 
 class _ApiDryRunTransport:

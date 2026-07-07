@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   fetchOpenEvoDesktopShellModel,
+  pollOpenEvoRunStatus,
   runOpenEvoBootstrap,
   runOpenEvoStartRun,
   runOpenEvoWorkspaceSync,
@@ -225,13 +226,55 @@ describe("OpenEvo sidecar client", () => {
     await fetchOpenEvoDesktopShellModel();
     const response = await runOpenEvoStartRun();
 
-    expect(response.run.ready).toBe(true);
-    expect(response.run.output_dir).toBe(
-      "/home/alice/.openevo/runs/protein/folding/runs/latest",
+    expect(response.run.id).toBe("run_20260707170000000000");
+    expect(response.run.state).toBe("running");
+    expect(response.run.ready).toBe(false);
+    expect(response.run.outputDir).toBe(
+      "/home/alice/.openevo/runs/protein/folding/runs/run_20260707170000000000",
     );
+    expect(response.run.finishedAt).toBeNull();
     expect(calls).toHaveLength(2);
     expect(calls[1]).toMatchObject({ path: "/openevo-api/desktop/run" });
     expect(calls[1].headers.get("X-OpenEvo-Sidecar-Token")).toBe("run-token");
+  });
+
+  it("sends the sidecar mutation token on run status polling", async () => {
+    const calls: Array<{ path: string; headers: Headers; method: string }> = [];
+    const shellPayload = sidecarShellPayload("poll-token");
+    vi.spyOn(globalThis, "fetch").mockImplementation(
+      async (input, init) => {
+        const path = String(input);
+        calls.push({
+          path,
+          headers: new Headers(init?.headers),
+          method: init?.method ?? "GET",
+        });
+        if (path === "/openevo-api/desktop/shell") {
+          return jsonResponse(shellPayload);
+        }
+        if (path === "/openevo-api/desktop/run") {
+          return jsonResponse({
+            run: sidecarRunReport({ state: "succeeded" }),
+            status: shellPayload,
+          });
+        }
+        return new Response("not found", { status: 404 });
+      },
+    );
+
+    await fetchOpenEvoDesktopShellModel();
+    const response = await pollOpenEvoRunStatus();
+
+    expect(response.run.state).toBe("succeeded");
+    expect(response.run.ready).toBe(true);
+    expect(response.run.returnCode).toBe(0);
+    expect(response.run.finishedAt).toBe("2026-07-07T17:01:00+00:00");
+    expect(calls).toHaveLength(2);
+    expect(calls[1]).toMatchObject({
+      path: "/openevo-api/desktop/run",
+      method: "GET",
+    });
+    expect(calls[1].headers.get("X-OpenEvo-Sidecar-Token")).toBe("poll-token");
   });
 
   it("sends the sidecar mutation token on project config requests", async () => {
@@ -326,18 +369,27 @@ function sidecarShellPayload(mutationToken: string) {
   };
 }
 
-function sidecarRunReport() {
+function sidecarRunReport({
+  state = "running",
+}: {
+  state?: "running" | "succeeded" | "failed";
+} = {}) {
+  const succeeded = state === "succeeded";
+  const failed = state === "failed";
   return {
-    ready: true,
-    status: "pass",
+    id: "run_20260707170000000000",
+    state,
+    ready: succeeded,
     command:
-      "openevo run /home/alice/.openevo/runs/protein/folding/experiment.json --output-dir /home/alice/.openevo/runs/protein/folding/runs/latest --json",
-    return_code: 0,
-    stdout: "ok",
-    stderr: "",
-    output_dir: "/home/alice/.openevo/runs/protein/folding/runs/latest",
+      "openevo run /home/alice/.openevo/runs/protein/folding/experiment.json --output-dir /home/alice/.openevo/runs/protein/folding/runs/run_20260707170000000000 --json",
+    return_code: state === "running" ? null : succeeded ? 0 : 2,
+    stdout: succeeded ? "ok" : "",
+    stderr: failed ? "run failed" : "",
+    output_dir:
+      "/home/alice/.openevo/runs/protein/folding/runs/run_20260707170000000000",
     experiment_snapshot: "/home/alice/.openevo/runs/protein/folding/experiment.json",
     started_at: "2026-07-07T16:00:00+00:00",
+    finished_at: state === "running" ? null : "2026-07-07T17:01:00+00:00",
   };
 }
 

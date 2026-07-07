@@ -116,9 +116,10 @@ export interface OpenEvoWorkspaceResponse {
   status: OpenEvoDesktopShellModel;
 }
 
-export interface OpenEvoRunReport {
+export interface OpenEvoRunStatusPayload {
+  id: string;
+  state: "running" | "succeeded" | "failed";
   ready: boolean;
-  status: "pass" | "fail";
   command: string;
   return_code: number | null;
   stdout: string;
@@ -126,15 +127,30 @@ export interface OpenEvoRunReport {
   output_dir: string;
   experiment_snapshot: string;
   started_at: string;
+  finished_at: string | null;
+}
+
+export interface OpenEvoRunStatus {
+  id: string;
+  state: "running" | "succeeded" | "failed";
+  ready: boolean;
+  command: string;
+  returnCode: number | null;
+  stdout: string;
+  stderr: string;
+  outputDir: string;
+  experimentSnapshot: string;
+  startedAt: string;
+  finishedAt: string | null;
 }
 
 export interface OpenEvoRunResponsePayload {
-  run: OpenEvoRunReport;
+  run: OpenEvoRunStatusPayload;
   status: OpenEvoDesktopShellStatusPayload;
 }
 
 export interface OpenEvoRunResponse {
-  run: OpenEvoRunReport;
+  run: OpenEvoRunStatus;
   status: OpenEvoDesktopShellModel;
 }
 
@@ -213,7 +229,22 @@ export async function runOpenEvoStartRun(): Promise<OpenEvoRunResponse> {
   );
   rememberOpenEvoSidecarMutationToken(payload.status);
   return {
-    run: payload.run,
+    run: toOpenEvoRunStatus(payload.run),
+    status: toOpenEvoDesktopShellModel(payload.status),
+  };
+}
+
+export async function pollOpenEvoRunStatus(): Promise<OpenEvoRunResponse> {
+  const headers = sidecarMutationToken
+    ? { [sidecarMutationTokenHeader]: sidecarMutationToken }
+    : undefined;
+  const payload = await api.get<OpenEvoRunResponsePayload>(
+    "/openevo-api/desktop/run",
+    headers,
+  );
+  rememberOpenEvoSidecarMutationToken(payload.status);
+  return {
+    run: toOpenEvoRunStatus(payload.run),
     status: toOpenEvoDesktopShellModel(payload.status),
   };
 }
@@ -230,6 +261,24 @@ export function toOpenEvoBootstrapResponse(
     },
     report: payload.report,
     status: toOpenEvoDesktopShellModel(payload.status),
+  };
+}
+
+export function toOpenEvoRunStatus(
+  payload: OpenEvoRunStatusPayload,
+): OpenEvoRunStatus {
+  return {
+    id: payload.id,
+    state: payload.state,
+    ready: payload.ready,
+    command: payload.command,
+    returnCode: payload.return_code,
+    stdout: payload.stdout,
+    stderr: payload.stderr,
+    outputDir: payload.output_dir,
+    experimentSnapshot: payload.experiment_snapshot,
+    startedAt: payload.started_at,
+    finishedAt: payload.finished_at,
   };
 }
 

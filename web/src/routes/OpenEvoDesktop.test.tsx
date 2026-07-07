@@ -1,6 +1,6 @@
 // @vitest-environment happy-dom
 
-import { act } from "react";
+import { StrictMode, act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { renderToString } from "react-dom/server";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -12,6 +12,7 @@ import {
 
 const apiMocks = vi.hoisted(() => ({
   fetchOpenEvoDesktopShellModel: vi.fn(),
+  pollOpenEvoRunStatus: vi.fn(),
   runOpenEvoBootstrap: vi.fn(),
   runOpenEvoStartRun: vi.fn(),
   runOpenEvoWorkspaceSync: vi.fn(),
@@ -20,6 +21,7 @@ const apiMocks = vi.hoisted(() => ({
 
 vi.mock("../api/openevo", () => ({
   fetchOpenEvoDesktopShellModel: apiMocks.fetchOpenEvoDesktopShellModel,
+  pollOpenEvoRunStatus: apiMocks.pollOpenEvoRunStatus,
   runOpenEvoBootstrap: apiMocks.runOpenEvoBootstrap,
   runOpenEvoStartRun: apiMocks.runOpenEvoStartRun,
   runOpenEvoWorkspaceSync: apiMocks.runOpenEvoWorkspaceSync,
@@ -31,11 +33,15 @@ vi.mock("../api/openevo", () => ({
 describe("OpenEvoDesktop", () => {
   beforeEach(() => {
     apiMocks.fetchOpenEvoDesktopShellModel.mockReset();
+    apiMocks.pollOpenEvoRunStatus.mockReset();
     apiMocks.runOpenEvoBootstrap.mockReset();
     apiMocks.runOpenEvoStartRun.mockReset();
     apiMocks.runOpenEvoWorkspaceSync.mockReset();
     apiMocks.saveOpenEvoProjectConfig.mockReset();
     apiMocks.fetchOpenEvoDesktopShellModel.mockRejectedValue(
+      new Error("sidecar unavailable"),
+    );
+    apiMocks.pollOpenEvoRunStatus.mockRejectedValue(
       new Error("sidecar unavailable"),
     );
     apiMocks.runOpenEvoBootstrap.mockRejectedValue(
@@ -54,6 +60,7 @@ describe("OpenEvoDesktop", () => {
   });
 
   afterEach(() => {
+    vi.useRealTimers();
     document.body.innerHTML = "";
   });
 
@@ -229,6 +236,13 @@ describe("OpenEvoDesktop", () => {
       transcriptState: "planned",
       transcriptDetail: "Trajectory capture will start after the first run",
     });
+    const runningModel = modelWithRun({
+      projectName: "Loaded Science Project",
+      backendState: "running",
+      backendDetail: "OpenEvo run is running",
+      transcriptState: "running",
+      transcriptDetail: "Capturing transcript trajectory",
+    });
     const ranModel = modelWithRun({
       projectName: "Loaded Science Project",
       backendState: "ready",
@@ -237,8 +251,10 @@ describe("OpenEvoDesktop", () => {
       transcriptDetail: "Run completed and transcript captured",
     });
     apiMocks.fetchOpenEvoDesktopShellModel.mockResolvedValue(shellModel);
-    const deferred = deferRun(ranModel);
-    apiMocks.runOpenEvoStartRun.mockReturnValue(deferred.promise);
+    const launch = deferRun(runningModel, runStatus("running"));
+    const poll = deferRun(ranModel, runStatus("succeeded"));
+    apiMocks.runOpenEvoStartRun.mockReturnValue(launch.promise);
+    apiMocks.pollOpenEvoRunStatus.mockReturnValue(poll.promise);
 
     const root = await renderClient();
     await flushEffects();
@@ -259,17 +275,247 @@ describe("OpenEvoDesktop", () => {
     expect(document.body.textContent).toContain("Running");
 
     await act(async () => {
-      deferred.resolve({
-        run: { ready: true },
+      launch.resolve({
+        run: runStatus("running"),
+        status: runningModel,
+      });
+      await Promise.resolve();
+    });
+
+    expect(apiMocks.pollOpenEvoRunStatus).toHaveBeenCalledTimes(1);
+    expect(document.body.textContent).toContain("run_20260707170000000000");
+    expect(document.body.textContent).toContain("running");
+
+    await act(async () => {
+      poll.resolve({
+        run: runStatus("succeeded"),
         status: ranModel,
       });
       await Promise.resolve();
     });
 
+    expect(document.body.textContent).toContain("succeeded");
+    expect(document.body.textContent).toContain(
+      "/home/alice/.openevo/runs/protein/folding/runs/run_20260707170000000000",
+    );
+    expect(document.body.textContent).toContain("ok");
     expect(document.body.textContent).toContain("Last run completed");
     expect(document.body.textContent).toContain(
       "Run completed and transcript captured",
     );
+    await unmountClient(root);
+  });
+
+  it("updates run state after the StrictMode mount cleanup probe", async () => {
+    const shellModel = modelWithRun({
+      projectName: "Loaded Science Project",
+      backendState: "planned",
+      backendDetail: "Service supervisor integration is next",
+      transcriptState: "planned",
+      transcriptDetail: "Trajectory capture will start after the first run",
+    });
+    const runningModel = modelWithRun({
+      projectName: "Loaded Science Project",
+      backendState: "running",
+      backendDetail: "OpenEvo run is running",
+      transcriptState: "running",
+      transcriptDetail: "Capturing transcript trajectory",
+    });
+    const ranModel = modelWithRun({
+      projectName: "Loaded Science Project",
+      backendState: "ready",
+      backendDetail: "Last run completed",
+      transcriptState: "complete",
+      transcriptDetail: "Run completed and transcript captured",
+    });
+    apiMocks.fetchOpenEvoDesktopShellModel.mockResolvedValue(shellModel);
+    apiMocks.runOpenEvoStartRun.mockResolvedValue({
+      run: runStatus("running"),
+      status: runningModel,
+    });
+    apiMocks.pollOpenEvoRunStatus.mockResolvedValue({
+      run: runStatus("succeeded"),
+      status: ranModel,
+    });
+
+    const root = await renderClient({ strict: true });
+    await flushEffects();
+
+    await act(async () => {
+      buttonByText("Start Run").dispatchEvent(
+        new MouseEvent("click", { bubbles: true }),
+      );
+      await Promise.resolve();
+    });
+
+    expect(document.body.textContent).toContain("succeeded");
+    expect(document.body.textContent).toContain("run_20260707170000000000");
+    expect(document.body.textContent).toContain("Last run completed");
+    await unmountClient(root);
+  });
+
+  it("does not continue polling after unmount", async () => {
+    vi.useFakeTimers();
+    const shellModel = modelWithRun({
+      projectName: "Loaded Science Project",
+      backendState: "planned",
+      backendDetail: "Service supervisor integration is next",
+      transcriptState: "planned",
+      transcriptDetail: "Trajectory capture will start after the first run",
+    });
+    const runningModel = modelWithRun({
+      projectName: "Loaded Science Project",
+      backendState: "running",
+      backendDetail: "OpenEvo run is running",
+      transcriptState: "running",
+      transcriptDetail: "Capturing transcript trajectory",
+    });
+    apiMocks.fetchOpenEvoDesktopShellModel.mockResolvedValue(shellModel);
+    const launch = deferRun(runningModel, runStatus("running"));
+    const poll = deferRun(runningModel, runStatus("running"));
+    apiMocks.runOpenEvoStartRun.mockReturnValue(launch.promise);
+    apiMocks.pollOpenEvoRunStatus.mockReturnValue(poll.promise);
+
+    const root = await renderClient();
+    await flushEffects();
+
+    await act(async () => {
+      buttonByText("Start Run").dispatchEvent(
+        new MouseEvent("click", { bubbles: true }),
+      );
+    });
+    await act(async () => {
+      launch.resolve({
+        run: runStatus("running"),
+        status: runningModel,
+      });
+      await Promise.resolve();
+    });
+    expect(apiMocks.pollOpenEvoRunStatus).toHaveBeenCalledTimes(1);
+
+    await unmountClient(root);
+    await act(async () => {
+      poll.resolve({
+        run: runStatus("running"),
+        status: runningModel,
+      });
+      await Promise.resolve();
+      vi.advanceTimersByTime(1000);
+      await Promise.resolve();
+    });
+
+    expect(apiMocks.pollOpenEvoRunStatus).toHaveBeenCalledTimes(1);
+  });
+
+  it("clears the latest run when a new project config is saved", async () => {
+    const shellModel = getOpenEvoDesktopShellModel();
+    const runningModel = modelWithRun({
+      projectName: "Loaded Science Project",
+      backendState: "running",
+      backendDetail: "OpenEvo run is running",
+      transcriptState: "running",
+      transcriptDetail: "Capturing transcript trajectory",
+    });
+    const savedModel = {
+      ...shellModel,
+      project: {
+        ...shellModel.project,
+        name: "Configured Science Project",
+      },
+    };
+    apiMocks.fetchOpenEvoDesktopShellModel.mockResolvedValue(shellModel);
+    apiMocks.runOpenEvoStartRun.mockResolvedValue({
+      run: runStatus("running"),
+      status: runningModel,
+    });
+    apiMocks.pollOpenEvoRunStatus.mockResolvedValue({
+      run: runStatus("failed"),
+      status: modelWithRun({
+        projectName: "Loaded Science Project",
+        backendState: "blocked",
+        backendDetail: "run failed",
+        transcriptState: "blocked",
+        transcriptDetail: "run failed",
+      }),
+    });
+    apiMocks.saveOpenEvoProjectConfig.mockResolvedValue({
+      config: {
+        science_config_path:
+          "/home/alice/.openevo/desktop/projects/configured/science.yaml",
+        remote_profile_path:
+          "/home/alice/.openevo/desktop/profiles/science-team.yaml",
+      },
+      status: savedModel,
+    });
+
+    const root = await renderClient();
+    await flushEffects();
+
+    await act(async () => {
+      buttonByText("Start Run").dispatchEvent(
+        new MouseEvent("click", { bubbles: true }),
+      );
+      await Promise.resolve();
+    });
+    expect(document.body.textContent).toContain("run_20260707170000000000");
+
+    await act(async () => {
+      buttonByText("Save Config").dispatchEvent(
+        new MouseEvent("click", { bubbles: true }),
+      );
+      await Promise.resolve();
+    });
+
+    expect(document.body.textContent).toContain("Configured Science Project");
+    expect(document.body.textContent).not.toContain("run_20260707170000000000");
+    await unmountClient(root);
+  });
+
+  it("renders failed run status and stderr after polling", async () => {
+    const shellModel = modelWithRun({
+      projectName: "Loaded Science Project",
+      backendState: "planned",
+      backendDetail: "Service supervisor integration is next",
+      transcriptState: "planned",
+      transcriptDetail: "Trajectory capture will start after the first run",
+    });
+    const runningModel = modelWithRun({
+      projectName: "Loaded Science Project",
+      backendState: "running",
+      backendDetail: "OpenEvo run is running",
+      transcriptState: "running",
+      transcriptDetail: "Capturing transcript trajectory",
+    });
+    const failedModel = modelWithRun({
+      projectName: "Loaded Science Project",
+      backendState: "blocked",
+      backendDetail: "run failed",
+      transcriptState: "blocked",
+      transcriptDetail: "run failed",
+    });
+    apiMocks.fetchOpenEvoDesktopShellModel.mockResolvedValue(shellModel);
+    apiMocks.runOpenEvoStartRun.mockResolvedValue({
+      run: runStatus("running"),
+      status: runningModel,
+    });
+    apiMocks.pollOpenEvoRunStatus.mockResolvedValue({
+      run: runStatus("failed"),
+      status: failedModel,
+    });
+
+    const root = await renderClient();
+    await flushEffects();
+
+    await act(async () => {
+      buttonByText("Start Run").dispatchEvent(
+        new MouseEvent("click", { bubbles: true }),
+      );
+      await Promise.resolve();
+    });
+
+    expect(document.body.textContent).toContain("failed");
+    expect(document.body.textContent).toContain("run failed");
+    expect(document.body.textContent).toContain("2");
     await unmountClient(root);
   });
 
@@ -385,12 +631,20 @@ describe("OpenEvoDesktop", () => {
   });
 });
 
-async function renderClient(): Promise<Root> {
+async function renderClient({ strict = false }: { strict?: boolean } = {}): Promise<Root> {
   const container = document.createElement("div");
   document.body.appendChild(container);
   const root = createRoot(container);
   await act(async () => {
-    root.render(<OpenEvoDesktop />);
+    root.render(
+      strict ? (
+        <StrictMode>
+          <OpenEvoDesktop />
+        </StrictMode>
+      ) : (
+        <OpenEvoDesktop />
+      ),
+    );
   });
   return root;
 }
@@ -574,7 +828,7 @@ function deferWorkspace(status: OpenEvoDesktopShellModel) {
   return { promise, resolve, status };
 }
 
-function deferRun(status: OpenEvoDesktopShellModel) {
+function deferRun(status: OpenEvoDesktopShellModel, run: Record<string, any>) {
   let resolve!: (value: {
     run: Record<string, any>;
     status: OpenEvoDesktopShellModel;
@@ -585,7 +839,25 @@ function deferRun(status: OpenEvoDesktopShellModel) {
   }>((next) => {
     resolve = next;
   });
-  return { promise, resolve, status };
+  return { promise, resolve, run, status };
+}
+
+function runStatus(state: "running" | "succeeded" | "failed") {
+  return {
+    id: "run_20260707170000000000",
+    state,
+    ready: state === "succeeded",
+    command:
+      "openevo run /home/alice/.openevo/runs/protein/folding/experiment.json --output-dir /home/alice/.openevo/runs/protein/folding/runs/run_20260707170000000000 --json",
+    returnCode: state === "running" ? null : state === "succeeded" ? 0 : 2,
+    stdout: state === "succeeded" ? "ok" : "",
+    stderr: state === "failed" ? "run failed" : "",
+    outputDir:
+      "/home/alice/.openevo/runs/protein/folding/runs/run_20260707170000000000",
+    experimentSnapshot: "/home/alice/.openevo/runs/protein/folding/experiment.json",
+    startedAt: "2026-07-07T16:00:00+00:00",
+    finishedAt: state === "running" ? null : "2026-07-07T17:01:00+00:00",
+  };
 }
 
 function deferProjectConfig(status: OpenEvoDesktopShellModel) {

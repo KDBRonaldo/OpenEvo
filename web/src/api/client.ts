@@ -38,7 +38,8 @@ async function request<T>(
 }
 
 export const api = {
-  get: <T>(path: string) => request<T>("GET", path),
+  get: <T>(path: string, headers?: HeadersInit) =>
+    request<T>("GET", path, undefined, headers),
   post: <T>(path: string, body: unknown, headers?: HeadersInit) =>
     request<T>("POST", path, body, headers),
   delete: <T>(path: string) => request<T>("DELETE", path),

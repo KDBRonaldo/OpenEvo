@@ -13,14 +13,16 @@ import {
   ShieldCheck,
   Upload,
 } from "lucide-react";
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import {
   fetchOpenEvoDesktopShellModel,
+  pollOpenEvoRunStatus,
   runOpenEvoBootstrap,
   runOpenEvoStartRun,
   runOpenEvoWorkspaceSync,
   saveOpenEvoProjectConfig,
   type OpenEvoProjectConfigDraft,
+  type OpenEvoRunStatus,
 } from "../api/openevo";
 import {
   type EvolutionStepState,
@@ -53,11 +55,15 @@ export function OpenEvoDesktop() {
   const [bootstrapError, setBootstrapError] = useState<string | null>(null);
   const [runRunning, setRunRunning] = useState(false);
   const [runError, setRunError] = useState<string | null>(null);
+  const [latestRun, setLatestRun] = useState<OpenEvoRunStatus | null>(null);
   const [configSaving, setConfigSaving] = useState(false);
   const [configError, setConfigError] = useState<string | null>(null);
   const [configDraft, setConfigDraft] = useState<OpenEvoProjectConfigDraft>(() =>
     draftFromModel(getOpenEvoDesktopShellModel()),
   );
+  const mounted = useRef(true);
+  const runPollGeneration = useRef(0);
+  const runPollTimer = useRef<number | null>(null);
   const summary = getOpenEvoTimelineSummary(model);
 
   useEffect(() => {
@@ -78,12 +84,39 @@ export function OpenEvoDesktop() {
     };
   }, []);
 
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+      invalidateRunPolling();
+    };
+  }, []);
+
+  const clearRunPollTimer = () => {
+    if (runPollTimer.current !== null) {
+      window.clearTimeout(runPollTimer.current);
+      runPollTimer.current = null;
+    }
+  };
+
+  const invalidateRunPolling = () => {
+    runPollGeneration.current += 1;
+    clearRunPollTimer();
+  };
+
+  const clearLatestRunForContextChange = () => {
+    invalidateRunPolling();
+    setRunRunning(false);
+    setLatestRun(null);
+  };
+
   const handleWorkspaceSync = async () => {
     setWorkspaceRunning(true);
     setWorkspaceError(null);
     try {
       const response = await runOpenEvoWorkspaceSync();
       setModel(response.status);
+      clearLatestRunForContextChange();
       setSidecarConnected(true);
     } catch (error) {
       const message =
@@ -125,6 +158,7 @@ export function OpenEvoDesktop() {
       const response = await saveOpenEvoProjectConfig(submittedDraft);
       setModel(response.status);
       setConfigDraft(submittedDraft);
+      clearLatestRunForContextChange();
       setSidecarConnected(true);
     } catch (error) {
       const message =
@@ -141,6 +175,7 @@ export function OpenEvoDesktop() {
     try {
       const response = await runOpenEvoBootstrap();
       setModel(response.status);
+      clearLatestRunForContextChange();
       setSidecarConnected(true);
     } catch (error) {
       const message = error instanceof Error ? error.message : "Bootstrap failed";
@@ -151,16 +186,56 @@ export function OpenEvoDesktop() {
   };
 
   const handleStartRun = async () => {
+    invalidateRunPolling();
+    const generation = runPollGeneration.current;
     setRunRunning(true);
     setRunError(null);
     try {
       const response = await runOpenEvoStartRun();
+      if (!mounted.current || generation !== runPollGeneration.current) {
+        return;
+      }
       setModel(response.status);
+      setLatestRun(response.run);
       setSidecarConnected(true);
+      if (response.run.state === "running") {
+        void pollLatestRun(generation);
+      } else {
+        setRunRunning(false);
+      }
     } catch (error) {
+      if (!mounted.current || generation !== runPollGeneration.current) {
+        return;
+      }
       const message = error instanceof Error ? error.message : "Run launch failed";
       setRunError(message);
-    } finally {
+      setRunRunning(false);
+    }
+  };
+
+  const pollLatestRun = async (generation: number) => {
+    clearRunPollTimer();
+    try {
+      const response = await pollOpenEvoRunStatus();
+      if (!mounted.current || generation !== runPollGeneration.current) {
+        return;
+      }
+      setModel(response.status);
+      setLatestRun(response.run);
+      setSidecarConnected(true);
+      if (response.run.state === "running") {
+        runPollTimer.current = window.setTimeout(() => {
+          void pollLatestRun(generation);
+        }, 1000);
+      } else {
+        setRunRunning(false);
+      }
+    } catch (error) {
+      if (!mounted.current || generation !== runPollGeneration.current) {
+        return;
+      }
+      const message = error instanceof Error ? error.message : "Run status failed";
+      setRunError(message);
       setRunRunning(false);
     }
   };
@@ -484,6 +559,32 @@ export function OpenEvoDesktop() {
         </div>
       </Panel>
 
+      {latestRun ? (
+        <Panel title="Run Status" icon={<Play size={17} />}>
+          <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
+            <Field label="Run ID" value={latestRun.id} />
+            <Field label="State" value={latestRun.state} />
+            <Field
+              label="Return code"
+              value={
+                latestRun.returnCode === null
+                  ? "pending"
+                  : String(latestRun.returnCode)
+              }
+            />
+            <Field label="Output dir" value={latestRun.outputDir} wide />
+            <Field label="Started" value={latestRun.startedAt} />
+            <Field label="Finished" value={latestRun.finishedAt ?? "pending"} />
+            {latestRun.stdout ? (
+              <LogBlock label="stdout" value={latestRun.stdout} />
+            ) : null}
+            {latestRun.stderr ? (
+              <LogBlock label="stderr" value={latestRun.stderr} />
+            ) : null}
+          </div>
+        </Panel>
+      ) : null}
+
       <section className="grid grid-cols-1 gap-4 lg:grid-cols-3">
         <QuickAction
           icon={<GitBranch size={16} />}
@@ -590,6 +691,17 @@ function Field({
     <div className={wide ? "md:col-span-2" : undefined}>
       <div className="text-xs font-medium uppercase text-slate-500">{label}</div>
       <div className="mt-1 text-sm leading-6 text-slate-900">{value}</div>
+    </div>
+  );
+}
+
+function LogBlock({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="lg:col-span-3">
+      <div className="text-xs font-medium uppercase text-slate-500">{label}</div>
+      <pre className="mt-1 max-h-36 overflow-auto rounded-md bg-slate-950 px-3 py-2 text-xs leading-5 text-slate-50">
+        {value}
+      </pre>
     </div>
   );
 }

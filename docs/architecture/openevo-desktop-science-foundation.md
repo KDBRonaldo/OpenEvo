@@ -199,16 +199,24 @@ latest bootstrap report contains both `prepared_paths.experiment_snapshot` and
 paths:
 
 ```bash
-openevo run <experiment_snapshot> --output-dir <state_root>/runs/latest --json
+openevo run <experiment_snapshot> --output-dir <state_root>/runs/<run-id> --json
 ```
 
-The sidecar executes that command through the configured remote transport with
-`cwd=<state_root>` and returns a run report containing readiness, status,
-command, return code, stdout, stderr, output directory, experiment snapshot, and
-start timestamp. A passing command marks the OpenEvo backend service ready and
-the transcript evolution row complete. A failing command still returns HTTP 200
-with `run.ready=false`, and the refreshed shell status marks those rows blocked
-with the command error.
+The sidecar supervises that command as a background job in the local sidecar
+process. `POST /openevo-api/desktop/run` records a `run_<timestamp>` id, stores
+a running status, starts a daemon thread that executes the command through the
+configured remote transport with `cwd=<state_root>`, and returns immediately.
+The returned run status includes the run id, state, readiness, command, return
+code, stdout/stderr snapshots, output directory, experiment snapshot, start
+timestamp, and finish timestamp.
+
+Desktop polls `GET /openevo-api/desktop/run` with the same sidecar mutation
+token to recover the latest run state and refreshed shell status. While the run
+is active, the OpenEvo backend service and transcript evolution row are marked
+`running`. A passing terminal status marks the OpenEvo backend service ready and
+the transcript evolution row complete. A failing terminal status still returns
+HTTP 200 from the polling endpoint with `run.ready=false`, and the refreshed
+shell status marks those rows blocked with the command error.
 
 The sidecar generates a per-process mutation token and includes it in
 `GET /openevo-api/desktop/shell` under `sidecar.mutation_token`. Mutating
@@ -224,17 +232,19 @@ actions are written under a shared status lock so concurrent workspace and
 bootstrap runs do not clobber each other's service rows.
 
 Dry-run serve mode is intended for local UI development and smoke tests. It
-exercises the same planning and report mapping path, but it does not mutate the
-remote server. A dry-run report can therefore show the UI path as ready without
-proving that task workspaces, Docker images, or Hugging Face models were
-actually prepared. Real remote preparation requires `--transport ssh`.
+exercises the same planning, status, and polling path, but it does not mutate
+the remote server. A dry-run report can therefore show the UI path as ready
+without proving that task workspaces, Docker images, or Hugging Face models were
+actually prepared. Real remote preparation and run execution require
+`--transport ssh`.
 
-This slice does not add a long-running supervisor or Electron process manager.
-`POST /desktop/run` is a synchronous launch/report boundary only; it does not
-stream logs, expose cancel or resume, keep a background job table, restart the
-sidecar process, or start vLLM, Polar gateway, rollout, or evolution worker
+This slice adds only a local sidecar run supervisor with one latest run per
+config-backed session. It does not survive sidecar process restarts, stream
+incremental remote log files, cancel remote process groups, expose resume,
+restart the sidecar process, start vLLM, start Polar gateway, run Docker
+Compose, manage dynamic adapters, or supervise rollout/evolution worker
 services independently. Those operations remain behind the remote lifecycle
-contracts until a supervisor is added.
+contracts until dedicated service supervisors are added.
 
 ## CLI
 

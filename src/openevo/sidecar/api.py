@@ -10,7 +10,7 @@ import re
 import secrets
 import shlex
 from typing import Any, Literal
-from threading import Lock
+from threading import Lock, Thread
 
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.encoders import jsonable_encoder
@@ -163,9 +163,10 @@ class OpenEvoDesktopProjectConfigResponse(_StrictFrozenModel):
     status: OpenEvoDesktopShellStatus
 
 
-class OpenEvoDesktopRunReport(_StrictFrozenModel):
+class OpenEvoDesktopRunStatus(_StrictFrozenModel):
+    id: str
+    state: Literal["running", "succeeded", "failed"]
     ready: bool
-    status: Literal["pass", "fail"]
     command: str
     return_code: int | None
     stdout: str
@@ -173,10 +174,21 @@ class OpenEvoDesktopRunReport(_StrictFrozenModel):
     output_dir: str
     experiment_snapshot: str
     started_at: str
+    finished_at: str | None
+
+    @model_validator(mode="after")
+    def _validate_ready_state(self) -> OpenEvoDesktopRunStatus:
+        if self.ready != (self.state == "succeeded"):
+            raise ValueError("ready must be true only for succeeded runs")
+        if self.state == "running" and self.finished_at is not None:
+            raise ValueError("running runs must not have finished_at")
+        if self.state != "running" and self.finished_at is None:
+            raise ValueError("terminal runs must have finished_at")
+        return self
 
 
 class OpenEvoDesktopRunResponse(_StrictFrozenModel):
-    run: OpenEvoDesktopRunReport
+    run: OpenEvoDesktopRunStatus
     status: OpenEvoDesktopShellStatus
 
 
@@ -188,7 +200,7 @@ class OpenEvoSidecarSession:
     status: OpenEvoDesktopShellStatus
     last_workspace_report: object | None = None
     last_bootstrap_report: object | None = None
-    last_run_report: object | None = None
+    latest_run: OpenEvoDesktopRunStatus | None = None
     status_lock: LockType = field(default_factory=Lock)
     workspace_lock: LockType = field(default_factory=Lock)
     bootstrap_lock: LockType = field(default_factory=Lock)
@@ -535,24 +547,61 @@ def create_sidecar_app(
                 )
         try:
             experiment_snapshot, state_root = _run_ready_context(active_session)
-            report = _run_openevo_task(
-                active_session,
+            run_status = _initial_run_status(
                 experiment_snapshot=experiment_snapshot,
                 state_root=state_root,
             )
             with active_session.status_lock:
-                active_session.last_run_report = report
+                active_session.latest_run = run_status
                 active_session.status = _status_after_run(
                     active_session.status,
-                    report,
+                    run_status,
                 )
                 response_status = _status_with_mutation_token(
                     active_session.status,
                     sidecar_token,
                 )
-        finally:
+            Thread(
+                target=_finish_openevo_task_run,
+                args=(active_session, run_status, state_root),
+                daemon=True,
+            ).start()
+        except Exception:
             active_session.run_lock.release()
-        return OpenEvoDesktopRunResponse(run=report, status=response_status)
+            raise
+        return OpenEvoDesktopRunResponse(run=run_status, status=response_status)
+
+    @app.get(
+        "/openevo-api/desktop/run",
+        response_model=OpenEvoDesktopRunResponse,
+    )
+    def latest_run(
+        token: str | None = Header(
+            default=None,
+            alias=SIDECAR_MUTATION_TOKEN_HEADER,
+        ),
+    ) -> OpenEvoDesktopRunResponse:
+        _validate_mutation_token(token, sidecar_token)
+        active_session = current_session()
+        if active_session is None:
+            raise HTTPException(
+                status_code=409,
+                detail="Desktop run status requires a config-backed sidecar session.",
+            )
+        with active_session.status_lock:
+            if active_session.latest_run is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail="No Desktop run has been launched.",
+                )
+            response_status = _status_with_mutation_token(
+                active_session.status,
+                sidecar_token,
+            )
+            return OpenEvoDesktopRunResponse(
+                run=active_session.latest_run,
+                status=response_status,
+            )
 
     return app
 
@@ -727,47 +776,83 @@ def _run_ready_context(session: OpenEvoSidecarSession) -> tuple[str, str]:
     return experiment_snapshot, state_root
 
 
-def _run_openevo_task(
-    session: OpenEvoSidecarSession,
+def _initial_run_status(
     *,
     experiment_snapshot: str,
     state_root: str,
-) -> OpenEvoDesktopRunReport:
-    output_dir = posixpath.join(state_root, "runs", "latest")
+) -> OpenEvoDesktopRunStatus:
+    run_id = "run_" + datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S%f")
+    output_dir = posixpath.join(state_root, "runs", run_id)
     command = (
         f"openevo run {shlex.quote(experiment_snapshot)} "
         f"--output-dir {shlex.quote(output_dir)} --json"
     )
-    started_at = datetime.now(timezone.utc).isoformat()
+    return OpenEvoDesktopRunStatus(
+        id=run_id,
+        state="running",
+        ready=False,
+        command=command,
+        return_code=None,
+        stdout="",
+        stderr="",
+        output_dir=output_dir,
+        experiment_snapshot=experiment_snapshot,
+        started_at=datetime.now(timezone.utc).isoformat(),
+        finished_at=None,
+    )
+
+
+def _finish_openevo_task_run(
+    session: OpenEvoSidecarSession,
+    started: OpenEvoDesktopRunStatus,
+    state_root: str,
+) -> None:
+    try:
+        finished = _run_openevo_task(
+            session,
+            started=started,
+            state_root=state_root,
+        )
+        with session.status_lock:
+            if session.latest_run is not None and session.latest_run.id == started.id:
+                session.latest_run = finished
+                session.status = _status_after_run(session.status, finished)
+    finally:
+        session.run_lock.release()
+
+
+def _run_openevo_task(
+    session: OpenEvoSidecarSession,
+    *,
+    started: OpenEvoDesktopRunStatus,
+    state_root: str,
+) -> OpenEvoDesktopRunStatus:
     try:
         result = session.transport_factory(session.profile).run(
-            command,
+            started.command,
             cwd=state_root,
             timeout_seconds=86400.0,
         )
     except Exception as exc:
-        return OpenEvoDesktopRunReport(
-            ready=False,
-            status="fail",
-            command=command,
-            return_code=None,
-            stdout="",
-            stderr=str(exc),
-            output_dir=output_dir,
-            experiment_snapshot=experiment_snapshot,
-            started_at=started_at,
+        return started.model_copy(
+            update={
+                "state": "failed",
+                "ready": False,
+                "return_code": None,
+                "stderr": str(exc),
+                "finished_at": datetime.now(timezone.utc).isoformat(),
+            }
         )
     ready = result.return_code == 0
-    return OpenEvoDesktopRunReport(
-        ready=ready,
-        status="pass" if ready else "fail",
-        command=command,
-        return_code=result.return_code,
-        stdout=result.stdout,
-        stderr=result.stderr,
-        output_dir=output_dir,
-        experiment_snapshot=experiment_snapshot,
-        started_at=started_at,
+    return started.model_copy(
+        update={
+            "state": "succeeded" if ready else "failed",
+            "ready": ready,
+            "return_code": result.return_code,
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+            "finished_at": datetime.now(timezone.utc).isoformat(),
+        }
     )
 
 
@@ -921,7 +1006,7 @@ def _bootstrap_blocked_detail(report) -> str:
 
 def _status_after_run(
     status: OpenEvoDesktopShellStatus,
-    report: OpenEvoDesktopRunReport,
+    report: OpenEvoDesktopRunStatus,
 ) -> OpenEvoDesktopShellStatus:
     return status.model_copy(
         update={
@@ -940,10 +1025,14 @@ def _status_after_run(
 def _service_after_run(
     service: DesktopServiceStatus,
     *,
-    report: OpenEvoDesktopRunReport,
+    report: OpenEvoDesktopRunStatus,
 ) -> DesktopServiceStatus:
     if service.id != "openevo-backend":
         return service
+    if report.state == "running":
+        return service.model_copy(
+            update={"state": "running", "detail": "OpenEvo run is running"}
+        )
     if report.ready:
         return service.model_copy(
             update={"state": "ready", "detail": "Last run completed"}
@@ -956,10 +1045,14 @@ def _service_after_run(
 def _evolution_after_run(
     step: DesktopEvolutionStep,
     *,
-    report: OpenEvoDesktopRunReport,
+    report: OpenEvoDesktopRunStatus,
 ) -> DesktopEvolutionStep:
     if step.id != "transcript":
         return step
+    if report.state == "running":
+        return step.model_copy(
+            update={"state": "running", "detail": "Capturing transcript trajectory"}
+        )
     if report.ready:
         return step.model_copy(
             update={
@@ -972,7 +1065,7 @@ def _evolution_after_run(
     )
 
 
-def _run_blocked_detail(report: OpenEvoDesktopRunReport) -> str:
+def _run_blocked_detail(report: OpenEvoDesktopRunStatus) -> str:
     stderr = report.stderr.strip()
     if stderr:
         return stderr
