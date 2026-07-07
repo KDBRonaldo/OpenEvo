@@ -512,7 +512,9 @@ flowchart TB
 - worker output 目录下的 `training.jsonl`，每行形如
   `{"messages": [...], "metadata": {...}}`。默认 projection 只包含成功轨迹；同一个
   successful record 中多个可训练 trace 会分别导出为多行。`terminal_bench_corrective_tool_call_policy`
-  是例外，它可以从 failed/zero-reward records 导出真实 prefix 的纠偏样本；
+  是例外，它可以从 failed/zero-reward records 导出真实 prefix 的纠偏样本。默认
+  `full_trace` 会保留 assistant `tool_calls`，即使对应 message 的 `content` 为空；如果
+  trace 提供 top-level `tools`，worker 也会把它写入对应 SFT JSONL 行；
 - `trainer.stdout.txt` 和 `trainer.stderr.txt`，用于排障；
 - `ArtifactRegisterRequest(type=parametric_memory)`；
 - `uri=file://.../adapter`，该目录会在 trainer 执行前清理旧内容，并且 trainer 必须写出
@@ -531,6 +533,32 @@ Trainer contract:
 - 对 Qwen/vLLM tool-use records，trainer 必须把 top-level `tools` 传入
   `tokenizer.apply_chat_template(..., tools=record["tools"])`，否则训练格式不会匹配 runtime 的
   `qwen3_xml` tool parser。
+
+Task-local Terminal Bench parametric jobs can be prepared without going through
+the event store:
+
+```sh
+uv run polar-evolution terminal-bench-task-local-parametric-memory-job \
+  --trajectory-pool /path/to/trajectory_pool.jsonl \
+  --task-id train-fasttext \
+  --output-root /tmp/tb21-task-local-parametric/train-fasttext \
+  --base-model Qwen/Qwen3.6-35B-A3B \
+  --adapter-id tb-parametric-memory-train-fasttext \
+  --trainer-command /root/evolab-vllm/bin/python \
+  --trainer-arg /path/to/train_lora.py \
+  --trainer-arg --train-file \
+  --trainer-arg '{training_dataset}' \
+  --trainer-arg --output-dir \
+  --trainer-arg '{adapter_dir}' \
+  --command-contains /app/model.bin \
+  --output /tmp/tb21-task-local-parametric/train-fasttext/job.json
+```
+
+The command selects tasks that have at least one failed and one successful pool
+row, reads successful Codex command events from `agent/codex.txt`, writes a
+standalone dataset artifact manifest plus `records.jsonl`, and emits a
+`parametric_memory_lora_sft` `WorkerClaimedJob` payload. It only invokes the
+trainer when `--run-worker` is set.
 
 Serving contract:
 

@@ -323,6 +323,41 @@ query-optimize
 make-mips-interpreter
 ```
 
+For task-local parametric-memory experiments, prefer building the SFT dataset
+from a trajectory pool that contains both failed and successful attempts for the
+same Terminal Bench task. This path does not ingest events into EvolutionStore;
+it writes a standalone dataset manifest, `records.jsonl`, and
+`WorkerClaimedJob` payload under `--output-root`. It extracts a successful
+Codex command from `agent/codex.txt`, pairs it with a failed trajectory summary,
+and exports a Qwen tool-call SFT record using the default `full_trace`
+projection. Use `--run-worker` only when the trainer is ready to run locally.
+
+```sh
+uv run polar-evolution terminal-bench-task-local-parametric-memory-job \
+  --trajectory-pool /home/jyw/openevo-skill-rl-experiments/pools/tb21-current-20260702/trajectory_pool.jsonl \
+  --task-id train-fasttext \
+  --output-root /tmp/tb21-task-local-parametric/train-fasttext \
+  --dataset-name tb21-task-local-train-fasttext \
+  --base-model Qwen/Qwen3.6-35B-A3B \
+  --adapter-id tb-parametric-memory-train-fasttext \
+  --trainer-command /root/evolab-vllm/bin/python \
+  --trainer-arg /path/to/train_lora.py \
+  --trainer-arg --train-file \
+  --trainer-arg '{training_dataset}' \
+  --trainer-arg --output-dir \
+  --trainer-arg '{adapter_dir}' \
+  --command-contains /app/model.bin \
+  --output /tmp/tb21-task-local-parametric/train-fasttext/job.json
+```
+
+The CLI normalizes repeated `--trainer-arg` values, so trainer flags such as
+`--train-file` and `--output-dir` are passed through as literal trainer
+arguments. The generated job still uses `parametric_memory_lora_sft`, so the
+trainer must render each JSONL row with the row-level `tools` value when tool
+schemas are present. `full_trace` now preserves assistant messages that contain
+`tool_calls` even when `content` is empty, and carries trace-level `tools` into
+`training.jsonl`.
+
 Create a parametric-memory job from successful Terminal Bench trajectories and
 run the local worker once:
 

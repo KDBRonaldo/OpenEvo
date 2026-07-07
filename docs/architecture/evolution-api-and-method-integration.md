@@ -550,7 +550,18 @@ mask；BPE 可能把 prompt 末尾 token 和 response 开头 token 合并。推�
 text 和 generation prefix，确认 full 以 prefix 开头，再分别用 `add_special_tokens=False`
 tokenize prefix 与 suffix，拼接 token ids，并只 mask prefix ids。对 Qwen/vLLM tool-use
 records，trainer 必须把 record-level `tools` 传给 `tokenizer.apply_chat_template`，使训练
-格式和 runtime 的 `qwen3_xml` parser 一致。
+格式和 runtime 的 `qwen3_xml` parser 一致。默认 `full_trace` projection 也会保留
+assistant `tool_calls` 空文本消息，并把 trace-level `tools` 写入 SFT JSONL 行，供这类
+trainer 复用。
+
+Task-local Terminal Bench parametric-memory jobs can also be prepared directly
+from a trajectory pool with
+`terminal-bench-task-local-parametric-memory-job`。这一路径要求同一 task 至少有一个失败
+trajectory 和一个成功 trajectory，读取成功 trial 的 `agent/codex.txt` command event，生成
+standalone dataset manifest、`records.jsonl` 和 `parametric_memory_lora_sft`
+`WorkerClaimedJob` JSON。它不写 EvolutionStore；只有显式 `--run-worker` 时才调用本地
+reference method。该路径用于本地/proxy inference 的 parametric-memory ablation，不适用于
+Codex subscription serving。
 
 本地 vLLM eval 提供 serving-time adapter 兼容层：对 Qwen3.5/Qwen3.6 MoE PEFT LoRA，可在
 `terminal-bench-local-parametric-memory-eval` 中使用
