@@ -481,3 +481,99 @@ def test_cli_sidecar_serve_invokes_runner(monkeypatch) -> None:
 
     assert exit_code == 0
     assert calls == [("OpenEvo Desktop Sidecar", "127.0.0.1", 3766)]
+
+
+def test_cli_sidecar_serve_loads_config_status(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    app_calls = []
+    runner_calls = []
+
+    class FakeApp:
+        title = "OpenEvo Desktop Sidecar"
+
+    def fake_create_app(status=None):
+        app_calls.append(status)
+        return FakeApp()
+
+    def fake_runner(app, *, host: str, port: int) -> None:
+        runner_calls.append((app.title, host, port))
+
+    monkeypatch.setattr("openevo.cli.create_sidecar_app", fake_create_app)
+    monkeypatch.setattr("openevo.cli._run_sidecar_server", fake_runner)
+    science_path = _write_config(tmp_path / "science.yaml", _minimal_science_payload())
+    profile_path = _write_config(
+        tmp_path / "remote.yaml",
+        {
+            "version": 1,
+            "id": "science-team",
+            "host": "gpu.example.edu",
+            "user": "alice",
+        },
+    )
+
+    exit_code = main(
+        [
+            "sidecar",
+            "serve",
+            "--config",
+            str(science_path),
+            "--remote-profile",
+            str(profile_path),
+        ]
+    )
+
+    assert exit_code == 0
+    assert len(app_calls) == 1
+    assert app_calls[0].project.task_id == "folding-baseline"
+    assert app_calls[0].remote.id == "science-team"
+    assert runner_calls == [("OpenEvo Desktop Sidecar", "127.0.0.1", 3766)]
+
+
+def test_cli_sidecar_serve_requires_config_and_profile_together(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+) -> None:
+    runner_calls = []
+
+    def fake_runner(app, *, host: str, port: int) -> None:
+        runner_calls.append((app.title, host, port))
+
+    monkeypatch.setattr("openevo.cli._run_sidecar_server", fake_runner)
+    science_path = _write_config(tmp_path / "science.yaml", _minimal_science_payload())
+
+    exit_code = main(["sidecar", "serve", "--config", str(science_path)])
+
+    assert exit_code == 1
+    assert "--config and --remote-profile must be used together" in capsys.readouterr().err
+    assert runner_calls == []
+
+
+def test_cli_sidecar_serve_requires_profile_and_config_together(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+) -> None:
+    runner_calls = []
+
+    def fake_runner(app, *, host: str, port: int) -> None:
+        runner_calls.append((app.title, host, port))
+
+    monkeypatch.setattr("openevo.cli._run_sidecar_server", fake_runner)
+    profile_path = _write_config(
+        tmp_path / "remote.yaml",
+        {
+            "version": 1,
+            "id": "science-team",
+            "host": "gpu.example.edu",
+            "user": "alice",
+        },
+    )
+
+    exit_code = main(["sidecar", "serve", "--remote-profile", str(profile_path)])
+
+    assert exit_code == 1
+    assert "--config and --remote-profile must be used together" in capsys.readouterr().err
+    assert runner_calls == []

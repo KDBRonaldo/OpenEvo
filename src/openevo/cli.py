@@ -26,6 +26,7 @@ from openevo.science import (
 )
 from openevo.sidecar import (
     build_sidecar_science_plan,
+    build_desktop_shell_status,
     create_sidecar_app,
     load_remote_profile_config,
 )
@@ -159,6 +160,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     serve_parser.add_argument("--host", default="127.0.0.1", help="Host to bind.")
     serve_parser.add_argument("--port", type=int, default=3766, help="Port to bind.")
+    serve_parser.add_argument(
+        "--config",
+        help="Optional Science Project YAML used to derive Desktop shell status.",
+    )
+    serve_parser.add_argument(
+        "--remote-profile",
+        help="Optional remote profile YAML used with --config.",
+    )
     return parser
 
 
@@ -300,7 +309,14 @@ def _handle_sidecar_bootstrap(args: argparse.Namespace) -> int:
 
 
 def _handle_sidecar_serve(args: argparse.Namespace) -> int:
-    _run_sidecar_server(create_sidecar_app(), host=args.host, port=args.port)
+    if bool(args.config) != bool(args.remote_profile):
+        raise ValueError("sidecar serve --config and --remote-profile must be used together")
+    status = None
+    if args.config and args.remote_profile:
+        project = load_science_project_config(Path(args.config))
+        profile = load_remote_profile_config(Path(args.remote_profile))
+        status = build_desktop_shell_status(project, profile)
+    _run_sidecar_server(create_sidecar_app(status), host=args.host, port=args.port)
     return 0
 
 

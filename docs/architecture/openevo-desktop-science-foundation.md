@@ -118,6 +118,22 @@ using the same concepts as the Python contracts.
 OpenEvo Desktop starts a local sidecar API with
 `openevo sidecar serve --host 127.0.0.1 --port 3766`.
 
+For a user project, Desktop can start the same server with local config paths:
+
+```bash
+openevo sidecar serve \
+  --config science.yaml \
+  --remote-profile remote.yaml \
+  --host 127.0.0.1 \
+  --port 3766
+```
+
+In this mode the sidecar reads the local Science Project YAML and remote profile
+YAML, validates them, builds the existing sidecar science plan, and derives a
+Desktop shell status response from those contracts. This is a local read-only
+operation; it does not run SSH, remote preflight, workspace upload, git clone,
+bootstrap, model download, or remote service startup.
+
 The first endpoint is `GET /openevo-api/desktop/shell`. It returns typed shell
 status for the `/openevo` route and keeps the same subscription transcript
 semantics as the Python sidecar contracts: token-level metrics remain false in

@@ -2,13 +2,6 @@
 
 from __future__ import annotations
 
-from openevo.sidecar.api import (
-    DesktopExecutionStatus,
-    OpenEvoDesktopShellStatus,
-    SidecarHealth,
-    create_sidecar_app,
-    default_desktop_shell_status,
-)
 from openevo.sidecar.models import (
     ProxySettings,
     RemoteProfileConfig,
@@ -25,6 +18,14 @@ from openevo.sidecar.workspace import (
     WorkspacePreparationPlan,
     plan_workspace_preparation,
 )
+from openevo.sidecar.api import (
+    DesktopExecutionStatus,
+    OpenEvoDesktopShellStatus,
+    SidecarHealth,
+    build_desktop_shell_status,
+    create_sidecar_app,
+    default_desktop_shell_status,
+)
 
 __all__ = [
     "DesktopExecutionStatus",
@@ -37,6 +38,7 @@ __all__ = [
     "WorkspacePreparationAction",
     "WorkspacePreparationPlan",
     "build_sidecar_science_plan",
+    "build_desktop_shell_status",
     "create_sidecar_app",
     "default_desktop_shell_status",
     "load_remote_profile_config",

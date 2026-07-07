@@ -1,9 +1,15 @@
 from __future__ import annotations
 
+import posixpath
+import re
 from typing import Literal
 
 from fastapi import FastAPI
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from openevo.science import ScienceProjectConfig
+from openevo.sidecar.models import RemoteProfileConfig
+from openevo.sidecar.planner import build_sidecar_science_plan
 
 
 class _StrictFrozenModel(BaseModel):
@@ -105,6 +111,43 @@ class OpenEvoDesktopShellStatus(_StrictFrozenModel):
         if isinstance(value, list):
             return tuple(value)
         return value
+
+
+def build_desktop_shell_status(
+    project: ScienceProjectConfig,
+    profile: RemoteProfileConfig,
+) -> OpenEvoDesktopShellStatus:
+    sidecar_plan = build_sidecar_science_plan(project, profile)
+    return OpenEvoDesktopShellStatus(
+        remote=DesktopRemoteProfile(
+            id=profile.id,
+            host=profile.host,
+            user=profile.user,
+            proxy=DesktopRemoteProxy(
+                https_proxy=profile.proxy.https_proxy,
+                huggingface_endpoint=profile.proxy.huggingface_endpoint,
+            ),
+        ),
+        project=DesktopScienceProject(
+            name=project.project.name,
+            task_id=project.task.id,
+            source=_source_label(project),
+            objective=project.task.objective,
+        ),
+        execution=_execution_status(project),
+        bootstrap=DesktopBootstrapStatus(
+            ready=False,
+            state_root=_state_root(
+                sidecar_plan.workspace.workspace_root,
+                project_name=sidecar_plan.project_name,
+                task_id=sidecar_plan.task_id,
+            ),
+            workspace_root=sidecar_plan.workspace.workspace_root,
+            readiness_notes=("Remote bootstrap has not run yet.",),
+        ),
+        services=_service_statuses(project),
+        evolution=_evolution_steps(project),
+    )
 
 
 def default_desktop_shell_status() -> OpenEvoDesktopShellStatus:
@@ -214,3 +257,123 @@ def create_sidecar_app(
         return desktop_status
 
     return app
+
+
+def _execution_status(project: ScienceProjectConfig) -> DesktopExecutionStatus:
+    if project.execution.mode == "codex_subscription_transcript":
+        return DesktopExecutionStatus(
+            mode=project.execution.mode,
+            model=project.execution.codex_model or "gpt-5.1-codex-mini",
+            token_metrics_available=False,
+        )
+    return DesktopExecutionStatus(
+        mode=project.execution.mode,
+        model=project.execution.hf_model or "",
+        token_metrics_available=True,
+    )
+
+
+def _source_label(project: ScienceProjectConfig) -> str:
+    source = project.task.source
+    if source.type == "remote_path":
+        return f"Remote path: {source.path}"
+    if source.type == "local_folder":
+        return f"Local folder: {source.path}"
+    if source.type == "git_repository":
+        branch = f" ({source.branch})" if source.branch else ""
+        return f"Git repository: {source.url}{branch}"
+    return "Scratch workspace"
+
+
+def _service_statuses(
+    project: ScienceProjectConfig,
+) -> tuple[DesktopServiceStatus, ...]:
+    source_type = project.task.source.type
+    workspace_ready = source_type in {"remote_path", "scratch"}
+    if source_type == "remote_path":
+        workspace_detail = "Workspace source is already remote"
+    elif source_type == "scratch":
+        workspace_detail = "Scratch workspace does not need source preparation"
+    else:
+        workspace_detail = "Workspace preparation has not run yet"
+    return (
+        DesktopServiceStatus(
+            id="ssh",
+            label="SSH transport",
+            state="planned",
+            detail="Remote preflight has not run yet",
+        ),
+        DesktopServiceStatus(
+            id="workspace",
+            label="Workspace",
+            state="ready" if workspace_ready else "planned",
+            detail=workspace_detail,
+        ),
+        DesktopServiceStatus(
+            id="bootstrap",
+            label="Bootstrap",
+            state="planned",
+            detail="Remote bootstrap has not run yet",
+        ),
+        DesktopServiceStatus(
+            id="openevo-backend",
+            label="OpenEvo backend",
+            state="planned",
+            detail="Service supervisor integration is next",
+        ),
+    )
+
+
+def _evolution_steps(
+    project: ScienceProjectConfig,
+) -> tuple[DesktopEvolutionStep, ...]:
+    steps = [
+        DesktopEvolutionStep(
+            id="transcript",
+            label="Transcript capture",
+            state="planned",
+            detail="Trajectory capture will start after the first run",
+        )
+    ]
+    if project.evolution.text_memory:
+        steps.append(
+            DesktopEvolutionStep(
+                id="text-memory",
+                label="Text memory",
+                state="planned",
+                detail="No promoted memory artifact yet",
+            )
+        )
+    if project.evolution.skill_bundle:
+        steps.append(
+            DesktopEvolutionStep(
+                id="skill-bundle",
+                label="Skill bundle",
+                state="planned",
+                detail="No promoted skill bundle yet",
+            )
+        )
+    if project.evolution.agent_system:
+        steps.append(
+            DesktopEvolutionStep(
+                id="agent-system",
+                label="Agent system",
+                state="planned",
+                detail="No promoted agent-system artifact yet",
+            )
+        )
+    return tuple(steps)
+
+
+def _state_root(workspace_root: str, *, project_name: str, task_id: str) -> str:
+    root = workspace_root.rstrip("/") or "/"
+    if posixpath.basename(root) == "workspaces":
+        base = posixpath.join(posixpath.dirname(root), "runs")
+    else:
+        base = posixpath.join(root, ".openevo-runs")
+    return posixpath.join(base, _slugify(project_name), _slugify(task_id))
+
+
+def _slugify(value: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
+    return slug or "item"
