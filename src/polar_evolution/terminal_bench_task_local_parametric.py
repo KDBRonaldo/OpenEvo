@@ -75,6 +75,18 @@ _TERMINAL_BENCH_TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "tb_collect_result",
+            "description": "Collect the latest Terminal-Bench verifier result.",
+            "parameters": {
+                "type": "object",
+                "properties": {"task_id": {"type": "string"}},
+                "required": ["task_id"],
+            },
+        },
+    },
 ]
 
 _TASK_LOCAL_SYNTHETIC_SYSTEM = (
@@ -263,6 +275,7 @@ def build_task_local_sft_records(
     target_mode: str = "final",
     target_exec_timeout_seconds: int | None = None,
     include_run_tests_correction: bool = False,
+    include_collect_result_correction: bool = False,
 ) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     if prompt_style not in _TASK_LOCAL_PROMPT_STYLES:
@@ -277,6 +290,10 @@ def build_task_local_sft_records(
     if include_run_tests_correction and target_mode != "final":
         raise ValueError(
             "include_run_tests_correction is only supported with target_mode=final"
+        )
+    if include_collect_result_correction and target_mode != "final":
+        raise ValueError(
+            "include_collect_result_correction is only supported with target_mode=final"
         )
     for failed in selection.failed:
         if len(records) >= max_records:
@@ -334,6 +351,18 @@ def build_task_local_sft_records(
                 )
                 if include_run_tests_correction and len(records) < max_records:
                     correction_record = _task_local_run_tests_correction_record(
+                        selection=selection,
+                        failed=failed,
+                        successful=successful,
+                        command=command,
+                        prompt_style=prompt_style,
+                        target_mode=target_mode,
+                        target_exec_timeout_seconds=target_exec_timeout_seconds,
+                    )
+                    if correction_record is not None:
+                        records.append(correction_record)
+                if include_collect_result_correction and len(records) < max_records:
+                    correction_record = _task_local_collect_result_correction_record(
                         selection=selection,
                         failed=failed,
                         successful=successful,
@@ -636,6 +665,39 @@ def _task_local_run_tests_correction_record(
     )
 
 
+def _task_local_collect_result_correction_record(
+    *,
+    selection: TaskLocalSelection,
+    failed: TrajectoryPoolRow,
+    successful: TrajectoryPoolRow,
+    command: CodexCommandEvent,
+    prompt_style: str,
+    target_mode: str,
+    target_exec_timeout_seconds: int | None,
+) -> dict[str, Any] | None:
+    if prompt_style != "live_replay" or target_mode != "final":
+        return None
+    correction_prefix = _task_local_collect_result_correction_prefix(failed.trial_dir)
+    if correction_prefix is None:
+        return None
+    prompt_messages, call_index = correction_prefix
+    return _task_local_sft_record(
+        selection=selection,
+        failed=failed,
+        successful=successful,
+        command=command,
+        prompt_style=prompt_style,
+        target_mode=target_mode,
+        target_exec_timeout_seconds=target_exec_timeout_seconds,
+        prompt_messages_override=prompt_messages,
+        prefix_source_override=(
+            f"live_replay_collect_result_correction_llm_call:{call_index}"
+        ),
+        target_correction_stage="collect_result_failure",
+        event_id_suffix=f":collect-result-correction:{call_index}",
+    )
+
+
 def _task_local_sequence_messages(
     *,
     selection: TaskLocalSelection,
@@ -906,7 +968,41 @@ def _task_local_run_tests_correction_prefix(
     return None
 
 
+def _task_local_collect_result_correction_prefix(
+    trial_dir: Path,
+) -> tuple[list[dict[str, Any]], int] | None:
+    calls_path = _trial_evolab_llm_calls(trial_dir)
+    if not calls_path.is_file():
+        return None
+    for call_index, line in enumerate(
+        calls_path.read_text(encoding="utf-8", errors="replace").splitlines(),
+        start=1,
+    ):
+        if not line.strip():
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        raw_input_messages = payload.get("input_messages")
+        if not _input_messages_have_failed_tool_result(
+            raw_input_messages,
+            "tb_collect_result",
+        ):
+            continue
+        input_messages = _compact_live_replay_messages(raw_input_messages)
+        if input_messages:
+            return input_messages, call_index
+    return None
+
+
 def _input_messages_have_failed_run_tests_result(value: Any) -> bool:
+    return _input_messages_have_failed_tool_result(value, "tb_run_tests")
+
+
+def _input_messages_have_failed_tool_result(value: Any, tool_name: str) -> bool:
     if not isinstance(value, list):
         return False
     for message in value:
@@ -914,7 +1010,7 @@ def _input_messages_have_failed_run_tests_result(value: Any) -> bool:
             continue
         if message.get("role") != "tool":
             continue
-        if _tool_result_name(message) != "tb_run_tests":
+        if _tool_result_name(message) != tool_name:
             continue
         if _tool_result_indicates_failure(message):
             return True
@@ -935,22 +1031,31 @@ def _tool_result_name(message: dict[str, Any]) -> str | None:
 
 def _tool_result_indicates_failure(message: dict[str, Any]) -> bool:
     for payload in _tool_result_payloads(message):
-        if _payload_has_missing_candidate_artifact(payload):
+        if _payload_indicates_failure(payload):
             return True
-        status = payload.get("status")
-        if isinstance(status, str):
-            normalized = status.strip().lower()
-            if normalized and normalized not in {
-                "completed",
-                "ok",
-                "passed",
-                "success",
-                "succeeded",
-            }:
-                return True
-        exit_code = payload.get("exit_code")
-        if isinstance(exit_code, int | float) and exit_code != 0:
+    return False
+
+
+def _payload_indicates_failure(payload: dict[str, Any]) -> bool:
+    if _payload_has_missing_candidate_artifact(payload):
+        return True
+    status = payload.get("status")
+    if isinstance(status, str):
+        normalized = status.strip().lower()
+        if normalized and normalized not in {
+            "completed",
+            "ok",
+            "passed",
+            "success",
+            "succeeded",
+        }:
             return True
+    exit_code = payload.get("exit_code")
+    if isinstance(exit_code, int | float) and exit_code != 0:
+        return True
+    result = payload.get("result")
+    if isinstance(result, dict) and _payload_indicates_failure(result):
+        return True
     return False
 
 

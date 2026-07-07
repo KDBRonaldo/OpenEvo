@@ -925,6 +925,14 @@ that verifier feedback and whose target is still the selected successful
 should contain both the first-action live replay record and a
 `live_replay_run_tests_correction_llm_call:*` record carrying
 `candidate_artifacts` feedback that `/app/out.txt` is missing.
+The v2 negative result then showed a later failure point: after
+`tb_collect_result` had already collected the failed verifier result, the
+treatment wrote a report claiming success instead of repairing the missing
+artifact. The builder now also exposes `--include-collect-result-correction`,
+which adds a supervised record from the real prefix after failed
+`tb_collect_result` and targets the selected successful `tb_exec` repair. The
+next gcode variant should therefore include first-action, post-run-tests, and
+post-collect-result records as separate local-memory stages.
 
 The first correction-stage gcode adapter used
 `/tmp/tb21-task-local-parametric-gcode-correction-20260707/correction_pool.jsonl`,

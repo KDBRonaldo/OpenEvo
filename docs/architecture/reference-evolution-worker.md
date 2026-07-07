@@ -584,6 +584,12 @@ record keeps the real post-verifier prefix, including missing artifact feedback
 such as `/app/out.txt present=false`, and uses the same selected successful
 `tb_exec` target. This separates first-action imitation from explicit
 post-verifier repair training.
+Use `--include-collect-result-correction` with the same prompt and target mode
+when the failed trajectory first collects the verifier failure through
+`tb_collect_result`. This adds another record whose prefix includes the nested
+failed verifier result after collection, then supervises the selected
+successful `tb_exec`; it is intended to train repair instead of premature
+reporting after a failed collected result.
 Use `--target-mode sequence` when the successful trajectory is a recipe whose
 later write command depends on earlier dependency installation, data
 preparation, or intermediate files. Sequence mode emits progressive

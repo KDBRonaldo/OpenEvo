@@ -587,6 +587,11 @@ serving。
 `candidate_artifacts` 中 `/app/out.txt present=false` 这类反馈，并继续把成功轨迹中选中的
 `tb_exec` 写入命令作为 target。该开关用于训练“看到 verifier 反馈后修正输出路径/产物”的
 局部记忆，不替代 sequence recipe。
+`--include-collect-result-correction` 用于同一 `live_replay` + final-target 路径，但触发点是
+失败轨迹已经通过 `tb_collect_result` 收集到失败 verifier 结果之后。builder 会保留 collect
+之后的真实 prefix，包括嵌套的失败 `tb_run_tests` result 和 missing artifact feedback，并继续
+监督同一个成功 `tb_exec` target；该开关用于训练“collect_result 明确失败后继续修复”，避免模型
+过早写 report 或停止。
 
 本地 vLLM eval 提供 serving-time adapter 兼容层：对通过 vLLM
 `--language-model-only` 服务的 Qwen3.5/Qwen3.6 PEFT LoRA，可在
