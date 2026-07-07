@@ -4,6 +4,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from _thread import LockType
+import json
 from pathlib import Path
 import posixpath
 import re
@@ -18,6 +19,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from pydantic import ValidationError
 
 from openevo.remote.executor import RemoteExecutorTransport
+from openevo.remote.redaction import sanitize_remote_text
 from openevo.science import ScienceProjectConfig
 from openevo.sidecar.config import (
     DesktopProjectConfigDraft,
@@ -233,6 +235,39 @@ class OpenEvoDesktopRunStatus(_StrictFrozenModel):
 class OpenEvoDesktopRunResponse(_StrictFrozenModel):
     run: OpenEvoDesktopRunStatus
     status: OpenEvoDesktopShellStatus
+
+
+class OpenEvoDesktopRunArtifactJob(_StrictFrozenModel):
+    artifact_type: str
+    method: str
+    worker_status: str
+    artifact_ids: list[str] = Field(default_factory=list)
+    approved_artifact_ids: list[str] = Field(default_factory=list)
+    promotion_status: str
+
+
+class OpenEvoDesktopRunArtifactRound(_StrictFrozenModel):
+    round_index: int
+    policy_version: str | None = None
+    rollout_status: str | None = None
+    dataset_status: str | None = None
+    artifact_ids: dict[str, list[str]] = Field(default_factory=dict)
+    jobs: list[OpenEvoDesktopRunArtifactJob] = Field(default_factory=list)
+
+
+class OpenEvoDesktopRunArtifactTask(_StrictFrozenModel):
+    task_id: str
+    rounds: list[OpenEvoDesktopRunArtifactRound] = Field(default_factory=list)
+
+
+class OpenEvoDesktopRunArtifactsResponse(_StrictFrozenModel):
+    run_id: str
+    output_dir: str
+    summary_status: str | None = None
+    experiment_id: str | None = None
+    experiment_name: str | None = None
+    round_count: int | None = None
+    tasks: list[OpenEvoDesktopRunArtifactTask] = Field(default_factory=list)
 
 
 @dataclass
@@ -865,6 +900,38 @@ def create_sidecar_app(
                 status=response_status,
             )
 
+    @app.get(
+        "/openevo-api/desktop/run/artifacts",
+        response_model=OpenEvoDesktopRunArtifactsResponse,
+    )
+    def latest_run_artifacts(
+        token: str | None = Header(
+            default=None,
+            alias=SIDECAR_MUTATION_TOKEN_HEADER,
+        ),
+    ) -> OpenEvoDesktopRunArtifactsResponse:
+        _validate_mutation_token(token, sidecar_token)
+        active_session = current_session()
+        if active_session is None:
+            raise HTTPException(
+                status_code=409,
+                detail="Desktop run artifacts require a config-backed sidecar session.",
+            )
+        with active_session.status_lock:
+            if active_session.latest_run is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail="No Desktop run has been launched.",
+                )
+            latest = active_session.latest_run
+        if latest.state == "running":
+            raise HTTPException(
+                status_code=409,
+                detail="Desktop run artifacts require a terminal run.",
+            )
+        summary = _read_remote_run_summary(active_session, latest.output_dir)
+        return _run_artifacts_response(latest, summary)
+
     return app
 
 
@@ -1025,6 +1092,54 @@ def _run_services(session: OpenEvoSidecarSession):
     )
 
 
+def _read_remote_run_summary(
+    session: OpenEvoSidecarSession,
+    output_dir: str,
+) -> dict[str, Any]:
+    transport = session.transport_factory(session.profile)
+    command = _read_run_summary_command(output_dir)
+    result = transport.run(command, timeout_seconds=30.0)
+    env = session.profile.proxy.to_env()
+    if not result.ok:
+        detail = sanitize_remote_text(result.stderr or result.stdout, env).strip()
+        if "summary not found" in detail.lower():
+            raise HTTPException(
+                status_code=404,
+                detail="OpenEvo run summary not found.",
+            )
+        raise HTTPException(
+            status_code=502,
+            detail=detail or "Failed to read OpenEvo run summary.",
+        )
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="OpenEvo run summary was not valid JSON.",
+        ) from exc
+    if not isinstance(payload, dict):
+        raise HTTPException(
+            status_code=502,
+            detail="OpenEvo run summary was not a JSON object.",
+        )
+    return payload
+
+
+def _read_run_summary_command(output_dir: str) -> str:
+    return "\n".join(
+        [
+            "python3 - <<'PY'",
+            "from pathlib import Path",
+            f"path = Path({output_dir!r}) / 'summary.json'",
+            "if not path.is_file():",
+            "    raise SystemExit('OpenEvo run summary not found.')",
+            "print(path.read_text(encoding='utf-8'), end='')",
+            "PY",
+        ]
+    )
+
+
 def _run_workspace_sync(session: OpenEvoSidecarSession):
     from openevo.remote.executor import execute_sidecar_plan
 
@@ -1033,6 +1148,99 @@ def _run_workspace_sync(session: OpenEvoSidecarSession):
         sidecar_plan,
         session.transport_factory(session.profile),
     )
+
+
+def _run_artifacts_response(
+    latest: OpenEvoDesktopRunStatus,
+    summary: dict[str, Any],
+) -> OpenEvoDesktopRunArtifactsResponse:
+    return OpenEvoDesktopRunArtifactsResponse(
+        run_id=latest.id,
+        output_dir=latest.output_dir,
+        summary_status=_optional_string(summary.get("status")),
+        experiment_id=_optional_string(summary.get("experiment_id")),
+        experiment_name=_optional_string(summary.get("experiment_name")),
+        round_count=_optional_int(summary.get("round_count")),
+        tasks=[
+            _artifact_task_summary(task)
+            for task in _dict_list(summary.get("tasks"))
+        ],
+    )
+
+
+def _artifact_task_summary(task: dict[str, Any]) -> OpenEvoDesktopRunArtifactTask:
+    return OpenEvoDesktopRunArtifactTask(
+        task_id=_string_value(task.get("task_id"), "unknown-task"),
+        rounds=[
+            _artifact_round_summary(round_payload)
+            for round_payload in _dict_list(task.get("rounds"))
+        ],
+    )
+
+
+def _artifact_round_summary(
+    round_payload: dict[str, Any],
+) -> OpenEvoDesktopRunArtifactRound:
+    return OpenEvoDesktopRunArtifactRound(
+        round_index=_int_value(round_payload.get("round_index"), 0),
+        policy_version=_optional_string(round_payload.get("policy_version")),
+        rollout_status=_optional_string(round_payload.get("rollout_status")),
+        dataset_status=_optional_string(round_payload.get("dataset_status")),
+        artifact_ids=_artifact_id_map(round_payload.get("artifact_ids")),
+        jobs=[
+            _artifact_job_summary(job_payload)
+            for job_payload in _dict_list(round_payload.get("jobs"))
+        ],
+    )
+
+
+def _artifact_job_summary(job: dict[str, Any]) -> OpenEvoDesktopRunArtifactJob:
+    return OpenEvoDesktopRunArtifactJob(
+        artifact_type=_string_value(job.get("artifact_type"), "unknown"),
+        method=_string_value(job.get("method"), "unknown"),
+        worker_status=_string_value(job.get("worker_status"), "unknown"),
+        artifact_ids=_string_list(job.get("artifact_ids")),
+        approved_artifact_ids=_string_list(job.get("approved_artifact_ids")),
+        promotion_status=_string_value(job.get("promotion_status"), "unknown"),
+    )
+
+
+def _artifact_id_map(value: object) -> dict[str, list[str]]:
+    if not isinstance(value, dict):
+        return {}
+    return {
+        str(key): _string_list(item)
+        for key, item in value.items()
+        if isinstance(key, str)
+    }
+
+
+def _dict_list(value: object) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, dict)]
+
+
+def _string_list(value: object) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, str)]
+
+
+def _string_value(value: object, default: str) -> str:
+    return value if isinstance(value, str) and value else default
+
+
+def _optional_string(value: object) -> str | None:
+    return value if isinstance(value, str) and value else None
+
+
+def _optional_int(value: object) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _int_value(value: object, default: int) -> int:
+    return value if isinstance(value, int) and not isinstance(value, bool) else default
 
 
 def _require_workspace_and_bootstrap_ready(session: OpenEvoSidecarSession) -> None:

@@ -208,6 +208,72 @@ export interface OpenEvoRunResponse {
   status: OpenEvoDesktopShellModel;
 }
 
+export interface OpenEvoRunArtifactJobPayload {
+  artifact_type: string;
+  method: string;
+  worker_status: string;
+  artifact_ids: string[];
+  approved_artifact_ids: string[];
+  promotion_status: string;
+}
+
+export interface OpenEvoRunArtifactRoundPayload {
+  round_index: number;
+  policy_version: string | null;
+  rollout_status: string | null;
+  dataset_status: string | null;
+  artifact_ids: Record<string, string[]>;
+  jobs: OpenEvoRunArtifactJobPayload[];
+}
+
+export interface OpenEvoRunArtifactTaskPayload {
+  task_id: string;
+  rounds: OpenEvoRunArtifactRoundPayload[];
+}
+
+export interface OpenEvoRunArtifactsPayload {
+  run_id: string;
+  output_dir: string;
+  summary_status: string | null;
+  experiment_id: string | null;
+  experiment_name: string | null;
+  round_count: number | null;
+  tasks: OpenEvoRunArtifactTaskPayload[];
+}
+
+export interface OpenEvoRunArtifactJob {
+  artifactType: string;
+  method: string;
+  workerStatus: string;
+  artifactIds: string[];
+  approvedArtifactIds: string[];
+  promotionStatus: string;
+}
+
+export interface OpenEvoRunArtifactRound {
+  roundIndex: number;
+  policyVersion: string;
+  rolloutStatus: string;
+  datasetStatus: string;
+  artifactIds: Record<string, string[]>;
+  jobs: OpenEvoRunArtifactJob[];
+}
+
+export interface OpenEvoRunArtifactTask {
+  taskId: string;
+  rounds: OpenEvoRunArtifactRound[];
+}
+
+export interface OpenEvoRunArtifacts {
+  runId: string;
+  outputDir: string;
+  summaryStatus: string;
+  experimentId: string;
+  experimentName: string;
+  roundCount: number;
+  tasks: OpenEvoRunArtifactTask[];
+}
+
 export interface OpenEvoProjectConfigResponse {
   config: OpenEvoProjectConfigPaths;
   status: OpenEvoDesktopShellModel;
@@ -363,6 +429,17 @@ export async function pollOpenEvoRunStatus(): Promise<OpenEvoRunResponse> {
   };
 }
 
+export async function fetchOpenEvoRunArtifacts(): Promise<OpenEvoRunArtifacts> {
+  const headers = sidecarMutationToken
+    ? { [sidecarMutationTokenHeader]: sidecarMutationToken }
+    : undefined;
+  const payload = await api.get<OpenEvoRunArtifactsPayload>(
+    "/openevo-api/desktop/run/artifacts",
+    headers,
+  );
+  return toOpenEvoRunArtifacts(payload);
+}
+
 export function toOpenEvoBootstrapResponse(
   payload: OpenEvoBootstrapResponsePayload,
 ): OpenEvoBootstrapResponse {
@@ -393,6 +470,38 @@ export function toOpenEvoRunStatus(
     experimentSnapshot: payload.experiment_snapshot,
     startedAt: payload.started_at,
     finishedAt: payload.finished_at,
+  };
+}
+
+export function toOpenEvoRunArtifacts(
+  payload: OpenEvoRunArtifactsPayload,
+): OpenEvoRunArtifacts {
+  return {
+    runId: payload.run_id,
+    outputDir: payload.output_dir,
+    summaryStatus: payload.summary_status ?? "unknown",
+    experimentId: payload.experiment_id ?? "unknown",
+    experimentName:
+      payload.experiment_name ?? payload.experiment_id ?? "unknown",
+    roundCount: payload.round_count ?? 0,
+    tasks: payload.tasks.map((task) => ({
+      taskId: task.task_id,
+      rounds: task.rounds.map((round) => ({
+        roundIndex: round.round_index,
+        policyVersion: round.policy_version ?? "",
+        rolloutStatus: round.rollout_status ?? "unknown",
+        datasetStatus: round.dataset_status ?? "unknown",
+        artifactIds: round.artifact_ids,
+        jobs: round.jobs.map((job) => ({
+          artifactType: job.artifact_type,
+          method: job.method,
+          workerStatus: job.worker_status,
+          artifactIds: job.artifact_ids,
+          approvedArtifactIds: job.approved_artifact_ids,
+          promotionStatus: job.promotion_status,
+        })),
+      })),
+    })),
   };
 }
 

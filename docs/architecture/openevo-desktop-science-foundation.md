@@ -411,6 +411,31 @@ the transcript evolution row complete. A failing terminal status still returns
 HTTP 200 from the polling endpoint with `run.ready=false`, and the refreshed
 shell status marks those rows blocked with the command error.
 
+After a terminal run status, Desktop calls
+`GET /openevo-api/desktop/run/artifacts` with the same sidecar mutation token.
+The endpoint is read-only but still token-protected because it reaches into the
+remote run directory. It is available only for config-backed sidecar sessions
+with a launched latest run, and it rejects active runs because the run
+`summary.json` contract is complete only after `openevo run` exits.
+
+The endpoint reads `<run.output_dir>/summary.json` on the remote machine through
+the configured transport, parses it, and returns a compact timeline payload:
+run id, output directory, summary status, experiment id/name, round count, and
+per-task rounds with rollout status, dataset status, produced artifact ids, and
+worker job summaries. Worker summaries include artifact type, method, worker
+status, produced artifact ids, approved artifact ids, and promotion status. The
+payload intentionally does not inline artifact contents; Desktop renders ids and
+statuses so users can see the evolution process without transferring generated
+memory, skill, agent-system, or adapter directories into the local browser.
+
+If the remote summary file is missing, the endpoint returns 404. If remote
+command execution or JSON parsing fails, it returns a sanitized 502 response.
+Desktop renders the artifact timeline after terminal success or failure when a
+summary is available, and shows the sanitized timeline-load error without
+hiding the terminal run status. Saving or activating a different project config,
+rerunning workspace sync, rerunning bootstrap, or restarting services clears the
+latest run and its artifact timeline to avoid showing stale evolution state.
+
 The sidecar generates a per-process mutation token and includes it in
 `GET /openevo-api/desktop/shell` under `sidecar.mutation_token`. Mutating
 requests must send that token in the non-simple
@@ -438,9 +463,10 @@ This slice adds a command-and-health-check service supervisor plus a local
 sidecar run supervisor with one latest run per config-backed session. It does
 not survive sidecar process restarts, stream incremental remote log files,
 cancel remote process groups, expose resume, restart the sidecar process, run
-Docker Compose, restart crashed remote daemons, tune GPU placement or
-quantization for vLLM, or manage dynamic adapters. Those operations remain
-behind future remote lifecycle contracts.
+Docker Compose, restart crashed remote daemons, transfer artifact contents or
+diffs into Desktop, tune GPU placement or quantization for vLLM, or manage
+dynamic adapters. Those operations remain behind future remote lifecycle
+contracts.
 
 ## CLI
 
