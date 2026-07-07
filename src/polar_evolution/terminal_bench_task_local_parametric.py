@@ -23,6 +23,15 @@ class TaskLocalSelection:
     null_reward: list[TrajectoryPoolRow]
 
 
+@dataclass(frozen=True)
+class CodexCommandEvent:
+    event_index: int
+    command: str
+    exit_code: int | None
+    status: str | None
+    output_excerpt: str
+
+
 def load_trajectory_pool(path: Path) -> list[TrajectoryPoolRow]:
     rows: list[TrajectoryPoolRow] = []
     for line_number, line in enumerate(
@@ -89,6 +98,63 @@ def select_task_local_candidates(
                 )
             )
     return selections
+
+
+def iter_codex_events(path: Path) -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    if not path.is_file():
+        return events
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("{"):
+            continue
+        try:
+            payload = json.loads(stripped)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            events.append(payload)
+    return events
+
+
+def extract_successful_codex_commands(
+    transcript_path: Path,
+    *,
+    command_contains: list[str] | None = None,
+    exclude_command_contains: list[str] | None = None,
+    max_output_chars: int = 1000,
+) -> list[CodexCommandEvent]:
+    required = [needle for needle in command_contains or [] if needle]
+    excluded = [needle for needle in exclude_command_contains or [] if needle]
+    commands: list[CodexCommandEvent] = []
+    for event_index, event in enumerate(iter_codex_events(transcript_path)):
+        if event.get("type") != "item.completed":
+            continue
+        item = event.get("item")
+        if not isinstance(item, dict) or item.get("type") != "command_execution":
+            continue
+        command = item.get("command")
+        if not isinstance(command, str) or not command.strip():
+            continue
+        if item.get("exit_code") != 0 or item.get("status") != "completed":
+            continue
+        if required and not all(needle in command for needle in required):
+            continue
+        if excluded and any(needle in command for needle in excluded):
+            continue
+        output = item.get("aggregated_output")
+        if output is None:
+            output = ""
+        commands.append(
+            CodexCommandEvent(
+                event_index=event_index,
+                command=command.strip(),
+                exit_code=0,
+                status="completed",
+                output_excerpt=str(output)[: max(1, int(max_output_chars))],
+            )
+        )
+    return commands
 
 
 def _parse_reward(value: Any) -> float | None:

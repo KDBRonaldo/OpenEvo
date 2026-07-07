@@ -5,6 +5,7 @@ from pathlib import Path
 
 from polar_evolution.terminal_bench_task_local_parametric import (
     TaskLocalSelection,
+    extract_successful_codex_commands,
     select_task_local_candidates,
 )
 
@@ -66,3 +67,70 @@ def test_select_task_local_candidates_requires_success_and_failure(
     assert [row.trajectory_id for row in selection.failed] == ["train-fail-1"]
     assert [row.trajectory_id for row in selection.successful] == ["train-pass-1"]
     assert [row.trajectory_id for row in selection.null_reward] == ["null-run"]
+
+
+def test_extract_successful_codex_commands_reads_completed_command_events(
+    tmp_path: Path,
+) -> None:
+    transcript = tmp_path / "codex.txt"
+    transcript.write_text(
+        "\n".join(
+            [
+                "WARNING: non-json prefix",
+                json.dumps({"type": "thread.started", "thread_id": "t"}),
+                json.dumps(
+                    {
+                        "type": "item.completed",
+                        "item": {
+                            "id": "cmd-1",
+                            "type": "command_execution",
+                            "command": "/bin/bash -lc 'cat data/train.parquet'",
+                            "aggregated_output": "too much output",
+                            "exit_code": 0,
+                            "status": "completed",
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "item.completed",
+                        "item": {
+                            "id": "cmd-2",
+                            "type": "command_execution",
+                            "command": (
+                                "/bin/bash -lc 'python train.py && "
+                                "cp model.bin /app/model.bin'"
+                            ),
+                            "aggregated_output": "accuracy 0.6257\nsize 143211714",
+                            "exit_code": 0,
+                            "status": "completed",
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "item.completed",
+                        "item": {
+                            "id": "msg-1",
+                            "type": "agent_message",
+                            "text": "Done.",
+                        },
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    commands = extract_successful_codex_commands(
+        transcript,
+        command_contains=["/app/model.bin"],
+    )
+
+    assert [command.command for command in commands] == [
+        "/bin/bash -lc 'python train.py && cp model.bin /app/model.bin'"
+    ]
+    assert commands[0].event_index == 2
+    assert commands[0].exit_code == 0
+    assert "accuracy" in commands[0].output_excerpt
