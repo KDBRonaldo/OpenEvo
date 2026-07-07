@@ -31,6 +31,7 @@ from openevo.sidecar.models import RemoteProfileConfig
 from openevo.sidecar.planner import build_sidecar_science_plan
 
 SIDECAR_MUTATION_TOKEN_HEADER = "X-OpenEvo-Sidecar-Token"
+SidecarTransportKind = Literal["dry-run", "ssh"]
 
 
 class _StrictFrozenModel(BaseModel):
@@ -131,8 +132,16 @@ class DesktopDeveloperMode(_StrictFrozenModel):
     benchmark_controls_visible: bool = False
 
 
+class DesktopSidecarTransport(_StrictFrozenModel):
+    id: SidecarTransportKind = "dry-run"
+    label: str = "Dry-run transport"
+    supports_password_ref: bool = True
+    supports_passphrase_ref: bool = True
+
+
 class DesktopSidecarSecurity(_StrictFrozenModel):
     mutation_token: str | None = None
+    transport: DesktopSidecarTransport = Field(default_factory=DesktopSidecarTransport)
 
     @field_validator("mutation_token")
     @classmethod
@@ -384,6 +393,7 @@ def create_sidecar_app(
     *,
     session: OpenEvoSidecarSession | None = None,
     mutation_token: str | None = None,
+    transport_kind: SidecarTransportKind = "dry-run",
     config_root: Path | None = None,
     transport_factory: Callable[[RemoteProfileConfig], RemoteExecutorTransport]
     | None = None,
@@ -412,8 +422,13 @@ def create_sidecar_app(
                 return _status_with_mutation_token(
                     active_session.status,
                     sidecar_token,
+                    transport_kind=transport_kind,
                 )
-        return _status_with_mutation_token(desktop_status, sidecar_token)
+        return _status_with_mutation_token(
+            desktop_status,
+            sidecar_token,
+            transport_kind=transport_kind,
+        )
 
     @app.post(
         "/openevo-api/desktop/project-config",
@@ -473,6 +488,7 @@ def create_sidecar_app(
             response_status = _status_with_mutation_token(
                 new_session.status,
                 sidecar_token,
+                transport_kind=transport_kind,
             )
         return OpenEvoDesktopProjectConfigResponse(
             config=paths,
@@ -553,6 +569,7 @@ def create_sidecar_app(
             response_status = _status_with_mutation_token(
                 new_session.status,
                 sidecar_token,
+                transport_kind=transport_kind,
             )
         return OpenEvoDesktopProjectConfigResponse(
             config=paths,
@@ -580,6 +597,10 @@ def create_sidecar_app(
                         "session."
                     ),
                 )
+            _raise_for_unsupported_lifecycle_auth(
+                active_session.profile,
+                transport_kind,
+            )
             if not active_session.workspace_lock.acquire(blocking=False):
                 raise HTTPException(
                     status_code=409,
@@ -596,6 +617,7 @@ def create_sidecar_app(
                 response_status = _status_with_mutation_token(
                     active_session.status,
                     sidecar_token,
+                    transport_kind=transport_kind,
                 )
         finally:
             active_session.workspace_lock.release()
@@ -623,6 +645,10 @@ def create_sidecar_app(
                     status_code=409,
                     detail="Desktop bootstrap requires a config-backed sidecar session.",
                 )
+            _raise_for_unsupported_lifecycle_auth(
+                active_session.profile,
+                transport_kind,
+            )
             if not active_session.bootstrap_lock.acquire(blocking=False):
                 raise HTTPException(
                     status_code=409,
@@ -639,6 +665,7 @@ def create_sidecar_app(
                 response_status = _status_with_mutation_token(
                     active_session.status,
                     sidecar_token,
+                    transport_kind=transport_kind,
                 )
         finally:
             active_session.bootstrap_lock.release()
@@ -666,6 +693,10 @@ def create_sidecar_app(
                     status_code=409,
                     detail="Desktop run launch requires a config-backed sidecar session.",
                 )
+            _raise_for_unsupported_lifecycle_auth(
+                active_session.profile,
+                transport_kind,
+            )
             if not active_session.run_lock.acquire(blocking=False):
                 raise HTTPException(
                     status_code=409,
@@ -686,6 +717,7 @@ def create_sidecar_app(
                 response_status = _status_with_mutation_token(
                     active_session.status,
                     sidecar_token,
+                    transport_kind=transport_kind,
                 )
             Thread(
                 target=_finish_openevo_task_run,
@@ -723,6 +755,7 @@ def create_sidecar_app(
             response_status = _status_with_mutation_token(
                 active_session.status,
                 sidecar_token,
+                transport_kind=transport_kind,
             )
             return OpenEvoDesktopRunResponse(
                 run=active_session.latest_run,
@@ -738,6 +771,7 @@ def create_sidecar_app_for_project(
     *,
     transport_factory: Callable[[RemoteProfileConfig], RemoteExecutorTransport],
     mutation_token: str | None = None,
+    transport_kind: SidecarTransportKind = "dry-run",
 ) -> FastAPI:
     session = OpenEvoSidecarSession(
         project=project,
@@ -745,7 +779,11 @@ def create_sidecar_app_for_project(
         transport_factory=transport_factory,
         status=build_desktop_shell_status(project, profile),
     )
-    return create_sidecar_app(session=session, mutation_token=mutation_token)
+    return create_sidecar_app(
+        session=session,
+        mutation_token=mutation_token,
+        transport_kind=transport_kind,
+    )
 
 
 def _execution_status(project: ScienceProjectConfig) -> DesktopExecutionStatus:
@@ -1036,10 +1074,61 @@ def _session_lifecycle_busy(session: OpenEvoSidecarSession) -> bool:
 def _status_with_mutation_token(
     status: OpenEvoDesktopShellStatus,
     token: str,
+    *,
+    transport_kind: SidecarTransportKind,
 ) -> OpenEvoDesktopShellStatus:
     return status.model_copy(
-        update={"sidecar": DesktopSidecarSecurity(mutation_token=token)}
+        update={
+            "sidecar": DesktopSidecarSecurity(
+                mutation_token=token,
+                transport=_sidecar_transport_status(transport_kind),
+            )
+        }
     )
+
+
+def _sidecar_transport_status(kind: SidecarTransportKind) -> DesktopSidecarTransport:
+    if kind == "ssh":
+        return DesktopSidecarTransport(
+            id="ssh",
+            label="SSH transport",
+            supports_password_ref=False,
+            supports_passphrase_ref=False,
+        )
+    return DesktopSidecarTransport(
+        id="dry-run",
+        label="Dry-run transport",
+        supports_password_ref=True,
+        supports_passphrase_ref=True,
+    )
+
+
+def _raise_for_unsupported_lifecycle_auth(
+    profile: RemoteProfileConfig,
+    transport_kind: SidecarTransportKind,
+) -> None:
+    detail = _unsupported_lifecycle_auth_detail(profile, transport_kind)
+    if detail is not None:
+        raise HTTPException(status_code=409, detail=detail)
+
+
+def _unsupported_lifecycle_auth_detail(
+    profile: RemoteProfileConfig,
+    transport_kind: SidecarTransportKind,
+) -> str | None:
+    transport = _sidecar_transport_status(transport_kind)
+    auth = profile.auth
+    if auth.method == "password_ref" and not transport.supports_password_ref:
+        return (
+            f"{transport.label} cannot resolve password_ref yet. "
+            "Use SSH agent or a private key without a secret reference."
+        )
+    if auth.passphrase_ref is not None and not transport.supports_passphrase_ref:
+        return (
+            f"{transport.label} cannot resolve passphrase_ref yet. "
+            "Use SSH agent or a private key without a secret reference."
+        )
+    return None
 
 
 def _workspace_response_payload(report) -> dict[str, Any]:

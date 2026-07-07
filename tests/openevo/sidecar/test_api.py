@@ -100,6 +100,92 @@ def test_bootstrap_endpoint_rejects_invalid_sidecar_token() -> None:
     assert response.json()["detail"] == "Invalid OpenEvo sidecar token."
 
 
+def test_desktop_shell_endpoint_reports_ssh_auth_capabilities() -> None:
+    project = ScienceProjectConfig.model_validate(_science_project_payload())
+    profile = _remote_profile()
+    client = TestClient(
+        create_sidecar_app_for_project(
+            project,
+            profile,
+            transport_factory=lambda _profile: _ApiDryRunTransport(),
+            transport_kind="ssh",
+        )
+    )
+
+    response = client.get("/openevo-api/desktop/shell")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["sidecar"]["transport"] == {
+        "id": "ssh",
+        "label": "SSH transport",
+        "supports_password_ref": False,
+        "supports_passphrase_ref": False,
+    }
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        "/openevo-api/desktop/workspace",
+        "/openevo-api/desktop/bootstrap",
+        "/openevo-api/desktop/run",
+    ],
+    ids=["workspace", "bootstrap", "run"],
+)
+@pytest.mark.parametrize(
+    ("auth", "detail"),
+    [
+        (
+            {"method": "password_ref", "password_ref": "keyring://openevo/team"},
+            (
+                "SSH transport cannot resolve password_ref yet. Use SSH agent "
+                "or a private key without a secret reference."
+            ),
+        ),
+        (
+            {
+                "method": "private_key",
+                "private_key_path": "/home/alice/.ssh/openevo",
+                "passphrase_ref": "keyring://openevo/team",
+            },
+            (
+                "SSH transport cannot resolve passphrase_ref yet. Use SSH agent "
+                "or a private key without a secret reference."
+            ),
+        ),
+    ],
+    ids=["password-ref", "passphrase-ref"],
+)
+def test_lifecycle_endpoints_reject_unsupported_ssh_secret_refs(
+    endpoint: str,
+    auth: dict,
+    detail: str,
+) -> None:
+    project = ScienceProjectConfig.model_validate(_science_project_payload())
+    profile = _remote_profile(auth=auth)
+    transport = _ApiDryRunTransport()
+    client = TestClient(
+        create_sidecar_app_for_project(
+            project,
+            profile,
+            transport_factory=lambda _profile: transport,
+            transport_kind="ssh",
+        )
+    )
+    token = _sidecar_token(client)
+
+    response = client.post(
+        endpoint,
+        headers={"X-OpenEvo-Sidecar-Token": token},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == detail
+    assert transport.commands == []
+    assert transport.uploads == []
+
+
 def test_bootstrap_endpoint_runs_config_backed_dry_run_and_refreshes_status() -> None:
     project = ScienceProjectConfig.model_validate(_science_project_payload())
     profile = _remote_profile()
@@ -1356,12 +1442,13 @@ def _science_project_payload() -> dict:
     }
 
 
-def _remote_profile() -> RemoteProfileConfig:
+def _remote_profile(auth: dict | None = None) -> RemoteProfileConfig:
     return RemoteProfileConfig(
         version=1,
         id="science-team",
         host="gpu.example.edu",
         user="alice",
+        auth=auth or {"method": "ssh_agent"},
         proxy={"https_proxy": "http://127.0.0.1:7890"},
     )
 

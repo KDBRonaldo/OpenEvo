@@ -62,6 +62,12 @@ export interface OpenEvoDesktopShellStatusPayload {
   };
   sidecar?: {
     mutation_token: string | null;
+    transport?: {
+      id: OpenEvoDesktopShellModel["sidecar"]["transport"]["id"];
+      label: string;
+      supports_password_ref: boolean;
+      supports_passphrase_ref: boolean;
+    };
   };
 }
 
@@ -435,6 +441,16 @@ export function toOpenEvoDesktopShellModel(
       enabled: payload.developer_mode.enabled,
       benchmarkControlsVisible:
         payload.developer_mode.benchmark_controls_visible,
+    },
+    sidecar: {
+      transport: {
+        id: payload.sidecar?.transport?.id ?? "dry-run",
+        label: payload.sidecar?.transport?.label ?? "Dry-run transport",
+        supportsPasswordRef:
+          payload.sidecar?.transport?.supports_password_ref ?? true,
+        supportsPassphraseRef:
+          payload.sidecar?.transport?.supports_passphrase_ref ?? true,
+      },
     },
   };
 }

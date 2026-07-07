@@ -85,6 +85,7 @@ export function OpenEvoDesktop() {
   const runPollGeneration = useRef(0);
   const runPollTimer = useRef<number | null>(null);
   const summary = getOpenEvoTimelineSummary(model);
+  const lifecycleAuthError = unsupportedLifecycleAuthMessage(model);
 
   const refreshSavedConfigs = async () => {
     catalogRefreshGeneration.current += 1;
@@ -162,6 +163,10 @@ export function OpenEvoDesktop() {
   };
 
   const handleWorkspaceSync = async () => {
+    if (lifecycleAuthError) {
+      setWorkspaceError(lifecycleAuthError);
+      return;
+    }
     setWorkspaceRunning(true);
     setWorkspaceError(null);
     setWorkspaceReport(null);
@@ -261,6 +266,10 @@ export function OpenEvoDesktop() {
   };
 
   const handleBootstrap = async () => {
+    if (lifecycleAuthError) {
+      setBootstrapError(lifecycleAuthError);
+      return;
+    }
     setBootstrapRunning(true);
     setBootstrapError(null);
     setBootstrapReport(null);
@@ -279,6 +288,10 @@ export function OpenEvoDesktop() {
   };
 
   const handleStartRun = async () => {
+    if (lifecycleAuthError) {
+      setRunError(lifecycleAuthError);
+      return;
+    }
     invalidateRunPolling();
     const generation = runPollGeneration.current;
     setRunRunning(true);
@@ -361,7 +374,8 @@ export function OpenEvoDesktop() {
               bootstrapRunning ||
               runRunning ||
               configSaving ||
-              activatingConfigSlug !== null
+              activatingConfigSlug !== null ||
+              lifecycleAuthError !== null
             }
             onClick={handleWorkspaceSync}
           />
@@ -374,7 +388,8 @@ export function OpenEvoDesktop() {
               workspaceRunning ||
               runRunning ||
               configSaving ||
-              activatingConfigSlug !== null
+              activatingConfigSlug !== null ||
+              lifecycleAuthError !== null
             }
             onClick={handleBootstrap}
           />
@@ -388,7 +403,8 @@ export function OpenEvoDesktop() {
               workspaceRunning ||
               bootstrapRunning ||
               configSaving ||
-              activatingConfigSlug !== null
+              activatingConfigSlug !== null ||
+              lifecycleAuthError !== null
             }
             onClick={handleStartRun}
           />
@@ -729,6 +745,7 @@ export function OpenEvoDesktop() {
             <Field label="Profile" value={`${model.remote.id} - ${model.remote.user}`} />
             <Field label="Host" value={`${model.remote.host}:${model.remote.port}`} />
             <Field label="Auth" value={model.remote.auth.method} />
+            <Field label="Transport" value={model.sidecar.transport.label} />
             <Field label="Workspace root" value={model.remote.workspaceRoot} />
             <Field label="HTTP proxy" value={model.remote.proxy.httpProxy} />
             <Field label="HTTPS proxy" value={model.remote.proxy.httpsProxy} />
@@ -767,6 +784,11 @@ export function OpenEvoDesktop() {
                 <span>{note}</span>
               </div>
             ))}
+            {lifecycleAuthError ? (
+              <div className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-900">
+                {lifecycleAuthError}
+              </div>
+            ) : null}
             {workspaceReport ? (
               <LifecycleReport title="Workspace Report" report={workspaceReport} />
             ) : null}
@@ -1211,6 +1233,26 @@ function PathRow({ label, value }: { label: string; value: string }) {
       </div>
     </div>
   );
+}
+
+function unsupportedLifecycleAuthMessage(
+  model: OpenEvoDesktopShellModel,
+): string | null {
+  const { auth } = model.remote;
+  const { transport } = model.sidecar;
+  if (auth.method === "password_ref" && !transport.supportsPasswordRef) {
+    return (
+      `${transport.label} cannot resolve password_ref yet. ` +
+      "Use SSH agent or a private key without a secret reference."
+    );
+  }
+  if (auth.passphraseRef !== null && !transport.supportsPassphraseRef) {
+    return (
+      `${transport.label} cannot resolve passphrase_ref yet. ` +
+      "Use SSH agent or a private key without a secret reference."
+    );
+  }
+  return null;
 }
 
 function draftFromModel(

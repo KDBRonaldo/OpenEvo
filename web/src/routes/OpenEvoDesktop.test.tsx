@@ -801,6 +801,71 @@ describe("OpenEvoDesktop", () => {
     await unmountClient(root);
   });
 
+  it("blocks lifecycle actions when SSH password refs are unsupported", async () => {
+    apiMocks.fetchOpenEvoDesktopShellModel.mockResolvedValue(
+      modelWithUnsupportedSshAuth({
+        auth: {
+          method: "password_ref",
+          privateKeyPath: null,
+          passwordRef: "keyring://openevo/science-team",
+          passphraseRef: null,
+        },
+      }),
+    );
+
+    const root = await renderClient();
+    await flushEffects();
+
+    expect(document.body.textContent).toContain(
+      "SSH transport cannot resolve password_ref yet",
+    );
+    expect(buttonByText("Sync Workspace").disabled).toBe(true);
+    expect(buttonByText("Bootstrap").disabled).toBe(true);
+    expect(buttonByText("Start Run").disabled).toBe(true);
+
+    await act(async () => {
+      buttonByText("Sync Workspace").dispatchEvent(
+        new MouseEvent("click", { bubbles: true }),
+      );
+      buttonByText("Bootstrap").dispatchEvent(
+        new MouseEvent("click", { bubbles: true }),
+      );
+      buttonByText("Start Run").dispatchEvent(
+        new MouseEvent("click", { bubbles: true }),
+      );
+      await Promise.resolve();
+    });
+
+    expect(apiMocks.runOpenEvoWorkspaceSync).not.toHaveBeenCalled();
+    expect(apiMocks.runOpenEvoBootstrap).not.toHaveBeenCalled();
+    expect(apiMocks.runOpenEvoStartRun).not.toHaveBeenCalled();
+    await unmountClient(root);
+  });
+
+  it("blocks lifecycle actions when SSH passphrase refs are unsupported", async () => {
+    apiMocks.fetchOpenEvoDesktopShellModel.mockResolvedValue(
+      modelWithUnsupportedSshAuth({
+        auth: {
+          method: "private_key",
+          privateKeyPath: "/home/alice/.ssh/openevo",
+          passwordRef: null,
+          passphraseRef: "keyring://openevo/science-team",
+        },
+      }),
+    );
+
+    const root = await renderClient();
+    await flushEffects();
+
+    expect(document.body.textContent).toContain(
+      "SSH transport cannot resolve passphrase_ref yet",
+    );
+    expect(buttonByText("Sync Workspace").disabled).toBe(true);
+    expect(buttonByText("Bootstrap").disabled).toBe(true);
+    expect(buttonByText("Start Run").disabled).toBe(true);
+    await unmountClient(root);
+  });
+
   it("renders failed workspace actions from the workspace report", async () => {
     const shellModel = modelWithWorkspace({
       projectName: "Loaded Science Project",
@@ -1438,6 +1503,33 @@ function modelWithWorkspace({
           }
         : service,
     ),
+  };
+}
+
+function modelWithUnsupportedSshAuth({
+  auth,
+}: {
+  auth: OpenEvoDesktopShellModel["remote"]["auth"];
+}): OpenEvoDesktopShellModel {
+  const model = modelWithWorkspace({
+    projectName: "Loaded Science Project",
+    state: "planned",
+    detail: "Workspace preparation has not run yet",
+  });
+  return {
+    ...model,
+    remote: {
+      ...model.remote,
+      auth,
+    },
+    sidecar: {
+      transport: {
+        id: "ssh",
+        label: "SSH transport",
+        supportsPasswordRef: false,
+        supportsPassphraseRef: false,
+      },
+    },
   };
 }
 

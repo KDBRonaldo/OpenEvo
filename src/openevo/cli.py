@@ -417,6 +417,7 @@ def _build_sidecar_serve_app(args: argparse.Namespace, *, command_name: str):
             project,
             profile,
             transport_factory=_sidecar_transport_factory(args.transport),
+            transport_kind=args.transport,
         )
     config_root = (
         Path(args.desktop_config_root).expanduser()
@@ -426,6 +427,7 @@ def _build_sidecar_serve_app(args: argparse.Namespace, *, command_name: str):
     return create_sidecar_app(
         config_root=config_root,
         transport_factory=_sidecar_transport_factory(args.transport),
+        transport_kind=args.transport,
     )
 
 

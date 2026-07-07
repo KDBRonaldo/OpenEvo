@@ -57,6 +57,14 @@ export interface OpenEvoDesktopShellModel {
     enabled: boolean;
     benchmarkControlsVisible: boolean;
   };
+  sidecar: {
+    transport: {
+      id: "dry-run" | "ssh";
+      label: string;
+      supportsPasswordRef: boolean;
+      supportsPassphraseRef: boolean;
+    };
+  };
 }
 
 export interface OpenEvoTimelineSummary {
@@ -165,6 +173,14 @@ export function getOpenEvoDesktopShellModel(): OpenEvoDesktopShellModel {
     developerMode: {
       enabled: false,
       benchmarkControlsVisible: false,
+    },
+    sidecar: {
+      transport: {
+        id: "dry-run",
+        label: "Dry-run transport",
+        supportsPasswordRef: true,
+        supportsPassphraseRef: true,
+      },
     },
   };
 }

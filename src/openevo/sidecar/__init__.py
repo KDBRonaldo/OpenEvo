@@ -20,6 +20,7 @@ from openevo.sidecar.workspace import (
 )
 from openevo.sidecar.api import (
     DesktopExecutionStatus,
+    DesktopSidecarTransport,
     OpenEvoDesktopBootstrapResponse,
     OpenEvoDesktopProjectConfigResponse,
     OpenEvoDesktopRunResponse,
@@ -48,6 +49,7 @@ __all__ = [
     "DesktopProjectConfigDraft",
     "DesktopProjectConfigPaths",
     "DesktopProjectConfigSummary",
+    "DesktopSidecarTransport",
     "OpenEvoDesktopBootstrapResponse",
     "OpenEvoDesktopProjectConfigResponse",
     "OpenEvoDesktopRunResponse",

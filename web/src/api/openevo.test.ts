@@ -77,6 +77,15 @@ describe("OpenEvo sidecar client", () => {
         enabled: false,
         benchmark_controls_visible: false,
       },
+      sidecar: {
+        mutation_token: "token-123",
+        transport: {
+          id: "ssh",
+          label: "SSH transport",
+          supports_password_ref: false,
+          supports_passphrase_ref: false,
+        },
+      },
     });
 
     expect(model.remote.proxy.httpsProxy).toBe("http://127.0.0.1:7890");
@@ -94,6 +103,12 @@ describe("OpenEvo sidecar client", () => {
     expect(model.bootstrap.readinessNotes).toEqual([
       "Codex subscription login available",
     ]);
+    expect(model.sidecar.transport).toEqual({
+      id: "ssh",
+      label: "SSH transport",
+      supportsPasswordRef: false,
+      supportsPassphraseRef: false,
+    });
     expect(model.developerMode.benchmarkControlsVisible).toBe(false);
   });
 

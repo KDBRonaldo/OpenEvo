@@ -228,6 +228,13 @@ the Desktop setup draft after startup or saved-config activation: profile id,
 host, port, user, auth method plus key/reference ids, effective workspace root,
 HTTP/HTTPS proxy, `NO_PROXY`, `PIP_INDEX_URL`, Hugging Face endpoint, and
 `HF_HOME`. It does not include raw passwords or private-key material.
+The response also includes `sidecar.transport` capability metadata for the
+selected local mutating transport. Desktop uses it to block lifecycle actions
+before remote execution when the active auth settings require unsupported
+secret-reference resolution, such as `password_ref` or `passphrase_ref` with the
+current SSH transport. The sidecar API enforces the same capability check on
+workspace sync, bootstrap, and run launch, returning `409` before invoking the
+remote transport.
 
 `POST /openevo-api/desktop/project-config` is the local setup endpoint for
 ordinary Desktop users. It is mutation-token protected and available when the

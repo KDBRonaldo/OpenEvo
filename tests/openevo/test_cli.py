@@ -535,8 +535,14 @@ def test_cli_sidecar_serve_loads_config_status(
     class FakeApp:
         title = "OpenEvo Desktop Sidecar"
 
-    def fake_create_project_app(project, profile, *, transport_factory):
-        app_calls.append((project, profile, transport_factory))
+    def fake_create_project_app(
+        project,
+        profile,
+        *,
+        transport_factory,
+        transport_kind,
+    ):
+        app_calls.append((project, profile, transport_factory, transport_kind))
         return FakeApp()
 
     def fake_runner(app, *, host: str, port: int) -> None:
@@ -568,10 +574,11 @@ def test_cli_sidecar_serve_loads_config_status(
 
     assert exit_code == 0
     assert len(app_calls) == 1
-    project, profile, transport_factory = app_calls[0]
+    project, profile, transport_factory, transport_kind = app_calls[0]
     assert project.task.id == "folding-baseline"
     assert profile.id == "science-team"
     assert transport_factory(profile).__class__.__name__ == "_CliDryRunTransport"
+    assert transport_kind == "dry-run"
     assert runner_calls == [("OpenEvo Desktop Sidecar", "127.0.0.1", 3766)]
 
 
@@ -584,8 +591,14 @@ def test_cli_sidecar_serve_ssh_transport_factory_is_lazy(
     class FakeApp:
         title = "OpenEvo Desktop Sidecar"
 
-    def fake_create_project_app(project, profile, *, transport_factory):
-        app_calls.append((project, profile, transport_factory))
+    def fake_create_project_app(
+        project,
+        profile,
+        *,
+        transport_factory,
+        transport_kind,
+    ):
+        app_calls.append((project, profile, transport_factory, transport_kind))
         return FakeApp()
 
     monkeypatch.setattr("openevo.cli.create_sidecar_app_for_project", fake_create_project_app)
@@ -621,7 +634,8 @@ def test_cli_sidecar_serve_ssh_transport_factory_is_lazy(
 
     assert exit_code == 0
     assert _CliRecordingSshTransport.profiles == []
-    _, profile, transport_factory = app_calls[0]
+    _, profile, transport_factory, transport_kind = app_calls[0]
+    assert transport_kind == "ssh"
     transport_factory(profile)
     assert _CliRecordingSshTransport.profiles[0].id == "science-team"
 
@@ -810,8 +824,14 @@ def test_cli_desktop_serve_loads_config_status(
     class FakeApp:
         title = "OpenEvo Desktop Sidecar"
 
-    def fake_create_project_app(project, profile, *, transport_factory):
-        app_calls.append((project, profile, transport_factory))
+    def fake_create_project_app(
+        project,
+        profile,
+        *,
+        transport_factory,
+        transport_kind,
+    ):
+        app_calls.append((project, profile, transport_factory, transport_kind))
         return FakeApp()
 
     def fake_create_desktop_app(app, *, static_root=None):
@@ -850,10 +870,11 @@ def test_cli_desktop_serve_loads_config_status(
     )
 
     assert exit_code == 0
-    project, profile, transport_factory = app_calls[0]
+    project, profile, transport_factory, transport_kind = app_calls[0]
     assert project.task.id == "folding-baseline"
     assert profile.id == "science-team"
     assert transport_factory(profile).__class__.__name__ == "_CliDryRunTransport"
+    assert transport_kind == "dry-run"
     assert desktop_calls[0][1] == tmp_path / "web"
 
 

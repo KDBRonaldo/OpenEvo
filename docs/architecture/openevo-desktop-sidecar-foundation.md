@@ -59,6 +59,15 @@ profile: host, port, user, auth method and reference ids, effective workspace
 root, and proxy/mirror fields. The saved-config catalog remains more restrictive
 and does not expose private-key paths or secret references.
 
+Desktop shell status also returns `sidecar.transport` for the active local
+sidecar process. That object is capability metadata, not a credential surface:
+it includes the selected transport id and label plus
+`supports_password_ref`/`supports_passphrase_ref` booleans. The Desktop UI uses
+those booleans to keep future vault-compatible profile schemas round-trippable
+while blocking lifecycle actions that the current transport cannot execute. The
+sidecar mutating endpoints enforce the same check and return `409` before any
+remote command runs.
+
 ## Proxy And Mirrors
 
 The profile proxy settings support remote servers behind restricted networks or

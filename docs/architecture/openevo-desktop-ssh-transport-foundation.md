@@ -79,6 +79,15 @@ vault before it can safely resolve them. Until that vault exists, the SSH
 transport rejects these auth modes with actionable errors instead of prompting,
 logging, or guessing.
 
+When Desktop is served with `--transport ssh`, `GET /openevo-api/desktop/shell`
+reports `sidecar.transport.supports_password_ref=false` and
+`sidecar.transport.supports_passphrase_ref=false`. The packaged Desktop UI uses
+those capability flags to preserve saved config round-tripping but disable
+workspace sync, bootstrap, and run launch until the active profile uses
+`ssh_agent` or a private key without a secret reference. The sidecar API applies
+the same guard to direct mutating requests and returns `409` before constructing
+the SSH transport.
+
 ## Command Execution
 
 `run(command, env=..., cwd=...)` builds:
