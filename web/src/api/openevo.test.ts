@@ -1,5 +1,10 @@
-import { describe, expect, it } from "vitest";
-import { toOpenEvoDesktopShellModel } from "./openevo";
+import { describe, expect, it, vi } from "vitest";
+import {
+  fetchOpenEvoDesktopShellModel,
+  runOpenEvoBootstrap,
+  toOpenEvoBootstrapResponse,
+  toOpenEvoDesktopShellModel,
+} from "./openevo";
 
 describe("OpenEvo sidecar client", () => {
   it("maps sidecar shell status to the route model", () => {
@@ -60,4 +65,143 @@ describe("OpenEvo sidecar client", () => {
     ]);
     expect(model.developerMode.benchmarkControlsVisible).toBe(false);
   });
+
+  it("maps bootstrap response status to the route model", () => {
+    const response = toOpenEvoBootstrapResponse({
+      bootstrap: {
+        ready: true,
+        state_root: "/home/alice/.openevo/runs/protein/folding",
+        workspace_root: "/home/alice/.openevo/workspaces",
+        readiness_notes: ["Remote bootstrap is ready."],
+      },
+      report: {
+        ready: true,
+        prepared_paths: {
+          bootstrap_manifest: "/home/alice/.openevo/runs/protein/folding/bootstrap.json",
+        },
+      },
+      status: {
+        remote: {
+          id: "lab-gpu",
+          host: "gpu.example.edu",
+          user: "alice",
+          proxy: {
+            https_proxy: "http://127.0.0.1:7890",
+            huggingface_endpoint: null,
+          },
+        },
+        project: {
+          name: "Protein Folding Literature Sprint",
+          task_id: "folding-baseline",
+          source: "Remote path: /datasets/folding-baseline",
+          objective: "Improve folding.",
+        },
+        execution: {
+          mode: "codex_subscription_transcript",
+          model: "gpt-5.1-codex-mini",
+          token_metrics_available: false,
+        },
+        bootstrap: {
+          ready: true,
+          state_root: "/home/alice/.openevo/runs/protein/folding",
+          workspace_root: "/home/alice/.openevo/workspaces",
+          readiness_notes: ["Remote bootstrap is ready."],
+        },
+        services: [],
+        evolution: [],
+        developer_mode: {
+          enabled: false,
+          benchmark_controls_visible: false,
+        },
+      },
+    });
+
+    expect(response.bootstrap.ready).toBe(true);
+    expect(response.status.bootstrap.readinessNotes).toEqual([
+      "Remote bootstrap is ready.",
+    ]);
+    expect(response.report.prepared_paths).toEqual({
+      bootstrap_manifest: "/home/alice/.openevo/runs/protein/folding/bootstrap.json",
+    });
+  });
+
+  it("sends the sidecar mutation token on bootstrap requests", async () => {
+    const calls: Array<{ path: string; headers: Headers }> = [];
+    const shellPayload = sidecarShellPayload("token-123");
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(
+      async (input, init) => {
+        const path = String(input);
+        calls.push({
+          path,
+          headers: new Headers(init?.headers),
+        });
+        if (path === "/openevo-api/desktop/shell") {
+          return jsonResponse(shellPayload);
+        }
+        if (path === "/openevo-api/desktop/bootstrap") {
+          return jsonResponse({
+            bootstrap: shellPayload.bootstrap,
+            report: { ready: true },
+            status: shellPayload,
+          });
+        }
+        return new Response("not found", { status: 404 });
+      },
+    );
+
+    await fetchOpenEvoDesktopShellModel();
+    await runOpenEvoBootstrap();
+
+    expect(calls).toHaveLength(2);
+    expect(calls[1]).toMatchObject({ path: "/openevo-api/desktop/bootstrap" });
+    expect(calls[1].headers.get("X-OpenEvo-Sidecar-Token")).toBe("token-123");
+    fetchMock.mockRestore();
+  });
 });
+
+function sidecarShellPayload(mutationToken: string) {
+  return {
+    remote: {
+      id: "lab-gpu",
+      host: "gpu.example.edu",
+      user: "alice",
+      proxy: {
+        https_proxy: "http://127.0.0.1:7890",
+        huggingface_endpoint: null,
+      },
+    },
+    project: {
+      name: "Protein Folding Literature Sprint",
+      task_id: "folding-baseline",
+      source: "Remote path: /datasets/folding-baseline",
+      objective: "Improve folding.",
+    },
+    execution: {
+      mode: "codex_subscription_transcript" as const,
+      model: "gpt-5.1-codex-mini",
+      token_metrics_available: false,
+    },
+    bootstrap: {
+      ready: true,
+      state_root: "/home/alice/.openevo/runs/protein/folding",
+      workspace_root: "/home/alice/.openevo/workspaces",
+      readiness_notes: ["Remote bootstrap is ready."],
+    },
+    services: [],
+    evolution: [],
+    developer_mode: {
+      enabled: false,
+      benchmark_controls_visible: false,
+    },
+    sidecar: {
+      mutation_token: mutationToken,
+    },
+  };
+}
+
+function jsonResponse(payload: object): Response {
+  return new Response(JSON.stringify(payload), {
+    status: 200,
+    headers: { "Content-Type": "application/json" },
+  });
+}

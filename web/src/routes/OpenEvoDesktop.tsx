@@ -14,7 +14,10 @@ import {
   Upload,
 } from "lucide-react";
 import { useEffect, useState, type ReactNode } from "react";
-import { fetchOpenEvoDesktopShellModel } from "../api/openevo";
+import {
+  fetchOpenEvoDesktopShellModel,
+  runOpenEvoBootstrap,
+} from "../api/openevo";
 import {
   type EvolutionStepState,
   type RemoteServiceState,
@@ -38,6 +41,9 @@ const evolutionTone: Record<EvolutionStepState, string> = {
 
 export function OpenEvoDesktop() {
   const [model, setModel] = useState(() => getOpenEvoDesktopShellModel());
+  const [sidecarConnected, setSidecarConnected] = useState(false);
+  const [bootstrapRunning, setBootstrapRunning] = useState(false);
+  const [bootstrapError, setBootstrapError] = useState<string | null>(null);
   const summary = getOpenEvoTimelineSummary(model);
 
   useEffect(() => {
@@ -47,6 +53,7 @@ export function OpenEvoDesktop() {
       .then((nextModel) => {
         if (!cancelled) {
           setModel(nextModel);
+          setSidecarConnected(true);
         }
       })
       .catch(() => undefined);
@@ -55,6 +62,21 @@ export function OpenEvoDesktop() {
       cancelled = true;
     };
   }, []);
+
+  const handleBootstrap = async () => {
+    setBootstrapRunning(true);
+    setBootstrapError(null);
+    try {
+      const response = await runOpenEvoBootstrap();
+      setModel(response.status);
+      setSidecarConnected(true);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Bootstrap failed";
+      setBootstrapError(message);
+    } finally {
+      setBootstrapRunning(false);
+    }
+  };
 
   return (
     <div className="space-y-5">
@@ -75,9 +97,14 @@ export function OpenEvoDesktop() {
           </div>
         </div>
         <div className="flex flex-wrap gap-2">
-          <CommandButton icon={<Upload size={16} />} label="Sync Workspace" />
-          <CommandButton icon={<RefreshCw size={16} />} label="Bootstrap" />
-          <CommandButton icon={<Play size={16} />} label="Start Run" primary />
+          <CommandButton icon={<Upload size={16} />} label="Sync Workspace" disabled />
+          <CommandButton
+            icon={<RefreshCw size={16} />}
+            label={bootstrapRunning ? "Bootstrapping" : "Bootstrap"}
+            disabled={!sidecarConnected || bootstrapRunning}
+            onClick={handleBootstrap}
+          />
+          <CommandButton icon={<Play size={16} />} label="Start Run" primary disabled />
         </div>
       </section>
 
@@ -150,6 +177,11 @@ export function OpenEvoDesktop() {
                 <span>{note}</span>
               </div>
             ))}
+            {bootstrapError ? (
+              <div className="rounded-md border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-900">
+                {bootstrapError}
+              </div>
+            ) : null}
           </div>
         </Panel>
 
@@ -215,19 +247,28 @@ function CommandButton({
   icon,
   label,
   primary = false,
+  disabled = false,
+  onClick,
 }: {
   icon: ReactNode;
   label: string;
   primary?: boolean;
+  disabled?: boolean;
+  onClick?: () => void;
 }) {
   return (
     <button
       type="button"
-      disabled
+      disabled={disabled}
+      onClick={onClick}
       className={`inline-flex h-9 items-center gap-2 rounded-md border px-3 text-sm font-medium ${
         primary
-          ? "border-slate-900 bg-slate-900 text-white opacity-80"
-          : "border-slate-200 bg-white text-slate-500 opacity-80"
+          ? "border-slate-900 bg-slate-900 text-white"
+          : "border-slate-200 bg-white text-slate-700"
+      } ${
+        disabled
+          ? "cursor-not-allowed opacity-60"
+          : "hover:border-slate-300 hover:bg-slate-50"
       }`}
     >
       {icon}

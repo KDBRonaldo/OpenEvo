@@ -104,9 +104,9 @@ and subscription checks run only when subscription execution is required.
 
 ## Desktop Web Shell
 
-The first web shell lives at `/openevo` in the existing Vite app. It is
-fixture/local-state backed in this slice and is meant to validate the ordinary
-science-user layout before the Python sidecar API is connected.
+The first web shell lives at `/openevo` in the existing Vite app. It uses the
+local Python sidecar API when available and keeps a fixture fallback so the
+layout remains usable when the sidecar is not running.
 
 The shell intentionally keeps Terminal Bench and low-level runtime image fields
 out of the default flow. It displays the remote profile, proxy settings, Science
@@ -130,9 +130,9 @@ openevo sidecar serve \
 
 In this mode the sidecar reads the local Science Project YAML and remote profile
 YAML, validates them, builds the existing sidecar science plan, and derives a
-Desktop shell status response from those contracts. This is a local read-only
-operation; it does not run SSH, remote preflight, workspace upload, git clone,
-bootstrap, model download, or remote service startup.
+Desktop shell status response from those contracts. The status endpoint is a
+local read-only operation; it does not run SSH, remote preflight, workspace
+upload, git clone, bootstrap, model download, or remote service startup.
 
 The first endpoint is `GET /openevo-api/desktop/shell`. It returns typed shell
 status for the `/openevo` route and keeps the same subscription transcript
@@ -140,9 +140,36 @@ semantics as the Python sidecar contracts: token-level metrics remain false in
 subscription mode, bootstrap readiness is represented separately from
 informational readiness notes, and no direct model API call is made.
 
-This slice does not let the HTTP API start SSH bootstrap, vLLM, Polar gateway,
-rollout, or evolution worker processes. Those operations remain behind the
-existing CLI and remote lifecycle contracts until a supervisor is added.
+`POST /openevo-api/desktop/bootstrap` is the first mutating sidecar endpoint.
+It is available only for config-backed sidecar sessions. It reuses
+`build_sidecar_science_plan()`, `build_remote_bootstrap_plan()`, and
+`execute_remote_bootstrap_plan()` to run the existing bootstrap executor, then
+returns both the bootstrap report and refreshed shell status. The default serve
+transport is dry-run; `openevo sidecar serve --transport ssh` selects the SSH
+transport for the bootstrap endpoint. Bootstrap does not upload local folders or
+clone git task sources; workspace preparation remains a separate lifecycle step
+so the UI can report source materialization independently from runtime
+readiness.
+
+The sidecar generates a per-process mutation token and includes it in
+`GET /openevo-api/desktop/shell` under `sidecar.mutation_token`. Mutating
+requests must send that token in the non-simple
+`X-OpenEvo-Sidecar-Token` header. Missing or invalid tokens are rejected before
+any bootstrap work starts. This is a local CSRF guard for the Desktop sidecar:
+cross-site pages can submit simple localhost requests, but cannot read the
+same-origin shell response or set the required custom header. The sidecar also
+serializes bootstrap runs per config-backed session; a second bootstrap request
+returns 409 while one is already running.
+
+Dry-run serve mode is intended for local UI development and smoke tests. It
+exercises the same planning and report mapping path, but it does not mutate the
+remote server. A dry-run report can therefore show the UI path as ready without
+proving that remote files, Docker images, or Hugging Face models were actually
+prepared. Real remote preparation requires `--transport ssh`.
+
+This slice does not let the HTTP API start vLLM, Polar gateway, rollout,
+evolution worker, or long-running OpenEvo backend processes. Those operations
+remain behind the remote lifecycle contracts until a supervisor is added.
 
 ## CLI
 

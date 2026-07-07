@@ -26,8 +26,8 @@ from openevo.science import (
 )
 from openevo.sidecar import (
     build_sidecar_science_plan,
-    build_desktop_shell_status,
     create_sidecar_app,
+    create_sidecar_app_for_project,
     load_remote_profile_config,
 )
 
@@ -167,6 +167,12 @@ def build_parser() -> argparse.ArgumentParser:
     serve_parser.add_argument(
         "--remote-profile",
         help="Optional remote profile YAML used with --config.",
+    )
+    serve_parser.add_argument(
+        "--transport",
+        choices=("dry-run", "ssh"),
+        default="dry-run",
+        help="Remote executor transport used by sidecar bootstrap. Defaults to dry-run.",
     )
     return parser
 
@@ -311,12 +317,19 @@ def _handle_sidecar_bootstrap(args: argparse.Namespace) -> int:
 def _handle_sidecar_serve(args: argparse.Namespace) -> int:
     if bool(args.config) != bool(args.remote_profile):
         raise ValueError("sidecar serve --config and --remote-profile must be used together")
-    status = None
+    if args.transport == "ssh" and not args.config:
+        raise ValueError("sidecar serve --transport ssh requires --config and --remote-profile")
     if args.config and args.remote_profile:
         project = load_science_project_config(Path(args.config))
         profile = load_remote_profile_config(Path(args.remote_profile))
-        status = build_desktop_shell_status(project, profile)
-    _run_sidecar_server(create_sidecar_app(status), host=args.host, port=args.port)
+        app = create_sidecar_app_for_project(
+            project,
+            profile,
+            transport_factory=_sidecar_transport_factory(args.transport),
+        )
+    else:
+        app = create_sidecar_app()
+    _run_sidecar_server(app, host=args.host, port=args.port)
     return 0
 
 
@@ -332,6 +345,14 @@ def _sidecar_transport(args: argparse.Namespace, profile):
     if args.transport == "ssh":
         return SshRemoteExecutorTransport(profile)
     raise ValueError(f"Unknown sidecar transport: {args.transport}")
+
+
+def _sidecar_transport_factory(transport: str):
+    if transport == "dry-run":
+        return lambda profile: _CliDryRunTransport()
+    if transport == "ssh":
+        return lambda profile: SshRemoteExecutorTransport(profile)
+    raise ValueError(f"Unknown sidecar transport: {transport}")
 
 
 class _CliDryRunTransport:

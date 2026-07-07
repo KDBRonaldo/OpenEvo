@@ -1,15 +1,23 @@
 from __future__ import annotations
 
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from _thread import LockType
 import posixpath
 import re
-from typing import Literal
+import secrets
+from typing import Any, Literal
+from threading import Lock
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from openevo.remote.executor import RemoteExecutorTransport
 from openevo.science import ScienceProjectConfig
 from openevo.sidecar.models import RemoteProfileConfig
 from openevo.sidecar.planner import build_sidecar_science_plan
+
+SIDECAR_MUTATION_TOKEN_HEADER = "X-OpenEvo-Sidecar-Token"
 
 
 class _StrictFrozenModel(BaseModel):
@@ -96,6 +104,20 @@ class DesktopDeveloperMode(_StrictFrozenModel):
     benchmark_controls_visible: bool = False
 
 
+class DesktopSidecarSecurity(_StrictFrozenModel):
+    mutation_token: str | None = None
+
+    @field_validator("mutation_token")
+    @classmethod
+    def _strip_token(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        token = value.strip()
+        if not token:
+            raise ValueError("mutation_token must be a non-empty string")
+        return token
+
+
 class OpenEvoDesktopShellStatus(_StrictFrozenModel):
     remote: DesktopRemoteProfile
     project: DesktopScienceProject
@@ -104,6 +126,7 @@ class OpenEvoDesktopShellStatus(_StrictFrozenModel):
     services: tuple[DesktopServiceStatus, ...] = Field(default_factory=tuple)
     evolution: tuple[DesktopEvolutionStep, ...] = Field(default_factory=tuple)
     developer_mode: DesktopDeveloperMode = Field(default_factory=DesktopDeveloperMode)
+    sidecar: DesktopSidecarSecurity = Field(default_factory=DesktopSidecarSecurity)
 
     @field_validator("services", "evolution", mode="before")
     @classmethod
@@ -111,6 +134,22 @@ class OpenEvoDesktopShellStatus(_StrictFrozenModel):
         if isinstance(value, list):
             return tuple(value)
         return value
+
+
+class OpenEvoDesktopBootstrapResponse(_StrictFrozenModel):
+    bootstrap: DesktopBootstrapStatus
+    report: dict[str, Any]
+    status: OpenEvoDesktopShellStatus
+
+
+@dataclass
+class OpenEvoSidecarSession:
+    project: ScienceProjectConfig
+    profile: RemoteProfileConfig
+    transport_factory: Callable[[RemoteProfileConfig], RemoteExecutorTransport]
+    status: OpenEvoDesktopShellStatus
+    last_bootstrap_report: object | None = None
+    bootstrap_lock: LockType = field(default_factory=Lock)
 
 
 def build_desktop_shell_status(
@@ -241,8 +280,12 @@ def default_desktop_shell_status() -> OpenEvoDesktopShellStatus:
 
 def create_sidecar_app(
     status: OpenEvoDesktopShellStatus | None = None,
+    *,
+    session: OpenEvoSidecarSession | None = None,
+    mutation_token: str | None = None,
 ) -> FastAPI:
     desktop_status = status or default_desktop_shell_status()
+    sidecar_token = _mutation_token(mutation_token)
     app = FastAPI(title="OpenEvo Desktop Sidecar", version="0.1.0")
 
     @app.get("/health", response_model=SidecarHealth)
@@ -254,9 +297,61 @@ def create_sidecar_app(
         response_model=OpenEvoDesktopShellStatus,
     )
     def desktop_shell() -> OpenEvoDesktopShellStatus:
-        return desktop_status
+        if session is not None:
+            return _status_with_mutation_token(session.status, sidecar_token)
+        return _status_with_mutation_token(desktop_status, sidecar_token)
+
+    @app.post(
+        "/openevo-api/desktop/bootstrap",
+        response_model=OpenEvoDesktopBootstrapResponse,
+    )
+    def bootstrap(
+        token: str | None = Header(
+            default=None,
+            alias=SIDECAR_MUTATION_TOKEN_HEADER,
+        ),
+    ) -> OpenEvoDesktopBootstrapResponse:
+        _validate_mutation_token(token, sidecar_token)
+        if session is None:
+            raise HTTPException(
+                status_code=409,
+                detail="Desktop bootstrap requires a config-backed sidecar session.",
+            )
+        if not session.bootstrap_lock.acquire(blocking=False):
+            raise HTTPException(
+                status_code=409,
+                detail="Desktop bootstrap is already running.",
+            )
+        try:
+            report = _run_bootstrap(session)
+            session.last_bootstrap_report = report
+            session.status = _status_after_bootstrap(session.status, report)
+        finally:
+            session.bootstrap_lock.release()
+        response_status = _status_with_mutation_token(session.status, sidecar_token)
+        return OpenEvoDesktopBootstrapResponse(
+            bootstrap=response_status.bootstrap,
+            report=report.model_dump(mode="json"),
+            status=response_status,
+        )
 
     return app
+
+
+def create_sidecar_app_for_project(
+    project: ScienceProjectConfig,
+    profile: RemoteProfileConfig,
+    *,
+    transport_factory: Callable[[RemoteProfileConfig], RemoteExecutorTransport],
+    mutation_token: str | None = None,
+) -> FastAPI:
+    session = OpenEvoSidecarSession(
+        project=project,
+        profile=profile,
+        transport_factory=transport_factory,
+        status=build_desktop_shell_status(project, profile),
+    )
+    return create_sidecar_app(session=session, mutation_token=mutation_token)
 
 
 def _execution_status(project: ScienceProjectConfig) -> DesktopExecutionStatus:
@@ -363,6 +458,100 @@ def _evolution_steps(
             )
         )
     return tuple(steps)
+
+
+def _run_bootstrap(session: OpenEvoSidecarSession):
+    from openevo.remote.bootstrap import (
+        build_remote_bootstrap_plan,
+        execute_remote_bootstrap_plan,
+    )
+
+    sidecar_plan = build_sidecar_science_plan(session.project, session.profile)
+    bootstrap_plan = build_remote_bootstrap_plan(sidecar_plan)
+    return execute_remote_bootstrap_plan(
+        bootstrap_plan,
+        session.transport_factory(session.profile),
+    )
+
+
+def _mutation_token(value: str | None) -> str:
+    if value is None:
+        return secrets.token_urlsafe(32)
+    token = value.strip()
+    if not token:
+        raise ValueError("mutation_token must be a non-empty string")
+    return token
+
+
+def _validate_mutation_token(candidate: str | None, expected: str) -> None:
+    if candidate is None or not secrets.compare_digest(candidate, expected):
+        raise HTTPException(
+            status_code=403,
+            detail="Invalid OpenEvo sidecar token.",
+        )
+
+
+def _status_with_mutation_token(
+    status: OpenEvoDesktopShellStatus,
+    token: str,
+) -> OpenEvoDesktopShellStatus:
+    return status.model_copy(
+        update={"sidecar": DesktopSidecarSecurity(mutation_token=token)}
+    )
+
+
+def _status_after_bootstrap(
+    status: OpenEvoDesktopShellStatus,
+    report,
+) -> OpenEvoDesktopShellStatus:
+    bootstrap_ready = bool(report.ready)
+    return status.model_copy(
+        update={
+            "bootstrap": status.bootstrap.model_copy(
+                update={
+                    "ready": bootstrap_ready,
+                    "readiness_notes": tuple(report.next_actions),
+                }
+            ),
+            "services": tuple(
+                _service_after_bootstrap(service, report=report)
+                for service in status.services
+            ),
+        }
+    )
+
+
+def _service_after_bootstrap(
+    service: DesktopServiceStatus,
+    *,
+    report,
+) -> DesktopServiceStatus:
+    if service.id == "ssh" and report.preflight is not None:
+        if report.preflight.ready:
+            return service.model_copy(
+                update={"state": "ready", "detail": "Remote preflight passed"}
+            )
+        return service.model_copy(
+            update={"state": "blocked", "detail": "Remote preflight failed"}
+        )
+    if service.id == "bootstrap":
+        if report.ready:
+            return service.model_copy(
+                update={
+                    "state": "ready",
+                    "detail": "Runtime image and manifests prepared",
+                }
+            )
+        return service.model_copy(
+            update={"state": "blocked", "detail": _bootstrap_blocked_detail(report)}
+        )
+    return service
+
+
+def _bootstrap_blocked_detail(report) -> str:
+    if report.next_actions:
+        return report.next_actions[0]
+    return "Remote bootstrap did not complete."
 
 
 def _state_root(workspace_root: str, *, project_name: str, task_id: str) -> str:

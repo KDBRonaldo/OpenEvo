@@ -493,14 +493,14 @@ def test_cli_sidecar_serve_loads_config_status(
     class FakeApp:
         title = "OpenEvo Desktop Sidecar"
 
-    def fake_create_app(status=None):
-        app_calls.append(status)
+    def fake_create_project_app(project, profile, *, transport_factory):
+        app_calls.append((project, profile, transport_factory))
         return FakeApp()
 
     def fake_runner(app, *, host: str, port: int) -> None:
         runner_calls.append((app.title, host, port))
 
-    monkeypatch.setattr("openevo.cli.create_sidecar_app", fake_create_app)
+    monkeypatch.setattr("openevo.cli.create_sidecar_app_for_project", fake_create_project_app)
     monkeypatch.setattr("openevo.cli._run_sidecar_server", fake_runner)
     science_path = _write_config(tmp_path / "science.yaml", _minimal_science_payload())
     profile_path = _write_config(
@@ -526,9 +526,69 @@ def test_cli_sidecar_serve_loads_config_status(
 
     assert exit_code == 0
     assert len(app_calls) == 1
-    assert app_calls[0].project.task_id == "folding-baseline"
-    assert app_calls[0].remote.id == "science-team"
+    project, profile, transport_factory = app_calls[0]
+    assert project.task.id == "folding-baseline"
+    assert profile.id == "science-team"
+    assert transport_factory(profile).__class__.__name__ == "_CliDryRunTransport"
     assert runner_calls == [("OpenEvo Desktop Sidecar", "127.0.0.1", 3766)]
+
+
+def test_cli_sidecar_serve_ssh_transport_factory_is_lazy(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    app_calls = []
+
+    class FakeApp:
+        title = "OpenEvo Desktop Sidecar"
+
+    def fake_create_project_app(project, profile, *, transport_factory):
+        app_calls.append((project, profile, transport_factory))
+        return FakeApp()
+
+    monkeypatch.setattr("openevo.cli.create_sidecar_app_for_project", fake_create_project_app)
+    monkeypatch.setattr("openevo.cli._run_sidecar_server", lambda app, *, host, port: None)
+    _CliRecordingSshTransport.profiles = []
+    monkeypatch.setattr(
+        "openevo.cli.SshRemoteExecutorTransport",
+        _CliRecordingSshTransport,
+    )
+    science_path = _write_config(tmp_path / "science.yaml", _minimal_science_payload())
+    profile_path = _write_config(
+        tmp_path / "remote.yaml",
+        {
+            "version": 1,
+            "id": "science-team",
+            "host": "gpu.example.edu",
+            "user": "alice",
+        },
+    )
+
+    exit_code = main(
+        [
+            "sidecar",
+            "serve",
+            "--config",
+            str(science_path),
+            "--remote-profile",
+            str(profile_path),
+            "--transport",
+            "ssh",
+        ]
+    )
+
+    assert exit_code == 0
+    assert _CliRecordingSshTransport.profiles == []
+    _, profile, transport_factory = app_calls[0]
+    transport_factory(profile)
+    assert _CliRecordingSshTransport.profiles[0].id == "science-team"
+
+
+def test_cli_sidecar_serve_rejects_ssh_transport_without_config(capsys) -> None:
+    exit_code = main(["sidecar", "serve", "--transport", "ssh"])
+
+    assert exit_code == 1
+    assert "sidecar serve --transport ssh requires --config" in capsys.readouterr().err
 
 
 def test_cli_sidecar_serve_requires_config_and_profile_together(

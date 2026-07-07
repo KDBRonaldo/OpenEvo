@@ -20,16 +20,21 @@ from openevo.sidecar.workspace import (
 )
 from openevo.sidecar.api import (
     DesktopExecutionStatus,
+    OpenEvoDesktopBootstrapResponse,
     OpenEvoDesktopShellStatus,
+    OpenEvoSidecarSession,
     SidecarHealth,
     build_desktop_shell_status,
     create_sidecar_app,
+    create_sidecar_app_for_project,
     default_desktop_shell_status,
 )
 
 __all__ = [
     "DesktopExecutionStatus",
+    "OpenEvoDesktopBootstrapResponse",
     "OpenEvoDesktopShellStatus",
+    "OpenEvoSidecarSession",
     "ProxySettings",
     "RemoteProfileConfig",
     "SSHAuthConfig",
@@ -40,6 +45,7 @@ __all__ = [
     "build_sidecar_science_plan",
     "build_desktop_shell_status",
     "create_sidecar_app",
+    "create_sidecar_app_for_project",
     "default_desktop_shell_status",
     "load_remote_profile_config",
     "plan_workspace_preparation",

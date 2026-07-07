@@ -48,13 +48,69 @@ export interface OpenEvoDesktopShellStatusPayload {
     enabled: boolean;
     benchmark_controls_visible: boolean;
   };
+  sidecar?: {
+    mutation_token: string | null;
+  };
 }
+
+export interface OpenEvoBootstrapResponsePayload {
+  bootstrap: OpenEvoDesktopShellStatusPayload["bootstrap"];
+  report: Record<string, any>;
+  status: OpenEvoDesktopShellStatusPayload;
+}
+
+export interface OpenEvoBootstrapResponse {
+  bootstrap: OpenEvoDesktopShellModel["bootstrap"];
+  report: Record<string, any>;
+  status: OpenEvoDesktopShellModel;
+}
+
+const sidecarMutationTokenHeader = "X-OpenEvo-Sidecar-Token";
+let sidecarMutationToken: string | null = null;
 
 export async function fetchOpenEvoDesktopShellModel(): Promise<OpenEvoDesktopShellModel> {
   const payload = await api.get<OpenEvoDesktopShellStatusPayload>(
     "/openevo-api/desktop/shell",
   );
+  rememberOpenEvoSidecarMutationToken(payload);
   return toOpenEvoDesktopShellModel(payload);
+}
+
+export async function runOpenEvoBootstrap(): Promise<OpenEvoBootstrapResponse> {
+  const headers = sidecarMutationToken
+    ? { [sidecarMutationTokenHeader]: sidecarMutationToken }
+    : undefined;
+  const payload = await api.post<OpenEvoBootstrapResponsePayload>(
+    "/openevo-api/desktop/bootstrap",
+    {},
+    headers,
+  );
+  rememberOpenEvoSidecarMutationToken(payload.status);
+  return toOpenEvoBootstrapResponse(payload);
+}
+
+export function toOpenEvoBootstrapResponse(
+  payload: OpenEvoBootstrapResponsePayload,
+): OpenEvoBootstrapResponse {
+  return {
+    bootstrap: {
+      ready: payload.bootstrap.ready,
+      stateRoot: payload.bootstrap.state_root,
+      workspaceRoot: payload.bootstrap.workspace_root,
+      readinessNotes: payload.bootstrap.readiness_notes,
+    },
+    report: payload.report,
+    status: toOpenEvoDesktopShellModel(payload.status),
+  };
+}
+
+function rememberOpenEvoSidecarMutationToken(
+  payload: OpenEvoDesktopShellStatusPayload,
+) {
+  const token = payload.sidecar?.mutation_token;
+  if (token) {
+    sidecarMutationToken = token;
+  }
 }
 
 export function toOpenEvoDesktopShellModel(
