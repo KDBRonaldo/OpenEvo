@@ -1093,6 +1093,24 @@ then returned reward `1.0`. Treat this as positive one-task controlled evidence
 for the current parametric-memory path plus a shared artifact-path repair
 guard, not as full Terminal Bench 2.1 performance evidence.
 
+A follow-up task-local pass@5 run used the same adapter and guard, but increased
+`--context-window-tokens` to `32768` so long baseline attempts would not mix
+16k context-boundary 400s into the comparison. The run at
+`/tmp/tb21-task-local-parametric-gcode-pathbound-guard-20260707/eval-gcode-qwen35-pathbound-repair-tempprintf-pass5-32k-r8-s140`
+used `--n-attempts 5`, `--solver-temperature 0.0`,
+`--vllm-generation-config vllm`, `--artifact-path-guard repair`, and
+`--required-artifact-path /app/out.txt`. Baseline had five verifier rewards of
+`0.0`, so pass@1/pass@5 was `0/1`. Parametric memory had rewards
+`[1.0, 1.0, 0.0, 1.0, 1.0]`, so pass@1/pass@5 was `1/1` and mean reward was
+`0.8`. The summary again recorded only `parametric_memory` enabled, with
+`text_memory`, `skill_bundle`, and `agent_system` disabled. The passing
+treatment attempts include six `normalize_required_artifact_printf_write`
+repair events across the tool traces. The single treatment failure shows the
+remaining stability gap: the adapter sometimes stops after `tb_read_task` or
+later drifts into malformed tool-call JSON, so this is strong single-task
+positive evidence for pass@5 under the guarded local setup, not a solved
+general parametric-memory method.
+
 For `password-recovery`, a Qwen3.5-9B local LoRA smoke was trained from the
 existing failed/successful tool-policy trajectory at
 `/tmp/tb21-parametric-memory-password-toolpolicy-20260702-110343/local-eval-password-toolpolicy-2048/baseline/harbor_jobs/baseline-password-recovery/password-recovery__AzMbthq`.
