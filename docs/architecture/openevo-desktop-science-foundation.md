@@ -482,13 +482,18 @@ workspace paths.
 
 ## Limitations
 
-This foundation slice does not include:
+The current release includes local Desktop serving, config-backed sidecar
+sessions, SSH-backed remote workspace preparation, remote bootstrap,
+command-based service startup, run supervision, and terminal-run artifact
+summary display. It still does not include:
 
-- vault or SSH tunnel management;
-- a remote backend implementation;
-- Electron packaging or sidecar process supervision;
+- local credential vault or SSH tunnel management;
+- Electron/native-app packaging or a supervised local sidecar daemon outside
+  the `openevo desktop open` / `openevo desktop serve` process;
 - Docker Compose lifecycle management;
-- production vLLM lifecycle tuning, restart policy, or adapter loading;
+- production vLLM lifecycle tuning, restart policy, GPU placement, or dynamic
+  adapter loading;
+- artifact content transfer or diff browsing in Desktop;
 - parametric memory or adapter training for Science Projects.
 
 Those capabilities remain separate layers above or below the Science Project

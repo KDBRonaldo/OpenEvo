@@ -146,6 +146,20 @@ def test_release_smoke_workflow_builds_packaged_assets_and_validates_wheel() -> 
     )
 
 
+def test_desktop_science_release_doc_matches_remote_lifecycle_state() -> None:
+    doc = Path("docs/architecture/openevo-desktop-science-foundation.md")
+
+    text = doc.read_text(encoding="utf-8")
+
+    assert "a remote backend implementation" not in text
+    assert "sidecar process supervision" not in text
+    assert "remote workspace preparation" in text
+    assert "`POST /openevo-api/desktop/bootstrap`" in text
+    assert "`POST /openevo-api/desktop/services`" in text
+    assert "`POST /openevo-api/desktop/run`" in text
+    assert "`GET /openevo-api/desktop/run/artifacts`" in text
+
+
 def _write_wheel(
     path: Path,
     *,
