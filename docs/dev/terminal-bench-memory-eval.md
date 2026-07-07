@@ -784,6 +784,46 @@ the smoke run and was stopped before the parametric-memory condition. These
 smokes validate dataset/trainer/local-server plumbing for sequence mode, but do
 not constitute a completed paired performance result.
 
+The formal `train-fasttext` sequence follow-up at
+`/tmp/tb21-task-local-parametric-sequence-formal-20260707/train-fasttext-qwen35-9b-sequence-r8-s160`
+trained a Qwen3.5-9B LoRA on GPU 6 from 16 sequence records, LoRA rank 8,
+alpha 16, `max_length=4096`, and 160 steps. Diagnostics recorded loss moving
+from `0.4766453802585602` to `0.0007073074812069535`, and the worker
+registered a `parametric_memory` adapter compatible with
+`terminal-bench:train-fasttext`. The paired eval attempt at
+`/tmp/tb21-task-local-parametric-sequence-formal-20260707/train-fasttext-qwen35-9b-sequence-r8-s160-eval`
+used managed Qwen3.5-9B vLLM on GPU 6 and loaded the rewritten LoRA adapter.
+Baseline failed by the 31-tool budget and then its official verifier timed out
+after 1h7m while installing/building fastText verifier dependencies. The
+treatment also failed by tool budget and did not create `/app/model.bin`; the
+run was stopped before repeating the same long verifier path. Treat this as a
+negative/inconclusive task-local method result and as evidence that
+`train-fasttext` is poor for quick iteration unless verifier dependencies are
+prebaked or otherwise cached under the benchmark protocol.
+
+The next fast-verifier task-local run used `gcode-to-text`, which has both
+failed and successful trajectory-pool records and a lightweight pytest
+verifier. The dry projection at
+`/tmp/tb21-task-local-parametric-gcode-20260707/dryrun` exported 16 sequence
+records ending with the successful target command
+`printf '%s' 'flag{gc0d3_iz_ch4LLenGiNg}' > /app/out.txt`. Training at
+`/tmp/tb21-task-local-parametric-gcode-20260707/train-gcode-qwen35-sequence-r8-s120`
+used Qwen3.5-9B, GPU 6, LoRA rank 8, alpha 16, `max_length=4096`, and 120
+steps; diagnostics recorded loss moving from `1.722609043121338` to
+`0.014706883579492569`, and the adapter was registered as
+`tb-parametric-memory-gcode-qwen35-sequence-r8-s120`. The paired local eval at
+`/tmp/tb21-task-local-parametric-gcode-20260707/eval-gcode-qwen35-sequence-r8-s120`
+completed cleanly with baseline pass@1 `0/1`, parametric-memory pass@1 `0/1`,
+and delta `0`. The treatment server loaded the adapter with
+`--enable-lora`, exposed model id
+`tb-parametric-memory-gcode-qwen35-sequence-r8-s120`, and rewrote 64 LoRA keys.
+The remaining failure is method alignment: the treatment followed the trained
+sequence prefix too literally, starting with a command that ran
+`rg --files -uu` after `pwd`, but the live task container does not have `rg`;
+later generated shell and Python commands also failed before writing
+`/app/out.txt`. This is a real negative performance result for the current
+task-local sequence backend, not a serving-path failure.
+
 For `password-recovery`, a Qwen3.5-9B local LoRA smoke was trained from the
 existing failed/successful tool-policy trajectory at
 `/tmp/tb21-parametric-memory-password-toolpolicy-20260702-110343/local-eval-password-toolpolicy-2048/baseline/harbor_jobs/baseline-password-recovery/password-recovery__AzMbthq`.
