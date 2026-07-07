@@ -6,6 +6,7 @@ from pathlib import Path
 from polar_evolution.terminal_bench_task_local_parametric import (
     TaskLocalSelection,
     TrajectoryPoolRow,
+    build_task_local_parametric_job_payload,
     build_task_local_sft_records,
     extract_successful_codex_commands,
     select_task_local_candidates,
@@ -215,3 +216,76 @@ def test_build_task_local_sft_records_uses_successful_command_as_tb_exec_target(
     assert record["metadata"]["source_failed_trajectory_id"] == "failed-1"
     assert record["metadata"]["source_successful_trajectory_id"] == "success-1"
     assert record["metadata"]["prefix_source"] == "task_summary_fallback"
+
+
+def test_build_task_local_parametric_job_payload_writes_dataset_and_lora_job(
+    tmp_path: Path,
+) -> None:
+    record = {
+        "event_id": "task-local-parametric:train-fasttext:failed:success:1",
+        "task_id": "train-fasttext",
+        "session_id": "task-local-parametric:train-fasttext",
+        "status": "COMPLETED",
+        "reward": 1.0,
+        "traces": [
+            {
+                "prompt_messages": [{"role": "user", "content": "Train fastText."}],
+                "response_messages": [
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": "target",
+                                "type": "function",
+                                "function": {
+                                    "name": "tb_exec",
+                                    "arguments": {
+                                        "task_id": "terminal-bench-task",
+                                        "command": "cp model.bin /app/model.bin",
+                                    },
+                                },
+                            }
+                        ],
+                    }
+                ],
+                "tools": [],
+            }
+        ],
+        "metadata": {"builder": "terminal_bench_task_local_parametric"},
+    }
+
+    payload = build_task_local_parametric_job_payload(
+        records=[record],
+        output_root=tmp_path / "out",
+        dataset_name="tb21-task-local-train-fasttext",
+        base_model="Qwen/Qwen3.6-35B-A3B",
+        adapter_id="tb-parametric-memory-train-fasttext",
+        trainer_command="python",
+        trainer_args=[
+            "/opt/train_lora.py",
+            "--train-file",
+            "{training_dataset}",
+            "--output-dir",
+            "{adapter_dir}",
+        ],
+        task_ids=["train-fasttext"],
+    )
+
+    manifest_path = Path(payload["dataset"]["manifest_path"])
+    records_path = manifest_path.with_name("records.jsonl")
+    assert manifest_path.is_file()
+    assert records_path.is_file()
+    assert json.loads(records_path.read_text(encoding="utf-8"))["task_id"] == (
+        "train-fasttext"
+    )
+    assert payload["dataset"]["artifact"]["type"] == "dataset"
+    assert payload["job"]["method"] == "parametric_memory_lora_sft"
+    assert payload["job"]["input_artifacts"][0]["uri"] == (
+        manifest_path.resolve().as_uri()
+    )
+    assert payload["job"]["config"]["training_projection"] == {"type": "full_trace"}
+    assert payload["job"]["config"]["compatibility"]["task_tags"] == [
+        "terminal-bench",
+        "terminal-bench:train-fasttext",
+    ]

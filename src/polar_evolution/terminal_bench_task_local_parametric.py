@@ -5,6 +5,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+from polar_evolution.models import ArtifactType, WorkerClaimInputArtifact, WorkerClaimedJob
+
 
 @dataclass(frozen=True)
 class TrajectoryPoolRow:
@@ -225,6 +227,108 @@ def build_task_local_sft_records(
     return records
 
 
+def build_task_local_parametric_job_payload(
+    *,
+    records: list[dict[str, Any]],
+    output_root: Path,
+    dataset_name: str,
+    base_model: str,
+    adapter_id: str,
+    trainer_command: str,
+    trainer_args: list[str],
+    task_ids: list[str],
+    trainer_timeout_seconds: float = 3600.0,
+) -> dict[str, Any]:
+    if not records:
+        raise ValueError("task-local parametric dataset requires at least one record")
+    missing_placeholders = [
+        placeholder
+        for placeholder in ("{training_dataset}", "{adapter_dir}")
+        if not any(placeholder in arg for arg in trainer_args)
+    ]
+    if missing_placeholders:
+        raise ValueError("trainer_args require {training_dataset} and {adapter_dir}")
+
+    dataset_dir = output_root / "dataset"
+    dataset_dir.mkdir(parents=True, exist_ok=True)
+    records_path = dataset_dir / "records.jsonl"
+    records_path.write_text(
+        "".join(
+            json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n"
+            for record in records
+        ),
+        encoding="utf-8",
+    )
+
+    manifest = {
+        "name": dataset_name,
+        "purpose": "task-local-parametric-memory",
+        "records_path": "records.jsonl",
+        "record_count": len(records),
+        "task_ids": list(task_ids),
+        "builder": "terminal_bench_task_local_parametric",
+    }
+    manifest_path = dataset_dir / "manifest.json"
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    dataset_artifact_id = f"dataset-{_safe_name(dataset_name)}"
+    input_artifact = WorkerClaimInputArtifact(
+        artifact_id=dataset_artifact_id,
+        type=ArtifactType.DATASET,
+        uri=manifest_path.resolve().as_uri(),
+        name=dataset_name,
+    )
+    job = WorkerClaimedJob(
+        job_id=f"job-{_safe_name(adapter_id)}",
+        lease_id="local-task-local-parametric",
+        job_type="parametric_memory_lora_sft",
+        method="parametric_memory_lora_sft",
+        input_artifacts=[input_artifact],
+        config={
+            "name": f"Task-local parametric memory {', '.join(task_ids)}",
+            "base_model": base_model,
+            "output_adapter_id": adapter_id,
+            "adapter_format": "lora",
+            "training_projection": {"type": "full_trace"},
+            "trainer": {
+                "command": trainer_command,
+                "args": list(trainer_args),
+                "timeout_seconds": float(trainer_timeout_seconds),
+            },
+            "compatibility": {
+                "agent_harness": ["terminal-bench-harbor"],
+                "task_tags": [
+                    "terminal-bench",
+                    *[f"terminal-bench:{task_id}" for task_id in task_ids],
+                ],
+                "base_model": [base_model],
+            },
+            "lineage": {
+                "method": "terminal_bench_task_local_parametric",
+                "source_task_ids": list(task_ids),
+                "dataset_manifest_uri": manifest_path.resolve().as_uri(),
+            },
+            "scores": {
+                "quality": 0.0,
+                "train_record_count": float(len(records)),
+            },
+            "promoted": False,
+        },
+    )
+    return {
+        "dataset": {
+            "manifest_path": str(manifest_path),
+            "records_path": str(records_path),
+            "artifact": input_artifact.model_dump(mode="json"),
+            "record_count": len(records),
+        },
+        "job": job.model_dump(mode="json"),
+    }
+
+
 def _task_local_sft_record(
     *,
     selection: TaskLocalSelection,
@@ -304,6 +408,14 @@ def _tool_call(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         "type": "function",
         "function": {"name": name, "arguments": arguments},
     }
+
+
+def _safe_name(value: str) -> str:
+    safe = "".join(
+        ch if ch.isalnum() or ch in {"-", "_"} else "-"
+        for ch in value.strip()
+    )
+    return "-".join(part for part in safe.split("-") if part) or "task-local-parametric"
 
 
 def _parse_reward(value: Any) -> float | None:
