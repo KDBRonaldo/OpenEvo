@@ -767,6 +767,45 @@ the smoke run and was stopped before the parametric-memory condition. These
 smokes validate dataset/trainer/local-server plumbing for sequence mode, but do
 not constitute a completed paired performance result.
 
+For `password-recovery`, a Qwen3.5-9B local LoRA smoke was trained from the
+existing failed/successful tool-policy trajectory at
+`/tmp/tb21-parametric-memory-password-toolpolicy-20260702-110343/local-eval-password-toolpolicy-2048/baseline/harbor_jobs/baseline-password-recovery/password-recovery__AzMbthq`.
+The first Qwen3.5 adapter used the short-target recipe with
+`target_task_id=terminal-bench-task` and wrote artifact
+`art_2cd9a7338f1d4891` under
+`/tmp/tb21-parametric-memory-qwen35-password-20260707-train`. It trained 84
+steps on 8 projected records and reached final losses around `4e-5`. A paired
+local eval at
+`/tmp/tb21-parametric-memory-qwen35-password-20260707-eval` initially completed
+with pass@1 delta `0`, but the treatment vLLM log showed late context-boundary
+rejections when the prompt reached roughly 16,375 input tokens. Rerunning the
+same adapter with `max_output_tokens=512`, `context_reserve_tokens=512`, and
+`tool_result_prompt_max_chars=512` at
+`/tmp/tb21-parametric-memory-qwen35-password-20260707-eval-tight` produced a
+clean paired result: baseline pass@1 `0/1`, parametric-memory pass@1 `0/1`,
+delta `0`, and no vLLM context errors. The treatment server loaded the LoRA,
+but both conditions failed by subagent budget and the treatment did not emit
+the trained `find varsea/disks` recipe.
+
+A second Qwen3.5 adapter aligned the recipe target to the current direct-solver
+tool id, `target_task_id=static-node-0`, increased the after-read target repeat
+to 32, and trained LoRA rank 16 for 160 steps on 37 projected records. The
+artifact is `art_fd254dacec40485d` under
+`/tmp/tb21-parametric-memory-qwen35-password-staticnode-20260707`; trainer
+diagnostics report final losses around `3.5e-5`. The paired eval at
+`/tmp/tb21-parametric-memory-qwen35-password-staticnode-20260707-eval-tight`
+again completed cleanly with baseline pass@1 `0/1`, parametric-memory pass@1
+`0/1`, and delta `0`. Both vLLM stderr logs had no
+`VLLMValidationError`/context-length error, and the treatment stdout confirmed
+the LoRA module was mounted. However, the baseline and treatment tool-call
+sequences were exactly identical for all 25 calls, starting with
+`tb_read_task(static-node-0)`, `tb_exec("ls -la")`, and repeated shallow
+inspection of `*.bin` files. This makes the current Qwen3.5
+`password-recovery` negative result a method-alignment failure rather than a
+serving/runtime failure: the adapter is loaded and overfits the tiny training
+set by loss, but it does not move deterministic Qwen3.5 tool-call decoding
+toward the recipe under vLLM.
+
 Evaluate baseline local Qwen and adapter local Qwen against the same subset:
 
 ```sh
