@@ -194,6 +194,107 @@ describe("OpenEvoDesktop", () => {
     await unmountClient(root);
   });
 
+  it("round-trips complete remote setup fields through the setup form", async () => {
+    const shellModel = modelWithRemoteSetup();
+    apiMocks.fetchOpenEvoDesktopShellModel.mockResolvedValue(shellModel);
+    apiMocks.saveOpenEvoProjectConfig.mockResolvedValue({
+      config: {
+        science_config_path:
+          "/home/alice/.openevo/desktop/projects/protein-design/science.yaml",
+        remote_profile_path:
+          "/home/alice/.openevo/desktop/profiles/science-team.yaml",
+      },
+      status: shellModel,
+    });
+
+    const root = await renderClient();
+    await flushEffects();
+
+    expect(inputByLabel("Remote profile ID").value).toBe("science-team");
+    expect(inputByLabel("Remote port").value).toBe("2222");
+    expect(selectByLabel("Auth method").value).toBe("private_key");
+    expect(inputByLabel("Private key path").value).toBe(
+      "/home/alice/.ssh/openevo",
+    );
+    expect(inputByLabel("Passphrase ref").value).toBe(
+      "keyring://openevo/science-team",
+    );
+    expect(inputByLabel("Workspace root").value).toBe(
+      "/data/openevo/workspaces",
+    );
+    expect(inputByLabel("HTTP proxy").value).toBe("http://127.0.0.1:7890");
+    expect(inputByLabel("HTTPS proxy").value).toBe("http://127.0.0.1:7891");
+    expect(inputByLabel("NO_PROXY").value).toBe("localhost,127.0.0.1");
+    expect(inputByLabel("PIP index URL").value).toBe(
+      "https://pypi.tuna.tsinghua.edu.cn/simple",
+    );
+    expect(inputByLabel("HF home").value).toBe("/data/hf-cache");
+
+    await changeInput("HTTP proxy", "http://127.0.0.1:1080");
+    await changeInput("HF home", "/mnt/models/hf-cache");
+
+    await act(async () => {
+      buttonByText("Save Config").dispatchEvent(
+        new MouseEvent("click", { bubbles: true }),
+      );
+      await Promise.resolve();
+    });
+
+    expect(apiMocks.saveOpenEvoProjectConfig).toHaveBeenCalledWith(
+      expect.objectContaining({
+        remote_profile_id: "science-team",
+        remote_port: 2222,
+        auth_method: "private_key",
+        private_key_path: "/home/alice/.ssh/openevo",
+        passphrase_ref: "keyring://openevo/science-team",
+        workspace_root: "/data/openevo/workspaces",
+        http_proxy: "http://127.0.0.1:1080",
+        https_proxy: "http://127.0.0.1:7891",
+        no_proxy: "localhost,127.0.0.1",
+        pip_index_url: "https://pypi.tuna.tsinghua.edu.cn/simple",
+        huggingface_endpoint: "https://hf-mirror.com",
+        hf_home: "/mnt/models/hf-cache",
+      }),
+    );
+    await unmountClient(root);
+  });
+
+  it("saves password reference auth from the setup form", async () => {
+    const shellModel = getOpenEvoDesktopShellModel();
+    apiMocks.fetchOpenEvoDesktopShellModel.mockResolvedValue(shellModel);
+    apiMocks.saveOpenEvoProjectConfig.mockResolvedValue({
+      config: {
+        science_config_path:
+          "/home/alice/.openevo/desktop/projects/protein-design/science.yaml",
+        remote_profile_path:
+          "/home/alice/.openevo/desktop/profiles/science-team.yaml",
+      },
+      status: shellModel,
+    });
+
+    const root = await renderClient();
+    await flushEffects();
+
+    await changeSelect("Auth method", "password_ref");
+    await changeInput("Password ref", "keyring://openevo/science-team");
+    await act(async () => {
+      buttonByText("Save Config").dispatchEvent(
+        new MouseEvent("click", { bubbles: true }),
+      );
+      await Promise.resolve();
+    });
+
+    expect(apiMocks.saveOpenEvoProjectConfig).toHaveBeenCalledWith(
+      expect.objectContaining({
+        auth_method: "password_ref",
+        private_key_path: null,
+        password_ref: "keyring://openevo/science-team",
+        passphrase_ref: null,
+      }),
+    );
+    await unmountClient(root);
+  });
+
   it("loads saved project configs and marks invalid configs read-only", async () => {
     apiMocks.fetchOpenEvoDesktopShellModel.mockResolvedValue(
       getOpenEvoDesktopShellModel(),
@@ -939,12 +1040,64 @@ async function changeInput(label: string, value: string) {
   });
 }
 
+async function changeSelect(label: string, value: string) {
+  const select = selectByLabel(label);
+  await act(async () => {
+    const setter = Object.getOwnPropertyDescriptor(
+      HTMLSelectElement.prototype,
+      "value",
+    )?.set;
+    setter?.call(select, value);
+    select.dispatchEvent(new Event("change", { bubbles: true }));
+  });
+}
+
 function inputByLabel(label: string): HTMLInputElement {
   const input = document.querySelector(`[aria-label="${label}"]`);
   if (!(input instanceof HTMLInputElement)) {
     throw new Error(`Input not found: ${label}`);
   }
   return input;
+}
+
+function selectByLabel(label: string): HTMLSelectElement {
+  const select = document.querySelector(`[aria-label="${label}"]`);
+  if (!(select instanceof HTMLSelectElement)) {
+    throw new Error(`Select not found: ${label}`);
+  }
+  return select;
+}
+
+function modelWithRemoteSetup(): OpenEvoDesktopShellModel {
+  const model = getOpenEvoDesktopShellModel();
+  return {
+    ...model,
+    remote: {
+      ...model.remote,
+      id: "science-team",
+      port: 2222,
+      auth: {
+        method: "private_key",
+        privateKeyPath: "/home/alice/.ssh/openevo",
+        passwordRef: null,
+        passphraseRef: "keyring://openevo/science-team",
+      },
+      workspaceRoot: "/data/openevo/workspaces",
+      proxy: {
+        ...model.remote.proxy,
+        httpProxy: "http://127.0.0.1:7890",
+        httpsProxy: "http://127.0.0.1:7891",
+        noProxy: "localhost,127.0.0.1",
+        pipIndexUrl: "https://pypi.tuna.tsinghua.edu.cn/simple",
+        huggingFaceEndpoint: "https://hf-mirror.com",
+        hfHome: "/data/hf-cache",
+      },
+    },
+    bootstrap: {
+      ...model.bootstrap,
+      workspaceRoot: "/data/openevo/workspaces",
+    },
+  };
 }
 
 function modelWithBootstrap({

@@ -223,13 +223,19 @@ status for the `/openevo` route and keeps the same subscription transcript
 semantics as the Python sidecar contracts: token-level metrics remain false in
 subscription mode, bootstrap readiness is represented separately from
 informational readiness notes, and no direct model API call is made.
+The remote profile block includes the non-secret fields needed to reconstruct
+the Desktop setup draft after startup or saved-config activation: profile id,
+host, port, user, auth method plus key/reference ids, effective workspace root,
+HTTP/HTTPS proxy, `NO_PROXY`, `PIP_INDEX_URL`, Hugging Face endpoint, and
+`HF_HOME`. It does not include raw passwords or private-key material.
 
 `POST /openevo-api/desktop/project-config` is the local setup endpoint for
 ordinary Desktop users. It is mutation-token protected and available when the
 sidecar was created with a writable config root and transport factory. The
 request payload is a typed Desktop draft with project name, task id, objective,
-task source, SSH host/user/port, proxy/mirror settings, Codex model, and text
-evolution toggles. The sidecar validates that draft by constructing the existing
+task source, SSH host/user/port/auth references, workspace root, proxy/mirror
+settings, Codex model, and text evolution toggles. The sidecar validates that
+draft by constructing the existing
 `ScienceProjectConfig` and `RemoteProfileConfig` models, then writes:
 
 ```text
@@ -277,6 +283,11 @@ validation error returned by the sidecar. Activating a valid saved config
 refreshes the shell status, repopulates the setup draft from the active project,
 and clears stale latest-run state. Saving a new draft refreshes the catalog so
 the newly written config is available without restarting Desktop.
+The same panel exposes the non-secret remote setup fields, including remote
+profile id, SSH auth method, private-key path/reference ids, workspace root,
+HTTP/HTTPS proxy, `NO_PROXY`, pip index URL, Hugging Face endpoint, and
+`HF_HOME`, so science users can configure a new remote GPU server from Desktop
+without editing YAML for common proxy or mirror settings.
 
 `POST /openevo-api/desktop/bootstrap` is the first mutating sidecar endpoint.
 It is available only for config-backed sidecar sessions. It reuses

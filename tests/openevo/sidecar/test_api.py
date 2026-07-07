@@ -1598,6 +1598,51 @@ def test_build_desktop_shell_status_from_subscription_project() -> None:
     ]
 
 
+def test_build_desktop_shell_status_includes_remote_setup_fields() -> None:
+    project = ScienceProjectConfig.model_validate(_science_project_payload())
+    profile = RemoteProfileConfig(
+        version=1,
+        id="science-team",
+        host="gpu.example.edu",
+        port=2222,
+        user="alice",
+        auth={
+            "method": "private_key",
+            "private_key_path": "/home/alice/.ssh/openevo",
+            "passphrase_ref": "keyring://openevo/science-team",
+        },
+        proxy={
+            "http_proxy": "http://127.0.0.1:7890",
+            "https_proxy": "http://127.0.0.1:7891",
+            "no_proxy": "localhost,127.0.0.1",
+            "pip_index_url": "https://pypi.tuna.tsinghua.edu.cn/simple",
+            "huggingface_endpoint": "https://hf-mirror.com",
+            "hf_home": "/data/hf-cache",
+        },
+        workspace_root="/data/openevo/workspaces",
+    )
+
+    payload = build_desktop_shell_status(project, profile).model_dump(mode="json")
+
+    assert payload["remote"]["port"] == 2222
+    assert payload["remote"]["auth"] == {
+        "method": "private_key",
+        "private_key_path": "/home/alice/.ssh/openevo",
+        "password_ref": None,
+        "passphrase_ref": "keyring://openevo/science-team",
+    }
+    assert payload["remote"]["workspace_root"] == "/data/openevo/workspaces"
+    assert payload["remote"]["proxy"] == {
+        "http_proxy": "http://127.0.0.1:7890",
+        "https_proxy": "http://127.0.0.1:7891",
+        "no_proxy": "localhost,127.0.0.1",
+        "pip_index_url": "https://pypi.tuna.tsinghua.edu.cn/simple",
+        "huggingface_endpoint": "https://hf-mirror.com",
+        "hf_home": "/data/hf-cache",
+    }
+    assert payload["bootstrap"]["workspace_root"] == "/data/openevo/workspaces"
+
+
 def test_build_desktop_shell_status_from_managed_local_inference_project() -> None:
     project = ScienceProjectConfig.model_validate(
         _science_project_payload()

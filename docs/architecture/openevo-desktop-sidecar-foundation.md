@@ -54,6 +54,10 @@ Authentication modes are intentionally reference-only:
 The schema forbids raw secret fields such as `password` or `private_key`. A
 future vault implementation can resolve references outside this model without
 changing the profile contract.
+Desktop shell status returns the same non-secret setup surface for the active
+profile: host, port, user, auth method and reference ids, effective workspace
+root, and proxy/mirror fields. The saved-config catalog remains more restrictive
+and does not expose private-key paths or secret references.
 
 ## Proxy And Mirrors
 
@@ -135,7 +139,6 @@ This foundation slice does not include:
 - Docker daemon or Docker Compose lifecycle management;
 - vLLM/model serving lifecycle management;
 - runtime image build/push/upload;
-- Desktop UI;
 - dynamic adapter or parametric-memory lifecycle.
 
 Those layers should consume this contract instead of duplicating Science Project

@@ -190,6 +190,20 @@ export function OpenEvoDesktop() {
     }));
   };
 
+  const handleAuthMethodChange = (
+    authMethod: OpenEvoProjectConfigDraft["auth_method"],
+  ) => {
+    setConfigDraft((current) => ({
+      ...current,
+      auth_method: authMethod,
+      private_key_path:
+        authMethod === "private_key" ? current.private_key_path ?? "" : null,
+      password_ref: authMethod === "password_ref" ? current.password_ref ?? "" : null,
+      passphrase_ref:
+        authMethod === "private_key" ? current.passphrase_ref ?? null : null,
+    }));
+  };
+
   const handleSaveConfig = async () => {
     setConfigSaving(true);
     setConfigError(null);
@@ -480,6 +494,13 @@ export function OpenEvoDesktop() {
             onChange={(value) => handleConfigDraftChange("task_id", value)}
           />
           <TextInput
+            label="Remote profile ID"
+            value={configDraft.remote_profile_id}
+            onChange={(value) =>
+              handleConfigDraftChange("remote_profile_id", value)
+            }
+          />
+          <TextInput
             label="Remote host"
             value={configDraft.remote_host}
             onChange={(value) => handleConfigDraftChange("remote_host", value)}
@@ -488,6 +509,55 @@ export function OpenEvoDesktop() {
             label="Remote user"
             value={configDraft.remote_user}
             onChange={(value) => handleConfigDraftChange("remote_user", value)}
+          />
+          <NumberInput
+            label="Remote port"
+            value={configDraft.remote_port}
+            onChange={(value) => handleConfigDraftChange("remote_port", value)}
+          />
+          <SelectInput
+            label="Auth method"
+            value={configDraft.auth_method}
+            options={["ssh_agent", "private_key", "password_ref"]}
+            onChange={(value) =>
+              handleAuthMethodChange(
+                value as OpenEvoProjectConfigDraft["auth_method"],
+              )
+            }
+          />
+          {configDraft.auth_method === "private_key" ? (
+            <>
+              <TextInput
+                label="Private key path"
+                value={configDraft.private_key_path ?? ""}
+                onChange={(value) =>
+                  handleConfigDraftChange("private_key_path", value || null)
+                }
+              />
+              <TextInput
+                label="Passphrase ref"
+                value={configDraft.passphrase_ref ?? ""}
+                onChange={(value) =>
+                  handleConfigDraftChange("passphrase_ref", value || null)
+                }
+              />
+            </>
+          ) : null}
+          {configDraft.auth_method === "password_ref" ? (
+            <TextInput
+              label="Password ref"
+              value={configDraft.password_ref ?? ""}
+              onChange={(value) =>
+                handleConfigDraftChange("password_ref", value || null)
+              }
+            />
+          ) : null}
+          <TextInput
+            label="Workspace root"
+            value={configDraft.workspace_root ?? ""}
+            onChange={(value) =>
+              handleConfigDraftChange("workspace_root", value || null)
+            }
           />
           <SelectInput
             label="Source type"
@@ -531,13 +601,6 @@ export function OpenEvoDesktop() {
             />
           )}
           <TextInput
-            label="HTTPS proxy"
-            value={configDraft.https_proxy ?? ""}
-            onChange={(value) =>
-              handleConfigDraftChange("https_proxy", value || null)
-            }
-          />
-          <TextInput
             label="Codex model"
             value={configDraft.codex_model}
             onChange={(value) => handleConfigDraftChange("codex_model", value)}
@@ -549,16 +612,46 @@ export function OpenEvoDesktop() {
             onChange={(value) => handleConfigDraftChange("objective", value)}
           />
           <TextInput
+            label="HTTP proxy"
+            value={configDraft.http_proxy ?? ""}
+            onChange={(value) =>
+              handleConfigDraftChange("http_proxy", value || null)
+            }
+          />
+          <TextInput
+            label="HTTPS proxy"
+            value={configDraft.https_proxy ?? ""}
+            onChange={(value) =>
+              handleConfigDraftChange("https_proxy", value || null)
+            }
+          />
+          <TextInput
+            label="NO_PROXY"
+            value={configDraft.no_proxy ?? ""}
+            onChange={(value) =>
+              handleConfigDraftChange("no_proxy", value || null)
+            }
+          />
+          <TextInput
+            label="PIP index URL"
+            value={configDraft.pip_index_url ?? ""}
+            onChange={(value) =>
+              handleConfigDraftChange("pip_index_url", value || null)
+            }
+          />
+          <TextInput
             label="Hugging Face endpoint"
             value={configDraft.huggingface_endpoint ?? ""}
             onChange={(value) =>
               handleConfigDraftChange("huggingface_endpoint", value || null)
             }
           />
-          <NumberInput
-            label="Remote port"
-            value={configDraft.remote_port}
-            onChange={(value) => handleConfigDraftChange("remote_port", value)}
+          <TextInput
+            label="HF home"
+            value={configDraft.hf_home ?? ""}
+            onChange={(value) =>
+              handleConfigDraftChange("hf_home", value || null)
+            }
           />
           <div className="flex flex-wrap items-end gap-3 lg:col-span-4">
             <CheckboxInput
@@ -617,12 +710,18 @@ export function OpenEvoDesktop() {
         <Panel title="Remote Profile" icon={<Server size={17} />}>
           <div className="grid grid-cols-1 gap-3 text-sm">
             <Field label="Profile" value={`${model.remote.id} - ${model.remote.user}`} />
-            <Field label="Host" value={model.remote.host} />
+            <Field label="Host" value={`${model.remote.host}:${model.remote.port}`} />
+            <Field label="Auth" value={model.remote.auth.method} />
+            <Field label="Workspace root" value={model.remote.workspaceRoot} />
+            <Field label="HTTP proxy" value={model.remote.proxy.httpProxy} />
             <Field label="HTTPS proxy" value={model.remote.proxy.httpsProxy} />
+            <Field label="NO_PROXY" value={model.remote.proxy.noProxy} />
+            <Field label="PIP index URL" value={model.remote.proxy.pipIndexUrl} />
             <Field
               label="Hugging Face endpoint"
               value={model.remote.proxy.huggingFaceEndpoint}
             />
+            <Field label="HF home" value={model.remote.proxy.hfHome} />
           </div>
         </Panel>
       </section>
@@ -840,7 +939,9 @@ function Field({
   return (
     <div className={wide ? "md:col-span-2" : undefined}>
       <div className="text-xs font-medium uppercase text-slate-500">{label}</div>
-      <div className="mt-1 text-sm leading-6 text-slate-900">{value}</div>
+      <div className="mt-1 break-words text-sm leading-6 text-slate-900">
+        {value}
+      </div>
     </div>
   );
 }
@@ -982,11 +1083,19 @@ function draftFromModel(
     source_branch: source.source_branch,
     remote_profile_id: model.remote.id,
     remote_host: model.remote.host,
-    remote_port: 22,
+    remote_port: model.remote.port,
     remote_user: model.remote.user,
-    auth_method: "ssh_agent",
+    auth_method: model.remote.auth.method,
+    private_key_path: model.remote.auth.privateKeyPath,
+    password_ref: model.remote.auth.passwordRef,
+    passphrase_ref: model.remote.auth.passphraseRef,
+    workspace_root: model.remote.workspaceRoot,
+    http_proxy: optionalConfigured(model.remote.proxy.httpProxy),
     https_proxy: optionalConfigured(model.remote.proxy.httpsProxy),
+    no_proxy: optionalConfigured(model.remote.proxy.noProxy),
+    pip_index_url: optionalConfigured(model.remote.proxy.pipIndexUrl),
     huggingface_endpoint: optionalConfigured(model.remote.proxy.huggingFaceEndpoint),
+    hf_home: optionalConfigured(model.remote.proxy.hfHome),
     codex_model: model.execution.model || "gpt-5.1-codex-mini",
     text_memory: model.evolution.some((step) =>
       ["text-memory", "memory"].includes(step.id),

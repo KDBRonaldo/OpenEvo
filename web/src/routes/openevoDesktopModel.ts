@@ -6,10 +6,22 @@ export interface OpenEvoDesktopShellModel {
   remote: {
     id: string;
     host: string;
+    port: number;
     user: string;
+    auth: {
+      method: "ssh_agent" | "private_key" | "password_ref";
+      privateKeyPath: string | null;
+      passwordRef: string | null;
+      passphraseRef: string | null;
+    };
+    workspaceRoot: string;
     proxy: {
+      httpProxy: string;
       httpsProxy: string;
+      noProxy: string;
+      pipIndexUrl: string;
       huggingFaceEndpoint: string;
+      hfHome: string;
     };
   };
   project: {
@@ -61,10 +73,22 @@ export function getOpenEvoDesktopShellModel(): OpenEvoDesktopShellModel {
     remote: {
       id: "lab-gpu",
       host: "gpu.example.edu",
+      port: 22,
       user: "alice",
+      auth: {
+        method: "ssh_agent",
+        privateKeyPath: null,
+        passwordRef: null,
+        passphraseRef: null,
+      },
+      workspaceRoot: "/home/alice/.openevo/workspaces",
       proxy: {
+        httpProxy: "not configured",
         httpsProxy: "http://127.0.0.1:7890",
+        noProxy: "not configured",
+        pipIndexUrl: "not configured",
         huggingFaceEndpoint: "https://hf-mirror.com",
+        hfHome: "not configured",
       },
     },
     project: {

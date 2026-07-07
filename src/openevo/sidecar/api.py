@@ -48,14 +48,28 @@ class SidecarHealth(_StrictFrozenModel):
 
 
 class DesktopRemoteProxy(_StrictFrozenModel):
+    http_proxy: str | None = None
     https_proxy: str | None = None
+    no_proxy: str | None = None
+    pip_index_url: str | None = None
     huggingface_endpoint: str | None = None
+    hf_home: str | None = None
+
+
+class DesktopRemoteAuth(_StrictFrozenModel):
+    method: Literal["ssh_agent", "private_key", "password_ref"] = "ssh_agent"
+    private_key_path: str | None = None
+    password_ref: str | None = None
+    passphrase_ref: str | None = None
 
 
 class DesktopRemoteProfile(_StrictFrozenModel):
     id: str
     host: str
+    port: int = Field(default=22, ge=1, le=65535)
     user: str
+    auth: DesktopRemoteAuth = Field(default_factory=DesktopRemoteAuth)
+    workspace_root: str
     proxy: DesktopRemoteProxy = Field(default_factory=DesktopRemoteProxy)
 
 
@@ -230,10 +244,22 @@ def build_desktop_shell_status(
         remote=DesktopRemoteProfile(
             id=profile.id,
             host=profile.host,
+            port=profile.port,
             user=profile.user,
+            auth=DesktopRemoteAuth(
+                method=profile.auth.method,
+                private_key_path=profile.auth.private_key_path,
+                password_ref=profile.auth.password_ref,
+                passphrase_ref=profile.auth.passphrase_ref,
+            ),
+            workspace_root=profile.effective_workspace_root,
             proxy=DesktopRemoteProxy(
+                http_proxy=profile.proxy.http_proxy,
                 https_proxy=profile.proxy.https_proxy,
+                no_proxy=profile.proxy.no_proxy,
+                pip_index_url=profile.proxy.pip_index_url,
                 huggingface_endpoint=profile.proxy.huggingface_endpoint,
+                hf_home=profile.proxy.hf_home,
             ),
         ),
         project=DesktopScienceProject(
@@ -263,10 +289,16 @@ def default_desktop_shell_status() -> OpenEvoDesktopShellStatus:
         remote=DesktopRemoteProfile(
             id="lab-gpu",
             host="gpu.example.edu",
+            port=22,
             user="alice",
+            workspace_root="/home/alice/.openevo/workspaces",
             proxy=DesktopRemoteProxy(
+                http_proxy=None,
                 https_proxy="http://127.0.0.1:7890",
+                no_proxy=None,
+                pip_index_url=None,
                 huggingface_endpoint="https://hf-mirror.com",
+                hf_home=None,
             ),
         ),
         project=DesktopScienceProject(

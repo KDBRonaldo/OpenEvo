@@ -22,10 +22,22 @@ describe("OpenEvo sidecar client", () => {
       remote: {
         id: "lab-gpu",
         host: "gpu.example.edu",
+        port: 2222,
         user: "alice",
+        auth: {
+          method: "private_key",
+          private_key_path: "/home/alice/.ssh/openevo",
+          password_ref: null,
+          passphrase_ref: "keyring://openevo/lab-gpu",
+        },
+        workspace_root: "/data/openevo/workspaces",
         proxy: {
+          http_proxy: "http://127.0.0.1:7890",
           https_proxy: "http://127.0.0.1:7890",
+          no_proxy: "localhost,127.0.0.1",
+          pip_index_url: "https://pypi.tuna.tsinghua.edu.cn/simple",
           huggingface_endpoint: "https://hf-mirror.com",
+          hf_home: "/data/hf-cache",
         },
       },
       project: {
@@ -68,6 +80,15 @@ describe("OpenEvo sidecar client", () => {
     });
 
     expect(model.remote.proxy.httpsProxy).toBe("http://127.0.0.1:7890");
+    expect(model.remote.port).toBe(2222);
+    expect(model.remote.auth.privateKeyPath).toBe("/home/alice/.ssh/openevo");
+    expect(model.remote.auth.passphraseRef).toBe("keyring://openevo/lab-gpu");
+    expect(model.remote.workspaceRoot).toBe("/data/openevo/workspaces");
+    expect(model.remote.proxy.noProxy).toBe("localhost,127.0.0.1");
+    expect(model.remote.proxy.pipIndexUrl).toBe(
+      "https://pypi.tuna.tsinghua.edu.cn/simple",
+    );
+    expect(model.remote.proxy.hfHome).toBe("/data/hf-cache");
     expect(model.project.taskId).toBe("folding-baseline");
     expect(model.execution.tokenMetricsAvailable).toBe(false);
     expect(model.bootstrap.readinessNotes).toEqual([
@@ -94,10 +115,22 @@ describe("OpenEvo sidecar client", () => {
         remote: {
           id: "lab-gpu",
           host: "gpu.example.edu",
+          port: 22,
           user: "alice",
+          auth: {
+            method: "ssh_agent",
+            private_key_path: null,
+            password_ref: null,
+            passphrase_ref: null,
+          },
+          workspace_root: "/home/alice/.openevo/workspaces",
           proxy: {
+            http_proxy: null,
             https_proxy: "http://127.0.0.1:7890",
+            no_proxy: null,
+            pip_index_url: null,
             huggingface_endpoint: null,
+            hf_home: null,
           },
         },
         project: {
@@ -456,10 +489,22 @@ function sidecarShellPayload(mutationToken: string) {
     remote: {
       id: "lab-gpu",
       host: "gpu.example.edu",
+      port: 22,
       user: "alice",
+      auth: {
+        method: "ssh_agent" as const,
+        private_key_path: null,
+        password_ref: null,
+        passphrase_ref: null,
+      },
+      workspace_root: "/home/alice/.openevo/workspaces",
       proxy: {
+        http_proxy: null,
         https_proxy: "http://127.0.0.1:7890",
+        no_proxy: null,
+        pip_index_url: null,
         huggingface_endpoint: null,
+        hf_home: null,
       },
     },
     project: {
@@ -527,6 +572,7 @@ function projectConfigDraft() {
     remote_port: 22,
     remote_user: "alice",
     auth_method: "ssh_agent" as const,
+    workspace_root: "/home/alice/.openevo/workspaces",
     https_proxy: "http://127.0.0.1:7890",
     huggingface_endpoint: "https://hf-mirror.com",
     codex_model: "gpt-5.1-codex-mini",

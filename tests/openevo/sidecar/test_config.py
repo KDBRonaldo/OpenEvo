@@ -127,6 +127,29 @@ def test_list_desktop_project_configs_returns_non_secret_summaries(
     assert "private_key_path" not in first.model_dump_json()
 
 
+def test_list_desktop_project_configs_omits_auth_secret_references(
+    tmp_path: Path,
+) -> None:
+    draft = DesktopProjectConfigDraft.model_validate(
+        VALID_DRAFT
+        | {
+            "auth_method": "private_key",
+            "private_key_path": "/home/alice/.ssh/openevo",
+            "passphrase_ref": "keyring://openevo/science-team-passphrase",
+        }
+    )
+    save_desktop_project_config(draft, tmp_path)
+
+    configs = list_desktop_project_configs(tmp_path)
+
+    serialized = configs[0].model_dump_json()
+    assert configs[0].valid is True
+    assert "private_key_path" not in serialized
+    assert "/home/alice/.ssh/openevo" not in serialized
+    assert "passphrase_ref" not in serialized
+    assert "science-team-passphrase" not in serialized
+
+
 def test_list_desktop_project_configs_redacts_git_url_userinfo(tmp_path: Path) -> None:
     draft = DesktopProjectConfigDraft.model_validate(
         VALID_DRAFT

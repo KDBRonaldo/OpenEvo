@@ -9,10 +9,22 @@ export interface OpenEvoDesktopShellStatusPayload {
   remote: {
     id: string;
     host: string;
+    port: number;
     user: string;
+    auth: {
+      method: OpenEvoProjectConfigDraft["auth_method"];
+      private_key_path: string | null;
+      password_ref: string | null;
+      passphrase_ref: string | null;
+    };
+    workspace_root: string;
     proxy: {
+      http_proxy: string | null;
       https_proxy: string | null;
+      no_proxy: string | null;
+      pip_index_url: string | null;
       huggingface_endpoint: string | null;
+      hf_home: string | null;
     };
   };
   project: {
@@ -381,11 +393,23 @@ export function toOpenEvoDesktopShellModel(
     remote: {
       id: payload.remote.id,
       host: payload.remote.host,
+      port: payload.remote.port,
       user: payload.remote.user,
+      auth: {
+        method: payload.remote.auth.method,
+        privateKeyPath: payload.remote.auth.private_key_path,
+        passwordRef: payload.remote.auth.password_ref,
+        passphraseRef: payload.remote.auth.passphrase_ref,
+      },
+      workspaceRoot: payload.remote.workspace_root,
       proxy: {
+        httpProxy: payload.remote.proxy.http_proxy ?? "not configured",
         httpsProxy: payload.remote.proxy.https_proxy ?? "not configured",
+        noProxy: payload.remote.proxy.no_proxy ?? "not configured",
+        pipIndexUrl: payload.remote.proxy.pip_index_url ?? "not configured",
         huggingFaceEndpoint:
           payload.remote.proxy.huggingface_endpoint ?? "not configured",
+        hfHome: payload.remote.proxy.hf_home ?? "not configured",
       },
     },
     project: {
