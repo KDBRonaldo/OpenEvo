@@ -64,9 +64,26 @@ _TERMINAL_BENCH_TOOLS = [
     },
 ]
 
-_TASK_LOCAL_SYSTEM = (
+_TASK_LOCAL_SYNTHETIC_SYSTEM = (
     "Use Terminal-Bench tools to solve the task. Emit one useful next tool call."
 )
+_TASK_LOCAL_DIRECT_SOLVER_SYSTEM = (
+    "Solve exactly one task_id. Use tb_read_task first. Use tb_exec to inspect "
+    "and edit files in the Harbor task container. Run tb_run_tests after changes "
+    "without supplying a custom test command; it runs the visible test or "
+    "evaluation entrypoint available in the container. Keep commands small and "
+    "auditable. When verifier feedback names a failed assertion, predicate, "
+    "expected property, or hard constraint, synthesize a temporary local checker "
+    "from visible task files and make candidate outputs pass that checker before "
+    "finalizing. For git recovery tasks, use git reflog/log plus git show --stat "
+    "or git diff-tree --name-only to identify the recovered commit and verify all "
+    "touched files before reporting completion."
+)
+_TASK_LOCAL_PROMPT_STYLES = {
+    "direct_solver",
+    "live_replay",
+    "synthetic_correction",
+}
 
 _TARGET_WRITE_COMMAND_NEEDLES = (
     "save_model(",
@@ -225,8 +242,14 @@ def build_task_local_sft_records(
     command_contains: list[str] | None = None,
     exclude_command_contains: list[str] | None = None,
     max_records: int = 16,
+    prompt_style: str = "direct_solver",
 ) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
+    if prompt_style not in _TASK_LOCAL_PROMPT_STYLES:
+        raise ValueError(
+            "task-local parametric prompt_style must be direct_solver, "
+            "live_replay, or synthetic_correction"
+        )
     for failed in selection.failed:
         if len(records) >= max_records:
             break
@@ -246,6 +269,7 @@ def build_task_local_sft_records(
                     failed=failed,
                     successful=successful,
                     command=command,
+                    prompt_style=prompt_style,
                 )
             )
             break
@@ -382,14 +406,35 @@ def _task_local_sft_record(
     failed: TrajectoryPoolRow,
     successful: TrajectoryPoolRow,
     command: CodexCommandEvent,
+    prompt_style: str,
 ) -> dict[str, Any]:
-    prompt = (
-        "Task-local parametric memory correction.\n\n"
-        f"Task id: {selection.task_id}\n"
-        f"Failed trajectory summary: {_task_summary(failed)}\n"
-        f"Successful trajectory summary: {_task_summary(successful)}\n\n"
-        "Produce the next solve action as a tool call."
-    )
+    if prompt_style == "synthetic_correction":
+        prompt_messages, response_messages, prefix_source = (
+            _task_local_synthetic_correction_messages(
+                selection=selection,
+                failed=failed,
+                successful=successful,
+                command=command,
+            )
+        )
+    elif prompt_style == "live_replay":
+        prompt_messages, response_messages, prefix_source = (
+            _task_local_live_replay_messages(
+                selection=selection,
+                failed=failed,
+                successful=successful,
+                command=command,
+            )
+        )
+    else:
+        prompt_messages, response_messages, prefix_source = (
+            _task_local_direct_solver_messages(
+                selection=selection,
+                failed=failed,
+                successful=successful,
+                command=command,
+            )
+        )
     return {
         "event_id": (
             f"task-local-parametric:{selection.task_id}:"
@@ -401,25 +446,8 @@ def _task_local_sft_record(
         "reward": 1.0,
         "traces": [
             {
-                "prompt_messages": [
-                    {"role": "system", "content": _TASK_LOCAL_SYSTEM},
-                    {"role": "user", "content": prompt},
-                ],
-                "response_messages": [
-                    {
-                        "role": "assistant",
-                        "content": "",
-                        "tool_calls": [
-                            _tool_call(
-                                "tb_exec",
-                                {
-                                    "task_id": "terminal-bench-task",
-                                    "command": command.command,
-                                },
-                            )
-                        ],
-                    }
-                ],
+                "prompt_messages": prompt_messages,
+                "response_messages": response_messages,
                 "tools": _TERMINAL_BENCH_TOOLS,
             }
         ],
@@ -431,14 +459,284 @@ def _task_local_sft_record(
             "source_successful_trial_dir": str(successful.trial_dir),
             "source_successful_command_event_index": command.event_index,
             "source_successful_command_output_excerpt": command.output_excerpt,
-            "prefix_source": "task_summary_fallback",
+            "prefix_source": prefix_source,
             "target_tool_name": "tb_exec",
         },
     }
 
 
+def _task_local_synthetic_correction_messages(
+    *,
+    selection: TaskLocalSelection,
+    failed: TrajectoryPoolRow,
+    successful: TrajectoryPoolRow,
+    command: CodexCommandEvent,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], str]:
+    prompt = (
+        "Task-local parametric memory correction.\n\n"
+        f"Task id: {selection.task_id}\n"
+        f"Failed trajectory summary: {_task_summary(failed)}\n"
+        f"Successful trajectory summary: {_task_summary(successful)}\n\n"
+        "Produce the next solve action as a tool call."
+    )
+    return (
+        [
+            {"role": "system", "content": _TASK_LOCAL_SYNTHETIC_SYSTEM},
+            {"role": "user", "content": prompt},
+        ],
+        [_task_local_target_exec_message(command.command)],
+        "task_summary_fallback",
+    )
+
+
+def _task_local_live_replay_messages(
+    *,
+    selection: TaskLocalSelection,
+    failed: TrajectoryPoolRow,
+    successful: TrajectoryPoolRow,
+    command: CodexCommandEvent,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], str]:
+    live_prefix = _task_local_live_replay_prefix(failed.trial_dir)
+    if live_prefix is None:
+        return _task_local_direct_solver_messages(
+            selection=selection,
+            failed=failed,
+            successful=successful,
+            command=command,
+        )
+    prompt_messages, call_index = live_prefix
+    return (
+        prompt_messages,
+        [_task_local_target_exec_message(command.command)],
+        f"live_replay_llm_call:{call_index}",
+    )
+
+
+def _task_local_direct_solver_messages(
+    *,
+    selection: TaskLocalSelection,
+    failed: TrajectoryPoolRow,
+    successful: TrajectoryPoolRow,
+    command: CodexCommandEvent,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], str]:
+    read_task_call_id = "polar-task-local-read-task"
+    task_text = _task_instruction_text(failed) or _task_instruction_text(successful)
+    if not task_text:
+        task_text = _task_summary(failed)
+    return (
+        [
+            {"role": "system", "content": _TASK_LOCAL_DIRECT_SOLVER_SYSTEM},
+            {"role": "user", "content": _task_local_direct_solver_instruction()},
+        ],
+        [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    _tool_call(
+                        "tb_read_task",
+                        {"task_id": "terminal-bench-task"},
+                        call_id=read_task_call_id,
+                    )
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": read_task_call_id,
+                "content": _task_local_read_task_response(task_text),
+            },
+            _task_local_target_exec_message(command.command),
+        ],
+        "direct_solver_read_task",
+    )
+
+
+def _task_local_live_replay_prefix(
+    trial_dir: Path,
+) -> tuple[list[dict[str, Any]], int] | None:
+    calls_path = _trial_evolab_llm_calls(trial_dir)
+    if not calls_path.is_file():
+        return None
+    for call_index, line in enumerate(
+        calls_path.read_text(encoding="utf-8", errors="replace").splitlines(),
+        start=1,
+    ):
+        if not line.strip():
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        input_messages = _compact_live_replay_messages(payload.get("input_messages"))
+        if not input_messages:
+            continue
+        if not any(message.get("role") == "tool" for message in input_messages):
+            continue
+        if not _llm_call_outputs_tool(payload, "tb_exec"):
+            continue
+        return input_messages, call_index
+    return None
+
+
+def _compact_live_replay_messages(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    messages: list[dict[str, Any]] = []
+    for message in value:
+        if not isinstance(message, dict):
+            continue
+        role = message.get("role")
+        if not isinstance(role, str) or not role.strip():
+            continue
+        content = _message_content(message.get("content"))
+        compact: dict[str, Any] = {"role": role.strip(), "content": content}
+        tool_calls = message.get("tool_calls")
+        if isinstance(tool_calls, list) and tool_calls:
+            compact["tool_calls"] = tool_calls
+        tool_call_id = message.get("tool_call_id")
+        if isinstance(tool_call_id, str) and tool_call_id.strip():
+            compact["tool_call_id"] = tool_call_id.strip()
+        name = message.get("name")
+        if isinstance(name, str) and name.strip():
+            compact["name"] = name.strip()
+        if content or compact.get("tool_calls"):
+            messages.append(compact)
+    return messages
+
+
+def _message_content(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        parts: list[str] = []
+        for item in value:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict) and isinstance(item.get("text"), str):
+                parts.append(item["text"])
+        return "\n".join(parts)
+    return ""
+
+
+def _llm_call_outputs_tool(payload: dict[str, Any], tool_name: str) -> bool:
+    output_messages = payload.get("output_messages")
+    if not isinstance(output_messages, list):
+        return False
+    for message in output_messages:
+        if not isinstance(message, dict):
+            continue
+        if tool_name in _message_tool_call_names(message):
+            return True
+    return False
+
+
+def _message_tool_call_names(message: dict[str, Any]) -> set[str]:
+    names: set[str] = set()
+    _collect_tool_call_names(message.get("tool_calls"), names)
+    metadata = message.get("metadata")
+    if isinstance(metadata, dict):
+        _collect_tool_call_names(metadata.get("tool_call"), names)
+        _collect_tool_call_names(metadata.get("tool_calls"), names)
+    return names
+
+
+def _collect_tool_call_names(value: Any, names: set[str]) -> None:
+    if isinstance(value, list):
+        for item in value:
+            _collect_tool_call_names(item, names)
+        return
+    if not isinstance(value, dict):
+        return
+    name = value.get("name")
+    if isinstance(name, str) and name:
+        names.add(name)
+    function = value.get("function")
+    if isinstance(function, dict):
+        function_name = function.get("name")
+        if isinstance(function_name, str) and function_name:
+            names.add(function_name)
+
+
+def _task_local_direct_solver_instruction() -> str:
+    instruction = {
+        "subagent_goal": (
+            "Solve the current Terminal-Bench task in the Harbor task container. "
+            "Use tb_read_task to read the task instruction, then use tb_exec to "
+            "modify files so the official verifier passes."
+        ),
+        "task_summary": (
+            "There is exactly one work item for this Harbor trial. The task is "
+            "complete when the expected files in /app satisfy the verifier."
+        ),
+        "available_input_artifacts": [],
+        "expected_output_artifacts": [],
+    }
+    return "Instruction:\n" + json.dumps(instruction, indent=2, sort_keys=True)
+
+
+def _task_local_read_task_response(task_text: str) -> str:
+    task_yaml = "descriptions:\n  - key: base\n    description: |\n"
+    for line in task_text.splitlines() or [""]:
+        task_yaml += f"      {line}\n"
+    payload = {
+        "message": "read Harbor task terminal-bench-task",
+        "task_id": "terminal-bench-task",
+        "task_yaml": task_yaml,
+        "tool": "tb_read_task",
+        "visible_baselines": [],
+        "workspace": "Harbor task container",
+    }
+    return json.dumps(payload, indent=2, sort_keys=True)
+
+
+def _task_local_target_exec_message(command: str) -> dict[str, Any]:
+    return {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+            _tool_call(
+                "tb_exec",
+                {
+                    "task_id": "terminal-bench-task",
+                    "command": command,
+                },
+            )
+        ],
+    }
+
+
 def _trial_codex_transcript(trial_dir: Path) -> Path:
     return trial_dir / "agent" / "codex.txt"
+
+
+def _trial_evolab_llm_calls(trial_dir: Path) -> Path:
+    return (
+        trial_dir
+        / "agent"
+        / "evolab_lab"
+        / ".evolab"
+        / "registries"
+        / "trajectory"
+        / "llm_calls.jsonl"
+    )
+
+
+def _trial_instruction(trial_dir: Path) -> str | None:
+    path = trial_dir / "agent" / "instruction.txt"
+    if not path.is_file():
+        return None
+    text = path.read_text(encoding="utf-8", errors="replace").strip()
+    return text or None
+
+
+def _task_instruction_text(row: TrajectoryPoolRow) -> str | None:
+    for key in ("instruction", "prompt", "task_description", "prompt_summary"):
+        value = row.raw.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return _trial_instruction(row.trial_dir)
 
 
 def _task_summary(row: TrajectoryPoolRow) -> str:
@@ -449,9 +747,14 @@ def _task_summary(row: TrajectoryPoolRow) -> str:
     return f"Terminal-Bench task {row.task_id}"
 
 
-def _tool_call(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+def _tool_call(
+    name: str,
+    arguments: dict[str, Any],
+    *,
+    call_id: str = "polar-task-local-target",
+) -> dict[str, Any]:
     return {
-        "id": "polar-task-local-target",
+        "id": call_id,
         "type": "function",
         "function": {"name": name, "arguments": arguments},
     }

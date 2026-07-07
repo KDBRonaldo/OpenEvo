@@ -36,6 +36,7 @@ DEFAULT_VLLM_GPUS = ["1", "2", "3", "4"]
 DEFAULT_LOCAL_PARAMETRIC_MAX_OUTPUT_TOKENS = 4096
 DEFAULT_LOCAL_PARAMETRIC_CONTEXT_WINDOW_TOKENS = 16384
 DEFAULT_LOCAL_PARAMETRIC_CONTEXT_RESERVE_TOKENS = 1536
+DEFAULT_LOCAL_PARAMETRIC_AGENT_CONTEXT_SAFETY_TOKENS = 64
 DEFAULT_LOCAL_PARAMETRIC_SOLVER_TEMPERATURE = 0.0
 DEFAULT_VLLM_GENERATION_CONFIG = "vllm"
 ADAPTER_KEY_REWRITE_NONE = "none"
@@ -195,7 +196,9 @@ def build_evolab_harbor_env(
     env = dict(os.environ if base_env is None else base_env)
     env["EVOLAB_TB_LLM_API"] = "openai-chat-completions"
     env["EVOLAB_TB_MODE"] = "direct_solver"
-    env["EVOLAB_TB_CONTEXT_WINDOW_TOKENS"] = str(context_window)
+    env["EVOLAB_TB_CONTEXT_WINDOW_TOKENS"] = str(
+        _agent_context_window_tokens(context_window)
+    )
     env["EVOLAB_TB_CONTEXT_RESERVE_TOKENS"] = str(context_reserve)
     env["EVOLAB_TB_MAX_OUTPUT_TOKENS"] = str(output_tokens)
     env["EVOLAB_TB_LLM_TEMPERATURE"] = str(float(solver_temperature))
@@ -263,6 +266,12 @@ def build_vllm_command(
     if adapter_id is not None or adapter_path is not None:
         if not adapter_id or adapter_path is None:
             raise ValueError("adapter_id and adapter_path must be provided together")
+        if adapter_id == served_model_name:
+            raise ValueError(
+                "served_model_name must differ from adapter_id when serving LoRA; "
+                "OpenAI-compatible requests select the LoRA by adapter_id while "
+                "the base served model keeps its own name"
+            )
 
     selected_gpus = list(DEFAULT_VLLM_GPUS if gpus is None else gpus)
     if not selected_gpus:
@@ -884,12 +893,21 @@ def _local_parametric_context_budget(
     context_reserve_tokens: int,
 ) -> tuple[int, int, int]:
     context_window = max(1, int(context_window_tokens))
+    agent_context_window = _agent_context_window_tokens(context_window)
     context_reserve = min(
         max(1, int(context_reserve_tokens)),
-        max(1, context_window - 1),
+        max(1, agent_context_window - 1),
     )
     output_tokens = min(max(1, int(max_output_tokens)), context_reserve)
     return context_window, context_reserve, output_tokens
+
+
+def _agent_context_window_tokens(context_window: int) -> int:
+    safety_margin = min(
+        DEFAULT_LOCAL_PARAMETRIC_AGENT_CONTEXT_SAFETY_TOKENS,
+        max(0, int(context_window) - 1),
+    )
+    return max(1, int(context_window) - safety_margin)
 
 
 def _run_local_parametric_condition(
@@ -1009,7 +1027,7 @@ def _build_condition_vllm_command(
     if condition.adapter_id and condition.adapter_path is not None:
         return build_vllm_command(
             model=base_model,
-            served_model_name=condition.adapter_id,
+            served_model_name=base_model,
             port=port,
             vllm_executable=vllm_executable,
             gpus=gpus,

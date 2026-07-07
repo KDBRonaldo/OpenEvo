@@ -65,7 +65,7 @@ def test_build_evolab_harbor_env_sets_openai_chat_endpoint(
     assert env["AIGOCODE_GPT_BASE_URL"] == "http://127.0.0.1:8000/v1"
     assert env["OPENAI_API_KEY"] == "dummy-local-key"
     assert env["EVOLAB_TB_MODE"] == "direct_solver"
-    assert env["EVOLAB_TB_CONTEXT_WINDOW_TOKENS"] == "16384"
+    assert env["EVOLAB_TB_CONTEXT_WINDOW_TOKENS"] == "16320"
     assert env["EVOLAB_TB_CONTEXT_RESERVE_TOKENS"] == "1536"
     assert env["EVOLAB_TB_MAX_OUTPUT_TOKENS"] == "1536"
     assert env["EVOLAB_TB_LLM_TEMPERATURE"] == "0.0"
@@ -82,9 +82,24 @@ def test_build_evolab_harbor_env_clamps_output_tokens_to_context_reserve() -> No
         context_reserve_tokens=1024,
     )
 
-    assert env["EVOLAB_TB_CONTEXT_WINDOW_TOKENS"] == "32768"
+    assert env["EVOLAB_TB_CONTEXT_WINDOW_TOKENS"] == "32704"
     assert env["EVOLAB_TB_CONTEXT_RESERVE_TOKENS"] == "1024"
     assert env["EVOLAB_TB_MAX_OUTPUT_TOKENS"] == "1024"
+
+
+def test_build_evolab_harbor_env_leaves_context_safety_margin() -> None:
+    env = build_evolab_harbor_env(
+        base_env={},
+        server_url="http://127.0.0.1:8000/v1",
+        model="tb-parametric-memory",
+        context_window_tokens=8192,
+        context_reserve_tokens=1800,
+        max_output_tokens=1800,
+    )
+
+    assert env["EVOLAB_TB_CONTEXT_WINDOW_TOKENS"] == "8128"
+    assert env["EVOLAB_TB_CONTEXT_RESERVE_TOKENS"] == "1800"
+    assert env["EVOLAB_TB_MAX_OUTPUT_TOKENS"] == "1800"
 
 
 def test_build_evolab_harbor_env_allows_explicit_solver_temperature() -> None:
@@ -222,6 +237,16 @@ def test_build_vllm_command_rejects_empty_gpu_list() -> None:
         build_vllm_command(gpus=[])
 
 
+def test_build_vllm_command_rejects_lora_served_model_name_collision() -> None:
+    with pytest.raises(ValueError, match="served_model_name"):
+        build_vllm_command(
+            model="Qwen/Qwen3.6-35B-A3B",
+            served_model_name="tb-parametric-memory",
+            adapter_id="tb-parametric-memory",
+            adapter_path=Path("/tmp/adapter"),
+        )
+
+
 def test_local_parametric_dry_run_reports_matrix_and_disabled_artifacts(
     tmp_path: Path,
 ) -> None:
@@ -346,7 +371,7 @@ def test_run_local_parametric_memory_eval_compares_baseline_and_adapter(
     assert envs[1]["EVOLAB_TB_MODEL"] == "tb-parametric-memory"
     assert all(env["EVOLAB_TB_MODE"] == "direct_solver" for env in envs)
     assert all(env["EVOLAB_TB_MAX_OUTPUT_TOKENS"] == "1536" for env in envs)
-    assert all(env["EVOLAB_TB_CONTEXT_WINDOW_TOKENS"] == "16384" for env in envs)
+    assert all(env["EVOLAB_TB_CONTEXT_WINDOW_TOKENS"] == "16320" for env in envs)
     assert all(env["EVOLAB_TB_CONTEXT_RESERVE_TOKENS"] == "1536" for env in envs)
     assert all(env["EVOLAB_TB_LLM_TEMPERATURE"] == "0.0" for env in envs)
     assert all(env["EVOLAB_TB_TOOL_RESULT_PROMPT_MAX_CHARS"] == "2048" for env in envs)
@@ -495,6 +520,9 @@ def test_run_local_parametric_memory_eval_manages_baseline_and_adapter_servers(
     treatment_spec = servers[1]["spec"]
     assert "--enable-lora" not in baseline_spec.command
     assert "--enable-lora" in treatment_spec.command
+    assert treatment_spec.command[treatment_spec.command.index("--served-model-name") + 1] == (
+        "Qwen/Qwen3.6-35B-A3B"
+    )
     assert f"tb-parametric-memory={tmp_path / 'adapter'}" in treatment_spec.command
 
 

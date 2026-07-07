@@ -498,6 +498,17 @@ def build_parser() -> argparse.ArgumentParser:
         default=16,
     )
     tb_task_local_parametric_job.add_argument(
+        "--prompt-style",
+        choices=["direct_solver", "live_replay", "synthetic_correction"],
+        default="direct_solver",
+        help=(
+            "Prompt shape for task-local SFT records. live_replay uses failed "
+            "EvoLab llm_calls prefixes when available; direct_solver uses a "
+            "synthetic Terminal-Bench local direct-solver prefix; "
+            "synthetic_correction keeps the older compact correction prompt."
+        ),
+    )
+    tb_task_local_parametric_job.add_argument(
         "--artifact-root",
         help="Artifact root used only when --run-worker is set.",
     )
@@ -1506,6 +1517,7 @@ def _create_terminal_bench_task_local_parametric_memory_job(
             command_contains=list(args.command_contains),
             exclude_command_contains=list(args.exclude_command_contains),
             max_records=args.max_records_per_task,
+            prompt_style=args.prompt_style,
         )
         selection_summary.append(
             {
@@ -1544,6 +1556,7 @@ def _create_terminal_bench_task_local_parametric_memory_job(
     payload["trajectory_pool"] = str(Path(args.trajectory_pool))
     payload["selected_tasks"] = selected_task_ids
     payload["selection_summary"] = selection_summary
+    payload["prompt_style"] = args.prompt_style
 
     if args.run_worker:
         artifact_root = Path(args.artifact_root) if args.artifact_root else output_root / "artifacts"

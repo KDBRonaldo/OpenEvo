@@ -205,18 +205,271 @@ def test_build_task_local_sft_records_uses_successful_command_as_tb_exec_target(
         "system",
         "user",
     ]
-    assert trace["response_messages"][0]["tool_calls"][0]["function"]["name"] == (
+    target_tool_call = trace["response_messages"][-1]["tool_calls"][0]["function"]
+    assert target_tool_call["name"] == (
         "tb_exec"
     )
-    assert trace["response_messages"][0]["tool_calls"][0]["function"][
-        "arguments"
-    ] == {
+    assert target_tool_call["arguments"] == {
         "task_id": "terminal-bench-task",
         "command": "/bin/bash -lc 'python train.py && cp model.bin /app/model.bin'",
     }
     assert record["metadata"]["source_failed_trajectory_id"] == "failed-1"
     assert record["metadata"]["source_successful_trajectory_id"] == "success-1"
-    assert record["metadata"]["prefix_source"] == "task_summary_fallback"
+    assert record["metadata"]["prefix_source"] == "direct_solver_read_task"
+
+
+def test_build_task_local_sft_records_default_matches_direct_solver_prefix(
+    tmp_path: Path,
+) -> None:
+    failed_trial = tmp_path / "failed-trial"
+    successful_trial = tmp_path / "successful-trial"
+    (failed_trial / "agent").mkdir(parents=True)
+    (successful_trial / "agent").mkdir(parents=True)
+    (successful_trial / "agent" / "codex.txt").write_text(
+        json.dumps(
+            {
+                "type": "item.completed",
+                "item": {
+                    "type": "command_execution",
+                    "command": "python train.py && cp model.bin /app/model.bin",
+                    "aggregated_output": "accuracy 0.6257",
+                    "exit_code": 0,
+                    "status": "completed",
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    selection = TaskLocalSelection(
+        task_id="train-fasttext",
+        failed=[
+            TrajectoryPoolRow(
+                trajectory_id="failed-1",
+                task_id="train-fasttext",
+                reward=0.0,
+                trial_dir=failed_trial,
+                raw={"prompt_summary": "Please train a fasttext model."},
+            )
+        ],
+        successful=[
+            TrajectoryPoolRow(
+                trajectory_id="success-1",
+                task_id="train-fasttext",
+                reward=1.0,
+                trial_dir=successful_trial,
+                raw={},
+            )
+        ],
+        null_reward=[],
+    )
+
+    [record] = build_task_local_sft_records(
+        selection,
+        command_contains=["/app/model.bin"],
+        max_records=1,
+    )
+
+    trace = record["traces"][0]
+    assert trace["prompt_messages"][0]["role"] == "system"
+    assert trace["prompt_messages"][0]["content"].startswith(
+        "Solve exactly one task_id. Use tb_read_task first."
+    )
+    assert trace["prompt_messages"][1]["content"].startswith("Instruction:\n{")
+    assert [message["role"] for message in trace["response_messages"]] == [
+        "assistant",
+        "tool",
+        "assistant",
+    ]
+    assert trace["response_messages"][0]["tool_calls"][0]["function"] == {
+        "name": "tb_read_task",
+        "arguments": {"task_id": "terminal-bench-task"},
+    }
+    assert "Please train a fasttext model." in trace["response_messages"][1]["content"]
+    assert trace["response_messages"][2]["tool_calls"][0]["function"] == {
+        "name": "tb_exec",
+        "arguments": {
+            "task_id": "terminal-bench-task",
+            "command": "python train.py && cp model.bin /app/model.bin",
+        },
+    }
+    assert record["metadata"]["prefix_source"] == "direct_solver_read_task"
+
+
+def test_build_task_local_sft_records_live_replay_uses_failed_llm_prefix(
+    tmp_path: Path,
+) -> None:
+    failed_trial = tmp_path / "failed-trial"
+    successful_trial = tmp_path / "successful-trial"
+    llm_calls = (
+        failed_trial
+        / "agent"
+        / "evolab_lab"
+        / ".evolab"
+        / "registries"
+        / "trajectory"
+        / "llm_calls.jsonl"
+    )
+    llm_calls.parent.mkdir(parents=True)
+    (successful_trial / "agent").mkdir(parents=True)
+    llm_calls.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "input_messages": [
+                            {"role": "system", "content": "Solve exactly one task_id."},
+                            {
+                                "role": "user",
+                                "content": "Instruction:\n{}\n\nMemory:\n\n\nSkills:",
+                            },
+                        ],
+                        "output_messages": [
+                            {
+                                "role": "assistant",
+                                "content": "",
+                                "tool_calls": [
+                                    {
+                                        "id": "call-read",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "tb_read_task",
+                                            "arguments": {"task_id": "static-node-0"},
+                                        },
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                ),
+                json.dumps(
+                    {
+                        "input_messages": [
+                            {"role": "system", "content": "Solve exactly one task_id."},
+                            {
+                                "role": "user",
+                                "content": (
+                                    "Instruction:\n{}\n\nMemory:\n\n\nSkills:\n\n\n"
+                                    "Skill Context:\n{\"required_tools\": [\"tb_read_task\"]}"
+                                ),
+                            },
+                            {
+                                "role": "tool",
+                                "content": (
+                                    "{\n"
+                                    '  "container_inventory": {"stdout": "/app\\n"},\n'
+                                    '  "task_yaml": "Please train a fasttext model",\n'
+                                    '  "tool": "tb_read_task"\n'
+                                    "}"
+                                ),
+                                "tool_call_id": "call-read",
+                            },
+                        ],
+                        "output_messages": [
+                            {
+                                "role": "assistant",
+                                "content": "",
+                                "tool_calls": [
+                                    {
+                                        "id": "call-ls",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "tb_exec",
+                                            "arguments": {
+                                                "task_id": "terminal-bench-task",
+                                                "command": "ls -la",
+                                            },
+                                        },
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (successful_trial / "agent" / "codex.txt").write_text(
+        json.dumps(
+            {
+                "type": "item.completed",
+                "item": {
+                    "type": "command_execution",
+                    "command": "python train.py && cp model.bin /app/model.bin",
+                    "aggregated_output": "accuracy 0.63",
+                    "exit_code": 0,
+                    "status": "completed",
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    selection = TaskLocalSelection(
+        task_id="train-fasttext",
+        failed=[
+            TrajectoryPoolRow(
+                trajectory_id="failed-live",
+                task_id="train-fasttext",
+                reward=0.0,
+                trial_dir=failed_trial,
+                raw={},
+            )
+        ],
+        successful=[
+            TrajectoryPoolRow(
+                trajectory_id="success",
+                task_id="train-fasttext",
+                reward=1.0,
+                trial_dir=successful_trial,
+                raw={},
+            )
+        ],
+        null_reward=[],
+    )
+
+    [record] = build_task_local_sft_records(
+        selection,
+        command_contains=["/app/model.bin"],
+        max_records=1,
+        prompt_style="live_replay",
+    )
+
+    trace = record["traces"][0]
+    assert [message["role"] for message in trace["prompt_messages"]] == [
+        "system",
+        "user",
+        "tool",
+    ]
+    assert "Skill Context" in trace["prompt_messages"][1]["content"]
+    assert "container_inventory" in trace["prompt_messages"][2]["content"]
+    assert trace["prompt_messages"][2]["tool_call_id"] == "call-read"
+    assert trace["response_messages"] == [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "polar-task-local-target",
+                    "type": "function",
+                    "function": {
+                        "name": "tb_exec",
+                        "arguments": {
+                            "task_id": "terminal-bench-task",
+                            "command": (
+                                "python train.py && cp model.bin /app/model.bin"
+                            ),
+                        },
+                    },
+                }
+            ],
+        }
+    ]
+    assert record["metadata"]["prefix_source"] == "live_replay_llm_call:2"
 
 
 def test_build_task_local_sft_records_prefers_write_command_over_later_validation(
@@ -301,9 +554,9 @@ def test_build_task_local_sft_records_prefers_write_command_over_later_validatio
         max_records=1,
     )
 
-    target = record["traces"][0]["response_messages"][0]["tool_calls"][0]["function"][
-        "arguments"
-    ]["command"]
+    target = record["traces"][0]["response_messages"][-1]["tool_calls"][0][
+        "function"
+    ]["arguments"]["command"]
     assert "save_model('/app/model.bin')" in target
     assert "path.exists()" not in target
 
@@ -480,4 +733,129 @@ def test_terminal_bench_task_local_parametric_memory_job_cli_writes_payload(
         "--output-dir",
         "{adapter_dir}",
     ]
+    record = json.loads(Path(payload["dataset"]["records_path"]).read_text())
+    assert record["metadata"]["prefix_source"] == "direct_solver_read_task"
     assert "completed_artifacts" not in payload
+
+
+def test_terminal_bench_task_local_parametric_memory_job_cli_accepts_prompt_style(
+    tmp_path: Path,
+) -> None:
+    failed_trial = tmp_path / "failed-trial"
+    successful_trial = tmp_path / "successful-trial"
+    llm_calls = (
+        failed_trial
+        / "agent"
+        / "evolab_lab"
+        / ".evolab"
+        / "registries"
+        / "trajectory"
+        / "llm_calls.jsonl"
+    )
+    llm_calls.parent.mkdir(parents=True)
+    (successful_trial / "agent").mkdir(parents=True)
+    llm_calls.write_text(
+        json.dumps(
+            {
+                "input_messages": [
+                    {"role": "system", "content": "system"},
+                    {"role": "user", "content": "user"},
+                    {"role": "tool", "content": "read task", "tool_call_id": "read"},
+                ],
+                "output_messages": [
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": "ls",
+                                "type": "function",
+                                "function": {
+                                    "name": "tb_exec",
+                                    "arguments": {
+                                        "task_id": "terminal-bench-task",
+                                        "command": "ls",
+                                    },
+                                },
+                            }
+                        ],
+                    }
+                ],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (successful_trial / "agent" / "codex.txt").write_text(
+        json.dumps(
+            {
+                "type": "item.completed",
+                "item": {
+                    "type": "command_execution",
+                    "command": "cp model.bin /app/model.bin",
+                    "aggregated_output": "copied",
+                    "exit_code": 0,
+                    "status": "completed",
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    pool = tmp_path / "trajectory_pool.jsonl"
+    _write_pool(
+        pool,
+        [
+            {
+                "trajectory_id": "failed-1",
+                "task_id": "train-fasttext",
+                "reward": 0.0,
+                "trial_dir": str(failed_trial),
+            },
+            {
+                "trajectory_id": "success-1",
+                "task_id": "train-fasttext",
+                "reward": 1.0,
+                "trial_dir": str(successful_trial),
+            },
+        ],
+    )
+
+    output = tmp_path / "job.json"
+    assert (
+        main(
+            [
+                "terminal-bench-task-local-parametric-memory-job",
+                "--trajectory-pool",
+                str(pool),
+                "--task-id",
+                "train-fasttext",
+                "--output-root",
+                str(tmp_path / "out"),
+                "--trainer-command",
+                "python",
+                "--trainer-arg",
+                "train_lora.py",
+                "--trainer-arg",
+                "--train-file",
+                "--trainer-arg",
+                "{training_dataset}",
+                "--trainer-arg",
+                "--output-dir",
+                "--trainer-arg",
+                "{adapter_dir}",
+                "--command-contains",
+                "/app/model.bin",
+                "--prompt-style",
+                "live_replay",
+                "--output",
+                str(output),
+            ]
+        )
+        == 0
+    )
+
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    record = json.loads(Path(payload["dataset"]["records_path"]).read_text())
+    assert payload["prompt_style"] == "live_replay"
+    assert record["metadata"]["prefix_source"] == "live_replay_llm_call:1"

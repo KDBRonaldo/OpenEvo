@@ -328,9 +328,16 @@ from a trajectory pool that contains both failed and successful attempts for the
 same Terminal Bench task. This path does not ingest events into EvolutionStore;
 it writes a standalone dataset manifest, `records.jsonl`, and
 `WorkerClaimedJob` payload under `--output-root`. It extracts a successful
-Codex command from `agent/codex.txt`, pairs it with a failed trajectory summary,
+Codex command from `agent/codex.txt`, pairs it with a failed trajectory prefix,
 and exports a Qwen tool-call SFT record using the default `full_trace`
-projection. Use `--run-worker` only when the trainer is ready to run locally.
+projection. Prefer `--prompt-style live_replay` when failed local Harbor/Qwen
+trajectories include `agent/evolab_lab/.evolab/registries/trajectory/llm_calls.jsonl`;
+it reuses the real model `input_messages` immediately after `tb_read_task` and
+supervises the successful `tb_exec` target. The default `--prompt-style
+direct_solver` remains a synthetic direct-solver approximation for pools that
+only contain Codex transcripts. Use `--prompt-style synthetic_correction` only
+for explicit ablations of the old compact correction prompt. Use `--run-worker`
+only when the trainer is ready to run locally.
 
 ```sh
 OPEN_EVO_REPO=/path/to/OpenEvo
@@ -348,6 +355,7 @@ uv run polar-evolution terminal-bench-task-local-parametric-memory-job \
   --trainer-arg --output-dir \
   --trainer-arg '{adapter_dir}' \
   --command-contains /app/model.bin \
+  --prompt-style live_replay \
   --output /tmp/tb21-task-local-parametric/train-fasttext/job.json
 ```
 
@@ -360,6 +368,12 @@ schemas are present. `full_trace` now preserves assistant messages that contain
 `training.jsonl`. When several successful commands match `--command-contains`,
 the builder prefers write-like commands such as `save_model`, `cp`, `mv`, or
 file writes over later verification commands such as `Path.exists()` checks.
+With `live_replay`, `records.jsonl` contains the exact failed local harness
+prefix selected from `llm_calls.jsonl`, including runtime Memory/Skills/Skill
+Context blocks and the real `tb_read_task` tool result. With the synthetic
+direct-solver prompt style, `records.jsonl` contains the direct-solver
+system/user prompt, a masked `tb_read_task` assistant/tool prefix, and the
+supervised target `tb_exec` as the final assistant tool call.
 The repo helper `scripts/qwen_lora_sft.py` is an experiment script, not a main
 package dependency; run it with a trainer Python environment that already has
 `torch`, `transformers`, and `peft`. Pass this helper as an absolute path, or
@@ -410,6 +424,26 @@ Single-task non-smoke evidence on 2026-07-07:
   loading path was exercised. The task still failed because the treatment did
   not produce `/app/model.bin` for the verifier. Treat this as a negative
   single-task method result, not as full Terminal Bench performance evidence.
+- A follow-up direct-solver-aligned run at
+  `/tmp/tb21-task-local-parametric-train-direct-20260707/train-fasttext-qwen35-9b-direct-r8-s66`
+  used `Qwen/Qwen3.5-9B`, `CUDA_VISIBLE_DEVICES=6`, 11 records,
+  `--prompt-style direct_solver`, LoRA rank 8, alpha 16, `max_length=2048`,
+  and 66 trainer steps. Loss moved from `1.0200927257537842` to
+  `7.931108848424628e-05`. The paired eval at
+  `/tmp/tb21-task-local-parametric-eval-direct-20260707/train-fasttext-qwen35-9b-direct-r8-s66`
+  also produced baseline pass@1/pass@k `0/1` and parametric-memory
+  pass@1/pass@k `0/1`, delta `0`.
+- Diagnosis from the direct-solver-aligned treatment:
+  the adapter was loaded by vLLM, but the treatment trajectory still began with
+  exploratory commands (`ls -la`, `ls -la data/`, parquet inspection, fastText
+  import checks) and never wrote `/app/model.bin`. The training records used a
+  synthetic direct-solver prefix, while the live Qwen/Harbor request included
+  runtime Memory/Skills/Skill Context blocks and a richer `tb_read_task` tool
+  result. Additionally, the selected successful target command was the final
+  `model.save_model('/app/model.bin')` command from a longer successful Codex
+  sequence, so it depended on intermediate files such as `train_full.ft.txt`.
+  These observations motivated the `live_replay` prompt style and one-shot
+  target experiments.
 
 Create a parametric-memory job from successful Terminal Bench trajectories and
 run the local worker once:
@@ -660,6 +694,43 @@ evidence that the v2 parametric memory adapter improves `password-recovery`
 under the local Qwen3.6 MoE backend when paired with the harness-side
 auto-tested exec guard.
 
+Task-local `train-fasttext` parametric-memory attempts on Qwen3.5-9B did not
+yet show a Terminal-Bench reward gain. A direct-solver-aligned SFT run at
+`/tmp/tb21-task-local-parametric-train-direct-20260707/train-fasttext-qwen35-9b-direct-r8-s66`
+trained 11 records for 66 steps (`loss: 1.02009 -> 0.000079`) and evaluated at
+`/tmp/tb21-task-local-parametric-eval-direct-20260707/train-fasttext-qwen35-9b-direct-r8-s66`
+with baseline `0/1`, parametric memory `0/1`, delta `0`. The treatment loaded
+the LoRA adapter but still followed the base model's exploratory path (`ls`,
+parquet inspection, fastText availability checks) and never wrote
+`/app/model.bin`.
+
+The next `train-fasttext` attempt added `--prompt-style live_replay` and a
+self-contained one-shot target command. Training used one live-replay record at
+`/tmp/tb21-task-local-parametric-train-live-replay-20260707/train-fasttext-qwen35-9b-live-replay-oneshot-r8-s80`
+for 80 steps (`loss: 0.79877 -> 0.000034`). The first paired eval attempt was
+diagnostically useful but not a valid benchmark result: the runner served the
+base model and LoRA module under the same model id, so `/v1/models` exposed two
+entries named `tb-parametric-memory-train-fasttext-qwen35-live-replay-oneshot-r8-s80`.
+That made `model=adapter_id` ambiguous. The same run also hit repeated vLLM
+context-length 400s at exact `prompt_tokens + output_tokens = max_model_len + 1`
+boundaries when the agent kept exploring.
+
+After the serving fix, a focused treatment-only rerun used base
+`--served-model-name Qwen/Qwen3.5-9B` and LoRA module
+`tb-parametric-memory-train-fasttext-qwen35-live-replay-oneshot-r8-s80=...`.
+`/v1/models` then exposed distinct base and adapter ids, with the adapter's
+`parent` set to the base model. This proved request routing could select the
+adapter. The treatment trajectory at
+`/tmp/tb21-task-local-parametric-eval-live-replay-fixed-20260707/treatment-only/harbor_jobs/parametric-memory-train-fasttext-fixed-routing/train-fasttext__viNqa4t`
+did shift behavior compared with baseline (first `tb_exec` became
+`ls -la /app && ls -la /app/data/`), but it still did not emit the trained
+fastText one-shot command. It attempted `pip install fasttext`, installed
+`scikit-learn`, and drifted into sklearn logistic-regression training rather
+than producing a fastText binary. The run was stopped after this failure mode
+was captured, so it should be treated as method debugging evidence, not a
+formal pass@1 result. For completed `train-fasttext` paired runs so far, the
+measured parametric-memory delta remains `0`.
+
 Evaluate baseline local Qwen and adapter local Qwen against the same subset:
 
 ```sh
@@ -704,7 +775,9 @@ default context reserve `1536`; increase `--context-reserve-tokens` only when
 the serving context window and prompt growth leave enough room. For smoke tests
 on slower local Qwen/vLLM servers, lower `--max-output-tokens` explicitly, for
 example `--max-output-tokens 1024`. `--context-window-tokens` also drives
-managed vLLM `--max-model-len`. `--tool-result-prompt-max-chars` sets
+managed vLLM `--max-model-len`; the Harbor agent receives a context window 64
+tokens smaller through `EVOLAB_TB_CONTEXT_WINDOW_TOKENS` to avoid exact-boundary
+server rejections. `--tool-result-prompt-max-chars` sets
 `EVOLAB_TB_TOOL_RESULT_PROMPT_MAX_CHARS` for the Harbor agent. It only affects
 runtime behavior when the installed Terminal Bench/EvoLab package honors that
 environment variable; otherwise the value is still recorded in the summary as a

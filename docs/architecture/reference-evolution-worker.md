@@ -552,6 +552,7 @@ uv run polar-evolution terminal-bench-task-local-parametric-memory-job \
   --trainer-arg --output-dir \
   --trainer-arg '{adapter_dir}' \
   --command-contains /app/model.bin \
+  --prompt-style live_replay \
   --output /tmp/tb21-task-local-parametric/train-fasttext/job.json
 ```
 
@@ -561,7 +562,19 @@ standalone dataset artifact manifest plus `records.jsonl`, and emits a
 `parametric_memory_lora_sft` `WorkerClaimedJob` payload. It only invokes the
 trainer when `--run-worker` is set. If multiple successful commands match the
 filters, the builder prefers write-like commands over later validation commands,
-so post-hoc existence checks do not become the supervised target.
+so post-hoc existence checks do not become the supervised target. Prefer
+`--prompt-style live_replay` when failed local Harbor/Qwen runs have
+`agent/evolab_lab/.evolab/registries/trajectory/llm_calls.jsonl`; it uses the
+real `input_messages` prefix immediately after `tb_read_task`, including
+runtime Memory/Skills/Skill Context and the actual tool result, then supervises
+the selected successful `tb_exec`. The default `--prompt-style direct_solver`
+is a synthetic approximation for pools that only contain Codex transcripts. Use
+`--prompt-style synthetic_correction` only to reproduce the older compact
+correction prompt. The selected target command must be executable from the
+chosen prefix state. If a successful trajectory created intermediate files or
+installed dependencies before its final write command, the method should provide
+a self-contained one-shot target or a sequence-compression strategy instead of
+training on only the final command.
 `scripts/qwen_lora_sft.py` is a repository-provided experiment helper; it should
 be run with a trainer environment that provides `torch`, `transformers`, and
 `peft`, rather than making those libraries mandatory package dependencies. Pass
@@ -581,9 +594,16 @@ Serving contract:
 - 本地 eval 会记录 `requested_max_output_tokens` 和实际传给 Harbor agent 的
   `max_output_tokens`。实际值会被 `context_reserve_tokens` clamp；默认
   `context_window_tokens=16384`、`context_reserve_tokens=1536`。Managed vLLM server 使用同一个
-  `context_window_tokens` 作为 `--max-model-len`，并把 context budget 通过
-  `EVOLAB_TB_CONTEXT_WINDOW_TOKENS`、`EVOLAB_TB_CONTEXT_RESERVE_TOKENS` 暴露给支持新版 contract 的
-  Terminal Bench/EvoLab package。
+  `context_window_tokens` 作为 `--max-model-len`。为了避免 vLLM/OpenAI-compatible server 在
+  exact-boundary prompt truncation 上返回 context length 400，runner 会把
+  `EVOLAB_TB_CONTEXT_WINDOW_TOKENS` 暴露为 server window 减 64 token 的 agent-side budget，
+  同时保持 summary 中的 `context_window_tokens` 表示实际 server max len。
+  `EVOLAB_TB_CONTEXT_RESERVE_TOKENS` 暴露的是已按 agent-side budget clamp 后的 reserve。
+- Managed vLLM LoRA serving 必须让 base served model name 和 adapter id 保持不同。Runner
+  用 base model 作为 `--served-model-name`，用 `adapter_id` 作为 `--lora-modules
+  <adapter_id>=<adapter_path>` 的 serving-time adapter name，并让 Harbor agent 请求
+  `model=adapter_id`。不要把 `--served-model-name` 也设为 `adapter_id`；那会在 `/v1/models`
+  中暴露重复 id，使 OpenAI-compatible request 无法可靠选择 LoRA adapter。
 
 该 artifact 只适用于 proxy/local inference runtime。Subscription harness 直连外部模型
 服务，不能选择 OpenEvo 训练出的 adapter；上层 experiment config 和 Terminal Bench
