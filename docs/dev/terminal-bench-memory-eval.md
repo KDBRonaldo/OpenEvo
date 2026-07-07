@@ -309,12 +309,14 @@ implemented by the installed Terminal-Bench/EvoLab package.
 
 Use `--auth-mode local` or `--auth-mode proxy` for local/proxy inference modes;
 neither is subscription mode. The selected auth mode is recorded in the
-summary. `--server-url` selects the OpenAI-compatible endpoint. With
-`--manage-server`, the command starts and stops vLLM locally; without it, the
-command targets an already-running endpoint. When `--manage-server` receives an
-absolute vLLM executable path, the runner prepends that executable's directory
-to the server `PATH`, so vLLM subprocesses can find venv-local helpers such as
-`ninja` during FlashInfer JIT startup.
+summary. `--server-url` selects the OpenAI-compatible endpoint when supplied.
+If it is omitted, the CLI derives `http://127.0.0.1:<server-port>/v1` from
+`--server-port`, so managed vLLM runs on non-default ports do not wait on the
+default 8000 endpoint. With `--manage-server`, the command starts and stops
+vLLM locally; without it, the command targets an already-running endpoint. When
+`--manage-server` receives an absolute vLLM executable path, the runner
+prepends that executable's directory to the server `PATH`, so vLLM subprocesses
+can find venv-local helpers such as `ninja` during FlashInfer JIT startup.
 
 Repeated `--trainer-arg` values are preserved as trainer arguments, including
 values that begin with `--`. For example, `--trainer-arg --train-file` passes
@@ -878,8 +880,9 @@ command in one `tb_exec` call; the verifier passed both
 `test_recovery_file_exists` and `test_password_match`. A first attempt at the
 same eval accidentally set only `--server-port 8011` while leaving
 `--server-url` at the default port 8000, so it stayed in server readiness and
-never launched Harbor; always keep those two values aligned when using a
-non-default managed-server port.
+never launched Harbor. The CLI now derives the default URL from
+`--server-port`; if `--server-url` is supplied explicitly, keep it aligned with
+the managed-server port.
 
 Evaluate baseline local Qwen and adapter local Qwen against the same subset:
 

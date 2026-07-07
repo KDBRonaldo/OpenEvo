@@ -2014,6 +2014,7 @@ def test_terminal_bench_local_parametric_cli_live_invokes_runner(
     assert captured["adapter_artifact_id"] == "art-parametric"
     assert captured["gpus"] == ["1", "2"]
     assert captured["port"] == 8011
+    assert captured["server_url"] == "http://127.0.0.1:8011/v1"
     assert captured["auth_mode"] == "proxy"
     assert captured["verifier_env"] == {"UV_NO_INDEX": "1"}
     assert captured["agent_env"] == {"EVOLAB_TB_REQUIRE_SUCCESSFUL_COLLECT": "1"}

@@ -684,7 +684,7 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     tb_local_parametric.add_argument("--adapter-artifact-id")
-    tb_local_parametric.add_argument("--server-url", default="http://127.0.0.1:8000/v1")
+    tb_local_parametric.add_argument("--server-url")
     tb_local_parametric.add_argument("--server-port", type=int, default=8000)
     tb_local_parametric.add_argument("--vllm-executable", default=DEFAULT_VLLM_EXECUTABLE)
     tb_local_parametric.add_argument("--gpu", action="append", default=[])
@@ -916,6 +916,7 @@ def main(argv: list[str] | None = None) -> int:
             python_install_mirror=args.verifier_python_install_mirror,
         )
         agent_env = _parse_key_value_entries(args.agent_env)
+        server_url = _local_parametric_server_url(args.server_url, args.server_port)
         if args.dry_run:
             payload = run_local_parametric_memory_eval_dry_run(
                 task_root=Path(args.task_root),
@@ -924,7 +925,7 @@ def main(argv: list[str] | None = None) -> int:
                 model=args.model,
                 adapter_path=Path(args.adapter_path),
                 adapter_id=args.adapter_id,
-                server_url=args.server_url,
+                server_url=server_url,
                 n_attempts=args.n_attempts,
                 max_output_tokens=args.max_output_tokens,
                 context_window_tokens=args.context_window_tokens,
@@ -949,7 +950,7 @@ def main(argv: list[str] | None = None) -> int:
             adapter_path=Path(args.adapter_path),
             adapter_id=args.adapter_id,
             adapter_artifact_id=args.adapter_artifact_id,
-            server_url=args.server_url,
+            server_url=server_url,
             n_attempts=args.n_attempts,
             max_output_tokens=args.max_output_tokens,
             context_window_tokens=args.context_window_tokens,
@@ -1974,6 +1975,12 @@ def _local_parametric_verifier_env(
             _local_parametric_python_install_mirror(python_install_mirror),
         )
     return env
+
+
+def _local_parametric_server_url(value: str | None, port: int) -> str:
+    if value:
+        return value
+    return f"http://127.0.0.1:{int(port)}/v1"
 
 
 def _local_parametric_python_install_mirror(value: str) -> str:
