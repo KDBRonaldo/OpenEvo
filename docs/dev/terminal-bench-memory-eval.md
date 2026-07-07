@@ -1025,6 +1025,26 @@ selected mode plus required paths into the dry-run/live summary. The default is
 honoring `EVOLAB_TB_ARTIFACT_PATH_GUARD` and
 `EVOLAB_TB_REQUIRED_ARTIFACT_PATHS`.
 
+A guard-backed gcode eval at
+`/tmp/tb21-task-local-parametric-gcode-pathbound-guard-20260707/eval-gcode-qwen35-pathbound-repair-r8-s140`
+used the path-bound Qwen3.5-9B adapter above with
+`--artifact-path-guard repair`, `--required-artifact-path /app/out.txt`,
+managed vLLM on GPU 6, deterministic decoding, and the
+`qwen3_5_vllm_language_model` adapter key rewrite. The summary recorded
+`rewritten_key_count=64`, baseline pass@1/pass@k `0/1`,
+parametric-memory pass@1/pass@k `0/1`, and delta `0`. This run validates the
+guard plumbing and summary contract, but it is not positive method evidence.
+The baseline wrote `/app/out.txt` with the wrong content, so there was no
+single wrong output path for repair to rewrite. The treatment loaded the
+adapter but produced no tool call: the OpenAI-compatible response ended with
+`finish_reason="length"`, empty content, and no `tool_calls`, which the Harbor
+bridge reported as `{"error": "empty_model_response"}`. Inspecting the raw
+reasoning showed the model stalled before `tb_read_task` because the
+direct-solver prompt did not expose a concrete usable task id. Before adding
+more gcode SFT variants, fix the local Qwen direct-solver bootstrap so the
+runtime task id is explicit or defaulted consistently; the artifact-path guard
+can only repair supported `tb_exec` commands after a tool call exists.
+
 For `password-recovery`, a Qwen3.5-9B local LoRA smoke was trained from the
 existing failed/successful tool-policy trajectory at
 `/tmp/tb21-parametric-memory-password-toolpolicy-20260702-110343/local-eval-password-toolpolicy-2048/baseline/harbor_jobs/baseline-password-recovery/password-recovery__AzMbthq`.
