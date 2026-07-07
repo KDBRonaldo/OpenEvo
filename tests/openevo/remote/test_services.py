@@ -36,6 +36,12 @@ def test_service_plan_starts_subscription_runtime_services() -> None:
     assert "http://127.0.0.1:8100/health" in gateway.health_command
     assert "deadline = time.monotonic() + 30" in gateway.health_command
     assert gateway.health_timeout_seconds == 35.0
+    rollout = plan.step_by_id("rollout")
+    assert f"polar serve_rollout --config {plan.topology_path}" in rollout.command
+    assert (
+        f"polar serve_gateway --config {plan.topology_path} "
+        "--node-id desktop-node"
+    ) in gateway.command
 
 
 def test_service_plan_starts_vllm_for_managed_local_inference() -> None:
