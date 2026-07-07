@@ -972,6 +972,102 @@ def test_cli_desktop_open_opens_browser_and_runs_desktop_app(
     assert desktop_calls[0][1] == static_root
 
 
+def test_cli_desktop_open_defaults_to_ssh_transport(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    app_calls = []
+
+    class FakeApp:
+        title = "OpenEvo Desktop Sidecar"
+
+    def fake_create_sidecar_app(**kwargs):
+        app_calls.append(kwargs)
+        return FakeApp()
+
+    monkeypatch.setattr("openevo.cli.create_sidecar_app", fake_create_sidecar_app)
+    monkeypatch.setattr(
+        "openevo.cli.create_desktop_app",
+        lambda app, *, static_root=None: app,
+    )
+    monkeypatch.setattr(
+        "openevo.cli._run_desktop_open_server",
+        lambda app, *, host, port, sock, url, open_browser: sock.close(),
+    )
+    _CliRecordingSshTransport.profiles = []
+    monkeypatch.setattr(
+        "openevo.cli.SshRemoteExecutorTransport",
+        _CliRecordingSshTransport,
+    )
+
+    exit_code = main(
+        [
+            "desktop",
+            "open",
+            "--no-browser",
+            "--port",
+            "3778",
+            "--desktop-config-root",
+            str(tmp_path / "configs"),
+            "--static-root",
+            str(_desktop_static_root(tmp_path)),
+        ]
+    )
+
+    assert exit_code == 0
+    assert app_calls[0]["transport_kind"] == "ssh"
+    app_calls[0]["transport_factory"](_remote_profile_for_cli())
+    assert _CliRecordingSshTransport.profiles[0].id == "science-team"
+
+
+def test_cli_desktop_open_allows_explicit_dry_run_transport(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    app_calls = []
+
+    class FakeApp:
+        title = "OpenEvo Desktop Sidecar"
+
+    def fake_create_sidecar_app(**kwargs):
+        app_calls.append(kwargs)
+        return FakeApp()
+
+    monkeypatch.setattr("openevo.cli.create_sidecar_app", fake_create_sidecar_app)
+    monkeypatch.setattr(
+        "openevo.cli.create_desktop_app",
+        lambda app, *, static_root=None: app,
+    )
+    monkeypatch.setattr(
+        "openevo.cli._run_desktop_open_server",
+        lambda app, *, host, port, sock, url, open_browser: sock.close(),
+    )
+
+    exit_code = main(
+        [
+            "desktop",
+            "open",
+            "--transport",
+            "dry-run",
+            "--no-browser",
+            "--port",
+            "3778",
+            "--desktop-config-root",
+            str(tmp_path / "configs"),
+            "--static-root",
+            str(_desktop_static_root(tmp_path)),
+        ]
+    )
+
+    assert exit_code == 0
+    assert app_calls[0]["transport_kind"] == "dry-run"
+    assert (
+        app_calls[0]["transport_factory"](_remote_profile_for_cli())
+        .__class__.__name__
+        == "_CliDryRunTransport"
+    )
+
+
 def test_cli_desktop_open_no_browser_suppresses_browser_open(
     tmp_path: Path,
     monkeypatch,

@@ -131,7 +131,10 @@ openevo desktop open
 This starts the same local FastAPI/uvicorn process, opens `/openevo` in the
 user browser, and falls back to an available local port if the preferred port is
 occupied. `--no-browser` keeps the server-only behavior for headless or scripted
-environments.
+environments. The user-facing launcher defaults sidecar mutating endpoints to
+SSH transport so the Desktop lifecycle buttons operate the configured remote
+server. Pass `--transport dry-run` for local demos that should not open SSH
+connections.
 
 The exact-port server entrypoint remains:
 
@@ -141,7 +144,9 @@ openevo desktop serve --host 127.0.0.1 --port 3766
 
 Both commands serve the packaged Desktop SPA at `/openevo` and the sidecar API
 at `/openevo-api/*`. `desktop serve` preserves exact-port behavior for tests,
-integrations, and power users.
+integrations, and power users. `desktop serve` and API-only `sidecar serve`
+keep `dry-run` as their default transport; pass `--transport ssh` when those
+entrypoints should mutate a remote server.
 The root path `/` redirects to `/openevo`. The packaged asset set is built in
 OpenEvo-only mode, so users do not see the shared Polar dashboard navigation.
 The local server still returns the SPA for compatibility routes `/tasks`,
@@ -307,10 +312,12 @@ It is available only for config-backed sidecar sessions. It reuses
 `execute_remote_bootstrap_plan()` to run the existing bootstrap executor, then
 returns both the bootstrap report and refreshed shell status. The default serve
 transport is dry-run; `openevo sidecar serve --transport ssh` selects the SSH
-transport for the bootstrap endpoint. Bootstrap does not upload local folders or
-clone git task sources; workspace preparation remains a separate lifecycle step
-so the UI can report source materialization independently from runtime
-readiness.
+transport for the bootstrap endpoint. The user-facing `openevo desktop open`
+launcher selects SSH by default, while exact-port serve and API-only sidecar
+serve keep dry-run defaults for tests and integrations. Bootstrap does not
+upload local folders or clone git task sources; workspace preparation remains a
+separate lifecycle step so the UI can report source materialization
+independently from runtime readiness.
 
 `POST /openevo-api/desktop/workspace` executes that separate workspace
 preparation lifecycle. It is available only for config-backed sidecar sessions
@@ -458,7 +465,9 @@ exercises the same planning, status, and polling path, but it does not mutate
 the remote server. A dry-run report can therefore show the UI path as ready
 without proving that task workspaces, Docker images, or Hugging Face models were
 actually prepared. Real remote preparation and run execution require
-`--transport ssh`.
+SSH transport. `openevo desktop open` selects SSH by default; `desktop serve`
+and `sidecar serve` require `--transport ssh` when they should mutate a remote
+server.
 
 This slice adds a command-and-health-check service supervisor plus a local
 sidecar run supervisor with one latest run per config-backed session. It does

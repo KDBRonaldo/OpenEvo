@@ -275,13 +275,20 @@ openevo desktop open
 
 This starts the local sidecar server, opens `/openevo` in the browser, and
 falls back to a free local port if the default port is already occupied. Use
-`--no-browser` for headless environments.
+`--no-browser` for headless environments. This user-facing launcher defaults
+sidecar lifecycle actions to SSH transport so the Desktop buttons operate the
+configured remote server. Use `--transport dry-run` for local demos that should
+not open SSH connections.
 
 For an exact-port server entrypoint:
 
 ```bash
 openevo desktop serve --host 127.0.0.1 --port 3766
 ```
+
+`openevo desktop serve` and `openevo sidecar serve` keep `dry-run` as their
+default transport for tests, integrations, and power users; pass `--transport
+ssh` when those entrypoints should mutate a remote server.
 
 Release wheels are built from the OpenEvo package metadata and include the
 packaged OpenEvo-only Desktop assets under `openevo/desktop/web/`.
