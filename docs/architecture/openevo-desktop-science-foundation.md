@@ -248,6 +248,28 @@ private-key path, password reference, and passphrase reference fields, but it
 forbids raw secret extras such as `password`. A future vault/keychain layer can
 resolve those references outside this local config contract.
 
+`GET /openevo-api/desktop/project-configs` lists saved Desktop project configs
+from the same config root. It scans
+`<desktop-config-root>/projects/*/science.yaml`, validates each Science Project,
+loads the matching remote profile from
+`<desktop-config-root>/profiles/<remote-profile-id>.yaml`, and returns
+deterministic summaries sorted by project slug. Summaries include only
+non-secret fields: project slug, project name, task id, objective, source type
+and label, remote profile id, remote host/user, config file paths, validity, and
+a sanitized validation error when invalid. They do not expose raw password
+values, key material, private key paths, password references, or passphrase
+references.
+
+`POST /openevo-api/desktop/project-configs/{project_slug}/activate` loads a
+previously saved valid config into the current sidecar process after a Desktop
+restart. It requires the same mutation token as other mutating endpoints,
+rejects invalid slugs before path resolution, returns 404 for unknown saved
+projects, and returns 422 for saved configs whose Science Project or matching
+remote profile no longer validates. Successful activation returns the config
+paths plus a refreshed shell status and replaces the in-process session, so
+subsequent `/workspace`, `/bootstrap`, and `/run` calls use the activated saved
+config without asking the user to locate YAML files manually.
+
 `POST /openevo-api/desktop/bootstrap` is the first mutating sidecar endpoint.
 It is available only for config-backed sidecar sessions. It reuses
 `build_sidecar_science_plan()`, `build_remote_bootstrap_plan()`, and

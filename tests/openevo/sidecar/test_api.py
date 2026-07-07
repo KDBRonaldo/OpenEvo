@@ -561,6 +561,243 @@ def test_project_config_endpoint_rejects_missing_sidecar_token(tmp_path: Path) -
     assert response.json()["detail"] == "Invalid OpenEvo sidecar token."
 
 
+def test_project_config_catalog_lists_saved_configs_after_restart(
+    tmp_path: Path,
+) -> None:
+    writer = TestClient(
+        create_sidecar_app(
+            config_root=tmp_path,
+            transport_factory=lambda _profile: _ApiDryRunTransport(),
+        )
+    )
+    writer_token = _sidecar_token(writer)
+    saved = writer.post(
+        "/openevo-api/desktop/project-config",
+        headers={"X-OpenEvo-Sidecar-Token": writer_token},
+        json=_desktop_config_draft_payload(),
+    )
+    assert saved.status_code == 200
+    client = TestClient(
+        create_sidecar_app(
+            config_root=tmp_path,
+            transport_factory=lambda _profile: _ApiDryRunTransport(),
+        )
+    )
+
+    response = client.get("/openevo-api/desktop/project-configs")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert len(payload["configs"]) == 1
+    summary = payload["configs"][0]
+    assert summary["project_slug"] == "protein-design"
+    assert summary["valid"] is True
+    assert summary["error"] is None
+    assert summary["project_name"] == "Protein Design"
+    assert summary["task_id"] == "folding-baseline"
+    assert summary["source_type"] == "remote_path"
+    assert summary["source_label"] == "/datasets/folding-baseline"
+    assert summary["remote_profile_id"] == "science-team"
+    assert summary["remote_host"] == "gpu.example.edu"
+    assert summary["remote_user"] == "alice"
+    assert "password" not in json.dumps(payload)
+    assert "private_key_path" not in json.dumps(payload)
+
+
+def test_project_config_catalog_requires_config_root() -> None:
+    client = TestClient(create_sidecar_app())
+
+    response = client.get("/openevo-api/desktop/project-configs")
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == (
+        "Desktop project config catalog requires a writable config root."
+    )
+
+
+def test_project_config_activate_loads_saved_config_after_restart(
+    tmp_path: Path,
+) -> None:
+    writer = TestClient(
+        create_sidecar_app(
+            config_root=tmp_path,
+            transport_factory=lambda _profile: _ApiDryRunTransport(),
+        )
+    )
+    writer_token = _sidecar_token(writer)
+    saved = writer.post(
+        "/openevo-api/desktop/project-config",
+        headers={"X-OpenEvo-Sidecar-Token": writer_token},
+        json=_desktop_config_draft_payload(),
+    )
+    assert saved.status_code == 200
+    transport = _ApiDryRunTransport()
+    client = TestClient(
+        create_sidecar_app(
+            config_root=tmp_path,
+            transport_factory=lambda _profile: transport,
+        )
+    )
+    token = _sidecar_token(client)
+    headers = {"X-OpenEvo-Sidecar-Token": token}
+
+    activate = client.post(
+        "/openevo-api/desktop/project-configs/protein-design/activate",
+        headers=headers,
+    )
+
+    assert activate.status_code == 200
+    payload = activate.json()
+    assert payload["status"]["project"]["name"] == "Protein Design"
+    assert payload["status"]["remote"]["host"] == "gpu.example.edu"
+    assert payload["config"]["science_config_path"].endswith(
+        "/projects/protein-design/science.yaml"
+    )
+    workspace = client.post("/openevo-api/desktop/workspace", headers=headers)
+    assert workspace.status_code == 200
+    assert workspace.json()["workspace"]["ready"] is True
+
+
+def test_project_config_activate_rejects_missing_sidecar_token(
+    tmp_path: Path,
+) -> None:
+    client = TestClient(
+        create_sidecar_app(
+            config_root=tmp_path,
+            transport_factory=lambda _profile: _ApiDryRunTransport(),
+        )
+    )
+
+    response = client.post(
+        "/openevo-api/desktop/project-configs/protein-design/activate",
+    )
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Invalid OpenEvo sidecar token."
+
+
+def test_project_config_activate_rejects_unknown_slug(tmp_path: Path) -> None:
+    client = TestClient(
+        create_sidecar_app(
+            config_root=tmp_path,
+            transport_factory=lambda _profile: _ApiDryRunTransport(),
+        )
+    )
+    token = _sidecar_token(client)
+
+    response = client.post(
+        "/openevo-api/desktop/project-configs/missing-project/activate",
+        headers={"X-OpenEvo-Sidecar-Token": token},
+    )
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "Saved Desktop project config not found."
+
+
+def test_project_config_activate_rejects_invalid_saved_config(
+    tmp_path: Path,
+) -> None:
+    writer = TestClient(
+        create_sidecar_app(
+            config_root=tmp_path,
+            transport_factory=lambda _profile: _ApiDryRunTransport(),
+        )
+    )
+    writer_token = _sidecar_token(writer)
+    saved = writer.post(
+        "/openevo-api/desktop/project-config",
+        headers={"X-OpenEvo-Sidecar-Token": writer_token},
+        json=_desktop_config_draft_payload(),
+    )
+    assert saved.status_code == 200
+    (tmp_path / "profiles" / "science-team.yaml").unlink()
+    client = TestClient(
+        create_sidecar_app(
+            config_root=tmp_path,
+            transport_factory=lambda _profile: _ApiDryRunTransport(),
+        )
+    )
+    token = _sidecar_token(client)
+
+    response = client.post(
+        "/openevo-api/desktop/project-configs/protein-design/activate",
+        headers={"X-OpenEvo-Sidecar-Token": token},
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"].startswith("Saved Desktop project config is invalid")
+    assert str(tmp_path) not in response.json()["detail"]
+
+
+def test_project_config_activate_sanitizes_invalid_profile_inputs(
+    tmp_path: Path,
+) -> None:
+    writer = TestClient(
+        create_sidecar_app(
+            config_root=tmp_path,
+            transport_factory=lambda _profile: _ApiDryRunTransport(),
+        )
+    )
+    writer_token = _sidecar_token(writer)
+    saved = writer.post(
+        "/openevo-api/desktop/project-config",
+        headers={"X-OpenEvo-Sidecar-Token": writer_token},
+        json=_desktop_config_draft_payload(),
+    )
+    assert saved.status_code == 200
+    profile_path = tmp_path / "profiles" / "science-team.yaml"
+    profile_path.write_text(
+        "\n".join(
+            [
+                "version: 1",
+                "id: science-team",
+                "host: gpu.example.edu",
+                "port: 22",
+                "user: alice",
+                "password: super-secret-value",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    client = TestClient(
+        create_sidecar_app(
+            config_root=tmp_path,
+            transport_factory=lambda _profile: _ApiDryRunTransport(),
+        )
+    )
+    token = _sidecar_token(client)
+
+    response = client.post(
+        "/openevo-api/desktop/project-configs/protein-design/activate",
+        headers={"X-OpenEvo-Sidecar-Token": token},
+    )
+
+    detail = response.json()["detail"]
+    assert response.status_code == 422
+    assert "Extra inputs are not permitted" in detail
+    assert "super-secret-value" not in detail
+
+
+def test_project_config_activate_rejects_path_traversal_slug(
+    tmp_path: Path,
+) -> None:
+    client = TestClient(
+        create_sidecar_app(
+            config_root=tmp_path,
+            transport_factory=lambda _profile: _ApiDryRunTransport(),
+        )
+    )
+    token = _sidecar_token(client)
+
+    response = client.post(
+        "/openevo-api/desktop/project-configs/%2E%2E/activate",
+        headers={"X-OpenEvo-Sidecar-Token": token},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Invalid Desktop project slug."
+
+
 def test_project_config_endpoint_saves_config_and_enables_workspace(
     tmp_path: Path,
 ) -> None:

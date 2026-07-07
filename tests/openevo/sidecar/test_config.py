@@ -9,6 +9,8 @@ import yaml
 from openevo.sidecar.config import (
     DesktopProjectConfigDraft,
     build_desktop_project_configs,
+    list_desktop_project_configs,
+    load_desktop_project_config,
     save_desktop_project_config,
 )
 
@@ -82,6 +84,177 @@ def test_save_desktop_project_config_writes_deterministic_yaml(tmp_path: Path) -
     assert remote_yaml["proxy"]["https_proxy"] == "http://127.0.0.1:7890"
     assert "path" not in science_yaml
     assert "path" not in remote_yaml
+
+
+def test_list_desktop_project_configs_returns_non_secret_summaries(
+    tmp_path: Path,
+) -> None:
+    alpha = DesktopProjectConfigDraft.model_validate(
+        VALID_DRAFT | {"project_name": "Alpha Project", "remote_profile_id": "alpha"}
+    )
+    zeta = DesktopProjectConfigDraft.model_validate(
+        VALID_DRAFT
+        | {
+            "project_name": "Zeta Project",
+            "remote_profile_id": "zeta",
+            "remote_host": "zeta.example.edu",
+        }
+    )
+    save_desktop_project_config(zeta, tmp_path)
+    save_desktop_project_config(alpha, tmp_path)
+
+    configs = list_desktop_project_configs(tmp_path)
+
+    assert [config.project_slug for config in configs] == [
+        "alpha-project",
+        "zeta-project",
+    ]
+    first = configs[0]
+    assert first.valid is True
+    assert first.error is None
+    assert first.project_name == "Alpha Project"
+    assert first.task_id == "folding-baseline"
+    assert first.source_type == "remote_path"
+    assert first.source_label == "/datasets/folding-baseline"
+    assert first.remote_profile_id == "alpha"
+    assert first.remote_host == "gpu.example.edu"
+    assert first.remote_user == "alice"
+    assert first.science_config_path == (
+        tmp_path / "projects" / "alpha-project" / "science.yaml"
+    )
+    assert first.remote_profile_path == tmp_path / "profiles" / "alpha.yaml"
+    assert "password" not in first.model_dump_json()
+    assert "private_key_path" not in first.model_dump_json()
+
+
+def test_list_desktop_project_configs_redacts_git_url_userinfo(tmp_path: Path) -> None:
+    draft = DesktopProjectConfigDraft.model_validate(
+        VALID_DRAFT
+        | {
+            "source_type": "git_repository",
+            "source_path": None,
+            "source_url": "https://alice:super-secret-token@example.com/repo.git",
+            "source_branch": "main",
+        }
+    )
+    save_desktop_project_config(draft, tmp_path)
+
+    configs = list_desktop_project_configs(tmp_path)
+
+    assert len(configs) == 1
+    assert configs[0].source_label == "https://example.com/repo.git@main"
+    assert "super-secret-token" not in configs[0].model_dump_json()
+
+
+def test_list_desktop_project_configs_redacts_git_url_userinfo_with_bad_port(
+    tmp_path: Path,
+) -> None:
+    draft = DesktopProjectConfigDraft.model_validate(
+        VALID_DRAFT
+        | {
+            "source_type": "git_repository",
+            "source_path": None,
+            "source_url": "https://alice:super-secret-token@example.com:notaport/repo.git",
+        }
+    )
+    save_desktop_project_config(draft, tmp_path)
+
+    configs = list_desktop_project_configs(tmp_path)
+
+    assert len(configs) == 1
+    assert configs[0].valid is True
+    assert configs[0].source_label == "https://example.com:notaport/repo.git"
+    assert "super-secret-token" not in configs[0].model_dump_json()
+
+
+def test_list_desktop_project_configs_redacts_scp_like_git_userinfo(
+    tmp_path: Path,
+) -> None:
+    draft = DesktopProjectConfigDraft.model_validate(
+        VALID_DRAFT
+        | {
+            "source_type": "git_repository",
+            "source_path": None,
+            "source_url": "super-secret-token@example.com:org/repo.git",
+        }
+    )
+    save_desktop_project_config(draft, tmp_path)
+
+    configs = list_desktop_project_configs(tmp_path)
+
+    assert len(configs) == 1
+    assert configs[0].source_label == "example.com:org/repo.git"
+    assert "super-secret-token" not in configs[0].model_dump_json()
+
+
+def test_list_desktop_project_configs_marks_missing_profile_invalid(
+    tmp_path: Path,
+) -> None:
+    draft = DesktopProjectConfigDraft.model_validate(VALID_DRAFT)
+    _project, _profile, paths = save_desktop_project_config(draft, tmp_path)
+    paths.remote_profile_path.unlink()
+
+    configs = list_desktop_project_configs(tmp_path)
+
+    assert len(configs) == 1
+    summary = configs[0]
+    assert summary.project_slug == "protein-design"
+    assert summary.valid is False
+    assert summary.project_name == "Protein Design"
+    assert summary.remote_profile_id == "science-team"
+    assert summary.remote_profile_path == tmp_path / "profiles" / "science-team.yaml"
+    assert summary.remote_host is None
+    assert summary.remote_user is None
+    assert "Remote profile config not found" in (summary.error or "")
+    assert str(tmp_path) not in (summary.error or "")
+
+
+def test_list_desktop_project_configs_sanitizes_invalid_profile_inputs(
+    tmp_path: Path,
+) -> None:
+    draft = DesktopProjectConfigDraft.model_validate(VALID_DRAFT)
+    _project, _profile, paths = save_desktop_project_config(draft, tmp_path)
+    paths.remote_profile_path.write_text(
+        "\n".join(
+            [
+                "version: 1",
+                "id: science-team",
+                "host: gpu.example.edu",
+                "port: 22",
+                "user: alice",
+                "password: super-secret-value",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    configs = list_desktop_project_configs(tmp_path)
+
+    summary = configs[0]
+    assert summary.valid is False
+    assert "Extra inputs are not permitted" in (summary.error or "")
+    assert "super-secret-value" not in (summary.error or "")
+
+
+def test_load_desktop_project_config_rejects_path_traversal(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="Invalid Desktop project slug"):
+        load_desktop_project_config(tmp_path, "../profiles")
+
+
+def test_load_desktop_project_config_loads_saved_models(tmp_path: Path) -> None:
+    draft = DesktopProjectConfigDraft.model_validate(VALID_DRAFT)
+    save_desktop_project_config(draft, tmp_path)
+
+    project, profile, paths = load_desktop_project_config(tmp_path, "protein-design")
+
+    assert project.project.name == "Protein Design"
+    assert project.remote_profile == "science-team"
+    assert profile.id == "science-team"
+    assert profile.host == "gpu.example.edu"
+    assert paths.science_config_path == (
+        tmp_path / "projects" / "protein-design" / "science.yaml"
+    )
+    assert paths.remote_profile_path == tmp_path / "profiles" / "science-team.yaml"
 
 
 def test_desktop_project_config_draft_rejects_raw_secret_fields() -> None:

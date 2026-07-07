@@ -36,7 +36,10 @@ from openevo.sidecar.api import (
 from openevo.sidecar.config import (
     DesktopProjectConfigDraft,
     DesktopProjectConfigPaths,
+    DesktopProjectConfigSummary,
     build_desktop_project_configs,
+    list_desktop_project_configs,
+    load_desktop_project_config,
     save_desktop_project_config,
 )
 
@@ -44,6 +47,7 @@ __all__ = [
     "DesktopExecutionStatus",
     "DesktopProjectConfigDraft",
     "DesktopProjectConfigPaths",
+    "DesktopProjectConfigSummary",
     "OpenEvoDesktopBootstrapResponse",
     "OpenEvoDesktopProjectConfigResponse",
     "OpenEvoDesktopRunResponse",
@@ -64,6 +68,8 @@ __all__ = [
     "create_sidecar_app",
     "create_sidecar_app_for_project",
     "default_desktop_shell_status",
+    "list_desktop_project_configs",
+    "load_desktop_project_config",
     "load_remote_profile_config",
     "plan_workspace_preparation",
     "preflight_settings_for_project",

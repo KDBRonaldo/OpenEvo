@@ -22,6 +22,9 @@ from openevo.science import ScienceProjectConfig
 from openevo.sidecar.config import (
     DesktopProjectConfigDraft,
     DesktopProjectConfigPaths,
+    DesktopProjectConfigSummary,
+    list_desktop_project_configs,
+    load_desktop_project_config,
     save_desktop_project_config,
 )
 from openevo.sidecar.models import RemoteProfileConfig
@@ -161,6 +164,17 @@ class OpenEvoDesktopWorkspaceResponse(_StrictFrozenModel):
 class OpenEvoDesktopProjectConfigResponse(_StrictFrozenModel):
     config: DesktopProjectConfigPaths
     status: OpenEvoDesktopShellStatus
+
+
+class OpenEvoDesktopProjectConfigsResponse(_StrictFrozenModel):
+    configs: tuple[DesktopProjectConfigSummary, ...] = Field(default_factory=tuple)
+
+    @field_validator("configs", mode="before")
+    @classmethod
+    def _coerce_configs(cls, value):
+        if isinstance(value, list):
+            return tuple(value)
+        return value
 
 
 class OpenEvoDesktopRunStatus(_StrictFrozenModel):
@@ -415,6 +429,86 @@ def create_sidecar_app(
                 raise HTTPException(
                     status_code=422,
                     detail=_validation_error_detail(exc),
+                ) from exc
+            new_session = OpenEvoSidecarSession(
+                project=project,
+                profile=profile,
+                transport_factory=transport_factory,
+                status=build_desktop_shell_status(project, profile),
+            )
+            session = new_session
+        with new_session.status_lock:
+            response_status = _status_with_mutation_token(
+                new_session.status,
+                sidecar_token,
+            )
+        return OpenEvoDesktopProjectConfigResponse(
+            config=paths,
+            status=response_status,
+        )
+
+    @app.get(
+        "/openevo-api/desktop/project-configs",
+        response_model=OpenEvoDesktopProjectConfigsResponse,
+    )
+    def project_config_catalog() -> OpenEvoDesktopProjectConfigsResponse:
+        if config_root is None:
+            raise HTTPException(
+                status_code=409,
+                detail="Desktop project config catalog requires a writable config root.",
+            )
+        return OpenEvoDesktopProjectConfigsResponse(
+            configs=list_desktop_project_configs(config_root),
+        )
+
+    @app.post(
+        "/openevo-api/desktop/project-configs/{project_slug}/activate",
+        response_model=OpenEvoDesktopProjectConfigResponse,
+    )
+    def activate_project_config(
+        project_slug: str,
+        token: str | None = Header(
+            default=None,
+            alias=SIDECAR_MUTATION_TOKEN_HEADER,
+        ),
+    ) -> OpenEvoDesktopProjectConfigResponse:
+        nonlocal session
+        _validate_mutation_token(token, sidecar_token)
+        if config_root is None or transport_factory is None:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Desktop project config activation requires a writable "
+                    "config root and transport factory."
+                ),
+            )
+        with session_pointer_lock:
+            if session is not None and _session_lifecycle_busy(session):
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Desktop project config cannot activate while another "
+                        "lifecycle action is running."
+                    ),
+                )
+            try:
+                project, profile, paths = load_desktop_project_config(
+                    config_root,
+                    project_slug,
+                )
+            except FileNotFoundError as exc:
+                if str(exc) == "Saved Desktop project config not found.":
+                    raise HTTPException(status_code=404, detail=str(exc)) from exc
+                raise HTTPException(
+                    status_code=422,
+                    detail=_saved_config_error(exc, config_root),
+                ) from exc
+            except ValueError as exc:
+                if str(exc) == "Invalid Desktop project slug.":
+                    raise HTTPException(status_code=400, detail=str(exc)) from exc
+                raise HTTPException(
+                    status_code=422,
+                    detail=_saved_config_error(exc, config_root),
                 ) from exc
             new_session = OpenEvoSidecarSession(
                 project=project,
@@ -875,6 +969,28 @@ def _validate_mutation_token(candidate: str | None, expected: str) -> None:
 
 def _validation_error_detail(exc: ValidationError):
     return jsonable_encoder(exc.errors(include_input=False))
+
+
+def _saved_config_error(exc: Exception, config_root: Path) -> str:
+    if isinstance(exc, ValidationError):
+        return f"Saved Desktop project config is invalid: {_validation_error_summary(exc)}"
+    text = str(exc)
+    root = config_root.expanduser()
+    for prefix in (f"{root.as_posix()}/", str(root) + "/", root.as_posix(), str(root)):
+        text = text.replace(prefix, "")
+    return f"Saved Desktop project config is invalid: {text}"
+
+
+def _validation_error_summary(exc: ValidationError) -> str:
+    messages: list[str] = []
+    for error in exc.errors(include_input=False):
+        loc = ".".join(str(part) for part in error.get("loc", ()))
+        message = str(error.get("msg", "Invalid value"))
+        if loc:
+            messages.append(f"{loc}: {message}")
+        else:
+            messages.append(message)
+    return "; ".join(messages) or "Invalid config"
 
 
 def _session_lifecycle_busy(session: OpenEvoSidecarSession) -> bool:
