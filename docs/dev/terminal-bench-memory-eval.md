@@ -975,6 +975,45 @@ method negatives: the LoRA reliably injects the answer string and timeout
 schema, but path binding remains unstable under this pure SFT task-local memory
 construction.
 
+The collect-result correction follow-up used the failed v2 treatment trajectory
+as the negative prefix source:
+`/tmp/tb21-task-local-parametric-gcode-collect-correction-20260707/collect_correction_pool.jsonl`.
+The dry-run exported 72 records: 24 first-action `live_replay_llm_call:2`
+records, 24 `live_replay_run_tests_correction_llm_call:4` records, and 24
+`live_replay_collect_result_correction_llm_call:5` records. All targets wrote
+the correct flag to `/app/out.txt`, all carried `timeout_seconds=30`, and the
+collect-result prefixes included nested failed verifier output. Training at
+`/tmp/tb21-task-local-parametric-gcode-collect-correction-20260707/train-gcode-qwen35-collect-correction-r8-s140`
+used Qwen3.5-9B, GPU 6, LoRA rank 8, alpha 16, `max_length=4096`, and 140
+steps; diagnostics recorded 72 training records and loss moving from roughly
+`1.27` to `6.9e-6`. The paired eval at
+`/tmp/tb21-task-local-parametric-gcode-collect-correction-20260707/eval-gcode-qwen35-collect-correction-r8-s140`
+again scored baseline pass@1 `0/1`, parametric-memory pass@1 `0/1`, delta `0`.
+The treatment no longer wrote a premature report, but it wrote the correct flag
+to `/app/text.gcode`; the official verifier still failed because `/app/out.txt`
+did not exist. This isolates output-path binding, rather than correction-stage
+timing, as the remaining failure.
+
+A path-bound target variant used a synthetic successful Codex transcript whose
+target command repeated `/app/out.txt` three times and verified the file in
+shell:
+`/tmp/tb21-task-local-parametric-gcode-pathbound-20260707/pathbound_pool.jsonl`.
+The dry-run again exported 72 records across the same three stage types, with
+no target references to `/app/text.gcode`. Training at
+`/tmp/tb21-task-local-parametric-gcode-pathbound-20260707/train-gcode-qwen35-pathbound-r8-s140`
+used the same Qwen3.5-9B LoRA settings for 140 steps and reached final losses
+around `9.6e-6`. The paired eval at
+`/tmp/tb21-task-local-parametric-gcode-pathbound-20260707/eval-gcode-qwen35-pathbound-r8-s140`
+still scored baseline pass@1 `0/1`, parametric-memory pass@1 `0/1`, delta `0`.
+The treatment compressed the path-bound target into a wrong variant,
+`out=/app/out.bin` with content `AVAY`, so the official verifier again failed
+because `/app/out.txt` did not exist. Across these gcode variants, the
+Qwen3.5 LoRA changes action shape but pure task-local SFT is not enough to
+reliably preserve literal output-path and content bindings. The next method
+should either add a constrained decode/validation layer for critical artifact
+paths, or move from single-task memorization to broader path-binding
+supervision before treating `gcode-to-text` as a positive-control task.
+
 For `password-recovery`, a Qwen3.5-9B local LoRA smoke was trained from the
 existing failed/successful tool-policy trajectory at
 `/tmp/tb21-parametric-memory-password-toolpolicy-20260702-110343/local-eval-password-toolpolicy-2048/baseline/harbor_jobs/baseline-password-recovery/password-recovery__AzMbthq`.
