@@ -32,6 +32,7 @@ jobs:
         working-directory: web
         run: |
           npm ci
+          npm test -- --run
           npm run build:openevo
 
       - name: Check packaged Desktop assets are current

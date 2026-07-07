@@ -163,6 +163,7 @@ wheel into a clean environment and runs the installed OpenEvo CLI entrypoints:
 ```bash
 cd web
 npm ci
+npm test -- --run
 npm run build:openevo
 cd ..
 diff -qr web/dist src/openevo/desktop/web

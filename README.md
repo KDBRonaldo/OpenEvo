@@ -291,6 +291,7 @@ Before publishing a wheel, refresh and validate the packaged Desktop assets:
 ```bash
 cd web
 npm ci
+npm test -- --run
 npm run build:openevo
 cd ..
 diff -qr web/dist src/openevo/desktop/web
