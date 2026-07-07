@@ -56,6 +56,9 @@ where = ["src"]
 include = ["polar*", "slime_bridge*", "polar_evolution*", "openevo*"]
 
 [tool.setuptools.package-data]
+openevo = [
+    "desktop/web/**/*",
+]
 polar = [
     "**/README.md",
     "platform/web/dist/**/*",

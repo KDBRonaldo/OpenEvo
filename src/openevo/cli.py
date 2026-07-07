@@ -11,6 +11,7 @@ import httpx
 import yaml
 from pydantic import ValidationError
 
+from openevo.desktop import create_desktop_app
 from openevo.experiment.models import load_experiment_config
 from openevo.experiment.runner import dry_run_experiment, run_experiment
 from openevo.remote import (
@@ -159,30 +160,52 @@ def build_parser() -> argparse.ArgumentParser:
         "serve",
         help="Run the local OpenEvo Desktop sidecar API.",
     )
-    serve_parser.add_argument("--host", default="127.0.0.1", help="Host to bind.")
-    serve_parser.add_argument("--port", type=int, default=3766, help="Port to bind.")
-    serve_parser.add_argument(
+    _add_desktop_serve_arguments(serve_parser)
+
+    desktop_parser = subparsers.add_parser(
+        "desktop",
+        help="Run the packaged OpenEvo Desktop app.",
+    )
+    desktop_subparsers = desktop_parser.add_subparsers(
+        dest="desktop_command",
+        required=True,
+    )
+    desktop_serve_parser = desktop_subparsers.add_parser(
+        "serve",
+        help="Serve the packaged OpenEvo Desktop UI and local sidecar API.",
+    )
+    _add_desktop_serve_arguments(desktop_serve_parser)
+    desktop_serve_parser.add_argument(
+        "--static-root",
+        help="Override the packaged OpenEvo Desktop static asset directory.",
+    )
+    return parser
+
+
+def _add_desktop_serve_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--host", default="127.0.0.1", help="Host to bind.")
+    parser.add_argument("--port", type=int, default=3766, help="Port to bind.")
+    parser.add_argument(
         "--config",
         help="Optional Science Project YAML used to derive Desktop shell status.",
     )
-    serve_parser.add_argument(
+    parser.add_argument(
         "--remote-profile",
         help="Optional remote profile YAML used with --config.",
     )
-    serve_parser.add_argument(
+    parser.add_argument(
         "--transport",
         choices=("dry-run", "ssh"),
         default="dry-run",
         help="Remote executor transport used by sidecar mutating endpoints.",
     )
-    serve_parser.add_argument(
+    parser.add_argument(
         "--desktop-config-root",
         help=(
             "Writable local directory for Desktop-created Science Project and "
             "remote profile configs."
         ),
     )
-    return parser
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -195,6 +218,8 @@ def main(argv: list[str] | None = None) -> int:
             return _handle_science(args)
         if args.command == "sidecar":
             return _handle_sidecar(args)
+        if args.command == "desktop":
+            return _handle_desktop(args)
     except (FileNotFoundError, ValueError, ValidationError, TimeoutError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
@@ -275,6 +300,12 @@ def _handle_sidecar(args: argparse.Namespace) -> int:
     raise ValueError(f"Unknown sidecar command: {args.sidecar_command}")
 
 
+def _handle_desktop(args: argparse.Namespace) -> int:
+    if args.desktop_command == "serve":
+        return _handle_desktop_serve(args)
+    raise ValueError(f"Unknown desktop command: {args.desktop_command}")
+
+
 def _handle_sidecar_plan(args: argparse.Namespace) -> int:
     project = load_science_project_config(Path(args.config))
     profile = load_remote_profile_config(Path(args.remote_profile))
@@ -323,28 +354,42 @@ def _handle_sidecar_bootstrap(args: argparse.Namespace) -> int:
 
 
 def _handle_sidecar_serve(args: argparse.Namespace) -> int:
+    app = _build_sidecar_serve_app(args, command_name="sidecar serve")
+    _run_sidecar_server(app, host=args.host, port=args.port)
+    return 0
+
+
+def _handle_desktop_serve(args: argparse.Namespace) -> int:
+    app = _build_sidecar_serve_app(args, command_name="desktop serve")
+    static_root = Path(args.static_root).expanduser() if args.static_root else None
+    app = create_desktop_app(app, static_root=static_root)
+    print(f"OpenEvo Desktop: http://{args.host}:{args.port}/openevo", file=sys.stderr)
+    _run_sidecar_server(app, host=args.host, port=args.port)
+    return 0
+
+
+def _build_sidecar_serve_app(args: argparse.Namespace, *, command_name: str):
     if bool(args.config) != bool(args.remote_profile):
-        raise ValueError("sidecar serve --config and --remote-profile must be used together")
+        raise ValueError(
+            f"{command_name} --config and --remote-profile must be used together"
+        )
     if args.config and args.remote_profile:
         project = load_science_project_config(Path(args.config))
         profile = load_remote_profile_config(Path(args.remote_profile))
-        app = create_sidecar_app_for_project(
+        return create_sidecar_app_for_project(
             project,
             profile,
             transport_factory=_sidecar_transport_factory(args.transport),
         )
-    else:
-        config_root = (
-            Path(args.desktop_config_root).expanduser()
-            if args.desktop_config_root
-            else _default_desktop_config_root()
-        )
-        app = create_sidecar_app(
-            config_root=config_root,
-            transport_factory=_sidecar_transport_factory(args.transport),
-        )
-    _run_sidecar_server(app, host=args.host, port=args.port)
-    return 0
+    config_root = (
+        Path(args.desktop_config_root).expanduser()
+        if args.desktop_config_root
+        else _default_desktop_config_root()
+    )
+    return create_sidecar_app(
+        config_root=config_root,
+        transport_factory=_sidecar_transport_factory(args.transport),
+    )
 
 
 def _run_sidecar_server(app, *, host: str, port: int) -> None:

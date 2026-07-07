@@ -113,15 +113,39 @@ out of the default flow. It displays the remote profile, proxy settings, Science
 Project summary, bootstrap paths, lifecycle readiness, and evolution timeline
 using the same concepts as the Python contracts.
 
-### Local Sidecar API
+### Local Desktop Serve
 
-OpenEvo Desktop starts a local sidecar API with
-`openevo sidecar serve --host 127.0.0.1 --port 3766`.
+The release-shaped local entrypoint is:
+
+```bash
+openevo desktop serve --host 127.0.0.1 --port 3766
+```
+
+This starts one local FastAPI/uvicorn process. The same process serves the
+packaged Desktop SPA at `/openevo` and the sidecar API at `/openevo-api/*`.
+The root path `/` redirects to `/openevo`. Because the current packaged bundle
+still uses the shared dashboard shell, the local server also returns the SPA for
+the visible client routes `/tasks`, `/tasks/*`, `/sessions`, `/sessions/*`, and
+`/compare`; unknown `/openevo-api/*` paths remain API 404s.
+
+For development or custom packages, `--static-root` can point at a Vite build
+output directory:
+
+```bash
+openevo desktop serve --static-root web/dist
+```
+
+If static assets are missing, incomplete, or referenced by `index.html` but not
+present on disk, the command fails before starting the API server and tells the
+caller to build and package Desktop assets or pass `--static-root`.
+
+`openevo sidecar serve --host 127.0.0.1 --port 3766` remains available as an
+API-only entrypoint for integration tests and power users.
 
 For a user project, Desktop can start the same server with local config paths:
 
 ```bash
-openevo sidecar serve \
+openevo desktop serve \
   --config science.yaml \
   --remote-profile remote.yaml \
   --host 127.0.0.1 \

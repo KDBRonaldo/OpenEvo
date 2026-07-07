@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import tomllib
 from pathlib import Path
 
 import yaml
@@ -709,3 +710,197 @@ def test_cli_sidecar_serve_requires_profile_and_config_together(
     assert exit_code == 1
     assert "--config and --remote-profile must be used together" in capsys.readouterr().err
     assert runner_calls == []
+
+
+def _desktop_static_root(tmp_path: Path) -> Path:
+    root = tmp_path / "desktop-web"
+    assets = root / "assets"
+    assets.mkdir(parents=True)
+    (root / "index.html").write_text(
+        "<!doctype html><title>OpenEvo CLI Desktop</title><div id='root'></div>",
+        encoding="utf-8",
+    )
+    (assets / "app.js").write_text("window.__openevoCliTest = true;", encoding="utf-8")
+    return root
+
+
+def test_cli_desktop_serve_invokes_runner_with_wrapped_app(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    calls = []
+
+    def fake_runner(app, *, host: str, port: int) -> None:
+        calls.append((app, host, port))
+
+    monkeypatch.setattr("openevo.cli._run_sidecar_server", fake_runner)
+
+    exit_code = main(
+        [
+            "desktop",
+            "serve",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "3766",
+            "--static-root",
+            str(_desktop_static_root(tmp_path)),
+        ]
+    )
+
+    assert exit_code == 0
+    assert calls[0][1:] == ("127.0.0.1", 3766)
+    assert calls[0][0].title == "OpenEvo Desktop Sidecar"
+    assert "http://127.0.0.1:3766/openevo" in capsys.readouterr().err
+
+
+def test_cli_desktop_serve_passes_desktop_config_root_and_static_root(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    app_calls = []
+    desktop_calls = []
+
+    class FakeApp:
+        title = "OpenEvo Desktop Sidecar"
+
+    def fake_create_sidecar_app(**kwargs):
+        app_calls.append(kwargs)
+        return FakeApp()
+
+    def fake_create_desktop_app(app, *, static_root=None):
+        desktop_calls.append((app, static_root))
+        return app
+
+    monkeypatch.setattr("openevo.cli.create_sidecar_app", fake_create_sidecar_app)
+    monkeypatch.setattr(
+        "openevo.cli.create_desktop_app",
+        fake_create_desktop_app,
+        raising=False,
+    )
+    monkeypatch.setattr("openevo.cli._run_sidecar_server", lambda app, *, host, port: None)
+
+    exit_code = main(
+        [
+            "desktop",
+            "serve",
+            "--desktop-config-root",
+            str(tmp_path / "configs"),
+            "--static-root",
+            str(tmp_path / "web"),
+        ]
+    )
+
+    assert exit_code == 0
+    assert app_calls[0]["config_root"] == tmp_path / "configs"
+    assert app_calls[0]["transport_factory"] is not None
+    assert len(desktop_calls) == 1
+    assert desktop_calls[0][1] == tmp_path / "web"
+
+
+def test_cli_desktop_serve_loads_config_status(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    app_calls = []
+    desktop_calls = []
+
+    class FakeApp:
+        title = "OpenEvo Desktop Sidecar"
+
+    def fake_create_project_app(project, profile, *, transport_factory):
+        app_calls.append((project, profile, transport_factory))
+        return FakeApp()
+
+    def fake_create_desktop_app(app, *, static_root=None):
+        desktop_calls.append((app, static_root))
+        return app
+
+    monkeypatch.setattr("openevo.cli.create_sidecar_app_for_project", fake_create_project_app)
+    monkeypatch.setattr(
+        "openevo.cli.create_desktop_app",
+        fake_create_desktop_app,
+        raising=False,
+    )
+    monkeypatch.setattr("openevo.cli._run_sidecar_server", lambda app, *, host, port: None)
+    science_path = _write_config(tmp_path / "science.yaml", _minimal_science_payload())
+    profile_path = _write_config(
+        tmp_path / "remote.yaml",
+        {
+            "version": 1,
+            "id": "science-team",
+            "host": "gpu.example.edu",
+            "user": "alice",
+        },
+    )
+
+    exit_code = main(
+        [
+            "desktop",
+            "serve",
+            "--config",
+            str(science_path),
+            "--remote-profile",
+            str(profile_path),
+            "--static-root",
+            str(tmp_path / "web"),
+        ]
+    )
+
+    assert exit_code == 0
+    project, profile, transport_factory = app_calls[0]
+    assert project.task.id == "folding-baseline"
+    assert profile.id == "science-team"
+    assert transport_factory(profile).__class__.__name__ == "_CliDryRunTransport"
+    assert desktop_calls[0][1] == tmp_path / "web"
+
+
+def test_cli_desktop_serve_requires_config_and_profile_together(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr("openevo.cli._run_sidecar_server", lambda app, *, host, port: None)
+    science_path = _write_config(tmp_path / "science.yaml", _minimal_science_payload())
+
+    exit_code = main(["desktop", "serve", "--config", str(science_path)])
+
+    assert exit_code == 1
+    assert "desktop serve --config and --remote-profile must be used together" in (
+        capsys.readouterr().err
+    )
+
+
+def test_cli_desktop_serve_rejects_incomplete_static_root(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+) -> None:
+    runner_calls = []
+    static_root = tmp_path / "desktop-web"
+    static_root.mkdir()
+    (static_root / "index.html").write_text(
+        "<!doctype html><title>OpenEvo CLI Desktop</title><div id='root'></div>",
+        encoding="utf-8",
+    )
+
+    def fake_runner(app, *, host: str, port: int) -> None:
+        runner_calls.append((app, host, port))
+
+    monkeypatch.setattr("openevo.cli._run_sidecar_server", fake_runner)
+
+    exit_code = main(["desktop", "serve", "--static-root", str(static_root)])
+
+    assert exit_code == 1
+    assert runner_calls == []
+    assert "assets" in capsys.readouterr().err
+
+
+def test_pyproject_packages_openevo_desktop_web_assets() -> None:
+    payload = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
+
+    package_data = payload["tool"]["setuptools"]["package-data"]
+
+    assert "openevo" in package_data
+    assert "desktop/web/**/*" in package_data["openevo"]
