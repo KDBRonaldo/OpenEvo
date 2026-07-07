@@ -1,0 +1,40 @@
+name: OpenEvo Python checks
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened, ready_for_review]
+    paths:
+      - ".github/workflows/openevo-python.yml"
+      - "pyproject.toml"
+      - "uv.lock"
+      - "src/openevo/**"
+      - "src/polar/**"
+      - "src/polar_evolution/**"
+      - "src/slime_bridge/**"
+      - "tests/openevo/**"
+      - "tests/ci/test_openevo_python_workflow.py"
+
+jobs:
+  python-tests:
+    name: ruff and tests/openevo
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .
+          python -m pip install pytest ruff build twine
+
+      - name: Lint OpenEvo package
+        run: |
+          ruff check src/openevo tests/openevo
+
+      - name: Run OpenEvo regression tests
+        run: |
+          python -m pytest tests/ci/test_openevo_python_workflow.py tests/openevo -q

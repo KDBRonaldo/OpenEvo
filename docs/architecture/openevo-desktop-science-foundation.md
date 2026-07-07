@@ -169,6 +169,13 @@ python -m build --wheel
 python scripts/ci/check_openevo_release.py --wheel dist/*.whl
 ```
 
+OpenEvo package and Desktop-sidecar Python regressions are checked with:
+
+```bash
+ruff check src/openevo tests/openevo
+PYTHONPATH=src:. python -m pytest tests/ci/test_openevo_python_workflow.py tests/openevo -q
+```
+
 For development or custom packages, `--static-root` can point at a Vite build
 output directory:
 

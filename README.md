@@ -298,6 +298,13 @@ python -m build --wheel
 python scripts/ci/check_openevo_release.py --wheel dist/*.whl
 ```
 
+For the focused OpenEvo Python regression check used by CI:
+
+```bash
+ruff check src/openevo tests/openevo
+PYTHONPATH=src:. python -m pytest tests/ci/test_openevo_python_workflow.py tests/openevo -q
+```
+
 Shared infrastructure that is already implemented:
 
 - Golden-standard evaluator for sequence/component extraction: article-scoped
