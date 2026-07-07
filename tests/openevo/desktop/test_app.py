@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from html.parser import HTMLParser
 from pathlib import Path
 
 import pytest
@@ -12,6 +13,25 @@ from openevo.desktop import (
     resolve_desktop_static_root,
 )
 from openevo.sidecar import create_sidecar_app
+
+
+class _PackagedAssetParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.assets: list[Path] = []
+
+    def handle_starttag(
+        self,
+        _tag: str,
+        attrs: list[tuple[str, str | None]],
+    ) -> None:
+        for name, value in attrs:
+            if name not in {"href", "src"} or value is None:
+                continue
+            if value.startswith("/assets/"):
+                self.assets.append(Path(value[1:]))
+            elif value.startswith("assets/"):
+                self.assets.append(Path(value))
 
 
 def _static_root(tmp_path: Path) -> Path:
@@ -85,6 +105,23 @@ def test_packaged_desktop_static_root_points_at_bundled_assets() -> None:
 
     assert root.name == "web"
     assert (root / "index.html").is_file()
+
+
+def test_packaged_desktop_assets_are_openevo_only() -> None:
+    root = packaged_desktop_static_root()
+    index_text = (root / "index.html").read_text(encoding="utf-8")
+    parser = _PackagedAssetParser()
+    parser.feed(index_text)
+
+    packaged_text = index_text + "\n" + "\n".join(
+        (root / asset).read_text(encoding="utf-8") for asset in parser.assets
+    )
+
+    assert "OpenEvo Desktop" in packaged_text
+    assert "Polar Dashboard" not in packaged_text
+    assert 'href="/tasks"' not in packaged_text
+    assert ">Dashboard<" not in packaged_text
+    assert "/api/events" not in packaged_text
 
 
 def test_create_desktop_app_serves_spa_and_sidecar_api(tmp_path: Path) -> None:

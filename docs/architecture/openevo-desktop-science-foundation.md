@@ -123,10 +123,18 @@ openevo desktop serve --host 127.0.0.1 --port 3766
 
 This starts one local FastAPI/uvicorn process. The same process serves the
 packaged Desktop SPA at `/openevo` and the sidecar API at `/openevo-api/*`.
-The root path `/` redirects to `/openevo`. Because the current packaged bundle
-still uses the shared dashboard shell, the local server also returns the SPA for
-the visible client routes `/tasks`, `/tasks/*`, `/sessions`, `/sessions/*`, and
-`/compare`; unknown `/openevo-api/*` paths remain API 404s.
+The root path `/` redirects to `/openevo`. The packaged asset set is built in
+OpenEvo-only mode, so users do not see the shared Polar dashboard navigation.
+The local server still returns the SPA for compatibility routes `/tasks`,
+`/tasks/*`, `/sessions`, `/sessions/*`, and `/compare`; unknown
+`/openevo-api/*` paths remain API 404s.
+
+Packaged Desktop assets are refreshed with:
+
+```bash
+cd web && npm run build:openevo
+rsync -a --delete web/dist/ src/openevo/desktop/web/
+```
 
 For development or custom packages, `--static-root` can point at a Vite build
 output directory:

@@ -904,3 +904,13 @@ def test_pyproject_packages_openevo_desktop_web_assets() -> None:
 
     assert "openevo" in package_data
     assert "desktop/web/**/*" in package_data["openevo"]
+
+
+def test_web_package_defines_openevo_desktop_build_mode() -> None:
+    package = json.loads(Path("web/package.json").read_text(encoding="utf-8"))
+    env_file = Path("web/.env.openevo-desktop")
+
+    assert package["scripts"]["build:openevo"] == "vite build --mode openevo-desktop"
+    assert env_file.read_text(encoding="utf-8").strip() == (
+        "VITE_OPENEVO_DESKTOP_ONLY=true"
+    )
