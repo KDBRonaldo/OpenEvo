@@ -558,7 +558,9 @@ The command selects tasks that have at least one failed and one successful pool
 row, reads successful Codex command events from `agent/codex.txt`, writes a
 standalone dataset artifact manifest plus `records.jsonl`, and emits a
 `parametric_memory_lora_sft` `WorkerClaimedJob` payload. It only invokes the
-trainer when `--run-worker` is set.
+trainer when `--run-worker` is set. If multiple successful commands match the
+filters, the builder prefers write-like commands over later validation commands,
+so post-hoc existence checks do not become the supervised target.
 
 Serving contract:
 

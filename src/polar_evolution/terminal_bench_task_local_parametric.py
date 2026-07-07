@@ -68,6 +68,31 @@ _TASK_LOCAL_SYSTEM = (
     "Use Terminal-Bench tools to solve the task. Emit one useful next tool call."
 )
 
+_TARGET_WRITE_COMMAND_NEEDLES = (
+    "save_model(",
+    "torch.save(",
+    "pickle.dump(",
+    "json.dump(",
+    "write_text(",
+    "shutil.copy",
+    " cp ",
+    "\ncp ",
+    " mv ",
+    "\nmv ",
+    "> /app/",
+    "cat >",
+)
+
+_TARGET_VALIDATION_COMMAND_NEEDLES = (
+    "path.exists()",
+    ".exists()",
+    ".stat()",
+    "load_model(",
+    "ls -",
+    "du -",
+    "test -f",
+)
+
 
 def load_trajectory_pool(path: Path) -> list[TrajectoryPoolRow]:
     rows: list[TrajectoryPoolRow] = []
@@ -214,7 +239,7 @@ def build_task_local_sft_records(
             if not commands:
                 continue
 
-            command = commands[-1]
+            command = _select_task_local_target_command(commands)
             records.append(
                 _task_local_sft_record(
                     selection=selection,
@@ -225,6 +250,28 @@ def build_task_local_sft_records(
             )
             break
     return records
+
+
+def _select_task_local_target_command(
+    commands: list[CodexCommandEvent],
+) -> CodexCommandEvent:
+    return max(
+        commands,
+        key=lambda command: (
+            _task_local_target_command_score(command.command),
+            command.event_index,
+        ),
+    )
+
+
+def _task_local_target_command_score(command: str) -> int:
+    lowered = command.lower()
+    score = 0
+    if any(needle in lowered for needle in _TARGET_WRITE_COMMAND_NEEDLES):
+        score += 2
+    if any(needle in lowered for needle in _TARGET_VALIDATION_COMMAND_NEEDLES):
+        score -= 1
+    return score
 
 
 def build_task_local_parametric_job_payload(

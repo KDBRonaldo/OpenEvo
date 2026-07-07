@@ -219,6 +219,95 @@ def test_build_task_local_sft_records_uses_successful_command_as_tb_exec_target(
     assert record["metadata"]["prefix_source"] == "task_summary_fallback"
 
 
+def test_build_task_local_sft_records_prefers_write_command_over_later_validation(
+    tmp_path: Path,
+) -> None:
+    failed_trial = tmp_path / "failed-trial"
+    successful_trial = tmp_path / "successful-trial"
+    (failed_trial / "agent").mkdir(parents=True)
+    (successful_trial / "agent").mkdir(parents=True)
+    (successful_trial / "agent" / "codex.txt").write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "item.completed",
+                        "item": {
+                            "type": "command_execution",
+                            "command": (
+                                "/bin/bash -lc \"python - <<'PY'\n"
+                                "import fasttext\n"
+                                "model = fasttext.train_supervised(input='train.txt')\n"
+                                "model.save_model('/app/model.bin')\n"
+                                "PY\""
+                            ),
+                            "aggregated_output": "trained",
+                            "exit_code": 0,
+                            "status": "completed",
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "item.completed",
+                        "item": {
+                            "type": "command_execution",
+                            "command": (
+                                "/bin/bash -lc \"python - <<'PY'\n"
+                                "from pathlib import Path\n"
+                                "path = Path('/app/model.bin')\n"
+                                "print(path.exists())\n"
+                                "print(path.stat().st_size)\n"
+                                "PY\""
+                            ),
+                            "aggregated_output": "True\n143211714",
+                            "exit_code": 0,
+                            "status": "completed",
+                        },
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    selection = TaskLocalSelection(
+        task_id="train-fasttext",
+        failed=[
+            TrajectoryPoolRow(
+                trajectory_id="failed-1",
+                task_id="train-fasttext",
+                reward=0.0,
+                trial_dir=failed_trial,
+                raw={},
+            )
+        ],
+        successful=[
+            TrajectoryPoolRow(
+                trajectory_id="success-1",
+                task_id="train-fasttext",
+                reward=1.0,
+                trial_dir=successful_trial,
+                raw={},
+            )
+        ],
+        null_reward=[],
+    )
+
+    [record] = build_task_local_sft_records(
+        selection,
+        command_contains=["/app/model.bin"],
+        max_records=1,
+    )
+
+    target = record["traces"][0]["response_messages"][0]["tool_calls"][0]["function"][
+        "arguments"
+    ]["command"]
+    assert "save_model('/app/model.bin')" in target
+    assert "path.exists()" not in target
+
+
 def test_build_task_local_parametric_job_payload_writes_dataset_and_lora_job(
     tmp_path: Path,
 ) -> None:

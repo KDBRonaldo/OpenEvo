@@ -356,7 +356,9 @@ arguments. The generated job still uses `parametric_memory_lora_sft`, so the
 trainer must render each JSONL row with the row-level `tools` value when tool
 schemas are present. `full_trace` now preserves assistant messages that contain
 `tool_calls` even when `content` is empty, and carries trace-level `tools` into
-`training.jsonl`.
+`training.jsonl`. When several successful commands match `--command-contains`,
+the builder prefers write-like commands such as `save_model`, `cp`, `mv`, or
+file writes over later verification commands such as `Path.exists()` checks.
 
 Create a parametric-memory job from successful Terminal Bench trajectories and
 run the local worker once:

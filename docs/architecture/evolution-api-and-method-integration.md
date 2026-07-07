@@ -560,8 +560,9 @@ from a trajectory pool with
 trajectory 和一个成功 trajectory，读取成功 trial 的 `agent/codex.txt` command event，生成
 standalone dataset manifest、`records.jsonl` 和 `parametric_memory_lora_sft`
 `WorkerClaimedJob` JSON。它不写 EvolutionStore；只有显式 `--run-worker` 时才调用本地
-reference method。该路径用于本地/proxy inference 的 parametric-memory ablation，不适用于
-Codex subscription serving。
+reference method。若多个成功命令匹配过滤条件，builder 会优先选择写入型命令，而不是后续
+存在性检查或 size check。该路径用于本地/proxy inference 的 parametric-memory ablation，
+不适用于 Codex subscription serving。
 
 本地 vLLM eval 提供 serving-time adapter 兼容层：对 Qwen3.5/Qwen3.6 MoE PEFT LoRA，可在
 `terminal-bench-local-parametric-memory-eval` 中使用
