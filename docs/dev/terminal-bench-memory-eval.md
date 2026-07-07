@@ -341,7 +341,7 @@ uv run polar-evolution terminal-bench-task-local-parametric-memory-job \
   --base-model Qwen/Qwen3.6-35B-A3B \
   --adapter-id tb-parametric-memory-train-fasttext \
   --trainer-command /root/evolab-vllm/bin/python \
-  --trainer-arg /path/to/train_lora.py \
+  --trainer-arg scripts/qwen_lora_sft.py \
   --trainer-arg --train-file \
   --trainer-arg '{training_dataset}' \
   --trainer-arg --output-dir \
@@ -359,6 +359,9 @@ schemas are present. `full_trace` now preserves assistant messages that contain
 `training.jsonl`. When several successful commands match `--command-contains`,
 the builder prefers write-like commands such as `save_model`, `cp`, `mv`, or
 file writes over later verification commands such as `Path.exists()` checks.
+The repo helper `scripts/qwen_lora_sft.py` is an experiment script, not a main
+package dependency; run it with a trainer Python environment that already has
+`torch`, `transformers`, and `peft`.
 
 Smoke evidence on 2026-07-07:
 
@@ -396,7 +399,7 @@ uv run polar-evolution terminal-bench-parametric-memory-job \
   --base-model Qwen/Qwen3.6-35B-A3B \
   --adapter-id tb-parametric-memory \
   --trainer-command python \
-  --trainer-arg /path/to/train_lora.py \
+  --trainer-arg scripts/qwen_lora_sft.py \
   --trainer-arg --train-file \
   --trainer-arg '{training_dataset}' \
   --trainer-arg --output-dir \
@@ -425,7 +428,7 @@ uv run polar-evolution terminal-bench-parametric-memory-job \
   --base-model Qwen/Qwen3.6-35B-A3B \
   --adapter-id tb-parametric-memory-password-corrective \
   --trainer-command /root/evolab-vllm/bin/python \
-  --trainer-arg /tmp/qwen36_lora_sft.py \
+  --trainer-arg scripts/qwen_lora_sft.py \
   --trainer-arg --train-file \
   --trainer-arg '{training_dataset}' \
   --trainer-arg --output-dir \
@@ -451,7 +454,7 @@ uv run polar-evolution terminal-bench-parametric-memory-job \
   --base-model Qwen/Qwen3.6-35B-A3B \
   --adapter-id tb-parametric-memory-password-recipe \
   --trainer-command /root/evolab-vllm/bin/python \
-  --trainer-arg /tmp/qwen36_lora_sft.py \
+  --trainer-arg scripts/qwen_lora_sft.py \
   --trainer-arg --train-file \
   --trainer-arg '{training_dataset}' \
   --trainer-arg --output-dir \

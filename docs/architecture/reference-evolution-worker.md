@@ -545,7 +545,7 @@ uv run polar-evolution terminal-bench-task-local-parametric-memory-job \
   --base-model Qwen/Qwen3.6-35B-A3B \
   --adapter-id tb-parametric-memory-train-fasttext \
   --trainer-command /root/evolab-vllm/bin/python \
-  --trainer-arg /path/to/train_lora.py \
+  --trainer-arg scripts/qwen_lora_sft.py \
   --trainer-arg --train-file \
   --trainer-arg '{training_dataset}' \
   --trainer-arg --output-dir \
@@ -561,6 +561,9 @@ standalone dataset artifact manifest plus `records.jsonl`, and emits a
 trainer when `--run-worker` is set. If multiple successful commands match the
 filters, the builder prefers write-like commands over later validation commands,
 so post-hoc existence checks do not become the supervised target.
+`scripts/qwen_lora_sft.py` is a repository-provided experiment helper; it should
+be run with a trainer environment that provides `torch`, `transformers`, and
+`peft`, rather than making those libraries mandatory package dependencies.
 
 Serving contract:
 
