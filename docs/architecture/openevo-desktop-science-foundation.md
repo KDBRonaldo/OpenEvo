@@ -20,7 +20,7 @@ The science layer is a config and compilation layer. It does not:
 - start Docker;
 - open SSH connections;
 - call model APIs;
-- manage gateway, vLLM, or Docker Compose lifecycles.
+- manage Docker Compose lifecycles.
 
 It validates Science Project input and compiles it to the existing OpenEvo/Polar
 experiment contract. OpenEvo still wraps the Codex harness; this layer only makes
@@ -67,8 +67,8 @@ data for text evolution and explicitly has no token-level metrics.
 `codex_managed_local_inference` uses proxy authentication and requires
 `execution.hf_model`. The compiler sets the agent model to that Hugging Face
 model and injects `OPENEVO_MANAGED_HF_MODEL` into the runtime environment. The
-remote backend is responsible for starting and wiring vLLM, the gateway, and the
-proxy path.
+remote Desktop service lifecycle starts vLLM, the gateway, and the proxy path
+before a run can launch.
 
 Science Projects do not support `evolution.parametric_memory` in this foundation
 slice, including managed local inference projects. Parametric memory requires a
@@ -339,16 +339,54 @@ the failure.
 For managed local inference configs, the compiled experiment contains
 `OPENEVO_MANAGED_HF_MODEL`, so the remote bootstrap plan also attempts a
 Hugging Face snapshot download using the configured `HF_ENDPOINT`, `HF_HOME`,
-and proxy/PIP environment. vLLM startup and health supervision remain separate
-from this setup form and bootstrap slice.
+and proxy/PIP environment. vLLM startup and health supervision are handled by
+the separate service lifecycle.
+
+`POST /openevo-api/desktop/services` starts the remote runtime services after
+workspace and bootstrap readiness. It is available only for config-backed
+sidecar sessions and requires the same mutation token. The sidecar rebuilds the
+deterministic bootstrap plan, writes a remote service topology under
+`<state_root>/services/topology.yaml`, then starts and checks the OpenEvo
+service daemons needed by Desktop Science runs:
+
+- evolution backend on `127.0.0.1:8200`;
+- rollout on `127.0.0.1:8080`;
+- gateway on `127.0.0.1:8100`;
+- evolution worker bound to the same topology file;
+- vLLM on `127.0.0.1:8000` for `codex_managed_local_inference`.
+
+The service commands use the remote user PATH plus `~/.local/bin` and export the
+same proxy/PIP/Hugging Face environment rendered from the remote profile for the
+whole remote command script. The managed local inference path installs `vllm`
+with `python3 -m pip install --user vllm` if the import check fails, then
+launches the OpenAI-compatible vLLM server for the configured Hugging Face
+model. Subscription mode still starts the OpenEvo runtime services for rollout,
+gateway, transcript capture, and evolution coordination, but it does not start a
+local model server.
+
+Each service start is followed by a bounded readiness poll. The standard
+OpenEvo services poll their local health endpoints for 30 seconds. Managed vLLM
+polls `/v1/models` for up to 900 seconds and verifies that the configured
+Hugging Face model id is actually served before Desktop marks services ready.
+
+The services endpoint returns a top-level readiness summary plus the full
+service report. Desktop keeps the latest report in the Bootstrap Readiness area
+and renders failed or warning start/health-check steps with their command,
+message, and stderr when present. Remote stdout, stderr, and exception text are
+redacted before they are returned so proxy URLs, pip index URLs, and URL
+userinfo credentials are not displayed in Desktop. Re-running workspace
+preparation or bootstrap invalidates the prior service readiness and clears
+stale latest-run state, because the prepared workspace or state root may have
+changed.
 
 `POST /openevo-api/desktop/run` launches the configured Science task after
-workspace and bootstrap readiness. It is available only for config-backed
-sidecar sessions, requires the same mutation token, and rejects requests unless
-the Workspace service is `ready`, `status.bootstrap.ready` is true, and the
-latest bootstrap report contains both `prepared_paths.experiment_snapshot` and
-`prepared_paths.state_root`. The command is derived only from those bootstrap
-paths:
+workspace, bootstrap, and service readiness. It is available only for
+config-backed sidecar sessions, requires the same mutation token, and rejects
+requests unless the Workspace service is `ready`, `status.bootstrap.ready` is
+true, the latest bootstrap report contains both
+`prepared_paths.experiment_snapshot` and `prepared_paths.state_root`, and the
+latest services report is ready. The command is derived only from those
+bootstrap paths:
 
 ```bash
 PATH="$HOME/.local/bin:$PATH" openevo run <experiment_snapshot> --output-dir <state_root>/runs/<run-id> --json
@@ -380,11 +418,14 @@ requests must send that token in the non-simple
 any workspace, bootstrap, or run work starts. This is a local CSRF guard for the
 Desktop sidecar: cross-site pages can submit simple localhost requests, but
 cannot read the same-origin shell response or set the required custom header.
-The sidecar serializes workspace syncs, bootstrap runs, and run launches
-independently per config-backed session; a second request for the same lifecycle
-action returns 409 while one is already running. Status updates from lifecycle
-actions are written under a shared status lock so concurrent workspace and
-bootstrap runs do not clobber each other's service rows.
+The sidecar allows only one mutating lifecycle action per config-backed session
+at a time. A second request for the same lifecycle action returns a specific
+409, such as `Desktop services are already running.` A different lifecycle
+action started while workspace, bootstrap, services, or run is active also
+returns 409. This prevents older workspace/bootstrap/service reports from
+overwriting newer invalidation and prevents run launch from using stale service
+readiness. Status updates from lifecycle actions are written under a shared
+status lock.
 
 Dry-run serve mode is intended for local UI development and smoke tests. It
 exercises the same planning, status, and polling path, but it does not mutate
@@ -393,13 +434,13 @@ without proving that task workspaces, Docker images, or Hugging Face models were
 actually prepared. Real remote preparation and run execution require
 `--transport ssh`.
 
-This slice adds only a local sidecar run supervisor with one latest run per
-config-backed session. It does not survive sidecar process restarts, stream
-incremental remote log files, cancel remote process groups, expose resume,
-restart the sidecar process, start vLLM, start Polar gateway, run Docker
-Compose, manage dynamic adapters, or supervise rollout/evolution worker
-services independently. Those operations remain behind the remote lifecycle
-contracts until dedicated service supervisors are added.
+This slice adds a command-and-health-check service supervisor plus a local
+sidecar run supervisor with one latest run per config-backed session. It does
+not survive sidecar process restarts, stream incremental remote log files,
+cancel remote process groups, expose resume, restart the sidecar process, run
+Docker Compose, restart crashed remote daemons, tune GPU placement or
+quantization for vLLM, or manage dynamic adapters. Those operations remain
+behind future remote lifecycle contracts.
 
 ## CLI
 
@@ -420,7 +461,7 @@ This foundation slice does not include:
 - a remote backend implementation;
 - Electron packaging or sidecar process supervision;
 - Docker Compose lifecycle management;
-- vLLM lifecycle management;
+- production vLLM lifecycle tuning, restart policy, or adapter loading;
 - parametric memory or adapter training for Science Projects.
 
 Those capabilities remain separate layers above or below the Science Project

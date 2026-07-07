@@ -139,10 +139,32 @@ def test_run_quotes_remote_env_values_and_cwd() -> None:
     remote_command = runner.calls[0][0][-1]
     assert remote_command == (
         "cd /home/alice/project-dir && "
-        "env HTTPS_PROXY=http://127.0.0.1:7890 "
+        "export HTTPS_PROXY=http://127.0.0.1:7890 "
         "PIP_INDEX_URL='https://mirror.example/simple path' "
-        "python script.py"
+        "&& python script.py"
     )
+
+
+def test_run_exports_env_before_multiline_remote_script() -> None:
+    runner = RecordingRunner()
+    transport = SshRemoteExecutorTransport(_profile(), runner=runner)
+
+    transport.run(
+        "python3 - <<'PY'\n"
+        "import os\n"
+        "print(os.environ['HTTPS_PROXY'])\n"
+        "PY\n"
+        "nohup env PATH=\"$HOME/.local/bin:$PATH\" python3 server.py &",
+        env={"HTTPS_PROXY": "http://proxy-user:proxy-secret@127.0.0.1:7890"},
+    )
+
+    remote_command = runner.calls[0][0][-1]
+    assert remote_command.startswith(
+        "export HTTPS_PROXY="
+        "http://proxy-user:proxy-secret@127.0.0.1:7890 && python3 - <<'PY'"
+    )
+    assert "\nnohup env PATH=" in remote_command
+    assert "env HTTPS_PROXY=" not in remote_command
 
 
 def test_run_rejects_invalid_env_key() -> None:

@@ -83,6 +83,12 @@ export interface OpenEvoWorkspaceResponsePayload {
   status: OpenEvoDesktopShellStatusPayload;
 }
 
+export interface OpenEvoServicesResponsePayload {
+  services: Record<string, any>;
+  report: Record<string, any>;
+  status: OpenEvoDesktopShellStatusPayload;
+}
+
 export interface OpenEvoProjectConfigDraft {
   project_name: string;
   task_id: string;
@@ -154,6 +160,12 @@ export interface OpenEvoBootstrapResponse {
 
 export interface OpenEvoWorkspaceResponse {
   workspace: Record<string, any>;
+  report: Record<string, any>;
+  status: OpenEvoDesktopShellModel;
+}
+
+export interface OpenEvoServicesResponse {
+  services: Record<string, any>;
   report: Record<string, any>;
   status: OpenEvoDesktopShellModel;
 }
@@ -253,6 +265,23 @@ export async function runOpenEvoWorkspaceSync(): Promise<OpenEvoWorkspaceRespons
   rememberOpenEvoSidecarMutationToken(payload.status);
   return {
     workspace: payload.workspace,
+    report: payload.report,
+    status: toOpenEvoDesktopShellModel(payload.status),
+  };
+}
+
+export async function runOpenEvoServices(): Promise<OpenEvoServicesResponse> {
+  const headers = sidecarMutationToken
+    ? { [sidecarMutationTokenHeader]: sidecarMutationToken }
+    : undefined;
+  const payload = await api.post<OpenEvoServicesResponsePayload>(
+    "/openevo-api/desktop/services",
+    {},
+    headers,
+  );
+  rememberOpenEvoSidecarMutationToken(payload.status);
+  return {
+    services: payload.services,
     report: payload.report,
     status: toOpenEvoDesktopShellModel(payload.status),
   };

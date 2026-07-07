@@ -34,6 +34,15 @@ from openevo.remote.preflight import (
     RemoteProbe,
     run_preflight,
 )
+from openevo.remote.services import (
+    RemoteServiceStep,
+    RemoteServiceStepExecution,
+    RemoteServiceStepStatus,
+    RemoteServicesPlan,
+    RemoteServicesReport,
+    build_remote_services_plan,
+    execute_remote_services_plan,
+)
 from openevo.remote.ssh import SshRemoteExecutorTransport
 
 __all__ = [
@@ -56,12 +65,19 @@ __all__ = [
     "RemoteCommandResult",
     "RemotePreflightSettings",
     "RemoteProbe",
+    "RemoteServiceStep",
+    "RemoteServiceStepExecution",
+    "RemoteServiceStepStatus",
+    "RemoteServicesPlan",
+    "RemoteServicesReport",
     "SidecarExecutionReport",
     "SshRemoteExecutorTransport",
     "WorkspaceActionExecution",
     "WorkspaceActionStatus",
     "WorkspaceExecutionReport",
+    "build_remote_services_plan",
     "execute_sidecar_plan",
+    "execute_remote_services_plan",
     "execute_workspace_plan",
     "run_preflight",
 ]

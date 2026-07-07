@@ -337,6 +337,244 @@ def test_bootstrap_endpoint_keeps_unprepared_workspace_planned(
     }
 
 
+def test_services_endpoint_requires_config_backed_session() -> None:
+    client = TestClient(create_sidecar_app())
+    token = _sidecar_token(client)
+
+    response = client.post(
+        "/openevo-api/desktop/services",
+        headers={"X-OpenEvo-Sidecar-Token": token},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == (
+        "Desktop services require a config-backed sidecar session."
+    )
+
+
+def test_services_endpoint_rejects_until_bootstrap_ready() -> None:
+    project = ScienceProjectConfig.model_validate(_science_project_payload())
+    profile = _remote_profile()
+    client = TestClient(
+        create_sidecar_app_for_project(
+            project,
+            profile,
+            transport_factory=lambda _profile: _ApiDryRunTransport(),
+        )
+    )
+    token = _sidecar_token(client)
+
+    response = client.post(
+        "/openevo-api/desktop/services",
+        headers={"X-OpenEvo-Sidecar-Token": token},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == (
+        "Desktop services require ready workspace and bootstrap."
+    )
+
+
+def test_services_endpoint_starts_after_bootstrap_and_refreshes_status() -> None:
+    project = ScienceProjectConfig.model_validate(_science_project_payload())
+    profile = _remote_profile()
+    transport = _ApiDryRunTransport()
+    client = TestClient(
+        create_sidecar_app_for_project(
+            project,
+            profile,
+            transport_factory=lambda _profile: transport,
+        )
+    )
+    token = _sidecar_token(client)
+    headers = {"X-OpenEvo-Sidecar-Token": token}
+    _prepare_workspace_and_bootstrap(client, headers)
+
+    response = client.post("/openevo-api/desktop/services", headers=headers)
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["services"]["ready"] is True
+    assert [step["id"] for step in payload["report"]["steps"]] == [
+        "write_topology",
+        "evolution_backend",
+        "rollout",
+        "gateway",
+        "evolution_worker",
+    ]
+    assert any("polar serve_rollout" in command for command in transport.commands)
+    assert any("polar serve_gateway" in command for command in transport.commands)
+    services = {service["id"]: service for service in payload["status"]["services"]}
+    assert services["openevo-backend"] == {
+        "id": "openevo-backend",
+        "label": "OpenEvo backend",
+        "state": "ready",
+        "detail": "Remote runtime services are ready",
+    }
+
+
+def test_services_endpoint_preserves_failure_status() -> None:
+    project = ScienceProjectConfig.model_validate(_science_project_payload())
+    profile = _remote_profile()
+    transport = _FailingServicesTransport()
+    client = TestClient(
+        create_sidecar_app_for_project(
+            project,
+            profile,
+            transport_factory=lambda _profile: transport,
+        )
+    )
+    token = _sidecar_token(client)
+    headers = {"X-OpenEvo-Sidecar-Token": token}
+    _prepare_workspace_and_bootstrap(client, headers)
+
+    response = client.post("/openevo-api/desktop/services", headers=headers)
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["services"]["ready"] is False
+    assert payload["report"]["next_actions"] == [
+        "Fix remote service failure and restart services."
+    ]
+    rollout = next(
+        step for step in payload["report"]["steps"] if step["id"] == "rollout"
+    )
+    assert rollout["status"] == "fail"
+    assert rollout["stderr"] == "rollout failed"
+    services = {service["id"]: service for service in payload["status"]["services"]}
+    assert services["openevo-backend"] == {
+        "id": "openevo-backend",
+        "label": "OpenEvo backend",
+        "state": "blocked",
+        "detail": "rollout failed",
+    }
+
+
+def test_services_endpoint_rejects_concurrent_runs() -> None:
+    project = ScienceProjectConfig.model_validate(_science_project_payload())
+    profile = _remote_profile()
+    transport = _BlockingServicesTransport()
+    client = TestClient(
+        create_sidecar_app_for_project(
+            project,
+            profile,
+            transport_factory=lambda _profile: transport,
+        )
+    )
+    token = _sidecar_token(client)
+    headers = {"X-OpenEvo-Sidecar-Token": token}
+    _prepare_workspace_and_bootstrap(client, headers)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        first = executor.submit(
+            client.post,
+            "/openevo-api/desktop/services",
+            headers=headers,
+        )
+        assert transport.service_started.wait(timeout=5)
+        second = client.post("/openevo-api/desktop/services", headers=headers)
+        transport.service_release.set()
+
+    assert first.result(timeout=5).status_code == 200
+    assert second.status_code == 409
+    assert second.json()["detail"] == "Desktop services are already running."
+
+
+def test_run_rejects_while_services_restart_is_running() -> None:
+    project = ScienceProjectConfig.model_validate(_science_project_payload())
+    profile = _remote_profile()
+    transport = _BlockingSecondServicesTransport()
+    client = TestClient(
+        create_sidecar_app_for_project(
+            project,
+            profile,
+            transport_factory=lambda _profile: transport,
+        )
+    )
+    token = _sidecar_token(client)
+    headers = {"X-OpenEvo-Sidecar-Token": token}
+    _prepare_workspace_bootstrap_and_services(client, headers)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        services_restart = executor.submit(
+            client.post,
+            "/openevo-api/desktop/services",
+            headers=headers,
+        )
+        assert transport.second_service_started.wait(timeout=5)
+        run = client.post("/openevo-api/desktop/run", headers=headers)
+        transport.second_service_release.set()
+
+    assert services_restart.result(timeout=5).status_code == 200
+    assert run.status_code == 409
+    assert run.json()["detail"] == (
+        "Desktop run launch requires ready workspace, bootstrap, and services."
+    )
+
+
+def test_bootstrap_rejects_while_services_are_running() -> None:
+    project = ScienceProjectConfig.model_validate(_science_project_payload())
+    profile = _remote_profile()
+    transport = _BlockingSecondServicesTransport()
+    client = TestClient(
+        create_sidecar_app_for_project(
+            project,
+            profile,
+            transport_factory=lambda _profile: transport,
+        )
+    )
+    token = _sidecar_token(client)
+    headers = {"X-OpenEvo-Sidecar-Token": token}
+    _prepare_workspace_bootstrap_and_services(client, headers)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        services_restart = executor.submit(
+            client.post,
+            "/openevo-api/desktop/services",
+            headers=headers,
+        )
+        assert transport.second_service_started.wait(timeout=5)
+        bootstrap = client.post("/openevo-api/desktop/bootstrap", headers=headers)
+        transport.second_service_release.set()
+
+    assert services_restart.result(timeout=5).status_code == 200
+    assert bootstrap.status_code == 409
+    assert bootstrap.json()["detail"] == (
+        "Desktop bootstrap cannot start while another lifecycle action is running."
+    )
+
+
+def test_bootstrap_clears_previous_service_readiness() -> None:
+    project = ScienceProjectConfig.model_validate(_science_project_payload())
+    profile = _remote_profile()
+    client = TestClient(
+        create_sidecar_app_for_project(
+            project,
+            profile,
+            transport_factory=lambda _profile: _ApiDryRunTransport(),
+        )
+    )
+    token = _sidecar_token(client)
+    headers = {"X-OpenEvo-Sidecar-Token": token}
+    _prepare_workspace_bootstrap_and_services(client, headers)
+
+    bootstrap = client.post("/openevo-api/desktop/bootstrap", headers=headers)
+    run = client.post("/openevo-api/desktop/run", headers=headers)
+
+    assert bootstrap.status_code == 200
+    services = {service["id"]: service for service in bootstrap.json()["status"]["services"]}
+    assert services["openevo-backend"] == {
+        "id": "openevo-backend",
+        "label": "OpenEvo backend",
+        "state": "planned",
+        "detail": "Remote runtime services have not started",
+    }
+    assert run.status_code == 409
+    assert run.json()["detail"] == (
+        "Desktop run launch requires ready workspace, bootstrap, and services."
+    )
+
+
 def test_workspace_endpoint_requires_config_backed_session() -> None:
     client = TestClient(create_sidecar_app())
     token = _sidecar_token(client)
@@ -583,7 +821,7 @@ def test_workspace_endpoint_preserves_preflight_failure_report() -> None:
     }
 
 
-def test_workspace_and_bootstrap_concurrent_status_updates_do_not_clobber(
+def test_bootstrap_rejects_while_workspace_sync_is_running(
     tmp_path: Path,
 ) -> None:
     local_source = tmp_path / "workflow"
@@ -620,14 +858,17 @@ def test_workspace_and_bootstrap_concurrent_status_updates_do_not_clobber(
         bootstrap = client.post("/openevo-api/desktop/bootstrap", headers=headers)
         transport.release.set()
 
-    assert bootstrap.status_code == 200
+    assert bootstrap.status_code == 409
+    assert bootstrap.json()["detail"] == (
+        "Desktop bootstrap cannot start while another lifecycle action is running."
+    )
     assert workspace.result(timeout=5).status_code == 200
     status_response = client.get("/openevo-api/desktop/shell")
     services = {
         service["id"]: service for service in status_response.json()["services"]
     }
     assert services["workspace"]["state"] == "ready"
-    assert services["bootstrap"]["state"] == "ready"
+    assert services["bootstrap"]["state"] == "planned"
 
 
 def test_project_config_endpoint_rejects_missing_sidecar_token(tmp_path: Path) -> None:
@@ -1207,11 +1448,33 @@ def test_run_endpoint_rejects_when_not_ready() -> None:
 
     assert response.status_code == 409
     assert response.json()["detail"] == (
-        "Desktop run launch requires ready workspace and bootstrap."
+        "Desktop run launch requires ready workspace, bootstrap, and services."
     )
 
 
-def test_run_endpoint_launches_after_workspace_and_bootstrap() -> None:
+def test_run_endpoint_rejects_without_ready_services() -> None:
+    project = ScienceProjectConfig.model_validate(_science_project_payload())
+    profile = _remote_profile()
+    client = TestClient(
+        create_sidecar_app_for_project(
+            project,
+            profile,
+            transport_factory=lambda _profile: _ApiDryRunTransport(),
+        )
+    )
+    token = _sidecar_token(client)
+    headers = {"X-OpenEvo-Sidecar-Token": token}
+    _prepare_workspace_and_bootstrap(client, headers)
+
+    response = client.post("/openevo-api/desktop/run", headers=headers)
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == (
+        "Desktop run launch requires ready workspace, bootstrap, and services."
+    )
+
+
+def test_run_endpoint_launches_after_workspace_bootstrap_and_services() -> None:
     project = ScienceProjectConfig.model_validate(_science_project_payload())
     profile = _remote_profile()
     transport = _ApiDryRunTransport()
@@ -1224,7 +1487,7 @@ def test_run_endpoint_launches_after_workspace_and_bootstrap() -> None:
     )
     token = _sidecar_token(client)
     headers = {"X-OpenEvo-Sidecar-Token": token}
-    bootstrap = _prepare_workspace_and_bootstrap(client, headers)
+    bootstrap = _prepare_workspace_bootstrap_and_services(client, headers)
 
     response = client.post("/openevo-api/desktop/run", headers=headers)
 
@@ -1277,7 +1540,7 @@ def test_run_endpoint_preserves_command_failure_status() -> None:
     )
     token = _sidecar_token(client)
     headers = {"X-OpenEvo-Sidecar-Token": token}
-    _prepare_workspace_and_bootstrap(client, headers)
+    _prepare_workspace_bootstrap_and_services(client, headers)
 
     response = client.post("/openevo-api/desktop/run", headers=headers)
 
@@ -1310,7 +1573,7 @@ def test_run_endpoint_rejects_concurrent_runs() -> None:
     )
     token = _sidecar_token(client)
     headers = {"X-OpenEvo-Sidecar-Token": token}
-    _prepare_workspace_and_bootstrap(client, headers)
+    _prepare_workspace_bootstrap_and_services(client, headers)
 
     first = client.post("/openevo-api/desktop/run", headers=headers)
     assert transport.run_started.wait(timeout=5)
@@ -1336,7 +1599,7 @@ def test_run_status_endpoint_returns_latest_running_report() -> None:
     )
     token = _sidecar_token(client)
     headers = {"X-OpenEvo-Sidecar-Token": token}
-    bootstrap = _prepare_workspace_and_bootstrap(client, headers)
+    bootstrap = _prepare_workspace_bootstrap_and_services(client, headers)
 
     launch = client.post("/openevo-api/desktop/run", headers=headers)
     assert transport.run_started.wait(timeout=5)
@@ -1530,6 +1793,17 @@ def _prepare_workspace_and_bootstrap(
     return bootstrap.json()
 
 
+def _prepare_workspace_bootstrap_and_services(
+    client: TestClient,
+    headers: dict[str, str],
+) -> dict:
+    bootstrap = _prepare_workspace_and_bootstrap(client, headers)
+    services = client.post("/openevo-api/desktop/services", headers=headers)
+    assert services.status_code == 200
+    assert services.json()["services"]["ready"] is True
+    return bootstrap
+
+
 def _wait_latest_run_state(
     client: TestClient,
     headers: dict[str, str],
@@ -1630,6 +1904,30 @@ class _FailingRunTransport(_ApiDryRunTransport):
         )
 
 
+class _FailingServicesTransport(_ApiDryRunTransport):
+    def run(
+        self,
+        command: str,
+        *,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        timeout_seconds: float = 30.0,
+    ) -> RemoteCommandResult:
+        if "polar serve_rollout" in command:
+            self.commands.append(command)
+            return RemoteCommandResult(
+                command=command,
+                return_code=1,
+                stderr="rollout failed",
+            )
+        return super().run(
+            command,
+            cwd=cwd,
+            env=env,
+            timeout_seconds=timeout_seconds,
+        )
+
+
 class _BlockingTransport(_ApiDryRunTransport):
     def __init__(self) -> None:
         super().__init__()
@@ -1688,6 +1986,66 @@ class _BlockingRunTransport(_ApiDryRunTransport):
             self.run_started.set()
             if not self.run_release.wait(timeout=5):
                 raise TimeoutError("run concurrency test timed out")
+            return RemoteCommandResult(command=command, return_code=0, stdout="ok")
+        return super().run(
+            command,
+            cwd=cwd,
+            env=env,
+            timeout_seconds=timeout_seconds,
+        )
+
+
+class _BlockingServicesTransport(_ApiDryRunTransport):
+    def __init__(self) -> None:
+        super().__init__()
+        self.service_started = Event()
+        self.service_release = Event()
+
+    def run(
+        self,
+        command: str,
+        *,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        timeout_seconds: float = 30.0,
+    ) -> RemoteCommandResult:
+        if "polar serve_rollout" in command and not self.service_started.is_set():
+            self.commands.append(command)
+            self.service_started.set()
+            if not self.service_release.wait(timeout=5):
+                raise TimeoutError("services concurrency test timed out")
+            return RemoteCommandResult(command=command, return_code=0, stdout="ok")
+        return super().run(
+            command,
+            cwd=cwd,
+            env=env,
+            timeout_seconds=timeout_seconds,
+        )
+
+
+class _BlockingSecondServicesTransport(_ApiDryRunTransport):
+    def __init__(self) -> None:
+        super().__init__()
+        self.rollout_start_count = 0
+        self.second_service_started = Event()
+        self.second_service_release = Event()
+
+    def run(
+        self,
+        command: str,
+        *,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        timeout_seconds: float = 30.0,
+    ) -> RemoteCommandResult:
+        if "polar serve_rollout" in command:
+            self.commands.append(command)
+            self.run_calls.append((command, cwd, timeout_seconds))
+            self.rollout_start_count += 1
+            if self.rollout_start_count == 2:
+                self.second_service_started.set()
+                if not self.second_service_release.wait(timeout=5):
+                    raise TimeoutError("second services test timed out")
             return RemoteCommandResult(command=command, return_code=0, stdout="ok")
         return super().run(
             command,

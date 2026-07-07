@@ -184,6 +184,12 @@ class OpenEvoDesktopWorkspaceResponse(_StrictFrozenModel):
     status: OpenEvoDesktopShellStatus
 
 
+class OpenEvoDesktopServicesResponse(_StrictFrozenModel):
+    services: dict[str, Any]
+    report: dict[str, Any]
+    status: OpenEvoDesktopShellStatus
+
+
 class OpenEvoDesktopProjectConfigResponse(_StrictFrozenModel):
     config: DesktopProjectConfigPaths
     status: OpenEvoDesktopShellStatus
@@ -237,10 +243,12 @@ class OpenEvoSidecarSession:
     status: OpenEvoDesktopShellStatus
     last_workspace_report: object | None = None
     last_bootstrap_report: object | None = None
+    last_services_report: object | None = None
     latest_run: OpenEvoDesktopRunStatus | None = None
     status_lock: LockType = field(default_factory=Lock)
     workspace_lock: LockType = field(default_factory=Lock)
     bootstrap_lock: LockType = field(default_factory=Lock)
+    services_lock: LockType = field(default_factory=Lock)
     run_lock: LockType = field(default_factory=Lock)
 
 
@@ -356,7 +364,7 @@ def default_desktop_shell_status() -> OpenEvoDesktopShellStatus:
                 id="openevo-backend",
                 label="OpenEvo backend",
                 state="planned",
-                detail="Service supervisor integration is next",
+                detail="Remote runtime services have not started",
             ),
         ),
         evolution=(
@@ -606,12 +614,23 @@ def create_sidecar_app(
                     status_code=409,
                     detail="Desktop workspace sync is already running.",
                 )
+            if _other_lifecycle_busy(active_session, excluding="workspace"):
+                active_session.workspace_lock.release()
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Desktop workspace sync cannot start while another "
+                        "lifecycle action is running."
+                    ),
+                )
         try:
             report = _run_workspace_sync(active_session)
             with active_session.status_lock:
                 active_session.last_workspace_report = report
+                active_session.last_services_report = None
+                active_session.latest_run = None
                 active_session.status = _status_after_workspace(
-                    active_session.status,
+                    _status_reset_runtime_services(active_session.status),
                     report,
                 )
                 response_status = _status_with_mutation_token(
@@ -654,12 +673,23 @@ def create_sidecar_app(
                     status_code=409,
                     detail="Desktop bootstrap is already running.",
                 )
+            if _other_lifecycle_busy(active_session, excluding="bootstrap"):
+                active_session.bootstrap_lock.release()
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Desktop bootstrap cannot start while another lifecycle "
+                        "action is running."
+                    ),
+                )
         try:
             report = _run_bootstrap(active_session)
             with active_session.status_lock:
                 active_session.last_bootstrap_report = report
+                active_session.last_services_report = None
+                active_session.latest_run = None
                 active_session.status = _status_after_bootstrap(
-                    active_session.status,
+                    _status_reset_runtime_services(active_session.status),
                     report,
                 )
                 response_status = _status_with_mutation_token(
@@ -671,6 +701,70 @@ def create_sidecar_app(
             active_session.bootstrap_lock.release()
         return OpenEvoDesktopBootstrapResponse(
             bootstrap=response_status.bootstrap,
+            report=report.model_dump(mode="json"),
+            status=response_status,
+        )
+
+    @app.post(
+        "/openevo-api/desktop/services",
+        response_model=OpenEvoDesktopServicesResponse,
+    )
+    def services(
+        token: str | None = Header(
+            default=None,
+            alias=SIDECAR_MUTATION_TOKEN_HEADER,
+        ),
+    ) -> OpenEvoDesktopServicesResponse:
+        _validate_mutation_token(token, sidecar_token)
+        with session_pointer_lock:
+            active_session = session
+            if active_session is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Desktop services require a config-backed sidecar session.",
+                )
+            _raise_for_unsupported_lifecycle_auth(
+                active_session.profile,
+                transport_kind,
+            )
+            if not active_session.services_lock.acquire(blocking=False):
+                raise HTTPException(
+                    status_code=409,
+                    detail="Desktop services are already running.",
+                )
+            if _other_lifecycle_busy(active_session, excluding="services"):
+                active_session.services_lock.release()
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Desktop services cannot start while another lifecycle "
+                        "action is running."
+                    ),
+                )
+        try:
+            _require_workspace_and_bootstrap_ready(active_session)
+            with active_session.status_lock:
+                active_session.last_services_report = None
+                active_session.latest_run = None
+                active_session.status = _status_services_running(
+                    active_session.status
+                )
+            report = _run_services(active_session)
+            with active_session.status_lock:
+                active_session.last_services_report = report
+                active_session.status = _status_after_services(
+                    active_session.status,
+                    report,
+                )
+                response_status = _status_with_mutation_token(
+                    active_session.status,
+                    sidecar_token,
+                    transport_kind=transport_kind,
+                )
+        finally:
+            active_session.services_lock.release()
+        return OpenEvoDesktopServicesResponse(
+            services=_services_response_payload(report),
             report=report.model_dump(mode="json"),
             status=response_status,
         )
@@ -701,6 +795,15 @@ def create_sidecar_app(
                 raise HTTPException(
                     status_code=409,
                     detail="Desktop run launch is already running.",
+                )
+            if _other_lifecycle_busy(active_session, excluding="run"):
+                active_session.run_lock.release()
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Desktop run launch requires ready workspace, bootstrap, "
+                        "and services."
+                    ),
                 )
         try:
             experiment_snapshot, state_root = _run_ready_context(active_session)
@@ -846,7 +949,7 @@ def _service_statuses(
             id="openevo-backend",
             label="OpenEvo backend",
             state="planned",
-            detail="Service supervisor integration is next",
+            detail="Remote runtime services have not started",
         ),
     )
 
@@ -906,6 +1009,22 @@ def _run_bootstrap(session: OpenEvoSidecarSession):
     )
 
 
+def _run_services(session: OpenEvoSidecarSession):
+    from openevo.remote.bootstrap import build_remote_bootstrap_plan
+    from openevo.remote.services import (
+        build_remote_services_plan,
+        execute_remote_services_plan,
+    )
+
+    _require_workspace_and_bootstrap_ready(session)
+    sidecar_plan = build_sidecar_science_plan(session.project, session.profile)
+    services_plan = build_remote_services_plan(build_remote_bootstrap_plan(sidecar_plan))
+    return execute_remote_services_plan(
+        services_plan,
+        session.transport_factory(session.profile),
+    )
+
+
 def _run_workspace_sync(session: OpenEvoSidecarSession):
     from openevo.remote.executor import execute_sidecar_plan
 
@@ -916,7 +1035,7 @@ def _run_workspace_sync(session: OpenEvoSidecarSession):
     )
 
 
-def _run_ready_context(session: OpenEvoSidecarSession) -> tuple[str, str]:
+def _require_workspace_and_bootstrap_ready(session: OpenEvoSidecarSession) -> None:
     with session.status_lock:
         workspace_ready = any(
             service.id == "workspace" and service.state == "ready"
@@ -927,7 +1046,34 @@ def _run_ready_context(session: OpenEvoSidecarSession) -> tuple[str, str]:
     if not workspace_ready or not bootstrap_ready or bootstrap_report is None:
         raise HTTPException(
             status_code=409,
-            detail="Desktop run launch requires ready workspace and bootstrap.",
+            detail="Desktop services require ready workspace and bootstrap.",
+        )
+
+
+def _run_ready_context(session: OpenEvoSidecarSession) -> tuple[str, str]:
+    with session.status_lock:
+        workspace_ready = any(
+            service.id == "workspace" and service.state == "ready"
+            for service in session.status.services
+        )
+        bootstrap_ready = session.status.bootstrap.ready
+        bootstrap_report = session.last_bootstrap_report
+        services_report = session.last_services_report
+    services_ready = bool(
+        services_report is not None and getattr(services_report, "ready", False)
+    )
+    if (
+        not workspace_ready
+        or not bootstrap_ready
+        or bootstrap_report is None
+        or not services_ready
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Desktop run launch requires ready workspace, bootstrap, "
+                "and services."
+            ),
         )
     prepared_paths = getattr(bootstrap_report, "prepared_paths", {})
     experiment_snapshot = prepared_paths.get("experiment_snapshot")
@@ -1068,8 +1214,23 @@ def _session_lifecycle_busy(session: OpenEvoSidecarSession) -> bool:
     return (
         session.workspace_lock.locked()
         or session.bootstrap_lock.locked()
+        or session.services_lock.locked()
         or session.run_lock.locked()
     )
+
+
+def _other_lifecycle_busy(
+    session: OpenEvoSidecarSession,
+    *,
+    excluding: Literal["workspace", "bootstrap", "services", "run"],
+) -> bool:
+    locks = {
+        "workspace": session.workspace_lock,
+        "bootstrap": session.bootstrap_lock,
+        "services": session.services_lock,
+        "run": session.run_lock,
+    }
+    return any(name != excluding and lock.locked() for name, lock in locks.items())
 
 
 def _status_with_mutation_token(
@@ -1136,6 +1297,14 @@ def _workspace_response_payload(report) -> dict[str, Any]:
     payload = report.workspace.model_dump(mode="json")
     payload["ready"] = bool(report.ready)
     return payload
+
+
+def _services_response_payload(report) -> dict[str, Any]:
+    return {
+        "ready": bool(report.ready),
+        "state_root": report.state_root,
+        "topology_path": report.topology_path,
+    }
 
 
 def _status_after_workspace(
@@ -1240,6 +1409,103 @@ def _bootstrap_blocked_detail(report) -> str:
     if report.next_actions:
         return report.next_actions[0]
     return "Remote bootstrap did not complete."
+
+
+def _status_after_services(
+    status: OpenEvoDesktopShellStatus,
+    report,
+) -> OpenEvoDesktopShellStatus:
+    return status.model_copy(
+        update={
+            "services": tuple(
+                _service_after_services(service, report=report)
+                for service in status.services
+            ),
+        }
+    )
+
+
+def _status_services_running(
+    status: OpenEvoDesktopShellStatus,
+) -> OpenEvoDesktopShellStatus:
+    return status.model_copy(
+        update={
+            "services": tuple(
+                _service_services_running(service) for service in status.services
+            ),
+        }
+    )
+
+
+def _service_services_running(service: DesktopServiceStatus) -> DesktopServiceStatus:
+    if service.id != "openevo-backend":
+        return service
+    return service.model_copy(
+        update={
+            "state": "running",
+            "detail": "Starting remote runtime services",
+        }
+    )
+
+
+def _service_after_services(
+    service: DesktopServiceStatus,
+    *,
+    report,
+) -> DesktopServiceStatus:
+    if service.id != "openevo-backend":
+        return service
+    if report.ready:
+        return service.model_copy(
+            update={
+                "state": "ready",
+                "detail": "Remote runtime services are ready",
+            }
+        )
+    return service.model_copy(
+        update={"state": "blocked", "detail": _services_blocked_detail(report)}
+    )
+
+
+def _services_blocked_detail(report) -> str:
+    for step in report.steps:
+        if step.status == "fail":
+            for text in (
+                step.stderr,
+                step.health_stderr,
+                step.message,
+                step.health_stdout,
+                step.stdout,
+            ):
+                stripped = text.strip()
+                if stripped:
+                    return stripped
+    if report.next_actions:
+        return report.next_actions[0]
+    return "Remote services did not become ready."
+
+
+def _status_reset_runtime_services(
+    status: OpenEvoDesktopShellStatus,
+) -> OpenEvoDesktopShellStatus:
+    return status.model_copy(
+        update={
+            "services": tuple(
+                _reset_runtime_service(service) for service in status.services
+            ),
+        }
+    )
+
+
+def _reset_runtime_service(service: DesktopServiceStatus) -> DesktopServiceStatus:
+    if service.id != "openevo-backend":
+        return service
+    return service.model_copy(
+        update={
+            "state": "planned",
+            "detail": "Remote runtime services have not started",
+        }
+    )
 
 
 def _status_after_run(

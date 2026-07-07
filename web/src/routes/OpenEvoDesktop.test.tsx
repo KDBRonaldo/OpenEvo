@@ -16,6 +16,7 @@ const apiMocks = vi.hoisted(() => ({
   fetchOpenEvoDesktopShellModel: vi.fn(),
   pollOpenEvoRunStatus: vi.fn(),
   runOpenEvoBootstrap: vi.fn(),
+  runOpenEvoServices: vi.fn(),
   runOpenEvoStartRun: vi.fn(),
   runOpenEvoWorkspaceSync: vi.fn(),
   saveOpenEvoProjectConfig: vi.fn(),
@@ -27,6 +28,7 @@ vi.mock("../api/openevo", () => ({
   fetchOpenEvoDesktopShellModel: apiMocks.fetchOpenEvoDesktopShellModel,
   pollOpenEvoRunStatus: apiMocks.pollOpenEvoRunStatus,
   runOpenEvoBootstrap: apiMocks.runOpenEvoBootstrap,
+  runOpenEvoServices: apiMocks.runOpenEvoServices,
   runOpenEvoStartRun: apiMocks.runOpenEvoStartRun,
   runOpenEvoWorkspaceSync: apiMocks.runOpenEvoWorkspaceSync,
   saveOpenEvoProjectConfig: apiMocks.saveOpenEvoProjectConfig,
@@ -41,6 +43,7 @@ describe("OpenEvoDesktop", () => {
     apiMocks.fetchOpenEvoDesktopShellModel.mockReset();
     apiMocks.pollOpenEvoRunStatus.mockReset();
     apiMocks.runOpenEvoBootstrap.mockReset();
+    apiMocks.runOpenEvoServices.mockReset();
     apiMocks.runOpenEvoStartRun.mockReset();
     apiMocks.runOpenEvoWorkspaceSync.mockReset();
     apiMocks.saveOpenEvoProjectConfig.mockReset();
@@ -57,6 +60,9 @@ describe("OpenEvoDesktop", () => {
       new Error("sidecar unavailable"),
     );
     apiMocks.runOpenEvoBootstrap.mockRejectedValue(
+      new Error("sidecar unavailable"),
+    );
+    apiMocks.runOpenEvoServices.mockRejectedValue(
       new Error("sidecar unavailable"),
     );
     apiMocks.runOpenEvoStartRun.mockRejectedValue(
@@ -241,6 +247,157 @@ describe("OpenEvoDesktop", () => {
       "docker pull openevo/science-runtime:0.1.0",
     );
     expect(document.body.textContent).toContain("network timeout");
+    await unmountClient(root);
+  });
+
+  it("starts remote services and enables run after services are ready", async () => {
+    const shellModel = withBackendService(
+      modelWithBootstrap({
+        projectName: "Loaded Science Project",
+        ready: true,
+        notes: ["Remote bootstrap is ready."],
+        bootstrapDetail: "Runtime image and manifests prepared",
+      }),
+      {
+        state: "planned",
+        detail: "Remote runtime services have not started",
+      },
+    );
+    const servicesModel = withBackendService(shellModel, {
+      state: "ready",
+      detail: "Remote runtime services are ready",
+    });
+    apiMocks.fetchOpenEvoDesktopShellModel.mockResolvedValue(shellModel);
+    const deferred = deferServices(servicesModel);
+    apiMocks.runOpenEvoServices.mockReturnValue(deferred.promise);
+
+    const root = await renderClient();
+    await flushEffects();
+
+    expect(document.body.textContent).toContain(
+      "Remote runtime services have not started",
+    );
+    expect(buttonByText("Start Run").disabled).toBe(true);
+
+    await act(async () => {
+      buttonByText("Start Services").dispatchEvent(
+        new MouseEvent("click", { bubbles: true }),
+      );
+    });
+
+    expect(apiMocks.runOpenEvoServices).toHaveBeenCalledTimes(1);
+    expect(document.body.textContent).toContain("Starting Services");
+
+    await act(async () => {
+      deferred.resolve({
+        services: {
+          ready: true,
+          state_root: "/home/alice/.openevo/runs/protein/folding",
+          topology_path:
+            "/home/alice/.openevo/runs/protein/folding/services/topology.yaml",
+        },
+        report: {
+          ready: true,
+          steps: [
+            {
+              id: "rollout",
+              status: "pass",
+              message: "Rollout server is ready.",
+              command: "polar serve_rollout topology.yaml",
+            },
+          ],
+        },
+        status: servicesModel,
+      });
+      await Promise.resolve();
+    });
+
+    expect(document.body.textContent).toContain("Remote runtime services are ready");
+    expect(buttonByText("Start Run").disabled).toBe(false);
+    await unmountClient(root);
+  });
+
+  it("disables service start until bootstrap is ready", async () => {
+    const shellModel = withBackendService(
+      modelWithBootstrap({
+        projectName: "Loaded Science Project",
+        ready: false,
+        notes: ["Remote bootstrap has not run yet."],
+        bootstrapDetail: "Remote bootstrap has not run yet",
+      }),
+      {
+        state: "planned",
+        detail: "Remote runtime services have not started",
+      },
+    );
+    apiMocks.fetchOpenEvoDesktopShellModel.mockResolvedValue(shellModel);
+
+    const root = await renderClient();
+    await flushEffects();
+
+    expect(buttonByText("Start Services").disabled).toBe(true);
+    await unmountClient(root);
+  });
+
+  it("renders failed service steps from the services report", async () => {
+    const shellModel = withBackendService(
+      modelWithBootstrap({
+        projectName: "Loaded Science Project",
+        ready: true,
+        notes: ["Remote bootstrap is ready."],
+        bootstrapDetail: "Runtime image and manifests prepared",
+      }),
+      {
+        state: "planned",
+        detail: "Remote runtime services have not started",
+      },
+    );
+    const failedModel = withBackendService(shellModel, {
+      state: "blocked",
+      detail: "rollout failed",
+    });
+    apiMocks.fetchOpenEvoDesktopShellModel.mockResolvedValue(shellModel);
+    apiMocks.runOpenEvoServices.mockResolvedValue({
+      services: {
+        ready: false,
+        state_root: "/home/alice/.openevo/runs/protein/folding",
+        topology_path:
+          "/home/alice/.openevo/runs/protein/folding/services/topology.yaml",
+      },
+      report: {
+        ready: false,
+        next_actions: ["Fix remote service failure and restart services."],
+        steps: [
+          {
+            id: "rollout",
+            status: "fail",
+            message: "Rollout server failed to start.",
+            command: "polar serve_rollout topology.yaml",
+            stderr: "rollout failed",
+          },
+        ],
+      },
+      status: failedModel,
+    });
+
+    const root = await renderClient();
+    await flushEffects();
+
+    await act(async () => {
+      buttonByText("Start Services").dispatchEvent(
+        new MouseEvent("click", { bubbles: true }),
+      );
+      await Promise.resolve();
+    });
+
+    expect(document.body.textContent).toContain("Services Report");
+    expect(document.body.textContent).toContain(
+      "Fix remote service failure and restart services.",
+    );
+    expect(document.body.textContent).toContain("rollout");
+    expect(document.body.textContent).toContain("polar serve_rollout topology.yaml");
+    expect(document.body.textContent).toContain("rollout failed");
+    expect(buttonByText("Start Run").disabled).toBe(true);
     await unmountClient(root);
   });
 
@@ -624,7 +781,10 @@ describe("OpenEvoDesktop", () => {
   });
 
   it("activates a saved config and clears stale run state", async () => {
-    const shellModel = getOpenEvoDesktopShellModel();
+    const shellModel = withBackendService(getOpenEvoDesktopShellModel(), {
+      state: "ready",
+      detail: "Remote runtime services are ready",
+    });
     const runningModel = modelWithRun({
       projectName: "Loaded Science Project",
       backendState: "running",
@@ -1006,8 +1166,8 @@ describe("OpenEvoDesktop", () => {
   it("starts a run from the button and refreshes visible status", async () => {
     const shellModel = modelWithRun({
       projectName: "Loaded Science Project",
-      backendState: "planned",
-      backendDetail: "Service supervisor integration is next",
+      backendState: "ready",
+      backendDetail: "Remote runtime services are ready",
       transcriptState: "planned",
       transcriptDetail: "Trajectory capture will start after the first run",
     });
@@ -1036,7 +1196,7 @@ describe("OpenEvoDesktop", () => {
 
     expect(document.body.textContent).toContain("Loaded Science Project");
     expect(document.body.textContent).toContain(
-      "Service supervisor integration is next",
+      "Remote runtime services are ready",
     );
 
     const button = buttonByText("Start Run");
@@ -1084,8 +1244,8 @@ describe("OpenEvoDesktop", () => {
   it("updates run state after the StrictMode mount cleanup probe", async () => {
     const shellModel = modelWithRun({
       projectName: "Loaded Science Project",
-      backendState: "planned",
-      backendDetail: "Service supervisor integration is next",
+      backendState: "ready",
+      backendDetail: "Remote runtime services are ready",
       transcriptState: "planned",
       transcriptDetail: "Trajectory capture will start after the first run",
     });
@@ -1133,8 +1293,8 @@ describe("OpenEvoDesktop", () => {
     vi.useFakeTimers();
     const shellModel = modelWithRun({
       projectName: "Loaded Science Project",
-      backendState: "planned",
-      backendDetail: "Service supervisor integration is next",
+      backendState: "ready",
+      backendDetail: "Remote runtime services are ready",
       transcriptState: "planned",
       transcriptDetail: "Trajectory capture will start after the first run",
     });
@@ -1183,7 +1343,10 @@ describe("OpenEvoDesktop", () => {
   });
 
   it("clears the latest run when a new project config is saved", async () => {
-    const shellModel = getOpenEvoDesktopShellModel();
+    const shellModel = withBackendService(getOpenEvoDesktopShellModel(), {
+      state: "ready",
+      detail: "Remote runtime services are ready",
+    });
     const runningModel = modelWithRun({
       projectName: "Loaded Science Project",
       backendState: "running",
@@ -1249,8 +1412,8 @@ describe("OpenEvoDesktop", () => {
   it("renders failed run status and stderr after polling", async () => {
     const shellModel = modelWithRun({
       projectName: "Loaded Science Project",
-      backendState: "planned",
-      backendDetail: "Service supervisor integration is next",
+      backendState: "ready",
+      backendDetail: "Remote runtime services are ready",
       transcriptState: "planned",
       transcriptDetail: "Trajectory capture will start after the first run",
     });
@@ -1355,8 +1518,8 @@ describe("OpenEvoDesktop", () => {
     apiMocks.fetchOpenEvoDesktopShellModel.mockResolvedValue(
       modelWithRun({
         projectName: "Loaded Science Project",
-        backendState: "planned",
-        backendDetail: "Service supervisor integration is next",
+        backendState: "ready",
+        backendDetail: "Remote runtime services are ready",
         transcriptState: "planned",
         transcriptDetail: "Trajectory capture will start after the first run",
       }),
@@ -1670,6 +1833,30 @@ function modelWithRun({
   };
 }
 
+function withBackendService(
+  model: OpenEvoDesktopShellModel,
+  {
+    state,
+    detail,
+  }: {
+    state: OpenEvoDesktopShellModel["services"][number]["state"];
+    detail: string;
+  },
+): OpenEvoDesktopShellModel {
+  return {
+    ...model,
+    services: model.services.map((service) =>
+      service.id === "openevo-backend"
+        ? {
+            ...service,
+            state,
+            detail,
+          }
+        : service,
+    ),
+  };
+}
+
 function deferBootstrap(status: OpenEvoDesktopShellModel) {
   let resolve!: (value: {
     bootstrap: OpenEvoDesktopShellModel["bootstrap"];
@@ -1678,6 +1865,22 @@ function deferBootstrap(status: OpenEvoDesktopShellModel) {
   }) => void;
   const promise = new Promise<{
     bootstrap: OpenEvoDesktopShellModel["bootstrap"];
+    report: Record<string, any>;
+    status: OpenEvoDesktopShellModel;
+  }>((next) => {
+    resolve = next;
+  });
+  return { promise, resolve, status };
+}
+
+function deferServices(status: OpenEvoDesktopShellModel) {
+  let resolve!: (value: {
+    services: Record<string, any>;
+    report: Record<string, any>;
+    status: OpenEvoDesktopShellModel;
+  }) => void;
+  const promise = new Promise<{
+    services: Record<string, any>;
     report: Record<string, any>;
     status: OpenEvoDesktopShellModel;
   }>((next) => {

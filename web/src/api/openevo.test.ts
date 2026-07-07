@@ -5,6 +5,7 @@ import {
   fetchOpenEvoDesktopShellModel,
   pollOpenEvoRunStatus,
   runOpenEvoBootstrap,
+  runOpenEvoServices,
   runOpenEvoStartRun,
   runOpenEvoWorkspaceSync,
   saveOpenEvoProjectConfig,
@@ -247,6 +248,51 @@ describe("OpenEvo sidecar client", () => {
     expect(calls[1]).toMatchObject({ path: "/openevo-api/desktop/workspace" });
     expect(calls[1].headers.get("X-OpenEvo-Sidecar-Token")).toBe(
       "workspace-token",
+    );
+  });
+
+  it("sends the sidecar mutation token on service start requests", async () => {
+    const calls: Array<{ path: string; headers: Headers }> = [];
+    const shellPayload = sidecarShellPayload("services-token");
+    vi.spyOn(globalThis, "fetch").mockImplementation(
+      async (input, init) => {
+        const path = String(input);
+        calls.push({
+          path,
+          headers: new Headers(init?.headers),
+        });
+        if (path === "/openevo-api/desktop/shell") {
+          return jsonResponse(shellPayload);
+        }
+        if (path === "/openevo-api/desktop/services") {
+          return jsonResponse({
+            services: {
+              ready: true,
+              state_root: "/home/alice/.openevo/runs/protein/folding",
+              topology_path:
+                "/home/alice/.openevo/runs/protein/folding/services/topology.yaml",
+            },
+            report: {
+              ready: true,
+              steps: [{ id: "rollout", status: "pass", message: "ready" }],
+            },
+            status: shellPayload,
+          });
+        }
+        return new Response("not found", { status: 404 });
+      },
+    );
+
+    await fetchOpenEvoDesktopShellModel();
+    const response = await runOpenEvoServices();
+
+    expect(response.services.ready).toBe(true);
+    expect(response.services.topology_path).toContain("topology.yaml");
+    expect(response.report.steps[0].id).toBe("rollout");
+    expect(calls).toHaveLength(2);
+    expect(calls[1]).toMatchObject({ path: "/openevo-api/desktop/services" });
+    expect(calls[1].headers.get("X-OpenEvo-Sidecar-Token")).toBe(
+      "services-token",
     );
   });
 

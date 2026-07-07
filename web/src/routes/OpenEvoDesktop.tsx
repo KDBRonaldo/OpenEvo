@@ -20,6 +20,7 @@ import {
   fetchOpenEvoDesktopShellModel,
   pollOpenEvoRunStatus,
   runOpenEvoBootstrap,
+  runOpenEvoServices,
   runOpenEvoStartRun,
   runOpenEvoWorkspaceSync,
   saveOpenEvoProjectConfig,
@@ -60,6 +61,10 @@ export function OpenEvoDesktop() {
   const [bootstrapError, setBootstrapError] = useState<string | null>(null);
   const [bootstrapReport, setBootstrapReport] =
     useState<LifecycleReportPayload | null>(null);
+  const [servicesRunning, setServicesRunning] = useState(false);
+  const [servicesError, setServicesError] = useState<string | null>(null);
+  const [servicesReport, setServicesReport] =
+    useState<LifecycleReportPayload | null>(null);
   const [runRunning, setRunRunning] = useState(false);
   const [runError, setRunError] = useState<string | null>(null);
   const [workspaceReport, setWorkspaceReport] =
@@ -86,6 +91,14 @@ export function OpenEvoDesktop() {
   const runPollTimer = useRef<number | null>(null);
   const summary = getOpenEvoTimelineSummary(model);
   const lifecycleAuthError = unsupportedLifecycleAuthMessage(model);
+  const workspaceReady = model.services.some(
+    (service) => service.id === "workspace" && service.state === "ready",
+  );
+  const bootstrapReady = model.bootstrap.ready;
+  const servicesPrerequisitesReady = workspaceReady && bootstrapReady;
+  const runtimeServicesReady = model.services.some(
+    (service) => service.id === "openevo-backend" && service.state === "ready",
+  );
 
   const refreshSavedConfigs = async () => {
     catalogRefreshGeneration.current += 1;
@@ -160,6 +173,7 @@ export function OpenEvoDesktop() {
   const clearLifecycleReportsForContextChange = () => {
     setWorkspaceReport(null);
     setBootstrapReport(null);
+    setServicesReport(null);
   };
 
   const handleWorkspaceSync = async () => {
@@ -174,6 +188,8 @@ export function OpenEvoDesktop() {
       const response = await runOpenEvoWorkspaceSync();
       setModel(response.status);
       setWorkspaceReport(response.report);
+      setServicesReport(null);
+      setServicesError(null);
       clearLatestRunForContextChange();
       setSidecarConnected(true);
     } catch (error) {
@@ -294,6 +310,8 @@ export function OpenEvoDesktop() {
       const response = await runOpenEvoBootstrap();
       setModel(response.status);
       setBootstrapReport(response.report);
+      setServicesReport(null);
+      setServicesError(null);
       clearLatestRunForContextChange();
       setSidecarConnected(true);
     } catch (error) {
@@ -301,6 +319,29 @@ export function OpenEvoDesktop() {
       setBootstrapError(message);
     } finally {
       setBootstrapRunning(false);
+    }
+  };
+
+  const handleServices = async () => {
+    if (lifecycleAuthError) {
+      setServicesError(lifecycleAuthError);
+      return;
+    }
+    setServicesRunning(true);
+    setServicesError(null);
+    setServicesReport(null);
+    try {
+      const response = await runOpenEvoServices();
+      setModel(response.status);
+      setServicesReport(response.report);
+      clearLatestRunForContextChange();
+      setSidecarConnected(true);
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : "Service startup failed";
+      setServicesError(message);
+    } finally {
+      setServicesRunning(false);
     }
   };
 
@@ -393,6 +434,7 @@ export function OpenEvoDesktop() {
               !sidecarConnected ||
               workspaceRunning ||
               bootstrapRunning ||
+              servicesRunning ||
               runRunning ||
               configSaving ||
               activatingConfigSlug !== null ||
@@ -407,12 +449,29 @@ export function OpenEvoDesktop() {
               !sidecarConnected ||
               bootstrapRunning ||
               workspaceRunning ||
+              servicesRunning ||
               runRunning ||
               configSaving ||
               activatingConfigSlug !== null ||
               lifecycleAuthError !== null
             }
             onClick={handleBootstrap}
+          />
+          <CommandButton
+            icon={<Activity size={16} />}
+            label={servicesRunning ? "Starting Services" : "Start Services"}
+            disabled={
+              !sidecarConnected ||
+              servicesRunning ||
+              workspaceRunning ||
+              bootstrapRunning ||
+              runRunning ||
+              configSaving ||
+              activatingConfigSlug !== null ||
+              !servicesPrerequisitesReady ||
+              lifecycleAuthError !== null
+            }
+            onClick={handleServices}
           />
           <CommandButton
             icon={<Play size={16} />}
@@ -423,6 +482,8 @@ export function OpenEvoDesktop() {
               runRunning ||
               workspaceRunning ||
               bootstrapRunning ||
+              servicesRunning ||
+              !runtimeServicesReady ||
               configSaving ||
               activatingConfigSlug !== null ||
               lifecycleAuthError !== null
@@ -523,6 +584,7 @@ export function OpenEvoDesktop() {
                             configSaving ||
                             workspaceRunning ||
                             bootstrapRunning ||
+                            servicesRunning ||
                             runRunning
                           }
                           onClick={() => void handleActivateConfig(config)}
@@ -767,6 +829,7 @@ export function OpenEvoDesktop() {
                 activatingConfigSlug !== null ||
                 workspaceRunning ||
                 bootstrapRunning ||
+                servicesRunning ||
                 runRunning
               }
               onClick={handleSaveConfig}
@@ -846,6 +909,9 @@ export function OpenEvoDesktop() {
             {bootstrapReport ? (
               <LifecycleReport title="Bootstrap Report" report={bootstrapReport} />
             ) : null}
+            {servicesReport ? (
+              <LifecycleReport title="Services Report" report={servicesReport} />
+            ) : null}
             {bootstrapError ? (
               <div className="rounded-md border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-900">
                 {bootstrapError}
@@ -854,6 +920,11 @@ export function OpenEvoDesktop() {
             {workspaceError ? (
               <div className="rounded-md border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-900">
                 {workspaceError}
+              </div>
+            ) : null}
+            {servicesError ? (
+              <div className="rounded-md border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-900">
+                {servicesError}
               </div>
             ) : null}
             {runError ? (

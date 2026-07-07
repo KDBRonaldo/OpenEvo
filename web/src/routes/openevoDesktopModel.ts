@@ -141,7 +141,7 @@ export function getOpenEvoDesktopShellModel(): OpenEvoDesktopShellModel {
         id: "openevo-backend",
         label: "OpenEvo backend",
         state: "planned",
-        detail: "Service supervisor integration is next",
+        detail: "Remote runtime services have not started",
       },
     ],
     evolution: [

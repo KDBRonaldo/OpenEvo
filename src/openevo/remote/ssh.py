@@ -133,12 +133,14 @@ def _remote_command(
     if cwd is not None:
         _validate_remote_absolute_path(cwd, "cwd")
         pieces.append(f"cd {shlex.quote(cwd)}")
-    env_prefix = _env_prefix(env or {})
-    pieces.append(f"{env_prefix}{command}" if env_prefix else command)
+    env_export = _env_export(env or {})
+    if env_export:
+        pieces.append(env_export)
+    pieces.append(command)
     return " && ".join(pieces)
 
 
-def _env_prefix(env: dict[str, str]) -> str:
+def _env_export(env: dict[str, str]) -> str:
     assignments: list[str] = []
     for key, value in env.items():
         if not _ENV_KEY_RE.fullmatch(key):
@@ -146,7 +148,7 @@ def _env_prefix(env: dict[str, str]) -> str:
         assignments.append(f"{key}={shlex.quote(value)}")
     if not assignments:
         return ""
-    return "env " + " ".join(assignments) + " "
+    return "export " + " ".join(assignments)
 
 
 def _validate_remote_absolute_path(path: str, field_name: str) -> None:

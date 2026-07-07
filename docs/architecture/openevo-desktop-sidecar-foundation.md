@@ -8,9 +8,12 @@ a user-selected Science Project and remote profile into a deterministic dry-run
 plan. That plan can be displayed by OpenEvo Desktop, passed to a future remote
 executor, and compiled into the existing OpenEvo/Polar experiment contract.
 
-The sidecar layer does not run SSH, upload files, start Docker, start vLLM,
-store secrets, or render UI. It only validates configuration and produces the
-plan that those future components will execute.
+The foundation plan layer does not run SSH, upload files, start Docker, start
+vLLM, store secrets, or render UI. It validates configuration and produces the
+plan consumed by the Desktop lifecycle endpoints. Later sidecar layers now use
+that plan to execute workspace preparation, remote bootstrap, command-based
+service startup, and run launch when `openevo sidecar serve --transport ssh` is
+selected.
 
 ## Boundary
 
@@ -104,9 +107,11 @@ remote workspace actions:
 | `scratch` | none | Run without a prepared workspace. |
 
 Workspace actions are dry-run descriptions. The sidecar does not perform the
-upload or clone. `WorkspacePreparationPlan.to_prepared_workspaces()` converts
-actions into the `PreparedWorkspace` mapping required by
-`compile_science_project()`.
+upload or clone at plan time. The Desktop workspace lifecycle endpoint consumes
+the same actions to upload local folders, clone git repositories, accept remote
+paths, or leave scratch tasks empty.
+`WorkspacePreparationPlan.to_prepared_workspaces()` converts actions into the
+`PreparedWorkspace` mapping required by `compile_science_project()`.
 
 Remote paths must be absolute. Relative local folder paths are resolved against
 the Science Project file location when available, otherwise the current process
@@ -143,16 +148,43 @@ The JSON output is the same payload OpenEvo Desktop can render before execution:
 
 Without `--json`, the same payload is printed as YAML for manual inspection.
 
+## Desktop Lifecycle Consumption
+
+OpenEvo Desktop keeps the foundation plan as the source of truth for mutating
+sidecar endpoints:
+
+- `POST /openevo-api/desktop/workspace` consumes the workspace preparation plan.
+- `POST /openevo-api/desktop/bootstrap` compiles the experiment snapshot and
+  prepares the remote user-site OpenEvo CLI, state root, and optional Hugging
+  Face model snapshot.
+- `POST /openevo-api/desktop/services` writes a deterministic topology file
+  under the bootstrap state root, then starts and health-checks the remote
+  evolution backend, rollout, gateway, evolution worker, and managed vLLM when
+  the execution mode requires local inference.
+- `POST /openevo-api/desktop/run` launches `openevo run` only after workspace,
+  bootstrap, and services are all ready.
+
+The service supervisor is intentionally command based. It exports the remote
+profile proxy/PIP/Hugging Face environment for the full remote command script,
+records pid files, writes stdout/stderr logs under the remote state root, and
+polls local health URLs or worker pids before reporting readiness. Managed vLLM
+startup gets a longer readiness window and verifies that `/v1/models` contains
+the configured Hugging Face model id. Service reports redact proxy, pip index,
+and URL userinfo credentials before returning stdout, stderr, or exception text
+to Desktop. It is not a Docker Compose replacement and does not provide
+restart-on-crash, process-group cancellation, tunnel management, GPU sizing, or
+dynamic adapter lifecycle.
+
 ## Limitations
 
 This foundation slice does not include:
 
-- real SSH/SFTP transport;
 - local credential vault or keychain integration;
+- password-based SSH auth or private-key passphrase resolution;
 - full remote installation or dependency repair beyond later bootstrap layers'
   user-site Python package checks;
 - Docker daemon or Docker Compose lifecycle management;
-- vLLM/model serving lifecycle management;
+- production vLLM/model serving tuning, restart policy, or adapter loading;
 - runtime image build/push/upload;
 - dynamic adapter or parametric-memory lifecycle.
 
