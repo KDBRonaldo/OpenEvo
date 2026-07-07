@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 from pathlib import Path
+import re
 from typing import Any
 
 from polar_evolution.models import ArtifactType, WorkerClaimInputArtifact, WorkerClaimedJob
@@ -423,6 +424,17 @@ def _task_local_target_command_score(command: str) -> int:
     return score
 
 
+def _app_paths_in_command(command: str) -> list[str]:
+    paths: list[str] = []
+    seen: set[str] = set()
+    for match in re.finditer(r"/app/[A-Za-z0-9._/\-]+", command):
+        path = match.group(0).rstrip(".,:")
+        if path and path not in seen:
+            seen.add(path)
+            paths.append(path)
+    return paths
+
+
 def build_task_local_parametric_job_payload(
     *,
     records: list[dict[str, Any]],
@@ -434,6 +446,7 @@ def build_task_local_parametric_job_payload(
     trainer_args: list[str],
     task_ids: list[str],
     trainer_timeout_seconds: float = 3600.0,
+    target_filters: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if not records:
         raise ValueError("task-local parametric dataset requires at least one record")
@@ -464,6 +477,8 @@ def build_task_local_parametric_job_payload(
         "task_ids": list(task_ids),
         "builder": "terminal_bench_task_local_parametric",
     }
+    if target_filters is not None:
+        manifest["target_filters"] = target_filters
     manifest_path = dataset_dir / "manifest.json"
     manifest_path.write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n",
@@ -602,6 +617,8 @@ def _task_local_sft_record(
         "source_successful_command_event_index": command.event_index,
         "source_successful_command_output_excerpt": command.output_excerpt,
         "prefix_source": prefix_source,
+        "target_app_paths": _app_paths_in_command(command.command),
+        "target_command": command.command,
         "target_tool_name": "tb_exec",
     }
     if target_exec_timeout_seconds is not None:

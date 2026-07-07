@@ -391,6 +391,12 @@ schemas are present. `full_trace` now preserves assistant messages that contain
 `training.jsonl`. When several successful commands match `--command-contains`,
 the builder prefers write-like commands such as `save_model`, `cp`, `mv`, or
 file writes over later verification commands such as `Path.exists()` checks.
+Each SFT record records the selected `target_command` and extracted
+`target_app_paths` in metadata, and the dataset manifest records the target
+filters used by the CLI. These fields are audit metadata only; they do not
+change the supervised messages. They let later gcode/path-binding experiments
+separate what the adapter was trained to emit from what an eval-time artifact
+path guard repaired.
 With `--target-mode sequence`, it first selects that final target and then emits
 one SFT row per successful command up to and including it, preserving the task
 state through synthetic `tb_exec` tool-result messages between targets.

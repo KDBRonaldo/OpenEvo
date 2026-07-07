@@ -1301,6 +1301,8 @@ def test_build_task_local_sft_records_can_pin_target_exec_timeout(
         "timeout_seconds": 30,
     }
     assert record["metadata"]["target_exec_timeout_seconds"] == 30
+    assert record["metadata"]["target_command"] == "printf solved > /app/out.txt"
+    assert record["metadata"]["target_app_paths"] == ["/app/out.txt"]
 
 
 def test_build_task_local_sft_records_can_add_run_tests_correction_prefix(
@@ -1942,6 +1944,16 @@ def test_terminal_bench_task_local_parametric_memory_job_cli_accepts_target_exec
     ]["arguments"]
     assert payload["target_exec_timeout_seconds"] == 30
     assert target_args["timeout_seconds"] == 30
+    assert payload["command_contains"] == ["/app/out.txt"]
+    manifest = json.loads(
+        Path(payload["dataset"]["manifest_path"]).read_text(encoding="utf-8")
+    )
+    assert manifest["target_filters"] == {
+        "command_contains": ["/app/out.txt"],
+        "exclude_command_contains": [],
+        "prompt_style": "direct_solver",
+        "target_mode": "final",
+    }
 
 
 def test_terminal_bench_task_local_parametric_memory_job_cli_accepts_run_tests_correction(

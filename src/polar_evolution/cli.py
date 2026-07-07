@@ -1663,10 +1663,18 @@ def _create_terminal_bench_task_local_parametric_memory_job(
         trainer_args=list(args.trainer_arg),
         trainer_timeout_seconds=args.trainer_timeout_seconds,
         task_ids=selected_task_ids,
+        target_filters={
+            "command_contains": list(args.command_contains),
+            "exclude_command_contains": list(args.exclude_command_contains),
+            "prompt_style": args.prompt_style,
+            "target_mode": args.target_mode,
+        },
     )
     payload["trajectory_pool"] = str(Path(args.trajectory_pool))
     payload["selected_tasks"] = selected_task_ids
     payload["selection_summary"] = selection_summary
+    payload["command_contains"] = list(args.command_contains)
+    payload["exclude_command_contains"] = list(args.exclude_command_contains)
     payload["prompt_style"] = args.prompt_style
     payload["target_mode"] = args.target_mode
     payload["target_exec_timeout_seconds"] = args.target_exec_timeout_seconds
