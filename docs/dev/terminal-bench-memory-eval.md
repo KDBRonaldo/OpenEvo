@@ -824,6 +824,28 @@ later generated shell and Python commands also failed before writing
 `/app/out.txt`. This is a real negative performance result for the current
 task-local sequence backend, not a serving-path failure.
 
+A final-target follow-up on the same `gcode-to-text` pool tested whether the
+sequence-prefix failure was the dominant issue. The dry projection at
+`/tmp/tb21-task-local-parametric-gcode-final-20260707/dryrun` exported 16
+records with `--target-mode final`; all records used the single target command
+`/bin/bash -lc "printf '%s' 'flag{gc0d3_iz_ch4LLenGiNg}' > /app/out.txt"` and
+none included the earlier `rg` exploration target. Training at
+`/tmp/tb21-task-local-parametric-gcode-final-20260707/train-gcode-qwen35-final-r8-s100`
+used Qwen3.5-9B, GPU 6, LoRA rank 8, alpha 16, `max_length=4096`, and 100
+steps; diagnostics recorded loss moving from `1.5798166990280151` to
+`1.3598812074633315e-05`. The paired eval at
+`/tmp/tb21-task-local-parametric-gcode-final-20260707/eval-gcode-qwen35-final-r8-s100`
+completed with baseline pass@1 `0/1`, parametric-memory pass@1 `0/1`, and
+delta `0`. The treatment server loaded the LoRA adapter with
+`--enable-lora`, exposed model id
+`tb-parametric-memory-gcode-qwen35-final-r8-s100`, and rewrote 64 adapter keys.
+The method failure changed shape: after `tb_read_task`, the treatment emitted a
+near-target `tb_exec` call, but its captured arguments were malformed
+(`timeout_seconds` had no value) and the command drifted to `flag.txt` rather
+than `/app/out.txt`. This shows final-target training removes the `rg` prefix
+pollution but still needs stronger tool-argument/schema shaping before it can
+be treated as a reliable task-local parametric-memory backend.
+
 For `password-recovery`, a Qwen3.5-9B local LoRA smoke was trained from the
 existing failed/successful tool-policy trajectory at
 `/tmp/tb21-parametric-memory-password-toolpolicy-20260702-110343/local-eval-password-toolpolicy-2048/baseline/harbor_jobs/baseline-password-recovery/password-recovery__AzMbthq`.
