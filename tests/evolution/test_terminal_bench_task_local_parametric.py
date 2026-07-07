@@ -814,6 +814,81 @@ def test_build_task_local_sft_records_prefers_write_command_over_later_validatio
     assert "path.exists()" not in target
 
 
+def test_build_task_local_sft_records_can_pin_target_exec_timeout(
+    tmp_path: Path,
+) -> None:
+    failed_trial = tmp_path / "failed-trial"
+    successful_trial = tmp_path / "successful-trial"
+    (failed_trial / "agent").mkdir(parents=True)
+    (successful_trial / "agent").mkdir(parents=True)
+    (successful_trial / "agent" / "codex.txt").write_text(
+        json.dumps(
+            {
+                "type": "item.completed",
+                "item": {
+                    "type": "command_execution",
+                    "command": "printf solved > /app/out.txt",
+                    "aggregated_output": "",
+                    "exit_code": 0,
+                    "status": "completed",
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    selection = TaskLocalSelection(
+        task_id="gcode-to-text",
+        failed=[
+            TrajectoryPoolRow(
+                trajectory_id="failed",
+                task_id="gcode-to-text",
+                reward=0.0,
+                trial_dir=failed_trial,
+                raw={"prompt_summary": "Write /app/out.txt"},
+            )
+        ],
+        successful=[
+            TrajectoryPoolRow(
+                trajectory_id="success",
+                task_id="gcode-to-text",
+                reward=1.0,
+                trial_dir=successful_trial,
+                raw={},
+            )
+        ],
+        null_reward=[],
+    )
+
+    [record] = build_task_local_sft_records(
+        selection,
+        command_contains=["/app/out.txt"],
+        max_records=1,
+        target_exec_timeout_seconds=30,
+    )
+
+    trace = record["traces"][0]
+    tb_exec_tool = next(
+        tool
+        for tool in trace["tools"]
+        if tool["function"]["name"] == "tb_exec"
+    )
+    assert tb_exec_tool["function"]["parameters"]["properties"]["timeout_seconds"] == {
+        "type": "integer",
+        "minimum": 1,
+    }
+    target_args = trace["response_messages"][-1]["tool_calls"][0]["function"][
+        "arguments"
+    ]
+    assert target_args == {
+        "task_id": "terminal-bench-task",
+        "command": "printf solved > /app/out.txt",
+        "timeout_seconds": 30,
+    }
+    assert record["metadata"]["target_exec_timeout_seconds"] == 30
+
+
 def test_build_task_local_parametric_job_payload_writes_dataset_and_lora_job(
     tmp_path: Path,
 ) -> None:
@@ -1218,3 +1293,92 @@ def test_terminal_bench_task_local_parametric_memory_job_cli_accepts_sequence_ta
     assert payload["dataset"]["record_count"] == 2
     assert [record["metadata"]["target_sequence_index"] for record in records] == [0, 1]
     assert [record["metadata"]["target_sequence_length"] for record in records] == [2, 2]
+
+
+def test_terminal_bench_task_local_parametric_memory_job_cli_accepts_target_exec_timeout(
+    tmp_path: Path,
+) -> None:
+    failed_trial = tmp_path / "failed-trial"
+    successful_trial = tmp_path / "successful-trial"
+    (failed_trial / "agent").mkdir(parents=True)
+    (successful_trial / "agent").mkdir(parents=True)
+    (successful_trial / "agent" / "codex.txt").write_text(
+        json.dumps(
+            {
+                "type": "item.completed",
+                "item": {
+                    "type": "command_execution",
+                    "command": "printf solved > /app/out.txt",
+                    "aggregated_output": "",
+                    "exit_code": 0,
+                    "status": "completed",
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    pool = tmp_path / "trajectory_pool.jsonl"
+    _write_pool(
+        pool,
+        [
+            {
+                "trajectory_id": "failed-1",
+                "task_id": "gcode-to-text",
+                "reward": 0.0,
+                "trial_dir": str(failed_trial),
+                "prompt_summary": "Write /app/out.txt.",
+            },
+            {
+                "trajectory_id": "success-1",
+                "task_id": "gcode-to-text",
+                "reward": 1.0,
+                "trial_dir": str(successful_trial),
+            },
+        ],
+    )
+
+    output = tmp_path / "job.json"
+    assert (
+        main(
+            [
+                "terminal-bench-task-local-parametric-memory-job",
+                "--trajectory-pool",
+                str(pool),
+                "--task-id",
+                "gcode-to-text",
+                "--output-root",
+                str(tmp_path / "out"),
+                "--trainer-command",
+                "python",
+                "--trainer-arg",
+                "train_lora.py",
+                "--trainer-arg",
+                "--train-file",
+                "--trainer-arg",
+                "{training_dataset}",
+                "--trainer-arg",
+                "--output-dir",
+                "--trainer-arg",
+                "{adapter_dir}",
+                "--command-contains",
+                "/app/out.txt",
+                "--target-exec-timeout-seconds",
+                "30",
+                "--output",
+                str(output),
+            ]
+        )
+        == 0
+    )
+
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    [record] = [
+        json.loads(line)
+        for line in Path(payload["dataset"]["records_path"]).read_text().splitlines()
+    ]
+    target_args = record["traces"][0]["response_messages"][-1]["tool_calls"][0][
+        "function"
+    ]["arguments"]
+    assert payload["target_exec_timeout_seconds"] == 30
+    assert target_args["timeout_seconds"] == 30

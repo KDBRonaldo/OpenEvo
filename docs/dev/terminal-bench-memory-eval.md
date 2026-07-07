@@ -356,8 +356,10 @@ for explicit ablations of the old compact correction prompt. The default
 `--target-mode sequence` for multi-step recipes such as `train-fasttext`, where
 the final `/app/model.bin` write depends on earlier package installation or data
 preparation commands; sequence mode exports progressive next-command examples
-through the selected final target. Use `--run-worker` only when the trainer is
-ready to run locally.
+through the selected final target. Use `--target-exec-timeout-seconds` to pin a
+runtime-compatible optional `timeout_seconds` argument on each supervised
+`tb_exec` target when local tool-call models drift into malformed optional
+arguments. Use `--run-worker` only when the trainer is ready to run locally.
 
 ```sh
 OPEN_EVO_REPO=/path/to/OpenEvo
@@ -845,6 +847,28 @@ near-target `tb_exec` call, but its captured arguments were malformed
 than `/app/out.txt`. This shows final-target training removes the `rg` prefix
 pollution but still needs stronger tool-argument/schema shaping before it can
 be treated as a reliable task-local parametric-memory backend.
+
+A timeout-shaped final-target follow-up fixed the runtime tool schema mismatch.
+The dry projection at
+`/tmp/tb21-task-local-parametric-gcode-timeout-20260707/dryrun` exported 16
+records with `--target-mode final --target-exec-timeout-seconds 30`; every
+target command was
+`/bin/bash -lc "printf '%s' 'flag{gc0d3_iz_ch4LLenGiNg}' > /app/out.txt"`,
+every target included `timeout_seconds: 30`, the `tb_exec` tool schema exposed
+`timeout_seconds` as an integer with minimum 1, and no target contained `rg`.
+Training at
+`/tmp/tb21-task-local-parametric-gcode-timeout-20260707/train-gcode-qwen35-final-timeout-r8-s100`
+used Qwen3.5-9B, GPU 6, LoRA rank 8, alpha 16, `max_length=4096`, and 100
+steps; diagnostics recorded loss moving from `1.3398288488388062` to
+`1.3986424164613709e-05`, and the worker registered one `parametric_memory`
+artifact. The paired eval at
+`/tmp/tb21-task-local-parametric-gcode-timeout-20260707/eval-gcode-qwen35-final-timeout-r8-s100`
+completed with baseline pass@1 `0/1`, parametric-memory pass@1 `0/1`, and
+delta `0`. The treatment server loaded the LoRA adapter, rewrote 64 adapter
+keys, and its first `tb_exec` carried a valid `timeout_seconds: 30`; the failure
+therefore moved from malformed tool arguments to semantic target drift. The
+treatment wrote the correct flag to `/app/challenge.txt`, then later variants
+of `/app/challenge.txt`, while the verifier required `/app/out.txt`.
 
 For `password-recovery`, a Qwen3.5-9B local LoRA smoke was trained from the
 existing failed/successful tool-policy trajectory at

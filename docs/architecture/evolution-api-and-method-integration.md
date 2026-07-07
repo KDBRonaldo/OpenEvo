@@ -573,8 +573,11 @@ reference method。若多个成功命令匹配过滤条件，builder 会优先�
 progressive next-command SFT records，并用 synthetic `tb_exec` tool-result messages 表示
 前序命令状态；若 sequence 长度超过 `--max-records-per-task`，截断会保留靠近最终目标的
 suffix，确保最终目标仍被训练。该模式适合 final write 依赖依赖安装、数据准备或中间文件的
-Terminal Bench recipe。该路径用于本地/proxy inference 的 parametric-memory ablation，
-不适用于 Codex subscription serving。
+Terminal Bench recipe。可选 `--target-exec-timeout-seconds` 会把 runtime-compatible
+`timeout_seconds` 写入每个监督 `tb_exec` target，并让导出的 `tb_exec` tool schema 暴露同一
+可选 integer 字段，用于约束本地 tool-call 模型避免生成 malformed optional arguments。该路径
+用于本地/proxy inference 的 parametric-memory ablation，不适用于 Codex subscription
+serving。
 
 本地 vLLM eval 提供 serving-time adapter 兼容层：对通过 vLLM
 `--language-model-only` 服务的 Qwen3.5/Qwen3.6 PEFT LoRA，可在

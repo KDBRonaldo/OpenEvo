@@ -57,6 +57,7 @@ _TERMINAL_BENCH_TOOLS = [
                 "properties": {
                     "task_id": {"type": "string"},
                     "command": {"type": "string"},
+                    "timeout_seconds": {"type": "integer", "minimum": 1},
                 },
                 "required": ["task_id", "command"],
             },
@@ -248,6 +249,7 @@ def build_task_local_sft_records(
     max_records: int = 16,
     prompt_style: str = "direct_solver",
     target_mode: str = "final",
+    target_exec_timeout_seconds: int | None = None,
 ) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     if prompt_style not in _TASK_LOCAL_PROMPT_STYLES:
@@ -257,6 +259,8 @@ def build_task_local_sft_records(
         )
     if target_mode not in _TASK_LOCAL_TARGET_MODES:
         raise ValueError("task-local parametric target_mode must be final or sequence")
+    if target_exec_timeout_seconds is not None and target_exec_timeout_seconds <= 0:
+        raise ValueError("target_exec_timeout_seconds must be positive")
     for failed in selection.failed:
         if len(records) >= max_records:
             break
@@ -292,6 +296,7 @@ def build_task_local_sft_records(
                             command=command,
                             prompt_style=prompt_style,
                             target_mode=target_mode,
+                            target_exec_timeout_seconds=target_exec_timeout_seconds,
                             previous_commands=commands[:target_index],
                             target_sequence_index=target_index,
                             target_sequence_length=len(commands),
@@ -307,6 +312,7 @@ def build_task_local_sft_records(
                         command=command,
                         prompt_style=prompt_style,
                         target_mode=target_mode,
+                        target_exec_timeout_seconds=target_exec_timeout_seconds,
                     )
                 )
             if records:
@@ -469,6 +475,7 @@ def _task_local_sft_record(
     command: CodexCommandEvent,
     prompt_style: str,
     target_mode: str,
+    target_exec_timeout_seconds: int | None = None,
     previous_commands: list[CodexCommandEvent] | None = None,
     target_sequence_index: int | None = None,
     target_sequence_length: int | None = None,
@@ -481,6 +488,7 @@ def _task_local_sft_record(
                 successful=successful,
                 command=command,
                 prompt_style=prompt_style,
+                target_exec_timeout_seconds=target_exec_timeout_seconds,
                 previous_commands=previous_commands or [],
             )
         )
@@ -491,6 +499,7 @@ def _task_local_sft_record(
                 failed=failed,
                 successful=successful,
                 command=command,
+                target_exec_timeout_seconds=target_exec_timeout_seconds,
             )
         )
     elif prompt_style == "live_replay":
@@ -500,6 +509,7 @@ def _task_local_sft_record(
                 failed=failed,
                 successful=successful,
                 command=command,
+                target_exec_timeout_seconds=target_exec_timeout_seconds,
             )
         )
     else:
@@ -509,6 +519,7 @@ def _task_local_sft_record(
                 failed=failed,
                 successful=successful,
                 command=command,
+                target_exec_timeout_seconds=target_exec_timeout_seconds,
             )
         )
     metadata = {
@@ -522,6 +533,8 @@ def _task_local_sft_record(
         "prefix_source": prefix_source,
         "target_tool_name": "tb_exec",
     }
+    if target_exec_timeout_seconds is not None:
+        metadata["target_exec_timeout_seconds"] = target_exec_timeout_seconds
     if target_sequence_index is not None and target_sequence_length is not None:
         metadata["target_sequence_index"] = target_sequence_index
         metadata["target_sequence_length"] = target_sequence_length
@@ -552,6 +565,7 @@ def _task_local_sequence_messages(
     successful: TrajectoryPoolRow,
     command: CodexCommandEvent,
     prompt_style: str,
+    target_exec_timeout_seconds: int | None,
     previous_commands: list[CodexCommandEvent],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], str]:
     if prompt_style == "live_replay":
@@ -587,11 +601,19 @@ def _task_local_sequence_messages(
 
     prompt_messages = [
         *prompt_messages,
-        *_previous_command_messages(previous_commands),
+        *_previous_command_messages(
+            previous_commands,
+            timeout_seconds=target_exec_timeout_seconds,
+        ),
     ]
     return (
         prompt_messages,
-        [_task_local_target_exec_message(command.command)],
+        [
+            _task_local_target_exec_message(
+                command.command,
+                timeout_seconds=target_exec_timeout_seconds,
+            )
+        ],
         prefix_source,
     )
 
@@ -602,6 +624,7 @@ def _task_local_synthetic_correction_messages(
     failed: TrajectoryPoolRow,
     successful: TrajectoryPoolRow,
     command: CodexCommandEvent,
+    target_exec_timeout_seconds: int | None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], str]:
     prompt = (
         "Task-local parametric memory correction.\n\n"
@@ -615,7 +638,12 @@ def _task_local_synthetic_correction_messages(
             {"role": "system", "content": _TASK_LOCAL_SYNTHETIC_SYSTEM},
             {"role": "user", "content": prompt},
         ],
-        [_task_local_target_exec_message(command.command)],
+        [
+            _task_local_target_exec_message(
+                command.command,
+                timeout_seconds=target_exec_timeout_seconds,
+            )
+        ],
         "task_summary_fallback",
     )
 
@@ -626,6 +654,7 @@ def _task_local_live_replay_messages(
     failed: TrajectoryPoolRow,
     successful: TrajectoryPoolRow,
     command: CodexCommandEvent,
+    target_exec_timeout_seconds: int | None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], str]:
     live_prefix = _task_local_live_replay_prefix(failed.trial_dir)
     if live_prefix is None:
@@ -634,11 +663,17 @@ def _task_local_live_replay_messages(
             failed=failed,
             successful=successful,
             command=command,
+            target_exec_timeout_seconds=target_exec_timeout_seconds,
         )
     prompt_messages, call_index = live_prefix
     return (
         prompt_messages,
-        [_task_local_target_exec_message(command.command)],
+        [
+            _task_local_target_exec_message(
+                command.command,
+                timeout_seconds=target_exec_timeout_seconds,
+            )
+        ],
         f"live_replay_llm_call:{call_index}",
     )
 
@@ -649,6 +684,7 @@ def _task_local_direct_solver_messages(
     failed: TrajectoryPoolRow,
     successful: TrajectoryPoolRow,
     command: CodexCommandEvent,
+    target_exec_timeout_seconds: int | None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], str]:
     del selection
     prompt_messages = _task_local_direct_solver_prefix_messages(
@@ -660,7 +696,10 @@ def _task_local_direct_solver_messages(
         prompt_messages[:2],
         [
             *read_task_messages,
-            _task_local_target_exec_message(command.command),
+            _task_local_target_exec_message(
+                command.command,
+                timeout_seconds=target_exec_timeout_seconds,
+            ),
         ],
         "direct_solver_read_task",
     )
@@ -699,13 +738,19 @@ def _task_local_direct_solver_prefix_messages(
 
 def _previous_command_messages(
     commands: list[CodexCommandEvent],
+    *,
+    timeout_seconds: int | None = None,
 ) -> list[dict[str, Any]]:
     messages: list[dict[str, Any]] = []
     for index, command in enumerate(commands):
         call_id = f"polar-task-local-sequence-{index}"
         messages.extend(
             [
-                _task_local_target_exec_message(command.command, call_id=call_id),
+                _task_local_target_exec_message(
+                    command.command,
+                    call_id=call_id,
+                    timeout_seconds=timeout_seconds,
+                ),
                 {
                     "role": "tool",
                     "tool_call_id": call_id,
@@ -871,17 +916,21 @@ def _task_local_target_exec_message(
     command: str,
     *,
     call_id: str = "polar-task-local-target",
+    timeout_seconds: int | None = None,
 ) -> dict[str, Any]:
+    arguments: dict[str, Any] = {
+        "task_id": "terminal-bench-task",
+        "command": command,
+    }
+    if timeout_seconds is not None:
+        arguments["timeout_seconds"] = timeout_seconds
     return {
         "role": "assistant",
         "content": "",
         "tool_calls": [
             _tool_call(
                 "tb_exec",
-                {
-                    "task_id": "terminal-bench-task",
-                    "command": command,
-                },
+                arguments,
                 call_id=call_id,
             )
         ],

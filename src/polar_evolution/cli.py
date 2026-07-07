@@ -548,6 +548,16 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     tb_task_local_parametric_job.add_argument(
+        "--target-exec-timeout-seconds",
+        type=int,
+        help=(
+            "Optional timeout_seconds value to include in every supervised "
+            "task-local tb_exec target. Use this to align SFT records with the "
+            "runtime tb_exec schema when local models drift into malformed "
+            "optional timeout arguments."
+        ),
+    )
+    tb_task_local_parametric_job.add_argument(
         "--artifact-root",
         help="Artifact root used only when --run-worker is set.",
     )
@@ -1572,6 +1582,7 @@ def _create_terminal_bench_task_local_parametric_memory_job(
             max_records=args.max_records_per_task,
             prompt_style=args.prompt_style,
             target_mode=args.target_mode,
+            target_exec_timeout_seconds=args.target_exec_timeout_seconds,
         )
         selection_summary.append(
             {
@@ -1612,6 +1623,7 @@ def _create_terminal_bench_task_local_parametric_memory_job(
     payload["selection_summary"] = selection_summary
     payload["prompt_style"] = args.prompt_style
     payload["target_mode"] = args.target_mode
+    payload["target_exec_timeout_seconds"] = args.target_exec_timeout_seconds
 
     if args.run_worker:
         artifact_root = Path(args.artifact_root) if args.artifact_root else output_root / "artifacts"

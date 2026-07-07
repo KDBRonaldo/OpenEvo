@@ -581,6 +581,10 @@ tool-result messages for earlier successful commands so each target is
 executable from the represented prefix state. If the sequence has more commands
 than `--max-records-per-task`, the cap is suffix-anchored so the selected final
 target is still included.
+Use `--target-exec-timeout-seconds` to include the runtime-compatible optional
+`timeout_seconds` integer on every supervised `tb_exec` target and in the
+exported `tb_exec` tool schema. This is a shaping knob for local tool-call
+models that otherwise drift into malformed optional timeout arguments.
 `scripts/qwen_lora_sft.py` is a repository-provided experiment helper; it should
 be run with a trainer environment that provides `torch`, `transformers`, and
 `peft`, rather than making those libraries mandatory package dependencies. Pass
