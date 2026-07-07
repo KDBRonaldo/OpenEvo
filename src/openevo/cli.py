@@ -15,6 +15,8 @@ from openevo.experiment.runner import dry_run_experiment, run_experiment
 from openevo.remote import (
     RemoteCommandResult,
     SshRemoteExecutorTransport,
+    build_remote_bootstrap_plan,
+    execute_remote_bootstrap_plan,
     execute_sidecar_plan,
 )
 from openevo.science import (
@@ -128,6 +130,28 @@ def build_parser() -> argparse.ArgumentParser:
         help="Remote executor transport to use. Defaults to dry-run.",
     )
     execute_parser.add_argument("--json", action="store_true", help="Print JSON output.")
+    bootstrap_parser = sidecar_subparsers.add_parser(
+        "bootstrap",
+        help="Prepare a remote OpenEvo run directory and return a bootstrap report.",
+    )
+    bootstrap_parser.add_argument("config", help="Path to science project YAML.")
+    bootstrap_parser.add_argument(
+        "--remote-profile",
+        required=True,
+        help="Path to remote profile YAML.",
+    )
+    bootstrap_parser.add_argument(
+        "--skip-preflight",
+        action="store_true",
+        help="Skip remote preflight before bootstrap preparation.",
+    )
+    bootstrap_parser.add_argument(
+        "--transport",
+        choices=("dry-run", "ssh"),
+        default="dry-run",
+        help="Remote executor transport to use. Defaults to dry-run.",
+    )
+    bootstrap_parser.add_argument("--json", action="store_true", help="Print JSON output.")
     return parser
 
 
@@ -214,6 +238,8 @@ def _handle_sidecar(args: argparse.Namespace) -> int:
         return _handle_sidecar_plan(args)
     if args.sidecar_command == "execute":
         return _handle_sidecar_execute(args)
+    if args.sidecar_command == "bootstrap":
+        return _handle_sidecar_bootstrap(args)
     raise ValueError(f"Unknown sidecar command: {args.sidecar_command}")
 
 
@@ -235,6 +261,24 @@ def _handle_sidecar_execute(args: argparse.Namespace) -> int:
     plan = build_sidecar_science_plan(project, profile)
     report = execute_sidecar_plan(
         plan,
+        _sidecar_transport(args, profile),
+        run_remote_preflight=not args.skip_preflight,
+    )
+    result = report.model_dump(mode="json")
+    if args.json:
+        print(_json_dumps(result), end="")
+        return 0 if report.ready else 1
+    print(yaml.safe_dump(result, sort_keys=True), end="")
+    return 0 if report.ready else 1
+
+
+def _handle_sidecar_bootstrap(args: argparse.Namespace) -> int:
+    project = load_science_project_config(Path(args.config))
+    profile = load_remote_profile_config(Path(args.remote_profile))
+    sidecar_plan = build_sidecar_science_plan(project, profile)
+    bootstrap_plan = build_remote_bootstrap_plan(sidecar_plan)
+    report = execute_remote_bootstrap_plan(
+        bootstrap_plan,
         _sidecar_transport(args, profile),
         run_remote_preflight=not args.skip_preflight,
     )

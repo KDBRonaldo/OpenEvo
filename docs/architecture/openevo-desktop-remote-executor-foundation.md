@@ -8,10 +8,14 @@ preparation through a small transport protocol, and returns structured reports
 that Desktop can render.
 
 This layer is not a full remote backend. The first concrete SSH transport is
-documented in `docs/architecture/openevo-desktop-ssh-transport-foundation.md`,
-but credential vaults, Docker Compose lifecycle, vLLM lifecycle, remote OpenEvo
-service startup, and UI still sit above this contract. Those components should
-consume this executor contract instead of reimplementing sidecar plan parsing.
+documented in `docs/architecture/openevo-desktop-ssh-transport-foundation.md`.
+The remote bootstrap and lifecycle-status layer above this executor is
+documented in
+`docs/architecture/openevo-desktop-remote-bootstrap-lifecycle-foundation.md`.
+Credential vaults, Docker Compose lifecycle, vLLM lifecycle, remote OpenEvo
+service startup, and UI still sit above these contracts. Those components
+should consume the executor and bootstrap contracts instead of reimplementing
+sidecar plan parsing.
 
 ## Transport Boundary
 
@@ -86,19 +90,31 @@ openevo sidecar execute science.yaml --remote-profile remote.yaml --skip-preflig
 
 Without `--json`, the report is printed as YAML.
 
+The bootstrap layer above workspace execution adds:
+
+```bash
+openevo sidecar bootstrap science.yaml --remote-profile remote.yaml --json
+openevo sidecar bootstrap science.yaml --remote-profile remote.yaml --transport ssh --json
+```
+
+That command prepares the remote run directory, writes `experiment.json` and
+`bootstrap.json`, checks subscription-mode Codex readiness, pulls the runtime
+image, and prefetches the HF model for managed local inference.
+
 ## Limitations
 
 This foundation still does not include:
 
 - local credential vault or keychain integration;
-- remote dependency installation or repair;
+- host-wide remote dependency installation or repair;
 - Docker daemon or Compose lifecycle management;
 - vLLM/model-serving lifecycle management;
 - remote OpenEvo backend startup;
 - Desktop UI.
 
-The next release slices can add lifecycle managers behind the protocol
-introduced here.
+The bootstrap layer adds run-directory preparation and process-scoped model
+download attempts. Full lifecycle managers can be added behind these protocols
+without changing the executor transport boundary.
 
 ## Verification
 

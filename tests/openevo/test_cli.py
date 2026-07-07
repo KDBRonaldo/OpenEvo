@@ -383,3 +383,78 @@ def test_cli_sidecar_execute_transport_ssh_uses_ssh_transport(
     payload = json.loads(capsys.readouterr().out)
     assert payload["ready"] is True
     assert _CliRecordingSshTransport.profiles[0].id == "science-team"
+
+
+def test_cli_sidecar_bootstrap_default_dry_run_outputs_report(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    science_path = _write_config(tmp_path / "science.yaml", _minimal_science_payload())
+    profile_path = _write_config(
+        tmp_path / "remote.yaml",
+        {
+            "version": 1,
+            "id": "science-team",
+            "host": "gpu.example.edu",
+            "user": "alice",
+        },
+    )
+
+    exit_code = main(
+        [
+            "sidecar",
+            "bootstrap",
+            str(science_path),
+            "--remote-profile",
+            str(profile_path),
+            "--json",
+        ]
+    )
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ready"] is True
+    assert payload["prepared_paths"]["state_root"].endswith(
+        "/protein-design/folding-baseline"
+    )
+    assert payload["steps"][-1]["id"] == "docker_pull_runtime"
+
+
+def test_cli_sidecar_bootstrap_transport_ssh_uses_ssh_transport(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+) -> None:
+    _CliRecordingSshTransport.profiles = []
+    monkeypatch.setattr(
+        "openevo.cli.SshRemoteExecutorTransport",
+        _CliRecordingSshTransport,
+    )
+    science_path = _write_config(tmp_path / "science.yaml", _minimal_science_payload())
+    profile_path = _write_config(
+        tmp_path / "remote.yaml",
+        {
+            "version": 1,
+            "id": "science-team",
+            "host": "gpu.example.edu",
+            "user": "alice",
+        },
+    )
+
+    exit_code = main(
+        [
+            "sidecar",
+            "bootstrap",
+            str(science_path),
+            "--remote-profile",
+            str(profile_path),
+            "--transport",
+            "ssh",
+            "--json",
+        ]
+    )
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ready"] is True
+    assert _CliRecordingSshTransport.profiles[0].id == "science-team"
