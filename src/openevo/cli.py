@@ -7,10 +7,16 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+import yaml
 from pydantic import ValidationError
 
 from openevo.experiment.models import load_experiment_config
 from openevo.experiment.runner import dry_run_experiment, run_experiment
+from openevo.science import (
+    PreparedWorkspace,
+    compile_science_project,
+    load_science_project_config,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -47,6 +53,30 @@ def build_parser() -> argparse.ArgumentParser:
         default=1800,
         help="Maximum rollout status polls per task round.",
     )
+
+    science_parser = subparsers.add_parser(
+        "science",
+        help="Work with OpenEvo Science project configs.",
+    )
+    science_subparsers = science_parser.add_subparsers(
+        dest="science_command",
+        required=True,
+    )
+    compile_parser = science_subparsers.add_parser(
+        "compile",
+        help="Compile a Science Project YAML to an experiment config.",
+    )
+    compile_parser.add_argument("config", help="Path to science project YAML.")
+    compile_parser.add_argument("--json", action="store_true", help="Print JSON output.")
+    compile_parser.add_argument(
+        "--prepared-workspace",
+        action="append",
+        default=None,
+        help=(
+            "Prepared workspace mapping in task_id=/remote/path form. "
+            "Can be repeated."
+        ),
+    )
     return parser
 
 
@@ -56,6 +86,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "run":
             return _handle_run(args)
+        if args.command == "science":
+            return _handle_science(args)
     except (FileNotFoundError, ValueError, ValidationError, TimeoutError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
@@ -102,6 +134,41 @@ def _handle_run(args: argparse.Namespace) -> int:
     )
     _print_result(result, as_json=args.json)
     return 0 if result.get("status") == "completed" else 1
+
+
+def _handle_science(args: argparse.Namespace) -> int:
+    if args.science_command == "compile":
+        return _handle_science_compile(args)
+    raise ValueError(f"Unknown science command: {args.science_command}")
+
+
+def _handle_science_compile(args: argparse.Namespace) -> int:
+    project = load_science_project_config(Path(args.config))
+    config = compile_science_project(
+        project,
+        prepared_workspaces=_parse_prepared_workspaces(args.prepared_workspace),
+    )
+    result = config.model_dump(mode="json", exclude={"path"})
+    if args.json:
+        print(_json_dumps(result), end="")
+        return 0
+    print(yaml.safe_dump(result, sort_keys=True), end="")
+    return 0
+
+
+def _parse_prepared_workspaces(
+    values: list[str] | None,
+) -> dict[str, PreparedWorkspace] | None:
+    if not values:
+        return None
+
+    prepared_workspaces: dict[str, PreparedWorkspace] = {}
+    for value in values:
+        task_id, separator, path = value.partition("=")
+        if not task_id or separator != "=" or not path.startswith("/"):
+            raise ValueError("--prepared-workspace must use task_id=/remote/path")
+        prepared_workspaces[task_id] = PreparedWorkspace(path=path)
+    return prepared_workspaces
 
 
 def _print_result(result: dict[str, Any], *, as_json: bool) -> None:

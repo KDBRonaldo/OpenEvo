@@ -93,11 +93,35 @@ class AgentConfig(_StrictModel):
         return self
 
 
+class RuntimePrepareActionConfig(_StrictModel):
+    type: Literal["upload_file", "upload_dir", "exec"]
+    source: str | None = None
+    target: str | None = None
+    command: str | None = None
+    cwd: str | None = None
+    env: dict[str, str] | None = None
+
+    @model_validator(mode="after")
+    def _validate_fields(self) -> RuntimePrepareActionConfig:
+        if self.type in {"upload_file", "upload_dir"}:
+            if not self.source or not self.target:
+                raise ValueError(f"{self.type} requires source and target")
+            if self.command is not None or self.cwd is not None or self.env is not None:
+                raise ValueError(f"{self.type} must not set command, cwd, or env")
+        elif self.type == "exec":
+            if not self.command:
+                raise ValueError("exec requires command")
+            if self.source is not None or self.target is not None:
+                raise ValueError("exec must not set source or target")
+        return self
+
+
 class RuntimeConfig(_StrictModel):
     kind: Literal["docker", "apptainer"] = "docker"
     workdir: str = "/polar/session/workspace"
     image: str | None = None
     env: dict[str, str] = Field(default_factory=dict)
+    prepare: list[RuntimePrepareActionConfig] = Field(default_factory=list)
 
     @field_validator("workdir")
     @classmethod
@@ -330,4 +354,5 @@ def _runtime_has_non_default_overrides(runtime: RuntimeConfig) -> bool:
         runtime.kind != "docker"
         or runtime.workdir != "/polar/session/workspace"
         or bool(runtime.env)
+        or bool(runtime.prepare)
     )
