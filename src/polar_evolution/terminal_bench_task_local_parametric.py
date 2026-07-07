@@ -32,6 +32,41 @@ class CodexCommandEvent:
     output_excerpt: str
 
 
+_TERMINAL_BENCH_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "tb_read_task",
+            "description": "Read the current Terminal-Bench task instruction.",
+            "parameters": {
+                "type": "object",
+                "properties": {"task_id": {"type": "string"}},
+                "required": ["task_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "tb_exec",
+            "description": "Run a shell command in the Terminal-Bench task container.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task_id": {"type": "string"},
+                    "command": {"type": "string"},
+                },
+                "required": ["task_id", "command"],
+            },
+        },
+    },
+]
+
+_TASK_LOCAL_SYSTEM = (
+    "Use Terminal-Bench tools to solve the task. Emit one useful next tool call."
+)
+
+
 def load_trajectory_pool(path: Path) -> list[TrajectoryPoolRow]:
     rows: list[TrajectoryPoolRow] = []
     for line_number, line in enumerate(
@@ -155,6 +190,120 @@ def extract_successful_codex_commands(
             )
         )
     return commands
+
+
+def build_task_local_sft_records(
+    selection: TaskLocalSelection,
+    *,
+    command_contains: list[str] | None = None,
+    exclude_command_contains: list[str] | None = None,
+    max_records: int = 16,
+) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for failed in selection.failed:
+        if len(records) >= max_records:
+            break
+        for successful in selection.successful:
+            commands = extract_successful_codex_commands(
+                _trial_codex_transcript(successful.trial_dir),
+                command_contains=command_contains,
+                exclude_command_contains=exclude_command_contains,
+            )
+            if not commands:
+                continue
+
+            command = commands[-1]
+            records.append(
+                _task_local_sft_record(
+                    selection=selection,
+                    failed=failed,
+                    successful=successful,
+                    command=command,
+                )
+            )
+            break
+    return records
+
+
+def _task_local_sft_record(
+    *,
+    selection: TaskLocalSelection,
+    failed: TrajectoryPoolRow,
+    successful: TrajectoryPoolRow,
+    command: CodexCommandEvent,
+) -> dict[str, Any]:
+    prompt = (
+        "Task-local parametric memory correction.\n\n"
+        f"Task id: {selection.task_id}\n"
+        f"Failed trajectory summary: {_task_summary(failed)}\n"
+        f"Successful trajectory summary: {_task_summary(successful)}\n\n"
+        "Produce the next solve action as a tool call."
+    )
+    return {
+        "event_id": (
+            f"task-local-parametric:{selection.task_id}:"
+            f"{failed.trajectory_id}:{successful.trajectory_id}:{command.event_index}"
+        ),
+        "task_id": selection.task_id,
+        "session_id": f"task-local-parametric:{selection.task_id}",
+        "status": "COMPLETED",
+        "reward": 1.0,
+        "traces": [
+            {
+                "prompt_messages": [
+                    {"role": "system", "content": _TASK_LOCAL_SYSTEM},
+                    {"role": "user", "content": prompt},
+                ],
+                "response_messages": [
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            _tool_call(
+                                "tb_exec",
+                                {
+                                    "task_id": "terminal-bench-task",
+                                    "command": command.command,
+                                },
+                            )
+                        ],
+                    }
+                ],
+                "tools": _TERMINAL_BENCH_TOOLS,
+            }
+        ],
+        "metadata": {
+            "builder": "terminal_bench_task_local_parametric",
+            "source_failed_trajectory_id": failed.trajectory_id,
+            "source_failed_trial_dir": str(failed.trial_dir),
+            "source_successful_trajectory_id": successful.trajectory_id,
+            "source_successful_trial_dir": str(successful.trial_dir),
+            "source_successful_command_event_index": command.event_index,
+            "source_successful_command_output_excerpt": command.output_excerpt,
+            "prefix_source": "task_summary_fallback",
+            "target_tool_name": "tb_exec",
+        },
+    }
+
+
+def _trial_codex_transcript(trial_dir: Path) -> Path:
+    return trial_dir / "agent" / "codex.txt"
+
+
+def _task_summary(row: TrajectoryPoolRow) -> str:
+    for key in ("prompt_summary", "response_summary", "verifier_summary"):
+        value = row.raw.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return f"Terminal-Bench task {row.task_id}"
+
+
+def _tool_call(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": "polar-task-local-target",
+        "type": "function",
+        "function": {"name": name, "arguments": arguments},
+    }
 
 
 def _parse_reward(value: Any) -> float | None:

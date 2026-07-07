@@ -5,6 +5,8 @@ from pathlib import Path
 
 from polar_evolution.terminal_bench_task_local_parametric import (
     TaskLocalSelection,
+    TrajectoryPoolRow,
+    build_task_local_sft_records,
     extract_successful_codex_commands,
     select_task_local_candidates,
 )
@@ -134,3 +136,82 @@ def test_extract_successful_codex_commands_reads_completed_command_events(
     assert commands[0].event_index == 2
     assert commands[0].exit_code == 0
     assert "accuracy" in commands[0].output_excerpt
+
+
+def test_build_task_local_sft_records_uses_successful_command_as_tb_exec_target(
+    tmp_path: Path,
+) -> None:
+    failed_trial = tmp_path / "failed-trial"
+    successful_trial = tmp_path / "successful-trial"
+    (failed_trial / "agent").mkdir(parents=True)
+    (successful_trial / "agent").mkdir(parents=True)
+    (successful_trial / "agent" / "codex.txt").write_text(
+        json.dumps(
+            {
+                "type": "item.completed",
+                "item": {
+                    "type": "command_execution",
+                    "command": (
+                        "/bin/bash -lc 'python train.py && "
+                        "cp model.bin /app/model.bin'"
+                    ),
+                    "aggregated_output": "accuracy 0.6257\nsize 143211714",
+                    "exit_code": 0,
+                    "status": "completed",
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    selection = TaskLocalSelection(
+        task_id="train-fasttext",
+        failed=[
+            TrajectoryPoolRow(
+                trajectory_id="failed-1",
+                task_id="train-fasttext",
+                reward=0.0,
+                trial_dir=failed_trial,
+                raw={"prompt_summary": "Train fastText and write /app/model.bin"},
+            )
+        ],
+        successful=[
+            TrajectoryPoolRow(
+                trajectory_id="success-1",
+                task_id="train-fasttext",
+                reward=1.0,
+                trial_dir=successful_trial,
+                raw={"response_summary": "Created /app/model.bin under 150MB"},
+            )
+        ],
+        null_reward=[],
+    )
+
+    [record] = build_task_local_sft_records(
+        selection,
+        command_contains=["/app/model.bin"],
+        max_records=1,
+    )
+
+    assert record["task_id"] == "train-fasttext"
+    assert record["status"] == "COMPLETED"
+    assert record["reward"] == 1.0
+    trace = record["traces"][0]
+    assert trace["tools"][1]["function"]["name"] == "tb_exec"
+    assert [message["role"] for message in trace["prompt_messages"]] == [
+        "system",
+        "user",
+    ]
+    assert trace["response_messages"][0]["tool_calls"][0]["function"]["name"] == (
+        "tb_exec"
+    )
+    assert trace["response_messages"][0]["tool_calls"][0]["function"][
+        "arguments"
+    ] == {
+        "task_id": "terminal-bench-task",
+        "command": "/bin/bash -lc 'python train.py && cp model.bin /app/model.bin'",
+    }
+    assert record["metadata"]["source_failed_trajectory_id"] == "failed-1"
+    assert record["metadata"]["source_successful_trajectory_id"] == "success-1"
+    assert record["metadata"]["prefix_source"] == "task_summary_fallback"
