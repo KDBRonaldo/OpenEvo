@@ -115,6 +115,13 @@ using the same concepts as the Python contracts.
 
 ### Local Desktop Serve
 
+The installable Python distribution is named `openevo`. It includes the
+OpenEvo Desktop assets and the lower-level `polar` / `polar_evolution` packages
+that still provide rollout, gateway, trajectory, and evolution backend runtime
+modules. The `openevo`, `polar`, and `polar-evolution` console scripts remain
+declared from the same distribution so existing backend workflows keep working
+while the user-facing package identity is OpenEvo.
+
 The release-shaped local entrypoint is:
 
 ```bash

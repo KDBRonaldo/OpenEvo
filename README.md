@@ -259,6 +259,23 @@ explicit task entry. A task generator is intentionally left out of the first
 version; tool evolution is handled as helper files inside `skill_bundle`
 artifacts rather than as a separate artifact type.
 
+## OpenEvo Desktop Package
+
+The installable Python distribution is `openevo`. It bundles the OpenEvo
+Desktop shell, the `openevo` CLI, and the lower-level Polar packages that still
+provide rollout, gateway, trajectory, and evolution backend runtime modules.
+The legacy `polar` and `polar-evolution` console scripts remain available for
+developer and backend workflows.
+
+For the local Desktop entrypoint:
+
+```bash
+openevo desktop serve --host 127.0.0.1 --port 3766
+```
+
+Release wheels are built from the OpenEvo package metadata and include the
+packaged OpenEvo-only Desktop assets under `openevo/desktop/web/`.
+
 Shared infrastructure that is already implemented:
 
 - Golden-standard evaluator for sequence/component extraction: article-scoped

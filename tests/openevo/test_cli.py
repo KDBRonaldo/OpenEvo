@@ -906,6 +906,46 @@ def test_pyproject_packages_openevo_desktop_web_assets() -> None:
     assert "desktop/web/**/*" in package_data["openevo"]
 
 
+def test_pyproject_uses_openevo_release_metadata() -> None:
+    payload = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
+
+    project = payload["project"]
+
+    assert project["name"] == "openevo"
+    assert project["description"] == (
+        "OpenEvo Desktop and agent evolution orchestration."
+    )
+    assert project["urls"]["Homepage"] == "https://github.com/CompLifeLab-ZJU/OpenEvo"
+    assert project["urls"]["Repository"] == (
+        "https://github.com/CompLifeLab-ZJU/OpenEvo"
+    )
+    assert project["urls"]["Issues"] == (
+        "https://github.com/CompLifeLab-ZJU/OpenEvo/issues"
+    )
+
+
+def test_pyproject_keeps_openevo_and_polar_console_scripts() -> None:
+    payload = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
+
+    scripts = payload["project"]["scripts"]
+
+    assert scripts["openevo"] == "openevo.cli:main"
+    assert scripts["polar"] == "polar.cli:main"
+    assert scripts["polar-evolution"] == "polar_evolution.cli:main"
+
+
+def test_uv_lock_uses_openevo_editable_root_package() -> None:
+    payload = tomllib.loads(Path("uv.lock").read_text(encoding="utf-8"))
+
+    editable_roots = [
+        package
+        for package in payload["package"]
+        if package.get("source") == {"editable": "."}
+    ]
+
+    assert [package["name"] for package in editable_roots] == ["openevo"]
+
+
 def test_web_package_defines_openevo_desktop_build_mode() -> None:
     package = json.loads(Path("web/package.json").read_text(encoding="utf-8"))
     env_file = Path("web/.env.openevo-desktop")
