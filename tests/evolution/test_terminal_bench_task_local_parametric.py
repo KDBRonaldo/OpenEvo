@@ -472,6 +472,136 @@ def test_build_task_local_sft_records_live_replay_uses_failed_llm_prefix(
     assert record["metadata"]["prefix_source"] == "live_replay_llm_call:2"
 
 
+def test_build_task_local_sft_records_live_replay_preserves_full_tool_result(
+    tmp_path: Path,
+) -> None:
+    failed_trial = tmp_path / "failed-trial"
+    successful_trial = tmp_path / "successful-trial"
+    llm_calls = (
+        failed_trial
+        / "agent"
+        / "evolab_lab"
+        / ".evolab"
+        / "registries"
+        / "trajectory"
+        / "llm_calls.jsonl"
+    )
+    llm_calls.parent.mkdir(parents=True)
+    (successful_trial / "agent").mkdir(parents=True)
+    full_tool_result = json.dumps(
+        {
+            "message": "read Harbor task terminal-bench-task",
+            "task_yaml": (
+                "descriptions:\n"
+                "  - key: base\n"
+                "    description: |\n"
+                "      Write the output to /app/out.txt\n"
+            ),
+            "tool": "tb_read_task",
+        },
+        indent=2,
+        sort_keys=True,
+    )
+    llm_calls.write_text(
+        json.dumps(
+            {
+                "input_messages": [
+                    {"role": "system", "content": "Solve exactly one task_id."},
+                    {"role": "user", "content": "Instruction:\n{}"},
+                    {
+                        "role": "tool",
+                        "content": (
+                            "{\n"
+                            '  "message": "read Harbor task terminal-bench-task",\n'
+                            '  "task_yaml": "descriptions: ...[truncated 91 chars]",\n'
+                            '  "tool": "tb_read_task"\n'
+                            "}"
+                        ),
+                        "metadata": {
+                            "tool_result": {
+                                "content": full_tool_result,
+                                "status": "ok",
+                            }
+                        },
+                        "tool_call_id": "call-read",
+                    },
+                ],
+                "output_messages": [
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": "call-write",
+                                "type": "function",
+                                "function": {
+                                    "name": "tb_exec",
+                                    "arguments": {
+                                        "task_id": "terminal-bench-task",
+                                        "command": "write wrong path",
+                                    },
+                                },
+                            }
+                        ],
+                    }
+                ],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (successful_trial / "agent" / "codex.txt").write_text(
+        json.dumps(
+            {
+                "type": "item.completed",
+                "item": {
+                    "type": "command_execution",
+                    "command": "printf solved > /app/out.txt",
+                    "aggregated_output": "",
+                    "exit_code": 0,
+                    "status": "completed",
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    selection = TaskLocalSelection(
+        task_id="gcode-to-text",
+        failed=[
+            TrajectoryPoolRow(
+                trajectory_id="failed-live",
+                task_id="gcode-to-text",
+                reward=0.0,
+                trial_dir=failed_trial,
+                raw={},
+            )
+        ],
+        successful=[
+            TrajectoryPoolRow(
+                trajectory_id="success",
+                task_id="gcode-to-text",
+                reward=1.0,
+                trial_dir=successful_trial,
+                raw={},
+            )
+        ],
+        null_reward=[],
+    )
+
+    [record] = build_task_local_sft_records(
+        selection,
+        command_contains=["/app/out.txt"],
+        max_records=1,
+        prompt_style="live_replay",
+    )
+
+    tool_message = record["traces"][0]["prompt_messages"][-1]
+    assert tool_message["role"] == "tool"
+    assert "/app/out.txt" in tool_message["content"]
+    assert "[truncated" not in tool_message["content"]
+
+
 def test_build_task_local_sft_records_sequence_builds_progressive_records(
     tmp_path: Path,
 ) -> None:

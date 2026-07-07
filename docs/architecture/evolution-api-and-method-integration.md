@@ -578,6 +578,9 @@ Terminal Bench recipe。可选 `--target-exec-timeout-seconds` 会把 runtime-co
 可选 integer 字段，用于约束本地 tool-call 模型避免生成 malformed optional arguments。该路径
 用于本地/proxy inference 的 parametric-memory ablation，不适用于 Codex subscription
 serving。
+当 `--prompt-style live_replay` 读取 Harbor/EvoLab `llm_calls.jsonl` 时，tool message 应优先使用
+`metadata.tool_result.content` 中的完整工具结果；外层 `content` 可能是给日志展示用的截断文本，
+不能作为 SFT prefix 的唯一来源，否则会丢失 `/app/out.txt` 这类关键任务约束。
 
 本地 vLLM eval 提供 serving-time adapter 兼容层：对通过 vLLM
 `--language-model-only` 服务的 Qwen3.5/Qwen3.6 PEFT LoRA，可在

@@ -573,6 +573,10 @@ is a synthetic approximation for pools that only contain Codex transcripts. Use
 `--prompt-style synthetic_correction` only to reproduce the older compact
 correction prompt. The default `--target-mode final` preserves the older
 single-target behavior: it supervises only the selected successful `tb_exec`.
+When live replay consumes Harbor/EvoLab `llm_calls.jsonl`, tool messages prefer
+the full `metadata.tool_result.content` payload over the outer message
+`content`, which can be a truncated display string. This keeps task constraints
+such as `/app/out.txt` in the SFT prefix.
 Use `--target-mode sequence` when the successful trajectory is a recipe whose
 later write command depends on earlier dependency installation, data
 preparation, or intermediate files. Sequence mode emits progressive

@@ -870,6 +870,52 @@ therefore moved from malformed tool arguments to semantic target drift. The
 treatment wrote the correct flag to `/app/challenge.txt`, then later variants
 of `/app/challenge.txt`, while the verifier required `/app/out.txt`.
 
+The next gcode iteration found that the earlier `--prompt-style live_replay`
+jobs had silently fallen back to `direct_solver_read_task`, because the original
+pool's failed gcode rows were Codex transcripts without Harbor/EvoLab
+`llm_calls.jsonl`. A micro pool at
+`/tmp/tb21-task-local-parametric-gcode-livereplay-20260707/micro_pool.jsonl`
+paired the latest failed Qwen treatment trial with the same successful Codex
+trial. The dry-run first showed another framework issue: Harbor's outer tool
+message `content` can be truncated, while the full `tb_read_task` result lives
+under `metadata.tool_result.content`; using the truncated display text dropped
+the `/app/out.txt` constraint from the SFT prefix. The builder now preserves the
+full metadata tool result for live replay tool messages. After the fix, the
+dry-run at
+`/tmp/tb21-task-local-parametric-gcode-livereplay-20260707/dryrun-fulltool`
+exported 16 records from `live_replay_llm_call:2`; all 16 prompt prefixes
+contained `/app/out.txt`, none contained `[truncated`, and all targets wrote
+the correct flag to `/app/out.txt`.
+
+Training at
+`/tmp/tb21-task-local-parametric-gcode-livereplay-20260707/train-gcode-qwen35-livereplay-fulltool-r8-s100`
+used Qwen3.5-9B, GPU 6, LoRA rank 8, alpha 16, `max_length=4096`, and 100
+steps; diagnostics recorded loss moving from `1.2726507186889648` to
+`1.6078307453426532e-05`. The paired eval at
+`/tmp/tb21-task-local-parametric-gcode-livereplay-20260707/eval-gcode-qwen35-livereplay-fulltool-r8-s100`
+still completed with baseline pass@1 `0/1`, parametric-memory pass@1 `0/1`,
+and delta `0`. The treatment no longer wrote `challenge.txt`, but it regressed
+to `printf '%s' 'flag=gc0d3' > flag`, so preserving full live replay context was
+necessary for correct training input but not sufficient for stable generation.
+
+A mixed follow-up at `/tmp/tb21-task-local-parametric-gcode-mixed-20260707`
+combined 16 original direct-solver fallback rows with 16 full live-replay rows.
+The dry-run exported 32 records: 16 `direct_solver_read_task` and 16
+`live_replay_llm_call:2`; every supervised target was the exact
+`/app/out.txt` command. Training at
+`/tmp/tb21-task-local-parametric-gcode-mixed-20260707/train-gcode-qwen35-mixed-r8-s120`
+used the same Qwen3.5-9B LoRA settings with 120 steps and reached final losses
+around `2.28e-05`. The paired eval at
+`/tmp/tb21-task-local-parametric-gcode-mixed-20260707/eval-gcode-qwen35-mixed-r8-s120`
+also scored baseline pass@1 `0/1`, parametric-memory pass@1 `0/1`, delta `0`.
+The treatment was more tool-sequence aligned (`tb_exec -> tb_run_tests ->
+tb_collect_result`) but its first command rewrote `/app/text.gcode` with a small
+dummy G-code file instead of writing `/app/out.txt`. This negative result
+suggests the next method variable should not be more repetition of one target;
+it needs stronger action-shape separation, such as training explicit
+post-verifier correction stages or constraining output-file creation separately
+from task input inspection/editing.
+
 For `password-recovery`, a Qwen3.5-9B local LoRA smoke was trained from the
 existing failed/successful tool-policy trajectory at
 `/tmp/tb21-parametric-memory-password-toolpolicy-20260702-110343/local-eval-password-toolpolicy-2048/baseline/harbor_jobs/baseline-password-recovery/password-recovery__AzMbthq`.

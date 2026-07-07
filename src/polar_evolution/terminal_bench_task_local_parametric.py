@@ -811,8 +811,9 @@ def _compact_live_replay_messages(value: Any) -> list[dict[str, Any]]:
         role = message.get("role")
         if not isinstance(role, str) or not role.strip():
             continue
-        content = _message_content(message.get("content"))
-        compact: dict[str, Any] = {"role": role.strip(), "content": content}
+        role = role.strip()
+        content = _live_replay_message_content(message, role=role)
+        compact: dict[str, Any] = {"role": role, "content": content}
         tool_calls = message.get("tool_calls")
         if isinstance(tool_calls, list) and tool_calls:
             compact["tool_calls"] = tool_calls
@@ -825,6 +826,18 @@ def _compact_live_replay_messages(value: Any) -> list[dict[str, Any]]:
         if content or compact.get("tool_calls"):
             messages.append(compact)
     return messages
+
+
+def _live_replay_message_content(message: dict[str, Any], *, role: str) -> str:
+    if role == "tool":
+        metadata = message.get("metadata")
+        if isinstance(metadata, dict):
+            tool_result = metadata.get("tool_result")
+            if isinstance(tool_result, dict):
+                content = tool_result.get("content")
+                if isinstance(content, str) and content.strip():
+                    return content
+    return _message_content(message.get("content"))
 
 
 def _message_content(value: Any) -> str:
