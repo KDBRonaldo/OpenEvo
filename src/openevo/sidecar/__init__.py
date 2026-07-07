@@ -21,6 +21,8 @@ from openevo.sidecar.workspace import (
 from openevo.sidecar.api import (
     DesktopExecutionStatus,
     OpenEvoDesktopBootstrapResponse,
+    OpenEvoDesktopRunReport,
+    OpenEvoDesktopRunResponse,
     OpenEvoDesktopShellStatus,
     OpenEvoDesktopWorkspaceResponse,
     OpenEvoSidecarSession,
@@ -34,6 +36,8 @@ from openevo.sidecar.api import (
 __all__ = [
     "DesktopExecutionStatus",
     "OpenEvoDesktopBootstrapResponse",
+    "OpenEvoDesktopRunReport",
+    "OpenEvoDesktopRunResponse",
     "OpenEvoDesktopShellStatus",
     "OpenEvoDesktopWorkspaceResponse",
     "OpenEvoSidecarSession",

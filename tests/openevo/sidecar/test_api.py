@@ -540,6 +540,211 @@ def test_workspace_and_bootstrap_concurrent_status_updates_do_not_clobber(
     assert services["bootstrap"]["state"] == "ready"
 
 
+def test_run_endpoint_requires_config_backed_session() -> None:
+    client = TestClient(create_sidecar_app())
+    token = _sidecar_token(client)
+
+    response = client.post(
+        "/openevo-api/desktop/run",
+        headers={"X-OpenEvo-Sidecar-Token": token},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == (
+        "Desktop run launch requires a config-backed sidecar session."
+    )
+
+
+def test_run_endpoint_rejects_missing_sidecar_token() -> None:
+    project = ScienceProjectConfig.model_validate(_science_project_payload())
+    profile = _remote_profile()
+    client = TestClient(
+        create_sidecar_app_for_project(
+            project,
+            profile,
+            transport_factory=lambda _profile: _ApiDryRunTransport(),
+        )
+    )
+
+    response = client.post("/openevo-api/desktop/run")
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Invalid OpenEvo sidecar token."
+
+
+def test_run_endpoint_rejects_invalid_sidecar_token() -> None:
+    project = ScienceProjectConfig.model_validate(_science_project_payload())
+    profile = _remote_profile()
+    client = TestClient(
+        create_sidecar_app_for_project(
+            project,
+            profile,
+            transport_factory=lambda _profile: _ApiDryRunTransport(),
+        )
+    )
+
+    response = client.post(
+        "/openevo-api/desktop/run",
+        headers={"X-OpenEvo-Sidecar-Token": "wrong-token"},
+    )
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Invalid OpenEvo sidecar token."
+
+
+def test_run_endpoint_rejects_when_not_ready() -> None:
+    project = ScienceProjectConfig.model_validate(_science_project_payload())
+    profile = _remote_profile()
+    client = TestClient(
+        create_sidecar_app_for_project(
+            project,
+            profile,
+            transport_factory=lambda _profile: _ApiDryRunTransport(),
+        )
+    )
+    token = _sidecar_token(client)
+
+    response = client.post(
+        "/openevo-api/desktop/run",
+        headers={"X-OpenEvo-Sidecar-Token": token},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == (
+        "Desktop run launch requires ready workspace and bootstrap."
+    )
+
+
+def test_run_endpoint_launches_after_workspace_and_bootstrap() -> None:
+    project = ScienceProjectConfig.model_validate(_science_project_payload())
+    profile = _remote_profile()
+    transport = _ApiDryRunTransport()
+    client = TestClient(
+        create_sidecar_app_for_project(
+            project,
+            profile,
+            transport_factory=lambda _profile: transport,
+        )
+    )
+    token = _sidecar_token(client)
+    headers = {"X-OpenEvo-Sidecar-Token": token}
+    bootstrap = _prepare_workspace_and_bootstrap(client, headers)
+
+    response = client.post("/openevo-api/desktop/run", headers=headers)
+
+    assert response.status_code == 200
+    payload = response.json()
+    state_root = bootstrap["report"]["prepared_paths"]["state_root"]
+    experiment_snapshot = bootstrap["report"]["prepared_paths"]["experiment_snapshot"]
+    output_dir = f"{state_root}/runs/latest"
+    expected_command = (
+        f"openevo run {experiment_snapshot} "
+        f"--output-dir {output_dir} --json"
+    )
+    assert payload["run"]["ready"] is True
+    assert payload["run"]["status"] == "pass"
+    assert payload["run"]["command"] == expected_command
+    assert payload["run"]["output_dir"] == output_dir
+    assert payload["run"]["experiment_snapshot"] == experiment_snapshot
+    assert payload["run"]["command"] in transport.commands
+    assert transport.run_calls[-1] == (expected_command, state_root, 86400.0)
+    services = {service["id"]: service for service in payload["status"]["services"]}
+    assert services["openevo-backend"] == {
+        "id": "openevo-backend",
+        "label": "OpenEvo backend",
+        "state": "ready",
+        "detail": "Last run completed",
+    }
+    evolution = {step["id"]: step for step in payload["status"]["evolution"]}
+    assert evolution["transcript"]["state"] == "complete"
+    assert evolution["transcript"]["detail"] == "Run completed and transcript captured"
+
+
+def test_run_endpoint_preserves_command_failure_status() -> None:
+    project = ScienceProjectConfig.model_validate(_science_project_payload())
+    profile = _remote_profile()
+    transport = _FailingRunTransport()
+    client = TestClient(
+        create_sidecar_app_for_project(
+            project,
+            profile,
+            transport_factory=lambda _profile: transport,
+        )
+    )
+    token = _sidecar_token(client)
+    headers = {"X-OpenEvo-Sidecar-Token": token}
+    _prepare_workspace_and_bootstrap(client, headers)
+
+    response = client.post("/openevo-api/desktop/run", headers=headers)
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["run"]["ready"] is False
+    assert payload["run"]["status"] == "fail"
+    assert payload["run"]["stderr"] == "run failed"
+    services = {service["id"]: service for service in payload["status"]["services"]}
+    assert services["openevo-backend"] == {
+        "id": "openevo-backend",
+        "label": "OpenEvo backend",
+        "state": "blocked",
+        "detail": "run failed",
+    }
+
+
+def test_run_endpoint_rejects_concurrent_runs() -> None:
+    project = ScienceProjectConfig.model_validate(_science_project_payload())
+    profile = _remote_profile()
+    transport = _BlockingRunTransport()
+    client = TestClient(
+        create_sidecar_app_for_project(
+            project,
+            profile,
+            transport_factory=lambda _profile: transport,
+        )
+    )
+    token = _sidecar_token(client)
+    headers = {"X-OpenEvo-Sidecar-Token": token}
+    _prepare_workspace_and_bootstrap(client, headers)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        first = executor.submit(
+            client.post,
+            "/openevo-api/desktop/run",
+            headers=headers,
+        )
+        assert transport.run_started.wait(timeout=5)
+        second = client.post("/openevo-api/desktop/run", headers=headers)
+        transport.run_release.set()
+
+    assert second.status_code == 409
+    assert second.json()["detail"] == "Desktop run launch is already running."
+    assert first.result(timeout=5).status_code == 200
+
+
+def test_run_response_schema_has_structured_report_contract() -> None:
+    client = TestClient(create_sidecar_app())
+
+    schema = client.get("/openapi.json").json()
+
+    response_schema = schema["components"]["schemas"]["OpenEvoDesktopRunResponse"]
+    run_ref = response_schema["properties"]["run"]["$ref"]
+    assert run_ref == "#/components/schemas/OpenEvoDesktopRunReport"
+    run_schema = schema["components"]["schemas"]["OpenEvoDesktopRunReport"]
+    assert set(run_schema["required"]) == {
+        "ready",
+        "status",
+        "command",
+        "return_code",
+        "stdout",
+        "stderr",
+        "output_dir",
+        "experiment_snapshot",
+        "started_at",
+    }
+    assert run_schema["properties"]["status"]["enum"] == ["pass", "fail"]
+    assert run_schema["properties"]["output_dir"]["type"] == "string"
+
+
 def test_default_desktop_status_round_trips_as_json() -> None:
     status = default_desktop_shell_status()
 
@@ -590,9 +795,22 @@ def _sidecar_token(client: TestClient) -> str:
     return token
 
 
+def _prepare_workspace_and_bootstrap(
+    client: TestClient,
+    headers: dict[str, str],
+) -> dict:
+    workspace = client.post("/openevo-api/desktop/workspace", headers=headers)
+    assert workspace.status_code == 200
+    bootstrap = client.post("/openevo-api/desktop/bootstrap", headers=headers)
+    assert bootstrap.status_code == 200
+    return bootstrap.json()
+
+
 class _ApiDryRunTransport:
     def __init__(self) -> None:
         self.uploads: list[tuple[str, str]] = []
+        self.commands: list[str] = []
+        self.run_calls: list[tuple[str, str | None, float]] = []
 
     def run(
         self,
@@ -602,6 +820,8 @@ class _ApiDryRunTransport:
         env: dict[str, str] | None = None,
         timeout_seconds: float = 30.0,
     ) -> RemoteCommandResult:
+        self.commands.append(command)
+        self.run_calls.append((command, cwd, timeout_seconds))
         if command == 'df -Pk "$HOME"':
             return RemoteCommandResult(
                 command=command,
@@ -647,6 +867,30 @@ class _FailingUploadTransport(_ApiDryRunTransport):
         raise RuntimeError("upload failed")
 
 
+class _FailingRunTransport(_ApiDryRunTransport):
+    def run(
+        self,
+        command: str,
+        *,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        timeout_seconds: float = 30.0,
+    ) -> RemoteCommandResult:
+        if command.startswith("openevo run "):
+            self.commands.append(command)
+            return RemoteCommandResult(
+                command=command,
+                return_code=2,
+                stderr="run failed",
+            )
+        return super().run(
+            command,
+            cwd=cwd,
+            env=env,
+            timeout_seconds=timeout_seconds,
+        )
+
+
 class _BlockingTransport(_ApiDryRunTransport):
     def __init__(self) -> None:
         super().__init__()
@@ -684,6 +928,34 @@ class _BlockingWorkspaceTransport(_ApiDryRunTransport):
         if not self.release.wait(timeout=5):
             raise TimeoutError("workspace concurrency test timed out")
         super().upload_dir(local_path, remote_path)
+
+
+class _BlockingRunTransport(_ApiDryRunTransport):
+    def __init__(self) -> None:
+        super().__init__()
+        self.run_started = Event()
+        self.run_release = Event()
+
+    def run(
+        self,
+        command: str,
+        *,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        timeout_seconds: float = 30.0,
+    ) -> RemoteCommandResult:
+        if command.startswith("openevo run "):
+            self.commands.append(command)
+            self.run_started.set()
+            if not self.run_release.wait(timeout=5):
+                raise TimeoutError("run concurrency test timed out")
+            return RemoteCommandResult(command=command, return_code=0, stdout="ok")
+        return super().run(
+            command,
+            cwd=cwd,
+            env=env,
+            timeout_seconds=timeout_seconds,
+        )
 
 
 def test_build_desktop_shell_status_from_subscription_project() -> None:

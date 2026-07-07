@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   fetchOpenEvoDesktopShellModel,
   runOpenEvoBootstrap,
+  runOpenEvoStartRun,
   runOpenEvoWorkspaceSync,
   toOpenEvoBootstrapResponse,
   toOpenEvoDesktopShellModel,
@@ -196,6 +197,41 @@ describe("OpenEvo sidecar client", () => {
       "workspace-token",
     );
   });
+
+  it("sends the sidecar mutation token on start run requests", async () => {
+    const calls: Array<{ path: string; headers: Headers }> = [];
+    const shellPayload = sidecarShellPayload("run-token");
+    vi.spyOn(globalThis, "fetch").mockImplementation(
+      async (input, init) => {
+        const path = String(input);
+        calls.push({
+          path,
+          headers: new Headers(init?.headers),
+        });
+        if (path === "/openevo-api/desktop/shell") {
+          return jsonResponse(shellPayload);
+        }
+        if (path === "/openevo-api/desktop/run") {
+          return jsonResponse({
+            run: sidecarRunReport(),
+            status: shellPayload,
+          });
+        }
+        return new Response("not found", { status: 404 });
+      },
+    );
+
+    await fetchOpenEvoDesktopShellModel();
+    const response = await runOpenEvoStartRun();
+
+    expect(response.run.ready).toBe(true);
+    expect(response.run.output_dir).toBe(
+      "/home/alice/.openevo/runs/protein/folding/runs/latest",
+    );
+    expect(calls).toHaveLength(2);
+    expect(calls[1]).toMatchObject({ path: "/openevo-api/desktop/run" });
+    expect(calls[1].headers.get("X-OpenEvo-Sidecar-Token")).toBe("run-token");
+  });
 });
 
 function sidecarShellPayload(mutationToken: string) {
@@ -235,6 +271,21 @@ function sidecarShellPayload(mutationToken: string) {
     sidecar: {
       mutation_token: mutationToken,
     },
+  };
+}
+
+function sidecarRunReport() {
+  return {
+    ready: true,
+    status: "pass",
+    command:
+      "openevo run /home/alice/.openevo/runs/protein/folding/experiment.json --output-dir /home/alice/.openevo/runs/protein/folding/runs/latest --json",
+    return_code: 0,
+    stdout: "ok",
+    stderr: "",
+    output_dir: "/home/alice/.openevo/runs/protein/folding/runs/latest",
+    experiment_snapshot: "/home/alice/.openevo/runs/protein/folding/experiment.json",
+    started_at: "2026-07-07T16:00:00+00:00",
   };
 }
 

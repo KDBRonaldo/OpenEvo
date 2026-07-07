@@ -77,6 +77,28 @@ export interface OpenEvoWorkspaceResponse {
   status: OpenEvoDesktopShellModel;
 }
 
+export interface OpenEvoRunReport {
+  ready: boolean;
+  status: "pass" | "fail";
+  command: string;
+  return_code: number | null;
+  stdout: string;
+  stderr: string;
+  output_dir: string;
+  experiment_snapshot: string;
+  started_at: string;
+}
+
+export interface OpenEvoRunResponsePayload {
+  run: OpenEvoRunReport;
+  status: OpenEvoDesktopShellStatusPayload;
+}
+
+export interface OpenEvoRunResponse {
+  run: OpenEvoRunReport;
+  status: OpenEvoDesktopShellModel;
+}
+
 const sidecarMutationTokenHeader = "X-OpenEvo-Sidecar-Token";
 let sidecarMutationToken: string | null = null;
 
@@ -114,6 +136,22 @@ export async function runOpenEvoWorkspaceSync(): Promise<OpenEvoWorkspaceRespons
   return {
     workspace: payload.workspace,
     report: payload.report,
+    status: toOpenEvoDesktopShellModel(payload.status),
+  };
+}
+
+export async function runOpenEvoStartRun(): Promise<OpenEvoRunResponse> {
+  const headers = sidecarMutationToken
+    ? { [sidecarMutationTokenHeader]: sidecarMutationToken }
+    : undefined;
+  const payload = await api.post<OpenEvoRunResponsePayload>(
+    "/openevo-api/desktop/run",
+    {},
+    headers,
+  );
+  rememberOpenEvoSidecarMutationToken(payload.status);
+  return {
+    run: payload.run,
     status: toOpenEvoDesktopShellModel(payload.status),
   };
 }

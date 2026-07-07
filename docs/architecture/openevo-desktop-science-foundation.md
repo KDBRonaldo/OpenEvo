@@ -161,18 +161,38 @@ refreshed shell status. Workspace readiness updates only the SSH and Workspace
 service rows; it does not imply bootstrap readiness, model availability, gateway
 startup, rollout startup, or evolution worker startup.
 
+`POST /openevo-api/desktop/run` launches the configured Science task after
+workspace and bootstrap readiness. It is available only for config-backed
+sidecar sessions, requires the same mutation token, and rejects requests unless
+the Workspace service is `ready`, `status.bootstrap.ready` is true, and the
+latest bootstrap report contains both `prepared_paths.experiment_snapshot` and
+`prepared_paths.state_root`. The command is derived only from those bootstrap
+paths:
+
+```bash
+openevo run <experiment_snapshot> --output-dir <state_root>/runs/latest --json
+```
+
+The sidecar executes that command through the configured remote transport with
+`cwd=<state_root>` and returns a run report containing readiness, status,
+command, return code, stdout, stderr, output directory, experiment snapshot, and
+start timestamp. A passing command marks the OpenEvo backend service ready and
+the transcript evolution row complete. A failing command still returns HTTP 200
+with `run.ready=false`, and the refreshed shell status marks those rows blocked
+with the command error.
+
 The sidecar generates a per-process mutation token and includes it in
 `GET /openevo-api/desktop/shell` under `sidecar.mutation_token`. Mutating
 requests must send that token in the non-simple
 `X-OpenEvo-Sidecar-Token` header. Missing or invalid tokens are rejected before
-any workspace or bootstrap work starts. This is a local CSRF guard for the
+any workspace, bootstrap, or run work starts. This is a local CSRF guard for the
 Desktop sidecar: cross-site pages can submit simple localhost requests, but
 cannot read the same-origin shell response or set the required custom header.
-The sidecar also serializes workspace syncs and bootstrap runs independently per
-config-backed session; a second request for the same lifecycle action returns
-409 while one is already running. Status updates from both lifecycle actions are
-written under a shared status lock so concurrent workspace and bootstrap runs do
-not clobber each other's service rows.
+The sidecar serializes workspace syncs, bootstrap runs, and run launches
+independently per config-backed session; a second request for the same lifecycle
+action returns 409 while one is already running. Status updates from lifecycle
+actions are written under a shared status lock so concurrent workspace and
+bootstrap runs do not clobber each other's service rows.
 
 Dry-run serve mode is intended for local UI development and smoke tests. It
 exercises the same planning and report mapping path, but it does not mutate the
@@ -180,9 +200,11 @@ remote server. A dry-run report can therefore show the UI path as ready without
 proving that task workspaces, Docker images, or Hugging Face models were
 actually prepared. Real remote preparation requires `--transport ssh`.
 
-This slice does not let the HTTP API start vLLM, Polar gateway, rollout,
-evolution worker, or long-running OpenEvo backend processes. Those operations
-remain behind the remote lifecycle contracts until a supervisor is added.
+This slice does not add a long-running supervisor. `POST /desktop/run` is a
+synchronous launch/report boundary only; it does not stream logs, expose cancel
+or resume, keep a background job table, or start vLLM, Polar gateway, rollout,
+or evolution worker services independently. Those operations remain behind the
+remote lifecycle contracts until a supervisor is added.
 
 ## CLI
 

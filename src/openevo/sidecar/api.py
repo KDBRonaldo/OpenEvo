@@ -2,10 +2,12 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from _thread import LockType
 import posixpath
 import re
 import secrets
+import shlex
 from typing import Any, Literal
 from threading import Lock
 
@@ -148,6 +150,23 @@ class OpenEvoDesktopWorkspaceResponse(_StrictFrozenModel):
     status: OpenEvoDesktopShellStatus
 
 
+class OpenEvoDesktopRunReport(_StrictFrozenModel):
+    ready: bool
+    status: Literal["pass", "fail"]
+    command: str
+    return_code: int | None
+    stdout: str
+    stderr: str
+    output_dir: str
+    experiment_snapshot: str
+    started_at: str
+
+
+class OpenEvoDesktopRunResponse(_StrictFrozenModel):
+    run: OpenEvoDesktopRunReport
+    status: OpenEvoDesktopShellStatus
+
+
 @dataclass
 class OpenEvoSidecarSession:
     project: ScienceProjectConfig
@@ -156,9 +175,11 @@ class OpenEvoSidecarSession:
     status: OpenEvoDesktopShellStatus
     last_workspace_report: object | None = None
     last_bootstrap_report: object | None = None
+    last_run_report: object | None = None
     status_lock: LockType = field(default_factory=Lock)
     workspace_lock: LockType = field(default_factory=Lock)
     bootstrap_lock: LockType = field(default_factory=Lock)
+    run_lock: LockType = field(default_factory=Lock)
 
 
 def build_desktop_shell_status(
@@ -387,6 +408,45 @@ def create_sidecar_app(
             status=response_status,
         )
 
+    @app.post(
+        "/openevo-api/desktop/run",
+        response_model=OpenEvoDesktopRunResponse,
+    )
+    def run(
+        token: str | None = Header(
+            default=None,
+            alias=SIDECAR_MUTATION_TOKEN_HEADER,
+        ),
+    ) -> OpenEvoDesktopRunResponse:
+        _validate_mutation_token(token, sidecar_token)
+        if session is None:
+            raise HTTPException(
+                status_code=409,
+                detail="Desktop run launch requires a config-backed sidecar session.",
+            )
+        if not session.run_lock.acquire(blocking=False):
+            raise HTTPException(
+                status_code=409,
+                detail="Desktop run launch is already running.",
+            )
+        try:
+            experiment_snapshot, state_root = _run_ready_context(session)
+            report = _run_openevo_task(
+                session,
+                experiment_snapshot=experiment_snapshot,
+                state_root=state_root,
+            )
+            with session.status_lock:
+                session.last_run_report = report
+                session.status = _status_after_run(session.status, report)
+                response_status = _status_with_mutation_token(
+                    session.status,
+                    sidecar_token,
+                )
+        finally:
+            session.run_lock.release()
+        return OpenEvoDesktopRunResponse(run=report, status=response_status)
+
     return app
 
 
@@ -536,6 +596,74 @@ def _run_workspace_sync(session: OpenEvoSidecarSession):
     )
 
 
+def _run_ready_context(session: OpenEvoSidecarSession) -> tuple[str, str]:
+    with session.status_lock:
+        workspace_ready = any(
+            service.id == "workspace" and service.state == "ready"
+            for service in session.status.services
+        )
+        bootstrap_ready = session.status.bootstrap.ready
+        bootstrap_report = session.last_bootstrap_report
+    if not workspace_ready or not bootstrap_ready or bootstrap_report is None:
+        raise HTTPException(
+            status_code=409,
+            detail="Desktop run launch requires ready workspace and bootstrap.",
+        )
+    prepared_paths = getattr(bootstrap_report, "prepared_paths", {})
+    experiment_snapshot = prepared_paths.get("experiment_snapshot")
+    state_root = prepared_paths.get("state_root")
+    if not experiment_snapshot or not state_root:
+        raise HTTPException(
+            status_code=409,
+            detail="Desktop run launch requires ready workspace and bootstrap.",
+        )
+    return experiment_snapshot, state_root
+
+
+def _run_openevo_task(
+    session: OpenEvoSidecarSession,
+    *,
+    experiment_snapshot: str,
+    state_root: str,
+) -> OpenEvoDesktopRunReport:
+    output_dir = posixpath.join(state_root, "runs", "latest")
+    command = (
+        f"openevo run {shlex.quote(experiment_snapshot)} "
+        f"--output-dir {shlex.quote(output_dir)} --json"
+    )
+    started_at = datetime.now(timezone.utc).isoformat()
+    try:
+        result = session.transport_factory(session.profile).run(
+            command,
+            cwd=state_root,
+            timeout_seconds=86400.0,
+        )
+    except Exception as exc:
+        return OpenEvoDesktopRunReport(
+            ready=False,
+            status="fail",
+            command=command,
+            return_code=None,
+            stdout="",
+            stderr=str(exc),
+            output_dir=output_dir,
+            experiment_snapshot=experiment_snapshot,
+            started_at=started_at,
+        )
+    ready = result.return_code == 0
+    return OpenEvoDesktopRunReport(
+        ready=ready,
+        status="pass" if ready else "fail",
+        command=command,
+        return_code=result.return_code,
+        stdout=result.stdout,
+        stderr=result.stderr,
+        output_dir=output_dir,
+        experiment_snapshot=experiment_snapshot,
+        started_at=started_at,
+    )
+
+
 def _mutation_token(value: str | None) -> str:
     if value is None:
         return secrets.token_urlsafe(32)
@@ -670,6 +798,69 @@ def _bootstrap_blocked_detail(report) -> str:
     if report.next_actions:
         return report.next_actions[0]
     return "Remote bootstrap did not complete."
+
+
+def _status_after_run(
+    status: OpenEvoDesktopShellStatus,
+    report: OpenEvoDesktopRunReport,
+) -> OpenEvoDesktopShellStatus:
+    return status.model_copy(
+        update={
+            "services": tuple(
+                _service_after_run(service, report=report)
+                for service in status.services
+            ),
+            "evolution": tuple(
+                _evolution_after_run(step, report=report)
+                for step in status.evolution
+            ),
+        }
+    )
+
+
+def _service_after_run(
+    service: DesktopServiceStatus,
+    *,
+    report: OpenEvoDesktopRunReport,
+) -> DesktopServiceStatus:
+    if service.id != "openevo-backend":
+        return service
+    if report.ready:
+        return service.model_copy(
+            update={"state": "ready", "detail": "Last run completed"}
+        )
+    return service.model_copy(
+        update={"state": "blocked", "detail": _run_blocked_detail(report)}
+    )
+
+
+def _evolution_after_run(
+    step: DesktopEvolutionStep,
+    *,
+    report: OpenEvoDesktopRunReport,
+) -> DesktopEvolutionStep:
+    if step.id != "transcript":
+        return step
+    if report.ready:
+        return step.model_copy(
+            update={
+                "state": "complete",
+                "detail": "Run completed and transcript captured",
+            }
+        )
+    return step.model_copy(
+        update={"state": "blocked", "detail": _run_blocked_detail(report)}
+    )
+
+
+def _run_blocked_detail(report: OpenEvoDesktopRunReport) -> str:
+    stderr = report.stderr.strip()
+    if stderr:
+        return stderr
+    stdout = report.stdout.strip()
+    if stdout:
+        return stdout
+    return "Run launch failed"
 
 
 def _state_root(workspace_root: str, *, project_name: str, task_id: str) -> str:
