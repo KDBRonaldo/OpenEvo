@@ -17,6 +17,7 @@ from openevo.remote.preflight import (
     RemoteProbe,
     run_preflight,
 )
+from openevo.remote.ssh import SshRemoteExecutorTransport
 
 __all__ = [
     "PreflightCheck",
@@ -26,6 +27,7 @@ __all__ = [
     "RemotePreflightSettings",
     "RemoteProbe",
     "SidecarExecutionReport",
+    "SshRemoteExecutorTransport",
     "WorkspaceActionExecution",
     "WorkspaceActionStatus",
     "WorkspaceExecutionReport",

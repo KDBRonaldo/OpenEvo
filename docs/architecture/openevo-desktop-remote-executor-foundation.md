@@ -7,10 +7,11 @@ It consumes a `SidecarSciencePlan`, runs remote preflight and workspace
 preparation through a small transport protocol, and returns structured reports
 that Desktop can render.
 
-This layer is not a full remote backend. It does not implement SSH, SFTP,
-credential vaults, Docker Compose lifecycle, vLLM lifecycle, remote OpenEvo
-service startup, or UI. Those components should consume this executor contract
-instead of reimplementing sidecar plan parsing.
+This layer is not a full remote backend. The first concrete SSH transport is
+documented in `docs/architecture/openevo-desktop-ssh-transport-foundation.md`,
+but credential vaults, Docker Compose lifecycle, vLLM lifecycle, remote OpenEvo
+service startup, and UI still sit above this contract. Those components should
+consume this executor contract instead of reimplementing sidecar plan parsing.
 
 ## Transport Boundary
 
@@ -22,7 +23,8 @@ class RemoteExecutorTransport(Protocol):
     def upload_dir(local_path, remote_path) -> None: ...
 ```
 
-The same transport can be adapted to SSH later, but tests use in-memory fakes.
+Concrete transports include the dry-run CLI transport and the subprocess-backed
+SSH transport. Unit tests still use in-memory fakes for deterministic coverage.
 Command failures should be represented as `RemoteCommandResult` values whenever
 possible. Transport exceptions are caught by executor boundaries and turned into
 structured failure reports.
@@ -64,9 +66,17 @@ openevo sidecar execute science.yaml --remote-profile remote.yaml --json
 ```
 
 By default, the CLI uses a local dry-run transport. It can build the same report
-shape as a future SSH transport without opening network connections. The command
-is therefore useful for Desktop/backend integration tests and local inspection,
-but it is not a real remote executor yet.
+shape without opening network connections, so it remains useful for
+Desktop/backend integration tests and local inspection.
+
+To opt into real SSH execution:
+
+```bash
+openevo sidecar execute science.yaml --remote-profile remote.yaml --transport ssh --json
+```
+
+The SSH transport is documented separately and requires local OpenSSH plus
+rsync.
 
 To skip preflight and inspect workspace execution:
 
@@ -78,10 +88,8 @@ Without `--json`, the report is printed as YAML.
 
 ## Limitations
 
-This slice does not include:
+This foundation still does not include:
 
-- SSH client implementation;
-- SFTP/rsync upload implementation;
 - local credential vault or keychain integration;
 - remote dependency installation or repair;
 - Docker daemon or Compose lifecycle management;
@@ -89,8 +97,8 @@ This slice does not include:
 - remote OpenEvo backend startup;
 - Desktop UI.
 
-The next release slices can add concrete transports and lifecycle managers behind
-the protocol introduced here.
+The next release slices can add lifecycle managers behind the protocol
+introduced here.
 
 ## Verification
 

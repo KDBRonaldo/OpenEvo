@@ -6,6 +6,7 @@ from pathlib import Path
 import yaml
 
 from openevo.cli import main
+from openevo.remote import RemoteCommandResult
 
 
 def _write_config(path: Path, payload: dict) -> Path:
@@ -37,6 +38,35 @@ def _minimal_science_payload() -> dict:
             },
         },
     }
+
+
+class _CliRecordingSshTransport:
+    profiles = []
+
+    def __init__(self, profile) -> None:
+        self.profiles.append(profile)
+
+    def run(
+        self,
+        command,
+        *,
+        cwd=None,
+        env=None,
+        timeout_seconds=30.0,
+    ):
+        if command == 'df -Pk "$HOME"':
+            return RemoteCommandResult(
+                command=command,
+                return_code=0,
+                stdout=(
+                    "Filesystem 1024-blocks Used Available Capacity Mounted on\n"
+                    "/dev/root 100000000 1 99999999 1% /home\n"
+                ),
+            )
+        return RemoteCommandResult(command=command, return_code=0, stdout="ok")
+
+    def upload_dir(self, local_path, remote_path):
+        return None
 
 
 def test_cli_dry_run_json_outputs_compiled_plan(
@@ -313,3 +343,43 @@ def test_cli_sidecar_execute_default_preflight_uses_parseable_dry_run_output(
     assert payload["preflight"]["ready"] is True
     assert {check["status"] for check in payload["preflight"]["checks"]} == {"pass"}
     assert payload["workspace"]["actions"][0]["status"] == "skip"
+
+
+def test_cli_sidecar_execute_transport_ssh_uses_ssh_transport(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+) -> None:
+    _CliRecordingSshTransport.profiles = []
+    monkeypatch.setattr(
+        "openevo.cli.SshRemoteExecutorTransport",
+        _CliRecordingSshTransport,
+    )
+    science_path = _write_config(tmp_path / "science.yaml", _minimal_science_payload())
+    profile_path = _write_config(
+        tmp_path / "remote.yaml",
+        {
+            "version": 1,
+            "id": "science-team",
+            "host": "gpu.example.edu",
+            "user": "alice",
+        },
+    )
+
+    exit_code = main(
+        [
+            "sidecar",
+            "execute",
+            str(science_path),
+            "--remote-profile",
+            str(profile_path),
+            "--transport",
+            "ssh",
+            "--json",
+        ]
+    )
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ready"] is True
+    assert _CliRecordingSshTransport.profiles[0].id == "science-team"

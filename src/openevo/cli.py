@@ -14,6 +14,7 @@ from openevo.experiment.models import load_experiment_config
 from openevo.experiment.runner import dry_run_experiment, run_experiment
 from openevo.remote import (
     RemoteCommandResult,
+    SshRemoteExecutorTransport,
     execute_sidecar_plan,
 )
 from openevo.science import (
@@ -107,7 +108,7 @@ def build_parser() -> argparse.ArgumentParser:
     plan_parser.add_argument("--json", action="store_true", help="Print JSON output.")
     execute_parser = sidecar_subparsers.add_parser(
         "execute",
-        help="Build a sidecar plan and execute it through the local dry-run transport.",
+        help="Build a sidecar plan and execute it through a selected transport.",
     )
     execute_parser.add_argument("config", help="Path to science project YAML.")
     execute_parser.add_argument(
@@ -119,6 +120,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--skip-preflight",
         action="store_true",
         help="Skip remote preflight before workspace preparation.",
+    )
+    execute_parser.add_argument(
+        "--transport",
+        choices=("dry-run", "ssh"),
+        default="dry-run",
+        help="Remote executor transport to use. Defaults to dry-run.",
     )
     execute_parser.add_argument("--json", action="store_true", help="Print JSON output.")
     return parser
@@ -228,7 +235,7 @@ def _handle_sidecar_execute(args: argparse.Namespace) -> int:
     plan = build_sidecar_science_plan(project, profile)
     report = execute_sidecar_plan(
         plan,
-        _CliDryRunTransport(),
+        _sidecar_transport(args, profile),
         run_remote_preflight=not args.skip_preflight,
     )
     result = report.model_dump(mode="json")
@@ -237,6 +244,14 @@ def _handle_sidecar_execute(args: argparse.Namespace) -> int:
         return 0 if report.ready else 1
     print(yaml.safe_dump(result, sort_keys=True), end="")
     return 0 if report.ready else 1
+
+
+def _sidecar_transport(args: argparse.Namespace, profile):
+    if args.transport == "dry-run":
+        return _CliDryRunTransport()
+    if args.transport == "ssh":
+        return SshRemoteExecutorTransport(profile)
+    raise ValueError(f"Unknown sidecar transport: {args.transport}")
 
 
 class _CliDryRunTransport:
