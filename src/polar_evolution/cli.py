@@ -355,6 +355,22 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     tb_parametric_job.add_argument(
+        "--training-corrective-strip-input-tool-result-payload",
+        action="store_true",
+        help=(
+            "Strip appended Tool result payload sections from tool-result input "
+            "messages exported with terminal_bench_corrective_tool_call_policy."
+        ),
+    )
+    tb_parametric_job.add_argument(
+        "--training-corrective-max-input-tool-content-chars",
+        type=int,
+        help=(
+            "Maximum characters to keep in each tool-result input message exported "
+            "with terminal_bench_corrective_tool_call_policy."
+        ),
+    )
+    tb_parametric_job.add_argument(
         "--training-corrective-target-command",
         help=(
             "Target tb_exec command for terminal_bench_corrective_tool_call_policy."
@@ -452,6 +468,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--training-recipe-max-input-tool-messages",
         type=int,
         help="Keep only the last N tool-result input messages in recipe stages.",
+    )
+    tb_parametric_job.add_argument(
+        "--training-recipe-strip-input-tool-result-payload",
+        action="store_true",
+        help=(
+            "Strip appended Tool result payload sections from tool-result input "
+            "messages in recipe stages."
+        ),
+    )
+    tb_parametric_job.add_argument(
+        "--training-recipe-max-input-tool-content-chars",
+        type=int,
+        help="Maximum characters to keep in each tool-result input message in recipe stages.",
     )
     tb_parametric_job.add_argument("--run-worker", action="store_true")
     tb_parametric_job.add_argument("--job-name")
@@ -1447,6 +1476,12 @@ def _create_terminal_bench_parametric_memory_job(args: argparse.Namespace) -> di
                 config["training_projection"]["max_input_tool_messages"] = (
                     args.training_corrective_max_input_tool_messages
                 )
+            if args.training_corrective_strip_input_tool_result_payload:
+                config["training_projection"]["strip_input_tool_result_payload"] = True
+            if args.training_corrective_max_input_tool_content_chars is not None:
+                config["training_projection"]["max_input_tool_content_chars"] = (
+                    args.training_corrective_max_input_tool_content_chars
+                )
     if args.training_projection == "terminal_bench_password_recovery_shorttarget_recipe":
         if not args.training_recipe_target_command:
             raise ValueError(
@@ -1478,6 +1513,12 @@ def _create_terminal_bench_parametric_memory_job(args: argparse.Namespace) -> di
         if args.training_recipe_max_input_tool_messages is not None:
             recipe_projection["max_input_tool_messages"] = (
                 args.training_recipe_max_input_tool_messages
+            )
+        if args.training_recipe_strip_input_tool_result_payload:
+            recipe_projection["strip_input_tool_result_payload"] = True
+        if args.training_recipe_max_input_tool_content_chars is not None:
+            recipe_projection["max_input_tool_content_chars"] = (
+                args.training_recipe_max_input_tool_content_chars
             )
         config["training_projection"] = _parametric_memory_training_projection(
             recipe_projection

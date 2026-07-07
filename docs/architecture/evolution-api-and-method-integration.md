@@ -526,12 +526,19 @@ settings 或 metadata 标记 subscription auth 时跳过 `parametric_memory` art
   该 projection 使用 opt-in 保存到 trace metadata 的 compact `llm_calls`，从真实
   `system/user/tool...` prefix 导出监督 next tool-call。它可以消费 failed/zero-reward
   records，并可用 `input_contains` 过滤 prefix；长 prefix 可用 `max_input_tool_messages`
-  保留最近 N 条 tool result，以避免 LoRA trainer 在长上下文上 OOM。这一路径用于修正本地
+  保留最近 N 条 tool result，以避免 LoRA trainer 在长上下文上 OOM。Terminal Bench bridge
+  写入的 tool message 可能在 compact stdout 后追加 `Tool result payload` 原始 JSON，
+  如果这导致训练 prefix 与 runtime `llm_calls` prefix 不一致，可设置
+  `strip_input_tool_result_payload=true` 剥离该追加段，并用
+  `max_input_tool_content_chars=N` 对每条 tool-result input content 做字符级上限裁剪。
+  剥离和裁剪发生在 `input_contains` 过滤前，因此过滤词应匹配最终导出的 prefix。
+  这一路径用于修正本地
   推理策略，不改变默认 successful-only SFT 导出；也可以设置 `stages` 列表，把多个
   corrective 目标放在同一 projection 中。每个 stage 支持 `name`、二选一的
   `target_tool_call` 或 `target_assistant_message`、`input_contains`、`max_examples`、
-  `repeat`、`max_input_tool_messages` 和 `synthetic_tool_results`，worker 会按 stage
-  独立扫描 saved `llm_calls`，并给导出的 JSONL metadata 标记 stage 和 repeat index。
+  `repeat`、`max_input_tool_messages`、`strip_input_tool_result_payload`、
+  `max_input_tool_content_chars` 和 `synthetic_tool_results`，worker 会按 stage 独立扫描
+  saved `llm_calls`，并给导出的 JSONL metadata 标记 stage 和 repeat index。
   `synthetic_tool_results` 只追加到导出的 SFT prefix 中，用于补齐真实 rollout 没有到达的
   finish-boundary context，例如 synthetic `tb_run_tests` result 后监督
   `tb_collect_result`。

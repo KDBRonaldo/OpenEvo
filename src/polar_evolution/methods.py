@@ -1756,6 +1756,17 @@ def _parametric_memory_training_projection(value: Any) -> dict[str, Any]:
                 "arguments": target_tool_arguments,
             },
         }
+        if bool(value.get("strip_input_tool_result_payload", False)):
+            projection["strip_input_tool_result_payload"] = True
+        max_input_tool_content_chars = _optional_positive_int_config(
+            value.get("max_input_tool_content_chars"),
+            field_name=(
+                "terminal_bench_corrective_tool_call_policy "
+                "max_input_tool_content_chars"
+            ),
+        )
+        if max_input_tool_content_chars is not None:
+            projection["max_input_tool_content_chars"] = max_input_tool_content_chars
         max_input_tool_messages = value.get("max_input_tool_messages")
         if max_input_tool_messages is not None:
             max_input_tool_messages = int(max_input_tool_messages)
@@ -1846,6 +1857,16 @@ def _parametric_memory_password_recovery_shorttarget_recipe(
                 "max_input_tool_messages"
             ),
         )
+    strip_input_tool_result_payload = bool(
+        value.get("strip_input_tool_result_payload", False)
+    )
+    max_input_tool_content_chars = _optional_positive_int_config(
+        value.get("max_input_tool_content_chars"),
+        field_name=(
+            "terminal_bench_password_recovery_shorttarget_recipe "
+            "max_input_tool_content_chars"
+        ),
+    )
 
     recipe: dict[str, Any] = {
         "type": "terminal_bench_password_recovery_shorttarget_recipe",
@@ -1862,6 +1883,10 @@ def _parametric_memory_password_recovery_shorttarget_recipe(
     }
     if max_input_tool_messages is not None:
         recipe["max_input_tool_messages"] = max_input_tool_messages
+    if strip_input_tool_result_payload:
+        recipe["strip_input_tool_result_payload"] = True
+    if max_input_tool_content_chars is not None:
+        recipe["max_input_tool_content_chars"] = max_input_tool_content_chars
 
     stages: list[dict[str, Any]] = [
         {
@@ -1907,6 +1932,12 @@ def _parametric_memory_password_recovery_shorttarget_recipe(
     if max_input_tool_messages is not None:
         for stage in stages:
             stage["max_input_tool_messages"] = max_input_tool_messages
+    if strip_input_tool_result_payload:
+        for stage in stages:
+            stage["strip_input_tool_result_payload"] = True
+    if max_input_tool_content_chars is not None:
+        for stage in stages:
+            stage["max_input_tool_content_chars"] = max_input_tool_content_chars
 
     return {
         "type": "terminal_bench_corrective_tool_call_policy",
@@ -1926,6 +1957,12 @@ def _positive_int_config(value: Any, *, field_name: str) -> int:
     if parsed <= 0:
         raise ValueError(f"parametric_memory_lora_sft {field_name} must be positive")
     return parsed
+
+
+def _optional_positive_int_config(value: Any, *, field_name: str) -> int | None:
+    if value is None:
+        return None
+    return _positive_int_config(value, field_name=field_name)
 
 
 def _string_list_or_default(value: Any, default: list[str]) -> list[str]:
@@ -2011,6 +2048,17 @@ def _parametric_memory_corrective_projection_stage(
                 "stage.max_input_tool_messages must be positive"
             )
         projection["max_input_tool_messages"] = max_input_tool_messages
+    if bool(value.get("strip_input_tool_result_payload", False)):
+        projection["strip_input_tool_result_payload"] = True
+    max_input_tool_content_chars = _optional_positive_int_config(
+        value.get("max_input_tool_content_chars"),
+        field_name=(
+            "terminal_bench_corrective_tool_call_policy "
+            "stage.max_input_tool_content_chars"
+        ),
+    )
+    if max_input_tool_content_chars is not None:
+        projection["max_input_tool_content_chars"] = max_input_tool_content_chars
     synthetic_tool_results = _parametric_memory_synthetic_tool_results(
         value.get("synthetic_tool_results")
     )
@@ -2247,6 +2295,10 @@ def _terminal_bench_corrective_tool_call_policy_message_sets(
             input_messages = _terminal_bench_corrective_input_messages(
                 llm_call.get("input_messages"),
                 max_tool_messages=stage.get("max_input_tool_messages"),
+                strip_tool_result_payload=bool(
+                    stage.get("strip_input_tool_result_payload", False)
+                ),
+                max_tool_content_chars=stage.get("max_input_tool_content_chars"),
             )
             if not input_messages:
                 continue
@@ -2319,9 +2371,13 @@ def _terminal_bench_corrective_input_messages(
     value: Any,
     *,
     max_tool_messages: Any = None,
+    strip_tool_result_payload: bool = False,
+    max_tool_content_chars: Any = None,
 ) -> list[dict[str, Any]]:
     if not isinstance(value, list):
         return []
+    if max_tool_content_chars is not None:
+        max_tool_content_chars = int(max_tool_content_chars)
     messages: list[dict[str, Any]] = []
     for message in value:
         if not isinstance(message, dict):
@@ -2329,12 +2385,20 @@ def _terminal_bench_corrective_input_messages(
         role = message.get("role")
         if not isinstance(role, str) or not role.strip():
             continue
+        role = role.strip()
         content = message.get("content")
         if content is None:
             content = ""
+        content_text = str(content)
+        if role == "tool":
+            content_text = _terminal_bench_corrective_tool_content(
+                content_text,
+                strip_tool_result_payload=strip_tool_result_payload,
+                max_tool_content_chars=max_tool_content_chars,
+            )
         compact: dict[str, Any] = {
-            "role": role.strip(),
-            "content": str(content),
+            "role": role,
+            "content": content_text,
         }
         name = message.get("name")
         if isinstance(name, str) and name.strip():
@@ -2355,6 +2419,27 @@ def _terminal_bench_corrective_input_messages(
         for index, message in enumerate(messages)
         if message.get("role") != "tool" or index in keep_tool_indexes
     ]
+
+
+def _terminal_bench_corrective_tool_content(
+    content: str,
+    *,
+    strip_tool_result_payload: bool,
+    max_tool_content_chars: int | None,
+) -> str:
+    if strip_tool_result_payload:
+        for marker in (
+            "\n\nTool result payload:\n",
+            "\nTool result payload:\n",
+            "Tool result payload:\n",
+        ):
+            head, separator, _tail = content.partition(marker)
+            if separator:
+                content = head
+                break
+    if max_tool_content_chars is not None:
+        content = content[:max_tool_content_chars]
+    return content
 
 
 def _terminal_bench_openai_tools_from_specs(value: Any) -> list[dict[str, Any]]:

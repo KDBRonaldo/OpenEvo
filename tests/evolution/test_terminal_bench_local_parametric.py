@@ -1510,6 +1510,9 @@ def test_terminal_bench_parametric_memory_job_accepts_corrective_tool_call_polic
             "3",
             "--training-corrective-max-input-tool-messages",
             "4",
+            "--training-corrective-strip-input-tool-result-payload",
+            "--training-corrective-max-input-tool-content-chars",
+            "384",
             "--training-corrective-target-command",
             "printf '%s\\n' 8XDP5Q2RT9ZK7VB3BV4WW54 > /app/recovered_passwords.txt",
             "--output",
@@ -1525,6 +1528,8 @@ def test_terminal_bench_parametric_memory_job_accepts_corrective_tool_call_polic
         "input_contains": ["PASSWORD=.*"],
         "max_examples": 3,
         "max_input_tool_messages": 4,
+        "strip_input_tool_result_payload": True,
+        "max_input_tool_content_chars": 384,
         "target_tool_call": {
             "name": "tb_exec",
             "arguments": {
@@ -1796,6 +1801,9 @@ def test_terminal_bench_parametric_memory_job_accepts_password_recovery_recipe(
             "1",
             "--training-recipe-max-input-tool-messages",
             "2",
+            "--training-recipe-strip-input-tool-result-payload",
+            "--training-recipe-max-input-tool-content-chars",
+            "512",
             "--output",
             str(output),
         ]
@@ -1819,6 +1827,8 @@ def test_terminal_bench_parametric_memory_job_accepts_password_recovery_recipe(
             "correction_max_examples": 1,
             "correction_repeat": 1,
             "max_input_tool_messages": 2,
+            "strip_input_tool_result_payload": True,
+            "max_input_tool_content_chars": 512,
         },
         "stages": [
             {
@@ -1827,6 +1837,8 @@ def test_terminal_bench_parametric_memory_job_accepts_password_recovery_recipe(
                 "max_examples": 1,
                 "repeat": 1,
                 "max_input_tool_messages": 2,
+                "strip_input_tool_result_payload": True,
+                "max_input_tool_content_chars": 512,
                 "target_tool_call": {
                     "name": "tb_read_task",
                     "arguments": {"task_id": "terminal-bench-task"},
@@ -1838,6 +1850,8 @@ def test_terminal_bench_parametric_memory_job_accepts_password_recovery_recipe(
                 "max_examples": 1,
                 "repeat": 2,
                 "max_input_tool_messages": 2,
+                "strip_input_tool_result_payload": True,
+                "max_input_tool_content_chars": 512,
                 "target_tool_call": {
                     "name": "tb_exec",
                     "arguments": {
@@ -1852,6 +1866,8 @@ def test_terminal_bench_parametric_memory_job_accepts_password_recovery_recipe(
                 "max_examples": 1,
                 "repeat": 1,
                 "max_input_tool_messages": 2,
+                "strip_input_tool_result_payload": True,
+                "max_input_tool_content_chars": 512,
                 "target_tool_call": {
                     "name": "tb_exec",
                     "arguments": {

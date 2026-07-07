@@ -222,13 +222,21 @@ records again include top-level `tools` and require trainer-side
 can exceed 13k tokens, so use `max_input_tool_messages` or the CLI
 `--training-corrective-max-input-tool-messages` to keep the system/user prompt
 and only the most recent tool-result messages when the trainer cannot fit the
-full prefix.
+full prefix. If the saved training prefix contains bridge-only appended
+`Tool result payload` sections that are absent from live runtime `llm_calls`,
+also set `strip_input_tool_result_payload=true` or pass
+`--training-corrective-strip-input-tool-result-payload`. Use
+`max_input_tool_content_chars` or
+`--training-corrective-max-input-tool-content-chars` to cap each tool-result
+input message after optional payload stripping. `input_contains` is evaluated
+after these shaping steps, so filters should match the final exported prefix.
 For stage-aware corrective SFT, set
 `{"type": "terminal_bench_corrective_tool_call_policy", "stages": [...]}`.
 Each stage has `name`, exactly one of `target_tool_call` or
 `target_assistant_message`, optional `input_contains`, `max_examples` (default
-64), `repeat` (default 1), optional `max_input_tool_messages`, and optional
-`synthetic_tool_results`. Synthetic tool results are appended only to the
+64), `repeat` (default 1), optional `max_input_tool_messages`, optional
+`strip_input_tool_result_payload`, optional `max_input_tool_content_chars`, and
+optional `synthetic_tool_results`. Synthetic tool results are appended only to the
 exported SFT prefix before the target assistant action; they are useful for
 finish-boundary records such as "tests passed -> collect result -> stop" when a
 real rollout never reached that later prefix. The exporter scans the saved
@@ -248,7 +256,12 @@ read output, and an optional `correct_back_to_short_exec` target when
 `static-terminal-bench-harbor` for the read stage and `recovered_passwords.txt`
 for the after-read stage; the target command still must be provided explicitly
 and should derive `/app/recovered_passwords.txt` from task files rather than
-embed a protected answer.
+embed a protected answer. Recipe configs and CLI accept the same tool-prefix
+shaping knobs via `strip_input_tool_result_payload`,
+`max_input_tool_content_chars`,
+`--training-recipe-strip-input-tool-result-payload`, and
+`--training-recipe-max-input-tool-content-chars`; the recipe copies them into
+every generated corrective stage.
 For Qwen chat-template SFT, the trainer must not derive the loss mask by
 tokenizing the full conversation and a generation prefix independently and then
 masking by prefix token count. BPE can merge the prompt-ending newline with the
@@ -537,6 +550,8 @@ uv run polar-evolution terminal-bench-parametric-memory-job \
   --training-recipe-after-read-repeat 6 \
   --training-recipe-correction-input-contains 'Dummy entry' \
   --training-recipe-max-input-tool-messages 5 \
+  --training-recipe-strip-input-tool-result-payload \
+  --training-recipe-max-input-tool-content-chars 512 \
   --run-worker \
   --output /tmp/tb21-parametric-memory-corrective/job.json
 ```
@@ -829,6 +844,16 @@ drifted from the trained `varsea/disks` and `8XD...W54` pattern toward
 `varsea/disconnected` and numeric fragments. Treat this as evidence that the
 Qwen3.5 static-node adapter is active but not yet a usable task-local memory
 method.
+
+Inspection of the static-node adapter's `training.jsonl` versus the live
+treatment `llm_calls` found a second, earlier alignment issue: the training
+tool-result prefix included a duplicated appended `Tool result payload` section,
+while the runtime prefix contained only the compact tool message. Exact-prefix
+HF/PEFT and vLLM probes therefore showed the adapter could memorize the shaped
+training prefix, but full Terminal-Bench evaluation queried a different prefix.
+For follow-up Qwen3.5 password-recovery recipe runs, use the recipe shaping
+flags above so the SFT records strip appended payloads and cap tool-result
+content before filtering and training.
 
 Evaluate baseline local Qwen and adapter local Qwen against the same subset:
 

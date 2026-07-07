@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -2935,7 +2936,7 @@ def test_parametric_memory_lora_sft_exports_dataset_and_registers_adapter(tmp_pa
             "base_model": "Qwen/Qwen3.6-35B-A3B",
             "output_adapter_id": "tb-memory-lora",
             "trainer": {
-                "command": "python",
+                "command": sys.executable,
                 "args": [
                     str(trainer_script),
                     "--train-file",
@@ -3043,7 +3044,7 @@ def test_parametric_memory_lora_sft_exports_every_successful_trace(tmp_path: Pat
         config={
             "base_model": "Qwen/Qwen3.6-35B-A3B",
             "trainer": {
-                "command": "python",
+                "command": sys.executable,
                 "args": [
                     str(trainer_script),
                     "--train-file",
@@ -3148,7 +3149,7 @@ def test_parametric_memory_lora_sft_full_trace_preserves_trace_tools(tmp_path: P
             "base_model": "Qwen/Qwen3.6-35B-A3B",
             "training_projection": {"type": "full_trace"},
             "trainer": {
-                "command": "python",
+                "command": sys.executable,
                 "args": [
                     str(trainer_script),
                     "--train-file",
@@ -3229,7 +3230,7 @@ def test_parametric_memory_lora_sft_can_project_response_tail(tmp_path: Path):
                 "response_tail_chars": 36,
             },
             "trainer": {
-                "command": "python",
+                "command": sys.executable,
                 "args": [
                     str(trainer_script),
                     "--train-file",
@@ -3363,7 +3364,7 @@ def test_parametric_memory_lora_sft_can_project_terminal_bench_final_actions(
                 "max_output_chars": 32,
             },
             "trainer": {
-                "command": "python",
+                "command": sys.executable,
                 "args": [
                     str(trainer_script),
                     "--train-file",
@@ -3477,7 +3478,7 @@ def test_parametric_memory_lora_sft_can_project_terminal_bench_tool_call_policy(
                 "max_commands": 1,
             },
             "trainer": {
-                "command": "python",
+                "command": sys.executable,
                 "args": [
                     str(trainer_script),
                     "--train-file",
@@ -3635,7 +3636,7 @@ def test_parametric_memory_lora_sft_can_project_corrective_tool_call_policy(
                 },
             },
             "trainer": {
-                "command": "python",
+                "command": sys.executable,
                 "args": [
                     str(trainer_script),
                     "--train-file",
@@ -3781,7 +3782,7 @@ def test_parametric_memory_lora_sft_corrective_projection_can_keep_recent_tool_m
                 },
             },
             "trainer": {
-                "command": "python",
+                "command": sys.executable,
                 "args": [
                     str(trainer_script),
                     "--train-file",
@@ -3816,6 +3817,118 @@ def test_parametric_memory_lora_sft_corrective_projection_can_keep_recent_tool_m
     assert "grep -a -o" in messages[2]["content"]
     assert "find /app" not in json.dumps(training_line)
     assert artifact.manifest["training_projection"]["max_input_tool_messages"] == 1
+
+
+def test_parametric_memory_lora_sft_corrective_projection_can_shape_tool_content(
+    tmp_path: Path,
+):
+    trainer_script = tmp_path / "fake_trainer.py"
+    trainer_script.write_text(
+        "from pathlib import Path\n"
+        "import argparse\n"
+        "parser = argparse.ArgumentParser()\n"
+        "parser.add_argument('--train-file')\n"
+        "parser.add_argument('--output-dir')\n"
+        "args = parser.parse_args()\n"
+        "Path(args.output_dir).mkdir(parents=True, exist_ok=True)\n"
+        "(Path(args.output_dir) / 'adapter_config.json').write_text('{}')\n",
+        encoding="utf-8",
+    )
+    dataset = _parametric_dataset_artifact(
+        tmp_path,
+        [
+            {
+                "event_id": "evt_corrective_shape_tool",
+                "task_id": "terminal-bench/password-recovery",
+                "session_id": "password-recovery__failed",
+                "status": "COMPLETED",
+                "reward": 0.0,
+                "traces": [
+                    {
+                        "metadata": {
+                            "llm_calls": [
+                                {
+                                    "input_messages": [
+                                        {"role": "system", "content": "Use tools."},
+                                        {"role": "user", "content": "Recover password."},
+                                        {
+                                            "role": "tool",
+                                            "name": "tb_read_task",
+                                            "tool_call_id": "call-read",
+                                            "content": (
+                                                '{"task_yaml": "recover", '
+                                                '"stdout": "visible inventory"}'
+                                                "\n\nTool result payload:\n"
+                                                '{"schema_version": "v1", '
+                                                '"duplicated": true}'
+                                            ),
+                                        },
+                                    ],
+                                    "metadata": {"step_index": 1},
+                                }
+                            ],
+                        },
+                    }
+                ],
+            }
+        ],
+    )
+    job = _job(
+        "parametric_memory_lora_sft",
+        tmp_path,
+        input_artifacts=[dataset],
+        config={
+            "base_model": "Qwen/Qwen3.6-35B-A3B",
+            "training_projection": {
+                "type": "terminal_bench_corrective_tool_call_policy",
+                "input_contains": ["recover"],
+                "max_examples": 1,
+                "strip_input_tool_result_payload": True,
+                "max_input_tool_content_chars": 40,
+                "target_tool_call": {
+                    "name": "tb_exec",
+                    "arguments": {
+                        "task_id": "terminal-bench-task",
+                        "command": "printf ok > /app/recovered_passwords.txt",
+                    },
+                },
+            },
+            "trainer": {
+                "command": sys.executable,
+                "args": [
+                    str(trainer_script),
+                    "--train-file",
+                    "{training_dataset}",
+                    "--output-dir",
+                    "{adapter_dir}",
+                ],
+            },
+        },
+    )
+
+    [artifact] = run_method(job, artifact_root=tmp_path / "artifacts")
+
+    train_path = (
+        tmp_path
+        / "artifacts"
+        / "workers"
+        / job.job_id
+        / "parametric_memory_lora_sft"
+        / "training.jsonl"
+    )
+    [training_line] = [
+        json.loads(line) for line in train_path.read_text(encoding="utf-8").splitlines()
+    ]
+    tool_message = training_line["messages"][2]
+    assert tool_message["role"] == "tool"
+    assert tool_message["content"] == '{"task_yaml": "recover", "stdout": "visi'
+    assert "Tool result payload" not in json.dumps(training_line)
+    assert artifact.manifest["training_projection"][
+        "strip_input_tool_result_payload"
+    ] is True
+    assert artifact.manifest["training_projection"][
+        "max_input_tool_content_chars"
+    ] == 40
 
 
 def test_parametric_memory_lora_sft_corrective_projection_can_export_weighted_stages(
@@ -3952,7 +4065,7 @@ def test_parametric_memory_lora_sft_corrective_projection_can_export_weighted_st
                 ],
             },
             "trainer": {
-                "command": "python",
+                "command": sys.executable,
                 "args": [
                     str(trainer_script),
                     "--train-file",
@@ -4100,7 +4213,7 @@ def test_parametric_memory_lora_sft_corrective_projection_can_export_finish_mess
                 ],
             },
             "trainer": {
-                "command": "python",
+                "command": sys.executable,
                 "args": [
                     str(trainer_script),
                     "--train-file",
@@ -4219,7 +4332,7 @@ def test_parametric_memory_lora_sft_corrective_projection_can_insert_synthetic_t
                 ],
             },
             "trainer": {
-                "command": "python",
+                "command": sys.executable,
                 "args": [
                     str(trainer_script),
                     "--train-file",
@@ -4413,7 +4526,7 @@ def test_parametric_memory_lora_sft_password_recovery_recipe_exports_mixed_recor
                 "max_input_tool_messages": 2,
             },
             "trainer": {
-                "command": "python",
+                "command": sys.executable,
                 "args": [
                     str(trainer_script),
                     "--train-file",
@@ -4579,7 +4692,7 @@ def test_parametric_memory_lora_sft_requires_trainer_output_adapter(tmp_path: Pa
         config={
             "base_model": "Qwen/Qwen3.6-35B-A3B",
             "trainer": {
-                "command": "python",
+                "command": sys.executable,
                 "args": [
                     str(trainer_script),
                     "{training_dataset}",
@@ -4603,7 +4716,7 @@ def test_parametric_memory_lora_sft_reports_trainer_nonzero_exit(tmp_path: Path)
         config={
             "base_model": "Qwen/Qwen3.6-35B-A3B",
             "trainer": {
-                "command": "python",
+                "command": sys.executable,
                 "args": [str(trainer_script), "{training_dataset}", "{adapter_dir}"],
             },
         },
@@ -4630,7 +4743,7 @@ def test_parametric_memory_lora_sft_rejects_invalid_adapter_output(tmp_path: Pat
         config={
             "base_model": "Qwen/Qwen3.6-35B-A3B",
             "trainer": {
-                "command": "python",
+                "command": sys.executable,
                 "args": [str(trainer_script), "{training_dataset}", "{adapter_dir}"],
             },
         },
@@ -4650,7 +4763,7 @@ def test_parametric_memory_lora_sft_cleans_stale_adapter_output(tmp_path: Path):
         config={
             "base_model": "Qwen/Qwen3.6-35B-A3B",
             "trainer": {
-                "command": "python",
+                "command": sys.executable,
                 "args": [str(trainer_script), "{training_dataset}", "{adapter_dir}"],
             },
         },
@@ -4686,7 +4799,7 @@ def test_parametric_memory_lora_sft_trainer_timeout(tmp_path: Path):
         config={
             "base_model": "Qwen/Qwen3.6-35B-A3B",
             "trainer": {
-                "command": "python",
+                "command": sys.executable,
                 "args": [str(trainer_script), "{training_dataset}", "{adapter_dir}"],
                 "timeout_seconds": 0.1,
             },
