@@ -142,13 +142,22 @@ class OpenEvoDesktopBootstrapResponse(_StrictFrozenModel):
     status: OpenEvoDesktopShellStatus
 
 
+class OpenEvoDesktopWorkspaceResponse(_StrictFrozenModel):
+    workspace: dict[str, Any]
+    report: dict[str, Any]
+    status: OpenEvoDesktopShellStatus
+
+
 @dataclass
 class OpenEvoSidecarSession:
     project: ScienceProjectConfig
     profile: RemoteProfileConfig
     transport_factory: Callable[[RemoteProfileConfig], RemoteExecutorTransport]
     status: OpenEvoDesktopShellStatus
+    last_workspace_report: object | None = None
     last_bootstrap_report: object | None = None
+    status_lock: LockType = field(default_factory=Lock)
+    workspace_lock: LockType = field(default_factory=Lock)
     bootstrap_lock: LockType = field(default_factory=Lock)
 
 
@@ -298,8 +307,47 @@ def create_sidecar_app(
     )
     def desktop_shell() -> OpenEvoDesktopShellStatus:
         if session is not None:
-            return _status_with_mutation_token(session.status, sidecar_token)
+            with session.status_lock:
+                return _status_with_mutation_token(session.status, sidecar_token)
         return _status_with_mutation_token(desktop_status, sidecar_token)
+
+    @app.post(
+        "/openevo-api/desktop/workspace",
+        response_model=OpenEvoDesktopWorkspaceResponse,
+    )
+    def workspace(
+        token: str | None = Header(
+            default=None,
+            alias=SIDECAR_MUTATION_TOKEN_HEADER,
+        ),
+    ) -> OpenEvoDesktopWorkspaceResponse:
+        _validate_mutation_token(token, sidecar_token)
+        if session is None:
+            raise HTTPException(
+                status_code=409,
+                detail="Desktop workspace sync requires a config-backed sidecar session.",
+            )
+        if not session.workspace_lock.acquire(blocking=False):
+            raise HTTPException(
+                status_code=409,
+                detail="Desktop workspace sync is already running.",
+            )
+        try:
+            report = _run_workspace_sync(session)
+            with session.status_lock:
+                session.last_workspace_report = report
+                session.status = _status_after_workspace(session.status, report)
+                response_status = _status_with_mutation_token(
+                    session.status,
+                    sidecar_token,
+                )
+        finally:
+            session.workspace_lock.release()
+        return OpenEvoDesktopWorkspaceResponse(
+            workspace=_workspace_response_payload(report),
+            report=report.model_dump(mode="json"),
+            status=response_status,
+        )
 
     @app.post(
         "/openevo-api/desktop/bootstrap",
@@ -324,11 +372,15 @@ def create_sidecar_app(
             )
         try:
             report = _run_bootstrap(session)
-            session.last_bootstrap_report = report
-            session.status = _status_after_bootstrap(session.status, report)
+            with session.status_lock:
+                session.last_bootstrap_report = report
+                session.status = _status_after_bootstrap(session.status, report)
+                response_status = _status_with_mutation_token(
+                    session.status,
+                    sidecar_token,
+                )
         finally:
             session.bootstrap_lock.release()
-        response_status = _status_with_mutation_token(session.status, sidecar_token)
         return OpenEvoDesktopBootstrapResponse(
             bootstrap=response_status.bootstrap,
             report=report.model_dump(mode="json"),
@@ -474,6 +526,16 @@ def _run_bootstrap(session: OpenEvoSidecarSession):
     )
 
 
+def _run_workspace_sync(session: OpenEvoSidecarSession):
+    from openevo.remote.executor import execute_sidecar_plan
+
+    sidecar_plan = build_sidecar_science_plan(session.project, session.profile)
+    return execute_sidecar_plan(
+        sidecar_plan,
+        session.transport_factory(session.profile),
+    )
+
+
 def _mutation_token(value: str | None) -> str:
     if value is None:
         return secrets.token_urlsafe(32)
@@ -498,6 +560,62 @@ def _status_with_mutation_token(
     return status.model_copy(
         update={"sidecar": DesktopSidecarSecurity(mutation_token=token)}
     )
+
+
+def _workspace_response_payload(report) -> dict[str, Any]:
+    payload = report.workspace.model_dump(mode="json")
+    payload["ready"] = bool(report.ready)
+    return payload
+
+
+def _status_after_workspace(
+    status: OpenEvoDesktopShellStatus,
+    report,
+) -> OpenEvoDesktopShellStatus:
+    return status.model_copy(
+        update={
+            "services": tuple(
+                _service_after_workspace(service, report=report)
+                for service in status.services
+            ),
+        }
+    )
+
+
+def _service_after_workspace(
+    service: DesktopServiceStatus,
+    *,
+    report,
+) -> DesktopServiceStatus:
+    if service.id == "ssh" and report.preflight is not None:
+        if report.preflight.ready:
+            return service.model_copy(
+                update={"state": "ready", "detail": "Remote preflight passed"}
+            )
+        return service.model_copy(
+            update={"state": "blocked", "detail": "Remote preflight failed"}
+        )
+    if service.id == "workspace":
+        if report.ready:
+            detail = (
+                service.detail
+                if service.state == "ready"
+                else "Workspace prepared"
+            )
+            return service.model_copy(update={"state": "ready", "detail": detail})
+        return service.model_copy(
+            update={"state": "blocked", "detail": _workspace_blocked_detail(report)}
+        )
+    return service
+
+
+def _workspace_blocked_detail(report) -> str:
+    if report.preflight is not None and not report.preflight.ready:
+        return "Remote preflight failed"
+    for action in report.workspace.actions:
+        if action.status == "fail":
+            return action.message
+    return "Workspace preparation did not complete."
 
 
 def _status_after_bootstrap(

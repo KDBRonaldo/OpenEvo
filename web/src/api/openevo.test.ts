@@ -1,12 +1,17 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   fetchOpenEvoDesktopShellModel,
   runOpenEvoBootstrap,
+  runOpenEvoWorkspaceSync,
   toOpenEvoBootstrapResponse,
   toOpenEvoDesktopShellModel,
 } from "./openevo";
 
 describe("OpenEvo sidecar client", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
   it("maps sidecar shell status to the route model", () => {
     const model = toOpenEvoDesktopShellModel({
       remote: {
@@ -128,7 +133,7 @@ describe("OpenEvo sidecar client", () => {
   it("sends the sidecar mutation token on bootstrap requests", async () => {
     const calls: Array<{ path: string; headers: Headers }> = [];
     const shellPayload = sidecarShellPayload("token-123");
-    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(
+    vi.spyOn(globalThis, "fetch").mockImplementation(
       async (input, init) => {
         const path = String(input);
         calls.push({
@@ -155,7 +160,41 @@ describe("OpenEvo sidecar client", () => {
     expect(calls).toHaveLength(2);
     expect(calls[1]).toMatchObject({ path: "/openevo-api/desktop/bootstrap" });
     expect(calls[1].headers.get("X-OpenEvo-Sidecar-Token")).toBe("token-123");
-    fetchMock.mockRestore();
+  });
+
+  it("sends the sidecar mutation token on workspace sync requests", async () => {
+    const calls: Array<{ path: string; headers: Headers }> = [];
+    const shellPayload = sidecarShellPayload("workspace-token");
+    vi.spyOn(globalThis, "fetch").mockImplementation(
+      async (input, init) => {
+        const path = String(input);
+        calls.push({
+          path,
+          headers: new Headers(init?.headers),
+        });
+        if (path === "/openevo-api/desktop/shell") {
+          return jsonResponse(shellPayload);
+        }
+        if (path === "/openevo-api/desktop/workspace") {
+          return jsonResponse({
+            workspace: { ready: true, actions: [] },
+            report: { ready: true },
+            status: shellPayload,
+          });
+        }
+        return new Response("not found", { status: 404 });
+      },
+    );
+
+    await fetchOpenEvoDesktopShellModel();
+    const response = await runOpenEvoWorkspaceSync();
+
+    expect(response.workspace.ready).toBe(true);
+    expect(calls).toHaveLength(2);
+    expect(calls[1]).toMatchObject({ path: "/openevo-api/desktop/workspace" });
+    expect(calls[1].headers.get("X-OpenEvo-Sidecar-Token")).toBe(
+      "workspace-token",
+    );
   });
 });
 

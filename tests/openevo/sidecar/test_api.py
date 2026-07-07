@@ -247,6 +247,299 @@ def test_bootstrap_endpoint_keeps_unprepared_workspace_planned(
     }
 
 
+def test_workspace_endpoint_requires_config_backed_session() -> None:
+    client = TestClient(create_sidecar_app())
+    token = _sidecar_token(client)
+
+    response = client.post(
+        "/openevo-api/desktop/workspace",
+        headers={"X-OpenEvo-Sidecar-Token": token},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == (
+        "Desktop workspace sync requires a config-backed sidecar session."
+    )
+
+
+def test_workspace_endpoint_rejects_missing_sidecar_token() -> None:
+    project = ScienceProjectConfig.model_validate(_science_project_payload())
+    profile = _remote_profile()
+    client = TestClient(
+        create_sidecar_app_for_project(
+            project,
+            profile,
+            transport_factory=lambda _profile: _ApiDryRunTransport(),
+        )
+    )
+
+    response = client.post("/openevo-api/desktop/workspace")
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Invalid OpenEvo sidecar token."
+
+
+def test_workspace_endpoint_rejects_invalid_sidecar_token() -> None:
+    project = ScienceProjectConfig.model_validate(_science_project_payload())
+    profile = _remote_profile()
+    client = TestClient(
+        create_sidecar_app_for_project(
+            project,
+            profile,
+            transport_factory=lambda _profile: _ApiDryRunTransport(),
+        )
+    )
+
+    response = client.post(
+        "/openevo-api/desktop/workspace",
+        headers={"X-OpenEvo-Sidecar-Token": "wrong-token"},
+    )
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Invalid OpenEvo sidecar token."
+
+
+def test_workspace_endpoint_marks_remote_path_ready() -> None:
+    project = ScienceProjectConfig.model_validate(_science_project_payload())
+    profile = _remote_profile()
+    client = TestClient(
+        create_sidecar_app_for_project(
+            project,
+            profile,
+            transport_factory=lambda _profile: _ApiDryRunTransport(),
+        )
+    )
+    token = _sidecar_token(client)
+
+    response = client.post(
+        "/openevo-api/desktop/workspace",
+        headers={"X-OpenEvo-Sidecar-Token": token},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["workspace"]["ready"] is True
+    assert payload["workspace"]["actions"][0]["type"] == "use_remote_path"
+    assert payload["report"]["ready"] is True
+    assert payload["report"]["remote_profile_id"] == "science-team"
+    assert payload["report"]["task_id"] == "folding-baseline"
+    services = {service["id"]: service for service in payload["status"]["services"]}
+    assert services["workspace"] == {
+        "id": "workspace",
+        "label": "Workspace",
+        "state": "ready",
+        "detail": "Workspace source is already remote",
+    }
+
+
+def test_workspace_endpoint_uploads_local_folder_and_refreshes_status(
+    tmp_path: Path,
+) -> None:
+    local_source = tmp_path / "workflow"
+    local_source.mkdir()
+    project = ScienceProjectConfig.model_validate(
+        _science_project_payload()
+        | {
+            "task": {
+                "id": "local-workflow",
+                "objective": "Run the local workflow.",
+                "source": {"type": "local_folder", "path": str(local_source)},
+            }
+        }
+    )
+    profile = _remote_profile()
+    transport = _ApiDryRunTransport()
+    client = TestClient(
+        create_sidecar_app_for_project(
+            project,
+            profile,
+            transport_factory=lambda _profile: transport,
+        )
+    )
+    token = _sidecar_token(client)
+
+    response = client.post(
+        "/openevo-api/desktop/workspace",
+        headers={"X-OpenEvo-Sidecar-Token": token},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["workspace"]["ready"] is True
+    assert transport.uploads[0][0] == str(local_source)
+    services = {service["id"]: service for service in payload["status"]["services"]}
+    assert services["workspace"] == {
+        "id": "workspace",
+        "label": "Workspace",
+        "state": "ready",
+        "detail": "Workspace prepared",
+    }
+
+
+def test_workspace_endpoint_preserves_upload_failure_status(
+    tmp_path: Path,
+) -> None:
+    local_source = tmp_path / "workflow"
+    local_source.mkdir()
+    project = ScienceProjectConfig.model_validate(
+        _science_project_payload()
+        | {
+            "task": {
+                "id": "local-workflow",
+                "objective": "Run the local workflow.",
+                "source": {"type": "local_folder", "path": str(local_source)},
+            }
+        }
+    )
+    profile = _remote_profile()
+    client = TestClient(
+        create_sidecar_app_for_project(
+            project,
+            profile,
+            transport_factory=lambda _profile: _FailingUploadTransport(),
+        )
+    )
+    token = _sidecar_token(client)
+
+    response = client.post(
+        "/openevo-api/desktop/workspace",
+        headers={"X-OpenEvo-Sidecar-Token": token},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["workspace"]["ready"] is False
+    assert payload["report"]["ready"] is False
+    assert payload["report"]["workspace"]["actions"][0]["stderr"] == "upload failed"
+    services = {service["id"]: service for service in payload["status"]["services"]}
+    assert services["workspace"] == {
+        "id": "workspace",
+        "label": "Workspace",
+        "state": "blocked",
+        "detail": "upload failed",
+    }
+
+
+def test_workspace_endpoint_rejects_concurrent_runs(tmp_path: Path) -> None:
+    local_source = tmp_path / "workflow"
+    local_source.mkdir()
+    project = ScienceProjectConfig.model_validate(
+        _science_project_payload()
+        | {
+            "task": {
+                "id": "local-workflow",
+                "objective": "Run the local workflow.",
+                "source": {"type": "local_folder", "path": str(local_source)},
+            }
+        }
+    )
+    profile = _remote_profile()
+    transport = _BlockingWorkspaceTransport()
+    client = TestClient(
+        create_sidecar_app_for_project(
+            project,
+            profile,
+            transport_factory=lambda _profile: transport,
+        )
+    )
+    token = _sidecar_token(client)
+    headers = {"X-OpenEvo-Sidecar-Token": token}
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        first = executor.submit(
+            client.post,
+            "/openevo-api/desktop/workspace",
+            headers=headers,
+        )
+        assert transport.started.wait(timeout=5)
+        second = client.post("/openevo-api/desktop/workspace", headers=headers)
+        transport.release.set()
+
+    assert second.status_code == 409
+    assert second.json()["detail"] == "Desktop workspace sync is already running."
+    assert first.result(timeout=5).status_code == 200
+
+
+def test_workspace_endpoint_preserves_preflight_failure_report() -> None:
+    project = ScienceProjectConfig.model_validate(_science_project_payload())
+    profile = _remote_profile()
+    client = TestClient(
+        create_sidecar_app_for_project(
+            project,
+            profile,
+            transport_factory=lambda _profile: _FailingPreflightTransport(),
+        )
+    )
+    token = _sidecar_token(client)
+
+    response = client.post(
+        "/openevo-api/desktop/workspace",
+        headers={"X-OpenEvo-Sidecar-Token": token},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["workspace"] == {"actions": [], "ready": False}
+    assert payload["report"]["ready"] is False
+    assert payload["report"]["preflight"]["checks"][0]["name"] == "ssh"
+    assert payload["report"]["preflight"]["checks"][0]["status"] == "fail"
+    services = {service["id"]: service for service in payload["status"]["services"]}
+    assert services["ssh"]["state"] == "blocked"
+    assert services["workspace"] == {
+        "id": "workspace",
+        "label": "Workspace",
+        "state": "blocked",
+        "detail": "Remote preflight failed",
+    }
+
+
+def test_workspace_and_bootstrap_concurrent_status_updates_do_not_clobber(
+    tmp_path: Path,
+) -> None:
+    local_source = tmp_path / "workflow"
+    local_source.mkdir()
+    project = ScienceProjectConfig.model_validate(
+        _science_project_payload()
+        | {
+            "task": {
+                "id": "local-workflow",
+                "objective": "Run the local workflow.",
+                "source": {"type": "local_folder", "path": str(local_source)},
+            }
+        }
+    )
+    profile = _remote_profile()
+    transport = _BlockingWorkspaceTransport()
+    client = TestClient(
+        create_sidecar_app_for_project(
+            project,
+            profile,
+            transport_factory=lambda _profile: transport,
+        )
+    )
+    token = _sidecar_token(client)
+    headers = {"X-OpenEvo-Sidecar-Token": token}
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        workspace = executor.submit(
+            client.post,
+            "/openevo-api/desktop/workspace",
+            headers=headers,
+        )
+        assert transport.started.wait(timeout=5)
+        bootstrap = client.post("/openevo-api/desktop/bootstrap", headers=headers)
+        transport.release.set()
+
+    assert bootstrap.status_code == 200
+    assert workspace.result(timeout=5).status_code == 200
+    status_response = client.get("/openevo-api/desktop/shell")
+    services = {
+        service["id"]: service for service in status_response.json()["services"]
+    }
+    assert services["workspace"]["state"] == "ready"
+    assert services["bootstrap"]["state"] == "ready"
+
+
 def test_default_desktop_status_round_trips_as_json() -> None:
     status = default_desktop_shell_status()
 
@@ -298,6 +591,9 @@ def _sidecar_token(client: TestClient) -> str:
 
 
 class _ApiDryRunTransport:
+    def __init__(self) -> None:
+        self.uploads: list[tuple[str, str]] = []
+
     def run(
         self,
         command: str,
@@ -318,6 +614,7 @@ class _ApiDryRunTransport:
         return RemoteCommandResult(command=command, return_code=0, stdout="ok")
 
     def upload_dir(self, local_path: str, remote_path: str) -> None:
+        self.uploads.append((local_path, remote_path))
         return None
 
 
@@ -344,8 +641,15 @@ class _FailingPreflightTransport(_ApiDryRunTransport):
         )
 
 
+class _FailingUploadTransport(_ApiDryRunTransport):
+    def upload_dir(self, local_path: str, remote_path: str) -> None:
+        self.uploads.append((local_path, remote_path))
+        raise RuntimeError("upload failed")
+
+
 class _BlockingTransport(_ApiDryRunTransport):
     def __init__(self) -> None:
+        super().__init__()
         self.started = Event()
         self.release = Event()
 
@@ -367,6 +671,19 @@ class _BlockingTransport(_ApiDryRunTransport):
             env=env,
             timeout_seconds=timeout_seconds,
         )
+
+
+class _BlockingWorkspaceTransport(_ApiDryRunTransport):
+    def __init__(self) -> None:
+        super().__init__()
+        self.started = Event()
+        self.release = Event()
+
+    def upload_dir(self, local_path: str, remote_path: str) -> None:
+        self.started.set()
+        if not self.release.wait(timeout=5):
+            raise TimeoutError("workspace concurrency test timed out")
+        super().upload_dir(local_path, remote_path)
 
 
 def test_build_desktop_shell_status_from_subscription_project() -> None:

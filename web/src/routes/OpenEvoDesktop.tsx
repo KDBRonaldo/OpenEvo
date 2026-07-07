@@ -17,6 +17,7 @@ import { useEffect, useState, type ReactNode } from "react";
 import {
   fetchOpenEvoDesktopShellModel,
   runOpenEvoBootstrap,
+  runOpenEvoWorkspaceSync,
 } from "../api/openevo";
 import {
   type EvolutionStepState,
@@ -42,6 +43,8 @@ const evolutionTone: Record<EvolutionStepState, string> = {
 export function OpenEvoDesktop() {
   const [model, setModel] = useState(() => getOpenEvoDesktopShellModel());
   const [sidecarConnected, setSidecarConnected] = useState(false);
+  const [workspaceRunning, setWorkspaceRunning] = useState(false);
+  const [workspaceError, setWorkspaceError] = useState<string | null>(null);
   const [bootstrapRunning, setBootstrapRunning] = useState(false);
   const [bootstrapError, setBootstrapError] = useState<string | null>(null);
   const summary = getOpenEvoTimelineSummary(model);
@@ -62,6 +65,22 @@ export function OpenEvoDesktop() {
       cancelled = true;
     };
   }, []);
+
+  const handleWorkspaceSync = async () => {
+    setWorkspaceRunning(true);
+    setWorkspaceError(null);
+    try {
+      const response = await runOpenEvoWorkspaceSync();
+      setModel(response.status);
+      setSidecarConnected(true);
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : "Workspace sync failed";
+      setWorkspaceError(message);
+    } finally {
+      setWorkspaceRunning(false);
+    }
+  };
 
   const handleBootstrap = async () => {
     setBootstrapRunning(true);
@@ -97,11 +116,16 @@ export function OpenEvoDesktop() {
           </div>
         </div>
         <div className="flex flex-wrap gap-2">
-          <CommandButton icon={<Upload size={16} />} label="Sync Workspace" disabled />
+          <CommandButton
+            icon={<Upload size={16} />}
+            label={workspaceRunning ? "Syncing" : "Sync Workspace"}
+            disabled={!sidecarConnected || workspaceRunning || bootstrapRunning}
+            onClick={handleWorkspaceSync}
+          />
           <CommandButton
             icon={<RefreshCw size={16} />}
             label={bootstrapRunning ? "Bootstrapping" : "Bootstrap"}
-            disabled={!sidecarConnected || bootstrapRunning}
+            disabled={!sidecarConnected || bootstrapRunning || workspaceRunning}
             onClick={handleBootstrap}
           />
           <CommandButton icon={<Play size={16} />} label="Start Run" primary disabled />
@@ -180,6 +204,11 @@ export function OpenEvoDesktop() {
             {bootstrapError ? (
               <div className="rounded-md border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-900">
                 {bootstrapError}
+              </div>
+            ) : null}
+            {workspaceError ? (
+              <div className="rounded-md border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-900">
+                {workspaceError}
               </div>
             ) : null}
           </div>

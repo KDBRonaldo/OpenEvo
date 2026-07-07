@@ -151,21 +151,34 @@ clone git task sources; workspace preparation remains a separate lifecycle step
 so the UI can report source materialization independently from runtime
 readiness.
 
+`POST /openevo-api/desktop/workspace` executes that separate workspace
+preparation lifecycle. It is available only for config-backed sidecar sessions
+and reuses `build_sidecar_science_plan()` plus `execute_sidecar_plan()` so
+`local_folder` uploads, `git_repository` clones, `remote_path` no-ops, and
+`scratch` workspaces stay on the existing remote executor contract. The endpoint
+returns both the full executor report and a top-level workspace summary, plus a
+refreshed shell status. Workspace readiness updates only the SSH and Workspace
+service rows; it does not imply bootstrap readiness, model availability, gateway
+startup, rollout startup, or evolution worker startup.
+
 The sidecar generates a per-process mutation token and includes it in
 `GET /openevo-api/desktop/shell` under `sidecar.mutation_token`. Mutating
 requests must send that token in the non-simple
 `X-OpenEvo-Sidecar-Token` header. Missing or invalid tokens are rejected before
-any bootstrap work starts. This is a local CSRF guard for the Desktop sidecar:
-cross-site pages can submit simple localhost requests, but cannot read the
-same-origin shell response or set the required custom header. The sidecar also
-serializes bootstrap runs per config-backed session; a second bootstrap request
-returns 409 while one is already running.
+any workspace or bootstrap work starts. This is a local CSRF guard for the
+Desktop sidecar: cross-site pages can submit simple localhost requests, but
+cannot read the same-origin shell response or set the required custom header.
+The sidecar also serializes workspace syncs and bootstrap runs independently per
+config-backed session; a second request for the same lifecycle action returns
+409 while one is already running. Status updates from both lifecycle actions are
+written under a shared status lock so concurrent workspace and bootstrap runs do
+not clobber each other's service rows.
 
 Dry-run serve mode is intended for local UI development and smoke tests. It
 exercises the same planning and report mapping path, but it does not mutate the
 remote server. A dry-run report can therefore show the UI path as ready without
-proving that remote files, Docker images, or Hugging Face models were actually
-prepared. Real remote preparation requires `--transport ssh`.
+proving that task workspaces, Docker images, or Hugging Face models were
+actually prepared. Real remote preparation requires `--transport ssh`.
 
 This slice does not let the HTTP API start vLLM, Polar gateway, rollout,
 evolution worker, or long-running OpenEvo backend processes. Those operations

@@ -59,8 +59,20 @@ export interface OpenEvoBootstrapResponsePayload {
   status: OpenEvoDesktopShellStatusPayload;
 }
 
+export interface OpenEvoWorkspaceResponsePayload {
+  workspace: Record<string, any>;
+  report: Record<string, any>;
+  status: OpenEvoDesktopShellStatusPayload;
+}
+
 export interface OpenEvoBootstrapResponse {
   bootstrap: OpenEvoDesktopShellModel["bootstrap"];
+  report: Record<string, any>;
+  status: OpenEvoDesktopShellModel;
+}
+
+export interface OpenEvoWorkspaceResponse {
+  workspace: Record<string, any>;
   report: Record<string, any>;
   status: OpenEvoDesktopShellModel;
 }
@@ -87,6 +99,23 @@ export async function runOpenEvoBootstrap(): Promise<OpenEvoBootstrapResponse> {
   );
   rememberOpenEvoSidecarMutationToken(payload.status);
   return toOpenEvoBootstrapResponse(payload);
+}
+
+export async function runOpenEvoWorkspaceSync(): Promise<OpenEvoWorkspaceResponse> {
+  const headers = sidecarMutationToken
+    ? { [sidecarMutationTokenHeader]: sidecarMutationToken }
+    : undefined;
+  const payload = await api.post<OpenEvoWorkspaceResponsePayload>(
+    "/openevo-api/desktop/workspace",
+    {},
+    headers,
+  );
+  rememberOpenEvoSidecarMutationToken(payload.status);
+  return {
+    workspace: payload.workspace,
+    report: payload.report,
+    status: toOpenEvoDesktopShellModel(payload.status),
+  };
 }
 
 export function toOpenEvoBootstrapResponse(

@@ -13,11 +13,13 @@ import {
 const apiMocks = vi.hoisted(() => ({
   fetchOpenEvoDesktopShellModel: vi.fn(),
   runOpenEvoBootstrap: vi.fn(),
+  runOpenEvoWorkspaceSync: vi.fn(),
 }));
 
 vi.mock("../api/openevo", () => ({
   fetchOpenEvoDesktopShellModel: apiMocks.fetchOpenEvoDesktopShellModel,
   runOpenEvoBootstrap: apiMocks.runOpenEvoBootstrap,
+  runOpenEvoWorkspaceSync: apiMocks.runOpenEvoWorkspaceSync,
 }));
 
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
@@ -26,10 +28,14 @@ describe("OpenEvoDesktop", () => {
   beforeEach(() => {
     apiMocks.fetchOpenEvoDesktopShellModel.mockReset();
     apiMocks.runOpenEvoBootstrap.mockReset();
+    apiMocks.runOpenEvoWorkspaceSync.mockReset();
     apiMocks.fetchOpenEvoDesktopShellModel.mockRejectedValue(
       new Error("sidecar unavailable"),
     );
     apiMocks.runOpenEvoBootstrap.mockRejectedValue(
+      new Error("sidecar unavailable"),
+    );
+    apiMocks.runOpenEvoWorkspaceSync.mockRejectedValue(
       new Error("sidecar unavailable"),
     );
     document.body.innerHTML = "";
@@ -94,6 +100,52 @@ describe("OpenEvoDesktop", () => {
     await unmountClient(root);
   });
 
+  it("runs workspace sync from the button and refreshes visible status", async () => {
+    const shellModel = modelWithWorkspace({
+      projectName: "Loaded Science Project",
+      state: "planned",
+      detail: "Workspace preparation has not run yet",
+    });
+    const syncedModel = modelWithWorkspace({
+      projectName: "Loaded Science Project",
+      state: "ready",
+      detail: "Workspace prepared",
+    });
+    apiMocks.fetchOpenEvoDesktopShellModel.mockResolvedValue(shellModel);
+    const deferred = deferWorkspace(syncedModel);
+    apiMocks.runOpenEvoWorkspaceSync.mockReturnValue(deferred.promise);
+
+    const root = await renderClient();
+    await flushEffects();
+
+    expect(document.body.textContent).toContain("Loaded Science Project");
+    expect(document.body.textContent).toContain(
+      "Workspace preparation has not run yet",
+    );
+
+    const button = buttonByText("Sync Workspace");
+    expect(button.disabled).toBe(false);
+
+    await act(async () => {
+      button.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+
+    expect(apiMocks.runOpenEvoWorkspaceSync).toHaveBeenCalledTimes(1);
+    expect(document.body.textContent).toContain("Syncing");
+
+    await act(async () => {
+      deferred.resolve({
+        workspace: { ready: true, actions: [] },
+        report: { ready: true },
+        status: syncedModel,
+      });
+      await Promise.resolve();
+    });
+
+    expect(document.body.textContent).toContain("Workspace prepared");
+    await unmountClient(root);
+  });
+
   it("shows a bootstrap error when the sidecar rejects the action", async () => {
     apiMocks.fetchOpenEvoDesktopShellModel.mockResolvedValue(
       modelWithBootstrap({
@@ -112,6 +164,34 @@ describe("OpenEvoDesktop", () => {
 
     await act(async () => {
       buttonByText("Bootstrap").dispatchEvent(
+        new MouseEvent("click", { bubbles: true }),
+      );
+      await Promise.resolve();
+    });
+
+    expect(document.body.textContent).toContain(
+      "HTTP 403 Forbidden: invalid token",
+    );
+    await unmountClient(root);
+  });
+
+  it("shows a workspace sync error when the sidecar rejects the action", async () => {
+    apiMocks.fetchOpenEvoDesktopShellModel.mockResolvedValue(
+      modelWithWorkspace({
+        projectName: "Loaded Science Project",
+        state: "planned",
+        detail: "Workspace preparation has not run yet",
+      }),
+    );
+    apiMocks.runOpenEvoWorkspaceSync.mockRejectedValue(
+      new Error("HTTP 403 Forbidden: invalid token"),
+    );
+
+    const root = await renderClient();
+    await flushEffects();
+
+    await act(async () => {
+      buttonByText("Sync Workspace").dispatchEvent(
         new MouseEvent("click", { bubbles: true }),
       );
       await Promise.resolve();
@@ -191,6 +271,34 @@ function modelWithBootstrap({
   };
 }
 
+function modelWithWorkspace({
+  projectName,
+  state,
+  detail,
+}: {
+  projectName: string;
+  state: OpenEvoDesktopShellModel["services"][number]["state"];
+  detail: string;
+}): OpenEvoDesktopShellModel {
+  const model = getOpenEvoDesktopShellModel();
+  return {
+    ...model,
+    project: {
+      ...model.project,
+      name: projectName,
+    },
+    services: model.services.map((service) =>
+      service.id === "workspace"
+        ? {
+            ...service,
+            state,
+            detail,
+          }
+        : service,
+    ),
+  };
+}
+
 function deferBootstrap(status: OpenEvoDesktopShellModel) {
   let resolve!: (value: {
     bootstrap: OpenEvoDesktopShellModel["bootstrap"];
@@ -199,6 +307,22 @@ function deferBootstrap(status: OpenEvoDesktopShellModel) {
   }) => void;
   const promise = new Promise<{
     bootstrap: OpenEvoDesktopShellModel["bootstrap"];
+    report: Record<string, any>;
+    status: OpenEvoDesktopShellModel;
+  }>((next) => {
+    resolve = next;
+  });
+  return { promise, resolve, status };
+}
+
+function deferWorkspace(status: OpenEvoDesktopShellModel) {
+  let resolve!: (value: {
+    workspace: Record<string, any>;
+    report: Record<string, any>;
+    status: OpenEvoDesktopShellModel;
+  }) => void;
+  const promise = new Promise<{
+    workspace: Record<string, any>;
     report: Record<string, any>;
     status: OpenEvoDesktopShellModel;
   }>((next) => {
