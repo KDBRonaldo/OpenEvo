@@ -309,6 +309,16 @@ returns both the full executor report and a top-level workspace summary, plus a
 refreshed shell status. Workspace readiness updates only the SSH and Workspace
 service rows; it does not imply bootstrap readiness, model availability, gateway
 startup, rollout startup, or evolution worker startup.
+Desktop keeps the most recent workspace report in the Bootstrap Readiness area
+and surfaces failed or warning workspace actions with their message, command,
+and stderr when present, so upload or clone failures are visible without opening
+the raw API response.
+
+Desktop also keeps the most recent bootstrap report in the same area. It renders
+`next_actions`, failed or warning preflight checks with `remediation_kind`, and
+failed or warning bootstrap steps. Long commands, paths, proxy URLs, and stderr
+snippets are wrapped in the panel so remote dependency and setup failures remain
+readable in the app.
 
 `POST /openevo-api/desktop/run` launches the configured Science task after
 workspace and bootstrap readiness. It is available only for config-backed

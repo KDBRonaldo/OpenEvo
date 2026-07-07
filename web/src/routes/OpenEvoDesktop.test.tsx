@@ -131,6 +131,231 @@ describe("OpenEvoDesktop", () => {
     await unmountClient(root);
   });
 
+  it("renders bootstrap report next actions and failed preflight checks", async () => {
+    const shellModel = modelWithBootstrap({
+      projectName: "Loaded Science Project",
+      ready: false,
+      notes: ["Remote bootstrap has not run yet."],
+      bootstrapDetail: "Remote bootstrap has not run yet",
+    });
+    const failedModel = modelWithBootstrap({
+      projectName: "Loaded Science Project",
+      ready: false,
+      notes: ["Fix remote preflight failures and rerun bootstrap."],
+      bootstrapDetail: "Fix remote preflight failures and rerun bootstrap.",
+    });
+    apiMocks.fetchOpenEvoDesktopShellModel.mockResolvedValue(shellModel);
+    const deferred = deferBootstrap(failedModel);
+    apiMocks.runOpenEvoBootstrap.mockReturnValue(deferred.promise);
+
+    const root = await renderClient();
+    await flushEffects();
+
+    await act(async () => {
+      buttonByText("Bootstrap").dispatchEvent(
+        new MouseEvent("click", { bubbles: true }),
+      );
+    });
+    await act(async () => {
+      deferred.resolve({
+        bootstrap: failedModel.bootstrap,
+        report: {
+          ready: false,
+          next_actions: ["Fix remote preflight failures and rerun bootstrap."],
+          preflight: {
+            checks: [
+              {
+                name: "ssh",
+                status: "pass",
+                message: "Remote command execution is available.",
+                remediation_kind: "none",
+                command: "true",
+              },
+              {
+                name: "docker",
+                status: "fail",
+                message: "Docker is not available.",
+                remediation_kind: "openevo_install",
+                command: "docker info",
+              },
+            ],
+          },
+        },
+        status: failedModel,
+      });
+      await Promise.resolve();
+    });
+
+    expect(document.body.textContent).toContain("Bootstrap Report");
+    expect(document.body.textContent).toContain(
+      "Fix remote preflight failures and rerun bootstrap.",
+    );
+    expect(document.body.textContent).toContain("docker");
+    expect(document.body.textContent).toContain("openevo_install");
+    expect(document.body.textContent).toContain("Docker is not available.");
+    expect(document.body.textContent).not.toContain(
+      "Remote command execution is available.",
+    );
+    await unmountClient(root);
+  });
+
+  it("renders failed bootstrap steps from the bootstrap report", async () => {
+    const shellModel = modelWithBootstrap({
+      projectName: "Loaded Science Project",
+      ready: false,
+      notes: ["Remote bootstrap has not run yet."],
+      bootstrapDetail: "Remote bootstrap has not run yet",
+    });
+    apiMocks.fetchOpenEvoDesktopShellModel.mockResolvedValue(shellModel);
+    apiMocks.runOpenEvoBootstrap.mockResolvedValue({
+      bootstrap: shellModel.bootstrap,
+      report: {
+        ready: false,
+        steps: [
+          {
+            id: "docker_pull_runtime",
+            status: "fail",
+            message: "Runtime image pull failed.",
+            command: "docker pull openevo/science-runtime:0.1.0",
+            stderr: "network timeout",
+          },
+        ],
+      },
+      status: shellModel,
+    });
+
+    const root = await renderClient();
+    await flushEffects();
+
+    await act(async () => {
+      buttonByText("Bootstrap").dispatchEvent(
+        new MouseEvent("click", { bubbles: true }),
+      );
+      await Promise.resolve();
+    });
+
+    expect(document.body.textContent).toContain("Bootstrap Report");
+    expect(document.body.textContent).toContain("docker_pull_runtime");
+    expect(document.body.textContent).toContain("Runtime image pull failed.");
+    expect(document.body.textContent).toContain(
+      "docker pull openevo/science-runtime:0.1.0",
+    );
+    expect(document.body.textContent).toContain("network timeout");
+    await unmountClient(root);
+  });
+
+  it("keeps the bootstrap report when workspace sync runs", async () => {
+    const shellModel = modelWithBootstrap({
+      projectName: "Loaded Science Project",
+      ready: false,
+      notes: ["Remote bootstrap has not run yet."],
+      bootstrapDetail: "Remote bootstrap has not run yet",
+    });
+    const syncedModel = modelWithWorkspace({
+      projectName: "Loaded Science Project",
+      state: "ready",
+      detail: "Workspace prepared",
+    });
+    apiMocks.fetchOpenEvoDesktopShellModel.mockResolvedValue(shellModel);
+    apiMocks.runOpenEvoBootstrap.mockResolvedValue({
+      bootstrap: shellModel.bootstrap,
+      report: {
+        ready: false,
+        next_actions: ["Resolve failed bootstrap steps and rerun."],
+      },
+      status: shellModel,
+    });
+    apiMocks.runOpenEvoWorkspaceSync.mockResolvedValue({
+      workspace: { ready: true, actions: [] },
+      report: { ready: true },
+      status: syncedModel,
+    });
+
+    const root = await renderClient();
+    await flushEffects();
+
+    await act(async () => {
+      buttonByText("Bootstrap").dispatchEvent(
+        new MouseEvent("click", { bubbles: true }),
+      );
+      await Promise.resolve();
+    });
+    expect(document.body.textContent).toContain("Bootstrap Report");
+
+    await act(async () => {
+      buttonByText("Sync Workspace").dispatchEvent(
+        new MouseEvent("click", { bubbles: true }),
+      );
+      await Promise.resolve();
+    });
+
+    expect(document.body.textContent).toContain("Workspace prepared");
+    expect(document.body.textContent).toContain("Bootstrap Report");
+    expect(document.body.textContent).toContain(
+      "Resolve failed bootstrap steps and rerun.",
+    );
+    await unmountClient(root);
+  });
+
+  it("clears lifecycle reports when a new project config is saved", async () => {
+    const shellModel = modelWithBootstrap({
+      projectName: "Loaded Science Project",
+      ready: false,
+      notes: ["Remote bootstrap has not run yet."],
+      bootstrapDetail: "Remote bootstrap has not run yet",
+    });
+    const savedModel = {
+      ...shellModel,
+      project: {
+        ...shellModel.project,
+        name: "Configured Science Project",
+      },
+    };
+    apiMocks.fetchOpenEvoDesktopShellModel.mockResolvedValue(shellModel);
+    apiMocks.runOpenEvoBootstrap.mockResolvedValue({
+      bootstrap: shellModel.bootstrap,
+      report: {
+        ready: false,
+        next_actions: ["Fix remote preflight failures and rerun bootstrap."],
+      },
+      status: shellModel,
+    });
+    apiMocks.saveOpenEvoProjectConfig.mockResolvedValue({
+      config: {
+        science_config_path:
+          "/home/alice/.openevo/desktop/projects/configured/science.yaml",
+        remote_profile_path:
+          "/home/alice/.openevo/desktop/profiles/science-team.yaml",
+      },
+      status: savedModel,
+    });
+
+    const root = await renderClient();
+    await flushEffects();
+
+    await act(async () => {
+      buttonByText("Bootstrap").dispatchEvent(
+        new MouseEvent("click", { bubbles: true }),
+      );
+      await Promise.resolve();
+    });
+    expect(document.body.textContent).toContain("Bootstrap Report");
+
+    await act(async () => {
+      buttonByText("Save Config").dispatchEvent(
+        new MouseEvent("click", { bubbles: true }),
+      );
+      await Promise.resolve();
+    });
+
+    expect(document.body.textContent).toContain("Configured Science Project");
+    expect(document.body.textContent).not.toContain("Bootstrap Report");
+    expect(document.body.textContent).not.toContain(
+      "Fix remote preflight failures and rerun bootstrap.",
+    );
+    await unmountClient(root);
+  });
+
   it("saves project config from the setup form and refreshes visible status", async () => {
     const shellModel = getOpenEvoDesktopShellModel();
     const savedModel = {
@@ -573,6 +798,59 @@ describe("OpenEvoDesktop", () => {
     });
 
     expect(document.body.textContent).toContain("Workspace prepared");
+    await unmountClient(root);
+  });
+
+  it("renders failed workspace actions from the workspace report", async () => {
+    const shellModel = modelWithWorkspace({
+      projectName: "Loaded Science Project",
+      state: "planned",
+      detail: "Workspace preparation has not run yet",
+    });
+    const failedModel = modelWithWorkspace({
+      projectName: "Loaded Science Project",
+      state: "blocked",
+      detail: "Workspace preparation failed",
+    });
+    apiMocks.fetchOpenEvoDesktopShellModel.mockResolvedValue(shellModel);
+    const deferred = deferWorkspace(failedModel);
+    apiMocks.runOpenEvoWorkspaceSync.mockReturnValue(deferred.promise);
+
+    const root = await renderClient();
+    await flushEffects();
+
+    await act(async () => {
+      buttonByText("Sync Workspace").dispatchEvent(
+        new MouseEvent("click", { bubbles: true }),
+      );
+    });
+    await act(async () => {
+      deferred.resolve({
+        workspace: { ready: false, actions: [] },
+        report: {
+          ready: false,
+          workspace: {
+            actions: [
+              {
+                type: "upload_dir",
+                status: "fail",
+                message: "Local folder upload failed.",
+                target:
+                  "/home/alice/.openevo/workspaces/protein/folding/abcdef",
+                stderr: "upload failed",
+              },
+            ],
+          },
+        },
+        status: failedModel,
+      });
+      await Promise.resolve();
+    });
+
+    expect(document.body.textContent).toContain("Workspace Report");
+    expect(document.body.textContent).toContain("upload_dir");
+    expect(document.body.textContent).toContain("Local folder upload failed.");
+    expect(document.body.textContent).toContain("upload failed");
     await unmountClient(root);
   });
 

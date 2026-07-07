@@ -49,6 +49,8 @@ const evolutionTone: Record<EvolutionStepState, string> = {
   blocked: "bg-rose-600",
 };
 
+type LifecycleReportPayload = Record<string, unknown>;
+
 export function OpenEvoDesktop() {
   const [model, setModel] = useState(() => getOpenEvoDesktopShellModel());
   const [sidecarConnected, setSidecarConnected] = useState(false);
@@ -56,8 +58,12 @@ export function OpenEvoDesktop() {
   const [workspaceError, setWorkspaceError] = useState<string | null>(null);
   const [bootstrapRunning, setBootstrapRunning] = useState(false);
   const [bootstrapError, setBootstrapError] = useState<string | null>(null);
+  const [bootstrapReport, setBootstrapReport] =
+    useState<LifecycleReportPayload | null>(null);
   const [runRunning, setRunRunning] = useState(false);
   const [runError, setRunError] = useState<string | null>(null);
+  const [workspaceReport, setWorkspaceReport] =
+    useState<LifecycleReportPayload | null>(null);
   const [latestRun, setLatestRun] = useState<OpenEvoRunStatus | null>(null);
   const [configSaving, setConfigSaving] = useState(false);
   const [configError, setConfigError] = useState<string | null>(null);
@@ -150,12 +156,19 @@ export function OpenEvoDesktop() {
     setLatestRun(null);
   };
 
+  const clearLifecycleReportsForContextChange = () => {
+    setWorkspaceReport(null);
+    setBootstrapReport(null);
+  };
+
   const handleWorkspaceSync = async () => {
     setWorkspaceRunning(true);
     setWorkspaceError(null);
+    setWorkspaceReport(null);
     try {
       const response = await runOpenEvoWorkspaceSync();
       setModel(response.status);
+      setWorkspaceReport(response.report);
       clearLatestRunForContextChange();
       setSidecarConnected(true);
     } catch (error) {
@@ -212,6 +225,7 @@ export function OpenEvoDesktop() {
       const response = await saveOpenEvoProjectConfig(submittedDraft);
       setModel(response.status);
       setConfigDraft(submittedDraft);
+      clearLifecycleReportsForContextChange();
       clearLatestRunForContextChange();
       setSidecarConnected(true);
       await refreshSavedConfigs();
@@ -234,6 +248,7 @@ export function OpenEvoDesktop() {
       const response = await activateOpenEvoProjectConfig(config.projectSlug);
       setModel(response.status);
       setConfigDraft(draftFromModel(response.status));
+      clearLifecycleReportsForContextChange();
       clearLatestRunForContextChange();
       setSidecarConnected(true);
     } catch (error) {
@@ -248,9 +263,11 @@ export function OpenEvoDesktop() {
   const handleBootstrap = async () => {
     setBootstrapRunning(true);
     setBootstrapError(null);
+    setBootstrapReport(null);
     try {
       const response = await runOpenEvoBootstrap();
       setModel(response.status);
+      setBootstrapReport(response.report);
       clearLatestRunForContextChange();
       setSidecarConnected(true);
     } catch (error) {
@@ -750,6 +767,12 @@ export function OpenEvoDesktop() {
                 <span>{note}</span>
               </div>
             ))}
+            {workspaceReport ? (
+              <LifecycleReport title="Workspace Report" report={workspaceReport} />
+            ) : null}
+            {bootstrapReport ? (
+              <LifecycleReport title="Bootstrap Report" report={bootstrapReport} />
+            ) : null}
             {bootstrapError ? (
               <div className="rounded-md border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-900">
                 {bootstrapError}
@@ -944,6 +967,127 @@ function Field({
       </div>
     </div>
   );
+}
+
+function LifecycleReport({
+  title,
+  report,
+}: {
+  title: string;
+  report: LifecycleReportPayload;
+}) {
+  const nextActions = stringArray(report.next_actions);
+  const items = lifecycleReportItems(report);
+
+  if (nextActions.length === 0 && items.length === 0) {
+    return null;
+  }
+
+  return (
+    <div className="border-l border-slate-200 pl-3">
+      <div className="text-xs font-medium uppercase text-slate-500">{title}</div>
+      {nextActions.length > 0 ? (
+        <div className="mt-2 space-y-1">
+          {nextActions.map((action) => (
+            <div
+              key={action}
+              className="break-words text-sm font-medium text-slate-900"
+            >
+              {action}
+            </div>
+          ))}
+        </div>
+      ) : null}
+      {items.length > 0 ? (
+        <div className="mt-3 space-y-2">
+          {items.map((item) => (
+            <div
+              key={`${item.kind}:${item.name}:${item.message}`}
+              className={`border-l-2 pl-3 ${
+                item.status === "fail" ? "border-rose-300" : "border-amber-300"
+              }`}
+            >
+              <div className="break-words text-sm font-medium text-slate-900">
+                {item.kind}: {item.name} / {item.status}
+              </div>
+              <div className="mt-1 break-words text-sm text-slate-600">
+                {item.message}
+              </div>
+              {item.remediation ? (
+                <div className="mt-1 break-words text-xs uppercase text-slate-500">
+                  {item.remediation}
+                </div>
+              ) : null}
+              {item.command ? (
+                <div className="mt-1 break-words font-mono text-xs text-slate-500">
+                  {item.command}
+                </div>
+              ) : null}
+              {item.stderr ? (
+                <div className="mt-1 break-words font-mono text-xs text-rose-800">
+                  {item.stderr}
+                </div>
+              ) : null}
+            </div>
+          ))}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function lifecycleReportItems(report: LifecycleReportPayload) {
+  const preflight = recordValue(report.preflight);
+  const workspace = recordValue(report.workspace);
+  return [
+    ...reportItems("Preflight", recordArray(preflight?.checks), "name"),
+    ...reportItems("Workspace", recordArray(workspace?.actions), "type"),
+    ...reportItems("Step", recordArray(report.steps), "id"),
+  ];
+}
+
+function reportItems(
+  kind: string,
+  items: Record<string, unknown>[],
+  nameKey: string,
+) {
+  return items
+    .filter((item) => {
+      const status = stringValue(item.status);
+      return status === "fail" || status === "warn";
+    })
+    .map((item) => ({
+      kind,
+      name: stringValue(item[nameKey]) ?? "unknown",
+      status: stringValue(item.status) ?? "unknown",
+      message: stringValue(item.message) ?? "No message.",
+      remediation: stringValue(item.remediation_kind),
+      command: stringValue(item.command),
+      stderr: stringValue(item.stderr),
+    }));
+}
+
+function stringArray(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === "string")
+    : [];
+}
+
+function recordArray(value: unknown): Record<string, unknown>[] {
+  return Array.isArray(value)
+    ? value.filter((item): item is Record<string, unknown> => recordValue(item) !== null)
+    : [];
+}
+
+function recordValue(value: unknown): Record<string, unknown> | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return null;
+  }
+  return value as Record<string, unknown>;
+}
+
+function stringValue(value: unknown): string | null {
+  return typeof value === "string" && value ? value : null;
 }
 
 function LogBlock({ label, value }: { label: string; value: string }) {
