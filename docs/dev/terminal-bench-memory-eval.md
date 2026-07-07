@@ -855,6 +855,32 @@ For follow-up Qwen3.5 password-recovery recipe runs, use the recipe shaping
 flags above so the SFT records strip appended payloads and cap tool-result
 content before filtering and training.
 
+A shaped follow-up adapter was trained from the same `password-recovery`
+trajectory with `target_task_id=static-node-0`, `after_read_input_contains` set
+to `tb_read_task_inventory`, stripped appended tool-result payloads, capped
+input tool content at 512 characters, 32 after-read repeats, and 4 correction
+repeats. The dry projection produced 37 records with no `Tool result payload`
+marker and max tool-message content length 512. The training run at
+`/tmp/tb21-parametric-memory-qwen35-password-staticnode-shaped-v2-train-20260707`
+registered artifact `art_6d348034b5f2421b`; diagnostics report 160 trained
+steps, CUDA device `6`, and final loss around `1.52e-5`. The paired local eval
+at
+`/tmp/tb21-parametric-memory-qwen35-password-staticnode-shaped-v2-eval-urlfix-20260707`
+used `--server-url http://127.0.0.1:8011/v1`,
+`--server-port 8011`, `--adapter-key-rewrite qwen3_5_vllm_language_model`,
+`max_output_tokens=512`, `context_reserve_tokens=512`, and
+`tool_result_prompt_max_chars=512`. It completed with baseline pass@1 `0/1`,
+parametric-memory pass@1 `1/1`, and delta `+1` on `password-recovery`. The
+treatment vLLM `/v1/models` endpoint exposed both the base model and adapter
+model id, and the summary recorded 64 rewritten LoRA keys. The treatment
+tool-call trace read `static-node-0` and then emitted the trained recovery
+command in one `tb_exec` call; the verifier passed both
+`test_recovery_file_exists` and `test_password_match`. A first attempt at the
+same eval accidentally set only `--server-port 8011` while leaving
+`--server-url` at the default port 8000, so it stayed in server readiness and
+never launched Harbor; always keep those two values aligned when using a
+non-default managed-server port.
+
 Evaluate baseline local Qwen and adapter local Qwen against the same subset:
 
 ```sh
