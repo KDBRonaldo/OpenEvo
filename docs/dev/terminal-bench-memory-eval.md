@@ -1059,6 +1059,40 @@ still produced no `tb_exec`; Harbor recorded the final assistant message as
 `/app/out.txt` was never created. This isolates the next method problem as
 post-`tb_read_task` action generation, not task-id discovery or LoRA serving.
 
+Direct vLLM probes against the exact live post-`tb_read_task` prefix then found
+that this second empty-response layer was not a LoRA training failure. With the
+path-bound adapter loaded, `temperature=0.0` produced the expected
+`/app/out.txt` write command at 512, 1024, 2048, and 4096 output-token caps,
+while requests that left temperature unset were unstable and sometimes returned
+no tool call. The local Terminal-Bench/EvoLab package therefore needed to pass
+its configured solver temperature through the OpenAI-compatible chat-completion
+runtime, not just record it at the benchmark layer.
+
+After that package-level temperature fix, the rerun at
+`/tmp/tb21-task-local-parametric-gcode-pathbound-guard-20260707/eval-gcode-qwen35-pathbound-repair-tempfix-r8-s140`
+still scored baseline `0/1`, parametric memory `0/1`, delta `0`, but the
+treatment now emitted `tb_exec` after `tb_read_task`. Its first command had the
+right content and `/app/out.txt` intent, but wrapped the write in an outer
+`bash -lc` form whose `$out` and `$(cat /app/out.txt)` fragments were expanded
+by the wrong shell layer before the inner command ran. This failed before
+creating the required artifact, so the remaining issue was command
+normalization at the execution boundary.
+
+The final guard-backed rerun at
+`/tmp/tb21-task-local-parametric-gcode-pathbound-guard-20260707/eval-gcode-qwen35-pathbound-repair-tempprintf-r8-s140`
+used the same path-bound Qwen3.5-9B adapter, managed vLLM on GPU 6,
+`--solver-temperature 0.0`, `--vllm-generation-config vllm`,
+`--artifact-path-guard repair`, and `--required-artifact-path /app/out.txt`.
+The summary recorded `enabled_artifacts=["parametric_memory"]` and disabled
+`text_memory`, `skill_bundle`, and `agent_system`. Baseline pass@1/pass@k was
+`0/1`; parametric-memory pass@1/pass@k was `1/1`; delta was `+1`.
+The treatment trajectory read `terminal-bench-task`, generated the path-bound
+`printf` write, and the guard repaired only that supported fragile printf form
+to `printf '%s' ... > /app/out.txt` before execution. The official verifier
+then returned reward `1.0`. Treat this as positive one-task controlled evidence
+for the current parametric-memory path plus a shared artifact-path repair
+guard, not as full Terminal Bench 2.1 performance evidence.
+
 For `password-recovery`, a Qwen3.5-9B local LoRA smoke was trained from the
 existing failed/successful tool-policy trajectory at
 `/tmp/tb21-parametric-memory-password-toolpolicy-20260702-110343/local-eval-password-toolpolicy-2048/baseline/harbor_jobs/baseline-password-recovery/password-recovery__AzMbthq`.
