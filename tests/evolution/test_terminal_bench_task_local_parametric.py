@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from polar_evolution.cli import main
 from polar_evolution.terminal_bench_task_local_parametric import (
     TaskLocalSelection,
     TrajectoryPoolRow,
@@ -289,3 +290,105 @@ def test_build_task_local_parametric_job_payload_writes_dataset_and_lora_job(
         "terminal-bench",
         "terminal-bench:train-fasttext",
     ]
+
+
+def test_terminal_bench_task_local_parametric_memory_job_cli_writes_payload(
+    tmp_path: Path,
+) -> None:
+    failed_trial = tmp_path / "failed-trial"
+    successful_trial = tmp_path / "successful-trial"
+    (failed_trial / "agent").mkdir(parents=True)
+    (successful_trial / "agent").mkdir(parents=True)
+    (successful_trial / "agent" / "codex.txt").write_text(
+        json.dumps(
+            {
+                "type": "item.completed",
+                "item": {
+                    "type": "command_execution",
+                    "command": (
+                        "/bin/bash -lc 'python train.py && "
+                        "cp model.bin /app/model.bin'"
+                    ),
+                    "aggregated_output": "accuracy 0.6257",
+                    "exit_code": 0,
+                    "status": "completed",
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    pool = tmp_path / "trajectory_pool.jsonl"
+    _write_pool(
+        pool,
+        [
+            {
+                "trajectory_id": "failed-1",
+                "task_id": "train-fasttext",
+                "reward": 0.0,
+                "trial_dir": str(failed_trial),
+                "prompt_summary": "Train fastText and write /app/model.bin",
+            },
+            {
+                "trajectory_id": "success-1",
+                "task_id": "train-fasttext",
+                "reward": 1.0,
+                "trial_dir": str(successful_trial),
+            },
+        ],
+    )
+
+    output = tmp_path / "job.json"
+    assert (
+        main(
+            [
+                "terminal-bench-task-local-parametric-memory-job",
+                "--trajectory-pool",
+                str(pool),
+                "--task-id",
+                "train-fasttext",
+                "--output-root",
+                str(tmp_path / "out"),
+                "--dataset-name",
+                "tb21-task-local-train-fasttext",
+                "--base-model",
+                "Qwen/Qwen3.6-35B-A3B",
+                "--adapter-id",
+                "tb-parametric-memory-train-fasttext",
+                "--trainer-command",
+                "python",
+                "--trainer-arg",
+                "train_lora.py",
+                "--trainer-arg",
+                "--train-file",
+                "--trainer-arg",
+                "{training_dataset}",
+                "--trainer-arg",
+                "--output-dir",
+                "--trainer-arg",
+                "{adapter_dir}",
+                "--command-contains",
+                "/app/model.bin",
+                "--output",
+                str(output),
+            ]
+        )
+        == 0
+    )
+
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert payload["selected_tasks"] == ["train-fasttext"]
+    assert payload["dataset"]["record_count"] == 1
+    assert Path(payload["dataset"]["records_path"]).is_file()
+    assert payload["job"]["method"] == "parametric_memory_lora_sft"
+    assert payload["job"]["config"]["output_adapter_id"] == (
+        "tb-parametric-memory-train-fasttext"
+    )
+    assert payload["job"]["config"]["trainer"]["args"] == [
+        "train_lora.py",
+        "--train-file",
+        "{training_dataset}",
+        "--output-dir",
+        "{adapter_dir}",
+    ]
+    assert "completed_artifacts" not in payload

@@ -9,8 +9,17 @@ from typing import Any
 from urllib.parse import unquote, urlparse
 
 from polar_evolution.agent_system import DEFAULT_AGENT_SYSTEM_TARGET_PATH
-from polar_evolution.methods import METHOD_REGISTRY, _parametric_memory_training_projection
-from polar_evolution.models import DatasetCreateRequest, EventIngestRequest, JobCreateRequest
+from polar_evolution.methods import (
+    METHOD_REGISTRY,
+    _parametric_memory_training_projection,
+    run_method,
+)
+from polar_evolution.models import (
+    DatasetCreateRequest,
+    EventIngestRequest,
+    JobCreateRequest,
+    WorkerClaimedJob,
+)
 from polar_evolution.server import create_app
 from polar_evolution.store import EvolutionStore
 from polar_evolution.terminal_bench_bridge import build_terminal_bench_events
@@ -36,6 +45,11 @@ from polar_evolution.terminal_bench_per_task import (
     run_group_evolution_dry_run,
     run_per_task_evolution,
     run_per_task_evolution_dry_run,
+)
+from polar_evolution.terminal_bench_task_local_parametric import (
+    build_task_local_parametric_job_payload,
+    build_task_local_sft_records,
+    select_task_local_candidates,
 )
 from polar_evolution.worker import EvolutionWorkerClient, run_once
 
@@ -443,6 +457,52 @@ def build_parser() -> argparse.ArgumentParser:
     tb_parametric_job.add_argument("--job-name")
     tb_parametric_job.add_argument("--priority", type=int, default=100)
     tb_parametric_job.add_argument("--max-records", type=int)
+    tb_task_local_parametric_job = subparsers.add_parser(
+        "terminal-bench-task-local-parametric-memory-job",
+        help=(
+            "Build task-local Terminal Bench SFT records from a trajectory pool "
+            "and create a parametric-memory LoRA worker job payload."
+        ),
+    )
+    tb_task_local_parametric_job.add_argument("--trajectory-pool", required=True)
+    tb_task_local_parametric_job.add_argument("--task-id", action="append", default=[])
+    tb_task_local_parametric_job.add_argument("--output-root", required=True)
+    tb_task_local_parametric_job.add_argument("--dataset-name")
+    tb_task_local_parametric_job.add_argument("--base-model", default=DEFAULT_LOCAL_MODEL)
+    tb_task_local_parametric_job.add_argument(
+        "--adapter-id",
+        default=DEFAULT_LOCAL_PARAMETRIC_ADAPTER_ID,
+    )
+    tb_task_local_parametric_job.add_argument("--trainer-command", required=True)
+    tb_task_local_parametric_job.add_argument("--trainer-arg", action="append", default=[])
+    tb_task_local_parametric_job.add_argument(
+        "--trainer-timeout-seconds",
+        type=float,
+        default=3600.0,
+    )
+    tb_task_local_parametric_job.add_argument(
+        "--command-contains",
+        action="append",
+        default=[],
+        help="Required substring for successful Codex command targets. Can be repeated.",
+    )
+    tb_task_local_parametric_job.add_argument(
+        "--exclude-command-contains",
+        action="append",
+        default=[],
+        help="Excluded substring for successful Codex command targets. Can be repeated.",
+    )
+    tb_task_local_parametric_job.add_argument(
+        "--max-records-per-task",
+        type=int,
+        default=16,
+    )
+    tb_task_local_parametric_job.add_argument(
+        "--artifact-root",
+        help="Artifact root used only when --run-worker is set.",
+    )
+    tb_task_local_parametric_job.add_argument("--run-worker", action="store_true")
+    tb_task_local_parametric_job.add_argument("--output", help="Output JSON path. Defaults to stdout.")
     tb_per_task = subparsers.add_parser(
         "terminal-bench-per-task-evolution",
         help="Run or plan per-task Terminal Bench evolution.",
@@ -660,7 +720,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _normalize_cli_argv(argv: list[str]) -> list[str]:
-    if not argv or argv[0] != "terminal-bench-parametric-memory-job":
+    trainer_arg_commands = {
+        "terminal-bench-parametric-memory-job",
+        "terminal-bench-task-local-parametric-memory-job",
+    }
+    if not argv or argv[0] not in trainer_arg_commands:
         return list(argv)
     normalized: list[str] = []
     index = 0
@@ -787,6 +851,10 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == "terminal-bench-parametric-memory-job":
         payload = _create_terminal_bench_parametric_memory_job(args)
+        _write_json_output(payload, args.output)
+        return 0
+    if args.command == "terminal-bench-task-local-parametric-memory-job":
+        payload = _create_terminal_bench_task_local_parametric_memory_job(args)
         _write_json_output(payload, args.output)
         return 0
     if args.command == "terminal-bench-local-parametric-memory-eval":
@@ -1419,6 +1487,79 @@ def _create_terminal_bench_parametric_memory_job(args: argparse.Namespace) -> di
             db_path=Path(args.db),
             artifact_root=Path(args.artifact_root),
         )
+    return payload
+
+
+def _create_terminal_bench_task_local_parametric_memory_job(
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    selections = select_task_local_candidates(
+        Path(args.trajectory_pool),
+        task_ids=args.task_id or None,
+    )
+    records: list[dict[str, Any]] = []
+    selected_task_ids: list[str] = []
+    selection_summary: list[dict[str, Any]] = []
+    for selection in selections:
+        task_records = build_task_local_sft_records(
+            selection,
+            command_contains=list(args.command_contains),
+            exclude_command_contains=list(args.exclude_command_contains),
+            max_records=args.max_records_per_task,
+        )
+        selection_summary.append(
+            {
+                "task_id": selection.task_id,
+                "failed_count": len(selection.failed),
+                "successful_count": len(selection.successful),
+                "null_reward_count": len(selection.null_reward),
+                "record_count": len(task_records),
+            }
+        )
+        if not task_records:
+            continue
+        selected_task_ids.append(selection.task_id)
+        records.extend(task_records)
+
+    if not records:
+        raise ValueError(
+            "terminal-bench-task-local-parametric-memory-job found no usable "
+            "task-local SFT records"
+        )
+
+    task_suffix = "-".join(selected_task_ids)
+    dataset_name = args.dataset_name or f"tb21-task-local-parametric-{task_suffix}"
+    output_root = Path(args.output_root)
+    payload = build_task_local_parametric_job_payload(
+        records=records,
+        output_root=output_root,
+        dataset_name=dataset_name,
+        base_model=args.base_model,
+        adapter_id=args.adapter_id,
+        trainer_command=args.trainer_command,
+        trainer_args=list(args.trainer_arg),
+        trainer_timeout_seconds=args.trainer_timeout_seconds,
+        task_ids=selected_task_ids,
+    )
+    payload["trajectory_pool"] = str(Path(args.trajectory_pool))
+    payload["selected_tasks"] = selected_task_ids
+    payload["selection_summary"] = selection_summary
+
+    if args.run_worker:
+        artifact_root = Path(args.artifact_root) if args.artifact_root else output_root / "artifacts"
+        artifacts = run_method(
+            WorkerClaimedJob.model_validate(payload["job"]),
+            artifact_root=artifact_root,
+        )
+        completed_artifacts = [artifact.model_dump(mode="json") for artifact in artifacts]
+        payload["completed_artifacts"] = completed_artifacts
+        completed_path = output_root / "completed_artifacts.json"
+        completed_path.write_text(
+            json.dumps(completed_artifacts, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        payload["completed_artifacts_path"] = str(completed_path)
+
     return payload
 
 
