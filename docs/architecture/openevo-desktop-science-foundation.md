@@ -143,6 +143,20 @@ cd web && npm run build:openevo
 rsync -a --delete web/dist/ src/openevo/desktop/web/
 ```
 
+The release smoke check rebuilds the OpenEvo-only Desktop assets, verifies that
+the committed package assets match `web/dist`, builds the Python wheel, and
+inspects the wheel metadata, console scripts, and packaged assets:
+
+```bash
+cd web
+npm ci
+npm run build:openevo
+cd ..
+diff -qr web/dist src/openevo/desktop/web
+python -m build --wheel
+python scripts/ci/check_openevo_release.py --wheel dist/*.whl
+```
+
 For development or custom packages, `--static-root` can point at a Vite build
 output directory:
 

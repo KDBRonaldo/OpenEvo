@@ -1,0 +1,57 @@
+name: OpenEvo release smoke
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened, ready_for_review]
+    paths:
+      - ".github/workflows/openevo-release-smoke.yml"
+      - "pyproject.toml"
+      - "uv.lock"
+      - "scripts/ci/check_openevo_release.py"
+      - "src/openevo/**"
+      - "src/polar/**"
+      - "src/polar_evolution/**"
+      - "src/slime_bridge/**"
+      - "tests/ci/**"
+      - "web/**"
+
+jobs:
+  wheel-smoke:
+    name: build and inspect wheel
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Build OpenEvo Desktop assets
+        working-directory: web
+        run: |
+          npm ci
+          npm run build:openevo
+
+      - name: Check packaged Desktop assets are current
+        run: |
+          diff -qr web/dist src/openevo/desktop/web
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Test release validator
+        run: |
+          python -m pip install --upgrade pip pytest
+          PYTHONPATH=src:. python -m pytest tests/ci/test_check_openevo_release.py -q
+
+      - name: Build wheel
+        run: |
+          python -m pip install build
+          python -m build --wheel
+
+      - name: Validate OpenEvo wheel
+        run: |
+          python scripts/ci/check_openevo_release.py --wheel dist/*.whl

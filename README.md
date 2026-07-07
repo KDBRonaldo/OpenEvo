@@ -276,6 +276,18 @@ openevo desktop serve --host 127.0.0.1 --port 3766
 Release wheels are built from the OpenEvo package metadata and include the
 packaged OpenEvo-only Desktop assets under `openevo/desktop/web/`.
 
+Before publishing a wheel, refresh and validate the packaged Desktop assets:
+
+```bash
+cd web
+npm ci
+npm run build:openevo
+cd ..
+diff -qr web/dist src/openevo/desktop/web
+python -m build --wheel
+python scripts/ci/check_openevo_release.py --wheel dist/*.whl
+```
+
 Shared infrastructure that is already implemented:
 
 - Golden-standard evaluator for sequence/component extraction: article-scoped
