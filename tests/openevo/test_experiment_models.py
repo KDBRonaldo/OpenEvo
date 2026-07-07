@@ -219,3 +219,31 @@ def test_load_experiment_config_requires_top_level_mapping(tmp_path: Path) -> No
 
     with pytest.raises(ValueError, match="top-level mapping"):
         load_experiment_config(path)
+
+
+def test_runtime_prepare_accepts_exec_actions() -> None:
+    payload = _minimal_payload()
+    payload["runtime"]["prepare"] = [
+        {
+            "type": "exec",
+            "command": "pip install -r requirements.txt",
+            "cwd": "/polar/session/workspace",
+            "env": {"PIP_INDEX_URL": "https://pypi.example/simple"},
+        }
+    ]
+
+    config = ExperimentConfig.model_validate(payload)
+
+    [action] = config.runtime.prepare
+    assert action.type == "exec"
+    assert action.command == "pip install -r requirements.txt"
+    assert action.cwd == "/polar/session/workspace"
+    assert action.env == {"PIP_INDEX_URL": "https://pypi.example/simple"}
+
+
+def test_runtime_prepare_rejects_upload_without_target() -> None:
+    payload = _minimal_payload()
+    payload["runtime"]["prepare"] = [{"type": "upload_dir", "source": "/tmp/src"}]
+
+    with pytest.raises(ValidationError, match="upload_dir requires source and target"):
+        ExperimentConfig.model_validate(payload)

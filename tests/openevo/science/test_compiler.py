@@ -1,0 +1,255 @@
+from __future__ import annotations
+
+import pytest
+
+from openevo.experiment.compiler import compile_experiment
+from openevo.science import PreparedWorkspace, ScienceProjectConfig, compile_science_project
+from openevo.science.compiler import MANAGED_RUNTIME_IMAGES
+
+
+def _project(**overrides: object) -> ScienceProjectConfig:
+    payload = {
+        "version": 1,
+        "project": {"name": "protein-design"},
+        "remote_profile": "science-team",
+        "task": {
+            "id": "folding-baseline",
+            "objective": "Improve the folding baseline.",
+            "source": {
+                "type": "remote_path",
+                "path": "/datasets/folding-baseline",
+            },
+            "setup_commands": ["python -m pip install -e ."],
+            "metadata": {"domain": "protein"},
+        },
+    }
+    payload.update(overrides)
+    return ScienceProjectConfig.model_validate(payload)
+
+
+def test_subscription_project_compiles_to_transcript_experiment_config() -> None:
+    compiled = compile_science_project(
+        _project(evolution={"parametric_memory": False})
+    )
+
+    assert compiled.experiment.name == "protein-design"
+    assert compiled.agent.preset == "codex"
+    assert compiled.agent.model == "gpt-5.1-codex-mini"
+    assert compiled.agent.auth == "subscription"
+    assert compiled.agent.settings == {
+        "auth_mode": "subscription",
+        "capture_mode": "transcript",
+    }
+    assert compiled.runtime.image == MANAGED_RUNTIME_IMAGES["managed_science"]
+    assert compiled.runtime.workdir == "/polar/session/workspace"
+    assert [action.model_dump(mode="json") for action in compiled.runtime.prepare] == [
+        {
+            "type": "exec",
+            "command": "mkdir -p /polar/session/workspace",
+            "cwd": None,
+            "env": None,
+            "source": None,
+            "target": None,
+        },
+        {
+            "type": "exec",
+            "command": "python -m pip install -e .",
+            "cwd": "/polar/session/workspace",
+            "env": None,
+            "source": None,
+            "target": None,
+        }
+    ]
+    assert len(compiled.tasks) == 1
+    task = compiled.tasks[0]
+    assert task.id == "folding-baseline"
+    assert task.instruction == "Improve the folding baseline."
+    assert task.workspace == "/datasets/folding-baseline"
+    assert task.metadata == {
+        "domain": "protein",
+        "openevo": {
+            "project_name": "protein-design",
+            "remote_profile": "science-team",
+            "source_type": "remote_path",
+            "environment_profile": "managed_science",
+            "execution_mode": "codex_subscription_transcript",
+        },
+    }
+    assert compiled.artifacts.text_memory.enabled is True
+    assert compiled.artifacts.skill_bundle.enabled is True
+    assert compiled.artifacts.agent_system.enabled is True
+    assert compiled.artifacts.parametric_memory.enabled is False
+
+
+def test_local_inference_compiles_to_proxy_auth_and_hf_model_metadata_env() -> None:
+    compiled = compile_science_project(
+        _project(
+            execution={
+                "mode": "codex_managed_local_inference",
+                "hf_model": "Qwen/Qwen3-Coder-30B-A3B-Instruct",
+            },
+            environment={"env": {"SCIENCE_DATASET": "folding"}},
+        )
+    )
+
+    assert compiled.agent.preset == "codex"
+    assert compiled.agent.model == "Qwen/Qwen3-Coder-30B-A3B-Instruct"
+    assert compiled.agent.auth == "proxy"
+    assert compiled.agent.settings == {"auth_mode": "proxy"}
+    assert compiled.runtime.env == {
+        "SCIENCE_DATASET": "folding",
+        "OPENEVO_MANAGED_HF_MODEL": "Qwen/Qwen3-Coder-30B-A3B-Instruct",
+    }
+    assert compiled.tasks[0].metadata["openevo"]["execution_mode"] == (
+        "codex_managed_local_inference"
+    )
+    assert compiled.artifacts.parametric_memory.enabled is False
+
+
+def test_task_metadata_merges_existing_openevo_dict_with_compiler_keys_winning() -> None:
+    compiled = compile_science_project(
+        _project(
+            task={
+                "id": "folding-baseline",
+                "objective": "Improve the folding baseline.",
+                "source": {
+                    "type": "remote_path",
+                    "path": "/datasets/folding-baseline",
+                },
+                "metadata": {
+                    "domain": "protein",
+                    "openevo": {
+                        "sidecar_run_id": "abc",
+                        "project_name": "wrong",
+                    },
+                },
+            }
+        )
+    )
+
+    openevo_metadata = compiled.tasks[0].metadata["openevo"]
+    assert openevo_metadata["sidecar_run_id"] == "abc"
+    assert openevo_metadata["project_name"] == "protein-design"
+
+
+def test_local_folder_requires_prepared_workspace_mapping() -> None:
+    project = _project(
+        task={
+            "id": "local-task",
+            "objective": "Run local workflow.",
+            "source": {
+                "type": "local_folder",
+                "path": "workflows/local-task",
+            },
+        }
+    )
+
+    with pytest.raises(ValueError, match="prepared workspace is required"):
+        compile_science_project(project)
+
+
+def test_local_folder_uses_prepared_workspace_mapping_and_source_fingerprint() -> None:
+    project = _project(
+        task={
+            "id": "local-task",
+            "objective": "Run local workflow.",
+            "source": {
+                "type": "local_folder",
+                "path": "workflows/local-task",
+            },
+        }
+    )
+
+    compiled = compile_science_project(
+        project,
+        prepared_workspaces={
+            "local-task": PreparedWorkspace(
+                path="/tmp/prepared/local-task",
+                source_fingerprint="sha256:abc123",
+            )
+        },
+    )
+
+    assert compiled.tasks[0].workspace == "/tmp/prepared/local-task"
+    assert compiled.tasks[0].metadata["openevo"]["source_fingerprint"] == (
+        "sha256:abc123"
+    )
+
+
+def test_custom_image_profile_controls_runtime_image() -> None:
+    compiled = compile_science_project(
+        _project(
+            environment={
+                "profile": "custom_image",
+                "custom_image": "ghcr.io/example/science:latest",
+            }
+        )
+    )
+
+    assert compiled.runtime.image == "ghcr.io/example/science:latest"
+
+
+def test_scratch_source_has_no_workspace_and_keeps_runtime_and_setup_commands() -> None:
+    compiled = compile_science_project(
+        _project(
+            task={
+                "id": "scratch-task",
+                "objective": "Create a new experiment.",
+                "source": {"type": "scratch"},
+                "setup_commands": ["python -m pip install numpy"],
+            },
+            environment={"profile": "python_research"},
+        )
+    )
+
+    assert compiled.runtime.image == MANAGED_RUNTIME_IMAGES["python_research"]
+    assert compiled.tasks[0].workspace is None
+    assert [action.model_dump(mode="json") for action in compiled.runtime.prepare] == [
+        {
+            "type": "exec",
+            "command": "mkdir -p /polar/session/workspace",
+            "cwd": None,
+            "env": None,
+            "source": None,
+            "target": None,
+        },
+        {
+            "type": "exec",
+            "command": "python -m pip install numpy",
+            "cwd": "/polar/session/workspace",
+            "env": None,
+            "source": None,
+            "target": None,
+        }
+    ]
+
+
+def test_experiment_compiler_uploads_workspace_before_science_prepare_actions() -> None:
+    experiment = compile_science_project(_project())
+    compiled = compile_experiment(experiment)
+
+    payload = compiled.tasks[0].rollout_payload_for_round(0, context_artifact_ids=[])
+
+    assert payload["runtime"]["prepare"] == [
+        {
+            "type": "upload_dir",
+            "source": "/datasets/folding-baseline",
+            "target": "/polar/session/workspace",
+        },
+        {
+            "type": "exec",
+            "source": None,
+            "target": None,
+            "command": "mkdir -p /polar/session/workspace",
+            "cwd": None,
+            "env": None,
+        },
+        {
+            "type": "exec",
+            "source": None,
+            "target": None,
+            "command": "python -m pip install -e .",
+            "cwd": "/polar/session/workspace",
+            "env": None,
+        },
+    ]
