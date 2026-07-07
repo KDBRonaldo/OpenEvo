@@ -38,6 +38,8 @@ DEFAULT_LOCAL_PARAMETRIC_CONTEXT_WINDOW_TOKENS = 16384
 DEFAULT_LOCAL_PARAMETRIC_CONTEXT_RESERVE_TOKENS = 1536
 DEFAULT_LOCAL_PARAMETRIC_AGENT_CONTEXT_SAFETY_TOKENS = 64
 DEFAULT_LOCAL_PARAMETRIC_SOLVER_TEMPERATURE = 0.0
+DEFAULT_LOCAL_PARAMETRIC_ARTIFACT_PATH_GUARD = "off"
+LOCAL_PARAMETRIC_ARTIFACT_PATH_GUARD_CHOICES = ["off", "audit", "repair"]
 DEFAULT_VLLM_GENERATION_CONFIG = "vllm"
 ADAPTER_KEY_REWRITE_NONE = "none"
 ADAPTER_KEY_REWRITE_QWEN35_VLLM_LANGUAGE_MODEL = "qwen3_5_vllm_language_model"
@@ -83,6 +85,8 @@ _CONTROLLED_AGENT_ENV_KEYS = {
     "EVOLAB_TB_MAX_OUTPUT_TOKENS",
     "EVOLAB_TB_MODE",
     "EVOLAB_TB_MODEL",
+    "EVOLAB_TB_ARTIFACT_PATH_GUARD",
+    "EVOLAB_TB_REQUIRED_ARTIFACT_PATHS",
     "EVOLAB_TB_TOOL_RESULT_PROMPT_MAX_CHARS",
 }
 
@@ -194,6 +198,8 @@ def build_evolab_harbor_env(
     context_reserve_tokens: int = DEFAULT_LOCAL_PARAMETRIC_CONTEXT_RESERVE_TOKENS,
     solver_temperature: float = DEFAULT_LOCAL_PARAMETRIC_SOLVER_TEMPERATURE,
     tool_result_prompt_max_chars: int | None = None,
+    artifact_path_guard: str = DEFAULT_LOCAL_PARAMETRIC_ARTIFACT_PATH_GUARD,
+    required_artifact_paths: list[str] | None = None,
     agent_env: dict[str, str] | None = None,
 ) -> dict[str, str]:
     context_window, context_reserve, output_tokens = _local_parametric_context_budget(
@@ -214,6 +220,11 @@ def build_evolab_harbor_env(
         env["EVOLAB_TB_TOOL_RESULT_PROMPT_MAX_CHARS"] = str(
             max(1, int(tool_result_prompt_max_chars))
         )
+    guard_mode = _validate_artifact_path_guard(artifact_path_guard)
+    paths = _normalize_required_artifact_paths(required_artifact_paths)
+    if guard_mode != DEFAULT_LOCAL_PARAMETRIC_ARTIFACT_PATH_GUARD:
+        env["EVOLAB_TB_ARTIFACT_PATH_GUARD"] = guard_mode
+        env["EVOLAB_TB_REQUIRED_ARTIFACT_PATHS"] = json.dumps(paths, sort_keys=True)
     env["EVOLAB_TB_MODEL"] = model
     env["OPENAI_BASE_URL"] = server_url
     env["AIGOCODE_GPT_BASE_URL"] = server_url
@@ -244,6 +255,28 @@ def _validated_agent_env(agent_env: dict[str, str]) -> dict[str, str]:
             )
         validated[key] = str(value)
     return validated
+
+
+def _validate_artifact_path_guard(value: str | None) -> str:
+    guard = (value or DEFAULT_LOCAL_PARAMETRIC_ARTIFACT_PATH_GUARD).strip().lower()
+    if guard not in LOCAL_PARAMETRIC_ARTIFACT_PATH_GUARD_CHOICES:
+        raise ValueError(
+            "unsupported artifact_path_guard: "
+            f"{guard!r}; expected one of {LOCAL_PARAMETRIC_ARTIFACT_PATH_GUARD_CHOICES!r}"
+        )
+    return guard
+
+
+def _normalize_required_artifact_paths(paths: list[str] | None) -> list[str]:
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for raw_path in paths or []:
+        path = str(raw_path).strip()
+        if not path or path in seen:
+            continue
+        seen.add(path)
+        normalized.append(path)
+    return normalized
 
 
 def _path_with_executable_parent(executable: str, base_path: str | None) -> str | None:
@@ -684,9 +717,13 @@ def run_local_parametric_memory_eval_dry_run(
     agent_env: dict[str, str] | None = None,
     auth_mode: str = "local",
     adapter_key_rewrite: str = ADAPTER_KEY_REWRITE_NONE,
+    artifact_path_guard: str = DEFAULT_LOCAL_PARAMETRIC_ARTIFACT_PATH_GUARD,
+    required_artifact_paths: list[str] | None = None,
 ) -> dict[str, Any]:
     auth_mode = _validate_auth_mode(auth_mode)
     key_rewrite = _validate_adapter_key_rewrite(adapter_key_rewrite)
+    guard_mode = _validate_artifact_path_guard(artifact_path_guard)
+    artifact_paths = _normalize_required_artifact_paths(required_artifact_paths)
     requested_output_token_cap = max(1, int(max_output_tokens))
     context_window, context_reserve, output_token_cap = _local_parametric_context_budget(
         max_output_tokens=requested_output_token_cap,
@@ -726,6 +763,8 @@ def run_local_parametric_memory_eval_dry_run(
         "tool_result_prompt_max_chars": tool_result_prompt_cap,
         "manage_server": manage_server,
         "adapter_key_rewrite": key_rewrite,
+        "artifact_path_guard": guard_mode,
+        "required_artifact_paths": artifact_paths,
         "verifier_env": _redacted_env(effective_verifier_env),
         "agent_env": _redacted_env(effective_agent_env),
         "enabled_artifacts": ["parametric_memory"],
@@ -777,10 +816,14 @@ def run_local_parametric_memory_eval(
     port: int = 8000,
     auth_mode: str = "local",
     adapter_key_rewrite: str = ADAPTER_KEY_REWRITE_NONE,
+    artifact_path_guard: str = DEFAULT_LOCAL_PARAMETRIC_ARTIFACT_PATH_GUARD,
+    required_artifact_paths: list[str] | None = None,
 ) -> dict[str, Any]:
     _validate_adapter_path(adapter_path)
     auth_mode = _validate_auth_mode(auth_mode)
     key_rewrite = _validate_adapter_key_rewrite(adapter_key_rewrite)
+    guard_mode = _validate_artifact_path_guard(artifact_path_guard)
+    artifact_paths = _normalize_required_artifact_paths(required_artifact_paths)
     prepared_adapter = prepare_serving_adapter(
         adapter_path=adapter_path,
         run_root=run_root,
@@ -828,6 +871,8 @@ def run_local_parametric_memory_eval(
             tool_result_prompt_max_chars=tool_result_prompt_cap,
             verifier_env=effective_verifier_env,
             agent_env=effective_agent_env,
+            artifact_path_guard=guard_mode,
+            required_artifact_paths=artifact_paths,
             command_runner=command_runner,
             manage_server=manage_server,
             server_timeout_seconds=server_timeout_seconds,
@@ -858,6 +903,8 @@ def run_local_parametric_memory_eval(
         "tool_result_prompt_max_chars": tool_result_prompt_cap,
         "manage_server": manage_server,
         "adapter_key_rewrite": key_rewrite,
+        "artifact_path_guard": guard_mode,
+        "required_artifact_paths": artifact_paths,
         "verifier_env": _redacted_env(effective_verifier_env),
         "agent_env": _redacted_env(effective_agent_env),
         "enabled_artifacts": ["parametric_memory"],
@@ -936,6 +983,8 @@ def _run_local_parametric_condition(
     tool_result_prompt_max_chars: int | None,
     verifier_env: dict[str, str],
     agent_env: dict[str, str],
+    artifact_path_guard: str,
+    required_artifact_paths: list[str],
     command_runner: CommandRunner,
     manage_server: bool,
     server_timeout_seconds: float,
@@ -984,6 +1033,8 @@ def _run_local_parametric_condition(
                 tool_result_prompt_max_chars=tool_result_prompt_max_chars,
                 verifier_env=verifier_env,
                 agent_env=agent_env,
+                artifact_path_guard=artifact_path_guard,
+                required_artifact_paths=required_artifact_paths,
                 command_runner=command_runner,
             )
             for task_id in task_ids
@@ -1071,6 +1122,8 @@ def _run_local_parametric_task(
     tool_result_prompt_max_chars: int | None,
     verifier_env: dict[str, str],
     agent_env: dict[str, str],
+    artifact_path_guard: str,
+    required_artifact_paths: list[str],
     command_runner: CommandRunner,
 ) -> dict[str, Any]:
     job_name = f"{condition.name}-{task_id}"
@@ -1095,6 +1148,8 @@ def _run_local_parametric_task(
         context_reserve_tokens=context_reserve_tokens,
         solver_temperature=solver_temperature,
         tool_result_prompt_max_chars=tool_result_prompt_max_chars,
+        artifact_path_guard=artifact_path_guard,
+        required_artifact_paths=required_artifact_paths,
         agent_env=agent_env,
     )
     _prepend_terminal_bench_package_pythonpath(env, terminal_bench_package_root)

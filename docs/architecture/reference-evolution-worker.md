@@ -628,6 +628,13 @@ Serving contract:
   `EVOLAB_TB_CONTEXT_WINDOW_TOKENS` 暴露为 server window 减 64 token 的 agent-side budget，
   同时保持 summary 中的 `context_window_tokens` 表示实际 server max len。
   `EVOLAB_TB_CONTEXT_RESERVE_TOKENS` 暴露的是已按 agent-side budget clamp 后的 reserve。
+- 本地 eval 可用 `--artifact-path-guard {off,audit,repair}` 和重复的
+  `--required-artifact-path /app/...` 记录并传递 Terminal-Bench artifact path guard 实验变量。
+  默认 `off` 不注入 guard env；`audit`/`repair` 会把
+  `EVOLAB_TB_ARTIFACT_PATH_GUARD` 和 JSON 编码的
+  `EVOLAB_TB_REQUIRED_ARTIFACT_PATHS` 传给 Harbor agent，并在 dry-run/live summary 中记录。
+  该开关用于区分 parametric memory 学到的内容和执行层对必需 artifact path 的硬约束；实际
+  审计或修正语义由安装的 Terminal-Bench/EvoLab package 实现。
 - Managed vLLM LoRA serving 必须让 base served model name 和 adapter id 保持不同。Runner
   用 base model 作为 `--served-model-name`，用 `adapter_id` 作为 `--lora-modules
   <adapter_id>=<adapter_path>` 的 serving-time adapter name，并让 Harbor agent 请求

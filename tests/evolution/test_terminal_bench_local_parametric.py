@@ -143,6 +143,22 @@ def test_build_evolab_harbor_env_applies_agent_env_knobs() -> None:
     assert env["EVOLAB_TB_DIRECT_SOLVER_COMPLETION_GUARD"] == "successful_collect"
 
 
+def test_build_evolab_harbor_env_applies_artifact_path_guard() -> None:
+    env = build_evolab_harbor_env(
+        base_env={},
+        server_url="http://127.0.0.1:8000/v1",
+        model="tb-parametric-memory",
+        artifact_path_guard="repair",
+        required_artifact_paths=["/app/out.txt", "/app/model.bin"],
+    )
+
+    assert env["EVOLAB_TB_ARTIFACT_PATH_GUARD"] == "repair"
+    assert json.loads(env["EVOLAB_TB_REQUIRED_ARTIFACT_PATHS"]) == [
+        "/app/out.txt",
+        "/app/model.bin",
+    ]
+
+
 def test_build_evolab_harbor_env_rejects_unsafe_agent_env() -> None:
     with pytest.raises(ValueError, match="EVOLAB_TB_"):
         build_evolab_harbor_env(
@@ -283,6 +299,29 @@ def test_local_parametric_dry_run_reports_matrix_and_disabled_artifacts(
     assert payload["vllm_generation_config"] == "vllm"
     assert payload["tool_result_prompt_max_chars"] == 2048
     assert payload["agent_env"] == {"EVOLAB_TB_REQUIRE_SUCCESSFUL_COLLECT": "1"}
+    assert payload["artifact_path_guard"] == "off"
+    assert payload["required_artifact_paths"] == []
+
+
+def test_local_parametric_dry_run_records_artifact_path_guard(
+    tmp_path: Path,
+) -> None:
+    payload = run_local_parametric_memory_eval_dry_run(
+        task_root=Path("/root/datasets/terminal-bench-2-1/tasks"),
+        task_ids=["gcode"],
+        run_root=tmp_path / "run",
+        model="Qwen/Qwen3.6-35B-A3B",
+        adapter_path=Path("/tmp/adapter"),
+        adapter_id="tb-parametric-memory",
+        server_url="http://127.0.0.1:8000/v1",
+        n_attempts=1,
+        manage_server=False,
+        artifact_path_guard="audit",
+        required_artifact_paths=["/app/out.txt"],
+    )
+
+    assert payload["artifact_path_guard"] == "audit"
+    assert payload["required_artifact_paths"] == ["/app/out.txt"]
 
 
 def test_run_local_parametric_memory_eval_compares_baseline_and_adapter(
@@ -349,6 +388,8 @@ def test_run_local_parametric_memory_eval_compares_baseline_and_adapter(
         tool_result_prompt_max_chars=2048,
         verifier_env={},
         agent_env={"EVOLAB_TB_REQUIRE_SUCCESSFUL_COLLECT": "1"},
+        artifact_path_guard="repair",
+        required_artifact_paths=["/app/out.txt"],
         command_runner=fake_command_runner,
         manage_server=False,
     )
@@ -376,6 +417,13 @@ def test_run_local_parametric_memory_eval_compares_baseline_and_adapter(
     assert all(env["EVOLAB_TB_LLM_TEMPERATURE"] == "0.0" for env in envs)
     assert all(env["EVOLAB_TB_TOOL_RESULT_PROMPT_MAX_CHARS"] == "2048" for env in envs)
     assert all(env["EVOLAB_TB_REQUIRE_SUCCESSFUL_COLLECT"] == "1" for env in envs)
+    assert all(env["EVOLAB_TB_ARTIFACT_PATH_GUARD"] == "repair" for env in envs)
+    assert all(
+        json.loads(env["EVOLAB_TB_REQUIRED_ARTIFACT_PATHS"]) == ["/app/out.txt"]
+        for env in envs
+    )
+    assert summary["artifact_path_guard"] == "repair"
+    assert summary["required_artifact_paths"] == ["/app/out.txt"]
     assert all(cwd == package_root for cwd in cwds)
     pythonpath_prefix = f"{package_root / 'src'}:{package_root}"
     assert all(env["PYTHONPATH"].startswith(pythonpath_prefix) for env in envs)
@@ -991,6 +1039,10 @@ def test_terminal_bench_local_parametric_cli_dry_run_writes_output(
             "1536",
             "--tool-result-prompt-max-chars",
             "2048",
+            "--artifact-path-guard",
+            "audit",
+            "--required-artifact-path",
+            "/app/out.txt",
             "--manage-server",
             "--dry-run",
             "--output",
@@ -1009,6 +1061,8 @@ def test_terminal_bench_local_parametric_cli_dry_run_writes_output(
     ]
     assert payload["max_output_tokens"] == 1536
     assert payload["tool_result_prompt_max_chars"] == 2048
+    assert payload["artifact_path_guard"] == "audit"
+    assert payload["required_artifact_paths"] == ["/app/out.txt"]
 
 
 def test_terminal_bench_local_parametric_cli_dry_run_records_verifier_env(
@@ -2003,6 +2057,10 @@ def test_terminal_bench_local_parametric_cli_live_invokes_runner(
             "UV_NO_INDEX=1",
             "--agent-env",
             "EVOLAB_TB_REQUIRE_SUCCESSFUL_COLLECT=1",
+            "--artifact-path-guard",
+            "repair",
+            "--required-artifact-path",
+            "/app/out.txt",
             "--output",
             str(output),
         ]
@@ -2018,6 +2076,8 @@ def test_terminal_bench_local_parametric_cli_live_invokes_runner(
     assert captured["auth_mode"] == "proxy"
     assert captured["verifier_env"] == {"UV_NO_INDEX": "1"}
     assert captured["agent_env"] == {"EVOLAB_TB_REQUIRE_SUCCESSFUL_COLLECT": "1"}
+    assert captured["artifact_path_guard"] == "repair"
+    assert captured["required_artifact_paths"] == ["/app/out.txt"]
     assert json.loads(output.read_text(encoding="utf-8")) == {
         "dry_run": False,
         "conditions": [],

@@ -622,6 +622,12 @@ transcript 在后续 turn 中让 `input_tokens + max_output_tokens` 超过 servi
 可见测试入口，应通过同一 `--agent-env` 机制显式提供任务可见的
 `EVOLAB_TB_TEST_COMMAND`。具体 guard
 语义由安装的 Terminal-Bench/EvoLab package 实现，不属于 evolution artifact contract。
+对输出文件路径敏感的 local parametric-memory 实验，应优先使用一等 CLI 参数而不是手写
+`--agent-env`：`--artifact-path-guard {off,audit,repair}` 和重复的
+`--required-artifact-path /app/...`。默认 `off` 保持旧行为；`audit`/`repair` 会在 Harbor
+agent 环境中设置 `EVOLAB_TB_ARTIFACT_PATH_GUARD` 和 JSON 编码的
+`EVOLAB_TB_REQUIRED_ARTIFACT_PATHS`，并在 dry-run/live summary 中记录。该变量只定义本地
+eval 的实验控制面；实际 audit/repair 行为仍由安装的 Terminal-Bench/EvoLab package 提供。
 当显式传入 `--terminal-bench-package-root` 时，本地 parametric-memory eval 会把该目录的
 `src` 和 package root prepend 到 Harbor 子进程的 `PYTHONPATH`，并使用同一 package root
 下的 Terminal-Bench Docker compose override 文件。这样 worktree 中的 EvoLab runtime

@@ -26,6 +26,7 @@ from polar_evolution.terminal_bench_bridge import build_terminal_bench_events
 from polar_evolution.terminal_bench_local_parametric import (
     ADAPTER_KEY_REWRITE_CHOICES,
     ADAPTER_KEY_REWRITE_NONE,
+    DEFAULT_LOCAL_PARAMETRIC_ARTIFACT_PATH_GUARD,
     DEFAULT_LOCAL_MODEL,
     DEFAULT_LOCAL_PARAMETRIC_CONTEXT_RESERVE_TOKENS,
     DEFAULT_LOCAL_PARAMETRIC_CONTEXT_WINDOW_TOKENS,
@@ -34,6 +35,7 @@ from polar_evolution.terminal_bench_local_parametric import (
     DEFAULT_LOCAL_PARAMETRIC_SOLVER_TEMPERATURE,
     DEFAULT_VLLM_GENERATION_CONFIG,
     DEFAULT_VLLM_EXECUTABLE,
+    LOCAL_PARAMETRIC_ARTIFACT_PATH_GUARD_CHOICES,
     run_local_parametric_memory_eval,
     run_local_parametric_memory_eval_dry_run,
 )
@@ -768,6 +770,26 @@ def build_parser() -> argparse.ArgumentParser:
             "EvoLab agent may add back into the model prompt."
         ),
     )
+    tb_local_parametric.add_argument(
+        "--artifact-path-guard",
+        choices=LOCAL_PARAMETRIC_ARTIFACT_PATH_GUARD_CHOICES,
+        default=DEFAULT_LOCAL_PARAMETRIC_ARTIFACT_PATH_GUARD,
+        help=(
+            "Terminal Bench local parametric eval artifact-path guard mode. "
+            "off records no guard env, audit asks the task package to report "
+            "tb_exec path mismatches, and repair asks it to repair supported "
+            "mismatches before execution."
+        ),
+    )
+    tb_local_parametric.add_argument(
+        "--required-artifact-path",
+        action="append",
+        default=[],
+        help=(
+            "Required task artifact path for the artifact-path guard, e.g. "
+            "/app/out.txt. Can be repeated."
+        ),
+    )
     tb_local_parametric.add_argument("--manage-server", action="store_true")
     tb_local_parametric.add_argument("--server-timeout-seconds", type=float, default=600.0)
     tb_local_parametric.add_argument(
@@ -966,6 +988,8 @@ def main(argv: list[str] | None = None) -> int:
                 agent_env=agent_env,
                 auth_mode=args.auth_mode,
                 adapter_key_rewrite=args.adapter_key_rewrite,
+                artifact_path_guard=args.artifact_path_guard,
+                required_artifact_paths=args.required_artifact_path,
             )
             _write_json_output(payload, args.output)
             return 0
@@ -995,6 +1019,8 @@ def main(argv: list[str] | None = None) -> int:
             port=args.server_port,
             auth_mode=args.auth_mode,
             adapter_key_rewrite=args.adapter_key_rewrite,
+            artifact_path_guard=args.artifact_path_guard,
+            required_artifact_paths=args.required_artifact_path,
         )
         _write_json_output(payload, args.output)
         return 0

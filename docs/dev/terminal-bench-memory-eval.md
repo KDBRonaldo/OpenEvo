@@ -1014,6 +1014,17 @@ should either add a constrained decode/validation layer for critical artifact
 paths, or move from single-task memorization to broader path-binding
 supervision before treating `gcode-to-text` as a positive-control task.
 
+The local parametric eval runner now exposes the constrained-path experiment
+variable explicitly with `--artifact-path-guard {off,audit,repair}` and repeated
+`--required-artifact-path /app/...`. This is not a new memory backend: baseline
+and treatment both receive the same guard mode. It records whether the
+Terminal-Bench/EvoLab execution layer should only audit path mismatches or try
+to repair supported `tb_exec` commands before execution, and it writes the
+selected mode plus required paths into the dry-run/live summary. The default is
+`off`; actual audit/repair behavior depends on the installed task package
+honoring `EVOLAB_TB_ARTIFACT_PATH_GUARD` and
+`EVOLAB_TB_REQUIRED_ARTIFACT_PATHS`.
+
 For `password-recovery`, a Qwen3.5-9B local LoRA smoke was trained from the
 existing failed/successful tool-policy trajectory at
 `/tmp/tb21-parametric-memory-password-toolpolicy-20260702-110343/local-eval-password-toolpolicy-2048/baseline/harbor_jobs/baseline-password-recovery/password-recovery__AzMbthq`.
