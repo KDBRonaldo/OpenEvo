@@ -809,6 +809,46 @@ negative/inconclusive task-local method result and as evidence that
 `train-fasttext` is poor for quick iteration unless verifier dependencies are
 prebaked or otherwise cached under the benchmark protocol.
 
+A second `train-fasttext` follow-up used local Qwen failed trajectories instead
+of Codex-only failed references. The pool at
+`/tmp/tb21-task-local-parametric-trainfasttext-local-correction-20260708/local_correction_pool.jsonl`
+combined three failed local Qwen3.5 baseline attempts with one successful Codex
+reference row. A filtered target search requiring the literal
+`fasttext supervised` produced no records, but the unfiltered dry-run at
+`/tmp/tb21-task-local-parametric-trainfasttext-local-correction-20260708/dryrun-any`
+selected a 755-character target command that trains fastText and saves
+`/app/model.bin`. It exported three task-local records, all from
+`live_replay_llm_call:2`, all targeting `/app/model.bin`, and no
+`tb_run_tests` or `tb_collect_result` correction records. This makes the run a
+local-live target-command experiment, not a full correction-stage experiment.
+
+Training at
+`/tmp/tb21-task-local-parametric-trainfasttext-local-correction-20260708/train-trainfasttext-qwen35-local-live-r8-s80`
+used Qwen3.5-9B on GPU 6 with LoRA rank 8, alpha 16, max length 4096, and
+80 SFT steps. The registered artifact was
+`tb-parametric-memory-trainfasttext-local-live-r8-s80` with
+`training_record_count=3`; diagnostics recorded loss moving from about `0.93`,
+`0.89`, `0.82` to roughly `5.6e-05`. The paired eval at
+`/tmp/tb21-task-local-parametric-trainfasttext-local-correction-20260708/eval-trainfasttext-qwen35-local-live-r8-s80`
+used the clean Terminal-Bench/EvoLab package PR #34, managed Qwen3.5-9B vLLM
+on GPU 6 and port 8014, deterministic decoding,
+`--context-window-tokens 32768`, and no artifact-path guard. Only
+`parametric_memory` was enabled; the summary recorded baseline pass@1/pass@k
+`0/1`, parametric-memory pass@1/pass@k `0/1`, and delta `0`, with no Harbor
+exceptions. The treatment server command included LoRA serving and the baseline
+server command did not; GPU 6 and port 8014 were released after the run.
+
+The failure mode is method-relevant. Baseline read the task, issued four
+`tb_exec` inspection/package commands, and then hit `empty_model_response`.
+The LoRA treatment read the task and immediately hit `empty_model_response`
+without issuing any `tb_exec`; it never attempted the trained `/app/model.bin`
+target. This is a clean negative result for the current three-record
+local-live SFT recipe on a second task. The next task-local parametric method
+should not simply repeat one long final command from a successful transcript;
+it needs shorter staged targets, more local correction points, or an explicit
+finish-policy/objective stage that keeps action generation alive after
+`tb_read_task`.
+
 The next fast-verifier task-local run used `gcode-to-text`, which has both
 failed and successful trajectory-pool records and a lightweight pytest
 verifier. The dry projection at
