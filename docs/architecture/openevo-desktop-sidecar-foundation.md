@@ -58,6 +58,11 @@ Desktop shell status returns the same non-secret setup surface for the active
 profile: host, port, user, auth method and reference ids, effective workspace
 root, and proxy/mirror fields. The saved-config catalog remains more restrictive
 and does not expose private-key paths or secret references.
+For Desktop-created Science configs, the setup draft also includes the Science
+execution mode plus exactly one mode-specific model field: `codex_model` for
+`codex_subscription_transcript`, or Hugging Face `hf_model` for
+`codex_managed_local_inference`. The sidecar validates this draft through the
+same `ScienceProjectConfig` schema used by hand-authored YAML.
 
 Desktop shell status also returns `sidecar.transport` for the active local
 sidecar process. That object is capability metadata, not a credential surface:

@@ -484,6 +484,90 @@ describe("OpenEvoDesktop", () => {
     await unmountClient(root);
   });
 
+  it("round-trips managed local inference setup through the setup form", async () => {
+    const shellModel = modelWithManagedLocalInference();
+    apiMocks.fetchOpenEvoDesktopShellModel.mockResolvedValue(shellModel);
+    apiMocks.saveOpenEvoProjectConfig.mockResolvedValue({
+      config: {
+        science_config_path:
+          "/home/alice/.openevo/desktop/projects/protein-design/science.yaml",
+        remote_profile_path:
+          "/home/alice/.openevo/desktop/profiles/science-team.yaml",
+      },
+      status: shellModel,
+    });
+
+    const root = await renderClient();
+    await flushEffects();
+
+    expect(selectByLabel("Execution mode").value).toBe(
+      "codex_managed_local_inference",
+    );
+    expect(inputByLabel("HF model").value).toBe(
+      "Qwen/Qwen3-Coder-30B-A3B-Instruct",
+    );
+    expect(document.body.textContent).toContain("HF model");
+    expect(document.body.textContent).toContain("token capture path");
+
+    await changeInput("HF model", "Qwen/Qwen2.5-7B-Instruct");
+    await act(async () => {
+      buttonByText("Save Config").dispatchEvent(
+        new MouseEvent("click", { bubbles: true }),
+      );
+      await Promise.resolve();
+    });
+
+    expect(apiMocks.saveOpenEvoProjectConfig).toHaveBeenCalledWith(
+      expect.objectContaining({
+        execution_mode: "codex_managed_local_inference",
+        codex_model: null,
+        hf_model: "Qwen/Qwen2.5-7B-Instruct",
+      }),
+    );
+    await unmountClient(root);
+  });
+
+  it("switches subscription setup to managed local inference", async () => {
+    const shellModel = getOpenEvoDesktopShellModel();
+    apiMocks.fetchOpenEvoDesktopShellModel.mockResolvedValue(shellModel);
+    apiMocks.saveOpenEvoProjectConfig.mockResolvedValue({
+      config: {
+        science_config_path:
+          "/home/alice/.openevo/desktop/projects/protein-design/science.yaml",
+        remote_profile_path:
+          "/home/alice/.openevo/desktop/profiles/science-team.yaml",
+      },
+      status: modelWithManagedLocalInference(),
+    });
+
+    const root = await renderClient();
+    await flushEffects();
+
+    expect(selectByLabel("Execution mode").value).toBe(
+      "codex_subscription_transcript",
+    );
+    expect(inputByLabel("Codex model").value).toBe("gpt-5.1-codex-mini");
+
+    await changeSelect("Execution mode", "codex_managed_local_inference");
+    expect(inputByLabel("HF model").value).toBe("");
+    await changeInput("HF model", "Qwen/Qwen3-Coder-30B-A3B-Instruct");
+    await act(async () => {
+      buttonByText("Save Config").dispatchEvent(
+        new MouseEvent("click", { bubbles: true }),
+      );
+      await Promise.resolve();
+    });
+
+    expect(apiMocks.saveOpenEvoProjectConfig).toHaveBeenCalledWith(
+      expect.objectContaining({
+        execution_mode: "codex_managed_local_inference",
+        codex_model: null,
+        hf_model: "Qwen/Qwen3-Coder-30B-A3B-Instruct",
+      }),
+    );
+    await unmountClient(root);
+  });
+
   it("saves password reference auth from the setup form", async () => {
     const shellModel = getOpenEvoDesktopShellModel();
     apiMocks.fetchOpenEvoDesktopShellModel.mockResolvedValue(shellModel);
@@ -1439,6 +1523,18 @@ function modelWithRemoteSetup(): OpenEvoDesktopShellModel {
     bootstrap: {
       ...model.bootstrap,
       workspaceRoot: "/data/openevo/workspaces",
+    },
+  };
+}
+
+function modelWithManagedLocalInference(): OpenEvoDesktopShellModel {
+  const model = getOpenEvoDesktopShellModel();
+  return {
+    ...model,
+    execution: {
+      mode: "codex_managed_local_inference",
+      model: "Qwen/Qwen3-Coder-30B-A3B-Instruct",
+      tokenMetricsAvailable: true,
     },
   };
 }

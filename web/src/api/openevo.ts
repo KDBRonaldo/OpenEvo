@@ -106,7 +106,11 @@ export interface OpenEvoProjectConfigDraft {
   pip_index_url?: string | null;
   huggingface_endpoint?: string | null;
   hf_home?: string | null;
-  codex_model: string;
+  execution_mode:
+    | "codex_subscription_transcript"
+    | "codex_managed_local_inference";
+  codex_model?: string | null;
+  hf_model?: string | null;
   text_memory: boolean;
   skill_bundle: boolean;
   agent_system: boolean;

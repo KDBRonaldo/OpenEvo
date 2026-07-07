@@ -222,6 +222,23 @@ export function OpenEvoDesktop() {
     }));
   };
 
+  const handleExecutionModeChange = (
+    executionMode: OpenEvoProjectConfigDraft["execution_mode"],
+  ) => {
+    setConfigDraft((current) => ({
+      ...current,
+      execution_mode: executionMode,
+      codex_model:
+        executionMode === "codex_subscription_transcript"
+          ? current.codex_model || "gpt-5.1-codex-mini"
+          : null,
+      hf_model:
+        executionMode === "codex_managed_local_inference"
+          ? current.hf_model || ""
+          : null,
+    }));
+  };
+
   const handleSaveConfig = async () => {
     setConfigSaving(true);
     setConfigError(null);
@@ -361,7 +378,11 @@ export function OpenEvoDesktop() {
             <span className="text-slate-300">/</span>
             <span>{model.execution.mode}</span>
             <span className="text-slate-300">/</span>
-            <span>transcript evolution</span>
+            <span>
+              {model.execution.tokenMetricsAvailable
+                ? "token capture path"
+                : "transcript evolution"}
+            </span>
           </div>
         </div>
         <div className="flex flex-wrap gap-2">
@@ -425,7 +446,11 @@ export function OpenEvoDesktop() {
         <Metric
           label="Token metrics"
           value={model.execution.tokenMetricsAvailable ? "available" : "off"}
-          detail="subscription transcript mode"
+          detail={
+            model.execution.tokenMetricsAvailable
+              ? "proxy capture path"
+              : "subscription transcript mode"
+          }
         />
         <Metric
           label="Bootstrap"
@@ -633,11 +658,36 @@ export function OpenEvoDesktop() {
               }
             />
           )}
-          <TextInput
-            label="Codex model"
-            value={configDraft.codex_model}
-            onChange={(value) => handleConfigDraftChange("codex_model", value)}
+          <SelectInput
+            label="Execution mode"
+            value={configDraft.execution_mode}
+            options={[
+              "codex_subscription_transcript",
+              "codex_managed_local_inference",
+            ]}
+            onChange={(value) =>
+              handleExecutionModeChange(
+                value as OpenEvoProjectConfigDraft["execution_mode"],
+              )
+            }
           />
+          {configDraft.execution_mode === "codex_managed_local_inference" ? (
+            <TextInput
+              label="HF model"
+              value={configDraft.hf_model ?? ""}
+              onChange={(value) =>
+                handleConfigDraftChange("hf_model", value || null)
+              }
+            />
+          ) : (
+            <TextInput
+              label="Codex model"
+              value={configDraft.codex_model ?? ""}
+              onChange={(value) =>
+                handleConfigDraftChange("codex_model", value || null)
+              }
+            />
+          )}
           <TextInput
             label="Objective"
             value={configDraft.objective}
@@ -735,7 +785,8 @@ export function OpenEvoDesktop() {
         <Panel title="Science Project" icon={<FileText size={17} />}>
           <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
             <Field label="Task source" value={model.project.source} />
-            <Field label="Codex model" value={model.execution.model} />
+            <Field label="Execution mode" value={model.execution.mode} />
+            <Field label="Model" value={model.execution.model} />
             <Field label="Objective" value={model.project.objective} wide />
           </div>
         </Panel>
@@ -1282,7 +1333,15 @@ function draftFromModel(
     pip_index_url: optionalConfigured(model.remote.proxy.pipIndexUrl),
     huggingface_endpoint: optionalConfigured(model.remote.proxy.huggingFaceEndpoint),
     hf_home: optionalConfigured(model.remote.proxy.hfHome),
-    codex_model: model.execution.model || "gpt-5.1-codex-mini",
+    execution_mode: model.execution.mode,
+    codex_model:
+      model.execution.mode === "codex_subscription_transcript"
+        ? model.execution.model || "gpt-5.1-codex-mini"
+        : null,
+    hf_model:
+      model.execution.mode === "codex_managed_local_inference"
+        ? model.execution.model
+        : null,
     text_memory: model.evolution.some((step) =>
       ["text-memory", "memory"].includes(step.id),
     ),

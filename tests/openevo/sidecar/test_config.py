@@ -59,6 +59,71 @@ def test_desktop_project_config_draft_builds_existing_models() -> None:
     assert profile.proxy.huggingface_endpoint == "https://hf-mirror.com"
 
 
+def test_desktop_project_config_draft_defaults_subscription_codex_model() -> None:
+    draft_payload = dict(VALID_DRAFT)
+    draft_payload.pop("codex_model")
+    draft = DesktopProjectConfigDraft.model_validate(draft_payload)
+
+    project, _profile = build_desktop_project_configs(draft)
+
+    assert project.execution.mode == "codex_subscription_transcript"
+    assert project.execution.codex_model == "gpt-5.1-codex-mini"
+    assert project.execution.hf_model is None
+
+
+def test_desktop_project_config_draft_builds_managed_local_inference() -> None:
+    draft = DesktopProjectConfigDraft.model_validate(
+        VALID_DRAFT
+        | {
+            "execution_mode": "codex_managed_local_inference",
+            "codex_model": None,
+            "hf_model": "Qwen/Qwen3-Coder-30B-A3B-Instruct",
+        }
+    )
+
+    project, _profile = build_desktop_project_configs(draft)
+
+    assert project.execution.mode == "codex_managed_local_inference"
+    assert project.execution.codex_model is None
+    assert project.execution.hf_model == "Qwen/Qwen3-Coder-30B-A3B-Instruct"
+
+
+def test_desktop_project_config_draft_builds_managed_local_inference_without_codex_model() -> None:
+    draft_payload = dict(VALID_DRAFT)
+    draft_payload.pop("codex_model")
+    draft = DesktopProjectConfigDraft.model_validate(
+        draft_payload
+        | {
+            "execution_mode": "codex_managed_local_inference",
+            "hf_model": "Qwen/Qwen3-Coder-30B-A3B-Instruct",
+        }
+    )
+
+    project, _profile = build_desktop_project_configs(draft)
+
+    assert project.execution.mode == "codex_managed_local_inference"
+    assert project.execution.codex_model is None
+    assert project.execution.hf_model == "Qwen/Qwen3-Coder-30B-A3B-Instruct"
+
+
+def test_desktop_project_config_draft_rejects_managed_local_inference_without_hf_model() -> None:
+    with pytest.raises(ValidationError, match="hf_model"):
+        DesktopProjectConfigDraft.model_validate(
+            VALID_DRAFT
+            | {
+                "execution_mode": "codex_managed_local_inference",
+                "codex_model": None,
+            }
+        )
+
+
+def test_desktop_project_config_draft_rejects_hf_model_for_subscription() -> None:
+    with pytest.raises(ValidationError, match="hf_model"):
+        DesktopProjectConfigDraft.model_validate(
+            VALID_DRAFT | {"hf_model": "Qwen/Qwen3-Coder-30B-A3B-Instruct"}
+        )
+
+
 def test_save_desktop_project_config_writes_deterministic_yaml(tmp_path: Path) -> None:
     draft = DesktopProjectConfigDraft.model_validate(VALID_DRAFT)
 
@@ -84,6 +149,27 @@ def test_save_desktop_project_config_writes_deterministic_yaml(tmp_path: Path) -
     assert remote_yaml["proxy"]["https_proxy"] == "http://127.0.0.1:7890"
     assert "path" not in science_yaml
     assert "path" not in remote_yaml
+
+
+def test_save_desktop_project_config_writes_managed_local_inference_yaml(
+    tmp_path: Path,
+) -> None:
+    draft = DesktopProjectConfigDraft.model_validate(
+        VALID_DRAFT
+        | {
+            "execution_mode": "codex_managed_local_inference",
+            "codex_model": None,
+            "hf_model": "Qwen/Qwen3-Coder-30B-A3B-Instruct",
+        }
+    )
+
+    _project, _profile, paths = save_desktop_project_config(draft, tmp_path)
+
+    science_yaml = yaml.safe_load(paths.science_config_path.read_text(encoding="utf-8"))
+    assert science_yaml["execution"] == {
+        "mode": "codex_managed_local_inference",
+        "hf_model": "Qwen/Qwen3-Coder-30B-A3B-Instruct",
+    }
 
 
 def test_list_desktop_project_configs_returns_non_secret_summaries(

@@ -1034,6 +1034,44 @@ def test_project_config_endpoint_returns_422_for_model_validation_failures(
     assert not (tmp_path / "profiles").exists()
 
 
+def test_project_config_endpoint_saves_managed_local_inference_draft(
+    tmp_path: Path,
+) -> None:
+    client = TestClient(
+        create_sidecar_app(
+            config_root=tmp_path,
+            transport_factory=lambda _profile: _ApiDryRunTransport(),
+        )
+    )
+    token = _sidecar_token(client)
+
+    response = client.post(
+        "/openevo-api/desktop/project-config",
+        headers={"X-OpenEvo-Sidecar-Token": token},
+        json=_desktop_config_draft_payload()
+        | {
+            "execution_mode": "codex_managed_local_inference",
+            "codex_model": None,
+            "hf_model": "Qwen/Qwen3-Coder-30B-A3B-Instruct",
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"]["execution"] == {
+        "mode": "codex_managed_local_inference",
+        "model": "Qwen/Qwen3-Coder-30B-A3B-Instruct",
+        "token_metrics_available": True,
+    }
+    science_yaml = yaml.safe_load(
+        Path(payload["config"]["science_config_path"]).read_text(encoding="utf-8")
+    )
+    assert science_yaml["execution"] == {
+        "mode": "codex_managed_local_inference",
+        "hf_model": "Qwen/Qwen3-Coder-30B-A3B-Instruct",
+    }
+
+
 def test_project_config_endpoint_rejects_raw_secret_extra(tmp_path: Path) -> None:
     client = TestClient(
         create_sidecar_app(

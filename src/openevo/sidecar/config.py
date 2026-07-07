@@ -53,10 +53,25 @@ class DesktopProjectConfigDraft(_StrictFrozenModel):
     pip_index_url: str | None = None
     huggingface_endpoint: str | None = None
     hf_home: str | None = None
-    codex_model: str = "gpt-5.1-codex-mini"
+    execution_mode: Literal[
+        "codex_subscription_transcript",
+        "codex_managed_local_inference",
+    ] = "codex_subscription_transcript"
+    codex_model: str | None = None
+    hf_model: str | None = None
     text_memory: bool = True
     skill_bundle: bool = True
     agent_system: bool = True
+
+    @model_validator(mode="before")
+    @classmethod
+    def _default_subscription_codex_model(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        mode = data.get("execution_mode", "codex_subscription_transcript")
+        if mode == "codex_subscription_transcript" and "codex_model" not in data:
+            return data | {"codex_model": "gpt-5.1-codex-mini"}
+        return data
 
     @field_validator(
         "project_name",
@@ -79,6 +94,7 @@ class DesktopProjectConfigDraft(_StrictFrozenModel):
         "huggingface_endpoint",
         "hf_home",
         "codex_model",
+        "hf_model",
     )
     @classmethod
     def _strip_text(cls, value: str | None, info) -> str | None:
@@ -114,6 +130,16 @@ class DesktopProjectConfigDraft(_StrictFrozenModel):
 
         if self.source_branch is not None and self.source_type != "git_repository":
             raise ValueError("source_branch is only valid for git_repository")
+        if self.execution_mode == "codex_subscription_transcript":
+            if self.codex_model is None:
+                raise ValueError("codex_model is required for subscription mode")
+            if self.hf_model is not None:
+                raise ValueError("hf_model is only valid for managed local inference")
+        elif self.execution_mode == "codex_managed_local_inference":
+            if self.codex_model is not None:
+                raise ValueError("codex_model is only valid for subscription mode")
+            if self.hf_model is None:
+                raise ValueError("hf_model is required for managed local inference")
         return self
 
 
@@ -226,10 +252,7 @@ def _science_project_payload(draft: DesktopProjectConfigDraft) -> dict[str, Any]
             "objective": draft.objective,
             "source": _task_source_payload(draft),
         },
-        "execution": {
-            "mode": "codex_subscription_transcript",
-            "codex_model": draft.codex_model,
-        },
+        "execution": _execution_payload(draft),
         "evolution": {
             "text_memory": draft.text_memory,
             "skill_bundle": draft.skill_bundle,
@@ -248,6 +271,18 @@ def _task_source_payload(draft: DesktopProjectConfigDraft) -> dict[str, Any]:
             payload["branch"] = draft.source_branch
         return payload
     return {"type": "scratch"}
+
+
+def _execution_payload(draft: DesktopProjectConfigDraft) -> dict[str, Any]:
+    if draft.execution_mode == "codex_managed_local_inference":
+        return {
+            "mode": "codex_managed_local_inference",
+            "hf_model": draft.hf_model,
+        }
+    return {
+        "mode": "codex_subscription_transcript",
+        "codex_model": draft.codex_model,
+    }
 
 
 def _remote_profile_payload(draft: DesktopProjectConfigDraft) -> dict[str, Any]:

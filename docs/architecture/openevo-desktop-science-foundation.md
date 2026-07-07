@@ -241,8 +241,10 @@ ordinary Desktop users. It is mutation-token protected and available when the
 sidecar was created with a writable config root and transport factory. The
 request payload is a typed Desktop draft with project name, task id, objective,
 task source, SSH host/user/port/auth references, workspace root, proxy/mirror
-settings, Codex model, and text evolution toggles. The sidecar validates that
-draft by constructing the existing
+settings, execution mode, mode-specific model field, and text evolution
+toggles. Subscription transcript drafts carry `codex_model`; managed local
+inference drafts carry Hugging Face `hf_model` and omit `codex_model`. The
+sidecar validates that draft by constructing the existing
 `ScienceProjectConfig` and `RemoteProfileConfig` models, then writes:
 
 ```text
@@ -293,8 +295,10 @@ the newly written config is available without restarting Desktop.
 The same panel exposes the non-secret remote setup fields, including remote
 profile id, SSH auth method, private-key path/reference ids, workspace root,
 HTTP/HTTPS proxy, `NO_PROXY`, pip index URL, Hugging Face endpoint, and
-`HF_HOME`, so science users can configure a new remote GPU server from Desktop
-without editing YAML for common proxy or mirror settings.
+`HF_HOME`, plus the execution-mode selector and relevant model input. Science
+users can therefore configure either Codex subscription transcript mode or
+remote managed local inference from Desktop without editing YAML for common
+proxy, mirror, or model settings.
 
 `POST /openevo-api/desktop/bootstrap` is the first mutating sidecar endpoint.
 It is available only for config-backed sidecar sessions. It reuses
@@ -332,6 +336,11 @@ the remote command PATH plus `~/.local/bin`, it runs
 proxy/PIP environment. It then validates `openevo --help`; if that check fails,
 bootstrap attempts one user-site upgrade and validates again before reporting
 the failure.
+For managed local inference configs, the compiled experiment contains
+`OPENEVO_MANAGED_HF_MODEL`, so the remote bootstrap plan also attempts a
+Hugging Face snapshot download using the configured `HF_ENDPOINT`, `HF_HOME`,
+and proxy/PIP environment. vLLM startup and health supervision remain separate
+from this setup form and bootstrap slice.
 
 `POST /openevo-api/desktop/run` launches the configured Science task after
 workspace and bootstrap readiness. It is available only for config-backed

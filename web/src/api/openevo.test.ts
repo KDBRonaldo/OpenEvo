@@ -590,6 +590,7 @@ function projectConfigDraft() {
     workspace_root: "/home/alice/.openevo/workspaces",
     https_proxy: "http://127.0.0.1:7890",
     huggingface_endpoint: "https://hf-mirror.com",
+    execution_mode: "codex_subscription_transcript" as const,
     codex_model: "gpt-5.1-codex-mini",
     text_memory: true,
     skill_bundle: true,
