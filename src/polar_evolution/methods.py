@@ -1603,6 +1603,10 @@ def _sft_message_sets_from_record(
             trace.get("response_messages"),
             default_role="assistant",
         )
+        trace_extra_fields: dict[str, Any] = {}
+        trace_tools = trace.get("tools")
+        if isinstance(trace_tools, list):
+            trace_extra_fields["tools"] = trace_tools
         if training_projection.get("type") == "terminal_bench_corrective_tool_call_policy":
             message_sets.extend(
                 _terminal_bench_corrective_tool_call_policy_message_sets(
@@ -1627,7 +1631,13 @@ def _sft_message_sets_from_record(
             training_projection=training_projection,
         )
         if prompt_messages and response_messages:
-            message_sets.append((trace_index, [*prompt_messages, *response_messages], {}))
+            message_sets.append(
+                (
+                    trace_index,
+                    [*prompt_messages, *response_messages],
+                    dict(trace_extra_fields),
+                )
+            )
     return message_sets
 
 
@@ -2538,8 +2548,18 @@ def _sft_messages(value: Any, *, default_role: str) -> list[dict[str, Any]]:
         if not isinstance(role, str) or not role.strip():
             role = default_role
         content = _content_text(message.get("content"))
-        if content:
-            messages.append({"role": role.strip(), "content": content})
+        compact: dict[str, Any] = {"role": role.strip(), "content": content}
+        tool_calls = message.get("tool_calls")
+        if isinstance(tool_calls, list) and tool_calls:
+            compact["tool_calls"] = tool_calls
+        tool_call_id = message.get("tool_call_id")
+        if isinstance(tool_call_id, str) and tool_call_id.strip():
+            compact["tool_call_id"] = tool_call_id.strip()
+        name = message.get("name")
+        if isinstance(name, str) and name.strip():
+            compact["name"] = name.strip()
+        if content or compact.get("tool_calls"):
+            messages.append(compact)
     return messages
 
 

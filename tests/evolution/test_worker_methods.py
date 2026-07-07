@@ -3076,6 +3076,106 @@ def test_parametric_memory_lora_sft_exports_every_successful_trace(tmp_path: Pat
     assert artifact.compatibility == {"base_model": ["Qwen/Qwen3.6-35B-A3B"]}
 
 
+def test_parametric_memory_lora_sft_full_trace_preserves_trace_tools(tmp_path: Path):
+    trainer_script = tmp_path / "fake_trainer.py"
+    trainer_script.write_text(
+        "from pathlib import Path\n"
+        "import argparse\n"
+        "parser = argparse.ArgumentParser()\n"
+        "parser.add_argument('--train-file')\n"
+        "parser.add_argument('--output-dir')\n"
+        "args = parser.parse_args()\n"
+        "Path(args.output_dir).mkdir(parents=True, exist_ok=True)\n"
+        "(Path(args.output_dir) / 'adapter_config.json').write_text('{}')\n",
+        encoding="utf-8",
+    )
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "tb_exec",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"command": {"type": "string"}},
+                },
+            },
+        }
+    ]
+    dataset = _parametric_dataset_artifact(
+        tmp_path,
+        [
+            {
+                "event_id": "evt_task_local",
+                "task_id": "train-fasttext",
+                "status": "COMPLETED",
+                "reward": 1.0,
+                "traces": [
+                    {
+                        "prompt_messages": [
+                            {"role": "user", "content": "Train model."}
+                        ],
+                        "response_messages": [
+                            {
+                                "role": "assistant",
+                                "content": "",
+                                "tool_calls": [
+                                    {
+                                        "id": "call-target",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "tb_exec",
+                                            "arguments": {
+                                                "command": (
+                                                    "cp model.bin /app/model.bin"
+                                                )
+                                            },
+                                        },
+                                    }
+                                ],
+                            }
+                        ],
+                        "tools": tools,
+                    }
+                ],
+            }
+        ],
+    )
+    job = _job(
+        "parametric_memory_lora_sft",
+        tmp_path,
+        input_artifacts=[dataset],
+        config={
+            "base_model": "Qwen/Qwen3.6-35B-A3B",
+            "training_projection": {"type": "full_trace"},
+            "trainer": {
+                "command": "python",
+                "args": [
+                    str(trainer_script),
+                    "--train-file",
+                    "{training_dataset}",
+                    "--output-dir",
+                    "{adapter_dir}",
+                ],
+            },
+        },
+    )
+
+    run_method(job, artifact_root=tmp_path / "artifacts")
+
+    train_path = (
+        tmp_path
+        / "artifacts"
+        / "workers"
+        / job.job_id
+        / "parametric_memory_lora_sft"
+        / "training.jsonl"
+    )
+    [training_line] = [
+        json.loads(line) for line in train_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert training_line["tools"] == tools
+
+
 def test_parametric_memory_lora_sft_can_project_response_tail(tmp_path: Path):
     trainer_script = tmp_path / "fake_trainer.py"
     trainer_script.write_text(
