@@ -15,6 +15,7 @@ const apiMocks = vi.hoisted(() => ({
   runOpenEvoBootstrap: vi.fn(),
   runOpenEvoStartRun: vi.fn(),
   runOpenEvoWorkspaceSync: vi.fn(),
+  saveOpenEvoProjectConfig: vi.fn(),
 }));
 
 vi.mock("../api/openevo", () => ({
@@ -22,6 +23,7 @@ vi.mock("../api/openevo", () => ({
   runOpenEvoBootstrap: apiMocks.runOpenEvoBootstrap,
   runOpenEvoStartRun: apiMocks.runOpenEvoStartRun,
   runOpenEvoWorkspaceSync: apiMocks.runOpenEvoWorkspaceSync,
+  saveOpenEvoProjectConfig: apiMocks.saveOpenEvoProjectConfig,
 }));
 
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
@@ -32,6 +34,7 @@ describe("OpenEvoDesktop", () => {
     apiMocks.runOpenEvoBootstrap.mockReset();
     apiMocks.runOpenEvoStartRun.mockReset();
     apiMocks.runOpenEvoWorkspaceSync.mockReset();
+    apiMocks.saveOpenEvoProjectConfig.mockReset();
     apiMocks.fetchOpenEvoDesktopShellModel.mockRejectedValue(
       new Error("sidecar unavailable"),
     );
@@ -42,6 +45,9 @@ describe("OpenEvoDesktop", () => {
       new Error("sidecar unavailable"),
     );
     apiMocks.runOpenEvoWorkspaceSync.mockRejectedValue(
+      new Error("sidecar unavailable"),
+    );
+    apiMocks.saveOpenEvoProjectConfig.mockRejectedValue(
       new Error("sidecar unavailable"),
     );
     document.body.innerHTML = "";
@@ -103,6 +109,69 @@ describe("OpenEvoDesktop", () => {
 
     expect(document.body.textContent).toContain("Remote ready");
     expect(document.body.textContent).toContain("Remote bootstrap is ready.");
+    await unmountClient(root);
+  });
+
+  it("saves project config from the setup form and refreshes visible status", async () => {
+    const shellModel = getOpenEvoDesktopShellModel();
+    const savedModel = {
+      ...shellModel,
+      project: {
+        ...shellModel.project,
+        name: "Configured Science Project",
+      },
+      remote: {
+        ...shellModel.remote,
+        host: "configured.gpu.example.edu",
+      },
+    };
+    apiMocks.fetchOpenEvoDesktopShellModel.mockResolvedValue(shellModel);
+    const deferred = deferProjectConfig(savedModel);
+    apiMocks.saveOpenEvoProjectConfig.mockReturnValue(deferred.promise);
+
+    const root = await renderClient();
+    await flushEffects();
+
+    await changeInput("Project name", "Configured Science Project");
+    await changeInput("Remote host", "configured.gpu.example.edu");
+    await changeInput("Remote port", "2222");
+
+    const button = buttonByText("Save Config");
+    expect(button.disabled).toBe(false);
+
+    await act(async () => {
+      button.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+
+    expect(apiMocks.saveOpenEvoProjectConfig).toHaveBeenCalledWith(
+      expect.objectContaining({
+        project_name: "Configured Science Project",
+        remote_host: "configured.gpu.example.edu",
+        remote_port: 2222,
+        source_type: "git_repository",
+        text_memory: true,
+        skill_bundle: true,
+        agent_system: true,
+      }),
+    );
+    expect(document.body.textContent).toContain("Saving");
+
+    await act(async () => {
+      deferred.resolve({
+        config: {
+          science_config_path:
+            "/home/alice/.openevo/desktop/projects/configured/science.yaml",
+          remote_profile_path:
+            "/home/alice/.openevo/desktop/profiles/science-team.yaml",
+        },
+        status: savedModel,
+      });
+      await Promise.resolve();
+    });
+
+    expect(document.body.textContent).toContain("Configured Science Project");
+    expect(document.body.textContent).toContain("configured.gpu.example.edu");
+    expect(inputByLabel("Remote port").value).toBe("2222");
     await unmountClient(root);
   });
 
@@ -290,6 +359,30 @@ describe("OpenEvoDesktop", () => {
     );
     await unmountClient(root);
   });
+
+  it("shows a project config error when the sidecar rejects the draft", async () => {
+    apiMocks.fetchOpenEvoDesktopShellModel.mockResolvedValue(
+      getOpenEvoDesktopShellModel(),
+    );
+    apiMocks.saveOpenEvoProjectConfig.mockRejectedValue(
+      new Error("HTTP 422 Unprocessable Entity: invalid draft"),
+    );
+
+    const root = await renderClient();
+    await flushEffects();
+
+    await act(async () => {
+      buttonByText("Save Config").dispatchEvent(
+        new MouseEvent("click", { bubbles: true }),
+      );
+      await Promise.resolve();
+    });
+
+    expect(document.body.textContent).toContain(
+      "HTTP 422 Unprocessable Entity: invalid draft",
+    );
+    await unmountClient(root);
+  });
 });
 
 async function renderClient(): Promise<Root> {
@@ -322,6 +415,27 @@ function buttonByText(text: string): HTMLButtonElement {
     throw new Error(`Button not found: ${text}`);
   }
   return button;
+}
+
+async function changeInput(label: string, value: string) {
+  const input = inputByLabel(label);
+  await act(async () => {
+    const setter = Object.getOwnPropertyDescriptor(
+      HTMLInputElement.prototype,
+      "value",
+    )?.set;
+    setter?.call(input, value);
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    input.dispatchEvent(new Event("change", { bubbles: true }));
+  });
+}
+
+function inputByLabel(label: string): HTMLInputElement {
+  const input = document.querySelector(`[aria-label="${label}"]`);
+  if (!(input instanceof HTMLInputElement)) {
+    throw new Error(`Input not found: ${label}`);
+  }
+  return input;
 }
 
 function modelWithBootstrap({
@@ -467,6 +581,26 @@ function deferRun(status: OpenEvoDesktopShellModel) {
   }) => void;
   const promise = new Promise<{
     run: Record<string, any>;
+    status: OpenEvoDesktopShellModel;
+  }>((next) => {
+    resolve = next;
+  });
+  return { promise, resolve, status };
+}
+
+function deferProjectConfig(status: OpenEvoDesktopShellModel) {
+  let resolve!: (value: {
+    config: {
+      science_config_path: string;
+      remote_profile_path: string;
+    };
+    status: OpenEvoDesktopShellModel;
+  }) => void;
+  const promise = new Promise<{
+    config: {
+      science_config_path: string;
+      remote_profile_path: string;
+    };
     status: OpenEvoDesktopShellModel;
   }>((next) => {
     resolve = next;

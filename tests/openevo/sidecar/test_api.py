@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import json
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Event
 
 from fastapi.testclient import TestClient
 import pytest
+import yaml
 
+import openevo.sidecar.api as sidecar_api
 from openevo.sidecar import (
     DesktopExecutionStatus,
     build_desktop_shell_status,
@@ -540,6 +543,237 @@ def test_workspace_and_bootstrap_concurrent_status_updates_do_not_clobber(
     assert services["bootstrap"]["state"] == "ready"
 
 
+def test_project_config_endpoint_rejects_missing_sidecar_token(tmp_path: Path) -> None:
+    client = TestClient(
+        create_sidecar_app(
+            config_root=tmp_path,
+            transport_factory=lambda _profile: _ApiDryRunTransport(),
+        )
+    )
+
+    response = client.post(
+        "/openevo-api/desktop/project-config",
+        json=_desktop_config_draft_payload(),
+    )
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Invalid OpenEvo sidecar token."
+
+
+def test_project_config_endpoint_saves_config_and_enables_workspace(
+    tmp_path: Path,
+) -> None:
+    client = TestClient(
+        create_sidecar_app(
+            config_root=tmp_path,
+            transport_factory=lambda _profile: _ApiDryRunTransport(),
+        )
+    )
+    token = _sidecar_token(client)
+    headers = {"X-OpenEvo-Sidecar-Token": token}
+
+    response = client.post(
+        "/openevo-api/desktop/project-config",
+        headers=headers,
+        json=_desktop_config_draft_payload(),
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    science_path = Path(payload["config"]["science_config_path"])
+    profile_path = Path(payload["config"]["remote_profile_path"])
+    assert science_path == tmp_path / "projects" / "protein-design" / "science.yaml"
+    assert profile_path == tmp_path / "profiles" / "science-team.yaml"
+    assert science_path.is_file()
+    assert profile_path.is_file()
+    science_yaml = yaml.safe_load(science_path.read_text(encoding="utf-8"))
+    profile_yaml = yaml.safe_load(profile_path.read_text(encoding="utf-8"))
+    assert science_yaml["project"]["name"] == "Protein Design"
+    assert profile_yaml["host"] == "gpu.example.edu"
+    assert payload["status"]["project"]["name"] == "Protein Design"
+    assert payload["status"]["remote"]["host"] == "gpu.example.edu"
+
+    workspace = client.post("/openevo-api/desktop/workspace", headers=headers)
+    assert workspace.status_code == 200
+    assert workspace.json()["workspace"]["ready"] is True
+
+
+def test_project_config_endpoint_returns_status_for_submitted_draft_when_overlapped(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first_status_requested = Event()
+    release_first_status = Event()
+    original_session = sidecar_api.OpenEvoSidecarSession
+    session_count = 0
+
+    class _BlockingStatusLock:
+        def __enter__(self):
+            first_status_requested.set()
+            if not release_first_status.wait(timeout=5):
+                raise TimeoutError("project config status test timed out")
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+    def session_factory(*args, **kwargs):
+        nonlocal session_count
+        session_count += 1
+        created = original_session(*args, **kwargs)
+        if session_count == 1:
+            created.status_lock = _BlockingStatusLock()
+        return created
+
+    monkeypatch.setattr(sidecar_api, "OpenEvoSidecarSession", session_factory)
+    client = TestClient(
+        sidecar_api.create_sidecar_app(
+            config_root=tmp_path,
+            transport_factory=lambda _profile: _ApiDryRunTransport(),
+        )
+    )
+    token = _sidecar_token(client)
+    headers = {"X-OpenEvo-Sidecar-Token": token}
+    first_draft = _desktop_config_draft_payload() | {
+        "project_name": "First Project",
+        "task_id": "first-task",
+        "remote_profile_id": "first-team",
+    }
+    second_draft = _desktop_config_draft_payload() | {
+        "project_name": "Second Project",
+        "task_id": "second-task",
+        "remote_profile_id": "second-team",
+        "remote_host": "gpu2.example.edu",
+    }
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        first = executor.submit(
+            client.post,
+            "/openevo-api/desktop/project-config",
+            headers=headers,
+            json=first_draft,
+        )
+        assert first_status_requested.wait(timeout=5)
+        second = client.post(
+            "/openevo-api/desktop/project-config",
+            headers=headers,
+            json=second_draft,
+        )
+        release_first_status.set()
+
+    first_response = first.result(timeout=5)
+    assert second.status_code == 200
+    assert first_response.status_code == 200
+    assert second.json()["status"]["project"]["name"] == "Second Project"
+    assert first_response.json()["status"]["project"]["name"] == "First Project"
+
+
+def test_project_config_endpoint_rejects_invalid_draft(tmp_path: Path) -> None:
+    client = TestClient(
+        create_sidecar_app(
+            config_root=tmp_path,
+            transport_factory=lambda _profile: _ApiDryRunTransport(),
+        )
+    )
+    token = _sidecar_token(client)
+
+    response = client.post(
+        "/openevo-api/desktop/project-config",
+        headers={"X-OpenEvo-Sidecar-Token": token},
+        json=_desktop_config_draft_payload() | {"remote_host": " "},
+    )
+
+    assert response.status_code == 422
+    assert not (tmp_path / "projects").exists()
+    assert not (tmp_path / "profiles").exists()
+
+
+def test_project_config_endpoint_returns_422_for_model_validation_failures(
+    tmp_path: Path,
+) -> None:
+    client = TestClient(
+        create_sidecar_app(
+            config_root=tmp_path,
+            transport_factory=lambda _profile: _ApiDryRunTransport(),
+        )
+    )
+    token = _sidecar_token(client)
+
+    response = client.post(
+        "/openevo-api/desktop/project-config",
+        headers={"X-OpenEvo-Sidecar-Token": token},
+        json=_desktop_config_draft_payload() | {"task_id": "bad/task"},
+    )
+
+    assert response.status_code == 422
+    assert not (tmp_path / "projects").exists()
+    assert not (tmp_path / "profiles").exists()
+
+
+def test_project_config_endpoint_rejects_raw_secret_extra(tmp_path: Path) -> None:
+    client = TestClient(
+        create_sidecar_app(
+            config_root=tmp_path,
+            transport_factory=lambda _profile: _ApiDryRunTransport(),
+        )
+    )
+    token = _sidecar_token(client)
+
+    response = client.post(
+        "/openevo-api/desktop/project-config",
+        headers={"X-OpenEvo-Sidecar-Token": token},
+        json=_desktop_config_draft_payload() | {"password": "super-secret-value"},
+    )
+
+    assert response.status_code == 422
+    assert "super-secret-value" not in json.dumps(response.json())
+    assert not (tmp_path / "projects").exists()
+    assert not (tmp_path / "profiles").exists()
+
+
+def test_project_config_endpoint_rejects_while_workspace_is_running(
+    tmp_path: Path,
+) -> None:
+    local_source = tmp_path / "workflow"
+    local_source.mkdir()
+    transport = _BlockingWorkspaceTransport()
+    client = TestClient(
+        create_sidecar_app(
+            config_root=tmp_path / "config",
+            transport_factory=lambda _profile: transport,
+        )
+    )
+    token = _sidecar_token(client)
+    headers = {"X-OpenEvo-Sidecar-Token": token}
+    config = client.post(
+        "/openevo-api/desktop/project-config",
+        headers=headers,
+        json=_desktop_config_draft_payload()
+        | {"source_type": "local_folder", "source_path": str(local_source)},
+    )
+    assert config.status_code == 200
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        workspace = executor.submit(
+            client.post,
+            "/openevo-api/desktop/workspace",
+            headers=headers,
+        )
+        assert transport.started.wait(timeout=5)
+        second = client.post(
+            "/openevo-api/desktop/project-config",
+            headers=headers,
+            json=_desktop_config_draft_payload(),
+        )
+        transport.release.set()
+
+    assert second.status_code == 409
+    assert second.json()["detail"] == (
+        "Desktop project config cannot run while another lifecycle action is running."
+    )
+    assert workspace.result(timeout=5).status_code == 200
+
+
 def test_run_endpoint_requires_config_backed_session() -> None:
     client = TestClient(create_sidecar_app())
     token = _sidecar_token(client)
@@ -793,6 +1027,27 @@ def _sidecar_token(client: TestClient) -> str:
     token = payload["sidecar"]["mutation_token"]
     assert token
     return token
+
+
+def _desktop_config_draft_payload() -> dict:
+    return {
+        "project_name": "Protein Design",
+        "task_id": "folding-baseline",
+        "objective": "Improve the folding baseline.",
+        "source_type": "remote_path",
+        "source_path": "/datasets/folding-baseline",
+        "remote_profile_id": "science-team",
+        "remote_host": "gpu.example.edu",
+        "remote_port": 22,
+        "remote_user": "alice",
+        "auth_method": "ssh_agent",
+        "https_proxy": "http://127.0.0.1:7890",
+        "huggingface_endpoint": "https://hf-mirror.com",
+        "codex_model": "gpt-5.1-codex-mini",
+        "text_memory": True,
+        "skill_bundle": True,
+        "agent_system": True,
+    }
 
 
 def _prepare_workspace_and_bootstrap(

@@ -4,6 +4,7 @@ import {
   runOpenEvoBootstrap,
   runOpenEvoStartRun,
   runOpenEvoWorkspaceSync,
+  saveOpenEvoProjectConfig,
   toOpenEvoBootstrapResponse,
   toOpenEvoDesktopShellModel,
 } from "./openevo";
@@ -232,6 +233,57 @@ describe("OpenEvo sidecar client", () => {
     expect(calls[1]).toMatchObject({ path: "/openevo-api/desktop/run" });
     expect(calls[1].headers.get("X-OpenEvo-Sidecar-Token")).toBe("run-token");
   });
+
+  it("sends the sidecar mutation token on project config requests", async () => {
+    const calls: Array<{ path: string; headers: Headers; body: any }> = [];
+    const shellPayload = sidecarShellPayload("config-token");
+    const savedPayload = {
+      ...shellPayload,
+      project: {
+        ...shellPayload.project,
+        name: "Configured Project",
+      },
+    };
+    vi.spyOn(globalThis, "fetch").mockImplementation(
+      async (input, init) => {
+        const path = String(input);
+        calls.push({
+          path,
+          headers: new Headers(init?.headers),
+          body: init?.body ? JSON.parse(String(init.body)) : undefined,
+        });
+        if (path === "/openevo-api/desktop/shell") {
+          return jsonResponse(shellPayload);
+        }
+        if (path === "/openevo-api/desktop/project-config") {
+          return jsonResponse({
+            config: {
+              science_config_path:
+                "/home/alice/.openevo/desktop/projects/configured/science.yaml",
+              remote_profile_path:
+                "/home/alice/.openevo/desktop/profiles/science-team.yaml",
+            },
+            status: savedPayload,
+          });
+        }
+        return new Response("not found", { status: 404 });
+      },
+    );
+
+    await fetchOpenEvoDesktopShellModel();
+    const response = await saveOpenEvoProjectConfig(projectConfigDraft());
+
+    expect(response.config.science_config_path).toContain("science.yaml");
+    expect(response.status.project.name).toBe("Configured Project");
+    expect(calls).toHaveLength(2);
+    expect(calls[1]).toMatchObject({
+      path: "/openevo-api/desktop/project-config",
+    });
+    expect(calls[1].headers.get("X-OpenEvo-Sidecar-Token")).toBe(
+      "config-token",
+    );
+    expect(calls[1].body.remote_host).toBe("gpu.example.edu");
+  });
 });
 
 function sidecarShellPayload(mutationToken: string) {
@@ -286,6 +338,27 @@ function sidecarRunReport() {
     output_dir: "/home/alice/.openevo/runs/protein/folding/runs/latest",
     experiment_snapshot: "/home/alice/.openevo/runs/protein/folding/experiment.json",
     started_at: "2026-07-07T16:00:00+00:00",
+  };
+}
+
+function projectConfigDraft() {
+  return {
+    project_name: "Protein Design",
+    task_id: "folding-baseline",
+    objective: "Improve the folding baseline.",
+    source_type: "remote_path" as const,
+    source_path: "/datasets/folding-baseline",
+    remote_profile_id: "science-team",
+    remote_host: "gpu.example.edu",
+    remote_port: 22,
+    remote_user: "alice",
+    auth_method: "ssh_agent" as const,
+    https_proxy: "http://127.0.0.1:7890",
+    huggingface_endpoint: "https://hf-mirror.com",
+    codex_model: "gpt-5.1-codex-mini",
+    text_memory: true,
+    skill_bundle: true,
+    agent_system: true,
   };
 }
 

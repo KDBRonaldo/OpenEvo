@@ -21,6 +21,7 @@ from openevo.sidecar.workspace import (
 from openevo.sidecar.api import (
     DesktopExecutionStatus,
     OpenEvoDesktopBootstrapResponse,
+    OpenEvoDesktopProjectConfigResponse,
     OpenEvoDesktopRunReport,
     OpenEvoDesktopRunResponse,
     OpenEvoDesktopShellStatus,
@@ -32,10 +33,19 @@ from openevo.sidecar.api import (
     create_sidecar_app_for_project,
     default_desktop_shell_status,
 )
+from openevo.sidecar.config import (
+    DesktopProjectConfigDraft,
+    DesktopProjectConfigPaths,
+    build_desktop_project_configs,
+    save_desktop_project_config,
+)
 
 __all__ = [
     "DesktopExecutionStatus",
+    "DesktopProjectConfigDraft",
+    "DesktopProjectConfigPaths",
     "OpenEvoDesktopBootstrapResponse",
+    "OpenEvoDesktopProjectConfigResponse",
     "OpenEvoDesktopRunReport",
     "OpenEvoDesktopRunResponse",
     "OpenEvoDesktopShellStatus",
@@ -48,6 +58,7 @@ __all__ = [
     "SidecarSciencePlan",
     "WorkspacePreparationAction",
     "WorkspacePreparationPlan",
+    "build_desktop_project_configs",
     "build_sidecar_science_plan",
     "build_desktop_shell_status",
     "create_sidecar_app",
@@ -56,4 +67,5 @@ __all__ = [
     "load_remote_profile_config",
     "plan_workspace_preparation",
     "preflight_settings_for_project",
+    "save_desktop_project_config",
 ]

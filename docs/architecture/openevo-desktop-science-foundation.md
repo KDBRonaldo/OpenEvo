@@ -128,6 +128,11 @@ openevo sidecar serve \
   --port 3766
 ```
 
+Desktop-created projects can start from a no-config sidecar. In that mode the
+sidecar receives a writable local config root from `--desktop-config-root`, or
+uses `OPENEVO_DESKTOP_CONFIG_DIR`, falling back to
+`~/.openevo/desktop`.
+
 In this mode the sidecar reads the local Science Project YAML and remote profile
 YAML, validates them, builds the existing sidecar science plan, and derives a
 Desktop shell status response from those contracts. The status endpoint is a
@@ -139,6 +144,30 @@ status for the `/openevo` route and keeps the same subscription transcript
 semantics as the Python sidecar contracts: token-level metrics remain false in
 subscription mode, bootstrap readiness is represented separately from
 informational readiness notes, and no direct model API call is made.
+
+`POST /openevo-api/desktop/project-config` is the local setup endpoint for
+ordinary Desktop users. It is mutation-token protected and available when the
+sidecar was created with a writable config root and transport factory. The
+request payload is a typed Desktop draft with project name, task id, objective,
+task source, SSH host/user/port, proxy/mirror settings, Codex model, and text
+evolution toggles. The sidecar validates that draft by constructing the existing
+`ScienceProjectConfig` and `RemoteProfileConfig` models, then writes:
+
+```text
+<desktop-config-root>/projects/<project-slug>/science.yaml
+<desktop-config-root>/profiles/<remote-profile-id>.yaml
+```
+
+The response returns those two paths and a refreshed shell status. Saving a
+valid draft replaces the current in-process sidecar session with a config-backed
+session, so subsequent `/workspace`, `/bootstrap`, and `/run` calls use the
+saved configs without requiring the user to restart the sidecar. Invalid drafts
+return 422 and do not write files.
+
+The draft contract remains secret-reference-only. It accepts SSH agent,
+private-key path, password reference, and passphrase reference fields, but it
+forbids raw secret extras such as `password`. A future vault/keychain layer can
+resolve those references outside this local config contract.
 
 `POST /openevo-api/desktop/bootstrap` is the first mutating sidecar endpoint.
 It is available only for config-backed sidecar sessions. It reuses
@@ -200,11 +229,12 @@ remote server. A dry-run report can therefore show the UI path as ready without
 proving that task workspaces, Docker images, or Hugging Face models were
 actually prepared. Real remote preparation requires `--transport ssh`.
 
-This slice does not add a long-running supervisor. `POST /desktop/run` is a
-synchronous launch/report boundary only; it does not stream logs, expose cancel
-or resume, keep a background job table, or start vLLM, Polar gateway, rollout,
-or evolution worker services independently. Those operations remain behind the
-remote lifecycle contracts until a supervisor is added.
+This slice does not add a long-running supervisor or Electron process manager.
+`POST /desktop/run` is a synchronous launch/report boundary only; it does not
+stream logs, expose cancel or resume, keep a background job table, restart the
+sidecar process, or start vLLM, Polar gateway, rollout, or evolution worker
+services independently. Those operations remain behind the remote lifecycle
+contracts until a supervisor is added.
 
 ## CLI
 
@@ -221,9 +251,9 @@ workspace paths.
 
 This foundation slice does not include:
 
-- a fully wired Desktop UI;
 - vault or SSH tunnel management;
 - a remote backend implementation;
+- Electron packaging or sidecar process supervision;
 - Docker Compose lifecycle management;
 - vLLM lifecycle management;
 - parametric memory or adapter training for Science Projects.

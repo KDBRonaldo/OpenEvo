@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -172,7 +173,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--transport",
         choices=("dry-run", "ssh"),
         default="dry-run",
-        help="Remote executor transport used by sidecar bootstrap. Defaults to dry-run.",
+        help="Remote executor transport used by sidecar mutating endpoints.",
+    )
+    serve_parser.add_argument(
+        "--desktop-config-root",
+        help=(
+            "Writable local directory for Desktop-created Science Project and "
+            "remote profile configs."
+        ),
     )
     return parser
 
@@ -317,8 +325,6 @@ def _handle_sidecar_bootstrap(args: argparse.Namespace) -> int:
 def _handle_sidecar_serve(args: argparse.Namespace) -> int:
     if bool(args.config) != bool(args.remote_profile):
         raise ValueError("sidecar serve --config and --remote-profile must be used together")
-    if args.transport == "ssh" and not args.config:
-        raise ValueError("sidecar serve --transport ssh requires --config and --remote-profile")
     if args.config and args.remote_profile:
         project = load_science_project_config(Path(args.config))
         profile = load_remote_profile_config(Path(args.remote_profile))
@@ -328,7 +334,15 @@ def _handle_sidecar_serve(args: argparse.Namespace) -> int:
             transport_factory=_sidecar_transport_factory(args.transport),
         )
     else:
-        app = create_sidecar_app()
+        config_root = (
+            Path(args.desktop_config_root).expanduser()
+            if args.desktop_config_root
+            else _default_desktop_config_root()
+        )
+        app = create_sidecar_app(
+            config_root=config_root,
+            transport_factory=_sidecar_transport_factory(args.transport),
+        )
     _run_sidecar_server(app, host=args.host, port=args.port)
     return 0
 
@@ -353,6 +367,13 @@ def _sidecar_transport_factory(transport: str):
     if transport == "ssh":
         return lambda profile: SshRemoteExecutorTransport(profile)
     raise ValueError(f"Unknown sidecar transport: {transport}")
+
+
+def _default_desktop_config_root() -> Path:
+    configured = os.environ.get("OPENEVO_DESKTOP_CONFIG_DIR")
+    if configured:
+        return Path(configured).expanduser()
+    return Path.home() / ".openevo" / "desktop"
 
 
 class _CliDryRunTransport:

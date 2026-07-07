@@ -4,6 +4,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from _thread import LockType
+from pathlib import Path
 import posixpath
 import re
 import secrets
@@ -12,10 +13,17 @@ from typing import Any, Literal
 from threading import Lock
 
 from fastapi import FastAPI, Header, HTTPException
+from fastapi.encoders import jsonable_encoder
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import ValidationError
 
 from openevo.remote.executor import RemoteExecutorTransport
 from openevo.science import ScienceProjectConfig
+from openevo.sidecar.config import (
+    DesktopProjectConfigDraft,
+    DesktopProjectConfigPaths,
+    save_desktop_project_config,
+)
 from openevo.sidecar.models import RemoteProfileConfig
 from openevo.sidecar.planner import build_sidecar_science_plan
 
@@ -147,6 +155,11 @@ class OpenEvoDesktopBootstrapResponse(_StrictFrozenModel):
 class OpenEvoDesktopWorkspaceResponse(_StrictFrozenModel):
     workspace: dict[str, Any]
     report: dict[str, Any]
+    status: OpenEvoDesktopShellStatus
+
+
+class OpenEvoDesktopProjectConfigResponse(_StrictFrozenModel):
+    config: DesktopProjectConfigPaths
     status: OpenEvoDesktopShellStatus
 
 
@@ -313,10 +326,18 @@ def create_sidecar_app(
     *,
     session: OpenEvoSidecarSession | None = None,
     mutation_token: str | None = None,
+    config_root: Path | None = None,
+    transport_factory: Callable[[RemoteProfileConfig], RemoteExecutorTransport]
+    | None = None,
 ) -> FastAPI:
     desktop_status = status or default_desktop_shell_status()
     sidecar_token = _mutation_token(mutation_token)
+    session_pointer_lock = Lock()
     app = FastAPI(title="OpenEvo Desktop Sidecar", version="0.1.0")
+
+    def current_session() -> OpenEvoSidecarSession | None:
+        with session_pointer_lock:
+            return session
 
     @app.get("/health", response_model=SidecarHealth)
     def health() -> SidecarHealth:
@@ -327,10 +348,78 @@ def create_sidecar_app(
         response_model=OpenEvoDesktopShellStatus,
     )
     def desktop_shell() -> OpenEvoDesktopShellStatus:
-        if session is not None:
-            with session.status_lock:
-                return _status_with_mutation_token(session.status, sidecar_token)
+        active_session = current_session()
+        if active_session is not None:
+            with active_session.status_lock:
+                return _status_with_mutation_token(
+                    active_session.status,
+                    sidecar_token,
+                )
         return _status_with_mutation_token(desktop_status, sidecar_token)
+
+    @app.post(
+        "/openevo-api/desktop/project-config",
+        response_model=OpenEvoDesktopProjectConfigResponse,
+    )
+    def project_config(
+        payload: dict[str, Any],
+        token: str | None = Header(
+            default=None,
+            alias=SIDECAR_MUTATION_TOKEN_HEADER,
+        ),
+    ) -> OpenEvoDesktopProjectConfigResponse:
+        nonlocal session
+        _validate_mutation_token(token, sidecar_token)
+        if config_root is None or transport_factory is None:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Desktop project config requires a writable config root "
+                    "and transport factory."
+                ),
+            )
+        try:
+            draft = DesktopProjectConfigDraft.model_validate(payload)
+        except ValidationError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail=_validation_error_detail(exc),
+            ) from exc
+        with session_pointer_lock:
+            if session is not None and _session_lifecycle_busy(session):
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Desktop project config cannot run while another "
+                        "lifecycle action is running."
+                    ),
+                )
+            try:
+                project, profile, paths = save_desktop_project_config(
+                    draft,
+                    config_root,
+                )
+            except ValidationError as exc:
+                raise HTTPException(
+                    status_code=422,
+                    detail=_validation_error_detail(exc),
+                ) from exc
+            new_session = OpenEvoSidecarSession(
+                project=project,
+                profile=profile,
+                transport_factory=transport_factory,
+                status=build_desktop_shell_status(project, profile),
+            )
+            session = new_session
+        with new_session.status_lock:
+            response_status = _status_with_mutation_token(
+                new_session.status,
+                sidecar_token,
+            )
+        return OpenEvoDesktopProjectConfigResponse(
+            config=paths,
+            status=response_status,
+        )
 
     @app.post(
         "/openevo-api/desktop/workspace",
@@ -343,27 +432,35 @@ def create_sidecar_app(
         ),
     ) -> OpenEvoDesktopWorkspaceResponse:
         _validate_mutation_token(token, sidecar_token)
-        if session is None:
-            raise HTTPException(
-                status_code=409,
-                detail="Desktop workspace sync requires a config-backed sidecar session.",
-            )
-        if not session.workspace_lock.acquire(blocking=False):
-            raise HTTPException(
-                status_code=409,
-                detail="Desktop workspace sync is already running.",
-            )
+        with session_pointer_lock:
+            active_session = session
+            if active_session is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Desktop workspace sync requires a config-backed sidecar "
+                        "session."
+                    ),
+                )
+            if not active_session.workspace_lock.acquire(blocking=False):
+                raise HTTPException(
+                    status_code=409,
+                    detail="Desktop workspace sync is already running.",
+                )
         try:
-            report = _run_workspace_sync(session)
-            with session.status_lock:
-                session.last_workspace_report = report
-                session.status = _status_after_workspace(session.status, report)
+            report = _run_workspace_sync(active_session)
+            with active_session.status_lock:
+                active_session.last_workspace_report = report
+                active_session.status = _status_after_workspace(
+                    active_session.status,
+                    report,
+                )
                 response_status = _status_with_mutation_token(
-                    session.status,
+                    active_session.status,
                     sidecar_token,
                 )
         finally:
-            session.workspace_lock.release()
+            active_session.workspace_lock.release()
         return OpenEvoDesktopWorkspaceResponse(
             workspace=_workspace_response_payload(report),
             report=report.model_dump(mode="json"),
@@ -381,27 +478,32 @@ def create_sidecar_app(
         ),
     ) -> OpenEvoDesktopBootstrapResponse:
         _validate_mutation_token(token, sidecar_token)
-        if session is None:
-            raise HTTPException(
-                status_code=409,
-                detail="Desktop bootstrap requires a config-backed sidecar session.",
-            )
-        if not session.bootstrap_lock.acquire(blocking=False):
-            raise HTTPException(
-                status_code=409,
-                detail="Desktop bootstrap is already running.",
-            )
+        with session_pointer_lock:
+            active_session = session
+            if active_session is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Desktop bootstrap requires a config-backed sidecar session.",
+                )
+            if not active_session.bootstrap_lock.acquire(blocking=False):
+                raise HTTPException(
+                    status_code=409,
+                    detail="Desktop bootstrap is already running.",
+                )
         try:
-            report = _run_bootstrap(session)
-            with session.status_lock:
-                session.last_bootstrap_report = report
-                session.status = _status_after_bootstrap(session.status, report)
+            report = _run_bootstrap(active_session)
+            with active_session.status_lock:
+                active_session.last_bootstrap_report = report
+                active_session.status = _status_after_bootstrap(
+                    active_session.status,
+                    report,
+                )
                 response_status = _status_with_mutation_token(
-                    session.status,
+                    active_session.status,
                     sidecar_token,
                 )
         finally:
-            session.bootstrap_lock.release()
+            active_session.bootstrap_lock.release()
         return OpenEvoDesktopBootstrapResponse(
             bootstrap=response_status.bootstrap,
             report=report.model_dump(mode="json"),
@@ -419,32 +521,37 @@ def create_sidecar_app(
         ),
     ) -> OpenEvoDesktopRunResponse:
         _validate_mutation_token(token, sidecar_token)
-        if session is None:
-            raise HTTPException(
-                status_code=409,
-                detail="Desktop run launch requires a config-backed sidecar session.",
-            )
-        if not session.run_lock.acquire(blocking=False):
-            raise HTTPException(
-                status_code=409,
-                detail="Desktop run launch is already running.",
-            )
+        with session_pointer_lock:
+            active_session = session
+            if active_session is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Desktop run launch requires a config-backed sidecar session.",
+                )
+            if not active_session.run_lock.acquire(blocking=False):
+                raise HTTPException(
+                    status_code=409,
+                    detail="Desktop run launch is already running.",
+                )
         try:
-            experiment_snapshot, state_root = _run_ready_context(session)
+            experiment_snapshot, state_root = _run_ready_context(active_session)
             report = _run_openevo_task(
-                session,
+                active_session,
                 experiment_snapshot=experiment_snapshot,
                 state_root=state_root,
             )
-            with session.status_lock:
-                session.last_run_report = report
-                session.status = _status_after_run(session.status, report)
+            with active_session.status_lock:
+                active_session.last_run_report = report
+                active_session.status = _status_after_run(
+                    active_session.status,
+                    report,
+                )
                 response_status = _status_with_mutation_token(
-                    session.status,
+                    active_session.status,
                     sidecar_token,
                 )
         finally:
-            session.run_lock.release()
+            active_session.run_lock.release()
         return OpenEvoDesktopRunResponse(run=report, status=response_status)
 
     return app
@@ -679,6 +786,18 @@ def _validate_mutation_token(candidate: str | None, expected: str) -> None:
             status_code=403,
             detail="Invalid OpenEvo sidecar token.",
         )
+
+
+def _validation_error_detail(exc: ValidationError):
+    return jsonable_encoder(exc.errors(include_input=False))
+
+
+def _session_lifecycle_busy(session: OpenEvoSidecarSession) -> bool:
+    return (
+        session.workspace_lock.locked()
+        or session.bootstrap_lock.locked()
+        or session.run_lock.locked()
+    )
 
 
 def _status_with_mutation_token(

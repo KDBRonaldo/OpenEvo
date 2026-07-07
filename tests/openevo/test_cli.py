@@ -7,6 +7,7 @@ import yaml
 
 from openevo.cli import main
 from openevo.remote import RemoteCommandResult
+from openevo.sidecar import RemoteProfileConfig
 
 
 def _write_config(path: Path, payload: dict) -> Path:
@@ -38,6 +39,15 @@ def _minimal_science_payload() -> dict:
             },
         },
     }
+
+
+def _remote_profile_for_cli() -> RemoteProfileConfig:
+    return RemoteProfileConfig(
+        version=1,
+        id="science-team",
+        host="gpu.example.edu",
+        user="alice",
+    )
 
 
 class _CliRecordingSshTransport:
@@ -483,6 +493,36 @@ def test_cli_sidecar_serve_invokes_runner(monkeypatch) -> None:
     assert calls == [("OpenEvo Desktop Sidecar", "127.0.0.1", 3766)]
 
 
+def test_cli_sidecar_serve_passes_desktop_config_root(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    app_calls = []
+
+    class FakeApp:
+        title = "OpenEvo Desktop Sidecar"
+
+    def fake_create_sidecar_app(**kwargs):
+        app_calls.append(kwargs)
+        return FakeApp()
+
+    monkeypatch.setattr("openevo.cli.create_sidecar_app", fake_create_sidecar_app)
+    monkeypatch.setattr("openevo.cli._run_sidecar_server", lambda app, *, host, port: None)
+
+    exit_code = main(
+        [
+            "sidecar",
+            "serve",
+            "--desktop-config-root",
+            str(tmp_path),
+        ]
+    )
+
+    assert exit_code == 0
+    assert app_calls[0]["config_root"] == tmp_path
+    assert app_calls[0]["transport_factory"] is not None
+
+
 def test_cli_sidecar_serve_loads_config_status(
     tmp_path: Path,
     monkeypatch,
@@ -584,11 +624,43 @@ def test_cli_sidecar_serve_ssh_transport_factory_is_lazy(
     assert _CliRecordingSshTransport.profiles[0].id == "science-team"
 
 
-def test_cli_sidecar_serve_rejects_ssh_transport_without_config(capsys) -> None:
-    exit_code = main(["sidecar", "serve", "--transport", "ssh"])
+def test_cli_sidecar_serve_allows_ssh_transport_without_config(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    app_calls = []
 
-    assert exit_code == 1
-    assert "sidecar serve --transport ssh requires --config" in capsys.readouterr().err
+    class FakeApp:
+        title = "OpenEvo Desktop Sidecar"
+
+    def fake_create_sidecar_app(**kwargs):
+        app_calls.append(kwargs)
+        return FakeApp()
+
+    monkeypatch.setattr("openevo.cli.create_sidecar_app", fake_create_sidecar_app)
+    monkeypatch.setattr("openevo.cli._run_sidecar_server", lambda app, *, host, port: None)
+    _CliRecordingSshTransport.profiles = []
+    monkeypatch.setattr(
+        "openevo.cli.SshRemoteExecutorTransport",
+        _CliRecordingSshTransport,
+    )
+
+    exit_code = main(
+        [
+            "sidecar",
+            "serve",
+            "--transport",
+            "ssh",
+            "--desktop-config-root",
+            str(tmp_path),
+        ]
+    )
+
+    assert exit_code == 0
+    assert _CliRecordingSshTransport.profiles == []
+    profile = _remote_profile_for_cli()
+    app_calls[0]["transport_factory"](profile)
+    assert _CliRecordingSshTransport.profiles[0].id == "science-team"
 
 
 def test_cli_sidecar_serve_requires_config_and_profile_together(

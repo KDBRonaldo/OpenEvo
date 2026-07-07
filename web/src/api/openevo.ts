@@ -65,6 +65,45 @@ export interface OpenEvoWorkspaceResponsePayload {
   status: OpenEvoDesktopShellStatusPayload;
 }
 
+export interface OpenEvoProjectConfigDraft {
+  project_name: string;
+  task_id: string;
+  objective: string;
+  source_type: "local_folder" | "git_repository" | "remote_path" | "scratch";
+  source_path?: string | null;
+  source_url?: string | null;
+  source_branch?: string | null;
+  remote_profile_id: string;
+  remote_host: string;
+  remote_port: number;
+  remote_user: string;
+  auth_method: "ssh_agent" | "private_key" | "password_ref";
+  private_key_path?: string | null;
+  password_ref?: string | null;
+  passphrase_ref?: string | null;
+  workspace_root?: string | null;
+  http_proxy?: string | null;
+  https_proxy?: string | null;
+  no_proxy?: string | null;
+  pip_index_url?: string | null;
+  huggingface_endpoint?: string | null;
+  hf_home?: string | null;
+  codex_model: string;
+  text_memory: boolean;
+  skill_bundle: boolean;
+  agent_system: boolean;
+}
+
+export interface OpenEvoProjectConfigPaths {
+  science_config_path: string;
+  remote_profile_path: string;
+}
+
+export interface OpenEvoProjectConfigResponsePayload {
+  config: OpenEvoProjectConfigPaths;
+  status: OpenEvoDesktopShellStatusPayload;
+}
+
 export interface OpenEvoBootstrapResponse {
   bootstrap: OpenEvoDesktopShellModel["bootstrap"];
   report: Record<string, any>;
@@ -96,6 +135,11 @@ export interface OpenEvoRunResponsePayload {
 
 export interface OpenEvoRunResponse {
   run: OpenEvoRunReport;
+  status: OpenEvoDesktopShellModel;
+}
+
+export interface OpenEvoProjectConfigResponse {
+  config: OpenEvoProjectConfigPaths;
   status: OpenEvoDesktopShellModel;
 }
 
@@ -136,6 +180,24 @@ export async function runOpenEvoWorkspaceSync(): Promise<OpenEvoWorkspaceRespons
   return {
     workspace: payload.workspace,
     report: payload.report,
+    status: toOpenEvoDesktopShellModel(payload.status),
+  };
+}
+
+export async function saveOpenEvoProjectConfig(
+  draft: OpenEvoProjectConfigDraft,
+): Promise<OpenEvoProjectConfigResponse> {
+  const headers = sidecarMutationToken
+    ? { [sidecarMutationTokenHeader]: sidecarMutationToken }
+    : undefined;
+  const payload = await api.post<OpenEvoProjectConfigResponsePayload>(
+    "/openevo-api/desktop/project-config",
+    draft,
+    headers,
+  );
+  rememberOpenEvoSidecarMutationToken(payload.status);
+  return {
+    config: payload.config,
     status: toOpenEvoDesktopShellModel(payload.status),
   };
 }

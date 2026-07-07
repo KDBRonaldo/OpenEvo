@@ -19,9 +19,12 @@ import {
   runOpenEvoBootstrap,
   runOpenEvoStartRun,
   runOpenEvoWorkspaceSync,
+  saveOpenEvoProjectConfig,
+  type OpenEvoProjectConfigDraft,
 } from "../api/openevo";
 import {
   type EvolutionStepState,
+  type OpenEvoDesktopShellModel,
   type RemoteServiceState,
   getOpenEvoDesktopShellModel,
   getOpenEvoTimelineSummary,
@@ -50,6 +53,11 @@ export function OpenEvoDesktop() {
   const [bootstrapError, setBootstrapError] = useState<string | null>(null);
   const [runRunning, setRunRunning] = useState(false);
   const [runError, setRunError] = useState<string | null>(null);
+  const [configSaving, setConfigSaving] = useState(false);
+  const [configError, setConfigError] = useState<string | null>(null);
+  const [configDraft, setConfigDraft] = useState<OpenEvoProjectConfigDraft>(() =>
+    draftFromModel(getOpenEvoDesktopShellModel()),
+  );
   const summary = getOpenEvoTimelineSummary(model);
 
   useEffect(() => {
@@ -59,6 +67,7 @@ export function OpenEvoDesktop() {
       .then((nextModel) => {
         if (!cancelled) {
           setModel(nextModel);
+          setConfigDraft(draftFromModel(nextModel));
           setSidecarConnected(true);
         }
       })
@@ -82,6 +91,47 @@ export function OpenEvoDesktop() {
       setWorkspaceError(message);
     } finally {
       setWorkspaceRunning(false);
+    }
+  };
+
+  const handleConfigDraftChange = (
+    field: keyof OpenEvoProjectConfigDraft,
+    value: string | number | boolean | null,
+  ) => {
+    setConfigDraft((current) => ({ ...current, [field]: value }));
+  };
+
+  const handleSourceTypeChange = (
+    sourceType: OpenEvoProjectConfigDraft["source_type"],
+  ) => {
+    setConfigDraft((current) => ({
+      ...current,
+      source_type: sourceType,
+      source_path:
+        sourceType === "remote_path" || sourceType === "local_folder"
+          ? current.source_path ?? ""
+          : null,
+      source_url: sourceType === "git_repository" ? current.source_url ?? "" : null,
+      source_branch:
+        sourceType === "git_repository" ? current.source_branch ?? null : null,
+    }));
+  };
+
+  const handleSaveConfig = async () => {
+    setConfigSaving(true);
+    setConfigError(null);
+    const submittedDraft = configDraft;
+    try {
+      const response = await saveOpenEvoProjectConfig(submittedDraft);
+      setModel(response.status);
+      setConfigDraft(submittedDraft);
+      setSidecarConnected(true);
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : "Project config save failed";
+      setConfigError(message);
+    } finally {
+      setConfigSaving(false);
     }
   };
 
@@ -138,7 +188,11 @@ export function OpenEvoDesktop() {
             icon={<Upload size={16} />}
             label={workspaceRunning ? "Syncing" : "Sync Workspace"}
             disabled={
-              !sidecarConnected || workspaceRunning || bootstrapRunning || runRunning
+              !sidecarConnected ||
+              workspaceRunning ||
+              bootstrapRunning ||
+              runRunning ||
+              configSaving
             }
             onClick={handleWorkspaceSync}
           />
@@ -146,7 +200,11 @@ export function OpenEvoDesktop() {
             icon={<RefreshCw size={16} />}
             label={bootstrapRunning ? "Bootstrapping" : "Bootstrap"}
             disabled={
-              !sidecarConnected || bootstrapRunning || workspaceRunning || runRunning
+              !sidecarConnected ||
+              bootstrapRunning ||
+              workspaceRunning ||
+              runRunning ||
+              configSaving
             }
             onClick={handleBootstrap}
           />
@@ -155,7 +213,11 @@ export function OpenEvoDesktop() {
             label={runRunning ? "Running" : "Start Run"}
             primary
             disabled={
-              !sidecarConnected || runRunning || workspaceRunning || bootstrapRunning
+              !sidecarConnected ||
+              runRunning ||
+              workspaceRunning ||
+              bootstrapRunning ||
+              configSaving
             }
             onClick={handleStartRun}
           />
@@ -184,6 +246,142 @@ export function OpenEvoDesktop() {
           detail="remote preflight"
         />
       </section>
+
+      <Panel title="Project Setup" icon={<Settings size={17} />}>
+        <form
+          className="grid grid-cols-1 gap-3 lg:grid-cols-4"
+          onSubmit={(event) => {
+            event.preventDefault();
+            void handleSaveConfig();
+          }}
+        >
+          <TextInput
+            label="Project name"
+            value={configDraft.project_name}
+            onChange={(value) => handleConfigDraftChange("project_name", value)}
+          />
+          <TextInput
+            label="Task ID"
+            value={configDraft.task_id}
+            onChange={(value) => handleConfigDraftChange("task_id", value)}
+          />
+          <TextInput
+            label="Remote host"
+            value={configDraft.remote_host}
+            onChange={(value) => handleConfigDraftChange("remote_host", value)}
+          />
+          <TextInput
+            label="Remote user"
+            value={configDraft.remote_user}
+            onChange={(value) => handleConfigDraftChange("remote_user", value)}
+          />
+          <SelectInput
+            label="Source type"
+            value={configDraft.source_type}
+            options={[
+              "remote_path",
+              "local_folder",
+              "git_repository",
+              "scratch",
+            ]}
+            onChange={(value) =>
+              handleSourceTypeChange(
+                value as OpenEvoProjectConfigDraft["source_type"],
+              )
+            }
+          />
+          {configDraft.source_type === "git_repository" ? (
+            <>
+              <TextInput
+                label="Source URL"
+                value={configDraft.source_url ?? ""}
+                onChange={(value) =>
+                  handleConfigDraftChange("source_url", value || null)
+                }
+              />
+              <TextInput
+                label="Source branch"
+                value={configDraft.source_branch ?? ""}
+                onChange={(value) =>
+                  handleConfigDraftChange("source_branch", value || null)
+                }
+              />
+            </>
+          ) : configDraft.source_type === "scratch" ? null : (
+            <TextInput
+              label="Source path"
+              value={configDraft.source_path ?? ""}
+              onChange={(value) =>
+                handleConfigDraftChange("source_path", value || null)
+              }
+            />
+          )}
+          <TextInput
+            label="HTTPS proxy"
+            value={configDraft.https_proxy ?? ""}
+            onChange={(value) =>
+              handleConfigDraftChange("https_proxy", value || null)
+            }
+          />
+          <TextInput
+            label="Codex model"
+            value={configDraft.codex_model}
+            onChange={(value) => handleConfigDraftChange("codex_model", value)}
+          />
+          <TextInput
+            label="Objective"
+            value={configDraft.objective}
+            wide
+            onChange={(value) => handleConfigDraftChange("objective", value)}
+          />
+          <TextInput
+            label="Hugging Face endpoint"
+            value={configDraft.huggingface_endpoint ?? ""}
+            onChange={(value) =>
+              handleConfigDraftChange("huggingface_endpoint", value || null)
+            }
+          />
+          <NumberInput
+            label="Remote port"
+            value={configDraft.remote_port}
+            onChange={(value) => handleConfigDraftChange("remote_port", value)}
+          />
+          <div className="flex flex-wrap items-end gap-3 lg:col-span-4">
+            <CheckboxInput
+              label="Text memory"
+              checked={configDraft.text_memory}
+              onChange={(checked) =>
+                handleConfigDraftChange("text_memory", checked)
+              }
+            />
+            <CheckboxInput
+              label="Skill bundle"
+              checked={configDraft.skill_bundle}
+              onChange={(checked) =>
+                handleConfigDraftChange("skill_bundle", checked)
+              }
+            />
+            <CheckboxInput
+              label="Agent system"
+              checked={configDraft.agent_system}
+              onChange={(checked) =>
+                handleConfigDraftChange("agent_system", checked)
+              }
+            />
+            <CommandButton
+              icon={<ShieldCheck size={16} />}
+              label={configSaving ? "Saving" : "Save Config"}
+              disabled={!sidecarConnected || configSaving}
+              onClick={handleSaveConfig}
+            />
+          </div>
+          {configError ? (
+            <div className="rounded-md border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-900 lg:col-span-4">
+              {configError}
+            </div>
+          ) : null}
+        </form>
+      </Panel>
 
       <section className="grid grid-cols-1 gap-4 xl:grid-cols-[1.15fr_0.85fr]">
         <Panel title="Science Project" icon={<FileText size={17} />}>
@@ -396,6 +594,107 @@ function Field({
   );
 }
 
+function TextInput({
+  label,
+  value,
+  wide = false,
+  onChange,
+}: {
+  label: string;
+  value: string;
+  wide?: boolean;
+  onChange: (value: string) => void;
+}) {
+  return (
+    <label className={wide ? "lg:col-span-2" : undefined}>
+      <span className="text-xs font-medium uppercase text-slate-500">{label}</span>
+      <input
+        aria-label={label}
+        value={value}
+        onChange={(event) => onChange(event.target.value)}
+        className="mt-1 h-9 w-full rounded-md border border-slate-200 bg-white px-2 text-sm text-slate-900"
+      />
+    </label>
+  );
+}
+
+function NumberInput({
+  label,
+  value,
+  onChange,
+}: {
+  label: string;
+  value: number;
+  onChange: (value: number) => void;
+}) {
+  return (
+    <label>
+      <span className="text-xs font-medium uppercase text-slate-500">{label}</span>
+      <input
+        aria-label={label}
+        type="number"
+        min={1}
+        max={65535}
+        value={value}
+        onChange={(event) => onChange(Number(event.target.value))}
+        className="mt-1 h-9 w-full rounded-md border border-slate-200 bg-white px-2 text-sm text-slate-900"
+      />
+    </label>
+  );
+}
+
+function SelectInput({
+  label,
+  value,
+  options,
+  onChange,
+}: {
+  label: string;
+  value: string;
+  options: string[];
+  onChange: (value: string) => void;
+}) {
+  return (
+    <label>
+      <span className="text-xs font-medium uppercase text-slate-500">{label}</span>
+      <select
+        aria-label={label}
+        value={value}
+        onChange={(event) => onChange(event.target.value)}
+        className="mt-1 h-9 w-full rounded-md border border-slate-200 bg-white px-2 text-sm text-slate-900"
+      >
+        {options.map((option) => (
+          <option key={option} value={option}>
+            {option}
+          </option>
+        ))}
+      </select>
+    </label>
+  );
+}
+
+function CheckboxInput({
+  label,
+  checked,
+  onChange,
+}: {
+  label: string;
+  checked: boolean;
+  onChange: (checked: boolean) => void;
+}) {
+  return (
+    <label className="inline-flex h-9 items-center gap-2 rounded-md border border-slate-200 bg-white px-3 text-sm text-slate-700">
+      <input
+        aria-label={label}
+        type="checkbox"
+        checked={checked}
+        onChange={(event) => onChange(event.target.checked)}
+      />
+      <span>{label}</span>
+    </label>
+  );
+}
+
 function PathRow({ label, value }: { label: string; value: string }) {
   return (
     <div>
@@ -405,6 +704,80 @@ function PathRow({ label, value }: { label: string; value: string }) {
       </div>
     </div>
   );
+}
+
+function draftFromModel(
+  model: OpenEvoDesktopShellModel,
+): OpenEvoProjectConfigDraft {
+  const source = sourceDraftFromLabel(model.project.source);
+  return {
+    project_name: model.project.name,
+    task_id: model.project.taskId,
+    objective: model.project.objective,
+    source_type: source.source_type,
+    source_path: source.source_path,
+    source_url: source.source_url,
+    source_branch: source.source_branch,
+    remote_profile_id: model.remote.id,
+    remote_host: model.remote.host,
+    remote_port: 22,
+    remote_user: model.remote.user,
+    auth_method: "ssh_agent",
+    https_proxy: optionalConfigured(model.remote.proxy.httpsProxy),
+    huggingface_endpoint: optionalConfigured(model.remote.proxy.huggingFaceEndpoint),
+    codex_model: model.execution.model || "gpt-5.1-codex-mini",
+    text_memory: model.evolution.some((step) =>
+      ["text-memory", "memory"].includes(step.id),
+    ),
+    skill_bundle: model.evolution.some((step) =>
+      ["skill-bundle", "skills"].includes(step.id),
+    ),
+    agent_system: model.evolution.some((step) => step.id === "agent-system"),
+  };
+}
+
+function sourceDraftFromLabel(
+  label: string,
+): Pick<
+  OpenEvoProjectConfigDraft,
+  "source_type" | "source_path" | "source_url" | "source_branch"
+> {
+  if (label.startsWith("Remote path: ")) {
+    return {
+      source_type: "remote_path",
+      source_path: label.slice("Remote path: ".length),
+      source_url: null,
+      source_branch: null,
+    };
+  }
+  if (label.startsWith("Local folder: ")) {
+    return {
+      source_type: "local_folder",
+      source_path: label.slice("Local folder: ".length),
+      source_url: null,
+      source_branch: null,
+    };
+  }
+  if (label.startsWith("Git repository: ")) {
+    const value = label.slice("Git repository: ".length);
+    const match = value.match(/^(.*) \((.*)\)$/);
+    return {
+      source_type: "git_repository",
+      source_path: null,
+      source_url: match ? match[1] : value,
+      source_branch: match ? match[2] : null,
+    };
+  }
+  return {
+    source_type: "scratch",
+    source_path: null,
+    source_url: null,
+    source_branch: null,
+  };
+}
+
+function optionalConfigured(value: string): string | null {
+  return value === "not configured" ? null : value;
 }
 
 function StatusBadge({ state }: { state: RemoteServiceState }) {
