@@ -472,6 +472,259 @@ def test_build_task_local_sft_records_live_replay_uses_failed_llm_prefix(
     assert record["metadata"]["prefix_source"] == "live_replay_llm_call:2"
 
 
+def test_build_task_local_sft_records_sequence_builds_progressive_records(
+    tmp_path: Path,
+) -> None:
+    failed_trial = tmp_path / "failed-trial"
+    successful_trial = tmp_path / "successful-trial"
+    llm_calls = (
+        failed_trial
+        / "agent"
+        / "evolab_lab"
+        / ".evolab"
+        / "registries"
+        / "trajectory"
+        / "llm_calls.jsonl"
+    )
+    llm_calls.parent.mkdir(parents=True)
+    (successful_trial / "agent").mkdir(parents=True)
+    llm_calls.write_text(
+        json.dumps(
+            {
+                "input_messages": [
+                    {"role": "system", "content": "Solve exactly one task_id."},
+                    {"role": "user", "content": "Instruction:\n{}"},
+                    {
+                        "role": "tool",
+                        "content": '{"task_yaml": "train fastText"}',
+                        "tool_call_id": "read",
+                    },
+                ],
+                "output_messages": [
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": "probe",
+                                "type": "function",
+                                "function": {
+                                    "name": "tb_exec",
+                                    "arguments": {
+                                        "task_id": "terminal-bench-task",
+                                        "command": "ls -la /app",
+                                    },
+                                },
+                            }
+                        ],
+                    }
+                ],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (successful_trial / "agent" / "codex.txt").write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "item.completed",
+                        "item": {
+                            "type": "command_execution",
+                            "command": "apt-get update && apt-get install -y g++",
+                            "aggregated_output": "installed compiler",
+                            "exit_code": 0,
+                            "status": "completed",
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "item.completed",
+                        "item": {
+                            "type": "command_execution",
+                            "command": "python prepare_fasttext_data.py",
+                            "aggregated_output": "wrote train_full.ft.txt",
+                            "exit_code": 0,
+                            "status": "completed",
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "item.completed",
+                        "item": {
+                            "type": "command_execution",
+                            "command": (
+                                "python train_fasttext.py && "
+                                "cp model.bin /app/model.bin"
+                            ),
+                            "aggregated_output": "saved /app/model.bin",
+                            "exit_code": 0,
+                            "status": "completed",
+                        },
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    selection = TaskLocalSelection(
+        task_id="train-fasttext",
+        failed=[
+            TrajectoryPoolRow(
+                trajectory_id="failed-live",
+                task_id="train-fasttext",
+                reward=0.0,
+                trial_dir=failed_trial,
+                raw={},
+            )
+        ],
+        successful=[
+            TrajectoryPoolRow(
+                trajectory_id="success",
+                task_id="train-fasttext",
+                reward=1.0,
+                trial_dir=successful_trial,
+                raw={},
+            )
+        ],
+        null_reward=[],
+    )
+
+    records = build_task_local_sft_records(
+        selection,
+        command_contains=["/app/model.bin"],
+        max_records=8,
+        prompt_style="live_replay",
+        target_mode="sequence",
+    )
+
+    assert len(records) == 3
+    target_commands = [
+        record["traces"][0]["response_messages"][0]["tool_calls"][0]["function"][
+            "arguments"
+        ]["command"]
+        for record in records
+    ]
+    assert target_commands == [
+        "apt-get update && apt-get install -y g++",
+        "python prepare_fasttext_data.py",
+        "python train_fasttext.py && cp model.bin /app/model.bin",
+    ]
+    assert records[0]["metadata"]["target_sequence_index"] == 0
+    assert records[2]["metadata"]["target_sequence_index"] == 2
+    assert all(record["metadata"]["target_sequence_length"] == 3 for record in records)
+
+    second_prompt = records[1]["traces"][0]["prompt_messages"]
+    assert [message["role"] for message in second_prompt][-2:] == [
+        "assistant",
+        "tool",
+    ]
+    assert second_prompt[-2]["tool_calls"][0]["function"]["arguments"]["command"] == (
+        "apt-get update && apt-get install -y g++"
+    )
+    assert "installed compiler" in second_prompt[-1]["content"]
+
+    third_prompt = records[2]["traces"][0]["prompt_messages"]
+    prompt_commands = [
+        message["tool_calls"][0]["function"]["arguments"]["command"]
+        for message in third_prompt
+        if message.get("role") == "assistant" and message.get("tool_calls")
+    ]
+    assert prompt_commands == [
+        "apt-get update && apt-get install -y g++",
+        "python prepare_fasttext_data.py",
+    ]
+    assert "wrote train_full.ft.txt" in third_prompt[-1]["content"]
+
+
+def test_build_task_local_sft_records_sequence_cap_keeps_final_target(
+    tmp_path: Path,
+) -> None:
+    failed_trial = tmp_path / "failed-trial"
+    successful_trial = tmp_path / "successful-trial"
+    (failed_trial / "agent").mkdir(parents=True)
+    (successful_trial / "agent").mkdir(parents=True)
+    commands = [
+        "inspect data",
+        "install compiler",
+        "prepare fasttext rows",
+        "train validation model",
+        "train final model && cp model.bin /app/model.bin",
+    ]
+    (successful_trial / "agent" / "codex.txt").write_text(
+        "\n".join(
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "type": "command_execution",
+                        "command": command,
+                        "aggregated_output": f"finished {index}",
+                        "exit_code": 0,
+                        "status": "completed",
+                    },
+                }
+            )
+            for index, command in enumerate(commands)
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    selection = TaskLocalSelection(
+        task_id="train-fasttext",
+        failed=[
+            TrajectoryPoolRow(
+                trajectory_id="failed",
+                task_id="train-fasttext",
+                reward=0.0,
+                trial_dir=failed_trial,
+                raw={"prompt_summary": "Train fastText."},
+            )
+        ],
+        successful=[
+            TrajectoryPoolRow(
+                trajectory_id="success",
+                task_id="train-fasttext",
+                reward=1.0,
+                trial_dir=successful_trial,
+                raw={},
+            )
+        ],
+        null_reward=[],
+    )
+
+    records = build_task_local_sft_records(
+        selection,
+        command_contains=["/app/model.bin"],
+        max_records=2,
+        target_mode="sequence",
+    )
+
+    target_commands = [
+        record["traces"][0]["response_messages"][0]["tool_calls"][0]["function"][
+            "arguments"
+        ]["command"]
+        for record in records
+    ]
+    assert target_commands == commands[-2:]
+    assert [record["metadata"]["target_sequence_index"] for record in records] == [3, 4]
+    assert all(record["metadata"]["target_sequence_length"] == 5 for record in records)
+
+    final_prompt_commands = [
+        message["tool_calls"][0]["function"]["arguments"]["command"]
+        for message in records[-1]["traces"][0]["prompt_messages"]
+        if message.get("role") == "assistant"
+        and message.get("tool_calls")
+        and message["tool_calls"][0]["function"]["name"] == "tb_exec"
+    ]
+    assert final_prompt_commands[-4:] == commands[:-1]
+    assert "finished 3" in records[-1]["traces"][0]["prompt_messages"][-1]["content"]
+
+
 def test_build_task_local_sft_records_prefers_write_command_over_later_validation(
     tmp_path: Path,
 ) -> None:
@@ -859,3 +1112,109 @@ def test_terminal_bench_task_local_parametric_memory_job_cli_accepts_prompt_styl
     record = json.loads(Path(payload["dataset"]["records_path"]).read_text())
     assert payload["prompt_style"] == "live_replay"
     assert record["metadata"]["prefix_source"] == "live_replay_llm_call:1"
+
+
+def test_terminal_bench_task_local_parametric_memory_job_cli_accepts_sequence_target_mode(
+    tmp_path: Path,
+) -> None:
+    failed_trial = tmp_path / "failed-trial"
+    successful_trial = tmp_path / "successful-trial"
+    (failed_trial / "agent").mkdir(parents=True)
+    (successful_trial / "agent").mkdir(parents=True)
+    (successful_trial / "agent" / "codex.txt").write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "item.completed",
+                        "item": {
+                            "type": "command_execution",
+                            "command": "apt-get update && apt-get install -y g++",
+                            "aggregated_output": "installed compiler",
+                            "exit_code": 0,
+                            "status": "completed",
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "item.completed",
+                        "item": {
+                            "type": "command_execution",
+                            "command": (
+                                "python train.py && cp model.bin /app/model.bin"
+                            ),
+                            "aggregated_output": "saved /app/model.bin",
+                            "exit_code": 0,
+                            "status": "completed",
+                        },
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    pool = tmp_path / "trajectory_pool.jsonl"
+    _write_pool(
+        pool,
+        [
+            {
+                "trajectory_id": "failed-1",
+                "task_id": "train-fasttext",
+                "reward": 0.0,
+                "trial_dir": str(failed_trial),
+                "prompt_summary": "Train a fastText classifier.",
+            },
+            {
+                "trajectory_id": "success-1",
+                "task_id": "train-fasttext",
+                "reward": 1.0,
+                "trial_dir": str(successful_trial),
+            },
+        ],
+    )
+
+    output = tmp_path / "job.json"
+    assert (
+        main(
+            [
+                "terminal-bench-task-local-parametric-memory-job",
+                "--trajectory-pool",
+                str(pool),
+                "--task-id",
+                "train-fasttext",
+                "--output-root",
+                str(tmp_path / "out"),
+                "--trainer-command",
+                "python",
+                "--trainer-arg",
+                "train_lora.py",
+                "--trainer-arg",
+                "--train-file",
+                "--trainer-arg",
+                "{training_dataset}",
+                "--trainer-arg",
+                "--output-dir",
+                "--trainer-arg",
+                "{adapter_dir}",
+                "--command-contains",
+                "/app/model.bin",
+                "--target-mode",
+                "sequence",
+                "--output",
+                str(output),
+            ]
+        )
+        == 0
+    )
+
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    records = [
+        json.loads(line)
+        for line in Path(payload["dataset"]["records_path"]).read_text().splitlines()
+    ]
+    assert payload["target_mode"] == "sequence"
+    assert payload["dataset"]["record_count"] == 2
+    assert [record["metadata"]["target_sequence_index"] for record in records] == [0, 1]
+    assert [record["metadata"]["target_sequence_length"] for record in records] == [2, 2]

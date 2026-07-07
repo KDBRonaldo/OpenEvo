@@ -553,6 +553,7 @@ uv run polar-evolution terminal-bench-task-local-parametric-memory-job \
   --trainer-arg '{adapter_dir}' \
   --command-contains /app/model.bin \
   --prompt-style live_replay \
+  --target-mode sequence \
   --output /tmp/tb21-task-local-parametric/train-fasttext/job.json
 ```
 
@@ -570,11 +571,16 @@ runtime Memory/Skills/Skill Context and the actual tool result, then supervises
 the selected successful `tb_exec`. The default `--prompt-style direct_solver`
 is a synthetic approximation for pools that only contain Codex transcripts. Use
 `--prompt-style synthetic_correction` only to reproduce the older compact
-correction prompt. The selected target command must be executable from the
-chosen prefix state. If a successful trajectory created intermediate files or
-installed dependencies before its final write command, the method should provide
-a self-contained one-shot target or a sequence-compression strategy instead of
-training on only the final command.
+correction prompt. The default `--target-mode final` preserves the older
+single-target behavior: it supervises only the selected successful `tb_exec`.
+Use `--target-mode sequence` when the successful trajectory is a recipe whose
+later write command depends on earlier dependency installation, data
+preparation, or intermediate files. Sequence mode emits progressive
+next-command records through the selected final target, appending synthetic
+tool-result messages for earlier successful commands so each target is
+executable from the represented prefix state. If the sequence has more commands
+than `--max-records-per-task`, the cap is suffix-anchored so the selected final
+target is still included.
 `scripts/qwen_lora_sft.py` is a repository-provided experiment helper; it should
 be run with a trainer environment that provides `torch`, `transformers`, and
 `peft`, rather than making those libraries mandatory package dependencies. Pass

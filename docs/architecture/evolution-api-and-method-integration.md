@@ -561,7 +561,12 @@ trajectory 和一个成功 trajectory，读取成功 trial 的 `agent/codex.txt`
 standalone dataset manifest、`records.jsonl` 和 `parametric_memory_lora_sft`
 `WorkerClaimedJob` JSON。它不写 EvolutionStore；只有显式 `--run-worker` 时才调用本地
 reference method。若多个成功命令匹配过滤条件，builder 会优先选择写入型命令，而不是后续
-存在性检查或 size check。该路径用于本地/proxy inference 的 parametric-memory ablation，
+存在性检查或 size check。默认 `--target-mode final` 只监督这个选中的成功命令；
+`--target-mode sequence` 会先选定同一个最终目标，再把成功轨迹中到该目标为止的命令拆成
+progressive next-command SFT records，并用 synthetic `tb_exec` tool-result messages 表示
+前序命令状态；若 sequence 长度超过 `--max-records-per-task`，截断会保留靠近最终目标的
+suffix，确保最终目标仍被训练。该模式适合 final write 依赖依赖安装、数据准备或中间文件的
+Terminal Bench recipe。该路径用于本地/proxy inference 的 parametric-memory ablation，
 不适用于 Codex subscription serving。
 
 本地 vLLM eval 提供 serving-time adapter 兼容层：对 Qwen3.5/Qwen3.6 MoE PEFT LoRA，可在

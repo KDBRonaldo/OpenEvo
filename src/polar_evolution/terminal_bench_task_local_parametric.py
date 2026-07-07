@@ -84,6 +84,10 @@ _TASK_LOCAL_PROMPT_STYLES = {
     "live_replay",
     "synthetic_correction",
 }
+_TASK_LOCAL_TARGET_MODES = {
+    "final",
+    "sequence",
+}
 
 _TARGET_WRITE_COMMAND_NEEDLES = (
     "save_model(",
@@ -243,6 +247,7 @@ def build_task_local_sft_records(
     exclude_command_contains: list[str] | None = None,
     max_records: int = 16,
     prompt_style: str = "direct_solver",
+    target_mode: str = "final",
 ) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     if prompt_style not in _TASK_LOCAL_PROMPT_STYLES:
@@ -250,30 +255,86 @@ def build_task_local_sft_records(
             "task-local parametric prompt_style must be direct_solver, "
             "live_replay, or synthetic_correction"
         )
+    if target_mode not in _TASK_LOCAL_TARGET_MODES:
+        raise ValueError("task-local parametric target_mode must be final or sequence")
     for failed in selection.failed:
         if len(records) >= max_records:
             break
         for successful in selection.successful:
-            commands = extract_successful_codex_commands(
-                _trial_codex_transcript(successful.trial_dir),
-                command_contains=command_contains,
-                exclude_command_contains=exclude_command_contains,
-            )
+            transcript_path = _trial_codex_transcript(successful.trial_dir)
+            if target_mode == "sequence":
+                commands = _sequence_target_commands(
+                    transcript_path,
+                    command_contains=command_contains,
+                    exclude_command_contains=exclude_command_contains,
+                )
+            else:
+                commands = extract_successful_codex_commands(
+                    transcript_path,
+                    command_contains=command_contains,
+                    exclude_command_contains=exclude_command_contains,
+                )
             if not commands:
                 continue
 
-            command = _select_task_local_target_command(commands)
-            records.append(
-                _task_local_sft_record(
-                    selection=selection,
-                    failed=failed,
-                    successful=successful,
-                    command=command,
-                    prompt_style=prompt_style,
+            if target_mode == "sequence":
+                remaining_records = max_records - len(records)
+                start_index = max(0, len(commands) - remaining_records)
+                for target_index in range(start_index, len(commands)):
+                    command = commands[target_index]
+                    if len(records) >= max_records:
+                        break
+                    records.append(
+                        _task_local_sft_record(
+                            selection=selection,
+                            failed=failed,
+                            successful=successful,
+                            command=command,
+                            prompt_style=prompt_style,
+                            target_mode=target_mode,
+                            previous_commands=commands[:target_index],
+                            target_sequence_index=target_index,
+                            target_sequence_length=len(commands),
+                        )
+                    )
+            else:
+                command = _select_task_local_target_command(commands)
+                records.append(
+                    _task_local_sft_record(
+                        selection=selection,
+                        failed=failed,
+                        successful=successful,
+                        command=command,
+                        prompt_style=prompt_style,
+                        target_mode=target_mode,
+                    )
                 )
-            )
-            break
+            if records:
+                break
     return records
+
+
+def _sequence_target_commands(
+    transcript_path: Path,
+    *,
+    command_contains: list[str] | None,
+    exclude_command_contains: list[str] | None,
+) -> list[CodexCommandEvent]:
+    commands = extract_successful_codex_commands(
+        transcript_path,
+        exclude_command_contains=exclude_command_contains,
+    )
+    required = [needle for needle in command_contains or [] if needle]
+    target_candidates = [
+        command
+        for command in commands
+        if not required or all(needle in command.command for needle in required)
+    ]
+    if not target_candidates:
+        return []
+    target = _select_task_local_target_command(target_candidates)
+    target_position = commands.index(target)
+    return commands[: target_position + 1]
 
 
 def _select_task_local_target_command(
@@ -407,8 +468,23 @@ def _task_local_sft_record(
     successful: TrajectoryPoolRow,
     command: CodexCommandEvent,
     prompt_style: str,
+    target_mode: str,
+    previous_commands: list[CodexCommandEvent] | None = None,
+    target_sequence_index: int | None = None,
+    target_sequence_length: int | None = None,
 ) -> dict[str, Any]:
-    if prompt_style == "synthetic_correction":
+    if target_mode == "sequence":
+        prompt_messages, response_messages, prefix_source = (
+            _task_local_sequence_messages(
+                selection=selection,
+                failed=failed,
+                successful=successful,
+                command=command,
+                prompt_style=prompt_style,
+                previous_commands=previous_commands or [],
+            )
+        )
+    elif prompt_style == "synthetic_correction":
         prompt_messages, response_messages, prefix_source = (
             _task_local_synthetic_correction_messages(
                 selection=selection,
@@ -435,6 +511,20 @@ def _task_local_sft_record(
                 command=command,
             )
         )
+    metadata = {
+        "builder": "terminal_bench_task_local_parametric",
+        "source_failed_trajectory_id": failed.trajectory_id,
+        "source_failed_trial_dir": str(failed.trial_dir),
+        "source_successful_trajectory_id": successful.trajectory_id,
+        "source_successful_trial_dir": str(successful.trial_dir),
+        "source_successful_command_event_index": command.event_index,
+        "source_successful_command_output_excerpt": command.output_excerpt,
+        "prefix_source": prefix_source,
+        "target_tool_name": "tb_exec",
+    }
+    if target_sequence_index is not None and target_sequence_length is not None:
+        metadata["target_sequence_index"] = target_sequence_index
+        metadata["target_sequence_length"] = target_sequence_length
     return {
         "event_id": (
             f"task-local-parametric:{selection.task_id}:"
@@ -451,18 +541,59 @@ def _task_local_sft_record(
                 "tools": _TERMINAL_BENCH_TOOLS,
             }
         ],
-        "metadata": {
-            "builder": "terminal_bench_task_local_parametric",
-            "source_failed_trajectory_id": failed.trajectory_id,
-            "source_failed_trial_dir": str(failed.trial_dir),
-            "source_successful_trajectory_id": successful.trajectory_id,
-            "source_successful_trial_dir": str(successful.trial_dir),
-            "source_successful_command_event_index": command.event_index,
-            "source_successful_command_output_excerpt": command.output_excerpt,
-            "prefix_source": prefix_source,
-            "target_tool_name": "tb_exec",
-        },
+        "metadata": metadata,
     }
+
+
+def _task_local_sequence_messages(
+    *,
+    selection: TaskLocalSelection,
+    failed: TrajectoryPoolRow,
+    successful: TrajectoryPoolRow,
+    command: CodexCommandEvent,
+    prompt_style: str,
+    previous_commands: list[CodexCommandEvent],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], str]:
+    if prompt_style == "live_replay":
+        live_prefix = _task_local_live_replay_prefix(failed.trial_dir)
+        if live_prefix is not None:
+            prompt_messages, call_index = live_prefix
+            prefix_source = f"live_replay_llm_call:{call_index}"
+        else:
+            prompt_messages = _task_local_direct_solver_prefix_messages(
+                failed=failed,
+                successful=successful,
+            )
+            prefix_source = "direct_solver_read_task"
+    elif prompt_style == "synthetic_correction":
+        prompt = (
+            "Task-local parametric memory correction.\n\n"
+            f"Task id: {selection.task_id}\n"
+            f"Failed trajectory summary: {_task_summary(failed)}\n"
+            f"Successful trajectory summary: {_task_summary(successful)}\n\n"
+            "Produce the next solve action as a tool call."
+        )
+        prompt_messages = [
+            {"role": "system", "content": _TASK_LOCAL_SYNTHETIC_SYSTEM},
+            {"role": "user", "content": prompt},
+        ]
+        prefix_source = "task_summary_fallback"
+    else:
+        prompt_messages = _task_local_direct_solver_prefix_messages(
+            failed=failed,
+            successful=successful,
+        )
+        prefix_source = "direct_solver_read_task"
+
+    prompt_messages = [
+        *prompt_messages,
+        *_previous_command_messages(previous_commands),
+    ]
+    return (
+        prompt_messages,
+        [_task_local_target_exec_message(command.command)],
+        prefix_source,
+    )
 
 
 def _task_local_synthetic_correction_messages(
@@ -519,36 +650,81 @@ def _task_local_direct_solver_messages(
     successful: TrajectoryPoolRow,
     command: CodexCommandEvent,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], str]:
-    read_task_call_id = "polar-task-local-read-task"
-    task_text = _task_instruction_text(failed) or _task_instruction_text(successful)
-    if not task_text:
-        task_text = _task_summary(failed)
+    del selection
+    prompt_messages = _task_local_direct_solver_prefix_messages(
+        failed=failed,
+        successful=successful,
+    )
+    read_task_messages = prompt_messages[2:]
     return (
+        prompt_messages[:2],
         [
-            {"role": "system", "content": _TASK_LOCAL_DIRECT_SOLVER_SYSTEM},
-            {"role": "user", "content": _task_local_direct_solver_instruction()},
-        ],
-        [
-            {
-                "role": "assistant",
-                "content": "",
-                "tool_calls": [
-                    _tool_call(
-                        "tb_read_task",
-                        {"task_id": "terminal-bench-task"},
-                        call_id=read_task_call_id,
-                    )
-                ],
-            },
-            {
-                "role": "tool",
-                "tool_call_id": read_task_call_id,
-                "content": _task_local_read_task_response(task_text),
-            },
+            *read_task_messages,
             _task_local_target_exec_message(command.command),
         ],
         "direct_solver_read_task",
     )
+
+
+def _task_local_direct_solver_prefix_messages(
+    *,
+    failed: TrajectoryPoolRow,
+    successful: TrajectoryPoolRow,
+) -> list[dict[str, Any]]:
+    read_task_call_id = "polar-task-local-read-task"
+    task_text = _task_instruction_text(failed) or _task_instruction_text(successful)
+    if not task_text:
+        task_text = _task_summary(failed)
+    return [
+        {"role": "system", "content": _TASK_LOCAL_DIRECT_SOLVER_SYSTEM},
+        {"role": "user", "content": _task_local_direct_solver_instruction()},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                _tool_call(
+                    "tb_read_task",
+                    {"task_id": "terminal-bench-task"},
+                    call_id=read_task_call_id,
+                )
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": read_task_call_id,
+            "content": _task_local_read_task_response(task_text),
+        },
+    ]
+
+
+def _previous_command_messages(
+    commands: list[CodexCommandEvent],
+) -> list[dict[str, Any]]:
+    messages: list[dict[str, Any]] = []
+    for index, command in enumerate(commands):
+        call_id = f"polar-task-local-sequence-{index}"
+        messages.extend(
+            [
+                _task_local_target_exec_message(command.command, call_id=call_id),
+                {
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "content": _task_local_command_result_message(command),
+                },
+            ]
+        )
+    return messages
+
+
+def _task_local_command_result_message(command: CodexCommandEvent) -> str:
+    payload = {
+        "command": command.command,
+        "exit_code": command.exit_code,
+        "output_excerpt": command.output_excerpt,
+        "status": command.status,
+        "tool": "tb_exec",
+    }
+    return json.dumps(payload, indent=2, sort_keys=True)
 
 
 def _task_local_live_replay_prefix(
@@ -691,7 +867,11 @@ def _task_local_read_task_response(task_text: str) -> str:
     return json.dumps(payload, indent=2, sort_keys=True)
 
 
-def _task_local_target_exec_message(command: str) -> dict[str, Any]:
+def _task_local_target_exec_message(
+    command: str,
+    *,
+    call_id: str = "polar-task-local-target",
+) -> dict[str, Any]:
     return {
         "role": "assistant",
         "content": "",
@@ -702,6 +882,7 @@ def _task_local_target_exec_message(command: str) -> dict[str, Any]:
                     "task_id": "terminal-bench-task",
                     "command": command,
                 },
+                call_id=call_id,
             )
         ],
     }

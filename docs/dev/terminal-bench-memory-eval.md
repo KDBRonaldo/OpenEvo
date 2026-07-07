@@ -336,8 +336,13 @@ it reuses the real model `input_messages` immediately after `tb_read_task` and
 supervises the successful `tb_exec` target. The default `--prompt-style
 direct_solver` remains a synthetic direct-solver approximation for pools that
 only contain Codex transcripts. Use `--prompt-style synthetic_correction` only
-for explicit ablations of the old compact correction prompt. Use `--run-worker`
-only when the trainer is ready to run locally.
+for explicit ablations of the old compact correction prompt. The default
+`--target-mode final` exports one selected successful command. Use
+`--target-mode sequence` for multi-step recipes such as `train-fasttext`, where
+the final `/app/model.bin` write depends on earlier package installation or data
+preparation commands; sequence mode exports progressive next-command examples
+through the selected final target. Use `--run-worker` only when the trainer is
+ready to run locally.
 
 ```sh
 OPEN_EVO_REPO=/path/to/OpenEvo
@@ -356,6 +361,7 @@ uv run polar-evolution terminal-bench-task-local-parametric-memory-job \
   --trainer-arg '{adapter_dir}' \
   --command-contains /app/model.bin \
   --prompt-style live_replay \
+  --target-mode sequence \
   --output /tmp/tb21-task-local-parametric/train-fasttext/job.json
 ```
 
@@ -368,6 +374,9 @@ schemas are present. `full_trace` now preserves assistant messages that contain
 `training.jsonl`. When several successful commands match `--command-contains`,
 the builder prefers write-like commands such as `save_model`, `cp`, `mv`, or
 file writes over later verification commands such as `Path.exists()` checks.
+With `--target-mode sequence`, it first selects that final target and then emits
+one SFT row per successful command up to and including it, preserving the task
+state through synthetic `tb_exec` tool-result messages between targets.
 With `live_replay`, `records.jsonl` contains the exact failed local harness
 prefix selected from `llm_calls.jsonl`, including runtime Memory/Skills/Skill
 Context blocks and the real `tb_read_task` tool result. With the synthetic
@@ -730,6 +739,33 @@ than producing a fastText binary. The run was stopped after this failure mode
 was captured, so it should be treated as method debugging evidence, not a
 formal pass@1 result. For completed `train-fasttext` paired runs so far, the
 measured parametric-memory delta remains `0`.
+
+The next framework change added `--target-mode sequence` for task-local
+parametric-memory jobs. On the same real `train-fasttext` trajectory pool, the
+sequence builder at
+`/tmp/tb21-task-local-parametric-sequence-20260707/train-fasttext-qwen35-9b-sequence-smoke-v2`
+exported 16 capped records from a 23-command successful recipe. Because the cap
+is suffix-anchored in sequence mode, the exported records covered sequence
+indices 7 through 22 and still included the final `/app/model.bin` target. A
+Qwen3.5-9B 1-step trainer smoke at
+`/tmp/tb21-task-local-parametric-sequence-20260707/train-fasttext-qwen35-9b-sequence-smoke-train-v2`
+read all 16 records, trained one LoRA step on GPU 6, and registered a
+`parametric_memory` artifact with `adapter_config.json`,
+`adapter_model.safetensors`, and `trainer_diagnostics.json`
+(`losses: [0.5574389696121216]`).
+
+Two local-inference smoke eval attempts used the sequence adapter above with
+managed Qwen3.5-9B vLLM on GPU 6. The first used `context_window_tokens=8192`
+and reproduced the known boundary failure: vLLM rejected a later baseline
+request with `prompt contains at least 8192 input tokens` plus requested output,
+after which the baseline verifier path was stopped. The second used
+`context_window_tokens=16384`, `max_output_tokens=512`, and
+`EVOLAB_TB_MAX_SUBAGENT_TOOL_CALLS=12`; vLLM and the Harbor agent interacted
+normally with no context-window rejection, and baseline failed cleanly by
+tool-call budget, but the official `train-fasttext` verifier was still slow in
+the smoke run and was stopped before the parametric-memory condition. These
+smokes validate dataset/trainer/local-server plumbing for sequence mode, but do
+not constitute a completed paired performance result.
 
 Evaluate baseline local Qwen and adapter local Qwen against the same subset:
 

@@ -509,6 +509,16 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     tb_task_local_parametric_job.add_argument(
+        "--target-mode",
+        choices=["final", "sequence"],
+        default="final",
+        help=(
+            "Target construction for task-local SFT records. final keeps the "
+            "single selected successful tb_exec target; sequence creates "
+            "progressive next-command records through that target."
+        ),
+    )
+    tb_task_local_parametric_job.add_argument(
         "--artifact-root",
         help="Artifact root used only when --run-worker is set.",
     )
@@ -1518,6 +1528,7 @@ def _create_terminal_bench_task_local_parametric_memory_job(
             exclude_command_contains=list(args.exclude_command_contains),
             max_records=args.max_records_per_task,
             prompt_style=args.prompt_style,
+            target_mode=args.target_mode,
         )
         selection_summary.append(
             {
@@ -1557,6 +1568,7 @@ def _create_terminal_bench_task_local_parametric_memory_job(
     payload["selected_tasks"] = selected_task_ids
     payload["selection_summary"] = selection_summary
     payload["prompt_style"] = args.prompt_style
+    payload["target_mode"] = args.target_mode
 
     if args.run_worker:
         artifact_root = Path(args.artifact_root) if args.artifact_root else output_root / "artifacts"
