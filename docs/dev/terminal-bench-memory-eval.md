@@ -926,6 +926,47 @@ should contain both the first-action live replay record and a
 `live_replay_run_tests_correction_llm_call:*` record carrying
 `candidate_artifacts` feedback that `/app/out.txt` is missing.
 
+The first correction-stage gcode adapter used
+`/tmp/tb21-task-local-parametric-gcode-correction-20260707/correction_pool.jsonl`,
+which combined the prior mixed pool with repeated failed local treatment rows.
+The dry-run exported 64 records: 16 `direct_solver_read_task`, 24
+`live_replay_llm_call:2`, and 24
+`live_replay_run_tests_correction_llm_call:4`; every target command wrote the
+correct flag to `/app/out.txt`, every target carried `timeout_seconds=30`, and
+24 prefixes included `candidate_artifacts` feedback. Training at
+`/tmp/tb21-task-local-parametric-gcode-correction-20260707/train-gcode-qwen35-correction-r8-s160`
+used Qwen3.5-9B, GPU 6, LoRA rank 8, alpha 16, `max_length=4096`, and 160
+steps; diagnostics recorded 64 training records and loss moving from roughly
+`1.35` to `1.57e-5`. The paired eval at
+`/tmp/tb21-task-local-parametric-gcode-correction-20260707/eval-gcode-qwen35-correction-r8-s160`
+completed with baseline pass@1 `0/1`, parametric-memory pass@1 `0/1`, and
+delta `0`. This adapter was active: the treatment immediately emitted the
+correct flag string and valid `timeout_seconds=30`, while the baseline kept
+inspecting `text.gcode`. The remaining error was output-path drift. The
+treatment wrote `flag.txt` or `/app/flag.txt`, saw `tb_run_tests` report
+`/app/out.txt present=false`, and still did not repair to `/app/out.txt`.
+
+A second iterative correction adapter used the failed v1 treatment trajectory
+itself as the negative prefix source:
+`/tmp/tb21-task-local-parametric-gcode-correction-v2-20260707/correction_v2_pool.jsonl`.
+Its dry-run exported 64 records: 32 first-action `live_replay_llm_call:2`
+records and 32 `live_replay_run_tests_correction_llm_call:4` records. All
+targets were the exact `/app/out.txt` write command, all carried
+`timeout_seconds=30`, all prefixes contained `/app/out.txt`, and all correction
+prefixes contained both `flag.txt` and missing-artifact feedback. Training at
+`/tmp/tb21-task-local-parametric-gcode-correction-v2-20260707/train-gcode-qwen35-correction-v2-r8-s120`
+used the same Qwen3.5-9B LoRA settings for 120 steps and reached final losses
+around `7e-6`. The paired eval at
+`/tmp/tb21-task-local-parametric-gcode-correction-v2-20260707/eval-gcode-qwen35-correction-v2-r8-s120`
+again scored baseline pass@1 `0/1`, parametric-memory pass@1 `0/1`, delta `0`.
+The treatment wrote the correct flag to `/app/flag.txt`, called
+`tb_run_tests`, wrote a report incorrectly claiming success, and never created
+`/app/out.txt`; the official verifier failed `test_hello_file_exists` and
+`test_hello_file_content`. Treat these gcode correction runs as active-adapter
+method negatives: the LoRA reliably injects the answer string and timeout
+schema, but path binding remains unstable under this pure SFT task-local memory
+construction.
+
 For `password-recovery`, a Qwen3.5-9B local LoRA smoke was trained from the
 existing failed/successful tool-policy trajectory at
 `/tmp/tb21-parametric-memory-password-toolpolicy-20260702-110343/local-eval-password-toolpolicy-2048/baseline/harbor_jobs/baseline-password-recovery/password-recovery__AzMbthq`.
