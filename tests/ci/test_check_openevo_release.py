@@ -131,6 +131,16 @@ def test_release_smoke_workflow_builds_packaged_assets_and_validates_wheel() -> 
     assert "tests/ci/test_check_openevo_release.py" in text
     assert "python -m build --wheel" in text
     assert "scripts/ci/check_openevo_release.py --wheel dist/*.whl" in text
+    assert "python -m venv .openevo-wheel-smoke" in text
+    assert ".openevo-wheel-smoke/bin/python -m pip install dist/*.whl" in text
+    assert ".openevo-wheel-smoke/bin/openevo --help" in text
+    assert ".openevo-wheel-smoke/bin/openevo desktop --help" in text
+    assert ".openevo-wheel-smoke/bin/openevo desktop open --help" in text
+
+    assert text.index("name: Build wheel") < text.index("name: Validate OpenEvo wheel")
+    assert text.index("name: Validate OpenEvo wheel") < text.index(
+        "name: Install wheel and smoke OpenEvo CLI"
+    )
 
 
 def _write_wheel(

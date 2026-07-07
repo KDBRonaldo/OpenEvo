@@ -55,3 +55,12 @@ jobs:
       - name: Validate OpenEvo wheel
         run: |
           python scripts/ci/check_openevo_release.py --wheel dist/*.whl
+
+      - name: Install wheel and smoke OpenEvo CLI
+        run: |
+          python -m venv .openevo-wheel-smoke
+          .openevo-wheel-smoke/bin/python -m pip install --upgrade pip
+          .openevo-wheel-smoke/bin/python -m pip install dist/*.whl
+          .openevo-wheel-smoke/bin/openevo --help
+          .openevo-wheel-smoke/bin/openevo desktop --help
+          .openevo-wheel-smoke/bin/openevo desktop open --help

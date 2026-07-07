@@ -156,8 +156,9 @@ rsync -a --delete web/dist/ src/openevo/desktop/web/
 ```
 
 The release smoke check rebuilds the OpenEvo-only Desktop assets, verifies that
-the committed package assets match `web/dist`, builds the Python wheel, and
-inspects the wheel metadata, console scripts, and packaged assets:
+the committed package assets match `web/dist`, builds the Python wheel, inspects
+the wheel metadata, console scripts, and packaged assets, then installs the
+wheel into a clean environment and runs the installed OpenEvo CLI entrypoints:
 
 ```bash
 cd web
@@ -167,6 +168,12 @@ cd ..
 diff -qr web/dist src/openevo/desktop/web
 python -m build --wheel
 python scripts/ci/check_openevo_release.py --wheel dist/*.whl
+python -m venv .openevo-wheel-smoke
+.openevo-wheel-smoke/bin/python -m pip install --upgrade pip
+.openevo-wheel-smoke/bin/python -m pip install dist/*.whl
+.openevo-wheel-smoke/bin/openevo --help
+.openevo-wheel-smoke/bin/openevo desktop --help
+.openevo-wheel-smoke/bin/openevo desktop open --help
 ```
 
 OpenEvo package and Desktop-sidecar Python regressions are checked with:

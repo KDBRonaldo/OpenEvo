@@ -296,6 +296,12 @@ cd ..
 diff -qr web/dist src/openevo/desktop/web
 python -m build --wheel
 python scripts/ci/check_openevo_release.py --wheel dist/*.whl
+python -m venv .openevo-wheel-smoke
+.openevo-wheel-smoke/bin/python -m pip install --upgrade pip
+.openevo-wheel-smoke/bin/python -m pip install dist/*.whl
+.openevo-wheel-smoke/bin/openevo --help
+.openevo-wheel-smoke/bin/openevo desktop --help
+.openevo-wheel-smoke/bin/openevo desktop open --help
 ```
 
 For the focused OpenEvo Python regression check used by CI:
