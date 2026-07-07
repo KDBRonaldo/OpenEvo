@@ -168,3 +168,54 @@ def test_cli_science_compile_rejects_invalid_prepared_workspace(
 
     assert exit_code == 1
     assert "--prepared-workspace must use task_id=/remote/path" in capsys.readouterr().err
+
+
+def test_cli_sidecar_plan_outputs_workspace_and_preflight(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    science_path = _write_config(
+        tmp_path / "science.yaml",
+        _minimal_science_payload()
+        | {
+            "task": {
+                "id": "local-task",
+                "objective": "Run local workflow.",
+                "source": {
+                    "type": "local_folder",
+                    "path": "workflows/local-task",
+                },
+            }
+        },
+    )
+    profile_path = _write_config(
+        tmp_path / "remote.yaml",
+        {
+            "version": 1,
+            "id": "science-team",
+            "host": "gpu.example.edu",
+            "user": "alice",
+            "proxy": {"https_proxy": "http://127.0.0.1:7890"},
+        },
+    )
+
+    exit_code = main(
+        [
+            "sidecar",
+            "plan",
+            str(science_path),
+            "--remote-profile",
+            str(profile_path),
+            "--json",
+        ]
+    )
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["remote_profile_id"] == "science-team"
+    assert payload["preflight"]["require_codex_subscription"] is True
+    assert payload["proxy_env"]["HTTPS_PROXY"] == "http://127.0.0.1:7890"
+    assert payload["workspace"]["actions"][0]["type"] == "upload_dir"
+    assert payload["experiment"]["tasks"][0]["workspace"].startswith(
+        "/home/alice/.openevo/workspaces/protein-design/local-task/"
+    )

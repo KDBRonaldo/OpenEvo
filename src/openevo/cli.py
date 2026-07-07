@@ -17,6 +17,10 @@ from openevo.science import (
     compile_science_project,
     load_science_project_config,
 )
+from openevo.sidecar import (
+    build_sidecar_science_plan,
+    load_remote_profile_config,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -77,6 +81,26 @@ def build_parser() -> argparse.ArgumentParser:
             "Can be repeated."
         ),
     )
+
+    sidecar_parser = subparsers.add_parser(
+        "sidecar",
+        help="Work with OpenEvo Desktop sidecar plans.",
+    )
+    sidecar_subparsers = sidecar_parser.add_subparsers(
+        dest="sidecar_command",
+        required=True,
+    )
+    plan_parser = sidecar_subparsers.add_parser(
+        "plan",
+        help="Build a Desktop sidecar dry-run plan for a Science Project.",
+    )
+    plan_parser.add_argument("config", help="Path to science project YAML.")
+    plan_parser.add_argument(
+        "--remote-profile",
+        required=True,
+        help="Path to remote profile YAML.",
+    )
+    plan_parser.add_argument("--json", action="store_true", help="Print JSON output.")
     return parser
 
 
@@ -88,6 +112,8 @@ def main(argv: list[str] | None = None) -> int:
             return _handle_run(args)
         if args.command == "science":
             return _handle_science(args)
+        if args.command == "sidecar":
+            return _handle_sidecar(args)
     except (FileNotFoundError, ValueError, ValidationError, TimeoutError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
@@ -149,6 +175,24 @@ def _handle_science_compile(args: argparse.Namespace) -> int:
         prepared_workspaces=_parse_prepared_workspaces(args.prepared_workspace),
     )
     result = config.model_dump(mode="json", exclude={"path"})
+    if args.json:
+        print(_json_dumps(result), end="")
+        return 0
+    print(yaml.safe_dump(result, sort_keys=True), end="")
+    return 0
+
+
+def _handle_sidecar(args: argparse.Namespace) -> int:
+    if args.sidecar_command == "plan":
+        return _handle_sidecar_plan(args)
+    raise ValueError(f"Unknown sidecar command: {args.sidecar_command}")
+
+
+def _handle_sidecar_plan(args: argparse.Namespace) -> int:
+    project = load_science_project_config(Path(args.config))
+    profile = load_remote_profile_config(Path(args.remote_profile))
+    plan = build_sidecar_science_plan(project, profile)
+    result = plan.model_dump(mode="json")
     if args.json:
         print(_json_dumps(result), end="")
         return 0
