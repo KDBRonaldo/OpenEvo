@@ -360,6 +360,20 @@ schemas are present. `full_trace` now preserves assistant messages that contain
 the builder prefers write-like commands such as `save_model`, `cp`, `mv`, or
 file writes over later verification commands such as `Path.exists()` checks.
 
+Smoke evidence on 2026-07-07:
+
+- Dry-run job generation at
+  `/tmp/tb21-task-local-parametric-smoke-20260707/train-fasttext` selected
+  `train-fasttext`, wrote 11 SFT records, and chose the successful
+  `model.save_model('/app/model.bin')` command rather than the later file-size
+  verification command.
+- Trainer smoke at
+  `/tmp/tb21-task-local-parametric-train-smoke-20260707/train-fasttext-qwen35-9b`
+  used `Qwen/Qwen3.5-9B`, `CUDA_VISIBLE_DEVICES=6`, one SFT record, one trainer
+  step, and produced a `parametric_memory` artifact with
+  `adapter_config.json`, `adapter_model.safetensors`, and
+  `trainer_diagnostics.json`. The diagnostic loss was `1.2177761793136597`.
+
 Create a parametric-memory job from successful Terminal Bench trajectories and
 run the local worker once:
 
