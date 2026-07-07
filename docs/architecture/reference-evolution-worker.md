@@ -538,6 +538,7 @@ Task-local Terminal Bench parametric jobs can be prepared without going through
 the event store:
 
 ```sh
+OPEN_EVO_REPO=/path/to/OpenEvo
 uv run polar-evolution terminal-bench-task-local-parametric-memory-job \
   --trajectory-pool /path/to/trajectory_pool.jsonl \
   --task-id train-fasttext \
@@ -545,7 +546,7 @@ uv run polar-evolution terminal-bench-task-local-parametric-memory-job \
   --base-model Qwen/Qwen3.6-35B-A3B \
   --adapter-id tb-parametric-memory-train-fasttext \
   --trainer-command /root/evolab-vllm/bin/python \
-  --trainer-arg scripts/qwen_lora_sft.py \
+  --trainer-arg "${OPEN_EVO_REPO}/scripts/qwen_lora_sft.py" \
   --trainer-arg --train-file \
   --trainer-arg '{training_dataset}' \
   --trainer-arg --output-dir \
@@ -563,7 +564,9 @@ filters, the builder prefers write-like commands over later validation commands,
 so post-hoc existence checks do not become the supervised target.
 `scripts/qwen_lora_sft.py` is a repository-provided experiment helper; it should
 be run with a trainer environment that provides `torch`, `transformers`, and
-`peft`, rather than making those libraries mandatory package dependencies.
+`peft`, rather than making those libraries mandatory package dependencies. Pass
+the helper as an absolute path, or expand a repo-root variable in the shell,
+because the worker invokes the trainer from the artifact output directory.
 
 Serving contract:
 

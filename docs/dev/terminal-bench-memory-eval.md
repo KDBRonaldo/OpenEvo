@@ -333,6 +333,7 @@ and exports a Qwen tool-call SFT record using the default `full_trace`
 projection. Use `--run-worker` only when the trainer is ready to run locally.
 
 ```sh
+OPEN_EVO_REPO=/path/to/OpenEvo
 uv run polar-evolution terminal-bench-task-local-parametric-memory-job \
   --trajectory-pool /home/jyw/openevo-skill-rl-experiments/pools/tb21-current-20260702/trajectory_pool.jsonl \
   --task-id train-fasttext \
@@ -341,7 +342,7 @@ uv run polar-evolution terminal-bench-task-local-parametric-memory-job \
   --base-model Qwen/Qwen3.6-35B-A3B \
   --adapter-id tb-parametric-memory-train-fasttext \
   --trainer-command /root/evolab-vllm/bin/python \
-  --trainer-arg scripts/qwen_lora_sft.py \
+  --trainer-arg "${OPEN_EVO_REPO}/scripts/qwen_lora_sft.py" \
   --trainer-arg --train-file \
   --trainer-arg '{training_dataset}' \
   --trainer-arg --output-dir \
@@ -361,7 +362,10 @@ the builder prefers write-like commands such as `save_model`, `cp`, `mv`, or
 file writes over later verification commands such as `Path.exists()` checks.
 The repo helper `scripts/qwen_lora_sft.py` is an experiment script, not a main
 package dependency; run it with a trainer Python environment that already has
-`torch`, `transformers`, and `peft`.
+`torch`, `transformers`, and `peft`. Pass this helper as an absolute path, or
+expand a repo-root variable in the shell as shown above, because the worker
+invokes the trainer from the artifact output directory rather than from the
+OpenEvo repository root.
 
 Smoke evidence on 2026-07-07:
 
@@ -384,10 +388,34 @@ Smoke evidence on 2026-07-07:
   plumbing and LoRA serving path, but it is not performance evidence for the
   method because the adapter was trained for only one step on one record.
 
+Single-task non-smoke evidence on 2026-07-07:
+
+- Task-local training at
+  `/tmp/tb21-task-local-parametric-train-full-20260707/train-fasttext-qwen35-9b-r8-s44`
+  used `Qwen/Qwen3.5-9B`, `CUDA_VISIBLE_DEVICES=6`, 11 SFT records from the
+  `train-fasttext` trajectory pool, LoRA rank 8, alpha 16, `max_length=1024`,
+  and 44 trainer steps. The trainer diagnostics recorded loss moving from
+  `1.1809505224227905` to `0.0003651840379461646`, and the worker registered a
+  `parametric_memory` adapter under
+  `/tmp/tb21-task-local-parametric-train-full-20260707/train-fasttext-qwen35-9b-r8-s44/artifacts/workers/job-tb-parametric-memory-train-fasttext-qwen35-9b-r8-s44/parametric_memory_lora_sft/adapter`.
+- The paired local eval at
+  `/tmp/tb21-task-local-parametric-eval-full-20260707/train-fasttext-qwen35-9b-r8-s44`
+  used managed vLLM on GPU 6 with `Qwen/Qwen3.5-9B`, `n_attempts=1`,
+  `--solver-temperature 0.0`, `--max-output-tokens 1024`,
+  `--context-window-tokens 8192`, and `--tool-result-prompt-max-chars 2048`.
+  Baseline pass@1/pass@k was `0/1`; parametric-memory pass@1/pass@k was `0/1`;
+  delta was `0`. The treatment server command recorded `--enable-lora` and
+  served model
+  `tb-parametric-memory-train-fasttext-qwen35-9b-r8-s44`, so the adapter
+  loading path was exercised. The task still failed because the treatment did
+  not produce `/app/model.bin` for the verifier. Treat this as a negative
+  single-task method result, not as full Terminal Bench performance evidence.
+
 Create a parametric-memory job from successful Terminal Bench trajectories and
 run the local worker once:
 
 ```sh
+OPEN_EVO_REPO=/path/to/OpenEvo
 uv run polar-evolution terminal-bench-parametric-memory-job \
   --input /tmp/tb21-text-memory-train-fasttext-20260701-073824/run/tasks/train-fasttext/r1/harbor_jobs/train-fasttext-r1/train-fasttext__attempt1 \
   --input /tmp/tb21-text-memory-query-optimize-20260701-021002/run/tasks/query-optimize/r1/harbor_jobs/query-optimize-r1/query-optimize__attempt1 \
@@ -399,7 +427,7 @@ uv run polar-evolution terminal-bench-parametric-memory-job \
   --base-model Qwen/Qwen3.6-35B-A3B \
   --adapter-id tb-parametric-memory \
   --trainer-command python \
-  --trainer-arg scripts/qwen_lora_sft.py \
+  --trainer-arg "${OPEN_EVO_REPO}/scripts/qwen_lora_sft.py" \
   --trainer-arg --train-file \
   --trainer-arg '{training_dataset}' \
   --trainer-arg --output-dir \
@@ -418,6 +446,7 @@ one or more staged next-tool-call targets. Keep target commands bounded and
 avoid embedding protected task answers in docs or reusable configs:
 
 ```sh
+OPEN_EVO_REPO=/path/to/OpenEvo
 uv run polar-evolution terminal-bench-parametric-memory-job \
   --input /tmp/tb21-parametric-memory-password-toolpolicy-20260702-110343/local-eval-password-toolpolicy-2048/baseline/harbor_jobs/baseline-password-recovery/password-recovery__AzMbthq \
   --db /tmp/tb21-parametric-memory-corrective/evolution.db \
@@ -428,7 +457,7 @@ uv run polar-evolution terminal-bench-parametric-memory-job \
   --base-model Qwen/Qwen3.6-35B-A3B \
   --adapter-id tb-parametric-memory-password-corrective \
   --trainer-command /root/evolab-vllm/bin/python \
-  --trainer-arg scripts/qwen_lora_sft.py \
+  --trainer-arg "${OPEN_EVO_REPO}/scripts/qwen_lora_sft.py" \
   --trainer-arg --train-file \
   --trainer-arg '{training_dataset}' \
   --trainer-arg --output-dir \
@@ -444,6 +473,7 @@ The equivalent first-class recipe form is less error-prone for the
 `password-recovery` short-target smoke:
 
 ```sh
+OPEN_EVO_REPO=/path/to/OpenEvo
 uv run polar-evolution terminal-bench-parametric-memory-job \
   --input /tmp/tb21-parametric-memory-password-toolpolicy-20260702-110343/local-eval-password-toolpolicy-2048/baseline/harbor_jobs/baseline-password-recovery/password-recovery__AzMbthq \
   --db /tmp/tb21-parametric-memory-corrective/evolution.db \
@@ -454,7 +484,7 @@ uv run polar-evolution terminal-bench-parametric-memory-job \
   --base-model Qwen/Qwen3.6-35B-A3B \
   --adapter-id tb-parametric-memory-password-recipe \
   --trainer-command /root/evolab-vllm/bin/python \
-  --trainer-arg scripts/qwen_lora_sft.py \
+  --trainer-arg "${OPEN_EVO_REPO}/scripts/qwen_lora_sft.py" \
   --trainer-arg --train-file \
   --trainer-arg '{training_dataset}' \
   --trainer-arg --output-dir \
