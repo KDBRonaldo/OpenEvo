@@ -558,6 +558,15 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     tb_task_local_parametric_job.add_argument(
+        "--include-run-tests-correction",
+        action="store_true",
+        help=(
+            "For live_replay final-target records, also export a correction "
+            "record whose prefix includes a failed tb_run_tests tool result and "
+            "whose target is the selected successful tb_exec command."
+        ),
+    )
+    tb_task_local_parametric_job.add_argument(
         "--artifact-root",
         help="Artifact root used only when --run-worker is set.",
     )
@@ -1583,6 +1592,7 @@ def _create_terminal_bench_task_local_parametric_memory_job(
             prompt_style=args.prompt_style,
             target_mode=args.target_mode,
             target_exec_timeout_seconds=args.target_exec_timeout_seconds,
+            include_run_tests_correction=args.include_run_tests_correction,
         )
         selection_summary.append(
             {
@@ -1624,6 +1634,7 @@ def _create_terminal_bench_task_local_parametric_memory_job(
     payload["prompt_style"] = args.prompt_style
     payload["target_mode"] = args.target_mode
     payload["target_exec_timeout_seconds"] = args.target_exec_timeout_seconds
+    payload["include_run_tests_correction"] = args.include_run_tests_correction
 
     if args.run_worker:
         artifact_root = Path(args.artifact_root) if args.artifact_root else output_root / "artifacts"

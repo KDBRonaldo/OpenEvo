@@ -577,6 +577,13 @@ When live replay consumes Harbor/EvoLab `llm_calls.jsonl`, tool messages prefer
 the full `metadata.tool_result.content` payload over the outer message
 `content`, which can be a truncated display string. This keeps task constraints
 such as `/app/out.txt` in the SFT prefix.
+Use `--include-run-tests-correction` with `--prompt-style live_replay` and the
+default `--target-mode final` to add a second supervised record when a failed
+local trajectory contains a failed `tb_run_tests` tool result. The correction
+record keeps the real post-verifier prefix, including missing artifact feedback
+such as `/app/out.txt present=false`, and uses the same selected successful
+`tb_exec` target. This separates first-action imitation from explicit
+post-verifier repair training.
 Use `--target-mode sequence` when the successful trajectory is a recipe whose
 later write command depends on earlier dependency installation, data
 preparation, or intermediate files. Sequence mode emits progressive

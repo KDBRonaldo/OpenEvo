@@ -916,6 +916,16 @@ it needs stronger action-shape separation, such as training explicit
 post-verifier correction stages or constraining output-file creation separately
 from task input inspection/editing.
 
+The framework now exposes the explicit post-verifier variant as
+`--include-run-tests-correction` for task-local `live_replay` + final-target
+jobs. When a failed local trajectory contains a failed `tb_run_tests` tool
+result, the builder adds a second record whose prompt is the real prefix after
+that verifier feedback and whose target is still the selected successful
+`tb_exec` write command. This is intended for the next gcode run: the dry-run
+should contain both the first-action live replay record and a
+`live_replay_run_tests_correction_llm_call:*` record carrying
+`candidate_artifacts` feedback that `/app/out.txt` is missing.
+
 For `password-recovery`, a Qwen3.5-9B local LoRA smoke was trained from the
 existing failed/successful tool-policy trajectory at
 `/tmp/tb21-parametric-memory-password-toolpolicy-20260702-110343/local-eval-password-toolpolicy-2048/baseline/harbor_jobs/baseline-password-recovery/password-recovery__AzMbthq`.

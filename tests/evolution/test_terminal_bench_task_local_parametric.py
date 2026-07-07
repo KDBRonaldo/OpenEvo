@@ -21,6 +21,196 @@ def _write_pool(path: Path, rows: list[dict]) -> None:
     )
 
 
+def _write_gcode_run_tests_correction_fixture(
+    *,
+    failed_trial: Path,
+    successful_trial: Path,
+) -> None:
+    llm_calls = (
+        failed_trial
+        / "agent"
+        / "evolab_lab"
+        / ".evolab"
+        / "registries"
+        / "trajectory"
+        / "llm_calls.jsonl"
+    )
+    llm_calls.parent.mkdir(parents=True)
+    (successful_trial / "agent").mkdir(parents=True)
+    read_task_result = json.dumps(
+        {
+            "message": "read Harbor task terminal-bench-task",
+            "task_yaml": (
+                "descriptions:\n"
+                "  - key: base\n"
+                "    description: |\n"
+                "      Convert /app/text.gcode and write the answer to /app/out.txt\n"
+            ),
+            "tool": "tb_read_task",
+        },
+        indent=2,
+        sort_keys=True,
+    )
+    run_tests_result = json.dumps(
+        {
+            "exit_code": 1,
+            "status": "failed",
+            "task_progress": {
+                "candidate_artifacts": [
+                    {"path": "/app/out.txt", "present": False},
+                ],
+                "requirement_hints": [
+                    "Convert /app/text.gcode and write the answer to /app/out.txt",
+                ],
+            },
+            "tool": "tb_run_tests",
+        },
+        indent=2,
+        sort_keys=True,
+    )
+    wrong_exec_call = {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+            {
+                "id": "call-wrong",
+                "type": "function",
+                "function": {
+                    "name": "tb_exec",
+                    "arguments": {
+                        "task_id": "terminal-bench-task",
+                        "command": "printf wrong > /app/challenge.txt",
+                    },
+                },
+            }
+        ],
+    }
+    run_tests_call = {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+            {
+                "id": "call-run-tests",
+                "type": "function",
+                "function": {
+                    "name": "tb_run_tests",
+                    "arguments": {"task_id": "terminal-bench-task"},
+                },
+            }
+        ],
+    }
+    llm_calls.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "input_messages": [
+                            {"role": "system", "content": "Solve exactly one task_id."},
+                            {"role": "user", "content": "Instruction:\n{}"},
+                            {
+                                "role": "tool",
+                                "content": read_task_result,
+                                "metadata": {
+                                    "tool_result": {
+                                        "content": read_task_result,
+                                        "status": "ok",
+                                    }
+                                },
+                                "name": "tb_read_task",
+                                "tool_call_id": "call-read",
+                            },
+                        ],
+                        "output_messages": [wrong_exec_call],
+                    }
+                ),
+                json.dumps(
+                    {
+                        "input_messages": [
+                            {"role": "system", "content": "Solve exactly one task_id."},
+                            {"role": "user", "content": "Instruction:\n{}"},
+                            {
+                                "role": "tool",
+                                "content": read_task_result,
+                                "metadata": {
+                                    "tool_result": {
+                                        "content": read_task_result,
+                                        "status": "ok",
+                                    }
+                                },
+                                "name": "tb_read_task",
+                                "tool_call_id": "call-read",
+                            },
+                            wrong_exec_call,
+                            {
+                                "role": "tool",
+                                "content": '{"status":"completed","tool":"tb_exec"}',
+                                "name": "tb_exec",
+                                "tool_call_id": "call-wrong",
+                            },
+                            run_tests_call,
+                            {
+                                "role": "tool",
+                                "content": (
+                                    '{"status":"failed","task_progress":'
+                                    '{"candidate_artifacts":[{"path":'
+                                    '"/app/out.txt","present":false}]}}'
+                                ),
+                                "metadata": {
+                                    "tool_result": {
+                                        "content": run_tests_result,
+                                        "status": "failed",
+                                    }
+                                },
+                                "name": "tb_run_tests",
+                                "tool_call_id": "call-run-tests",
+                            },
+                        ],
+                        "output_messages": [
+                            {
+                                "role": "assistant",
+                                "content": "",
+                                "tool_calls": [
+                                    {
+                                        "id": "call-collect",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "tb_collect_result",
+                                            "arguments": {
+                                                "task_id": "terminal-bench-task"
+                                            },
+                                        },
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (successful_trial / "agent" / "codex.txt").write_text(
+        json.dumps(
+            {
+                "type": "item.completed",
+                "item": {
+                    "type": "command_execution",
+                    "command": (
+                        "/bin/bash -lc \"printf '%s' "
+                        "'flag{gc0d3_iz_ch4LLenGiNg}' > /app/out.txt\""
+                    ),
+                    "aggregated_output": "",
+                    "exit_code": 0,
+                    "status": "completed",
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
 def test_select_task_local_candidates_requires_success_and_failure(
     tmp_path: Path,
 ) -> None:
@@ -1019,6 +1209,78 @@ def test_build_task_local_sft_records_can_pin_target_exec_timeout(
     assert record["metadata"]["target_exec_timeout_seconds"] == 30
 
 
+def test_build_task_local_sft_records_can_add_run_tests_correction_prefix(
+    tmp_path: Path,
+) -> None:
+    failed_trial = tmp_path / "failed-trial"
+    successful_trial = tmp_path / "successful-trial"
+    _write_gcode_run_tests_correction_fixture(
+        failed_trial=failed_trial,
+        successful_trial=successful_trial,
+    )
+    selection = TaskLocalSelection(
+        task_id="gcode-to-text",
+        failed=[
+            TrajectoryPoolRow(
+                trajectory_id="failed-gcode",
+                task_id="gcode-to-text",
+                reward=0.0,
+                trial_dir=failed_trial,
+                raw={},
+            )
+        ],
+        successful=[
+            TrajectoryPoolRow(
+                trajectory_id="success-gcode",
+                task_id="gcode-to-text",
+                reward=1.0,
+                trial_dir=successful_trial,
+                raw={},
+            )
+        ],
+        null_reward=[],
+    )
+
+    records = build_task_local_sft_records(
+        selection,
+        command_contains=["/app/out.txt"],
+        max_records=2,
+        prompt_style="live_replay",
+        target_exec_timeout_seconds=30,
+        include_run_tests_correction=True,
+    )
+
+    assert len(records) == 2
+    assert records[0]["event_id"] != records[1]["event_id"]
+    assert records[0]["metadata"]["prefix_source"] == "live_replay_llm_call:1"
+    correction = records[1]
+    assert correction["metadata"]["prefix_source"] == (
+        "live_replay_run_tests_correction_llm_call:2"
+    )
+    assert correction["metadata"]["target_correction_stage"] == "run_tests_failure"
+    trace = correction["traces"][0]
+    tool_names = [tool["function"]["name"] for tool in trace["tools"]]
+    assert "tb_run_tests" in tool_names
+    run_tests_message = next(
+        message
+        for message in trace["prompt_messages"]
+        if message.get("name") == "tb_run_tests"
+    )
+    assert "/app/out.txt" in run_tests_message["content"]
+    assert "candidate_artifacts" in run_tests_message["content"]
+    target_args = trace["response_messages"][-1]["tool_calls"][0]["function"][
+        "arguments"
+    ]
+    assert target_args == {
+        "task_id": "terminal-bench-task",
+        "command": (
+            "/bin/bash -lc \"printf '%s' "
+            "'flag{gc0d3_iz_ch4LLenGiNg}' > /app/out.txt\""
+        ),
+        "timeout_seconds": 30,
+    }
+
+
 def test_build_task_local_parametric_job_payload_writes_dataset_and_lora_job(
     tmp_path: Path,
 ) -> None:
@@ -1512,3 +1774,80 @@ def test_terminal_bench_task_local_parametric_memory_job_cli_accepts_target_exec
     ]["arguments"]
     assert payload["target_exec_timeout_seconds"] == 30
     assert target_args["timeout_seconds"] == 30
+
+
+def test_terminal_bench_task_local_parametric_memory_job_cli_accepts_run_tests_correction(
+    tmp_path: Path,
+) -> None:
+    failed_trial = tmp_path / "failed-trial"
+    successful_trial = tmp_path / "successful-trial"
+    _write_gcode_run_tests_correction_fixture(
+        failed_trial=failed_trial,
+        successful_trial=successful_trial,
+    )
+    pool = tmp_path / "trajectory_pool.jsonl"
+    _write_pool(
+        pool,
+        [
+            {
+                "trajectory_id": "failed-gcode",
+                "task_id": "gcode-to-text",
+                "reward": 0.0,
+                "trial_dir": str(failed_trial),
+            },
+            {
+                "trajectory_id": "success-gcode",
+                "task_id": "gcode-to-text",
+                "reward": 1.0,
+                "trial_dir": str(successful_trial),
+            },
+        ],
+    )
+
+    output = tmp_path / "job.json"
+    assert (
+        main(
+            [
+                "terminal-bench-task-local-parametric-memory-job",
+                "--trajectory-pool",
+                str(pool),
+                "--task-id",
+                "gcode-to-text",
+                "--output-root",
+                str(tmp_path / "out"),
+                "--trainer-command",
+                "python",
+                "--trainer-arg",
+                "train_lora.py",
+                "--trainer-arg",
+                "--train-file",
+                "--trainer-arg",
+                "{training_dataset}",
+                "--trainer-arg",
+                "--output-dir",
+                "--trainer-arg",
+                "{adapter_dir}",
+                "--command-contains",
+                "/app/out.txt",
+                "--prompt-style",
+                "live_replay",
+                "--target-exec-timeout-seconds",
+                "30",
+                "--include-run-tests-correction",
+                "--max-records-per-task",
+                "2",
+                "--output",
+                str(output),
+            ]
+        )
+        == 0
+    )
+
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    records = [
+        json.loads(line)
+        for line in Path(payload["dataset"]["records_path"]).read_text().splitlines()
+    ]
+    assert payload["include_run_tests_correction"] is True
+    assert payload["dataset"]["record_count"] == 2
+    assert records[1]["metadata"]["target_correction_stage"] == "run_tests_failure"

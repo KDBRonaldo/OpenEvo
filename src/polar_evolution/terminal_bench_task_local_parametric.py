@@ -63,6 +63,18 @@ _TERMINAL_BENCH_TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "tb_run_tests",
+            "description": "Run the visible Terminal-Bench verifier for the task.",
+            "parameters": {
+                "type": "object",
+                "properties": {"task_id": {"type": "string"}},
+                "required": ["task_id"],
+            },
+        },
+    },
 ]
 
 _TASK_LOCAL_SYNTHETIC_SYSTEM = (
@@ -250,6 +262,7 @@ def build_task_local_sft_records(
     prompt_style: str = "direct_solver",
     target_mode: str = "final",
     target_exec_timeout_seconds: int | None = None,
+    include_run_tests_correction: bool = False,
 ) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     if prompt_style not in _TASK_LOCAL_PROMPT_STYLES:
@@ -261,6 +274,10 @@ def build_task_local_sft_records(
         raise ValueError("task-local parametric target_mode must be final or sequence")
     if target_exec_timeout_seconds is not None and target_exec_timeout_seconds <= 0:
         raise ValueError("target_exec_timeout_seconds must be positive")
+    if include_run_tests_correction and target_mode != "final":
+        raise ValueError(
+            "include_run_tests_correction is only supported with target_mode=final"
+        )
     for failed in selection.failed:
         if len(records) >= max_records:
             break
@@ -315,6 +332,18 @@ def build_task_local_sft_records(
                         target_exec_timeout_seconds=target_exec_timeout_seconds,
                     )
                 )
+                if include_run_tests_correction and len(records) < max_records:
+                    correction_record = _task_local_run_tests_correction_record(
+                        selection=selection,
+                        failed=failed,
+                        successful=successful,
+                        command=command,
+                        prompt_style=prompt_style,
+                        target_mode=target_mode,
+                        target_exec_timeout_seconds=target_exec_timeout_seconds,
+                    )
+                    if correction_record is not None:
+                        records.append(correction_record)
             if records:
                 break
     return records
@@ -479,8 +508,21 @@ def _task_local_sft_record(
     previous_commands: list[CodexCommandEvent] | None = None,
     target_sequence_index: int | None = None,
     target_sequence_length: int | None = None,
+    prompt_messages_override: list[dict[str, Any]] | None = None,
+    prefix_source_override: str | None = None,
+    target_correction_stage: str | None = None,
+    event_id_suffix: str = "",
 ) -> dict[str, Any]:
-    if target_mode == "sequence":
+    if prompt_messages_override is not None:
+        prompt_messages = prompt_messages_override
+        response_messages = [
+            _task_local_target_exec_message(
+                command.command,
+                timeout_seconds=target_exec_timeout_seconds,
+            )
+        ]
+        prefix_source = prefix_source_override or "override"
+    elif target_mode == "sequence":
         prompt_messages, response_messages, prefix_source = (
             _task_local_sequence_messages(
                 selection=selection,
@@ -538,10 +580,13 @@ def _task_local_sft_record(
     if target_sequence_index is not None and target_sequence_length is not None:
         metadata["target_sequence_index"] = target_sequence_index
         metadata["target_sequence_length"] = target_sequence_length
+    if target_correction_stage is not None:
+        metadata["target_correction_stage"] = target_correction_stage
     return {
         "event_id": (
             f"task-local-parametric:{selection.task_id}:"
             f"{failed.trajectory_id}:{successful.trajectory_id}:{command.event_index}"
+            f"{event_id_suffix}"
         ),
         "task_id": selection.task_id,
         "session_id": f"task-local-parametric:{selection.task_id}",
@@ -556,6 +601,39 @@ def _task_local_sft_record(
         ],
         "metadata": metadata,
     }
+
+
+def _task_local_run_tests_correction_record(
+    *,
+    selection: TaskLocalSelection,
+    failed: TrajectoryPoolRow,
+    successful: TrajectoryPoolRow,
+    command: CodexCommandEvent,
+    prompt_style: str,
+    target_mode: str,
+    target_exec_timeout_seconds: int | None,
+) -> dict[str, Any] | None:
+    if prompt_style != "live_replay" or target_mode != "final":
+        return None
+    correction_prefix = _task_local_run_tests_correction_prefix(failed.trial_dir)
+    if correction_prefix is None:
+        return None
+    prompt_messages, call_index = correction_prefix
+    return _task_local_sft_record(
+        selection=selection,
+        failed=failed,
+        successful=successful,
+        command=command,
+        prompt_style=prompt_style,
+        target_mode=target_mode,
+        target_exec_timeout_seconds=target_exec_timeout_seconds,
+        prompt_messages_override=prompt_messages,
+        prefix_source_override=(
+            f"live_replay_run_tests_correction_llm_call:{call_index}"
+        ),
+        target_correction_stage="run_tests_failure",
+        event_id_suffix=f":run-tests-correction:{call_index}",
+    )
 
 
 def _task_local_sequence_messages(
@@ -798,6 +876,122 @@ def _task_local_live_replay_prefix(
         if not _llm_call_outputs_tool(payload, "tb_exec"):
             continue
         return input_messages, call_index
+    return None
+
+
+def _task_local_run_tests_correction_prefix(
+    trial_dir: Path,
+) -> tuple[list[dict[str, Any]], int] | None:
+    calls_path = _trial_evolab_llm_calls(trial_dir)
+    if not calls_path.is_file():
+        return None
+    for call_index, line in enumerate(
+        calls_path.read_text(encoding="utf-8", errors="replace").splitlines(),
+        start=1,
+    ):
+        if not line.strip():
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        raw_input_messages = payload.get("input_messages")
+        if not _input_messages_have_failed_run_tests_result(raw_input_messages):
+            continue
+        input_messages = _compact_live_replay_messages(raw_input_messages)
+        if input_messages:
+            return input_messages, call_index
+    return None
+
+
+def _input_messages_have_failed_run_tests_result(value: Any) -> bool:
+    if not isinstance(value, list):
+        return False
+    for message in value:
+        if not isinstance(message, dict):
+            continue
+        if message.get("role") != "tool":
+            continue
+        if _tool_result_name(message) != "tb_run_tests":
+            continue
+        if _tool_result_indicates_failure(message):
+            return True
+    return False
+
+
+def _tool_result_name(message: dict[str, Any]) -> str | None:
+    name = message.get("name")
+    if isinstance(name, str) and name.strip():
+        return name.strip()
+    for payload in _tool_result_payloads(message):
+        for key in ("tool", "kind", "name"):
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return None
+
+
+def _tool_result_indicates_failure(message: dict[str, Any]) -> bool:
+    for payload in _tool_result_payloads(message):
+        if _payload_has_missing_candidate_artifact(payload):
+            return True
+        status = payload.get("status")
+        if isinstance(status, str):
+            normalized = status.strip().lower()
+            if normalized and normalized not in {
+                "completed",
+                "ok",
+                "passed",
+                "success",
+                "succeeded",
+            }:
+                return True
+        exit_code = payload.get("exit_code")
+        if isinstance(exit_code, int | float) and exit_code != 0:
+            return True
+    return False
+
+
+def _payload_has_missing_candidate_artifact(payload: dict[str, Any]) -> bool:
+    task_progress = payload.get("task_progress")
+    if not isinstance(task_progress, dict):
+        return False
+    candidate_artifacts = task_progress.get("candidate_artifacts")
+    if not isinstance(candidate_artifacts, list):
+        return False
+    return any(
+        isinstance(candidate, dict) and candidate.get("present") is False
+        for candidate in candidate_artifacts
+    )
+
+
+def _tool_result_payloads(message: dict[str, Any]) -> list[dict[str, Any]]:
+    payloads: list[dict[str, Any]] = []
+    metadata = message.get("metadata")
+    if isinstance(metadata, dict):
+        tool_result = metadata.get("tool_result")
+        if isinstance(tool_result, dict):
+            payloads.append(tool_result)
+            parsed = _json_object_from_text(tool_result.get("content"))
+            if parsed is not None:
+                payloads.append(parsed)
+    parsed_content = _json_object_from_text(message.get("content"))
+    if parsed_content is not None:
+        payloads.append(parsed_content)
+    return payloads
+
+
+def _json_object_from_text(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        return None
+    if isinstance(parsed, dict):
+        return parsed
     return None
 
 
