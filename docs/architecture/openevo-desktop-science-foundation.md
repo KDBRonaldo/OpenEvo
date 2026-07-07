@@ -102,6 +102,17 @@ does not run later checks. After SSH succeeds, Docker is checked with
 capabilities are reported through the same fakeable probe contract. Codex CLI
 and subscription checks run only when subscription execution is required.
 
+## Desktop Web Shell
+
+The first web shell lives at `/openevo` in the existing Vite app. It is
+fixture/local-state backed in this slice and is meant to validate the ordinary
+science-user layout before the Python sidecar API is connected.
+
+The shell intentionally keeps Terminal Bench and low-level runtime image fields
+out of the default flow. It displays the remote profile, proxy settings, Science
+Project summary, bootstrap paths, lifecycle readiness, and evolution timeline
+using the same concepts as the Python contracts.
+
 ## CLI
 
 The initial user-visible CLI for this slice is:
@@ -117,7 +128,7 @@ workspace paths.
 
 This foundation slice does not include:
 
-- a full Desktop UI;
+- a fully wired Desktop UI;
 - vault or SSH tunnel management;
 - a remote backend implementation;
 - Docker Compose lifecycle management;

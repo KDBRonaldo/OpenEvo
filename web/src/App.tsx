@@ -6,6 +6,7 @@ import { TasksList } from "./routes/TasksList";
 import { TaskDetail } from "./routes/TaskDetail";
 import { SessionDetail } from "./routes/SessionDetail";
 import { Compare } from "./routes/Compare";
+import { OpenEvoDesktop } from "./routes/OpenEvoDesktop";
 import { subscribePolarEvents } from "./api/sse";
 
 function NavItem({ to, label }: { to: string; label: string }) {
@@ -36,6 +37,7 @@ function NavBar() {
           <span className="font-semibold">Polar Dashboard</span>
         </Link>
         <div className="flex items-center gap-1">
+          <NavItem to="/openevo" label="OpenEvo" />
           <NavItem to="/" label="Dashboard" />
           <NavItem to="/tasks" label="Tasks" />
         </div>
@@ -95,6 +97,7 @@ export default function App() {
       <main className="mx-auto w-full max-w-7xl flex-1 px-4 py-4">
         <Routes>
           <Route path="/" element={<Dashboard />} />
+          <Route path="/openevo" element={<OpenEvoDesktop />} />
           <Route path="/tasks" element={<TasksList />} />
           <Route path="/tasks/:taskId" element={<TaskDetail />} />
           <Route path="/sessions/:sessionId" element={<SessionDetail />} />
