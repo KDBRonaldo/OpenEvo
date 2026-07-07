@@ -5,6 +5,8 @@ from dataclasses import dataclass
 import pytest
 
 from openevo.remote import (
+    PreflightCheck,
+    PreflightReport,
     RemoteCommandResult,
     RemotePreflightSettings,
     run_preflight,
@@ -184,3 +186,39 @@ def test_report_by_name_raises_key_error_for_missing_check() -> None:
 
     with pytest.raises(KeyError):
         report.by_name("codex_subscription")
+
+
+def test_preflight_report_checks_are_tuple_backed_and_dump_as_json_array() -> None:
+    report = PreflightReport(
+        checks=[
+            PreflightCheck(
+                name="ssh",
+                status="pass",
+                message="Remote command execution is available.",
+            )
+        ]
+    )
+
+    assert isinstance(report.checks, tuple)
+    dumped = report.model_dump(mode="json")
+    assert dumped["ready"] is True
+    assert dumped["checks"] == [
+        {
+            "name": "ssh",
+            "status": "pass",
+            "message": "Remote command execution is available.",
+            "command": None,
+            "remediation_kind": "none",
+            "stdout": "",
+            "stderr": "",
+        }
+    ]
+    assert PreflightReport.model_validate(dumped).ready is True
+    with pytest.raises(AttributeError):
+        report.checks.append(
+            PreflightCheck(
+                name="docker",
+                status="pass",
+                message="Docker is available.",
+            )
+        )

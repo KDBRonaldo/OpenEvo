@@ -219,3 +219,97 @@ def test_cli_sidecar_plan_outputs_workspace_and_preflight(
     assert payload["experiment"]["tasks"][0]["workspace"].startswith(
         "/home/alice/.openevo/workspaces/protein-design/local-task/"
     )
+
+
+def test_cli_sidecar_execute_skip_preflight_outputs_workspace_report(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    science_path = _write_config(
+        tmp_path / "science.yaml",
+        _minimal_science_payload()
+        | {
+            "task": {
+                "id": "local-task",
+                "objective": "Run local workflow.",
+                "source": {
+                    "type": "remote_path",
+                    "path": "/datasets/local-task",
+                },
+            }
+        },
+    )
+    profile_path = _write_config(
+        tmp_path / "remote.yaml",
+        {
+            "version": 1,
+            "id": "science-team",
+            "host": "gpu.example.edu",
+            "user": "alice",
+        },
+    )
+
+    exit_code = main(
+        [
+            "sidecar",
+            "execute",
+            str(science_path),
+            "--remote-profile",
+            str(profile_path),
+            "--skip-preflight",
+            "--json",
+        ]
+    )
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ready"] is True
+    assert payload["preflight"] is None
+    assert payload["workspace"]["actions"][0]["status"] == "skip"
+
+
+def test_cli_sidecar_execute_default_preflight_uses_parseable_dry_run_output(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    science_path = _write_config(
+        tmp_path / "science.yaml",
+        _minimal_science_payload()
+        | {
+            "task": {
+                "id": "local-task",
+                "objective": "Run local workflow.",
+                "source": {
+                    "type": "remote_path",
+                    "path": "/datasets/local-task",
+                },
+            }
+        },
+    )
+    profile_path = _write_config(
+        tmp_path / "remote.yaml",
+        {
+            "version": 1,
+            "id": "science-team",
+            "host": "gpu.example.edu",
+            "user": "alice",
+        },
+    )
+
+    exit_code = main(
+        [
+            "sidecar",
+            "execute",
+            str(science_path),
+            "--remote-profile",
+            str(profile_path),
+            "--json",
+        ]
+    )
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ready"] is True
+    assert payload["preflight"]["ready"] is True
+    assert {check["status"] for check in payload["preflight"]["checks"]} == {"pass"}
+    assert payload["workspace"]["actions"][0]["status"] == "skip"

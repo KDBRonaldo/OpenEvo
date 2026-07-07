@@ -2,7 +2,14 @@ from __future__ import annotations
 
 from typing import Literal, Protocol
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    computed_field,
+    field_validator,
+    model_validator,
+)
 
 
 class _StrictFrozenModel(BaseModel):
@@ -49,8 +56,23 @@ class PreflightCheck(_StrictFrozenModel):
 
 
 class PreflightReport(_StrictFrozenModel):
-    checks: list[PreflightCheck]
+    checks: tuple[PreflightCheck, ...]
 
+    @model_validator(mode="before")
+    @classmethod
+    def _ignore_dumped_ready(cls, value):
+        if isinstance(value, dict) and "ready" in value:
+            return {key: item for key, item in value.items() if key != "ready"}
+        return value
+
+    @field_validator("checks", mode="before")
+    @classmethod
+    def _coerce_checks_tuple(cls, value):
+        if isinstance(value, list):
+            return tuple(value)
+        return value
+
+    @computed_field
     @property
     def ready(self) -> bool:
         return all(check.status != "fail" for check in self.checks)

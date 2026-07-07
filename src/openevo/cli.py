@@ -12,6 +12,10 @@ from pydantic import ValidationError
 
 from openevo.experiment.models import load_experiment_config
 from openevo.experiment.runner import dry_run_experiment, run_experiment
+from openevo.remote import (
+    RemoteCommandResult,
+    execute_sidecar_plan,
+)
 from openevo.science import (
     PreparedWorkspace,
     compile_science_project,
@@ -101,6 +105,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="Path to remote profile YAML.",
     )
     plan_parser.add_argument("--json", action="store_true", help="Print JSON output.")
+    execute_parser = sidecar_subparsers.add_parser(
+        "execute",
+        help="Build a sidecar plan and execute it through the local dry-run transport.",
+    )
+    execute_parser.add_argument("config", help="Path to science project YAML.")
+    execute_parser.add_argument(
+        "--remote-profile",
+        required=True,
+        help="Path to remote profile YAML.",
+    )
+    execute_parser.add_argument(
+        "--skip-preflight",
+        action="store_true",
+        help="Skip remote preflight before workspace preparation.",
+    )
+    execute_parser.add_argument("--json", action="store_true", help="Print JSON output.")
     return parser
 
 
@@ -185,6 +205,8 @@ def _handle_science_compile(args: argparse.Namespace) -> int:
 def _handle_sidecar(args: argparse.Namespace) -> int:
     if args.sidecar_command == "plan":
         return _handle_sidecar_plan(args)
+    if args.sidecar_command == "execute":
+        return _handle_sidecar_execute(args)
     raise ValueError(f"Unknown sidecar command: {args.sidecar_command}")
 
 
@@ -198,6 +220,44 @@ def _handle_sidecar_plan(args: argparse.Namespace) -> int:
         return 0
     print(yaml.safe_dump(result, sort_keys=True), end="")
     return 0
+
+
+def _handle_sidecar_execute(args: argparse.Namespace) -> int:
+    project = load_science_project_config(Path(args.config))
+    profile = load_remote_profile_config(Path(args.remote_profile))
+    plan = build_sidecar_science_plan(project, profile)
+    report = execute_sidecar_plan(
+        plan,
+        _CliDryRunTransport(),
+        run_remote_preflight=not args.skip_preflight,
+    )
+    result = report.model_dump(mode="json")
+    if args.json:
+        print(_json_dumps(result), end="")
+        return 0 if report.ready else 1
+    print(yaml.safe_dump(result, sort_keys=True), end="")
+    return 0 if report.ready else 1
+
+
+class _CliDryRunTransport:
+    def run(
+        self,
+        command: str,
+        *,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        timeout_seconds: float = 30.0,
+    ) -> RemoteCommandResult:
+        if command == 'df -Pk "$HOME"':
+            stdout = (
+                "Filesystem 1024-blocks Used Available Capacity Mounted on\n"
+                "/dev/root 100000000 1 99999999 1% /home\n"
+            )
+            return RemoteCommandResult(command=command, return_code=0, stdout=stdout)
+        return RemoteCommandResult(command=command, return_code=0, stdout="ok")
+
+    def upload_dir(self, local_path: str, remote_path: str) -> None:
+        return None
 
 
 def _parse_prepared_workspaces(
