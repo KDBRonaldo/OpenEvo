@@ -11,6 +11,8 @@ import {
 } from "./openevoDesktopModel";
 
 const apiMocks = vi.hoisted(() => ({
+  activateOpenEvoProjectConfig: vi.fn(),
+  fetchOpenEvoProjectConfigs: vi.fn(),
   fetchOpenEvoDesktopShellModel: vi.fn(),
   pollOpenEvoRunStatus: vi.fn(),
   runOpenEvoBootstrap: vi.fn(),
@@ -20,6 +22,8 @@ const apiMocks = vi.hoisted(() => ({
 }));
 
 vi.mock("../api/openevo", () => ({
+  activateOpenEvoProjectConfig: apiMocks.activateOpenEvoProjectConfig,
+  fetchOpenEvoProjectConfigs: apiMocks.fetchOpenEvoProjectConfigs,
   fetchOpenEvoDesktopShellModel: apiMocks.fetchOpenEvoDesktopShellModel,
   pollOpenEvoRunStatus: apiMocks.pollOpenEvoRunStatus,
   runOpenEvoBootstrap: apiMocks.runOpenEvoBootstrap,
@@ -32,12 +36,20 @@ vi.mock("../api/openevo", () => ({
 
 describe("OpenEvoDesktop", () => {
   beforeEach(() => {
+    apiMocks.activateOpenEvoProjectConfig.mockReset();
+    apiMocks.fetchOpenEvoProjectConfigs.mockReset();
     apiMocks.fetchOpenEvoDesktopShellModel.mockReset();
     apiMocks.pollOpenEvoRunStatus.mockReset();
     apiMocks.runOpenEvoBootstrap.mockReset();
     apiMocks.runOpenEvoStartRun.mockReset();
     apiMocks.runOpenEvoWorkspaceSync.mockReset();
     apiMocks.saveOpenEvoProjectConfig.mockReset();
+    apiMocks.activateOpenEvoProjectConfig.mockRejectedValue(
+      new Error("sidecar unavailable"),
+    );
+    apiMocks.fetchOpenEvoProjectConfigs.mockRejectedValue(
+      new Error("sidecar unavailable"),
+    );
     apiMocks.fetchOpenEvoDesktopShellModel.mockRejectedValue(
       new Error("sidecar unavailable"),
     );
@@ -179,6 +191,241 @@ describe("OpenEvoDesktop", () => {
     expect(document.body.textContent).toContain("Configured Science Project");
     expect(document.body.textContent).toContain("configured.gpu.example.edu");
     expect(inputByLabel("Remote port").value).toBe("2222");
+    await unmountClient(root);
+  });
+
+  it("loads saved project configs and marks invalid configs read-only", async () => {
+    apiMocks.fetchOpenEvoDesktopShellModel.mockResolvedValue(
+      getOpenEvoDesktopShellModel(),
+    );
+    apiMocks.fetchOpenEvoProjectConfigs.mockResolvedValue(savedProjectConfigs());
+
+    const root = await renderClient();
+    await flushEffects();
+
+    expect(document.body.textContent).toContain("Saved Configs");
+    expect(document.body.textContent).toContain("Protein Design");
+    expect(document.body.textContent).toContain("gpu.example.edu");
+    expect(document.body.textContent).toContain("Broken Project");
+    expect(document.body.textContent).toContain("profiles/broken.yaml: not found");
+    expect(buttonByLabel("Activate Protein Design").disabled).toBe(false);
+    expect(buttonByLabel("Activate Broken Project").disabled).toBe(true);
+    await unmountClient(root);
+  });
+
+  it("activates a saved config and clears stale run state", async () => {
+    const shellModel = getOpenEvoDesktopShellModel();
+    const runningModel = modelWithRun({
+      projectName: "Loaded Science Project",
+      backendState: "running",
+      backendDetail: "OpenEvo run is running",
+      transcriptState: "running",
+      transcriptDetail: "Capturing transcript trajectory",
+    });
+    const activatedModel = {
+      ...shellModel,
+      project: {
+        ...shellModel.project,
+        name: "Activated Project",
+      },
+      remote: {
+        ...shellModel.remote,
+        host: "activated.gpu.example.edu",
+      },
+    };
+    apiMocks.fetchOpenEvoDesktopShellModel.mockResolvedValue(shellModel);
+    apiMocks.fetchOpenEvoProjectConfigs.mockResolvedValue(savedProjectConfigs());
+    apiMocks.runOpenEvoStartRun.mockResolvedValue({
+      run: runStatus("running"),
+      status: runningModel,
+    });
+    apiMocks.pollOpenEvoRunStatus.mockResolvedValue({
+      run: runStatus("failed"),
+      status: modelWithRun({
+        projectName: "Loaded Science Project",
+        backendState: "blocked",
+        backendDetail: "run failed",
+        transcriptState: "blocked",
+        transcriptDetail: "run failed",
+      }),
+    });
+    apiMocks.activateOpenEvoProjectConfig.mockResolvedValue({
+      config: {
+        science_config_path:
+          "/home/alice/.openevo/desktop/projects/protein-design/science.yaml",
+        remote_profile_path:
+          "/home/alice/.openevo/desktop/profiles/science-team.yaml",
+      },
+      status: activatedModel,
+    });
+
+    const root = await renderClient();
+    await flushEffects();
+
+    await act(async () => {
+      buttonByText("Start Run").dispatchEvent(
+        new MouseEvent("click", { bubbles: true }),
+      );
+      await Promise.resolve();
+    });
+    expect(document.body.textContent).toContain("run_20260707170000000000");
+
+    await act(async () => {
+      buttonByLabel("Activate Protein Design").dispatchEvent(
+        new MouseEvent("click", { bubbles: true }),
+      );
+      await Promise.resolve();
+    });
+
+    expect(apiMocks.activateOpenEvoProjectConfig).toHaveBeenCalledWith(
+      "protein-design",
+    );
+    expect(document.body.textContent).toContain("Activated Project");
+    expect(document.body.textContent).toContain("activated.gpu.example.edu");
+    expect(document.body.textContent).not.toContain("run_20260707170000000000");
+    await unmountClient(root);
+  });
+
+  it("disables save while activating a saved config", async () => {
+    const shellModel = getOpenEvoDesktopShellModel();
+    const activatedModel = {
+      ...shellModel,
+      project: {
+        ...shellModel.project,
+        name: "Activated Project",
+      },
+    };
+    apiMocks.fetchOpenEvoDesktopShellModel.mockResolvedValue(shellModel);
+    apiMocks.fetchOpenEvoProjectConfigs.mockResolvedValue(savedProjectConfigs());
+    const activation = deferProjectConfig(activatedModel);
+    apiMocks.activateOpenEvoProjectConfig.mockReturnValue(activation.promise);
+
+    const root = await renderClient();
+    await flushEffects();
+
+    await act(async () => {
+      buttonByLabel("Activate Protein Design").dispatchEvent(
+        new MouseEvent("click", { bubbles: true }),
+      );
+      await Promise.resolve();
+    });
+
+    expect(buttonByText("Save Config").disabled).toBe(true);
+
+    await act(async () => {
+      activation.resolve({
+        config: {
+          science_config_path:
+            "/home/alice/.openevo/desktop/projects/protein-design/science.yaml",
+          remote_profile_path:
+            "/home/alice/.openevo/desktop/profiles/science-team.yaml",
+        },
+        status: activatedModel,
+      });
+      await Promise.resolve();
+    });
+
+    expect(buttonByText("Save Config").disabled).toBe(false);
+    await unmountClient(root);
+  });
+
+  it("refreshes saved configs after saving a project config", async () => {
+    const shellModel = getOpenEvoDesktopShellModel();
+    const savedModel = {
+      ...shellModel,
+      project: {
+        ...shellModel.project,
+        name: "Configured Science Project",
+      },
+    };
+    apiMocks.fetchOpenEvoDesktopShellModel.mockResolvedValue(shellModel);
+    apiMocks.fetchOpenEvoProjectConfigs
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([
+        {
+          ...savedProjectConfigs()[0],
+          projectSlug: "configured-science-project",
+          projectName: "Configured Science Project",
+        },
+      ]);
+    apiMocks.saveOpenEvoProjectConfig.mockResolvedValue({
+      config: {
+        science_config_path:
+          "/home/alice/.openevo/desktop/projects/configured/science.yaml",
+        remote_profile_path:
+          "/home/alice/.openevo/desktop/profiles/science-team.yaml",
+      },
+      status: savedModel,
+    });
+
+    const root = await renderClient();
+    await flushEffects();
+
+    expect(document.body.textContent).not.toContain("Saved Configs");
+    await act(async () => {
+      buttonByText("Save Config").dispatchEvent(
+        new MouseEvent("click", { bubbles: true }),
+      );
+      await Promise.resolve();
+    });
+
+    expect(apiMocks.fetchOpenEvoProjectConfigs).toHaveBeenCalledTimes(2);
+    expect(document.body.textContent).toContain("Configured Science Project");
+    await unmountClient(root);
+  });
+
+  it("keeps the newest saved config refresh when requests resolve out of order", async () => {
+    const shellModel = getOpenEvoDesktopShellModel();
+    const savedModel = {
+      ...shellModel,
+      project: {
+        ...shellModel.project,
+        name: "Configured Science Project",
+      },
+    };
+    const initialCatalog = deferCatalog();
+    const postSaveCatalog = deferCatalog();
+    apiMocks.fetchOpenEvoDesktopShellModel.mockResolvedValue(shellModel);
+    apiMocks.fetchOpenEvoProjectConfigs
+      .mockReturnValueOnce(initialCatalog.promise)
+      .mockReturnValueOnce(postSaveCatalog.promise);
+    apiMocks.saveOpenEvoProjectConfig.mockResolvedValue({
+      config: {
+        science_config_path:
+          "/home/alice/.openevo/desktop/projects/configured/science.yaml",
+        remote_profile_path:
+          "/home/alice/.openevo/desktop/profiles/science-team.yaml",
+      },
+      status: savedModel,
+    });
+
+    const root = await renderClient();
+    await flushEffects();
+
+    await act(async () => {
+      buttonByText("Save Config").dispatchEvent(
+        new MouseEvent("click", { bubbles: true }),
+      );
+      await Promise.resolve();
+    });
+
+    await act(async () => {
+      postSaveCatalog.resolve([
+        {
+          ...savedProjectConfigs()[0],
+          projectSlug: "configured-science-project",
+          projectName: "Configured Science Project",
+        },
+      ]);
+      await Promise.resolve();
+    });
+    expect(document.body.textContent).toContain("Configured Science Project");
+
+    await act(async () => {
+      initialCatalog.resolve([]);
+      await Promise.resolve();
+    });
+    expect(document.body.textContent).toContain("Configured Science Project");
     await unmountClient(root);
   });
 
@@ -671,6 +918,14 @@ function buttonByText(text: string): HTMLButtonElement {
   return button;
 }
 
+function buttonByLabel(label: string): HTMLButtonElement {
+  const button = document.querySelector(`[aria-label="${label}"]`);
+  if (!(button instanceof HTMLButtonElement)) {
+    throw new Error(`Button not found: ${label}`);
+  }
+  return button;
+}
+
 async function changeInput(label: string, value: string) {
   const input = inputByLabel(label);
   await act(async () => {
@@ -878,4 +1133,51 @@ function deferProjectConfig(status: OpenEvoDesktopShellModel) {
     resolve = next;
   });
   return { promise, resolve, status };
+}
+
+function deferCatalog() {
+  let resolve!: (value: ReturnType<typeof savedProjectConfigs>) => void;
+  const promise = new Promise<ReturnType<typeof savedProjectConfigs>>((next) => {
+    resolve = next;
+  });
+  return { promise, resolve };
+}
+
+function savedProjectConfigs() {
+  return [
+    {
+      projectSlug: "protein-design",
+      valid: true,
+      error: null,
+      projectName: "Protein Design",
+      taskId: "folding-baseline",
+      objective: "Improve the folding baseline.",
+      sourceType: "remote_path",
+      sourceLabel: "/datasets/folding-baseline",
+      remoteProfileId: "science-team",
+      remoteHost: "gpu.example.edu",
+      remoteUser: "alice",
+      scienceConfigPath:
+        "/home/alice/.openevo/desktop/projects/protein-design/science.yaml",
+      remoteProfilePath:
+        "/home/alice/.openevo/desktop/profiles/science-team.yaml",
+    },
+    {
+      projectSlug: "broken-project",
+      valid: false,
+      error: "profiles/broken.yaml: not found",
+      projectName: "Broken Project",
+      taskId: "broken-task",
+      objective: "Repair the config.",
+      sourceType: "remote_path",
+      sourceLabel: "/datasets/broken",
+      remoteProfileId: "broken",
+      remoteHost: null,
+      remoteUser: null,
+      scienceConfigPath:
+        "/home/alice/.openevo/desktop/projects/broken-project/science.yaml",
+      remoteProfilePath:
+        "/home/alice/.openevo/desktop/profiles/broken.yaml",
+    },
+  ];
 }

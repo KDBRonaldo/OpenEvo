@@ -1,5 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  activateOpenEvoProjectConfig,
+  fetchOpenEvoProjectConfigs,
   fetchOpenEvoDesktopShellModel,
   pollOpenEvoRunStatus,
   runOpenEvoBootstrap,
@@ -326,6 +328,126 @@ describe("OpenEvo sidecar client", () => {
       "config-token",
     );
     expect(calls[1].body.remote_host).toBe("gpu.example.edu");
+  });
+
+  it("fetches saved project config summaries", async () => {
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const path = String(input);
+      if (path === "/openevo-api/desktop/project-configs") {
+        return jsonResponse({
+          configs: [
+            {
+              project_slug: "protein-design",
+              valid: true,
+              error: null,
+              project_name: "Protein Design",
+              task_id: "folding-baseline",
+              objective: "Improve the folding baseline.",
+              source_type: "git_repository",
+              source_label: "https://example.com/repo.git@main",
+              remote_profile_id: "science-team",
+              remote_host: "gpu.example.edu",
+              remote_user: "alice",
+              science_config_path:
+                "/home/alice/.openevo/desktop/projects/protein-design/science.yaml",
+              remote_profile_path:
+                "/home/alice/.openevo/desktop/profiles/science-team.yaml",
+            },
+            {
+              project_slug: "broken-project",
+              valid: false,
+              error: "profiles/broken.yaml: not found",
+              project_name: "Broken Project",
+              task_id: "broken-task",
+              objective: "Repair the config.",
+              source_type: "remote_path",
+              source_label: "/datasets/broken",
+              remote_profile_id: "broken",
+              remote_host: null,
+              remote_user: null,
+              science_config_path:
+                "/home/alice/.openevo/desktop/projects/broken-project/science.yaml",
+              remote_profile_path:
+                "/home/alice/.openevo/desktop/profiles/broken.yaml",
+            },
+          ],
+        });
+      }
+      return new Response("not found", { status: 404 });
+    });
+
+    const configs = await fetchOpenEvoProjectConfigs();
+
+    expect(configs).toHaveLength(2);
+    expect(configs[0]).toMatchObject({
+      projectSlug: "protein-design",
+      valid: true,
+      projectName: "Protein Design",
+      sourceLabel: "https://example.com/repo.git@main",
+      remoteHost: "gpu.example.edu",
+      scienceConfigPath:
+        "/home/alice/.openevo/desktop/projects/protein-design/science.yaml",
+    });
+    expect(configs[1]).toMatchObject({
+      projectSlug: "broken-project",
+      valid: false,
+      error: "profiles/broken.yaml: not found",
+      remoteHost: null,
+      remoteUser: null,
+    });
+  });
+
+  it("activates a saved project config with the sidecar mutation token", async () => {
+    const calls: Array<{ path: string; headers: Headers; method: string }> = [];
+    const shellPayload = sidecarShellPayload("activate-token");
+    const activatedPayload = {
+      ...shellPayload,
+      project: {
+        ...shellPayload.project,
+        name: "Activated Science Project",
+      },
+    };
+    vi.spyOn(globalThis, "fetch").mockImplementation(
+      async (input, init) => {
+        const path = String(input);
+        calls.push({
+          path,
+          headers: new Headers(init?.headers),
+          method: init?.method ?? "GET",
+        });
+        if (path === "/openevo-api/desktop/shell") {
+          return jsonResponse(shellPayload);
+        }
+        if (
+          path ===
+          "/openevo-api/desktop/project-configs/protein-design/activate"
+        ) {
+          return jsonResponse({
+            config: {
+              science_config_path:
+                "/home/alice/.openevo/desktop/projects/protein-design/science.yaml",
+              remote_profile_path:
+                "/home/alice/.openevo/desktop/profiles/science-team.yaml",
+            },
+            status: activatedPayload,
+          });
+        }
+        return new Response("not found", { status: 404 });
+      },
+    );
+
+    await fetchOpenEvoDesktopShellModel();
+    const response = await activateOpenEvoProjectConfig("protein-design");
+
+    expect(response.status.project.name).toBe("Activated Science Project");
+    expect(calls).toHaveLength(2);
+    expect(calls[1]).toMatchObject({
+      path: "/openevo-api/desktop/project-configs/protein-design/activate",
+      method: "POST",
+    });
+    expect(calls[1].headers.get("X-OpenEvo-Sidecar-Token")).toBe(
+      "activate-token",
+    );
   });
 });
 

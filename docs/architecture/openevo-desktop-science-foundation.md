@@ -270,6 +270,14 @@ paths plus a refreshed shell status and replaces the in-process session, so
 subsequent `/workspace`, `/bootstrap`, and `/run` calls use the activated saved
 config without asking the user to locate YAML files manually.
 
+The packaged Desktop UI consumes both endpoints in the Project Setup panel. On
+sidecar connection it loads the saved config catalog, renders valid and invalid
+summaries, disables activation for invalid configs, and shows the sanitized
+validation error returned by the sidecar. Activating a valid saved config
+refreshes the shell status, repopulates the setup draft from the active project,
+and clears stale latest-run state. Saving a new draft refreshes the catalog so
+the newly written config is available without restarting Desktop.
+
 `POST /openevo-api/desktop/bootstrap` is the first mutating sidecar endpoint.
 It is available only for config-backed sidecar sessions. It reuses
 `build_sidecar_science_plan()`, `build_remote_bootstrap_plan()`, and

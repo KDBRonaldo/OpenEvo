@@ -104,6 +104,26 @@ export interface OpenEvoProjectConfigResponsePayload {
   status: OpenEvoDesktopShellStatusPayload;
 }
 
+export interface OpenEvoSavedProjectConfigPayload {
+  project_slug: string;
+  valid: boolean;
+  error: string | null;
+  project_name: string | null;
+  task_id: string | null;
+  objective: string | null;
+  source_type: string | null;
+  source_label: string | null;
+  remote_profile_id: string | null;
+  remote_host: string | null;
+  remote_user: string | null;
+  science_config_path: string;
+  remote_profile_path: string | null;
+}
+
+export interface OpenEvoProjectConfigsResponsePayload {
+  configs: OpenEvoSavedProjectConfigPayload[];
+}
+
 export interface OpenEvoBootstrapResponse {
   bootstrap: OpenEvoDesktopShellModel["bootstrap"];
   report: Record<string, any>;
@@ -159,6 +179,22 @@ export interface OpenEvoProjectConfigResponse {
   status: OpenEvoDesktopShellModel;
 }
 
+export interface OpenEvoSavedProjectConfig {
+  projectSlug: string;
+  valid: boolean;
+  error: string | null;
+  projectName: string | null;
+  taskId: string | null;
+  objective: string | null;
+  sourceType: string | null;
+  sourceLabel: string | null;
+  remoteProfileId: string | null;
+  remoteHost: string | null;
+  remoteUser: string | null;
+  scienceConfigPath: string;
+  remoteProfilePath: string | null;
+}
+
 const sidecarMutationTokenHeader = "X-OpenEvo-Sidecar-Token";
 let sidecarMutationToken: string | null = null;
 
@@ -209,6 +245,33 @@ export async function saveOpenEvoProjectConfig(
   const payload = await api.post<OpenEvoProjectConfigResponsePayload>(
     "/openevo-api/desktop/project-config",
     draft,
+    headers,
+  );
+  rememberOpenEvoSidecarMutationToken(payload.status);
+  return {
+    config: payload.config,
+    status: toOpenEvoDesktopShellModel(payload.status),
+  };
+}
+
+export async function fetchOpenEvoProjectConfigs(): Promise<
+  OpenEvoSavedProjectConfig[]
+> {
+  const payload = await api.get<OpenEvoProjectConfigsResponsePayload>(
+    "/openevo-api/desktop/project-configs",
+  );
+  return payload.configs.map(toOpenEvoSavedProjectConfig);
+}
+
+export async function activateOpenEvoProjectConfig(
+  projectSlug: string,
+): Promise<OpenEvoProjectConfigResponse> {
+  const headers = sidecarMutationToken
+    ? { [sidecarMutationTokenHeader]: sidecarMutationToken }
+    : undefined;
+  const payload = await api.post<OpenEvoProjectConfigResponsePayload>(
+    `/openevo-api/desktop/project-configs/${encodeURIComponent(projectSlug)}/activate`,
+    {},
     headers,
   );
   rememberOpenEvoSidecarMutationToken(payload.status);
@@ -279,6 +342,26 @@ export function toOpenEvoRunStatus(
     experimentSnapshot: payload.experiment_snapshot,
     startedAt: payload.started_at,
     finishedAt: payload.finished_at,
+  };
+}
+
+export function toOpenEvoSavedProjectConfig(
+  payload: OpenEvoSavedProjectConfigPayload,
+): OpenEvoSavedProjectConfig {
+  return {
+    projectSlug: payload.project_slug,
+    valid: payload.valid,
+    error: payload.error,
+    projectName: payload.project_name,
+    taskId: payload.task_id,
+    objective: payload.objective,
+    sourceType: payload.source_type,
+    sourceLabel: payload.source_label,
+    remoteProfileId: payload.remote_profile_id,
+    remoteHost: payload.remote_host,
+    remoteUser: payload.remote_user,
+    scienceConfigPath: payload.science_config_path,
+    remoteProfilePath: payload.remote_profile_path,
   };
 }
 

@@ -15,6 +15,8 @@ import {
 } from "lucide-react";
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import {
+  activateOpenEvoProjectConfig,
+  fetchOpenEvoProjectConfigs,
   fetchOpenEvoDesktopShellModel,
   pollOpenEvoRunStatus,
   runOpenEvoBootstrap,
@@ -23,6 +25,7 @@ import {
   saveOpenEvoProjectConfig,
   type OpenEvoProjectConfigDraft,
   type OpenEvoRunStatus,
+  type OpenEvoSavedProjectConfig,
 } from "../api/openevo";
 import {
   type EvolutionStepState,
@@ -58,13 +61,49 @@ export function OpenEvoDesktop() {
   const [latestRun, setLatestRun] = useState<OpenEvoRunStatus | null>(null);
   const [configSaving, setConfigSaving] = useState(false);
   const [configError, setConfigError] = useState<string | null>(null);
+  const [savedConfigs, setSavedConfigs] = useState<OpenEvoSavedProjectConfig[]>(
+    [],
+  );
+  const [configCatalogLoading, setConfigCatalogLoading] = useState(false);
+  const [configCatalogError, setConfigCatalogError] = useState<string | null>(
+    null,
+  );
+  const [activatingConfigSlug, setActivatingConfigSlug] = useState<string | null>(
+    null,
+  );
   const [configDraft, setConfigDraft] = useState<OpenEvoProjectConfigDraft>(() =>
     draftFromModel(getOpenEvoDesktopShellModel()),
   );
   const mounted = useRef(true);
+  const catalogRefreshGeneration = useRef(0);
   const runPollGeneration = useRef(0);
   const runPollTimer = useRef<number | null>(null);
   const summary = getOpenEvoTimelineSummary(model);
+
+  const refreshSavedConfigs = async () => {
+    catalogRefreshGeneration.current += 1;
+    const generation = catalogRefreshGeneration.current;
+    setConfigCatalogLoading(true);
+    setConfigCatalogError(null);
+    try {
+      const configs = await fetchOpenEvoProjectConfigs();
+      if (!mounted.current || generation !== catalogRefreshGeneration.current) {
+        return;
+      }
+      setSavedConfigs(configs);
+    } catch (error) {
+      if (!mounted.current || generation !== catalogRefreshGeneration.current) {
+        return;
+      }
+      const message =
+        error instanceof Error ? error.message : "Saved config catalog failed";
+      setConfigCatalogError(message);
+    } finally {
+      if (mounted.current && generation === catalogRefreshGeneration.current) {
+        setConfigCatalogLoading(false);
+      }
+    }
+  };
 
   useEffect(() => {
     let cancelled = false;
@@ -75,6 +114,7 @@ export function OpenEvoDesktop() {
           setModel(nextModel);
           setConfigDraft(draftFromModel(nextModel));
           setSidecarConnected(true);
+          void refreshSavedConfigs();
         }
       })
       .catch(() => undefined);
@@ -160,12 +200,34 @@ export function OpenEvoDesktop() {
       setConfigDraft(submittedDraft);
       clearLatestRunForContextChange();
       setSidecarConnected(true);
+      await refreshSavedConfigs();
     } catch (error) {
       const message =
         error instanceof Error ? error.message : "Project config save failed";
       setConfigError(message);
     } finally {
       setConfigSaving(false);
+    }
+  };
+
+  const handleActivateConfig = async (config: OpenEvoSavedProjectConfig) => {
+    if (!config.valid) {
+      return;
+    }
+    setActivatingConfigSlug(config.projectSlug);
+    setConfigError(null);
+    try {
+      const response = await activateOpenEvoProjectConfig(config.projectSlug);
+      setModel(response.status);
+      setConfigDraft(draftFromModel(response.status));
+      clearLatestRunForContextChange();
+      setSidecarConnected(true);
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : "Project config activation failed";
+      setConfigError(message);
+    } finally {
+      setActivatingConfigSlug(null);
     }
   };
 
@@ -267,7 +329,8 @@ export function OpenEvoDesktop() {
               workspaceRunning ||
               bootstrapRunning ||
               runRunning ||
-              configSaving
+              configSaving ||
+              activatingConfigSlug !== null
             }
             onClick={handleWorkspaceSync}
           />
@@ -279,7 +342,8 @@ export function OpenEvoDesktop() {
               bootstrapRunning ||
               workspaceRunning ||
               runRunning ||
-              configSaving
+              configSaving ||
+              activatingConfigSlug !== null
             }
             onClick={handleBootstrap}
           />
@@ -292,7 +356,8 @@ export function OpenEvoDesktop() {
               runRunning ||
               workspaceRunning ||
               bootstrapRunning ||
-              configSaving
+              configSaving ||
+              activatingConfigSlug !== null
             }
             onClick={handleStartRun}
           />
@@ -323,6 +388,80 @@ export function OpenEvoDesktop() {
       </section>
 
       <Panel title="Project Setup" icon={<Settings size={17} />}>
+        <div className="space-y-4">
+          {savedConfigs.length > 0 || configCatalogLoading || configCatalogError ? (
+            <div className="space-y-3 border-b border-slate-100 pb-4">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="text-sm font-semibold text-slate-900">
+                  Saved Configs
+                </div>
+                {configCatalogLoading ? (
+                  <div className="text-xs uppercase text-slate-500">Loading</div>
+                ) : null}
+              </div>
+              {configCatalogError ? (
+                <div className="border-l-2 border-rose-300 pl-3 text-sm text-rose-900">
+                  {configCatalogError}
+                </div>
+              ) : null}
+              {savedConfigs.length > 0 ? (
+                <div className="divide-y divide-slate-100">
+                  {savedConfigs.map((config) => {
+                    const displayName = config.projectName ?? config.projectSlug;
+                    const activating = activatingConfigSlug === config.projectSlug;
+                    return (
+                      <div
+                        key={config.projectSlug}
+                        className="grid grid-cols-[minmax(0,1fr)_auto] gap-3 py-3 first:pt-0 last:pb-0"
+                      >
+                        <div className="min-w-0">
+                          <div className="flex flex-wrap items-center gap-2">
+                            <span className="text-sm font-medium text-slate-900">
+                              {displayName}
+                            </span>
+                            <span
+                              className={`rounded-full px-2 py-0.5 text-xs ${
+                                config.valid
+                                  ? "bg-emerald-50 text-emerald-800"
+                                  : "bg-rose-50 text-rose-800"
+                              }`}
+                            >
+                              {config.valid ? "valid" : "invalid"}
+                            </span>
+                          </div>
+                          <div className="mt-1 truncate text-xs text-slate-500">
+                            {config.taskId ?? config.projectSlug}
+                            {config.remoteHost ? ` / ${config.remoteHost}` : ""}
+                            {config.sourceLabel ? ` / ${config.sourceLabel}` : ""}
+                          </div>
+                          {config.error ? (
+                            <div className="mt-1 text-xs text-rose-800">
+                              {config.error}
+                            </div>
+                          ) : null}
+                        </div>
+                        <CommandButton
+                          icon={<CheckCircle2 size={16} />}
+                          label={activating ? "Activating" : "Activate"}
+                          ariaLabel={`Activate ${displayName}`}
+                          disabled={
+                            !sidecarConnected ||
+                            !config.valid ||
+                            activatingConfigSlug !== null ||
+                            configSaving ||
+                            workspaceRunning ||
+                            bootstrapRunning ||
+                            runRunning
+                          }
+                          onClick={() => void handleActivateConfig(config)}
+                        />
+                      </div>
+                    );
+                  })}
+                </div>
+              ) : null}
+            </div>
+          ) : null}
         <form
           className="grid grid-cols-1 gap-3 lg:grid-cols-4"
           onSubmit={(event) => {
@@ -446,7 +585,14 @@ export function OpenEvoDesktop() {
             <CommandButton
               icon={<ShieldCheck size={16} />}
               label={configSaving ? "Saving" : "Save Config"}
-              disabled={!sidecarConnected || configSaving}
+              disabled={
+                !sidecarConnected ||
+                configSaving ||
+                activatingConfigSlug !== null ||
+                workspaceRunning ||
+                bootstrapRunning ||
+                runRunning
+              }
               onClick={handleSaveConfig}
             />
           </div>
@@ -456,6 +602,7 @@ export function OpenEvoDesktop() {
             </div>
           ) : null}
         </form>
+        </div>
       </Panel>
 
       <section className="grid grid-cols-1 gap-4 xl:grid-cols-[1.15fr_0.85fr]">
@@ -609,12 +756,14 @@ export function OpenEvoDesktop() {
 function CommandButton({
   icon,
   label,
+  ariaLabel,
   primary = false,
   disabled = false,
   onClick,
 }: {
   icon: ReactNode;
   label: string;
+  ariaLabel?: string;
   primary?: boolean;
   disabled?: boolean;
   onClick?: () => void;
@@ -622,6 +771,7 @@ function CommandButton({
   return (
     <button
       type="button"
+      aria-label={ariaLabel}
       disabled={disabled}
       onClick={onClick}
       className={`inline-flex h-9 items-center gap-2 rounded-md border px-3 text-sm font-medium ${
