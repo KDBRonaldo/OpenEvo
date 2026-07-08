@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import json
 import tomllib
 from pathlib import Path
@@ -13,6 +14,19 @@ from openevo import cli as openevo_cli
 from openevo.cli import main
 from openevo.remote import RemoteCommandResult
 from openevo.sidecar import RemoteProfileConfig
+
+
+def _subparser_help(*command_path: str) -> str:
+    parser = openevo_cli.build_parser()
+    current_parser = parser
+    for command in command_path:
+        subparsers_action = next(
+            action
+            for action in current_parser._actions
+            if isinstance(action, argparse._SubParsersAction)
+        )
+        current_parser = subparsers_action.choices[command]
+    return current_parser.format_help()
 
 
 def _write_config(path: Path, payload: dict) -> Path:
@@ -138,6 +152,36 @@ def test_cli_version_outputs_package_version(capsys) -> None:
 
     assert exc_info.value.code == 0
     assert capsys.readouterr().out.strip() == f"openevo {OPENEVO_VERSION}"
+
+
+def test_cli_help_uses_core_desktop_dev_kit_terms() -> None:
+    help_text = openevo_cli.build_parser().format_help()
+
+    assert "OpenEvo Core" in help_text
+    assert "OpenEvo Desktop" in help_text
+    assert "OpenEvo Dev Kit" in help_text
+    assert "Polar" not in help_text
+
+
+@pytest.mark.parametrize(
+    ("command_path", "expected_terms"),
+    [
+        (("run",), ("OpenEvo Core", "OpenEvo Dev Kit")),
+        (("science",), ("OpenEvo Desktop", "OpenEvo Dev Kit")),
+        (("desktop",), ("OpenEvo Desktop",)),
+        (("sidecar",), ("OpenEvo Desktop", "OpenEvo Dev Kit")),
+        (("sidecar", "serve"), ("OpenEvo Desktop", "OpenEvo Dev Kit")),
+    ],
+)
+def test_cli_subcommand_help_uses_public_openevo_terms(
+    command_path: tuple[str, ...],
+    expected_terms: tuple[str, ...],
+) -> None:
+    help_text = _subparser_help(*command_path)
+
+    for term in expected_terms:
+        assert term in help_text
+    assert "Polar" not in help_text
 
 
 def test_cli_dry_run_output_file_matches_reported_plan_path(

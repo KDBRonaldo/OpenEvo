@@ -37,7 +37,10 @@ from openevo.sidecar.api import prepare_and_execute_remote_bootstrap
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="openevo",
-        description="Run OpenEvo experiments on top of Polar rollout and evolution services.",
+        description=(
+            "Run OpenEvo Core experiments, open OpenEvo Desktop, and use "
+            "OpenEvo Dev Kit workflows for benchmark and sidecar development."
+        ),
     )
     parser.add_argument(
         "--version",
@@ -48,7 +51,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     run_parser = subparsers.add_parser(
         "run",
-        help="Run or dry-run an OpenEvo experiment config.",
+        help="Run or dry-run an OpenEvo Core experiment config.",
+        description=(
+            "Run or dry-run an OpenEvo Core experiment config. OpenEvo Dev Kit "
+            "benchmark workflows use this command to validate Core records, "
+            "datasets, jobs, artifacts, and context inputs."
+        ),
     )
     run_parser.add_argument("config", help="Path to experiment YAML.")
     run_parser.add_argument("--dry-run", action="store_true", help="Print the compiled plan.")
@@ -76,7 +84,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     science_parser = subparsers.add_parser(
         "science",
-        help="Work with OpenEvo Science project configs.",
+        help="Compile OpenEvo Desktop science projects for Core runs.",
+        description=(
+            "Compile OpenEvo Desktop science project configs into OpenEvo Core "
+            "experiment configs. OpenEvo Dev Kit workflows use this path for "
+            "benchmark and developer project fixtures."
+        ),
     )
     science_subparsers = science_parser.add_subparsers(
         dest="science_command",
@@ -100,7 +113,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     sidecar_parser = subparsers.add_parser(
         "sidecar",
-        help="Work with OpenEvo Desktop sidecar plans.",
+        help="Debug OpenEvo Desktop sidecar plans from the OpenEvo Dev Kit.",
+        description=(
+            "OpenEvo Dev Kit commands for OpenEvo Desktop sidecar debugging."
+        ),
     )
     sidecar_subparsers = sidecar_parser.add_subparsers(
         dest="sidecar_command",
@@ -164,12 +180,19 @@ def build_parser() -> argparse.ArgumentParser:
     serve_parser = sidecar_subparsers.add_parser(
         "serve",
         help="Run the local OpenEvo Desktop sidecar API.",
+        description=(
+            "Run the local OpenEvo Desktop sidecar API for OpenEvo Dev Kit "
+            "debugging and integration tests."
+        ),
     )
     _add_desktop_serve_arguments(serve_parser)
 
     desktop_parser = subparsers.add_parser(
         "desktop",
         help="Run the packaged OpenEvo Desktop app.",
+        description=(
+            "Run the packaged OpenEvo Desktop app for ordinary science workflows."
+        ),
     )
     desktop_subparsers = desktop_parser.add_subparsers(
         dest="desktop_command",

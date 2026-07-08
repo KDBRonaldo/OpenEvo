@@ -1,24 +1,35 @@
-# OpenEvo: Agent System Evolution on Polar
+# OpenEvo: Core, Desktop, and Dev Kit
 
-OpenEvo builds task-facing agent-system evolution on top of Polar's rollout and
-evolution backend. The current focus is to turn completed trajectories or
-transcripts into safer, auditable updates to `AGENTS.md`, then feed those updates
-back into later rollouts without leaking held-out answers.
+OpenEvo is an agent-system evolution product with three public surfaces:
 
-The previous root README described the original Polar framework. It is preserved
-as [README.polar.md](README.polar.md). Lower-level evolution backend usage lives
-in [src/polar_evolution/README.md](src/polar_evolution/README.md).
+- **OpenEvo Core**: the execution, dataset, job, artifact, method, context, and
+  runtime contract used by all OpenEvo workflows.
+- **OpenEvo Desktop**: the ordinary-user science UI for preparing and running
+  OpenEvo tasks.
+- **OpenEvo Dev Kit**: the developer wrapper for CLI, source, test, benchmark,
+  method-development, artifact-inspection, and regression-fixture workflows.
+
+The current Core focus is to turn completed trajectories or transcripts into
+safer, auditable updates to `AGENTS.md`, then feed those updates back into later
+rollouts without leaking held-out answers.
+
+The previous root README described the original lower-level framework. It is
+preserved as [README.polar.md](README.polar.md). Implementation modules still
+use `polar` and `polar_evolution` package names in places; public OpenEvo
+documentation should treat those as implementation details rather than product
+identity. Lower-level evolution backend usage lives in
+[src/polar_evolution/README.md](src/polar_evolution/README.md).
 
 ## Architecture
 
 ```text
-external harness or Polar rollout
+external harness or OpenEvo Core rollout
         |
         v
 trajectory / transcript capture
         |
         v
-Polar events -> dataset artifact -> evolution job
+Core events -> dataset artifact -> evolution job
         |
         v
 method backend
@@ -35,14 +46,14 @@ task evaluator -> sanitized feedback -> next evolution job
 
 Main components:
 
-- **Capture layer**: Polar proxy traces support token-level data. Subscription or
+- **Capture layer**: Core proxy traces support token-level data. Subscription or
   external harness runs use pure-text transcript capture with
   `token_level_metrics_available=false`.
 - **Offline bridges**: Terminal Bench trial/job directories can be converted into
-  Polar events and datasets while excluding oracle solutions, reference patches,
+  Core events and datasets while excluding oracle solutions, reference patches,
   secrets, and protected literals.
 - **Evolution backend**: datasets, jobs, leases, artifacts, lineage, compatibility
-  filters, and context resolution are handled by the Polar EvolutionStore/API.
+  filters, and context resolution are handled by the Core EvolutionStore/API.
 - **Algorithm backends**: methods in `src/polar_evolution/methods.py` consume
   dataset artifacts and produce typed artifacts.
 - **Evaluators**: task-level evaluators live outside specific methods. For
@@ -72,9 +83,9 @@ Main components:
 
 ## OpenEvo Runner
 
-`openevo run` is the user-facing experiment wrapper for ordinary Polar tasks. It
+`openevo run` is the Dev Kit experiment wrapper for OpenEvo Core tasks. It
 uses technical defaults for service URLs and evolution methods. A task with a
-workspace must also name the runtime image because Polar cannot upload a
+workspace must also name the runtime image because Core cannot upload a
 workspace into an implicit/default runtime:
 
 ```yaml
@@ -110,7 +121,7 @@ artifacts:
 
 `native_memory_policy` controls harness-native memory only. For Codex, `clear`
 removes `CODEX_HOME/memories/` and `CODEX_HOME/memories_*.sqlite*` while keeping
-subscription auth state. Polar evolution memory is controlled separately through
+subscription auth state. Core evolution memory is controlled separately through
 `artifacts.text_memory` and `artifacts.parametric_memory`.
 
 Textual memory is rendered into the agent instruction and works in both
@@ -259,13 +270,19 @@ explicit task entry. A task generator is intentionally left out of the first
 version; tool evolution is handled as helper files inside `skill_bundle`
 artifacts rather than as a separate artifact type.
 
+Benchmark adapters belong in OpenEvo Dev Kit. They should translate benchmark
+tasks and results into Core records, datasets, metrics, jobs, artifacts, and
+context inputs rather than implementing a separate evolution backend or method
+registry.
+
 ## OpenEvo Desktop Package
 
 The installable Python distribution is `openevo`. It bundles the OpenEvo
-Desktop shell, the `openevo` CLI, and the lower-level Polar packages that still
-provide rollout, gateway, trajectory, and evolution backend runtime modules.
-The legacy `polar` and `polar-evolution` console scripts remain available for
-developer and backend workflows.
+Desktop shell, the `openevo` CLI, OpenEvo Core facades, and lower-level runtime
+modules that still provide rollout, gateway, trajectory, and evolution backend
+implementation details. The legacy `polar` and `polar-evolution` console
+scripts remain available for backend and migration workflows, but OpenEvo Core,
+Desktop, and Dev Kit are the public product surfaces.
 
 For the local Desktop launcher:
 
