@@ -26,6 +26,18 @@ class RemoteLifecycleStatus(StrEnum):
     PLANNED = "planned"
     STARTING = "starting"
     RUNNING = "running"
+    READY = "ready"
+    STOPPED = "stopped"
+    FAILED = "failed"
+    UNKNOWN = "unknown"
+
+
+class RemoteServiceState(StrEnum):
+    PLANNED = "planned"
+    STARTING = "starting"
+    RUNNING = "running"
+    READY = "ready"
+    DEGRADED = "degraded"
     STOPPED = "stopped"
     FAILED = "failed"
     UNKNOWN = "unknown"
@@ -189,8 +201,101 @@ class RemoteStatusReport(_StrictFrozenModel):
             return False
         return all(
             service.status
-            in {RemoteLifecycleStatus.PLANNED, RemoteLifecycleStatus.RUNNING}
+            in {
+                RemoteLifecycleStatus.PLANNED,
+                RemoteLifecycleStatus.RUNNING,
+                RemoteLifecycleStatus.READY,
+            }
             for service in self.services
+        )
+
+
+class RemoteManagedServiceStatus(_StrictFrozenModel):
+    service_id: str
+    state: RemoteServiceState
+    message: str
+    required: bool = True
+    pid: int | None = None
+    log_path: str | None = None
+    health_check: str | None = None
+
+    @field_validator("state", mode="before")
+    @classmethod
+    def _coerce_state(cls, value) -> RemoteServiceState:
+        if isinstance(value, str):
+            return RemoteServiceState(value)
+        return value
+
+    @field_validator("service_id", "message", "log_path", "health_check")
+    @classmethod
+    def _strip_text(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        return _strip_non_empty(value, info.field_name)
+
+    @field_validator("pid")
+    @classmethod
+    def _validate_pid(cls, value: int | None) -> int | None:
+        if value is not None and value <= 0:
+            raise ValueError("pid must be a positive integer")
+        return value
+
+
+class RemoteServiceLog(_StrictFrozenModel):
+    service_id: str
+    content: str
+    line_count: int = Field(ge=0)
+
+    @field_validator("service_id")
+    @classmethod
+    def _strip_service_id(cls, value: str) -> str:
+        return _strip_non_empty(value, "service_id")
+
+
+class RemoteServiceOperationResult(_StrictFrozenModel):
+    service_id: str
+    state: RemoteServiceState
+    message: str
+    stdout: str = ""
+    stderr: str = ""
+
+    @field_validator("state", mode="before")
+    @classmethod
+    def _coerce_state(cls, value) -> RemoteServiceState:
+        if isinstance(value, str):
+            return RemoteServiceState(value)
+        return value
+
+    @field_validator("service_id", "message")
+    @classmethod
+    def _strip_required_text(cls, value: str, info) -> str:
+        return _strip_non_empty(value, info.field_name)
+
+
+class RemoteServicesStatus(_StrictFrozenModel):
+    services: tuple[RemoteManagedServiceStatus, ...] = Field(default_factory=tuple)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _ignore_dumped_ready(cls, value):
+        if isinstance(value, dict) and "ready" in value:
+            return {key: item for key, item in value.items() if key != "ready"}
+        return value
+
+    @field_validator("services", mode="before")
+    @classmethod
+    def _coerce_services(cls, value):
+        if isinstance(value, list):
+            return tuple(value)
+        return value
+
+    @computed_field
+    @property
+    def ready(self) -> bool:
+        required_services = [service for service in self.services if service.required]
+        return bool(required_services) and all(
+            service.state in {RemoteServiceState.READY, RemoteServiceState.RUNNING}
+            for service in required_services
         )
 
 

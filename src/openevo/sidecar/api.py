@@ -25,6 +25,11 @@ from openevo.core.capabilities import (
     build_core_capabilities,
 )
 from openevo.remote.executor import RemoteExecutorTransport
+from openevo.remote.lifecycle import (
+    RemoteServiceLog,
+    RemoteServiceOperationResult,
+    RemoteServicesStatus,
+)
 from openevo.remote.redaction import sanitize_remote_text
 from openevo.science import ScienceProjectConfig
 from openevo.sidecar.config import (
@@ -205,6 +210,18 @@ class OpenEvoDesktopServicesResponse(_StrictFrozenModel):
     services: dict[str, Any]
     report: dict[str, Any]
     status: OpenEvoDesktopShellStatus
+
+
+class OpenEvoDesktopServiceOperationRequest(_StrictFrozenModel):
+    service_id: str
+
+    @field_validator("service_id")
+    @classmethod
+    def _strip_service_id(cls, value: str) -> str:
+        service_id = value.strip()
+        if not service_id:
+            raise ValueError("service_id must be a non-empty string")
+        return service_id
 
 
 class OpenEvoDesktopProjectConfigResponse(_StrictFrozenModel):
@@ -854,6 +871,141 @@ def create_sidecar_app(
             status=response_status,
         )
 
+    @app.get(
+        "/openevo-api/desktop/services/status",
+        response_model=RemoteServicesStatus,
+    )
+    def services_status(
+        token: str | None = Header(
+            default=None,
+            alias=SIDECAR_MUTATION_TOKEN_HEADER,
+        ),
+    ) -> RemoteServicesStatus:
+        _validate_mutation_token(token, sidecar_token)
+        active_session = _active_ready_services_session(
+            session,
+            session_pointer_lock=session_pointer_lock,
+            transport_kind=transport_kind,
+        )
+        return _inspect_remote_services(active_session)
+
+    @app.get(
+        "/openevo-api/desktop/services/health",
+        response_model=RemoteServicesStatus,
+    )
+    def services_health(
+        token: str | None = Header(
+            default=None,
+            alias=SIDECAR_MUTATION_TOKEN_HEADER,
+        ),
+    ) -> RemoteServicesStatus:
+        _validate_mutation_token(token, sidecar_token)
+        active_session = _active_ready_services_session(
+            session,
+            session_pointer_lock=session_pointer_lock,
+            transport_kind=transport_kind,
+        )
+        return _inspect_remote_services(active_session)
+
+    @app.get(
+        "/openevo-api/desktop/services/logs",
+        response_model=RemoteServiceLog,
+    )
+    def service_logs(
+        service_id: str,
+        lines: int = 200,
+        token: str | None = Header(
+            default=None,
+            alias=SIDECAR_MUTATION_TOKEN_HEADER,
+        ),
+    ) -> RemoteServiceLog:
+        _validate_mutation_token(token, sidecar_token)
+        active_session = _active_ready_services_session(
+            session,
+            session_pointer_lock=session_pointer_lock,
+            transport_kind=transport_kind,
+        )
+        try:
+            return _read_remote_service_logs(active_session, service_id, lines=lines)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post(
+        "/openevo-api/desktop/services/stop",
+        response_model=RemoteServiceOperationResult,
+    )
+    def service_stop(
+        payload: OpenEvoDesktopServiceOperationRequest,
+        token: str | None = Header(
+            default=None,
+            alias=SIDECAR_MUTATION_TOKEN_HEADER,
+        ),
+    ) -> RemoteServiceOperationResult:
+        _validate_mutation_token(token, sidecar_token)
+        active_session = _active_ready_services_session(
+            session,
+            session_pointer_lock=session_pointer_lock,
+            transport_kind=transport_kind,
+        )
+        if not active_session.services_lock.acquire(blocking=False):
+            raise HTTPException(
+                status_code=409,
+                detail="Desktop services control is already running.",
+            )
+        if _other_lifecycle_busy(active_session, excluding="services"):
+            active_session.services_lock.release()
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Desktop services control cannot run while another "
+                    "lifecycle action is running."
+                ),
+            )
+        try:
+            return _stop_remote_service(active_session, payload.service_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        finally:
+            active_session.services_lock.release()
+
+    @app.post(
+        "/openevo-api/desktop/services/restart",
+        response_model=RemoteServiceOperationResult,
+    )
+    def service_restart(
+        payload: OpenEvoDesktopServiceOperationRequest,
+        token: str | None = Header(
+            default=None,
+            alias=SIDECAR_MUTATION_TOKEN_HEADER,
+        ),
+    ) -> RemoteServiceOperationResult:
+        _validate_mutation_token(token, sidecar_token)
+        active_session = _active_ready_services_session(
+            session,
+            session_pointer_lock=session_pointer_lock,
+            transport_kind=transport_kind,
+        )
+        if not active_session.services_lock.acquire(blocking=False):
+            raise HTTPException(
+                status_code=409,
+                detail="Desktop services control is already running.",
+            )
+        if _other_lifecycle_busy(active_session, excluding="services"):
+            active_session.services_lock.release()
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Desktop services control cannot run while another "
+                    "lifecycle action is running."
+                ),
+            )
+        try:
+            return _restart_remote_service(active_session, payload.service_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        finally:
+            active_session.services_lock.release()
+
     @app.post(
         "/openevo-api/desktop/run",
         response_model=OpenEvoDesktopRunResponse,
@@ -1186,6 +1338,88 @@ def _run_services(session: OpenEvoSidecarSession):
     return execute_remote_services_plan(
         services_plan,
         session.transport_factory(session.profile),
+    )
+
+
+def _active_ready_services_session(
+    session: OpenEvoSidecarSession | None,
+    *,
+    session_pointer_lock: LockType,
+    transport_kind: SidecarTransportKind,
+) -> OpenEvoSidecarSession:
+    with session_pointer_lock:
+        active_session = session
+        if active_session is None:
+            raise HTTPException(
+                status_code=409,
+                detail="Desktop services require a config-backed sidecar session.",
+            )
+        _raise_for_unsupported_lifecycle_auth(
+            active_session.profile,
+            transport_kind,
+        )
+    _require_workspace_and_bootstrap_ready(active_session)
+    return active_session
+
+
+def _current_remote_services_plan(session: OpenEvoSidecarSession):
+    from openevo.remote.bootstrap import build_remote_bootstrap_plan
+    from openevo.remote.services import build_remote_services_plan
+
+    sidecar_plan = build_sidecar_science_plan(session.project, session.profile)
+    return build_remote_services_plan(build_remote_bootstrap_plan(sidecar_plan))
+
+
+def _inspect_remote_services(
+    session: OpenEvoSidecarSession,
+) -> RemoteServicesStatus:
+    from openevo.remote.services import inspect_remote_services
+
+    return inspect_remote_services(
+        session.transport_factory(session.profile),
+        _current_remote_services_plan(session),
+    )
+
+
+def _read_remote_service_logs(
+    session: OpenEvoSidecarSession,
+    service_id: str,
+    *,
+    lines: int,
+) -> RemoteServiceLog:
+    from openevo.remote.services import read_remote_service_logs
+
+    return read_remote_service_logs(
+        session.transport_factory(session.profile),
+        _current_remote_services_plan(session),
+        service_id,
+        lines=lines,
+    )
+
+
+def _stop_remote_service(
+    session: OpenEvoSidecarSession,
+    service_id: str,
+) -> RemoteServiceOperationResult:
+    from openevo.remote.services import stop_remote_service
+
+    return stop_remote_service(
+        session.transport_factory(session.profile),
+        _current_remote_services_plan(session),
+        service_id,
+    )
+
+
+def _restart_remote_service(
+    session: OpenEvoSidecarSession,
+    service_id: str,
+) -> RemoteServiceOperationResult:
+    from openevo.remote.services import restart_remote_service
+
+    return restart_remote_service(
+        session.transport_factory(session.profile),
+        _current_remote_services_plan(session),
+        service_id,
     )
 
 

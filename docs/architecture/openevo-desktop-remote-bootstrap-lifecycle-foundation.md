@@ -1,6 +1,6 @@
 # OpenEvo Desktop Remote Bootstrap Lifecycle Foundation
 
-Tracked by #45.
+Tracked by #45. Remote lifecycle controls are tracked by #120.
 
 This document defines the first remote bootstrap and lifecycle-status contract
 for OpenEvo Desktop. It sits above the sidecar planner, remote executor, and SSH
@@ -155,22 +155,80 @@ registry mirror configuration outside OpenEvo.
 
 - `RemoteDaemonLaunchSpec`;
 - `RemoteLifecycleStatus`;
+- `RemoteServiceState`;
 - `RemoteServiceStatus`;
+- `RemoteManagedServiceStatus`;
+- `RemoteServicesStatus`;
+- `RemoteServiceLog`;
+- `RemoteServiceOperationResult`;
 - `RemoteLifecycleEvent`;
 - `RemoteStatusReport`.
 
 These models are strict, frozen, and JSON round-trip safe. They do not supervise
 processes. `RemoteStatusReport.ready` is true only when bootstrap and workspace
-are ready, every service is `running` or `planned`, and no actionable errors are
-present.
+are ready, every service is `running`, `ready`, or `planned`, and no actionable
+errors are present.
 
-Later slices can connect these models to a real remote supervisor that starts
-OpenEvo services, checks ports and health endpoints, and streams lifecycle
-events to Desktop.
+`RemoteServicesStatus` is the Desktop/Core contract for the managed remote
+service facade. It contains one `RemoteManagedServiceStatus` per daemon service
+and computes `ready` when every required daemon is `ready` or `running`.
+`RemoteServiceState` values are `planned`, `starting`, `running`, `ready`,
+`degraded`, `stopped`, `failed`, and `unknown`.
 
-The current Desktop service lifecycle endpoint already starts command-based
-OpenEvo services after bootstrap readiness. The lifecycle models remain the
-JSON contract Desktop renders for those service reports.
+## Remote Service Lifecycle Facade
+
+The existing aggregate start endpoint remains:
+
+```text
+POST /openevo-api/desktop/services
+```
+
+It still builds a `RemoteServicesPlan` from the current sidecar session and
+executes its ordered steps. The facade added for Desktop control does not create
+a parallel supervisor topology. It uses the same `RemoteServicesPlan` as the
+source of managed daemons and ignores the `write_topology` step because that
+step writes config, not a long-running process.
+
+Daemon `RemoteServiceStep.manifest` entries include:
+
+- `service_id`;
+- `pid_path` under `<state_root>/services/pids/<service_id>.pid`;
+- `log_path` under `<state_root>/services/logs/<service_id>.log`;
+- `port` where the service owns a local HTTP port;
+- `model` for managed vLLM.
+
+The sidecar exposes these token-gated endpoints:
+
+| Endpoint | Response | Purpose |
+|---|---|---|
+| `GET /openevo-api/desktop/services/status` | `RemoteServicesStatus` | Inspect pid files, process liveness, and health commands for all managed daemons. |
+| `GET /openevo-api/desktop/services/health` | `RemoteServicesStatus` | Same structured health report as status for Desktop polling. |
+| `GET /openevo-api/desktop/services/logs?service_id=gateway&lines=50` | `RemoteServiceLog` | Tail one managed daemon log. |
+| `POST /openevo-api/desktop/services/stop` | `RemoteServiceOperationResult` | Stop one managed daemon by pid file. |
+| `POST /openevo-api/desktop/services/restart` | `RemoteServiceOperationResult` | Stop, start with the existing step command, then run that step's health command. |
+
+All five require `X-OpenEvo-Sidecar-Token`, a config-backed sidecar session, and
+ready workspace/bootstrap state. Stop and restart also acquire the existing
+services lifecycle lock so they do not collide with service start or each other.
+Unknown service ids return a clear client error; `write_topology` is not a valid
+service id for logs, stop, or restart.
+
+Inspection semantics are intentionally pragmatic:
+
+- missing pid file or dead pid is `stopped`;
+- live pid plus successful health command is `ready`;
+- live pid with no health command is `running`;
+- live pid plus failed health command is `degraded`;
+- transport exceptions or malformed inspect results become structured
+  `failed` or `unknown` service statuses instead of uncaught crashes.
+
+Log and operation outputs are sanitized with the remote proxy redaction rules.
+They also redact `Authorization:` and `Proxy-Authorization:` header values and
+bearer tokens before returning content to Desktop.
+
+This facade is still command-based. It does not add systemd units, persistent
+restart policies, cross-session process ownership tracking, or a new daemon
+supervisor.
 
 ## CLI
 
@@ -217,6 +275,9 @@ This slice intentionally does not implement:
 Focused validation:
 
 ```bash
+source .venv/bin/activate && PYTHONPATH=src pytest tests/openevo/remote/test_services.py tests/openevo/remote/test_lifecycle.py tests/openevo/sidecar/test_api.py -q
+source .venv/bin/activate && ruff check src/openevo/remote/services.py src/openevo/remote/lifecycle.py src/openevo/remote/__init__.py src/openevo/sidecar/api.py tests/openevo/remote/test_services.py tests/openevo/remote/test_lifecycle.py tests/openevo/sidecar/test_api.py
+git diff --check
 PYTHONPATH=src /home/ziyi/ProRL-Agent-Server/.venv/bin/python -m pytest tests/openevo/test_cli.py tests/openevo/sidecar tests/openevo/remote tests/openevo/science tests/evolution/test_models.py -q
 PYTHONPATH=src /home/ziyi/ProRL-Agent-Server/.venv/bin/python -m pytest tests/openevo/science tests/evolution/test_models.py --collect-only -q >/tmp/openevo-remote-bootstrap-collect.txt
 /home/ziyi/ProRL-Agent-Server/.venv/bin/ruff check src/openevo/remote src/openevo/cli.py tests/openevo/remote tests/openevo/test_cli.py

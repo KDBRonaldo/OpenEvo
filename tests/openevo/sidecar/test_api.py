@@ -526,6 +526,163 @@ def test_services_endpoint_rejects_concurrent_runs() -> None:
     assert second.json()["detail"] == "Desktop services are already running."
 
 
+def test_services_status_endpoint_requires_token_and_ready_bootstrap() -> None:
+    project = ScienceProjectConfig.model_validate(_science_project_payload())
+    profile = _remote_profile()
+    client = TestClient(
+        create_sidecar_app_for_project(
+            project,
+            profile,
+            transport_factory=lambda _profile: _ApiLifecycleTransport(),
+        )
+    )
+    token = _sidecar_token(client)
+
+    missing_token = client.get("/openevo-api/desktop/services/status")
+    not_ready = client.get(
+        "/openevo-api/desktop/services/status",
+        headers={"X-OpenEvo-Sidecar-Token": token},
+    )
+
+    assert missing_token.status_code == 403
+    assert missing_token.json()["detail"] == "Invalid OpenEvo sidecar token."
+    assert not_ready.status_code == 409
+    assert not_ready.json()["detail"] == (
+        "Desktop services require ready workspace and bootstrap."
+    )
+
+
+def test_services_status_and_health_endpoints_inspect_remote_services() -> None:
+    project = ScienceProjectConfig.model_validate(_science_project_payload())
+    profile = _remote_profile()
+    transport = _ApiLifecycleTransport(
+        pid_states={
+            "evolution_backend": {"pid": 120, "alive": True},
+            "rollout": {"pid": 121, "alive": True},
+            "gateway": {"pid": 122, "alive": True},
+            "evolution_worker": {"pid": 123, "alive": True},
+        }
+    )
+    client = TestClient(
+        create_sidecar_app_for_project(
+            project,
+            profile,
+            transport_factory=lambda _profile: transport,
+        )
+    )
+    token = _sidecar_token(client)
+    headers = {"X-OpenEvo-Sidecar-Token": token}
+    _prepare_workspace_and_bootstrap(client, headers)
+
+    status = client.get("/openevo-api/desktop/services/status", headers=headers)
+    health = client.get("/openevo-api/desktop/services/health", headers=headers)
+
+    assert status.status_code == 200
+    assert status.json()["ready"] is True
+    services = {service["service_id"]: service for service in status.json()["services"]}
+    assert services["gateway"]["state"] == "ready"
+    assert services["gateway"]["pid"] == 122
+    assert health.status_code == 200
+    assert health.json() == status.json()
+
+
+def test_services_logs_endpoint_tails_selected_service_with_redaction() -> None:
+    project = ScienceProjectConfig.model_validate(_science_project_payload())
+    profile = _remote_profile()
+    transport = _ApiLifecycleTransport(
+        log_content=(
+            "Authorization: Bearer secret-token\n"
+            "Proxy http://proxy-user:proxy-secret@127.0.0.1:7890\n"
+            "Gateway ready\n"
+        )
+    )
+    client = TestClient(
+        create_sidecar_app_for_project(
+            project,
+            profile,
+            transport_factory=lambda _profile: transport,
+        )
+    )
+    token = _sidecar_token(client)
+    headers = {"X-OpenEvo-Sidecar-Token": token}
+    _prepare_workspace_and_bootstrap(client, headers)
+
+    response = client.get(
+        "/openevo-api/desktop/services/logs",
+        headers=headers,
+        params={"service_id": "gateway", "lines": 50},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["service_id"] == "gateway"
+    assert payload["line_count"] == 3
+    assert "Gateway ready" in payload["content"]
+    assert "secret-token" not in payload["content"]
+    assert "proxy-secret" not in payload["content"]
+    assert "Authorization: [REDACTED]" in payload["content"]
+
+
+def test_services_stop_and_restart_endpoints_control_selected_service() -> None:
+    project = ScienceProjectConfig.model_validate(_science_project_payload())
+    profile = _remote_profile()
+    transport = _ApiLifecycleTransport(pid_states={"gateway": {"pid": 122, "alive": True}})
+    client = TestClient(
+        create_sidecar_app_for_project(
+            project,
+            profile,
+            transport_factory=lambda _profile: transport,
+        )
+    )
+    token = _sidecar_token(client)
+    headers = {"X-OpenEvo-Sidecar-Token": token}
+    _prepare_workspace_and_bootstrap(client, headers)
+
+    stop = client.post(
+        "/openevo-api/desktop/services/stop",
+        headers=headers,
+        json={"service_id": "gateway"},
+    )
+    transport.pid_states["gateway"] = {"pid": 124, "alive": True}
+    restart = client.post(
+        "/openevo-api/desktop/services/restart",
+        headers=headers,
+        json={"service_id": "gateway"},
+    )
+
+    assert stop.status_code == 200
+    assert stop.json()["state"] == "stopped"
+    assert restart.status_code == 200
+    assert restart.json()["state"] == "ready"
+    assert transport.stopped_services == ["gateway", "gateway"]
+    assert any("polar serve_gateway" in command for command in transport.commands)
+    assert not any("polar serve_rollout" in command for command in transport.commands)
+
+
+def test_services_control_endpoint_rejects_unknown_service_id() -> None:
+    project = ScienceProjectConfig.model_validate(_science_project_payload())
+    profile = _remote_profile()
+    client = TestClient(
+        create_sidecar_app_for_project(
+            project,
+            profile,
+            transport_factory=lambda _profile: _ApiLifecycleTransport(),
+        )
+    )
+    token = _sidecar_token(client)
+    headers = {"X-OpenEvo-Sidecar-Token": token}
+    _prepare_workspace_and_bootstrap(client, headers)
+
+    response = client.post(
+        "/openevo-api/desktop/services/stop",
+        headers=headers,
+        json={"service_id": "write_topology"},
+    )
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "Unknown remote service id: write_topology"
+
+
 def test_run_rejects_while_services_restart_is_running() -> None:
     project = ScienceProjectConfig.model_validate(_science_project_payload())
     profile = _remote_profile()
@@ -2410,6 +2567,106 @@ class _ApiDryRunTransport:
     def upload_dir(self, local_path: str, remote_path: str) -> None:
         self.uploads.append((local_path, remote_path))
         return None
+
+
+class _ApiLifecycleTransport(_ApiDryRunTransport):
+    def __init__(
+        self,
+        *,
+        pid_states: dict[str, dict[str, object]] | None = None,
+        health_failures: dict[str, str] | None = None,
+        log_content: str = "",
+    ) -> None:
+        super().__init__()
+        self.pid_states = pid_states or {}
+        self.health_failures = health_failures or {}
+        self.log_content = log_content
+        self.stopped_services: list[str] = []
+
+    def run(
+        self,
+        command: str,
+        *,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        timeout_seconds: float = 30.0,
+    ) -> RemoteCommandResult:
+        self.commands.append(command)
+        self.run_calls.append((command, cwd, timeout_seconds))
+        service_id = _service_id_from_command(command)
+        if command == 'df -Pk "$HOME"':
+            return super().run(
+                command,
+                cwd=cwd,
+                env=env,
+                timeout_seconds=timeout_seconds,
+            )
+        if "json.dumps" in command and "pid_path =" in command:
+            state = self.pid_states.get(service_id or "", {})
+            return RemoteCommandResult(
+                command=command,
+                return_code=0,
+                stdout=json.dumps(
+                    {
+                        "pid_exists": service_id in self.pid_states,
+                        "pid": state.get("pid"),
+                        "alive": bool(state.get("alive")),
+                    }
+                ),
+            )
+        if command.startswith("if [ -f ") and "tail -n" in command:
+            return RemoteCommandResult(
+                command=command,
+                return_code=0,
+                stdout=self.log_content,
+            )
+        if "os.kill(pid, signal.SIGTERM)" in command:
+            if service_id not in self.pid_states:
+                return RemoteCommandResult(
+                    command=command,
+                    return_code=0,
+                    stdout=f"{service_id} is already stopped.",
+                )
+            self.stopped_services.append(service_id or "")
+            self.pid_states.pop(service_id or "", None)
+            return RemoteCommandResult(
+                command=command,
+                return_code=0,
+                stdout=f"{service_id} stopped.",
+            )
+        if service_id in self.health_failures and (
+            "/health" in command or "pid_path =" in command
+        ):
+            return RemoteCommandResult(
+                command=command,
+                return_code=1,
+                stderr=self.health_failures[service_id],
+            )
+        return RemoteCommandResult(command=command, return_code=0, stdout="ok")
+
+
+def _service_id_from_command(command: str) -> str | None:
+    url_services = {
+        "127.0.0.1:8200": "evolution_backend",
+        "127.0.0.1:8080": "rollout",
+        "127.0.0.1:8100": "gateway",
+        "127.0.0.1:8000": "vllm",
+    }
+    for url_fragment, service_id in url_services.items():
+        if url_fragment in command:
+            return service_id
+    for service_id in (
+        "evolution_backend",
+        "evolution_worker",
+        "gateway",
+        "rollout",
+        "vllm",
+    ):
+        if f"/{service_id}.pid" in command or f"/{service_id}.log" in command:
+            return service_id
+        if f" {service_id} " in command:
+            return service_id
+    return None
 
 
 class _FailingPreflightTransport(_ApiDryRunTransport):

@@ -23,7 +23,12 @@ from openevo.remote.lifecycle import (
     RemoteDaemonLaunchSpec,
     RemoteLifecycleEvent,
     RemoteLifecycleStatus,
+    RemoteManagedServiceStatus,
+    RemoteServiceLog,
+    RemoteServiceOperationResult,
+    RemoteServiceState,
     RemoteServiceStatus,
+    RemoteServicesStatus,
     RemoteStatusReport,
 )
 from openevo.remote.preflight import (
@@ -42,6 +47,12 @@ from openevo.remote.services import (
     RemoteServicesReport,
     build_remote_services_plan,
     execute_remote_services_plan,
+    inspect_remote_services,
+    managed_service_step_by_id,
+    managed_service_steps,
+    read_remote_service_logs,
+    restart_remote_service,
+    stop_remote_service,
 )
 from openevo.remote.ssh import SshRemoteExecutorTransport
 
@@ -59,7 +70,12 @@ __all__ = [
     "RemoteExecutorTransport",
     "RemoteLifecycleEvent",
     "RemoteLifecycleStatus",
+    "RemoteManagedServiceStatus",
+    "RemoteServiceLog",
+    "RemoteServiceOperationResult",
+    "RemoteServiceState",
     "RemoteServiceStatus",
+    "RemoteServicesStatus",
     "RemoteStatusReport",
     "PreflightReport",
     "RemoteCommandResult",
@@ -79,5 +95,11 @@ __all__ = [
     "execute_sidecar_plan",
     "execute_remote_services_plan",
     "execute_workspace_plan",
+    "inspect_remote_services",
+    "managed_service_step_by_id",
+    "managed_service_steps",
+    "read_remote_service_logs",
+    "restart_remote_service",
     "run_preflight",
+    "stop_remote_service",
 ]

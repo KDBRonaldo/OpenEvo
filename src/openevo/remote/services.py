@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import posixpath
+import re
 import shlex
 from collections.abc import Mapping
 from enum import StrEnum
@@ -17,6 +19,13 @@ from pydantic import (
 import yaml
 
 from openevo.remote.executor import RemoteExecutorTransport
+from openevo.remote.lifecycle import (
+    RemoteManagedServiceStatus,
+    RemoteServiceLog,
+    RemoteServiceOperationResult,
+    RemoteServiceState,
+    RemoteServicesStatus,
+)
 from openevo.remote.redaction import sanitize_remote_text
 
 if TYPE_CHECKING:
@@ -234,7 +243,13 @@ def build_remote_services_plan(bootstrap_plan: RemoteBootstrapPlan) -> RemoteSer
                 env=dict(bootstrap_plan.proxy_env),
                 timeout_seconds=900.0,
                 health_timeout_seconds=905.0,
-                manifest={"model": managed_hf_model, "port": 8000},
+                manifest=_daemon_manifest(
+                    "vllm",
+                    log_dir=log_dir,
+                    pid_dir=pid_dir,
+                    port=8000,
+                    model=managed_hf_model,
+                ),
             )
         )
     steps.extend(
@@ -259,13 +274,18 @@ def build_remote_services_plan(bootstrap_plan: RemoteBootstrapPlan) -> RemoteSer
                     log_dir=log_dir,
                     pid_dir=pid_dir,
                 ),
-	                health_command=_http_health_command(
-	                    "http://127.0.0.1:8200/v1/health"
-	                ),
+                health_command=_http_health_command(
+                    "http://127.0.0.1:8200/v1/health"
+                ),
                 env=dict(bootstrap_plan.proxy_env),
                 timeout_seconds=60.0,
                 health_timeout_seconds=35.0,
-                manifest={"port": 8200},
+                manifest=_daemon_manifest(
+                    "evolution_backend",
+                    log_dir=log_dir,
+                    pid_dir=pid_dir,
+                    port=8200,
+                ),
             ),
             RemoteServiceStep(
                 id="rollout",
@@ -276,11 +296,16 @@ def build_remote_services_plan(bootstrap_plan: RemoteBootstrapPlan) -> RemoteSer
                     log_dir=log_dir,
                     pid_dir=pid_dir,
                 ),
-	                health_command=_http_health_command("http://127.0.0.1:8080/health"),
+                health_command=_http_health_command("http://127.0.0.1:8080/health"),
                 env=dict(bootstrap_plan.proxy_env),
                 timeout_seconds=60.0,
                 health_timeout_seconds=35.0,
-                manifest={"port": 8080},
+                manifest=_daemon_manifest(
+                    "rollout",
+                    log_dir=log_dir,
+                    pid_dir=pid_dir,
+                    port=8080,
+                ),
             ),
             RemoteServiceStep(
                 id="gateway",
@@ -298,11 +323,16 @@ def build_remote_services_plan(bootstrap_plan: RemoteBootstrapPlan) -> RemoteSer
                     log_dir=log_dir,
                     pid_dir=pid_dir,
                 ),
-	                health_command=_http_health_command("http://127.0.0.1:8100/health"),
+                health_command=_http_health_command("http://127.0.0.1:8100/health"),
                 env=dict(bootstrap_plan.proxy_env),
                 timeout_seconds=60.0,
                 health_timeout_seconds=35.0,
-                manifest={"port": 8100},
+                manifest=_daemon_manifest(
+                    "gateway",
+                    log_dir=log_dir,
+                    pid_dir=pid_dir,
+                    port=8100,
+                ),
             ),
             RemoteServiceStep(
                 id="evolution_worker",
@@ -322,12 +352,17 @@ def build_remote_services_plan(bootstrap_plan: RemoteBootstrapPlan) -> RemoteSer
                     log_dir=log_dir,
                     pid_dir=pid_dir,
                 ),
-	                health_command=_pid_health_command(
-	                    posixpath.join(pid_dir, "evolution_worker.pid")
-	                ),
+                health_command=_pid_health_command(
+                    posixpath.join(pid_dir, "evolution_worker.pid")
+                ),
                 env=dict(bootstrap_plan.proxy_env),
                 timeout_seconds=60.0,
                 health_timeout_seconds=35.0,
+                manifest=_daemon_manifest(
+                    "evolution_worker",
+                    log_dir=log_dir,
+                    pid_dir=pid_dir,
+                ),
             ),
         ]
     )
@@ -360,6 +395,305 @@ def execute_remote_services_plan(
         topology_path=plan.topology_path,
         steps=tuple(executions),
         next_actions=_next_actions(executions),
+    )
+
+
+def managed_service_steps(plan: RemoteServicesPlan) -> tuple[RemoteServiceStep, ...]:
+    return tuple(
+        step
+        for step in plan.steps
+        if isinstance(step.manifest.get("service_id"), str)
+        and step.manifest.get("pid_path")
+        and step.manifest.get("log_path")
+    )
+
+
+def managed_service_step_by_id(
+    plan: RemoteServicesPlan,
+    service_id: str,
+) -> RemoteServiceStep:
+    service_id = _strip_non_empty(service_id, "service_id")
+    for step in managed_service_steps(plan):
+        if step.manifest.get("service_id") == service_id:
+            return step
+    raise ValueError(f"Unknown remote service id: {service_id}")
+
+
+def inspect_remote_services(
+    transport: RemoteExecutorTransport,
+    plan: RemoteServicesPlan,
+) -> RemoteServicesStatus:
+    statuses = [
+        _inspect_remote_service(transport, plan, step)
+        for step in managed_service_steps(plan)
+    ]
+    return RemoteServicesStatus(services=tuple(statuses))
+
+
+def read_remote_service_logs(
+    transport: RemoteExecutorTransport,
+    plan: RemoteServicesPlan,
+    service_id: str,
+    *,
+    lines: int = 200,
+) -> RemoteServiceLog:
+    step = managed_service_step_by_id(plan, service_id)
+    line_count = max(1, min(int(lines), 1000))
+    log_path = _manifest_text(step, "log_path")
+    command = (
+        f"if [ -f {shlex.quote(log_path)} ]; then "
+        f"tail -n {line_count} -- {shlex.quote(log_path)}; fi"
+    )
+    result = transport.run(command, env=dict(step.env), timeout_seconds=30.0)
+    content = result.stdout if result.ok else result.stderr or result.stdout
+    content = _sanitize_lifecycle_text(content, plan.proxy_env | step.env)
+    return RemoteServiceLog(
+        service_id=_manifest_text(step, "service_id"),
+        content=content,
+        line_count=_count_log_lines(content),
+    )
+
+
+def stop_remote_service(
+    transport: RemoteExecutorTransport,
+    plan: RemoteServicesPlan,
+    service_id: str,
+) -> RemoteServiceOperationResult:
+    step = managed_service_step_by_id(plan, service_id)
+    service_id = _manifest_text(step, "service_id")
+    command = _stop_service_command(_manifest_text(step, "pid_path"), service_id)
+    try:
+        result = transport.run(
+            command,
+            cwd=step.cwd,
+            env=dict(step.env),
+            timeout_seconds=30.0,
+        )
+    except Exception as exc:
+        message = _sanitize_lifecycle_text(str(exc), plan.proxy_env | step.env)
+        return RemoteServiceOperationResult(
+            service_id=service_id,
+            state=RemoteServiceState.FAILED,
+            message=message or f"{service_id} stop failed.",
+            stderr=message,
+        )
+    stdout = _sanitize_lifecycle_text(result.stdout, plan.proxy_env | step.env)
+    stderr = _sanitize_lifecycle_text(result.stderr, plan.proxy_env | step.env)
+    if not result.ok:
+        return RemoteServiceOperationResult(
+            service_id=service_id,
+            state=RemoteServiceState.FAILED,
+            message=stderr or stdout or f"{service_id} stop failed.",
+            stdout=stdout,
+            stderr=stderr,
+        )
+    already_stopped = "already stopped" in (stdout or stderr).lower()
+    return RemoteServiceOperationResult(
+        service_id=service_id,
+        state=RemoteServiceState.STOPPED,
+        message=(
+            f"{service_id} is already stopped."
+            if already_stopped
+            else f"{service_id} stopped."
+        ),
+        stdout=stdout,
+        stderr=stderr,
+    )
+
+
+def restart_remote_service(
+    transport: RemoteExecutorTransport,
+    plan: RemoteServicesPlan,
+    service_id: str,
+) -> RemoteServiceOperationResult:
+    step = managed_service_step_by_id(plan, service_id)
+    service_id = _manifest_text(step, "service_id")
+    stop_result = stop_remote_service(transport, plan, service_id)
+    if stop_result.state == RemoteServiceState.FAILED:
+        return stop_result
+
+    env = plan.proxy_env | step.env
+    try:
+        start = transport.run(
+            step.command,
+            cwd=step.cwd,
+            env=dict(step.env),
+            timeout_seconds=step.timeout_seconds,
+        )
+    except Exception as exc:
+        message = _sanitize_lifecycle_text(str(exc), env)
+        return RemoteServiceOperationResult(
+            service_id=service_id,
+            state=RemoteServiceState.FAILED,
+            message=message or f"{service_id} restart failed.",
+            stdout=stop_result.stdout,
+            stderr=_join_non_empty(stop_result.stderr, message),
+        )
+    start_stdout = _sanitize_lifecycle_text(start.stdout, env)
+    start_stderr = _sanitize_lifecycle_text(start.stderr, env)
+    stdout = _join_non_empty(stop_result.stdout, start_stdout)
+    stderr = _join_non_empty(stop_result.stderr, start_stderr)
+    if not start.ok:
+        return RemoteServiceOperationResult(
+            service_id=service_id,
+            state=RemoteServiceState.FAILED,
+            message=start_stderr or start_stdout or f"{service_id} restart failed.",
+            stdout=stdout,
+            stderr=stderr,
+        )
+    if step.health_command is None:
+        return RemoteServiceOperationResult(
+            service_id=service_id,
+            state=RemoteServiceState.RUNNING,
+            message=f"{service_id} restarted.",
+            stdout=stdout,
+            stderr=stderr,
+        )
+    try:
+        health = transport.run(
+            step.health_command,
+            cwd=step.cwd,
+            env=dict(step.env),
+            timeout_seconds=step.health_timeout_seconds,
+        )
+    except Exception as exc:
+        message = _sanitize_lifecycle_text(str(exc), env)
+        return RemoteServiceOperationResult(
+            service_id=service_id,
+            state=RemoteServiceState.DEGRADED,
+            message=message or f"{service_id} health check failed.",
+            stdout=stdout,
+            stderr=_join_non_empty(stderr, message),
+        )
+    health_stdout = _sanitize_lifecycle_text(health.stdout, env)
+    health_stderr = _sanitize_lifecycle_text(health.stderr, env)
+    stdout = _join_non_empty(stdout, health_stdout)
+    stderr = _join_non_empty(stderr, health_stderr)
+    if not health.ok:
+        return RemoteServiceOperationResult(
+            service_id=service_id,
+            state=RemoteServiceState.DEGRADED,
+            message=health_stderr or health_stdout or f"{service_id} health failed.",
+            stdout=stdout,
+            stderr=stderr,
+        )
+    return RemoteServiceOperationResult(
+        service_id=service_id,
+        state=RemoteServiceState.READY,
+        message=f"{service_id} restarted.",
+        stdout=stdout,
+        stderr=stderr,
+    )
+
+
+def _inspect_remote_service(
+    transport: RemoteExecutorTransport,
+    plan: RemoteServicesPlan,
+    step: RemoteServiceStep,
+) -> RemoteManagedServiceStatus:
+    service_id = _manifest_text(step, "service_id")
+    env = plan.proxy_env | step.env
+    try:
+        result = transport.run(
+            _inspect_pid_command(_manifest_text(step, "pid_path")),
+            cwd=step.cwd,
+            env=dict(step.env),
+            timeout_seconds=30.0,
+        )
+    except Exception as exc:
+        message = _sanitize_lifecycle_text(str(exc), env)
+        return RemoteManagedServiceStatus(
+            service_id=service_id,
+            state=RemoteServiceState.FAILED,
+            message=message or f"{service_id} inspect failed.",
+            required=step.required,
+            log_path=_manifest_text(step, "log_path"),
+            health_check=step.health_command,
+        )
+    if not result.ok:
+        message = _sanitize_lifecycle_text(result.stderr or result.stdout, env)
+        return RemoteManagedServiceStatus(
+            service_id=service_id,
+            state=RemoteServiceState.FAILED,
+            message=message or f"{service_id} inspect failed.",
+            required=step.required,
+            log_path=_manifest_text(step, "log_path"),
+            health_check=step.health_command,
+        )
+    try:
+        payload = json.loads(result.stdout or "{}")
+    except json.JSONDecodeError:
+        payload = None
+    if not isinstance(payload, dict):
+        return RemoteManagedServiceStatus(
+            service_id=service_id,
+            state=RemoteServiceState.UNKNOWN,
+            message=f"{service_id} inspect returned invalid status.",
+            required=step.required,
+            log_path=_manifest_text(step, "log_path"),
+            health_check=step.health_command,
+        )
+    pid = payload.get("pid") if isinstance(payload, dict) else None
+    pid = pid if isinstance(pid, int) and not isinstance(pid, bool) and pid > 0 else None
+    alive = bool(payload.get("alive"))
+    pid_exists = bool(payload.get("pid_exists"))
+    if not pid_exists or not alive:
+        return RemoteManagedServiceStatus(
+            service_id=service_id,
+            state=RemoteServiceState.STOPPED,
+            message=f"{service_id} is stopped.",
+            required=step.required,
+            pid=pid,
+            log_path=_manifest_text(step, "log_path"),
+            health_check=step.health_command,
+        )
+    if step.health_command is None:
+        return RemoteManagedServiceStatus(
+            service_id=service_id,
+            state=RemoteServiceState.RUNNING,
+            message=f"{service_id} process is running.",
+            required=step.required,
+            pid=pid,
+            log_path=_manifest_text(step, "log_path"),
+            health_check=step.health_command,
+        )
+    try:
+        health = transport.run(
+            step.health_command,
+            cwd=step.cwd,
+            env=dict(step.env),
+            timeout_seconds=step.health_timeout_seconds,
+        )
+    except Exception as exc:
+        message = _sanitize_lifecycle_text(str(exc), env)
+        return RemoteManagedServiceStatus(
+            service_id=service_id,
+            state=RemoteServiceState.DEGRADED,
+            message=message or f"{service_id} health check failed.",
+            required=step.required,
+            pid=pid,
+            log_path=_manifest_text(step, "log_path"),
+            health_check=step.health_command,
+        )
+    if not health.ok:
+        message = _sanitize_lifecycle_text(health.stderr or health.stdout, env)
+        return RemoteManagedServiceStatus(
+            service_id=service_id,
+            state=RemoteServiceState.DEGRADED,
+            message=message or f"{service_id} health check failed.",
+            required=step.required,
+            pid=pid,
+            log_path=_manifest_text(step, "log_path"),
+            health_check=step.health_command,
+        )
+    return RemoteManagedServiceStatus(
+        service_id=service_id,
+        state=RemoteServiceState.READY,
+        message=f"{service_id} is ready.",
+        required=step.required,
+        pid=pid,
+        log_path=_manifest_text(step, "log_path"),
+        health_check=step.health_command,
     )
 
 
@@ -486,6 +820,136 @@ def _next_actions(
 
 def _sanitize_service_text(value: str, env: Mapping[str, str]) -> str:
     return sanitize_remote_text(value, env)
+
+
+def _sanitize_lifecycle_text(value: str, env: Mapping[str, str]) -> str:
+    return _redact_authorization(sanitize_remote_text(value, env))
+
+
+def _redact_authorization(value: str) -> str:
+    value = re.sub(
+        r"(?im)^([ \t]*(?:authorization|proxy-authorization)[ \t]*:[ \t]*).*$",
+        r"\1[REDACTED]",
+        value,
+    )
+    return re.sub(
+        r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+",
+        "Bearer [REDACTED]",
+        value,
+    )
+
+
+def _count_log_lines(content: str) -> int:
+    if not content:
+        return 0
+    return len(content.splitlines())
+
+
+def _join_non_empty(*items: str) -> str:
+    return "\n".join(item for item in items if item)
+
+
+def _manifest_text(step: RemoteServiceStep, key: str) -> str:
+    value = step.manifest.get(key)
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"Managed service {step.id} missing manifest.{key}")
+    return value.strip()
+
+
+def _daemon_manifest(
+    service_id: str,
+    *,
+    log_dir: str,
+    pid_dir: str,
+    port: int | None = None,
+    model: str | None = None,
+) -> dict[str, Any]:
+    manifest: dict[str, Any] = {
+        "service_id": service_id,
+        "pid_path": posixpath.join(pid_dir, f"{service_id}.pid"),
+        "log_path": posixpath.join(log_dir, f"{service_id}.log"),
+    }
+    if port is not None:
+        manifest["port"] = port
+    if model is not None:
+        manifest["model"] = model
+    return manifest
+
+
+def _inspect_pid_command(pid_path: str) -> str:
+    return "\n".join(
+        [
+            "python3 - <<'PY'",
+            "import json",
+            "import os",
+            f"pid_path = {pid_path!r}",
+            "payload = {'pid_exists': False, 'pid': None, 'alive': False}",
+            "try:",
+            "    with open(pid_path, encoding='utf-8') as handle:",
+            "        pid = int(handle.read().strip())",
+            "    payload['pid_exists'] = True",
+            "    payload['pid'] = pid",
+            "    try:",
+            "        os.kill(pid, 0)",
+            "        payload['alive'] = True",
+            "    except OSError:",
+            "        payload['alive'] = False",
+            "except FileNotFoundError:",
+            "    pass",
+            "except Exception:",
+            "    payload['pid_exists'] = True",
+            "print(json.dumps(payload, sort_keys=True))",
+            "PY",
+        ]
+    )
+
+
+def _stop_service_command(pid_path: str, service_id: str) -> str:
+    return "\n".join(
+        [
+            "python3 - <<'PY'",
+            "import os",
+            "import signal",
+            "import sys",
+            "import time",
+            f"pid_path = {pid_path!r}",
+            f"service_id = {service_id!r}",
+            "try:",
+            "    with open(pid_path, encoding='utf-8') as handle:",
+            "        pid = int(handle.read().strip())",
+            "except FileNotFoundError:",
+            "    print(f'{service_id} is already stopped.')",
+            "    raise SystemExit(0)",
+            "except Exception as exc:",
+            "    print(f'failed to read pid file: {exc}', file=sys.stderr)",
+            "    raise SystemExit(1)",
+            "try:",
+            "    os.kill(pid, signal.SIGTERM)",
+            "except ProcessLookupError:",
+            "    try:",
+            "        os.remove(pid_path)",
+            "    except FileNotFoundError:",
+            "        pass",
+            "    print(f'{service_id} is already stopped.')",
+            "    raise SystemExit(0)",
+            "except Exception as exc:",
+            "    print(f'failed to stop {service_id}: {exc}', file=sys.stderr)",
+            "    raise SystemExit(1)",
+            "deadline = time.monotonic() + 10",
+            "while time.monotonic() < deadline:",
+            "    try:",
+            "        os.kill(pid, 0)",
+            "    except ProcessLookupError:",
+            "        break",
+            "    time.sleep(0.2)",
+            "try:",
+            "    os.remove(pid_path)",
+            "except FileNotFoundError:",
+            "    pass",
+            "print(f'{service_id} stopped.')",
+            "PY",
+        ]
+    )
 
 
 def _topology_yaml(
