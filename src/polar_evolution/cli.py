@@ -803,6 +803,22 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     tb_local_parametric.add_argument(
+        "--exec-timeout-cap-seconds",
+        type=int,
+        help=(
+            "Optional EVOLAB_TB_EXEC_TIMEOUT_CAP_SECONDS value for local "
+            "Terminal Bench task execution."
+        ),
+    )
+    tb_local_parametric.add_argument(
+        "--max-subagent-runtime-seconds",
+        type=int,
+        help=(
+            "Optional EVOLAB_TB_MAX_SUBAGENT_RUNTIME_SECONDS value for "
+            "compatible Terminal Bench EvoLab direct-solver packages."
+        ),
+    )
+    tb_local_parametric.add_argument(
         "--artifact-path-guard",
         choices=LOCAL_PARAMETRIC_ARTIFACT_PATH_GUARD_CHOICES,
         default=DEFAULT_LOCAL_PARAMETRIC_ARTIFACT_PATH_GUARD,
@@ -1017,6 +1033,8 @@ def main(argv: list[str] | None = None) -> int:
                 solver_temperature=args.solver_temperature,
                 vllm_generation_config=args.vllm_generation_config,
                 tool_result_prompt_max_chars=args.tool_result_prompt_max_chars,
+                exec_timeout_cap_seconds=args.exec_timeout_cap_seconds,
+                max_subagent_runtime_seconds=args.max_subagent_runtime_seconds,
                 manage_server=args.manage_server,
                 verifier_env=verifier_env,
                 agent_env=agent_env,
@@ -1046,6 +1064,8 @@ def main(argv: list[str] | None = None) -> int:
             solver_temperature=args.solver_temperature,
             vllm_generation_config=args.vllm_generation_config,
             tool_result_prompt_max_chars=args.tool_result_prompt_max_chars,
+            exec_timeout_cap_seconds=args.exec_timeout_cap_seconds,
+            max_subagent_runtime_seconds=args.max_subagent_runtime_seconds,
             verifier_env=verifier_env,
             agent_env=agent_env,
             manage_server=args.manage_server,

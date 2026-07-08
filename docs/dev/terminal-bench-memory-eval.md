@@ -1681,6 +1681,8 @@ uv run polar-evolution terminal-bench-local-parametric-memory-eval \
   --n-attempts 5 \
   --timeout-multiplier 2.0 \
   --agent-timeout-multiplier 3.5 \
+  --exec-timeout-cap-seconds 1800 \
+  --max-subagent-runtime-seconds 2400 \
   --max-output-tokens 4096 \
   --context-window-tokens 16384 \
   --context-reserve-tokens 1536 \
@@ -1698,8 +1700,10 @@ The summary reports `baseline`, `parametric_memory`, `delta`, and the
 `context_window_tokens`, `context_reserve_tokens`, and
 `tool_result_prompt_max_chars` caps used for both conditions, plus
 `solver_temperature`, `vllm_generation_config`, optional Harbor
-`timeout_multiplier` and `agent_timeout_multiplier`, and redacted `agent_env`
-package knobs when supplied. The default
+`timeout_multiplier` and `agent_timeout_multiplier`, optional internal
+Terminal-Bench package budgets `exec_timeout_cap_seconds` and
+`max_subagent_runtime_seconds`, and redacted `agent_env` package knobs when
+supplied. The default
 requested output-token cap is `4096`, but the effective cap is clamped to the
 default context reserve `1536`; increase `--context-reserve-tokens` only when
 the serving context window and prompt growth leave enough room. For smoke tests
@@ -1719,7 +1723,13 @@ turn a controlled adapter eval into sampled decoding. Many Terminal
 Bench tasks such as `train-fasttext` can spend most of the Harbor agent budget
 inside slow setup commands such as `apt-get install`; use
 `--agent-timeout-multiplier` when the adapter is expected to run multiple
-setup/training commands before verification. Many Terminal Bench verifiers run
+setup/training commands before verification. `--exec-timeout-cap-seconds` sets
+`EVOLAB_TB_EXEC_TIMEOUT_CAP_SECONDS`, which current EvoLab Terminal-Bench
+packages use to cap each `tb_exec` call. `--max-subagent-runtime-seconds` sets
+`EVOLAB_TB_MAX_SUBAGENT_RUNTIME_SECONDS`; the OpenEvo runner records and
+exports it, but it only affects runtime after the installed task package reads
+that environment variable instead of using its historical fixed 900 second
+direct-solver subagent limit. Many Terminal Bench verifiers run
 `uvx -p ...`, which can download managed Python even when
 wheel dependencies are local. When a local Python-build mirror is available,
 pass `--verifier-python-install-mirror` with the uv-compatible

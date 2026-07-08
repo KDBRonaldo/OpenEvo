@@ -80,9 +80,11 @@ _AGENT_ENV_PREFIX = "EVOLAB_TB_"
 _CONTROLLED_AGENT_ENV_KEYS = {
     "EVOLAB_TB_CONTEXT_RESERVE_TOKENS",
     "EVOLAB_TB_CONTEXT_WINDOW_TOKENS",
+    "EVOLAB_TB_EXEC_TIMEOUT_CAP_SECONDS",
     "EVOLAB_TB_LLM_API",
     "EVOLAB_TB_LLM_TEMPERATURE",
     "EVOLAB_TB_MAX_OUTPUT_TOKENS",
+    "EVOLAB_TB_MAX_SUBAGENT_RUNTIME_SECONDS",
     "EVOLAB_TB_MODE",
     "EVOLAB_TB_MODEL",
     "EVOLAB_TB_ARTIFACT_PATH_GUARD",
@@ -206,6 +208,8 @@ def build_evolab_harbor_env(
     context_reserve_tokens: int = DEFAULT_LOCAL_PARAMETRIC_CONTEXT_RESERVE_TOKENS,
     solver_temperature: float = DEFAULT_LOCAL_PARAMETRIC_SOLVER_TEMPERATURE,
     tool_result_prompt_max_chars: int | None = None,
+    exec_timeout_cap_seconds: int | None = None,
+    max_subagent_runtime_seconds: int | None = None,
     artifact_path_guard: str = DEFAULT_LOCAL_PARAMETRIC_ARTIFACT_PATH_GUARD,
     required_artifact_paths: list[str] | None = None,
     agent_env: dict[str, str] | None = None,
@@ -228,6 +232,12 @@ def build_evolab_harbor_env(
         env["EVOLAB_TB_TOOL_RESULT_PROMPT_MAX_CHARS"] = str(
             max(1, int(tool_result_prompt_max_chars))
         )
+    exec_timeout_cap = _optional_positive_int(exec_timeout_cap_seconds)
+    if exec_timeout_cap is not None:
+        env["EVOLAB_TB_EXEC_TIMEOUT_CAP_SECONDS"] = str(exec_timeout_cap)
+    subagent_runtime = _optional_positive_int(max_subagent_runtime_seconds)
+    if subagent_runtime is not None:
+        env["EVOLAB_TB_MAX_SUBAGENT_RUNTIME_SECONDS"] = str(subagent_runtime)
     guard_mode = _validate_artifact_path_guard(artifact_path_guard)
     paths = _normalize_required_artifact_paths(required_artifact_paths)
     if guard_mode != DEFAULT_LOCAL_PARAMETRIC_ARTIFACT_PATH_GUARD:
@@ -723,6 +733,8 @@ def run_local_parametric_memory_eval_dry_run(
     solver_temperature: float = DEFAULT_LOCAL_PARAMETRIC_SOLVER_TEMPERATURE,
     vllm_generation_config: str = DEFAULT_VLLM_GENERATION_CONFIG,
     tool_result_prompt_max_chars: int | None = None,
+    exec_timeout_cap_seconds: int | None = None,
+    max_subagent_runtime_seconds: int | None = None,
     verifier_env: dict[str, str] | None = None,
     agent_env: dict[str, str] | None = None,
     auth_mode: str = "local",
@@ -741,6 +753,8 @@ def run_local_parametric_memory_eval_dry_run(
         context_reserve_tokens=context_reserve_tokens,
     )
     tool_result_prompt_cap = _optional_positive_int(tool_result_prompt_max_chars)
+    exec_timeout_cap = _optional_positive_int(exec_timeout_cap_seconds)
+    subagent_runtime = _optional_positive_int(max_subagent_runtime_seconds)
     timeout_value = _optional_positive_float(timeout_multiplier)
     agent_timeout_value = _optional_positive_float(agent_timeout_multiplier)
     solver_temperature_value = float(solver_temperature)
@@ -773,6 +787,8 @@ def run_local_parametric_memory_eval_dry_run(
         "solver_temperature": solver_temperature_value,
         "vllm_generation_config": vllm_generation_config,
         "tool_result_prompt_max_chars": tool_result_prompt_cap,
+        "exec_timeout_cap_seconds": exec_timeout_cap,
+        "max_subagent_runtime_seconds": subagent_runtime,
         "timeout_multiplier": timeout_value,
         "agent_timeout_multiplier": agent_timeout_value,
         "manage_server": manage_server,
@@ -822,6 +838,8 @@ def run_local_parametric_memory_eval(
     solver_temperature: float = DEFAULT_LOCAL_PARAMETRIC_SOLVER_TEMPERATURE,
     vllm_generation_config: str = DEFAULT_VLLM_GENERATION_CONFIG,
     tool_result_prompt_max_chars: int | None = None,
+    exec_timeout_cap_seconds: int | None = None,
+    max_subagent_runtime_seconds: int | None = None,
     verifier_env: dict[str, str] | None = None,
     agent_env: dict[str, str] | None = None,
     command_runner: CommandRunner = _default_command_runner,
@@ -854,6 +872,8 @@ def run_local_parametric_memory_eval(
         context_reserve_tokens=context_reserve_tokens,
     )
     tool_result_prompt_cap = _optional_positive_int(tool_result_prompt_max_chars)
+    exec_timeout_cap = _optional_positive_int(exec_timeout_cap_seconds)
+    subagent_runtime = _optional_positive_int(max_subagent_runtime_seconds)
     timeout_value = _optional_positive_float(timeout_multiplier)
     agent_timeout_value = _optional_positive_float(agent_timeout_multiplier)
     solver_temperature_value = float(solver_temperature)
@@ -889,6 +909,8 @@ def run_local_parametric_memory_eval(
             solver_temperature=solver_temperature_value,
             vllm_generation_config=vllm_generation_config,
             tool_result_prompt_max_chars=tool_result_prompt_cap,
+            exec_timeout_cap_seconds=exec_timeout_cap,
+            max_subagent_runtime_seconds=subagent_runtime,
             verifier_env=effective_verifier_env,
             agent_env=effective_agent_env,
             artifact_path_guard=guard_mode,
@@ -921,6 +943,8 @@ def run_local_parametric_memory_eval(
         "solver_temperature": solver_temperature_value,
         "vllm_generation_config": vllm_generation_config,
         "tool_result_prompt_max_chars": tool_result_prompt_cap,
+        "exec_timeout_cap_seconds": exec_timeout_cap,
+        "max_subagent_runtime_seconds": subagent_runtime,
         "timeout_multiplier": timeout_value,
         "agent_timeout_multiplier": agent_timeout_value,
         "manage_server": manage_server,
@@ -1014,6 +1038,8 @@ def _run_local_parametric_condition(
     solver_temperature: float,
     vllm_generation_config: str,
     tool_result_prompt_max_chars: int | None,
+    exec_timeout_cap_seconds: int | None,
+    max_subagent_runtime_seconds: int | None,
     verifier_env: dict[str, str],
     agent_env: dict[str, str],
     artifact_path_guard: str,
@@ -1066,6 +1092,8 @@ def _run_local_parametric_condition(
                 context_reserve_tokens=context_reserve_tokens,
                 solver_temperature=solver_temperature,
                 tool_result_prompt_max_chars=tool_result_prompt_max_chars,
+                exec_timeout_cap_seconds=exec_timeout_cap_seconds,
+                max_subagent_runtime_seconds=max_subagent_runtime_seconds,
                 verifier_env=verifier_env,
                 agent_env=agent_env,
                 artifact_path_guard=artifact_path_guard,
@@ -1157,6 +1185,8 @@ def _run_local_parametric_task(
     context_reserve_tokens: int,
     solver_temperature: float,
     tool_result_prompt_max_chars: int | None,
+    exec_timeout_cap_seconds: int | None,
+    max_subagent_runtime_seconds: int | None,
     verifier_env: dict[str, str],
     agent_env: dict[str, str],
     artifact_path_guard: str,
@@ -1187,6 +1217,8 @@ def _run_local_parametric_task(
         context_reserve_tokens=context_reserve_tokens,
         solver_temperature=solver_temperature,
         tool_result_prompt_max_chars=tool_result_prompt_max_chars,
+        exec_timeout_cap_seconds=exec_timeout_cap_seconds,
+        max_subagent_runtime_seconds=max_subagent_runtime_seconds,
         artifact_path_guard=artifact_path_guard,
         required_artifact_paths=required_artifact_paths,
         agent_env=agent_env,
