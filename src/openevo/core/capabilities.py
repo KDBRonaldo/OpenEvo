@@ -44,7 +44,9 @@ class EvolutionMethodCapability(_CoreModel):
     artifact_type: ArtifactType
     visibility: MethodVisibility
     visible_in_desktop: bool = False
+    input_requirements: tuple[str, ...] = ()
     supported_execution_modes: tuple[ExecutionMode, ...]
+    default_config: dict[str, Any] = Field(default_factory=dict)
     config_schema: dict[str, Any] = Field(default_factory=lambda: {"type": "object"})
     stability_level: StabilityLevel = "stable"
 

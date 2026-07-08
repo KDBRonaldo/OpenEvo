@@ -175,10 +175,12 @@ Method metadata contract：
   "artifact_type": "text_memory",
   "visibility": "ordinary_user",
   "visible_in_desktop": true,
+  "input_requirements": ["dataset"],
   "supported_execution_modes": [
     "codex_subscription_transcript",
     "self-deployed"
   ],
+  "default_config": {},
   "config_schema": {"type": "object", "additionalProperties": true},
   "stability_level": "stable"
 }
@@ -190,6 +192,12 @@ Method metadata contract：
   `visible_in_desktop=true` 的方法。
 - `dev_kit`：Dev Kit 和研究/调试界面可发现；Desktop 默认隐藏。
 - `internal`：内部 plumbing 或暂不面向产品 surface 的方法。
+
+`input_requirements` 描述 method 运行前需要调用方准备的输入类别，例如 dataset reflector
+方法声明 `["dataset"]`，adapter 注册类 parametric method 声明 `["adapter"]`，纯 config/manual
+注册方法声明空列表。`default_config` 提供 UI 或 Dev Kit 创建 job 时可预填的 method config；
+例如 agent-system 产物默认写入 `{"target_path": "AGENTS.md"}`。`config_schema` 描述可编辑
+config 的 JSON schema，当前内置 baseline 至少提供 object schema，后续可逐步收紧。
 
 普通用户可见的非参数化 reflector 方法必须同时支持
 `codex_subscription_transcript` 和 `self-deployed`，这样 Desktop 可以在订阅 transcript
@@ -663,9 +671,9 @@ METHOD_REGISTRY["my_memory_method"] = my_memory_method
 
 3. 在 `METHOD_METADATA` 注册 capability metadata。metadata 的 key 必须等于
    `METHOD_REGISTRY` key，至少说明 `display_name`、`description`、`artifact_type`、
-   `visibility`、`visible_in_desktop`、`supported_execution_modes`、`config_schema` 和
-   `stability_level`。Desktop/Dev Kit 会通过 `openevo.core.capabilities` 读取这份 metadata，
-   不应再硬编码 method table。
+   `visibility`、`visible_in_desktop`、`input_requirements`、`supported_execution_modes`、
+   `default_config`、`config_schema` 和 `stability_level`。Desktop/Dev Kit 会通过
+   `openevo.core.capabilities` 读取这份 metadata，不应再硬编码 method table。
 
 4. 创建 job 时设置：
 
