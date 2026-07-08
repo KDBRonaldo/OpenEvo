@@ -1605,6 +1605,24 @@ never launched Harbor. The CLI now derives the default URL from
 `--server-port`; if `--server-url` is supplied explicitly, keep it aligned with
 the managed-server port.
 
+A current-runner pass@3 reproduction on GPU 7 at
+`/tmp/tb21-parametric-memory-qwen35-password-staticnode-shaped-v2-rerun-20260708/pass3-current-runner-gpu7`
+used the same shaped-v2 adapter, `Qwen/Qwen3.5-9B`, deterministic decoding,
+`--adapter-key-rewrite qwen3_5_vllm_language_model`,
+`max_output_tokens=512`, `context_reserve_tokens=512`, and
+`tool_result_prompt_max_chars=512`. The summary again recorded only
+`parametric_memory` enabled, with `text_memory`, `skill_bundle`, and
+`agent_system` disabled. Baseline rewards were `[0.0, 0.0, 0.0]`; parametric
+memory rewards were `[1.0, 1.0, 0.0]`. Thus baseline pass@1/pass@3 was `0/1`,
+parametric-memory pass@1/pass@3 was `1/1`, mean reward improved from `0.0` to
+`0.667`, and delta pass@1/pass@3 was `+1`. There were no Harbor exceptions in
+either condition, the treatment server loaded the rewritten LoRA with 64
+rewritten keys, and the passing treatment attempts emitted the intended
+`find varsea/disks` recovery command after `tb_read_task`. The one treatment
+failure still emitted the same command family but drifted over repeated
+attempts, so this is stronger single-task evidence for a real local
+parametric-memory gain, not a solved aggregate Terminal Bench 2.1 result.
+
 Two train-fasttext task-local Qwen3.5-9B milestone-sequence probes on 2026-07-08
 did not improve pass@1, but they clarified the next framework requirement. The
 first adapter was trained at
