@@ -560,6 +560,15 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     tb_task_local_parametric_job.add_argument(
+        "--include-tool-schema-lock",
+        action="store_true",
+        help=(
+            "Also export a short direct-solver record after tb_read_task whose "
+            "target is a complete tb_exec call. This is useful when local "
+            "adapters drift into malformed tool arguments."
+        ),
+    )
+    tb_task_local_parametric_job.add_argument(
         "--include-run-tests-correction",
         action="store_true",
         help=(
@@ -1641,6 +1650,7 @@ def _create_terminal_bench_task_local_parametric_memory_job(
             include_tb_exec_failure_correction=(
                 args.include_tb_exec_failure_correction
             ),
+            include_tool_schema_lock=args.include_tool_schema_lock,
         )
         selection_summary.append(
             {
@@ -1665,6 +1675,14 @@ def _create_terminal_bench_task_local_parametric_memory_job(
     task_suffix = "-".join(selected_task_ids)
     dataset_name = args.dataset_name or f"tb21-task-local-parametric-{task_suffix}"
     output_root = Path(args.output_root)
+    target_filters = {
+        "command_contains": list(args.command_contains),
+        "exclude_command_contains": list(args.exclude_command_contains),
+        "prompt_style": args.prompt_style,
+        "target_mode": args.target_mode,
+    }
+    if args.include_tool_schema_lock:
+        target_filters["include_tool_schema_lock"] = True
     payload = build_task_local_parametric_job_payload(
         records=records,
         output_root=output_root,
@@ -1675,12 +1693,7 @@ def _create_terminal_bench_task_local_parametric_memory_job(
         trainer_args=list(args.trainer_arg),
         trainer_timeout_seconds=args.trainer_timeout_seconds,
         task_ids=selected_task_ids,
-        target_filters={
-            "command_contains": list(args.command_contains),
-            "exclude_command_contains": list(args.exclude_command_contains),
-            "prompt_style": args.prompt_style,
-            "target_mode": args.target_mode,
-        },
+        target_filters=target_filters,
     )
     payload["trajectory_pool"] = str(Path(args.trajectory_pool))
     payload["selected_tasks"] = selected_task_ids
@@ -1690,6 +1703,7 @@ def _create_terminal_bench_task_local_parametric_memory_job(
     payload["prompt_style"] = args.prompt_style
     payload["target_mode"] = args.target_mode
     payload["target_exec_timeout_seconds"] = args.target_exec_timeout_seconds
+    payload["include_tool_schema_lock"] = args.include_tool_schema_lock
     payload["include_run_tests_correction"] = args.include_run_tests_correction
     payload["include_collect_result_correction"] = (
         args.include_collect_result_correction

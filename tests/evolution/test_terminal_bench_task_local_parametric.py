@@ -1457,6 +1457,170 @@ def test_build_task_local_sft_records_can_pin_target_exec_timeout(
     assert record["metadata"]["target_app_paths"] == ["/app/out.txt"]
 
 
+def test_build_task_local_sft_records_can_add_tool_schema_lock_record(
+    tmp_path: Path,
+) -> None:
+    failed_trial = tmp_path / "failed-trial"
+    successful_trial = tmp_path / "successful-trial"
+    (failed_trial / "agent").mkdir(parents=True)
+    (successful_trial / "agent").mkdir(parents=True)
+    (successful_trial / "agent" / "codex.txt").write_text(
+        json.dumps(
+            {
+                "type": "item.completed",
+                "item": {
+                    "type": "command_execution",
+                    "command": "printf solved > /app/out.txt",
+                    "aggregated_output": "ok",
+                    "exit_code": 0,
+                    "status": "completed",
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    selection = TaskLocalSelection(
+        task_id="gcode-to-text",
+        failed=[
+            TrajectoryPoolRow(
+                trajectory_id="failed",
+                task_id="gcode-to-text",
+                reward=0.0,
+                trial_dir=failed_trial,
+                raw={"prompt_summary": "Write /app/out.txt"},
+            )
+        ],
+        successful=[
+            TrajectoryPoolRow(
+                trajectory_id="success",
+                task_id="gcode-to-text",
+                reward=1.0,
+                trial_dir=successful_trial,
+                raw={},
+            )
+        ],
+        null_reward=[],
+    )
+
+    records = build_task_local_sft_records(
+        selection,
+        command_contains=["/app/out.txt"],
+        max_records=2,
+        prompt_style="live_replay",
+        target_exec_timeout_seconds=30,
+        include_tool_schema_lock=True,
+    )
+
+    assert len(records) == 2
+    schema_lock = records[1]
+    assert schema_lock["metadata"]["target_correction_stage"] == "tool_schema_lock"
+    assert schema_lock["metadata"]["prefix_source"] == "direct_solver_tool_schema_lock"
+    trace = schema_lock["traces"][0]
+    assert [message["role"] for message in trace["prompt_messages"]] == [
+        "system",
+        "user",
+        "assistant",
+        "tool",
+    ]
+    target_args = trace["response_messages"][0]["tool_calls"][0]["function"][
+        "arguments"
+    ]
+    assert target_args == {
+        "task_id": "terminal-bench-task",
+        "command": "printf solved > /app/out.txt",
+        "timeout_seconds": 30,
+    }
+
+
+def test_build_task_local_sft_records_can_add_sequence_tool_schema_lock_record(
+    tmp_path: Path,
+) -> None:
+    failed_trial = tmp_path / "failed-trial"
+    successful_trial = tmp_path / "successful-trial"
+    (failed_trial / "agent").mkdir(parents=True)
+    (successful_trial / "agent").mkdir(parents=True)
+    (successful_trial / "agent" / "codex.txt").write_text(
+        json.dumps(
+            {
+                "type": "item.completed",
+                "item": {
+                    "type": "command_execution",
+                    "command": "find data -maxdepth 1 -type f",
+                    "aggregated_output": "data/train.csv",
+                    "exit_code": 0,
+                    "status": "completed",
+                },
+            }
+        )
+        + "\n"
+        + json.dumps(
+            {
+                "type": "item.completed",
+                "item": {
+                    "type": "command_execution",
+                    "command": "printf solved > /app/out.txt",
+                    "aggregated_output": "",
+                    "exit_code": 0,
+                    "status": "completed",
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    selection = TaskLocalSelection(
+        task_id="gcode-to-text",
+        failed=[
+            TrajectoryPoolRow(
+                trajectory_id="failed",
+                task_id="gcode-to-text",
+                reward=0.0,
+                trial_dir=failed_trial,
+                raw={"prompt_summary": "Write /app/out.txt"},
+            )
+        ],
+        successful=[
+            TrajectoryPoolRow(
+                trajectory_id="success",
+                task_id="gcode-to-text",
+                reward=1.0,
+                trial_dir=successful_trial,
+                raw={},
+            )
+        ],
+        null_reward=[],
+    )
+
+    records = build_task_local_sft_records(
+        selection,
+        command_contains=["/app/out.txt"],
+        max_records=3,
+        target_mode="sequence",
+        target_exec_timeout_seconds=30,
+        include_tool_schema_lock=True,
+    )
+
+    assert [record["metadata"].get("target_sequence_index") for record in records] == [
+        0,
+        1,
+        None,
+    ]
+    schema_lock = records[2]
+    assert schema_lock["metadata"]["target_correction_stage"] == "tool_schema_lock"
+    assert schema_lock["metadata"]["target_command"] == "find data -maxdepth 1 -type f"
+    target_args = schema_lock["traces"][0]["response_messages"][0]["tool_calls"][0][
+        "function"
+    ]["arguments"]
+    assert target_args == {
+        "task_id": "terminal-bench-task",
+        "command": "find data -maxdepth 1 -type f",
+        "timeout_seconds": 30,
+    }
+
+
 def test_build_task_local_sft_records_can_add_run_tests_correction_prefix(
     tmp_path: Path,
 ) -> None:
@@ -2182,6 +2346,105 @@ def test_terminal_bench_task_local_parametric_memory_job_cli_accepts_target_exec
     assert manifest["target_filters"] == {
         "command_contains": ["/app/out.txt"],
         "exclude_command_contains": [],
+        "prompt_style": "direct_solver",
+        "target_mode": "final",
+    }
+
+
+def test_terminal_bench_task_local_parametric_memory_job_cli_accepts_tool_schema_lock(
+    tmp_path: Path,
+) -> None:
+    failed_trial = tmp_path / "failed-trial"
+    successful_trial = tmp_path / "successful-trial"
+    (failed_trial / "agent").mkdir(parents=True)
+    (successful_trial / "agent").mkdir(parents=True)
+    (successful_trial / "agent" / "codex.txt").write_text(
+        json.dumps(
+            {
+                "type": "item.completed",
+                "item": {
+                    "type": "command_execution",
+                    "command": "printf solved > /app/out.txt",
+                    "aggregated_output": "",
+                    "exit_code": 0,
+                    "status": "completed",
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    pool = tmp_path / "trajectory_pool.jsonl"
+    _write_pool(
+        pool,
+        [
+            {
+                "trajectory_id": "failed-1",
+                "task_id": "gcode-to-text",
+                "reward": 0.0,
+                "trial_dir": str(failed_trial),
+                "prompt_summary": "Write /app/out.txt.",
+            },
+            {
+                "trajectory_id": "success-1",
+                "task_id": "gcode-to-text",
+                "reward": 1.0,
+                "trial_dir": str(successful_trial),
+            },
+        ],
+    )
+
+    output = tmp_path / "job.json"
+    assert (
+        main(
+            [
+                "terminal-bench-task-local-parametric-memory-job",
+                "--trajectory-pool",
+                str(pool),
+                "--task-id",
+                "gcode-to-text",
+                "--output-root",
+                str(tmp_path / "out"),
+                "--trainer-command",
+                "python",
+                "--trainer-arg",
+                "train_lora.py",
+                "--trainer-arg",
+                "--train-file",
+                "--trainer-arg",
+                "{training_dataset}",
+                "--trainer-arg",
+                "--output-dir",
+                "--trainer-arg",
+                "{adapter_dir}",
+                "--command-contains",
+                "/app/out.txt",
+                "--target-exec-timeout-seconds",
+                "30",
+                "--include-tool-schema-lock",
+                "--output",
+                str(output),
+            ]
+        )
+        == 0
+    )
+
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    records = [
+        json.loads(line)
+        for line in Path(payload["dataset"]["records_path"]).read_text().splitlines()
+    ]
+    assert payload["include_tool_schema_lock"] is True
+    assert payload["dataset"]["record_count"] == 2
+    assert records[1]["metadata"]["target_correction_stage"] == "tool_schema_lock"
+    assert records[1]["metadata"]["tool_schema_lock"] is True
+    manifest = json.loads(
+        Path(payload["dataset"]["manifest_path"]).read_text(encoding="utf-8")
+    )
+    assert manifest["target_filters"] == {
+        "command_contains": ["/app/out.txt"],
+        "exclude_command_contains": [],
+        "include_tool_schema_lock": True,
         "prompt_style": "direct_solver",
         "target_mode": "final",
     }

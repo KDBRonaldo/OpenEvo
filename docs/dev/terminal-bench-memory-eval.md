@@ -359,7 +359,13 @@ preparation commands; sequence mode exports progressive next-command examples
 through the selected final target. Use `--target-exec-timeout-seconds` to pin a
 runtime-compatible optional `timeout_seconds` argument on each supervised
 `tb_exec` target when local tool-call models drift into malformed optional
-arguments. Use `--run-worker` only when the trainer is ready to run locally.
+arguments. Use `--include-tool-schema-lock` for local-inference adapters that
+still emit malformed `tb_exec` arguments after `tb_read_task`; it adds one short
+after-read-task record whose supervised target is a complete `tb_exec` call with
+`task_id`, `command`, and optional `timeout_seconds`. With `--target-mode
+sequence`, the schema-lock target is the first successful command in the
+sequence so the record shapes the first post-read-task action. Use
+`--run-worker` only when the trainer is ready to run locally.
 
 ```sh
 OPEN_EVO_REPO=/path/to/OpenEvo
@@ -1112,6 +1118,41 @@ arguments were captured as malformed `_raw_arguments` with an empty
 `train-fasttext` adapter an active but negative result: serving and key rewrite
 work, but task-local parametric memory still needs stronger tool-call schema
 shaping before it can be treated as a reliable backend.
+
+The follow-up framework change adds `--include-tool-schema-lock` to the
+task-local parametric-memory dataset builder. This keeps the existing sequence
+and correction records intact while adding a short after-`tb_read_task` example
+that targets a complete `tb_exec` argument object; it is intended for the
+malformed `_raw_arguments` failure mode above, not as a replacement for
+task-specific recipe records.
+
+The schema-lock train-fasttext follow-up used the same local Qwen3.5 setup and
+GPU 7. The dry projection at
+`/tmp/tb21-task-local-parametric-trainfasttext-schemalock-20260708/dryrun-sequence-schema-lock-max100`
+exported 69 records: 66 sequence records and 3 `tool_schema_lock` records. A
+mixed training payload at
+`/tmp/tb21-task-local-parametric-trainfasttext-schemalock-20260708/train-sequence-schema-lock-plus-tbexec-correction-r8-s180`
+added 4 existing `tb_exec_failure` correction records, for 73 records total.
+Training used `Qwen/Qwen3.5-9B`, LoRA `r=8`, alpha `16`, `max_length=4096`,
+and 180 steps on `CUDA_VISIBLE_DEVICES=7`. The adapter was written to
+`/tmp/tb21-task-local-parametric-trainfasttext-schemalock-20260708/train-sequence-schema-lock-plus-tbexec-correction-r8-s180/artifacts/workers/job-tb-parametric-memory-train-fasttext-sequence-schema-lock-tbexec-failure-r8-s180/parametric_memory_lora_sft/adapter`;
+trainer diagnostics recorded loss moving from `1.1006397008895874` to
+`0.05279954895377159`.
+
+The paired eval at
+`/tmp/tb21-task-local-parametric-trainfasttext-schemalock-20260708/eval-sequence-schema-lock-tbexec-r8-s180-tight1024-tool512`
+used the previous clean caps: `max_output_tokens=1024`,
+`context_reserve_tokens=1024`, `tool_result_prompt_max_chars=512`,
+`--adapter-key-rewrite qwen3_5_vllm_language_model`, and managed vLLM on GPU 7.
+The Harbor attempts completed, but the CLI runner did not write its normal
+summary because the parametric job-level result stayed running during eval
+teardown; `manual-summary.json` records the recovered result. Baseline pass@1
+was `0/1`; parametric-memory pass@1 was also `0/1`, so delta remained `0`.
+There were no maximum-context errors, no `_raw_arguments` failures, and no
+`task_id` tool-rejection errors in either condition. The treatment's first
+`tb_exec` was schema-clean and used `task_id=terminal-bench-task` with
+`timeout_seconds=300`; the remaining failure mode shifted to budget exhaustion
+after 31 schema-valid tool calls without producing `/app/model.bin`.
 
 The next fast-verifier task-local run used `gcode-to-text`, which has both
 failed and successful trajectory-pool records and a lightweight pytest

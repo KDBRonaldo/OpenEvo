@@ -278,6 +278,7 @@ def build_task_local_sft_records(
     include_run_tests_correction: bool = False,
     include_collect_result_correction: bool = False,
     include_tb_exec_failure_correction: bool = False,
+    include_tool_schema_lock: bool = False,
 ) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     if prompt_style not in _TASK_LOCAL_PROMPT_STYLES:
@@ -324,7 +325,10 @@ def build_task_local_sft_records(
 
             if target_mode == "sequence":
                 remaining_records = max_records - len(records)
-                start_index = max(0, len(commands) - remaining_records)
+                sequence_record_budget = remaining_records
+                if include_tool_schema_lock and remaining_records > 1:
+                    sequence_record_budget -= 1
+                start_index = max(0, len(commands) - sequence_record_budget)
                 for target_index in range(start_index, len(commands)):
                     command = commands[target_index]
                     if len(records) >= max_records:
@@ -343,6 +347,16 @@ def build_task_local_sft_records(
                             target_sequence_length=len(commands),
                         )
                     )
+                if include_tool_schema_lock and len(records) < max_records:
+                    records.append(
+                        _task_local_tool_schema_lock_record(
+                            selection=selection,
+                            failed=failed,
+                            successful=successful,
+                            command=commands[0],
+                            target_exec_timeout_seconds=target_exec_timeout_seconds,
+                        )
+                    )
             else:
                 command = _select_task_local_target_command(commands)
                 records.append(
@@ -356,6 +370,16 @@ def build_task_local_sft_records(
                         target_exec_timeout_seconds=target_exec_timeout_seconds,
                     )
                 )
+                if include_tool_schema_lock and len(records) < max_records:
+                    records.append(
+                        _task_local_tool_schema_lock_record(
+                            selection=selection,
+                            failed=failed,
+                            successful=successful,
+                            command=command,
+                            target_exec_timeout_seconds=target_exec_timeout_seconds,
+                        )
+                    )
                 if include_tb_exec_failure_correction and len(records) < max_records:
                     correction_record = _task_local_tb_exec_failure_correction_record(
                         selection=selection,
@@ -668,6 +692,33 @@ def _task_local_sft_record(
         ],
         "metadata": metadata,
     }
+
+
+def _task_local_tool_schema_lock_record(
+    *,
+    selection: TaskLocalSelection,
+    failed: TrajectoryPoolRow,
+    successful: TrajectoryPoolRow,
+    command: CodexCommandEvent,
+    target_exec_timeout_seconds: int | None,
+) -> dict[str, Any]:
+    return _task_local_sft_record(
+        selection=selection,
+        failed=failed,
+        successful=successful,
+        command=command,
+        prompt_style="direct_solver",
+        target_mode="final",
+        target_exec_timeout_seconds=target_exec_timeout_seconds,
+        prompt_messages_override=_task_local_direct_solver_prefix_messages(
+            failed=failed,
+            successful=successful,
+        ),
+        prefix_source_override="direct_solver_tool_schema_lock",
+        target_correction_stage="tool_schema_lock",
+        metadata_overrides={"tool_schema_lock": True},
+        event_id_suffix=":tool-schema-lock",
+    )
 
 
 def _task_local_tb_exec_failure_correction_record(
