@@ -849,6 +849,47 @@ it needs shorter staged targets, more local correction points, or an explicit
 finish-policy/objective stage that keeps action generation alive after
 `tb_read_task`.
 
+A staged-target experiment then tested that direction without changing the
+framework. The dry-run at
+`/tmp/tb21-task-local-parametric-trainfasttext-staged-20260708/dryrun-install-sequence`
+used the same three local Qwen failures plus one Codex success, but switched to
+`--target-mode sequence`, required the successful trajectory to reach
+`python -m pip install fasttext`, and excluded the earlier `rg --files`
+exploration command that is brittle in the live container. It exported 21
+records: each failed local prefix contributed seven short targets, starting
+with data/environment inspection and ending at fastText installation. All
+records used `live_replay_llm_call:2`, and the target commands were much
+shorter than the previous 755-character final training command.
+
+Training at
+`/tmp/tb21-task-local-parametric-trainfasttext-staged-20260708/train-trainfasttext-qwen35-install-sequence-r8-s100`
+used Qwen3.5-9B on GPU 6 with LoRA rank 8, alpha 16, max length 4096, and
+100 SFT steps. The registered artifact was
+`tb-parametric-memory-trainfasttext-install-sequence-r8-s100` with
+`training_record_count=21`; diagnostics recorded losses moving from about
+`1.10`, `0.65`, `0.67` to the `1e-5` to `2e-4` range. The paired eval at
+`/tmp/tb21-task-local-parametric-trainfasttext-staged-20260708/eval-trainfasttext-qwen35-install-sequence-r8-s100`
+used the clean Terminal-Bench/EvoLab package PR #34, managed Qwen3.5-9B vLLM
+on GPU 6 and port 8015, deterministic decoding,
+`--context-window-tokens 32768`, and no artifact-path guard. Only
+`parametric_memory` was enabled. The official summary still scored baseline
+pass@1/pass@k `0/1`, parametric-memory pass@1/pass@k `0/1`, delta `0`, with no
+Harbor exceptions. LoRA serving was enabled only for treatment, and GPU 6 plus
+port 8015 were released after the run.
+
+Although this did not improve reward, it is a stronger method diagnostic than
+the previous local-live final-command run. Baseline executed 18 `tb_exec` calls
+and failed by budget; treatment executed 26 `tb_exec` calls and also failed by
+budget. The important difference is that the prior treatment read the task and
+immediately returned `empty_model_response`, while the staged adapter kept
+action generation alive and produced many fastText-related commands. This
+supports the staged-target direction, but the current bootstrap stage stops too
+early in the solve process: it restores exploration/install behavior without
+teaching a reliable final model-training and `/app/model.bin` production stage.
+The next method iteration should extend the sequence through verified local
+training and add correction records around failed package/model commands, rather
+than only training the bootstrap install segment.
+
 The next fast-verifier task-local run used `gcode-to-text`, which has both
 failed and successful trajectory-pool records and a lightweight pytest
 verifier. The dry projection at
