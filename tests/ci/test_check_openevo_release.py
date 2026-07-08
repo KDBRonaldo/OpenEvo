@@ -188,6 +188,24 @@ def test_desktop_science_release_doc_matches_remote_lifecycle_state() -> None:
     assert "`GET /openevo-api/desktop/run/artifacts`" in text
 
 
+def test_readme_release_checklist_matches_frontend_audit_gate() -> None:
+    readme = Path("README.md")
+
+    text = readme.read_text(encoding="utf-8")
+
+    assert "Node 22" in text
+    assert "npm ci" in text
+    assert "npm audit --audit-level=high" in text
+    assert text.index("npm ci") < text.index("npm audit --audit-level=high")
+    assert text.index("npm audit --audit-level=high") < text.index(
+        "npm test -- --run"
+    )
+    assert (
+        ".openevo-wheel-smoke/bin/python "
+        "scripts/ci/smoke_openevo_desktop_wheel.py"
+    ) in text
+
+
 def _write_wheel(
     path: Path,
     *,

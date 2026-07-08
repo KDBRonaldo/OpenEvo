@@ -293,11 +293,13 @@ ssh` when those entrypoints should mutate a remote server.
 Release wheels are built from the OpenEvo package metadata and include the
 packaged OpenEvo-only Desktop assets under `openevo/desktop/web/`.
 
-Before publishing a wheel, refresh and validate the packaged Desktop assets:
+Before publishing a wheel, run the release smoke flow on Node 22, refresh the
+packaged Desktop assets, and validate the installed wheel:
 
 ```bash
 cd web
 npm ci
+npm audit --audit-level=high
 npm test -- --run
 npm run build:openevo
 cd ..
@@ -310,6 +312,7 @@ python -m venv .openevo-wheel-smoke
 .openevo-wheel-smoke/bin/openevo --help
 .openevo-wheel-smoke/bin/openevo desktop --help
 .openevo-wheel-smoke/bin/openevo desktop open --help
+.openevo-wheel-smoke/bin/python scripts/ci/smoke_openevo_desktop_wheel.py
 ```
 
 For the focused OpenEvo Python regression check used by CI:
