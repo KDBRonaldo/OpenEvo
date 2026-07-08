@@ -1505,6 +1505,30 @@ single-task official-verifier evidence for correction-aware local parametric
 memory plus the same execution guard, not as a clean finish-policy result or a
 Terminal Bench 2.1 aggregate claim.
 
+A current-runner pass@3 reproduction on GPU 7 at
+`/tmp/tb21-task-local-parametric-gcode-local-correction-20260708/pass3-current-runner-gpu7`
+used the same correction-aware adapter, `Qwen/Qwen3.5-9B`, deterministic
+decoding, `--vllm-generation-config vllm`, 32k serving context,
+`max_output_tokens=1024`, `context_reserve_tokens=1024`,
+`tool_result_prompt_max_chars=1024`, `--adapter-key-rewrite
+qwen3_5_vllm_language_model`, `--artifact-path-guard repair`, and
+`--required-artifact-path /app/out.txt`. The summary recorded only
+`parametric_memory` enabled, with `text_memory`, `skill_bundle`, and
+`agent_system` disabled. Baseline rewards were `[0.0, 0.0, 0.0]`; parametric
+memory rewards were `[1.0, 1.0, 1.0]`. Thus baseline pass@1/pass@3 was `0/1`,
+parametric-memory pass@1/pass@3 was `1/1`, mean reward improved from `0.0` to
+`1.0`, and delta pass@1/pass@3 was `+1`. The treatment server command included
+`--enable-lora` and loaded
+`tb-parametric-memory-gcode-local-correction-r8-s120`; the summary recorded 64
+rewritten LoRA keys. The shared artifact-path guard recorded seven treatment
+repairs with `normalize_required_artifact_printf_write`. The treatment trials
+are official-verifier positive but still not perfectly clean finish-policy
+traces: later tool calls in two attempts failed after the required artifact had
+already been written, while the official verifier passed because `/app/out.txt`
+was present and correct. Baseline runtime was dominated by slow verifier apt
+downloads, so use the reward/pass metrics rather than wall-clock as the
+controlled comparison signal.
+
 For `password-recovery`, a Qwen3.5-9B local LoRA smoke was trained from the
 existing failed/successful tool-policy trajectory at
 `/tmp/tb21-parametric-memory-password-toolpolicy-20260702-110343/local-eval-password-toolpolicy-2048/baseline/harbor_jobs/baseline-password-recovery/password-recovery__AzMbthq`.
@@ -1622,6 +1646,19 @@ rewritten keys, and the passing treatment attempts emitted the intended
 failure still emitted the same command family but drifted over repeated
 attempts, so this is stronger single-task evidence for a real local
 parametric-memory gain, not a solved aggregate Terminal Bench 2.1 result.
+
+Across the two current-runner Qwen3.5 controlled pass@3 reproductions above,
+both tasks kept only `parametric_memory` enabled and disabled `text_memory`,
+`skill_bundle`, and `agent_system`. `gcode-to-text` moved from baseline
+`[0.0, 0.0, 0.0]` to parametric `[1.0, 1.0, 1.0]`, so mean reward delta was
+`+1.0` and pass@1/pass@3 delta was `+1`. `password-recovery` moved from
+baseline `[0.0, 0.0, 0.0]` to parametric `[1.0, 1.0, 0.0]`, so mean reward
+delta was about `+0.667` and pass@1/pass@3 delta was `+1`. This is the current
+best controlled evidence that local parametric memory can improve selected
+Terminal Bench 2.1 tasks under fixed non-memory evolution variables. It is not
+yet a full-benchmark gain estimate; the negative `train-fasttext` probes below
+show that task-local parametric memory still needs better method design and
+runtime control before aggregate claims are justified.
 
 Two train-fasttext task-local Qwen3.5-9B milestone-sequence probes on 2026-07-08
 did not improve pass@1, but they clarified the next framework requirement. The
