@@ -537,6 +537,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=16,
     )
     tb_task_local_parametric_job.add_argument(
+        "--target-repeat",
+        type=int,
+        default=1,
+        help=(
+            "Repeat the selected final tb_exec target this many times in the "
+            "task-local SFT dataset. Only supported with --target-mode final."
+        ),
+    )
+    tb_task_local_parametric_job.add_argument(
         "--prompt-style",
         choices=["direct_solver", "live_replay", "synthetic_correction"],
         default="direct_solver",
@@ -1700,6 +1709,7 @@ def _create_terminal_bench_task_local_parametric_memory_job(
             exclude_command_contains=list(args.exclude_command_contains),
             target_command=args.target_command,
             max_records=args.max_records_per_task,
+            target_repeat=args.target_repeat,
             prompt_style=args.prompt_style,
             target_mode=args.target_mode,
             target_exec_timeout_seconds=args.target_exec_timeout_seconds,
@@ -1741,6 +1751,8 @@ def _create_terminal_bench_task_local_parametric_memory_job(
     }
     if args.target_command:
         target_filters["target_command"] = args.target_command
+    if args.target_repeat != 1:
+        target_filters["target_repeat"] = args.target_repeat
     if args.include_tool_schema_lock:
         target_filters["include_tool_schema_lock"] = True
     payload = build_task_local_parametric_job_payload(
@@ -1761,6 +1773,7 @@ def _create_terminal_bench_task_local_parametric_memory_job(
     payload["command_contains"] = list(args.command_contains)
     payload["exclude_command_contains"] = list(args.exclude_command_contains)
     payload["target_command"] = args.target_command
+    payload["target_repeat"] = args.target_repeat
     payload["prompt_style"] = args.prompt_style
     payload["target_mode"] = args.target_mode
     payload["target_exec_timeout_seconds"] = args.target_exec_timeout_seconds

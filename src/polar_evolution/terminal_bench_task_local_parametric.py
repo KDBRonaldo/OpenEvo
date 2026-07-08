@@ -273,6 +273,7 @@ def build_task_local_sft_records(
     exclude_command_contains: list[str] | None = None,
     target_command: str | None = None,
     max_records: int = 16,
+    target_repeat: int = 1,
     prompt_style: str = "direct_solver",
     target_mode: str = "final",
     target_exec_timeout_seconds: int | None = None,
@@ -292,6 +293,10 @@ def build_task_local_sft_records(
     manual_target_command = target_command.strip() if target_command else None
     if manual_target_command and target_mode != "final":
         raise ValueError("target_command is only supported with target_mode=final")
+    if target_repeat <= 0:
+        raise ValueError("target_repeat must be positive")
+    if target_repeat > 1 and target_mode != "final":
+        raise ValueError("target_repeat is only supported with target_mode=final")
     if target_exec_timeout_seconds is not None and target_exec_timeout_seconds <= 0:
         raise ValueError("target_exec_timeout_seconds must be positive")
     if include_run_tests_correction and target_mode != "final":
@@ -373,17 +378,30 @@ def build_task_local_sft_records(
                     )
             else:
                 command = _select_task_local_target_command(commands)
-                records.append(
-                    _task_local_sft_record(
-                        selection=selection,
-                        failed=failed,
-                        successful=successful,
-                        command=command,
-                        prompt_style=prompt_style,
-                        target_mode=target_mode,
-                        target_exec_timeout_seconds=target_exec_timeout_seconds,
+                for repeat_index in range(target_repeat):
+                    if len(records) >= max_records:
+                        break
+                    repeat_metadata = None
+                    repeat_suffix = ""
+                    if target_repeat > 1:
+                        repeat_metadata = {
+                            "target_repeat_index": repeat_index,
+                            "target_repeat_count": target_repeat,
+                        }
+                        repeat_suffix = f":target-repeat:{repeat_index}"
+                    records.append(
+                        _task_local_sft_record(
+                            selection=selection,
+                            failed=failed,
+                            successful=successful,
+                            command=command,
+                            prompt_style=prompt_style,
+                            target_mode=target_mode,
+                            target_exec_timeout_seconds=target_exec_timeout_seconds,
+                            metadata_overrides=repeat_metadata,
+                            event_id_suffix=repeat_suffix,
+                        )
                     )
-                )
                 if include_tool_schema_lock and len(records) < max_records:
                     records.append(
                         _task_local_tool_schema_lock_record(

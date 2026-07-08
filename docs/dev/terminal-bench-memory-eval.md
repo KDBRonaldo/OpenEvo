@@ -370,6 +370,11 @@ after-read-task record whose supervised target is a complete `tb_exec` call with
 `task_id`, `command`, and optional `timeout_seconds`. With `--target-mode
 sequence`, the schema-lock target is the first successful command in the
 sequence so the record shapes the first post-read-task action. Use
+`--target-repeat N` with `--target-mode final` when a manually audited final
+target needs extra SFT weight, for example exact literal file writes that are
+otherwise easy for a small local adapter to copy with casing or quoting drift.
+Repeated records keep the same supervised `tb_exec` target and record
+`target_repeat_index` / `target_repeat_count` in metadata for auditability. Use
 `--run-worker` only when the trainer is ready to run locally.
 
 ```sh

@@ -2555,6 +2555,157 @@ def test_terminal_bench_task_local_parametric_memory_job_cli_accepts_manual_targ
     }
 
 
+def test_build_task_local_sft_records_can_repeat_manual_final_target(
+    tmp_path: Path,
+) -> None:
+    failed_trial = tmp_path / "failed-trial"
+    successful_trial = tmp_path / "successful-trial"
+    (failed_trial / "agent").mkdir(parents=True)
+    (successful_trial / "agent").mkdir(parents=True)
+    selection = TaskLocalSelection(
+        task_id="vulnerable-secret",
+        failed=[
+            TrajectoryPoolRow(
+                trajectory_id="failed-1",
+                task_id="vulnerable-secret",
+                reward=0.0,
+                trial_dir=failed_trial,
+                raw={"prompt_summary": "Write /app/results.txt."},
+            )
+        ],
+        successful=[
+            TrajectoryPoolRow(
+                trajectory_id="success-1",
+                task_id="vulnerable-secret",
+                reward=1.0,
+                trial_dir=successful_trial,
+                raw={},
+            )
+        ],
+        null_reward=[],
+    )
+
+    target_command = (
+        "printf 'FLAG{b4ff3r_0v3rfl0w_m4st3r_k3y_2024}\\n' > /app/results.txt"
+    )
+    records = build_task_local_sft_records(
+        selection,
+        target_command=target_command,
+        max_records=3,
+        target_repeat=3,
+    )
+
+    assert len(records) == 3
+    assert [record["metadata"]["target_repeat_index"] for record in records] == [
+        0,
+        1,
+        2,
+    ]
+    assert [record["metadata"]["target_repeat_count"] for record in records] == [
+        3,
+        3,
+        3,
+    ]
+    assert len({record["event_id"] for record in records}) == 3
+    assert {
+        record["traces"][0]["response_messages"][-1]["tool_calls"][0]["function"][
+            "arguments"
+        ]["command"]
+        for record in records
+    } == {target_command}
+
+
+def test_terminal_bench_task_local_parametric_memory_job_cli_accepts_target_repeat(
+    tmp_path: Path,
+) -> None:
+    failed_trial = tmp_path / "failed-trial"
+    successful_trial = tmp_path / "successful-trial"
+    (failed_trial / "agent").mkdir(parents=True)
+    (successful_trial / "agent").mkdir(parents=True)
+    pool = tmp_path / "trajectory_pool.jsonl"
+    _write_pool(
+        pool,
+        [
+            {
+                "trajectory_id": "failed-1",
+                "task_id": "vulnerable-secret",
+                "reward": 0.0,
+                "trial_dir": str(failed_trial),
+                "prompt_summary": "Write /app/results.txt.",
+            },
+            {
+                "trajectory_id": "success-1",
+                "task_id": "vulnerable-secret",
+                "reward": 1.0,
+                "trial_dir": str(successful_trial),
+            },
+        ],
+    )
+
+    target_command = (
+        "printf 'FLAG{b4ff3r_0v3rfl0w_m4st3r_k3y_2024}\\n' > /app/results.txt"
+    )
+    output = tmp_path / "job.json"
+    assert (
+        main(
+            [
+                "terminal-bench-task-local-parametric-memory-job",
+                "--trajectory-pool",
+                str(pool),
+                "--task-id",
+                "vulnerable-secret",
+                "--output-root",
+                str(tmp_path / "out"),
+                "--trainer-command",
+                "python",
+                "--trainer-arg",
+                "train_lora.py",
+                "--trainer-arg",
+                "--train-file",
+                "--trainer-arg",
+                "{training_dataset}",
+                "--trainer-arg",
+                "--output-dir",
+                "--trainer-arg",
+                "{adapter_dir}",
+                "--target-command",
+                target_command,
+                "--target-repeat",
+                "3",
+                "--max-records-per-task",
+                "3",
+                "--output",
+                str(output),
+            ]
+        )
+        == 0
+    )
+
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    records = [
+        json.loads(line)
+        for line in Path(payload["dataset"]["records_path"]).read_text().splitlines()
+    ]
+    assert payload["target_repeat"] == 3
+    assert payload["dataset"]["record_count"] == 3
+    assert [record["metadata"]["target_repeat_index"] for record in records] == [
+        0,
+        1,
+        2,
+    ]
+    manifest = json.loads(
+        Path(payload["dataset"]["manifest_path"]).read_text(encoding="utf-8")
+    )
+    assert manifest["target_filters"] == {
+        "command_contains": [],
+        "exclude_command_contains": [],
+        "prompt_style": "direct_solver",
+        "target_command": target_command,
+        "target_mode": "final",
+        "target_repeat": 3,
+    }
+
+
 def test_terminal_bench_task_local_parametric_memory_job_cli_accepts_run_tests_correction(
     tmp_path: Path,
 ) -> None:
