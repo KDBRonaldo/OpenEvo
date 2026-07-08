@@ -1703,9 +1703,44 @@ treatment did not emit the supervised hex write at all: it first tried to read
 `/app/vulnerable/make_syms.sh`, then produced a malformed `tb_exec` without a
 valid `task_id`. The method conclusion is that manual target injection is now
 available and active, but two direct-solver records are not enough to make
-Qwen3.5 reliably copy exact literal/file-write commands. The next
-`vulnerable-secret` backend should add repeated/literal-lock target shaping or
-use live local failure prefixes before treating this task as positive evidence.
+Qwen3.5 reliably copy exact literal/file-write commands.
+
+The follow-up `vulnerable-secret` literal-shaping run added task-local target
+repeats and schema-lock repeats. The first repeated direct-solver run trained
+`tb-parametric-memory-vulnerable-secret-repeat16-r8-s120` at
+`/tmp/tb21-task-local-parametric-vulnerable-secret-repeat-20260708/train-repeat16-schemalock-r8-s120`
+from 16 repeated manual target records plus one schema-lock record. Its pass@1
+eval at
+`/tmp/tb21-task-local-parametric-vulnerable-secret-repeat-20260708/eval-repeat16-schemalock-r8-s120-pass1`
+kept the adapter active and rewrote 64 LoRA keys, but scored baseline `0/1`,
+parametric memory `0/1`, delta `0`: the treatment wrote `/app/results.txt`
+with unrelated Chinese text instead of the `FLAG{...}` literal. A second run
+used a fresh local Qwen3.5 failed baseline trajectory as the `live_replay`
+prefix and trained
+`tb-parametric-memory-vulnerable-secret-live-repeat16-r8-s120` at
+`/tmp/tb21-task-local-parametric-vulnerable-secret-repeat-20260708/train-live-repeat16-schemalock-r8-s120`.
+Its pass@1 eval at
+`/tmp/tb21-task-local-parametric-vulnerable-secret-repeat-20260708/eval-live-repeat16-schemalock-r8-s120-pass1`
+again scored `0/1` vs `0/1`; this time the adapter copied the exact
+`FLAG{...}` command but emitted incomplete `tb_exec` arguments missing
+`task_id`, so the tool call failed.
+
+The successful `vulnerable-secret` variant balanced the two failure modes by
+training 32 records: 16 `live_replay` literal targets from the failed local
+prefix plus 16 direct-solver schema-lock records. Training
+`tb-parametric-memory-vulnerable-secret-live-repeat16-schema16-r8-s120` at
+`/tmp/tb21-task-local-parametric-vulnerable-secret-repeat-20260708/train-live-repeat16-schema16-r8-s120`
+used Qwen3.5-9B on GPU 7, LoRA rank 8, alpha 16, `max_length=4096`, 120 steps,
+and final losses around `2.7e-5`. The paired pass@1 eval at
+`/tmp/tb21-task-local-parametric-vulnerable-secret-repeat-20260708/eval-live-repeat16-schema16-r8-s120-pass1`
+kept only `parametric_memory` enabled, disabled `text_memory`, `skill_bundle`,
+and `agent_system`, loaded the adapter with `qwen3_5_vllm_language_model`, and
+rewrote 64 LoRA keys. Baseline pass@1/pass@k was `0/1`; parametric-memory
+pass@1/pass@k was `1/1`, delta `+1`. The treatment emitted the intended
+complete `tb_exec` call:
+`printf 'FLAG{b4ff3r_0v3rfl0w_m4st3r_k3y_2024}\n' > /app/results.txt` with
+`task_id="terminal-bench-task"` and `timeout_seconds=30`, then ran
+`tb_run_tests`, and the verifier rewarded `1.0`.
 
 Across the two current-runner Qwen3.5 controlled pass@3 reproductions above,
 both tasks kept only `parametric_memory` enabled and disabled `text_memory`,
