@@ -949,11 +949,14 @@ This is an important method boundary. Replacing the failed pool row with a
 more informative active-adapter failure is not enough under the current
 `live_replay` semantics: the backend still trains from the first post-read-task
 action point and does not directly condition on the actual failed package,
-normalization, or model-training commands. The next framework change should add
-a `tb_exec` failure-correction stage analogous to the existing
-`tb_run_tests`/`tb_collect_result` correction records, selecting later failed
-tool results from the local trajectory and targeting the corresponding
-successful recovery or next model-production command.
+normalization, or model-training commands. The framework now exposes this
+missing stage as `--include-tb-exec-failure-correction`, analogous to the
+existing `tb_run_tests`/`tb_collect_result` correction records. It selects later
+failed `tb_exec` tool results from the local trajectory, preserves the live
+prefix through the concrete failed command output, and targets the selected
+successful final `tb_exec` command. It is intentionally final-target-only for
+now; per-failure alignment to intermediate recovery commands remains a future
+method extension.
 
 For `train-fasttext__R86vp3U`, the failed-tool evidence gives a concrete
 contract for that stage. The treatment had 26 `tb_exec` artifacts: 17 with
@@ -968,7 +971,7 @@ failed with an unterminated here-document string. A useful
 input contains a failed `tb_exec` tool result, preserve the compact live replay
 prefix through that failed result, and target the next successful recovery or
 model-production `tb_exec` from the successful Codex sequence. The metadata
-should expose at least `target_correction_stage="tb_exec_failure"`,
+now exposes `target_correction_stage="tb_exec_failure"`,
 `failed_tool_name="tb_exec"`, `failed_exit_code`, `failed_tool_index`, and a
 small normalized failure flag list such as `syntax`, `traceback`,
 `fasttext`, `parquet`, or `model_bin`. This is the missing dataset shape for

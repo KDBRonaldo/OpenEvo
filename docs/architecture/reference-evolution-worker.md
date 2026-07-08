@@ -590,6 +590,15 @@ when the failed trajectory first collects the verifier failure through
 failed verifier result after collection, then supervises the selected
 successful `tb_exec`; it is intended to train repair instead of premature
 reporting after a failed collected result.
+Use `--include-tb-exec-failure-correction` with the same prompt and target mode
+when the failed trajectory contains a failed `tb_exec` result before verifier
+collection. This adds a correction record whose prefix includes the actual
+failed command output, then supervises the selected successful `tb_exec`.
+Records are tagged with `target_correction_stage="tb_exec_failure"` and include
+the failed tool name, 1-based input-message index, available exit code, and
+normalized failure flags such as `syntax`, `traceback`, `fasttext`, `parquet`,
+`model_bin`, and `timeout`. This is a final-target correction stage only; it
+does not change `--target-mode sequence` command alignment.
 Use `--target-mode sequence` when the successful trajectory is a recipe whose
 later write command depends on earlier dependency installation, data
 preparation, or intermediate files. Sequence mode emits progressive

@@ -277,6 +277,7 @@ def build_task_local_sft_records(
     target_exec_timeout_seconds: int | None = None,
     include_run_tests_correction: bool = False,
     include_collect_result_correction: bool = False,
+    include_tb_exec_failure_correction: bool = False,
 ) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     if prompt_style not in _TASK_LOCAL_PROMPT_STYLES:
@@ -295,6 +296,11 @@ def build_task_local_sft_records(
     if include_collect_result_correction and target_mode != "final":
         raise ValueError(
             "include_collect_result_correction is only supported with target_mode=final"
+        )
+    if include_tb_exec_failure_correction and target_mode != "final":
+        raise ValueError(
+            "include_tb_exec_failure_correction is only supported with "
+            "target_mode=final"
         )
     for failed in selection.failed:
         if len(records) >= max_records:
@@ -350,6 +356,18 @@ def build_task_local_sft_records(
                         target_exec_timeout_seconds=target_exec_timeout_seconds,
                     )
                 )
+                if include_tb_exec_failure_correction and len(records) < max_records:
+                    correction_record = _task_local_tb_exec_failure_correction_record(
+                        selection=selection,
+                        failed=failed,
+                        successful=successful,
+                        command=command,
+                        prompt_style=prompt_style,
+                        target_mode=target_mode,
+                        target_exec_timeout_seconds=target_exec_timeout_seconds,
+                    )
+                    if correction_record is not None:
+                        records.append(correction_record)
                 if include_run_tests_correction and len(records) < max_records:
                     correction_record = _task_local_run_tests_correction_record(
                         selection=selection,
@@ -555,6 +573,7 @@ def _task_local_sft_record(
     prompt_messages_override: list[dict[str, Any]] | None = None,
     prefix_source_override: str | None = None,
     target_correction_stage: str | None = None,
+    metadata_overrides: dict[str, Any] | None = None,
     event_id_suffix: str = "",
 ) -> dict[str, Any]:
     if prompt_messages_override is not None:
@@ -628,6 +647,8 @@ def _task_local_sft_record(
         metadata["target_sequence_length"] = target_sequence_length
     if target_correction_stage is not None:
         metadata["target_correction_stage"] = target_correction_stage
+    if metadata_overrides is not None:
+        metadata.update(metadata_overrides)
     return {
         "event_id": (
             f"task-local-parametric:{selection.task_id}:"
@@ -647,6 +668,42 @@ def _task_local_sft_record(
         ],
         "metadata": metadata,
     }
+
+
+def _task_local_tb_exec_failure_correction_record(
+    *,
+    selection: TaskLocalSelection,
+    failed: TrajectoryPoolRow,
+    successful: TrajectoryPoolRow,
+    command: CodexCommandEvent,
+    prompt_style: str,
+    target_mode: str,
+    target_exec_timeout_seconds: int | None,
+) -> dict[str, Any] | None:
+    if prompt_style != "live_replay" or target_mode != "final":
+        return None
+    correction_prefix = _task_local_tb_exec_failure_correction_prefix(
+        failed.trial_dir
+    )
+    if correction_prefix is None:
+        return None
+    prompt_messages, call_index, failed_tool_metadata = correction_prefix
+    return _task_local_sft_record(
+        selection=selection,
+        failed=failed,
+        successful=successful,
+        command=command,
+        prompt_style=prompt_style,
+        target_mode=target_mode,
+        target_exec_timeout_seconds=target_exec_timeout_seconds,
+        prompt_messages_override=prompt_messages,
+        prefix_source_override=(
+            f"live_replay_tb_exec_failure_correction_llm_call:{call_index}"
+        ),
+        target_correction_stage="tb_exec_failure",
+        metadata_overrides=failed_tool_metadata,
+        event_id_suffix=f":tb-exec-failure-correction:{call_index}",
+    )
 
 
 def _task_local_run_tests_correction_record(
@@ -1015,6 +1072,37 @@ def _task_local_collect_result_correction_prefix(
     return None
 
 
+def _task_local_tb_exec_failure_correction_prefix(
+    trial_dir: Path,
+) -> tuple[list[dict[str, Any]], int, dict[str, Any]] | None:
+    calls_path = _trial_evolab_llm_calls(trial_dir)
+    if not calls_path.is_file():
+        return None
+    for call_index, line in enumerate(
+        calls_path.read_text(encoding="utf-8", errors="replace").splitlines(),
+        start=1,
+    ):
+        if not line.strip():
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        raw_input_messages = payload.get("input_messages")
+        failed_metadata = _first_failed_tool_result_metadata(
+            raw_input_messages,
+            "tb_exec",
+        )
+        if failed_metadata is None:
+            continue
+        input_messages = _compact_live_replay_messages(raw_input_messages)
+        if input_messages:
+            return input_messages, call_index, failed_metadata
+    return None
+
+
 def _input_messages_have_failed_run_tests_result(value: Any) -> bool:
     return _input_messages_have_failed_tool_result(value, "tb_run_tests")
 
@@ -1034,6 +1122,35 @@ def _input_messages_have_failed_tool_result(value: Any, tool_name: str) -> bool:
     return False
 
 
+def _first_failed_tool_result_metadata(
+    value: Any,
+    tool_name: str,
+) -> dict[str, Any] | None:
+    if not isinstance(value, list):
+        return None
+    for message_index, message in enumerate(value, start=1):
+        if not isinstance(message, dict):
+            continue
+        if message.get("role") != "tool":
+            continue
+        if _tool_result_name(message) != tool_name:
+            continue
+        if not _tool_result_indicates_failure(message):
+            continue
+        metadata: dict[str, Any] = {
+            "failed_tool_name": tool_name,
+            "failed_tool_index": message_index,
+        }
+        exit_code = _tool_result_exit_code(message)
+        if exit_code is not None:
+            metadata["failed_exit_code"] = exit_code
+        failure_flags = _tool_result_failure_flags(message)
+        if failure_flags:
+            metadata["failed_tool_failure_flags"] = failure_flags
+        return metadata
+    return None
+
+
 def _tool_result_name(message: dict[str, Any]) -> str | None:
     name = message.get("name")
     if isinstance(name, str) and name.strip():
@@ -1051,6 +1168,56 @@ def _tool_result_indicates_failure(message: dict[str, Any]) -> bool:
         if _payload_indicates_failure(payload):
             return True
     return False
+
+
+def _tool_result_exit_code(message: dict[str, Any]) -> int | None:
+    for payload in _tool_result_payloads(message):
+        exit_code = _payload_exit_code(payload)
+        if exit_code is not None:
+            return exit_code
+    return None
+
+
+def _payload_exit_code(payload: dict[str, Any]) -> int | None:
+    exit_code = payload.get("exit_code")
+    if isinstance(exit_code, bool):
+        return None
+    if isinstance(exit_code, int):
+        return exit_code
+    if isinstance(exit_code, float) and exit_code.is_integer():
+        return int(exit_code)
+    result = payload.get("result")
+    if isinstance(result, dict):
+        return _payload_exit_code(result)
+    return None
+
+
+def _tool_result_failure_flags(message: dict[str, Any]) -> list[str]:
+    text = _tool_result_failure_text(message).lower()
+    flags: list[str] = []
+    if any(token in text for token in ("syntax", "unterminated", "unexpected eof")):
+        flags.append("syntax")
+    if "traceback" in text:
+        flags.append("traceback")
+    if "fasttext" in text:
+        flags.append("fasttext")
+    if "parquet" in text:
+        flags.append("parquet")
+    if "model.bin" in text or "model_bin" in text:
+        flags.append("model_bin")
+    if "timeout" in text or "timed out" in text:
+        flags.append("timeout")
+    return flags
+
+
+def _tool_result_failure_text(message: dict[str, Any]) -> str:
+    parts: list[str] = []
+    for payload in _tool_result_payloads(message):
+        parts.append(json.dumps(payload, sort_keys=True, default=str))
+    content = _message_content(message.get("content"))
+    if content:
+        parts.append(content)
+    return "\n".join(parts)
 
 
 def _payload_indicates_failure(payload: dict[str, Any]) -> bool:

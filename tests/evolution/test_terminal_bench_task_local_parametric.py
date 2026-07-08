@@ -305,6 +305,158 @@ def _write_gcode_run_tests_correction_fixture(
     )
 
 
+def _write_train_fasttext_tb_exec_failure_fixture(
+    *,
+    failed_trial: Path,
+    successful_trial: Path,
+) -> None:
+    llm_calls = (
+        failed_trial
+        / "agent"
+        / "evolab_lab"
+        / ".evolab"
+        / "registries"
+        / "trajectory"
+        / "llm_calls.jsonl"
+    )
+    llm_calls.parent.mkdir(parents=True)
+    (successful_trial / "agent").mkdir(parents=True)
+    read_task_result = json.dumps(
+        {
+            "message": "read Harbor task terminal-bench-task",
+            "task_yaml": (
+                "descriptions:\n"
+                "  - key: base\n"
+                "    description: |\n"
+                "      Train a fastText model and write /app/model.bin\n"
+            ),
+            "tool": "tb_read_task",
+        },
+        indent=2,
+        sort_keys=True,
+    )
+    failed_exec_result = json.dumps(
+        {
+            "exit_code": 1,
+            "status": "failed",
+            "stderr": (
+                "Traceback (most recent call last):\n"
+                "  File \"/tmp/train.py\", line 7, in <module>\n"
+                "RuntimeError: fastText training failed before /app/model.bin"
+            ),
+            "tool": "tb_exec",
+        },
+        indent=2,
+        sort_keys=True,
+    )
+    wrong_exec_call = {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+            {
+                "id": "call-bad-train",
+                "type": "function",
+                "function": {
+                    "name": "tb_exec",
+                    "arguments": {
+                        "task_id": "terminal-bench-task",
+                        "command": "python /tmp/train.py",
+                    },
+                },
+            }
+        ],
+    }
+    llm_calls.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "input_messages": [
+                            {"role": "system", "content": "Solve exactly one task_id."},
+                            {"role": "user", "content": "Instruction:\n{}"},
+                            {
+                                "role": "tool",
+                                "content": read_task_result,
+                                "metadata": {
+                                    "tool_result": {
+                                        "content": read_task_result,
+                                        "status": "ok",
+                                    }
+                                },
+                                "name": "tb_read_task",
+                                "tool_call_id": "call-read",
+                            },
+                        ],
+                        "output_messages": [wrong_exec_call],
+                    }
+                ),
+                json.dumps(
+                    {
+                        "input_messages": [
+                            {"role": "system", "content": "Solve exactly one task_id."},
+                            {"role": "user", "content": "Instruction:\n{}"},
+                            {
+                                "role": "tool",
+                                "content": read_task_result,
+                                "metadata": {
+                                    "tool_result": {
+                                        "content": read_task_result,
+                                        "status": "ok",
+                                    }
+                                },
+                                "name": "tb_read_task",
+                                "tool_call_id": "call-read",
+                            },
+                            wrong_exec_call,
+                            {
+                                "role": "tool",
+                                "content": "{\"status\":\"failed\"}",
+                                "metadata": {
+                                    "tool_result": {
+                                        "content": failed_exec_result,
+                                        "status": "failed",
+                                    }
+                                },
+                                "name": "tb_exec",
+                                "tool_call_id": "call-bad-train",
+                            },
+                        ],
+                        "output_messages": [
+                            {
+                                "role": "assistant",
+                                "content": "The training command failed.",
+                            }
+                        ],
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (successful_trial / "agent" / "codex.txt").write_text(
+        json.dumps(
+            {
+                "type": "item.completed",
+                "item": {
+                    "type": "command_execution",
+                    "command": (
+                        "python - <<'PY'\n"
+                        "from pathlib import Path\n"
+                        "Path('/app/model.bin').write_bytes(b'fasttext')\n"
+                        "PY"
+                    ),
+                    "aggregated_output": "",
+                    "exit_code": 0,
+                    "status": "completed",
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
 def test_select_task_local_candidates_requires_success_and_failure(
     tmp_path: Path,
 ) -> None:
@@ -1451,6 +1603,85 @@ def test_build_task_local_sft_records_can_add_collect_result_correction_prefix(
     }
 
 
+def test_build_task_local_sft_records_can_add_tb_exec_failure_correction_prefix(
+    tmp_path: Path,
+) -> None:
+    failed_trial = tmp_path / "failed-trial"
+    successful_trial = tmp_path / "successful-trial"
+    _write_train_fasttext_tb_exec_failure_fixture(
+        failed_trial=failed_trial,
+        successful_trial=successful_trial,
+    )
+    selection = TaskLocalSelection(
+        task_id="train-fasttext",
+        failed=[
+            TrajectoryPoolRow(
+                trajectory_id="failed-train-fasttext",
+                task_id="train-fasttext",
+                reward=0.0,
+                trial_dir=failed_trial,
+                raw={},
+            )
+        ],
+        successful=[
+            TrajectoryPoolRow(
+                trajectory_id="success-train-fasttext",
+                task_id="train-fasttext",
+                reward=1.0,
+                trial_dir=successful_trial,
+                raw={},
+            )
+        ],
+        null_reward=[],
+    )
+
+    records = build_task_local_sft_records(
+        selection,
+        command_contains=["/app/model.bin"],
+        max_records=2,
+        prompt_style="live_replay",
+        target_exec_timeout_seconds=300,
+        include_tb_exec_failure_correction=True,
+    )
+
+    assert len(records) == 2
+    assert records[0]["metadata"]["prefix_source"] == "live_replay_llm_call:1"
+    correction = records[1]
+    assert correction["metadata"]["prefix_source"] == (
+        "live_replay_tb_exec_failure_correction_llm_call:2"
+    )
+    assert correction["metadata"]["target_correction_stage"] == "tb_exec_failure"
+    assert correction["metadata"]["failed_tool_name"] == "tb_exec"
+    assert correction["metadata"]["failed_tool_index"] == 5
+    assert correction["metadata"]["failed_exit_code"] == 1
+    assert correction["metadata"]["failed_tool_failure_flags"] == [
+        "traceback",
+        "fasttext",
+        "model_bin",
+    ]
+    trace = correction["traces"][0]
+    failed_exec_message = next(
+        message
+        for message in trace["prompt_messages"]
+        if message.get("name") == "tb_exec"
+    )
+    assert "Traceback" in failed_exec_message["content"]
+    assert "/app/model.bin" in failed_exec_message["content"]
+    target_args = trace["response_messages"][-1]["tool_calls"][0]["function"][
+        "arguments"
+    ]
+    assert target_args == {
+        "task_id": "terminal-bench-task",
+        "command": (
+            "python - <<'PY'\n"
+            "from pathlib import Path\n"
+            "Path('/app/model.bin').write_bytes(b'fasttext')\n"
+            "PY"
+        ),
+        "timeout_seconds": 300,
+    }
+
+
 def test_build_task_local_parametric_job_payload_writes_dataset_and_lora_job(
     tmp_path: Path,
 ) -> None:
@@ -2111,3 +2342,85 @@ def test_terminal_bench_task_local_parametric_memory_job_cli_accepts_collect_res
     assert records[2]["metadata"]["target_correction_stage"] == (
         "collect_result_failure"
     )
+
+
+def test_terminal_bench_task_local_parametric_memory_job_cli_accepts_tb_exec_failure_correction(
+    tmp_path: Path,
+) -> None:
+    failed_trial = tmp_path / "failed-trial"
+    successful_trial = tmp_path / "successful-trial"
+    _write_train_fasttext_tb_exec_failure_fixture(
+        failed_trial=failed_trial,
+        successful_trial=successful_trial,
+    )
+    pool = tmp_path / "trajectory_pool.jsonl"
+    _write_pool(
+        pool,
+        [
+            {
+                "trajectory_id": "failed-train-fasttext",
+                "task_id": "train-fasttext",
+                "reward": 0.0,
+                "trial_dir": str(failed_trial),
+            },
+            {
+                "trajectory_id": "success-train-fasttext",
+                "task_id": "train-fasttext",
+                "reward": 1.0,
+                "trial_dir": str(successful_trial),
+            },
+        ],
+    )
+
+    output = tmp_path / "job.json"
+    assert (
+        main(
+            [
+                "terminal-bench-task-local-parametric-memory-job",
+                "--trajectory-pool",
+                str(pool),
+                "--task-id",
+                "train-fasttext",
+                "--output-root",
+                str(tmp_path / "out"),
+                "--trainer-command",
+                "python",
+                "--trainer-arg",
+                "train_lora.py",
+                "--trainer-arg",
+                "--train-file",
+                "--trainer-arg",
+                "{training_dataset}",
+                "--trainer-arg",
+                "--output-dir",
+                "--trainer-arg",
+                "{adapter_dir}",
+                "--command-contains",
+                "/app/model.bin",
+                "--prompt-style",
+                "live_replay",
+                "--target-exec-timeout-seconds",
+                "300",
+                "--include-tb-exec-failure-correction",
+                "--max-records-per-task",
+                "2",
+                "--output",
+                str(output),
+            ]
+        )
+        == 0
+    )
+
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    records = [
+        json.loads(line)
+        for line in Path(payload["dataset"]["records_path"]).read_text().splitlines()
+    ]
+    assert payload["include_tb_exec_failure_correction"] is True
+    assert payload["dataset"]["record_count"] == 2
+    assert records[1]["metadata"]["target_correction_stage"] == "tb_exec_failure"
+    assert records[1]["metadata"]["failed_tool_failure_flags"] == [
+        "traceback",
+        "fasttext",
+        "model_bin",
+    ]

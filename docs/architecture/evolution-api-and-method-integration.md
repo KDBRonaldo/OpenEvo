@@ -592,6 +592,13 @@ serving。
 之后的真实 prefix，包括嵌套的失败 `tb_run_tests` result 和 missing artifact feedback，并继续
 监督同一个成功 `tb_exec` target；该开关用于训练“collect_result 明确失败后继续修复”，避免模型
 过早写 report 或停止。
+`--include-tb-exec-failure-correction` 也用于 `live_replay` + final-target 路径，但触发点是
+失败本地轨迹中已经出现失败的 `tb_exec` 工具结果。builder 会保留真实 prefix 到该失败命令输出，
+记录 `target_correction_stage="tb_exec_failure"`、失败工具名、失败工具所在 input-message
+index、可用 exit code，以及 `syntax`、`traceback`、`fasttext`、`parquet`、`model_bin`、
+`timeout` 这类归一化失败标记，并继续监督选中的成功 `tb_exec` target。该开关用于训练
+“看到具体 shell/Python/package/model 失败后继续修复”的局部 parametric memory；它当前不改变
+sequence 对齐逻辑，也不尝试自动匹配每一个失败命令到逐步恢复命令。
 
 本地 vLLM eval 提供 serving-time adapter 兼容层：对通过 vLLM
 `--language-model-only` 服务的 Qwen3.5/Qwen3.6 PEFT LoRA，可在
