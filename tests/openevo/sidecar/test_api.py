@@ -623,6 +623,42 @@ def test_services_logs_endpoint_tails_selected_service_with_redaction() -> None:
     assert "Authorization: [REDACTED]" in payload["content"]
 
 
+def test_services_logs_endpoint_returns_structured_log_on_transport_exception() -> None:
+    project = ScienceProjectConfig.model_validate(_science_project_payload())
+    profile = _remote_profile()
+    transport = _ApiLifecycleTransport(
+        log_exception=RuntimeError(
+            "tail failed via http://proxy-user:proxy-secret@127.0.0.1:7890\n"
+            "Authorization: Bearer secret-token"
+        )
+    )
+    client = TestClient(
+        create_sidecar_app_for_project(
+            project,
+            profile,
+            transport_factory=lambda _profile: transport,
+        )
+    )
+    token = _sidecar_token(client)
+    headers = {"X-OpenEvo-Sidecar-Token": token}
+    _prepare_workspace_and_bootstrap(client, headers)
+
+    response = client.get(
+        "/openevo-api/desktop/services/logs",
+        headers=headers,
+        params={"service_id": "gateway", "lines": 50},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["service_id"] == "gateway"
+    assert payload["line_count"] == 2
+    assert "tail failed" in payload["content"]
+    assert "proxy-secret" not in payload["content"]
+    assert "secret-token" not in payload["content"]
+    assert "Authorization: [REDACTED]" in payload["content"]
+
+
 def test_services_stop_and_restart_endpoints_control_selected_service() -> None:
     project = ScienceProjectConfig.model_validate(_science_project_payload())
     profile = _remote_profile()
@@ -2576,11 +2612,13 @@ class _ApiLifecycleTransport(_ApiDryRunTransport):
         pid_states: dict[str, dict[str, object]] | None = None,
         health_failures: dict[str, str] | None = None,
         log_content: str = "",
+        log_exception: Exception | None = None,
     ) -> None:
         super().__init__()
         self.pid_states = pid_states or {}
         self.health_failures = health_failures or {}
         self.log_content = log_content
+        self.log_exception = log_exception
         self.stopped_services: list[str] = []
 
     def run(
@@ -2615,6 +2653,8 @@ class _ApiLifecycleTransport(_ApiDryRunTransport):
                 ),
             )
         if command.startswith("if [ -f ") and "tail -n" in command:
+            if self.log_exception is not None:
+                raise self.log_exception
             return RemoteCommandResult(
                 command=command,
                 return_code=0,

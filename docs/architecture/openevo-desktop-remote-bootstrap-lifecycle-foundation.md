@@ -230,6 +230,9 @@ Inspection semantics are intentionally pragmatic:
 Log and operation outputs are sanitized with the remote proxy redaction rules.
 They also redact `Authorization:` and `Proxy-Authorization:` header values and
 bearer tokens before returning content to Desktop.
+If log tailing itself fails due to a transport exception, the logs endpoint
+still returns a `RemoteServiceLog` with sanitized diagnostic content instead of
+surfacing an unstructured server error.
 
 This facade is still command-based. It does not add systemd units, persistent
 restart policies, cross-session process ownership tracking, or a new daemon

@@ -217,6 +217,28 @@ def test_read_remote_service_logs_tails_and_redacts_sensitive_headers() -> None:
     assert "Authorization: [REDACTED]" in log.content
 
 
+def test_read_remote_service_logs_returns_structured_log_on_transport_exception() -> None:
+    secret_proxy = "http://proxy-user:proxy-secret@127.0.0.1:7890"
+    plan = build_remote_services_plan(
+        _bootstrap_plan(proxy={"https_proxy": secret_proxy})
+    )
+    transport = _LifecycleTransport(
+        log_exception=RuntimeError(
+            "tail failed via http://proxy-user:proxy-secret@127.0.0.1:7890\n"
+            "Authorization: Bearer secret-token"
+        )
+    )
+
+    log = read_remote_service_logs(transport, plan, "gateway", lines=50)
+
+    assert log.service_id == "gateway"
+    assert log.line_count == 2
+    assert "tail failed" in log.content
+    assert "proxy-secret" not in log.content
+    assert "secret-token" not in log.content
+    assert "Authorization: [REDACTED]" in log.content
+
+
 def test_stop_remote_service_kills_pid_and_missing_pid_returns_stopped() -> None:
     plan = build_remote_services_plan(_bootstrap_plan())
     transport = _LifecycleTransport(pid_states={"gateway": {"pid": 123, "alive": True}})
@@ -381,6 +403,7 @@ class _LifecycleTransport(_RecordingTransport):
         pid_states: dict[str, dict[str, object]] | None = None,
         health_failures: dict[str, str] | None = None,
         log_content: str = "",
+        log_exception: Exception | None = None,
         malformed_inspect: set[str] | None = None,
         stop_still_running: set[str] | None = None,
     ) -> None:
@@ -388,6 +411,7 @@ class _LifecycleTransport(_RecordingTransport):
         self.pid_states = pid_states or {}
         self.health_failures = health_failures or {}
         self.log_content = log_content
+        self.log_exception = log_exception
         self.malformed_inspect = malformed_inspect or set()
         self.stop_still_running = stop_still_running or set()
         self.stopped_services: list[str] = []
@@ -422,6 +446,8 @@ class _LifecycleTransport(_RecordingTransport):
                 ),
             )
         if command.startswith("if [ -f ") and "tail -n" in command:
+            if self.log_exception is not None:
+                raise self.log_exception
             return RemoteCommandResult(command=command, return_code=0, stdout=self.log_content)
         if "os.kill(pid, signal.SIGTERM)" in command:
             if service_id not in self.pid_states:

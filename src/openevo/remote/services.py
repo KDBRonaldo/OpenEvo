@@ -444,9 +444,18 @@ def read_remote_service_logs(
         f"if [ -f {shlex.quote(log_path)} ]; then "
         f"tail -n {line_count} -- {shlex.quote(log_path)}; fi"
     )
-    result = transport.run(command, env=dict(step.env), timeout_seconds=30.0)
+    env = plan.proxy_env | step.env
+    try:
+        result = transport.run(command, env=dict(step.env), timeout_seconds=30.0)
+    except Exception as exc:
+        content = _sanitize_lifecycle_text(str(exc), env)
+        return RemoteServiceLog(
+            service_id=_manifest_text(step, "service_id"),
+            content=content,
+            line_count=_count_log_lines(content),
+        )
     content = result.stdout if result.ok else result.stderr or result.stdout
-    content = _sanitize_lifecycle_text(content, plan.proxy_env | step.env)
+    content = _sanitize_lifecycle_text(content, env)
     return RemoteServiceLog(
         service_id=_manifest_text(step, "service_id"),
         content=content,
