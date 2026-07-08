@@ -586,6 +586,15 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     tb_task_local_parametric_job.add_argument(
+        "--tool-schema-lock-repeat",
+        type=int,
+        default=1,
+        help=(
+            "Repeat the optional tool-schema-lock record this many times. "
+            "Requires --include-tool-schema-lock."
+        ),
+    )
+    tb_task_local_parametric_job.add_argument(
         "--include-run-tests-correction",
         action="store_true",
         help=(
@@ -1719,6 +1728,7 @@ def _create_terminal_bench_task_local_parametric_memory_job(
                 args.include_tb_exec_failure_correction
             ),
             include_tool_schema_lock=args.include_tool_schema_lock,
+            tool_schema_lock_repeat=args.tool_schema_lock_repeat,
         )
         selection_summary.append(
             {
@@ -1755,6 +1765,8 @@ def _create_terminal_bench_task_local_parametric_memory_job(
         target_filters["target_repeat"] = args.target_repeat
     if args.include_tool_schema_lock:
         target_filters["include_tool_schema_lock"] = True
+    if args.tool_schema_lock_repeat != 1:
+        target_filters["tool_schema_lock_repeat"] = args.tool_schema_lock_repeat
     payload = build_task_local_parametric_job_payload(
         records=records,
         output_root=output_root,
@@ -1778,6 +1790,7 @@ def _create_terminal_bench_task_local_parametric_memory_job(
     payload["target_mode"] = args.target_mode
     payload["target_exec_timeout_seconds"] = args.target_exec_timeout_seconds
     payload["include_tool_schema_lock"] = args.include_tool_schema_lock
+    payload["tool_schema_lock_repeat"] = args.tool_schema_lock_repeat
     payload["include_run_tests_correction"] = args.include_run_tests_correction
     payload["include_collect_result_correction"] = (
         args.include_collect_result_correction

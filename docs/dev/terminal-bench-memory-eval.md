@@ -375,6 +375,11 @@ target needs extra SFT weight, for example exact literal file writes that are
 otherwise easy for a small local adapter to copy with casing or quoting drift.
 Repeated records keep the same supervised `tb_exec` target and record
 `target_repeat_index` / `target_repeat_count` in metadata for auditability. Use
+`--tool-schema-lock-repeat N` together with `--include-tool-schema-lock` when
+literal target repeats preserve the command text but the local model drifts into
+incomplete tool arguments such as missing `task_id`; repeated schema-lock records
+keep the same complete `tb_exec` target and record
+`tool_schema_lock_repeat_index` / `tool_schema_lock_repeat_count`. Use
 `--run-worker` only when the trainer is ready to run locally.
 
 ```sh
