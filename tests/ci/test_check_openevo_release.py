@@ -140,7 +140,9 @@ def test_release_smoke_workflow_builds_packaged_assets_and_validates_wheel() -> 
 
     text = workflow.read_text(encoding="utf-8")
 
+    assert 'node-version: "22"' in text
     assert "npm test -- --run" in text
+    assert "npm audit --audit-level=high" in text
     assert "npm run build:openevo" in text
     assert "diff -qr web/dist src/openevo/desktop/web" in text
     assert '"src/polar/**"' in text
@@ -161,6 +163,10 @@ def test_release_smoke_workflow_builds_packaged_assets_and_validates_wheel() -> 
     ) in text
 
     assert text.index("npm ci") < text.index("npm test -- --run")
+    assert text.index("npm ci") < text.index("npm audit --audit-level=high")
+    assert text.index("npm audit --audit-level=high") < text.index(
+        "npm run build:openevo"
+    )
     assert text.index("npm test -- --run") < text.index("npm run build:openevo")
     assert text.index("name: Build wheel") < text.index("name: Validate OpenEvo wheel")
     assert text.index("name: Validate OpenEvo wheel") < text.index(
