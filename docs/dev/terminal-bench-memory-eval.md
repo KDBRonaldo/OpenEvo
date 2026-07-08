@@ -925,19 +925,27 @@ recovered by replaying the same payload generation command without
 directly for eval with adapter id
 `tb-parametric-memory-trainfasttext-model-sequence-r8-s100`.
 
-The paired eval for this extended adapter is intentionally not reported yet.
-At resume time, GPU 6 showed active 33GB/95% utilization with no visible
-OpenEvo-owned process in the normal process table, while GPU 7 was occupied by
-the long-running `qwen3.5-curator` vLLM service on port 8008. To avoid
-interfering with another job, do not launch the extended paired eval until a
-clean GPU is visible. The intended eval root is
-`/tmp/tb21-task-local-parametric-trainfasttext-extended-20260708/eval-trainfasttext-qwen35-model-sequence-r8-s100`,
-with managed Qwen3.5-9B vLLM and adapter key rewrite
-`qwen3_5_vllm_language_model`. Use deterministic decoding, no artifact-path
-guard, and only `parametric_memory` enabled.
+The paired eval for this extended adapter was deferred until a clean local GPU
+was available, then run at
+`/tmp/tb21-task-local-parametric-trainfasttext-extended-20260708/eval-trainfasttext-qwen35-model-sequence-r8-s100-tight1024-tool512`.
+It used managed Qwen3.5-9B vLLM on GPU 7, deterministic decoding,
+`max_output_tokens=1024`, `context_reserve_tokens=1024`,
+`tool_result_prompt_max_chars=512`, no artifact-path guard, adapter key rewrite
+`qwen3_5_vllm_language_model`, and only `parametric_memory` enabled. The summary
+recorded baseline pass@1/pass@k `0/1`, parametric-memory pass@1/pass@k `0/1`,
+and delta `0`, with no Harbor exceptions. The baseline exhausted the tool
+budget after 31 tool calls without producing `/app/model.bin`. The treatment
+loaded the LoRA, read the task, inspected data files, installed fastText, then
+hit a here-document quoting error while inspecting the parquet schema. It
+retried `python3 -m pip install fasttext`, but the next LLM response was
+`{"error": "empty_model_response"}` and no `/app/model.bin` was created. This
+negative result confirms that the 30-record extended sequence improved the
+early action path relative to baseline, but still did not teach robust recovery
+or final model production.
 
-An offline iterative-data dry-run then checked whether the current builder can
-reuse active-adapter failures before that extended eval is available. The pool
+Before that extended eval result was available, an offline iterative-data
+dry-run checked whether the current builder can reuse active-adapter failures.
+The pool
 at
 `/tmp/tb21-task-local-parametric-trainfasttext-iterative-20260708/iterative_pool.jsonl`
 combined the failed install-sequence treatment trajectory
