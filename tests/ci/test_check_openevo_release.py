@@ -36,6 +36,28 @@ def _load_module():
     return module
 
 
+def _load_desktop_wheel_smoke_module():
+    path = (
+        Path(__file__).resolve().parents[2]
+        / "scripts/ci/smoke_openevo_desktop_wheel.py"
+    )
+    spec = importlib.util.spec_from_file_location("smoke_openevo_desktop_wheel", path)
+    assert spec is not None
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_desktop_wheel_smoke_exercises_config_backed_lifecycle(capsys) -> None:
+    smoke = _load_desktop_wheel_smoke_module()
+
+    assert smoke.main() == 0
+
+    output = capsys.readouterr().out
+    assert "OpenEvo Desktop config-backed lifecycle smoke passed" in output
+
+
 def test_accepts_valid_openevo_release_wheel(tmp_path: Path) -> None:
     checker = _load_module()
     wheel = _write_wheel(tmp_path / "openevo-0.1.0-py3-none-any.whl")
@@ -149,6 +171,7 @@ def test_release_smoke_workflow_builds_packaged_assets_and_validates_wheel() -> 
     assert '"src/polar_evolution/**"' in text
     assert '"src/slime_bridge/**"' in text
     assert '"tests/ci/**"' in text
+    assert "python -m pip install --upgrade pip pytest -e ." in text
     assert "tests/ci/test_check_openevo_release.py" in text
     assert "python -m build --wheel" in text
     assert "scripts/ci/check_openevo_release.py --wheel dist/*.whl" in text
@@ -188,6 +211,7 @@ def test_release_artifact_workflow_builds_validated_wheel_artifact() -> None:
     assert "npm test -- --run" in text
     assert "npm run build:openevo" in text
     assert "diff -qr web/dist src/openevo/desktop/web" in text
+    assert "python -m pip install --upgrade pip pytest -e ." in text
     assert "python -m build --wheel" in text
     assert "scripts/ci/check_openevo_release.py --wheel dist/*.whl" in text
     assert ".openevo-wheel-smoke/bin/openevo desktop open --help" in text
@@ -225,6 +249,7 @@ def test_pypi_publish_workflow_uses_trusted_publishing() -> None:
     assert "npm test -- --run" in text
     assert "npm run build:openevo" in text
     assert "diff -qr web/dist src/openevo/desktop/web" in text
+    assert "python -m pip install --upgrade pip pytest twine -e ." in text
     assert "python -m build --wheel" in text
     assert "scripts/ci/check_openevo_release.py --wheel dist/*.whl" in text
     assert "twine check --strict dist/*.whl" in text
@@ -272,6 +297,7 @@ def test_readme_release_checklist_matches_frontend_audit_gate() -> None:
         ".openevo-wheel-smoke/bin/python "
         "scripts/ci/smoke_openevo_desktop_wheel.py"
     ) in text
+    assert "config-backed Desktop lifecycle" in text
     assert "PyPI trusted publishing" in text
     assert "pypa/gh-action-pypi-publish@release/v1" in text
     assert "GitHub release" in text
