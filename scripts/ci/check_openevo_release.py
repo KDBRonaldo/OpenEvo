@@ -5,9 +5,12 @@ from __future__ import annotations
 
 import argparse
 import configparser
+from html.parser import HTMLParser
+import posixpath
 import sys
 from email.parser import Parser
 from pathlib import Path
+from urllib.parse import urlsplit
 from zipfile import BadZipFile, ZipFile
 
 EXPECTED_PROJECT_NAME = "openevo"
@@ -105,6 +108,13 @@ def _validate_desktop_assets(wheel: ZipFile, names: set[str]) -> list[str]:
     errors: list[str] = []
     if REQUIRED_DESKTOP_INDEX not in names:
         errors.append(f"Wheel is missing packaged Desktop index: {REQUIRED_DESKTOP_INDEX}.")
+    else:
+        errors.extend(
+            _validate_desktop_index_asset_references(
+                _read_text(wheel, REQUIRED_DESKTOP_INDEX),
+                names,
+            )
+        )
     if not any(
         name.startswith(REQUIRED_DESKTOP_ASSET_PREFIX) and not name.endswith("/")
         for name in names
@@ -123,6 +133,56 @@ def _validate_desktop_assets(wheel: ZipFile, names: set[str]) -> list[str]:
         )
     errors.extend(_find_shared_dashboard_content(wheel, names))
     return errors
+
+
+class _DesktopIndexAssetParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.assets: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        for name, value in attrs:
+            if name not in {"href", "src"} or value is None:
+                continue
+            asset = _desktop_asset_reference(value)
+            if asset is not None:
+                self.assets.append(asset)
+
+
+def _validate_desktop_index_asset_references(
+    index_html: str,
+    names: set[str],
+) -> list[str]:
+    parser = _DesktopIndexAssetParser()
+    try:
+        parser.feed(index_html)
+    except ValueError as exc:
+        return [str(exc)]
+
+    errors: list[str] = []
+    for asset in sorted(set(parser.assets)):
+        wheel_path = f"openevo/desktop/web/{asset}"
+        if wheel_path not in names:
+            errors.append(
+                "Packaged Desktop index references missing Desktop asset "
+                f"`{asset}`."
+            )
+    return errors
+
+
+def _desktop_asset_reference(value: str) -> str | None:
+    parsed = urlsplit(value)
+    if parsed.scheme or parsed.netloc:
+        return None
+    path = parsed.path
+    if path.startswith("/assets/"):
+        path = path[1:]
+    elif not path.startswith("assets/"):
+        return None
+    normalized = posixpath.normpath(path)
+    if normalized == "assets" or not normalized.startswith("assets/"):
+        raise ValueError(f"Packaged Desktop index has invalid asset reference `{value}`.")
+    return normalized
 
 
 def _find_shared_dashboard_content(wheel: ZipFile, names: set[str]) -> list[str]:

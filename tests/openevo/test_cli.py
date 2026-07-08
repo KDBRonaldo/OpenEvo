@@ -1267,6 +1267,7 @@ def test_pyproject_packages_openevo_desktop_web_assets() -> None:
 
     assert "openevo" in package_data
     assert "desktop/web/**/*" in package_data["openevo"]
+    assert "platform/web/dist/**/*" not in package_data.get("polar", [])
 
 
 def test_pyproject_uses_openevo_release_metadata() -> None:
@@ -1311,8 +1312,12 @@ def test_uv_lock_uses_openevo_editable_root_package() -> None:
 
 def test_web_package_defines_openevo_desktop_build_mode() -> None:
     package = json.loads(Path("web/package.json").read_text(encoding="utf-8"))
+    lock = json.loads(Path("web/package-lock.json").read_text(encoding="utf-8"))
     env_file = Path("web/.env.openevo-desktop")
 
+    assert package["name"] == "openevo-desktop-web"
+    assert lock["name"] == "openevo-desktop-web"
+    assert lock["packages"][""]["name"] == "openevo-desktop-web"
     assert package["scripts"]["build:openevo"] == "vite build --mode openevo-desktop"
     assert env_file.read_text(encoding="utf-8").strip() == (
         "VITE_OPENEVO_DESKTOP_ONLY=true"

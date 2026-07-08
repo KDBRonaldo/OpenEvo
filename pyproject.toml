@@ -61,7 +61,6 @@ openevo = [
 ]
 polar = [
     "**/README.md",
-    "platform/web/dist/**/*",
 ]
 slime_bridge = ["README.md"]
 
