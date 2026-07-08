@@ -152,6 +152,16 @@ class CompiledTask:
                 },
                 "compatibility": compatibility,
             }
+            if spec.artifact_type == "parametric_memory":
+                base_model = str(
+                    payload["config"].get("base_model")
+                    or self.agent.get("model_name")
+                    or ""
+                ).strip()
+                if base_model:
+                    if "base_model" not in payload["config"]:
+                        payload["config"]["base_model"] = base_model
+                    payload["config"]["compatibility"]["base_model"] = [base_model]
             if _promotion_gate_targets_artifact(self.promotion_gate, spec.artifact_type):
                 payload["config"]["promotion_gate"] = _worker_visible_promotion_gate(
                     self.promotion_gate
@@ -412,6 +422,11 @@ def _runtime_payload(config: ExperimentConfig) -> dict[str, Any]:
         payload["image"] = config.runtime.image
     if config.runtime.env:
         payload["env"] = dict(config.runtime.env)
+    if config.runtime.prepare:
+        payload["prepare"] = [
+            action.model_dump(mode="json")
+            for action in config.runtime.prepare
+        ]
     return payload
 
 
@@ -433,7 +448,8 @@ def _runtime_for_task(
                 "type": "upload_dir",
                 "source": _workspace_source(task, config_path),
                 "target": payload["workdir"],
-            }
+            },
+            *payload.get("prepare", []),
         ]
     return payload
 
@@ -452,7 +468,10 @@ def _reflector_llm(config: ExperimentConfig) -> dict[str, str]:
         return {"provider": config.agent.provider, "model": config.agent.model}
     provider = (
         "codex_cli"
-        if config.agent.auth in _SUBSCRIPTION_AUTH_MODES
+        if (
+            config.agent.auth in _SUBSCRIPTION_AUTH_MODES
+            or config.agent.preset == "codex"
+        )
         else "openai_chat"
     )
     return {"provider": provider, "model": config.agent.model}

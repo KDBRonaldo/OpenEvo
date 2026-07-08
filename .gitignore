@@ -68,6 +68,7 @@ cython_debug/
 .env
 .env.*
 !.env.example
+!web/.env.openevo-desktop
 .venv/
 .venv*/
 env/

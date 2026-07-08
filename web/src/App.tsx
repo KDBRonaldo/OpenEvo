@@ -6,7 +6,11 @@ import { TasksList } from "./routes/TasksList";
 import { TaskDetail } from "./routes/TaskDetail";
 import { SessionDetail } from "./routes/SessionDetail";
 import { Compare } from "./routes/Compare";
+import { OpenEvoDesktop } from "./routes/OpenEvoDesktop";
 import { subscribePolarEvents } from "./api/sse";
+
+const isOpenEvoDesktopOnlyBuild =
+  import.meta.env.VITE_OPENEVO_DESKTOP_ONLY === "true";
 
 function NavItem({ to, label }: { to: string; label: string }) {
   return (
@@ -36,6 +40,7 @@ function NavBar() {
           <span className="font-semibold">Polar Dashboard</span>
         </Link>
         <div className="flex items-center gap-1">
+          <NavItem to="/openevo" label="OpenEvo" />
           <NavItem to="/" label="Dashboard" />
           <NavItem to="/tasks" label="Tasks" />
         </div>
@@ -44,7 +49,7 @@ function NavBar() {
   );
 }
 
-export default function App() {
+export function SharedDashboardShell() {
   const location = useLocation();
   const queryClient = useQueryClient();
 
@@ -95,6 +100,7 @@ export default function App() {
       <main className="mx-auto w-full max-w-7xl flex-1 px-4 py-4">
         <Routes>
           <Route path="/" element={<Dashboard />} />
+          <Route path="/openevo" element={<OpenEvoDesktop />} />
           <Route path="/tasks" element={<TasksList />} />
           <Route path="/tasks/:taskId" element={<TaskDetail />} />
           <Route path="/sessions/:sessionId" element={<SessionDetail />} />
@@ -116,5 +122,33 @@ export default function App() {
         </a>
       </footer>
     </div>
+  );
+}
+
+export function OpenEvoDesktopOnlyShell() {
+  return (
+    <div className="min-h-full bg-slate-50 text-slate-900">
+      <main className="mx-auto w-full max-w-7xl px-4 py-4">
+        <Routes>
+          <Route path="/" element={<OpenEvoDesktop />} />
+          <Route path="/openevo/*" element={<OpenEvoDesktop />} />
+          <Route path="*" element={<OpenEvoDesktop />} />
+        </Routes>
+      </main>
+    </div>
+  );
+}
+
+export function AppShell({ desktopOnly = false }: { desktopOnly?: boolean }) {
+  return desktopOnly ? <OpenEvoDesktopOnlyShell /> : <SharedDashboardShell />;
+}
+
+// Keep this build-time branch at the entrypoint so Vite can drop shared
+// dashboard code from OpenEvo-only bundles.
+export default function App() {
+  return isOpenEvoDesktopOnlyBuild ? (
+    <OpenEvoDesktopOnlyShell />
+  ) : (
+    <SharedDashboardShell />
   );
 }

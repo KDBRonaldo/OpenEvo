@@ -3,13 +3,13 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "polar"
+name = "openevo"
 version = "0.1.0"
-description = "Polar is a rollout server for agent RL."
+description = "OpenEvo Desktop and agent evolution orchestration."
 readme = "README.md"
 requires-python = ">=3.11"
 authors = [
-    { name = "Binfeng Xu, Yi Dong, Hao Zhang, Shaokun Zhang, Songyang Han, Jian Hu, Mingjie Liu, etc" },
+    { name = "OpenEvo contributors" },
 ]
 
 dependencies = [
@@ -21,9 +21,9 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/NVIDIA-NeMo/ProRL-Agent-Server"
-Repository = "https://github.com/NVIDIA-NeMo/ProRL-Agent-Server"
-Issues = "https://github.com/NVIDIA-NeMo/ProRL-Agent-Server/issues"
+Homepage = "https://github.com/CompLifeLab-ZJU/OpenEvo"
+Repository = "https://github.com/CompLifeLab-ZJU/OpenEvo"
+Issues = "https://github.com/CompLifeLab-ZJU/OpenEvo/issues"
 
 [project.optional-dependencies]
 swebench = [
@@ -56,9 +56,12 @@ where = ["src"]
 include = ["polar*", "slime_bridge*", "polar_evolution*", "openevo*"]
 
 [tool.setuptools.package-data]
+openevo = [
+    "desktop/web/**/*",
+    "wheels/*.whl",
+]
 polar = [
     "**/README.md",
-    "platform/web/dist/**/*",
 ]
 slime_bridge = ["README.md"]
 

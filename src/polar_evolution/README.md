@@ -35,6 +35,41 @@ uv run polar-evolution serve --host 127.0.0.1 --port 8200
 Parametric memory artifacts 会被注册到 backend，并在 context resolve 时以
 adapter merge specs 的形式返回给 trainer 和 inference infrastructure。
 
+## OPSD privileged distillation helpers
+
+`polar_evolution.opsd` 提供官方 OPSD 风格的轻量 helper，用于外部 trainer 或 vLLM
+runner 组装 privileged-context distillation 数据流。它不注册 evolution artifact，也不
+改变 context resolver 行为。
+
+核心约定：
+
+- student prompt 只包含测试时可见的 problem / schema / state。
+- teacher prompt 包含同一个 problem，再额外包含 delimited privileged information。
+- completion 必须来自 student on-policy generation。
+- teacher 和 student 都 score 同一段 student completion。
+- loss mask 只覆盖 completion tokens；prompt 和 privileged block 不参与训练。
+
+使用 vLLM 做 full-logit OPSD 时，外部 runner 应启动允许 all-logits 的 vLLM server
+并用同一 tokenizer 构造 student/teacher token sequences。若 teacher/student tokenizer
+或 vocab 不一致，只能做 target-token 或 sequence-level distillation，不能做 full-vocab
+KL/JSD。
+
+`polar_evolution.opsd_vllm.VllmOpsdClient` 是一个最小 vLLM/OpenAI-compatible
+runner。它会：
+
+1. 用 student model 从 student prompt 生成 on-policy completion。
+2. 用 teacher model tokenize teacher privileged prompt。
+3. 把同一段 completion token ids 拼到 student/teacher prompt ids 后。
+4. 对两段 pre-tokenized input ids 发 `/v1/completions` scoring 请求：
+   `max_tokens=0`、`prompt_logprobs=-1`、`return_token_ids=true`、
+   `add_special_tokens=false`。
+5. 从 vLLM `prompt_logprobs` 中切出 completion token positions，计算 JSD/KL
+   smoke loss，或把 logits 交给外部 torch trainer。
+
+vLLM server 需要以允许 full prompt logits 的方式启动，例如设置
+`--max-logprobs -1`，并在需要 raw logits 而不是 logprobs 时设置对应的
+`--logprobs-mode`。
+
 运行内置 reference worker：
 
 ```sh

@@ -1,7 +1,9 @@
 # Evolution API 与新算法接入
 
 本文说明当前 skill/memory/agent-system/parametric-memory evolution 的 API contract，
-以及如何把新的 SOTA 方法或 research 方法接入 Polar Evolution Backend。
+以及如何把新的 SOTA 方法或 research 方法接入 OpenEvo Core evolution backend。
+OpenEvo Dev Kit 的开发者、benchmark adapter 和测试工作流边界见
+[OpenEvo Dev Kit](openevo-dev-kit.md)。
 
 ## 总体数据流
 
@@ -29,7 +31,7 @@ training 或评估。算法只需要遵守两个边界：
 Evolution 方法读取 dataset 或 session event 时，需要先判断 trajectory 的 capture
 形态：
 
-- Polar proxy 模式会产生 token-level traces。`response_ids`、`loss_mask` 和
+- Core proxy 模式会产生 token-level traces。`response_ids`、`loss_mask` 和
   `response_logprobs` 可用于 RL 或偏好优化等 token-level 训练。
 - Pure-text transcript capture 模式由 `agent.settings.capture_mode="transcript"`
   或等价 transcript capture mode 显式开启。Gateway 会在无 completion 时从 agent
@@ -42,13 +44,13 @@ Evolution 方法读取 dataset 或 session event 时，需要先判断 trajector
 
 因此，skill/memory/agent-system evolution 可以把 transcript trajectory 当作行为记录、
 反思材料或 memory mining 输入；需要 token-level metric 的 RL 方法必须过滤掉
-`token_level_metrics_available=false` 的 traces，或要求任务使用 Polar proxy capture。
+`token_level_metrics_available=false` 的 traces，或要求任务使用 Core proxy capture。
 
 ### 外部 harness 的离线 transcript 输入
 
-不由 Polar gateway 直接启动的 harness 也可以进入 pure-text evolution path。以
+不由 Core gateway 直接启动的 harness 也可以进入 pure-text evolution path。以
 Terminal Bench + Harbor/EvoLab 为例，官方 verifier 仍负责执行和打分，离线 bridge 只把
-trial/job 目录中的非 oracle 产物转换成 Polar events：
+trial/job 目录中的非 oracle 产物转换成 Core events：
 
 ```sh
 uv run polar-evolution terminal-bench-events \
@@ -115,7 +117,7 @@ trial name、task instruction、task path 和 verifier failed-test 摘要会作�
 
 | API | 用途 |
 |---|---|
-| `POST /v1/events` | 接收 Polar session/task event |
+| `POST /v1/events` | 接收 Core session/task event |
 | `POST /v1/datasets` | 从 events 物化 dataset，并注册 `dataset` artifact |
 | `POST /v1/jobs` | 创建 evolution job |
 | `POST /v1/jobs/claim` | Worker 按 capability claim job |
@@ -137,6 +139,90 @@ trial name、task instruction、task path 和 verifier failed-test 摘要会作�
 `job_type` 是 claim selector，`method` 是 worker 内部执行的算法名。reference worker 默认让
 二者同名，例如 `job_type=agent_system, method=agent_system`。专用 research worker 可以用
 自己的 capability 策略，只要 claim 到 job 后返回合法 artifact 即可。
+
+## OpenEvo Core capability metadata
+
+Desktop 和 Dev Kit 不应硬编码 method table。内置 evolution method 的可发现信息由
+`openevo.core.capabilities` 暴露：
+
+- `build_core_capabilities()` 返回 frozen Pydantic `CoreCapabilities`，包含 execution modes、
+  artifact targets 和 evolution methods。
+- `method_metadata_by_id()` 返回 `dict[str, EvolutionMethodCapability]`，key 与
+  `polar_evolution.methods.METHOD_REGISTRY` 的 method ID 一致。
+- `polar_evolution.methods.METHOD_METADATA` 是内置 worker method 的 metadata 源；每个
+  `METHOD_REGISTRY` key 都必须有对应 metadata，避免 UI 或 Dev Kit 维护第二份方法表。
+
+当前 Core execution modes 是：
+
+- `codex_subscription_transcript`：订阅认证 harness + transcript capture 的 pure-text
+  evolution 模式。它不代表 token-level proxy capture，也不提供 logprob/loss-mask 指标。
+- `self-deployed`：自部署模型服务、Core proxy 或兼容基础设施的执行模式。
+
+当前 artifact targets 是：
+
+| Artifact target | Desktop visible | 说明 |
+|---|---:|---|
+| `text_memory` | yes | 自然语言长期记忆 |
+| `skill_bundle` | yes | harness 可加载 skill bundle |
+| `agent_system` | yes | agent system prompt 或 instruction 文件 |
+| `parametric_memory` | no | LoRA/adapter 等参数化记忆；Dev Kit 可发现，Desktop 暂不展示 |
+
+Method metadata contract：
+
+```json
+{
+  "method_id": "text_memory_reflector",
+  "display_name": "Text Memory Reflector",
+  "description": "Reflect over task trajectories to synthesize reusable text memory.",
+  "artifact_type": "text_memory",
+  "visibility": "ordinary_user",
+  "visible_in_desktop": true,
+  "input_requirements": ["dataset"],
+  "supported_execution_modes": [
+    "codex_subscription_transcript",
+    "self-deployed"
+  ],
+  "default_config": {},
+  "config_schema": {"type": "object", "additionalProperties": true},
+  "stability_level": "stable"
+}
+```
+
+`visibility` 的取值为：
+
+- `ordinary_user`：可面向普通用户展示；Desktop 只应展示同时满足
+  `visible_in_desktop=true` 的方法。
+- `dev_kit`：Dev Kit 和研究/调试界面可发现；Desktop 默认隐藏。
+- `internal`：内部 plumbing 或暂不面向产品 surface 的方法。
+
+`input_requirements` 描述 method 运行前需要调用方准备的输入类别，例如 dataset reflector
+方法声明 `["dataset"]`，adapter 注册类 parametric method 声明 `["adapter"]`，纯 config/manual
+注册方法声明空列表。`default_config` 提供 UI 或 Dev Kit 创建 job 时可预填的 method config；
+例如 agent-system 产物默认写入 `{"target_path": "AGENTS.md"}`。`config_schema` 描述可编辑
+config 的 JSON schema，当前内置 baseline 至少提供 object schema，后续可逐步收紧。
+
+普通用户可见的非参数化 reflector 方法必须同时支持
+`codex_subscription_transcript` 和 `self-deployed`，这样 Desktop 可以在订阅 transcript
+模式和自部署模式之间复用同一组 memory/skill/agent-system evolution 选项。实验方法、
+history/pareto/GEPA 变体和 parametric-memory 方法保持 Dev Kit 可发现，但默认不进入
+Desktop method picker。
+
+Dev Kit 可以检查 broader method set，包括 `ordinary_user`、`dev_kit` 和内部调试方法。
+但 Dev Kit 仍然消费同一份 `METHOD_REGISTRY` / `METHOD_METADATA` / Core capabilities
+contract，不能维护第二套 method registry。
+
+## Dev Kit benchmark adapter contract
+
+Benchmark adapter 属于 OpenEvo Dev Kit，而不是 Desktop。Adapter 的职责是把外部 benchmark
+task、transcript、score、artifact 和 protected metadata 转换为 OpenEvo Core 可消费的
+records、datasets、metrics、jobs、artifacts 和 context inputs。
+
+Benchmark adapter 必须复用 Core dataset/job/artifact/context contract，不能实现独立的
+evolution backend、method registry、artifact type system、context resolver 或 promotion
+路径。如果 benchmark 需要新算法，应按上面的 method metadata lifecycle 接入
+`METHOD_REGISTRY` 和 `METHOD_METADATA`；如果需要新输出形态，优先使用 typed Core artifact
+和 manifest 表达。更多 Dev Kit 边界见
+[OpenEvo Dev Kit](openevo-dev-kit.md)。
 
 ## Artifact Register Contract
 
@@ -729,7 +815,14 @@ def my_memory_method(job: WorkerClaimedJob, artifact_root: Path) -> list[Artifac
 METHOD_REGISTRY["my_memory_method"] = my_memory_method
 ```
 
-3. 创建 job 时设置：
+3. 在 `METHOD_METADATA` 注册 capability metadata。metadata 的 key 和 payload 内的
+   `method_id` 都必须等于 `METHOD_REGISTRY` key，至少说明 `method_id`、`display_name`、
+   `description`、`artifact_type`、`visibility`、`visible_in_desktop`、`input_requirements`、
+   `supported_execution_modes`、`default_config`、`config_schema` 和 `stability_level`。
+   Desktop/Dev Kit 会通过
+   `openevo.core.capabilities` 读取这份 metadata，不应再硬编码 method table。
+
+4. 创建 job 时设置：
 
 ```json
 {
@@ -740,7 +833,7 @@ METHOD_REGISTRY["my_memory_method"] = my_memory_method
 }
 ```
 
-4. 为 method 输出、worker complete、context resolve 添加测试。
+5. 为 method 输出、worker complete、context resolve 和 Core capability metadata 添加测试。
 
 ### 方式二：外部 research worker
 
@@ -751,7 +844,7 @@ METHOD_REGISTRY["my_memory_method"] = my_memory_method
 3. 运行算法，产出文件或 adapter。
 4. `POST /v1/jobs/{job_id}/complete`，提交一个或多个 `ArtifactRegisterRequest`。
 
-这种方式不需要修改 backend DB schema。新算法通过 typed artifact 与 Polar 通信。
+这种方式不需要修改 backend DB schema。新算法通过 typed artifact 与 Core 通信。
 
 ### 方式三：直接注册 artifact
 

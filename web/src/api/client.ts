@@ -2,10 +2,15 @@ async function request<T>(
   method: string,
   path: string,
   body?: unknown,
+  headers?: HeadersInit,
 ): Promise<T> {
+  const requestHeaders = new Headers(headers);
+  if (body) {
+    requestHeaders.set("Content-Type", "application/json");
+  }
   const init: RequestInit = {
     method,
-    headers: body ? { "Content-Type": "application/json" } : undefined,
+    headers: requestHeaders,
     body: body ? JSON.stringify(body) : undefined,
   };
   const response = await fetch(path, init);
@@ -33,7 +38,9 @@ async function request<T>(
 }
 
 export const api = {
-  get: <T>(path: string) => request<T>("GET", path),
-  post: <T>(path: string, body: unknown) => request<T>("POST", path, body),
+  get: <T>(path: string, headers?: HeadersInit) =>
+    request<T>("GET", path, undefined, headers),
+  post: <T>(path: string, body: unknown, headers?: HeadersInit) =>
+    request<T>("POST", path, body, headers),
   delete: <T>(path: string) => request<T>("DELETE", path),
 };

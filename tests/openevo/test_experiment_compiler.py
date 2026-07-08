@@ -316,9 +316,73 @@ def test_evolution_job_payloads_include_ordered_methods_and_reflector_llm() -> N
     assert all(job["config"]["promoted"] is True for job in jobs)
     assert all("base_model" not in job["config"]["compatibility"] for job in jobs)
     assert jobs[2]["config"]["reflector_llm"] == {
-        "provider": "openai_chat",
+        "provider": "codex_cli",
         "model": "gpt-5.1-codex-mini",
     }
+
+
+def test_parametric_memory_job_uses_prior_parametric_context_only() -> None:
+    compiled = compile_experiment(
+        _config(
+            artifacts={
+                "text_memory": {"enabled": False},
+                "skill_bundle": {"enabled": False},
+                "agent_system": {"enabled": False},
+                "parametric_memory": {
+                    "enabled": True,
+                    "config": {
+                        "adapter_uri": "file:///tmp/qwen-memory-adapter",
+                        "base_model": "Qwen/Qwen3.6-35B-A3B",
+                    },
+                },
+            },
+        ),
+        rounds_override=2,
+    )
+
+    jobs = compiled.evolution_job_payloads_for_round(
+        1,
+        dataset_artifact_id="dataset_artifact_1",
+        context_artifact_ids={
+            "text_memory": ["memory_1"],
+            "parametric_memory": ["adapter_1"],
+            "agent_system": ["agent_system_1"],
+        },
+    )
+
+    assert [job["method"] for job in jobs] == ["parametric_memory_register"]
+    assert jobs[0]["input_artifact_ids"] == ["dataset_artifact_1", "adapter_1"]
+    assert jobs[0]["config"]["compatibility"]["base_model"] == ["Qwen/Qwen3.6-35B-A3B"]
+
+
+def test_parametric_memory_job_derives_base_model_from_agent_model_when_absent() -> None:
+    compiled = compile_experiment(
+        _config(
+            agent={"preset": "codex", "model": "Qwen/Qwen3-Coder-30B-A3B-Instruct"},
+            artifacts={
+                "text_memory": {"enabled": False},
+                "skill_bundle": {"enabled": False},
+                "agent_system": {"enabled": False},
+                "parametric_memory": {
+                    "enabled": True,
+                    "config": {
+                        "adapter_uri": "file:///tmp/qwen-memory-adapter",
+                    },
+                },
+            },
+        )
+    )
+
+    jobs = compiled.evolution_job_payloads_for_round(
+        0,
+        dataset_artifact_id="dataset_artifact_1",
+        context_artifact_ids=[],
+    )
+
+    assert jobs[0]["config"]["base_model"] == "Qwen/Qwen3-Coder-30B-A3B-Instruct"
+    assert jobs[0]["config"]["compatibility"]["base_model"] == [
+        "Qwen/Qwen3-Coder-30B-A3B-Instruct"
+    ]
 
 
 def test_evolution_jobs_are_unpromoted_when_promotion_gate_is_enabled() -> None:
@@ -597,6 +661,53 @@ def test_codex_cli_agent_provider_defaults_reflector_provider_to_codex_cli() -> 
     assert jobs[0]["config"]["reflector_llm"]["provider"] == "codex_cli"
 
 
+def test_proxy_codex_cli_agent_uses_codex_cli_reflector_in_job_config() -> None:
+    compiled = compile_experiment(
+        _config(
+            agent={
+                "preset": "codex",
+                "model": "Qwen/Qwen3-Coder-30B-A3B-Instruct",
+                "auth": "proxy",
+                "provider": "codex_cli",
+                "settings": {"auth_mode": "proxy"},
+            }
+        )
+    )
+
+    jobs = compiled.evolution_job_payloads_for_round(
+        0,
+        dataset_artifact_id="dataset_artifact_1",
+        context_artifact_ids=[],
+    )
+
+    assert jobs[0]["config"]["reflector_llm"] == {
+        "provider": "codex_cli",
+        "model": "Qwen/Qwen3-Coder-30B-A3B-Instruct",
+    }
+    assert jobs[0]["config"]["reflector_llm"]["provider"] != "openai_chat"
+
+
+def test_proxy_agent_respects_explicit_openai_chat_reflector_provider() -> None:
+    compiled = compile_experiment(
+        _config(
+            agent={
+                "preset": "codex",
+                "model": "gpt-5.1-codex-mini",
+                "auth": "proxy",
+                "provider": "openai_chat",
+            }
+        )
+    )
+
+    jobs = compiled.evolution_job_payloads_for_round(
+        0,
+        dataset_artifact_id="dataset_artifact_1",
+        context_artifact_ids=[],
+    )
+
+    assert jobs[0]["config"]["reflector_llm"]["provider"] == "openai_chat"
+
+
 def test_task_filter_and_round_override_are_applied() -> None:
     config = _config(
         tasks=[
@@ -621,3 +732,37 @@ def test_empty_task_filter_is_rejected() -> None:
         assert "task_ids must select at least one task" in str(exc)
     else:
         raise AssertionError("expected ValueError")
+
+
+def test_workspace_upload_precedes_runtime_prepare_actions() -> None:
+    config = _config(
+        runtime={
+            "image": "runtime:latest",
+            "prepare": [
+                {
+                    "type": "exec",
+                    "command": "python -m pip install -r requirements.txt",
+                    "cwd": "/polar/session/workspace",
+                }
+            ],
+        }
+    )
+    compiled = compile_experiment(config)
+
+    payload = compiled.tasks[0].rollout_payload_for_round(0, context_artifact_ids=[])
+
+    assert payload["runtime"]["prepare"] == [
+        {
+            "type": "upload_dir",
+            "source": "/root/codex54minitest/five_article_agentic_workflow_subset",
+            "target": "/polar/session/workspace",
+        },
+        {
+            "type": "exec",
+            "command": "python -m pip install -r requirements.txt",
+            "cwd": "/polar/session/workspace",
+            "env": None,
+            "source": None,
+            "target": None,
+        },
+    ]

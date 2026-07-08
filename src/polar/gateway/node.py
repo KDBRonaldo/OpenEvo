@@ -38,7 +38,7 @@ from polar.rollout.models import (
     SessionStatus,
 )
 from polar.rollout.timer import StageTimer
-from polar.runtime.base import BaseRuntime
+from polar.runtime.base import BaseRuntime, RUNTIME_SESSION_DIR
 from polar.runtime.factory import create_runtime
 from polar.runtime.models import ExecInput, RuntimeSpec
 from polar.trajectory.models import (
@@ -56,6 +56,7 @@ from polar_evolution.client import EvolutionClient
 logger = logging.getLogger(__name__)
 
 _SAFE_SKILL_NAME_RE = re.compile(r"[^A-Za-z0-9_.-]+")
+_SUBSCRIPTION_AUTH_MODES = {"subscription", "chatgpt_subscription"}
 
 
 class GatewayExecutionTimeout(TimeoutError):
@@ -356,6 +357,34 @@ def _completion_session_with_agent_metadata(
     return completion_session.model_copy(update={"metadata": metadata})
 
 
+def _is_codex_subscription_agent(agent) -> bool:
+    if agent.harness != "codex":
+        return False
+    auth_mode = agent.settings.get("auth_mode")
+    return isinstance(auth_mode, str) and auth_mode in _SUBSCRIPTION_AUTH_MODES
+
+
+def _runtime_codex_home(agent) -> str:
+    codex_home = agent.env.get("CODEX_HOME")
+    if isinstance(codex_home, str) and codex_home.strip():
+        return codex_home.strip()
+    return f"{RUNTIME_SESSION_DIR}/.codex"
+
+
+def _host_path_for_runtime_session_path(
+    session_dir: Path,
+    runtime_path: str,
+) -> Path | None:
+    path = PurePosixPath(runtime_path)
+    try:
+        relative = path.relative_to(PurePosixPath(RUNTIME_SESSION_DIR))
+    except ValueError:
+        return None
+    if any(part in {"", ".", ".."} for part in relative.parts):
+        return None
+    return session_dir.joinpath(*relative.parts)
+
+
 class GatewayNodeManager:
     """Run the INIT/READY/RUN/POST_RUN lifecycle on one gateway node."""
 
@@ -549,6 +578,7 @@ class GatewayNodeManager:
         managed.timer.mark("init", "started")
         try:
             runtime_spec = self._resolve_runtime_spec(request)
+            self._stage_codex_subscription_auth(request, managed.session_dir)
             runtime = create_runtime(runtime_spec, request.session_id, managed.session_dir)
             managed.runtime = runtime
             await self._await_with_budget(runtime.start(), managed)
@@ -577,6 +607,34 @@ class GatewayNodeManager:
                 "node has no default_runtime"
             )
         return spec
+
+    def _stage_codex_subscription_auth(
+        self,
+        request: SessionDispatchRequest,
+        session_dir: Path,
+    ) -> None:
+        if not _is_codex_subscription_agent(request.agent):
+            return
+
+        runtime_codex_home = _runtime_codex_home(request.agent)
+        target_home = _host_path_for_runtime_session_path(
+            session_dir,
+            runtime_codex_home,
+        )
+        if target_home is None:
+            raise RuntimeError(
+                "Codex subscription CODEX_HOME must be under "
+                f"{RUNTIME_SESSION_DIR} so the runtime can receive auth.json"
+            )
+
+        source = Path.home() / ".codex" / "auth.json"
+        if not source.is_file():
+            raise RuntimeError(
+                "Codex subscription auth was not found at ~/.codex/auth.json"
+            )
+
+        target_home.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target_home / "auth.json")
 
     async def _run_runtime_prepare(
         self,
