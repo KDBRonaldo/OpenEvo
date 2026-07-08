@@ -1749,6 +1749,54 @@ plumbing for compatible task packages, while the remaining `train-fasttext`
 parametric-memory work is method-level: avoid slow network apt setup, provide a
 cached task image or mirror, and train a cleaner long-command solve policy.
 
+A single-command follow-up isolated that method variable on GPU 7. The dry
+projection at
+`/tmp/tb21-task-local-parametric-trainfasttext-singlecommand-20260708/dryrun-long-command`
+used the two failed long-timeout treatment traces above and a staged corrective
+projection with three stages: `read_task`, a repeated
+`single_long_exec_after_read` target, and a repeated
+`single_long_exec_after_failures` target. Training at
+`/tmp/tb21-task-local-parametric-trainfasttext-singlecommand-20260708/train-single-long-command-r8-s120-v2`
+used `Qwen/Qwen3.5-9B`, LoRA rank 8, alpha 16, `max_length=4096`, and 120
+steps on `CUDA_VISIBLE_DEVICES=7`. It produced artifact
+`art_8485054684174de1` with 76 SFT records and an adapter at
+`artifacts/workers/job_48c9914abf464311/parametric_memory_lora_sft/adapter`;
+diagnostics recorded loss falling from about `0.84` to `2.15e-4`.
+
+The treatment-only eval at
+`/tmp/tb21-task-local-parametric-trainfasttext-singlecommand-20260708/eval-single-long-command-r8-s120-v2-treatment-only-gpu7`
+loaded the adapter through managed vLLM on GPU 7 with
+`qwen3_5_vllm_language_model` key rewrite, enabled only
+`parametric_memory`, and used the local task-package timeout floor/cap of 3600
+seconds. The first live `tb_exec` did request the intended long setup/train
+command with `timeout_seconds=3600`, proving the adapter can shape the policy
+toward a long single command. The run still scored `0/1`: the generated Python
+heredoc turned escaped newline string literals into literal line breaks inside
+`str.replace(...)` and `f.write(...)`, causing `SyntaxError`; follow-up retries
+then drifted into deleting `/tmp/fastText` before running `make`.
+
+A no-escape retrain removed that Python string-literal failure from the target
+command by using `splitlines()` and `print(..., file=f)` instead of embedded
+newline escapes. Training at
+`/tmp/tb21-task-local-parametric-trainfasttext-singlecommand-20260708/train-single-long-command-r8-s120-v3-noescape`
+again exported 76 records, trained 120 steps on GPU 7, and produced artifact
+`art_11ac3dd17a2647fe`; diagnostics recorded loss falling from about `0.84` to
+`9.3e-5`. Two treatment-only evals at
+`/tmp/tb21-task-local-parametric-trainfasttext-singlecommand-20260708/eval-single-long-command-r8-s120-v3-noescape-treatment-only-gpu7`
+and
+`/tmp/tb21-task-local-parametric-trainfasttext-singlecommand-20260708/eval-single-long-command-r8-s120-v3-noescape-treatment-only-gpu7-output3072`
+both scored `0/1`. In both runs the first `tb_exec` was rejected before shell
+execution because Qwen3 XML tool parsing captured malformed `_raw_arguments`
+ending with `</tool_response>` instead of a complete JSON object containing
+`task_id`, `command`, and `timeout_seconds`. Raising the effective output cap
+from 1536 to 3072 tokens did not change the malformed arguments, so this is not
+an output-budget truncation issue. The resulting method conclusion is that a
+single very long `tb_exec` target is too brittle for this Qwen3 tool-call
+surface: v2 preserved tool schema but failed Python escaping, while v3 fixed the
+shell/Python target and broke tool-call closure. The next `train-fasttext`
+backend candidate should prefer shorter staged targets plus explicit tool-schema
+lock/correction records over another single-command adapter.
+
 Evaluate baseline local Qwen and adapter local Qwen against the same subset:
 
 ```sh
