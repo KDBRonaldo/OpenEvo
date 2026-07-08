@@ -32,6 +32,44 @@ def test_sidecar_health_endpoint() -> None:
     assert response.json() == {"service": "openevo-sidecar", "status": "ok"}
 
 
+def test_sidecar_exposes_core_capabilities() -> None:
+    client = TestClient(create_sidecar_app())
+
+    response = client.get("/openevo-api/desktop/capabilities")
+
+    assert response.status_code == 200
+    payload = response.json()
+    execution_modes = {item["mode"] for item in payload["execution_modes"]}
+    assert {
+        "codex_subscription_transcript",
+        "self-deployed",
+    }.issubset(execution_modes)
+    artifact_targets = {item["artifact_type"] for item in payload["artifact_targets"]}
+    assert {"text_memory", "skill_bundle", "agent_system"}.issubset(
+        artifact_targets
+    )
+    methods = {
+        item["method_id"]: item
+        for item in payload["evolution_methods"]
+    }
+    text_memory_method = methods["text_memory_reflector"]
+    assert text_memory_method["visibility"]
+    assert isinstance(text_memory_method["default_config"], dict)
+    assert isinstance(text_memory_method["config_schema"], dict)
+
+
+def test_sidecar_exposes_methods_alias() -> None:
+    client = TestClient(create_sidecar_app())
+
+    response = client.get("/openevo-api/desktop/methods")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert set(payload) == {"methods"}
+    method_ids = {item["method_id"] for item in payload["methods"]}
+    assert "text_memory_reflector" in method_ids
+
+
 def test_desktop_shell_endpoint_preserves_subscription_readiness() -> None:
     client = TestClient(create_sidecar_app())
 
@@ -1865,6 +1903,73 @@ def test_run_artifacts_endpoint_reports_remote_read_failure() -> None:
     assert response.json()["detail"] == "python3: command not found"
 
 
+def test_artifact_content_api_returns_memory_markdown() -> None:
+    project = ScienceProjectConfig.model_validate(_science_project_payload())
+    profile = _remote_profile()
+    transport = _ArtifactContentTransport(
+        _sample_run_summary_with_artifact_content(),
+        "# Learned Memory\n\n- Prefer stable folds.\n",
+    )
+    client = TestClient(
+        create_sidecar_app_for_project(
+            project,
+            profile,
+            transport_factory=lambda _profile: transport,
+        )
+    )
+    token = _sidecar_token(client)
+    headers = {"X-OpenEvo-Sidecar-Token": token}
+    _prepare_workspace_bootstrap_and_services(client, headers)
+    client.post("/openevo-api/desktop/run", headers=headers)
+    _wait_latest_run_state(client, headers, "succeeded")
+
+    response = client.get(
+        "/openevo-api/desktop/artifacts/artifact-text-memory/content",
+        headers=headers,
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "artifact_id": "artifact-text-memory",
+        "artifact_type": "text_memory",
+        "filename": "memory.md",
+        "content": "# Learned Memory\n\n- Prefer stable folds.\n",
+        "mime_type": "text/markdown",
+    }
+    assert any("memory.md" in command for command in transport.commands)
+
+
+def test_artifact_content_api_rejects_unsafe_content_path() -> None:
+    project = ScienceProjectConfig.model_validate(_science_project_payload())
+    profile = _remote_profile()
+    summary = _sample_run_summary_with_artifact_content()
+    summary["artifacts"][0]["manifest"]["content_path"] = "../secrets.txt"
+    transport = _ArtifactContentTransport(summary, "secret")
+    client = TestClient(
+        create_sidecar_app_for_project(
+            project,
+            profile,
+            transport_factory=lambda _profile: transport,
+        )
+    )
+    token = _sidecar_token(client)
+    headers = {"X-OpenEvo-Sidecar-Token": token}
+    _prepare_workspace_bootstrap_and_services(client, headers)
+    client.post("/openevo-api/desktop/run", headers=headers)
+    _wait_latest_run_state(client, headers, "succeeded")
+
+    response = client.get(
+        "/openevo-api/desktop/artifacts/artifact-text-memory/content",
+        headers=headers,
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == (
+        "Artifact content_path must stay within the artifact root."
+    )
+    assert not any("secrets.txt" in command for command in transport.commands)
+
+
 def test_run_response_schema_has_structured_report_contract() -> None:
     client = TestClient(create_sidecar_app())
 
@@ -2066,6 +2171,19 @@ def _sample_run_summary() -> dict:
     }
 
 
+def _sample_run_summary_with_artifact_content() -> dict:
+    summary = _sample_run_summary()
+    summary["artifacts"] = [
+        {
+            "artifact_id": "artifact-text-memory",
+            "type": "text_memory",
+            "uri": "file:///remote/run/artifacts/text_memory/artifact-text-memory",
+            "manifest": {"content_path": "memory.md"},
+        }
+    ]
+    return summary
+
+
 class _ApiDryRunTransport:
     def __init__(self) -> None:
         self.uploads: list[tuple[str, str]] = []
@@ -2181,6 +2299,44 @@ class _RunArtifactsTransport(_ApiDryRunTransport):
             cwd=cwd,
             env=env,
             timeout_seconds=timeout_seconds,
+        )
+
+
+class _ArtifactContentTransport(_RunArtifactsTransport):
+    def __init__(self, summary: dict, content: str) -> None:
+        super().__init__(summary)
+        self.content = content
+
+    def run(
+        self,
+        command: str,
+        *,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        timeout_seconds: float = 30.0,
+    ) -> RemoteCommandResult:
+        if "summary.json" in command or command.startswith(
+            'PATH="$HOME/.local/bin:$PATH" openevo run '
+        ):
+            return super().run(
+                command,
+                cwd=cwd,
+                env=env,
+                timeout_seconds=timeout_seconds,
+            )
+        if "memory.md" not in command and "secrets.txt" not in command:
+            return super().run(
+                command,
+                cwd=cwd,
+                env=env,
+                timeout_seconds=timeout_seconds,
+            )
+        self.commands.append(command)
+        self.run_calls.append((command, cwd, timeout_seconds))
+        return RemoteCommandResult(
+            command=command,
+            return_code=0,
+            stdout=self.content,
         )
 
 

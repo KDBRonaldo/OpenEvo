@@ -156,6 +156,12 @@ Without `--json`, the same payload is printed as YAML for manual inspection.
 OpenEvo Desktop keeps the foundation plan as the source of truth for mutating
 sidecar endpoints:
 
+- `GET /openevo-api/desktop/capabilities` exposes Core execution-mode,
+  artifact-target, and evolution-method metadata. It is read-only and does not
+  require a sidecar mutation token or active project session.
+- `GET /openevo-api/desktop/methods` is a read-only catalog alias that returns
+  `{"methods": [...]}` using the same evolution-method capability objects from
+  Core.
 - `POST /openevo-api/desktop/workspace` consumes the workspace preparation plan.
 - `POST /openevo-api/desktop/bootstrap` compiles the experiment snapshot and
   prepares the remote user-site OpenEvo CLI, state root, and optional Hugging
@@ -166,6 +172,17 @@ sidecar endpoints:
   the execution mode requires local inference.
 - `POST /openevo-api/desktop/run` launches `openevo run` only after workspace,
   bootstrap, and services are all ready.
+- `GET /openevo-api/desktop/run/artifacts` reads the latest terminal remote
+  run's `summary.json` and returns a compact task/round/job artifact summary.
+- `GET /openevo-api/desktop/artifacts/{artifact_id}/content` reads one
+  human-readable text artifact from that latest terminal run summary. It
+  requires the sidecar mutation token and an active config-backed session. The
+  sidecar resolves only artifact metadata present in the latest summary, supports
+  `file://` artifact URIs, accepts only relative in-artifact content paths, and
+  returns markdown/text content for `text_memory`, `skill_bundle`, and
+  `agent_system`. It rejects non-file URI schemes, path traversal, active runs,
+  missing runs, and unsupported binary artifacts instead of accepting arbitrary
+  request-supplied file paths.
 
 The service supervisor is intentionally command based. It exports the remote
 profile proxy/PIP/Hugging Face environment for the full remote command script,

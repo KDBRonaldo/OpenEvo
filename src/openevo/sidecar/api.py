@@ -12,12 +12,18 @@ import secrets
 import shlex
 from typing import Any, Literal
 from threading import Lock, Thread
+from urllib.parse import unquote, urlparse
 
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.encoders import jsonable_encoder
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic import ValidationError
 
+from openevo.core.capabilities import (
+    CoreCapabilities,
+    EvolutionMethodCapability,
+    build_core_capabilities,
+)
 from openevo.remote.executor import RemoteExecutorTransport
 from openevo.remote.redaction import sanitize_remote_text
 from openevo.science import ScienceProjectConfig
@@ -279,6 +285,25 @@ class OpenEvoDesktopRunArtifactsResponse(_StrictFrozenModel):
     tasks: list[OpenEvoDesktopRunArtifactTask] = Field(default_factory=list)
 
 
+class OpenEvoDesktopMethodsResponse(_StrictFrozenModel):
+    methods: tuple[EvolutionMethodCapability, ...] = Field(default_factory=tuple)
+
+    @field_validator("methods", mode="before")
+    @classmethod
+    def _coerce_methods(cls, value):
+        if isinstance(value, list):
+            return tuple(value)
+        return value
+
+
+class OpenEvoDesktopArtifactContent(_StrictFrozenModel):
+    artifact_id: str
+    artifact_type: str
+    filename: str
+    content: str
+    mime_type: str = "text/markdown"
+
+
 @dataclass
 class OpenEvoSidecarSession:
     project: ScienceProjectConfig
@@ -480,6 +505,22 @@ def create_sidecar_app(
             desktop_status,
             sidecar_token,
             transport_kind=transport_kind,
+        )
+
+    @app.get(
+        "/openevo-api/desktop/capabilities",
+        response_model=CoreCapabilities,
+    )
+    def desktop_capabilities() -> CoreCapabilities:
+        return build_core_capabilities()
+
+    @app.get(
+        "/openevo-api/desktop/methods",
+        response_model=OpenEvoDesktopMethodsResponse,
+    )
+    def desktop_methods() -> OpenEvoDesktopMethodsResponse:
+        return OpenEvoDesktopMethodsResponse(
+            methods=build_core_capabilities().evolution_methods,
         )
 
     @app.post(
@@ -941,6 +982,47 @@ def create_sidecar_app(
         summary = _read_remote_run_summary(active_session, latest.output_dir)
         return _run_artifacts_response(latest, summary)
 
+    @app.get(
+        "/openevo-api/desktop/artifacts/{artifact_id}/content",
+        response_model=OpenEvoDesktopArtifactContent,
+    )
+    def artifact_content(
+        artifact_id: str,
+        token: str | None = Header(
+            default=None,
+            alias=SIDECAR_MUTATION_TOKEN_HEADER,
+        ),
+    ) -> OpenEvoDesktopArtifactContent:
+        _validate_mutation_token(token, sidecar_token)
+        active_session = current_session()
+        if active_session is None:
+            raise HTTPException(
+                status_code=409,
+                detail="Desktop artifact content requires a config-backed sidecar session.",
+            )
+        with active_session.status_lock:
+            if active_session.latest_run is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail="No Desktop run has been launched.",
+                )
+            latest = active_session.latest_run
+        if latest.state == "running":
+            raise HTTPException(
+                status_code=409,
+                detail="Desktop artifact content requires a terminal run.",
+            )
+        summary = _read_remote_run_summary(active_session, latest.output_dir)
+        artifact = _artifact_metadata_from_summary(summary, artifact_id)
+        request = _artifact_content_request(artifact)
+        content = _read_remote_artifact_content(active_session, request)
+        return OpenEvoDesktopArtifactContent(
+            artifact_id=artifact_id,
+            artifact_type=request.artifact_type,
+            filename=request.filename,
+            content=content,
+        )
+
     return app
 
 
@@ -1144,6 +1226,199 @@ def _read_run_summary_command(output_dir: str) -> str:
             f"path = Path({output_dir!r}) / 'summary.json'",
             "if not path.is_file():",
             "    raise SystemExit('OpenEvo run summary not found.')",
+            "print(path.read_text(encoding='utf-8'), end='')",
+            "PY",
+        ]
+    )
+
+
+@dataclass(frozen=True)
+class _ArtifactContentReadRequest:
+    artifact_type: str
+    artifact_root: str
+    relative_path: str
+    filename: str
+
+
+def _artifact_metadata_from_summary(
+    summary: dict[str, Any],
+    artifact_id: str,
+) -> dict[str, Any]:
+    for artifact in _iter_summary_artifact_metadata(summary):
+        if artifact.get("artifact_id") == artifact_id:
+            return artifact
+    raise HTTPException(
+        status_code=404,
+        detail="Artifact not found in latest run summary.",
+    )
+
+
+def _iter_summary_artifact_metadata(value: object):
+    if isinstance(value, dict):
+        if isinstance(value.get("artifact_id"), str):
+            yield value
+        for child in value.values():
+            yield from _iter_summary_artifact_metadata(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _iter_summary_artifact_metadata(child)
+
+
+def _artifact_content_request(
+    artifact: dict[str, Any],
+) -> _ArtifactContentReadRequest:
+    artifact_type = _optional_string(artifact.get("type")) or _optional_string(
+        artifact.get("artifact_type")
+    )
+    if artifact_type not in {"text_memory", "skill_bundle", "agent_system"}:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Artifact content is only supported for text_memory, "
+                "skill_bundle, and agent_system artifacts."
+            ),
+        )
+    uri = _optional_string(artifact.get("uri"))
+    if uri is None:
+        raise HTTPException(
+            status_code=422,
+            detail="Artifact summary does not include a file URI.",
+        )
+    uri_path = _file_uri_path(uri)
+    relative_path = _artifact_relative_content_path(
+        artifact,
+        artifact_type=artifact_type,
+        uri_path=uri_path,
+    )
+    artifact_root = _artifact_root_path(
+        artifact_type=artifact_type,
+        uri_path=uri_path,
+        relative_path=relative_path,
+    )
+    _validate_relative_artifact_path(relative_path)
+    return _ArtifactContentReadRequest(
+        artifact_type=artifact_type,
+        artifact_root=artifact_root,
+        relative_path=relative_path,
+        filename=posixpath.basename(relative_path),
+    )
+
+
+def _file_uri_path(uri: str) -> str:
+    parsed = urlparse(uri)
+    if parsed.scheme != "file":
+        raise HTTPException(
+            status_code=422,
+            detail="Artifact URI must use the file scheme.",
+        )
+    path = unquote(parsed.path)
+    if not path.startswith("/"):
+        raise HTTPException(
+            status_code=422,
+            detail="Artifact file URI must contain an absolute path.",
+        )
+    return posixpath.normpath(path)
+
+
+def _artifact_relative_content_path(
+    artifact: dict[str, Any],
+    *,
+    artifact_type: str,
+    uri_path: str,
+) -> str:
+    manifest = artifact.get("manifest")
+    if isinstance(manifest, dict):
+        content_path = manifest.get("content_path")
+        if isinstance(content_path, str) and content_path.strip():
+            return content_path.strip()
+    if artifact_type == "text_memory":
+        filename = posixpath.basename(uri_path)
+        return filename if "." in filename else "memory.md"
+    if artifact_type == "agent_system":
+        if isinstance(manifest, dict):
+            target_path = manifest.get("target_path")
+            if isinstance(target_path, str) and target_path.strip():
+                return posixpath.basename(target_path.strip())
+        return "agent_system.md"
+    return "SKILL.md"
+
+
+def _artifact_root_path(
+    *,
+    artifact_type: str,
+    uri_path: str,
+    relative_path: str,
+) -> str:
+    if artifact_type in {"text_memory", "agent_system"}:
+        uri_filename = posixpath.basename(uri_path)
+        if uri_filename == posixpath.basename(relative_path):
+            return posixpath.dirname(uri_path)
+    return uri_path
+
+
+def _validate_relative_artifact_path(relative_path: str) -> None:
+    normalized = posixpath.normpath(relative_path)
+    if (
+        normalized in {"", "."}
+        or posixpath.isabs(relative_path)
+        or normalized == ".."
+        or normalized.startswith("../")
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail="Artifact content_path must stay within the artifact root.",
+        )
+
+
+def _read_remote_artifact_content(
+    session: OpenEvoSidecarSession,
+    request: _ArtifactContentReadRequest,
+) -> str:
+    transport = session.transport_factory(session.profile)
+    command = _read_artifact_content_command(
+        request.artifact_root,
+        request.relative_path,
+    )
+    result = transport.run(command, timeout_seconds=30.0)
+    env = session.profile.proxy.to_env()
+    if not result.ok:
+        detail = sanitize_remote_text(result.stderr or result.stdout, env).strip()
+        if "not found" in detail.lower():
+            raise HTTPException(
+                status_code=404,
+                detail="Artifact content file not found.",
+            )
+        if "stay within the artifact root" in detail:
+            raise HTTPException(status_code=422, detail=detail)
+        raise HTTPException(
+            status_code=502,
+            detail=detail or "Failed to read artifact content.",
+        )
+    return result.stdout
+
+
+def _read_artifact_content_command(artifact_root: str, relative_path: str) -> str:
+    return "\n".join(
+        [
+            "python3 - <<'PY'",
+            "from pathlib import Path",
+            f"root = Path({artifact_root!r}).resolve()",
+            f"relative = Path({relative_path!r})",
+            "if relative.is_absolute() or '..' in relative.parts:",
+            (
+                "    raise SystemExit("
+                "'Artifact content_path must stay within the artifact root.')"
+            ),
+            "path = (root / relative).resolve()",
+            "try:",
+            "    path.relative_to(root)",
+            "except ValueError:",
+            (
+                "    raise SystemExit("
+                "'Artifact content_path must stay within the artifact root.')"
+            ),
+            "if not path.is_file():",
+            "    raise SystemExit('Artifact content file not found.')",
             "print(path.read_text(encoding='utf-8'), end='')",
             "PY",
         ]
