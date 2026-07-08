@@ -890,6 +890,42 @@ The next method iteration should extend the sequence through verified local
 training and add correction records around failed package/model commands, rather
 than only training the bootstrap install segment.
 
+The next extended-stage `train-fasttext` adapter follows that recommendation
+and is ready for paired eval when a clean local GPU is available. The dry-run at
+`/tmp/tb21-task-local-parametric-trainfasttext-extended-20260708/dryrun-model-sequence`
+again used the three local Qwen failures plus one Codex success, but required
+the successful trajectory to reach `/app/model.bin` and still excluded
+`rg --files`. With `--target-mode sequence` and `--max-records-per-task 30`, it
+exported 30 records: one failed local prefix received the full 22-step sequence
+from data/environment inspection through model production, and a second failed
+local prefix received the final eight model-production targets. Six records
+explicitly targeted `/app/model.bin`; the rest teach the preceding data,
+package, normalization, and fastText training stages.
+
+Training at
+`/tmp/tb21-task-local-parametric-trainfasttext-extended-20260708/train-trainfasttext-qwen35-model-sequence-r8-s100`
+used Qwen3.5-9B on GPU 6 with LoRA rank 8, alpha 16, max length 4096, and
+100 SFT steps. The adapter directory was written at
+`artifacts/workers/job-tb-parametric-memory-trainfasttext-model-sequence-r8-s100/parametric_memory_lora_sft/adapter`
+and contains `adapter_model.safetensors`, tokenizer files, and
+`trainer_diagnostics.json`. Diagnostics recorded `record_count=30`,
+`trained_steps=100`, and losses moving from about `1.10`, `0.65`, `0.68` to a
+noisier final tail between roughly `0.0014` and `0.37`. The process was
+interrupted before the CLI wrote its top-level `job.json`, but the adapter
+artifact itself is complete and can be used directly for eval with adapter id
+`tb-parametric-memory-trainfasttext-model-sequence-r8-s100`.
+
+The paired eval for this extended adapter is intentionally not reported yet.
+At resume time, GPU 6 showed active 33GB/95% utilization with no visible
+OpenEvo-owned process in the normal process table, while GPU 7 was occupied by
+the long-running `qwen3.5-curator` vLLM service on port 8008. To avoid
+interfering with another job, do not launch the extended paired eval until a
+clean GPU is visible. The intended eval root is
+`/tmp/tb21-task-local-parametric-trainfasttext-extended-20260708/eval-trainfasttext-qwen35-model-sequence-r8-s100`,
+with managed Qwen3.5-9B vLLM and adapter key rewrite
+`qwen3_5_vllm_language_model`. Use deterministic decoding, no artifact-path
+guard, and only `parametric_memory` enabled.
+
 The next fast-verifier task-local run used `gcode-to-text`, which has both
 failed and successful trajectory-pool records and a lightweight pytest
 verifier. The dry projection at
