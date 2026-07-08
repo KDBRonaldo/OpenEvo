@@ -1742,13 +1742,30 @@ complete `tb_exec` call:
 `task_id="terminal-bench-task"` and `timeout_seconds=30`, then ran
 `tb_run_tests`, and the verifier rewarded `1.0`.
 
-Across the two current-runner Qwen3.5 controlled pass@3 reproductions above,
-both tasks kept only `parametric_memory` enabled and disabled `text_memory`,
+A pass@3 reproduction on GPU 7 at
+`/tmp/tb21-task-local-parametric-vulnerable-secret-repeat-20260708/eval-live-repeat16-schema16-r8-s120-pass3`
+used the same adapter, local Qwen3.5-9B serving setup, and
+`artifact_path_guard=off`. `summary.json` recorded baseline rewards
+`[0.0, 0.0, 0.0]` and
+parametric-memory rewards `[1.0, 1.0, 1.0]`, so baseline pass@1/pass@3 was
+`0/1`, parametric-memory pass@1/pass@3 was `1/1`, mean reward improved from
+`0.0` to `1.0`, and delta pass@1/pass@3 was `+1`. All three treatment trials
+emitted the exact `tb_exec` command above with complete `task_id` and
+`timeout_seconds` arguments. The first treatment trial continued issuing
+repeated write/test/report calls after the first successful report, but Harbor
+still scored the final trial reward as `1.0`; this is a useful stability signal
+for future finish-boundary training rather than a failure of the task-local
+adapter.
+
+Across the three current-runner Qwen3.5 controlled pass@3 reproductions above,
+all three tasks kept only `parametric_memory` enabled and disabled `text_memory`,
 `skill_bundle`, and `agent_system`. `gcode-to-text` moved from baseline
 `[0.0, 0.0, 0.0]` to parametric `[1.0, 1.0, 1.0]`, so mean reward delta was
 `+1.0` and pass@1/pass@3 delta was `+1`. `password-recovery` moved from
 baseline `[0.0, 0.0, 0.0]` to parametric `[1.0, 1.0, 0.0]`, so mean reward
-delta was about `+0.667` and pass@1/pass@3 delta was `+1`. This is the current
+delta was about `+0.667` and pass@1/pass@3 delta was `+1`. `vulnerable-secret`
+moved from baseline `[0.0, 0.0, 0.0]` to parametric `[1.0, 1.0, 1.0]`, so mean
+reward delta was `+1.0` and pass@1/pass@3 delta was `+1`. This is the current
 best controlled evidence that local parametric memory can improve selected
 Terminal Bench 2.1 tasks under fixed non-memory evolution variables. It is not
 yet a full-benchmark gain estimate; the negative `train-fasttext` probes below
