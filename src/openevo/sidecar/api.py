@@ -1246,18 +1246,23 @@ class _ArtifactContentReadRequest:
 
 
 def _summary_contains_artifact_id(value: object, artifact_id: str) -> bool:
-    if isinstance(value, dict):
-        if value.get("artifact_id") == artifact_id:
-            return True
-        for key in ("artifact_ids", "approved_artifact_ids"):
-            if _artifact_id_container_contains(value.get(key), artifact_id):
+    if not isinstance(value, dict):
+        return False
+    for task in _dict_list(value.get("tasks")):
+        for round_payload in _dict_list(task.get("rounds")):
+            if _artifact_id_container_contains(
+                round_payload.get("artifact_ids"),
+                artifact_id,
+            ):
                 return True
-        return any(
-            _summary_contains_artifact_id(child, artifact_id)
-            for child in value.values()
-        )
-    if isinstance(value, list):
-        return any(_summary_contains_artifact_id(child, artifact_id) for child in value)
+            for job in _dict_list(round_payload.get("jobs")):
+                if _artifact_id_container_contains(job.get("artifact_ids"), artifact_id):
+                    return True
+                if _artifact_id_container_contains(
+                    job.get("approved_artifact_ids"),
+                    artifact_id,
+                ):
+                    return True
     return False
 
 
