@@ -292,6 +292,9 @@ ssh` when those entrypoints should mutate a remote server.
 
 Release wheels are built from the OpenEvo package metadata and include the
 packaged OpenEvo-only Desktop assets under `openevo/desktop/web/`.
+The `OpenEvo release artifact` GitHub Actions workflow runs the same audited
+release smoke path on `v*` tags and manual dispatch, then uploads `dist/*.whl`
+as the `openevo-wheel` artifact. It intentionally does not publish to PyPI yet.
 
 Before publishing a wheel, run the release smoke flow on Node 22, refresh the
 packaged Desktop assets, and validate the installed wheel:

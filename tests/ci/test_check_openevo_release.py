@@ -174,6 +174,41 @@ def test_release_smoke_workflow_builds_packaged_assets_and_validates_wheel() -> 
     )
 
 
+def test_release_artifact_workflow_builds_validated_wheel_artifact() -> None:
+    workflow = Path(".github/workflows/openevo-release-artifact.yml")
+
+    text = workflow.read_text(encoding="utf-8")
+
+    assert "workflow_dispatch:" in text
+    assert "tags:" in text
+    assert '"v*"' in text
+    assert 'node-version: "22"' in text
+    assert "npm ci" in text
+    assert "npm audit --audit-level=high" in text
+    assert "npm test -- --run" in text
+    assert "npm run build:openevo" in text
+    assert "diff -qr web/dist src/openevo/desktop/web" in text
+    assert "python -m build --wheel" in text
+    assert "scripts/ci/check_openevo_release.py --wheel dist/*.whl" in text
+    assert ".openevo-wheel-smoke/bin/openevo desktop open --help" in text
+    assert (
+        ".openevo-wheel-smoke/bin/python "
+        "scripts/ci/smoke_openevo_desktop_wheel.py"
+    ) in text
+    assert "actions/upload-artifact@v4" in text
+    assert "path: dist/*.whl" in text
+
+    assert text.index("npm audit --audit-level=high") < text.index(
+        "npm run build:openevo"
+    )
+    assert text.index("python -m build --wheel") < text.index(
+        "scripts/ci/check_openevo_release.py --wheel dist/*.whl"
+    )
+    assert text.index("scripts/ci/check_openevo_release.py --wheel dist/*.whl") < (
+        text.index("actions/upload-artifact@v4")
+    )
+
+
 def test_desktop_science_release_doc_matches_remote_lifecycle_state() -> None:
     doc = Path("docs/architecture/openevo-desktop-science-foundation.md")
 
