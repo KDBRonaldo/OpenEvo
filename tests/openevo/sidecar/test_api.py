@@ -2102,6 +2102,57 @@ def test_artifact_content_api_ignores_worker_result_artifact_ids() -> None:
     assert transport.metadata_commands == []
 
 
+def test_artifact_content_api_ignores_malformed_nested_artifact_fields() -> None:
+    project = ScienceProjectConfig.model_validate(_science_project_payload())
+    profile = _remote_profile()
+    summary = _sample_run_summary_with_artifact_content()
+    round_payload = summary["tasks"][0]["rounds"][0]
+    round_payload["artifact_ids"] = {
+        "text_memory": [{"artifact_ids": ["artifact-smuggled"]}]
+    }
+    round_payload["jobs"][0]["artifact_ids"] = [
+        {"artifact_ids": ["artifact-smuggled"]}
+    ]
+    round_payload["jobs"][0]["approved_artifact_ids"] = [
+        {"artifact_ids": ["artifact-smuggled"]}
+    ]
+    transport = _ArtifactContentTransport(
+        summary,
+        "# Smuggled\n",
+        artifact_metadata={
+            "artifact-smuggled": _artifact_metadata(
+                artifact_id="artifact-smuggled",
+                artifact_type="text_memory",
+                uri="file:///remote/run/artifacts/text_memory/artifact-smuggled",
+                manifest={"content_path": "memory.md"},
+            ),
+        },
+        content_root="/remote/run/artifacts/text_memory/artifact-smuggled",
+        content_relative_path="memory.md",
+    )
+    client = TestClient(
+        create_sidecar_app_for_project(
+            project,
+            profile,
+            transport_factory=lambda _profile: transport,
+        )
+    )
+    token = _sidecar_token(client)
+    headers = {"X-OpenEvo-Sidecar-Token": token}
+    _prepare_workspace_bootstrap_and_services(client, headers)
+    client.post("/openevo-api/desktop/run", headers=headers)
+    _wait_latest_run_state(client, headers, "succeeded")
+
+    response = client.get(
+        "/openevo-api/desktop/artifacts/artifact-smuggled/content",
+        headers=headers,
+    )
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "Artifact not found in latest run summary."
+    assert transport.metadata_commands == []
+
+
 def test_run_response_schema_has_structured_report_contract() -> None:
     client = TestClient(create_sidecar_app())
 

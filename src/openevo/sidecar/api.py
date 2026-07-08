@@ -1250,15 +1250,15 @@ def _summary_contains_artifact_id(value: object, artifact_id: str) -> bool:
         return False
     for task in _dict_list(value.get("tasks")):
         for round_payload in _dict_list(task.get("rounds")):
-            if _artifact_id_container_contains(
+            if _artifact_id_map_contains(
                 round_payload.get("artifact_ids"),
                 artifact_id,
             ):
                 return True
             for job in _dict_list(round_payload.get("jobs")):
-                if _artifact_id_container_contains(job.get("artifact_ids"), artifact_id):
+                if _artifact_id_list_contains(job.get("artifact_ids"), artifact_id):
                     return True
-                if _artifact_id_container_contains(
+                if _artifact_id_list_contains(
                     job.get("approved_artifact_ids"),
                     artifact_id,
                 ):
@@ -1266,17 +1266,16 @@ def _summary_contains_artifact_id(value: object, artifact_id: str) -> bool:
     return False
 
 
-def _artifact_id_container_contains(value: object, artifact_id: str) -> bool:
-    if isinstance(value, str):
-        return value == artifact_id
-    if isinstance(value, list):
-        return any(_artifact_id_container_contains(item, artifact_id) for item in value)
-    if isinstance(value, dict):
-        return any(
-            _artifact_id_container_contains(item, artifact_id)
-            for item in value.values()
-        )
-    return False
+def _artifact_id_map_contains(value: object, artifact_id: str) -> bool:
+    if not isinstance(value, dict):
+        return False
+    return any(_artifact_id_list_contains(item, artifact_id) for item in value.values())
+
+
+def _artifact_id_list_contains(value: object, artifact_id: str) -> bool:
+    if not isinstance(value, list):
+        return False
+    return any(item == artifact_id for item in value if isinstance(item, str))
 
 
 def _read_remote_artifact_metadata(
