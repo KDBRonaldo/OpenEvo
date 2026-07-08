@@ -1677,6 +1677,23 @@ long setup commands to request a higher timeout, add a task-package supported
 minimum/default timeout override, or avoid network apt setup; raising only the
 cap is not sufficient.
 
+A follow-up treatment-only GPU 7 run at
+`/tmp/tb21-task-local-parametric-trainfasttext-milestone-longtimeout-20260708/eval-timeoutfloor-treatment-only-gpu7-20260708`
+used the same adapter with `EVOLAB_TB_EXEC_TIMEOUT_CAP_SECONDS=1800`,
+`EVOLAB_TB_EXEC_TIMEOUT_MIN_SECONDS=1800`, and
+`EVOLAB_TB_MAX_SUBAGENT_RUNTIME_SECONDS=2400` in the local task package. It
+again returned reward `0.0` (`0/1`) after 41m03s, with
+`rewritten_key_count=64`, but it verified the timeout-floor path: `apt-get
+update` requested 900 seconds and ran with an effective 1800 second timeout;
+`apt-get install -y g++` also requested 900 seconds and timed out only after
+1800.1 seconds. The run then continued through short recovery/test calls but
+failed when the subagent budget was exceeded after 2443.7 seconds and 21 tool
+calls; later generated Python snippets still contained invalid fragments such
+as `swapNode@params`. At this point OpenEvo can expose the needed timeout
+plumbing for compatible task packages, while the remaining `train-fasttext`
+parametric-memory work is method-level: avoid slow network apt setup, provide a
+cached task image or mirror, and train a cleaner long-command solve policy.
+
 Evaluate baseline local Qwen and adapter local Qwen against the same subset:
 
 ```sh
