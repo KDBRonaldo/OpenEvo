@@ -1053,6 +1053,23 @@ uv run polar-evolution terminal-bench-task-local-parametric-memory-job \
   --output /tmp/tb21-task-local-parametric-trainfasttext-tbexec-correction-20260708/train-combined-tb-exec-failure-r8-s120/job.json
 ```
 
+Because the correction-only final-target job does not teach the multi-step
+recipe, a mixed CPU-side candidate was also prepared without starting training.
+It concatenates the already trained 30-record sequence dataset from
+`/tmp/tb21-task-local-parametric-trainfasttext-extended-20260708/train-trainfasttext-qwen35-model-sequence-r8-s100/dataset/records.jsonl`
+with only the four `tb_exec_failure` records from the combined correction
+dataset, excluding duplicate first-action base records. The mixed job at
+`/tmp/tb21-task-local-parametric-trainfasttext-mixed-20260708/dryrun-sequence-plus-tbexec-correction/job.json`
+therefore contains 34 records: 30 sequence records and 4 failed-command
+correction records. The sequence portion preserves progressive next-command
+targets through the successful `/app/model.bin` write; the correction portion
+covers three fastText import tracebacks and one active-adapter here-document
+fastText syntax failure. The trainer payload uses
+`tb-parametric-memory-train-fasttext-sequence-plus-tbexec-failure-r8-s140`,
+`Qwen/Qwen3.5-9B`, LoRA rank 8, alpha 16, `max_length=4096`, and 140 steps.
+This is the preferred next training candidate once a safe GPU is available,
+because it combines recipe imitation with explicit failed-`tb_exec` repair.
+
 The next fast-verifier task-local run used `gcode-to-text`, which has both
 failed and successful trajectory-pool records and a lightweight pytest
 verifier. The dry projection at
