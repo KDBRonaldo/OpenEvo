@@ -4,13 +4,13 @@ Date: 2026-07-08
 
 ## Purpose
 
-OpenEvo needs two product-facing wrappers around one shared backend:
+OpenEvo needs two product-facing wrappers and one shared backend:
 
 - **OpenEvo Desktop**: a macOS desktop app for ordinary science users who want to run research tasks with OpenEvo.
 - **OpenEvo Dev Kit**: a code, CLI, testing, and benchmark toolkit for OpenEvo developers.
 - **OpenEvo Core**: the single source of truth used by both Desktop and Dev Kit.
 
-The goal of this design is to make Desktop usable by non-CS researchers while keeping all algorithm, runtime, artifact, benchmark, and evolution behavior in Core. Desktop must not become a second implementation of OpenEvo.
+The goal of this design is to make Desktop usable by non-CS researchers while keeping algorithm behavior, runtime behavior, artifact contracts, benchmark contracts, canonical data models, and the evolution flow in Core. Desktop must not become a second implementation of OpenEvo.
 
 This design covers Codex-only execution, subscription mode, self-deployed remote inference mode, remote SSH lifecycle, non-parametric evolution, Desktop monitoring, Dev Kit workflows, and release synchronization.
 
@@ -91,7 +91,7 @@ Dev Kit is for OpenEvo developers. It is not a hidden advanced mode inside Deskt
 
 ## Ordinary User Desktop Flow
 
-After installing the OpenEvo Desktop `.dmg`, a science user should be able to run a task without using `pip install`, editing source code, or manually preparing the remote GPU server.
+After installing the OpenEvo Desktop `.dmg`, a science user should be able to run a task without using `pip install`, editing source code, or manually preparing the remote execution server. A GPU server is required for self-deployed mode, but subscription mode only requires a remote server that can run Codex and OpenEvo.
 
 The expected flow is:
 
@@ -99,7 +99,7 @@ The expected flow is:
 2. Create a science project.
 3. Enter a research objective and task source.
 4. Configure a remote SSH server and workspace root.
-5. Configure optional server-side proxy and package/model mirrors.
+5. Configure optional server-side proxy and package mirrors, plus model mirrors for self-deployed mode.
 6. Choose subscription mode or self-deployed mode.
 7. Choose non-parametric evolution targets.
 8. Run prepare checks.
@@ -147,11 +147,15 @@ Custom runtime images are a Dev Kit or internal workflow. They should not appear
 
 OpenEvo supports two Codex-only modes in this design. The difference is the model source used by Codex on the remote server.
 
-OpenEvo itself must not directly call model APIs to get task or reflection responses.
+For the Desktop science workflow and the covered ordinary-user-visible Core modes, OpenEvo must not directly call model APIs to get task or reflection responses.
+
+This no-direct-model-call rule applies to the Desktop science workflow and to Core methods that are marked as ordinary-user-visible. For the modes covered by this design, task execution and non-parametric reflection must both go through the Codex harness. Direct OpenAI-compatible worker providers, if they remain during migration, are legacy or internal research paths for Dev Kit use only. They must not be selected by Desktop, by ordinary-user-visible Core methods, or by the default Core compilation path for the covered execution modes.
 
 ### Subscription Mode
 
 Subscription mode assumes the remote server already has Codex installed and logged in.
+
+Subscription mode does not require a GPU or a Hugging Face model download. It only checks the remote resources needed to run Codex, OpenEvo, and the task runtime.
 
 Prepare checks include:
 
@@ -187,12 +191,25 @@ Subscription mode does not support parameter evolution in Desktop.
 
 Self-deployed mode assumes the user has a remote GPU server and provides a Hugging Face model name.
 
+`Self-deployed mode` is the product-facing name. Existing internal config values may temporarily use older names while the codebase migrates, but new Desktop labels, user documentation, saved project files, and public Dev Kit surfaces should use `self-deployed`.
+
+Compatibility aliases:
+
+```text
+codex_managed_local_inference -> self-deployed
+proxy auth used by self-deployed internals -> Codex harness through remote gateway/inference
+```
+
+During migration, Core may accept older saved config or API payload values and normalize them to `self-deployed` at the boundary. New public payloads should emit `self-deployed`.
+
+Public boundaries include science project config files, sidecar request/response payloads, frontend API types, shell/status responses, CLI help text, and user documentation.
+
 Core should prepare the remote server by:
 
 - checking SSH connectivity
 - checking GPU and disk availability
 - setting server-side proxy environment variables
-- installing or updating remote OpenEvo
+- installing the matching remote OpenEvo Core version
 - installing required Python dependencies
 - checking or installing Codex CLI
 - downloading the Hugging Face model snapshot
@@ -206,12 +223,16 @@ Execution path:
 ```text
 Desktop -> local sidecar -> OpenEvo Core -> SSH -> remote OpenEvo Core
 remote Core -> Codex CLI -> remote gateway -> remote inference server
-captured transcript/trajectory -> dataset
+Codex transcript and any Core-captured records -> dataset
 dataset -> non-parametric evolution jobs
 promoted artifacts -> next-round context
 ```
 
 Self-deployed mode still uses Codex as the harness. Core must not bypass Codex and directly call the remote inference server for task or reflection responses.
+
+Ordinary-user self-deployed reflection must select `codex_cli` or another Codex-harness path, even if internal fields still use names such as `proxy`. It must not select a direct OpenAI-compatible `openai_chat` provider. The Science/Desktop compilation path must set this explicitly and must not rely on old defaults such as `auth != subscription -> openai_chat`.
+
+Token-level metrics in self-deployed mode may be exposed only when Core actually captured token ids, logprobs, and loss masks through the runtime path. The source of truth is trajectory/session capture metadata or the run summary, not the execution mode name. Desktop must otherwise show transcript/text capture only and must not infer token-level availability from the execution mode name.
 
 Self-deployed mode supports ordinary-user non-parametric evolution. Parameter evolution remains a Core/Dev Kit extension area and is not part of the Desktop science workflow described here.
 
@@ -378,7 +399,7 @@ The project wizard collects:
 - remote workspace root
 - execution mode
 - model name for self-deployed mode
-- proxy and mirror settings
+- proxy and package mirror settings, plus model mirror settings for self-deployed mode
 - non-parametric evolution targets
 
 ### Prepare
@@ -388,10 +409,10 @@ Prepare displays:
 - SSH connection
 - remote OpenEvo version
 - Codex availability and authentication
-- GPU and disk checks
+- GPU and disk checks, with GPU checks required only for self-deployed mode
 - dependency setup
 - proxy and package connectivity
-- model download status
+- model download status, shown only for self-deployed mode
 - managed runtime status
 - service startup status
 
@@ -422,6 +443,8 @@ Evolution Timeline shows:
 - context injected into the next round
 
 Users can open generated artifacts such as `memory.md`, `SKILL.md`, and `AGENTS.md` from Desktop.
+
+Raw command lines, service ports, config paths, stdout/stderr, artifact ids, method ids, and internal store details should be grouped under diagnostics or expandable technical details. They should not be the primary ordinary-user cards or the only explanation for failures.
 
 ## Dev Kit Design
 
@@ -462,12 +485,17 @@ POST /api/remote/preflight
 POST /api/remote/bootstrap
 POST /api/remote/services/start
 GET  /api/remote/services/status
+GET  /api/remote/services/health
 GET  /api/remote/services/logs
+POST /api/remote/services/stop
+POST /api/remote/services/restart
 POST /api/runs
 GET  /api/runs/{id}
 GET  /api/runs/{id}/timeline
 GET  /api/artifacts/{id}
 ```
+
+These paths are logical API names. An implementation may keep a compatibility prefix during migration, and it may group lifecycle operations behind a service facade, but the stable contract is the semantic boundary: Desktop calls sidecar/Core capabilities and lifecycle operations, not internal implementation objects.
 
 The API must return structured machine-readable status plus user-facing summaries. Raw logs should be available for diagnostics but should not be the only failure surface.
 
@@ -481,12 +509,17 @@ Release artifacts:
 - OpenEvo Dev Kit package and CLI
 - source distribution for development
 
-The Desktop bundle must include or reliably install the matching Core version. Remote installation should prefer the exact Core version bundled with Desktop, for example by uploading a bundled wheel or installing a pinned released package. It should not silently install an unrelated latest version.
+The released ordinary-user Desktop artifact is a native macOS app packaged as a `.dmg`. A browser-served shell such as `openevo desktop serve` or `openevo desktop open` may remain as a Dev Kit debugging, smoke-test, or migration aid, but it is not the ordinary-user release format.
+
+The Desktop bundle must include the matching Core version. Remote installation must install that exact Core version, for example by uploading a bundled wheel or installing a pinned released package. If exact-version installation is impossible, the prepare step must fail with a clear remediation instead of silently falling back to an unrelated latest version.
 
 Release checks should verify:
 
+- Tauri `.dmg` artifact is produced for the ordinary-user Desktop release
+- Python package, bundled frontend/web assets, sidecar-reported Core version, Desktop bundle metadata, and Dev Kit CLI version agree
 - Desktop sidecar reports the expected Core version
 - Dev Kit CLI reports the expected Core version
+- remote prepare or smoke tests report a remote Core version matching the Desktop-bundled Core version
 - capability schema loads
 - non-parametric method metadata loads
 - subscription-mode experiment config validates
@@ -538,7 +571,7 @@ Architecture criteria:
 
 - Desktop does not implement an evolution method registry
 - Desktop does not directly call model APIs
-- Core does not bypass Codex to request model responses in the covered modes
+- ordinary-user-visible Core methods do not bypass Codex to request task or reflection responses in the covered modes
 - subscription mode is transcript-only
 - self-deployed mode uses Codex through the remote inference path
 - token-level metrics are not claimed when unavailable
@@ -565,12 +598,15 @@ The current repository already has useful foundations:
 Main gaps to close:
 
 - package Desktop as a Tauri `.dmg` rather than a browser-only shell
+- keep browser-served Desktop commands as Dev Kit/debugging tools only, if they remain
 - make Desktop an ordinary-user science app, not a developer console
 - add Core capability and method metadata APIs
 - remove Desktop hardcoding of evolution target booleans
 - ensure self-deployed non-parametric reflection uses Codex harness flow, not direct Core model API calls
+- migrate public execution-mode naming to `self-deployed`, with any older internal enum treated as a compatibility alias
+- report token-level metrics only when token ids, logprobs, and loss masks are actually captured
 - expose remote lifecycle as structured status, logs, stop, and restart operations
-- install the exact matching remote Core version whenever possible
+- install the exact matching remote Core version and fail clearly when that cannot be done
 - keep custom runtime images out of the ordinary Desktop science path
 - formalize Dev Kit as the developer wrapper around Core
 - align documentation and UI terminology around Core, Desktop, and Dev Kit
