@@ -955,6 +955,26 @@ a `tb_exec` failure-correction stage analogous to the existing
 tool results from the local trajectory and targeting the corresponding
 successful recovery or next model-production command.
 
+For `train-fasttext__R86vp3U`, the failed-tool evidence gives a concrete
+contract for that stage. The treatment had 26 `tb_exec` artifacts: 17 with
+exit code 0, eight with exit code 1, and one with exit code 2. The failed
+commands were not random terminal noise; they clustered around actionable
+training failures: two short fastText import/version checks failed with
+here-document syntax errors, one parquet inspection command failed with a shell
+syntax error, four fastText/parquet training attempts failed with tracebacks,
+two attempts failed around closed temporary files, and the final long command
+failed with an unterminated here-document string. A useful
+`tb_exec_failure` correction record should therefore select an LLM call whose
+input contains a failed `tb_exec` tool result, preserve the compact live replay
+prefix through that failed result, and target the next successful recovery or
+model-production `tb_exec` from the successful Codex sequence. The metadata
+should expose at least `target_correction_stage="tb_exec_failure"`,
+`failed_tool_name="tb_exec"`, `failed_exit_code`, `failed_tool_index`, and a
+small normalized failure flag list such as `syntax`, `traceback`,
+`fasttext`, `parquet`, or `model_bin`. This is the missing dataset shape for
+learning from active-adapter failures rather than only replaying first-action
+or verifier-result corrections.
+
 The next fast-verifier task-local run used `gcode-to-text`, which has both
 failed and successful trajectory-pool records and a lightweight pytest
 verifier. The dry projection at
