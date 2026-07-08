@@ -930,6 +930,31 @@ with managed Qwen3.5-9B vLLM and adapter key rewrite
 `qwen3_5_vllm_language_model`. Use deterministic decoding, no artifact-path
 guard, and only `parametric_memory` enabled.
 
+An offline iterative-data dry-run then checked whether the current builder can
+reuse active-adapter failures before that extended eval is available. The pool
+at
+`/tmp/tb21-task-local-parametric-trainfasttext-iterative-20260708/iterative_pool.jsonl`
+combined the failed install-sequence treatment trajectory
+`train-fasttext__R86vp3U` with the same successful Codex reference. The dry-run
+at
+`/tmp/tb21-task-local-parametric-trainfasttext-iterative-20260708/dryrun-model-sequence`
+again targeted `/app/model.bin`, excluded `rg --files`, used
+`--target-mode sequence`, and exported 22 records. All records used
+`prefix_source=live_replay_llm_call:2`; prompt tool-message counts then grew
+from 1 to 22 only because the builder appended successful previous-command
+messages from the Codex sequence. It did not use the staged treatment's later
+failed `tb_exec` outputs as correction prefixes.
+
+This is an important method boundary. Replacing the failed pool row with a
+more informative active-adapter failure is not enough under the current
+`live_replay` semantics: the backend still trains from the first post-read-task
+action point and does not directly condition on the actual failed package,
+normalization, or model-training commands. The next framework change should add
+a `tb_exec` failure-correction stage analogous to the existing
+`tb_run_tests`/`tb_collect_result` correction records, selecting later failed
+tool results from the local trajectory and targeting the corresponding
+successful recovery or next model-production command.
+
 The next fast-verifier task-local run used `gcode-to-text`, which has both
 failed and successful trajectory-pool records and a lightweight pytest
 verifier. The dry projection at
