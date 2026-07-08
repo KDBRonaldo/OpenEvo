@@ -138,6 +138,65 @@ trial name、task instruction、task path 和 verifier failed-test 摘要会作�
 二者同名，例如 `job_type=agent_system, method=agent_system`。专用 research worker 可以用
 自己的 capability 策略，只要 claim 到 job 后返回合法 artifact 即可。
 
+## OpenEvo Core capability metadata
+
+Desktop 和 Dev Kit 不应硬编码 method table。内置 evolution method 的可发现信息由
+`openevo.core.capabilities` 暴露：
+
+- `build_core_capabilities()` 返回 frozen Pydantic `CoreCapabilities`，包含 execution modes、
+  artifact targets 和 evolution methods。
+- `method_metadata_by_id()` 返回 `dict[str, EvolutionMethodCapability]`，key 与
+  `polar_evolution.methods.METHOD_REGISTRY` 的 method ID 一致。
+- `polar_evolution.methods.METHOD_METADATA` 是内置 worker method 的 metadata 源；每个
+  `METHOD_REGISTRY` key 都必须有对应 metadata，避免 UI 或 Dev Kit 维护第二份方法表。
+
+当前 Core execution modes 是：
+
+- `codex_subscription_transcript`：订阅认证 harness + transcript capture 的 pure-text
+  evolution 模式。它不代表 token-level proxy capture，也不提供 logprob/loss-mask 指标。
+- `self-deployed`：自部署模型服务、Polar proxy 或兼容基础设施的执行模式。
+
+当前 artifact targets 是：
+
+| Artifact target | Desktop visible | 说明 |
+|---|---:|---|
+| `text_memory` | yes | 自然语言长期记忆 |
+| `skill_bundle` | yes | harness 可加载 skill bundle |
+| `agent_system` | yes | agent system prompt 或 instruction 文件 |
+| `parametric_memory` | no | LoRA/adapter 等参数化记忆；Dev Kit 可发现，Desktop 暂不展示 |
+
+Method metadata contract：
+
+```json
+{
+  "method_id": "text_memory_reflector",
+  "display_name": "Text Memory Reflector",
+  "description": "Reflect over task trajectories to synthesize reusable text memory.",
+  "artifact_type": "text_memory",
+  "visibility": "ordinary_user",
+  "visible_in_desktop": true,
+  "supported_execution_modes": [
+    "codex_subscription_transcript",
+    "self-deployed"
+  ],
+  "config_schema": {"type": "object", "additionalProperties": true},
+  "stability_level": "stable"
+}
+```
+
+`visibility` 的取值为：
+
+- `ordinary_user`：可面向普通用户展示；Desktop 只应展示同时满足
+  `visible_in_desktop=true` 的方法。
+- `dev_kit`：Dev Kit 和研究/调试界面可发现；Desktop 默认隐藏。
+- `internal`：内部 plumbing 或暂不面向产品 surface 的方法。
+
+普通用户可见的非参数化 reflector 方法必须同时支持
+`codex_subscription_transcript` 和 `self-deployed`，这样 Desktop 可以在订阅 transcript
+模式和自部署模式之间复用同一组 memory/skill/agent-system evolution 选项。实验方法、
+history/pareto/GEPA 变体和 parametric-memory 方法保持 Dev Kit 可发现，但默认不进入
+Desktop method picker。
+
 ## Artifact Register Contract
 
 Worker complete 和 direct artifact registration 都使用同一类 artifact payload：
@@ -602,7 +661,13 @@ def my_memory_method(job: WorkerClaimedJob, artifact_root: Path) -> list[Artifac
 METHOD_REGISTRY["my_memory_method"] = my_memory_method
 ```
 
-3. 创建 job 时设置：
+3. 在 `METHOD_METADATA` 注册 capability metadata。metadata 的 key 必须等于
+   `METHOD_REGISTRY` key，至少说明 `display_name`、`description`、`artifact_type`、
+   `visibility`、`visible_in_desktop`、`supported_execution_modes`、`config_schema` 和
+   `stability_level`。Desktop/Dev Kit 会通过 `openevo.core.capabilities` 读取这份 metadata，
+   不应再硬编码 method table。
+
+4. 创建 job 时设置：
 
 ```json
 {
@@ -613,7 +678,7 @@ METHOD_REGISTRY["my_memory_method"] = my_memory_method
 }
 ```
 
-4. 为 method 输出、worker complete、context resolve 添加测试。
+5. 为 method 输出、worker complete、context resolve 和 Core capability metadata 添加测试。
 
 ### 方式二：外部 research worker
 
