@@ -910,9 +910,13 @@ used Qwen3.5-9B on GPU 6 with LoRA rank 8, alpha 16, max length 4096, and
 and contains `adapter_model.safetensors`, tokenizer files, and
 `trainer_diagnostics.json`. Diagnostics recorded `record_count=30`,
 `trained_steps=100`, and losses moving from about `1.10`, `0.65`, `0.68` to a
-noisier final tail between roughly `0.0014` and `0.37`. The process was
-interrupted before the CLI wrote its top-level `job.json`, but the adapter
-artifact itself is complete and can be used directly for eval with adapter id
+noisier final tail between roughly `0.0014` and `0.37`. The initial process
+was interrupted before the CLI wrote its top-level `job.json`; this was later
+recovered by replaying the same payload generation command without
+`--run-worker`. The recovered `job.json` records `record_count=30`,
+`selected_tasks=["train-fasttext"]`, `prompt_style=live_replay`, and
+`target_mode=sequence`. The adapter artifact itself is complete and can be used
+directly for eval with adapter id
 `tb-parametric-memory-trainfasttext-model-sequence-r8-s100`.
 
 The paired eval for this extended adapter is intentionally not reported yet.
