@@ -124,6 +124,23 @@ def test_packaged_desktop_assets_are_openevo_only() -> None:
     assert "/api/events" not in packaged_text
 
 
+def test_packaged_desktop_assets_expose_self_deployed_mode() -> None:
+    root = packaged_desktop_static_root()
+    index_text = (root / "index.html").read_text(encoding="utf-8")
+    parser = _PackagedAssetParser()
+    parser.feed(index_text)
+
+    packaged_text = index_text + "\n" + "\n".join(
+        (root / asset).read_text(encoding="utf-8") for asset in parser.assets
+    )
+
+    assert "self-deployed" in packaged_text
+    assert (
+        "codex_subscription_transcript`,`codex_managed_local_inference"
+        not in packaged_text
+    )
+
+
 def test_create_desktop_app_serves_spa_and_sidecar_api(tmp_path: Path) -> None:
     app = create_desktop_app(create_sidecar_app(), static_root=_static_root(tmp_path))
     client = TestClient(app)
