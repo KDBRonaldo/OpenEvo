@@ -1070,6 +1070,49 @@ fastText syntax failure. The trainer payload uses
 This is the preferred next training candidate once a safe GPU is available,
 because it combines recipe imitation with explicit failed-`tb_exec` repair.
 
+The mixed candidate was then trained on GPU 7 at
+`/tmp/tb21-task-local-parametric-trainfasttext-mixed-20260708/train-sequence-plus-tbexec-correction-r8-s140`
+by running the `parametric_memory_lora_sft` worker directly against the dry-run
+job payload. The resulting adapter directory is
+`/tmp/tb21-task-local-parametric-trainfasttext-mixed-20260708/train-sequence-plus-tbexec-correction-r8-s140/artifacts/workers/job-tb-parametric-memory-train-fasttext-sequence-plus-tbexec-failure-r8-s140/parametric_memory_lora_sft/adapter`.
+Trainer diagnostics record 34 training records, 140 trained steps,
+`cuda_visible_devices=7`, LoRA rank 8, alpha 16, `max_length=4096`, and loss
+moving from `1.1006397008895874` to `0.08282413333654404`. The local direct
+worker artifact has no store-assigned artifact id, but its manifest records the
+adapter id `tb-parametric-memory-train-fasttext-sequence-plus-tbexec-failure-r8-s140`,
+base model `Qwen/Qwen3.5-9B`, and `training_record_count=34`.
+
+Three paired `train-fasttext` evals were run on GPU 7 with
+`--adapter-key-rewrite qwen3_5_vllm_language_model` and only
+`parametric_memory` enabled. The first run at
+`/tmp/tb21-task-local-parametric-trainfasttext-mixed-20260708/eval-sequence-plus-tbexec-correction-r8-s140`
+used `max_output_tokens=1536`, `context_reserve_tokens=1536`, and
+`tool_result_prompt_max_chars=2048`; it completed with baseline `0/1`,
+parametric memory `0/1`, and delta `0`, but both conditions hit vLLM context
+overflow retries. The baseline log contained 3,761 maximum-context errors and
+the treatment log contained 2,459, so this run is a context-budget diagnostic,
+not clean method evidence.
+
+A second run at
+`/tmp/tb21-task-local-parametric-trainfasttext-mixed-20260708/eval-sequence-plus-tbexec-correction-r8-s140-tight512`
+used `max_output_tokens=512`, `context_reserve_tokens=512`, and
+`tool_result_prompt_max_chars=512`. It removed context errors and again scored
+baseline `0/1`, parametric memory `0/1`, delta `0`, but the small output cap
+caused early malformed tool JSON in the baseline and treatment. The useful
+clean comparison is therefore the third run at
+`/tmp/tb21-task-local-parametric-trainfasttext-mixed-20260708/eval-sequence-plus-tbexec-correction-r8-s140-tight1024-tool512`,
+with `max_output_tokens=1024`, `context_reserve_tokens=1024`, and
+`tool_result_prompt_max_chars=512`. That run had zero vLLM context errors in
+both conditions, baseline pass@1 `0/1`, parametric-memory pass@1 `0/1`, and
+delta `0`. The baseline failed by exhausting the tool budget after 30
+`tb_exec` feedback records without producing `/app/model.bin`; the treatment
+loaded the LoRA through vLLM, but after `tb_read_task` its first `tb_exec`
+arguments were captured as malformed `_raw_arguments` with an empty
+`timeout_seconds` and no `task_id`. This makes the current mixed
+`train-fasttext` adapter an active but negative result: serving and key rewrite
+work, but task-local parametric memory still needs stronger tool-call schema
+shaping before it can be treated as a reliable backend.
+
 The next fast-verifier task-local run used `gcode-to-text`, which has both
 failed and successful trajectory-pool records and a lightweight pytest
 verifier. The dry projection at
