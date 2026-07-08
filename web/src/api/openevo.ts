@@ -1,12 +1,35 @@
 import { api } from "./client";
 import type {
   EvolutionStepState,
-  OpenEvoExecutionMode,
   OpenEvoExecutionModePayload,
   OpenEvoDesktopShellModel,
   RemoteServiceState,
 } from "../routes/openevoDesktopModel";
 import { normalizeOpenEvoExecutionMode } from "../routes/openevoDesktopModel";
+
+export type OpenEvoExecutionMode =
+  | "codex_subscription_transcript"
+  | "self-deployed";
+
+export interface EvolutionMethodCapability {
+  method_id: string;
+  display_name: string;
+  artifact_type:
+    | "text_memory"
+    | "skill_bundle"
+    | "agent_system"
+    | "parametric_memory";
+  supported_execution_modes: OpenEvoExecutionMode[];
+  visible_in_desktop: boolean;
+  stability_level: "stable" | "experimental" | "internal";
+}
+
+export interface OpenEvoArtifactTargetCapability {
+  artifact_type: EvolutionMethodCapability["artifact_type"];
+  display_name: string;
+  visible_in_desktop: boolean;
+  stability_level: "stable" | "experimental" | "internal";
+}
 
 export interface OpenEvoDesktopShellStatusPayload {
   remote: {
@@ -242,6 +265,44 @@ export interface OpenEvoRunArtifactsPayload {
   tasks: OpenEvoRunArtifactTaskPayload[];
 }
 
+export interface OpenEvoDesktopCapabilitiesPayload {
+  artifact_targets: OpenEvoArtifactTargetCapability[];
+  evolution_methods: EvolutionMethodCapability[];
+}
+
+export interface OpenEvoDesktopCapabilities {
+  artifactTargets: Array<{
+    artifactType: OpenEvoArtifactTargetCapability["artifact_type"];
+    displayName: string;
+    visibleInDesktop: boolean;
+    stabilityLevel: OpenEvoArtifactTargetCapability["stability_level"];
+  }>;
+  evolutionMethods: Array<{
+    methodId: string;
+    displayName: string;
+    artifactType: EvolutionMethodCapability["artifact_type"];
+    supportedExecutionModes: OpenEvoExecutionMode[];
+    visibleInDesktop: boolean;
+    stabilityLevel: EvolutionMethodCapability["stability_level"];
+  }>;
+}
+
+export interface OpenEvoArtifactContentPayload {
+  artifact_id: string;
+  artifact_type: string;
+  filename: string;
+  content: string;
+  mime_type: string;
+}
+
+export interface OpenEvoArtifactContent {
+  artifactId: string;
+  artifactType: string;
+  filename: string;
+  content: string;
+  mimeType: string;
+}
+
 export interface OpenEvoRunArtifactJob {
   artifactType: string;
   method: string;
@@ -441,6 +502,26 @@ export async function fetchOpenEvoRunArtifacts(): Promise<OpenEvoRunArtifacts> {
   return toOpenEvoRunArtifacts(payload);
 }
 
+export async function fetchOpenEvoDesktopCapabilities(): Promise<OpenEvoDesktopCapabilities> {
+  const payload = await api.get<OpenEvoDesktopCapabilitiesPayload>(
+    "/openevo-api/desktop/capabilities",
+  );
+  return toOpenEvoDesktopCapabilities(payload);
+}
+
+export async function fetchOpenEvoArtifactContent(
+  artifactId: string,
+): Promise<OpenEvoArtifactContent> {
+  const headers = sidecarMutationToken
+    ? { [sidecarMutationTokenHeader]: sidecarMutationToken }
+    : undefined;
+  const payload = await api.get<OpenEvoArtifactContentPayload>(
+    `/openevo-api/desktop/artifacts/${encodeURIComponent(artifactId)}/content`,
+    headers,
+  );
+  return toOpenEvoArtifactContent(payload);
+}
+
 export function toOpenEvoBootstrapResponse(
   payload: OpenEvoBootstrapResponsePayload,
 ): OpenEvoBootstrapResponse {
@@ -503,6 +584,39 @@ export function toOpenEvoRunArtifacts(
         })),
       })),
     })),
+  };
+}
+
+export function toOpenEvoDesktopCapabilities(
+  payload: OpenEvoDesktopCapabilitiesPayload,
+): OpenEvoDesktopCapabilities {
+  return {
+    artifactTargets: payload.artifact_targets.map((target) => ({
+      artifactType: target.artifact_type,
+      displayName: target.display_name,
+      visibleInDesktop: target.visible_in_desktop,
+      stabilityLevel: target.stability_level,
+    })),
+    evolutionMethods: payload.evolution_methods.map((method) => ({
+      methodId: method.method_id,
+      displayName: method.display_name,
+      artifactType: method.artifact_type,
+      supportedExecutionModes: method.supported_execution_modes,
+      visibleInDesktop: method.visible_in_desktop,
+      stabilityLevel: method.stability_level,
+    })),
+  };
+}
+
+export function toOpenEvoArtifactContent(
+  payload: OpenEvoArtifactContentPayload,
+): OpenEvoArtifactContent {
+  return {
+    artifactId: payload.artifact_id,
+    artifactType: payload.artifact_type,
+    filename: payload.filename,
+    content: payload.content,
+    mimeType: payload.mime_type,
   };
 }
 

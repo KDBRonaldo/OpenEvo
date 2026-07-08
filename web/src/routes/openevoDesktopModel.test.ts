@@ -3,6 +3,7 @@ import {
   getOpenEvoDesktopShellModel,
   getOpenEvoTimelineSummary,
   normalizeOpenEvoExecutionMode,
+  toDraftPayload,
 } from "./openevoDesktopModel";
 
 describe("OpenEvo Desktop shell model", () => {
@@ -40,5 +41,17 @@ describe("OpenEvo Desktop shell model", () => {
       "self-deployed",
     );
     expect(normalizeOpenEvoExecutionMode("self-deployed")).toBe("self-deployed");
+  });
+
+  it("normalizes legacy execution mode in draft payloads", () => {
+    const model = {
+      ...getOpenEvoDesktopShellModel(),
+      execution: {
+        ...getOpenEvoDesktopShellModel().execution,
+        mode: normalizeOpenEvoExecutionMode("codex_managed_local_inference"),
+      },
+    };
+
+    expect(toDraftPayload(model).execution_mode).toBe("self-deployed");
   });
 });

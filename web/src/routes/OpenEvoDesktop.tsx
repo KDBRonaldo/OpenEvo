@@ -16,6 +16,8 @@ import {
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import {
   activateOpenEvoProjectConfig,
+  fetchOpenEvoArtifactContent,
+  fetchOpenEvoDesktopCapabilities,
   fetchOpenEvoProjectConfigs,
   fetchOpenEvoDesktopShellModel,
   fetchOpenEvoRunArtifacts,
@@ -26,6 +28,8 @@ import {
   runOpenEvoWorkspaceSync,
   saveOpenEvoProjectConfig,
   type OpenEvoProjectConfigDraft,
+  type OpenEvoArtifactContent,
+  type OpenEvoDesktopCapabilities,
   type OpenEvoRunArtifacts,
   type OpenEvoRunStatus,
   type OpenEvoSavedProjectConfig,
@@ -36,6 +40,7 @@ import {
   type RemoteServiceState,
   getOpenEvoDesktopShellModel,
   getOpenEvoTimelineSummary,
+  toDraftPayload,
 } from "./openevoDesktopModel";
 
 const serviceTone: Record<RemoteServiceState, string> = {
@@ -77,6 +82,15 @@ export function OpenEvoDesktop() {
   );
   const [runArtifactsLoading, setRunArtifactsLoading] = useState(false);
   const [runArtifactsError, setRunArtifactsError] = useState<string | null>(null);
+  const [artifactContent, setArtifactContent] =
+    useState<OpenEvoArtifactContent | null>(null);
+  const [artifactContentLoading, setArtifactContentLoading] = useState(false);
+  const [artifactContentError, setArtifactContentError] = useState<string | null>(
+    null,
+  );
+  const [desktopCapabilities, setDesktopCapabilities] =
+    useState<OpenEvoDesktopCapabilities | null>(null);
+  const [diagnosticsOpen, setDiagnosticsOpen] = useState(false);
   const [configSaving, setConfigSaving] = useState(false);
   const [configError, setConfigError] = useState<string | null>(null);
   const [savedConfigs, setSavedConfigs] = useState<OpenEvoSavedProjectConfig[]>(
@@ -90,7 +104,7 @@ export function OpenEvoDesktop() {
     null,
   );
   const [configDraft, setConfigDraft] = useState<OpenEvoProjectConfigDraft>(() =>
-    draftFromModel(getOpenEvoDesktopShellModel()),
+    toDraftPayload(getOpenEvoDesktopShellModel()),
   );
   const mounted = useRef(true);
   const catalogRefreshGeneration = useRef(0);
@@ -106,6 +120,11 @@ export function OpenEvoDesktop() {
   const runtimeServicesReady = model.services.some(
     (service) => service.id === "openevo-backend" && service.state === "ready",
   );
+  const evolutionTargets = desktopEvolutionTargets(
+    desktopCapabilities,
+    configDraft.execution_mode,
+  );
+  const artifactDisplayNames = artifactTargetDisplayNames(desktopCapabilities);
 
   const refreshSavedConfigs = async () => {
     catalogRefreshGeneration.current += 1;
@@ -135,11 +154,19 @@ export function OpenEvoDesktop() {
   useEffect(() => {
     let cancelled = false;
 
+    fetchOpenEvoDesktopCapabilities()
+      .then((capabilities) => {
+        if (!cancelled) {
+          setDesktopCapabilities(capabilities);
+        }
+      })
+      .catch(() => undefined);
+
     fetchOpenEvoDesktopShellModel()
       .then((nextModel) => {
         if (!cancelled) {
           setModel(nextModel);
-          setConfigDraft(draftFromModel(nextModel));
+          setConfigDraft(toDraftPayload(nextModel));
           setSidecarConnected(true);
           void refreshSavedConfigs();
         }
@@ -178,6 +205,10 @@ export function OpenEvoDesktop() {
     setRunArtifacts(null);
     setRunArtifactsLoading(false);
     setRunArtifactsError(null);
+    setArtifactContent(null);
+    setArtifactContentLoading(false);
+    setArtifactContentError(null);
+    setDiagnosticsOpen(false);
   };
 
   const clearLifecycleReportsForContextChange = () => {
@@ -292,7 +323,7 @@ export function OpenEvoDesktop() {
     try {
       const response = await activateOpenEvoProjectConfig(config.projectSlug);
       setModel(response.status);
-      setConfigDraft(draftFromModel(response.status));
+      setConfigDraft(toDraftPayload(response.status));
       clearLifecycleReportsForContextChange();
       clearLatestRunForContextChange();
       setSidecarConnected(true);
@@ -364,6 +395,10 @@ export function OpenEvoDesktop() {
     setRunArtifacts(null);
     setRunArtifactsLoading(false);
     setRunArtifactsError(null);
+    setArtifactContent(null);
+    setArtifactContentLoading(false);
+    setArtifactContentError(null);
+    setDiagnosticsOpen(false);
     try {
       const response = await runOpenEvoStartRun();
       if (!mounted.current || generation !== runPollGeneration.current) {
@@ -425,6 +460,10 @@ export function OpenEvoDesktop() {
         return;
       }
       setRunArtifacts(artifacts);
+      const previewArtifactId = firstDisplayArtifactId(artifacts);
+      if (previewArtifactId) {
+        void loadArtifactContent(previewArtifactId, generation);
+      }
     } catch (error) {
       if (!mounted.current || generation !== runPollGeneration.current) {
         return;
@@ -436,6 +475,30 @@ export function OpenEvoDesktop() {
     } finally {
       if (mounted.current && generation === runPollGeneration.current) {
         setRunArtifactsLoading(false);
+      }
+    }
+  };
+
+  const loadArtifactContent = async (artifactId: string, generation: number) => {
+    setArtifactContentLoading(true);
+    setArtifactContentError(null);
+    try {
+      const content = await fetchOpenEvoArtifactContent(artifactId);
+      if (!mounted.current || generation !== runPollGeneration.current) {
+        return;
+      }
+      setArtifactContent(content);
+    } catch (error) {
+      if (!mounted.current || generation !== runPollGeneration.current) {
+        return;
+      }
+      const message =
+        error instanceof Error ? error.message : "Artifact content failed";
+      setArtifactContent(null);
+      setArtifactContentError(message);
+    } finally {
+      if (mounted.current && generation === runPollGeneration.current) {
+        setArtifactContentLoading(false);
       }
     }
   };
@@ -777,15 +840,7 @@ export function OpenEvoDesktop() {
                 handleConfigDraftChange("hf_model", value || null)
               }
             />
-          ) : (
-            <TextInput
-              label="Codex model"
-              value={configDraft.codex_model ?? ""}
-              onChange={(value) =>
-                handleConfigDraftChange("codex_model", value || null)
-              }
-            />
-          )}
+          ) : null}
           <TextInput
             label="Objective"
             value={configDraft.objective}
@@ -820,42 +875,36 @@ export function OpenEvoDesktop() {
               handleConfigDraftChange("pip_index_url", value || null)
             }
           />
-          <TextInput
-            label="Hugging Face endpoint"
-            value={configDraft.huggingface_endpoint ?? ""}
-            onChange={(value) =>
-              handleConfigDraftChange("huggingface_endpoint", value || null)
-            }
-          />
-          <TextInput
-            label="HF home"
-            value={configDraft.hf_home ?? ""}
-            onChange={(value) =>
-              handleConfigDraftChange("hf_home", value || null)
-            }
-          />
+          {configDraft.execution_mode === "self-deployed" ? (
+            <>
+              <TextInput
+                label="Hugging Face endpoint"
+                value={configDraft.huggingface_endpoint ?? ""}
+                onChange={(value) =>
+                  handleConfigDraftChange("huggingface_endpoint", value || null)
+                }
+              />
+              <TextInput
+                label="HF home"
+                value={configDraft.hf_home ?? ""}
+                onChange={(value) =>
+                  handleConfigDraftChange("hf_home", value || null)
+                }
+              />
+            </>
+          ) : null}
           <div className="flex flex-wrap items-end gap-3 lg:col-span-4">
-            <CheckboxInput
-              label="Text memory"
-              checked={configDraft.text_memory}
-              onChange={(checked) =>
-                handleConfigDraftChange("text_memory", checked)
-              }
-            />
-            <CheckboxInput
-              label="Skill bundle"
-              checked={configDraft.skill_bundle}
-              onChange={(checked) =>
-                handleConfigDraftChange("skill_bundle", checked)
-              }
-            />
-            <CheckboxInput
-              label="Agent system"
-              checked={configDraft.agent_system}
-              onChange={(checked) =>
-                handleConfigDraftChange("agent_system", checked)
-              }
-            />
+            {evolutionTargets.map((target) => (
+              <CheckboxInput
+                key={target.artifactType}
+                label={target.displayName}
+                checked={Boolean(configDraft[target.configKey])}
+                testId="evolution-target"
+                onChange={(checked) =>
+                  handleConfigDraftChange(target.configKey, checked)
+                }
+              />
+            ))}
             <CommandButton
               icon={<ShieldCheck size={16} />}
               label={configSaving ? "Saving" : "Save Config"}
@@ -885,7 +934,9 @@ export function OpenEvoDesktop() {
           <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
             <Field label="Task source" value={model.project.source} />
             <Field label="Execution mode" value={model.execution.mode} />
-            <Field label="Model" value={model.execution.model} />
+            {model.execution.mode === "self-deployed" ? (
+              <Field label="Model" value={model.execution.model} />
+            ) : null}
             <Field label="Objective" value={model.project.objective} wide />
           </div>
         </Panel>
@@ -901,11 +952,15 @@ export function OpenEvoDesktop() {
             <Field label="HTTPS proxy" value={model.remote.proxy.httpsProxy} />
             <Field label="NO_PROXY" value={model.remote.proxy.noProxy} />
             <Field label="PIP index URL" value={model.remote.proxy.pipIndexUrl} />
-            <Field
-              label="Hugging Face endpoint"
-              value={model.remote.proxy.huggingFaceEndpoint}
-            />
-            <Field label="HF home" value={model.remote.proxy.hfHome} />
+            {model.execution.mode === "self-deployed" ? (
+              <>
+                <Field
+                  label="Hugging Face endpoint"
+                  value={model.remote.proxy.huggingFaceEndpoint}
+                />
+                <Field label="HF home" value={model.remote.proxy.hfHome} />
+              </>
+            ) : null}
           </div>
         </Panel>
       </section>
@@ -1011,7 +1066,6 @@ export function OpenEvoDesktop() {
       {latestRun ? (
         <Panel title="Run Status" icon={<Play size={17} />}>
           <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
-            <Field label="Run ID" value={latestRun.id} />
             <Field label="State" value={latestRun.state} />
             <Field
               label="Return code"
@@ -1021,15 +1075,8 @@ export function OpenEvoDesktop() {
                   : String(latestRun.returnCode)
               }
             />
-            <Field label="Output dir" value={latestRun.outputDir} wide />
             <Field label="Started" value={latestRun.startedAt} />
             <Field label="Finished" value={latestRun.finishedAt ?? "pending"} />
-            {latestRun.stdout ? (
-              <LogBlock label="stdout" value={latestRun.stdout} />
-            ) : null}
-            {latestRun.stderr ? (
-              <LogBlock label="stderr" value={latestRun.stderr} />
-            ) : null}
           </div>
         </Panel>
       ) : null}
@@ -1040,8 +1087,29 @@ export function OpenEvoDesktop() {
             artifacts={runArtifacts}
             loading={runArtifactsLoading}
             error={runArtifactsError}
+            displayNames={artifactDisplayNames}
           />
         </Panel>
+      ) : null}
+
+      {latestRun && latestRun.state !== "running" ? (
+        <Panel title="Artifact Content" icon={<FileText size={17} />}>
+          <ArtifactContentPanel
+            content={artifactContent}
+            loading={artifactContentLoading}
+            error={artifactContentError}
+            displayNames={artifactDisplayNames}
+          />
+        </Panel>
+      ) : null}
+
+      {latestRun ? (
+        <DiagnosticsDisclosure
+          latestRun={latestRun}
+          artifacts={runArtifacts}
+          open={diagnosticsOpen}
+          onToggle={setDiagnosticsOpen}
+        />
       ) : null}
 
       <section className="grid grid-cols-1 gap-4 lg:grid-cols-3">
@@ -1163,10 +1231,12 @@ function RunArtifactTimeline({
   artifacts,
   loading,
   error,
+  displayNames,
 }: {
   artifacts: OpenEvoRunArtifacts | null;
   loading: boolean;
   error: string | null;
+  displayNames: Record<string, string>;
 }) {
   return (
     <div className="space-y-4">
@@ -1186,7 +1256,6 @@ function RunArtifactTimeline({
             <Field label="Experiment" value={artifacts.experimentName} />
             <Field label="Summary" value={artifacts.summaryStatus} />
             <Field label="Rounds" value={String(artifacts.roundCount)} />
-            <Field label="Run" value={artifacts.runId} />
           </div>
           {artifacts.tasks.length > 0 ? (
             <div className="divide-y divide-slate-100 border-t border-slate-100">
@@ -1213,21 +1282,25 @@ function RunArtifactTimeline({
                             </span>
                           ) : null}
                         </div>
-                        <ArtifactIdGroups artifactIds={round.artifactIds} />
+                        <ArtifactTypeGroups
+                          artifactIds={round.artifactIds}
+                          displayNames={displayNames}
+                        />
                         {round.jobs.length > 0 ? (
                           <div className="mt-3 divide-y divide-slate-100">
                             {round.jobs.map((job, index) => (
                               <div
                                 key={`${job.artifactType}:${job.method}:${index}`}
-                                className="grid grid-cols-1 gap-2 py-3 first:pt-0 last:pb-0 lg:grid-cols-[minmax(0,1fr)_minmax(0,1.4fr)]"
+                                className="grid grid-cols-1 gap-2 py-3 first:pt-0 last:pb-0 lg:grid-cols-[minmax(0,1fr)_auto]"
                               >
                                 <div className="min-w-0">
                                   <div className="break-words text-sm font-medium text-slate-900">
-                                    {job.method}
+                                    {displayNames[job.artifactType] ??
+                                      prettyArtifactType(job.artifactType)}
                                   </div>
                                   <div className="mt-1 flex flex-wrap items-center gap-2">
                                     <InlineStatus
-                                      label={job.artifactType}
+                                      label="worker"
                                       value={job.workerStatus}
                                     />
                                     {job.promotionStatus ? (
@@ -1236,16 +1309,6 @@ function RunArtifactTimeline({
                                       </span>
                                     ) : null}
                                   </div>
-                                </div>
-                                <div className="min-w-0 space-y-2">
-                                  <ArtifactIdLine
-                                    label="Artifacts"
-                                    values={job.artifactIds}
-                                  />
-                                  <ArtifactIdLine
-                                    label="Approved"
-                                    values={job.approvedArtifactIds}
-                                  />
                                 </div>
                               </div>
                             ))}
@@ -1274,6 +1337,31 @@ function InlineStatus({ label, value }: { label: string; value: string }) {
       <span className="font-medium text-slate-500">{label}</span>
       <span>{value || "unknown"}</span>
     </span>
+  );
+}
+
+function ArtifactTypeGroups({
+  artifactIds,
+  displayNames,
+}: {
+  artifactIds: Record<string, string[]>;
+  displayNames: Record<string, string>;
+}) {
+  const groups = Object.entries(artifactIds).filter(([, ids]) => ids.length > 0);
+  if (groups.length === 0) {
+    return null;
+  }
+  return (
+    <div className="mt-3 flex flex-wrap gap-2">
+      {groups.map(([artifactType]) => (
+        <span
+          key={artifactType}
+          className="rounded-md border border-slate-200 bg-slate-50 px-2 py-1 text-xs text-slate-700"
+        >
+          {displayNames[artifactType] ?? prettyArtifactType(artifactType)}
+        </span>
+      ))}
+    </div>
   );
 }
 
@@ -1319,6 +1407,134 @@ function ArtifactIdLine({
         ))}
       </div>
     </div>
+  );
+}
+
+function ArtifactContentPanel({
+  content,
+  loading,
+  error,
+  displayNames,
+}: {
+  content: OpenEvoArtifactContent | null;
+  loading: boolean;
+  error: string | null;
+  displayNames: Record<string, string>;
+}) {
+  return (
+    <div className="space-y-3">
+      {loading ? (
+        <div className="rounded-md border border-blue-100 bg-blue-50 px-3 py-2 text-sm text-blue-800">
+          Reading promoted artifact content
+        </div>
+      ) : null}
+      {error ? (
+        <div className="rounded-md border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-900">
+          {error}
+        </div>
+      ) : null}
+      {content ? (
+        <div className="space-y-2">
+          <div className="flex flex-wrap items-center gap-2 text-sm">
+            <span className="font-medium text-slate-900">
+              {displayNames[content.artifactType] ??
+                prettyArtifactType(content.artifactType)}
+            </span>
+            <span className="text-xs text-slate-500">{content.filename}</span>
+          </div>
+          <pre className="max-h-80 overflow-auto whitespace-pre-wrap rounded-md border border-slate-200 bg-slate-50 px-3 py-2 text-sm leading-6 text-slate-900">
+            {content.content}
+          </pre>
+        </div>
+      ) : !loading && !error ? (
+        <div className="rounded-md border border-slate-200 bg-slate-50 px-3 py-2 text-sm text-slate-600">
+          No promoted artifact content available yet.
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function DiagnosticsDisclosure({
+  latestRun,
+  artifacts,
+  open,
+  onToggle,
+}: {
+  latestRun: OpenEvoRunStatus;
+  artifacts: OpenEvoRunArtifacts | null;
+  open: boolean;
+  onToggle: (open: boolean) => void;
+}) {
+  return (
+    <details
+      open={open}
+      onToggle={(event) => onToggle(event.currentTarget.open)}
+      className="rounded-lg border border-slate-200 bg-white"
+    >
+      <summary className="cursor-pointer px-4 py-3 text-sm font-semibold text-slate-900">
+        Diagnostics
+      </summary>
+      {open ? (
+        <div className="space-y-4 border-t border-slate-100 p-4">
+          <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
+            <Field label="Run ID" value={latestRun.id} />
+            <Field label="Output dir" value={latestRun.outputDir} wide />
+            <Field label="Command" value={latestRun.command} wide />
+            {latestRun.stdout ? (
+              <LogBlock label="stdout" value={latestRun.stdout} />
+            ) : null}
+            {latestRun.stderr ? (
+              <LogBlock label="stderr" value={latestRun.stderr} />
+            ) : null}
+          </div>
+          {artifacts ? (
+            <div className="space-y-4">
+              <div className="grid grid-cols-1 gap-3 text-sm lg:grid-cols-3">
+                <Field label="Artifact run" value={artifacts.runId} />
+                <Field label="Artifact output dir" value={artifacts.outputDir} wide />
+              </div>
+              {artifacts.tasks.map((task) => (
+                <div key={task.taskId} className="border-l border-slate-200 pl-3">
+                  <div className="text-sm font-semibold text-slate-900">
+                    {task.taskId}
+                  </div>
+                  {task.rounds.map((round) => (
+                    <div
+                      key={`${task.taskId}:${round.roundIndex}`}
+                      className="mt-3 space-y-3"
+                    >
+                      <div className="text-xs font-medium uppercase text-slate-500">
+                        Round {round.roundIndex}
+                      </div>
+                      <ArtifactIdGroups artifactIds={round.artifactIds} />
+                      {round.jobs.map((job, index) => (
+                        <div
+                          key={`${job.artifactType}:${job.method}:${index}`}
+                          className="border-l border-slate-100 pl-3"
+                        >
+                          <Field label="Method" value={job.method} />
+                          <div className="mt-2 grid grid-cols-1 gap-2 lg:grid-cols-2">
+                            <ArtifactIdLine
+                              label="Artifacts"
+                              values={job.artifactIds}
+                            />
+                            <ArtifactIdLine
+                              label="Approved"
+                              values={job.approvedArtifactIds}
+                            />
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  ))}
+                </div>
+              ))}
+            </div>
+          ) : null}
+        </div>
+      ) : null}
+    </details>
   );
 }
 
@@ -1443,6 +1659,100 @@ function stringValue(value: unknown): string | null {
   return typeof value === "string" && value ? value : null;
 }
 
+function desktopEvolutionTargets(
+  capabilities: OpenEvoDesktopCapabilities | null,
+  executionMode: OpenEvoProjectConfigDraft["execution_mode"],
+) {
+  if (!capabilities) {
+    return [];
+  }
+  const displayNames = artifactTargetDisplayNames(capabilities);
+  return capabilities.evolutionMethods
+    .filter(
+      (method) =>
+        method.visibleInDesktop &&
+        method.supportedExecutionModes.includes(executionMode),
+    )
+    .map((method) => ({
+      artifactType: method.artifactType,
+      displayName:
+        displayNames[method.artifactType] ?? sentenceCase(method.displayName),
+      configKey: configKeyForArtifactType(method.artifactType),
+    }))
+    .filter(
+      (target): target is {
+        artifactType: "text_memory" | "skill_bundle" | "agent_system";
+        displayName: string;
+        configKey: "text_memory" | "skill_bundle" | "agent_system";
+      } => target.configKey !== null,
+    );
+}
+
+function artifactTargetDisplayNames(
+  capabilities: OpenEvoDesktopCapabilities | null,
+): Record<string, string> {
+  const displayNames: Record<string, string> = {};
+  for (const target of capabilities?.artifactTargets ?? []) {
+    if (target.visibleInDesktop) {
+      displayNames[target.artifactType] = sentenceCase(target.displayName);
+    }
+  }
+  for (const method of capabilities?.evolutionMethods ?? []) {
+    if (
+      method.visibleInDesktop &&
+      !displayNames[method.artifactType] &&
+      configKeyForArtifactType(method.artifactType)
+    ) {
+      displayNames[method.artifactType] = sentenceCase(
+        prettyArtifactType(method.artifactType),
+      );
+    }
+  }
+  return displayNames;
+}
+
+function configKeyForArtifactType(
+  artifactType: string,
+): "text_memory" | "skill_bundle" | "agent_system" | null {
+  if (
+    artifactType === "text_memory" ||
+    artifactType === "skill_bundle" ||
+    artifactType === "agent_system"
+  ) {
+    return artifactType;
+  }
+  return null;
+}
+
+function firstDisplayArtifactId(artifacts: OpenEvoRunArtifacts): string | null {
+  for (const task of artifacts.tasks) {
+    for (const round of task.rounds) {
+      for (const job of round.jobs) {
+        const [approved] = job.approvedArtifactIds;
+        if (approved) {
+          return approved;
+        }
+      }
+    }
+  }
+  return null;
+}
+
+function prettyArtifactType(artifactType: string): string {
+  return artifactType
+    .split("_")
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ");
+}
+
+function sentenceCase(label: string): string {
+  if (!label) {
+    return label;
+  }
+  return label.charAt(0).toUpperCase() + label.slice(1).toLowerCase();
+}
+
 function LogBlock({ label, value }: { label: string; value: string }) {
   return (
     <div className="lg:col-span-3">
@@ -1536,14 +1846,19 @@ function SelectInput({
 function CheckboxInput({
   label,
   checked,
+  testId,
   onChange,
 }: {
   label: string;
   checked: boolean;
+  testId?: string;
   onChange: (checked: boolean) => void;
 }) {
   return (
-    <label className="inline-flex h-9 items-center gap-2 rounded-md border border-slate-200 bg-white px-3 text-sm text-slate-700">
+    <label
+      data-testid={testId}
+      className="inline-flex h-9 items-center gap-2 rounded-md border border-slate-200 bg-white px-3 text-sm text-slate-700"
+    >
       <input
         aria-label={label}
         type="checkbox"
@@ -1584,94 +1899,6 @@ function unsupportedLifecycleAuthMessage(
     );
   }
   return null;
-}
-
-function draftFromModel(
-  model: OpenEvoDesktopShellModel,
-): OpenEvoProjectConfigDraft {
-  const source = sourceDraftFromLabel(model.project.source);
-  return {
-    project_name: model.project.name,
-    task_id: model.project.taskId,
-    objective: model.project.objective,
-    source_type: source.source_type,
-    source_path: source.source_path,
-    source_url: source.source_url,
-    source_branch: source.source_branch,
-    remote_profile_id: model.remote.id,
-    remote_host: model.remote.host,
-    remote_port: model.remote.port,
-    remote_user: model.remote.user,
-    auth_method: model.remote.auth.method,
-    private_key_path: model.remote.auth.privateKeyPath,
-    password_ref: model.remote.auth.passwordRef,
-    passphrase_ref: model.remote.auth.passphraseRef,
-    workspace_root: model.remote.workspaceRoot,
-    http_proxy: optionalConfigured(model.remote.proxy.httpProxy),
-    https_proxy: optionalConfigured(model.remote.proxy.httpsProxy),
-    no_proxy: optionalConfigured(model.remote.proxy.noProxy),
-    pip_index_url: optionalConfigured(model.remote.proxy.pipIndexUrl),
-    huggingface_endpoint: optionalConfigured(model.remote.proxy.huggingFaceEndpoint),
-    hf_home: optionalConfigured(model.remote.proxy.hfHome),
-    execution_mode: model.execution.mode,
-    codex_model:
-      model.execution.mode === "codex_subscription_transcript"
-        ? model.execution.model || "gpt-5.1-codex-mini"
-        : null,
-    hf_model:
-      model.execution.mode === "self-deployed" ? model.execution.model : null,
-    text_memory: model.evolution.some((step) =>
-      ["text-memory", "memory"].includes(step.id),
-    ),
-    skill_bundle: model.evolution.some((step) =>
-      ["skill-bundle", "skills"].includes(step.id),
-    ),
-    agent_system: model.evolution.some((step) => step.id === "agent-system"),
-  };
-}
-
-function sourceDraftFromLabel(
-  label: string,
-): Pick<
-  OpenEvoProjectConfigDraft,
-  "source_type" | "source_path" | "source_url" | "source_branch"
-> {
-  if (label.startsWith("Remote path: ")) {
-    return {
-      source_type: "remote_path",
-      source_path: label.slice("Remote path: ".length),
-      source_url: null,
-      source_branch: null,
-    };
-  }
-  if (label.startsWith("Local folder: ")) {
-    return {
-      source_type: "local_folder",
-      source_path: label.slice("Local folder: ".length),
-      source_url: null,
-      source_branch: null,
-    };
-  }
-  if (label.startsWith("Git repository: ")) {
-    const value = label.slice("Git repository: ".length);
-    const match = value.match(/^(.*) \((.*)\)$/);
-    return {
-      source_type: "git_repository",
-      source_path: null,
-      source_url: match ? match[1] : value,
-      source_branch: match ? match[2] : null,
-    };
-  }
-  return {
-    source_type: "scratch",
-    source_path: null,
-    source_url: null,
-    source_branch: null,
-  };
-}
-
-function optionalConfigured(value: string): string | null {
-  return value === "not configured" ? null : value;
 }
 
 function StatusBadge({ state }: { state: RemoteServiceState }) {

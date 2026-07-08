@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   activateOpenEvoProjectConfig,
+  fetchOpenEvoArtifactContent,
+  fetchOpenEvoDesktopCapabilities,
   fetchOpenEvoProjectConfigs,
   fetchOpenEvoDesktopShellModel,
   fetchOpenEvoRunArtifacts,
@@ -455,6 +457,128 @@ describe("OpenEvo sidecar client", () => {
     });
     expect(calls[1].headers.get("X-OpenEvo-Sidecar-Token")).toBe(
       "artifact-token",
+    );
+  });
+
+  it("fetches desktop capabilities for ordinary-user targets", async () => {
+    const calls: Array<{ path: string; method: string }> = [];
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const path = String(input);
+      calls.push({ path, method: init?.method ?? "GET" });
+      if (path === "/openevo-api/desktop/capabilities") {
+        return jsonResponse({
+          execution_modes: [],
+          artifact_targets: [
+            {
+              artifact_type: "text_memory",
+              display_name: "Text Memory",
+              visible_in_desktop: true,
+              stability_level: "stable",
+            },
+          ],
+          evolution_methods: [
+            {
+              method_id: "text_memory_reflector",
+              display_name: "Text memory",
+              artifact_type: "text_memory",
+              supported_execution_modes: [
+                "codex_subscription_transcript",
+                "self-deployed",
+              ],
+              visible_in_desktop: true,
+              stability_level: "stable",
+            },
+            {
+              method_id: "parametric_memory_trainer",
+              display_name: "Parametric memory",
+              artifact_type: "parametric_memory",
+              supported_execution_modes: ["self-deployed"],
+              visible_in_desktop: false,
+              stability_level: "experimental",
+            },
+          ],
+        });
+      }
+      return new Response("not found", { status: 404 });
+    });
+
+    const capabilities = await fetchOpenEvoDesktopCapabilities();
+
+    expect(capabilities.evolutionMethods).toEqual([
+      {
+        methodId: "text_memory_reflector",
+        displayName: "Text memory",
+        artifactType: "text_memory",
+        supportedExecutionModes: [
+          "codex_subscription_transcript",
+          "self-deployed",
+        ],
+        visibleInDesktop: true,
+        stabilityLevel: "stable",
+      },
+      {
+        methodId: "parametric_memory_trainer",
+        displayName: "Parametric memory",
+        artifactType: "parametric_memory",
+        supportedExecutionModes: ["self-deployed"],
+        visibleInDesktop: false,
+        stabilityLevel: "experimental",
+      },
+    ]);
+    expect(capabilities.artifactTargets).toEqual([
+      {
+        artifactType: "text_memory",
+        displayName: "Text Memory",
+        visibleInDesktop: true,
+        stabilityLevel: "stable",
+      },
+    ]);
+    expect(calls).toEqual([
+      { path: "/openevo-api/desktop/capabilities", method: "GET" },
+    ]);
+  });
+
+  it("fetches markdown artifact content with the sidecar token", async () => {
+    const calls: Array<{ path: string; headers: Headers; method: string }> = [];
+    const shellPayload = sidecarShellPayload("content-token");
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const path = String(input);
+      calls.push({
+        path,
+        headers: new Headers(init?.headers),
+        method: init?.method ?? "GET",
+      });
+      if (path === "/openevo-api/desktop/shell") {
+        return jsonResponse(shellPayload);
+      }
+      if (path === "/openevo-api/desktop/artifacts/artifact-text-memory/content") {
+        return jsonResponse({
+          artifact_id: "artifact-text-memory",
+          artifact_type: "text_memory",
+          filename: "memory.md",
+          content: "# Learned Memory\n\n- Prefer stable folds.\n",
+          mime_type: "text/markdown",
+        });
+      }
+      return new Response("not found", { status: 404 });
+    });
+
+    await fetchOpenEvoDesktopShellModel();
+    const content = await fetchOpenEvoArtifactContent("artifact-text-memory");
+
+    expect(content).toEqual({
+      artifactId: "artifact-text-memory",
+      artifactType: "text_memory",
+      filename: "memory.md",
+      content: "# Learned Memory\n\n- Prefer stable folds.\n",
+      mimeType: "text/markdown",
+    });
+    expect(calls[1]).toMatchObject({
+      path: "/openevo-api/desktop/artifacts/artifact-text-memory/content",
+      method: "GET",
+    });
+    expect(calls[1].headers.get("X-OpenEvo-Sidecar-Token")).toBe(
+      "content-token",
     );
   });
 

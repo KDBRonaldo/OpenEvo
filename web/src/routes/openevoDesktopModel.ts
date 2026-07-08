@@ -84,6 +84,37 @@ export interface OpenEvoTimelineSummary {
   readinessNotes: string[];
 }
 
+export interface OpenEvoProjectConfigDraftPayload {
+  project_name: string;
+  task_id: string;
+  objective: string;
+  source_type: "local_folder" | "git_repository" | "remote_path" | "scratch";
+  source_path?: string | null;
+  source_url?: string | null;
+  source_branch?: string | null;
+  remote_profile_id: string;
+  remote_host: string;
+  remote_port: number;
+  remote_user: string;
+  auth_method: "ssh_agent" | "private_key" | "password_ref";
+  private_key_path?: string | null;
+  password_ref?: string | null;
+  passphrase_ref?: string | null;
+  workspace_root?: string | null;
+  http_proxy?: string | null;
+  https_proxy?: string | null;
+  no_proxy?: string | null;
+  pip_index_url?: string | null;
+  huggingface_endpoint?: string | null;
+  hf_home?: string | null;
+  execution_mode: OpenEvoExecutionMode;
+  codex_model?: string | null;
+  hf_model?: string | null;
+  text_memory: boolean;
+  skill_bundle: boolean;
+  agent_system: boolean;
+}
+
 export function normalizeOpenEvoExecutionMode(
   mode: OpenEvoExecutionModePayload,
 ): OpenEvoExecutionMode {
@@ -214,4 +245,92 @@ export function getOpenEvoTimelineSummary(
     totalEvolutionSteps: model.evolution.length,
     readinessNotes: model.bootstrap.readinessNotes,
   };
+}
+
+export function toDraftPayload(
+  model: OpenEvoDesktopShellModel,
+): OpenEvoProjectConfigDraftPayload {
+  const source = sourceDraftFromLabel(model.project.source);
+  const executionMode = normalizeOpenEvoExecutionMode(model.execution.mode);
+  return {
+    project_name: model.project.name,
+    task_id: model.project.taskId,
+    objective: model.project.objective,
+    source_type: source.source_type,
+    source_path: source.source_path,
+    source_url: source.source_url,
+    source_branch: source.source_branch,
+    remote_profile_id: model.remote.id,
+    remote_host: model.remote.host,
+    remote_port: model.remote.port,
+    remote_user: model.remote.user,
+    auth_method: model.remote.auth.method,
+    private_key_path: model.remote.auth.privateKeyPath,
+    password_ref: model.remote.auth.passwordRef,
+    passphrase_ref: model.remote.auth.passphraseRef,
+    workspace_root: model.remote.workspaceRoot,
+    http_proxy: optionalConfigured(model.remote.proxy.httpProxy),
+    https_proxy: optionalConfigured(model.remote.proxy.httpsProxy),
+    no_proxy: optionalConfigured(model.remote.proxy.noProxy),
+    pip_index_url: optionalConfigured(model.remote.proxy.pipIndexUrl),
+    huggingface_endpoint: optionalConfigured(model.remote.proxy.huggingFaceEndpoint),
+    hf_home: optionalConfigured(model.remote.proxy.hfHome),
+    execution_mode: executionMode,
+    codex_model:
+      executionMode === "codex_subscription_transcript"
+        ? model.execution.model || "gpt-5.1-codex-mini"
+        : null,
+    hf_model: executionMode === "self-deployed" ? model.execution.model : null,
+    text_memory: model.evolution.some((step) =>
+      ["text-memory", "memory"].includes(step.id),
+    ),
+    skill_bundle: model.evolution.some((step) =>
+      ["skill-bundle", "skills"].includes(step.id),
+    ),
+    agent_system: model.evolution.some((step) => step.id === "agent-system"),
+  };
+}
+
+function sourceDraftFromLabel(
+  label: string,
+): Pick<
+  OpenEvoProjectConfigDraftPayload,
+  "source_type" | "source_path" | "source_url" | "source_branch"
+> {
+  if (label.startsWith("Remote path: ")) {
+    return {
+      source_type: "remote_path",
+      source_path: label.slice("Remote path: ".length),
+      source_url: null,
+      source_branch: null,
+    };
+  }
+  if (label.startsWith("Local folder: ")) {
+    return {
+      source_type: "local_folder",
+      source_path: label.slice("Local folder: ".length),
+      source_url: null,
+      source_branch: null,
+    };
+  }
+  if (label.startsWith("Git repository: ")) {
+    const value = label.slice("Git repository: ".length);
+    const match = value.match(/^(.*) \((.*)\)$/);
+    return {
+      source_type: "git_repository",
+      source_path: null,
+      source_url: match ? match[1] : value,
+      source_branch: match ? match[2] : null,
+    };
+  }
+  return {
+    source_type: "scratch",
+    source_path: null,
+    source_url: null,
+    source_branch: null,
+  };
+}
+
+function optionalConfigured(value: string): string | null {
+  return value === "not configured" ? null : value;
 }

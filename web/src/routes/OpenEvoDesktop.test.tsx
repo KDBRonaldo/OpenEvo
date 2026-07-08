@@ -12,6 +12,8 @@ import {
 
 const apiMocks = vi.hoisted(() => ({
   activateOpenEvoProjectConfig: vi.fn(),
+  fetchOpenEvoArtifactContent: vi.fn(),
+  fetchOpenEvoDesktopCapabilities: vi.fn(),
   fetchOpenEvoProjectConfigs: vi.fn(),
   fetchOpenEvoDesktopShellModel: vi.fn(),
   fetchOpenEvoRunArtifacts: vi.fn(),
@@ -25,6 +27,8 @@ const apiMocks = vi.hoisted(() => ({
 
 vi.mock("../api/openevo", () => ({
   activateOpenEvoProjectConfig: apiMocks.activateOpenEvoProjectConfig,
+  fetchOpenEvoArtifactContent: apiMocks.fetchOpenEvoArtifactContent,
+  fetchOpenEvoDesktopCapabilities: apiMocks.fetchOpenEvoDesktopCapabilities,
   fetchOpenEvoProjectConfigs: apiMocks.fetchOpenEvoProjectConfigs,
   fetchOpenEvoDesktopShellModel: apiMocks.fetchOpenEvoDesktopShellModel,
   fetchOpenEvoRunArtifacts: apiMocks.fetchOpenEvoRunArtifacts,
@@ -41,6 +45,8 @@ vi.mock("../api/openevo", () => ({
 describe("OpenEvoDesktop", () => {
   beforeEach(() => {
     apiMocks.activateOpenEvoProjectConfig.mockReset();
+    apiMocks.fetchOpenEvoArtifactContent.mockReset();
+    apiMocks.fetchOpenEvoDesktopCapabilities.mockReset();
     apiMocks.fetchOpenEvoProjectConfigs.mockReset();
     apiMocks.fetchOpenEvoDesktopShellModel.mockReset();
     apiMocks.fetchOpenEvoRunArtifacts.mockReset();
@@ -52,6 +58,12 @@ describe("OpenEvoDesktop", () => {
     apiMocks.saveOpenEvoProjectConfig.mockReset();
     apiMocks.activateOpenEvoProjectConfig.mockRejectedValue(
       new Error("sidecar unavailable"),
+    );
+    apiMocks.fetchOpenEvoArtifactContent.mockRejectedValue(
+      new Error("sidecar unavailable"),
+    );
+    apiMocks.fetchOpenEvoDesktopCapabilities.mockResolvedValue(
+      desktopCapabilities(),
     );
     apiMocks.fetchOpenEvoProjectConfigs.mockRejectedValue(
       new Error("sidecar unavailable"),
@@ -614,10 +626,9 @@ describe("OpenEvoDesktop", () => {
     expect(inputByLabel("PIP index URL").value).toBe(
       "https://pypi.tuna.tsinghua.edu.cn/simple",
     );
-    expect(inputByLabel("HF home").value).toBe("/data/hf-cache");
+    expect(document.body.textContent).not.toContain("HF home");
 
     await changeInput("HTTP proxy", "http://127.0.0.1:1080");
-    await changeInput("HF home", "/mnt/models/hf-cache");
 
     await act(async () => {
       buttonByText("Save Config").dispatchEvent(
@@ -639,7 +650,7 @@ describe("OpenEvoDesktop", () => {
         no_proxy: "localhost,127.0.0.1",
         pip_index_url: "https://pypi.tuna.tsinghua.edu.cn/simple",
         huggingface_endpoint: "https://hf-mirror.com",
-        hf_home: "/mnt/models/hf-cache",
+        hf_home: "/data/hf-cache",
       }),
     );
     await unmountClient(root);
@@ -665,10 +676,13 @@ describe("OpenEvoDesktop", () => {
     expect(inputByLabel("HF model").value).toBe(
       "Qwen/Qwen3-Coder-30B-A3B-Instruct",
     );
+    expect(inputByLabel("Hugging Face endpoint").value).toBe("https://hf-mirror.com");
+    expect(inputByLabel("HF home").value).toBe("");
     expect(document.body.textContent).toContain("HF model");
     expect(document.body.textContent).toContain("transcript evolution");
 
     await changeInput("HF model", "Qwen/Qwen2.5-7B-Instruct");
+    await changeInput("HF home", "/mnt/models/hf-cache");
     await act(async () => {
       buttonByText("Save Config").dispatchEvent(
         new MouseEvent("click", { bubbles: true }),
@@ -681,8 +695,99 @@ describe("OpenEvoDesktop", () => {
         execution_mode: "self-deployed",
         codex_model: null,
         hf_model: "Qwen/Qwen2.5-7B-Instruct",
+        hf_home: "/mnt/models/hf-cache",
       }),
     );
+    await unmountClient(root);
+  });
+
+  it("renders evolution target controls from desktop capabilities", async () => {
+    const shellModel = getOpenEvoDesktopShellModel();
+    apiMocks.fetchOpenEvoDesktopShellModel.mockResolvedValue(shellModel);
+    apiMocks.fetchOpenEvoDesktopCapabilities.mockResolvedValue({
+      artifactTargets: [
+        {
+          artifactType: "text_memory",
+          displayName: "Text Memory",
+          visibleInDesktop: true,
+          stabilityLevel: "stable",
+        },
+        {
+          artifactType: "skill_bundle",
+          displayName: "Skill Bundle",
+          visibleInDesktop: true,
+          stabilityLevel: "stable",
+        },
+        {
+          artifactType: "agent_system",
+          displayName: "Agent System",
+          visibleInDesktop: true,
+          stabilityLevel: "stable",
+        },
+        {
+          artifactType: "parametric_memory",
+          displayName: "Parametric Memory",
+          visibleInDesktop: false,
+          stabilityLevel: "experimental",
+        },
+      ],
+      evolutionMethods: [
+        {
+          methodId: "text_memory_reflector",
+          displayName: "Text memory",
+          artifactType: "text_memory",
+          supportedExecutionModes: [
+            "codex_subscription_transcript",
+            "self-deployed",
+          ],
+          visibleInDesktop: true,
+          stabilityLevel: "stable",
+        },
+        {
+          methodId: "skill_bundle_reflector",
+          displayName: "Skill bundle",
+          artifactType: "skill_bundle",
+          supportedExecutionModes: [
+            "codex_subscription_transcript",
+            "self-deployed",
+          ],
+          visibleInDesktop: true,
+          stabilityLevel: "stable",
+        },
+        {
+          methodId: "agent_system_reflector",
+          displayName: "Agent system",
+          artifactType: "agent_system",
+          supportedExecutionModes: [
+            "codex_subscription_transcript",
+            "self-deployed",
+          ],
+          visibleInDesktop: true,
+          stabilityLevel: "stable",
+        },
+        {
+          methodId: "parametric_memory_trainer",
+          displayName: "Parametric memory",
+          artifactType: "parametric_memory",
+          supportedExecutionModes: ["self-deployed"],
+          visibleInDesktop: false,
+          stabilityLevel: "experimental",
+        },
+      ],
+    });
+
+    const root = await renderClient();
+    await flushEffects();
+
+    const targetLabels = Array.from(
+      document.querySelectorAll('[data-testid="evolution-target"]'),
+    ).map((item) => item.textContent?.trim());
+    expect(targetLabels).toEqual([
+      "Text memory",
+      "Skill bundle",
+      "Agent system",
+    ]);
+    expect(document.body.textContent).not.toContain("Parametric memory");
     await unmountClient(root);
   });
 
@@ -705,7 +810,7 @@ describe("OpenEvoDesktop", () => {
     expect(selectByLabel("Execution mode").value).toBe(
       "codex_subscription_transcript",
     );
-    expect(inputByLabel("Codex model").value).toBe("gpt-5.1-codex-mini");
+    expect(document.body.textContent).not.toContain("Codex model");
 
     await changeSelect("Execution mode", "self-deployed");
     expect(inputByLabel("HF model").value).toBe("");
@@ -840,7 +945,8 @@ describe("OpenEvoDesktop", () => {
       );
       await Promise.resolve();
     });
-    expect(document.body.textContent).toContain("run_20260707170000000000");
+    expect(document.body.textContent).toContain("Run Status");
+    expect(document.body.textContent).toContain("failed");
 
     await act(async () => {
       buttonByLabel("Activate Protein Design").dispatchEvent(
@@ -854,7 +960,7 @@ describe("OpenEvoDesktop", () => {
     );
     expect(document.body.textContent).toContain("Activated Project");
     expect(document.body.textContent).toContain("activated.gpu.example.edu");
-    expect(document.body.textContent).not.toContain("run_20260707170000000000");
+    expect(document.body.textContent).not.toContain("Run Status");
     await unmountClient(root);
   });
 
@@ -1220,7 +1326,6 @@ describe("OpenEvoDesktop", () => {
     });
 
     expect(apiMocks.pollOpenEvoRunStatus).toHaveBeenCalledTimes(1);
-    expect(document.body.textContent).toContain("run_20260707170000000000");
     expect(document.body.textContent).toContain("running");
 
     await act(async () => {
@@ -1232,10 +1337,6 @@ describe("OpenEvoDesktop", () => {
     });
 
     expect(document.body.textContent).toContain("succeeded");
-    expect(document.body.textContent).toContain(
-      "/home/alice/.openevo/runs/protein/folding/runs/run_20260707170000000000",
-    );
-    expect(document.body.textContent).toContain("ok");
     expect(document.body.textContent).toContain("Last run completed");
     expect(document.body.textContent).toContain(
       "Run completed and transcript captured",
@@ -1271,6 +1372,13 @@ describe("OpenEvoDesktop", () => {
     apiMocks.runOpenEvoStartRun.mockReturnValue(launch.promise);
     apiMocks.pollOpenEvoRunStatus.mockReturnValue(poll.promise);
     apiMocks.fetchOpenEvoRunArtifacts.mockResolvedValue(runArtifacts());
+    apiMocks.fetchOpenEvoArtifactContent.mockResolvedValue({
+      artifactId: "artifact-text-memory",
+      artifactType: "text_memory",
+      filename: "memory.md",
+      content: "# Learned Memory\n\n- Prefer stable folds.\n",
+      mimeType: "text/markdown",
+    });
 
     const root = await renderClient();
     await flushEffects();
@@ -1297,12 +1405,139 @@ describe("OpenEvoDesktop", () => {
     });
 
     expect(apiMocks.fetchOpenEvoRunArtifacts).toHaveBeenCalledTimes(1);
+    expect(apiMocks.fetchOpenEvoArtifactContent).toHaveBeenCalledWith(
+      "artifact-text-memory",
+    );
     expect(document.body.textContent).toContain("Run Artifact Timeline");
     expect(document.body.textContent).toContain("folding-baseline");
     expect(document.body.textContent).toContain("Round 0");
+    expect(document.body.textContent).toContain("Text memory");
+    expect(document.body.textContent).toContain("Learned Memory");
+    expect(document.body.textContent).toContain("approved");
+    await unmountClient(root);
+  });
+
+  it("hides raw run and artifact diagnostics until Diagnostics is opened", async () => {
+    const shellModel = modelWithRun({
+      projectName: "Loaded Science Project",
+      backendState: "ready",
+      backendDetail: "Remote runtime services are ready",
+      transcriptState: "planned",
+      transcriptDetail: "Trajectory capture will start after the first run",
+    });
+    const ranModel = modelWithRun({
+      projectName: "Loaded Science Project",
+      backendState: "ready",
+      backendDetail: "Last run completed",
+      transcriptState: "complete",
+      transcriptDetail: "Run completed and transcript captured",
+    });
+    apiMocks.fetchOpenEvoDesktopShellModel.mockResolvedValue(shellModel);
+    const diagnosticRun = {
+      ...runStatus("succeeded"),
+      stdout: "stdout secret payload",
+      stderr: "stderr secret payload",
+    };
+    apiMocks.runOpenEvoStartRun.mockResolvedValue({
+      run: diagnosticRun,
+      status: ranModel,
+    });
+    apiMocks.fetchOpenEvoRunArtifacts.mockResolvedValue(runArtifacts());
+    apiMocks.fetchOpenEvoArtifactContent.mockResolvedValue({
+      artifactId: "artifact-text-memory",
+      artifactType: "text_memory",
+      filename: "memory.md",
+      content: "# Learned Memory\n",
+      mimeType: "text/markdown",
+    });
+
+    const root = await renderClient();
+    await flushEffects();
+
+    await act(async () => {
+      buttonByText("Start Run").dispatchEvent(
+        new MouseEvent("click", { bubbles: true }),
+      );
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(document.body.textContent).toContain("Diagnostics");
+    expect(document.body.textContent).not.toContain("run_20260707170000000000");
+    expect(document.body.textContent).not.toContain(
+      "/home/alice/.openevo/runs/protein/folding/runs/run_20260707170000000000",
+    );
+    expect(document.body.textContent).not.toContain("stdout secret payload");
+    expect(document.body.textContent).not.toContain("stderr secret payload");
+    expect(document.body.textContent).not.toContain("text_memory_reflector");
+    expect(document.body.textContent).not.toContain("artifact-text-memory");
+
+    await act(async () => {
+      const details = document.querySelector("details");
+      if (!(details instanceof HTMLDetailsElement)) {
+        throw new Error("Diagnostics details not found");
+      }
+      details.open = true;
+      details.dispatchEvent(new Event("toggle", { bubbles: true }));
+    });
+
+    expect(document.body.textContent).toContain("run_20260707170000000000");
+    expect(document.body.textContent).toContain(
+      "/home/alice/.openevo/runs/protein/folding/runs/run_20260707170000000000",
+    );
+    expect(document.body.textContent).toContain("stdout secret payload");
+    expect(document.body.textContent).toContain("stderr secret payload");
     expect(document.body.textContent).toContain("text_memory_reflector");
     expect(document.body.textContent).toContain("artifact-text-memory");
-    expect(document.body.textContent).toContain("approved");
+    await unmountClient(root);
+  });
+
+  it("does not preview draft artifacts without approved artifact IDs", async () => {
+    const shellModel = modelWithRun({
+      projectName: "Loaded Science Project",
+      backendState: "ready",
+      backendDetail: "Remote runtime services are ready",
+      transcriptState: "planned",
+      transcriptDetail: "Trajectory capture will start after the first run",
+    });
+    const ranModel = modelWithRun({
+      projectName: "Loaded Science Project",
+      backendState: "ready",
+      backendDetail: "Last run completed",
+      transcriptState: "complete",
+      transcriptDetail: "Run completed and transcript captured",
+    });
+    apiMocks.fetchOpenEvoDesktopShellModel.mockResolvedValue(shellModel);
+    apiMocks.runOpenEvoStartRun.mockResolvedValue({
+      run: runStatus("succeeded"),
+      status: ranModel,
+    });
+    apiMocks.fetchOpenEvoRunArtifacts.mockResolvedValue(draftOnlyRunArtifacts());
+    apiMocks.fetchOpenEvoArtifactContent.mockResolvedValue({
+      artifactId: "artifact-draft-memory",
+      artifactType: "text_memory",
+      filename: "memory.md",
+      content: "# Draft Memory\n\n- This content is not approved.\n",
+      mimeType: "text/markdown",
+    });
+
+    const root = await renderClient();
+    await flushEffects();
+
+    await act(async () => {
+      buttonByText("Start Run").dispatchEvent(
+        new MouseEvent("click", { bubbles: true }),
+      );
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(apiMocks.fetchOpenEvoArtifactContent).not.toHaveBeenCalled();
+    expect(document.body.textContent).toContain(
+      "No promoted artifact content available yet.",
+    );
+    expect(document.body.textContent).not.toContain("Draft Memory");
+    expect(document.body.textContent).not.toContain("artifact-draft-memory");
     await unmountClient(root);
   });
 
@@ -1401,7 +1636,6 @@ describe("OpenEvoDesktop", () => {
     });
 
     expect(document.body.textContent).toContain("succeeded");
-    expect(document.body.textContent).toContain("run_20260707170000000000");
     expect(document.body.textContent).toContain("Last run completed");
     await unmountClient(root);
   });
@@ -1512,7 +1746,8 @@ describe("OpenEvoDesktop", () => {
       );
       await Promise.resolve();
     });
-    expect(document.body.textContent).toContain("run_20260707170000000000");
+    expect(document.body.textContent).toContain("Run Status");
+    expect(document.body.textContent).toContain("failed");
 
     await act(async () => {
       buttonByText("Save Config").dispatchEvent(
@@ -1522,7 +1757,7 @@ describe("OpenEvoDesktop", () => {
     });
 
     expect(document.body.textContent).toContain("Configured Science Project");
-    expect(document.body.textContent).not.toContain("run_20260707170000000000");
+    expect(document.body.textContent).not.toContain("Run Status");
     await unmountClient(root);
   });
 
@@ -1554,7 +1789,10 @@ describe("OpenEvoDesktop", () => {
       status: runningModel,
     });
     apiMocks.pollOpenEvoRunStatus.mockResolvedValue({
-      run: runStatus("failed"),
+      run: {
+        ...runStatus("failed"),
+        stderr: "stderr secret payload",
+      },
       status: failedModel,
     });
 
@@ -1570,7 +1808,17 @@ describe("OpenEvoDesktop", () => {
 
     expect(document.body.textContent).toContain("failed");
     expect(document.body.textContent).toContain("run failed");
+    expect(document.body.textContent).not.toContain("stderr secret payload");
     expect(document.body.textContent).toContain("2");
+    await act(async () => {
+      const details = document.querySelector("details");
+      if (!(details instanceof HTMLDetailsElement)) {
+        throw new Error("Diagnostics details not found");
+      }
+      details.open = true;
+      details.dispatchEvent(new Event("toggle", { bubbles: true }));
+    });
+    expect(document.body.textContent).toContain("stderr secret payload");
     await unmountClient(root);
   });
 
@@ -2098,6 +2346,99 @@ function runArtifacts() {
             ],
           },
         ],
+      },
+    ],
+  };
+}
+
+function draftOnlyRunArtifacts() {
+  return {
+    ...emptyRunArtifacts(),
+    roundCount: 1,
+    tasks: [
+      {
+        taskId: "folding-baseline",
+        rounds: [
+          {
+            roundIndex: 0,
+            policyVersion: "policy-r0",
+            rolloutStatus: "completed",
+            datasetStatus: "ready",
+            artifactIds: {
+              text_memory: ["artifact-draft-memory"],
+            },
+            jobs: [
+              {
+                artifactType: "text_memory",
+                method: "text_memory_reflector",
+                workerStatus: "succeeded",
+                artifactIds: ["artifact-draft-memory"],
+                approvedArtifactIds: [],
+                promotionStatus: "rejected",
+              },
+            ],
+          },
+        ],
+      },
+    ],
+  };
+}
+
+function desktopCapabilities() {
+  return {
+    artifactTargets: [
+      {
+        artifactType: "text_memory",
+        displayName: "Text Memory",
+        visibleInDesktop: true,
+        stabilityLevel: "stable",
+      },
+      {
+        artifactType: "skill_bundle",
+        displayName: "Skill Bundle",
+        visibleInDesktop: true,
+        stabilityLevel: "stable",
+      },
+      {
+        artifactType: "agent_system",
+        displayName: "Agent System",
+        visibleInDesktop: true,
+        stabilityLevel: "stable",
+      },
+    ],
+    evolutionMethods: [
+      {
+        methodId: "text_memory_reflector",
+        displayName: "Text memory",
+        artifactType: "text_memory",
+        supportedExecutionModes: [
+          "codex_subscription_transcript",
+          "self-deployed",
+        ],
+        visibleInDesktop: true,
+        stabilityLevel: "stable",
+      },
+      {
+        methodId: "skill_bundle_reflector",
+        displayName: "Skill bundle",
+        artifactType: "skill_bundle",
+        supportedExecutionModes: [
+          "codex_subscription_transcript",
+          "self-deployed",
+        ],
+        visibleInDesktop: true,
+        stabilityLevel: "stable",
+      },
+      {
+        methodId: "agent_system_reflector",
+        displayName: "Agent system",
+        artifactType: "agent_system",
+        supportedExecutionModes: [
+          "codex_subscription_transcript",
+          "self-deployed",
+        ],
+        visibleInDesktop: true,
+        stabilityLevel: "stable",
       },
     ],
   };
