@@ -1429,6 +1429,7 @@ _OBJECT_CONFIG_SCHEMA: dict[str, Any] = {"type": "object", "additionalProperties
 
 METHOD_METADATA: dict[str, dict[str, Any]] = {
     "text_memory": {
+        "method_id": "text_memory",
         "display_name": "Text Memory",
         "description": "Build text memory directly from dataset records.",
         "artifact_type": "text_memory",
@@ -1441,6 +1442,7 @@ METHOD_METADATA: dict[str, dict[str, Any]] = {
         "stability_level": "stable",
     },
     "text_memory_reflector": {
+        "method_id": "text_memory_reflector",
         "display_name": "Text Memory Reflector",
         "description": "Reflect over task trajectories to synthesize reusable text memory.",
         "artifact_type": "text_memory",
@@ -1453,6 +1455,7 @@ METHOD_METADATA: dict[str, dict[str, Any]] = {
         "stability_level": "stable",
     },
     "text_memory_expel_reflector": {
+        "method_id": "text_memory_expel_reflector",
         "display_name": "Text Memory ExpeL Reflector",
         "description": "Produce structured ExpeL-style text memory from success and failure traces.",
         "artifact_type": "text_memory",
@@ -1465,6 +1468,7 @@ METHOD_METADATA: dict[str, dict[str, Any]] = {
         "stability_level": "experimental",
     },
     "skill_bundle": {
+        "method_id": "skill_bundle",
         "display_name": "Skill Bundle",
         "description": "Register a configured skill bundle artifact.",
         "artifact_type": "skill_bundle",
@@ -1477,6 +1481,7 @@ METHOD_METADATA: dict[str, dict[str, Any]] = {
         "stability_level": "stable",
     },
     "skill_bundle_reflector": {
+        "method_id": "skill_bundle_reflector",
         "display_name": "Skill Bundle Reflector",
         "description": "Reflect over trajectories to synthesize a harness-loadable skill bundle.",
         "artifact_type": "skill_bundle",
@@ -1489,6 +1494,7 @@ METHOD_METADATA: dict[str, dict[str, Any]] = {
         "stability_level": "stable",
     },
     "agent_system": {
+        "method_id": "agent_system",
         "display_name": "Agent System",
         "description": "Register a configured agent-system instruction artifact.",
         "artifact_type": "agent_system",
@@ -1501,6 +1507,7 @@ METHOD_METADATA: dict[str, dict[str, Any]] = {
         "stability_level": "stable",
     },
     "agent_system_reflector": {
+        "method_id": "agent_system_reflector",
         "display_name": "Agent System Reflector",
         "description": "Reflect over trajectories to synthesize improved agent instructions.",
         "artifact_type": "agent_system",
@@ -1513,6 +1520,7 @@ METHOD_METADATA: dict[str, dict[str, Any]] = {
         "stability_level": "stable",
     },
     "agent_system_history_reflector": {
+        "method_id": "agent_system_history_reflector",
         "display_name": "Agent System History Reflector",
         "description": "Use prior evolution rounds to synthesize the next agent-system artifact.",
         "artifact_type": "agent_system",
@@ -1525,6 +1533,7 @@ METHOD_METADATA: dict[str, dict[str, Any]] = {
         "stability_level": "experimental",
     },
     "agent_system_pareto_reflector": {
+        "method_id": "agent_system_pareto_reflector",
         "display_name": "Agent System Pareto Reflector",
         "description": "Generate and select agent-system candidates with Pareto-style scoring.",
         "artifact_type": "agent_system",
@@ -1537,6 +1546,7 @@ METHOD_METADATA: dict[str, dict[str, Any]] = {
         "stability_level": "experimental",
     },
     "agent_system_gepa_reflector": {
+        "method_id": "agent_system_gepa_reflector",
         "display_name": "Agent System GEPA Reflector",
         "description": "Generate agent-system prompt mutations using GEPA-style strategies.",
         "artifact_type": "agent_system",
@@ -1549,6 +1559,7 @@ METHOD_METADATA: dict[str, dict[str, Any]] = {
         "stability_level": "experimental",
     },
     "parametric_memory_register": {
+        "method_id": "parametric_memory_register",
         "display_name": "Parametric Memory Register",
         "description": "Register an existing adapter as a parametric-memory artifact.",
         "artifact_type": "parametric_memory",
@@ -1561,6 +1572,7 @@ METHOD_METADATA: dict[str, dict[str, Any]] = {
         "stability_level": "experimental",
     },
     "parametric_memory_lora_sft": {
+        "method_id": "parametric_memory_lora_sft",
         "display_name": "Parametric Memory LoRA SFT",
         "description": "Train or register a LoRA-style supervised fine-tuning adapter.",
         "artifact_type": "parametric_memory",

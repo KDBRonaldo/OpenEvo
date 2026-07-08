@@ -60,6 +60,21 @@ def test_capability_models_have_stable_json_shape() -> None:
 
 
 def test_every_registered_method_has_metadata() -> None:
+    required_fields = {
+        "method_id",
+        "display_name",
+        "artifact_type",
+        "description",
+        "input_requirements",
+        "supported_execution_modes",
+        "config_schema",
+        "default_config",
+        "stability_level",
+        "visibility",
+        "visible_in_desktop",
+    }
+
     assert set(METHOD_METADATA) == set(METHOD_REGISTRY)
-    assert all("input_requirements" in metadata for metadata in METHOD_METADATA.values())
-    assert all("default_config" in metadata for metadata in METHOD_METADATA.values())
+    for method_id, payload in METHOD_METADATA.items():
+        assert required_fields.issubset(payload)
+        assert payload["method_id"] == method_id

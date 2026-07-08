@@ -669,10 +669,11 @@ def my_memory_method(job: WorkerClaimedJob, artifact_root: Path) -> list[Artifac
 METHOD_REGISTRY["my_memory_method"] = my_memory_method
 ```
 
-3. 在 `METHOD_METADATA` 注册 capability metadata。metadata 的 key 必须等于
-   `METHOD_REGISTRY` key，至少说明 `display_name`、`description`、`artifact_type`、
-   `visibility`、`visible_in_desktop`、`input_requirements`、`supported_execution_modes`、
-   `default_config`、`config_schema` 和 `stability_level`。Desktop/Dev Kit 会通过
+3. 在 `METHOD_METADATA` 注册 capability metadata。metadata 的 key 和 payload 内的
+   `method_id` 都必须等于 `METHOD_REGISTRY` key，至少说明 `method_id`、`display_name`、
+   `description`、`artifact_type`、`visibility`、`visible_in_desktop`、`input_requirements`、
+   `supported_execution_modes`、`default_config`、`config_schema` 和 `stability_level`。
+   Desktop/Dev Kit 会通过
    `openevo.core.capabilities` 读取这份 metadata，不应再硬编码 method table。
 
 4. 创建 job 时设置：

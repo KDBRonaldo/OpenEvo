@@ -60,10 +60,13 @@ class CoreCapabilities(_CoreModel):
 def method_metadata_by_id() -> dict[str, EvolutionMethodCapability]:
     from polar_evolution.methods import METHOD_METADATA
 
-    return {
-        method_id: EvolutionMethodCapability(method_id=method_id, **metadata)
-        for method_id, metadata in METHOD_METADATA.items()
-    }
+    metadata_by_id: dict[str, EvolutionMethodCapability] = {}
+    for method_id, metadata in METHOD_METADATA.items():
+        payload = dict(metadata)
+        if payload.get("method_id") != method_id:
+            raise ValueError(f"Method metadata ID mismatch for {method_id}")
+        metadata_by_id[method_id] = EvolutionMethodCapability(**payload)
+    return metadata_by_id
 
 
 def build_core_capabilities() -> CoreCapabilities:
