@@ -5,6 +5,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Event
+from zipfile import ZipFile
 
 from fastapi.testclient import TestClient
 import pytest
@@ -262,6 +263,169 @@ def test_bootstrap_endpoint_runs_config_backed_dry_run_and_refreshes_status() ->
 
     status_response = client.get("/openevo-api/desktop/shell")
     assert status_response.json()["bootstrap"]["ready"] is True
+
+
+def test_bootstrap_uploads_exact_core_wheel_when_available(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wheel_dir = tmp_path / "dist"
+    wheel = _write_openevo_wheel(wheel_dir / "openevo-0.1.0-py3-none-any.whl")
+    monkeypatch.setattr(sidecar_api, "discover_local_openevo_wheel", lambda: wheel)
+    project = ScienceProjectConfig.model_validate(_science_project_payload())
+    profile = _remote_profile()
+    transport = _ApiDryRunTransport()
+    client = TestClient(
+        create_sidecar_app_for_project(
+            project,
+            profile,
+            transport_factory=lambda _profile: transport,
+        )
+    )
+    token = _sidecar_token(client)
+
+    response = client.post(
+        "/openevo-api/desktop/bootstrap",
+        headers={"X-OpenEvo-Sidecar-Token": token},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["report"]["ready"] is True
+    assert len(transport.uploads) == 1
+    uploaded_local, uploaded_remote = transport.uploads[0]
+    assert Path(uploaded_local) != wheel_dir
+    assert transport.upload_contents == [[wheel.name]]
+    assert uploaded_remote == (
+        "/home/alice/.openevo/runs/protein-design/folding-baseline/wheels"
+    )
+    ensure_step = next(
+        step
+        for step in payload["report"]["steps"]
+        if step["id"] == "ensure_openevo_cli"
+    )
+    remote_wheel = (
+        "/home/alice/.openevo/runs/protein-design/"
+        "folding-baseline/wheels/openevo-0.1.0-py3-none-any.whl"
+    )
+    assert ensure_step["remediation_kind"] == "upload_exact_openevo_wheel"
+    assert remote_wheel in ensure_step["command"]
+    assert "expected = '0.1.0'" in ensure_step["command"]
+    assert "pip install --user --upgrade openevo" not in ensure_step["command"]
+
+
+def test_bootstrap_reports_sanitized_exact_core_wheel_upload_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wheel = _write_openevo_wheel(tmp_path / "openevo-0.1.0-py3-none-any.whl")
+    monkeypatch.setattr(sidecar_api, "discover_local_openevo_wheel", lambda: wheel)
+    project = ScienceProjectConfig.model_validate(_science_project_payload())
+    profile = _remote_profile(
+        proxy={"https_proxy": "http://proxy-user:proxy-secret@127.0.0.1:7890"}
+    )
+    transport = _WheelUploadFailingTransport()
+    client = TestClient(
+        create_sidecar_app_for_project(
+            project,
+            profile,
+            transport_factory=lambda _profile: transport,
+        )
+    )
+    token = _sidecar_token(client)
+
+    response = client.post(
+        "/openevo-api/desktop/bootstrap",
+        headers={"X-OpenEvo-Sidecar-Token": token},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["bootstrap"]["ready"] is False
+    assert payload["report"]["ready"] is False
+    assert payload["report"]["steps"][0]["id"] == "ensure_openevo_cli"
+    assert payload["report"]["steps"][0]["status"] == "fail"
+    assert payload["report"]["steps"][0]["remediation_kind"] == (
+        "upload_exact_openevo_wheel"
+    )
+    assert "proxy-secret" not in payload["report"]["steps"][0]["stderr"]
+    assert "[REDACTED]" in payload["report"]["steps"][0]["stderr"]
+
+
+def test_bootstrap_runs_preflight_before_exact_core_wheel_upload(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wheel = _write_openevo_wheel(tmp_path / "openevo-0.1.0-py3-none-any.whl")
+    monkeypatch.setattr(sidecar_api, "discover_local_openevo_wheel", lambda: wheel)
+    project = ScienceProjectConfig.model_validate(_science_project_payload())
+    profile = _remote_profile()
+    transport = _FailingPreflightTransport()
+    client = TestClient(
+        create_sidecar_app_for_project(
+            project,
+            profile,
+            transport_factory=lambda _profile: transport,
+        )
+    )
+    token = _sidecar_token(client)
+
+    response = client.post(
+        "/openevo-api/desktop/bootstrap",
+        headers={"X-OpenEvo-Sidecar-Token": token},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["bootstrap"]["ready"] is False
+    assert payload["report"]["ready"] is False
+    assert payload["report"]["steps"] == []
+    assert payload["report"]["preflight"]["checks"][0]["name"] == "ssh"
+    assert payload["report"]["preflight"]["checks"][0]["status"] == "fail"
+    assert transport.uploads == []
+
+
+def test_wheel_discovery_ignores_untrusted_cwd_dist(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dist = tmp_path / "dist"
+    _write_openevo_wheel(dist / "openevo-0.1.0-py3-none-any.whl")
+    monkeypatch.chdir(tmp_path)
+
+    assert sidecar_api.discover_local_openevo_wheel() is None
+
+
+def test_wheel_discovery_uses_only_package_relative_bundled_dirs() -> None:
+    package_root = Path(sidecar_api.__file__).resolve().parents[1]
+
+    assert sidecar_api._openevo_wheel_search_dirs() == (
+        package_root / "wheels",
+        package_root / "desktop" / "wheels",
+    )
+
+
+def test_wheel_discovery_requires_matching_openevo_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trusted = tmp_path / "trusted"
+    invalid = _write_openevo_wheel(
+        trusted / "openevo-0.1.0-py3-none-any.whl",
+        metadata_name="polar",
+    )
+    valid = _write_openevo_wheel(trusted / "openevo-0.1.0-local-py3-none-any.whl")
+    monkeypatch.setattr(sidecar_api, "_openevo_wheel_search_dirs", lambda: (trusted,))
+
+    assert sidecar_api.discover_local_openevo_wheel() == valid
+    invalid.unlink()
+    valid.unlink()
+    _write_openevo_wheel(
+        trusted / "openevo-0.1.0-py3-none-any.whl",
+        metadata_version="0.2.0",
+    )
+
+    assert sidecar_api.discover_local_openevo_wheel() is None
 
 
 def test_bootstrap_endpoint_preserves_failure_status() -> None:
@@ -2420,14 +2584,17 @@ def _science_project_payload() -> dict:
     }
 
 
-def _remote_profile(auth: dict | None = None) -> RemoteProfileConfig:
+def _remote_profile(
+    auth: dict | None = None,
+    proxy: dict | None = None,
+) -> RemoteProfileConfig:
     return RemoteProfileConfig(
         version=1,
         id="science-team",
         host="gpu.example.edu",
         user="alice",
         auth=auth or {"method": "ssh_agent"},
-        proxy={"https_proxy": "http://127.0.0.1:7890"},
+        proxy=proxy or {"https_proxy": "http://127.0.0.1:7890"},
     )
 
 
@@ -2573,9 +2740,32 @@ def _artifact_metadata(
     }
 
 
+def _write_openevo_wheel(
+    path: Path,
+    *,
+    metadata_name: str = "openevo",
+    metadata_version: str = "0.1.0",
+) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with ZipFile(path, "w") as wheel:
+        wheel.writestr(
+            "openevo-0.1.0.dist-info/METADATA",
+            "\n".join(
+                [
+                    "Metadata-Version: 2.4",
+                    f"Name: {metadata_name}",
+                    f"Version: {metadata_version}",
+                    "",
+                ]
+            ),
+        )
+    return path
+
+
 class _ApiDryRunTransport:
     def __init__(self) -> None:
         self.uploads: list[tuple[str, str]] = []
+        self.upload_contents: list[list[str]] = []
         self.commands: list[str] = []
         self.run_calls: list[tuple[str, str | None, float]] = []
 
@@ -2598,11 +2788,26 @@ class _ApiDryRunTransport:
                     "/dev/root 100000000 1 99999999 1% /home\n"
                 ),
             )
+        if "importlib.metadata" in command and "version('openevo')" in command:
+            return RemoteCommandResult(command=command, return_code=0, stdout="0.1.0\n")
+        if "openevo --version" in command:
+            return RemoteCommandResult(command=command, return_code=0, stdout="openevo 0.1.0\n")
+        if "openevo --help" in command:
+            return RemoteCommandResult(command=command, return_code=0, stdout="help")
         return RemoteCommandResult(command=command, return_code=0, stdout="ok")
 
     def upload_dir(self, local_path: str, remote_path: str) -> None:
         self.uploads.append((local_path, remote_path))
+        self.upload_contents.append(sorted(path.name for path in Path(local_path).iterdir()))
         return None
+
+
+class _WheelUploadFailingTransport(_ApiDryRunTransport):
+    def upload_dir(self, local_path: str, remote_path: str) -> None:
+        self.uploads.append((local_path, remote_path))
+        raise RuntimeError(
+            "upload failed via http://proxy-user:proxy-secret@127.0.0.1:7890"
+        )
 
 
 class _ApiLifecycleTransport(_ApiDryRunTransport):
@@ -2633,6 +2838,20 @@ class _ApiLifecycleTransport(_ApiDryRunTransport):
         self.run_calls.append((command, cwd, timeout_seconds))
         service_id = _service_id_from_command(command)
         if command == 'df -Pk "$HOME"':
+            return super().run(
+                command,
+                cwd=cwd,
+                env=env,
+                timeout_seconds=timeout_seconds,
+            )
+        if "importlib.metadata" in command and "version('openevo')" in command:
+            return super().run(
+                command,
+                cwd=cwd,
+                env=env,
+                timeout_seconds=timeout_seconds,
+            )
+        if "openevo --version" in command or "openevo --help" in command:
             return super().run(
                 command,
                 cwd=cwd,

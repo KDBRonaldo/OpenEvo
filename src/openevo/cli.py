@@ -11,14 +11,13 @@ import httpx
 import yaml
 from pydantic import ValidationError
 
+from openevo import __version__ as OPENEVO_VERSION
 from openevo.desktop import create_desktop_app
 from openevo.experiment.models import load_experiment_config
 from openevo.experiment.runner import dry_run_experiment, run_experiment
 from openevo.remote import (
     RemoteCommandResult,
     SshRemoteExecutorTransport,
-    build_remote_bootstrap_plan,
-    execute_remote_bootstrap_plan,
     execute_sidecar_plan,
 )
 from openevo.science import (
@@ -32,12 +31,18 @@ from openevo.sidecar import (
     create_sidecar_app_for_project,
     load_remote_profile_config,
 )
+from openevo.sidecar.api import prepare_and_execute_remote_bootstrap
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="openevo",
         description="Run OpenEvo experiments on top of Polar rollout and evolution services.",
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"openevo {OPENEVO_VERSION}",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -362,9 +367,8 @@ def _handle_sidecar_bootstrap(args: argparse.Namespace) -> int:
     project = load_science_project_config(Path(args.config))
     profile = load_remote_profile_config(Path(args.remote_profile))
     sidecar_plan = build_sidecar_science_plan(project, profile)
-    bootstrap_plan = build_remote_bootstrap_plan(sidecar_plan)
-    report = execute_remote_bootstrap_plan(
-        bootstrap_plan,
+    report = prepare_and_execute_remote_bootstrap(
+        sidecar_plan,
         _sidecar_transport(args, profile),
         run_remote_preflight=not args.skip_preflight,
     )
@@ -607,6 +611,20 @@ class _CliDryRunTransport:
                 "/dev/root 100000000 1 99999999 1% /home\n"
             )
             return RemoteCommandResult(command=command, return_code=0, stdout=stdout)
+        if "importlib.metadata" in command and "version('openevo')" in command:
+            return RemoteCommandResult(
+                command=command,
+                return_code=0,
+                stdout=f"{OPENEVO_VERSION}\n",
+            )
+        if "openevo --version" in command:
+            return RemoteCommandResult(
+                command=command,
+                return_code=0,
+                stdout=f"openevo {OPENEVO_VERSION}\n",
+            )
+        if "openevo --help" in command:
+            return RemoteCommandResult(command=command, return_code=0, stdout="help")
         return RemoteCommandResult(command=command, return_code=0, stdout="ok")
 
     def upload_dir(self, local_path: str, remote_path: str) -> None:

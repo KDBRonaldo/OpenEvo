@@ -8,6 +8,7 @@ from collections.abc import Mapping
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Literal
 
+from openevo import __version__ as OPENEVO_VERSION
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -80,7 +81,11 @@ class RemoteBootstrapStep(_StrictFrozenModel):
     network: bool = False
     required: bool = True
     remediation_kind: Literal[
-        "none", "openevo_retry", "openevo_install", "user_action"
+        "none",
+        "openevo_retry",
+        "openevo_install",
+        "upload_exact_openevo_wheel",
+        "user_action",
     ] = "none"
     manifest: dict[str, Any] = Field(default_factory=dict)
 
@@ -115,7 +120,11 @@ class RemoteBootstrapStepExecution(_StrictFrozenModel):
     command: str
     required: bool = True
     remediation_kind: Literal[
-        "none", "openevo_retry", "openevo_install", "user_action"
+        "none",
+        "openevo_retry",
+        "openevo_install",
+        "upload_exact_openevo_wheel",
+        "user_action",
     ] = "none"
     return_code: int | None = None
     stdout: str = ""
@@ -249,7 +258,12 @@ class RemoteBootstrapReport(_StrictFrozenModel):
         return RemoteBootstrapStepStatus.PASS
 
 
-def build_remote_bootstrap_plan(plan: SidecarSciencePlan) -> RemoteBootstrapPlan:
+def build_remote_bootstrap_plan(
+    plan: SidecarSciencePlan,
+    *,
+    expected_openevo_version: str | None = None,
+    bundled_wheel_remote_path: str | None = None,
+) -> RemoteBootstrapPlan:
     experiment_snapshot = _thaw_json(plan.experiment)
     if not isinstance(experiment_snapshot, dict):
         raise ValueError("sidecar experiment snapshot must be a JSON object")
@@ -262,6 +276,7 @@ def build_remote_bootstrap_plan(plan: SidecarSciencePlan) -> RemoteBootstrapPlan
     runtime_image = _runtime_image(experiment_snapshot)
     hf_model = _managed_hf_model(experiment_snapshot)
     proxy_env = dict(plan.proxy_env)
+    expected_version = expected_openevo_version or OPENEVO_VERSION
     experiment_path = posixpath.join(state_root, "experiment.json")
     manifest_path = posixpath.join(state_root, "bootstrap.json")
 
@@ -308,16 +323,10 @@ def build_remote_bootstrap_plan(plan: SidecarSciencePlan) -> RemoteBootstrapPlan
             remediation_kind="openevo_retry",
             manifest={"path": manifest_path},
         ),
-        RemoteBootstrapStep(
-            id="ensure_openevo_cli",
-            kind=RemoteBootstrapStepKind.CHECK_COMMAND,
-            command=_openevo_cli_install_command(),
-            env=proxy_env,
-            timeout_seconds=300.0,
-            network=True,
-            required=True,
-            remediation_kind="openevo_install",
-            manifest={"package": "openevo"},
+        ensure_remote_openevo_cli_step(
+            expected_version=expected_version,
+            bundled_wheel_remote_path=bundled_wheel_remote_path,
+            proxy_env=proxy_env,
         ),
     ]
 
@@ -393,6 +402,54 @@ def build_remote_bootstrap_plan(plan: SidecarSciencePlan) -> RemoteBootstrapPlan
     )
 
 
+def ensure_remote_openevo_cli_step(
+    *,
+    expected_version: str,
+    bundled_wheel_remote_path: str | None,
+    proxy_env: Mapping[str, str],
+) -> RemoteBootstrapStep:
+    expected = _strip_non_empty(expected_version, "expected_version")
+    if bundled_wheel_remote_path is None:
+        command = _openevo_exact_version_check_command(
+            expected,
+            no_wheel_message=(
+                f"Remote OpenEvo Core must be {expected}; "
+                "no bundled wheel was available"
+            ),
+        )
+    else:
+        wheel_path = _strip_non_empty(
+            bundled_wheel_remote_path,
+            "bundled_wheel_remote_path",
+        )
+        command = "\n".join(
+            [
+                "set -e",
+                (
+                    "python3 -m pip install --user --force-reinstall --no-input "
+                    f"--disable-pip-version-check {shlex.quote(wheel_path)}"
+                ),
+                _openevo_exact_version_check_command(expected),
+            ]
+        )
+
+    return RemoteBootstrapStep(
+        id="ensure_openevo_cli",
+        kind=RemoteBootstrapStepKind.CHECK_COMMAND,
+        command=command,
+        env=dict(proxy_env),
+        timeout_seconds=300.0,
+        network=True,
+        required=True,
+        remediation_kind="upload_exact_openevo_wheel",
+        manifest={
+            "expected_version": expected,
+            "bundled_wheel": bundled_wheel_remote_path is not None,
+            "bundled_wheel_remote_path": bundled_wheel_remote_path,
+        },
+    )
+
+
 def execute_remote_bootstrap_plan(
     plan: RemoteBootstrapPlan,
     transport: RemoteExecutorTransport,
@@ -420,6 +477,15 @@ def execute_remote_bootstrap_plan(
     executions: list[RemoteBootstrapStepExecution] = []
     for step in plan.steps:
         execution = _execute_bootstrap_step(step, transport)
+        if (
+            step.id == "ensure_openevo_cli"
+            and execution.status == RemoteBootstrapStepStatus.PASS
+        ):
+            execution = _verify_remote_openevo_cli_version(
+                step,
+                execution,
+                transport,
+            )
         executions.append(execution)
         if execution.required and execution.status == RemoteBootstrapStepStatus.FAIL:
             break
@@ -623,65 +689,55 @@ def _hf_snapshot_download_command(model: str) -> str:
     )
 
 
-def _openevo_cli_install_command() -> str:
+def _openevo_exact_version_check_command(
+    expected_version: str,
+    *,
+    no_wheel_message: str | None = None,
+) -> str:
+    mismatch_message = (
+        no_wheel_message
+        or f"Remote OpenEvo Core must be {expected_version}; found {{found}}"
+    )
     return "\n".join(
         [
             "python3 - <<'PY'",
-            "import os",
-            "import shutil",
-            "import subprocess",
+            "from importlib.metadata import PackageNotFoundError, version",
             "import sys",
-            "",
-            "env = os.environ.copy()",
-            "user_bin = os.path.expanduser('~/.local/bin')",
-            "os.makedirs(user_bin, exist_ok=True)",
-            "env['PATH'] = user_bin + os.pathsep + env.get('PATH', '')",
-            "",
-            "def run_command(args):",
-            "    try:",
-            (
-                "        return subprocess.run(args, check=True, env=env, "
-                "stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)"
-            ),
-            "    except subprocess.CalledProcessError as exc:",
-            "        return exc",
-            "",
-            "def fail(label, result):",
-            (
-                "    print(f'{label} failed with exit code "
-                "{result.returncode}', file=sys.stderr)"
-            ),
-            "    if result.stdout:",
-            "        print(f'{label} stdout:\\n{result.stdout}', file=sys.stderr)",
-            "    if result.stderr:",
-            "        print(f'{label} stderr:\\n{result.stderr}', file=sys.stderr)",
-            "    raise SystemExit(result.returncode or 1)",
-            "",
-            "def install_openevo():",
-            (
-                "    return run_command([sys.executable, '-m', 'pip', "
-                "'--disable-pip-version-check', 'install', '--user', "
-                "'--upgrade', '--no-input', 'openevo'])"
-            ),
-            "",
-            "def check_openevo():",
-            "    return run_command(['openevo', '--help'])",
-            "",
-            "if shutil.which('openevo', path=env.get('PATH')) is None:",
-            "    install = install_openevo()",
-            "    if install.returncode != 0:",
-            "        fail('openevo install', install)",
-            "check = check_openevo()",
-            "if check.returncode != 0:",
-            "    repair = install_openevo()",
-            "    if repair.returncode != 0:",
-            "        fail('openevo repair', repair)",
-            "    check = check_openevo()",
-            "    if check.returncode != 0:",
-            "        fail('openevo check', check)",
+            f"expected = {expected_version!r}",
+            "try:",
+            "    found = version('openevo')",
+            "except PackageNotFoundError:",
+            "    found = None",
+            "if found == expected:",
+            "    print(found)",
+            "else:",
+            f"    print({mismatch_message!r}.format(found=found or 'unknown'), file=sys.stderr)",
+            "    raise SystemExit(1)",
             "PY",
         ]
     )
+
+
+def _remote_openevo_version_command() -> str:
+    return "\n".join(
+        [
+            "python3 - <<'PY'",
+            "from importlib.metadata import PackageNotFoundError, version",
+            "try:",
+            "    print(version('openevo'))",
+            "except PackageNotFoundError:",
+            "    raise SystemExit(1)",
+            "PY",
+        ]
+    )
+
+
+def _remote_openevo_cli_version_command() -> str:
+    return 'PATH="$HOME/.local/bin:$PATH" openevo --version'
+
+
+def _remote_openevo_cli_help_command() -> str:
+    return 'PATH="$HOME/.local/bin:$PATH" openevo --help'
 
 
 def _thaw_json(value: object) -> object:
@@ -754,8 +810,184 @@ def _execute_bootstrap_step(
     )
 
 
+def _verify_remote_openevo_cli_version(
+    step: RemoteBootstrapStep,
+    execution: RemoteBootstrapStepExecution,
+    transport: RemoteExecutorTransport,
+) -> RemoteBootstrapStepExecution:
+    expected_version = step.manifest.get("expected_version")
+    if not isinstance(expected_version, str) or not expected_version.strip():
+        return execution
+
+    command = _remote_openevo_version_command()
+    try:
+        result = transport.run(
+            command,
+            cwd=step.cwd,
+            env=dict(step.env),
+            timeout_seconds=30.0,
+        )
+    except Exception as exc:
+        message = _sanitize_bootstrap_text(str(exc), step.env)
+        return execution.model_copy(
+            update={
+                "status": RemoteBootstrapStepStatus.FAIL,
+                "message": (
+                    f"Remote OpenEvo Core must be {expected_version}; found unknown."
+                ),
+                "return_code": None,
+                "stderr": _join_sanitized(execution.stderr, message),
+            }
+        )
+
+    stdout = _sanitize_bootstrap_text(result.stdout, step.env)
+    stderr = _sanitize_bootstrap_text(result.stderr, step.env)
+    found_version = _parse_openevo_version_probe_stdout(result.stdout) if result.ok else ""
+    if result.ok and found_version == expected_version:
+        execution = execution.model_copy(
+            update={
+                "stdout": _join_sanitized(execution.stdout, stdout),
+                "stderr": _join_sanitized(execution.stderr, stderr),
+            }
+        )
+        return _verify_remote_openevo_cli_entrypoint(
+            step,
+            execution,
+            transport,
+            expected_version=expected_version,
+        )
+
+    found_label = found_version or "unknown"
+    return execution.model_copy(
+        update={
+            "status": RemoteBootstrapStepStatus.FAIL,
+            "message": (
+                f"Remote OpenEvo Core must be {expected_version}; found {found_label}."
+            ),
+            "return_code": result.return_code,
+            "stdout": _join_sanitized(execution.stdout, stdout),
+            "stderr": _join_sanitized(execution.stderr, stderr),
+        }
+    )
+
+
+def _verify_remote_openevo_cli_entrypoint(
+    step: RemoteBootstrapStep,
+    execution: RemoteBootstrapStepExecution,
+    transport: RemoteExecutorTransport,
+    *,
+    expected_version: str,
+) -> RemoteBootstrapStepExecution:
+    try:
+        version_result = transport.run(
+            _remote_openevo_cli_version_command(),
+            cwd=step.cwd,
+            env=dict(step.env),
+            timeout_seconds=30.0,
+        )
+    except Exception as exc:
+        message = _sanitize_bootstrap_text(str(exc), step.env)
+        return execution.model_copy(
+            update={
+                "status": RemoteBootstrapStepStatus.FAIL,
+                "message": (
+                    "Remote OpenEvo CLI must be executable and report "
+                    f"{expected_version}; found unknown."
+                ),
+                "return_code": None,
+                "stderr": _join_sanitized(execution.stderr, message),
+            }
+        )
+
+    version_stdout = _sanitize_bootstrap_text(version_result.stdout, step.env)
+    version_stderr = _sanitize_bootstrap_text(version_result.stderr, step.env)
+    cli_version = (
+        _parse_openevo_cli_version_probe_stdout(version_result.stdout)
+        if version_result.ok
+        else ""
+    )
+    if not version_result.ok or cli_version != expected_version:
+        return execution.model_copy(
+            update={
+                "status": RemoteBootstrapStepStatus.FAIL,
+                "message": (
+                    "Remote OpenEvo CLI must be executable and report "
+                    f"{expected_version}; found {cli_version or 'unknown'}."
+                ),
+                "return_code": version_result.return_code,
+                "stdout": _join_sanitized(execution.stdout, version_stdout),
+                "stderr": _join_sanitized(execution.stderr, version_stderr),
+            }
+        )
+
+    try:
+        help_result = transport.run(
+            _remote_openevo_cli_help_command(),
+            cwd=step.cwd,
+            env=dict(step.env),
+            timeout_seconds=30.0,
+        )
+    except Exception as exc:
+        message = _sanitize_bootstrap_text(str(exc), step.env)
+        return execution.model_copy(
+            update={
+                "status": RemoteBootstrapStepStatus.FAIL,
+                "message": (
+                    "Remote OpenEvo CLI must be executable and report "
+                    f"{expected_version}; found unknown."
+                ),
+                "return_code": None,
+                "stdout": _join_sanitized(execution.stdout, version_stdout),
+                "stderr": _join_sanitized(execution.stderr, version_stderr, message),
+            }
+        )
+
+    help_stdout = _sanitize_bootstrap_text(help_result.stdout, step.env)
+    help_stderr = _sanitize_bootstrap_text(help_result.stderr, step.env)
+    if not help_result.ok:
+        return execution.model_copy(
+            update={
+                "status": RemoteBootstrapStepStatus.FAIL,
+                "message": (
+                    "Remote OpenEvo CLI must be executable and report "
+                    f"{expected_version}; found {cli_version}."
+                ),
+                "return_code": help_result.return_code,
+                "stdout": _join_sanitized(execution.stdout, version_stdout, help_stdout),
+                "stderr": _join_sanitized(execution.stderr, version_stderr, help_stderr),
+            }
+        )
+
+    return execution.model_copy(
+        update={
+            "stdout": _join_sanitized(execution.stdout, version_stdout, help_stdout),
+            "stderr": _join_sanitized(execution.stderr, version_stderr, help_stderr),
+        }
+    )
+
+
 def _sanitize_bootstrap_text(value: str, env: Mapping[str, str]) -> str:
     return sanitize_remote_text(value, env)
+
+
+def _join_sanitized(*parts: str) -> str:
+    return "\n".join(part for part in parts if part)
+
+
+def _parse_openevo_version_probe_stdout(stdout: str) -> str:
+    text = stdout.strip()
+    if not text:
+        return ""
+    first_line = text.splitlines()[0].strip()
+    return first_line if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.!+_-]*", first_line) else ""
+
+
+def _parse_openevo_cli_version_probe_stdout(stdout: str) -> str:
+    text = stdout.strip()
+    if not text:
+        return ""
+    match = re.search(r"(?:^|\s)([0-9][A-Za-z0-9.!+_-]*)(?:\s|$)", text)
+    return match.group(1) if match else ""
 
 
 def _preflight_exception_report(exc: Exception) -> PreflightReport:

@@ -189,6 +189,11 @@ npm test -- --run
 npm run build:openevo
 cd ..
 diff -qr web/dist src/openevo/desktop/web
+rm -rf .openevo-remote-wheel src/openevo/wheels
+python -m build --wheel --outdir .openevo-remote-wheel
+mkdir -p src/openevo/wheels
+cp .openevo-remote-wheel/openevo-*.whl src/openevo/wheels/
+rm -rf dist
 python -m build --wheel
 python scripts/ci/check_openevo_release.py --wheel dist/*.whl
 python -m venv .openevo-wheel-smoke
@@ -358,12 +363,15 @@ Desktop also keeps the most recent bootstrap report in the same area. It renders
 failed or warning bootstrap steps. Long commands, paths, proxy URLs, and stderr
 snippets are wrapped in the panel so remote dependency and setup failures remain
 readable in the app.
-Bootstrap includes a user-scoped OpenEvo CLI check: if `openevo` is missing on
-the remote command PATH plus `~/.local/bin`, it runs
-`python3 -m pip install --user --upgrade openevo` with the configured remote
-proxy/PIP environment. It then validates `openevo --help`; if that check fails,
-bootstrap attempts one user-site upgrade and validates again before reporting
-the failure.
+Bootstrap includes a user-scoped exact OpenEvo Core check. Desktop/CLI searches
+only bundled package-relative wheel directories for an `openevo-<version>-*.whl`
+whose wheel metadata matches the local packaged version. If present, it uploads
+only that wheel and bootstrap installs it with user-site `pip --force-reinstall`
+before verifying remote package metadata, `openevo --version`, and
+`openevo --help` with `~/.local/bin` prepended to PATH. If no bundled wheel is
+available, bootstrap passes only when the remote package and CLI already report
+the exact expected version; otherwise it fails clearly and does not install an
+unpinned latest package from PyPI.
 For managed Science runtime profiles, bootstrap also prepares the runtime image
 without requiring the user to provide one. It runs
 `docker pull <managed-image> || docker build ... -t <managed-image> ...`; Docker

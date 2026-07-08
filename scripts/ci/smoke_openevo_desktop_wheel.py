@@ -14,6 +14,7 @@ from typing import Any
 from urllib.parse import urlsplit
 import warnings
 
+from openevo import __version__ as OPENEVO_VERSION
 from openevo.desktop.app import create_desktop_app
 from openevo.remote import RemoteCommandResult
 from openevo.sidecar.api import create_sidecar_app
@@ -89,6 +90,20 @@ class _LifecycleSmokeTransport:
                     "/dev/root 100000000 1 99999999 1% /home\n"
                 ),
             )
+        if "importlib.metadata" in command and "version('openevo')" in command:
+            return RemoteCommandResult(
+                command=command,
+                return_code=0,
+                stdout=f"{OPENEVO_VERSION}\n",
+            )
+        if "openevo --version" in command:
+            return RemoteCommandResult(
+                command=command,
+                return_code=0,
+                stdout=f"openevo {OPENEVO_VERSION}\n",
+            )
+        if "openevo --help" in command:
+            return RemoteCommandResult(command=command, return_code=0, stdout="help")
         if command.startswith('PATH="$HOME/.local/bin:$PATH" openevo run '):
             return RemoteCommandResult(command=command, return_code=0, stdout="ok")
         if "summary.json" in command:

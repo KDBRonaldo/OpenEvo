@@ -58,6 +58,7 @@ include = ["polar*", "slime_bridge*", "polar_evolution*", "openevo*"]
 [tool.setuptools.package-data]
 openevo = [
     "desktop/web/**/*",
+    "wheels/*.whl",
 ]
 polar = [
     "**/README.md",

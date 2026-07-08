@@ -8,6 +8,7 @@ from openevo.remote.bootstrap import (
     RemoteBootstrapStepKind,
     RemoteBootstrapStepStatus,
     build_remote_bootstrap_plan,
+    ensure_remote_openevo_cli_step,
     execute_remote_bootstrap_plan,
 )
 from openevo.remote.executor import (
@@ -65,6 +66,7 @@ __all__ = [
     "RemoteBootstrapStepKind",
     "RemoteBootstrapStepStatus",
     "build_remote_bootstrap_plan",
+    "ensure_remote_openevo_cli_step",
     "execute_remote_bootstrap_plan",
     "RemoteDaemonLaunchSpec",
     "RemoteExecutorTransport",

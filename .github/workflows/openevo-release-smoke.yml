@@ -50,9 +50,17 @@ jobs:
           python -m pip install --upgrade pip pytest -e .
           PYTHONPATH=src:. python -m pytest tests/ci/test_check_openevo_release.py -q
 
-      - name: Build wheel
+      - name: Build remote install wheel
         run: |
           python -m pip install build
+          rm -rf .openevo-remote-wheel src/openevo/wheels
+          python -m build --wheel --outdir .openevo-remote-wheel
+          mkdir -p src/openevo/wheels
+          cp .openevo-remote-wheel/openevo-*.whl src/openevo/wheels/
+
+      - name: Build wheel
+        run: |
+          rm -rf dist
           python -m build --wheel
 
       - name: Validate OpenEvo wheel

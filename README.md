@@ -315,6 +315,11 @@ npm test -- --run
 npm run build:openevo
 cd ..
 diff -qr web/dist src/openevo/desktop/web
+rm -rf .openevo-remote-wheel src/openevo/wheels
+python -m build --wheel --outdir .openevo-remote-wheel
+mkdir -p src/openevo/wheels
+cp .openevo-remote-wheel/openevo-*.whl src/openevo/wheels/
+rm -rf dist
 python -m build --wheel
 python scripts/ci/check_openevo_release.py --wheel dist/*.whl
 python -m venv .openevo-wheel-smoke

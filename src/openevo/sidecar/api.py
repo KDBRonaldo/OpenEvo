@@ -10,15 +10,20 @@ import posixpath
 import re
 import secrets
 import shlex
+import shutil
+import tempfile
 from typing import Any, Literal
 from threading import Lock, Thread
 from urllib.parse import quote, unquote, urlparse
+from zipfile import BadZipFile, ZipFile
+from email.parser import Parser
 
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.encoders import jsonable_encoder
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic import ValidationError
 
+from openevo import __version__ as OPENEVO_VERSION
 from openevo.core.capabilities import (
     CoreCapabilities,
     EvolutionMethodCapability,
@@ -30,6 +35,7 @@ from openevo.remote.lifecycle import (
     RemoteServiceOperationResult,
     RemoteServicesStatus,
 )
+from openevo.remote.preflight import PreflightCheck, PreflightReport, run_preflight
 from openevo.remote.redaction import sanitize_remote_text
 from openevo.science import ScienceProjectConfig
 from openevo.sidecar.config import (
@@ -1312,17 +1318,178 @@ def _evolution_steps(
 
 
 def _run_bootstrap(session: OpenEvoSidecarSession):
+    sidecar_plan = build_sidecar_science_plan(session.project, session.profile)
+    return prepare_and_execute_remote_bootstrap(
+        sidecar_plan,
+        session.transport_factory(session.profile),
+    )
+
+
+def prepare_and_execute_remote_bootstrap(
+    sidecar_plan,
+    transport: RemoteExecutorTransport,
+    *,
+    expected_version: str = OPENEVO_VERSION,
+    run_remote_preflight: bool = True,
+):
     from openevo.remote.bootstrap import (
+        RemoteBootstrapReport,
+        RemoteBootstrapStepExecution,
+        RemoteBootstrapStepKind,
+        RemoteBootstrapStepStatus,
         build_remote_bootstrap_plan,
         execute_remote_bootstrap_plan,
     )
 
-    sidecar_plan = build_sidecar_science_plan(session.project, session.profile)
-    bootstrap_plan = build_remote_bootstrap_plan(sidecar_plan)
-    return execute_remote_bootstrap_plan(
-        bootstrap_plan,
-        session.transport_factory(session.profile),
+    bootstrap_plan = build_remote_bootstrap_plan(
+        sidecar_plan,
+        expected_openevo_version=expected_version,
     )
+    wheel = discover_local_openevo_wheel()
+    preflight_report = None
+    if wheel is not None and run_remote_preflight:
+        preflight_report = _run_bootstrap_preflight(bootstrap_plan, transport)
+        if not preflight_report.ready:
+            return _bootstrap_report_for_preflight_failure(
+                bootstrap_plan,
+                preflight_report,
+            )
+    remote_wheel_path = None
+    if wheel is not None:
+        remote_wheel_dir = posixpath.join(bootstrap_plan.state_root, "wheels")
+        try:
+            with tempfile.TemporaryDirectory(prefix="openevo-wheel-upload-") as staging:
+                staging_path = Path(staging)
+                shutil.copy2(wheel, staging_path / wheel.name)
+                transport.upload_dir(str(staging_path), remote_wheel_dir)
+        except Exception as exc:
+            message = sanitize_remote_text(str(exc), bootstrap_plan.proxy_env)
+            return RemoteBootstrapReport(
+                remote_profile_id=bootstrap_plan.remote_profile_id,
+                project_name=bootstrap_plan.project_name,
+                task_id=bootstrap_plan.task_id,
+                preflight=preflight_report,
+                steps=(
+                    RemoteBootstrapStepExecution(
+                        id="ensure_openevo_cli",
+                        kind=RemoteBootstrapStepKind.CHECK_COMMAND,
+                        status=RemoteBootstrapStepStatus.FAIL,
+                        message="Bundled OpenEvo wheel upload failed.",
+                        command=f"upload {wheel.name} to {remote_wheel_dir}",
+                        required=True,
+                        remediation_kind="upload_exact_openevo_wheel",
+                        stderr=message,
+                    ),
+                ),
+                prepared_paths=_bootstrap_prepared_paths(bootstrap_plan),
+                next_actions=("Resolve failed bootstrap steps and rerun.",),
+            )
+        remote_wheel_path = posixpath.join(remote_wheel_dir, wheel.name)
+        bootstrap_plan = build_remote_bootstrap_plan(
+            sidecar_plan,
+            expected_openevo_version=expected_version,
+            bundled_wheel_remote_path=remote_wheel_path,
+        )
+    report = execute_remote_bootstrap_plan(
+        bootstrap_plan,
+        transport,
+        run_remote_preflight=run_remote_preflight and preflight_report is None,
+    )
+    if preflight_report is not None:
+        return report.model_copy(update={"preflight": preflight_report})
+    return report
+
+
+def _run_bootstrap_preflight(
+    bootstrap_plan,
+    transport: RemoteExecutorTransport,
+) -> PreflightReport:
+    try:
+        return run_preflight(transport, bootstrap_plan.preflight)
+    except Exception as exc:
+        message = sanitize_remote_text(str(exc), bootstrap_plan.proxy_env)
+        return PreflightReport(
+            checks=(
+                PreflightCheck(
+                    name="preflight",
+                    status="fail",
+                    message=f"Remote preflight failed: {message}",
+                    remediation_kind="user_action",
+                    stderr=message,
+                ),
+            )
+        )
+
+
+def _bootstrap_report_for_preflight_failure(
+    bootstrap_plan,
+    preflight: PreflightReport,
+):
+    from openevo.remote.bootstrap import RemoteBootstrapReport
+
+    return RemoteBootstrapReport(
+        remote_profile_id=bootstrap_plan.remote_profile_id,
+        project_name=bootstrap_plan.project_name,
+        task_id=bootstrap_plan.task_id,
+        preflight=preflight,
+        prepared_paths=_bootstrap_prepared_paths(bootstrap_plan),
+        next_actions=("Fix remote preflight failures and rerun bootstrap.",),
+    )
+
+
+def _bootstrap_prepared_paths(bootstrap_plan) -> dict[str, str]:
+    return {
+        "state_root": bootstrap_plan.state_root,
+        "workspace_root": bootstrap_plan.workspace_root,
+        "experiment_snapshot": posixpath.join(
+            bootstrap_plan.state_root,
+            "experiment.json",
+        ),
+        "bootstrap_manifest": posixpath.join(
+            bootstrap_plan.state_root,
+            "bootstrap.json",
+        ),
+    }
+
+
+def discover_local_openevo_wheel() -> Path | None:
+    candidates: list[Path] = []
+    for directory in _openevo_wheel_search_dirs():
+        if directory.is_dir():
+            candidates.extend(sorted(directory.glob(f"openevo-{OPENEVO_VERSION}-*.whl")))
+    for candidate in candidates:
+        if _is_valid_openevo_wheel(candidate, expected_version=OPENEVO_VERSION):
+            return candidate
+    return None
+
+
+def _openevo_wheel_search_dirs() -> tuple[Path, ...]:
+    package_root = Path(__file__).resolve().parents[1]
+    return (
+        package_root / "wheels",
+        package_root / "desktop" / "wheels",
+    )
+
+
+def _is_valid_openevo_wheel(path: Path, *, expected_version: str) -> bool:
+    try:
+        with ZipFile(path) as wheel:
+            metadata_name = _wheel_metadata_path(set(wheel.namelist()))
+            if metadata_name is None:
+                return False
+            metadata = Parser().parsestr(wheel.read(metadata_name).decode("utf-8"))
+    except (BadZipFile, KeyError, UnicodeDecodeError, OSError):
+        return False
+    return metadata.get("Name") == "openevo" and metadata.get("Version") == expected_version
+
+
+def _wheel_metadata_path(names: set[str]) -> str | None:
+    matches = sorted(
+        name
+        for name in names
+        if name.endswith(".dist-info/METADATA") and name.count(".dist-info/") == 1
+    )
+    return matches[0] if matches else None
 
 
 def _run_services(session: OpenEvoSidecarSession):

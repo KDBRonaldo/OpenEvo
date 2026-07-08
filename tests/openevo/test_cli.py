@@ -3,9 +3,12 @@ from __future__ import annotations
 import json
 import tomllib
 from pathlib import Path
+from zipfile import ZipFile
 
+import pytest
 import yaml
 
+from openevo import __version__ as OPENEVO_VERSION
 from openevo import cli as openevo_cli
 from openevo.cli import main
 from openevo.remote import RemoteCommandResult
@@ -14,6 +17,23 @@ from openevo.sidecar import RemoteProfileConfig
 
 def _write_config(path: Path, payload: dict) -> Path:
     path.write_text(yaml.safe_dump(payload), encoding="utf-8")
+    return path
+
+
+def _write_openevo_wheel(path: Path) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with ZipFile(path, "w") as wheel:
+        wheel.writestr(
+            "openevo-0.1.0.dist-info/METADATA",
+            "\n".join(
+                [
+                    "Metadata-Version: 2.4",
+                    "Name: openevo",
+                    "Version: 0.1.0",
+                    "",
+                ]
+            ),
+        )
     return path
 
 
@@ -54,9 +74,14 @@ def _remote_profile_for_cli() -> RemoteProfileConfig:
 
 class _CliRecordingSshTransport:
     profiles = []
+    instances = []
 
     def __init__(self, profile) -> None:
         self.profiles.append(profile)
+        self.uploads: list[tuple[str, str]] = []
+        self.upload_contents: list[list[str]] = []
+        self.commands: list[str] = []
+        self.instances.append(self)
 
     def run(
         self,
@@ -66,6 +91,7 @@ class _CliRecordingSshTransport:
         env=None,
         timeout_seconds=30.0,
     ):
+        self.commands.append(command)
         if command == 'df -Pk "$HOME"':
             return RemoteCommandResult(
                 command=command,
@@ -75,9 +101,17 @@ class _CliRecordingSshTransport:
                     "/dev/root 100000000 1 99999999 1% /home\n"
                 ),
             )
+        if "importlib.metadata" in command and "version('openevo')" in command:
+            return RemoteCommandResult(command=command, return_code=0, stdout="0.1.0\n")
+        if "openevo --version" in command:
+            return RemoteCommandResult(command=command, return_code=0, stdout="openevo 0.1.0\n")
+        if "openevo --help" in command:
+            return RemoteCommandResult(command=command, return_code=0, stdout="help")
         return RemoteCommandResult(command=command, return_code=0, stdout="ok")
 
     def upload_dir(self, local_path, remote_path):
+        self.uploads.append((local_path, remote_path))
+        self.upload_contents.append(sorted(path.name for path in Path(local_path).iterdir()))
         return None
 
 
@@ -96,6 +130,14 @@ def test_cli_dry_run_json_outputs_compiled_plan(
     assert payload["tasks"][0]["rounds"][1]["evolution_jobs"][2]["method"] == (
         "agent_system_history_reflector"
     )
+
+
+def test_cli_version_outputs_package_version(capsys) -> None:
+    with pytest.raises(SystemExit) as exc_info:
+        main(["--version"])
+
+    assert exc_info.value.code == 0
+    assert capsys.readouterr().out.strip() == f"openevo {OPENEVO_VERSION}"
 
 
 def test_cli_dry_run_output_file_matches_reported_plan_path(
@@ -470,6 +512,56 @@ def test_cli_sidecar_bootstrap_transport_ssh_uses_ssh_transport(
     payload = json.loads(capsys.readouterr().out)
     assert payload["ready"] is True
     assert _CliRecordingSshTransport.profiles[0].id == "science-team"
+
+
+def test_cli_sidecar_bootstrap_uploads_exact_core_wheel(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+) -> None:
+    _CliRecordingSshTransport.profiles = []
+    _CliRecordingSshTransport.instances = []
+    wheel = _write_openevo_wheel(tmp_path / "openevo-0.1.0-py3-none-any.whl")
+    monkeypatch.setattr(
+        "openevo.cli.SshRemoteExecutorTransport",
+        _CliRecordingSshTransport,
+    )
+    monkeypatch.setattr("openevo.sidecar.api.discover_local_openevo_wheel", lambda: wheel)
+    science_path = _write_config(tmp_path / "science.yaml", _minimal_science_payload())
+    profile_path = _write_config(
+        tmp_path / "remote.yaml",
+        {
+            "version": 1,
+            "id": "science-team",
+            "host": "gpu.example.edu",
+            "user": "alice",
+        },
+    )
+
+    exit_code = main(
+        [
+            "sidecar",
+            "bootstrap",
+            str(science_path),
+            "--remote-profile",
+            str(profile_path),
+            "--transport",
+            "ssh",
+            "--json",
+        ]
+    )
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    transport = _CliRecordingSshTransport.instances[0]
+    assert len(transport.uploads) == 1
+    uploaded_local, uploaded_remote = transport.uploads[0]
+    assert transport.upload_contents == [[wheel.name]]
+    assert uploaded_remote.endswith("/protein-design/folding-baseline/wheels")
+    ensure_step = next(step for step in payload["steps"] if step["id"] == "ensure_openevo_cli")
+    assert ensure_step["remediation_kind"] == "upload_exact_openevo_wheel"
+    assert wheel.name in ensure_step["command"]
+    assert "pip install --user --upgrade openevo" not in ensure_step["command"]
 
 
 def test_cli_sidecar_serve_invokes_runner(monkeypatch) -> None:
