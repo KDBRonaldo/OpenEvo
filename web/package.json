@@ -7,6 +7,9 @@
     "dev": "vite",
     "build": "vite build",
     "build:openevo": "vite build --mode openevo-desktop",
+    "tauri:dev": "tauri dev",
+    "tauri:build": "tauri build",
+    "build:desktop": "npm run build && npm run tauri:build",
     "preview": "vite preview",
     "test": "vitest"
   },
@@ -21,6 +24,7 @@
   },
   "devDependencies": {
     "@tailwindcss/vite": "^4.0.0",
+    "@tauri-apps/cli": "^2.0.0",
     "@types/node": "^22.7.0",
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",

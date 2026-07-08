@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 from io import BytesIO
 from pathlib import Path
 from zipfile import ZipFile
@@ -114,18 +115,55 @@ def test_requires_exact_openevo_wheel_artifact(tmp_path: Path) -> None:
     checker = _load_module()
     other_wheel = _write_wheel(tmp_path / "polar-0.1.0-py3-none-any.whl")
     openevo_wheel = _write_wheel(tmp_path / "openevo-0.1.0-py3-none-any.whl")
+    dmg = tmp_path / "OpenEvo Desktop_0.1.0_aarch64.dmg"
+    dmg.write_bytes(b"not a real dmg; release list validation only checks presence")
 
     assert checker.validate_release_artifacts(
         [other_wheel],
         expected_version="0.1.0",
     ) == [
         "Release artifacts must include an exact OpenEvo wheel for remote install: "
-        "openevo-0.1.0-*.whl."
+        "openevo-0.1.0-*.whl.",
+        "Release artifacts must include an OpenEvo Desktop macOS .dmg.",
     ]
     assert checker.validate_release_artifacts(
         [other_wheel, openevo_wheel],
         expected_version="0.1.0",
+    ) == ["Release artifacts must include an OpenEvo Desktop macOS .dmg."]
+    assert checker.validate_release_artifacts(
+        [other_wheel, openevo_wheel, dmg],
+        expected_version="0.1.0",
     ) == []
+
+
+def test_cli_wheel_only_requires_exact_openevo_wheel_artifact_name(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    checker = _load_module()
+    wheel = _write_wheel(tmp_path / "polar-0.1.0-py3-none-any.whl")
+
+    result = checker.main(["--wheel", str(wheel)])
+
+    assert result == 1
+    assert (
+        "Release artifacts must include an exact OpenEvo wheel for remote install: "
+        "openevo-0.1.0-*.whl."
+    ) in capsys.readouterr().err
+
+
+def test_release_artifact_list_rejects_nonexistent_paths(tmp_path: Path) -> None:
+    checker = _load_module()
+    openevo_wheel = _write_wheel(tmp_path / "openevo-0.1.0-py3-none-any.whl")
+    missing_dmg = tmp_path / "release-artifacts" / "openevo-desktop-dmg" / "*.dmg"
+
+    assert checker.validate_release_artifacts(
+        [openevo_wheel, missing_dmg],
+        expected_version="0.1.0",
+    ) == [
+        f"Release artifact does not exist: {missing_dmg}",
+        "Release artifacts must include an OpenEvo Desktop macOS .dmg.",
+    ]
 
 
 def test_rejects_non_openevo_project_metadata(tmp_path: Path) -> None:
@@ -305,6 +343,62 @@ def test_release_artifact_workflow_builds_validated_wheel_artifact() -> None:
     )
     assert text.index("scripts/ci/check_openevo_release.py --wheel dist/*.whl") < (
         text.index("actions/upload-artifact@v4")
+    )
+
+
+def test_release_artifact_workflow_builds_desktop_dmg_artifact() -> None:
+    workflow = Path(".github/workflows/openevo-release-artifact.yml")
+
+    text = workflow.read_text(encoding="utf-8")
+
+    assert "desktop-dmg-artifact:" in text
+    assert "runs-on: macos-latest" in text
+    assert 'node-version: "20"' in text
+    assert "dtolnay/rust-toolchain@stable" in text
+    assert "working-directory: web" in text
+    assert "working-directory: web/src-tauri" in text
+    assert "cargo metadata --locked --format-version 1" in text
+    assert "npm ci" in text
+    assert "npm run build:desktop" in text
+    assert "name: openevo-desktop-dmg" in text
+    assert "web/src-tauri/target/release/bundle/dmg/*.dmg" in text
+
+    assert text.index("runs-on: macos-latest") < text.index('node-version: "20"')
+    assert text.index('node-version: "20"') < text.index("dtolnay/rust-toolchain@stable")
+    assert text.index("cargo metadata --locked --format-version 1") < text.index(
+        "npm run build:desktop"
+    )
+    assert text.index("npm ci") < text.index("npm run build:desktop")
+    assert text.index("npm run build:desktop") < text.index("openevo-desktop-dmg")
+
+
+def test_web_package_defines_tauri_desktop_scripts_and_cli_dependency() -> None:
+    package = json.loads(Path("web/package.json").read_text(encoding="utf-8"))
+
+    assert package["scripts"]["tauri:dev"] == "tauri dev"
+    assert package["scripts"]["tauri:build"] == "tauri build"
+    assert package["scripts"]["build:desktop"] == "npm run build && npm run tauri:build"
+    assert "@tauri-apps/cli" in package["devDependencies"]
+
+
+def test_tauri_macos_config_builds_dmg_release_shell() -> None:
+    config = json.loads(Path("web/src-tauri/tauri.conf.json").read_text(encoding="utf-8"))
+    cargo = Path("web/src-tauri/Cargo.toml").read_text(encoding="utf-8")
+    main = Path("web/src-tauri/src/main.rs").read_text(encoding="utf-8")
+
+    assert config["productName"] == "OpenEvo Desktop"
+    assert config["version"] == "0.1.0"
+    assert config["identifier"] == "org.openevo.desktop"
+    assert config["build"]["beforeBuildCommand"] == "npm run build"
+    assert config["build"]["frontendDist"] == "../dist"
+    assert config["bundle"]["active"] is True
+    assert config["bundle"]["targets"] == ["dmg"]
+    assert config["bundle"]["macOS"]["minimumSystemVersion"] == "12.0"
+    assert 'name = "openevo-desktop"' in cargo
+    assert 'tauri = ' in cargo
+    assert (
+        'fn main() { tauri::Builder::default().run(tauri::generate_context!()).expect("error while running OpenEvo Desktop"); }'
+        in main
     )
 
 

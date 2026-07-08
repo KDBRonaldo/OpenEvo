@@ -46,6 +46,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         required=True,
         help="One or more built wheel files to validate.",
     )
+    parser.add_argument(
+        "--artifact",
+        type=Path,
+        nargs="+",
+        default=None,
+        help=(
+            "Complete release artifact list to validate. When omitted, only wheel "
+            "contents are checked."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -340,9 +350,40 @@ def _desktop_package_metadata_paths() -> tuple[Path, ...]:
     return tuple(path for path in candidates if path.exists())
 
 
-def validate_release_artifacts(wheel_paths: list[Path], *, expected_version: str) -> list[str]:
+def validate_release_artifacts(
+    artifact_paths: list[Path],
+    *,
+    expected_version: str,
+) -> list[str]:
+    errors: list[str] = []
+    existing_artifact_paths = []
+    for path in artifact_paths:
+        if not path.exists():
+            errors.append(f"Release artifact does not exist: {path}")
+            continue
+        existing_artifact_paths.append(path)
+
+    errors.extend(
+        validate_release_wheel_artifacts(
+            existing_artifact_paths,
+            expected_version=expected_version,
+        )
+    )
+    if not any(path.suffix == ".dmg" for path in existing_artifact_paths):
+        errors.append("Release artifacts must include an OpenEvo Desktop macOS .dmg.")
+    return errors
+
+
+def validate_release_wheel_artifacts(
+    wheel_paths: list[Path],
+    *,
+    expected_version: str,
+) -> list[str]:
     expected_prefix = f"openevo-{expected_version}-"
-    if any(path.name.startswith(expected_prefix) and path.suffix == ".whl" for path in wheel_paths):
+    if any(
+        path.name.startswith(expected_prefix) and path.suffix == ".whl"
+        for path in wheel_paths
+    ):
         return []
     return [
         "Release artifacts must include an exact OpenEvo wheel for remote install: "
@@ -359,9 +400,14 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     all_errors: list[str] = []
     all_errors.extend(validate_local_versions(expected_version))
-    all_errors.extend(
-        validate_release_artifacts(args.wheel, expected_version=expected_version)
-    )
+    if args.artifact is not None:
+        all_errors.extend(
+            validate_release_artifacts(args.artifact, expected_version=expected_version)
+        )
+    else:
+        all_errors.extend(
+            validate_release_wheel_artifacts(args.wheel, expected_version=expected_version)
+        )
     for wheel_path in args.wheel:
         errors = validate_wheel(wheel_path, expected_version=expected_version)
         if errors:
@@ -372,7 +418,13 @@ def main(argv: list[str] | None = None) -> int:
         print("\n".join(all_errors), file=sys.stderr)
         return 1
 
-    print(f"OpenEvo release wheel checks passed for {len(args.wheel)} wheel(s).")
+    if args.artifact is not None:
+        print(
+            "OpenEvo release checks passed for "
+            f"{len(args.wheel)} wheel(s) and {len(args.artifact)} artifact(s)."
+        )
+    else:
+        print(f"OpenEvo release wheel checks passed for {len(args.wheel)} wheel(s).")
     return 0
 
 

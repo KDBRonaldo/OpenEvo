@@ -76,3 +76,59 @@ jobs:
           name: openevo-wheel
           path: dist/*.whl
           if-no-files-found: error
+
+  desktop-dmg-artifact:
+    name: build macOS desktop dmg artifact
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Check Tauri Rust lockfile
+        working-directory: web/src-tauri
+        run: |
+          cargo metadata --locked --format-version 1
+
+      - name: Build OpenEvo Desktop dmg
+        working-directory: web
+        run: |
+          npm ci
+          npm run build:desktop
+
+      - name: Upload OpenEvo Desktop dmg artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: openevo-desktop-dmg
+          path: web/src-tauri/target/release/bundle/dmg/*.dmg
+          if-no-files-found: error
+
+  release-artifact-list:
+    name: validate release artifact list
+    runs-on: ubuntu-latest
+    needs:
+      - wheel-artifact
+      - desktop-dmg-artifact
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+
+      - name: Validate OpenEvo release artifact list
+        run: |
+          python scripts/ci/check_openevo_release.py \
+            --wheel release-artifacts/openevo-wheel/*.whl \
+            --artifact release-artifacts/openevo-wheel/*.whl release-artifacts/openevo-desktop-dmg/*.dmg
