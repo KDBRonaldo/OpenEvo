@@ -58,11 +58,23 @@ Science environment profiles compile to runtime images:
 `custom_image` is an escape hatch for developers and advanced experiments. It is
 not the default user path.
 
+For managed profiles, users do not upload or choose a runtime image in Desktop.
+Remote bootstrap first attempts to pull the managed image. If that image is not
+available to the remote Docker daemon, bootstrap writes an OpenEvo-managed
+Dockerfile under the run state directory and builds the same image tag on the
+remote server. The generated image contains Python, Node, common build tools,
+and the pinned Codex CLI required by the Codex harness. Custom images remain
+pull-only because OpenEvo cannot infer their system dependencies.
+
 ## Execution Modes
 
 `codex_subscription_transcript` uses Codex subscription authentication and sets
 `agent.settings.capture_mode="transcript"`. This produces transcript trajectory
 data for text evolution and explicitly has no token-level metrics.
+Remote preflight checks that the remote user has `codex` and
+`~/.codex/auth.json`. During each gateway runtime session, that host auth file
+is staged into the container-visible `CODEX_HOME` under `/polar/session`, so the
+user does not need to log in again inside the managed runtime image.
 
 `codex_managed_local_inference` uses proxy authentication and requires
 `execution.hf_model`. The compiler sets the agent model to that Hugging Face
@@ -344,11 +356,22 @@ the remote command PATH plus `~/.local/bin`, it runs
 proxy/PIP environment. It then validates `openevo --help`; if that check fails,
 bootstrap attempts one user-site upgrade and validates again before reporting
 the failure.
+For managed Science runtime profiles, bootstrap also prepares the runtime image
+without requiring the user to provide one. It runs
+`docker pull <managed-image> || docker build ... -t <managed-image> ...`; Docker
+build receives the same proxy environment and standard proxy build args. If the
+remote Docker daemon itself needs registry mirrors or daemon-level proxy
+configuration, bootstrap reports the failure instead of editing host-wide Docker
+settings.
 For managed local inference configs, the compiled experiment contains
 `OPENEVO_MANAGED_HF_MODEL`, so the remote bootstrap plan also attempts a
 Hugging Face snapshot download using the configured `HF_ENDPOINT`, `HF_HOME`,
 and proxy/PIP environment. vLLM startup and health supervision are handled by
 the separate service lifecycle.
+
+Docker Compose is probed but not required for the current Desktop Science path.
+Missing Compose is rendered as a warning because OpenEvo services are started
+through the service lifecycle endpoint rather than a Compose stack.
 
 `POST /openevo-api/desktop/services` starts the remote runtime services after
 workspace and bootstrap readiness. It is available only for config-backed

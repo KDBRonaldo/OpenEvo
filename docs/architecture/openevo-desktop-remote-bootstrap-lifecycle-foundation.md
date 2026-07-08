@@ -8,8 +8,10 @@ transport layers. The goal is to let a local Desktop app prepare a remote GPU
 server for a Science run, return a structured readiness report, and expose data
 models that the UI can render while later service supervisors are built.
 
-This layer still does not start a real OpenEvo backend, Polar gateway, rollout
-server, evolution worker, vLLM server, or Docker Compose stack.
+Bootstrap itself prepares run state and dependencies. The Desktop service
+lifecycle endpoint starts the OpenEvo backend, gateway, rollout server,
+evolution worker, and optional vLLM server after bootstrap readiness. No current
+Desktop path starts a Docker Compose stack.
 
 ## Input Boundary
 
@@ -73,11 +75,23 @@ The current builder emits idempotent remote steps:
 | `ensure_openevo_cli` | Ensures the remote user can run `openevo`; installs or upgrades the `openevo` Python package with `python3 -m pip install --user --upgrade openevo` when the command is absent or `openevo --help` fails. |
 | `check_codex_cli` | Subscription mode only; verifies `codex --version`. |
 | `check_codex_subscription` | Subscription mode only; verifies `~/.codex/auth.json`. |
-| `docker_pull_runtime` | Pulls the runtime image declared by the compiled experiment. |
+| `docker_pull_runtime` | For custom images, pulls the image declared by the compiled experiment. For managed OpenEvo Science images, writes a managed runtime Dockerfile under `<state_root>/runtime-images/` and runs `docker pull <image> || docker build ... -t <image> ...`. |
 | `hf_snapshot_download` | Managed local inference only; installs `huggingface_hub` for the remote user and downloads the HF model snapshot. |
 
 `bootstrap.json` records the state root, workspace root, experiment snapshot
 path, runtime image, and managed HF model name when one is present.
+
+Managed runtime fallback images are built from public Python and Node bases and
+install the pinned Codex CLI used by the existing Codex harness examples. The
+fallback is only for OpenEvo-managed image names. Developer-supplied
+`custom_image` profiles remain pull-only, because OpenEvo cannot infer their
+Dockerfile or system dependencies.
+
+Subscription-mode Codex auth is checked on the remote host during preflight and
+bootstrap. At gateway runtime initialization, the host `~/.codex/auth.json` is
+copied into the per-session bind mount under the runtime `CODEX_HOME`, defaulting
+to `/polar/session/.codex`. Users should not need to log in inside the managed
+runtime container.
 
 ## Execution Semantics
 
@@ -88,6 +102,10 @@ test fakes.
 By default it runs the common remote preflight before any bootstrap step. If
 preflight fails or raises a transport exception, no bootstrap steps are run and
 the report tells the user to fix preflight failures.
+
+Docker Compose is a non-blocking preflight probe in the current Desktop Science
+path. Missing Compose is reported as a warning because services are started by
+direct commands, not a Compose stack.
 
 When bootstrap steps run:
 
@@ -123,9 +141,10 @@ preserving enough command failure text for diagnosis.
 
 This is intentionally process-scoped. Bootstrap does not configure the Docker
 daemon, systemd units, registry mirrors, host-wide pip config, or shell profile
-files. In particular, `docker pull` receives proxy environment variables in the
-client process, but a remote Docker daemon may still require administrator-level
-proxy or registry mirror configuration outside OpenEvo.
+files. In particular, `docker pull` and the managed runtime `docker build`
+receive proxy environment variables in the client process and proxy build args,
+but a remote Docker daemon may still require administrator-level proxy or
+registry mirror configuration outside OpenEvo.
 
 ## Lifecycle Models
 
@@ -145,6 +164,10 @@ present.
 Later slices can connect these models to a real remote supervisor that starts
 OpenEvo services, checks ports and health endpoints, and streams lifecycle
 events to Desktop.
+
+The current Desktop service lifecycle endpoint already starts command-based
+OpenEvo services after bootstrap readiness. The lifecycle models remain the
+JSON contract Desktop renders for those service reports.
 
 ## CLI
 
@@ -180,11 +203,11 @@ This slice intentionally does not implement:
 - Docker daemon proxy or registry mirror repair;
 - full Python dependency repair beyond the user-site `openevo` and
   `huggingface_hub` installs attempted by bootstrap;
-- vLLM startup, health management, or dynamic adapter loading;
+- Docker Compose stack startup;
+- production vLLM tuning, restart policy, or dynamic adapter loading;
 - physical LoRA merge or request-level adapter lifecycle changes;
 - credential vault or keychain integration;
-- Desktop UI rendering;
-- remote OpenEvo backend, gateway, rollout server, or evolution worker startup.
+- Desktop UI rendering beyond the structured readiness/status reports.
 
 ## Verification
 

@@ -126,6 +126,21 @@ def test_docker_missing_is_openevo_install_failure() -> None:
     assert "Docker is not available" in check.message
 
 
+def test_missing_docker_compose_is_non_blocking_warning() -> None:
+    probe = _ready_probe()
+    probe.results["docker compose version"] = _fail(
+        "docker compose version", "docker: 'compose' is not a docker command"
+    )
+
+    report = run_preflight(probe)
+    check = report.by_name("docker_compose")
+
+    assert report.ready is True
+    assert check.status == "warn"
+    assert check.remediation_kind == "openevo_install"
+    assert "Docker Compose is not available" in check.message
+
+
 def test_ssh_failure_short_circuits_remaining_checks() -> None:
     probe = FakeProbe({"true": _fail("true", "ssh failed")})
 

@@ -99,8 +99,9 @@ openevo sidecar bootstrap science.yaml --remote-profile remote.yaml --transport 
 
 That command prepares the remote run directory, writes `experiment.json` and
 `bootstrap.json`, checks or installs the remote user-site `openevo` CLI, checks
-subscription-mode Codex readiness, pulls the runtime image, and prefetches the
-HF model for managed local inference.
+subscription-mode Codex readiness, pulls custom runtime images, pull-or-builds
+managed OpenEvo Science runtime images, and prefetches the HF model for managed
+local inference.
 
 ## Limitations
 

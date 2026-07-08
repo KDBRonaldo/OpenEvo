@@ -167,7 +167,7 @@ def _check_docker_compose(probe: RemoteProbe) -> PreflightCheck:
     result = probe.run("docker compose version")
     if result.ok:
         return _pass("docker_compose", "Docker Compose is available.", result)
-    return _fail(
+    return _warn(
         "docker_compose",
         "Docker Compose is not available.",
         result,
@@ -288,6 +288,24 @@ def _fail(
     return PreflightCheck(
         name=name,
         status="fail",
+        message=message,
+        command=result.command,
+        remediation_kind=remediation_kind,
+        stdout=result.stdout,
+        stderr=result.stderr,
+    )
+
+
+def _warn(
+    name: str,
+    message: str,
+    result: RemoteCommandResult,
+    *,
+    remediation_kind: Literal["openevo_retry", "openevo_install", "user_action"],
+) -> PreflightCheck:
+    return PreflightCheck(
+        name=name,
+        status="warn",
         message=message,
         command=result.command,
         remediation_kind=remediation_kind,

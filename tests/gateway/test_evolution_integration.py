@@ -135,6 +135,64 @@ def test_build_evolution_session_event_preserves_explicit_falsey_metadata():
     assert event["rollout_step"] == 0
 
 
+def test_codex_subscription_auth_is_staged_into_runtime_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    source = home / ".codex" / "auth.json"
+    source.parent.mkdir(parents=True)
+    source.write_text('{"subscription": true}\n', encoding="utf-8")
+    monkeypatch.setenv("HOME", str(home))
+    session_dir = tmp_path / "session"
+    session_dir.mkdir()
+    request = SessionDispatchRequest(
+        session_id="session_1",
+        task_id="task_1",
+        instruction="Do work.",
+        remaining_timeout_seconds=60,
+        agent=AgentSpec(
+            harness="codex",
+            model_name="gpt-5.5",
+            settings={"auth_mode": "subscription", "capture_mode": "transcript"},
+        ),
+        metadata={},
+    )
+
+    manager = GatewayNodeManager.__new__(GatewayNodeManager)
+    manager._stage_codex_subscription_auth(request, session_dir)
+
+    staged = session_dir / ".codex" / "auth.json"
+    assert staged.read_text(encoding="utf-8") == '{"subscription": true}\n'
+
+
+def test_codex_subscription_auth_staging_reports_missing_host_login(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    session_dir = tmp_path / "session"
+    session_dir.mkdir()
+    request = SessionDispatchRequest(
+        session_id="session_1",
+        task_id="task_1",
+        instruction="Do work.",
+        remaining_timeout_seconds=60,
+        agent=AgentSpec(
+            harness="codex",
+            model_name="gpt-5.5",
+            settings={"auth_mode": "subscription", "capture_mode": "transcript"},
+        ),
+        metadata={},
+    )
+
+    manager = GatewayNodeManager.__new__(GatewayNodeManager)
+    with pytest.raises(RuntimeError, match="Codex subscription auth was not found"):
+        manager._stage_codex_subscription_auth(request, session_dir)
+
+
 def _session_result(
     *,
     session_id: str = "ses_1",
