@@ -2,6 +2,14 @@ export type RemoteServiceState = "ready" | "running" | "planned" | "blocked";
 
 export type EvolutionStepState = "complete" | "running" | "planned" | "blocked";
 
+export type OpenEvoExecutionMode =
+  | "codex_subscription_transcript"
+  | "self-deployed";
+
+export type OpenEvoExecutionModePayload =
+  | OpenEvoExecutionMode
+  | "codex_managed_local_inference";
+
 export interface OpenEvoDesktopShellModel {
   remote: {
     id: string;
@@ -31,7 +39,7 @@ export interface OpenEvoDesktopShellModel {
     objective: string;
   };
   execution: {
-    mode: "codex_subscription_transcript" | "codex_managed_local_inference";
+    mode: OpenEvoExecutionMode;
     model: string;
     tokenMetricsAvailable: boolean;
   };
@@ -74,6 +82,15 @@ export interface OpenEvoTimelineSummary {
   completedEvolutionSteps: number;
   totalEvolutionSteps: number;
   readinessNotes: string[];
+}
+
+export function normalizeOpenEvoExecutionMode(
+  mode: OpenEvoExecutionModePayload,
+): OpenEvoExecutionMode {
+  if (mode === "codex_managed_local_inference") {
+    return "self-deployed";
+  }
+  return mode;
 }
 
 export function getOpenEvoDesktopShellModel(): OpenEvoDesktopShellModel {

@@ -1,9 +1,12 @@
 import { api } from "./client";
 import type {
   EvolutionStepState,
+  OpenEvoExecutionMode,
+  OpenEvoExecutionModePayload,
   OpenEvoDesktopShellModel,
   RemoteServiceState,
 } from "../routes/openevoDesktopModel";
+import { normalizeOpenEvoExecutionMode } from "../routes/openevoDesktopModel";
 
 export interface OpenEvoDesktopShellStatusPayload {
   remote: {
@@ -34,7 +37,7 @@ export interface OpenEvoDesktopShellStatusPayload {
     objective: string;
   };
   execution: {
-    mode: OpenEvoDesktopShellModel["execution"]["mode"];
+    mode: OpenEvoExecutionModePayload;
     model: string;
     token_metrics_available: boolean;
   };
@@ -112,9 +115,7 @@ export interface OpenEvoProjectConfigDraft {
   pip_index_url?: string | null;
   huggingface_endpoint?: string | null;
   hf_home?: string | null;
-  execution_mode:
-    | "codex_subscription_transcript"
-    | "codex_managed_local_inference";
+  execution_mode: OpenEvoExecutionMode;
   codex_model?: string | null;
   hf_model?: string | null;
   text_memory: boolean;
@@ -567,7 +568,7 @@ export function toOpenEvoDesktopShellModel(
       objective: payload.project.objective,
     },
     execution: {
-      mode: payload.execution.mode,
+      mode: normalizeOpenEvoExecutionMode(payload.execution.mode),
       model: payload.execution.model,
       tokenMetricsAvailable: payload.execution.token_metrics_available,
     },

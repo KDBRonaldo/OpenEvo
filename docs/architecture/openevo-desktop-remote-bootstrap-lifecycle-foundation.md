@@ -28,13 +28,16 @@ ScienceProjectConfig + RemoteProfileConfig
   -> RemoteBootstrapReport
 ```
 
-This keeps subscription mode and managed local inference aligned with the
+This keeps subscription mode and self-deployed inference aligned with the
 existing Science compiler:
 
 - `codex_subscription_transcript` remains Codex subscription auth with explicit
   transcript capture.
-- `codex_managed_local_inference` remains Codex harness plus proxy auth against
-  a remote model-serving path.
+- `self-deployed` remains Codex harness plus proxy auth against a remote
+  model-serving path.
+
+The legacy value `codex_managed_local_inference` is accepted only as an input
+alias at config boundaries and normalizes to `self-deployed`.
 
 No bootstrap path directly calls model APIs.
 

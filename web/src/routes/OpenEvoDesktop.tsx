@@ -258,10 +258,7 @@ export function OpenEvoDesktop() {
         executionMode === "codex_subscription_transcript"
           ? current.codex_model || "gpt-5.1-codex-mini"
           : null,
-      hf_model:
-        executionMode === "codex_managed_local_inference"
-          ? current.hf_model || ""
-          : null,
+      hf_model: executionMode === "self-deployed" ? current.hf_model || "" : null,
     }));
   };
 
@@ -764,7 +761,7 @@ export function OpenEvoDesktop() {
             value={configDraft.execution_mode}
             options={[
               "codex_subscription_transcript",
-              "codex_managed_local_inference",
+              "self-deployed",
             ]}
             onChange={(value) =>
               handleExecutionModeChange(
@@ -772,7 +769,7 @@ export function OpenEvoDesktop() {
               )
             }
           />
-          {configDraft.execution_mode === "codex_managed_local_inference" ? (
+          {configDraft.execution_mode === "self-deployed" ? (
             <TextInput
               label="HF model"
               value={configDraft.hf_model ?? ""}
@@ -1622,9 +1619,7 @@ function draftFromModel(
         ? model.execution.model || "gpt-5.1-codex-mini"
         : null,
     hf_model:
-      model.execution.mode === "codex_managed_local_inference"
-        ? model.execution.model
-        : null,
+      model.execution.mode === "self-deployed" ? model.execution.model : null,
     text_memory: model.evolution.some((step) =>
       ["text-memory", "memory"].includes(step.id),
     ),

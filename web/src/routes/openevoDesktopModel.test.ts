@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   getOpenEvoDesktopShellModel,
   getOpenEvoTimelineSummary,
+  normalizeOpenEvoExecutionMode,
 } from "./openevoDesktopModel";
 
 describe("OpenEvo Desktop shell model", () => {
@@ -32,5 +33,12 @@ describe("OpenEvo Desktop shell model", () => {
     expect(summary.readinessNotes).toEqual([
       "Codex subscription login available",
     ]);
+  });
+
+  it("normalizes legacy managed local inference mode to self-deployed", () => {
+    expect(normalizeOpenEvoExecutionMode("codex_managed_local_inference")).toBe(
+      "self-deployed",
+    );
+    expect(normalizeOpenEvoExecutionMode("self-deployed")).toBe("self-deployed");
   });
 });

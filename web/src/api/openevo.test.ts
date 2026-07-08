@@ -114,6 +114,40 @@ describe("OpenEvo sidecar client", () => {
     expect(model.developerMode.benchmarkControlsVisible).toBe(false);
   });
 
+  it("maps public self-deployed shell status to the route model", () => {
+    const payload = sidecarShellPayload("token-123");
+
+    const model = toOpenEvoDesktopShellModel({
+      ...payload,
+      execution: {
+        mode: "self-deployed",
+        model: "Qwen/Qwen3-Coder-30B-A3B-Instruct",
+        token_metrics_available: false,
+      },
+    });
+
+    expect(model.execution).toEqual({
+      mode: "self-deployed",
+      model: "Qwen/Qwen3-Coder-30B-A3B-Instruct",
+      tokenMetricsAvailable: false,
+    });
+  });
+
+  it("normalizes legacy managed local inference shell status", () => {
+    const payload = sidecarShellPayload("token-123");
+
+    const model = toOpenEvoDesktopShellModel({
+      ...payload,
+      execution: {
+        mode: "codex_managed_local_inference",
+        model: "Qwen/Qwen3-Coder-30B-A3B-Instruct",
+        token_metrics_available: false,
+      },
+    });
+
+    expect(model.execution.mode).toBe("self-deployed");
+  });
+
   it("maps bootstrap response status to the route model", () => {
     const response = toOpenEvoBootstrapResponse({
       bootstrap: {
@@ -473,6 +507,57 @@ describe("OpenEvo sidecar client", () => {
       "config-token",
     );
     expect(calls[1].body.remote_host).toBe("gpu.example.edu");
+  });
+
+  it("sends self-deployed as the public project config mode", async () => {
+    const calls: Array<{ path: string; headers: Headers; body: any }> = [];
+    const shellPayload = sidecarShellPayload("config-token");
+    vi.spyOn(globalThis, "fetch").mockImplementation(
+      async (input, init) => {
+        const path = String(input);
+        calls.push({
+          path,
+          headers: new Headers(init?.headers),
+          body: init?.body ? JSON.parse(String(init.body)) : undefined,
+        });
+        if (path === "/openevo-api/desktop/shell") {
+          return jsonResponse(shellPayload);
+        }
+        if (path === "/openevo-api/desktop/project-config") {
+          return jsonResponse({
+            config: {
+              science_config_path:
+                "/home/alice/.openevo/desktop/projects/configured/science.yaml",
+              remote_profile_path:
+                "/home/alice/.openevo/desktop/profiles/science-team.yaml",
+            },
+            status: {
+              ...shellPayload,
+              execution: {
+                mode: "self-deployed",
+                model: "Qwen/Qwen3-Coder-30B-A3B-Instruct",
+                token_metrics_available: false,
+              },
+            },
+          });
+        }
+        return new Response("not found", { status: 404 });
+      },
+    );
+
+    await fetchOpenEvoDesktopShellModel();
+    await saveOpenEvoProjectConfig({
+      ...projectConfigDraft(),
+      execution_mode: "self-deployed",
+      codex_model: null,
+      hf_model: "Qwen/Qwen3-Coder-30B-A3B-Instruct",
+    });
+
+    expect(calls[1].body).toMatchObject({
+      execution_mode: "self-deployed",
+      codex_model: null,
+      hf_model: "Qwen/Qwen3-Coder-30B-A3B-Instruct",
+    });
   });
 
   it("fetches saved project config summaries", async () => {
