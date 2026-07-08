@@ -25,9 +25,24 @@ from openevo.remote.preflight import (
     run_preflight,
 )
 from openevo.remote.redaction import sanitize_remote_text
+from openevo.science.compiler import MANAGED_RUNTIME_IMAGES
 
 if TYPE_CHECKING:
     from openevo.sidecar import SidecarSciencePlan
+
+
+_MANAGED_RUNTIME_IMAGE_SET = frozenset(MANAGED_RUNTIME_IMAGES.values())
+_MANAGED_RUNTIME_BASE_IMAGE = "node:22-bookworm-slim"
+_MANAGED_RUNTIME_PYTHON_IMAGE = "python:3.12-slim-bookworm"
+_MANAGED_RUNTIME_CODEX_PACKAGE = "@openai/codex@0.121.0"
+_DOCKER_PROXY_BUILD_ARGS = (
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "no_proxy",
+)
 
 
 class _StrictFrozenModel(BaseModel):
@@ -329,17 +344,24 @@ def build_remote_bootstrap_plan(plan: SidecarSciencePlan) -> RemoteBootstrapPlan
         )
 
     if runtime_image is not None:
+        is_managed_runtime = _is_managed_runtime_image(runtime_image)
         steps.append(
             RemoteBootstrapStep(
                 id="docker_pull_runtime",
                 kind=RemoteBootstrapStepKind.DOCKER_PULL,
-                command=f"docker pull {shlex.quote(runtime_image)}",
+                command=_runtime_image_command(
+                    runtime_image,
+                    state_root=state_root,
+                ),
                 env=proxy_env,
                 timeout_seconds=900.0,
                 network=True,
                 required=True,
                 remediation_kind="openevo_retry",
-                manifest={"image": runtime_image},
+                manifest={
+                    "image": runtime_image,
+                    "managed_runtime": is_managed_runtime,
+                },
             )
         )
 
@@ -450,6 +472,81 @@ def _runtime_image(experiment_snapshot: Mapping[str, Any]) -> str | None:
     return image if isinstance(image, str) and image.strip() else None
 
 
+def _is_managed_runtime_image(image: str) -> bool:
+    return image in _MANAGED_RUNTIME_IMAGE_SET
+
+
+def _runtime_image_command(runtime_image: str, *, state_root: str) -> str:
+    if not _is_managed_runtime_image(runtime_image):
+        return f"docker pull {shlex.quote(runtime_image)}"
+
+    context_dir = posixpath.join(
+        state_root,
+        "runtime-images",
+        _slugify(runtime_image),
+    )
+    dockerfile_path = posixpath.join(context_dir, "Dockerfile")
+    build_args = " ".join(
+        f"--build-arg {arg_name}" for arg_name in _DOCKER_PROXY_BUILD_ARGS
+    )
+    image_ref = shlex.quote(runtime_image)
+    return "\n".join(
+        [
+            _write_text_command(
+                dockerfile_path,
+                _managed_runtime_dockerfile(),
+            ),
+            (
+                f"docker pull {image_ref} || docker build {build_args} "
+                f"--pull -t {image_ref} {shlex.quote(context_dir)}"
+            ),
+        ]
+    )
+
+
+def _managed_runtime_dockerfile() -> str:
+    return f"""\
+FROM {_MANAGED_RUNTIME_BASE_IMAGE} AS node
+
+FROM {_MANAGED_RUNTIME_PYTHON_IMAGE}
+
+COPY --from=node /usr/local/ /usr/local/
+
+ENV DEBIAN_FRONTEND=noninteractive \\
+    HOME=/home/polar \\
+    NPM_CONFIG_PREFIX=/home/polar/.local \\
+    NPM_CONFIG_UPDATE_NOTIFIER=false \\
+    PATH=/home/polar/.local/bin:${{PATH}}
+
+LABEL io.openevo.managed-runtime="true"
+
+RUN apt-get update \\
+    && apt-get install -y --no-install-recommends \\
+        bash \\
+        build-essential \\
+        ca-certificates \\
+        curl \\
+        git \\
+        python-is-python3 \\
+        rsync \\
+        sudo \\
+        tmux \\
+    && rm -rf /var/lib/apt/lists/*
+
+RUN useradd -m -s /bin/bash polar \\
+    && echo 'polar ALL=(ALL) NOPASSWD:ALL' >> /etc/sudoers \\
+    && mkdir -p /polar/session/workspace /home/polar/.local \\
+    && chown -R polar:polar /polar/session /home/polar
+
+RUN echo 'export PATH=/home/polar/.local/bin:$PATH' > /etc/profile.d/polar-path.sh
+
+USER polar
+RUN npm install -g {_MANAGED_RUNTIME_CODEX_PACKAGE}
+
+WORKDIR /polar/session/workspace
+"""
+
+
 def _bootstrap_manifest(
     plan: SidecarSciencePlan,
     *,
@@ -496,6 +593,19 @@ def _write_json_command(remote_path: str, payload: Mapping[str, Any]) -> str:
             "python3 - <<'PY'",
             "from pathlib import Path",
             f"Path({remote_path!r}).write_text({body!r}, encoding='utf-8')",
+            "PY",
+        ]
+    )
+
+
+def _write_text_command(remote_path: str, contents: str) -> str:
+    return "\n".join(
+        [
+            "python3 - <<'PY'",
+            "from pathlib import Path",
+            f"path = Path({remote_path!r})",
+            "path.parent.mkdir(parents=True, exist_ok=True)",
+            f"path.write_text({contents!r}, encoding='utf-8')",
             "PY",
         ]
     )

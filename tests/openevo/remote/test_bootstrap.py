@@ -329,9 +329,10 @@ def test_build_remote_bootstrap_plan_derives_subscription_steps() -> None:
         "/bootstrap.json"
     )
     assert '"experiment_snapshot":' in steps_by_id["write_bootstrap_manifest"].command
-    assert steps_by_id["docker_pull_runtime"].command == (
-        "docker pull openevo/science-runtime:0.1.0"
+    assert "docker pull openevo/science-runtime:0.1.0 || docker build" in (
+        steps_by_id["docker_pull_runtime"].command
     )
+    assert steps_by_id["docker_pull_runtime"].manifest["managed_runtime"] is True
     assert steps_by_id["docker_pull_runtime"].env["HTTPS_PROXY"] == (
         "http://127.0.0.1:7890"
     )
@@ -340,6 +341,55 @@ def test_build_remote_bootstrap_plan_derives_subscription_steps() -> None:
         "test -f ~/.codex/auth.json"
     )
     assert "hf_snapshot_download" not in steps_by_id
+
+
+def test_managed_runtime_bootstrap_builds_image_when_pull_fails() -> None:
+    sidecar_plan = build_sidecar_science_plan(_project(), _profile())
+
+    plan = build_remote_bootstrap_plan(sidecar_plan)
+    docker_step = {step.id: step for step in plan.steps}["docker_pull_runtime"]
+
+    assert "docker pull openevo/science-runtime:0.1.0 || docker build" in (
+        docker_step.command
+    )
+    assert "node:22-bookworm-slim" in docker_step.command
+    assert "@openai/codex@0.121.0" in docker_step.command
+    assert "--build-arg HTTP_PROXY" in docker_step.command
+    assert docker_step.manifest["managed_runtime"] is True
+
+
+def test_python_research_runtime_bootstrap_builds_image_when_pull_fails() -> None:
+    sidecar_plan = build_sidecar_science_plan(
+        _project(environment={"profile": "python_research"}),
+        _profile(),
+    )
+
+    plan = build_remote_bootstrap_plan(sidecar_plan)
+    docker_step = {step.id: step for step in plan.steps}["docker_pull_runtime"]
+
+    assert "docker pull openevo/python-research-runtime:0.1.0 || docker build" in (
+        docker_step.command
+    )
+    assert docker_step.manifest["managed_runtime"] is True
+
+
+def test_custom_runtime_bootstrap_remains_pull_only() -> None:
+    sidecar_plan = build_sidecar_science_plan(
+        _project(
+            environment={
+                "profile": "custom_image",
+                "custom_image": "ghcr.io/example/science:latest",
+            }
+        ),
+        _profile(),
+    )
+
+    plan = build_remote_bootstrap_plan(sidecar_plan)
+    docker_step = {step.id: step for step in plan.steps}["docker_pull_runtime"]
+
+    assert docker_step.command == "docker pull ghcr.io/example/science:latest"
+    assert "docker build" not in docker_step.command
+    assert docker_step.manifest["managed_runtime"] is False
 
 
 def test_build_remote_bootstrap_plan_adds_managed_inference_hf_prefetch() -> None:
@@ -359,6 +409,10 @@ def test_build_remote_bootstrap_plan_adds_managed_inference_hf_prefetch() -> Non
     assert plan.state_root == "/srv/openevo/runs/protein-design/folding-baseline"
     assert "check_codex_cli" not in steps_by_id
     assert "check_codex_subscription" not in steps_by_id
+    assert "docker pull openevo/science-runtime:0.1.0 || docker build" in (
+        steps_by_id["docker_pull_runtime"].command
+    )
+    assert steps_by_id["docker_pull_runtime"].manifest["managed_runtime"] is True
     assert steps_by_id["hf_snapshot_download"].kind == (
         RemoteBootstrapStepKind.HF_SNAPSHOT_DOWNLOAD
     )
