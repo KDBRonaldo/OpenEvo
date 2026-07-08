@@ -217,6 +217,9 @@ Stop sends SIGTERM and waits for the process to disappear before deleting the
 pid file. If the process is still alive after the grace period, stop returns a
 failed `RemoteServiceOperationResult`, leaves the pid file intact, and restart
 does not start a replacement process.
+Pid file values must be positive integers before inspect or stop sends any
+signal. Non-positive pid values are treated as invalid pid files and reported
+without calling `os.kill`.
 
 Inspection semantics are intentionally pragmatic:
 

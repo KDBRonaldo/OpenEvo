@@ -194,6 +194,23 @@ def test_inspect_remote_services_reports_unknown_for_malformed_inspect_output() 
     assert services["gateway"].message == "gateway inspect returned invalid status."
 
 
+def test_inspect_remote_services_reports_unknown_for_invalid_pid_without_kill() -> None:
+    plan = build_remote_services_plan(_bootstrap_plan())
+    transport = _LifecycleTransport(pid_states={"gateway": {"pid": 0, "alive": True}})
+
+    report = inspect_remote_services(transport, plan)
+
+    services = {service.service_id: service for service in report.services}
+    assert services["gateway"].state == "unknown"
+    assert services["gateway"].message == "invalid pid file for gateway: 0"
+    gateway_inspect = next(
+        command
+        for command, _env in transport.commands
+        if "/gateway.pid" in command and "json.dumps" in command
+    )
+    _assert_before(gateway_inspect, "if pid <= 0:", "os.kill(pid, 0)")
+
+
 def test_read_remote_service_logs_tails_and_redacts_sensitive_headers() -> None:
     secret_proxy = "http://proxy-user:proxy-secret@127.0.0.1:7890"
     plan = build_remote_services_plan(
@@ -271,6 +288,21 @@ def test_stop_remote_service_fails_when_process_survives_grace_period() -> None:
     assert "did not stop after SIGTERM" in stop_command
 
 
+def test_stop_remote_service_fails_for_invalid_pid_without_signaling() -> None:
+    plan = build_remote_services_plan(_bootstrap_plan())
+    transport = _LifecycleTransport(pid_states={"gateway": {"pid": 0, "alive": True}})
+
+    result = stop_remote_service(transport, plan, "gateway")
+
+    assert result.state == "failed"
+    assert result.message == "invalid pid file for gateway: 0"
+    assert result.stderr == "invalid pid file for gateway: 0"
+    assert transport.stopped_services == []
+    assert "gateway" in transport.pid_states
+    stop_command = transport.commands[-1][0]
+    _assert_before(stop_command, "if pid <= 0:", "os.kill(pid, signal.SIGTERM)")
+
+
 def test_restart_remote_service_stops_starts_and_checks_selected_service_only() -> None:
     plan = build_remote_services_plan(_bootstrap_plan())
     transport = _LifecycleTransport(pid_states={"gateway": {"pid": 123, "alive": True}})
@@ -301,6 +333,19 @@ def test_restart_remote_service_does_not_start_when_stop_fails() -> None:
 
     assert result.state == "failed"
     assert result.message == "gateway did not stop after SIGTERM."
+    assert not any(
+        "polar serve_gateway" in command for command, _env in transport.commands
+    )
+
+
+def test_restart_remote_service_does_not_start_when_pid_file_is_invalid() -> None:
+    plan = build_remote_services_plan(_bootstrap_plan())
+    transport = _LifecycleTransport(pid_states={"gateway": {"pid": -1, "alive": True}})
+
+    result = restart_remote_service(transport, plan, "gateway")
+
+    assert result.state == "failed"
+    assert result.message == "invalid pid file for gateway: -1"
     assert not any(
         "polar serve_gateway" in command for command, _env in transport.commands
     )
@@ -434,6 +479,21 @@ class _LifecycleTransport(_RecordingTransport):
                     stdout="not-json",
                 )
             state = self.pid_states.get(service_id or "", {})
+            pid = state.get("pid")
+            if isinstance(pid, int) and not isinstance(pid, bool) and pid <= 0:
+                return RemoteCommandResult(
+                    command=command,
+                    return_code=0,
+                    stdout=__import__("json").dumps(
+                        {
+                            "pid_exists": True,
+                            "pid": pid,
+                            "alive": False,
+                            "invalid_pid": True,
+                            "message": f"invalid pid file for {service_id}: {pid}",
+                        }
+                    ),
+                )
             return RemoteCommandResult(
                 command=command,
                 return_code=0,
@@ -455,6 +515,13 @@ class _LifecycleTransport(_RecordingTransport):
                     command=command,
                     return_code=0,
                     stdout=f"{service_id} is already stopped.",
+                )
+            pid = self.pid_states[service_id].get("pid")
+            if isinstance(pid, int) and not isinstance(pid, bool) and pid <= 0:
+                return RemoteCommandResult(
+                    command=command,
+                    return_code=1,
+                    stderr=f"invalid pid file for {service_id}: {pid}",
                 )
             if service_id in self.stop_still_running:
                 return RemoteCommandResult(
@@ -478,6 +545,12 @@ class _LifecycleTransport(_RecordingTransport):
                 stderr=self.health_failures[service_id],
             )
         return RemoteCommandResult(command=command, return_code=0, stdout="ok")
+
+
+def _assert_before(command: str, earlier: str, later: str) -> None:
+    assert earlier in command
+    assert later in command
+    assert command.index(earlier) < command.index(later)
 
 
 def _service_id_from_command(command: str) -> str | None:

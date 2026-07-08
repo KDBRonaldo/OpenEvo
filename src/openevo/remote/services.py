@@ -642,7 +642,19 @@ def _inspect_remote_service(
             log_path=_manifest_text(step, "log_path"),
             health_check=step.health_command,
         )
-    pid = payload.get("pid") if isinstance(payload, dict) else None
+    raw_pid = payload.get("pid")
+    if raw_pid is not None and (
+        not isinstance(raw_pid, int) or isinstance(raw_pid, bool) or raw_pid <= 0
+    ):
+        return RemoteManagedServiceStatus(
+            service_id=service_id,
+            state=RemoteServiceState.UNKNOWN,
+            message=f"invalid pid file for {service_id}: {raw_pid}",
+            required=step.required,
+            log_path=_manifest_text(step, "log_path"),
+            health_check=step.health_command,
+        )
+    pid = raw_pid
     pid = pid if isinstance(pid, int) and not isinstance(pid, bool) and pid > 0 else None
     alive = bool(payload.get("alive"))
     pid_exists = bool(payload.get("pid_exists"))
@@ -898,6 +910,11 @@ def _inspect_pid_command(pid_path: str) -> str:
             "        pid = int(handle.read().strip())",
             "    payload['pid_exists'] = True",
             "    payload['pid'] = pid",
+            "    if pid <= 0:",
+            "        payload['invalid_pid'] = True",
+            "        payload['message'] = f'invalid pid file: {pid}'",
+            "        print(json.dumps(payload, sort_keys=True))",
+            "        raise SystemExit(0)",
             "    try:",
             "        os.kill(pid, 0)",
             "        payload['alive'] = True",
@@ -931,6 +948,9 @@ def _stop_service_command(pid_path: str, service_id: str) -> str:
             "    raise SystemExit(0)",
             "except Exception as exc:",
             "    print(f'failed to read pid file: {exc}', file=sys.stderr)",
+            "    raise SystemExit(1)",
+            "if pid <= 0:",
+            "    print(f'invalid pid file for {service_id}: {pid}', file=sys.stderr)",
             "    raise SystemExit(1)",
             "try:",
             "    os.kill(pid, signal.SIGTERM)",
