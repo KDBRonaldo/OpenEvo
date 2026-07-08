@@ -1658,6 +1658,25 @@ package also needs a controllable direct-solver subagent runtime budget and a
 larger `EVOLAB_TB_EXEC_TIMEOUT_CAP_SECONDS`, or the method needs to avoid
 network apt setup entirely.
 
+A treatment-only GPU 7 rerun at
+`/tmp/tb21-task-local-parametric-trainfasttext-milestone-longtimeout-20260708/eval-internalbudget-treatment-only-gpu7-20260708`
+used the same adapter, `Qwen/Qwen3.5-9B`,
+`EVOLAB_TB_EXEC_TIMEOUT_CAP_SECONDS=1800`, and a local task-package patch that
+reads `EVOLAB_TB_MAX_SUBAGENT_RUNTIME_SECONDS=2400`. It returned reward `0.0`
+(`0/1`) after a 25m57s Harbor run, with `rewritten_key_count=64`. This
+confirmed the internal subagent runtime budget was no longer the first
+blocker: the EvoLab round ran for 1537.1 seconds rather than stopping at 900.
+However, the agent still requested `timeout_seconds=900` on
+`apt-get install -y g++`, so the command timed out after 900.1 seconds even
+though the cap was 1800. `EVOLAB_TB_EXEC_TIMEOUT_CAP_SECONDS` is therefore only
+an upper bound, not a way to raise explicit model-requested timeouts. The run
+then continued through several short recovery/test/report calls but finally
+failed on another malformed `_raw_arguments` `tb_exec` call. The next
+parametric-memory method requirement for `train-fasttext` is to train or prompt
+long setup commands to request a higher timeout, add a task-package supported
+minimum/default timeout override, or avoid network apt setup; raising only the
+cap is not sufficient.
+
 Evaluate baseline local Qwen and adapter local Qwen against the same subset:
 
 ```sh
