@@ -1322,3 +1322,12 @@ def test_web_package_defines_openevo_desktop_build_mode() -> None:
     assert env_file.read_text(encoding="utf-8").strip() == (
         "VITE_OPENEVO_DESKTOP_ONLY=true"
     )
+
+
+def test_web_package_uses_audited_vite_toolchain_versions() -> None:
+    package = json.loads(Path("web/package.json").read_text(encoding="utf-8"))
+
+    dev_dependencies = package["devDependencies"]
+
+    assert dev_dependencies["vite"].startswith("^8.")
+    assert dev_dependencies["vitest"].startswith("^4.")

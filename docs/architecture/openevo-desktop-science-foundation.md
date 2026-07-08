@@ -172,15 +172,17 @@ cd web && npm run build:openevo
 rsync -a --delete web/dist/ src/openevo/desktop/web/
 ```
 
-The release smoke check rebuilds the OpenEvo-only Desktop assets, verifies that
-the committed package assets match `web/dist`, builds the Python wheel, inspects
-the wheel metadata, console scripts, packaged asset references, and forbidden
-shared-dashboard payloads, then installs the wheel into a clean environment and
-runs the installed OpenEvo CLI and Desktop app smoke checks:
+The release smoke check runs on Node 22, audits the Desktop frontend dependency
+graph for high or critical advisories, rebuilds the OpenEvo-only Desktop assets,
+verifies that the committed package assets match `web/dist`, builds the Python
+wheel, inspects the wheel metadata, console scripts, packaged asset references,
+and forbidden shared-dashboard payloads, then installs the wheel into a clean
+environment and runs the installed OpenEvo CLI and Desktop app smoke checks:
 
 ```bash
 cd web
 npm ci
+npm audit --audit-level=high
 npm test -- --run
 npm run build:openevo
 cd ..
