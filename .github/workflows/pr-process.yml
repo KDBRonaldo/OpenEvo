@@ -6,7 +6,7 @@ on:
 
 jobs:
   process-checks:
-    name: issue and docs warnings
+    name: issue and docs gate
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -32,4 +32,5 @@ jobs:
         run: |
           python3 scripts/ci/check_pr_process.py \
             --pr-body-file pr_body.md \
-            --changed-files-file changed_files.txt
+            --changed-files-file changed_files.txt \
+            --strict
