@@ -139,6 +139,8 @@ def build_local_harbor_command(
     verifier_env: dict[str, str],
     n_attempts: int = 1,
     n_concurrent: int = 1,
+    timeout_multiplier: float | None = None,
+    agent_timeout_multiplier: float | None = None,
     environment_import_path: str | None = DEFAULT_TERMINAL_BENCH_ENVIRONMENT_IMPORT_PATH,
     extra_docker_compose: list[Path] | None = None,
     preserve_environment: bool = True,
@@ -167,6 +169,12 @@ def build_local_harbor_command(
         "--ak",
         "mode=evolab",
     ]
+    timeout_value = _optional_positive_float(timeout_multiplier)
+    agent_timeout_value = _optional_positive_float(agent_timeout_multiplier)
+    if timeout_value is not None:
+        command.extend(["--timeout-multiplier", str(timeout_value)])
+    if agent_timeout_value is not None:
+        command.extend(["--agent-timeout-multiplier", str(agent_timeout_value)])
     if environment_import_path:
         command.extend(["--environment-import-path", environment_import_path])
     if preserve_environment:
@@ -707,6 +715,8 @@ def run_local_parametric_memory_eval_dry_run(
     server_url: str,
     n_attempts: int,
     manage_server: bool,
+    timeout_multiplier: float | None = None,
+    agent_timeout_multiplier: float | None = None,
     max_output_tokens: int = DEFAULT_LOCAL_PARAMETRIC_MAX_OUTPUT_TOKENS,
     context_window_tokens: int = DEFAULT_LOCAL_PARAMETRIC_CONTEXT_WINDOW_TOKENS,
     context_reserve_tokens: int = DEFAULT_LOCAL_PARAMETRIC_CONTEXT_RESERVE_TOKENS,
@@ -731,6 +741,8 @@ def run_local_parametric_memory_eval_dry_run(
         context_reserve_tokens=context_reserve_tokens,
     )
     tool_result_prompt_cap = _optional_positive_int(tool_result_prompt_max_chars)
+    timeout_value = _optional_positive_float(timeout_multiplier)
+    agent_timeout_value = _optional_positive_float(agent_timeout_multiplier)
     solver_temperature_value = float(solver_temperature)
     effective_verifier_env = dict(verifier_env or {})
     effective_agent_env = _validated_agent_env(dict(agent_env or {}))
@@ -761,6 +773,8 @@ def run_local_parametric_memory_eval_dry_run(
         "solver_temperature": solver_temperature_value,
         "vllm_generation_config": vllm_generation_config,
         "tool_result_prompt_max_chars": tool_result_prompt_cap,
+        "timeout_multiplier": timeout_value,
+        "agent_timeout_multiplier": agent_timeout_value,
         "manage_server": manage_server,
         "adapter_key_rewrite": key_rewrite,
         "artifact_path_guard": guard_mode,
@@ -800,6 +814,8 @@ def run_local_parametric_memory_eval(
     adapter_artifact_id: str | None = None,
     server_url: str = "http://127.0.0.1:8000/v1",
     n_attempts: int = 1,
+    timeout_multiplier: float | None = None,
+    agent_timeout_multiplier: float | None = None,
     max_output_tokens: int = DEFAULT_LOCAL_PARAMETRIC_MAX_OUTPUT_TOKENS,
     context_window_tokens: int = DEFAULT_LOCAL_PARAMETRIC_CONTEXT_WINDOW_TOKENS,
     context_reserve_tokens: int = DEFAULT_LOCAL_PARAMETRIC_CONTEXT_RESERVE_TOKENS,
@@ -838,6 +854,8 @@ def run_local_parametric_memory_eval(
         context_reserve_tokens=context_reserve_tokens,
     )
     tool_result_prompt_cap = _optional_positive_int(tool_result_prompt_max_chars)
+    timeout_value = _optional_positive_float(timeout_multiplier)
+    agent_timeout_value = _optional_positive_float(agent_timeout_multiplier)
     solver_temperature_value = float(solver_temperature)
     effective_verifier_env = dict(verifier_env or {})
     effective_agent_env = _validated_agent_env(dict(agent_env or {}))
@@ -863,6 +881,8 @@ def run_local_parametric_memory_eval(
             base_model=model,
             server_url=server_url,
             n_attempts=attempt_count,
+            timeout_multiplier=timeout_value,
+            agent_timeout_multiplier=agent_timeout_value,
             max_output_tokens=output_token_cap,
             context_window_tokens=context_window,
             context_reserve_tokens=context_reserve,
@@ -901,6 +921,8 @@ def run_local_parametric_memory_eval(
         "solver_temperature": solver_temperature_value,
         "vllm_generation_config": vllm_generation_config,
         "tool_result_prompt_max_chars": tool_result_prompt_cap,
+        "timeout_multiplier": timeout_value,
+        "agent_timeout_multiplier": agent_timeout_value,
         "manage_server": manage_server,
         "adapter_key_rewrite": key_rewrite,
         "artifact_path_guard": guard_mode,
@@ -941,6 +963,15 @@ def _optional_positive_int(value: int | None) -> int | None:
     return max(1, int(value))
 
 
+def _optional_positive_float(value: float | None) -> float | None:
+    if value is None:
+        return None
+    number = float(value)
+    if number <= 0:
+        raise ValueError("timeout multipliers must be positive")
+    return number
+
+
 def _local_parametric_context_budget(
     *,
     max_output_tokens: int,
@@ -975,6 +1006,8 @@ def _run_local_parametric_condition(
     base_model: str,
     server_url: str,
     n_attempts: int,
+    timeout_multiplier: float | None,
+    agent_timeout_multiplier: float | None,
     max_output_tokens: int,
     context_window_tokens: int,
     context_reserve_tokens: int,
@@ -1026,6 +1059,8 @@ def _run_local_parametric_condition(
                 terminal_bench_package_root=terminal_bench_package_root,
                 server_url=server_url,
                 n_attempts=n_attempts,
+                timeout_multiplier=timeout_multiplier,
+                agent_timeout_multiplier=agent_timeout_multiplier,
                 max_output_tokens=max_output_tokens,
                 context_window_tokens=context_window_tokens,
                 context_reserve_tokens=context_reserve_tokens,
@@ -1115,6 +1150,8 @@ def _run_local_parametric_task(
     terminal_bench_package_root: Path,
     server_url: str,
     n_attempts: int,
+    timeout_multiplier: float | None,
+    agent_timeout_multiplier: float | None,
     max_output_tokens: int,
     context_window_tokens: int,
     context_reserve_tokens: int,
@@ -1135,6 +1172,8 @@ def _run_local_parametric_task(
         model=condition.model,
         verifier_env=verifier_env,
         n_attempts=n_attempts,
+        timeout_multiplier=timeout_multiplier,
+        agent_timeout_multiplier=agent_timeout_multiplier,
         extra_docker_compose=_terminal_bench_extra_docker_compose(
             terminal_bench_package_root
         ),

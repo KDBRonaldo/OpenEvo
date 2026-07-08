@@ -738,6 +738,20 @@ def build_parser() -> argparse.ArgumentParser:
     tb_local_parametric.add_argument("--gpu", action="append", default=[])
     tb_local_parametric.add_argument("--n-attempts", type=int, default=1)
     tb_local_parametric.add_argument(
+        "--timeout-multiplier",
+        type=float,
+        help="Optional Harbor task timeout multiplier for local parametric eval jobs.",
+    )
+    tb_local_parametric.add_argument(
+        "--agent-timeout-multiplier",
+        type=float,
+        help=(
+            "Optional Harbor agent execution timeout multiplier for local "
+            "parametric eval jobs. Harbor treats this as overriding "
+            "--timeout-multiplier for the agent phase."
+        ),
+    )
+    tb_local_parametric.add_argument(
         "--max-output-tokens",
         type=int,
         default=DEFAULT_LOCAL_PARAMETRIC_MAX_OUTPUT_TOKENS,
@@ -995,6 +1009,8 @@ def main(argv: list[str] | None = None) -> int:
                 adapter_id=args.adapter_id,
                 server_url=server_url,
                 n_attempts=args.n_attempts,
+                timeout_multiplier=args.timeout_multiplier,
+                agent_timeout_multiplier=args.agent_timeout_multiplier,
                 max_output_tokens=args.max_output_tokens,
                 context_window_tokens=args.context_window_tokens,
                 context_reserve_tokens=args.context_reserve_tokens,
@@ -1022,6 +1038,8 @@ def main(argv: list[str] | None = None) -> int:
             adapter_artifact_id=args.adapter_artifact_id,
             server_url=server_url,
             n_attempts=args.n_attempts,
+            timeout_multiplier=args.timeout_multiplier,
+            agent_timeout_multiplier=args.agent_timeout_multiplier,
             max_output_tokens=args.max_output_tokens,
             context_window_tokens=args.context_window_tokens,
             context_reserve_tokens=args.context_reserve_tokens,

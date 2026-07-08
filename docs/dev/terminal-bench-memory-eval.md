@@ -1658,6 +1658,8 @@ uv run polar-evolution terminal-bench-local-parametric-memory-eval \
   --server-port 8000 \
   --manage-server \
   --n-attempts 5 \
+  --timeout-multiplier 2.0 \
+  --agent-timeout-multiplier 3.5 \
   --max-output-tokens 4096 \
   --context-window-tokens 16384 \
   --context-reserve-tokens 1536 \
@@ -1674,7 +1676,8 @@ The summary reports `baseline`, `parametric_memory`, `delta`, and the
 `requested_max_output_tokens`, effective `max_output_tokens`,
 `context_window_tokens`, `context_reserve_tokens`, and
 `tool_result_prompt_max_chars` caps used for both conditions, plus
-`solver_temperature`, `vllm_generation_config`, and redacted `agent_env`
+`solver_temperature`, `vllm_generation_config`, optional Harbor
+`timeout_multiplier` and `agent_timeout_multiplier`, and redacted `agent_env`
 package knobs when supplied. The default
 requested output-token cap is `4096`, but the effective cap is clamped to the
 default context reserve `1536`; increase `--context-reserve-tokens` only when
@@ -1692,7 +1695,11 @@ must honor `EVOLAB_TB_LLM_TEMPERATURE` for `--solver-temperature` to affect
 OpenAI-compatible chat-completion requests. `--vllm-generation-config vllm` is
 the managed-server default so model-local generation configs do not silently
 turn a controlled adapter eval into sampled decoding. Many Terminal
-Bench verifiers run `uvx -p ...`, which can download managed Python even when
+Bench tasks such as `train-fasttext` can spend most of the Harbor agent budget
+inside slow setup commands such as `apt-get install`; use
+`--agent-timeout-multiplier` when the adapter is expected to run multiple
+setup/training commands before verification. Many Terminal Bench verifiers run
+`uvx -p ...`, which can download managed Python even when
 wheel dependencies are local. When a local Python-build mirror is available,
 pass `--verifier-python-install-mirror` with the uv-compatible
 `.../python-build-standalone/releases/download` base; if the local mirror root

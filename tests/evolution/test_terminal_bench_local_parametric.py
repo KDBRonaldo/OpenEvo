@@ -45,6 +45,22 @@ def test_build_local_harbor_command_uses_evolab_mode_and_attempts() -> None:
     assert "UV_NO_INDEX=1" in command
 
 
+def test_build_local_harbor_command_includes_timeout_multipliers() -> None:
+    command = build_local_harbor_command(
+        job_name="train-fasttext-parametric",
+        task_root=Path("/root/datasets/terminal-bench-2-1/tasks"),
+        task_id="train-fasttext",
+        jobs_dir=Path("/tmp/tb21-local/parametric/harbor_jobs"),
+        model="tb-parametric-memory",
+        verifier_env={},
+        timeout_multiplier=2.0,
+        agent_timeout_multiplier=3.5,
+    )
+
+    assert command[command.index("--timeout-multiplier") + 1] == "2.0"
+    assert command[command.index("--agent-timeout-multiplier") + 1] == "3.5"
+
+
 def test_build_evolab_harbor_env_sets_openai_chat_endpoint(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -275,6 +291,8 @@ def test_local_parametric_dry_run_reports_matrix_and_disabled_artifacts(
         adapter_id="tb-parametric-memory",
         server_url="http://127.0.0.1:8000/v1",
         n_attempts=5,
+        timeout_multiplier=2.0,
+        agent_timeout_multiplier=3.5,
         tool_result_prompt_max_chars=2048,
         agent_env={"EVOLAB_TB_REQUIRE_SUCCESSFUL_COLLECT": "1"},
         manage_server=True,
@@ -298,6 +316,8 @@ def test_local_parametric_dry_run_reports_matrix_and_disabled_artifacts(
     assert payload["solver_temperature"] == 0.0
     assert payload["vllm_generation_config"] == "vllm"
     assert payload["tool_result_prompt_max_chars"] == 2048
+    assert payload["timeout_multiplier"] == 2.0
+    assert payload["agent_timeout_multiplier"] == 3.5
     assert payload["agent_env"] == {"EVOLAB_TB_REQUIRE_SUCCESSFUL_COLLECT": "1"}
     assert payload["artifact_path_guard"] == "off"
     assert payload["required_artifact_paths"] == []
@@ -385,6 +405,8 @@ def test_run_local_parametric_memory_eval_compares_baseline_and_adapter(
         n_attempts=2,
         max_output_tokens=1536,
         context_reserve_tokens=1536,
+        timeout_multiplier=2.0,
+        agent_timeout_multiplier=3.5,
         tool_result_prompt_max_chars=2048,
         verifier_env={},
         agent_env={"EVOLAB_TB_REQUIRE_SUCCESSFUL_COLLECT": "1"},
@@ -418,6 +440,11 @@ def test_run_local_parametric_memory_eval_compares_baseline_and_adapter(
     assert all(env["EVOLAB_TB_TOOL_RESULT_PROMPT_MAX_CHARS"] == "2048" for env in envs)
     assert all(env["EVOLAB_TB_REQUIRE_SUCCESSFUL_COLLECT"] == "1" for env in envs)
     assert all(env["EVOLAB_TB_ARTIFACT_PATH_GUARD"] == "repair" for env in envs)
+    assert all(command[command.index("--timeout-multiplier") + 1] == "2.0" for command in commands)
+    assert all(
+        command[command.index("--agent-timeout-multiplier") + 1] == "3.5"
+        for command in commands
+    )
     assert all(
         json.loads(env["EVOLAB_TB_REQUIRED_ARTIFACT_PATHS"]) == ["/app/out.txt"]
         for env in envs
@@ -1035,6 +1062,10 @@ def test_terminal_bench_local_parametric_cli_dry_run_writes_output(
             "http://127.0.0.1:8000/v1",
             "--n-attempts",
             "5",
+            "--timeout-multiplier",
+            "2.0",
+            "--agent-timeout-multiplier",
+            "3.5",
             "--max-output-tokens",
             "1536",
             "--tool-result-prompt-max-chars",
@@ -1061,6 +1092,8 @@ def test_terminal_bench_local_parametric_cli_dry_run_writes_output(
     ]
     assert payload["max_output_tokens"] == 1536
     assert payload["tool_result_prompt_max_chars"] == 2048
+    assert payload["timeout_multiplier"] == 2.0
+    assert payload["agent_timeout_multiplier"] == 3.5
     assert payload["artifact_path_guard"] == "audit"
     assert payload["required_artifact_paths"] == ["/app/out.txt"]
 
@@ -2051,6 +2084,10 @@ def test_terminal_bench_local_parametric_cli_live_invokes_runner(
             "2",
             "--server-port",
             "8011",
+            "--timeout-multiplier",
+            "2.0",
+            "--agent-timeout-multiplier",
+            "3.5",
             "--auth-mode",
             "proxy",
             "--verifier-env",
@@ -2072,6 +2109,8 @@ def test_terminal_bench_local_parametric_cli_live_invokes_runner(
     assert captured["adapter_artifact_id"] == "art-parametric"
     assert captured["gpus"] == ["1", "2"]
     assert captured["port"] == 8011
+    assert captured["timeout_multiplier"] == 2.0
+    assert captured["agent_timeout_multiplier"] == 3.5
     assert captured["server_url"] == "http://127.0.0.1:8011/v1"
     assert captured["auth_mode"] == "proxy"
     assert captured["verifier_env"] == {"UV_NO_INDEX": "1"}
