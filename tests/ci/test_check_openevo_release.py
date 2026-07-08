@@ -209,6 +209,39 @@ def test_release_artifact_workflow_builds_validated_wheel_artifact() -> None:
     )
 
 
+def test_pypi_publish_workflow_uses_trusted_publishing() -> None:
+    workflow = Path(".github/workflows/openevo-publish-pypi.yml")
+
+    text = workflow.read_text(encoding="utf-8")
+
+    assert "release:" in text
+    assert "types: [published]" in text
+    assert "id-token: write" in text
+    assert "contents: read" in text
+    assert "environment:" in text
+    assert "name: pypi" in text
+    assert 'node-version: "22"' in text
+    assert "npm audit --audit-level=high" in text
+    assert "npm test -- --run" in text
+    assert "npm run build:openevo" in text
+    assert "diff -qr web/dist src/openevo/desktop/web" in text
+    assert "python -m build --wheel" in text
+    assert "scripts/ci/check_openevo_release.py --wheel dist/*.whl" in text
+    assert "twine check --strict dist/*.whl" in text
+    assert ".openevo-wheel-smoke/bin/openevo desktop open --help" in text
+    assert (
+        ".openevo-wheel-smoke/bin/python "
+        "scripts/ci/smoke_openevo_desktop_wheel.py"
+    ) in text
+    assert "pypa/gh-action-pypi-publish@release/v1" in text
+    assert "password:" not in text.casefold()
+    assert "api-token" not in text.casefold()
+
+    assert text.index("twine check --strict dist/*.whl") < text.index(
+        "pypa/gh-action-pypi-publish@release/v1"
+    )
+
+
 def test_desktop_science_release_doc_matches_remote_lifecycle_state() -> None:
     doc = Path("docs/architecture/openevo-desktop-science-foundation.md")
 
@@ -239,6 +272,10 @@ def test_readme_release_checklist_matches_frontend_audit_gate() -> None:
         ".openevo-wheel-smoke/bin/python "
         "scripts/ci/smoke_openevo_desktop_wheel.py"
     ) in text
+    assert "PyPI trusted publishing" in text
+    assert "pypa/gh-action-pypi-publish@release/v1" in text
+    assert "GitHub release" in text
+    assert "does not publish to PyPI yet" not in text
 
 
 def _write_wheel(
