@@ -76,16 +76,18 @@ Remote preflight checks that the remote user has `codex` and
 is staged into the container-visible `CODEX_HOME` under `/polar/session`, so the
 user does not need to log in again inside the managed runtime image.
 
-`codex_managed_local_inference` uses proxy authentication and requires
-`execution.hf_model`. The compiler sets the agent model to that Hugging Face
+`self-deployed` uses proxy authentication and requires `execution.hf_model`.
+The legacy config value `codex_managed_local_inference` remains accepted as an
+input alias at Desktop and Science model boundaries, but configs normalize and
+emit `self-deployed`. The compiler sets the agent model to that Hugging Face
 model and injects `OPENEVO_MANAGED_HF_MODEL` into the runtime environment. The
 remote Desktop service lifecycle starts vLLM, the gateway, and the proxy path
 before a run can launch.
 
 Science Projects do not support `evolution.parametric_memory` in this foundation
-slice, including managed local inference projects. Parametric memory requires a
-separate adapter source or trainer contract that is not part of the Science
-Project schema yet.
+slice, including self-deployed projects. Parametric memory requires a separate
+adapter source or trainer contract that is not part of the Science Project
+schema yet.
 
 ## Runtime Prepare
 
@@ -264,10 +266,10 @@ sidecar was created with a writable config root and transport factory. The
 request payload is a typed Desktop draft with project name, task id, objective,
 task source, SSH host/user/port/auth references, workspace root, proxy/mirror
 settings, execution mode, mode-specific model field, and text evolution
-toggles. Subscription transcript drafts carry `codex_model`; managed local
-inference drafts carry Hugging Face `hf_model` and omit `codex_model`. The
-sidecar validates that draft by constructing the existing
-`ScienceProjectConfig` and `RemoteProfileConfig` models, then writes:
+toggles. Subscription transcript drafts carry `codex_model`; self-deployed
+drafts carry Hugging Face `hf_model` and omit `codex_model`. The sidecar
+validates that draft by constructing the existing `ScienceProjectConfig` and
+`RemoteProfileConfig` models, then writes:
 
 ```text
 <desktop-config-root>/projects/<project-slug>/science.yaml
@@ -319,8 +321,10 @@ profile id, SSH auth method, private-key path/reference ids, workspace root,
 HTTP/HTTPS proxy, `NO_PROXY`, pip index URL, Hugging Face endpoint, and
 `HF_HOME`, plus the execution-mode selector and relevant model input. Science
 users can therefore configure either Codex subscription transcript mode or
-remote managed local inference from Desktop without editing YAML for common
-proxy, mirror, or model settings.
+self-deployed remote inference from Desktop without editing YAML for common
+proxy, mirror, or model settings. Drafts using the legacy
+`codex_managed_local_inference` value are accepted for compatibility and saved
+back as `self-deployed`.
 
 `POST /openevo-api/desktop/bootstrap` is the first mutating sidecar endpoint.
 It is available only for config-backed sidecar sessions. It reuses
@@ -367,7 +371,7 @@ build receives the same proxy environment and standard proxy build args. If the
 remote Docker daemon itself needs registry mirrors or daemon-level proxy
 configuration, bootstrap reports the failure instead of editing host-wide Docker
 settings.
-For managed local inference configs, the compiled experiment contains
+For self-deployed configs, the compiled experiment contains
 `OPENEVO_MANAGED_HF_MODEL`, so the remote bootstrap plan also attempts a
 Hugging Face snapshot download using the configured `HF_ENDPOINT`, `HF_HOME`,
 and proxy/PIP environment. vLLM startup and health supervision are handled by
@@ -388,11 +392,11 @@ service daemons needed by Desktop Science runs:
 - rollout on `127.0.0.1:8080`;
 - gateway on `127.0.0.1:8100`;
 - evolution worker bound to the same topology file;
-- vLLM on `127.0.0.1:8000` for `codex_managed_local_inference`.
+- vLLM on `127.0.0.1:8000` for `self-deployed`.
 
 The service commands use the remote user PATH plus `~/.local/bin` and export the
 same proxy/PIP/Hugging Face environment rendered from the remote profile for the
-whole remote command script. The managed local inference path installs `vllm`
+whole remote command script. The self-deployed inference path installs `vllm`
 with `python3 -m pip install --user vllm` if the import check fails, then
 launches the OpenAI-compatible vLLM server for the configured Hugging Face
 model. Subscription mode still starts the OpenEvo runtime services for rollout,

@@ -71,7 +71,26 @@ def test_desktop_project_config_draft_defaults_subscription_codex_model() -> Non
     assert project.execution.hf_model is None
 
 
-def test_desktop_project_config_draft_builds_managed_local_inference() -> None:
+def test_desktop_project_config_draft_builds_self_deployed() -> None:
+    draft = DesktopProjectConfigDraft.model_validate(
+        VALID_DRAFT
+        | {
+            "execution_mode": "self-deployed",
+            "codex_model": None,
+            "hf_model": "Qwen/Qwen3-Coder-30B-A3B-Instruct",
+        }
+    )
+
+    project, _profile = build_desktop_project_configs(draft)
+
+    assert draft.execution_mode == "self-deployed"
+    assert draft.model_dump(mode="json")["execution_mode"] == "self-deployed"
+    assert project.execution.mode == "self-deployed"
+    assert project.execution.codex_model is None
+    assert project.execution.hf_model == "Qwen/Qwen3-Coder-30B-A3B-Instruct"
+
+
+def test_desktop_project_config_draft_accepts_legacy_managed_local_inference_alias() -> None:
     draft = DesktopProjectConfigDraft.model_validate(
         VALID_DRAFT
         | {
@@ -83,42 +102,50 @@ def test_desktop_project_config_draft_builds_managed_local_inference() -> None:
 
     project, _profile = build_desktop_project_configs(draft)
 
-    assert project.execution.mode == "codex_managed_local_inference"
+    assert draft.execution_mode == "self-deployed"
+    assert draft.model_dump(mode="json")["execution_mode"] == "self-deployed"
+    assert project.execution.mode == "self-deployed"
     assert project.execution.codex_model is None
     assert project.execution.hf_model == "Qwen/Qwen3-Coder-30B-A3B-Instruct"
 
 
-def test_desktop_project_config_draft_builds_managed_local_inference_without_codex_model() -> None:
+def test_desktop_project_config_draft_builds_self_deployed_without_codex_model() -> None:
     draft_payload = dict(VALID_DRAFT)
     draft_payload.pop("codex_model")
     draft = DesktopProjectConfigDraft.model_validate(
         draft_payload
         | {
-            "execution_mode": "codex_managed_local_inference",
+            "execution_mode": "self-deployed",
             "hf_model": "Qwen/Qwen3-Coder-30B-A3B-Instruct",
         }
     )
 
     project, _profile = build_desktop_project_configs(draft)
 
-    assert project.execution.mode == "codex_managed_local_inference"
+    assert project.execution.mode == "self-deployed"
     assert project.execution.codex_model is None
     assert project.execution.hf_model == "Qwen/Qwen3-Coder-30B-A3B-Instruct"
 
 
-def test_desktop_project_config_draft_rejects_managed_local_inference_without_hf_model() -> None:
-    with pytest.raises(ValidationError, match="hf_model"):
+def test_desktop_project_config_draft_rejects_self_deployed_without_hf_model() -> None:
+    with pytest.raises(
+        ValidationError,
+        match="hf_model is required for self-deployed mode",
+    ):
         DesktopProjectConfigDraft.model_validate(
             VALID_DRAFT
             | {
-                "execution_mode": "codex_managed_local_inference",
+                "execution_mode": "self-deployed",
                 "codex_model": None,
             }
         )
 
 
 def test_desktop_project_config_draft_rejects_hf_model_for_subscription() -> None:
-    with pytest.raises(ValidationError, match="hf_model"):
+    with pytest.raises(
+        ValidationError,
+        match="hf_model is only valid for self-deployed mode",
+    ):
         DesktopProjectConfigDraft.model_validate(
             VALID_DRAFT | {"hf_model": "Qwen/Qwen3-Coder-30B-A3B-Instruct"}
         )
@@ -151,13 +178,13 @@ def test_save_desktop_project_config_writes_deterministic_yaml(tmp_path: Path) -
     assert "path" not in remote_yaml
 
 
-def test_save_desktop_project_config_writes_managed_local_inference_yaml(
+def test_save_desktop_project_config_writes_self_deployed_yaml(
     tmp_path: Path,
 ) -> None:
     draft = DesktopProjectConfigDraft.model_validate(
         VALID_DRAFT
         | {
-            "execution_mode": "codex_managed_local_inference",
+            "execution_mode": "self-deployed",
             "codex_model": None,
             "hf_model": "Qwen/Qwen3-Coder-30B-A3B-Instruct",
         }
@@ -167,7 +194,7 @@ def test_save_desktop_project_config_writes_managed_local_inference_yaml(
 
     science_yaml = yaml.safe_load(paths.science_config_path.read_text(encoding="utf-8"))
     assert science_yaml["execution"] == {
-        "mode": "codex_managed_local_inference",
+        "mode": "self-deployed",
         "hf_model": "Qwen/Qwen3-Coder-30B-A3B-Instruct",
     }
 

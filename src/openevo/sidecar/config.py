@@ -16,7 +16,12 @@ from pydantic import (
 import yaml
 
 from openevo.science import ScienceProjectConfig, load_science_project_config
-from openevo.sidecar.models import RemoteProfileConfig, load_remote_profile_config
+from openevo.sidecar.models import (
+    DesktopExecutionMode,
+    RemoteProfileConfig,
+    load_remote_profile_config,
+    normalize_desktop_execution_mode,
+)
 
 
 class _StrictFrozenModel(BaseModel):
@@ -53,10 +58,7 @@ class DesktopProjectConfigDraft(_StrictFrozenModel):
     pip_index_url: str | None = None
     huggingface_endpoint: str | None = None
     hf_home: str | None = None
-    execution_mode: Literal[
-        "codex_subscription_transcript",
-        "codex_managed_local_inference",
-    ] = "codex_subscription_transcript"
+    execution_mode: DesktopExecutionMode = "codex_subscription_transcript"
     codex_model: str | None = None
     hf_model: str | None = None
     text_memory: bool = True
@@ -68,7 +70,10 @@ class DesktopProjectConfigDraft(_StrictFrozenModel):
     def _default_subscription_codex_model(cls, data: Any) -> Any:
         if not isinstance(data, dict):
             return data
-        mode = data.get("execution_mode", "codex_subscription_transcript")
+        mode = normalize_desktop_execution_mode(
+            data.get("execution_mode", "codex_subscription_transcript")
+        )
+        data = data | {"execution_mode": mode}
         if mode == "codex_subscription_transcript" and "codex_model" not in data:
             return data | {"codex_model": "gpt-5.1-codex-mini"}
         return data
@@ -134,12 +139,12 @@ class DesktopProjectConfigDraft(_StrictFrozenModel):
             if self.codex_model is None:
                 raise ValueError("codex_model is required for subscription mode")
             if self.hf_model is not None:
-                raise ValueError("hf_model is only valid for managed local inference")
-        elif self.execution_mode == "codex_managed_local_inference":
+                raise ValueError("hf_model is only valid for self-deployed mode")
+        elif self.execution_mode == "self-deployed":
             if self.codex_model is not None:
                 raise ValueError("codex_model is only valid for subscription mode")
             if self.hf_model is None:
-                raise ValueError("hf_model is required for managed local inference")
+                raise ValueError("hf_model is required for self-deployed mode")
         return self
 
 
@@ -274,9 +279,9 @@ def _task_source_payload(draft: DesktopProjectConfigDraft) -> dict[str, Any]:
 
 
 def _execution_payload(draft: DesktopProjectConfigDraft) -> dict[str, Any]:
-    if draft.execution_mode == "codex_managed_local_inference":
+    if draft.execution_mode == "self-deployed":
         return {
-            "mode": "codex_managed_local_inference",
+            "mode": "self-deployed",
             "hf_model": draft.hf_model,
         }
     return {

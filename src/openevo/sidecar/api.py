@@ -975,6 +975,7 @@ def _execution_status(project: ScienceProjectConfig) -> DesktopExecutionStatus:
     return DesktopExecutionStatus(
         mode=project.execution.mode,
         model=project.execution.hf_model or "",
+        # Project-only shell status has no run summary capture metadata yet.
         token_metrics_available=False,
     )
 
