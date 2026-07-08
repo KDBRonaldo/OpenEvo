@@ -294,7 +294,12 @@ Release wheels are built from the OpenEvo package metadata and include the
 packaged OpenEvo-only Desktop assets under `openevo/desktop/web/`.
 The `OpenEvo release artifact` GitHub Actions workflow runs the same audited
 release smoke path on `v*` tags and manual dispatch, then uploads `dist/*.whl`
-as the `openevo-wheel` artifact. It intentionally does not publish to PyPI yet.
+as the `openevo-wheel` artifact.
+The `Publish OpenEvo to PyPI` workflow uses PyPI trusted publishing through
+`pypa/gh-action-pypi-publish@release/v1` and runs when a GitHub release is
+published. Before the first publish, configure the PyPI trusted publisher for
+project `openevo`, repository `CompLifeLab-ZJU/OpenEvo`, workflow
+`.github/workflows/openevo-publish-pypi.yml`, and environment `pypi`.
 
 Before publishing a wheel, run the release smoke flow on Node 22, refresh the
 packaged Desktop assets, and validate the installed wheel:
