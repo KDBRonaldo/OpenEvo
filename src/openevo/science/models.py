@@ -123,8 +123,12 @@ class EnvironmentConfig(_StrictModel):
         return self
 
 
+_LEGACY_SELF_DEPLOYED_MODE = "codex_managed_local_inference"
+_SELF_DEPLOYED_MODE = "self-deployed"
+
+
 class ExecutionConfig(_StrictModel):
-    mode: Literal["codex_subscription_transcript", "codex_managed_local_inference"] = (
+    mode: Literal["codex_subscription_transcript", "self-deployed"] = (
         "codex_subscription_transcript"
     )
     codex_model: str | None = None
@@ -135,11 +139,14 @@ class ExecutionConfig(_StrictModel):
     def _default_subscription_codex_model(cls, data: Any) -> Any:
         if not isinstance(data, dict):
             return data
-        mode = data.get("mode", "codex_subscription_transcript")
-        if mode == "codex_managed_local_inference" and "codex_model" in data:
+        mode = _normalize_execution_mode(
+            data.get("mode", "codex_subscription_transcript")
+        )
+        if mode == _SELF_DEPLOYED_MODE and "codex_model" in data:
             raise ValueError(
                 "execution.codex_model is only valid for subscription transcript mode"
             )
+        data = data | {"mode": mode}
         if "codex_model" in data:
             return data
         if mode != "codex_subscription_transcript":
@@ -176,15 +183,15 @@ class ExecutionConfig(_StrictModel):
                 )
             if self.hf_model is not None:
                 raise ValueError(
-                    "execution.hf_model is only valid for managed local inference"
+                    "execution.hf_model is only valid for self-deployed mode"
                 )
-        elif self.mode == "codex_managed_local_inference":
+        elif self.mode == _SELF_DEPLOYED_MODE:
             if self.codex_model is not None:
                 raise ValueError(
                     "execution.codex_model is only valid for subscription transcript mode"
                 )
             if self.hf_model is None:
-                raise ValueError("execution.hf_model is required for managed local inference")
+                raise ValueError("execution.hf_model is required for self-deployed mode")
         return self
 
 
@@ -242,3 +249,9 @@ def _strip_non_empty(value: str, field_name: str) -> str:
     if not text:
         raise ValueError(f"{field_name} must be a non-empty string")
     return text
+
+
+def _normalize_execution_mode(value: Any) -> Any:
+    if value == _LEGACY_SELF_DEPLOYED_MODE:
+        return _SELF_DEPLOYED_MODE
+    return value

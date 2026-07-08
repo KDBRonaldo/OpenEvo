@@ -47,6 +47,44 @@ def test_managed_local_inference_requires_hf_model() -> None:
         ScienceProjectConfig.model_validate(payload)
 
 
+def test_science_project_accepts_legacy_managed_local_inference_alias() -> None:
+    project = ScienceProjectConfig.model_validate(
+        {
+            "version": 1,
+            "project": {"name": "protein"},
+            "remote_profile": "lab",
+            "task": {
+                "id": "fold",
+                "objective": "Analyze folding",
+                "source": {"type": "scratch"},
+            },
+            "execution": {
+                "mode": "codex_managed_local_inference",
+                "hf_model": "Qwen/Qwen3-8B",
+            },
+        }
+    )
+    assert project.execution.mode == "self-deployed"
+    assert project.model_dump(mode="json")["execution"]["mode"] == "self-deployed"
+
+
+def test_science_project_emits_public_self_deployed_mode() -> None:
+    project = ScienceProjectConfig.model_validate(
+        {
+            "version": 1,
+            "project": {"name": "protein"},
+            "remote_profile": "lab",
+            "task": {
+                "id": "fold",
+                "objective": "Analyze folding",
+                "source": {"type": "scratch"},
+            },
+            "execution": {"mode": "self-deployed", "hf_model": "Qwen/Qwen3-8B"},
+        }
+    )
+    assert project.execution.mode == "self-deployed"
+
+
 def test_subscription_transcript_rejects_hf_model() -> None:
     payload = _minimal_payload() | {
         "execution": {
@@ -57,7 +95,7 @@ def test_subscription_transcript_rejects_hf_model() -> None:
 
     with pytest.raises(
         ValidationError,
-        match="execution.hf_model is only valid for managed local inference",
+        match="execution.hf_model is only valid for self-deployed mode",
     ):
         ScienceProjectConfig.model_validate(payload)
 
@@ -72,7 +110,7 @@ def test_managed_local_inference_accepts_hf_model() -> None:
 
     config = ScienceProjectConfig.model_validate(payload)
 
-    assert config.execution.mode == "codex_managed_local_inference"
+    assert config.execution.mode == "self-deployed"
     assert config.execution.hf_model == "Qwen/Qwen3-Coder-30B-A3B-Instruct"
     assert config.execution.codex_model is None
     assert config.evolution.parametric_memory is False

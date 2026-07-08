@@ -95,15 +95,43 @@ def test_local_inference_compiles_to_proxy_auth_and_hf_model_metadata_env() -> N
     assert compiled.agent.preset == "codex"
     assert compiled.agent.model == "Qwen/Qwen3-Coder-30B-A3B-Instruct"
     assert compiled.agent.auth == "proxy"
+    assert compiled.agent.provider == "codex_cli"
     assert compiled.agent.settings == {"auth_mode": "proxy"}
     assert compiled.runtime.env == {
         "SCIENCE_DATASET": "folding",
         "OPENEVO_MANAGED_HF_MODEL": "Qwen/Qwen3-Coder-30B-A3B-Instruct",
     }
     assert compiled.tasks[0].metadata["openevo"]["execution_mode"] == (
-        "codex_managed_local_inference"
+        "self-deployed"
     )
     assert compiled.artifacts.parametric_memory.enabled is False
+
+
+def test_self_deployed_science_compile_uses_codex_reflector_llm() -> None:
+    project = ScienceProjectConfig.model_validate(
+        {
+            "version": 1,
+            "project": {"name": "protein-design"},
+            "remote_profile": "science-team",
+            "task": {
+                "id": "folding-baseline",
+                "objective": "Improve the folding baseline.",
+                "source": {
+                    "type": "remote_path",
+                    "path": "/datasets/folding-baseline",
+                },
+            },
+            "execution": {
+                "mode": "self-deployed",
+                "hf_model": "Qwen/Qwen3-Coder-30B-A3B-Instruct",
+            },
+        }
+    )
+
+    experiment = compile_science_project(project)
+
+    assert experiment.agent.auth == "proxy"
+    assert experiment.agent.provider == "codex_cli"
 
 
 def test_task_metadata_merges_existing_openevo_dict_with_compiler_keys_winning() -> None:

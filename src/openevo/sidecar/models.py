@@ -6,6 +6,13 @@ from typing import Any, Literal
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+LEGACY_SELF_DEPLOYED_EXECUTION_MODE = "codex_managed_local_inference"
+SELF_DEPLOYED_EXECUTION_MODE = "self-deployed"
+DesktopExecutionMode = Literal[
+    "codex_subscription_transcript",
+    "self-deployed",
+]
+
 
 class _StrictFrozenModel(BaseModel):
     model_config = ConfigDict(
@@ -174,3 +181,9 @@ def _strip_non_empty(value: str, field_name: str) -> str:
     if not text:
         raise ValueError(f"{field_name} must be a non-empty string")
     return text
+
+
+def normalize_desktop_execution_mode(value: Any) -> Any:
+    if value == LEGACY_SELF_DEPLOYED_EXECUTION_MODE:
+        return SELF_DEPLOYED_EXECUTION_MODE
+    return value

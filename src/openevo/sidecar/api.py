@@ -29,7 +29,11 @@ from openevo.sidecar.config import (
     load_desktop_project_config,
     save_desktop_project_config,
 )
-from openevo.sidecar.models import RemoteProfileConfig
+from openevo.sidecar.models import (
+    DesktopExecutionMode,
+    RemoteProfileConfig,
+    normalize_desktop_execution_mode,
+)
 from openevo.sidecar.planner import build_sidecar_science_plan
 
 SIDECAR_MUTATION_TOKEN_HEADER = "X-OpenEvo-Sidecar-Token"
@@ -84,9 +88,14 @@ class DesktopScienceProject(_StrictFrozenModel):
 
 
 class DesktopExecutionStatus(_StrictFrozenModel):
-    mode: Literal["codex_subscription_transcript", "codex_managed_local_inference"]
+    mode: DesktopExecutionMode
     model: str
     token_metrics_available: bool
+
+    @field_validator("mode", mode="before")
+    @classmethod
+    def _normalize_mode(cls, value):
+        return normalize_desktop_execution_mode(value)
 
     @model_validator(mode="after")
     def _validate_subscription_metrics(self) -> DesktopExecutionStatus:
@@ -966,7 +975,7 @@ def _execution_status(project: ScienceProjectConfig) -> DesktopExecutionStatus:
     return DesktopExecutionStatus(
         mode=project.execution.mode,
         model=project.execution.hf_model or "",
-        token_metrics_available=True,
+        token_metrics_available=False,
     )
 
 

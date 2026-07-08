@@ -1308,15 +1308,15 @@ def test_project_config_endpoint_saves_managed_local_inference_draft(
     assert response.status_code == 200
     payload = response.json()
     assert payload["status"]["execution"] == {
-        "mode": "codex_managed_local_inference",
+        "mode": "self-deployed",
         "model": "Qwen/Qwen3-Coder-30B-A3B-Instruct",
-        "token_metrics_available": True,
+        "token_metrics_available": False,
     }
     science_yaml = yaml.safe_load(
         Path(payload["config"]["science_config_path"]).read_text(encoding="utf-8")
     )
     assert science_yaml["execution"] == {
-        "mode": "codex_managed_local_inference",
+        "mode": "self-deployed",
         "hf_model": "Qwen/Qwen3-Coder-30B-A3B-Instruct",
     }
 
@@ -1912,6 +1912,17 @@ def test_subscription_transcript_status_rejects_token_metrics() -> None:
         )
 
 
+def test_execution_status_accepts_legacy_self_deployed_alias() -> None:
+    status = DesktopExecutionStatus(
+        mode="codex_managed_local_inference",
+        model="Qwen/Qwen2.5-7B-Instruct",
+        token_metrics_available=False,
+    )
+
+    assert status.mode == "self-deployed"
+    assert status.model_dump(mode="json")["mode"] == "self-deployed"
+
+
 def _science_project_payload() -> dict:
     return {
         "version": 1,
@@ -2470,9 +2481,9 @@ def test_build_desktop_shell_status_from_managed_local_inference_project() -> No
 
     status = build_desktop_shell_status(project, profile)
 
-    assert status.execution.mode == "codex_managed_local_inference"
+    assert status.execution.mode == "self-deployed"
     assert status.execution.model == "Qwen/Qwen2.5-7B-Instruct"
-    assert status.execution.token_metrics_available is True
+    assert status.execution.token_metrics_available is False
     assert status.services[1].state == "planned"
     assert status.project.source == "Local folder: workflows/local-task"
 

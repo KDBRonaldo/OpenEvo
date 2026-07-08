@@ -65,13 +65,14 @@ def _agent_payload(project: ScienceProjectConfig) -> dict[str, Any]:
         "preset": "codex",
         "model": project.execution.hf_model,
         "auth": "proxy",
+        "provider": "codex_cli",
         "settings": {"auth_mode": "proxy"},
     }
 
 
 def _runtime_payload(project: ScienceProjectConfig) -> dict[str, Any]:
     env = dict(project.environment.env)
-    if project.execution.mode == "codex_managed_local_inference":
+    if project.execution.mode == "self-deployed":
         env["OPENEVO_MANAGED_HF_MODEL"] = str(project.execution.hf_model)
 
     return {

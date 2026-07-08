@@ -316,7 +316,7 @@ def test_evolution_job_payloads_include_ordered_methods_and_reflector_llm() -> N
     assert all(job["config"]["promoted"] is True for job in jobs)
     assert all("base_model" not in job["config"]["compatibility"] for job in jobs)
     assert jobs[2]["config"]["reflector_llm"] == {
-        "provider": "openai_chat",
+        "provider": "codex_cli",
         "model": "gpt-5.1-codex-mini",
     }
 
@@ -659,6 +659,53 @@ def test_codex_cli_agent_provider_defaults_reflector_provider_to_codex_cli() -> 
     )
 
     assert jobs[0]["config"]["reflector_llm"]["provider"] == "codex_cli"
+
+
+def test_proxy_codex_cli_agent_uses_codex_cli_reflector_in_job_config() -> None:
+    compiled = compile_experiment(
+        _config(
+            agent={
+                "preset": "codex",
+                "model": "Qwen/Qwen3-Coder-30B-A3B-Instruct",
+                "auth": "proxy",
+                "provider": "codex_cli",
+                "settings": {"auth_mode": "proxy"},
+            }
+        )
+    )
+
+    jobs = compiled.evolution_job_payloads_for_round(
+        0,
+        dataset_artifact_id="dataset_artifact_1",
+        context_artifact_ids=[],
+    )
+
+    assert jobs[0]["config"]["reflector_llm"] == {
+        "provider": "codex_cli",
+        "model": "Qwen/Qwen3-Coder-30B-A3B-Instruct",
+    }
+    assert jobs[0]["config"]["reflector_llm"]["provider"] != "openai_chat"
+
+
+def test_proxy_agent_respects_explicit_openai_chat_reflector_provider() -> None:
+    compiled = compile_experiment(
+        _config(
+            agent={
+                "preset": "codex",
+                "model": "gpt-5.1-codex-mini",
+                "auth": "proxy",
+                "provider": "openai_chat",
+            }
+        )
+    )
+
+    jobs = compiled.evolution_job_payloads_for_round(
+        0,
+        dataset_artifact_id="dataset_artifact_1",
+        context_artifact_ids=[],
+    )
+
+    assert jobs[0]["config"]["reflector_llm"]["provider"] == "openai_chat"
 
 
 def test_task_filter_and_round_override_are_applied() -> None:

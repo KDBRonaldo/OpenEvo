@@ -468,7 +468,10 @@ def _reflector_llm(config: ExperimentConfig) -> dict[str, str]:
         return {"provider": config.agent.provider, "model": config.agent.model}
     provider = (
         "codex_cli"
-        if config.agent.auth in _SUBSCRIPTION_AUTH_MODES
+        if (
+            config.agent.auth in _SUBSCRIPTION_AUTH_MODES
+            or config.agent.preset == "codex"
+        )
         else "openai_chat"
     )
     return {"provider": provider, "model": config.agent.model}
