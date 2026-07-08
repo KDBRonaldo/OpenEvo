@@ -12,7 +12,7 @@ import secrets
 import shlex
 from typing import Any, Literal
 from threading import Lock, Thread
-from urllib.parse import unquote, urlparse
+from urllib.parse import quote, unquote, urlparse
 
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.encoders import jsonable_encoder
@@ -1013,7 +1013,12 @@ def create_sidecar_app(
                 detail="Desktop artifact content requires a terminal run.",
             )
         summary = _read_remote_run_summary(active_session, latest.output_dir)
-        artifact = _artifact_metadata_from_summary(summary, artifact_id)
+        if not _summary_contains_artifact_id(summary, artifact_id):
+            raise HTTPException(
+                status_code=404,
+                detail="Artifact not found in latest run summary.",
+            )
+        artifact = _read_remote_artifact_metadata(active_session, artifact_id)
         request = _artifact_content_request(artifact)
         content = _read_remote_artifact_content(active_session, request)
         return OpenEvoDesktopArtifactContent(
@@ -1240,28 +1245,98 @@ class _ArtifactContentReadRequest:
     filename: str
 
 
-def _artifact_metadata_from_summary(
-    summary: dict[str, Any],
+def _summary_contains_artifact_id(value: object, artifact_id: str) -> bool:
+    if isinstance(value, dict):
+        if value.get("artifact_id") == artifact_id:
+            return True
+        for key in ("artifact_ids", "approved_artifact_ids"):
+            if _artifact_id_container_contains(value.get(key), artifact_id):
+                return True
+        return any(
+            _summary_contains_artifact_id(child, artifact_id)
+            for child in value.values()
+        )
+    if isinstance(value, list):
+        return any(_summary_contains_artifact_id(child, artifact_id) for child in value)
+    return False
+
+
+def _artifact_id_container_contains(value: object, artifact_id: str) -> bool:
+    if isinstance(value, str):
+        return value == artifact_id
+    if isinstance(value, list):
+        return any(_artifact_id_container_contains(item, artifact_id) for item in value)
+    if isinstance(value, dict):
+        return any(
+            _artifact_id_container_contains(item, artifact_id)
+            for item in value.values()
+        )
+    return False
+
+
+def _read_remote_artifact_metadata(
+    session: OpenEvoSidecarSession,
     artifact_id: str,
 ) -> dict[str, Any]:
-    for artifact in _iter_summary_artifact_metadata(summary):
-        if artifact.get("artifact_id") == artifact_id:
-            return artifact
-    raise HTTPException(
-        status_code=404,
-        detail="Artifact not found in latest run summary.",
+    transport = session.transport_factory(session.profile)
+    command = _read_artifact_metadata_command(artifact_id)
+    result = transport.run(command, timeout_seconds=30.0)
+    env = session.profile.proxy.to_env()
+    if not result.ok:
+        detail = sanitize_remote_text(result.stderr or result.stdout, env).strip()
+        if "not found" in detail.lower() or "404" in detail:
+            raise HTTPException(
+                status_code=404,
+                detail="Artifact metadata not found.",
+            )
+        raise HTTPException(
+            status_code=502,
+            detail=detail or "Failed to read artifact metadata.",
+        )
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="Artifact metadata was not valid JSON.",
+        ) from exc
+    if not isinstance(payload, dict):
+        raise HTTPException(
+            status_code=502,
+            detail="Artifact metadata was not a JSON object.",
+        )
+    return payload
+
+
+def _read_artifact_metadata_command(artifact_id: str) -> str:
+    encoded_artifact_id = quote(artifact_id, safe="")
+    url = f"http://127.0.0.1:8200/v1/artifacts/{encoded_artifact_id}"
+    return "\n".join(
+        [
+            "python3 - <<'PY'",
+            "import sys",
+            "import urllib.error",
+            "import urllib.request",
+            f"url = {url!r}",
+            "try:",
+            "    with urllib.request.urlopen(url, timeout=10) as response:",
+            "        body = response.read().decode('utf-8')",
+            "except urllib.error.HTTPError as exc:",
+            "    if exc.code == 404:",
+            "        raise SystemExit('Artifact metadata not found.')",
+            (
+                "    raise SystemExit("
+                "f'Artifact metadata fetch failed: HTTP {exc.code}')"
+            ),
+            "except urllib.error.URLError as exc:",
+            (
+                "    raise SystemExit("
+                "f'Artifact metadata fetch failed: {exc.reason}')"
+            ),
+            "sys.stdout.write(body)",
+            "PY",
+        ]
     )
-
-
-def _iter_summary_artifact_metadata(value: object):
-    if isinstance(value, dict):
-        if isinstance(value.get("artifact_id"), str):
-            yield value
-        for child in value.values():
-            yield from _iter_summary_artifact_metadata(child)
-    elif isinstance(value, list):
-        for child in value:
-            yield from _iter_summary_artifact_metadata(child)
 
 
 def _artifact_content_request(
@@ -1290,12 +1365,11 @@ def _artifact_content_request(
         artifact_type=artifact_type,
         uri_path=uri_path,
     )
+    _validate_relative_artifact_path(relative_path)
     artifact_root = _artifact_root_path(
-        artifact_type=artifact_type,
         uri_path=uri_path,
         relative_path=relative_path,
     )
-    _validate_relative_artifact_path(relative_path)
     return _ArtifactContentReadRequest(
         artifact_type=artifact_type,
         artifact_root=artifact_root,
@@ -1345,14 +1419,13 @@ def _artifact_relative_content_path(
 
 def _artifact_root_path(
     *,
-    artifact_type: str,
     uri_path: str,
     relative_path: str,
 ) -> str:
-    if artifact_type in {"text_memory", "agent_system"}:
-        uri_filename = posixpath.basename(uri_path)
-        if uri_filename == posixpath.basename(relative_path):
-            return posixpath.dirname(uri_path)
+    normalized_relative = posixpath.normpath(relative_path)
+    suffix = f"/{normalized_relative}"
+    if uri_path.endswith(suffix):
+        return uri_path[: -len(suffix)] or "/"
     return uri_path
 
 

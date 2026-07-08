@@ -1909,6 +1909,16 @@ def test_artifact_content_api_returns_memory_markdown() -> None:
     transport = _ArtifactContentTransport(
         _sample_run_summary_with_artifact_content(),
         "# Learned Memory\n\n- Prefer stable folds.\n",
+        artifact_metadata={
+            "artifact-text-memory": _artifact_metadata(
+                artifact_id="artifact-text-memory",
+                artifact_type="text_memory",
+                uri="file:///remote/run/artifacts/text_memory/artifact-text-memory",
+                manifest={"content_path": "memory.md"},
+            ),
+        },
+        content_root="/remote/run/artifacts/text_memory/artifact-text-memory",
+        content_relative_path="memory.md",
     )
     client = TestClient(
         create_sidecar_app_for_project(
@@ -1936,15 +1946,93 @@ def test_artifact_content_api_returns_memory_markdown() -> None:
         "content": "# Learned Memory\n\n- Prefer stable folds.\n",
         "mime_type": "text/markdown",
     }
-    assert any("memory.md" in command for command in transport.commands)
+    assert any(
+        "/v1/artifacts/artifact-text-memory" in command
+        for command in transport.commands
+    )
+    content_command = transport.content_commands[-1]
+    assert "root = Path('/remote/run/artifacts/text_memory/artifact-text-memory')" in (
+        content_command
+    )
+    assert "relative = Path('memory.md')" in content_command
+
+
+def test_artifact_content_api_splits_nested_agent_system_path() -> None:
+    project = ScienceProjectConfig.model_validate(_science_project_payload())
+    profile = _remote_profile()
+    transport = _ArtifactContentTransport(
+        _sample_run_summary_with_artifact_content(),
+        "# Repo Microagent\n",
+        artifact_metadata={
+            "artifact-agent-system": _artifact_metadata(
+                artifact_id="artifact-agent-system",
+                artifact_type="agent_system",
+                uri=(
+                    "file:///remote/run/artifacts/agent_system/"
+                    "artifact-agent-system/.openhands/microagents/repo.md"
+                ),
+                manifest={"content_path": ".openhands/microagents/repo.md"},
+            ),
+        },
+        content_root="/remote/run/artifacts/agent_system/artifact-agent-system",
+        content_relative_path=".openhands/microagents/repo.md",
+    )
+    client = TestClient(
+        create_sidecar_app_for_project(
+            project,
+            profile,
+            transport_factory=lambda _profile: transport,
+        )
+    )
+    token = _sidecar_token(client)
+    headers = {"X-OpenEvo-Sidecar-Token": token}
+    _prepare_workspace_bootstrap_and_services(client, headers)
+    client.post("/openevo-api/desktop/run", headers=headers)
+    _wait_latest_run_state(client, headers, "succeeded")
+
+    response = client.get(
+        "/openevo-api/desktop/artifacts/artifact-agent-system/content",
+        headers=headers,
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "artifact_id": "artifact-agent-system",
+        "artifact_type": "agent_system",
+        "filename": "repo.md",
+        "content": "# Repo Microagent\n",
+        "mime_type": "text/markdown",
+    }
+    content_command = transport.content_commands[-1]
+    assert "root = Path('/remote/run/artifacts/agent_system/artifact-agent-system')" in (
+        content_command
+    )
+    assert "relative = Path('.openhands/microagents/repo.md')" in content_command
+    assert (
+        "/remote/run/artifacts/agent_system/artifact-agent-system/"
+        ".openhands/microagents/repo.md/.openhands/microagents/repo.md"
+        not in content_command
+    )
 
 
 def test_artifact_content_api_rejects_unsafe_content_path() -> None:
     project = ScienceProjectConfig.model_validate(_science_project_payload())
     profile = _remote_profile()
     summary = _sample_run_summary_with_artifact_content()
-    summary["artifacts"][0]["manifest"]["content_path"] = "../secrets.txt"
-    transport = _ArtifactContentTransport(summary, "secret")
+    transport = _ArtifactContentTransport(
+        summary,
+        "secret",
+        artifact_metadata={
+            "artifact-text-memory": _artifact_metadata(
+                artifact_id="artifact-text-memory",
+                artifact_type="text_memory",
+                uri="file:///remote/run/artifacts/text_memory/artifact-text-memory",
+                manifest={"content_path": "../secrets.txt"},
+            ),
+        },
+        content_root="/remote/run/artifacts/text_memory/artifact-text-memory",
+        content_relative_path="../secrets.txt",
+    )
     client = TestClient(
         create_sidecar_app_for_project(
             project,
@@ -2172,16 +2260,29 @@ def _sample_run_summary() -> dict:
 
 
 def _sample_run_summary_with_artifact_content() -> dict:
-    summary = _sample_run_summary()
-    summary["artifacts"] = [
-        {
-            "artifact_id": "artifact-text-memory",
-            "type": "text_memory",
-            "uri": "file:///remote/run/artifacts/text_memory/artifact-text-memory",
-            "manifest": {"content_path": "memory.md"},
-        }
-    ]
-    return summary
+    return _sample_run_summary()
+
+
+def _artifact_metadata(
+    *,
+    artifact_id: str,
+    artifact_type: str,
+    uri: str,
+    manifest: dict,
+) -> dict:
+    return {
+        "artifact_id": artifact_id,
+        "type": artifact_type,
+        "name": artifact_id,
+        "version": 1,
+        "state": "ready",
+        "uri": uri,
+        "manifest": manifest,
+        "compatibility": {},
+        "scores": {},
+        "tags": [],
+        "promoted": False,
+    }
 
 
 class _ApiDryRunTransport:
@@ -2303,9 +2404,22 @@ class _RunArtifactsTransport(_ApiDryRunTransport):
 
 
 class _ArtifactContentTransport(_RunArtifactsTransport):
-    def __init__(self, summary: dict, content: str) -> None:
+    def __init__(
+        self,
+        summary: dict,
+        content: str,
+        *,
+        artifact_metadata: dict[str, dict],
+        content_root: str,
+        content_relative_path: str,
+    ) -> None:
         super().__init__(summary)
         self.content = content
+        self.artifact_metadata = artifact_metadata
+        self.content_root = content_root
+        self.content_relative_path = content_relative_path
+        self.metadata_commands: list[str] = []
+        self.content_commands: list[str] = []
 
     def run(
         self,
@@ -2324,7 +2438,23 @@ class _ArtifactContentTransport(_RunArtifactsTransport):
                 env=env,
                 timeout_seconds=timeout_seconds,
             )
-        if "memory.md" not in command and "secrets.txt" not in command:
+        if "/v1/artifacts/" in command:
+            self.commands.append(command)
+            self.metadata_commands.append(command)
+            self.run_calls.append((command, cwd, timeout_seconds))
+            for artifact_id, metadata in self.artifact_metadata.items():
+                if f"/v1/artifacts/{artifact_id}" in command:
+                    return RemoteCommandResult(
+                        command=command,
+                        return_code=0,
+                        stdout=json.dumps(metadata),
+                    )
+            return RemoteCommandResult(
+                command=command,
+                return_code=22,
+                stderr="Artifact metadata not found.",
+            )
+        if "root = Path(" not in command or "relative = Path(" not in command:
             return super().run(
                 command,
                 cwd=cwd,
@@ -2332,7 +2462,16 @@ class _ArtifactContentTransport(_RunArtifactsTransport):
                 timeout_seconds=timeout_seconds,
             )
         self.commands.append(command)
+        self.content_commands.append(command)
         self.run_calls.append((command, cwd, timeout_seconds))
+        expected_root = f"root = Path({self.content_root!r})"
+        expected_relative = f"relative = Path({self.content_relative_path!r})"
+        if expected_root not in command or expected_relative not in command:
+            return RemoteCommandResult(
+                command=command,
+                return_code=2,
+                stderr="unexpected artifact content path",
+            )
         return RemoteCommandResult(
             command=command,
             return_code=0,

@@ -177,12 +177,13 @@ sidecar endpoints:
 - `GET /openevo-api/desktop/artifacts/{artifact_id}/content` reads one
   human-readable text artifact from that latest terminal run summary. It
   requires the sidecar mutation token and an active config-backed session. The
-  sidecar resolves only artifact metadata present in the latest summary, supports
+  sidecar first confirms the artifact id appears in the latest run summary, then
+  reads artifact metadata from the remote evolution backend registry. It supports
   `file://` artifact URIs, accepts only relative in-artifact content paths, and
   returns markdown/text content for `text_memory`, `skill_bundle`, and
   `agent_system`. It rejects non-file URI schemes, path traversal, active runs,
-  missing runs, and unsupported binary artifacts instead of accepting arbitrary
-  request-supplied file paths.
+  missing runs, unknown registry artifacts, and unsupported binary artifacts
+  instead of accepting arbitrary request-supplied file paths.
 
 The service supervisor is intentionally command based. It exports the remote
 profile proxy/PIP/Hugging Face environment for the full remote command script,
