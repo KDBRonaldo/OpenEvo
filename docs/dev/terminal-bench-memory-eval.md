@@ -978,6 +978,81 @@ small normalized failure flag list such as `syntax`, `traceback`,
 learning from active-adapter failures rather than only replaying first-action
 or verifier-result corrections.
 
+After that framework change, the `tb_exec_failure` dry projection was rerun
+without starting GPU training. The first run used only the active-adapter failed
+trial:
+`/tmp/tb21-task-local-parametric-trainfasttext-tbexec-correction-20260708/dryrun-tb-exec-failure-final`.
+It exported two records from
+`/tmp/tb21-task-local-parametric-trainfasttext-iterative-20260708/iterative_pool.jsonl`:
+one base `live_replay_llm_call:2` record and one
+`live_replay_tb_exec_failure_correction_llm_call:10` record tagged
+`target_correction_stage="tb_exec_failure"`. The correction preserved the real
+failed `tb_exec` output and tagged the failure as
+`syntax`, `fasttext`, and `timeout`; the selected target remained the successful
+`/app/model.bin` write command with `timeout_seconds=300`.
+
+The wider candidate pool at
+`/tmp/tb21-task-local-parametric-trainfasttext-tbexec-correction-20260708/combined_local_and_active_pool.jsonl`
+then combined three failed local baseline trials, the failed active-adapter
+trial `train-fasttext__R86vp3U`, and the same successful Codex reference. The
+candidate job at
+`/tmp/tb21-task-local-parametric-trainfasttext-tbexec-correction-20260708/dryrun-combined-tb-exec-failure-final/job.json`
+exported eight records: four base first-action records and four
+`tb_exec_failure` correction records. Three corrections captured
+`ModuleNotFoundError: No module named 'fasttext'` style import failures and were
+tagged `traceback`, `fasttext`, `timeout`; the active-adapter correction captured
+the here-document fastText command failure and was tagged `syntax`, `fasttext`,
+`timeout`. All eight targets were the same successful `/app/model.bin` command,
+with `--command-contains /app/model.bin`, `--exclude-command-contains 'rg --files'`,
+`--prompt-style live_replay`, `--target-mode final`, and
+`--include-tb-exec-failure-correction`.
+
+The corrected trainer payload for this candidate uses
+`/root/evolab-vllm/bin/python` and `scripts/qwen_lora_sft.py` with
+`--model-name Qwen/Qwen3.5-9B`, LoRA rank 8, alpha 16, `max_length=4096`, and
+120 steps. As of the dry-run audit, all GPUs still had high resident memory,
+GPU 3-6 had high utilization, and GPU 7 was serving `qwen3.5-curator`; training
+and paired eval are therefore deferred until a safe local GPU is available. The
+intended training command is:
+
+```sh
+CUDA_VISIBLE_DEVICES=<free_gpu> \
+uv run polar-evolution terminal-bench-task-local-parametric-memory-job \
+  --trajectory-pool /tmp/tb21-task-local-parametric-trainfasttext-tbexec-correction-20260708/combined_local_and_active_pool.jsonl \
+  --task-id train-fasttext \
+  --output-root /tmp/tb21-task-local-parametric-trainfasttext-tbexec-correction-20260708/train-combined-tb-exec-failure-r8-s120 \
+  --dataset-name tb21-task-local-train-fasttext-combined-tbexec-failure \
+  --base-model Qwen/Qwen3.5-9B \
+  --adapter-id tb-parametric-memory-train-fasttext-combined-tbexec-failure-r8-s120 \
+  --trainer-command /root/evolab-vllm/bin/python \
+  --trainer-timeout-seconds 3600 \
+  --trainer-arg /root/.config/superpowers/worktrees/ProRL-Agent-Server/openevo-memory-backends/scripts/qwen_lora_sft.py \
+  --trainer-arg --train-file \
+  --trainer-arg '{training_dataset}' \
+  --trainer-arg --output-dir \
+  --trainer-arg '{adapter_dir}' \
+  --trainer-arg --model-name \
+  --trainer-arg Qwen/Qwen3.5-9B \
+  --trainer-arg --max-steps \
+  --trainer-arg 120 \
+  --trainer-arg --lora-r \
+  --trainer-arg 8 \
+  --trainer-arg --lora-alpha \
+  --trainer-arg 16 \
+  --trainer-arg --max-length \
+  --trainer-arg 4096 \
+  --command-contains /app/model.bin \
+  --exclude-command-contains 'rg --files' \
+  --prompt-style live_replay \
+  --target-mode final \
+  --target-exec-timeout-seconds 300 \
+  --include-tb-exec-failure-correction \
+  --max-records-per-task 8 \
+  --run-worker \
+  --artifact-root /tmp/tb21-task-local-parametric-trainfasttext-tbexec-correction-20260708/train-combined-tb-exec-failure-r8-s120/artifacts \
+  --output /tmp/tb21-task-local-parametric-trainfasttext-tbexec-correction-20260708/train-combined-tb-exec-failure-r8-s120/job.json
+```
+
 The next fast-verifier task-local run used `gcode-to-text`, which has both
 failed and successful trajectory-pool records and a lightweight pytest
 verifier. The dry projection at
