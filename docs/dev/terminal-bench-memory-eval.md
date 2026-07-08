@@ -1637,6 +1637,27 @@ repeated slow apt setup, increase the relevant Harbor/agent budget for local
 parametric probes, or train a single long command that performs setup and model
 creation within one tool call whose timeout matches the task.
 
+A follow-up local probe used the same long-timeout adapter with the newly
+exposed Harbor `--agent-timeout-multiplier 3.5` flag. The full
+baseline-plus-adapter run at
+`/tmp/tb21-task-local-parametric-trainfasttext-milestone-longtimeout-20260708/eval-milestone-longtimeout-r8-s120-agentx35-tight1024-tool512`
+confirmed the Harbor config recorded `agent_timeout_multiplier=3.5`; the
+baseline still failed (`0/1`) after exploring unrelated commands and was
+interrupted during verifier apt setup to avoid spending the run on a repeated
+failed-baseline verifier install. A treatment-only diagnostic run at
+`/tmp/tb21-task-local-parametric-trainfasttext-milestone-longtimeout-20260708/eval-milestone-longtimeout-r8-s120-agentx35-treatment-only-tight1024-tool512`
+served the rewritten adapter successfully (`rewritten_key_count=64`) and
+returned reward `0.0` (`0/1`). The treatment was schema-clean and followed the
+intended path through dependency check and `apt-get update`, but
+`apt-get install -y g++` timed out after its own `900` second `tb_exec`
+timeout. The trajectory also showed EvoLab's internal
+`max_subagent_runtime_seconds` remained `900` even though Harbor's outer
+agent timeout multiplier was set. Therefore the next framework requirement for
+slow Terminal-Bench tasks is not only Harbor timeout passthrough; the task
+package also needs a controllable direct-solver subagent runtime budget and a
+larger `EVOLAB_TB_EXEC_TIMEOUT_CAP_SECONDS`, or the method needs to avoid
+network apt setup entirely.
+
 Evaluate baseline local Qwen and adapter local Qwen against the same subset:
 
 ```sh
