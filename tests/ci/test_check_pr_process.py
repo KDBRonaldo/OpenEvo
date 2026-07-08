@@ -117,3 +117,25 @@ def test_issue_templates_are_docs_like() -> None:
     )
 
     assert warnings == []
+
+
+def test_pr_process_workflow_runs_checker_in_strict_mode() -> None:
+    workflow = Path(".github/workflows/pr-process.yml")
+
+    text = workflow.read_text(encoding="utf-8")
+
+    assert "name: issue and docs gate" in text
+    assert "scripts/ci/check_pr_process.py" in text
+    assert "--pr-body-file pr_body.md" in text
+    assert "--changed-files-file changed_files.txt" in text
+    assert "--strict" in text
+
+
+def test_pr_process_docs_describe_blocking_ci_gate() -> None:
+    doc = Path("docs/architecture/pr-process-checks.md")
+
+    text = doc.read_text(encoding="utf-8")
+
+    assert "blocking CI gate" in text
+    assert "warning-only" in text
+    assert "exits successfully by default" not in text
