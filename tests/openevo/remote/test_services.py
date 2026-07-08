@@ -231,6 +231,24 @@ def test_stop_remote_service_kills_pid_and_missing_pid_returns_stopped() -> None
     assert transport.stopped_services == ["gateway"]
 
 
+def test_stop_remote_service_fails_when_process_survives_grace_period() -> None:
+    plan = build_remote_services_plan(_bootstrap_plan())
+    transport = _LifecycleTransport(
+        pid_states={"gateway": {"pid": 123, "alive": True}},
+        stop_still_running={"gateway"},
+    )
+
+    result = stop_remote_service(transport, plan, "gateway")
+
+    assert result.state == "failed"
+    assert result.message == "gateway did not stop after SIGTERM."
+    assert result.stderr == "gateway did not stop after SIGTERM."
+    assert transport.stopped_services == []
+    assert "gateway" in transport.pid_states
+    stop_command = transport.commands[-1][0]
+    assert "did not stop after SIGTERM" in stop_command
+
+
 def test_restart_remote_service_stops_starts_and_checks_selected_service_only() -> None:
     plan = build_remote_services_plan(_bootstrap_plan())
     transport = _LifecycleTransport(pid_states={"gateway": {"pid": 123, "alive": True}})
@@ -247,6 +265,22 @@ def test_restart_remote_service_stops_starts_and_checks_selected_service_only() 
     assert any(
         "http://127.0.0.1:8100/health" in command
         for command, _env in transport.commands
+    )
+
+
+def test_restart_remote_service_does_not_start_when_stop_fails() -> None:
+    plan = build_remote_services_plan(_bootstrap_plan())
+    transport = _LifecycleTransport(
+        pid_states={"gateway": {"pid": 123, "alive": True}},
+        stop_still_running={"gateway"},
+    )
+
+    result = restart_remote_service(transport, plan, "gateway")
+
+    assert result.state == "failed"
+    assert result.message == "gateway did not stop after SIGTERM."
+    assert not any(
+        "polar serve_gateway" in command for command, _env in transport.commands
     )
 
 
@@ -348,12 +382,14 @@ class _LifecycleTransport(_RecordingTransport):
         health_failures: dict[str, str] | None = None,
         log_content: str = "",
         malformed_inspect: set[str] | None = None,
+        stop_still_running: set[str] | None = None,
     ) -> None:
         super().__init__()
         self.pid_states = pid_states or {}
         self.health_failures = health_failures or {}
         self.log_content = log_content
         self.malformed_inspect = malformed_inspect or set()
+        self.stop_still_running = stop_still_running or set()
         self.stopped_services: list[str] = []
 
     def run(
@@ -393,6 +429,12 @@ class _LifecycleTransport(_RecordingTransport):
                     command=command,
                     return_code=0,
                     stdout=f"{service_id} is already stopped.",
+                )
+            if service_id in self.stop_still_running:
+                return RemoteCommandResult(
+                    command=command,
+                    return_code=1,
+                    stderr=f"{service_id} did not stop after SIGTERM.",
                 )
             self.stopped_services.append(service_id or "")
             self.pid_states.pop(service_id or "", None)

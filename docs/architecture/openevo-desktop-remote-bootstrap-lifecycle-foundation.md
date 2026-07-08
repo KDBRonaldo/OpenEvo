@@ -213,6 +213,11 @@ services lifecycle lock so they do not collide with service start or each other.
 Unknown service ids return a clear client error; `write_topology` is not a valid
 service id for logs, stop, or restart.
 
+Stop sends SIGTERM and waits for the process to disappear before deleting the
+pid file. If the process is still alive after the grace period, stop returns a
+failed `RemoteServiceOperationResult`, leaves the pid file intact, and restart
+does not start a replacement process.
+
 Inspection semantics are intentionally pragmatic:
 
 - missing pid file or dead pid is `stopped`;

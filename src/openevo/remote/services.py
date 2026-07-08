@@ -936,12 +936,20 @@ def _stop_service_command(pid_path: str, service_id: str) -> str:
             "    print(f'failed to stop {service_id}: {exc}', file=sys.stderr)",
             "    raise SystemExit(1)",
             "deadline = time.monotonic() + 10",
+            "stopped = False",
             "while time.monotonic() < deadline:",
             "    try:",
             "        os.kill(pid, 0)",
             "    except ProcessLookupError:",
+            "        stopped = True",
             "        break",
             "    time.sleep(0.2)",
+            "if not stopped:",
+            (
+                "    print(f'{service_id} did not stop after SIGTERM.', "
+                "file=sys.stderr)"
+            ),
+            "    raise SystemExit(1)",
             "try:",
             "    os.remove(pid_path)",
             "except FileNotFoundError:",
