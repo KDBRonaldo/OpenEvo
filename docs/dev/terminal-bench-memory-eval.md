@@ -1605,6 +1605,38 @@ never launched Harbor. The CLI now derives the default URL from
 `--server-port`; if `--server-url` is supplied explicitly, keep it aligned with
 the managed-server port.
 
+Two train-fasttext task-local Qwen3.5-9B milestone-sequence probes on 2026-07-08
+did not improve pass@1, but they clarified the next framework requirement. The
+first adapter was trained at
+`/tmp/tb21-task-local-parametric-trainfasttext-milestone-20260708/train-milestone-schema-lock-tbexec-r8-s120`
+from 25 records: 3 schema-lock records, 18 milestone sequence records, and 4
+`tb_exec` failure records. Its paired/manual eval at
+`/tmp/tb21-task-local-parametric-trainfasttext-milestone-20260708/eval-milestone-r8-s120-tight1024-tool512`
+had baseline pass@1 `0/1`, parametric-memory pass@1 `0/1`, and delta `0`.
+The treatment emitted schema-valid `tb_exec` calls with `task_id` and
+`timeout_seconds`, reached `apt-get update`, but then timed out on
+`apt-get install -y g++` at 300 seconds; the timeout left a `dpkg` lock and the
+following retry failed before a later malformed `_raw_arguments` tool call
+terminated the attempt.
+
+The follow-up long-timeout adapter was trained at
+`/tmp/tb21-task-local-parametric-trainfasttext-milestone-longtimeout-20260708/train-milestone-longtimeout-schema-lock-tbexec-r8-s120`
+with the same 25 records but with long-running apt, pip, data-conversion, and
+training targets supervised at 900 seconds. Its manual eval at
+`/tmp/tb21-task-local-parametric-trainfasttext-milestone-longtimeout-20260708/eval-milestone-longtimeout-r8-s120-tight1024-tool512`
+again had baseline pass@1 `0/1`, parametric-memory pass@1 `0/1`, and delta
+`0`. The schema issue was gone: 4 LLM calls, no `_raw_arguments`, and no
+missing `task_id`. The treatment completed the dependency check,
+`apt-get update`, and `apt-get install -y g++`; however the install took 803.6
+seconds, so the Harbor agent round budget was exhausted immediately afterward
+before `pip install fasttext`, data conversion, model training, or verifier
+execution. This indicates the current train-fasttext failure is dominated by
+environment setup latency and rollout budget, not by adapter selection or basic
+tool schema alignment. A production milestone backend should either avoid
+repeated slow apt setup, increase the relevant Harbor/agent budget for local
+parametric probes, or train a single long command that performs setup and model
+creation within one tool call whose timeout matches the task.
+
 Evaluate baseline local Qwen and adapter local Qwen against the same subset:
 
 ```sh
