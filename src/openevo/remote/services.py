@@ -1063,17 +1063,43 @@ def _daemon_command(
     return "\n".join(
         [
             f"mkdir -p {shlex.quote(log_dir)} {shlex.quote(pid_dir)}",
-            (
-                f"if [ -s {shlex.quote(pid_path)} ] "
-                f"&& kill -0 \"$(cat {shlex.quote(pid_path)})\" 2>/dev/null; "
-                "then exit 0; fi"
-            ),
+            _daemon_alive_check_command(pid_path),
             *(prelude or []),
             (
                 'nohup env PATH="$HOME/.local/bin:$PATH" '
                 f"{command} > {shlex.quote(log_path)} 2>&1 < /dev/null &"
             ),
             f"echo $! > {shlex.quote(pid_path)}",
+        ]
+    )
+
+
+def _daemon_alive_check_command(pid_path: str) -> str:
+    return "\n".join(
+        [
+            "python3 - <<'PY'",
+            "import os",
+            "from pathlib import Path",
+            f"pid_path = Path({pid_path!r})",
+            "try:",
+            "    text = pid_path.read_text(encoding='utf-8').strip()",
+            "except FileNotFoundError:",
+            "    raise SystemExit(1)",
+            "if not text:",
+            "    raise SystemExit(1)",
+            "try:",
+            "    pid = int(text)",
+            "except ValueError:",
+            "    raise SystemExit(1)",
+            "if pid <= 0:",
+            "    raise SystemExit(1)",
+            "try:",
+            "    os.kill(pid, 0)",
+            "except OSError:",
+            "    raise SystemExit(1)",
+            "raise SystemExit(0)",
+            "PY",
+            "if [ $? -eq 0 ]; then exit 0; fi",
         ]
     )
 
@@ -1177,6 +1203,11 @@ def _pid_health_command(pid_path: str, *, wait_seconds: int = 30) -> str:
             "    try:",
             "        with open(pid_path, encoding='utf-8') as handle:",
             "            pid = int(handle.read().strip())",
+            "        if pid <= 0:",
+            (
+                "            raise ValueError("
+                "f'invalid pid file {pid_path}: {pid}')"
+            ),
             "        os.kill(pid, 0)",
             "        raise SystemExit(0)",
             "    except Exception as exc:",

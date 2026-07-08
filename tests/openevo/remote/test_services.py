@@ -39,6 +39,8 @@ def test_service_plan_starts_subscription_runtime_services() -> None:
     assert gateway.manifest["pid_path"].endswith("/services/pids/gateway.pid")
     assert gateway.manifest["log_path"].endswith("/services/logs/gateway.log")
     assert gateway.manifest["port"] == 8100
+    assert 'kill -0 "$(cat' not in gateway.command
+    _assert_before(gateway.command, "if pid <= 0:", "os.kill(pid, 0)")
     assert "polar serve_gateway" in gateway.command
     assert plan.topology_path in gateway.command
     assert gateway.health_command is not None
@@ -49,6 +51,8 @@ def test_service_plan_starts_subscription_runtime_services() -> None:
     assert rollout.manifest["service_id"] == "rollout"
     assert rollout.manifest["pid_path"].endswith("/services/pids/rollout.pid")
     assert rollout.manifest["log_path"].endswith("/services/logs/rollout.log")
+    assert 'kill -0 "$(cat' not in rollout.command
+    _assert_before(rollout.command, "if pid <= 0:", "os.kill(pid, 0)")
     assert f"polar serve_rollout --config {plan.topology_path}" in rollout.command
     assert (
         f"polar serve_gateway --config {plan.topology_path} "
@@ -88,6 +92,8 @@ def test_service_plan_starts_vllm_for_managed_local_inference() -> None:
     assert "expected_model not in models" in vllm.health_command
     assert "deadline = time.monotonic() + 900" in vllm.health_command
     assert vllm.health_timeout_seconds == 905.0
+    assert 'kill -0 "$(cat' not in vllm.command
+    _assert_before(vllm.command, "if pid <= 0:", "os.kill(pid, 0)")
     topology = plan.step_by_id("write_topology")
     assert "engine: vllm" in topology.command
     assert "model_served: Qwen/Qwen3-Coder-30B-A3B-Instruct" in topology.command
@@ -146,6 +152,15 @@ def test_execute_remote_services_plan_redacts_proxy_secrets() -> None:
     assert "proxy-secret" not in rollout.stderr
     assert "download-secret" not in rollout.stderr
     assert "[REDACTED]" in rollout.stderr
+
+
+def test_pid_health_command_validates_positive_pid_before_kill() -> None:
+    plan = build_remote_services_plan(_bootstrap_plan())
+    worker = plan.step_by_id("evolution_worker")
+
+    assert worker.health_command is not None
+    _assert_before(worker.health_command, "if pid <= 0:", "os.kill(pid, 0)")
+    assert "invalid pid file" in worker.health_command
 
 
 def test_managed_service_lookup_excludes_topology_step() -> None:

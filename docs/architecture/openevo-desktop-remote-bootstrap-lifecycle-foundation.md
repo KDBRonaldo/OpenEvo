@@ -220,6 +220,8 @@ does not start a replacement process.
 Pid file values must be positive integers before inspect or stop sends any
 signal. Non-positive pid values are treated as invalid pid files and reported
 without calling `os.kill`.
+The daemon already-running check and pid-file health checks apply the same
+positive-pid validation before probing process liveness.
 
 Inspection semantics are intentionally pragmatic:
 
