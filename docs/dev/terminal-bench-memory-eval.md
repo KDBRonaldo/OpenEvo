@@ -359,8 +359,13 @@ preparation commands; sequence mode exports progressive next-command examples
 through the selected final target. Use `--target-exec-timeout-seconds` to pin a
 runtime-compatible optional `timeout_seconds` argument on each supervised
 `tb_exec` target when local tool-call models drift into malformed optional
-arguments. Use `--include-tool-schema-lock` for local-inference adapters that
-still emit malformed `tb_exec` arguments after `tb_read_task`; it adds one short
+arguments. Use `--target-command` when a successful Codex trajectory completed
+through a non-shell `file_change` event, or when the desired research target is
+a manually audited shell command rather than a selected successful
+`command_execution`; this is supported only with `--target-mode final` and is
+recorded in the dataset metadata as a manual target. Use
+`--include-tool-schema-lock` for local-inference adapters that still emit
+malformed `tb_exec` arguments after `tb_read_task`; it adds one short
 after-read-task record whose supervised target is a complete `tb_exec` call with
 `task_id`, `command`, and optional `timeout_seconds`. With `--target-mode
 sequence`, the schema-lock target is the first successful command in the
@@ -1654,6 +1659,43 @@ rewritten keys, and the passing treatment attempts emitted the intended
 failure still emitted the same command family but drifted over repeated
 attempts, so this is stronger single-task evidence for a real local
 parametric-memory gain, not a solved aggregate Terminal Bench 2.1 result.
+
+A third task-local Qwen3.5 probe on `vulnerable-secret` exposed a useful
+framework boundary and a negative method result. The pool had one failed
+baseline trajectory and many successful Codex trajectories, but the successful
+ones wrote `/app/results.txt` through Codex `file_change` events rather than
+shell `command_execution` events. A normal `--command-contains results.txt`
+dry-run therefore selected a read-back validation command instead of a command
+that creates the required file. The task-local builder now supports
+`--target-command` for this case. The first manual-target adapter at
+`/tmp/tb21-task-local-parametric-vulnerable-secret-20260708/train-manual-target-r8-s80`
+trained two records, the explicit `printf 'FLAG{...}\n' > /app/results.txt`
+target plus a schema-lock record, using Qwen3.5-9B on GPU 7 with LoRA rank 8,
+alpha 16, `max_length=4096`, and 80 steps. The pass@3 eval at
+`/tmp/tb21-task-local-parametric-vulnerable-secret-20260708/eval-manual-target-r8-s80-pass3`
+kept only `parametric_memory` enabled, used deterministic Qwen3.5 local vLLM
+with `qwen3_5_vllm_language_model` key rewrite, and scored baseline `[0.0,
+0.0, 0.0]`, parametric memory `[0.0, 0.0, 0.0]`, delta `0`. The treatment
+loaded the adapter and often tried to write `/app/results.txt` immediately, but
+the command drifted into nested `printf` quoting errors or wrote lowercase
+`flag{...}`, so the verifier failed exact `FLAG{...}` checks.
+
+A second `vulnerable-secret` manual-target variant tested whether avoiding the
+literal `FLAG` token would stabilize exact output. It trained
+`tb-parametric-memory-vulnerable-secret-manual-hex-r8-s100` at
+`/tmp/tb21-task-local-parametric-vulnerable-secret-20260708/train-manual-hex-r8-s100`
+with a Python one-liner target that writes `bytes.fromhex(...)` to
+`/app/results.txt`; diagnostics recorded two records, 100 steps, and final loss
+around `2e-5`. The pass@1 eval at
+`/tmp/tb21-task-local-parametric-vulnerable-secret-20260708/eval-manual-hex-r8-s100-pass1`
+again scored baseline `0/1`, parametric memory `0/1`, delta `0`. This time the
+treatment did not emit the supervised hex write at all: it first tried to read
+`/app/vulnerable/make_syms.sh`, then produced a malformed `tb_exec` without a
+valid `task_id`. The method conclusion is that manual target injection is now
+available and active, but two direct-solver records are not enough to make
+Qwen3.5 reliably copy exact literal/file-write commands. The next
+`vulnerable-secret` backend should add repeated/literal-lock target shaping or
+use live local failure prefixes before treating this task as positive evidence.
 
 Across the two current-runner Qwen3.5 controlled pass@3 reproductions above,
 both tasks kept only `parametric_memory` enabled and disabled `text_memory`,

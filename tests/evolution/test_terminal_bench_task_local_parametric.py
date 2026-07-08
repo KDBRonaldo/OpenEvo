@@ -2450,6 +2450,111 @@ def test_terminal_bench_task_local_parametric_memory_job_cli_accepts_tool_schema
     }
 
 
+def test_terminal_bench_task_local_parametric_memory_job_cli_accepts_manual_target_command(
+    tmp_path: Path,
+) -> None:
+    failed_trial = tmp_path / "failed-trial"
+    successful_trial = tmp_path / "successful-trial"
+    (failed_trial / "agent").mkdir(parents=True)
+    (successful_trial / "agent").mkdir(parents=True)
+    (successful_trial / "agent" / "codex.txt").write_text(
+        json.dumps(
+            {
+                "type": "item.completed",
+                "item": {
+                    "type": "file_change",
+                    "changes": [{"path": "/app/results.txt", "kind": "add"}],
+                    "status": "completed",
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    pool = tmp_path / "trajectory_pool.jsonl"
+    _write_pool(
+        pool,
+        [
+            {
+                "trajectory_id": "failed-1",
+                "task_id": "vulnerable-secret",
+                "reward": 0.0,
+                "trial_dir": str(failed_trial),
+                "prompt_summary": "Write /app/results.txt.",
+            },
+            {
+                "trajectory_id": "success-1",
+                "task_id": "vulnerable-secret",
+                "reward": 1.0,
+                "trial_dir": str(successful_trial),
+            },
+        ],
+    )
+
+    target_command = (
+        "printf 'FLAG{b4ff3r_0v3rfl0w_m4st3r_k3y_2024}\\n' > /app/results.txt"
+    )
+    output = tmp_path / "job.json"
+    assert (
+        main(
+            [
+                "terminal-bench-task-local-parametric-memory-job",
+                "--trajectory-pool",
+                str(pool),
+                "--task-id",
+                "vulnerable-secret",
+                "--output-root",
+                str(tmp_path / "out"),
+                "--trainer-command",
+                "python",
+                "--trainer-arg",
+                "train_lora.py",
+                "--trainer-arg",
+                "--train-file",
+                "--trainer-arg",
+                "{training_dataset}",
+                "--trainer-arg",
+                "--output-dir",
+                "--trainer-arg",
+                "{adapter_dir}",
+                "--target-command",
+                target_command,
+                "--target-exec-timeout-seconds",
+                "30",
+                "--output",
+                str(output),
+            ]
+        )
+        == 0
+    )
+
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    [record] = [
+        json.loads(line)
+        for line in Path(payload["dataset"]["records_path"]).read_text().splitlines()
+    ]
+    target_args = record["traces"][0]["response_messages"][-1]["tool_calls"][0][
+        "function"
+    ]["arguments"]
+    assert payload["target_command"] == target_command
+    assert record["metadata"]["target_command"] == target_command
+    assert record["metadata"]["target_command_source"] == "manual"
+    assert record["metadata"]["source_successful_command_event_index"] == -1
+    assert record["metadata"]["target_app_paths"] == ["/app/results.txt"]
+    assert target_args["command"] == target_command
+    assert target_args["timeout_seconds"] == 30
+    manifest = json.loads(
+        Path(payload["dataset"]["manifest_path"]).read_text(encoding="utf-8")
+    )
+    assert manifest["target_filters"] == {
+        "command_contains": [],
+        "exclude_command_contains": [],
+        "prompt_style": "direct_solver",
+        "target_command": target_command,
+        "target_mode": "final",
+    }
+
+
 def test_terminal_bench_task_local_parametric_memory_job_cli_accepts_run_tests_correction(
     tmp_path: Path,
 ) -> None:

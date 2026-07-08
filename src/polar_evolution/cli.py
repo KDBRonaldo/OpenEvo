@@ -524,6 +524,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Excluded substring for successful Codex command targets. Can be repeated.",
     )
     tb_task_local_parametric_job.add_argument(
+        "--target-command",
+        help=(
+            "Explicit tb_exec command to supervise instead of selecting one "
+            "from successful Codex command_execution events. Use this for "
+            "successful trajectories that completed via file_change."
+        ),
+    )
+    tb_task_local_parametric_job.add_argument(
         "--max-records-per-task",
         type=int,
         default=16,
@@ -1690,6 +1698,7 @@ def _create_terminal_bench_task_local_parametric_memory_job(
             selection,
             command_contains=list(args.command_contains),
             exclude_command_contains=list(args.exclude_command_contains),
+            target_command=args.target_command,
             max_records=args.max_records_per_task,
             prompt_style=args.prompt_style,
             target_mode=args.target_mode,
@@ -1730,6 +1739,8 @@ def _create_terminal_bench_task_local_parametric_memory_job(
         "prompt_style": args.prompt_style,
         "target_mode": args.target_mode,
     }
+    if args.target_command:
+        target_filters["target_command"] = args.target_command
     if args.include_tool_schema_lock:
         target_filters["include_tool_schema_lock"] = True
     payload = build_task_local_parametric_job_payload(
@@ -1749,6 +1760,7 @@ def _create_terminal_bench_task_local_parametric_memory_job(
     payload["selection_summary"] = selection_summary
     payload["command_contains"] = list(args.command_contains)
     payload["exclude_command_contains"] = list(args.exclude_command_contains)
+    payload["target_command"] = args.target_command
     payload["prompt_style"] = args.prompt_style
     payload["target_mode"] = args.target_mode
     payload["target_exec_timeout_seconds"] = args.target_exec_timeout_seconds

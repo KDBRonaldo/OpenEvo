@@ -271,6 +271,7 @@ def build_task_local_sft_records(
     *,
     command_contains: list[str] | None = None,
     exclude_command_contains: list[str] | None = None,
+    target_command: str | None = None,
     max_records: int = 16,
     prompt_style: str = "direct_solver",
     target_mode: str = "final",
@@ -288,6 +289,9 @@ def build_task_local_sft_records(
         )
     if target_mode not in _TASK_LOCAL_TARGET_MODES:
         raise ValueError("task-local parametric target_mode must be final or sequence")
+    manual_target_command = target_command.strip() if target_command else None
+    if manual_target_command and target_mode != "final":
+        raise ValueError("target_command is only supported with target_mode=final")
     if target_exec_timeout_seconds is not None and target_exec_timeout_seconds <= 0:
         raise ValueError("target_exec_timeout_seconds must be positive")
     if include_run_tests_correction and target_mode != "final":
@@ -308,7 +312,17 @@ def build_task_local_sft_records(
             break
         for successful in selection.successful:
             transcript_path = _trial_codex_transcript(successful.trial_dir)
-            if target_mode == "sequence":
+            if manual_target_command:
+                commands = [
+                    CodexCommandEvent(
+                        event_index=-1,
+                        command=manual_target_command,
+                        exit_code=0,
+                        status="manual",
+                        output_excerpt="",
+                    )
+                ]
+            elif target_mode == "sequence":
                 commands = _sequence_target_commands(
                     transcript_path,
                     command_contains=command_contains,
@@ -664,6 +678,8 @@ def _task_local_sft_record(
         "target_command": command.command,
         "target_tool_name": "tb_exec",
     }
+    if command.status == "manual" and command.event_index < 0:
+        metadata["target_command_source"] = "manual"
     if target_exec_timeout_seconds is not None:
         metadata["target_exec_timeout_seconds"] = target_exec_timeout_seconds
     if target_sequence_index is not None and target_sequence_length is not None:
