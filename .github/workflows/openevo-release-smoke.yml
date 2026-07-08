@@ -8,6 +8,7 @@ on:
       - "pyproject.toml"
       - "uv.lock"
       - "scripts/ci/check_openevo_release.py"
+      - "scripts/ci/smoke_openevo_desktop_wheel.py"
       - "src/openevo/**"
       - "src/polar/**"
       - "src/polar_evolution/**"
@@ -65,3 +66,4 @@ jobs:
           .openevo-wheel-smoke/bin/openevo --help
           .openevo-wheel-smoke/bin/openevo desktop --help
           .openevo-wheel-smoke/bin/openevo desktop open --help
+          .openevo-wheel-smoke/bin/python scripts/ci/smoke_openevo_desktop_wheel.py

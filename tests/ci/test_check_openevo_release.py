@@ -89,6 +89,24 @@ def test_requires_packaged_openevo_desktop_assets(tmp_path: Path) -> None:
     assert any("openevo/desktop/web/assets/" in error for error in errors)
 
 
+def test_rejects_desktop_index_referencing_missing_assets(tmp_path: Path) -> None:
+    checker = _load_module()
+    wheel = _write_wheel(
+        tmp_path / "openevo-0.1.0-py3-none-any.whl",
+        desktop_index=(
+            "<title>OpenEvo Desktop</title>"
+            '<script type="module" src="/assets/missing.js"></script>'
+        ),
+    )
+
+    errors = checker.validate_wheel(wheel)
+
+    assert any(
+        "references missing Desktop asset" in error and "assets/missing.js" in error
+        for error in errors
+    )
+
+
 def test_rejects_shared_dashboard_static_assets(tmp_path: Path) -> None:
     checker = _load_module()
     wheel = _write_wheel(
@@ -137,6 +155,10 @@ def test_release_smoke_workflow_builds_packaged_assets_and_validates_wheel() -> 
     assert ".openevo-wheel-smoke/bin/openevo --help" in text
     assert ".openevo-wheel-smoke/bin/openevo desktop --help" in text
     assert ".openevo-wheel-smoke/bin/openevo desktop open --help" in text
+    assert (
+        ".openevo-wheel-smoke/bin/python "
+        "scripts/ci/smoke_openevo_desktop_wheel.py"
+    ) in text
 
     assert text.index("npm ci") < text.index("npm test -- --run")
     assert text.index("npm test -- --run") < text.index("npm run build:openevo")
@@ -166,6 +188,10 @@ def _write_wheel(
     metadata: str = GOOD_METADATA,
     entry_points: str = GOOD_ENTRY_POINTS,
     include_desktop_assets: bool = True,
+    desktop_index: str = (
+        "<title>OpenEvo Desktop</title>"
+        '<script src="/assets/app.js"></script>'
+    ),
     extra_files: dict[str, str] | None = None,
 ) -> Path:
     dist_info = "openevo-0.1.0.dist-info"
@@ -175,7 +201,7 @@ def _write_wheel(
         if include_desktop_assets:
             wheel.writestr(
                 "openevo/desktop/web/index.html",
-                "<title>OpenEvo Desktop</title><script src=\"/assets/app.js\"></script>",
+                desktop_index,
             )
             wheel.writestr("openevo/desktop/web/assets/app.js", "console.log('openevo')")
         for name, content in (extra_files or {}).items():
