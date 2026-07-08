@@ -1944,6 +1944,50 @@ specific: staged targets are less brittle than one very long command, but the
 dataset still needs stronger ordering/path anchoring and final-answer boundary
 supervision for the official `/app/model.bin` artifact.
 
+Two follow-ups tested that diagnosis without changing framework code. The first
+was a final-path weighted resampling at
+`/tmp/tb21-task-local-parametric-trainfasttext-finalweighted-20260708/train-finalweighted-r8-s220`.
+It reused the key-sequence dry run, produced 188 SFT records, kept 16
+schema-lock records, and upweighted the two `/app/model.bin` /
+`final_model_size_bytes` sequence targets to 112 records. Training used
+`Qwen/Qwen3.5-9B`, LoRA rank 8, alpha 16, `max_length=4096`, 220 steps, and
+GPU 7; diagnostics recorded `record_count=188`, `trained_steps=220`, and a
+loss tail around `1e-4`. The paired eval at
+`/tmp/tb21-task-local-parametric-trainfasttext-finalweighted-20260708/eval-finalweighted-r8-s220-pass1`
+again scored baseline `0/1`, parametric memory `0/1`, delta `0`. The treatment
+kept most tool calls schema-valid (`6/7` `tb_exec` calls carried
+`timeout_seconds=3600`) but never emitted `/app/model.bin` or
+`final_model_size_bytes`. It ran `apt-get update`, then skipped
+`apt-get install -y g++`, attempted `python -m pip install fasttext`, failed on
+the C++17 compiler requirement, drifted into `python -m pip install g++`, and
+ended with malformed `_raw_arguments`. This shows final-path weighting alone
+does not fix dependency-order recovery.
+
+The second follow-up added active failure correction records from that failed
+final-weighted trajectory. Training at
+`/tmp/tb21-task-local-parametric-trainfasttext-activecorrection-20260708/train-activecorr-r8-s180`
+combined weighted key-sequence records with 80 live-prefix correction records
+from LLM calls containing `Unsupported compiler`, `Invalid requirement`,
+`g++: command not found`, or `installagarbage`. The supervised correction target
+was `apt-get install -y g++ && python -m pip install fasttext`. The run produced
+243 SFT records, including 72 `/app/model.bin` final-path targets and 16
+schema-lock records, then trained `Qwen/Qwen3.5-9B` for 180 steps on GPU 7. The
+paired eval at
+`/tmp/tb21-task-local-parametric-trainfasttext-activecorrection-20260708/eval-activecorr-r8-s180-pass1`
+also scored baseline `0/1`, parametric memory `0/1`, delta `0`, but it changed
+the failure mode. The treatment emitted 13 `tb_exec` calls; 12 carried
+`timeout_seconds=3600`, 10 contained `/app/model.bin`, and 2 contained
+`apt-get install -y g++`. It did recover toward installing `g++`, but generated
+broken Python snippets: repeated keyword arguments, missing `fasttext`, invalid
+`from fasttext.train_supervised import ...`, undefined `test_df`, and a
+`subprocess` use before import. This narrows the next method requirement: for
+`train-fasttext`, active correction must supervise the full runnable Python
+program and fastText API shape, not only dependency recovery and output-path
+tokens. The likely next backend candidate should use compact script-file targets
+or a prevalidated command template with failure-state corrections, rather than
+asking the adapter to synthesize large Python programs from sparse sequence
+examples.
+
 Evaluate baseline local Qwen and adapter local Qwen against the same subset:
 
 ```sh
