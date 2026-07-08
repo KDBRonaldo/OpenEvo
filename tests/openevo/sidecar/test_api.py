@@ -5,6 +5,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Event
+from typing import cast
 from zipfile import ZipFile
 
 from fastapi.testclient import TestClient
@@ -69,6 +70,100 @@ def test_sidecar_exposes_methods_alias() -> None:
     assert set(payload) == {"methods"}
     method_ids = {item["method_id"] for item in payload["methods"]}
     assert "text_memory_reflector" in method_ids
+
+
+def assert_desktop_science_payload(payload: dict[str, object]) -> None:
+    execution = payload["execution"]
+    assert isinstance(execution, dict)
+    execution_payload = cast(dict[str, object], execution)
+    assert execution_payload["mode"] in {
+        "codex_subscription_transcript",
+        "self-deployed",
+    }
+    assert "token_metrics_available" in execution_payload
+    diagnostics = payload.get("diagnostics", {})
+    assert isinstance(diagnostics, dict)
+    assert "capabilities" not in diagnostics
+
+
+def test_desktop_science_smoke_exercises_ordinary_user_route_set(
+    tmp_path: Path,
+) -> None:
+    transport = _ArtifactContentTransport(
+        _sample_run_summary_with_artifact_content(),
+        "# Learned Memory\n\n- Prefer stable folds.\n",
+        artifact_metadata={
+            "artifact-text-memory": _artifact_metadata(
+                artifact_id="artifact-text-memory",
+                artifact_type="text_memory",
+                uri="file:///remote/run/artifacts/text_memory/artifact-text-memory",
+                manifest={"content_path": "memory.md"},
+            ),
+        },
+        content_root="/remote/run/artifacts/text_memory/artifact-text-memory",
+        content_relative_path="memory.md",
+    )
+    client = TestClient(
+        create_sidecar_app(
+            config_root=tmp_path,
+            transport_factory=lambda _profile: transport,
+        )
+    )
+    token = _sidecar_token(client)
+    headers = {"X-OpenEvo-Sidecar-Token": token}
+
+    capabilities = client.get("/openevo-api/desktop/capabilities")
+    methods = client.get("/openevo-api/desktop/methods")
+    shell = client.get("/openevo-api/desktop/shell")
+    project_config = client.post(
+        "/openevo-api/desktop/project-config",
+        headers=headers,
+        json=_desktop_config_draft_payload(),
+    )
+    project_configs = client.get("/openevo-api/desktop/project-configs")
+    workspace = client.post("/openevo-api/desktop/workspace", headers=headers)
+    bootstrap = client.post("/openevo-api/desktop/bootstrap", headers=headers)
+    services = client.post("/openevo-api/desktop/services", headers=headers)
+    services_status = client.get(
+        "/openevo-api/desktop/services/status",
+        headers=headers,
+    )
+    launch = client.post("/openevo-api/desktop/run", headers=headers)
+    terminal = _wait_latest_run_state(client, headers, "succeeded")
+    artifacts = client.get("/openevo-api/desktop/run/artifacts", headers=headers)
+    content = client.get(
+        "/openevo-api/desktop/artifacts/artifact-text-memory/content",
+        headers=headers,
+    )
+
+    for response in (
+        capabilities,
+        methods,
+        shell,
+        project_config,
+        project_configs,
+        workspace,
+        bootstrap,
+        services,
+        services_status,
+        launch,
+        artifacts,
+        content,
+    ):
+        assert response.status_code == 200
+    assert_desktop_science_payload(cast(dict[str, object], shell.json()))
+    assert_desktop_science_payload(
+        cast(dict[str, object], project_config.json()["status"])
+    )
+    assert {item["method_id"] for item in methods.json()["methods"]} >= {
+        "text_memory_reflector",
+        "skill_bundle_reflector",
+        "agent_system_reflector",
+    }
+    assert services_status.json()["ready"] is True
+    assert artifacts.json()["run_id"] == launch.json()["run"]["id"]
+    assert terminal["run"]["ready"] is True
+    assert content.json()["content"].startswith("# Learned Memory")
 
 
 def test_desktop_shell_endpoint_preserves_subscription_readiness() -> None:
@@ -3048,6 +3143,20 @@ class _ArtifactContentTransport(_RunArtifactsTransport):
                 cwd=cwd,
                 env=env,
                 timeout_seconds=timeout_seconds,
+            )
+        if "json.dumps" in command and "pid_path =" in command:
+            self.commands.append(command)
+            self.run_calls.append((command, cwd, timeout_seconds))
+            return RemoteCommandResult(
+                command=command,
+                return_code=0,
+                stdout=json.dumps(
+                    {
+                        "pid_exists": True,
+                        "pid": 120,
+                        "alive": True,
+                    }
+                ),
             )
         if "/v1/artifacts/" in command:
             self.commands.append(command)

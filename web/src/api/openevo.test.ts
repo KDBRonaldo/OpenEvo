@@ -582,6 +582,136 @@ describe("OpenEvo sidecar client", () => {
     );
   });
 
+  it("exercises the ordinary-user desktop API route set with sidecar token preservation", async () => {
+    const calls: Array<{ path: string; headers: Headers; method: string }> = [];
+    const shellPayload = sidecarShellPayload("smoke-token");
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const path = String(input);
+      const method = init?.method ?? "GET";
+      calls.push({
+        path,
+        headers: new Headers(init?.headers),
+        method,
+      });
+      if (path === "/openevo-api/desktop/capabilities") {
+        return jsonResponse({
+          execution_modes: [],
+          artifact_targets: [
+            {
+              artifact_type: "text_memory",
+              display_name: "Text Memory",
+              visible_in_desktop: true,
+              stability_level: "stable",
+            },
+          ],
+          evolution_methods: [
+            {
+              method_id: "text_memory_reflector",
+              display_name: "Text memory",
+              artifact_type: "text_memory",
+              supported_execution_modes: [
+                "codex_subscription_transcript",
+                "self-deployed",
+              ],
+              visible_in_desktop: true,
+              stability_level: "stable",
+            },
+          ],
+        });
+      }
+      if (path === "/openevo-api/desktop/shell") {
+        return jsonResponse(shellPayload);
+      }
+      if (path === "/openevo-api/desktop/project-config") {
+        return jsonResponse({
+          config: {
+            science_config_path:
+              "/home/alice/.openevo/desktop/projects/protein/science.yaml",
+            remote_profile_path:
+              "/home/alice/.openevo/desktop/profiles/science-team.yaml",
+          },
+          status: shellPayload,
+        });
+      }
+      if (path === "/openevo-api/desktop/workspace") {
+        return jsonResponse({
+          workspace: { ready: true },
+          report: { ready: true },
+          status: shellPayload,
+        });
+      }
+      if (path === "/openevo-api/desktop/bootstrap") {
+        return jsonResponse({
+          bootstrap: shellPayload.bootstrap,
+          report: { ready: true },
+          status: shellPayload,
+        });
+      }
+      if (path === "/openevo-api/desktop/services") {
+        return jsonResponse({
+          services: { ready: true },
+          report: { ready: true },
+          status: shellPayload,
+        });
+      }
+      if (path === "/openevo-api/desktop/run") {
+        return jsonResponse({
+          run: sidecarRunReport({
+            state: method === "GET" ? "succeeded" : "running",
+          }),
+          status: shellPayload,
+        });
+      }
+      if (path === "/openevo-api/desktop/run/artifacts") {
+        return jsonResponse(sidecarRunArtifactsPayload());
+      }
+      if (path === "/openevo-api/desktop/artifacts/artifact-text-memory/content") {
+        return jsonResponse({
+          artifact_id: "artifact-text-memory",
+          artifact_type: "text_memory",
+          filename: "memory.md",
+          content: "# Learned Memory\n\n- Prefer stable folds.\n",
+          mime_type: "text/markdown",
+        });
+      }
+      return new Response("not found", { status: 404 });
+    });
+
+    const capabilities = await fetchOpenEvoDesktopCapabilities();
+    await fetchOpenEvoDesktopShellModel();
+    await saveOpenEvoProjectConfig(projectConfigDraft());
+    await runOpenEvoWorkspaceSync();
+    await runOpenEvoBootstrap();
+    await runOpenEvoServices();
+    await runOpenEvoStartRun();
+    await pollOpenEvoRunStatus();
+    const artifacts = await fetchOpenEvoRunArtifacts();
+    const content = await fetchOpenEvoArtifactContent("artifact-text-memory");
+
+    expect(capabilities.evolutionMethods[0]?.methodId).toBe(
+      "text_memory_reflector",
+    );
+    expect(artifacts.tasks[0]?.rounds[0]?.artifactIds.text_memory).toEqual([
+      "artifact-text-memory",
+    ]);
+    expect(content.content).toContain("Prefer stable folds");
+    expect(calls.map((call) => `${call.method} ${call.path}`)).toEqual([
+      "GET /openevo-api/desktop/capabilities",
+      "GET /openevo-api/desktop/shell",
+      "POST /openevo-api/desktop/project-config",
+      "POST /openevo-api/desktop/workspace",
+      "POST /openevo-api/desktop/bootstrap",
+      "POST /openevo-api/desktop/services",
+      "POST /openevo-api/desktop/run",
+      "GET /openevo-api/desktop/run",
+      "GET /openevo-api/desktop/run/artifacts",
+      "GET /openevo-api/desktop/artifacts/artifact-text-memory/content",
+    ]);
+    for (const call of calls.slice(2)) {
+      expect(call.headers.get("X-OpenEvo-Sidecar-Token")).toBe("smoke-token");
+    }
+  });
+
   it("sends the sidecar mutation token on project config requests", async () => {
     const calls: Array<{ path: string; headers: Headers; body: any }> = [];
     const shellPayload = sidecarShellPayload("config-token");

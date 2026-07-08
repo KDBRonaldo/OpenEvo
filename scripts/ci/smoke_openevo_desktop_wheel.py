@@ -104,6 +104,18 @@ class _LifecycleSmokeTransport:
             )
         if "openevo --help" in command:
             return RemoteCommandResult(command=command, return_code=0, stdout="help")
+        if "json.dumps" in command and "pid_path =" in command:
+            return RemoteCommandResult(
+                command=command,
+                return_code=0,
+                stdout=json.dumps(
+                    {
+                        "pid_exists": True,
+                        "pid": 120,
+                        "alive": True,
+                    }
+                ),
+            )
         if command.startswith('PATH="$HOME/.local/bin:$PATH" openevo run '):
             return RemoteCommandResult(command=command, return_code=0, stdout="ok")
         if "summary.json" in command:
@@ -111,6 +123,28 @@ class _LifecycleSmokeTransport:
                 command=command,
                 return_code=0,
                 stdout=json.dumps(_sample_run_summary()),
+            )
+        if "/v1/artifacts/artifact-text-memory" in command:
+            return RemoteCommandResult(
+                command=command,
+                return_code=0,
+                stdout=json.dumps(_sample_artifact_metadata()),
+            )
+        if "root = Path(" in command and "relative = Path(" in command:
+            expected_root = (
+                "root = Path('/remote/run/artifacts/text_memory/artifact-text-memory')"
+            )
+            expected_relative = "relative = Path('memory.md')"
+            if expected_root not in command or expected_relative not in command:
+                return RemoteCommandResult(
+                    command=command,
+                    return_code=2,
+                    stderr="unexpected artifact content path",
+                )
+            return RemoteCommandResult(
+                command=command,
+                return_code=0,
+                stdout="# Learned Memory\n\n- Prefer stable folds.\n",
             )
         return RemoteCommandResult(command=command, return_code=0, stdout="ok")
 
@@ -153,6 +187,25 @@ def _smoke_packaged_assets(client: TestClient) -> list[str]:
 
 def _smoke_config_backed_lifecycle(client: TestClient) -> None:
     headers = _mutation_headers(client)
+    capabilities = _get_json(client, "/openevo-api/desktop/capabilities")
+    method_ids = {
+        method["method_id"]
+        for method in capabilities["evolution_methods"]
+        if method.get("visible_in_desktop")
+    }
+    if not {
+        "text_memory_reflector",
+        "skill_bundle_reflector",
+        "agent_system_reflector",
+    }.issubset(method_ids):
+        raise SmokeFailure("Desktop capabilities did not expose science methods.")
+
+    methods = _get_json(client, "/openevo-api/desktop/methods")
+    if "text_memory_reflector" not in {
+        method["method_id"] for method in methods["methods"]
+    }:
+        raise SmokeFailure("Desktop methods alias did not expose text memory.")
+
     config = _post_json(
         client,
         "/openevo-api/desktop/project-config",
@@ -178,6 +231,14 @@ def _smoke_config_backed_lifecycle(client: TestClient) -> None:
     if services["services"]["ready"] is not True:
         raise SmokeFailure("Desktop services did not become ready.")
 
+    services_status = _get_json(
+        client,
+        "/openevo-api/desktop/services/status",
+        headers=headers,
+    )
+    if services_status["ready"] is not True:
+        raise SmokeFailure("Desktop services status did not become ready.")
+
     launch = _post_json(client, "/openevo-api/desktop/run", headers=headers)
     run_id = launch["run"]["id"]
     terminal = _wait_latest_run_state(client, headers, "succeeded")
@@ -193,6 +254,14 @@ def _smoke_config_backed_lifecycle(client: TestClient) -> None:
         raise SmokeFailure("Desktop run artifacts response did not match latest run.")
     if artifacts["summary_status"] != "completed" or not artifacts["tasks"]:
         raise SmokeFailure("Desktop run artifacts summary was not parsed.")
+
+    content = _get_json(
+        client,
+        "/openevo-api/desktop/artifacts/artifact-text-memory/content",
+        headers=headers,
+    )
+    if content["content"] != "# Learned Memory\n\n- Prefer stable folds.\n":
+        raise SmokeFailure("Desktop artifact content was not readable.")
 
 
 def _mutation_headers(client: TestClient) -> dict[str, str]:
@@ -309,6 +378,22 @@ def _sample_run_summary() -> dict[str, Any]:
                 ],
             }
         ],
+    }
+
+
+def _sample_artifact_metadata() -> dict[str, Any]:
+    return {
+        "artifact_id": "artifact-text-memory",
+        "type": "text_memory",
+        "name": "artifact-text-memory",
+        "version": 1,
+        "state": "ready",
+        "uri": "file:///remote/run/artifacts/text_memory/artifact-text-memory",
+        "manifest": {"content_path": "memory.md"},
+        "compatibility": {},
+        "scores": {},
+        "tags": [],
+        "promoted": False,
     }
 
 

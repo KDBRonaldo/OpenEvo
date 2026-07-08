@@ -67,7 +67,7 @@ jobs:
         run: |
           python scripts/ci/check_openevo_release.py --wheel dist/*.whl
 
-      - name: Install wheel and smoke OpenEvo CLI
+      - name: Install wheel and smoke OpenEvo CLI and Desktop API
         run: |
           python -m venv .openevo-wheel-smoke
           .openevo-wheel-smoke/bin/python -m pip install --upgrade pip
