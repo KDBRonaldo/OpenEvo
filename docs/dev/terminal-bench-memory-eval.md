@@ -1909,6 +1909,41 @@ shell/Python target and broke tool-call closure. The next `train-fasttext`
 backend candidate should prefer shorter staged targets plus explicit tool-schema
 lock/correction records over another single-command adapter.
 
+A key-sequence follow-up tested that shorter staged direction with a full
+3600-second timeout target. The dry run at
+`/tmp/tb21-task-local-parametric-trainfasttext-sequence3600-20260708/dryrun-keysequence3600-schema8`
+exported 48 SFT records: 23 live-replay sequence records selected from the
+successful Codex trajectory's key commands and 25 direct solver tool-schema-lock
+records. The sequence targets started with `apt-get update`, `apt-get install
+-y g++`, `python -m pip install fasttext`, data conversion, intermediate
+tuning, final normalized training, and final raw training with
+`final_model_size_bytes`; all sequence targets supervised
+`timeout_seconds=3600`. Training at
+`/tmp/tb21-task-local-parametric-trainfasttext-sequence3600-20260708/train-keysequence3600-schema8-r8-s140`
+used `Qwen/Qwen3.5-9B`, LoRA rank 8, alpha 16, `max_length=4096`, and 140
+steps on GPU 7. It registered adapter
+`tb-parametric-memory-train-fasttext-keysequence3600-schema8-r8-s140`;
+diagnostics recorded 48 records, 140 trained steps, and a final loss tail around
+`4.5e-6`.
+
+The paired eval at
+`/tmp/tb21-task-local-parametric-trainfasttext-sequence3600-20260708/eval-keysequence3600-schema8-r8-s140-pass1`
+completed cleanly with only `parametric_memory` enabled in the treatment.
+Baseline pass@1/pass@k was `0/1`, parametric-memory pass@1/pass@k was `0/1`,
+and delta was `0`. The adapter was served through managed vLLM on GPU 7 with
+the `qwen3_5_vllm_language_model` key rewrite. The treatment produced 26
+`tb_exec` calls; 25 carried `timeout_seconds=3600`, so the timeout supervision
+mostly held. One early malformed call missed the timeout and contained an
+unfinished `pd.read_parquet("data/train-00...` command followed by `</think>`,
+but the run recovered into valid tool calls. It installed dependencies and
+eventually issued two fastText training commands that saved relative
+`model.bin`, but it never emitted the intended `/app/model.bin` plus
+`final_model_size_bytes` target and ended with `subagent budget_exceeded` after
+27 tool calls and no artifact. This makes the next method requirement more
+specific: staged targets are less brittle than one very long command, but the
+dataset still needs stronger ordering/path anchoring and final-answer boundary
+supervision for the official `/app/model.bin` artifact.
+
 Evaluate baseline local Qwen and adapter local Qwen against the same subset:
 
 ```sh
