@@ -302,7 +302,10 @@ project `openevo`, repository `CompLifeLab-ZJU/OpenEvo`, workflow
 `.github/workflows/openevo-publish-pypi.yml`, and environment `pypi`.
 
 Before publishing a wheel, run the release smoke flow on Node 22, refresh the
-packaged Desktop assets, and validate the installed wheel:
+packaged Desktop assets, and validate the installed wheel. The installed-wheel
+smoke serves `/openevo` from package data and exercises the config-backed Desktop lifecycle
+in dry-run mode, including project config save, workspace, bootstrap, services,
+run launch, and artifact summary parsing:
 
 ```bash
 cd web
