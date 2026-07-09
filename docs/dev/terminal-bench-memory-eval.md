@@ -2234,3 +2234,53 @@ as a configuration error; without this rewrite, vLLM can expose the adapter
 model id while the generated logits remain unchanged. The older
 `qwen3_5_moe_vllm_language_model` spelling is still accepted as a compatibility
 alias for existing scripts and summaries.
+
+## Local-Success Replay Parametric Memory
+
+`terminal-bench-local-success-replay-parametric-memory-job` builds a
+`parametric_memory_lora_sft` job from successful local Harbor
+`llm_calls.jsonl` rows. This path is opt-in and does not replace the
+failed-prefix task-local corrective builder.
+
+Use this path only with local/proxy inference. Textual memory works across
+capture modes, but `parametric_memory` evaluation must use a local serving
+backend that can load the LoRA adapter. Subscription harnesses are not valid for
+this eval path.
+
+The first controlled v2b run uses the successful local Qwen train-fasttext
+trial:
+
+```bash
+python -m polar_evolution.cli terminal-bench-local-success-replay-parametric-memory-job \
+  --success-trial-dir /tmp/tb21-task-local-parametric-trainfasttext-oneshot-20260709/eval-oneshot-r8-s260-pass2-cacheenv/treatment/trials/train-fasttext__7GGAsRu \
+  --task-id train-fasttext \
+  --output-root /tmp/tb21-local-success-replay-trainfasttext-20260709/train-replay-r8-s260 \
+  --dataset-name tb21-local-success-replay-train-fasttext \
+  --base-model Qwen/Qwen3.5-9B \
+  --adapter-id tb-parametric-memory-train-fasttext-replay-r8-s260 \
+  --trainer-command /root/evolab-vllm/bin/python \
+  --trainer-arg /root/.config/superpowers/worktrees/ProRL-Agent-Server/openevo-memory-backends/scripts/qwen_lora_sft.py \
+  --trainer-arg --train-file \
+  --trainer-arg '{training_dataset}' \
+  --trainer-arg --output-dir \
+  --trainer-arg '{adapter_dir}' \
+  --trainer-arg --model-name \
+  --trainer-arg Qwen/Qwen3.5-9B \
+  --trainer-arg --max-steps \
+  --trainer-arg 260 \
+  --trainer-arg --lora-r \
+  --trainer-arg 8 \
+  --trainer-arg --lora-alpha \
+  --trainer-arg 16 \
+  --trainer-arg --max-length \
+  --trainer-arg 4096 \
+  --require-tool-name tb_exec \
+  --max-records 16 \
+  --max-records-per-trial 16 \
+  --output /tmp/tb21-local-success-replay-trainfasttext-20260709/train-replay-r8-s260/job.json
+```
+
+During paired eval, enable only `parametric_memory`; keep `text_memory`,
+`skill_bundle`, and `agent_system` disabled. Set
+`EVOLAB_TB_UV_CACHE_TARBALL` and `EVOLAB_TB_UV_PYTHON_TARBALL`, and do not pass
+`--verifier-python-install-mirror` for this host's cached verifier path.
