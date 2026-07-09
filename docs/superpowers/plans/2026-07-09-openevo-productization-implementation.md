@@ -137,7 +137,7 @@ for the productization workflow without committing any known-failing tests to
 - Create: `scripts/ci/audit_openevo_identity.py`
 - Create: `tests/ci/test_openevo_productization_workflow.py`
 - Create: `docs/maintainer/productization-inventory.md`
-- Modify: no production code in this task
+- Modify: `.gitignore`
 
 - [ ] **Step 1: Create identity inventory script**
 
@@ -147,22 +147,12 @@ Create `scripts/ci/audit_openevo_identity.py`:
 from __future__ import annotations
 
 import json
-import os
+import subprocess
 import sys
 from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_IGNORES = {
-    ".git",
-    ".venv",
-    "node_modules",
-    "__pycache__",
-    ".pytest_cache",
-    ".ruff_cache",
-    "dist",
-    "build",
-}
 TEXT_SUFFIXES = {
     ".md",
     ".py",
@@ -186,14 +176,21 @@ MARKERS = (
 
 
 def _tracked_text_files() -> list[Path]:
+    result = subprocess.run(
+        ["git", "ls-files", "-z"],
+        check=True,
+        cwd=REPO_ROOT,
+        stdout=subprocess.PIPE,
+    )
     files: list[Path] = []
-    for path in REPO_ROOT.rglob("*"):
+    for raw_path in result.stdout.decode().split("\0"):
+        if not raw_path:
+            continue
+        path = REPO_ROOT / raw_path
         if not path.is_file() or path.suffix not in TEXT_SUFFIXES:
             continue
-        if any(part in DEFAULT_IGNORES for part in path.parts):
-            continue
         files.append(path)
-    return files
+    return sorted(files)
 
 
 def audit() -> dict[str, object]:
@@ -204,6 +201,7 @@ def audit() -> dict[str, object]:
         for marker in MARKERS:
             if marker in text:
                 matches.append({"path": str(relative), "marker": marker})
+    matches.sort(key=lambda match: (match["path"], match["marker"]))
     return {
         "src_polar_exists": (REPO_ROOT / "src" / "polar").exists(),
         "src_polar_evolution_exists": (REPO_ROOT / "src" / "polar_evolution").exists(),
@@ -216,7 +214,7 @@ def audit() -> dict[str, object]:
 def main() -> int:
     report = audit()
     json.dump(report, sys.stdout, indent=2, sort_keys=True)
-    sys.stdout.write(os.linesep)
+    sys.stdout.write("\n")
     return 0
 
 
@@ -231,6 +229,7 @@ Create `tests/ci/test_openevo_productization_workflow.py`:
 ```python
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 
@@ -238,12 +237,21 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 PLAN = REPO_ROOT / "docs" / "superpowers" / "plans" / "2026-07-09-openevo-productization-implementation.md"
 
 
+def _bash_blocks(text: str) -> str:
+    return "\n".join(re.findall(r"```bash\n(.*?)\n```", text, flags=re.DOTALL))
+
+
 def test_plan_uses_phase_branch_pr_workflow() -> None:
     text = PLAN.read_text(encoding="utf-8")
-    assert "git push openevo " + "stable" not in text
-    assert "gh pr create" in text
-    assert "--base stable" in text
-    assert "Part of #121" in text
+    bash = _bash_blocks(text)
+    assert "git push openevo " + "stable" not in bash
+    assert "git push -u openevo HEAD" in bash
+    pr_commands = re.findall(
+        r'gh pr create --base stable --head "\$\(git branch --show-current\)"',
+        bash,
+    )
+    assert len(pr_commands) >= 9
+    assert "Part of #121" in bash
 
 
 def test_plan_does_not_commit_known_failing_tests() -> None:
@@ -274,7 +282,7 @@ migration can be audited without committing known-failing tests to `stable`.
 Run:
 
 ```bash
-python scripts/ci/audit_openevo_identity.py
+python3 scripts/ci/audit_openevo_identity.py
 ```
 
 The migration is complete only after the final identity guard in Task 9 passes
@@ -286,7 +294,7 @@ without an allowlist for public Polar runtime identity.
 Run:
 
 ```bash
-python scripts/ci/audit_openevo_identity.py
+python3 scripts/ci/audit_openevo_identity.py
 pytest tests/ci/test_openevo_productization_workflow.py -q
 ```
 
@@ -300,7 +308,7 @@ Run:
 git status --short
 git diff --check
 git diff
-git add scripts/ci/audit_openevo_identity.py tests/ci/test_openevo_productization_workflow.py docs/maintainer/productization-inventory.md
+git add .gitignore scripts/ci/audit_openevo_identity.py tests/ci/test_openevo_productization_workflow.py docs/maintainer/productization-inventory.md
 git diff --cached --stat
 git commit -m "test: add openevo productization inventory guards"
 git push -u openevo HEAD
@@ -310,7 +318,7 @@ Docs updated:
 - docs/maintainer/productization-inventory.md
 
 Tests run:
-- python scripts/ci/audit_openevo_identity.py
+- python3 scripts/ci/audit_openevo_identity.py
 - pytest tests/ci/test_openevo_productization_workflow.py -q"
 ```
 
@@ -2172,7 +2180,7 @@ removed.
 Run:
 
 ```bash
-python scripts/ci/audit_openevo_identity.py
+python3 scripts/ci/audit_openevo_identity.py
 pytest tests/ci/test_openevo_productization_workflow.py -q
 rg -n "Polar|polar" README.md AGENTS.md docs examples .github scripts
 ```
@@ -2198,7 +2206,7 @@ Docs updated:
 - docs/maintainer/
 
 Tests run:
-- python scripts/ci/audit_openevo_identity.py
+- python3 scripts/ci/audit_openevo_identity.py
 - pytest tests/ci/test_openevo_productization_workflow.py -q
 - rg -n \"Polar|polar\" README.md AGENTS.md docs examples .github scripts"
 ```

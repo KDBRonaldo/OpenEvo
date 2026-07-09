@@ -123,6 +123,8 @@ docs/*
 !docs/architecture/*.md
 !docs/dev/
 !docs/dev/*.md
+!docs/maintainer/
+!docs/maintainer/**
 !docs/report/
 !docs/report/*
 !docs/superpowers/
