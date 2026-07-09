@@ -69,7 +69,7 @@ pull-only because OpenEvo cannot infer their system dependencies.
 data for text evolution and explicitly has no token-level metrics.
 Remote preflight checks that the remote user has `codex` and
 `~/.codex/auth.json`. During each gateway runtime session, that host auth file
-is staged into the container-visible `CODEX_HOME` under `/polar/session`, so the
+is staged into the container-visible `CODEX_HOME` under `/openevo/session`, so the
 user does not need to log in again inside the managed runtime image.
 
 `self-deployed` uses proxy authentication and requires `execution.hf_model`.
@@ -89,7 +89,7 @@ schema yet.
 
 Task `setup_commands` compile to `RuntimeSpec.prepare` exec actions running in
 the experiment workspace. The science compiler first emits a prepare action that
-creates `/polar/session/workspace`, then emits user setup commands. Workspace
+creates `/openevo/session/workspace`, then emits user setup commands. Workspace
 upload is handled by the lower-level experiment compiler before these prepare
 actions run for workspace-backed tasks, so dependency installation and other
 setup steps can read workspace files.

@@ -54,7 +54,7 @@ class OpenHandsSdkHarness(BaseHarness):
 
         # Pass skill roots
         skill_paths = self.effective_skill_paths()
-        if self.env.get("POLAR_SKILLS_DIR"):
+        if self.env.get("OPENEVO_SKILLS_DIR"):
             skill_paths = list(reversed(skill_paths))
         if skill_paths:
             env["SKILL_PATHS"] = ":".join(skill_paths)

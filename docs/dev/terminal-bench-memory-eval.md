@@ -30,7 +30,7 @@ It works for both transcript-only subscription runs and proxy/local inference
 runs. To isolate memory evolution, enable only `text_memory`:
 
 ```sh
-uv run polar-evolution terminal-bench-per-task-evolution \
+uv run python -m openevo.evolution.cli terminal-bench-per-task-evolution \
   --task-root /root/datasets/terminal-bench-2-1/tasks \
   --task-id <task-id> \
   --baseline-root /tmp/tb21-baseline/jobs \
@@ -384,7 +384,7 @@ keep the same complete `tb_exec` target and record
 
 ```sh
 OPEN_EVO_REPO=/path/to/OpenEvo
-uv run polar-evolution terminal-bench-task-local-parametric-memory-job \
+uv run python -m openevo.evolution.cli terminal-bench-task-local-parametric-memory-job \
   --trajectory-pool /home/jyw/openevo-skill-rl-experiments/pools/tb21-current-20260702/trajectory_pool.jsonl \
   --task-id train-fasttext \
   --output-root /tmp/tb21-task-local-parametric/train-fasttext \
@@ -503,7 +503,7 @@ run the local worker once:
 
 ```sh
 OPEN_EVO_REPO=/path/to/OpenEvo
-uv run polar-evolution terminal-bench-parametric-memory-job \
+uv run python -m openevo.evolution.cli terminal-bench-parametric-memory-job \
   --input /tmp/tb21-text-memory-train-fasttext-20260701-073824/run/tasks/train-fasttext/r1/harbor_jobs/train-fasttext-r1/train-fasttext__attempt1 \
   --input /tmp/tb21-text-memory-query-optimize-20260701-021002/run/tasks/query-optimize/r1/harbor_jobs/query-optimize-r1/query-optimize__attempt1 \
   --input /tmp/tb21-text-memory-mips-interpreter-20260701-040524/run/tasks/make-mips-interpreter/r1/harbor_jobs/make-mips-interpreter-r1/make-mips-interpreter__attempt2 \
@@ -534,7 +534,7 @@ avoid embedding protected task answers in docs or reusable configs:
 
 ```sh
 OPEN_EVO_REPO=/path/to/OpenEvo
-uv run polar-evolution terminal-bench-parametric-memory-job \
+uv run python -m openevo.evolution.cli terminal-bench-parametric-memory-job \
   --input /tmp/tb21-parametric-memory-password-toolpolicy-20260702-110343/local-eval-password-toolpolicy-2048/baseline/harbor_jobs/baseline-password-recovery/password-recovery__AzMbthq \
   --db /tmp/tb21-parametric-memory-corrective/evolution.db \
   --artifact-root /tmp/tb21-parametric-memory-corrective/artifacts \
@@ -561,7 +561,7 @@ The equivalent first-class recipe form is less error-prone for the
 
 ```sh
 OPEN_EVO_REPO=/path/to/OpenEvo
-uv run polar-evolution terminal-bench-parametric-memory-job \
+uv run python -m openevo.evolution.cli terminal-bench-parametric-memory-job \
   --input /tmp/tb21-parametric-memory-password-toolpolicy-20260702-110343/local-eval-password-toolpolicy-2048/baseline/harbor_jobs/baseline-password-recovery/password-recovery__AzMbthq \
   --db /tmp/tb21-parametric-memory-corrective/evolution.db \
   --artifact-root /tmp/tb21-parametric-memory-corrective/artifacts \
@@ -1046,7 +1046,7 @@ intended training command is:
 
 ```sh
 CUDA_VISIBLE_DEVICES=<free_gpu> \
-uv run polar-evolution terminal-bench-task-local-parametric-memory-job \
+uv run python -m openevo.evolution.cli terminal-bench-task-local-parametric-memory-job \
   --trajectory-pool /tmp/tb21-task-local-parametric-trainfasttext-tbexec-correction-20260708/combined_local_and_active_pool.jsonl \
   --task-id train-fasttext \
   --output-root /tmp/tb21-task-local-parametric-trainfasttext-tbexec-correction-20260708/train-combined-tb-exec-failure-r8-s120 \
@@ -2132,7 +2132,7 @@ adapter above.
 Evaluate baseline local Qwen and adapter local Qwen against the same subset:
 
 ```sh
-uv run polar-evolution terminal-bench-local-parametric-memory-eval \
+uv run python -m openevo.evolution.cli terminal-bench-local-parametric-memory-eval \
   --task-root /root/datasets/terminal-bench-2-1/tasks \
   --task-id train-fasttext \
   --task-id query-optimize \
@@ -2251,7 +2251,7 @@ The first controlled v2b run uses the successful local Qwen train-fasttext
 trial:
 
 ```bash
-uv run polar-evolution terminal-bench-local-success-replay-parametric-memory-job \
+uv run python -m openevo.evolution.cli terminal-bench-local-success-replay-parametric-memory-job \
   --success-trial-dir /tmp/tb21-task-local-parametric-trainfasttext-oneshot-20260709/eval-oneshot-r8-s260-pass2-cacheenv/parametric_memory/harbor_jobs/parametric_memory-train-fasttext/train-fasttext__7GGAsRu \
   --task-id train-fasttext \
   --output-root /tmp/tb21-local-success-replay-trainfasttext-20260709/train-replay-r8-s260 \

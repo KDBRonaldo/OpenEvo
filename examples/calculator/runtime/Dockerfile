@@ -2,7 +2,7 @@ FROM node:22-bookworm-slim AS node
 
 FROM python:3.12-slim-bookworm
 
-ARG POLAR_CALCULATOR_IMAGE_VERSION=3
+ARG OPENEVO_CALCULATOR_IMAGE_VERSION=3
 
 COPY --from=node /usr/local/ /usr/local/
 
@@ -12,7 +12,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     NPM_CONFIG_UPDATE_NOTIFIER=false \
     PATH=/home/polar/.local/bin:/home/polar/.venv/bin:${PATH}
 
-LABEL io.polar.calculator-image-version="${POLAR_CALCULATOR_IMAGE_VERSION}"
+LABEL io.openevo.calculator-image-version="${OPENEVO_CALCULATOR_IMAGE_VERSION}"
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -28,8 +28,8 @@ RUN apt-get update \
 
 RUN useradd -m -s /bin/bash polar \
     && echo 'polar ALL=(ALL) NOPASSWD:ALL' >> /etc/sudoers \
-    && mkdir -p /polar/session /home/polar/.local /home/polar/.venv \
-    && chown -R polar:polar /polar/session /home/polar
+    && mkdir -p /openevo/session /home/polar/.local /home/polar/.venv \
+    && chown -R polar:polar /openevo/session /home/polar
 
 # Persist PATH for login shells (docker exec bash -lc) via /etc/profile.d/
 RUN echo 'export PATH=/home/polar/.local/bin:/home/polar/.venv/bin:$PATH' \
@@ -37,4 +37,4 @@ RUN echo 'export PATH=/home/polar/.local/bin:/home/polar/.venv/bin:$PATH' \
 
 USER polar
 
-WORKDIR /polar/session
+WORKDIR /openevo/session

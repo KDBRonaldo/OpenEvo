@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ──────────────────────────────────────────────────────────────────────
-# Async GRPO training on SWE-Gym via Polar + Slime (Qwen3.5-4B).
+# Async GRPO training on SWE-Gym via OpenEvo + Slime (Qwen3.5-4B).
 #
 # Qwen3.5-4B is a VLM checkpoint (Qwen3_5ForConditionalGeneration) with
 # hybrid attention (1 full + 3 GatedDeltaNet linear per 4 layers). Text-only
@@ -12,12 +12,12 @@
 #
 # Port layout:
 #   9000        – SGLang router (slime-managed, load-balances engines)
-#   8080        – Polar rollout server (task coordinator)
-#   8100        – Polar gateway node (dispatches agent sessions)
+#   8080        – OpenEvo rollout server (task coordinator)
+#   8100        – OpenEvo gateway node (dispatches agent sessions)
 #   8265        – Ray dashboard
 #
 # Weight sync: native GPU-to-GPU via NCCL every training step.
-# Slime manages SGLang engines; Polar gateway proxies LLM calls to them.
+# Slime manages SGLang engines; OpenEvo gateway proxies LLM calls to them.
 # Dynamic-history: every trace in each agent session becomes one training
 # sample, so gradients learn from *every* turn (not just the last one).
 # ──────────────────────────────────────────────────────────────────────
@@ -116,12 +116,12 @@ fi
 export AGENT_CLI_DIR="${AGENT_CLI_DIR:-${PROJECT_ROOT}/tmp/swegym_agent_cli/opt_node}"
 export APPTAINER_IMAGE_DIR="${APPTAINER_IMAGE_DIR:-${PROJECT_ROOT}/tmp/swegym_apptainer_images}"
 # Prefer apptainer in PATH (HPC modules etc.); fall back to /usr/bin for Ubuntu defaults.
-export POLAR_APPTAINER_BIN="${POLAR_APPTAINER_BIN:-$(command -v apptainer || echo /usr/bin/apptainer)}"
+export OPENEVO_APPTAINER_BIN="${OPENEVO_APPTAINER_BIN:-$(command -v apptainer || echo /usr/bin/apptainer)}"
 SGLANG_ROUTER_PORT="${SGLANG_ROUTER_PORT:-9000}"
 SGLANG_ROUTER_HOST="${SGLANG_ROUTER_HOST:-$(detect_host_ip)}"
 export SGLANG_ROUTER_BASE_URL="${SGLANG_ROUTER_BASE_URL:-http://${SGLANG_ROUTER_HOST}:${SGLANG_ROUTER_PORT}}"
 TOPOLOGY_TEMPLATE="${TOPOLOGY_TEMPLATE:-${SCRIPT_DIR}/topology.yaml}"
-POLAR_CONFIG_TEMPLATE="${POLAR_CONFIG_TEMPLATE:-${SCRIPT_DIR}/polar_config.yaml}"
+OPENEVO_CONFIG_TEMPLATE="${OPENEVO_CONFIG_TEMPLATE:-${SCRIPT_DIR}/polar_config.yaml}"
 TOPOLOGY_PATH="${TOPOLOGY_PATH:-${RUN_DIR}/topology.yaml}"
 CUSTOM_CONFIG_PATH="${CUSTOM_CONFIG_PATH:-${RUN_DIR}/polar_config.yaml}"
 
@@ -131,14 +131,14 @@ command -v envsubst >/dev/null || { echo "ERROR: envsubst not found (install get
 TEMPLATE_VARS='${SGLANG_ROUTER_BASE_URL} ${AGENT_CLI_DIR} ${APPTAINER_IMAGE_DIR}'
 mkdir -p "$(dirname "$TOPOLOGY_PATH")" "$(dirname "$CUSTOM_CONFIG_PATH")"
 envsubst "$TEMPLATE_VARS" < "$TOPOLOGY_TEMPLATE"     > "$TOPOLOGY_PATH"
-envsubst "$TEMPLATE_VARS" < "$POLAR_CONFIG_TEMPLATE" > "$CUSTOM_CONFIG_PATH"
+envsubst "$TEMPLATE_VARS" < "$OPENEVO_CONFIG_TEMPLATE" > "$CUSTOM_CONFIG_PATH"
 
 echo "Using topology: ${TOPOLOGY_PATH}"
-echo "Using Polar config: ${CUSTOM_CONFIG_PATH}"
+echo "Using OpenEvo config: ${CUSTOM_CONFIG_PATH}"
 echo "Using Apptainer image dir: ${APPTAINER_IMAGE_DIR}"
 echo "Using run id: ${RUN_ID}"
 echo "Using save dir: ${SAVE_DIR}"
-echo "Using SGLang router URL for Polar gateway: ${SGLANG_ROUTER_BASE_URL}"
+echo "Using SGLang router URL for OpenEvo gateway: ${SGLANG_ROUTER_BASE_URL}"
 
 # ── Cleanup on exit ────────────────────────────────────────────────
 PIDS=()
@@ -150,18 +150,18 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# ── Step 1: Polar services (runs on host, CPU only) ───────────────
-echo "=== Starting Polar rollout server (:8080) ==="
-polar serve_rollout -c "${TOPOLOGY_PATH}" &
+# ── Step 1: OpenEvo services (runs on host, CPU only) ─────────────
+echo "=== Starting OpenEvo rollout server (:8080) ==="
+"${PYTHON_BIN}" -m openevo.rollout.server --config "${TOPOLOGY_PATH}" &
 PIDS+=($!)
 sleep 2
 
-echo "=== Starting Polar gateway (:8100) ==="
-polar serve_gateway -c "${TOPOLOGY_PATH}" --node-id localhost-node-01 &
+echo "=== Starting OpenEvo gateway (:8100) ==="
+"${PYTHON_BIN}" -m openevo.gateway.server --config "${TOPOLOGY_PATH}" --node-id localhost-node-01 &
 PIDS+=($!)
 sleep 2
 
-curl -sf http://127.0.0.1:8080/health || { echo "Polar rollout server not healthy"; exit 1; }
+curl -sf http://127.0.0.1:8080/health || { echo "OpenEvo rollout server not healthy"; exit 1; }
 
 # ── Step 2: Ray + Slime (manages SGLang engines + training) ───────
 # GPU split — defaults are 2 training + 6 rollout (8x B200 single node).

@@ -102,8 +102,8 @@ def test_build_evolution_session_event():
 
     event = build_evolution_session_event(result)
 
-    assert event["source"] == "polar"
-    assert event["event_type"] == "polar.session_completed"
+    assert event["source"] == "openevo"
+    assert event["event_type"] == "openevo.session_completed"
     assert event["source_event_id"] == "session:ses_1"
     assert event["policy_version"] == "policy_1"
     assert event["rollout_step"] == 4
@@ -223,7 +223,7 @@ async def test_export_evolution_event_sends_built_event_when_enabled():
     await manager._export_evolution_event(_session_result())
 
     assert len(client.exported_events) == 1
-    assert client.exported_events[0]["event_type"] == "polar.session_completed"
+    assert client.exported_events[0]["event_type"] == "openevo.session_completed"
     assert client.exported_events[0]["source_event_id"] == "session:ses_1"
 
 
@@ -508,7 +508,7 @@ async def test_handle_postrun_fail_closed_export_error_skips_delete_and_callback
 class FakeRuntime:
     def __init__(self, *, workdir: str | None = None) -> None:
         self.spec = RuntimeSpec(image="runtime:latest", workdir=workdir)
-        self.runtime_session_dir = "/polar/session"
+        self.runtime_session_dir = "/openevo/session"
         self.uploads: dict[str, str] = {}
         self.exec_commands: list[str] = []
 
@@ -593,28 +593,30 @@ async def test_write_evolution_context_files(tmp_path):
         runtime=runtime,
         context=context,
         host_dir=tmp_path,
-        target_dir="/polar/session/evolution",
+        target_dir="/openevo/session/evolution",
     )
 
     assert (
-        json.loads(runtime.uploads["/polar/session/evolution/context.json"])["context_id"]
+        json.loads(runtime.uploads["/openevo/session/evolution/context.json"])["context_id"]
         == "ctx_1"
     )
-    assert runtime.uploads["/polar/session/evolution/memory.md"] == ("Remember parser precedence.")
-    assert runtime.uploads["/polar/session/evolution/agent_system.md"] == (
+    assert runtime.uploads["/openevo/session/evolution/memory.md"] == ("Remember parser precedence.")
+    assert runtime.uploads["/openevo/session/evolution/agent_system.md"] == (
         "Prefer repository-local conventions."
     )
-    assert runtime.uploads["/polar/session/AGENTS.md"] == ("Prefer repository-local conventions.")
+    assert (tmp_path / ".openevo" / "evolution_upload" / "context.json").is_file()
+    assert not (tmp_path / (".openevo" + ".evolution_upload")).exists()
+    assert runtime.uploads["/openevo/session/AGENTS.md"] == ("Prefer repository-local conventions.")
     assert (
-        json.loads(runtime.uploads["/polar/session/evolution/adapters.json"])["merge_mode"]
+        json.loads(runtime.uploads["/openevo/session/evolution/adapters.json"])["merge_mode"]
         == "reference_only"
     )
-    assert env["POLAR_EVOLUTION_CONTEXT"] == "/polar/session/evolution/context.json"
-    assert env["POLAR_MEMORY_FILE"] == "/polar/session/evolution/memory.md"
-    assert env["POLAR_AGENT_SYSTEM_FILE"] == "/polar/session/evolution/agent_system.md"
-    assert env["POLAR_AGENT_SYSTEM_TARGET"] == "/polar/session/AGENTS.md"
-    assert json.loads(env["POLAR_AGENT_SYSTEM_TARGETS"]) == ["/polar/session/AGENTS.md"]
-    assert env["POLAR_AGENTS_MD"] == "/polar/session/AGENTS.md"
+    assert env["OPENEVO_EVOLUTION_CONTEXT"] == "/openevo/session/evolution/context.json"
+    assert env["OPENEVO_MEMORY_FILE"] == "/openevo/session/evolution/memory.md"
+    assert env["OPENEVO_AGENT_SYSTEM_FILE"] == "/openevo/session/evolution/agent_system.md"
+    assert env["OPENEVO_AGENT_SYSTEM_TARGET"] == "/openevo/session/AGENTS.md"
+    assert json.loads(env["OPENEVO_AGENT_SYSTEM_TARGETS"]) == ["/openevo/session/AGENTS.md"]
+    assert env["OPENEVO_AGENTS_MD"] == "/openevo/session/AGENTS.md"
 
 
 @pytest.mark.asyncio
@@ -634,12 +636,12 @@ async def test_write_evolution_context_files_uses_runtime_workdir_for_agent_syst
         runtime=runtime,
         context=context,
         host_dir=tmp_path,
-        target_dir="/polar/session/evolution",
+        target_dir="/openevo/session/evolution",
     )
 
     assert runtime.uploads["/workspace/repo/AGENTS.md"] == ("Prefer repository-local conventions.")
-    assert env["POLAR_AGENT_SYSTEM_TARGET"] == "/workspace/repo/AGENTS.md"
-    assert env["POLAR_AGENTS_MD"] == "/workspace/repo/AGENTS.md"
+    assert env["OPENEVO_AGENT_SYSTEM_TARGET"] == "/workspace/repo/AGENTS.md"
+    assert env["OPENEVO_AGENTS_MD"] == "/workspace/repo/AGENTS.md"
     assert "mkdir -p /workspace/repo" in runtime.exec_commands
 
 
@@ -660,7 +662,7 @@ async def test_write_evolution_context_files_avoids_bind_mount_same_file(tmp_pat
         runtime=runtime,
         context=context,
         host_dir=tmp_path,
-        target_dir="/polar/session/evolution",
+        target_dir="/openevo/session/evolution",
     )
 
     assert (
@@ -678,12 +680,12 @@ async def test_write_evolution_context_files_avoids_bind_mount_same_file(tmp_pat
         == "reference_only"
     )
     assert (tmp_path / "evolution" / "skills").is_dir()
-    assert env["POLAR_EVOLUTION_CONTEXT"] == "/polar/session/evolution/context.json"
-    assert env["POLAR_AGENT_SYSTEM_TARGET"] == ("/polar/session/.openhands/microagents/repo.md")
-    assert json.loads(env["POLAR_AGENT_SYSTEM_TARGETS"]) == [
-        "/polar/session/.openhands/microagents/repo.md"
+    assert env["OPENEVO_EVOLUTION_CONTEXT"] == "/openevo/session/evolution/context.json"
+    assert env["OPENEVO_AGENT_SYSTEM_TARGET"] == ("/openevo/session/.openhands/microagents/repo.md")
+    assert json.loads(env["OPENEVO_AGENT_SYSTEM_TARGETS"]) == [
+        "/openevo/session/.openhands/microagents/repo.md"
     ]
-    assert "POLAR_AGENTS_MD" not in env
+    assert "OPENEVO_AGENTS_MD" not in env
 
 
 @pytest.mark.asyncio
@@ -703,17 +705,17 @@ async def test_write_evolution_context_files_skips_unsafe_agent_system_target_bu
         runtime=runtime,
         context=context,
         host_dir=tmp_path,
-        target_dir="/polar/session/evolution",
+        target_dir="/openevo/session/evolution",
     )
 
-    assert runtime.uploads["/polar/session/evolution/agent_system.md"] == (
+    assert runtime.uploads["/openevo/session/evolution/agent_system.md"] == (
         "Do not overwrite project config."
     )
-    assert "/polar/session/pyproject.toml" not in runtime.uploads
-    assert env["POLAR_AGENT_SYSTEM_FILE"] == "/polar/session/evolution/agent_system.md"
-    assert "POLAR_AGENT_SYSTEM_TARGET" not in env
-    assert "POLAR_AGENT_SYSTEM_TARGETS" not in env
-    assert "warnings" in json.loads(runtime.uploads["/polar/session/evolution/context.json"])
+    assert "/openevo/session/pyproject.toml" not in runtime.uploads
+    assert env["OPENEVO_AGENT_SYSTEM_FILE"] == "/openevo/session/evolution/agent_system.md"
+    assert "OPENEVO_AGENT_SYSTEM_TARGET" not in env
+    assert "OPENEVO_AGENT_SYSTEM_TARGETS" not in env
+    assert "warnings" in json.loads(runtime.uploads["/openevo/session/evolution/context.json"])
 
 
 @pytest.mark.asyncio
@@ -740,7 +742,7 @@ async def test_write_evolution_context_files_stages_skill_bundle_artifacts(tmp_p
         runtime=runtime,
         context=context,
         host_dir=tmp_path,
-        target_dir="/polar/session/evolution",
+        target_dir="/openevo/session/evolution",
     )
 
     staged_skill = tmp_path / "evolution" / "skills" / "artifact-skill-1"
@@ -778,7 +780,7 @@ async def test_write_evolution_context_files_skips_bad_skill_without_dropping_me
         runtime=runtime,
         context=context,
         host_dir=tmp_path,
-        target_dir="/polar/session/evolution",
+        target_dir="/openevo/session/evolution",
     )
 
     assert (tmp_path / "evolution" / "memory.md").read_text(encoding="utf-8") == (
@@ -836,10 +838,10 @@ async def test_resolve_and_inject_evolution_context_updates_metadata_and_returns
             "metadata": {"policy_version": "v1", "rollout_step": 7, "source": "test"},
         }
     ]
-    assert env["POLAR_EVOLUTION_CONTEXT"] == "/polar/session/evolution/context.json"
-    assert env["POLAR_MEMORY_FILE"] == "/polar/session/evolution/memory.md"
-    assert env["POLAR_SKILLS_DIR"] == "/polar/session/evolution/skills"
-    assert env["POLAR_ADAPTER_MERGE_SPEC"] == "/polar/session/evolution/adapters.json"
+    assert env["OPENEVO_EVOLUTION_CONTEXT"] == "/openevo/session/evolution/context.json"
+    assert env["OPENEVO_MEMORY_FILE"] == "/openevo/session/evolution/memory.md"
+    assert env["OPENEVO_SKILLS_DIR"] == "/openevo/session/evolution/skills"
+    assert env["OPENEVO_ADAPTER_MERGE_SPEC"] == "/openevo/session/evolution/adapters.json"
     assert request.metadata["evolution"] == {
         "context_id": "ctx_1",
         "context_injected": True,
@@ -1031,10 +1033,10 @@ async def test_handle_run_passes_evolution_env_to_runtime_exec(tmp_path, monkeyp
     assert managed.agent_result.status == "completed"
     assert runtime.exec_envs[-1]["EXISTING"] == "1"
     assert (
-        runtime.exec_envs[-1]["POLAR_EVOLUTION_CONTEXT"] == "/polar/session/evolution/context.json"
+        runtime.exec_envs[-1]["OPENEVO_EVOLUTION_CONTEXT"] == "/openevo/session/evolution/context.json"
     )
-    assert runtime.exec_envs[-1]["POLAR_MEMORY_FILE"] == ("/polar/session/evolution/memory.md")
-    assert request.agent.env["POLAR_SKILLS_DIR"] == "/polar/session/evolution/skills"
+    assert runtime.exec_envs[-1]["OPENEVO_MEMORY_FILE"] == ("/openevo/session/evolution/memory.md")
+    assert request.agent.env["OPENEVO_SKILLS_DIR"] == "/openevo/session/evolution/skills"
 
 
 @pytest.mark.asyncio
@@ -1057,7 +1059,7 @@ async def test_handle_run_codex_subscription_auth_mode_unsets_polar_proxy_env(
             harness="codex",
             model_name="gpt-5.5",
             settings={"auth_mode": "subscription", "capture_mode": "transcript"},
-            env={"CODEX_HOME": "/polar/session/preauthenticated-codex"},
+            env={"CODEX_HOME": "/openevo/session/preauthenticated-codex"},
         ),
         metadata={},
     )
@@ -1095,7 +1097,7 @@ async def test_handle_run_codex_subscription_auth_mode_unsets_polar_proxy_env(
     assert "--model gpt-5.5" in command
     assert runtime.exec_envs[-1]["OPENAI_BASE_URL"] == "http://gateway.test/v1"
     assert runtime.exec_envs[-1]["OPENAI_API_KEY"] == "session_1"
-    assert runtime.exec_envs[-1]["CODEX_HOME"] == "/polar/session/preauthenticated-codex"
+    assert runtime.exec_envs[-1]["CODEX_HOME"] == "/openevo/session/preauthenticated-codex"
 
 
 @pytest.mark.asyncio

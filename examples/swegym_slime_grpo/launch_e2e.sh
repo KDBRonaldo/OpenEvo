@@ -38,7 +38,7 @@ AGENT_CLI_DIR="${AGENT_CLI_DIR:-${PROJECT_ROOT}/tmp/swegym_agent_cli/opt_node}"
 APPTAINER_IMAGE_DIR="${APPTAINER_IMAGE_DIR:-${PROJECT_ROOT}/tmp/swegym_apptainer_images}"
 APPTAINER_CACHEDIR="${APPTAINER_CACHEDIR:-${PROJECT_ROOT}/tmp/apptainer_cache}"
 APPTAINER_TMPDIR="${APPTAINER_TMPDIR:-${PROJECT_ROOT}/tmp/apptainer_tmp}"
-POLAR_APPTAINER_BIN="${POLAR_APPTAINER_BIN:-$(command -v apptainer || echo /usr/bin/apptainer)}"
+OPENEVO_APPTAINER_BIN="${OPENEVO_APPTAINER_BIN:-$(command -v apptainer || echo /usr/bin/apptainer)}"
 
 INSTALL_EDITABLE="${INSTALL_EDITABLE:-1}"
 INSTALL_TRAINING_STACK="${INSTALL_TRAINING_STACK:-1}"  # TE + FLA + flash-attn (SM100 only)
@@ -48,7 +48,7 @@ APPLY_SGLANG_PATCH="${APPLY_SGLANG_PATCH:-1}"
 PREPARE_IMAGES="${PREPARE_IMAGES:-1}"
 APPTAINER_PREPARE_JOBS="${APPTAINER_PREPARE_JOBS:-2}"
 CONVERT_WEIGHTS="${CONVERT_WEIGHTS:-auto}"
-export APPTAINER_CACHEDIR APPTAINER_TMPDIR POLAR_APPTAINER_BIN
+export APPTAINER_CACHEDIR APPTAINER_TMPDIR OPENEVO_APPTAINER_BIN
 
 require_cmd() {
     if ! command -v "$1" >/dev/null 2>&1; then
@@ -211,7 +211,7 @@ ensure_training_stack() {
 require_cmd git
 require_cmd "${PYTHON_BIN}"
 require_cmd uv
-require_cmd "${POLAR_APPTAINER_BIN}"
+require_cmd "${OPENEVO_APPTAINER_BIN}"
 require_cmd envsubst  # run.sh uses it to render YAML templates
 
 clone_if_missing "Slime" "${SLIME_REPO}" "${SLIME_REF}" "${SLIME_DIR}"

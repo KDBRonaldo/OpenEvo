@@ -25,7 +25,7 @@ class OpenClawHarness(BaseHarness):
     _CONFIG_PATH = "$HOME/.openclaw/openclaw.json"
     # Placeholder substituted with $OPENAI_BASE_URL at exec time (the gateway
     # env is only present during run steps, not setup), keeping the JSON static.
-    _BASE_URL_PLACEHOLDER = "__POLAR_GATEWAY_BASE_URL__"
+    _BASE_URL_PLACEHOLDER = "__OPENEVO_GATEWAY_BASE_URL__"
 
     async def setup(self, runtime: BaseRuntime) -> None:
         # `setup` creates the baseline config, workspace, and per-agent session

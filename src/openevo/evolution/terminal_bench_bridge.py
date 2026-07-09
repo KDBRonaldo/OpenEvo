@@ -149,7 +149,7 @@ def _build_trial_event(
 
     return EventIngestRequest(
         source="terminal_bench.harbor",
-        event_type="polar.session_completed",
+        event_type="openevo.session_completed",
         source_event_id=f"terminal-bench:{session_id}",
         created_at=_text_or_none(result.get("finished_at")) or _text_or_none(result.get("started_at")),
         task_id=task_id,

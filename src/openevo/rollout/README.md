@@ -61,7 +61,7 @@ against the agent's wall-clock.
   "instruction": "Implement calculator.py and make the tests pass.",
   "num_samples": 8,
   "timeout_seconds": 900,
-  "runtime": {"backend": "docker", "image": "...", "workdir": "/polar/session/workspace", "network": "host"},
+  "runtime": {"backend": "docker", "image": "...", "workdir": "/openevo/session/workspace", "network": "host"},
   "agent": {"harness": "codex", "model_name": "openai/gpt-5.4"},
   "builder": {"strategy": "prefix_merging"},
   "evaluator": {"strategy": "test_on_output", "config": {"test_command": "...", "expected_output_json": {"test_calculator": "PASSED"}}},

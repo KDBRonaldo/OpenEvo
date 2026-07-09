@@ -319,7 +319,7 @@ describe("OpenEvoDesktop", () => {
               id: "rollout",
               status: "pass",
               message: "Rollout server is ready.",
-              command: "polar serve_rollout topology.yaml",
+              command: "python -m openevo.rollout.server --config topology.yaml",
             },
           ],
         },
@@ -388,7 +388,7 @@ describe("OpenEvoDesktop", () => {
             id: "rollout",
             status: "fail",
             message: "Rollout server failed to start.",
-            command: "polar serve_rollout topology.yaml",
+            command: "python -m openevo.rollout.server --config topology.yaml",
             stderr: "rollout failed",
           },
         ],
@@ -411,7 +411,7 @@ describe("OpenEvoDesktop", () => {
       "Fix remote service failure and restart services.",
     );
     expect(document.body.textContent).toContain("rollout");
-    expect(document.body.textContent).toContain("polar serve_rollout topology.yaml");
+    expect(document.body.textContent).toContain("python -m openevo.rollout.server --config topology.yaml");
     expect(document.body.textContent).toContain("rollout failed");
     expect(buttonByText("Start Run").disabled).toBe(true);
     await unmountClient(root);

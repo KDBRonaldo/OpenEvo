@@ -28,7 +28,7 @@ model stochasticity.
 - GEPA performance reference:
   `docs/dev/tb21_failed_tasks_gepa_performance.md`
 - Method implementation:
-  `src/polar_evolution/methods.py::agent_system_gepa_reflector`
+  `src/openevo/evolution/methods.py::agent_system_gepa_reflector`
 
 Useful inspection commands:
 
@@ -48,7 +48,7 @@ find /tmp/tb21-failed-agent-system-gepa-per-task-20260626-160706/tasks/raman-fit
 
 ## How To Read A Record
 
-Each `records.jsonl` line is a `polar.session_completed` event. For these
+Each `records.jsonl` line is a `openevo.session_completed` event. For these
 Terminal Bench runs the useful fields are:
 
 - `reward`: verifier reward, usually `0.0` or `1.0`.

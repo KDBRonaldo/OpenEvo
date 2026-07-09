@@ -70,7 +70,7 @@ async def write_evolution_context_files(
     host_dir: Path,
     target_dir: str,
 ) -> dict[str, str]:
-    evolution_dir = host_dir / ".openevo.evolution_upload"
+    evolution_dir = host_dir / ".openevo/evolution_upload"
     if evolution_dir.exists():
         shutil.rmtree(evolution_dir)
     skills_dir = evolution_dir / "skills"
@@ -86,7 +86,7 @@ async def write_evolution_context_files(
     agent_system_text = _agent_system_rendered_text(context)
     agent_system_env: dict[str, str] = {}
     if agent_system_text:
-        agent_system_env["POLAR_AGENT_SYSTEM_FILE"] = f"{target_dir}/agent_system.md"
+        agent_system_env["OPENEVO_AGENT_SYSTEM_FILE"] = f"{target_dir}/agent_system.md"
         agent_system_env.update(
             await _stage_evolution_agent_system(
                 runtime=runtime,
@@ -121,10 +121,10 @@ async def write_evolution_context_files(
     await runtime.upload_dir(str(skills_dir), f"{target_dir}/skills")
 
     env = {
-        "POLAR_EVOLUTION_CONTEXT": f"{target_dir}/context.json",
-        "POLAR_MEMORY_FILE": f"{target_dir}/memory.md",
-        "POLAR_SKILLS_DIR": f"{target_dir}/skills",
-        "POLAR_ADAPTER_MERGE_SPEC": f"{target_dir}/adapters.json",
+        "OPENEVO_EVOLUTION_CONTEXT": f"{target_dir}/context.json",
+        "OPENEVO_MEMORY_FILE": f"{target_dir}/memory.md",
+        "OPENEVO_SKILLS_DIR": f"{target_dir}/skills",
+        "OPENEVO_ADAPTER_MERGE_SPEC": f"{target_dir}/adapters.json",
     }
     env.update(agent_system_env)
     return env
@@ -204,11 +204,11 @@ async def _stage_evolution_agent_system(
     if not remote_targets:
         return {}
     env = {
-        "POLAR_AGENT_SYSTEM_TARGET": remote_targets[0],
-        "POLAR_AGENT_SYSTEM_TARGETS": json.dumps(remote_targets),
+        "OPENEVO_AGENT_SYSTEM_TARGET": remote_targets[0],
+        "OPENEVO_AGENT_SYSTEM_TARGETS": json.dumps(remote_targets),
     }
     if agents_md_target is not None:
-        env["POLAR_AGENTS_MD"] = agents_md_target
+        env["OPENEVO_AGENTS_MD"] = agents_md_target
     return env
 
 
@@ -223,7 +223,7 @@ def _agent_system_target_root(runtime: BaseRuntime) -> PurePosixPath:
     workdir = getattr(getattr(runtime, "spec", None), "workdir", None)
     if isinstance(workdir, str) and workdir.strip():
         return PurePosixPath(workdir.strip())
-    runtime_session_dir = getattr(runtime, "runtime_session_dir", "/polar/session")
+    runtime_session_dir = getattr(runtime, "runtime_session_dir", "/openevo/session")
     return PurePosixPath(str(runtime_session_dir))
 
 
@@ -300,8 +300,8 @@ def build_evolution_session_event(result: SessionResult) -> dict:
     metadata = dict(result.metadata or {})
     trajectory_metadata = dict(result.trajectory.metadata or {})
     return {
-        "source": "polar",
-        "event_type": "polar.session_completed",
+        "source": "openevo",
+        "event_type": "openevo.session_completed",
         "source_event_id": f"session:{result.session_id}",
         "task_id": result.task_id,
         "session_id": result.session_id,

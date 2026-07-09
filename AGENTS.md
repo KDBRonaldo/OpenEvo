@@ -14,9 +14,9 @@ OpenEvo 是面向真实 agent harness 的 evolution 系统，当前对外产品�
 - **OpenEvo Dev Kit**：面向 OpenEvo 开发者的 CLI、源码、测试、benchmark 和 method
   development 工具。
 
-仓库中仍保留 `POLAR_*` 环境变量、`/polar/session` runtime path 和部分 runtime
-identity 字符串。这些是后续 runtime/data identity 迁移前的实现层命名，不是新的产品边界。
-对外设计和新文档应以 OpenEvo Core、OpenEvo Desktop 和 OpenEvo Dev Kit 为主。
+Runtime/data identity 使用 `OPENEVO_*` 环境变量、`/openevo/session` runtime path、
+`.openevo/evolution` state root 和 `openevo.session_completed` event type。不要在新的
+公开 contract、文档、测试或示例中引入 legacy Polar runtime markers。
 
 OpenEvo Core 的核心目标是把 agent 运行过程稳定地转成可训练、可评估、可演化的数据，并
 把演化后的 memory、skill、agent system 和 parametric memory 注入后续 session。
@@ -95,8 +95,8 @@ session/task events -> dataset artifact -> evolution job -> worker method
 
 Runtime 消费：
 
-- Gateway 写入 `/polar/session/evolution/memory.md`。
-- 设置 `POLAR_MEMORY_FILE`。
+- Gateway 写入 `/openevo/session/evolution/memory.md`。
+- 设置 `OPENEVO_MEMORY_FILE`。
 - 将 rendered memory prepend 到 agent instruction。
 
 ### `skill_bundle`
@@ -117,8 +117,8 @@ Runtime 消费：
 
 Runtime 消费：
 
-- Gateway stage 到 `/polar/session/evolution/skills/`。
-- Copy-based harness 通过 `POLAR_SKILLS_DIR` 加载。
+- Gateway stage 到 `/openevo/session/evolution/skills/`。
+- Copy-based harness 通过 `OPENEVO_SKILLS_DIR` 加载。
 - OpenHands 等 path-based harness 应让 evolution skill path 优先于静态 skill path。
 
 ### `agent_system`
@@ -147,10 +147,10 @@ Runtime 消费：
 
 Runtime 消费：
 
-- Gateway 写入 canonical `/polar/session/evolution/agent_system.md`。
+- Gateway 写入 canonical `/openevo/session/evolution/agent_system.md`。
 - Gateway 尝试写入 runtime workdir 下的 `target_path`。
-- 设置 `POLAR_AGENT_SYSTEM_FILE`、`POLAR_AGENT_SYSTEM_TARGET` 和
-  `POLAR_AGENT_SYSTEM_TARGETS`。
+- 设置 `OPENEVO_AGENT_SYSTEM_FILE`、`OPENEVO_AGENT_SYSTEM_TARGET` 和
+  `OPENEVO_AGENT_SYSTEM_TARGETS`。
 - 将 rendered agent-system text prepend 到 agent instruction。
 
 ### `parametric_memory`

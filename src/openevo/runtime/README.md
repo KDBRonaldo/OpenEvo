@@ -10,18 +10,18 @@ and out, then tear it down.
 - **One `RuntimeSpec` → one container**, shared across the init → run → eval
   stages of a session.
 - The host session directory is **bind-mounted** to a fixed in-container path,
-  `/polar/session` (`RUNTIME_SESSION_DIR`). Uploads/downloads under that path
+  `/openevo/session` (`RUNTIME_SESSION_DIR`). Uploads/downloads under that path
   are plain host-side file copies (fast); paths outside it fall back to
   `docker cp` / `tar` streaming.
 - Commands run in a login shell (`bash -lc`) with working directory
-  `cwd or spec.workdir or /polar/session`.
+  `cwd or spec.workdir or /openevo/session`.
 - The factory verifies the chosen backend actually supports what the spec asks
   for (GPUs, CPU/memory limits, internet-off) before building it.
 
 ## Main files
 
 - `models.py`: `RuntimeSpec`, `PrepareAction`, `ExecInput`, `ExecResult`.
-- `base.py`: the `BaseRuntime` contract, the `/polar/session` path constants, and
+- `base.py`: the `BaseRuntime` contract, the `/openevo/session` path constants, and
   the bind-mount copy helpers.
 - `docker.py`: `DockerRuntime` — the default backend.
 - `apptainer.py`: `ApptainerRuntime` — daemonless, for clusters.
@@ -33,7 +33,7 @@ and out, then tear it down.
 A backend implements `start`, `stop`, `exec`, `upload_file`, `upload_dir`,
 `download_file`, `download_dir` (plus `cancel`), hiding container details from
 harnesses and evaluators. Well-known in-container paths (from `base.py`) are
-`/polar/session` and, under it, `artifacts/`, `logs/`, `logs/agent/`,
+`/openevo/session` and, under it, `artifacts/`, `logs/`, `logs/agent/`,
 `logs/eval/`, and `eval_artifacts/`.
 
 ## Prepare recipe

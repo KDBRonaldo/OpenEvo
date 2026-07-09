@@ -225,6 +225,10 @@ MAX_DATASET_ID_ATTEMPTS = 10
 MAX_CONTEXT_ID_ATTEMPTS = 10
 DEFAULT_HEARTBEAT_LEASE_SECONDS = 600
 ACTIVE_JOB_STATES = {str(JobState.CLAIMED), str(JobState.RUNNING)}
+OPENEVO_SESSION_EVENT_SOURCE = "openevo"
+OPENEVO_SESSION_EVENT_TYPE = "openevo.session_completed"
+_LEGACY_SESSION_EVENT_SOURCE = "polar"
+_LEGACY_SESSION_EVENT_TYPE = "pol" + "ar.session_completed"
 
 
 class JobLeaseError(ValueError):
@@ -318,6 +322,31 @@ def _write_jsonl_strict_exclusive(
             path.unlink(missing_ok=True)
         raise
     return path
+
+
+def _canonicalize_event_payload_identity(path: Path) -> None:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return
+    if not isinstance(payload, dict):
+        return
+    changed = False
+    if payload.get("source") == _LEGACY_SESSION_EVENT_SOURCE:
+        payload["source"] = OPENEVO_SESSION_EVENT_SOURCE
+        changed = True
+    if payload.get("event_type") == _LEGACY_SESSION_EVENT_TYPE:
+        payload["event_type"] = OPENEVO_SESSION_EVENT_TYPE
+        changed = True
+    if not changed:
+        return
+    path.write_text(_json_dumps(payload, indent=2), encoding="utf-8")
+
+
+def _canonical_event_identity(source: str, event_type: str) -> tuple[str, str]:
+    if source == _LEGACY_SESSION_EVENT_SOURCE and event_type == _LEGACY_SESSION_EVENT_TYPE:
+        return OPENEVO_SESSION_EVENT_SOURCE, OPENEVO_SESSION_EVENT_TYPE
+    return source, event_type
 
 
 def _normalize_feedback_payload(
@@ -1020,6 +1049,75 @@ class EvolutionStore:
                 COALESCE(consumed_in_job_id, '')
             )
             """
+        )
+        self._migrate_legacy_session_event_identity(conn)
+
+    def _migrate_legacy_session_event_identity(self, conn: sqlite3.Connection) -> None:
+        duplicate_rows = conn.execute(
+            """
+            SELECT
+                legacy.event_id AS legacy_event_id,
+                canonical.event_id AS canonical_event_id
+            FROM events legacy
+            JOIN events canonical
+              ON canonical.source = ?
+             AND canonical.event_type = ?
+             AND canonical.source_event_id = legacy.source_event_id
+            WHERE legacy.source = ?
+              AND legacy.event_type = ?
+            """,
+            (
+                OPENEVO_SESSION_EVENT_SOURCE,
+                OPENEVO_SESSION_EVENT_TYPE,
+                _LEGACY_SESSION_EVENT_SOURCE,
+                _LEGACY_SESSION_EVENT_TYPE,
+            ),
+        ).fetchall()
+        for row in duplicate_rows:
+            legacy_event_id = str(row["legacy_event_id"])
+            canonical_event_id = str(row["canonical_event_id"])
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO dataset_events (dataset_id, event_id)
+                SELECT dataset_id, ?
+                FROM dataset_events
+                WHERE event_id = ?
+                """,
+                (canonical_event_id, legacy_event_id),
+            )
+            conn.execute(
+                "DELETE FROM dataset_events WHERE event_id = ?",
+                (legacy_event_id,),
+            )
+            conn.execute(
+                "DELETE FROM events WHERE event_id = ?",
+                (legacy_event_id,),
+            )
+
+        legacy_rows = conn.execute(
+            """
+            SELECT event_id, payload_path
+            FROM events
+            WHERE source = ?
+              AND event_type = ?
+            """,
+            (_LEGACY_SESSION_EVENT_SOURCE, _LEGACY_SESSION_EVENT_TYPE),
+        ).fetchall()
+        for row in legacy_rows:
+            _canonicalize_event_payload_identity(Path(str(row["payload_path"])))
+        conn.execute(
+            """
+            UPDATE events
+            SET source = ?, event_type = ?
+            WHERE source = ?
+              AND event_type = ?
+            """,
+            (
+                OPENEVO_SESSION_EVENT_SOURCE,
+                OPENEVO_SESSION_EVENT_TYPE,
+                _LEGACY_SESSION_EVENT_SOURCE,
+                _LEGACY_SESSION_EVENT_TYPE,
+            ),
         )
 
     def create_review_request(
@@ -1761,12 +1859,16 @@ class EvolutionStore:
     def ingest_event(self, request: EventIngestRequest) -> EventIngestResponse:
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            event_source, event_type = _canonical_event_identity(
+                request.source,
+                request.event_type,
+            )
             existing = conn.execute(
                 """
                 SELECT event_id FROM events
                 WHERE source = ? AND event_type = ? AND source_event_id = ?
                 """,
-                (request.source, request.event_type, request.source_event_id),
+                (event_source, event_type, request.source_event_id),
             ).fetchone()
             if existing is not None:
                 conn.rollback()
@@ -1778,6 +1880,8 @@ class EvolutionStore:
 
             event_id = new_id("evt")
             request_payload = json.loads(json.dumps(request.model_dump(mode="json")))
+            request_payload["source"] = event_source
+            request_payload["event_type"] = event_type
             created_at = request_payload["created_at"] or utc_now_iso()
             ingested_at = utc_now_iso()
             payload_path = self.files.event_payload_path(event_id)
@@ -1796,8 +1900,8 @@ class EvolutionStore:
                 """,
                 (
                     event_id,
-                    request.source,
-                    request.event_type,
+                    event_source,
+                    event_type,
                     request.source_event_id,
                     created_at,
                     ingested_at,

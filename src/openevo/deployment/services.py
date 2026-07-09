@@ -1033,7 +1033,7 @@ def _topology_yaml(
             "enabled": True,
             "backend_url": "http://127.0.0.1:8200",
             "context": {
-                "target_dir": "/polar/session/evolution",
+                "target_dir": "/openevo/session/evolution",
                 "timeout_seconds": 10.0,
                 "fail_open": True,
             },

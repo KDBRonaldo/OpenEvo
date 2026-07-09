@@ -11,7 +11,7 @@ from typing import Final
 
 from openevo.runtime.models import ExecResult, RuntimeSpec
 
-RUNTIME_SESSION_DIR: Final[str] = "/polar/session"
+RUNTIME_SESSION_DIR: Final[str] = "/openevo/session"
 RUNTIME_ARTIFACTS_DIR: Final[str] = f"{RUNTIME_SESSION_DIR}/artifacts"
 RUNTIME_LOGS_DIR: Final[str] = f"{RUNTIME_SESSION_DIR}/logs"
 RUNTIME_AGENT_LOG_DIR: Final[str] = f"{RUNTIME_LOGS_DIR}/agent"

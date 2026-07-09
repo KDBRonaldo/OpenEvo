@@ -10,7 +10,7 @@ evolution methods 可以接入 backend。
 uv run python -m openevo.evolution.cli worker \
   --base-url http://127.0.0.1:8200 \
   --worker-id reference-worker \
-  --artifact-root .polar_evolution \
+  --artifact-root .openevo/evolution \
   --once
 ```
 
@@ -672,7 +672,7 @@ python -m openevo.evolution.cli worker
   --capability text_memory_expel_reflector
   --capability parametric_memory_register
   --capability parametric_memory_lora_sft
-  --artifact-root .polar_evolution
+  --artifact-root .openevo/evolution
   --once
   --sleep-seconds 5
   --lease-seconds 600

@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""Submit SWE-bench Verified tasks to the Polar rollout server.
+"""Submit SWE-bench Verified tasks to the OpenEvo rollout server.
 
 Each task runs an agent in a per-instance container and is graded by the
-official `swebench` harness. Tasks are submitted at once; live progress and
-per-session detail are visible in the dashboard
-(`polar dashboard -c examples/swebench_verified/topology.yaml`).
+official `swebench` harness. Tasks are submitted at once; progress is printed
+here and detailed progress is available in the rollout/gateway logs.
 
     uv run python examples/swebench_verified/submit_swebench_tasks.py --harness claude_code --max-tasks 10
     uv run python examples/swebench_verified/submit_swebench_tasks.py --harness codex --max-tasks 50 --num-samples 4
@@ -44,13 +43,13 @@ HARNESS_NPM_PACKAGE: dict[str, str] = {
 
 # INIT stage: install the harness CLI, then stage the repo into the workspace.
 _PREPARE_BASE = (
-    "rm -rf /polar/session/workspace && "
-    "mkdir -p /polar/session/logs/agent /polar/session/workspace \"$HOME/.venv/bin\" && "
-    "cp -a /testbed/. /polar/session/workspace/ && "
+    "rm -rf /openevo/session/workspace && "
+    "mkdir -p /openevo/session/logs/agent /openevo/session/workspace \"$HOME/.venv/bin\" && "
+    "cp -a /testbed/. /openevo/session/workspace/ && "
     "ln -sf /opt/miniconda3/envs/testbed/bin/python \"$HOME/.venv/bin/python\" && "
     "ln -sf /opt/miniconda3/envs/testbed/bin/python \"$HOME/.venv/bin/python3\" && "
     "git config --global core.pager '' && "
-    "cd /polar/session/workspace && git reset --hard; true"
+    "cd /openevo/session/workspace && git reset --hard; true"
 )
 
 
@@ -74,7 +73,7 @@ def evaluator_exclude_patterns_for_harness(harness: str) -> list[str]:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--harness", required=True, choices=SUPPORTED_HARNESSES)
-    parser.add_argument("--topology", default=os.environ.get("POLAR_TOPOLOGY", str(DEFAULT_TOPOLOGY)))
+    parser.add_argument("--topology", default=os.environ.get("OPENEVO_TOPOLOGY", str(DEFAULT_TOPOLOGY)))
     parser.add_argument("--num-samples", type=int, default=1, help="Samples per task (pass@k).")
     parser.add_argument("--max-tasks", type=int, default=-1, help="Maximum tasks to submit. -1 = all 500.")
     parser.add_argument("--instance-id", action="append", default=[])
@@ -131,7 +130,7 @@ def build_task_request(args: argparse.Namespace, instance: dict[str, Any], batch
             "prepare": [{"type": "exec", "command": prepare_command_for_harness(args.harness)}],
             "env": runtime_env_for_harness(args.harness),
             "network": "host",
-            "workdir": "/polar/session/workspace",
+            "workdir": "/openevo/session/workspace",
         },
         "agent": {"harness": args.harness, "model_name": args.model_name},
         "builder": {"strategy": "prefix_merging"},
@@ -139,7 +138,7 @@ def build_task_request(args: argparse.Namespace, instance: dict[str, Any], batch
             "strategy": "swebench_harness",
             "config": {
                 "repo_dir": "/testbed",
-                "patch_command": "cd /polar/session/workspace && git add -A && git diff --cached --binary",
+                "patch_command": "cd /openevo/session/workspace && git add -A && git diff --cached --binary",
                 "instance": instance,
                 "exclude_patterns": evaluator_exclude_patterns_for_harness(args.harness),
             },
@@ -177,7 +176,7 @@ def print_summary(stats: dict[str, tuple[int, int]], elapsed: float) -> None:
     for iid in sorted(stats):
         r1, total = stats[iid]
         print(f"  {iid:<45} {f'{r1}/{total}':>12}")
-    print("\n  Per-session detail: polar dashboard -c examples/swebench_verified/topology.yaml")
+    print("\n  Per-session detail: inspect the rollout and gateway logs.")
 
 
 def main() -> int:
@@ -197,7 +196,7 @@ def main() -> int:
         print(f"Skipping {len(missing)} instance(s) with missing images. Build them with: python build_images.py")
     instances = ready
 
-    from polar.config import TopologyConfig
+    from openevo.config import TopologyConfig
 
     rollout_url = TopologyConfig.load(args.topology).rollout.public_url
     print(f"Submitting {len(instances)} task(s) to {rollout_url} "
@@ -213,7 +212,7 @@ def main() -> int:
             resp.raise_for_status()
             task_ids[iid] = resp.json()["task_id"]
 
-        print(f"Polling every {POLL_INTERVAL_SECONDS:.0f}s (watch live in the dashboard) ...")
+        print(f"Polling every {POLL_INTERVAL_SECONDS:.0f}s ...")
         t0 = time.monotonic()
         stats: dict[str, tuple[int, int]] = {}
         while len(stats) < len(task_ids):

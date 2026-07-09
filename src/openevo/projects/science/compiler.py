@@ -13,7 +13,7 @@ MANAGED_RUNTIME_IMAGES = {
     "python_research": "openevo/python-research-runtime:0.1.0",
 }
 
-_WORKDIR = "/polar/session/workspace"
+_WORKDIR = "/openevo/session/workspace"
 
 
 @dataclass(frozen=True)

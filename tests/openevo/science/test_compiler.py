@@ -43,11 +43,11 @@ def test_subscription_project_compiles_to_transcript_experiment_config() -> None
         "capture_mode": "transcript",
     }
     assert compiled.runtime.image == MANAGED_RUNTIME_IMAGES["managed_science"]
-    assert compiled.runtime.workdir == "/polar/session/workspace"
+    assert compiled.runtime.workdir == "/openevo/session/workspace"
     assert [action.model_dump(mode="json") for action in compiled.runtime.prepare] == [
         {
             "type": "exec",
-            "command": "mkdir -p /polar/session/workspace",
+            "command": "mkdir -p /openevo/session/workspace",
             "cwd": None,
             "env": None,
             "source": None,
@@ -56,7 +56,7 @@ def test_subscription_project_compiles_to_transcript_experiment_config() -> None
         {
             "type": "exec",
             "command": "python -m pip install -e .",
-            "cwd": "/polar/session/workspace",
+            "cwd": "/openevo/session/workspace",
             "env": None,
             "source": None,
             "target": None,
@@ -237,7 +237,7 @@ def test_scratch_source_has_no_workspace_and_keeps_runtime_and_setup_commands() 
     assert [action.model_dump(mode="json") for action in compiled.runtime.prepare] == [
         {
             "type": "exec",
-            "command": "mkdir -p /polar/session/workspace",
+            "command": "mkdir -p /openevo/session/workspace",
             "cwd": None,
             "env": None,
             "source": None,
@@ -246,7 +246,7 @@ def test_scratch_source_has_no_workspace_and_keeps_runtime_and_setup_commands() 
         {
             "type": "exec",
             "command": "python -m pip install numpy",
-            "cwd": "/polar/session/workspace",
+            "cwd": "/openevo/session/workspace",
             "env": None,
             "source": None,
             "target": None,
@@ -264,13 +264,13 @@ def test_experiment_compiler_uploads_workspace_before_science_prepare_actions() 
         {
             "type": "upload_dir",
             "source": "/datasets/folding-baseline",
-            "target": "/polar/session/workspace",
+            "target": "/openevo/session/workspace",
         },
         {
             "type": "exec",
             "source": None,
             "target": None,
-            "command": "mkdir -p /polar/session/workspace",
+            "command": "mkdir -p /openevo/session/workspace",
             "cwd": None,
             "env": None,
         },
@@ -279,7 +279,7 @@ def test_experiment_compiler_uploads_workspace_before_science_prepare_actions() 
             "source": None,
             "target": None,
             "command": "python -m pip install -e .",
-            "cwd": "/polar/session/workspace",
+            "cwd": "/openevo/session/workspace",
             "env": None,
         },
     ]

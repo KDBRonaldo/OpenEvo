@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Run the count-stars demo across every harness and print a comparison table.
 
-Each harness gets the same image at `/polar/session/workspace/polar_stars.png`,
+Each harness gets the same image at `/openevo/session/workspace/polar_stars.png`,
 inspects it, and writes its star count to `answer.txt`. This exercises image
 input through the local vLLM OpenAI-compatible backend. All harnesses are
-submitted at once; per-session detail is visible in the dashboard
-(`polar dashboard -c examples/count_stars/topology.yaml`).
+submitted at once; progress is printed here and detailed progress is available
+in the rollout/gateway logs.
 
     uv run python examples/count_stars/run.py                 # docker (default)
     uv run python examples/count_stars/run.py --backend apptainer
@@ -25,8 +25,8 @@ import httpx
 EXAMPLE_DIR = Path(__file__).resolve().parent
 IMAGE_FILE = EXAMPLE_DIR / "assets" / "polar_stars.png"
 TOPOLOGY = EXAMPLE_DIR / "topology.yaml"
-RUNTIME_IMAGE = "polar-localhost-count-stars:latest"
-RUNTIME_IMAGE_PATH = "/polar/session/workspace/polar_stars.png"
+RUNTIME_IMAGE = "openevo-localhost-count-stars:latest"
+RUNTIME_IMAGE_PATH = "/openevo/session/workspace/polar_stars.png"
 NUM_SAMPLES = 4
 TIMEOUT_SECONDS = 300.0
 POLL_INTERVAL_SECONDS = 10.0
@@ -34,10 +34,10 @@ POLL_INTERVAL_SECONDS = 10.0
 HARNESSES = ("claude_code", "codex", "gemini_cli")
 
 INSTRUCTION = """\
-Use your image viewing tool to inspect `/polar/session/workspace/polar_stars.png`.
+Use your image viewing tool to inspect `/openevo/session/workspace/polar_stars.png`.
 Count the visible stars in that image.
 
-Write the answer as a single integer line to `/polar/session/workspace/answer.txt`.
+Write the answer as a single integer line to `/openevo/session/workspace/answer.txt`.
 Do not write any other text to that file. Stop after writing the file.
 """
 
@@ -57,9 +57,9 @@ HARNESS_MODEL: dict[str, str] = {
 
 # INIT stage: install the harness CLI, then set up a clean git workspace.
 _WORKSPACE_PREPARE = (
-    "rm -rf /polar/session/workspace && "
-    "mkdir -p /polar/session/workspace /polar/session/logs/agent && "
-    "cd /polar/session/workspace && "
+    "rm -rf /openevo/session/workspace && "
+    "mkdir -p /openevo/session/workspace /openevo/session/logs/agent && "
+    "cd /openevo/session/workspace && "
     "git init -q && "
     "git config user.email 'polar@test' && "
     "git config user.name 'Polar'"
@@ -86,7 +86,7 @@ def build_task_payload(harness: str, batch_id: str, backend: str) -> dict[str, A
                 {"type": "upload_file", "source": str(IMAGE_FILE), "target": RUNTIME_IMAGE_PATH},
             ],
             "network": "host",
-            "workdir": "/polar/session/workspace",
+            "workdir": "/openevo/session/workspace",
         },
         "agent": {"harness": harness, "model_name": HARNESS_MODEL[harness]},
         "builder": {"strategy": "prefix_merging"},
@@ -112,7 +112,7 @@ def main() -> int:
     parser.add_argument("--backend", choices=["docker", "apptainer"], default="docker")
     backend = parser.parse_args().backend
 
-    from polar.config import TopologyConfig
+    from openevo.config import TopologyConfig
 
     rollout_url = TopologyConfig.load(TOPOLOGY).rollout.public_url
     batch_id = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
@@ -128,7 +128,7 @@ def main() -> int:
             task_ids[harness] = resp.json()["task_id"]
             print(f"  {harness:<16} -> {task_ids[harness]}")
 
-        print(f"\nPolling every {POLL_INTERVAL_SECONDS:.0f}s (watch live in the dashboard) ...")
+        print(f"\nPolling every {POLL_INTERVAL_SECONDS:.0f}s ...")
         t0 = time.monotonic()
         finished: dict[str, dict[str, Any]] = {}
         while len(finished) < len(HARNESSES):

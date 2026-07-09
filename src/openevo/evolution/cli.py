@@ -65,13 +65,13 @@ def build_parser() -> argparse.ArgumentParser:
     serve = subparsers.add_parser("serve", help="Start the Evolution Backend.")
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=8200)
-    serve.add_argument("--db", default=".openevo.evolution/evolution.db")
-    serve.add_argument("--artifact-root", default=".openevo.evolution")
+    serve.add_argument("--db", default=".openevo/evolution/evolution.db")
+    serve.add_argument("--artifact-root", default=".openevo/evolution")
     worker = subparsers.add_parser("worker", help="Run an Evolution reference worker.")
     worker.add_argument("--base-url", default="http://127.0.0.1:8200")
     worker.add_argument("--worker-id", default="reference-worker")
     worker.add_argument("--capability", action="append", default=[])
-    worker.add_argument("--artifact-root", default=".openevo.evolution")
+    worker.add_argument("--artifact-root", default=".openevo/evolution")
     worker.add_argument("--once", action="store_true")
     worker.add_argument("--sleep-seconds", type=float, default=5.0)
     worker.add_argument("--lease-seconds", type=int, default=600)
@@ -92,8 +92,8 @@ def build_parser() -> argparse.ArgumentParser:
     tb_dataset.add_argument(
         "--input", required=True, help="Terminal Bench trial or job directory."
     )
-    tb_dataset.add_argument("--db", default=".openevo.evolution/evolution.db")
-    tb_dataset.add_argument("--artifact-root", default=".openevo.evolution")
+    tb_dataset.add_argument("--db", default=".openevo/evolution/evolution.db")
+    tb_dataset.add_argument("--artifact-root", default=".openevo/evolution")
     tb_dataset.add_argument("--name", required=True)
     tb_dataset.add_argument("--purpose", default="agent_system_reflection")
     tb_dataset.add_argument("--policy-version")
@@ -112,8 +112,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=[],
         help="Terminal Bench trial or job directory to ingest. Can be repeated.",
     )
-    tb_job.add_argument("--db", default=".openevo.evolution/evolution.db")
-    tb_job.add_argument("--artifact-root", default=".openevo.evolution")
+    tb_job.add_argument("--db", default=".openevo/evolution/evolution.db")
+    tb_job.add_argument("--artifact-root", default=".openevo/evolution")
     tb_job.add_argument(
         "--dataset-artifact-id",
         action="append",
@@ -178,8 +178,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=[],
         help="Terminal Bench trial or job directory to ingest. Can be repeated.",
     )
-    tb_memory_job.add_argument("--db", default=".openevo.evolution/evolution.db")
-    tb_memory_job.add_argument("--artifact-root", default=".openevo.evolution")
+    tb_memory_job.add_argument("--db", default=".openevo/evolution/evolution.db")
+    tb_memory_job.add_argument("--artifact-root", default=".openevo/evolution")
     tb_memory_job.add_argument(
         "--dataset-artifact-id",
         action="append",
@@ -243,8 +243,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=[],
         help="Existing dataset artifact id to use as job input. Can be repeated.",
     )
-    tb_parametric_job.add_argument("--db", default=".openevo.evolution/evolution.db")
-    tb_parametric_job.add_argument("--artifact-root", default=".openevo.evolution")
+    tb_parametric_job.add_argument("--db", default=".openevo/evolution/evolution.db")
+    tb_parametric_job.add_argument("--artifact-root", default=".openevo/evolution")
     tb_parametric_job.add_argument("--dataset-name")
     tb_parametric_job.add_argument("--purpose", default="parametric_memory_lora_sft")
     tb_parametric_job.add_argument("--policy-version")
@@ -1080,7 +1080,7 @@ def main(argv: list[str] | None = None) -> int:
                 name=args.name,
                 purpose=args.purpose,
                 query={
-                    "event_types": ["polar.session_completed"],
+                    "event_types": ["openevo.session_completed"],
                     "status": args.status,
                     "policy_version": args.policy_version,
                 },
@@ -1395,7 +1395,7 @@ def _create_terminal_bench_agent_system_job(args: argparse.Namespace) -> dict[st
                 name=args.dataset_name,
                 purpose=args.purpose,
                 query={
-                    "event_types": ["polar.session_completed"],
+                    "event_types": ["openevo.session_completed"],
                     "status": args.status,
                     "policy_version": args.policy_version,
                 },
@@ -1489,7 +1489,7 @@ def _create_terminal_bench_text_memory_job(args: argparse.Namespace) -> dict[str
                 name=args.dataset_name,
                 purpose=args.purpose,
                 query={
-                    "event_types": ["polar.session_completed"],
+                    "event_types": ["openevo.session_completed"],
                     "status": args.status,
                     "policy_version": args.policy_version,
                 },
@@ -1605,7 +1605,7 @@ def _create_terminal_bench_parametric_memory_job(args: argparse.Namespace) -> di
                 name=args.dataset_name,
                 purpose=args.purpose,
                 query={
-                    "event_types": ["polar.session_completed"],
+                    "event_types": ["openevo.session_completed"],
                     "status": args.status,
                     "policy_version": args.policy_version,
                 },

@@ -181,10 +181,10 @@ def get_state() -> GatewayState:
     global _state
     if _state is None:
         topology_path = _configured_topology_path or os.environ.get(
-            "POLAR_TOPOLOGY",
+            "OPENEVO_TOPOLOGY",
             "topology.yaml",
         )
-        node_id = _configured_node_id or os.environ.get("POLAR_GATEWAY_NODE_ID")
+        node_id = _configured_node_id or os.environ.get("OPENEVO_GATEWAY_NODE_ID")
         _state = _build_state(TopologyConfig.load(topology_path), node_id)
     return _state
 
@@ -872,8 +872,8 @@ def serve(
 
 def main() -> None:
     parser = argparse.ArgumentParser(prog="python -m openevo.gateway.server")
-    parser.add_argument("--config", default=os.environ.get("POLAR_TOPOLOGY", "topology.yaml"))
-    parser.add_argument("--node-id", default=os.environ.get("POLAR_GATEWAY_NODE_ID"))
+    parser.add_argument("--config", default=os.environ.get("OPENEVO_TOPOLOGY", "topology.yaml"))
+    parser.add_argument("--node-id", default=os.environ.get("OPENEVO_GATEWAY_NODE_ID"))
     parser.add_argument("--log-level", default="info")
     args = parser.parse_args()
     serve(args.config, node_id=args.node_id, log_level=args.log_level)

@@ -92,7 +92,7 @@ uv run python -m openevo.evolution.cli terminal-bench-agent-system-job \
 `--method agent_system_history_reflector` 或 `--method agent_system_pareto_reflector`
 可覆盖这个选择。
 
-转换后的 event 使用 `event_type="polar.session_completed"`，其 trajectory 由
+转换后的 event 使用 `event_type="openevo.session_completed"`，其 trajectory 由
 `terminal_bench_transcript_bridge` 构造，metadata 必须包含：
 
 ```json
@@ -382,7 +382,7 @@ Typed feedback contract：
 }
 ```
 
-Gateway 会把选中的 memory 写到 `POLAR_MEMORY_FILE`，并 prepend 到 agent instruction。
+Gateway 会把选中的 memory 写到 `OPENEVO_MEMORY_FILE`，并 prepend 到 agent instruction。
 该路径只依赖 rendered text，因此对 proxy/local inference 和 transcript-only subscription
 harness 都生效。内置 reference worker 提供三条 text-memory 方法：
 
@@ -408,7 +408,7 @@ Agent harness 可加载的 skill 目录。URI 指向目录，目录内通常包�
 }
 ```
 
-Gateway 会 stage 到 `/polar/session/evolution/skills/`，harness 通过 `POLAR_SKILLS_DIR`
+Gateway 会 stage 到 `/openevo/session/evolution/skills/`，harness 通过 `OPENEVO_SKILLS_DIR`
 消费。
 
 ### `agent_system`
@@ -436,8 +436,8 @@ Agent system prompt 或 harness-specific repository instruction 文本。URI 指
 - `.openhands/microagents/*.md`
 
 Backend 和 gateway 都会拒绝空路径、绝对路径、包含 `..` 的路径，以及 allowlist 外路径。
-Gateway 总会把文本写到 `POLAR_AGENT_SYSTEM_FILE`；如果 target path 通过安全检查，也会写到
-runtime workdir 下，并设置 `POLAR_AGENT_SYSTEM_TARGET` / `POLAR_AGENT_SYSTEM_TARGETS`。
+Gateway 总会把文本写到 `OPENEVO_AGENT_SYSTEM_FILE`；如果 target path 通过安全检查，也会写到
+runtime workdir 下，并设置 `OPENEVO_AGENT_SYSTEM_TARGET` / `OPENEVO_AGENT_SYSTEM_TARGETS`。
 
 内置 reference worker 提供四个 agent-system 相关方法：
 

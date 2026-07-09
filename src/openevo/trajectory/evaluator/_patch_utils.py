@@ -26,8 +26,8 @@ from openevo.runtime.models import RuntimeSpec
 from openevo.trajectory.evaluator.base import BaseTrajectoryEvaluator
 from openevo.trajectory.models import EvalResult, Trajectory
 
-APPLY_PATCH_PASS = "__POLAR_APPLY_PATCH_PASS__"
-APPLY_PATCH_FAIL = "__POLAR_APPLY_PATCH_FAIL__"
+APPLY_PATCH_PASS = "__OPENEVO_APPLY_PATCH_PASS__"
+APPLY_PATCH_FAIL = "__OPENEVO_APPLY_PATCH_FAIL__"
 ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*m|\r")
 
 _DEFAULT_EXCLUDE_PATTERNS = (
@@ -265,7 +265,7 @@ class BasePatchEvaluator(BaseTrajectoryEvaluator):
             f"echo '{APPLY_PATCH_PASS}' || echo '{APPLY_PATCH_FAIL}')))"
         )
         # Pin cwd to repo_dir: the eval runtime is fresh and its spec.workdir
-        # (e.g. /polar/session/workspace) won't exist there, so falling through
+        # (e.g. /openevo/session/workspace) won't exist there, so falling through
         # to spec.workdir would make `docker exec -w ...` fail at OCI chdir.
         result = await runtime.exec(
             apply_cmd,

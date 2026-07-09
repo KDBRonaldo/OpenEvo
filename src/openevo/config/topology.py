@@ -84,7 +84,7 @@ class _CompletionPersistenceConfig(_StrictModel):
 
 
 class EvolutionContextConfig(_StrictModel):
-    target_dir: str = "/polar/session/evolution"
+    target_dir: str = "/openevo/session/evolution"
     timeout_seconds: float = Field(default=10.0, gt=0)
     fail_open: bool = True
 

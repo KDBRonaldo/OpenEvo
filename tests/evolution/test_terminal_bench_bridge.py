@@ -45,7 +45,7 @@ def test_build_terminal_bench_event_preserves_transcript_metadata_without_secret
     [event] = build_terminal_bench_events(trial_dir)
 
     assert event.source == "terminal_bench.harbor"
-    assert event.event_type == "polar.session_completed"
+    assert event.event_type == "openevo.session_completed"
     assert event.source_event_id == "terminal-bench:fix-git__abc123"
     assert event.task_id == "fix-git"
     assert event.session_id == "fix-git__abc123"
@@ -101,7 +101,7 @@ def test_build_terminal_bench_event_preserves_transcript_metadata_without_secret
         DatasetCreateRequest(
             name="tb21_fix_git",
             purpose="agent_system_reflection",
-            query={"event_types": ["polar.session_completed"], "status": ["COMPLETED"]},
+            query={"event_types": ["openevo.session_completed"], "status": ["COMPLETED"]},
         )
     )
 
@@ -286,7 +286,7 @@ def test_terminal_bench_events_cli_writes_jsonl(tmp_path):
     assert len(lines) == 1
     event_payload = json.loads(lines[0])
     assert event_payload["source"] == "terminal_bench.harbor"
-    assert event_payload["event_type"] == "polar.session_completed"
+    assert event_payload["event_type"] == "openevo.session_completed"
     assert event_payload["payload"]["session_result"]["trajectory"]["metadata"][
         "capture_mode"
     ] == "transcript"
@@ -644,7 +644,7 @@ def test_terminal_bench_task_tags_preserve_short_task_ids_from_events(tmp_path):
         [
             EventIngestRequest(
                 source="terminal_bench.harbor",
-                event_type="polar.session_completed",
+                event_type="openevo.session_completed",
                 source_event_id="event-1",
                 task_id="git",
             )
@@ -749,7 +749,7 @@ def _ingest_terminal_bench_dataset(
             name=name,
             purpose="agent_system_reflection",
             query={
-                "event_types": ["polar.session_completed"],
+                "event_types": ["openevo.session_completed"],
                 "status": ["COMPLETED"],
                 "policy_version": policy_version,
             },

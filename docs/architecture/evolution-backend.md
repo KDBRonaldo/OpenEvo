@@ -104,7 +104,7 @@ erDiagram
 | 类型 | 用途 | Runtime 消费方 |
 |---|---|---|
 | `dataset` | 物化后的 event/traces 选择，包含 `manifest.json` 和 `records.jsonl` | Evolution workers |
-| `text_memory` | 长期自然语言 memory 文件 | Gateway instruction injection 和 `POLAR_MEMORY_FILE` |
+| `text_memory` | 长期自然语言 memory 文件 | Gateway instruction injection 和 `OPENEVO_MEMORY_FILE` |
 | `skill_bundle` | 包含 `SKILL.md` 和可选辅助文件的目录 | Agent harness skill loaders |
 | `agent_system` | 面向 agent system / harness instruction 文件的演化文本 | `AGENTS.md`、OpenHands microagent、Claude/Gemini 等 harness-specific 文本 |
 | `parametric_memory` | 已注册的 adapter/LoRA 引用 | Gateway adapter merge spec for SGLang/vLLM |
@@ -155,10 +155,10 @@ flowchart LR
 
 ## 存储布局
 
-默认情况下，backend state 保存在 `.polar_evolution/` 下。
+默认情况下，backend state 保存在 `.openevo/evolution/` 下。
 
 ```text
-.polar_evolution/
+.openevo/evolution/
   evolution.db
   events/
     <event_id>.json
@@ -179,6 +179,10 @@ flowchart LR
 
 数据库是状态和 leases 的权威来源。文件系统用于保存较大的 payload 和物化后的
 artifacts。
+
+启动已有本地 state 时，`EvolutionStore.initialize()` 会把历史 session-completed
+event/source identity canonicalize 为当前 OpenEvo identity，避免旧本地 events 在新的
+`openevo.session_completed` dataset query 中不可见。
 
 ## Context Resolution
 

@@ -601,15 +601,15 @@ RUN apt-get update \\
 
 RUN useradd -m -s /bin/bash polar \\
     && echo 'polar ALL=(ALL) NOPASSWD:ALL' >> /etc/sudoers \\
-    && mkdir -p /polar/session/workspace /home/polar/.local \\
-    && chown -R polar:polar /polar/session /home/polar
+    && mkdir -p /openevo/session/workspace /home/polar/.local \\
+    && chown -R polar:polar /openevo/session /home/polar
 
 RUN echo 'export PATH=/home/polar/.local/bin:$PATH' > /etc/profile.d/polar-path.sh
 
 USER polar
 RUN npm install -g {_MANAGED_RUNTIME_CODEX_PACKAGE}
 
-WORKDIR /polar/session/workspace
+WORKDIR /openevo/session/workspace
 """
 
 

@@ -22,11 +22,35 @@ TEXT_SUFFIXES = {
 MARKERS = (
     "src/" + "polar",
     "src/" + "polar" + "_evolution",
-    "POLAR_",
-    "/polar/session",
-    "polar.session_completed",
+    "POL" + "AR_",
+    "/pol" + "ar/session",
+    "pol" + "ar.session_completed",
     "polar-" + "evolution",
+    "uv run " + "polar",
+    "polar serve_",
+    "polar dashboard",
+    "from polar",
+    "import polar",
 )
+ACTIVE_PREFIXES = (
+    "src/",
+    "tests/",
+    "scripts/",
+    "examples/",
+    "web/",
+    "docs/architecture/",
+    "README.md",
+    "AGENTS.md",
+)
+ARCHIVED_PREFIXES = (
+    "docs/superpowers/",
+    "docs/dev/",
+    "README.polar.md",
+)
+IGNORED_PATHS = {
+    "scripts/ci/audit_openevo_identity.py",
+    "tests/ci/test_openevo_productization_workflow.py",
+}
 
 
 def _tracked_text_files() -> list[Path]:
@@ -49,13 +73,25 @@ def _tracked_text_files() -> list[Path]:
 
 def audit() -> dict[str, object]:
     matches: list[dict[str, str]] = []
+    active_matches: list[dict[str, str]] = []
+    archived_matches: list[dict[str, str]] = []
     for path in _tracked_text_files():
         relative = path.relative_to(REPO_ROOT)
+        relative_text = str(relative)
+        if relative_text in IGNORED_PATHS:
+            continue
         text = path.read_text(encoding="utf-8", errors="ignore")
         for marker in MARKERS:
             if marker in text:
-                matches.append({"path": str(relative), "marker": marker})
+                match = {"path": str(relative), "marker": marker}
+                matches.append(match)
+                if relative_text.startswith(ARCHIVED_PREFIXES):
+                    archived_matches.append(match)
+                elif relative_text.startswith(ACTIVE_PREFIXES):
+                    active_matches.append(match)
     matches.sort(key=lambda match: (match["path"], match["marker"]))
+    active_matches.sort(key=lambda match: (match["path"], match["marker"]))
+    archived_matches.sort(key=lambda match: (match["path"], match["marker"]))
     return {
         "src_polar_exists": (REPO_ROOT / "src" / "polar").exists(),
         "src_legacy_evolution_exists": (
@@ -63,6 +99,8 @@ def audit() -> dict[str, object]:
         ).exists(),
         "web_exists": (REPO_ROOT / "web").exists(),
         "desktop_exists": (REPO_ROOT / "desktop").exists(),
+        "active_matches": active_matches,
+        "archived_matches": archived_matches,
         "matches": matches,
     }
 

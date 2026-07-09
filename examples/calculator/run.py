@@ -3,8 +3,8 @@
 
 Each harness gets a tiny `calculator.py` with parser stubs, edits it, and the
 evaluator runs `python3 test_calculator.py`. All harnesses are submitted at
-once; live progress and per-session detail are visible in the dashboard
-(`polar dashboard -c examples/calculator/topology.yaml`).
+once; live progress is printed here and detailed progress is available in the
+rollout/gateway logs.
 
     uv run python examples/calculator/run.py                 # docker (default)
     uv run python examples/calculator/run.py --backend apptainer
@@ -26,7 +26,7 @@ ASSETS_DIR = EXAMPLE_DIR / "assets"
 TEST_FILE = ASSETS_DIR / "test_calculator.py"
 STARTER_FILE = ASSETS_DIR / "calculator.py"
 TOPOLOGY = EXAMPLE_DIR / "topology.yaml"
-RUNTIME_IMAGE = "polar-localhost-calculator:latest"
+RUNTIME_IMAGE = "openevo-localhost-calculator:latest"
 NUM_SAMPLES = 4
 # Generous budget: INIT install (npm / pip / venv) shares the per-task budget
 # with the agent run and evaluation.
@@ -58,7 +58,7 @@ Implement the three methods to build a recursive-descent expression parser:
 Also fix `__call__` to return the parsed value instead of `0`.
 
 Requirements:
-- Work only in `/polar/session/workspace/calculator.py`.
+- Work only in `/openevo/session/workspace/calculator.py`.
 - Keep the existing file structure, `_tokenize`, `_peek`, and `_consume` as-is.
 - Do not add imports.
 - Use `//` for division (integer division).
@@ -105,9 +105,9 @@ HARNESS_MODEL: dict[str, str] = {
 
 # INIT stage: install the harness CLI, then set up a clean git workspace.
 _WORKSPACE_PREPARE = (
-    "rm -rf /polar/session/workspace && "
-    "mkdir -p /polar/session/workspace /polar/session/logs/agent && "
-    "cd /polar/session/workspace && "
+    "rm -rf /openevo/session/workspace && "
+    "mkdir -p /openevo/session/workspace /openevo/session/logs/agent && "
+    "cd /openevo/session/workspace && "
     "git init -q && "
     "git config user.email 'polar@test' && "
     "git config user.name 'Polar'"
@@ -145,21 +145,21 @@ def build_task_payload(harness: str, batch_id: str, backend: str) -> dict[str, A
             "image": runtime_image_for_backend(backend),
             "prepare": [
                 {"type": "exec", "command": f"{HARNESS_INSTALL[harness]} && {_WORKSPACE_PREPARE}"},
-                {"type": "upload_file", "source": str(TEST_FILE), "target": "/polar/session/workspace/test_calculator.py"},
-                {"type": "upload_file", "source": str(STARTER_FILE), "target": "/polar/session/workspace/calculator.py"},
-                {"type": "exec", "command": "cd /polar/session/workspace && git add -A && git commit -qm 'initial'"},
+                {"type": "upload_file", "source": str(TEST_FILE), "target": "/openevo/session/workspace/test_calculator.py"},
+                {"type": "upload_file", "source": str(STARTER_FILE), "target": "/openevo/session/workspace/calculator.py"},
+                {"type": "exec", "command": "cd /openevo/session/workspace && git add -A && git commit -qm 'initial'"},
             ],
             "network": "host",
-            "workdir": "/polar/session/workspace",
+            "workdir": "/openevo/session/workspace",
         },
         "agent": {"harness": harness, "model_name": HARNESS_MODEL[harness]},
         "builder": {"strategy": "prefix_merging"},
         "evaluator": {
             "strategy": "test_on_output",
             "config": {
-                "repo_dir": "/polar/session/workspace",
-                "patch_command": "cd /polar/session/workspace && git add -A && git diff --cached --binary",
-                "test_command": "cd /polar/session/workspace && python3 test_calculator.py && echo 'PASSED test_calculator'",
+                "repo_dir": "/openevo/session/workspace",
+                "patch_command": "cd /openevo/session/workspace && git add -A && git diff --cached --binary",
+                "test_command": "cd /openevo/session/workspace && python3 test_calculator.py && echo 'PASSED test_calculator'",
                 "test_timeout": 60.0,
                 "expected_output_json": {"test_calculator": "PASSED"},
                 "exclude_patterns": [*_COMMON_EXCLUDES, *_EVAL_EXCLUDES[harness]],
@@ -195,7 +195,7 @@ def main() -> int:
     parser.add_argument("--backend", choices=["docker", "apptainer"], default="docker")
     backend = parser.parse_args().backend
 
-    from polar.config import TopologyConfig
+    from openevo.config import TopologyConfig
 
     rollout_url = TopologyConfig.load(TOPOLOGY).rollout.public_url
     batch_id = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
@@ -211,7 +211,7 @@ def main() -> int:
             task_ids[harness] = resp.json()["task_id"]
             print(f"  {harness:<16} -> {task_ids[harness]}")
 
-        print(f"\nPolling every {POLL_INTERVAL_SECONDS:.0f}s (watch live in the dashboard) ...")
+        print(f"\nPolling every {POLL_INTERVAL_SECONDS:.0f}s ...")
         t0 = time.monotonic()
         finished: dict[str, dict[str, Any]] = {}
         while len(finished) < len(HARNESSES):

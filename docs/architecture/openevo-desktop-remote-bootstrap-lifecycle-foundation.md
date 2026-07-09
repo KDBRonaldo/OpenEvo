@@ -93,7 +93,7 @@ Dockerfile or system dependencies.
 Subscription-mode Codex auth is checked on the remote host during preflight and
 bootstrap. At gateway runtime initialization, the host `~/.codex/auth.json` is
 copied into the per-session bind mount under the runtime `CODEX_HOME`, defaulting
-to `/polar/session/.codex`. Users should not need to log in inside the managed
+to `/openevo/session/.codex`. Users should not need to log in inside the managed
 runtime container.
 
 ## Execution Semantics

@@ -213,7 +213,7 @@ def prepare_sifs(
 
 
 def _apptainer_binary() -> str:
-    override = os.environ.get("POLAR_APPTAINER_BIN")
+    override = os.environ.get("OPENEVO_APPTAINER_BIN")
     if override:
         return override
     for candidate in ("/usr/bin/apptainer", "/bin/apptainer"):

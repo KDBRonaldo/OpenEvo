@@ -81,7 +81,7 @@ def test_dataset_query_uses_exact_policy_version_without_latest_fallback() -> No
     assert payload["query"]["policy_version"] == (
         "openevo:biology-components:component-extraction-train:round-0"
     )
-    assert payload["query"]["event_types"] == ["polar.session_completed"]
+    assert payload["query"]["event_types"] == ["openevo.session_completed"]
     assert payload["query"]["status"] == ["COMPLETED"]
     assert "latest" not in payload["query"]
     assert "task_tags" not in payload["query"]
@@ -96,7 +96,7 @@ def test_rollout_payload_uploads_workspace_with_explicit_runtime_image() -> None
         {
             "type": "upload_dir",
             "source": "/root/codex54minitest/five_article_agentic_workflow_subset",
-            "target": "/polar/session/workspace",
+            "target": "/openevo/session/workspace",
         }
     ]
 
@@ -745,7 +745,7 @@ def test_workspace_upload_precedes_runtime_prepare_actions() -> None:
                 {
                     "type": "exec",
                     "command": "python -m pip install -r requirements.txt",
-                    "cwd": "/polar/session/workspace",
+                    "cwd": "/openevo/session/workspace",
                 }
             ],
         }
@@ -758,12 +758,12 @@ def test_workspace_upload_precedes_runtime_prepare_actions() -> None:
         {
             "type": "upload_dir",
             "source": "/root/codex54minitest/five_article_agentic_workflow_subset",
-            "target": "/polar/session/workspace",
+            "target": "/openevo/session/workspace",
         },
         {
             "type": "exec",
             "command": "python -m pip install -r requirements.txt",
-            "cwd": "/polar/session/workspace",
+            "cwd": "/openevo/session/workspace",
             "env": None,
             "source": None,
             "target": None,

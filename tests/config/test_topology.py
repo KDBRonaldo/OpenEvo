@@ -224,7 +224,7 @@ evolution:
   enabled: true
   backend_url: http://127.0.0.1:8200
   context:
-    target_dir: /polar/session/evolution
+    target_dir: /openevo/session/evolution
     timeout_seconds: 3
     fail_open: true
   event_export:
@@ -239,7 +239,7 @@ evolution:
     assert topology.evolution is not None
     assert topology.evolution.enabled is True
     assert topology.evolution.backend_url == "http://127.0.0.1:8200"
-    assert topology.evolution.context.target_dir == "/polar/session/evolution"
+    assert topology.evolution.context.target_dir == "/openevo/session/evolution"
     assert topology.evolution.context.timeout_seconds == 3
     assert topology.evolution.event_export.timeout_seconds == 4
 

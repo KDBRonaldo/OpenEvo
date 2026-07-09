@@ -26,31 +26,31 @@ polar_task_template:
     # images.
     image: "{args.polar_apptainer_image_dir}/{sample.metadata.instance_id}.sif"
     network: "host"
-    workdir: "/polar/session/workspace"
+    workdir: "/openevo/session/workspace"
     env:
-      HOME: "/polar/session/home"
-      PATH: "/polar/session/home/.venv/bin:/opt/node/bin:/opt/miniconda3/envs/testbed/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+      HOME: "/openevo/session/home"
+      PATH: "/openevo/session/home/.venv/bin:/opt/node/bin:/opt/miniconda3/envs/testbed/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
     kwargs:
       volumes:
         - "{args.polar_agent_cli_dir}:/opt/node:ro"
-    # Node 22 + agent CLIs are mounted from polar_agent_cli_dir — no npm install
+    # Node 22 + agent CLIs are mounted from the configured agent CLI dir; no npm install
     # at session start.
     prepare:
       - type: exec
         command: >-
-          rm -rf /polar/session/workspace &&
-          mkdir -p /polar/session/logs/agent /polar/session/workspace "$HOME/.venv/bin" &&
-          cp -a /testbed/. /polar/session/workspace/ &&
+          rm -rf /openevo/session/workspace &&
+          mkdir -p /openevo/session/logs/agent /openevo/session/workspace "$HOME/.venv/bin" &&
+          cp -a /testbed/. /openevo/session/workspace/ &&
           ln -sf /opt/miniconda3/envs/testbed/bin/python "$HOME/.venv/bin/python" &&
           ln -sf /opt/miniconda3/envs/testbed/bin/python "$HOME/.venv/bin/python3" &&
           git config --global core.pager '' &&
-          cd /polar/session/workspace &&
+          cd /openevo/session/workspace &&
           (git reset --hard || true)
     # Fresh reward-test runtime applies the patch and runs swebench tests.
     eval_prepare:
       - type: exec
         command: >-
-          mkdir -p /polar/session/logs/agent "$HOME/.venv/bin" &&
+          mkdir -p /openevo/session/logs/agent "$HOME/.venv/bin" &&
           ln -sf /opt/miniconda3/envs/testbed/bin/python "$HOME/.venv/bin/python" &&
           ln -sf /opt/miniconda3/envs/testbed/bin/python "$HOME/.venv/bin/python3" &&
           git config --global core.pager ''
@@ -64,7 +64,7 @@ polar_task_template:
     refresh_runtime: true
     config:
       repo_dir: "/testbed"
-      patch_command: "cd /polar/session/workspace && git add -A && git diff --cached --binary"
+      patch_command: "cd /openevo/session/workspace && git add -A && git diff --cached --binary"
       instance: "{sample.metadata.instance}"
       # Strip per-harness config/session dirs and common stray artifacts that
       # would otherwise get swept into `git add -A` and bloat the patch.

@@ -81,7 +81,7 @@ def get_state() -> RolloutState:
     global _state
     if _state is None:
         topology_path = _configured_topology_path or os.environ.get(
-            "POLAR_TOPOLOGY",
+            "OPENEVO_TOPOLOGY",
             "topology.yaml",
         )
         _state = _build_state(TopologyConfig.load(topology_path))
@@ -236,7 +236,7 @@ def serve(topology_path: str = "topology.yaml", *, log_level: str = "info") -> N
 
 def main() -> None:
     parser = argparse.ArgumentParser(prog="python -m openevo.rollout.server")
-    parser.add_argument("--config", default=os.environ.get("POLAR_TOPOLOGY", "topology.yaml"))
+    parser.add_argument("--config", default=os.environ.get("OPENEVO_TOPOLOGY", "topology.yaml"))
     parser.add_argument("--log-level", default="info")
     args = parser.parse_args()
     serve(args.config, log_level=args.log_level)

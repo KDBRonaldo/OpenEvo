@@ -1,9 +1,9 @@
 ARG BASE_IMAGE=python:3.12-slim
-ARG POLAR_SWEBENCH_IMAGE_VERSION=1
+ARG OPENEVO_SWEBENCH_IMAGE_VERSION=1
 FROM ${BASE_IMAGE}
 
-ARG POLAR_SWEBENCH_IMAGE_VERSION=1
-LABEL io.polar.swebench-image-version=${POLAR_SWEBENCH_IMAGE_VERSION}
+ARG OPENEVO_SWEBENCH_IMAGE_VERSION=1
+LABEL io.openevo.swebench-image-version=${OPENEVO_SWEBENCH_IMAGE_VERSION}
 
 ENV DEBIAN_FRONTEND=noninteractive \
     NPM_CONFIG_UPDATE_NOTIFIER=false \
@@ -16,8 +16,8 @@ RUN apt-get update \
     && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && useradd -m -s /bin/bash polar \
-    && mkdir -p /home/polar/.npm-global /polar/session \
-    && chown -R polar:polar /home/polar /polar/session \
+    && mkdir -p /home/polar/.npm-global /openevo/session \
+    && chown -R polar:polar /home/polar /openevo/session \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 USER polar

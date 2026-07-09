@@ -10,9 +10,9 @@ from pathlib import Path
 
 EXAMPLE_DIR = Path(__file__).resolve().parent
 DOCKERFILE_DIR = EXAMPLE_DIR / "runtime"
-DEFAULT_IMAGE = "polar-localhost-calculator:latest"
+DEFAULT_IMAGE = "openevo-localhost-calculator:latest"
 IMAGE_LAYOUT_VERSION = "3"
-IMAGE_VERSION_LABEL = "io.polar.calculator-image-version"
+IMAGE_VERSION_LABEL = "io.openevo.calculator-image-version"
 
 
 def parse_args() -> argparse.Namespace:
@@ -73,7 +73,7 @@ def main() -> int:
             "docker",
             "build",
             "--build-arg",
-            f"POLAR_CALCULATOR_IMAGE_VERSION={IMAGE_LAYOUT_VERSION}",
+            f"OPENEVO_CALCULATOR_IMAGE_VERSION={IMAGE_LAYOUT_VERSION}",
             "--tag",
             args.image,
             str(DOCKERFILE_DIR),

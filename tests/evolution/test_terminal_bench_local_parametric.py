@@ -132,7 +132,7 @@ def test_build_evolab_harbor_env_allows_explicit_solver_temperature() -> None:
 def test_build_evolab_harbor_env_empty_base_does_not_inherit_host_env(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("POLAR_SENTINEL_HOST_ENV", "host-value")
+    monkeypatch.setenv("OPENEVO_SENTINEL_HOST_ENV", "host-value")
 
     env = build_evolab_harbor_env(
         base_env={},
@@ -140,7 +140,7 @@ def test_build_evolab_harbor_env_empty_base_does_not_inherit_host_env(
         model="tb-parametric-memory",
     )
 
-    assert "POLAR_SENTINEL_HOST_ENV" not in env
+    assert "OPENEVO_SENTINEL_HOST_ENV" not in env
     assert env["EVOLAB_TB_LLM_API"] == "openai-chat-completions"
 
 

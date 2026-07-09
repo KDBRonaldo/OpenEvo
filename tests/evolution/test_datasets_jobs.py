@@ -39,8 +39,8 @@ def test_create_dataset_filters_events(tmp_path):
     store.initialize()
     good_event = store.ingest_event(
         EventIngestRequest(
-            source="polar",
-            event_type="polar.session_completed",
+            source="openevo",
+            event_type="openevo.session_completed",
             source_event_id="session:good",
             task_id="task_good",
             session_id="session_good",
@@ -54,8 +54,8 @@ def test_create_dataset_filters_events(tmp_path):
     )
     store.ingest_event(
         EventIngestRequest(
-            source="polar",
-            event_type="polar.session_completed",
+            source="openevo",
+            event_type="openevo.session_completed",
             source_event_id="session:bad",
             task_id="task_bad",
             status="ERROR",
@@ -70,7 +70,7 @@ def test_create_dataset_filters_events(tmp_path):
             name="good_policy_1",
             purpose="skill_distillation",
             query={
-                "event_types": ["polar.session_completed"],
+                "event_types": ["openevo.session_completed"],
                 "status": ["COMPLETED"],
                 "reward_min": 0.8,
                 "policy_version": "policy_1",
@@ -102,7 +102,7 @@ def test_create_dataset_filters_events(tmp_path):
     assert dataset_row["purpose"] == "skill_distillation"
     assert dataset_row["state"] == "active"
     assert json.loads(dataset_row["query_json"]) == {
-        "event_types": ["polar.session_completed"],
+        "event_types": ["openevo.session_completed"],
         "policy_version": "policy_1",
         "reward_min": 0.8,
         "status": ["COMPLETED"],
@@ -125,7 +125,7 @@ def test_create_dataset_filters_events(tmp_path):
         "name": "good_policy_1",
         "purpose": "skill_distillation",
         "query": {
-            "event_types": ["polar.session_completed"],
+            "event_types": ["openevo.session_completed"],
             "policy_version": "policy_1",
             "reward_min": 0.8,
             "status": ["COMPLETED"],
@@ -146,8 +146,8 @@ def test_create_dataset_filters_events(tmp_path):
     assert records == [
         {
             "event_id": good_event.event_id,
-            "source": "polar",
-            "event_type": "polar.session_completed",
+            "source": "openevo",
+            "event_type": "openevo.session_completed",
             "source_event_id": "session:good",
             "created_at": records[0]["created_at"],
             "ingested_at": records[0]["ingested_at"],
@@ -173,7 +173,6 @@ def test_create_dataset_filters_events(tmp_path):
             },
         }
     ]
-
     assert artifact_row is not None
     assert artifact_row["type"] == "dataset"
     assert artifact_row["name"] == "good_policy_1"
@@ -194,13 +193,52 @@ def test_create_dataset_filters_events(tmp_path):
     assert worker_records[0]["traces"] == [{"reward": 1.0}]
 
 
+def test_create_dataset_includes_migrated_legacy_session_events(tmp_path):
+    store = EvolutionStore(db_path=tmp_path / "evolution.db", artifact_root=tmp_path / "artifacts")
+    store.initialize()
+    legacy_event = store.ingest_event(
+        EventIngestRequest(
+            source="polar",
+            event_type="pol" + "ar.session_completed",
+            source_event_id="session:legacy",
+            task_id="task_legacy",
+            session_id="legacy",
+            status="COMPLETED",
+            policy_version="policy_1",
+            payload={"session_result": {"trajectory": {"traces": [{"reward": 1.0}]}}},
+        )
+    )
+    store.initialize()
+
+    response = store.create_dataset(
+        DatasetCreateRequest(
+            name="migrated_legacy",
+            purpose="skill_distillation",
+            query={
+                "event_types": ["openevo.session_completed"],
+                "status": ["COMPLETED"],
+                "policy_version": "policy_1",
+            },
+        )
+    )
+
+    assert response.event_count == 1
+    with store.connect() as conn:
+        dataset_event_rows = conn.execute(
+            "SELECT event_id FROM dataset_events WHERE dataset_id = ?",
+            (response.dataset_id,),
+        ).fetchall()
+
+    assert [row["event_id"] for row in dataset_event_rows] == [legacy_event.event_id]
+
+
 def test_create_dataset_sanitizes_validated_human_feedback(tmp_path):
     store = EvolutionStore(db_path=tmp_path / "evolution.db", artifact_root=tmp_path / "artifacts")
     store.initialize()
     event = store.ingest_event(
         EventIngestRequest(
-            source="polar",
-            event_type="polar.session_completed",
+            source="openevo",
+            event_type="openevo.session_completed",
             source_event_id="session:human-feedback",
             task_id="task_human_feedback",
             session_id="session_human_feedback",
@@ -310,7 +348,7 @@ def test_create_dataset_sanitizes_validated_human_feedback(tmp_path):
             name="human_feedback_dataset",
             purpose="agent_system_evolution",
             query={
-                "event_types": ["polar.session_completed"],
+                "event_types": ["openevo.session_completed"],
                 "status": ["COMPLETED"],
             },
         )
@@ -371,8 +409,8 @@ def test_create_dataset_merges_human_feedback_alias(tmp_path):
     store.initialize()
     event = store.ingest_event(
         EventIngestRequest(
-            source="polar",
-            event_type="polar.session_completed",
+            source="openevo",
+            event_type="openevo.session_completed",
             source_event_id="session:human-feedback-alias",
             task_id="task_human_feedback_alias",
             session_id="session_human_feedback_alias",
@@ -406,7 +444,7 @@ def test_create_dataset_merges_human_feedback_alias(tmp_path):
             name="human_feedback_alias_dataset",
             purpose="agent_system_evolution",
             query={
-                "event_types": ["polar.session_completed"],
+                "event_types": ["openevo.session_completed"],
                 "status": ["COMPLETED"],
             },
         )
@@ -445,8 +483,8 @@ def test_create_dataset_canonicalizes_human_feedback_from_session_result_aliases
     store.initialize()
     event = store.ingest_event(
         EventIngestRequest(
-            source="polar",
-            event_type="polar.session_completed",
+            source="openevo",
+            event_type="openevo.session_completed",
             source_event_id="session:human-feedback-session-alias",
             task_id="task_human_feedback_session_alias",
             session_id="session_human_feedback_session_alias",
@@ -517,7 +555,7 @@ def test_create_dataset_canonicalizes_human_feedback_from_session_result_aliases
             name="human_feedback_session_alias_dataset",
             purpose="agent_system_evolution",
             query={
-                "event_types": ["polar.session_completed"],
+                "event_types": ["openevo.session_completed"],
                 "status": ["COMPLETED"],
             },
         )
@@ -592,8 +630,8 @@ def test_create_dataset_preserves_non_mapping_metadata_evolution_feedback(
     store.initialize()
     event = store.ingest_event(
         EventIngestRequest(
-            source="polar",
-            event_type="polar.session_completed",
+            source="openevo",
+            event_type="openevo.session_completed",
             source_event_id=f"session:shared-feedback-{type(shared_feedback).__name__}",
             task_id="task_shared_feedback",
             session_id="session_shared_feedback",
@@ -623,7 +661,7 @@ def test_create_dataset_preserves_non_mapping_metadata_evolution_feedback(
             name=f"shared_feedback_{type(shared_feedback).__name__}",
             purpose="agent_system_evolution",
             query={
-                "event_types": ["polar.session_completed"],
+                "event_types": ["openevo.session_completed"],
                 "status": ["COMPLETED"],
             },
         )
@@ -662,8 +700,8 @@ def test_create_dataset_redacts_secrets_from_human_feedback_strings(tmp_path):
     store.initialize()
     event = store.ingest_event(
         EventIngestRequest(
-            source="polar",
-            event_type="polar.session_completed",
+            source="openevo",
+            event_type="openevo.session_completed",
             source_event_id="session:redacted-human-feedback",
             task_id="task_redacted_feedback",
             session_id="session_redacted_feedback",
@@ -715,7 +753,7 @@ def test_create_dataset_redacts_secrets_from_human_feedback_strings(tmp_path):
                                         "Inspect /secret.txt",
                                         "Inspect /workspace/prod/key.pem",
                                         "Inspect /app/secret.txt",
-                                        "Inspect /polar/session/evolution/memory.md",
+                                        "Inspect /openevo/session/evolution/memory.md",
                                         "Call route /api/v1/feedback",
                                         "Probe endpoint /healthz",
                                         "Call reviews route /v1/reviews",
@@ -753,7 +791,7 @@ def test_create_dataset_redacts_secrets_from_human_feedback_strings(tmp_path):
             name="redacted_human_feedback",
             purpose="agent_system_evolution",
             query={
-                "event_types": ["polar.session_completed"],
+                "event_types": ["openevo.session_completed"],
                 "status": ["COMPLETED"],
             },
         )
@@ -821,7 +859,7 @@ def test_create_dataset_redacts_secrets_from_human_feedback_strings(tmp_path):
     assert "/secret.txt" not in rendered_record
     assert "/workspace/prod/key.pem" not in rendered_record
     assert "/app/secret.txt" not in rendered_record
-    assert "/polar/session/evolution/memory.md" not in rendered_record
+    assert "/openevo/session/evolution/memory.md" not in rendered_record
     assert "/api/v1/feedback" not in rendered_record
     assert "/healthz" not in rendered_record
     assert "/v1/reviews" not in rendered_record
@@ -880,7 +918,7 @@ def test_create_dataset_accepts_subscription_transcript_trajectory_event(tmp_pat
             name="subscription_transcript",
             purpose="memory_mining",
             query={
-                "event_types": ["polar.session_completed"],
+                "event_types": ["openevo.session_completed"],
                 "status": ["COMPLETED"],
                 "policy_version": "policy_sub",
             },
@@ -952,8 +990,8 @@ def test_create_dataset_rejects_task_tags_query_without_writes(tmp_path):
     store.initialize()
     store.ingest_event(
         EventIngestRequest(
-            source="polar",
-            event_type="polar.session_completed",
+            source="openevo",
+            event_type="openevo.session_completed",
             source_event_id="session:tagged",
             status="COMPLETED",
             payload={"session_result": {"trajectory": {"traces": [{"reward": 1.0}]}}},
@@ -987,8 +1025,8 @@ def test_create_dataset_retries_id_collision_without_overwriting_manifest(tmp_pa
     store.initialize()
     store.ingest_event(
         EventIngestRequest(
-            source="polar",
-            event_type="polar.session_completed",
+            source="openevo",
+            event_type="openevo.session_completed",
             source_event_id="session:one",
             status="COMPLETED",
             payload={"session_result": {"trajectory": {"traces": [{"reward": 1.0}]}}},
@@ -1034,8 +1072,8 @@ def test_create_dataset_stops_selecting_events_after_trace_limit(tmp_path):
     store.initialize()
     first_event = store.ingest_event(
         EventIngestRequest(
-            source="polar",
-            event_type="polar.session_completed",
+            source="openevo",
+            event_type="openevo.session_completed",
             source_event_id="session:first",
             status="COMPLETED",
             payload={
@@ -1045,8 +1083,8 @@ def test_create_dataset_stops_selecting_events_after_trace_limit(tmp_path):
     )
     second_event = store.ingest_event(
         EventIngestRequest(
-            source="polar",
-            event_type="polar.session_completed",
+            source="openevo",
+            event_type="openevo.session_completed",
             source_event_id="session:second",
             status="COMPLETED",
             payload={"session_result": {"trajectory": {"traces": [{"reward": 0.8}]}}},
@@ -1095,8 +1133,8 @@ def test_create_dataset_keeps_single_event_that_exceeds_trace_limit(tmp_path):
     store.initialize()
     event = store.ingest_event(
         EventIngestRequest(
-            source="polar",
-            event_type="polar.session_completed",
+            source="openevo",
+            event_type="openevo.session_completed",
             source_event_id="session:oversized",
             status="COMPLETED",
             payload={
@@ -1136,8 +1174,8 @@ def test_create_dataset_cleans_up_dataset_and_artifact_when_backfill_fails(
     store.initialize()
     store.ingest_event(
         EventIngestRequest(
-            source="polar",
-            event_type="polar.session_completed",
+            source="openevo",
+            event_type="openevo.session_completed",
             source_event_id="session:backfill",
             status="COMPLETED",
             payload={"session_result": {"trajectory": {"traces": [{"reward": 1.0}]}}},
@@ -1227,8 +1265,8 @@ def test_create_dataset_counts_malformed_trace_shape_as_zero(tmp_path):
     store.initialize()
     store.ingest_event(
         EventIngestRequest(
-            source="polar",
-            event_type="polar.session_completed",
+            source="openevo",
+            event_type="openevo.session_completed",
             source_event_id="session:malformed",
             status="COMPLETED",
             payload={"session_result": {"trajectory": {"traces": {"unexpected": "mapping"}}}},
@@ -1246,8 +1284,8 @@ def test_create_dataset_rejects_missing_payload_file_before_writes(tmp_path):
     store.initialize()
     event = store.ingest_event(
         EventIngestRequest(
-            source="polar",
-            event_type="polar.session_completed",
+            source="openevo",
+            event_type="openevo.session_completed",
             source_event_id="session:missing",
             status="COMPLETED",
             payload={"session_result": {"trajectory": {"traces": [{"reward": 1.0}]}}},
@@ -1283,8 +1321,8 @@ def test_create_dataset_rejects_corrupt_payload_json_before_writes(tmp_path):
     store.initialize()
     event = store.ingest_event(
         EventIngestRequest(
-            source="polar",
-            event_type="polar.session_completed",
+            source="openevo",
+            event_type="openevo.session_completed",
             source_event_id="session:corrupt",
             status="COMPLETED",
             payload={"session_result": {"trajectory": {"traces": [{"reward": 1.0}]}}},

@@ -18,7 +18,7 @@ _HERMES_HOME = "/tmp/hermes"
 _PROVIDER = "polar"
 # Substituted with $OPENAI_BASE_URL at exec time (the gateway env is only
 # present during run steps, not setup), keeping the config static.
-_BASE_URL_PLACEHOLDER = "__POLAR_GATEWAY_BASE_URL__"
+_BASE_URL_PLACEHOLDER = "__OPENEVO_GATEWAY_BASE_URL__"
 
 
 class HermesHarness(BaseHarness):

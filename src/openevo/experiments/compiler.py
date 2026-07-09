@@ -100,7 +100,7 @@ class CompiledTask:
             "name": f"{self.experiment_name}:{self.task_id}:round-{round_index}",
             "purpose": "openevo_experiment_rollout",
             "query": {
-                "event_types": ["polar.session_completed"],
+                "event_types": ["openevo.session_completed"],
                 "status": ["COMPLETED"],
                 "policy_version": policy_version,
             },

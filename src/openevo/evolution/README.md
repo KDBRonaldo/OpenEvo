@@ -1,9 +1,9 @@
-# Polar Evolution Backend（演化后端）
+# OpenEvo Evolution Backend（演化后端）
 
-Polar Evolution Backend 是一个面向 skill、memory、agent system 文本和 parametric
-memory evolution 的异步控制面。它接收 Polar session 和 task events，从 events
+OpenEvo Evolution Backend 是一个面向 skill、memory、agent system 文本和 parametric
+memory evolution 的异步控制面。它接收 OpenEvo session 和 task events，从 events
 构建 datasets，把 jobs 租约给外部 workers，注册 workers 产出的 artifacts，并为
-后续 Polar sessions 解析 runtime context。
+后续 OpenEvo sessions 解析 runtime context。
 
 架构文档和图：
 
@@ -18,7 +18,11 @@ memory evolution 的异步控制面。它接收 Polar session 和 task events，
 uv run python -m openevo.evolution.cli serve --host 127.0.0.1 --port 8200
 ```
 
-默认情况下，backend 状态保存在 `.openevo.evolution/` 下。
+默认情况下，backend 状态保存在 `.openevo/evolution/` 下。
+
+初始化已有本地 state 时，store 会把历史 session-completed event identity
+canonicalize 为 `openevo.session_completed`，并把旧 `source="polar"` 行迁移为
+`source="openevo"`。新 producers 和新文档只应使用 OpenEvo identity。
 
 核心 APIs：
 
@@ -303,6 +307,6 @@ instruction、trial name 和 verifier failure feedback 会保留为可学习的�
 - `verifier/ctrf.json`
 - `verifier/test-stdout.txt`
 
-输出 event 使用 `event_type="polar.session_completed"`，trajectory metadata 显式设置
+输出 event 使用 `event_type="openevo.session_completed"`，trajectory metadata 显式设置
 `capture_mode="transcript"` 和 `token_level_metrics_available=false`。它不会把
 `config.agent.env`、API key、oracle solution 或 reference patch 写入 event。

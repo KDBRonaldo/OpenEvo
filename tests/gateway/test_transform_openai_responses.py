@@ -139,7 +139,7 @@ def test_responses_request_moves_image_function_output_to_user_message() -> None
                     "type": "function_call",
                     "call_id": "call-1",
                     "name": "view_image",
-                    "arguments": '{"path": "/polar/session/workspace/polar_stars.png"}',
+                    "arguments": '{"path": "/openevo/session/workspace/polar_stars.png"}',
                 },
                 {
                     "type": "function_call_output",
@@ -166,7 +166,7 @@ def test_responses_request_moves_image_function_output_to_user_message() -> None
                     "type": "function",
                     "function": {
                         "name": "view_image",
-                        "arguments": '{"path": "/polar/session/workspace/polar_stars.png"}',
+                        "arguments": '{"path": "/openevo/session/workspace/polar_stars.png"}',
                     },
                 }
             ],

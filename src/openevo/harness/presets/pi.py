@@ -54,7 +54,7 @@ class PiHarness(BaseHarness):
         models_config = {
             "providers": {
                 provider: {
-                    "baseUrl": "__POLAR_GATEWAY_BASE_URL__",
+                    "baseUrl": "__OPENEVO_GATEWAY_BASE_URL__",
                     "compat": compat,
                     "models": [
                         {
@@ -86,7 +86,7 @@ class PiHarness(BaseHarness):
                     # $OPENAI_BASE_URL is substituted at exec time; the
                     # placeholder keeps the JSON static (no shell quoting fun).
                     f"printf '%s' {shlex.quote(config_json)} "
-                    f'| sed "s|__POLAR_GATEWAY_BASE_URL__|$OPENAI_BASE_URL|g" '
+                    f'| sed "s|__OPENEVO_GATEWAY_BASE_URL__|$OPENAI_BASE_URL|g" '
                     f"> {self._AGENT_DIR}/models.json && "
                     f"pi --print --mode json --no-session "
                     f"--provider {shlex.quote(provider)} "

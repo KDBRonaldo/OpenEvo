@@ -1,11 +1,11 @@
 # Evolution Runtime Context（演化运行时上下文）
 
 本文说明 Evolution Backend 选出的 artifacts 如何在一个正在运行的 OpenEvo
-Core/Polar runtime session 中真正可用。文中的 `/polar/session` 路径和 `POLAR_*`
+Core runtime session 中真正可用。文中的 `/openevo/session` 路径和 `OPENEVO_*`
 环境变量是当前实现层 contract。
 
 Runtime context 的注入发生在 gateway session 被 dispatch 之后、agent harness
-`setup()` 之前。这个时机允许 Polar 在 agent 启动前 staging skills 和 memory，
+`setup()` 之前。这个时机允许 OpenEvo 在 agent 启动前 staging skills 和 memory，
 同时 backend 仍然可以基于真实 task、agent、policy、rollout step 和 served model
 选择上下文。
 
@@ -28,7 +28,7 @@ sequenceDiagram
     G->>RT: upload context.json, memory.md, agent_system.md, adapters.json, skills/
     G->>RT: write AGENTS.md / harness-specific text target
     G->>G: adapter_merge_spec 写入 session metadata
-    G->>H: setup(runtime)，harness env 中包含 POLAR_SKILLS_DIR
+    G->>H: setup(runtime)，harness env 中包含 OPENEVO_SKILLS_DIR
     G->>H: run_steps(agent-system/memory-prefixed instruction)
     H->>P: LLM request
     P->>P: 读取 session adapter_merge_spec
@@ -40,18 +40,18 @@ sequenceDiagram
 ## Runtime 文件和环境变量
 
 `write_evolution_context_files()` 会把选出的 context staging 到 session runtime
-的目标目录下。默认目标目录是 `/polar/session/evolution`。
+的目标目录下。默认目标目录是 `/openevo/session/evolution`。
 
 | Runtime path | Env var | 作用 |
 |---|---|---|
-| `/polar/session/evolution/context.json` | `POLAR_EVOLUTION_CONTEXT` | 完整 resolved context，包括 warnings |
-| `/polar/session/evolution/memory.md` | `POLAR_MEMORY_FILE` | 渲染后的自然语言 memory |
-| `/polar/session/evolution/agent_system.md` | `POLAR_AGENT_SYSTEM_FILE` | 渲染后的 agent system 文本 |
-| `<runtime workdir>/AGENTS.md` 或 manifest 指定相对路径 | `POLAR_AGENT_SYSTEM_TARGET` | 第一个成功写出的 harness-specific instruction 文件 |
-| `<runtime workdir>/...` target 列表 | `POLAR_AGENT_SYSTEM_TARGETS` | JSON string，包含所有成功写出的 agent system targets |
-| `<runtime workdir>/AGENTS.md` | `POLAR_AGENTS_MD` | 仅当实际 target basename 是 `AGENTS.md` 时设置 |
-| `/polar/session/evolution/skills/` | `POLAR_SKILLS_DIR` | staged skill bundle directories |
-| `/polar/session/evolution/adapters.json` | `POLAR_ADAPTER_MERGE_SPEC` | custom runtimes/tools 可读取的 adapter merge spec |
+| `/openevo/session/evolution/context.json` | `OPENEVO_EVOLUTION_CONTEXT` | 完整 resolved context，包括 warnings |
+| `/openevo/session/evolution/memory.md` | `OPENEVO_MEMORY_FILE` | 渲染后的自然语言 memory |
+| `/openevo/session/evolution/agent_system.md` | `OPENEVO_AGENT_SYSTEM_FILE` | 渲染后的 agent system 文本 |
+| `<runtime workdir>/AGENTS.md` 或 manifest 指定相对路径 | `OPENEVO_AGENT_SYSTEM_TARGET` | 第一个成功写出的 harness-specific instruction 文件 |
+| `<runtime workdir>/...` target 列表 | `OPENEVO_AGENT_SYSTEM_TARGETS` | JSON string，包含所有成功写出的 agent system targets |
+| `<runtime workdir>/AGENTS.md` | `OPENEVO_AGENTS_MD` | 仅当实际 target basename 是 `AGENTS.md` 时设置 |
+| `/openevo/session/evolution/skills/` | `OPENEVO_SKILLS_DIR` | staged skill bundle directories |
+| `/openevo/session/evolution/adapters.json` | `OPENEVO_ADAPTER_MERGE_SPEC` | custom runtimes/tools 可读取的 adapter merge spec |
 
 `agent_system` 和自然语言 memory 也会被 prepend 到 agent instruction：
 
@@ -80,7 +80,7 @@ Task:
 ```
 
 `target_path` 是 `runtime.spec.workdir` 下的相对路径；如果 runtime 没有配置 workdir，
-则相对 `/polar/session`。当前允许的目标是明确的 harness instruction 文件：
+则相对 `/openevo/session`。当前允许的目标是明确的 harness instruction 文件：
 
 - `AGENTS.md` 或 `agents.md`：Codex/通用 repository instruction。
 - `.openhands/microagents/*.md`：OpenHands repository microagent。
@@ -89,7 +89,7 @@ Task:
 Backend 注册和 Gateway staging 都会拒绝空路径、绝对路径、包含 `..` 的路径，以及
 allowlist 外的相对路径，避免 evolution artifact 覆盖任意 workdir 文件。一个 context
 可以包含多个 `agent_system.targets`；gateway 会分别写出对应目标，并把拼接后的文本写到
-`POLAR_AGENT_SYSTEM_FILE`。即使所有 harness target 都因为安全校验失败被跳过，
+`OPENEVO_AGENT_SYSTEM_FILE`。即使所有 harness target 都因为安全校验失败被跳过，
 canonical `agent_system.md` 仍会被写出并且 instruction prepend 仍然生效。
 
 ## Skill Bundle Staging
@@ -98,8 +98,8 @@ canonical `agent_system.md` 仍会被写出并且 instruction prepend 仍然生�
 flowchart LR
     ContextSkill[skill_bundle artifact]
     FileURI[file:// URI]
-    StageDir["host .polar_evolution_upload/skills/<safe-name>"]
-    RuntimeDir["/polar/session/evolution/skills/<safe-name>"]
+    StageDir["host .openevo/evolution_upload/skills/<safe-name>"]
+    RuntimeDir["/openevo/session/evolution/skills/<safe-name>"]
     HarnessSkillDir[Agent-specific skill dir]
 
     ContextSkill --> FileURI --> StageDir --> RuntimeDir --> HarnessSkillDir
@@ -116,7 +116,7 @@ flowchart LR
 ## Harness 消费方式
 
 `BaseHarness.effective_skill_paths()` 会返回静态 `agent.skills_path`，以及在存在
-evolution context 时返回 `POLAR_SKILLS_DIR`。
+evolution context 时返回 `OPENEVO_SKILLS_DIR`。
 
 Copy-based harness 会先复制静态 skills，再复制 evolution skills。因此如果目录名
 重复，evolution bundle 会覆盖静态 skill：
@@ -124,18 +124,18 @@ Copy-based harness 会先复制静态 skills，再复制 evolution skills。因�
 ```mermaid
 flowchart TB
     Static[agent.skills_path]
-    Evolution[POLAR_SKILLS_DIR]
+    Evolution[OPENEVO_SKILLS_DIR]
     Target[Agent skill home]
 
     Static --> Target
     Evolution --> Target
 ```
 
-OpenHands 按 path 加载 skills，并保留第一个重复 name。因此 Polar 会把
+OpenHands 按 path 加载 skills，并保留第一个重复 name。因此 OpenEvo 会把
 `SKILL_PATHS` 设置为 evolution 在前：
 
 ```text
-SKILL_PATHS=/polar/session/evolution/skills:/polar/static-skills
+SKILL_PATHS=/openevo/session/evolution/skills:/openevo/static-skills
 ```
 
 ## Parametric Memory Runtime 路径

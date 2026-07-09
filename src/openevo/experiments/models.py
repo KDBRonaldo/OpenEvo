@@ -118,7 +118,7 @@ class RuntimePrepareActionConfig(_StrictModel):
 
 class RuntimeConfig(_StrictModel):
     kind: Literal["docker", "apptainer"] = "docker"
-    workdir: str = "/polar/session/workspace"
+    workdir: str = "/openevo/session/workspace"
     image: str | None = None
     env: dict[str, str] = Field(default_factory=dict)
     prepare: list[RuntimePrepareActionConfig] = Field(default_factory=list)
@@ -352,7 +352,7 @@ def _normalize_http_url(value: str, field_name: str) -> str:
 def _runtime_has_non_default_overrides(runtime: RuntimeConfig) -> bool:
     return (
         runtime.kind != "docker"
-        or runtime.workdir != "/polar/session/workspace"
+        or runtime.workdir != "/openevo/session/workspace"
         or bool(runtime.env)
         or bool(runtime.prepare)
     )

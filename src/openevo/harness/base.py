@@ -38,7 +38,7 @@ class BaseHarness(ABC):
         paths: list[str] = []
         if self.skills_path:
             paths.append(self.skills_path)
-        evolution_skills = self.env.get("POLAR_SKILLS_DIR")
+        evolution_skills = self.env.get("OPENEVO_SKILLS_DIR")
         if evolution_skills:
             paths.append(evolution_skills)
         return paths

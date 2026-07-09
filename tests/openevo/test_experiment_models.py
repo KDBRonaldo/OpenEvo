@@ -45,7 +45,7 @@ def test_minimal_yaml_loads_with_defaults(tmp_path: Path) -> None:
     assert config.agent.auth == "proxy"
     assert config.runtime.kind == "docker"
     assert config.runtime.image == "runtime:latest"
-    assert config.runtime.workdir == "/polar/session/workspace"
+    assert config.runtime.workdir == "/openevo/session/workspace"
     assert config.rollout.url == "http://127.0.0.1:8080"
     assert config.evolution.backend_url == "http://127.0.0.1:8200"
     assert config.evolution.rounds == 1
@@ -230,7 +230,7 @@ def test_runtime_prepare_accepts_exec_actions() -> None:
         {
             "type": "exec",
             "command": "pip install -r requirements.txt",
-            "cwd": "/polar/session/workspace",
+            "cwd": "/openevo/session/workspace",
             "env": {"PIP_INDEX_URL": "https://pypi.example/simple"},
         }
     ]
@@ -240,7 +240,7 @@ def test_runtime_prepare_accepts_exec_actions() -> None:
     [action] = config.runtime.prepare
     assert action.type == "exec"
     assert action.command == "pip install -r requirements.txt"
-    assert action.cwd == "/polar/session/workspace"
+    assert action.cwd == "/openevo/session/workspace"
     assert action.env == {"PIP_INDEX_URL": "https://pypi.example/simple"}
 
 

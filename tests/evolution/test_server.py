@@ -29,8 +29,8 @@ def test_health_reports_artifact_root(tmp_path):
 def test_post_event_ingests_once(tmp_path):
     app = create_app(db_path=tmp_path / "evolution.db", artifact_root=tmp_path / "artifacts")
     payload = {
-        "source": "polar",
-        "event_type": "polar.session_completed",
+        "source": "openevo",
+        "event_type": "openevo.session_completed",
         "source_event_id": "session:abc",
         "task_id": "task_1",
         "session_id": "abc",
@@ -295,8 +295,8 @@ async def test_evolution_client_resolve_context_with_mock_transport():
 @pytest.mark.asyncio
 async def test_evolution_client_export_event_with_mock_transport():
     payload = {
-        "source": "polar",
-        "event_type": "polar.session_completed",
+        "source": "openevo",
+        "event_type": "openevo.session_completed",
         "source_event_id": "session:client-test",
         "task_id": "task_1",
         "payload": {"reward": 1.0},
@@ -560,8 +560,8 @@ def test_create_dataset_route(tmp_path):
         event_response = client.post(
             "/v1/events",
             json={
-                "source": "polar",
-                "event_type": "polar.session_completed",
+                "source": "openevo",
+                "event_type": "openevo.session_completed",
                 "source_event_id": "session:dataset-route",
                 "status": "COMPLETED",
                 "reward": 1.0,
@@ -579,7 +579,7 @@ def test_create_dataset_route(tmp_path):
                 "name": "route_dataset",
                 "purpose": "skill_distillation",
                 "query": {
-                    "event_types": ["polar.session_completed"],
+                    "event_types": ["openevo.session_completed"],
                     "status": ["COMPLETED"],
                     "reward_min": 0.8,
                     "policy_version": "policy_route",
@@ -620,8 +620,8 @@ def test_create_dataset_route_rejects_task_tags_without_writes(tmp_path):
         event_response = client.post(
             "/v1/events",
             json={
-                "source": "polar",
-                "event_type": "polar.session_completed",
+                "source": "openevo",
+                "event_type": "openevo.session_completed",
                 "source_event_id": "session:dataset-task-tags",
                 "status": "COMPLETED",
                 "payload": {"session_result": {"trajectory": {"traces": [{"reward": 1.0}]}}},
@@ -721,8 +721,8 @@ def test_backend_event_dataset_job_context_flow(tmp_path):
         event_response = client.post(
             "/v1/events",
             json={
-                "source": "polar",
-                "event_type": "polar.session_completed",
+                "source": "openevo",
+                "event_type": "openevo.session_completed",
                 "source_event_id": "session:backend-flow",
                 "task_id": "task_calculator",
                 "session_id": "session_backend_flow",
@@ -752,7 +752,7 @@ def test_backend_event_dataset_job_context_flow(tmp_path):
                 "name": "calculator_policy_1",
                 "purpose": "text_memory_mining",
                 "query": {
-                    "event_types": ["polar.session_completed"],
+                    "event_types": ["openevo.session_completed"],
                     "status": ["COMPLETED"],
                     "reward_min": 0.8,
                     "policy_version": "policy_1",

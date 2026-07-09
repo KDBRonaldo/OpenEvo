@@ -18,8 +18,8 @@ from openevo.evolution.models import (
 def test_event_ingest_requires_source_identity():
     created_at = datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
     request = EventIngestRequest(
-        source="polar",
-        event_type="polar.session_completed",
+        source="openevo",
+        event_type="openevo.session_completed",
         source_event_id="session:abc",
         created_at=created_at,
         task_id="task_1",
@@ -27,7 +27,7 @@ def test_event_ingest_requires_source_identity():
         payload={"session_result": {"status": "COMPLETED"}},
     )
 
-    assert request.source == "polar"
+    assert request.source == "openevo"
     assert request.created_at == created_at
     assert request.payload["session_result"]["status"] == "COMPLETED"
     assert request.model_dump(mode="json")["created_at"] == "2026-01-02T03:04:05Z"
@@ -36,7 +36,7 @@ def test_event_ingest_requires_source_identity():
 def test_event_ingest_rejects_empty_event_type():
     with pytest.raises(ValidationError) as exc_info:
         EventIngestRequest(
-            source="polar",
+            source="openevo",
             event_type="",
             source_event_id="session:abc",
             payload={},
@@ -50,8 +50,8 @@ def test_event_ingest_rejects_empty_event_type():
 def test_event_ingest_rejects_invalid_created_at():
     with pytest.raises(ValidationError) as exc_info:
         EventIngestRequest(
-            source="polar",
-            event_type="polar.session_completed",
+            source="openevo",
+            event_type="openevo.session_completed",
             source_event_id="session:abc",
             created_at="not-a-date",
             payload={},

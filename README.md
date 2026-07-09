@@ -14,10 +14,10 @@ safer, auditable updates to `AGENTS.md`, then feed those updates back into later
 rollouts without leaking held-out answers.
 
 The original lower-level framework README is preserved as
-[README.polar.md](README.polar.md). Runtime identity strings such as
-`POLAR_*`, `/polar/session`, and `.polar_evolution` remain implementation
-details until the runtime/data identity migration. Lower-level evolution backend
-usage lives in [src/openevo/evolution/README.md](src/openevo/evolution/README.md).
+[README.polar.md](README.polar.md). Runtime/data identity now uses the OpenEvo
+contract: `OPENEVO_*`, `/openevo/session`, and `.openevo/evolution`.
+Lower-level evolution backend usage lives in
+[src/openevo/evolution/README.md](src/openevo/evolution/README.md).
 
 ## Architecture
 
@@ -172,7 +172,7 @@ Defaults:
 - `rollout.url`: `$OPENEVO_ROLLOUT_URL` or `http://127.0.0.1:8080`
 - `evolution.backend_url`: `$OPENEVO_EVOLUTION_URL` or `http://127.0.0.1:8200`
 - `evolution.rounds`: `1`
-- `runtime.kind`: `docker`; `runtime.workdir`: `/polar/session/workspace`
+- `runtime.kind`: `docker`; `runtime.workdir`: `/openevo/session/workspace`
 - `runtime.image`: required when any task sets `workspace`, or when overriding
   runtime fields such as `runtime.env`, `runtime.kind`, or `runtime.workdir`
 - enabled artifacts: `text_memory_reflector`, `skill_bundle_reflector`, and

@@ -1,13 +1,13 @@
 # SWE-bench Verified Example
 
-Evaluate Polar agent harnesses on [SWE-bench Verified](https://huggingface.co/datasets/princeton-nlp/SWE-bench_Verified)
+Evaluate OpenEvo agent harnesses on [SWE-bench Verified](https://huggingface.co/datasets/princeton-nlp/SWE-bench_Verified)
 (500 human-validated tasks). Each task runs an agent inside a per-instance
 container at the repo's `base_commit`, then grades the patch with the official
 `swebench` harness.
 
 ## Prerequisites
 
-Install **Polar** + the SWE-bench extra and **vLLM** as described in the
+Install **OpenEvo** + the SWE-bench extra and **vLLM** as described in the
 [top-level README](../../README.md#installation):
 
 ```bash
@@ -39,12 +39,12 @@ CUDA_VISIBLE_DEVICES=4,5,6,7 vllm serve Qwen/Qwen3.6-27B --port 8001 \
   --reasoning-parser qwen3 --enable-auto-tool-choice --tool-call-parser qwen3_coder
 ```
 
-### 3. Start Polar
+### 3. Start OpenEvo Core Servers
 
 ```bash
-uv run polar serve_rollout -c examples/swebench_verified/topology.yaml
-uv run polar serve_gateway -c examples/swebench_verified/topology.yaml --node-id localhost-node-01
-uv run polar serve_gateway -c examples/swebench_verified/topology.yaml --node-id localhost-node-02
+uv run python -m openevo.rollout.server --config examples/swebench_verified/topology.yaml
+uv run python -m openevo.gateway.server --config examples/swebench_verified/topology.yaml --node-id localhost-node-01
+uv run python -m openevo.gateway.server --config examples/swebench_verified/topology.yaml --node-id localhost-node-02
 ```
 
 ### 4. Submit tasks
@@ -66,10 +66,10 @@ uv run python examples/swebench_verified/submit_swebench_tasks.py --harness code
 
 Use Apptainer instead of Docker with `--runtime-backend apptainer`.
 
-### 5. (Optional) Watch in the dashboard
+### 5. (Optional) Inspect the services
 
 ```bash
-uv run polar dashboard -c examples/swebench_verified/topology.yaml
+curl http://127.0.0.1:8080/health
 ```
 
-Open <http://127.0.0.1:8090> for per-task patches, trajectories, and grading.
+Use the rollout and gateway logs for per-task patches, trajectories, and grading.

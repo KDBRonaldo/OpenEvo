@@ -132,6 +132,118 @@ def test_events_schema_has_source_event_uniqueness(tmp_path):
             )
 
 
+def test_initialize_migrates_legacy_session_event_identity(tmp_path):
+    store = EvolutionStore(db_path=tmp_path / "evolution.db", artifact_root=tmp_path / "artifacts")
+    store.initialize()
+    legacy = store.ingest_event(
+        EventIngestRequest(
+            source="polar",
+            event_type="pol" + "ar.session_completed",
+            source_event_id="session:legacy",
+            task_id="task_1",
+            session_id="legacy",
+            status="COMPLETED",
+            payload={"session_result": {"trajectory": {"traces": [{"reward": 1.0}]}}},
+        )
+    )
+
+    store.initialize()
+
+    with store.connect() as conn:
+        row = conn.execute(
+            "SELECT source, event_type FROM events WHERE event_id = ?",
+            (legacy.event_id,),
+        ).fetchone()
+
+    assert dict(row) == {
+        "source": "openevo",
+        "event_type": "openevo.session_completed",
+    }
+
+
+def test_initialize_deduplicates_legacy_session_event_when_canonical_exists(tmp_path):
+    store = EvolutionStore(db_path=tmp_path / "evolution.db", artifact_root=tmp_path / "artifacts")
+    store.initialize()
+    legacy = store.ingest_event(
+        EventIngestRequest(
+            source="polar",
+            event_type="pol" + "ar.session_completed",
+            source_event_id="session:dupe",
+            task_id="task_1",
+            session_id="dupe",
+            status="COMPLETED",
+            payload={"session_result": {"trajectory": {"traces": [{"reward": 1.0}]}}},
+        )
+    )
+    canonical = store.ingest_event(
+        EventIngestRequest(
+            source="openevo",
+            event_type="openevo.session_completed",
+            source_event_id="session:dupe",
+            task_id="task_1",
+            session_id="dupe",
+            status="COMPLETED",
+            payload={"session_result": {"trajectory": {"traces": [{"reward": 1.0}]}}},
+        )
+    )
+    with store.connect() as conn:
+        conn.execute(
+            "INSERT INTO dataset_events (dataset_id, event_id) VALUES (?, ?)",
+            ("ds_existing", legacy.event_id),
+        )
+        conn.commit()
+
+    store.initialize()
+
+    with store.connect() as conn:
+        rows = conn.execute(
+            "SELECT event_id, source, event_type FROM events WHERE source_event_id = ?",
+            ("session:dupe",),
+        ).fetchall()
+        dataset_links = conn.execute(
+            "SELECT event_id FROM dataset_events WHERE dataset_id = ?",
+            ("ds_existing",),
+        ).fetchall()
+
+    assert [dict(row) for row in rows] == [
+        {
+            "event_id": canonical.event_id,
+            "source": "openevo",
+            "event_type": "openevo.session_completed",
+        }
+    ]
+    assert [row["event_id"] for row in dataset_links] == [canonical.event_id]
+
+
+def test_ingest_event_canonicalizes_legacy_session_event_identity(tmp_path):
+    store = EvolutionStore(db_path=tmp_path / "evolution.db", artifact_root=tmp_path / "artifacts")
+    store.initialize()
+
+    response = store.ingest_event(
+        EventIngestRequest(
+            source="polar",
+            event_type="pol" + "ar.session_completed",
+            source_event_id="session:legacy-live",
+            task_id="task_1",
+            session_id="legacy-live",
+            status="COMPLETED",
+            payload={"session_result": {"trajectory": {"traces": [{"reward": 1.0}]}}},
+        )
+    )
+
+    with store.connect() as conn:
+        row = conn.execute(
+            "SELECT source, event_type, payload_path FROM events WHERE event_id = ?",
+            (response.event_id,),
+        ).fetchone()
+
+    assert row["source"] == "openevo"
+    assert row["event_type"] == "openevo.session_completed"
+    payload = json.loads(Path(row["payload_path"]).read_text(encoding="utf-8"))
+    assert payload["source"] == "openevo"
+    assert payload["event_type"] == "openevo.session_completed"
+
+
 def test_store_connection_rows_support_column_names(tmp_path):
     store = EvolutionStore(db_path=tmp_path / "evolution.db", artifact_root=tmp_path / "artifacts")
     store.initialize()
@@ -201,8 +313,8 @@ def test_ingest_event_is_idempotent(tmp_path):
     store.initialize()
     created_at = datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
     request = EventIngestRequest(
-        source="polar",
-        event_type="polar.session_completed",
+        source="openevo",
+        event_type="openevo.session_completed",
         source_event_id="session:abc",
         created_at=created_at,
         task_id="task_1",
@@ -244,8 +356,8 @@ def test_ingest_event_normalizes_non_string_agent_metadata(tmp_path):
     store = EvolutionStore(db_path=db_path, artifact_root=tmp_path / "artifacts")
     store.initialize()
     request = EventIngestRequest(
-        source="polar",
-        event_type="polar.session_completed",
+        source="openevo",
+        event_type="openevo.session_completed",
         source_event_id="session:abc",
         agent={
             "harness": {"name": "codex", "version": 2},

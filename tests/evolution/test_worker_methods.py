@@ -1919,7 +1919,7 @@ def test_agent_system_history_reflector_consumes_human_feedback(
                                 "file_path": "/secret.txt",
                                 "workspace_path": "/workspace/prod/key.pem",
                                 "app_path": "/app/secret.txt",
-                                "polar_path": "/polar/session/evolution/memory.md",
+                                "polar_path": "/openevo/session/evolution/memory.md",
                                 "windows_program_path": r"C:\Program Files\secret.txt",
                                 "windows_user_path": r"C:\Users\Alice Smith\secret.txt",
                                 "unc_path": r"\\server\share\secret.txt",
@@ -2138,7 +2138,7 @@ def test_agent_system_history_reflector_consumes_human_feedback(
     assert "/secret.txt" not in prompt
     assert "/workspace/prod/key.pem" not in prompt
     assert "/app/secret.txt" not in prompt
-    assert "/polar/session/evolution/memory.md" not in prompt
+    assert "/openevo/session/evolution/memory.md" not in prompt
     assert r"C:\Users\alice\secret.txt" not in prompt
     assert "Program Files" not in prompt
     assert "Alice Smith" not in prompt
@@ -2217,8 +2217,8 @@ def test_agent_system_history_reflector_consumes_store_sanitized_human_feedback(
     store.initialize()
     store.ingest_event(
         EventIngestRequest(
-            source="polar",
-            event_type="polar.session_completed",
+            source="openevo",
+            event_type="openevo.session_completed",
             source_event_id="session:store-human-feedback",
             task_id="task_store_human_feedback",
             session_id="session_store_human_feedback",
@@ -2257,7 +2257,7 @@ def test_agent_system_history_reflector_consumes_store_sanitized_human_feedback(
             name="store-human-feedback",
             purpose="agent_system_evolution",
             query={
-                "event_types": ["polar.session_completed"],
+                "event_types": ["openevo.session_completed"],
                 "status": ["COMPLETED"],
             },
         )

@@ -147,7 +147,7 @@ Codex 配置影响 Polar 任务。其他订阅式 harness 也应遵守同样边�
 transcript capture 负责 evolution 可消费的行为记录。
 当 Codex subscription session 未显式提供容器内登录目录时，gateway 会把宿主机
 `~/.codex/auth.json` staging 到 per-session bind mount 下的默认 `CODEX_HOME`
-（`/polar/session/.codex`），这样远端 host 登录态可以被容器内 Codex CLI 使用。
+（`/openevo/session/.codex`），这样远端 host 登录态可以被容器内 Codex CLI 使用。
 
 ## 主要模块
 

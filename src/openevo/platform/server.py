@@ -1,4 +1,4 @@
-"""FastAPI app for `polar dashboard`."""
+"""FastAPI app for the internal OpenEvo platform service."""
 
 from __future__ import annotations
 
@@ -145,7 +145,7 @@ def _mount_static(app: FastAPI) -> None:
         async def _no_frontend() -> dict[str, Any]:
             return {
                 "status": "ok",
-                "message": "Polar platform service running. Frontend not built yet.",
+                "message": "OpenEvo platform service running. Frontend not built yet.",
                 "build_with": "cd web && pnpm install && pnpm build",
                 "api_docs": "/docs",
             }

@@ -80,8 +80,8 @@ async def test_codex_setup_installs_static_and_evolution_skills(tmp_path):
     harness = CodexHarness(
         AgentSpec(
             harness="codex",
-            skills_path="/polar/static-skills",
-            env={"POLAR_SKILLS_DIR": "/polar/session/evolution/skills"},
+            skills_path="/openevo/static-skills",
+            env={"OPENEVO_SKILLS_DIR": "/openevo/session/evolution/skills"},
         )
     )
     runtime = RecordingRuntime(tmp_path)
@@ -90,8 +90,8 @@ async def test_codex_setup_installs_static_and_evolution_skills(tmp_path):
 
     copy_commands = [command for command in runtime.commands if ".agents/skills" in command]
     joined = "\n".join(copy_commands)
-    assert "cp -r /polar/static-skills/* $HOME/.agents/skills/" in joined
-    assert "cp -r /polar/session/evolution/skills/* $HOME/.agents/skills/" in joined
+    assert "cp -r /openevo/static-skills/* $HOME/.agents/skills/" in joined
+    assert "cp -r /openevo/session/evolution/skills/* $HOME/.agents/skills/" in joined
 
 
 @pytest.mark.asyncio
@@ -99,7 +99,7 @@ async def test_codex_setup_overwrites_config_without_mcp_servers(tmp_path):
     harness = CodexHarness(
         AgentSpec(
             harness="codex",
-            env={"CODEX_HOME": "/polar/session/preauthenticated-codex"},
+            env={"CODEX_HOME": "/openevo/session/preauthenticated-codex"},
         )
     )
     runtime = RecordingRuntime(tmp_path)
@@ -107,7 +107,7 @@ async def test_codex_setup_overwrites_config_without_mcp_servers(tmp_path):
     await harness.setup(runtime)
 
     joined = "\n".join(runtime.commands)
-    assert "cat > /polar/session/preauthenticated-codex/config.toml" in joined
+    assert "cat > /openevo/session/preauthenticated-codex/config.toml" in joined
     assert '[mcp_servers."' not in joined
 
 
@@ -116,7 +116,7 @@ async def test_codex_setup_preserves_native_memory_by_default(tmp_path):
     harness = CodexHarness(
         AgentSpec(
             harness="codex",
-            env={"CODEX_HOME": "/polar/session/preauthenticated-codex"},
+            env={"CODEX_HOME": "/openevo/session/preauthenticated-codex"},
         )
     )
     runtime = RecordingRuntime(tmp_path)
@@ -124,7 +124,7 @@ async def test_codex_setup_preserves_native_memory_by_default(tmp_path):
     await harness.setup(runtime)
 
     joined = "\n".join(runtime.commands)
-    assert "/polar/session/preauthenticated-codex/config.toml" in joined
+    assert "/openevo/session/preauthenticated-codex/config.toml" in joined
     assert "/memories" not in joined
     assert "memories_" not in joined
     assert "auth.json" not in joined
@@ -136,7 +136,7 @@ async def test_codex_setup_clears_native_memory_when_requested(tmp_path):
         AgentSpec(
             harness="codex",
             settings={"native_memory_policy": "clear"},
-            env={"CODEX_HOME": "/polar/session/preauthenticated-codex"},
+            env={"CODEX_HOME": "/openevo/session/preauthenticated-codex"},
         )
     )
     runtime = RecordingRuntime(tmp_path)
@@ -151,8 +151,8 @@ async def test_codex_setup_clears_native_memory_when_requested(tmp_path):
     assert len(cleanup_commands) == 1
     cleanup = cleanup_commands[0]
     assert cleanup.startswith("rm -rf -- ")
-    assert "/polar/session/preauthenticated-codex/memories" in cleanup
-    assert "/polar/session/preauthenticated-codex/memories_*.sqlite*" in cleanup
+    assert "/openevo/session/preauthenticated-codex/memories" in cleanup
+    assert "/openevo/session/preauthenticated-codex/memories_*.sqlite*" in cleanup
     assert "auth.json" not in cleanup
     assert "state_" not in cleanup
     assert "logs_" not in cleanup
@@ -193,7 +193,7 @@ async def test_codex_setup_uses_configured_codex_home_for_mcp_servers(tmp_path):
     harness = CodexHarness(
         AgentSpec(
             harness="codex",
-            env={"CODEX_HOME": "/polar/session/preauthenticated-codex"},
+            env={"CODEX_HOME": "/openevo/session/preauthenticated-codex"},
             mcp_servers=[
                 MCPServerSpec(
                     name="repo-tools",
@@ -209,9 +209,9 @@ async def test_codex_setup_uses_configured_codex_home_for_mcp_servers(tmp_path):
     await harness.setup(runtime)
 
     joined = "\n".join(runtime.commands)
-    assert "mkdir -p /polar/session/preauthenticated-codex" in joined
-    assert "cat > /polar/session/preauthenticated-codex/config.toml" in joined
-    assert "cat > /polar/session/.codex/config.toml" not in joined
+    assert "mkdir -p /openevo/session/preauthenticated-codex" in joined
+    assert "cat > /openevo/session/preauthenticated-codex/config.toml" in joined
+    assert "cat > /openevo/session/.codex/config.toml" not in joined
     assert '[mcp_servers."repo-tools"]' in joined
 
 
@@ -275,7 +275,7 @@ def test_codex_run_steps_subscription_auth_mode_uses_existing_login_state():
             harness="codex",
             model_name="gpt-5.5",
             settings={"auth_mode": "subscription", "capture_mode": "transcript"},
-            env={"CODEX_HOME": "/polar/session/preauthenticated-codex"},
+            env={"CODEX_HOME": "/openevo/session/preauthenticated-codex"},
         )
     )
 
@@ -292,7 +292,7 @@ def test_codex_run_steps_subscription_auth_mode_uses_existing_login_state():
     assert "harness_proxy" not in step.command
     assert "model_providers.harness_proxy" not in step.command
     assert step.env is not None
-    assert step.env["CODEX_HOME"] == "/polar/session/preauthenticated-codex"
+    assert step.env["CODEX_HOME"] == "/openevo/session/preauthenticated-codex"
 
 
 def test_codex_subscription_auth_mode_requires_transcript_capture_option():
@@ -353,7 +353,7 @@ def test_claude_run_steps_subscription_auth_mode_uses_existing_login_state():
     assert "claude --verbose" in step.command
     assert "--model opus" in step.command
     assert step.env is not None
-    assert step.env["CLAUDE_CONFIG_DIR"] == "/polar/session/.claude"
+    assert step.env["CLAUDE_CONFIG_DIR"] == "/openevo/session/.claude"
     assert step.env["ANTHROPIC_MODEL"] == "opus"
 
 
@@ -399,26 +399,26 @@ def test_openhands_run_steps_passes_static_and_evolution_skill_paths():
     harness = OpenHandsSdkHarness(
         AgentSpec(
             harness="openhands_sdk",
-            skills_path="/polar/static-skills",
-            env={"POLAR_SKILLS_DIR": "/polar/session/evolution/skills"},
+            skills_path="/openevo/static-skills",
+            env={"OPENEVO_SKILLS_DIR": "/openevo/session/evolution/skills"},
         )
     )
 
     step = harness.run_steps("Do work.")[0]
 
     assert step.env is not None
-    assert step.env["SKILL_PATHS"] == ("/polar/session/evolution/skills:/polar/static-skills")
+    assert step.env["SKILL_PATHS"] == ("/openevo/session/evolution/skills:/openevo/static-skills")
 
 
 def test_openhands_run_steps_uses_evolution_skill_path_without_static_path():
     harness = OpenHandsSdkHarness(
         AgentSpec(
             harness="openhands_sdk",
-            env={"POLAR_SKILLS_DIR": "/polar/session/evolution/skills"},
+            env={"OPENEVO_SKILLS_DIR": "/openevo/session/evolution/skills"},
         )
     )
 
     step = harness.run_steps("Do work.")[0]
 
     assert step.env is not None
-    assert step.env["SKILL_PATHS"] == "/polar/session/evolution/skills"
+    assert step.env["SKILL_PATHS"] == "/openevo/session/evolution/skills"

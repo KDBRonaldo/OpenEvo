@@ -7,7 +7,7 @@ image through the local vLLM OpenAI-compatible backend.
 
 ## Prerequisites
 
-Install **Polar** and **vLLM** as described in the [top-level README](../../README.md#installation).
+Install **OpenEvo** and **vLLM** as described in the [top-level README](../../README.md#installation).
 This example uses 1 node 8×B200 — two vLLM servers (tensor-parallel 4 each).
 Adjust the setup and topology for your hardware.
 
@@ -31,12 +31,12 @@ CUDA_VISIBLE_DEVICES=4,5,6,7 vllm serve Qwen/Qwen3.6-27B --port 8001 \
   --reasoning-parser qwen3 --enable-auto-tool-choice --tool-call-parser qwen3_coder
 ```
 
-### 3. Start Polar Servers
+### 3. Start OpenEvo Core Servers
 
 ```bash
-uv run polar serve_rollout -c examples/count_stars/topology.yaml
-uv run polar serve_gateway -c examples/count_stars/topology.yaml --node-id localhost-node-01
-uv run polar serve_gateway -c examples/count_stars/topology.yaml --node-id localhost-node-02
+uv run python -m openevo.rollout.server --config examples/count_stars/topology.yaml
+uv run python -m openevo.gateway.server --config examples/count_stars/topology.yaml --node-id localhost-node-01
+uv run python -m openevo.gateway.server --config examples/count_stars/topology.yaml --node-id localhost-node-02
 ```
 
 ### 4. Run
@@ -49,11 +49,11 @@ uv run python examples/count_stars/run.py
 
 Use Apptainer instead of Docker with `--backend apptainer`.
 
-### 5. (Optional) Watch in the dashboard
+### 5. (Optional) Inspect the services
 
 ```bash
-uv run polar dashboard -c examples/count_stars/topology.yaml
+curl http://127.0.0.1:8080/health
 ```
 
-Open <http://127.0.0.1:8090> to inspect each harness's image reasoning and
+Use the rollout and gateway logs to inspect each harness's image reasoning and
 the answer it wrote.

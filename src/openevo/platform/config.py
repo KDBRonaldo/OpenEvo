@@ -10,7 +10,7 @@ from openevo.config import TopologyConfig
 
 @dataclass(slots=True)
 class PlatformConfig:
-    """Resolved configuration for `polar dashboard`."""
+    """Resolved configuration for the internal OpenEvo platform service."""
 
     host: str
     port: int

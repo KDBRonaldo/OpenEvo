@@ -1,4 +1,4 @@
-"""CLI argument registration for `polar dashboard`."""
+"""CLI argument registration for the internal OpenEvo platform service."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from openevo.platform.server import serve
 def add_subcommand(subparsers: argparse._SubParsersAction) -> argparse.ArgumentParser:
     parser = subparsers.add_parser(
         "dashboard",
-        help="Start the Polar observability dashboard.",
+        help="Start the OpenEvo observability service.",
     )
     parser.add_argument(
         "-c",

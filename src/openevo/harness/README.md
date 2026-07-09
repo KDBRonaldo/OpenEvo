@@ -65,7 +65,7 @@ lines.
 ### Codex native memory
 
 The Codex preset stores Codex CLI state under `CODEX_HOME`, defaulting to
-`/polar/session/.codex` inside the runtime. OpenEvo preserves that state by
+`/openevo/session/.codex` inside the runtime. OpenEvo preserves that state by
 default. To start a Codex run without native Codex memory, set:
 
 ```yaml
@@ -78,7 +78,7 @@ agent:
 This removes `CODEX_HOME/memories/` and `CODEX_HOME/memories_*.sqlite*` during
 harness setup, while leaving auth and config files such as `auth.json` and
 `config.toml` in place. OpenEvo textual memory remains separate: selected
-`text_memory` artifacts are staged as `POLAR_MEMORY_FILE` and prepended to the
+`text_memory` artifacts are staged as `OPENEVO_MEMORY_FILE` and prepended to the
 agent instruction.
 
 ## The harness contract

@@ -13,3 +13,7 @@ python3 scripts/ci/audit_openevo_identity.py
 
 The migration is complete only after the final identity guard in Task 9 passes
 without an allowlist for public Polar runtime identity.
+
+The audit report separates `active_matches` from `archived_matches`.
+`active_matches` cover the current product surface; `archived_matches` cover
+historical plans, specs, and debug notes that are not release-facing.

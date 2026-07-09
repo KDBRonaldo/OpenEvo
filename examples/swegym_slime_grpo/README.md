@@ -1,7 +1,8 @@
 # SWE-Gym Slime GRPO
 
 End-to-end **training** example: train **Qwen3.5-4B** with async **GRPO** on
-**SWE-Gym** tasks, using **Polar** for agent rollouts and **Slime** for training.
+**SWE-Gym** tasks, using **OpenEvo Core** for agent rollouts and **Slime** for
+training.
 Targets a single node with 8× B200 (2 GPUs train, 6 serve).
 
 > Unlike the rollout demos (calculator / count_stars / swebench_verified), this
@@ -10,9 +11,9 @@ Targets a single node with 8× B200 (2 GPUs train, 6 serve).
 
 ## Prerequisites
 
-Install Polar and SGLang per [Polar installation](../../README.md#installation).
+Install OpenEvo and SGLang per [OpenEvo installation](../../README.md#installation).
 
-Make sure to install Polar's optional swebench dependency for evaluation.
+Make sure to install OpenEvo's optional swebench dependency for evaluation.
 ```
 uv pip install -e ".[swebench]"
 ```
@@ -30,31 +31,30 @@ It clones Slime + Megatron-LM, installs the training-stack extras (Transformer
 Engine; Flash Linear Attention; flash-attn on B200), applies the Slime/SGLang
 patches, builds the
 293-task SWE-Gym JSONL, pulls the Apptainer images + shared agent CLIs, converts
-the Qwen weights to torch_dist, then hands off to `run.sh` (Polar services + Ray + the Slime training job).
+the Qwen weights to torch_dist, then hands off to `run.sh` (OpenEvo services + Ray + the Slime training job).
 
-## (Optional) Watch rollouts in the dashboard
+## (Optional) Inspect rollouts
 
-While training runs, start the dashboard **from the repo root** (so its
-`./rollout_results` path matches the rollout server's) to inspect live agent
-sessions, trajectories, and the rewards feeding each training step:
+While training runs, inspect the rollout and gateway logs, or query the rollout
+health endpoint from the repo root:
 
 ```bash
-uv run polar dashboard -c tmp/swegym_slime_grpo/topology.yaml
+curl http://127.0.0.1:8080/health
 ```
 
-Open <http://127.0.0.1:8090>. (`tmp/swegym_slime_grpo/topology.yaml` is the
-rendered topology that `run.sh` writes at launch.)
+`tmp/swegym_slime_grpo/topology.yaml` is the rendered topology that `run.sh`
+writes at launch.
 
 ## Files
 
 | File | Purpose |
 |---|---|
 | `launch_e2e.sh` | One-shot entry: setup + run |
-| `run.sh` | Launches Polar services + Ray + Slime training job |
+| `run.sh` | Launches OpenEvo services + Ray + Slime training job |
 | `convert_weights.sh` | HF checkpoint → Megatron torch_dist |
 | `model_args.sh` | Qwen3.5-4B Megatron args, shared by `run.sh` + `convert_weights.sh` |
-| `topology.yaml` | Polar topology template (`${SGLANG_ROUTER_BASE_URL}` filled at runtime) |
-| `polar_config.yaml` | Polar bridge config template (`${AGENT_CLI_DIR}`, `${APPTAINER_IMAGE_DIR}` filled at runtime) |
+| `topology.yaml` | OpenEvo topology template (`${SGLANG_ROUTER_BASE_URL}` filled at runtime) |
+| `polar_config.yaml` | OpenEvo bridge config template (`${AGENT_CLI_DIR}`, `${APPTAINER_IMAGE_DIR}` filled at runtime) |
 | `prepare_data.py` | Builds `swegym_train_293.jsonl` |
 | `prepare_apptainer_images.py` | Pulls per-task SIF images, builds shared Node + agent CLI dir |
 | `sample_tasks.py` | Dataset helpers (HF fetch, registry image lookup) |

@@ -26,7 +26,7 @@ from dataset import (
 
 EXAMPLE_DIR = Path(__file__).resolve().parent
 IMAGE_LAYOUT_VERSION = "1"
-IMAGE_VERSION_LABEL = "io.polar.swebench-image-version"
+IMAGE_VERSION_LABEL = "io.openevo.swebench-image-version"
 
 
 def parse_args() -> argparse.Namespace:
@@ -123,7 +123,7 @@ def main() -> int:
             run_command([
                 "docker", "build",
                 "--build-arg", f"BASE_IMAGE={base_image}",
-                "--build-arg", f"POLAR_SWEBENCH_IMAGE_VERSION={IMAGE_LAYOUT_VERSION}",
+                "--build-arg", f"OPENEVO_SWEBENCH_IMAGE_VERSION={IMAGE_LAYOUT_VERSION}",
                 "--tag", runtime_image,
                 str(dockerfile_dir),
             ])
