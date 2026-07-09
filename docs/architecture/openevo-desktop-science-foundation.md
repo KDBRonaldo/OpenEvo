@@ -179,7 +179,10 @@ graph for high or critical advisories, rebuilds the OpenEvo-only Desktop assets,
 verifies that the committed package assets match `web/dist`, builds the Python
 wheel, inspects the wheel metadata, console scripts, packaged asset references,
 and forbidden shared-dashboard payloads, then installs the wheel into a clean
-environment and runs the installed OpenEvo CLI and Desktop app smoke checks:
+environment and runs the installed OpenEvo CLI and Desktop API smoke checks.
+The installed-wheel smoke covers Core capabilities, method metadata, project
+config save, workspace, bootstrap, services, service status, run launch, run
+artifact summary parsing, and artifact content reading:
 
 ```bash
 cd web
@@ -512,10 +515,11 @@ This slice adds a command-and-health-check service supervisor plus a local
 sidecar run supervisor with one latest run per config-backed session. It does
 not survive sidecar process restarts, stream incremental remote log files,
 cancel remote process groups, expose resume, restart the sidecar process, run
-Docker Compose, restart crashed remote daemons, transfer artifact contents or
-diffs into Desktop, tune GPU placement or quantization for vLLM, or manage
-dynamic adapters. Those operations remain behind future remote lifecycle
-contracts.
+Docker Compose, restart crashed remote daemons, browse artifact diffs, tune GPU
+placement or quantization for vLLM, or manage dynamic adapters. Those
+operations remain behind future remote lifecycle contracts. Human-readable
+artifact content for `text_memory`, `skill_bundle`, and `agent_system` is
+available through the latest-run artifact content endpoint.
 
 ## CLI
 
@@ -532,16 +536,17 @@ workspace paths.
 
 The current release includes local Desktop serving, config-backed sidecar
 sessions, SSH-backed remote workspace preparation, remote bootstrap,
-command-based service startup, run supervision, and terminal-run artifact
-summary display. It still does not include:
+command-based service startup, run supervision, terminal-run artifact summary
+display, and human-readable artifact content viewing. It still does not include:
 
 - local credential vault or SSH tunnel management;
-- Electron/native-app packaging or a supervised local sidecar daemon outside
-  the `openevo desktop open` / `openevo desktop serve` process;
+- native sidecar supervision, auto-update, or OS credential vault integration
+  outside the current minimal Tauri shell and `openevo desktop open` /
+  `openevo desktop serve` process;
 - Docker Compose lifecycle management;
 - production vLLM lifecycle tuning, restart policy, GPU placement, or dynamic
   adapter loading;
-- artifact content transfer or diff browsing in Desktop;
+- artifact diff browsing in Desktop;
 - parametric memory or adapter training for Science Projects.
 
 Those capabilities remain separate layers above or below the Science Project

@@ -1,8 +1,10 @@
-# Polar Evolution Backend（演化后端）
+# OpenEvo Core Evolution Backend（演化后端）
 
-Polar Evolution Backend 是独立的 skill/memory evolution 控制面。它从 Polar
-接收 session events，物化 datasets，把 jobs 租约给 workers，注册产出的
-artifacts，并为未来的 gateway sessions 解析 runtime context。
+OpenEvo Core Evolution Backend 是独立的 skill/memory/agent-system/adapter
+evolution 控制面。实现包名当前仍是 `polar_evolution`；这是历史实现层命名，不是
+新的产品边界。Backend 从 OpenEvo Core/Polar runtime 接收 session events，物化
+datasets，把 jobs 租约给 workers，注册产出的 artifacts，并为未来的 gateway
+sessions 解析 runtime context。
 
 这个 backend 有意不负责训练模型，也不负责 serving inference。训练、research
 methods、adapter 生产都在 workers 中执行。backend 只保存它们的输出 artifacts，

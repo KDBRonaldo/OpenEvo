@@ -1,19 +1,31 @@
-# Polar 开发指南
+# OpenEvo 开发指南
 
 本文件给 Codex/开发者提供仓库级协作约定。开始改代码前先读本文件，再按相关模块
 README 和 `docs/architecture/` 补上下文。
 
 ## 项目定位
 
-Polar 是面向真实 agent harness 的 rollout、gateway 和 evolution backend 系统。它的
-核心目标是把 agent 运行过程稳定地转成可训练、可评估、可演化的数据，并把演化后的
-memory、skill、agent system 和 parametric memory 注入后续 session。
+OpenEvo 是面向真实 agent harness 的 evolution 系统，当前对外产品面包括：
+
+- **OpenEvo Core**：执行、trajectory/transcript capture、dataset/job/artifact、method
+  registry、context resolve、runtime injection 和 benchmark adapter 的统一 contract。
+- **OpenEvo Desktop**：面向普通科研用户的 macOS 桌面应用，用于配置远程服务器、启动
+  OpenEvo Core 后端、运行 science task，并监控 memory、skill、agent-system 等演化过程。
+- **OpenEvo Dev Kit**：面向 OpenEvo 开发者的 CLI、源码、测试、benchmark 和 method
+  development 工具。
+
+仓库中仍保留 `src/polar/`、`src/polar_evolution/`、`POLAR_*` 环境变量和若干
+`polar` console script 名称。这些是历史/实现层命名，不是新的产品边界。对外设计和新文档
+应以 OpenEvo Core、OpenEvo Desktop 和 OpenEvo Dev Kit 为主。
+
+OpenEvo Core 的核心目标是把 agent 运行过程稳定地转成可训练、可评估、可演化的数据，并
+把演化后的 memory、skill、agent system 和 parametric memory 注入后续 session。
 
 当前系统有两条明确的数据路径：
 
-- Token-level training path：agent 经过 Polar LLM proxy，Polar 捕获 completion
+- Token-level training path：agent 经过 Core/Polar LLM proxy，Core 捕获 completion
   records，并构造包含 token ids、loss mask、logprobs 的 trajectory。
-- Pure-text evolution path：agent 不一定经过 Polar proxy，Polar 或外部 harness 只要求
+- Pure-text evolution path：agent 不一定经过 Core proxy，Core 或外部 harness 只要求
   提供可解析的 text/transcript trajectory，用于 skill、memory、agent-system 等文本
   自进化。
 
@@ -25,7 +37,10 @@ harness 只要能提供稳定 transcript，都应能接入 pure-text evolution�
 
 ## 目录结构
 
-- `src/polar/`: Polar 主包。
+- `src/openevo/`: OpenEvo Core facade、Desktop/Science config、remote lifecycle、sidecar
+  API 和 Dev Kit CLI。
+- `web/`: OpenEvo Desktop 的 React/Vite/Tauri 前端。
+- `src/polar/`: 低层 gateway、rollout、runtime 和 harness implementation package。
 - `src/polar/agent/`: agent harness contract 和 Codex、Claude Code、OpenHands 等 presets。
 - `src/polar/gateway/`: gateway server、LLM proxy、runtime lifecycle、completion capture、
   evolution context 注入。
@@ -35,7 +50,8 @@ harness 只要能提供稳定 transcript，都应能接入 pure-text evolution�
 - `src/polar/rollout/`: rollout server、pipeline、balancer、result aggregation。
 - `src/polar_evolution/`: Evolution Backend，包含 events、datasets、jobs、workers、
   artifacts 和 context resolver。
-- `docs/architecture/`: 系统架构、evolution API、runtime context、worker 接口文档。
+- `docs/architecture/`: OpenEvo Core/Desktop/Dev Kit 架构、evolution API、runtime
+  context、worker 接口文档。
 - `tests/`: regression tests，通常按 gateway、trajectory、evolution、rollout 等行为组织。
 
 更多模块边界见各目录下的 `README.md`。

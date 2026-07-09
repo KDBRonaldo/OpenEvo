@@ -1,7 +1,8 @@
 # Evolution Runtime Context（演化运行时上下文）
 
-本文说明 Evolution Backend 选出的 artifacts 如何在一个正在运行的 Polar session
-中真正可用。
+本文说明 Evolution Backend 选出的 artifacts 如何在一个正在运行的 OpenEvo
+Core/Polar runtime session 中真正可用。文中的 `/polar/session` 路径和 `POLAR_*`
+环境变量是当前实现层 contract。
 
 Runtime context 的注入发生在 gateway session 被 dispatch 之后、agent harness
 `setup()` 之前。这个时机允许 Polar 在 agent 启动前 staging skills 和 memory，

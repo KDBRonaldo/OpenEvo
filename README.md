@@ -13,11 +13,11 @@ The current Core focus is to turn completed trajectories or transcripts into
 safer, auditable updates to `AGENTS.md`, then feed those updates back into later
 rollouts without leaking held-out answers.
 
-The previous root README described the original lower-level framework. It is
-preserved as [README.polar.md](README.polar.md). Implementation modules still
-use `polar` and `polar_evolution` package names in places; public OpenEvo
-documentation should treat those as implementation details rather than product
-identity. Lower-level evolution backend usage lives in
+The original lower-level framework README is preserved as
+[README.polar.md](README.polar.md). Implementation modules still use `polar`
+and `polar_evolution` package names in places; public OpenEvo documentation
+should treat those as implementation details rather than product identity.
+Lower-level evolution backend usage lives in
 [src/polar_evolution/README.md](src/polar_evolution/README.md).
 
 ## Architecture
@@ -275,16 +275,23 @@ tasks and results into Core records, datasets, metrics, jobs, artifacts, and
 context inputs rather than implementing a separate evolution backend or method
 registry.
 
-## OpenEvo Desktop Package
+## OpenEvo Desktop Release and Dev Kit Launchers
 
-The installable Python distribution is `openevo`. It bundles the OpenEvo
-Desktop shell, the `openevo` CLI, OpenEvo Core facades, and lower-level runtime
-modules that still provide rollout, gateway, trajectory, and evolution backend
+The ordinary-user macOS release artifact is the OpenEvo Desktop `.dmg` produced
+by the Tauri release workflow. A scientist should install that app, configure a
+remote server inside Desktop, and avoid Python packaging details in the common
+path.
+
+The installable Python distribution is still named `openevo`. It bundles the
+OpenEvo Desktop web shell, the `openevo` CLI, OpenEvo Core facades, the exact
+remote-install wheel used by Desktop bootstrap, and lower-level runtime modules
+that still provide rollout, gateway, trajectory, and evolution backend
 implementation details. The legacy `polar` and `polar-evolution` console
 scripts remain available for backend and migration workflows, but OpenEvo Core,
 Desktop, and Dev Kit are the public product surfaces.
 
-For the local Desktop launcher:
+For Dev Kit, smoke tests, and local debugging, the browser-served Desktop
+launcher remains:
 
 ```bash
 openevo desktop open
@@ -309,20 +316,21 @@ ssh` when those entrypoints should mutate a remote server.
 
 Release wheels are built from the OpenEvo package metadata and include the
 packaged OpenEvo-only Desktop assets under `openevo/desktop/web/`.
-The `OpenEvo release artifact` GitHub Actions workflow runs the same audited
-release smoke path on `v*` tags and manual dispatch, then uploads `dist/*.whl`
-as the `openevo-wheel` artifact.
+The `OpenEvo release artifact` GitHub Actions workflow runs the audited release
+smoke path on `v*` tags and manual dispatch, then uploads both the exact
+`openevo-wheel` artifact and the `openevo-desktop-dmg` macOS artifact.
 The `Publish OpenEvo to PyPI` workflow uses PyPI trusted publishing through
 `pypa/gh-action-pypi-publish@release/v1` and runs when a GitHub release is
 published. Before the first publish, configure the PyPI trusted publisher for
 project `openevo`, repository `CompLifeLab-ZJU/OpenEvo`, workflow
 `.github/workflows/openevo-publish-pypi.yml`, and environment `pypi`.
 
-Before publishing a wheel, run the release smoke flow on Node 22, refresh the
-packaged Desktop assets, and validate the installed wheel. The installed-wheel
-smoke serves `/openevo` from package data and exercises the config-backed Desktop lifecycle
-in dry-run mode, including project config save, workspace, bootstrap, services,
-run launch, and artifact summary parsing:
+Before publishing a wheel or release artifact, run the release smoke flow on
+Node 22, refresh the packaged Desktop assets, and validate the installed wheel.
+The installed-wheel smoke serves `/openevo` from package data and exercises the
+config-backed Desktop lifecycle in dry-run mode, including Core capabilities,
+method metadata, project config save, workspace, bootstrap, services, service
+status, run launch, artifact summary parsing, and artifact content reading:
 
 ```bash
 cd web
@@ -365,33 +373,12 @@ Shared infrastructure that is already implemented:
 - Agent-system audit/repair pass to catch held-out literals and over-specific
   updates before artifact registration.
 
-## Current Dataset Performance
+## Internal Development Evidence
 
-These numbers are local experiment results from the currently available run
-artifacts. They are useful for tracking direction, not a frozen benchmark suite.
-
-| Dataset / setting | Method | Scope | Result | Source artifact |
-|---|---|---:|---|---|
-| Biology component extraction, 5 training bad cases | fixed agentic workflow baseline | 5 articles | Precision 0.715, recall 0.916, F1 0.803 | `/tmp/evolab-5-badcase-selfevolve-3rounds-fixed-20260525T160602Z/comparison_report.md` |
-| Biology component extraction, 28 articles | canonical/source-gated evaluator | 28 articles | Precision 0.852, recall 0.463, F1 0.600 | `/tmp/evolab-28-biology-dynamic-openrouter-before-20260522T011453Z/evaluation_28_processed_source_gated_after_debug/article_aligned_evaluator/evaluation_summary.json` |
-| Biology component extraction, round-3 self-evolved retry | posthoc deterministic evaluator | 28 articles | Precision 0.298, recall 0.717, F1 0.421 | `/tmp/evolab-28-selfevolve-round3-retry-20260526T060535Z/posthoc_deterministic_evaluation_28/promoter_eval_summary.md` |
-| Terminal Bench 2.1, Codex subscription baseline | no evolution, `gpt-5.5` | 89 tasks | Mean reward 0.719; 8 errored trials | `/tmp/tb21-full-codex-gpt55-subscription-cache-20260624-085451/jobs/tb21-full-codex-gpt55-subscription-cache/result.json` |
-| Terminal Bench 2.1, old EvoLab baseline | no evolution, `gpt-5.4-mini` | 89 tasks | Mean reward 0.146 | `/tmp/evolab-tb21-baseline-noevo-20260620-172605/jobs/tb21-full89-evolab-baseline-noevo-gpt54mini-20260620-172605/result.json` |
-| Terminal Bench 2.1, matched official vs wrapper smoke | no evolution, `gpt-5.5` | 10 tasks | Both official Codex and wrapper subscription runs scored 0.900 | `/tmp/tb21-compare-codex-vs-wrapper-20260622-082940/jobs/` |
-| Terminal Bench 2.1, GEPA per-task loop | `agent_system_gepa_reflector` | 10-task smoke | 9/9 already-passing tasks stayed passing; `filter-js-from-html` improved from 0 to 1 in generation 1 | `/tmp/tb21-gepa-loop-5task-20260624-060926/summary.json`, `/tmp/tb21-gepa-loop-remaining5-20260624-071032/summary.json` |
-
-Key interpretation:
-
-- The biology runs exposed a real regression pattern: broad recall rules can
-  inflate recall while collapsing precision. The method-level fix is to use
-  evaluator feedback, promotion gates, and history-aware reflection rather than
-  blindly accepting the latest reflector output.
-- The Terminal Bench wrapper can reproduce the official Codex subscription smoke
-  result on a matched 10-task subset. The full 89-task no-evolution run reaches
-  the expected 70%+ range, but still has verifier and agent timeout errors that
-  should be tracked separately from model correctness.
-- Per-task GEPA-style evolution is promising on targeted failures, but the current
-  evidence is still a smoke test, not a statistically meaningful benchmark.
+Local benchmark and science-run snapshots are tracked as internal development
+evidence, not as a published benchmark suite. See
+[docs/dev/current-dataset-performance.md](docs/dev/current-dataset-performance.md)
+for the current snapshot table and interpretation notes.
 
 ## Roadmap
 
@@ -422,4 +409,4 @@ Key interpretation:
 - Terminal Bench bridge: `src/polar_evolution/terminal_bench_bridge.py`
 - Per-task Terminal Bench loop: `src/polar_evolution/terminal_bench_per_task.py`
 - Architecture docs: `docs/architecture/evolution-api-and-method-integration.md`
-- Original Polar README: [README.polar.md](README.polar.md)
+- Historical lower-level framework README: [README.polar.md](README.polar.md)
