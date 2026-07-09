@@ -617,6 +617,10 @@ def build_task_local_parametric_job_payload(
     task_ids: list[str],
     trainer_timeout_seconds: float = 3600.0,
     target_filters: dict[str, Any] | None = None,
+    purpose: str = "task-local-parametric-memory",
+    builder: str = "terminal_bench_task_local_parametric",
+    manifest_extra: dict[str, Any] | None = None,
+    lineage_method: str | None = None,
 ) -> dict[str, Any]:
     if not records:
         raise ValueError("task-local parametric dataset requires at least one record")
@@ -641,14 +645,16 @@ def build_task_local_parametric_job_payload(
 
     manifest = {
         "name": dataset_name,
-        "purpose": "task-local-parametric-memory",
+        "purpose": purpose,
         "records_path": "records.jsonl",
         "record_count": len(records),
         "task_ids": list(task_ids),
-        "builder": "terminal_bench_task_local_parametric",
+        "builder": builder,
     }
     if target_filters is not None:
         manifest["target_filters"] = target_filters
+    if manifest_extra is not None:
+        manifest.update(manifest_extra)
     manifest_path = dataset_dir / "manifest.json"
     manifest_path.write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n",
@@ -688,7 +694,7 @@ def build_task_local_parametric_job_payload(
                 "base_model": [base_model],
             },
             "lineage": {
-                "method": "terminal_bench_task_local_parametric",
+                "method": lineage_method or builder,
                 "source_task_ids": list(task_ids),
                 "dataset_manifest_uri": manifest_path.resolve().as_uri(),
             },
@@ -708,6 +714,44 @@ def build_task_local_parametric_job_payload(
         },
         "job": job.model_dump(mode="json"),
     }
+
+
+def build_local_success_replay_parametric_job_payload(
+    *,
+    records: list[dict[str, Any]],
+    output_root: Path,
+    dataset_name: str,
+    base_model: str,
+    adapter_id: str,
+    trainer_command: str,
+    trainer_args: list[str],
+    task_ids: list[str],
+    source_trial_dirs: list[Path],
+    selection_filters: dict[str, Any],
+    source_models: list[str] | None = None,
+    trainer_timeout_seconds: float = 3600.0,
+) -> dict[str, Any]:
+    manifest_extra: dict[str, Any] = {
+        "source_trial_dirs": [str(path) for path in source_trial_dirs],
+    }
+    if source_models:
+        manifest_extra["source_models"] = list(source_models)
+    return build_task_local_parametric_job_payload(
+        records=records,
+        output_root=output_root,
+        dataset_name=dataset_name,
+        base_model=base_model,
+        adapter_id=adapter_id,
+        trainer_command=trainer_command,
+        trainer_args=trainer_args,
+        task_ids=task_ids,
+        trainer_timeout_seconds=trainer_timeout_seconds,
+        target_filters=selection_filters,
+        purpose="local-success-replay-parametric-memory",
+        builder="terminal_bench_local_success_replay",
+        manifest_extra=manifest_extra,
+        lineage_method="terminal_bench_local_success_replay",
+    )
 
 
 def _task_local_sft_record(

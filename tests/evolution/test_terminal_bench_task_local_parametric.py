@@ -8,6 +8,7 @@ from polar_evolution.terminal_bench_task_local_parametric import (
     LocalSuccessReplayTrial,
     TaskLocalSelection,
     TrajectoryPoolRow,
+    build_local_success_replay_parametric_job_payload,
     build_local_success_replay_sft_records,
     build_task_local_parametric_job_payload,
     build_task_local_sft_records,
@@ -2134,6 +2135,85 @@ def test_build_local_success_replay_sft_records_applies_tool_and_substring_filte
     assert record["metadata"]["selection_filters"]["require_tool_name"] == "tb_exec"
     assert record["metadata"]["selection_filters"]["exclude_if_input_contains"] == [
         "noisy probe"
+    ]
+
+
+def test_build_local_success_replay_parametric_job_payload_writes_replay_manifest(
+    tmp_path: Path,
+) -> None:
+    record = {
+        "event_id": "local-success-replay:train-fasttext:success:1",
+        "task_id": "train-fasttext",
+        "session_id": "local-success-replay:train-fasttext",
+        "status": "COMPLETED",
+        "reward": 1.0,
+        "traces": [
+            {
+                "prompt_messages": [{"role": "user", "content": "Instruction:\n{}"}],
+                "response_messages": [
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": "call-exec",
+                                "type": "function",
+                                "function": {
+                                    "name": "tb_exec",
+                                    "arguments": {
+                                        "task_id": "terminal-bench-task",
+                                        "command": (
+                                            "python - <<'PY'\nprint('ok')\nPY"
+                                        ),
+                                    },
+                                },
+                            }
+                        ],
+                    }
+                ],
+                "tools": [],
+            }
+        ],
+        "metadata": {
+            "builder": "terminal_bench_local_success_replay",
+            "source_trial_dir": str(tmp_path / "trial"),
+            "source_model": "Qwen/Qwen3.5-9B",
+            "selection_filters": {"allowed_tools": ["tb_exec"]},
+        },
+    }
+
+    payload = build_local_success_replay_parametric_job_payload(
+        records=[record],
+        output_root=tmp_path / "out",
+        dataset_name="tb21-local-success-replay-train-fasttext",
+        base_model="Qwen/Qwen3.5-9B",
+        adapter_id="tb-parametric-memory-train-fasttext-replay",
+        trainer_command="python",
+        trainer_args=[
+            "train_lora.py",
+            "--train-file",
+            "{training_dataset}",
+            "--output-dir",
+            "{adapter_dir}",
+        ],
+        task_ids=["train-fasttext"],
+        source_trial_dirs=[tmp_path / "trial"],
+        selection_filters={"allowed_tools": ["tb_exec"]},
+        source_models=["Qwen/Qwen3.5-9B"],
+    )
+
+    manifest = json.loads(Path(payload["dataset"]["manifest_path"]).read_text())
+    assert manifest["builder"] == "terminal_bench_local_success_replay"
+    assert manifest["purpose"] == "local-success-replay-parametric-memory"
+    assert manifest["source_trial_dirs"] == [str(tmp_path / "trial")]
+    assert manifest["source_models"] == ["Qwen/Qwen3.5-9B"]
+    assert manifest["target_filters"] == {"allowed_tools": ["tb_exec"]}
+    assert payload["job"]["config"]["lineage"]["method"] == (
+        "terminal_bench_local_success_replay"
+    )
+    assert payload["job"]["config"]["training_projection"] == {"type": "full_trace"}
+    assert payload["job"]["config"]["compatibility"]["base_model"] == [
+        "Qwen/Qwen3.5-9B"
     ]
 
 
