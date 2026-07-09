@@ -1697,6 +1697,40 @@ def test_heartbeat_renews_lease_expiration(tmp_path):
     assert _parse_utc(row["lease_expires_at"]) > _parse_utc(original_expires_at)
 
 
+def test_heartbeat_does_not_shorten_long_active_lease(tmp_path):
+    store = EvolutionStore(db_path=tmp_path / "evolution.db", artifact_root=tmp_path / "artifacts")
+    store.initialize()
+    job = store.create_job(JobCreateRequest(method="mock", job_type="text_memory_mining"))
+    claim = store.claim_job(
+        WorkerClaimRequest(
+            worker_id="worker_1",
+            capabilities=["text_memory_mining"],
+            lease_seconds=24 * 60 * 60,
+        )
+    )
+    assert claim.job is not None
+    with store.connect() as conn:
+        original_expires_at = conn.execute(
+            "SELECT lease_expires_at FROM jobs WHERE job_id = ?",
+            (job.job_id,),
+        ).fetchone()["lease_expires_at"]
+
+    result = store.heartbeat_job(
+        job.job_id,
+        WorkerHeartbeatRequest(
+            lease_id=claim.job.lease_id, progress=0.25, message="still running"
+        ),
+    )
+
+    with store.connect() as conn:
+        renewed_expires_at = conn.execute(
+            "SELECT lease_expires_at FROM jobs WHERE job_id = ?",
+            (job.job_id,),
+        ).fetchone()["lease_expires_at"]
+    assert result["state"] == "running"
+    assert _parse_utc(renewed_expires_at) >= _parse_utc(original_expires_at)
+
+
 def test_complete_job_invalid_artifact_marks_failed_and_cleans_registered_artifacts(tmp_path):
     store = EvolutionStore(db_path=tmp_path / "evolution.db", artifact_root=tmp_path / "artifacts")
     store.initialize()

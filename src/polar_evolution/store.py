@@ -2432,13 +2432,17 @@ class EvolutionStore:
         if request.progress is not None:
             _validate_finite_floats(request.progress, "progress")
 
-        lease_expires_at = _utc_dt_to_iso(
-            datetime.now(UTC) + timedelta(seconds=DEFAULT_HEARTBEAT_LEASE_SECONDS)
+        renewed_expires_at = datetime.now(UTC) + timedelta(
+            seconds=DEFAULT_HEARTBEAT_LEASE_SECONDS
         )
         with self.connect() as conn:
             try:
                 conn.execute("BEGIN IMMEDIATE")
-                self._assert_job_lease(conn, job_id, request.lease_id)
+                row = self._assert_job_lease(conn, job_id, request.lease_id)
+                current_expires_at = _parse_utc_iso(str(row["lease_expires_at"]))
+                if current_expires_at > renewed_expires_at:
+                    renewed_expires_at = current_expires_at
+                lease_expires_at = _utc_dt_to_iso(renewed_expires_at)
                 conn.execute(
                     """
                     UPDATE jobs

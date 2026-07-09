@@ -597,8 +597,135 @@ settings 或 metadata 标记 subscription auth 时跳过 `parametric_memory` art
 - `job.config.trainer.command` 指向可执行 trainer；
 - `job.config.trainer.args` 必须包含 `{training_dataset}` 和 `{adapter_dir}` 占位符；
 - `job.config.trainer.timeout_seconds` 默认 600 秒；
+- `job.config.training_projection` 默认 `{"type": "full_trace"}`；也可以设为
+  `{"type": "response_tail", "response_tail_chars": N}`，在保留 prompt messages 的同时只把
+  assistant response 尾部导出到 SFT JSONL，用于避免长工具输出 transcript 掩盖最终成功动作；
+  对 Codex-style Terminal Bench JSONL transcript，也可以设为
+  `{"type": "terminal_bench_final_actions", "max_events": N, "max_output_chars": M}`，
+  只导出最后 N 个 completed command/message events，并限制单个 command output 片段长度；
+  local Qwen/vLLM tool-use 训练可以设为
+  `{"type": "terminal_bench_tool_call_policy", "max_commands": N}`，导出带
+  `assistant.tool_calls` 和 top-level `tools` 的 SFT records，使 Qwen chat template 渲染出
+  vLLM `qwen3_xml` parser 期望的 `<tool_call>` XML；
+  对 local failed rollout 的纠偏训练可以设为
+  `{"type": "terminal_bench_corrective_tool_call_policy", "target_tool_call": {...}}`。
+  该 projection 使用 opt-in 保存到 trace metadata 的 compact `llm_calls`，从真实
+  `system/user/tool...` prefix 导出监督 next tool-call。它可以消费 failed/zero-reward
+  records，并可用 `input_contains` 过滤 prefix；长 prefix 可用 `max_input_tool_messages`
+  保留最近 N 条 tool result，以避免 LoRA trainer 在长上下文上 OOM。Terminal Bench bridge
+  写入的 tool message 可能在 compact stdout 后追加 `Tool result payload` 原始 JSON，
+  如果这导致训练 prefix 与 runtime `llm_calls` prefix 不一致，可设置
+  `strip_input_tool_result_payload=true` 剥离该追加段，并用
+  `max_input_tool_content_chars=N` 对每条 tool-result input content 做字符级上限裁剪。
+  剥离和裁剪发生在 `input_contains` 过滤前，因此过滤词应匹配最终导出的 prefix。
+  这一路径用于修正本地
+  推理策略，不改变默认 successful-only SFT 导出；也可以设置 `stages` 列表，把多个
+  corrective 目标放在同一 projection 中。每个 stage 支持 `name`、二选一的
+  `target_tool_call` 或 `target_assistant_message`、`input_contains`、`max_examples`、
+  `repeat`、`max_input_tool_messages`、`strip_input_tool_result_payload`、
+  `max_input_tool_content_chars` 和 `synthetic_tool_results`，worker 会按 stage 独立扫描
+  saved `llm_calls`，并给导出的 JSONL metadata 标记 stage 和 repeat index。
+  `synthetic_tool_results` 只追加到导出的 SFT prefix 中，用于补齐真实 rollout 没有到达的
+  finish-boundary context，例如 synthetic `tb_run_tests` result 后监督
+  `tb_collect_result`。
+  `target_assistant_message` 会导出不带 `tool_calls` 的普通 assistant message，用于训练
+  `tb_collect_result` 之后的 finish/stop 行为；`password-recovery` short-target 本地
+  smoke 可以使用
+  `{"type": "terminal_bench_password_recovery_shorttarget_recipe", "target_command": "..."}`
+  展开成同样的 staged corrective projection。该 recipe 只改变训练 JSONL 投影配置，
+  不新增 trainer、artifact 或 serving backend；
 - trainer 执行前会清理旧 adapter 目录；
 - 默认 `adapter_format=lora` 时，adapter 目录必须包含 `adapter_config.json`。
+
+使用 chat-template trainer 时，trainer 还必须保证第一个 generated response token 参与
+loss。不要分别 tokenize 完整 conversation 和 generation prefix 后仅按 prefix token 数切
+mask；BPE 可能把 prompt 末尾 token 和 response 开头 token 合并。推荐做法是 render full
+text 和 generation prefix，确认 full 以 prefix 开头，再分别用 `add_special_tokens=False`
+tokenize prefix 与 suffix，拼接 token ids，并只 mask prefix ids。对 Qwen/vLLM tool-use
+records，trainer 必须把 record-level `tools` 传给 `tokenizer.apply_chat_template`，使训练
+格式和 runtime 的 `qwen3_xml` parser 一致。默认 `full_trace` projection 也会保留
+assistant `tool_calls` 空文本消息，并把 trace-level `tools` 写入 SFT JSONL 行，供这类
+trainer 复用。
+
+Task-local Terminal Bench parametric-memory jobs can also be prepared directly
+from a trajectory pool with
+`terminal-bench-task-local-parametric-memory-job`。这一路径要求同一 task 至少有一个失败
+trajectory 和一个成功 trajectory，读取成功 trial 的 `agent/codex.txt` command event，生成
+standalone dataset manifest、`records.jsonl` 和 `parametric_memory_lora_sft`
+`WorkerClaimedJob` JSON。它不写 EvolutionStore；只有显式 `--run-worker` 时才调用本地
+reference method。若多个成功命令匹配过滤条件，builder 会优先选择写入型命令，而不是后续
+存在性检查或 size check。默认 `--target-mode final` 只监督这个选中的成功命令；
+`--target-mode sequence` 会先选定同一个最终目标，再把成功轨迹中到该目标为止的命令拆成
+progressive next-command SFT records，并用 synthetic `tb_exec` tool-result messages 表示
+前序命令状态；若 sequence 长度超过 `--max-records-per-task`，截断会保留靠近最终目标的
+suffix，确保最终目标仍被训练。该模式适合 final write 依赖依赖安装、数据准备或中间文件的
+Terminal Bench recipe。可选 `--target-exec-timeout-seconds` 会把 runtime-compatible
+`timeout_seconds` 写入每个监督 `tb_exec` target，并让导出的 `tb_exec` tool schema 暴露同一
+可选 integer 字段，用于约束本地 tool-call 模型避免生成 malformed optional arguments。该路径
+用于本地/proxy inference 的 parametric-memory ablation，不适用于 Codex subscription
+serving。
+当 `--prompt-style live_replay` 读取 Harbor/EvoLab `llm_calls.jsonl` 时，tool message 应优先使用
+`metadata.tool_result.content` 中的完整工具结果；外层 `content` 可能是给日志展示用的截断文本，
+不能作为 SFT prefix 的唯一来源，否则会丢失 `/app/out.txt` 这类关键任务约束。
+`--include-run-tests-correction` 可在 `--prompt-style live_replay` 和默认
+`--target-mode final` 下额外导出 post-verifier correction record：如果失败本地轨迹中有失败的
+`tb_run_tests` 工具结果，builder 会保留真实的 run-tests 之后 prefix，包括
+`candidate_artifacts` 中 `/app/out.txt present=false` 这类反馈，并继续把成功轨迹中选中的
+`tb_exec` 写入命令作为 target。该开关用于训练“看到 verifier 反馈后修正输出路径/产物”的
+局部记忆，不替代 sequence recipe。
+`--include-collect-result-correction` 用于同一 `live_replay` + final-target 路径，但触发点是
+失败轨迹已经通过 `tb_collect_result` 收集到失败 verifier 结果之后。builder 会保留 collect
+之后的真实 prefix，包括嵌套的失败 `tb_run_tests` result 和 missing artifact feedback，并继续
+监督同一个成功 `tb_exec` target；该开关用于训练“collect_result 明确失败后继续修复”，避免模型
+过早写 report 或停止。
+`--include-tb-exec-failure-correction` 也用于 `live_replay` + final-target 路径，但触发点是
+失败本地轨迹中已经出现失败的 `tb_exec` 工具结果。builder 会保留真实 prefix 到该失败命令输出，
+记录 `target_correction_stage="tb_exec_failure"`、失败工具名、失败工具所在 input-message
+index、可用 exit code，以及 `syntax`、`traceback`、`fasttext`、`parquet`、`model_bin`、
+`timeout` 这类归一化失败标记，并继续监督选中的成功 `tb_exec` target。该开关用于训练
+“看到具体 shell/Python/package/model 失败后继续修复”的局部 parametric memory；它当前不改变
+sequence 对齐逻辑，也不尝试自动匹配每一个失败命令到逐步恢复命令。
+
+本地 vLLM eval 提供 serving-time adapter 兼容层：对通过 vLLM
+`--language-model-only` 服务的 Qwen3.5/Qwen3.6 PEFT LoRA，可在
+`terminal-bench-local-parametric-memory-eval` 中使用
+`--adapter-key-rewrite qwen3_5_vllm_language_model`。该选项复制原始 adapter 到
+`run_root/prepared_adapters/...`，把 `base_model.model.model.layers.*` safetensors key
+改写为 vLLM language-model-only wrapper 期望的
+`base_model.model.model.language_model.layers.*`，并在 summary 中记录 source adapter path、
+serving adapter path、rewrite 名称和改写 key 数。它不改变 evolution artifact 的原始 URI。
+旧的 `qwen3_5_moe_vllm_language_model` 名称仍作为兼容 alias 接受。
+
+本地 parametric-memory eval 还会把 solver output budget 作为 serving contract 记录并传给
+Harbor/EvoLab agent。`requested_max_output_tokens` 是 CLI 请求值，实际
+`EVOLAB_TB_MAX_OUTPUT_TOKENS` 和 summary `max_output_tokens` 会被
+`context_reserve_tokens` clamp；默认 `context_window_tokens=16384`、
+`context_reserve_tokens=1536`，并且 managed vLLM server 使用同一个
+`context_window_tokens` 作为 `--max-model-len`。这样可以避免长 Terminal Bench tool-use
+transcript 在后续 turn 中让 `input_tokens + max_output_tokens` 超过 serving window。
+需要打开 Terminal-Bench/EvoLab 包级 direct-solver 行为开关时，使用
+`terminal-bench-local-parametric-memory-eval --agent-env KEY=VALUE`。该接口只允许
+`EVOLAB_TB_*` key，并拒绝覆盖 OpenEvo 控制的模型、模式和 token-budget 环境变量；summary
+中记录 redacted `agent_env`。例如 stop-after-success 这类 guard 可以通过包级
+`EVOLAB_TB_REQUIRE_SUCCESSFUL_COLLECT=1` 和
+`EVOLAB_TB_DIRECT_SOLVER_COMPLETION_GUARD=successful_collect` 打开；solve-focused adapter
+实验也可以用包级
+`EVOLAB_TB_DIRECT_SOLVER_COMPLETION_GUARD=successful_auto_tested_exec` 在成功 `tb_exec` 后
+自动运行固定测试，并只在测试通过时让 `tb_exec` 满足 runtime completion guard；如果任务没有
+可见测试入口，应通过同一 `--agent-env` 机制显式提供任务可见的
+`EVOLAB_TB_TEST_COMMAND`。具体 guard
+语义由安装的 Terminal-Bench/EvoLab package 实现，不属于 evolution artifact contract。
+对输出文件路径敏感的 local parametric-memory 实验，应优先使用一等 CLI 参数而不是手写
+`--agent-env`：`--artifact-path-guard {off,audit,repair}` 和重复的
+`--required-artifact-path /app/...`。默认 `off` 保持旧行为；`audit`/`repair` 会在 Harbor
+agent 环境中设置 `EVOLAB_TB_ARTIFACT_PATH_GUARD` 和 JSON 编码的
+`EVOLAB_TB_REQUIRED_ARTIFACT_PATHS`，并在 dry-run/live summary 中记录。该变量只定义本地
+eval 的实验控制面；实际 audit/repair 行为仍由安装的 Terminal-Bench/EvoLab package 提供。
+当显式传入 `--terminal-bench-package-root` 时，本地 parametric-memory eval 会把该目录的
+`src` 和 package root prepend 到 Harbor 子进程的 `PYTHONPATH`，并使用同一 package root
+下的 Terminal-Bench Docker compose override 文件。这样 worktree 中的 EvoLab runtime
+guard、task package 和 Harbor compose 配置会作为一个一致版本生效，而不是只改变 Harbor
+命令的 working directory。
 
 Reference worker 只定义训练编排和 artifact contract；具体 LoRA trainer、serving backend
 的 adapter 加载方式，以及长训练过程中的续约/heartbeat 扩展，应由本地 inference/training

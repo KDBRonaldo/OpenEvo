@@ -110,6 +110,109 @@ def test_build_terminal_bench_event_preserves_transcript_metadata_without_secret
     assert dataset.trace_count == 1
 
 
+def test_build_terminal_bench_event_can_include_compact_llm_calls(tmp_path):
+    trial_dir = _write_trial(
+        tmp_path,
+        stdout="Recovered the lost git commit and merged it into master.\n",
+        stderr="",
+        llm_calls=[
+            {
+                "schema_version": "v1",
+                "model": "Qwen/Qwen3.6-35B-A3B",
+                "input_messages": [
+                    {
+                        "schema_version": "v1",
+                        "role": "system",
+                        "content": "Solve exactly one task_id.",
+                    },
+                    {
+                        "schema_version": "v1",
+                        "role": "tool",
+                        "tool_call_id": "call-1",
+                        "content": "x" * 80,
+                    },
+                ],
+                "output_messages": [{"role": "assistant", "content": ""}],
+                "metadata": {
+                    "step_index": 12,
+                    "raw_response": {"secret": "do-not-preserve"},
+                    "tool_specs": [
+                        {
+                            "name": "tb_exec",
+                            "description": "Run a command.",
+                            "parameters_schema": {
+                                "type": "object",
+                                "properties": {"command": {"type": "string"}},
+                                "required": ["command"],
+                            },
+                        }
+                    ],
+                },
+            }
+        ],
+    )
+
+    [event] = build_terminal_bench_events(
+        trial_dir,
+        include_llm_calls=True,
+        max_llm_calls=1,
+        max_llm_call_message_chars=24,
+    )
+
+    trace = event.payload["session_result"]["trajectory"]["traces"][0]
+    llm_calls = trace["metadata"]["llm_calls"]
+    assert len(llm_calls) == 1
+    assert llm_calls[0]["model"] == "Qwen/Qwen3.6-35B-A3B"
+    assert llm_calls[0]["metadata"] == {
+        "step_index": 12,
+        "tool_specs": [
+            {
+                "name": "tb_exec",
+                "description": "Run a command.",
+                "parameters_schema": {
+                    "type": "object",
+                    "properties": {"command": {"type": "string"}},
+                    "required": ["command"],
+                },
+            }
+        ],
+    }
+    assert llm_calls[0]["input_messages"][1] == {
+        "role": "tool",
+        "tool_call_id": "call-1",
+        "content": "xxxxxxxxxxx\n[truncated]\n",
+    }
+    assert "do-not-preserve" not in event.model_dump_json()
+
+
+def test_build_terminal_bench_event_allows_llm_calls_without_transcript_when_opted_in(
+    tmp_path,
+):
+    trial_dir = _write_trial(
+        tmp_path,
+        stdout="",
+        stderr="",
+        report=None,
+        llm_calls=[
+            {
+                "model": "Qwen/Qwen3.6-35B-A3B",
+                "input_messages": [
+                    {"role": "system", "content": "Use tb_read_task first."},
+                    {"role": "tool", "content": '{"stdout": "PASSWORD=8XDP..."}'},
+                ],
+                "metadata": {"step_index": 12},
+            }
+        ],
+    )
+
+    [event] = build_terminal_bench_events(trial_dir, include_llm_calls=True)
+
+    trace = event.payload["session_result"]["trajectory"]["traces"][0]
+    assert trace["response_messages"] == []
+    assert trace["metadata"]["transcript_sources"] == []
+    assert trace["metadata"]["llm_calls"][0]["metadata"]["step_index"] == 12
+
+
 def test_build_terminal_bench_event_uses_report_when_stdout_is_empty(tmp_path):
     trial_dir = _write_trial(
         tmp_path,
@@ -664,6 +767,7 @@ def _write_trial(
     codex: str = "",
     ctrf: dict | None = None,
     verifier_stdout: str = "",
+    llm_calls: list[dict] | None = None,
 ) -> Path:
     trial_dir = root / "fix-git__abc123"
     (trial_dir / "agent").mkdir(parents=True)
@@ -679,6 +783,13 @@ def _write_trial(
     if report is not None:
         (trial_dir / "agent" / "evolab_lab" / "terminal_bench_report.md").write_text(
             report,
+            encoding="utf-8",
+        )
+    if llm_calls is not None:
+        trajectory_dir = trial_dir / "agent" / "evolab_lab" / ".evolab" / "registries" / "trajectory"
+        trajectory_dir.mkdir(parents=True)
+        (trajectory_dir / "llm_calls.jsonl").write_text(
+            "".join(json.dumps(call) + "\n" for call in llm_calls),
             encoding="utf-8",
         )
     (trial_dir / "verifier" / "reward.txt").write_text("0.5", encoding="utf-8")

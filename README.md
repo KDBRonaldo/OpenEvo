@@ -147,6 +147,9 @@ artifacts:
     config:
       base_model: Qwen/Qwen3.6-35B-A3B
       output_adapter_id: memory-lora
+      training_projection:
+        type: response_tail
+        response_tail_chars: 4096
       trainer:
         command: python
         args:

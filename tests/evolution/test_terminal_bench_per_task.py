@@ -1955,6 +1955,14 @@ def test_parse_key_value_entries_rejects_invalid_entry():
         _parse_key_value_entries(["BROKEN"])
 
 
+def test_subscription_live_artifact_type_rejects_parametric_memory_directly() -> None:
+    with pytest.raises(
+        ValueError,
+        match="Terminal Bench Codex subscription runs do not support parametric_memory",
+    ):
+        per_task_module._single_live_artifact_type(["parametric_memory"])
+
+
 def test_terminal_bench_per_task_evolution_cli_live_mode_rejects_parametric_memory(
     tmp_path: Path,
 ):
