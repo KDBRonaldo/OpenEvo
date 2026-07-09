@@ -27,7 +27,15 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.command == "serve":
-        raise SystemExit("openevo-backend serve is introduced in the backend API phase.")
+        import uvicorn
+
+        uvicorn.run(
+            "openevo.backend.api:create_backend_app",
+            factory=True,
+            host=args.host,
+            port=args.port,
+        )
+        return 0
     if args.command == "run":
         return _run_experiment_command(args)
     raise ValueError(args.command)

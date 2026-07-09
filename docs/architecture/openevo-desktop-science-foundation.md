@@ -137,9 +137,10 @@ openevo-backend --help
 openevo-backend serve --help
 ```
 
-`openevo-backend serve` is a reserved stub until the backend API phase adds the
-remote supervisor. Desktop-native launch and sidecar integration are handled by
-the later Desktop migration tasks.
+`openevo-backend serve` starts the typed Core Backend API. This phase exposes
+the route and error contract Desktop will consume; Desktop-native launch,
+sidecar integration, and full remote service supervision are handled by later
+Desktop migration tasks.
 The root path `/` redirects to `/openevo`. The Desktop asset set is built in
 OpenEvo-only mode and kept under the top-level `desktop/packaging/web/` path,
 so users do not see the shared Polar dashboard navigation and the Core wheel

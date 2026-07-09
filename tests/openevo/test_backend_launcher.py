@@ -111,10 +111,19 @@ def test_backend_launcher_run_dry_run_uses_dry_runner(
     assert json.loads(capsys.readouterr().out) == {"mode": "dry_run"}
 
 
-def test_backend_launcher_serve_remains_reserved() -> None:
-    with pytest.raises(SystemExit) as exc_info:
-        launcher.main(["serve"])
+def test_backend_launcher_serve_starts_backend_api(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: dict[str, object] = {}
 
-    assert "openevo-backend serve is introduced in the backend API phase" in str(
-        exc_info.value
-    )
+    def fake_uvicorn_run(app: str, **kwargs: object) -> None:
+        calls["app"] = app
+        calls.update(kwargs)
+
+    monkeypatch.setattr("uvicorn.run", fake_uvicorn_run)
+
+    assert launcher.main(["serve", "--host", "0.0.0.0", "--port", "9876"]) == 0
+    assert calls == {
+        "app": "openevo.backend.api:create_backend_app",
+        "factory": True,
+        "host": "0.0.0.0",
+        "port": 9876,
+    }

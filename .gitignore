@@ -121,6 +121,8 @@ glm/
 docs/*
 !docs/architecture/
 !docs/architecture/*.md
+!docs/core/
+!docs/core/*.md
 !docs/dev/
 !docs/dev/*.md
 !docs/maintainer/

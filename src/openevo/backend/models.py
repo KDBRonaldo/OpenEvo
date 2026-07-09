@@ -1,0 +1,152 @@
+from __future__ import annotations
+
+from typing import Any, Literal
+
+from pydantic import BaseModel, Field
+
+
+ErrorSeverity = Literal["info", "warning", "blocking"]
+ErrorCategory = Literal["environment", "project", "run", "artifact", "service", "internal"]
+RepairAction = Literal[
+    "openevo_can_retry",
+    "openevo_can_install",
+    "openevo_can_reconfigure",
+    "user_action_required",
+    "unsupported",
+]
+ExecutionMode = Literal["codex_subscription_transcript", "self-deployed"]
+
+
+class BackendError(BaseModel):
+    code: str
+    message: str
+    severity: ErrorSeverity
+    category: ErrorCategory
+    retryable: bool
+    repair_action: RepairAction
+    details: dict[str, Any] = Field(default_factory=dict)
+    logs_ref: str | None = None
+
+
+class HealthResponse(BaseModel):
+    status: Literal["ok"]
+
+
+class ServiceSummary(BaseModel):
+    id: str
+    name: str
+    status: Literal["stopped", "starting", "running", "failed"]
+    restartable: bool = True
+
+
+class BackendStatus(BaseModel):
+    status: Literal["starting", "ready", "degraded", "blocked"]
+    services: list[ServiceSummary]
+    active_runs: int = 0
+    supervision_mode: Literal["scaffold", "managed"] = "scaffold"
+
+
+class EnvironmentSettings(BaseModel):
+    workspace_root: str = "~/.openevo/workspaces"
+    proxy_url: str | None = None
+    no_proxy: list[str] = Field(default_factory=list)
+    pip_index_url: str | None = None
+    huggingface_endpoint: str | None = None
+    huggingface_cache: str | None = None
+
+
+class EnvironmentDoctorRequest(BaseModel):
+    repair: bool = False
+
+
+class EnvironmentCheck(BaseModel):
+    id: str
+    category: Literal["python", "docker", "codex", "network"]
+    status: Literal["ok", "warning", "blocking"]
+    message: str
+    repair_action: RepairAction
+
+
+class EnvironmentDoctorResponse(BaseModel):
+    status: Literal["ok", "needs_user_action"]
+    checks: list[EnvironmentCheck]
+
+
+class EnvironmentRepairRequest(BaseModel):
+    actions: list[str] = Field(default_factory=list)
+
+
+class EnvironmentRepairResponse(BaseModel):
+    status: Literal["ok", "needs_user_action"]
+    performed_actions: list[str] = Field(default_factory=list)
+    errors: list[BackendError] = Field(default_factory=list)
+
+
+class ProjectCreateRequest(BaseModel):
+    name: str
+    workspace_root: str
+
+
+class ProjectPatchRequest(BaseModel):
+    name: str | None = None
+    workspace_root: str | None = None
+
+
+class ProjectSummary(BaseModel):
+    id: str
+    name: str
+    workspace_root: str
+    status: Literal["draft", "ready", "blocked"] = "draft"
+
+
+class RunCreateRequest(BaseModel):
+    project_id: str
+    execution_mode: ExecutionMode
+
+
+class RunSummary(BaseModel):
+    id: str
+    project_id: str
+    execution_mode: ExecutionMode
+    status: Literal["created", "running", "completed", "failed", "cancelled"]
+
+
+class TimelineEvent(BaseModel):
+    id: str
+    phase: str
+    title: str
+    message: str
+    artifact_ids: list[str] = Field(default_factory=list)
+
+
+class LogResponse(BaseModel):
+    id: str
+    lines: list[str]
+
+
+class ArtifactSummary(BaseModel):
+    id: str
+    run_id: str
+    artifact_type: Literal["text_memory", "skill_bundle", "agent_system", "parametric_memory"]
+    title: str
+    promoted: bool = False
+    lineage: dict[str, Any] = Field(default_factory=dict)
+
+
+class ArtifactContent(BaseModel):
+    id: str
+    artifact_type: str
+    content: str
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ArtifactDiff(BaseModel):
+    id: str
+    before: str
+    after: str
+    format: Literal["unified_text"] = "unified_text"
+
+
+class ServiceActionResponse(BaseModel):
+    service_id: str
+    status: Literal["running", "stopped", "failed"]

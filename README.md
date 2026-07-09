@@ -297,8 +297,10 @@ openevo-backend --help
 openevo-backend serve --help
 ```
 
-`openevo-backend serve` is a reserved command stub until the backend API phase
-introduces the remote supervisor and HTTP contract.
+`openevo-backend serve` starts the typed Core Backend API for Desktop and remote
+operation. The current API scaffold exposes health, status, environment,
+project, run, artifact, service, and capabilities routes; later productization
+phases connect those routes to the full remote supervisor.
 
 Release wheels are built from the OpenEvo Core package metadata and exclude
 Desktop facade code and Desktop static assets. OpenEvo-only Desktop assets are

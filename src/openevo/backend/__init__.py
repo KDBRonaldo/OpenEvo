@@ -1,1 +1,3 @@
-"""OpenEvo Core Backend launcher package."""
+from openevo.backend.api import create_backend_app
+
+__all__ = ["create_backend_app"]
