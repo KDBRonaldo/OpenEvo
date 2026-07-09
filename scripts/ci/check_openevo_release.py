@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import configparser
+import hashlib
 import json
 from io import BytesIO
 import sys
@@ -19,6 +20,8 @@ EXPECTED_CONSOLE_SCRIPTS = {
     "openevo-backend": "openevo.backend.launcher:main",
 }
 REQUIRED_REMOTE_WHEEL_PREFIX = "openevo/wheels/"
+REQUIRED_RELEASE_NOTES = "release-notes.md"
+RELEASE_BINARY_SUFFIXES = (".whl", ".dmg")
 FORBIDDEN_CORE_PACKAGE_PREFIXES = (
     "openevo/desktop/",
     "openevo/sidecar/",
@@ -122,6 +125,15 @@ def _validate_entry_points(wheel: ZipFile, names: set[str]) -> list[str]:
     console_scripts = (
         dict(parser["console_scripts"]) if parser.has_section("console_scripts") else {}
     )
+    if console_scripts != EXPECTED_CONSOLE_SCRIPTS:
+        unexpected = sorted(
+            script for script in console_scripts if script not in EXPECTED_CONSOLE_SCRIPTS
+        )
+        if unexpected:
+            errors.append(
+                "Console scripts must expose only OpenEvo Core Backend entrypoints; "
+                f"unexpected script(s): {', '.join(unexpected)}."
+            )
     for script, expected_target in EXPECTED_CONSOLE_SCRIPTS.items():
         actual_target = console_scripts.get(script)
         if actual_target != expected_target:
@@ -290,13 +302,25 @@ def validate_release_artifacts(
         existing_artifact_paths.append(path)
 
     errors.extend(
+        validate_allowed_release_artifact_set(
+            existing_artifact_paths,
+            expected_version=expected_version,
+        )
+    )
+    errors.extend(
         validate_release_wheel_artifacts(
             existing_artifact_paths,
             expected_version=expected_version,
         )
     )
-    if not any(path.suffix == ".dmg" for path in existing_artifact_paths):
-        errors.append("Release artifacts must include an OpenEvo Desktop macOS .dmg.")
+    errors.extend(
+        validate_release_dmg_artifacts(
+            existing_artifact_paths,
+            expected_version=expected_version,
+        )
+    )
+    errors.extend(validate_release_notes_artifacts(existing_artifact_paths))
+    errors.extend(validate_release_checksum_artifacts(existing_artifact_paths))
     return errors
 
 
@@ -306,15 +330,164 @@ def validate_release_wheel_artifacts(
     expected_version: str,
 ) -> list[str]:
     expected_prefix = f"openevo-{expected_version}-"
-    if any(
-        path.name.startswith(expected_prefix) and path.suffix == ".whl"
+    matches = [
+        path
         for path in wheel_paths
-    ):
+        if path.name.startswith(expected_prefix) and path.suffix == ".whl"
+    ]
+    if len(matches) == 1:
         return []
+    if len(matches) > 1:
+        return [
+            "Release artifacts must include exactly one exact OpenEvo wheel for "
+            f"remote install, found: {', '.join(path.name for path in matches)}."
+        ]
     return [
         "Release artifacts must include an exact OpenEvo wheel for remote install: "
         f"{expected_prefix}*.whl."
     ]
+
+
+def validate_release_dmg_artifacts(
+    artifact_paths: list[Path],
+    *,
+    expected_version: str,
+) -> list[str]:
+    matches = [
+        path
+        for path in artifact_paths
+        if _allowed_dmg_name(path.name, expected_version=expected_version)
+    ]
+    if len(matches) == 1:
+        return []
+    if len(matches) > 1:
+        return [
+            "Release artifacts must include exactly one OpenEvo Desktop macOS .dmg, "
+            f"found: {', '.join(path.name for path in matches)}."
+        ]
+    return ["Release artifacts must include an OpenEvo Desktop macOS .dmg."]
+
+
+def validate_allowed_release_artifact_set(
+    artifact_paths: list[Path],
+    *,
+    expected_version: str,
+) -> list[str]:
+    errors: list[str] = []
+    for path in artifact_paths:
+        if _allowed_release_artifact(path, expected_version=expected_version):
+            continue
+        errors.append(f"Unexpected release artifact: {path.name}")
+    return errors
+
+
+def _allowed_release_artifact(path: Path, *, expected_version: str) -> bool:
+    expected_wheel_prefix = f"openevo-{expected_version}-"
+    if path.name == REQUIRED_RELEASE_NOTES:
+        return True
+    if path.suffix == ".whl":
+        return path.name.startswith(expected_wheel_prefix)
+    if path.suffix == ".dmg":
+        return _allowed_dmg_name(path.name, expected_version=expected_version)
+    if path.name.endswith(".sha256"):
+        subject = path.name.removesuffix(".sha256")
+        return (
+            subject.startswith(expected_wheel_prefix)
+            and subject.endswith(".whl")
+        ) or _allowed_dmg_name(subject, expected_version=expected_version)
+    return False
+
+
+def _allowed_dmg_name(name: str, *, expected_version: str) -> bool:
+    prefix = f"OpenEvo Desktop_{expected_version}_"
+    return name.startswith(prefix) and name.endswith(".dmg") and len(name) > len(prefix) + 4
+
+
+def _is_release_binary(path: Path) -> bool:
+    return path.suffix in RELEASE_BINARY_SUFFIXES
+
+
+def _is_release_checksum(path: Path) -> bool:
+    return path.name.endswith(".sha256")
+
+
+def _expected_checksum_path(path: Path) -> Path:
+    return path.with_name(f"{path.name}.sha256")
+
+
+def _checksum_subject_path(path: Path) -> Path:
+    return path.with_name(path.name.removesuffix(".sha256"))
+
+
+def validate_release_notes_artifacts(artifact_paths: list[Path]) -> list[str]:
+    notes = [path for path in artifact_paths if path.name == REQUIRED_RELEASE_NOTES]
+    if not notes:
+        return [f"Release artifacts must include {REQUIRED_RELEASE_NOTES}."]
+
+    errors: list[str] = []
+    for note in notes:
+        try:
+            text = note.read_text(encoding="utf-8")
+        except OSError as exc:
+            errors.append(f"Could not read release notes {note}: {exc}")
+            continue
+        if "OpenEvo" not in text or not text.strip():
+            errors.append(f"{note} must contain non-empty OpenEvo release notes.")
+    return errors
+
+
+def validate_release_checksum_artifacts(artifact_paths: list[Path]) -> list[str]:
+    artifact_set = set(artifact_paths)
+    binary_artifacts = [path for path in artifact_paths if _is_release_binary(path)]
+    checksum_artifacts = [path for path in artifact_paths if _is_release_checksum(path)]
+
+    errors: list[str] = []
+    for artifact in binary_artifacts:
+        checksum_path = _expected_checksum_path(artifact)
+        if checksum_path not in artifact_set:
+            errors.append(
+                f"Release artifact {artifact.name} must have a sibling "
+                f"{artifact.name}.sha256 checksum."
+            )
+            continue
+        errors.extend(_validate_sha256_checksum(artifact, checksum_path))
+    binary_set = set(binary_artifacts)
+    for checksum_path in checksum_artifacts:
+        if _checksum_subject_path(checksum_path) not in binary_set:
+            errors.append(
+                f"Checksum artifact {checksum_path.name} must have a sibling "
+                f"{checksum_path.name.removesuffix('.sha256')} artifact."
+            )
+    return errors
+
+
+def _validate_sha256_checksum(artifact: Path, checksum_path: Path) -> list[str]:
+    try:
+        parts = checksum_path.read_text(encoding="utf-8").strip().split(maxsplit=1)
+    except OSError as exc:
+        return [f"Could not read checksum {checksum_path}: {exc}"]
+    if len(parts) < 2:
+        return [f"{checksum_path} must use '<sha256>  <filename>' format."]
+
+    expected_hash, expected_filename = parts[0].lower(), parts[1].strip()
+    errors: list[str] = []
+    if len(expected_hash) != 64 or any(char not in "0123456789abcdef" for char in expected_hash):
+        errors.append(f"{checksum_path} does not contain a valid SHA256 digest.")
+    if expected_filename != artifact.name:
+        errors.append(
+            f"{checksum_path} should reference `{artifact.name}`, got "
+            f"`{expected_filename}`."
+        )
+    if errors:
+        return errors
+
+    actual_hash = hashlib.sha256(artifact.read_bytes()).hexdigest()
+    if actual_hash != expected_hash:
+        errors.append(
+            f"{checksum_path} checksum mismatch for {artifact.name}: "
+            f"expected {expected_hash}, got {actual_hash}."
+        )
+    return errors
 
 
 def main(argv: list[str] | None = None) -> int:

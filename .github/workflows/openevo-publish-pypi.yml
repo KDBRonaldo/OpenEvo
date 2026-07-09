@@ -61,6 +61,10 @@ jobs:
       - name: Validate OpenEvo wheel
         run: |
           python scripts/ci/check_openevo_release.py --wheel dist/*.whl
+          rm -rf .openevo-publish-checks
+          mkdir -p .openevo-publish-checks
+          cp dist/*.whl .openevo-publish-checks/
+          python scripts/ci/write_sha256.py .openevo-publish-checks/*.whl
           twine check --strict dist/*.whl
 
       - name: Install wheel and smoke OpenEvo Backend

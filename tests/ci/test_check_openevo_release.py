@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import hashlib
 from io import BytesIO
 from pathlib import Path
 from zipfile import ZipFile
@@ -49,6 +50,42 @@ def _load_desktop_wheel_smoke_module():
     return module
 
 
+def _load_sha256_module():
+    path = Path(__file__).resolve().parents[2] / "scripts/ci/write_sha256.py"
+    spec = importlib.util.spec_from_file_location("write_sha256", path)
+    assert spec is not None
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_sidecar_smoke_module():
+    path = (
+        Path(__file__).resolve().parents[2]
+        / "scripts/ci/smoke_openevo_desktop_sidecar.py"
+    )
+    spec = importlib.util.spec_from_file_location("smoke_openevo_desktop_sidecar", path)
+    assert spec is not None
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_bundle_smoke_module():
+    path = (
+        Path(__file__).resolve().parents[2]
+        / "scripts/ci/smoke_openevo_desktop_bundle.py"
+    )
+    spec = importlib.util.spec_from_file_location("smoke_openevo_desktop_bundle", path)
+    assert spec is not None
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
 def test_desktop_wheel_smoke_exercises_config_backed_lifecycle(capsys) -> None:
     smoke = _load_desktop_wheel_smoke_module()
 
@@ -56,6 +93,73 @@ def test_desktop_wheel_smoke_exercises_config_backed_lifecycle(capsys) -> None:
 
     output = capsys.readouterr().out
     assert "OpenEvo Desktop config-backed lifecycle smoke passed" in output
+
+
+def test_write_sha256_writes_sibling_checksum(tmp_path: Path) -> None:
+    writer = _load_sha256_module()
+    artifact = tmp_path / "OpenEvo Desktop.dmg"
+    artifact.write_bytes(b"desktop")
+
+    checksum_path = writer.write_sha256(artifact)
+
+    assert checksum_path.name == "OpenEvo Desktop.dmg.sha256"
+    assert checksum_path.read_text(encoding="utf-8") == (
+        f"{hashlib.sha256(b'desktop').hexdigest()}  OpenEvo Desktop.dmg\n"
+    )
+
+
+def test_sidecar_smoke_extracts_desktop_static_assets() -> None:
+    smoke = _load_sidecar_smoke_module()
+
+    assets = smoke._asset_references(
+        '<html><head><link href="/assets/index.css"></head>'
+        '<body><script src="assets/index.js"></script></body></html>'
+    )
+
+    assert assets == ["assets/index.css", "assets/index.js"]
+
+
+def test_sidecar_smoke_launches_process_and_checks_assets(tmp_path: Path) -> None:
+    smoke = _load_sidecar_smoke_module()
+    sidecar = tmp_path / "fake-openevo-desktop-sidecar"
+    _write_fake_sidecar(sidecar)
+
+    smoke.smoke_sidecar(sidecar, timeout_seconds=5)
+
+
+def test_bundle_smoke_finds_and_launches_app_sidecar(tmp_path: Path) -> None:
+    smoke = _load_bundle_smoke_module()
+    sidecar = (
+        tmp_path
+        / "OpenEvo Desktop.app"
+        / "Contents"
+        / "MacOS"
+        / "openevo-desktop-sidecar"
+    )
+    _write_fake_sidecar(sidecar)
+
+    smoked_sidecar = smoke.smoke_bundle(tmp_path, timeout_seconds=5)
+
+    assert smoked_sidecar == sidecar
+
+
+def test_bundle_smoke_requires_openevo_desktop_app_bundle(tmp_path: Path) -> None:
+    smoke = _load_bundle_smoke_module()
+    other_sidecar = (
+        tmp_path
+        / "Other.app"
+        / "Contents"
+        / "MacOS"
+        / "openevo-desktop-sidecar"
+    )
+    _write_fake_sidecar(other_sidecar)
+
+    try:
+        smoke.find_bundled_sidecar(tmp_path)
+    except smoke.SmokeFailure as exc:
+        assert "No OpenEvo Desktop.app bundle found" in str(exc)
+    else:
+        raise AssertionError("Expected missing OpenEvo Desktop.app bundle to fail")
 
 
 def test_accepts_valid_openevo_release_wheel(tmp_path: Path) -> None:
@@ -111,13 +215,13 @@ def test_validates_packaged_remote_install_wheel_metadata(tmp_path: Path) -> Non
 
 def test_requires_exact_openevo_wheel_artifact(tmp_path: Path) -> None:
     checker = _load_module()
-    other_wheel = _write_wheel(tmp_path / "polar-0.1.0-py3-none-any.whl")
     openevo_wheel = _write_wheel(tmp_path / "openevo-0.1.0-py3-none-any.whl")
     dmg = tmp_path / "OpenEvo Desktop_0.1.0_aarch64.dmg"
     dmg.write_bytes(b"not a real dmg; release list validation only checks presence")
+    artifacts = [_write_release_notes(tmp_path)]
 
     assert checker.validate_release_artifacts(
-        [other_wheel],
+        artifacts,
         expected_version="0.1.0",
     ) == [
         "Release artifacts must include an exact OpenEvo wheel for remote install: "
@@ -125,13 +229,110 @@ def test_requires_exact_openevo_wheel_artifact(tmp_path: Path) -> None:
         "Release artifacts must include an OpenEvo Desktop macOS .dmg.",
     ]
     assert checker.validate_release_artifacts(
-        [other_wheel, openevo_wheel],
+        artifacts + [openevo_wheel, _write_checksum(openevo_wheel)],
         expected_version="0.1.0",
     ) == ["Release artifacts must include an OpenEvo Desktop macOS .dmg."]
     assert checker.validate_release_artifacts(
-        [other_wheel, openevo_wheel, dmg],
+        artifacts
+        + [openevo_wheel, _write_checksum(openevo_wheel), dmg, _write_checksum(dmg)],
         expected_version="0.1.0",
     ) == []
+
+
+def test_release_artifact_list_rejects_unknown_files_and_non_openevo_wheels(
+    tmp_path: Path,
+) -> None:
+    checker = _load_module()
+    openevo_wheel = _write_wheel(tmp_path / "openevo-0.1.0-py3-none-any.whl")
+    polar_wheel = _write_wheel(tmp_path / "polar-0.1.0-py3-none-any.whl")
+    dmg = tmp_path / "OpenEvo Desktop_0.1.0_aarch64.dmg"
+    dmg.write_bytes(b"dmg bytes")
+    debug_dmg = tmp_path / "debug.dmg"
+    debug_dmg.write_bytes(b"debug dmg bytes")
+    mislabeled_dmg = tmp_path / "OpenEvo Desktop_0.1.0-debug.dmg"
+    mislabeled_dmg.write_bytes(b"mislabeled dmg bytes")
+    unexpected = tmp_path / "debug.log"
+    unexpected.write_text("not a release artifact\n", encoding="utf-8")
+
+    errors = checker.validate_release_artifacts(
+        [
+            openevo_wheel,
+            _write_checksum(openevo_wheel),
+            polar_wheel,
+            _write_checksum(polar_wheel),
+            dmg,
+            _write_checksum(dmg),
+            debug_dmg,
+            _write_checksum(debug_dmg),
+            mislabeled_dmg,
+            _write_checksum(mislabeled_dmg),
+            _write_release_notes(tmp_path),
+            unexpected,
+        ],
+        expected_version="0.1.0",
+    )
+
+    assert "Unexpected release artifact: polar-0.1.0-py3-none-any.whl" in errors
+    assert "Unexpected release artifact: polar-0.1.0-py3-none-any.whl.sha256" in errors
+    assert "Unexpected release artifact: debug.dmg" in errors
+    assert "Unexpected release artifact: debug.dmg.sha256" in errors
+    assert "Unexpected release artifact: OpenEvo Desktop_0.1.0-debug.dmg" in errors
+    assert "Unexpected release artifact: OpenEvo Desktop_0.1.0-debug.dmg.sha256" in errors
+    assert "Unexpected release artifact: debug.log" in errors
+
+
+def test_release_artifact_list_rejects_multiple_openevo_wheels(tmp_path: Path) -> None:
+    checker = _load_module()
+    py3_wheel = _write_wheel(tmp_path / "openevo-0.1.0-py3-none-any.whl")
+    cp311_wheel = _write_wheel(tmp_path / "openevo-0.1.0-cp311-cp311-macosx_14_0_arm64.whl")
+    dmg = tmp_path / "OpenEvo Desktop_0.1.0_aarch64.dmg"
+    dmg.write_bytes(b"dmg bytes")
+
+    errors = checker.validate_release_artifacts(
+        [
+            py3_wheel,
+            _write_checksum(py3_wheel),
+            cp311_wheel,
+            _write_checksum(cp311_wheel),
+            dmg,
+            _write_checksum(dmg),
+            _write_release_notes(tmp_path),
+        ],
+        expected_version="0.1.0",
+    )
+
+    assert (
+        "Release artifacts must include exactly one exact OpenEvo wheel for remote "
+        "install, found: openevo-0.1.0-py3-none-any.whl, "
+        "openevo-0.1.0-cp311-cp311-macosx_14_0_arm64.whl."
+    ) in errors
+
+
+def test_release_artifact_list_rejects_multiple_desktop_dmgs(tmp_path: Path) -> None:
+    checker = _load_module()
+    wheel = _write_wheel(tmp_path / "openevo-0.1.0-py3-none-any.whl")
+    arm_dmg = tmp_path / "OpenEvo Desktop_0.1.0_aarch64.dmg"
+    x64_dmg = tmp_path / "OpenEvo Desktop_0.1.0_x64.dmg"
+    arm_dmg.write_bytes(b"arm dmg bytes")
+    x64_dmg.write_bytes(b"x64 dmg bytes")
+
+    errors = checker.validate_release_artifacts(
+        [
+            wheel,
+            _write_checksum(wheel),
+            arm_dmg,
+            _write_checksum(arm_dmg),
+            x64_dmg,
+            _write_checksum(x64_dmg),
+            _write_release_notes(tmp_path),
+        ],
+        expected_version="0.1.0",
+    )
+
+    assert (
+        "Release artifacts must include exactly one OpenEvo Desktop macOS .dmg, "
+        "found: OpenEvo Desktop_0.1.0_aarch64.dmg, OpenEvo Desktop_0.1.0_x64.dmg."
+    ) in errors
 
 
 def test_cli_wheel_only_requires_exact_openevo_wheel_artifact_name(
@@ -156,12 +357,95 @@ def test_release_artifact_list_rejects_nonexistent_paths(tmp_path: Path) -> None
     missing_dmg = tmp_path / "release-artifacts" / "openevo-desktop-dmg" / "*.dmg"
 
     assert checker.validate_release_artifacts(
-        [openevo_wheel, missing_dmg],
+        [
+            openevo_wheel,
+            _write_checksum(openevo_wheel),
+            _write_release_notes(tmp_path),
+            missing_dmg,
+        ],
         expected_version="0.1.0",
     ) == [
         f"Release artifact does not exist: {missing_dmg}",
         "Release artifacts must include an OpenEvo Desktop macOS .dmg.",
     ]
+
+
+def test_release_artifact_list_requires_checksums_and_release_notes(tmp_path: Path) -> None:
+    checker = _load_module()
+    openevo_wheel = _write_wheel(tmp_path / "openevo-0.1.0-py3-none-any.whl")
+    dmg = tmp_path / "OpenEvo Desktop_0.1.0_aarch64.dmg"
+    dmg.write_bytes(b"dmg bytes")
+
+    assert checker.validate_release_artifacts(
+        [openevo_wheel, dmg],
+        expected_version="0.1.0",
+    ) == [
+        "Release artifacts must include release-notes.md.",
+        "Release artifact openevo-0.1.0-py3-none-any.whl must have a sibling "
+        "openevo-0.1.0-py3-none-any.whl.sha256 checksum.",
+        "Release artifact OpenEvo Desktop_0.1.0_aarch64.dmg must have a sibling "
+        "OpenEvo Desktop_0.1.0_aarch64.dmg.sha256 checksum.",
+    ]
+
+    bad_checksum = tmp_path / f"{dmg.name}.sha256"
+    bad_checksum.write_text("0" * 64 + "  wrong.dmg\n", encoding="utf-8")
+    empty_notes = tmp_path / "release-notes.md"
+    empty_notes.write_text("", encoding="utf-8")
+
+    errors = checker.validate_release_artifacts(
+        [
+            openevo_wheel,
+            _write_checksum(openevo_wheel),
+            dmg,
+            bad_checksum,
+            empty_notes,
+        ],
+        expected_version="0.1.0",
+    )
+
+    assert f"{empty_notes} must contain non-empty OpenEvo release notes." in errors
+    assert (
+        f"{bad_checksum} should reference `{dmg.name}`, got `wrong.dmg`."
+    ) in errors
+
+
+def test_release_artifact_checksums_must_be_siblings(tmp_path: Path) -> None:
+    checker = _load_module()
+    wheel_dir = tmp_path / "openevo-wheel"
+    checksum_dir = tmp_path / "checksums"
+    dmg_dir = tmp_path / "openevo-desktop-dmg"
+    wheel_dir.mkdir()
+    checksum_dir.mkdir()
+    dmg_dir.mkdir()
+    openevo_wheel = _write_wheel(wheel_dir / "openevo-0.1.0-py3-none-any.whl")
+    misplaced_checksum = checksum_dir / f"{openevo_wheel.name}.sha256"
+    misplaced_checksum.write_text(
+        _write_checksum(openevo_wheel).read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    openevo_wheel.with_name(f"{openevo_wheel.name}.sha256").unlink()
+    dmg = dmg_dir / "OpenEvo Desktop_0.1.0_aarch64.dmg"
+    dmg.write_bytes(b"dmg bytes")
+
+    errors = checker.validate_release_artifacts(
+        [
+            openevo_wheel,
+            misplaced_checksum,
+            dmg,
+            _write_checksum(dmg),
+            _write_release_notes(tmp_path),
+        ],
+        expected_version="0.1.0",
+    )
+
+    assert (
+        "Release artifact openevo-0.1.0-py3-none-any.whl must have a sibling "
+        "openevo-0.1.0-py3-none-any.whl.sha256 checksum."
+    ) in errors
+    assert (
+        "Checksum artifact openevo-0.1.0-py3-none-any.whl.sha256 must have a sibling "
+        "openevo-0.1.0-py3-none-any.whl artifact."
+    ) in errors
 
 
 def test_rejects_non_openevo_project_metadata(tmp_path: Path) -> None:
@@ -194,6 +478,25 @@ def test_requires_expected_console_scripts(tmp_path: Path) -> None:
     assert any(
         "openevo-backend = openevo.backend.launcher:main" in error for error in errors
     )
+
+
+def test_rejects_unexpected_console_scripts(tmp_path: Path) -> None:
+    checker = _load_module()
+    wheel = _write_wheel(
+        tmp_path / "openevo-0.1.0-py3-none-any.whl",
+        entry_points="\n".join(
+            [
+                "[console_scripts]",
+                "openevo-backend = openevo.backend.launcher:main",
+                "openevo = openevo.evolution.cli:main",
+                "",
+            ]
+        ),
+    )
+
+    errors = checker.validate_wheel(wheel, expected_version="0.1.0")
+
+    assert any("unexpected script(s): openevo" in error for error in errors)
 
 
 def test_rejects_core_wheel_packaging_desktop_control_plane(tmp_path: Path) -> None:
@@ -321,6 +624,7 @@ def test_release_artifact_workflow_builds_validated_wheel_artifact() -> None:
     assert "cp .openevo-remote-wheel/openevo-*.whl src/openevo/wheels/" in text
     assert "python -m build --wheel" in text
     assert "scripts/ci/check_openevo_release.py --wheel dist/*.whl" in text
+    assert "python scripts/ci/write_sha256.py dist/*.whl" in text
     assert ".openevo-wheel-smoke/bin/openevo-backend --help" in text
     assert ".openevo-wheel-smoke/bin/openevo-backend serve --help" in text
     assert ".openevo-wheel-smoke/bin/openevo-backend run --help" in text
@@ -329,7 +633,8 @@ def test_release_artifact_workflow_builds_validated_wheel_artifact() -> None:
         "scripts/ci/smoke_openevo_desktop_wheel.py"
     ) in text
     assert "actions/upload-artifact@v4" in text
-    assert "path: dist/*.whl" in text
+    assert "dist/*.whl" in text
+    assert "dist/*.whl.sha256" in text
 
     assert text.index("npm audit --audit-level=high") < text.index(
         "npm run build:openevo"
@@ -349,38 +654,59 @@ def test_release_artifact_workflow_builds_desktop_dmg_artifact() -> None:
     workflow = Path(".github/workflows/openevo-release-artifact.yml")
 
     text = workflow.read_text(encoding="utf-8")
+    desktop_job = text.split("desktop-dmg-artifact:", maxsplit=1)[1].split(
+        "release-notes-artifact:",
+        maxsplit=1,
+    )[0]
 
     assert "desktop-dmg-artifact:" in text
-    assert "runs-on: macos-latest" in text
-    assert 'node-version: "20"' in text
-    assert "actions/setup-python@v5" in text
-    assert "python-version: \"3.11\"" in text
-    assert "dtolnay/rust-toolchain@stable" in text
-    assert "name: Build bundled OpenEvo Desktop sidecar" in text
-    assert "python -m pip install -e . pyinstaller" in text
-    assert "python desktop/packaging/build_sidecar.py" in text
-    assert 'SIDECAR="desktop/src-tauri/binaries/openevo-desktop-sidecar-$(rustc --print host-tuple)"' in text
-    assert 'test -x "$SIDECAR"' in text
-    assert '"$SIDECAR" --help' in text
-    assert "working-directory: desktop" in text
-    assert "working-directory: desktop/src-tauri" in text
-    assert "cargo metadata --locked --format-version 1" in text
-    assert "cargo test --locked" in text
-    assert "npm ci" in text
-    assert "npm run build:desktop" in text
-    assert "name: openevo-desktop-dmg" in text
-    assert "desktop/src-tauri/target/release/bundle/dmg/*.dmg" in text
+    assert "runs-on: macos-latest" in desktop_job
+    assert 'node-version: "22"' in desktop_job
+    assert "actions/setup-python@v5" in desktop_job
+    assert "python-version: \"3.11\"" in desktop_job
+    assert "dtolnay/rust-toolchain@stable" in desktop_job
+    assert "name: Install OpenEvo Desktop sidecar build dependencies" in desktop_job
+    assert "python -m pip install -e . pyinstaller" in desktop_job
+    assert "name: Smoke OpenEvo Desktop app bundle sidecar" in desktop_job
+    assert "python scripts/ci/smoke_openevo_desktop_bundle.py \\" in desktop_job
+    assert "desktop/src-tauri/target/release/bundle/macos" in desktop_job
+    assert "working-directory: desktop" in desktop_job
+    assert "working-directory: desktop/src-tauri" in desktop_job
+    assert "cargo metadata --locked --format-version 1" in desktop_job
+    assert "cargo test --locked" in desktop_job
+    assert "npm ci" in desktop_job
+    assert "npm run build:desktop" in desktop_job
+    assert (
+        "python ../scripts/ci/write_sha256.py "
+        "src-tauri/target/release/bundle/dmg/*.dmg"
+    ) in desktop_job
+    assert "name: openevo-desktop-dmg" in desktop_job
+    assert "desktop/src-tauri/target/release/bundle/dmg/*.dmg" in desktop_job
+    assert "desktop/src-tauri/target/release/bundle/dmg/*.dmg.sha256" in desktop_job
 
-    assert text.index("runs-on: macos-latest") < text.index('node-version: "20"')
-    assert text.index('node-version: "20"') < text.index("dtolnay/rust-toolchain@stable")
-    assert text.index("Build bundled OpenEvo Desktop sidecar") < text.index(
+    assert desktop_job.index("runs-on: macos-latest") < desktop_job.index(
+        'node-version: "22"'
+    )
+    assert desktop_job.index('node-version: "22"') < desktop_job.index(
+        "dtolnay/rust-toolchain@stable"
+    )
+    assert desktop_job.index(
+        "Install OpenEvo Desktop sidecar build dependencies"
+    ) < desktop_job.index(
         "cargo metadata --locked --format-version 1"
     )
-    assert text.index("cargo metadata --locked --format-version 1") < text.index(
+    assert desktop_job.index(
+        "cargo metadata --locked --format-version 1"
+    ) < desktop_job.index(
         "npm run build:desktop"
     )
-    assert text.index("npm ci") < text.index("npm run build:desktop")
-    assert text.index("npm run build:desktop") < text.index("openevo-desktop-dmg")
+    assert desktop_job.index("npm ci") < desktop_job.index("npm run build:desktop")
+    assert desktop_job.index("npm run build:desktop") < desktop_job.index(
+        "Smoke OpenEvo Desktop app bundle sidecar"
+    )
+    assert desktop_job.index(
+        "Smoke OpenEvo Desktop app bundle sidecar"
+    ) < desktop_job.index("openevo-desktop-dmg")
 
 
 def test_desktop_package_defines_tauri_desktop_scripts_and_cli_dependency() -> None:
@@ -389,7 +715,10 @@ def test_desktop_package_defines_tauri_desktop_scripts_and_cli_dependency() -> N
     assert package["name"] == "openevo-desktop"
     assert package["scripts"]["tauri:dev"] == "tauri dev"
     assert package["scripts"]["tauri:build"] == "tauri build"
-    assert package["scripts"]["build:desktop"] == "npm run tauri:build"
+    assert package["scripts"]["build:sidecar"] == "python packaging/build_sidecar.py"
+    assert package["scripts"]["build:desktop"] == (
+        "npm run build:sidecar && npm run tauri:build"
+    )
     assert "@tauri-apps/cli" in package["devDependencies"]
 
 
@@ -417,6 +746,8 @@ def test_tauri_macos_config_builds_dmg_release_shell() -> None:
     assert sidecar_entry.is_file()
     assert linux_sidecar_stub.is_file()
     assert "PyInstaller" in sidecar_builder.read_text(encoding="utf-8")
+    assert "--add-data" in sidecar_builder.read_text(encoding="utf-8")
+    assert "desktop/packaging/web" in sidecar_builder.read_text(encoding="utf-8")
     assert "desktop.server.launcher" in sidecar_entry.read_text(encoding="utf-8")
     assert 'name = "openevo-desktop"' in cargo
     assert 'serde = { version = "1", features = ["derive"] }' in cargo
@@ -463,6 +794,13 @@ def test_pypi_publish_workflow_uses_trusted_publishing() -> None:
     assert "cp .openevo-remote-wheel/openevo-*.whl src/openevo/wheels/" in text
     assert "python -m build --wheel" in text
     assert "scripts/ci/check_openevo_release.py --wheel dist/*.whl" in text
+    assert "python scripts/ci/write_sha256.py dist/*.whl" not in text
+    assert "rm -rf .openevo-publish-checks" in text
+    assert "cp dist/*.whl .openevo-publish-checks/" in text
+    assert (
+        "python scripts/ci/write_sha256.py .openevo-publish-checks/*.whl"
+        in text
+    )
     assert "twine check --strict dist/*.whl" in text
     assert ".openevo-wheel-smoke/bin/openevo-backend --help" in text
     assert ".openevo-wheel-smoke/bin/openevo-backend serve --help" in text
@@ -478,6 +816,22 @@ def test_pypi_publish_workflow_uses_trusted_publishing() -> None:
     assert text.index("twine check --strict dist/*.whl") < text.index(
         "pypa/gh-action-pypi-publish@release/v1"
     )
+
+
+def test_release_artifact_workflow_uploads_checksums_and_release_notes() -> None:
+    workflow = Path(".github/workflows/openevo-release-artifact.yml")
+
+    text = workflow.read_text(encoding="utf-8")
+
+    assert "name: Write release notes" in text
+    assert "printf '# OpenEvo %s release artifacts\\n\\n' \"${GITHUB_REF_NAME}\"" in text
+    assert "OpenEvo Core Backend wheel and the OpenEvo Desktop macOS disk image" in text
+    assert "name: openevo-release-notes" in text
+    assert "path: .openevo-release-notes/release-notes.md" in text
+    assert "--artifact \\" in text
+    assert "release-artifacts/openevo-wheel/*" in text
+    assert "release-artifacts/openevo-desktop-dmg/*" in text
+    assert "release-artifacts/openevo-release-notes/release-notes.md" in text
 
 
 def test_desktop_science_release_doc_matches_remote_lifecycle_state() -> None:
@@ -548,3 +902,72 @@ def _nested_wheel_bytes(*, metadata: str) -> bytes:
     with ZipFile(buffer, "w") as wheel:
         wheel.writestr("openevo-0.1.0.dist-info/METADATA", metadata)
     return buffer.getvalue()
+
+
+def _write_checksum(path: Path) -> Path:
+    checksum_path = path.with_name(f"{path.name}.sha256")
+    checksum = hashlib.sha256(path.read_bytes()).hexdigest()
+    checksum_path.write_text(f"{checksum}  {path.name}\n", encoding="utf-8")
+    return checksum_path
+
+
+def _write_release_notes(directory: Path) -> Path:
+    notes = directory / "release-notes.md"
+    notes.write_text("# OpenEvo 0.1.0\n\nRelease smoke notes.\n", encoding="utf-8")
+    return notes
+
+
+def _write_fake_sidecar(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "\n".join(
+            [
+                "#!/usr/bin/env python3",
+                "from http.server import BaseHTTPRequestHandler, HTTPServer",
+                "import argparse",
+                "import json",
+                "",
+                "class Handler(BaseHTTPRequestHandler):",
+                "    def do_GET(self):",
+                "        if self.path == '/health':",
+                "            body = json.dumps({'status': 'ok'}).encode()",
+                "            self.send_response(200)",
+                "            self.send_header('Content-Type', 'application/json')",
+                "            self.send_header('Content-Length', str(len(body)))",
+                "            self.end_headers()",
+                "            self.wfile.write(body)",
+                "            return",
+                "        if self.path == '/openevo':",
+                "            body = b'<script src=\"/assets/index.js\"></script>'",
+                "            self.send_response(200)",
+                "            self.send_header('Content-Type', 'text/html')",
+                "            self.send_header('Content-Length', str(len(body)))",
+                "            self.end_headers()",
+                "            self.wfile.write(body)",
+                "            return",
+                "        if self.path == '/assets/index.js':",
+                "            body = b'console.log(\"openevo\")'",
+                "            self.send_response(200)",
+                "            self.send_header('Content-Type', 'text/javascript')",
+                "            self.send_header('Content-Length', str(len(body)))",
+                "            self.end_headers()",
+                "            self.wfile.write(body)",
+                "            return",
+                "        self.send_response(404)",
+                "        self.end_headers()",
+                "",
+                "    def log_message(self, format, *args):",
+                "        return",
+                "",
+                "parser = argparse.ArgumentParser()",
+                "parser.add_argument('--host', default='127.0.0.1')",
+                "parser.add_argument('--port', type=int, required=True)",
+                "parser.add_argument('--desktop-config-root')",
+                "args = parser.parse_args()",
+                "HTTPServer((args.host, args.port), Handler).serve_forever()",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    path.chmod(0o755)

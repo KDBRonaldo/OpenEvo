@@ -114,14 +114,15 @@ openevo-backend run examples/science-minimal/experiment.yaml --dry-run --json
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -e '.[dev]'
+pip install -e .
+pip install pytest pytest-asyncio ruff build twine
 ```
 
 Focused Python checks:
 
 ```bash
-ruff check src/openevo tests/openevo
-PYTHONPATH=src:. python -m pytest tests/ci tests/openevo -q
+ruff check src tests scripts
+PYTHONPATH=src:. python -m pytest tests/ci tests/openevo tests/evolution -q
 ```
 
 Desktop checks:
@@ -133,6 +134,10 @@ npm audit --audit-level=high
 npm test -- --run
 npm run build:openevo
 cd src-tauri
+# Ubuntu/Linux CI runners need Tauri native packages such as
+# libwebkit2gtk-4.1-dev, libayatana-appindicator3-dev, libgtk-3-dev,
+# libxdo-dev, librsvg2-dev, and patchelf.
+cargo metadata --locked --format-version 1
 cargo test --locked
 ```
 
@@ -160,6 +165,7 @@ mkdir -p src/openevo/wheels
 cp .openevo-remote-wheel/openevo-*.whl src/openevo/wheels/
 python -m build --wheel
 python scripts/ci/check_openevo_release.py --wheel dist/*.whl
+python scripts/ci/write_sha256.py dist/*.whl
 python -m venv .openevo-wheel-smoke
 .openevo-wheel-smoke/bin/python -m pip install --upgrade pip
 .openevo-wheel-smoke/bin/python -m pip install dist/*.whl

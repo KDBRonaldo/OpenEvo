@@ -56,6 +56,7 @@ def build_sidecar(*, clean: bool) -> Path:
     dist_dir = packaging_root / "sidecar-dist"
     build_dir = packaging_root / "sidecar-build"
     entrypoint = packaging_root / "sidecar_entry.py"
+    static_root = packaging_root / "web"
 
     if clean:
         shutil.rmtree(dist_dir, ignore_errors=True)
@@ -87,6 +88,8 @@ def build_sidecar(*, clean: bool) -> Path:
         "openevo",
         "--collect-data",
         "openevo",
+        "--add-data",
+        f"{static_root}{os.pathsep}desktop/packaging/web",
         "--hidden-import",
         "uvicorn.logging",
         "--hidden-import",
