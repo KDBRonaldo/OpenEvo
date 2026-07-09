@@ -49,6 +49,9 @@ from polar_evolution.terminal_bench_per_task import (
     run_per_task_evolution_dry_run,
 )
 from polar_evolution.terminal_bench_task_local_parametric import (
+    LocalSuccessReplayTrial,
+    build_local_success_replay_parametric_job_payload,
+    build_local_success_replay_sft_records,
     build_task_local_parametric_job_payload,
     build_task_local_sft_records,
     select_task_local_candidates,
@@ -627,6 +630,77 @@ def build_parser() -> argparse.ArgumentParser:
     )
     tb_task_local_parametric_job.add_argument("--run-worker", action="store_true")
     tb_task_local_parametric_job.add_argument("--output", help="Output JSON path. Defaults to stdout.")
+    tb_local_success_replay_job = subparsers.add_parser(
+        "terminal-bench-local-success-replay-parametric-memory-job",
+        help=(
+            "Build Terminal Bench parametric-memory LoRA job payloads from "
+            "successful local Harbor llm_calls.jsonl trajectories."
+        ),
+    )
+    tb_local_success_replay_job.add_argument(
+        "--success-trial-dir",
+        action="append",
+        default=[],
+        required=True,
+    )
+    tb_local_success_replay_job.add_argument(
+        "--task-id",
+        action="append",
+        default=[],
+        required=True,
+    )
+    tb_local_success_replay_job.add_argument("--output-root", required=True)
+    tb_local_success_replay_job.add_argument("--dataset-name")
+    tb_local_success_replay_job.add_argument(
+        "--base-model",
+        default=DEFAULT_LOCAL_MODEL,
+    )
+    tb_local_success_replay_job.add_argument(
+        "--adapter-id",
+        default=DEFAULT_LOCAL_PARAMETRIC_ADAPTER_ID,
+    )
+    tb_local_success_replay_job.add_argument("--trainer-command", required=True)
+    tb_local_success_replay_job.add_argument(
+        "--trainer-arg",
+        action="append",
+        default=[],
+    )
+    tb_local_success_replay_job.add_argument(
+        "--trainer-timeout-seconds",
+        type=float,
+        default=3600.0,
+    )
+    tb_local_success_replay_job.add_argument(
+        "--allowed-tool",
+        action="append",
+        default=[],
+        help=(
+            "Allowed output tool name. Defaults to tb_read_task, tb_exec, and "
+            "tb_run_tests when omitted. Can be repeated."
+        ),
+    )
+    tb_local_success_replay_job.add_argument("--require-tool-name")
+    tb_local_success_replay_job.add_argument(
+        "--exclude-if-input-contains",
+        action="append",
+        default=[],
+    )
+    tb_local_success_replay_job.add_argument(
+        "--exclude-if-output-contains",
+        action="append",
+        default=[],
+    )
+    tb_local_success_replay_job.add_argument("--max-records", type=int)
+    tb_local_success_replay_job.add_argument("--max-records-per-trial", type=int)
+    tb_local_success_replay_job.add_argument(
+        "--artifact-root",
+        help="Artifact root used only when --run-worker is set.",
+    )
+    tb_local_success_replay_job.add_argument("--run-worker", action="store_true")
+    tb_local_success_replay_job.add_argument(
+        "--output",
+        help="Output JSON path. Defaults to stdout.",
+    )
     tb_per_task = subparsers.add_parser(
         "terminal-bench-per-task-evolution",
         help="Run or plan per-task Terminal Bench evolution.",
@@ -907,6 +981,7 @@ def _normalize_cli_argv(argv: list[str]) -> list[str]:
     trainer_arg_commands = {
         "terminal-bench-parametric-memory-job",
         "terminal-bench-task-local-parametric-memory-job",
+        "terminal-bench-local-success-replay-parametric-memory-job",
     }
     if not argv or argv[0] not in trainer_arg_commands:
         return list(argv)
@@ -1039,6 +1114,12 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == "terminal-bench-task-local-parametric-memory-job":
         payload = _create_terminal_bench_task_local_parametric_memory_job(args)
+        _write_json_output(payload, args.output)
+        return 0
+    if args.command == "terminal-bench-local-success-replay-parametric-memory-job":
+        payload = _create_terminal_bench_local_success_replay_parametric_memory_job(
+            args
+        )
         _write_json_output(payload, args.output)
         return 0
     if args.command == "terminal-bench-local-parametric-memory-eval":
@@ -1806,6 +1887,99 @@ def _create_terminal_bench_task_local_parametric_memory_job(
             artifact_root=artifact_root,
         )
         completed_artifacts = [artifact.model_dump(mode="json") for artifact in artifacts]
+        payload["completed_artifacts"] = completed_artifacts
+        completed_path = output_root / "completed_artifacts.json"
+        completed_path.write_text(
+            json.dumps(completed_artifacts, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        payload["completed_artifacts_path"] = str(completed_path)
+
+    return payload
+
+
+def _local_success_replay_trials_from_args(
+    args: argparse.Namespace,
+) -> list[LocalSuccessReplayTrial]:
+    trial_dirs = [Path(path) for path in args.success_trial_dir]
+    task_ids = list(args.task_id)
+    if len(task_ids) == 1 and len(trial_dirs) > 1:
+        task_ids = task_ids * len(trial_dirs)
+    if len(task_ids) != len(trial_dirs):
+        raise ValueError(
+            "terminal-bench-local-success-replay-parametric-memory-job requires "
+            "one --task-id for all success trials or one --task-id per "
+            "--success-trial-dir"
+        )
+    return [
+        LocalSuccessReplayTrial(task_id=task_id, trial_dir=trial_dir)
+        for task_id, trial_dir in zip(task_ids, trial_dirs, strict=True)
+    ]
+
+
+def _create_terminal_bench_local_success_replay_parametric_memory_job(
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    trials = _local_success_replay_trials_from_args(args)
+    allowed_tools = list(args.allowed_tool) or None
+    records = build_local_success_replay_sft_records(
+        trials,
+        allowed_tools=allowed_tools,
+        require_tool_name=args.require_tool_name,
+        exclude_if_input_contains=list(args.exclude_if_input_contains),
+        exclude_if_output_contains=list(args.exclude_if_output_contains),
+        max_records=args.max_records,
+        max_records_per_trial=args.max_records_per_trial,
+    )
+    if not records:
+        raise ValueError(
+            "terminal-bench-local-success-replay-parametric-memory-job found no "
+            "usable local success replay records"
+        )
+    selected_task_ids = sorted({trial.task_id for trial in trials})
+    selection_filters = records[0]["metadata"]["selection_filters"]
+    source_models = sorted(
+        {
+            record["metadata"]["source_model"]
+            for record in records
+            if isinstance(record.get("metadata"), dict)
+            and isinstance(record["metadata"].get("source_model"), str)
+        }
+    )
+    task_suffix = "-".join(selected_task_ids)
+    dataset_name = args.dataset_name or f"tb21-local-success-replay-{task_suffix}"
+    output_root = Path(args.output_root)
+    payload = build_local_success_replay_parametric_job_payload(
+        records=records,
+        output_root=output_root,
+        dataset_name=dataset_name,
+        base_model=args.base_model,
+        adapter_id=args.adapter_id,
+        trainer_command=args.trainer_command,
+        trainer_args=list(args.trainer_arg),
+        trainer_timeout_seconds=args.trainer_timeout_seconds,
+        task_ids=selected_task_ids,
+        source_trial_dirs=[trial.trial_dir for trial in trials],
+        selection_filters=selection_filters,
+        source_models=source_models,
+    )
+    payload["source_trial_dirs"] = [str(trial.trial_dir) for trial in trials]
+    payload["selected_tasks"] = selected_task_ids
+    payload["selection_filters"] = selection_filters
+    payload["source_models"] = source_models
+
+    if args.run_worker:
+        if args.artifact_root:
+            artifact_root = Path(args.artifact_root)
+        else:
+            artifact_root = output_root / "artifacts"
+        artifacts = run_method(
+            WorkerClaimedJob.model_validate(payload["job"]),
+            artifact_root=artifact_root,
+        )
+        completed_artifacts = [
+            artifact.model_dump(mode="json") for artifact in artifacts
+        ]
         payload["completed_artifacts"] = completed_artifacts
         completed_path = output_root / "completed_artifacts.json"
         completed_path.write_text(

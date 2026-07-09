@@ -2321,6 +2321,94 @@ def test_terminal_bench_task_local_parametric_memory_job_cli_writes_payload(
     assert "completed_artifacts" not in payload
 
 
+def test_terminal_bench_local_success_replay_parametric_memory_job_cli_writes_payload(
+    tmp_path: Path,
+) -> None:
+    trial_dir = tmp_path / "train-fasttext__success"
+    _write_local_success_llm_calls(
+        trial_dir,
+        [
+            {
+                "trajectory_id": "qwen-success-1",
+                "model": "Qwen/Qwen3.5-9B",
+                "usage": {"prompt_tokens": 12, "completion_tokens": 8},
+                "input_messages": [{"role": "user", "content": "Instruction:\n{}"}],
+                "output_messages": [
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": "call-exec",
+                                "type": "function",
+                                "function": {
+                                    "name": "tb_exec",
+                                    "arguments": {
+                                        "task_id": "terminal-bench-task",
+                                        "command": (
+                                            "python - <<'PY'\nprint('ok')\nPY"
+                                        ),
+                                    },
+                                },
+                            }
+                        ],
+                    }
+                ],
+            }
+        ],
+    )
+    output = tmp_path / "job.json"
+
+    assert (
+        main(
+            [
+                "terminal-bench-local-success-replay-parametric-memory-job",
+                "--success-trial-dir",
+                str(trial_dir),
+                "--task-id",
+                "train-fasttext",
+                "--output-root",
+                str(tmp_path / "out"),
+                "--dataset-name",
+                "tb21-local-success-replay-train-fasttext",
+                "--base-model",
+                "Qwen/Qwen3.5-9B",
+                "--adapter-id",
+                "tb-parametric-memory-train-fasttext-replay",
+                "--trainer-command",
+                "python",
+                "--trainer-arg",
+                "train_lora.py",
+                "--trainer-arg",
+                "--train-file",
+                "--trainer-arg",
+                "{training_dataset}",
+                "--trainer-arg",
+                "--output-dir",
+                "--trainer-arg",
+                "{adapter_dir}",
+                "--require-tool-name",
+                "tb_exec",
+                "--max-records",
+                "1",
+                "--output",
+                str(output),
+            ]
+        )
+        == 0
+    )
+
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert payload["selected_tasks"] == ["train-fasttext"]
+    assert payload["dataset"]["record_count"] == 1
+    assert payload["source_trial_dirs"] == [str(trial_dir)]
+    assert payload["selection_filters"]["require_tool_name"] == "tb_exec"
+    assert payload["job"]["method"] == "parametric_memory_lora_sft"
+    record = json.loads(Path(payload["dataset"]["records_path"]).read_text())
+    assert record["metadata"]["builder"] == "terminal_bench_local_success_replay"
+    assert record["metadata"]["output_tool_names"] == ["tb_exec"]
+
+
 def test_terminal_bench_task_local_parametric_memory_job_cli_accepts_prompt_style(
     tmp_path: Path,
 ) -> None:
