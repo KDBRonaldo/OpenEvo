@@ -169,7 +169,7 @@ wheel, and Core/Desktop package boundary, then installs the wheel into a clean
 environment and runs the installed backend launcher plus Desktop API smoke
 checks. The installed-wheel smoke covers Core capabilities, method metadata,
 project config save, workspace, bootstrap, services, service status, run launch,
-run artifact summary parsing, and artifact content reading:
+backend-facade timeline/artifact reads, and artifact preview rendering:
 
 ```bash
 cd desktop
@@ -360,6 +360,7 @@ deterministic bootstrap plan, writes a remote service topology under
 `<state_root>/services/topology.yaml`, then starts and checks the OpenEvo
 service daemons needed by Desktop Science runs:
 
+- OpenEvo Core backend on `127.0.0.1:8765`;
 - evolution backend on `127.0.0.1:8200`;
 - rollout on `127.0.0.1:8080`;
 - gateway on `127.0.0.1:8100`;
@@ -400,7 +401,7 @@ latest services report is ready. The command is derived only from those
 bootstrap paths:
 
 ```bash
-PATH="$HOME/.local/bin:$PATH" openevo-backend run <experiment_snapshot> --output-dir <state_root>/runs/<run-id> --json
+PATH="$HOME/.local/bin:$PATH" openevo-backend run <experiment_snapshot> --output-dir <state_root>/runs/<run-id> --artifact-root <state_root>/evolution/artifacts --json
 ```
 
 The PATH prefix lets the run use the console script created by bootstrap's
@@ -422,37 +423,39 @@ the transcript evolution row complete. A failing terminal status still returns
 HTTP 200 from the polling endpoint with `run.ready=false`, and the refreshed
 shell status marks those rows blocked with the command error.
 
-After a terminal run status, Desktop calls
-`GET /openevo-api/desktop/run/artifacts` with the same sidecar mutation token.
-The endpoint is read-only but still token-protected because it reaches into the
-remote run directory. It is available only for config-backed sidecar sessions
-with a launched latest run, and it rejects active runs because the run
-`summary.json` contract is complete only after `openevo-backend run` exits.
+After a terminal run status, Desktop calls the local backend facade with the
+same sidecar mutation token:
 
-The endpoint reads `<run.output_dir>/summary.json` on the remote machine through
-the configured transport, parses it, and returns a compact timeline payload:
-run id, output directory, summary status, experiment id/name, round count, and
-per-task rounds with rollout status, dataset status, produced artifact ids, and
-worker job summaries. Worker summaries include artifact type, method, worker
-status, produced artifact ids, approved artifact ids, and promotion status. The
-payload intentionally does not inline artifact contents; Desktop renders ids and
-statuses so users can see the evolution process without transferring generated
-memory, skill, agent-system, or adapter directories into the local browser.
+```text
+GET /openevo-api/backend/runs/{run_id}/timeline
+GET /openevo-api/backend/runs/{run_id}/artifacts
+GET /openevo-api/backend/artifacts/{artifact_id}/content
+GET /openevo-api/backend/artifacts/{artifact_id}/diff
+```
 
-If the remote summary file is missing, the endpoint returns 404. If remote
-command execution or JSON parsing fails, it returns a sanitized 502 response.
-Desktop renders the artifact timeline after terminal success or failure when a
-summary is available, and shows the sanitized timeline-load error without
-hiding the terminal run status. Saving or activating a different project config,
-rerunning workspace sync, rerunning bootstrap, or restarting services clears the
-latest run and its artifact timeline to avoid showing stale evolution state.
+The facade forwards these requests to the remote OpenEvo Core Backend through
+the sidecar-managed SSH tunnel created after remote services become ready. The
+sidecar preserves typed backend payloads and errors; it does not read run
+`summary.json`, parse artifact directories, execute evolution methods, or
+define a second method registry for Desktop. The remote backend receives the
+bootstrap `state_root` and reads Core-owned
+`<state_root>/runs/<run-id>/summary.json` plus `<state_root>/evolution/`
+artifacts for sidecar-launched runs.
+
+Desktop renders Core-provided timeline events, artifact summaries, promoted
+artifact previews, and text diffs after terminal success or failure when Core
+has data available. Timeline/artifact load errors are shown without hiding the
+terminal run status. Saving or activating a different project config, rerunning
+workspace sync, rerunning bootstrap, or restarting services clears the latest
+run, timeline, artifacts, and preview to avoid showing stale evolution state.
 
 The sidecar generates a per-process mutation token and includes it in
 `GET /openevo-api/desktop/shell` under `sidecar.mutation_token`. Mutating
-requests must send that token in the non-simple
+requests and backend facade requests must send that token in the non-simple
 `X-OpenEvo-Sidecar-Token` header. Missing or invalid tokens are rejected before
-any workspace, bootstrap, or run work starts. This is a local CSRF guard for the
-Desktop sidecar: cross-site pages can submit simple localhost requests, but
+any workspace, bootstrap, run, or backend facade work starts. This is a local
+CSRF guard for the Desktop sidecar: cross-site pages can submit simple localhost
+requests, but
 cannot read the same-origin shell response or set the required custom header.
 The sidecar allows only one mutating lifecycle action per config-backed session
 at a time. A second request for the same lifecycle action returns a specific
@@ -479,8 +482,8 @@ crashed remote daemons, browse artifact diffs, tune GPU placement or
 quantization for vLLM, or manage dynamic adapters. The Tauri host starts and
 stops the bundled local sidecar process; restart policy is still a product
 hardening task. Human-readable artifact content for `text_memory`,
-`skill_bundle`, and `agent_system` is available through the latest-run artifact
-content endpoint.
+`skill_bundle`, and `agent_system` is available through the backend artifact
+preview facade.
 
 ## CLI
 
@@ -493,15 +496,16 @@ productization tasks.
 
 The current release includes local Desktop serving, config-backed sidecar
 sessions, SSH-backed remote workspace preparation, remote bootstrap,
-command-based service startup, run supervision, terminal-run artifact summary
-display, and human-readable artifact content viewing. It still does not include:
+command-based service startup, run supervision, backend-facade timeline and
+artifact preview display, and human-readable artifact content viewing. It still
+does not include:
 
-- local credential vault or SSH tunnel management;
+- local credential vault or persistent SSH tunnel monitoring/reconnect;
 - auto-update, code signing, notarization, or OS credential vault integration;
 - Docker Compose lifecycle management;
 - production vLLM lifecycle tuning, restart policy, GPU placement, or dynamic
   adapter loading;
-- artifact diff browsing in Desktop;
+- rich artifact directory browsing in Desktop;
 - parametric memory or adapter training for Science Projects.
 
 Those capabilities remain separate layers above or below the Science Project

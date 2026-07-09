@@ -29,8 +29,9 @@ describe("AppShell", () => {
   it("renders OpenEvo Desktop without shared dashboard navigation in desktop-only mode", () => {
     const html = renderShell("/openevo", true);
 
-    expect(html).toContain("Protein Folding Literature Sprint");
-    expect(html).toContain("Remote ready");
+    expect(html).toContain("Untitled Science Project");
+    expect(html).toContain("Setup required");
+    expect(html).not.toContain("Protein Folding Literature Sprint");
     expect(html).not.toContain("OpenEvo Observability");
     expect(html).not.toContain('href="/tasks"');
     expect(html).not.toContain(">Dashboard<");
@@ -39,7 +40,7 @@ describe("AppShell", () => {
   it("renders OpenEvo Desktop at the root path in desktop-only mode", () => {
     const html = renderShell("/", true);
 
-    expect(html).toContain("Protein Folding Literature Sprint");
+    expect(html).toContain("Untitled Science Project");
     expect(html).not.toContain("Not found");
   });
 });

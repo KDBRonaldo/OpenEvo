@@ -211,6 +211,23 @@ def test_create_app_launcher_accepts_config_root_override(tmp_path: Path) -> Non
     assert response.json() == {"configs": []}
 
 
+def test_create_app_launcher_wires_backend_facade_base_url(tmp_path: Path) -> None:
+    app = create_app(
+        static_root=_static_root(tmp_path),
+        backend_base_url="http://127.0.0.1:9",
+    )
+    client = TestClient(app)
+    token = client.get("/openevo-api/desktop/shell").json()["sidecar"]["mutation_token"]
+
+    response = client.get(
+        "/openevo-api/backend/status",
+        headers={"X-OpenEvo-Sidecar-Token": token},
+    )
+
+    assert response.status_code == 503
+    assert response.json()["code"] == "backend_connection_failed"
+
+
 def test_create_app_launcher_saves_first_project_config(tmp_path: Path) -> None:
     config_root = tmp_path / "config"
     app = create_app(

@@ -29,11 +29,13 @@ def test_backend_launcher_run_invokes_experiment_runner(
         task_ids: list[str] | None,
         rounds_override: int | None,
         output_dir: Path | None,
+        artifact_root: Path | None,
     ) -> dict[str, object]:
         calls["loaded_config"] = loaded_config
         calls["task_ids"] = task_ids
         calls["rounds_override"] = rounds_override
         calls["output_dir"] = output_dir
+        calls["artifact_root"] = artifact_root
         return {"status": "completed", "summary_path": str(output_dir / "summary.json")}
 
     monkeypatch.setattr(
@@ -49,6 +51,8 @@ def test_backend_launcher_run_invokes_experiment_runner(
             str(config_path),
             "--output-dir",
             str(output_dir),
+            "--artifact-root",
+            str(tmp_path / "state" / "evolution" / "artifacts"),
             "--rounds",
             "3",
             "--task-id",
@@ -66,6 +70,7 @@ def test_backend_launcher_run_invokes_experiment_runner(
         "task_ids": ["task-a", "task-b"],
         "rounds_override": 3,
         "output_dir": output_dir,
+        "artifact_root": tmp_path / "state" / "evolution" / "artifacts",
     }
     assert json.loads(capsys.readouterr().out) == {
         "status": "completed",
@@ -114,16 +119,33 @@ def test_backend_launcher_run_dry_run_uses_dry_runner(
 def test_backend_launcher_serve_starts_backend_api(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: dict[str, object] = {}
 
-    def fake_uvicorn_run(app: str, **kwargs: object) -> None:
+    app = object()
+
+    def fake_create_backend_app(*, state_root: Path | None = None) -> object:
+        calls["state_root"] = state_root
+        return app
+
+    def fake_uvicorn_run(app: object, **kwargs: object) -> None:
         calls["app"] = app
         calls.update(kwargs)
 
+    monkeypatch.setattr(launcher, "create_backend_app", fake_create_backend_app)
     monkeypatch.setattr("uvicorn.run", fake_uvicorn_run)
 
-    assert launcher.main(["serve", "--host", "0.0.0.0", "--port", "9876"]) == 0
+    assert launcher.main(
+        [
+            "serve",
+            "--host",
+            "0.0.0.0",
+            "--port",
+            "9876",
+            "--state-root",
+            "/srv/openevo/state",
+        ]
+    ) == 0
     assert calls == {
-        "app": "openevo.backend.api:create_backend_app",
-        "factory": True,
+        "state_root": Path("/srv/openevo/state"),
+        "app": app,
         "host": "0.0.0.0",
         "port": 9876,
     }

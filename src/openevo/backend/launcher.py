@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 from openevo import __version__
+from openevo.backend.api import create_backend_app
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -14,9 +15,11 @@ def build_parser() -> argparse.ArgumentParser:
     serve = subparsers.add_parser("serve", help="Start the OpenEvo backend server.")
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=8765)
+    serve.add_argument("--state-root", type=Path, default=None)
     run = subparsers.add_parser("run", help="Run an OpenEvo experiment snapshot.")
     run.add_argument("config", type=Path)
     run.add_argument("--output-dir", type=Path)
+    run.add_argument("--artifact-root", type=Path)
     run.add_argument("--rounds", type=int, dest="rounds_override")
     run.add_argument("--task-id", action="append", default=[])
     run.add_argument("--dry-run", action="store_true")
@@ -30,8 +33,7 @@ def main(argv: list[str] | None = None) -> int:
         import uvicorn
 
         uvicorn.run(
-            "openevo.backend.api:create_backend_app",
-            factory=True,
+            create_backend_app(state_root=args.state_root),
             host=args.host,
             port=args.port,
         )
@@ -58,6 +60,7 @@ def _run_experiment_command(args: argparse.Namespace) -> int:
             task_ids=task_ids,
             rounds_override=args.rounds_override,
             output_dir=args.output_dir,
+            artifact_root=args.artifact_root,
         )
     output = json.dumps(result, indent=None if args.json else 2, sort_keys=True)
     print(output)

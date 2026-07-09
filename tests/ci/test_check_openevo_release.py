@@ -431,7 +431,7 @@ def test_tauri_macos_config_builds_dmg_release_shell() -> None:
     assert "fn host_status(" in main
     assert "fn start_sidecar(" in main
     assert "fn stop_sidecar(" in main
-    assert "fn create_ssh_tunnel(" in main
+    assert "fn create_ssh_tunnel(" not in main
     assert "fn keychain_reference(" in main
     assert "fn app_logs(" in main
     assert "desktop.server.launcher" in main
@@ -491,7 +491,9 @@ def test_desktop_science_release_doc_matches_remote_lifecycle_state() -> None:
     assert "`POST /openevo-api/desktop/bootstrap`" in text
     assert "`POST /openevo-api/desktop/services`" in text
     assert "`POST /openevo-api/desktop/run`" in text
-    assert "`GET /openevo-api/desktop/run/artifacts`" in text
+    assert "GET /openevo-api/backend/runs/{run_id}/timeline" in text
+    assert "GET /openevo-api/backend/runs/{run_id}/artifacts" in text
+    assert "GET /openevo-api/backend/artifacts/{artifact_id}/content" in text
 
 
 def test_readme_release_checklist_matches_frontend_audit_gate() -> None:

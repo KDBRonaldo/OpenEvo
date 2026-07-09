@@ -23,15 +23,6 @@ struct SidecarStatus {
 }
 
 #[derive(Clone, serde::Serialize)]
-struct TunnelStatus {
-    id: String,
-    local_port: u16,
-    remote_host: String,
-    remote_port: u16,
-    state: String,
-}
-
-#[derive(Clone, serde::Serialize)]
 struct KeychainReference {
     service: String,
     account: String,
@@ -45,7 +36,6 @@ struct ManagedSidecar {
 #[derive(Default)]
 struct DesktopHostState {
     sidecar: Mutex<Option<ManagedSidecar>>,
-    tunnels: Mutex<Vec<TunnelStatus>>,
     logs: Arc<Mutex<Vec<String>>>,
 }
 
@@ -83,38 +73,66 @@ fn bundled_sidecar_path(app: Option<&tauri::AppHandle>) -> Option<PathBuf> {
     candidates.into_iter().find(|path| path.is_file())
 }
 
-fn sidecar_command(app: Option<&tauri::AppHandle>, port: u16) -> (String, Vec<String>) {
+fn normalized_backend_base_url(value: &str) -> Option<String> {
+    let trimmed = value.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn backend_base_url_for_sidecar() -> Option<String> {
+    if let Ok(value) = std::env::var("OPENEVO_DESKTOP_BACKEND_BASE_URL") {
+        if let Some(normalized) = normalized_backend_base_url(&value) {
+            return Some(normalized);
+        }
+    }
+    None
+}
+
+fn sidecar_command(
+    app: Option<&tauri::AppHandle>,
+    port: u16,
+    backend_base_url: Option<&str>,
+) -> (String, Vec<String>) {
+    let backend_base_url = backend_base_url.and_then(normalized_backend_base_url);
     if let Ok(command_line) = std::env::var("OPENEVO_DESKTOP_SIDECAR_COMMAND") {
         return (
             "sh".to_string(),
             vec![
                 "-c".to_string(),
-                command_line.replace("{port}", &port.to_string()),
+                command_line.replace("{port}", &port.to_string()).replace(
+                    "{backend_base_url}",
+                    backend_base_url.as_deref().unwrap_or(""),
+                ),
             ],
         );
     }
     if let Some(sidecar_path) = bundled_sidecar_path(app) {
-        return (
-            sidecar_path.to_string_lossy().into_owned(),
-            vec![
-                "--host".to_string(),
-                "127.0.0.1".to_string(),
-                "--port".to_string(),
-                port.to_string(),
-            ],
-        );
-    }
-    (
-        "python3".to_string(),
-        vec![
-            "-m".to_string(),
-            "desktop.server.launcher".to_string(),
+        let mut args = vec![
             "--host".to_string(),
             "127.0.0.1".to_string(),
             "--port".to_string(),
             port.to_string(),
-        ],
-    )
+        ];
+        if let Some(url) = backend_base_url {
+            args.extend(["--backend-base-url".to_string(), url]);
+        }
+        return (sidecar_path.to_string_lossy().into_owned(), args);
+    }
+    let mut args = vec![
+        "-m".to_string(),
+        "desktop.server.launcher".to_string(),
+        "--host".to_string(),
+        "127.0.0.1".to_string(),
+        "--port".to_string(),
+        port.to_string(),
+    ];
+    if let Some(url) = backend_base_url {
+        args.extend(["--backend-base-url".to_string(), url]);
+    }
+    ("python3".to_string(), args)
 }
 
 fn check_sidecar_health(port: u16) -> Result<(), String> {
@@ -284,7 +302,8 @@ fn start_sidecar(
     }
 
     let port = allocate_port()?;
-    let (program, args) = sidecar_command(Some(&app), port);
+    let backend_base_url = backend_base_url_for_sidecar();
+    let (program, args) = sidecar_command(Some(&app), port, backend_base_url.as_deref());
     let display = command_display(&program, &args);
     let mut command = Command::new(&program);
     command
@@ -381,34 +400,6 @@ fn stop_sidecar(state: tauri::State<'_, DesktopHostState>) -> Result<SidecarStat
 }
 
 #[tauri::command]
-fn create_ssh_tunnel(
-    state: tauri::State<'_, DesktopHostState>,
-    remote_host: String,
-    remote_port: u16,
-) -> Result<TunnelStatus, String> {
-    let remote_host = remote_host.trim().to_string();
-    if remote_host.is_empty() {
-        return Err("remote_host must be a non-empty string".to_string());
-    }
-    if remote_port == 0 {
-        return Err("remote_port must be greater than zero".to_string());
-    }
-    let tunnel = TunnelStatus {
-        id: format!("{remote_host}:{remote_port}"),
-        local_port: allocate_port()?,
-        remote_host,
-        remote_port,
-        state: "reserved".to_string(),
-    };
-    state
-        .tunnels
-        .lock()
-        .map_err(|_| "tunnel state lock poisoned".to_string())?
-        .push(tunnel.clone());
-    Ok(tunnel)
-}
-
-#[tauri::command]
 fn keychain_reference(service: String, account: String) -> KeychainReference {
     KeychainReference { service, account }
 }
@@ -429,7 +420,6 @@ fn main() {
             host_status,
             start_sidecar,
             stop_sidecar,
-            create_ssh_tunnel,
             keychain_reference,
             app_logs,
         ])
@@ -440,8 +430,8 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        allocate_port, check_sidecar_health, sidecar_command, wait_for_sidecar_ready,
-        SIDECAR_HEALTH_CONNECT_TIMEOUT,
+        allocate_port, backend_base_url_for_sidecar, check_sidecar_health, sidecar_command,
+        wait_for_sidecar_ready, SIDECAR_HEALTH_CONNECT_TIMEOUT,
     };
     use std::io::{Read, Write};
     use std::net::TcpListener;
@@ -450,6 +440,8 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
     fn allocate_port_returns_non_zero_port() {
         assert!(allocate_port().unwrap() > 0);
@@ -457,7 +449,9 @@ mod tests {
 
     #[test]
     fn sidecar_command_targets_local_launcher() {
-        let (program, args) = sidecar_command(None, 49152);
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("OPENEVO_DESKTOP_SIDECAR_COMMAND");
+        let (program, args) = sidecar_command(None, 49152, None);
 
         assert_eq!(program, "python3");
         assert_eq!(
@@ -474,14 +468,58 @@ mod tests {
     }
 
     #[test]
-    fn sidecar_command_allows_env_override() {
-        std::env::set_var("OPENEVO_DESKTOP_SIDECAR_COMMAND", "custom --port {port}");
+    fn sidecar_command_passes_backend_base_url() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("OPENEVO_DESKTOP_SIDECAR_COMMAND");
+        let (program, args) = sidecar_command(None, 49152, Some("http://127.0.0.1:8765/"));
 
-        let (program, args) = sidecar_command(None, 49153);
+        assert_eq!(program, "python3");
+        assert_eq!(
+            args,
+            vec![
+                "-m",
+                "desktop.server.launcher",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "49152",
+                "--backend-base-url",
+                "http://127.0.0.1:8765",
+            ]
+        );
+    }
+
+    #[test]
+    fn sidecar_command_allows_env_override() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var(
+            "OPENEVO_DESKTOP_SIDECAR_COMMAND",
+            "custom --port {port} --backend {backend_base_url}",
+        );
+
+        let (program, args) = sidecar_command(None, 49153, Some("http://127.0.0.1:8765"));
 
         std::env::remove_var("OPENEVO_DESKTOP_SIDECAR_COMMAND");
         assert_eq!(program, "sh");
-        assert_eq!(args, vec!["-c", "custom --port 49153"]);
+        assert_eq!(
+            args,
+            vec!["-c", "custom --port 49153 --backend http://127.0.0.1:8765"]
+        );
+    }
+
+    #[test]
+    fn backend_base_url_uses_env_override_only() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var(
+            "OPENEVO_DESKTOP_BACKEND_BASE_URL",
+            "http://127.0.0.1:49154/",
+        );
+        assert_eq!(
+            backend_base_url_for_sidecar(),
+            Some("http://127.0.0.1:49154".to_string())
+        );
+        std::env::remove_var("OPENEVO_DESKTOP_BACKEND_BASE_URL");
+        assert_eq!(backend_base_url_for_sidecar(), None);
     }
 
     #[test]

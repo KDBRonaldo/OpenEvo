@@ -1,11 +1,12 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   activateOpenEvoProjectConfig,
-  fetchOpenEvoArtifactContent,
+  fetchOpenEvoBackendArtifactPreview,
+  fetchOpenEvoBackendRunArtifacts,
+  fetchOpenEvoBackendRunTimeline,
   fetchOpenEvoDesktopCapabilities,
   fetchOpenEvoProjectConfigs,
   fetchOpenEvoDesktopShellModel,
-  fetchOpenEvoRunArtifacts,
   pollOpenEvoRunStatus,
   runOpenEvoBootstrap,
   runOpenEvoServices,
@@ -410,7 +411,7 @@ describe("OpenEvo sidecar client", () => {
     expect(calls[1].headers.get("X-OpenEvo-Sidecar-Token")).toBe("poll-token");
   });
 
-  it("maps run artifact summary after terminal runs", async () => {
+  it("maps backend run artifacts after terminal runs", async () => {
     const calls: Array<{ path: string; headers: Headers; method: string }> = [];
     const shellPayload = sidecarShellPayload("artifact-token");
     vi.spyOn(globalThis, "fetch").mockImplementation(
@@ -424,39 +425,89 @@ describe("OpenEvo sidecar client", () => {
         if (path === "/openevo-api/desktop/shell") {
           return jsonResponse(shellPayload);
         }
-        if (path === "/openevo-api/desktop/run/artifacts") {
-          return jsonResponse(sidecarRunArtifactsPayload());
+        if (
+          path ===
+          "/openevo-api/backend/runs/run_20260707170000000000/artifacts"
+        ) {
+          return jsonResponse(backendRunArtifactsPayload());
         }
         return new Response("not found", { status: 404 });
       },
     );
 
     await fetchOpenEvoDesktopShellModel();
-    const artifacts = await fetchOpenEvoRunArtifacts();
+    const artifacts = await fetchOpenEvoBackendRunArtifacts(
+      "run_20260707170000000000",
+    );
 
-    expect(artifacts.runId).toBe("run_20260707170000000000");
-    expect(artifacts.summaryStatus).toBe("completed");
-    expect(artifacts.experimentId).toBe("biology-components");
-    expect(artifacts.tasks[0]?.taskId).toBe("folding-baseline");
-    expect(artifacts.tasks[0]?.rounds[0]?.roundIndex).toBe(0);
-    expect(artifacts.tasks[0]?.rounds[0]?.artifactIds.skill_bundle).toEqual([
-      "artifact-skill-bundle",
+    expect(artifacts).toEqual([
+      {
+        id: "artifact-text-memory",
+        runId: "run_20260707170000000000",
+        artifactType: "text_memory",
+        title: "Initial memory draft",
+        promoted: true,
+        lineage: {
+          method: "text_memory_reflector",
+          dataset_id: "dataset-artifact-1",
+        },
+      },
     ]);
-    expect(artifacts.tasks[0]?.rounds[0]?.jobs[0]).toEqual({
-      artifactType: "text_memory",
-      method: "text_memory_reflector",
-      workerStatus: "succeeded",
-      artifactIds: ["artifact-text-memory"],
-      approvedArtifactIds: ["artifact-text-memory"],
-      promotionStatus: "approved",
-    });
     expect(calls).toHaveLength(2);
     expect(calls[1]).toMatchObject({
-      path: "/openevo-api/desktop/run/artifacts",
+      path: "/openevo-api/backend/runs/run_20260707170000000000/artifacts",
       method: "GET",
     });
     expect(calls[1].headers.get("X-OpenEvo-Sidecar-Token")).toBe(
       "artifact-token",
+    );
+  });
+
+  it("maps backend timeline events after terminal runs", async () => {
+    const calls: Array<{ path: string; headers: Headers; method: string }> = [];
+    const shellPayload = sidecarShellPayload("timeline-token");
+    vi.spyOn(globalThis, "fetch").mockImplementation(
+      async (input, init) => {
+        const path = String(input);
+        calls.push({
+          path,
+          headers: new Headers(init?.headers),
+          method: init?.method ?? "GET",
+        });
+        if (path === "/openevo-api/desktop/shell") {
+          return jsonResponse(shellPayload);
+        }
+        if (
+          path ===
+          "/openevo-api/backend/runs/run_20260707170000000000/timeline"
+        ) {
+          return jsonResponse(backendRunTimelinePayload());
+        }
+        return new Response("not found", { status: 404 });
+      },
+    );
+
+    await fetchOpenEvoDesktopShellModel();
+    const timeline = await fetchOpenEvoBackendRunTimeline(
+      "run_20260707170000000000",
+    );
+
+    expect(timeline).toEqual([
+      {
+        id: "event-memory",
+        phase: "evolution",
+        label: "Memory updated",
+        message: "Text memory worker promoted one artifact.",
+        artifactIds: ["artifact-text-memory"],
+      },
+    ]);
+    expect(calls).toHaveLength(2);
+    expect(calls[1]).toMatchObject({
+      path: "/openevo-api/backend/runs/run_20260707170000000000/timeline",
+      method: "GET",
+    });
+    expect(calls[1].headers.get("X-OpenEvo-Sidecar-Token")).toBe(
+      "timeline-token",
     );
   });
 
@@ -538,7 +589,7 @@ describe("OpenEvo sidecar client", () => {
     ]);
   });
 
-  it("fetches markdown artifact content with the sidecar token", async () => {
+  it("fetches backend artifact preview with the sidecar token", async () => {
     const calls: Array<{ path: string; headers: Headers; method: string }> = [];
     const shellPayload = sidecarShellPayload("content-token");
     vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
@@ -551,33 +602,62 @@ describe("OpenEvo sidecar client", () => {
       if (path === "/openevo-api/desktop/shell") {
         return jsonResponse(shellPayload);
       }
-      if (path === "/openevo-api/desktop/artifacts/artifact-text-memory/content") {
+      if (path === "/openevo-api/backend/artifacts/artifact-text-memory/content") {
         return jsonResponse({
-          artifact_id: "artifact-text-memory",
+          id: "artifact-text-memory",
           artifact_type: "text_memory",
-          filename: "memory.md",
           content: "# Learned Memory\n\n- Prefer stable folds.\n",
-          mime_type: "text/markdown",
+          metadata: {
+            target_path: "memory.md",
+            lineage: {
+              method: "text_memory_reflector",
+            },
+          },
+        });
+      }
+      if (path === "/openevo-api/backend/artifacts/artifact-text-memory/diff") {
+        return jsonResponse({
+          id: "artifact-text-memory",
+          before: "",
+          after: "# Learned Memory\n\n- Prefer stable folds.\n",
+          format: "unified_text",
         });
       }
       return new Response("not found", { status: 404 });
     });
 
     await fetchOpenEvoDesktopShellModel();
-    const content = await fetchOpenEvoArtifactContent("artifact-text-memory");
+    const preview = await fetchOpenEvoBackendArtifactPreview(
+      "artifact-text-memory",
+    );
 
-    expect(content).toEqual({
-      artifactId: "artifact-text-memory",
-      artifactType: "text_memory",
-      filename: "memory.md",
-      content: "# Learned Memory\n\n- Prefer stable folds.\n",
-      mimeType: "text/markdown",
+    expect(preview).toEqual({
+      id: "artifact-text-memory",
+      kind: "text_memory",
+      body: "# Learned Memory\n\n- Prefer stable folds.\n",
+      targetPath: "memory.md",
+      lineage: {
+        method: "text_memory_reflector",
+      },
+      diff: {
+        id: "artifact-text-memory",
+        before: "",
+        after: "# Learned Memory\n\n- Prefer stable folds.\n",
+        format: "unified_text",
+      },
     });
     expect(calls[1]).toMatchObject({
-      path: "/openevo-api/desktop/artifacts/artifact-text-memory/content",
+      path: "/openevo-api/backend/artifacts/artifact-text-memory/content",
+      method: "GET",
+    });
+    expect(calls[2]).toMatchObject({
+      path: "/openevo-api/backend/artifacts/artifact-text-memory/diff",
       method: "GET",
     });
     expect(calls[1].headers.get("X-OpenEvo-Sidecar-Token")).toBe(
+      "content-token",
+    );
+    expect(calls[2].headers.get("X-OpenEvo-Sidecar-Token")).toBe(
       "content-token",
     );
   });
@@ -662,16 +742,37 @@ describe("OpenEvo sidecar client", () => {
           status: shellPayload,
         });
       }
-      if (path === "/openevo-api/desktop/run/artifacts") {
-        return jsonResponse(sidecarRunArtifactsPayload());
+      if (
+        path ===
+        "/openevo-api/backend/runs/run_20260707170000000000/timeline"
+      ) {
+        return jsonResponse(backendRunTimelinePayload());
       }
-      if (path === "/openevo-api/desktop/artifacts/artifact-text-memory/content") {
+      if (
+        path ===
+        "/openevo-api/backend/runs/run_20260707170000000000/artifacts"
+      ) {
+        return jsonResponse(backendRunArtifactsPayload());
+      }
+      if (path === "/openevo-api/backend/artifacts/artifact-text-memory/content") {
         return jsonResponse({
-          artifact_id: "artifact-text-memory",
+          id: "artifact-text-memory",
           artifact_type: "text_memory",
-          filename: "memory.md",
           content: "# Learned Memory\n\n- Prefer stable folds.\n",
-          mime_type: "text/markdown",
+          metadata: {
+            target_path: "memory.md",
+            lineage: {
+              method: "text_memory_reflector",
+            },
+          },
+        });
+      }
+      if (path === "/openevo-api/backend/artifacts/artifact-text-memory/diff") {
+        return jsonResponse({
+          id: "artifact-text-memory",
+          before: "",
+          after: "# Learned Memory\n\n- Prefer stable folds.\n",
+          format: "unified_text",
         });
       }
       return new Response("not found", { status: 404 });
@@ -685,16 +786,22 @@ describe("OpenEvo sidecar client", () => {
     await runOpenEvoServices();
     await runOpenEvoStartRun();
     await pollOpenEvoRunStatus();
-    const artifacts = await fetchOpenEvoRunArtifacts();
-    const content = await fetchOpenEvoArtifactContent("artifact-text-memory");
+    const timeline = await fetchOpenEvoBackendRunTimeline(
+      "run_20260707170000000000",
+    );
+    const artifacts = await fetchOpenEvoBackendRunArtifacts(
+      "run_20260707170000000000",
+    );
+    const content = await fetchOpenEvoBackendArtifactPreview(
+      "artifact-text-memory",
+    );
 
     expect(capabilities.evolutionMethods[0]?.methodId).toBe(
       "text_memory_reflector",
     );
-    expect(artifacts.tasks[0]?.rounds[0]?.artifactIds.text_memory).toEqual([
-      "artifact-text-memory",
-    ]);
-    expect(content.content).toContain("Prefer stable folds");
+    expect(timeline[0]?.artifactIds).toEqual(["artifact-text-memory"]);
+    expect(artifacts[0]?.artifactType).toBe("text_memory");
+    expect(content.body).toContain("Prefer stable folds");
     expect(calls.map((call) => `${call.method} ${call.path}`)).toEqual([
       "GET /openevo-api/desktop/capabilities",
       "GET /openevo-api/desktop/shell",
@@ -704,8 +811,10 @@ describe("OpenEvo sidecar client", () => {
       "POST /openevo-api/desktop/services",
       "POST /openevo-api/desktop/run",
       "GET /openevo-api/desktop/run",
-      "GET /openevo-api/desktop/run/artifacts",
-      "GET /openevo-api/desktop/artifacts/artifact-text-memory/content",
+      "GET /openevo-api/backend/runs/run_20260707170000000000/timeline",
+      "GET /openevo-api/backend/runs/run_20260707170000000000/artifacts",
+      "GET /openevo-api/backend/artifacts/artifact-text-memory/content",
+      "GET /openevo-api/backend/artifacts/artifact-text-memory/diff",
     ]);
     for (const call of calls.slice(2)) {
       expect(call.headers.get("X-OpenEvo-Sidecar-Token")).toBe("smoke-token");
@@ -999,7 +1108,7 @@ function sidecarRunReport({
     state,
     ready: succeeded,
     command:
-      "openevo run /home/alice/.openevo/runs/protein/folding/experiment.json --output-dir /home/alice/.openevo/runs/protein/folding/runs/run_20260707170000000000 --json",
+      "openevo-backend run /home/alice/.openevo/runs/protein/folding/experiment.json --output-dir /home/alice/.openevo/runs/protein/folding/runs/run_20260707170000000000 --artifact-root /home/alice/.openevo/runs/protein/folding/evolution/artifacts --json",
     return_code: state === "running" ? null : succeeded ? 0 : 2,
     stdout: succeeded ? "ok" : "",
     stderr: failed ? "run failed" : "",
@@ -1011,45 +1120,32 @@ function sidecarRunReport({
   };
 }
 
-function sidecarRunArtifactsPayload() {
-  return {
-    run_id: "run_20260707170000000000",
-    output_dir:
-      "/home/alice/.openevo/runs/protein/folding/runs/run_20260707170000000000",
-    summary_status: "completed",
-    experiment_id: "biology-components",
-    experiment_name: "Biology Components",
-    round_count: 1,
-    tasks: [
-      {
-        task_id: "folding-baseline",
-        rounds: [
-          {
-            round_index: 0,
-            policy_version: "policy-r0",
-            rollout_status: "completed",
-            dataset_status: "ready",
-            artifact_ids: {
-              dataset: ["dataset-artifact-1"],
-              text_memory: ["artifact-text-memory"],
-              skill_bundle: ["artifact-skill-bundle"],
-              agent_system: ["artifact-agent-system"],
-            },
-            jobs: [
-              {
-                artifact_type: "text_memory",
-                method: "text_memory_reflector",
-                worker_status: "succeeded",
-                artifact_ids: ["artifact-text-memory"],
-                approved_artifact_ids: ["artifact-text-memory"],
-                promotion_status: "approved",
-              },
-            ],
-          },
-        ],
+function backendRunTimelinePayload() {
+  return [
+    {
+      id: "event-memory",
+      phase: "evolution",
+      title: "Memory updated",
+      message: "Text memory worker promoted one artifact.",
+      artifact_ids: ["artifact-text-memory"],
+    },
+  ];
+}
+
+function backendRunArtifactsPayload() {
+  return [
+    {
+      id: "artifact-text-memory",
+      run_id: "run_20260707170000000000",
+      artifact_type: "text_memory",
+      title: "Initial memory draft",
+      promoted: true,
+      lineage: {
+        method: "text_memory_reflector",
+        dataset_id: "dataset-artifact-1",
       },
-    ],
-  };
+    },
+  ];
 }
 
 function projectConfigDraft() {

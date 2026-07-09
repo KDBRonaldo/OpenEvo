@@ -43,6 +43,38 @@ class FailSecondCallRunner(RecordingRunner):
         )
 
 
+class RecordingTunnelStarter:
+    def __init__(self) -> None:
+        self.calls: list[list[str]] = []
+        self.processes: list[FakeTunnelProcess] = []
+
+    def __call__(self, argv: list[str]) -> "FakeTunnelProcess":
+        self.calls.append(argv)
+        process = FakeTunnelProcess()
+        self.processes.append(process)
+        return process
+
+
+class FakeTunnelProcess:
+    def __init__(self) -> None:
+        self.terminated = False
+        self.killed = False
+        self.waited = False
+
+    def poll(self) -> int | None:
+        return None
+
+    def terminate(self) -> None:
+        self.terminated = True
+
+    def kill(self) -> None:
+        self.killed = True
+
+    def wait(self, timeout: float | None = None) -> int:
+        self.waited = True
+        return 0
+
+
 def _profile(**extra) -> RemoteProfileConfig:
     payload = {
         "version": 1,
@@ -255,6 +287,44 @@ def test_upload_dir_creates_remote_parent_and_runs_rsync(tmp_path: Path) -> None
     assert runner.calls[1][0][-2] == f"{local}/"
     assert runner.calls[1][0][-1] == "gpu.example.edu:/home/alice/.openevo/workspaces/task/"
     assert "-l alice" in runner.calls[1][0][4]
+
+
+def test_open_tunnel_starts_ssh_local_forwarding_and_closes_process() -> None:
+    starter = RecordingTunnelStarter()
+    transport = SshRemoteExecutorTransport(
+        _profile(),
+        runner=RecordingRunner(),
+        tunnel_starter=starter,
+        port_allocator=lambda: 49155,
+    )
+
+    tunnel = transport.open_tunnel(remote_port=8765, wait_for_ready=False)
+
+    assert tunnel.local_port == 49155
+    assert tunnel.remote_port == 8765
+    assert tunnel.base_url == "http://127.0.0.1:49155"
+    assert starter.calls == [
+        [
+            "ssh",
+            "-p",
+            "2222",
+            "-o",
+            "BatchMode=yes",
+            "-l",
+            "alice",
+            "-N",
+            "-L",
+            "127.0.0.1:49155:127.0.0.1:8765",
+            "--",
+            "gpu.example.edu",
+        ]
+    ]
+
+    tunnel.close()
+
+    assert starter.processes[0].terminated is True
+    assert starter.processes[0].waited is True
+    assert starter.processes[0].killed is False
 
 
 def test_upload_dir_rejects_missing_local_path(tmp_path: Path) -> None:

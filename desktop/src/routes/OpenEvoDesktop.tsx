@@ -16,21 +16,23 @@ import {
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import {
   activateOpenEvoProjectConfig,
-  fetchOpenEvoArtifactContent,
+  fetchOpenEvoBackendArtifactPreview,
+  fetchOpenEvoBackendRunArtifacts,
+  fetchOpenEvoBackendRunTimeline,
   fetchOpenEvoDesktopCapabilities,
   fetchOpenEvoProjectConfigs,
   fetchOpenEvoDesktopShellModel,
-  fetchOpenEvoRunArtifacts,
   pollOpenEvoRunStatus,
   runOpenEvoBootstrap,
   runOpenEvoServices,
   runOpenEvoStartRun,
   runOpenEvoWorkspaceSync,
   saveOpenEvoProjectConfig,
+  type OpenEvoBackendArtifactPreview,
+  type OpenEvoBackendArtifactSummary,
+  type OpenEvoBackendTimelineEvent,
   type OpenEvoProjectConfigDraft,
-  type OpenEvoArtifactContent,
   type OpenEvoDesktopCapabilities,
-  type OpenEvoRunArtifacts,
   type OpenEvoRunStatus,
   type OpenEvoSavedProjectConfig,
 } from "../api/openevo";
@@ -77,13 +79,16 @@ export function OpenEvoDesktop() {
   const [workspaceReport, setWorkspaceReport] =
     useState<LifecycleReportPayload | null>(null);
   const [latestRun, setLatestRun] = useState<OpenEvoRunStatus | null>(null);
-  const [runArtifacts, setRunArtifacts] = useState<OpenEvoRunArtifacts | null>(
-    null,
-  );
+  const [runTimeline, setRunTimeline] = useState<
+    OpenEvoBackendTimelineEvent[] | null
+  >(null);
+  const [runArtifacts, setRunArtifacts] = useState<
+    OpenEvoBackendArtifactSummary[] | null
+  >(null);
   const [runArtifactsLoading, setRunArtifactsLoading] = useState(false);
   const [runArtifactsError, setRunArtifactsError] = useState<string | null>(null);
   const [artifactContent, setArtifactContent] =
-    useState<OpenEvoArtifactContent | null>(null);
+    useState<OpenEvoBackendArtifactPreview | null>(null);
   const [artifactContentLoading, setArtifactContentLoading] = useState(false);
   const [artifactContentError, setArtifactContentError] = useState<string | null>(
     null,
@@ -202,6 +207,7 @@ export function OpenEvoDesktop() {
     invalidateRunPolling();
     setRunRunning(false);
     setLatestRun(null);
+    setRunTimeline(null);
     setRunArtifacts(null);
     setRunArtifactsLoading(false);
     setRunArtifactsError(null);
@@ -392,6 +398,7 @@ export function OpenEvoDesktop() {
     const generation = runPollGeneration.current;
     setRunRunning(true);
     setRunError(null);
+    setRunTimeline(null);
     setRunArtifacts(null);
     setRunArtifactsLoading(false);
     setRunArtifactsError(null);
@@ -411,7 +418,7 @@ export function OpenEvoDesktop() {
         void pollLatestRun(generation);
       } else {
         setRunRunning(false);
-        void loadRunArtifacts(generation);
+        void loadRunArtifacts(response.run.id, generation);
       }
     } catch (error) {
       if (!mounted.current || generation !== runPollGeneration.current) {
@@ -439,7 +446,7 @@ export function OpenEvoDesktop() {
         }, 1000);
       } else {
         setRunRunning(false);
-        void loadRunArtifacts(generation);
+        void loadRunArtifacts(response.run.id, generation);
       }
     } catch (error) {
       if (!mounted.current || generation !== runPollGeneration.current) {
@@ -451,14 +458,18 @@ export function OpenEvoDesktop() {
     }
   };
 
-  const loadRunArtifacts = async (generation: number) => {
+  const loadRunArtifacts = async (runId: string, generation: number) => {
     setRunArtifactsLoading(true);
     setRunArtifactsError(null);
     try {
-      const artifacts = await fetchOpenEvoRunArtifacts();
+      const [timeline, artifacts] = await Promise.all([
+        fetchOpenEvoBackendRunTimeline(runId),
+        fetchOpenEvoBackendRunArtifacts(runId),
+      ]);
       if (!mounted.current || generation !== runPollGeneration.current) {
         return;
       }
+      setRunTimeline(timeline);
       setRunArtifacts(artifacts);
       const previewArtifactId = firstDisplayArtifactId(artifacts);
       if (previewArtifactId) {
@@ -469,7 +480,8 @@ export function OpenEvoDesktop() {
         return;
       }
       const message =
-        error instanceof Error ? error.message : "Run artifact summary failed";
+        error instanceof Error ? error.message : "Run artifact loading failed";
+      setRunTimeline(null);
       setRunArtifacts(null);
       setRunArtifactsError(message);
     } finally {
@@ -483,7 +495,7 @@ export function OpenEvoDesktop() {
     setArtifactContentLoading(true);
     setArtifactContentError(null);
     try {
-      const content = await fetchOpenEvoArtifactContent(artifactId);
+      const content = await fetchOpenEvoBackendArtifactPreview(artifactId);
       if (!mounted.current || generation !== runPollGeneration.current) {
         return;
       }
@@ -1084,6 +1096,7 @@ export function OpenEvoDesktop() {
       {latestRun && latestRun.state !== "running" ? (
         <Panel title="Run Artifact Timeline" icon={<FileText size={17} />}>
           <RunArtifactTimeline
+            timeline={runTimeline}
             artifacts={runArtifacts}
             loading={runArtifactsLoading}
             error={runArtifactsError}
@@ -1103,9 +1116,10 @@ export function OpenEvoDesktop() {
         </Panel>
       ) : null}
 
-      {latestRun ? (
+      {latestRun && model.developerMode.enabled ? (
         <DiagnosticsDisclosure
           latestRun={latestRun}
+          timeline={runTimeline}
           artifacts={runArtifacts}
           open={diagnosticsOpen}
           onToggle={setDiagnosticsOpen}
@@ -1228,12 +1242,14 @@ function Field({
 }
 
 function RunArtifactTimeline({
+  timeline,
   artifacts,
   loading,
   error,
   displayNames,
 }: {
-  artifacts: OpenEvoRunArtifacts | null;
+  timeline: OpenEvoBackendTimelineEvent[] | null;
+  artifacts: OpenEvoBackendArtifactSummary[] | null;
   loading: boolean;
   error: string | null;
   displayNames: Record<string, string>;
@@ -1242,7 +1258,7 @@ function RunArtifactTimeline({
     <div className="space-y-4">
       {loading ? (
         <div className="rounded-md border border-blue-100 bg-blue-50 px-3 py-2 text-sm text-blue-800">
-          Reading remote summary.json
+          Reading remote backend timeline and artifacts
         </div>
       ) : null}
       {error ? (
@@ -1250,135 +1266,71 @@ function RunArtifactTimeline({
           {error}
         </div>
       ) : null}
-      {artifacts ? (
+      {timeline || artifacts ? (
         <>
-          <div className="grid grid-cols-1 gap-3 text-sm lg:grid-cols-4">
-            <Field label="Experiment" value={artifacts.experimentName} />
-            <Field label="Summary" value={artifacts.summaryStatus} />
-            <Field label="Rounds" value={String(artifacts.roundCount)} />
-          </div>
-          {artifacts.tasks.length > 0 ? (
-            <div className="divide-y divide-slate-100 border-t border-slate-100">
-              {artifacts.tasks.map((task) => (
-                <div key={task.taskId} className="py-4 first:pt-0 last:pb-0">
-                  <div className="text-sm font-semibold text-slate-900">
-                    {task.taskId}
+          {timeline && timeline.length > 0 ? (
+            <div className="divide-y divide-slate-100 border-b border-slate-100">
+              {timeline.map((event) => (
+                <div
+                  key={event.id}
+                  className="grid grid-cols-1 gap-2 py-3 first:pt-0 lg:grid-cols-[8rem_minmax(0,1fr)]"
+                >
+                  <div className="text-xs font-medium uppercase text-slate-500">
+                    {event.phase}
                   </div>
-                  <div className="mt-3 space-y-4">
-                    {task.rounds.map((round) => (
-                      <div
-                        key={`${task.taskId}:${round.roundIndex}`}
-                        className="border-l border-slate-200 pl-3"
-                      >
-                        <div className="flex flex-wrap items-center gap-2">
-                          <span className="text-sm font-medium text-slate-900">
-                            Round {round.roundIndex}
-                          </span>
-                          <InlineStatus label="rollout" value={round.rolloutStatus} />
-                          <InlineStatus label="dataset" value={round.datasetStatus} />
-                          {round.policyVersion ? (
-                            <span className="font-mono text-xs text-slate-500">
-                              {round.policyVersion}
-                            </span>
-                          ) : null}
-                        </div>
-                        <ArtifactTypeGroups
-                          artifactIds={round.artifactIds}
-                          displayNames={displayNames}
-                        />
-                        {round.jobs.length > 0 ? (
-                          <div className="mt-3 divide-y divide-slate-100">
-                            {round.jobs.map((job, index) => (
-                              <div
-                                key={`${job.artifactType}:${job.method}:${index}`}
-                                className="grid grid-cols-1 gap-2 py-3 first:pt-0 last:pb-0 lg:grid-cols-[minmax(0,1fr)_auto]"
-                              >
-                                <div className="min-w-0">
-                                  <div className="break-words text-sm font-medium text-slate-900">
-                                    {displayNames[job.artifactType] ??
-                                      prettyArtifactType(job.artifactType)}
-                                  </div>
-                                  <div className="mt-1 flex flex-wrap items-center gap-2">
-                                    <InlineStatus
-                                      label="worker"
-                                      value={job.workerStatus}
-                                    />
-                                    {job.promotionStatus ? (
-                                      <span className="text-xs font-medium text-slate-500">
-                                        {job.promotionStatus}
-                                      </span>
-                                    ) : null}
-                                  </div>
-                                </div>
-                              </div>
-                            ))}
-                          </div>
-                        ) : null}
+                  <div className="min-w-0">
+                    <div className="break-words text-sm font-medium text-slate-900">
+                      {event.label}
+                    </div>
+                    <div className="mt-1 break-words text-sm text-slate-600">
+                      {event.message}
+                    </div>
+                    {event.artifactIds.length > 0 ? (
+                      <div className="mt-1 text-xs text-slate-500">
+                        {event.artifactIds.length} artifact
+                        {event.artifactIds.length === 1 ? "" : "s"}
                       </div>
-                    ))}
+                    ) : null}
                   </div>
                 </div>
               ))}
             </div>
-          ) : (
-            <div className="rounded-md border border-slate-200 bg-slate-50 px-3 py-2 text-sm text-slate-600">
-              No artifact records in summary yet.
+          ) : null}
+          {artifacts && artifacts.length > 0 ? (
+            <div className="grid grid-cols-1 gap-3 lg:grid-cols-3">
+              {artifacts.map((artifact) => (
+                <div
+                  key={artifact.id}
+                  className="rounded-md border border-slate-200 bg-slate-50 px-3 py-2"
+                >
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="break-words text-sm font-medium text-slate-900">
+                      {artifact.title}
+                    </span>
+                    {artifact.promoted ? (
+                      <span className="rounded-md bg-emerald-100 px-2 py-0.5 text-xs font-medium text-emerald-800">
+                        Promoted
+                      </span>
+                    ) : (
+                      <span className="rounded-md bg-slate-200 px-2 py-0.5 text-xs font-medium text-slate-700">
+                        Draft
+                      </span>
+                    )}
+                  </div>
+                  <div className="mt-1 text-xs text-slate-500">
+                    {displayNames[artifact.artifactType] ??
+                      prettyArtifactType(artifact.artifactType)}
+                  </div>
+                </div>
+              ))}
             </div>
-          )}
+          ) : !loading && !error ? (
+            <div className="rounded-md border border-slate-200 bg-slate-50 px-3 py-2 text-sm text-slate-600">
+              No backend artifact records yet.
+            </div>
+          ) : null}
         </>
       ) : null}
-    </div>
-  );
-}
-
-function InlineStatus({ label, value }: { label: string; value: string }) {
-  return (
-    <span className="inline-flex items-center gap-1 rounded-md border border-slate-200 bg-slate-50 px-2 py-1 text-xs text-slate-700">
-      <span className="font-medium text-slate-500">{label}</span>
-      <span>{value || "unknown"}</span>
-    </span>
-  );
-}
-
-function ArtifactTypeGroups({
-  artifactIds,
-  displayNames,
-}: {
-  artifactIds: Record<string, string[]>;
-  displayNames: Record<string, string>;
-}) {
-  const groups = Object.entries(artifactIds).filter(([, ids]) => ids.length > 0);
-  if (groups.length === 0) {
-    return null;
-  }
-  return (
-    <div className="mt-3 flex flex-wrap gap-2">
-      {groups.map(([artifactType]) => (
-        <span
-          key={artifactType}
-          className="rounded-md border border-slate-200 bg-slate-50 px-2 py-1 text-xs text-slate-700"
-        >
-          {displayNames[artifactType] ?? prettyArtifactType(artifactType)}
-        </span>
-      ))}
-    </div>
-  );
-}
-
-function ArtifactIdGroups({
-  artifactIds,
-}: {
-  artifactIds: Record<string, string[]>;
-}) {
-  const groups = Object.entries(artifactIds).filter(([, ids]) => ids.length > 0);
-  if (groups.length === 0) {
-    return null;
-  }
-  return (
-    <div className="mt-3 grid grid-cols-1 gap-2 lg:grid-cols-2">
-      {groups.map(([artifactType, ids]) => (
-        <ArtifactIdLine key={artifactType} label={artifactType} values={ids} />
-      ))}
     </div>
   );
 }
@@ -1416,7 +1368,7 @@ function ArtifactContentPanel({
   error,
   displayNames,
 }: {
-  content: OpenEvoArtifactContent | null;
+  content: OpenEvoBackendArtifactPreview | null;
   loading: boolean;
   error: string | null;
   displayNames: Record<string, string>;
@@ -1434,17 +1386,26 @@ function ArtifactContentPanel({
         </div>
       ) : null}
       {content ? (
-        <div className="space-y-2">
+        <div className="space-y-3">
           <div className="flex flex-wrap items-center gap-2 text-sm">
             <span className="font-medium text-slate-900">
-              {displayNames[content.artifactType] ??
-                prettyArtifactType(content.artifactType)}
+              {displayNames[content.kind] ?? prettyArtifactType(content.kind)}
             </span>
-            <span className="text-xs text-slate-500">{content.filename}</span>
+            {content.targetPath ? (
+              <span className="font-mono text-xs text-slate-500">
+                {content.targetPath}
+              </span>
+            ) : null}
           </div>
           <pre className="max-h-80 overflow-auto whitespace-pre-wrap rounded-md border border-slate-200 bg-slate-50 px-3 py-2 text-sm leading-6 text-slate-900">
-            {content.content}
+            {content.body}
           </pre>
+          {content.diff.before || content.diff.after ? (
+            <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
+              <DiffBlock label="Before" value={content.diff.before} />
+              <DiffBlock label="After" value={content.diff.after} />
+            </div>
+          ) : null}
         </div>
       ) : !loading && !error ? (
         <div className="rounded-md border border-slate-200 bg-slate-50 px-3 py-2 text-sm text-slate-600">
@@ -1457,12 +1418,14 @@ function ArtifactContentPanel({
 
 function DiagnosticsDisclosure({
   latestRun,
+  timeline,
   artifacts,
   open,
   onToggle,
 }: {
   latestRun: OpenEvoRunStatus;
-  artifacts: OpenEvoRunArtifacts | null;
+  timeline: OpenEvoBackendTimelineEvent[] | null;
+  artifacts: OpenEvoBackendArtifactSummary[] | null;
   open: boolean;
   onToggle: (open: boolean) => void;
 }) {
@@ -1488,46 +1451,43 @@ function DiagnosticsDisclosure({
               <LogBlock label="stderr" value={latestRun.stderr} />
             ) : null}
           </div>
-          {artifacts ? (
+          {timeline && timeline.length > 0 ? (
             <div className="space-y-4">
-              <div className="grid grid-cols-1 gap-3 text-sm lg:grid-cols-3">
-                <Field label="Artifact run" value={artifacts.runId} />
-                <Field label="Artifact output dir" value={artifacts.outputDir} wide />
+              <div className="text-xs font-medium uppercase text-slate-500">
+                Backend timeline
               </div>
-              {artifacts.tasks.map((task) => (
-                <div key={task.taskId} className="border-l border-slate-200 pl-3">
-                  <div className="text-sm font-semibold text-slate-900">
-                    {task.taskId}
+              {timeline.map((event) => (
+                <div key={event.id} className="border-l border-slate-200 pl-3">
+                  <div className="break-words text-sm font-semibold text-slate-900">
+                    {event.phase}: {event.label}
                   </div>
-                  {task.rounds.map((round) => (
-                    <div
-                      key={`${task.taskId}:${round.roundIndex}`}
-                      className="mt-3 space-y-3"
-                    >
-                      <div className="text-xs font-medium uppercase text-slate-500">
-                        Round {round.roundIndex}
-                      </div>
-                      <ArtifactIdGroups artifactIds={round.artifactIds} />
-                      {round.jobs.map((job, index) => (
-                        <div
-                          key={`${job.artifactType}:${job.method}:${index}`}
-                          className="border-l border-slate-100 pl-3"
-                        >
-                          <Field label="Method" value={job.method} />
-                          <div className="mt-2 grid grid-cols-1 gap-2 lg:grid-cols-2">
-                            <ArtifactIdLine
-                              label="Artifacts"
-                              values={job.artifactIds}
-                            />
-                            <ArtifactIdLine
-                              label="Approved"
-                              values={job.approvedArtifactIds}
-                            />
-                          </div>
-                        </div>
-                      ))}
-                    </div>
-                  ))}
+                  <div className="mt-1 break-words text-sm text-slate-600">
+                    {event.message}
+                  </div>
+                  <ArtifactIdLine label="Artifacts" values={event.artifactIds} />
+                </div>
+              ))}
+            </div>
+          ) : null}
+          {artifacts && artifacts.length > 0 ? (
+            <div className="space-y-3">
+              <div className="text-xs font-medium uppercase text-slate-500">
+                Backend artifacts
+              </div>
+              {artifacts.map((artifact) => (
+                <div key={artifact.id} className="border-l border-slate-200 pl-3">
+                  <Field label="Artifact ID" value={artifact.id} />
+                  <div className="mt-2 grid grid-cols-1 gap-3 lg:grid-cols-3">
+                    <Field label="Run ID" value={artifact.runId} />
+                    <Field label="Type" value={artifact.artifactType} />
+                    <Field
+                      label="Promoted"
+                      value={artifact.promoted ? "true" : "false"}
+                    />
+                  </div>
+                  <pre className="mt-2 max-h-36 overflow-auto whitespace-pre-wrap rounded-md bg-slate-50 px-3 py-2 text-xs leading-5 text-slate-700">
+                    {JSON.stringify(artifact.lineage, null, 2)}
+                  </pre>
                 </div>
               ))}
             </div>
@@ -1724,18 +1684,11 @@ function configKeyForArtifactType(
   return null;
 }
 
-function firstDisplayArtifactId(artifacts: OpenEvoRunArtifacts): string | null {
-  for (const task of artifacts.tasks) {
-    for (const round of task.rounds) {
-      for (const job of round.jobs) {
-        const [approved] = job.approvedArtifactIds;
-        if (approved) {
-          return approved;
-        }
-      }
-    }
-  }
-  return null;
+function firstDisplayArtifactId(
+  artifacts: OpenEvoBackendArtifactSummary[],
+): string | null {
+  const promoted = artifacts.find((artifact) => artifact.promoted);
+  return promoted?.id ?? null;
 }
 
 function prettyArtifactType(artifactType: string): string {
@@ -1751,6 +1704,17 @@ function sentenceCase(label: string): string {
     return label;
   }
   return label.charAt(0).toUpperCase() + label.slice(1).toLowerCase();
+}
+
+function DiffBlock({ label, value }: { label: string; value: string }) {
+  return (
+    <div>
+      <div className="text-xs font-medium uppercase text-slate-500">{label}</div>
+      <pre className="mt-1 max-h-48 overflow-auto whitespace-pre-wrap rounded-md border border-slate-200 bg-white px-3 py-2 text-xs leading-5 text-slate-700">
+        {value || "No content"}
+      </pre>
+    </div>
+  );
 }
 
 function LogBlock({ label, value }: { label: string; value: string }) {

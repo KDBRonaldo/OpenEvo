@@ -12,11 +12,12 @@ import {
 
 const apiMocks = vi.hoisted(() => ({
   activateOpenEvoProjectConfig: vi.fn(),
-  fetchOpenEvoArtifactContent: vi.fn(),
+  fetchOpenEvoBackendArtifactPreview: vi.fn(),
+  fetchOpenEvoBackendRunArtifacts: vi.fn(),
+  fetchOpenEvoBackendRunTimeline: vi.fn(),
   fetchOpenEvoDesktopCapabilities: vi.fn(),
   fetchOpenEvoProjectConfigs: vi.fn(),
   fetchOpenEvoDesktopShellModel: vi.fn(),
-  fetchOpenEvoRunArtifacts: vi.fn(),
   pollOpenEvoRunStatus: vi.fn(),
   runOpenEvoBootstrap: vi.fn(),
   runOpenEvoServices: vi.fn(),
@@ -27,11 +28,12 @@ const apiMocks = vi.hoisted(() => ({
 
 vi.mock("../api/openevo", () => ({
   activateOpenEvoProjectConfig: apiMocks.activateOpenEvoProjectConfig,
-  fetchOpenEvoArtifactContent: apiMocks.fetchOpenEvoArtifactContent,
+  fetchOpenEvoBackendArtifactPreview: apiMocks.fetchOpenEvoBackendArtifactPreview,
+  fetchOpenEvoBackendRunArtifacts: apiMocks.fetchOpenEvoBackendRunArtifacts,
+  fetchOpenEvoBackendRunTimeline: apiMocks.fetchOpenEvoBackendRunTimeline,
   fetchOpenEvoDesktopCapabilities: apiMocks.fetchOpenEvoDesktopCapabilities,
   fetchOpenEvoProjectConfigs: apiMocks.fetchOpenEvoProjectConfigs,
   fetchOpenEvoDesktopShellModel: apiMocks.fetchOpenEvoDesktopShellModel,
-  fetchOpenEvoRunArtifacts: apiMocks.fetchOpenEvoRunArtifacts,
   pollOpenEvoRunStatus: apiMocks.pollOpenEvoRunStatus,
   runOpenEvoBootstrap: apiMocks.runOpenEvoBootstrap,
   runOpenEvoServices: apiMocks.runOpenEvoServices,
@@ -45,11 +47,12 @@ vi.mock("../api/openevo", () => ({
 describe("OpenEvoDesktop", () => {
   beforeEach(() => {
     apiMocks.activateOpenEvoProjectConfig.mockReset();
-    apiMocks.fetchOpenEvoArtifactContent.mockReset();
+    apiMocks.fetchOpenEvoBackendArtifactPreview.mockReset();
+    apiMocks.fetchOpenEvoBackendRunArtifacts.mockReset();
+    apiMocks.fetchOpenEvoBackendRunTimeline.mockReset();
     apiMocks.fetchOpenEvoDesktopCapabilities.mockReset();
     apiMocks.fetchOpenEvoProjectConfigs.mockReset();
     apiMocks.fetchOpenEvoDesktopShellModel.mockReset();
-    apiMocks.fetchOpenEvoRunArtifacts.mockReset();
     apiMocks.pollOpenEvoRunStatus.mockReset();
     apiMocks.runOpenEvoBootstrap.mockReset();
     apiMocks.runOpenEvoServices.mockReset();
@@ -59,9 +62,13 @@ describe("OpenEvoDesktop", () => {
     apiMocks.activateOpenEvoProjectConfig.mockRejectedValue(
       new Error("sidecar unavailable"),
     );
-    apiMocks.fetchOpenEvoArtifactContent.mockRejectedValue(
+    apiMocks.fetchOpenEvoBackendArtifactPreview.mockRejectedValue(
       new Error("sidecar unavailable"),
     );
+    apiMocks.fetchOpenEvoBackendRunArtifacts.mockResolvedValue(
+      emptyRunArtifacts(),
+    );
+    apiMocks.fetchOpenEvoBackendRunTimeline.mockResolvedValue(emptyRunTimeline());
     apiMocks.fetchOpenEvoDesktopCapabilities.mockResolvedValue(
       desktopCapabilities(),
     );
@@ -71,7 +78,6 @@ describe("OpenEvoDesktop", () => {
     apiMocks.fetchOpenEvoDesktopShellModel.mockRejectedValue(
       new Error("sidecar unavailable"),
     );
-    apiMocks.fetchOpenEvoRunArtifacts.mockResolvedValue(emptyRunArtifacts());
     apiMocks.pollOpenEvoRunStatus.mockRejectedValue(
       new Error("sidecar unavailable"),
     );
@@ -98,12 +104,14 @@ describe("OpenEvoDesktop", () => {
     document.body.innerHTML = "";
   });
 
-  it("renders fixture state when the sidecar fetch is unavailable", () => {
+  it("renders setup-required state when the sidecar fetch is unavailable", () => {
     const html = renderToString(<OpenEvoDesktop />);
 
-    expect(html).toContain("Protein Folding Literature Sprint");
+    expect(html).toContain("Untitled Science Project");
     expect(html).toContain("codex_subscription_transcript");
-    expect(html).toContain("Remote ready");
+    expect(html).toContain("Setup required");
+    expect(html).not.toContain("Protein Folding Literature Sprint");
+    expect(html).not.toContain("gpu.example.edu");
   });
 
   it("runs bootstrap from the button and refreshes visible status", async () => {
@@ -565,7 +573,7 @@ describe("OpenEvoDesktop", () => {
         project_name: "Configured Science Project",
         remote_host: "configured.gpu.example.edu",
         remote_port: 2222,
-        source_type: "git_repository",
+        source_type: "scratch",
         text_memory: true,
         skill_bundle: true,
         agent_system: true,
@@ -1371,14 +1379,11 @@ describe("OpenEvoDesktop", () => {
     const poll = deferRun(ranModel, runStatus("succeeded"));
     apiMocks.runOpenEvoStartRun.mockReturnValue(launch.promise);
     apiMocks.pollOpenEvoRunStatus.mockReturnValue(poll.promise);
-    apiMocks.fetchOpenEvoRunArtifacts.mockResolvedValue(runArtifacts());
-    apiMocks.fetchOpenEvoArtifactContent.mockResolvedValue({
-      artifactId: "artifact-text-memory",
-      artifactType: "text_memory",
-      filename: "memory.md",
-      content: "# Learned Memory\n\n- Prefer stable folds.\n",
-      mimeType: "text/markdown",
-    });
+    apiMocks.fetchOpenEvoBackendRunTimeline.mockResolvedValue(runTimeline());
+    apiMocks.fetchOpenEvoBackendRunArtifacts.mockResolvedValue(runArtifacts());
+    apiMocks.fetchOpenEvoBackendArtifactPreview.mockResolvedValue(
+      artifactPreview(),
+    );
 
     const root = await renderClient();
     await flushEffects();
@@ -1404,20 +1409,82 @@ describe("OpenEvoDesktop", () => {
       await Promise.resolve();
     });
 
-    expect(apiMocks.fetchOpenEvoRunArtifacts).toHaveBeenCalledTimes(1);
-    expect(apiMocks.fetchOpenEvoArtifactContent).toHaveBeenCalledWith(
+    expect(apiMocks.fetchOpenEvoBackendRunTimeline).toHaveBeenCalledWith(
+      "run_20260707170000000000",
+    );
+    expect(apiMocks.fetchOpenEvoBackendRunArtifacts).toHaveBeenCalledWith(
+      "run_20260707170000000000",
+    );
+    expect(apiMocks.fetchOpenEvoBackendArtifactPreview).toHaveBeenCalledWith(
       "artifact-text-memory",
     );
     expect(document.body.textContent).toContain("Run Artifact Timeline");
-    expect(document.body.textContent).toContain("folding-baseline");
-    expect(document.body.textContent).toContain("Round 0");
+    expect(document.body.textContent).toContain("Memory updated");
+    expect(document.body.textContent).toContain("Initial memory draft");
     expect(document.body.textContent).toContain("Text memory");
     expect(document.body.textContent).toContain("Learned Memory");
-    expect(document.body.textContent).toContain("approved");
+    expect(document.body.textContent).toContain("Promoted");
     await unmountClient(root);
   });
 
-  it("hides raw run and artifact diagnostics until Diagnostics is opened", async () => {
+  it("clears the previous backend timeline while launching another run", async () => {
+    const shellModel = modelWithRun({
+      projectName: "Loaded Science Project",
+      backendState: "ready",
+      backendDetail: "Remote runtime services are ready",
+      transcriptState: "planned",
+      transcriptDetail: "Trajectory capture will start after the first run",
+    });
+    const runningModel = modelWithRun({
+      projectName: "Loaded Science Project",
+      backendState: "running",
+      backendDetail: "OpenEvo run is running",
+      transcriptState: "running",
+      transcriptDetail: "Capturing transcript trajectory",
+    });
+    const ranModel = modelWithRun({
+      projectName: "Loaded Science Project",
+      backendState: "ready",
+      backendDetail: "Last run completed",
+      transcriptState: "complete",
+      transcriptDetail: "Run completed and transcript captured",
+    });
+    apiMocks.fetchOpenEvoDesktopShellModel.mockResolvedValue(shellModel);
+    const secondLaunch = deferRun(runningModel, runStatus("running"));
+    apiMocks.runOpenEvoStartRun
+      .mockResolvedValueOnce({
+        run: runStatus("succeeded"),
+        status: ranModel,
+      })
+      .mockReturnValueOnce(secondLaunch.promise);
+    apiMocks.fetchOpenEvoBackendRunTimeline.mockResolvedValue(runTimeline());
+    apiMocks.fetchOpenEvoBackendRunArtifacts.mockResolvedValue(runArtifacts());
+    apiMocks.fetchOpenEvoBackendArtifactPreview.mockResolvedValue(artifactPreview());
+
+    const root = await renderClient();
+    await flushEffects();
+
+    await act(async () => {
+      buttonByText("Start Run").dispatchEvent(
+        new MouseEvent("click", { bubbles: true }),
+      );
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(document.body.textContent).toContain("Memory updated");
+
+    await act(async () => {
+      buttonByText("Start Run").dispatchEvent(
+        new MouseEvent("click", { bubbles: true }),
+      );
+      await Promise.resolve();
+    });
+
+    expect(document.body.textContent).not.toContain("Memory updated");
+    await unmountClient(root);
+  });
+
+  it("does not expose raw diagnostics for ordinary users", async () => {
     const shellModel = modelWithRun({
       projectName: "Loaded Science Project",
       backendState: "ready",
@@ -1442,14 +1509,73 @@ describe("OpenEvoDesktop", () => {
       run: diagnosticRun,
       status: ranModel,
     });
-    apiMocks.fetchOpenEvoRunArtifacts.mockResolvedValue(runArtifacts());
-    apiMocks.fetchOpenEvoArtifactContent.mockResolvedValue({
-      artifactId: "artifact-text-memory",
-      artifactType: "text_memory",
-      filename: "memory.md",
-      content: "# Learned Memory\n",
-      mimeType: "text/markdown",
+    apiMocks.fetchOpenEvoBackendRunTimeline.mockResolvedValue(runTimeline());
+    apiMocks.fetchOpenEvoBackendRunArtifacts.mockResolvedValue(runArtifacts());
+    apiMocks.fetchOpenEvoBackendArtifactPreview.mockResolvedValue(
+      artifactPreview({
+        body: "# Learned Memory\n",
+      }),
+    );
+
+    const root = await renderClient();
+    await flushEffects();
+
+    await act(async () => {
+      buttonByText("Start Run").dispatchEvent(
+        new MouseEvent("click", { bubbles: true }),
+      );
+      await Promise.resolve();
+      await Promise.resolve();
     });
+
+    expect(document.body.textContent).not.toContain("Diagnostics");
+    expect(document.body.textContent).not.toContain("run_20260707170000000000");
+    expect(document.body.textContent).not.toContain(
+      "/home/alice/.openevo/runs/protein/folding/runs/run_20260707170000000000",
+    );
+    expect(document.body.textContent).not.toContain("stdout secret payload");
+    expect(document.body.textContent).not.toContain("stderr secret payload");
+    expect(document.body.textContent).not.toContain("text_memory_reflector");
+    expect(document.body.textContent).not.toContain("artifact-text-memory");
+    await unmountClient(root);
+  });
+
+  it("hides raw run and artifact diagnostics until developer Diagnostics is opened", async () => {
+    const shellModel = withDeveloperMode(
+      modelWithRun({
+        projectName: "Loaded Science Project",
+        backendState: "ready",
+        backendDetail: "Remote runtime services are ready",
+        transcriptState: "planned",
+        transcriptDetail: "Trajectory capture will start after the first run",
+      }),
+    );
+    const ranModel = withDeveloperMode(
+      modelWithRun({
+        projectName: "Loaded Science Project",
+        backendState: "ready",
+        backendDetail: "Last run completed",
+        transcriptState: "complete",
+        transcriptDetail: "Run completed and transcript captured",
+      }),
+    );
+    apiMocks.fetchOpenEvoDesktopShellModel.mockResolvedValue(shellModel);
+    const diagnosticRun = {
+      ...runStatus("succeeded"),
+      stdout: "stdout secret payload",
+      stderr: "stderr secret payload",
+    };
+    apiMocks.runOpenEvoStartRun.mockResolvedValue({
+      run: diagnosticRun,
+      status: ranModel,
+    });
+    apiMocks.fetchOpenEvoBackendRunTimeline.mockResolvedValue(runTimeline());
+    apiMocks.fetchOpenEvoBackendRunArtifacts.mockResolvedValue(runArtifacts());
+    apiMocks.fetchOpenEvoBackendArtifactPreview.mockResolvedValue(
+      artifactPreview({
+        body: "# Learned Memory\n",
+      }),
+    );
 
     const root = await renderClient();
     await flushEffects();
@@ -1512,14 +1638,16 @@ describe("OpenEvoDesktop", () => {
       run: runStatus("succeeded"),
       status: ranModel,
     });
-    apiMocks.fetchOpenEvoRunArtifacts.mockResolvedValue(draftOnlyRunArtifacts());
-    apiMocks.fetchOpenEvoArtifactContent.mockResolvedValue({
-      artifactId: "artifact-draft-memory",
-      artifactType: "text_memory",
-      filename: "memory.md",
-      content: "# Draft Memory\n\n- This content is not approved.\n",
-      mimeType: "text/markdown",
-    });
+    apiMocks.fetchOpenEvoBackendRunTimeline.mockResolvedValue(runTimeline());
+    apiMocks.fetchOpenEvoBackendRunArtifacts.mockResolvedValue(
+      draftOnlyRunArtifacts(),
+    );
+    apiMocks.fetchOpenEvoBackendArtifactPreview.mockResolvedValue(
+      artifactPreview({
+        id: "artifact-draft-memory",
+        body: "# Draft Memory\n\n- This content is not approved.\n",
+      }),
+    );
 
     const root = await renderClient();
     await flushEffects();
@@ -1532,7 +1660,7 @@ describe("OpenEvoDesktop", () => {
       await Promise.resolve();
     });
 
-    expect(apiMocks.fetchOpenEvoArtifactContent).not.toHaveBeenCalled();
+    expect(apiMocks.fetchOpenEvoBackendArtifactPreview).not.toHaveBeenCalled();
     expect(document.body.textContent).toContain(
       "No promoted artifact content available yet.",
     );
@@ -1572,8 +1700,8 @@ describe("OpenEvoDesktop", () => {
       run: runStatus("succeeded"),
       status: ranModel,
     });
-    apiMocks.fetchOpenEvoRunArtifacts.mockRejectedValue(
-      new Error("OpenEvo run summary not found."),
+    apiMocks.fetchOpenEvoBackendRunArtifacts.mockRejectedValue(
+      new Error("OpenEvo backend artifacts not found."),
     );
 
     const root = await renderClient();
@@ -1589,7 +1717,9 @@ describe("OpenEvoDesktop", () => {
     });
 
     expect(document.body.textContent).toContain("succeeded");
-    expect(document.body.textContent).toContain("OpenEvo run summary not found.");
+    expect(document.body.textContent).toContain(
+      "OpenEvo backend artifacts not found.",
+    );
     await unmountClient(root);
   });
 
@@ -1762,27 +1892,33 @@ describe("OpenEvoDesktop", () => {
   });
 
   it("renders failed run status and stderr after polling", async () => {
-    const shellModel = modelWithRun({
-      projectName: "Loaded Science Project",
-      backendState: "ready",
-      backendDetail: "Remote runtime services are ready",
-      transcriptState: "planned",
-      transcriptDetail: "Trajectory capture will start after the first run",
-    });
-    const runningModel = modelWithRun({
-      projectName: "Loaded Science Project",
-      backendState: "running",
-      backendDetail: "OpenEvo run is running",
-      transcriptState: "running",
-      transcriptDetail: "Capturing transcript trajectory",
-    });
-    const failedModel = modelWithRun({
-      projectName: "Loaded Science Project",
-      backendState: "blocked",
-      backendDetail: "run failed",
-      transcriptState: "blocked",
-      transcriptDetail: "run failed",
-    });
+    const shellModel = withDeveloperMode(
+      modelWithRun({
+        projectName: "Loaded Science Project",
+        backendState: "ready",
+        backendDetail: "Remote runtime services are ready",
+        transcriptState: "planned",
+        transcriptDetail: "Trajectory capture will start after the first run",
+      }),
+    );
+    const runningModel = withDeveloperMode(
+      modelWithRun({
+        projectName: "Loaded Science Project",
+        backendState: "running",
+        backendDetail: "OpenEvo run is running",
+        transcriptState: "running",
+        transcriptDetail: "Capturing transcript trajectory",
+      }),
+    );
+    const failedModel = withDeveloperMode(
+      modelWithRun({
+        projectName: "Loaded Science Project",
+        backendState: "blocked",
+        backendDetail: "run failed",
+        transcriptState: "blocked",
+        transcriptDetail: "run failed",
+      }),
+    );
     apiMocks.fetchOpenEvoDesktopShellModel.mockResolvedValue(shellModel);
     apiMocks.runOpenEvoStartRun.mockResolvedValue({
       run: runStatus("running"),
@@ -2056,9 +2192,16 @@ function modelWithRemoteSetup(): OpenEvoDesktopShellModel {
 }
 
 function modelWithSelfDeployedInference(): OpenEvoDesktopShellModel {
-  const model = getOpenEvoDesktopShellModel();
+  const model = modelWithRemoteSetup();
   return {
     ...model,
+    remote: {
+      ...model.remote,
+      proxy: {
+        ...model.remote.proxy,
+        hfHome: "not configured",
+      },
+    },
     execution: {
       mode: "self-deployed",
       model: "Qwen/Qwen3-Coder-30B-A3B-Instruct",
@@ -2091,7 +2234,13 @@ function modelWithBootstrap({
       readinessNotes: notes,
     },
     services: model.services.map((service) =>
-      service.id === "bootstrap"
+      service.id === "workspace" && ready
+        ? {
+            ...service,
+            state: "ready",
+            detail: "Workspace prepared",
+          }
+        : service.id === "bootstrap"
         ? {
             ...service,
             state: ready ? "ready" : "planned",
@@ -2178,7 +2327,19 @@ function modelWithRun({
       name: projectName,
     },
     services: model.services.map((service) =>
-      service.id === "openevo-backend"
+      service.id === "workspace"
+        ? {
+            ...service,
+            state: "ready",
+            detail: "Workspace prepared",
+          }
+        : service.id === "bootstrap"
+        ? {
+            ...service,
+            state: "ready",
+            detail: "Runtime image and manifests prepared",
+          }
+        : service.id === "openevo-backend"
         ? {
             ...service,
             state: backendState,
@@ -2186,15 +2347,32 @@ function modelWithRun({
           }
         : service,
     ),
-    evolution: model.evolution.map((step) =>
-      step.id === "transcript"
-        ? {
-            ...step,
-            state: transcriptState,
-            detail: transcriptDetail,
-          }
-        : step,
-    ),
+    bootstrap: {
+      ...model.bootstrap,
+      ready: true,
+      readinessNotes: ["Remote bootstrap is ready."],
+    },
+    evolution: [
+      {
+        id: "transcript",
+        label: "Transcript capture",
+        state: transcriptState,
+        detail: transcriptDetail,
+      },
+      ...model.evolution,
+    ],
+  };
+}
+
+function withDeveloperMode(
+  model: OpenEvoDesktopShellModel,
+): OpenEvoDesktopShellModel {
+  return {
+    ...model,
+    developerMode: {
+      ...model.developerMode,
+      enabled: true,
+    },
   };
 }
 
@@ -2290,7 +2468,7 @@ function runStatus(state: "running" | "succeeded" | "failed") {
     state,
     ready: state === "succeeded",
     command:
-      "openevo run /home/alice/.openevo/runs/protein/folding/experiment.json --output-dir /home/alice/.openevo/runs/protein/folding/runs/run_20260707170000000000 --json",
+      "openevo-backend run /home/alice/.openevo/runs/protein/folding/experiment.json --output-dir /home/alice/.openevo/runs/protein/folding/runs/run_20260707170000000000 --artifact-root /home/alice/.openevo/runs/protein/folding/evolution/artifacts --json",
     returnCode: state === "running" ? null : state === "succeeded" ? 0 : 2,
     stdout: state === "succeeded" ? "ok" : "",
     stderr: state === "failed" ? "run failed" : "",
@@ -2303,84 +2481,77 @@ function runStatus(state: "running" | "succeeded" | "failed") {
 }
 
 function emptyRunArtifacts() {
-  return {
-    runId: "run_20260707170000000000",
-    outputDir:
-      "/home/alice/.openevo/runs/protein/folding/runs/run_20260707170000000000",
-    summaryStatus: "completed",
-    experimentId: "biology-components",
-    experimentName: "Biology Components",
-    roundCount: 0,
-    tasks: [],
-  };
+  return [];
+}
+
+function emptyRunTimeline() {
+  return [];
+}
+
+function runTimeline() {
+  return [
+    {
+      id: "event-memory",
+      phase: "evolution",
+      label: "Memory updated",
+      message: "Text memory worker promoted one artifact.",
+      artifactIds: ["artifact-text-memory"],
+    },
+  ];
 }
 
 function runArtifacts() {
-  return {
-    ...emptyRunArtifacts(),
-    roundCount: 1,
-    tasks: [
-      {
-        taskId: "folding-baseline",
-        rounds: [
-          {
-            roundIndex: 0,
-            policyVersion: "policy-r0",
-            rolloutStatus: "completed",
-            datasetStatus: "ready",
-            artifactIds: {
-              dataset: ["dataset-artifact-1"],
-              text_memory: ["artifact-text-memory"],
-              skill_bundle: ["artifact-skill-bundle"],
-              agent_system: ["artifact-agent-system"],
-            },
-            jobs: [
-              {
-                artifactType: "text_memory",
-                method: "text_memory_reflector",
-                workerStatus: "succeeded",
-                artifactIds: ["artifact-text-memory"],
-                approvedArtifactIds: ["artifact-text-memory"],
-                promotionStatus: "approved",
-              },
-            ],
-          },
-        ],
+  return [
+    {
+      id: "artifact-text-memory",
+      runId: "run_20260707170000000000",
+      artifactType: "text_memory",
+      title: "Initial memory draft",
+      promoted: true,
+      lineage: {
+        method: "text_memory_reflector",
+        dataset_id: "dataset-artifact-1",
       },
-    ],
-  };
+    },
+  ];
 }
 
 function draftOnlyRunArtifacts() {
-  return {
-    ...emptyRunArtifacts(),
-    roundCount: 1,
-    tasks: [
-      {
-        taskId: "folding-baseline",
-        rounds: [
-          {
-            roundIndex: 0,
-            policyVersion: "policy-r0",
-            rolloutStatus: "completed",
-            datasetStatus: "ready",
-            artifactIds: {
-              text_memory: ["artifact-draft-memory"],
-            },
-            jobs: [
-              {
-                artifactType: "text_memory",
-                method: "text_memory_reflector",
-                workerStatus: "succeeded",
-                artifactIds: ["artifact-draft-memory"],
-                approvedArtifactIds: [],
-                promotionStatus: "rejected",
-              },
-            ],
-          },
-        ],
+  return [
+    {
+      id: "artifact-draft-memory",
+      runId: "run_20260707170000000000",
+      artifactType: "text_memory",
+      title: "Rejected memory draft",
+      promoted: false,
+      lineage: {
+        method: "text_memory_reflector",
       },
-    ],
+    },
+  ];
+}
+
+function artifactPreview({
+  id = "artifact-text-memory",
+  body = "# Learned Memory\n\n- Prefer stable folds.\n",
+}: {
+  id?: string;
+  body?: string;
+} = {}) {
+  return {
+    id,
+    kind: "text_memory",
+    body,
+    targetPath: "memory.md",
+    lineage: {
+      method: "text_memory_reflector",
+    },
+    diff: {
+      id,
+      before: "",
+      after: body,
+      format: "unified_text" as const,
+    },
   };
 }
 

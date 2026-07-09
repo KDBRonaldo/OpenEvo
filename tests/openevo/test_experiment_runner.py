@@ -160,6 +160,28 @@ def test_live_runner_calls_services_and_worker_in_order(tmp_path: Path) -> None:
     assert (tmp_path / "run" / "summary.json").exists()
 
 
+def test_live_runner_can_use_canonical_state_artifact_root(tmp_path: Path) -> None:
+    rollout = FakeRolloutClient()
+    evolution = FakeEvolutionClient()
+    worker = FakeWorkerRunner()
+    artifact_root = tmp_path / "state" / "evolution" / "artifacts"
+
+    run_experiment(
+        _config(),
+        output_dir=tmp_path / "state" / "runs" / "run-1",
+        artifact_root=artifact_root,
+        rollout_client=rollout,
+        evolution_client=evolution,
+        worker_runner=worker,
+        poll_interval_seconds=0.0,
+        max_poll_attempts=1,
+    )
+
+    assert worker.calls
+    assert all(call["artifact_root"] == artifact_root for call in worker.calls)
+    assert (tmp_path / "state" / "runs" / "run-1" / "summary.json").exists()
+
+
 def test_live_runner_rejects_non_positive_max_poll_attempts(tmp_path: Path) -> None:
     rollout = FakeRolloutClient()
 

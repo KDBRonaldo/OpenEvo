@@ -118,48 +118,69 @@ class _LifecycleSmokeTransport:
             )
         if command.startswith('PATH="$HOME/.local/bin:$PATH" openevo-backend run '):
             return RemoteCommandResult(command=command, return_code=0, stdout="ok")
-        if "summary.json" in command:
-            return RemoteCommandResult(
-                command=command,
-                return_code=0,
-                stdout=json.dumps(_sample_run_summary()),
-            )
-        if "/v1/artifacts/artifact-text-memory" in command:
-            return RemoteCommandResult(
-                command=command,
-                return_code=0,
-                stdout=json.dumps(_sample_artifact_metadata()),
-            )
-        if "root = Path(" in command and "relative = Path(" in command:
-            expected_root = (
-                "root = Path('/remote/run/artifacts/text_memory/artifact-text-memory')"
-            )
-            expected_relative = "relative = Path('memory.md')"
-            if expected_root not in command or expected_relative not in command:
-                return RemoteCommandResult(
-                    command=command,
-                    return_code=2,
-                    stderr="unexpected artifact content path",
-                )
-            return RemoteCommandResult(
-                command=command,
-                return_code=0,
-                stdout="# Learned Memory\n\n- Prefer stable folds.\n",
-            )
         return RemoteCommandResult(command=command, return_code=0, stdout="ok")
 
     def upload_dir(self, local_path: str, remote_path: str) -> None:
         self.uploads.append((local_path, remote_path))
 
 
+class _SmokeBackendClient:
+    def run_timeline(self, run_id: str) -> list[dict[str, Any]]:
+        return [
+            {
+                "id": f"{run_id}-memory",
+                "phase": "evolution",
+                "title": "Memory updated",
+                "message": "Text memory worker promoted one artifact.",
+                "artifact_ids": ["artifact-text-memory"],
+            }
+        ]
+
+    def run_artifacts(self, run_id: str) -> list[dict[str, Any]]:
+        return [
+            {
+                "id": "artifact-text-memory",
+                "run_id": run_id,
+                "artifact_type": "text_memory",
+                "title": "Initial memory draft",
+                "promoted": True,
+                "lineage": {
+                    "method": "text_memory_reflector",
+                    "dataset_id": "dataset-release-smoke",
+                },
+            }
+        ]
+
+    def artifact_content(self, artifact_id: str) -> dict[str, Any]:
+        return {
+            "id": artifact_id,
+            "artifact_type": "text_memory",
+            "content": "# Learned Memory\n\n- Prefer stable folds.\n",
+            "metadata": {
+                "target_path": "memory.md",
+                "lineage": {"method": "text_memory_reflector"},
+            },
+        }
+
+    def artifact_diff(self, artifact_id: str) -> dict[str, Any]:
+        return {
+            "id": artifact_id,
+            "before": "",
+            "after": "# Learned Memory\n\n- Prefer stable folds.\n",
+            "format": "unified_text",
+        }
+
+
 def main() -> int:
     transport = _LifecycleSmokeTransport()
+    backend = _SmokeBackendClient()
     try:
         with TemporaryDirectory(prefix="openevo-desktop-smoke-") as config_root:
             app = create_desktop_app(
                 create_sidecar_app(
                     config_root=Path(config_root),
                     transport_factory=lambda _profile: transport,
+                    backend_client_factory=lambda: backend,
                 )
             )
             with TestClient(app) as client:
@@ -245,23 +266,37 @@ def _smoke_config_backed_lifecycle(client: TestClient) -> None:
     if terminal["run"]["id"] != run_id or terminal["run"]["ready"] is not True:
         raise SmokeFailure("Desktop run did not finish successfully.")
 
-    artifacts = _get_json(
+    timeline = _get_json_array(
         client,
-        "/openevo-api/desktop/run/artifacts",
+        f"/openevo-api/backend/runs/{run_id}/timeline",
         headers=headers,
     )
-    if artifacts["run_id"] != run_id:
-        raise SmokeFailure("Desktop run artifacts response did not match latest run.")
-    if artifacts["summary_status"] != "completed" or not artifacts["tasks"]:
-        raise SmokeFailure("Desktop run artifacts summary was not parsed.")
+    if timeline[0]["artifact_ids"] != ["artifact-text-memory"]:
+        raise SmokeFailure("Desktop backend timeline did not expose artifact ids.")
+
+    artifacts = _get_json_array(
+        client,
+        f"/openevo-api/backend/runs/{run_id}/artifacts",
+        headers=headers,
+    )
+    if artifacts[0]["run_id"] != run_id or artifacts[0]["promoted"] is not True:
+        raise SmokeFailure("Desktop backend artifacts did not match latest run.")
 
     content = _get_json(
         client,
-        "/openevo-api/desktop/artifacts/artifact-text-memory/content",
+        "/openevo-api/backend/artifacts/artifact-text-memory/content",
         headers=headers,
     )
     if content["content"] != "# Learned Memory\n\n- Prefer stable folds.\n":
-        raise SmokeFailure("Desktop artifact content was not readable.")
+        raise SmokeFailure("Desktop backend artifact content was not readable.")
+
+    diff = _get_json(
+        client,
+        "/openevo-api/backend/artifacts/artifact-text-memory/diff",
+        headers=headers,
+    )
+    if diff["after"] != "# Learned Memory\n\n- Prefer stable folds.\n":
+        raise SmokeFailure("Desktop backend artifact diff was not readable.")
 
 
 def _mutation_headers(client: TestClient) -> dict[str, str]:
@@ -298,6 +333,20 @@ def _get_json(
     payload = response.json()
     if not isinstance(payload, dict):
         raise SmokeFailure(f"{path} did not return a JSON object.")
+    return payload
+
+
+def _get_json_array(
+    client: TestClient,
+    path: str,
+    *,
+    headers: dict[str, str] | None = None,
+) -> list[Any]:
+    response = client.get(path, headers=headers)
+    _require_status(response, path)
+    payload = response.json()
+    if not isinstance(payload, list):
+        raise SmokeFailure(f"{path} did not return a JSON array.")
     return payload
 
 
@@ -339,61 +388,6 @@ def _desktop_config_draft_payload() -> dict[str, Any]:
         "text_memory": True,
         "skill_bundle": True,
         "agent_system": True,
-    }
-
-
-def _sample_run_summary() -> dict[str, Any]:
-    return {
-        "mode": "run",
-        "status": "completed",
-        "experiment_id": "release-smoke-science",
-        "experiment_name": "Release Smoke Science",
-        "round_count": 1,
-        "tasks": [
-            {
-                "task_id": "literature-baseline",
-                "rounds": [
-                    {
-                        "round_index": 0,
-                        "policy_version": "policy-r0",
-                        "rollout_status": "completed",
-                        "dataset_status": "ready",
-                        "artifact_ids": {
-                            "dataset": ["dataset-release-smoke"],
-                            "text_memory": ["artifact-text-memory"],
-                            "skill_bundle": ["artifact-skill-bundle"],
-                            "agent_system": ["artifact-agent-system"],
-                        },
-                        "jobs": [
-                            {
-                                "artifact_type": "text_memory",
-                                "method": "text_memory_reflector",
-                                "worker_status": "succeeded",
-                                "artifact_ids": ["artifact-text-memory"],
-                                "approved_artifact_ids": ["artifact-text-memory"],
-                                "promotion_status": "approved",
-                            }
-                        ],
-                    }
-                ],
-            }
-        ],
-    }
-
-
-def _sample_artifact_metadata() -> dict[str, Any]:
-    return {
-        "artifact_id": "artifact-text-memory",
-        "type": "text_memory",
-        "name": "artifact-text-memory",
-        "version": 1,
-        "state": "ready",
-        "uri": "file:///remote/run/artifacts/text_memory/artifact-text-memory",
-        "manifest": {"content_path": "memory.md"},
-        "compatibility": {},
-        "scores": {},
-        "tags": [],
-        "promoted": False,
     }
 
 

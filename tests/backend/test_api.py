@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 from fastapi.testclient import TestClient
 
 from openevo.backend.api import BackendHTTPError, create_backend_app
 from openevo.backend.models import BackendError
+from openevo.evolution.models import ArtifactRegisterRequest
+from openevo.evolution.store import EvolutionStore
 
 
 def _client(*, raise_server_exceptions: bool = True) -> TestClient:
@@ -28,6 +33,56 @@ def _client(*, raise_server_exceptions: bool = True) -> TestClient:
         raise RuntimeError("boom")
 
     return TestClient(app, raise_server_exceptions=raise_server_exceptions)
+
+
+def _client_for_state_root(
+    state_root: Path,
+    *,
+    raise_server_exceptions: bool = True,
+) -> TestClient:
+    return TestClient(
+        create_backend_app(state_root=state_root),
+        raise_server_exceptions=raise_server_exceptions,
+    )
+
+
+def _write_summary_for_artifact(state_root: Path, run_id: str, artifact_id: str) -> None:
+    summary_path = state_root / "runs" / run_id / "summary.json"
+    summary_path.parent.mkdir(parents=True)
+    summary_path.write_text(
+        json.dumps(
+            {
+                "mode": "run",
+                "status": "completed",
+                "experiment_id": "biology-components",
+                "experiment_name": "Biology Components",
+                "run_id": run_id,
+                "round_count": 1,
+                "tasks": [
+                    {
+                        "task_id": "folding-baseline",
+                        "rounds": [
+                            {
+                                "round_index": 0,
+                                "artifact_ids": {"text_memory": [artifact_id]},
+                                "jobs": [
+                                    {
+                                        "artifact_type": "text_memory",
+                                        "method": "text_memory_reflector",
+                                        "worker_status": "succeeded",
+                                        "artifact_ids": [artifact_id],
+                                        "approved_artifact_ids": [artifact_id],
+                                        "promotion_status": "approved",
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
 
 
 def test_backend_health() -> None:
@@ -65,12 +120,12 @@ def test_backend_route_surface_is_present() -> None:
     assert ("/runs/{run_id}", "GET") in routes
     assert ("/runs/{run_id}/cancel", "POST") in routes
     assert ("/runs/{run_id}/retry", "POST") in routes
-    assert ("/runs/{run_id}/timeline", "GET") in routes
-    assert ("/runs/{run_id}/logs", "GET") in routes
-    assert ("/runs/{run_id}/artifacts", "GET") in routes
+    assert ("/runs/{run_id:path}/timeline", "GET") in routes
+    assert ("/runs/{run_id:path}/logs", "GET") in routes
+    assert ("/runs/{run_id:path}/artifacts", "GET") in routes
     assert ("/artifacts/{artifact_id}", "GET") in routes
-    assert ("/artifacts/{artifact_id}/content", "GET") in routes
-    assert ("/artifacts/{artifact_id}/diff", "GET") in routes
+    assert ("/artifacts/{artifact_id:path}/content", "GET") in routes
+    assert ("/artifacts/{artifact_id:path}/diff", "GET") in routes
     assert ("/services", "GET") in routes
     assert ("/services/{service_id}/logs", "GET") in routes
     assert ("/services/{service_id}/restart", "POST") in routes
@@ -106,6 +161,208 @@ def test_backend_project_run_artifact_flow() -> None:
     content = client.get(f"/artifacts/{artifact_id}/content")
     assert content.status_code == 200
     assert content.json()["artifact_type"] in {"text_memory", "skill_bundle", "agent_system"}
+
+
+def test_backend_reads_sidecar_run_state_from_state_root(tmp_path: Path) -> None:
+    state_root = tmp_path / "state"
+    store = EvolutionStore(
+        db_path=state_root / "evolution" / "evolution.db",
+        artifact_root=state_root / "evolution" / "artifacts",
+    )
+    store.initialize()
+    artifact_dir = state_root / "evolution" / "artifacts" / "manual-memory"
+    artifact_dir.mkdir(parents=True)
+    (artifact_dir / "memory.md").write_text(
+        "# Learned Memory\n\n- Prefer stable folds.\n",
+        encoding="utf-8",
+    )
+    artifact = store.register_artifact(
+        ArtifactRegisterRequest(
+            type="text_memory",
+            name="Learned memory",
+            uri=artifact_dir.as_uri(),
+            manifest={"content_path": "memory.md"},
+            lineage={"method": "text_memory_reflector"},
+            promoted=True,
+        )
+    )
+    run_id = "run_20260709120000000000"
+    summary_path = state_root / "runs" / run_id / "summary.json"
+    summary_path.parent.mkdir(parents=True)
+    summary_path.write_text(
+        json.dumps(
+            {
+                "mode": "run",
+                "status": "completed",
+                "experiment_id": "biology-components",
+                "experiment_name": "Biology Components",
+                "run_id": run_id,
+                "round_count": 1,
+                "tasks": [
+                    {
+                        "task_id": "folding-baseline",
+                        "rounds": [
+                            {
+                                "round_index": 0,
+                                "policy_version": "policy-r0",
+                                "rollout_status": "completed",
+                                "dataset_status": "ready",
+                                "artifact_ids": {
+                                    "text_memory": [artifact.artifact_id],
+                                },
+                                "jobs": [
+                                    {
+                                        "artifact_type": "text_memory",
+                                        "method": "text_memory_reflector",
+                                        "worker_status": "succeeded",
+                                        "artifact_ids": [artifact.artifact_id],
+                                        "approved_artifact_ids": [artifact.artifact_id],
+                                        "promotion_status": "approved",
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                ],
+                "summary_path": str(summary_path),
+            }
+        ),
+        encoding="utf-8",
+    )
+    client = _client_for_state_root(state_root)
+
+    timeline = client.get(f"/runs/{run_id}/timeline")
+    artifacts = client.get(f"/runs/{run_id}/artifacts")
+    content = client.get(f"/artifacts/{artifact.artifact_id}/content")
+    diff = client.get(f"/artifacts/{artifact.artifact_id}/diff")
+
+    assert timeline.status_code == 200
+    assert any(
+        artifact.artifact_id in event["artifact_ids"]
+        for event in timeline.json()
+    )
+    assert artifacts.status_code == 200
+    artifact_payload = artifacts.json()[0]
+    assert artifact_payload["id"] == artifact.artifact_id
+    assert artifact_payload["run_id"] == run_id
+    assert artifact_payload["artifact_type"] == "text_memory"
+    assert artifact_payload["title"] == "Learned memory"
+    assert artifact_payload["promoted"] is True
+    assert artifact_payload["lineage"]["method"] == "text_memory_reflector"
+    assert content.status_code == 200
+    assert content.json()["content"] == "# Learned Memory\n\n- Prefer stable folds.\n"
+    assert content.json()["metadata"]["target_path"] == "memory.md"
+    assert diff.status_code == 200
+    assert diff.json()["after"] == "# Learned Memory\n\n- Prefer stable folds.\n"
+
+
+def test_backend_rejects_artifact_content_outside_state_root(tmp_path: Path) -> None:
+    state_root = tmp_path / "state"
+    outside_root = tmp_path / "outside"
+    outside_root.mkdir()
+    (outside_root / "secret.txt").write_text("secret", encoding="utf-8")
+    store = EvolutionStore(
+        db_path=state_root / "evolution" / "evolution.db",
+        artifact_root=state_root / "evolution" / "artifacts",
+    )
+    store.initialize()
+    artifact = store.register_artifact(
+        ArtifactRegisterRequest(
+            type="text_memory",
+            name="Outside memory",
+            uri=outside_root.as_uri(),
+            manifest={"content_path": "secret.txt"},
+            promoted=True,
+        )
+    )
+    _write_summary_for_artifact(state_root, "run_20260709121000000000", artifact.artifact_id)
+    client = _client_for_state_root(state_root)
+
+    content = client.get(f"/artifacts/{artifact.artifact_id}/content")
+    diff = client.get(f"/artifacts/{artifact.artifact_id}/diff")
+
+    assert content.status_code == 404
+    assert content.json()["code"] == "artifact_content_not_found"
+    assert "secret" not in content.text
+    assert diff.status_code == 404
+    assert diff.json()["code"] == "artifact_content_not_found"
+    assert "secret" not in diff.text
+
+
+def test_backend_rejects_unreadable_artifact_content_uris(tmp_path: Path) -> None:
+    state_root = tmp_path / "state"
+    artifact_root = state_root / "evolution" / "artifacts"
+    artifact_dir = artifact_root / "manual-memory"
+    artifact_dir.mkdir(parents=True)
+    (artifact_dir / "memory.md").write_text("# Memory\n", encoding="utf-8")
+    (artifact_root / "secret.txt").write_text("secret", encoding="utf-8")
+    store = EvolutionStore(
+        db_path=state_root / "evolution" / "evolution.db",
+        artifact_root=artifact_root,
+    )
+    store.initialize()
+    artifacts = [
+        store.register_artifact(
+            ArtifactRegisterRequest(
+                type="text_memory",
+                name="Remote URI memory",
+                uri="https://example.test/memory.md",
+                manifest={"content_path": "memory.md"},
+                promoted=True,
+            )
+        ),
+        store.register_artifact(
+            ArtifactRegisterRequest(
+                type="text_memory",
+                name="Netloc URI memory",
+                uri=f"file://gpu.example.test{artifact_dir}/memory.md",
+                manifest={"content_path": "memory.md"},
+                promoted=True,
+            )
+        ),
+        store.register_artifact(
+            ArtifactRegisterRequest(
+                type="text_memory",
+                name="Traversal memory",
+                uri=artifact_dir.as_uri(),
+                manifest={"content_path": "../secret.txt"},
+                promoted=True,
+            )
+        ),
+    ]
+    for index, artifact in enumerate(artifacts):
+        _write_summary_for_artifact(
+            state_root,
+            f"run_2026070912200000000{index}",
+            artifact.artifact_id,
+        )
+    client = _client_for_state_root(state_root)
+
+    for artifact in artifacts:
+        response = client.get(f"/artifacts/{artifact.artifact_id}/content")
+
+        assert response.status_code == 404
+        assert response.json()["code"] == "artifact_content_not_found"
+        assert "secret" not in response.text
+
+
+def test_backend_invalid_state_ids_return_typed_client_errors(tmp_path: Path) -> None:
+    clients = [
+        _client(raise_server_exceptions=False),
+        _client_for_state_root(tmp_path / "state", raise_server_exceptions=False),
+    ]
+
+    for client in clients:
+        responses = [
+            (client.get("/runs/bad%5Cid/timeline"), "invalid_run_id", "run"),
+            (client.get("/runs/bad%2Fid/timeline"), "invalid_run_id", "run"),
+            (client.get("/artifacts/bad%5Cid/content"), "invalid_artifact_id", "artifact"),
+            (client.get("/artifacts/bad%2Fid/content"), "invalid_artifact_id", "artifact"),
+        ]
+        for response, code, category in responses:
+            assert response.status_code == 400
+            assert response.json()["code"] == code
+            assert response.json()["category"] == category
 
 
 def test_backend_accepts_advertised_capability_execution_modes() -> None:

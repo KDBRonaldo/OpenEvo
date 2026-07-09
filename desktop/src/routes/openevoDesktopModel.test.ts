@@ -7,32 +7,35 @@ import {
 } from "./openevoDesktopModel";
 
 describe("OpenEvo Desktop shell model", () => {
-  it("describes the science user flow without benchmark controls", () => {
+  it("starts in setup-required state without demo-ready fixture data", () => {
     const model = getOpenEvoDesktopShellModel();
 
-    expect(model.project.name).toBe("Protein Folding Literature Sprint");
+    expect(model.project.name).toBe("Untitled Science Project");
+    expect(model.remote.id).toBe("not-configured");
+    expect(model.remote.host).toBe("");
     expect(model.execution.mode).toBe("codex_subscription_transcript");
     expect(model.execution.tokenMetricsAvailable).toBe(false);
     expect(model.developerMode.enabled).toBe(false);
     expect(model.developerMode.benchmarkControlsVisible).toBe(false);
-    expect(model.bootstrap.ready).toBe(true);
+    expect(model.bootstrap.ready).toBe(false);
     expect(model.bootstrap.readinessNotes).toEqual([
-      "Codex subscription login available",
+      "Configure a project and remote backend to begin.",
     ]);
-    expect(model.remote.proxy.httpsProxy).toBe("http://127.0.0.1:7890");
+    expect(JSON.stringify(model)).not.toContain("Protein Folding Literature Sprint");
+    expect(JSON.stringify(model)).not.toContain("gpu.example.edu");
   });
 
-  it("summarizes readiness and evolution progress for the route", () => {
+  it("summarizes setup-required readiness and evolution progress", () => {
     const model = getOpenEvoDesktopShellModel();
     const summary = getOpenEvoTimelineSummary(model);
 
-    expect(summary.readyServices).toBe(3);
+    expect(summary.readyServices).toBe(0);
     expect(summary.totalServices).toBe(4);
-    expect(summary.bootstrapReady).toBe(true);
-    expect(summary.completedEvolutionSteps).toBe(2);
-    expect(summary.totalEvolutionSteps).toBe(4);
+    expect(summary.bootstrapReady).toBe(false);
+    expect(summary.completedEvolutionSteps).toBe(0);
+    expect(summary.totalEvolutionSteps).toBe(3);
     expect(summary.readinessNotes).toEqual([
-      "Codex subscription login available",
+      "Configure a project and remote backend to begin.",
     ]);
   });
 

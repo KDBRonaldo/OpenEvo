@@ -1,10 +1,10 @@
 from __future__ import annotations
 
+from contextlib import asynccontextmanager, contextmanager
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from _thread import LockType
-import json
 from pathlib import Path
 import posixpath
 import re
@@ -14,13 +14,13 @@ import shutil
 import tempfile
 from typing import Any, Literal
 from threading import Lock, Thread
-from urllib.parse import quote, unquote, urlparse
 from zipfile import BadZipFile, ZipFile
 from email.parser import Parser
 
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic import ValidationError
 
@@ -47,6 +47,11 @@ from desktop.sidecar.config import (
     load_desktop_project_config,
     save_desktop_project_config,
 )
+from desktop.sidecar.backend_client import (
+    BackendClient,
+    BackendConnection,
+    DesktopBackendError,
+)
 from openevo.deployment.profile import (
     DesktopExecutionMode,
     RemoteProfileConfig,
@@ -56,6 +61,7 @@ from openevo.deployment.planner import build_sidecar_science_plan
 
 SIDECAR_MUTATION_TOKEN_HEADER = "X-OpenEvo-Sidecar-Token"
 SidecarTransportKind = Literal["dry-run", "ssh"]
+REMOTE_CORE_BACKEND_PORT = 8765
 
 
 class _StrictFrozenModel(BaseModel):
@@ -276,39 +282,6 @@ class OpenEvoDesktopRunResponse(_StrictFrozenModel):
     status: OpenEvoDesktopShellStatus
 
 
-class OpenEvoDesktopRunArtifactJob(_StrictFrozenModel):
-    artifact_type: str
-    method: str
-    worker_status: str
-    artifact_ids: list[str] = Field(default_factory=list)
-    approved_artifact_ids: list[str] = Field(default_factory=list)
-    promotion_status: str
-
-
-class OpenEvoDesktopRunArtifactRound(_StrictFrozenModel):
-    round_index: int
-    policy_version: str | None = None
-    rollout_status: str | None = None
-    dataset_status: str | None = None
-    artifact_ids: dict[str, list[str]] = Field(default_factory=dict)
-    jobs: list[OpenEvoDesktopRunArtifactJob] = Field(default_factory=list)
-
-
-class OpenEvoDesktopRunArtifactTask(_StrictFrozenModel):
-    task_id: str
-    rounds: list[OpenEvoDesktopRunArtifactRound] = Field(default_factory=list)
-
-
-class OpenEvoDesktopRunArtifactsResponse(_StrictFrozenModel):
-    run_id: str
-    output_dir: str
-    summary_status: str | None = None
-    experiment_id: str | None = None
-    experiment_name: str | None = None
-    round_count: int | None = None
-    tasks: list[OpenEvoDesktopRunArtifactTask] = Field(default_factory=list)
-
-
 class OpenEvoDesktopMethodsResponse(_StrictFrozenModel):
     methods: tuple[EvolutionMethodCapability, ...] = Field(default_factory=tuple)
 
@@ -318,14 +291,6 @@ class OpenEvoDesktopMethodsResponse(_StrictFrozenModel):
         if isinstance(value, list):
             return tuple(value)
         return value
-
-
-class OpenEvoDesktopArtifactContent(_StrictFrozenModel):
-    artifact_id: str
-    artifact_type: str
-    filename: str
-    content: str
-    mime_type: str = "text/markdown"
 
 
 @dataclass
@@ -338,6 +303,9 @@ class OpenEvoSidecarSession:
     last_bootstrap_report: object | None = None
     last_services_report: object | None = None
     latest_run: OpenEvoDesktopRunStatus | None = None
+    backend_client: BackendClient | None = None
+    backend_tunnel: Any | None = None
+    backend_lock: LockType = field(default_factory=Lock)
     status_lock: LockType = field(default_factory=Lock)
     workspace_lock: LockType = field(default_factory=Lock)
     bootstrap_lock: LockType = field(default_factory=Lock)
@@ -397,93 +365,73 @@ def build_desktop_shell_status(
 def default_desktop_shell_status() -> OpenEvoDesktopShellStatus:
     return OpenEvoDesktopShellStatus(
         remote=DesktopRemoteProfile(
-            id="lab-gpu",
-            host="gpu.example.edu",
+            id="not-configured",
+            host="",
             port=22,
-            user="alice",
-            workspace_root="/home/alice/.openevo/workspaces",
-            proxy=DesktopRemoteProxy(
-                http_proxy=None,
-                https_proxy="http://127.0.0.1:7890",
-                no_proxy=None,
-                pip_index_url=None,
-                huggingface_endpoint="https://hf-mirror.com",
-                hf_home=None,
-            ),
+            user="",
+            workspace_root="~/.openevo/workspaces",
         ),
         project=DesktopScienceProject(
-            name="Protein Folding Literature Sprint",
-            task_id="folding-baseline",
-            source="Git repository: github.com/example/protein-workflows",
-            objective=(
-                "Survey recent folding papers, extract benchmark tables, "
-                "and run the baseline analysis notebook."
-            ),
+            name="Untitled Science Project",
+            task_id="new-task",
+            source="Scratch workspace",
+            objective="",
         ),
         execution=DesktopExecutionStatus(
             mode="codex_subscription_transcript",
-            model="gpt-5.1-codex-mini",
+            model="codex subscription on remote server",
             token_metrics_available=False,
         ),
         bootstrap=DesktopBootstrapStatus(
-            ready=True,
-            state_root=(
-                "/home/alice/.openevo/runs/"
-                "protein-folding-literature-sprint/folding-baseline"
-            ),
-            workspace_root="/home/alice/.openevo/workspaces",
-            readiness_notes=("Codex subscription login available",),
+            ready=False,
+            state_root="~/.openevo/runs/untitled-science-project/new-task",
+            workspace_root="~/.openevo/workspaces",
+            readiness_notes=("Configure a project and remote backend to begin.",),
         ),
         services=(
             DesktopServiceStatus(
                 id="ssh",
                 label="SSH transport",
-                state="ready",
-                detail="Remote command execution available",
+                state="planned",
+                detail="Configure a remote GPU server profile",
             ),
             DesktopServiceStatus(
                 id="workspace",
                 label="Workspace",
-                state="ready",
-                detail="Repository materialized in managed workspace",
+                state="planned",
+                detail="Save project config before workspace sync",
             ),
             DesktopServiceStatus(
                 id="bootstrap",
                 label="Bootstrap",
-                state="ready",
-                detail="Runtime image and manifests prepared",
+                state="planned",
+                detail="Run remote bootstrap after project config is saved",
             ),
             DesktopServiceStatus(
                 id="openevo-backend",
                 label="OpenEvo backend",
                 state="planned",
-                detail="Remote runtime services have not started",
+                detail="Start backend after bootstrap is ready",
             ),
         ),
         evolution=(
             DesktopEvolutionStep(
-                id="transcript",
-                label="Transcript capture",
-                state="complete",
-                detail="Codex subscription mode uses transcript trajectory data",
-            ),
-            DesktopEvolutionStep(
-                id="memory",
+                id="text-memory",
                 label="Text memory",
-                state="complete",
-                detail="Two durable research notes promoted",
+                state="planned",
+                detail="Memory updates appear after a run produces trajectories",
             ),
             DesktopEvolutionStep(
-                id="skills",
+                id="skill-bundle",
                 label="Skill bundle",
-                state="running",
-                detail="Extracting reusable literature-review workflow",
+                state="planned",
+                detail="Learned skills appear after evolution jobs complete",
             ),
             DesktopEvolutionStep(
                 id="agent-system",
                 label="Agent system",
                 state="planned",
-                detail="Instruction diff will be reviewed after this round",
+                detail="Instruction diffs appear after promoted artifacts exist",
             ),
         ),
     )
@@ -498,11 +446,34 @@ def create_sidecar_app(
     config_root: Path | None = None,
     transport_factory: Callable[[RemoteProfileConfig], RemoteExecutorTransport]
     | None = None,
+    backend_connection: BackendConnection | None = None,
+    backend_client_factory: Callable[[], BackendClient] | None = None,
 ) -> FastAPI:
     desktop_status = status or default_desktop_shell_status()
     sidecar_token = _mutation_token(mutation_token)
     session_pointer_lock = Lock()
-    app = FastAPI(title="OpenEvo Desktop Sidecar", version="0.1.0")
+    shared_backend_client = (
+        BackendClient(backend_connection)
+        if backend_client_factory is None and backend_connection is not None
+        else None
+    )
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        try:
+            yield
+        finally:
+            active_session = current_session()
+            if active_session is not None:
+                _close_session_backend(active_session)
+            if shared_backend_client is not None:
+                shared_backend_client.close()
+
+    app = FastAPI(
+        title="OpenEvo Desktop Sidecar",
+        version="0.1.0",
+        lifespan=lifespan,
+    )
     app.add_middleware(
         CORSMiddleware,
         allow_origin_regex=(
@@ -515,9 +486,94 @@ def create_sidecar_app(
         allow_credentials=False,
     )
 
+    @app.exception_handler(DesktopBackendError)
+    def desktop_backend_error_handler(
+        _request,
+        exc: DesktopBackendError,
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=exc.status_code,
+            content=jsonable_encoder(exc.error),
+        )
+
     def current_session() -> OpenEvoSidecarSession | None:
         with session_pointer_lock:
             return session
+
+    @contextmanager
+    def backend_client_context():
+        if backend_client_factory is not None:
+            client = backend_client_factory()
+            try:
+                yield client
+            finally:
+                if isinstance(client, BackendClient):
+                    client.close()
+            return
+        if shared_backend_client is not None:
+            yield shared_backend_client
+            return
+        active_session = current_session()
+        if active_session is not None:
+            with active_session.backend_lock:
+                if active_session.backend_client is not None:
+                    yield active_session.backend_client
+                    return
+        raise DesktopBackendError(
+            409,
+            {
+                "code": "backend_tunnel_not_configured",
+                "message": "Desktop has no active tunnel to the remote OpenEvo backend.",
+                "severity": "blocking",
+                "category": "service",
+                "retryable": True,
+                "repair_action": "openevo_can_reconfigure",
+                "details": {},
+                "logs_ref": None,
+            },
+        )
+
+    def attach_session_backend_facade(active_session: OpenEvoSidecarSession) -> None:
+        if backend_client_factory is not None or shared_backend_client is not None:
+            return
+        try:
+            transport = active_session.transport_factory(active_session.profile)
+            open_tunnel = getattr(transport, "open_tunnel", None)
+            if open_tunnel is None:
+                return
+            tunnel = open_tunnel(
+                remote_port=REMOTE_CORE_BACKEND_PORT,
+                remote_host="127.0.0.1",
+            )
+            base_url = getattr(tunnel, "base_url", None)
+            if not isinstance(base_url, str) or not base_url.strip():
+                _close_backend_tunnel(tunnel)
+                raise RuntimeError("SSH tunnel did not expose a backend base URL.")
+            client = BackendClient(BackendConnection(base_url.rstrip("/")))
+            try:
+                client.health()
+            except Exception:
+                client.close()
+                _close_backend_tunnel(tunnel)
+                raise
+            _replace_session_backend(active_session, client=client, tunnel=tunnel)
+        except Exception as exc:
+            raise DesktopBackendError(
+                503,
+                {
+                    "code": "backend_tunnel_failed",
+                    "message": (
+                        "Desktop could not open a tunnel to the remote OpenEvo "
+                        "backend."
+                    ),
+                    "severity": "blocking",
+                    "category": "service",
+                    "retryable": True,
+                    "repair_action": "openevo_can_retry",
+                    "details": {"error_type": type(exc).__name__},
+                    "logs_ref": "services/openevo_backend",
+                },
+            ) from exc
 
     @app.get("/health", response_model=SidecarHealth)
     def health() -> SidecarHealth:
@@ -558,6 +614,131 @@ def create_sidecar_app(
             methods=build_core_capabilities().evolution_methods,
         )
 
+    @app.get("/openevo-api/backend/health")
+    def backend_health(
+        token: str | None = Header(
+            default=None,
+            alias=SIDECAR_MUTATION_TOKEN_HEADER,
+        ),
+    ) -> dict[str, Any]:
+        _validate_mutation_token(token, sidecar_token)
+        with backend_client_context() as backend_client:
+            return backend_client.health()
+
+    @app.get("/openevo-api/backend/status")
+    def backend_status(
+        token: str | None = Header(
+            default=None,
+            alias=SIDECAR_MUTATION_TOKEN_HEADER,
+        ),
+    ) -> dict[str, Any]:
+        _validate_mutation_token(token, sidecar_token)
+        with backend_client_context() as backend_client:
+            return backend_client.status()
+
+    @app.post("/openevo-api/backend/environment/doctor")
+    def backend_environment_doctor(
+        token: str | None = Header(
+            default=None,
+            alias=SIDECAR_MUTATION_TOKEN_HEADER,
+        ),
+    ) -> dict[str, Any]:
+        _validate_mutation_token(token, sidecar_token)
+        with backend_client_context() as backend_client:
+            return backend_client.environment_doctor()
+
+    @app.post("/openevo-api/backend/environment/repair")
+    def backend_environment_repair(
+        payload: dict[str, Any],
+        token: str | None = Header(
+            default=None,
+            alias=SIDECAR_MUTATION_TOKEN_HEADER,
+        ),
+    ) -> dict[str, Any]:
+        _validate_mutation_token(token, sidecar_token)
+        actions = payload.get("actions", [])
+        if not isinstance(actions, list) or not all(
+            isinstance(action, str) for action in actions
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail="actions must be a list of strings.",
+            )
+        with backend_client_context() as backend_client:
+            return backend_client.environment_repair(actions)
+
+    @app.get("/openevo-api/backend/runs/{run_id:path}/timeline")
+    def backend_run_timeline(
+        run_id: str,
+        token: str | None = Header(
+            default=None,
+            alias=SIDECAR_MUTATION_TOKEN_HEADER,
+        ),
+    ) -> list[dict[str, Any]]:
+        _validate_mutation_token(token, sidecar_token)
+        with backend_client_context() as backend_client:
+            return backend_client.run_timeline(run_id)
+
+    @app.get("/openevo-api/backend/runs/{run_id:path}/logs")
+    def backend_run_logs(
+        run_id: str,
+        token: str | None = Header(
+            default=None,
+            alias=SIDECAR_MUTATION_TOKEN_HEADER,
+        ),
+    ) -> dict[str, Any]:
+        _validate_mutation_token(token, sidecar_token)
+        with backend_client_context() as backend_client:
+            return backend_client.run_logs(run_id)
+
+    @app.get("/openevo-api/backend/runs/{run_id:path}/artifacts")
+    def backend_run_artifacts(
+        run_id: str,
+        token: str | None = Header(
+            default=None,
+            alias=SIDECAR_MUTATION_TOKEN_HEADER,
+        ),
+    ) -> list[dict[str, Any]]:
+        _validate_mutation_token(token, sidecar_token)
+        with backend_client_context() as backend_client:
+            return backend_client.run_artifacts(run_id)
+
+    @app.get("/openevo-api/backend/artifacts/{artifact_id:path}/content")
+    def backend_artifact_content(
+        artifact_id: str,
+        token: str | None = Header(
+            default=None,
+            alias=SIDECAR_MUTATION_TOKEN_HEADER,
+        ),
+    ) -> dict[str, Any]:
+        _validate_mutation_token(token, sidecar_token)
+        with backend_client_context() as backend_client:
+            return backend_client.artifact_content(artifact_id)
+
+    @app.get("/openevo-api/backend/artifacts/{artifact_id:path}/diff")
+    def backend_artifact_diff(
+        artifact_id: str,
+        token: str | None = Header(
+            default=None,
+            alias=SIDECAR_MUTATION_TOKEN_HEADER,
+        ),
+    ) -> dict[str, Any]:
+        _validate_mutation_token(token, sidecar_token)
+        with backend_client_context() as backend_client:
+            return backend_client.artifact_diff(artifact_id)
+
+    @app.get("/openevo-api/backend/services/{service_id:path}/logs")
+    def backend_service_logs(
+        service_id: str,
+        token: str | None = Header(
+            default=None,
+            alias=SIDECAR_MUTATION_TOKEN_HEADER,
+        ),
+    ) -> dict[str, Any]:
+        _validate_mutation_token(token, sidecar_token)
+        with backend_client_context() as backend_client:
+            return backend_client.service_logs(service_id)
+
     @app.post(
         "/openevo-api/desktop/project-config",
         response_model=OpenEvoDesktopProjectConfigResponse,
@@ -595,6 +776,7 @@ def create_sidecar_app(
                         "lifecycle action is running."
                     ),
                 )
+            old_session = session
             try:
                 project, profile, paths = save_desktop_project_config(
                     draft,
@@ -612,6 +794,8 @@ def create_sidecar_app(
                 status=build_desktop_shell_status(project, profile),
             )
             session = new_session
+        if old_session is not None:
+            _close_session_backend(old_session)
         with new_session.status_lock:
             response_status = _status_with_mutation_token(
                 new_session.status,
@@ -667,6 +851,7 @@ def create_sidecar_app(
                         "lifecycle action is running."
                     ),
                 )
+            old_session = session
             try:
                 project, profile, paths = load_desktop_project_config(
                     config_root,
@@ -693,6 +878,8 @@ def create_sidecar_app(
                 status=build_desktop_shell_status(project, profile),
             )
             session = new_session
+        if old_session is not None:
+            _close_session_backend(old_session)
         with new_session.status_lock:
             response_status = _status_with_mutation_token(
                 new_session.status,
@@ -745,6 +932,7 @@ def create_sidecar_app(
                 )
         try:
             report = _run_workspace_sync(active_session)
+            _close_session_backend(active_session)
             with active_session.status_lock:
                 active_session.last_workspace_report = report
                 active_session.last_services_report = None
@@ -804,6 +992,7 @@ def create_sidecar_app(
                 )
         try:
             report = _run_bootstrap(active_session)
+            _close_session_backend(active_session)
             with active_session.status_lock:
                 active_session.last_bootstrap_report = report
                 active_session.last_services_report = None
@@ -863,6 +1052,7 @@ def create_sidecar_app(
                 )
         try:
             _require_workspace_and_bootstrap_ready(active_session)
+            _close_session_backend(active_session)
             with active_session.status_lock:
                 active_session.last_services_report = None
                 active_session.latest_run = None
@@ -870,17 +1060,30 @@ def create_sidecar_app(
                     active_session.status
                 )
             report = _run_services(active_session)
+            attach_error: DesktopBackendError | None = None
+            if report.ready:
+                try:
+                    attach_session_backend_facade(active_session)
+                except DesktopBackendError as exc:
+                    attach_error = exc
             with active_session.status_lock:
                 active_session.last_services_report = report
                 active_session.status = _status_after_services(
                     active_session.status,
                     report,
                 )
+                if attach_error is not None:
+                    active_session.status = _status_after_backend_tunnel_failure(
+                        active_session.status,
+                        attach_error,
+                    )
                 response_status = _status_with_mutation_token(
                     active_session.status,
                     sidecar_token,
                     transport_kind=transport_kind,
                 )
+            if attach_error is not None:
+                raise attach_error
         finally:
             active_session.services_lock.release()
         return OpenEvoDesktopServicesResponse(
@@ -1120,84 +1323,6 @@ def create_sidecar_app(
                 status=response_status,
             )
 
-    @app.get(
-        "/openevo-api/desktop/run/artifacts",
-        response_model=OpenEvoDesktopRunArtifactsResponse,
-    )
-    def latest_run_artifacts(
-        token: str | None = Header(
-            default=None,
-            alias=SIDECAR_MUTATION_TOKEN_HEADER,
-        ),
-    ) -> OpenEvoDesktopRunArtifactsResponse:
-        _validate_mutation_token(token, sidecar_token)
-        active_session = current_session()
-        if active_session is None:
-            raise HTTPException(
-                status_code=409,
-                detail="Desktop run artifacts require a config-backed sidecar session.",
-            )
-        with active_session.status_lock:
-            if active_session.latest_run is None:
-                raise HTTPException(
-                    status_code=404,
-                    detail="No Desktop run has been launched.",
-                )
-            latest = active_session.latest_run
-        if latest.state == "running":
-            raise HTTPException(
-                status_code=409,
-                detail="Desktop run artifacts require a terminal run.",
-            )
-        summary = _read_remote_run_summary(active_session, latest.output_dir)
-        return _run_artifacts_response(latest, summary)
-
-    @app.get(
-        "/openevo-api/desktop/artifacts/{artifact_id}/content",
-        response_model=OpenEvoDesktopArtifactContent,
-    )
-    def artifact_content(
-        artifact_id: str,
-        token: str | None = Header(
-            default=None,
-            alias=SIDECAR_MUTATION_TOKEN_HEADER,
-        ),
-    ) -> OpenEvoDesktopArtifactContent:
-        _validate_mutation_token(token, sidecar_token)
-        active_session = current_session()
-        if active_session is None:
-            raise HTTPException(
-                status_code=409,
-                detail="Desktop artifact content requires a config-backed sidecar session.",
-            )
-        with active_session.status_lock:
-            if active_session.latest_run is None:
-                raise HTTPException(
-                    status_code=404,
-                    detail="No Desktop run has been launched.",
-                )
-            latest = active_session.latest_run
-        if latest.state == "running":
-            raise HTTPException(
-                status_code=409,
-                detail="Desktop artifact content requires a terminal run.",
-            )
-        summary = _read_remote_run_summary(active_session, latest.output_dir)
-        if not _summary_contains_artifact_id(summary, artifact_id):
-            raise HTTPException(
-                status_code=404,
-                detail="Artifact not found in latest run summary.",
-            )
-        artifact = _read_remote_artifact_metadata(active_session, artifact_id)
-        request = _artifact_content_request(artifact)
-        content = _read_remote_artifact_content(active_session, request)
-        return OpenEvoDesktopArtifactContent(
-            artifact_id=artifact_id,
-            artifact_type=request.artifact_type,
-            filename=request.filename,
-            content=content,
-        )
-
     return app
 
 
@@ -1208,6 +1333,8 @@ def create_sidecar_app_for_project(
     transport_factory: Callable[[RemoteProfileConfig], RemoteExecutorTransport],
     mutation_token: str | None = None,
     transport_kind: SidecarTransportKind = "dry-run",
+    backend_connection: BackendConnection | None = None,
+    backend_client_factory: Callable[[], BackendClient] | None = None,
 ) -> FastAPI:
     session = OpenEvoSidecarSession(
         project=project,
@@ -1219,6 +1346,8 @@ def create_sidecar_app_for_project(
         session=session,
         mutation_token=mutation_token,
         transport_kind=transport_kind,
+        backend_connection=backend_connection,
+        backend_client_factory=backend_client_factory,
     )
 
 
@@ -1495,6 +1624,45 @@ def _is_valid_openevo_wheel(path: Path, *, expected_version: str) -> bool:
     return metadata.get("Name") == "openevo" and metadata.get("Version") == expected_version
 
 
+def _replace_session_backend(
+    session: OpenEvoSidecarSession,
+    *,
+    client: BackendClient,
+    tunnel: Any,
+) -> None:
+    with session.backend_lock:
+        old_client = session.backend_client
+        old_tunnel = session.backend_tunnel
+        session.backend_client = client
+        session.backend_tunnel = tunnel
+    _close_backend_resources(old_client, old_tunnel)
+
+
+def _close_session_backend(session: OpenEvoSidecarSession) -> None:
+    with session.backend_lock:
+        old_client = session.backend_client
+        old_tunnel = session.backend_tunnel
+        session.backend_client = None
+        session.backend_tunnel = None
+    _close_backend_resources(old_client, old_tunnel)
+
+
+def _close_backend_resources(
+    client: BackendClient | None,
+    tunnel: Any | None,
+) -> None:
+    if client is not None:
+        client.close()
+    if tunnel is not None:
+        _close_backend_tunnel(tunnel)
+
+
+def _close_backend_tunnel(tunnel: Any) -> None:
+    close = getattr(tunnel, "close", None)
+    if callable(close):
+        close()
+
+
 def _wheel_metadata_path(names: set[str]) -> str | None:
     matches = sorted(
         name
@@ -1602,319 +1770,6 @@ def _restart_remote_service(
     )
 
 
-def _read_remote_run_summary(
-    session: OpenEvoSidecarSession,
-    output_dir: str,
-) -> dict[str, Any]:
-    transport = session.transport_factory(session.profile)
-    command = _read_run_summary_command(output_dir)
-    result = transport.run(command, timeout_seconds=30.0)
-    env = session.profile.proxy.to_env()
-    if not result.ok:
-        detail = sanitize_remote_text(result.stderr or result.stdout, env).strip()
-        if "summary not found" in detail.lower():
-            raise HTTPException(
-                status_code=404,
-                detail="OpenEvo run summary not found.",
-            )
-        raise HTTPException(
-            status_code=502,
-            detail=detail or "Failed to read OpenEvo run summary.",
-        )
-    try:
-        payload = json.loads(result.stdout)
-    except json.JSONDecodeError as exc:
-        raise HTTPException(
-            status_code=502,
-            detail="OpenEvo run summary was not valid JSON.",
-        ) from exc
-    if not isinstance(payload, dict):
-        raise HTTPException(
-            status_code=502,
-            detail="OpenEvo run summary was not a JSON object.",
-        )
-    return payload
-
-
-def _read_run_summary_command(output_dir: str) -> str:
-    return "\n".join(
-        [
-            "python3 - <<'PY'",
-            "from pathlib import Path",
-            f"path = Path({output_dir!r}) / 'summary.json'",
-            "if not path.is_file():",
-            "    raise SystemExit('OpenEvo run summary not found.')",
-            "print(path.read_text(encoding='utf-8'), end='')",
-            "PY",
-        ]
-    )
-
-
-@dataclass(frozen=True)
-class _ArtifactContentReadRequest:
-    artifact_type: str
-    artifact_root: str
-    relative_path: str
-    filename: str
-
-
-def _summary_contains_artifact_id(value: object, artifact_id: str) -> bool:
-    if not isinstance(value, dict):
-        return False
-    for task in _dict_list(value.get("tasks")):
-        for round_payload in _dict_list(task.get("rounds")):
-            if _artifact_id_map_contains(
-                round_payload.get("artifact_ids"),
-                artifact_id,
-            ):
-                return True
-            for job in _dict_list(round_payload.get("jobs")):
-                if _artifact_id_list_contains(job.get("artifact_ids"), artifact_id):
-                    return True
-                if _artifact_id_list_contains(
-                    job.get("approved_artifact_ids"),
-                    artifact_id,
-                ):
-                    return True
-    return False
-
-
-def _artifact_id_map_contains(value: object, artifact_id: str) -> bool:
-    if not isinstance(value, dict):
-        return False
-    return any(_artifact_id_list_contains(item, artifact_id) for item in value.values())
-
-
-def _artifact_id_list_contains(value: object, artifact_id: str) -> bool:
-    if not isinstance(value, list):
-        return False
-    return any(item == artifact_id for item in value if isinstance(item, str))
-
-
-def _read_remote_artifact_metadata(
-    session: OpenEvoSidecarSession,
-    artifact_id: str,
-) -> dict[str, Any]:
-    transport = session.transport_factory(session.profile)
-    command = _read_artifact_metadata_command(artifact_id)
-    result = transport.run(command, timeout_seconds=30.0)
-    env = session.profile.proxy.to_env()
-    if not result.ok:
-        detail = sanitize_remote_text(result.stderr or result.stdout, env).strip()
-        if "not found" in detail.lower() or "404" in detail:
-            raise HTTPException(
-                status_code=404,
-                detail="Artifact metadata not found.",
-            )
-        raise HTTPException(
-            status_code=502,
-            detail=detail or "Failed to read artifact metadata.",
-        )
-    try:
-        payload = json.loads(result.stdout)
-    except json.JSONDecodeError as exc:
-        raise HTTPException(
-            status_code=502,
-            detail="Artifact metadata was not valid JSON.",
-        ) from exc
-    if not isinstance(payload, dict):
-        raise HTTPException(
-            status_code=502,
-            detail="Artifact metadata was not a JSON object.",
-        )
-    return payload
-
-
-def _read_artifact_metadata_command(artifact_id: str) -> str:
-    encoded_artifact_id = quote(artifact_id, safe="")
-    url = f"http://127.0.0.1:8200/v1/artifacts/{encoded_artifact_id}"
-    return "\n".join(
-        [
-            "python3 - <<'PY'",
-            "import sys",
-            "import urllib.error",
-            "import urllib.request",
-            f"url = {url!r}",
-            "try:",
-            "    with urllib.request.urlopen(url, timeout=10) as response:",
-            "        body = response.read().decode('utf-8')",
-            "except urllib.error.HTTPError as exc:",
-            "    if exc.code == 404:",
-            "        raise SystemExit('Artifact metadata not found.')",
-            (
-                "    raise SystemExit("
-                "f'Artifact metadata fetch failed: HTTP {exc.code}')"
-            ),
-            "except urllib.error.URLError as exc:",
-            (
-                "    raise SystemExit("
-                "f'Artifact metadata fetch failed: {exc.reason}')"
-            ),
-            "sys.stdout.write(body)",
-            "PY",
-        ]
-    )
-
-
-def _artifact_content_request(
-    artifact: dict[str, Any],
-) -> _ArtifactContentReadRequest:
-    artifact_type = _optional_string(artifact.get("type")) or _optional_string(
-        artifact.get("artifact_type")
-    )
-    if artifact_type not in {"text_memory", "skill_bundle", "agent_system"}:
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                "Artifact content is only supported for text_memory, "
-                "skill_bundle, and agent_system artifacts."
-            ),
-        )
-    uri = _optional_string(artifact.get("uri"))
-    if uri is None:
-        raise HTTPException(
-            status_code=422,
-            detail="Artifact summary does not include a file URI.",
-        )
-    uri_path = _file_uri_path(uri)
-    relative_path = _artifact_relative_content_path(
-        artifact,
-        artifact_type=artifact_type,
-        uri_path=uri_path,
-    )
-    _validate_relative_artifact_path(relative_path)
-    artifact_root = _artifact_root_path(
-        uri_path=uri_path,
-        relative_path=relative_path,
-    )
-    return _ArtifactContentReadRequest(
-        artifact_type=artifact_type,
-        artifact_root=artifact_root,
-        relative_path=relative_path,
-        filename=posixpath.basename(relative_path),
-    )
-
-
-def _file_uri_path(uri: str) -> str:
-    parsed = urlparse(uri)
-    if parsed.scheme != "file":
-        raise HTTPException(
-            status_code=422,
-            detail="Artifact URI must use the file scheme.",
-        )
-    path = unquote(parsed.path)
-    if not path.startswith("/"):
-        raise HTTPException(
-            status_code=422,
-            detail="Artifact file URI must contain an absolute path.",
-        )
-    return posixpath.normpath(path)
-
-
-def _artifact_relative_content_path(
-    artifact: dict[str, Any],
-    *,
-    artifact_type: str,
-    uri_path: str,
-) -> str:
-    manifest = artifact.get("manifest")
-    if isinstance(manifest, dict):
-        content_path = manifest.get("content_path")
-        if isinstance(content_path, str) and content_path.strip():
-            return content_path.strip()
-    if artifact_type == "text_memory":
-        filename = posixpath.basename(uri_path)
-        return filename if "." in filename else "memory.md"
-    if artifact_type == "agent_system":
-        if isinstance(manifest, dict):
-            target_path = manifest.get("target_path")
-            if isinstance(target_path, str) and target_path.strip():
-                return posixpath.basename(target_path.strip())
-        return "agent_system.md"
-    return "SKILL.md"
-
-
-def _artifact_root_path(
-    *,
-    uri_path: str,
-    relative_path: str,
-) -> str:
-    normalized_relative = posixpath.normpath(relative_path)
-    suffix = f"/{normalized_relative}"
-    if uri_path.endswith(suffix):
-        return uri_path[: -len(suffix)] or "/"
-    return uri_path
-
-
-def _validate_relative_artifact_path(relative_path: str) -> None:
-    normalized = posixpath.normpath(relative_path)
-    if (
-        normalized in {"", "."}
-        or posixpath.isabs(relative_path)
-        or normalized == ".."
-        or normalized.startswith("../")
-    ):
-        raise HTTPException(
-            status_code=422,
-            detail="Artifact content_path must stay within the artifact root.",
-        )
-
-
-def _read_remote_artifact_content(
-    session: OpenEvoSidecarSession,
-    request: _ArtifactContentReadRequest,
-) -> str:
-    transport = session.transport_factory(session.profile)
-    command = _read_artifact_content_command(
-        request.artifact_root,
-        request.relative_path,
-    )
-    result = transport.run(command, timeout_seconds=30.0)
-    env = session.profile.proxy.to_env()
-    if not result.ok:
-        detail = sanitize_remote_text(result.stderr or result.stdout, env).strip()
-        if "not found" in detail.lower():
-            raise HTTPException(
-                status_code=404,
-                detail="Artifact content file not found.",
-            )
-        if "stay within the artifact root" in detail:
-            raise HTTPException(status_code=422, detail=detail)
-        raise HTTPException(
-            status_code=502,
-            detail=detail or "Failed to read artifact content.",
-        )
-    return result.stdout
-
-
-def _read_artifact_content_command(artifact_root: str, relative_path: str) -> str:
-    return "\n".join(
-        [
-            "python3 - <<'PY'",
-            "from pathlib import Path",
-            f"root = Path({artifact_root!r}).resolve()",
-            f"relative = Path({relative_path!r})",
-            "if relative.is_absolute() or '..' in relative.parts:",
-            (
-                "    raise SystemExit("
-                "'Artifact content_path must stay within the artifact root.')"
-            ),
-            "path = (root / relative).resolve()",
-            "try:",
-            "    path.relative_to(root)",
-            "except ValueError:",
-            (
-                "    raise SystemExit("
-                "'Artifact content_path must stay within the artifact root.')"
-            ),
-            "if not path.is_file():",
-            "    raise SystemExit('Artifact content file not found.')",
-            "print(path.read_text(encoding='utf-8'), end='')",
-            "PY",
-        ]
-    )
-
-
 def _run_workspace_sync(session: OpenEvoSidecarSession):
     from openevo.deployment.executor import execute_sidecar_plan
 
@@ -1923,99 +1778,6 @@ def _run_workspace_sync(session: OpenEvoSidecarSession):
         sidecar_plan,
         session.transport_factory(session.profile),
     )
-
-
-def _run_artifacts_response(
-    latest: OpenEvoDesktopRunStatus,
-    summary: dict[str, Any],
-) -> OpenEvoDesktopRunArtifactsResponse:
-    return OpenEvoDesktopRunArtifactsResponse(
-        run_id=latest.id,
-        output_dir=latest.output_dir,
-        summary_status=_optional_string(summary.get("status")),
-        experiment_id=_optional_string(summary.get("experiment_id")),
-        experiment_name=_optional_string(summary.get("experiment_name")),
-        round_count=_optional_int(summary.get("round_count")),
-        tasks=[
-            _artifact_task_summary(task)
-            for task in _dict_list(summary.get("tasks"))
-        ],
-    )
-
-
-def _artifact_task_summary(task: dict[str, Any]) -> OpenEvoDesktopRunArtifactTask:
-    return OpenEvoDesktopRunArtifactTask(
-        task_id=_string_value(task.get("task_id"), "unknown-task"),
-        rounds=[
-            _artifact_round_summary(round_payload)
-            for round_payload in _dict_list(task.get("rounds"))
-        ],
-    )
-
-
-def _artifact_round_summary(
-    round_payload: dict[str, Any],
-) -> OpenEvoDesktopRunArtifactRound:
-    return OpenEvoDesktopRunArtifactRound(
-        round_index=_int_value(round_payload.get("round_index"), 0),
-        policy_version=_optional_string(round_payload.get("policy_version")),
-        rollout_status=_optional_string(round_payload.get("rollout_status")),
-        dataset_status=_optional_string(round_payload.get("dataset_status")),
-        artifact_ids=_artifact_id_map(round_payload.get("artifact_ids")),
-        jobs=[
-            _artifact_job_summary(job_payload)
-            for job_payload in _dict_list(round_payload.get("jobs"))
-        ],
-    )
-
-
-def _artifact_job_summary(job: dict[str, Any]) -> OpenEvoDesktopRunArtifactJob:
-    return OpenEvoDesktopRunArtifactJob(
-        artifact_type=_string_value(job.get("artifact_type"), "unknown"),
-        method=_string_value(job.get("method"), "unknown"),
-        worker_status=_string_value(job.get("worker_status"), "unknown"),
-        artifact_ids=_string_list(job.get("artifact_ids")),
-        approved_artifact_ids=_string_list(job.get("approved_artifact_ids")),
-        promotion_status=_string_value(job.get("promotion_status"), "unknown"),
-    )
-
-
-def _artifact_id_map(value: object) -> dict[str, list[str]]:
-    if not isinstance(value, dict):
-        return {}
-    return {
-        str(key): _string_list(item)
-        for key, item in value.items()
-        if isinstance(key, str)
-    }
-
-
-def _dict_list(value: object) -> list[dict[str, Any]]:
-    if not isinstance(value, list):
-        return []
-    return [item for item in value if isinstance(item, dict)]
-
-
-def _string_list(value: object) -> list[str]:
-    if not isinstance(value, list):
-        return []
-    return [item for item in value if isinstance(item, str)]
-
-
-def _string_value(value: object, default: str) -> str:
-    return value if isinstance(value, str) and value else default
-
-
-def _optional_string(value: object) -> str | None:
-    return value if isinstance(value, str) and value else None
-
-
-def _optional_int(value: object) -> int | None:
-    return value if isinstance(value, int) and not isinstance(value, bool) else None
-
-
-def _int_value(value: object, default: int) -> int:
-    return value if isinstance(value, int) and not isinstance(value, bool) else default
 
 
 def _require_workspace_and_bootstrap_ready(session: OpenEvoSidecarSession) -> None:
@@ -2076,10 +1838,12 @@ def _initial_run_status(
 ) -> OpenEvoDesktopRunStatus:
     run_id = "run_" + datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S%f")
     output_dir = posixpath.join(state_root, "runs", run_id)
+    artifact_root = posixpath.join(state_root, "evolution", "artifacts")
     command = (
         f'PATH="$HOME/.local/bin:$PATH" openevo-backend run '
         f"{shlex.quote(experiment_snapshot)} "
-        f"--output-dir {shlex.quote(output_dir)} --json"
+        f"--output-dir {shlex.quote(output_dir)} "
+        f"--artifact-root {shlex.quote(artifact_root)} --json"
     )
     return OpenEvoDesktopRunStatus(
         id=run_id,
@@ -2406,6 +2170,31 @@ def _status_after_services(
             ),
         }
     )
+
+
+def _status_after_backend_tunnel_failure(
+    status: OpenEvoDesktopShellStatus,
+    error: DesktopBackendError,
+) -> OpenEvoDesktopShellStatus:
+    detail = str(error.error.get("message") or "Backend tunnel failed.")
+    return status.model_copy(
+        update={
+            "services": tuple(
+                _service_after_backend_tunnel_failure(service, detail=detail)
+                for service in status.services
+            ),
+        }
+    )
+
+
+def _service_after_backend_tunnel_failure(
+    service: DesktopServiceStatus,
+    *,
+    detail: str,
+) -> DesktopServiceStatus:
+    if service.id != "openevo-backend":
+        return service
+    return service.model_copy(update={"state": "blocked", "detail": detail})
 
 
 def _status_services_running(

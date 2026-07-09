@@ -1,17 +1,23 @@
 from __future__ import annotations
 
 import json
+import socket
 import shlex
 import time
 import tomllib
 from concurrent.futures import ThreadPoolExecutor
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import Event
+from threading import Thread
 from typing import cast
+import urllib.request
+from urllib.parse import urlparse
 from zipfile import ZipFile
 
 from fastapi.testclient import TestClient
 import pytest
+import uvicorn
 import yaml
 
 import desktop.sidecar.api as sidecar_api
@@ -24,7 +30,10 @@ from desktop.sidecar import (
 )
 from openevo.projects.science import ScienceProjectConfig
 from desktop.sidecar import RemoteProfileConfig
+from openevo.backend.api import create_backend_app
 from openevo.deployment import RemoteCommandResult
+from openevo.evolution.models import ArtifactRegisterRequest
+from openevo.evolution.store import EvolutionStore
 
 
 def test_sidecar_health_endpoint() -> None:
@@ -138,24 +147,55 @@ def assert_desktop_science_payload(payload: dict[str, object]) -> None:
 def test_desktop_science_smoke_exercises_ordinary_user_route_set(
     tmp_path: Path,
 ) -> None:
-    transport = _ArtifactContentTransport(
-        _sample_run_summary_with_artifact_content(),
-        "# Learned Memory\n\n- Prefer stable folds.\n",
-        artifact_metadata={
-            "artifact-text-memory": _artifact_metadata(
-                artifact_id="artifact-text-memory",
-                artifact_type="text_memory",
-                uri="file:///remote/run/artifacts/text_memory/artifact-text-memory",
-                manifest={"content_path": "memory.md"},
-            ),
-        },
-        content_root="/remote/run/artifacts/text_memory/artifact-text-memory",
-        content_relative_path="memory.md",
-    )
+    class ProductBackendClient:
+        def run_timeline(self, run_id: str) -> list[dict[str, object]]:
+            return [
+                {
+                    "id": f"{run_id}:memory",
+                    "phase": "evolution",
+                    "title": "Memory updated",
+                    "message": "Text memory worker promoted one artifact.",
+                    "artifact_ids": ["artifact-text-memory"],
+                }
+            ]
+
+        def run_artifacts(self, run_id: str) -> list[dict[str, object]]:
+            return [
+                {
+                    "id": "artifact-text-memory",
+                    "run_id": run_id,
+                    "artifact_type": "text_memory",
+                    "title": "Initial memory draft",
+                    "promoted": True,
+                    "lineage": {"method": "text_memory_reflector"},
+                }
+            ]
+
+        def artifact_content(self, artifact_id: str) -> dict[str, object]:
+            return {
+                "id": artifact_id,
+                "artifact_type": "text_memory",
+                "content": "# Learned Memory\n\n- Prefer stable folds.\n",
+                "metadata": {
+                    "target_path": "memory.md",
+                    "lineage": {"method": "text_memory_reflector"},
+                },
+            }
+
+        def artifact_diff(self, artifact_id: str) -> dict[str, object]:
+            return {
+                "id": artifact_id,
+                "before": "",
+                "after": "# Learned Memory\n\n- Prefer stable folds.\n",
+                "format": "unified_text",
+            }
+
+    transport = _ApiLifecycleTransport(pid_states=_ready_service_pid_states())
     client = TestClient(
         create_sidecar_app(
             config_root=tmp_path,
             transport_factory=lambda _profile: transport,
+            backend_client_factory=ProductBackendClient,
         )
     )
     token = _sidecar_token(client)
@@ -179,9 +219,21 @@ def test_desktop_science_smoke_exercises_ordinary_user_route_set(
     )
     launch = client.post("/openevo-api/desktop/run", headers=headers)
     terminal = _wait_latest_run_state(client, headers, "succeeded")
-    artifacts = client.get("/openevo-api/desktop/run/artifacts", headers=headers)
+    run_id = terminal["run"]["id"]
+    timeline = client.get(
+        f"/openevo-api/backend/runs/{run_id}/timeline",
+        headers=headers,
+    )
+    artifacts = client.get(
+        f"/openevo-api/backend/runs/{run_id}/artifacts",
+        headers=headers,
+    )
     content = client.get(
-        "/openevo-api/desktop/artifacts/artifact-text-memory/content",
+        "/openevo-api/backend/artifacts/artifact-text-memory/content",
+        headers=headers,
+    )
+    diff = client.get(
+        "/openevo-api/backend/artifacts/artifact-text-memory/diff",
         headers=headers,
     )
 
@@ -196,8 +248,10 @@ def test_desktop_science_smoke_exercises_ordinary_user_route_set(
         services,
         services_status,
         launch,
+        timeline,
         artifacts,
         content,
+        diff,
     ):
         assert response.status_code == 200
     assert_desktop_science_payload(cast(dict[str, object], shell.json()))
@@ -210,25 +264,31 @@ def test_desktop_science_smoke_exercises_ordinary_user_route_set(
         "agent_system_reflector",
     }
     assert services_status.json()["ready"] is True
-    assert artifacts.json()["run_id"] == launch.json()["run"]["id"]
+    assert timeline.json()[0]["artifact_ids"] == ["artifact-text-memory"]
+    assert artifacts.json()[0]["run_id"] == launch.json()["run"]["id"]
     assert terminal["run"]["ready"] is True
     assert content.json()["content"].startswith("# Learned Memory")
+    assert diff.json()["after"].startswith("# Learned Memory")
 
 
-def test_desktop_shell_endpoint_preserves_subscription_readiness() -> None:
+def test_desktop_shell_endpoint_starts_in_setup_required_state() -> None:
     client = TestClient(create_sidecar_app())
 
     response = client.get("/openevo-api/desktop/shell")
 
     assert response.status_code == 200
     payload = response.json()
-    assert payload["remote"]["id"] == "lab-gpu"
+    assert payload["remote"]["id"] == "not-configured"
+    assert payload["remote"]["host"] == ""
+    assert payload["project"]["name"] == "Untitled Science Project"
     assert payload["execution"]["mode"] == "codex_subscription_transcript"
     assert payload["execution"]["token_metrics_available"] is False
-    assert payload["bootstrap"]["ready"] is True
+    assert payload["bootstrap"]["ready"] is False
     assert payload["bootstrap"]["readiness_notes"] == [
-        "Codex subscription login available"
+        "Configure a project and remote backend to begin."
     ]
+    assert "Protein Folding Literature Sprint" not in json.dumps(payload)
+    assert "gpu.example.edu" not in json.dumps(payload)
 
 
 def test_bootstrap_endpoint_requires_config_backed_session() -> None:
@@ -743,6 +803,7 @@ def test_services_endpoint_starts_after_bootstrap_and_refreshes_status() -> None
     assert payload["services"]["ready"] is True
     assert [step["id"] for step in payload["report"]["steps"]] == [
         "write_topology",
+        "openevo_backend",
         "evolution_backend",
         "rollout",
         "gateway",
@@ -765,6 +826,149 @@ def test_services_endpoint_starts_after_bootstrap_and_refreshes_status() -> None
         "state": "ready",
         "detail": "Remote runtime services are ready",
     }
+
+
+def test_services_endpoint_attaches_backend_facade_through_remote_tunnel() -> None:
+    project = ScienceProjectConfig.model_validate(_science_project_payload())
+    profile = _remote_profile()
+    with _BackendFacadeTestServer() as backend:
+        transport = _BackendTunnelTransport(backend.base_url)
+        with TestClient(
+            create_sidecar_app_for_project(
+                project,
+                profile,
+                transport_factory=lambda _profile: transport,
+                transport_kind="ssh",
+            )
+        ) as client:
+            token = _sidecar_token(client)
+            headers = {"X-OpenEvo-Sidecar-Token": token}
+            _prepare_workspace_and_bootstrap(client, headers)
+
+            before_services = client.get("/openevo-api/backend/health", headers=headers)
+            services = client.post("/openevo-api/desktop/services", headers=headers)
+            health = client.get("/openevo-api/backend/health", headers=headers)
+            timeline = client.get(
+                "/openevo-api/backend/runs/run-1/timeline",
+                headers=headers,
+            )
+
+        assert transport.tunnel_requests == [("127.0.0.1", 8765)]
+        assert transport.tunnel is not None
+        assert transport.tunnel.closed is True
+
+    assert before_services.status_code == 409
+    assert before_services.json()["code"] == "backend_tunnel_not_configured"
+    assert services.status_code == 200
+    assert services.json()["services"]["ready"] is True
+    assert health.status_code == 200
+    assert health.json() == {"status": "ok"}
+    assert timeline.status_code == 200
+    assert timeline.json() == [
+        {
+            "id": "run-1-created",
+            "phase": "created",
+            "title": "Run created",
+            "message": "codex run is queued.",
+            "artifact_ids": ["artifact-1"],
+        }
+    ]
+
+
+def test_backend_facade_reads_actual_sidecar_run_state_from_remote_backend(
+    tmp_path: Path,
+) -> None:
+    project = ScienceProjectConfig.model_validate(_science_project_payload())
+    profile = RemoteProfileConfig(
+        version=1,
+        id="science-team",
+        host="gpu.example.edu",
+        user="alice",
+        workspace_root=str(tmp_path / "workspaces"),
+        proxy={"https_proxy": "http://127.0.0.1:7890"},
+    )
+    state_root = tmp_path / "runs" / "protein-design" / "folding-baseline"
+    with _BackendApiStateRootTestServer(state_root) as backend:
+        transport = _StateRootRunTransport(
+            state_root=state_root,
+            backend_base_url=backend.base_url,
+        )
+        with TestClient(
+            create_sidecar_app_for_project(
+                project,
+                profile,
+                transport_factory=lambda _profile: transport,
+                transport_kind="ssh",
+            )
+        ) as client:
+            token = _sidecar_token(client)
+            headers = {"X-OpenEvo-Sidecar-Token": token}
+            _prepare_workspace_bootstrap_and_services(client, headers)
+
+            launch = client.post("/openevo-api/desktop/run", headers=headers)
+            terminal = _wait_latest_run_state(client, headers, "succeeded")
+            run_id = terminal["run"]["id"]
+            timeline = client.get(
+                f"/openevo-api/backend/runs/{run_id}/timeline",
+                headers=headers,
+            )
+            artifacts = client.get(
+                f"/openevo-api/backend/runs/{run_id}/artifacts",
+                headers=headers,
+            )
+            artifact_id = artifacts.json()[0]["id"]
+            content = client.get(
+                f"/openevo-api/backend/artifacts/{artifact_id}/content",
+                headers=headers,
+            )
+            diff = client.get(
+                f"/openevo-api/backend/artifacts/{artifact_id}/diff",
+                headers=headers,
+            )
+
+    assert launch.status_code == 200
+    assert timeline.status_code == 200
+    assert any(
+        artifact_id in event["artifact_ids"]
+        for event in timeline.json()
+    )
+    assert artifacts.status_code == 200
+    assert artifacts.json()[0]["run_id"] == run_id
+    assert artifacts.json()[0]["artifact_type"] == "text_memory"
+    assert artifacts.json()[0]["promoted"] is True
+    assert content.status_code == 200
+    assert content.json()["content"].startswith("# Learned Memory")
+    assert diff.status_code == 200
+    assert diff.json()["after"].startswith("# Learned Memory")
+
+
+def test_services_endpoint_records_blocked_status_when_backend_tunnel_fails() -> None:
+    project = ScienceProjectConfig.model_validate(_science_project_payload())
+    profile = _remote_profile()
+    transport = _FailingBackendTunnelTransport()
+    client = TestClient(
+        create_sidecar_app_for_project(
+            project,
+            profile,
+            transport_factory=lambda _profile: transport,
+            transport_kind="ssh",
+        )
+    )
+    token = _sidecar_token(client)
+    headers = {"X-OpenEvo-Sidecar-Token": token}
+
+    assert client.post("/openevo-api/desktop/workspace", headers=headers).status_code == 200
+    assert client.post("/openevo-api/desktop/bootstrap", headers=headers).status_code == 200
+    services = client.post("/openevo-api/desktop/services", headers=headers)
+    shell = client.get("/openevo-api/desktop/shell")
+
+    assert services.status_code == 503
+    assert services.json()["code"] == "backend_tunnel_failed"
+    service_rows = {item["id"]: item for item in shell.json()["services"]}
+    assert service_rows["openevo-backend"]["state"] == "blocked"
+    assert service_rows["openevo-backend"]["detail"] == (
+        "Desktop could not open a tunnel to the remote OpenEvo backend."
+    )
 
 
 def test_services_endpoint_preserves_failure_status() -> None:
@@ -865,6 +1069,7 @@ def test_services_status_and_health_endpoints_inspect_remote_services() -> None:
     profile = _remote_profile()
     transport = _ApiLifecycleTransport(
         pid_states={
+            "openevo_backend": {"pid": 119, "alive": True},
             "evolution_backend": {"pid": 120, "alive": True},
             "rollout": {"pid": 121, "alive": True},
             "gateway": {"pid": 122, "alive": True},
@@ -2043,9 +2248,10 @@ def test_run_endpoint_launches_after_workspace_bootstrap_and_services() -> None:
     state_root = bootstrap["report"]["prepared_paths"]["state_root"]
     experiment_snapshot = bootstrap["report"]["prepared_paths"]["experiment_snapshot"]
     output_dir = f"{state_root}/runs/{payload['run']['id']}"
+    artifact_root = f"{state_root}/evolution/artifacts"
     expected_command = (
         f'PATH="$HOME/.local/bin:$PATH" openevo-backend run {experiment_snapshot} '
-        f"--output-dir {output_dir} --json"
+        f"--output-dir {output_dir} --artifact-root {artifact_root} --json"
     )
     assert payload["run"]["id"].startswith("run_")
     assert payload["run"]["state"] == "running"
@@ -2255,433 +2461,6 @@ def test_run_status_endpoint_requires_launched_run() -> None:
     assert response.json()["detail"] == "No Desktop run has been launched."
 
 
-def test_run_artifacts_endpoint_requires_config_backed_session() -> None:
-    client = TestClient(create_sidecar_app())
-    token = _sidecar_token(client)
-
-    response = client.get(
-        "/openevo-api/desktop/run/artifacts",
-        headers={"X-OpenEvo-Sidecar-Token": token},
-    )
-
-    assert response.status_code == 409
-    assert response.json()["detail"] == (
-        "Desktop run artifacts require a config-backed sidecar session."
-    )
-
-
-def test_run_artifacts_endpoint_requires_launched_run() -> None:
-    project = ScienceProjectConfig.model_validate(_science_project_payload())
-    profile = _remote_profile()
-    client = TestClient(
-        create_sidecar_app_for_project(
-            project,
-            profile,
-            transport_factory=lambda _profile: _ApiDryRunTransport(),
-        )
-    )
-    token = _sidecar_token(client)
-
-    response = client.get(
-        "/openevo-api/desktop/run/artifacts",
-        headers={"X-OpenEvo-Sidecar-Token": token},
-    )
-
-    assert response.status_code == 404
-    assert response.json()["detail"] == "No Desktop run has been launched."
-
-
-def test_run_artifacts_endpoint_rejects_active_run() -> None:
-    project = ScienceProjectConfig.model_validate(_science_project_payload())
-    profile = _remote_profile()
-    transport = _BlockingRunTransport()
-    client = TestClient(
-        create_sidecar_app_for_project(
-            project,
-            profile,
-            transport_factory=lambda _profile: transport,
-        )
-    )
-    token = _sidecar_token(client)
-    headers = {"X-OpenEvo-Sidecar-Token": token}
-    _prepare_workspace_bootstrap_and_services(client, headers)
-
-    launch = client.post("/openevo-api/desktop/run", headers=headers)
-    assert transport.run_started.wait(timeout=5)
-    response = client.get("/openevo-api/desktop/run/artifacts", headers=headers)
-    transport.run_release.set()
-    _wait_latest_run_state(client, headers, "succeeded")
-
-    assert launch.status_code == 200
-    assert response.status_code == 409
-    assert response.json()["detail"] == (
-        "Desktop run artifacts require a terminal run."
-    )
-
-
-def test_run_artifacts_endpoint_reads_latest_run_summary() -> None:
-    project = ScienceProjectConfig.model_validate(_science_project_payload())
-    profile = _remote_profile()
-    transport = _RunArtifactsTransport(_sample_run_summary())
-    client = TestClient(
-        create_sidecar_app_for_project(
-            project,
-            profile,
-            transport_factory=lambda _profile: transport,
-        )
-    )
-    token = _sidecar_token(client)
-    headers = {"X-OpenEvo-Sidecar-Token": token}
-    _prepare_workspace_bootstrap_and_services(client, headers)
-    launch = client.post("/openevo-api/desktop/run", headers=headers)
-    terminal = _wait_latest_run_state(client, headers, "succeeded")
-
-    response = client.get("/openevo-api/desktop/run/artifacts", headers=headers)
-
-    assert launch.status_code == 200
-    assert terminal["run"]["ready"] is True
-    assert response.status_code == 200
-    payload = response.json()
-    assert payload["run_id"] == launch.json()["run"]["id"]
-    assert payload["output_dir"] == launch.json()["run"]["output_dir"]
-    assert payload["summary_status"] == "completed"
-    assert payload["experiment_id"] == "biology-components"
-    assert payload["tasks"] == [
-        {
-            "task_id": "folding-baseline",
-            "rounds": [
-                {
-                    "round_index": 0,
-                    "policy_version": "policy-r0",
-                    "rollout_status": "completed",
-                    "dataset_status": "ready",
-                    "artifact_ids": {
-                        "dataset": ["dataset-artifact-1"],
-                        "text_memory": ["artifact-text-memory"],
-                        "skill_bundle": ["artifact-skill-bundle"],
-                        "agent_system": ["artifact-agent-system"],
-                    },
-                    "jobs": [
-                        {
-                            "artifact_type": "text_memory",
-                            "method": "text_memory_reflector",
-                            "worker_status": "succeeded",
-                            "artifact_ids": ["artifact-text-memory"],
-                            "approved_artifact_ids": ["artifact-text-memory"],
-                            "promotion_status": "skipped",
-                        },
-                        {
-                            "artifact_type": "skill_bundle",
-                            "method": "skill_bundle_reflector",
-                            "worker_status": "succeeded",
-                            "artifact_ids": ["artifact-skill-bundle"],
-                            "approved_artifact_ids": ["artifact-skill-bundle"],
-                            "promotion_status": "approved",
-                        },
-                    ],
-                }
-            ],
-        }
-    ]
-    assert any("summary.json" in command for command in transport.commands)
-
-
-def test_run_artifacts_endpoint_reports_remote_summary_failure() -> None:
-    project = ScienceProjectConfig.model_validate(_science_project_payload())
-    profile = _remote_profile()
-    transport = _MissingRunArtifactsTransport()
-    client = TestClient(
-        create_sidecar_app_for_project(
-            project,
-            profile,
-            transport_factory=lambda _profile: transport,
-        )
-    )
-    token = _sidecar_token(client)
-    headers = {"X-OpenEvo-Sidecar-Token": token}
-    _prepare_workspace_bootstrap_and_services(client, headers)
-    client.post("/openevo-api/desktop/run", headers=headers)
-    _wait_latest_run_state(client, headers, "succeeded")
-
-    response = client.get("/openevo-api/desktop/run/artifacts", headers=headers)
-
-    assert response.status_code == 404
-    assert response.json()["detail"] == "OpenEvo run summary not found."
-
-
-def test_run_artifacts_endpoint_reports_remote_read_failure() -> None:
-    project = ScienceProjectConfig.model_validate(_science_project_payload())
-    profile = _remote_profile()
-    transport = _BrokenRunArtifactsTransport()
-    client = TestClient(
-        create_sidecar_app_for_project(
-            project,
-            profile,
-            transport_factory=lambda _profile: transport,
-        )
-    )
-    token = _sidecar_token(client)
-    headers = {"X-OpenEvo-Sidecar-Token": token}
-    _prepare_workspace_bootstrap_and_services(client, headers)
-    client.post("/openevo-api/desktop/run", headers=headers)
-    _wait_latest_run_state(client, headers, "succeeded")
-
-    response = client.get("/openevo-api/desktop/run/artifacts", headers=headers)
-
-    assert response.status_code == 502
-    assert response.json()["detail"] == "python3: command not found"
-
-
-def test_artifact_content_api_returns_memory_markdown() -> None:
-    project = ScienceProjectConfig.model_validate(_science_project_payload())
-    profile = _remote_profile()
-    transport = _ArtifactContentTransport(
-        _sample_run_summary_with_artifact_content(),
-        "# Learned Memory\n\n- Prefer stable folds.\n",
-        artifact_metadata={
-            "artifact-text-memory": _artifact_metadata(
-                artifact_id="artifact-text-memory",
-                artifact_type="text_memory",
-                uri="file:///remote/run/artifacts/text_memory/artifact-text-memory",
-                manifest={"content_path": "memory.md"},
-            ),
-        },
-        content_root="/remote/run/artifacts/text_memory/artifact-text-memory",
-        content_relative_path="memory.md",
-    )
-    client = TestClient(
-        create_sidecar_app_for_project(
-            project,
-            profile,
-            transport_factory=lambda _profile: transport,
-        )
-    )
-    token = _sidecar_token(client)
-    headers = {"X-OpenEvo-Sidecar-Token": token}
-    _prepare_workspace_bootstrap_and_services(client, headers)
-    client.post("/openevo-api/desktop/run", headers=headers)
-    _wait_latest_run_state(client, headers, "succeeded")
-
-    response = client.get(
-        "/openevo-api/desktop/artifacts/artifact-text-memory/content",
-        headers=headers,
-    )
-
-    assert response.status_code == 200
-    assert response.json() == {
-        "artifact_id": "artifact-text-memory",
-        "artifact_type": "text_memory",
-        "filename": "memory.md",
-        "content": "# Learned Memory\n\n- Prefer stable folds.\n",
-        "mime_type": "text/markdown",
-    }
-    assert any(
-        "/v1/artifacts/artifact-text-memory" in command
-        for command in transport.commands
-    )
-    content_command = transport.content_commands[-1]
-    assert "root = Path('/remote/run/artifacts/text_memory/artifact-text-memory')" in (
-        content_command
-    )
-    assert "relative = Path('memory.md')" in content_command
-
-
-def test_artifact_content_api_splits_nested_agent_system_path() -> None:
-    project = ScienceProjectConfig.model_validate(_science_project_payload())
-    profile = _remote_profile()
-    transport = _ArtifactContentTransport(
-        _sample_run_summary_with_artifact_content(),
-        "# Repo Microagent\n",
-        artifact_metadata={
-            "artifact-agent-system": _artifact_metadata(
-                artifact_id="artifact-agent-system",
-                artifact_type="agent_system",
-                uri=(
-                    "file:///remote/run/artifacts/agent_system/"
-                    "artifact-agent-system/.openhands/microagents/repo.md"
-                ),
-                manifest={"content_path": ".openhands/microagents/repo.md"},
-            ),
-        },
-        content_root="/remote/run/artifacts/agent_system/artifact-agent-system",
-        content_relative_path=".openhands/microagents/repo.md",
-    )
-    client = TestClient(
-        create_sidecar_app_for_project(
-            project,
-            profile,
-            transport_factory=lambda _profile: transport,
-        )
-    )
-    token = _sidecar_token(client)
-    headers = {"X-OpenEvo-Sidecar-Token": token}
-    _prepare_workspace_bootstrap_and_services(client, headers)
-    client.post("/openevo-api/desktop/run", headers=headers)
-    _wait_latest_run_state(client, headers, "succeeded")
-
-    response = client.get(
-        "/openevo-api/desktop/artifacts/artifact-agent-system/content",
-        headers=headers,
-    )
-
-    assert response.status_code == 200
-    assert response.json() == {
-        "artifact_id": "artifact-agent-system",
-        "artifact_type": "agent_system",
-        "filename": "repo.md",
-        "content": "# Repo Microagent\n",
-        "mime_type": "text/markdown",
-    }
-    content_command = transport.content_commands[-1]
-    assert "root = Path('/remote/run/artifacts/agent_system/artifact-agent-system')" in (
-        content_command
-    )
-    assert "relative = Path('.openhands/microagents/repo.md')" in content_command
-    assert (
-        "/remote/run/artifacts/agent_system/artifact-agent-system/"
-        ".openhands/microagents/repo.md/.openhands/microagents/repo.md"
-        not in content_command
-    )
-
-
-def test_artifact_content_api_rejects_unsafe_content_path() -> None:
-    project = ScienceProjectConfig.model_validate(_science_project_payload())
-    profile = _remote_profile()
-    summary = _sample_run_summary_with_artifact_content()
-    transport = _ArtifactContentTransport(
-        summary,
-        "secret",
-        artifact_metadata={
-            "artifact-text-memory": _artifact_metadata(
-                artifact_id="artifact-text-memory",
-                artifact_type="text_memory",
-                uri="file:///remote/run/artifacts/text_memory/artifact-text-memory",
-                manifest={"content_path": "../secrets.txt"},
-            ),
-        },
-        content_root="/remote/run/artifacts/text_memory/artifact-text-memory",
-        content_relative_path="../secrets.txt",
-    )
-    client = TestClient(
-        create_sidecar_app_for_project(
-            project,
-            profile,
-            transport_factory=lambda _profile: transport,
-        )
-    )
-    token = _sidecar_token(client)
-    headers = {"X-OpenEvo-Sidecar-Token": token}
-    _prepare_workspace_bootstrap_and_services(client, headers)
-    client.post("/openevo-api/desktop/run", headers=headers)
-    _wait_latest_run_state(client, headers, "succeeded")
-
-    response = client.get(
-        "/openevo-api/desktop/artifacts/artifact-text-memory/content",
-        headers=headers,
-    )
-
-    assert response.status_code == 422
-    assert response.json()["detail"] == (
-        "Artifact content_path must stay within the artifact root."
-    )
-    assert not any("secrets.txt" in command for command in transport.commands)
-
-
-def test_artifact_content_api_ignores_worker_result_artifact_ids() -> None:
-    project = ScienceProjectConfig.model_validate(_science_project_payload())
-    profile = _remote_profile()
-    summary = _sample_run_summary_with_artifact_content()
-    summary["tasks"][0]["rounds"][0]["jobs"][0]["worker_results"] = [
-        {"artifact_ids": ["artifact-smuggled"]}
-    ]
-    transport = _ArtifactContentTransport(
-        summary,
-        "# Smuggled\n",
-        artifact_metadata={
-            "artifact-smuggled": _artifact_metadata(
-                artifact_id="artifact-smuggled",
-                artifact_type="text_memory",
-                uri="file:///remote/run/artifacts/text_memory/artifact-smuggled",
-                manifest={"content_path": "memory.md"},
-            ),
-        },
-        content_root="/remote/run/artifacts/text_memory/artifact-smuggled",
-        content_relative_path="memory.md",
-    )
-    client = TestClient(
-        create_sidecar_app_for_project(
-            project,
-            profile,
-            transport_factory=lambda _profile: transport,
-        )
-    )
-    token = _sidecar_token(client)
-    headers = {"X-OpenEvo-Sidecar-Token": token}
-    _prepare_workspace_bootstrap_and_services(client, headers)
-    client.post("/openevo-api/desktop/run", headers=headers)
-    _wait_latest_run_state(client, headers, "succeeded")
-
-    response = client.get(
-        "/openevo-api/desktop/artifacts/artifact-smuggled/content",
-        headers=headers,
-    )
-
-    assert response.status_code == 404
-    assert response.json()["detail"] == "Artifact not found in latest run summary."
-    assert transport.metadata_commands == []
-
-
-def test_artifact_content_api_ignores_malformed_nested_artifact_fields() -> None:
-    project = ScienceProjectConfig.model_validate(_science_project_payload())
-    profile = _remote_profile()
-    summary = _sample_run_summary_with_artifact_content()
-    round_payload = summary["tasks"][0]["rounds"][0]
-    round_payload["artifact_ids"] = {
-        "text_memory": [{"artifact_ids": ["artifact-smuggled"]}]
-    }
-    round_payload["jobs"][0]["artifact_ids"] = [
-        {"artifact_ids": ["artifact-smuggled"]}
-    ]
-    round_payload["jobs"][0]["approved_artifact_ids"] = [
-        {"artifact_ids": ["artifact-smuggled"]}
-    ]
-    transport = _ArtifactContentTransport(
-        summary,
-        "# Smuggled\n",
-        artifact_metadata={
-            "artifact-smuggled": _artifact_metadata(
-                artifact_id="artifact-smuggled",
-                artifact_type="text_memory",
-                uri="file:///remote/run/artifacts/text_memory/artifact-smuggled",
-                manifest={"content_path": "memory.md"},
-            ),
-        },
-        content_root="/remote/run/artifacts/text_memory/artifact-smuggled",
-        content_relative_path="memory.md",
-    )
-    client = TestClient(
-        create_sidecar_app_for_project(
-            project,
-            profile,
-            transport_factory=lambda _profile: transport,
-        )
-    )
-    token = _sidecar_token(client)
-    headers = {"X-OpenEvo-Sidecar-Token": token}
-    _prepare_workspace_bootstrap_and_services(client, headers)
-    client.post("/openevo-api/desktop/run", headers=headers)
-    _wait_latest_run_state(client, headers, "succeeded")
-
-    response = client.get(
-        "/openevo-api/desktop/artifacts/artifact-smuggled/content",
-        headers=headers,
-    )
-
-    assert response.status_code == 404
-    assert response.json()["detail"] == "Artifact not found in latest run summary."
-    assert transport.metadata_commands == []
-
-
 def test_run_response_schema_has_structured_report_contract() -> None:
     client = TestClient(create_sidecar_app())
 
@@ -2835,80 +2614,13 @@ def _wait_latest_run_state(
     raise AssertionError(f"latest run did not reach {expected_state}")
 
 
-def _sample_run_summary() -> dict:
+def _ready_service_pid_states() -> dict[str, dict[str, object]]:
     return {
-        "mode": "run",
-        "status": "completed",
-        "experiment_id": "biology-components",
-        "experiment_name": "Biology Components",
-        "run_id": "compiled-run-id",
-        "round_count": 1,
-        "tasks": [
-            {
-                "task_id": "folding-baseline",
-                "rounds": [
-                    {
-                        "round_index": 0,
-                        "policy_version": "policy-r0",
-                        "rollout_status": "completed",
-                        "dataset_status": "ready",
-                        "artifact_ids": {
-                            "dataset": ["dataset-artifact-1"],
-                            "text_memory": ["artifact-text-memory"],
-                            "skill_bundle": ["artifact-skill-bundle"],
-                            "agent_system": ["artifact-agent-system"],
-                        },
-                        "jobs": [
-                            {
-                                "artifact_type": "text_memory",
-                                "method": "text_memory_reflector",
-                                "worker_status": "succeeded",
-                                "artifact_ids": ["artifact-text-memory"],
-                                "approved_artifact_ids": ["artifact-text-memory"],
-                                "promotion_status": "skipped",
-                                "worker_results": [{"large": "not returned"}],
-                            },
-                            {
-                                "artifact_type": "skill_bundle",
-                                "method": "skill_bundle_reflector",
-                                "worker_status": "succeeded",
-                                "artifact_ids": ["artifact-skill-bundle"],
-                                "approved_artifact_ids": ["artifact-skill-bundle"],
-                                "promotion_status": "approved",
-                                "job": {"large": "not returned"},
-                            },
-                        ],
-                    }
-                ],
-            }
-        ],
-        "summary_path": "/remote/run/summary.json",
-    }
-
-
-def _sample_run_summary_with_artifact_content() -> dict:
-    return _sample_run_summary()
-
-
-def _artifact_metadata(
-    *,
-    artifact_id: str,
-    artifact_type: str,
-    uri: str,
-    manifest: dict,
-) -> dict:
-    return {
-        "artifact_id": artifact_id,
-        "type": artifact_type,
-        "name": artifact_id,
-        "version": 1,
-        "state": "ready",
-        "uri": uri,
-        "manifest": manifest,
-        "compatibility": {},
-        "scores": {},
-        "tags": [],
-        "promoted": False,
+        "openevo_backend": {"pid": 119, "alive": True},
+        "evolution_backend": {"pid": 120, "alive": True},
+        "rollout": {"pid": 121, "alive": True},
+        "gateway": {"pid": 122, "alive": True},
+        "evolution_worker": {"pid": 123, "alive": True},
     }
 
 
@@ -2932,6 +2644,256 @@ def _write_openevo_wheel(
             ),
         )
     return path
+
+
+class _BackendFacadeTestServer:
+    def __init__(self) -> None:
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                path = urlparse(self.path).path
+                if path == "/health":
+                    self._write_json({"status": "ok"})
+                    return
+                if path == "/runs/run-1/timeline":
+                    self._write_json(
+                        [
+                            {
+                                "id": "run-1-created",
+                                "phase": "created",
+                                "title": "Run created",
+                                "message": "codex run is queued.",
+                                "artifact_ids": ["artifact-1"],
+                            }
+                        ]
+                    )
+                    return
+                self.send_response(404)
+                self.end_headers()
+
+            def log_message(self, _format: str, *_args: object) -> None:
+                return
+
+            def _write_json(self, payload: object) -> None:
+                data = json.dumps(payload).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+        self._server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self._thread = Thread(target=self._server.serve_forever, daemon=True)
+
+    @property
+    def base_url(self) -> str:
+        port = self._server.server_address[1]
+        return f"http://127.0.0.1:{port}"
+
+    def __enter__(self) -> "_BackendFacadeTestServer":
+        self._thread.start()
+        return self
+
+    def __exit__(self, *_exc_info: object) -> None:
+        self._server.shutdown()
+        self._server.server_close()
+        self._thread.join(timeout=5)
+
+
+class _BackendApiStateRootTestServer:
+    def __init__(self, state_root: Path) -> None:
+        self._port = _allocate_test_port()
+        self._server = uvicorn.Server(
+            uvicorn.Config(
+                create_backend_app(state_root=state_root),
+                host="127.0.0.1",
+                port=self._port,
+                log_level="critical",
+            )
+        )
+        self._thread = Thread(target=self._server.run, daemon=True)
+
+    @property
+    def base_url(self) -> str:
+        return f"http://127.0.0.1:{self._port}"
+
+    def __enter__(self) -> "_BackendApiStateRootTestServer":
+        self._thread.start()
+        _wait_for_test_backend(self.base_url)
+        return self
+
+    def __exit__(self, *_exc_info: object) -> None:
+        self._server.should_exit = True
+        self._thread.join(timeout=5)
+
+
+def _allocate_test_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+def _wait_for_test_backend(base_url: str) -> None:
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        try:
+            with urllib.request.urlopen(f"{base_url}/health", timeout=0.25) as response:
+                if response.status == 200:
+                    return
+        except OSError:
+            time.sleep(0.05)
+    raise RuntimeError("backend test server did not become ready")
+
+
+class _BackendTunnel:
+    def __init__(self, base_url: str) -> None:
+        port = urlparse(base_url).port
+        if port is None:
+            raise AssertionError("test backend URL must include a port")
+        self.local_port = port
+        self.remote_port = 8765
+        self.base_url = base_url
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _BackendTunnelTransport:
+    def __init__(self, base_url: str) -> None:
+        self._base_url = base_url
+        self.tunnel_requests: list[tuple[str, int]] = []
+        self.tunnel: _BackendTunnel | None = None
+        self._delegate = _ApiDryRunTransport()
+
+    def run(
+        self,
+        command: str,
+        *,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        timeout_seconds: float = 30.0,
+    ) -> RemoteCommandResult:
+        return self._delegate.run(
+            command,
+            cwd=cwd,
+            env=env,
+            timeout_seconds=timeout_seconds,
+        )
+
+    def upload_dir(self, local_path: str, remote_path: str) -> None:
+        self._delegate.upload_dir(local_path, remote_path)
+
+    def open_tunnel(
+        self,
+        *,
+        remote_port: int,
+        remote_host: str = "127.0.0.1",
+        wait_for_ready: bool = True,
+    ) -> _BackendTunnel:
+        self.tunnel_requests.append((remote_host, remote_port))
+        self.tunnel = _BackendTunnel(self._base_url)
+        return self.tunnel
+
+
+class _FailingBackendTunnelTransport(_BackendTunnelTransport):
+    def __init__(self) -> None:
+        super().__init__("http://127.0.0.1:1")
+
+
+class _StateRootRunTransport(_BackendTunnelTransport):
+    def __init__(self, *, state_root: Path, backend_base_url: str) -> None:
+        super().__init__(backend_base_url)
+        self._state_root = state_root
+
+    def run(
+        self,
+        command: str,
+        *,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        timeout_seconds: float = 30.0,
+    ) -> RemoteCommandResult:
+        if command.startswith('PATH="$HOME/.local/bin:$PATH" openevo-backend run '):
+            self._delegate.commands.append(command)
+            self._delegate.run_calls.append((command, cwd, timeout_seconds))
+            self._write_run_output(command)
+            return RemoteCommandResult(command=command, return_code=0, stdout="ok")
+        return super().run(
+            command,
+            cwd=cwd,
+            env=env,
+            timeout_seconds=timeout_seconds,
+        )
+
+    def _write_run_output(self, command: str) -> None:
+        tokens = shlex.split(command)
+        output_dir = Path(tokens[tokens.index("--output-dir") + 1])
+        artifact_root = Path(tokens[tokens.index("--artifact-root") + 1])
+        assert artifact_root == self._state_root / "evolution" / "artifacts"
+        store = EvolutionStore(
+            db_path=self._state_root / "evolution" / "evolution.db",
+            artifact_root=artifact_root,
+        )
+        store.initialize()
+        artifact_dir = artifact_root / "run-memory"
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        (artifact_dir / "memory.md").write_text(
+            "# Learned Memory\n\n- Prefer stable folds.\n",
+            encoding="utf-8",
+        )
+        artifact = store.register_artifact(
+            ArtifactRegisterRequest(
+                type="text_memory",
+                name="Learned memory",
+                uri=artifact_dir.as_uri(),
+                manifest={"content_path": "memory.md"},
+                promoted=True,
+            )
+        )
+        output_dir.mkdir(parents=True, exist_ok=True)
+        run_id = output_dir.name
+        (output_dir / "summary.json").write_text(
+            json.dumps(
+                {
+                    "mode": "run",
+                    "status": "completed",
+                    "experiment_id": "biology-components",
+                    "experiment_name": "Biology Components",
+                    "run_id": run_id,
+                    "round_count": 1,
+                    "tasks": [
+                        {
+                            "task_id": "folding-baseline",
+                            "rounds": [
+                                {
+                                    "round_index": 0,
+                                    "policy_version": "policy-r0",
+                                    "rollout_status": "completed",
+                                    "dataset_status": "ready",
+                                    "artifact_ids": {
+                                        "text_memory": [artifact.artifact_id],
+                                    },
+                                    "jobs": [
+                                        {
+                                            "artifact_type": "text_memory",
+                                            "method": "text_memory_reflector",
+                                            "worker_status": "succeeded",
+                                            "artifact_ids": [artifact.artifact_id],
+                                            "approved_artifact_ids": [
+                                                artifact.artifact_id
+                                            ],
+                                            "promotion_status": "approved",
+                                        }
+                                    ],
+                                }
+                            ],
+                        }
+                    ],
+                    "summary_path": str(output_dir / "summary.json"),
+                }
+            ),
+            encoding="utf-8",
+        )
 
 
 class _ApiDryRunTransport:
@@ -3078,6 +3040,7 @@ class _ApiLifecycleTransport(_ApiDryRunTransport):
 
 def _service_id_from_command(command: str) -> str | None:
     url_services = {
+        "127.0.0.1:8765": "openevo_backend",
         "127.0.0.1:8200": "evolution_backend",
         "127.0.0.1:8080": "rollout",
         "127.0.0.1:8100": "gateway",
@@ -3087,6 +3050,7 @@ def _service_id_from_command(command: str) -> str | None:
         if url_fragment in command:
             return service_id
     for service_id in (
+        "openevo_backend",
         "evolution_backend",
         "evolution_worker",
         "gateway",
@@ -3144,185 +3108,6 @@ class _FailingRunTransport(_ApiDryRunTransport):
                 command=command,
                 return_code=2,
                 stderr="run failed",
-            )
-        return super().run(
-            command,
-            cwd=cwd,
-            env=env,
-            timeout_seconds=timeout_seconds,
-        )
-
-
-class _RunArtifactsTransport(_ApiDryRunTransport):
-    def __init__(self, summary: dict) -> None:
-        super().__init__()
-        self.summary = summary
-
-    def run(
-        self,
-        command: str,
-        *,
-        cwd: str | None = None,
-        env: dict[str, str] | None = None,
-        timeout_seconds: float = 30.0,
-    ) -> RemoteCommandResult:
-        if command.startswith('PATH="$HOME/.local/bin:$PATH" openevo-backend run '):
-            self.commands.append(command)
-            self.run_calls.append((command, cwd, timeout_seconds))
-            return RemoteCommandResult(command=command, return_code=0, stdout="ok")
-        if "summary.json" in command:
-            self.commands.append(command)
-            self.run_calls.append((command, cwd, timeout_seconds))
-            return RemoteCommandResult(
-                command=command,
-                return_code=0,
-                stdout=json.dumps(self.summary),
-            )
-        return super().run(
-            command,
-            cwd=cwd,
-            env=env,
-            timeout_seconds=timeout_seconds,
-        )
-
-
-class _ArtifactContentTransport(_RunArtifactsTransport):
-    def __init__(
-        self,
-        summary: dict,
-        content: str,
-        *,
-        artifact_metadata: dict[str, dict],
-        content_root: str,
-        content_relative_path: str,
-    ) -> None:
-        super().__init__(summary)
-        self.content = content
-        self.artifact_metadata = artifact_metadata
-        self.content_root = content_root
-        self.content_relative_path = content_relative_path
-        self.metadata_commands: list[str] = []
-        self.content_commands: list[str] = []
-
-    def run(
-        self,
-        command: str,
-        *,
-        cwd: str | None = None,
-        env: dict[str, str] | None = None,
-        timeout_seconds: float = 30.0,
-    ) -> RemoteCommandResult:
-        if "summary.json" in command or command.startswith(
-            'PATH="$HOME/.local/bin:$PATH" openevo-backend run '
-        ):
-            return super().run(
-                command,
-                cwd=cwd,
-                env=env,
-                timeout_seconds=timeout_seconds,
-            )
-        if "json.dumps" in command and "pid_path =" in command:
-            self.commands.append(command)
-            self.run_calls.append((command, cwd, timeout_seconds))
-            return RemoteCommandResult(
-                command=command,
-                return_code=0,
-                stdout=json.dumps(
-                    {
-                        "pid_exists": True,
-                        "pid": 120,
-                        "alive": True,
-                    }
-                ),
-            )
-        if "/v1/artifacts/" in command:
-            self.commands.append(command)
-            self.metadata_commands.append(command)
-            self.run_calls.append((command, cwd, timeout_seconds))
-            for artifact_id, metadata in self.artifact_metadata.items():
-                if f"/v1/artifacts/{artifact_id}" in command:
-                    return RemoteCommandResult(
-                        command=command,
-                        return_code=0,
-                        stdout=json.dumps(metadata),
-                    )
-            return RemoteCommandResult(
-                command=command,
-                return_code=22,
-                stderr="Artifact metadata not found.",
-            )
-        if "root = Path(" not in command or "relative = Path(" not in command:
-            return super().run(
-                command,
-                cwd=cwd,
-                env=env,
-                timeout_seconds=timeout_seconds,
-            )
-        self.commands.append(command)
-        self.content_commands.append(command)
-        self.run_calls.append((command, cwd, timeout_seconds))
-        expected_root = f"root = Path({self.content_root!r})"
-        expected_relative = f"relative = Path({self.content_relative_path!r})"
-        if expected_root not in command or expected_relative not in command:
-            return RemoteCommandResult(
-                command=command,
-                return_code=2,
-                stderr="unexpected artifact content path",
-            )
-        return RemoteCommandResult(
-            command=command,
-            return_code=0,
-            stdout=self.content,
-        )
-
-
-class _MissingRunArtifactsTransport(_RunArtifactsTransport):
-    def __init__(self) -> None:
-        super().__init__(_sample_run_summary())
-
-    def run(
-        self,
-        command: str,
-        *,
-        cwd: str | None = None,
-        env: dict[str, str] | None = None,
-        timeout_seconds: float = 30.0,
-    ) -> RemoteCommandResult:
-        if "summary.json" in command:
-            self.commands.append(command)
-            self.run_calls.append((command, cwd, timeout_seconds))
-            return RemoteCommandResult(
-                command=command,
-                return_code=2,
-                stderr="OpenEvo run summary not found.",
-            )
-        return super().run(
-            command,
-            cwd=cwd,
-            env=env,
-            timeout_seconds=timeout_seconds,
-        )
-
-
-class _BrokenRunArtifactsTransport(_RunArtifactsTransport):
-    def __init__(self) -> None:
-        super().__init__(_sample_run_summary())
-
-    def run(
-        self,
-        command: str,
-        *,
-        cwd: str | None = None,
-        env: dict[str, str] | None = None,
-        timeout_seconds: float = 30.0,
-    ) -> RemoteCommandResult:
-        if "summary.json" in command:
-            self.commands.append(command)
-            self.run_calls.append((command, cwd, timeout_seconds))
-            return RemoteCommandResult(
-                command=command,
-                return_code=127,
-                stderr="python3: command not found",
             )
         return super().run(
             command,

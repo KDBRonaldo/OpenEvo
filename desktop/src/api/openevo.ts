@@ -6,6 +6,7 @@ import type {
   RemoteServiceState,
 } from "../routes/openevoDesktopModel";
 import { normalizeOpenEvoExecutionMode } from "../routes/openevoDesktopModel";
+import { artifactPreview, timelineView } from "./evolutionViewModel";
 
 export type OpenEvoExecutionMode =
   | "codex_subscription_transcript"
@@ -303,6 +304,63 @@ export interface OpenEvoArtifactContent {
   mimeType: string;
 }
 
+export interface OpenEvoBackendTimelineEventPayload {
+  id: string;
+  phase: string;
+  title: string;
+  message: string;
+  artifact_ids: string[];
+}
+
+export interface OpenEvoBackendTimelineEvent {
+  id: string;
+  phase: string;
+  label: string;
+  message: string;
+  artifactIds: string[];
+}
+
+export interface OpenEvoBackendArtifactSummaryPayload {
+  id: string;
+  run_id: string;
+  artifact_type: string;
+  title: string;
+  promoted: boolean;
+  lineage: Record<string, unknown>;
+}
+
+export interface OpenEvoBackendArtifactSummary {
+  id: string;
+  runId: string;
+  artifactType: string;
+  title: string;
+  promoted: boolean;
+  lineage: Record<string, unknown>;
+}
+
+export interface OpenEvoBackendArtifactContentPayload {
+  id: string;
+  artifact_type: string;
+  content: string;
+  metadata: Record<string, unknown>;
+}
+
+export interface OpenEvoBackendArtifactDiffPayload {
+  id: string;
+  before: string;
+  after: string;
+  format: "unified_text";
+}
+
+export interface OpenEvoBackendArtifactPreview {
+  id: string;
+  kind: string;
+  body: string;
+  targetPath?: string;
+  lineage: Record<string, unknown>;
+  diff: OpenEvoBackendArtifactDiffPayload;
+}
+
 export interface OpenEvoRunArtifactJob {
   artifactType: string;
   method: string;
@@ -491,15 +549,30 @@ export async function pollOpenEvoRunStatus(): Promise<OpenEvoRunResponse> {
   };
 }
 
-export async function fetchOpenEvoRunArtifacts(): Promise<OpenEvoRunArtifacts> {
+export async function fetchOpenEvoBackendRunTimeline(
+  runId: string,
+): Promise<OpenEvoBackendTimelineEvent[]> {
   const headers = sidecarMutationToken
     ? { [sidecarMutationTokenHeader]: sidecarMutationToken }
     : undefined;
-  const payload = await api.get<OpenEvoRunArtifactsPayload>(
-    "/openevo-api/desktop/run/artifacts",
+  const payload = await api.get<OpenEvoBackendTimelineEventPayload[]>(
+    `/openevo-api/backend/runs/${encodeURIComponent(runId)}/timeline`,
     headers,
   );
-  return toOpenEvoRunArtifacts(payload);
+  return timelineView(payload);
+}
+
+export async function fetchOpenEvoBackendRunArtifacts(
+  runId: string,
+): Promise<OpenEvoBackendArtifactSummary[]> {
+  const headers = sidecarMutationToken
+    ? { [sidecarMutationTokenHeader]: sidecarMutationToken }
+    : undefined;
+  const payload = await api.get<OpenEvoBackendArtifactSummaryPayload[]>(
+    `/openevo-api/backend/runs/${encodeURIComponent(runId)}/artifacts`,
+    headers,
+  );
+  return payload.map(toOpenEvoBackendArtifactSummary);
 }
 
 export async function fetchOpenEvoDesktopCapabilities(): Promise<OpenEvoDesktopCapabilities> {
@@ -509,17 +582,23 @@ export async function fetchOpenEvoDesktopCapabilities(): Promise<OpenEvoDesktopC
   return toOpenEvoDesktopCapabilities(payload);
 }
 
-export async function fetchOpenEvoArtifactContent(
+export async function fetchOpenEvoBackendArtifactPreview(
   artifactId: string,
-): Promise<OpenEvoArtifactContent> {
+): Promise<OpenEvoBackendArtifactPreview> {
   const headers = sidecarMutationToken
     ? { [sidecarMutationTokenHeader]: sidecarMutationToken }
     : undefined;
-  const payload = await api.get<OpenEvoArtifactContentPayload>(
-    `/openevo-api/desktop/artifacts/${encodeURIComponent(artifactId)}/content`,
-    headers,
-  );
-  return toOpenEvoArtifactContent(payload);
+  const [content, diff] = await Promise.all([
+    api.get<OpenEvoBackendArtifactContentPayload>(
+      `/openevo-api/backend/artifacts/${encodeURIComponent(artifactId)}/content`,
+      headers,
+    ),
+    api.get<OpenEvoBackendArtifactDiffPayload>(
+      `/openevo-api/backend/artifacts/${encodeURIComponent(artifactId)}/diff`,
+      headers,
+    ),
+  ]);
+  return artifactPreview(content, diff);
 }
 
 export function toOpenEvoBootstrapResponse(
@@ -617,6 +696,19 @@ export function toOpenEvoArtifactContent(
     filename: payload.filename,
     content: payload.content,
     mimeType: payload.mime_type,
+  };
+}
+
+export function toOpenEvoBackendArtifactSummary(
+  payload: OpenEvoBackendArtifactSummaryPayload,
+): OpenEvoBackendArtifactSummary {
+  return {
+    id: payload.id,
+    runId: payload.run_id,
+    artifactType: payload.artifact_type,
+    title: payload.title,
+    promoted: payload.promoted,
+    lineage: payload.lineage,
   };
 }
 

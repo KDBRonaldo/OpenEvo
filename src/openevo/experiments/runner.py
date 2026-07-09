@@ -108,6 +108,7 @@ def run_experiment(
     task_ids: Sequence[str] | None = None,
     rounds_override: int | None = None,
     output_dir: Path | None = None,
+    artifact_root: Path | None = None,
     rollout_client: RolloutClientProtocol | None = None,
     evolution_client: EvolutionClientProtocol | None = None,
     worker_runner: WorkerRunner | None = None,
@@ -131,7 +132,7 @@ def run_experiment(
         if output_dir is not None
         else Path(".openevo") / "runs" / _safe_path_component(compiled.experiment_id) / run_id
     )
-    artifact_root = output_root / "artifacts"
+    artifact_root = artifact_root if artifact_root is not None else output_root / "artifacts"
     output_root.mkdir(parents=True, exist_ok=True)
 
     owns_rollout = rollout_client is None

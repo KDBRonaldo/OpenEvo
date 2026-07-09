@@ -167,22 +167,25 @@ sidecar endpoints:
   Face model snapshot.
 - `POST /openevo-api/desktop/services` writes a deterministic topology file
   under the bootstrap state root, then starts and health-checks the remote
-  evolution backend, rollout, gateway, evolution worker, and managed vLLM when
-  the execution mode requires local inference.
+  OpenEvo Core backend (`openevo_backend` on port `8765`), evolution backend,
+  rollout, gateway, evolution worker, and managed vLLM when the execution mode
+  requires local inference. When the service report is ready, the sidecar opens
+  a session-scoped SSH local-forward to the remote Core backend so the Desktop
+  facade can serve timeline, artifact, and service-log reads.
+  `openevo_backend` receives the same bootstrap `state_root`, so its typed
+  facade reads canonical `<state_root>/runs/<run-id>/summary.json` files and
+  `<state_root>/evolution/` artifacts produced by the Core run command.
 - `POST /openevo-api/desktop/run` launches `openevo-backend run` only after
   workspace, bootstrap, and services are all ready.
-- `GET /openevo-api/desktop/run/artifacts` reads the latest terminal remote
-  run's `summary.json` and returns a compact task/round/job artifact summary.
-- `GET /openevo-api/desktop/artifacts/{artifact_id}/content` reads one
-  human-readable text artifact from that latest terminal run summary. It
-  requires the sidecar mutation token and an active config-backed session. The
-  sidecar first confirms the artifact id appears in the latest run summary, then
-  reads artifact metadata from the remote evolution backend registry. It supports
-  `file://` artifact URIs, accepts only relative in-artifact content paths, and
-  returns markdown/text content for `text_memory`, `skill_bundle`, and
-  `agent_system`. It rejects non-file URI schemes, path traversal, active runs,
-  missing runs, unknown registry artifacts, and unsupported binary artifacts
-  instead of accepting arbitrary request-supplied file paths.
+- `GET /openevo-api/backend/runs/{run_id}/timeline` and
+  `GET /openevo-api/backend/runs/{run_id}/artifacts` forward typed timeline and
+  artifact summary reads to the remote OpenEvo Core Backend through the local
+  sidecar facade.
+- `GET /openevo-api/backend/artifacts/{artifact_id}/content` and
+  `GET /openevo-api/backend/artifacts/{artifact_id}/diff` forward promoted
+  artifact preview reads to the remote backend. These facade routes require the
+  sidecar mutation token, preserve typed backend errors, and do not parse remote
+  `summary.json` or define a second artifact registry in the sidecar.
 
 The service supervisor is intentionally command based. It exports the remote
 profile proxy/PIP/Hugging Face environment for the full remote command script,
@@ -192,8 +195,8 @@ startup gets a longer readiness window and verifies that `/v1/models` contains
 the configured Hugging Face model id. Service reports redact proxy, pip index,
 and URL userinfo credentials before returning stdout, stderr, or exception text
 to Desktop. It is not a Docker Compose replacement and does not provide
-restart-on-crash, process-group cancellation, tunnel management, GPU sizing, or
-dynamic adapter lifecycle.
+restart-on-crash, process-group cancellation, persistent tunnel monitoring or
+reconnect, GPU sizing, or dynamic adapter lifecycle.
 
 ## Limitations
 

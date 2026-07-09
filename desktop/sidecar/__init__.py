@@ -18,6 +18,11 @@ from desktop.sidecar.api import (
     create_sidecar_app_for_project,
     default_desktop_shell_status,
 )
+from desktop.sidecar.backend_client import (
+    BackendClient,
+    BackendConnection,
+    DesktopBackendError,
+)
 from desktop.sidecar.config import (
     DesktopProjectConfigDraft,
     DesktopProjectConfigPaths,
@@ -46,6 +51,9 @@ from openevo.deployment.workspace import (
 
 __all__ = [
     "DesktopExecutionStatus",
+    "BackendClient",
+    "BackendConnection",
+    "DesktopBackendError",
     "DesktopProjectConfigDraft",
     "DesktopProjectConfigPaths",
     "DesktopProjectConfigSummary",
