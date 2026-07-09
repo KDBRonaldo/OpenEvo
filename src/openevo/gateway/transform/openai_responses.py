@@ -978,7 +978,7 @@ class OpenAIResponsesTransformer(BaseTransformer):
                 )
                 continue
 
-            # Drop server-side tool types Polar can't dispatch (web_search,
+            # Drop server-side tool types OpenEvo can't dispatch (web_search,
             # file_search, computer_use, mcp, code_interpreter, image_generation,
             # custom, etc.). Only client-side functions/shell are convertible.
             if tool_type and tool_type != "function":

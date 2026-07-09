@@ -48,7 +48,7 @@ class RemoteDaemonLaunchSpec(_StrictFrozenModel):
     kind: Literal[
         "openevo_backend",
         "vllm",
-        "polar_gateway",
+        "openevo_gateway",
         "rollout_server",
         "evolution_worker",
         "custom",

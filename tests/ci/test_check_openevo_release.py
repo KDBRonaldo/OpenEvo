@@ -266,7 +266,7 @@ def test_release_smoke_workflow_builds_packaged_assets_and_validates_wheel() -> 
     assert "diff -qr desktop/dist desktop/packaging/web" in text
     assert '"src/slime_bridge/**"' in text
     assert '"desktop/**"' in text
-    assert '"tests/ci/**"' in text
+    assert '"tests/**"' in text
     assert "python -m pip install --upgrade pip pytest -e ." in text
     assert "tests/ci/test_check_openevo_release.py" in text
     assert "name: Build remote install wheel" in text

@@ -1,0 +1,71 @@
+# SWE-Gym Slime GRPO
+
+End-to-end **training** example: train **Qwen3.5-4B** with async **GRPO** on
+**SWE-Gym** tasks, using **OpenEvo Core** for agent rollouts and **Slime** for
+training.
+Targets a single node with 8× B200 (2 GPUs train, 6 serve).
+
+> Unlike the rollout demos (calculator / count_stars / swebench_verified), this
+> path serves the model with **SGLang**: Slime owns the inference engines and
+> syncs the freshly trained weights into them every step (GPU-to-GPU NCCL).
+
+## Prerequisites
+
+Install OpenEvo and SGLang per [OpenEvo development setup](../../../README.md#development-setup).
+
+Make sure to install OpenEvo's optional swebench dependency for evaluation.
+```
+uv pip install -e ".[swebench]"
+```
+
+## Quick Start
+
+Log into wandb and one command sets everything up and starts training:
+
+```bash
+export WANDB_API_KEY=<your-key>
+bash examples/research-benchmarks/swegym_slime_grpo/launch_e2e.sh
+```
+
+It clones Slime + Megatron-LM, installs the training-stack extras (Transformer
+Engine; Flash Linear Attention; flash-attn on B200), applies the Slime/SGLang
+patches, builds the
+293-task SWE-Gym JSONL, pulls the Apptainer images + shared agent CLIs, converts
+the Qwen weights to torch_dist, then hands off to `run.sh` (OpenEvo services + Ray + the Slime training job).
+
+## (Optional) Inspect rollouts
+
+While training runs, inspect the rollout and gateway logs, or query the rollout
+health endpoint from the repo root:
+
+```bash
+curl http://127.0.0.1:8080/health
+```
+
+`tmp/swegym_slime_grpo/topology.yaml` is the rendered topology that `run.sh`
+writes at launch.
+
+## Files
+
+| File | Purpose |
+|---|---|
+| `launch_e2e.sh` | One-shot entry: setup + run |
+| `run.sh` | Launches OpenEvo services + Ray + Slime training job |
+| `convert_weights.sh` | HF checkpoint → Megatron torch_dist |
+| `model_args.sh` | Qwen3.5-4B Megatron args, shared by `run.sh` + `convert_weights.sh` |
+| `topology.yaml` | OpenEvo topology template (`${SGLANG_ROUTER_BASE_URL}` filled at runtime) |
+| `openevo_bridge_config.yaml` | OpenEvo bridge config template (`${AGENT_CLI_DIR}`, `${APPTAINER_IMAGE_DIR}` filled at runtime) |
+| `prepare_data.py` | Builds `swegym_train_293.jsonl` |
+| `prepare_apptainer_images.py` | Pulls per-task SIF images, builds shared Node + agent CLI dir |
+| `sample_tasks.py` | Dataset helpers (HF fetch, registry image lookup) |
+
+## Common knobs
+
+| What you want to tune | Where |
+|---|---|
+| Train/rollout GPU split, batch size, KL coef, LR | `run.sh` (env vars near top + Slime args at bottom) |
+| Which agent harness (qwen_code / claude_code / codex / opencode / pi) | `openevo_bridge_config.yaml` → `agent.harness` |
+| Per-task timeout, async level, callback host | `openevo_bridge_config.yaml` → adapter config fields |
+| Gateway/rollout host & port, model served | `topology.yaml` |
+| Which SWE-Gym dataset / split | `sample_tasks.py` → `DATASET_NAME`, `DATASET_SPLITS` |
+| Model architecture args (don't change unless swapping models) | `model_args.sh` |

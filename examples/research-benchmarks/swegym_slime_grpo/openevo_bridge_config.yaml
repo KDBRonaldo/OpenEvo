@@ -1,0 +1,98 @@
+# OpenEvo bridge configuration for Slime's --custom-config-path.
+# These become attributes on the `args` namespace passed to the rollout function.
+
+openevo_rollout_url: "http://127.0.0.1:8080"
+openevo_gateway_url: "http://127.0.0.1:8100"
+openevo_reward_key: "score"
+openevo_max_async_level: 2
+openevo_request_timeout: 2400
+openevo_callback_host: "127.0.0.1"
+openevo_min_complete_accept_fraction: 0.6
+openevo_allow_weight_update_overlap: false
+openevo_weight_update_pause_timeout: 300
+# Filled by run.sh via envsubst — absolute host paths to assets prepared by
+# prepare_apptainer_images.py. The container mounts and image lookups below
+# reference these through {args.openevo_agent_cli_dir} / {args.openevo_apptainer_image_dir}.
+openevo_agent_cli_dir: ${AGENT_CLI_DIR}
+openevo_apptainer_image_dir: ${APPTAINER_IMAGE_DIR}
+
+# Task template rendered per sample group.  Placeholders are filled
+# from the context: {instruction}, {num_samples}, {sample.*}, {args.*}.
+openevo_task_template:
+  timeout_seconds: 2400
+  runtime:
+    backend: "apptainer"
+    # Use project-local SIF files prepared from the official SWE-Gym registry
+    # images.
+    image: "{args.openevo_apptainer_image_dir}/{sample.metadata.instance_id}.sif"
+    network: "host"
+    workdir: "/openevo/session/workspace"
+    env:
+      HOME: "/openevo/session/home"
+      PATH: "/openevo/session/home/.venv/bin:/opt/node/bin:/opt/miniconda3/envs/testbed/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    kwargs:
+      volumes:
+        - "{args.openevo_agent_cli_dir}:/opt/node:ro"
+    # Node 22 + agent CLIs are mounted from the configured agent CLI dir; no npm install
+    # at session start.
+    prepare:
+      - type: exec
+        command: >-
+          rm -rf /openevo/session/workspace &&
+          mkdir -p /openevo/session/logs/agent /openevo/session/workspace "$HOME/.venv/bin" &&
+          cp -a /testbed/. /openevo/session/workspace/ &&
+          ln -sf /opt/miniconda3/envs/testbed/bin/python "$HOME/.venv/bin/python" &&
+          ln -sf /opt/miniconda3/envs/testbed/bin/python "$HOME/.venv/bin/python3" &&
+          git config --global core.pager '' &&
+          cd /openevo/session/workspace &&
+          (git reset --hard || true)
+    # Fresh reward-test runtime applies the patch and runs swebench tests.
+    eval_prepare:
+      - type: exec
+        command: >-
+          mkdir -p /openevo/session/logs/agent "$HOME/.venv/bin" &&
+          ln -sf /opt/miniconda3/envs/testbed/bin/python "$HOME/.venv/bin/python" &&
+          ln -sf /opt/miniconda3/envs/testbed/bin/python "$HOME/.venv/bin/python3" &&
+          git config --global core.pager ''
+  agent:
+    harness: "codex"
+    model_name: "gpt-5.4"
+  builder:
+    strategy: "prefix_merging"
+  evaluator:
+    strategy: "swebench_harness"
+    refresh_runtime: true
+    config:
+      repo_dir: "/testbed"
+      patch_command: "cd /openevo/session/workspace && git add -A && git diff --cached --binary"
+      instance: "{sample.metadata.instance}"
+      # Strip per-harness config/session dirs and common stray artifacts that
+      # would otherwise get swept into `git add -A` and bloat the patch.
+      exclude_patterns:
+        - "trajectories/**"
+        - "**/trajectories/**"
+        - "node_modules/**"
+        - "**/node_modules/**"
+        - ".cache/**"
+        - "**/.cache/**"
+        - ".venv/**"
+        - "**/.venv/**"
+        - ".claude/**"
+        - "**/.claude/**"
+        - ".codex/**"
+        - "**/.codex/**"
+        - ".gemini/**"
+        - "**/.gemini/**"
+        - ".opencode/**"
+        - "**/.opencode/**"
+        - ".config/opencode/**"
+        - ".pi/**"
+        - "**/.pi/**"
+        - ".qwen/**"
+        - "**/.qwen/**"
+        # Guard against the historical claude_code $HOME-literal env bug
+        # (now fixed, but old workspaces may still carry these dirs).
+        - "$HOME/**"
+        - "**/$HOME/**"
+
+openevo_task_id_template: "openevo-swegym-grpo-{rollout_id}-{sample.group_index}"

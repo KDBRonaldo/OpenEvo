@@ -15,7 +15,7 @@ _HERMES_HOME = "/tmp/hermes"
 # A user-defined provider pins the OpenAI-compatible transport + gateway base
 # URL explicitly. Hermes' built-in providers and `provider: auto` route by
 # models.dev heuristics (and can mis-detect the model vendor), so we bypass them.
-_PROVIDER = "polar"
+_PROVIDER = "openevo"
 # Substituted with $OPENAI_BASE_URL at exec time (the gateway env is only
 # present during run steps, not setup), keeping the config static.
 _BASE_URL_PLACEHOLDER = "__OPENEVO_GATEWAY_BASE_URL__"
@@ -24,7 +24,7 @@ _BASE_URL_PLACEHOLDER = "__OPENEVO_GATEWAY_BASE_URL__"
 class HermesHarness(BaseHarness):
     """Run NousResearch's Hermes agent non-interactively (``hermes chat -q``).
 
-    Routes through a user-defined ``providers.polar`` entry whose ``base_url`` is
+    Routes through a user-defined ``providers.openevo`` entry whose ``base_url`` is
     the gateway proxy and whose ``key_env`` is ``OPENAI_API_KEY`` (injected by the
     gateway as the session id), forcing the ``openai_chat`` wire format.
     """

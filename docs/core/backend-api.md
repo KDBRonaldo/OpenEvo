@@ -1,7 +1,5 @@
 # OpenEvo Core Backend API
 
-Tracked by #121.
-
 `openevo-backend serve` starts the remote Core Backend HTTP API that OpenEvo
 Desktop reaches through a sidecar-managed SSH tunnel. Desktop uses this API for
 typed backend status, timeline, log, artifact-summary, content, and diff reads.

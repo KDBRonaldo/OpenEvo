@@ -8,7 +8,7 @@ result back.
 
 ## Mental model
 
-The agent never knows Polar is in the middle. Before running it, the gateway
+The agent never knows OpenEvo is in the middle. Before running it, the gateway
 injects proxy endpoints as environment variables — `OPENAI_BASE_URL`,
 `ANTHROPIC_BASE_URL`, `GOOGLE_API_URL`, with the **API key set to the session
 id**. The agent thinks it's calling OpenAI/Anthropic/Google, but every request

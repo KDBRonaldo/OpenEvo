@@ -1,4 +1,4 @@
-"""Load and validate a single Polar topology file."""
+"""Load and validate a single OpenEvo topology file."""
 
 from __future__ import annotations
 

@@ -21,7 +21,7 @@ uv run python -m openevo.evolution.cli serve --host 127.0.0.1 --port 8200
 默认情况下，backend 状态保存在 `.openevo/evolution/` 下。
 
 初始化已有本地 state 时，store 会把历史 session-completed event identity
-canonicalize 为 `openevo.session_completed`，并把旧 `source="polar"` 行迁移为
+canonicalize 为 `openevo.session_completed`，并把旧 event source 行迁移为
 `source="openevo"`。新 producers 和新文档只应使用 OpenEvo identity。
 
 核心 APIs：
@@ -82,9 +82,9 @@ uv run python -m openevo.evolution.cli worker --base-url http://127.0.0.1:8200 -
 
 ## Terminal Bench 离线 transcript bridge
 
-Terminal Bench 可以继续由 Harbor/EvoLab 和官方 verifier 执行。若只想让 Polar
+Terminal Bench 可以继续由 Harbor/EvoLab 和官方 verifier 执行。若只想让 OpenEvo
 负责后续 skill、memory 或 agent-system evolution，可先把 Harbor/EvoLab 的 trial
-或 job 目录转换成 Polar event JSONL：
+或 job 目录转换成 OpenEvo event JSONL：
 
 ### Per-task Terminal Bench evolution
 
@@ -215,12 +215,12 @@ uv run python -m openevo.evolution.cli terminal-bench-events \
 ```sh
 uv run python -m openevo.evolution.cli terminal-bench-dataset \
   --input /tmp/evolab-tb21-run/<job-or-trial-dir> \
-  --db /tmp/polar-tb21/evolution.db \
-  --artifact-root /tmp/polar-tb21/artifacts \
+  --db /tmp/openevo-tb21/evolution.db \
+  --artifact-root /tmp/openevo-tb21/artifacts \
   --name tb21_round0 \
   --purpose agent_system_reflection \
   --policy-version tb21-round0 \
-  --output /tmp/polar-tb21/dataset.json
+  --output /tmp/openevo-tb21/dataset.json
 ```
 
 如果目标是 agent-system-only evolution，可以直接创建 audited reflector job：
@@ -228,14 +228,14 @@ uv run python -m openevo.evolution.cli terminal-bench-dataset \
 ```sh
 uv run python -m openevo.evolution.cli terminal-bench-agent-system-job \
   --input /tmp/evolab-tb21-run/<job-or-trial-dir> \
-  --db /tmp/polar-tb21/evolution.db \
-  --artifact-root /tmp/polar-tb21/artifacts \
+  --db /tmp/openevo-tb21/evolution.db \
+  --artifact-root /tmp/openevo-tb21/artifacts \
   --dataset-name tb21_round0 \
   --policy-version tb21-round0 \
   --reflector-provider codex_cli \
   --reflector-model gpt-5.4 \
   --codex-home /path/to/codex-home \
-  --output /tmp/polar-tb21/agent-system-job.json
+  --output /tmp/openevo-tb21/agent-system-job.json
 ```
 
 该命令会 ingest Terminal Bench events、创建 dataset artifact，并创建一个
@@ -246,8 +246,8 @@ uv run python -m openevo.evolution.cli terminal-bench-agent-system-job \
 
 ```sh
 uv run python -m openevo.evolution.cli terminal-bench-agent-system-job \
-  --db /tmp/polar-tb21/evolution.db \
-  --artifact-root /tmp/polar-tb21/artifacts \
+  --db /tmp/openevo-tb21/evolution.db \
+  --artifact-root /tmp/openevo-tb21/artifacts \
   --dataset-artifact-id art_round1 \
   --dataset-artifact-id art_round2 \
   --reflector-model gpt-5.4
@@ -258,15 +258,15 @@ uv run python -m openevo.evolution.cli terminal-bench-agent-system-job \
 ```sh
 uv run python -m openevo.evolution.cli terminal-bench-text-memory-job \
   --input /tmp/evolab-tb21-run/<job-or-trial-dir> \
-  --db /tmp/polar-tb21/evolution.db \
-  --artifact-root /tmp/polar-tb21/artifacts \
+  --db /tmp/openevo-tb21/evolution.db \
+  --artifact-root /tmp/openevo-tb21/artifacts \
   --dataset-name tb21_memory_round0 \
   --policy-version tb21-memory-round0 \
   --method text_memory_expel_reflector \
   --reflector-provider codex_cli \
   --reflector-model gpt-5.5 \
   --codex-home /path/to/codex-home \
-  --output /tmp/polar-tb21/text-memory-job.json
+  --output /tmp/openevo-tb21/text-memory-job.json
 ```
 
 该命令同样只消费 transcript dataset，不要求 token-level logprobs，并且默认纳入
@@ -279,8 +279,8 @@ artifact 仍只适用于 proxy/local inference。
 
 ```sh
 uv run python -m openevo.evolution.cli terminal-bench-agent-system-job \
-  --db /tmp/polar-tb21/evolution.db \
-  --artifact-root /tmp/polar-tb21/artifacts \
+  --db /tmp/openevo-tb21/evolution.db \
+  --artifact-root /tmp/openevo-tb21/artifacts \
   --dataset-artifact-id art_round1 \
   --dataset-artifact-id art_round2 \
   --dataset-artifact-id art_round3 \

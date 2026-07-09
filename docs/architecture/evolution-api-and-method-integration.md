@@ -2,8 +2,8 @@
 
 本文说明当前 skill/memory/agent-system/parametric-memory evolution 的 API contract，
 以及如何把新的 SOTA 方法或 research 方法接入 OpenEvo Core evolution backend。
-OpenEvo Dev Kit 的开发者、benchmark adapter 和测试工作流边界见
-[OpenEvo Dev Kit](openevo-dev-kit.md)。
+开发者、benchmark adapter 和测试工作流边界见
+[OpenEvo Core Developer Workflows](core-developer-workflows.md)。
 
 ## 总体数据流
 
@@ -63,8 +63,8 @@ uv run python -m openevo.evolution.cli terminal-bench-events \
 ```sh
 uv run python -m openevo.evolution.cli terminal-bench-dataset \
   --input /tmp/evolab-tb21-run/<job-or-trial-dir> \
-  --db /tmp/polar-tb21/evolution.db \
-  --artifact-root /tmp/polar-tb21/artifacts \
+  --db /tmp/openevo-tb21/evolution.db \
+  --artifact-root /tmp/openevo-tb21/artifacts \
   --name tb21_round0 \
   --purpose agent_system_reflection \
   --policy-version tb21-round0
@@ -75,8 +75,8 @@ uv run python -m openevo.evolution.cli terminal-bench-dataset \
 ```sh
 uv run python -m openevo.evolution.cli terminal-bench-agent-system-job \
   --input /tmp/evolab-tb21-run/<job-or-trial-dir> \
-  --db /tmp/polar-tb21/evolution.db \
-  --artifact-root /tmp/polar-tb21/artifacts \
+  --db /tmp/openevo-tb21/evolution.db \
+  --artifact-root /tmp/openevo-tb21/artifacts \
   --dataset-name tb21_round0 \
   --policy-version tb21-round0 \
   --reflector-provider codex_cli \
@@ -142,7 +142,7 @@ trial name、task instruction、task path 和 verifier failed-test 摘要会作�
 
 ## OpenEvo Core capability metadata
 
-Desktop 和 Dev Kit 不应硬编码 method table。内置 evolution method 的可发现信息由
+Desktop 和 developer workflow utilities 不应硬编码 method table。内置 evolution method 的可发现信息由
 `openevo.capabilities` 暴露：
 
 - `build_core_capabilities()` 返回 frozen Pydantic `CoreCapabilities`，包含 execution modes、
@@ -150,7 +150,7 @@ Desktop 和 Dev Kit 不应硬编码 method table。内置 evolution method 的�
 - `method_metadata_by_id()` 返回 `dict[str, EvolutionMethodCapability]`，key 与
   `openevo.evolution.methods.METHOD_REGISTRY` 的 method ID 一致。
 - `openevo.evolution.methods.METHOD_METADATA` 是内置 worker method 的 metadata 源；每个
-  `METHOD_REGISTRY` key 都必须有对应 metadata，避免 UI 或 Dev Kit 维护第二份方法表。
+  `METHOD_REGISTRY` key 都必须有对应 metadata，避免 UI 或开发者工具维护第二份方法表。
 
 当前 Core execution modes 是：
 
@@ -165,7 +165,7 @@ Desktop 和 Dev Kit 不应硬编码 method table。内置 evolution method 的�
 | `text_memory` | yes | 自然语言长期记忆 |
 | `skill_bundle` | yes | harness 可加载 skill bundle |
 | `agent_system` | yes | agent system prompt 或 instruction 文件 |
-| `parametric_memory` | no | LoRA/adapter 等参数化记忆；Dev Kit 可发现，Desktop 暂不展示 |
+| `parametric_memory` | no | LoRA/adapter 等参数化记忆；开发者工作流可发现，Desktop 暂不展示 |
 
 Method metadata contract：
 
@@ -192,28 +192,28 @@ Method metadata contract：
 
 - `ordinary_user`：可面向普通用户展示；Desktop 只应展示同时满足
   `visible_in_desktop=true` 的方法。
-- `dev_kit`：Dev Kit 和研究/调试界面可发现；Desktop 默认隐藏。
+- `dev_kit`：开发者、研究和调试工作流可发现；Desktop 默认隐藏。
 - `internal`：内部 plumbing 或暂不面向产品 surface 的方法。
 
 `input_requirements` 描述 method 运行前需要调用方准备的输入类别，例如 dataset reflector
 方法声明 `["dataset"]`，adapter 注册类 parametric method 声明 `["adapter"]`，纯 config/manual
-注册方法声明空列表。`default_config` 提供 UI 或 Dev Kit 创建 job 时可预填的 method config；
+注册方法声明空列表。`default_config` 提供 UI 或开发者工具创建 job 时可预填的 method config；
 例如 agent-system 产物默认写入 `{"target_path": "AGENTS.md"}`。`config_schema` 描述可编辑
 config 的 JSON schema，当前内置 baseline 至少提供 object schema，后续可逐步收紧。
 
 普通用户可见的非参数化 reflector 方法必须同时支持
 `codex_subscription_transcript` 和 `self-deployed`，这样 Desktop 可以在订阅 transcript
 模式和自部署模式之间复用同一组 memory/skill/agent-system evolution 选项。实验方法、
-history/pareto/GEPA 变体和 parametric-memory 方法保持 Dev Kit 可发现，但默认不进入
+history/pareto/GEPA 变体和 parametric-memory 方法保持开发者工作流可发现，但默认不进入
 Desktop method picker。
 
-Dev Kit 可以检查 broader method set，包括 `ordinary_user`、`dev_kit` 和内部调试方法。
-但 Dev Kit 仍然消费同一份 `METHOD_REGISTRY` / `METHOD_METADATA` / Core capabilities
+开发者工具可以检查 broader method set，包括 `ordinary_user`、`dev_kit` 和内部调试方法。
+但这些工具仍然消费同一份 `METHOD_REGISTRY` / `METHOD_METADATA` / Core capabilities
 contract，不能维护第二套 method registry。
 
-## Dev Kit benchmark adapter contract
+## Benchmark Adapter Contract
 
-Benchmark adapter 属于 OpenEvo Dev Kit，而不是 Desktop。Adapter 的职责是把外部 benchmark
+Benchmark adapter 属于 Core developer workflows，而不是 Desktop。Adapter 的职责是把外部 benchmark
 task、transcript、score、artifact 和 protected metadata 转换为 OpenEvo Core 可消费的
 records、datasets、metrics、jobs、artifacts 和 context inputs。
 
@@ -221,8 +221,8 @@ Benchmark adapter 必须复用 Core dataset/job/artifact/context contract，不�
 evolution backend、method registry、artifact type system、context resolver 或 promotion
 路径。如果 benchmark 需要新算法，应按上面的 method metadata lifecycle 接入
 `METHOD_REGISTRY` 和 `METHOD_METADATA`；如果需要新输出形态，优先使用 typed Core artifact
-和 manifest 表达。更多 Dev Kit 边界见
-[OpenEvo Dev Kit](openevo-dev-kit.md)。
+和 manifest 表达。更多开发者工作流边界见
+[OpenEvo Core Developer Workflows](core-developer-workflows.md)。
 
 ## Artifact Register Contract
 
@@ -819,7 +819,7 @@ METHOD_REGISTRY["my_memory_method"] = my_memory_method
    `method_id` 都必须等于 `METHOD_REGISTRY` key，至少说明 `method_id`、`display_name`、
    `description`、`artifact_type`、`visibility`、`visible_in_desktop`、`input_requirements`、
    `supported_execution_modes`、`default_config`、`config_schema` 和 `stability_level`。
-   Desktop/Dev Kit 会通过
+   Desktop 或开发者工具会通过
    `openevo.capabilities` 读取这份 metadata，不应再硬编码 method table。
 
 4. 创建 job 时设置：

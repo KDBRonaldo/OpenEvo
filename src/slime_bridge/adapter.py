@@ -1,4 +1,4 @@
-"""Convert Polar rollout results into Slime samples.
+"""Convert OpenEvo rollout results into Slime samples.
 
 Every trace in ``Trajectory.traces`` becomes one Slime ``Sample``.  All
 samples produced from the same session share the same ``Sample.index``
@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 
 class RolloutLogprobError(ValueError):
-    """Raised when a trainable Polar trace lacks aligned rollout logprobs."""
+    """Raised when a trainable OpenEvo trace lacks aligned rollout logprobs."""
 
 
 def session_result_to_samples(
@@ -36,7 +36,7 @@ def session_result_to_samples(
     reward_key: str = "score",
     max_tokens: int | None = None,
 ) -> list[Any]:
-    """Convert one Polar session result into Slime samples — one per trace.
+    """Convert one OpenEvo session result into Slime samples, one per trace.
 
     Every usable trace becomes an independent Sample sharing the same
     ``(group_index, index)`` key. Slime's reward post-processor collapses
@@ -188,7 +188,7 @@ def _build_dummy_sample(
 
     This carries no policy, TIS, or KL contribution. It lets the scheduler
     accept a partially usable group while still surfacing empty sessions in
-    Polar metrics.
+    OpenEvo bridge metrics.
     """
     polar_metadata: dict[str, Any] = {
         "node_id": result.node_id,
@@ -316,7 +316,7 @@ def _load_sample_type() -> Any:
         from slime.utils.types import Sample
     except ImportError as exc:
         raise ImportError(
-            "Slime is required to convert Polar rollouts into training samples. "
+            "Slime is required to convert OpenEvo rollouts into training samples. "
             "Ensure the Slime package is installed in the current environment."
         ) from exc
     return Sample

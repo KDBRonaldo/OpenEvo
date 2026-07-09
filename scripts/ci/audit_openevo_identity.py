@@ -19,6 +19,10 @@ TEXT_SUFFIXES = {
     ".rs",
     ".sh",
 }
+TEXT_FILENAMES = {
+    "Dockerfile",
+    "Containerfile",
+}
 MARKERS = (
     "src/" + "polar",
     "src/" + "polar" + "_evolution",
@@ -29,8 +33,20 @@ MARKERS = (
     "uv run " + "polar",
     "polar serve_",
     "polar dashboard",
+    '"polar' + '_gateway"',
     "from polar",
     "import polar",
+)
+PATH_MARKERS = (
+    "README.polar.md",
+    "assets/polar",
+    "docs/superpowers",
+    "docs/report",
+    "polar_config.yaml",
+    "polar-system-overview",
+    "openevo-dev-kit",
+    "slime_polar_async",
+    "polar_stars",
 )
 ACTIVE_PREFIXES = (
     "src/",
@@ -40,13 +56,15 @@ ACTIVE_PREFIXES = (
     "desktop/",
     "web/",
     "docs/architecture/",
+    "docs/user/",
+    "docs/maintainer/",
     "README.md",
     "AGENTS.md",
 )
 ARCHIVED_PREFIXES = (
-    "docs/superpowers/",
+    "docs/maintainer/development-history/",
+    "docs/maintainer/productization/",
     "docs/dev/",
-    "README.polar.md",
 )
 IGNORED_PATHS = {
     "scripts/ci/audit_openevo_identity.py",
@@ -54,9 +72,9 @@ IGNORED_PATHS = {
 }
 
 
-def _tracked_text_files() -> list[Path]:
+def _tracked_files() -> list[Path]:
     result = subprocess.run(
-        ["git", "ls-files", "-z"],
+        ["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
         check=True,
         cwd=REPO_ROOT,
         stdout=subprocess.PIPE,
@@ -66,20 +84,34 @@ def _tracked_text_files() -> list[Path]:
         if not raw_path:
             continue
         path = REPO_ROOT / raw_path
-        if not path.is_file() or path.suffix not in TEXT_SUFFIXES:
+        if not path.is_file():
             continue
         files.append(path)
     return sorted(files)
+
+
+def _is_text_scan_file(path: Path) -> bool:
+    return path.suffix in TEXT_SUFFIXES or path.name in TEXT_FILENAMES
 
 
 def audit() -> dict[str, object]:
     matches: list[dict[str, str]] = []
     active_matches: list[dict[str, str]] = []
     archived_matches: list[dict[str, str]] = []
-    for path in _tracked_text_files():
+    for path in _tracked_files():
         relative = path.relative_to(REPO_ROOT)
         relative_text = str(relative)
         if relative_text in IGNORED_PATHS:
+            continue
+        for marker in PATH_MARKERS:
+            if marker in relative_text:
+                match = {"path": str(relative), "marker": marker}
+                matches.append(match)
+                if relative_text.startswith(ARCHIVED_PREFIXES):
+                    archived_matches.append(match)
+                elif relative_text.startswith(ACTIVE_PREFIXES):
+                    active_matches.append(match)
+        if not _is_text_scan_file(path):
             continue
         text = path.read_text(encoding="utf-8", errors="ignore")
         for marker in MARKERS:
@@ -110,6 +142,13 @@ def main() -> int:
     report = audit()
     json.dump(report, sys.stdout, indent=2, sort_keys=True)
     sys.stdout.write("\n")
+    if (
+        report["src_polar_exists"]
+        or report["src_legacy_evolution_exists"]
+        or report["web_exists"]
+        or report["active_matches"]
+    ):
+        return 1
     return 0
 
 

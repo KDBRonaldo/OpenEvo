@@ -46,7 +46,7 @@ def normalize_auth_mode(
 
 
 def command_with_unset_proxy_env(command: str) -> str:
-    """Run a command with Polar proxy environment variables removed."""
+    """Run a command with OpenEvo proxy environment variables removed."""
 
     unset_flags = " ".join(f"-u {key}" for key in SUBSCRIPTION_PROXY_ENV_VARS)
     return f"env {unset_flags} {command}"

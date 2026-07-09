@@ -14,7 +14,7 @@ Builders convert a captured `CompletionSession` into a `Trajectory` of trainable
 
 ## `agent_transcript`
 
-`agent_transcript` 是不经过 Polar proxy 的 harness run 的 fallback builder。Gateway
+`agent_transcript` 是不经过 OpenEvo proxy 的 harness run 的 fallback builder。Gateway
 只有在 `agent.settings.capture_mode="transcript"` 或等价 transcript capture mode
 开启、且没有 proxy completions 时才会选择它。它读取
 `agent_result.metadata.log_dir` 和 `last_step`，加载 `step.xx.stdout.log`，并生成一个

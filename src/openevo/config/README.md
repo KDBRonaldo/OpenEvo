@@ -1,9 +1,9 @@
 # Configuration
 
 `openevo.config` loads and validates the single `topology.yaml` that describes a
-whole Polar deployment: one **rollout** server plus one or more **gateway**
-nodes (each with its own inference backend). `TopologyConfig.load()` is the entry
-point every `polar` command uses.
+Core Backend deployment: one **rollout** server plus one or more **gateway**
+nodes, each with its own inference backend. `TopologyConfig.load()` is the entry
+point used by backend launchers and service supervisors.
 
 ## Mental model
 

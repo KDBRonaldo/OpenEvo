@@ -53,7 +53,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     parser.add_argument("--train-gpus", default="0,1,2,3", help="comma-separated trainer GPU ids")
     parser.add_argument("--rollout-gpus", default="4,5,6,7", help="comma-separated rollout GPU ids")
-    parser.add_argument("--wandb-project", default=os.environ.get("WANDB_PROJECT", "polar-swegym-grpo"))
+    parser.add_argument(
+        "--wandb-project",
+        default=os.environ.get("WANDB_PROJECT", "openevo-swegym-grpo"),
+    )
     parser.add_argument("--wandb-entity", default=os.environ.get("WANDB_ENTITY", ""))
     parser.add_argument("--wandb-run-id", default=os.environ.get("WANDB_RUN_ID", ""))
     parser.add_argument("--wandb-dir", default=str(ROOT / "logs"))

@@ -1,4 +1,4 @@
-"""Shared configuration helpers for Polar."""
+"""Shared configuration helpers for OpenEvo."""
 
 from openevo.config.topology import (
     EvolutionConfig,

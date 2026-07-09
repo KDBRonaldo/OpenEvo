@@ -11,7 +11,7 @@ from openevo.runtime.models import ExecInput
 
 
 class PiHarness(BaseHarness):
-    """Run the pi coding agent CLI against the Polar gateway.
+    """Run the pi coding agent CLI against the OpenEvo gateway.
 
     pi bakes provider base URLs into its model registry — there is no
     ``OPENAI_BASE_URL`` equivalent — so we drop a ``models.json`` into pi's

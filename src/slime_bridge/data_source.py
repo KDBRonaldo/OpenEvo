@@ -1,4 +1,4 @@
-"""Slime data-source wrappers used by Polar examples."""
+"""Slime data-source wrappers used by OpenEvo examples."""
 
 from __future__ import annotations
 

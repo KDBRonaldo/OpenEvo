@@ -1,10 +1,10 @@
-"""Inference backend strategies for the Polar gateway.
+"""Inference backend strategies for the OpenEvo gateway.
 
 The gateway speaks the OpenAI Chat Completions API to a local inference server.
 Two backends are supported, and they differ only in:
 
   1. the request params that make them emit the token ids + per-token logprobs
-     Polar needs for training, and
+     OpenEvo needs for training, and
   2. the exact shape of those fields in the response.
 
 The base implements the canonical contract -- request ``logprobs`` (the one
@@ -65,7 +65,7 @@ class InferenceEngine(ABC):
 
 
 class SGLangEngine(InferenceEngine):
-    """Canonical backend: it emits Polar's training shape with no per-request or
+    """Canonical backend: it emits OpenEvo's training shape with no per-request or
     response adaptation here -- so it inherits the base hooks unchanged. The one
     thing SGLang lacks natively is token-id *output* (no request flag exists for
     it); ``scripts/patch/patch_sglang.sh`` adds that on the response side.
@@ -114,7 +114,7 @@ class VLLMEngine(InferenceEngine):
         request = super().prepare_request(request)  # logprobs=True
         request["return_token_ids"] = True
         request.setdefault("top_logprobs", 0)
-        # vLLM reads input reasoning from `reasoning`, not Polar's canonical
+        # vLLM reads input reasoning from `reasoning`, not OpenEvo's canonical
         # `reasoning_content`; rename it so prior turns' interleaved thinking
         # survives templating (else they render an empty `<think></think>`).
         for message in request.get("messages") or []:
@@ -135,7 +135,7 @@ class VLLMEngine(InferenceEngine):
 
     @staticmethod
     def _canonicalize_reasoning(message: Any) -> None:
-        """vLLM names the field ``reasoning``; Polar's canonical field is ``reasoning_content``."""
+        """vLLM names the field ``reasoning``; OpenEvo's canonical field is ``reasoning_content``."""
         if not isinstance(message, dict):
             return
         if message.get("reasoning_content") is None and message.get("reasoning") is not None:

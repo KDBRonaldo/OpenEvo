@@ -69,6 +69,22 @@ def test_status_report_ready_semantics_and_tuple_backing() -> None:
         report.services.append(report.services[0])
 
 
+def test_daemon_launch_spec_uses_openevo_gateway_kind() -> None:
+    spec = RemoteDaemonLaunchSpec(
+        service_id="gateway",
+        kind="openevo_gateway",
+        command="python -m openevo.gateway.server",
+    )
+
+    assert spec.kind == "openevo_gateway"
+    with pytest.raises(ValueError):
+        RemoteDaemonLaunchSpec(
+            service_id="gateway",
+            kind="polar" + "_gateway",
+            command="python -m openevo.gateway.server",
+        )
+
+
 def test_status_report_not_ready_when_service_failed() -> None:
     report = RemoteStatusReport(
         remote_profile_id="lab-gpu",

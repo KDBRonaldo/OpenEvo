@@ -127,19 +127,10 @@ docs/*
 !docs/core/*.md
 !docs/dev/
 !docs/dev/*.md
+!docs/user/
+!docs/user/*.md
 !docs/maintainer/
 !docs/maintainer/**
-!docs/report/
-!docs/report/*
-!docs/superpowers/
-docs/superpowers/*
-!docs/superpowers/plans/
-docs/superpowers/plans/*
-!docs/superpowers/plans/*.md
-!docs/superpowers/specs/
-docs/superpowers/specs/*
-!docs/superpowers/specs/*.md
-!docs/superpowers/specs/*.png
 /site
 
 # Desktop frontend build artifacts

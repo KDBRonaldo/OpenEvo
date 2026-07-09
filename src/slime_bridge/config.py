@@ -1,4 +1,4 @@
-"""Configuration helpers for Slime-driven Polar rollouts."""
+"""Configuration helpers for Slime-driven OpenEvo rollouts."""
 
 from __future__ import annotations
 
@@ -34,26 +34,37 @@ class PolarSlimeConfig:
     eval_dataset_name: str
 
 
+def _config_value(args: Any, *names: str, default: Any = None) -> Any:
+    for name in names:
+        if hasattr(args, name):
+            value = getattr(args, name)
+            if value is not None:
+                return value
+    return default
+
+
 def resolve_polar_slime_config(args: Any) -> PolarSlimeConfig:
-    rollout_server_url = getattr(args, "polar_rollout_url", None)
-    topology_path = getattr(args, "polar_topology_path", None)
+    rollout_server_url = _config_value(args, "openevo_rollout_url", "polar_rollout_url")
+    topology_path = _config_value(args, "openevo_topology_path", "polar_topology_path")
     if rollout_server_url is None and topology_path:
         rollout_server_url = TopologyConfig.load(topology_path).rollout.public_url
     if rollout_server_url is None:
         raise ValueError(
-            "Polar rollout URL is not configured. Set polar_rollout_url or polar_topology_path "
+            "OpenEvo rollout URL is not configured. Set openevo_rollout_url or openevo_topology_path "
             "in Slime's custom config YAML."
         )
 
-    task_template = deepcopy(getattr(args, "polar_task_template", None) or {})
+    task_template = deepcopy(
+        _config_value(args, "openevo_task_template", "polar_task_template", default={}) or {}
+    )
     if not isinstance(task_template, dict):
-        raise ValueError("polar_task_template must be a mapping")
+        raise ValueError("openevo_task_template must be a mapping")
     if "agent" not in task_template:
-        raise ValueError("polar_task_template must include an agent spec")
+        raise ValueError("openevo_task_template must include an agent spec")
 
-    max_async_level = int(getattr(args, "polar_max_async_level", 2))
+    max_async_level = int(_config_value(args, "openevo_max_async_level", "polar_max_async_level", default=2))
     if max_async_level <= 0:
-        raise ValueError("polar_max_async_level must be greater than 0")
+        raise ValueError("openevo_max_async_level must be greater than 0")
 
     rollout_batch_size = int(getattr(args, "rollout_batch_size", 1) or 1)
     if rollout_batch_size <= 0:
@@ -71,37 +82,61 @@ def resolve_polar_slime_config(args: Any) -> PolarSlimeConfig:
     max_session_concurrency = max_concurrency * group_size
     max_off_policy_steps = max_async_level + update_weights_interval
 
-    request_timeout = getattr(args, "polar_request_timeout", None)
+    request_timeout = _config_value(args, "openevo_request_timeout", "polar_request_timeout")
     if request_timeout is not None:
         request_timeout = float(request_timeout)
         if request_timeout <= 0:
-            raise ValueError("polar_request_timeout must be greater than 0")
+            raise ValueError("openevo_request_timeout must be greater than 0")
 
-    callback_host = str(getattr(args, "polar_callback_host", "127.0.0.1")).strip()
+    callback_host = str(
+        _config_value(
+            args,
+            "openevo_callback_host",
+            "polar_callback_host",
+            default="127.0.0.1",
+        )
+    ).strip()
     if not callback_host:
-        raise ValueError("polar_callback_host must be a non-empty host or IP")
+        raise ValueError("openevo_callback_host must be a non-empty host or IP")
     if callback_host in {"0.0.0.0", "::"}:
-        raise ValueError("polar_callback_host must be reachable by the rollout server, not a wildcard bind address")
+        raise ValueError("openevo_callback_host must be reachable by the rollout server, not a wildcard bind address")
 
-    scoring_mode = str(getattr(args, "polar_scoring_mode", "group")).strip().lower()
+    scoring_mode = str(
+        _config_value(args, "openevo_scoring_mode", "polar_scoring_mode", default="group")
+    ).strip().lower()
     if scoring_mode not in {"group", "individual"}:
-        raise ValueError("polar_scoring_mode must be 'group' or 'individual'")
+        raise ValueError("openevo_scoring_mode must be 'group' or 'individual'")
 
     min_complete_accept_fraction = float(
-        getattr(args, "polar_min_complete_accept_fraction", 0.0) or 0.0
+        _config_value(
+            args,
+            "openevo_min_complete_accept_fraction",
+            "polar_min_complete_accept_fraction",
+            default=0.0,
+        )
+        or 0.0
     )
     if not 0.0 <= min_complete_accept_fraction <= 1.0:
-        raise ValueError("polar_min_complete_accept_fraction must be between 0 and 1")
+        raise ValueError("openevo_min_complete_accept_fraction must be between 0 and 1")
 
     return PolarSlimeConfig(
         rollout_server_url=str(rollout_server_url).rstrip("/"),
         task_template=task_template,
         task_id_template=str(
-            getattr(args, "polar_task_id_template", "polar-slime-{rollout_id}-{sample.group_index}")
+            _config_value(
+                args,
+                "openevo_task_id_template",
+                "polar_task_id_template",
+                default="openevo-slime-{rollout_id}-{sample.group_index}",
+            )
         ),
-        instruction_template=getattr(args, "polar_instruction_template", None),
+        instruction_template=_config_value(
+            args,
+            "openevo_instruction_template",
+            "polar_instruction_template",
+        ),
         reward_key=str(
-            getattr(args, "polar_reward_key", None)
+            _config_value(args, "openevo_reward_key", "polar_reward_key")
             or getattr(args, "reward_key", None)
             or "score"
         ),
@@ -114,8 +149,22 @@ def resolve_polar_slime_config(args: Any) -> PolarSlimeConfig:
         scoring_mode=scoring_mode,
         min_complete_accept_fraction=min_complete_accept_fraction,
         tokenizer_name_or_path=getattr(args, "hf_checkpoint", None),
-        add_generation_prompt=bool(getattr(args, "polar_add_generation_prompt", True)),
-        eval_dataset_name=str(getattr(args, "polar_eval_dataset_name", "polar_eval")),
+        add_generation_prompt=bool(
+            _config_value(
+                args,
+                "openevo_add_generation_prompt",
+                "polar_add_generation_prompt",
+                default=True,
+            )
+        ),
+        eval_dataset_name=str(
+            _config_value(
+                args,
+                "openevo_eval_dataset_name",
+                "polar_eval_dataset_name",
+                default="openevo_eval",
+            )
+        ),
     )
 
 
@@ -147,7 +196,7 @@ def render_task_payload(
     )
     payload = _render_template_value(deepcopy(config.task_template), context)
     if not isinstance(payload, dict):
-        raise ValueError("polar_task_template must render to a mapping")
+        raise ValueError("openevo_task_template must render to a mapping")
 
     payload["task_id"] = str(_render_template_value(config.task_id_template, context))
     payload["instruction"] = instruction
@@ -178,7 +227,7 @@ def render_instruction(
     )
     rendered = _render_template_value(template, context)
     if not isinstance(rendered, str):
-        raise ValueError("polar_instruction_template must render to a string")
+        raise ValueError("openevo_instruction_template must render to a string")
     return rendered
 
 

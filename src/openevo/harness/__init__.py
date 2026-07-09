@@ -1,4 +1,4 @@
-"""Agent harness abstractions for Polar."""
+"""Agent harness abstractions for OpenEvo."""
 
 from openevo.harness.base import BaseHarness
 from openevo.harness.factory import create_harness

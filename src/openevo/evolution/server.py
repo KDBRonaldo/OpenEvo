@@ -58,7 +58,7 @@ def create_app(*, db_path: str | Path, artifact_root: str | Path) -> FastAPI:
     root.mkdir(parents=True, exist_ok=True)
     store = EvolutionStore(db_path=db_path, artifact_root=root)
     store.initialize()
-    app = FastAPI(title="Polar Evolution Backend", version="0.1.0")
+    app = FastAPI(title="OpenEvo Evolution Backend", version="0.1.0")
     app.state.db_path = Path(db_path)
     app.state.artifact_root = root
     app.state.store = store

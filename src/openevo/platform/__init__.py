@@ -1,1 +1,1 @@
-"""Polar observability platform service."""
+"""OpenEvo observability platform service."""

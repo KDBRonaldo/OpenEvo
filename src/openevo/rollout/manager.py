@@ -196,7 +196,7 @@ class RolloutManager:
     async def _execute_task(self, request: TaskRequest) -> TaskResult:
         sessions = [
             SessionContext(
-                session_id=f"sk-polar-{uuid.uuid4()}",
+                session_id=f"sk-openevo-{uuid.uuid4()}",
                 task_id=request.task_id,
                 request=request,
                 deadline_monotonic=time.monotonic() + request.timeout_seconds,

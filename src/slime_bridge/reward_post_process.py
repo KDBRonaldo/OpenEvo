@@ -7,7 +7,7 @@ normalizes across trajectories inside each group.  The normalized value is
 broadcast back to every sample of the trajectory.
 
 Adapter contract:
-    All Slime samples produced from the same Polar ``SessionResult`` share
+    All Slime samples produced from the same OpenEvo ``SessionResult`` share
     the same ``Sample.index`` (the trajectory's position within the group).
     Samples from different sessions in the same group get distinct indices.
 

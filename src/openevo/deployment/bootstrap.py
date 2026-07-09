@@ -579,10 +579,10 @@ FROM {_MANAGED_RUNTIME_PYTHON_IMAGE}
 COPY --from=node /usr/local/ /usr/local/
 
 ENV DEBIAN_FRONTEND=noninteractive \\
-    HOME=/home/polar \\
-    NPM_CONFIG_PREFIX=/home/polar/.local \\
+    HOME=/home/openevo \\
+    NPM_CONFIG_PREFIX=/home/openevo/.local \\
     NPM_CONFIG_UPDATE_NOTIFIER=false \\
-    PATH=/home/polar/.local/bin:${{PATH}}
+    PATH=/home/openevo/.local/bin:${{PATH}}
 
 LABEL io.openevo.managed-runtime="true"
 
@@ -599,14 +599,14 @@ RUN apt-get update \\
         tmux \\
     && rm -rf /var/lib/apt/lists/*
 
-RUN useradd -m -s /bin/bash polar \\
-    && echo 'polar ALL=(ALL) NOPASSWD:ALL' >> /etc/sudoers \\
-    && mkdir -p /openevo/session/workspace /home/polar/.local \\
-    && chown -R polar:polar /openevo/session /home/polar
+RUN useradd -m -s /bin/bash openevo \\
+    && echo 'openevo ALL=(ALL) NOPASSWD:ALL' >> /etc/sudoers \\
+    && mkdir -p /openevo/session/workspace /home/openevo/.local \\
+    && chown -R openevo:openevo /openevo/session /home/openevo
 
-RUN echo 'export PATH=/home/polar/.local/bin:$PATH' > /etc/profile.d/polar-path.sh
+RUN echo 'export PATH=/home/openevo/.local/bin:$PATH' > /etc/profile.d/openevo-path.sh
 
-USER polar
+USER openevo
 RUN npm install -g {_MANAGED_RUNTIME_CODEX_PACKAGE}
 
 WORKDIR /openevo/session/workspace

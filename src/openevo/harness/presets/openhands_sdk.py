@@ -20,13 +20,13 @@ class OpenHandsSdkHarness(BaseHarness):
 
     def __init__(self, agent_spec: AgentSpec) -> None:
         super().__init__(agent_spec)
-        self._runner_script = "/tmp/polar_openhands_sdk_run.py"
+        self._runner_script = "/tmp/openevo_openhands_sdk_run.py"
 
     async def setup(self, runtime: BaseRuntime) -> None:
         # Write the embedded runner script
         script = _RUNNER_SCRIPT
         await runtime.exec(
-            f"cat > {self._runner_script} << 'POLARSCRIPT'\n{script}\nPOLARSCRIPT\n"
+            f"cat > {self._runner_script} << 'OPENEVO_SCRIPT'\n{script}\nOPENEVO_SCRIPT\n"
             f"chmod +x {self._runner_script}"
         )
 
@@ -88,7 +88,7 @@ class OpenHandsSdkHarness(BaseHarness):
 
 
 _RUNNER_SCRIPT = r'''#!/usr/bin/env python3
-"""OpenHands SDK runner for Polar."""
+"""OpenHands SDK runner for OpenEvo."""
 from __future__ import annotations
 
 import json

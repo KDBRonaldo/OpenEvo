@@ -5,18 +5,20 @@ README 和 `docs/architecture/` 补上下文。
 
 ## 项目定位
 
-OpenEvo 是面向真实 agent harness 的 evolution 系统，当前对外产品面包括：
+OpenEvo 是面向真实 agent harness 的 evolution 系统，当前对外产品面只有：
 
-- **OpenEvo Core**：执行、trajectory/transcript capture、dataset/job/artifact、method
-  registry、context resolve、runtime injection 和 benchmark adapter 的统一 contract。
+- **OpenEvo Core Backend**：运行在远程服务器上的执行、trajectory/transcript capture、
+  dataset/job/artifact、method registry、context resolve、runtime injection、deployment
+  和 backend API 统一 contract。
 - **OpenEvo Desktop**：面向普通科研用户的 macOS 桌面应用，用于配置远程服务器、启动
   OpenEvo Core 后端、运行 science task，并监控 memory、skill、agent-system 等演化过程。
-- **OpenEvo Dev Kit**：面向 OpenEvo 开发者的 CLI、源码、测试、benchmark 和 method
-  development 工具。
+
+不存在单独发布的 CLI 或开发套件产品面。保留的命令行入口只是后端 launcher、维护工具、
+CI 工具或开发者自动化工具，不能在公开文档里包装成普通用户产品。
 
 Runtime/data identity 使用 `OPENEVO_*` 环境变量、`/openevo/session` runtime path、
 `.openevo/evolution` state root 和 `openevo.session_completed` event type。不要在新的
-公开 contract、文档、测试或示例中引入 legacy Polar runtime markers。
+公开 contract、文档、测试或示例中引入 legacy runtime markers。
 
 OpenEvo Core 的核心目标是把 agent 运行过程稳定地转成可训练、可评估、可演化的数据，并
 把演化后的 memory、skill、agent system 和 parametric memory 注入后续 session。
@@ -38,7 +40,7 @@ harness 只要能提供稳定 transcript，都应能接入 pure-text evolution�
 ## 目录结构
 
 - `src/openevo/`: OpenEvo Core Backend package、Desktop/Science config、deployment
-  lifecycle、sidecar API 和 Dev Kit helpers。
+  lifecycle、backend API 和 developer automation helpers。
 - `desktop/`: OpenEvo Desktop 的 React/Vite/Tauri 前端、native host、sidecar 和打包资源。
 - `src/openevo/harness/`: agent harness contract 和 Codex、Claude Code、OpenHands 等 presets。
 - `src/openevo/gateway/`: gateway server、LLM proxy、runtime lifecycle、completion capture、
@@ -54,7 +56,7 @@ harness 只要能提供稳定 transcript，都应能接入 pure-text evolution�
 - `src/openevo/experiments/`: experiment compiler/runner/promotion helpers。
 - `src/openevo/projects/science/`: ordinary-user science project config/compiler。
 - `src/openevo/deployment/`: remote deployment lifecycle、bootstrap、preflight、SSH transport。
-- `docs/architecture/`: OpenEvo Core/Desktop/Dev Kit 架构、evolution API、runtime
+- `docs/architecture/`: OpenEvo Core Backend/Desktop 架构、evolution API、runtime
   context、worker 接口文档。
 - `tests/`: regression tests，通常按 gateway、trajectory、evolution、rollout 等行为组织。
 

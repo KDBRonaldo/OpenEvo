@@ -98,7 +98,7 @@ async def _lifespan(_: FastAPI):
         await state.pipeline.close()
 
 
-app = FastAPI(title="Polar Rollout", version="0.1.0", lifespan=_lifespan)
+app = FastAPI(title="OpenEvo Rollout", version="0.1.0", lifespan=_lifespan)
 
 
 @app.get("/health")

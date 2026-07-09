@@ -1,13 +1,13 @@
 # Agent Harnesses
 
-In Polar, an **agent harness** is whatever launches your agent inside a prepared
-runtime. The key idea is that you **do not integrate agents into Polar** — you
+In OpenEvo Core, an **agent harness** is whatever launches your agent inside a prepared
+runtime. The key idea is that you **do not integrate agents into OpenEvo** — you
 run them unmodified. A harness only has to:
 
 1. start the agent process, and
 2. let the agent's LLM calls flow through the gateway proxy.
 
-Polar injects the proxy endpoints as environment variables
+OpenEvo injects the proxy endpoints as environment variables
 (`OPENAI_BASE_URL`, `ANTHROPIC_BASE_URL`, `GOOGLE_API_URL`, and matching
 `*_API_KEY`s set to the session id). The gateway serves the model, rewrites the
 request to the served model, and **captures the trajectory** from the wire-level
@@ -26,7 +26,7 @@ The public task field is `agent`, validated by `models.AgentSpec`.
 
 Presets are **conveniences, not integrations** — each is a thin `BaseHarness`
 (a few dozen lines) that writes the agent's config and emits its run command.
-If your agent isn't listed below, you don't add code to Polar: reach for `shell`
+If your agent isn't listed below, you don't add code to OpenEvo Core: reach for `shell`
 or `import_path`.
 
 ## Presets
@@ -34,7 +34,7 @@ or `import_path`.
 API type names match `openevo.gateway.detection.APIType`: `anthropic`,
 `openai_chat`, `openai_responses`, and `google`. *Streaming* is the wire style
 the agent sends to the proxy. *Version* is the external CLI/SDK release verified
-end-to-end by the [calculator example](../../../examples/calculator/README.md);
+end-to-end by the [calculator example](../../../examples/research-benchmarks/calculator/README.md);
 examples may pin their own, but these are the known-good ones.
 
 | Preset | API type | Streaming | Verified version |
@@ -88,7 +88,7 @@ name, environment, settings, and optional MCP servers. It returns an
 `AgentRunResult` with status `completed`, `failed`, or `timeout`.
 
 - The harness starts the agent process.
-- Polar owns runtime setup, the model proxy endpoints, completion capture, and
+- OpenEvo owns runtime setup, the model proxy endpoints, completion capture, and
   evaluation.
 
 ```python
@@ -118,7 +118,7 @@ is available, so anything that needs `$OPENAI_BASE_URL` must be written inside a
 
 ## Bring your own agent
 
-You don't need a preset. Two no-Polar-code paths:
+You don't need a preset. Two no-Core-code paths:
 
 **`shell`** — wrap any command. Requires `agent.custom_shell`; cannot be combined
 with MCP servers or a skills path.

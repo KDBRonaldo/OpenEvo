@@ -85,7 +85,7 @@ def build_core_capabilities() -> CoreCapabilities:
                 mode="self-deployed",
                 display_name="Self-Deployed",
                 description=(
-                    "Run against self-deployed model serving through Polar proxy or compatible "
+                    "Run against self-deployed model serving through OpenEvo proxy or compatible "
                     "infrastructure."
                 ),
                 visible_in_desktop=True,

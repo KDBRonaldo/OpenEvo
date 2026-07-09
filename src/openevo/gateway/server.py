@@ -203,12 +203,12 @@ async def _lifespan(_: FastAPI):
         await state.completion_writer.close()
 
 
-app = FastAPI(title="Polar Gateway", version="0.1.0", lifespan=_lifespan)
+app = FastAPI(title="OpenEvo Gateway", version="0.1.0", lifespan=_lifespan)
 
 
 @app.api_route("/", methods=["GET", "HEAD"])
 async def root() -> dict[str, str]:
-    return {"status": "ok", "service": "polar-gateway"}
+    return {"status": "ok", "service": "openevo-gateway"}
 
 
 def _format_anthropic_events(events: list[dict[str, Any]]) -> str:

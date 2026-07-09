@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 
 import pytest
@@ -11,6 +12,8 @@ from slime_bridge.config import (
     resolve_polar_slime_config,
     resolve_sglang_router_base_url,
 )
+from slime_bridge.reward import reward_func
+from slime_bridge.rollout import _resolve_gateway_url
 
 
 def _args(**overrides):
@@ -54,6 +57,92 @@ def test_resolve_polar_slime_config_computes_concurrency_and_normalizes_url() ->
     assert config.min_complete_accept_fraction == 0.0
 
 
+def test_resolve_polar_slime_config_accepts_openevo_aliases() -> None:
+    config = resolve_polar_slime_config(
+        _args(
+            polar_rollout_url=None,
+            polar_task_template=None,
+            openevo_rollout_url="http://openevo-rollout:8080/",
+            openevo_task_template={
+                "agent": {"harness": "codex", "model_name": "{args.model_name}"},
+                "runtime": {"image": "{sample.metadata.image}"},
+            },
+            openevo_task_id_template="openevo-{rollout_id}-{sample.group_index}",
+            openevo_reward_key="reward",
+            openevo_max_async_level=3,
+            openevo_request_timeout=120,
+            openevo_callback_host="10.0.0.5",
+            openevo_min_complete_accept_fraction=0.5,
+            openevo_eval_dataset_name="openevo_eval",
+        )
+    )
+
+    assert config.rollout_server_url == "http://openevo-rollout:8080"
+    assert config.task_id_template == "openevo-{rollout_id}-{sample.group_index}"
+    assert config.reward_key == "reward"
+    assert config.max_async_level == 3
+    assert config.request_timeout == 120.0
+    assert config.callback_host == "10.0.0.5"
+    assert config.min_complete_accept_fraction == 0.5
+    assert config.eval_dataset_name == "openevo_eval"
+
+
+def test_slime_weight_update_helpers_accept_openevo_aliases(tmp_path) -> None:
+    topology_path = tmp_path / "topology.yaml"
+    topology_path.write_text(
+        """
+rollout: {host: 127.0.0.1, port: 8080, public_url: http://127.0.0.1:8080}
+gateway:
+  nodes:
+    - id: n1
+      host: 127.0.0.1
+      port: 8100
+      public_url: http://127.0.0.1:8100
+      model_served: Qwen/Qwen3.5-4B
+      inference: {engine: sglang, base_url: http://127.0.0.1:9000}
+""".strip()
+    )
+
+    assert (
+        _resolve_gateway_url(
+            _args(
+                polar_gateway_url=None,
+                polar_topology_path=None,
+                openevo_topology_path=str(topology_path),
+            )
+        )
+        == "http://127.0.0.1:8100"
+    )
+    assert (
+        _resolve_gateway_url(
+            _args(polar_gateway_url=None, openevo_gateway_url="http://gateway:8100/")
+        )
+        == "http://gateway:8100"
+    )
+
+
+def test_reward_func_accepts_openevo_reward_key() -> None:
+    result = asyncio.run(
+        reward_func(
+            SimpleNamespace(openevo_reward_key="accuracy"),
+            SimpleNamespace(reward={"accuracy": 0.75, "score": 0.25}),
+        )
+    )
+
+    assert result == {"accuracy": 0.75}
+
+
+def test_reward_func_treats_none_openevo_reward_key_as_absent() -> None:
+    result = asyncio.run(
+        reward_func(
+            SimpleNamespace(openevo_reward_key=None, polar_reward_key="legacy_score"),
+            SimpleNamespace(reward={"legacy_score": 0.6, "score": 0.2}),
+        )
+    )
+
+    assert result == {"legacy_score": 0.6}
+
+
 def test_resolve_polar_slime_config_requires_agent_template() -> None:
     with pytest.raises(ValueError, match="agent spec"):
         resolve_polar_slime_config(_args(polar_task_template={}))
@@ -69,7 +158,7 @@ def test_resolve_polar_slime_config_accepts_complete_fraction_threshold() -> Non
 
 @pytest.mark.parametrize("value", [-0.1, 1.1])
 def test_resolve_polar_slime_config_rejects_invalid_complete_fraction(value) -> None:
-    with pytest.raises(ValueError, match="polar_min_complete_accept_fraction"):
+    with pytest.raises(ValueError, match="openevo_min_complete_accept_fraction"):
         resolve_polar_slime_config(_args(polar_min_complete_accept_fraction=value))
 
 

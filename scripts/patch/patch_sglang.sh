@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Patch SGLang to expose the token IDs Polar needs for training:
+# Patch SGLang to expose the token IDs OpenEvo needs for training:
 #   - token_id on each response-token logprob entry (ChatCompletionTokenLogprob
 #     and LogProbs) for response-side token extraction.
 #   - input_token_ids on each choice (streaming and non-streaming) for

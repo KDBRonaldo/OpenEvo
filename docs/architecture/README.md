@@ -1,31 +1,29 @@
 # OpenEvo Architecture Docs
 
-This directory is the publish-facing architecture index for OpenEvo. The public
-surfaces are:
+This directory is the release-facing architecture index for OpenEvo. The
+product surfaces are:
 
-- **OpenEvo Core**: execution, capture, dataset/job/artifact, method, context,
-  runtime, and benchmark-adapter contracts.
-- **OpenEvo Desktop**: the ordinary-user macOS science app and local sidecar
-  control plane.
-- **OpenEvo Dev Kit**: CLI, source, testing, benchmark, method-development, and
-  artifact-inspection workflows for OpenEvo developers.
+- **OpenEvo Desktop**: the ordinary-user macOS app and local sidecar facade.
+- **OpenEvo Core Backend**: the remote Python backend that owns execution,
+  deployment, trajectory capture, evolution, artifacts, and typed APIs.
 
-Some implementation packages, environment variables, and historical documents
-still use `polar` names. Treat those as lower-level runtime implementation
-details unless a document explicitly discusses the legacy framework.
+Developer automation, benchmark adapters, and source-checkout utilities are
+Core Backend workflows. They are not a separate product surface.
 
 ## Recommended Reading Order
 
 1. [OpenEvo Desktop Science Foundation](openevo-desktop-science-foundation.md)
-   - Science Project config, ordinary-user Desktop flow, remote lifecycle,
-     subscription/self-deployed semantics, run supervision, and artifact viewing.
-2. [OpenEvo Dev Kit](openevo-dev-kit.md)
-   - Developer workflow boundary, method metadata lifecycle, and benchmark
-     adapter rules.
-3. [OpenEvo Desktop Release Packaging](openevo-desktop-release.md)
-   - Tauri `.dmg` packaging, exact wheel artifacts, and release validation.
+   - Ordinary-user science projects, remote lifecycle, execution modes, run
+     supervision, and artifact viewing.
+2. [OpenEvo Desktop Release Packaging](openevo-desktop-release.md)
+   - Tauri `.dmg` packaging, bundled sidecar, exact wheel artifacts, and release
+     validation.
+3. [OpenEvo Core Backend API](../core/backend-api.md)
+   - Typed backend routes, Desktop facade boundary, state-root reads, and error
+     model.
 4. [Evolution API And Method Integration](evolution-api-and-method-integration.md)
-   - Core artifact contracts and how to add new methods.
+   - Core artifact contracts and how new evolution methods plug into the
+     method registry.
 5. [OpenEvo Core Evolution Backend](evolution-backend.md)
    - Events, datasets, jobs, workers, artifact registry, context resolver, and
      storage layout.
@@ -33,7 +31,7 @@ details unless a document explicitly discusses the legacy framework.
    - How memory, skill bundles, agent-system text, and adapters are resolved and
      staged into runtime sessions.
 
-## Desktop And Remote Lifecycle Docs
+## Desktop And Remote Lifecycle
 
 - [OpenEvo Desktop Sidecar Foundation](openevo-desktop-sidecar-foundation.md)
   - Local sidecar config contract, project profiles, proxy/mirror fields, Core
@@ -46,40 +44,40 @@ details unless a document explicitly discusses the legacy framework.
   - Remote bootstrap, exact OpenEvo Core installation, service status/log/control
     endpoints, and self-deployed service preparation.
 
-## Core Evolution Docs
+## Core Backend Internals
 
+- [OpenEvo Core Runtime System Overview](core-runtime-system-overview.md)
+  - Rollout, gateway, runtime, proxy, and transcript/proxy capture data paths.
 - [Reference Evolution Worker](reference-evolution-worker.md)
   - Built-in reference methods, including `text_memory`, `skill_bundle`,
     `agent_system`, and parametric-memory registration/training interfaces.
+- [OpenEvo Core Developer Workflows](core-developer-workflows.md)
+  - Source-checkout workflows for method development, benchmark adapters,
+    artifact inspection, and regression fixtures.
 - [PR Process Checks](pr-process-checks.md)
-  - Issue/PR templates and warning-level issue-link/docs-change checks.
-- [OpenEvo Core Runtime System Overview](polar-system-overview.md)
-  - Historical lower-level rollout/gateway/runtime/proxy architecture used by
-    OpenEvo Core internals.
+  - Issue/PR templates and issue-link/docs-change checks.
 
 ## High-Level Boundary
 
 ```mermaid
 flowchart LR
     Desktop[OpenEvo Desktop .dmg]
-    DevKit[OpenEvo Dev Kit CLI/tests/benchmarks]
-    Core[OpenEvo Core]
-    Remote[Remote OpenEvo Core services]
-    Harness[Codex harness]
+    Sidecar[Local sidecar facade]
+    Backend[Remote OpenEvo Core Backend]
+    Harness[Codex or other harness]
     Store[Evolution backend]
     Methods[Method workers]
     Artifacts[Typed artifacts]
 
-    Desktop -->|local sidecar API| Core
-    DevKit -->|CLI / tests / benchmark adapters| Core
-    Core -->|SSH lifecycle| Remote
-    Remote -->|task runs| Harness
-    Remote -->|events / datasets / jobs| Store
+    Desktop --> Sidecar
+    Sidecar -->|SSH tunnel + typed API| Backend
+    Backend -->|task runs| Harness
+    Backend -->|events / datasets / jobs| Store
     Store --> Methods
     Methods --> Artifacts
-    Artifacts -->|context resolve / injection| Remote
+    Artifacts -->|context resolve / injection| Backend
 ```
 
-Desktop and Dev Kit are wrappers around Core. They should not fork method
-registry behavior, artifact contracts, context resolution, remote lifecycle, or
-harness execution semantics.
+Desktop must not fork method registry behavior, artifact contracts, context
+resolution, remote lifecycle, or harness execution semantics. Those live in
+Core Backend.

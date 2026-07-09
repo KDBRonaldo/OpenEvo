@@ -21,10 +21,10 @@ class ApptainerRuntime(BaseRuntime):
     def __init__(self, spec: RuntimeSpec, session_id: str, session_dir: Path) -> None:
         super().__init__(spec, session_id, session_dir)
         # Use a hash suffix to guarantee uniqueness even when session IDs
-        # share a long prefix (e.g. "sk-polar-...-eval" vs "sk-polar-...").
+        # share a long prefix (e.g. "sk-openevo-...-eval" vs "sk-openevo-...").
         short_hash = hashlib.sha256(session_id.encode()).hexdigest()[:8]
         safe_name = session_id.replace("/", "-")[:30]
-        self._instance_name = f"polar-{safe_name}-{short_hash}"
+        self._instance_name = f"openevo-{safe_name}-{short_hash}"
         self._binary = self._resolve_binary()
 
     @property

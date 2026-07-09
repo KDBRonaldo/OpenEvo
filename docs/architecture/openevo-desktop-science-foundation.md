@@ -485,12 +485,12 @@ hardening task. Human-readable artifact content for `text_memory`,
 `skill_bundle`, and `agent_system` is available through the backend artifact
 preview facade.
 
-## CLI
+## Backend Launcher
 
 The Python package no longer exposes a user-facing `openevo` console script.
 The only package console script in the Core Backend migration phase is
-`openevo-backend`; Dev Kit and Desktop-native entrypoints are handled by later
-productization tasks.
+`openevo-backend`; backend maintenance automation and Desktop-native entrypoints
+are handled by productization tasks.
 
 ## Limitations
 

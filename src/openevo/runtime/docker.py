@@ -20,7 +20,7 @@ class DockerRuntime(BaseRuntime):
         # Use enough of the session_id to preserve the "-eval" suffix used by
         # fresh evaluator runtimes, avoiding collisions with the agent runtime.
         safe_name = session_id.replace("/", "-")[:55]
-        self._container_name = f"polar-{safe_name}"
+        self._container_name = f"openevo-{safe_name}"
         self._chmod_needed: bool | None = None
 
     @property

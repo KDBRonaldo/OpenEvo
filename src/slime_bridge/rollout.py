@@ -1,8 +1,8 @@
-"""Slime rollout bridge for Polar-managed agent sessions.
+"""Slime rollout bridge for OpenEvo-managed agent sessions.
 
 Single entrypoint ``generate_rollout_polar_async`` routes training to a
 persistent background worker and evaluation to a one-shot submit+poll batch.
-Both paths speak Polar's async-only HTTP surface (``/rollout/task/submit`` +
+Both paths speak OpenEvo's async-only HTTP surface (``/rollout/task/submit`` +
 ``/rollout/task/{task_id}``).
 """
 
@@ -47,7 +47,7 @@ _LONGEST_TRACE_ARTIFACT_INTERVAL = 5  # dump longest trace every N rollouts
 
 
 class PolarRolloutSchedulerError(RuntimeError):
-    """Raised when the async Polar scheduler cannot safely make progress."""
+    """Raised when the async OpenEvo scheduler cannot safely make progress."""
 
 
 class PolarLowCompleteAcceptFractionError(PolarRolloutSchedulerError):
@@ -90,7 +90,7 @@ def get_global_async_worker(args: Any, data_source: Any) -> "AsyncPolarRolloutWo
     global _global_async_worker
     with _worker_lock:
         if _global_async_worker is None or not _global_async_worker.is_alive():
-            logger.info("Creating new async Polar rollout worker")
+            logger.info("Creating new async OpenEvo rollout worker")
             _global_async_worker = AsyncPolarRolloutWorker(args, data_source)
             _global_async_worker.start()
         return _global_async_worker
@@ -114,7 +114,7 @@ def update_policy_version(args: Any, policy_version: int) -> None:
 
 def prepare_policy_update(args: Any, policy_version: int) -> None:
     """Optional hook called by Slime before overlapping inference weight sync."""
-    logger.info("Preparing Polar bridge for policy_version=%s weight update", policy_version)
+    logger.info("Preparing OpenEvo bridge for policy_version=%s weight update", policy_version)
     with _worker_lock:
         worker = _global_async_worker
         if worker is not None:
@@ -126,7 +126,7 @@ def prepare_policy_update(args: Any, policy_version: int) -> None:
         try:
             _resume_gateway_generation(args)
         except Exception:
-            logger.warning("Failed to resume Polar gateway after prepare_policy_update error", exc_info=True)
+            logger.warning("Failed to resume OpenEvo gateway after prepare_policy_update error", exc_info=True)
         with _worker_lock:
             worker = _global_async_worker
             if worker is not None:
@@ -143,15 +143,24 @@ def finish_policy_update(args: Any, policy_version: int) -> None:
             worker = _global_async_worker
             if worker is not None:
                 worker.resume_admission()
-    logger.info("Finished Polar bridge policy_version=%s weight update", policy_version)
+    logger.info("Finished OpenEvo bridge policy_version=%s weight update", policy_version)
+
+
+def _arg_value(args: Any, *names: str, default: Any = None) -> Any:
+    for name in names:
+        if hasattr(args, name):
+            value = getattr(args, name)
+            if value is not None:
+                return value
+    return default
 
 
 def _resolve_gateway_url(args: Any) -> str | None:
-    gateway_url = getattr(args, "polar_gateway_url", None)
+    gateway_url = _arg_value(args, "openevo_gateway_url", "polar_gateway_url")
     if gateway_url:
         return str(gateway_url).rstrip("/")
 
-    topology_path = getattr(args, "polar_topology_path", None)
+    topology_path = _arg_value(args, "openevo_topology_path", "polar_topology_path")
     if topology_path:
         topology = TopologyConfig.load(topology_path)
         if topology.gateway.nodes:
@@ -163,11 +172,19 @@ def _pause_gateway_generation(args: Any) -> None:
     gateway_url = _resolve_gateway_url(args)
     if not gateway_url:
         raise PolarRolloutSchedulerError(
-            "polar_gateway_url or polar_topology_path is required when "
-            "polar_allow_weight_update_overlap is enabled"
+            "openevo_gateway_url or openevo_topology_path is required when "
+            "openevo_allow_weight_update_overlap is enabled; legacy polar_* "
+            "aliases are still accepted."
         )
 
-    timeout_seconds = float(getattr(args, "polar_weight_update_pause_timeout", 300.0))
+    timeout_seconds = float(
+        _arg_value(
+            args,
+            "openevo_weight_update_pause_timeout",
+            "polar_weight_update_pause_timeout",
+            default=300.0,
+        )
+    )
     request_timeout = max(timeout_seconds + 5.0, 10.0)
     with httpx.Client(timeout=request_timeout) as client:
         response = client.post(
@@ -175,7 +192,7 @@ def _pause_gateway_generation(args: Any) -> None:
             params={"timeout_seconds": timeout_seconds},
         )
         response.raise_for_status()
-        logger.info("Paused Polar gateway generation for inference weight update: %s", response.json())
+        logger.info("Paused OpenEvo gateway generation for inference weight update: %s", response.json())
 
 
 def _resume_gateway_generation(args: Any) -> None:
@@ -183,11 +200,18 @@ def _resume_gateway_generation(args: Any) -> None:
     if not gateway_url:
         return
 
-    request_timeout = float(getattr(args, "polar_gateway_control_timeout", 30.0))
+    request_timeout = float(
+        _arg_value(
+            args,
+            "openevo_gateway_control_timeout",
+            "polar_gateway_control_timeout",
+            default=30.0,
+        )
+    )
     with httpx.Client(timeout=max(request_timeout, 5.0)) as client:
         response = client.post(f"{gateway_url}/admin/inference/resume")
         response.raise_for_status()
-        logger.info("Resumed Polar gateway generation after inference weight update: %s", response.json())
+        logger.info("Resumed OpenEvo gateway generation after inference weight update: %s", response.json())
 
 
 # ---------------------------------------------------------------------------
@@ -234,7 +258,7 @@ def _attach_scheduler_metadata(
     if metadata is None:
         metadata = {}
     if not isinstance(metadata, dict):
-        raise ValueError("polar task metadata must be a mapping when provided")
+        raise ValueError("OpenEvo task metadata must be a mapping when provided")
     payload["metadata"] = {
         **metadata,
         "group_id": group_id,
@@ -269,7 +293,7 @@ async def _submit_and_wait_for_task(
             httpx.TimeoutException,
             httpx.TransportError,
         ) as exc:
-            logger.warning("Polling Polar task %s failed; continuing: %s", task_id, exc)
+            logger.warning("Polling OpenEvo task %s failed; continuing: %s", task_id, exc)
             continue
         status = TaskStatus.model_validate(status_resp.json())
         if status.status in ("completed", "failed"):
@@ -363,7 +387,7 @@ def _low_complete_accept_fraction_rejection_reason(
     fraction = completed_trainable / total_sessions
     return (
         f"completed trainable sessions {completed_trainable}/{total_sessions} "
-        f"({fraction:.3f}) below polar_min_complete_accept_fraction={threshold:g} "
+        f"({fraction:.3f}) below openevo_min_complete_accept_fraction={threshold:g} "
         f"(requires >= {required})"
     )
 
@@ -445,7 +469,7 @@ def _annotate_accepted_samples(
 # Persistent training worker
 # ---------------------------------------------------------------------------
 class AsyncPolarRolloutWorker:
-    """Persistent background worker that continuously submits Polar tasks.
+    """Persistent background worker that continuously submits OpenEvo tasks.
 
     Runs in its own thread with a dedicated asyncio event loop.  Pulls
     sample groups from ``data_source``, submits them to the async
@@ -487,7 +511,7 @@ class AsyncPolarRolloutWorker:
     # -- lifecycle -------------------------------------------------------------
 
     def start(self) -> None:
-        self._thread = threading.Thread(target=self._run_loop, daemon=True, name="polar-async-rollout")
+        self._thread = threading.Thread(target=self._run_loop, daemon=True, name="openevo-async-rollout")
         self._thread.start()
 
     def stop(self) -> None:
@@ -553,7 +577,7 @@ class AsyncPolarRolloutWorker:
                 self._inc_metric("polar/dropped_stale_groups")
                 self._inc_metric("polar/dropped_sessions", completed.session_count)
                 logger.warning(
-                    "Dropping stale Polar group %s task=%s: %s",
+                    "Dropping stale OpenEvo group %s task=%s: %s",
                     completed.group_id,
                     completed.task_id,
                     reason,
@@ -599,7 +623,7 @@ class AsyncPolarRolloutWorker:
         asyncio.run(self._async_loop())
 
     async def _async_loop(self) -> None:
-        logger.info("Async Polar rollout worker started")
+        logger.info("Async OpenEvo rollout worker started")
         active: dict[asyncio.Task[None], _PendingGroup] = {}
         active_session_cost = 0
         wakeup = asyncio.Event()
@@ -616,7 +640,7 @@ class AsyncPolarRolloutWorker:
                         try:
                             t.result()
                         except Exception as exc:
-                            logger.exception("Polar async task failed")
+                            logger.exception("OpenEvo async task failed")
                             self._set_fatal(exc)
                             self._running = False
                     self._record_active_counts(active, active_session_cost)
@@ -657,7 +681,7 @@ class AsyncPolarRolloutWorker:
                         )
                         task = asyncio.create_task(
                             self._submit_and_collect(client, pending),
-                            name=f"polar-rollout-task-{gid}",
+                            name=f"openevo-rollout-task-{gid}",
                         )
                         task.add_done_callback(lambda _: wakeup.set())
                         active[task] = pending
@@ -672,7 +696,7 @@ class AsyncPolarRolloutWorker:
                         wakeup.clear()
 
             if active:
-                logger.info("Waiting for %d in-flight Polar tasks", len(active))
+                logger.info("Waiting for %d in-flight OpenEvo tasks", len(active))
                 await asyncio.gather(*active.keys(), return_exceptions=True)
         finally:
             callback_server.should_exit = True
@@ -680,7 +704,7 @@ class AsyncPolarRolloutWorker:
                 await asyncio.wait_for(callback_task, timeout=5.0)
             except asyncio.TimeoutError:
                 logger.warning("Callback listener did not shut down within 5s")
-        logger.info("Async Polar rollout worker stopped")
+        logger.info("Async OpenEvo rollout worker stopped")
 
     async def _start_callback_listener(self) -> tuple[uvicorn.Server, asyncio.Task[None]]:
         """Bind a FastAPI listener for TaskResult callbacks."""
@@ -708,12 +732,12 @@ class AsyncPolarRolloutWorker:
             log_level="warning", lifespan="on",
         )
         server = uvicorn.Server(config)
-        task = asyncio.create_task(server.serve(), name="polar-callback-listener")
+        task = asyncio.create_task(server.serve(), name="openevo-callback-listener")
         while not server.started:
             await asyncio.sleep(0.01)
         port = server.servers[0].sockets[0].getsockname()[1]
         self._callback_url = f"http://{self.config.callback_host}:{port}/callback/task_result"
-        logger.info("Polar trainer callback listener bound to %s", self._callback_url)
+        logger.info("OpenEvo trainer callback listener bound to %s", self._callback_url)
         return server, task
 
     async def _submit_and_collect(
@@ -749,7 +773,7 @@ class AsyncPolarRolloutWorker:
         self._inc_metric(category_metric)
         self._inc_metric("polar/dropped_sessions", pending.session_cost)
         logger.warning(
-            "Dropping Polar group %s because of %s: %s",
+            "Dropping OpenEvo group %s because of %s: %s",
             pending.group_id,
             reason,
             last_error,
@@ -971,7 +995,7 @@ async def _run_eval_rollout(
         return RolloutFnEvalOutput(data=data, metrics=metrics)
 
     logger.warning(
-        "Polar eval called without args.eval_datasets; falling back to the training data source. "
+        "OpenEvo eval called without args.eval_datasets; falling back to the training data source. "
         "Pass --eval-prompt-data to evaluate validation prompts."
     )
     sample_groups = _pull_sample_groups(data_source, args.rollout_batch_size)
@@ -1017,7 +1041,7 @@ async def _submit_eval_groups(
     sample_groups: list[list[Any]],
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     if not sample_groups:
-        raise ValueError("Polar eval dataset produced no sample groups")
+        raise ValueError("OpenEvo eval dataset produced no sample groups")
 
     timeout = None if config.request_timeout is None else httpx.Timeout(config.request_timeout)
     semaphore = asyncio.Semaphore(config.max_concurrency)
@@ -1399,7 +1423,10 @@ def _polar_extra_metrics(
     rewards: list[float],
     reward_key: str,
 ) -> dict[str, float]:
-    """Compact user-facing Polar metrics for W&B."""
+    """Compact bridge metrics for W&B.
+
+    The metric keys keep the legacy ``polar/`` prefix for existing dashboards.
+    """
     out: dict[str, float] = {}
     seen: set[str] = set()
     register_to_init_queue_ms: list[float] = []
@@ -1479,7 +1506,7 @@ def _load_rollout_train_output_type() -> Any:
         from slime.rollout.base_types import RolloutFnTrainOutput
     except ImportError as exc:
         raise ImportError(
-            "Slime is required to run Polar rollouts from a Slime trainer."
+            "Slime is required to run OpenEvo rollouts from a Slime trainer."
         ) from exc
     return RolloutFnTrainOutput
 
@@ -1489,7 +1516,7 @@ def _load_rollout_eval_output_type() -> Any:
         from slime.rollout.base_types import RolloutFnEvalOutput
     except ImportError as exc:
         raise ImportError(
-            "Slime is required to run Polar evaluation rollouts from a Slime trainer."
+            "Slime is required to run OpenEvo evaluation rollouts from a Slime trainer."
         ) from exc
     return RolloutFnEvalOutput
 
@@ -1499,7 +1526,7 @@ def _load_sample_type() -> Any:
         from slime.utils.types import Sample
     except ImportError as exc:
         raise ImportError(
-            "Slime is required to build Polar evaluation samples from eval datasets."
+            "Slime is required to build OpenEvo evaluation samples from eval datasets."
         ) from exc
     return Sample
 

@@ -1,7 +1,7 @@
 # Rollout Service
 
 `openevo.rollout` is the **central orchestrator**. A client (a trainer,
-`polar submit`, or an example script) posts a task here; the rollout server fans
+backend automation, or an example script) posts a task here; the rollout server fans
 it out into one session per sample, schedules each onto a healthy gateway node,
 collects the terminal result, and optionally persists it.
 
@@ -73,7 +73,7 @@ against the agent's wall-clock.
 - `runtime`: the Docker/Apptainer sandbox (see [runtime](../runtime/README.md)).
   Optional — a node's `default_runtime` is used if omitted.
 - `agent`: a preset harness, the generic `shell` harness, or a custom
-  `import_path` (see [agent](../agent/README.md)).
+  `import_path` (see [harness](../harness/README.md)).
 - `builder` / `evaluator`: how completions become trajectories and how reward is
   attached (see [trajectory](../trajectory/README.md)).
 - `callback_url` (optional): where the final `TaskResult` is POSTed.
