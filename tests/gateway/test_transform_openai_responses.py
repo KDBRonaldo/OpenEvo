@@ -11,7 +11,7 @@ def test_responses_request_maps_all_fields_and_image_input_to_chat() -> None:
 
     transformed = transformer.transform_request(
         {
-            "_polar_model_served": "Qwen/Qwen3.5-4B",
+            "_openevo_model_served": "Qwen/Qwen3.5-4B",
             "instructions": "You are a coding agent.",
             "input": [
                 {
@@ -276,7 +276,7 @@ def test_responses_reasoning_effort_none_does_not_enable_thinking() -> None:
 
     transformed = transformer.transform_request(
         {
-            "_polar_model_served": "MiniMax-M2.5",
+            "_openevo_model_served": "MiniMax-M2.5",
             "input": "answer directly",
             "reasoning": {"effort": "none"},
         }

@@ -5,9 +5,9 @@ This is a sidecar monitor for long Ray/Slime jobs. W&B's built-in system
 metrics can create many host/process-scoped GPU labels when multiple Ray actors
 attach to the same run. This script logs one stable metric family instead:
 
-    polar_system/gpu_0/util_pct
-    polar_system/gpu_train/mean_util_pct
-    polar_system/gpu_rollout/mean_util_pct
+    openevo_system/gpu_0/util_pct
+    openevo_system/gpu_train/mean_util_pct
+    openevo_system/gpu_rollout/mean_util_pct
 
 Raw samples are always written to CSV under tmp/gpu_monitor by default.
 """
@@ -67,7 +67,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         choices=["online", "shared", "offline", "disabled"],
         help="use 'shared' when attaching to an active multi-process run",
     )
-    parser.add_argument("--metric-prefix", default="polar_system")
+    parser.add_argument("--metric-prefix", default="openevo_system")
     parser.add_argument("--no-wandb", action="store_true", help="only write CSV")
     return parser.parse_args(argv)
 

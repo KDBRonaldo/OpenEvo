@@ -11,7 +11,7 @@ def test_anthropic_request_maps_all_fields_and_image_input_to_chat() -> None:
 
     transformed = transformer.transform_request(
         {
-            "_polar_model_served": "Qwen/Qwen3.5-4B",
+            "_openevo_model_served": "Qwen/Qwen3.5-4B",
             "system": "x-anthropic-billing-header: cch=unstable;\nBe direct.",
             "messages": [
                 {
@@ -624,7 +624,7 @@ def test_anthropic_request_drops_server_side_tools() -> None:
     )
 
     # Only the custom function tool reaches SGLang; server-side tools are
-    # dropped because Polar can't execute them.
+    # dropped because OpenEvo can't execute them.
     assert transformed["tools"] == [
         {
             "type": "function",

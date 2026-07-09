@@ -80,7 +80,7 @@ def test_daemon_launch_spec_uses_openevo_gateway_kind() -> None:
     with pytest.raises(ValueError):
         RemoteDaemonLaunchSpec(
             service_id="gateway",
-            kind="polar" + "_gateway",
+            kind="invalid_gateway",
             command="python -m openevo.gateway.server",
         )
 

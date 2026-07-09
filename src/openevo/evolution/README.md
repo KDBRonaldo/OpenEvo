@@ -20,9 +20,9 @@ uv run python -m openevo.evolution.cli serve --host 127.0.0.1 --port 8200
 
 默认情况下，backend 状态保存在 `.openevo/evolution/` 下。
 
-初始化已有本地 state 时，store 会把历史 session-completed event identity
-canonicalize 为 `openevo.session_completed`，并把旧 event source 行迁移为
-`source="openevo"`。新 producers 和新文档只应使用 OpenEvo identity。
+初始化已有本地 state 时，store 保留 event source 和 event type 原值，不再迁移
+pre-release runtime identity。新 producers 和新文档必须使用 OpenEvo identity，
+例如 `source="openevo"` 和 `event_type="openevo.session_completed"`。
 
 核心 APIs：
 

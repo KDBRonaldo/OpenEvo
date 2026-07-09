@@ -299,7 +299,7 @@ class ExperimentConfig(_StrictModel):
         if self.runtime.image is None and any(task.workspace for task in self.tasks):
             raise ValueError(
                 "runtime.image is required when tasks[].workspace is set; "
-                "Polar cannot upload a workspace without an explicit runtime image"
+                "OpenEvo cannot upload a workspace without an explicit runtime image"
             )
         if self.runtime.image is None and _runtime_has_non_default_overrides(self.runtime):
             raise ValueError(

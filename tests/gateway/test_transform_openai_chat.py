@@ -9,7 +9,7 @@ def test_openai_chat_request_preserves_fields_and_image_content() -> None:
     transformer = OpenAIChatTransformer()
 
     body = {
-        "_polar_model_served": "Qwen/Qwen3.5-4B",
+        "_openevo_model_served": "Qwen/Qwen3.5-4B",
         "model": "client-visible-model",
         "messages": [
             {"role": "developer", "content": "Use short answers."},
@@ -43,7 +43,7 @@ def test_openai_chat_request_preserves_fields_and_image_content() -> None:
 
     transformed = transformer.transform_request(body)
 
-    assert "_polar_model_served" not in transformed
+    assert "_openevo_model_served" not in transformed
     assert transformed["model"] == "client-visible-model"
     # `developer` role is normalized to `system` and merged with adjacent systems.
     assert transformed["messages"] == [
@@ -105,7 +105,7 @@ def test_openai_chat_merges_developer_role_for_non_qwen_models() -> None:
 
     transformed = transformer.transform_request(
         {
-            "_polar_model_served": "MiniMax-M2.5",
+            "_openevo_model_served": "MiniMax-M2.5",
             "messages": [
                 {"role": "user", "content": "hi"},
                 {"role": "developer", "content": "Use short answers."},

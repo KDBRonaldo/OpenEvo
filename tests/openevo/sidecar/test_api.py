@@ -616,7 +616,7 @@ def test_wheel_discovery_requires_matching_openevo_metadata(
     trusted = tmp_path / "trusted"
     invalid = _write_openevo_wheel(
         trusted / "openevo-0.1.0-py3-none-any.whl",
-        metadata_name="polar",
+        metadata_name="not-openevo",
     )
     valid = _write_openevo_wheel(trusted / "openevo-0.1.0-local-py3-none-any.whl")
     monkeypatch.setattr(sidecar_api, "_openevo_wheel_search_dirs", lambda: (trusted,))

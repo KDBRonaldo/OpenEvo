@@ -252,7 +252,7 @@ def text_memory_reflector(
         ),
         codex_prompt=_codex_cli_text_memory_reflector_prompt(reflection_prompt),
         error_context="text_memory_reflector",
-        temp_prefix="polar-text-memory-reflector-",
+        temp_prefix="openevo-text-memory-reflector-",
     )
     memory_markdown, audit_report = _guard_generic_reflector_output(
         memory_markdown,
@@ -383,7 +383,7 @@ def text_memory_expel_reflector(
         ),
         codex_prompt=_codex_cli_text_memory_reflector_prompt(reflection_prompt),
         error_context="text_memory_expel_reflector",
-        temp_prefix="polar-text-memory-expel-reflector-",
+        temp_prefix="openevo-text-memory-expel-reflector-",
     )
     memory_markdown, audit_report = _guard_generic_reflector_output(
         memory_markdown,
@@ -535,7 +535,7 @@ def skill_bundle_reflector(
         ),
         codex_prompt=_codex_cli_skill_bundle_reflector_prompt(reflection_prompt),
         error_context="skill_bundle_reflector",
-        temp_prefix="polar-skill-bundle-reflector-",
+        temp_prefix="openevo-skill-bundle-reflector-",
     )
     skill_markdown, audit_report = _guard_generic_reflector_output(
         skill_markdown,
@@ -2264,7 +2264,7 @@ def _parametric_memory_synthetic_tool_results(value: Any) -> list[dict[str, str]
             )
         tool_call_id = item.get("tool_call_id")
         if tool_call_id is None:
-            tool_call_id = f"polar-train-synthetic-tool-result-{index}"
+            tool_call_id = f"openevo-train-synthetic-tool-result-{index}"
         if not isinstance(tool_call_id, str) or not tool_call_id.strip():
             raise ValueError(
                 "parametric_memory_lora_sft terminal_bench_corrective_tool_call_policy "
@@ -2341,7 +2341,7 @@ def _terminal_bench_tool_call_policy_message_sets(
     if not prompt_text or not commands:
         return []
 
-    read_task_call_id = "polar-train-read-task"
+    read_task_call_id = "openevo-train-read-task"
     base_messages: list[dict[str, Any]] = [
         {"role": "system", "content": _TERMINAL_BENCH_LOCAL_SOLVER_SYSTEM},
         {
@@ -2480,10 +2480,10 @@ def _terminal_bench_corrective_tool_call_policy_message_sets(
                 source_metadata.get("tool_specs")
             )
             for repeat_index in range(repeat):
-                call_id = "polar-train-corrective-tool-call"
+                call_id = "openevo-train-corrective-tool-call"
                 if include_stage_metadata:
                     call_id = (
-                        "polar-train-corrective-tool-call-"
+                        "openevo-train-corrective-tool-call-"
                         f"{stage_index}-{exported_examples}-{repeat_index}"
                     )
                 if isinstance(target_tool_call, dict):
@@ -2682,7 +2682,7 @@ def _terminal_bench_tool_call(
     name: str,
     arguments: dict[str, Any],
     *,
-    call_id: str = "polar-train-tool-call",
+    call_id: str = "openevo-train-tool-call",
 ) -> dict[str, Any]:
     return {
         "id": call_id,
@@ -3882,7 +3882,7 @@ def _generate_agent_system_reflection(prompt: str, llm_config: dict[str, Any]) -
         ),
         codex_prompt=_codex_cli_reflector_prompt(prompt),
         error_context="agent_system_reflector",
-        temp_prefix="polar-agent-system-reflector-",
+        temp_prefix="openevo-agent-system-reflector-",
     )
 
 

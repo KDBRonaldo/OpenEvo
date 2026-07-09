@@ -99,7 +99,7 @@ def test_anthropic_response_emits_thinking_with_tool_use() -> None:
 def test_anthropic_request_recovers_reasoning_from_thinking_block() -> None:
     t = AnthropicTransformer()
     req = {
-        "_polar_model_served": "MiniMax-M2.5",
+        "_openevo_model_served": "MiniMax-M2.5",
         "messages": [
             {"role": "user", "content": "compute 1+1"},
             {
@@ -108,7 +108,7 @@ def test_anthropic_request_recovers_reasoning_from_thinking_block() -> None:
                     {
                         "type": "thinking",
                         "thinking": REASONING_TEXT,
-                        "signature": "sg_polar_xxx",
+                        "signature": "sg_openevo_xxx",
                     },
                     {"type": "text", "text": ANSWER_TEXT},
                 ],
@@ -127,7 +127,7 @@ def test_anthropic_thinking_request_param_enables_thinking() -> None:
     t = AnthropicTransformer()
     out = t.transform_request(
         {
-            "_polar_model_served": "MiniMax-M2.5",
+            "_openevo_model_served": "MiniMax-M2.5",
             "thinking": {"type": "enabled", "budget_tokens": 1024},
             "messages": [{"role": "user", "content": "hi"}],
             "max_tokens": 10,
@@ -183,7 +183,7 @@ def test_gemini_request_recovers_reasoning_from_thought_part() -> None:
     t = GoogleTransformer()
     out = t.transform_request(
         {
-            "_polar_model_served": "MiniMax-M2.5",
+            "_openevo_model_served": "MiniMax-M2.5",
             "contents": [
                 {"role": "user", "parts": [{"text": "compute"}]},
                 {
@@ -192,7 +192,7 @@ def test_gemini_request_recovers_reasoning_from_thought_part() -> None:
                         {
                             "thought": True,
                             "text": REASONING_TEXT,
-                            "thoughtSignature": "sg_polar_xxx",
+                            "thoughtSignature": "sg_openevo_xxx",
                         },
                         {"text": ANSWER_TEXT},
                     ],
@@ -211,7 +211,7 @@ def test_gemini_thinking_config_enables_thinking() -> None:
     t = GoogleTransformer()
     out = t.transform_request(
         {
-            "_polar_model_served": "MiniMax-M2.5",
+            "_openevo_model_served": "MiniMax-M2.5",
             "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
             "generationConfig": {"thinkingConfig": {"includeThoughts": True}},
         }
@@ -237,7 +237,7 @@ def test_responses_request_recovers_reasoning_attached_to_assistant() -> None:
     t = OpenAIResponsesTransformer()
     out = t.transform_request(
         {
-            "_polar_model_served": "MiniMax-M2.5",
+            "_openevo_model_served": "MiniMax-M2.5",
             "input": [
                 {"type": "message", "role": "user", "content": "compute"},
                 {
@@ -245,7 +245,7 @@ def test_responses_request_recovers_reasoning_attached_to_assistant() -> None:
                     "id": "rs_1",
                     "summary": [{"type": "summary_text", "text": REASONING_TEXT}],
                     "content": [{"type": "reasoning_text", "text": REASONING_TEXT}],
-                    "encrypted_content": "polar:LWE=",
+                    "encrypted_content": "openevo:LWE=",
                 },
                 {"type": "message", "role": "assistant", "content": ANSWER_TEXT},
                 {"type": "message", "role": "user", "content": "explain"},
@@ -260,7 +260,7 @@ def test_responses_request_attaches_reasoning_to_function_call() -> None:
     t = OpenAIResponsesTransformer()
     out = t.transform_request(
         {
-            "_polar_model_served": "MiniMax-M2.5",
+            "_openevo_model_served": "MiniMax-M2.5",
             "input": [
                 {"type": "message", "role": "user", "content": "use tool"},
                 {
@@ -286,7 +286,7 @@ def test_responses_reasoning_request_param_enables_thinking() -> None:
     t = OpenAIResponsesTransformer()
     out = t.transform_request(
         {
-            "_polar_model_served": "MiniMax-M2.5",
+            "_openevo_model_served": "MiniMax-M2.5",
             "input": "compute",
             "reasoning": {"effort": "medium"},
         }

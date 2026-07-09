@@ -1919,7 +1919,7 @@ def test_agent_system_history_reflector_consumes_human_feedback(
                                 "file_path": "/secret.txt",
                                 "workspace_path": "/workspace/prod/key.pem",
                                 "app_path": "/app/secret.txt",
-                                "polar_path": "/openevo/session/evolution/memory.md",
+                                "openevo_path": "/openevo/session/evolution/memory.md",
                                 "windows_program_path": r"C:\Program Files\secret.txt",
                                 "windows_user_path": r"C:\Users\Alice Smith\secret.txt",
                                 "unc_path": r"\\server\share\secret.txt",
@@ -1987,7 +1987,7 @@ def test_agent_system_history_reflector_consumes_human_feedback(
                                             "s3://bucket/key?X-Amz-Signature=s3-prompt"
                                             "#s3-fragment"
                                         ),
-                                        "Avoid custom polar+artifact://host/path?secret=query-secret#frag",
+                                        "Avoid custom openevo+artifact://host/path?secret=query-secret#frag",
                                         (
                                             "Avoid credentialed URL "
                                             "https://reviewer:prompt_token@example.com/path"
@@ -2014,7 +2014,7 @@ def test_agent_system_history_reflector_consumes_human_feedback(
                                         "Do not log AWS_SECRET_ACCESS_KEY=prompt-aws-secret",
                                         "Do not inspect file:///tmp/prompt-secret.txt",
                                         "Do not inspect /secret.txt",
-                                        "Do not inspect /tmp/polar-secret.txt",
+                                        "Do not inspect /tmp/openevo-secret.txt",
                                         "Do not inspect /etc/passwd",
                                         "Do not inspect /mnt/data/secret.txt",
                                         "Do not inspect /scratch/alice/.aws/credentials",
@@ -2130,7 +2130,7 @@ def test_agent_system_history_reflector_consumes_human_feedback(
     assert "prompt-aws-secret" not in prompt
     assert "file://" not in prompt
     assert "/tmp/prompt-secret.txt" not in prompt
-    assert "/tmp/polar-secret.txt" not in prompt
+    assert "/tmp/openevo-secret.txt" not in prompt
     assert "/etc/passwd" not in prompt
     assert "/mnt/data/secret.txt" not in prompt
     assert "/scratch/alice/.aws/credentials" not in prompt

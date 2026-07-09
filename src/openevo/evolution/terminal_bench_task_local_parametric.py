@@ -1161,7 +1161,7 @@ def _task_local_direct_solver_prefix_messages(
     failed: TrajectoryPoolRow,
     successful: TrajectoryPoolRow,
 ) -> list[dict[str, Any]]:
-    read_task_call_id = "polar-task-local-read-task"
+    read_task_call_id = "openevo-task-local-read-task"
     task_text = _task_instruction_text(failed) or _task_instruction_text(successful)
     if not task_text:
         task_text = _task_summary(failed)
@@ -1194,7 +1194,7 @@ def _previous_command_messages(
 ) -> list[dict[str, Any]]:
     messages: list[dict[str, Any]] = []
     for index, command in enumerate(commands):
-        call_id = f"polar-task-local-sequence-{index}"
+        call_id = f"openevo-task-local-sequence-{index}"
         messages.extend(
             [
                 _task_local_target_exec_message(
@@ -1936,7 +1936,7 @@ def _task_local_read_task_response(task_text: str) -> str:
 def _task_local_target_exec_message(
     command: str,
     *,
-    call_id: str = "polar-task-local-target",
+    call_id: str = "openevo-task-local-target",
     timeout_seconds: int | None = None,
 ) -> dict[str, Any]:
     arguments: dict[str, Any] = {
@@ -2002,7 +2002,7 @@ def _tool_call(
     name: str,
     arguments: dict[str, Any],
     *,
-    call_id: str = "polar-task-local-target",
+    call_id: str = "openevo-task-local-target",
 ) -> dict[str, Any]:
     return {
         "id": call_id,

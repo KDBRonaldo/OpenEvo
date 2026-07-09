@@ -16,7 +16,7 @@ class OpenAIChatTransformer(BaseTransformer):
             result["max_tokens"] = result["max_completion_tokens"]
         return self._normalize_request(
             result,
-            body.get("_polar_model_served"),
+            body.get("_openevo_model_served"),
         )
 
     def transform_response(

@@ -27,7 +27,7 @@ def make_signature(reasoning_text: str) -> str:
     if not reasoning_text:
         return ""
     digest = hashlib.sha256(reasoning_text.encode("utf-8")).digest()
-    return "sg_polar_" + base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
+    return "sg_openevo_" + base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
 
 
 def encrypt_reasoning(reasoning_text: str) -> str:
@@ -38,15 +38,15 @@ def encrypt_reasoning(reasoning_text: str) -> str:
     """
     if not reasoning_text:
         return ""
-    return "polar:" + base64.urlsafe_b64encode(reasoning_text.encode("utf-8")).decode("ascii")
+    return "openevo:" + base64.urlsafe_b64encode(reasoning_text.encode("utf-8")).decode("ascii")
 
 
 def decrypt_reasoning(encrypted: str | None) -> str:
     """Reverse of `encrypt_reasoning`. Returns empty string on any failure."""
-    if not isinstance(encrypted, str) or not encrypted.startswith("polar:"):
+    if not isinstance(encrypted, str) or not encrypted.startswith("openevo:"):
         return ""
     try:
-        return base64.urlsafe_b64decode(encrypted[len("polar:") :].encode("ascii")).decode("utf-8")
+        return base64.urlsafe_b64decode(encrypted[len("openevo:") :].encode("ascii")).decode("utf-8")
     except Exception:
         return ""
 

@@ -69,7 +69,7 @@ class CodexHarness(BaseHarness):
                 toml_lines.append(f"type = {_toml_string(server.transport)}")
         toml_content = "\n".join(toml_lines)
         await runtime.exec(
-            f"cat > {shlex.quote(codex_home)}/config.toml << 'POLARCFG'\n{toml_content}\nPOLARCFG"
+            f"cat > {shlex.quote(codex_home)}/config.toml << 'OPENEVO_CFG'\n{toml_content}\nOPENEVO_CFG"
         )
 
         # Copy skills

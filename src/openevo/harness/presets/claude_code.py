@@ -51,7 +51,7 @@ class ClaudeCodeHarness(BaseHarness):
             config = {"mcpServers": mcp_config}
             config_json = json.dumps(config)
             await runtime.exec(
-                f"cat > {shlex.quote(config_dir)}/.claude.json << 'POLARCFG'\n{config_json}\nPOLARCFG"
+                f"cat > {shlex.quote(config_dir)}/.claude.json << 'OPENEVO_CFG'\n{config_json}\nOPENEVO_CFG"
             )
 
         # Copy skills

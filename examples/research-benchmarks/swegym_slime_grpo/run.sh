@@ -226,7 +226,7 @@ ray job submit --address="http://${RAY_HEAD_IP}:8265" \
     --save "$SAVE_DIR" \
     --save-interval "${SAVE_INTERVAL:-10}" \
     --update-weights-interval 1 \
-    --rollout-function-path slime_bridge.rollout.generate_rollout_polar_async \
+    --rollout-function-path slime_bridge.rollout.generate_rollout_openevo_async \
     --custom-rm-path slime_bridge.reward.reward_func \
     --custom-reward-post-process-path slime_bridge.reward_post_process.post_process_rewards \
     --custom-config-path "${CUSTOM_CONFIG_PATH}" \

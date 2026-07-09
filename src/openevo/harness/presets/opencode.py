@@ -63,7 +63,7 @@ class OpenCodeHarness(BaseHarness):
 
         config_json = json.dumps(config, indent=2)
         await runtime.exec(
-            f"cat > {self._config_dir}/opencode.json << 'POLARCFG'\n{config_json}\nPOLARCFG"
+            f"cat > {self._config_dir}/opencode.json << 'OPENEVO_CFG'\n{config_json}\nOPENEVO_CFG"
         )
 
         # Copy skills

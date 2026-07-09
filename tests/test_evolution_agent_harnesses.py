@@ -68,10 +68,10 @@ class RecordingRuntime(BaseRuntime):
 
 
 def _codex_config_toml(commands: list[str]) -> str:
-    marker = "config.toml << 'POLARCFG'\n"
+    marker = "config.toml << 'OPENEVO_CFG'\n"
     for command in commands:
         if marker in command:
-            return command.split(marker, 1)[1].rsplit("\nPOLARCFG", 1)[0]
+            return command.split(marker, 1)[1].rsplit("\nOPENEVO_CFG", 1)[0]
     raise AssertionError("Codex config.toml write command not found")
 
 

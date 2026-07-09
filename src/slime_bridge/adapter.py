@@ -139,7 +139,7 @@ def _build_sample(
 
     prompt_value = prompt_messages if prompt_messages else ""
 
-    polar_metadata: dict[str, Any] = {
+    openevo_metadata: dict[str, Any] = {
         "node_id": result.node_id,
         "result_metadata": deepcopy(getattr(result, "metadata", {}) or {}),
         "result_error": result.error,
@@ -159,7 +159,7 @@ def _build_sample(
             "response_messages": deepcopy(response_messages),
         },
     }
-    polar_metadata.update(_scheduler_metadata(result, trace))
+    openevo_metadata.update(_scheduler_metadata(result, trace))
 
     return Sample(
         group_index=group_index,
@@ -172,7 +172,7 @@ def _build_sample(
         loss_mask=loss_mask,
         rollout_log_probs=response_log_probs,
         status=status,
-        metadata={"polar": polar_metadata},
+        metadata={"openevo": openevo_metadata},
     )
 
 
@@ -190,7 +190,7 @@ def _build_dummy_sample(
     accept a partially usable group while still surfacing empty sessions in
     OpenEvo bridge metrics.
     """
-    polar_metadata: dict[str, Any] = {
+    openevo_metadata: dict[str, Any] = {
         "node_id": result.node_id,
         "result_metadata": deepcopy(getattr(result, "metadata", {}) or {}),
         "result_error": result.error,
@@ -204,7 +204,7 @@ def _build_dummy_sample(
         "trajectory_status": result.trajectory.status,
         "placeholder": True,
     }
-    polar_metadata.update(_scheduler_metadata(result, None))
+    openevo_metadata.update(_scheduler_metadata(result, None))
     return Sample(
         group_index=group_index,
         index=index,
@@ -217,7 +217,7 @@ def _build_dummy_sample(
         rollout_log_probs=[0.0],
         status=Sample.Status.ABORTED,
         remove_sample=True,
-        metadata={"polar": polar_metadata},
+        metadata={"openevo": openevo_metadata},
     )
 
 

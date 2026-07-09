@@ -9,7 +9,7 @@ from slime_bridge.config import (
     render_instruction,
     render_task_payload,
     render_topology_template,
-    resolve_polar_slime_config,
+    resolve_openevo_slime_config,
     resolve_sglang_router_base_url,
 )
 from slime_bridge.reward import reward_func
@@ -18,26 +18,26 @@ from slime_bridge.rollout import _resolve_gateway_url
 
 def _args(**overrides):
     base = {
-        "polar_rollout_url": "http://rollout:8080/",
-        "polar_task_template": {
+        "openevo_rollout_url": "http://rollout:8080/",
+        "openevo_task_template": {
             "agent": {"harness": "codex", "model_name": "{args.model_name}"},
             "runtime": {"image": "{sample.metadata.image}"},
             "metadata": {"instance": "{sample.metadata.instance_id}"},
         },
-        "polar_task_id_template": "task-{rollout_id}-{sample.group_index}",
-        "polar_instruction_template": "Instruction: {instruction}",
-        "polar_reward_key": "score",
-        "polar_max_async_level": 2,
+        "openevo_task_id_template": "task-{rollout_id}-{sample.group_index}",
+        "openevo_instruction_template": "Instruction: {instruction}",
+        "openevo_reward_key": "score",
+        "openevo_max_async_level": 2,
         "rollout_batch_size": 3,
         "n_samples_per_prompt": 4,
         "update_weights_interval": 5,
-        "polar_request_timeout": 60,
-        "polar_callback_host": "127.0.0.1",
-        "polar_scoring_mode": "group",
-        "polar_min_complete_accept_fraction": 0.0,
+        "openevo_request_timeout": 60,
+        "openevo_callback_host": "127.0.0.1",
+        "openevo_scoring_mode": "group",
+        "openevo_min_complete_accept_fraction": 0.0,
         "hf_checkpoint": "tokenizer-name",
-        "polar_add_generation_prompt": True,
-        "polar_eval_dataset_name": "eval",
+        "openevo_add_generation_prompt": True,
+        "openevo_eval_dataset_name": "eval",
         "model_name": "openai/gpt-test",
         "sglang_router_ip": "127.0.0.1",
         "sglang_router_port": 30000,
@@ -46,8 +46,8 @@ def _args(**overrides):
     return SimpleNamespace(**base)
 
 
-def test_resolve_polar_slime_config_computes_concurrency_and_normalizes_url() -> None:
-    config = resolve_polar_slime_config(_args())
+def test_resolve_openevo_slime_config_computes_concurrency_and_normalizes_url() -> None:
+    config = resolve_openevo_slime_config(_args())
 
     assert config.rollout_server_url == "http://rollout:8080"
     assert config.max_concurrency == 6
@@ -57,11 +57,9 @@ def test_resolve_polar_slime_config_computes_concurrency_and_normalizes_url() ->
     assert config.min_complete_accept_fraction == 0.0
 
 
-def test_resolve_polar_slime_config_accepts_openevo_aliases() -> None:
-    config = resolve_polar_slime_config(
+def test_resolve_openevo_slime_config_uses_openevo_settings() -> None:
+    config = resolve_openevo_slime_config(
         _args(
-            polar_rollout_url=None,
-            polar_task_template=None,
             openevo_rollout_url="http://openevo-rollout:8080/",
             openevo_task_template={
                 "agent": {"harness": "codex", "model_name": "{args.model_name}"},
@@ -87,7 +85,7 @@ def test_resolve_polar_slime_config_accepts_openevo_aliases() -> None:
     assert config.eval_dataset_name == "openevo_eval"
 
 
-def test_slime_weight_update_helpers_accept_openevo_aliases(tmp_path) -> None:
+def test_slime_weight_update_helpers_accept_openevo_settings(tmp_path) -> None:
     topology_path = tmp_path / "topology.yaml"
     topology_path.write_text(
         """
@@ -106,8 +104,7 @@ gateway:
     assert (
         _resolve_gateway_url(
             _args(
-                polar_gateway_url=None,
-                polar_topology_path=None,
+                openevo_gateway_url=None,
                 openevo_topology_path=str(topology_path),
             )
         )
@@ -115,7 +112,7 @@ gateway:
     )
     assert (
         _resolve_gateway_url(
-            _args(polar_gateway_url=None, openevo_gateway_url="http://gateway:8100/")
+            _args(openevo_gateway_url="http://gateway:8100/")
         )
         == "http://gateway:8100"
     )
@@ -135,36 +132,36 @@ def test_reward_func_accepts_openevo_reward_key() -> None:
 def test_reward_func_treats_none_openevo_reward_key_as_absent() -> None:
     result = asyncio.run(
         reward_func(
-            SimpleNamespace(openevo_reward_key=None, polar_reward_key="legacy_score"),
-            SimpleNamespace(reward={"legacy_score": 0.6, "score": 0.2}),
+            SimpleNamespace(openevo_reward_key=None, reward_key="fallback_score"),
+            SimpleNamespace(reward={"fallback_score": 0.6, "score": 0.2}),
         )
     )
 
-    assert result == {"legacy_score": 0.6}
+    assert result == {"fallback_score": 0.6}
 
 
-def test_resolve_polar_slime_config_requires_agent_template() -> None:
+def test_resolve_openevo_slime_config_requires_agent_template() -> None:
     with pytest.raises(ValueError, match="agent spec"):
-        resolve_polar_slime_config(_args(polar_task_template={}))
+        resolve_openevo_slime_config(_args(openevo_task_template={}))
 
 
-def test_resolve_polar_slime_config_accepts_complete_fraction_threshold() -> None:
-    config = resolve_polar_slime_config(
-        _args(polar_min_complete_accept_fraction=0.8)
+def test_resolve_openevo_slime_config_accepts_complete_fraction_threshold() -> None:
+    config = resolve_openevo_slime_config(
+        _args(openevo_min_complete_accept_fraction=0.8)
     )
 
     assert config.min_complete_accept_fraction == 0.8
 
 
 @pytest.mark.parametrize("value", [-0.1, 1.1])
-def test_resolve_polar_slime_config_rejects_invalid_complete_fraction(value) -> None:
+def test_resolve_openevo_slime_config_rejects_invalid_complete_fraction(value) -> None:
     with pytest.raises(ValueError, match="openevo_min_complete_accept_fraction"):
-        resolve_polar_slime_config(_args(polar_min_complete_accept_fraction=value))
+        resolve_openevo_slime_config(_args(openevo_min_complete_accept_fraction=value))
 
 
 def test_render_task_payload_resolves_args_and_sample_placeholders() -> None:
     args = _args()
-    config = resolve_polar_slime_config(args)
+    config = resolve_openevo_slime_config(args)
     sample = SimpleNamespace(
         prompt="prompt",
         metadata={"image": "runtime:latest", "instance_id": "abc123"},
@@ -191,7 +188,7 @@ def test_render_task_payload_resolves_args_and_sample_placeholders() -> None:
 
 def test_render_instruction_uses_optional_template() -> None:
     args = _args()
-    config = resolve_polar_slime_config(args)
+    config = resolve_openevo_slime_config(args)
 
     rendered = render_instruction(
         args=args,

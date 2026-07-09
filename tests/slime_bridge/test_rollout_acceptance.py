@@ -33,7 +33,7 @@ def _sample(
         loss_mask=loss_mask,
         response_length=len(loss_mask),
         remove_sample=remove_sample,
-        metadata={"polar": {"session_id": f"session-{session_index}"}},
+        metadata={"openevo": {"session_id": f"session-{session_index}"}},
     )
 
 

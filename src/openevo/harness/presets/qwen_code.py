@@ -36,7 +36,7 @@ class QwenCodeHarness(BaseHarness):
             config = {"mcpServers": servers_config}
             config_json = json.dumps(config)
             await runtime.exec(
-                f"cat > {self._qwen_dir}/settings.json << 'POLARCFG'\n{config_json}\nPOLARCFG"
+                f"cat > {self._qwen_dir}/settings.json << 'OPENEVO_CFG'\n{config_json}\nOPENEVO_CFG"
             )
 
         # Copy skills

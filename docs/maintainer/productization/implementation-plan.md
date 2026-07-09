@@ -2586,7 +2586,11 @@ def test_desktop_is_top_level_product_surface() -> None:
     assert not (REPO_ROOT / "src" / "openevo" / "desktop").exists()
 ```
 
-Expected: the identity guard is a normal blocking pytest module.
+Expected: the identity guard is a normal blocking pytest module. It scans the
+release-facing active surface and may allowlist only explicit maintainer archive
+paths such as `docs/maintainer/development-history/`,
+`docs/maintainer/productization/`, `docs/dev/`, the identity audit script, and
+tests that intentionally mention legacy markers.
 
 - [ ] **Step 2: Run full identity audit**
 
@@ -2595,15 +2599,20 @@ Run:
 ```bash
 pytest tests/ci/test_openevo_productization_identity.py -q
 rg -n \
+  --glob '!desktop/node_modules/**' \
+  --glob '!docs/maintainer/development-history/**' \
   --glob '!docs/maintainer/productization/**' \
+  --glob '!docs/dev/**' \
   --glob '!docs/maintainer/migration-notes.md' \
   --glob '!scripts/ci/audit_openevo_identity.py' \
+  --glob '!tests/ci/test_check_openevo_release.py' \
+  --glob '!tests/ci/test_openevo_productization_workflow.py' \
   --glob '!tests/ci/test_openevo_productization_identity.py' \
-  "src/polar|src/polar_evolution|POLAR_|/polar/session|polar\\.session_completed|polar-evolution|Polar Dashboard" \
+  "Polar|polar|POLAR[A-Z0-9_]*|POLAR_|/polar/session|polar\\.session_completed|polar_|polar/|polar:|polar-|polar\\." \
   .
 ```
 
-Expected: no matches outside allowlisted migration notes/tests.
+Expected: no matches outside allowlisted archive notes/tests.
 
 - [ ] **Step 3: Run focused test suites**
 

@@ -7,9 +7,8 @@ separately — OpenEvo depends on none of them.
 
 ## How it fits
 
-Slime calls one entry point, `generate_rollout_polar_async`, wired in via
-`--rollout-function-path`. That entry point name is a legacy compatibility name;
-the behavior is the OpenEvo bridge. From there the bridge:
+Slime calls one entry point, `generate_rollout_openevo_async`, wired in via
+`--rollout-function-path`. From there the bridge:
 
 - submits async task batches to `openevo_rollout_url` (or a node derived from
   `openevo_topology_path`) and collects each result through a local callback
@@ -28,11 +27,9 @@ the behavior is the OpenEvo bridge. From there the bridge:
 
 ## Main files
 
-- `config.py`: `PolarSlimeConfig` + `resolve_polar_slime_config`; these class and
-  function names are legacy compatibility names. The resolver accepts
-  `openevo_*` config keys first and falls back to old aliases. It also renders the
-  task payload, the instruction, and the topology that points gateways at Slime's
-  SGLang router.
+- `config.py`: `OpenEvoSlimeConfig` + `resolve_openevo_slime_config`; the
+  resolver accepts `openevo_*` config keys, renders the task payload and
+  instruction, and points gateways at Slime's SGLang router.
 - `rollout.py`: the async worker (submit → callback/poll → convert), the
   evaluation path, policy-update coordination, the acceptance filters, and the
   Slime entry point.

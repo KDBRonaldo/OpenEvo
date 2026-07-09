@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -16,12 +17,19 @@ TEXT_SUFFIXES = {
     ".json",
     ".ts",
     ".tsx",
+    ".svg",
     ".rs",
     ".sh",
+    ".html",
+    ".css",
+    ".js",
+    ".lock",
+    ".txt",
 }
 TEXT_FILENAMES = {
     "Dockerfile",
     "Containerfile",
+    ".env.openevo-desktop",
 }
 MARKERS = (
     "src/" + "polar",
@@ -29,7 +37,13 @@ MARKERS = (
     "POL" + "AR_",
     "/pol" + "ar/session",
     "pol" + "ar.session_completed",
+    "Polar",
+    "polar_",
+    "polar/",
+    "polar:",
     "polar-" + "evolution",
+    "polar-",
+    "polar.",
     "uv run " + "polar",
     "polar serve_",
     "polar dashboard",
@@ -47,19 +61,34 @@ PATH_MARKERS = (
     "openevo-dev-kit",
     "slime_polar_async",
     "polar_stars",
+    "polar_",
+)
+TEXT_PATTERNS = tuple(
+    re.compile(pattern)
+    for pattern in (
+        r"\bpolar[A-Za-z0-9_]+",
+        r"\b[A-Za-z0-9_]+polar[A-Za-z0-9_]*",
+        r"\bPOLAR[A-Z0-9_]*\b",
+    )
 )
 ACTIVE_PREFIXES = (
     "src/",
-    "tests/",
     "scripts/",
     "examples/",
+    "assets/",
     "desktop/",
     "web/",
     "docs/architecture/",
+    "docs/core/",
     "docs/user/",
     "docs/maintainer/",
+    ".github/",
     "README.md",
     "AGENTS.md",
+    "pyproject.toml",
+    "CHANGELOG.md",
+    "CONTRIBUTING.md",
+    "SECURITY.md",
 )
 ARCHIVED_PREFIXES = (
     "docs/maintainer/development-history/",
@@ -69,6 +98,7 @@ ARCHIVED_PREFIXES = (
 IGNORED_PATHS = {
     "scripts/ci/audit_openevo_identity.py",
     "tests/ci/test_openevo_productization_workflow.py",
+    "tests/ci/test_openevo_productization_identity.py",
 }
 
 
@@ -117,6 +147,14 @@ def audit() -> dict[str, object]:
         for marker in MARKERS:
             if marker in text:
                 match = {"path": str(relative), "marker": marker}
+                matches.append(match)
+                if relative_text.startswith(ARCHIVED_PREFIXES):
+                    archived_matches.append(match)
+                elif relative_text.startswith(ACTIVE_PREFIXES):
+                    active_matches.append(match)
+        for pattern in TEXT_PATTERNS:
+            if pattern.search(text):
+                match = {"path": str(relative), "marker": pattern.pattern}
                 matches.append(match)
                 if relative_text.startswith(ARCHIVED_PREFIXES):
                     archived_matches.append(match)

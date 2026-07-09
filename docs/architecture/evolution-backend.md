@@ -180,9 +180,9 @@ flowchart LR
 数据库是状态和 leases 的权威来源。文件系统用于保存较大的 payload 和物化后的
 artifacts。
 
-启动已有本地 state 时，`EvolutionStore.initialize()` 会把历史 session-completed
-event/source identity canonicalize 为当前 OpenEvo identity，避免旧本地 events 在新的
-`openevo.session_completed` dataset query 中不可见。
+启动已有本地 state 时，`EvolutionStore.initialize()` 保留 event source 和
+event type 原值，不迁移 pre-release runtime identity。Dataset queries 只匹配
+显式请求的 OpenEvo event identity，例如 `openevo.session_completed`。
 
 ## Context Resolution
 

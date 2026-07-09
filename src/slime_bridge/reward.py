@@ -18,7 +18,7 @@ async def reward_func(args: Any, sample_or_samples: Any, **kwargs: Any) -> Any:
     """Read the reward already embedded in OpenEvo-converted Slime samples."""
     del kwargs
     reward_key = str(
-        _arg_value(args, "openevo_reward_key", "polar_reward_key", "reward_key", default="score")
+        _arg_value(args, "openevo_reward_key", "reward_key", default="score")
     )
     if isinstance(sample_or_samples, list):
         return [{reward_key: _extract_reward(sample, reward_key)} for sample in sample_or_samples]

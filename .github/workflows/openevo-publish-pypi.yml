@@ -43,7 +43,8 @@ jobs:
       - name: Test release validator
         run: |
           python -m pip install --upgrade pip pytest twine -e .
-          PYTHONPATH=src:. python -m pytest tests/ci/test_check_openevo_release.py -q
+          PYTHONPATH=src:. python -m pytest tests/ci/test_check_openevo_release.py tests/ci/test_openevo_productization_identity.py -q
+          PYTHONPATH=src:. python scripts/ci/audit_openevo_identity.py
 
       - name: Build remote install wheel
         run: |

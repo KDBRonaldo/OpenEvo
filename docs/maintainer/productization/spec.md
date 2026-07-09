@@ -510,6 +510,11 @@ Remove or move out of the release-facing repository:
 - internal presentation files;
 - development-process specs and plans from the public docs path.
 
+Historical development notes may remain only under explicit maintainer archive
+paths such as `docs/maintainer/development-history/`,
+`docs/maintainer/productization/`, or `docs/dev/`. These archives are not
+ordinary-user or release-facing product documentation.
+
 Recommended docs structure:
 
 ```text
@@ -609,8 +614,11 @@ Test classes:
   artifact diff, service logs, keychain refs;
 - release smoke tests for wheel/backend and `.dmg`.
 
-Allowlist any deliberate historical mentions only in migration notes or tests
-that explicitly verify old names are gone.
+The final identity guard scans the release-facing active surface. It may
+allowlist explicit maintainer archives, migration/productization notes, and
+tests that verify old names are gone; it must not allow legacy identity strings
+in active product code, examples, user docs, release docs, workflows, package
+metadata, or Desktop assets.
 
 ## Development Workflow
 

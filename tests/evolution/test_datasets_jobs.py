@@ -193,16 +193,17 @@ def test_create_dataset_filters_events(tmp_path):
     assert worker_records[0]["traces"] == [{"reward": 1.0}]
 
 
-def test_create_dataset_includes_migrated_legacy_session_events(tmp_path):
+def test_create_dataset_excludes_non_openevo_session_event_identity(tmp_path):
     store = EvolutionStore(db_path=tmp_path / "evolution.db", artifact_root=tmp_path / "artifacts")
     store.initialize()
-    legacy_event = store.ingest_event(
+    non_openevo_event_type = "pol" + "ar.session_completed"
+    store.ingest_event(
         EventIngestRequest(
-            source="polar",
-            event_type="pol" + "ar.session_completed",
-            source_event_id="session:legacy",
-            task_id="task_legacy",
-            session_id="legacy",
+            source="openevo",
+            event_type=non_openevo_event_type,
+            source_event_id="session:non-openevo",
+            task_id="task_non_openevo",
+            session_id="non-openevo",
             status="COMPLETED",
             policy_version="policy_1",
             payload={"session_result": {"trajectory": {"traces": [{"reward": 1.0}]}}},
@@ -212,7 +213,7 @@ def test_create_dataset_includes_migrated_legacy_session_events(tmp_path):
 
     response = store.create_dataset(
         DatasetCreateRequest(
-            name="migrated_legacy",
+            name="non_openevo_session_event",
             purpose="skill_distillation",
             query={
                 "event_types": ["openevo.session_completed"],
@@ -222,14 +223,14 @@ def test_create_dataset_includes_migrated_legacy_session_events(tmp_path):
         )
     )
 
-    assert response.event_count == 1
+    assert response.event_count == 0
     with store.connect() as conn:
         dataset_event_rows = conn.execute(
             "SELECT event_id FROM dataset_events WHERE dataset_id = ?",
             (response.dataset_id,),
         ).fetchall()
 
-    assert [row["event_id"] for row in dataset_event_rows] == [legacy_event.event_id]
+    assert dataset_event_rows == []
 
 
 def test_create_dataset_sanitizes_validated_human_feedback(tmp_path):
@@ -743,9 +744,9 @@ def test_create_dataset_redacts_secrets_from_human_feedback_strings(tmp_path):
                                             "s3://bucket/key?X-Amz-Signature=s3-dataset"
                                             "#s3-fragment"
                                         ),
-                                        "Fetch custom polar+artifact://host/path?secret=query-secret#frag",
+                                        "Fetch custom openevo+artifact://host/path?secret=query-secret#frag",
                                         "Inspect file:///home/ziyi/.ssh/id_rsa",
-                                        "Inspect /tmp/polar-secret.txt",
+                                        "Inspect /tmp/openevo-secret.txt",
                                         "Inspect /etc/passwd",
                                         "Inspect /mnt/data/secret.txt",
                                         "Inspect /gpfs/projects/private/key.txt",
@@ -851,7 +852,7 @@ def test_create_dataset_redacts_secrets_from_human_feedback_strings(tmp_path):
     assert "dataset-aws-secret" not in rendered_record
     assert "file://" not in rendered_record
     assert "/home/ziyi/.ssh/id_rsa" not in rendered_record
-    assert "/tmp/polar-secret.txt" not in rendered_record
+    assert "/tmp/openevo-secret.txt" not in rendered_record
     assert "/etc/passwd" not in rendered_record
     assert "/mnt/data/secret.txt" not in rendered_record
     assert "/gpfs/projects/private/key.txt" not in rendered_record

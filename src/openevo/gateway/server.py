@@ -652,7 +652,7 @@ async def proxy_request(request: Request, path: str):
         body["_streaming"] = True
 
     transformed_body = body.copy()
-    transformed_body["_polar_model_served"] = state.node.model_served
+    transformed_body["_openevo_model_served"] = state.node.model_served
     openai_request = transformer.transform_request(transformed_body)
     openai_request["model"] = state.node.model_served
     _apply_session_adapter_merge_spec(

@@ -109,7 +109,7 @@ class BaseTransformer(ABC):
         and apply per-model template fixes. Training-signal params (logprobs,
         token ids) are added later by the inference engine.
         """
-        request.pop("_polar_model_served", None)
+        request.pop("_openevo_model_served", None)
 
         request = self._merge_developer_role(request)
 

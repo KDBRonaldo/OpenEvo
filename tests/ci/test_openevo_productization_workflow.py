@@ -57,16 +57,22 @@ def test_current_product_surface_uses_openevo_runtime_identity() -> None:
     )
     scanned_roots = (
         "src/",
-        "tests/",
         "scripts/",
         "examples/",
+        "assets/",
         "desktop/",
         "web/",
         "docs/architecture/",
+        "docs/core/",
         "docs/user/",
         "docs/maintainer/",
+        ".github/",
         "README.md",
         "AGENTS.md",
+        "pyproject.toml",
+        "CHANGELOG.md",
+        "CONTRIBUTING.md",
+        "SECURITY.md",
     )
     archived_roots = (
         "docs/maintainer/development-history/",
@@ -76,13 +82,20 @@ def test_current_product_surface_uses_openevo_runtime_identity() -> None:
     ignored_paths = {
         "scripts/ci/audit_openevo_identity.py",
         "tests/ci/test_openevo_productization_workflow.py",
+        "tests/ci/test_openevo_productization_identity.py",
     }
     forbidden = (
         "POL" + "AR_",
         "/pol" + "ar/session",
         "pol" + "ar.session_completed",
+        "Polar",
+        "polar_",
+        "polar/",
+        "polar:",
         ".pol" + "ar_evolution",
         "pol" + "ar-evolution",
+        "polar-",
+        "polar.",
         "uv run " + "polar",
         "polar serve_",
         "polar dashboard",
@@ -104,6 +117,14 @@ def test_current_product_surface_uses_openevo_runtime_identity() -> None:
         "slime_polar_async",
         "polar_stars",
     )
+    forbidden_patterns = tuple(
+        re.compile(pattern)
+        for pattern in (
+            r"\bpolar[A-Za-z0-9_]+",
+            r"\b[A-Za-z0-9_]+polar[A-Za-z0-9_]*",
+            r"\bPOLAR[A-Z0-9_]*\b",
+        )
+    )
     matches: list[tuple[str, str]] = []
     for raw_path in result.stdout.decode().split("\0"):
         if not raw_path or raw_path in ignored_paths:
@@ -123,15 +144,24 @@ def test_current_product_surface_uses_openevo_runtime_identity() -> None:
             ".yaml",
             ".yml",
             ".json",
+            ".html",
+            ".css",
+            ".js",
+            ".lock",
+            ".txt",
             ".sh",
             ".ts",
             ".tsx",
-        } and path.name not in {"Dockerfile", "Containerfile"}:
+            ".svg",
+        } and path.name not in {"Dockerfile", "Containerfile", ".env.openevo-desktop"}:
             continue
         text = path.read_text(encoding="utf-8", errors="ignore")
         for marker in forbidden:
             if marker in text:
                 matches.append((raw_path, marker))
+        for pattern in forbidden_patterns:
+            if pattern.search(text):
+                matches.append((raw_path, pattern.pattern))
 
     assert matches == []
 
@@ -157,10 +187,12 @@ def test_identity_audit_fails_on_active_legacy_markers() -> None:
     bad_dir = REPO_ROOT / "examples" / "__openevo_identity_audit_fixture"
     bad_text = bad_dir / "Dockerfile"
     bad_path = bad_dir / "assets" / "polar_bad.bin"
+    bad_svg = bad_dir / "diagram.svg"
     try:
         bad_path.parent.mkdir(parents=True, exist_ok=True)
         bad_text.write_text("from polar import legacy\n", encoding="utf-8")
         bad_path.write_bytes(b"legacy path marker")
+        bad_svg.write_text("<svg><text>Polar</text></svg>\n", encoding="utf-8")
 
         result = subprocess.run(
             [sys.executable, "scripts/ci/audit_openevo_identity.py"],
@@ -180,9 +212,14 @@ def test_identity_audit_fails_on_active_legacy_markers() -> None:
             "path": "examples/__openevo_identity_audit_fixture/assets/polar_bad.bin",
             "marker": "assets/polar",
         } in report["active_matches"]
+        assert {
+            "path": "examples/__openevo_identity_audit_fixture/diagram.svg",
+            "marker": "Polar",
+        } in report["active_matches"]
     finally:
         bad_text.unlink(missing_ok=True)
         bad_path.unlink(missing_ok=True)
+        bad_svg.unlink(missing_ok=True)
         (bad_dir / "assets").rmdir()
         bad_dir.rmdir()
 

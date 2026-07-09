@@ -70,9 +70,9 @@ def test_session_result_to_samples_converts_trace_to_slime_like_sample(monkeypat
     assert sample.loss_mask == [1, 0]
     assert sample.rollout_log_probs == [-0.1, -0.2]
     assert sample.status == FakeSample.Status.COMPLETED
-    assert sample.metadata["polar"]["group_id"] == "group-1"
-    assert sample.metadata["polar"]["policy_version"] == 5
-    assert sample.metadata["polar"]["rollout_step"] == 7
+    assert sample.metadata["openevo"]["group_id"] == "group-1"
+    assert sample.metadata["openevo"]["policy_version"] == 5
+    assert sample.metadata["openevo"]["rollout_step"] == 7
 
 
 def test_session_result_to_samples_emits_placeholder_when_trace_is_unusable(monkeypatch) -> None:
@@ -92,7 +92,7 @@ def test_session_result_to_samples_emits_placeholder_when_trace_is_unusable(monk
     assert len(samples) == 1
     assert samples[0].remove_sample is True
     assert samples[0].loss_mask == [0]
-    assert samples[0].metadata["polar"]["placeholder"] is True
+    assert samples[0].metadata["openevo"]["placeholder"] is True
 
 
 def test_session_result_to_samples_requires_logprobs_for_trainable_tokens(monkeypatch) -> None:

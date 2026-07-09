@@ -11,7 +11,7 @@ def test_google_request_maps_all_fields_and_image_input_to_chat() -> None:
 
     transformed = transformer.transform_request(
         {
-            "_polar_model_served": "Qwen/Qwen3.5-4B",
+            "_openevo_model_served": "Qwen/Qwen3.5-4B",
             "_streaming": True,
             "config": {
                 "systemInstruction": {"parts": [{"text": "Be direct."}]},

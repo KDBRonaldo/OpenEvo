@@ -447,7 +447,7 @@ class OpenAIResponsesTransformer(BaseTransformer):
 
         return self._normalize_request(
             result,
-            body.get("_polar_model_served"),
+            body.get("_openevo_model_served"),
         )
 
     def _response_format_from_text_config(

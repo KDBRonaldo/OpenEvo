@@ -1933,7 +1933,7 @@ def test_run_worker_once_local_claims_with_long_lease(
     )
 
     completed = _run_worker_once_local(
-        db_path=tmp_path / "polar.db",
+        db_path=tmp_path / "openevo.db",
         artifact_root=tmp_path / "artifacts",
     )
 

@@ -1,6 +1,6 @@
 """Slime rollout bridge for OpenEvo-managed agent sessions.
 
-Single entrypoint ``generate_rollout_polar_async`` routes training to a
+Single entrypoint ``generate_rollout_openevo_async`` routes training to a
 persistent background worker and evaluation to a one-shot submit+poll batch.
 Both paths speak OpenEvo's async-only HTTP surface (``/rollout/task/submit`` +
 ``/rollout/task/{task_id}``).
@@ -33,10 +33,10 @@ from openevo.rollout.models import TaskResult, TaskStatus
 from slime_bridge._messages import prompt_to_instruction_text
 from slime_bridge.adapter import RolloutLogprobError, session_result_to_samples
 from slime_bridge.config import (
-    PolarSlimeConfig,
+    OpenEvoSlimeConfig,
     render_instruction,
     render_task_payload,
-    resolve_polar_slime_config,
+    resolve_openevo_slime_config,
 )
 
 logger = logging.getLogger(__name__)
@@ -46,11 +46,11 @@ _CALLBACK_FALLBACK_POLL_SECONDS = 60.0  # defensive backstop for dropped callbac
 _LONGEST_TRACE_ARTIFACT_INTERVAL = 5  # dump longest trace every N rollouts
 
 
-class PolarRolloutSchedulerError(RuntimeError):
+class OpenEvoRolloutSchedulerError(RuntimeError):
     """Raised when the async OpenEvo scheduler cannot safely make progress."""
 
 
-class PolarLowCompleteAcceptFractionError(PolarRolloutSchedulerError):
+class OpenEvoLowCompleteAcceptFractionError(OpenEvoRolloutSchedulerError):
     """Raised when a completed task has too few trainable completed sessions."""
 
 
@@ -82,16 +82,16 @@ class _CompletedGroup:
 # ---------------------------------------------------------------------------
 # Global worker singleton
 # ---------------------------------------------------------------------------
-_global_async_worker: "AsyncPolarRolloutWorker | None" = None
+_global_async_worker: "AsyncOpenEvoRolloutWorker | None" = None
 _worker_lock = threading.Lock()
 
 
-def get_global_async_worker(args: Any, data_source: Any) -> "AsyncPolarRolloutWorker":
+def get_global_async_worker(args: Any, data_source: Any) -> "AsyncOpenEvoRolloutWorker":
     global _global_async_worker
     with _worker_lock:
         if _global_async_worker is None or not _global_async_worker.is_alive():
             logger.info("Creating new async OpenEvo rollout worker")
-            _global_async_worker = AsyncPolarRolloutWorker(args, data_source)
+            _global_async_worker = AsyncOpenEvoRolloutWorker(args, data_source)
             _global_async_worker.start()
         return _global_async_worker
 
@@ -156,11 +156,11 @@ def _arg_value(args: Any, *names: str, default: Any = None) -> Any:
 
 
 def _resolve_gateway_url(args: Any) -> str | None:
-    gateway_url = _arg_value(args, "openevo_gateway_url", "polar_gateway_url")
+    gateway_url = _arg_value(args, "openevo_gateway_url")
     if gateway_url:
         return str(gateway_url).rstrip("/")
 
-    topology_path = _arg_value(args, "openevo_topology_path", "polar_topology_path")
+    topology_path = _arg_value(args, "openevo_topology_path")
     if topology_path:
         topology = TopologyConfig.load(topology_path)
         if topology.gateway.nodes:
@@ -171,17 +171,15 @@ def _resolve_gateway_url(args: Any) -> str | None:
 def _pause_gateway_generation(args: Any) -> None:
     gateway_url = _resolve_gateway_url(args)
     if not gateway_url:
-        raise PolarRolloutSchedulerError(
+        raise OpenEvoRolloutSchedulerError(
             "openevo_gateway_url or openevo_topology_path is required when "
-            "openevo_allow_weight_update_overlap is enabled; legacy polar_* "
-            "aliases are still accepted."
+            "openevo_allow_weight_update_overlap is enabled."
         )
 
     timeout_seconds = float(
         _arg_value(
             args,
             "openevo_weight_update_pause_timeout",
-            "polar_weight_update_pause_timeout",
             default=300.0,
         )
     )
@@ -204,7 +202,6 @@ def _resume_gateway_generation(args: Any) -> None:
         _arg_value(
             args,
             "openevo_gateway_control_timeout",
-            "polar_gateway_control_timeout",
             default=30.0,
         )
     )
@@ -220,7 +217,7 @@ def _resume_gateway_generation(args: Any) -> None:
 def _build_task_payload(
     *,
     args: Any,
-    config: PolarSlimeConfig,
+    config: OpenEvoSlimeConfig,
     group: list[Any],
     rollout_id: int,
     task_position: int,
@@ -322,7 +319,7 @@ def _resolve_max_tokens(args: Any) -> int | None:
 
 
 def _convert_task_result_to_samples(
-    config: PolarSlimeConfig,
+    config: OpenEvoSlimeConfig,
     task_result: TaskResult,
     group: list[Any],
     *,
@@ -367,7 +364,7 @@ def _has_trainable_tokens(samples: list[Any]) -> bool:
 
 
 def _low_complete_accept_fraction_rejection_reason(
-    config: PolarSlimeConfig,
+    config: OpenEvoSlimeConfig,
     task_result: TaskResult,
     samples: list[Any],
 ) -> str | None:
@@ -415,8 +412,8 @@ def _completed_trainable_session_count(
 
 
 def _sample_session_id(sample: Any) -> str | None:
-    polar_meta = (getattr(sample, "metadata", {}) or {}).get("polar", {})
-    session_id = polar_meta.get("session_id") or getattr(sample, "session_id", None)
+    openevo_meta = (getattr(sample, "metadata", {}) or {}).get("openevo", {})
+    session_id = openevo_meta.get("session_id") or getattr(sample, "session_id", None)
     return str(session_id) if session_id else None
 
 
@@ -441,11 +438,11 @@ def _annotate_accepted_samples(
         if not isinstance(metadata, dict):
             metadata = {}
             sample.metadata = metadata
-        polar_meta = metadata.setdefault("polar", {})
-        if not isinstance(polar_meta, dict):
-            polar_meta = {}
-            metadata["polar"] = polar_meta
-        polar_meta.update(
+        openevo_meta = metadata.setdefault("openevo", {})
+        if not isinstance(openevo_meta, dict):
+            openevo_meta = {}
+            metadata["openevo"] = openevo_meta
+        openevo_meta.update(
             {
                 "accepted_rollout_id": int(accepted_rollout_id),
                 "policy_staleness": int(staleness),
@@ -468,7 +465,7 @@ def _annotate_accepted_samples(
 # ---------------------------------------------------------------------------
 # Persistent training worker
 # ---------------------------------------------------------------------------
-class AsyncPolarRolloutWorker:
+class AsyncOpenEvoRolloutWorker:
     """Persistent background worker that continuously submits OpenEvo tasks.
 
     Runs in its own thread with a dedicated asyncio event loop.  Pulls
@@ -481,7 +478,7 @@ class AsyncPolarRolloutWorker:
     def __init__(self, args: Any, data_source: Any) -> None:
         self.args = args
         self.data_source = data_source
-        self.config = resolve_polar_slime_config(args)
+        self.config = resolve_openevo_slime_config(args)
         batch_size = int(getattr(args, "rollout_batch_size", 1) or 1)
         # Output queue is a handoff channel; the durable overflow buffer is
         # `_completed_buffer`, which is drained in bounded chunks by training.
@@ -535,8 +532,8 @@ class AsyncPolarRolloutWorker:
     def pause_admission(self) -> None:
         with self._state_lock:
             self._admission_paused = True
-            self._metrics["polar/scheduler/admission_pauses"] = (
-                self._metrics.get("polar/scheduler/admission_pauses", 0.0) + 1.0
+            self._metrics["openevo/scheduler/admission_pauses"] = (
+                self._metrics.get("openevo/scheduler/admission_pauses", 0.0) + 1.0
             )
 
     def resume_admission(self) -> None:
@@ -545,7 +542,7 @@ class AsyncPolarRolloutWorker:
 
     def raise_if_failed(self) -> None:
         if self._fatal_error is not None:
-            raise PolarRolloutSchedulerError(str(self._fatal_error)) from self._fatal_error
+            raise OpenEvoRolloutSchedulerError(str(self._fatal_error)) from self._fatal_error
 
     def drain_completed(
         self,
@@ -568,14 +565,14 @@ class AsyncPolarRolloutWorker:
             completed = self._completed_buffer.popleft()
             staleness = max(0, int(rollout_id) - completed.policy_version)
             if staleness > self.config.max_off_policy_steps:
-                self._inc_metric("polar/stale_groups")
+                self._inc_metric("openevo/stale_groups")
                 reason = (
                     f"staleness {staleness} exceeded max_off_policy_steps="
                     f"{self.config.max_off_policy_steps}"
                 )
-                self._inc_metric("polar/dropped_groups")
-                self._inc_metric("polar/dropped_stale_groups")
-                self._inc_metric("polar/dropped_sessions", completed.session_count)
+                self._inc_metric("openevo/dropped_groups")
+                self._inc_metric("openevo/dropped_stale_groups")
+                self._inc_metric("openevo/dropped_sessions", completed.session_count)
                 logger.warning(
                     "Dropping stale OpenEvo group %s task=%s: %s",
                     completed.group_id,
@@ -608,13 +605,13 @@ class AsyncPolarRolloutWorker:
     def snapshot_metrics(self) -> dict[str, float]:
         with self._state_lock:
             out = dict(self._metrics)
-            out["polar/scheduler/active_groups"] = float(self._active_groups)
-            out["polar/scheduler/active_sessions"] = float(self._active_sessions)
-            out["polar/scheduler/completed_buffer"] = float(self._completed_buffer_size)
-            out["polar/scheduler/output_queue"] = float(self.output_queue.qsize())
-            out["polar/scheduler/deferred_queue"] = float(self.deferred_queue.qsize())
-            out["polar/scheduler/policy_version"] = float(self._policy_version)
-            out["polar/scheduler/admission_paused"] = float(self._admission_paused)
+            out["openevo/scheduler/active_groups"] = float(self._active_groups)
+            out["openevo/scheduler/active_sessions"] = float(self._active_sessions)
+            out["openevo/scheduler/completed_buffer"] = float(self._completed_buffer_size)
+            out["openevo/scheduler/output_queue"] = float(self.output_queue.qsize())
+            out["openevo/scheduler/deferred_queue"] = float(self.deferred_queue.qsize())
+            out["openevo/scheduler/policy_version"] = float(self._policy_version)
+            out["openevo/scheduler/admission_paused"] = float(self._admission_paused)
             return out
 
     # -- internal --------------------------------------------------------------
@@ -657,7 +654,7 @@ class AsyncPolarRolloutWorker:
                         session_cost = len(next_group.group)
                         if session_cost > self.config.max_session_concurrency:
                             self._set_fatal(
-                                PolarRolloutSchedulerError(
+                                OpenEvoRolloutSchedulerError(
                                     f"Prompt group needs {session_cost} sessions but "
                                     f"derived max_session_concurrency is "
                                     f"{self.config.max_session_concurrency}"
@@ -757,21 +754,21 @@ class AsyncPolarRolloutWorker:
             return
 
         if _is_zero_trainable_error(last_error):
-            category_metric = "polar/dropped_zero_trainable_groups"
+            category_metric = "openevo/dropped_zero_trainable_groups"
             reason = "zero trainable tokens"
-        elif isinstance(last_error, PolarLowCompleteAcceptFractionError):
-            category_metric = "polar/dropped_low_complete_fraction_groups"
+        elif isinstance(last_error, OpenEvoLowCompleteAcceptFractionError):
+            category_metric = "openevo/dropped_low_complete_fraction_groups"
             reason = "low complete accept fraction"
         elif isinstance(last_error, RolloutLogprobError):
-            category_metric = "polar/dropped_logprob_error_groups"
+            category_metric = "openevo/dropped_logprob_error_groups"
             reason = "rollout logprob error"
         else:
-            category_metric = "polar/dropped_failed_groups"
+            category_metric = "openevo/dropped_failed_groups"
             reason = "task failure"
 
-        self._inc_metric("polar/dropped_groups")
+        self._inc_metric("openevo/dropped_groups")
         self._inc_metric(category_metric)
-        self._inc_metric("polar/dropped_sessions", pending.session_cost)
+        self._inc_metric("openevo/dropped_sessions", pending.session_cost)
         logger.warning(
             "Dropping OpenEvo group %s because of %s: %s",
             pending.group_id,
@@ -800,7 +797,7 @@ class AsyncPolarRolloutWorker:
 
         rejection_reason = self._task_rejection_reason(task_result, pending.group)
         if rejection_reason is not None:
-            raise PolarRolloutSchedulerError(
+            raise OpenEvoRolloutSchedulerError(
                 f"Task {task_result.task_id} cannot be accepted: {rejection_reason}"
             )
 
@@ -809,16 +806,16 @@ class AsyncPolarRolloutWorker:
             max_tokens=_resolve_max_tokens(self.args),
         )
         if not group_samples:
-            raise PolarRolloutSchedulerError(f"Task {task_result.task_id} converted to zero samples")
+            raise OpenEvoRolloutSchedulerError(f"Task {task_result.task_id} converted to zero samples")
         if not _has_trainable_tokens(group_samples):
-            raise PolarRolloutSchedulerError(
+            raise OpenEvoRolloutSchedulerError(
                 f"Task {task_result.task_id} produced zero trainable tokens"
             )
         rejection_reason = _low_complete_accept_fraction_rejection_reason(
             self.config, task_result, group_samples
         )
         if rejection_reason is not None:
-            raise PolarLowCompleteAcceptFractionError(
+            raise OpenEvoLowCompleteAcceptFractionError(
                 f"Task {task_result.task_id} cannot be accepted: {rejection_reason}"
             )
 
@@ -836,16 +833,16 @@ class AsyncPolarRolloutWorker:
         while self._running:
             try:
                 self.output_queue.put_nowait(completed)
-                self._inc_metric("polar/completed_groups")
+                self._inc_metric("openevo/completed_groups")
                 return
             except queue.Full:
-                self._inc_metric("polar/output_queue_full_waits")
+                self._inc_metric("openevo/output_queue_full_waits")
                 await asyncio.sleep(0.1)
 
     def _next_group_for_submission(self) -> _DeferredGroup | None:
         try:
             deferred = self.deferred_queue.get_nowait()
-            self._inc_metric("polar/deferred_queue_dequeues")
+            self._inc_metric("openevo/deferred_queue_dequeues")
             return deferred
         except queue.Empty:
             pass
@@ -855,7 +852,7 @@ class AsyncPolarRolloutWorker:
             return None
         group = groups[0]
         if not group:
-            raise PolarRolloutSchedulerError("Slime data source returned an empty sample group")
+            raise OpenEvoRolloutSchedulerError("Slime data source returned an empty sample group")
         return _DeferredGroup(group=group)
 
     def _can_admit_group(
@@ -976,7 +973,7 @@ async def _run_eval_rollout(
     rollout_id: int,
     data_source: Any,
 ) -> Any:
-    config = resolve_polar_slime_config(args)
+    config = resolve_openevo_slime_config(args)
     eval_datasets = list(getattr(args, "eval_datasets", []) or [])
     if eval_datasets:
         data: dict[str, dict[str, Any]] = {}
@@ -1016,7 +1013,7 @@ async def _run_eval_rollout(
 async def _run_eval_dataset(
     *,
     args: Any,
-    config: PolarSlimeConfig,
+    config: OpenEvoSlimeConfig,
     rollout_id: int,
     dataset_cfg: Any,
 ) -> tuple[str, dict[str, Any], dict[str, Any]]:
@@ -1035,7 +1032,7 @@ async def _run_eval_dataset(
 async def _submit_eval_groups(
     *,
     args: Any,
-    config: PolarSlimeConfig,
+    config: OpenEvoSlimeConfig,
     dataset_name: str,
     rollout_id: int,
     sample_groups: list[list[Any]],
@@ -1118,15 +1115,15 @@ def _completed_session_samples(samples: list[Any]) -> list[Any]:
         if _sample_session_status(sample) == "COMPLETED"
         and not bool(
             (getattr(sample, "metadata", {}) or {})
-            .get("polar", {})
+            .get("openevo", {})
             .get("placeholder")
         )
     ]
 
 
 def _sample_session_status(sample: Any) -> str | None:
-    polar_meta = (getattr(sample, "metadata", {}) or {}).get("polar", {})
-    status = polar_meta.get("session_status")
+    openevo_meta = (getattr(sample, "metadata", {}) or {}).get("openevo", {})
+    status = openevo_meta.get("session_status")
     return getattr(status, "value", status)
 
 
@@ -1203,10 +1200,10 @@ def _inject_eval_metadata(dataset_cfg: Any, sample_metadata: Any) -> dict[str, A
 def _prefix_eval_metrics(dataset_name: str, metrics: dict[str, Any]) -> dict[str, Any]:
     prefixed: dict[str, Any] = {}
     for key, value in metrics.items():
-        if key.startswith("polar/"):
-            prefixed[f"polar/eval/{dataset_name}/{key.removeprefix('polar/')}"] = value
+        if key.startswith("openevo/"):
+            prefixed[f"openevo/eval/{dataset_name}/{key.removeprefix('openevo/')}"] = value
         else:
-            prefixed[f"polar/eval/{dataset_name}/{key}"] = value
+            prefixed[f"openevo/eval/{dataset_name}/{key}"] = value
     return prefixed
 
 
@@ -1227,7 +1224,7 @@ def _pull_sample_groups(data_source: Any, batch_size: int) -> list[list[Any]]:
 
 
 def _build_metrics(
-    config: PolarSlimeConfig,
+    config: OpenEvoSlimeConfig,
     task_results: list[TaskResult],
     output_groups: list[list[Any]],
     *,
@@ -1246,14 +1243,14 @@ def _build_metrics(
     else:
         raise ValueError("reward_filter must be 'all' or 'completed'")
     metrics: dict[str, Any] = {}
-    metrics.update(_polar_extra_metrics(flat_samples, rewards, config.reward_key))
+    metrics.update(_openevo_extra_metrics(flat_samples, rewards, config.reward_key))
     return metrics
 
 
 # ---------------------------------------------------------------------------
 # Public entrypoint
 # ---------------------------------------------------------------------------
-def generate_rollout_polar_async(args: Any, rollout_id: int, data_source: Any, evaluation: bool = False) -> Any:
+def generate_rollout_openevo_async(args: Any, rollout_id: int, data_source: Any, evaluation: bool = False) -> Any:
     """Slime-compatible async rollout entrypoint.
 
     Training runs are served by a persistent background worker that pulls
@@ -1304,7 +1301,7 @@ def generate_rollout_polar_async(args: Any, rollout_id: int, data_source: Any, e
     flat = [s for g in data for s in g]
     rewards = [_extract_sample_reward(s, async_worker.config.reward_key) for s in flat]
     metrics: dict[str, Any] = {}
-    metrics.update(_polar_extra_metrics(flat, rewards, async_worker.config.reward_key))
+    metrics.update(_openevo_extra_metrics(flat, rewards, async_worker.config.reward_key))
     return RolloutFnTrainOutput(samples=data, metrics=metrics)
 
 
@@ -1344,15 +1341,15 @@ def _maybe_dump_longest_trace_artifact(
 
     longest_samples = sorted(
         longest_samples,
-        key=lambda s: int((s.metadata.get("polar") or {}).get("trace_index", 0) or 0),
+        key=lambda s: int((s.metadata.get("openevo") or {}).get("trace_index", 0) or 0),
     )
     traces = []
     for sample in longest_samples:
-        polar_meta = sample.metadata.get("polar") or {}
-        trace_debug = polar_meta.get("trace_debug") or {}
+        openevo_meta = sample.metadata.get("openevo") or {}
+        trace_debug = openevo_meta.get("trace_debug") or {}
         status = getattr(sample, "status", None)
         traces.append({
-            "trace_index": polar_meta.get("trace_index"),
+            "trace_index": openevo_meta.get("trace_index"),
             "finish_reason": trace_debug.get("finish_reason"),
             "response_length": int(getattr(sample, "response_length", 0) or 0),
             "status": getattr(status, "value", None) if status is not None else None,
@@ -1361,7 +1358,7 @@ def _maybe_dump_longest_trace_artifact(
         })
 
     first = longest_samples[0]
-    first_meta = first.metadata.get("polar") or {}
+    first_meta = first.metadata.get("openevo") or {}
     reward = getattr(first, "reward", None)
     if isinstance(reward, dict):
         session_reward = float(reward.get("score", 0.0))
@@ -1418,14 +1415,14 @@ def _extract_sample_reward(sample: Any, reward_key: str) -> float:
     return 0.0
 
 
-def _polar_extra_metrics(
+def _openevo_extra_metrics(
     flat_samples: list[Any],
     rewards: list[float],
     reward_key: str,
 ) -> dict[str, float]:
     """Compact bridge metrics for W&B.
 
-    The metric keys keep the legacy ``polar/`` prefix for existing dashboards.
+    The metric keys use the ``openevo/`` prefix for OpenEvo dashboards.
     """
     out: dict[str, float] = {}
     seen: set[str] = set()
@@ -1438,16 +1435,16 @@ def _polar_extra_metrics(
     completed_session_rewards: list[float] = []
     policy_staleness: list[float] = []
     for sample in flat_samples:
-        polar_meta = sample.metadata.get("polar", {})
-        if "policy_staleness" in polar_meta:
-            policy_staleness.append(float(polar_meta["policy_staleness"]))
-        session_id = polar_meta.get("session_id")
-        is_placeholder = bool(polar_meta.get("placeholder"))
+        openevo_meta = sample.metadata.get("openevo", {})
+        if "policy_staleness" in openevo_meta:
+            policy_staleness.append(float(openevo_meta["policy_staleness"]))
+        session_id = openevo_meta.get("session_id")
+        is_placeholder = bool(openevo_meta.get("placeholder"))
         if not session_id:
             continue
         if session_id not in seen:
             seen.add(session_id)
-            timing = polar_meta.get("timing") or {}
+            timing = openevo_meta.get("timing") or {}
             if timing:
                 register_to_init_queue_ms.append(
                     float(timing.get("register_to_init_queue_ms", 0.0))
@@ -1456,7 +1453,7 @@ def _polar_extra_metrics(
                 run_ms.append(float(timing.get("run_ms", 0.0)))
                 postrun_ms.append(float(timing.get("postrun_ms", 0.0)))
             session_is_placeholder[session_id] = is_placeholder
-            evaluation = (polar_meta.get("trajectory_metadata") or {}).get("evaluation") or {}
+            evaluation = (openevo_meta.get("trajectory_metadata") or {}).get("evaluation") or {}
             report = evaluation.get("report") or {}
             if isinstance(report, dict) and report:
                 session_report[session_id] = report
@@ -1466,33 +1463,33 @@ def _polar_extra_metrics(
                 )
 
     if init_ms:
-        out["polar/session_ms/register_to_init_queue_mean"] = (
+        out["openevo/session_ms/register_to_init_queue_mean"] = (
             sum(register_to_init_queue_ms) / len(register_to_init_queue_ms)
         )
-        out["polar/session_ms/init_mean"] = sum(init_ms) / len(init_ms)
-        out["polar/session_ms/run_mean"] = sum(run_ms) / len(run_ms)
-        out["polar/session_ms/postrun_mean"] = sum(postrun_ms) / len(postrun_ms)
+        out["openevo/session_ms/init_mean"] = sum(init_ms) / len(init_ms)
+        out["openevo/session_ms/run_mean"] = sum(run_ms) / len(run_ms)
+        out["openevo/session_ms/postrun_mean"] = sum(postrun_ms) / len(postrun_ms)
     if rewards:
-        out["polar/reward_mean"] = sum(rewards) / len(rewards)
+        out["openevo/reward_mean"] = sum(rewards) / len(rewards)
     if len(rewards) > 1:
-        out["polar/reward_std"] = statistics.pstdev(rewards)
+        out["openevo/reward_std"] = statistics.pstdev(rewards)
     if completed_session_rewards:
-        out["polar/reward_mean_completed"] = (
+        out["openevo/reward_mean_completed"] = (
             sum(completed_session_rewards) / len(completed_session_rewards)
         )
     if policy_staleness:
-        out["polar/staleness/mean"] = sum(policy_staleness) / len(policy_staleness)
+        out["openevo/staleness/mean"] = sum(policy_staleness) / len(policy_staleness)
 
     total_sessions = len(seen)
     empty_sessions = sum(1 for p in session_is_placeholder.values() if p)
     if total_sessions > 0:
-        out["polar/rollout_success_rate"] = (
+        out["openevo/rollout_success_rate"] = (
             total_sessions - empty_sessions
         ) / total_sessions
     if session_report:
         graded_sessions = len(session_report)
         resolved = sum(1 for r in session_report.values() if r.get("resolved"))
-        out["polar/eval/resolved_rate"] = resolved / graded_sessions
+        out["openevo/eval/resolved_rate"] = resolved / graded_sessions
     return out
 
 

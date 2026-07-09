@@ -914,7 +914,7 @@ def test_build_task_local_sft_records_live_replay_uses_failed_llm_prefix(
             "content": "",
             "tool_calls": [
                 {
-                    "id": "polar-task-local-target",
+                    "id": "openevo-task-local-target",
                     "type": "function",
                     "function": {
                         "name": "tb_exec",

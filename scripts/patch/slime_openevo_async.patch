@@ -139,7 +139,7 @@ index 94cc296..647fabd 100644
 +            allow_weight_update_overlap = bool(
 +                openevo_weight_overlap
 +                if openevo_weight_overlap is not None
-+                else getattr(args, "polar_allow_weight_update_overlap", False)
++                else getattr(args, "openevo_allow_weight_update_overlap", False)
 +            )
 +            next_policy_version = rollout_id + 1
 +            if not allow_weight_update_overlap:
@@ -178,6 +178,6 @@ index 2ec859d..d191e43 100644
      wandb.define_metric("passrate/*", step_metric="rollout/step")
      wandb.define_metric("eval/step")
      wandb.define_metric("eval/*", step_metric="eval/step")
-+    wandb.define_metric("polar/*", step_metric="rollout/step")
-+    wandb.define_metric("polar/eval/*", step_metric="eval/step")
++    wandb.define_metric("openevo/*", step_metric="rollout/step")
++    wandb.define_metric("openevo/eval/*", step_metric="eval/step")
      wandb.define_metric("perf/*", step_metric="rollout/step")

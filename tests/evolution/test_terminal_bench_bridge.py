@@ -299,8 +299,8 @@ def test_terminal_bench_dataset_cli_ingests_events_and_creates_dataset(tmp_path)
         stderr="",
     )
     output_path = tmp_path / "dataset.json"
-    db_path = tmp_path / "polar.db"
-    artifact_root = tmp_path / "polar_artifacts"
+    db_path = tmp_path / "openevo.db"
+    artifact_root = tmp_path / "openevo_artifacts"
 
     exit_code = main(
         [
@@ -356,8 +356,8 @@ def test_terminal_bench_agent_system_job_cli_creates_audited_reflector_job(tmp_p
         stderr="",
     )
     output_path = tmp_path / "job.json"
-    db_path = tmp_path / "polar.db"
-    artifact_root = tmp_path / "polar_artifacts"
+    db_path = tmp_path / "openevo.db"
+    artifact_root = tmp_path / "openevo_artifacts"
 
     exit_code = main(
         [
@@ -429,9 +429,9 @@ def test_terminal_bench_agent_system_job_cli_requires_policy_version_with_input(
                 "--input",
                 str(trial_dir.parent),
                 "--db",
-                str(tmp_path / "polar.db"),
+                str(tmp_path / "openevo.db"),
                 "--artifact-root",
-                str(tmp_path / "polar_artifacts"),
+                str(tmp_path / "openevo_artifacts"),
                 "--dataset-name",
                 "tb21_round0",
                 "--reflector-model",
@@ -443,8 +443,8 @@ def test_terminal_bench_agent_system_job_cli_requires_policy_version_with_input(
 def test_terminal_bench_agent_system_job_cli_uses_history_method_for_multiple_datasets(
     tmp_path,
 ):
-    db_path = tmp_path / "polar.db"
-    artifact_root = tmp_path / "polar_artifacts"
+    db_path = tmp_path / "openevo.db"
+    artifact_root = tmp_path / "openevo_artifacts"
     store = EvolutionStore(db_path=db_path, artifact_root=artifact_root)
     store.initialize()
 
@@ -513,8 +513,8 @@ def test_terminal_bench_agent_system_job_cli_uses_history_method_for_multiple_da
 def test_terminal_bench_text_memory_job_cli_places_new_dataset_before_history(
     tmp_path,
 ):
-    db_path = tmp_path / "polar.db"
-    artifact_root = tmp_path / "polar_artifacts"
+    db_path = tmp_path / "openevo.db"
+    artifact_root = tmp_path / "openevo_artifacts"
     store = EvolutionStore(db_path=db_path, artifact_root=artifact_root)
     store.initialize()
 
@@ -593,8 +593,8 @@ def test_terminal_bench_text_memory_job_cli_places_new_dataset_before_history(
 def test_terminal_bench_text_memory_job_cli_includes_error_trials_by_default(
     tmp_path,
 ):
-    db_path = tmp_path / "polar.db"
-    artifact_root = tmp_path / "polar_artifacts"
+    db_path = tmp_path / "openevo.db"
+    artifact_root = tmp_path / "openevo_artifacts"
     trial_dir = _write_trial(
         tmp_path / "job",
         stdout="",
@@ -637,7 +637,7 @@ def test_terminal_bench_text_memory_job_cli_includes_error_trials_by_default(
 
 
 def test_terminal_bench_task_tags_preserve_short_task_ids_from_events(tmp_path):
-    store = EvolutionStore(db_path=tmp_path / "polar.db", artifact_root=tmp_path / "artifacts")
+    store = EvolutionStore(db_path=tmp_path / "openevo.db", artifact_root=tmp_path / "artifacts")
     tags = _terminal_bench_task_tags(
         store,
         [],
@@ -686,8 +686,8 @@ def test_terminal_bench_auto_forbidden_literals_ignore_public_task_context(tmp_p
 def test_terminal_bench_dataset_artifact_structured_forbidden_literals_are_decoded(
     tmp_path,
 ):
-    db_path = tmp_path / "polar.db"
-    artifact_root = tmp_path / "polar artifacts"
+    db_path = tmp_path / "openevo.db"
+    artifact_root = tmp_path / "openevo artifacts"
     store = EvolutionStore(db_path=db_path, artifact_root=artifact_root)
     store.initialize()
 

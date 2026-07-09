@@ -1040,7 +1040,7 @@ async def test_handle_run_passes_evolution_env_to_runtime_exec(tmp_path, monkeyp
 
 
 @pytest.mark.asyncio
-async def test_handle_run_codex_subscription_auth_mode_unsets_polar_proxy_env(
+async def test_handle_run_codex_subscription_auth_mode_unsets_openevo_proxy_env(
     tmp_path,
     monkeypatch,
 ):
