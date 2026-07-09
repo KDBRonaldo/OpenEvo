@@ -5,8 +5,10 @@ from pathlib import Path
 
 from polar_evolution.cli import main
 from polar_evolution.terminal_bench_task_local_parametric import (
+    LocalSuccessReplayTrial,
     TaskLocalSelection,
     TrajectoryPoolRow,
+    build_local_success_replay_sft_records,
     build_task_local_parametric_job_payload,
     build_task_local_sft_records,
     extract_successful_codex_commands,
@@ -19,6 +21,27 @@ def _write_pool(path: Path, rows: list[dict]) -> None:
         "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows),
         encoding="utf-8",
     )
+
+
+def _write_local_success_llm_calls(
+    trial_dir: Path,
+    rows: list[dict],
+) -> Path:
+    calls_path = (
+        trial_dir
+        / "agent"
+        / "evolab_lab"
+        / ".evolab"
+        / "registries"
+        / "trajectory"
+        / "llm_calls.jsonl"
+    )
+    calls_path.parent.mkdir(parents=True)
+    calls_path.write_text(
+        "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+    return calls_path
 
 
 def _write_gcode_run_tests_correction_fixture(
@@ -1916,6 +1939,201 @@ def test_build_task_local_parametric_job_payload_writes_dataset_and_lora_job(
     assert payload["job"]["config"]["compatibility"]["task_tags"] == [
         "terminal-bench",
         "terminal-bench:train-fasttext",
+    ]
+
+
+def test_build_local_success_replay_sft_records_exports_tool_call_trace(
+    tmp_path: Path,
+) -> None:
+    trial_dir = tmp_path / "train-fasttext__success"
+    assistant_call = {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+            {
+                "id": "call-exec",
+                "type": "function",
+                "function": {
+                    "name": "tb_exec",
+                    "arguments": {
+                        "task_id": "terminal-bench-task",
+                        "command": (
+                            "python - <<'PY'\n"
+                            "from pathlib import Path\n"
+                            "Path('/app/model.bin').write_bytes(b'fasttext')\n"
+                            "PY"
+                        ),
+                        "timeout_seconds": 300,
+                    },
+                },
+            }
+        ],
+    }
+    _write_local_success_llm_calls(
+        trial_dir,
+        [
+            {
+                "trajectory_id": "qwen-success-1",
+                "model": "Qwen/Qwen3.5-9B",
+                "usage": {"prompt_tokens": 123, "completion_tokens": 45},
+                "input_messages": [
+                    {"role": "system", "content": "Solve exactly one task_id."},
+                    {"role": "user", "content": "Instruction:\n{}"},
+                    {
+                        "role": "tool",
+                        "name": "tb_read_task",
+                        "tool_call_id": "call-read",
+                        "content": "short fallback",
+                        "metadata": {
+                            "tool_result": {
+                                "content": (
+                                    '{"tool":"tb_read_task",'
+                                    '"task_id":"terminal-bench-task"}'
+                                ),
+                                "status": "ok",
+                            }
+                        },
+                    },
+                ],
+                "output_messages": [assistant_call],
+            }
+        ],
+    )
+
+    [record] = build_local_success_replay_sft_records(
+        [
+            LocalSuccessReplayTrial(
+                task_id="train-fasttext",
+                trial_dir=trial_dir,
+                trajectory_id="trial-success",
+            )
+        ]
+    )
+
+    trace = record["traces"][0]
+    assert trace["prompt_messages"][2]["content"] == (
+        '{"tool":"tb_read_task","task_id":"terminal-bench-task"}'
+    )
+    assert trace["response_messages"] == [assistant_call]
+    assert [tool["function"]["name"] for tool in trace["tools"]] == [
+        "tb_read_task",
+        "tb_exec",
+        "tb_run_tests",
+        "tb_collect_result",
+    ]
+    assert record["task_id"] == "train-fasttext"
+    assert record["reward"] == 1.0
+    assert record["metadata"]["builder"] == "terminal_bench_local_success_replay"
+    assert record["metadata"]["source_trial_dir"] == str(trial_dir)
+    assert record["metadata"]["source_trajectory_id"] == "qwen-success-1"
+    assert record["metadata"]["source_llm_call_index"] == 1
+    assert record["metadata"]["output_tool_names"] == ["tb_exec"]
+    assert record["metadata"]["source_model"] == "Qwen/Qwen3.5-9B"
+    assert record["metadata"]["prompt_tokens"] == 123
+    assert record["metadata"]["completion_tokens"] == 45
+    assert record["metadata"]["selection_filters"]["allowed_tools"] == [
+        "tb_read_task",
+        "tb_exec",
+        "tb_run_tests",
+    ]
+
+
+def test_build_local_success_replay_sft_records_rejects_no_tool_outputs(
+    tmp_path: Path,
+) -> None:
+    trial_dir = tmp_path / "train-fasttext__success"
+    _write_local_success_llm_calls(
+        trial_dir,
+        [
+            {
+                "model": "Qwen/Qwen3.5-9B",
+                "input_messages": [{"role": "user", "content": "Instruction:\n{}"}],
+                "output_messages": [
+                    {"role": "assistant", "content": "The task is complete."}
+                ],
+            }
+        ],
+    )
+
+    records = build_local_success_replay_sft_records(
+        [LocalSuccessReplayTrial(task_id="train-fasttext", trial_dir=trial_dir)]
+    )
+
+    assert records == []
+
+
+def test_build_local_success_replay_sft_records_applies_tool_and_substring_filters(
+    tmp_path: Path,
+) -> None:
+    trial_dir = tmp_path / "train-fasttext__success"
+    _write_local_success_llm_calls(
+        trial_dir,
+        [
+            {
+                "model": "Qwen/Qwen3.5-9B",
+                "input_messages": [
+                    {"role": "user", "content": "Instruction:\n{} noisy probe"}
+                ],
+                "output_messages": [
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": "call-read",
+                                "type": "function",
+                                "function": {
+                                    "name": "tb_read_task",
+                                    "arguments": {"task_id": "terminal-bench-task"},
+                                },
+                            }
+                        ],
+                    }
+                ],
+            },
+            {
+                "model": "Qwen/Qwen3.5-9B",
+                "input_messages": [
+                    {"role": "user", "content": "Instruction:\n{} clean"}
+                ],
+                "output_messages": [
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": "call-exec",
+                                "type": "function",
+                                "function": {
+                                    "name": "tb_exec",
+                                    "arguments": {
+                                        "task_id": "terminal-bench-task",
+                                        "command": (
+                                            "python - <<'PY'\nprint('ok')\nPY"
+                                        ),
+                                    },
+                                },
+                            }
+                        ],
+                    }
+                ],
+            },
+        ],
+    )
+
+    [record] = build_local_success_replay_sft_records(
+        [LocalSuccessReplayTrial(task_id="train-fasttext", trial_dir=trial_dir)],
+        require_tool_name="tb_exec",
+        exclude_if_input_contains=["noisy probe"],
+        max_records=1,
+        max_records_per_trial=1,
+    )
+
+    assert record["metadata"]["source_llm_call_index"] == 2
+    assert record["metadata"]["output_tool_names"] == ["tb_exec"]
+    assert record["metadata"]["selection_filters"]["require_tool_name"] == "tb_exec"
+    assert record["metadata"]["selection_filters"]["exclude_if_input_contains"] == [
+        "noisy probe"
     ]
 
 

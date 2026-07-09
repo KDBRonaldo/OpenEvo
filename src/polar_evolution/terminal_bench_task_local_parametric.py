@@ -27,6 +27,13 @@ class TaskLocalSelection:
 
 
 @dataclass(frozen=True)
+class LocalSuccessReplayTrial:
+    task_id: str
+    trial_dir: Path
+    trajectory_id: str | None = None
+
+
+@dataclass(frozen=True)
 class CodexCommandEvent:
     event_index: int
     command: str
@@ -114,6 +121,11 @@ _TASK_LOCAL_TARGET_MODES = {
     "final",
     "sequence",
 }
+_LOCAL_SUCCESS_REPLAY_DEFAULT_ALLOWED_TOOLS = (
+    "tb_read_task",
+    "tb_exec",
+    "tb_run_tests",
+)
 
 _TARGET_WRITE_COMMAND_NEEDLES = (
     "save_model(",
@@ -471,6 +483,69 @@ def build_task_local_sft_records(
                         records.append(correction_record)
             if records:
                 break
+    return records
+
+
+def build_local_success_replay_sft_records(
+    trials: list[LocalSuccessReplayTrial],
+    *,
+    allowed_tools: list[str] | None = None,
+    require_tool_name: str | None = None,
+    exclude_if_input_contains: list[str] | None = None,
+    exclude_if_output_contains: list[str] | None = None,
+    max_records: int | None = None,
+    max_records_per_trial: int | None = None,
+) -> list[dict[str, Any]]:
+    allowed = _normalize_allowed_success_replay_tools(allowed_tools)
+    selection_filters = _local_success_replay_selection_filters(
+        allowed_tools=allowed,
+        require_tool_name=require_tool_name,
+        exclude_if_input_contains=exclude_if_input_contains,
+        exclude_if_output_contains=exclude_if_output_contains,
+        max_records=max_records,
+        max_records_per_trial=max_records_per_trial,
+    )
+    records: list[dict[str, Any]] = []
+    for trial in trials:
+        if max_records is not None and len(records) >= max_records:
+            break
+        trial_records = 0
+        calls_path = _trial_evolab_llm_calls(trial.trial_dir)
+        if not calls_path.is_file():
+            continue
+        for call_index, line in enumerate(
+            calls_path.read_text(encoding="utf-8", errors="replace").splitlines(),
+            start=1,
+        ):
+            if max_records is not None and len(records) >= max_records:
+                break
+            if (
+                max_records_per_trial is not None
+                and trial_records >= max_records_per_trial
+            ):
+                break
+            if not line.strip():
+                continue
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(payload, dict):
+                continue
+            record = _local_success_replay_record(
+                trial=trial,
+                payload=payload,
+                call_index=call_index,
+                allowed_tools=allowed,
+                require_tool_name=require_tool_name,
+                exclude_if_input_contains=exclude_if_input_contains,
+                exclude_if_output_contains=exclude_if_output_contains,
+                selection_filters=selection_filters,
+            )
+            if record is None:
+                continue
+            records.append(record)
+            trial_records += 1
     return records
 
 
@@ -1465,6 +1540,202 @@ def _llm_call_outputs_tool(payload: dict[str, Any], tool_name: str) -> bool:
         if tool_name in _message_tool_call_names(message):
             return True
     return False
+
+
+def _normalize_allowed_success_replay_tools(
+    allowed_tools: list[str] | None,
+) -> list[str]:
+    values = [
+        tool.strip()
+        for tool in (
+            allowed_tools or list(_LOCAL_SUCCESS_REPLAY_DEFAULT_ALLOWED_TOOLS)
+        )
+        if isinstance(tool, str) and tool.strip()
+    ]
+    if not values:
+        raise ValueError("local success replay allowed_tools must not be empty")
+    return values
+
+
+def _local_success_replay_selection_filters(
+    *,
+    allowed_tools: list[str],
+    require_tool_name: str | None,
+    exclude_if_input_contains: list[str] | None,
+    exclude_if_output_contains: list[str] | None,
+    max_records: int | None,
+    max_records_per_trial: int | None,
+) -> dict[str, Any]:
+    filters: dict[str, Any] = {"allowed_tools": list(allowed_tools)}
+    if require_tool_name:
+        filters["require_tool_name"] = require_tool_name
+    if exclude_if_input_contains:
+        filters["exclude_if_input_contains"] = list(exclude_if_input_contains)
+    if exclude_if_output_contains:
+        filters["exclude_if_output_contains"] = list(exclude_if_output_contains)
+    if max_records is not None:
+        filters["max_records"] = max_records
+    if max_records_per_trial is not None:
+        filters["max_records_per_trial"] = max_records_per_trial
+    return filters
+
+
+def _local_success_replay_record(
+    *,
+    trial: LocalSuccessReplayTrial,
+    payload: dict[str, Any],
+    call_index: int,
+    allowed_tools: list[str],
+    require_tool_name: str | None,
+    exclude_if_input_contains: list[str] | None,
+    exclude_if_output_contains: list[str] | None,
+    selection_filters: dict[str, Any],
+) -> dict[str, Any] | None:
+    prompt_messages = _compact_live_replay_messages(payload.get("input_messages"))
+    if not prompt_messages:
+        return None
+    response_message = _local_success_replay_response_message(payload)
+    if response_message is None:
+        return None
+    output_tool_names = sorted(_message_tool_call_names(response_message))
+    if not output_tool_names:
+        return None
+    if not any(tool in allowed_tools for tool in output_tool_names):
+        return None
+    if require_tool_name and require_tool_name not in output_tool_names:
+        return None
+    response_messages = [response_message]
+    if _messages_contain_any(prompt_messages, exclude_if_input_contains):
+        return None
+    if _messages_contain_any(response_messages, exclude_if_output_contains):
+        return None
+    metadata = _local_success_replay_metadata(
+        trial=trial,
+        payload=payload,
+        call_index=call_index,
+        output_tool_names=output_tool_names,
+        selection_filters=selection_filters,
+    )
+    return {
+        "event_id": (
+            "local-success-replay:"
+            f"{_safe_name(trial.task_id)}:"
+            f"{_safe_name(trial.trial_dir.name)}:{call_index}"
+        ),
+        "task_id": trial.task_id,
+        "session_id": f"local-success-replay:{_safe_name(trial.task_id)}",
+        "status": "COMPLETED",
+        "reward": 1.0,
+        "traces": [
+            {
+                "prompt_messages": prompt_messages,
+                "response_messages": response_messages,
+                "tools": _TERMINAL_BENCH_TOOLS,
+            }
+        ],
+        "metadata": metadata,
+    }
+
+
+def _local_success_replay_response_message(
+    payload: dict[str, Any],
+) -> dict[str, Any] | None:
+    messages = _compact_live_replay_messages(payload.get("output_messages"))
+    for message in messages:
+        if message.get("role") != "assistant":
+            continue
+        if _message_tool_call_names(message):
+            return message
+    return None
+
+
+def _local_success_replay_metadata(
+    *,
+    trial: LocalSuccessReplayTrial,
+    payload: dict[str, Any],
+    call_index: int,
+    output_tool_names: list[str],
+    selection_filters: dict[str, Any],
+) -> dict[str, Any]:
+    metadata: dict[str, Any] = {
+        "builder": "terminal_bench_local_success_replay",
+        "source_trial_dir": str(trial.trial_dir),
+        "source_llm_call_index": call_index,
+        "output_tool_names": list(output_tool_names),
+        "selection_filters": selection_filters,
+    }
+    source_trajectory_id = _local_success_replay_source_trajectory_id(
+        trial,
+        payload,
+    )
+    if source_trajectory_id is not None:
+        metadata["source_trajectory_id"] = source_trajectory_id
+    source_model = _local_success_replay_source_model(payload)
+    if source_model is not None:
+        metadata["source_model"] = source_model
+    prompt_tokens, completion_tokens = _local_success_replay_token_usage(payload)
+    if prompt_tokens is not None:
+        metadata["prompt_tokens"] = prompt_tokens
+    if completion_tokens is not None:
+        metadata["completion_tokens"] = completion_tokens
+    return metadata
+
+
+def _local_success_replay_source_trajectory_id(
+    trial: LocalSuccessReplayTrial,
+    payload: dict[str, Any],
+) -> str | None:
+    for key in ("trajectory_id", "trace_id", "session_id"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    if trial.trajectory_id and trial.trajectory_id.strip():
+        return trial.trajectory_id.strip()
+    return None
+
+
+def _local_success_replay_source_model(payload: dict[str, Any]) -> str | None:
+    for key in ("model", "model_name", "served_model_name"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _local_success_replay_token_usage(
+    payload: dict[str, Any],
+) -> tuple[int | None, int | None]:
+    usage = payload.get("usage")
+    if not isinstance(usage, dict):
+        return None, None
+    prompt_tokens = _int_usage_value(usage, "prompt_tokens", "input_tokens")
+    completion_tokens = _int_usage_value(
+        usage,
+        "completion_tokens",
+        "output_tokens",
+    )
+    return prompt_tokens, completion_tokens
+
+
+def _int_usage_value(usage: dict[str, Any], *keys: str) -> int | None:
+    for key in keys:
+        value = usage.get(key)
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, int):
+            return value
+    return None
+
+
+def _messages_contain_any(
+    messages: list[dict[str, Any]],
+    needles: list[str] | None,
+) -> bool:
+    active_needles = [needle for needle in needles or [] if needle]
+    if not active_needles:
+        return False
+    haystack = json.dumps(messages, ensure_ascii=False, sort_keys=True)
+    return any(needle in haystack for needle in active_needles)
 
 
 def _message_tool_call_names(message: dict[str, Any]) -> set[str]:
