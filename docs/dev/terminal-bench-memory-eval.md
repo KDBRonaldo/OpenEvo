@@ -1988,6 +1988,51 @@ or a prevalidated command template with failure-state corrections, rather than
 asking the adapter to synthesize large Python programs from sparse sequence
 examples.
 
+The compact-template follow-up tested exactly that method variable. A local
+container validation first proved a concise fastText CLI recipe was sufficient:
+install/build the upstream fastText CLI, convert Yelp parquet rows to
+`__label__...` text files, then run `fasttext supervised` with word bigrams,
+50 dimensions, 8 epochs, subword features, and a 500k bucket. The public
+held-out check reached `P@1=0.626` / `R@1=0.626`, and the generated model was
+`143211714` bytes, under the 150 MiB task limit. Training at
+`/tmp/tb21-task-local-parametric-trainfasttext-clitemplate-20260708/train-clitemplate-r8-s220`
+used `Qwen/Qwen3.5-9B`, GPU 7, LoRA rank 8, alpha 16, `max_length=4096`, and
+220 SFT steps. The dataset contained 256 records: 128
+`compact_cli_template_sequence`, 16 `compact_cli_template_direct_sequence`, 16
+`run_tests_after_compact_cli_template`, 16 `tool_schema_lock`, and 80
+`compact_cli_install_recovery` records. The supervised targets were 240
+`tb_exec` calls and 16 `tb_run_tests` calls, and trainer diagnostics recorded
+loss moving from about `0.90` to `8.6e-05`.
+
+The paired eval at
+`/tmp/tb21-task-local-parametric-trainfasttext-clitemplate-20260708/eval-clitemplate-r8-s220-pass1`
+used managed Qwen3.5-9B vLLM on GPU 7 with
+`--adapter-key-rewrite qwen3_5_vllm_language_model`, 32k context,
+`max_output_tokens=3072`, `exec_timeout_min_seconds=3600`,
+`exec_timeout_cap_seconds=3600`, and only `parametric_memory` enabled. The
+summary recorded baseline pass@1/pass@k `0/1`, parametric-memory pass@1/pass@k
+`0/1`, and delta `0`; GPU 7 was released after the managed server stopped. The
+treatment did load the LoRA and shifted strongly toward the intended policy:
+its first `tb_exec` installed `git build-essential`, requested
+`timeout_seconds=3600`, and attempted to clone/build fastText. The run failed
+because GitHub access inside the live task container repeatedly returned
+`gnutls_handshake() failed: The TLS connection was non-properly terminated`.
+Subsequent recovery attempts tried the same clone, wget/curl tarballs, a
+spurious `fasthtml` path, malformed `rm -rf/...` fragments, and finally
+`apt-get install -y rm -rf`; no `/app/model.bin` artifact was produced, and the
+parametric trial failed after 13 `tb_exec` calls and a 1653.6 second agent
+round.
+
+This is another negative `train-fasttext` method result, but it is cleaner than
+the earlier active-correction failure. The adapter learned the broad CLI
+template, long timeout, and schema shape; the remaining failure is an
+unreliable external GitHub dependency plus recovery drift after TLS failure.
+The next candidate should avoid GitHub clone/tarball setup in the supervised
+target, for example by using a prevalidated `build-essential`/PyPI `fasttext`
+path or a cached local source archive, and should add explicit negative
+correction records for `gnutls_handshake`, missing `curl`, and malformed
+`rm -rf/` recovery commands before repeating paired eval.
+
 Evaluate baseline local Qwen and adapter local Qwen against the same subset:
 
 ```sh
