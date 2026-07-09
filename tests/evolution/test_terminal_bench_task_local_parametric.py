@@ -2063,6 +2063,63 @@ def test_build_local_success_replay_sft_records_rejects_no_tool_outputs(
     assert records == []
 
 
+def test_build_local_success_replay_sft_records_normalizes_metadata_tool_calls(
+    tmp_path: Path,
+) -> None:
+    trial_dir = tmp_path / "train-fasttext__success"
+    _write_local_success_llm_calls(
+        trial_dir,
+        [
+            {
+                "model": "tb-parametric-memory-train-fasttext-oneshot-r8-s260",
+                "input_messages": [{"role": "user", "content": "Instruction:\n{}"}],
+                "output_messages": [
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_call_id": "chatcmpl-tool-1",
+                        "metadata": {
+                            "action": "tool_call",
+                            "tool_calls": [
+                                {
+                                    "schema_version": "v1",
+                                    "call_id": "chatcmpl-tool-1",
+                                    "name": "tb_exec",
+                                    "arguments": {
+                                        "task_id": "terminal-bench-task",
+                                        "command": "cd /app && ls -la",
+                                        "timeout_seconds": 60,
+                                    },
+                                }
+                            ],
+                        },
+                    }
+                ],
+            }
+        ],
+    )
+
+    [record] = build_local_success_replay_sft_records(
+        [LocalSuccessReplayTrial(task_id="train-fasttext", trial_dir=trial_dir)],
+        require_tool_name="tb_exec",
+    )
+
+    tool_call = record["traces"][0]["response_messages"][0]["tool_calls"][0]
+    assert tool_call == {
+        "id": "chatcmpl-tool-1",
+        "type": "function",
+        "function": {
+            "name": "tb_exec",
+            "arguments": {
+                "task_id": "terminal-bench-task",
+                "command": "cd /app && ls -la",
+                "timeout_seconds": 60,
+            },
+        },
+    }
+    assert record["metadata"]["output_tool_names"] == ["tb_exec"]
+
+
 def test_build_local_success_replay_sft_records_applies_tool_and_substring_filters(
     tmp_path: Path,
 ) -> None:

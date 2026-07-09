@@ -1684,13 +1684,105 @@ def _local_success_replay_record(
 def _local_success_replay_response_message(
     payload: dict[str, Any],
 ) -> dict[str, Any] | None:
-    messages = _compact_live_replay_messages(payload.get("output_messages"))
-    for message in messages:
-        if message.get("role") != "assistant":
+    output_messages = payload.get("output_messages")
+    if not isinstance(output_messages, list):
+        return None
+    for message in output_messages:
+        if not isinstance(message, dict):
             continue
-        if _message_tool_call_names(message):
-            return message
+        role = message.get("role")
+        if not isinstance(role, str) or role.strip() != "assistant":
+            continue
+        tool_calls = _local_success_replay_message_tool_calls(message)
+        if not tool_calls:
+            continue
+        return {
+            "role": "assistant",
+            "content": _live_replay_message_content(message, role="assistant"),
+            "tool_calls": tool_calls,
+        }
     return None
+
+
+def _local_success_replay_message_tool_calls(
+    message: dict[str, Any],
+) -> list[dict[str, Any]]:
+    raw_calls: list[Any] = []
+    _append_local_success_replay_raw_tool_calls(message.get("tool_calls"), raw_calls)
+    metadata = message.get("metadata")
+    if isinstance(metadata, dict):
+        _append_local_success_replay_raw_tool_calls(
+            metadata.get("tool_call"),
+            raw_calls,
+        )
+        _append_local_success_replay_raw_tool_calls(
+            metadata.get("tool_calls"),
+            raw_calls,
+        )
+
+    tool_calls: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for index, raw_call in enumerate(raw_calls, start=1):
+        tool_call = _normalize_local_success_replay_tool_call(
+            raw_call,
+            fallback_id=f"local-success-replay-tool-{index}",
+        )
+        if tool_call is None:
+            continue
+        key = json.dumps(tool_call, sort_keys=True, ensure_ascii=False)
+        if key in seen:
+            continue
+        seen.add(key)
+        tool_calls.append(tool_call)
+    return tool_calls
+
+
+def _append_local_success_replay_raw_tool_calls(
+    value: Any,
+    raw_calls: list[Any],
+) -> None:
+    if isinstance(value, list):
+        raw_calls.extend(value)
+    elif value is not None:
+        raw_calls.append(value)
+
+
+def _normalize_local_success_replay_tool_call(
+    value: Any,
+    *,
+    fallback_id: str,
+) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    function = value.get("function")
+    if isinstance(function, dict):
+        name = function.get("name")
+        arguments = function.get("arguments", {})
+    else:
+        name = value.get("name")
+        arguments = value.get("arguments", {})
+    if not isinstance(name, str) or not name.strip():
+        return None
+
+    call_id = value.get("id")
+    if not isinstance(call_id, str) or not call_id.strip():
+        call_id = value.get("call_id")
+    if not isinstance(call_id, str) or not call_id.strip():
+        call_id = value.get("tool_call_id")
+    if not isinstance(call_id, str) or not call_id.strip():
+        call_id = fallback_id
+
+    tool_type = value.get("type")
+    if not isinstance(tool_type, str) or not tool_type.strip():
+        tool_type = "function"
+    return {
+        "id": call_id.strip(),
+        "type": tool_type.strip(),
+        "function": {
+            "name": name.strip(),
+            "arguments": arguments,
+        },
+    }
 
 
 def _local_success_replay_metadata(

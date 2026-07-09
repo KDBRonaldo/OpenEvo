@@ -1162,7 +1162,7 @@ this eval path.
 The first controlled v2b run uses the successful local Qwen train-fasttext trial:
 
 ```bash
-python -m polar_evolution.cli terminal-bench-local-success-replay-parametric-memory-job \
+uv run polar-evolution terminal-bench-local-success-replay-parametric-memory-job \
   --success-trial-dir /tmp/tb21-task-local-parametric-trainfasttext-oneshot-20260709/eval-oneshot-r8-s260-pass2-cacheenv/parametric_memory/harbor_jobs/parametric_memory-train-fasttext/train-fasttext__7GGAsRu \
   --task-id train-fasttext \
   --output-root /tmp/tb21-local-success-replay-trainfasttext-20260709/train-replay-r8-s260 \
@@ -1305,7 +1305,7 @@ Expected: GPU7 has no compute app. If a GPU7 process is present, inspect it with
 Use the committed CLI subcommand with the exact successful local Qwen trial path:
 
 ```bash
-python -m polar_evolution.cli terminal-bench-local-success-replay-parametric-memory-job \
+uv run polar-evolution terminal-bench-local-success-replay-parametric-memory-job \
   --success-trial-dir /tmp/tb21-task-local-parametric-trainfasttext-oneshot-20260709/eval-oneshot-r8-s260-pass2-cacheenv/parametric_memory/harbor_jobs/parametric_memory-train-fasttext/train-fasttext__7GGAsRu \
   --task-id train-fasttext \
   --output-root /tmp/tb21-local-success-replay-trainfasttext-20260709/train-replay-r8-s260 \
