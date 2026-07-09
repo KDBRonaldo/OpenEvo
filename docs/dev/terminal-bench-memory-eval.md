@@ -2104,6 +2104,31 @@ robust backend: the next iteration should supervise a stop/finalization boundary
 after a public-passing model exists and reduce malformed shell/Python attempts
 before the first successful CLI training command.
 
+A state-machine follow-up attempted to preserve the one-shot gain while reducing
+malformed commands and post-success loops. Training at
+`/tmp/tb21-task-local-parametric-trainfasttext-statemachine-20260709/train-statemachine-r8-s280`
+used Qwen3.5-9B on GPU 7, LoRA rank 8, alpha 16, `max_length=4096`, 336
+records, and 280 SFT steps. The dataset mixed read-task, apt-install,
+data-preparation, train/test, and final assistant-message stages; the worker
+registered adapter
+`/tmp/tb21-task-local-parametric-trainfasttext-statemachine-20260709/train-statemachine-r8-s280/artifacts/workers/job-tb-parametric-memory-train-fasttext-statemachine-r8-s280/parametric_memory_lora_sft/adapter`.
+
+The paired eval at
+`/tmp/tb21-task-local-parametric-trainfasttext-statemachine-20260709/eval-statemachine-r8-s280-pass2-cacheenv-preloaded`
+used the same cache-env verifier setup as the successful one-shot pass and
+preloaded `Qwen/Qwen3.5-9B` with `huggingface_hub.snapshot_download`; without
+that preload, the managed vLLM server timed out after 600 seconds while
+materializing model shards. The official summary recorded baseline
+pass@1/pass@k `0/1`, parametric-memory pass@1/pass@k `0/1`, and delta `0`, with
+only `parametric_memory` enabled and `text_memory`, `skill_bundle`, and
+`agent_system` disabled. The adapter loaded successfully with 64 rewritten LoRA
+keys, but the treatment made only one tool call (`tb_read_task`). Its second LLM
+response produced no tool call, stopped, and contained repeated planning text in
+the Qwen `reasoning` field, so no `tb_exec` command or `/app/model.bin` was
+created. This v3 state-machine adapter is therefore a rejected method iteration;
+the current valid `train-fasttext` parametric-memory gain remains the one-shot
+adapter above.
+
 Evaluate baseline local Qwen and adapter local Qwen against the same subset:
 
 ```sh
