@@ -7,10 +7,10 @@ projects. A Science Project config is the user-facing input for ordinary
 science users. It validates a task, environment, execution mode, and evolution
 targets, then compiles to the existing OpenEvo `ExperimentConfig` contract.
 
-Users do not configure runtime images, Polar gateway wiring, Docker lifecycle,
-or model serving directly in the common path. The science layer chooses a
-runtime profile and execution mode, and the lower-level OpenEvo/Polar experiment
-compiler keeps responsibility for the concrete experiment payload.
+Users do not configure runtime images, Core gateway wiring, Docker lifecycle, or
+model serving directly in the common path. The science layer chooses a runtime
+profile and execution mode, and the lower-level OpenEvo experiment compiler
+keeps responsibility for the concrete experiment payload.
 
 ## Boundary
 
@@ -22,7 +22,7 @@ The science layer is a config and compilation layer. It does not:
 - call model APIs;
 - manage Docker Compose lifecycles.
 
-It validates Science Project input and compiles it to the existing OpenEvo/Polar
+It validates Science Project input and compiles it to the existing OpenEvo
 experiment contract. OpenEvo still wraps the Codex harness; this layer only makes
 that contract easier for Desktop science workflows to produce.
 
@@ -112,11 +112,14 @@ does not run later checks. After SSH succeeds, Docker is checked with
 capabilities are reported through the same fakeable probe contract. Codex CLI
 and subscription checks run only when subscription execution is required.
 
-## Desktop Web Shell
+## Desktop UI
 
-The first web shell lives at `/openevo` in the existing Vite app. It uses the
-local Python sidecar API when available and keeps a fixture fallback so the
-layout remains usable when the sidecar is not running.
+The Desktop UI lives in the top-level `desktop/` product package. The Tauri
+native host owns the installed application window and starts the local Python
+sidecar launcher; the Vite development server remains a developer and CI smoke
+path. The React UI uses the local sidecar API when available and keeps a
+fixture fallback so the layout remains inspectable when the sidecar is not
+running.
 
 The shell intentionally keeps Terminal Bench and low-level runtime image fields
 out of the default flow. It displays the remote profile, proxy settings, Science
@@ -137,14 +140,16 @@ openevo-backend --help
 openevo-backend serve --help
 ```
 
-`openevo-backend serve` starts the typed Core Backend API. This phase exposes
-the route and error contract Desktop will consume; Desktop-native launch,
-sidecar integration, and full remote service supervision are handled by later
-Desktop migration tasks.
+`openevo-backend serve` starts the typed Core Backend API. Desktop-native launch
+is handled by the Tauri host under `desktop/src-tauri/`, and the local Desktop
+sidecar can be served with `python3 -m desktop.server.launcher` in development
+or by the bundled PyInstaller sidecar binary during app launch. Platform
+signing, notarization, and update policy are separate Desktop release hardening
+tasks.
 The root path `/` redirects to `/openevo`. The Desktop asset set is built in
 OpenEvo-only mode and kept under the top-level `desktop/packaging/web/` path,
-so users do not see the shared Polar dashboard navigation and the Core wheel
-does not package Desktop assets.
+so users do not see the shared OpenEvo Observability navigation and the Core
+wheel does not package Desktop assets.
 The local server still returns the SPA for compatibility routes `/tasks`,
 `/tasks/*`, `/sessions`, `/sessions/*`, and `/compare`; unknown
 `/openevo-api/*` paths remain API 404s.
@@ -152,13 +157,13 @@ The local server still returns the SPA for compatibility routes `/tasks`,
 Packaged Desktop assets are refreshed with:
 
 ```bash
-cd web && npm run build:openevo
-rsync -a --delete web/dist/ desktop/packaging/web/
+cd desktop && npm run build:openevo
+rsync -a --delete desktop/dist/ desktop/packaging/web/
 ```
 
 The release smoke check runs on Node 22, audits the Desktop frontend dependency
 graph for high or critical advisories, rebuilds the OpenEvo-only Desktop assets,
-verifies that `desktop/packaging/web` matches `web/dist`, builds the Python
+verifies that `desktop/packaging/web` matches `desktop/dist`, builds the Python
 Core wheel, inspects the wheel metadata, console scripts, bundled remote-install
 wheel, and Core/Desktop package boundary, then installs the wheel into a clean
 environment and runs the installed backend launcher plus Desktop API smoke
@@ -167,13 +172,13 @@ project config save, workspace, bootstrap, services, service status, run launch,
 run artifact summary parsing, and artifact content reading:
 
 ```bash
-cd web
+cd desktop
 npm ci
 npm audit --audit-level=high
 npm test -- --run
 npm run build:openevo
 cd ..
-diff -qr web/dist desktop/packaging/web
+diff -qr desktop/dist desktop/packaging/web
 rm -rf .openevo-remote-wheel src/openevo/wheels
 python -m build --wheel --outdir .openevo-remote-wheel
 mkdir -p src/openevo/wheels
@@ -198,11 +203,9 @@ PYTHONPATH=src:. python -m pytest tests/ci/test_openevo_python_workflow.py tests
 ```
 
 The former Python Desktop and sidecar console-script entrypoints are not
-exposed after the Core Backend package migration. Desktop
-native hosting and sidecar launch are handled by the later Desktop migration
-tasks. Desktop-created projects can start from a no-config sidecar. In that mode the
-sidecar receives a writable local config root from `--desktop-config-root`, or
-uses `OPENEVO_DESKTOP_CONFIG_DIR`, falling back to
+exposed after the Core Backend package migration. Desktop-created projects can
+start from a no-config sidecar. In that mode the sidecar receives a writable
+local config root from `--desktop-config-root`; the local launcher defaults to
 `~/.openevo/desktop`.
 
 In this mode the sidecar reads the local Science Project YAML and remote profile
@@ -471,12 +474,13 @@ transport when it should mutate a remote server.
 This slice adds a command-and-health-check service supervisor plus a local
 sidecar run supervisor with one latest run per config-backed session. It does
 not survive sidecar process restarts, stream incremental remote log files,
-cancel remote process groups, expose resume, restart the sidecar process, run
-Docker Compose, restart crashed remote daemons, browse artifact diffs, tune GPU
-placement or quantization for vLLM, or manage dynamic adapters. Those
-operations remain behind future remote lifecycle contracts. Human-readable
-artifact content for `text_memory`, `skill_bundle`, and `agent_system` is
-available through the latest-run artifact content endpoint.
+cancel remote process groups, expose resume, run Docker Compose, restart
+crashed remote daemons, browse artifact diffs, tune GPU placement or
+quantization for vLLM, or manage dynamic adapters. The Tauri host starts and
+stops the bundled local sidecar process; restart policy is still a product
+hardening task. Human-readable artifact content for `text_memory`,
+`skill_bundle`, and `agent_system` is available through the latest-run artifact
+content endpoint.
 
 ## CLI
 
@@ -493,7 +497,7 @@ command-based service startup, run supervision, terminal-run artifact summary
 display, and human-readable artifact content viewing. It still does not include:
 
 - local credential vault or SSH tunnel management;
-- native sidecar supervision, auto-update, or OS credential vault integration;
+- auto-update, code signing, notarization, or OS credential vault integration;
 - Docker Compose lifecycle management;
 - production vLLM lifecycle tuning, restart policy, GPU placement, or dynamic
   adapter loading;

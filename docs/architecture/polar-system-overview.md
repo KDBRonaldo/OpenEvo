@@ -1,12 +1,17 @@
-# Polar 系统总览
+# OpenEvo Core Runtime 系统总览
 
-Polar 是面向真实 agent harness 的 rollout-as-a-service 框架。它通过在
+OpenEvo Core 的低层 runtime 是面向真实 agent harness 的 rollout-as-a-service
+框架。它通过在
 准备好的 runtime 中启动 agent，并在 agent 与 inference server 之间放置
-gateway proxy，使 agent 尽量不需要为 Polar 改代码。proxy 会捕获模型调用，
+gateway proxy，使 agent 尽量不需要为 OpenEvo 改代码。proxy 会捕获模型调用，
 并把这些调用转成 RL training 可消费的 token-level trajectory。对于不经过
-Polar proxy 的纯文本 capture 模式，Polar 只保证 transcript-level trajectory，
-不伪造 token id、logprob 或 token-level metric。订阅登录只是某些 harness 的
-auth 方式；它必须显式开启 transcript capture 后才允许运行。
+OpenEvo proxy 的纯文本 capture 模式，OpenEvo 只保证 transcript-level
+trajectory，不伪造 token id、logprob 或 token-level metric。订阅登录只是某些
+harness 的 auth 方式；它必须显式开启 transcript capture 后才允许运行。
+
+这个文档描述的是 OpenEvo Core 内部 rollout/gateway/runtime/proxy 数据路径。
+一些 package、环境变量或历史注释仍可能保留 legacy `polar` 名称；它们是实现
+细节，不是新的产品入口。
 
 ## 组件图
 
@@ -14,7 +19,7 @@ auth 方式；它必须显式开启 transcript capture 后才允许运行。
 flowchart TB
     subgraph ClientSide["Client / Trainer 侧"]
         Trainer[Trainer 或实验驱动]
-        Submit[polar submit / rollout API]
+        Submit[openevo run / rollout API]
     end
 
     subgraph RolloutService["Rollout Service"]
@@ -114,11 +119,11 @@ capture 和 trajectory 构造保持确定性。
 
 ## Capture 模式和训练信号
 
-Polar 当前区分两类 capture：
+OpenEvo Core 当前区分两类 capture：
 
 | 模式 | 入口 | 产物 | 适合用途 |
 |---|---|---|---|
-| Polar proxy capture | agent 请求 `OPENAI_BASE_URL` / `ANTHROPIC_BASE_URL` / Gemini proxy | `CompletionSession`，包含请求、响应、token ids、logprobs | token-level RL、policy gradient、需要 loss mask 的训练 |
+| OpenEvo proxy capture | agent 请求 `OPENAI_BASE_URL` / `ANTHROPIC_BASE_URL` / Gemini proxy | `CompletionSession`，包含请求、响应、token ids、logprobs | token-level RL、policy gradient、需要 loss mask 的训练 |
 | Pure-text transcript capture | `agent.settings.capture_mode="transcript"`；可配合订阅登录或其他不走 proxy 的 harness | `agent_transcript` trajectory，来自 `logs/agent/step.xx.stdout.log` | skill/memory/agent-system evolution、行为回放、非 token-level 评估 |
 
 纯文本 transcript capture 是显式选项，而不是某个 harness 的隐式行为。Gateway
@@ -137,13 +142,13 @@ trajectory 的 `Trace.response_ids`、`Trace.loss_mask`、`Trace.response_logpro
 
 后续 skill/memory/agent-system evolution 可以消费这类 transcript trajectory；
 token-level RL 训练必须过滤掉 `token_level_metrics_available=false` 的 traces，
-或要求任务走 Polar proxy 模式。
+或要求任务走 OpenEvo proxy 模式。
 
 如果 harness 选择 `auth_mode="subscription"` 或 harness-specific subscription
 alias，它必须同时设置 transcript capture mode。Codex subscription 模式会显式
-unset Polar proxy 相关环境变量，并使用已有 `CODEX_HOME` 登录态运行；其中
-`config.toml` 每次 session 都由 Polar 重新生成并覆盖，避免宿主机或预认证目录中的
-Codex 配置影响 Polar 任务。其他订阅式 harness 也应遵守同样边界：订阅负责 auth，
+unset proxy 相关环境变量，并使用已有 `CODEX_HOME` 登录态运行；其中
+`config.toml` 每次 session 都由 OpenEvo 重新生成并覆盖，避免宿主机或预认证目录中的
+Codex 配置影响 OpenEvo 任务。其他订阅式 harness 也应遵守同样边界：订阅负责 auth，
 transcript capture 负责 evolution 可消费的行为记录。
 当 Codex subscription session 未显式提供容器内登录目录时，gateway 会把宿主机
 `~/.codex/auth.json` staging 到 per-session bind mount 下的默认 `CODEX_HOME`

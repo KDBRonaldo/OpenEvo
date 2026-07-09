@@ -53,7 +53,7 @@ details unless a document explicitly discusses the legacy framework.
     `agent_system`, and parametric-memory registration/training interfaces.
 - [PR Process Checks](pr-process-checks.md)
   - Issue/PR templates and warning-level issue-link/docs-change checks.
-- [Polar System Overview](polar-system-overview.md)
+- [OpenEvo Core Runtime System Overview](polar-system-overview.md)
   - Historical lower-level rollout/gateway/runtime/proxy architecture used by
     OpenEvo Core internals.
 

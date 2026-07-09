@@ -23,7 +23,7 @@ OpenEvo Core 的核心目标是把 agent 运行过程稳定地转成可训练、
 
 当前系统有两条明确的数据路径：
 
-- Token-level training path：agent 经过 Core/Polar LLM proxy，Core 捕获 completion
+- Token-level training path：agent 经过 OpenEvo Core LLM proxy，Core 捕获 completion
   records，并构造包含 token ids、loss mask、logprobs 的 trajectory。
 - Pure-text evolution path：agent 不一定经过 Core proxy，Core 或外部 harness 只要求
   提供可解析的 text/transcript trajectory，用于 skill、memory、agent-system 等文本
@@ -39,7 +39,7 @@ harness 只要能提供稳定 transcript，都应能接入 pure-text evolution�
 
 - `src/openevo/`: OpenEvo Core Backend package、Desktop/Science config、deployment
   lifecycle、sidecar API 和 Dev Kit helpers。
-- `web/`: OpenEvo Desktop 的 React/Vite/Tauri 前端。
+- `desktop/`: OpenEvo Desktop 的 React/Vite/Tauri 前端、native host、sidecar 和打包资源。
 - `src/openevo/harness/`: agent harness contract 和 Codex、Claude Code、OpenHands 等 presets。
 - `src/openevo/gateway/`: gateway server、LLM proxy、runtime lifecycle、completion capture、
   evolution context 注入。
@@ -181,7 +181,7 @@ Runtime 消费：
 
 入口：
 
-- Agent 通过 Polar LLM proxy 调 OpenAI/Anthropic/Google compatible APIs。
+- Agent 通过 OpenEvo LLM proxy 调 OpenAI/Anthropic/Google compatible APIs。
 
 产物：
 
@@ -197,7 +197,7 @@ Runtime 消费：
 
 限制：
 
-- 必须走 Polar proxy。
+- 必须走 OpenEvo proxy。
 - 如果 harness 使用外部订阅直连模型服务，则不能声称有 token-level metric。
 
 ### Pure-text evolution mode
@@ -207,7 +207,7 @@ Runtime 消费：
 - Harness stdout/stderr transcript。
 - Agent run transcript。
 - 外部 text trajectory。
-- 不要求经过 Polar proxy。
+- 不要求经过 OpenEvo proxy。
 
 产物：
 

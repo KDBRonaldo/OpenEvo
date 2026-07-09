@@ -13,7 +13,6 @@ on:
       - "src/slime_bridge/**"
       - "desktop/**"
       - "tests/ci/**"
-      - "web/**"
 
 jobs:
   wheel-smoke:
@@ -26,10 +25,10 @@ jobs:
         with:
           node-version: "22"
           cache: npm
-          cache-dependency-path: web/package-lock.json
+          cache-dependency-path: desktop/package-lock.json
 
       - name: Build OpenEvo Desktop assets
-        working-directory: web
+        working-directory: desktop
         run: |
           npm ci
           npm audit --audit-level=high
@@ -38,7 +37,7 @@ jobs:
 
       - name: Check packaged Desktop assets are current
         run: |
-          diff -qr web/dist desktop/packaging/web
+          diff -qr desktop/dist desktop/packaging/web
 
       - uses: actions/setup-python@v5
         with:

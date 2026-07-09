@@ -1,13 +1,13 @@
 import { fetchEventSource } from "@microsoft/fetch-event-source";
 
-export type PolarEvent = {
+export type OpenEvoEvent = {
   type: string;
   ts: string;
   data: Record<string, any>;
 };
 
-export function subscribePolarEvents(
-  onEvent: (event: PolarEvent) => void,
+export function subscribeOpenEvoEvents(
+  onEvent: (event: OpenEvoEvent) => void,
   controller: AbortController,
 ): void {
   fetchEventSource("/api/events", {
@@ -21,7 +21,7 @@ export function subscribePolarEvents(
     onmessage(event) {
       if (!event.data) return;
       try {
-        const parsed = JSON.parse(event.data) as PolarEvent;
+        const parsed = JSON.parse(event.data) as OpenEvoEvent;
         onEvent(parsed);
       } catch {
         // ignore malformed payloads

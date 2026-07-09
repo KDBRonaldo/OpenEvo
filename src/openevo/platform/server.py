@@ -7,11 +7,10 @@ import logging
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
 from openevo.platform.api import (
@@ -41,10 +40,8 @@ class PlatformState:
 
 def _web_dist_path() -> Path | None:
     here = Path(__file__).resolve().parent
-    # Bundled (after `pnpm build` is copied next to the platform package)
     candidates = [
-        here / "web" / "dist",
-        here.parents[2] / "web" / "dist",  # repo-relative when running from source
+        here.parents[2] / "desktop" / "dist",  # repo-relative when running from source
     ]
     for path in candidates:
         if path.exists() and path.is_dir() and (path / "index.html").exists():
@@ -111,7 +108,7 @@ def create_app(config: PlatformConfig) -> FastAPI:
                 await client.close()
 
     app = FastAPI(
-        title="Polar Platform",
+        title="OpenEvo Platform",
         version="0.1.0",
         lifespan=lifespan,
     )
@@ -141,14 +138,21 @@ def _mount_static(app: FastAPI) -> None:
     web_dist = _web_dist_path()
     if web_dist is None:
         # Provide a placeholder so /docs and /api still work without a built frontend.
+        placeholder = (
+            "<!doctype html><title>OpenEvo platform</title>"
+            "<main>OpenEvo platform service running. Frontend not built yet. "
+            "Build with <code>cd desktop && npm install && npm run build:openevo</code>. "
+            "API docs: <a href=\"/docs\">/docs</a>.</main>"
+        )
+
         @app.get("/")
-        async def _no_frontend() -> dict[str, Any]:
-            return {
-                "status": "ok",
-                "message": "OpenEvo platform service running. Frontend not built yet.",
-                "build_with": "cd web && pnpm install && pnpm build",
-                "api_docs": "/docs",
-            }
+        async def _no_frontend() -> HTMLResponse:
+            return HTMLResponse(placeholder)
+
+        @app.get("/{path:path}", include_in_schema=False)
+        async def _no_frontend_fallback(path: str) -> HTMLResponse:
+            return HTMLResponse(placeholder, status_code=404)
+
         return
 
     index_file = web_dist / "index.html"

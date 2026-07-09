@@ -18,10 +18,10 @@ function renderShell(path: string, desktopOnly: boolean) {
 }
 
 describe("AppShell", () => {
-  it("renders the shared Polar dashboard shell by default", () => {
+  it("renders the shared OpenEvo observability shell by default", () => {
     const html = renderShell("/", false);
 
-    expect(html).toContain("Polar Dashboard");
+    expect(html).toContain("OpenEvo Observability");
     expect(html).toContain('href="/tasks"');
     expect(html).toContain(">Dashboard<");
   });
@@ -31,7 +31,7 @@ describe("AppShell", () => {
 
     expect(html).toContain("Protein Folding Literature Sprint");
     expect(html).toContain("Remote ready");
-    expect(html).not.toContain("Polar Dashboard");
+    expect(html).not.toContain("OpenEvo Observability");
     expect(html).not.toContain('href="/tasks"');
     expect(html).not.toContain(">Dashboard<");
   });

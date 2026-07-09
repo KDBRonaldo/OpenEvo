@@ -285,12 +285,13 @@ by the Tauri release workflow. A scientist should install that app, configure a
 remote server inside Desktop, and avoid Python packaging details in the common
 path.
 
-The installable Python distribution is still named `openevo`. It bundles the
-OpenEvo Desktop web shell, OpenEvo Core Backend modules, the exact
-remote-install wheel used by Desktop bootstrap, and runtime modules for rollout,
-gateway, trajectory, and evolution backend implementation details. The only
-console script exposed by the Python package in this phase is the backend
-launcher:
+The installable Python distribution is still named `openevo`. It ships the
+OpenEvo Core Backend modules, the exact remote-install wheel used by Desktop
+bootstrap, and runtime modules for rollout, gateway, trajectory, and evolution
+backend implementation details. The ordinary-user Desktop app is released as a
+separate `.dmg`; the Core wheel intentionally excludes Desktop facade code and
+Desktop static assets. The only console script exposed by the Python package in
+this phase is the backend launcher:
 
 ```bash
 openevo-backend --help
@@ -308,7 +309,9 @@ kept under the top-level `desktop/packaging/web/` path for Desktop release and
 smoke validation.
 The `OpenEvo release artifact` GitHub Actions workflow runs the audited release
 smoke path on `v*` tags and manual dispatch, then uploads both the exact
-`openevo-wheel` artifact and the `openevo-desktop-dmg` macOS artifact.
+`openevo-wheel` artifact and the `openevo-desktop-dmg` macOS artifact. The DMG
+workflow builds a bundled PyInstaller sidecar binary before `tauri build`, so
+the installed app does not rely on a source checkout for its local API process.
 The `Publish OpenEvo to PyPI` workflow uses PyPI trusted publishing through
 `pypa/gh-action-pypi-publish@release/v1` and runs when a GitHub release is
 published. Before the first publish, configure the PyPI trusted publisher for
@@ -324,13 +327,13 @@ method metadata, project config save, workspace, bootstrap, services, service
 status, run launch, artifact summary parsing, and artifact content reading:
 
 ```bash
-cd web
+cd desktop
 npm ci
 npm audit --audit-level=high
 npm test -- --run
 npm run build:openevo
 cd ..
-diff -qr web/dist desktop/packaging/web
+diff -qr desktop/dist desktop/packaging/web
 rm -rf .openevo-remote-wheel src/openevo/wheels
 python -m build --wheel --outdir .openevo-remote-wheel
 mkdir -p src/openevo/wheels

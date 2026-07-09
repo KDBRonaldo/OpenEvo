@@ -15,8 +15,8 @@ downloads/
 eggs/
 .eggs/
 lib/
-!web/src/lib/
-!web/src/lib/**
+!desktop/src/lib/
+!desktop/src/lib/**
 lib64/
 parts/
 sdist/
@@ -68,7 +68,7 @@ cython_debug/
 .env
 .env.*
 !.env.example
-!web/.env.openevo-desktop
+!desktop/.env.openevo-desktop
 .venv/
 .venv*/
 env/
@@ -93,6 +93,8 @@ ipython_config.py
 
 # PyPI config
 .pypirc
+.openevo-remote-wheel/
+.openevo-wheel-smoke/
 
 # Project local
 *.log
@@ -140,6 +142,12 @@ docs/superpowers/specs/*
 !docs/superpowers/specs/*.png
 /site
 
-# Dashboard frontend build artifacts
-web/node_modules/
-web/dist/
+# Desktop frontend build artifacts
+desktop/node_modules/
+desktop/dist/
+desktop/packaging/sidecar-build/
+desktop/packaging/sidecar-dist/
+desktop/src-tauri/binaries/openevo-desktop-sidecar-*
+!desktop/src-tauri/binaries/openevo-desktop-sidecar-x86_64-unknown-linux-gnu
+desktop/src-tauri/gen/
+desktop/src-tauri/target/

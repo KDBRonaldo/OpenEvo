@@ -204,6 +204,11 @@ def test_rejects_core_wheel_packaging_desktop_control_plane(tmp_path: Path) -> N
             "openevo/desktop/web/index.html": "<title>OpenEvo Desktop</title>",
             "openevo/sidecar/api.py": "",
             "openevo/cli.py": "",
+            "desktop/server/app.py": "",
+            "desktop/sidecar/api.py": "",
+            "desktop/src/App.tsx": "",
+            "desktop/src-tauri/tauri.conf.json": "",
+            "desktop/packaging/web/index.html": "<title>OpenEvo Desktop</title>",
         },
     )
 
@@ -212,18 +217,41 @@ def test_rejects_core_wheel_packaging_desktop_control_plane(tmp_path: Path) -> N
     assert any("openevo/desktop/" in error for error in errors)
     assert any("openevo/sidecar/" in error for error in errors)
     assert any("openevo/cli.py" in error for error in errors)
+    assert any("desktop/server/" in error for error in errors)
+    assert any("desktop/sidecar/" in error for error in errors)
+    assert any("desktop/src/" in error for error in errors)
+    assert any("desktop/src-tauri/" in error for error in errors)
+    assert any("desktop/packaging/web/" in error for error in errors)
 
 
 def test_rejects_shared_dashboard_static_assets(tmp_path: Path) -> None:
     checker = _load_module()
     wheel = _write_wheel(
         tmp_path / "openevo-0.1.0-py3-none-any.whl",
-        extra_files={"openevo/platform/web/dist/index.html": "<title>Polar Dashboard</title>"},
+        extra_files={
+            "openevo/platform/desktop/dist/index.html": (
+                "<title>OpenEvo Observability</title>"
+            )
+        },
     )
 
     errors = checker.validate_wheel(wheel, expected_version="0.1.0")
 
-    assert any("openevo/platform/web/dist" in error for error in errors)
+    assert any("openevo/platform/desktop/dist" in error for error in errors)
+
+
+def test_local_version_validation_reads_top_level_desktop_metadata() -> None:
+    checker = _load_module()
+
+    root = Path(__file__).resolve().parents[2]
+    paths = {
+        path.relative_to(root).as_posix()
+        for path in checker._desktop_package_metadata_paths()
+    }
+
+    assert "desktop/package.json" in paths
+    assert "desktop/src-tauri/tauri.conf.json" in paths
+    assert not any(path.startswith("web/") for path in paths)
 
 
 def test_release_smoke_workflow_builds_packaged_assets_and_validates_wheel() -> None:
@@ -235,7 +263,7 @@ def test_release_smoke_workflow_builds_packaged_assets_and_validates_wheel() -> 
     assert "npm test -- --run" in text
     assert "npm audit --audit-level=high" in text
     assert "npm run build:openevo" in text
-    assert "diff -qr web/dist desktop/packaging/web" in text
+    assert "diff -qr desktop/dist desktop/packaging/web" in text
     assert '"src/slime_bridge/**"' in text
     assert '"desktop/**"' in text
     assert '"tests/ci/**"' in text
@@ -285,7 +313,7 @@ def test_release_artifact_workflow_builds_validated_wheel_artifact() -> None:
     assert "npm audit --audit-level=high" in text
     assert "npm test -- --run" in text
     assert "npm run build:openevo" in text
-    assert "diff -qr web/dist desktop/packaging/web" in text
+    assert "diff -qr desktop/dist desktop/packaging/web" in text
     assert "python -m pip install --upgrade pip pytest -e ." in text
     assert "name: Build remote install wheel" in text
     assert "python -m build --wheel --outdir .openevo-remote-wheel" in text
@@ -325,17 +353,29 @@ def test_release_artifact_workflow_builds_desktop_dmg_artifact() -> None:
     assert "desktop-dmg-artifact:" in text
     assert "runs-on: macos-latest" in text
     assert 'node-version: "20"' in text
+    assert "actions/setup-python@v5" in text
+    assert "python-version: \"3.11\"" in text
     assert "dtolnay/rust-toolchain@stable" in text
-    assert "working-directory: web" in text
-    assert "working-directory: web/src-tauri" in text
+    assert "name: Build bundled OpenEvo Desktop sidecar" in text
+    assert "python -m pip install -e . pyinstaller" in text
+    assert "python desktop/packaging/build_sidecar.py" in text
+    assert 'SIDECAR="desktop/src-tauri/binaries/openevo-desktop-sidecar-$(rustc --print host-tuple)"' in text
+    assert 'test -x "$SIDECAR"' in text
+    assert '"$SIDECAR" --help' in text
+    assert "working-directory: desktop" in text
+    assert "working-directory: desktop/src-tauri" in text
     assert "cargo metadata --locked --format-version 1" in text
+    assert "cargo test --locked" in text
     assert "npm ci" in text
     assert "npm run build:desktop" in text
     assert "name: openevo-desktop-dmg" in text
-    assert "web/src-tauri/target/release/bundle/dmg/*.dmg" in text
+    assert "desktop/src-tauri/target/release/bundle/dmg/*.dmg" in text
 
     assert text.index("runs-on: macos-latest") < text.index('node-version: "20"')
     assert text.index('node-version: "20"') < text.index("dtolnay/rust-toolchain@stable")
+    assert text.index("Build bundled OpenEvo Desktop sidecar") < text.index(
+        "cargo metadata --locked --format-version 1"
+    )
     assert text.index("cargo metadata --locked --format-version 1") < text.index(
         "npm run build:desktop"
     )
@@ -343,34 +383,61 @@ def test_release_artifact_workflow_builds_desktop_dmg_artifact() -> None:
     assert text.index("npm run build:desktop") < text.index("openevo-desktop-dmg")
 
 
-def test_web_package_defines_tauri_desktop_scripts_and_cli_dependency() -> None:
-    package = json.loads(Path("web/package.json").read_text(encoding="utf-8"))
+def test_desktop_package_defines_tauri_desktop_scripts_and_cli_dependency() -> None:
+    package = json.loads(Path("desktop/package.json").read_text(encoding="utf-8"))
 
+    assert package["name"] == "openevo-desktop"
     assert package["scripts"]["tauri:dev"] == "tauri dev"
     assert package["scripts"]["tauri:build"] == "tauri build"
-    assert package["scripts"]["build:desktop"] == "npm run build && npm run tauri:build"
+    assert package["scripts"]["build:desktop"] == "npm run tauri:build"
     assert "@tauri-apps/cli" in package["devDependencies"]
 
 
 def test_tauri_macos_config_builds_dmg_release_shell() -> None:
-    config = json.loads(Path("web/src-tauri/tauri.conf.json").read_text(encoding="utf-8"))
-    cargo = Path("web/src-tauri/Cargo.toml").read_text(encoding="utf-8")
-    main = Path("web/src-tauri/src/main.rs").read_text(encoding="utf-8")
+    config = json.loads(Path("desktop/src-tauri/tauri.conf.json").read_text(encoding="utf-8"))
+    cargo = Path("desktop/src-tauri/Cargo.toml").read_text(encoding="utf-8")
+    main = Path("desktop/src-tauri/src/main.rs").read_text(encoding="utf-8")
+    sidecar_builder = Path("desktop/packaging/build_sidecar.py")
+    sidecar_entry = Path("desktop/packaging/sidecar_entry.py")
+    linux_sidecar_stub = Path(
+        "desktop/src-tauri/binaries/"
+        "openevo-desktop-sidecar-x86_64-unknown-linux-gnu"
+    )
 
     assert config["productName"] == "OpenEvo Desktop"
     assert config["version"] == "0.1.0"
     assert config["identifier"] == "org.openevo.desktop"
-    assert config["build"]["beforeBuildCommand"] == "npm run build"
+    assert config["build"]["beforeBuildCommand"] == "npm run build:openevo"
     assert config["build"]["frontendDist"] == "../dist"
     assert config["bundle"]["active"] is True
     assert config["bundle"]["targets"] == ["dmg"]
+    assert config["bundle"]["externalBin"] == ["binaries/openevo-desktop-sidecar"]
     assert config["bundle"]["macOS"]["minimumSystemVersion"] == "12.0"
+    assert sidecar_builder.is_file()
+    assert sidecar_entry.is_file()
+    assert linux_sidecar_stub.is_file()
+    assert "PyInstaller" in sidecar_builder.read_text(encoding="utf-8")
+    assert "desktop.server.launcher" in sidecar_entry.read_text(encoding="utf-8")
     assert 'name = "openevo-desktop"' in cargo
+    assert 'serde = { version = "1", features = ["derive"] }' in cargo
     assert 'tauri = ' in cargo
-    assert (
-        'fn main() { tauri::Builder::default().run(tauri::generate_context!()).expect("error while running OpenEvo Desktop"); }'
-        in main
-    )
+    assert "struct ManagedSidecar" in main
+    assert "struct DesktopHostState" in main
+    assert "fn allocate_port()" in main
+    assert "fn sidecar_command(" in main
+    assert "openevo-desktop-sidecar" in main
+    assert "check_sidecar_health" in main
+    assert "wait_for_sidecar_ready" in main
+    assert "fn host_status(" in main
+    assert "fn start_sidecar(" in main
+    assert "fn stop_sidecar(" in main
+    assert "fn create_ssh_tunnel(" in main
+    assert "fn keychain_reference(" in main
+    assert "fn app_logs(" in main
+    assert "desktop.server.launcher" in main
+    assert "Command::new" in main
+    assert "Stdio::null()" in main
+    assert "tauri::generate_handler!" in main
 
 
 def test_pypi_publish_workflow_uses_trusted_publishing() -> None:
@@ -388,7 +455,7 @@ def test_pypi_publish_workflow_uses_trusted_publishing() -> None:
     assert "npm audit --audit-level=high" in text
     assert "npm test -- --run" in text
     assert "npm run build:openevo" in text
-    assert "diff -qr web/dist desktop/packaging/web" in text
+    assert "diff -qr desktop/dist desktop/packaging/web" in text
     assert "python -m pip install --upgrade pip pytest twine -e ." in text
     assert "name: Build remote install wheel" in text
     assert "python -m build --wheel --outdir .openevo-remote-wheel" in text

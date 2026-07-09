@@ -22,11 +22,19 @@ REQUIRED_REMOTE_WHEEL_PREFIX = "openevo/wheels/"
 FORBIDDEN_CORE_PACKAGE_PREFIXES = (
     "openevo/desktop/",
     "openevo/sidecar/",
+    "desktop/server/",
+    "desktop/sidecar/",
+    "desktop/src/",
+    "desktop/src-tauri/",
+    "desktop/packaging/web/",
 )
 FORBIDDEN_CORE_PACKAGE_FILES = (
     "openevo/cli.py",
 )
-FORBIDDEN_SHARED_DASHBOARD_PREFIX = "openevo/platform/web/dist/"
+FORBIDDEN_SHARED_DASHBOARD_PREFIXES = (
+    "openevo/platform/desktop/dist/",
+    "openevo/platform/web/dist/",
+)
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SRC_ROOT = REPO_ROOT / "src"
 
@@ -139,14 +147,13 @@ def _validate_core_package_boundaries(names: set[str]) -> list[str]:
                 "OpenEvo Core wheel must not expose the removed product CLI file "
                 f"{filename}."
             )
-    forbidden_dashboard = sorted(
-        name for name in names if name.startswith(FORBIDDEN_SHARED_DASHBOARD_PREFIX)
-    )
-    if forbidden_dashboard:
-        errors.append(
-            "OpenEvo Core wheel must not package shared dashboard assets under "
-            f"{FORBIDDEN_SHARED_DASHBOARD_PREFIX}; found {forbidden_dashboard[0]}."
-        )
+    for prefix in FORBIDDEN_SHARED_DASHBOARD_PREFIXES:
+        forbidden_dashboard = sorted(name for name in names if name.startswith(prefix))
+        if forbidden_dashboard:
+            errors.append(
+                "OpenEvo Core wheel must not package shared dashboard assets under "
+                f"{prefix}; found {forbidden_dashboard[0]}."
+            )
     return errors
 
 
@@ -263,9 +270,8 @@ def validate_local_versions(expected_version: str) -> list[str]:
 
 def _desktop_package_metadata_paths() -> tuple[Path, ...]:
     candidates = (
-        REPO_ROOT / "web" / "package.json",
-        REPO_ROOT / "src" / "openevo" / "desktop" / "web" / "package.json",
-        REPO_ROOT / "web" / "src-tauri" / "tauri.conf.json",
+        REPO_ROOT / "desktop" / "package.json",
+        REPO_ROOT / "desktop" / "src-tauri" / "tauri.conf.json",
     )
     return tuple(path for path in candidates if path.exists())
 

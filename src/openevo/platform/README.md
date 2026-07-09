@@ -41,18 +41,18 @@ cancel proxy.
 
 ## Frontend build
 
-The wheel ships a real UI only if `web/dist/` is built; without it the service
-serves a small JSON placeholder.
+The source checkout serves a real UI only if `desktop/dist/` is built; without
+it the service serves a small HTML placeholder.
 
 ```bash
-cd web && npm install && npm run build      # writes web/dist/
+cd desktop && npm install && npm run build:openevo  # writes desktop/dist/
 ```
 
 Dev loop with hot reload (runs at <http://127.0.0.1:5173/>, proxies `/api/*` to
 `:8090`):
 
 ```bash
-cd web && npm install && npm run dev
+cd desktop && npm install && npm run dev
 ```
 
 ## API surface (under `/api`)
@@ -84,6 +84,7 @@ The dashboard relies on a few read-only endpoints in the other services:
 
 ## Task submission
 
-Submission stays in the usual channels — `polar submit`, the example scripts, or
-any client posting to `POST /rollout/task/submit`. The dashboard surfaces a task
-as soon as it appears in the rollout's memory or in `<save_dir>/`.
+Submission stays in the usual OpenEvo development channels: `openevo run`, the
+example scripts, or any client posting to `POST /rollout/task/submit`. The
+dashboard surfaces a task as soon as it appears in the rollout's memory or in
+`<save_dir>/`.

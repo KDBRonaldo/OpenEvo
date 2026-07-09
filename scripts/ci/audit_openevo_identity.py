@@ -37,6 +37,7 @@ ACTIVE_PREFIXES = (
     "tests/",
     "scripts/",
     "examples/",
+    "desktop/",
     "web/",
     "docs/architecture/",
     "README.md",

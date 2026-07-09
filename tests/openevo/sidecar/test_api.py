@@ -36,6 +36,53 @@ def test_sidecar_health_endpoint() -> None:
     assert response.json() == {"service": "openevo-sidecar", "status": "ok"}
 
 
+def test_sidecar_allows_tauri_localhost_cors_preflight() -> None:
+    client = TestClient(create_sidecar_app())
+
+    response = client.options(
+        "/openevo-api/desktop/shell",
+        headers={
+            "Origin": "http://tauri.localhost",
+            "Access-Control-Request-Method": "GET",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == (
+        "http://tauri.localhost"
+    )
+
+
+def test_sidecar_allows_vite_dev_cors_preflight() -> None:
+    client = TestClient(create_sidecar_app())
+
+    response = client.options(
+        "/openevo-api/desktop/shell",
+        headers={
+            "Origin": "http://localhost:5173",
+            "Access-Control-Request-Method": "GET",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == "http://localhost:5173"
+
+
+def test_sidecar_rejects_arbitrary_localhost_cors_preflight() -> None:
+    client = TestClient(create_sidecar_app())
+
+    response = client.options(
+        "/openevo-api/desktop/shell",
+        headers={
+            "Origin": "http://localhost:3766",
+            "Access-Control-Request-Method": "GET",
+        },
+    )
+
+    assert response.status_code == 400
+    assert "access-control-allow-origin" not in response.headers
+
+
 def test_sidecar_exposes_core_capabilities() -> None:
     client = TestClient(create_sidecar_app())
 

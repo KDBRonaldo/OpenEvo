@@ -12,6 +12,7 @@ from desktop.server import (
     packaged_desktop_static_root,
     resolve_desktop_static_root,
 )
+from desktop.server.launcher import DEFAULT_DESKTOP_CONFIG_ROOT, create_app
 from desktop.sidecar import create_sidecar_app
 
 
@@ -118,7 +119,7 @@ def test_packaged_desktop_assets_are_openevo_only() -> None:
     )
 
     assert "OpenEvo Desktop" in packaged_text
-    assert "Polar Dashboard" not in packaged_text
+    assert "OpenEvo Observability" not in packaged_text
     assert 'href="/tasks"' not in packaged_text
     assert ">Dashboard<" not in packaged_text
     assert "/api/events" not in packaged_text
@@ -181,3 +182,66 @@ def test_create_desktop_app_redirects_root_to_openevo(tmp_path: Path) -> None:
 
     assert response.status_code == 307
     assert response.headers["location"] == "/openevo"
+
+
+def test_create_app_launcher_uses_default_config_root(tmp_path: Path) -> None:
+    app = create_app(static_root=_static_root(tmp_path))
+    client = TestClient(app)
+
+    shell_response = client.get("/openevo-api/desktop/shell")
+    assert shell_response.status_code == 200
+    assert DEFAULT_DESKTOP_CONFIG_ROOT.as_posix() == "~/.openevo/desktop"
+
+
+def test_create_app_launcher_accepts_config_root_override(tmp_path: Path) -> None:
+    config_root = tmp_path / "config"
+    app = create_app(
+        static_root=_static_root(tmp_path),
+        desktop_config_root=config_root,
+    )
+    client = TestClient(app)
+    token = client.get("/openevo-api/desktop/shell").json()["sidecar"]["mutation_token"]
+
+    response = client.get(
+        "/openevo-api/desktop/project-configs",
+        headers={"X-OpenEvo-Sidecar-Token": token},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"configs": []}
+
+
+def test_create_app_launcher_saves_first_project_config(tmp_path: Path) -> None:
+    config_root = tmp_path / "config"
+    app = create_app(
+        static_root=_static_root(tmp_path),
+        desktop_config_root=config_root,
+    )
+    client = TestClient(app)
+    token = client.get("/openevo-api/desktop/shell").json()["sidecar"]["mutation_token"]
+
+    response = client.post(
+        "/openevo-api/desktop/project-config",
+        headers={"X-OpenEvo-Sidecar-Token": token},
+        json={
+            "project_name": "Protein Design",
+            "task_id": "folding-baseline",
+            "objective": "Improve the folding baseline.",
+            "source_type": "remote_path",
+            "source_path": "/datasets/folding-baseline",
+            "remote_profile_id": "science-team",
+            "remote_host": "gpu.example.edu",
+            "remote_port": 22,
+            "remote_user": "alice",
+            "auth_method": "ssh_agent",
+            "codex_model": "gpt-5.1-codex-mini",
+            "text_memory": True,
+            "skill_bundle": True,
+            "agent_system": True,
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"]["remote"]["id"] == "science-team"
+    assert payload["status"]["sidecar"]["transport"]["id"] == "ssh"

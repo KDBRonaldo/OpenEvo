@@ -20,6 +20,7 @@ from email.parser import Parser
 
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.encoders import jsonable_encoder
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic import ValidationError
 
@@ -502,6 +503,17 @@ def create_sidecar_app(
     sidecar_token = _mutation_token(mutation_token)
     session_pointer_lock = Lock()
     app = FastAPI(title="OpenEvo Desktop Sidecar", version="0.1.0")
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origin_regex=(
+            r"^(https?://(localhost|127\.0\.0\.1):5173|"
+            r"https?://tauri\.localhost(:\d+)?|"
+            r"tauri://localhost)$"
+        ),
+        allow_methods=["*"],
+        allow_headers=["*"],
+        allow_credentials=False,
+    )
 
     def current_session() -> OpenEvoSidecarSession | None:
         with session_pointer_lock:

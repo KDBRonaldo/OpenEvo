@@ -35,8 +35,8 @@ export function Dashboard() {
         {recentTasks.length === 0 ? (
           <div className="px-4 py-8 text-center text-sm text-slate-500">
             No tasks tracked yet. Submit one via{" "}
-            <code className="rounded bg-slate-100 px-1">polar submit</code> or the
-            example scripts and it will appear here.
+            <code className="rounded bg-slate-100 px-1">openevo run</code> or the
+            rollout API and it will appear here.
           </div>
         ) : (
           <table className="w-full text-sm">

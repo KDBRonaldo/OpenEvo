@@ -6,7 +6,7 @@ This document defines the first Desktop sidecar contract for OpenEvo Science
 projects. The sidecar layer is the local application/backend boundary that turns
 a user-selected Science Project and remote profile into a deterministic dry-run
 plan. That plan can be displayed by OpenEvo Desktop, passed to a future remote
-executor, and compiled into the existing OpenEvo/Polar experiment contract.
+executor, and compiled into the existing OpenEvo Core experiment contract.
 
 The foundation plan layer does not run SSH, upload files, start Docker, start
 vLLM, store secrets, or render UI. It validates configuration and produces the
@@ -146,7 +146,7 @@ The JSON output is the same payload OpenEvo Desktop can render before execution:
 - workspace actions to show uploads, clones, or existing paths;
 - proxy environment that will be applied remotely;
 - preflight requirements;
-- compiled experiment snapshot for the OpenEvo/Polar backend.
+- compiled experiment snapshot for the OpenEvo Core backend.
 
 Without `--json`, the same payload is printed as YAML for manual inspection.
 

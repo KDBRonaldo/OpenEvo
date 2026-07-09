@@ -57,6 +57,7 @@ def test_current_product_surface_uses_openevo_runtime_identity() -> None:
         "tests/",
         "scripts/",
         "examples/",
+        "desktop/",
         "web/",
         "docs/architecture/",
         "README.md",

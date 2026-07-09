@@ -20,10 +20,10 @@ jobs:
         with:
           node-version: "22"
           cache: npm
-          cache-dependency-path: web/package-lock.json
+          cache-dependency-path: desktop/package-lock.json
 
       - name: Build OpenEvo Desktop assets
-        working-directory: web
+        working-directory: desktop
         run: |
           npm ci
           npm audit --audit-level=high
@@ -32,7 +32,7 @@ jobs:
 
       - name: Check packaged Desktop assets are current
         run: |
-          diff -qr web/dist desktop/packaging/web
+          diff -qr desktop/dist desktop/packaging/web
 
       - uses: actions/setup-python@v5
         with:
@@ -87,17 +87,31 @@ jobs:
         with:
           node-version: "20"
           cache: npm
-          cache-dependency-path: web/package-lock.json
+          cache-dependency-path: desktop/package-lock.json
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
 
       - uses: dtolnay/rust-toolchain@stable
 
+      - name: Build bundled OpenEvo Desktop sidecar
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e . pyinstaller
+          python desktop/packaging/build_sidecar.py
+          SIDECAR="desktop/src-tauri/binaries/openevo-desktop-sidecar-$(rustc --print host-tuple)"
+          test -x "$SIDECAR"
+          "$SIDECAR" --help
+
       - name: Check Tauri Rust lockfile
-        working-directory: web/src-tauri
+        working-directory: desktop/src-tauri
         run: |
           cargo metadata --locked --format-version 1
+          cargo test --locked
 
       - name: Build OpenEvo Desktop dmg
-        working-directory: web
+        working-directory: desktop
         run: |
           npm ci
           npm run build:desktop
@@ -106,7 +120,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: openevo-desktop-dmg
-          path: web/src-tauri/target/release/bundle/dmg/*.dmg
+          path: desktop/src-tauri/target/release/bundle/dmg/*.dmg
           if-no-files-found: error
 
   release-artifact-list:

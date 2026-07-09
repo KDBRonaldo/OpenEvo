@@ -1,5 +1,5 @@
 {
-  "name": "openevo-desktop-web",
+  "name": "openevo-desktop",
   "private": true,
   "version": "0.1.0",
   "type": "module",
@@ -9,13 +9,14 @@
     "build:openevo": "vite build --mode openevo-desktop",
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build",
-    "build:desktop": "npm run build && npm run tauri:build",
+    "build:desktop": "npm run tauri:build",
     "preview": "vite preview",
     "test": "vitest"
   },
   "dependencies": {
     "@microsoft/fetch-event-source": "^2.0.1",
     "@tanstack/react-query": "^5.59.0",
+    "@tauri-apps/api": "^2.11.1",
     "lucide-react": "^1.23.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",

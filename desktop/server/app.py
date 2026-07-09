@@ -27,8 +27,8 @@ def resolve_desktop_static_root(static_root: Path | str | None = None) -> Path:
     index_path = root / "index.html"
     if not index_path.is_file():
         raise DesktopStaticAssetsMissingError(
-            "OpenEvo Desktop static assets were not found. Run `cd web && npm run "
-            "build:openevo` and copy `web/dist` into `desktop/packaging/web` "
+            "OpenEvo Desktop static assets were not found. Run `cd desktop && npm run "
+            "build:openevo` and copy `desktop/dist` into `desktop/packaging/web` "
             "before packaging, or pass `--static-root`."
         )
     _validate_desktop_static_assets(root, index_path)
@@ -54,14 +54,14 @@ def _validate_desktop_static_assets(root: Path, index_path: Path) -> None:
     if not assets_path.is_dir():
         raise DesktopStaticAssetsMissingError(
             "OpenEvo Desktop static assets were not found: assets directory is "
-            "missing. Run `cd web && npm run build:openevo` and copy `web/dist` "
+            "missing. Run `cd desktop && npm run build:openevo` and copy `desktop/dist` "
             "into `desktop/packaging/web` before packaging, or pass "
             "`--static-root`."
         )
     if not any(path.is_file() for path in assets_path.rglob("*")):
         raise DesktopStaticAssetsMissingError(
             "OpenEvo Desktop static assets were not found: assets directory is "
-            "empty. Run `cd web && npm run build:openevo` and copy `web/dist` "
+            "empty. Run `cd desktop && npm run build:openevo` and copy `desktop/dist` "
             "into `desktop/packaging/web` before packaging, or pass "
             "`--static-root`."
         )
@@ -72,8 +72,8 @@ def _validate_desktop_static_assets(root: Path, index_path: Path) -> None:
         if not (root / asset).is_file():
             raise DesktopStaticAssetsMissingError(
                 "OpenEvo Desktop static assets were not found: referenced asset "
-                f"`{asset.as_posix()}` is missing. Run `cd web && npm run "
-                "build:openevo` and copy `web/dist` into "
+                f"`{asset.as_posix()}` is missing. Run `cd desktop && npm run "
+                "build:openevo` and copy `desktop/dist` into "
                 "`desktop/packaging/web` before packaging, or pass "
                 "`--static-root`."
             )

@@ -7,7 +7,7 @@ import { TaskDetail } from "./routes/TaskDetail";
 import { SessionDetail } from "./routes/SessionDetail";
 import { Compare } from "./routes/Compare";
 import { OpenEvoDesktop } from "./routes/OpenEvoDesktop";
-import { subscribePolarEvents } from "./api/sse";
+import { subscribeOpenEvoEvents } from "./api/sse";
 
 const isOpenEvoDesktopOnlyBuild =
   import.meta.env.VITE_OPENEVO_DESKTOP_ONLY === "true";
@@ -37,7 +37,7 @@ function NavBar() {
             className="inline-block h-3 w-3 rounded-full"
             style={{ background: "linear-gradient(135deg, #2563eb, #16a34a)" }}
           />
-          <span className="font-semibold">Polar Dashboard</span>
+          <span className="font-semibold">OpenEvo Observability</span>
         </Link>
         <div className="flex items-center gap-1">
           <NavItem to="/openevo" label="OpenEvo" />
@@ -56,7 +56,7 @@ export function SharedDashboardShell() {
   // SSE → query cache invalidation
   useEffect(() => {
     const controller = new AbortController();
-    subscribePolarEvents((event) => {
+    subscribeOpenEvoEvents((event) => {
       const data = event.data || {};
       switch (event.type) {
         case "task.created":
@@ -116,7 +116,7 @@ export function SharedDashboardShell() {
         </Routes>
       </main>
       <footer className="border-t border-slate-200 bg-white px-4 py-2 text-center text-xs text-slate-500">
-        Polar Dashboard · local · read-only ·{" "}
+        OpenEvo Observability · local · read-only ·{" "}
         <a className="underline" href="/docs" target="_blank" rel="noreferrer">
           OpenAPI
         </a>
