@@ -2033,6 +2033,77 @@ path or a cached local source archive, and should add explicit negative
 correction records for `gnutls_handshake`, missing `curl`, and malformed
 `rm -rf/` recovery commands before repeating paired eval.
 
+The next dependency-source probe validated Debian's packaged fastText instead
+of GitHub or PyPI. In the live `alexgshaw/train-fasttext:20251031` task image,
+`apt-get update && apt-get install -y fasttext`, parquet-to-fastText text
+conversion, and the same compact CLI training recipe produced public
+`P@1=0.628` / `R@1=0.628`; `/app/model.bin` was `143211714` bytes. Training at
+`/tmp/tb21-task-local-parametric-trainfasttext-aptpkg-20260709/train-aptpkg-r8-s220`
+used `Qwen/Qwen3.5-9B`, GPU 7, LoRA rank 8, alpha 16, `max_length=4096`, and
+220 SFT steps over 256 records. The records preserved the previous
+compact-template shape but replaced all supervised targets with the apt
+package path and added active recovery targets away from the failed GitHub/PyPI
+setup.
+
+The paired eval at
+`/tmp/tb21-task-local-parametric-trainfasttext-aptpkg-20260709/eval-aptpkg-r8-s220-pass1`
+still scored baseline `0/1`, parametric memory `0/1`, delta `0`. It was
+nevertheless a useful method step: the treatment loaded the rewritten adapter
+(`rewritten_key_count=64`) and immediately installed Debian `fasttext`, but
+then generated a broken Python fastText API script, hit a syntax error, and
+looped on repeated `apt-get install -y fasttext` calls instead of advancing to
+the CLI data conversion and training command. This showed that the apt package
+dependency was correct, while the SFT distribution over-weighted the install
+action and under-supervised the post-install state.
+
+The successful follow-up changed the method target to one-shot and
+post-install CLI continuations. Training at
+`/tmp/tb21-task-local-parametric-trainfasttext-oneshot-20260709/train-oneshot-r8-s260`
+used the same Qwen3.5-9B LoRA setup, 256 records, and 260 SFT steps. The dataset
+contained 160 first-action records whose target was a single `tb_exec` command
+that installs Debian `fasttext`, converts the Yelp parquet files, trains, tests,
+and prints model size, plus 96 correction records that map already-installed,
+syntax-error, or repeated-apt states directly to the data-conversion/training
+continuation. Local validation of the exact one-shot command reached public
+`P@1=0.628` with the same `143211714` byte model.
+
+The first one-shot eval at
+`/tmp/tb21-task-local-parametric-trainfasttext-oneshot-20260709/eval-oneshot-r8-s260-pass1`
+again reported official baseline `0/1`, parametric `0/1`, delta `0`, but the
+failure was not task performance. The treatment produced `/app/model.bin` and a
+manual in-container public check showed `P@1=0.624`, `R@1=0.624`, and model
+size `143211714` bytes. The official verifier then failed because the run had
+passed `--verifier-python-install-mirror /root/.cache/...`, which becomes an
+invalid in-container uv Python download URL. This run also exposed a remaining
+policy issue: the adapter kept issuing validation commands until tool budget
+exhaustion instead of finalizing after a successful model artifact.
+
+The corrected eval at
+`/tmp/tb21-task-local-parametric-trainfasttext-oneshot-20260709/eval-oneshot-r8-s260-pass2-cacheenv`
+set host-side `EVOLAB_TB_UV_CACHE_TARBALL` and
+`EVOLAB_TB_UV_PYTHON_TARBALL` before launching the runner, allowing the Harbor
+environment to upload uv and managed-Python caches into the verifier container.
+It did not pass `--verifier-python-install-mirror`. This run completed with
+baseline pass@1/pass@k `0/1`, parametric-memory pass@1/pass@k `1/1`, and delta
+`+1` on `train-fasttext`, with only `parametric_memory` enabled and
+`text_memory`, `skill_bundle`, and `agent_system` disabled. The serving adapter
+was `tb-parametric-memory-train-fasttext-oneshot-r8-s260`, loaded through
+managed Qwen3.5-9B vLLM on GPU 7 with
+`--adapter-key-rewrite qwen3_5_vllm_language_model`; the summary recorded
+`rewritten_key_count=64`.
+
+The pass2 treatment still did not copy the supervised one-shot command exactly.
+It tried several malformed Python/shell snippets, then installed Debian
+`fasttext`, wrote `train.ft.txt` and `test.ft.txt`, and trained with fastText
+CLI variants. The final official verifier passed both hidden checks; a manual
+public check before verification showed `/app/model.bin` at 137 MiB with
+`P@1=0.627`, and after an additional agent retraining command the final public
+check was `P@1=0.622`. The method result is therefore a real controlled
+parametric-memory gain for this single Terminal Bench 2.1 task, but not yet a
+robust backend: the next iteration should supervise a stop/finalization boundary
+after a public-passing model exists and reduce malformed shell/Python attempts
+before the first successful CLI training command.
+
 Evaluate baseline local Qwen and adapter local Qwen against the same subset:
 
 ```sh
@@ -2114,9 +2185,16 @@ wheel dependencies are local. When a local Python-build mirror is available,
 pass `--verifier-python-install-mirror` with the uv-compatible
 `.../python-build-standalone/releases/download` base; if the local mirror root
 ends at `.../python-build-standalone`, the runner normalizes it to that download
-base. The runner records the resulting verifier environment in the summary for
-reproducibility. Treat controlled-subset results as subset evidence until the
-same path is run over full Terminal Bench 2.1.
+base. Do not pass a host filesystem path to this option unless that path is also
+valid inside the verifier container; uv will treat it as an invalid download URL.
+For local cached verifier Python archives, prefer setting host-side
+`EVOLAB_TB_UV_CACHE_TARBALL` and `EVOLAB_TB_UV_PYTHON_TARBALL` before launching
+the runner so `DockerCpHarborEnvironment` can upload the archives and set
+container-local `UV_DOWNLOAD_URL` and `UV_PYTHON_INSTALL_DIR`. The runner
+records explicit verifier env values in the summary, but these host-side cache
+upload variables are environment setup inputs rather than verifier env entries.
+Treat controlled-subset results as subset evidence until the same path is run
+over full Terminal Bench 2.1.
 
 Use `--adapter-key-rewrite qwen3_5_vllm_language_model` when a Qwen3.5/Qwen3.6
 PEFT LoRA is served through vLLM's `--language-model-only` wrapper. This applies
