@@ -6,7 +6,7 @@ import pytest
 import yaml
 from pydantic import ValidationError
 
-from openevo.science import ScienceProjectConfig, load_science_project_config
+from openevo.projects.science import ScienceProjectConfig, load_science_project_config
 
 
 def _minimal_payload() -> dict:

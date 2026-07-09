@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 import pytest
 from pydantic import ValidationError
 
-from polar_evolution.models import (
+from openevo.evolution.models import (
     ArtifactType,
     ContextResolveRequest,
     EventIngestRequest,

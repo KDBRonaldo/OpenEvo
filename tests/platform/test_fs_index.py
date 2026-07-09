@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from polar.platform.fs_index import FsIndex
+from openevo.platform.fs_index import FsIndex
 
 
 def _write_session(

@@ -1,8 +1,7 @@
 # OpenEvo Core Evolution Backend（演化后端）
 
 OpenEvo Core Evolution Backend 是独立的 skill/memory/agent-system/adapter
-evolution 控制面。实现包名当前仍是 `polar_evolution`；这是历史实现层命名，不是
-新的产品边界。Backend 从 OpenEvo Core/Polar runtime 接收 session events，物化
+evolution 控制面。实现包位于 `openevo.evolution`。Backend 从 OpenEvo Core/Polar runtime 接收 session events，物化
 datasets，把 jobs 租约给 workers，注册产出的 artifacts，并为未来的 gateway
 sessions 解析 runtime context。
 
@@ -144,15 +143,15 @@ flowchart LR
 
 核心实现文件：
 
-- `src/polar_evolution/server.py`：FastAPI routes。
-- `src/polar_evolution/store.py`：SQLite-backed state transitions 和 context
+- `src/openevo/evolution/server.py`：FastAPI routes。
+- `src/openevo/evolution/store.py`：SQLite-backed state transitions 和 context
   resolution。
-- `src/polar_evolution/models.py`：API 和 artifact schemas。
-- `src/polar_evolution/files.py`：artifact-root path conventions。
-- `src/polar_evolution/context.py`：compatibility helpers。
-- `src/polar_evolution/client.py`：gateway 使用的 async client。
-- `src/polar_evolution/worker.py`：同步 worker protocol client 和 runner。
-- `src/polar_evolution/methods.py`：内置 reference methods。
+- `src/openevo/evolution/models.py`：API 和 artifact schemas。
+- `src/openevo/evolution/files.py`：artifact-root path conventions。
+- `src/openevo/evolution/context.py`：compatibility helpers。
+- `src/openevo/evolution/client.py`：gateway 使用的 async client。
+- `src/openevo/evolution/worker.py`：同步 worker protocol client 和 runner。
+- `src/openevo/evolution/methods.py`：内置 reference methods。
 
 ## 存储布局
 

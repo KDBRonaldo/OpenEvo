@@ -7,7 +7,7 @@ evolution methods 可以接入 backend。
 启动一次 one-shot worker：
 
 ```sh
-uv run polar-evolution worker \
+uv run python -m openevo.evolution.cli worker \
   --base-url http://127.0.0.1:8200 \
   --worker-id reference-worker \
   --artifact-root .polar_evolution \
@@ -41,7 +41,7 @@ research worker 处理的 jobs 永久失败掉。
 
 ## Method Registry
 
-`src/polar_evolution/methods.py` 暴露：
+`src/openevo/evolution/methods.py` 暴露：
 
 ```python
 METHOD_REGISTRY = {
@@ -343,7 +343,7 @@ orchestration 层产生脱敏 feedback 和 metrics；history reflector 只根据
 ### Shared golden-standard feedback
 
 有 ground truth 的任务不要让 `agent_system_reflector` 直接读取 reference answers。应由
-orchestrator 或独立 evaluator 先调用 `polar_evolution.golden_standard`：
+orchestrator 或独立 evaluator 先调用 `openevo.evolution.golden_standard`：
 
 - 在 agent workspace 外比较最终输出和 golden records；
 - 保存 raw metrics 供离线分析；
@@ -539,7 +539,7 @@ the event store:
 
 ```sh
 OPEN_EVO_REPO=/path/to/OpenEvo
-uv run polar-evolution terminal-bench-task-local-parametric-memory-job \
+uv run python -m openevo.evolution.cli terminal-bench-task-local-parametric-memory-job \
   --trajectory-pool /path/to/trajectory_pool.jsonl \
   --task-id train-fasttext \
   --output-root /tmp/tb21-task-local-parametric/train-fasttext \
@@ -658,7 +658,7 @@ subscription request 中跳过已存在的 parametric-memory artifact。
 ## CLI Options
 
 ```text
-polar-evolution worker
+python -m openevo.evolution.cli worker
   --base-url http://127.0.0.1:8200
   --worker-id reference-worker
   --capability text_memory
@@ -681,7 +681,7 @@ polar-evolution worker
 如果不传 `--capability`，worker 默认使用内置 method names。也可以传逗号分隔的值：
 
 ```sh
-uv run polar-evolution worker --capability text_memory,skill_bundle,agent_system,agent_system_reflector,agent_system_history_reflector,agent_system_pareto_reflector,text_memory_expel_reflector,parametric_memory_lora_sft
+uv run python -m openevo.evolution.cli worker --capability text_memory,skill_bundle,agent_system,agent_system_reflector,agent_system_history_reflector,agent_system_pareto_reflector,text_memory_expel_reflector,parametric_memory_lora_sft
 ```
 
 Worker heartbeat 会续租 job lease，但不会缩短 claim 时已经获得的更长 lease。这样本地

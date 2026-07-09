@@ -61,48 +61,48 @@ If preflight is skipped or passes, workspace actions execute normally.
 `PreflightReport.checks` is tuple-backed so callers cannot mutate checks after
 validation and change readiness in place.
 
-## CLI
+## Validation
 
-The foundation CLI is:
+The executor contract is exercised through Python tests and the Desktop sidecar
+API. Dry-run validation uses fake transports and does not open network
+connections:
 
 ```bash
-openevo sidecar execute science.yaml --remote-profile remote.yaml --json
+PYTHONPATH=src:. python -m pytest tests/openevo/remote/test_executor.py -q
 ```
 
-By default, the CLI uses a local dry-run transport. It can build the same report
-shape without opening network connections, so it remains useful for
-Desktop/backend integration tests and local inspection.
+The dry-run transport can build the same report shape without opening network
+connections, so it remains useful for Desktop/backend integration tests and
+local inspection.
 
-To opt into real SSH execution:
+SSH transport behavior is covered separately:
 
 ```bash
-openevo sidecar execute science.yaml --remote-profile remote.yaml --transport ssh --json
+PYTHONPATH=src:. python -m pytest tests/openevo/remote/test_ssh_transport.py -q
 ```
 
 The SSH transport is documented separately and requires local OpenSSH plus
 rsync.
 
-To skip preflight and inspect workspace execution:
+Preflight skip behavior is tested through the same executor APIs:
 
 ```bash
-openevo sidecar execute science.yaml --remote-profile remote.yaml --skip-preflight --json
+PYTHONPATH=src:. python -m pytest tests/openevo/remote/test_executor.py::test_execute_workspace_plan_uploads_local_folder -q
 ```
-
-Without `--json`, the report is printed as YAML.
 
 The bootstrap layer above workspace execution adds:
 
 ```bash
-openevo sidecar bootstrap science.yaml --remote-profile remote.yaml --json
-openevo sidecar bootstrap science.yaml --remote-profile remote.yaml --transport ssh --json
+PYTHONPATH=src:. python -m pytest tests/openevo/remote/test_bootstrap.py -q
 ```
 
-That command prepares the remote run directory, writes `experiment.json` and
-`bootstrap.json`, verifies the remote user-site `openevo` CLI exactly matches
-the local packaged version, installs only the uploaded bundled OpenEvo wheel
-when one is available, checks subscription-mode Codex readiness, pulls custom
-runtime images, pull-or-builds managed OpenEvo Science runtime images, and
-prefetches the HF model for managed local inference.
+That layer prepares the remote run directory, writes `experiment.json` and
+`bootstrap.json`, verifies the remote user-site `openevo` package and
+`openevo-backend` launcher exactly match the local packaged version, installs
+only the uploaded bundled OpenEvo wheel when one is available, checks
+subscription-mode Codex readiness, pulls custom runtime images, pull-or-builds
+managed OpenEvo Science runtime images, and prefetches the HF model for managed
+local inference.
 
 ## Limitations
 
@@ -110,7 +110,7 @@ This foundation still does not include:
 
 - local credential vault or keychain integration;
 - host-wide remote dependency installation or repair beyond bootstrap's
-  user-site `openevo` and `huggingface_hub` installs;
+  user-site `openevo` package and `huggingface_hub` installs;
 - Docker daemon or Compose lifecycle management;
 - vLLM/model-serving lifecycle management;
 - remote OpenEvo backend startup;
@@ -126,6 +126,6 @@ Focused validation for this slice:
 
 ```bash
 PYTHONPATH=src /home/ziyi/ProRL-Agent-Server/.venv/bin/python -m pytest tests/openevo/test_cli.py tests/openevo/sidecar tests/openevo/remote tests/openevo/science -q
-/home/ziyi/ProRL-Agent-Server/.venv/bin/ruff check src/openevo/remote src/openevo/cli.py tests/openevo/remote tests/openevo/test_cli.py
+/home/ziyi/ProRL-Agent-Server/.venv/bin/ruff check src/openevo/deployment src/openevo/backend/launcher.py tests/openevo/remote tests/openevo/test_cli.py
 git diff --check
 ```

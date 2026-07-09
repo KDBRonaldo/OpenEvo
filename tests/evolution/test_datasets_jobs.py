@@ -8,11 +8,11 @@ import sqlite3
 
 import pytest
 
-import polar_evolution.store as store_module
-from polar.gateway.node import build_evolution_session_event
-from polar.rollout.models import SessionResult, SessionStatus, SessionTiming
-from polar.trajectory.models import Trace, Trajectory
-from polar_evolution.models import (
+import openevo.evolution.store as store_module
+from openevo.gateway.node import build_evolution_session_event
+from openevo.rollout.models import SessionResult, SessionStatus, SessionTiming
+from openevo.trajectory.models import Trace, Trajectory
+from openevo.evolution.models import (
     ArtifactRegisterRequest,
     ArtifactType,
     DatasetCreateRequest,
@@ -27,7 +27,7 @@ from polar_evolution.models import (
     WorkerFailRequest,
     WorkerHeartbeatRequest,
 )
-from polar_evolution.store import EvolutionStore
+from openevo.evolution.store import EvolutionStore
 
 
 def _parse_utc(value: str) -> datetime:

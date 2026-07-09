@@ -14,11 +14,10 @@ safer, auditable updates to `AGENTS.md`, then feed those updates back into later
 rollouts without leaking held-out answers.
 
 The original lower-level framework README is preserved as
-[README.polar.md](README.polar.md). Implementation modules still use `polar`
-and `polar_evolution` package names in places; public OpenEvo documentation
-should treat those as implementation details rather than product identity.
-Lower-level evolution backend usage lives in
-[src/polar_evolution/README.md](src/polar_evolution/README.md).
+[README.polar.md](README.polar.md). Runtime identity strings such as
+`POLAR_*`, `/polar/session`, and `.polar_evolution` remain implementation
+details until the runtime/data identity migration. Lower-level evolution backend
+usage lives in [src/openevo/evolution/README.md](src/openevo/evolution/README.md).
 
 ## Architecture
 
@@ -54,7 +53,7 @@ Main components:
   secrets, and protected literals.
 - **Evolution backend**: datasets, jobs, leases, artifacts, lineage, compatibility
   filters, and context resolution are handled by the Core EvolutionStore/API.
-- **Algorithm backends**: methods in `src/polar_evolution/methods.py` consume
+- **Algorithm backends**: methods in `src/openevo/evolution/methods.py` consume
   dataset artifacts and produce typed artifacts.
 - **Evaluators**: task-level evaluators live outside specific methods. For
   ground-truth tasks, they produce sanitized method feedback and leakage guards
@@ -81,12 +80,13 @@ Main components:
 | `parametric_memory_register` | `parametric_memory` | implemented | Registers external adapter artifacts for later trainer/inference use. |
 | `parametric_memory_lora_sft` | `parametric_memory` | implemented | Exports successful trajectories to SFT JSONL, invokes an external LoRA trainer, and registers the adapter. |
 
-## OpenEvo Runner
+## OpenEvo Backend Runner
 
-`openevo run` is the Dev Kit experiment wrapper for OpenEvo Core tasks. It
-uses technical defaults for service URLs and evolution methods. A task with a
-workspace must also name the runtime image because Core cannot upload a
-workspace into an implicit/default runtime:
+`openevo-backend run` is the server-side experiment runner used by OpenEvo
+Core and Desktop-managed remote sessions. It uses technical defaults for
+service URLs and evolution methods. A task with a workspace must also name the
+runtime image because Core cannot upload a workspace into an implicit/default
+runtime:
 
 ```yaml
 version: 1
@@ -260,9 +260,9 @@ rejects it as `missing_target_artifact`.
 Useful commands:
 
 ```bash
-openevo run examples/openevo/experiment.yaml --dry-run --json
-openevo run examples/openevo/experiment.yaml --rounds 3 --output-dir runs/biology
-openevo run examples/openevo/experiment.yaml --task-id task-a --task-id task-b
+openevo-backend run examples/openevo/experiment.yaml --dry-run --json
+openevo-backend run examples/openevo/experiment.yaml --rounds 3 --output-dir runs/biology
+openevo-backend run examples/openevo/experiment.yaml --task-id task-a --task-id task-b
 ```
 
 Without `--output-dir`, live runs write summaries and worker artifacts under a
@@ -286,39 +286,24 @@ remote server inside Desktop, and avoid Python packaging details in the common
 path.
 
 The installable Python distribution is still named `openevo`. It bundles the
-OpenEvo Desktop web shell, the `openevo` CLI, OpenEvo Core facades, the exact
-remote-install wheel used by Desktop bootstrap, and lower-level runtime modules
-that still provide rollout, gateway, trajectory, and evolution backend
-implementation details. The legacy `polar` and `polar-evolution` console
-scripts remain available for backend and migration workflows, but OpenEvo Core,
-Desktop, and Dev Kit are the public product surfaces.
-
-For Dev Kit, smoke tests, and local debugging, the browser-served Desktop
-launcher remains:
+OpenEvo Desktop web shell, OpenEvo Core Backend modules, the exact
+remote-install wheel used by Desktop bootstrap, and runtime modules for rollout,
+gateway, trajectory, and evolution backend implementation details. The only
+console script exposed by the Python package in this phase is the backend
+launcher:
 
 ```bash
-openevo desktop open
+openevo-backend --help
+openevo-backend serve --help
 ```
 
-This starts the local sidecar server, opens `/openevo` in the browser, and
-falls back to a free local port if the default port is already occupied. Use
-`--no-browser` for headless environments. This user-facing launcher defaults
-sidecar lifecycle actions to SSH transport so the Desktop buttons operate the
-configured remote server. Use `--transport dry-run` for local demos that should
-not open SSH connections.
+`openevo-backend serve` is a reserved command stub until the backend API phase
+introduces the remote supervisor and HTTP contract.
 
-For an exact-port server entrypoint:
-
-```bash
-openevo desktop serve --host 127.0.0.1 --port 3766
-```
-
-`openevo desktop serve` and `openevo sidecar serve` keep `dry-run` as their
-default transport for tests, integrations, and power users; pass `--transport
-ssh` when those entrypoints should mutate a remote server.
-
-Release wheels are built from the OpenEvo package metadata and include the
-packaged OpenEvo-only Desktop assets under `openevo/desktop/web/`.
+Release wheels are built from the OpenEvo Core package metadata and exclude
+Desktop facade code and Desktop static assets. OpenEvo-only Desktop assets are
+kept under the top-level `desktop/packaging/web/` path for Desktop release and
+smoke validation.
 The `OpenEvo release artifact` GitHub Actions workflow runs the audited release
 smoke path on `v*` tags and manual dispatch, then uploads both the exact
 `openevo-wheel` artifact and the `openevo-desktop-dmg` macOS artifact.
@@ -329,8 +314,9 @@ project `openevo`, repository `CompLifeLab-ZJU/OpenEvo`, workflow
 `.github/workflows/openevo-publish-pypi.yml`, and environment `pypi`.
 
 Before publishing a wheel or release artifact, run the release smoke flow on
-Node 22, refresh the packaged Desktop assets, and validate the installed wheel.
-The installed-wheel smoke serves `/openevo` from package data and exercises the
+Node 22, refresh the top-level Desktop assets, and validate the installed Core
+wheel. The installed-wheel smoke serves `/openevo` from `desktop/packaging/web`
+while loading `openevo` from the installed wheel, then exercises the
 config-backed Desktop lifecycle in dry-run mode, including Core capabilities,
 method metadata, project config save, workspace, bootstrap, services, service
 status, run launch, artifact summary parsing, and artifact content reading:
@@ -342,7 +328,7 @@ npm audit --audit-level=high
 npm test -- --run
 npm run build:openevo
 cd ..
-diff -qr web/dist src/openevo/desktop/web
+diff -qr web/dist desktop/packaging/web
 rm -rf .openevo-remote-wheel src/openevo/wheels
 python -m build --wheel --outdir .openevo-remote-wheel
 mkdir -p src/openevo/wheels
@@ -353,10 +339,10 @@ python scripts/ci/check_openevo_release.py --wheel dist/*.whl
 python -m venv .openevo-wheel-smoke
 .openevo-wheel-smoke/bin/python -m pip install --upgrade pip
 .openevo-wheel-smoke/bin/python -m pip install dist/*.whl
-.openevo-wheel-smoke/bin/openevo --help
-.openevo-wheel-smoke/bin/openevo desktop --help
-.openevo-wheel-smoke/bin/openevo desktop open --help
-.openevo-wheel-smoke/bin/python scripts/ci/smoke_openevo_desktop_wheel.py
+.openevo-wheel-smoke/bin/openevo-backend --help
+.openevo-wheel-smoke/bin/openevo-backend serve --help
+.openevo-wheel-smoke/bin/openevo-backend run --help
+PYTHONPATH=. .openevo-wheel-smoke/bin/python scripts/ci/smoke_openevo_desktop_wheel.py
 ```
 
 For the focused OpenEvo Python regression check used by CI:
@@ -389,7 +375,7 @@ for the current snapshot table and interpretation notes.
   summaries.
 - Add a stable biology 5-train/23-test split runner with canonical article-id
   mapping in the task description rather than hidden pipeline state.
-- Add a Terminal Bench task-list generator on top of the new `openevo run`
+- Add a Terminal Bench task-list generator on top of the new `openevo-backend run`
   config, while keeping explicit task entries as the stable interchange format.
 - Extend runner/backend promotion policies with paired evaluator scores, leakage
   audit, regression limits, and candidate diversity.
@@ -404,12 +390,12 @@ for the current snapshot table and interpretation notes.
 
 ## Entry Points
 
-- Backend CLI and worker code: `src/polar_evolution/`
-- User-facing experiment runner: `src/openevo/`
+- Backend launcher: `src/openevo/backend/launcher.py`
+- Core Backend modules: `src/openevo/`
 - Minimal runner config: `examples/openevo/experiment.yaml`
-- Evolution method implementations: `src/polar_evolution/methods.py`
-- Golden-standard evaluator: `src/polar_evolution/golden_standard.py`
-- Terminal Bench bridge: `src/polar_evolution/terminal_bench_bridge.py`
-- Per-task Terminal Bench loop: `src/polar_evolution/terminal_bench_per_task.py`
+- Evolution method implementations: `src/openevo/evolution/methods.py`
+- Golden-standard evaluator: `src/openevo/evolution/golden_standard.py`
+- Terminal Bench bridge: `src/openevo/evolution/terminal_bench_bridge.py`
+- Per-task Terminal Bench loop: `src/openevo/evolution/terminal_bench_per_task.py`
 - Architecture docs: `docs/architecture/evolution-api-and-method-integration.md`
 - Historical lower-level framework README: [README.polar.md](README.polar.md)

@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from polar.gateway.engine import SGLangEngine, VLLMEngine
-from polar.gateway.server import _apply_session_adapter_merge_spec
+from openevo.gateway.engine import SGLangEngine, VLLMEngine
+from openevo.gateway.server import _apply_session_adapter_merge_spec
 
 
 def test_apply_session_adapter_merge_spec_uses_top_level_session_metadata() -> None:

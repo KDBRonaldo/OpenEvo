@@ -75,7 +75,7 @@ The current builder emits idempotent remote steps:
 | `ensure_state_root` | Creates the per-run state directory. |
 | `write_experiment_snapshot` | Writes `<state_root>/experiment.json`. |
 | `write_bootstrap_manifest` | Writes `<state_root>/bootstrap.json`. |
-| `ensure_openevo_cli` | Ensures the remote OpenEvo Core package and `openevo` console script exactly match the local packaged version. If Desktop/CLI uploaded a bundled `openevo-<version>-*.whl`, bootstrap installs that wheel with user-site `pip --force-reinstall` and then verifies package metadata plus `openevo --version` and `openevo --help`. If no bundled wheel is available, the step passes only when the remote package and CLI already report the exact expected version. |
+| `ensure_openevo_cli` | Ensures the remote OpenEvo Core package and `openevo-backend` console script exactly match the local packaged version. If Desktop uploaded a bundled `openevo-<version>-*.whl`, bootstrap installs that wheel with user-site `pip --force-reinstall` and then verifies package metadata plus `openevo-backend --version` and `openevo-backend --help`. If no bundled wheel is available, the step passes only when the remote package and backend launcher already report the exact expected version. |
 | `check_codex_cli` | Subscription mode only; verifies `codex --version`. |
 | `check_codex_subscription` | Subscription mode only; verifies `~/.codex/auth.json`. |
 | `docker_pull_runtime` | For custom images, pulls the image declared by the compiled experiment. For managed OpenEvo Science images, writes a managed runtime Dockerfile under `<state_root>/runtime-images/` and runs `docker pull <image> || docker build ... -t <image> ...`. |
@@ -133,7 +133,7 @@ This includes standard `HTTP_PROXY`, `HTTPS_PROXY`, lowercase variants,
 `extra_env`.
 
 The `ensure_openevo_cli` step is intentionally user-scoped. It never falls back
-to installing the latest package from PyPI. Desktop/CLI first looks for a
+to installing the latest package from PyPI. Desktop first looks for a
 packaged exact-version OpenEvo wheel under bundled package-relative wheel
 directories and uploads only that selected wheel. Bootstrap installs the
 uploaded wheel into the remote user's site packages, prepends `~/.local/bin`
@@ -156,7 +156,7 @@ registry mirror configuration outside OpenEvo.
 
 ## Lifecycle Models
 
-`src/openevo/remote/lifecycle.py` defines data-only contracts for Desktop:
+`src/openevo/deployment/lifecycle.py` defines data-only contracts for Desktop:
 
 - `RemoteDaemonLaunchSpec`;
 - `RemoteLifecycleStatus`;
@@ -248,24 +248,24 @@ This facade is still command-based. It does not add systemd units, persistent
 restart policies, cross-session process ownership tracking, or a new daemon
 supervisor.
 
-## CLI
+## Validation
 
 Dry-run bootstrap:
 
 ```bash
-openevo sidecar bootstrap science.yaml --remote-profile remote.yaml --json
+PYTHONPATH=src:. python -m pytest tests/openevo/remote/test_bootstrap.py -q
 ```
 
 Real SSH bootstrap:
 
 ```bash
-openevo sidecar bootstrap science.yaml --remote-profile remote.yaml --transport ssh --json
+PYTHONPATH=src:. python -m pytest tests/openevo/remote/test_ssh_transport.py -q
 ```
 
 Skip preflight:
 
 ```bash
-openevo sidecar bootstrap science.yaml --remote-profile remote.yaml --skip-preflight --json
+PYTHONPATH=src:. python -m pytest tests/openevo/remote/test_bootstrap.py::test_execute_bootstrap_plan_skips_preflight_when_requested -q
 ```
 
 Without `--json`, reports are printed as YAML.
@@ -281,7 +281,8 @@ This slice intentionally does not implement:
 - sudo, systemd, or daemon configuration;
 - Docker daemon proxy or registry mirror repair;
 - full Python dependency repair beyond the exact bundled user-site `openevo`
-  wheel and `huggingface_hub` installs attempted by bootstrap;
+  wheel, `openevo-backend` launcher, and `huggingface_hub` installs attempted
+  by bootstrap;
 - Docker Compose stack startup;
 - production vLLM tuning, restart policy, or dynamic adapter loading;
 - physical LoRA merge or request-level adapter lifecycle changes;
@@ -294,10 +295,10 @@ Focused validation:
 
 ```bash
 source .venv/bin/activate && PYTHONPATH=src pytest tests/openevo/remote/test_services.py tests/openevo/remote/test_lifecycle.py tests/openevo/sidecar/test_api.py -q
-source .venv/bin/activate && ruff check src/openevo/remote/services.py src/openevo/remote/lifecycle.py src/openevo/remote/__init__.py src/openevo/sidecar/api.py tests/openevo/remote/test_services.py tests/openevo/remote/test_lifecycle.py tests/openevo/sidecar/test_api.py
+source .venv/bin/activate && ruff check src/openevo/deployment/services.py src/openevo/deployment/lifecycle.py src/openevo/deployment/__init__.py src/openevo/sidecar/api.py tests/openevo/remote/test_services.py tests/openevo/remote/test_lifecycle.py tests/openevo/sidecar/test_api.py
 git diff --check
 PYTHONPATH=src /home/ziyi/ProRL-Agent-Server/.venv/bin/python -m pytest tests/openevo/test_cli.py tests/openevo/sidecar tests/openevo/remote tests/openevo/science tests/evolution/test_models.py -q
 PYTHONPATH=src /home/ziyi/ProRL-Agent-Server/.venv/bin/python -m pytest tests/openevo/science tests/evolution/test_models.py --collect-only -q >/tmp/openevo-remote-bootstrap-collect.txt
-/home/ziyi/ProRL-Agent-Server/.venv/bin/ruff check src/openevo/remote src/openevo/cli.py tests/openevo/remote tests/openevo/test_cli.py
+/home/ziyi/ProRL-Agent-Server/.venv/bin/ruff check src/openevo/deployment src/openevo/backend/launcher.py tests/openevo/remote tests/openevo/test_cli.py
 git diff --check openevo/stable...HEAD
 ```

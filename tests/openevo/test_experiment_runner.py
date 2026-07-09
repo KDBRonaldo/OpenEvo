@@ -10,11 +10,14 @@ from typing import Any
 
 import pytest
 
-from openevo.experiment import promotion as openevo_promotion
-from openevo.experiment import runner as openevo_runner
-from openevo.experiment.models import ExperimentConfig
-from openevo.experiment.runner import dry_run_experiment, run_experiment
-from polar_evolution.models import ReviewRequestCreateRequest
+from openevo import experiments
+from openevo.evolution.models import ReviewRequestCreateRequest
+
+ExperimentConfig = experiments.ExperimentConfig
+dry_run_experiment = experiments.dry_run_experiment
+openevo_promotion = experiments.promotion
+openevo_runner = experiments.runner
+run_experiment = experiments.run_experiment
 
 
 def _config(**overrides: object) -> ExperimentConfig:

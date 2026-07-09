@@ -12,8 +12,7 @@ The foundation plan layer does not run SSH, upload files, start Docker, start
 vLLM, store secrets, or render UI. It validates configuration and produces the
 plan consumed by the Desktop lifecycle endpoints. Later sidecar layers now use
 that plan to execute workspace preparation, remote bootstrap, command-based
-service startup, and run launch when `openevo sidecar serve --transport ssh` is
-selected.
+service startup, and run launch through the Desktop sidecar API.
 
 ## Boundary
 
@@ -134,12 +133,12 @@ mode to remote preflight checks:
 
 Both modes carry `min_home_available_kb` from the remote profile.
 
-## CLI
+## Validation
 
-The dry-run CLI is:
+The dry-run plan contract is covered by focused Python tests:
 
 ```bash
-openevo sidecar plan science.yaml --remote-profile remote.yaml --json
+PYTHONPATH=src:. python -m pytest tests/openevo/sidecar/test_planner.py -q
 ```
 
 The JSON output is the same payload OpenEvo Desktop can render before execution:
@@ -170,8 +169,8 @@ sidecar endpoints:
   under the bootstrap state root, then starts and health-checks the remote
   evolution backend, rollout, gateway, evolution worker, and managed vLLM when
   the execution mode requires local inference.
-- `POST /openevo-api/desktop/run` launches `openevo run` only after workspace,
-  bootstrap, and services are all ready.
+- `POST /openevo-api/desktop/run` launches `openevo-backend run` only after
+  workspace, bootstrap, and services are all ready.
 - `GET /openevo-api/desktop/run/artifacts` reads the latest terminal remote
   run's `summary.json` and returns a compact task/round/job artifact summary.
 - `GET /openevo-api/desktop/artifacts/{artifact_id}/content` reads one

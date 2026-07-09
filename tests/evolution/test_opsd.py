@@ -4,7 +4,7 @@ import math
 
 import pytest
 
-from polar_evolution.opsd import (
+from openevo.evolution.opsd import (
     build_opsd_prompt_pair,
     build_opsd_token_sequences,
     generalized_jsd_loss,

@@ -6,8 +6,8 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from openevo.science import ScienceProjectConfig
-from openevo.sidecar import (
+from openevo.projects.science import ScienceProjectConfig
+from desktop.sidecar import (
     RemoteProfileConfig,
     SidecarSciencePlan,
     build_sidecar_science_plan,

@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from openevo.remote import RemoteCommandResult
-from openevo.remote.executor import (
+from openevo.deployment import RemoteCommandResult
+from openevo.deployment.executor import (
     RemoteExecutorTransport,
     SidecarExecutionReport,
     WorkspaceActionStatus,
@@ -11,8 +11,8 @@ from openevo.remote.executor import (
     execute_sidecar_plan,
     execute_workspace_plan,
 )
-from openevo.science import ScienceProjectConfig
-from openevo.sidecar import RemoteProfileConfig, build_sidecar_science_plan
+from openevo.projects.science import ScienceProjectConfig
+from openevo.deployment import RemoteProfileConfig, build_sidecar_science_plan
 
 
 class FakeTransport:

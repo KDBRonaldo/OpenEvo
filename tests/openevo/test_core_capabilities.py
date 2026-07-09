@@ -1,9 +1,9 @@
-from openevo.core.capabilities import (
+from openevo.capabilities import (
     MethodVisibility,
     build_core_capabilities,
     method_metadata_by_id,
 )
-from polar_evolution.methods import METHOD_METADATA, METHOD_REGISTRY
+from openevo.evolution.methods import METHOD_METADATA, METHOD_REGISTRY
 
 
 def test_core_capabilities_expose_desktop_visible_non_parametric_methods() -> None:

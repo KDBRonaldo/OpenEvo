@@ -3,8 +3,8 @@ from __future__ import annotations
 import asyncio
 import json
 
-from polar.trajectory.builder.agent_transcript import AgentTranscriptBuilder
-from polar.trajectory.models import CompletionSession
+from openevo.trajectory.builder.agent_transcript import AgentTranscriptBuilder
+from openevo.trajectory.models import CompletionSession
 
 
 def test_agent_transcript_builder_builds_trajectory_from_step_stdout_log(tmp_path) -> None:

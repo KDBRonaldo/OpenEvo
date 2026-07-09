@@ -6,15 +6,15 @@ from urllib.parse import unquote
 
 import pytest
 
-from polar_evolution.cli import (
+from openevo.evolution.cli import (
     _terminal_bench_forbidden_literals_from_dataset_artifacts,
     _terminal_bench_forbidden_literals_from_events,
     _terminal_bench_task_tags,
     main,
 )
-from polar_evolution.models import DatasetCreateRequest, EventIngestRequest, WorkerClaimRequest
-from polar_evolution.store import EvolutionStore
-from polar_evolution.terminal_bench_bridge import (
+from openevo.evolution.models import DatasetCreateRequest, EventIngestRequest, WorkerClaimRequest
+from openevo.evolution.store import EvolutionStore
+from openevo.evolution.terminal_bench_bridge import (
     TerminalBenchBridgeError,
     build_terminal_bench_events,
 )

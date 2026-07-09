@@ -10,11 +10,11 @@ from __future__ import annotations
 
 import asyncio
 
-from polar.gateway.engine import VLLMEngine
-from polar.trajectory.builder.per_request import PerRequestBuilder
-from polar.trajectory.builder.prefix_merging import PrefixMergingBuilder
-from polar.trajectory.builder.record_utils import build_trace_from_completion
-from polar.trajectory.models import CompletionRecord, CompletionSession
+from openevo.gateway.engine import VLLMEngine
+from openevo.trajectory.builder.per_request import PerRequestBuilder
+from openevo.trajectory.builder.prefix_merging import PrefixMergingBuilder
+from openevo.trajectory.builder.record_utils import build_trace_from_completion
+from openevo.trajectory.models import CompletionRecord, CompletionSession
 
 _EOT = 99  # synthetic end-of-turn token id
 

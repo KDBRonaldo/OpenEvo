@@ -9,17 +9,17 @@ from typing import Any
 import httpx
 import pytest
 
-from polar_evolution.cli import _parse_capabilities
-from polar_evolution.methods import METHOD_REGISTRY, _audit_agent_system_markdown, run_method
-from polar_evolution.models import (
+from openevo.evolution.cli import _parse_capabilities
+from openevo.evolution.methods import METHOD_REGISTRY, _audit_agent_system_markdown, run_method
+from openevo.evolution.models import (
     ArtifactType,
     ContextResolveRequest,
     DatasetCreateRequest,
     EventIngestRequest,
     WorkerClaimedJob,
 )
-from polar_evolution.store import EvolutionStore
-from polar_evolution.worker import run_once
+from openevo.evolution.store import EvolutionStore
+from openevo.evolution.worker import run_once
 
 
 def _dataset_artifact(tmp_path: Path) -> dict[str, Any]:

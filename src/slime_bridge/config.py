@@ -9,7 +9,7 @@ import re
 from types import SimpleNamespace
 from typing import Any
 
-from polar.config import TopologyConfig
+from openevo.config import TopologyConfig
 
 _PLACEHOLDER_RE = re.compile(r"{([^{}]+)}")
 

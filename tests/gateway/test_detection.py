@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from polar.gateway.detection import APIType, detect, extract_model
+from openevo.gateway.detection import APIType, detect, extract_model
 
 
 def test_detect_prefers_path_over_body_shape() -> None:

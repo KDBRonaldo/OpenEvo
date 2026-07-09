@@ -19,7 +19,7 @@ def test_accepts_issue_reference_and_docs_change() -> None:
 
     warnings = checker.find_process_warnings(
         "Fixes #123\n\nDocs updated in docs/dev/process.md",
-        ["src/polar_evolution/methods.py", "docs/dev/process.md"],
+        ["src/openevo/evolution/methods.py", "docs/dev/process.md"],
     )
 
     assert warnings == []
@@ -58,7 +58,7 @@ def test_template_placeholders_do_not_count_as_process_overrides() -> None:
                 "- [ ] Docs are updated, or `No docs needed:` is explained.",
             ]
         ),
-        ["src/polar_evolution/methods.py"],
+        ["src/openevo/evolution/methods.py"],
     )
 
     assert len(warnings) == 2
@@ -78,7 +78,7 @@ def test_warns_for_non_docs_change_without_docs_or_explanation() -> None:
 
     warnings = checker.find_process_warnings(
         "Part of #123",
-        ["src/polar_evolution/methods.py"],
+        ["src/openevo/evolution/methods.py"],
     )
 
     assert len(warnings) == 1

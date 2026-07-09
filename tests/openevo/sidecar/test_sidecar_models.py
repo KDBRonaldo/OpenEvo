@@ -6,7 +6,7 @@ import pytest
 import yaml
 from pydantic import ValidationError
 
-from openevo.sidecar import (
+from desktop.sidecar import (
     ProxySettings,
     RemoteProfileConfig,
     SSHAuthConfig,

@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from polar.gateway.completion_writer import CompletionWriter, _truncate_value
+from openevo.gateway.completion_writer import CompletionWriter, _truncate_value
 
 
 def test_truncate_value_string() -> None:

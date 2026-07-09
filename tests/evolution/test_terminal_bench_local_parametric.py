@@ -7,10 +7,10 @@ from types import SimpleNamespace
 
 import pytest
 
-import polar_evolution.cli as cli_module
-import polar_evolution.terminal_bench_local_parametric as local_parametric
-from polar_evolution.cli import main
-from polar_evolution.terminal_bench_local_parametric import (
+import openevo.evolution.cli as cli_module
+import openevo.evolution.terminal_bench_local_parametric as local_parametric
+from openevo.evolution.cli import main
+from openevo.evolution.terminal_bench_local_parametric import (
     DEFAULT_LOCAL_PARAMETRIC_DISABLED_ARTIFACTS,
     build_evolab_harbor_env,
     build_local_harbor_command,

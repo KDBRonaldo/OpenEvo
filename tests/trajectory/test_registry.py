@@ -4,9 +4,9 @@ import asyncio
 
 import pytest
 
-from polar.trajectory.builder.base import BaseTrajectoryBuilder
-from polar.trajectory.models import CompletionSession, StrategySpec, Trajectory
-from polar.trajectory.registry import StrategyRegistry, default_builder_registry
+from openevo.trajectory.builder.base import BaseTrajectoryBuilder
+from openevo.trajectory.models import CompletionSession, StrategySpec, Trajectory
+from openevo.trajectory.registry import StrategyRegistry, default_builder_registry
 
 
 class DummyBuilder(BaseTrajectoryBuilder):

@@ -32,7 +32,7 @@ jobs:
 
       - name: Check packaged Desktop assets are current
         run: |
-          diff -qr web/dist src/openevo/desktop/web
+          diff -qr web/dist desktop/packaging/web
 
       - uses: actions/setup-python@v5
         with:
@@ -60,15 +60,15 @@ jobs:
         run: |
           python scripts/ci/check_openevo_release.py --wheel dist/*.whl
 
-      - name: Install wheel and smoke OpenEvo CLI
+      - name: Install wheel and smoke OpenEvo Backend
         run: |
           python -m venv .openevo-wheel-smoke
           .openevo-wheel-smoke/bin/python -m pip install --upgrade pip
           .openevo-wheel-smoke/bin/python -m pip install dist/*.whl
-          .openevo-wheel-smoke/bin/openevo --help
-          .openevo-wheel-smoke/bin/openevo desktop --help
-          .openevo-wheel-smoke/bin/openevo desktop open --help
-          .openevo-wheel-smoke/bin/python scripts/ci/smoke_openevo_desktop_wheel.py
+          .openevo-wheel-smoke/bin/openevo-backend --help
+          .openevo-wheel-smoke/bin/openevo-backend serve --help
+          .openevo-wheel-smoke/bin/openevo-backend run --help
+          PYTHONPATH=. .openevo-wheel-smoke/bin/python scripts/ci/smoke_openevo_desktop_wheel.py
 
       - name: Upload OpenEvo wheel artifact
         uses: actions/upload-artifact@v4

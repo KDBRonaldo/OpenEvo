@@ -5,9 +5,9 @@ from pathlib import Path
 
 import pytest
 
-from openevo.remote import RemoteCommandResult, RemoteExecutorTransport
-from openevo.remote.ssh import SshRemoteExecutorTransport
-from openevo.sidecar import RemoteProfileConfig
+from openevo.deployment import RemoteCommandResult, RemoteExecutorTransport
+from openevo.deployment.ssh import SshRemoteExecutorTransport
+from openevo.deployment import RemoteProfileConfig
 
 
 class RecordingRunner:

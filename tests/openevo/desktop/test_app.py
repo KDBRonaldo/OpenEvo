@@ -6,13 +6,13 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-from openevo.desktop import (
+from desktop.server import (
     DesktopStaticAssetsMissingError,
     create_desktop_app,
     packaged_desktop_static_root,
     resolve_desktop_static_root,
 )
-from openevo.sidecar import create_sidecar_app
+from desktop.sidecar import create_sidecar_app
 
 
 class _PackagedAssetParser(HTMLParser):

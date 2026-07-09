@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import asyncio
 
-from polar.trajectory.builder.per_request import PerRequestBuilder
-from polar.trajectory.models import CompletionRecord, CompletionSession
+from openevo.trajectory.builder.per_request import PerRequestBuilder
+from openevo.trajectory.models import CompletionRecord, CompletionSession
 
 
 def test_per_request_builder_returns_error_for_empty_session() -> None:

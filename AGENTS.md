@@ -14,9 +14,9 @@ OpenEvo 是面向真实 agent harness 的 evolution 系统，当前对外产品�
 - **OpenEvo Dev Kit**：面向 OpenEvo 开发者的 CLI、源码、测试、benchmark 和 method
   development 工具。
 
-仓库中仍保留 `src/polar/`、`src/polar_evolution/`、`POLAR_*` 环境变量和若干
-`polar` console script 名称。这些是历史/实现层命名，不是新的产品边界。对外设计和新文档
-应以 OpenEvo Core、OpenEvo Desktop 和 OpenEvo Dev Kit 为主。
+仓库中仍保留 `POLAR_*` 环境变量、`/polar/session` runtime path 和部分 runtime
+identity 字符串。这些是后续 runtime/data identity 迁移前的实现层命名，不是新的产品边界。
+对外设计和新文档应以 OpenEvo Core、OpenEvo Desktop 和 OpenEvo Dev Kit 为主。
 
 OpenEvo Core 的核心目标是把 agent 运行过程稳定地转成可训练、可评估、可演化的数据，并
 把演化后的 memory、skill、agent system 和 parametric memory 注入后续 session。
@@ -37,19 +37,23 @@ harness 只要能提供稳定 transcript，都应能接入 pure-text evolution�
 
 ## 目录结构
 
-- `src/openevo/`: OpenEvo Core facade、Desktop/Science config、remote lifecycle、sidecar
-  API 和 Dev Kit CLI。
+- `src/openevo/`: OpenEvo Core Backend package、Desktop/Science config、deployment
+  lifecycle、sidecar API 和 Dev Kit helpers。
 - `web/`: OpenEvo Desktop 的 React/Vite/Tauri 前端。
-- `src/polar/`: 低层 gateway、rollout、runtime 和 harness implementation package。
-- `src/polar/agent/`: agent harness contract 和 Codex、Claude Code、OpenHands 等 presets。
-- `src/polar/gateway/`: gateway server、LLM proxy、runtime lifecycle、completion capture、
+- `src/openevo/harness/`: agent harness contract 和 Codex、Claude Code、OpenHands 等 presets。
+- `src/openevo/gateway/`: gateway server、LLM proxy、runtime lifecycle、completion capture、
   evolution context 注入。
-- `src/polar/trajectory/`: completion/session/transcript 到 `Trajectory` 的 builder 和
+- `src/openevo/trajectory/`: completion/session/transcript 到 `Trajectory` 的 builder 和
   evaluator。
-- `src/polar/runtime/`: Docker/Apptainer runtime 抽象。
-- `src/polar/rollout/`: rollout server、pipeline、balancer、result aggregation。
-- `src/polar_evolution/`: Evolution Backend，包含 events、datasets、jobs、workers、
+- `src/openevo/runtime/`: Docker/Apptainer runtime 抽象。
+- `src/openevo/rollout/`: rollout server、pipeline、balancer、result aggregation。
+- `src/openevo/config/`: topology/config model。
+- `src/openevo/platform/`: observability platform APIs and helpers。
+- `src/openevo/evolution/`: Evolution Backend，包含 events、datasets、jobs、workers、
   artifacts 和 context resolver。
+- `src/openevo/experiments/`: experiment compiler/runner/promotion helpers。
+- `src/openevo/projects/science/`: ordinary-user science project config/compiler。
+- `src/openevo/deployment/`: remote deployment lifecycle、bootstrap、preflight、SSH transport。
 - `docs/architecture/`: OpenEvo Core/Desktop/Dev Kit 架构、evolution API、runtime
   context、worker 接口文档。
 - `tests/`: regression tests，通常按 gateway、trajectory、evolution、rollout 等行为组织。
@@ -239,7 +243,7 @@ Runtime 消费：
    `parametric_memory` 或新的 typed artifact。
 3. 实现 method：接收 `WorkerClaimedJob` 和 `artifact_root`，返回
    `list[ArtifactRegisterRequest]`。
-4. 注册 method：内置 baseline 放入 `src/polar_evolution/methods.py` 的
+4. 注册 method：内置 baseline 放入 `src/openevo/evolution/methods.py` 的
    `METHOD_REGISTRY`；专用 research worker 可以维护自己的 registry。
 5. 设置 `compatibility`：限制 task tags、agent harness、base model，避免 artifact 污染
    不兼容 session。
@@ -331,8 +335,8 @@ Issue 应包含：
    如果没有，则要求 PR body 包含明确的 `No docs needed:` 说明。
 4. CI issue link check：脚本检查 PR body 是否包含 issue reference。对纯本地实验、机械格式化或
    明确标注的 no-issue 小改可以允许维护者 override。
-5. CODEOWNERS/review rule：让 `docs/architecture/`、`src/polar_evolution/`、gateway/trajectory
-   contract 相关改动至少经过一名熟悉接口边界的人 review。
+5. CODEOWNERS/review rule：让 `docs/architecture/`、`src/openevo/evolution/`、
+   gateway/trajectory contract 相关改动至少经过一名熟悉接口边界的人 review。
 
 这些机制应该先以 PR checklist 和 warning 形式落地，再升级为 blocking CI，避免早期规则过硬
 影响研究迭代速度。

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from openevo.remote.lifecycle import (
+from openevo.deployment.lifecycle import (
     RemoteDaemonLaunchSpec,
     RemoteLifecycleEvent,
     RemoteLifecycleStatus,
@@ -20,7 +20,7 @@ def test_daemon_launch_spec_round_trips() -> None:
     spec = RemoteDaemonLaunchSpec(
         service_id="openevo-backend",
         kind="openevo_backend",
-        command="openevo run remote.yaml",
+        command="openevo-backend run remote.yaml",
         cwd="/home/alice/.openevo/runs/protein/folding",
         env={"OPENEVO_MODE": "science"},
         ports={"api": 18080},

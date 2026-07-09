@@ -18,8 +18,8 @@ from typing import Any, TYPE_CHECKING
 from slime_bridge._messages import messages_to_text
 
 if TYPE_CHECKING:
-    from polar.rollout.models import SessionResult
-    from polar.trajectory.models import Trace
+    from openevo.rollout.models import SessionResult
+    from openevo.trajectory.models import Trace
 
 logger = logging.getLogger(__name__)
 

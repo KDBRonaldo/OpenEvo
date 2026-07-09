@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from polar.config import TopologyConfig
+from openevo.config import TopologyConfig
 
 
 def _write_yaml(path: Path, data: dict) -> Path:

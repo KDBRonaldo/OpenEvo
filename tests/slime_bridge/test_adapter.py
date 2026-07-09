@@ -4,8 +4,8 @@ from enum import Enum
 
 import pytest
 
-from polar.rollout.models import SessionResult, SessionStatus, SessionTiming
-from polar.trajectory.models import Trace, Trajectory
+from openevo.rollout.models import SessionResult, SessionStatus, SessionTiming
+from openevo.trajectory.models import Trace, Trajectory
 from slime_bridge import adapter
 from slime_bridge.adapter import RolloutLogprobError, session_result_to_samples
 

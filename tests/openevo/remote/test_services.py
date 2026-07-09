@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from openevo.remote import build_remote_bootstrap_plan
-from openevo.remote.preflight import RemoteCommandResult
-from openevo.remote.services import (
+from openevo.deployment import build_remote_bootstrap_plan
+from openevo.deployment.preflight import RemoteCommandResult
+from openevo.deployment.services import (
     build_remote_services_plan,
     execute_remote_services_plan,
     inspect_remote_services,
@@ -11,9 +11,9 @@ from openevo.remote.services import (
     restart_remote_service,
     stop_remote_service,
 )
-from openevo.science import ScienceProjectConfig
-from openevo.sidecar.models import RemoteProfileConfig
-from openevo.sidecar.planner import build_sidecar_science_plan
+from openevo.projects.science import ScienceProjectConfig
+from openevo.deployment.profile import RemoteProfileConfig
+from openevo.deployment.planner import build_sidecar_science_plan
 
 
 def test_service_plan_starts_subscription_runtime_services() -> None:
@@ -41,7 +41,7 @@ def test_service_plan_starts_subscription_runtime_services() -> None:
     assert gateway.manifest["port"] == 8100
     assert 'kill -0 "$(cat' not in gateway.command
     _assert_before(gateway.command, "if pid <= 0:", "os.kill(pid, 0)")
-    assert "polar serve_gateway" in gateway.command
+    assert "python3 -m openevo.gateway.server" in gateway.command
     assert plan.topology_path in gateway.command
     assert gateway.health_command is not None
     assert "http://127.0.0.1:8100/health" in gateway.health_command
@@ -53,9 +53,9 @@ def test_service_plan_starts_subscription_runtime_services() -> None:
     assert rollout.manifest["log_path"].endswith("/services/logs/rollout.log")
     assert 'kill -0 "$(cat' not in rollout.command
     _assert_before(rollout.command, "if pid <= 0:", "os.kill(pid, 0)")
-    assert f"polar serve_rollout --config {plan.topology_path}" in rollout.command
+    assert f"python3 -m openevo.rollout.server --config {plan.topology_path}" in rollout.command
     assert (
-        f"polar serve_gateway --config {plan.topology_path} "
+        f"python3 -m openevo.gateway.server --config {plan.topology_path} "
         "--node-id desktop-node"
     ) in gateway.command
 
@@ -108,7 +108,7 @@ def test_execute_remote_services_plan_runs_start_and_health_checks() -> None:
     assert report.ready is True
     assert [step.status for step in report.steps] == ["pass"] * len(plan.steps)
     assert transport.commands[0][0] == plan.steps[0].command
-    assert any("polar serve_rollout" in command for command, _env in transport.commands)
+    assert any("python3 -m openevo.rollout.server" in command for command, _env in transport.commands)
     assert any(
         "http://127.0.0.1:8080/health" in command
         for command, _env in transport.commands
@@ -117,7 +117,7 @@ def test_execute_remote_services_plan_runs_start_and_health_checks() -> None:
 
 def test_execute_remote_services_plan_stops_on_required_failure() -> None:
     plan = build_remote_services_plan(_bootstrap_plan())
-    transport = _RecordingTransport(fail_contains="polar serve_rollout")
+    transport = _RecordingTransport(fail_contains="python3 -m openevo.rollout.server")
 
     report = execute_remote_services_plan(plan, transport)
 
@@ -139,7 +139,7 @@ def test_execute_remote_services_plan_redacts_proxy_secrets() -> None:
         _bootstrap_plan(proxy={"https_proxy": secret_proxy})
     )
     transport = _RecordingTransport(
-        fail_contains="polar serve_rollout",
+        fail_contains="python3 -m openevo.rollout.server",
         failure_stderr=(
             "Proxy http://proxy-user:proxy-secret@127.0.0.1:7890 "
             "failed for https://download-user:download-secret@example.test/pkg"
@@ -327,9 +327,9 @@ def test_restart_remote_service_stops_starts_and_checks_selected_service_only() 
     assert result.state == "ready"
     assert result.message == "gateway restarted."
     assert transport.stopped_services == ["gateway"]
-    assert any("polar serve_gateway" in command for command, _env in transport.commands)
+    assert any("python3 -m openevo.gateway.server" in command for command, _env in transport.commands)
     assert not any(
-        "polar serve_rollout" in command for command, _env in transport.commands
+        "python3 -m openevo.rollout.server" in command for command, _env in transport.commands
     )
     assert any(
         "http://127.0.0.1:8100/health" in command
@@ -349,7 +349,7 @@ def test_restart_remote_service_does_not_start_when_stop_fails() -> None:
     assert result.state == "failed"
     assert result.message == "gateway did not stop after SIGTERM."
     assert not any(
-        "polar serve_gateway" in command for command, _env in transport.commands
+        "python3 -m openevo.gateway.server" in command for command, _env in transport.commands
     )
 
 
@@ -362,7 +362,7 @@ def test_restart_remote_service_does_not_start_when_pid_file_is_invalid() -> Non
     assert result.state == "failed"
     assert result.message == "invalid pid file for gateway: -1"
     assert not any(
-        "polar serve_gateway" in command for command, _env in transport.commands
+        "python3 -m openevo.gateway.server" in command for command, _env in transport.commands
     )
 
 

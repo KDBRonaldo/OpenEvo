@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate that built wheels carry the OpenEvo release identity and assets."""
+"""Validate that built wheels carry the OpenEvo release identity and boundaries."""
 
 from __future__ import annotations
 
@@ -7,32 +7,26 @@ import argparse
 import configparser
 import json
 from io import BytesIO
-from html.parser import HTMLParser
-import posixpath
 import sys
 from email.parser import Parser
 from pathlib import Path
-from urllib.parse import urlsplit
 from zipfile import BadZipFile, ZipFile
 import tomllib
 
 EXPECTED_PROJECT_NAME = "openevo"
 EXPECTED_SUMMARY = "OpenEvo Desktop and agent evolution orchestration."
 EXPECTED_CONSOLE_SCRIPTS = {
-    "openevo": "openevo.cli:main",
-    "polar": "polar.cli:main",
-    "polar-evolution": "polar_evolution.cli:main",
+    "openevo-backend": "openevo.backend.launcher:main",
 }
-REQUIRED_DESKTOP_INDEX = "openevo/desktop/web/index.html"
-REQUIRED_DESKTOP_ASSET_PREFIX = "openevo/desktop/web/assets/"
 REQUIRED_REMOTE_WHEEL_PREFIX = "openevo/wheels/"
-FORBIDDEN_SHARED_DASHBOARD_PREFIX = "polar/platform/web/dist/"
-FORBIDDEN_DESKTOP_CONTENT_MARKERS = (
-    "Polar Dashboard",
-    'href="/tasks"',
-    'href=\\"/tasks\\"',
-    ">Dashboard<",
+FORBIDDEN_CORE_PACKAGE_PREFIXES = (
+    "openevo/desktop/",
+    "openevo/sidecar/",
 )
+FORBIDDEN_CORE_PACKAGE_FILES = (
+    "openevo/cli.py",
+)
+FORBIDDEN_SHARED_DASHBOARD_PREFIX = "openevo/platform/web/dist/"
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SRC_ROOT = REPO_ROOT / "src"
 
@@ -71,7 +65,7 @@ def validate_wheel(wheel_path: Path, *, expected_version: str) -> list[str]:
             names = set(wheel.namelist())
             errors.extend(_validate_metadata(wheel, names, expected_version))
             errors.extend(_validate_entry_points(wheel, names))
-            errors.extend(_validate_desktop_assets(wheel, names))
+            errors.extend(_validate_core_package_boundaries(names))
             errors.extend(_validate_packaged_remote_install_wheel(wheel, names, expected_version))
     except BadZipFile:
         errors.append(f"Wheel is not a readable zip archive: {wheel_path}")
@@ -130,34 +124,29 @@ def _validate_entry_points(wheel: ZipFile, names: set[str]) -> list[str]:
     return errors
 
 
-def _validate_desktop_assets(wheel: ZipFile, names: set[str]) -> list[str]:
+def _validate_core_package_boundaries(names: set[str]) -> list[str]:
     errors: list[str] = []
-    if REQUIRED_DESKTOP_INDEX not in names:
-        errors.append(f"Wheel is missing packaged Desktop index: {REQUIRED_DESKTOP_INDEX}.")
-    else:
-        errors.extend(
-            _validate_desktop_index_asset_references(
-                _read_text(wheel, REQUIRED_DESKTOP_INDEX),
-                names,
+    for prefix in FORBIDDEN_CORE_PACKAGE_PREFIXES:
+        packaged = sorted(name for name in names if name.startswith(prefix))
+        if packaged:
+            errors.append(
+                "OpenEvo Core wheel must not package Desktop control-plane files under "
+                f"{prefix}; found {packaged[0]}."
             )
-        )
-    if not any(
-        name.startswith(REQUIRED_DESKTOP_ASSET_PREFIX) and not name.endswith("/")
-        for name in names
-    ):
-        errors.append(
-            "Wheel must include at least one packaged Desktop asset under "
-            f"{REQUIRED_DESKTOP_ASSET_PREFIX}."
-        )
-    forbidden = sorted(
+    for filename in FORBIDDEN_CORE_PACKAGE_FILES:
+        if filename in names:
+            errors.append(
+                "OpenEvo Core wheel must not expose the removed product CLI file "
+                f"{filename}."
+            )
+    forbidden_dashboard = sorted(
         name for name in names if name.startswith(FORBIDDEN_SHARED_DASHBOARD_PREFIX)
     )
-    if forbidden:
+    if forbidden_dashboard:
         errors.append(
-            "Wheel must not package shared dashboard assets under "
-            f"{FORBIDDEN_SHARED_DASHBOARD_PREFIX}; found {forbidden[0]}."
+            "OpenEvo Core wheel must not package shared dashboard assets under "
+            f"{FORBIDDEN_SHARED_DASHBOARD_PREFIX}; found {forbidden_dashboard[0]}."
         )
-    errors.extend(_find_shared_dashboard_content(wheel, names))
     return errors
 
 
@@ -214,75 +203,6 @@ def _validate_nested_remote_install_wheel(
             "Nested remote-install wheel METADATA Version should be "
             f"`{expected_version}`, got `{metadata.get('Version') or '<missing>'}`."
         )
-    return errors
-
-
-class _DesktopIndexAssetParser(HTMLParser):
-    def __init__(self) -> None:
-        super().__init__()
-        self.assets: list[str] = []
-
-    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        for name, value in attrs:
-            if name not in {"href", "src"} or value is None:
-                continue
-            asset = _desktop_asset_reference(value)
-            if asset is not None:
-                self.assets.append(asset)
-
-
-def _validate_desktop_index_asset_references(
-    index_html: str,
-    names: set[str],
-) -> list[str]:
-    parser = _DesktopIndexAssetParser()
-    try:
-        parser.feed(index_html)
-    except ValueError as exc:
-        return [str(exc)]
-
-    errors: list[str] = []
-    for asset in sorted(set(parser.assets)):
-        wheel_path = f"openevo/desktop/web/{asset}"
-        if wheel_path not in names:
-            errors.append(
-                "Packaged Desktop index references missing Desktop asset "
-                f"`{asset}`."
-            )
-    return errors
-
-
-def _desktop_asset_reference(value: str) -> str | None:
-    parsed = urlsplit(value)
-    if parsed.scheme or parsed.netloc:
-        return None
-    path = parsed.path
-    if path.startswith("/assets/"):
-        path = path[1:]
-    elif not path.startswith("assets/"):
-        return None
-    normalized = posixpath.normpath(path)
-    if normalized == "assets" or not normalized.startswith("assets/"):
-        raise ValueError(f"Packaged Desktop index has invalid asset reference `{value}`.")
-    return normalized
-
-
-def _find_shared_dashboard_content(wheel: ZipFile, names: set[str]) -> list[str]:
-    errors: list[str] = []
-    for name in sorted(names):
-        if not name.startswith("openevo/desktop/web/") or name.endswith("/"):
-            continue
-        try:
-            content = _read_text(wheel, name)
-        except UnicodeDecodeError:
-            continue
-        for marker in FORBIDDEN_DESKTOP_CONTENT_MARKERS:
-            if marker in content:
-                errors.append(
-                    "Packaged OpenEvo Desktop asset contains shared dashboard marker "
-                    f"`{marker}` in {name}."
-                )
-                break
     return errors
 
 

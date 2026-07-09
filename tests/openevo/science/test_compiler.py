@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import pytest
 
-from openevo.experiment.compiler import compile_experiment
-from openevo.science import PreparedWorkspace, ScienceProjectConfig, compile_science_project
-from openevo.science.compiler import MANAGED_RUNTIME_IMAGES
+from openevo import experiments
+from openevo.projects.science import PreparedWorkspace, ScienceProjectConfig, compile_science_project
+from openevo.projects.science.compiler import MANAGED_RUNTIME_IMAGES
+
+compile_experiment = experiments.compile_experiment
 
 
 def _project(**overrides: object) -> ScienceProjectConfig:

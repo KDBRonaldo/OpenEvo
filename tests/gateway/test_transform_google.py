@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from polar.gateway.transform.google import GoogleTransformer
+from openevo.gateway.transform.google import GoogleTransformer
 
 IMAGE_B64 = "abc123"
 IMAGE_URL = f"data:image/png;base64,{IMAGE_B64}"

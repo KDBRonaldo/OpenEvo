@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from polar_evolution.golden_standard import (
+from openevo.evolution.golden_standard import (
     assert_no_golden_leakage,
     evaluate_records_against_golden,
     find_golden_leaks,

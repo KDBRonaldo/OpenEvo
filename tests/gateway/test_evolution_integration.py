@@ -6,28 +6,28 @@ from pathlib import Path
 
 import pytest
 
-from polar.agent.base import BaseHarness
-from polar.agent.models import AgentRunResult, AgentSpec
-from polar.agent.presets.codex import CodexHarness
-from polar.config import EvolutionConfig
-from polar.gateway.dispatcher import ManagedSession
-from polar.gateway.node import (
+from openevo.harness.base import BaseHarness
+from openevo.harness.models import AgentRunResult, AgentSpec
+from openevo.harness.presets.codex import CodexHarness
+from openevo.config import EvolutionConfig
+from openevo.gateway.dispatcher import ManagedSession
+from openevo.gateway.node import (
     GatewayNodeManager,
     build_evolution_session_event,
     write_evolution_context_files,
 )
-from polar.gateway.session import SessionRegistry
-from polar.rollout.models import (
+from openevo.gateway.session import SessionRegistry
+from openevo.rollout.models import (
     SessionDispatchRequest,
     SessionResult,
     SessionStatus,
     SessionTiming,
 )
-from polar.rollout.timer import StageTimer
-from polar.runtime.base import BaseRuntime
-from polar.runtime.models import ExecInput, ExecResult, RuntimeSpec
-from polar.trajectory.models import CompletionRecord, CompletionSession, Trajectory
-from polar.trajectory.registry import default_builder_registry
+from openevo.rollout.timer import StageTimer
+from openevo.runtime.base import BaseRuntime
+from openevo.runtime.models import ExecInput, ExecResult, RuntimeSpec
+from openevo.trajectory.models import CompletionRecord, CompletionSession, Trajectory
+from openevo.trajectory.registry import default_builder_registry
 
 
 class FakeHarness(BaseHarness):

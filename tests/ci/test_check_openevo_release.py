@@ -20,9 +20,7 @@ GOOD_METADATA = "\n".join(
 GOOD_ENTRY_POINTS = "\n".join(
     [
         "[console_scripts]",
-        "openevo = openevo.cli:main",
-        "polar = polar.cli:main",
-        "polar-evolution = polar_evolution.cli:main",
+        "openevo-backend = openevo.backend.launcher:main",
         "",
     ]
 )
@@ -185,8 +183,7 @@ def test_requires_expected_console_scripts(tmp_path: Path) -> None:
         entry_points="\n".join(
             [
                 "[console_scripts]",
-                "polar = polar.cli:main",
-                "polar-evolution = polar_evolution.cli:main",
+                "openevo = openevo.cli:main",
                 "",
             ]
         ),
@@ -194,66 +191,39 @@ def test_requires_expected_console_scripts(tmp_path: Path) -> None:
 
     errors = checker.validate_wheel(wheel, expected_version="0.1.0")
 
-    assert any("openevo = openevo.cli:main" in error for error in errors)
-
-
-def test_requires_packaged_openevo_desktop_assets(tmp_path: Path) -> None:
-    checker = _load_module()
-    wheel = _write_wheel(
-        tmp_path / "openevo-0.1.0-py3-none-any.whl",
-        include_desktop_assets=False,
-    )
-
-    errors = checker.validate_wheel(wheel, expected_version="0.1.0")
-
-    assert any("openevo/desktop/web/index.html" in error for error in errors)
-    assert any("openevo/desktop/web/assets/" in error for error in errors)
-
-
-def test_rejects_desktop_index_referencing_missing_assets(tmp_path: Path) -> None:
-    checker = _load_module()
-    wheel = _write_wheel(
-        tmp_path / "openevo-0.1.0-py3-none-any.whl",
-        desktop_index=(
-            "<title>OpenEvo Desktop</title>"
-            '<script type="module" src="/assets/missing.js"></script>'
-        ),
-    )
-
-    errors = checker.validate_wheel(wheel, expected_version="0.1.0")
-
     assert any(
-        "references missing Desktop asset" in error and "assets/missing.js" in error
-        for error in errors
+        "openevo-backend = openevo.backend.launcher:main" in error for error in errors
     )
+
+
+def test_rejects_core_wheel_packaging_desktop_control_plane(tmp_path: Path) -> None:
+    checker = _load_module()
+    wheel = _write_wheel(
+        tmp_path / "openevo-0.1.0-py3-none-any.whl",
+        extra_files={
+            "openevo/desktop/web/index.html": "<title>OpenEvo Desktop</title>",
+            "openevo/sidecar/api.py": "",
+            "openevo/cli.py": "",
+        },
+    )
+
+    errors = checker.validate_wheel(wheel, expected_version="0.1.0")
+
+    assert any("openevo/desktop/" in error for error in errors)
+    assert any("openevo/sidecar/" in error for error in errors)
+    assert any("openevo/cli.py" in error for error in errors)
 
 
 def test_rejects_shared_dashboard_static_assets(tmp_path: Path) -> None:
     checker = _load_module()
     wheel = _write_wheel(
         tmp_path / "openevo-0.1.0-py3-none-any.whl",
-        extra_files={"polar/platform/web/dist/index.html": "<title>Polar Dashboard</title>"},
+        extra_files={"openevo/platform/web/dist/index.html": "<title>Polar Dashboard</title>"},
     )
 
     errors = checker.validate_wheel(wheel, expected_version="0.1.0")
 
-    assert any("polar/platform/web/dist" in error for error in errors)
-
-
-def test_rejects_shared_dashboard_shell_copied_into_openevo_assets(tmp_path: Path) -> None:
-    checker = _load_module()
-    wheel = _write_wheel(
-        tmp_path / "openevo-0.1.0-py3-none-any.whl",
-        extra_files={
-            "openevo/desktop/web/assets/shared-shell.js": (
-                'const nav = "Polar Dashboard"; const tasks = "/tasks";'
-            )
-        },
-    )
-
-    errors = checker.validate_wheel(wheel, expected_version="0.1.0")
-
-    assert any("shared dashboard marker" in error for error in errors)
+    assert any("openevo/platform/web/dist" in error for error in errors)
 
 
 def test_release_smoke_workflow_builds_packaged_assets_and_validates_wheel() -> None:
@@ -265,10 +235,9 @@ def test_release_smoke_workflow_builds_packaged_assets_and_validates_wheel() -> 
     assert "npm test -- --run" in text
     assert "npm audit --audit-level=high" in text
     assert "npm run build:openevo" in text
-    assert "diff -qr web/dist src/openevo/desktop/web" in text
-    assert '"src/polar/**"' in text
-    assert '"src/polar_evolution/**"' in text
+    assert "diff -qr web/dist desktop/packaging/web" in text
     assert '"src/slime_bridge/**"' in text
+    assert '"desktop/**"' in text
     assert '"tests/ci/**"' in text
     assert "python -m pip install --upgrade pip pytest -e ." in text
     assert "tests/ci/test_check_openevo_release.py" in text
@@ -280,11 +249,11 @@ def test_release_smoke_workflow_builds_packaged_assets_and_validates_wheel() -> 
     assert "scripts/ci/check_openevo_release.py --wheel dist/*.whl" in text
     assert "python -m venv .openevo-wheel-smoke" in text
     assert ".openevo-wheel-smoke/bin/python -m pip install dist/*.whl" in text
-    assert ".openevo-wheel-smoke/bin/openevo --help" in text
-    assert ".openevo-wheel-smoke/bin/openevo desktop --help" in text
-    assert ".openevo-wheel-smoke/bin/openevo desktop open --help" in text
+    assert ".openevo-wheel-smoke/bin/openevo-backend --help" in text
+    assert ".openevo-wheel-smoke/bin/openevo-backend serve --help" in text
+    assert ".openevo-wheel-smoke/bin/openevo-backend run --help" in text
     assert (
-        ".openevo-wheel-smoke/bin/python "
+        "PYTHONPATH=. .openevo-wheel-smoke/bin/python "
         "scripts/ci/smoke_openevo_desktop_wheel.py"
     ) in text
 
@@ -299,7 +268,7 @@ def test_release_smoke_workflow_builds_packaged_assets_and_validates_wheel() -> 
     )
     assert text.index("name: Build wheel") < text.index("name: Validate OpenEvo wheel")
     assert text.index("name: Validate OpenEvo wheel") < text.index(
-        "name: Install wheel and smoke OpenEvo CLI"
+        "name: Install wheel and smoke OpenEvo Backend"
     )
 
 
@@ -316,7 +285,7 @@ def test_release_artifact_workflow_builds_validated_wheel_artifact() -> None:
     assert "npm audit --audit-level=high" in text
     assert "npm test -- --run" in text
     assert "npm run build:openevo" in text
-    assert "diff -qr web/dist src/openevo/desktop/web" in text
+    assert "diff -qr web/dist desktop/packaging/web" in text
     assert "python -m pip install --upgrade pip pytest -e ." in text
     assert "name: Build remote install wheel" in text
     assert "python -m build --wheel --outdir .openevo-remote-wheel" in text
@@ -324,9 +293,11 @@ def test_release_artifact_workflow_builds_validated_wheel_artifact() -> None:
     assert "cp .openevo-remote-wheel/openevo-*.whl src/openevo/wheels/" in text
     assert "python -m build --wheel" in text
     assert "scripts/ci/check_openevo_release.py --wheel dist/*.whl" in text
-    assert ".openevo-wheel-smoke/bin/openevo desktop open --help" in text
+    assert ".openevo-wheel-smoke/bin/openevo-backend --help" in text
+    assert ".openevo-wheel-smoke/bin/openevo-backend serve --help" in text
+    assert ".openevo-wheel-smoke/bin/openevo-backend run --help" in text
     assert (
-        ".openevo-wheel-smoke/bin/python "
+        "PYTHONPATH=. .openevo-wheel-smoke/bin/python "
         "scripts/ci/smoke_openevo_desktop_wheel.py"
     ) in text
     assert "actions/upload-artifact@v4" in text
@@ -417,7 +388,7 @@ def test_pypi_publish_workflow_uses_trusted_publishing() -> None:
     assert "npm audit --audit-level=high" in text
     assert "npm test -- --run" in text
     assert "npm run build:openevo" in text
-    assert "diff -qr web/dist src/openevo/desktop/web" in text
+    assert "diff -qr web/dist desktop/packaging/web" in text
     assert "python -m pip install --upgrade pip pytest twine -e ." in text
     assert "name: Build remote install wheel" in text
     assert "python -m build --wheel --outdir .openevo-remote-wheel" in text
@@ -426,9 +397,11 @@ def test_pypi_publish_workflow_uses_trusted_publishing() -> None:
     assert "python -m build --wheel" in text
     assert "scripts/ci/check_openevo_release.py --wheel dist/*.whl" in text
     assert "twine check --strict dist/*.whl" in text
-    assert ".openevo-wheel-smoke/bin/openevo desktop open --help" in text
+    assert ".openevo-wheel-smoke/bin/openevo-backend --help" in text
+    assert ".openevo-wheel-smoke/bin/openevo-backend serve --help" in text
+    assert ".openevo-wheel-smoke/bin/openevo-backend run --help" in text
     assert (
-        ".openevo-wheel-smoke/bin/python "
+        "PYTHONPATH=. .openevo-wheel-smoke/bin/python "
         "scripts/ci/smoke_openevo_desktop_wheel.py"
     ) in text
     assert "pypa/gh-action-pypi-publish@release/v1" in text
@@ -467,9 +440,10 @@ def test_readme_release_checklist_matches_frontend_audit_gate() -> None:
         "npm test -- --run"
     )
     assert (
-        ".openevo-wheel-smoke/bin/python "
+        "PYTHONPATH=. .openevo-wheel-smoke/bin/python "
         "scripts/ci/smoke_openevo_desktop_wheel.py"
     ) in text
+    assert ".openevo-wheel-smoke/bin/openevo-backend run --help" in text
     assert "config-backed Desktop lifecycle" in text
     assert "PyPI trusted publishing" in text
     assert "pypa/gh-action-pypi-publish@release/v1" in text
@@ -482,11 +456,6 @@ def _write_wheel(
     *,
     metadata: str = GOOD_METADATA,
     entry_points: str = GOOD_ENTRY_POINTS,
-    include_desktop_assets: bool = True,
-    desktop_index: str = (
-        "<title>OpenEvo Desktop</title>"
-        '<script src="/assets/app.js"></script>'
-    ),
     include_nested_remote_wheel: bool = True,
     nested_remote_wheel_metadata: str = GOOD_METADATA,
     extra_files: dict[str, str] | None = None,
@@ -495,12 +464,6 @@ def _write_wheel(
     with ZipFile(path, "w") as wheel:
         wheel.writestr(f"{dist_info}/METADATA", metadata)
         wheel.writestr(f"{dist_info}/entry_points.txt", entry_points)
-        if include_desktop_assets:
-            wheel.writestr(
-                "openevo/desktop/web/index.html",
-                desktop_index,
-            )
-            wheel.writestr("openevo/desktop/web/assets/app.js", "console.log('openevo')")
         if include_nested_remote_wheel:
             wheel.writestr(
                 "openevo/wheels/openevo-0.1.0-py3-none-any.whl",

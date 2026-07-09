@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from polar.gateway.engine import SGLangEngine, VLLMEngine, get_engine
+from openevo.gateway.engine import SGLangEngine, VLLMEngine, get_engine
 
 
 def test_get_engine_returns_the_right_strategy() -> None:

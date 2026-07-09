@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from polar.gateway.transform.reasoning import encrypt_reasoning
-from polar.gateway.transform.openai_responses import OpenAIResponsesTransformer
+from openevo.gateway.transform.reasoning import encrypt_reasoning
+from openevo.gateway.transform.openai_responses import OpenAIResponsesTransformer
 
 IMAGE_URL = "data:image/png;base64,abc123"
 

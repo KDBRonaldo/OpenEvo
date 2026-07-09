@@ -53,7 +53,7 @@ Terminal Bench + Harbor/EvoLab 为例，官方 verifier 仍负责执行和打分
 trial/job 目录中的非 oracle 产物转换成 Core events：
 
 ```sh
-uv run polar-evolution terminal-bench-events \
+uv run python -m openevo.evolution.cli terminal-bench-events \
   --input /tmp/evolab-tb21-run/<job-or-trial-dir> \
   --output /tmp/tb21-events.jsonl
 ```
@@ -61,7 +61,7 @@ uv run polar-evolution terminal-bench-events \
 本地实验可以跳过 HTTP backend，直接写 SQLite store 并生成 dataset artifact：
 
 ```sh
-uv run polar-evolution terminal-bench-dataset \
+uv run python -m openevo.evolution.cli terminal-bench-dataset \
   --input /tmp/evolab-tb21-run/<job-or-trial-dir> \
   --db /tmp/polar-tb21/evolution.db \
   --artifact-root /tmp/polar-tb21/artifacts \
@@ -73,7 +73,7 @@ uv run polar-evolution terminal-bench-dataset \
 如果下一步就是 agent-system evolution，可以直接生成 audited reflector job：
 
 ```sh
-uv run polar-evolution terminal-bench-agent-system-job \
+uv run python -m openevo.evolution.cli terminal-bench-agent-system-job \
   --input /tmp/evolab-tb21-run/<job-or-trial-dir> \
   --db /tmp/polar-tb21/evolution.db \
   --artifact-root /tmp/polar-tb21/artifacts \
@@ -143,13 +143,13 @@ trial name、task instruction、task path 和 verifier failed-test 摘要会作�
 ## OpenEvo Core capability metadata
 
 Desktop 和 Dev Kit 不应硬编码 method table。内置 evolution method 的可发现信息由
-`openevo.core.capabilities` 暴露：
+`openevo.capabilities` 暴露：
 
 - `build_core_capabilities()` 返回 frozen Pydantic `CoreCapabilities`，包含 execution modes、
   artifact targets 和 evolution methods。
 - `method_metadata_by_id()` 返回 `dict[str, EvolutionMethodCapability]`，key 与
-  `polar_evolution.methods.METHOD_REGISTRY` 的 method ID 一致。
-- `polar_evolution.methods.METHOD_METADATA` 是内置 worker method 的 metadata 源；每个
+  `openevo.evolution.methods.METHOD_REGISTRY` 的 method ID 一致。
+- `openevo.evolution.methods.METHOD_METADATA` 是内置 worker method 的 metadata 源；每个
   `METHOD_REGISTRY` key 都必须有对应 metadata，避免 UI 或 Dev Kit 维护第二份方法表。
 
 当前 Core execution modes 是：
@@ -532,7 +532,7 @@ paired evaluation，可把每个候选的 `precision`、`recall`、`f1` 和
 ## Golden-standard evaluator
 
 有 ground truth 的任务应把评估放在 evolution orchestration 层，而不是放进某个具体
-method。共享实现位于 `polar_evolution.golden_standard`，负责：
+method。共享实现位于 `openevo.evolution.golden_standard`，负责：
 
 - 读取 JSON / JSONL golden records；
 - 按 article-scoped sequence matching 计算 TP/FP/FN、precision、recall、F1 和重复预测；
@@ -802,7 +802,7 @@ Gateway 在 run 前调用：
 
 适合本仓库内的 baseline 或实验方法。
 
-1. 在 `src/polar_evolution/methods.py` 添加函数：
+1. 在 `src/openevo/evolution/methods.py` 添加函数：
 
 ```python
 def my_memory_method(job: WorkerClaimedJob, artifact_root: Path) -> list[ArtifactRegisterRequest]:
@@ -820,7 +820,7 @@ METHOD_REGISTRY["my_memory_method"] = my_memory_method
    `description`、`artifact_type`、`visibility`、`visible_in_desktop`、`input_requirements`、
    `supported_execution_modes`、`default_config`、`config_schema` 和 `stability_level`。
    Desktop/Dev Kit 会通过
-   `openevo.core.capabilities` 读取这份 metadata，不应再硬编码 method table。
+   `openevo.capabilities` 读取这份 metadata，不应再硬编码 method table。
 
 4. 创建 job 时设置：
 

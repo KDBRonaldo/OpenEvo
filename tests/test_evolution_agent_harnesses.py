@@ -5,12 +5,12 @@ from pathlib import Path
 
 import pytest
 
-from polar.agent.models import AgentSpec, MCPServerSpec
-from polar.agent.presets.claude_code import ClaudeCodeHarness
-from polar.agent.presets.codex import CodexHarness
-from polar.agent.presets.openhands_sdk import OpenHandsSdkHarness
-from polar.runtime.base import BaseRuntime
-from polar.runtime.models import ExecResult, RuntimeSpec
+from openevo.harness.models import AgentSpec, MCPServerSpec
+from openevo.harness.presets.claude_code import ClaudeCodeHarness
+from openevo.harness.presets.codex import CodexHarness
+from openevo.harness.presets.openhands_sdk import OpenHandsSdkHarness
+from openevo.runtime.base import BaseRuntime
+from openevo.runtime.models import ExecResult, RuntimeSpec
 
 SUBSCRIPTION_PROXY_ENV_VARS = (
     "OPENAI_BASE_URL",

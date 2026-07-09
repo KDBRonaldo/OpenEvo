@@ -338,6 +338,7 @@ evolution algorithm behavior.
   - `src/openevo/harness/`
   - `src/openevo/config/`
   - `src/openevo/gateway/`
+  - `src/openevo/platform/`
   - `src/openevo/runtime/`
   - `src/openevo/rollout/`
   - `src/openevo/trajectory/`
@@ -349,6 +350,12 @@ evolution algorithm behavior.
   - `src/openevo/tools/`
 - Move:
   - `src/openevo/core/capabilities.py -> src/openevo/capabilities.py`
+  - reusable remote profile/workspace/planning contracts from the old sidecar
+    module into `src/openevo/deployment/`
+  - Desktop HTTP facade and static-app helpers into top-level `desktop/`
+- Create:
+  - `src/openevo/backend/__init__.py`
+  - `src/openevo/backend/launcher.py`
 - Delete:
   - `src/polar/`
   - `src/polar_evolution/`
@@ -356,7 +363,7 @@ evolution algorithm behavior.
   - old `src/openevo/science/`
   - old `src/openevo/remote/`
   - old `src/openevo/sidecar/`
-  - old `src/openevo/desktop/` if superseded by top-level `desktop/`
+  - old `src/openevo/desktop/`
 - Modify imports in all Python files and tests.
 
 - [ ] **Step 1: Move low-level runtime modules**
@@ -367,6 +374,7 @@ Move:
 src/polar/agent       -> src/openevo/harness
 src/polar/config      -> src/openevo/config
 src/polar/gateway     -> src/openevo/gateway
+src/polar/platform    -> src/openevo/platform
 src/polar/runtime     -> src/openevo/runtime
 src/polar/rollout     -> src/openevo/rollout
 src/polar/trajectory  -> src/openevo/trajectory
@@ -426,6 +434,7 @@ Apply mechanical import changes:
 polar.agent            -> openevo.harness
 polar.config           -> openevo.config
 polar.gateway          -> openevo.gateway
+polar.platform         -> openevo.platform
 polar.runtime          -> openevo.runtime
 polar.rollout          -> openevo.rollout
 polar.trajectory       -> openevo.trajectory
@@ -458,7 +467,42 @@ where = ["src"]
 include = ["openevo*", "slime_bridge*"]
 ```
 
-Remove package data entries for `polar`.
+Remove package data entries for `polar` and Desktop assets. The Core Backend
+wheel must not package `openevo/desktop/*`, `openevo/sidecar/*`, or
+`openevo/cli.py`; Desktop release assets belong to the top-level Desktop
+product and macOS DMG workflow.
+
+Create a minimal `src/openevo/backend/launcher.py` so the package entrypoint is
+not broken before Task 4 expands the backend API:
+
+```python
+from __future__ import annotations
+
+import argparse
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="openevo-backend")
+    parser.add_argument("command", choices=("serve",))
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8765)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    if args.command == "serve":
+        raise SystemExit(
+            "openevo-backend serve is introduced in the backend API phase."
+        )
+    raise ValueError(args.command)
+```
+
+Create `src/openevo/backend/__init__.py`:
+
+```python
+"""OpenEvo Core Backend launcher package."""
+```
 
 - [ ] **Step 7: Run focused import checks**
 

@@ -8,8 +8,6 @@ on:
       - "pyproject.toml"
       - "uv.lock"
       - "src/openevo/**"
-      - "src/polar/**"
-      - "src/polar_evolution/**"
       - "src/slime_bridge/**"
       - "tests/openevo/**"
       - "tests/ci/test_openevo_python_workflow.py"

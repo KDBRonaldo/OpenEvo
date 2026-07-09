@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import httpx
 
-from openevo.experiment.clients import RolloutHttpClient
+from openevo import experiments
+
+RolloutHttpClient = experiments.RolloutHttpClient
 
 
 def test_rollout_http_client_url_encodes_task_id_path_segment() -> None:

@@ -20,12 +20,12 @@ TEXT_SUFFIXES = {
     ".sh",
 }
 MARKERS = (
-    "src/polar",
-    "src/polar_evolution",
+    "src/" + "polar",
+    "src/" + "polar" + "_evolution",
     "POLAR_",
     "/polar/session",
     "polar.session_completed",
-    "polar-evolution",
+    "polar-" + "evolution",
 )
 
 
@@ -58,7 +58,9 @@ def audit() -> dict[str, object]:
     matches.sort(key=lambda match: (match["path"], match["marker"]))
     return {
         "src_polar_exists": (REPO_ROOT / "src" / "polar").exists(),
-        "src_polar_evolution_exists": (REPO_ROOT / "src" / "polar_evolution").exists(),
+        "src_legacy_evolution_exists": (
+            REPO_ROOT / "src" / ("polar" + "_evolution")
+        ).exists(),
         "web_exists": (REPO_ROOT / "web").exists(),
         "desktop_exists": (REPO_ROOT / "desktop").exists(),
         "matches": matches,

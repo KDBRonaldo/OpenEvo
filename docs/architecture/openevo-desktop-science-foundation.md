@@ -37,11 +37,7 @@ Science Project task sources describe where the task workspace comes from:
 
 `local_folder` and `git_repository` require a Desktop or remote backend to
 prepare the workspace first. After preparation, the compiler receives a prepared
-remote workspace path for the task, for example through:
-
-```bash
-openevo science compile CONFIG --prepared-workspace task=/remote/path
-```
+remote workspace path for the task through the Python compiler API.
 
 The science compiler does not upload local files or clone repositories itself.
 
@@ -106,7 +102,7 @@ all Science Projects until adapter source and trainer configuration are defined.
 
 ## Preflight
 
-`openevo.remote.preflight` defines fakeable remote preflight contracts. It does
+`openevo.deployment.preflight` defines fakeable remote preflight contracts. It does
 not implement SSH transport. Callers provide a `RemoteProbe` that can run remote
 commands and return structured results.
 
@@ -129,40 +125,25 @@ using the same concepts as the Python contracts.
 
 ### Local Desktop Serve
 
-The installable Python distribution is named `openevo`. It includes the
-OpenEvo Desktop assets and the lower-level `polar` / `polar_evolution` packages
-that still provide rollout, gateway, trajectory, and evolution backend runtime
-modules. The `openevo`, `polar`, and `polar-evolution` console scripts remain
-declared from the same distribution so existing backend workflows keep working
-while the user-facing package identity is OpenEvo.
-
-The release-shaped local launcher is:
+The installable Python distribution is named `openevo`. It includes only the
+OpenEvo Core Backend modules that provide rollout, gateway, trajectory, and
+evolution backend runtime code. Desktop assets live under the top-level
+`desktop/packaging/web/` path for Desktop release and smoke validation. In the
+Core Backend migration phase, the only Python console script is the backend
+launcher:
 
 ```bash
-openevo desktop open
+openevo-backend --help
+openevo-backend serve --help
 ```
 
-This starts the same local FastAPI/uvicorn process, opens `/openevo` in the
-user browser, and falls back to an available local port if the preferred port is
-occupied. `--no-browser` keeps the server-only behavior for headless or scripted
-environments. The user-facing launcher defaults sidecar mutating endpoints to
-SSH transport so the Desktop lifecycle buttons operate the configured remote
-server. Pass `--transport dry-run` for local demos that should not open SSH
-connections.
-
-The exact-port server entrypoint remains:
-
-```bash
-openevo desktop serve --host 127.0.0.1 --port 3766
-```
-
-Both commands serve the packaged Desktop SPA at `/openevo` and the sidecar API
-at `/openevo-api/*`. `desktop serve` preserves exact-port behavior for tests,
-integrations, and power users. `desktop serve` and API-only `sidecar serve`
-keep `dry-run` as their default transport; pass `--transport ssh` when those
-entrypoints should mutate a remote server.
-The root path `/` redirects to `/openevo`. The packaged asset set is built in
-OpenEvo-only mode, so users do not see the shared Polar dashboard navigation.
+`openevo-backend serve` is a reserved stub until the backend API phase adds the
+remote supervisor. Desktop-native launch and sidecar integration are handled by
+the later Desktop migration tasks.
+The root path `/` redirects to `/openevo`. The Desktop asset set is built in
+OpenEvo-only mode and kept under the top-level `desktop/packaging/web/` path,
+so users do not see the shared Polar dashboard navigation and the Core wheel
+does not package Desktop assets.
 The local server still returns the SPA for compatibility routes `/tasks`,
 `/tasks/*`, `/sessions`, `/sessions/*`, and `/compare`; unknown
 `/openevo-api/*` paths remain API 404s.
@@ -171,18 +152,18 @@ Packaged Desktop assets are refreshed with:
 
 ```bash
 cd web && npm run build:openevo
-rsync -a --delete web/dist/ src/openevo/desktop/web/
+rsync -a --delete web/dist/ desktop/packaging/web/
 ```
 
 The release smoke check runs on Node 22, audits the Desktop frontend dependency
 graph for high or critical advisories, rebuilds the OpenEvo-only Desktop assets,
-verifies that the committed package assets match `web/dist`, builds the Python
-wheel, inspects the wheel metadata, console scripts, packaged asset references,
-and forbidden shared-dashboard payloads, then installs the wheel into a clean
-environment and runs the installed OpenEvo CLI and Desktop API smoke checks.
-The installed-wheel smoke covers Core capabilities, method metadata, project
-config save, workspace, bootstrap, services, service status, run launch, run
-artifact summary parsing, and artifact content reading:
+verifies that `desktop/packaging/web` matches `web/dist`, builds the Python
+Core wheel, inspects the wheel metadata, console scripts, bundled remote-install
+wheel, and Core/Desktop package boundary, then installs the wheel into a clean
+environment and runs the installed backend launcher plus Desktop API smoke
+checks. The installed-wheel smoke covers Core capabilities, method metadata,
+project config save, workspace, bootstrap, services, service status, run launch,
+run artifact summary parsing, and artifact content reading:
 
 ```bash
 cd web
@@ -191,7 +172,7 @@ npm audit --audit-level=high
 npm test -- --run
 npm run build:openevo
 cd ..
-diff -qr web/dist src/openevo/desktop/web
+diff -qr web/dist desktop/packaging/web
 rm -rf .openevo-remote-wheel src/openevo/wheels
 python -m build --wheel --outdir .openevo-remote-wheel
 mkdir -p src/openevo/wheels
@@ -202,10 +183,10 @@ python scripts/ci/check_openevo_release.py --wheel dist/*.whl
 python -m venv .openevo-wheel-smoke
 .openevo-wheel-smoke/bin/python -m pip install --upgrade pip
 .openevo-wheel-smoke/bin/python -m pip install dist/*.whl
-.openevo-wheel-smoke/bin/openevo --help
-.openevo-wheel-smoke/bin/openevo desktop --help
-.openevo-wheel-smoke/bin/openevo desktop open --help
-.openevo-wheel-smoke/bin/python scripts/ci/smoke_openevo_desktop_wheel.py
+.openevo-wheel-smoke/bin/openevo-backend --help
+.openevo-wheel-smoke/bin/openevo-backend serve --help
+.openevo-wheel-smoke/bin/openevo-backend run --help
+PYTHONPATH=. .openevo-wheel-smoke/bin/python scripts/ci/smoke_openevo_desktop_wheel.py
 ```
 
 OpenEvo package and Desktop-sidecar Python regressions are checked with:
@@ -215,31 +196,10 @@ ruff check src/openevo tests/openevo
 PYTHONPATH=src:. python -m pytest tests/ci/test_openevo_python_workflow.py tests/openevo -q
 ```
 
-For development or custom packages, `--static-root` can point at a Vite build
-output directory:
-
-```bash
-openevo desktop serve --static-root web/dist
-```
-
-If static assets are missing, incomplete, or referenced by `index.html` but not
-present on disk, the command fails before starting the API server and tells the
-caller to build and package Desktop assets or pass `--static-root`.
-
-`openevo sidecar serve --host 127.0.0.1 --port 3766` remains available as an
-API-only entrypoint for integration tests and power users.
-
-For a user project, Desktop can start the same server with local config paths:
-
-```bash
-openevo desktop serve \
-  --config science.yaml \
-  --remote-profile remote.yaml \
-  --host 127.0.0.1 \
-  --port 3766
-```
-
-Desktop-created projects can start from a no-config sidecar. In that mode the
+The former Python Desktop and sidecar console-script entrypoints are not
+exposed after the Core Backend package migration. Desktop
+native hosting and sidecar launch are handled by the later Desktop migration
+tasks. Desktop-created projects can start from a no-config sidecar. In that mode the
 sidecar receives a writable local config root from `--desktop-config-root`, or
 uses `OPENEVO_DESKTOP_CONFIG_DIR`, falling back to
 `~/.openevo/desktop`.
@@ -338,11 +298,8 @@ back as `self-deployed`.
 It is available only for config-backed sidecar sessions. It reuses
 `build_sidecar_science_plan()`, `build_remote_bootstrap_plan()`, and
 `execute_remote_bootstrap_plan()` to run the existing bootstrap executor, then
-returns both the bootstrap report and refreshed shell status. The default serve
-transport is dry-run; `openevo sidecar serve --transport ssh` selects the SSH
-transport for the bootstrap endpoint. The user-facing `openevo desktop open`
-launcher selects SSH by default, while exact-port serve and API-only sidecar
-serve keep dry-run defaults for tests and integrations. Bootstrap does not
+returns both the bootstrap report and refreshed shell status. Desktop-native
+launch will select the transport for the bootstrap endpoint. Bootstrap does not
 upload local folders or clone git task sources; workspace preparation remains a
 separate lifecycle step so the UI can report source materialization
 independently from runtime readiness.
@@ -366,15 +323,15 @@ Desktop also keeps the most recent bootstrap report in the same area. It renders
 failed or warning bootstrap steps. Long commands, paths, proxy URLs, and stderr
 snippets are wrapped in the panel so remote dependency and setup failures remain
 readable in the app.
-Bootstrap includes a user-scoped exact OpenEvo Core check. Desktop/CLI searches
+Bootstrap includes a user-scoped exact OpenEvo Core check. Desktop searches
 only bundled package-relative wheel directories for an `openevo-<version>-*.whl`
 whose wheel metadata matches the local packaged version. If present, it uploads
 only that wheel and bootstrap installs it with user-site `pip --force-reinstall`
-before verifying remote package metadata, `openevo --version`, and
-`openevo --help` with `~/.local/bin` prepended to PATH. If no bundled wheel is
-available, bootstrap passes only when the remote package and CLI already report
-the exact expected version; otherwise it fails clearly and does not install an
-unpinned latest package from PyPI.
+before verifying remote package metadata and the `openevo-backend` launcher with
+`~/.local/bin` prepended to PATH. If no bundled wheel is available, bootstrap
+passes only when the remote package and backend launcher already report the exact
+expected version; otherwise it fails clearly and does not install an unpinned
+latest package from PyPI.
 For managed Science runtime profiles, bootstrap also prepares the runtime image
 without requiring the user to provide one. It runs
 `docker pull <managed-image> || docker build ... -t <managed-image> ...`; Docker
@@ -439,7 +396,7 @@ latest services report is ready. The command is derived only from those
 bootstrap paths:
 
 ```bash
-PATH="$HOME/.local/bin:$PATH" openevo run <experiment_snapshot> --output-dir <state_root>/runs/<run-id> --json
+PATH="$HOME/.local/bin:$PATH" openevo-backend run <experiment_snapshot> --output-dir <state_root>/runs/<run-id> --json
 ```
 
 The PATH prefix lets the run use the console script created by bootstrap's
@@ -466,7 +423,7 @@ After a terminal run status, Desktop calls
 The endpoint is read-only but still token-protected because it reaches into the
 remote run directory. It is available only for config-backed sidecar sessions
 with a launched latest run, and it rejects active runs because the run
-`summary.json` contract is complete only after `openevo run` exits.
+`summary.json` contract is complete only after `openevo-backend run` exits.
 
 The endpoint reads `<run.output_dir>/summary.json` on the remote machine through
 the configured transport, parses it, and returns a compact timeline payload:
@@ -507,9 +464,8 @@ exercises the same planning, status, and polling path, but it does not mutate
 the remote server. A dry-run report can therefore show the UI path as ready
 without proving that task workspaces, Docker images, or Hugging Face models were
 actually prepared. Real remote preparation and run execution require
-SSH transport. `openevo desktop open` selects SSH by default; `desktop serve`
-and `sidecar serve` require `--transport ssh` when they should mutate a remote
-server.
+SSH transport. Desktop-native launch is responsible for choosing dry-run or SSH
+transport when it should mutate a remote server.
 
 This slice adds a command-and-health-check service supervisor plus a local
 sidecar run supervisor with one latest run per config-backed session. It does
@@ -523,14 +479,10 @@ available through the latest-run artifact content endpoint.
 
 ## CLI
 
-The initial user-visible CLI for this slice is:
-
-```bash
-openevo science compile CONFIG [--json] [--prepared-workspace task=/remote/path]
-```
-
-`--prepared-workspace` can be repeated when multiple tasks need prepared remote
-workspace paths.
+The Python package no longer exposes a user-facing `openevo` console script.
+The only package console script in the Core Backend migration phase is
+`openevo-backend`; Dev Kit and Desktop-native entrypoints are handled by later
+productization tasks.
 
 ## Limitations
 
@@ -540,9 +492,7 @@ command-based service startup, run supervision, terminal-run artifact summary
 display, and human-readable artifact content viewing. It still does not include:
 
 - local credential vault or SSH tunnel management;
-- native sidecar supervision, auto-update, or OS credential vault integration
-  outside the current minimal Tauri shell and `openevo desktop open` /
-  `openevo desktop serve` process;
+- native sidecar supervision, auto-update, or OS credential vault integration;
 - Docker Compose lifecycle management;
 - production vLLM lifecycle tuning, restart policy, GPU placement, or dynamic
   adapter loading;

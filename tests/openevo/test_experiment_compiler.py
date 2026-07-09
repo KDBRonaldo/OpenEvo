@@ -4,8 +4,11 @@ from pathlib import Path
 
 import yaml
 
-from openevo.experiment.compiler import compile_experiment
-from openevo.experiment.models import ExperimentConfig, load_experiment_config
+from openevo import experiments
+
+ExperimentConfig = experiments.ExperimentConfig
+compile_experiment = experiments.compile_experiment
+load_experiment_config = experiments.load_experiment_config
 
 
 def _config(**overrides: object) -> ExperimentConfig:

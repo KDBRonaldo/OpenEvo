@@ -8,9 +8,9 @@ from fastapi.testclient import TestClient
 import httpx
 import pytest
 
-from polar_evolution.client import EvolutionClient
-from polar_evolution.server import create_app
-from polar_evolution.worker import EvolutionWorkerClient
+from openevo.evolution.client import EvolutionClient
+from openevo.evolution.server import create_app
+from openevo.evolution.worker import EvolutionWorkerClient
 
 
 def test_health_reports_artifact_root(tmp_path):

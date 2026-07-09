@@ -153,21 +153,21 @@ transcript capture 负责 evolution 可消费的行为记录。
 
 | 区域 | 文件 | 职责 |
 |---|---|---|
-| Gateway server | `src/polar/gateway/server.py` | FastAPI app、proxy route、session/admin endpoints |
-| Gateway execution | `src/polar/gateway/node.py` | runtime 生命周期、harness setup/run、post-run、evolution hooks |
-| Dispatch | `src/polar/gateway/dispatcher.py` | 分阶段 worker pools 和 session transitions |
-| Sessions | `src/polar/gateway/session.py` | 内存 session registry 和 session id 解析 |
-| Proxy client | `src/polar/gateway/proxy.py` | 到 inference backend 的 HTTP client，支持 pause/resume generation |
-| Engine strategy | `src/polar/gateway/engine.py` | SGLang/vLLM 请求与响应差异 |
-| Agent contract | `src/polar/agent/base.py`, `src/polar/agent/models.py` | harness API 和 task schema |
-| Presets | `src/polar/agent/presets/` | Codex、Claude Code、OpenHands 等 launcher |
-| Trajectory | `src/polar/trajectory/` | completion records 到 trajectory/evaluation 数据 |
+| Gateway server | `src/openevo/gateway/server.py` | FastAPI app、proxy route、session/admin endpoints |
+| Gateway execution | `src/openevo/gateway/node.py` | runtime 生命周期、harness setup/run、post-run、evolution hooks |
+| Dispatch | `src/openevo/gateway/dispatcher.py` | 分阶段 worker pools 和 session transitions |
+| Sessions | `src/openevo/gateway/session.py` | 内存 session registry 和 session id 解析 |
+| Proxy client | `src/openevo/gateway/proxy.py` | 到 inference backend 的 HTTP client，支持 pause/resume generation |
+| Engine strategy | `src/openevo/gateway/engine.py` | SGLang/vLLM 请求与响应差异 |
+| Agent contract | `src/openevo/harness/base.py`, `src/openevo/harness/models.py` | harness API 和 task schema |
+| Presets | `src/openevo/harness/presets/` | Codex、Claude Code、OpenHands 等 launcher |
+| Trajectory | `src/openevo/trajectory/` | completion records 到 trajectory/evaluation 数据 |
 
 ## 扩展点
 
 - 新 agent：实现 `BaseHarness` 子类，或使用 `agent.harness: shell`。
 - 新 inference backend：新增 `InferenceEngine` 实现，并在 `get_engine` 中注册。
-- 新 API 请求/响应形态：在 `src/polar/gateway/transform/` 中添加 transformer。
+- 新 API 请求/响应形态：在 `src/openevo/gateway/transform/` 中添加 transformer。
 - 新 trajectory builder/evaluator：通过现有 registry 注册。
 - 新 skill/memory/agent-system evolution 方法：通过 Evolution Backend method
   registry 添加，详见 [Reference Evolution Worker](reference-evolution-worker.md)。

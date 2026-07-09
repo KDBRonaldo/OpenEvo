@@ -6,11 +6,11 @@ from pathlib import Path
 
 import pytest
 
-import polar_evolution.cli as cli_module
-import polar_evolution.terminal_bench_per_task as per_task_module
-from polar_evolution.cli import _parse_key_value_entries, main
-from polar_evolution.models import ArtifactRegisterRequest, ArtifactType
-from polar_evolution.terminal_bench_per_task import (
+import openevo.evolution.cli as cli_module
+import openevo.evolution.terminal_bench_per_task as per_task_module
+from openevo.evolution.cli import _parse_key_value_entries, main
+from openevo.evolution.models import ArtifactRegisterRequest, ArtifactType
+from openevo.evolution.terminal_bench_per_task import (
     ArtifactMaterializer,
     EvolutionArtifact,
     TerminalBenchTaskGroup,

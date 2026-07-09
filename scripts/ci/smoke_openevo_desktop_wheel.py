@@ -15,10 +15,10 @@ from urllib.parse import urlsplit
 import warnings
 
 from openevo import __version__ as OPENEVO_VERSION
-from openevo.desktop.app import create_desktop_app
-from openevo.remote import RemoteCommandResult
-from openevo.sidecar.api import create_sidecar_app
-from openevo.sidecar.api import SIDECAR_MUTATION_TOKEN_HEADER
+from desktop.server.app import create_desktop_app
+from openevo.deployment import RemoteCommandResult
+from desktop.sidecar.api import create_sidecar_app
+from desktop.sidecar.api import SIDECAR_MUTATION_TOKEN_HEADER
 
 warnings.filterwarnings(
     "ignore",
@@ -96,13 +96,13 @@ class _LifecycleSmokeTransport:
                 return_code=0,
                 stdout=f"{OPENEVO_VERSION}\n",
             )
-        if "openevo --version" in command:
+        if "openevo-backend --version" in command:
             return RemoteCommandResult(
                 command=command,
                 return_code=0,
                 stdout=f"openevo {OPENEVO_VERSION}\n",
             )
-        if "openevo --help" in command:
+        if "openevo-backend --help" in command:
             return RemoteCommandResult(command=command, return_code=0, stdout="help")
         if "json.dumps" in command and "pid_path =" in command:
             return RemoteCommandResult(
@@ -116,7 +116,7 @@ class _LifecycleSmokeTransport:
                     }
                 ),
             )
-        if command.startswith('PATH="$HOME/.local/bin:$PATH" openevo run '):
+        if command.startswith('PATH="$HOME/.local/bin:$PATH" openevo-backend run '):
             return RemoteCommandResult(command=command, return_code=0, stdout="ok")
         if "summary.json" in command:
             return RemoteCommandResult(

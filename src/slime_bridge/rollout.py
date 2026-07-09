@@ -28,8 +28,8 @@ import httpx
 import uvicorn
 from fastapi import FastAPI, Request
 
-from polar.config import TopologyConfig
-from polar.rollout.models import TaskResult, TaskStatus
+from openevo.config import TopologyConfig
+from openevo.rollout.models import TaskResult, TaskStatus
 from slime_bridge._messages import prompt_to_instruction_text
 from slime_bridge.adapter import RolloutLogprobError, session_result_to_samples
 from slime_bridge.config import (

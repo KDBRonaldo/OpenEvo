@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import shlex
 import time
+import tomllib
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Event
@@ -12,17 +14,17 @@ from fastapi.testclient import TestClient
 import pytest
 import yaml
 
-import openevo.sidecar.api as sidecar_api
-from openevo.sidecar import (
+import desktop.sidecar.api as sidecar_api
+from desktop.sidecar import (
     DesktopExecutionStatus,
     build_desktop_shell_status,
     create_sidecar_app,
     create_sidecar_app_for_project,
     default_desktop_shell_status,
 )
-from openevo.science import ScienceProjectConfig
-from openevo.sidecar import RemoteProfileConfig
-from openevo.remote import RemoteCommandResult
+from openevo.projects.science import ScienceProjectConfig
+from desktop.sidecar import RemoteProfileConfig
+from openevo.deployment import RemoteCommandResult
 
 
 def test_sidecar_health_endpoint() -> None:
@@ -699,14 +701,14 @@ def test_services_endpoint_starts_after_bootstrap_and_refreshes_status() -> None
         "gateway",
         "evolution_worker",
     ]
-    assert any("polar serve_rollout" in command for command in transport.commands)
-    assert any("polar serve_gateway" in command for command in transport.commands)
+    assert any("python3 -m openevo.rollout.server" in command for command in transport.commands)
+    assert any("python3 -m openevo.gateway.server" in command for command in transport.commands)
     assert any(
-        "polar serve_rollout --config" in command
+        "python3 -m openevo.rollout.server --config" in command
         for command in transport.commands
     )
     assert any(
-        "polar serve_gateway --config" in command
+        "python3 -m openevo.gateway.server --config" in command
         for command in transport.commands
     )
     services = {service["id"]: service for service in payload["status"]["services"]}
@@ -950,8 +952,8 @@ def test_services_stop_and_restart_endpoints_control_selected_service() -> None:
     assert restart.status_code == 200
     assert restart.json()["state"] == "ready"
     assert transport.stopped_services == ["gateway", "gateway"]
-    assert any("polar serve_gateway" in command for command in transport.commands)
-    assert not any("polar serve_rollout" in command for command in transport.commands)
+    assert any("python3 -m openevo.gateway.server" in command for command in transport.commands)
+    assert not any("python3 -m openevo.rollout.server" in command for command in transport.commands)
 
 
 def test_services_control_endpoint_rejects_unknown_service_id() -> None:
@@ -1995,7 +1997,7 @@ def test_run_endpoint_launches_after_workspace_bootstrap_and_services() -> None:
     experiment_snapshot = bootstrap["report"]["prepared_paths"]["experiment_snapshot"]
     output_dir = f"{state_root}/runs/{payload['run']['id']}"
     expected_command = (
-        f'PATH="$HOME/.local/bin:$PATH" openevo run {experiment_snapshot} '
+        f'PATH="$HOME/.local/bin:$PATH" openevo-backend run {experiment_snapshot} '
         f"--output-dir {output_dir} --json"
     )
     assert payload["run"]["id"].startswith("run_")
@@ -2023,6 +2025,34 @@ def test_run_endpoint_launches_after_workspace_bootstrap_and_services() -> None:
     evolution = {step["id"]: step for step in terminal["status"]["evolution"]}
     assert evolution["transcript"]["state"] == "complete"
     assert evolution["transcript"]["detail"] == "Run completed and transcript captured"
+
+
+def test_run_endpoint_uses_installed_backend_entrypoint() -> None:
+    project = ScienceProjectConfig.model_validate(_science_project_payload())
+    profile = _remote_profile()
+    transport = _ApiDryRunTransport()
+    client = TestClient(
+        create_sidecar_app_for_project(
+            project,
+            profile,
+            transport_factory=lambda _profile: transport,
+        )
+    )
+    token = _sidecar_token(client)
+    headers = {"X-OpenEvo-Sidecar-Token": token}
+    _prepare_workspace_bootstrap_and_services(client, headers)
+
+    response = client.post("/openevo-api/desktop/run", headers=headers)
+
+    assert response.status_code == 200
+    scripts = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))[
+        "project"
+    ]["scripts"]
+    tokens = shlex.split(response.json()["run"]["command"])
+    assert tokens[0].startswith("PATH=")
+    assert tokens[1] == "openevo-backend"
+    assert scripts[tokens[1]] == "openevo.backend.launcher:main"
+    assert "openevo" not in scripts
 
 
 def test_run_endpoint_preserves_command_failure_status() -> None:
@@ -2885,9 +2915,9 @@ class _ApiDryRunTransport:
             )
         if "importlib.metadata" in command and "version('openevo')" in command:
             return RemoteCommandResult(command=command, return_code=0, stdout="0.1.0\n")
-        if "openevo --version" in command:
+        if "openevo-backend --version" in command:
             return RemoteCommandResult(command=command, return_code=0, stdout="openevo 0.1.0\n")
-        if "openevo --help" in command:
+        if "openevo-backend --help" in command:
             return RemoteCommandResult(command=command, return_code=0, stdout="help")
         return RemoteCommandResult(command=command, return_code=0, stdout="ok")
 
@@ -2946,7 +2976,7 @@ class _ApiLifecycleTransport(_ApiDryRunTransport):
                 env=env,
                 timeout_seconds=timeout_seconds,
             )
-        if "openevo --version" in command or "openevo --help" in command:
+        if "openevo-backend --version" in command or "openevo-backend --help" in command:
             return super().run(
                 command,
                 cwd=cwd,
@@ -3061,7 +3091,7 @@ class _FailingRunTransport(_ApiDryRunTransport):
         env: dict[str, str] | None = None,
         timeout_seconds: float = 30.0,
     ) -> RemoteCommandResult:
-        if command.startswith('PATH="$HOME/.local/bin:$PATH" openevo run '):
+        if command.startswith('PATH="$HOME/.local/bin:$PATH" openevo-backend run '):
             self.commands.append(command)
             return RemoteCommandResult(
                 command=command,
@@ -3089,7 +3119,7 @@ class _RunArtifactsTransport(_ApiDryRunTransport):
         env: dict[str, str] | None = None,
         timeout_seconds: float = 30.0,
     ) -> RemoteCommandResult:
-        if command.startswith('PATH="$HOME/.local/bin:$PATH" openevo run '):
+        if command.startswith('PATH="$HOME/.local/bin:$PATH" openevo-backend run '):
             self.commands.append(command)
             self.run_calls.append((command, cwd, timeout_seconds))
             return RemoteCommandResult(command=command, return_code=0, stdout="ok")
@@ -3136,7 +3166,7 @@ class _ArtifactContentTransport(_RunArtifactsTransport):
         timeout_seconds: float = 30.0,
     ) -> RemoteCommandResult:
         if "summary.json" in command or command.startswith(
-            'PATH="$HOME/.local/bin:$PATH" openevo run '
+            'PATH="$HOME/.local/bin:$PATH" openevo-backend run '
         ):
             return super().run(
                 command,
@@ -3264,7 +3294,7 @@ class _FailingServicesTransport(_ApiDryRunTransport):
         env: dict[str, str] | None = None,
         timeout_seconds: float = 30.0,
     ) -> RemoteCommandResult:
-        if "polar serve_rollout" in command:
+        if "python3 -m openevo.rollout.server" in command:
             self.commands.append(command)
             return RemoteCommandResult(
                 command=command,
@@ -3332,7 +3362,7 @@ class _BlockingRunTransport(_ApiDryRunTransport):
         env: dict[str, str] | None = None,
         timeout_seconds: float = 30.0,
     ) -> RemoteCommandResult:
-        if command.startswith('PATH="$HOME/.local/bin:$PATH" openevo run '):
+        if command.startswith('PATH="$HOME/.local/bin:$PATH" openevo-backend run '):
             self.commands.append(command)
             self.run_started.set()
             if not self.run_release.wait(timeout=5):
@@ -3360,7 +3390,7 @@ class _BlockingServicesTransport(_ApiDryRunTransport):
         env: dict[str, str] | None = None,
         timeout_seconds: float = 30.0,
     ) -> RemoteCommandResult:
-        if "polar serve_rollout" in command and not self.service_started.is_set():
+        if "python3 -m openevo.rollout.server" in command and not self.service_started.is_set():
             self.commands.append(command)
             self.service_started.set()
             if not self.service_release.wait(timeout=5):
@@ -3389,7 +3419,7 @@ class _BlockingSecondServicesTransport(_ApiDryRunTransport):
         env: dict[str, str] | None = None,
         timeout_seconds: float = 30.0,
     ) -> RemoteCommandResult:
-        if "polar serve_rollout" in command:
+        if "python3 -m openevo.rollout.server" in command:
             self.commands.append(command)
             self.run_calls.append((command, cwd, timeout_seconds))
             self.rollout_start_count += 1

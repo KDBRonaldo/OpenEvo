@@ -8,7 +8,7 @@ from fastapi.testclient import TestClient
 from pydantic import ValidationError
 import pytest
 
-from polar_evolution.models import (
+from openevo.evolution.models import (
     FeedbackApplicationCreateRequest,
     FeedbackApplicationResponse,
     FeedbackApplicationTargetType,
@@ -27,8 +27,8 @@ from polar_evolution.models import (
     ReviewStatus,
     ReviewType,
 )
-from polar_evolution.server import create_app
-from polar_evolution.store import EvolutionStore
+from openevo.evolution.server import create_app
+from openevo.evolution.store import EvolutionStore
 
 
 def _create_submitted_review(

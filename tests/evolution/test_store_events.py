@@ -7,9 +7,9 @@ import sqlite3
 
 import pytest
 
-from polar_evolution.files import ArtifactFileStore
-from polar_evolution.models import EventIngestRequest
-from polar_evolution.store import EvolutionStore
+from openevo.evolution.files import ArtifactFileStore
+from openevo.evolution.models import EventIngestRequest
+from openevo.evolution.store import EvolutionStore
 
 
 def test_store_initializes_schema(tmp_path):

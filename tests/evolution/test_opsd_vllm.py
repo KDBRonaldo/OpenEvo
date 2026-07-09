@@ -5,7 +5,7 @@ import json
 import httpx
 import pytest
 
-from polar_evolution.opsd_vllm import VllmOpsdClient
+from openevo.evolution.opsd_vllm import VllmOpsdClient
 
 
 def test_vllm_score_token_ids_requests_full_prompt_logits() -> None:

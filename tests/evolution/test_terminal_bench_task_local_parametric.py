@@ -3,8 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from polar_evolution.cli import main
-from polar_evolution.terminal_bench_task_local_parametric import (
+from openevo.evolution.cli import main
+from openevo.evolution.terminal_bench_task_local_parametric import (
     LocalSuccessReplayTrial,
     TaskLocalSelection,
     TrajectoryPoolRow,

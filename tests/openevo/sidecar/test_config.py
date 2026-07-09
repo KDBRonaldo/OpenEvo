@@ -6,7 +6,7 @@ from pydantic import ValidationError
 import pytest
 import yaml
 
-from openevo.sidecar.config import (
+from desktop.sidecar.config import (
     DesktopProjectConfigDraft,
     build_desktop_project_configs,
     list_desktop_project_configs,

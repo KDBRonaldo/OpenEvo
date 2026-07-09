@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from openevo.remote.bootstrap import (
+from openevo.deployment.bootstrap import (
     RemoteBootstrapPlan,
     RemoteBootstrapReport,
     RemoteBootstrapStep,
@@ -13,13 +13,13 @@ from openevo.remote.bootstrap import (
     ensure_remote_openevo_cli_step,
     execute_remote_bootstrap_plan,
 )
-from openevo.remote.preflight import (
+from openevo.deployment.preflight import (
     PreflightCheck,
     PreflightReport,
     RemoteCommandResult,
 )
-from openevo.science import ScienceProjectConfig
-from openevo.sidecar import RemoteProfileConfig, build_sidecar_science_plan
+from openevo.projects.science import ScienceProjectConfig
+from openevo.deployment import RemoteProfileConfig, build_sidecar_science_plan
 
 
 class RecordingTransport:
@@ -66,13 +66,13 @@ class RecordingTransport:
                 return_code=0,
                 stdout=f"{self.openevo_version}\n",
             )
-        if "openevo --version" in command:
+        if "openevo-backend --version" in command:
             return RemoteCommandResult(
                 command=command,
                 return_code=0,
                 stdout=f"openevo {self.openevo_version}\n",
             )
-        if "openevo --help" in command:
+        if "openevo-backend --help" in command:
             return RemoteCommandResult(command=command, return_code=0, stdout="help")
         return RemoteCommandResult(command=command, return_code=0, stdout="ok")
 
@@ -210,9 +210,9 @@ class LeakySuccessfulVersionProbeTransport(RecordingTransport):
             )
         if "importlib.metadata" in command and "version('openevo')" in command:
             return RemoteCommandResult(command=command, return_code=0, stdout="0.1.0\n")
-        if "openevo --version" in command:
+        if "openevo-backend --version" in command:
             return RemoteCommandResult(command=command, return_code=0, stdout="openevo 0.1.0\n")
-        if "openevo --help" in command:
+        if "openevo-backend --help" in command:
             return RemoteCommandResult(command=command, return_code=0, stdout="help")
         return RemoteCommandResult(command=command, return_code=0, stdout="ok")
 
@@ -229,7 +229,7 @@ class MissingCliEntrypointTransport(RecordingTransport):
         self.commands.append((command, cwd, env, timeout_seconds))
         if "importlib.metadata" in command and "version('openevo')" in command:
             return RemoteCommandResult(command=command, return_code=0, stdout="0.1.0\n")
-        if "openevo --version" in command:
+        if "openevo-backend --version" in command:
             return RemoteCommandResult(
                 command=command,
                 return_code=127,
@@ -250,7 +250,7 @@ class StaleCliEntrypointTransport(RecordingTransport):
         self.commands.append((command, cwd, env, timeout_seconds))
         if "importlib.metadata" in command and "version('openevo')" in command:
             return RemoteCommandResult(command=command, return_code=0, stdout="0.1.0\n")
-        if "openevo --version" in command:
+        if "openevo-backend --version" in command:
             return RemoteCommandResult(command=command, return_code=0, stdout="openevo 0.2.0\n")
         return RemoteCommandResult(command=command, return_code=0, stdout="ok")
 
@@ -644,8 +644,8 @@ def test_execute_remote_bootstrap_plan_runs_steps_and_reports_ready() -> None:
         for command in commands
         if "importlib.metadata" in command and "print(version('openevo'))" in command
     )
-    cli_version_probe = 'PATH="$HOME/.local/bin:$PATH" openevo --version'
-    cli_help_probe = 'PATH="$HOME/.local/bin:$PATH" openevo --help'
+    cli_version_probe = 'PATH="$HOME/.local/bin:$PATH" openevo-backend --version'
+    cli_help_probe = 'PATH="$HOME/.local/bin:$PATH" openevo-backend --help'
     assert commands == [
         plan.steps[0].command,
         plan.steps[1].command,
@@ -915,7 +915,7 @@ def test_execute_remote_bootstrap_plan_fails_when_cli_entrypoint_missing() -> No
     ensure_execution = next(step for step in report.steps if step.id == "ensure_openevo_cli")
     assert ensure_execution.status == RemoteBootstrapStepStatus.FAIL
     assert ensure_execution.message == (
-        "Remote OpenEvo CLI must be executable and report 0.1.0; found unknown."
+        "Remote OpenEvo Backend launcher must be executable and report 0.1.0; found unknown."
     )
     assert "command not found" in ensure_execution.stderr
 
@@ -936,7 +936,7 @@ def test_execute_remote_bootstrap_plan_fails_when_cli_entrypoint_is_stale() -> N
     ensure_execution = next(step for step in report.steps if step.id == "ensure_openevo_cli")
     assert ensure_execution.status == RemoteBootstrapStepStatus.FAIL
     assert ensure_execution.message == (
-        "Remote OpenEvo CLI must be executable and report 0.1.0; found 0.2.0."
+        "Remote OpenEvo Backend launcher must be executable and report 0.1.0; found 0.2.0."
     )
 
 

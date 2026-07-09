@@ -12,13 +12,13 @@ remote daemon, manage Docker Compose, manage vLLM, or perform Desktop UI
 orchestration. Remote dependency installation is limited to the bootstrap
 layer's user-site Python package checks.
 
-## CLI Contract
+## Transport Contract
 
-`openevo sidecar execute` now supports explicit transport selection:
+Desktop chooses between dry-run and SSH transports through the sidecar API. The
+transport contract is covered by focused tests:
 
 ```bash
-openevo sidecar execute science.yaml --remote-profile remote.yaml --transport dry-run --json
-openevo sidecar execute science.yaml --remote-profile remote.yaml --transport ssh --json
+PYTHONPATH=src:. python -m pytest tests/openevo/remote/test_ssh_transport.py -q
 ```
 
 `dry-run` remains the default. It never opens network connections and is useful
@@ -157,6 +157,6 @@ Focused validation:
 ```bash
 PYTHONPATH=src /home/ziyi/ProRL-Agent-Server/.venv/bin/python -m pytest tests/openevo/test_cli.py tests/openevo/sidecar tests/openevo/remote tests/openevo/science tests/evolution/test_models.py -q
 PYTHONPATH=src /home/ziyi/ProRL-Agent-Server/.venv/bin/python -m pytest tests/openevo/science tests/evolution/test_models.py --collect-only -q >/tmp/openevo-ssh-transport-collect.txt
-/home/ziyi/ProRL-Agent-Server/.venv/bin/ruff check src/openevo/remote src/openevo/cli.py tests/openevo/remote tests/openevo/test_cli.py
+/home/ziyi/ProRL-Agent-Server/.venv/bin/ruff check src/openevo/deployment src/openevo/backend/launcher.py tests/openevo/remote tests/openevo/test_cli.py
 git diff --check openevo/stable...HEAD
 ```

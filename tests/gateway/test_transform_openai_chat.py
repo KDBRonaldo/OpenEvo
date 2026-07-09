@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from polar.gateway.transform.openai_chat import OpenAIChatTransformer
+from openevo.gateway.transform.openai_chat import OpenAIChatTransformer
 
 IMAGE_URL = "data:image/png;base64,abc123"
 

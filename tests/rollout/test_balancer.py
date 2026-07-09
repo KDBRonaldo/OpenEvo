@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-from polar.rollout.balancer import NodeScheduler
-from polar.rollout.models import NodeRegistrationRequest, NodeStageMetrics
+from openevo.rollout.balancer import NodeScheduler
+from openevo.rollout.models import NodeRegistrationRequest, NodeStageMetrics
 
 
 def _register(

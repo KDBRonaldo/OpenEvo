@@ -4,8 +4,8 @@ from pathlib import Path
 
 import pytest
 
-from openevo.science import ScienceProjectConfig, compile_science_project
-from openevo.sidecar import (
+from openevo.projects.science import ScienceProjectConfig, compile_science_project
+from desktop.sidecar import (
     RemoteProfileConfig,
     plan_workspace_preparation,
 )

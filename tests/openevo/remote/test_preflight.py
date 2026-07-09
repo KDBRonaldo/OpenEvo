@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 import pytest
 
-from openevo.remote import (
+from openevo.deployment import (
     PreflightCheck,
     PreflightReport,
     RemoteCommandResult,

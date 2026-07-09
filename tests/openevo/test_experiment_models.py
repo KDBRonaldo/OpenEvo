@@ -6,7 +6,10 @@ import pytest
 import yaml
 from pydantic import ValidationError
 
-from openevo.experiment.models import ExperimentConfig, load_experiment_config
+from openevo import experiments
+
+ExperimentConfig = experiments.ExperimentConfig
+load_experiment_config = experiments.load_experiment_config
 
 
 def _write_yaml(path: Path, payload: dict) -> Path:

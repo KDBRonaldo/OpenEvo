@@ -8,14 +8,14 @@ import sqlite3
 
 import pytest
 
-import polar_evolution.store as store_module
-from polar_evolution.models import (
+import openevo.evolution.store as store_module
+from openevo.evolution.models import (
     ArtifactRegisterRequest,
     ArtifactState,
     ArtifactType,
     ContextResolveRequest,
 )
-from polar_evolution.store import EvolutionStore
+from openevo.evolution.store import EvolutionStore
 
 
 def test_register_artifact_persists_manifest(tmp_path):
