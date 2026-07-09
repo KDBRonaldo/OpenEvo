@@ -2284,3 +2284,41 @@ During paired eval, enable only `parametric_memory`; keep `text_memory`,
 `skill_bundle`, and `agent_system` disabled. Set
 `EVOLAB_TB_UV_CACHE_TARBALL` and `EVOLAB_TB_UV_PYTHON_TARBALL`, and do not pass
 `--verifier-python-install-mirror` for this host's cached verifier path.
+
+2026-07-09 training result:
+
+- Run root:
+  `/tmp/tb21-local-success-replay-trainfasttext-20260709/train-replay-r8-s260`.
+- Dataset manifest:
+  `/tmp/tb21-local-success-replay-trainfasttext-20260709/train-replay-r8-s260/dataset/manifest.json`.
+- Dataset builder: `terminal_bench_local_success_replay`.
+- Record count: 16 full-trace records from the successful one-shot local Qwen
+  treatment trial.
+- Adapter:
+  `/tmp/tb21-local-success-replay-trainfasttext-20260709/train-replay-r8-s260/artifacts/workers/job-tb-parametric-memory-train-fasttext-replay-r8-s260/parametric_memory_lora_sft/adapter`.
+- Trainer diagnostics: `Qwen/Qwen3.5-9B`, GPU7, LoRA `r=8`, `alpha=16`,
+  `max_length=4096`, 260 steps, final logged loss `4.0529634134145454e-05`.
+
+2026-07-09 paired eval evidence:
+
+- Eval root:
+  `/tmp/tb21-local-success-replay-trainfasttext-20260709/eval-replay-r8-s260-pass2-cacheenv-oldparams`.
+- Baseline Harbor job completed 1/1 with reward `0.0`:
+  `baseline/harbor_jobs/baseline-train-fasttext/result.json`.
+- Treatment loaded adapter
+  `tb-parametric-memory-train-fasttext-replay-r8-s260` on GPU7, but the
+  outer eval exited before writing the top-level `summary.json`.
+- The treatment Harbor job did not finish; its job result remained
+  `n_running_trials=1`, `n_completed_trials=0`, and `finished_at=null`.
+- Treatment trajectory made five tool calls. It first tried `/workspace`, then
+  tried the Debian `fasttext` CLI directly on parquet data, then entered
+  `apt-get install -y python3-pip && pip3 install fasttext`.
+- The fifth `tb_exec` returned status `error` after `1258.3s` with no output
+  artifact, and no `/app/model.bin` artifact was produced.
+
+This replay adapter is therefore not a valid performance gain result. It proves
+that the replay dataset/trainer/artifact path works, but this paired eval has
+baseline `0.0` and no completed treatment score. The previous single-task
+one-shot adapter remains the only observed `train-fasttext` parametric-memory
+positive result in this log, and it should still be treated as task-specific
+overfitting until repeated across more Terminal Bench 2.1 tasks.
