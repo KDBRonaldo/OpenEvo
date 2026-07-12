@@ -18,21 +18,33 @@ PLAN = (
 RELEASE_SMOKE_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "openevo-release-smoke.yml"
 
 
-def _bash_blocks(text: str) -> str:
-    return "\n".join(re.findall(r"```bash\n(.*?)\n```", text, flags=re.DOTALL))
-
-
-def test_plan_uses_phase_branch_pr_workflow() -> None:
+def test_plan_uses_focused_branch_and_pr_workflow() -> None:
     text = PLAN.read_text(encoding="utf-8")
-    bash = _bash_blocks(text)
-    assert "git push openevo " + "stable" not in bash
-    assert "git push -u openevo HEAD" in bash
-    pr_commands = re.findall(
-        r'gh pr create --base stable --head "\$\(git branch --show-current\)"',
-        bash,
+
+    assert "#131" in text
+    assert "Base branch: `stable`" in text
+    assert "focused branches" in text
+    assert "ivowang <ziyiwang@ieee.org>" in text
+    assert "gpt-5.6-sol" in text
+
+
+def test_plan_covers_productization_workstreams_and_release_gates() -> None:
+    text = PLAN.read_text(encoding="utf-8")
+    required_markers = (
+        "A. Algorithm Protection And Benchmark Boundary",
+        "B. Core Backend Convergence",
+        "C. Desktop Product Maturity",
+        "D. Repository, Docs, And Release Engineering",
+        "E. Release Candidate Validation",
+        "textual-memory 12/21 performance gate",
+        "trajectory-to-skill 14/25 performance gate",
+        "agent-system 17/25 performance gate",
+        "clean Core install",
+        "packaged DMG",
+        "Immediate Execution Order",
     )
-    assert len(pr_commands) >= 9
-    assert "Part of #121" in bash
+    missing = [marker for marker in required_markers if marker not in text]
+    assert missing == []
 
 
 def test_plan_does_not_commit_known_failing_tests() -> None:
@@ -137,6 +149,8 @@ def test_current_product_surface_uses_openevo_runtime_identity() -> None:
             if marker in raw_path:
                 matches.append((raw_path, marker))
         path = REPO_ROOT / raw_path
+        if not path.exists():
+            continue
         if path.suffix not in {
             ".md",
             ".py",

@@ -39,9 +39,12 @@ harness 只要能提供稳定 transcript，都应能接入 pure-text evolution�
 
 ## 目录结构
 
-- `src/openevo/`: OpenEvo Core Backend package、Desktop/Science config、deployment
-  lifecycle、backend API 和 developer automation helpers。
+- `src/openevo/`: OpenEvo Core Backend package、Core-owned science/project config
+  consumed by Desktop、deployment lifecycle、backend API 和 developer automation
+  helpers。
 - `desktop/`: OpenEvo Desktop 的 React/Vite/Tauri 前端、native host、sidecar 和打包资源。
+- `benchmarks/`: standalone benchmark automation packages。Benchmark-specific code
+  must live outside `src/openevo` and `desktop` and import/call Core capabilities。
 - `src/openevo/harness/`: agent harness contract 和 Codex、Claude Code、OpenHands 等 presets。
 - `src/openevo/gateway/`: gateway server、LLM proxy、runtime lifecycle、completion capture、
   evolution context 注入。

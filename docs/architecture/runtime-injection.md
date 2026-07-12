@@ -1,0 +1,119 @@
+# Runtime Injection
+
+> Target contract: staging exists in Core, while complete release manifests and
+> packaged science/benchmark E2E coverage remain workstream B/E work.
+
+Runtime injection is the Core-owned path that makes promoted evolution
+artifacts available to later agent sessions. It is shared by ordinary science
+runs and benchmark automation; Desktop displays Core-provided artifacts and the
+method-owned promotion decision.
+
+## Text Memory
+
+`text_memory` artifacts are natural-language memory files. Core stages the
+selected memory to:
+
+```text
+/openevo/session/evolution/memory.md
+```
+
+and sets:
+
+```text
+OPENEVO_MEMORY_FILE=/openevo/session/evolution/memory.md
+```
+
+Harnesses may prepend the rendered memory to agent instructions.
+
+## Skill Bundle
+
+`skill_bundle` artifacts are directories containing at least `SKILL.md`. Core
+stages selected skills under:
+
+```text
+/openevo/session/evolution/skills/
+```
+
+and sets:
+
+```text
+OPENEVO_SKILLS_DIR=/openevo/session/evolution/skills
+```
+
+Copy-based harnesses load from that directory. Path-based harnesses must prefer
+the evolution skill path over static skill paths when both exist.
+
+## Agent-System Staging Paths
+
+`agent_system` artifacts contain evolved harness instructions. Core writes the
+canonical file:
+
+```text
+/openevo/session/evolution/agent_system.md
+```
+
+It may also write a safe relative target such as `AGENTS.md`, `CLAUDE.md`,
+`GEMINI.md`, or `.openhands/microagents/*.md` into the runtime workdir.
+
+## Env Vars
+
+Core sets:
+
+```text
+OPENEVO_AGENT_SYSTEM_FILE=/openevo/session/evolution/agent_system.md
+OPENEVO_AGENT_SYSTEM_TARGET=<target-path>
+OPENEVO_AGENT_SYSTEM_TARGETS=<json-or-delimited-target-list>
+```
+
+The target path must be validated before writing into the runtime workdir.
+
+## Injection Manifest
+
+Each release gate must produce a runtime injection manifest that records:
+
+- selected artifact IDs and types;
+- source URIs and payload hashes;
+- staged runtime paths;
+- environment variables;
+- harness arguments or instruction targets;
+- pre-task probe result;
+- compatibility match evidence.
+
+The public release manifest may aggregate per-task manifests, but it must avoid
+raw secrets, private paths, and hidden benchmark answers.
+
+## Context Resolver Boundary
+
+The evolution method owns candidate evaluation, best-result selection, and
+promotion. Context resolution filters for promoted, compatible artifacts and
+validates explicit artifact IDs selected by the method/run. It must not rerank
+unpromoted method candidates or replace a method-selected promoted artifact.
+
+Generic fallback ordering for old artifacts is an implementation detail of
+`src/openevo/evolution/context.py`; productization does not redefine it. Release
+science and benchmark paths pass the method-selected promoted artifact ID
+explicitly. Changing fallback ranking requires a separate issue, regression
+tests, and algorithm-impact review.
+
+Core rejects artifacts incompatible with the task, harness, model, execution
+mode, or base model. It also validates payload and lineage references so a run
+does not silently inject an unrelated or stale artifact. Injection evidence
+records the selected IDs, rejected incompatible IDs, staged paths, and payload
+integrity.
+
+## Benchmark/Science Consumers
+
+Benchmark/science consumers share the same Core runtime injection contract.
+
+### Benchmark Consumers
+
+Benchmark automation calls Core APIs and consumes the same runtime injection
+contract as science runs. Benchmark-specific adapters and scorers live outside
+Core and Desktop.
+
+### Science Consumers
+
+OpenEvo Desktop lets ordinary users inspect promoted text memory, skill bundle,
+and agent-system artifacts plus method-owned selection evidence. It requests a
+follow-up run with the promoted artifact IDs; Core performs the final
+compatibility check and staging.

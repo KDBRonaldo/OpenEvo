@@ -8,8 +8,10 @@ follow-up per-task evolution experiments.
 
 ## Source Run
 
-- Baseline:
-  `/tmp/tb21-full-codex-gpt55-subscription-cache-20260624-085451/jobs/tb21-full-codex-gpt55-subscription-cache`
+- Baseline local run label:
+  `tb21-full-codex-gpt55-subscription-cache-20260624-085451`
+- Evidence status:
+  `historical_local_path_redacted_non_release_evidence`
 - Started: `2026-06-24T08:54:51.924148`
 - Finished: `2026-06-24T17:11:45.734819`
 - Total trials: 89

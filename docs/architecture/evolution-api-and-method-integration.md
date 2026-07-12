@@ -2,8 +2,9 @@
 
 本文说明当前 skill/memory/agent-system/parametric-memory evolution 的 API contract，
 以及如何把新的 SOTA 方法或 research 方法接入 OpenEvo Core evolution backend。
-开发者、benchmark adapter 和测试工作流边界见
-[OpenEvo Core Developer Workflows](core-developer-workflows.md)。
+本文只描述 Core evolution contract。Source-checkout developer、benchmark
+automation 和历史维护入口属于 maintainer material，不在 release-facing reading order
+中展开。
 
 ## 总体数据流
 
@@ -46,54 +47,15 @@ Evolution 方法读取 dataset 或 session event 时，需要先判断 trajector
 反思材料或 memory mining 输入；需要 token-level metric 的 RL 方法必须过滤掉
 `token_level_metrics_available=false` 的 traces，或要求任务使用 Core proxy capture。
 
-### 外部 harness 的离线 transcript 输入
+### 外部 harness 的 transcript 输入
 
-不由 Core gateway 直接启动的 harness 也可以进入 pure-text evolution path。以
-Terminal Bench + Harbor/EvoLab 为例，官方 verifier 仍负责执行和打分，离线 bridge 只把
-trial/job 目录中的非 oracle 产物转换成 Core events：
+不由 Core gateway 直接启动的 harness 也可以进入 pure-text evolution path，只要调用方把
+稳定 transcript 转换成 Core events、datasets 和 jobs。Release-facing Core contract 只要求
+这些输入遵守 event/dataset/job/artifact 边界；具体 benchmark 或 source-checkout
+automation 入口不属于 Core 或 Desktop 产品面。
 
-```sh
-uv run python -m openevo.evolution.cli terminal-bench-events \
-  --input /tmp/evolab-tb21-run/<job-or-trial-dir> \
-  --output /tmp/tb21-events.jsonl
-```
-
-本地实验可以跳过 HTTP backend，直接写 SQLite store 并生成 dataset artifact：
-
-```sh
-uv run python -m openevo.evolution.cli terminal-bench-dataset \
-  --input /tmp/evolab-tb21-run/<job-or-trial-dir> \
-  --db /tmp/openevo-tb21/evolution.db \
-  --artifact-root /tmp/openevo-tb21/artifacts \
-  --name tb21_round0 \
-  --purpose agent_system_reflection \
-  --policy-version tb21-round0
-```
-
-如果下一步就是 agent-system evolution，可以直接生成 audited reflector job：
-
-```sh
-uv run python -m openevo.evolution.cli terminal-bench-agent-system-job \
-  --input /tmp/evolab-tb21-run/<job-or-trial-dir> \
-  --db /tmp/openevo-tb21/evolution.db \
-  --artifact-root /tmp/openevo-tb21/artifacts \
-  --dataset-name tb21_round0 \
-  --policy-version tb21-round0 \
-  --reflector-provider codex_cli \
-  --reflector-model gpt-5.4 \
-  --codex-home /path/to/codex-home
-```
-
-该命令会复用同一个 offline bridge ingest events，创建 dataset artifact，然后创建
-`agent_system_reflector` job。为了避免本地 DB 中不同轮次的 completed events 被混入，
-`--input` 模式必须显式传 `--policy-version`。也可以跳过 ingest、直接传一个或多个已有
-`--dataset-artifact-id`；当输入 dataset artifact 超过一个时，`--method auto` 会创建
-`agent_system_history_reflector` job。显式 `--method agent_system_reflector`、
-`--method agent_system_history_reflector` 或 `--method agent_system_pareto_reflector`
-可覆盖这个选择。
-
-转换后的 event 使用 `event_type="openevo.session_completed"`，其 trajectory 由
-`terminal_bench_transcript_bridge` 构造，metadata 必须包含：
+转换后的 event 使用 `event_type="openevo.session_completed"`。Importer 或外部
+automation 可以使用自己的 transcript parser，但写入 Core 的 trajectory metadata 必须包含：
 
 ```json
 {
@@ -102,16 +64,10 @@ uv run python -m openevo.evolution.cli terminal-bench-agent-system-job \
 }
 ```
 
-bridge 可以读取 agent instruction、stdout/stderr、EvoLab 生成的
-`terminal_bench_report.md`、verifier reward、CTRF summary 和 verifier stdout 摘要。它
-不能读取或写入 oracle solution、reference patch，也不能把 `config.agent.env` 中的 API key
-等敏感值带入 event payload。Terminal Bench agent-system job 默认只从结构化 protected
-metadata（例如 `leakage_basis` / `forbidden_literals`、article title/id、source
-file/sheet/row、sequence）派生 `agent_system_audit.forbidden_literals`；公开 task id、
-trial name、task instruction、task path 和 verifier failed-test 摘要会作为可学习上下文保留，
-不会自动加入 forbidden list。额外 protected literal 可通过 `--audit-forbidden-literal` 传入。
-后续 orchestrator 仍可把这些 JSONL events ingest 到 Evolution Backend，再按普通
-`POST /v1/jobs` 路径创建自定义 job。
+外部 transcript 输入不能包含 oracle answer、reference patch、secret、provider token 或
+其他受保护材料。调用方应把可学习上下文和受保护 metadata 分离，并在 artifact lineage 或
+job config 中记录来源、policy/version、redaction evidence 和兼容性信息。后续仍按普通
+`POST /v1/events`、`POST /v1/datasets` 和 `POST /v1/jobs` 路径进入 Evolution Backend。
 
 ## 核心 API
 
@@ -140,6 +96,12 @@ trial name、task instruction、task path 和 verifier failed-test 摘要会作�
 二者同名，例如 `job_type=agent_system, method=agent_system`。专用 research worker 可以用
 自己的 capability 策略，只要 claim 到 job 后返回合法 artifact 即可。
 
+## Method Registry
+
+OpenEvo Core exposes method registry metadata as a contract, not as Desktop-local
+configuration. UI and automation must discover release-supported methods through
+Core capability metadata derived from the same registry used by workers.
+
 ## OpenEvo Core capability metadata
 
 Desktop 和 developer workflow utilities 不应硬编码 method table。内置 evolution method 的可发现信息由
@@ -156,7 +118,9 @@ Desktop 和 developer workflow utilities 不应硬编码 method table。内置 e
 
 - `codex_subscription_transcript`：订阅认证 harness + transcript capture 的 pure-text
   evolution 模式。它不代表 token-level proxy capture，也不提供 logprob/loss-mask 指标。
-- `self-deployed`：自部署模型服务、Core proxy 或兼容基础设施的执行模式。
+- `self_deployed_reference`：External Beta 的 Self-Deployed Reference mode
+  execution token，用于自部署模型服务、Core proxy 或兼容基础设施的执行模式。
+  历史 spelling `self-deployed` 只允许出现在迁移说明或负向 fixture 中。
 
 当前 artifact targets 是：
 
@@ -171,16 +135,19 @@ Method metadata contract：
 
 ```json
 {
-  "method_id": "text_memory_reflector",
-  "display_name": "Text Memory Reflector",
-  "description": "Reflect over task trajectories to synthesize reusable text memory.",
+  "method_id": "text_memory_expel_reflector",
+  "display_name": "Text Memory EXPEL Reflector",
+  "description": "Mine transcript trajectories into reusable text memory.",
   "artifact_type": "text_memory",
   "visibility": "ordinary_user",
   "visible_in_desktop": true,
+  "release_supported": true,
+  "default_enabled": true,
+  "release_baseline_id": "terminal_bench_textual_memory_baseline_failed_v1",
   "input_requirements": ["dataset"],
   "supported_execution_modes": [
     "codex_subscription_transcript",
-    "self-deployed"
+    "self_deployed_reference"
   ],
   "default_config": {},
   "config_schema": {"type": "object", "additionalProperties": true},
@@ -190,10 +157,15 @@ Method metadata contract：
 
 `visibility` 的取值为：
 
-- `ordinary_user`：可面向普通用户展示；Desktop 只应展示同时满足
-  `visible_in_desktop=true` 的方法。
+- `ordinary_user`：可面向普通用户展示；External Beta Desktop 只能展示来自
+  Core `/capabilities`、同时满足 `visible_in_desktop=true`、`release_supported=true`、
+  `default_enabled=true`、execution-mode compatible、并且属于当前 release-supported
+  method ID allowlist 的方法。
 - `dev_kit`：开发者、研究和调试工作流可发现；Desktop 默认隐藏。
 - `internal`：内部 plumbing 或暂不面向产品 surface 的方法。
+
+`dev_kit` 是历史 metadata 值，含义是 source-checkout developer、benchmark 或 maintainer
+workflow 可发现；它不定义也不暗示一个单独对外发布的开发者产品面。
 
 `input_requirements` 描述 method 运行前需要调用方准备的输入类别，例如 dataset reflector
 方法声明 `["dataset"]`，adapter 注册类 parametric method 声明 `["adapter"]`，纯 config/manual
@@ -201,28 +173,27 @@ Method metadata contract：
 例如 agent-system 产物默认写入 `{"target_path": "AGENTS.md"}`。`config_schema` 描述可编辑
 config 的 JSON schema，当前内置 baseline 至少提供 object schema，后续可逐步收紧。
 
-普通用户可见的非参数化 reflector 方法必须同时支持
-`codex_subscription_transcript` 和 `self-deployed`，这样 Desktop 可以在订阅 transcript
-模式和自部署模式之间复用同一组 memory/skill/agent-system evolution 选项。实验方法、
-history/pareto/GEPA 变体和 parametric-memory 方法保持开发者工作流可发现，但默认不进入
-Desktop method picker。
+External Beta 普通用户可见的非参数化方法必须由 Core `/capabilities` 标记
+`release_supported=true` 和 `default_enabled=true`，并且只能包含当前 release gate 验证的
+三类方法：`text_memory_expel_reflector`、`skill_bundle_reflector` 和
+`agent_system_gepa_reflector`。它们必须同时支持 `codex_subscription_transcript` 和
+`self_deployed_reference`，这样 Desktop 可以在订阅 transcript 模式和
+Self-Deployed Reference mode 之间复用同一组 memory/skill/agent-system evolution 选项。
+未通过 release gate 的 legacy aliases、
+history/pareto 变体和 parametric-memory 方法可以继续作为 source-checkout maintainer
+workflow 可发现项，但不能作为 release-supported/default-enabled Desktop method，也不能由
+Desktop 维护本地 registry 替代 Core capabilities。
 
 开发者工具可以检查 broader method set，包括 `ordinary_user`、`dev_kit` 和内部调试方法。
 但这些工具仍然消费同一份 `METHOD_REGISTRY` / `METHOD_METADATA` / Core capabilities
 contract，不能维护第二套 method registry。
 
-## Benchmark Adapter Contract
+## Artifact Contract
 
-Benchmark adapter 属于 Core developer workflows，而不是 Desktop。Adapter 的职责是把外部 benchmark
-task、transcript、score、artifact 和 protected metadata 转换为 OpenEvo Core 可消费的
-records、datasets、metrics、jobs、artifacts 和 context inputs。
-
-Benchmark adapter 必须复用 Core dataset/job/artifact/context contract，不能实现独立的
-evolution backend、method registry、artifact type system、context resolver 或 promotion
-路径。如果 benchmark 需要新算法，应按上面的 method metadata lifecycle 接入
-`METHOD_REGISTRY` 和 `METHOD_METADATA`；如果需要新输出形态，优先使用 typed Core artifact
-和 manifest 表达。更多开发者工作流边界见
-[OpenEvo Core Developer Workflows](core-developer-workflows.md)。
+Artifacts are the only durable outputs of evolution methods. Core stores typed
+artifact metadata, provenance, compatibility, scores, and promotion state so
+runtime injection and release gates can validate method outputs without knowing
+algorithm internals.
 
 ## Artifact Register Contract
 
@@ -251,7 +222,15 @@ Worker complete 和 direct artifact registration 都使用同一类 artifact pay
 - `uri`：artifact 内容位置。当前 runtime staging 主要支持 `file://`。
 - `manifest`：artifact-specific metadata，例如 adapter ID 或 agent target path。
 - `compatibility`：context resolver 的过滤条件；为空表示全局匹配。
-- `scores`：resolver 排序依据，目前优先使用 `quality`，其次 `heldout_reward_delta`。
+- `scores`：可由算法记录评估信息。候选生成、评估、最佳结果选择和 promotion 属于 method
+  的受保护逻辑；Core context resolver 不得用一套新排序替换 method 的 promoted 结果。
+  Release run 应显式携带 method-selected promoted artifact ID，再由 resolver 做
+  compatibility 和 payload/lineage 校验。Generic fallback ordering 是当前
+  `src/openevo/evolution/context.py` 的实现细节，修改它需要独立 issue、回归测试和
+  algorithm-impact review。
+- stale artifact guard：Context resolve 验证 selected artifact 的 payload hash、source
+  dataset / producing job lineage 和 compatibility，避免把无关或陈旧 artifact 注入后续
+  session；productization 不通过重新排列 unpromoted candidates 来解决 stale selection。
 - `promoted`：只有 promoted 且 active/experimental 的 artifacts 会进入 context resolve。
 - `manifest.promotion_support`：启用 runner/backend promotion gate 时，算法应写入
   `trajectory_findings`、`proposed_changes`、`expected_benefits`、`risks` 和
@@ -599,41 +578,11 @@ settings 或 metadata 标记 subscription auth 时跳过 `parametric_memory` art
 - `job.config.trainer.timeout_seconds` 默认 600 秒；
 - `job.config.training_projection` 默认 `{"type": "full_trace"}`；也可以设为
   `{"type": "response_tail", "response_tail_chars": N}`，在保留 prompt messages 的同时只把
-  assistant response 尾部导出到 SFT JSONL，用于避免长工具输出 transcript 掩盖最终成功动作；
-  对 Codex-style Terminal Bench JSONL transcript，也可以设为
-  `{"type": "terminal_bench_final_actions", "max_events": N, "max_output_chars": M}`，
-  只导出最后 N 个 completed command/message events，并限制单个 command output 片段长度；
-  local Qwen/vLLM tool-use 训练可以设为
-  `{"type": "terminal_bench_tool_call_policy", "max_commands": N}`，导出带
-  `assistant.tool_calls` 和 top-level `tools` 的 SFT records，使 Qwen chat template 渲染出
-  vLLM `qwen3_xml` parser 期望的 `<tool_call>` XML；
-  对 local failed rollout 的纠偏训练可以设为
-  `{"type": "terminal_bench_corrective_tool_call_policy", "target_tool_call": {...}}`。
-  该 projection 使用 opt-in 保存到 trace metadata 的 compact `llm_calls`，从真实
-  `system/user/tool...` prefix 导出监督 next tool-call。它可以消费 failed/zero-reward
-  records，并可用 `input_contains` 过滤 prefix；长 prefix 可用 `max_input_tool_messages`
-  保留最近 N 条 tool result，以避免 LoRA trainer 在长上下文上 OOM。Terminal Bench bridge
-  写入的 tool message 可能在 compact stdout 后追加 `Tool result payload` 原始 JSON，
-  如果这导致训练 prefix 与 runtime `llm_calls` prefix 不一致，可设置
-  `strip_input_tool_result_payload=true` 剥离该追加段，并用
-  `max_input_tool_content_chars=N` 对每条 tool-result input content 做字符级上限裁剪。
-  剥离和裁剪发生在 `input_contains` 过滤前，因此过滤词应匹配最终导出的 prefix。
-  这一路径用于修正本地
-  推理策略，不改变默认 successful-only SFT 导出；也可以设置 `stages` 列表，把多个
-  corrective 目标放在同一 projection 中。每个 stage 支持 `name`、二选一的
-  `target_tool_call` 或 `target_assistant_message`、`input_contains`、`max_examples`、
-  `repeat`、`max_input_tool_messages`、`strip_input_tool_result_payload`、
-  `max_input_tool_content_chars` 和 `synthetic_tool_results`，worker 会按 stage 独立扫描
-  saved `llm_calls`，并给导出的 JSONL metadata 标记 stage 和 repeat index。
-  `synthetic_tool_results` 只追加到导出的 SFT prefix 中，用于补齐真实 rollout 没有到达的
-  finish-boundary context，例如 synthetic `tb_run_tests` result 后监督
-  `tb_collect_result`。
-  `target_assistant_message` 会导出不带 `tool_calls` 的普通 assistant message，用于训练
-  `tb_collect_result` 之后的 finish/stop 行为；`password-recovery` short-target 本地
-  smoke 可以使用
-  `{"type": "terminal_bench_password_recovery_shorttarget_recipe", "target_command": "..."}`
-  展开成同样的 staged corrective projection。该 recipe 只改变训练 JSONL 投影配置，
-  不新增 trainer、artifact 或 serving backend；
+  assistant response 尾部导出到 SFT JSONL，用于避免长工具输出 transcript 掩盖最终成功动作。
+  其他 benchmark-specific 或 harness-specific projection 必须作为 release-excluded
+  maintainer automation 实现，不能成为 Core/Desktop public contract。进入 Core 的结果仍必须是
+  普通 dataset、job config 和 artifact lineage，并且必须显式记录 projection policy、输入来源、
+  redaction evidence、compatibility 和是否允许消费 failed/zero-reward records；
 - trainer 执行前会清理旧 adapter 目录；
 - 默认 `adapter_format=lora` 时，adapter 目录必须包含 `adapter_config.json`。
 
@@ -647,89 +596,24 @@ records，trainer 必须把 record-level `tools` 传给 `tokenizer.apply_chat_te
 assistant `tool_calls` 空文本消息，并把 trace-level `tools` 写入 SFT JSONL 行，供这类
 trainer 复用。
 
-Task-local Terminal Bench parametric-memory jobs can also be prepared directly
-from a trajectory pool with
-`terminal-bench-task-local-parametric-memory-job`。这一路径要求同一 task 至少有一个失败
-trajectory 和一个成功 trajectory，读取成功 trial 的 `agent/codex.txt` command event，生成
-standalone dataset manifest、`records.jsonl` 和 `parametric_memory_lora_sft`
-`WorkerClaimedJob` JSON。它不写 EvolutionStore；只有显式 `--run-worker` 时才调用本地
-reference method。若多个成功命令匹配过滤条件，builder 会优先选择写入型命令，而不是后续
-存在性检查或 size check。默认 `--target-mode final` 只监督这个选中的成功命令；
-`--target-mode sequence` 会先选定同一个最终目标，再把成功轨迹中到该目标为止的命令拆成
-progressive next-command SFT records，并用 synthetic `tb_exec` tool-result messages 表示
-前序命令状态；若 sequence 长度超过 `--max-records-per-task`，截断会保留靠近最终目标的
-suffix，确保最终目标仍被训练。该模式适合 final write 依赖依赖安装、数据准备或中间文件的
-Terminal Bench recipe。可选 `--target-exec-timeout-seconds` 会把 runtime-compatible
-`timeout_seconds` 写入每个监督 `tb_exec` target，并让导出的 `tb_exec` tool schema 暴露同一
-可选 integer 字段，用于约束本地 tool-call 模型避免生成 malformed optional arguments。该路径
-用于本地/proxy inference 的 parametric-memory ablation，不适用于 Codex subscription
-serving。
-当 `--prompt-style live_replay` 读取 Harbor/EvoLab `llm_calls.jsonl` 时，tool message 应优先使用
-`metadata.tool_result.content` 中的完整工具结果；外层 `content` 可能是给日志展示用的截断文本，
-不能作为 SFT prefix 的唯一来源，否则会丢失 `/app/out.txt` 这类关键任务约束。
-`--include-run-tests-correction` 可在 `--prompt-style live_replay` 和默认
-`--target-mode final` 下额外导出 post-verifier correction record：如果失败本地轨迹中有失败的
-`tb_run_tests` 工具结果，builder 会保留真实的 run-tests 之后 prefix，包括
-`candidate_artifacts` 中 `/app/out.txt present=false` 这类反馈，并继续把成功轨迹中选中的
-`tb_exec` 写入命令作为 target。该开关用于训练“看到 verifier 反馈后修正输出路径/产物”的
-局部记忆，不替代 sequence recipe。
-`--include-collect-result-correction` 用于同一 `live_replay` + final-target 路径，但触发点是
-失败轨迹已经通过 `tb_collect_result` 收集到失败 verifier 结果之后。builder 会保留 collect
-之后的真实 prefix，包括嵌套的失败 `tb_run_tests` result 和 missing artifact feedback，并继续
-监督同一个成功 `tb_exec` target；该开关用于训练“collect_result 明确失败后继续修复”，避免模型
-过早写 report 或停止。
-`--include-tb-exec-failure-correction` 也用于 `live_replay` + final-target 路径，但触发点是
-失败本地轨迹中已经出现失败的 `tb_exec` 工具结果。builder 会保留真实 prefix 到该失败命令输出，
-记录 `target_correction_stage="tb_exec_failure"`、失败工具名、失败工具所在 input-message
-index、可用 exit code，以及 `syntax`、`traceback`、`fasttext`、`parquet`、`model_bin`、
-`timeout` 这类归一化失败标记，并继续监督选中的成功 `tb_exec` target。该开关用于训练
-“看到具体 shell/Python/package/model 失败后继续修复”的局部 parametric memory；它当前不改变
-sequence 对齐逻辑，也不尝试自动匹配每一个失败命令到逐步恢复命令。
-
-本地 vLLM eval 提供 serving-time adapter 兼容层：对通过 vLLM
-`--language-model-only` 服务的 Qwen3.5/Qwen3.6 PEFT LoRA，可在
-`terminal-bench-local-parametric-memory-eval` 中使用
-`--adapter-key-rewrite qwen3_5_vllm_language_model`。该选项复制原始 adapter 到
-`run_root/prepared_adapters/...`，把 `base_model.model.model.layers.*` safetensors key
-改写为 vLLM language-model-only wrapper 期望的
-`base_model.model.model.language_model.layers.*`，并在 summary 中记录 source adapter path、
-serving adapter path、rewrite 名称和改写 key 数。它不改变 evolution artifact 的原始 URI。
-旧的 `qwen3_5_moe_vllm_language_model` 名称仍作为兼容 alias 接受。
-
-本地 parametric-memory eval 还会把 solver output budget 作为 serving contract 记录并传给
-Harbor/EvoLab agent。`requested_max_output_tokens` 是 CLI 请求值，实际
-`EVOLAB_TB_MAX_OUTPUT_TOKENS` 和 summary `max_output_tokens` 会被
-`context_reserve_tokens` clamp；默认 `context_window_tokens=16384`、
-`context_reserve_tokens=1536`，并且 managed vLLM server 使用同一个
-`context_window_tokens` 作为 `--max-model-len`。这样可以避免长 Terminal Bench tool-use
-transcript 在后续 turn 中让 `input_tokens + max_output_tokens` 超过 serving window。
-需要打开 Terminal-Bench/EvoLab 包级 direct-solver 行为开关时，使用
-`terminal-bench-local-parametric-memory-eval --agent-env KEY=VALUE`。该接口只允许
-`EVOLAB_TB_*` key，并拒绝覆盖 OpenEvo 控制的模型、模式和 token-budget 环境变量；summary
-中记录 redacted `agent_env`。例如 stop-after-success 这类 guard 可以通过包级
-`EVOLAB_TB_REQUIRE_SUCCESSFUL_COLLECT=1` 和
-`EVOLAB_TB_DIRECT_SOLVER_COMPLETION_GUARD=successful_collect` 打开；solve-focused adapter
-实验也可以用包级
-`EVOLAB_TB_DIRECT_SOLVER_COMPLETION_GUARD=successful_auto_tested_exec` 在成功 `tb_exec` 后
-自动运行固定测试，并只在测试通过时让 `tb_exec` 满足 runtime completion guard；如果任务没有
-可见测试入口，应通过同一 `--agent-env` 机制显式提供任务可见的
-`EVOLAB_TB_TEST_COMMAND`。具体 guard
-语义由安装的 Terminal-Bench/EvoLab package 实现，不属于 evolution artifact contract。
-对输出文件路径敏感的 local parametric-memory 实验，应优先使用一等 CLI 参数而不是手写
-`--agent-env`：`--artifact-path-guard {off,audit,repair}` 和重复的
-`--required-artifact-path /app/...`。默认 `off` 保持旧行为；`audit`/`repair` 会在 Harbor
-agent 环境中设置 `EVOLAB_TB_ARTIFACT_PATH_GUARD` 和 JSON 编码的
-`EVOLAB_TB_REQUIRED_ARTIFACT_PATHS`，并在 dry-run/live summary 中记录。该变量只定义本地
-eval 的实验控制面；实际 audit/repair 行为仍由安装的 Terminal-Bench/EvoLab package 提供。
-当显式传入 `--terminal-bench-package-root` 时，本地 parametric-memory eval 会把该目录的
-`src` 和 package root prepend 到 Harbor 子进程的 `PYTHONPATH`，并使用同一 package root
-下的 Terminal-Bench Docker compose override 文件。这样 worktree 中的 EvoLab runtime
-guard、task package 和 Harbor compose 配置会作为一个一致版本生效，而不是只改变 Harbor
-命令的 working directory。
+Benchmark-specific task-local builders, local evaluation adapters, serving-time adapter
+rewrite helpers, and package-specific guard flags are maintainer automation outside
+Core/Desktop. They may call Core APIs and reference worker methods, but the release-facing
+Core contract only observes standard dataset artifacts, `WorkerClaimedJob` JSON,
+registered `parametric_memory` artifacts, compatibility metadata, and runtime injection
+evidence. Such automation must not be documented as a Core Backend command, Desktop
+feature, or ordinary-user workflow.
 
 Reference worker 只定义训练编排和 artifact contract；具体 LoRA trainer、serving backend
 的 adapter 加载方式，以及长训练过程中的续约/heartbeat 扩展，应由本地 inference/training
 infrastructure 提供。
+
+## Context Resolver
+
+The context resolver is the Core-owned selection boundary between stored
+artifacts and the next harness session. It filters compatibility, ranks promoted
+artifacts deterministically, and returns the exact payloads that gateway runtime
+injection stages.
 
 ## Context Resolve Contract
 
@@ -796,7 +680,7 @@ Gateway 在 run 前调用：
 }
 ```
 
-## 接入新算法
+## Adding Methods / 接入新算法
 
 ### 方式一：扩展内置 method registry
 
@@ -846,18 +730,29 @@ METHOD_REGISTRY["my_memory_method"] = my_memory_method
 
 这种方式不需要修改 backend DB schema。新算法通过 typed artifact 与 Core 通信。
 
-### 方式三：直接注册 artifact
+### 方式三：外部 artifact 注册 contract
 
-适合人工 curated memory、离线训练好的 adapter，或已有 skill bundle：
+适合经过维护者审核的 curated memory、离线训练好的 adapter，或已有 skill bundle。Release-facing
+文档只定义 Core API payload contract；它不把手写 shell/curl 调用作为普通用户或 Desktop
+路径。Desktop 通过 Core Backend 和受控 automation 提交这些 payload。
 
-```sh
-curl -X POST http://127.0.0.1:8200/v1/artifacts \
-  -H 'content-type: application/json' \
-  -d @artifact.json
+```json
+{
+  "type": "skill_bundle",
+  "name": "curated skill bundle",
+  "uri": "file:///immutable/artifacts/skill_bundle",
+  "manifest": {"content_path": "SKILL.md"},
+  "lineage": {"input_artifact_ids": ["art_dataset"]},
+  "compatibility": {"agent_harness": ["codex"]},
+  "scores": {"quality": 0.8},
+  "tags": ["curated"],
+  "promoted": false
+}
 ```
 
-直接注册也会走同样的 validation。例如 `agent_system.manifest.target_path` 会被规范化和
-allowlist 校验。
+外部 artifact 注册也会走同样的 validation。例如
+`agent_system.manifest.target_path` 会被规范化和 allowlist 校验，payload URI、lineage、
+compatibility、scores、tags 和 promotion state 必须满足 Core artifact contract。
 
 ## 新算法输出建议
 

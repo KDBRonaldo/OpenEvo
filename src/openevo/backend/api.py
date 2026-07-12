@@ -120,7 +120,7 @@ def create_backend_app(state_root: str | Path | None = None) -> FastAPI:
             category="internal",
             retryable=False,
             repair_action="openevo_can_reconfigure",
-            details={"errors": exc.errors()},
+            details={"errors": _sanitize_validation_errors(exc.errors())},
         )
         return _error_response(422, error)
 
@@ -828,6 +828,17 @@ def _string_value(value: object, default: str) -> str:
 
 def _int_value(value: object, default: int) -> int:
     return value if isinstance(value, int) and not isinstance(value, bool) else default
+
+
+def _sanitize_validation_errors(errors: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    sanitized: list[dict[str, Any]] = []
+    for error in errors:
+        item = dict(error)
+        ctx = item.get("ctx")
+        if isinstance(ctx, dict):
+            item["ctx"] = {key: str(value) for key, value in ctx.items()}
+        sanitized.append(item)
+    return sanitized
 
 
 def _title_from_type(artifact_type: str) -> str:

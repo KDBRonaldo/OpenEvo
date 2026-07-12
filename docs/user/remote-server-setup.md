@@ -1,13 +1,20 @@
-# Remote Server Setup
+# Remote Server Setup Target
 
-OpenEvo Desktop prepares as much of a fresh remote GPU server as it can from
-user-level permissions.
+> Pre-release target: the complete fresh-server workflow is still under
+> implementation and is not currently a supported user procedure.
 
-Desktop may create `~/.openevo`, install the exact Core Backend bundle into a
-Python environment or user site, configure process-level proxy variables, pull
-managed runtime images, download model snapshots, and start user-owned backend
-services.
+Before Core exists, the Desktop native host/sidecar connects over SSH, prepares
+OpenEvo-owned directories, uploads and verifies the exact Core artifact,
+installs it in a user-level environment, starts Core, and opens the local
+tunnel. After Core is healthy, Core owns doctor/repair, upgrades, services, and
+runs.
 
-Desktop must not modify system packages, Docker daemon configuration, systemd,
-global shell profiles, or SSH private keys. Codex subscription login remains a
-user action on the remote server.
+The supported setup should configure process-level proxy variables, install
+supported user-space dependencies, verify or install Codex CLI, pull managed
+runtime assets, download the pinned self-deployed reference model, and start
+user-owned services.
+
+OpenEvo must not modify system packages, Docker daemon configuration, systemd,
+global shell profiles, drivers, firewall policy, or SSH private keys. It reports
+those requirements as explicit user actions and preserves completed setup work
+for retry.

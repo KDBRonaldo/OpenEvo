@@ -1,3 +1,11 @@
+# Release-incompatible foundation note
+
+This document preserves pre-External-Beta foundation context. It is not External Beta release behavior.
+Direct run commands, dry-run transports,
+developer override env vars, legacy token headers, package-relative Core
+artifacts, and command-based service facades are superseded by
+`docs/maintainer/productization/spec.md`.
+
 # OpenEvo Desktop Sidecar Foundation
 
 Tracked by #39.

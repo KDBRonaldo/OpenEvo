@@ -16,6 +16,26 @@ ISSUE_REFERENCE_RE = re.compile(
     r"\b(?:fixes|closes|resolves|part\s+of)\s+#\d+\b",
     re.IGNORECASE,
 )
+RELEASE_SCOPE_PREFIXES = (
+    ".github/workflows/",
+    "benchmarks/",
+    "desktop/",
+    "docs/architecture/",
+    "docs/core/",
+    "docs/maintainer/productization/",
+    "docs/maintainer/release",
+    "docs/user/",
+    "scripts/ci/",
+    "src/openevo/",
+)
+RELEASE_SCOPE_FILES = {
+    ".github/pull_request_template.md",
+    "AGENTS.md",
+    "README.md",
+    "docs/maintainer/repository-structure.md",
+    "docs/maintainer/testing.md",
+    "pyproject.toml",
+}
 NO_ISSUE_LINE_RE = re.compile(
     r"^\s*(?:[-*]\s+)?(?:\[[ xX]\]\s+)?no\s+issue\s+needed\s*:\s*(?P<text>\S.*)$",
     re.IGNORECASE,
@@ -47,7 +67,14 @@ def read_changed_files(path: Path) -> list[str]:
 
 
 def has_issue_reference(body: str) -> bool:
-    return bool(ISSUE_REFERENCE_RE.search(body) or _has_explained_line(body, NO_ISSUE_LINE_RE))
+    return bool(
+        ISSUE_REFERENCE_RE.search(body)
+        or _has_explained_line(body, NO_ISSUE_LINE_RE)
+    )
+
+
+def has_linked_issue_reference(body: str) -> bool:
+    return bool(ISSUE_REFERENCE_RE.search(body))
 
 
 def has_docs_explanation(body: str) -> bool:
@@ -88,9 +115,25 @@ def needs_docs_change(paths: list[str]) -> bool:
     return any(not is_docs_like(path) for path in paths)
 
 
+def requires_linked_issue(paths: list[str]) -> bool:
+    for path in paths:
+        normalized = path.replace("\\", "/")
+        if normalized in RELEASE_SCOPE_FILES:
+            return True
+        if any(normalized.startswith(prefix) for prefix in RELEASE_SCOPE_PREFIXES):
+            return True
+    return False
+
+
 def find_process_warnings(pr_body: str, changed_files: list[str]) -> list[str]:
     warnings: list[str] = []
-    if not has_issue_reference(pr_body):
+    if requires_linked_issue(changed_files) and not has_linked_issue_reference(pr_body):
+        warnings.append(
+            "Core, Desktop, benchmark, release-facing docs, productization, and "
+            "release automation changes must link an issue; `No issue needed:` "
+            "is not allowed for this scope."
+        )
+    elif not has_issue_reference(pr_body):
         warnings.append(
             "PR body should include Fixes/Closes/Resolves/Part of #<issue>, "
             "or explain `No issue needed:`."

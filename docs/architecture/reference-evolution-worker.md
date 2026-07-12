@@ -4,9 +4,47 @@ Reference worker 是用于本地开发和 smoke testing 的轻量 worker。它�
 method 实现；它的作用是定义稳定的接口和 baseline 行为，让新的 skill/memory
 evolution methods 可以接入 backend。
 
+## Worker Method Boundary
+
+Worker method boundary for External Beta is deliberately narrow: a worker claims
+a typed job, reads declared input artifacts and `job.config`, runs exactly one
+registered method, writes method-owned payload files under the artifact root, and
+returns `ArtifactRegisterRequest` objects. The worker must not alter Core store
+schemas, context resolver ranking, runtime injection policy, or release-gate
+benchmark scoring.
+
+## Inputs
+
+Inputs come from `WorkerClaimedJob.input_artifacts`, dataset manifests, prior
+artifact manifests, and method-specific `job.config`. Release-supported methods
+must treat hidden benchmark answers, verifier-private logs, post-hoc rewards,
+and task-specific oracle hints as forbidden inputs.
+
+## Outputs
+
+Outputs are typed artifacts such as `text_memory`, `skill_bundle`,
+`agent_system`, and `parametric_memory`. Each output needs a URI, manifest,
+lineage, compatibility, scores, tags, and promotion state that downstream Core
+APIs can validate without knowing the algorithm internals.
+
+## Artifact Registration
+
+Artifact registration is store-authored. A method returns registration requests;
+Core records artifact IDs, job lineage, source dataset IDs, compatibility, and
+payload checksums. Release evidence must not rely on direct handwritten artifact
+rows or bypass worker completion for counted artifacts.
+
+## Algorithm Preservation
+
+Algorithm preservation means productization may relocate files, imports, command
+surfaces, and documentation, but must not change the validated method logic,
+prompts, filtering, candidate policy, selection policy, or payload construction
+for textual memory, trajectory-to-skill, or agent-system release gates.
+
 启动一次 one-shot worker：
 
-```sh
+<!-- openevo:maintainer-only-command -->
+```sh {.openevo-maintainer-only}
 uv run python -m openevo.evolution.cli worker \
   --base-url http://127.0.0.1:8200 \
   --worker-id reference-worker \
@@ -535,9 +573,13 @@ Trainer contract:
   `qwen3_xml` tool parser。
 
 Task-local Terminal Bench parametric jobs can be prepared without going through
-the event store:
+the event store. The command below is a legacy source-checkout benchmark
+automation entrypoint. Productization should move Terminal Bench-specific
+automation out of Core; this section documents the worker contract it currently
+uses, not a long-term Core CLI surface:
 
-```sh
+<!-- openevo:maintainer-only-command -->
+```sh {.openevo-maintainer-only}
 OPEN_EVO_REPO=/path/to/OpenEvo
 uv run python -m openevo.evolution.cli terminal-bench-task-local-parametric-memory-job \
   --trajectory-pool /path/to/trajectory_pool.jsonl \
@@ -655,9 +697,13 @@ Serving contract:
 Codex subscription runner 都应拒绝启用 `parametric_memory`，context resolver 也会在
 subscription request 中跳过已存在的 parametric-memory artifact。
 
-## CLI Options
+## Maintainer Worker Options
 
-```text
+These options document the maintainer/source-checkout worker launcher. They are
+not an ordinary-user CLI product surface.
+
+<!-- openevo:maintainer-only-command -->
+```text {.openevo-maintainer-only}
 python -m openevo.evolution.cli worker
   --base-url http://127.0.0.1:8200
   --worker-id reference-worker
@@ -680,7 +726,8 @@ python -m openevo.evolution.cli worker
 
 如果不传 `--capability`，worker 默认使用内置 method names。也可以传逗号分隔的值：
 
-```sh
+<!-- openevo:maintainer-only-command -->
+```sh {.openevo-maintainer-only}
 uv run python -m openevo.evolution.cli worker --capability text_memory,skill_bundle,agent_system,agent_system_reflector,agent_system_history_reflector,agent_system_pareto_reflector,text_memory_expel_reflector,parametric_memory_lora_sft
 ```
 

@@ -12,7 +12,11 @@ import sys
 from email.parser import Parser
 from pathlib import Path
 from zipfile import BadZipFile, ZipFile
-import tomllib
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - older local interpreter support.
+    import tomli as tomllib
 
 EXPECTED_PROJECT_NAME = "openevo"
 EXPECTED_SUMMARY = "OpenEvo Desktop and agent evolution orchestration."
@@ -22,6 +26,7 @@ EXPECTED_CONSOLE_SCRIPTS = {
 REQUIRED_REMOTE_WHEEL_PREFIX = "openevo/wheels/"
 REQUIRED_RELEASE_NOTES = "release-notes.md"
 RELEASE_BINARY_SUFFIXES = (".whl", ".dmg")
+ALLOWED_DMG_TARGETS = {"aarch64", "x64", "universal"}
 FORBIDDEN_CORE_PACKAGE_PREFIXES = (
     "openevo/desktop/",
     "openevo/sidecar/",
@@ -399,8 +404,11 @@ def _allowed_release_artifact(path: Path, *, expected_version: str) -> bool:
 
 
 def _allowed_dmg_name(name: str, *, expected_version: str) -> bool:
-    prefix = f"OpenEvo Desktop_{expected_version}_"
-    return name.startswith(prefix) and name.endswith(".dmg") and len(name) > len(prefix) + 4
+    prefix = f"OpenEvo-Desktop-{expected_version}-"
+    if not (name.startswith(prefix) and name.endswith(".dmg")):
+        return False
+    target = name.removeprefix(prefix).removesuffix(".dmg")
+    return target in ALLOWED_DMG_TARGETS
 
 
 def _is_release_binary(path: Path) -> bool:

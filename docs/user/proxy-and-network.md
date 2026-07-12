@@ -1,15 +1,17 @@
-# Proxy And Network Settings
+# Proxy And Network Target
 
-Remote setup can use:
+> Pre-release target: this configuration is not yet validated in a packaged
+> Desktop release.
 
-- HTTP proxy
-- HTTPS proxy
-- no-proxy host list
-- pip index URL
-- Hugging Face endpoint
-- Hugging Face cache location
+Remote setup needs to support:
 
-These settings are applied to OpenEvo-managed remote commands and services.
-They do not bypass institutional network policy. If a download fails after
-OpenEvo retries, Desktop should report the failing phase and the manual action
-needed.
+- HTTP and HTTPS proxy URLs through secret references;
+- a no-proxy host list;
+- pip index URL;
+- Hugging Face endpoint and cache location;
+- SSH jump/proxy configuration where supported.
+
+Settings apply to OpenEvo-managed remote downloads and services, not only the
+local Desktop process. They do not bypass institutional policy. After retries,
+Desktop must report the failing phase and the remaining user action without
+logging proxy credentials.

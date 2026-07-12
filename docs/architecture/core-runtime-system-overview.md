@@ -175,4 +175,5 @@ transcript capture 负责 evolution 可消费的行为记录。
 - 新 API 请求/响应形态：在 `src/openevo/gateway/transform/` 中添加 transformer。
 - 新 trajectory builder/evaluator：通过现有 registry 注册。
 - 新 skill/memory/agent-system evolution 方法：通过 Evolution Backend method
-  registry 添加，详见 [Reference Evolution Worker](reference-evolution-worker.md)。
+  registry 添加，详见
+  [Evolution API And Method Integration](evolution-api-and-method-integration.md)。

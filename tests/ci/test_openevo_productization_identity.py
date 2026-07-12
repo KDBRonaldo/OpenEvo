@@ -35,6 +35,7 @@ ACTIVE_PREFIXES = (
     "assets/",
     "desktop/",
     "web/",
+    "docs/architecture/",
     ".github/",
     "docs/core/",
     "docs/user/",

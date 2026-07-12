@@ -1,40 +1,82 @@
-# OpenEvo Release Process
+# OpenEvo External Beta Release Process
 
-The release artifacts are:
+Canonical release requirements are defined in
+`docs/maintainer/productization/spec.md`. This guide records the practical
+release procedure. It will evolve with the implementation, but it must never
+weaken the canonical release gates.
 
-- OpenEvo Core Backend wheel: `openevo-<version>-*.whl`
-- OpenEvo Core Backend wheel checksum: `openevo-<version>-*.whl.sha256`
-- OpenEvo Desktop macOS disk image: `OpenEvo Desktop_<version>_<target>.dmg`
-- OpenEvo Desktop disk image checksum: `OpenEvo Desktop_<version>_<target>.dmg.sha256`
-- Release notes: `release-notes.md`
+## Current Status
 
-The wheel is used for remote backend installation and automation. It is not the
-ordinary-user Desktop app. The `.dmg` is the macOS user-facing release artifact.
-The release artifact validator rejects non-OpenEvo wheels, unknown files,
-orphan checksums, and checksums that are not siblings of the artifact they
-describe.
+Automated publishing is disabled while productization work tracked by #131 is
+in progress. Do not publish a GitHub Release, PyPI package, or `v*` tag from the
+current placeholder workflows.
 
-## Required Checks
+PyPI is not part of the unsigned External Beta. The ordinary-user artifact is
+the macOS Desktop DMG; Desktop installs the descriptor-matched Core artifact on
+the remote server.
 
-```bash
-cd desktop
-npm ci
-npm audit --audit-level=high
-npm test -- --run
-npm run build:openevo
-cd ..
-diff -qr desktop/dist desktop/packaging/web
+## Required Outputs
 
-rm -rf .openevo-remote-wheel src/openevo/wheels dist
-python -m build --wheel --outdir .openevo-remote-wheel
-mkdir -p src/openevo/wheels
-cp .openevo-remote-wheel/openevo-*.whl src/openevo/wheels/
-python -m build --wheel
-python scripts/ci/check_openevo_release.py --wheel dist/*.whl
-python scripts/ci/write_sha256.py dist/*.whl
-```
+- OpenEvo Desktop DMG for each declared macOS architecture, or one universal
+  DMG;
+- DMG SHA256 checksum;
+- exact Core install artifact and SHA256 checksum;
+- Core descriptor containing version, compatibility, source commit, artifact
+  name, and checksum;
+- release notes;
+- dependency lock, practical vulnerability, and license results for shipped
+  Python, npm, and Rust dependencies;
+- benchmark summaries for textual memory, trajectory-to-skill, and
+  agent-system gates.
 
-The GitHub release artifact workflow builds the `.dmg` on macOS, smokes the
-packaged sidecar, writes checksums for binary artifacts, and validates the final
-artifact list with `scripts/ci/check_openevo_release.py --artifact`.
-Signing, notarization, and update policy remain separate release operations.
+## Candidate Preparation
+
+1. Select one candidate commit from `stable` after all productization PRs are
+   merged.
+2. Run protected algorithm/source-boundary tests.
+3. Run the three independent Terminal Bench performance gates.
+4. Build and clean-install the Core artifact.
+5. Run Core integration tests for Codex subscription transcript and the
+   self-deployed reference profile.
+6. Build the Desktop app and run source-level tests before packaging.
+7. Build the DMG and rerun the packaged-app lifecycle and science workflow
+   smoke against the exact Core descriptor/artifact.
+8. Run secret-canary, diagnostics redaction, privacy, identity, docs/link, and
+   dependency checks.
+
+Any product or benchmark failure creates a new candidate after the fix.
+Infrastructure-only retries must be recorded and may not be used to select the
+best stochastic result.
+
+## Draft Release Validation
+
+Create a GitHub draft release only after the candidate preparation succeeds.
+Upload the required outputs, download every asset into a clean directory, and
+verify:
+
+- asset names and architectures are expected;
+- SHA256 files match downloaded bytes;
+- the Core descriptor references the uploaded Core artifact;
+- the DMG version and bundled/fetched descriptor match the candidate commit;
+- release notes state unsigned/not-notarized status, supported modes, known
+  limitations, benchmark counts, privacy/security behavior, and
+  install/upgrade/uninstall steps;
+- no unclassified development, secret, benchmark-private, or source-checkout
+  files are present.
+
+Two fresh-context `gpt-5.6-sol` high-effort reviews must approve product/spec
+compliance and release risk before publication.
+
+## Publication
+
+After validation, create the final annotated tag at the candidate commit and
+publish the already-validated draft release without rebuilding assets. Record
+the release URL and final asset checksums in the release issue.
+
+## Rollback
+
+Before publication, close the failed draft and open a corrective issue. After
+publication, mark a broken release clearly, preserve evidence needed to explain
+the failure, and publish a corrected version rather than replacing bytes under
+the same tag. User-facing rollback is manual installation of the most recent
+compatible DMG/Core pair; document any irreversible state migration.

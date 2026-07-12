@@ -85,6 +85,35 @@ def _write_summary_for_artifact(state_root: Path, run_id: str, artifact_id: str)
     )
 
 
+def _run_create_payload(
+    project_id: str,
+    *,
+    execution_mode: str = "codex_subscription_transcript",
+) -> dict:
+    return {
+        "schema_version": "1",
+        "idempotency_key": f"idem-{project_id}-{execution_mode}",
+        "project_id": project_id,
+        "project_snapshot_id": f"snapshot-{project_id}",
+        "workspace_snapshot_ref": f"workspace://{project_id}/snapshot",
+        "task": {
+            "id": "folding-baseline",
+            "objective": "Improve the folding baseline.",
+            "source": {"type": "scratch"},
+        },
+        "execution_mode": execution_mode,
+        "capture_mode": "transcript",
+        "artifact_families": ["text_memory", "skill_bundle", "agent_system"],
+        "method_ids": [
+            "text_memory_expel_reflector",
+            "skill_bundle_reflector",
+            "agent_system_gepa_reflector",
+        ],
+        "runtime": {"kind": "managed_science"},
+        "model": {"name": "gpt-5.1-codex-mini"},
+    }
+
+
 def test_backend_health() -> None:
     client = _client()
     response = client.get("/health")
@@ -145,7 +174,7 @@ def test_backend_project_run_artifact_flow() -> None:
 
     run = client.post(
         "/runs",
-        json={"project_id": project_id, "execution_mode": "codex_subscription_transcript"},
+        json=_run_create_payload(project_id),
     )
     assert run.status_code == 200
     run_id = run.json()["id"]
@@ -379,10 +408,92 @@ def test_backend_accepts_advertised_capability_execution_modes() -> None:
     for mode in modes:
         response = client.post(
             "/runs",
-            json={"project_id": project_id, "execution_mode": mode},
+            json=_run_create_payload(project_id, execution_mode=mode),
         )
         assert response.status_code == 200
         assert response.json()["execution_mode"] == mode
+
+
+def test_backend_run_create_rejects_benchmark_only_fields() -> None:
+    client = _client()
+    project = client.post(
+        "/projects",
+        json={"name": "science demo", "workspace_root": "/srv/openevo/workspaces/demo"},
+    )
+    assert project.status_code == 200
+    project_id = project.json()["id"]
+
+    top_level = _run_create_payload(project_id) | {"benchmark_task_id": "tb-1"}
+    top_level_response = client.post("/runs", json=top_level)
+    assert top_level_response.status_code == 422
+    assert top_level_response.json()["code"] == "request_validation_error"
+
+    nested = _run_create_payload(project_id)
+    nested["task"]["metadata"] = {"benchmark_task_id": "tb-1"}
+    nested_response = client.post("/runs", json=nested)
+    assert nested_response.status_code == 422
+    assert nested_response.json()["code"] == "request_validation_error"
+
+
+def test_backend_run_create_requires_subscription_transcript_capture() -> None:
+    client = _client()
+    project = client.post(
+        "/projects",
+        json={"name": "science demo", "workspace_root": "/srv/openevo/workspaces/demo"},
+    )
+    assert project.status_code == 200
+    project_id = project.json()["id"]
+
+    payload = _run_create_payload(project_id) | {"capture_mode": "proxy"}
+
+    response = client.post("/runs", json=payload)
+
+    assert response.status_code == 422
+    assert response.json()["code"] == "request_validation_error"
+    assert "subscription" in json.dumps(response.json()["details"]["errors"])
+
+
+def test_backend_run_create_rejects_client_token_metric_claim() -> None:
+    client = _client()
+    project = client.post(
+        "/projects",
+        json={"name": "science demo", "workspace_root": "/srv/openevo/workspaces/demo"},
+    )
+    assert project.status_code == 200
+    project_id = project.json()["id"]
+
+    payload = _run_create_payload(project_id) | {
+        "token_level_metrics_available": True,
+    }
+
+    response = client.post("/runs", json=payload)
+
+    assert response.status_code == 422
+    body = response.json()
+    assert body["code"] == "request_validation_error"
+    assert "token_level_metrics_available" in json.dumps(body["details"]["errors"])
+
+
+def test_backend_run_create_requires_external_beta_contract_fields() -> None:
+    client = _client()
+    project = client.post(
+        "/projects",
+        json={"name": "science demo", "workspace_root": "/srv/openevo/workspaces/demo"},
+    )
+    assert project.status_code == 200
+    project_id = project.json()["id"]
+
+    response = client.post(
+        "/runs",
+        json={"project_id": project_id, "execution_mode": "codex_subscription_transcript"},
+    )
+    assert response.status_code == 422
+    body = response.json()
+    assert body["code"] == "request_validation_error"
+    error_text = json.dumps(body["details"]["errors"])
+    assert "schema_version" in error_text
+    assert "task" in error_text
+    assert "method_ids" in error_text
 
 
 def test_backend_typed_error_model() -> None:

@@ -4,7 +4,7 @@ OpenEvo is a product for running and evolving agent systems on real scientific
 workflows. It has two release-facing surfaces:
 
 - **OpenEvo Desktop**: the macOS application used by scientists to configure a
-  remote GPU server, start runs, and inspect memory, skill, and agent-system
+  remote server, start runs, and inspect memory, skill, and agent-system
   evolution.
 - **OpenEvo Core Backend**: the Python runtime installed on the remote server.
   It owns harness execution, runtime sessions, trajectory capture, datasets,
@@ -20,10 +20,10 @@ The ordinary-user flow is:
 ```text
 Install OpenEvo Desktop .dmg
 -> create a science project
--> configure a remote GPU server and optional network proxy
+-> configure a remote server and optional network proxy
 -> run doctor/bootstrap from Desktop
 -> start the remote OpenEvo Core Backend
--> choose Codex subscription transcript mode or self-deployed mode
+-> choose Codex subscription transcript mode or Self-Deployed Reference mode
 -> launch a science run
 -> monitor services, logs, timeline, and evolved artifacts
 ```
@@ -42,9 +42,9 @@ harness on the remote server. It requires transcript capture, does not call
 model APIs directly, and supports non-parametric evolution such as text memory,
 skill bundles, and agent-system instructions.
 
-**Self-deployed mode** uses a remote model-serving path, initially vLLM. It
-supports the same non-parametric evolution path and provides the deployment
-structure for future parameter-oriented work.
+**Self-Deployed Reference mode** uses a remote model-serving path, initially
+vLLM. It supports the same non-parametric evolution path and provides the
+deployment structure for future parameter-oriented work.
 
 In both modes, OpenEvo is a wrapper around an existing harness. OpenEvo captures
 or ingests trajectories/transcripts, evolves typed artifacts, and injects the
@@ -96,22 +96,24 @@ server-side backend launcher:
 ```bash
 openevo-backend --help
 openevo-backend serve --help
-openevo-backend run --help
 ```
 
 `openevo-backend serve` starts the typed backend API used by Desktop through an
 SSH tunnel. `openevo-backend run` is a backend maintenance and automation
 entrypoint for experiment snapshots; it is not the ordinary-user product UI.
 
-Minimal experiment smoke:
+Maintainer-only backend automation smoke:
 
-```bash
+<!-- openevo:maintainer-only-command -->
+```bash {.openevo-maintainer-only}
+openevo-backend run --help
 openevo-backend run examples/science-minimal/experiment.yaml --dry-run --json
 ```
 
 ## Development Setup
 
-```bash
+<!-- openevo:maintainer-only-command -->
+```bash {.openevo-maintainer-only}
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -e .
@@ -120,14 +122,16 @@ pip install pytest pytest-asyncio ruff build twine
 
 Focused Python checks:
 
-```bash
+<!-- openevo:maintainer-only-command -->
+```bash {.openevo-maintainer-only}
 ruff check src tests scripts
 PYTHONPATH=src:. python -m pytest tests/ci tests/openevo tests/evolution -q
 ```
 
 Desktop checks:
 
-```bash
+<!-- openevo:maintainer-only-command -->
+```bash {.openevo-maintainer-only}
 cd desktop
 npm ci
 npm audit --audit-level=high
@@ -141,54 +145,35 @@ cargo metadata --locked --format-version 1
 cargo test --locked
 ```
 
-Release smoke checks build the Core Backend wheel, package the remote-install
-wheel, validate Desktop assets, and build the macOS `.dmg` in GitHub Actions.
-See `docs/architecture/openevo-desktop-release.md` and
-`docs/maintainer/release-process.md`.
+Current release smoke checks are pre-External-Beta maintainer checks. They
+validate Core Backend wheel identity and Desktop asset packaging, but they do
+not publish GitHub Release assets, PyPI artifacts, or a release-ready `.dmg`.
+The External Beta release gates and required Core, DMG, checksum, and
+release-note artifacts are defined in
+`docs/maintainer/productization/spec.md`.
 
-## Release Smoke
+## Pre-External-Beta Release Smoke
 
-The release smoke path runs on Node 22 for Desktop assets and validates the
-installed Core Backend wheel:
+The historical smoke path is maintainer-only and predates the External Beta
+release contract. It is useful for local regression checks, but it is not the
+release process and does not create a releasable DMG, GitHub Release, or PyPI
+artifact.
 
-```bash
-cd desktop
-npm ci
-npm audit --audit-level=high
-npm test -- --run
-npm run build:openevo
-cd ..
-diff -qr desktop/dist desktop/packaging/web
-rm -rf .openevo-remote-wheel src/openevo/wheels dist
-python -m build --wheel --outdir .openevo-remote-wheel
-mkdir -p src/openevo/wheels
-cp .openevo-remote-wheel/openevo-*.whl src/openevo/wheels/
-python -m build --wheel
-python scripts/ci/check_openevo_release.py --wheel dist/*.whl
-python scripts/ci/write_sha256.py dist/*.whl
-python -m venv .openevo-wheel-smoke
-.openevo-wheel-smoke/bin/python -m pip install --upgrade pip
-.openevo-wheel-smoke/bin/python -m pip install dist/*.whl
-.openevo-wheel-smoke/bin/openevo-backend --help
-.openevo-wheel-smoke/bin/openevo-backend serve --help
-.openevo-wheel-smoke/bin/openevo-backend run --help
-PYTHONPATH=. .openevo-wheel-smoke/bin/python scripts/ci/smoke_openevo_desktop_wheel.py
-```
-
-The wheel smoke covers the config-backed Desktop lifecycle through the packaged
-sidecar facade. PyPI trusted publishing uses
-`pypa/gh-action-pypi-publish@release/v1` after a GitHub release is published.
+External Beta release work must use the descriptor-matched Core artifact, the
+exact packaged DMG and checksums, and the release gates in
+`docs/maintainer/productization/spec.md`. PyPI is not part of this release.
 
 ## Examples
 
 - `examples/science-minimal/`: smallest Core Backend experiment config.
 - `examples/science-with-local-folder/`: ordinary science project shape that
   uses a user workspace folder.
-- `examples/self-deployed-model/`: self-deployed model-serving configuration
-  notes.
+- `examples/self-deployed-model/`: Self-Deployed Reference model-serving
+  configuration notes.
 - `examples/backend-automation/`: backend automation examples for maintainers.
-- `examples/research-benchmarks/`: benchmark and training examples for OpenEvo
-  developers and researchers.
+- `examples/research-benchmarks/`: release-excluded research/maintainer-only
+  benchmark and training examples for OpenEvo developers and researchers, not an
+  ordinary-user Desktop quickstart.
 
 Benchmark examples are not Desktop quickstarts. They translate external
 benchmark tasks and results into the same Core records, datasets, metrics, jobs,
@@ -196,10 +181,16 @@ artifacts, and context inputs that Desktop-backed runs use.
 
 ## Documentation
 
-- User guidance: `docs/user/`
+- User guidance: [docs/user/README.md](docs/user/README.md)
 - Core Backend API: `docs/core/backend-api.md`
-- Runtime and evolution contracts: `docs/architecture/`
-- Maintainer release/process docs: `docs/maintainer/`
+- Release-facing architecture index: `docs/architecture/README.md`
+- Security policy: [SECURITY.md](SECURITY.md)
+- Runtime and evolution contracts:
+  `docs/architecture/core-runtime-system-overview.md`,
+  `docs/architecture/evolution-api-and-method-integration.md`,
+  `docs/architecture/evolution-backend.md`,
+  `docs/architecture/evolution-runtime-context.md`,
+  `docs/architecture/runtime-injection.md`
 
 ## Contributing
 

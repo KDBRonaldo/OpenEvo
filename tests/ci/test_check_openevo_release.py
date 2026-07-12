@@ -216,7 +216,7 @@ def test_validates_packaged_remote_install_wheel_metadata(tmp_path: Path) -> Non
 def test_requires_exact_openevo_wheel_artifact(tmp_path: Path) -> None:
     checker = _load_module()
     openevo_wheel = _write_wheel(tmp_path / "openevo-0.1.0-py3-none-any.whl")
-    dmg = tmp_path / "OpenEvo Desktop_0.1.0_aarch64.dmg"
+    dmg = tmp_path / "OpenEvo-Desktop-0.1.0-aarch64.dmg"
     dmg.write_bytes(b"not a real dmg; release list validation only checks presence")
     artifacts = [_write_release_notes(tmp_path)]
 
@@ -239,17 +239,30 @@ def test_requires_exact_openevo_wheel_artifact(tmp_path: Path) -> None:
     ) == []
 
 
+def test_release_dmg_name_uses_canonical_hyphenated_format() -> None:
+    checker = _load_module()
+
+    assert checker._allowed_dmg_name(
+        "OpenEvo-Desktop-0.1.0-aarch64.dmg",
+        expected_version="0.1.0",
+    )
+    assert not checker._allowed_dmg_name(
+        "OpenEvo Desktop_0.1.0_aarch64.dmg",
+        expected_version="0.1.0",
+    )
+
+
 def test_release_artifact_list_rejects_unknown_files_and_non_openevo_wheels(
     tmp_path: Path,
 ) -> None:
     checker = _load_module()
     openevo_wheel = _write_wheel(tmp_path / "openevo-0.1.0-py3-none-any.whl")
     polar_wheel = _write_wheel(tmp_path / "polar-0.1.0-py3-none-any.whl")
-    dmg = tmp_path / "OpenEvo Desktop_0.1.0_aarch64.dmg"
+    dmg = tmp_path / "OpenEvo-Desktop-0.1.0-aarch64.dmg"
     dmg.write_bytes(b"dmg bytes")
     debug_dmg = tmp_path / "debug.dmg"
     debug_dmg.write_bytes(b"debug dmg bytes")
-    mislabeled_dmg = tmp_path / "OpenEvo Desktop_0.1.0-debug.dmg"
+    mislabeled_dmg = tmp_path / "OpenEvo-Desktop-0.1.0-debug.dmg"
     mislabeled_dmg.write_bytes(b"mislabeled dmg bytes")
     unexpected = tmp_path / "debug.log"
     unexpected.write_text("not a release artifact\n", encoding="utf-8")
@@ -276,8 +289,8 @@ def test_release_artifact_list_rejects_unknown_files_and_non_openevo_wheels(
     assert "Unexpected release artifact: polar-0.1.0-py3-none-any.whl.sha256" in errors
     assert "Unexpected release artifact: debug.dmg" in errors
     assert "Unexpected release artifact: debug.dmg.sha256" in errors
-    assert "Unexpected release artifact: OpenEvo Desktop_0.1.0-debug.dmg" in errors
-    assert "Unexpected release artifact: OpenEvo Desktop_0.1.0-debug.dmg.sha256" in errors
+    assert "Unexpected release artifact: OpenEvo-Desktop-0.1.0-debug.dmg" in errors
+    assert "Unexpected release artifact: OpenEvo-Desktop-0.1.0-debug.dmg.sha256" in errors
     assert "Unexpected release artifact: debug.log" in errors
 
 
@@ -285,7 +298,7 @@ def test_release_artifact_list_rejects_multiple_openevo_wheels(tmp_path: Path) -
     checker = _load_module()
     py3_wheel = _write_wheel(tmp_path / "openevo-0.1.0-py3-none-any.whl")
     cp311_wheel = _write_wheel(tmp_path / "openevo-0.1.0-cp311-cp311-macosx_14_0_arm64.whl")
-    dmg = tmp_path / "OpenEvo Desktop_0.1.0_aarch64.dmg"
+    dmg = tmp_path / "OpenEvo-Desktop-0.1.0-aarch64.dmg"
     dmg.write_bytes(b"dmg bytes")
 
     errors = checker.validate_release_artifacts(
@@ -311,8 +324,8 @@ def test_release_artifact_list_rejects_multiple_openevo_wheels(tmp_path: Path) -
 def test_release_artifact_list_rejects_multiple_desktop_dmgs(tmp_path: Path) -> None:
     checker = _load_module()
     wheel = _write_wheel(tmp_path / "openevo-0.1.0-py3-none-any.whl")
-    arm_dmg = tmp_path / "OpenEvo Desktop_0.1.0_aarch64.dmg"
-    x64_dmg = tmp_path / "OpenEvo Desktop_0.1.0_x64.dmg"
+    arm_dmg = tmp_path / "OpenEvo-Desktop-0.1.0-aarch64.dmg"
+    x64_dmg = tmp_path / "OpenEvo-Desktop-0.1.0-x64.dmg"
     arm_dmg.write_bytes(b"arm dmg bytes")
     x64_dmg.write_bytes(b"x64 dmg bytes")
 
@@ -331,7 +344,7 @@ def test_release_artifact_list_rejects_multiple_desktop_dmgs(tmp_path: Path) -> 
 
     assert (
         "Release artifacts must include exactly one OpenEvo Desktop macOS .dmg, "
-        "found: OpenEvo Desktop_0.1.0_aarch64.dmg, OpenEvo Desktop_0.1.0_x64.dmg."
+        "found: OpenEvo-Desktop-0.1.0-aarch64.dmg, OpenEvo-Desktop-0.1.0-x64.dmg."
     ) in errors
 
 
@@ -373,7 +386,7 @@ def test_release_artifact_list_rejects_nonexistent_paths(tmp_path: Path) -> None
 def test_release_artifact_list_requires_checksums_and_release_notes(tmp_path: Path) -> None:
     checker = _load_module()
     openevo_wheel = _write_wheel(tmp_path / "openevo-0.1.0-py3-none-any.whl")
-    dmg = tmp_path / "OpenEvo Desktop_0.1.0_aarch64.dmg"
+    dmg = tmp_path / "OpenEvo-Desktop-0.1.0-aarch64.dmg"
     dmg.write_bytes(b"dmg bytes")
 
     assert checker.validate_release_artifacts(
@@ -383,8 +396,8 @@ def test_release_artifact_list_requires_checksums_and_release_notes(tmp_path: Pa
         "Release artifacts must include release-notes.md.",
         "Release artifact openevo-0.1.0-py3-none-any.whl must have a sibling "
         "openevo-0.1.0-py3-none-any.whl.sha256 checksum.",
-        "Release artifact OpenEvo Desktop_0.1.0_aarch64.dmg must have a sibling "
-        "OpenEvo Desktop_0.1.0_aarch64.dmg.sha256 checksum.",
+        "Release artifact OpenEvo-Desktop-0.1.0-aarch64.dmg must have a sibling "
+        "OpenEvo-Desktop-0.1.0-aarch64.dmg.sha256 checksum.",
     ]
 
     bad_checksum = tmp_path / f"{dmg.name}.sha256"
@@ -424,7 +437,7 @@ def test_release_artifact_checksums_must_be_siblings(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     openevo_wheel.with_name(f"{openevo_wheel.name}.sha256").unlink()
-    dmg = dmg_dir / "OpenEvo Desktop_0.1.0_aarch64.dmg"
+    dmg = dmg_dir / "OpenEvo-Desktop-0.1.0-aarch64.dmg"
     dmg.write_bytes(b"dmg bytes")
 
     errors = checker.validate_release_artifacts(
@@ -603,110 +616,22 @@ def test_release_smoke_workflow_builds_packaged_assets_and_validates_wheel() -> 
     )
 
 
-def test_release_artifact_workflow_builds_validated_wheel_artifact() -> None:
+def test_pre_external_beta_release_artifact_workflow_is_disabled() -> None:
     workflow = Path(".github/workflows/openevo-release-artifact.yml")
 
     text = workflow.read_text(encoding="utf-8")
 
     assert "workflow_dispatch:" in text
-    assert "tags:" in text
-    assert '"v*"' in text
-    assert 'node-version: "22"' in text
-    assert "npm ci" in text
-    assert "npm audit --audit-level=high" in text
-    assert "npm test -- --run" in text
-    assert "npm run build:openevo" in text
-    assert "diff -qr desktop/dist desktop/packaging/web" in text
-    assert "python -m pip install --upgrade pip pytest -e ." in text
-    assert "name: Build remote install wheel" in text
-    assert "python -m build --wheel --outdir .openevo-remote-wheel" in text
-    assert "mkdir -p src/openevo/wheels" in text
-    assert "cp .openevo-remote-wheel/openevo-*.whl src/openevo/wheels/" in text
-    assert "python -m build --wheel" in text
-    assert "scripts/ci/check_openevo_release.py --wheel dist/*.whl" in text
-    assert "python scripts/ci/write_sha256.py dist/*.whl" in text
-    assert ".openevo-wheel-smoke/bin/openevo-backend --help" in text
-    assert ".openevo-wheel-smoke/bin/openevo-backend serve --help" in text
-    assert ".openevo-wheel-smoke/bin/openevo-backend run --help" in text
-    assert (
-        "PYTHONPATH=. .openevo-wheel-smoke/bin/python "
-        "scripts/ci/smoke_openevo_desktop_wheel.py"
-    ) in text
-    assert "actions/upload-artifact@v4" in text
-    assert "dist/*.whl" in text
-    assert "dist/*.whl.sha256" in text
-
-    assert text.index("npm audit --audit-level=high") < text.index(
-        "npm run build:openevo"
-    )
-    assert text.index("name: Build remote install wheel") < text.index(
-        "name: Build wheel"
-    )
-    assert text.index("python -m build --wheel") < text.index(
-        "scripts/ci/check_openevo_release.py --wheel dist/*.whl"
-    )
-    assert text.index("scripts/ci/check_openevo_release.py --wheel dist/*.whl") < (
-        text.index("actions/upload-artifact@v4")
-    )
-
-
-def test_release_artifact_workflow_builds_desktop_dmg_artifact() -> None:
-    workflow = Path(".github/workflows/openevo-release-artifact.yml")
-
-    text = workflow.read_text(encoding="utf-8")
-    desktop_job = text.split("desktop-dmg-artifact:", maxsplit=1)[1].split(
-        "release-notes-artifact:",
-        maxsplit=1,
-    )[0]
-
-    assert "desktop-dmg-artifact:" in text
-    assert "runs-on: macos-latest" in desktop_job
-    assert 'node-version: "22"' in desktop_job
-    assert "actions/setup-python@v5" in desktop_job
-    assert "python-version: \"3.11\"" in desktop_job
-    assert "dtolnay/rust-toolchain@stable" in desktop_job
-    assert "name: Install OpenEvo Desktop sidecar build dependencies" in desktop_job
-    assert "python -m pip install -e . pyinstaller" in desktop_job
-    assert "name: Smoke OpenEvo Desktop app bundle sidecar" in desktop_job
-    assert "python scripts/ci/smoke_openevo_desktop_bundle.py \\" in desktop_job
-    assert "desktop/src-tauri/target/release/bundle/macos" in desktop_job
-    assert "working-directory: desktop" in desktop_job
-    assert "working-directory: desktop/src-tauri" in desktop_job
-    assert "cargo metadata --locked --format-version 1" in desktop_job
-    assert "cargo test --locked" in desktop_job
-    assert "npm ci" in desktop_job
-    assert "npm run build:desktop" in desktop_job
-    assert (
-        "python ../scripts/ci/write_sha256.py "
-        "src-tauri/target/release/bundle/dmg/*.dmg"
-    ) in desktop_job
-    assert "name: openevo-desktop-dmg" in desktop_job
-    assert "desktop/src-tauri/target/release/bundle/dmg/*.dmg" in desktop_job
-    assert "desktop/src-tauri/target/release/bundle/dmg/*.dmg.sha256" in desktop_job
-
-    assert desktop_job.index("runs-on: macos-latest") < desktop_job.index(
-        'node-version: "22"'
-    )
-    assert desktop_job.index('node-version: "22"') < desktop_job.index(
-        "dtolnay/rust-toolchain@stable"
-    )
-    assert desktop_job.index(
-        "Install OpenEvo Desktop sidecar build dependencies"
-    ) < desktop_job.index(
-        "cargo metadata --locked --format-version 1"
-    )
-    assert desktop_job.index(
-        "cargo metadata --locked --format-version 1"
-    ) < desktop_job.index(
-        "npm run build:desktop"
-    )
-    assert desktop_job.index("npm ci") < desktop_job.index("npm run build:desktop")
-    assert desktop_job.index("npm run build:desktop") < desktop_job.index(
-        "Smoke OpenEvo Desktop app bundle sidecar"
-    )
-    assert desktop_job.index(
-        "Smoke OpenEvo Desktop app bundle sidecar"
-    ) < desktop_job.index("openevo-desktop-dmg")
+    assert "pre-external-beta release artifact path disabled" in text
+    assert "build," in text
+    assert "redownload, and verify the exact Core and DMG" in text
+    assert "docs/maintainer/productization/spec.md" in text
+    assert "tags:" not in text
+    assert '"v*"' not in text
+    assert "actions/upload-artifact@v4" not in text
+    assert "python -m build --wheel" not in text
+    assert "npm run build:desktop" not in text
+    assert "desktop-dmg-artifact:" not in text
 
 
 def test_desktop_package_defines_tauri_desktop_scripts_and_cli_dependency() -> None:
@@ -771,67 +696,39 @@ def test_tauri_macos_config_builds_dmg_release_shell() -> None:
     assert "tauri::generate_handler!" in main
 
 
-def test_pypi_publish_workflow_uses_trusted_publishing() -> None:
+def test_pre_external_beta_pypi_publish_workflow_is_disabled() -> None:
     workflow = Path(".github/workflows/openevo-publish-pypi.yml")
 
     text = workflow.read_text(encoding="utf-8")
 
-    assert "release:" in text
-    assert "types: [published]" in text
-    assert "id-token: write" in text
     assert "contents: read" in text
-    assert "environment:" in text
-    assert "name: pypi" in text
-    assert 'node-version: "22"' in text
-    assert "npm audit --audit-level=high" in text
-    assert "npm test -- --run" in text
-    assert "npm run build:openevo" in text
-    assert "diff -qr desktop/dist desktop/packaging/web" in text
-    assert "python -m pip install --upgrade pip pytest twine -e ." in text
-    assert "name: Build remote install wheel" in text
-    assert "python -m build --wheel --outdir .openevo-remote-wheel" in text
-    assert "mkdir -p src/openevo/wheels" in text
-    assert "cp .openevo-remote-wheel/openevo-*.whl src/openevo/wheels/" in text
-    assert "python -m build --wheel" in text
-    assert "scripts/ci/check_openevo_release.py --wheel dist/*.whl" in text
-    assert "python scripts/ci/write_sha256.py dist/*.whl" not in text
-    assert "rm -rf .openevo-publish-checks" in text
-    assert "cp dist/*.whl .openevo-publish-checks/" in text
-    assert (
-        "python scripts/ci/write_sha256.py .openevo-publish-checks/*.whl"
-        in text
-    )
-    assert "twine check --strict dist/*.whl" in text
-    assert ".openevo-wheel-smoke/bin/openevo-backend --help" in text
-    assert ".openevo-wheel-smoke/bin/openevo-backend serve --help" in text
-    assert ".openevo-wheel-smoke/bin/openevo-backend run --help" in text
-    assert (
-        "PYTHONPATH=. .openevo-wheel-smoke/bin/python "
-        "scripts/ci/smoke_openevo_desktop_wheel.py"
-    ) in text
-    assert "pypa/gh-action-pypi-publish@release/v1" in text
+    assert "name: PyPI publishing disabled" in text
+    assert "PyPI is not an External Beta release surface" in text
+    assert "Any future PyPI release requires a separate product" in text
+    assert "completing the External" in text
+    assert "Beta gates must not enable publication here" in text
+    assert "release:" not in text
+    assert "types: [published]" not in text
+    assert "id-token: write" not in text
+    assert "name: pypi" not in text
+    assert "python -m build --wheel" not in text
+    assert "twine check --strict dist/*.whl" not in text
+    assert "pypa/gh-action-pypi-publish@release/v1" not in text
     assert "password:" not in text.casefold()
     assert "api-token" not in text.casefold()
 
-    assert text.index("twine check --strict dist/*.whl") < text.index(
-        "pypa/gh-action-pypi-publish@release/v1"
-    )
 
-
-def test_release_artifact_workflow_uploads_checksums_and_release_notes() -> None:
+def test_disabled_release_artifact_workflow_does_not_upload_checksums_or_notes() -> None:
     workflow = Path(".github/workflows/openevo-release-artifact.yml")
 
     text = workflow.read_text(encoding="utf-8")
 
-    assert "name: Write release notes" in text
-    assert "printf '# OpenEvo %s release artifacts\\n\\n' \"${GITHUB_REF_NAME}\"" in text
-    assert "OpenEvo Core Backend wheel and the OpenEvo Desktop macOS disk image" in text
-    assert "name: openevo-release-notes" in text
-    assert "path: .openevo-release-notes/release-notes.md" in text
-    assert "--artifact \\" in text
-    assert "release-artifacts/openevo-wheel/*" in text
-    assert "release-artifacts/openevo-desktop-dmg/*" in text
-    assert "release-artifacts/openevo-release-notes/release-notes.md" in text
+    assert "pre-External-Beta release artifact workflow is disabled" in text
+    assert "name: Write release notes" not in text
+    assert "actions/upload-artifact@v4" not in text
+    assert "openevo-release-notes" not in text
+    assert "release-artifacts/openevo-wheel/*" not in text
+    assert "release-artifacts/openevo-desktop-dmg/*" not in text
 
 
 def test_desktop_science_release_doc_matches_remote_lifecycle_state() -> None:
@@ -854,24 +751,23 @@ def test_readme_release_checklist_matches_frontend_audit_gate() -> None:
     readme = Path("README.md")
 
     text = readme.read_text(encoding="utf-8")
+    smoke_section = text[text.index("## Pre-External-Beta Release Smoke") :]
 
-    assert "Node 22" in text
     assert "npm ci" in text
     assert "npm audit --audit-level=high" in text
     assert text.index("npm ci") < text.index("npm audit --audit-level=high")
     assert text.index("npm audit --audit-level=high") < text.index(
         "npm test -- --run"
     )
-    assert (
-        "PYTHONPATH=. .openevo-wheel-smoke/bin/python "
-        "scripts/ci/smoke_openevo_desktop_wheel.py"
-    ) in text
-    assert ".openevo-wheel-smoke/bin/openevo-backend run --help" in text
-    assert "config-backed Desktop lifecycle" in text
-    assert "PyPI trusted publishing" in text
-    assert "pypa/gh-action-pypi-publish@release/v1" in text
-    assert "GitHub release" in text
-    assert "does not publish to PyPI yet" not in text
+    assert smoke_section.startswith("## Pre-External-Beta Release Smoke")
+    assert "maintainer-only" in smoke_section
+    assert "GitHub Release" in smoke_section
+    assert "PyPI" in smoke_section
+    assert "docs/maintainer/productization/spec.md" in smoke_section
+    assert "scripts/ci/smoke_openevo_desktop_wheel.py" not in smoke_section
+    assert ".openevo-wheel-smoke/bin/openevo-backend run --help" not in smoke_section
+    assert "PyPI trusted publishing" not in text
+    assert "pypa/gh-action-pypi-publish@release/v1" not in text
 
 
 def _write_wheel(
