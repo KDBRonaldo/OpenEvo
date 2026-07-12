@@ -81,6 +81,15 @@ session/task events -> dataset artifact -> evolution job -> worker method
   -> typed artifacts -> context resolve -> gateway runtime injection
 ```
 
+Project/experiment evolution config 只使用
+`evolution.targets.<target_id> = {enabled, method, config}`。启用的 target 必须显式选择
+method；禁用 target 可以保留 draft method/config。不要重新引入旧的 Science flat
+booleans、experiment 顶层 `artifacts` config 或兼容 wrapper。`agent_system.method=auto`
+只由 Core 根据当前 round 开始前的 prior dataset IDs 解析，job/lineage 必须记录 concrete
+method、requested value 和 resolver 输入。为了让 Desktop 无损保存未知 method config，project
+config integer 只允许 JavaScript safe-integer 范围；integral float 规范成 integer，超出范围的
+integer 应使用 string 表达。
+
 ### `text_memory`
 
 用途：自然语言长期记忆。
@@ -245,9 +254,11 @@ store 或调度分支。`src/openevo/evolution/framework/builtins.py` 是当前�
 identity 和 method descriptor 的权威目录；研究插件必须由维护者提供明确的 distribution
 lock，不能自动发现或自动启用。
 
-A2.2 只实现 catalog 和 verified loader，尚未把 plugin handles 接到 worker dispatch。
-因此当前可执行路径仍限于已有 `METHOD_REGISTRY` built-ins 和现有 external worker protocol；
-`MethodExecutionContext` plugin 从 A2.3 cutover 后才可端到端执行。现在编写的新 plugin 应先做
+A2.2 只实现 catalog 和 verified loader；A2.3 的 project-schema slice 也尚未把 plugin handles
+接到 worker dispatch。因此当前可执行路径仍限于已有 `METHOD_REGISTRY` built-ins 和现有
+external worker protocol；generic project compiler 临时用 `METHOD_METADATA` 只做 built-in
+target-method fail-closed guard。`MethodExecutionContext` plugin 从 A2.3 dispatch cutover 后才可
+端到端执行。现在编写的新 plugin 应先做
 descriptor/loader/direct invocation contract tests，不能在文档或 capability 中声称已经可运行。
 
 1. 明确输入：需要 dataset、旧 artifacts、外部训练产物，还是只需要 `job.config`。
@@ -259,7 +270,7 @@ descriptor/loader/direct invocation contract tests，不能在文档或 capabili
 4. 注册 descriptor：声明稳定 method ID、target、ordered input bindings、output artifact
    types、closed config schema、execution/capture/harness/runtime support、exposure、maturity
    和 locked implementation entry point。不要从旧 `METHOD_METADATA` 反向生成 descriptor。
-5. A2.2 迁移期兼容：需要立即可 dispatch 的内置方法还必须临时同步到
+5. A2 dispatch 迁移期兼容：需要立即可 dispatch 的内置方法还必须临时同步到
    `METHOD_REGISTRY` 和 `METHOD_METADATA`，两表 key 必须一致，并由测试证明 descriptor
    entry point 与 callable 是同一对象。只做未来 plugin/direct test 时不要加入 legacy 表。
    A2.3 切换 dispatch/capabilities、A2.5 删除重复表后不再执行此步。

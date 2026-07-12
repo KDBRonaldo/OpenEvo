@@ -21,6 +21,26 @@ run_experiment = experiments.run_experiment
 
 
 def _config(**overrides: object) -> ExperimentConfig:
+    evolution_targets = overrides.pop("evolution_targets", None)
+    evolution = dict(overrides.pop("evolution", {}))
+    if evolution_targets is not None:
+        default_methods = {
+            "text_memory": "text_memory_reflector",
+            "parametric_memory": "parametric_memory_register",
+            "skill_bundle": "skill_bundle_reflector",
+            "agent_system": "auto",
+        }
+        evolution["targets"] = {
+            target_id: {
+                **selection,
+                **(
+                    {"method": default_methods[target_id]}
+                    if selection.get("enabled") and "method" not in selection
+                    else {}
+                ),
+            }
+            for target_id, selection in evolution_targets.items()
+        }
     payload = {
         "version": 1,
         "experiment": {"name": "biology-components"},
@@ -34,6 +54,8 @@ def _config(**overrides: object) -> ExperimentConfig:
             }
         ],
     }
+    if evolution:
+        payload["evolution"] = evolution
     payload.update(overrides)
     return ExperimentConfig.model_validate(payload)
 
@@ -53,6 +75,37 @@ def test_dry_run_emits_default_evolution_jobs_per_task_round() -> None:
         "text_memory_reflector",
         "skill_bundle_reflector",
         "agent_system_history_reflector",
+    ]
+
+
+def test_dry_run_passes_round_start_prior_dataset_snapshot(monkeypatch) -> None:
+    snapshots: list[list[str]] = []
+    original = openevo_runner.CompiledExperiment.evolution_methods_for_round
+
+    def record_snapshot(
+        compiled,
+        round_index: int,
+        *,
+        prior_dataset_artifact_ids: list[str],
+    ):
+        snapshots.append(list(prior_dataset_artifact_ids))
+        return original(
+            compiled,
+            round_index,
+            prior_dataset_artifact_ids=prior_dataset_artifact_ids,
+        )
+
+    monkeypatch.setattr(
+        openevo_runner.CompiledExperiment,
+        "evolution_methods_for_round",
+        record_snapshot,
+    )
+
+    dry_run_experiment(_config(), rounds_override=2)
+
+    assert snapshots == [
+        [],
+        ["<dataset_artifact:component-extraction-train:round-0>"],
     ]
 
 
@@ -78,17 +131,23 @@ def test_dry_run_shows_multi_round_context_placeholders() -> None:
 def test_dry_run_tracks_parametric_memory_placeholders_when_enabled() -> None:
     plan = dry_run_experiment(
         _config(
-            artifacts={
-                "text_memory": {"enabled": True},
-                "parametric_memory": {
-                    "enabled": True,
-                    "config": {
-                        "adapter_uri": "file:///adapters/parser-memory",
-                        "base_model": "gpt-5.1-codex-mini",
+            evolution={
+                "targets": {
+                    "text_memory": {
+                        "enabled": True,
+                        "method": "text_memory_reflector",
                     },
+                    "parametric_memory": {
+                        "enabled": True,
+                        "method": "parametric_memory_register",
+                        "config": {
+                            "adapter_uri": "file:///adapters/parser-memory",
+                            "base_model": "gpt-5.1-codex-mini",
+                        },
+                    },
+                    "skill_bundle": {"enabled": False},
+                    "agent_system": {"enabled": False},
                 },
-                "skill_bundle": {"enabled": False},
-                "agent_system": {"enabled": False},
             }
         ),
         rounds_override=2,
@@ -520,10 +579,51 @@ def test_live_runner_passes_prior_datasets_to_history_reflector(tmp_path: Path) 
         "agent_system_reflector",
         "agent_system_history_reflector",
     ]
-    assert agent_system_jobs[1]["input_artifact_ids"][:2] == [
+    assert agent_system_jobs[1]["input_artifact_ids"] == [
         "dataset-artifact-2",
         "dataset-artifact-1",
+        "artifact-agent-system",
     ]
+
+
+def test_live_runner_passes_round_start_prior_dataset_snapshot(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    snapshots: list[list[str]] = []
+    original = openevo_runner.CompiledExperiment.evolution_methods_for_round
+
+    def record_snapshot(
+        compiled,
+        round_index: int,
+        *,
+        prior_dataset_artifact_ids: list[str],
+    ):
+        snapshots.append(list(prior_dataset_artifact_ids))
+        return original(
+            compiled,
+            round_index,
+            prior_dataset_artifact_ids=prior_dataset_artifact_ids,
+        )
+
+    monkeypatch.setattr(
+        openevo_runner.CompiledExperiment,
+        "evolution_methods_for_round",
+        record_snapshot,
+    )
+
+    run_experiment(
+        _config(),
+        rounds_override=2,
+        output_dir=tmp_path / "run",
+        rollout_client=FakeRolloutClient(),
+        evolution_client=FakeEvolutionClient(),
+        worker_runner=FakeWorkerRunner(),
+        poll_interval_seconds=0.0,
+        max_poll_attempts=1,
+    )
+
+    assert snapshots == [[], ["dataset-artifact-1"]]
 
 
 def test_live_runner_rollouts_use_only_latest_evolved_artifacts(
@@ -566,17 +666,23 @@ def test_live_runner_tracks_latest_parametric_memory_artifacts(tmp_path: Path) -
 
     result = run_experiment(
         _config(
-            artifacts={
-                "text_memory": {"enabled": True},
-                "parametric_memory": {
-                    "enabled": True,
-                    "config": {
-                        "adapter_uri": "file:///adapters/parser-memory",
-                        "base_model": "gpt-5.1-codex-mini",
+            evolution={
+                "targets": {
+                    "text_memory": {
+                        "enabled": True,
+                        "method": "text_memory_reflector",
                     },
+                    "parametric_memory": {
+                        "enabled": True,
+                        "method": "parametric_memory_register",
+                        "config": {
+                            "adapter_uri": "file:///adapters/parser-memory",
+                            "base_model": "gpt-5.1-codex-mini",
+                        },
+                    },
+                    "skill_bundle": {"enabled": False},
+                    "agent_system": {"enabled": False},
                 },
-                "skill_bundle": {"enabled": False},
-                "agent_system": {"enabled": False},
             }
         ),
         rounds_override=2,
@@ -709,7 +815,7 @@ def test_llm_promotion_gate_rejects_artifact_without_promoting_it(
 
     result = run_experiment(
         _config(
-            artifacts={
+            evolution_targets={
                 "text_memory": {"enabled": True},
                 "skill_bundle": {"enabled": False},
                 "agent_system": {"enabled": False},
@@ -771,7 +877,7 @@ def test_promotion_gate_demotes_worker_promoted_artifact_when_rejected(
 
     result = run_experiment(
         _config(
-            artifacts={
+            evolution_targets={
                 "text_memory": {"enabled": True},
                 "skill_bundle": {"enabled": False},
                 "agent_system": {"enabled": False},
@@ -809,7 +915,7 @@ def test_promotion_gate_rejects_artifacts_missing_algorithm_support(
 
     result = run_experiment(
         _config(
-            artifacts={
+            evolution_targets={
                 "text_memory": {"enabled": True},
                 "skill_bundle": {"enabled": False},
                 "agent_system": {"enabled": False},
@@ -861,7 +967,7 @@ def test_llm_promotion_gate_promotes_approved_artifacts(tmp_path: Path) -> None:
 
     result = run_experiment(
         _config(
-            artifacts={
+            evolution_targets={
                 "text_memory": {"enabled": True},
                 "skill_bundle": {"enabled": False},
                 "agent_system": {"enabled": False},
@@ -939,7 +1045,7 @@ def test_llm_promotion_gate_review_packet_includes_artifact_content(
 
     run_experiment(
         _config(
-            artifacts={
+            evolution_targets={
                 "text_memory": {"enabled": True},
                 "skill_bundle": {"enabled": False},
                 "agent_system": {"enabled": False},
@@ -1015,7 +1121,7 @@ def test_llm_promotion_gate_redacts_credential_bearing_artifact_uris(
 
     run_experiment(
         _config(
-            artifacts={
+            evolution_targets={
                 "text_memory": {"enabled": True},
                 "skill_bundle": {"enabled": False},
                 "agent_system": {"enabled": False},
@@ -1090,7 +1196,7 @@ def test_llm_promotion_gate_redacts_nested_manifest_artifact_uris(
 
     run_experiment(
         _config(
-            artifacts={
+            evolution_targets={
                 "text_memory": {"enabled": True},
                 "skill_bundle": {"enabled": False},
                 "agent_system": {"enabled": False},
@@ -1255,7 +1361,7 @@ def test_promotion_gate_packet_does_not_expose_local_artifact_paths(
 
     run_experiment(
         _config(
-            artifacts={
+            evolution_targets={
                 "text_memory": {"enabled": True},
                 "skill_bundle": {"enabled": False},
                 "agent_system": {"enabled": False},
@@ -1320,7 +1426,7 @@ def test_llm_promotion_gate_redacts_relative_artifact_uri_queries(
 
     run_experiment(
         _config(
-            artifacts={
+            evolution_targets={
                 "text_memory": {"enabled": True},
                 "skill_bundle": {"enabled": False},
                 "agent_system": {"enabled": False},
@@ -1386,7 +1492,7 @@ def test_promotion_gate_does_not_read_artifact_content_outside_artifact_root(
 
     run_experiment(
         _config(
-            artifacts={
+            evolution_targets={
                 "text_memory": {"enabled": True},
                 "skill_bundle": {"enabled": False},
                 "agent_system": {"enabled": False},
@@ -1436,7 +1542,7 @@ def test_llm_promotion_gate_rejects_stringified_false_approval(tmp_path: Path) -
 
     result = run_experiment(
         _config(
-            artifacts={
+            evolution_targets={
                 "text_memory": {"enabled": True},
                 "skill_bundle": {"enabled": False},
                 "agent_system": {"enabled": False},
@@ -1493,7 +1599,7 @@ def test_llm_promotion_gate_rejects_scores_outside_contract(tmp_path: Path) -> N
         evolution.promoted.clear()
         result = run_experiment(
             _config(
-                artifacts={
+                evolution_targets={
                     "text_memory": {"enabled": True},
                     "skill_bundle": {"enabled": False},
                     "agent_system": {"enabled": False},
@@ -1556,7 +1662,7 @@ def test_llm_promotion_gate_rejects_missing_or_invalid_scores_when_threshold_is_
 
         result = run_experiment(
             _config(
-                artifacts={
+                evolution_targets={
                     "text_memory": {"enabled": True},
                     "skill_bundle": {"enabled": False},
                     "agent_system": {"enabled": False},
@@ -1609,7 +1715,7 @@ def test_promotion_gate_rejects_job_without_target_artifacts(tmp_path: Path) -> 
 
     result = run_experiment(
         _config(
-            artifacts={
+            evolution_targets={
                 "text_memory": {"enabled": False},
                 "skill_bundle": {"enabled": False},
                 "agent_system": {"enabled": True},
@@ -1700,7 +1806,7 @@ def test_human_promotion_gate_writes_review_packet_and_waits_for_approval(
 
     result = run_experiment(
         _config(
-            artifacts={
+            evolution_targets={
                 "text_memory": {"enabled": True},
                 "skill_bundle": {"enabled": False},
                 "agent_system": {"enabled": False},
@@ -1782,7 +1888,7 @@ def test_human_promotion_gate_creates_backend_review_request_when_supported(
 
     result = run_experiment(
         _config(
-            artifacts={
+            evolution_targets={
                 "text_memory": {"enabled": True},
                 "skill_bundle": {"enabled": False},
                 "agent_system": {"enabled": False},
@@ -1863,7 +1969,7 @@ def test_human_promotion_gate_embeds_query_decision_in_backend_review(
 
     result = run_experiment(
         _config(
-            artifacts={
+            evolution_targets={
                 "text_memory": {"enabled": True},
                 "skill_bundle": {"enabled": False},
                 "agent_system": {"enabled": False},
@@ -1948,7 +2054,7 @@ def test_human_promotion_gate_keeps_local_review_when_atomic_backend_review_fail
 
     result = run_experiment(
         _config(
-            artifacts={
+            evolution_targets={
                 "text_memory": {"enabled": True},
                 "skill_bundle": {"enabled": False},
                 "agent_system": {"enabled": False},
@@ -2578,7 +2684,7 @@ def test_human_promotion_gate_preserves_pending_review_when_backend_review_creat
 
     result = run_experiment(
         _config(
-            artifacts={
+            evolution_targets={
                 "text_memory": {"enabled": True},
                 "skill_bundle": {"enabled": False},
                 "agent_system": {"enabled": False},
@@ -2666,7 +2772,7 @@ def test_human_promotion_gate_waits_for_decision_and_promotes_artifact(
     try:
         result = run_experiment(
             _config(
-                artifacts={
+                evolution_targets={
                     "text_memory": {"enabled": True},
                     "skill_bundle": {"enabled": False},
                     "agent_system": {"enabled": False},
@@ -3147,7 +3253,7 @@ def test_human_promotion_gate_keeps_malformed_decision_pending_until_rewritten(
     try:
         result = run_experiment(
             _config(
-                artifacts={
+                evolution_targets={
                     "text_memory": {"enabled": True},
                     "skill_bundle": {"enabled": False},
                     "agent_system": {"enabled": False},
@@ -3220,7 +3326,7 @@ def test_human_promotion_gate_rejects_out_of_contract_score(
 
     result = run_experiment(
         _config(
-            artifacts={
+            evolution_targets={
                 "text_memory": {"enabled": True},
                 "skill_bundle": {"enabled": False},
                 "agent_system": {"enabled": False},
@@ -3345,7 +3451,7 @@ def test_human_promotion_gate_writes_all_candidate_packets_before_waiting(
     try:
         result = run_experiment(
             _config(
-                artifacts={
+                evolution_targets={
                     "text_memory": {"enabled": False},
                     "skill_bundle": {"enabled": False},
                     "agent_system": {"enabled": True},
@@ -3528,7 +3634,7 @@ def test_promotion_gate_promotes_approved_candidates_when_others_are_rejected(
 
     result = run_experiment(
         _config(
-            artifacts={
+            evolution_targets={
                 "text_memory": {"enabled": False},
                 "skill_bundle": {"enabled": False},
                 "agent_system": {"enabled": True},

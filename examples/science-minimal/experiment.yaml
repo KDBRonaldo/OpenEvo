@@ -11,6 +11,24 @@ runtime:
   image: my-task-image:latest
 evolution:
   rounds: 3
+  targets:
+    text_memory:
+      enabled: true
+      method: text_memory_reflector
+      config: {}
+    skill_bundle:
+      enabled: true
+      method: skill_bundle_reflector
+      config: {}
+    agent_system:
+      enabled: true
+      method: auto
+      config:
+        target_path: AGENTS.md
+    parametric_memory:
+      enabled: false
+      method: parametric_memory_register
+      config: {}
   # Keep disabled for the smallest local smoke test. Use mode: human or mode: llm
   # to require review before evolved artifacts enter later rollouts.
   promotion_gate:

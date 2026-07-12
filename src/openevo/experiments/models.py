@@ -1,14 +1,26 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Self
 from urllib.parse import urlparse
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
 
+from openevo.evolution.framework import (
+    ProjectEvolutionTargetMap,
+    ProjectEvolutionTargetSelection,
+)
 from openevo.harness.capture import TRANSCRIPT_CAPTURE_MODES, transcript_capture_enabled
+from openevo.projects.evolution_defaults import default_project_evolution_targets
 
 _SUBSCRIPTION_AUTH_MODES = {"subscription", "chatgpt_subscription"}
 _NATIVE_MEMORY_POLICIES = {"preserve", "clear"}
@@ -192,63 +204,28 @@ class EvolutionConfig(_StrictModel):
     rounds: int = Field(default=1, ge=1)
     worker: EvolutionWorkerConfig = Field(default_factory=EvolutionWorkerConfig)
     promotion_gate: PromotionGateConfig = Field(default_factory=PromotionGateConfig)
+    targets: ProjectEvolutionTargetMap = Field(
+        default_factory=default_project_evolution_targets
+    )
 
     @field_validator("backend_url")
     @classmethod
     def _validate_backend_url(cls, value: str) -> str:
         return _normalize_http_url(value, "evolution.backend_url")
 
+    def model_copy(
+        self,
+        *,
+        update: Mapping[str, Any] | None = None,
+        deep: bool = False,
+    ) -> Self:
+        """Return a fully validated evolution config copy."""
 
-class AgentSystemArtifactConfig(_StrictModel):
-    enabled: bool = True
-    method: str = "auto"
-    target_path: str = "AGENTS.md"
-
-    @field_validator("method", "target_path")
-    @classmethod
-    def _strip_required_text(cls, value: str, info) -> str:
-        return _strip_non_empty(value, f"artifacts.agent_system.{info.field_name}")
-
-
-class TextMemoryArtifactConfig(_StrictModel):
-    enabled: bool = True
-    method: str = "text_memory_reflector"
-
-    @field_validator("method")
-    @classmethod
-    def _strip_method(cls, value: str) -> str:
-        return _strip_non_empty(value, "artifacts.text_memory.method")
-
-
-class ParametricMemoryArtifactConfig(_StrictModel):
-    enabled: bool = False
-    method: str = "parametric_memory_register"
-    config: dict[str, Any] = Field(default_factory=dict)
-
-    @field_validator("method")
-    @classmethod
-    def _strip_method(cls, value: str) -> str:
-        return _strip_non_empty(value, "artifacts.parametric_memory.method")
-
-
-class SkillBundleArtifactConfig(_StrictModel):
-    enabled: bool = True
-    method: str = "skill_bundle_reflector"
-
-    @field_validator("method")
-    @classmethod
-    def _strip_method(cls, value: str) -> str:
-        return _strip_non_empty(value, "artifacts.skill_bundle.method")
-
-
-class ArtifactControls(_StrictModel):
-    agent_system: AgentSystemArtifactConfig = Field(default_factory=AgentSystemArtifactConfig)
-    text_memory: TextMemoryArtifactConfig = Field(default_factory=TextMemoryArtifactConfig)
-    parametric_memory: ParametricMemoryArtifactConfig = Field(
-        default_factory=ParametricMemoryArtifactConfig
-    )
-    skill_bundle: SkillBundleArtifactConfig = Field(default_factory=SkillBundleArtifactConfig)
-
+        del deep
+        payload = self.model_dump(mode="python")
+        if update:
+            payload.update(update)
+        return type(self).model_validate(payload)
 
 class TaskConfig(_StrictModel):
     id: str = Field(min_length=1)
@@ -280,7 +257,6 @@ class ExperimentConfig(_StrictModel):
     runtime: RuntimeConfig = Field(default_factory=RuntimeConfig)
     rollout: RolloutConfig = Field(default_factory=RolloutConfig)
     evolution: EvolutionConfig = Field(default_factory=EvolutionConfig)
-    artifacts: ArtifactControls = Field(default_factory=ArtifactControls)
     path: Path | None = None
 
     @model_validator(mode="after")
@@ -289,11 +265,14 @@ class ExperimentConfig(_StrictModel):
         if len(task_ids) != len(set(task_ids)):
             raise ValueError("tasks[].id values must be unique")
         if (
-            self.artifacts.parametric_memory.enabled
+            self.evolution.targets.get(
+                "parametric_memory",
+                ProjectEvolutionTargetSelection(enabled=False),
+            ).enabled
             and self.agent.auth in _SUBSCRIPTION_AUTH_MODES
         ):
             raise ValueError(
-                "artifacts.parametric_memory requires proxy/local inference auth; "
+                "evolution.targets.parametric_memory requires proxy/local inference auth; "
                 "subscription runs can use text_memory but cannot apply parametric adapters"
             )
         if self.runtime.image is None and any(task.workspace for task in self.tasks):

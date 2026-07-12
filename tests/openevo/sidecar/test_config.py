@@ -15,6 +15,30 @@ from desktop.sidecar.config import (
 )
 
 
+EVOLUTION_TARGETS = {
+    "text_memory": {
+        "enabled": True,
+        "method": "text_memory_reflector",
+        "config": {},
+    },
+    "skill_bundle": {
+        "enabled": True,
+        "method": "skill_bundle_reflector",
+        "config": {},
+    },
+    "agent_system": {
+        "enabled": True,
+        "method": "auto",
+        "config": {"target_path": "AGENTS.md"},
+    },
+    "parametric_memory": {
+        "enabled": False,
+        "method": "parametric_memory_register",
+        "config": {},
+    },
+}
+
+
 VALID_DRAFT = {
     "project_name": "Protein Design",
     "task_id": "folding-baseline",
@@ -29,9 +53,7 @@ VALID_DRAFT = {
     "https_proxy": "http://127.0.0.1:7890",
     "huggingface_endpoint": "https://hf-mirror.com",
     "codex_model": "gpt-5.1-codex-mini",
-    "text_memory": True,
-    "skill_bundle": True,
-    "agent_system": True,
+    "evolution": {"targets": EVOLUTION_TARGETS},
 }
 
 
@@ -47,9 +69,9 @@ def test_desktop_project_config_draft_builds_existing_models() -> None:
     assert project.task.source.path == "/datasets/folding-baseline"
     assert project.execution.mode == "codex_subscription_transcript"
     assert project.execution.codex_model == "gpt-5.1-codex-mini"
-    assert project.evolution.text_memory is True
-    assert project.evolution.skill_bundle is True
-    assert project.evolution.agent_system is True
+    assert project.evolution.model_dump(mode="json") == {
+        "targets": EVOLUTION_TARGETS
+    }
     assert profile.id == "science-team"
     assert profile.host == "gpu.example.edu"
     assert profile.port == 22
@@ -172,10 +194,21 @@ def test_save_desktop_project_config_writes_deterministic_yaml(tmp_path: Path) -
     assert science_yaml["remote_profile"] == "science-team"
     assert science_yaml["task"]["source"]["path"] == "/datasets/folding-baseline"
     assert science_yaml["execution"]["mode"] == "codex_subscription_transcript"
+    assert science_yaml["evolution"] == {"targets": EVOLUTION_TARGETS}
+    assert "artifacts" not in science_yaml
     assert remote_yaml["id"] == "science-team"
     assert remote_yaml["proxy"]["https_proxy"] == "http://127.0.0.1:7890"
     assert "path" not in science_yaml
     assert "path" not in remote_yaml
+
+
+def test_desktop_project_config_draft_rejects_removed_target_booleans() -> None:
+    payload = dict(VALID_DRAFT)
+    payload.pop("evolution")
+    payload["text_memory"] = True
+
+    with pytest.raises(ValidationError, match="text_memory"):
+        DesktopProjectConfigDraft.model_validate(payload)
 
 
 def test_save_desktop_project_config_writes_self_deployed_yaml(

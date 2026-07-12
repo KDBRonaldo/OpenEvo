@@ -30,9 +30,7 @@ def _project(**overrides: object) -> ScienceProjectConfig:
 
 
 def test_subscription_project_compiles_to_transcript_experiment_config() -> None:
-    compiled = compile_science_project(
-        _project(evolution={"parametric_memory": False})
-    )
+    compiled = compile_science_project(_project())
 
     assert compiled.experiment.name == "protein-design"
     assert compiled.agent.preset == "codex"
@@ -77,10 +75,8 @@ def test_subscription_project_compiles_to_transcript_experiment_config() -> None
             "execution_mode": "codex_subscription_transcript",
         },
     }
-    assert compiled.artifacts.text_memory.enabled is True
-    assert compiled.artifacts.skill_bundle.enabled is True
-    assert compiled.artifacts.agent_system.enabled is True
-    assert compiled.artifacts.parametric_memory.enabled is False
+    assert compiled.evolution.targets == _project().evolution.targets
+    assert not hasattr(compiled, "artifacts")
 
 
 def test_local_inference_compiles_to_proxy_auth_and_hf_model_metadata_env() -> None:
@@ -106,7 +102,61 @@ def test_local_inference_compiles_to_proxy_auth_and_hf_model_metadata_env() -> N
     assert compiled.tasks[0].metadata["openevo"]["execution_mode"] == (
         "self-deployed"
     )
-    assert compiled.artifacts.parametric_memory.enabled is False
+    assert compiled.evolution.targets["parametric_memory"].enabled is False
+
+
+def test_science_compiler_preserves_generic_targets_without_loss() -> None:
+    project = _project(
+        evolution={
+            "targets": {
+                "future_target": {
+                    "enabled": False,
+                    "method": "future_method",
+                    "config": {"nested": {"values": [1, 2]}},
+                },
+                "agent_system": {
+                    "enabled": True,
+                    "method": "auto",
+                    "config": {"target_path": "CLAUDE.md"},
+                },
+            }
+        }
+    )
+
+    compiled = compile_science_project(project)
+
+    assert compiled.evolution.targets == project.evolution.targets
+    assert compiled.evolution.model_dump(mode="json")["targets"] == (
+        project.evolution.model_dump(mode="json")["targets"]
+    )
+    assert compiled.evolution.rounds == 1
+    assert compiled.evolution.backend_url == "http://127.0.0.1:8200"
+
+
+def test_science_text_target_cannot_smuggle_parametric_method() -> None:
+    experiment = compile_science_project(
+        _project(
+            evolution={
+                "targets": {
+                    "text_memory": {
+                        "enabled": True,
+                        "method": "parametric_memory_register",
+                        "config": {
+                            "adapter_uri": "s3://adapters/parser-memory",
+                            "base_model": "model",
+                        },
+                    }
+                }
+            }
+        )
+    )
+
+    compiled = compile_experiment(experiment)
+    with pytest.raises(ValueError, match="belongs to target 'parametric_memory'"):
+        compiled.evolution_methods_for_round(
+            0,
+            prior_dataset_artifact_ids=[],
+        )
 
 
 def test_self_deployed_science_compile_uses_codex_reflector_llm() -> None:

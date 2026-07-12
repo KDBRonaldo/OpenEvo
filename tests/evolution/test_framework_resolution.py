@@ -29,3 +29,10 @@ def test_agent_system_method_must_be_nonempty(method: str) -> None:
 def test_agent_system_prior_dataset_ids_must_be_nonempty() -> None:
     with pytest.raises(ValueError, match="dataset artifact IDs"):
         resolve_agent_system_method("auto", ("",))
+
+
+def test_agent_system_prior_dataset_ids_reject_bare_string_and_non_strings() -> None:
+    with pytest.raises(TypeError, match="sequence of strings"):
+        resolve_agent_system_method("auto", "dataset-round-0")
+    with pytest.raises(TypeError, match="contain only strings"):
+        resolve_agent_system_method("auto", (b"dataset-round-0",))

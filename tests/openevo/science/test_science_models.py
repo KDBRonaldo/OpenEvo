@@ -1,12 +1,17 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from pathlib import Path
 
 import pytest
 import yaml
 from pydantic import ValidationError
 
-from openevo.projects.science import ScienceProjectConfig, load_science_project_config
+from openevo.projects.science import (
+    EvolutionTargetsConfig,
+    ScienceProjectConfig,
+    load_science_project_config,
+)
 
 
 def _minimal_payload() -> dict:
@@ -32,10 +37,28 @@ def test_minimal_project_defaults_to_science_subscription_transcript() -> None:
     assert config.environment.profile == "managed_science"
     assert config.execution.mode == "codex_subscription_transcript"
     assert config.execution.codex_model == "gpt-5.1-codex-mini"
-    assert config.evolution.text_memory is True
-    assert config.evolution.skill_bundle is True
-    assert config.evolution.agent_system is True
-    assert config.evolution.parametric_memory is False
+    assert config.evolution.model_dump(mode="json")["targets"] == {
+        "text_memory": {
+            "enabled": True,
+            "method": "text_memory_reflector",
+            "config": {},
+        },
+        "parametric_memory": {
+            "enabled": False,
+            "method": "parametric_memory_register",
+            "config": {},
+        },
+        "skill_bundle": {
+            "enabled": True,
+            "method": "skill_bundle_reflector",
+            "config": {},
+        },
+        "agent_system": {
+            "enabled": True,
+            "method": "auto",
+            "config": {"target_path": "AGENTS.md"},
+        },
+    }
 
 
 def test_managed_local_inference_requires_hf_model() -> None:
@@ -113,7 +136,7 @@ def test_managed_local_inference_accepts_hf_model() -> None:
     assert config.execution.mode == "self-deployed"
     assert config.execution.hf_model == "Qwen/Qwen3-Coder-30B-A3B-Instruct"
     assert config.execution.codex_model is None
-    assert config.evolution.parametric_memory is False
+    assert config.evolution.targets["parametric_memory"].enabled is False
 
 
 def test_managed_local_inference_round_trips_through_json_model_dump() -> None:
@@ -186,7 +209,16 @@ def test_custom_image_is_invalid_for_non_custom_image_profile() -> None:
 
 
 def test_subscription_mode_rejects_parametric_memory() -> None:
-    payload = _minimal_payload() | {"evolution": {"parametric_memory": True}}
+    payload = _minimal_payload() | {
+        "evolution": {
+            "targets": {
+                "parametric_memory": {
+                    "enabled": True,
+                    "method": "parametric_memory_register",
+                }
+            }
+        }
+    }
 
     with pytest.raises(
         ValidationError,
@@ -201,7 +233,14 @@ def test_managed_local_inference_rejects_parametric_memory() -> None:
             "mode": "codex_managed_local_inference",
             "hf_model": "Qwen/Qwen3-Coder-30B-A3B-Instruct",
         },
-        "evolution": {"parametric_memory": True},
+        "evolution": {
+            "targets": {
+                "parametric_memory": {
+                    "enabled": True,
+                    "method": "parametric_memory_register",
+                }
+            }
+        },
     }
 
     with pytest.raises(
@@ -209,6 +248,82 @@ def test_managed_local_inference_rejects_parametric_memory() -> None:
         match="Science Projects do not support parametric_memory yet",
     ):
         ScienceProjectConfig.model_validate(payload)
+
+
+def test_science_targets_defer_unknown_ids_and_retain_disabled_drafts() -> None:
+    payload = _minimal_payload() | {
+        "evolution": {
+            "targets": {
+                "future_target": {
+                    "enabled": False,
+                    "method": "future_method",
+                    "config": {"nested": ["draft"]},
+                }
+            }
+        }
+    }
+    config = ScienceProjectConfig.model_validate(payload)
+    payload["evolution"]["targets"]["future_target"]["config"]["nested"].append(
+        "changed"
+    )
+
+    assert config.evolution.targets["future_target"].model_dump(mode="json") == {
+        "enabled": False,
+        "method": "future_method",
+        "config": {"nested": ["draft"]},
+    }
+    assert ScienceProjectConfig.model_validate(config.model_dump(mode="json")) == config
+    assert ScienceProjectConfig.model_validate(
+        config.model_dump(round_trip=True)
+    ) == config
+    with pytest.raises(TypeError):
+        config.evolution.targets["mutated_target"] = config.evolution.targets[
+            "future_target"
+        ]
+    assert deepcopy(config) == config
+    assert config.model_copy(deep=True) == config
+    assert EvolutionTargetsConfig(targets=config.evolution.targets) == config.evolution
+    with pytest.raises(ValidationError, match="enabled target requires method"):
+        config.evolution.model_copy(
+            update={"targets": {"bad_target": {"enabled": True}}}
+        )
+
+
+def test_science_evolution_target_map_schema_has_typed_values() -> None:
+    for mode in ("validation", "serialization"):
+        schema = ScienceProjectConfig.model_json_schema(mode=mode)
+        targets = schema["$defs"]["EvolutionTargetsConfig"]["properties"]["targets"]
+        value_schema = targets["additionalProperties"]
+        assert value_schema["$ref"].endswith("/ProjectEvolutionTargetSelection")
+
+
+def test_science_rejects_old_boolean_evolution_schema() -> None:
+    payload = _minimal_payload() | {"evolution": {"text_memory": True}}
+
+    with pytest.raises(ValidationError, match="text_memory"):
+        ScienceProjectConfig.model_validate(payload)
+
+
+def test_science_target_map_is_closed_and_keys_use_stable_ids() -> None:
+    extra = _minimal_payload() | {
+        "evolution": {
+            "targets": {"future_target": {"enabled": False, "unexpected": True}}
+        }
+    }
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        ScienceProjectConfig.model_validate(extra)
+
+    invalid_key = _minimal_payload() | {
+        "evolution": {"targets": {"bad/target": {"enabled": False}}}
+    }
+    with pytest.raises(ValidationError, match="stable identifier"):
+        ScienceProjectConfig.model_validate(invalid_key)
+
+    coerced_key = _minimal_payload() | {
+        "evolution": {"targets": {b"text_memory": {"enabled": False}}}
+    }
+    with pytest.raises(ValidationError, match="target IDs must be strings"):
+        ScienceProjectConfig.model_validate(coerced_key)
 
 
 def test_load_science_project_config_reads_yaml_and_sets_path(tmp_path: Path) -> None:

@@ -38,7 +38,9 @@ from openevo.deployment.lifecycle import (
 )
 from openevo.deployment.preflight import PreflightCheck, PreflightReport, run_preflight
 from openevo.deployment.redaction import sanitize_remote_text
+from openevo.evolution.framework import ProjectEvolutionTargetSelection
 from openevo.projects.science import ScienceProjectConfig
+from openevo.projects.science.models import EvolutionTargetsConfig
 from desktop.sidecar.config import (
     DesktopProjectConfigDraft,
     DesktopProjectConfigPaths,
@@ -109,6 +111,7 @@ class DesktopScienceProject(_StrictFrozenModel):
     task_id: str
     source: str
     objective: str
+    evolution_targets: dict[str, ProjectEvolutionTargetSelection]
 
 
 class DesktopExecutionStatus(_StrictFrozenModel):
@@ -345,6 +348,7 @@ def build_desktop_shell_status(
             task_id=project.task.id,
             source=_source_label(project),
             objective=project.task.objective,
+            evolution_targets=dict(project.evolution.targets),
         ),
         execution=_execution_status(project),
         bootstrap=DesktopBootstrapStatus(
@@ -376,6 +380,7 @@ def default_desktop_shell_status() -> OpenEvoDesktopShellStatus:
             task_id="new-task",
             source="Scratch workspace",
             objective="",
+            evolution_targets=dict(EvolutionTargetsConfig().targets),
         ),
         execution=DesktopExecutionStatus(
             mode="codex_subscription_transcript",
@@ -1420,6 +1425,7 @@ def _service_statuses(
 def _evolution_steps(
     project: ScienceProjectConfig,
 ) -> tuple[DesktopEvolutionStep, ...]:
+    targets = project.evolution.targets
     steps = [
         DesktopEvolutionStep(
             id="transcript",
@@ -1428,7 +1434,8 @@ def _evolution_steps(
             detail="Trajectory capture will start after the first run",
         )
     ]
-    if project.evolution.text_memory:
+    text_memory = targets.get("text_memory")
+    if text_memory is not None and text_memory.enabled:
         steps.append(
             DesktopEvolutionStep(
                 id="text-memory",
@@ -1437,7 +1444,8 @@ def _evolution_steps(
                 detail="No promoted memory artifact yet",
             )
         )
-    if project.evolution.skill_bundle:
+    skill_bundle = targets.get("skill_bundle")
+    if skill_bundle is not None and skill_bundle.enabled:
         steps.append(
             DesktopEvolutionStep(
                 id="skill-bundle",
@@ -1446,7 +1454,8 @@ def _evolution_steps(
                 detail="No promoted skill bundle yet",
             )
         )
-    if project.evolution.agent_system:
+    agent_system = targets.get("agent_system")
+    if agent_system is not None and agent_system.enabled:
         steps.append(
             DesktopEvolutionStep(
                 id="agent-system",

@@ -574,9 +574,9 @@ describe("OpenEvoDesktop", () => {
         remote_host: "configured.gpu.example.edu",
         remote_port: 2222,
         source_type: "scratch",
-        text_memory: true,
-        skill_bundle: true,
-        agent_system: true,
+        evolution: {
+          targets: shellModel.project.evolutionTargets,
+        },
       }),
     );
     expect(document.body.textContent).toContain("Saving");
@@ -796,6 +796,74 @@ describe("OpenEvoDesktop", () => {
       "Agent system",
     ]);
     expect(document.body.textContent).not.toContain("Parametric memory");
+    await unmountClient(root);
+  });
+
+  it("toggles only enabled while preserving complete evolution selections", async () => {
+    const shellModel = getOpenEvoDesktopShellModel();
+    shellModel.project.evolutionTargets = {
+      text_memory: {
+        enabled: true,
+        method: "custom_memory_method",
+        config: { threshold: 0.75 },
+      },
+      skill_bundle: {
+        enabled: false,
+        method: null,
+        config: { draft_prompt: "retain me" },
+      },
+      future_target: {
+        enabled: false,
+        method: "future_method",
+        config: { opaque: [1, 2, 3] },
+      },
+    };
+    apiMocks.fetchOpenEvoDesktopShellModel.mockResolvedValue(shellModel);
+    apiMocks.saveOpenEvoProjectConfig.mockResolvedValue({
+      config: {
+        science_config_path: "/tmp/science.yaml",
+        remote_profile_path: "/tmp/remote.yaml",
+      },
+      status: shellModel,
+    });
+
+    const root = await renderClient();
+    await flushEffects();
+
+    expect(inputByLabel("Text memory").checked).toBe(true);
+    expect(inputByLabel("Skill bundle").checked).toBe(false);
+    expect(inputByLabel("Agent system").checked).toBe(false);
+    await act(async () => {
+      inputByLabel("Text memory").click();
+      inputByLabel("Skill bundle").click();
+      inputByLabel("Agent system").click();
+    });
+    await act(async () => {
+      buttonByText("Save Config").click();
+      await Promise.resolve();
+    });
+
+    const submitted = apiMocks.saveOpenEvoProjectConfig.mock.calls[0]?.[0];
+    expect(submitted.evolution.targets).toEqual({
+      ...shellModel.project.evolutionTargets,
+      text_memory: {
+        ...shellModel.project.evolutionTargets.text_memory,
+        enabled: false,
+      },
+      skill_bundle: {
+        ...shellModel.project.evolutionTargets.skill_bundle,
+        enabled: true,
+        method: "skill_bundle_reflector",
+      },
+      agent_system: {
+        enabled: true,
+        method: "agent_system_reflector",
+        config: {},
+      },
+    });
+    expect(submitted).not.toHaveProperty("text_memory");
+    expect(submitted).not.toHaveProperty("skill_bundle");
+    expect(submitted).not.toHaveProperty("agent_system");
     await unmountClient(root);
   });
 

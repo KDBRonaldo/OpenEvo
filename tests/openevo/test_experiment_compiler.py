@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 import yaml
 
 from openevo import experiments
@@ -216,7 +217,13 @@ def test_relative_workspace_resolves_from_config_file(tmp_path: Path) -> None:
 def test_evolution_methods_default_to_text_memory_skill_bundle_agent_system() -> None:
     compiled = compile_experiment(_config())
 
-    assert [spec.artifact_type for spec in compiled.evolution_methods_for_round(0)] == [
+    assert [
+        spec.artifact_type
+        for spec in compiled.evolution_methods_for_round(
+            0,
+            prior_dataset_artifact_ids=[],
+        )
+    ] == [
         "text_memory",
         "skill_bundle",
         "agent_system",
@@ -226,24 +233,32 @@ def test_evolution_methods_default_to_text_memory_skill_bundle_agent_system() ->
 def test_evolution_methods_include_parametric_memory_when_enabled() -> None:
     compiled = compile_experiment(
         _config(
-            artifacts={
-                "text_memory": {"enabled": True},
-                "parametric_memory": {
-                    "enabled": True,
-                    "method": "parametric_memory_register",
-                    "config": {
-                        "adapter_uri": "file:///adapters/parser-memory",
-                        "base_model": "gpt-5.1-codex-mini",
-                        "adapter_id": "parser-memory",
+            evolution={
+                "targets": {
+                    "text_memory": {
+                        "enabled": True,
+                        "method": "text_memory_reflector",
                     },
+                    "parametric_memory": {
+                        "enabled": True,
+                        "method": "parametric_memory_register",
+                        "config": {
+                            "adapter_uri": "file:///adapters/parser-memory",
+                            "base_model": "gpt-5.1-codex-mini",
+                            "adapter_id": "parser-memory",
+                        },
+                    },
+                    "skill_bundle": {
+                        "enabled": True,
+                        "method": "skill_bundle_reflector",
+                    },
+                    "agent_system": {"enabled": True, "method": "auto"},
                 },
-                "skill_bundle": {"enabled": True},
-                "agent_system": {"enabled": True},
             }
         )
     )
 
-    specs = compiled.evolution_methods_for_round(0)
+    specs = compiled.evolution_methods_for_round(0, prior_dataset_artifact_ids=[])
 
     assert [spec.artifact_type for spec in specs] == [
         "text_memory",
@@ -261,32 +276,243 @@ def test_evolution_methods_include_parametric_memory_when_enabled() -> None:
 def test_parametric_memory_config_drops_user_reflector_llm() -> None:
     compiled = compile_experiment(
         _config(
-            artifacts={
-                "parametric_memory": {
-                    "enabled": True,
-                    "config": {
-                        "adapter_uri": "file:///adapters/parser-memory",
-                        "reflector_llm": {"provider": "bad", "model": "bad"},
+            evolution={
+                "targets": {
+                    "text_memory": {
+                        "enabled": True,
+                        "method": "text_memory_reflector",
                     },
+                    "parametric_memory": {
+                        "enabled": True,
+                        "method": "parametric_memory_register",
+                        "config": {
+                            "adapter_uri": "file:///adapters/parser-memory",
+                            "reflector_llm": {"provider": "bad", "model": "bad"},
+                        },
+                    },
+                    "skill_bundle": {
+                        "enabled": True,
+                        "method": "skill_bundle_reflector",
+                    },
+                    "agent_system": {"enabled": True, "method": "auto"},
                 },
             }
         )
     )
 
-    specs = compiled.evolution_methods_for_round(0)
+    specs = compiled.evolution_methods_for_round(0, prior_dataset_artifact_ids=[])
 
     assert specs[1].artifact_type == "parametric_memory"
     assert specs[1].config["adapter_uri"] == "file:///adapters/parser-memory"
     assert "reflector_llm" not in specs[1].config
 
 
-def test_agent_system_auto_resolves_by_round() -> None:
+def test_agent_system_auto_resolves_from_prior_dataset_snapshot_not_round() -> None:
     compiled = compile_experiment(_config(), rounds_override=2)
 
-    assert compiled.evolution_methods_for_round(0)[-1].method == "agent_system_reflector"
-    assert compiled.evolution_methods_for_round(1)[-1].method == (
-        "agent_system_history_reflector"
+    without_history = compiled.evolution_methods_for_round(
+        1,
+        prior_dataset_artifact_ids=[],
+    )[-1]
+    with_history = compiled.evolution_methods_for_round(
+        0,
+        prior_dataset_artifact_ids=["dataset_artifact_0"],
+    )[-1]
+
+    assert without_history.method == "agent_system_reflector"
+    assert without_history.requested_method == "auto"
+    assert without_history.prior_dataset_artifact_ids == ()
+    assert with_history.method == "agent_system_history_reflector"
+    assert with_history.requested_method == "auto"
+    assert with_history.prior_dataset_artifact_ids == ("dataset_artifact_0",)
+
+
+def test_prior_dataset_snapshot_rejects_bare_string_and_non_string_ids() -> None:
+    compiled = compile_experiment(_config())
+
+    with pytest.raises(TypeError, match="must be a sequence of strings"):
+        compiled.evolution_methods_for_round(
+            0,
+            prior_dataset_artifact_ids="dataset_artifact_0",
+        )
+    with pytest.raises(TypeError, match="must contain only strings"):
+        compiled.evolution_methods_for_round(
+            0,
+            prior_dataset_artifact_ids=["dataset_artifact_0", 1],
+        )
+
+
+def test_generic_target_config_is_projected_into_compiled_method_specs() -> None:
+    compiled = compile_experiment(
+        _config(
+            evolution={
+                "targets": {
+                    "text_memory": {
+                        "enabled": True,
+                        "method": "text_memory_reflector",
+                        "config": {"max_records": 11},
+                    },
+                    "parametric_memory": {
+                        "enabled": True,
+                        "method": "parametric_memory_register",
+                        "config": {
+                            "adapter_uri": "file:///adapters/parser-memory",
+                            "base_model": "gpt-5.1-codex-mini",
+                            "adapter_id": "parser-memory",
+                        },
+                    },
+                    "skill_bundle": {
+                        "enabled": True,
+                        "method": "skill_bundle_reflector",
+                        "config": {
+                            "max_records": 7,
+                            "base_skill_markdown": "Existing skill.",
+                        },
+                    },
+                    "agent_system": {
+                        "enabled": True,
+                        "method": "agent_system_reflector",
+                        "config": {
+                            "max_records": 5,
+                            "target_path": "CLAUDE.md",
+                        },
+                    },
+                }
+            }
+        )
     )
+
+    specs = compiled.evolution_methods_for_round(0, prior_dataset_artifact_ids=[])
+
+    assert [spec.artifact_type for spec in specs] == [
+        "text_memory",
+        "parametric_memory",
+        "skill_bundle",
+        "agent_system",
+    ]
+    assert specs[0].config["max_records"] == 11
+    assert specs[1].config["adapter_id"] == "parser-memory"
+    assert specs[2].config["max_records"] == 7
+    assert specs[2].config["base_skill_markdown"] == "Existing skill."
+    assert specs[3].config["max_records"] == 5
+    assert specs[3].config["target_path"] == "CLAUDE.md"
+    assert specs[0].config["reflector_llm"] == {
+        "provider": "codex_cli",
+        "model": "gpt-5.1-codex-mini",
+    }
+    assert specs[2].config["reflector_llm"] == specs[0].config["reflector_llm"]
+    assert specs[3].config["reflector_llm"] == specs[0].config["reflector_llm"]
+    assert "reflector_llm" not in specs[1].config
+
+
+def test_compiled_target_selections_do_not_alias_mutable_project_config() -> None:
+    config = _config(
+        evolution={
+            "targets": {
+                "text_memory": {
+                    "enabled": True,
+                    "method": "text_memory_reflector",
+                    "config": {"nested": {"values": [1]}},
+                }
+            }
+        }
+    )
+    compiled = compile_experiment(config)
+
+    config.evolution.targets["text_memory"].config["nested"]["values"].append(2)
+
+    spec = compiled.evolution_methods_for_round(
+        0,
+        prior_dataset_artifact_ids=[],
+    )[0]
+    assert spec.config["nested"] == {"values": [1]}
+
+
+def test_compile_experiment_rejects_unknown_evolution_target() -> None:
+    config = _config(
+        evolution={
+            "targets": {
+                "text_memory": {
+                    "enabled": True,
+                    "method": "text_memory_reflector",
+                },
+                "future_memory": {
+                    "enabled": True,
+                    "method": "future_memory_reflector",
+                },
+            }
+        }
+    )
+
+    with pytest.raises(ValueError, match="Unsupported evolution target: future_memory"):
+        compile_experiment(config)
+
+
+def test_compile_experiment_preserves_but_ignores_disabled_unknown_target() -> None:
+    config = _config(
+        evolution={
+            "targets": {
+                "text_memory": {
+                    "enabled": True,
+                    "method": "text_memory_reflector",
+                },
+                "future_memory": {
+                    "enabled": False,
+                    "method": "future_memory_reflector",
+                    "config": {"draft": {"keep": True}},
+                },
+            }
+        }
+    )
+
+    compiled = compile_experiment(config)
+
+    assert config.evolution.targets["future_memory"].config == {
+        "draft": {"keep": True}
+    }
+    assert [
+        spec.artifact_type
+        for spec in compiled.evolution_methods_for_round(
+            0,
+            prior_dataset_artifact_ids=[],
+        )
+    ] == ["text_memory"]
+
+
+def test_compile_experiment_rejects_cross_target_method_before_job_creation() -> None:
+    config = _config(
+        agent={
+            "preset": "codex",
+            "model": "gpt-5.1-codex-mini",
+            "auth": "subscription",
+            "settings": {"capture_mode": "transcript"},
+        },
+        evolution={
+            "targets": {
+                "text_memory": {
+                    "enabled": True,
+                    "method": "parametric_memory_register",
+                    "config": {
+                        "adapter_uri": "s3://adapters/parser-memory",
+                        "base_model": "model",
+                    },
+                }
+            }
+        },
+    )
+
+    compiled = compile_experiment(config)
+    with pytest.raises(
+        ValueError,
+        match=(
+            "method 'parametric_memory_register' belongs to target "
+            "'parametric_memory', not 'text_memory'"
+        ),
+    ):
+        compiled.evolution_methods_for_round(
+            0,
+            prior_dataset_artifact_ids=[],
+        )
 
 
 def test_evolution_job_payloads_include_ordered_methods_and_reflector_llm() -> None:
@@ -296,6 +522,7 @@ def test_evolution_job_payloads_include_ordered_methods_and_reflector_llm() -> N
         1,
         dataset_artifact_id="dataset_artifact_1",
         context_artifact_ids={
+            "dataset": ["dataset_artifact_0"],
             "text_memory": ["memory_1"],
             "skill_bundle": ["skill_1"],
             "agent_system": ["agent_system_1"],
@@ -314,8 +541,17 @@ def test_evolution_job_payloads_include_ordered_methods_and_reflector_llm() -> N
     ]
     assert jobs[0]["input_artifact_ids"] == ["dataset_artifact_1", "memory_1"]
     assert jobs[1]["input_artifact_ids"] == ["dataset_artifact_1", "skill_1"]
-    assert jobs[2]["input_artifact_ids"] == ["dataset_artifact_1", "agent_system_1"]
+    assert jobs[2]["input_artifact_ids"] == [
+        "dataset_artifact_1",
+        "dataset_artifact_0",
+        "agent_system_1",
+    ]
     assert jobs[2]["config"]["target_path"] == "AGENTS.md"
+    assert jobs[2]["config"]["lineage"]["method_resolution"] == {
+        "requested_method": "auto",
+        "resolved_method": "agent_system_history_reflector",
+        "prior_dataset_artifact_ids": ["dataset_artifact_0"],
+    }
     assert all(job["config"]["promoted"] is True for job in jobs)
     assert all("base_model" not in job["config"]["compatibility"] for job in jobs)
     assert jobs[2]["config"]["reflector_llm"] == {
@@ -324,18 +560,38 @@ def test_evolution_job_payloads_include_ordered_methods_and_reflector_llm() -> N
     }
 
 
+def test_flat_context_is_not_reinterpreted_as_prior_dataset_history() -> None:
+    compiled = compile_experiment(_config())
+
+    jobs = compiled.evolution_job_payloads_for_round(
+        0,
+        dataset_artifact_id="dataset_artifact_0",
+        context_artifact_ids=["prior_agent_system"],
+    )
+
+    agent_system_job = jobs[-1]
+    assert agent_system_job["method"] == "agent_system_reflector"
+    assert agent_system_job["input_artifact_ids"] == [
+        "dataset_artifact_0",
+        "prior_agent_system",
+    ]
+
+
 def test_parametric_memory_job_uses_prior_parametric_context_only() -> None:
     compiled = compile_experiment(
         _config(
-            artifacts={
-                "text_memory": {"enabled": False},
-                "skill_bundle": {"enabled": False},
-                "agent_system": {"enabled": False},
-                "parametric_memory": {
-                    "enabled": True,
-                    "config": {
-                        "adapter_uri": "file:///tmp/qwen-memory-adapter",
-                        "base_model": "Qwen/Qwen3.6-35B-A3B",
+            evolution={
+                "targets": {
+                    "text_memory": {"enabled": False},
+                    "skill_bundle": {"enabled": False},
+                    "agent_system": {"enabled": False},
+                    "parametric_memory": {
+                        "enabled": True,
+                        "method": "parametric_memory_register",
+                        "config": {
+                            "adapter_uri": "file:///tmp/qwen-memory-adapter",
+                            "base_model": "Qwen/Qwen3.6-35B-A3B",
+                        },
                     },
                 },
             },
@@ -362,14 +618,17 @@ def test_parametric_memory_job_derives_base_model_from_agent_model_when_absent()
     compiled = compile_experiment(
         _config(
             agent={"preset": "codex", "model": "Qwen/Qwen3-Coder-30B-A3B-Instruct"},
-            artifacts={
-                "text_memory": {"enabled": False},
-                "skill_bundle": {"enabled": False},
-                "agent_system": {"enabled": False},
-                "parametric_memory": {
-                    "enabled": True,
-                    "config": {
-                        "adapter_uri": "file:///tmp/qwen-memory-adapter",
+            evolution={
+                "targets": {
+                    "text_memory": {"enabled": False},
+                    "skill_bundle": {"enabled": False},
+                    "agent_system": {"enabled": False},
+                    "parametric_memory": {
+                        "enabled": True,
+                        "method": "parametric_memory_register",
+                        "config": {
+                            "adapter_uri": "file:///tmp/qwen-memory-adapter",
+                        },
                     },
                 },
             },
@@ -434,7 +693,10 @@ def test_promotion_gate_accepts_human_input_mode() -> None:
 
     jobs = compiled.tasks[0].evolution_job_payloads_for_round(
         0,
-        compiled.evolution_methods_for_round(0),
+        compiled.evolution_methods_for_round(
+            0,
+            prior_dataset_artifact_ids=[],
+        ),
         dataset_artifact_id="dataset_artifact_1",
         context_artifact_ids=[],
     )
@@ -498,25 +760,27 @@ def test_evolution_job_compatibility_uses_single_task_scoped_tag() -> None:
 def test_parametric_memory_job_compatibility_preserves_base_model_and_task_scope() -> None:
     compiled = compile_experiment(
         _config(
-            artifacts={
-                "text_memory": {"enabled": False},
-                "parametric_memory": {
-                    "enabled": True,
-                    "method": "parametric_memory_register",
-                    "config": {
-                        "adapter_uri": "file:///adapters/parser-memory",
-                        "base_model": "gpt-5.1-codex-mini",
-                        "adapter_id": "parser-memory",
-                        "compatibility": {
-                            "base_model": ["wrong-model"],
-                            "task_tags": ["wrong-task"],
-                            "agent_harness": ["wrong-harness"],
-                            "capability": ["component-extraction"],
+            evolution={
+                "targets": {
+                    "text_memory": {"enabled": False},
+                    "parametric_memory": {
+                        "enabled": True,
+                        "method": "parametric_memory_register",
+                        "config": {
+                            "adapter_uri": "file:///adapters/parser-memory",
+                            "base_model": "gpt-5.1-codex-mini",
+                            "adapter_id": "parser-memory",
+                            "compatibility": {
+                                "base_model": ["wrong-model"],
+                                "task_tags": ["wrong-task"],
+                                "agent_harness": ["wrong-harness"],
+                                "capability": ["component-extraction"],
+                            },
                         },
                     },
+                    "skill_bundle": {"enabled": False},
+                    "agent_system": {"enabled": False},
                 },
-                "skill_bundle": {"enabled": False},
-                "agent_system": {"enabled": False},
             }
         )
     )

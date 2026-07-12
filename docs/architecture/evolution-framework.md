@@ -1,18 +1,20 @@
 # Pluggable Evolution Framework
 
-Status: A2.2 built-in catalog and verified loader; runtime cutover is deferred
+Status: A2.3 project-schema cutover in progress; registry runtime cutover is deferred
 
-Tracking: issues #137 and #139, productization step A2. A2.1 implements
-contracts for `PLUG-1` through `PLUG-4`; A2.2 catalogs the existing
-implementations and extends the A1 `PLUG-5` behavior fixtures.
+Tracking: issues #137, #139, #141, and #142, productization step A2. A2.1
+implements contracts for `PLUG-1` through `PLUG-4`; A2.2 catalogs the existing
+implementations; the first A2.3 slice migrates project configuration and round
+method projection without changing method dispatch.
 
 This contract makes evolution targets and methods pluggable without replacing
 the existing OpenEvo Core architecture. A2.1 added the data models and
 validation. A2.2 adds a deterministic built-in catalog and distribution-backed
-entry-point verification. Current method dispatch, jobs, worker leases,
-artifact registration, promotion, context resolution, gateway injection,
-Science config, and Desktop behavior remain unchanged until their assigned
-cutovers.
+entry-point verification. A2.3 now uses the canonical target map in Science,
+experiments, and Desktop, and resolves `agent_system=auto` from the round-start
+dataset snapshot. Method dispatch, worker leases, artifact registration,
+context resolution, gateway injection, and remote capability projection remain
+on their existing paths until their assigned cutovers.
 
 ## Boundary
 
@@ -179,6 +181,27 @@ evolution:
         candidate_count: 2
 ```
 
+`ProjectEvolutionTargetSelection` is the single project/experiment map-value
+contract. Its fields are exactly `enabled`, `method`, and `config`; enabled
+targets require a method, while disabled targets may retain draft method/config
+state. The former Science booleans and experiment-level `artifacts` object are
+removed rather than accepted through aliases. Desktop may keep checkbox state
+internally, but every saved or submitted Core project uses this target map.
+Selection config uses canonical JSON backing and returns defensive object
+copies; validated Core/Science target maps are read-only views. Python inputs
+cannot coerce non-string target keys into IDs. Because Desktop must preserve
+unknown method config through JavaScript, project config integers are limited to
+the inclusive `[-9007199254740991, 9007199254740991]` range, finite integral
+floats are normalized to integers, and other finite floats retain binary64
+semantics. Larger integer identities must be represented as strings.
+
+The current automation defaults remain explicit in project configuration while
+the registry migration is in progress: `text_memory_reflector`,
+`skill_bundle_reflector`, `agent_system=auto`, and disabled
+`parametric_memory_register`. They are not silently replaced by the catalog's
+release-profile defaults. Capability-driven Desktop defaults are applied only
+when Desktop consumes the connected Core registry in A2.4.
+
 Desktop may retain config for a disabled target in its editing draft. Compiled
 plans contain enabled targets only. Each resolved selection stores target,
 handler, and concrete method IDs, canonical normalized config JSON and digest,
@@ -193,8 +216,9 @@ schema defaults < descriptor default_config < project selection config
 ```
 
 Object values merge recursively; arrays and scalars replace the lower-precedence
-value. The merged result must satisfy the method schema. Unknown targets,
-methods, fields, and incompatible profiles fail before a job is created.
+value. The merged result must satisfy the method schema. Unknown enabled targets,
+methods, fields, and incompatible profiles fail before a job is created. An
+unknown disabled target remains as draft state but is absent from the plan.
 
 ## Execution Compatibility
 
@@ -216,6 +240,20 @@ and `dynamic_adapter_loading`. They are compatibility declarations, not a
 parametric algorithm design. Current non-parametric methods may require none.
 
 ## Method Inputs And Invocation
+
+Before registry dispatch cuts over, every method descriptor gains one closed
+invocation ABI that is part of its canonical identity:
+
+- `legacy_worker_job_v1`: `(WorkerClaimedJob, Path) -> artifacts`, invoked only
+  through `invoke_legacy_method`;
+- `method_context_v1`: `(MethodExecutionContext) -> artifacts`, with inference
+  available only through `CoreHarnessService`.
+
+The verified loader checks the one signature selected by that field and the
+worker dispatches by the field, never by signature guessing. A2.2 signature
+checks remain an anti-drift guard until this A2.3 descriptor/dispatch change is
+implemented; the current schema-only cutover does not claim the ABI is already
+present in `EvolutionMethodDescriptor`.
 
 Each method owns an ordered tuple of `MethodInputBinding` values. A binding
 declares source, artifact type, and minimum/maximum count. Core flattens bindings
@@ -248,6 +286,19 @@ no prior dataset selects `agent_system_reflector`; otherwise it selects
 `agent_system_history_reflector`. Plans/jobs store the concrete method, while
 lineage stores the requested value and prior dataset IDs. GEPA's internal
 candidate/round selection is separate algorithm-owned behavior.
+
+Experiment dry-run and live-run materialization now pass the same snapshot of
+datasets completed before the current round. The current round's dataset is not
+added until that round finishes. This means a later round without history still
+selects the plain reflector, while round zero with explicitly supplied history
+selects the history reflector. Until the verified executable registry is wired
+into production startup later in A2.3, this concrete resolution is recorded in
+the existing job projection; production `EvolutionPlan` binding is not yet
+claimed by this schema cutover. To prevent the broader generic config from
+enabling cross-target execution during that interval, the compiler fails closed
+against the existing built-in `METHOD_METADATA` target relation. This is a
+temporary A2 guard, not a new registry; the verified snapshot replaces it in
+the next A2.3 slice and A2.5 removes the legacy table.
 
 ## Bounded Config Schema
 

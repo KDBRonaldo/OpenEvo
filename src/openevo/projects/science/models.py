@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Self
 
 import yaml
 from pydantic import (
@@ -12,6 +13,9 @@ from pydantic import (
     model_serializer,
     model_validator,
 )
+
+from openevo.evolution.framework import ProjectEvolutionTargetMap
+from openevo.projects.evolution_defaults import default_project_evolution_targets
 
 
 class _StrictModel(BaseModel):
@@ -196,10 +200,23 @@ class ExecutionConfig(_StrictModel):
 
 
 class EvolutionTargetsConfig(_StrictModel):
-    text_memory: bool = True
-    skill_bundle: bool = True
-    agent_system: bool = True
-    parametric_memory: bool = False
+    targets: ProjectEvolutionTargetMap = Field(
+        default_factory=default_project_evolution_targets
+    )
+
+    def model_copy(
+        self,
+        *,
+        update: Mapping[str, Any] | None = None,
+        deep: bool = False,
+    ) -> Self:
+        """Return a fully validated target-map copy."""
+
+        del deep
+        payload = self.model_dump(mode="python")
+        if update:
+            payload.update(update)
+        return type(self).model_validate(payload)
 
 
 class ScienceProjectConfig(_StrictModel):
@@ -219,7 +236,8 @@ class ScienceProjectConfig(_StrictModel):
 
     @model_validator(mode="after")
     def _validate_execution_evolution_compatibility(self) -> ScienceProjectConfig:
-        if self.evolution.parametric_memory:
+        parametric_memory = self.evolution.targets.get("parametric_memory")
+        if parametric_memory is not None and parametric_memory.enabled:
             raise ValueError(
                 "Science Projects do not support parametric_memory yet"
             )

@@ -88,10 +88,11 @@ model and injects `OPENEVO_MANAGED_HF_MODEL` into the runtime environment. The
 remote Desktop service lifecycle starts vLLM, the gateway, and the proxy path
 before a run can launch.
 
-Science Projects do not support `evolution.parametric_memory` in this foundation
-slice, including self-deployed projects. Parametric memory requires a separate
-adapter source or trainer contract that is not part of the Science Project
-schema yet.
+Science Projects do not support an enabled
+`evolution.targets.parametric_memory` selection in this foundation slice,
+including self-deployed projects. Parametric memory requires a separate adapter
+source or trainer contract that is not part of the ordinary-user Science
+Project workflow yet.
 
 ## Runtime Prepare
 
@@ -107,6 +108,37 @@ setup steps can read workspace files.
 Science Projects support text memory, skill bundle, and agent system evolution
 targets in this foundation slice. Parametric memory is intentionally rejected for
 all Science Projects until adapter source and trainer configuration are defined.
+
+The persisted and sidecar request shape is the same generic Core contract used
+by experiments:
+
+```yaml
+evolution:
+  targets:
+    text_memory:
+      enabled: true
+      method: text_memory_reflector
+      config: {}
+    skill_bundle:
+      enabled: true
+      method: skill_bundle_reflector
+      config: {}
+    agent_system:
+      enabled: true
+      method: auto
+      config:
+        target_path: AGENTS.md
+    parametric_memory:
+      enabled: false
+      method: parametric_memory_register
+      config: {}
+```
+
+Target IDs are generic map keys and each value contains only `enabled`,
+`method`, and `config`. Enabled targets require a method. Disabled targets may
+retain draft settings. The removed flat booleans and experiment-level
+`artifacts` object are rejected rather than normalized through compatibility
+aliases.
 
 ## Preflight
 
@@ -231,7 +263,12 @@ The remote profile block includes the non-secret fields needed to reconstruct
 the Desktop setup draft after startup or saved-config activation: profile id,
 host, port, user, auth method plus key/reference ids, effective workspace root,
 HTTP/HTTPS proxy, `NO_PROXY`, `PIP_INDEX_URL`, Hugging Face endpoint, and
-`HF_HOME`. It does not include raw passwords or private-key material.
+`HF_HOME`, plus the complete canonical `evolution.targets` selections. Desktop
+keeps that map through load/edit/save. A toggle preserves every existing
+non-null method and all config; when enabling a missing or method-null visible
+selection, it initializes the method from the corresponding Core capability.
+It cannot discard unknown future targets. The response does not include raw
+passwords or private-key material.
 The response also includes `sidecar.transport` capability metadata for the
 selected local mutating transport. Desktop uses it to block lifecycle actions
 before remote execution when the active auth settings require unsupported
@@ -245,8 +282,9 @@ ordinary Desktop users. It is mutation-token protected and available when the
 sidecar was created with a writable config root and transport factory. The
 request payload is a typed Desktop draft with project name, task id, objective,
 task source, SSH host/user/port/auth references, workspace root, proxy/mirror
-settings, execution mode, mode-specific model field, and text evolution
-toggles. Subscription transcript drafts carry `codex_model`; self-deployed
+settings, execution mode, mode-specific model field, and complete
+`evolution.targets` selections. Subscription transcript drafts carry
+`codex_model`; self-deployed
 drafts carry Hugging Face `hf_model` and omit `codex_model`. The sidecar
 validates that draft by constructing the existing `ScienceProjectConfig` and
 `RemoteProfileConfig` models, then writes:

@@ -255,6 +255,49 @@ export function OpenEvoDesktop() {
     setConfigDraft((current) => ({ ...current, [field]: value }));
   };
 
+  const handleEvolutionTargetChange = (
+    target: { artifactType: string; methodId: string },
+    enabled: boolean,
+  ) => {
+    setConfigDraft((current) => {
+      const selection = current.evolution.targets[target.artifactType];
+      if (!selection) {
+        if (!enabled) {
+          return current;
+        }
+        return {
+          ...current,
+          evolution: {
+            targets: {
+              ...current.evolution.targets,
+              [target.artifactType]: {
+                enabled: true,
+                method: target.methodId,
+                config: {},
+              },
+            },
+          },
+        };
+      }
+      return {
+        ...current,
+        evolution: {
+          targets: {
+            ...current.evolution.targets,
+            [target.artifactType]: {
+              ...selection,
+              enabled,
+              method:
+                enabled && selection.method === null
+                  ? target.methodId
+                  : selection.method,
+            },
+          },
+        },
+      };
+    });
+  };
+
   const handleSourceTypeChange = (
     sourceType: OpenEvoProjectConfigDraft["source_type"],
   ) => {
@@ -910,10 +953,12 @@ export function OpenEvoDesktop() {
               <CheckboxInput
                 key={target.artifactType}
                 label={target.displayName}
-                checked={Boolean(configDraft[target.configKey])}
+                checked={Boolean(
+                  configDraft.evolution.targets[target.artifactType]?.enabled,
+                )}
                 testId="evolution-target"
                 onChange={(checked) =>
-                  handleConfigDraftChange(target.configKey, checked)
+                  handleEvolutionTargetChange(target, checked)
                 }
               />
             ))}
@@ -1635,16 +1680,16 @@ function desktopEvolutionTargets(
     )
     .map((method) => ({
       artifactType: method.artifactType,
+      methodId: method.methodId,
       displayName:
         displayNames[method.artifactType] ?? sentenceCase(method.displayName),
-      configKey: configKeyForArtifactType(method.artifactType),
     }))
     .filter(
       (target): target is {
         artifactType: "text_memory" | "skill_bundle" | "agent_system";
+        methodId: string;
         displayName: string;
-        configKey: "text_memory" | "skill_bundle" | "agent_system";
-      } => target.configKey !== null,
+      } => configKeyForArtifactType(target.artifactType) !== null,
     );
 }
 

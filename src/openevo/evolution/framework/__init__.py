@@ -99,7 +99,15 @@ from .loading import (
     load_verified_entry_point,
     verify_distribution_install,
 )
-from .plan import EvolutionPlan, EvolutionTargetSelection, ResolvedEvolutionSelection
+from .plan import (
+    EvolutionPlan,
+    EvolutionTargetSelection,
+    ProjectEvolutionConfig,
+    ProjectEvolutionTargetMap,
+    ProjectEvolutionTargetSelection,
+    ResolvedEvolutionSelection,
+    validate_project_target_map_keys,
+)
 from .profiles import ReleaseExecutionMode, execution_profile_for_release_mode
 from .registry import CanonicalModelView, EvolutionFrameworkRegistry, RegistrySnapshot
 from .resolution import resolve_agent_system_method
@@ -191,6 +199,9 @@ __all__ = [
     "MethodInputResolution",
     "PayloadKind",
     "PayloadManifestEntry",
+    "ProjectEvolutionConfig",
+    "ProjectEvolutionTargetMap",
+    "ProjectEvolutionTargetSelection",
     "RuntimeDestinationRoots",
     "RegistrySnapshot",
     "RendererKind",
@@ -227,6 +238,7 @@ __all__ = [
     "resolve_method_inputs",
     "validate_config_schema",
     "validate_payload_source_path",
+    "validate_project_target_map_keys",
     "validate_absolute_runtime_path",
     "validate_relative_path",
     "validate_schema",

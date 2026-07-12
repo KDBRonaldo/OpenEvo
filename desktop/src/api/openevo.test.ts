@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { toDraftPayload } from "../routes/openevoDesktopModel";
 import {
   activateOpenEvoProjectConfig,
   fetchOpenEvoBackendArtifactPreview,
@@ -50,6 +51,7 @@ describe("OpenEvo sidecar client", () => {
         task_id: "folding-baseline",
         source: "Git repository: github.com/example/protein-workflows",
         objective: "Survey papers.",
+        evolution_targets: evolutionTargets(),
       },
       execution: {
         mode: "codex_subscription_transcript",
@@ -104,6 +106,7 @@ describe("OpenEvo sidecar client", () => {
     );
     expect(model.remote.proxy.hfHome).toBe("/data/hf-cache");
     expect(model.project.taskId).toBe("folding-baseline");
+    expect(model.project.evolutionTargets).toEqual(evolutionTargets());
     expect(model.execution.tokenMetricsAvailable).toBe(false);
     expect(model.bootstrap.readinessNotes).toEqual([
       "Codex subscription login available",
@@ -192,6 +195,7 @@ describe("OpenEvo sidecar client", () => {
           task_id: "folding-baseline",
           source: "Remote path: /datasets/folding-baseline",
           objective: "Improve folding.",
+          evolution_targets: evolutionTargets(),
         },
         execution: {
           mode: "codex_subscription_transcript",
@@ -857,8 +861,8 @@ describe("OpenEvo sidecar client", () => {
       },
     );
 
-    await fetchOpenEvoDesktopShellModel();
-    const response = await saveOpenEvoProjectConfig(projectConfigDraft());
+    const shellModel = await fetchOpenEvoDesktopShellModel();
+    const response = await saveOpenEvoProjectConfig(toDraftPayload(shellModel));
 
     expect(response.config.science_config_path).toContain("science.yaml");
     expect(response.status.project.name).toBe("Configured Project");
@@ -870,6 +874,12 @@ describe("OpenEvo sidecar client", () => {
       "config-token",
     );
     expect(calls[1].body.remote_host).toBe("gpu.example.edu");
+    expect(calls[1].body.evolution).toEqual({
+      targets: evolutionTargets(),
+    });
+    expect(calls[1].body).not.toHaveProperty("text_memory");
+    expect(calls[1].body).not.toHaveProperty("skill_bundle");
+    expect(calls[1].body).not.toHaveProperty("agent_system");
   });
 
   it("sends self-deployed as the public project config mode", async () => {
@@ -1072,6 +1082,7 @@ function sidecarShellPayload(mutationToken: string) {
       task_id: "folding-baseline",
       source: "Remote path: /datasets/folding-baseline",
       objective: "Improve folding.",
+      evolution_targets: evolutionTargets(),
     },
     execution: {
       mode: "codex_subscription_transcript" as const,
@@ -1165,9 +1176,32 @@ function projectConfigDraft() {
     huggingface_endpoint: "https://hf-mirror.com",
     execution_mode: "codex_subscription_transcript" as const,
     codex_model: "gpt-5.1-codex-mini",
-    text_memory: true,
-    skill_bundle: true,
-    agent_system: true,
+    evolution: { targets: evolutionTargets() },
+  };
+}
+
+function evolutionTargets() {
+  return {
+    text_memory: {
+      enabled: true,
+      method: "custom_memory_method",
+      config: { threshold: 0.75, nested: { mode: "strict" } },
+    },
+    skill_bundle: {
+      enabled: false,
+      method: null,
+      config: { draft_prompt: "retain me" },
+    },
+    agent_system: {
+      enabled: true,
+      method: "auto",
+      config: { target_path: "CLAUDE.md" },
+    },
+    future_target: {
+      enabled: false,
+      method: "future_method",
+      config: { opaque: [1, 2, 3] },
+    },
   };
 }
 

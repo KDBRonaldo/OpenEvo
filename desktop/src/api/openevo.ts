@@ -3,9 +3,15 @@ import type {
   EvolutionStepState,
   OpenEvoExecutionModePayload,
   OpenEvoDesktopShellModel,
+  OpenEvoProjectConfigDraftPayload,
+  OpenEvoProjectConfigPayload,
   RemoteServiceState,
 } from "../routes/openevoDesktopModel";
-import { normalizeOpenEvoExecutionMode } from "../routes/openevoDesktopModel";
+import {
+  copyEvolutionTargets,
+  normalizeOpenEvoExecutionMode,
+  toProjectConfigPayload,
+} from "../routes/openevoDesktopModel";
 import { artifactPreview, timelineView } from "./evolutionViewModel";
 
 export type OpenEvoExecutionMode =
@@ -59,6 +65,7 @@ export interface OpenEvoDesktopShellStatusPayload {
     task_id: string;
     source: string;
     objective: string;
+    evolution_targets: OpenEvoProjectConfigPayload["evolution"]["targets"];
   };
   execution: {
     mode: OpenEvoExecutionModePayload;
@@ -116,36 +123,9 @@ export interface OpenEvoServicesResponsePayload {
   status: OpenEvoDesktopShellStatusPayload;
 }
 
-export interface OpenEvoProjectConfigDraft {
-  project_name: string;
-  task_id: string;
-  objective: string;
-  source_type: "local_folder" | "git_repository" | "remote_path" | "scratch";
-  source_path?: string | null;
-  source_url?: string | null;
-  source_branch?: string | null;
-  remote_profile_id: string;
-  remote_host: string;
-  remote_port: number;
-  remote_user: string;
-  auth_method: "ssh_agent" | "private_key" | "password_ref";
-  private_key_path?: string | null;
-  password_ref?: string | null;
-  passphrase_ref?: string | null;
-  workspace_root?: string | null;
-  http_proxy?: string | null;
-  https_proxy?: string | null;
-  no_proxy?: string | null;
-  pip_index_url?: string | null;
-  huggingface_endpoint?: string | null;
-  hf_home?: string | null;
-  execution_mode: OpenEvoExecutionMode;
-  codex_model?: string | null;
-  hf_model?: string | null;
-  text_memory: boolean;
-  skill_bundle: boolean;
-  agent_system: boolean;
-}
+export type OpenEvoProjectConfigDraft = OpenEvoProjectConfigDraftPayload;
+
+export type { OpenEvoProjectConfigPayload };
 
 export interface OpenEvoProjectConfigPaths {
   science_config_path: string;
@@ -481,7 +461,7 @@ export async function saveOpenEvoProjectConfig(
     : undefined;
   const payload = await api.post<OpenEvoProjectConfigResponsePayload>(
     "/openevo-api/desktop/project-config",
-    draft,
+    toProjectConfigPayload(draft),
     headers,
   );
   rememberOpenEvoSidecarMutationToken(payload.status);
@@ -772,6 +752,9 @@ export function toOpenEvoDesktopShellModel(
       taskId: payload.project.task_id,
       source: payload.project.source,
       objective: payload.project.objective,
+      evolutionTargets: copyEvolutionTargets(
+        payload.project.evolution_targets,
+      ),
     },
     execution: {
       mode: normalizeOpenEvoExecutionMode(payload.execution.mode),

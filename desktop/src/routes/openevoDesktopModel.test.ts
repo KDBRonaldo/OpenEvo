@@ -4,6 +4,7 @@ import {
   getOpenEvoTimelineSummary,
   normalizeOpenEvoExecutionMode,
   toDraftPayload,
+  toProjectConfigPayload,
 } from "./openevoDesktopModel";
 
 describe("OpenEvo Desktop shell model", () => {
@@ -56,5 +57,68 @@ describe("OpenEvo Desktop shell model", () => {
     };
 
     expect(toDraftPayload(model).execution_mode).toBe("self-deployed");
+  });
+
+  it("preserves the complete canonical evolution target map in draft payloads", () => {
+    const model = getOpenEvoDesktopShellModel();
+    const evolutionTargets = {
+      text_memory: {
+        enabled: true,
+        method: "custom_memory_method",
+        config: { threshold: 0.75, nested: { mode: "strict" } },
+      },
+      skill_bundle: {
+        enabled: false,
+        method: null,
+        config: { draft_prompt: "retain me" },
+      },
+      future_target: {
+        enabled: false,
+        method: "future_method",
+        config: { opaque: [1, 2, 3] },
+      },
+    };
+    model.project.evolutionTargets = evolutionTargets;
+
+    const draft = toDraftPayload(model);
+    const payload = toProjectConfigPayload(draft);
+
+    expect(payload.evolution).toEqual({
+      targets: evolutionTargets,
+    });
+    expect(draft.evolution.targets).not.toBe(model.project.evolutionTargets);
+    expect(payload.evolution.targets).not.toBe(draft.evolution.targets);
+    expect(payload.evolution.targets.text_memory?.config).not.toBe(
+      draft.evolution.targets.text_memory?.config,
+    );
+    expect(payload).not.toHaveProperty("text_memory");
+    expect(payload).not.toHaveProperty("skill_bundle");
+    expect(payload).not.toHaveProperty("agent_system");
+  });
+
+  it("rejects target config numbers that JavaScript cannot preserve", () => {
+    const draft = toDraftPayload(getOpenEvoDesktopShellModel());
+    draft.evolution.targets.future_target = {
+      enabled: false,
+      method: null,
+      config: { unsafe: Number.MAX_SAFE_INTEGER + 1 },
+    };
+
+    expect(() => toProjectConfigPayload(draft)).toThrow(
+      "integer exceeds the safe JSON range",
+    );
+  });
+
+  it("rejects non-JSON target config instead of silently deleting it", () => {
+    const draft = toDraftPayload(getOpenEvoDesktopShellModel());
+    draft.evolution.targets.future_target = {
+      enabled: false,
+      method: null,
+      config: { invalid: undefined } as never,
+    };
+
+    expect(() => toProjectConfigPayload(draft)).toThrow(
+      "contains a non-JSON value",
+    );
   });
 });

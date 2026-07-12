@@ -10,6 +10,24 @@ export type OpenEvoExecutionModePayload =
   | OpenEvoExecutionMode
   | "codex_managed_local_inference";
 
+export type OpenEvoJsonValue =
+  | null
+  | boolean
+  | number
+  | string
+  | OpenEvoJsonValue[]
+  | OpenEvoJsonObject;
+
+export interface OpenEvoJsonObject {
+  [key: string]: OpenEvoJsonValue;
+}
+
+export interface OpenEvoEvolutionTargetSelection {
+  enabled: boolean;
+  method: string | null;
+  config: OpenEvoJsonObject;
+}
+
 export interface OpenEvoDesktopShellModel {
   remote: {
     id: string;
@@ -37,6 +55,7 @@ export interface OpenEvoDesktopShellModel {
     taskId: string;
     source: string;
     objective: string;
+    evolutionTargets: Record<string, OpenEvoEvolutionTargetSelection>;
   };
   execution: {
     mode: OpenEvoExecutionMode;
@@ -110,10 +129,12 @@ export interface OpenEvoProjectConfigDraftPayload {
   execution_mode: OpenEvoExecutionMode;
   codex_model?: string | null;
   hf_model?: string | null;
-  text_memory: boolean;
-  skill_bundle: boolean;
-  agent_system: boolean;
+  evolution: {
+    targets: Record<string, OpenEvoEvolutionTargetSelection>;
+  };
 }
+
+export type OpenEvoProjectConfigPayload = OpenEvoProjectConfigDraftPayload;
 
 export function normalizeOpenEvoExecutionMode(
   mode: OpenEvoExecutionModePayload,
@@ -152,6 +173,28 @@ export function getOpenEvoDesktopShellModel(): OpenEvoDesktopShellModel {
       taskId: "new-task",
       source: "Scratch workspace",
       objective: "",
+      evolutionTargets: {
+        text_memory: {
+          enabled: true,
+          method: "text_memory_reflector",
+          config: {},
+        },
+        parametric_memory: {
+          enabled: false,
+          method: "parametric_memory_register",
+          config: {},
+        },
+        skill_bundle: {
+          enabled: true,
+          method: "skill_bundle_reflector",
+          config: {},
+        },
+        agent_system: {
+          enabled: true,
+          method: "auto",
+          config: { target_path: "AGENTS.md" },
+        },
+      },
     },
     execution: {
       mode: "codex_subscription_transcript",
@@ -273,14 +316,93 @@ export function toDraftPayload(
         ? model.execution.model || "gpt-5.1-codex-mini"
         : null,
     hf_model: executionMode === "self-deployed" ? model.execution.model : null,
-    text_memory: model.evolution.some((step) =>
-      ["text-memory", "memory"].includes(step.id),
-    ),
-    skill_bundle: model.evolution.some((step) =>
-      ["skill-bundle", "skills"].includes(step.id),
-    ),
-    agent_system: model.evolution.some((step) => step.id === "agent-system"),
+    evolution: {
+      targets: copyEvolutionTargets(model.project.evolutionTargets),
+    },
   };
+}
+
+export function toProjectConfigPayload(
+  draft: OpenEvoProjectConfigDraftPayload,
+): OpenEvoProjectConfigPayload {
+  return {
+    ...draft,
+    evolution: {
+      targets: copyEvolutionTargets(draft.evolution.targets),
+    },
+  };
+}
+
+export function copyEvolutionTargets(
+  targets: Record<string, OpenEvoEvolutionTargetSelection>,
+): Record<string, OpenEvoEvolutionTargetSelection> {
+  return Object.fromEntries(
+    Object.entries(targets).map(([targetId, selection]) => [
+      targetId,
+      {
+        ...selection,
+        config: copyJsonObject(selection.config),
+      },
+    ]),
+  );
+}
+
+function copyJsonObject(value: OpenEvoJsonObject): OpenEvoJsonObject {
+  const copied = copyJsonValue(value, "config", new WeakSet<object>());
+  if (copied === null || Array.isArray(copied) || typeof copied !== "object") {
+    throw new TypeError("evolution target config must be a JSON object");
+  }
+  return copied;
+}
+
+function copyJsonValue(
+  value: unknown,
+  path: string,
+  ancestors: WeakSet<object>,
+): OpenEvoJsonValue {
+  if (
+    value === null ||
+    typeof value === "string" ||
+    typeof value === "boolean"
+  ) {
+    return value;
+  }
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) {
+      throw new TypeError(`${path} must contain only finite JSON numbers`);
+    }
+    if (Number.isInteger(value) && !Number.isSafeInteger(value)) {
+      throw new TypeError(`${path} integer exceeds the safe JSON range`);
+    }
+    return value;
+  }
+  if (typeof value !== "object") {
+    throw new TypeError(`${path} contains a non-JSON value`);
+  }
+  if (ancestors.has(value)) {
+    throw new TypeError(`${path} contains a circular reference`);
+  }
+
+  ancestors.add(value);
+  try {
+    if (Array.isArray(value)) {
+      return Array.from(value, (item, index) =>
+        copyJsonValue(item, `${path}[${index}]`, ancestors),
+      );
+    }
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype !== Object.prototype && prototype !== null) {
+      throw new TypeError(`${path} contains a non-JSON object`);
+    }
+    return Object.fromEntries(
+      Object.entries(value).map(([key, item]) => [
+        key,
+        copyJsonValue(item, `${path}.${key}`, ancestors),
+      ]),
+    );
+  } finally {
+    ancestors.delete(value);
+  }
 }
 
 function sourceDraftFromLabel(

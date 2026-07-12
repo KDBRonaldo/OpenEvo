@@ -566,8 +566,8 @@ Context resolver 会把它转成 `adapter_merge_spec`。Gateway/proxy 当前做 
 adapter selection，不做物理权重合并。Parametric memory 只适用于 proxy/local inference
 运行：serving backend 必须能按 request 选择或加载对应 adapter。Subscription harness 直连
 外部模型服务，不能应用 OpenEvo 产生的 adapter，因此 experiment config 会拒绝在 subscription
-auth 下启用 `artifacts.parametric_memory`，context resolver 也会在 request 的 agent
-settings 或 metadata 标记 subscription auth 时跳过 `parametric_memory` artifacts。
+auth 下启用 `evolution.targets.parametric_memory`，context resolver 也会在 request 的
+agent settings 或 metadata 标记 subscription auth 时跳过 `parametric_memory` artifacts。
 
 内置 reference worker 提供两条 parametric-memory 方法：
 

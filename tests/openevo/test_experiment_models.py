@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from pathlib import Path
 
 import pytest
@@ -50,15 +51,29 @@ def test_minimal_yaml_loads_with_defaults(tmp_path: Path) -> None:
     assert config.evolution.backend_url == "http://127.0.0.1:8200"
     assert config.evolution.rounds == 1
     assert config.evolution.worker.mode == "local_once"
-    assert config.artifacts.text_memory.enabled is True
-    assert config.artifacts.text_memory.method == "text_memory_reflector"
-    assert config.artifacts.skill_bundle.enabled is True
-    assert config.artifacts.skill_bundle.method == "skill_bundle_reflector"
-    assert config.artifacts.agent_system.enabled is True
-    assert config.artifacts.agent_system.method == "auto"
-    assert config.artifacts.agent_system.target_path == "AGENTS.md"
-    assert config.artifacts.parametric_memory.enabled is False
-    assert config.artifacts.parametric_memory.method == "parametric_memory_register"
+    assert config.evolution.model_dump(mode="json")["targets"] == {
+        "text_memory": {
+            "enabled": True,
+            "method": "text_memory_reflector",
+            "config": {},
+        },
+        "parametric_memory": {
+            "enabled": False,
+            "method": "parametric_memory_register",
+            "config": {},
+        },
+        "skill_bundle": {
+            "enabled": True,
+            "method": "skill_bundle_reflector",
+            "config": {},
+        },
+        "agent_system": {
+            "enabled": True,
+            "method": "auto",
+            "config": {"target_path": "AGENTS.md"},
+        },
+    }
+    assert not hasattr(config, "artifacts")
     assert config.tasks[0].id == "component-extraction-train"
 
 
@@ -151,20 +166,100 @@ def test_subscription_agents_cannot_enable_parametric_memory() -> None:
         "auth": "subscription",
         "settings": {"capture_mode": "transcript"},
     }
-    payload["artifacts"] = {
-        "text_memory": {"enabled": True},
-        "parametric_memory": {
-            "enabled": True,
-            "config": {
-                "adapter_uri": "file:///adapters/parser-memory",
-                "base_model": "Qwen/Qwen3.6-35B-A3B",
-            },
-        },
-        "skill_bundle": {"enabled": False},
-        "agent_system": {"enabled": False},
+    payload["evolution"] = {
+        "targets": {
+            "parametric_memory": {
+                "enabled": True,
+                "method": "parametric_memory_register",
+                "config": {"adapter_uri": "file:///adapters/parser-memory"},
+            }
+        }
     }
 
     with pytest.raises(ValidationError, match="parametric_memory requires proxy"):
+        ExperimentConfig.model_validate(payload)
+
+
+def test_experiment_rejects_removed_artifacts_schema() -> None:
+    payload = _minimal_payload() | {"artifacts": {}}
+
+    with pytest.raises(ValidationError, match="artifacts"):
+        ExperimentConfig.model_validate(payload)
+
+
+def test_evolution_targets_are_generic_closed_and_round_trip_without_aliases() -> None:
+    payload = _minimal_payload() | {
+        "evolution": {
+            "rounds": 3,
+            "targets": {
+                "future_target": {
+                    "enabled": False,
+                    "method": "future_method",
+                    "config": {"nested": {"weights": [1, 2]}},
+                }
+            },
+        }
+    }
+    config = ExperimentConfig.model_validate(payload)
+    payload["evolution"]["targets"]["future_target"]["config"]["nested"][
+        "weights"
+    ].append(3)
+
+    target = config.evolution.targets["future_target"]
+    assert target.enabled is False
+    assert target.method == "future_method"
+    assert target.config == {"nested": {"weights": [1, 2]}}
+    dumped = config.model_dump(mode="json")
+    assert "artifacts" not in dumped
+    assert ExperimentConfig.model_validate(dumped) == config
+    assert ExperimentConfig.model_validate(config.model_dump(round_trip=True)) == config
+
+    invalid = _minimal_payload() | {
+        "evolution": {"targets": {"text_memory": {"enabled": False, "extra": 1}}}
+    }
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        ExperimentConfig.model_validate(invalid)
+
+    with pytest.raises(TypeError):
+        config.evolution.targets["mutated_target"] = target
+
+    assert deepcopy(config) == config
+    assert config.model_copy(deep=True) == config
+    rebuilt = type(config.evolution)(targets=config.evolution.targets)
+    assert rebuilt.targets == config.evolution.targets
+    assert config.evolution.model_dump(
+        include={"targets": {"future_target"}}
+    ) == {"targets": {"future_target": target.model_dump(mode="python")}}
+    with pytest.raises(ValidationError, match="enabled target requires method"):
+        config.evolution.model_copy(
+            update={"targets": {"bad_target": {"enabled": True}}}
+        )
+
+
+def test_experiment_evolution_target_map_schema_has_typed_values() -> None:
+    for mode in ("validation", "serialization"):
+        schema = ExperimentConfig.model_json_schema(mode=mode)
+        targets = schema["$defs"]["EvolutionConfig"]["properties"]["targets"]
+        value_schema = targets["additionalProperties"]
+        assert value_schema["$ref"].endswith("/ProjectEvolutionTargetSelection")
+
+
+@pytest.mark.parametrize("target_id", ["bad/target", " spaced", "method:target"])
+def test_experiment_evolution_target_keys_must_be_stable_ids(target_id: str) -> None:
+    payload = _minimal_payload() | {
+        "evolution": {"targets": {target_id: {"enabled": False}}}
+    }
+
+    with pytest.raises(ValidationError, match="stable identifier"):
+        ExperimentConfig.model_validate(payload)
+
+
+def test_experiment_evolution_target_keys_do_not_coerce_bytes() -> None:
+    payload = _minimal_payload() | {
+        "evolution": {"targets": {b"text_memory": {"enabled": False}}}
+    }
+
+    with pytest.raises(ValidationError, match="target IDs must be strings"):
         ExperimentConfig.model_validate(payload)
 
 

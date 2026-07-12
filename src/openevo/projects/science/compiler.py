@@ -44,7 +44,9 @@ def compile_science_project(
                 }
             ],
             "runtime": _runtime_payload(project),
-            "artifacts": _artifacts_payload(project),
+            "evolution": {
+                "targets": project.evolution.model_dump(mode="json")["targets"],
+            },
         }
     )
 
@@ -139,15 +141,6 @@ def _task_metadata(
         openevo_metadata["source_fingerprint"] = prepared_workspace.source_fingerprint
     metadata["openevo"] = openevo_metadata
     return metadata
-
-
-def _artifacts_payload(project: ScienceProjectConfig) -> dict[str, dict[str, bool]]:
-    return {
-        "text_memory": {"enabled": project.evolution.text_memory},
-        "skill_bundle": {"enabled": project.evolution.skill_bundle},
-        "agent_system": {"enabled": project.evolution.agent_system},
-        "parametric_memory": {"enabled": project.evolution.parametric_memory},
-    }
 
 
 def _required_prepared_workspace(

@@ -252,9 +252,30 @@ def test_create_app_launcher_saves_first_project_config(tmp_path: Path) -> None:
             "remote_user": "alice",
             "auth_method": "ssh_agent",
             "codex_model": "gpt-5.1-codex-mini",
-            "text_memory": True,
-            "skill_bundle": True,
-            "agent_system": True,
+            "evolution": {
+                "targets": {
+                    "text_memory": {
+                        "enabled": True,
+                        "method": "text_memory_reflector",
+                        "config": {},
+                    },
+                    "skill_bundle": {
+                        "enabled": True,
+                        "method": "skill_bundle_reflector",
+                        "config": {},
+                    },
+                    "agent_system": {
+                        "enabled": True,
+                        "method": "auto",
+                        "config": {"target_path": "AGENTS.md"},
+                    },
+                    "parametric_memory": {
+                        "enabled": False,
+                        "method": "parametric_memory_register",
+                        "config": {},
+                    },
+                }
+            },
         },
     )
 

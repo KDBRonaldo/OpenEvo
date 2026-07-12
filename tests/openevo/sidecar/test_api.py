@@ -1906,6 +1906,8 @@ def test_project_config_endpoint_saves_config_and_enables_workspace(
     science_yaml = yaml.safe_load(science_path.read_text(encoding="utf-8"))
     profile_yaml = yaml.safe_load(profile_path.read_text(encoding="utf-8"))
     assert science_yaml["project"]["name"] == "Protein Design"
+    assert science_yaml["evolution"] == {"targets": _evolution_targets_payload()}
+    assert "artifacts" not in science_yaml
     assert profile_yaml["host"] == "gpu.example.edu"
     assert payload["status"]["project"]["name"] == "Protein Design"
     assert payload["status"]["remote"]["host"] == "gpu.example.edu"
@@ -2497,6 +2499,9 @@ def test_default_desktop_status_round_trips_as_json() -> None:
     restored = type(status).model_validate(status.model_dump(mode="json"))
 
     assert restored == status
+    assert status.project.evolution_targets == ScienceProjectConfig.model_validate(
+        _science_project_payload()
+    ).evolution.targets
 
 
 def test_subscription_transcript_status_rejects_token_metrics() -> None:
@@ -2531,6 +2536,32 @@ def _science_project_payload() -> dict:
                 "type": "remote_path",
                 "path": "/datasets/folding-baseline",
             },
+        },
+        "evolution": {"targets": _evolution_targets_payload()},
+    }
+
+
+def _evolution_targets_payload() -> dict:
+    return {
+        "text_memory": {
+            "enabled": True,
+            "method": "text_memory_reflector",
+            "config": {},
+        },
+        "skill_bundle": {
+            "enabled": True,
+            "method": "skill_bundle_reflector",
+            "config": {},
+        },
+        "agent_system": {
+            "enabled": True,
+            "method": "auto",
+            "config": {"target_path": "AGENTS.md"},
+        },
+        "parametric_memory": {
+            "enabled": False,
+            "method": "parametric_memory_register",
+            "config": {},
         },
     }
 
@@ -2571,9 +2602,7 @@ def _desktop_config_draft_payload() -> dict:
         "https_proxy": "http://127.0.0.1:7890",
         "huggingface_endpoint": "https://hf-mirror.com",
         "codex_model": "gpt-5.1-codex-mini",
-        "text_memory": True,
-        "skill_bundle": True,
-        "agent_system": True,
+        "evolution": {"targets": _evolution_targets_payload()},
     }
 
 
@@ -3278,6 +3307,7 @@ def test_build_desktop_shell_status_from_subscription_project() -> None:
     assert status.remote.proxy.https_proxy == "http://127.0.0.1:7890"
     assert status.project.task_id == "folding-baseline"
     assert status.project.source == "Remote path: /datasets/folding-baseline"
+    assert status.project.evolution_targets == project.evolution.targets
     assert status.execution.mode == "codex_subscription_transcript"
     assert status.execution.model == "gpt-5.1-codex-mini"
     assert status.execution.token_metrics_available is False
@@ -3292,6 +3322,57 @@ def test_build_desktop_shell_status_from_subscription_project() -> None:
         "skill-bundle",
         "agent-system",
     ]
+
+
+def test_build_desktop_shell_status_uses_enabled_generic_targets() -> None:
+    project = ScienceProjectConfig.model_validate(
+        _science_project_payload()
+        | {
+            "evolution": {
+                "targets": {
+                    "text_memory": _evolution_targets_payload()["text_memory"],
+                    "agent_system": _evolution_targets_payload()["agent_system"],
+                }
+            }
+        }
+    )
+
+    status = build_desktop_shell_status(project, _remote_profile())
+
+    assert [step.id for step in status.evolution] == [
+        "transcript",
+        "text-memory",
+        "agent-system",
+    ]
+
+
+def test_build_desktop_shell_status_preserves_complete_evolution_target_map() -> None:
+    targets = {
+        "text_memory": {
+            "enabled": True,
+            "method": "custom_memory_method",
+            "config": {"threshold": 0.75, "nested": {"mode": "strict"}},
+        },
+        "skill_bundle": {
+            "enabled": False,
+            "method": None,
+            "config": {"draft_prompt": "retain me"},
+        },
+        "future_target": {
+            "enabled": False,
+            "method": "future_method",
+            "config": {"opaque": [1, 2, 3]},
+        },
+    }
+    project = ScienceProjectConfig.model_validate(
+        _science_project_payload() | {"evolution": {"targets": targets}}
+    )
+
+    payload = build_desktop_shell_status(
+        project, _remote_profile()
+    ).model_dump(mode="json")
+
+    assert payload["project"]["evolution_targets"] == targets
 
 
 def test_build_desktop_shell_status_includes_remote_setup_fields() -> None:

@@ -48,7 +48,10 @@ def compiled_experiment_plan(compiled: CompiledExperiment) -> dict[str, Any]:
         rollout_context_artifact_ids = _empty_context_artifact_ids()
         for round_index in range(compiled.round_count):
             dataset_placeholder = f"<dataset_artifact:{task.task_id}:round-{round_index}>"
-            method_specs = compiled.evolution_methods_for_round(round_index)
+            method_specs = compiled.evolution_methods_for_round(
+                round_index,
+                prior_dataset_artifact_ids=history_context_artifact_ids["dataset"],
+            )
             rounds.append(
                 {
                     "round_index": round_index,
@@ -231,7 +234,11 @@ def _run_compiled_experiment(
             }
             next_rollout_context_artifact_ids = _empty_context_artifact_ids()
             round_failed = False
-            for spec in compiled.evolution_methods_for_round(round_index):
+            method_specs = compiled.evolution_methods_for_round(
+                round_index,
+                prior_dataset_artifact_ids=prior_context_artifact_ids["dataset"],
+            )
+            for spec in method_specs:
                 job_payload = task.evolution_job_payloads_for_round(
                     round_index,
                     [spec],

@@ -16,6 +16,7 @@ from pydantic import (
 import yaml
 
 from openevo.projects.science import ScienceProjectConfig, load_science_project_config
+from openevo.projects.science.models import EvolutionTargetsConfig
 from openevo.deployment.profile import (
     DesktopExecutionMode,
     RemoteProfileConfig,
@@ -61,9 +62,7 @@ class DesktopProjectConfigDraft(_StrictFrozenModel):
     execution_mode: DesktopExecutionMode = "codex_subscription_transcript"
     codex_model: str | None = None
     hf_model: str | None = None
-    text_memory: bool = True
-    skill_bundle: bool = True
-    agent_system: bool = True
+    evolution: EvolutionTargetsConfig = Field(default_factory=EvolutionTargetsConfig)
 
     @model_validator(mode="before")
     @classmethod
@@ -258,12 +257,7 @@ def _science_project_payload(draft: DesktopProjectConfigDraft) -> dict[str, Any]
             "source": _task_source_payload(draft),
         },
         "execution": _execution_payload(draft),
-        "evolution": {
-            "text_memory": draft.text_memory,
-            "skill_bundle": draft.skill_bundle,
-            "agent_system": draft.agent_system,
-            "parametric_memory": False,
-        },
+        "evolution": draft.evolution.model_dump(mode="json"),
     }
 
 

@@ -73,13 +73,10 @@ Acceptance:
 
 ### A2. Build The Pluggable Evolution Framework
 
-Implement `EvolutionTarget`, `EvolutionMethod`, and immutable per-run
-`EvolutionPlan` contracts plus one authoritative registry. Built-ins load
-explicitly and research plugins fail closed. Define the detailed execution,
-plan snapshot, registry identity, config-schema, and target-handler contribution
-contracts in `docs/architecture/evolution-framework.md` before migrating code.
-Keep the existing job/lease/worker/artifact/store lifecycle; this work adds a
-plugin boundary and does not replace Core scheduling or persistence.
+Implement `EvolutionTarget`, `EvolutionMethod`, immutable per-run
+`EvolutionPlan`, and one authoritative registry. Built-ins load explicitly and
+research plugins fail closed under `docs/architecture/evolution-framework.md`.
+Keep the existing job/lease/worker/artifact/store lifecycle.
 
 Execute this migration in the following order:
 
@@ -91,16 +88,16 @@ Execute this migration in the following order:
 | `A2.4` | `PLUG-4` | Replace target-specific context/runtime projection with validated handler contributions and add the generic Desktop renderer/config projection. |
 | `A2.5` | `PLUG-1`, `PLUG-2`, `PLUG-3`, `PLUG-4`, `PLUG-5` | Cut over Core and Desktop, delete duplicate registries/target switches, run behavior/performance gates, and document method/target authoring. |
 
-`A2.1` is contract-only and switches no runtime/product path; A1 froze `PLUG-5`,
-which is migrated and equivalence-tested in A2.2.
+A2.3 lands as reviewable repository slices, not separate product versions:
+1. Migrate all callers to sole `evolution.targets`; preserve order and resolve `auto` from the pre-round dataset snapshot.
+2. Load one verified executable registry; bind job identity, filter methods, and renew existing leases.
+3. Project capabilities from that registry and make sidecar proxy remote Core without local fallback.
+Each PR uses `Part of` until A2.3 closes and introduces no dual schema, scheduler, fallback registry, or algorithm change.
 
 A2 completion acceptance:
 
-- registry tests cover graph/identity/immutability, ordered input binding and
-  exact legacy job projection, config precedence, four-axis compatibility,
-  trusted multi-artifact handler input/context aggregation, and reachable closure;
-- test method/target plugins require no central switches, unsupported contracts
-  fail closed, and method inference can run only through a Core harness service;
+- registry tests cover graph/identity/immutability, ordered input and exact legacy job projection, config precedence, four-axis support, handler aggregation, and reachable closure;
+- test plugins require no central switches, fail closed, and infer only through a Core harness service;
 - remote-Core capabilities expose four separate support axes and stable reasons;
   combined release-profile labels map once and remain presentation only;
 - Desktop consumes the remote Core projection and gives every target a toggle,

@@ -2,22 +2,31 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Sequence
 
 
 def resolve_agent_system_method(
     requested_method: str,
-    prior_dataset_artifact_ids: Iterable[str],
+    prior_dataset_artifact_ids: Sequence[str],
 ) -> str:
     """Preserve the existing agent-system ``auto`` history-selection behavior."""
 
-    if not requested_method.strip():
+    if not isinstance(requested_method, str) or not requested_method.strip():
         raise ValueError("requested agent-system method must not be empty")
+    if isinstance(prior_dataset_artifact_ids, str) or not isinstance(
+        prior_dataset_artifact_ids,
+        Sequence,
+    ):
+        raise TypeError("prior dataset artifact IDs must be a sequence of strings")
+    prior_ids: list[str] = []
+    for artifact_id in prior_dataset_artifact_ids:
+        if not isinstance(artifact_id, str):
+            raise TypeError("prior dataset artifact IDs must contain only strings")
+        if not artifact_id.strip():
+            raise ValueError("prior dataset artifact IDs must not be empty")
+        prior_ids.append(artifact_id)
     if requested_method != "auto":
         return requested_method
-    prior_ids = tuple(prior_dataset_artifact_ids)
-    if any(not artifact_id.strip() for artifact_id in prior_ids):
-        raise ValueError("prior dataset artifact IDs must not be empty")
     return (
         "agent_system_history_reflector"
         if prior_ids

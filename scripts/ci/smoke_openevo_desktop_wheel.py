@@ -15,6 +15,8 @@ from urllib.parse import urlsplit
 import warnings
 
 from openevo import __version__ as OPENEVO_VERSION
+from openevo.experiments import compile_experiment
+from openevo.projects.science import compile_science_project, load_science_project_config
 from desktop.server.app import create_desktop_app
 from openevo.deployment import RemoteCommandResult
 from desktop.sidecar.api import create_sidecar_app
@@ -227,14 +229,36 @@ def _smoke_config_backed_lifecycle(client: TestClient) -> None:
     }:
         raise SmokeFailure("Desktop methods alias did not expose text memory.")
 
+    draft = _desktop_config_draft_payload()
     config = _post_json(
         client,
         "/openevo-api/desktop/project-config",
         headers=headers,
-        json=_desktop_config_draft_payload(),
+        json=draft,
     )
     if config["status"]["project"]["name"] != "Release Smoke Science":
         raise SmokeFailure("Desktop project config response did not load submitted project.")
+    if config["status"]["project"]["evolution_targets"] != draft["evolution"][
+        "targets"
+    ]:
+        raise SmokeFailure("Desktop project config response changed evolution targets.")
+    science_project = load_science_project_config(
+        Path(config["config"]["science_config_path"])
+    )
+    compiled = compile_experiment(compile_science_project(science_project))
+    compiled_methods = {
+        spec.method
+        for spec in compiled.evolution_methods_for_round(
+            0,
+            prior_dataset_artifact_ids=[],
+        )
+    }
+    if "future_target" in compiled_methods or compiled_methods != {
+        "text_memory_reflector",
+        "skill_bundle_reflector",
+        "agent_system_reflector",
+    }:
+        raise SmokeFailure("Desktop saved targets did not compile as expected.")
 
     catalog = _get_json(client, "/openevo-api/desktop/project-configs")
     if len(catalog["configs"]) != 1 or catalog["configs"][0]["valid"] is not True:
@@ -385,9 +409,38 @@ def _desktop_config_draft_payload() -> dict[str, Any]:
         "https_proxy": "http://127.0.0.1:7890",
         "huggingface_endpoint": "https://hf-mirror.com",
         "codex_model": "gpt-5.1-codex-mini",
-        "text_memory": True,
-        "skill_bundle": True,
-        "agent_system": True,
+        "evolution": {
+            "targets": {
+                "text_memory": {
+                    "enabled": True,
+                    "method": "text_memory_reflector",
+                    "config": {},
+                },
+                "skill_bundle": {
+                    "enabled": True,
+                    "method": "skill_bundle_reflector",
+                    "config": {},
+                },
+                "agent_system": {
+                    "enabled": True,
+                    "method": "auto",
+                    "config": {"target_path": "AGENTS.md"},
+                },
+                "parametric_memory": {
+                    "enabled": False,
+                    "method": "parametric_memory_register",
+                    "config": {},
+                },
+                "future_target": {
+                    "enabled": False,
+                    "method": None,
+                    "config": {
+                        "largest_safe_integer": 9_007_199_254_740_991,
+                        "nested": {"values": [1, True, None]},
+                    },
+                },
+            }
+        },
     }
 
 

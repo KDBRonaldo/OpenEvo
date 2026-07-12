@@ -2,9 +2,10 @@ from __future__ import annotations
 
 from copy import deepcopy
 import hashlib
+import pickle
 
 import pytest
-from pydantic import ValidationError
+from pydantic import TypeAdapter, ValidationError
 
 import openevo.evolution.framework as framework
 from openevo.evolution.framework import (
@@ -14,6 +15,9 @@ from openevo.evolution.framework import (
     EvolutionExecutionProfile,
     EvolutionMethodDescriptor,
     EvolutionPlan,
+    ProjectEvolutionConfig,
+    ProjectEvolutionTargetMap,
+    ProjectEvolutionTargetSelection,
     EvolutionTargetSelection,
     ExecutionMode,
     ImplementationRef,
@@ -146,6 +150,197 @@ def test_project_selection_retains_disabled_draft_but_enabled_requires_method() 
     assert disabled.config == {"rounds": 3}
     with pytest.raises(ValidationError, match="requires method_id"):
         EvolutionTargetSelection(target_id="text_memory", enabled=True)
+
+
+def test_project_target_map_value_is_strict_frozen_and_deep_copies_json() -> None:
+    source = {"nested": {"values": [1, True, None]}}
+    selection = ProjectEvolutionTargetSelection(
+        enabled=False,
+        method="draft_method",
+        config=source,
+    )
+
+    source["nested"]["values"].append(2)
+    assert selection.config == {"nested": {"values": [1, True, None]}}
+    mutable_view = selection.config
+    mutable_view["nested"]["values"].append("local-only")
+    with pytest.raises(TypeError):
+        mutable_view["not_json"] = object()
+    assert selection.config == {"nested": {"values": [1, True, None]}}
+    assert ProjectEvolutionTargetSelection.model_validate(
+        selection.model_dump(mode="json")
+    ) == selection
+    assert ProjectEvolutionTargetSelection.model_validate(
+        selection.model_dump(round_trip=True)
+    ) == selection
+    assert selection.model_dump(exclude={"config"}) == {
+        "enabled": False,
+        "method": "draft_method",
+    }
+    assert selection.model_dump(include={"enabled"}) == {"enabled": False}
+    assert selection.model_dump(include={"config": {"nested"}}) == {
+        "config": {"nested": {"values": [1, True, None]}},
+    }
+    assert selection.model_dump(exclude={"config": {"nested"}}) == {
+        "enabled": False,
+        "method": "draft_method",
+        "config": {},
+    }
+    with pytest.raises(ValidationError):
+        selection.enabled = True
+    with pytest.raises(ValidationError, match="valid boolean"):
+        ProjectEvolutionTargetSelection(enabled="true", method="auto")
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        ProjectEvolutionTargetSelection(
+            enabled=False,
+            method=None,
+            config={},
+            target_id="text_memory",
+        )
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        ProjectEvolutionTargetSelection(
+            enabled=False,
+            config_json="{}",
+        )
+    with pytest.raises(ValidationError, match="non-JSON"):
+        ProjectEvolutionTargetSelection(
+            enabled=False,
+            config={"bad": object()},
+        )
+
+    changed = selection.model_copy(update={"config": {"replacement": [1, 2]}})
+    assert changed.config == {"replacement": [1, 2]}
+    assert selection.config == {"nested": {"values": [1, True, None]}}
+    with pytest.raises(ValueError, match="unknown.*config_json"):
+        selection.model_copy(update={"config_json": "{}"})
+
+
+def test_project_target_config_uses_lossless_cross_language_numbers() -> None:
+    selection = ProjectEvolutionTargetSelection(
+        enabled=False,
+        config={
+            "largest_safe_integer": 9_007_199_254_740_991,
+            "integral_float": 1.0,
+            "fraction": 0.125,
+        },
+    )
+
+    assert selection.config == {
+        "largest_safe_integer": 9_007_199_254_740_991,
+        "integral_float": 1,
+        "fraction": 0.125,
+    }
+    with pytest.raises(ValidationError, match="exceeds safe JSON range"):
+        ProjectEvolutionTargetSelection(
+            enabled=False,
+            config={"unsafe": 9_007_199_254_740_992},
+        )
+
+
+def test_project_target_config_does_not_alias_prebuilt_or_deep_copied_values() -> None:
+    supplied = ProjectEvolutionConfig({"value": "original"})
+    selection = ProjectEvolutionTargetSelection(enabled=False, config=supplied)
+    copied = deepcopy(selection)
+
+    object.__setattr__(supplied, "_encoded", '{"value":"supplied-mutated"}')
+    object.__setattr__(selection.config, "_encoded", '{"value":"selection-mutated"}')
+
+    assert selection.config == {"value": "selection-mutated"}
+    assert copied.config == {"value": "original"}
+
+
+def test_project_target_map_is_deeply_copyable_and_has_typed_schema() -> None:
+    target_map = ProjectEvolutionTargetMap(
+        {
+            "future_target": {
+                "enabled": False,
+                "method": "future_method",
+                "config": {"nested": [1]},
+            }
+        }
+    )
+
+    copied = deepcopy(target_map)
+    assert copied == target_map
+    assert copied is not target_map
+    assert ProjectEvolutionTargetMap(target_map).to_dict() == target_map.to_dict()
+    assert pickle.loads(pickle.dumps(target_map)) == target_map
+    adapter = TypeAdapter(ProjectEvolutionTargetMap)
+    nullable_map = ProjectEvolutionTargetMap(
+        {"draft_target": {"enabled": False, "method": None, "config": {}}}
+    )
+    assert adapter.dump_python(nullable_map, exclude_none=True) == {
+        "draft_target": {"enabled": False, "config": {}}
+    }
+    assert adapter.dump_python(nullable_map, exclude_defaults=True) == {
+        "draft_target": {"enabled": False}
+    }
+    with pytest.raises(TypeError):
+        target_map["other"] = target_map["future_target"]
+    with pytest.raises(TypeError, match="immutable"):
+        target_map._items = ()
+    with pytest.raises(ValueError, match="target IDs must be strings"):
+        ProjectEvolutionTargetMap({b"future_target": {"enabled": False}})
+
+    object.__setattr__(
+        target_map,
+        "_items",
+        (("future_target", '{"enabled":true,"method":null,"config":{}}'),),
+    )
+    with pytest.raises(ValidationError, match="enabled target requires method"):
+        adapter.validate_python(target_map)
+
+
+def test_enabled_project_target_requires_method_or_auto() -> None:
+    with pytest.raises(ValidationError, match="enabled target requires method"):
+        ProjectEvolutionTargetSelection(enabled=True)
+    with pytest.raises(ValidationError, match="stable identifier"):
+        ProjectEvolutionTargetSelection(enabled=True, method="")
+
+    assert ProjectEvolutionTargetSelection(enabled=True, method="auto").method == "auto"
+
+
+def test_project_target_selection_revalidates_existing_instances() -> None:
+    selection = ProjectEvolutionTargetSelection(enabled=False, method="valid_method")
+    object.__setattr__(selection, "method", "bad/method")
+
+    with pytest.raises(ValidationError, match="stable identifier"):
+        ProjectEvolutionTargetSelection.model_validate(selection)
+    with pytest.raises(ValidationError, match="stable identifier"):
+        TypeAdapter(ProjectEvolutionTargetSelection).validate_python(selection)
+
+
+def test_project_target_public_schema_keeps_config_as_an_object() -> None:
+    validation = ProjectEvolutionTargetSelection.model_json_schema(mode="validation")
+    serialization = ProjectEvolutionTargetSelection.model_json_schema(
+        mode="serialization"
+    )
+
+    assert validation["properties"]["config"]["type"] == "object"
+    assert serialization["properties"]["config"]["type"] == "object"
+    assert "config_json" not in validation["properties"]
+    assert "config_json" not in serialization["properties"]
+
+    selection = ProjectEvolutionTargetSelection(
+        enabled=False,
+        config={"nested": {"keep": 1, "drop": 2}, "top": 3},
+    )
+    assert selection.model_dump(
+        include={"config": {"nested": {"keep"}}}
+    ) == {"config": {"nested": {"keep": 1}}}
+    assert selection.model_dump(
+        exclude={"config": {"nested": {"drop"}}}
+    ) == {
+        "enabled": False,
+        "method": None,
+        "config": {"nested": {"keep": 1}, "top": 3},
+    }
+
+    nullable = ProjectEvolutionTargetSelection(enabled=False, method=None)
+    assert nullable.model_dump(exclude_none=True) == {
+        "enabled": False,
+        "config": {},
+    }
 
 
 def test_canonical_json_and_resolved_config_are_immutable_by_copy() -> None:
