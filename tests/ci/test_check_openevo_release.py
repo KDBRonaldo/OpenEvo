@@ -86,13 +86,24 @@ def _load_bundle_smoke_module():
     return module
 
 
-def test_desktop_wheel_smoke_exercises_config_backed_lifecycle(capsys) -> None:
+def test_desktop_wheel_smoke_exercises_config_backed_lifecycle(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+) -> None:
     smoke = _load_desktop_wheel_smoke_module()
+    wheel = tmp_path / "openevo-0.1.0-py3-none-any.whl"
+    wheel.write_bytes(_nested_wheel_bytes(metadata=GOOD_METADATA))
+    monkeypatch.setattr(
+        "desktop.sidecar.api.discover_local_openevo_wheel",
+        lambda: wheel,
+    )
 
     assert smoke.main() == 0
 
     output = capsys.readouterr().out
-    assert "OpenEvo Desktop config-backed lifecycle smoke passed" in output
+    assert "Installed Core + source Desktop harness smoke passed" in output
+    assert "Source Desktop config-backed lifecycle harness passed" in output
 
 
 def test_write_sha256_writes_sibling_checksum(tmp_path: Path) -> None:
@@ -573,10 +584,13 @@ def test_local_version_validation_reads_top_level_desktop_metadata() -> None:
 def test_release_smoke_workflow_builds_packaged_assets_and_validates_wheel() -> None:
     workflow = Path(".github/workflows/openevo-release-smoke.yml")
     framework_smoke = Path("scripts/ci/smoke_evolution_framework_wheel.py")
+    desktop_smoke = Path("scripts/ci/smoke_openevo_desktop_wheel.py")
 
     text = workflow.read_text(encoding="utf-8")
     framework_smoke_text = framework_smoke.read_text(encoding="utf-8")
+    desktop_smoke_text = desktop_smoke.read_text(encoding="utf-8")
 
+    assert text.startswith("name: OpenEvo installed Core + source Desktop outer smoke")
     assert 'node-version: "22"' in text
     assert "npm test -- --run" in text
     assert "npm audit --audit-level=high" in text
@@ -585,35 +599,54 @@ def test_release_smoke_workflow_builds_packaged_assets_and_validates_wheel() -> 
     assert '"src/slime_bridge/**"' in text
     assert '"desktop/**"' in text
     assert '"tests/**"' in text
-    assert "python -m pip install --upgrade pip pytest -e ." in text
+    assert "astral-sh/setup-uv@v6" in text
+    assert "uv sync --frozen --group dev" in text
+    assert "tests/ci/test_build_sidecar.py" in text
     assert "tests/ci/test_check_openevo_release.py" in text
-    assert "name: Build remote install wheel" in text
-    assert "python -m build --wheel --outdir .openevo-remote-wheel" in text
-    assert "mkdir -p src/openevo/wheels" in text
-    assert "cp .openevo-remote-wheel/openevo-*.whl src/openevo/wheels/" in text
-    assert "python -m build --wheel" in text
+    assert "name: Build and smoke packaged Desktop sidecar" in text
+    assert "uv run python desktop/packaging/build_sidecar.py" in text
+    assert "--core-wheel-output-dir .openevo-remote-wheel" in text
+    assert "scripts/ci/smoke_openevo_desktop_sidecar.py" in text
+    assert "name: Build outer smoke wheel from isolated source" in text
+    assert "python -m build --wheel --outdir .openevo-remote-wheel" not in text
+    assert "rm -rf src/openevo/wheels" not in text
+    assert "mkdir -p src/openevo/wheels" not in text
+    assert 'mkdir -p "$outer_source/src/openevo/wheels"' in text
+    assert 'src/ "$outer_source/src/"' in text
+    assert "uv run python -m build --wheel --no-isolation" in text
     assert "scripts/ci/check_openevo_release.py --wheel dist/*.whl" in text
+    assert "name: Smoke exact remote Core wheel" in text
+    assert "python -m venv .openevo-remote-wheel-smoke" in text
+    assert (
+        ".openevo-remote-wheel-smoke/bin/python -m pip install "
+        ".openevo-remote-wheel/*.whl"
+    ) in text
+    assert ".openevo-remote-wheel-smoke/bin/openevo-backend --help" in text
+    assert ".openevo-remote-wheel-smoke/bin/openevo-backend serve --help" in text
+    assert ".openevo-remote-wheel-smoke/bin/openevo-backend run --help" in text
+    assert (
+        "PYTHONPATH= .openevo-remote-wheel-smoke/bin/python "
+        "scripts/ci/smoke_evolution_framework_wheel.py "
+        "--wheel .openevo-remote-wheel/*.whl"
+    ) in text
+    assert "name: Smoke installed Core with source Desktop harness" in text
     assert "python -m venv .openevo-wheel-smoke" in text
     assert ".openevo-wheel-smoke/bin/python -m pip install dist/*.whl" in text
-    assert ".openevo-wheel-smoke/bin/openevo-backend --help" in text
-    assert ".openevo-wheel-smoke/bin/openevo-backend serve --help" in text
-    assert ".openevo-wheel-smoke/bin/openevo-backend run --help" in text
-    assert (
-        "PYTHONPATH= .openevo-wheel-smoke/bin/python "
-        "scripts/ci/smoke_evolution_framework_wheel.py --wheel dist/*.whl"
-    ) in text
     assert (
         "PYTHONPATH=. .openevo-wheel-smoke/bin/python "
         "scripts/ci/smoke_openevo_desktop_wheel.py"
     ) in text
+    assert "source Desktop harness, not a packaged app" in desktop_smoke_text
     assert "EXPECTED_METHOD_IDS" in framework_smoke_text
     assert "EXPECTED_TARGET_IDS" in framework_smoke_text
     assert "EXPECTED_HANDLER_IDS" in framework_smoke_text
     assert framework_smoke_text.index("verified = verify_distribution_install(") < (
-        framework_smoke_text.index(
-            "from openevo.evolution.framework.builtins import "
-            "load_verified_builtin_registry"
-        )
+        framework_smoke_text.index("from openevo.evolution.framework import (")
+    )
+    assert "FrameworkDistributionLock" in framework_smoke_text
+    assert "load_verified_framework_registry" in framework_smoke_text
+    assert framework_smoke_text.index("FrameworkDistributionLock(") < (
+        framework_smoke_text.index("loaded = load_verified_framework_registry(lock_path)")
     )
 
     assert text.index("npm ci") < text.index("npm test -- --run")
@@ -622,12 +655,17 @@ def test_release_smoke_workflow_builds_packaged_assets_and_validates_wheel() -> 
         "npm run build:openevo"
     )
     assert text.index("npm test -- --run") < text.index("npm run build:openevo")
-    assert text.index("name: Build remote install wheel") < text.index(
-        "name: Build wheel"
+    assert text.index("name: Build and smoke packaged Desktop sidecar") < text.index(
+        "name: Build outer smoke wheel from isolated source"
     )
-    assert text.index("name: Build wheel") < text.index("name: Validate OpenEvo wheel")
+    assert text.index("name: Build outer smoke wheel from isolated source") < text.index(
+        "name: Validate OpenEvo wheel"
+    )
     assert text.index("name: Validate OpenEvo wheel") < text.index(
-        "name: Install wheel and smoke OpenEvo Backend"
+        "name: Smoke exact remote Core wheel"
+    )
+    assert text.index("name: Smoke exact remote Core wheel") < text.index(
+        "name: Smoke installed Core with source Desktop harness"
     )
 
 
@@ -684,8 +722,10 @@ def test_tauri_macos_config_builds_dmg_release_shell() -> None:
     assert config["bundle"]["macOS"]["minimumSystemVersion"] == "12.0"
     assert sidecar_builder.is_file()
     assert sidecar_entry.is_file()
-    assert linux_sidecar_stub.is_file()
+    assert not linux_sidecar_stub.exists()
     assert "PyInstaller" in sidecar_builder.read_text(encoding="utf-8")
+    assert "_build_core_wheel" in sidecar_builder.read_text(encoding="utf-8")
+    assert "_validate_embedded_core_wheel" in sidecar_builder.read_text(encoding="utf-8")
     assert "--add-data" in sidecar_builder.read_text(encoding="utf-8")
     assert "desktop/packaging/web" in sidecar_builder.read_text(encoding="utf-8")
     assert "desktop.server.launcher" in sidecar_entry.read_text(encoding="utf-8")
@@ -842,6 +882,25 @@ def _write_fake_sidecar(path: Path) -> None:
                 "    def do_GET(self):",
                 "        if self.path == '/health':",
                 "            body = json.dumps({'status': 'ok'}).encode()",
+                "            self.send_response(200)",
+                "            self.send_header('Content-Type', 'application/json')",
+                "            self.send_header('Content-Length', str(len(body)))",
+                "            self.end_headers()",
+                "            self.wfile.write(body)",
+                "            return",
+                "        if self.path == '/openevo-api/desktop/core-artifact':",
+                "            digest = 'a' * 64",
+                "            body = json.dumps({",
+                "                'available': True,",
+                "                'distribution': 'openevo',",
+                "                'distribution_version': '0.1.0',",
+                "                'wheel_filename': 'openevo-0.1.0-py3-none-any.whl',",
+                "                'distribution_digest': digest,",
+                "                'framework_lock': {",
+                "                    'distribution_digest': digest,",
+                "                    'wheel_filename': 'openevo-0.1.0-py3-none-any.whl',",
+                "                },",
+                "            }).encode()",
                 "            self.send_response(200)",
                 "            self.send_header('Content-Type', 'application/json')",
                 "            self.send_header('Content-Length', str(len(body)))",

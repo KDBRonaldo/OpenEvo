@@ -12,10 +12,13 @@ memory evolution 的异步控制面。它接收 OpenEvo session 和 task events�
 - [Evolution API 与新算法接入](../../docs/architecture/evolution-api-and-method-integration.md)
 - [Reference Evolution Worker](../../docs/architecture/reference-evolution-worker.md)
 
-本地启动 backend：
+维护者从已安装 release wheel 启动 backend 时必须提供与 wheel 同目录的外部 lock：
 
-```sh
-uv run python -m openevo.evolution.cli serve --host 127.0.0.1 --port 8200
+<!-- openevo:maintainer-only-command -->
+```sh {.openevo-maintainer-only}
+python -m openevo.evolution.cli serve \
+  --host 127.0.0.1 --port 8200 \
+  --framework-lock /path/to/framework-lock.json
 ```
 
 默认情况下，backend 状态保存在 `.openevo/evolution/` 下。
@@ -28,6 +31,7 @@ pre-release runtime identity。新 producers 和新文档必须使用 OpenEvo id
 
 - `/v1/events`
 - `/v1/datasets`
+- `/v1/planned-jobs`
 - `/v1/jobs`
 - `/v1/jobs/claim`
 - `/v1/jobs/{job_id}/heartbeat`
@@ -74,11 +78,20 @@ vLLM server 需要以允许 full prompt logits 的方式启动，例如设置
 `--max-logprobs -1`，并在需要 raw logits 而不是 logprobs 时设置对应的
 `--logprobs-mode`。
 
-运行内置 reference worker：
+运行 plan-bound reference worker 时使用同一份 lock：
 
-```sh
-uv run python -m openevo.evolution.cli worker --base-url http://127.0.0.1:8200 --once
+<!-- openevo:maintainer-only-command -->
+```sh {.openevo-maintainer-only}
+python -m openevo.evolution.cli worker \
+  --base-url http://127.0.0.1:8200 --once \
+  --framework-lock /path/to/framework-lock.json
 ```
+
+`/v1/planned-jobs` 是 Core experiment 的产品路径。它把 immutable plan、method identity、
+ordered input snapshots 和 execution envelope 绑定到现有 job/lease lifecycle。`/v1/jobs`
+暂时只供尚未迁移的 benchmark automation 使用，不能作为 plan-bound dispatch fallback。
+同一 plan/target 的重复 create 是幂等的。Plan-bound claim 必须携带 verified method identity
+digests；store 在发 lease 前校验 persisted contract，并在 complete 时拒绝未声明 output type。
 
 ## Terminal Bench 离线 transcript bridge
 

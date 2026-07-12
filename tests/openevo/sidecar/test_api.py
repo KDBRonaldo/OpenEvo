@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import socket
 import shlex
@@ -499,7 +500,7 @@ def test_bootstrap_uploads_exact_core_wheel_when_available(
     assert len(transport.uploads) == 1
     uploaded_local, uploaded_remote = transport.uploads[0]
     assert Path(uploaded_local) != wheel_dir
-    assert transport.upload_contents == [[wheel.name]]
+    assert transport.upload_contents == [["framework-lock.json", wheel.name]]
     assert uploaded_remote == (
         "/home/alice/.openevo/runs/protein-design/folding-baseline/wheels"
     )
@@ -601,12 +602,9 @@ def test_wheel_discovery_ignores_untrusted_cwd_dist(
 
 
 def test_wheel_discovery_uses_only_package_relative_bundled_dirs() -> None:
-    package_root = Path(sidecar_api.__file__).resolve().parents[1]
+    package_root = Path(sidecar_api.openevo.__file__).resolve().parent
 
-    assert sidecar_api._openevo_wheel_search_dirs() == (
-        package_root / "wheels",
-        package_root / "desktop" / "wheels",
-    )
+    assert sidecar_api._openevo_wheel_search_dirs() == (package_root / "wheels",)
 
 
 def test_wheel_discovery_requires_matching_openevo_metadata(
@@ -630,6 +628,39 @@ def test_wheel_discovery_requires_matching_openevo_metadata(
     )
 
     assert sidecar_api.discover_local_openevo_wheel() is None
+
+
+def test_core_artifact_endpoint_reports_exact_packaged_wheel_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trusted = tmp_path / "trusted"
+    wheel = _write_openevo_wheel(
+        trusted / "openevo-0.1.0-py3-none-any.whl"
+    )
+    monkeypatch.setattr(sidecar_api, "_openevo_wheel_search_dirs", lambda: (trusted,))
+
+    response = TestClient(create_sidecar_app()).get(
+        "/openevo-api/desktop/core-artifact"
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    digest = hashlib.sha256(wheel.read_bytes()).hexdigest()
+    assert payload == {
+        "available": True,
+        "distribution": "openevo",
+        "distribution_version": "0.1.0",
+        "wheel_filename": wheel.name,
+        "distribution_digest": digest,
+        "framework_lock": {
+            "schema_version": "1",
+            "distribution": "openevo",
+            "distribution_version": "0.1.0",
+            "distribution_digest": digest,
+            "wheel_filename": wheel.name,
+        },
+    }
 
 
 def test_bootstrap_endpoint_preserves_failure_status() -> None:
@@ -2230,7 +2261,12 @@ def test_run_endpoint_rejects_without_ready_services() -> None:
 
 def test_run_endpoint_launches_after_workspace_bootstrap_and_services() -> None:
     project = ScienceProjectConfig.model_validate(_science_project_payload())
-    profile = _remote_profile()
+    profile = _remote_profile(
+        proxy={
+            "https_proxy": "http://127.0.0.1:7890",
+            "extra_env": {"HF_ENDPOINT": "https://hf-mirror.example.test"},
+        }
+    )
     transport = _ApiDryRunTransport()
     client = TestClient(
         create_sidecar_app_for_project(
@@ -2251,9 +2287,11 @@ def test_run_endpoint_launches_after_workspace_bootstrap_and_services() -> None:
     experiment_snapshot = bootstrap["report"]["prepared_paths"]["experiment_snapshot"]
     output_dir = f"{state_root}/runs/{payload['run']['id']}"
     artifact_root = f"{state_root}/evolution/artifacts"
+    framework_lock = f"{state_root}/wheels/framework-lock.json"
     expected_command = (
         f'PATH="$HOME/.local/bin:$PATH" openevo-backend run {experiment_snapshot} '
-        f"--output-dir {output_dir} --artifact-root {artifact_root} --json"
+        f"--output-dir {output_dir} --artifact-root {artifact_root} "
+        f"--framework-lock {framework_lock} --json"
     )
     assert payload["run"]["id"].startswith("run_")
     assert payload["run"]["state"] == "running"
@@ -2266,6 +2304,7 @@ def test_run_endpoint_launches_after_workspace_bootstrap_and_services() -> None:
     terminal = _wait_latest_run_state(client, headers, "succeeded")
     assert payload["run"]["command"] in transport.commands
     assert transport.run_calls[-1] == (expected_command, state_root, 86400.0)
+    assert transport.run_envs[-1] == profile.proxy.to_env()
     assert terminal["run"]["ready"] is True
     assert terminal["run"]["return_code"] == 0
     assert terminal["run"]["stdout"] == "ok"
@@ -2931,6 +2970,7 @@ class _ApiDryRunTransport:
         self.upload_contents: list[list[str]] = []
         self.commands: list[str] = []
         self.run_calls: list[tuple[str, str | None, float]] = []
+        self.run_envs: list[dict[str, str] | None] = []
 
     def run(
         self,
@@ -2942,6 +2982,7 @@ class _ApiDryRunTransport:
     ) -> RemoteCommandResult:
         self.commands.append(command)
         self.run_calls.append((command, cwd, timeout_seconds))
+        self.run_envs.append(env)
         if command == 'df -Pk "$HOME"':
             return RemoteCommandResult(
                 command=command,
@@ -3042,7 +3083,10 @@ class _ApiLifecycleTransport(_ApiDryRunTransport):
                 return_code=0,
                 stdout=self.log_content,
             )
-        if "os.kill(pid, signal.SIGTERM)" in command:
+        if (
+            "service_id =" in command
+            and "os.kill(pid, signal.SIGTERM)" in command
+        ):
             if service_id not in self.pid_states:
                 return RemoteCommandResult(
                     command=command,

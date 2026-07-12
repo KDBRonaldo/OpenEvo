@@ -240,16 +240,29 @@ class CoreHarnessService(Protocol):
 
 class MethodExecutionEnvelope(_Contract):
     plan_id: str
+    plan_digest: str
+    registry_snapshot_digest: str
     target_id: str
     method_id: str
+    method_identity_digest: str
     user_config_json: str
     user_config_digest: str
     core_config_json: str
     core_config_digest: str
     input_bindings: tuple[ResolvedMethodInputBinding, ...]
+    output_artifact_types: tuple[str, ...]
 
     _ids = field_validator("plan_id", "target_id", "method_id")(_stable_id)
-    _digests = field_validator("user_config_digest", "core_config_digest")(_digest)
+    _digests = field_validator(
+        "plan_digest",
+        "registry_snapshot_digest",
+        "method_identity_digest",
+        "user_config_digest",
+        "core_config_digest",
+    )(_digest)
+    _output_types = field_validator("output_artifact_types")(
+        lambda values: tuple(_stable_id(value) for value in values)
+    )
 
     @model_validator(mode="after")
     def _canonical_configs(self) -> MethodExecutionEnvelope:
@@ -288,6 +301,10 @@ class MethodExecutionEnvelope(_Contract):
         binding_ids = tuple(binding.binding_id for binding in self.input_bindings)
         if len(binding_ids) != len(set(binding_ids)):
             raise ValueError("resolved input binding IDs must be unique")
+        if not self.output_artifact_types:
+            raise ValueError("execution envelope must declare output artifact types")
+        if len(self.output_artifact_types) != len(set(self.output_artifact_types)):
+            raise ValueError("execution envelope output artifact types must be unique")
         return self
 
     def user_config(self) -> dict[str, Any]:
@@ -363,6 +380,7 @@ LegacyEvolutionMethod: TypeAlias = Callable[
     [WorkerClaimedJob, Path],
     list[ArtifactRegisterRequest],
 ]
+EvolutionMethodHandle: TypeAlias = LegacyEvolutionMethod | EvolutionMethodPlugin
 
 
 def invoke_legacy_method(
@@ -381,29 +399,38 @@ def invoke_legacy_method(
 def build_execution_envelope(
     *,
     plan_id: str,
+    plan_digest: str,
+    registry_snapshot_digest: str,
     target_id: str,
     method_id: str,
+    method_identity_digest: str,
     user_config: dict[str, Any],
     core_config: dict[str, Any],
     input_bindings: tuple[ResolvedMethodInputBinding, ...],
+    output_artifact_types: tuple[str, ...],
 ) -> MethodExecutionEnvelope:
     user_config_json = canonical_json(user_config)
     core_config_json = canonical_json(core_config)
     return MethodExecutionEnvelope(
         plan_id=plan_id,
+        plan_digest=plan_digest,
+        registry_snapshot_digest=registry_snapshot_digest,
         target_id=target_id,
         method_id=method_id,
+        method_identity_digest=method_identity_digest,
         user_config_json=user_config_json,
         user_config_digest=canonical_digest(user_config),
         core_config_json=core_config_json,
         core_config_digest=canonical_digest(core_config),
         input_bindings=input_bindings,
+        output_artifact_types=output_artifact_types,
     )
 
 
 __all__ = [
     "CORE_CONFIG_RESERVED_KEYS",
     "CoreHarnessService",
+    "EvolutionMethodHandle",
     "EvolutionMethodPlugin",
     "HarnessInferenceRequest",
     "HarnessInferenceResponse",

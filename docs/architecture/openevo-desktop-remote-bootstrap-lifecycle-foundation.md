@@ -83,7 +83,7 @@ The current builder emits idempotent remote steps:
 | `ensure_state_root` | Creates the per-run state directory. |
 | `write_experiment_snapshot` | Writes `<state_root>/experiment.json`. |
 | `write_bootstrap_manifest` | Writes `<state_root>/bootstrap.json`. |
-| `ensure_openevo_cli` | Ensures the remote OpenEvo Core package and `openevo-backend` console script exactly match the local packaged version. If Desktop uploaded a bundled `openevo-<version>-*.whl`, bootstrap installs that wheel with user-site `pip --force-reinstall` and then verifies package metadata plus `openevo-backend --version` and `openevo-backend --help`. If no bundled wheel is available, the step passes only when the remote package and backend launcher already report the exact expected version. |
+| `ensure_openevo_cli` | Ensures the remote OpenEvo Core package and `openevo-backend` console script exactly match the local packaged version. Desktop uploads the selected `openevo-<version>-*.whl` together with `framework-lock.json`, whose version, sibling wheel basename, and SHA-256 bind evolution startup to those exact bytes. Bootstrap installs that wheel with user-site `pip --force-reinstall` and then verifies package metadata plus `openevo-backend --version` and `openevo-backend --help`. If no bundled wheel is available, the step passes only when the remote package and backend launcher already report the exact expected version, but release evolution startup still requires a valid external lock. |
 | `check_codex_cli` | Subscription mode only; verifies `codex --version`. |
 | `check_codex_subscription` | Subscription mode only; verifies `~/.codex/auth.json`. |
 | `docker_pull_runtime` | For custom images, pulls the image declared by the compiled experiment. For managed OpenEvo Science images, writes a managed runtime Dockerfile under `<state_root>/runtime-images/` and runs `docker pull <image> || docker build ... -t <image> ...`. |
@@ -138,7 +138,9 @@ The report includes `prepared_paths` for:
 Networked bootstrap steps receive `proxy_env` from `RemoteProfileConfig.proxy`.
 This includes standard `HTTP_PROXY`, `HTTPS_PROXY`, lowercase variants,
 `NO_PROXY`, `PIP_INDEX_URL`, `HF_ENDPOINT`, `HF_HOME`, and user-provided
-`extra_env`.
+`extra_env`. The live `openevo-backend run` transport call receives the same
+environment so its in-process evolution worker uses the configured mirrors,
+proxies, and extra variables rather than only applying them during bootstrap.
 
 The `ensure_openevo_cli` step is intentionally user-scoped. It never falls back
 to installing the latest package from PyPI. Desktop first looks for a
@@ -148,7 +150,11 @@ uploaded wheel into the remote user's site packages, prepends `~/.local/bin`
 while checking the console script, and leaves host-wide Python or shell
 configuration untouched. Later run commands also prepend `~/.local/bin` so the
 console script created by `pip --user` can be found without editing shell
-profiles. If upload is unavailable and the remote package/CLI version is not
+profiles. The sidecar computes SHA-256 over the selected local wheel and uploads
+an external `framework-lock.json` beside it. Core backend, Evolution backend,
+Evolution worker, and run commands all receive that lock path; startup verifies
+the installed inventory and method entry points before publishing an executable
+registry. If upload is unavailable and the remote package/CLI version is not
 already exact, bootstrap fails with an actionable report instead of repairing
 from an unpinned network source.
 Bootstrap reports sanitize stdout and stderr from remote steps before storing
@@ -207,6 +213,9 @@ Daemon `RemoteServiceStep.manifest` entries include:
 - `service_id`;
 - `pid_path` under `<state_root>/services/pids/<service_id>.pid`;
 - `log_path` under `<state_root>/services/logs/<service_id>.log`;
+- `identity_path` under `<state_root>/services/pids/<service_id>.identity`;
+- `identity_source_path`, which names the uploaded `framework-lock.json`;
+- `identity_scheme=framework_lock_and_argv_sha256_v1`;
 - `port` where the service owns a local HTTP port;
 - `model` for managed vLLM.
 
@@ -235,6 +244,17 @@ signal. Non-positive pid values are treated as invalid pid files and reported
 without calling `os.kill`.
 The daemon already-running check and pid-file health checks apply the same
 positive-pid validation before probing process liveness.
+Before reusing a live daemon, service startup hashes the exact framework lock
+bytes together with the service id, canonical argv, and a digest of the
+proxy/mirror/extra environment, then compares that value with the daemon identity
+file. Environment secrets are not embedded in the command or identity file. An
+exact match is idempotent. A missing or changed identity stops the old managed PID
+before starting a replacement; if the old PID cannot be stopped, startup fails
+instead of running two service generations.
+An unreadable framework lock also fails closed and never reuses the live daemon.
+This binds gateway, rollout, vLLM, Core backend, Evolution backend, and Evolution
+worker processes to the release wheel/lock and their startup command without
+adding a separate supervisor.
 
 Inspection semantics are intentionally pragmatic:
 
@@ -254,7 +274,9 @@ surfacing an unstructured server error.
 
 This facade is still command-based. It does not add systemd units, persistent
 restart policies, cross-session process ownership tracking, or a new daemon
-supervisor.
+supervisor. The identity file binds intended argv/release/environment, but a PID
+file alone does not protect against OS PID reuse; stronger process ownership is
+still a B2 lifecycle requirement.
 
 ## Validation
 

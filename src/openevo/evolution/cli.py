@@ -57,6 +57,7 @@ from openevo.evolution.terminal_bench_task_local_parametric import (
     select_task_local_candidates,
 )
 from openevo.evolution.worker import EvolutionWorkerClient, run_once
+from openevo.evolution.framework import load_verified_framework_registry
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -67,6 +68,7 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--port", type=int, default=8200)
     serve.add_argument("--db", default=".openevo/evolution/evolution.db")
     serve.add_argument("--artifact-root", default=".openevo/evolution")
+    serve.add_argument("--framework-lock", type=Path, required=True)
     worker = subparsers.add_parser("worker", help="Run an Evolution reference worker.")
     worker.add_argument("--base-url", default="http://127.0.0.1:8200")
     worker.add_argument("--worker-id", default="reference-worker")
@@ -75,6 +77,7 @@ def build_parser() -> argparse.ArgumentParser:
     worker.add_argument("--once", action="store_true")
     worker.add_argument("--sleep-seconds", type=float, default=5.0)
     worker.add_argument("--lease-seconds", type=int, default=600)
+    worker.add_argument("--framework-lock", type=Path)
     tb_events = subparsers.add_parser(
         "terminal-bench-events",
         help="Convert Terminal Bench Harbor/EvoLab results to OpenEvo event JSONL.",
@@ -1014,12 +1017,22 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "serve":
         import uvicorn
 
-        app = create_app(db_path=Path(args.db), artifact_root=Path(args.artifact_root))
+        registry = load_verified_framework_registry(args.framework_lock)
+        app = create_app(
+            db_path=Path(args.db),
+            artifact_root=Path(args.artifact_root),
+            registry_snapshot=registry.snapshot,
+        )
         uvicorn.run(app, host=args.host, port=args.port)
         return 0
     if args.command == "worker":
         capabilities = _parse_capabilities(args.capability)
         artifact_root = Path(args.artifact_root)
+        registry = (
+            load_verified_framework_registry(args.framework_lock)
+            if args.framework_lock is not None
+            else None
+        )
         with EvolutionWorkerClient(args.base_url) as client:
             while True:
                 claimed = run_once(
@@ -1028,6 +1041,7 @@ def main(argv: list[str] | None = None) -> int:
                     capabilities=capabilities,
                     artifact_root=artifact_root,
                     lease_seconds=args.lease_seconds,
+                    executable_registry=registry,
                 )
                 if args.once:
                     return 0

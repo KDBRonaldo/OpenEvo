@@ -1,15 +1,155 @@
 from __future__ import annotations
 
 from pathlib import Path
+import subprocess
+import sys
 
 import pytest
 import yaml
 
 from openevo import experiments
+from openevo.evolution.framework import (
+    EvolutionExecutionProfile,
+    EvolutionFrameworkRegistry,
+    EvolutionMethodDescriptor,
+    EvolutionTargetDescriptor,
+    MethodInputBinding,
+    TargetHandlerDescriptor,
+)
+from openevo.evolution.framework.builtins import (
+    ImplementationDistributionIdentity,
+    _handler_descriptors,
+    _method_descriptors,
+    _target_descriptors,
+    build_builtin_registry,
+)
 
 ExperimentConfig = experiments.ExperimentConfig
-compile_experiment = experiments.compile_experiment
+_compile_experiment = experiments.compile_experiment
 load_experiment_config = experiments.load_experiment_config
+
+_REGISTRY_SNAPSHOT = build_builtin_registry(
+    ImplementationDistributionIdentity(
+        distribution="openevo",
+        distribution_version="0.1.0",
+        distribution_digest="a" * 64,
+    )
+)
+_EXECUTION_PROFILE = EvolutionExecutionProfile(
+    execution_mode="self_deployed",
+    capture_mode="transcript",
+    harness_id="codex",
+    runtime_capabilities=(
+        "adapter_serving",
+        "constrained_trainer_contract",
+        "trainer",
+    ),
+)
+
+
+def _registry_with_external_target():
+    identity = ImplementationDistributionIdentity(
+        distribution="openevo",
+        distribution_version="0.1.0",
+        distribution_digest="b" * 64,
+    )
+    registry = EvolutionFrameworkRegistry()
+    for descriptor in (
+        *_target_descriptors(identity),
+        *_handler_descriptors(identity),
+        *_method_descriptors(identity),
+        EvolutionTargetDescriptor(
+            id="quality_notes",
+            display_name="Quality notes",
+            description="External quality notes target.",
+            artifact_type="research_note",
+            handler_id="quality_notes_handler",
+            renderer_kind="markdown",
+            default_method_id="quality_notes_external",
+            implementation_ref=identity.ref("external:quality_notes_target"),
+        ),
+        TargetHandlerDescriptor(
+            id="quality_notes_handler",
+            target_id="quality_notes",
+            artifact_types=("research_note",),
+            renderer_kind="markdown",
+            allowed_uri_schemes=("file",),
+            allowed_media_types=("text/markdown",),
+            allowed_destination_scopes=("target_data",),
+            allowed_contribution_kinds=("staged_payload",),
+            implementation_ref=identity.ref("external:quality_notes_handler"),
+        ),
+        EvolutionMethodDescriptor(
+            id="quality_notes_external",
+            display_name="Quality notes external",
+            description="External method with source-sensitive bindings.",
+            target_id="quality_notes",
+            invocation_abi="method_context_v1",
+            execution_modes=("self_deployed",),
+            capture_modes=("transcript",),
+            supported_harness_ids=("codex",),
+            input_bindings=(
+                MethodInputBinding(
+                    binding_id="current",
+                    source="current_dataset",
+                    artifact_type="dataset",
+                    min_count=1,
+                    max_count=1,
+                ),
+                MethodInputBinding(
+                    binding_id="history",
+                    source="history_datasets",
+                    artifact_type="dataset",
+                ),
+                MethodInputBinding(
+                    binding_id="prior_notes_primary",
+                    source="current_target_artifacts",
+                    artifact_type="research_note",
+                ),
+                MethodInputBinding(
+                    binding_id="prior_notes_secondary",
+                    source="current_target_artifacts",
+                    artifact_type="research_note",
+                ),
+                MethodInputBinding(
+                    binding_id="explicit_evidence",
+                    source="explicit_inputs",
+                    artifact_type="evidence",
+                ),
+            ),
+            output_artifact_types=("research_note",),
+            config_schema={
+                "type": "object",
+                "properties": {
+                    "prompt": {"type": "string"},
+                    "reflector_llm": {
+                        "type": "object",
+                        "properties": {},
+                        "additionalProperties": False,
+                    },
+                    "base_model": {"type": "string"},
+                },
+                "additionalProperties": False,
+            },
+            implementation_ref=identity.ref("external:quality_notes_method"),
+        ),
+    ):
+        registry.register(descriptor)
+    return registry.freeze()
+
+
+def compile_experiment(
+    config: ExperimentConfig,
+    *args: object,
+    **kwargs: object,
+):
+    return _compile_experiment(
+        config,
+        *args,
+        registry_snapshot=_REGISTRY_SNAPSHOT,
+        execution_profile=_EXECUTION_PROFILE,
+        **kwargs,
+    )
 
 
 def _config(**overrides: object) -> ExperimentConfig:
@@ -405,6 +545,145 @@ def test_generic_target_config_is_projected_into_compiled_method_specs() -> None
     assert "reflector_llm" not in specs[1].config
 
 
+def test_external_target_compiles_after_builtins_with_descriptor_artifact_type() -> None:
+    compiled = _compile_experiment(
+        _config(
+            evolution={
+                "targets": {
+                    "quality_notes": {
+                        "enabled": True,
+                        "method": "quality_notes_external",
+                        "config": {"prompt": "Find unsupported claims."},
+                    },
+                    "agent_system": {
+                        "enabled": True,
+                        "method": "agent_system_reflector",
+                    },
+                    "skill_bundle": {
+                        "enabled": True,
+                        "method": "skill_bundle_reflector",
+                    },
+                    "text_memory": {
+                        "enabled": True,
+                        "method": "text_memory_reflector",
+                    },
+                    "parametric_memory": {
+                        "enabled": True,
+                        "method": "parametric_memory_register",
+                        "config": {
+                            "adapter_uri": "file:///adapter",
+                            "base_model": "model",
+                        },
+                    },
+                }
+            }
+        ),
+        rounds_override=2,
+        registry_snapshot=_registry_with_external_target(),
+        execution_profile=_EXECUTION_PROFILE,
+    )
+
+    specs = compiled.evolution_methods_for_round(
+        0,
+        prior_dataset_artifact_ids=["dataset-old"],
+    )
+
+    assert [spec.target_id for spec in specs] == [
+        "text_memory",
+        "parametric_memory",
+        "skill_bundle",
+        "agent_system",
+        "quality_notes",
+    ]
+    assert specs[-1].artifact_type == "research_note"
+    assert specs[-1].config == {"prompt": "Find unsupported claims."}
+
+
+def test_external_source_bindings_preserve_descriptor_order_and_duplicates() -> None:
+    compiled = _compile_experiment(
+        _config(
+            evolution={
+                "targets": {
+                    "quality_notes": {
+                        "enabled": True,
+                        "method": "quality_notes_external",
+                        "config": {"prompt": "Find unsupported claims."},
+                    }
+                }
+            }
+        ),
+        rounds_override=2,
+        registry_snapshot=_registry_with_external_target(),
+        execution_profile=_EXECUTION_PROFILE,
+    )
+
+    jobs = compiled.evolution_job_payloads_for_round(
+        1,
+        dataset_artifact_id="dataset-current",
+        prior_dataset_artifact_ids=["dataset-old-a", "dataset-old-b"],
+        context_artifact_ids={
+            "dataset": ["dataset-old-a", "dataset-old-b"],
+            "research_note": ["note-a", "note-b"],
+            "evidence": ["evidence-a"],
+        },
+    )
+
+    assert jobs[0]["input_bindings"] == [
+        {"binding_id": "current", "artifact_ids": ["dataset-current"]},
+        {
+            "binding_id": "history",
+            "artifact_ids": ["dataset-old-a", "dataset-old-b"],
+        },
+        {
+            "binding_id": "prior_notes_primary",
+            "artifact_ids": ["note-a", "note-b"],
+        },
+        {
+            "binding_id": "prior_notes_secondary",
+            "artifact_ids": ["note-a", "note-b"],
+        },
+        {"binding_id": "explicit_evidence", "artifact_ids": ["evidence-a"]},
+    ]
+    assert jobs[0]["input_artifact_ids"] == [
+        "dataset-current",
+        "dataset-old-a",
+        "dataset-old-b",
+        "note-a",
+        "note-b",
+        "note-a",
+        "note-b",
+        "evidence-a",
+    ]
+
+
+def test_expel_explicit_dataset_binding_matches_stable_current_only_projection() -> None:
+    compiled = compile_experiment(
+        _config(
+            evolution={
+                "targets": {
+                    "text_memory": {
+                        "enabled": True,
+                        "method": "text_memory_expel_reflector",
+                    }
+                }
+            }
+        ),
+        rounds_override=2,
+    )
+
+    jobs = compiled.evolution_job_payloads_for_round(
+        1,
+        dataset_artifact_id="dataset-current",
+        prior_dataset_artifact_ids=["dataset-old-a", "dataset-old-b"],
+        context_artifact_ids={"dataset": ["dataset-old-a", "dataset-old-b"]},
+    )
+
+    assert jobs[0]["input_bindings"][0] == {
+        "binding_id": "dataset_inputs",
+        "artifact_ids": ["dataset-current"],
+    }
+
+
 def test_compiled_target_selections_do_not_alias_mutable_project_config() -> None:
     config = _config(
         evolution={
@@ -412,20 +691,21 @@ def test_compiled_target_selections_do_not_alias_mutable_project_config() -> Non
                 "text_memory": {
                     "enabled": True,
                     "method": "text_memory_reflector",
-                    "config": {"nested": {"values": [1]}},
+                    "config": {"max_records": 1},
                 }
             }
         }
     )
     compiled = compile_experiment(config)
 
-    config.evolution.targets["text_memory"].config["nested"]["values"].append(2)
+    with pytest.raises(TypeError):
+        config.evolution.targets["text_memory"].config["max_records"] = 2
 
     spec = compiled.evolution_methods_for_round(
         0,
         prior_dataset_artifact_ids=[],
     )[0]
-    assert spec.config["nested"] == {"values": [1]}
+    assert spec.config["max_records"] == 1
 
 
 def test_compile_experiment_rejects_unknown_evolution_target() -> None:
@@ -444,7 +724,7 @@ def test_compile_experiment_rejects_unknown_evolution_target() -> None:
         }
     )
 
-    with pytest.raises(ValueError, match="Unsupported evolution target: future_memory"):
+    with pytest.raises(ValueError, match="unknown target 'future_memory'"):
         compile_experiment(config)
 
 
@@ -501,18 +781,11 @@ def test_compile_experiment_rejects_cross_target_method_before_job_creation() ->
         },
     )
 
-    compiled = compile_experiment(config)
     with pytest.raises(
         ValueError,
-        match=(
-            "method 'parametric_memory_register' belongs to target "
-            "'parametric_memory', not 'text_memory'"
-        ),
+        match="does not belong to target 'text_memory'",
     ):
-        compiled.evolution_methods_for_round(
-            0,
-            prior_dataset_artifact_ids=[],
-        )
+        compile_experiment(config)
 
 
 def test_evolution_job_payloads_include_ordered_methods_and_reflector_llm() -> None:
@@ -869,25 +1142,18 @@ def test_subscription_agents_default_reflector_provider_to_codex_cli() -> None:
 
 
 def test_subscription_agents_respect_explicit_reflector_provider() -> None:
-    compiled = compile_experiment(
-        _config(
-            agent={
-                "preset": "codex",
-                "model": "gpt-5.1-codex-mini",
-                "auth": "subscription",
-                "provider": "openai_chat",
-                "settings": {"capture_mode": "transcript"},
-            }
+    with pytest.raises(ValueError, match="allowed enum value"):
+        compile_experiment(
+            _config(
+                agent={
+                    "preset": "codex",
+                    "model": "gpt-5.1-codex-mini",
+                    "auth": "subscription",
+                    "provider": "openai_chat",
+                    "settings": {"capture_mode": "transcript"},
+                }
+            )
         )
-    )
-
-    jobs = compiled.evolution_job_payloads_for_round(
-        0,
-        dataset_artifact_id="dataset_artifact_1",
-        context_artifact_ids=[],
-    )
-
-    assert jobs[0]["config"]["reflector_llm"]["provider"] == "openai_chat"
 
 
 def test_subscription_agent_payload_defaults_auth_mode() -> None:
@@ -955,24 +1221,17 @@ def test_proxy_codex_cli_agent_uses_codex_cli_reflector_in_job_config() -> None:
 
 
 def test_proxy_agent_respects_explicit_openai_chat_reflector_provider() -> None:
-    compiled = compile_experiment(
-        _config(
-            agent={
-                "preset": "codex",
-                "model": "gpt-5.1-codex-mini",
-                "auth": "proxy",
-                "provider": "openai_chat",
-            }
+    with pytest.raises(ValueError, match="allowed enum value"):
+        compile_experiment(
+            _config(
+                agent={
+                    "preset": "codex",
+                    "model": "gpt-5.1-codex-mini",
+                    "auth": "proxy",
+                    "provider": "openai_chat",
+                }
+            )
         )
-    )
-
-    jobs = compiled.evolution_job_payloads_for_round(
-        0,
-        dataset_artifact_id="dataset_artifact_1",
-        context_artifact_ids=[],
-    )
-
-    assert jobs[0]["config"]["reflector_llm"]["provider"] == "openai_chat"
 
 
 def test_task_filter_and_round_override_are_applied() -> None:
@@ -1033,3 +1292,171 @@ def test_workspace_upload_precedes_runtime_prepare_actions() -> None:
             "target": None,
         },
     ]
+
+
+def test_compile_requires_explicit_registry_snapshot_and_execution_profile() -> None:
+    with pytest.raises(TypeError, match="registry_snapshot"):
+        _compile_experiment(_config(), execution_profile=_EXECUTION_PROFILE)
+    with pytest.raises(TypeError, match="execution_profile"):
+        _compile_experiment(_config(), registry_snapshot=_REGISTRY_SNAPSHOT)
+
+
+def test_round_plan_has_stable_identity_and_all_specs_reference_it() -> None:
+    compiled = compile_experiment(_config(), rounds_override=2, run_id="stable-run")
+
+    plan = compiled.evolution_plan_for_round(
+        1,
+        task_id="component-extraction-train",
+        prior_dataset_artifact_ids=["dataset-0"],
+    )
+    repeated = compiled.evolution_plan_for_round(
+        1,
+        task_id="component-extraction-train",
+        prior_dataset_artifact_ids=["dataset-0"],
+    )
+    specs = compiled.evolution_methods_for_round(
+        1,
+        prior_dataset_artifact_ids=["dataset-0"],
+    )
+
+    assert repeated == plan
+    assert plan.plan_id.startswith("plan-")
+    assert len(plan.plan_id) <= 128
+    assert all(spec.plan_id == plan.plan_id for spec in specs)
+    assert all(spec.plan is specs[0].plan for spec in specs)
+    assert all(
+        spec.registry_snapshot_digest == plan.registry_snapshot_digest
+        for spec in specs
+    )
+    assert {
+        selection.target_id: selection.method_id for selection in plan.selections
+    }["agent_system"] == "agent_system_history_reflector"
+
+
+def test_plan_identity_distinguishes_task_round_and_ordered_prior_datasets() -> None:
+    compiled = compile_experiment(
+        _config(
+            tasks=[
+                {"id": "task-a", "instruction": "Do A."},
+                {"id": "task-b", "instruction": "Do B."},
+            ]
+        ),
+        rounds_override=2,
+        run_id="identity-run",
+    )
+
+    def plan_id(task_id: str, round_index: int, prior: list[str]) -> str:
+        return compiled.evolution_plan_for_round(
+            round_index,
+            task_id=task_id,
+            prior_dataset_artifact_ids=prior,
+        ).plan_id
+
+    baseline = plan_id("task-a", 0, ["dataset-a", "dataset-b"])
+    assert baseline != plan_id("task-b", 0, ["dataset-a", "dataset-b"])
+    assert baseline != plan_id("task-a", 1, ["dataset-a", "dataset-b"])
+    assert baseline != plan_id("task-a", 0, ["dataset-b", "dataset-a"])
+
+
+def test_job_projection_carries_complete_plan_and_resolved_identities() -> None:
+    compiled = compile_experiment(_config(), run_id="plan-job")
+
+    jobs = compiled.evolution_job_payloads_for_round(
+        0,
+        dataset_artifact_id="dataset-current",
+    )
+    plan_ids = {job["plan"]["plan_id"] for job in jobs}
+
+    assert len(plan_ids) == 1
+    assert all(job["target_id"] == job["plan_selection"]["target_id"] for job in jobs)
+    assert all(job["method"] == job["plan_selection"]["method_id"] for job in jobs)
+    assert all(job["plan"]["registry_snapshot_digest"] for job in jobs)
+    assert all(job["plan_selection"]["handler_id"].endswith("_handler") for job in jobs)
+    assert all(len(job["plan_selection"]["method_identity_digest"]) == 64 for job in jobs)
+
+
+def test_compiled_and_task_level_job_projection_are_equivalent() -> None:
+    compiled = compile_experiment(_config(), run_id="projection-run")
+    context = {
+        "dataset": ["dataset-history"],
+        "text_memory": ["memory-history"],
+        "skill_bundle": ["skill-history"],
+        "agent_system": ["agent-system-history"],
+    }
+    specs = compiled.evolution_methods_for_round(
+        0,
+        prior_dataset_artifact_ids=context["dataset"],
+    )
+
+    direct = compiled.tasks[0].evolution_job_payloads_for_round(
+        0,
+        specs,
+        dataset_artifact_id="dataset-current",
+        context_artifact_ids=context,
+    )
+    projected = compiled.evolution_job_payloads_for_round(
+        0,
+        dataset_artifact_id="dataset-current",
+        context_artifact_ids=context,
+    )
+
+    assert projected == direct
+
+
+def test_registry_rejects_unknown_config_and_profile_mismatch_at_plan_time() -> None:
+    with pytest.raises(ValueError, match="unknown"):
+        compile_experiment(
+            _config(
+                evolution={
+                    "targets": {
+                        "text_memory": {
+                            "enabled": True,
+                            "method": "text_memory_reflector",
+                            "config": {"unknown": True},
+                        }
+                    }
+                }
+            )
+        )
+
+    subscription_profile = EvolutionExecutionProfile(
+        execution_mode="subscription",
+        capture_mode="transcript",
+        harness_id="codex",
+    )
+    parametric = _config(
+        evolution={
+            "targets": {
+                "parametric_memory": {
+                    "enabled": True,
+                    "method": "parametric_memory_register",
+                    "config": {
+                        "adapter_uri": "file:///adapter",
+                        "base_model": "model",
+                    },
+                }
+            }
+        }
+    )
+    with pytest.raises(ValueError, match="execution mode"):
+        _compile_experiment(
+            parametric,
+            registry_snapshot=_REGISTRY_SNAPSHOT,
+            execution_profile=subscription_profile,
+        )
+
+
+def test_plan_id_is_stable_in_a_fresh_process() -> None:
+    script = """
+from openevo.evolution.framework import EvolutionExecutionProfile
+from openevo.evolution.framework.builtins import ImplementationDistributionIdentity, build_builtin_registry
+from openevo.experiments import ExperimentConfig, compile_experiment
+snapshot = build_builtin_registry(ImplementationDistributionIdentity(distribution='openevo', distribution_version='0.1.0', distribution_digest='a' * 64))
+profile = EvolutionExecutionProfile(execution_mode='self_deployed', capture_mode='transcript', harness_id='codex')
+config = ExperimentConfig.model_validate({'version': 1, 'experiment': {'name': 'stable'}, 'agent': {'preset': 'codex', 'model': 'model'}, 'tasks': [{'id': 'task-a', 'instruction': 'Do A.'}]})
+compiled = compile_experiment(config, run_id='run-a', registry_snapshot=snapshot, execution_profile=profile)
+print(compiled.evolution_plan_for_round(0, prior_dataset_artifact_ids=[]).plan_id)
+"""
+    first = subprocess.check_output([sys.executable, "-c", script], text=True).strip()
+    second = subprocess.check_output([sys.executable, "-c", script], text=True).strip()
+    assert first == second

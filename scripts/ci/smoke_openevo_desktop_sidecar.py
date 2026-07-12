@@ -8,6 +8,7 @@ from html.parser import HTMLParser
 import json
 from pathlib import Path
 import posixpath
+import re
 import socket
 import subprocess
 import sys
@@ -115,6 +116,25 @@ def smoke_sidecar(sidecar: Path, *, timeout_seconds: float) -> None:
                     time.sleep(0.25)
             else:
                 raise SmokeFailure(f"sidecar did not become healthy within {timeout_seconds}s")
+
+            core_artifact = _read_json(
+                f"{base_url}/openevo-api/desktop/core-artifact"
+            )
+            digest = core_artifact.get("distribution_digest")
+            framework_lock = core_artifact.get("framework_lock")
+            if (
+                core_artifact.get("available") is not True
+                or core_artifact.get("distribution") != "openevo"
+                or not isinstance(digest, str)
+                or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+                or not isinstance(framework_lock, dict)
+                or framework_lock.get("distribution_digest") != digest
+                or framework_lock.get("wheel_filename")
+                != core_artifact.get("wheel_filename")
+            ):
+                raise SmokeFailure(
+                    "packaged sidecar did not discover its exact embedded Core wheel"
+                )
 
             index_html = _read_url(f"{base_url}/openevo").decode("utf-8")
             assets = _asset_references(index_html)

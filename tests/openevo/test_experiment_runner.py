@@ -11,13 +11,133 @@ from typing import Any
 import pytest
 
 from openevo import experiments
+from openevo.evolution import methods as evolution_methods
+from openevo.evolution.framework import (
+    EvolutionExecutionProfile,
+    EvolutionFrameworkRegistry,
+    EvolutionMethodDescriptor,
+    EvolutionTargetDescriptor,
+    MethodInputBinding,
+    TargetHandlerDescriptor,
+)
+from openevo.evolution.framework.builtins import (
+    ImplementationDistributionIdentity,
+    VerifiedExecutableRegistry,
+    build_builtin_registry,
+)
 from openevo.evolution.models import ReviewRequestCreateRequest
 
 ExperimentConfig = experiments.ExperimentConfig
-dry_run_experiment = experiments.dry_run_experiment
+_dry_run_experiment = experiments.dry_run_experiment
 openevo_promotion = experiments.promotion
 openevo_runner = experiments.runner
-run_experiment = experiments.run_experiment
+_run_experiment = experiments.run_experiment
+
+_REGISTRY_SNAPSHOT = build_builtin_registry(
+    ImplementationDistributionIdentity(
+        distribution="openevo",
+        distribution_version="0.1.0",
+        distribution_digest="a" * 64,
+    )
+)
+_EXECUTION_PROFILE = EvolutionExecutionProfile(
+    execution_mode="self_deployed",
+    capture_mode="transcript",
+    harness_id="codex",
+    runtime_capabilities=(
+        "adapter_serving",
+        "constrained_trainer_contract",
+        "trainer",
+    ),
+)
+_EXECUTABLE_REGISTRY = VerifiedExecutableRegistry(
+    snapshot=_REGISTRY_SNAPSHOT,
+    method_handles=evolution_methods.METHOD_REGISTRY,
+    descriptor_anchors={},
+)
+
+
+def _external_registry_snapshot():
+    identity = ImplementationDistributionIdentity(
+        distribution="openevo",
+        distribution_version="0.1.0",
+        distribution_digest="c" * 64,
+    )
+    registry = EvolutionFrameworkRegistry()
+    for descriptor in (
+        EvolutionTargetDescriptor(
+            id="quality_notes",
+            display_name="Quality notes",
+            description="External quality notes target.",
+            artifact_type="research_note",
+            handler_id="quality_notes_handler",
+            renderer_kind="markdown",
+            default_method_id="quality_notes_external",
+            implementation_ref=identity.ref("external:quality_notes_target"),
+        ),
+        TargetHandlerDescriptor(
+            id="quality_notes_handler",
+            target_id="quality_notes",
+            artifact_types=("research_note",),
+            renderer_kind="markdown",
+            allowed_uri_schemes=("file",),
+            allowed_media_types=("text/markdown",),
+            allowed_destination_scopes=("target_data",),
+            allowed_contribution_kinds=("staged_payload",),
+            implementation_ref=identity.ref("external:quality_notes_handler"),
+        ),
+        EvolutionMethodDescriptor(
+            id="quality_notes_external",
+            display_name="Quality notes external",
+            description="External quality notes method.",
+            target_id="quality_notes",
+            invocation_abi="method_context_v1",
+            execution_modes=("self_deployed",),
+            capture_modes=("transcript",),
+            supported_harness_ids=("codex",),
+            input_bindings=(
+                MethodInputBinding(
+                    binding_id="current",
+                    source="current_dataset",
+                    artifact_type="dataset",
+                    min_count=1,
+                    max_count=1,
+                ),
+                MethodInputBinding(
+                    binding_id="prior_notes",
+                    source="current_target_artifacts",
+                    artifact_type="research_note",
+                ),
+            ),
+            output_artifact_types=("research_note",),
+            config_schema={
+                "type": "object",
+                "properties": {"prompt": {"type": "string"}},
+                "additionalProperties": False,
+            },
+            implementation_ref=identity.ref("external:quality_notes_method"),
+        ),
+    ):
+        registry.register(descriptor)
+    return registry.freeze()
+
+
+def dry_run_experiment(config: ExperimentConfig, **kwargs: Any):
+    return _dry_run_experiment(
+        config,
+        registry_snapshot=_REGISTRY_SNAPSHOT,
+        execution_profile=_EXECUTION_PROFILE,
+        **kwargs,
+    )
+
+
+def run_experiment(config: ExperimentConfig, **kwargs: Any):
+    return _run_experiment(
+        config,
+        executable_registry=_EXECUTABLE_REGISTRY,
+        execution_profile=_EXECUTION_PROFILE,
+        **kwargs,
+    )
 
 
 def _config(**overrides: object) -> ExperimentConfig:
@@ -87,12 +207,14 @@ def test_dry_run_passes_round_start_prior_dataset_snapshot(monkeypatch) -> None:
         round_index: int,
         *,
         prior_dataset_artifact_ids: list[str],
+        task_id: str,
     ):
         snapshots.append(list(prior_dataset_artifact_ids))
         return original(
             compiled,
             round_index,
             prior_dataset_artifact_ids=prior_dataset_artifact_ids,
+            task_id=task_id,
         )
 
     monkeypatch.setattr(
@@ -128,6 +250,43 @@ def test_dry_run_shows_multi_round_context_placeholders() -> None:
     ]
 
 
+def test_dry_run_tracks_dynamic_artifact_type_without_dataset_rollout_context() -> None:
+    plan = _dry_run_experiment(
+        _config(
+            evolution={
+                "targets": {
+                    "quality_notes": {
+                        "enabled": True,
+                        "method": "quality_notes_external",
+                        "config": {"prompt": "Find unsupported claims."},
+                    }
+                }
+            }
+        ),
+        rounds_override=2,
+        registry_snapshot=_external_registry_snapshot(),
+        execution_profile=_EXECUTION_PROFILE,
+    )
+
+    rounds = plan["tasks"][0]["rounds"]
+    assert rounds[0]["evolution_jobs"][0]["target_id"] == "quality_notes"
+    assert rounds[1]["rollout_payload"]["metadata"]["evolution"][
+        "context_artifact_ids"
+    ] == ["<research_note_artifact:component-extraction-train:round-0>"]
+    assert rounds[1]["evolution_jobs"][0]["input_bindings"] == [
+        {
+            "binding_id": "current",
+            "artifact_ids": [
+                "<dataset_artifact:component-extraction-train:round-1>"
+            ],
+        },
+        {
+            "binding_id": "prior_notes",
+            "artifact_ids": [
+                "<research_note_artifact:component-extraction-train:round-0>"
+            ],
+        },
+    ]
 def test_dry_run_tracks_parametric_memory_placeholders_when_enabled() -> None:
     plan = dry_run_experiment(
         _config(
@@ -180,6 +339,32 @@ def test_dry_run_task_filter_limits_tasks() -> None:
     assert [task["task_id"] for task in plan["tasks"]] == ["task-b"]
 
 
+def test_dry_run_scopes_evolution_plans_to_each_task() -> None:
+    plan = dry_run_experiment(
+        _config(
+            tasks=[
+                {"id": "task-a", "instruction": "Do A.", "workspace": "/tmp/a"},
+                {"id": "task-b", "instruction": "Do B.", "workspace": "/tmp/b"},
+            ],
+        )
+    )
+
+    assert [task["task_id"] for task in plan["tasks"]] == ["task-a", "task-b"]
+    plan_ids_by_task = []
+    for task in plan["tasks"]:
+        jobs = task["rounds"][0]["evolution_jobs"]
+        assert [job["method"] for job in jobs] == [
+            "text_memory_reflector",
+            "skill_bundle_reflector",
+            "agent_system_reflector",
+        ]
+        plan_ids = {job["plan"]["plan_id"] for job in jobs}
+        assert len(plan_ids) == 1
+        plan_ids_by_task.append(plan_ids.pop())
+
+    assert plan_ids_by_task[0] != plan_ids_by_task[1]
+
+
 def test_live_runner_calls_services_and_worker_in_order(tmp_path: Path) -> None:
     rollout = FakeRolloutClient()
     evolution = FakeEvolutionClient()
@@ -217,6 +402,41 @@ def test_live_runner_calls_services_and_worker_in_order(tmp_path: Path) -> None:
     assert round_result["artifact_ids"]["skill_bundle"] == ["artifact-skill-bundle"]
     assert round_result["artifact_ids"]["agent_system"] == ["artifact-agent-system"]
     assert (tmp_path / "run" / "summary.json").exists()
+
+
+def test_live_runner_scopes_evolution_plans_to_each_task(tmp_path: Path) -> None:
+    rollout = FakeRolloutClient()
+    evolution = FakeEvolutionClient()
+
+    result = run_experiment(
+        _config(
+            tasks=[
+                {"id": "task-a", "instruction": "Do A.", "workspace": "/tmp/a"},
+                {"id": "task-b", "instruction": "Do B.", "workspace": "/tmp/b"},
+            ],
+        ),
+        output_dir=tmp_path / "run",
+        rollout_client=rollout,
+        evolution_client=evolution,
+        worker_runner=FakeWorkerRunner(),
+        poll_interval_seconds=0.0,
+        max_poll_attempts=1,
+    )
+
+    assert result["status"] == "completed"
+    assert [task["task_id"] for task in result["tasks"]] == ["task-a", "task-b"]
+    assert [payload["instruction"] for payload in rollout.submitted] == [
+        "Do A.",
+        "Do B.",
+    ]
+    assert len(evolution.datasets) == 2
+    assert len(evolution.jobs) == 6
+    plan_ids_by_task = [
+        {job["plan"]["plan_id"] for job in evolution.jobs[start : start + 3]}
+        for start in (0, 3)
+    ]
+    assert all(len(plan_ids) == 1 for plan_ids in plan_ids_by_task)
+    assert plan_ids_by_task[0] != plan_ids_by_task[1]
 
 
 def test_live_runner_can_use_canonical_state_artifact_root(tmp_path: Path) -> None:
@@ -598,12 +818,14 @@ def test_live_runner_passes_round_start_prior_dataset_snapshot(
         round_index: int,
         *,
         prior_dataset_artifact_ids: list[str],
+        task_id: str,
     ):
         snapshots.append(list(prior_dataset_artifact_ids))
         return original(
             compiled,
             round_index,
             prior_dataset_artifact_ids=prior_dataset_artifact_ids,
+            task_id=task_id,
         )
 
     monkeypatch.setattr(
@@ -3609,6 +3831,17 @@ def test_promotion_gate_promotes_approved_candidates_when_others_are_rejected(
                 "tags": [],
                 "promoted": False,
             },
+            "agent-system-search-report": {
+                "artifact_id": "agent-system-search-report",
+                "type": "report",
+                "name": "GEPA search report",
+                "uri": "file:///tmp/gepa-report.json",
+                "manifest": {},
+                "compatibility": {},
+                "scores": {},
+                "tags": [],
+                "promoted": False,
+            },
         }
     )
 
@@ -3620,6 +3853,7 @@ def test_promotion_gate_promotes_approved_candidates_when_others_are_rejected(
                 "artifact_ids": [
                     "candidate-agent-system-a",
                     "candidate-agent-system-b",
+                    "agent-system-search-report",
                 ],
             }
         ]
@@ -3656,9 +3890,165 @@ def test_promotion_gate_promotes_approved_candidates_when_others_are_rejected(
     assert evolution.promoted == [("candidate-agent-system-a", True)]
     assert job_result["promotion_status"] == "partially_approved"
     assert job_result["approved_artifact_ids"] == ["candidate-agent-system-a"]
+    assert job_result["target_artifact_ids"] == [
+        "candidate-agent-system-a",
+        "candidate-agent-system-b",
+    ]
+    assert job_result["artifact_ids"] == [
+        "candidate-agent-system-a",
+        "candidate-agent-system-b",
+        "agent-system-search-report",
+    ]
     assert result["tasks"][0]["rounds"][0]["artifact_ids"]["agent_system"] == [
         "candidate-agent-system-a"
     ]
+
+
+def test_runner_reuses_only_algorithm_promoted_target_artifacts(
+    tmp_path: Path,
+) -> None:
+    artifacts = {
+        "candidate-agent-system-a": {
+            "artifact_id": "candidate-agent-system-a",
+            "type": "agent_system",
+            "name": "selected candidate",
+            "uri": "file:///tmp/candidate-a/AGENTS.md",
+            "manifest": {},
+            "compatibility": {},
+            "scores": {},
+            "tags": [],
+            "promoted": True,
+        },
+        "candidate-agent-system-b": {
+            "artifact_id": "candidate-agent-system-b",
+            "type": "agent_system",
+            "name": "unselected candidate",
+            "uri": "file:///tmp/candidate-b/AGENTS.md",
+            "manifest": {},
+            "compatibility": {},
+            "scores": {},
+            "tags": [],
+            "promoted": False,
+        },
+        "agent-system-search-report": {
+            "artifact_id": "agent-system-search-report",
+            "type": "report",
+            "name": "GEPA search report",
+            "uri": "file:///tmp/gepa-report.json",
+            "manifest": {},
+            "compatibility": {},
+            "scores": {},
+            "tags": [],
+            "promoted": False,
+        },
+    }
+    evolution = FakeEvolutionClient(artifacts=artifacts)
+
+    def multi_output_worker(**kwargs: Any) -> list[dict[str, Any]]:
+        return [
+            {
+                "claimed": True,
+                "job_id": kwargs["expected_job_id"],
+                "artifact_ids": list(artifacts),
+            }
+        ]
+
+    rollout = FakeRolloutClient()
+    result = run_experiment(
+        _config(
+            evolution={
+                "targets": {
+                    "text_memory": {"enabled": False},
+                    "skill_bundle": {"enabled": False},
+                    "agent_system": {
+                        "enabled": True,
+                        "method": "agent_system_gepa_reflector",
+                    },
+                }
+            }
+        ),
+        rounds_override=2,
+        output_dir=tmp_path / "run",
+        rollout_client=rollout,
+        evolution_client=evolution,
+        worker_runner=multi_output_worker,
+        poll_interval_seconds=0.0,
+        max_poll_attempts=1,
+    )
+
+    assert result["status"] == "completed"
+    assert len(result["tasks"][0]["rounds"]) == 2
+    first_job = result["tasks"][0]["rounds"][0]["jobs"][0]
+    assert first_job["promotion_status"] == "skipped"
+    assert first_job["approved_artifact_ids"] == ["candidate-agent-system-a"]
+    assert first_job["target_artifact_ids"] == [
+        "candidate-agent-system-a",
+        "candidate-agent-system-b",
+    ]
+    assert rollout.submitted[1]["metadata"]["evolution"]["context_artifact_ids"] == [
+        "candidate-agent-system-a"
+    ]
+    assert "candidate-agent-system-a" in evolution.jobs[1]["input_artifact_ids"]
+    assert "candidate-agent-system-b" not in evolution.jobs[1]["input_artifact_ids"]
+    assert "agent-system-search-report" not in evolution.jobs[1]["input_artifact_ids"]
+
+
+def test_runner_fails_closed_without_algorithm_promoted_target(
+    tmp_path: Path,
+) -> None:
+    artifacts = {
+        "candidate-agent-system-a": {
+            "artifact_id": "candidate-agent-system-a",
+            "type": "agent_system",
+            "promoted": False,
+        },
+        "agent-system-search-report": {
+            "artifact_id": "agent-system-search-report",
+            "type": "report",
+            "promoted": False,
+        },
+    }
+    evolution = FakeEvolutionClient(artifacts=artifacts)
+
+    def multi_output_worker(**kwargs: Any) -> list[dict[str, Any]]:
+        return [
+            {
+                "claimed": True,
+                "job_id": kwargs["expected_job_id"],
+                "artifact_ids": list(artifacts),
+            }
+        ]
+
+    result = run_experiment(
+        _config(
+            evolution={
+                "targets": {
+                    "text_memory": {"enabled": False},
+                    "skill_bundle": {"enabled": False},
+                    "agent_system": {
+                        "enabled": True,
+                        "method": "agent_system_gepa_reflector",
+                    },
+                }
+            }
+        ),
+        rounds_override=2,
+        output_dir=tmp_path / "run",
+        rollout_client=FakeRolloutClient(),
+        evolution_client=evolution,
+        worker_runner=multi_output_worker,
+        poll_interval_seconds=0.0,
+        max_poll_attempts=1,
+    )
+
+    assert result["status"] == "failed"
+    assert len(result["tasks"][0]["rounds"]) == 1
+    job_result = result["tasks"][0]["rounds"][0]["jobs"][0]
+    assert job_result["promotion_status"] == "missing_promoted_target_artifact"
+    assert job_result["artifact_ids"] == list(artifacts)
+    assert job_result["target_artifact_ids"] == ["candidate-agent-system-a"]
+    assert job_result["approved_artifact_ids"] == []
+    assert result["tasks"][0]["rounds"][0]["artifact_ids"]["agent_system"] == []
 
 
 def test_local_worker_runner_returns_recorded_failures(
@@ -3679,6 +4069,7 @@ def test_local_worker_runner_returns_recorded_failures(
         base_url="http://evolution.test",
         artifact_root=tmp_path / "artifacts",
         capabilities=["openevo:run:task:round-0:text_memory_reflector"],
+        executable_registry=_EXECUTABLE_REGISTRY,
     )
 
     assert result == [{"job_id": "job-1", "state": "failed", "error": "reflector crashed"}]
@@ -3735,19 +4126,42 @@ class FakeEvolutionClient:
         self.jobs.append(payload)
         return {"job_id": f"job-{len(self.jobs)}", "state": "pending"}
 
+    def create_plan_bound_job(self, payload: dict[str, Any]) -> dict[str, Any]:
+        selection = next(
+            selection
+            for selection in payload["plan"]["selections"]
+            if selection["target_id"] == payload["target_id"]
+        )
+        projected = {
+            **payload,
+            "method": selection["method_id"],
+            "config": {
+                **json.loads(selection["config_json"]),
+                **payload["core_config"],
+            },
+            "input_artifact_ids": [
+                artifact_id
+                for binding in payload["input_bindings"]
+                for artifact_id in binding["artifact_ids"]
+            ],
+        }
+        self.jobs.append(projected)
+        return {"job_id": f"job-{len(self.jobs)}", "state": "pending"}
+
     def get_artifact(self, artifact_id: str) -> dict[str, Any]:
         artifact = self.artifacts.get(artifact_id)
         if artifact is not None:
             return dict(artifact)
         artifact_type = (
             "text_memory"
-            if "text-memory" in artifact_id
+            if "text-memory" in artifact_id or "text_memory" in artifact_id
             else "parametric_memory"
             if "parametric-memory" in artifact_id or "parametric_memory" in artifact_id
             else "skill_bundle"
-            if "skill-bundle" in artifact_id
+            if "skill-bundle" in artifact_id or "skill_bundle" in artifact_id
             else "agent_system"
         )
+        promoted = not self.jobs or self.jobs[-1]["config"].get("promoted") is not False
         return {
             "artifact_id": artifact_id,
             "type": artifact_type,
@@ -3757,7 +4171,7 @@ class FakeEvolutionClient:
             "compatibility": {},
             "scores": {},
             "tags": [],
-            "promoted": False,
+            "promoted": promoted,
         }
 
     def update_artifact_promotion(self, artifact_id: str, *, promoted: bool) -> dict[str, Any]:

@@ -104,6 +104,41 @@ def test_worker_claim_request_and_enums():
     assert JobState.PENDING == "pending"
 
 
+def test_worker_claim_request_binds_method_names_to_identity_digests():
+    request = WorkerClaimRequest(
+        worker_id="verified-worker",
+        method_capabilities=["skill_bundle_reflector"],
+        method_identity_capabilities={"skill_bundle_reflector": "a" * 64},
+    )
+
+    assert request.method_identity_capabilities == {
+        "skill_bundle_reflector": "a" * 64
+    }
+    with pytest.raises(ValidationError, match="same methods"):
+        WorkerClaimRequest(
+            worker_id="mismatched-worker",
+            method_capabilities=["skill_bundle_reflector"],
+            method_identity_capabilities={"text_memory_reflector": "a" * 64},
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("capabilities", [f"capability-{index}" for index in range(257)]),
+        ("method_capabilities", [f"method-{index}" for index in range(257)]),
+        ("capabilities", ["duplicate", "duplicate"]),
+        ("method_capabilities", ["duplicate", "duplicate"]),
+    ],
+)
+def test_worker_claim_request_rejects_unbounded_or_duplicate_capabilities(
+    field: str,
+    value: list[str],
+):
+    with pytest.raises(ValidationError):
+        WorkerClaimRequest(worker_id="worker", **{field: value})
+
+
 def test_worker_claim_response_validates_typed_job_payload():
     response = WorkerClaimResponse(
         job={
@@ -156,6 +191,12 @@ def test_worker_claim_response_validates_typed_job_payload():
             "config": {"epochs": 1},
             "priority": 50,
             "state": "claimed",
+            "plan": None,
+            "target_id": None,
+            "registry_snapshot_digest": None,
+            "method_identity_digest": None,
+            "execution_envelope": None,
+            "execution_envelope_digest": None,
         }
     }
 

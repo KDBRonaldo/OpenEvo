@@ -57,18 +57,17 @@ The lifecycle for a new built-in method is:
 6. Let Desktop consume only `desktop` exposure; maintainers and benchmark
    automation may consume `maintainer` and `internal` entries through Core.
 
-During A2.2 only, existing built-ins remain in `METHOD_REGISTRY` for unchanged
-worker dispatch, and `METHOD_METADATA` remains for the old capabilities path.
-Any built-in added to one legacy table during this interval must be added to the
-other with the same key; CI enforces equality. Exact-object tests prevent
-callable drift. A2.3 cuts dispatch/capabilities over; A2.5 deletes both duplicate
-legacy tables.
+Existing built-ins remain in `METHOD_REGISTRY` only for unplanned benchmark
+jobs, and `METHOD_METADATA` remains only for the old capability projection.
+Plan-bound product jobs dispatch from `VerifiedExecutableRegistry` and never
+fall back to either table. Exact-object tests protect legacy callable identity;
+A2.5 deletes both duplicate tables after benchmark/capability migration.
 
-A2.2 can verify a locked research-plugin wheel and its entry points, but current
-workers do not invoke those handles. In-process plugin execution and registry
-composition are A2.3 behavior. Until then, new plugin code is testable through
-its direct contract or the existing external-worker protocol, not as a claimed
-release capability.
+The loader can verify a locked research-plugin wheel and its entry points, and
+the worker can invoke a context-ABI handle present in its executable registry.
+Current release startup still composes built-ins only: multi-distribution plugin
+composition is unfinished. Until it lands, new plugin code is contract-testable
+but is not a claimed release capability.
 
 Framework exposure uses `desktop`, `maintainer`, and `internal`. The historical
 legacy metadata values `ordinary_user` and `dev_kit` remain only until A2.5;

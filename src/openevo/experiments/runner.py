@@ -9,11 +9,13 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from openevo.evolution.framework import EvolutionExecutionProfile, RegistrySnapshot
+from openevo.evolution.framework.builtins import VerifiedExecutableRegistry
 from openevo.evolution.worker import EvolutionWorkerClient, run_once
 
 from .clients import EvolutionClientProtocol, EvolutionHttpClient
 from .clients import RolloutClientProtocol, RolloutHttpClient
-from .compiler import CompiledExperiment, compile_experiment
+from .compiler import CompiledEvolutionMethodSpec, CompiledExperiment, compile_experiment
 from .models import ExperimentConfig
 from .promotion import (
     PromotionReviewer,
@@ -31,11 +33,15 @@ def dry_run_experiment(
     *,
     task_ids: Sequence[str] | None = None,
     rounds_override: int | None = None,
+    registry_snapshot: RegistrySnapshot,
+    execution_profile: EvolutionExecutionProfile,
 ) -> dict[str, Any]:
     compiled = compile_experiment(
         config,
         task_ids=task_ids,
         rounds_override=rounds_override,
+        registry_snapshot=registry_snapshot,
+        execution_profile=execution_profile,
     )
     return compiled_experiment_plan(compiled)
 
@@ -51,6 +57,7 @@ def compiled_experiment_plan(compiled: CompiledExperiment) -> dict[str, Any]:
             method_specs = compiled.evolution_methods_for_round(
                 round_index,
                 prior_dataset_artifact_ids=history_context_artifact_ids["dataset"],
+                task_id=task.task_id,
             )
             rounds.append(
                 {
@@ -74,7 +81,7 @@ def compiled_experiment_plan(compiled: CompiledExperiment) -> dict[str, Any]:
                 artifact_placeholder = (
                     f"<{spec.artifact_type}_artifact:{task.task_id}:round-{round_index}>"
                 )
-                history_context_artifact_ids[spec.artifact_type].append(
+                history_context_artifact_ids.setdefault(spec.artifact_type, []).append(
                     artifact_placeholder
                 )
                 next_rollout_context_artifact_ids[spec.artifact_type] = [
@@ -118,6 +125,8 @@ def run_experiment(
     promotion_reviewer: PromotionReviewer | None = None,
     poll_interval_seconds: float = 2.0,
     max_poll_attempts: int = 1800,
+    executable_registry: VerifiedExecutableRegistry,
+    execution_profile: EvolutionExecutionProfile,
 ) -> dict[str, Any]:
     _validate_polling_options(
         poll_interval_seconds=poll_interval_seconds,
@@ -129,6 +138,8 @@ def run_experiment(
         task_ids=task_ids,
         rounds_override=rounds_override,
         run_id=run_id,
+        registry_snapshot=executable_registry.snapshot,
+        execution_profile=execution_profile,
     )
     output_root = (
         output_dir
@@ -153,6 +164,7 @@ def run_experiment(
             promotion_reviewer=promotion_reviewer,
             poll_interval_seconds=poll_interval_seconds,
             max_poll_attempts=max_poll_attempts,
+            executable_registry=executable_registry,
         )
     finally:
         if owns_rollout and hasattr(rollout, "close"):
@@ -181,6 +193,7 @@ def _run_compiled_experiment(
     promotion_reviewer: PromotionReviewer | None,
     poll_interval_seconds: float,
     max_poll_attempts: int,
+    executable_registry: VerifiedExecutableRegistry,
 ) -> dict[str, Any]:
     task_results: list[dict[str, Any]] = []
     any_failure = False
@@ -237,6 +250,7 @@ def _run_compiled_experiment(
             method_specs = compiled.evolution_methods_for_round(
                 round_index,
                 prior_dataset_artifact_ids=prior_context_artifact_ids["dataset"],
+                task_id=task.task_id,
             )
             for spec in method_specs:
                 job_payload = task.evolution_job_payloads_for_round(
@@ -252,7 +266,9 @@ def _run_compiled_experiment(
                     method=spec.method,
                 )
                 job_payload["job_type"] = claim_capability
-                created_job = evolution_client.create_job(job_payload)
+                created_job = evolution_client.create_plan_bound_job(
+                    _plan_bound_job_payload(spec, job_payload)
+                )
                 created_job_id = _required_text(
                     created_job,
                     "job_id",
@@ -264,6 +280,7 @@ def _run_compiled_experiment(
                     artifact_root=artifact_root,
                     capability=claim_capability,
                     expected_job_id=created_job_id,
+                    executable_registry=executable_registry,
                 )
                 artifact_ids, unexpected_job_ids = _artifact_ids_from_worker_results(
                     worker_results,
@@ -286,18 +303,44 @@ def _run_compiled_experiment(
                     else "missing_artifacts"
                 )
                 if worker_status == "succeeded":
-                    approved_artifact_ids = list(artifact_ids)
-                    promotion_status = "skipped"
+                    artifacts = [
+                        evolution_client.get_artifact(artifact_id)
+                        for artifact_id in artifact_ids
+                    ]
+                    for expected_artifact_id, artifact in zip(
+                        artifact_ids,
+                        artifacts,
+                        strict=True,
+                    ):
+                        actual_artifact_id = _required_text(
+                            artifact,
+                            "artifact_id",
+                            "artifact response",
+                        )
+                        if actual_artifact_id != expected_artifact_id:
+                            raise ValueError(
+                                "artifact response identity does not match worker output: "
+                                f"expected {expected_artifact_id!r}, got {actual_artifact_id!r}"
+                            )
+                    target_artifacts = [
+                        artifact
+                        for artifact in artifacts
+                        if artifact.get("type") == spec.artifact_type
+                    ]
+                    target_artifact_ids = [
+                        _required_text(artifact, "artifact_id", "artifact response")
+                        for artifact in target_artifacts
+                    ]
+                    approved_artifact_ids: list[str]
                     promotion_reviews: list[dict[str, Any]] = []
                     if _promotion_gate_targets_artifact(
                         compiled.promotion_gate,
                         spec.artifact_type,
                     ):
-                        artifacts = [
-                            evolution_client.get_artifact(artifact_id)
-                            for artifact_id in artifact_ids
-                        ]
-                        _demote_already_promoted_artifacts(evolution_client, artifacts)
+                        _demote_already_promoted_artifacts(
+                            evolution_client,
+                            target_artifacts,
+                        )
                         promotion_result = evaluate_promotion_gate(
                             gate_config=compiled.promotion_gate,
                             artifact_type=spec.artifact_type,
@@ -306,7 +349,7 @@ def _run_compiled_experiment(
                             round_index=round_index,
                             job_id=created_job_id,
                             job_payload=job_payload,
-                            artifacts=artifacts,
+                            artifacts=target_artifacts,
                             output_root=output_root,
                             content_roots=[artifact_root],
                             reviewer=promotion_reviewer,
@@ -332,6 +375,22 @@ def _run_compiled_experiment(
                         else:
                             any_failure = True
                             round_failed = True
+                    else:
+                        approved_artifact_ids = [
+                            _required_text(
+                                artifact,
+                                "artifact_id",
+                                "artifact response",
+                            )
+                            for artifact in target_artifacts
+                            if artifact.get("promoted") is True
+                        ]
+                        if approved_artifact_ids:
+                            promotion_status = "skipped"
+                        else:
+                            promotion_status = "missing_promoted_target_artifact"
+                            any_failure = True
+                            round_failed = True
 
                     history_context_artifact_ids.setdefault(spec.artifact_type, []).extend(
                         approved_artifact_ids
@@ -340,6 +399,7 @@ def _run_compiled_experiment(
                         approved_artifact_ids
                     )
                 else:
+                    target_artifact_ids = []
                     approved_artifact_ids = []
                     promotion_status = "not_applicable"
                     promotion_reviews = []
@@ -353,6 +413,7 @@ def _run_compiled_experiment(
                         "worker_error": worker_error,
                         "unexpected_job_ids": unexpected_job_ids,
                         "artifact_ids": artifact_ids,
+                        "target_artifact_ids": target_artifact_ids,
                         "approved_artifact_ids": approved_artifact_ids,
                         "promotion_status": promotion_status,
                         "promotion_reviews": promotion_reviews,
@@ -553,6 +614,32 @@ def _claim_capability_for_job(
     return f"openevo:{run_id}:{task_id}:round-{round_index}:{method}"
 
 
+def _plan_bound_job_payload(
+    spec: CompiledEvolutionMethodSpec,
+    legacy_job_payload: dict[str, Any],
+) -> dict[str, Any]:
+    user_config = spec.selection.config()
+    legacy_config = legacy_job_payload.get("config")
+    if not isinstance(legacy_config, dict):
+        raise ValueError("compiled evolution job config must be a JSON object")
+    for key, value in user_config.items():
+        if legacy_config.get(key) != value:
+            raise ValueError(
+                f"compiled evolution job changed normalized method config field {key!r}"
+            )
+    core_config = {
+        key: value for key, value in legacy_config.items() if key not in user_config
+    }
+    return {
+        "plan": spec.plan.model_dump(mode="json"),
+        "target_id": spec.target_id,
+        "job_type": legacy_job_payload["job_type"],
+        "input_bindings": legacy_job_payload["input_bindings"],
+        "core_config": core_config,
+        "priority": legacy_job_payload.get("priority", 100),
+    }
+
+
 def _run_worker_for_job(
     compiled: CompiledExperiment,
     *,
@@ -560,6 +647,7 @@ def _run_worker_for_job(
     artifact_root: Path,
     capability: str,
     expected_job_id: str,
+    executable_registry: VerifiedExecutableRegistry,
 ) -> list[dict[str, Any]]:
     if worker_runner is not None:
         return worker_runner(
@@ -573,6 +661,7 @@ def _run_worker_for_job(
         base_url=compiled.evolution_backend_url,
         artifact_root=artifact_root,
         capabilities=[capability],
+        executable_registry=executable_registry,
     )
 
 
@@ -581,6 +670,7 @@ def _run_local_worker_once(
     base_url: str,
     artifact_root: Path,
     capabilities: list[str],
+    executable_registry: VerifiedExecutableRegistry,
 ) -> list[dict[str, Any]]:
     with _RecordingEvolutionWorkerClient(base_url) as client:
         claimed = run_once(
@@ -589,6 +679,7 @@ def _run_local_worker_once(
             capabilities=capabilities,
             artifact_root=artifact_root,
             lease_seconds=600,
+            executable_registry=executable_registry,
         )
         if not claimed:
             return [{"claimed": False, "artifact_ids": []}]

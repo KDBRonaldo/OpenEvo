@@ -21,6 +21,7 @@ from openevo.evolution.framework import (
     EvolutionTargetSelection,
     ExecutionMode,
     ImplementationRef,
+    MethodInvocationABI,
     MethodInputBinding,
     InstructionContribution,
     RendererPayload,
@@ -89,6 +90,7 @@ def test_descriptors_are_strict_frozen_and_use_stable_ids() -> None:
         display_name="Text Memory ExpeL",
         description="Reflect transcript trajectories into reusable memory.",
         target_id="text_memory",
+        invocation_abi=MethodInvocationABI.LEGACY_WORKER_JOB_V1,
         execution_modes=("subscription", "self_deployed"),
         capture_modes=("transcript",),
         supported_harness_ids=("codex",),
@@ -104,6 +106,7 @@ def test_descriptors_are_strict_frozen_and_use_stable_ids() -> None:
         implementation_ref=_implementation(),
     )
     assert method.default_config == {}
+    assert method.invocation_abi is MethodInvocationABI.LEGACY_WORKER_JOB_V1
     with pytest.raises(ValidationError):
         method.id = "changed"
     with pytest.raises(ValidationError, match="stable identifier"):
@@ -116,6 +119,28 @@ def test_descriptors_are_strict_frozen_and_use_stable_ids() -> None:
             **method.model_dump(),
             unexpected=True,
         )
+
+
+def test_method_invocation_abi_is_closed_and_required() -> None:
+    assert tuple(abi.value for abi in MethodInvocationABI) == (
+        "legacy_worker_job_v1",
+        "method_context_v1",
+    )
+    payload = {
+        "id": "reflect",
+        "display_name": "Reflect",
+        "description": "Reflect trajectories.",
+        "target_id": "text_memory",
+        "execution_modes": ("self_deployed",),
+        "capture_modes": ("transcript",),
+        "supported_harness_ids": ("codex",),
+        "output_artifact_types": ("text_memory",),
+    }
+
+    with pytest.raises(ValidationError, match="invocation_abi"):
+        EvolutionMethodDescriptor(**payload)
+    with pytest.raises(ValidationError, match="invocation_abi"):
+        EvolutionMethodDescriptor(**payload, invocation_abi="unknown_v1")
 
 
 @pytest.mark.parametrize(
@@ -589,6 +614,7 @@ def test_caller_mutation_does_not_change_descriptor_copy_input() -> None:
         display_name="Reflect",
         description="Reflect.",
         target_id="memory",
+        invocation_abi=MethodInvocationABI.METHOD_CONTEXT_V1,
         execution_modes=("self_deployed",),
         capture_modes=("transcript",),
         supported_harness_ids=("codex",),

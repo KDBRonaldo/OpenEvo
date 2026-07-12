@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import posixpath
 import re
@@ -207,6 +208,11 @@ def build_remote_services_plan(bootstrap_plan: RemoteBootstrapPlan) -> RemoteSer
     topology_path = posixpath.join(services_root, "topology.yaml")
     log_dir = posixpath.join(services_root, "logs")
     pid_dir = posixpath.join(services_root, "pids")
+    framework_lock_path = posixpath.join(
+        state_root,
+        "wheels",
+        "framework-lock.json",
+    )
     experiment_snapshot = bootstrap_plan.experiment_snapshot
     model = _agent_model(experiment_snapshot)
     managed_hf_model = _managed_hf_model(experiment_snapshot)
@@ -234,6 +240,8 @@ def build_remote_services_plan(bootstrap_plan: RemoteBootstrapPlan) -> RemoteSer
                     managed_hf_model,
                     log_dir=log_dir,
                     pid_dir=pid_dir,
+                    framework_lock_path=framework_lock_path,
+                    identity_env=bootstrap_plan.proxy_env,
                 ),
                 health_command=_http_health_command(
                     "http://127.0.0.1:8000/v1/models",
@@ -247,6 +255,7 @@ def build_remote_services_plan(bootstrap_plan: RemoteBootstrapPlan) -> RemoteSer
                     "vllm",
                     log_dir=log_dir,
                     pid_dir=pid_dir,
+                    framework_lock_path=framework_lock_path,
                     port=8000,
                     model=managed_hf_model,
                 ),
@@ -268,9 +277,13 @@ def build_remote_services_plan(bootstrap_plan: RemoteBootstrapPlan) -> RemoteSer
                         "8765",
                         "--state-root",
                         state_root,
+                        "--framework-lock",
+                        framework_lock_path,
                     ],
                     log_dir=log_dir,
                     pid_dir=pid_dir,
+                    framework_lock_path=framework_lock_path,
+                    identity_env=bootstrap_plan.proxy_env,
                 ),
                 health_command=_http_health_command("http://127.0.0.1:8765/health"),
                 env=dict(bootstrap_plan.proxy_env),
@@ -280,6 +293,7 @@ def build_remote_services_plan(bootstrap_plan: RemoteBootstrapPlan) -> RemoteSer
                     "openevo_backend",
                     log_dir=log_dir,
                     pid_dir=pid_dir,
+                    framework_lock_path=framework_lock_path,
                     port=8765,
                 ),
             ),
@@ -301,9 +315,13 @@ def build_remote_services_plan(bootstrap_plan: RemoteBootstrapPlan) -> RemoteSer
                         posixpath.join(state_root, "evolution", "evolution.db"),
                         "--artifact-root",
                         posixpath.join(state_root, "evolution", "artifacts"),
+                        "--framework-lock",
+                        framework_lock_path,
                     ],
                     log_dir=log_dir,
                     pid_dir=pid_dir,
+                    framework_lock_path=framework_lock_path,
+                    identity_env=bootstrap_plan.proxy_env,
                 ),
                 health_command=_http_health_command(
                     "http://127.0.0.1:8200/v1/health"
@@ -315,6 +333,7 @@ def build_remote_services_plan(bootstrap_plan: RemoteBootstrapPlan) -> RemoteSer
                     "evolution_backend",
                     log_dir=log_dir,
                     pid_dir=pid_dir,
+                    framework_lock_path=framework_lock_path,
                     port=8200,
                 ),
             ),
@@ -332,6 +351,8 @@ def build_remote_services_plan(bootstrap_plan: RemoteBootstrapPlan) -> RemoteSer
                     ],
                     log_dir=log_dir,
                     pid_dir=pid_dir,
+                    framework_lock_path=framework_lock_path,
+                    identity_env=bootstrap_plan.proxy_env,
                 ),
                 health_command=_http_health_command("http://127.0.0.1:8080/health"),
                 env=dict(bootstrap_plan.proxy_env),
@@ -341,6 +362,7 @@ def build_remote_services_plan(bootstrap_plan: RemoteBootstrapPlan) -> RemoteSer
                     "rollout",
                     log_dir=log_dir,
                     pid_dir=pid_dir,
+                    framework_lock_path=framework_lock_path,
                     port=8080,
                 ),
             ),
@@ -360,6 +382,8 @@ def build_remote_services_plan(bootstrap_plan: RemoteBootstrapPlan) -> RemoteSer
                     ],
                     log_dir=log_dir,
                     pid_dir=pid_dir,
+                    framework_lock_path=framework_lock_path,
+                    identity_env=bootstrap_plan.proxy_env,
                 ),
                 health_command=_http_health_command("http://127.0.0.1:8100/health"),
                 env=dict(bootstrap_plan.proxy_env),
@@ -369,6 +393,7 @@ def build_remote_services_plan(bootstrap_plan: RemoteBootstrapPlan) -> RemoteSer
                     "gateway",
                     log_dir=log_dir,
                     pid_dir=pid_dir,
+                    framework_lock_path=framework_lock_path,
                     port=8100,
                 ),
             ),
@@ -388,9 +413,13 @@ def build_remote_services_plan(bootstrap_plan: RemoteBootstrapPlan) -> RemoteSer
                         "openevo-desktop-worker",
                         "--artifact-root",
                         posixpath.join(state_root, "evolution", "artifacts"),
+                        "--framework-lock",
+                        framework_lock_path,
                     ],
                     log_dir=log_dir,
                     pid_dir=pid_dir,
+                    framework_lock_path=framework_lock_path,
+                    identity_env=bootstrap_plan.proxy_env,
                 ),
                 health_command=_pid_health_command(
                     posixpath.join(pid_dir, "evolution_worker.pid")
@@ -402,6 +431,7 @@ def build_remote_services_plan(bootstrap_plan: RemoteBootstrapPlan) -> RemoteSer
                     "evolution_worker",
                     log_dir=log_dir,
                     pid_dir=pid_dir,
+                    framework_lock_path=framework_lock_path,
                 ),
             ),
         ]
@@ -922,6 +952,7 @@ def _daemon_manifest(
     *,
     log_dir: str,
     pid_dir: str,
+    framework_lock_path: str,
     port: int | None = None,
     model: str | None = None,
 ) -> dict[str, Any]:
@@ -929,6 +960,9 @@ def _daemon_manifest(
         "service_id": service_id,
         "pid_path": posixpath.join(pid_dir, f"{service_id}.pid"),
         "log_path": posixpath.join(log_dir, f"{service_id}.log"),
+        "identity_path": posixpath.join(pid_dir, f"{service_id}.identity"),
+        "identity_source_path": framework_lock_path,
+        "identity_scheme": "framework_lock_and_argv_sha256_v1",
     }
     if port is not None:
         manifest["port"] = port
@@ -1095,56 +1129,167 @@ def _daemon_command(
     *,
     log_dir: str,
     pid_dir: str,
+    framework_lock_path: str,
+    identity_env: Mapping[str, str],
     prelude: list[str] | None = None,
 ) -> str:
     pid_path = posixpath.join(pid_dir, f"{service_id}.pid")
     log_path = posixpath.join(log_dir, f"{service_id}.log")
+    identity_path = posixpath.join(pid_dir, f"{service_id}.identity")
+    identity_env_digest = hashlib.sha256(
+        json.dumps(
+            dict(sorted(identity_env.items())),
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+    identity_material = json.dumps(
+        {
+            "argv": argv,
+            "environment_digest": identity_env_digest,
+            "service_id": service_id,
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
     command = " ".join(shlex.quote(part) for part in argv)
     return "\n".join(
         [
             f"mkdir -p {shlex.quote(log_dir)} {shlex.quote(pid_dir)}",
-            _daemon_alive_check_command(pid_path),
+            (
+                'daemon_identity="$('
+                + _daemon_identity_check_command(
+                    pid_path,
+                    identity_path,
+                    framework_lock_path,
+                    identity_material,
+                )
+                + '\n)"'
+            ),
+            "daemon_identity_status=$?",
+            "if [ $daemon_identity_status -eq 0 ]; then exit 0; fi",
+            (
+                "if [ $daemon_identity_status -ne 1 ]; then "
+                "exit $daemon_identity_status; fi"
+            ),
             *(prelude or []),
             (
                 'nohup env PATH="$HOME/.local/bin:$PATH" '
                 f"{command} > {shlex.quote(log_path)} 2>&1 < /dev/null &"
             ),
             f"echo $! > {shlex.quote(pid_path)}",
+            f"identity_tmp={shlex.quote(identity_path)}.tmp.$$",
+            "printf '%s\\n' \"$daemon_identity\" > \"$identity_tmp\"",
+            f"mv -f -- \"$identity_tmp\" {shlex.quote(identity_path)}",
         ]
     )
 
 
-def _daemon_alive_check_command(pid_path: str) -> str:
+def _daemon_identity_check_command(
+    pid_path: str,
+    identity_path: str,
+    framework_lock_path: str,
+    identity_material: str,
+) -> str:
     return "\n".join(
         [
             "python3 - <<'PY'",
+            "import hashlib",
             "import os",
+            "import signal",
+            "import sys",
+            "import time",
             "from pathlib import Path",
             f"pid_path = Path({pid_path!r})",
+            f"identity_path = Path({identity_path!r})",
+            f"framework_lock_path = Path({framework_lock_path!r})",
+            f"identity_material = {identity_material!r}",
+            "try:",
+            "    lock_bytes = framework_lock_path.read_bytes()",
+            "except OSError as exc:",
+            (
+                "    print(f'failed to read daemon identity source "
+                "{framework_lock_path}: {exc}', file=sys.stderr)"
+            ),
+            "    raise SystemExit(2)",
+            "digest = hashlib.sha256()",
+            "digest.update(b'openevo-daemon-v1\\0')",
+            "digest.update(lock_bytes)",
+            "digest.update(b'\\0')",
+            "digest.update(identity_material.encode('utf-8'))",
+            "expected_identity = digest.hexdigest()",
             "try:",
             "    text = pid_path.read_text(encoding='utf-8').strip()",
             "except FileNotFoundError:",
+            "    print(expected_identity)",
             "    raise SystemExit(1)",
             "if not text:",
+            "    print(expected_identity)",
             "    raise SystemExit(1)",
             "try:",
             "    pid = int(text)",
             "except ValueError:",
+            "    print(expected_identity)",
             "    raise SystemExit(1)",
             "if pid <= 0:",
+            "    print(expected_identity)",
             "    raise SystemExit(1)",
             "try:",
             "    os.kill(pid, 0)",
-            "except OSError:",
+            "except ProcessLookupError:",
+            "    print(expected_identity)",
             "    raise SystemExit(1)",
-            "raise SystemExit(0)",
+            "except OSError as exc:",
+            "    print(f'failed to inspect daemon pid {pid}: {exc}', file=sys.stderr)",
+            "    raise SystemExit(2)",
+            "try:",
+            "    current_identity = identity_path.read_text(encoding='utf-8').strip()",
+            "except OSError:",
+            "    current_identity = ''",
+            "if current_identity == expected_identity:",
+            "    raise SystemExit(0)",
+            "try:",
+            "    os.kill(pid, signal.SIGTERM)",
+            "except ProcessLookupError:",
+            "    pass",
+            "except OSError as exc:",
+            "    print(f'failed to stop stale daemon pid {pid}: {exc}', file=sys.stderr)",
+            "    raise SystemExit(2)",
+            "deadline = time.monotonic() + 10",
+            "while time.monotonic() < deadline:",
+            "    try:",
+            "        os.kill(pid, 0)",
+            "    except ProcessLookupError:",
+            "        break",
+            "    time.sleep(0.2)",
+            "else:",
+            (
+                "    print(f'stale daemon pid {pid} did not stop after identity "
+                "change', file=sys.stderr)"
+            ),
+            "    raise SystemExit(2)",
+            "for stale_path in (pid_path, identity_path):",
+            "    try:",
+            "        stale_path.unlink()",
+            "    except FileNotFoundError:",
+            "        pass",
+            "print(expected_identity)",
+            "raise SystemExit(1)",
             "PY",
-            "if [ $? -eq 0 ]; then exit 0; fi",
         ]
     )
 
 
-def _vllm_command(model: str, *, log_dir: str, pid_dir: str) -> str:
+def _vllm_command(
+    model: str,
+    *,
+    log_dir: str,
+    pid_dir: str,
+    framework_lock_path: str,
+    identity_env: Mapping[str, str],
+) -> str:
     install_prelude = [
         "\n".join(
             [
@@ -1179,6 +1324,8 @@ def _vllm_command(model: str, *, log_dir: str, pid_dir: str) -> str:
         ],
         log_dir=log_dir,
         pid_dir=pid_dir,
+        framework_lock_path=framework_lock_path,
+        identity_env=identity_env,
         prelude=install_prelude,
     )
 

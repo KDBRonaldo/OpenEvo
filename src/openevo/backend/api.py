@@ -39,6 +39,7 @@ from openevo.backend.models import (
     TimelineEvent,
 )
 from openevo.capabilities import CoreCapabilities, build_core_capabilities
+from openevo.evolution.framework.builtins import VerifiedExecutableRegistry
 from openevo.evolution.models import ArtifactResponse
 from openevo.evolution.store import EvolutionStore
 
@@ -88,8 +89,13 @@ def _bad_request(code: str, category: ErrorCategory, message: str) -> BackendHTT
     )
 
 
-def create_backend_app(state_root: str | Path | None = None) -> FastAPI:
+def create_backend_app(
+    state_root: str | Path | None = None,
+    *,
+    evolution_registry: VerifiedExecutableRegistry | None = None,
+) -> FastAPI:
     app = FastAPI(title="OpenEvo Core Backend", version="0.1.0")
+    app.state.evolution_registry = evolution_registry
     canonical_state_root = _canonical_state_root(state_root)
     project_counter = count(1)
     run_counter = count(1)

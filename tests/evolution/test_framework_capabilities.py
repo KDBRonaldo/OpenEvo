@@ -65,6 +65,7 @@ def _snapshot():
                 display_name=method_id,
                 description=f"{method_id} method",
                 target_id="memory",
+                invocation_abi="method_context_v1",
                 execution_modes=(
                     ("subscription",)
                     if method_id == "reflect"

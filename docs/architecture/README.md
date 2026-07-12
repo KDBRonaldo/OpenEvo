@@ -29,8 +29,8 @@ capabilities, and is not a separate product surface.
    - Core artifact contracts and how new evolution methods plug into the
      method registry.
 6. [Pluggable Evolution Framework Contract](evolution-framework.md)
-   - A2 target/method registry, plan identity, handler contributions, capability
-     projection, and security contract; A2.1 has not cut over runtime paths.
+   - A2 target/method registry, durable plan identity, verified worker dispatch,
+     handler contributions, remaining capability projection, and security contract.
 7. [Protected Evolution Behavior](protected-behavior.md)
    - A1 regression tests for validated methods and the proven stage boundaries
      preserved during productization.
@@ -44,9 +44,9 @@ capabilities, and is not a separate product surface.
 ## Desktop And Remote Lifecycle
 
 Pre-release Desktop workflow notes live under `docs/user/`; Core target
-contracts live under `docs/core/`. Older Desktop foundation notes remain as
-non-current implementation history and are not part of the recommended reading
-order.
+contracts live under `docs/core/`. [Desktop Release Packaging](openevo-desktop-release.md)
+separates the currently executable sidecar build from the still-blocked macOS
+DMG release gates. Older Desktop foundation notes remain implementation history.
 
 ## Core Backend Internals
 

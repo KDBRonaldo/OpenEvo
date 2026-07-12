@@ -7,7 +7,7 @@ def test_evolution_cli_defaults_use_openevo_state_root() -> None:
     parser = build_parser()
 
     cases = [
-        ["serve"],
+        ["serve", "--framework-lock", "/tmp/framework-lock.json"],
         ["worker"],
         ["terminal-bench-dataset", "--input", "trial", "--name", "tb"],
         ["terminal-bench-agent-system-job", "--reflector-model", "gpt-5.5"],

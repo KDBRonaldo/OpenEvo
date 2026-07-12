@@ -1,20 +1,22 @@
 # Pluggable Evolution Framework
 
-Status: A2.3 project-schema cutover in progress; registry runtime cutover is deferred
+Status: A2.3 plan-bound dispatch implemented; remote capability cutover remains
 
 Tracking: issues #137, #139, #141, and #142, productization step A2. A2.1
 implements contracts for `PLUG-1` through `PLUG-4`; A2.2 catalogs the existing
-implementations; the first A2.3 slice migrates project configuration and round
-method projection without changing method dispatch.
+implementations; A2.3 now covers project configuration, per-round plans, durable
+job identity, and verified worker dispatch. Remote capability projection is the
+remaining A2.3 slice.
 
 This contract makes evolution targets and methods pluggable without replacing
 the existing OpenEvo Core architecture. A2.1 added the data models and
 validation. A2.2 adds a deterministic built-in catalog and distribution-backed
 entry-point verification. A2.3 now uses the canonical target map in Science,
-experiments, and Desktop, and resolves `agent_system=auto` from the round-start
-dataset snapshot. Method dispatch, worker leases, artifact registration,
-context resolution, gateway injection, and remote capability projection remain
-on their existing paths until their assigned cutovers.
+experiments, and Desktop, resolves `agent_system=auto` from the round-start
+dataset snapshot, persists the resulting plan with each new experiment job,
+and dispatches that job only through its verified method handle. Artifact
+registration, context resolution, gateway injection, and remote capability
+projection keep their existing contracts until their assigned cutovers.
 
 ## Boundary
 
@@ -122,18 +124,20 @@ They are not placeholders that claim current Gateway behavior has migrated.
 | `parametric_memory` | `parametric_memory_register` | internal | `adapter` |
 
 All current `METHOD_REGISTRY` keys have exactly one method descriptor whose
-entry point is `openevo.evolution.methods:<method_id>`. During A2.2,
-`load_builtin_method_handles` proves each resolved object is the same callable
-object as the legacy registry. This temporary equality check is an anti-drift
-guard, not a second dispatch path. A2.3 makes descriptor entry points
-authoritative; A2.5 deletes the legacy metadata/callable duplication.
+entry point is `openevo.evolution.methods:<method_id>`. The A2.2
+`load_builtin_method_handles` check remains an anti-drift test. Production
+plan-bound jobs now dispatch from `VerifiedExecutableRegistry.method_handles`;
+they never fall back to `METHOD_REGISTRY`. The legacy table remains only for
+unplanned benchmark jobs until their A2.5 migration.
 
 Only the three performance-protected methods are Desktop-exposed in the A2.2
 catalog, and they remain `experimental` until the release performance gates
 pass. Other text methods are maintainer-visible. Incomplete parameter methods
 remain internal. Pareto and GEPA descriptors declare both `agent_system` and
-`report` output, and `parametric_memory_register` correctly declares no input
-artifact.
+`report` output. Manual skill, agent-system, and parametric materializers
+declare optional current-dataset and prior-target inputs so their existing
+experiment job projection is preserved even though the algorithms do not
+require those inputs.
 
 Descriptor config schemas expose only bounded algorithm settings. Core-owned
 lineage, compatibility, scores, tags, promotion fields, audit policy, evaluator
@@ -149,6 +153,10 @@ history datasets. Multi-dataset legacy methods therefore use one
 caller supplies its existing ordered dataset sequence, and the adapter does not
 reinterpret it. This preserves both experiment-runner and protected benchmark
 ordering instead of imposing a new global current/history order.
+The experiment compiler preserves its pre-framework projection: ExpeL receives
+only the current-round dataset, while agent-system history, Pareto, and GEPA
+receive current then prior datasets. New methods request history explicitly with
+`history_datasets`; they do not inherit a legacy method-ID convention.
 
 The incomplete `parametric_memory_lora_sft` descriptor remains internal and
 requires the unavailable `constrained_trainer_contract` runtime capability. It
@@ -157,9 +165,9 @@ cannot be reported as runnable merely because a machine has `trainer` and
 types, with `application/octet-stream` as the inventory fallback for other
 auxiliary files.
 
-The legacy dispatch continues accepting its existing flat config until cutover,
-so this cataloging step does not alter current algorithm inputs. A2.3 must map
-Core-owned controls and the harness service before it can replace that path.
+The execution envelope reconstructs the existing flat `job.config` immediately
+before invoking a legacy ABI method. This preserves current algorithm inputs
+without allowing user config to shadow Core-owned controls.
 
 ## Selection And Plan
 
@@ -241,19 +249,18 @@ parametric algorithm design. Current non-parametric methods may require none.
 
 ## Method Inputs And Invocation
 
-Before registry dispatch cuts over, every method descriptor gains one closed
-invocation ABI that is part of its canonical identity:
+Every method descriptor has one closed invocation ABI that is part of its
+canonical identity:
 
 - `legacy_worker_job_v1`: `(WorkerClaimedJob, Path) -> artifacts`, invoked only
   through `invoke_legacy_method`;
 - `method_context_v1`: `(MethodExecutionContext) -> artifacts`, with inference
   available only through `CoreHarnessService`.
 
-The verified loader checks the one signature selected by that field and the
-worker dispatches by the field, never by signature guessing. A2.2 signature
-checks remain an anti-drift guard until this A2.3 descriptor/dispatch change is
-implemented; the current schema-only cutover does not claim the ABI is already
-present in `EvolutionMethodDescriptor`.
+The verified loader checks the exact signature selected by that field and the
+worker dispatches by the field, never by signature guessing. Missing or unknown
+ABIs, alternate parameter names/kinds, and variadic signatures fail closed
+before the registry becomes executable.
 
 Each method owns an ordered tuple of `MethodInputBinding` values. A binding
 declares source, artifact type, and minimum/maximum count. Core flattens bindings
@@ -287,18 +294,51 @@ no prior dataset selects `agent_system_reflector`; otherwise it selects
 lineage stores the requested value and prior dataset IDs. GEPA's internal
 candidate/round selection is separate algorithm-owned behavior.
 
-Experiment dry-run and live-run materialization now pass the same snapshot of
+Experiment dry-run and live-run materialization pass the same snapshot of
 datasets completed before the current round. The current round's dataset is not
 added until that round finishes. This means a later round without history still
 selects the plain reflector, while round zero with explicitly supplied history
-selects the history reflector. Until the verified executable registry is wired
-into production startup later in A2.3, this concrete resolution is recorded in
-the existing job projection; production `EvolutionPlan` binding is not yet
-claimed by this schema cutover. To prevent the broader generic config from
-enabling cross-target execution during that interval, the compiler fails closed
-against the existing built-in `METHOD_METADATA` target relation. This is a
-temporary A2 guard, not a new registry; the verified snapshot replaces it in
-the next A2.3 slice and A2.5 removes the legacy table.
+selects the history reflector. The compiler validates each enabled target and
+method against an explicit frozen registry/profile, assigns a stable plan ID
+from experiment/run/task/round identity plus ordered prior datasets, and sends
+the full plan to `POST /v1/planned-jobs`.
+
+The compiler emits every enabled plan selection. It preserves the protected
+built-in execution order and appends external targets by stable ID; it never
+silently drops an unknown-to-the-UI target. Artifact type comes from the target
+descriptor rather than the target ID. Input artifacts are projected in descriptor
+order from `current_dataset`, `history_datasets`, `current_target_artifacts`, or
+`explicit_inputs`, including multiple bindings with the same artifact type. Core
+injects built-in reflector/base-model defaults only when the selected closed
+method schema declares those fields.
+
+The store atomically persists the immutable plan and a job execution envelope
+containing the target, method identity, canonical user/Core config, ordered
+input artifact snapshots, and declared output types, plus an independent digest
+over the complete envelope. `(plan_id, target_id)` is
+unique: an identical create retries idempotently, while a conflicting retry
+fails. Plan-bound claims require both queue capabilities and exact verified
+method-ID-to-identity-digest capabilities; a worker without identities can claim
+only legacy jobs. Before granting a lease, the store validates persisted plan,
+envelope/digest, config, input snapshots, and output declarations against the
+active frozen registry. A corrupt plan-bound row is quarantined as failed before
+a lease is issued. The worker then revalidates
+them against its executable registry and renews the lease every one third of the
+claim duration. Completion repeats that validation before staging and publish,
+rejects undeclared output types, keeps job-owned outputs staged and invisible
+until artifact publication and job success commit atomically, and
+adds store-owned execution lineage without rewriting the algorithm's payload.
+Failure, lease expiry, startup recovery, and successful retry remove stale staged rows and manifests.
+
+Workers are trusted Core processes on the loopback backend boundary. Identity
+capability matching prevents stale or wrong locked workers from consuming a
+job; it is not cryptographic attestation against an arbitrary process running as
+the same remote user. Backend authentication/process isolation belongs to the
+Core lifecycle security workstream and must not be inferred from this contract.
+
+The generic `POST /v1/jobs` and `run_method()` path is bounded to benchmark
+automation that has not yet migrated. It cannot execute a plan-bound job or act
+as a fallback after identity verification fails.
 
 ## Bounded Config Schema
 
@@ -426,6 +466,9 @@ declared output artifact types must include the target artifact type. Candidate
 generation, evaluation, history accumulation, tie-breaking, and best-result
 selection stay inside the method. Core does not infer a winner from generic
 scores and does not rewrite algorithm output during promotion or context reuse.
+The runner routes only target-typed outputs: an auxiliary `report` remains
+observable but never becomes target history. Without an external gate, only a
+method-promoted target output is reusable; absence of one fails closed.
 
 The following remain frozen during adaptation:
 
@@ -441,7 +484,7 @@ The following remain frozen during adaptation:
 | --- | --- |
 | A2.1 | Contracts, bounded schema, ordered input/legacy invocation adapter, handler input/output validation, capability DTOs, frozen registry, identity, and focused tests only. |
 | A2.2 | Mechanically register current methods/targets/handlers and preserve GEPA behavior; no dispatch cutover. |
-| A2.3 | Generic project selections, plan compiler, capabilities, and registry dispatch on existing jobs/workers/artifacts. |
+| A2.3 | Generic selections, durable plans, verified registry dispatch, and remote capabilities on existing jobs/workers/artifacts; capability projection remains. |
 | A2.4 | Generic context/runtime contribution engine and capability-driven Desktop configuration/rendering. |
 | A2.5 | Remove duplicate registries and target switches, document extension paths, and pass behavior/performance gates. |
 
@@ -463,6 +506,7 @@ A2.2 verification adds:
   transitions.
 
 The release-shaped smoke builds the OpenEvo wheel, installs it into a fresh
-environment outside the repository, verifies the wheel against its SHA-256,
-and loads 12 exact method handles plus 8 target/handler identity anchors. This
-does not replace the final Terminal Bench performance gates.
+environment outside the repository, writes the same external framework lock
+used by Desktop bootstrap, verifies the wheel against its SHA-256, and loads 12
+exact method handles plus 8 target/handler identity anchors. This does not
+replace the final Terminal Bench performance gates.

@@ -77,9 +77,25 @@ optimization、skill synthesis、LoRA training 或评估。算法只需要遵守
 通用数据流：
 
 ```text
-session/task events -> dataset artifact -> evolution job -> worker method
+session/task events -> dataset artifact -> immutable evolution plan
+  -> plan-bound job -> verified worker method
   -> typed artifacts -> context resolve -> gateway runtime injection
 ```
+
+新的 Core experiment job 必须通过 `POST /v1/planned-jobs` 创建。Plan-bound job 持久化
+plan、plan digest、target、reachable registry digest、method identity、canonical execution envelope 和有序
+input artifact snapshots，并独立保存完整 envelope digest；复用 plan ID 时必须同时匹配
+schema version、registry snapshot digest、plan digest 和 canonical plan JSON；同一 plan/target 的相同请求幂等返回
+同一 job，不同请求拒绝。Worker
+claim 必须提交 verified method ID -> identity digest mapping，store 只租出 exact match，并在
+发 lease 前对照当前 frozen registry 校验 persisted plan/envelope/input snapshots；损坏的 selected row 会先隔离为 failed。
+Complete 必须再次完成同一校验并符合 active descriptor 声明的 output types。Outputs 由 job
+拥有并先 staged，不得在 job success 的最终事务前被读取、promotion 或 resolve；失败、lease
+过期和启动恢复会清理不可恢复的 staged rows/files。Claim 必须持久化请求的 lease duration，
+heartbeat 按该 duration 续租；所有 lease clear 路径同时清空 duration。Startup 在 DB recovery
+transaction 内将 Core-owned managed artifact manifests 与 DB rows reconciliation，提交后幂等删除
+无引用 orphan，且不得跟随 artifact root 外部 symlink。`POST /v1/jobs`/`METHOD_REGISTRY` 只暂留给尚未迁移的 benchmark automation，
+不能作为 plan 校验或 verified dispatch 失败后的 fallback。
 
 Project/experiment evolution config 只使用
 `evolution.targets.<target_id> = {enabled, method, config}`。启用的 target 必须显式选择
@@ -251,29 +267,31 @@ Runtime 消费：
 
 优先通过 evolution framework registry 接入新方法，不要把方法逻辑硬编码进 gateway、
 store 或调度分支。`src/openevo/evolution/framework/builtins.py` 是当前内置 target、handler
-identity 和 method descriptor 的权威目录；研究插件必须由维护者提供明确的 distribution
-lock，不能自动发现或自动启用。
+identity 和 method descriptor 的权威目录。Release startup 从 Desktop/维护者提供的外部
+`framework-lock.json` 校验 exact wheel 和安装 inventory，再发布
+`VerifiedExecutableRegistry`；不能自动发现、自动启用插件，也不能从运行中的代码自算 digest
+后信任。
 
-A2.2 只实现 catalog 和 verified loader；A2.3 的 project-schema slice 也尚未把 plugin handles
-接到 worker dispatch。因此当前可执行路径仍限于已有 `METHOD_REGISTRY` built-ins 和现有
-external worker protocol；generic project compiler 临时用 `METHOD_METADATA` 只做 built-in
-target-method fail-closed guard。`MethodExecutionContext` plugin 从 A2.3 dispatch cutover 后才可
-端到端执行。现在编写的新 plugin 应先做
-descriptor/loader/direct invocation contract tests，不能在文档或 capability 中声称已经可运行。
+每个 method descriptor 必须声明一个进入 canonical identity 的 invocation ABI：已有方法使用
+`legacy_worker_job_v1` 的 `(job, artifact_root)`；新 contract method 使用
+`method_context_v1` 的 `(context)`。Loader 校验精确参数名和 kind，worker 按 ABI 分发，不猜
+signature。当前 release composition 只加载 built-ins；外部 research plugin 和任意新 target
+仍需完成 registry composition、generic projection 和 release tests，不能只凭 descriptor 测试
+声称端到端可运行。
 
 1. 明确输入：需要 dataset、旧 artifacts、外部训练产物，还是只需要 `job.config`。
 2. 明确输出 artifact type：`text_memory`、`skill_bundle`、`agent_system`、
    `parametric_memory` 或新的 typed artifact。
-3. 实现 method：A2.3 后的新插件接收 framework `MethodExecutionContext`；当前已有方法继续
-   通过 legacy adapter 接收 `WorkerClaimedJob` 和 `artifact_root`，返回
-   `list[ArtifactRegisterRequest]`。A2.2 阶段的新插件只能 direct-test，不能由 worker dispatch。
+3. 实现 method：新方法接收 framework `MethodExecutionContext`；当前已有方法继续通过
+   legacy adapter 接收 `WorkerClaimedJob` 和 `artifact_root`，返回
+   `list[ArtifactRegisterRequest]`。不要修改已有算法函数来适配框架。
 4. 注册 descriptor：声明稳定 method ID、target、ordered input bindings、output artifact
    types、closed config schema、execution/capture/harness/runtime support、exposure、maturity
    和 locked implementation entry point。不要从旧 `METHOD_METADATA` 反向生成 descriptor。
-5. A2 dispatch 迁移期兼容：需要立即可 dispatch 的内置方法还必须临时同步到
-   `METHOD_REGISTRY` 和 `METHOD_METADATA`，两表 key 必须一致，并由测试证明 descriptor
-   entry point 与 callable 是同一对象。只做未来 plugin/direct test 时不要加入 legacy 表。
-   A2.3 切换 dispatch/capabilities、A2.5 删除重复表后不再执行此步。
+5. A2 迁移期兼容：已有内置 legacy 方法仍临时同步到 `METHOD_REGISTRY` 和
+   `METHOD_METADATA`，并由 anti-drift tests 证明 descriptor entry point 与 callable 是同一
+   对象；plan-bound product jobs 不读取这两张表。新 context method 不得加入 legacy dispatch
+   作为 fallback。A2.5 在 benchmark automation 迁移后删除重复表。
 6. 设置 `compatibility`：限制 task tags、agent harness、base model，避免 artifact 污染
    不兼容 session。
 7. 设置 `lineage`：记录输入 dataset、旧 artifacts、training run、adapter source 等。

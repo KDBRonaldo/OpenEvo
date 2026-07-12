@@ -81,6 +81,7 @@ def _registry(
             display_name="Method",
             description="Method",
             target_id=target_id,
+            invocation_abi="method_context_v1",
             execution_modes=("self_deployed",),
             capture_modes=("transcript",),
             supported_harness_ids=("codex",),

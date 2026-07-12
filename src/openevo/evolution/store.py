@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
 import re
 import sqlite3
@@ -21,7 +23,7 @@ from openevo.evolution.context import (
     request_uses_subscription_auth,
     sort_candidates,
 )
-from openevo.evolution.files import ArtifactFileStore
+from openevo.evolution.files import ARTIFACT_TYPE_DIRECTORIES, ArtifactFileStore
 from openevo.evolution.ids import new_id
 from openevo.evolution.models import (
     ArtifactPromotionUpdateRequest,
@@ -54,12 +56,25 @@ from openevo.evolution.models import (
     ReviewRequestResponse,
     ReviewStatus,
     WorkerClaimRequest,
+    WorkerClaimInputArtifact,
     WorkerClaimResponse,
     WorkerCompleteRequest,
     WorkerFailRequest,
     WorkerHeartbeatRequest,
 )
+from openevo.evolution.planned_jobs import (
+    PlanBoundJobCreateRequest,
+    materialize_plan_bound_job,
+    validate_plan_against_snapshot,
+)
 from openevo.evolution.time import utc_now_iso
+from openevo.evolution.framework.contracts import canonical_digest, canonical_json
+from openevo.evolution.framework.execution import (
+    MethodExecutionEnvelope,
+    worker_input_artifact_digest,
+)
+from openevo.evolution.framework.plan import EvolutionPlan, ResolvedEvolutionSelection
+from openevo.evolution.framework.registry import RegistrySnapshot
 
 
 SCHEMA = """
@@ -100,6 +115,14 @@ CREATE TABLE IF NOT EXISTS dataset_events (
     event_id TEXT NOT NULL,
     PRIMARY KEY(dataset_id, event_id)
 );
+CREATE TABLE IF NOT EXISTS evolution_plans (
+    plan_id TEXT PRIMARY KEY,
+    schema_version TEXT NOT NULL,
+    registry_snapshot_digest TEXT NOT NULL,
+    plan_digest TEXT NOT NULL,
+    plan_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS jobs (
     job_id TEXT PRIMARY KEY,
     job_type TEXT NOT NULL,
@@ -111,8 +134,15 @@ CREATE TABLE IF NOT EXISTS jobs (
     claimed_by TEXT,
     lease_id TEXT,
     lease_expires_at TEXT,
+    lease_duration_seconds INTEGER,
     input_artifact_ids_json TEXT NOT NULL,
     config_json TEXT NOT NULL,
+    plan_id TEXT,
+    target_id TEXT,
+    method_identity_digest TEXT,
+    execution_envelope_json TEXT,
+    execution_envelope_digest TEXT,
+    declared_output_artifact_types_json TEXT,
     error TEXT,
     attempt_count INTEGER NOT NULL
 );
@@ -129,7 +159,8 @@ CREATE TABLE IF NOT EXISTS artifacts (
     compatibility_json TEXT NOT NULL,
     scores_json TEXT NOT NULL,
     tags_json TEXT NOT NULL,
-    promoted INTEGER NOT NULL
+    promoted INTEGER NOT NULL,
+    staging_job_id TEXT
 );
 CREATE TABLE IF NOT EXISTS artifact_lineage (
     parent_artifact_id TEXT NOT NULL,
@@ -223,10 +254,10 @@ WHERE query_decision_id IS NOT NULL;
 MAX_ARTIFACT_ID_ATTEMPTS = 10
 MAX_DATASET_ID_ATTEMPTS = 10
 MAX_CONTEXT_ID_ATTEMPTS = 10
-DEFAULT_HEARTBEAT_LEASE_SECONDS = 600
 ACTIVE_JOB_STATES = {str(JobState.CLAIMED), str(JobState.RUNNING)}
 OPENEVO_SESSION_EVENT_SOURCE = "openevo"
 OPENEVO_SESSION_EVENT_TYPE = "openevo.session_completed"
+_ARTIFACT_MANIFEST_DIRECTORIES = frozenset(ARTIFACT_TYPE_DIRECTORIES.values())
 
 
 class JobLeaseError(ValueError):
@@ -897,6 +928,16 @@ _ACTIVE_FEEDBACK_STATUSES = (
 )
 
 
+@dataclass(frozen=True, slots=True)
+class _ValidatedPlanBoundJob:
+    plan: EvolutionPlan
+    selection: ResolvedEvolutionSelection
+    envelope: MethodExecutionEnvelope
+    input_artifact_ids: tuple[str, ...]
+    input_artifacts: tuple[WorkerClaimInputArtifact, ...]
+    output_artifact_types: tuple[str, ...]
+
+
 def _require_review_transition(
     row: sqlite3.Row,
     *,
@@ -970,19 +1011,107 @@ def _insert_human_query_decision_row(
 
 
 class EvolutionStore:
-    def __init__(self, *, db_path: str | Path, artifact_root: str | Path) -> None:
+    def __init__(
+        self,
+        *,
+        db_path: str | Path,
+        artifact_root: str | Path,
+        registry_snapshot: RegistrySnapshot | None = None,
+    ) -> None:
         self.db_path = Path(db_path)
         self.files = ArtifactFileStore(artifact_root)
+        self._registry_snapshot = registry_snapshot
+
+    def _bind_registry_snapshot(self, snapshot: RegistrySnapshot) -> None:
+        if self._registry_snapshot is None:
+            self._registry_snapshot = snapshot
+            return
+        if self._registry_snapshot.registry_digest != snapshot.registry_digest:
+            raise ValueError("store is already bound to a different registry snapshot")
 
     def initialize(self) -> None:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.files.initialize()
+        orphan_manifest_paths: list[Path] = []
         with self.connect() as conn:
             conn.executescript(SCHEMA)
+            conn.execute("BEGIN IMMEDIATE")
             self._ensure_schema(conn)
+            self._requeue_expired_jobs(conn, datetime.now(UTC))
+            self._delete_recoverable_staged_artifacts(conn)
+            orphan_manifest_paths = self._orphan_managed_artifact_manifests(
+                conn,
+            )
             conn.commit()
+        self._unlink_artifact_manifests(orphan_manifest_paths)
 
     def _ensure_schema(self, conn: sqlite3.Connection) -> None:
+        artifact_columns = {
+            str(row["name"])
+            for row in conn.execute("PRAGMA table_info(artifacts)").fetchall()
+        }
+        if "staging_job_id" not in artifact_columns:
+            conn.execute("ALTER TABLE artifacts ADD COLUMN staging_job_id TEXT")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_artifacts_staging_job "
+            "ON artifacts(staging_job_id) WHERE staging_job_id IS NOT NULL"
+        )
+        job_columns = {
+            str(row["name"])
+            for row in conn.execute("PRAGMA table_info(jobs)").fetchall()
+        }
+        if "lease_duration_seconds" not in job_columns:
+            conn.execute("ALTER TABLE jobs ADD COLUMN lease_duration_seconds INTEGER")
+            job_columns.add("lease_duration_seconds")
+        for column_name in (
+            "plan_id",
+            "target_id",
+            "method_identity_digest",
+            "execution_envelope_json",
+            "execution_envelope_digest",
+            "declared_output_artifact_types_json",
+        ):
+            if column_name not in job_columns:
+                conn.execute(f"ALTER TABLE jobs ADD COLUMN {column_name} TEXT")
+        legacy_active_leases = conn.execute(
+            """
+            SELECT job_id, updated_at, lease_expires_at
+            FROM jobs
+            WHERE state IN (?, ?)
+              AND lease_duration_seconds IS NULL
+              AND lease_expires_at IS NOT NULL
+            """,
+            (str(JobState.CLAIMED), str(JobState.RUNNING)),
+        ).fetchall()
+        for row in legacy_active_leases:
+            lease_duration_seconds = self._infer_legacy_lease_duration_seconds(row)
+            if lease_duration_seconds is not None:
+                conn.execute(
+                    """
+                    UPDATE jobs SET lease_duration_seconds = ? WHERE job_id = ?
+                    """,
+                    (lease_duration_seconds, row["job_id"]),
+                )
+        duplicate_plan_target = conn.execute(
+            """
+            SELECT plan_id, target_id
+            FROM jobs
+            WHERE plan_id IS NOT NULL
+            GROUP BY plan_id, target_id
+            HAVING COUNT(*) > 1
+            LIMIT 1
+            """
+        ).fetchone()
+        if duplicate_plan_target is not None:
+            raise RuntimeError("plan-bound jobs contain duplicate plan/target identity")
+        conn.execute("DROP INDEX IF EXISTS idx_jobs_plan_target")
+        conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_plan_target_unique
+            ON jobs(plan_id, target_id)
+            WHERE plan_id IS NOT NULL
+            """
+        )
         review_columns = {
             str(row["name"])
             for row in conn.execute("PRAGMA table_info(review_requests)").fetchall()
@@ -1819,6 +1948,20 @@ class EvolutionStore:
             return EventIngestResponse(event_id=event_id, ingested=True, duplicate=False)
 
     def register_artifact(self, request: ArtifactRegisterRequest) -> ArtifactResponse:
+        return self._register_artifact(
+            request,
+            initial_state=ArtifactState.ACTIVE,
+        )
+
+    def _register_artifact(
+        self,
+        request: ArtifactRegisterRequest,
+        *,
+        initial_state: ArtifactState,
+        staging_job_id: str | None = None,
+    ) -> ArtifactResponse:
+        if (initial_state is ArtifactState.STAGED) != (staging_job_id is not None):
+            raise ValueError("staged artifact ownership must match its state")
         raw_payload = request.model_dump(mode="python")
         for field in ("manifest", "lineage", "compatibility", "scores", "tags"):
             _validate_finite_floats(raw_payload[field], field)
@@ -1868,16 +2011,16 @@ class EvolutionStore:
                         INSERT INTO artifacts (
                             artifact_id, type, name, version, state, created_at, uri,
                             manifest_path, lineage_json, compatibility_json, scores_json,
-                            tags_json, promoted
+                            tags_json, promoted, staging_job_id
                         )
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             artifact_id,
                             artifact_type,
                             request_payload["name"],
                             1,
-                            str(ArtifactState.ACTIVE),
+                            str(initial_state),
                             created_at,
                             request_payload["uri"],
                             str(manifest_path),
@@ -1886,6 +2029,7 @@ class EvolutionStore:
                             scores_json,
                             tags_json,
                             1 if request_payload["promoted"] else 0,
+                            staging_job_id,
                         ),
                     )
                     try:
@@ -1915,7 +2059,7 @@ class EvolutionStore:
                 type=artifact_type,
                 name=request_payload["name"],
                 version=1,
-                state=ArtifactState.ACTIVE,
+                state=initial_state,
                 uri=request_payload["uri"],
                 manifest=request_payload["manifest"],
                 compatibility=request_payload["compatibility"],
@@ -1928,8 +2072,8 @@ class EvolutionStore:
     def get_artifact(self, artifact_id: str) -> ArtifactResponse:
         with self.connect() as conn:
             row = conn.execute(
-                "SELECT * FROM artifacts WHERE artifact_id = ?",
-                (artifact_id,),
+                "SELECT * FROM artifacts WHERE artifact_id = ? AND state != ?",
+                (artifact_id, str(ArtifactState.STAGED)),
             ).fetchone()
         if row is None:
             raise ValueError(f"unknown artifact: {artifact_id}")
@@ -1945,8 +2089,8 @@ class EvolutionStore:
             try:
                 conn.execute("BEGIN IMMEDIATE")
                 row = conn.execute(
-                    "SELECT * FROM artifacts WHERE artifact_id = ?",
-                    (artifact_id,),
+                    "SELECT * FROM artifacts WHERE artifact_id = ? AND state != ?",
+                    (artifact_id, str(ArtifactState.STAGED)),
                 ).fetchone()
                 if row is None:
                     raise ValueError(f"unknown artifact: {artifact_id}")
@@ -2203,6 +2347,154 @@ class EvolutionStore:
             return response
         raise RuntimeError("could not allocate unique context id")
 
+    def create_plan_bound_job(
+        self,
+        request: PlanBoundJobCreateRequest,
+        *,
+        snapshot: RegistrySnapshot,
+    ) -> JobCreateResponse:
+        self._bind_registry_snapshot(snapshot)
+        artifact_ids_by_binding = {
+            binding.binding_id: list(binding.artifact_ids)
+            for binding in request.input_bindings
+        }
+        plan_json = canonical_json(request.plan)
+        plan_digest = canonical_digest(request.plan)
+        job_id = new_id("job")
+        now = utc_now_iso()
+        with self.connect() as conn:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                artifacts_by_binding = {
+                    binding_id: [
+                        WorkerClaimInputArtifact.model_validate(artifact)
+                        for artifact in self._worker_claim_input_artifacts_from_connection(
+                            conn,
+                            artifact_ids,
+                        )
+                    ]
+                    for binding_id, artifact_ids in artifact_ids_by_binding.items()
+                }
+                for binding_id, artifact_ids in artifact_ids_by_binding.items():
+                    if len(artifacts_by_binding[binding_id]) != len(artifact_ids):
+                        raise ValueError(
+                            f"planned input binding {binding_id!r} contains an unknown artifact"
+                        )
+                materialized = materialize_plan_bound_job(
+                    request,
+                    snapshot=snapshot,
+                    artifacts_by_binding=artifacts_by_binding,
+                )
+                input_artifact_ids = list(materialized.envelope.input_artifact_ids())
+                config = materialized.envelope.legacy_flat_config()
+                _validate_finite_floats(config, "config")
+                input_artifact_ids_json = _json_dumps(input_artifact_ids)
+                config_json = _json_dumps(config)
+                envelope_json = canonical_json(materialized.envelope)
+                envelope_digest = canonical_digest(materialized.envelope)
+                output_types_json = _json_dumps(
+                    list(materialized.output_artifact_types)
+                )
+                existing_plan = conn.execute(
+                    """
+                    SELECT schema_version, registry_snapshot_digest, plan_digest, plan_json
+                    FROM evolution_plans WHERE plan_id = ?
+                    """,
+                    (request.plan.plan_id,),
+                ).fetchone()
+                if existing_plan is None:
+                    conn.execute(
+                        """
+                        INSERT INTO evolution_plans (
+                            plan_id, schema_version, registry_snapshot_digest,
+                            plan_digest, plan_json, created_at
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            request.plan.plan_id,
+                            request.plan.schema_version,
+                            request.plan.registry_snapshot_digest,
+                            plan_digest,
+                            plan_json,
+                            now,
+                        ),
+                    )
+                elif (
+                    str(existing_plan["schema_version"])
+                    != request.plan.schema_version
+                    or str(existing_plan["registry_snapshot_digest"])
+                    != request.plan.registry_snapshot_digest
+                    or str(existing_plan["plan_digest"]) != plan_digest
+                    or str(existing_plan["plan_json"]) != plan_json
+                ):
+                    raise ValueError("plan_id is already bound to a different plan")
+
+                selection = request.selection()
+                existing_job = conn.execute(
+                    "SELECT * FROM jobs WHERE plan_id = ? AND target_id = ?",
+                    (request.plan.plan_id, request.target_id),
+                ).fetchone()
+                if existing_job is not None:
+                    expected = {
+                        "job_type": request.job_type,
+                        "method": selection.method_id,
+                        "priority": request.priority,
+                        "input_artifact_ids_json": input_artifact_ids_json,
+                        "config_json": config_json,
+                        "method_identity_digest": materialized.method_identity_digest,
+                        "execution_envelope_json": envelope_json,
+                        "execution_envelope_digest": envelope_digest,
+                        "declared_output_artifact_types_json": output_types_json,
+                    }
+                    if any(existing_job[key] != value for key, value in expected.items()):
+                        raise ValueError(
+                            "plan target is already bound to a different job request"
+                        )
+                    conn.commit()
+                    return JobCreateResponse(
+                        job_id=str(existing_job["job_id"]),
+                        state=JobState(str(existing_job["state"])),
+                    )
+                conn.execute(
+                    """
+                    INSERT INTO jobs (
+                        job_id, job_type, method, state, priority, created_at,
+                        updated_at, input_artifact_ids_json, config_json,
+                        plan_id, target_id, method_identity_digest,
+                        execution_envelope_json, execution_envelope_digest,
+                        declared_output_artifact_types_json, attempt_count
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        job_id,
+                        request.job_type,
+                        selection.method_id,
+                        str(JobState.PENDING),
+                        request.priority,
+                        now,
+                        now,
+                        input_artifact_ids_json,
+                        config_json,
+                        request.plan.plan_id,
+                        request.target_id,
+                        materialized.method_identity_digest,
+                        envelope_json,
+                        envelope_digest,
+                        output_types_json,
+                        0,
+                    ),
+                )
+                conn.commit()
+            except Exception:
+                try:
+                    conn.rollback()
+                except sqlite3.Error:
+                    pass
+                raise
+        return JobCreateResponse(job_id=job_id, state=JobState.PENDING)
+
     def create_job(self, request: JobCreateRequest) -> JobCreateResponse:
         raw_payload = request.model_dump(mode="python")
         _validate_finite_floats(raw_payload["config"], "config")
@@ -2257,9 +2549,9 @@ class EvolutionStore:
         if not unique_ids:
             return
         rows = conn.execute(
-            "SELECT artifact_id FROM artifacts WHERE artifact_id IN (%s)"
+            "SELECT artifact_id FROM artifacts WHERE state != ? AND artifact_id IN (%s)"
             % ",".join("?" for _ in unique_ids),
-            unique_ids,
+            (str(ArtifactState.STAGED), *unique_ids),
         ).fetchall()
         existing_ids = {str(row["artifact_id"]) for row in rows}
         missing_ids = [
@@ -2269,19 +2561,162 @@ class EvolutionStore:
             label = "artifact_id" if len(missing_ids) == 1 else "artifact_ids"
             raise ValueError(f"unknown input {label}: {', '.join(missing_ids)}")
 
+    def _validate_plan_bound_job_contract(
+        self,
+        conn: sqlite3.Connection,
+        row: sqlite3.Row,
+    ) -> _ValidatedPlanBoundJob:
+        plan_id = row["plan_id"]
+        if not isinstance(plan_id, str) or not plan_id:
+            raise ValueError("plan-bound job is missing plan identity")
+        plan_row = conn.execute(
+            "SELECT * FROM evolution_plans WHERE plan_id = ?",
+            (plan_id,),
+        ).fetchone()
+        if plan_row is None:
+            raise ValueError(f"job references unknown plan: {plan_id}")
+        plan = EvolutionPlan.model_validate_json(str(plan_row["plan_json"]))
+        snapshot = self._registry_snapshot
+        if snapshot is None:
+            raise RuntimeError("plan-bound execution requires an active registry snapshot")
+        validate_plan_against_snapshot(plan, snapshot)
+        plan_digest = canonical_digest(plan)
+        if (
+            plan.plan_id != plan_id
+            or canonical_json(plan) != str(plan_row["plan_json"])
+            or plan_digest != str(plan_row["plan_digest"])
+            or plan.schema_version != str(plan_row["schema_version"])
+            or plan.registry_snapshot_digest
+            != str(plan_row["registry_snapshot_digest"])
+        ):
+            raise ValueError("persisted evolution plan identity is invalid")
+        selections = tuple(
+            selection
+            for selection in plan.selections
+            if selection.target_id == row["target_id"]
+        )
+        if len(selections) != 1:
+            raise ValueError("plan-bound job target is not selected by its plan")
+        selection = selections[0]
+        if (
+            selection.method_id != row["method"]
+            or selection.method_identity_digest != row["method_identity_digest"]
+        ):
+            raise ValueError("plan-bound job method identity is invalid")
+        descriptor = snapshot.methods[selection.method_id]
+        if (
+            snapshot.identity_digest_for("method", selection.method_id)
+            != selection.method_identity_digest
+        ):
+            raise ValueError("plan-bound job method registry identity is invalid")
+
+        envelope_json = str(row["execution_envelope_json"])
+        envelope = MethodExecutionEnvelope.model_validate_json(envelope_json)
+        if (
+            canonical_json(envelope) != envelope_json
+            or canonical_digest(envelope) != row["execution_envelope_digest"]
+            or envelope.plan_id != plan.plan_id
+            or envelope.plan_digest != plan_digest
+            or envelope.registry_snapshot_digest != plan.registry_snapshot_digest
+            or envelope.target_id != selection.target_id
+            or envelope.method_id != selection.method_id
+            or envelope.method_identity_digest != selection.method_identity_digest
+            or envelope.user_config() != selection.config()
+        ):
+            raise ValueError("plan-bound job execution envelope is invalid")
+
+        config = json.loads(str(row["config_json"]))
+        if not isinstance(config, dict) or envelope.legacy_flat_config() != config:
+            raise ValueError("plan-bound job config does not match its execution envelope")
+        input_artifact_ids = json.loads(str(row["input_artifact_ids_json"]))
+        if not isinstance(input_artifact_ids, list) or any(
+            not isinstance(artifact_id, str) or not artifact_id
+            for artifact_id in input_artifact_ids
+        ):
+            raise ValueError("job input artifact IDs are invalid")
+        input_artifacts = tuple(
+            WorkerClaimInputArtifact.model_validate(artifact)
+            for artifact in self._worker_claim_input_artifacts_from_connection(
+                conn,
+                input_artifact_ids,
+            )
+        )
+        if (
+            len(input_artifacts) != len(input_artifact_ids)
+            or tuple(input_artifact_ids) != envelope.input_artifact_ids()
+            or tuple(
+                worker_input_artifact_digest(artifact)
+                for artifact in input_artifacts
+            )
+            != envelope.input_artifact_digests()
+        ):
+            raise ValueError("plan-bound job input artifact snapshots are invalid")
+
+        output_types = json.loads(str(row["declared_output_artifact_types_json"]))
+        if (
+            not isinstance(output_types, list)
+            or any(not isinstance(value, str) or not value for value in output_types)
+            or tuple(output_types) != envelope.output_artifact_types
+            or tuple(output_types) != descriptor.output_artifact_types
+        ):
+            raise ValueError("plan-bound job output artifact types are invalid")
+        return _ValidatedPlanBoundJob(
+            plan=plan,
+            selection=selection,
+            envelope=envelope,
+            input_artifact_ids=tuple(input_artifact_ids),
+            input_artifacts=input_artifacts,
+            output_artifact_types=tuple(output_types),
+        )
+
     def claim_job(self, request: WorkerClaimRequest) -> WorkerClaimResponse:
         now_dt = datetime.now(UTC)
         lease_expires_at = _utc_dt_to_iso(now_dt + timedelta(seconds=request.lease_seconds))
-        where = "state = ?"
-        params: list[object] = [str(JobState.PENDING)]
+        base_where = "state = ?"
+        base_params: list[object] = [str(JobState.PENDING)]
         if request.capabilities:
-            where += f" AND job_type IN ({','.join('?' for _ in request.capabilities)})"
-            params.extend(request.capabilities)
+            base_where += (
+                f" AND job_type IN ({','.join('?' for _ in request.capabilities)})"
+            )
+            base_params.extend(request.capabilities)
+        if request.method_capabilities is not None:
+            if not request.method_capabilities:
+                return WorkerClaimResponse(job=None)
+            base_where += (
+                " AND method IN ("
+                + ",".join("?" for _ in request.method_capabilities)
+                + ")"
+            )
+            base_params.extend(request.method_capabilities)
+
+        where = base_where
+        params = list(base_params)
+        method_identities = request.method_identity_capabilities
+        if method_identities is None:
+            where += " AND plan_id IS NULL"
+        elif method_identities:
+            identity_terms = " OR ".join(
+                "(method = ? AND method_identity_digest = ?)"
+                for _ in method_identities
+            )
+            where += f" AND (plan_id IS NULL OR ({identity_terms}))"
+            for method_id, identity_digest in method_identities.items():
+                params.extend((method_id, identity_digest))
+        else:
+            where += " AND plan_id IS NULL"
 
         with self.connect() as conn:
             try:
                 conn.execute("BEGIN IMMEDIATE")
-                self._requeue_expired_jobs(conn, now_dt)
+                manifest_paths = self._requeue_expired_jobs(conn, now_dt)
+                manifest_paths.extend(
+                    self._quarantine_invalid_identity_mismatches(
+                        conn,
+                        where=base_where,
+                        params=base_params,
+                        method_identities=method_identities,
+                    )
+                )
                 row = conn.execute(
                     f"""
                     SELECT * FROM jobs
@@ -2292,15 +2727,90 @@ class EvolutionStore:
                     params,
                 ).fetchone()
                 if row is None:
-                    conn.rollback()
+                    conn.commit()
+                    self._unlink_artifact_manifests(manifest_paths)
                     return WorkerClaimResponse(job=None)
 
                 lease_id = new_id("lease")
+                plan_payload: dict[str, Any] | None = None
+                registry_snapshot_digest: str | None = None
+                execution_envelope_payload: dict[str, Any] | None = None
+                if row["plan_id"] is not None:
+                    try:
+                        validated = self._validate_plan_bound_job_contract(conn, row)
+                    except (KeyError, TypeError, ValueError):
+                        manifest_paths.extend(
+                            self._quarantine_plan_bound_job(conn, row)
+                        )
+                        conn.commit()
+                        self._unlink_artifact_manifests(manifest_paths)
+                        return WorkerClaimResponse(job=None)
+                    input_artifacts = [
+                        artifact.model_dump(mode="json")
+                        for artifact in validated.input_artifacts
+                    ]
+                    config = validated.envelope.legacy_flat_config()
+                    plan_payload = validated.plan.model_dump(mode="json")
+                    registry_snapshot_digest = (
+                        validated.plan.registry_snapshot_digest
+                    )
+                    execution_envelope_payload = validated.envelope.model_dump(
+                        mode="json"
+                    )
+                elif any(
+                    row[column] is not None
+                    for column in (
+                        "target_id",
+                        "method_identity_digest",
+                        "execution_envelope_json",
+                        "execution_envelope_digest",
+                        "declared_output_artifact_types_json",
+                    )
+                ):
+                    raise ValueError("unplanned job contains partial plan identity")
+                else:
+                    input_artifact_ids = json.loads(
+                        str(row["input_artifact_ids_json"])
+                    )
+                    if not isinstance(input_artifact_ids, list) or any(
+                        not isinstance(artifact_id, str) or not artifact_id
+                        for artifact_id in input_artifact_ids
+                    ):
+                        raise ValueError("job input artifact IDs are invalid")
+                    input_artifacts = self._worker_claim_input_artifacts_from_connection(
+                        conn,
+                        input_artifact_ids,
+                    )
+                    config = json.loads(str(row["config_json"]))
+                    if not isinstance(config, dict):
+                        raise ValueError("job config is not a JSON object")
+
+                response = WorkerClaimResponse(
+                    job={
+                        "job_id": row["job_id"],
+                        "lease_id": lease_id,
+                        "job_type": row["job_type"],
+                        "method": row["method"],
+                        "input_artifacts": input_artifacts,
+                        "config": config,
+                        "priority": row["priority"],
+                        "state": JobState.CLAIMED,
+                        "plan": plan_payload,
+                        "target_id": row["target_id"],
+                        "registry_snapshot_digest": registry_snapshot_digest,
+                        "method_identity_digest": row["method_identity_digest"],
+                        "execution_envelope": execution_envelope_payload,
+                        "execution_envelope_digest": row[
+                            "execution_envelope_digest"
+                        ],
+                    }
+                )
                 cursor = conn.execute(
                     """
                     UPDATE jobs
                     SET state = ?, claimed_by = ?, lease_id = ?, lease_expires_at = ?,
-                        updated_at = ?, attempt_count = attempt_count + 1
+                        lease_duration_seconds = ?, updated_at = ?,
+                        attempt_count = attempt_count + 1
                     WHERE job_id = ? AND state = ?
                     """,
                     (
@@ -2308,6 +2818,7 @@ class EvolutionStore:
                         request.worker_id,
                         lease_id,
                         lease_expires_at,
+                        request.lease_seconds,
                         utc_now_iso(),
                         row["job_id"],
                         str(JobState.PENDING),
@@ -2317,29 +2828,238 @@ class EvolutionStore:
                     conn.rollback()
                     return WorkerClaimResponse(job=None)
                 conn.commit()
+                self._unlink_artifact_manifests(manifest_paths)
             except Exception:
                 try:
                     conn.rollback()
                 except sqlite3.Error:
                     pass
                 raise
+        return response
 
-        return WorkerClaimResponse(
-            job={
-                "job_id": row["job_id"],
-                "lease_id": lease_id,
-                "job_type": row["job_type"],
-                "method": row["method"],
-                "input_artifacts": self._worker_claim_input_artifacts(
-                    json.loads(str(row["input_artifact_ids_json"]))
-                ),
-                "config": json.loads(str(row["config_json"])),
-                "priority": row["priority"],
-                "state": JobState.CLAIMED,
-            }
+    def _quarantine_invalid_identity_mismatches(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        where: str,
+        params: list[object],
+        method_identities: dict[str, str] | None,
+    ) -> list[Path]:
+        if not method_identities:
+            return []
+        identity_terms = " OR ".join(
+            "(method = ? AND method_identity_digest = ?)"
+            for _ in method_identities
         )
+        identity_params: list[object] = []
+        for method_id, identity_digest in method_identities.items():
+            identity_params.extend((method_id, identity_digest))
+        rows = conn.execute(
+            f"""
+            SELECT * FROM jobs
+            WHERE {where} AND plan_id IS NOT NULL AND NOT ({identity_terms})
+            ORDER BY priority DESC, created_at ASC, job_id ASC
+            """,
+            [*params, *identity_params],
+        ).fetchall()
+        manifest_paths: list[Path] = []
+        for row in rows:
+            try:
+                self._validate_plan_bound_job_contract(conn, row)
+            except (KeyError, TypeError, ValueError):
+                manifest_paths.extend(self._quarantine_plan_bound_job(conn, row))
+        return manifest_paths
 
-    def _requeue_expired_jobs(self, conn: sqlite3.Connection, now: datetime) -> None:
+    def _quarantine_plan_bound_job(
+        self,
+        conn: sqlite3.Connection,
+        row: sqlite3.Row,
+    ) -> list[Path]:
+        manifest_paths = self._delete_staged_artifacts_for_job(
+            conn,
+            str(row["job_id"]),
+        )
+        conn.execute(
+            """
+            UPDATE jobs
+            SET state = ?, updated_at = ?, error = ?, claimed_by = NULL,
+                lease_id = NULL, lease_expires_at = NULL,
+                lease_duration_seconds = NULL
+            WHERE job_id = ? AND state = ?
+            """,
+            (
+                str(JobState.FAILED),
+                utc_now_iso(),
+                "plan-bound job contract validation failed",
+                row["job_id"],
+                str(JobState.PENDING),
+            ),
+        )
+        return manifest_paths
+
+    def _delete_staged_artifacts_for_job(
+        self,
+        conn: sqlite3.Connection,
+        job_id: str,
+        *,
+        keep_artifact_ids: list[str] | None = None,
+    ) -> list[Path]:
+        keep_ids = list(dict.fromkeys(keep_artifact_ids or []))
+        keep_clause = ""
+        params: list[object] = [str(ArtifactState.STAGED), job_id]
+        if keep_ids:
+            keep_clause = " AND artifact_id NOT IN (%s)" % ",".join(
+                "?" for _ in keep_ids
+            )
+            params.extend(keep_ids)
+        rows = conn.execute(
+            f"""
+            SELECT artifact_id, manifest_path
+            FROM artifacts
+            WHERE state = ? AND staging_job_id = ?
+            {keep_clause}
+            """,
+            params,
+        ).fetchall()
+        artifact_ids = [str(row["artifact_id"]) for row in rows]
+        if artifact_ids:
+            placeholders = ",".join("?" for _ in artifact_ids)
+            conn.execute(
+                f"""
+                DELETE FROM artifact_lineage
+                WHERE parent_artifact_id IN ({placeholders})
+                   OR child_artifact_id IN ({placeholders})
+                """,
+                (*artifact_ids, *artifact_ids),
+            )
+            conn.execute(
+                f"DELETE FROM artifacts WHERE artifact_id IN ({placeholders})",
+                artifact_ids,
+            )
+        return [Path(str(row["manifest_path"])) for row in rows]
+
+    def _delete_recoverable_staged_artifacts(
+        self,
+        conn: sqlite3.Connection,
+    ) -> list[Path]:
+        rows = conn.execute(
+            """
+            SELECT artifacts.artifact_id, artifacts.manifest_path
+            FROM artifacts
+            LEFT JOIN jobs ON jobs.job_id = artifacts.staging_job_id
+            WHERE artifacts.state = ?
+              AND (
+                artifacts.staging_job_id IS NULL
+                OR jobs.job_id IS NULL
+                OR jobs.state NOT IN (?, ?)
+              )
+            """,
+            (
+                str(ArtifactState.STAGED),
+                str(JobState.CLAIMED),
+                str(JobState.RUNNING),
+            ),
+        ).fetchall()
+        artifact_ids = [str(row["artifact_id"]) for row in rows]
+        if artifact_ids:
+            placeholders = ",".join("?" for _ in artifact_ids)
+            conn.execute(
+                f"DELETE FROM artifacts WHERE artifact_id IN ({placeholders})",
+                artifact_ids,
+            )
+        return [Path(str(row["manifest_path"])) for row in rows]
+
+    def _managed_artifact_manifests(self) -> set[Path]:
+        artifacts_root = self.files.root / "artifacts"
+        managed: set[Path] = set()
+        if artifacts_root.is_symlink() or not artifacts_root.is_dir():
+            return managed
+        for directory_name in _ARTIFACT_MANIFEST_DIRECTORIES:
+            type_directory = artifacts_root / directory_name
+            if type_directory.is_symlink() or not type_directory.is_dir():
+                continue
+            for artifact_directory in type_directory.iterdir():
+                if artifact_directory.is_symlink() or not artifact_directory.is_dir():
+                    continue
+                manifest_path = artifact_directory / "manifest.json"
+                if manifest_path.is_symlink() or not manifest_path.is_file():
+                    continue
+                managed_path = self._managed_artifact_manifest_path(manifest_path)
+                if managed_path is not None:
+                    managed.add(managed_path)
+        return managed
+
+    def _managed_artifact_manifest_path(self, manifest_path: Path) -> Path | None:
+        artifacts_root = self.files.root / "artifacts"
+        candidate = Path(os.path.abspath(manifest_path))
+        try:
+            relative = candidate.relative_to(artifacts_root)
+        except ValueError:
+            return None
+        if (
+            len(relative.parts) != 3
+            or relative.parts[0] not in _ARTIFACT_MANIFEST_DIRECTORIES
+            or relative.parts[2] != "manifest.json"
+        ):
+            return None
+        current = artifacts_root
+        if current.is_symlink():
+            return None
+        for part in relative.parts[:-1]:
+            current /= part
+            if current.is_symlink():
+                return None
+        if candidate.is_symlink():
+            return None
+        return candidate
+
+    def _orphan_managed_artifact_manifests(
+        self,
+        conn: sqlite3.Connection,
+    ) -> list[Path]:
+        referenced_paths = set()
+        for row in conn.execute("SELECT manifest_path FROM artifacts").fetchall():
+            managed_path = self._managed_artifact_manifest_path(
+                Path(str(row["manifest_path"]))
+            )
+            if managed_path is not None:
+                referenced_paths.add(managed_path)
+        return sorted(self._managed_artifact_manifests() - referenced_paths)
+
+    def _unlink_artifact_manifests(self, manifest_paths: list[Path]) -> None:
+        for manifest_path in dict.fromkeys(manifest_paths):
+            managed_path = self._managed_artifact_manifest_path(manifest_path)
+            if managed_path is None:
+                continue
+            try:
+                managed_path.unlink(missing_ok=True)
+            except OSError:
+                continue
+            parent = managed_path.parent
+            if parent.is_symlink() or self.files.root not in parent.parents:
+                continue
+            try:
+                parent.rmdir()
+            except OSError:
+                pass
+
+    @staticmethod
+    def _infer_legacy_lease_duration_seconds(row: sqlite3.Row) -> int | None:
+        try:
+            updated_at = _parse_utc_iso(str(row["updated_at"]))
+            lease_expires_at = _parse_utc_iso(str(row["lease_expires_at"]))
+        except (TypeError, ValueError):
+            return None
+        duration_seconds = math.ceil(
+            (lease_expires_at - updated_at).total_seconds()
+        )
+        return duration_seconds if duration_seconds >= 1 else None
+
+    def _requeue_expired_jobs(
+        self,
+        conn: sqlite3.Connection,
+        now: datetime,
+    ) -> list[Path]:
         rows = conn.execute(
             """
             SELECT job_id, lease_expires_at
@@ -2349,15 +3069,23 @@ class EvolutionStore:
             (str(JobState.CLAIMED), str(JobState.RUNNING)),
         ).fetchall()
         now = now.astimezone(UTC)
+        manifest_paths: list[Path] = []
         for row in rows:
             try:
                 lease_expires_at = _parse_utc_iso(str(row["lease_expires_at"]))
             except ValueError:
+                manifest_paths.extend(
+                    self._delete_staged_artifacts_for_job(
+                        conn,
+                        str(row["job_id"]),
+                    )
+                )
                 conn.execute(
                     """
                     UPDATE jobs
                     SET state = ?, claimed_by = NULL, lease_id = NULL,
-                        lease_expires_at = NULL, updated_at = ?, error = ?
+                        lease_expires_at = NULL, lease_duration_seconds = NULL,
+                        updated_at = ?, error = ?
                     WHERE job_id = ?
                     """,
                     (
@@ -2369,11 +3097,18 @@ class EvolutionStore:
                 )
                 continue
             if lease_expires_at <= now:
+                manifest_paths.extend(
+                    self._delete_staged_artifacts_for_job(
+                        conn,
+                        str(row["job_id"]),
+                    )
+                )
                 conn.execute(
                     """
                     UPDATE jobs
                     SET state = ?, claimed_by = NULL, lease_id = NULL,
-                        lease_expires_at = NULL, updated_at = ?,
+                        lease_expires_at = NULL, lease_duration_seconds = NULL,
+                        updated_at = ?,
                         error = COALESCE(error, ?)
                     WHERE job_id = ?
                     """,
@@ -2384,24 +3119,36 @@ class EvolutionStore:
                         row["job_id"],
                     ),
                 )
+        return manifest_paths
 
     def _worker_claim_input_artifacts(self, artifact_ids: list[str]) -> list[dict[str, Any]]:
-        artifacts: list[dict[str, Any]] = []
         with self.connect() as conn:
-            for artifact_id in artifact_ids:
-                artifact = conn.execute(
-                    "SELECT artifact_id, type, uri, name FROM artifacts WHERE artifact_id = ?",
-                    (artifact_id,),
-                ).fetchone()
-                if artifact is not None:
-                    artifacts.append(
-                        {
-                            "artifact_id": artifact["artifact_id"],
-                            "type": artifact["type"],
-                            "uri": artifact["uri"],
-                            "name": artifact["name"],
-                        }
-                    )
+            return self._worker_claim_input_artifacts_from_connection(
+                conn,
+                artifact_ids,
+            )
+
+    def _worker_claim_input_artifacts_from_connection(
+        self,
+        conn: sqlite3.Connection,
+        artifact_ids: list[str],
+    ) -> list[dict[str, Any]]:
+        artifacts: list[dict[str, Any]] = []
+        for artifact_id in artifact_ids:
+            artifact = conn.execute(
+                "SELECT artifact_id, type, uri, name FROM artifacts "
+                "WHERE artifact_id = ? AND state != ?",
+                (artifact_id, str(ArtifactState.STAGED)),
+            ).fetchone()
+            if artifact is not None:
+                artifacts.append(
+                    {
+                        "artifact_id": artifact["artifact_id"],
+                        "type": artifact["type"],
+                        "uri": artifact["uri"],
+                        "name": artifact["name"],
+                    }
+                )
         return artifacts
 
     def _assert_job_lease(
@@ -2434,24 +3181,40 @@ class EvolutionStore:
         if request.progress is not None:
             _validate_finite_floats(request.progress, "progress")
 
-        renewed_expires_at = datetime.now(UTC) + timedelta(
-            seconds=DEFAULT_HEARTBEAT_LEASE_SECONDS
-        )
         with self.connect() as conn:
             try:
                 conn.execute("BEGIN IMMEDIATE")
                 row = self._assert_job_lease(conn, job_id, request.lease_id)
-                current_expires_at = _parse_utc_iso(str(row["lease_expires_at"]))
-                if current_expires_at > renewed_expires_at:
-                    renewed_expires_at = current_expires_at
+                lease_duration_seconds = row["lease_duration_seconds"]
+                if lease_duration_seconds is None:
+                    lease_duration_seconds = self._infer_legacy_lease_duration_seconds(
+                        row
+                    )
+                if (
+                    not isinstance(lease_duration_seconds, int)
+                    or lease_duration_seconds < 1
+                ):
+                    raise JobLeaseError(
+                        f"invalid lease duration for job: {job_id}"
+                    )
+                renewed_expires_at = datetime.now(UTC) + timedelta(
+                    seconds=lease_duration_seconds
+                )
                 lease_expires_at = _utc_dt_to_iso(renewed_expires_at)
                 conn.execute(
                     """
                     UPDATE jobs
-                    SET state = ?, updated_at = ?, lease_expires_at = ?
+                    SET state = ?, updated_at = ?, lease_expires_at = ?,
+                        lease_duration_seconds = ?
                     WHERE job_id = ?
                     """,
-                    (str(JobState.RUNNING), utc_now_iso(), lease_expires_at, job_id),
+                    (
+                        str(JobState.RUNNING),
+                        utc_now_iso(),
+                        lease_expires_at,
+                        lease_duration_seconds,
+                        job_id,
+                    ),
                 )
                 conn.commit()
             except Exception:
@@ -2476,13 +3239,54 @@ class EvolutionStore:
         _validate_finite_floats(raw_payload["report"], "report")
 
         force_unpromoted_outputs = False
+        store_owned_execution_lineage: dict[str, Any] | None = None
+        planned_job = False
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
                 job_row = self._assert_job_lease(conn, job_id, request.lease_id)
                 job_config = json.loads(str(job_row["config_json"]))
-                if isinstance(job_config, dict):
-                    force_unpromoted_outputs = job_config.get("promoted") is False
+                if not isinstance(job_config, dict):
+                    raise ValueError("job config is not a JSON object")
+                force_unpromoted_outputs = job_config.get("promoted") is False
+                if job_row["plan_id"] is not None:
+                    planned_job = True
+                    validated = self._validate_plan_bound_job_contract(conn, job_row)
+                    envelope = validated.envelope
+                    declared_output_types = validated.output_artifact_types
+                    unexpected_output_types = sorted(
+                        {
+                            str(artifact.type)
+                            for artifact in request.artifacts
+                            if str(artifact.type) not in declared_output_types
+                        }
+                    )
+                    if unexpected_output_types:
+                        raise ValueError(
+                            "plan-bound job returned undeclared artifact type(s): "
+                            + ", ".join(unexpected_output_types)
+                        )
+                    store_owned_execution_lineage = {
+                        "job_id": job_id,
+                        "plan_id": validated.plan.plan_id,
+                        "plan_digest": validated.envelope.plan_digest,
+                        "target_id": validated.selection.target_id,
+                        "method_id": validated.selection.method_id,
+                        "method_identity_digest": (
+                            validated.selection.method_identity_digest
+                        ),
+                        "execution_envelope_digest": canonical_digest(envelope),
+                        "registry_snapshot_digest": (
+                            validated.plan.registry_snapshot_digest
+                        ),
+                        "input_bindings": [
+                            binding.model_dump(mode="json")
+                            for binding in envelope.input_bindings
+                        ],
+                        "declared_output_artifact_types": list(
+                            declared_output_types
+                        ),
+                    }
                 conn.rollback()
             except Exception:
                 try:
@@ -2493,14 +3297,28 @@ class EvolutionStore:
 
         registered_artifact_ids: list[str] = []
         registered_artifacts: list[ArtifactResponse] = []
+        stale_manifest_paths: list[Path] = []
         try:
             for artifact_request in request.artifacts:
+                if store_owned_execution_lineage is not None:
+                    artifact_payload = artifact_request.model_dump(mode="python")
+                    artifact_payload["lineage"] = {
+                        **artifact_payload["lineage"],
+                        "openevo_execution": store_owned_execution_lineage,
+                    }
+                    artifact_request = ArtifactRegisterRequest.model_validate(
+                        artifact_payload
+                    )
                 request_to_register = (
                     artifact_request.model_copy(update={"promoted": False})
                     if force_unpromoted_outputs
                     else artifact_request
                 )
-                artifact = self.register_artifact(request_to_register)
+                artifact = self._register_artifact(
+                    request_to_register,
+                    initial_state=ArtifactState.STAGED,
+                    staging_job_id=job_id,
+                )
                 registered_artifact_ids.append(artifact.artifact_id)
                 registered_artifacts.append(artifact)
 
@@ -2508,9 +3326,29 @@ class EvolutionStore:
                 try:
                     conn.execute("BEGIN IMMEDIATE")
                     job_row = self._assert_job_lease(conn, job_id, request.lease_id)
-                    input_artifact_ids = json.loads(str(job_row["input_artifact_ids_json"]))
+                    if (job_row["plan_id"] is not None) != planned_job:
+                        raise ValueError("job plan identity changed during completion")
+                    if planned_job:
+                        final_validation = self._validate_plan_bound_job_contract(
+                            conn,
+                            job_row,
+                        )
+                        input_artifact_ids = list(
+                            final_validation.input_artifact_ids
+                        )
+                    else:
+                        input_artifact_ids = json.loads(
+                            str(job_row["input_artifact_ids_json"])
+                        )
+                        if not isinstance(input_artifact_ids, list):
+                            raise ValueError("job input artifact IDs are invalid")
                     unique_input_artifact_ids = list(dict.fromkeys(input_artifact_ids))
                     self._validate_input_artifacts_exist(conn, unique_input_artifact_ids)
+                    stale_manifest_paths = self._delete_staged_artifacts_for_job(
+                        conn,
+                        job_id,
+                        keep_artifact_ids=registered_artifact_ids,
+                    )
                     for input_artifact_id in unique_input_artifact_ids:
                         for output_artifact_id in registered_artifact_ids:
                             conn.execute(
@@ -2522,6 +3360,24 @@ class EvolutionStore:
                                 """,
                                 (input_artifact_id, output_artifact_id, "job_input"),
                             )
+                    if registered_artifact_ids:
+                        placeholders = ",".join("?" for _ in registered_artifact_ids)
+                        published = conn.execute(
+                            f"""
+                            UPDATE artifacts
+                            SET state = ?, staging_job_id = NULL
+                            WHERE state = ? AND staging_job_id = ?
+                              AND artifact_id IN ({placeholders})
+                            """,
+                            (
+                                str(ArtifactState.ACTIVE),
+                                str(ArtifactState.STAGED),
+                                job_id,
+                                *registered_artifact_ids,
+                            ),
+                        )
+                        if published.rowcount != len(registered_artifact_ids):
+                            raise ValueError("job output artifacts are not staged for publish")
                     method = str(job_row["method"])
                     for artifact in registered_artifacts:
                         self._materialize_feedback_applications_for_artifact(
@@ -2534,7 +3390,8 @@ class EvolutionStore:
                         """
                         UPDATE jobs
                         SET state = ?, updated_at = ?, claimed_by = NULL, lease_id = NULL,
-                            lease_expires_at = NULL, error = NULL
+                            lease_expires_at = NULL, lease_duration_seconds = NULL,
+                            error = NULL
                         WHERE job_id = ?
                         """,
                         (str(JobState.SUCCEEDED), utc_now_iso(), job_id),
@@ -2568,6 +3425,7 @@ class EvolutionStore:
                 exc.add_note(f"artifact cleanup failed: {cleanup_error}")
             raise
 
+        self._unlink_artifact_manifests(stale_manifest_paths)
         return {
             "job_id": job_id,
             "state": str(JobState.SUCCEEDED),
@@ -2673,15 +3531,18 @@ class EvolutionStore:
     def fail_job(self, job_id: str, request: WorkerFailRequest) -> dict[str, object]:
         next_state = JobState.PENDING if request.retryable else JobState.FAILED
         error = request.error
+        manifest_paths: list[Path] = []
         with self.connect() as conn:
             try:
                 conn.execute("BEGIN IMMEDIATE")
                 self._assert_job_lease(conn, job_id, request.lease_id)
+                manifest_paths = self._delete_staged_artifacts_for_job(conn, job_id)
                 conn.execute(
                     """
                     UPDATE jobs
                     SET state = ?, updated_at = ?, claimed_by = NULL, lease_id = NULL,
-                        lease_expires_at = NULL, error = ?
+                        lease_expires_at = NULL, lease_duration_seconds = NULL,
+                        error = ?
                     WHERE job_id = ?
                     """,
                     (str(next_state), utc_now_iso(), error, job_id),
@@ -2693,6 +3554,7 @@ class EvolutionStore:
                 except sqlite3.Error:
                     pass
                 raise
+        self._unlink_artifact_manifests(manifest_paths)
         return {"job_id": job_id, "state": str(next_state), "error": error}
 
     def _cleanup_registered_artifacts(self, artifact_ids: list[str]) -> None:
@@ -2705,6 +3567,24 @@ class EvolutionStore:
                     (artifact_id,),
                 ).fetchone()
                 if artifact_row is not None:
+                    lineage_reference = conn.execute(
+                        """
+                        SELECT 1 FROM artifact_lineage
+                        WHERE parent_artifact_id = ? OR child_artifact_id = ?
+                        LIMIT 1
+                        """,
+                        (artifact_id, artifact_id),
+                    ).fetchone()
+                    job_reference = any(
+                        artifact_id
+                        in json.loads(str(row["input_artifact_ids_json"]))
+                        for row in conn.execute(
+                            "SELECT input_artifact_ids_json FROM jobs"
+                        ).fetchall()
+                    )
+                    if lineage_reference is not None or job_reference:
+                        conn.rollback()
+                        continue
                     artifact_manifest_path = Path(str(artifact_row["manifest_path"]))
                     conn.execute(
                         """
@@ -2733,7 +3613,8 @@ class EvolutionStore:
                     """
                     UPDATE jobs
                     SET state = ?, updated_at = ?, claimed_by = NULL, lease_id = NULL,
-                        lease_expires_at = NULL, error = ?
+                        lease_expires_at = NULL, lease_duration_seconds = NULL,
+                        error = ?
                     WHERE job_id = ? AND lease_id = ? AND state IN (?, ?)
                     """,
                     (

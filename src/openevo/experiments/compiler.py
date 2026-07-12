@@ -6,7 +6,15 @@ from pathlib import Path
 from typing import Any
 
 from openevo.evolution.framework import (
+    EvolutionExecutionProfile,
+    EvolutionPlan,
+    EvolutionTargetSelection,
+    InputBindingSource,
+    MethodInputBinding,
     ProjectEvolutionTargetSelection,
+    RegistrySnapshot,
+    ResolvedEvolutionSelection,
+    canonical_digest,
     resolve_agent_system_method,
 )
 
@@ -17,7 +25,13 @@ from .models import (
 )
 
 _EVOLUTION_ORDER = ("text_memory", "parametric_memory", "skill_bundle", "agent_system")
-_ROLLOUT_CONTEXT_ARTIFACT_TYPES = _EVOLUTION_ORDER
+_LEGACY_AGENT_SYSTEM_HISTORY_METHODS = frozenset(
+    {
+        "agent_system_history_reflector",
+        "agent_system_pareto_reflector",
+        "agent_system_gepa_reflector",
+    }
+)
 _SUBSCRIPTION_AUTH_MODES = {"subscription", "chatgpt_subscription"}
 
 
@@ -27,18 +41,46 @@ ContextArtifactIds = Mapping[str, str | Sequence[str]] | Sequence[str] | None
 @dataclass(frozen=True)
 class CompiledEvolutionMethodSpec:
     artifact_type: str
+    target_id: str
+    handler_id: str
     method: str
     requested_method: str
     prior_dataset_artifact_ids: tuple[str, ...]
     job_type: str
     config: dict[str, Any]
+    plan: EvolutionPlan
+    selection: ResolvedEvolutionSelection
+    input_bindings: tuple[MethodInputBinding, ...]
+
+    @property
+    def plan_id(self) -> str:
+        return self.plan.plan_id
+
+    @property
+    def registry_snapshot_digest(self) -> str:
+        return self.plan.registry_snapshot_digest
+
+    @property
+    def target_identity_digest(self) -> str:
+        return self.selection.target_identity_digest
+
+    @property
+    def handler_identity_digest(self) -> str:
+        return self.selection.handler_identity_digest
+
+    @property
+    def method_identity_digest(self) -> str:
+        return self.selection.method_identity_digest
 
     def job_payload(self, input_artifact_ids: Sequence[str]) -> dict[str, Any]:
         return {
+            "target_id": self.target_id,
             "method": self.method,
             "job_type": self.job_type,
             "input_artifact_ids": list(input_artifact_ids),
             "config": dict(self.config),
+            "plan": self.plan.model_dump(mode="json"),
+            "plan_selection": self.selection.model_dump(mode="json"),
             "priority": 100,
         }
 
@@ -125,12 +167,19 @@ class CompiledTask:
         policy_version = self.policy_version_for_round(round_index)
         jobs: list[dict[str, Any]] = []
         for spec in method_specs:
-            context_ids = _job_context_artifact_ids(
-                context_artifact_ids,
+            payload = spec.job_payload(())
+            planned_input_bindings = _planned_input_bindings(
                 spec,
+                dataset_artifact_id=dataset_artifact_id,
+                context_artifact_ids=context_artifact_ids,
             )
-            input_artifact_ids = [dataset_artifact_id, *context_ids]
-            payload = spec.job_payload(input_artifact_ids)
+            payload["input_bindings"] = planned_input_bindings
+            payload["input_artifact_ids"] = [
+                artifact_id
+                for binding in planned_input_bindings
+                for artifact_id in binding["artifact_ids"]
+            ]
+            input_artifact_ids = payload["input_artifact_ids"]
             compatibility = _job_compatibility(
                 spec,
                 payload["config"],
@@ -166,15 +215,9 @@ class CompiledTask:
                 },
                 "compatibility": compatibility,
             }
-            if spec.artifact_type == "parametric_memory":
-                base_model = str(
-                    payload["config"].get("base_model")
-                    or self.agent.get("model_name")
-                    or ""
-                ).strip()
+            if spec.target_id == "parametric_memory":
+                base_model = str(payload["config"].get("base_model") or "").strip()
                 if base_model:
-                    if "base_model" not in payload["config"]:
-                        payload["config"]["base_model"] = base_model
                     payload["config"]["compatibility"]["base_model"] = [base_model]
             if _promotion_gate_targets_artifact(self.promotion_gate, spec.artifact_type):
                 payload["config"]["promotion_gate"] = _worker_visible_promotion_gate(
@@ -243,34 +286,83 @@ class CompiledExperiment:
     reflector_llm: dict[str, str]
     promotion_gate: dict[str, Any]
     _target_selections_json: tuple[tuple[str, str], ...]
+    _registry_snapshot: RegistrySnapshot
+    _execution_profile: EvolutionExecutionProfile
+
+    def evolution_plan_for_round(
+        self,
+        round_index: int,
+        *,
+        prior_dataset_artifact_ids: Sequence[str],
+        task_id: str | None = None,
+    ) -> EvolutionPlan:
+        _validate_round_index(round_index, self.round_count)
+        task = self._select_task(task_id)
+        prior_dataset_ids = _prior_dataset_artifact_ids(
+            prior_dataset_artifact_ids
+        )
+        selections = _plan_selections(
+            self._target_selections_json,
+            prior_dataset_artifact_ids=prior_dataset_ids,
+            agent_model=str(task.agent.get("model_name") or ""),
+            reflector_llm=self.reflector_llm,
+            registry_snapshot=self._registry_snapshot,
+        )
+        probe = self._registry_snapshot.compile_plan(
+            plan_id="plan-identity-probe",
+            selections=selections,
+            profile=self._execution_profile,
+        )
+        plan_identity = {
+            "experiment_id": self.experiment_id,
+            "run_id": self.run_id,
+            "task_id": task.task_id,
+            "round_index": round_index,
+            "prior_dataset_artifact_ids": list(prior_dataset_ids),
+            "resolved_plan": probe.model_dump(
+                mode="json",
+                exclude={"plan_id"},
+            ),
+        }
+        return self._registry_snapshot.compile_plan(
+            plan_id=f"plan-{canonical_digest(plan_identity)}",
+            selections=selections,
+            profile=self._execution_profile,
+        )
 
     def evolution_methods_for_round(
         self,
         round_index: int,
         *,
         prior_dataset_artifact_ids: Sequence[str],
+        task_id: str | None = None,
     ) -> list[CompiledEvolutionMethodSpec]:
-        _validate_round_index(round_index, self.round_count)
         normalized_prior_dataset_ids = _prior_dataset_artifact_ids(
             prior_dataset_artifact_ids
         )
-        selections = {
-            target_id: ProjectEvolutionTargetSelection.model_validate_json(encoded)
-            for target_id, encoded in self._target_selections_json
-        }
+        plan = self.evolution_plan_for_round(
+            round_index,
+            prior_dataset_artifact_ids=normalized_prior_dataset_ids,
+            task_id=task_id,
+        )
         specs: list[CompiledEvolutionMethodSpec] = []
-        for artifact_type in _EVOLUTION_ORDER:
-            selection = selections.get(artifact_type)
-            if selection is None:
-                continue
-            spec = _compile_method_spec(
-                selection,
-                artifact_type=artifact_type,
-                prior_dataset_artifact_ids=normalized_prior_dataset_ids,
-                reflector_llm=self.reflector_llm,
+        for resolved in _ordered_plan_selections(plan.selections):
+            requested = _requested_selection(
+                self._target_selections_json,
+                resolved.target_id,
             )
-            if spec is not None:
-                specs.append(spec)
+            target_descriptor = self._registry_snapshot.targets[resolved.target_id]
+            method_descriptor = self._registry_snapshot.methods[resolved.method_id]
+            specs.append(
+                _compile_method_spec(
+                    plan,
+                    resolved,
+                    requested_selection=requested,
+                    prior_dataset_artifact_ids=normalized_prior_dataset_ids,
+                    artifact_type=target_descriptor.artifact_type,
+                    input_bindings=method_descriptor.input_bindings,
+                )
+            )
         return specs
 
     def evolution_job_payloads_for_round(
@@ -294,6 +386,7 @@ class CompiledExperiment:
             self.evolution_methods_for_round(
                 round_index,
                 prior_dataset_artifact_ids=prior_dataset_artifact_ids,
+                task_id=task.task_id,
             ),
             dataset_artifact_id=dataset_artifact_id,
             context_artifact_ids=context_artifact_ids,
@@ -315,6 +408,9 @@ def compile_experiment(
     task_ids: Sequence[str] | None = None,
     rounds_override: int | None = None,
     run_id: str | None = None,
+    *,
+    registry_snapshot: RegistrySnapshot,
+    execution_profile: EvolutionExecutionProfile,
 ) -> CompiledExperiment:
     round_count = rounds_override if rounds_override is not None else config.evolution.rounds
     if isinstance(round_count, bool) or round_count < 1:
@@ -327,6 +423,18 @@ def compile_experiment(
     runtime = _runtime_payload(config)
     config_path = config.path
     experiment_id = config.experiment.name
+    reflector_llm = _reflector_llm(config)
+    registry_snapshot.compile_plan(
+        plan_id="plan-validation-probe",
+        selections=_plan_selections(
+            target_selections,
+            prior_dataset_artifact_ids=(),
+            agent_model=config.agent.model,
+            reflector_llm=reflector_llm,
+            registry_snapshot=registry_snapshot,
+        ),
+        profile=execution_profile,
+    )
     return CompiledExperiment(
         experiment_id=experiment_id,
         experiment_name=config.experiment.name,
@@ -350,9 +458,11 @@ def compile_experiment(
             )
             for task in selected_tasks
         ],
-        reflector_llm=_reflector_llm(config),
+        reflector_llm=reflector_llm,
         promotion_gate=_promotion_gate(config),
         _target_selections_json=target_selections,
+        _registry_snapshot=registry_snapshot,
+        _execution_profile=execution_profile,
     )
 
 
@@ -366,79 +476,191 @@ def _normalize_run_id(run_id: str | None) -> str | None:
 
 
 def _compile_method_spec(
-    selection: ProjectEvolutionTargetSelection,
+    plan: EvolutionPlan,
+    selection: ResolvedEvolutionSelection,
     *,
-    artifact_type: str,
+    requested_selection: ProjectEvolutionTargetSelection,
     prior_dataset_artifact_ids: Sequence[str],
-    reflector_llm: dict[str, str],
-) -> CompiledEvolutionMethodSpec | None:
-    if not selection.enabled:
-        return None
-    requested_method = selection.method
-    if requested_method is None:  # Project validation makes this unreachable.
-        raise ValueError(f"enabled evolution target {artifact_type!r} requires method")
-
-    method = requested_method
-    if requested_method == "auto":
-        if artifact_type != "agent_system":
-            raise ValueError(
-                f"automatic method resolution is unsupported for target {artifact_type!r}"
-            )
-        method = resolve_agent_system_method(
-            requested_method,
-            prior_dataset_artifact_ids,
-        )
-    _validate_method_target(method, artifact_type)
-
-    base_config = dict(selection.config)
-    if artifact_type == "parametric_memory":
-        base_config.pop("reflector_llm", None)
-    else:
-        base_config["reflector_llm"] = dict(reflector_llm)
-    if artifact_type == "agent_system":
-        base_config.setdefault("target_path", "AGENTS.md")
+    artifact_type: str,
+    input_bindings: tuple[MethodInputBinding, ...],
+) -> CompiledEvolutionMethodSpec:
+    base_config = selection.config()
+    if selection.target_id == "parametric_memory":
+        compatibility = requested_selection.config.get("compatibility")
+        if isinstance(compatibility, Mapping):
+            base_config["compatibility"] = dict(compatibility)
 
     return CompiledEvolutionMethodSpec(
         artifact_type=artifact_type,
-        method=method,
-        requested_method=requested_method,
+        target_id=selection.target_id,
+        handler_id=selection.handler_id,
+        method=selection.method_id,
+        requested_method=requested_selection.method or selection.method_id,
         prior_dataset_artifact_ids=tuple(prior_dataset_artifact_ids),
-        job_type=method,
+        job_type=selection.method_id,
         config=base_config,
+        plan=plan,
+        selection=selection,
+        input_bindings=input_bindings,
     )
 
 
 def _target_selections(
     config: ExperimentConfig,
 ) -> tuple[tuple[str, str], ...]:
-    unknown_targets = set(config.evolution.targets).difference(_EVOLUTION_ORDER)
-    for target_id in sorted(unknown_targets):
-        if config.evolution.targets[target_id].enabled:
-            raise ValueError(f"Unsupported evolution target: {target_id}")
     return tuple(
         (
             target_id,
-            config.evolution.targets[target_id].model_dump_json(),
+            selection.model_dump_json(),
         )
-        for target_id in _EVOLUTION_ORDER
-        if target_id in config.evolution.targets
+        for target_id, selection in sorted(config.evolution.targets.items())
     )
 
 
-def _validate_method_target(method_id: str, target_id: str) -> None:
-    """Temporary A2 guard until planning consumes the verified frozen registry."""
+def _requested_selection(
+    selections_json: tuple[tuple[str, str], ...],
+    target_id: str,
+) -> ProjectEvolutionTargetSelection:
+    for candidate_target, encoded in selections_json:
+        if candidate_target == target_id:
+            return ProjectEvolutionTargetSelection.model_validate_json(encoded)
+    raise ValueError(f"missing requested selection for resolved target {target_id!r}")
 
-    from openevo.evolution.methods import METHOD_METADATA
 
-    metadata = METHOD_METADATA.get(method_id)
-    if metadata is None:
-        raise ValueError(f"Unknown evolution method: {method_id}")
-    method_target = str(metadata.get("artifact_type") or "")
-    if method_target != target_id:
-        raise ValueError(
-            f"method {method_id!r} belongs to target {method_target!r}, "
-            f"not {target_id!r}"
+def _plan_selections(
+    selections_json: tuple[tuple[str, str], ...],
+    *,
+    prior_dataset_artifact_ids: tuple[str, ...],
+    agent_model: str,
+    reflector_llm: Mapping[str, str],
+    registry_snapshot: RegistrySnapshot,
+) -> tuple[EvolutionTargetSelection, ...]:
+    selections: list[EvolutionTargetSelection] = []
+    for target_id, encoded in selections_json:
+        requested = ProjectEvolutionTargetSelection.model_validate_json(encoded)
+        if not requested.enabled:
+            continue
+        if target_id not in registry_snapshot.targets:
+            raise ValueError(f"unknown target {target_id!r}")
+        method_id = requested.method
+        if method_id == "auto":
+            if target_id != "agent_system":
+                raise ValueError(
+                    f"automatic method resolution is unsupported for target {target_id!r}"
+                )
+            method_id = resolve_agent_system_method(
+                method_id,
+                prior_dataset_artifact_ids,
+            )
+        method_descriptor = registry_snapshot.methods.get(method_id)
+        if method_descriptor is None:
+            raise ValueError(f"unknown method {method_id!r}")
+        config = dict(requested.config)
+        config.pop("compatibility", None)
+        if target_id in {"text_memory", "skill_bundle", "agent_system"}:
+            config.pop("reflector_llm", None)
+            if _closed_schema_declares(method_descriptor.config_schema, "reflector_llm"):
+                config["reflector_llm"] = dict(reflector_llm)
+        elif target_id == "parametric_memory":
+            config.pop("reflector_llm", None)
+            if (
+                _closed_schema_declares(method_descriptor.config_schema, "base_model")
+                and not config.get("base_model")
+            ):
+                config["base_model"] = agent_model
+        selections.append(
+            EvolutionTargetSelection(
+                target_id=target_id,
+                enabled=True,
+                method_id=method_id,
+                config=config,
+            )
         )
+    return tuple(selections)
+
+
+def _planned_input_bindings(
+    spec: CompiledEvolutionMethodSpec,
+    *,
+    dataset_artifact_id: str,
+    context_artifact_ids: ContextArtifactIds,
+) -> list[dict[str, Any]]:
+    if not spec.input_bindings:
+        return []
+    planned: list[dict[str, Any]] = []
+    for binding in spec.input_bindings:
+        matching = _input_artifact_ids_for_binding(
+            binding,
+            spec=spec,
+            dataset_artifact_id=dataset_artifact_id,
+            context_artifact_ids=context_artifact_ids,
+        )
+        planned.append(
+            {
+                "binding_id": binding.binding_id,
+                "artifact_ids": matching,
+            }
+        )
+    return planned
+
+
+def _input_artifact_ids_for_binding(
+    binding: MethodInputBinding,
+    *,
+    spec: CompiledEvolutionMethodSpec,
+    dataset_artifact_id: str,
+    context_artifact_ids: ContextArtifactIds,
+) -> list[str]:
+    if binding.source is InputBindingSource.CURRENT_DATASET:
+        return [dataset_artifact_id] if binding.artifact_type == "dataset" else []
+    if binding.source is InputBindingSource.HISTORY_DATASETS:
+        return (
+            list(spec.prior_dataset_artifact_ids)
+            if binding.artifact_type == "dataset"
+            else []
+        )
+    if binding.source is InputBindingSource.CURRENT_TARGET_ARTIFACTS:
+        return _context_artifact_ids_for_type(
+            context_artifact_ids,
+            binding.artifact_type,
+        )
+    if binding.source is InputBindingSource.EXPLICIT_INPUTS:
+        if binding.artifact_type == "dataset":
+            artifact_ids = [dataset_artifact_id]
+            # Preserve the pre-framework experiment projection exactly. Other
+            # methods can request history through a HISTORY_DATASETS binding.
+            if (
+                spec.target_id == "agent_system"
+                and spec.method in _LEGACY_AGENT_SYSTEM_HISTORY_METHODS
+            ):
+                artifact_ids.extend(spec.prior_dataset_artifact_ids)
+            return artifact_ids
+        return _context_artifact_ids_for_type(
+            context_artifact_ids,
+            binding.artifact_type,
+        )
+    raise ValueError(f"unsupported input binding source {binding.source!r}")
+
+
+def _closed_schema_declares(schema: Mapping[str, Any], property_name: str) -> bool:
+    if schema.get("additionalProperties") is not False:
+        return False
+    properties = schema.get("properties")
+    return isinstance(properties, Mapping) and property_name in properties
+
+
+def _ordered_plan_selections(
+    selections: Sequence[ResolvedEvolutionSelection],
+) -> list[ResolvedEvolutionSelection]:
+    builtin_order = {target_id: index for index, target_id in enumerate(_EVOLUTION_ORDER)}
+    return sorted(
+        selections,
+        key=lambda selection: (
+            0 if selection.target_id in builtin_order else 1,
+            builtin_order.get(selection.target_id, 0),
+            selection.target_id if selection.target_id not in builtin_order else "",
+        ),
+    )
 
 
 def _prior_dataset_artifact_ids(value: Sequence[str]) -> tuple[str, ...]:
@@ -604,28 +826,11 @@ def _all_context_artifact_ids(context_artifact_ids: ContextArtifactIds) -> list[
         return []
     if isinstance(context_artifact_ids, Mapping):
         ids: list[str] = []
-        for artifact_type in _ROLLOUT_CONTEXT_ARTIFACT_TYPES:
-            ids.extend(_string_list(context_artifact_ids.get(artifact_type)))
+        for artifact_type, artifact_ids in context_artifact_ids.items():
+            if artifact_type != "dataset":
+                ids.extend(_string_list(artifact_ids))
         return ids
     return _string_list(context_artifact_ids)
-
-
-def _job_context_artifact_ids(
-    context_artifact_ids: ContextArtifactIds,
-    spec: CompiledEvolutionMethodSpec,
-) -> list[str]:
-    context_ids = _context_artifact_ids_for_type(context_artifact_ids, spec.artifact_type)
-    if (
-        spec.artifact_type == "agent_system"
-        and spec.method
-        in {
-            "agent_system_history_reflector",
-            "agent_system_pareto_reflector",
-            "agent_system_gepa_reflector",
-        }
-    ):
-        return [*spec.prior_dataset_artifact_ids, *context_ids]
-    return context_ids
 
 
 def _string_list(value: object) -> list[str]:

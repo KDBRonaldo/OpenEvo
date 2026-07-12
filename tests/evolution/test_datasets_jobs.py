@@ -9,11 +9,20 @@ import sqlite3
 import pytest
 
 import openevo.evolution.store as store_module
+from openevo.evolution.framework import (
+    EvolutionExecutionProfile,
+    EvolutionTargetSelection,
+)
+from openevo.evolution.framework.builtins import (
+    ImplementationDistributionIdentity,
+    build_builtin_registry,
+)
 from openevo.gateway.node import build_evolution_session_event
 from openevo.rollout.models import SessionResult, SessionStatus, SessionTiming
 from openevo.trajectory.models import Trace, Trajectory
 from openevo.evolution.models import (
     ArtifactRegisterRequest,
+    ArtifactState,
     ArtifactType,
     DatasetCreateRequest,
     EventIngestRequest,
@@ -28,6 +37,10 @@ from openevo.evolution.models import (
     WorkerHeartbeatRequest,
 )
 from openevo.evolution.store import EvolutionStore
+from openevo.evolution.planned_jobs import (
+    PlanBoundJobCreateRequest,
+    PlannedInputBinding,
+)
 
 
 def _parse_utc(value: str) -> datetime:
@@ -1354,6 +1367,92 @@ def test_create_dataset_rejects_corrupt_payload_json_before_writes(tmp_path):
     assert not list((tmp_path / "artifacts" / "artifacts" / "datasets").glob("*/manifest.json"))
 
 
+def test_plan_bound_job_rejects_each_mismatched_existing_plan_identity_field(tmp_path):
+    snapshot = build_builtin_registry(
+        ImplementationDistributionIdentity(
+            distribution="openevo-test",
+            distribution_version="1.0.0",
+            distribution_digest="a" * 64,
+        )
+    )
+    plan = snapshot.compile_plan(
+        plan_id="plan-store-identity",
+        selections=(
+            EvolutionTargetSelection(
+                target_id="skill_bundle",
+                enabled=True,
+                method_id="skill_bundle_reflector",
+                config={
+                    "reflector_llm": {
+                        "provider": "codex_cli",
+                        "model": "gpt-5.1-codex-mini",
+                    }
+                },
+            ),
+        ),
+        profile=EvolutionExecutionProfile(
+            execution_mode="self_deployed",
+            capture_mode="transcript",
+            harness_id="codex",
+        ),
+    )
+    store = EvolutionStore(
+        db_path=tmp_path / "evolution.db",
+        artifact_root=tmp_path / "artifacts",
+    )
+    store.initialize()
+    dataset = store.register_artifact(
+        ArtifactRegisterRequest(
+            type=ArtifactType.DATASET,
+            name="plan-dataset",
+            uri="file:///tmp/plan-dataset.json",
+        )
+    )
+    request = PlanBoundJobCreateRequest(
+        plan=plan,
+        target_id="skill_bundle",
+        job_type="skill_bundle",
+        input_bindings=(
+            PlannedInputBinding(
+                binding_id="current_dataset",
+                artifact_ids=(dataset.artifact_id,),
+            ),
+            PlannedInputBinding(
+                binding_id="prior_target_artifacts",
+                artifact_ids=(),
+            ),
+        ),
+    )
+    store.create_plan_bound_job(request, snapshot=snapshot)
+
+    replacements = {
+        "schema_version": "different-schema-version",
+        "registry_snapshot_digest": "f" * 64,
+        "plan_digest": "f" * 64,
+        "plan_json": "{}",
+    }
+    with store.connect() as conn:
+        original = conn.execute(
+            "SELECT * FROM evolution_plans WHERE plan_id = ?",
+            (plan.plan_id,),
+        ).fetchone()
+    for field, replacement in replacements.items():
+        with store.connect() as conn:
+            conn.execute(
+                f"UPDATE evolution_plans SET {field} = ? WHERE plan_id = ?",
+                (replacement, plan.plan_id),
+            )
+            conn.commit()
+        with pytest.raises(ValueError, match="different plan"):
+            store.create_plan_bound_job(request, snapshot=snapshot)
+        with store.connect() as conn:
+            conn.execute(
+                f"UPDATE evolution_plans SET {field} = ? WHERE plan_id = ?",
+                (original[field], plan.plan_id),
+            )
+            conn.commit()
+
+
 def test_job_claim_heartbeat_and_complete(tmp_path):
     store = EvolutionStore(db_path=tmp_path / "evolution.db", artifact_root=tmp_path / "artifacts")
     store.initialize()
@@ -1736,6 +1835,124 @@ def test_heartbeat_renews_lease_expiration(tmp_path):
     assert _parse_utc(row["lease_expires_at"]) > _parse_utc(original_expires_at)
 
 
+def test_claim_persists_duration_and_heartbeat_renews_exact_short_lease(
+    tmp_path,
+    monkeypatch,
+):
+    fixed_now = datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC)
+
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return fixed_now if tz is not None else fixed_now.replace(tzinfo=None)
+
+    monkeypatch.setattr(store_module, "datetime", FixedDateTime)
+    store = EvolutionStore(
+        db_path=tmp_path / "evolution.db",
+        artifact_root=tmp_path / "artifacts",
+    )
+    store.initialize()
+    job = store.create_job(
+        JobCreateRequest(method="mock", job_type="text_memory_mining")
+    )
+    claim = store.claim_job(
+        WorkerClaimRequest(
+            worker_id="worker_1",
+            capabilities=["text_memory_mining"],
+            lease_seconds=2,
+        )
+    )
+    assert claim.job is not None
+
+    fixed_now += timedelta(seconds=1)
+    result = store.heartbeat_job(
+        job.job_id,
+        WorkerHeartbeatRequest(lease_id=claim.job.lease_id),
+    )
+
+    with store.connect() as conn:
+        row = conn.execute(
+            """
+            SELECT lease_duration_seconds, lease_expires_at
+            FROM jobs WHERE job_id = ?
+            """,
+            (job.job_id,),
+        ).fetchone()
+    assert row["lease_duration_seconds"] == 2
+    assert _parse_utc(row["lease_expires_at"]) == fixed_now + timedelta(seconds=2)
+    assert _parse_utc(str(result["lease_expires_at"])) == fixed_now + timedelta(seconds=2)
+
+
+def test_heartbeat_backfills_legacy_active_null_lease_duration(tmp_path, monkeypatch):
+    fixed_now = datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC)
+
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return fixed_now if tz is not None else fixed_now.replace(tzinfo=None)
+
+    monkeypatch.setattr(store_module, "datetime", FixedDateTime)
+    store = EvolutionStore(
+        db_path=tmp_path / "evolution.db",
+        artifact_root=tmp_path / "artifacts",
+    )
+    store.initialize()
+    job = store.create_job(
+        JobCreateRequest(method="mock", job_type="text_memory_mining")
+    )
+    claim = store.claim_job(
+        WorkerClaimRequest(
+            worker_id="worker_1",
+            capabilities=["text_memory_mining"],
+            lease_seconds=7,
+        )
+    )
+    assert claim.job is not None
+    with store.connect() as conn:
+        conn.execute(
+            """
+            UPDATE jobs
+            SET lease_duration_seconds = NULL, updated_at = ?, lease_expires_at = ?
+            WHERE job_id = ?
+            """,
+            (
+                fixed_now.isoformat().replace("+00:00", "Z"),
+                (fixed_now + timedelta(seconds=7)).isoformat().replace("+00:00", "Z"),
+                job.job_id,
+            ),
+        )
+        conn.commit()
+
+    store = EvolutionStore(
+        db_path=tmp_path / "evolution.db",
+        artifact_root=tmp_path / "artifacts",
+    )
+    store.initialize()
+    with store.connect() as conn:
+        migrated_duration = conn.execute(
+            "SELECT lease_duration_seconds FROM jobs WHERE job_id = ?",
+            (job.job_id,),
+        ).fetchone()["lease_duration_seconds"]
+    assert migrated_duration == 7
+
+    fixed_now += timedelta(seconds=2)
+    store.heartbeat_job(
+        job.job_id,
+        WorkerHeartbeatRequest(lease_id=claim.job.lease_id),
+    )
+
+    with store.connect() as conn:
+        row = conn.execute(
+            """
+            SELECT lease_duration_seconds, lease_expires_at
+            FROM jobs WHERE job_id = ?
+            """,
+            (job.job_id,),
+        ).fetchone()
+    assert row["lease_duration_seconds"] == 7
+    assert _parse_utc(row["lease_expires_at"]) == fixed_now + timedelta(seconds=7)
+
+
 def test_heartbeat_does_not_shorten_long_active_lease(tmp_path):
     store = EvolutionStore(db_path=tmp_path / "evolution.db", artifact_root=tmp_path / "artifacts")
     store.initialize()
@@ -1950,6 +2167,391 @@ def test_complete_job_final_update_failure_marks_failed_and_cleans_artifacts(tmp
     assert not list((tmp_path / "artifacts" / "artifacts" / "text_memory").glob("*/manifest.json"))
 
 
+def test_complete_job_keeps_outputs_staged_until_success_is_committed(
+    tmp_path,
+    monkeypatch,
+):
+    store = EvolutionStore(
+        db_path=tmp_path / "evolution.db",
+        artifact_root=tmp_path / "artifacts",
+    )
+    store.initialize()
+    job = store.create_job(
+        JobCreateRequest(method="mock", job_type="text_memory_mining")
+    )
+    claim = store.claim_job(
+        WorkerClaimRequest(worker_id="worker_1", capabilities=["text_memory_mining"])
+    )
+    assert claim.job is not None
+
+    staged_artifact_ids: list[str] = []
+    original_register_artifact = store._register_artifact
+
+    def observe_staged_artifact(
+        request: ArtifactRegisterRequest,
+        *,
+        initial_state: ArtifactState,
+        staging_job_id: str | None = None,
+    ):
+        assert initial_state is ArtifactState.STAGED
+        assert staging_job_id == job.job_id
+        artifact = original_register_artifact(
+            request,
+            initial_state=initial_state,
+            staging_job_id=staging_job_id,
+        )
+        staged_artifact_ids.append(artifact.artifact_id)
+        with pytest.raises(ValueError, match="unknown artifact"):
+            store.get_artifact(artifact.artifact_id)
+        with store.connect() as conn:
+            row = conn.execute(
+                "SELECT state FROM artifacts WHERE artifact_id = ?",
+                (artifact.artifact_id,),
+            ).fetchone()
+        assert row["state"] == "staged"
+        return artifact
+
+    monkeypatch.setattr(store, "_register_artifact", observe_staged_artifact)
+
+    completed = store.complete_job(
+        job.job_id,
+        WorkerCompleteRequest(
+            lease_id=claim.job.lease_id,
+            artifacts=[
+                ArtifactRegisterRequest(
+                    type=ArtifactType.TEXT_MEMORY,
+                    name="published",
+                    uri="file:///tmp/published.md",
+                )
+            ],
+        ),
+    )
+
+    assert completed["artifact_ids"] == staged_artifact_ids
+    published = store.get_artifact(staged_artifact_ids[0])
+    assert published.state is ArtifactState.ACTIVE
+    with store.connect() as conn:
+        row = conn.execute(
+            "SELECT state FROM jobs WHERE job_id = ?",
+            (job.job_id,),
+        ).fetchone()
+        artifact_row = conn.execute(
+            "SELECT state, staging_job_id FROM artifacts WHERE artifact_id = ?",
+            (staged_artifact_ids[0],),
+        ).fetchone()
+    assert row["state"] == "succeeded"
+    assert artifact_row["state"] == "active"
+    assert artifact_row["staging_job_id"] is None
+
+
+def test_restart_reclaims_expired_job_staged_outputs(tmp_path):
+    db_path = tmp_path / "evolution.db"
+    artifact_root = tmp_path / "artifacts"
+    store = EvolutionStore(db_path=db_path, artifact_root=artifact_root)
+    store.initialize()
+    job = store.create_job(
+        JobCreateRequest(method="mock", job_type="text_memory_mining")
+    )
+    claim = store.claim_job(
+        WorkerClaimRequest(worker_id="worker-1", capabilities=["text_memory_mining"])
+    )
+    assert claim.job is not None
+    staged = store._register_artifact(
+        ArtifactRegisterRequest(
+            type=ArtifactType.TEXT_MEMORY,
+            name="crash-window",
+            uri="file:///tmp/crash-window.md",
+            promoted=True,
+        ),
+        initial_state=ArtifactState.STAGED,
+        staging_job_id=job.job_id,
+    )
+    with store.connect() as conn:
+        manifest_path = Path(
+            conn.execute(
+                "SELECT manifest_path FROM artifacts WHERE artifact_id = ?",
+                (staged.artifact_id,),
+            ).fetchone()["manifest_path"]
+        )
+        conn.execute(
+            "UPDATE jobs SET state = ?, lease_expires_at = ? WHERE job_id = ?",
+            (
+                str(JobState.RUNNING),
+                (datetime.now(UTC) - timedelta(seconds=1)).isoformat(),
+                job.job_id,
+            ),
+        )
+        conn.commit()
+    assert manifest_path.is_file()
+
+    restarted = EvolutionStore(db_path=db_path, artifact_root=artifact_root)
+    restarted.initialize()
+
+    with restarted.connect() as conn:
+        job_row = conn.execute(
+            "SELECT state FROM jobs WHERE job_id = ?",
+            (job.job_id,),
+        ).fetchone()
+        staged_count = conn.execute(
+            "SELECT COUNT(*) FROM artifacts WHERE staging_job_id = ?",
+            (job.job_id,),
+        ).fetchone()[0]
+    assert job_row["state"] == "pending"
+    assert staged_count == 0
+    assert not manifest_path.exists()
+    reclaimed = restarted.claim_job(
+        WorkerClaimRequest(worker_id="worker-2", capabilities=["text_memory_mining"])
+    )
+    assert reclaimed.job is not None
+    assert reclaimed.job.job_id == job.job_id
+
+
+def test_restart_reclaims_manifest_left_after_staged_db_delete(tmp_path):
+    db_path = tmp_path / "evolution.db"
+    artifact_root = tmp_path / "artifacts"
+    store = EvolutionStore(db_path=db_path, artifact_root=artifact_root)
+    store.initialize()
+    job = store.create_job(
+        JobCreateRequest(method="mock", job_type="text_memory_mining")
+    )
+    staged = store._register_artifact(
+        ArtifactRegisterRequest(
+            type=ArtifactType.TEXT_MEMORY,
+            name="db-delete-unlink-window",
+            uri="file:///tmp/db-delete-unlink-window.md",
+        ),
+        initial_state=ArtifactState.STAGED,
+        staging_job_id=job.job_id,
+    )
+    with store.connect() as conn:
+        manifest_path = Path(
+            conn.execute(
+                "SELECT manifest_path FROM artifacts WHERE artifact_id = ?",
+                (staged.artifact_id,),
+            ).fetchone()["manifest_path"]
+        )
+        conn.execute("DELETE FROM artifacts WHERE artifact_id = ?", (staged.artifact_id,))
+        conn.commit()
+    assert manifest_path.is_file()
+
+    EvolutionStore(db_path=db_path, artifact_root=artifact_root).initialize()
+
+    assert not manifest_path.exists()
+    assert not manifest_path.parent.exists()
+
+
+def test_restart_reclaims_malformed_managed_orphan_manifest(tmp_path):
+    artifact_root = tmp_path / "artifacts"
+    store = EvolutionStore(
+        db_path=tmp_path / "evolution.db",
+        artifact_root=artifact_root,
+    )
+    store.initialize()
+    orphan = (
+        artifact_root
+        / "artifacts"
+        / "text_memory"
+        / "art_malformed_orphan"
+        / "manifest.json"
+    )
+    orphan.parent.mkdir(parents=True)
+    orphan.write_text("{partial", encoding="utf-8")
+
+    EvolutionStore(
+        db_path=tmp_path / "evolution.db",
+        artifact_root=artifact_root,
+    ).initialize()
+
+    assert not orphan.exists()
+    assert not orphan.parent.exists()
+
+
+def test_fail_job_never_unlinks_manifest_path_outside_artifact_root(tmp_path):
+    store = EvolutionStore(
+        db_path=tmp_path / "evolution.db",
+        artifact_root=tmp_path / "artifacts",
+    )
+    store.initialize()
+    job = store.create_job(
+        JobCreateRequest(method="mock", job_type="text_memory_mining")
+    )
+    claim = store.claim_job(
+        WorkerClaimRequest(worker_id="worker-1", capabilities=["text_memory_mining"])
+    )
+    assert claim.job is not None
+    staged = store._register_artifact(
+        ArtifactRegisterRequest(
+            type=ArtifactType.TEXT_MEMORY,
+            name="unsafe-manifest-path",
+            uri="file:///tmp/unsafe-manifest-path.md",
+        ),
+        initial_state=ArtifactState.STAGED,
+        staging_job_id=job.job_id,
+    )
+    external = tmp_path / "must-not-delete.json"
+    external.write_text("keep", encoding="utf-8")
+    with store.connect() as conn:
+        conn.execute(
+            "UPDATE artifacts SET manifest_path = ? WHERE artifact_id = ?",
+            (str(external), staged.artifact_id),
+        )
+        conn.commit()
+
+    store.fail_job(
+        job.job_id,
+        WorkerFailRequest(
+            lease_id=claim.job.lease_id,
+            error="failure with tampered manifest path",
+            retryable=False,
+        ),
+    )
+
+    assert external.read_text(encoding="utf-8") == "keep"
+
+
+def test_restart_orphan_scan_does_not_follow_external_symlink(tmp_path):
+    db_path = tmp_path / "evolution.db"
+    artifact_root = tmp_path / "artifacts"
+    store = EvolutionStore(db_path=db_path, artifact_root=artifact_root)
+    store.initialize()
+    external_artifact_dir = tmp_path / "external" / "art_external"
+    external_artifact_dir.mkdir(parents=True)
+    external_manifest = external_artifact_dir / "manifest.json"
+    external_manifest.write_text(
+        json.dumps(
+            {
+                "artifact_id": "art_external",
+                "type": "text_memory",
+                "name": "external",
+                "uri": "file:///tmp/external.md",
+                "manifest": {},
+                "lineage": {},
+                "compatibility": {},
+                "scores": {},
+                "tags": [],
+                "promoted": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+    linked_dir = artifact_root / "artifacts" / "text_memory" / "art_external"
+    linked_dir.symlink_to(external_artifact_dir, target_is_directory=True)
+
+    EvolutionStore(db_path=db_path, artifact_root=artifact_root).initialize()
+
+    assert external_manifest.is_file()
+    assert linked_dir.is_symlink()
+
+
+def test_restart_preserves_live_staging_until_job_fails(tmp_path):
+    db_path = tmp_path / "evolution.db"
+    artifact_root = tmp_path / "artifacts"
+    store = EvolutionStore(db_path=db_path, artifact_root=artifact_root)
+    store.initialize()
+    job = store.create_job(
+        JobCreateRequest(method="mock", job_type="text_memory_mining")
+    )
+    claim = store.claim_job(
+        WorkerClaimRequest(worker_id="worker-1", capabilities=["text_memory_mining"])
+    )
+    assert claim.job is not None
+    staged = store._register_artifact(
+        ArtifactRegisterRequest(
+            type=ArtifactType.TEXT_MEMORY,
+            name="live-stage",
+            uri="file:///tmp/live-stage.md",
+        ),
+        initial_state=ArtifactState.STAGED,
+        staging_job_id=job.job_id,
+    )
+
+    restarted = EvolutionStore(db_path=db_path, artifact_root=artifact_root)
+    restarted.initialize()
+    with restarted.connect() as conn:
+        staged_row = conn.execute(
+            "SELECT manifest_path FROM artifacts WHERE artifact_id = ?",
+            (staged.artifact_id,),
+        ).fetchone()
+    assert staged_row is not None
+    manifest_path = Path(staged_row["manifest_path"])
+    assert manifest_path.is_file()
+
+    restarted.fail_job(
+        job.job_id,
+        WorkerFailRequest(
+            lease_id=claim.job.lease_id,
+            error="simulated worker failure",
+            retryable=False,
+        ),
+    )
+
+    with restarted.connect() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM artifacts WHERE artifact_id = ?",
+            (staged.artifact_id,),
+        ).fetchone()[0] == 0
+    assert not manifest_path.exists()
+
+
+def test_complete_job_reclaims_staging_from_an_interrupted_attempt(tmp_path):
+    store = EvolutionStore(
+        db_path=tmp_path / "evolution.db",
+        artifact_root=tmp_path / "artifacts",
+    )
+    store.initialize()
+    job = store.create_job(
+        JobCreateRequest(method="mock", job_type="text_memory_mining")
+    )
+    claim = store.claim_job(
+        WorkerClaimRequest(worker_id="worker-1", capabilities=["text_memory_mining"])
+    )
+    assert claim.job is not None
+    stale = store._register_artifact(
+        ArtifactRegisterRequest(
+            type=ArtifactType.TEXT_MEMORY,
+            name="interrupted-attempt",
+            uri="file:///tmp/interrupted-attempt.md",
+        ),
+        initial_state=ArtifactState.STAGED,
+        staging_job_id=job.job_id,
+    )
+    with store.connect() as conn:
+        stale_manifest_path = Path(
+            conn.execute(
+                "SELECT manifest_path FROM artifacts WHERE artifact_id = ?",
+                (stale.artifact_id,),
+            ).fetchone()["manifest_path"]
+        )
+
+    completed = store.complete_job(
+        job.job_id,
+        WorkerCompleteRequest(
+            lease_id=claim.job.lease_id,
+            artifacts=[
+                ArtifactRegisterRequest(
+                    type=ArtifactType.TEXT_MEMORY,
+                    name="retry-output",
+                    uri="file:///tmp/retry-output.md",
+                )
+            ],
+        ),
+    )
+
+    with store.connect() as conn:
+        stale_count = conn.execute(
+            "SELECT COUNT(*) FROM artifacts WHERE artifact_id = ?",
+            (stale.artifact_id,),
+        ).fetchone()[0]
+        published_row = conn.execute(
+            "SELECT state, staging_job_id FROM artifacts WHERE artifact_id = ?",
+            (completed["artifact_ids"][0],),
+        ).fetchone()
+    assert stale_count == 0
+    assert not stale_manifest_path.exists()
+    assert published_row["state"] == "active"
+    assert published_row["staging_job_id"] is None
+
+
 def test_complete_job_expired_final_lease_cleans_artifacts_without_failing_job(
     tmp_path,
     monkeypatch,
@@ -1966,10 +2568,19 @@ def test_complete_job_expired_final_lease_cleans_artifacts_without_failing_job(
     )
     assert claim.job is not None
 
-    original_register_artifact = store.register_artifact
+    original_register_artifact = store._register_artifact
 
-    def expire_lease_after_register(request: ArtifactRegisterRequest):
-        artifact = original_register_artifact(request)
+    def expire_lease_after_register(
+        request: ArtifactRegisterRequest,
+        *,
+        initial_state,
+        staging_job_id=None,
+    ):
+        artifact = original_register_artifact(
+            request,
+            initial_state=initial_state,
+            staging_job_id=staging_job_id,
+        )
         expired_at = (
             (datetime.now(UTC) - timedelta(seconds=1))
             .isoformat()
@@ -1986,7 +2597,7 @@ def test_complete_job_expired_final_lease_cleans_artifacts_without_failing_job(
             conn.commit()
         return artifact
 
-    monkeypatch.setattr(store, "register_artifact", expire_lease_after_register)
+    monkeypatch.setattr(store, "_register_artifact", expire_lease_after_register)
 
     with pytest.raises(ValueError, match="lease expired"):
         store.complete_job(

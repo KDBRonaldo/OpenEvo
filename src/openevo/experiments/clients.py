@@ -18,6 +18,8 @@ class EvolutionClientProtocol(Protocol):
 
     def create_job(self, payload: dict[str, Any]) -> dict[str, Any]: ...
 
+    def create_plan_bound_job(self, payload: dict[str, Any]) -> dict[str, Any]: ...
+
     def get_artifact(self, artifact_id: str) -> dict[str, Any]: ...
 
     def update_artifact_promotion(
@@ -138,6 +140,14 @@ class EvolutionHttpClient:
         result = response.json()
         if not isinstance(result, dict):
             raise ValueError("evolution job response was not a JSON object")
+        return result
+
+    def create_plan_bound_job(self, payload: dict[str, Any]) -> dict[str, Any]:
+        response = self._client.post(f"{self.base_url}/v1/planned-jobs", json=payload)
+        response.raise_for_status()
+        result = response.json()
+        if not isinstance(result, dict):
+            raise ValueError("planned evolution job response was not a JSON object")
         return result
 
     def get_artifact(self, artifact_id: str) -> dict[str, Any]:

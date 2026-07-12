@@ -240,8 +240,8 @@ document wording.
   publishes the descriptor graph and all reachable handles atomically only
   after every implementation verifies; partial graphs and fallback callable
   tables are forbidden.
-- `PLUG-3 Existing Core boundary`: registry-driven dispatch adapts to the current
-  `JobCreateRequest`, worker claim/lease/complete flow, `ArtifactRegisterRequest`,
+- `PLUG-3 Existing Core boundary`: registry-driven dispatch uses plan-bound job
+  materialization on the current worker claim/lease/complete flow, `ArtifactRegisterRequest`,
   artifact store, promotion, context resolver, and gateway injection. It does not
   introduce a second scheduler, stage ledger, publication store, compatibility
   runtime, or generic score-based winner selection. A method may be internally
@@ -249,10 +249,12 @@ document wording.
   reinterpreting it. One tested adapter reconstructs the current flat
   `WorkerClaimedJob.config` and exact input-artifact order for mechanically moved
   methods. Each persisted job binds the plan, registry snapshot, concrete method
-  identity, normalized user/Core config, and resolved input snapshots. Claiming
-  retains run-scoped `job_type` capabilities but also filters the worker's loaded
-  method capabilities. Workers renew the existing lease while a method runs;
-  deterministic registry/identity failures are non-retryable.
+  identity, normalized user/Core config, full-envelope digest, and resolved input
+  snapshots. Corrupt rows fail before lease. Claiming
+  retains run-scoped `job_type` capabilities but also filters exact loaded method
+  identity digests. Workers renew the existing lease while a method runs;
+  deterministic registry/identity failures are non-retryable. Outputs remain
+  transiently invisible until artifact publication and job success commit together.
 - `PLUG-4 Safe target integration`: a target handler consumes the current
   resolver-ranked artifacts for one target without reranking and returns
   versioned data-only
@@ -290,7 +292,8 @@ document wording.
 
 Candidate generation, evaluation, transition, and best-result selection remain
 inside algorithm-owned method execution. Core artifact lifecycle state records
-the algorithm result; it does not redefine it.
+the algorithm result; it does not redefine it. Auxiliary report outputs never
+enter target context, and absence of a method-selected target result fails closed.
 
 Project configuration uses a generic target map rather than one Pydantic class
 or compiler branch per carrier:

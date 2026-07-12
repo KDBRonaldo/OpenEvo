@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -10,6 +11,7 @@ import httpx
 import pytest
 
 from openevo.evolution import methods as methods_module
+from openevo.evolution import worker as worker_module
 from openevo.evolution.cli import _parse_capabilities
 from openevo.evolution.methods import METHOD_REGISTRY, _audit_agent_system_markdown, run_method
 from openevo.evolution.models import (
@@ -5208,6 +5210,7 @@ def test_parse_capabilities_defaults_to_reference_job_types():
 class FakeClient:
     def __init__(self, job: dict[str, Any] | None) -> None:
         self.job = job
+        self.claims: list[dict[str, Any]] = []
         self.heartbeats: list[dict[str, Any]] = []
         self.completed: list[dict[str, Any]] = []
         self.failed: list[dict[str, Any]] = []
@@ -5218,7 +5221,18 @@ class FakeClient:
         capabilities: list[str],
         *,
         lease_seconds: int | None = None,
+        method_capabilities: list[str] | None = None,
+        method_identity_capabilities: dict[str, str] | None = None,
     ) -> dict[str, Any] | None:
+        self.claims.append(
+            {
+                "worker_id": worker_id,
+                "capabilities": capabilities,
+                "lease_seconds": lease_seconds,
+                "method_capabilities": method_capabilities,
+                "method_identity_capabilities": method_identity_capabilities,
+            }
+        )
         return self.job
 
     def heartbeat(
@@ -5279,6 +5293,134 @@ def test_run_once_claims_and_completes_job(tmp_path):
     assert client.failed == []
 
 
+@pytest.mark.parametrize(
+    ("lease_seconds", "expected_effective_lease_seconds"),
+    [(None, 600), (30, 30)],
+)
+def test_run_once_heartbeats_during_blocking_method_before_half_lease(
+    tmp_path,
+    monkeypatch,
+    lease_seconds,
+    expected_effective_lease_seconds,
+):
+    job = _job("skill_bundle", tmp_path, config={"name": "demo"}).model_dump(mode="json")
+    client = FakeClient(job)
+    release_method = threading.Event()
+    seen_effective_leases: list[int] = []
+
+    def heartbeat_interval(effective_lease_seconds: int) -> float:
+        seen_effective_leases.append(effective_lease_seconds)
+        return 0.01
+
+    def blocking_method(job, *, artifact_root):
+        assert release_method.wait(timeout=1.0)
+        return []
+
+    original_heartbeat = client.heartbeat
+
+    def heartbeat(*args, **kwargs):
+        result = original_heartbeat(*args, **kwargs)
+        if len(client.heartbeats) >= 3:
+            release_method.set()
+        return result
+
+    client.heartbeat = heartbeat
+    monkeypatch.setattr(worker_module, "_heartbeat_interval_seconds", heartbeat_interval)
+    monkeypatch.setattr(worker_module, "run_method", blocking_method)
+
+    result = run_once(
+        client,
+        worker_id="worker-1",
+        capabilities=["skill_bundle"],
+        artifact_root=tmp_path / "artifacts",
+        lease_seconds=lease_seconds,
+    )
+
+    assert result is True
+    assert seen_effective_leases == [expected_effective_lease_seconds]
+    assert client.claims[0]["lease_seconds"] == lease_seconds
+    assert len(client.heartbeats) >= 4
+    assert client.completed != []
+    assert client.failed == []
+    assert not any(thread.name.startswith("openevo-heartbeat-") for thread in threading.enumerate())
+
+
+@pytest.mark.parametrize("lease_seconds", [None, 30])
+def test_heartbeat_interval_is_strictly_before_half_lease(lease_seconds):
+    effective_lease_seconds = 600 if lease_seconds is None else lease_seconds
+
+    interval = worker_module._heartbeat_interval_seconds(effective_lease_seconds)
+
+    assert 0 < interval < effective_lease_seconds / 2
+
+
+def test_run_once_stops_heartbeat_thread_when_method_fails(tmp_path, monkeypatch):
+    job = _job("skill_bundle", tmp_path, config={"name": "demo"}).model_dump(mode="json")
+    client = FakeClient(job)
+    method_started = threading.Event()
+
+    def failing_method(job, *, artifact_root):
+        method_started.set()
+        raise RuntimeError("method failed")
+
+    monkeypatch.setattr(worker_module, "run_method", failing_method)
+
+    result = run_once(
+        client,
+        worker_id="worker-1",
+        capabilities=["skill_bundle"],
+        artifact_root=tmp_path / "artifacts",
+        lease_seconds=1,
+    )
+
+    assert result is True
+    assert method_started.is_set()
+    assert client.completed == []
+    assert len(client.failed) == 1
+    assert client.failed[0]["error"] == "method failed"
+    assert client.failed[0]["retryable"] is False
+    assert not any(thread.name.startswith("openevo-heartbeat-") for thread in threading.enumerate())
+
+
+def test_run_once_heartbeat_failure_prevents_complete_and_fails_once(tmp_path, monkeypatch):
+    job = _job("skill_bundle", tmp_path, config={"name": "demo"}).model_dump(mode="json")
+    client = FakeClient(job)
+    release_method = threading.Event()
+    heartbeat_calls = 0
+
+    def blocking_method(job, *, artifact_root):
+        assert release_method.wait(timeout=1.0)
+        return []
+
+    def heartbeat(job_id, lease_id, *, progress=None, message=None):
+        nonlocal heartbeat_calls
+        heartbeat_calls += 1
+        if heartbeat_calls == 2:
+            release_method.set()
+            raise RuntimeError("heartbeat failed")
+        return {}
+
+    client.heartbeat = heartbeat
+    monkeypatch.setattr(worker_module, "run_method", blocking_method)
+    monkeypatch.setattr(worker_module, "_heartbeat_interval_seconds", lambda _: 0.01)
+
+    result = run_once(
+        client,
+        worker_id="worker-1",
+        capabilities=["skill_bundle"],
+        artifact_root=tmp_path / "artifacts",
+        lease_seconds=1,
+    )
+
+    assert result is True
+    assert heartbeat_calls == 2
+    assert client.completed == []
+    assert len(client.failed) == 1
+    assert client.failed[0]["error"] == "heartbeat failed"
+    assert client.failed[0]["retryable"] is False
+    assert not any(thread.name.startswith("openevo-heartbeat-") for thread in threading.enumerate())
+
+
 def test_run_once_fails_unknown_method(tmp_path):
     job = _job("unknown_method", tmp_path).model_dump(mode="json")
     client = FakeClient(job)
@@ -5317,3 +5459,33 @@ def test_run_once_fails_invalid_claim_payload_with_job_identity(tmp_path):
     assert client.completed == []
     assert client.failed[0]["job_id"] == "job_invalid"
     assert client.failed[0]["lease_id"] == "lease_invalid"
+
+
+def test_run_once_preserves_completion_error_when_redundant_fail_is_rejected(
+    tmp_path,
+) -> None:
+    job = _job("skill_bundle", tmp_path, config={"name": "demo"}).model_dump(
+        mode="json"
+    )
+    client = FakeClient(job)
+
+    def reject_complete(*args, **kwargs):
+        del args, kwargs
+        raise RuntimeError("completion rejected")
+
+    def reject_fail(*args, **kwargs):
+        del args, kwargs
+        raise RuntimeError("lease already closed")
+
+    client.complete = reject_complete
+    client.fail = reject_fail
+
+    with pytest.raises(RuntimeError, match="completion rejected") as raised:
+        run_once(
+            client,
+            worker_id="worker-1",
+            capabilities=["skill_bundle"],
+            artifact_root=tmp_path / "artifacts",
+        )
+
+    assert any("lease already closed" in note for note in raised.value.__notes__)

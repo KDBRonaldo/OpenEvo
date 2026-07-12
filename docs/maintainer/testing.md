@@ -76,11 +76,13 @@ may call Core APIs but must not ship as an ordinary-user product surface.
 ## Desktop
 
 ```bash
+source .venv/bin/activate
 cd desktop
 npm ci
 npm audit --audit-level=high
 npm test -- --run
 npm run build:openevo
+npm run build:sidecar
 cd src-tauri
 # Ubuntu/Linux CI runners need Tauri native packages such as
 # libwebkit2gtk-4.1-dev, libayatana-appindicator3-dev, libgtk-3-dev,

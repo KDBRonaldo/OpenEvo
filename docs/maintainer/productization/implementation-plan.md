@@ -88,10 +88,10 @@ Execute this migration in the following order:
 | `A2.4` | `PLUG-4` | Replace target-specific context/runtime projection with validated handler contributions and add the generic Desktop renderer/config projection. |
 | `A2.5` | `PLUG-1`, `PLUG-2`, `PLUG-3`, `PLUG-4`, `PLUG-5` | Cut over Core and Desktop, delete duplicate registries/target switches, run behavior/performance gates, and document method/target authoring. |
 
-A2.3 lands as reviewable repository slices, not separate product versions:
-1. Migrate all callers to sole `evolution.targets`; preserve order and resolve `auto` from the pre-round dataset snapshot.
-2. Load one verified executable registry; bind job identity, filter methods, and renew existing leases.
-3. Project capabilities from that registry and make sidecar proxy remote Core without local fallback.
+A2.3 is implemented as reviewable repository slices, not separate product versions:
+1. Implemented: migrate callers to sole `evolution.targets`; preserve order and resolve `auto` from the pre-round dataset snapshot.
+2. Implemented: load one verified executable registry; persist plan/job identity, filter methods, validate envelopes, and renew leases.
+3. Next: project capabilities from that registry and make sidecar proxy remote Core without local fallback.
 Each PR uses `Part of` until A2.3 closes and introduces no dual schema, scheduler, fallback registry, or algorithm change.
 
 A2 completion acceptance:
@@ -312,6 +312,8 @@ Acceptance:
 - first-run through remote Core health succeeds;
 - packaged resources contain no secrets, benchmark automation, development
   override, or stale web bundle;
+- a clean sidecar build creates, validates, embeds, and archive-inspects the exact
+  Core wheel without a checked-in launcher or pre-staged wheel;
 - checksum generation is deterministic.
 
 ## D. Repository, Docs, And Release Engineering
@@ -391,20 +393,20 @@ independently review:
 
 ## Immediate Execution Order
 
-The first implementation batch after this plan merges is:
+Continue from the implemented A1/A2.1/A2.2 and first two A2.3 slices:
 
-1. Complete A1 with the smallest behavior and architecture guards needed for
-   safe structural work.
-2. Complete A2 contracts and mechanically migrate existing methods into the
-   single registry without algorithm changes.
-3. Complete A3: move Terminal Bench automation out of Core without wrappers or
-   method changes.
-4. In parallel, inventory B1 direct sidecar execution and scaffold Core state;
-   turn each concrete gap into a focused child issue.
-5. Implement the smallest real Core run lifecycle slice used by Desktop, then
-   connect one Desktop project/run flow to it.
-6. Expand Core and Desktop vertically until one Codex subscription science run
-   evolves and reuses one artifact end to end.
+1. Finish A2.3 with registry-derived remote Core capabilities and a sidecar
+   proxy that has no local catalog fallback.
+2. Complete A2.4/A2.5 generic target integration, remove duplicate registries
+   and switches, and run protected behavior/performance gates.
+3. Complete A3 by moving Terminal Bench automation out of Core without wrappers
+   or method changes.
+4. Replace B1 direct sidecar orchestration with durable Core-owned project/run/
+   service state and reconnect Desktop through typed APIs.
+5. Complete exact Core artifact/bootstrap lifecycle B2 and both release execution
+   modes, including transcript capture and self-deployed model management.
+6. Expand the mature Desktop workflow and evidence until both science E2Es and
+   every D/E release gate pass on the same release commit.
 
 This vertical path is the first product milestone. Broader UI polish,
 self-deployed automation, all artifact viewers, packaging, and final benchmark
@@ -438,6 +440,7 @@ pytest tests/ci -q
 cd desktop
 npm test -- --run
 npm run build
+npm run build:sidecar
 cd src-tauri
 cargo test --locked
 

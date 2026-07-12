@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Smoke test the installed OpenEvo Desktop app and packaged static assets."""
+"""Smoke installed OpenEvo Core with the source Desktop harness, not a packaged app."""
 
 from __future__ import annotations
 
+import hashlib
 from html.parser import HTMLParser
 import json
 from pathlib import Path
@@ -16,6 +17,14 @@ import warnings
 
 from openevo import __version__ as OPENEVO_VERSION
 from openevo.experiments import compile_experiment
+from openevo.evolution.framework import (
+    EvolutionExecutionProfile,
+    FrameworkDistributionLock,
+)
+from openevo.evolution.framework.builtins import (
+    ImplementationDistributionIdentity,
+    build_builtin_registry,
+)
 from openevo.projects.science import compile_science_project, load_science_project_config
 from desktop.server.app import create_desktop_app
 from openevo.deployment import RemoteCommandResult
@@ -73,6 +82,7 @@ class _LifecycleSmokeTransport:
     def __init__(self) -> None:
         self.commands: list[str] = []
         self.uploads: list[tuple[str, str]] = []
+        self.uploaded_framework_lock: FrameworkDistributionLock | None = None
 
     def run(
         self,
@@ -123,6 +133,18 @@ class _LifecycleSmokeTransport:
         return RemoteCommandResult(command=command, return_code=0, stdout="ok")
 
     def upload_dir(self, local_path: str, remote_path: str) -> None:
+        staging = Path(local_path)
+        wheels = list(staging.glob("openevo-*.whl"))
+        if len(wheels) != 1:
+            raise SmokeFailure("Desktop bootstrap did not stage one exact Core wheel.")
+        lock_path = staging / "framework-lock.json"
+        lock = FrameworkDistributionLock.model_validate_json(
+            lock_path.read_text(encoding="utf-8")
+        )
+        digest = hashlib.sha256(wheels[0].read_bytes()).hexdigest()
+        if lock.wheel_filename != wheels[0].name or lock.distribution_digest != digest:
+            raise SmokeFailure("Desktop framework lock did not bind the staged Core wheel.")
+        self.uploaded_framework_lock = lock
         self.uploads.append((local_path, remote_path))
 
 
@@ -187,12 +209,15 @@ def main() -> int:
             )
             with TestClient(app) as client:
                 assets = _smoke_packaged_assets(client)
-                _smoke_config_backed_lifecycle(client)
+                _smoke_config_backed_lifecycle(client, transport)
     except SmokeFailure as exc:
         print(str(exc), file=sys.stderr)
         return 1
-    print(f"OpenEvo Desktop wheel smoke passed for {len(assets)} asset(s).")
-    print("OpenEvo Desktop config-backed lifecycle smoke passed.")
+    print(
+        "Installed Core + source Desktop harness smoke passed for "
+        f"{len(assets)} asset(s)."
+    )
+    print("Source Desktop config-backed lifecycle harness passed.")
     return 0
 
 
@@ -208,7 +233,10 @@ def _smoke_packaged_assets(client: TestClient) -> list[str]:
     return assets
 
 
-def _smoke_config_backed_lifecycle(client: TestClient) -> None:
+def _smoke_config_backed_lifecycle(
+    client: TestClient,
+    transport: _LifecycleSmokeTransport,
+) -> None:
     headers = _mutation_headers(client)
     capabilities = _get_json(client, "/openevo-api/desktop/capabilities")
     method_ids = {
@@ -245,7 +273,21 @@ def _smoke_config_backed_lifecycle(client: TestClient) -> None:
     science_project = load_science_project_config(
         Path(config["config"]["science_config_path"])
     )
-    compiled = compile_experiment(compile_science_project(science_project))
+    compiled = compile_experiment(
+        compile_science_project(science_project),
+        registry_snapshot=build_builtin_registry(
+            ImplementationDistributionIdentity(
+                distribution="openevo-smoke",
+                distribution_version=OPENEVO_VERSION,
+                distribution_digest="a" * 64,
+            )
+        ),
+        execution_profile=EvolutionExecutionProfile(
+            execution_mode="subscription",
+            capture_mode="transcript",
+            harness_id="codex",
+        ),
+    )
     compiled_methods = {
         spec.method
         for spec in compiled.evolution_methods_for_round(
@@ -271,6 +313,8 @@ def _smoke_config_backed_lifecycle(client: TestClient) -> None:
     bootstrap = _post_json(client, "/openevo-api/desktop/bootstrap", headers=headers)
     if bootstrap["bootstrap"]["ready"] is not True:
         raise SmokeFailure("Desktop bootstrap did not become ready.")
+    if transport.uploaded_framework_lock is None or not transport.uploads:
+        raise SmokeFailure("Desktop bootstrap did not upload the Core wheel and lock.")
 
     services = _post_json(client, "/openevo-api/desktop/services", headers=headers)
     if services["services"]["ready"] is not True:

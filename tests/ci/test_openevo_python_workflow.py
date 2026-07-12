@@ -44,13 +44,17 @@ def test_openevo_desktop_workflow_runs_frontend_and_tauri_checks() -> None:
 
     text = workflow.read_text(encoding="utf-8")
 
-    assert "name: OpenEvo Desktop checks" in text
+    assert "name: OpenEvo packaged sidecar and Desktop source checks" in text
     assert '"desktop/**"' in text
     assert '"scripts/ci/smoke_openevo_desktop_bundle.py"' in text
     assert '"scripts/ci/smoke_openevo_desktop_sidecar.py"' in text
     assert '"scripts/ci/write_sha256.py"' in text
     assert 'node-version: "22"' in text
     assert "dtolnay/rust-toolchain@stable" in text
+    assert 'python-version: "3.11"' in text
+    assert "astral-sh/setup-uv@v6" in text
+    assert "name: Install packaged sidecar build dependencies" in text
+    assert "uv sync --frozen --group dev" in text
     assert "name: Install Linux Tauri dependencies" in text
     assert "libwebkit2gtk-4.1-dev" in text
     assert "libayatana-appindicator3-dev" in text
@@ -62,6 +66,8 @@ def test_openevo_desktop_workflow_runs_frontend_and_tauri_checks() -> None:
     assert "npm audit --audit-level=high" in text
     assert "npm test -- --run" in text
     assert "npm run build:openevo" in text
+    assert "npm run build:sidecar" in text
+    assert text.index("npm run build:sidecar") < text.index("cargo test --locked")
     assert "working-directory: desktop/src-tauri" in text
     assert "cargo metadata --locked --format-version 1" in text
     assert "cargo test --locked" in text

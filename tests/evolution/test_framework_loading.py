@@ -9,8 +9,8 @@ Expected API contract:
   injectable ``name -> importlib.metadata.Distribution`` provider, and returns
   a ``VerifiedDistribution`` opaque capability.
 * ``load_verified_entry_point(ref, verified)`` accepts only a matching ref,
-  resolves ``module:qualname`` from verified files, and returns a one-argument
-  method plugin or two-argument target handler callable.
+  resolves ``module:qualname`` from verified files, and validates a method
+  against its declared invocation ABI or a target handler against its fixed ABI.
 """
 
 from __future__ import annotations
@@ -29,7 +29,11 @@ from zipfile import ZIP_DEFLATED, ZipFile
 
 import pytest
 
-from openevo.evolution.framework import DescriptorKind, ImplementationRef
+from openevo.evolution.framework import (
+    DescriptorKind,
+    ImplementationRef,
+    MethodInvocationABI,
+)
 from openevo.evolution.framework.loading import (
     DistributionArtifactExpectation,
     FrameworkLoadError,
@@ -335,8 +339,12 @@ def test_verify_rejects_wheel_data_importable_code(
         )
 
 
-def test_loader_returns_verified_callable(installed_wheel: InstalledWheel) -> None:
-    plugin = load_verified_entry_point(_ref(installed_wheel), installed_wheel.verify())
+def test_loader_returns_verified_context_callable(installed_wheel: InstalledWheel) -> None:
+    plugin = load_verified_entry_point(
+        _ref(installed_wheel),
+        installed_wheel.verify(),
+        invocation_abi=MethodInvocationABI.METHOD_CONTEXT_V1,
+    )
 
     marker = object()
     assert plugin(marker) is marker
@@ -360,7 +368,11 @@ def test_loader_rejects_ref_identity_mismatch(
     }[mismatch]
 
     with pytest.raises(FrameworkLoadError):
-        load_verified_entry_point(_ref(installed_wheel, **values), verified)
+        load_verified_entry_point(
+            _ref(installed_wheel, **values),
+            verified,
+            invocation_abi=MethodInvocationABI.METHOD_CONTEXT_V1,
+        )
 
 
 def test_loader_rejects_unowned_module_before_import(
@@ -382,6 +394,7 @@ def test_loader_rejects_unowned_module_before_import(
         load_verified_entry_point(
             _ref(installed_wheel, entry_point="unowned_plugin:plugin"),
             installed_wheel.verify(),
+            invocation_abi=MethodInvocationABI.METHOD_CONTEXT_V1,
         )
 
     assert not marker.exists()
@@ -407,7 +420,11 @@ def test_loader_rejects_same_name_shadow_package_before_import(
     sys.modules.pop(DEFAULT_MODULE, None)
 
     with pytest.raises(FrameworkLoadError):
-        load_verified_entry_point(_ref(installed_wheel), installed_wheel.verify())
+        load_verified_entry_point(
+            _ref(installed_wheel),
+            installed_wheel.verify(),
+            invocation_abi=MethodInvocationABI.METHOD_CONTEXT_V1,
+        )
 
     assert not marker.exists()
     assert PACKAGE not in sys.modules
@@ -423,7 +440,11 @@ def test_loader_rejects_changed_module_origin_after_import(
     )
 
     with pytest.raises(FrameworkLoadError):
-        load_verified_entry_point(_ref(rebuilt), rebuilt.verify())
+        load_verified_entry_point(
+            _ref(rebuilt),
+            rebuilt.verify(),
+            invocation_abi=MethodInvocationABI.METHOD_CONTEXT_V1,
+        )
 
 
 def test_loader_wraps_module_removed_after_distribution_verification(
@@ -433,7 +454,11 @@ def test_loader_wraps_module_removed_after_distribution_verification(
     (installed_wheel.root / PACKAGE / "implementation.py").unlink()
 
     with pytest.raises(FrameworkLoadError):
-        load_verified_entry_point(_ref(installed_wheel), verified)
+        load_verified_entry_point(
+            _ref(installed_wheel),
+            verified,
+            invocation_abi=MethodInvocationABI.METHOD_CONTEXT_V1,
+        )
 
 
 def test_loader_rechecks_owned_dependencies_after_distribution_verification(
@@ -448,7 +473,11 @@ def test_loader_rechecks_owned_dependencies_after_distribution_verification(
     )
 
     with pytest.raises(FrameworkLoadError):
-        load_verified_entry_point(_ref(installed_wheel), verified)
+        load_verified_entry_point(
+            _ref(installed_wheel),
+            verified,
+            invocation_abi=MethodInvocationABI.METHOD_CONTEXT_V1,
+        )
 
     assert not marker.exists()
 
@@ -459,18 +488,68 @@ def test_loader_rejects_qualname_alias(installed_wheel: InstalledWheel) -> None:
     )
 
     with pytest.raises(FrameworkLoadError):
-        load_verified_entry_point(_ref(rebuilt), rebuilt.verify())
+        load_verified_entry_point(
+            _ref(rebuilt),
+            rebuilt.verify(),
+            invocation_abi=MethodInvocationABI.METHOD_CONTEXT_V1,
+        )
 
 
-def test_loader_rejects_callable_with_unsupported_signature(
+@pytest.mark.parametrize(
+    ("source", "invocation_abi"),
+    [
+        ("def plugin():\n    return None\n", MethodInvocationABI.METHOD_CONTEXT_V1),
+        ("def plugin(job):\n    return job\n", MethodInvocationABI.LEGACY_WORKER_JOB_V1),
+        (
+            "def plugin(context, extra):\n    return context\n",
+            MethodInvocationABI.METHOD_CONTEXT_V1,
+        ),
+        ("def plugin(*context):\n    return context\n", MethodInvocationABI.METHOD_CONTEXT_V1),
+        ("def plugin(**context):\n    return context\n", MethodInvocationABI.METHOD_CONTEXT_V1),
+        ("def plugin(*, context):\n    return context\n", MethodInvocationABI.METHOD_CONTEXT_V1),
+        ("def plugin(context, /):\n    return context\n", MethodInvocationABI.METHOD_CONTEXT_V1),
+    ],
+)
+def test_loader_rejects_method_with_signature_outside_declared_abi(
     installed_wheel: InstalledWheel,
+    source: str,
+    invocation_abi: MethodInvocationABI,
 ) -> None:
-    rebuilt = installed_wheel.rebuild(
-        "def plugin():\n    return None\n"
-    )
+    rebuilt = installed_wheel.rebuild(source)
 
     with pytest.raises(FrameworkLoadError):
-        load_verified_entry_point(_ref(rebuilt), rebuilt.verify())
+        load_verified_entry_point(
+            _ref(rebuilt),
+            rebuilt.verify(),
+            invocation_abi=invocation_abi,
+        )
+
+
+def test_loader_accepts_verified_legacy_method(installed_wheel: InstalledWheel) -> None:
+    rebuilt = installed_wheel.rebuild(
+        "def plugin(job, artifact_root):\n    return job, artifact_root\n"
+    )
+
+    plugin = load_verified_entry_point(
+        _ref(rebuilt),
+        rebuilt.verify(),
+        invocation_abi=MethodInvocationABI.LEGACY_WORKER_JOB_V1,
+    )
+
+    assert plugin("job", "root") == ("job", "root")
+
+
+@pytest.mark.parametrize("invocation_abi", [None, "unknown_v1"])
+def test_loader_rejects_missing_or_unknown_method_abi(
+    installed_wheel: InstalledWheel,
+    invocation_abi: str | None,
+) -> None:
+    with pytest.raises(FrameworkLoadError, match="ABI"):
+        load_verified_entry_point(
+            _ref(installed_wheel),
+            installed_wheel.verify(),
+            invocation_abi=invocation_abi,
+        )
 
 
 def test_loader_accepts_verified_two_argument_target_handler(
@@ -486,19 +565,26 @@ def test_loader_accepts_verified_two_argument_target_handler(
         rebuilt.verify(),
         expected_kind=DescriptorKind.TARGET_HANDLER,
         expected_id="fixture_handler",
-        expected_parameters=("handler_input", "services"),
     )
 
     assert handler("input", "services") == ("input", "services")
 
 
+@pytest.mark.parametrize(
+    "source",
+    [
+        "def handler(handler_input):\n    return handler_input\n",
+        "def handler(value, services):\n    return value, services\n",
+        "def handler(handler_input, *, services):\n    return handler_input, services\n",
+        "def handler(handler_input, services, /):\n    return handler_input, services\n",
+        "def handler(*args):\n    return args\n",
+    ],
+)
 def test_loader_rejects_target_handler_with_wrong_signature(
     installed_wheel: InstalledWheel,
+    source: str,
 ) -> None:
-    rebuilt = installed_wheel.rebuild(
-        "def handler(handler_input):\n"
-        "    return handler_input\n"
-    )
+    rebuilt = installed_wheel.rebuild(source)
 
     with pytest.raises(FrameworkLoadError):
         load_verified_entry_point(
@@ -506,5 +592,4 @@ def test_loader_rejects_target_handler_with_wrong_signature(
             rebuilt.verify(),
             expected_kind=DescriptorKind.TARGET_HANDLER,
             expected_id="fixture_handler",
-            expected_parameters=("handler_input", "services"),
         )

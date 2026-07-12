@@ -35,7 +35,9 @@ from openevo.evolution.models import (
     WorkerFailRequest,
     WorkerHeartbeatRequest,
 )
+from openevo.evolution.planned_jobs import PlanBoundJobCreateRequest
 from openevo.evolution.store import EvolutionStore
+from openevo.evolution.framework.registry import RegistrySnapshot
 
 
 def _review_write_error(exc: ValueError) -> HTTPException:
@@ -53,15 +55,25 @@ def _feedback_application_create_error(exc: ValueError) -> HTTPException:
     return HTTPException(status_code=status_code, detail=str(exc))
 
 
-def create_app(*, db_path: str | Path, artifact_root: str | Path) -> FastAPI:
+def create_app(
+    *,
+    db_path: str | Path,
+    artifact_root: str | Path,
+    registry_snapshot: RegistrySnapshot | None = None,
+) -> FastAPI:
     root = Path(artifact_root)
     root.mkdir(parents=True, exist_ok=True)
-    store = EvolutionStore(db_path=db_path, artifact_root=root)
+    store = EvolutionStore(
+        db_path=db_path,
+        artifact_root=root,
+        registry_snapshot=registry_snapshot,
+    )
     store.initialize()
     app = FastAPI(title="OpenEvo Evolution Backend", version="0.1.0")
     app.state.db_path = Path(db_path)
     app.state.artifact_root = root
     app.state.store = store
+    app.state.registry_snapshot = registry_snapshot
 
     @app.get("/v1/health")
     async def health() -> dict[str, Any]:
@@ -242,6 +254,18 @@ def create_app(*, db_path: str | Path, artifact_root: str | Path) -> FastAPI:
     def create_job(request: JobCreateRequest) -> JobCreateResponse:
         try:
             return store.create_job(request)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/v1/planned-jobs", response_model=JobCreateResponse)
+    def create_plan_bound_job(request: PlanBoundJobCreateRequest) -> JobCreateResponse:
+        if registry_snapshot is None:
+            raise HTTPException(
+                status_code=503,
+                detail="plan-bound execution requires an active verified registry",
+            )
+        try:
+            return store.create_plan_bound_job(request, snapshot=registry_snapshot)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 

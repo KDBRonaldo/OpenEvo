@@ -28,6 +28,7 @@ from .contracts import (
     MAX_PAYLOAD_TREE_DEPTH,
     MAX_RENDERER_PAYLOAD_BYTES,
     Maturity,
+    MethodInvocationABI,
     PayloadKind,
     RendererKind,
     canonical_digest,
@@ -60,6 +61,7 @@ from .descriptors import (
 from .execution import (
     CORE_CONFIG_RESERVED_KEYS,
     CoreHarnessService,
+    EvolutionMethodHandle,
     EvolutionMethodPlugin,
     HarnessInferenceRequest,
     HarnessInferenceResponse,
@@ -111,6 +113,11 @@ from .plan import (
 from .profiles import ReleaseExecutionMode, execution_profile_for_release_mode
 from .registry import CanonicalModelView, EvolutionFrameworkRegistry, RegistrySnapshot
 from .resolution import resolve_agent_system_method
+from .runtime import (
+    FrameworkDistributionLock,
+    load_framework_distribution_lock,
+    load_verified_framework_registry,
+)
 from .schema import (
     MAX_ARRAY_ITEMS,
     MAX_ENUM_VALUES,
@@ -151,6 +158,7 @@ __all__ = [
     "EvolutionExecutionProfile",
     "EvolutionCapabilitiesV1",
     "EvolutionFrameworkRegistry",
+    "EvolutionMethodHandle",
     "EvolutionMethodPlugin",
     "EvolutionMethodDescriptor",
     "EvolutionMethodCapabilityV1",
@@ -164,6 +172,7 @@ __all__ = [
     "FileBundleEntry",
     "FileBundleRendererData",
     "FrameworkLoadError",
+    "FrameworkDistributionLock",
     "ImplementationIdentity",
     "ImplementationRef",
     "InlineTextPayloadContribution",
@@ -190,6 +199,7 @@ __all__ = [
     "MAX_SCHEMA_NODES",
     "MAX_STRING_LENGTH",
     "Maturity",
+    "MethodInvocationABI",
     "MethodSupport",
     "MethodSupportOverall",
     "MethodExecutionContext",
@@ -226,6 +236,8 @@ __all__ = [
     "build_evolution_capabilities",
     "invoke_legacy_method",
     "load_verified_entry_point",
+    "load_framework_distribution_lock",
+    "load_verified_framework_registry",
     "paths_conflict",
     "payload_tree_digest",
     "payload_entries_under_root",

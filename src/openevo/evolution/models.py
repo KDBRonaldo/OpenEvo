@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import StrEnum
+import re
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -18,6 +19,7 @@ class ArtifactType(StrEnum):
 
 
 class ArtifactState(StrEnum):
+    STAGED = "staged"
     ACTIVE = "active"
     EXPERIMENTAL = "experimental"
     DEPRECATED = "deprecated"
@@ -197,7 +199,70 @@ class JobCreateResponse(BaseModel):
 class WorkerClaimRequest(BaseModel):
     worker_id: str = Field(min_length=1)
     capabilities: list[str] = Field(default_factory=list)
+    method_capabilities: list[str] | None = None
+    method_identity_capabilities: dict[str, str] | None = None
     lease_seconds: int = Field(default=600, ge=1)
+
+    @field_validator("capabilities")
+    @classmethod
+    def _capabilities(cls, value: list[str]) -> list[str]:
+        if len(value) > 256:
+            raise ValueError("worker capabilities exceed the size limit")
+        if any(
+            not capability
+            or len(capability) > 512
+            or capability != capability.strip()
+            for capability in value
+        ):
+            raise ValueError("worker capability is invalid")
+        if len(value) != len(set(value)):
+            raise ValueError("worker capabilities must be unique")
+        return list(value)
+
+    @field_validator("method_capabilities")
+    @classmethod
+    def _method_capabilities(cls, value: list[str] | None) -> list[str] | None:
+        if value is None:
+            return None
+        if len(value) > 256:
+            raise ValueError("method capabilities exceed the size limit")
+        if any(
+            not method_id
+            or len(method_id) > 128
+            or method_id != method_id.strip()
+            for method_id in value
+        ):
+            raise ValueError("method capability ID is invalid")
+        if len(value) != len(set(value)):
+            raise ValueError("method capabilities must be unique")
+        return list(value)
+
+    @field_validator("method_identity_capabilities")
+    @classmethod
+    def _method_identity_capabilities(
+        cls,
+        value: dict[str, str] | None,
+    ) -> dict[str, str] | None:
+        if value is None:
+            return None
+        if len(value) > 256:
+            raise ValueError("method identity capabilities exceed the size limit")
+        for method_id, digest in value.items():
+            if not method_id or len(method_id) > 128 or method_id != method_id.strip():
+                raise ValueError("method identity capability ID is invalid")
+            if re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+                raise ValueError("method identity capability must be a lowercase SHA-256")
+        return dict(value)
+
+    @model_validator(mode="after")
+    def _matching_method_capabilities(self) -> WorkerClaimRequest:
+        if (
+            self.method_capabilities is not None
+            and self.method_identity_capabilities is not None
+            and set(self.method_capabilities) != set(self.method_identity_capabilities)
+        ):
+            raise ValueError("method capabilities and identities must name the same methods")
+        return self
 
 
 class WorkerClaimInputArtifact(BaseModel):
@@ -216,6 +281,12 @@ class WorkerClaimedJob(BaseModel):
     config: dict[str, Any] = Field(default_factory=dict)
     priority: int | None = None
     state: JobState | None = None
+    plan: dict[str, Any] | None = None
+    target_id: str | None = None
+    registry_snapshot_digest: str | None = None
+    method_identity_digest: str | None = None
+    execution_envelope: dict[str, Any] | None = None
+    execution_envelope_digest: str | None = None
 
 
 class WorkerClaimResponse(BaseModel):

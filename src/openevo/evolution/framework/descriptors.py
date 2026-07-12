@@ -15,6 +15,7 @@ from .contracts import (
     Exposure,
     ImplementationRef,
     Maturity,
+    MethodInvocationABI,
     RendererKind,
     _Contract,
     _contract_version,
@@ -109,6 +110,7 @@ class EvolutionMethodDescriptor(_Descriptor):
     display_name: str
     description: str
     target_id: str
+    invocation_abi: MethodInvocationABI
     execution_modes: tuple[ExecutionMode, ...] = Field(min_length=1)
     capture_modes: tuple[CaptureMode, ...] = Field(min_length=1)
     supported_harness_ids: tuple[str, ...] = Field(min_length=1)

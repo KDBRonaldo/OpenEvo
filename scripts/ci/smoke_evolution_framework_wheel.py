@@ -6,6 +6,8 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import shutil
+import tempfile
 from importlib import metadata
 from pathlib import Path
 
@@ -57,18 +59,34 @@ def smoke(wheel_path: Path) -> dict[str, object]:
         raise RuntimeError("wheel smoke imported OpenEvo from the source checkout")
 
     version = metadata.version("openevo")
+    wheel_sha256 = _sha256(wheel)
     verified = verify_distribution_install(
         DistributionArtifactExpectation(
             distribution="openevo",
             distribution_version=version,
-            distribution_digest=_sha256(wheel),
+            distribution_digest=wheel_sha256,
         ),
         wheel,
     )
 
-    from openevo.evolution.framework.builtins import load_verified_builtin_registry
+    from openevo.evolution.framework import (
+        FrameworkDistributionLock,
+        load_verified_framework_registry,
+    )
 
-    loaded = load_verified_builtin_registry(verified)
+    with tempfile.TemporaryDirectory(prefix="openevo-framework-lock-smoke-") as temp_dir:
+        locked_wheel = Path(temp_dir) / wheel.name
+        shutil.copy2(wheel, locked_wheel)
+        lock_path = Path(temp_dir) / "framework-lock.json"
+        lock_path.write_text(
+            FrameworkDistributionLock(
+                distribution_version=version,
+                distribution_digest=wheel_sha256,
+                wheel_filename=wheel.name,
+            ).model_dump_json(),
+            encoding="utf-8",
+        )
+        loaded = load_verified_framework_registry(lock_path)
     if set(loaded.method_handles) != EXPECTED_METHOD_IDS:
         raise RuntimeError("installed built-in method handles are incomplete")
     if set(loaded.snapshot.targets) != EXPECTED_TARGET_IDS:

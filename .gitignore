@@ -94,6 +94,7 @@ ipython_config.py
 # PyPI config
 .pypirc
 .openevo-remote-wheel/
+.openevo-remote-wheel-smoke/
 .openevo-wheel-smoke/
 
 # Project local
@@ -138,7 +139,7 @@ desktop/node_modules/
 desktop/dist/
 desktop/packaging/sidecar-build/
 desktop/packaging/sidecar-dist/
+desktop/packaging/core-wheel-dist/
 desktop/src-tauri/binaries/openevo-desktop-sidecar-*
-!desktop/src-tauri/binaries/openevo-desktop-sidecar-x86_64-unknown-linux-gnu
 desktop/src-tauri/gen/
 desktop/src-tauri/target/

@@ -23,6 +23,7 @@ from .contracts import (
     ImplementationIdentity,
     ImplementationRef,
     Maturity,
+    MethodInvocationABI,
     RendererKind,
     _Contract,
     _digest,
@@ -34,7 +35,7 @@ from .descriptors import (
     EvolutionTargetDescriptor,
     TargetHandlerDescriptor,
 )
-from .execution import LegacyEvolutionMethod, MethodInputBinding
+from .execution import EvolutionMethodHandle, LegacyEvolutionMethod, MethodInputBinding
 from .loading import (
     DescriptorImplementationAnchor,
     VerifiedDistribution,
@@ -90,12 +91,29 @@ class ImplementationDistributionIdentity(_Contract):
 
 
 @dataclass(frozen=True, slots=True)
-class LoadedBuiltinRegistry:
+class VerifiedExecutableRegistry:
     """Frozen catalog plus the exact handles proven against its distribution."""
 
     snapshot: RegistrySnapshot
-    method_handles: Mapping[str, LegacyEvolutionMethod]
+    method_handles: Mapping[str, EvolutionMethodHandle]
     descriptor_anchors: Mapping[str, DescriptorImplementationAnchor]
+
+    def __post_init__(self) -> None:
+        expected_methods = set(self.snapshot.methods)
+        if set(self.method_handles) != expected_methods:
+            raise ValueError("executable method handles do not match the frozen registry")
+        if any(not callable(handle) for handle in self.method_handles.values()):
+            raise TypeError("executable method handles must be callable")
+        object.__setattr__(
+            self,
+            "method_handles",
+            MappingProxyType(dict(self.method_handles)),
+        )
+        object.__setattr__(
+            self,
+            "descriptor_anchors",
+            MappingProxyType(dict(self.descriptor_anchors)),
+        )
 
 
 text_memory_target_anchor = DescriptorImplementationAnchor(
@@ -223,6 +241,16 @@ def _current_dataset() -> MethodInputBinding:
         source="current_dataset",
         artifact_type="dataset",
         min_count=1,
+        max_count=1,
+    )
+
+
+def _optional_current_dataset() -> MethodInputBinding:
+    return MethodInputBinding(
+        binding_id="current_dataset",
+        source="current_dataset",
+        artifact_type="dataset",
+        min_count=0,
         max_count=1,
     )
 
@@ -446,6 +474,7 @@ def _method(
         display_name=display_name,
         description=description,
         target_id=target_id,
+        invocation_abi=MethodInvocationABI.LEGACY_WORKER_JOB_V1,
         execution_modes=execution_modes,
         capture_modes=_TEXT_AND_TOKEN_CAPTURE,
         supported_harness_ids=_CODEX,
@@ -509,7 +538,10 @@ def _method_descriptors(
             description="Register configured Markdown as a skill bundle.",
             target_id="skill_bundle",
             execution_modes=_SELF_DEPLOYED,
-            input_bindings=(),
+            input_bindings=(
+                _optional_current_dataset(),
+                _prior_target("skill_bundle"),
+            ),
             output_artifact_types=("skill_bundle",),
             config_schema=_closed_object(
                 {
@@ -544,7 +576,10 @@ def _method_descriptors(
             description="Register configured Markdown as harness instructions.",
             target_id="agent_system",
             execution_modes=_SELF_DEPLOYED,
-            input_bindings=(),
+            input_bindings=(
+                _optional_current_dataset(),
+                _prior_target("agent_system"),
+            ),
             output_artifact_types=("agent_system",),
             config_schema=_closed_object(agent_fields),
             default_config={"target_path": "AGENTS.md"},
@@ -634,7 +669,10 @@ def _method_descriptors(
             description="Register one prebuilt model adapter artifact.",
             target_id="parametric_memory",
             execution_modes=_SELF_DEPLOYED,
-            input_bindings=(),
+            input_bindings=(
+                _optional_current_dataset(),
+                _prior_target("parametric_memory"),
+            ),
             output_artifact_types=("parametric_memory",),
             config_schema=_closed_object(
                 {
@@ -734,7 +772,7 @@ def load_verified_builtin_registry(
     verified: VerifiedDistribution,
     *,
     entry_point_loader: Callable[..., object] = load_verified_entry_point,
-) -> LoadedBuiltinRegistry:
+) -> VerifiedExecutableRegistry:
     """Build the catalog and verify every built-in entry point before use."""
 
     expectation = verified.expectation
@@ -771,10 +809,12 @@ def load_verified_builtin_registry(
             verified,
             expected_kind=DescriptorKind.METHOD,
             expected_id=implementation_identity.descriptor_id,
-            expected_parameters=("job", "artifact_root"),
+            invocation_abi=snapshot.methods[
+                implementation_identity.descriptor_id
+            ].invocation_abi,
         ),
     )
-    return LoadedBuiltinRegistry(
+    return VerifiedExecutableRegistry(
         snapshot=snapshot,
         method_handles=method_handles,
         descriptor_anchors=MappingProxyType(anchors),
@@ -784,7 +824,7 @@ def load_verified_builtin_registry(
 __all__ = [
     "BUILTIN_METHOD_IDS",
     "ImplementationDistributionIdentity",
-    "LoadedBuiltinRegistry",
+    "VerifiedExecutableRegistry",
     "agent_system_handler_anchor",
     "agent_system_target_anchor",
     "build_builtin_registry",

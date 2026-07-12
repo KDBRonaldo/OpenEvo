@@ -5,6 +5,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from _thread import LockType
+import hashlib
 from pathlib import Path
 import posixpath
 import re
@@ -24,6 +25,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic import ValidationError
 
+import openevo
 from openevo import __version__ as OPENEVO_VERSION
 from openevo.capabilities import (
     CoreCapabilities,
@@ -38,7 +40,10 @@ from openevo.deployment.lifecycle import (
 )
 from openevo.deployment.preflight import PreflightCheck, PreflightReport, run_preflight
 from openevo.deployment.redaction import sanitize_remote_text
-from openevo.evolution.framework import ProjectEvolutionTargetSelection
+from openevo.evolution.framework import (
+    FrameworkDistributionLock,
+    ProjectEvolutionTargetSelection,
+)
 from openevo.projects.science import ScienceProjectConfig
 from openevo.projects.science.models import EvolutionTargetsConfig
 from desktop.sidecar.config import (
@@ -208,6 +213,15 @@ class OpenEvoDesktopShellStatus(_StrictFrozenModel):
         if isinstance(value, list):
             return tuple(value)
         return value
+
+
+class PackagedCoreArtifactIdentity(_StrictFrozenModel):
+    available: bool
+    distribution: Literal["openevo"] = "openevo"
+    distribution_version: str
+    wheel_filename: str | None = None
+    distribution_digest: str | None = None
+    framework_lock: FrameworkDistributionLock | None = None
 
 
 class OpenEvoDesktopBootstrapResponse(_StrictFrozenModel):
@@ -609,6 +623,13 @@ def create_sidecar_app(
     )
     def desktop_capabilities() -> CoreCapabilities:
         return build_core_capabilities()
+
+    @app.get(
+        "/openevo-api/desktop/core-artifact",
+        response_model=PackagedCoreArtifactIdentity,
+    )
+    def desktop_core_artifact() -> PackagedCoreArtifactIdentity:
+        return packaged_core_artifact_identity()
 
     @app.get(
         "/openevo-api/desktop/methods",
@@ -1511,6 +1532,14 @@ def prepare_and_execute_remote_bootstrap(
             with tempfile.TemporaryDirectory(prefix="openevo-wheel-upload-") as staging:
                 staging_path = Path(staging)
                 shutil.copy2(wheel, staging_path / wheel.name)
+                framework_lock = _framework_distribution_lock(
+                    wheel,
+                    expected_version=expected_version,
+                )
+                (staging_path / "framework-lock.json").write_text(
+                    framework_lock.model_dump_json(indent=2) + "\n",
+                    encoding="utf-8",
+                )
                 transport.upload_dir(str(staging_path), remote_wheel_dir)
         except Exception as exc:
             message = sanitize_remote_text(str(exc), bootstrap_plan.proxy_env)
@@ -1613,12 +1642,49 @@ def discover_local_openevo_wheel() -> Path | None:
     return None
 
 
-def _openevo_wheel_search_dirs() -> tuple[Path, ...]:
-    package_root = Path(__file__).resolve().parents[1]
-    return (
-        package_root / "wheels",
-        package_root / "desktop" / "wheels",
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _framework_distribution_lock(
+    wheel: Path,
+    *,
+    expected_version: str,
+) -> FrameworkDistributionLock:
+    return FrameworkDistributionLock(
+        distribution_version=expected_version,
+        distribution_digest=_sha256_file(wheel),
+        wheel_filename=wheel.name,
     )
+
+
+def packaged_core_artifact_identity() -> PackagedCoreArtifactIdentity:
+    wheel = discover_local_openevo_wheel()
+    if wheel is None:
+        return PackagedCoreArtifactIdentity(
+            available=False,
+            distribution_version=OPENEVO_VERSION,
+        )
+    framework_lock = _framework_distribution_lock(
+        wheel,
+        expected_version=OPENEVO_VERSION,
+    )
+    return PackagedCoreArtifactIdentity(
+        available=True,
+        distribution_version=OPENEVO_VERSION,
+        wheel_filename=wheel.name,
+        distribution_digest=framework_lock.distribution_digest,
+        framework_lock=framework_lock,
+    )
+
+
+def _openevo_wheel_search_dirs() -> tuple[Path, ...]:
+    package_root = Path(openevo.__file__).resolve().parent
+    return (package_root / "wheels",)
 
 
 def _is_valid_openevo_wheel(path: Path, *, expected_version: str) -> bool:
@@ -1848,11 +1914,13 @@ def _initial_run_status(
     run_id = "run_" + datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S%f")
     output_dir = posixpath.join(state_root, "runs", run_id)
     artifact_root = posixpath.join(state_root, "evolution", "artifacts")
+    framework_lock = posixpath.join(state_root, "wheels", "framework-lock.json")
     command = (
         f'PATH="$HOME/.local/bin:$PATH" openevo-backend run '
         f"{shlex.quote(experiment_snapshot)} "
         f"--output-dir {shlex.quote(output_dir)} "
-        f"--artifact-root {shlex.quote(artifact_root)} --json"
+        f"--artifact-root {shlex.quote(artifact_root)} "
+        f"--framework-lock {shlex.quote(framework_lock)} --json"
     )
     return OpenEvoDesktopRunStatus(
         id=run_id,
@@ -1894,10 +1962,12 @@ def _run_openevo_task(
     started: OpenEvoDesktopRunStatus,
     state_root: str,
 ) -> OpenEvoDesktopRunStatus:
+    run_env = session.profile.proxy.to_env()
     try:
         result = session.transport_factory(session.profile).run(
             started.command,
             cwd=state_root,
+            env=run_env,
             timeout_seconds=86400.0,
         )
     except Exception as exc:
@@ -1906,7 +1976,7 @@ def _run_openevo_task(
                 "state": "failed",
                 "ready": False,
                 "return_code": None,
-                "stderr": str(exc),
+                "stderr": sanitize_remote_text(str(exc), run_env),
                 "finished_at": datetime.now(timezone.utc).isoformat(),
             }
         )
@@ -1916,8 +1986,8 @@ def _run_openevo_task(
             "state": "succeeded" if ready else "failed",
             "ready": ready,
             "return_code": result.return_code,
-            "stdout": result.stdout,
-            "stderr": result.stderr,
+            "stdout": sanitize_remote_text(result.stdout, run_env),
+            "stderr": sanitize_remote_text(result.stderr, run_env),
             "finished_at": datetime.now(timezone.utc).isoformat(),
         }
     )

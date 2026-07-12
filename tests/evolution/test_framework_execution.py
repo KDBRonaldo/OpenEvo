@@ -135,8 +135,11 @@ def test_execution_envelope_separates_config_and_legacy_adapter_is_exact(
     artifacts = [_artifact("current", "dataset"), _artifact("history", "dataset")]
     envelope = build_execution_envelope(
         plan_id="plan-1",
+        plan_digest="a" * 64,
+        registry_snapshot_digest="b" * 64,
         target_id="agent_system",
         method_id="agent_system_reflector",
+        method_identity_digest="c" * 64,
         user_config={"reflector_llm": {"model": "gpt-5"}},
         core_config={"round_index": 2, "task_id": "task-1"},
         input_bindings=(
@@ -151,6 +154,7 @@ def test_execution_envelope_separates_config_and_legacy_adapter_is_exact(
                 artifact_digests=(worker_input_artifact_digest(artifacts[1]),),
             ),
         ),
+        output_artifact_types=("agent_system",),
     )
     original = WorkerClaimedJob(
         job_id="job-1",
@@ -200,31 +204,43 @@ def test_execution_envelope_rejects_core_user_shadowing() -> None:
     with pytest.raises(ValueError, match="shadow Core-owned"):
         build_execution_envelope(
             plan_id="plan-1",
+            plan_digest="a" * 64,
+            registry_snapshot_digest="b" * 64,
             target_id="memory",
             method_id="reflect",
+            method_identity_digest="c" * 64,
             user_config={"round_index": 9},
             core_config={"round_index": 1},
             input_bindings=(),
+            output_artifact_types=("memory",),
         )
 
     with pytest.raises(ValueError, match="reserved for Core"):
         build_execution_envelope(
             plan_id="plan-1",
+            plan_digest="a" * 64,
+            registry_snapshot_digest="b" * 64,
             target_id="memory",
             method_id="reflect",
+            method_identity_digest="c" * 64,
             user_config={"task_id": "forged"},
             core_config={},
             input_bindings=(),
+            output_artifact_types=("memory",),
         )
 
     with pytest.raises(ValueError, match="only contain Core-owned"):
         build_execution_envelope(
             plan_id="plan-1",
+            plan_digest="a" * 64,
+            registry_snapshot_digest="b" * 64,
             target_id="memory",
             method_id="reflect",
+            method_identity_digest="c" * 64,
             user_config={},
             core_config={"algorithm_setting": True},
             input_bindings=(),
+            output_artifact_types=("memory",),
         )
 
 
@@ -238,11 +254,15 @@ def test_evaluator_and_audit_controls_are_core_owned(tmp_path: Path) -> None:
 
     envelope = build_execution_envelope(
         plan_id="plan-controls",
+        plan_digest="a" * 64,
+        registry_snapshot_digest="b" * 64,
         target_id="agent_system",
         method_id="agent_system_gepa_reflector",
+        method_identity_digest="c" * 64,
         user_config={},
         core_config=controls,
         input_bindings=(),
+        output_artifact_types=("agent_system", "report"),
     )
 
     assert json.loads(envelope.core_config_json) == controls
@@ -289,11 +309,15 @@ def test_execution_envelope_binds_full_duplicate_artifact_snapshots(
     )
     envelope = build_execution_envelope(
         plan_id="plan-duplicate",
+        plan_digest="a" * 64,
+        registry_snapshot_digest="b" * 64,
         target_id="memory",
         method_id="reflect",
+        method_identity_digest="c" * 64,
         user_config={},
         core_config={},
         input_bindings=resolution.bindings,
+        output_artifact_types=("memory",),
     )
     context = MethodExecutionContext(
         job=WorkerClaimedJob(

@@ -126,6 +126,9 @@ def test_builtin_catalog_is_complete_frozen_and_has_expected_defaults(
     assert frozenset(snapshot.targets) == frozenset(TARGET_IDS)
     assert frozenset(snapshot.target_handlers) == frozenset(HANDLER_IDS)
     assert frozenset(snapshot.methods) == frozenset(METHOD_IDS)
+    assert {
+        descriptor.invocation_abi.value for descriptor in snapshot.methods.values()
+    } == {"legacy_worker_job_v1"}
 
     assert snapshot.targets["text_memory"].default_method_id == (
         "text_memory_expel_reflector"
@@ -191,7 +194,12 @@ def test_builtin_output_and_protected_method_contracts(
     assert "report" in snapshot.methods[
         "agent_system_gepa_reflector"
     ].output_artifact_types
-    assert snapshot.methods["parametric_memory_register"].input_bindings == ()
+    register_bindings = snapshot.methods["parametric_memory_register"].input_bindings
+    assert [binding.binding_id for binding in register_bindings] == [
+        "current_dataset",
+        "prior_target_artifacts",
+    ]
+    assert register_bindings[0].min_count == 0
     assert "constrained_trainer_contract" in snapshot.methods[
         "parametric_memory_lora_sft"
     ].runtime_requirements
@@ -312,13 +320,17 @@ def test_gepa_descriptor_and_legacy_adapter_keep_caller_dataset_order(
     )
     envelope = build_execution_envelope(
         plan_id="plan-gepa-order",
+        plan_digest="a" * 64,
+        registry_snapshot_digest="b" * 64,
         target_id="agent_system",
         method_id="agent_system_gepa_reflector",
+        method_identity_digest="c" * 64,
         user_config={
             "reflector_llm": {"model": "gpt-5.5", "provider": "codex_cli"}
         },
         core_config={},
         input_bindings=resolution.bindings,
+        output_artifact_types=descriptor.output_artifact_types,
     )
     observed: list[str] = []
 
@@ -441,7 +453,7 @@ def test_verified_builtin_registry_loads_every_anchor_and_exact_method_handle(
         descriptor_id = expected["expected_id"]
         loaded_keys.append((kind, descriptor_id))
         if kind is DescriptorKind.METHOD:
-            assert expected["expected_parameters"] == ("job", "artifact_root")
+            assert expected["invocation_abi"] == "legacy_worker_job_v1"
             return methods.METHOD_REGISTRY[descriptor_id]
         _, attribute_name = _entry_point_parts(implementation.entry_point)
         return getattr(builtins, attribute_name)

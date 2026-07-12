@@ -66,8 +66,10 @@ automation 可以使用自己的 transcript parser，但写入 Core 的 trajecto
 
 外部 transcript 输入不能包含 oracle answer、reference patch、secret、provider token 或
 其他受保护材料。调用方应把可学习上下文和受保护 metadata 分离，并在 artifact lineage 或
-job config 中记录来源、policy/version、redaction evidence 和兼容性信息。后续仍按普通
-`POST /v1/events`、`POST /v1/datasets` 和 `POST /v1/jobs` 路径进入 Evolution Backend。
+Core-owned job config 中记录来源、policy/version、redaction evidence 和兼容性信息。Core
+experiment 后续通过 `POST /v1/events`、`POST /v1/datasets` 和
+`POST /v1/planned-jobs` 进入 Evolution Backend。尚未迁移的 benchmark automation 可以暂用
+`POST /v1/jobs`，但这不是 plan-bound 产品路径。
 
 ## 核心 API
 
@@ -75,8 +77,9 @@ job config 中记录来源、policy/version、redaction evidence 和兼容性信
 |---|---|
 | `POST /v1/events` | 接收 Core session/task event |
 | `POST /v1/datasets` | 从 events 物化 dataset，并注册 `dataset` artifact |
-| `POST /v1/jobs` | 创建 evolution job |
-| `POST /v1/jobs/claim` | Worker 按 capability claim job |
+| `POST /v1/planned-jobs` | 根据 frozen registry 校验并持久化 plan-bound evolution job |
+| `POST /v1/jobs` | 创建 legacy unplanned job；仅限 benchmark 迁移期 |
+| `POST /v1/jobs/claim` | Worker 按 queue capability claim；plan-bound job 还要求 verified method IDs 和 identity digests |
 | `POST /v1/jobs/{job_id}/heartbeat` | Worker 租约续约和进度上报 |
 | `POST /v1/jobs/{job_id}/complete` | Worker 提交 artifacts |
 | `POST /v1/jobs/{job_id}/fail` | Worker 标记失败 |
@@ -92,23 +95,25 @@ job config 中记录来源、policy/version、redaction evidence 和兼容性信
 | `POST /v1/query-decisions` | 记录本轮为什么询问或不询问 human |
 | `POST /v1/feedback-applications` | 记录 human feedback 被后续方法或 promotion decision 消费 |
 
-`job_type` 是 claim selector，`method` 是 worker 内部执行的算法名。reference worker 默认让
-二者同名，例如 `job_type=agent_system, method=agent_system`。专用 research worker 可以用
-自己的 capability 策略，只要 claim 到 job 后返回合法 artifact 即可。
+`job_type` 是 queue claim selector，`method` 是 plan 选择的算法名。Plan-bound request 不由
+调用方重复提交 `method`：Core 从 plan selection 取得它，并绑定 method identity、execution
+envelope 和 ordered artifact snapshots。Worker 同时声明可处理的 queue，以及从 verified
+registry 得到的 method ID -> identity digest mapping；三者都匹配才会获得 plan-bound job。
+没有 identity mapping 的 worker 只能获得 legacy job。
 
 ## Method Registry
 
 OpenEvo Core exposes method registry metadata as a contract, not as Desktop-local
-configuration. UI and automation must discover release-supported methods through
-Core capability metadata derived from the same frozen framework registry used by
-workers after the A2.3 dispatch cutover.
+configuration. Plan compiler, plan-bound store, and workers already consume the
+same frozen/verified registry. UI and automation must discover release-supported
+methods through the remaining A2.3 Core capability projection from that registry.
 
 ## OpenEvo Core capability metadata
 
-Desktop 和维护者 automation 不应硬编码 method table。A2.2 已在
-`openevo.evolution.framework.builtins` 建立 target-rooted frozen catalog；A2.3 才把
-现有 `openevo.capabilities` 和 worker dispatch 切到该 catalog。在此之前，旧 capability
-projection 仍是兼容路径，不是新增方法应扩展的权威表。
+Desktop 和维护者 automation 不应硬编码 method table。
+`openevo.evolution.framework.builtins` 是当前 target-rooted frozen catalog；plan-bound
+worker dispatch 已切换。现有 `openevo.capabilities` 仍是待迁移的兼容 projection，不是新增
+方法应扩展的权威表。
 
 当前兼容 API：
 
@@ -117,8 +122,8 @@ projection 仍是兼容路径，不是新增方法应扩展的权威表。
 - `method_metadata_by_id()` 返回 `dict[str, EvolutionMethodCapability]`，key 与
   `openevo.evolution.methods.METHOD_REGISTRY` 的 method ID 一致。
 - `openevo.evolution.methods.METHOD_METADATA` 是待删除的 legacy capability metadata；
-  A2.2 测试只要求其与当前 dispatch 不漂移。新增 target/method metadata 应写入 frozen
-  framework descriptor，A2.3/A2.5 完成后旧表不再存在。
+  anti-drift tests 只保证它与已有 built-ins 不漂移。新增 target/method metadata 应写入 frozen
+  framework descriptor；A2.3 capability projection 和 A2.5 cleanup 完成后旧表不再存在。
 
 当前 Core execution modes 是：
 
@@ -190,9 +195,9 @@ history/pareto 变体和 parametric-memory 方法可以继续作为 source-check
 workflow 可发现项，但不能作为 release-supported/default-enabled Desktop method，也不能由
 Desktop 维护本地 registry 替代 Core capabilities。
 
-开发者工具可以检查 broader method set，包括 `ordinary_user`、`dev_kit` 和内部调试方法。
-但这些工具仍然消费同一份 `METHOD_REGISTRY` / `METHOD_METADATA` / Core capabilities
-contract，不能维护第二套 method registry。
+维护者工具可以检查 broader method set，但必须消费 frozen framework registry 或 remote Core
+capabilities，不能维护第二套 method registry。`ordinary_user`、`dev_kit` 和
+`METHOD_METADATA` 只是待删除的 legacy vocabulary/metadata。
 
 ## Artifact Contract
 
@@ -238,6 +243,8 @@ Worker complete 和 direct artifact registration 都使用同一类 artifact pay
   dataset / producing job lineage 和 compatibility，避免把无关或陈旧 artifact 注入后续
   session；productization 不通过重新排列 unpromoted candidates 来解决 stale selection。
 - `promoted`：只有 promoted 且 active/experimental 的 artifacts 会进入 context resolve。
+  Worker complete 期间新 outputs 先处于不可读取、不可 promotion、不可 resolve 的 transient
+  `staged` state；只有 job success 的最终事务会把它们一起发布为 active。
 - `manifest.promotion_support`：启用 runner/backend promotion gate 时，算法应写入
   `trajectory_findings`、`proposed_changes`、`expected_benefits`、`risks` 和
   `validation_checks`。Gate 会先评估这些材料，并读取 bounded `file://` artifact 内容摘录
@@ -259,7 +266,9 @@ Worker complete 和 direct artifact registration 都使用同一类 artifact pay
   数值。Human decision 还可以携带 `human_feedback`，其中可包含 `observed_issues`、
   `suggested_changes`、`risks` 和 `validation_checks`；这些 insight 会进入 promotion review
   记录，但不会替代 `approved` 的 promotion 判定。Runner 只 promotion 通过的候选。如果
-  gated job 没有产出目标 artifact type，gate 会以 `missing_target_artifact` 拒绝。
+  gated job 没有产出目标 artifact type，gate 会以 `missing_target_artifact` 拒绝。Runner 不把
+  `report` 等非目标 outputs 送入 gate 或后续 target context；无 gate 时只沿用 method 自己
+  `promoted=true` 的 target output，没有这样的算法结果就 fail closed。
 
 ## HITL Review Lifecycle
 
@@ -692,10 +701,10 @@ Gateway 在 run 前调用：
 
 适合本仓库内的 baseline 或实验方法。
 
-1. 在 `src/openevo/evolution/methods.py` 添加函数：
+1. 新方法优先实现 context ABI；已有 legacy method 的函数签名保持不变：
 
 ```python
-def my_memory_method(job: WorkerClaimedJob, artifact_root: Path) -> list[ArtifactRegisterRequest]:
+def my_memory_method(context: MethodExecutionContext) -> list[ArtifactRegisterRequest]:
     ...
 ```
 
@@ -707,20 +716,21 @@ def my_memory_method(job: WorkerClaimedJob, artifact_root: Path) -> list[Artifac
 entry_point="openevo.evolution.methods:my_memory_method"
 ```
 
-3. A2.2 迁移期若该 built-in 需要立即由 worker dispatch，临时同步 callable 到
-   `METHOD_REGISTRY`，并同步一条 key 相同的 `METHOD_METADATA` 以保持现有 capability contract。
-   descriptor 仍是未来权威 catalog；不要新增第三份 metadata 表。
-   `test_framework_builtins.py` 必须证明 descriptor entry point 与 legacy registry 对象
-   identity 相同。A2.3 dispatch/capability cutover 后删除此兼容步骤。
+3. 声明 `invocation_abi="method_context_v1"`；loader 只接受精确 `(context)` signature。不要把
+   新方法加入 `METHOD_REGISTRY` 作为 fallback。已有 legacy built-ins 继续声明
+   `legacy_worker_job_v1`，并由 anti-drift tests 证明 entry point 与原 callable identity 相同。
 
-4. 创建 job 时设置：
+4. 由 registry/profile 编译 plan，再创建 plan-bound job：
 
 ```json
 {
+  "plan": {"plan_id": "plan-...", "selections": ["..."]},
+  "target_id": "text_memory",
   "job_type": "my_memory_method",
-  "method": "my_memory_method",
-  "input_artifact_ids": ["art_dataset"],
-  "config": {"max_records": 20}
+  "input_bindings": [
+    {"binding_id": "current_dataset", "artifact_ids": ["art_dataset"]}
+  ],
+  "core_config": {}
 }
 ```
 
@@ -734,19 +744,16 @@ entry_point="openevo.evolution.methods:my_memory_method"
 或自动执行环境中碰巧安装的插件。插件 descriptor 遵守同一 frozen registry contract，专用
 worker 继续实现现有 worker protocol。
 
-这是 A2.3 dispatch cutover 后的目标流程。A2.2 仅提供 locked wheel/install、entry-point
-verification 和 registry contracts；当前 worker 不执行动态 plugin handle。A2.2 期间，独立
-research worker 仍可按已有 capability/job protocol claim 已知 method jobs，但不能把自己的
-in-process catalog 动态接入 Core。
-
-A2.3 后：
+Plan-bound dispatch 已支持 verified executable handles，但当前 release composition 只加载
+built-ins。外部 research plugin 仍需一个显式的多 distribution registry composition；不能把
+已安装插件自动合并进 release registry，也不能仅凭 direct tests 声称端到端可运行。目标流程：
 
 1. 验证 locked wheel/install，再从该 distribution 加载 verified catalog provider。
 2. 注册 provider 返回的 descriptors 并 freeze/validate descriptor graph。
 3. 验证 frozen graph 中每个 implementation entry point；全部成功后才 publish loaded registry。
-4. `POST /v1/jobs/claim`，带上自己的 capabilities。
-5. 读取 claimed job 的 ordered `input_artifacts` 和 separated config envelope。
-6. 运行算法，产出文件或 adapter。
+4. 通过 frozen snapshot 编译 plan，并用 `/v1/planned-jobs` 持久化 exact execution identity。
+5. `POST /v1/jobs/claim`，带 queue capabilities、verified method IDs 和 identity digests。
+6. 校验 claimed plan/envelope/inputs，按 descriptor ABI 运行算法。
 7. `POST /v1/jobs/{job_id}/complete`，提交一个或多个 `ArtifactRegisterRequest`。
 
 这种方式不需要修改 backend DB schema。新算法通过 typed artifact 与 Core 通信。

@@ -4,11 +4,13 @@
 > published yet. Workstream B2 implements and tests this format before Desktop
 > or release docs may rely on it.
 
-The A2.2 evolution framework loader already consumes the descriptor's
-distribution name, version, and wheel SHA-256 shape to verify an installed
-distribution and its entry points. That verifier does not implement this full
-descriptor, publish an artifact, or permit Desktop to rely on a missing B2
-resource.
+The A2.3 evolution runtime consumes a bounded `framework-lock.json` containing
+the distribution name/version, sibling wheel basename, and SHA-256. Desktop
+currently writes that lock from its packaged exact wheel and uploads both files;
+Core verifies the installed inventory and entry points before startup. This is
+an internal bridge, not this full B2 descriptor: it has no release URL, source
+commit, size, platform matrix, or publication evidence and therefore does not
+make the release artifact contract complete.
 
 The Core install artifact is the exact OpenEvo Core Backend package that
 OpenEvo Desktop installs on the remote server. Desktop is the ordinary-user
@@ -80,7 +82,7 @@ declared artifact, starts `openevo-backend serve`, and verifies:
 - state root initialization;
 - typed errors;
 - import origin;
-- artifact SHA256 and descriptor SHA256.
+- artifact SHA256, framework-lock SHA256, and descriptor SHA256.
 
 ## Bootstrap Use
 

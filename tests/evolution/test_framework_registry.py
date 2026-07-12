@@ -102,6 +102,7 @@ def _descriptors(
             display_name="Reflect",
             description="Reflect over trajectories.",
             target_id=target_id,
+            invocation_abi="method_context_v1",
             execution_modes=("self_deployed",),
             capture_modes=("transcript",),
             supported_harness_ids=("codex",),
@@ -532,6 +533,21 @@ def test_set_like_descriptor_fields_have_canonical_order() -> None:
     assert (
         _registry(left).freeze().registry_digest
         != _registry(reversed_bindings).freeze().registry_digest
+    )
+
+
+def test_method_invocation_abi_is_part_of_descriptor_identity() -> None:
+    context_snapshot = _registry().freeze()
+    legacy_snapshot = _registry(
+        _replace(
+            _descriptors(),
+            EvolutionMethodDescriptor,
+            invocation_abi="legacy_worker_job_v1",
+        )
+    ).freeze()
+
+    assert context_snapshot.identity_digest_for("method", "reflect") != (
+        legacy_snapshot.identity_digest_for("method", "reflect")
     )
 
 

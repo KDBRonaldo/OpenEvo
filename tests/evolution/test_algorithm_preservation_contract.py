@@ -1,6 +1,11 @@
 from __future__ import annotations
 
 from openevo.evolution.methods import METHOD_METADATA, METHOD_REGISTRY
+from openevo.evolution.framework import EvolutionExecutionProfile
+from openevo.evolution.framework.builtins import (
+    ImplementationDistributionIdentity,
+    build_builtin_registry,
+)
 from openevo.experiments import ExperimentConfig, compile_experiment
 
 
@@ -33,6 +38,19 @@ PROTECTED_METHOD_CONTRACTS = {
         "default_config": {"target_path": "AGENTS.md"},
     },
 }
+
+REGISTRY_SNAPSHOT = build_builtin_registry(
+    ImplementationDistributionIdentity(
+        distribution="openevo",
+        distribution_version="0.1.0",
+        distribution_digest="a" * 64,
+    )
+)
+EXECUTION_PROFILE = EvolutionExecutionProfile(
+    execution_mode="self_deployed",
+    capture_mode="transcript",
+    harness_id="codex",
+)
 
 
 def test_protected_methods_keep_algorithm_facing_registry_contract() -> None:
@@ -74,7 +92,12 @@ def test_protected_methods_keep_generic_project_job_projection() -> None:
             },
         }
     )
-    compiled = compile_experiment(config, run_id="preservation")
+    compiled = compile_experiment(
+        config,
+        run_id="preservation",
+        registry_snapshot=REGISTRY_SNAPSHOT,
+        execution_profile=EXECUTION_PROFILE,
+    )
 
     jobs = compiled.evolution_job_payloads_for_round(
         0,

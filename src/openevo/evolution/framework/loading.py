@@ -30,6 +30,7 @@ from pydantic import field_validator
 from .contracts import (
     DescriptorKind,
     ImplementationRef,
+    MethodInvocationABI,
     _Contract,
     _digest,
     _distribution_name,
@@ -499,8 +500,7 @@ def _verify_callable_entry_point(
     *,
     module_name: str,
     attribute_path: str,
-    expected_parameters: tuple[str, ...] | None,
-    allowed_parameter_counts: set[int],
+    expected_parameters: tuple[str, ...],
     label: str,
 ) -> None:
     if not callable(value):
@@ -513,20 +513,11 @@ def _verify_callable_entry_point(
         parameters = tuple(inspect.signature(value).parameters.values())
     except (TypeError, ValueError) as exc:
         raise FrameworkLoadError(f"{label} entry-point signature is unavailable") from exc
-    parameter_names = tuple(parameter.name for parameter in parameters)
     if (
-        any(
-            parameter.kind
-            not in {
-                inspect.Parameter.POSITIONAL_ONLY,
-                inspect.Parameter.POSITIONAL_OR_KEYWORD,
-            }
+        tuple(parameter.name for parameter in parameters) != expected_parameters
+        or any(
+            parameter.kind is not inspect.Parameter.POSITIONAL_OR_KEYWORD
             for parameter in parameters
-        )
-        or (expected_parameters is not None and parameter_names != expected_parameters)
-        or (
-            expected_parameters is None
-            and len(parameters) not in allowed_parameter_counts
         )
     ):
         raise FrameworkLoadError(f"{label} entry-point signature does not match")
@@ -538,7 +529,7 @@ def load_verified_entry_point(
     *,
     expected_kind: DescriptorKind | str = DescriptorKind.METHOD,
     expected_id: str | None = None,
-    expected_parameters: tuple[str, ...] | None = None,
+    invocation_abi: MethodInvocationABI | str | None = None,
 ) -> object:
     """Load one entry point only after proving module ownership and identity."""
 
@@ -548,6 +539,18 @@ def load_verified_entry_point(
         kind = DescriptorKind(expected_kind)
     except ValueError as exc:
         raise FrameworkLoadError("entry-point descriptor kind is invalid") from exc
+    method_parameters: tuple[str, ...] | None = None
+    if kind is DescriptorKind.METHOD:
+        try:
+            method_abi = MethodInvocationABI(invocation_abi)
+        except (TypeError, ValueError) as exc:
+            raise FrameworkLoadError("method invocation ABI is missing or invalid") from exc
+        method_parameters = {
+            MethodInvocationABI.LEGACY_WORKER_JOB_V1: ("job", "artifact_root"),
+            MethodInvocationABI.METHOD_CONTEXT_V1: ("context",),
+        }[method_abi]
+    elif invocation_abi is not None:
+        raise FrameworkLoadError("invocation ABI is only valid for method entry points")
     try:
         module_name, attribute_path = implementation.entry_point.split(":", 1)
     except (ValueError, TypeError) as exc:
@@ -607,12 +610,13 @@ def load_verified_entry_point(
         raise FrameworkLoadError("entry-point attribute does not exist") from exc
 
     if kind is DescriptorKind.METHOD:
+        if method_parameters is None:  # The ABI validation above is exhaustive.
+            raise FrameworkLoadError("method invocation ABI is missing or invalid")
         _verify_callable_entry_point(
             value,
             module_name=module_name,
             attribute_path=attribute_path,
-            expected_parameters=expected_parameters,
-            allowed_parameter_counts={1, 2},
+            expected_parameters=method_parameters,
             label="method",
         )
     elif kind is DescriptorKind.TARGET_HANDLER and not isinstance(
@@ -622,8 +626,7 @@ def load_verified_entry_point(
             value,
             module_name=module_name,
             attribute_path=attribute_path,
-            expected_parameters=expected_parameters,
-            allowed_parameter_counts={2},
+            expected_parameters=("handler_input", "services"),
             label="target handler",
         )
     elif not isinstance(value, DescriptorImplementationAnchor):

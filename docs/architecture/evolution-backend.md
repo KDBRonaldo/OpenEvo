@@ -23,6 +23,7 @@ flowchart TB
         Store[EvolutionStore]
         EventTable[(events)]
         DatasetTable[(datasets)]
+        PlanTable[(evolution_plans)]
         JobTable[(jobs)]
         ArtifactTable[(artifacts)]
         ContextTable[(contexts)]
@@ -40,6 +41,7 @@ flowchart TB
     API --> Store
     Store --> EventTable
     Store --> DatasetTable
+    Store --> PlanTable
     Store --> JobTable
     Store --> ArtifactTable
     Store --> ContextTable
@@ -59,6 +61,7 @@ erDiagram
     EVENTS ||--o{ DATASET_EVENTS : selected_into
     DATASETS ||--o{ DATASET_EVENTS : contains
     DATASETS ||--|| ARTIFACTS : materialized_as
+    EVOLUTION_PLANS ||--o{ JOBS : binds
     JOBS ||--o{ ARTIFACT_LINEAGE : consumes_or_produces
     ARTIFACTS ||--o{ ARTIFACT_LINEAGE : parent_or_child
     CONTEXTS }o--o{ ARTIFACTS : selects
@@ -80,10 +83,20 @@ erDiagram
     }
     JOBS {
         string job_id
+        string plan_id
+        string target_id
         string job_type
         string method
+        string method_identity_digest
         string state
         string lease_id
+        int lease_duration_seconds
+    }
+    EVOLUTION_PLANS {
+        string plan_id
+        string registry_snapshot_digest
+        string plan_digest
+        string plan_json
     }
     ARTIFACTS {
         string artifact_id
@@ -120,7 +133,8 @@ erDiagram
 flowchart LR
     Events["POST /v1/events"]
     Datasets["POST /v1/datasets"]
-    Jobs["POST /v1/jobs"]
+    PlannedJobs["POST /v1/planned-jobs"]
+    LegacyJobs["POST /v1/jobs (benchmark migration only)"]
     Claim["POST /v1/jobs/claim"]
     Heartbeat["POST /v1/jobs/{id}/heartbeat"]
     Complete["POST /v1/jobs/{id}/complete"]
@@ -134,8 +148,9 @@ flowchart LR
     Applications["POST /v1/feedback-applications"]
 
     Events --> Datasets
-    Datasets --> Jobs
-    Jobs --> Claim --> Heartbeat --> Complete
+    Datasets --> PlannedJobs
+    LegacyJobs --> Claim
+    PlannedJobs --> Claim --> Heartbeat --> Complete
     Claim --> Fail
     Complete --> ArtifactRead --> Promote --> Resolve
     Complete --> Query --> Reviews --> Feedback --> Applications
@@ -151,6 +166,9 @@ flowchart LR
 - `src/openevo/evolution/context.py`：compatibility helpers。
 - `src/openevo/evolution/client.py`：gateway 使用的 async client。
 - `src/openevo/evolution/worker.py`：同步 worker protocol client 和 runner。
+- `src/openevo/evolution/planned_jobs.py`：plan-bound job materialization 和
+  execution-envelope validation。
+- `src/openevo/evolution/framework/`：frozen registry、verified loading、plan 和 method ABI。
 - `src/openevo/evolution/methods.py`：内置 reference methods。
 
 ## 存储布局
@@ -179,6 +197,17 @@ flowchart LR
 
 数据库是状态和 leases 的权威来源。文件系统用于保存较大的 payload 和物化后的
 artifacts。
+
+`evolution_plans` 保存 canonical immutable plan。复用已有 `plan_id` 时会同时核验
+`schema_version`、`registry_snapshot_digest`、`plan_digest` 和 canonical `plan_json`，任一字段
+不一致都拒绝。新 experiment job 通过
+`POST /v1/planned-jobs` 创建；同一个 `plan_id` 只能对应完全相同的 plan。Job row 绑定
+`plan_id`、`target_id`、method identity、canonical execution envelope 和 declared output
+types，并单独保存 canonical envelope digest。`(plan_id, target_id)` 唯一；完全相同的重试返回
+原 job，identity/config/input 不同的重试拒绝。Input snapshots 与 job 在同一个
+`BEGIN IMMEDIATE` transaction 中读取和写入。旧
+数据库由 `initialize()` 以 additive columns 迁移，旧 jobs 保留 NULL identity，不会被伪装成
+plan-bound jobs。
 
 启动已有本地 state 时，`EvolutionStore.initialize()` 保留 event source 和
 event type 原值，不迁移 pre-release runtime identity。Dataset queries 只匹配
@@ -225,19 +254,48 @@ adapter name；如果旧 artifact 没有这个字段，则回退到 artifact nam
 
 ## 运行注意事项
 
-- `job_type` 是 worker capability selector。reference worker 默认使用内置
-  method 名作为 job type：`text_memory`、`skill_bundle`、`agent_system`、
-  `parametric_memory_register`。
+- `job_type` 是 automation/queue capability selector；plan-bound claim 还必须提交从 verified
+  registry 得到的 method IDs 和对应 identity digests。Queue、method 和 identity 同时匹配才
+  会租出 job；没有 identity mapping 的 worker 只能 claim legacy jobs。
+- Plan-bound worker 必须加载与 server 相同 external framework lock，校验 plan、reachable
+  registry digest、target/method identity、execution envelope 和 ordered input snapshots 后才
+  调用 method。验证失败不会退回 `METHOD_REGISTRY`。
 - Unknown method 会以 retryable fail 结束，这样专用 research worker 仍有机会
-  重新 claim。
-- Job complete 会注册输出 artifacts，并记录 input artifact IDs 到 output
-  artifact IDs 的 lineage。
+  重新 claim 尚未迁移的 legacy job；plan-bound identity/contract 失败不可重试。
+- Worker 在 method 执行期间每隔 claim lease 的三分之一 heartbeat，并在 complete/fail 前
+  停止和 join heartbeat thread。Claim 将请求的秒数持久化到 job；heartbeat 从当前时间按同一
+  duration 续租，不会把短 lease 放大成默认 600 秒。旧 active row 的 NULL duration 只从其
+  `updated_at` 到 `lease_expires_at` 的有效正区间推导并持久化。Heartbeat 失败会阻止 complete，
+  所有 lease 释放路径会同时清空 duration。
+- Store 在更新 lease 前完成 plan JSON/digest、selection/envelope config、ordered input snapshot
+  和 declared output contract 与当前 frozen registry descriptor 的校验，避免 response 构造失败后
+  留下 claimed job。被选中的 plan-bound pending job 如果持久化合同已损坏，会在同一 claim
+  调用中隔离为 `failed`，不发 lease；identity-filter 排除但内部合同已损坏的 row 也会被隔离。
+- Job complete 会在 staging 前和最终 publish transaction 内重验完整 plan-bound contract，并拒绝
+  active descriptor 未声明的 output type。合法 outputs 先注册为同一 artifact
+  table 中 API/context 不可见的 `staged` rows；最终事务同时写 lineage、切换为 `active` 并把
+  job 标记为 `succeeded`，且只发布由该 job 拥有的 rows。失败、lease 过期或启动恢复会清理
+  不可恢复的 staged rows/files；成功重试也会删除同一 job 旧 attempt 的 staging。仍持有有效
+  lease 的 job 在重启时保留其 staging，不能提前暴露已
+  promoted 的半完成产物。Plan-bound outputs 还会得到 store-owned
+  `lineage.openevo_execution`，记录 job/plan/target/method identity、registry digest 和 resolved
+  input bindings；worker 不能伪造或覆盖这部分 lineage。
+- Startup 在同一个 transaction 中完成 expired/staged DB recovery，并扫描 Core-owned
+  `artifacts/*/*/manifest.json` 与剩余 artifact rows 双向 reconciliation。Transaction 提交后删除
+  没有任何 DB artifact row 引用的 managed orphan，因此 DB delete 与文件 unlink 之间崩溃可在
+  下次启动重复回收。扫描只接受 artifact root 内、目录/type/artifact ID 与 manifest 一致的普通
+  文件，不跟随指向外部的 symlink；删除会去重并尽量移除空 artifact 目录。
+- Identity mapping 是 loopback 上 trusted Core worker 的版本匹配，不是同一 OS user 下任意
+  进程的密码学 attestation；Core API auth/process isolation 由 backend lifecycle workstream 提供。
 - Human/LLM promotion gate 应让 worker 先注册 `promoted=false` artifact；backend 会强制
   `job.config.promoted=false` 的 job outputs 保持 unpromoted，避免 worker 忽略 config 后
   绕过 gate。Runner 再通过 `GET /v1/artifacts/{id}` 读取 review packet 所需 metadata；
   只有 gate 通过后才调用 `PATCH /v1/artifacts/{id}/promotion` 设置 `promoted=true`。如果同一
   job 输出多个候选 artifact，gate 可以返回 partial approval；backend 只会收到通过候选的
   promotion patch。
+- Runner 只把与 target type 相同的 artifacts 交给 gate；`report` 等辅助 outputs 保留在 job
+  结果中但不进入 target history/context。没有外部 gate 时，只复用 method 自己标记为
+  `promoted=true` 的 target outputs；没有此类 output 会 fail closed，Core 不从 scores 猜 winner。
 - `PATCH /v1/artifacts/{id}/promotion` 的请求 body 必须显式包含 `promoted`，例如
   `{"promoted": true}` 或 `{"promoted": false}`；空 body 会被拒绝，避免缺省值意外
   promote artifact。

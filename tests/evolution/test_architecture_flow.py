@@ -42,6 +42,8 @@ class StoreWorkerClient:
         capabilities: list[str],
         *,
         lease_seconds: int | None = None,
+        method_capabilities: list[str] | None = None,
+        method_identity_capabilities: dict[str, str] | None = None,
     ) -> dict[str, Any] | None:
         request: dict[str, Any] = {
             "worker_id": worker_id,
@@ -49,6 +51,10 @@ class StoreWorkerClient:
         }
         if lease_seconds is not None:
             request["lease_seconds"] = lease_seconds
+        if method_capabilities is not None:
+            request["method_capabilities"] = method_capabilities
+        if method_identity_capabilities is not None:
+            request["method_identity_capabilities"] = method_identity_capabilities
         claimed = self.store.claim_job(WorkerClaimRequest.model_validate(request)).job
         return None if claimed is None else claimed.model_dump(mode="json")
 

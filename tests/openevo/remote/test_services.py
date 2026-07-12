@@ -1,8 +1,15 @@
 from __future__ import annotations
 
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+
 from openevo.deployment import build_remote_bootstrap_plan
 from openevo.deployment.preflight import RemoteCommandResult
 from openevo.deployment.services import (
+    _daemon_command,
     build_remote_services_plan,
     execute_remote_services_plan,
     inspect_remote_services,
@@ -39,11 +46,18 @@ def test_service_plan_starts_subscription_runtime_services() -> None:
     assert backend.manifest["service_id"] == "openevo_backend"
     assert backend.manifest["pid_path"].endswith("/services/pids/openevo_backend.pid")
     assert backend.manifest["log_path"].endswith("/services/logs/openevo_backend.log")
+    assert backend.manifest["identity_path"].endswith(
+        "/services/pids/openevo_backend.identity"
+    )
     assert backend.manifest["port"] == 8765
     assert 'kill -0 "$(cat' not in backend.command
     _assert_before(backend.command, "if pid <= 0:", "os.kill(pid, 0)")
     assert "openevo-backend serve --host 127.0.0.1 --port 8765" in backend.command
     assert f"--state-root {plan.state_root}" in backend.command
+    framework_lock = f"{plan.state_root}/wheels/framework-lock.json"
+    assert backend.manifest["identity_source_path"] == framework_lock
+    assert backend.manifest["identity_scheme"] == "framework_lock_and_argv_sha256_v1"
+    assert f"--framework-lock {framework_lock}" in backend.command
     assert backend.health_command is not None
     assert "http://127.0.0.1:8765/health" in backend.health_command
     gateway = plan.step_by_id("gateway")
@@ -70,6 +84,82 @@ def test_service_plan_starts_subscription_runtime_services() -> None:
         f"python3 -m openevo.gateway.server --config {plan.topology_path} "
         "--node-id desktop-node"
     ) in gateway.command
+    evolution_backend = plan.step_by_id("evolution_backend")
+    evolution_worker = plan.step_by_id("evolution_worker")
+    assert f"--framework-lock {framework_lock}" in evolution_backend.command
+    assert f"--framework-lock {framework_lock}" in evolution_worker.command
+
+
+def test_daemon_start_identity_is_idempotent_and_restarts_after_lock_change(
+    tmp_path: Path,
+) -> None:
+    lock_path = tmp_path / "framework-lock.json"
+    lock_path.write_text('{"distribution_digest":"first"}\n', encoding="utf-8")
+    log_dir = tmp_path / "logs"
+    pid_dir = tmp_path / "pids"
+    command = _daemon_command(
+        "identity_test",
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        log_dir=str(log_dir),
+        pid_dir=str(pid_dir),
+        framework_lock_path=str(lock_path),
+        identity_env={},
+    )
+    pid_path = pid_dir / "identity_test.pid"
+    identity_path = pid_dir / "identity_test.identity"
+    started_pids: list[int] = []
+
+    try:
+        subprocess.run(command, shell=True, check=True, executable="/bin/sh")
+        first_pid = int(pid_path.read_text(encoding="utf-8"))
+        started_pids.append(first_pid)
+        first_identity = identity_path.read_text(encoding="utf-8").strip()
+
+        subprocess.run(command, shell=True, check=True, executable="/bin/sh")
+        assert int(pid_path.read_text(encoding="utf-8")) == first_pid
+        assert identity_path.read_text(encoding="utf-8").strip() == first_identity
+
+        lock_path.write_text(
+            '{"distribution_digest":"second"}\n', encoding="utf-8"
+        )
+        subprocess.run(command, shell=True, check=True, executable="/bin/sh")
+        second_pid = int(pid_path.read_text(encoding="utf-8"))
+        started_pids.append(second_pid)
+
+        assert second_pid != first_pid
+        assert identity_path.read_text(encoding="utf-8").strip() != first_identity
+        _assert_process_is_not_alive(first_pid)
+    finally:
+        for pid in started_pids:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+
+
+def test_daemon_start_fails_closed_without_framework_lock(tmp_path: Path) -> None:
+    pid_dir = tmp_path / "pids"
+    command = _daemon_command(
+        "identity_test",
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        log_dir=str(tmp_path / "logs"),
+        pid_dir=str(pid_dir),
+        framework_lock_path=str(tmp_path / "missing-framework-lock.json"),
+        identity_env={},
+    )
+
+    result = subprocess.run(
+        command,
+        shell=True,
+        check=False,
+        executable="/bin/sh",
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 2
+    assert "failed to read daemon identity source" in result.stderr
+    assert not (pid_dir / "identity_test.pid").exists()
 
 
 def test_service_plan_starts_vllm_for_managed_local_inference() -> None:
@@ -167,6 +257,21 @@ def test_execute_remote_services_plan_redacts_proxy_secrets() -> None:
     assert "proxy-secret" not in rollout.stderr
     assert "download-secret" not in rollout.stderr
     assert "[REDACTED]" in rollout.stderr
+
+
+def test_daemon_identity_tracks_proxy_environment_without_exposing_secrets() -> None:
+    first_secret = "http://first-user:first-secret@127.0.0.1:7890"
+    second_secret = "http://second-user:second-secret@127.0.0.1:7890"
+    first = build_remote_services_plan(
+        _bootstrap_plan(proxy={"https_proxy": first_secret})
+    ).step_by_id("evolution_worker")
+    second = build_remote_services_plan(
+        _bootstrap_plan(proxy={"https_proxy": second_secret})
+    ).step_by_id("evolution_worker")
+
+    assert first.command != second.command
+    assert "first-secret" not in first.command
+    assert "second-secret" not in second.command
 
 
 def test_pid_health_command_validates_positive_pid_before_kill() -> None:
@@ -558,7 +663,10 @@ class _LifecycleTransport(_RecordingTransport):
             if self.log_exception is not None:
                 raise self.log_exception
             return RemoteCommandResult(command=command, return_code=0, stdout=self.log_content)
-        if "os.kill(pid, signal.SIGTERM)" in command:
+        if (
+            "service_id =" in command
+            and "os.kill(pid, signal.SIGTERM)" in command
+        ):
             if service_id not in self.pid_states:
                 return RemoteCommandResult(
                     command=command,
@@ -600,6 +708,14 @@ def _assert_before(command: str, earlier: str, later: str) -> None:
     assert earlier in command
     assert later in command
     assert command.index(earlier) < command.index(later)
+
+
+def _assert_process_is_not_alive(pid: int) -> None:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return
+    raise AssertionError(f"process {pid} is still alive")
 
 
 def _service_id_from_command(command: str) -> str | None:

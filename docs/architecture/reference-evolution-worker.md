@@ -49,6 +49,7 @@ uv run python -m openevo.evolution.cli worker \
   --base-url http://127.0.0.1:8200 \
   --worker-id reference-worker \
   --artifact-root .openevo/evolution \
+  --framework-lock /path/to/framework-lock.json \
   --once
 ```
 
@@ -61,7 +62,9 @@ flowchart TB
     HasJob{返回 job?}
     Validate[校验 WorkerClaimedJob]
     Heartbeat0[heartbeat progress=0.0]
-    Dispatch[按 job.method 调 run_method]
+    Identity[校验 plan / registry / envelope / inputs]
+    Dispatch[按 descriptor ABI 调 verified handle]
+    Renew[每 lease/3 heartbeat]
     Heartbeat1[heartbeat progress=1.0]
     Complete[POST /v1/jobs/{id}/complete]
     Fail[POST /v1/jobs/{id}/fail]
@@ -69,15 +72,23 @@ flowchart TB
 
     Start --> Claim --> HasJob
     HasJob -- no --> Done
-    HasJob -- yes --> Validate --> Heartbeat0 --> Dispatch --> Heartbeat1 --> Complete --> Done
+    HasJob -- yes --> Validate --> Heartbeat0 --> Identity --> Dispatch --> Heartbeat1 --> Complete --> Done
+    Dispatch -. method running .-> Renew -. renew lease .-> Dispatch
     Validate -. 带 job identity 的异常 .-> Fail --> Done
+    Identity -. deterministic failure .-> Fail
     Dispatch -. exception .-> Fail --> Done
 ```
 
-Unknown method 会以 retryable fail 结束。这样 reference worker 不会把本应由专用
-research worker 处理的 jobs 永久失败掉。
+Plan-bound claim 同时按 `job_type`、method ID 和 verified method identity digest 过滤；没有
+identity mapping 的 worker 只能获得 legacy jobs。Worker
+重新计算 plan closure，检查 method/target identity、canonical flat config 和每个 input
+artifact snapshot，然后按 descriptor 的 `legacy_worker_job_v1` 或 `method_context_v1` ABI
+调用 verified handle。Identity/contract failure 不可重试，也不会 fallback。未迁移 legacy
+job 的 unknown method 仍以 retryable fail 结束，让专用 research worker 有机会 claim。
+Store 在发 lease 前发现损坏的 plan/envelope/input contract 时会直接把该 pending job 隔离为
+failed 并返回空 claim；worker 下一次轮询可继续处理健康 job。
 
-## Method Registry
+## Built-In Catalog And Legacy Registry
 
 `src/openevo/evolution/methods.py` 暴露：
 
@@ -98,9 +109,14 @@ METHOD_REGISTRY = {
 }
 ```
 
-Workers 根据 `job_type` claim jobs，而不是根据 method。CLI 默认 capabilities 是已
-注册的 method names。因此最简单的约定是创建 reference jobs 时让 `job_type` 和
-`method` 都使用同一个内置 method name。
+`METHOD_REGISTRY` 是尚未迁移 benchmark jobs 的临时 callable table，不是 plan-bound
+产品路径的 dispatch source。Release worker 从外部 `framework-lock.json` 加载
+`VerifiedExecutableRegistry`；每个 built-in descriptor 的 entry point 在启动时验证为同一个
+现有 callable，以保护算法不因产品化迁移而改变。
+
+Workers 使用 `job_type` 做 queue filtering，并使用 registry method IDs 做 method filtering。
+CLI 的默认 queue capabilities 是已有 method names；experiment runner 使用 run-specific
+queue capability，避免常驻 reference worker 抢占它同步等待的 job。
 
 ```mermaid
 flowchart LR
@@ -111,6 +127,9 @@ flowchart LR
 
     Job --> Claim --> Method --> Artifact
 ```
+
+上图只描述 legacy benchmark job。Plan-bound job 的 Method 节点是
+`VerifiedExecutableRegistry.method_handles[method_id]`。
 
 ## Method: `text_memory`
 
@@ -722,6 +741,7 @@ python -m openevo.evolution.cli worker
   --once
   --sleep-seconds 5
   --lease-seconds 600
+  --framework-lock /path/to/framework-lock.json
 ```
 
 如果不传 `--capability`，worker 默认使用内置 method names。也可以传逗号分隔的值：
@@ -731,17 +751,30 @@ python -m openevo.evolution.cli worker
 uv run python -m openevo.evolution.cli worker --capability text_memory,skill_bundle,agent_system,agent_system_reflector,agent_system_history_reflector,agent_system_pareto_reflector,text_memory_expel_reflector,parametric_memory_lora_sft
 ```
 
-Worker heartbeat 会续租 job lease，但不会缩短 claim 时已经获得的更长 lease。这样本地
-one-shot worker 可以为长时间运行的 `parametric_memory_lora_sft` trainer 使用较长 claim
-lease，并在 trainer 结束后正常 heartbeat 和 complete job。
+Worker 在 method 运行期间每隔 claim lease 的三分之一续租。Store 会持久化 claim 请求的
+`lease_seconds`，每次 heartbeat 都从当前时间续租相同 duration；短 lease 不会被放大成 600 秒。
+旧 active job 的 NULL duration 会从原 `updated_at`/`lease_expires_at` 区间安全推导并持久化，
+无法得到正 duration 时拒绝续租。线程在 method 成功或异常后都会停止并 join；heartbeat 失败会阻止 complete。这样
+长时间运行的 trainer 不会因为只有开始/结束 heartbeat 而被另一 worker 重新 claim。
 
 ## 添加 Research Method
 
-1. 添加一个接收 `WorkerClaimedJob` 和 `artifact_root` 的 method function。
-2. 返回一个或多个 `ArtifactRegisterRequest`。
-3. 在 `METHOD_REGISTRY` 中注册。
-4. 创建 jobs 时，让 `method` 和 `job_type` 匹配你的 worker capability 策略。
-5. 为 artifact 文件、manifest、runner fail/complete 行为添加测试。
+1. 新方法优先实现 `(MethodExecutionContext) -> list[ArtifactRegisterRequest]`；不要修改已有
+   legacy 算法函数。
+2. 注册 method descriptor，声明 target、ABI、ordered inputs、closed config schema、outputs、
+   support axes 和 locked implementation entry point。
+3. 由 verified registry/profile 编译 plan，并通过 `/v1/planned-jobs` 创建 job；不要给新方法
+   增加 `METHOD_REGISTRY` fallback。
+4. 为 descriptor identity、fresh-process loading、plan materialization、worker dispatch、artifact
+   registration、context/runtime consumption 添加测试。
+5. 当前 release composition 只加载 built-ins；外部 plugin 还必须完成显式 lock/registry
+   composition 才能声称端到端可运行。
 
 Backend 不需要 method-specific DB schema。新 methods 通过 typed artifacts 和
 manifest metadata 与系统通信。
+Worker complete 的 outputs 先在现有 artifact table 中以 `staged` 注册；它们对读取、promotion
+和 context resolve 不可见，直到最终事务在重验 plan/envelope/active descriptor 后，只发布该
+job 拥有的 outputs 并提交 job success。失败、lease 过期和启动恢复会回收不可恢复的 staging。
+Startup 的 DB staging recovery 与 Core-owned artifact manifest inventory 在同一 transaction 中
+reconcile；提交后幂等删除不再由任何 artifact row 引用的 managed orphan。扫描不跟随外部
+symlink，所以 DB delete 与 manifest unlink 之间的 crash window 可恢复且不会越过 artifact root。

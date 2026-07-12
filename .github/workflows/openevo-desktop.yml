@@ -1,14 +1,17 @@
-name: OpenEvo Desktop checks
+name: OpenEvo packaged sidecar and Desktop source checks
 
 on:
   pull_request:
     types: [opened, edited, synchronize, reopened, ready_for_review]
     paths:
       - ".github/workflows/openevo-desktop.yml"
+      - "pyproject.toml"
+      - "uv.lock"
       - "desktop/**"
       - "scripts/ci/smoke_openevo_desktop_bundle.py"
       - "scripts/ci/smoke_openevo_desktop_sidecar.py"
       - "scripts/ci/write_sha256.py"
+      - "tests/ci/test_build_sidecar.py"
       - "tests/ci/test_check_openevo_release.py"
 
 jobs:
@@ -25,6 +28,20 @@ jobs:
           cache-dependency-path: desktop/package-lock.json
 
       - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - uses: astral-sh/setup-uv@v6
+
+      - name: Install packaged sidecar build dependencies
+        run: |
+          uv sync --frozen --group dev
+          echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
+
+      - name: Test packaged sidecar builder
+        run: uv run python -m pytest tests/ci/test_build_sidecar.py -q
 
       - name: Install Linux Tauri dependencies
         run: |
@@ -47,6 +64,10 @@ jobs:
           npm audit --audit-level=high
           npm test -- --run
           npm run build:openevo
+
+      - name: Build packaged OpenEvo Desktop sidecar
+        working-directory: desktop
+        run: npm run build:sidecar
 
       - name: Check OpenEvo Desktop Tauri host
         working-directory: desktop/src-tauri

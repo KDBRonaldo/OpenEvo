@@ -75,6 +75,11 @@ class CaptureMode(StrEnum):
     TOKEN_LEVEL = "token_level"
 
 
+class MethodInvocationABI(StrEnum):
+    LEGACY_WORKER_JOB_V1 = "legacy_worker_job_v1"
+    METHOD_CONTEXT_V1 = "method_context_v1"
+
+
 class DestinationScope(StrEnum):
     TARGET_DATA = "target_data"
     HARNESS_SKILLS = "harness_skills"
@@ -391,6 +396,7 @@ __all__ = [
     "MAX_PAYLOAD_TREE_DEPTH",
     "MAX_RENDERER_PAYLOAD_BYTES",
     "Maturity",
+    "MethodInvocationABI",
     "PayloadKind",
     "RendererKind",
     "canonical_digest",

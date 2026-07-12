@@ -3,10 +3,37 @@ from __future__ import annotations
 import pytest
 
 from openevo import experiments
+from openevo.evolution.framework import EvolutionExecutionProfile
+from openevo.evolution.framework.builtins import (
+    ImplementationDistributionIdentity,
+    build_builtin_registry,
+)
 from openevo.projects.science import PreparedWorkspace, ScienceProjectConfig, compile_science_project
 from openevo.projects.science.compiler import MANAGED_RUNTIME_IMAGES
 
-compile_experiment = experiments.compile_experiment
+_compile_experiment = experiments.compile_experiment
+_REGISTRY_SNAPSHOT = build_builtin_registry(
+    ImplementationDistributionIdentity(
+        distribution="openevo",
+        distribution_version="0.1.0",
+        distribution_digest="a" * 64,
+    )
+)
+_EXECUTION_PROFILE = EvolutionExecutionProfile(
+    execution_mode="subscription",
+    capture_mode="transcript",
+    harness_id="codex",
+)
+
+
+def compile_experiment(config, *args, **kwargs):
+    return _compile_experiment(
+        config,
+        *args,
+        registry_snapshot=_REGISTRY_SNAPSHOT,
+        execution_profile=_EXECUTION_PROFILE,
+        **kwargs,
+    )
 
 
 def _project(**overrides: object) -> ScienceProjectConfig:
@@ -151,12 +178,8 @@ def test_science_text_target_cannot_smuggle_parametric_method() -> None:
         )
     )
 
-    compiled = compile_experiment(experiment)
-    with pytest.raises(ValueError, match="belongs to target 'parametric_memory'"):
-        compiled.evolution_methods_for_round(
-            0,
-            prior_dataset_artifact_ids=[],
-        )
+    with pytest.raises(ValueError, match="does not belong to target 'text_memory'"):
+        compile_experiment(experiment)
 
 
 def test_self_deployed_science_compile_uses_codex_reflector_llm() -> None:
