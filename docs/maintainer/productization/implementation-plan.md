@@ -1,11 +1,8 @@
 # OpenEvo Productization Execution Plan
 
 Status: current execution backlog
-
 Canonical design: `docs/maintainer/productization/spec.md`
-
 Tracking issue: #131
-
 Base branch: `stable`
 
 ## How To Use This Plan
@@ -25,8 +22,8 @@ README, test, or workflow instead of expanding this plan.
   a child issue.
 - Commit as `ivowang <ziyiwang@ieee.org>` and push branches promptly.
 - Do not modify protected evolution algorithm behavior.
-- Preserve the existing Polar-derived gateway/rollout/runtime/trajectory/
-  evolution/artifact architecture and data flow; restructure packaging and
+- Preserve the OpenEvo gateway/rollout/runtime/trajectory/evolution/artifact
+  architecture inherited from the legacy upstream; restructure packaging and
   access paths without redesigning those mechanisms.
 - Keep Core, Desktop, and benchmark automation in their declared ownership
   boundaries.
@@ -79,44 +76,52 @@ Acceptance:
 Implement `EvolutionTarget`, `EvolutionMethod`, and immutable per-run
 `EvolutionPlan` contracts plus one authoritative registry. Built-ins load
 explicitly and research plugins fail closed. Define the detailed execution,
-result, plan snapshot, registry identity, config-schema, and target-handler
-contracts in `docs/architecture/` before migrating code.
+plan snapshot, registry identity, config-schema, and target-handler contribution
+contracts in `docs/architecture/evolution-framework.md` before migrating code.
+Keep the existing job/lease/worker/artifact/store lifecycle; this work adds a
+plugin boundary and does not replace Core scheduling or persistence.
 
 Execute this migration in the following order:
 
 | Step | Requirements | Deliverable |
 | --- | --- | --- |
-| `A2.1` | `PLUG-1`, `PLUG-2`, `PLUG-3`, `PLUG-4`, `PLUG-5`, `PLUG-6` | Specify and test registry/identity, protocol, ledger, atomic publication, schema/security, and offline migration contracts. |
-| `A2.2` | `PLUG-2`, `PLUG-7` | Freeze exact GEPA generation/round, objective, history, and tie-break fixtures, then wrap existing functions in descriptors. |
-| `A2.3` | `PLUG-3`, `PLUG-4`, `PLUG-7` | Adapt the complete GEPA generator/evaluator/selection state machine to the new multi-stage boundary before any dispatch cutover. |
-| `A2.4` | `PLUG-2`, `PLUG-3`, `PLUG-4` | Implement plan/ledger persistence, attempts/fencing, verified worker identity binding, staged publication, and recovery. |
-| `A2.5` | `PLUG-1`, `PLUG-2`, `PLUG-5` | Implement registry-driven capabilities/dispatch plus generic project config and target handlers; keep cutover disabled. |
-| `A2.6` | `PLUG-7` | Mechanically relocate method bodies/helpers with all equivalence fixtures green. |
-| `A2.7` | `PLUG-6` | Save control state; isolate, drain-or-stop, capture restart journal/fence under lock, verify post-fence checkpoint, migrate, then hand off. |
-| `A2.8` | `PLUG-6`, `PLUG-7` | Validate new-only Core/peers in maintenance, switch supervisor/tunnel then admit; on failure restore old target under lock before restart/admit. |
+| `A2.1` | `PLUG-1`, `PLUG-2`, `PLUG-3`, `PLUG-4` | Define/test descriptors, ordered method input and invocation contracts, immutable plan identity, bounded config, handler input/output security, versioned capabilities, and a frozen registry. |
+| `A2.2` | `PLUG-2`, `PLUG-5` | Register existing methods mechanically with stable IDs and freeze exact GEPA generation/round/objective/history/tie-break behavior. |
+| `A2.3` | `PLUG-1`, `PLUG-2`, `PLUG-3` | Add generic project target selections, plan compilation, registry-driven worker dispatch and versioned capabilities on the existing job/lease/artifact path. |
+| `A2.4` | `PLUG-4` | Replace target-specific context/runtime projection with validated handler contributions and add the generic Desktop renderer/config projection. |
+| `A2.5` | `PLUG-1`, `PLUG-2`, `PLUG-3`, `PLUG-4`, `PLUG-5` | Cut over Core and Desktop, delete duplicate registries/target switches, run behavior/performance gates, and document method/target authoring. |
 
-Acceptance:
+`A2.1` is contract-only and switches no runtime/product path; A1 froze `PLUG-5`,
+which is migrated and equivalence-tested in A2.2.
 
-- `docs/architecture/` fixes legal ledger transitions, the worker trust/identity
-  model, Core-mediated payloads, single-writer recovery/writer quiescence,
-  schema/renderer/CSP limits, fail-closed install-manifest/API handshake,
-  state-lock handoff versus admission, consistent backup/restore, and
-  state-by-state migration before code cutover;
-- fresh-process and fault-injection tests cover create/claim/complete identity,
-  ready/blocked recovery, fencing, duplicate completion, every publication,
-  backup/restore and migration crash boundary, and no partially visible results;
+A2 completion acceptance:
+
+- registry tests cover graph/identity/immutability, ordered input binding and
+  exact legacy job projection, config precedence, four-axis compatibility,
+  trusted multi-artifact handler input/context aggregation, and reachable closure;
 - test method/target plugins require no central switches, unsupported contracts
   fail closed, and method inference can run only through a Core harness service;
-- GEPA fixtures preserve all `PLUG-7` generation, round, history, objective,
-  `None`, tie-break, and `auto` behavior before and after relocation;
-- migration tests cover each legacy record state, immutable rebuild linkage,
-  protocol rejection/recovery, rollback, and removal of runtime legacy paths.
+- remote-Core capabilities expose four separate support axes and stable reasons;
+  combined release-profile labels map once and remain presentation only;
+- Desktop consumes the remote Core projection and gives every target a toggle,
+  friendly method selector, schema-driven editor, durable save/reload, and clear
+  unsupported reason; it contains no method or target registry;
+- an external test target crosses compiler, resolver, gateway, capabilities, and
+  Desktop through an existing contribution/renderer kind with no target-ID branch;
+- maintainer documentation gives one complete path for adding a method to an
+  existing target and one for adding a target with a constrained handler; both
+  examples are exercised as external test plugins rather than privileged
+  built-in branches;
+- GEPA fixtures preserve `PLUG-5` generation/round/history/objective/`None`/
+  tie-break behavior; the separate project `auto` resolver preserves prior-dataset selection;
+- the existing store/job/lease/worker/artifact/context regression suite and all
+  three performance gates pass without a second scheduler or compatibility path.
 
 ### A3. Move Terminal Bench Automation Out Of Core
 
-Create `benchmarks/terminal_bench/` as standalone automation. A2 has already
-placed protected GEPA evaluation, selection, and transition behind its
-algorithm-owned boundary. Mechanically move only Terminal Bench task acquisition,
+Create `benchmarks/terminal_bench/` as standalone automation. Keep protected
+GEPA evaluation, selection, and transition inside its algorithm-owned method.
+Mechanically move only Terminal Bench task acquisition,
 Harbor execution, verifier adapter, materializer, reporting, task configuration,
 and benchmark commands out of `src/openevo/`.
 
@@ -267,6 +272,8 @@ Required views:
 - proxy/network and execution-mode settings;
 - doctor/bootstrap progress and recovery;
 - science task/workspace/evolution configuration;
+- capability-driven target toggles, friendly method selection, and schema-driven
+  method settings without exposing internal IDs;
 - run timeline, logs, services, and cancellation/retry;
 - memory, skill, and agent-system artifacts and diffs;
 - diagnostics, data locations, deletion, and application settings.
@@ -277,7 +284,9 @@ Acceptance:
 - ordinary users never need method IDs, worker details, benchmark concepts, or
   shell commands;
 - the UI remains responsive during SSH, download, model startup, and long runs;
-- reconnecting or restarting Desktop restores durable remote state.
+- reconnecting or restarting Desktop restores durable remote state;
+- saving and reopening a project preserves each target's enabled state, selected
+  method, and validated config; unsupported combinations show Core-provided reasons.
 
 ### C2. Complete Native Host And Local Security
 
@@ -314,7 +323,7 @@ Acceptance:
 
 Make `src/openevo/`, `desktop/`, and `benchmarks/` visibly match the canonical
 architecture. Remove obsolete wrappers, duplicated implementations, stale
-package data, and active Polar identity. Historical records remain only under
+package data, and active legacy upstream identity. Historical records remain only under
 clearly marked maintainer history paths.
 
 Acceptance:

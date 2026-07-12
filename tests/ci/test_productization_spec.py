@@ -21,8 +21,8 @@ RETIRED_MARKERS = (
     "science-task.schema.json",
     "science-workflow-canary-report.schema.json",
 )
-PLUG_REQUIREMENTS = tuple(f"PLUG-{number}" for number in range(1, 8))
-A2_STEPS = tuple(f"A2.{number}" for number in range(1, 9))
+PLUG_REQUIREMENTS = tuple(f"PLUG-{number}" for number in range(1, 6))
+A2_STEPS = tuple(f"A2.{number}" for number in range(1, 6))
 
 
 def _text(path: Path) -> str:
@@ -77,12 +77,15 @@ def test_spec_preserves_stable_product_boundaries() -> None:
         "benchmarks/terminal_bench/",
         "CLI or Dev Kit product",
         "call a model API directly",
-        "Polar-derived architecture",
+        "OpenEvo Core architecture",
         "gateway, rollout, runtime",
         "OPENEVO_*",
         "/openevo/session",
     ):
         assert marker in spec
+
+    assert "Polar" not in spec
+    assert "Polar" not in _text(PLAN)
 
 
 def test_spec_preserves_validated_methods_and_gates() -> None:
@@ -109,14 +112,11 @@ def test_spec_requires_pluggable_targets_methods_and_registry() -> None:
     mapped_requirements = {requirement for _, requirements in rows for requirement in requirements}
     assert mapped_requirements == set(PLUG_REQUIREMENTS)
     assert dict(rows) == {
-        "A2.1": ("PLUG-1", "PLUG-2", "PLUG-3", "PLUG-4", "PLUG-5", "PLUG-6"),
-        "A2.2": ("PLUG-2", "PLUG-7"),
-        "A2.3": ("PLUG-3", "PLUG-4", "PLUG-7"),
-        "A2.4": ("PLUG-2", "PLUG-3", "PLUG-4"),
-        "A2.5": ("PLUG-1", "PLUG-2", "PLUG-5"),
-        "A2.6": ("PLUG-7",),
-        "A2.7": ("PLUG-6",),
-        "A2.8": ("PLUG-6", "PLUG-7"),
+        "A2.1": ("PLUG-1", "PLUG-2", "PLUG-3", "PLUG-4"),
+        "A2.2": ("PLUG-2", "PLUG-5"),
+        "A2.3": ("PLUG-1", "PLUG-2", "PLUG-3"),
+        "A2.4": ("PLUG-4",),
+        "A2.5": ("PLUG-1", "PLUG-2", "PLUG-3", "PLUG-4", "PLUG-5"),
     }
 
     ordered_sections = ("### A1.", "### A2.", "### A3.", "## B.", "## C.")
