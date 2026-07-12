@@ -10,6 +10,12 @@ from openevo.harness.base import BaseHarness
 from openevo.harness.models import AgentRunResult, AgentSpec
 from openevo.harness.presets.codex import CodexHarness
 from openevo.config import EvolutionConfig
+from openevo.evolution.models import (
+    ArtifactRegisterRequest,
+    ArtifactType,
+    ContextResolveRequest,
+)
+from openevo.evolution.store import EvolutionStore
 from openevo.gateway.dispatcher import ManagedSession
 from openevo.gateway.node import (
     GatewayNodeManager,
@@ -616,6 +622,96 @@ async def test_write_evolution_context_files(tmp_path):
     assert env["OPENEVO_AGENT_SYSTEM_FILE"] == "/openevo/session/evolution/agent_system.md"
     assert env["OPENEVO_AGENT_SYSTEM_TARGET"] == "/openevo/session/AGENTS.md"
     assert json.loads(env["OPENEVO_AGENT_SYSTEM_TARGETS"]) == ["/openevo/session/AGENTS.md"]
+    assert env["OPENEVO_AGENTS_MD"] == "/openevo/session/AGENTS.md"
+
+
+@pytest.mark.asyncio
+async def test_resolved_store_context_stages_all_text_artifacts(tmp_path):
+    memory_text = "Remember to preserve parser precedence."
+    agent_system_text = "Inspect repository conventions before editing."
+    skill_text = "---\nname: parser-probe\n---\nUse recursive descent.\n"
+
+    memory_source = tmp_path / "sources" / "memory.md"
+    agent_system_source = tmp_path / "sources" / "AGENTS.md"
+    skill_source = tmp_path / "sources" / "parser-skill"
+    memory_source.parent.mkdir()
+    skill_source.mkdir()
+    memory_source.write_text(memory_text, encoding="utf-8")
+    agent_system_source.write_text(agent_system_text, encoding="utf-8")
+    (skill_source / "SKILL.md").write_text(skill_text, encoding="utf-8")
+
+    store = EvolutionStore(
+        db_path=tmp_path / "evolution.db",
+        artifact_root=tmp_path / "artifacts",
+    )
+    store.initialize()
+    memory = store.register_artifact(
+        ArtifactRegisterRequest(
+            type=ArtifactType.TEXT_MEMORY,
+            name="parser memory",
+            uri=memory_source.as_uri(),
+            compatibility={"task_tags": ["parser"], "agent_harness": ["codex"]},
+            scores={"quality": 0.9},
+            promoted=True,
+        )
+    )
+    skill = store.register_artifact(
+        ArtifactRegisterRequest(
+            type=ArtifactType.SKILL_BUNDLE,
+            name="parser skill",
+            uri=skill_source.as_uri(),
+            compatibility={"task_tags": ["parser"], "agent_harness": ["codex"]},
+            scores={"quality": 0.8},
+            promoted=True,
+        )
+    )
+    agent_system = store.register_artifact(
+        ArtifactRegisterRequest(
+            type=ArtifactType.AGENT_SYSTEM,
+            name="parser agent system",
+            uri=agent_system_source.as_uri(),
+            manifest={"target_path": "AGENTS.md"},
+            compatibility={"task_tags": ["parser"], "agent_harness": ["codex"]},
+            scores={"quality": 0.85},
+            promoted=True,
+        )
+    )
+
+    resolved = store.resolve_context(
+        ContextResolveRequest(
+            task_id="parser-task",
+            instruction="Fix the parser.",
+            agent={"harness": "codex"},
+            metadata={"task_tags": ["parser"]},
+        )
+    )
+    assert resolved.selection["artifact_ids"] == [
+        memory.artifact_id,
+        agent_system.artifact_id,
+        skill.artifact_id,
+    ]
+
+    runtime = BindMountRuntime(tmp_path)
+    env = await write_evolution_context_files(
+        runtime=runtime,
+        context=resolved.model_dump(),
+        host_dir=tmp_path,
+        target_dir="/openevo/session/evolution",
+    )
+
+    assert (tmp_path / "evolution" / "memory.md").read_text(encoding="utf-8") == memory_text
+    assert (tmp_path / "evolution" / "agent_system.md").read_text(
+        encoding="utf-8"
+    ) == agent_system_text
+    assert (tmp_path / "AGENTS.md").read_text(encoding="utf-8") == agent_system_text
+    staged_skill = tmp_path / "evolution" / "skills" / skill.artifact_id
+    assert (staged_skill / "SKILL.md").read_text(encoding="utf-8") == skill_text
+    assert env["OPENEVO_MEMORY_FILE"] == "/openevo/session/evolution/memory.md"
+    assert env["OPENEVO_SKILLS_DIR"] == "/openevo/session/evolution/skills"
+    assert env["OPENEVO_AGENT_SYSTEM_FILE"] == (
+        "/openevo/session/evolution/agent_system.md"
+    )
+    assert env["OPENEVO_AGENT_SYSTEM_TARGET"] == "/openevo/session/AGENTS.md"
     assert env["OPENEVO_AGENTS_MD"] == "/openevo/session/AGENTS.md"
 
 

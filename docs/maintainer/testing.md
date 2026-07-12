@@ -43,6 +43,11 @@ Run relevant module suites when touching shared behavior:
 PYTHONPATH=src:. python -m pytest tests/backend tests/evolution tests/gateway tests/trajectory tests/rollout -q
 ```
 
+The focused productization regression boundary is indexed in
+`docs/architecture/protected-behavior.md`. It protects observable method and
+cross-stage behavior without a source-hash manifest; it is not a substitute for
+the final benchmark performance gates.
+
 ## Release Gate Tests
 
 Release gate tests are stricter than local smoke tests. Their output must identify

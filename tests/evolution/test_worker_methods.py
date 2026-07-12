@@ -793,6 +793,107 @@ def test_text_memory_expel_reflector_rejects_missing_required_sections(
         run_method(job, artifact_root=tmp_path / "artifacts")
 
 
+@pytest.mark.parametrize(
+    ("method", "error"),
+    [
+        ("text_memory_expel_reflector", "requires an input dataset artifact"),
+        ("skill_bundle_reflector", "requires an input dataset artifact"),
+        ("agent_system_gepa_reflector", "requires at least one dataset artifact"),
+    ],
+)
+def test_canonical_reflector_methods_require_dataset(
+    tmp_path: Path,
+    method: str,
+    error: str,
+) -> None:
+    with pytest.raises(ValueError, match=error):
+        run_method(_job(method, tmp_path), artifact_root=tmp_path / "artifacts")
+
+
+@pytest.mark.parametrize(
+    ("method", "response"),
+    [
+        (
+            "text_memory_expel_reflector",
+            "# Memory\n\n"
+            "## Do\n- Inspect the failure.\n\n"
+            "## Avoid\n- Avoid unverified edits.\n\n"
+            "## Validate\n- Run focused tests.\n\n"
+            "## When Applicable\n- Apply to test failures.\n\n"
+            "## Retired Or Superseded\n- Retire stale advice.\n",
+        ),
+        (
+            "skill_bundle_reflector",
+            "---\nname: focused-reflection\n"
+            "description: Use when reflecting on task failures.\n---\n\n"
+            "# Focused Reflection\n\nRun the focused test before finalizing.\n",
+        ),
+    ],
+)
+def test_canonical_text_reflectors_default_to_twenty_records(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    method: str,
+    response: str,
+) -> None:
+    captured = _patch_reflector_llm(monkeypatch, response)
+    records = [
+        {
+            "event_id": "evt_skipped",
+            "task_id": "task_skipped",
+            "session_id": "session_skipped",
+            "status": "COMPLETED",
+            "reward": 1.0,
+            "traces": [],
+        },
+        *[
+            {
+                "event_id": f"evt_{index}",
+                "task_id": f"task_{index}",
+                "session_id": f"session_{index}",
+                "status": "COMPLETED",
+                "reward": 1.0,
+                "traces": [
+                    {
+                        "prompt_messages": [
+                            {
+                                "role": "user",
+                                "content": f"PROMPT_{index:02d}_MARKER",
+                            }
+                        ],
+                        "response_messages": [
+                            {"role": "assistant", "content": f"Result {index}"}
+                        ],
+                    }
+                ],
+            }
+            for index in range(21)
+        ],
+    ]
+    job = _job(
+        method,
+        tmp_path,
+        input_artifacts=[_parametric_dataset_artifact(tmp_path, records)],
+        config={
+            "reflector_llm": {
+                "model": "reflector-model",
+                "base_url": "http://reflector.test/v1",
+                "api_key": "test-key",
+            }
+        },
+    )
+
+    [artifact] = run_method(job, artifact_root=tmp_path / "artifacts")
+
+    prompt = captured["json"]["messages"][1]["content"]
+    assert artifact.manifest["record_count"] == 22
+    assert artifact.manifest["reflected_record_count"] == 20
+    assert "PROMPT_00_MARKER" in prompt
+    assert "PROMPT_19_MARKER" in prompt
+    assert "PROMPT_20_MARKER" not in prompt
+    assert "task_skipped" not in prompt
+
+
 def test_text_memory_reflector_includes_prior_text_memory_in_prompt(
     tmp_path,
     monkeypatch,
@@ -2687,6 +2788,97 @@ def test_agent_system_pareto_reflector_requires_history_dataset(tmp_path):
         raise AssertionError("expected ValueError")
 
 
+@pytest.mark.parametrize(
+    ("candidate_count", "mutation_strategies", "expected_strategies"),
+    [
+        (None, None, ["failure_targeted", "verification_gate", "preservation_gate"]),
+        (0, None, ["failure_targeted"]),
+        (
+            6,
+            None,
+            [
+                "failure_targeted",
+                "verification_gate",
+                "preservation_gate",
+                "anti_regression",
+                "edge_case_corpus",
+            ],
+        ),
+        (
+            1,
+            ["bounded_inventory", "verifier_recovery"],
+            ["bounded_inventory", "verifier_recovery"],
+        ),
+    ],
+)
+def test_agent_system_gepa_reflector_resolves_mutation_strategies(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    candidate_count: int | None,
+    mutation_strategies: list[str] | None,
+    expected_strategies: list[str],
+) -> None:
+    _patch_reflector_llm(
+        monkeypatch,
+        "# Candidate\n\n"
+        "- When changing behavior, run a focused test and validate the result before finalizing.",
+    )
+    dataset = _history_round_dataset_artifact(
+        tmp_path,
+        round_number=1,
+        precision=0.5,
+        recall=0.5,
+        f1=0.5,
+        record={
+            "event_id": "evt_gepa_defaults",
+            "task_id": "task_gepa_defaults",
+            "session_id": "session_gepa_defaults",
+            "status": "COMPLETED",
+            "reward": 0.5,
+            "traces": [
+                {
+                    "prompt_messages": [{"role": "user", "content": "Fix the failure."}],
+                    "response_messages": [
+                        {"role": "assistant", "content": "Ran a focused check."}
+                    ],
+                }
+            ],
+        },
+    )
+    config: dict[str, Any] = {
+        "reflector_llm": {
+            "model": "reflector-model",
+            "base_url": "http://reflector.test/v1",
+            "api_key": "test-key",
+        }
+    }
+    if candidate_count is not None:
+        config["candidate_count"] = candidate_count
+    if mutation_strategies is not None:
+        config["mutation_strategies"] = mutation_strategies
+
+    artifacts = run_method(
+        _job(
+            "agent_system_gepa_reflector",
+            tmp_path,
+            input_artifacts=[dataset],
+            config=config,
+        ),
+        artifact_root=tmp_path / "artifacts",
+    )
+
+    candidates = [
+        artifact for artifact in artifacts if artifact.type == ArtifactType.AGENT_SYSTEM
+    ]
+    assert [artifact.manifest["candidate_strategy"] for artifact in candidates] == (
+        expected_strategies
+    )
+    assert all(
+        artifact.manifest["candidate_count"] == len(expected_strategies)
+        for artifact in candidates
+    )
+
+
 def test_agent_system_gepa_reflector_generates_mutation_pool_from_verifier_feedback(
     tmp_path,
     monkeypatch,
@@ -2798,7 +2990,8 @@ def test_agent_system_gepa_reflector_generates_mutation_pool_from_verifier_feedb
     assert agent_system_artifacts[0].manifest["method"] == "agent_system_gepa_reflector"
     assert agent_system_artifacts[0].manifest["candidate_count"] == 2
     assert agent_system_artifacts[0].lineage["method"] == "agent_system_gepa_reflector"
-    assert agent_system_artifacts[0].promoted is False
+    assert all(artifact.promoted is False for artifact in agent_system_artifacts)
+    assert report_artifact.promoted is False
     for artifact in agent_system_artifacts:
         support = artifact.manifest["promotion_support"]
         assert support["trajectory_findings"]
@@ -2825,6 +3018,7 @@ def test_agent_system_gepa_reflector_generates_mutation_pool_from_verifier_feedb
     report = json.loads(Path(report_artifact.uri.removeprefix("file://")).read_text())
     assert report["method"] == "agent_system_gepa_reflector"
     assert report["candidate_count"] == 2
+    assert "selected_candidate" not in report
     assert [candidate["strategy"] for candidate in report["candidates"]] == [
         "preservation_gate",
         "xss_corpus",

@@ -28,10 +28,13 @@ capabilities, and is not a separate product surface.
 5. [Evolution API And Method Integration](evolution-api-and-method-integration.md)
    - Core artifact contracts and how new evolution methods plug into the
      method registry.
-6. [OpenEvo Core Evolution Backend](evolution-backend.md)
+6. [Protected Evolution Behavior](protected-behavior.md)
+   - A1 regression tests for validated methods and the proven stage boundaries
+     preserved during productization.
+7. [OpenEvo Core Evolution Backend](evolution-backend.md)
    - Events, datasets, jobs, workers, artifact registry, context resolver, and
      storage layout.
-7. [Evolution Runtime Context](evolution-runtime-context.md)
+8. [Evolution Runtime Context](evolution-runtime-context.md)
    - How memory, skill bundles, agent-system text, and adapters are resolved and
      staged into runtime sessions.
 

@@ -344,6 +344,102 @@ def test_summarize_transition_classifies_pass_fail_changes():
     assert summarize_transition(0.0, 0.0) == "fail_to_fail"
 
 
+@pytest.mark.parametrize(
+    ("selector", "objective_key"),
+    [
+        (per_task_module._select_best_candidate_result, "reward"),
+        (per_task_module._select_best_group_candidate_result, "score"),
+    ],
+)
+@pytest.mark.parametrize(
+    ("candidate_specs", "expected_artifact_id"),
+    [
+        ([("none", None, 99, 0), ("negative", -1.0, 0, 99)], "negative"),
+        ([("newer-low", 0.0, 99, 0), ("older-high", 1.0, 0, 99)], "older-high"),
+        ([("older", 1.0, 1, 0), ("newer", 1.0, 2, 99)], "newer"),
+        ([("larger-index", 1.0, 2, 2), ("smaller-index", 1.0, 2, 1)], "smaller-index"),
+    ],
+)
+def test_gepa_candidate_selectors_apply_objective_generation_and_index_order(
+    selector,
+    objective_key: str,
+    candidate_specs: list[tuple[str, float | None, int, int]],
+    expected_artifact_id: str,
+):
+    candidates = [
+        {
+            objective_key: objective,
+            "generation": generation,
+            "artifact": EvolutionArtifact(
+                artifact_type="agent_system",
+                artifact_id=artifact_id,
+                path=Path(f"/{artifact_id}.md"),
+                task_id="task-a",
+                round=1,
+                method="agent_system_gepa_reflector",
+                source_dataset_artifact_ids=[],
+                candidate_index=candidate_index,
+            ),
+        }
+        for artifact_id, objective, generation, candidate_index in candidate_specs
+    ]
+
+    selected = selector(candidates)
+
+    assert selected["artifact"].artifact_id == expected_artifact_id
+
+
+@pytest.mark.parametrize(
+    ("selector", "message"),
+    [
+        (per_task_module._select_best_candidate_result, "no candidate trials were evaluated"),
+        (
+            per_task_module._select_best_group_candidate_result,
+            "no group candidate trials were evaluated",
+        ),
+    ],
+)
+def test_gepa_candidate_selectors_reject_empty_input(selector, message: str):
+    with pytest.raises(ValueError, match=message):
+        selector([])
+
+
+@pytest.mark.parametrize(
+    ("dataset_ids", "expected_method"),
+    [
+        ([], "agent_system_reflector"),
+        (["dataset-r0", "dataset-r1", "dataset-r2"], "agent_system_history_reflector"),
+    ],
+)
+def test_auto_agent_system_job_selects_method_and_preserves_dataset_history(
+    tmp_path: Path,
+    dataset_ids: list[str],
+    expected_method: str,
+):
+    command = per_task_module._create_agent_system_job_command(
+        task_id="task-a",
+        round_number=2,
+        input_trial_dirs=[tmp_path / "trial"],
+        previous_dataset_artifact_ids=dataset_ids,
+        agent_system_method="auto",
+        gepa_candidate_count=1,
+        db_path=tmp_path / "evolution.db",
+        artifact_root=tmp_path / "artifacts",
+        reflector_model="gpt-5.5",
+        reflector_provider="codex_cli",
+        reflector_timeout_seconds=180.0,
+        codex_home=None,
+        output_path=tmp_path / "job.json",
+    )
+
+    assert command[command.index("--method") + 1] == expected_method
+    assert [
+        command[index + 1]
+        for index, value in enumerate(command)
+        if value == "--dataset-artifact-id"
+    ] == dataset_ids
+
+
 def test_memory_benchmark_summary_counts_pass_at_1_and_pass_at_5() -> None:
     summary = build_memory_benchmark_summary(
         model="gpt-5.5",
@@ -1150,12 +1246,16 @@ def test_gepa_orchestration_feeds_candidate_feedback_into_next_generation(
     (baseline / "verifier" / "reward.txt").write_text("0.0\n", encoding="utf-8")
 
     candidate_trials = [
-        tmp_path / "run" / "candidate-1" / "filter-js-from-html__g1c1",
-        tmp_path / "run" / "candidate-2" / "filter-js-from-html__g1c2",
-        tmp_path / "run" / "candidate-3" / "filter-js-from-html__g2c1",
-        tmp_path / "run" / "candidate-4" / "filter-js-from-html__g2c2",
+        tmp_path / "run" / "candidate-1" / "filter-js-from-html__r1g1c1",
+        tmp_path / "run" / "candidate-2" / "filter-js-from-html__r1g1c2",
+        tmp_path / "run" / "candidate-3" / "filter-js-from-html__r1g2c1",
+        tmp_path / "run" / "candidate-4" / "filter-js-from-html__r1g2c2",
+        tmp_path / "run" / "candidate-5" / "filter-js-from-html__r2g1c1",
+        tmp_path / "run" / "candidate-6" / "filter-js-from-html__r2g1c2",
+        tmp_path / "run" / "candidate-7" / "filter-js-from-html__r2g2c1",
+        tmp_path / "run" / "candidate-8" / "filter-js-from-html__r2g2c2",
     ]
-    rewards = [0.0, 0.0, 0.0, 1.0]
+    rewards = [0.0, 1.0, 0.1, 0.2, 0.3, 0.4, 0.5, 1.0]
     for index, (trial, reward) in enumerate(zip(candidate_trials, rewards), start=1):
         (trial / "agent").mkdir(parents=True)
         (trial / "verifier").mkdir()
@@ -1238,7 +1338,7 @@ def test_gepa_orchestration_feeds_candidate_feedback_into_next_generation(
         baseline_root=baseline.parent,
         model="gpt-5.5",
         reflector_model="gpt-5.5",
-        rounds=1,
+        rounds=2,
         env_json={},
         verifier_env={},
         agent_system_method="agent_system_gepa_reflector",
@@ -1252,8 +1352,8 @@ def test_gepa_orchestration_feeds_candidate_feedback_into_next_generation(
     job_commands = [
         command for command in commands if "terminal-bench-agent-system-job" in command
     ]
-    assert len(job_commands) == 2
-    first_job, second_job = job_commands
+    assert len(job_commands) == 4
+    first_job, second_job, third_job, fourth_job = job_commands
     assert first_job[first_job.index("--input") + 1] == str(baseline)
     assert "--dataset-artifact-id" not in first_job
 
@@ -1268,21 +1368,61 @@ def test_gepa_orchestration_feeds_candidate_feedback_into_next_generation(
     ]
     assert second_dataset_ids == ["dataset-g1"]
 
-    harbor_commands = [command for command in commands if command[:2] == ["harbor", "run"]]
-    assert len(harbor_commands) == 4
-    assert harbor_commands[0][harbor_commands[0].index("--job-name") + 1].endswith("-g1-c1")
-    assert harbor_commands[1][harbor_commands[1].index("--job-name") + 1].endswith("-g1-c2")
-    assert harbor_commands[2][harbor_commands[2].index("--job-name") + 1].endswith("-g2-c1")
-    assert harbor_commands[3][harbor_commands[3].index("--job-name") + 1].endswith("-g2-c2")
+    third_inputs = [
+        third_job[index + 1] for index, part in enumerate(third_job) if part == "--input"
+    ]
+    assert third_inputs == [str(candidate_trials[1])]
+    third_dataset_ids = [
+        third_job[index + 1]
+        for index, part in enumerate(third_job)
+        if part == "--dataset-artifact-id"
+    ]
+    assert third_dataset_ids == ["dataset-g1", "dataset-g2"]
 
-    round_summary = summary["tasks"][0]["rounds"][0]
-    assert round_summary["reward"] == 1.0
-    assert round_summary["transition"] == "fail_to_pass"
-    assert round_summary["artifact"]["artifact_id"] == "art-agent-g2-c2"
-    assert round_summary["gepa_generations"] == 2
-    assert round_summary["dataset_artifact_ids"] == ["dataset-g1", "dataset-g2"]
-    assert [trial["reward"] for trial in round_summary["candidate_trials"]] == rewards
-    assert [trial["generation"] for trial in round_summary["candidate_trials"]] == [1, 1, 2, 2]
+    fourth_inputs = [
+        fourth_job[index + 1]
+        for index, part in enumerate(fourth_job)
+        if part == "--input"
+    ]
+    assert fourth_inputs == [str(candidate_trials[4]), str(candidate_trials[5])]
+    fourth_dataset_ids = [
+        fourth_job[index + 1]
+        for index, part in enumerate(fourth_job)
+        if part == "--dataset-artifact-id"
+    ]
+    assert fourth_dataset_ids == ["dataset-g1", "dataset-g2", "dataset-g3"]
+
+    harbor_commands = [command for command in commands if command[:2] == ["harbor", "run"]]
+    assert len(harbor_commands) == 8
+    assert [
+        command[command.index("--job-name") + 1].rsplit("-r", maxsplit=1)[1]
+        for command in harbor_commands
+    ] == [
+        "1-g1-c1",
+        "1-g1-c2",
+        "1-g2-c1",
+        "1-g2-c2",
+        "2-g1-c1",
+        "2-g1-c2",
+        "2-g2-c1",
+        "2-g2-c2",
+    ]
+
+    first_round, second_round = summary["tasks"][0]["rounds"]
+    assert first_round["reward"] == 1.0
+    assert first_round["transition"] == "fail_to_pass"
+    assert first_round["artifact"]["artifact_id"] == "art-agent-g1-c2"
+    assert first_round["gepa_generations"] == 2
+    assert first_round["dataset_artifact_ids"] == ["dataset-g1", "dataset-g2"]
+    assert [trial["reward"] for trial in first_round["candidate_trials"]] == rewards[:4]
+    assert [trial["generation"] for trial in first_round["candidate_trials"]] == [1, 1, 2, 2]
+
+    assert second_round["input_trial"] == str(candidate_trials[1])
+    assert second_round["reward"] == 1.0
+    assert second_round["transition"] == "pass_to_pass"
+    assert second_round["artifact"]["artifact_id"] == "art-agent-g4-c2"
+    assert second_round["dataset_artifact_ids"] == ["dataset-g3", "dataset-g4"]
+    assert [trial["reward"] for trial in second_round["candidate_trials"]] == rewards[4:]
 
 
 def test_group_evolution_evaluates_candidate_pool_across_tasks_and_selects_macro_mean(
@@ -1461,7 +1601,7 @@ def test_group_evolution_evaluates_candidate_pool_across_tasks_and_selects_macro
     ]
 
 
-def test_group_evolution_feeds_selected_group_trials_into_next_round(
+def test_group_evolution_preserves_generation_feedback_and_selected_round_transition(
     tmp_path: Path,
 ):
     task_ids = ["task-a", "task-b"]
@@ -1484,19 +1624,37 @@ def test_group_evolution_feeds_selected_group_trials_into_next_round(
         (baseline / "verifier" / "reward.txt").write_text("0.0\n", encoding="utf-8")
 
     candidate_trials = [
-        tmp_path / "run" / "candidate-r1-c1" / "task-a__r1c1",
-        tmp_path / "run" / "candidate-r1-c1" / "task-b__r1c1",
-        tmp_path / "run" / "candidate-r1-c2" / "task-a__r1c2",
-        tmp_path / "run" / "candidate-r1-c2" / "task-b__r1c2",
-        tmp_path / "run" / "candidate-r2-c1" / "task-a__r2c1",
-        tmp_path / "run" / "candidate-r2-c1" / "task-b__r2c1",
-        tmp_path / "run" / "candidate-r2-c2" / "task-a__r2c2",
-        tmp_path / "run" / "candidate-r2-c2" / "task-b__r2c2",
+        tmp_path
+        / "run"
+        / f"candidate-r{round_number}-g{generation}-c{candidate}"
+        / f"{task_id}__r{round_number}g{generation}c{candidate}"
+        for round_number in (1, 2)
+        for generation in (1, 2)
+        for candidate in (1, 2)
+        for task_id in task_ids
+    ]
+    rewards = [
+        0.0,
+        0.0,
+        1.0,
+        1.0,
+        0.2,
+        0.2,
+        0.3,
+        0.3,
+        0.4,
+        0.4,
+        0.5,
+        0.5,
+        0.6,
+        0.6,
+        1.0,
+        1.0,
     ]
     for trial, task_id, reward in zip(
         candidate_trials,
-        ["task-a", "task-b", "task-a", "task-b", "task-a", "task-b", "task-a", "task-b"],
-        [0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0],
+        task_ids * 8,
+        rewards,
     ):
         (trial / "agent").mkdir(parents=True)
         (trial / "verifier").mkdir()
@@ -1579,6 +1737,7 @@ def test_group_evolution_feeds_selected_group_trials_into_next_round(
         verifier_env={},
         agent_system_method="agent_system_gepa_reflector",
         gepa_candidate_count=2,
+        gepa_generations=2,
         command_runner=fake_run_command,
         worker_runner=fake_worker_runner,
         evolved_trial_locator=lambda task_id, round_number, run_root: next(trial_iter),
@@ -1587,21 +1746,51 @@ def test_group_evolution_feeds_selected_group_trials_into_next_round(
     job_commands = [
         command for command in commands if "terminal-bench-agent-system-job" in command
     ]
-    assert len(job_commands) == 2
+    assert len(job_commands) == 4
+    first_job, second_job, third_job, fourth_job = job_commands
+    assert "--dataset-artifact-id" not in first_job
     second_inputs = [
-        job_commands[1][index + 1]
-        for index, part in enumerate(job_commands[1])
+        second_job[index + 1]
+        for index, part in enumerate(second_job)
         if part == "--input"
     ]
-    assert second_inputs == [str(candidate_trials[2]), str(candidate_trials[3])]
+    assert second_inputs == [str(path) for path in candidate_trials[:4]]
     second_dataset_ids = [
-        job_commands[1][index + 1]
-        for index, part in enumerate(job_commands[1])
+        second_job[index + 1]
+        for index, part in enumerate(second_job)
         if part == "--dataset-artifact-id"
     ]
     assert second_dataset_ids == ["dataset-r1"]
-    assert summary["groups"][0]["rounds"][0]["dataset_artifact_ids"] == ["dataset-r1"]
-    assert summary["groups"][0]["rounds"][1]["dataset_artifact_ids"] == ["dataset-r2"]
+
+    third_inputs = [
+        third_job[index + 1] for index, part in enumerate(third_job) if part == "--input"
+    ]
+    assert third_inputs == [str(candidate_trials[2]), str(candidate_trials[3])]
+    third_dataset_ids = [
+        third_job[index + 1]
+        for index, part in enumerate(third_job)
+        if part == "--dataset-artifact-id"
+    ]
+    assert third_dataset_ids == ["dataset-r1", "dataset-r2"]
+
+    fourth_inputs = [
+        fourth_job[index + 1]
+        for index, part in enumerate(fourth_job)
+        if part == "--input"
+    ]
+    assert fourth_inputs == [str(path) for path in candidate_trials[8:12]]
+    fourth_dataset_ids = [
+        fourth_job[index + 1]
+        for index, part in enumerate(fourth_job)
+        if part == "--dataset-artifact-id"
+    ]
+    assert fourth_dataset_ids == ["dataset-r1", "dataset-r2", "dataset-r3"]
+
+    first_round, second_round = summary["groups"][0]["rounds"]
+    assert first_round["artifact"]["artifact_id"] == "art-agent-r1-c2"
+    assert first_round["dataset_artifact_ids"] == ["dataset-r1", "dataset-r2"]
+    assert second_round["artifact"]["artifact_id"] == "art-agent-r4-c2"
+    assert second_round["dataset_artifact_ids"] == ["dataset-r3", "dataset-r4"]
 
 
 def test_group_evolution_uses_candidate_task_specific_jobs_dirs_for_default_locator(
