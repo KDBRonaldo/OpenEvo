@@ -30,12 +30,14 @@ def test_plan_uses_focused_branch_and_pr_workflow() -> None:
 
 def test_plan_covers_productization_workstreams_and_release_gates() -> None:
     text = PLAN.read_text(encoding="utf-8")
+    assert re.findall(r"^## ([A-E])\.", text, flags=re.MULTILINE) == [
+        "A",
+        "B",
+        "C",
+        "D",
+        "E",
+    ]
     required_markers = (
-        "A. Algorithm Protection And Benchmark Boundary",
-        "B. Core Backend Convergence",
-        "C. Desktop Product Maturity",
-        "D. Repository, Docs, And Release Engineering",
-        "E. Release Candidate Validation",
         "textual-memory 12/21 performance gate",
         "trajectory-to-skill 14/25 performance gate",
         "agent-system 17/25 performance gate",
@@ -306,6 +308,7 @@ def test_release_smoke_runs_for_productization_inputs() -> None:
     missing = [path_filter for path_filter in required_path_filters if path_filter not in text]
 
     assert missing == []
+    assert "tests/ci/test_productization_spec.py" in text
 
 
 def test_internal_process_history_is_not_under_public_superpowers_docs() -> None:

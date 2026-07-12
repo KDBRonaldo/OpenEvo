@@ -43,8 +43,8 @@ records to prove the work.
 
 | Workstream | Outcome | Depends on | Complete when |
 | --- | --- | --- | --- |
-| A. Algorithm protection and benchmark boundary | Protected methods are frozen and Terminal Bench is standalone automation. | This spec | Source/behavior guards pass, benchmark code is outside Core/Desktop, and three independent gates can run through Core. |
-| B. Core Backend convergence | Remote Core owns real setup, services, runs, artifacts, and injection. | A contract freeze; can overlap with benchmark migration | Clean-install and integration tests pass for both execution modes and promoted artifact reuse. |
+| A. Protected and pluggable evolution | Protected methods are frozen, one target/method registry owns evolution planning, and Terminal Bench is standalone automation. | This spec | Behavior guards pass, existing methods use the plugin contracts unchanged, benchmark code is outside Core/Desktop, and three independent gates can run through Core. |
+| B. Core Backend convergence | Remote Core owns real setup, services, runs, artifacts, and injection. | A1/A2 contracts; can overlap with benchmark migration | Clean-install and integration tests pass for both execution modes and artifact reuse. |
 | C. Desktop product maturity | A scientist can complete the workflow without CLI use. | Stable Core API slices from B | Packaged-app E2E covers setup, run, monitoring, artifacts, recovery, and diagnostics. |
 | D. Repository, docs, and release engineering | Repository and release artifacts present a coherent External Beta. | A-C interfaces mostly stable | Active identity/docs checks pass and release workflow builds mutually consistent Core/DMG artifacts. |
 | E. Release candidate validation | The exact release commit satisfies every canonical gate. | A-D | Three performance gates, two science E2Es, security/privacy, clean install, DMG smoke, and GitHub draft-release validation pass. |
@@ -52,46 +52,73 @@ records to prove the work.
 Workstreams are sequencing and ownership tools, not product versions. B, C, and
 D may proceed in parallel where their contracts are already stable.
 
-## A. Algorithm Protection And Benchmark Boundary
+## A. Protected And Pluggable Evolution
 
 ### A1. Freeze Protected Behavior And Architecture
 
-Create a small, reviewable baseline for:
-
-- `text_memory_expel_reflector`;
-- `skill_bundle_reflector`;
-- `agent_system_gepa_reflector`;
-- their prompts, defaults, filters, candidate/selection helpers, and artifact
-  construction paths.
-- gateway -> rollout/runtime -> capture/trajectory -> dataset/job/worker ->
-  artifact/context resolve -> runtime injection ownership and contract probes.
-
-The baseline may be a normalized source manifest plus focused behavioral
-fixtures. It must detect semantic drift without failing on mechanical file moves
-or import rewrites. Compare it with the best available pre-productization commit
-or archived source, not only the already-reorganized current branch.
+Create focused behavior fixtures for `text_memory_expel_reflector`,
+`skill_bundle_reflector`, `agent_system_gepa_reflector`, and the protected
+gateway -> rollout/runtime -> capture/trajectory -> dataset/job/worker ->
+artifact/context resolve -> runtime injection stages. Use historical source only
+to resolve ambiguity; do not build a second specification out of source hashes.
 
 Acceptance:
 
-- each protected method has an explicit source and dependency inventory;
-- GEPA candidate evaluation, best-result selection, and promotion helpers that
+- GEPA candidate evaluation, best-result selection, and transition helpers that
   currently live in Terminal Bench files are classified as protected algorithm
   code;
 - method IDs and artifact types are unchanged;
-- fixtures exercise representative output shape and selection semantics;
-- a deliberate prompt/default/filter/method-body change fails the guard;
-- path/import-only relocation can pass after review.
+- fixtures exercise observable payload/artifact construction and selection;
+- deliberate prompt/default/filter/artifact/selection changes fail focused tests;
+- path/import-only relocation can pass after review;
 - architecture probes fail if productization bypasses or replaces a protected
   data-flow stage.
 
-### A2. Move Terminal Bench Automation Out Of Core
+### A2. Build The Pluggable Evolution Framework
 
-Create `benchmarks/terminal_bench/` as standalone automation. First separate the
-protected GEPA candidate evaluation/best-result selection/promotion helpers from
-benchmark transport without changing their normalized behavior, and place them
-behind an algorithm-owned Core boundary. Then mechanically move Terminal Bench
-task acquisition, Harbor execution, verifier adapter, materializer, reporting,
-task configuration, and benchmark commands out of `src/openevo/`.
+Implement `EvolutionTarget`, `EvolutionMethod`, and immutable per-run
+`EvolutionPlan` contracts plus one authoritative registry. Built-ins load
+explicitly and research plugins fail closed. Define the detailed execution,
+result, plan snapshot, registry identity, config-schema, and target-handler
+contracts in `docs/architecture/` before migrating code.
+
+Execute this migration in the following order:
+
+| Step | Requirements | Deliverable |
+| --- | --- | --- |
+| `A2.1` | `PLUG-1`, `PLUG-2`, `PLUG-3`, `PLUG-4`, `PLUG-5`, `PLUG-6` | Specify and test registry/identity, protocol, ledger, atomic publication, schema/security, and offline migration contracts. |
+| `A2.2` | `PLUG-2`, `PLUG-7` | Freeze exact GEPA generation/round, objective, history, and tie-break fixtures, then wrap existing functions in descriptors. |
+| `A2.3` | `PLUG-3`, `PLUG-4`, `PLUG-7` | Adapt the complete GEPA generator/evaluator/selection state machine to the new multi-stage boundary before any dispatch cutover. |
+| `A2.4` | `PLUG-2`, `PLUG-3`, `PLUG-4` | Implement plan/ledger persistence, attempts/fencing, verified worker identity binding, staged publication, and recovery. |
+| `A2.5` | `PLUG-1`, `PLUG-2`, `PLUG-5` | Implement registry-driven capabilities/dispatch plus generic project config and target handlers; keep cutover disabled. |
+| `A2.6` | `PLUG-7` | Mechanically relocate method bodies/helpers with all equivalence fixtures green. |
+| `A2.7` | `PLUG-6` | Save control state; isolate, drain-or-stop, capture restart journal/fence under lock, verify post-fence checkpoint, migrate, then hand off. |
+| `A2.8` | `PLUG-6`, `PLUG-7` | Validate new-only Core/peers in maintenance, switch supervisor/tunnel then admit; on failure restore old target under lock before restart/admit. |
+
+Acceptance:
+
+- `docs/architecture/` fixes legal ledger transitions, the worker trust/identity
+  model, Core-mediated payloads, single-writer recovery/writer quiescence,
+  schema/renderer/CSP limits, fail-closed install-manifest/API handshake,
+  state-lock handoff versus admission, consistent backup/restore, and
+  state-by-state migration before code cutover;
+- fresh-process and fault-injection tests cover create/claim/complete identity,
+  ready/blocked recovery, fencing, duplicate completion, every publication,
+  backup/restore and migration crash boundary, and no partially visible results;
+- test method/target plugins require no central switches, unsupported contracts
+  fail closed, and method inference can run only through a Core harness service;
+- GEPA fixtures preserve all `PLUG-7` generation, round, history, objective,
+  `None`, tie-break, and `auto` behavior before and after relocation;
+- migration tests cover each legacy record state, immutable rebuild linkage,
+  protocol rejection/recovery, rollback, and removal of runtime legacy paths.
+
+### A3. Move Terminal Bench Automation Out Of Core
+
+Create `benchmarks/terminal_bench/` as standalone automation. A2 has already
+placed protected GEPA evaluation, selection, and transition behind its
+algorithm-owned boundary. Mechanically move only Terminal Bench task acquisition,
+Harbor execution, verifier adapter, materializer, reporting, task configuration,
+and benchmark commands out of `src/openevo/`.
 
 The automation calls public Core contracts for datasets, jobs, workers,
 artifacts, context resolution, injection, and harness runs. Unit tests may call
@@ -103,11 +130,11 @@ Acceptance:
   scorer, task list, or benchmark command;
 - old Core benchmark imports are removed rather than wrapped;
 - migrated automation produces equivalent task inputs and result summaries;
-- benchmark automation calls the protected Core selection/promotion contract
+- benchmark automation calls the protected Core selection/transition contract
   and contains no duplicate or rewritten GEPA selection policy;
 - algorithm-protection tests remain green.
 
-### A3. Make Performance Runs Reproducible
+### A4. Make Performance Runs Reproducible
 
 Freeze the task lists and run configuration for the three independent gates.
 The benchmark summary needs only the information required to audit pass@1:
@@ -115,10 +142,10 @@ task ID, selected artifact, attempt outcome, infrastructure rerun status, and
 aggregate rescue count.
 
 For agent-system GEPA, recover the candidate-generation, candidate-evaluation,
-best-result selection, and promotion rule from the pre-productization
-implementation and 17/25 run records. These are protected method semantics, not
-product-layer policy. Preserve them exactly; Core, Desktop, and benchmark
-automation consume the method-selected promoted artifact without reranking it.
+best-result selection, and transition rule from the pre-productization
+implementation and 17/25 run records. These are protected algorithm semantics,
+not product-layer policy. Preserve them exactly; Core, Desktop, and benchmark
+automation consume the algorithm-selected output without reranking it.
 
 Acceptance:
 
@@ -200,8 +227,8 @@ Acceptance:
   task execution;
 - all three artifact families complete produce, render, promote, stage, and
   follow-up reuse in each of the two execution modes;
-- GEPA product promotion uses the protected method's own best-result selection;
-  Core and Desktop do not substitute another candidate;
+- GEPA reuse consumes the protected algorithm-selected output; Core and Desktop
+  do not substitute another candidate;
 - selected artifact IDs and staging results are inspectable through Core.
 
 ### B4. Harden API, Security, And Diagnostics
@@ -360,15 +387,17 @@ independently review:
 
 The first implementation batch after this plan merges is:
 
-1. Complete A1: inventory and freeze the three protected method paths against
-   the best available pre-productization source.
-2. Complete A2: move Terminal Bench automation out of Core without wrappers or
+1. Complete A1 with the smallest behavior and architecture guards needed for
+   safe structural work.
+2. Complete A2 contracts and mechanically migrate existing methods into the
+   single registry without algorithm changes.
+3. Complete A3: move Terminal Bench automation out of Core without wrappers or
    method changes.
-3. In parallel, inventory B1 direct sidecar execution and scaffold Core state;
+4. In parallel, inventory B1 direct sidecar execution and scaffold Core state;
    turn each concrete gap into a focused child issue.
-4. Implement the smallest real Core run lifecycle slice used by Desktop, then
+5. Implement the smallest real Core run lifecycle slice used by Desktop, then
    connect one Desktop project/run flow to it.
-5. Expand Core and Desktop vertically until one Codex subscription science run
+6. Expand Core and Desktop vertically until one Codex subscription science run
    evolves and reuses one artifact end to end.
 
 This vertical path is the first product milestone. Broader UI polish,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 
@@ -20,10 +21,41 @@ RETIRED_MARKERS = (
     "science-task.schema.json",
     "science-workflow-canary-report.schema.json",
 )
+PLUG_REQUIREMENTS = tuple(f"PLUG-{number}" for number in range(1, 8))
+A2_STEPS = tuple(f"A2.{number}" for number in range(1, 9))
 
 
 def _text(path: Path) -> str:
     return path.read_text(encoding="utf-8")
+
+
+def _bullet_ids(text: str, prefix: str) -> tuple[str, ...]:
+    return tuple(
+        re.findall(rf"^- `({re.escape(prefix)}-\d+)\b", text, flags=re.MULTILINE)
+    )
+
+
+def _plug_requirement_bodies(text: str) -> dict[str, str]:
+    pattern = re.compile(
+        r"^- `(PLUG-\d+) [^`]+`: (?P<body>.*?)(?=^- `PLUG-\d+ |\n\n)",
+        flags=re.MULTILINE | re.DOTALL,
+    )
+    return {
+        match.group(1): " ".join(match.group("body").split())
+        for match in pattern.finditer(text)
+    }
+
+
+def _a2_rows(text: str) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    rows = re.findall(
+        r"^\| `(A2\.\d+)` \| (?P<requirements>[^|]+) \| [^|]+ \|$",
+        text,
+        flags=re.MULTILINE,
+    )
+    return tuple(
+        (step, tuple(re.findall(r"PLUG-\d+", requirements)))
+        for step, requirements in rows
+    )
 
 
 def test_productization_has_one_concise_canonical_spec() -> None:
@@ -64,9 +96,32 @@ def test_spec_preserves_validated_methods_and_gates() -> None:
         assert method_id in spec
         assert threshold in spec
 
-    assert "protected algorithm logic" in spec
-    assert "best-result selection" in spec
-    assert "preserve that behavior exactly" in spec
+
+def test_spec_requires_pluggable_targets_methods_and_registry() -> None:
+    spec = _text(SPEC)
+    assert _bullet_ids(spec, "PLUG") == PLUG_REQUIREMENTS
+    requirement_bodies = _plug_requirement_bodies(spec)
+    assert tuple(requirement_bodies) == PLUG_REQUIREMENTS
+
+    plan = _text(PLAN)
+    rows = _a2_rows(plan)
+    assert tuple(step for step, _ in rows) == A2_STEPS
+    mapped_requirements = {requirement for _, requirements in rows for requirement in requirements}
+    assert mapped_requirements == set(PLUG_REQUIREMENTS)
+    assert dict(rows) == {
+        "A2.1": ("PLUG-1", "PLUG-2", "PLUG-3", "PLUG-4", "PLUG-5", "PLUG-6"),
+        "A2.2": ("PLUG-2", "PLUG-7"),
+        "A2.3": ("PLUG-3", "PLUG-4", "PLUG-7"),
+        "A2.4": ("PLUG-2", "PLUG-3", "PLUG-4"),
+        "A2.5": ("PLUG-1", "PLUG-2", "PLUG-5"),
+        "A2.6": ("PLUG-7",),
+        "A2.7": ("PLUG-6",),
+        "A2.8": ("PLUG-6", "PLUG-7"),
+    }
+
+    ordered_sections = ("### A1.", "### A2.", "### A3.", "## B.", "## C.")
+    positions = [plan.index(section) for section in ordered_sections]
+    assert positions == sorted(positions)
 
 
 def test_spec_covers_modes_bootstrap_and_artifact_matrix() -> None:
@@ -109,15 +164,14 @@ def test_spec_covers_release_security_and_privacy_boundaries() -> None:
 
 def test_plan_has_five_executable_workstreams_without_old_governance_model() -> None:
     plan = _text(PLAN)
-    for heading in (
-        "## A. Algorithm Protection And Benchmark Boundary",
-        "## B. Core Backend Convergence",
-        "## C. Desktop Product Maturity",
-        "## D. Repository, Docs, And Release Engineering",
-        "## E. Release Candidate Validation",
-        "## Immediate Execution Order",
-    ):
-        assert heading in plan
+    assert tuple(re.findall(r"^## ([A-E])\.", plan, flags=re.MULTILINE)) == (
+        "A",
+        "B",
+        "C",
+        "D",
+        "E",
+    )
+    assert "## Immediate Execution Order" in plan
 
     for marker in (
         "gpt-5.6-sol",

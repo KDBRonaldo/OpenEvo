@@ -33,6 +33,10 @@ command line or benchmark workflow.
 - Existing evolution method logic, prompts, defaults, filtering, candidate
   policy, artifact semantics, and method IDs must not change during
   productization.
+- Evolution carriers and evolution methods are separate contracts. One
+  authoritative Core registry drives planning, worker dispatch, capabilities,
+  and Desktop configuration; those consumers must not maintain method-specific
+  branches or duplicate registries.
 - Preserve the proven Polar-derived architecture: gateway, rollout, runtime,
   capture/trajectory, evolution backend, worker, artifact, context resolution,
   and runtime injection keep their responsibilities and data flow. Public
@@ -91,6 +95,8 @@ After it is installed and started, Core owns:
 - Docker/Apptainer runtime sessions and workspaces;
 - harness invocation and capture-mode enforcement;
 - completion, transcript, and trajectory construction;
+- evolution target/method registration, per-run plan validation, and method
+  capability discovery;
 - datasets, evolution jobs, workers, artifacts, lineage, compatibility,
   promotion, and context resolution;
 - staging promoted memory, skills, and agent-system artifacts before a later
@@ -111,7 +117,8 @@ download of verified Core bytes, installation, process start, and tunnel
 establishment. Once Core is healthy, Core owns doctor/repair, upgrades, child
 services, runs, and artifacts. The sidecar then forwards typed requests; it must
 not directly run science jobs or manage Core child services with ad hoc remote
-commands.
+commands. The only exception is the fail-closed, one-time `PLUG-6` offline
+migration from an explicitly allowlisted API-less pre-release Core.
 
 ## Execution And Capture Modes
 
@@ -186,19 +193,178 @@ produced by the method, promotion state, and payload integrity. Core and
 Desktop consume one artifact contract; Desktop must not hide drift through a
 separate adapter.
 
-Candidate generation, evaluation, best-result selection, and promotion belong
-to the evolution method. In particular, the existing
-`agent_system_gepa_reflector` behavior that selects its best result for
-promotion is protected algorithm logic and is allowed. Productization must
-preserve that behavior exactly.
+Candidate generation, evaluation, and best-result selection belong to the
+evolution algorithm. This protected algorithm logic includes GEPA orchestration
+currently co-located with Terminal Bench. Product, benchmark, and Desktop
+layers may record or reuse the algorithm-selected output but may not rerank it
+or replace its decision. Generic artifact lifecycle state is a Core concern and
+must not be confused with or used to redefine algorithm selection.
 
-Core records and stages the method-selected promoted artifact; Desktop renders
-the candidates and method-owned selection evidence; benchmark automation scores
-the promoted output. None of those layers may replace the method's decision,
-rerank candidates, or promote a different result. The agent-system release gate
-must freeze the exact candidate-generation, evaluation, selection, and
-promotion path that produced the historical 17/25 result. If that path cannot
-be recovered, the gate remains blocked rather than guessing a replacement.
+## Pluggable Evolution Targets And Methods
+
+OpenEvo separates what is evolved from how it is evolved:
+
+| Contract | Responsibility |
+| --- | --- |
+| `EvolutionTarget` | A carrier such as text memory, skill bundle, agent system, or a future parameter carrier. Its handler defines artifact validation, context projection, constrained runtime consumption, and presentation metadata. |
+| `EvolutionMethod` | One algorithm for one target. It declares typed config, requirements, result roles, provenance, and a single-step or multi-stage execution protocol. |
+| `EvolutionPlan` | The immutable initial contract for one run: enabled targets, chosen methods or schedules, normalized config, dependencies, and implementation identity. Runtime progress belongs to an append-only execution ledger. |
+
+The following stable requirement IDs are the acceptance anchors for this
+framework. Tests and the implementation plan reference the IDs instead of exact
+document wording.
+
+- `PLUG-1 Plan and selection`: each target is independently enabled and selects
+  one compatible method or registry-owned schedule. Methods declare capture,
+  runtime, and harness requirements and use Core-provided harness execution;
+  method code does not open a model endpoint directly. Unknown targets, methods,
+  config fields, or incompatible modes fail validation.
+- `PLUG-2 Registry and identity`: one startup-frozen Core registry is the only
+  source for planning, dispatch, capabilities, lineage, and defaults. Every
+  method, target handler, schedule/transition rule, runner, and result contract
+  has an identity built from its canonical descriptor, immutable distribution
+  digest and entry point, and contract version. `registry_snapshot_digest` hashes
+  only the plan-reachable identity closure, so unrelated plugins do not invalidate
+  a job. Release workers are Core-supervised processes launched from a verified
+  install, so Core assigns their executable identities; explicit research
+  workers authenticate registration and bind an immutable plugin digest. Claim
+  returns the required identity and fencing token, and complete binds the
+  Core-assigned identity to that attempt. Host compromise is outside this trust
+  model. Reconciliation runs on Core startup, job creation, worker register/
+  deregister/heartbeat, and periodic lease sweep: no live exact match yields
+  `blocked:no_compatible_worker`, while a later match returns it to `ready`.
+  Worker-presence changes do not alter a running attempt before its own lease is
+  expired or fenced.
+- `PLUG-3 Result integrity`: stage-output relations distinguish candidates,
+  algorithm-selected primary outputs, auxiliary reports, and selection evidence;
+  a terminal selection record may reference a prior candidate as primary. This
+  algorithm role is orthogonal to Core `context_eligible`/promotion lifecycle.
+  Neither setting context eligibility nor changing lifecycle state rewrites the
+  algorithm selection, and release workflows reuse only an algorithm-selected
+  primary. Core never infers a winner from generic scores. Workers upload only
+  through Core-managed attempt staging and cannot write the final artifact root.
+  File payloads are server-verified there against an immutable
+  manifest/digest, and atomically finalized before publication. One database
+  transaction then commits stage/result relations, artifacts, lineage,
+  eligibility, and any successor transition. External Beta permits one active
+  Core writer per state root, enforced by an exclusive process/state lock.
+  Resolvers see committed rows only. Before recovery, the supervisor terminates
+  and confirms old local writer process groups and fences remote attempts;
+  recovery then removes safely unreferenced payloads and reconciles prepared work.
+- `PLUG-4 Multi-stage recovery`: the plan expands static steps and snapshots each
+  versioned data-dependent transition rule. An append-only ledger records legal
+  stage transitions among planned, ready, blocked, running, prepared, committed,
+  failed, and cancelled states. Every stage/generation has a stable ID,
+  dependencies and input/config/implementation digests; every execution has a
+  distinct attempt ID, lease, and fencing token. A transition decision and its
+  unique successor stage commit with the completed stage. Repeated completion
+  with the same identity and digests is idempotent; conflicting or late-fenced
+  completion is rejected. Retry reuses a committed stage only when all digests
+  match. Failed evaluation/transition exposes no partial primary.
+- `PLUG-5 Safe extensibility`: target handlers return declarative artifact,
+  context, and staging contributions; Core enforces URI-scheme and MIME
+  allowlists, realpath containment, symlink/TOCTOU defenses, archive file/count/
+  size limits, payload integrity, reserved `OPENEVO_*` environment ownership,
+  and deterministic contribution conflicts. Capability config uses a bounded
+  JSON Schema 2020-12 subset: scalar/object/array types, title/description,
+  properties, required, `additionalProperties: false`, enum/const/default,
+  scalar and collection bounds, and nullable `anyOf` only. References, recursion,
+  regex/patterns, arbitrary combinators, and executable formats are forbidden;
+  secrets are
+  opaque Core-owned references and never defaults. Desktop accepts only
+  versioned `markdown`, `file_bundle`, `structured_summary`, or `adapter`
+  renderer kinds, treats all content as untrusted, sanitizes Markdown/links, and
+  executes no plugin HTML or JavaScript. Renderers never fetch remote images,
+  media, fonts, previews, or metadata; links require explicit user action, and
+  Desktop CSP permits network access only to its authenticated local/tunnel Core
+  endpoints. Unknown schema/renderer kinds fail closed. Exact depth/count/length
+  limits live in the versioned architecture contract. A target using an existing
+  renderer needs no Desktop target branch.
+- `PLUG-6 Coordinated migration`: this pre-release change is a bounded offline
+  cutover, not a runtime wrapper. A fixed Core-owned install manifest atomically
+  records checksum-verified build/protocol identity; unknown metadata fails closed
+  except for an allowlisted pre-migration fingerprint. Before isolation, the
+  upgrader records prior control config and worker inventory, then disables
+  restart and closes the tunnel. Protocol-capable Core closes admission,
+  drains/cancels, atomically captures the runnable-work restart journal and fences
+  remaining attempts while holding its lock, then stops. For an API-less
+  build, the upgrader verifies executable identity, stops Core/local-worker groups
+  without claiming drain, and rotates remote-worker access. Both paths confirm
+  health/PIDs are gone before taking the exclusive state lock; uncertainty fails
+  closed. Under that lock the migrator captures the same journal, then fences
+  API-less interrupted attempts, marks them cutover-cancelled, discards staging,
+  checkpoints SQLite/WAL, and creates a checksum-verified checkpoint of the
+  database, committed artifacts, persisted config, registry, journal, and metadata.
+  This post-fence checkpoint is the rollback point; restore is verified before
+  migration maps fixed booleans plus `artifact_families`/`method_ids` into plans.
+  Completed, failed, and previously cancelled records remain audit history;
+  pending/cutover-cancelled work is rebuilt from immutable inputs/config with
+  `supersedes_job_id`, while ambiguity stays blocked with diagnostics. The
+  migrator releases or hands off the state lock while admission remains closed.
+  New Core acquires it and validates, then issues fresh worker credentials;
+  workers may register but not claim. Protocol negotiation rejects incompatible
+  peers with typed `upgrade_required`. Success points the supervisor only at the
+  verified new build, enables restart, and verifies the tunnel before admission.
+  Failure keeps restart/admission closed, stops new Core, reacquires the migration
+  lock, restores the checkpoint, and restores old-schema runnable work from that
+  journal. It points the supervisor at the old target with restart disabled,
+  issues fresh worker credentials, hands the lock to old Core, starts it, verifies
+  the tunnel, then restores restart/admission. Only the offline migrator reads old
+  formats; legacy runtime/API paths vanish.
+- `PLUG-7 Behavior preservation`: existing methods move mechanically behind
+  these contracts with stable IDs, algorithms, prompts, defaults, filters,
+  artifact semantics, and candidate policy. GEPA equivalence fixtures preserve
+  that every generation's candidate trials feed the next generation, only the
+  selected round winner feeds the next round, history datasets accumulate, and
+  `auto` resolves to the same methods. They also freeze per-task reward versus
+  group-objective selection, `None` as the lowest score, and existing generation
+  then candidate-index tie-breaking. Productization does not reinterpret any of
+  these choices.
+
+Candidate generation, evaluation, transition, and best-result selection remain
+inside algorithm-owned method execution. Candidate stage artifacts may be used
+by that execution but are not eligible for generic context selection. Core
+artifact lifecycle state records the algorithm result; it does not redefine it.
+
+Project configuration uses a generic target map rather than one Pydantic class
+or compiler branch per carrier:
+
+```yaml
+evolution:
+  targets:
+    text_memory:
+      enabled: true
+      method: text_memory_expel_reflector
+      config: {}
+    skill_bundle:
+      enabled: false
+    agent_system:
+      enabled: true
+      method: agent_system_gepa_reflector
+      config:
+        candidate_count: 2
+    parametric_memory:
+      enabled: false
+```
+
+Adding a method for an existing target requires only a method plugin, typed
+config, registration, and tests. It must not require a compiler `if/elif`, a
+new Science Project field, a gateway branch, or a Desktop method list. Adding a
+new target is intentionally broader: it requires an artifact contract, context
+and constrained runtime handler, capability metadata, and a supported renderer
+kind when exposed in Desktop. Registration with an existing renderer must be
+sufficient; central compiler, resolver, gateway, and Desktop target switches are
+forbidden.
+
+Desktop obtains target toggles, compatible method choices, defaults, config
+schemas, requirements, and support status from Core capabilities. It
+contains no method registry or algorithm logic. Release profiles load supported
+built-ins only. Explicit research plugins are trusted server code, require
+maintainer configuration, and are never installed automatically by Desktop.
+
+This framework replaces scattered dispatch and configuration, but wraps rather
+than replaces the existing worker/job/artifact boundaries and proven
+Polar-derived data flow.
 
 ## Algorithm Preservation And Performance Gate
 
@@ -214,11 +380,11 @@ release if productization regresses them:
 These are independent gates. A run enables one family only and cannot borrow
 artifacts or successes from another family.
 
-Before further structural changes, maintainers must freeze the current source
-locations and normalized contents of each canonical method, its prompts,
-defaults, filtering, candidate/selection helpers, and artifact construction.
-Moving files and changing imports are allowed only when normalized behavior is
-unchanged.
+Before structural changes, focused fixtures must freeze each canonical method's
+observable prompts, defaults, filtering, outputs, candidate/selection behavior,
+and artifact construction. Historical source resolves ambiguity but is not a
+second source-hash specification. Moving files and imports is allowed only when
+the fixtures and performance gates remain unchanged.
 
 Release-candidate benchmark rules:
 
@@ -231,7 +397,7 @@ Release-candidate benchmark rules:
   prevented scoring;
 - do not add best-of-candidate, attempt, artifact, or rerun selection beyond the
   candidate policy already frozen for that historical method gate;
-- treat method-internal candidate evaluation and best-result promotion as part
+- treat algorithm-owned candidate evaluation and best-result selection as part
   of the protected evolution algorithm, not as extra pass@k task attempts;
 - archive enough configuration, selected-artifact, injection, and result data
   to reproduce the count;
@@ -265,11 +431,11 @@ benchmark CLI commands. Desktop exposes no benchmark controls.
 
 Code location does not determine algorithm ownership. The current
 `terminal_bench_per_task.py` also contains GEPA candidate evaluation,
-best-result selection, and promotion behavior that produced the protected
-17/25 result. A1 must classify and freeze those exact helpers. During benchmark
-migration they move mechanically to an algorithm-owned Core module or existing
-method boundary, with identical behavior; only task acquisition, Harbor/
-Terminal Bench execution, verifier adaptation, and benchmark reporting move to
+best-result selection, and cross-generation/round transition behavior that
+produced the protected 17/25 result. A1 freezes that logic and A2 adapts it,
+unchanged, behind the algorithm-owned multi-stage method boundary before any
+protocol cutover. A3 then moves only task acquisition, Harbor/Terminal Bench
+execution, verifier adaptation, and benchmark reporting to
 `benchmarks/terminal_bench/`.
 
 The release performance run must exercise the real Core path through dataset,
