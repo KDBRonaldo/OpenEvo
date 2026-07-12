@@ -8,7 +8,10 @@ from fastapi.testclient import TestClient
 
 from openevo import __version__
 from openevo.backend.api import BackendHTTPError, create_backend_app
-from openevo.backend.models import BackendError
+from openevo.backend.models import (
+    BackendError,
+    MAX_EVOLUTION_PROJECT_VALIDATION_REQUEST_BYTES,
+)
 from openevo.evolution.framework import (
     CapabilityAudience,
     build_evolution_capabilities,
@@ -59,6 +62,27 @@ def _client_for_state_root(
         create_backend_app(state_root=state_root),
         raise_server_exceptions=raise_server_exceptions,
     )
+
+
+def _desktop_project_config_contract(method) -> tuple[dict, dict]:
+    schema = json.loads(canonical_json(method.config_schema))
+    default = json.loads(canonical_json(method.default_config))
+    injected = {
+        injection.field_name for injection in method.project_config_injections
+    }
+    for field_name in injected:
+        schema["properties"].pop(field_name)
+        default.pop(field_name, None)
+    required = [
+        field_name
+        for field_name in schema.get("required", [])
+        if field_name not in injected
+    ]
+    if required:
+        schema["required"] = required
+    else:
+        schema.pop("required", None)
+    return schema, default
 
 
 def _write_summary_for_artifact(state_root: Path, run_id: str, artifact_id: str) -> None:
@@ -239,12 +263,15 @@ def test_backend_capabilities_are_registry_snapshot_projection(
                     method_descriptor.id,
                 )
             )
-            assert method["config_schema_json"] == canonical_json(
-                method_descriptor.config_schema
+            expected_schema, expected_default = _desktop_project_config_contract(
+                method_descriptor
             )
-            assert method["default_config_json"] == canonical_json(
-                method_descriptor.default_config
-            )
+            assert method["config_schema_json"] == canonical_json(expected_schema)
+            assert method["default_config_json"] == canonical_json(expected_default)
+            for injection in method_descriptor.project_config_injections:
+                field_name = injection.field_name
+                assert field_name in method_descriptor.config_schema["properties"]
+                assert field_name not in expected_schema["properties"]
 
 
 def test_backend_capabilities_openapi_declares_typed_errors() -> None:
@@ -273,6 +300,220 @@ def test_backend_capabilities_fail_closed_without_verified_registry() -> None:
         "details": {},
         "logs_ref": None,
     }
+
+
+def test_backend_validates_resolver_config_against_every_concrete_method(
+    tmp_path: Path,
+) -> None:
+    registry = verified_builtin_registry(tmp_path / "registry")
+    response = _client(evolution_registry=registry).post(
+        "/evolution/project-validation",
+        json={
+            "execution_mode": "codex_subscription_transcript",
+            "expected_registry_digest": registry.snapshot.registry_digest,
+            "agent_model": "gpt-5.1-codex-mini",
+            "targets": {
+                "agent_system": {
+                    "enabled": True,
+                    "method": "auto",
+                    "config": {"target_path": "AGENTS.md"},
+                }
+            },
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "valid": True,
+        "registry_digest": registry.snapshot.registry_digest,
+    }
+
+
+@pytest.mark.parametrize(
+    ("target_id", "method"),
+    [
+        ("text_memory", "text_memory"),
+        ("agent_system", "auto"),
+    ],
+    ids=["hidden-method", "resolver"],
+)
+def test_backend_rejects_invalid_hidden_or_resolver_project_config(
+    tmp_path: Path,
+    target_id: str,
+    method: str,
+) -> None:
+    registry = verified_builtin_registry(tmp_path / method)
+    response = _client(evolution_registry=registry).post(
+        "/evolution/project-validation",
+        json={
+            "execution_mode": "self-deployed",
+            "expected_registry_digest": registry.snapshot.registry_digest,
+            "agent_model": "Qwen/Qwen3-Coder-30B-A3B-Instruct",
+            "targets": {
+                target_id: {
+                    "enabled": True,
+                    "method": method,
+                    "config": {"unexpected": True},
+                }
+            },
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "evolution_project_invalid"
+    assert response.json()["details"] == {
+        "target_id": target_id,
+        "selection": method,
+        "reason_code": "invalid_method_config_or_profile",
+        "registry_digest": registry.snapshot.registry_digest,
+    }
+
+
+def test_backend_rejects_project_validation_after_registry_change(
+    tmp_path: Path,
+) -> None:
+    registry = verified_builtin_registry(tmp_path / "registry")
+    response = _client(evolution_registry=registry).post(
+        "/evolution/project-validation",
+        json={
+            "execution_mode": "codex_subscription_transcript",
+            "expected_registry_digest": "0" * 64,
+            "agent_model": "gpt-5.1-codex-mini",
+            "targets": {},
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "evolution_registry_changed"
+    assert response.json()["details"] == {
+        "registry_digest": registry.snapshot.registry_digest
+    }
+
+
+def test_backend_bounds_project_validation_structure(tmp_path: Path) -> None:
+    registry = verified_builtin_registry(tmp_path / "registry")
+    deeply_nested: dict[str, object] = {}
+    for _ in range(40):
+        deeply_nested = {"next": deeply_nested}
+
+    response = _client(evolution_registry=registry).post(
+        "/evolution/project-validation",
+        json={
+            "execution_mode": "self-deployed",
+            "expected_registry_digest": registry.snapshot.registry_digest,
+            "agent_model": "Qwen/Qwen3-Coder-30B-A3B-Instruct",
+            "targets": {
+                "text_memory": {
+                    "enabled": False,
+                    "method": "text_memory",
+                    "config": deeply_nested,
+                }
+            },
+        },
+    )
+    assert response.status_code == 422
+    assert response.json()["code"] == "request_validation_error"
+
+    response = _client(evolution_registry=registry).post(
+        "/evolution/project-validation",
+        json={
+            "execution_mode": "self-deployed",
+            "expected_registry_digest": registry.snapshot.registry_digest,
+            "agent_model": "Qwen/Qwen3-Coder-30B-A3B-Instruct",
+            "targets": {
+                f"target_{index}": {"enabled": False}
+                for index in range(129)
+            },
+        },
+    )
+    assert response.status_code == 422
+    assert response.json()["code"] == "request_validation_error"
+
+
+def test_backend_rejects_oversized_project_validation_body(tmp_path: Path) -> None:
+    registry = verified_builtin_registry(tmp_path / "registry")
+    client = _client(evolution_registry=registry)
+    response = client.post(
+        "/evolution/project-validation",
+        content=json.dumps(
+            {
+                "execution_mode": "self-deployed",
+                "expected_registry_digest": registry.snapshot.registry_digest,
+                "agent_model": "Qwen/Qwen3-Coder-30B-A3B-Instruct",
+                "targets": {},
+                "padding": "x" * (1024 * 1024),
+            }
+        ),
+        headers={"content-type": "application/json"},
+    )
+
+    assert response.status_code == 413
+    assert response.json()["code"] == "request_body_too_large"
+
+    response = client.post(
+        "/evolution/project-validation",
+        content=iter((b"{", b"x" * (1024 * 1024 + 1))),
+        headers={"content-type": "application/json"},
+    )
+    assert response.status_code == 413
+    assert response.json()["code"] == "request_body_too_large"
+
+
+def test_backend_accepts_project_validation_resource_boundaries(
+    tmp_path: Path,
+) -> None:
+    registry = verified_builtin_registry(tmp_path / "registry")
+    client = _client(evolution_registry=registry)
+    targets = {
+        "boundary_a": {
+            "enabled": False,
+            "method": None,
+            "config": {"padding": ""},
+        },
+        "boundary_b": {
+            "enabled": False,
+            "method": None,
+            "config": {"padding": ""},
+        },
+    }
+    payload = {
+        "execution_mode": "self-deployed",
+        "expected_registry_digest": registry.snapshot.registry_digest,
+        "agent_model": "Qwen/Qwen3-Coder-30B-A3B-Instruct",
+        "targets": targets,
+    }
+    empty_body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    padding_bytes = MAX_EVOLUTION_PROJECT_VALIDATION_REQUEST_BYTES - len(empty_body)
+    first_padding = padding_bytes // 2
+    targets["boundary_a"]["config"]["padding"] = "x" * first_padding
+    targets["boundary_b"]["config"]["padding"] = "x" * (
+        padding_bytes - first_padding
+    )
+    body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+
+    assert len(body) == MAX_EVOLUTION_PROJECT_VALIDATION_REQUEST_BYTES
+    response = client.post(
+        "/evolution/project-validation",
+        content=body,
+        headers={"content-type": "application/json"},
+    )
+    assert response.status_code == 200
+
+    deepest_valid: dict[str, object] = {}
+    for _ in range(15):
+        deepest_valid = {"next": deepest_valid}
+    payload["targets"] = {
+        "boundary_depth": {
+            "enabled": False,
+            "method": None,
+            "config": {
+                **deepest_valid,
+                "template": '{["escaped"]}' * 64,
+            },
+        }
+    }
+    response = client.post("/evolution/project-validation", json=payload)
+    assert response.status_code == 200
 
 
 @pytest.mark.parametrize(

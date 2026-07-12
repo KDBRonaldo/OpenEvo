@@ -5,8 +5,9 @@ import { createRoot, type Root } from "react-dom/client";
 import { renderToString } from "react-dom/server";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { OpenEvoDesktop } from "./OpenEvoDesktop";
+import { parseEvolutionConfigSchema } from "../api/evolutionConfigSchema";
 import {
-  getOpenEvoDesktopShellModel,
+  getOpenEvoDesktopShellModel as getEmptyOpenEvoDesktopShellModel,
   type OpenEvoDesktopShellModel,
 } from "./openevoDesktopModel";
 
@@ -43,6 +44,58 @@ vi.mock("../api/openevo", () => ({
 }));
 
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
+
+function getOpenEvoDesktopShellModel(): OpenEvoDesktopShellModel {
+  const model = getEmptyOpenEvoDesktopShellModel();
+  return {
+    ...model,
+    project: {
+      ...model.project,
+      evolutionTargets: {
+        text_memory: {
+          enabled: true,
+          method: "text_memory_reflector",
+          config: {},
+        },
+        parametric_memory: {
+          enabled: false,
+          method: "parametric_memory_register",
+          config: {},
+        },
+        skill_bundle: {
+          enabled: true,
+          method: "skill_bundle_reflector",
+          config: {},
+        },
+        agent_system: {
+          enabled: true,
+          method: "auto",
+          config: { target_path: "AGENTS.md" },
+        },
+      },
+    },
+    evolution: [
+      {
+        id: "text-memory",
+        label: "Text memory",
+        state: "planned",
+        detail: "Memory updates appear after a run produces trajectories",
+      },
+      {
+        id: "skill-bundle",
+        label: "Skill bundle",
+        state: "planned",
+        detail: "Learned skills appear after evolution jobs complete",
+      },
+      {
+        id: "agent-system",
+        label: "Agent system",
+        state: "planned",
+        detail: "Instruction diffs appear after promoted artifacts exist",
+      },
+    ],
+  };
+}
 
 describe("OpenEvoDesktop", () => {
   beforeEach(() => {
@@ -586,6 +639,7 @@ describe("OpenEvoDesktop", () => {
       }),
     );
     expect(document.body.textContent).toContain("Saving");
+    expect(projectConfigFieldset().disabled).toBe(true);
 
     await act(async () => {
       deferred.resolve({
@@ -603,6 +657,7 @@ describe("OpenEvoDesktop", () => {
     expect(document.body.textContent).toContain("Configured Science Project");
     expect(document.body.textContent).toContain("configured.gpu.example.edu");
     expect(inputByLabel("Remote port").value).toBe("2222");
+    expect(projectConfigFieldset().disabled).toBe(false);
     await unmountClient(root);
   });
 
@@ -770,7 +825,7 @@ describe("OpenEvoDesktop", () => {
 
     const targetLabels = Array.from(
       document.querySelectorAll('[data-testid="evolution-target"]'),
-    ).map((item) => item.textContent?.trim());
+    ).map((item) => item.querySelector("input")?.getAttribute("aria-label"));
     expect(targetLabels).toEqual([
       "Text memory",
       "Skill bundle",
@@ -785,6 +840,278 @@ describe("OpenEvoDesktop", () => {
     ).toBeLessThan(
       apiMocks.fetchOpenEvoDesktopCapabilities.mock.invocationCallOrder[0],
     );
+    await unmountClient(root);
+  });
+
+  it("shows unavailable method reasons and exposes config disclosure semantics", async () => {
+    const shellModel = withBackendService(getOpenEvoDesktopShellModel(), {
+      state: "ready",
+      detail: "Remote runtime services are ready",
+    });
+    const capabilities = desktopCapabilities();
+    capabilities.targets[0].methods.push({
+      ...capabilities.targets[0].methods[0],
+      methodId: "gpu_only_memory",
+      displayName: "GPU-only memory",
+      description: "Uses the accelerated synthesis path.",
+      support: unsupportedSupport(
+        "missing_runtime_requirement",
+        "GPU synthesis runtime is unavailable.",
+      ),
+    });
+    apiMocks.fetchOpenEvoDesktopShellModel.mockResolvedValue(shellModel);
+    apiMocks.fetchOpenEvoDesktopCapabilities.mockResolvedValue(capabilities);
+
+    const root = await renderClient();
+    await flushEffects();
+
+    expect(document.body.textContent).toContain(
+      "GPU synthesis runtime is unavailable.",
+    );
+    const configure = buttonByLabel("Configure Text memory");
+    expect(configure.getAttribute("aria-expanded")).toBe("false");
+    expect(configure.getAttribute("aria-controls")).toBe(
+      "evolution-config-text_memory",
+    );
+    await act(async () => configure.click());
+    expect(configure.getAttribute("aria-expanded")).toBe("true");
+    expect(
+      document.getElementById("evolution-config-text_memory"),
+    ).not.toBeNull();
+    await unmountClient(root);
+  });
+
+  it("selects a remote evolution method and saves its declared default config", async () => {
+    const shellModel = withBackendService(getOpenEvoDesktopShellModel(), {
+      state: "ready",
+      detail: "Remote runtime services are ready",
+    });
+    const capabilities = desktopCapabilities();
+    const target = capabilities.targets[0];
+    target.methods.push({
+      ...target.methods[0],
+      methodId: "evidence_distillation",
+      displayName: "Evidence distillation",
+      description: "Distill reusable evidence from prior trajectories.",
+      configSchemaJson:
+        '{"additionalProperties":false,"properties":{"record_limit":{"maximum":20,"minimum":1,"title":"Record limit","type":"integer"}},"type":"object"}',
+      defaultConfigJson: '{"record_limit":8}',
+      configSchema: parseEvolutionConfigSchema({
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          record_limit: {
+            type: "integer",
+            title: "Record limit",
+            minimum: 1,
+            maximum: 20,
+          },
+        },
+      }),
+      defaultConfig: { record_limit: 8 },
+    });
+    target.acceptedMethods.push({
+      methodId: "evidence_distillation",
+      implementationIdentityDigest: "f".repeat(64),
+      support: supportedSupport(),
+    });
+    apiMocks.fetchOpenEvoDesktopShellModel.mockResolvedValue(shellModel);
+    apiMocks.fetchOpenEvoDesktopCapabilities.mockResolvedValue(capabilities);
+    apiMocks.saveOpenEvoProjectConfig.mockResolvedValue({
+      config: {
+        science_config_path: "/tmp/science.yaml",
+        remote_profile_path: "/tmp/remote.yaml",
+      },
+      status: shellModel,
+    });
+
+    const root = await renderClient();
+    await flushEffects();
+
+    await changeSelect("Text memory method", "evidence_distillation");
+    expect(inputByLabel("Record limit").value).toBe("8");
+    await act(async () => {
+      buttonByText("Save Config").click();
+      await Promise.resolve();
+    });
+
+    expect(
+      apiMocks.saveOpenEvoProjectConfig.mock.calls[0]?.[0].evolution.targets
+        .text_memory,
+    ).toEqual({
+      enabled: true,
+      method: "evidence_distillation",
+      config: { record_limit: 8 },
+    });
+    await unmountClient(root);
+  });
+
+  it("blocks save for an invalid method config and saves the repaired value", async () => {
+    const shellModel = withBackendService(getOpenEvoDesktopShellModel(), {
+      state: "ready",
+      detail: "Remote runtime services are ready",
+    });
+    shellModel.project.evolutionTargets.text_memory = {
+      enabled: true,
+      method: "text_memory_reflector",
+      config: { record_limit: 4 },
+    };
+    const capabilities = desktopCapabilities();
+    capabilities.targets[0].methods[0].configSchema =
+      parseEvolutionConfigSchema({
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          record_limit: {
+            type: "integer",
+            title: "Record limit",
+            minimum: 1,
+            maximum: 10,
+          },
+        },
+      });
+    apiMocks.fetchOpenEvoDesktopShellModel.mockResolvedValue(shellModel);
+    apiMocks.fetchOpenEvoDesktopCapabilities.mockResolvedValue(capabilities);
+    apiMocks.saveOpenEvoProjectConfig.mockResolvedValue({
+      config: {
+        science_config_path: "/tmp/science.yaml",
+        remote_profile_path: "/tmp/remote.yaml",
+      },
+      status: shellModel,
+    });
+
+    const root = await renderClient();
+    await flushEffects();
+
+    await act(async () => buttonByLabel("Configure Text memory").click());
+    await changeInput("Record limit", "12");
+    expect(document.body.textContent).toContain("must be at most 10");
+    expect(buttonByText("Save Config").disabled).toBe(true);
+
+    await act(async () => inputByLabel("Text memory").click());
+    expect(buttonByText("Save Config").disabled).toBe(false);
+    await act(async () => inputByLabel("Text memory").click());
+    expect(buttonByText("Save Config").disabled).toBe(true);
+
+    await changeInput("Record limit", "6");
+    expect(buttonByText("Save Config").disabled).toBe(false);
+    await act(async () => {
+      buttonByText("Save Config").click();
+      await Promise.resolve();
+    });
+    expect(
+      apiMocks.saveOpenEvoProjectConfig.mock.calls[0]?.[0].evolution.targets
+        .text_memory.config,
+    ).toEqual({ record_limit: 6 });
+    await unmountClient(root);
+  });
+
+  it("resets a stale unknown method override after the remote schema shrinks", async () => {
+    const shellModel = withBackendService(getOpenEvoDesktopShellModel(), {
+      state: "ready",
+      detail: "Remote runtime services are ready",
+    });
+    shellModel.project.evolutionTargets.text_memory = {
+      enabled: true,
+      method: "text_memory_reflector",
+      config: { removed_option: "legacy" },
+    };
+    const capabilities = desktopCapabilities();
+    capabilities.targets[0].methods[0].configSchema =
+      parseEvolutionConfigSchema({
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          threshold: { type: "number", title: "Threshold" },
+        },
+      });
+    capabilities.targets[0].methods[0].defaultConfig = { threshold: 0.5 };
+    apiMocks.fetchOpenEvoDesktopShellModel.mockResolvedValue(shellModel);
+    apiMocks.fetchOpenEvoDesktopCapabilities.mockResolvedValue(capabilities);
+    apiMocks.saveOpenEvoProjectConfig.mockResolvedValue({
+      config: {
+        science_config_path: "/tmp/science.yaml",
+        remote_profile_path: "/tmp/remote.yaml",
+      },
+      status: shellModel,
+    });
+
+    const root = await renderClient();
+    await flushEffects();
+
+    expect(document.body.textContent).toContain("unknown property");
+    await act(async () => inputByLabel("Skill bundle").click());
+    expect(buttonByText("Save Config").disabled).toBe(true);
+    const reset = buttonByLabel("Reset Text memory configuration");
+    expect(reset.title).toBe("Reset Text memory configuration");
+    await act(async () => reset.click());
+
+    expect(document.body.textContent).not.toContain("unknown property");
+    expect(buttonByText("Save Config").disabled).toBe(false);
+    await act(async () => {
+      buttonByText("Save Config").click();
+      await Promise.resolve();
+    });
+    expect(
+      apiMocks.saveOpenEvoProjectConfig.mock.calls[0]?.[0].evolution.targets
+        .text_memory.config,
+    ).toEqual({ threshold: 0.5 });
+    await unmountClient(root);
+  });
+
+  it("requires the final merged method config before saving a new selection", async () => {
+    const shellModel = withBackendService(getOpenEvoDesktopShellModel(), {
+      state: "ready",
+      detail: "Remote runtime services are ready",
+    });
+    const capabilities = desktopCapabilities();
+    const target = capabilities.targets[0];
+    target.methods.push({
+      ...target.methods[0],
+      methodId: "operator_memory",
+      displayName: "Operator memory",
+      configSchema: parseEvolutionConfigSchema({
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          operator: { type: "string", title: "Operator", minLength: 1 },
+        },
+        required: ["operator"],
+      }),
+      defaultConfig: {},
+    });
+    target.acceptedMethods.push({
+      methodId: "operator_memory",
+      implementationIdentityDigest: "f".repeat(64),
+      support: supportedSupport(),
+    });
+    apiMocks.fetchOpenEvoDesktopShellModel.mockResolvedValue(shellModel);
+    apiMocks.fetchOpenEvoDesktopCapabilities.mockResolvedValue(capabilities);
+    apiMocks.saveOpenEvoProjectConfig.mockResolvedValue({
+      config: {
+        science_config_path: "/tmp/science.yaml",
+        remote_profile_path: "/tmp/remote.yaml",
+      },
+      status: shellModel,
+    });
+
+    const root = await renderClient();
+    await flushEffects();
+    await changeSelect("Text memory method", "operator_memory");
+
+    expect(document.body.textContent).toContain("required property is missing");
+    expect(buttonByText("Save Config").disabled).toBe(true);
+    await changeInput("Operator", "reflect");
+    expect(buttonByText("Save Config").disabled).toBe(false);
+
+    await act(async () => {
+      buttonByText("Save Config").click();
+      await Promise.resolve();
+    });
+    expect(
+      apiMocks.saveOpenEvoProjectConfig.mock.calls[0]?.[0].evolution.targets
+        .text_memory.config,
+    ).toEqual({ operator: "reflect" });
     await unmountClient(root);
   });
 
@@ -1002,7 +1329,7 @@ describe("OpenEvoDesktop", () => {
     await flushEffects();
 
     expect(inputByLabel("Text memory").disabled).toBe(false);
-    expect(document.body.textContent).not.toContain(
+    expect(document.body.textContent).toContain(
       "The default method is unavailable.",
     );
     await act(async () => inputByLabel("Text memory").click());
@@ -1130,18 +1457,69 @@ describe("OpenEvoDesktop", () => {
     await unmountClient(root);
   });
 
-  it("stores generic remote selections by target id instead of artifact type", async () => {
+  it("round-trips a generic remote target through save, reload, and activation", async () => {
     const shellModel = withBackendService(getOpenEvoDesktopShellModel(), {
       state: "ready",
       detail: "Remote runtime services are ready",
     });
     const target = desktopCapabilityTarget(
-      "novel_memory",
-      "Novel Memory",
-      "novel_memory_reflector",
+      "quality_notes_external",
+      "Quality notes",
+      "synthesize_notes",
     );
     target.artifactType = "text_memory";
-    target.methods[0].defaultConfig = { threshold: 0.5 };
+    target.methods[0].configSchema = parseEvolutionConfigSchema({
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        style: { type: "string", title: "Style" },
+        limits: {
+          type: "object",
+          title: "Limits",
+          additionalProperties: false,
+          properties: {
+            records: {
+              type: "integer",
+              title: "Records",
+              minimum: 1,
+              maximum: 32,
+            },
+          },
+          required: ["records"],
+        },
+      },
+      required: ["style", "limits"],
+    });
+    target.methods[0].configSchemaJson =
+      '{"additionalProperties":false,"properties":{"limits":{"additionalProperties":false,"properties":{"records":{"maximum":32,"minimum":1,"title":"Records","type":"integer"}},"required":["records"],"title":"Limits","type":"object"},"style":{"title":"Style","type":"string"}},"required":["style","limits"],"type":"object"}';
+    target.methods[0].defaultConfig = {
+      style: "concise",
+      limits: { records: 8 },
+    };
+    target.methods[0].defaultConfigJson =
+      '{"limits":{"records":8},"style":"concise"}';
+    const savedSelection = {
+      enabled: true,
+      method: "synthesize_notes",
+      config: { style: "concise", limits: { records: 12 } },
+    };
+    const savedModel = {
+      ...shellModel,
+      project: {
+        ...shellModel.project,
+        evolutionTargets: {
+          ...shellModel.project.evolutionTargets,
+          quality_notes_external: savedSelection,
+        },
+      },
+    };
+    const activatedModel = {
+      ...savedModel,
+      project: {
+        ...savedModel.project,
+        name: "Activated External Notes",
+      },
+    };
     apiMocks.fetchOpenEvoDesktopShellModel.mockResolvedValue(shellModel);
     apiMocks.fetchOpenEvoDesktopCapabilities.mockResolvedValue({
       ...desktopCapabilities(),
@@ -1152,12 +1530,15 @@ describe("OpenEvoDesktop", () => {
         science_config_path: "/tmp/science.yaml",
         remote_profile_path: "/tmp/remote.yaml",
       },
-      status: shellModel,
+      status: savedModel,
     });
 
-    const root = await renderClient();
+    let root = await renderClient();
     await flushEffects();
-    await act(async () => inputByLabel("Novel memory").click());
+    await act(async () => inputByLabel("Quality notes").click());
+    await act(async () => buttonByLabel("Configure Quality notes").click());
+    expect(inputByLabel("Records").value).toBe("8");
+    await changeInput("Records", "12");
     await act(async () => {
       buttonByText("Save Config").click();
       await Promise.resolve();
@@ -1165,12 +1546,42 @@ describe("OpenEvoDesktop", () => {
 
     expect(
       apiMocks.saveOpenEvoProjectConfig.mock.calls[0]?.[0].evolution.targets
-        .novel_memory,
-    ).toEqual({
-      enabled: true,
-      method: "novel_memory_reflector",
-      config: { threshold: 0.5 },
+        .quality_notes_external,
+    ).toEqual(savedSelection);
+    await unmountClient(root);
+
+    apiMocks.fetchOpenEvoDesktopShellModel.mockResolvedValue(savedModel);
+    apiMocks.fetchOpenEvoProjectConfigs.mockResolvedValue(savedProjectConfigs());
+    apiMocks.activateOpenEvoProjectConfig.mockResolvedValue({
+      config: {
+        science_config_path: "/tmp/science.yaml",
+        remote_profile_path: "/tmp/remote.yaml",
+      },
+      status: activatedModel,
     });
+    root = await renderClient();
+    await flushEffects();
+
+    expect(inputByLabel("Quality notes").checked).toBe(true);
+    expect(selectByLabel("Quality notes method").value).toBe("synthesize_notes");
+    await act(async () => buttonByLabel("Configure Quality notes").click());
+    expect(inputByLabel("Style").value).toBe("concise");
+    expect(inputByLabel("Records").value).toBe("12");
+
+    await changeInput("Project name", "Unsaved local edit");
+    expect(buttonByLabel("Activate Protein Design").disabled).toBe(true);
+    expect(document.body.textContent).toContain(
+      "Save or discard current changes before activating another config.",
+    );
+    await act(async () => buttonByText("Discard Changes").click());
+    expect(inputByLabel("Project name").value).toBe(savedModel.project.name);
+    expect(buttonByLabel("Activate Protein Design").disabled).toBe(false);
+    await act(async () => {
+      buttonByLabel("Activate Protein Design").click();
+      await Promise.resolve();
+    });
+    expect(document.body.textContent).toContain("Activated External Notes");
+    expect(inputByLabel("Quality notes").checked).toBe(true);
     await unmountClient(root);
   });
 
@@ -1354,6 +1765,38 @@ describe("OpenEvoDesktop", () => {
     await unmountClient(root);
   });
 
+  it("blocks evolution saves while matching remote capabilities are unavailable", async () => {
+    const shellModel = withBackendService(getOpenEvoDesktopShellModel(), {
+      state: "ready",
+      detail: "Remote runtime services are ready",
+    });
+    const reload = deferCapabilities();
+    apiMocks.fetchOpenEvoDesktopShellModel.mockResolvedValue(shellModel);
+    apiMocks.fetchOpenEvoDesktopCapabilities
+      .mockResolvedValueOnce(desktopCapabilities())
+      .mockReturnValueOnce(reload.promise);
+
+    const root = await renderClient();
+    await flushEffects();
+    await act(async () => inputByLabel("Text memory").click());
+    expect(buttonByText("Save Config").disabled).toBe(false);
+
+    await changeSelect("Execution mode", "self-deployed");
+    expect(buttonByText("Save Config").disabled).toBe(true);
+    expect(document.body.textContent).toContain(
+      "Wait for remote capabilities before saving evolution changes.",
+    );
+
+    await act(async () => {
+      reload.reject(new Error("new backend registry unavailable"));
+      await Promise.resolve();
+    });
+    expect(buttonByText("Save Config").disabled).toBe(true);
+    expect(document.body.textContent).toContain("new backend registry unavailable");
+    expect(apiMocks.saveOpenEvoProjectConfig).not.toHaveBeenCalled();
+    await unmountClient(root);
+  });
+
   it("refetches a previous mode after another mode fails", async () => {
     const shellModel = withBackendService(getOpenEvoDesktopShellModel(), {
       state: "ready",
@@ -1451,7 +1894,7 @@ describe("OpenEvoDesktop", () => {
       detail: "Remote runtime services are ready",
     });
     const runningModel = modelWithRun({
-      projectName: "Loaded Science Project",
+      projectName: shellModel.project.name,
       backendState: "running",
       backendDetail: "OpenEvo run is running",
       transcriptState: "running",
@@ -1477,7 +1920,7 @@ describe("OpenEvoDesktop", () => {
     apiMocks.pollOpenEvoRunStatus.mockResolvedValue({
       run: runStatus("failed"),
       status: modelWithRun({
-        projectName: "Loaded Science Project",
+        projectName: shellModel.project.name,
         backendState: "blocked",
         backendDetail: "run failed",
         transcriptState: "blocked",
@@ -1547,6 +1990,7 @@ describe("OpenEvoDesktop", () => {
     });
 
     expect(buttonByText("Save Config").disabled).toBe(true);
+    expect(projectConfigFieldset().disabled).toBe(true);
 
     await act(async () => {
       activation.resolve({
@@ -1562,6 +2006,7 @@ describe("OpenEvoDesktop", () => {
     });
 
     expect(buttonByText("Save Config").disabled).toBe(false);
+    expect(projectConfigFieldset().disabled).toBe(false);
     await unmountClient(root);
   });
 
@@ -3133,9 +3578,9 @@ function desktopCapabilities() {
       runtimeCapabilities: [],
     },
     targets: [
-      desktopCapabilityTarget("text_memory", "Text Memory", "text_memory_reflector"),
-      desktopCapabilityTarget("skill_bundle", "Skill Bundle", "skill_bundle_reflector"),
-      desktopCapabilityTarget("agent_system", "Agent System", "agent_system_reflector"),
+      desktopCapabilityTarget("text_memory", "Text memory", "text_memory_reflector"),
+      desktopCapabilityTarget("skill_bundle", "Skill bundle", "skill_bundle_reflector"),
+      desktopCapabilityTarget("agent_system", "Agent system", "agent_system_reflector"),
     ],
   };
 }
@@ -3215,9 +3660,17 @@ function desktopCapabilityTarget(
         runtimeRequirements: [],
         inputBindings: [],
         outputArtifactTypes: [targetId],
-        configSchemaJson: '{"additionalProperties":false,"type":"object"}',
+        configSchemaJson:
+          '{"additionalProperties":false,"properties":{"retained":{"type":"boolean"},"threshold":{"type":"number"}},"type":"object"}',
         defaultConfigJson: "{}",
-        configSchema: { additionalProperties: false, type: "object" },
+        configSchema: parseEvolutionConfigSchema({
+          additionalProperties: false,
+          properties: {
+            retained: { type: "boolean" },
+            threshold: { type: "number" },
+          },
+          type: "object",
+        }),
         defaultConfig: {},
         implementationIdentityDigest: "d".repeat(64),
         support,
@@ -3273,6 +3726,28 @@ function deferProjectConfig(status: OpenEvoDesktopShellModel) {
     resolve = next;
   });
   return { promise, resolve, status };
+}
+
+function deferCapabilities() {
+  let resolve!: (value: ReturnType<typeof desktopCapabilities>) => void;
+  let reject!: (reason: unknown) => void;
+  const promise = new Promise<ReturnType<typeof desktopCapabilities>>(
+    (next, fail) => {
+      resolve = next;
+      reject = fail;
+    },
+  );
+  return { promise, resolve, reject };
+}
+
+function projectConfigFieldset(): HTMLFieldSetElement {
+  const fieldset = document.querySelector<HTMLFieldSetElement>(
+    '[data-testid="project-config-fields"]',
+  );
+  if (!fieldset) {
+    throw new Error("project config fieldset not found");
+  }
+  return fieldset;
 }
 
 function deferCatalog() {

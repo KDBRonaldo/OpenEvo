@@ -4,6 +4,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from openevo.evolution.framework import ProjectEvolutionTargetMap
 from openevo.projects.science.models import ScienceTaskConfig
 
 
@@ -27,6 +28,8 @@ _BENCHMARK_ONLY_TASK_KEYS = frozenset(
         "terminal_bench_task_id",
     }
 )
+MAX_EVOLUTION_PROJECT_VALIDATION_REQUEST_BYTES = 1024 * 1024
+MAX_EVOLUTION_PROJECT_VALIDATION_JSON_DEPTH = 24
 
 
 class BackendError(BaseModel):
@@ -56,6 +59,22 @@ class BackendStatus(BaseModel):
     services: list[ServiceSummary]
     active_runs: int = 0
     supervision_mode: Literal["scaffold", "managed"] = "scaffold"
+
+
+class EvolutionProjectValidationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    execution_mode: ExecutionMode
+    expected_registry_digest: str = Field(pattern=r"[0-9a-f]{64}")
+    agent_model: str = Field(min_length=1, max_length=4096)
+    targets: ProjectEvolutionTargetMap
+
+
+class EvolutionProjectValidationResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    valid: Literal[True] = True
+    registry_digest: str = Field(pattern=r"[0-9a-f]{64}")
 
 
 class EnvironmentSettings(BaseModel):

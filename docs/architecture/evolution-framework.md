@@ -1,8 +1,8 @@
 # Pluggable Evolution Framework
 
-Status: A2.3 planning, verified dispatch, and remote capability cutover implemented
+Status: A2.3 Core framework and the A2.4 Desktop config/preflight slice implemented
 
-Tracking: issues #137, #139, #141, #142, #144, and #146, productization step A2. A2.1
+Tracking: issues #137, #139, #141, #142, #144, #146, and #148, productization step A2. A2.1
 implements contracts for `PLUG-1` through `PLUG-4`; A2.2 catalogs the existing
 implementations; A2.3 covers project configuration, per-round plans, durable
 job identity, verified worker dispatch, and the remote registry capability
@@ -16,8 +16,11 @@ experiments, and Desktop, resolves `agent_system=auto` from the round-start
 dataset snapshot, persists the resulting plan with each new experiment job,
 dispatches that job only through its verified method handle, and publishes
 capabilities from the same frozen registry. Artifact registration keeps its
-existing contract. Generic context resolution, gateway injection, and Desktop
-rendering remain assigned to A2.4/A2.5.
+existing contract. The implemented A2.4 slice adds capability-driven Desktop
+selection/config editing, compiler-owned config injection, and registry-bound
+remote project preflight. Generic target-handler runtime cutover, context
+resolution, gateway injection, and removal of remaining target-specific runtime
+switches remain assigned to the unfinished A2.4/A2.5 work.
 
 ## Boundary
 
@@ -309,9 +312,11 @@ built-in execution order and appends external targets by stable ID; it never
 silently drops an unknown-to-the-UI target. Artifact type comes from the target
 descriptor rather than the target ID. Input artifacts are projected in descriptor
 order from `current_dataset`, `history_datasets`, `current_target_artifacts`, or
-`explicit_inputs`, including multiple bindings with the same artifact type. Core
-injects built-in reflector/base-model defaults only when the selected closed
-method schema declares those fields.
+`explicit_inputs`, including multiple bindings with the same artifact type. A
+method descriptor may bind a config field to a closed Core injection source.
+The compiler removes any project value for that field, writes the authoritative
+source value, and then performs full registry normalization; it never infers an
+injection from a target ID or coincidental property name.
 
 The store atomically persists the immutable plan and a job execution envelope
 containing the target, method identity, canonical user/Core config, ordered
@@ -460,6 +465,20 @@ ordered inputs, identity, separate execution/capture/harness/runtime declaration
 and four support axes. Axis states are `supported`, `unsupported`, or
 `unavailable`, with stable reason codes and missing requirements.
 
+Method schemas may include top-level execution fields that the project compiler,
+rather than an ordinary user, owns. The descriptor declares each
+`project_config_injections` entry as a field name plus a closed Core source,
+currently `reflector_llm` or `agent_model`; every field must exist in the full
+method schema. Capability projection removes those properties from the Desktop
+schema, its required list, and its default config. The experiment compiler reads
+the descriptor metadata, removes stale project values, and writes the
+authoritative source before verified-registry normalization. This is
+configuration ownership metadata only: it does not remove fields from the
+method's runtime config or change method behavior. A same-named field without an
+injection declaration remains user-owned and is never guessed or overwritten.
+Root object `default`, `const`, and `enum` annotations cannot embed injected
+fields because their correlated project-schema projection would be ambiguous.
+
 The executable registry retains the verified distribution evidence used to
 load it. The attestation digest set must equal the complete distribution digest
 set referenced by the snapshot; every implementation identity must match its
@@ -476,14 +495,52 @@ repository testkit path.
 is not a framework mode ID. The sole release mapping converts it to
 `subscription + transcript + codex` and Self-Deployed to
 `self_deployed + transcript + codex`; it never infers token-level availability.
-Desktop currently renders target toggles and validates existing selections from
-capabilities. A2.4 adds the friendly method selector and schema-driven config
-editor. Desktop never carries a method/target registry. Supported explicit selections retain their config;
-null, removed, or unsupported selections rebind to the remote effective default
-and its default config. Enabled invalid selections remain visible, can be
-disabled, and block run launch. Unsaved drafts never authorize the active
-session, and the sidecar re-fetches and validates capabilities immediately
-before every run launch. A test target using an existing contribution vocabulary
+Desktop renders target toggles, friendly method selectors, and bounded-schema
+config editors from this remote projection; it carries no method/target
+registry. Picker choices come only from visible `methods` and Core-owned
+`selection_resolvers`. Hidden `accepted_methods` may remain as an opaque saved
+selection but cannot become a new Desktop choice and expose no editable schema.
+Keeping a selection preserves its config. Selecting another visible method
+atomically replaces config with that method's remote default; selecting a
+resolver starts with an empty override because resolver capabilities declare no
+schema/default. Null, removed, or unsupported selections rebind only when the
+user enables through a supported remote effective default or explicitly chooses
+a supported option. Desktop never invents a default when
+`effective_default_method_id` is null.
+
+The editor implements the same closed JSON Schema subset as Core. It keeps the
+stored project value as a recursive partial override, so omitted defaults are not
+materialized into the project file and missing, explicit null, and concrete
+values remain distinct. Validation recursively merges schema defaults,
+descriptor defaults, and the project override, then validates the complete
+effective config; a required user-owned field must therefore come from one of
+those layers. Config schema, defaults, and values containing non-finite numbers
+or integers outside the JavaScript safe range fail closed before browser editing.
+Invalid enabled visible-method config blocks an evolution-changing save and run
+with field-level errors; disabling the target remains a valid repair and its
+opaque config stays preserved. An unrelated project edit may still be saved when
+the evolution map is unchanged. Any evolution change requires a capability snapshot
+for the selected execution mode; loading, missing, failed, or mismatched
+capabilities block that save. Resolver, hidden, stale, and unknown config remains
+opaque and round-trips without schema guessing. Enabled invalid or unknown
+selections remain repairable and block run launch; disabled unknown selections
+remain in the canonical map even when omitted from the ordinary setup surface.
+The sidecar streams the remote capability response through a fixed byte limit,
+caps global node/collection/text budgets and schema sizes, rejects unsafe outer
+integers and non-Desktop exposure, and redacts remote error details before
+forwarding them. Unsaved drafts never authorize the active session. Before every
+run launch, the sidecar re-fetches capabilities and calls remote Core
+`POST /evolution/project-validation` with the expected registry digest. Core
+validates visible methods, hidden accepted methods, and every possible concrete
+resolver method using the complete verified registry and compiler-owned
+injections; registry drift or invalid config fails before a run thread exists.
+The validation endpoint accepts at most 1 MiB of UTF-8 request bytes. Its ASGI
+guard checks declared and actually received bytes plus JSON nesting before
+parsing; the project contract then limits target count to 128 and applies
+depth/node/collection/text budgets to every method config. The sidecar serializes
+the exact outgoing JSON bytes and enforces the same 1 MiB limit before opening a
+remote request.
+A test target using an existing contribution vocabulary
 and renderer must cross compiler, resolver, gateway, capabilities, persistence,
 and Desktop without a target-ID switch.
 

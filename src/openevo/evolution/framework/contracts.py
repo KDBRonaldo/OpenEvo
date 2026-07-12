@@ -12,7 +12,7 @@ from enum import Enum, StrEnum
 from pathlib import PurePosixPath
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 MAX_CONTRIBUTION_TEXT = 1_048_576
@@ -24,6 +24,7 @@ MAX_PAYLOAD_ENTRIES = 256
 MAX_PAYLOAD_ENTRY_BYTES = 8 * 1024 * 1024 * 1024
 MAX_PAYLOAD_TOTAL_BYTES = 16 * 1024 * 1024 * 1024
 MAX_PAYLOAD_TREE_DEPTH = 32
+MAX_JAVASCRIPT_SAFE_INTEGER = (1 << 53) - 1
 
 _STABLE_ID_RE = re.compile(r"[A-Za-z][A-Za-z0-9_.-]{0,127}\Z", re.ASCII)
 _URI_SCHEME_RE = re.compile(r"[a-z][a-z0-9+.-]{0,31}\Z", re.ASCII)
@@ -78,6 +79,11 @@ class CaptureMode(StrEnum):
 class MethodInvocationABI(StrEnum):
     LEGACY_WORKER_JOB_V1 = "legacy_worker_job_v1"
     METHOD_CONTEXT_V1 = "method_context_v1"
+
+
+class ProjectConfigInjectionSource(StrEnum):
+    REFLECTOR_LLM = "reflector_llm"
+    AGENT_MODEL = "agent_model"
 
 
 class DestinationScope(StrEnum):
@@ -329,8 +335,8 @@ class EvolutionExecutionProfile(_Contract):
     execution_mode: ExecutionMode
     capture_mode: CaptureMode
     harness_id: str
-    harness_capabilities: tuple[str, ...] = ()
-    runtime_capabilities: tuple[str, ...] = ()
+    harness_capabilities: tuple[str, ...] = Field(default=(), max_length=256)
+    runtime_capabilities: tuple[str, ...] = Field(default=(), max_length=256)
 
     _harness = field_validator("harness_id")(_stable_id)
     _capabilities = field_validator(

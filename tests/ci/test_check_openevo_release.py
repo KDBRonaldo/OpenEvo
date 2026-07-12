@@ -7,6 +7,8 @@ from io import BytesIO
 from pathlib import Path
 from zipfile import ZipFile
 
+import pytest
+
 
 GOOD_METADATA = "\n".join(
     [
@@ -128,6 +130,25 @@ def test_sidecar_smoke_extracts_desktop_static_assets() -> None:
     )
 
     assert assets == ["assets/index.css", "assets/index.js"]
+
+
+def test_sidecar_smoke_rejects_core_owned_fields_in_project_contract() -> None:
+    smoke = _load_sidecar_smoke_module()
+
+    with pytest.raises(smoke.SmokeFailure, match="Core-owned field"):
+        smoke._assert_project_method_contract(
+            {
+                "method_id": "reflect",
+                "config_schema_json": json.dumps(
+                    {
+                        "type": "object",
+                        "properties": {"reflector_llm": {"type": "object"}},
+                        "additionalProperties": False,
+                    }
+                ),
+                "default_config_json": "{}",
+            }
+        )
 
 
 def test_sidecar_smoke_launches_process_and_checks_assets(tmp_path: Path) -> None:
@@ -720,6 +741,15 @@ def test_desktop_package_defines_tauri_desktop_scripts_and_cli_dependency() -> N
         "npm run build:sidecar && npm run tauri:build"
     )
     assert "@tauri-apps/cli" in package["devDependencies"]
+
+
+def test_desktop_tailwind_sources_are_explicit_and_exclude_packaged_web() -> None:
+    styles = Path("desktop/src/styles.css").read_text(encoding="utf-8")
+
+    assert '@import "tailwindcss" source(none);' in styles
+    assert '@source "../index.html";' in styles
+    assert '@source "./**/*.{ts,tsx}";' in styles
+    assert "packaging/web" not in styles
 
 
 def test_tauri_macos_config_builds_dmg_release_shell() -> None:

@@ -264,20 +264,57 @@ the Desktop setup draft after startup or saved-config activation: profile id,
 host, port, user, auth method plus key/reference ids, effective workspace root,
 HTTP/HTTPS proxy, `NO_PROXY`, `PIP_INDEX_URL`, Hugging Face endpoint, and
 `HF_HOME`, plus the complete canonical `evolution.targets` selections. Desktop
-keeps that map through load/edit/save. A toggle preserves every existing
-non-null, remotely supported method and its config. When enabling a missing,
-method-null, removed, or unsupported selection, it binds the remote effective
-default and its default config; config without a valid method has no method
-contract and is not carried across that rebind. Enabled unknown targets remain
-visible and block run launch until disabled. Desktop cannot silently discard
-unknown future targets. The response does not include raw passwords or
-private-key material.
+keeps that map through load/edit/save. Target controls, friendly method choices,
+support state, and config fields come only from the connected Core capability
+projection. A toggle preserves every existing non-null, remotely supported
+method and its config. A method change atomically installs that method's remote
+default config; a Core-owned resolver starts with an empty override and existing
+resolver config remains opaque. When enabling a missing, method-null, removed,
+or unsupported selection, Desktop binds a supported remote effective default
+only when one exists. It never guesses another method when Core publishes no
+effective default.
+
+Visible method config is edited through Core's bounded closed-schema subset and
+stored as a partial override without eagerly adding schema defaults. Desktop
+recursively merges Core defaults and that override to validate the complete
+effective config, so a missing required user-owned field blocks an evolution
+change. Core/compiler-owned required fields are removed from the Desktop
+projection through descriptor field/source ownership metadata and are injected
+again before Core plan compilation. Controls display the merged effective value,
+including inherited booleans and nested defaults, while edits still persist only
+the explicit override. A reset action replaces the current visible method's
+entire override with its remote `defaultConfig`, allowing a saved override with
+fields removed by a newer remote schema to recover without preserving unknown
+keys. Resetting a Core-owned resolver replaces its opaque override with an empty
+object. Hidden accepted methods, stale methods, and null selections cannot be
+reset because Desktop has no visible editable contract for them. Present invalid
+values, non-finite numbers, and integers that cannot round-trip through
+JavaScript block save and run. Resolver config otherwise remains opaque, and
+hidden accepted methods, stale methods, and unknown targets keep opaque config
+unchanged.
+Enabled unknown targets remain visible and block run launch until disabled;
+disabled unknown selections stay in the canonical map without being promoted
+into ordinary-user controls. Desktop cannot silently discard future targets.
+The response does not include raw passwords or private-key material.
+The React offline fallback contains no target or method defaults; before the
+sidecar responds it shows only neutral transcript state. Initial target
+selections come from the sidecar's validated Core-owned Science Project config,
+then become editable only against connected remote capabilities.
 Valid Core-owned resolver values such as `agent_system.method=auto` and valid
 explicit methods hidden from the ordinary-user picker remain accepted through
-remote `selection_resolvers` and `accepted_methods`. Draft changes must be saved
-and activated before Start Run can use them. After save, Desktop rebuilds the
-draft from the canonical sidecar status so server-side whitespace and config
-normalization cannot leave a false unsaved-change block.
+remote `selection_resolvers` and `accepted_methods`. Unsupported visible options
+remain identifiable with the Core support reason but cannot be newly selected.
+Draft changes must be saved and activated before Start Run can use them. After
+save, Desktop rebuilds the draft from the canonical sidecar status so
+server-side whitespace and config normalization cannot leave a false
+unsaved-change block. The complete setup form is disabled while save or saved
+config activation is in flight, preventing a late response from overwriting a
+newer local edit. Evolution-changing saves additionally require a current remote
+capability projection for the draft execution mode; non-evolution setup changes
+remain saveable when the evolution map is unchanged. A disabled target's retained
+config is not treated as an active validation failure. Saved-config activation is
+disabled while the current draft is dirty; the user must save or explicitly use
+Discard Changes before another config can replace it.
 The response also includes `sidecar.transport` capability metadata for the
 selected local mutating transport. Desktop uses it to block lifecycle actions
 before remote execution when the active auth settings require unsupported
@@ -341,7 +378,8 @@ sidecar connection it loads the saved config catalog, renders valid and invalid
 summaries, disables activation for invalid configs, and shows the sanitized
 validation error returned by the sidecar. Activating a valid saved config
 refreshes the shell status, repopulates the setup draft from the active project,
-and clears stale latest-run state. Saving a new draft refreshes the catalog so
+and clears stale latest-run state, but cannot overwrite an unsaved draft without
+an explicit discard. Saving a new draft refreshes the catalog so
 the newly written config is available without restarting Desktop.
 The same panel exposes the non-secret remote setup fields, including remote
 profile id, SSH auth method, private-key path/reference ids, workspace root,

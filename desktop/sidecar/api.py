@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from _thread import LockType
 import hashlib
+import json
 from pathlib import Path
 import posixpath
 import re
@@ -27,6 +28,7 @@ from pydantic import ValidationError
 
 import openevo
 from openevo import __version__ as OPENEVO_VERSION
+from openevo.backend.models import EvolutionProjectValidationResponse
 from openevo.deployment.executor import RemoteExecutorTransport
 from openevo.deployment.lifecycle import (
     RemoteServiceLog,
@@ -40,6 +42,7 @@ from openevo.evolution.framework import (
     FrameworkDistributionLock,
     ProjectEvolutionTargetSelection,
     execution_profile_for_release_mode,
+    normalize_config_override,
 )
 from openevo.projects.science import ScienceProjectConfig
 from openevo.projects.science.models import EvolutionTargetsConfig
@@ -569,7 +572,40 @@ def create_sidecar_app(
         expected_profile = execution_profile_for_release_mode(execution_mode)
         if capabilities.evaluated_profile != expected_profile:
             raise _invalid_backend_capabilities_error(execution_mode)
+        if any(
+            target.exposure != "desktop"
+            or any(method.exposure != "desktop" for method in target.methods)
+            for target in capabilities.targets
+        ):
+            raise _invalid_backend_capabilities_error(execution_mode)
         return capabilities
+
+    def validate_remote_project_evolution(
+        project: ScienceProjectConfig,
+        capabilities: EvolutionCapabilitiesV1,
+        *,
+        required_session: OpenEvoSidecarSession,
+    ) -> None:
+        agent_model = project.execution.codex_model or project.execution.hf_model
+        if agent_model is None:  # ScienceProjectConfig makes this unreachable.
+            raise _invalid_remote_project_validation_error()
+        request = {
+            "execution_mode": project.execution.mode,
+            "expected_registry_digest": capabilities.registry_digest,
+            "agent_model": agent_model,
+            "targets": project.evolution.model_dump(mode="json")["targets"],
+        }
+        with backend_client_context(required_session) as backend_client:
+            payload = backend_client.validate_evolution_project(request)
+        try:
+            response = EvolutionProjectValidationResponse.model_validate(
+                payload,
+                strict=True,
+            )
+        except ValidationError as exc:
+            raise _invalid_remote_project_validation_error() from exc
+        if response.registry_digest != capabilities.registry_digest:
+            raise _invalid_remote_project_validation_error()
 
     def attach_session_backend_facade(active_session: OpenEvoSidecarSession) -> None:
         if backend_client_factory is not None:
@@ -1316,6 +1352,11 @@ def create_sidecar_app(
                 active_session.project,
                 capabilities,
             )
+            validate_remote_project_evolution(
+                active_session.project,
+                capabilities,
+                required_session=active_session,
+            )
             run_status = _initial_run_status(
                 experiment_snapshot=experiment_snapshot,
                 state_root=state_root,
@@ -1480,34 +1521,16 @@ def _evolution_steps(
             detail="Trajectory capture will start after the first run",
         )
     ]
-    text_memory = targets.get("text_memory")
-    if text_memory is not None and text_memory.enabled:
+    for target_id, selection in targets.items():
+        if not selection.enabled:
+            continue
+        label = target_id.replace("_", " ").replace("-", " ").capitalize()
         steps.append(
             DesktopEvolutionStep(
-                id="text-memory",
-                label="Text memory",
+                id=target_id.replace("_", "-"),
+                label=label,
                 state="planned",
-                detail="No promoted memory artifact yet",
-            )
-        )
-    skill_bundle = targets.get("skill_bundle")
-    if skill_bundle is not None and skill_bundle.enabled:
-        steps.append(
-            DesktopEvolutionStep(
-                id="skill-bundle",
-                label="Skill bundle",
-                state="planned",
-                detail="No promoted skill bundle yet",
-            )
-        )
-    agent_system = targets.get("agent_system")
-    if agent_system is not None and agent_system.enabled:
-        steps.append(
-            DesktopEvolutionStep(
-                id="agent-system",
-                label="Agent system",
-                state="planned",
-                detail="No promoted agent-system artifact yet",
+                detail=f"No promoted {label.lower()} artifact yet",
             )
         )
     return tuple(steps)
@@ -2055,6 +2078,25 @@ def _invalid_backend_capabilities_error(
     )
 
 
+def _invalid_remote_project_validation_error() -> DesktopBackendError:
+    return DesktopBackendError(
+        502,
+        {
+            "code": "backend_evolution_validation_invalid",
+            "message": (
+                "Remote OpenEvo backend returned an invalid project validation "
+                "payload."
+            ),
+            "severity": "blocking",
+            "category": "internal",
+            "retryable": False,
+            "repair_action": "user_action_required",
+            "details": {},
+            "logs_ref": "services/openevo-backend",
+        },
+    )
+
+
 def _validate_project_evolution_capabilities(
     project: ScienceProjectConfig,
     capabilities: EvolutionCapabilitiesV1,
@@ -2080,6 +2122,27 @@ def _validate_project_evolution_capabilities(
             None,
         )
         if method is not None and method.support.overall == "supported":
+            visible_method = next(
+                (
+                    candidate
+                    for candidate in target.methods
+                    if candidate.method_id == selection.method
+                ),
+                None,
+            )
+            if visible_method is not None:
+                try:
+                    normalize_config_override(
+                        json.loads(visible_method.config_schema_json),
+                        json.loads(visible_method.default_config_json),
+                        selection.config.to_dict(),
+                    )
+                except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                    raise _invalid_evolution_config_error(
+                        target_id,
+                        selection.method,
+                        capabilities.registry_digest,
+                    ) from exc
             continue
         resolver = next(
             (
@@ -2127,6 +2190,30 @@ def _unavailable_evolution_selection_error(
                 "selection": selection,
                 "registry_digest": registry_digest,
                 "reason": reason,
+            },
+            "logs_ref": None,
+        },
+    )
+
+
+def _invalid_evolution_config_error(
+    target_id: str,
+    selection: str | None,
+    registry_digest: str,
+) -> DesktopBackendError:
+    return DesktopBackendError(
+        409,
+        {
+            "code": "evolution_config_invalid",
+            "message": "The active project evolution configuration is invalid.",
+            "severity": "blocking",
+            "category": "project",
+            "retryable": False,
+            "repair_action": "openevo_can_reconfigure",
+            "details": {
+                "target_id": target_id,
+                "selection": selection,
+                "registry_digest": registry_digest,
             },
             "logs_ref": None,
         },

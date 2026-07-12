@@ -124,11 +124,25 @@ Target 的 `methods` 是当前 audience 可展示的新选择；`accepted_method
 项目选择值（当前为 `agent_system.method=auto`）及其可能解析到的 concrete methods。不要把
 三者混成一个 method table；resolver concrete method 的 identity/support 必须与
 `accepted_methods` 同 ID 条目完全一致。
+Method descriptor 的 `project_config_injections` 以 field/source 对声明由 Core compiler
+确定性注入、普通用户不应编辑的顶层 config 字段。source 只能使用 framework 已实现的闭集；
+字段必须存在于完整 method schema。Desktop capability projection 从 schema/default/required
+中移除它们，experiment compiler 必须先删除 project/stale 值，再从权威 source 注入并执行
+verified registry 完整规范化。未声明 injection 的同名字段保持 user-owned，不得按 target ID
+或字段名猜测覆盖。注入字段不得嵌入顶层 object schema 的 `default`、`const` 或 `enum`
+annotation，避免投影后丢失字段关联语义。
 Desktop 对空 method 或远端已删除/不支持的 method 重新启用时，必须绑定远端 effective
 default 并使用其 default config；仍受支持的显式 method/config 必须原样保留。任何已启用但
 无效的 target/method 都必须可见、可关闭，并阻止 run，capability 获取失败必须提供同 mode
 重试而不能使用本地静态表。未保存 draft 不能放行已激活 session；Sidecar 的 run endpoint
 必须在每次远程启动前重新读取 capabilities，并按 active project/mode fail closed 校验。
+Sidecar 随后必须携带 capability registry digest 调用远程 Core
+`POST /evolution/project-validation`；Core 对 visible、hidden accepted 和 resolver 的全部可能
+concrete methods 使用完整 registry/schema 和 compiler injection 做同步校验，成功前不得创建
+run thread 或执行远程 run command。
+该 endpoint 的 UTF-8 request body 上限为 1 MiB，必须在 JSON 解析前按实际接收字节和结构
+深度 fail closed；target map 最多 128 项，method config 同时受深度、节点、集合项和文本总量
+预算约束。Desktop sidecar 必须使用同一字节上限并在发起远程请求前校验序列化后的 payload。
 存在 active project session 时，capability 和 run 校验只能使用该 session 的 SSH tunnel，不能
 退回 launcher 的共享 backend URL。
 
@@ -313,7 +327,10 @@ signature。当前 release composition 只加载 built-ins；外部 research plu
    `list[ArtifactRegisterRequest]`。不要修改已有算法函数来适配框架。
 4. 注册 descriptor：声明稳定 method ID、target、ordered input bindings、output artifact
    types、closed config schema、execution/capture/harness/runtime support、exposure、maturity
-   和 locked implementation entry point。不要从旧 `METHOD_METADATA` 反向生成 descriptor。
+   和 locked implementation entry point。由 compiler 提供而不应展示给普通用户的顶层字段
+   还要声明 `project_config_injections` 的 field/source，并确保 compiler 已实现该权威 source。
+   不要从旧
+   `METHOD_METADATA` 反向生成 descriptor。
 5. A2 迁移期兼容：已有内置 legacy 方法仍临时同步到 `METHOD_REGISTRY` 和
    `METHOD_METADATA`，并由 anti-drift tests 证明 descriptor entry point 与 callable 是同一
    对象；plan-bound product jobs 不读取这两张表。新 context method 不得加入 legacy dispatch

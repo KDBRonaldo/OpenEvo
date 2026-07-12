@@ -14,6 +14,7 @@ from openevo.evolution.framework import (
     EvolutionMethodDescriptor,
     EvolutionTargetDescriptor,
     MethodInputBinding,
+    ProjectConfigInjection,
     TargetHandlerDescriptor,
 )
 from openevo.evolution.framework.builtins import (
@@ -47,7 +48,7 @@ _EXECUTION_PROFILE = EvolutionExecutionProfile(
 )
 
 
-def _registry_with_external_target():
+def _registry_with_external_target(*, inject_config: bool = True):
     identity = ImplementationDistributionIdentity(
         distribution="openevo",
         distribution_version="0.1.0",
@@ -124,13 +125,31 @@ def _registry_with_external_target():
                     "prompt": {"type": "string"},
                     "reflector_llm": {
                         "type": "object",
-                        "properties": {},
+                        "properties": {
+                            "model": {"type": "string"},
+                            "provider": {"type": "string"},
+                        },
+                        "required": ["model", "provider"],
                         "additionalProperties": False,
                     },
                     "base_model": {"type": "string"},
                 },
                 "additionalProperties": False,
             },
+            project_config_injections=(
+                (
+                    ProjectConfigInjection(
+                        field_name="base_model",
+                        source="agent_model",
+                    ),
+                    ProjectConfigInjection(
+                        field_name="reflector_llm",
+                        source="reflector_llm",
+                    ),
+                )
+                if inject_config
+                else ()
+            ),
             implementation_ref=identity.ref("external:quality_notes_method"),
         ),
     ):
@@ -413,38 +432,30 @@ def test_evolution_methods_include_parametric_memory_when_enabled() -> None:
     assert "reflector_llm" not in specs[1].config
 
 
-def test_parametric_memory_config_drops_user_reflector_llm() -> None:
-    compiled = compile_experiment(
-        _config(
-            evolution={
-                "targets": {
-                    "text_memory": {
-                        "enabled": True,
-                        "method": "text_memory_reflector",
-                    },
-                    "parametric_memory": {
-                        "enabled": True,
-                        "method": "parametric_memory_register",
-                        "config": {
-                            "adapter_uri": "file:///adapters/parser-memory",
-                            "reflector_llm": {"provider": "bad", "model": "bad"},
+def test_parametric_memory_config_rejects_undeclared_reflector_llm() -> None:
+    with pytest.raises(ValueError, match="config.reflector_llm: unknown property"):
+        compile_experiment(
+            _config(
+                evolution={
+                    "targets": {
+                        "text_memory": {"enabled": False},
+                        "parametric_memory": {
+                            "enabled": True,
+                            "method": "parametric_memory_register",
+                            "config": {
+                                "adapter_uri": "file:///adapters/parser-memory",
+                                "reflector_llm": {
+                                    "provider": "bad",
+                                    "model": "bad",
+                                },
+                            },
                         },
+                        "skill_bundle": {"enabled": False},
+                        "agent_system": {"enabled": False},
                     },
-                    "skill_bundle": {
-                        "enabled": True,
-                        "method": "skill_bundle_reflector",
-                    },
-                    "agent_system": {"enabled": True, "method": "auto"},
-                },
-            }
+                }
+            )
         )
-    )
-
-    specs = compiled.evolution_methods_for_round(0, prior_dataset_artifact_ids=[])
-
-    assert specs[1].artifact_type == "parametric_memory"
-    assert specs[1].config["adapter_uri"] == "file:///adapters/parser-memory"
-    assert "reflector_llm" not in specs[1].config
 
 
 def test_agent_system_auto_resolves_from_prior_dataset_snapshot_not_round() -> None:
@@ -553,7 +564,14 @@ def test_external_target_compiles_after_builtins_with_descriptor_artifact_type()
                     "quality_notes": {
                         "enabled": True,
                         "method": "quality_notes_external",
-                        "config": {"prompt": "Find unsupported claims."},
+                        "config": {
+                            "prompt": "Find unsupported claims.",
+                            "base_model": "stale/model",
+                            "reflector_llm": {
+                                "provider": "stale",
+                                "model": "stale/model",
+                            },
+                        },
                     },
                     "agent_system": {
                         "enabled": True,
@@ -596,7 +614,50 @@ def test_external_target_compiles_after_builtins_with_descriptor_artifact_type()
         "quality_notes",
     ]
     assert specs[-1].artifact_type == "research_note"
-    assert specs[-1].config == {"prompt": "Find unsupported claims."}
+    assert specs[-1].config == {
+        "prompt": "Find unsupported claims.",
+        "base_model": "gpt-5.1-codex-mini",
+        "reflector_llm": {
+            "provider": "codex_cli",
+            "model": "gpt-5.1-codex-mini",
+        },
+    }
+
+
+def test_external_method_without_injection_keeps_user_owned_same_name_fields() -> None:
+    compiled = _compile_experiment(
+        _config(
+            evolution={
+                "targets": {
+                    "quality_notes": {
+                        "enabled": True,
+                        "method": "quality_notes_external",
+                        "config": {
+                            "prompt": "Find unsupported claims.",
+                            "base_model": "user/model",
+                            "reflector_llm": {
+                                "provider": "user_provider",
+                                "model": "user/model",
+                            },
+                        },
+                    }
+                }
+            }
+        ),
+        registry_snapshot=_registry_with_external_target(inject_config=False),
+        execution_profile=_EXECUTION_PROFILE,
+    )
+
+    spec = compiled.evolution_methods_for_round(
+        0,
+        prior_dataset_artifact_ids=[],
+    )[0]
+
+    assert spec.config["base_model"] == "user/model"
+    assert spec.config["reflector_llm"] == {
+        "provider": "user_provider",
+        "model": "user/model",
+    }
 
 
 def test_external_source_bindings_preserve_descriptor_order_and_duplicates() -> None:
@@ -853,6 +914,7 @@ def test_flat_context_is_not_reinterpreted_as_prior_dataset_history() -> None:
 def test_parametric_memory_job_uses_prior_parametric_context_only() -> None:
     compiled = compile_experiment(
         _config(
+            agent={"preset": "codex", "model": "Qwen/Qwen3.6-35B-A3B"},
             evolution={
                 "targets": {
                     "text_memory": {"enabled": False},
@@ -863,7 +925,7 @@ def test_parametric_memory_job_uses_prior_parametric_context_only() -> None:
                         "method": "parametric_memory_register",
                         "config": {
                             "adapter_uri": "file:///tmp/qwen-memory-adapter",
-                            "base_model": "Qwen/Qwen3.6-35B-A3B",
+                            "base_model": "stale/wrong-model",
                         },
                     },
                 },

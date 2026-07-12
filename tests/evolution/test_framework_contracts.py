@@ -316,6 +316,28 @@ def test_project_target_map_is_deeply_copyable_and_has_typed_schema() -> None:
         adapter.validate_python(target_map)
 
 
+def test_project_config_and_target_map_are_resource_bounded() -> None:
+    nested: dict[str, object] = {}
+    for _ in range(17):
+        nested = {"next": nested}
+
+    with pytest.raises(ValueError, match="depth budget"):
+        ProjectEvolutionConfig(nested)
+    with pytest.raises(ValueError, match="collection is too large"):
+        ProjectEvolutionConfig({"items": [None] * 4097})
+    with pytest.raises(ValueError, match="node budget"):
+        ProjectEvolutionConfig({"items": [[None] for _ in range(4096)]})
+    with pytest.raises(ValueError, match="text budget"):
+        ProjectEvolutionConfig({"text": "x" * (512 * 1024 + 1)})
+    with pytest.raises(ValueError, match="at most 128 targets"):
+        ProjectEvolutionTargetMap(
+            {
+                f"target_{index}": {"enabled": False}
+                for index in range(129)
+            }
+        )
+
+
 def test_enabled_project_target_requires_method_or_auto() -> None:
     with pytest.raises(ValidationError, match="enabled target requires method"):
         ProjectEvolutionTargetSelection(enabled=True)

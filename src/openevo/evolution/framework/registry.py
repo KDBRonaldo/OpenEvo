@@ -32,7 +32,11 @@ from .handler_validation import (
 from .handler_validation import validate_handler_outputs as validate_target_handler_outputs
 from .handlers import TargetHandlerInput
 from .plan import EvolutionPlan, EvolutionTargetSelection, ResolvedEvolutionSelection
-from .schema import normalize_config, normalize_partial_config, validate_config_schema
+from .schema import (
+    normalize_config_override,
+    normalize_partial_config,
+    validate_config_schema,
+)
 from .support import MethodSupportOverall, evaluate_method_support
 
 
@@ -119,27 +123,6 @@ def _validate_entry_point(ref: ImplementationRef, owner: str) -> None:
         raise ValueError(f"{owner} has malformed implementation entry_point")
 
 
-def _merge_json(base: Any, override: Any) -> Any:
-    if isinstance(base, dict) and isinstance(override, dict):
-        merged = {key: _copy_json(value) for key, value in base.items()}
-        for key, value in override.items():
-            merged[key] = (
-                _merge_json(merged[key], value)
-                if key in merged
-                else _copy_json(value)
-            )
-        return merged
-    return _copy_json(override)
-
-
-def _copy_json(value: Any) -> Any:
-    if isinstance(value, dict):
-        return {key: _copy_json(item) for key, item in value.items()}
-    if isinstance(value, list | tuple):
-        return [_copy_json(item) for item in value]
-    return value
-
-
 @dataclass(frozen=True, slots=True)
 class RegistrySnapshot:
     targets: CanonicalModelView[EvolutionTargetDescriptor]
@@ -180,9 +163,12 @@ class RegistrySnapshot:
             method = self.methods[method_id]
         except KeyError as exc:
             raise ValueError(f"unknown method {method_id!r}") from exc
-        merged = _merge_json(method.default_config, dict(config))
         try:
-            return normalize_config(method.config_schema, merged)
+            return normalize_config_override(
+                method.config_schema,
+                method.default_config,
+                dict(config),
+            )
         except ValueError as exc:
             raise ValueError(f"invalid config for method {method.id!r}: {exc}") from exc
 
@@ -466,6 +452,26 @@ class EvolutionFrameworkRegistry:
                     f"method {method.id!r} does not output target artifact type "
                     f"{target.artifact_type!r}"
                 )
+            injected_fields = {
+                injection.field_name
+                for injection in method.project_config_injections
+            }
+            root_annotations = [
+                method.config_schema.get("default"),
+                method.config_schema.get("const"),
+            ]
+            enum_annotation = method.config_schema.get("enum")
+            if isinstance(enum_annotation, list):
+                root_annotations.extend(enum_annotation)
+            if any(
+                isinstance(annotation, Mapping)
+                and bool(injected_fields.intersection(annotation))
+                for annotation in root_annotations
+            ):
+                raise ValueError(
+                    f"method {method.id!r} root schema annotation embeds injected "
+                    "project config fields"
+                )
             try:
                 validate_config_schema(method.config_schema)
                 validate_user_config_schema_ownership(method.config_schema)
@@ -473,6 +479,13 @@ class EvolutionFrameworkRegistry:
                 raise ValueError(
                     f"method {method.id!r} has invalid config schema: {exc}"
                 ) from exc
+            config_properties = method.config_schema.get("properties", {})
+            missing_injected_fields = injected_fields.difference(config_properties)
+            if missing_injected_fields:
+                raise ValueError(
+                    f"method {method.id!r} injects undeclared project config fields: "
+                    + ", ".join(sorted(missing_injected_fields))
+                )
             try:
                 normalize_partial_config(method.config_schema, method.default_config)
             except ValueError as exc:

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from enum import StrEnum
 
-from pydantic import field_validator, model_validator
+from pydantic import Field, field_validator, model_validator
 
 from .contracts import (
     EvolutionExecutionProfile,
@@ -31,8 +31,8 @@ class MethodSupportOverall(StrEnum):
 class AxisSupport(_Contract):
     state: SupportState
     reason_code: str | None = None
-    message: str
-    missing_requirements: tuple[str, ...] = ()
+    message: str = Field(max_length=4096)
+    missing_requirements: tuple[str, ...] = Field(default=(), max_length=256)
 
     _reason = field_validator("reason_code")(_optional_stable_id)
     _message = field_validator("message")(_text)

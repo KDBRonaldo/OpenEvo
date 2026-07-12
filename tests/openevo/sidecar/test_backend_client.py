@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import httpx
@@ -11,6 +12,7 @@ from desktop.sidecar.backend_client import (
     BackendClient,
     BackendConnection,
     DesktopBackendError,
+    MAX_CAPABILITIES_RESPONSE_BYTES,
 )
 
 
@@ -197,6 +199,265 @@ def test_backend_client_normalizes_invalid_capabilities_json() -> None:
     assert exc_info.value.status_code == 502
     assert exc_info.value.error["code"] == "backend_capabilities_invalid"
     assert exc_info.value.error["details"]["execution_mode"] == "self-deployed"
+
+
+def test_backend_client_rejects_capabilities_above_declared_byte_limit() -> None:
+    http_client = httpx.Client(
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(
+                200,
+                headers={
+                    "Content-Length": str(MAX_CAPABILITIES_RESPONSE_BYTES + 1)
+                },
+                content=b"{}",
+            )
+        )
+    )
+    client = BackendClient(
+        BackendConnection(base_url="http://openevo.test"),
+        http_client=http_client,
+    )
+
+    with pytest.raises(DesktopBackendError) as exc_info:
+        client.capabilities("self-deployed")
+
+    assert exc_info.value.status_code == 502
+    assert exc_info.value.error["code"] == "backend_capabilities_invalid"
+
+
+def test_backend_client_rejects_chunked_capabilities_above_byte_limit() -> None:
+    class OversizedStream(httpx.SyncByteStream):
+        def __iter__(self):
+            yield b"{" + (b" " * MAX_CAPABILITIES_RESPONSE_BYTES)
+
+    http_client = httpx.Client(
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(200, stream=OversizedStream())
+        )
+    )
+    client = BackendClient(
+        BackendConnection(base_url="http://openevo.test"),
+        http_client=http_client,
+    )
+
+    with pytest.raises(DesktopBackendError) as exc_info:
+        client.capabilities("codex_subscription_transcript")
+
+    assert exc_info.value.status_code == 502
+    assert exc_info.value.error["code"] == "backend_capabilities_invalid"
+
+
+def test_backend_client_rejects_capabilities_larger_than_declared_length() -> None:
+    class DishonestStream(httpx.SyncByteStream):
+        def __iter__(self):
+            yield b"{" + (b" " * MAX_CAPABILITIES_RESPONSE_BYTES)
+
+    http_client = httpx.Client(
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(
+                200,
+                headers={"Content-Length": "2"},
+                stream=DishonestStream(),
+            )
+        )
+    )
+    client = BackendClient(
+        BackendConnection(base_url="http://openevo.test"),
+        http_client=http_client,
+    )
+
+    with pytest.raises(DesktopBackendError) as exc_info:
+        client.capabilities("self-deployed")
+
+    assert exc_info.value.error["code"] == "backend_capabilities_invalid"
+
+
+def test_backend_client_rejects_chunked_typed_error_above_byte_limit() -> None:
+    class OversizedErrorStream(httpx.SyncByteStream):
+        def __iter__(self):
+            yield b"{" + (b" " * (64 * 1024))
+
+    http_client = httpx.Client(
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(503, stream=OversizedErrorStream())
+        )
+    )
+    client = BackendClient(
+        BackendConnection(base_url="http://openevo.test"),
+        http_client=http_client,
+    )
+
+    with pytest.raises(DesktopBackendError) as exc_info:
+        client.capabilities("codex_subscription_transcript")
+
+    assert exc_info.value.status_code == 502
+    assert exc_info.value.error["code"] == "backend_capabilities_invalid"
+
+
+def test_backend_client_redacts_remote_capabilities_error_details() -> None:
+    http_client = httpx.Client(
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(
+                503,
+                json={
+                    "code": "capabilities_unavailable",
+                    "message": "Internal path /srv/private and token are unavailable.",
+                    "severity": "blocking",
+                    "category": "service",
+                    "retryable": True,
+                    "repair_action": "openevo_can_retry",
+                    "details": {"secret": "do-not-forward"},
+                    "logs_ref": "/srv/private/backend.log",
+                },
+            )
+        )
+    )
+    client = BackendClient(
+        BackendConnection(base_url="http://openevo.test"),
+        http_client=http_client,
+    )
+
+    with pytest.raises(DesktopBackendError) as exc_info:
+        client.capabilities("self-deployed")
+
+    assert exc_info.value.status_code == 503
+    assert exc_info.value.error == {
+        "code": "capabilities_unavailable",
+        "message": "Remote OpenEvo backend could not provide capabilities.",
+        "severity": "blocking",
+        "category": "service",
+        "retryable": True,
+        "repair_action": "openevo_can_retry",
+        "details": {"execution_mode": "self-deployed"},
+        "logs_ref": "services/openevo-backend",
+    }
+
+
+def test_backend_client_posts_bounded_project_validation_request() -> None:
+    request_payload = {
+        "execution_mode": "self-deployed",
+        "expected_registry_digest": "a" * 64,
+        "agent_model": "\u6a21\u578b/Qwen3-Coder-30B-A3B-Instruct",
+        "targets": {},
+    }
+    expected_body = json.dumps(
+        request_payload,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "POST"
+        assert request.url.path == "/evolution/project-validation"
+        assert request.headers["content-type"] == "application/json"
+        assert request.content == expected_body
+        assert int(request.headers["content-length"]) == len(expected_body)
+        assert json.loads(request.content) == request_payload
+        return httpx.Response(
+            200,
+            json={"valid": True, "registry_digest": "a" * 64},
+        )
+
+    http_client = httpx.Client(transport=httpx.MockTransport(handler))
+    client = BackendClient(
+        BackendConnection(base_url="http://openevo.test"),
+        http_client=http_client,
+    )
+
+    assert client.validate_evolution_project(request_payload) == {
+        "valid": True,
+        "registry_digest": "a" * 64,
+    }
+
+
+def test_backend_client_rejects_oversized_project_validation_before_transport() -> None:
+    transport_called = False
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal transport_called
+        transport_called = True
+        return httpx.Response(200, json={"valid": True, "registry_digest": "a" * 64})
+
+    client = BackendClient(
+        BackendConnection(base_url="http://openevo.test"),
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    with pytest.raises(DesktopBackendError) as exc_info:
+        client.validate_evolution_project(
+            {
+                "execution_mode": "self-deployed",
+                "expected_registry_digest": "a" * 64,
+                "agent_model": "Qwen/Qwen3-Coder-30B-A3B-Instruct",
+                "targets": {
+                    "text_memory": {
+                        "enabled": False,
+                        "method": "text_memory",
+                        "config": {"opaque": "x" * (1024 * 1024)},
+                    }
+                },
+            }
+        )
+
+    assert transport_called is False
+    assert exc_info.value.error["code"] == "backend_evolution_validation_invalid"
+
+
+def test_backend_client_redacts_project_validation_error() -> None:
+    http_client = httpx.Client(
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(
+                409,
+                json={
+                    "code": "evolution_project_invalid",
+                    "message": "Internal path /srv/private is invalid.",
+                    "severity": "blocking",
+                    "category": "project",
+                    "retryable": False,
+                    "repair_action": "openevo_can_reconfigure",
+                    "details": {
+                        "target_id": "agent_system",
+                        "selection": "auto",
+                        "reason_code": "invalid_method_config_or_profile",
+                        "registry_digest": "a" * 64,
+                        "secret": "do-not-forward",
+                    },
+                    "logs_ref": "/srv/private/backend.log",
+                },
+            )
+        )
+    )
+    client = BackendClient(
+        BackendConnection(base_url="http://openevo.test"),
+        http_client=http_client,
+    )
+
+    with pytest.raises(DesktopBackendError) as exc_info:
+        client.validate_evolution_project(
+            {
+                "execution_mode": "codex_subscription_transcript",
+                "expected_registry_digest": "a" * 64,
+                "agent_model": "gpt-5.1-codex-mini",
+                "targets": {},
+            }
+        )
+
+    assert exc_info.value.error == {
+        "code": "evolution_project_invalid",
+        "message": "Remote OpenEvo backend could not validate this project.",
+        "severity": "blocking",
+        "category": "project",
+        "retryable": False,
+        "repair_action": "openevo_can_reconfigure",
+        "details": {
+            "target_id": "agent_system",
+            "selection": "auto",
+            "reason_code": "invalid_method_config_or_profile",
+            "registry_digest": "a" * 64,
+        },
+        "logs_ref": "services/openevo-backend",
+    }
 
 
 class _FakeBackendClient:

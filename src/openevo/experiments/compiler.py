@@ -7,11 +7,14 @@ from typing import Any
 
 from openevo.evolution.framework import (
     EvolutionExecutionProfile,
+    EvolutionMethodDescriptor,
     EvolutionPlan,
     EvolutionTargetSelection,
     InputBindingSource,
     MethodInputBinding,
     ProjectEvolutionTargetSelection,
+    ProjectEvolutionTargetMap,
+    ProjectConfigInjectionSource,
     RegistrySnapshot,
     ResolvedEvolutionSelection,
     canonical_digest,
@@ -36,6 +39,22 @@ _SUBSCRIPTION_AUTH_MODES = {"subscription", "chatgpt_subscription"}
 
 
 ContextArtifactIds = Mapping[str, str | Sequence[str]] | Sequence[str] | None
+
+
+class ProjectEvolutionValidationError(ValueError):
+    """A project selection rejected before any run process is launched."""
+
+    def __init__(
+        self,
+        *,
+        target_id: str,
+        selection: str | None,
+        reason_code: str,
+    ) -> None:
+        super().__init__(f"invalid project evolution selection for {target_id!r}")
+        self.target_id = target_id
+        self.selection = selection
+        self.reason_code = reason_code
 
 
 @dataclass(frozen=True)
@@ -466,6 +485,85 @@ def compile_experiment(
     )
 
 
+def validate_project_evolution_selections(
+    targets: ProjectEvolutionTargetMap,
+    *,
+    agent_model: str,
+    reflector_llm: Mapping[str, str],
+    registry_snapshot: RegistrySnapshot,
+    execution_profile: EvolutionExecutionProfile,
+) -> None:
+    """Validate direct, hidden, and resolver selections against one registry."""
+
+    for target_id, requested in targets.items():
+        if not requested.enabled:
+            continue
+        try:
+            target = registry_snapshot.targets[target_id]
+        except KeyError as exc:
+            raise ProjectEvolutionValidationError(
+                target_id=target_id,
+                selection=requested.method,
+                reason_code="unknown_target",
+            ) from exc
+        try:
+            resolved_method_id = _resolve_project_method_id(
+                target_id,
+                requested.method,
+                prior_dataset_artifact_ids=(),
+                registry_snapshot=registry_snapshot,
+            )
+        except ValueError as exc:
+            raise ProjectEvolutionValidationError(
+                target_id=target_id,
+                selection=requested.method,
+                reason_code="unknown_or_unsupported_selection",
+            ) from exc
+        resolver = next(
+            (
+                candidate
+                for candidate in target.selection_resolvers
+                if candidate.selection_value == requested.method
+            ),
+            None,
+        )
+        method_ids = (
+            resolver.resolved_method_ids
+            if resolver is not None
+            else (resolved_method_id,)
+        )
+        for method_id in method_ids:
+            method = registry_snapshot.methods.get(method_id)
+            if method is None:
+                raise ProjectEvolutionValidationError(
+                    target_id=target_id,
+                    selection=requested.method,
+                    reason_code="unknown_resolved_method",
+                )
+            config = _project_method_config(
+                requested.config,
+                method_descriptor=method,
+                agent_model=agent_model,
+                reflector_llm=reflector_llm,
+            )
+            try:
+                registry_snapshot.resolve_selection(
+                    EvolutionTargetSelection(
+                        target_id=target_id,
+                        enabled=True,
+                        method_id=method_id,
+                        config=config,
+                    ),
+                    execution_profile,
+                )
+            except ValueError as exc:
+                raise ProjectEvolutionValidationError(
+                    target_id=target_id,
+                    selection=requested.method,
+                    reason_code="invalid_method_config_or_profile",
+                ) from exc
+
+
 def _normalize_run_id(run_id: str | None) -> str | None:
     if run_id is None:
         return None
@@ -542,32 +640,21 @@ def _plan_selections(
             continue
         if target_id not in registry_snapshot.targets:
             raise ValueError(f"unknown target {target_id!r}")
-        method_id = requested.method
-        if method_id == "auto":
-            if target_id != "agent_system":
-                raise ValueError(
-                    f"automatic method resolution is unsupported for target {target_id!r}"
-                )
-            method_id = resolve_agent_system_method(
-                method_id,
-                prior_dataset_artifact_ids,
-            )
+        method_id = _resolve_project_method_id(
+            target_id,
+            requested.method,
+            prior_dataset_artifact_ids=prior_dataset_artifact_ids,
+            registry_snapshot=registry_snapshot,
+        )
         method_descriptor = registry_snapshot.methods.get(method_id)
         if method_descriptor is None:
             raise ValueError(f"unknown method {method_id!r}")
-        config = dict(requested.config)
-        config.pop("compatibility", None)
-        if target_id in {"text_memory", "skill_bundle", "agent_system"}:
-            config.pop("reflector_llm", None)
-            if _closed_schema_declares(method_descriptor.config_schema, "reflector_llm"):
-                config["reflector_llm"] = dict(reflector_llm)
-        elif target_id == "parametric_memory":
-            config.pop("reflector_llm", None)
-            if (
-                _closed_schema_declares(method_descriptor.config_schema, "base_model")
-                and not config.get("base_model")
-            ):
-                config["base_model"] = agent_model
+        config = _project_method_config(
+            requested.config,
+            method_descriptor=method_descriptor,
+            agent_model=agent_model,
+            reflector_llm=reflector_llm,
+        )
         selections.append(
             EvolutionTargetSelection(
                 target_id=target_id,
@@ -642,11 +729,63 @@ def _input_artifact_ids_for_binding(
     raise ValueError(f"unsupported input binding source {binding.source!r}")
 
 
-def _closed_schema_declares(schema: Mapping[str, Any], property_name: str) -> bool:
-    if schema.get("additionalProperties") is not False:
-        return False
-    properties = schema.get("properties")
-    return isinstance(properties, Mapping) and property_name in properties
+def _project_method_config(
+    requested_config: Mapping[str, Any],
+    *,
+    method_descriptor: EvolutionMethodDescriptor,
+    agent_model: str,
+    reflector_llm: Mapping[str, str],
+) -> dict[str, Any]:
+    config = dict(requested_config)
+    config.pop("compatibility", None)
+    for injection in method_descriptor.project_config_injections:
+        config.pop(injection.field_name, None)
+        if injection.source is ProjectConfigInjectionSource.REFLECTOR_LLM:
+            config[injection.field_name] = dict(reflector_llm)
+        elif injection.source is ProjectConfigInjectionSource.AGENT_MODEL:
+            config[injection.field_name] = agent_model
+        else:  # pragma: no cover - the descriptor enum is closed.
+            raise ValueError(
+                f"unsupported project config injection source {injection.source!r}"
+            )
+    return config
+
+
+def _resolve_project_method_id(
+    target_id: str,
+    requested_method: str | None,
+    *,
+    prior_dataset_artifact_ids: tuple[str, ...],
+    registry_snapshot: RegistrySnapshot,
+) -> str:
+    target = registry_snapshot.targets[target_id]
+    resolver = next(
+        (
+            candidate
+            for candidate in target.selection_resolvers
+            if candidate.selection_value == requested_method
+        ),
+        None,
+    )
+    if resolver is None:
+        if requested_method is None:
+            raise ValueError(f"target {target_id!r} has no selected method")
+        return requested_method
+    if target_id != "agent_system" or requested_method != "auto":
+        raise ValueError(
+            f"selection resolver {requested_method!r} is unsupported for target "
+            f"{target_id!r}"
+        )
+    resolved = resolve_agent_system_method(
+        requested_method,
+        prior_dataset_artifact_ids,
+    )
+    if resolved not in resolver.resolved_method_ids:
+        raise ValueError(
+            f"selection resolver {requested_method!r} returned undeclared method "
+            f"{resolved!r}"
+        )
+    return resolved
 
 
 def _ordered_plan_selections(

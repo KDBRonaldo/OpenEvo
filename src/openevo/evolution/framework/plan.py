@@ -31,7 +31,48 @@ from .contracts import (
 )
 
 _MAX_SAFE_JSON_INTEGER = 9_007_199_254_740_991
+_MAX_PROJECT_CONFIG_DEPTH = 16
+_MAX_PROJECT_CONFIG_NODES = 8192
+_MAX_PROJECT_CONFIG_COLLECTION_ITEMS = 8192
+_MAX_PROJECT_CONFIG_SINGLE_COLLECTION = 4096
+_MAX_PROJECT_CONFIG_TEXT_CHARACTERS = 512 * 1024
+_MAX_PROJECT_TARGETS = 128
 _PROJECT_CONFIG_SERIALIZER = TypeAdapter(dict[str, Any])
+
+
+def _validate_project_config_budget(value: object) -> None:
+    stack: list[tuple[object, int]] = [(value, 1)]
+    nodes = 0
+    collection_items = 0
+    text_characters = 0
+    while stack:
+        current, depth = stack.pop()
+        nodes += 1
+        if nodes > _MAX_PROJECT_CONFIG_NODES:
+            raise ValueError("project config exceeds the node budget")
+        if depth > _MAX_PROJECT_CONFIG_DEPTH:
+            raise ValueError("project config exceeds the depth budget")
+        if isinstance(current, str):
+            text_characters += len(current)
+        elif isinstance(current, Mapping):
+            size = len(current)
+            if size > _MAX_PROJECT_CONFIG_SINGLE_COLLECTION:
+                raise ValueError("project config collection is too large")
+            collection_items += size
+            for key, item in current.items():
+                if isinstance(key, str):
+                    text_characters += len(key)
+                stack.append((item, depth + 1))
+        elif isinstance(current, (list, tuple)):
+            size = len(current)
+            if size > _MAX_PROJECT_CONFIG_SINGLE_COLLECTION:
+                raise ValueError("project config collection is too large")
+            collection_items += size
+            stack.extend((item, depth + 1) for item in current)
+        if collection_items > _MAX_PROJECT_CONFIG_COLLECTION_ITEMS:
+            raise ValueError("project config exceeds the collection budget")
+        if text_characters > _MAX_PROJECT_CONFIG_TEXT_CHARACTERS:
+            raise ValueError("project config exceeds the text budget")
 
 
 def _project_config_json_value(value: Any, path: str = "$") -> Any:
@@ -116,6 +157,7 @@ class ProjectEvolutionConfig(Mapping[str, Any]):
 
     def __init__(self, values: Mapping[str, object] | None = None) -> None:
         source: Mapping[str, object] = {} if values is None else values
+        _validate_project_config_budget(source)
         copied = _project_config_json_value(_json_value(source))
         if not isinstance(copied, dict):  # Mapping input makes this unreachable.
             raise ValueError("config must be a JSON object")
@@ -267,6 +309,8 @@ def validate_project_target_map_keys(value: object) -> object:
 
     if not isinstance(value, Mapping):
         raise ValueError("evolution.targets must be a JSON object")
+    if len(value) > _MAX_PROJECT_TARGETS:
+        raise ValueError(f"evolution.targets supports at most {_MAX_PROJECT_TARGETS} targets")
     for target_id in value:
         if type(target_id) is not str:
             raise ValueError("evolution target IDs must be strings")

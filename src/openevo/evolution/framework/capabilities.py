@@ -3,16 +3,19 @@
 from __future__ import annotations
 
 import json
+import math
 from enum import StrEnum
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
-from pydantic import field_validator, model_validator
+from pydantic import Field, field_validator, model_validator
 
 from .contracts import (
     CaptureMode,
     EvolutionExecutionProfile,
     ExecutionMode,
     Exposure,
+    MAX_JAVASCRIPT_SAFE_INTEGER,
+    MAX_CONTRACT_JSON_BYTES,
     Maturity,
     RendererKind,
     _Contract,
@@ -23,10 +26,121 @@ from .contracts import (
     canonical_json,
 )
 from .execution import MethodInputBinding
+from .schema import normalize_partial_config, validate_config_schema
 from .support import MethodSupport, MethodSupportOverall, evaluate_method_support
 
 if TYPE_CHECKING:
+    from .descriptors import EvolutionMethodDescriptor
     from .registry import RegistrySnapshot
+
+
+_MAX_CAPABILITY_JSON_DEPTH = 16
+_MAX_CAPABILITY_JSON_NODES = 8192
+_MAX_CAPABILITY_TARGETS = 128
+_MAX_CAPABILITY_METHODS = 256
+_MAX_CAPABILITY_RESOLVERS = 64
+_MAX_CAPABILITY_PAYLOAD_NODES = 131_072
+_MAX_CAPABILITY_COLLECTION_ITEMS = 65_536
+_MAX_CAPABILITY_SINGLE_COLLECTION = 4_096
+_MAX_CAPABILITY_TEXT_CHARACTERS = 4 * 1024 * 1024
+
+
+def _validate_capability_payload_budget(value: object) -> None:
+    stack = [value]
+    nodes = 0
+    collection_items = 0
+    text_characters = 0
+    while stack:
+        current = stack.pop()
+        nodes += 1
+        if nodes > _MAX_CAPABILITY_PAYLOAD_NODES:
+            raise ValueError("capability payload exceeds the node budget")
+        if isinstance(current, bool) or current is None:
+            continue
+        if isinstance(current, str):
+            text_characters += len(current)
+            if text_characters > _MAX_CAPABILITY_TEXT_CHARACTERS:
+                raise ValueError("capability payload exceeds the text budget")
+            continue
+        if isinstance(current, int):
+            if abs(current) > MAX_JAVASCRIPT_SAFE_INTEGER:
+                raise ValueError(
+                    "capability payload integer exceeds the JavaScript safe range"
+                )
+            continue
+        if isinstance(current, float):
+            if (
+                math.isfinite(current)
+                and current.is_integer()
+                and abs(current) > MAX_JAVASCRIPT_SAFE_INTEGER
+            ):
+                raise ValueError(
+                    "capability payload integer exceeds the JavaScript safe range"
+                )
+            continue
+        if isinstance(current, dict):
+            size = len(current)
+            if size > _MAX_CAPABILITY_SINGLE_COLLECTION:
+                raise ValueError("capability payload collection is too large")
+            collection_items += size
+            if collection_items > _MAX_CAPABILITY_COLLECTION_ITEMS:
+                raise ValueError("capability payload exceeds the collection budget")
+            for key, item in current.items():
+                if isinstance(key, str):
+                    text_characters += len(key)
+                stack.append(item)
+            if text_characters > _MAX_CAPABILITY_TEXT_CHARACTERS:
+                raise ValueError("capability payload exceeds the text budget")
+            continue
+        if isinstance(current, list | tuple):
+            size = len(current)
+            if size > _MAX_CAPABILITY_SINGLE_COLLECTION:
+                raise ValueError("capability payload collection is too large")
+            collection_items += size
+            if collection_items > _MAX_CAPABILITY_COLLECTION_ITEMS:
+                raise ValueError("capability payload exceeds the collection budget")
+            stack.extend(current)
+
+
+def _validate_desktop_safe_integers(value: object, path: str) -> None:
+    stack: list[tuple[object, str, int]] = [(value, path, 1)]
+    nodes = 0
+    while stack:
+        current, current_path, depth = stack.pop()
+        nodes += 1
+        if nodes > _MAX_CAPABILITY_JSON_NODES:
+            raise ValueError(f"{path} exceeds the capability JSON node limit")
+        if depth > _MAX_CAPABILITY_JSON_DEPTH:
+            raise ValueError(f"{path} exceeds the capability JSON depth limit")
+        if isinstance(current, bool) or current is None or isinstance(current, str):
+            continue
+        if isinstance(current, int):
+            if abs(current) > MAX_JAVASCRIPT_SAFE_INTEGER:
+                raise ValueError(
+                    f"{current_path} exceeds the JavaScript safe integer range"
+                )
+            continue
+        if isinstance(current, float):
+            if (
+                math.isfinite(current)
+                and current.is_integer()
+                and abs(current) > MAX_JAVASCRIPT_SAFE_INTEGER
+            ):
+                raise ValueError(
+                    f"{current_path} exceeds the JavaScript safe integer range"
+                )
+            continue
+        if isinstance(current, list):
+            stack.extend(
+                (item, f"{current_path}[{index}]", depth + 1)
+                for index, item in enumerate(current)
+            )
+            continue
+        if isinstance(current, dict):
+            stack.extend(
+                (item, f"{current_path}.{key}", depth + 1)
+                for key, item in current.items()
+            )
 
 
 class CapabilityAudience(StrEnum):
@@ -37,17 +151,17 @@ class CapabilityAudience(StrEnum):
 
 class EvolutionMethodCapabilityV1(_Contract):
     method_id: str
-    display_name: str
-    description: str
+    display_name: str = Field(max_length=4096)
+    description: str = Field(max_length=4096)
     exposure: Exposure
     maturity: Maturity
     execution_modes: tuple[ExecutionMode, ...]
     capture_modes: tuple[CaptureMode, ...]
-    supported_harness_ids: tuple[str, ...]
-    harness_requirements: tuple[str, ...]
-    runtime_requirements: tuple[str, ...]
-    input_bindings: tuple[MethodInputBinding, ...]
-    output_artifact_types: tuple[str, ...]
+    supported_harness_ids: tuple[str, ...] = Field(max_length=256)
+    harness_requirements: tuple[str, ...] = Field(max_length=256)
+    runtime_requirements: tuple[str, ...] = Field(max_length=256)
+    input_bindings: tuple[MethodInputBinding, ...] = Field(max_length=256)
+    output_artifact_types: tuple[str, ...] = Field(max_length=256)
     config_schema_json: str
     default_config_json: str
     implementation_identity_digest: str
@@ -59,16 +173,25 @@ class EvolutionMethodCapabilityV1(_Contract):
 
     @model_validator(mode="after")
     def _canonical_config_json(self) -> EvolutionMethodCapabilityV1:
+        decoded: dict[str, dict[str, Any]] = {}
         for label, encoded in (
             ("config_schema", self.config_schema_json),
             ("default_config", self.default_config_json),
         ):
+            if len(encoded.encode("utf-8")) > MAX_CONTRACT_JSON_BYTES:
+                raise ValueError(f"{label}_json exceeds maximum bytes")
             try:
                 value = json.loads(encoded)
             except json.JSONDecodeError as exc:
                 raise ValueError(f"{label}_json must contain canonical JSON") from exc
             if not isinstance(value, dict) or canonical_json(value) != encoded:
                 raise ValueError(f"{label}_json must be a canonical JSON object")
+            _validate_desktop_safe_integers(value, f"{label}_json")
+            decoded[label] = value
+        schema = decoded["config_schema"]
+        default = decoded["default_config"]
+        validate_config_schema(schema)
+        normalize_partial_config(schema, default)
         return self
 
 
@@ -83,9 +206,11 @@ class EvolutionResolvedMethodCapabilityV1(_Contract):
 
 class EvolutionSelectionResolverCapabilityV1(_Contract):
     selection_value: str
-    display_name: str
-    description: str
-    resolved_methods: tuple[EvolutionResolvedMethodCapabilityV1, ...]
+    display_name: str = Field(max_length=4096)
+    description: str = Field(max_length=4096)
+    resolved_methods: tuple[EvolutionResolvedMethodCapabilityV1, ...] = Field(
+        max_length=_MAX_CAPABILITY_METHODS
+    )
 
     _selection = field_validator("selection_value")(_stable_id)
     _text_fields = field_validator("display_name", "description")(_text)
@@ -104,8 +229,8 @@ class EvolutionSelectionResolverCapabilityV1(_Contract):
 
 class EvolutionTargetCapabilityV1(_Contract):
     target_id: str
-    display_name: str
-    description: str
+    display_name: str = Field(max_length=4096)
+    description: str = Field(max_length=4096)
     artifact_type: str
     exposure: Exposure
     maturity: Maturity
@@ -116,12 +241,18 @@ class EvolutionTargetCapabilityV1(_Contract):
     renderer_kind: RendererKind
     renderer_contract_version: str
     contribution_contract_version: str
-    context_order: int
+    context_order: int = Field(ge=0, le=10_000)
     implementation_identity_digest: str
     handler_identity_digest: str
-    accepted_methods: tuple[EvolutionResolvedMethodCapabilityV1, ...]
-    selection_resolvers: tuple[EvolutionSelectionResolverCapabilityV1, ...]
-    methods: tuple[EvolutionMethodCapabilityV1, ...]
+    accepted_methods: tuple[EvolutionResolvedMethodCapabilityV1, ...] = Field(
+        max_length=_MAX_CAPABILITY_METHODS
+    )
+    selection_resolvers: tuple[EvolutionSelectionResolverCapabilityV1, ...] = Field(
+        max_length=_MAX_CAPABILITY_RESOLVERS
+    )
+    methods: tuple[EvolutionMethodCapabilityV1, ...] = Field(
+        max_length=_MAX_CAPABILITY_METHODS
+    )
 
     _ids = field_validator(
         "target_id", "artifact_type", "handler_id", "configured_default_method_id"
@@ -219,10 +350,19 @@ class EvolutionCapabilitiesV1(_Contract):
     core_version: str
     registry_digest: str
     evaluated_profile: EvolutionExecutionProfile
-    targets: tuple[EvolutionTargetCapabilityV1, ...]
+    targets: tuple[EvolutionTargetCapabilityV1, ...] = Field(
+        max_length=_MAX_CAPABILITY_TARGETS
+    )
 
     _version = field_validator("core_version")(_text)
     _digest = field_validator("registry_digest")(_digest)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _bounded_payload(cls, value: object) -> object:
+        if not isinstance(value, cls):
+            _validate_capability_payload_budget(value)
+        return value
 
     @field_validator("targets")
     @classmethod
@@ -282,6 +422,7 @@ def build_evolution_capabilities(
                 or method.exposure not in visible_exposures
             ):
                 continue
+            project_schema, project_default = _project_config_contract(method)
             methods.append(
                 EvolutionMethodCapabilityV1(
                     method_id=method.id,
@@ -296,8 +437,8 @@ def build_evolution_capabilities(
                     runtime_requirements=method.runtime_requirements,
                     input_bindings=method.input_bindings,
                     output_artifact_types=method.output_artifact_types,
-                    config_schema_json=canonical_json(method.config_schema),
-                    default_config_json=canonical_json(method.default_config),
+                    config_schema_json=canonical_json(project_schema),
+                    default_config_json=canonical_json(project_default),
                     implementation_identity_digest=snapshot.identity_digest_for(
                         "method", method.id
                     ),
@@ -364,6 +505,30 @@ def build_evolution_capabilities(
         evaluated_profile=profile,
         targets=tuple(targets),
     )
+
+
+def _project_config_contract(
+    method: EvolutionMethodDescriptor,
+) -> tuple[dict[str, object], dict[str, object]]:
+    schema = json.loads(canonical_json(method.config_schema))
+    default = json.loads(canonical_json(method.default_config))
+    injected = {
+        injection.field_name for injection in method.project_config_injections
+    }
+    properties = schema.get("properties", {})
+    if isinstance(properties, dict):
+        for field_name in injected:
+            properties.pop(field_name, None)
+    required = schema.get("required")
+    if isinstance(required, list):
+        remaining = [field_name for field_name in required if field_name not in injected]
+        if remaining:
+            schema["required"] = remaining
+        else:
+            schema.pop("required", None)
+    for field_name in injected:
+        default.pop(field_name, None)
+    return schema, default
 
 
 __all__ = [

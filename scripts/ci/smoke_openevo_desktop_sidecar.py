@@ -29,6 +29,7 @@ EXPECTED_DESKTOP_METHOD_IDS = frozenset(
         "text_memory_expel_reflector",
     }
 )
+CORE_OWNED_PROJECT_FIELDS = frozenset({"reflector_llm", "base_model"})
 EXPECTED_DESKTOP_TARGET_IDS = frozenset(
     {"agent_system", "skill_bundle", "text_memory"}
 )
@@ -223,6 +224,7 @@ def _assert_capabilities(
                     "capabilities response does not support agent_system auto"
                 )
     for method in methods:
+        _assert_project_method_contract(method)
         identity = method.get("implementation_identity_digest")
         if (
             not isinstance(identity, str)
@@ -230,6 +232,36 @@ def _assert_capabilities(
             or method.get("support", {}).get("overall") != "supported"
         ):
             raise SmokeFailure("capabilities response has an unsupported method")
+
+
+def _assert_project_method_contract(method: dict[str, Any]) -> None:
+    decoded: dict[str, dict[str, Any]] = {}
+    for field_name in ("config_schema_json", "default_config_json"):
+        encoded = method.get(field_name)
+        try:
+            value = json.loads(encoded)
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise SmokeFailure(
+                f"capabilities method has invalid {field_name}"
+            ) from exc
+        if not isinstance(value, dict):
+            raise SmokeFailure(f"capabilities method has non-object {field_name}")
+        decoded[field_name] = value
+
+    properties = decoded["config_schema_json"].get("properties")
+    leaked_fields = set(
+        CORE_OWNED_PROJECT_FIELDS.intersection(
+            properties if isinstance(properties, dict) else {}
+        )
+    )
+    leaked_fields.update(
+        CORE_OWNED_PROJECT_FIELDS.intersection(decoded["default_config_json"])
+    )
+    if leaked_fields:
+        raise SmokeFailure(
+            "Core-owned field leaked into the Desktop project contract: "
+            + ", ".join(sorted(leaked_fields))
+        )
 
 
 def _smoke_capability_proxy(base_url: str, *, expected_core_version: str) -> str:

@@ -20,6 +20,7 @@ from openevo.evolution.framework import (
     ImplementationRef,
     InstructionContribution,
     PayloadManifestEntry,
+    ProjectConfigInjection,
     RendererPayload,
     RuntimeDestinationRoots,
     StagedPayloadContribution,
@@ -245,6 +246,73 @@ def test_graph_validation_fails_closed(
 ) -> None:
     with pytest.raises(ValueError, match=message):
         _registry(mutate(_descriptors())).freeze()
+
+
+def test_registry_rejects_undeclared_project_config_injection() -> None:
+    descriptors = _replace(
+        _descriptors(),
+        EvolutionMethodDescriptor,
+        project_config_injections=(
+            ProjectConfigInjection(
+                field_name="reflector_llm",
+                source="reflector_llm",
+            ),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="injects undeclared project config fields"):
+        _registry(descriptors).freeze()
+
+
+@pytest.mark.parametrize(
+    ("keyword", "value"),
+    [
+        ("default", {"runtime_context": "model-a"}),
+        ("const", {"runtime_context": "model-a"}),
+        ("enum", [{"runtime_context": "model-a"}]),
+    ],
+)
+def test_registry_rejects_injected_fields_in_root_schema_annotations(
+    keyword: str,
+    value: object,
+) -> None:
+    schema = {
+        "type": "object",
+        "properties": {"runtime_context": {"type": "string"}},
+        "additionalProperties": False,
+        keyword: value,
+    }
+    descriptors = _replace(
+        _descriptors(),
+        EvolutionMethodDescriptor,
+        config_schema=schema,
+        default_config={},
+        project_config_injections=(
+            ProjectConfigInjection(
+                field_name="runtime_context",
+                source="agent_model",
+            ),
+        ),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="root schema annotation embeds injected project config fields",
+    ):
+        _registry(descriptors).freeze()
+
+
+def test_registry_preserves_schema_error_for_malformed_root_enum() -> None:
+    schema = _schema()
+    schema["enum"] = 1
+    descriptors = _replace(
+        _descriptors(),
+        EvolutionMethodDescriptor,
+        config_schema=schema,
+    )
+
+    with pytest.raises(ValueError, match="schema.enum.*non-empty array"):
+        _registry(descriptors).freeze()
 
 
 def test_visible_target_requires_visible_default_method() -> None:

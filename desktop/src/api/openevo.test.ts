@@ -619,6 +619,8 @@ describe("OpenEvo sidecar client", () => {
 
   it("accepts Python canonical numeric spellings in validated config JSON", async () => {
     const payload = remoteCapabilitiesPayload();
+    payload.targets[0].methods[0].config_schema_json =
+      '{"additionalProperties":false,"properties":{"float":{"type":"number"},"negative_zero":{"type":"number"},"small":{"type":"number"}},"type":"object"}';
     payload.targets[0].methods[0].default_config_json =
       '{"float":1.0,"negative_zero":-0.0,"small":1e-07}';
     vi.spyOn(globalThis, "fetch").mockResolvedValue(jsonResponse(payload));
@@ -642,6 +644,31 @@ describe("OpenEvo sidecar client", () => {
       await expect(
         fetchOpenEvoDesktopCapabilities("codex_subscription_transcript"),
       ).rejects.toThrow("default_config_json must contain canonical JSON");
+    },
+  );
+
+  it.each([
+    [
+      "config_schema_json",
+      '{"additionalProperties":false,"patternProperties":{},"properties":{},"type":"object"}',
+      "unsupported schema keyword",
+    ],
+    ["default_config_json", '{"unknown":true}', "unknown property"],
+    [
+      "default_config_json",
+      '{"threshold":9007199254740992}',
+      "safe integer range",
+    ],
+  ])(
+    "rejects an unrenderable capability %s contract",
+    async (field, encoded, message) => {
+      const payload = remoteCapabilitiesPayload();
+      payload.targets[0].methods[0][field] = encoded;
+      vi.spyOn(globalThis, "fetch").mockResolvedValue(jsonResponse(payload));
+
+      await expect(
+        fetchOpenEvoDesktopCapabilities("codex_subscription_transcript"),
+      ).rejects.toThrow(message);
     },
   );
 

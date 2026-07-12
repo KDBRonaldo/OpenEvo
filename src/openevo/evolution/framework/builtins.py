@@ -24,6 +24,7 @@ from .contracts import (
     ImplementationRef,
     Maturity,
     MethodInvocationABI,
+    ProjectConfigInjectionSource,
     RendererKind,
     _Contract,
     _digest,
@@ -32,6 +33,7 @@ from .contracts import (
 )
 from .descriptors import (
     EvolutionMethodDescriptor,
+    ProjectConfigInjection,
     EvolutionSelectionResolverDescriptor,
     EvolutionTargetDescriptor,
     TargetHandlerDescriptor,
@@ -69,6 +71,18 @@ _BOTH_EXECUTION_MODES = (
 _SELF_DEPLOYED = (ExecutionMode.SELF_DEPLOYED,)
 _TEXT_AND_TOKEN_CAPTURE = (CaptureMode.TRANSCRIPT, CaptureMode.TOKEN_LEVEL)
 _CODEX = ("codex",)
+_REFLECTOR_LLM_PROJECT_CONFIG_INJECTIONS = (
+    ProjectConfigInjection(
+        field_name="reflector_llm",
+        source=ProjectConfigInjectionSource.REFLECTOR_LLM,
+    ),
+)
+_AGENT_MODEL_PROJECT_CONFIG_INJECTIONS = (
+    ProjectConfigInjection(
+        field_name="base_model",
+        source=ProjectConfigInjectionSource.AGENT_MODEL,
+    ),
+)
 
 
 class ImplementationDistributionIdentity(_Contract):
@@ -596,6 +610,7 @@ def _method(
     default_config: dict[str, Any] | None = None,
     exposure: Exposure = Exposure.MAINTAINER,
     runtime_requirements: tuple[str, ...] = (),
+    project_config_injections: tuple[ProjectConfigInjection, ...] = (),
 ) -> EvolutionMethodDescriptor:
     return EvolutionMethodDescriptor(
         id=method_id,
@@ -611,6 +626,7 @@ def _method(
         output_artifact_types=output_artifact_types,
         config_schema=config_schema,
         default_config=default_config or {},
+        project_config_injections=project_config_injections,
         exposure=exposure,
         maturity=Maturity.EXPERIMENTAL,
         implementation_ref=identity.ref(f"{_METHODS_MODULE}:{method_id}"),
@@ -643,6 +659,7 @@ def _method_descriptors(
             input_bindings=(_current_dataset(), _prior_target("text_memory")),
             output_artifact_types=("text_memory",),
             config_schema=_reflector_schema(record_limit_name="max_records"),
+            project_config_injections=_REFLECTOR_LLM_PROJECT_CONFIG_INJECTIONS,
         ),
         _method(
             identity,
@@ -658,6 +675,7 @@ def _method_descriptors(
             output_artifact_types=("text_memory",),
             config_schema=_reflector_schema(record_limit_name="max_records"),
             exposure=Exposure.DESKTOP,
+            project_config_injections=_REFLECTOR_LLM_PROJECT_CONFIG_INJECTIONS,
         ),
         _method(
             identity,
@@ -696,6 +714,7 @@ def _method_descriptors(
                 },
             ),
             exposure=Exposure.DESKTOP,
+            project_config_injections=_REFLECTOR_LLM_PROJECT_CONFIG_INJECTIONS,
         ),
         _method(
             identity,
@@ -726,6 +745,7 @@ def _method_descriptors(
                 extra=agent_fields,
             ),
             default_config={"target_path": "AGENTS.md"},
+            project_config_injections=_REFLECTOR_LLM_PROJECT_CONFIG_INJECTIONS,
         ),
         _method(
             identity,
@@ -744,6 +764,7 @@ def _method_descriptors(
                 extra=agent_fields,
             ),
             default_config={"target_path": "AGENTS.md"},
+            project_config_injections=_REFLECTOR_LLM_PROJECT_CONFIG_INJECTIONS,
         ),
         _method(
             identity,
@@ -766,6 +787,7 @@ def _method_descriptors(
                 },
             ),
             default_config={"target_path": "AGENTS.md"},
+            project_config_injections=_REFLECTOR_LLM_PROJECT_CONFIG_INJECTIONS,
         ),
         _method(
             identity,
@@ -789,6 +811,7 @@ def _method_descriptors(
             ),
             default_config={"target_path": "AGENTS.md"},
             exposure=Exposure.DESKTOP,
+            project_config_injections=_REFLECTOR_LLM_PROJECT_CONFIG_INJECTIONS,
         ),
         _method(
             identity,
@@ -813,6 +836,7 @@ def _method_descriptors(
             ),
             exposure=Exposure.INTERNAL,
             runtime_requirements=("adapter_serving",),
+            project_config_injections=_AGENT_MODEL_PROJECT_CONFIG_INJECTIONS,
         ),
         _method(
             identity,

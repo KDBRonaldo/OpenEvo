@@ -13,6 +13,7 @@ from openevo.evolution.framework.schema import (
     MAX_SCHEMA_NODES,
     MAX_STRING_LENGTH,
     normalize_config,
+    normalize_config_override,
     normalize_partial_config,
     validate_config_schema,
     validate_schema,
@@ -86,6 +87,37 @@ def test_normalize_config_applies_nested_defaults_without_mutating_inputs() -> N
     assert normalized["settings"] is not value["settings"]
     assert value == {"settings": {"ratio": 0.5}, "enabled": True, "note": None}
     assert schema["properties"]["tags"]["default"] == ["stable"]
+
+
+def test_normalize_config_override_deep_merges_defaults_and_requires_final_fields() -> None:
+    schema = _object_schema(
+        {
+            "settings": _object_schema(
+                {
+                    "model": {"type": "string"},
+                    "timeout": {"type": "integer", "minimum": 1},
+                    "retries": {"type": "integer", "default": 2},
+                },
+                required=["model", "timeout"],
+            )
+        },
+        required=["settings"],
+    )
+    defaults = {"settings": {"model": "remote-model", "timeout": 30}}
+    override = {"settings": {"timeout": 60}}
+
+    assert normalize_config_override(schema, defaults, override) == {
+        "settings": {
+            "model": "remote-model",
+            "timeout": 60,
+            "retries": 2,
+        }
+    }
+    assert defaults == {"settings": {"model": "remote-model", "timeout": 30}}
+    assert override == {"settings": {"timeout": 60}}
+
+    with pytest.raises(ValueError, match="required property is missing"):
+        normalize_config_override(schema, {}, {"settings": {"timeout": 60}})
 
 
 @pytest.mark.parametrize(
@@ -220,6 +252,34 @@ def test_sensitive_fields_cannot_embed_values(
     message = str(exc_info.value)
     assert f"schema.properties.{field_name}.{keyword}" in message
     assert "do-not-report" not in message
+
+
+@pytest.mark.parametrize(
+    ("keyword", "embedded"),
+    [
+        ("default", {"nested": {"password": "do-not-report"}}),
+        ("enum", [{"nested": {"api_key_ref": "openevo-secret:private"}}]),
+        ("const", {"nested": {"credential": "do-not-report"}}),
+    ],
+)
+def test_ancestor_annotations_cannot_embed_sensitive_values(
+    keyword: str,
+    embedded: object,
+) -> None:
+    schema = _object_schema(
+        {
+            "wrapper": {
+                **_object_schema(),
+                keyword: embedded,
+            }
+        }
+    )
+
+    with pytest.raises(ValueError, match="sensitive") as exc_info:
+        validate_schema(schema)
+
+    assert "do-not-report" not in str(exc_info.value)
+    assert "openevo-secret:private" not in str(exc_info.value)
 
 
 def test_sensitive_config_requires_an_opaque_core_reference() -> None:

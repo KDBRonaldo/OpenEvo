@@ -121,13 +121,32 @@ def _remote_capabilities_payload(execution_mode: str) -> dict[str, object]:
 
 
 class _CapabilitiesBackendClient:
-    def __init__(self, payload: object) -> None:
+    def __init__(
+        self,
+        payload: object,
+        *,
+        validation_error: sidecar_api.DesktopBackendError | None = None,
+    ) -> None:
         self.payload = payload
         self.calls: list[str] = []
+        self.validation_calls: list[dict[str, object]] = []
+        self.validation_error = validation_error
 
     def capabilities(self, execution_mode: str) -> object:
         self.calls.append(execution_mode)
         return self.payload
+
+    def validate_evolution_project(
+        self,
+        payload: dict[str, object],
+    ) -> dict[str, object]:
+        self.validation_calls.append(payload)
+        if self.validation_error is not None:
+            raise self.validation_error
+        return {
+            "valid": True,
+            "registry_digest": payload["expected_registry_digest"],
+        }
 
 
 def _capabilities_backend_factory(project: ScienceProjectConfig):
@@ -286,6 +305,73 @@ def test_sidecar_capabilities_rejects_invalid_remote_payload() -> None:
     assert "unexpected" not in str(response.json()["details"])
 
 
+@pytest.mark.parametrize("owner", ["target", "method"])
+def test_sidecar_capabilities_rejects_non_desktop_visible_entries(
+    owner: str,
+) -> None:
+    payload = _remote_capabilities_payload("self-deployed")
+    targets = cast(list[dict[str, object]], payload["targets"])
+    if owner == "target":
+        targets[0]["exposure"] = "internal"
+    else:
+        methods = cast(list[dict[str, object]], targets[0]["methods"])
+        methods[0]["exposure"] = "maintainer"
+    backend = _CapabilitiesBackendClient(payload)
+    client = TestClient(
+        create_sidecar_app(backend_client_factory=lambda: backend)
+    )
+
+    response = client.get(
+        "/openevo-api/desktop/capabilities",
+        params={"execution_mode": "self-deployed"},
+        headers={"X-OpenEvo-Sidecar-Token": _sidecar_token(client)},
+    )
+
+    assert response.status_code == 502
+    assert response.json()["code"] == "backend_capabilities_invalid"
+
+
+@pytest.mark.parametrize(
+    ("field", "encoded"),
+    [
+        (
+            "config_schema_json",
+            '{"$ref":"#","additionalProperties":false,"properties":{},"type":"object"}',
+        ),
+        ("default_config_json", '{"count":9007199254740992}'),
+    ],
+)
+def test_sidecar_capabilities_rejects_unrenderable_method_config_contract(
+    field: str,
+    encoded: str,
+) -> None:
+    payload = _remote_capabilities_payload("self-deployed")
+    targets = cast(list[dict[str, object]], payload["targets"])
+    methods = cast(list[dict[str, object]], targets[0]["methods"])
+    method = methods[0]
+    if field == "default_config_json":
+        method["config_schema_json"] = (
+            '{"additionalProperties":false,"properties":{"count":'
+            '{"type":"integer"}},"type":"object"}'
+        )
+    method[field] = encoded
+    backend = _CapabilitiesBackendClient(payload)
+    client = TestClient(
+        create_sidecar_app(backend_client_factory=lambda: backend)
+    )
+
+    response = client.get(
+        "/openevo-api/desktop/capabilities",
+        params={"execution_mode": "self-deployed"},
+        headers={"X-OpenEvo-Sidecar-Token": _sidecar_token(client)},
+    )
+
+    assert response.status_code == 502
+    assert response.json()["code"] == "backend_capabilities_invalid"
+    assert response.json()["details"] == {"execution_mode": "self-deployed"}
+    assert encoded not in str(response.json())
+
+
 @pytest.mark.parametrize("mismatch", ["identity", "support"])
 def test_sidecar_capabilities_rejects_resolver_method_metadata_mismatch(
     mismatch: str,
@@ -395,6 +481,15 @@ def test_desktop_science_smoke_exercises_ordinary_user_route_set(
     class ProductBackendClient:
         def capabilities(self, execution_mode: str) -> dict[str, object]:
             return _remote_capabilities_payload(execution_mode)
+
+        def validate_evolution_project(
+            self,
+            payload: dict[str, object],
+        ) -> dict[str, object]:
+            return {
+                "valid": True,
+                "registry_digest": payload["expected_registry_digest"],
+            }
 
         def run_timeline(self, run_id: str) -> list[dict[str, object]]:
             return [
@@ -1982,10 +2077,21 @@ def test_project_config_activate_loads_saved_config_after_restart(
         )
     )
     writer_token = _sidecar_token(writer)
+    draft = _desktop_config_draft_payload()
+    evolution = cast(dict[str, object], draft["evolution"])
+    targets = cast(dict[str, object], evolution["targets"])
+    targets["quality_notes_external"] = {
+        "enabled": False,
+        "method": "synthesize_notes",
+        "config": {
+            "style": "concise",
+            "limits": {"records": 8},
+        },
+    }
     saved = writer.post(
         "/openevo-api/desktop/project-config",
         headers={"X-OpenEvo-Sidecar-Token": writer_token},
-        json=_desktop_config_draft_payload(),
+        json=draft,
     )
     assert saved.status_code == 200
     transport = _ApiDryRunTransport()
@@ -2007,6 +2113,9 @@ def test_project_config_activate_loads_saved_config_after_restart(
     payload = activate.json()
     assert payload["status"]["project"]["name"] == "Protein Design"
     assert payload["status"]["remote"]["host"] == "gpu.example.edu"
+    assert payload["status"]["project"]["evolution_targets"][
+        "quality_notes_external"
+    ] == targets["quality_notes_external"]
     assert payload["config"]["science_config_path"].endswith(
         "/projects/protein-design/science.yaml"
     )
@@ -2610,6 +2719,136 @@ def test_run_endpoint_revalidates_active_selections_against_remote_registry() ->
     assert response.json()["code"] == "evolution_selection_unavailable"
     assert response.json()["details"]["target_id"] == "text_memory"
     assert response.json()["details"]["selection"] == "text_memory_reflector"
+    assert not any(
+        command.startswith('PATH="$HOME/.local/bin:$PATH" openevo-backend run ')
+        for command in transport.commands
+    )
+
+
+def test_run_endpoint_revalidates_visible_method_config_against_latest_schema() -> None:
+    project = ScienceProjectConfig.model_validate(_science_project_payload())
+    profile = _remote_profile()
+    transport = _ApiDryRunTransport()
+    payload = _remote_capabilities_payload(project.execution.mode)
+    backend = _CapabilitiesBackendClient(payload)
+    client = TestClient(
+        create_sidecar_app_for_project(
+            project,
+            profile,
+            transport_factory=lambda _profile: transport,
+            backend_client_factory=lambda: backend,
+        )
+    )
+    token = _sidecar_token(client)
+    headers = {"X-OpenEvo-Sidecar-Token": token}
+    _prepare_workspace_bootstrap_and_services(client, headers)
+
+    skill_target = next(
+        target
+        for target in cast(list[dict[str, object]], payload["targets"])
+        if target["target_id"] == "skill_bundle"
+    )
+    skill_method = next(
+        method
+        for method in cast(list[dict[str, object]], skill_target["methods"])
+        if method["method_id"] == "skill_bundle_reflector"
+    )
+    skill_method["config_schema_json"] = (
+        '{"additionalProperties":false,"properties":{"required_value":'
+        '{"type":"string"}},"required":["required_value"],"type":"object"}'
+    )
+    skill_method["default_config_json"] = "{}"
+
+    response = client.post("/openevo-api/desktop/run", headers=headers)
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "evolution_config_invalid"
+    assert response.json()["details"] == {
+        "target_id": "skill_bundle",
+        "selection": "skill_bundle_reflector",
+        "registry_digest": payload["registry_digest"],
+    }
+    assert not any(
+        command.startswith('PATH="$HOME/.local/bin:$PATH" openevo-backend run ')
+        for command in transport.commands
+    )
+
+
+@pytest.mark.parametrize(
+    ("target_id", "selection", "execution"),
+    [
+        (
+            "text_memory",
+            "text_memory",
+            {
+                "mode": "self-deployed",
+                "hf_model": "Qwen/Qwen3-Coder-30B-A3B-Instruct",
+            },
+        ),
+        ("agent_system", "auto", None),
+    ],
+    ids=["hidden-method", "resolver"],
+)
+def test_run_endpoint_requires_remote_validation_for_opaque_config(
+    target_id: str,
+    selection: str,
+    execution: dict[str, object] | None,
+) -> None:
+    project_payload = _science_project_payload()
+    if execution is not None:
+        project_payload["execution"] = execution
+    targets = cast(dict[str, object], project_payload["evolution"])["targets"]
+    assert isinstance(targets, dict)
+    targets[target_id] = {
+        "enabled": True,
+        "method": selection,
+        "config": {"unexpected": True},
+    }
+    project = ScienceProjectConfig.model_validate(project_payload)
+    profile = _remote_profile()
+    transport = _ApiDryRunTransport()
+    validation_error = sidecar_api.DesktopBackendError(
+        409,
+        {
+            "code": "evolution_project_invalid",
+            "message": "The active project evolution configuration is invalid.",
+            "severity": "blocking",
+            "category": "project",
+            "retryable": False,
+            "repair_action": "openevo_can_reconfigure",
+            "details": {
+                "target_id": target_id,
+                "selection": selection,
+                "reason_code": "invalid_method_config_or_profile",
+                "registry_digest": "a" * 64,
+            },
+            "logs_ref": None,
+        },
+    )
+    backend = _CapabilitiesBackendClient(
+        _remote_capabilities_payload(project.execution.mode),
+        validation_error=validation_error,
+    )
+    client = TestClient(
+        create_sidecar_app_for_project(
+            project,
+            profile,
+            transport_factory=lambda _profile: transport,
+            backend_client_factory=lambda: backend,
+        )
+    )
+    headers = {"X-OpenEvo-Sidecar-Token": _sidecar_token(client)}
+    _prepare_workspace_bootstrap_and_services(client, headers)
+
+    response = client.post("/openevo-api/desktop/run", headers=headers)
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "evolution_project_invalid"
+    assert response.json()["details"]["target_id"] == target_id
+    assert len(backend.validation_calls) == 1
+    assert backend.validation_calls[0]["expected_registry_digest"] == (
+        _remote_capabilities_payload(project.execution.mode)["registry_digest"]
+    )
     assert not any(
         command.startswith('PATH="$HOME/.local/bin:$PATH" openevo-backend run ')
         for command in transport.commands
@@ -3665,9 +3904,9 @@ def test_build_desktop_shell_status_from_subscription_project() -> None:
     assert status.services[-1].state == "planned"
     assert [step.id for step in status.evolution] == [
         "transcript",
-        "text-memory",
-        "skill-bundle",
         "agent-system",
+        "skill-bundle",
+        "text-memory",
     ]
 
 
@@ -3678,6 +3917,11 @@ def test_build_desktop_shell_status_uses_enabled_generic_targets() -> None:
             "evolution": {
                 "targets": {
                     "text_memory": _evolution_targets_payload()["text_memory"],
+                    "quality_notes_external": {
+                        "enabled": True,
+                        "method": "synthesize_notes",
+                        "config": {"style": "concise"},
+                    },
                     "agent_system": _evolution_targets_payload()["agent_system"],
                 }
             }
@@ -3688,9 +3932,15 @@ def test_build_desktop_shell_status_uses_enabled_generic_targets() -> None:
 
     assert [step.id for step in status.evolution] == [
         "transcript",
-        "text-memory",
         "agent-system",
+        "quality-notes-external",
+        "text-memory",
     ]
+    assert next(
+        step.label
+        for step in status.evolution
+        if step.id == "quality-notes-external"
+    ) == "Quality notes external"
 
 
 def test_build_desktop_shell_status_preserves_complete_evolution_target_map() -> None:

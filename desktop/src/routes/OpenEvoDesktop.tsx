@@ -11,6 +11,7 @@ import {
   Server,
   Settings,
   ShieldCheck,
+  Undo2,
   Upload,
 } from "lucide-react";
 import { useEffect, useRef, useState, type ReactNode } from "react";
@@ -37,6 +38,10 @@ import {
   type OpenEvoSavedProjectConfig,
 } from "../api/openevo";
 import {
+  EvolutionConfigEditor,
+  validateEvolutionDraftConfigs,
+} from "../components/EvolutionConfigEditor";
+import {
   type EvolutionStepState,
   type OpenEvoDesktopShellModel,
   type RemoteServiceState,
@@ -44,6 +49,7 @@ import {
   getOpenEvoTimelineSummary,
   toDraftPayload,
 } from "./openevoDesktopModel";
+import { evolutionRunBlockReason } from "./evolutionConfigModel";
 
 const serviceTone: Record<RemoteServiceState, string> = {
   ready: "border-emerald-200 bg-emerald-50 text-emerald-800",
@@ -141,25 +147,45 @@ export function OpenEvoDesktop() {
   const runtimeServicesReady = model.services.some(
     (service) => service.id === "openevo-backend" && service.state === "ready",
   );
-  const evolutionTargets = desktopEvolutionTargets(
+  const evolutionConfigIssues = validateEvolutionDraftConfigs(
     desktopCapabilities,
     configDraft.evolution.targets,
   );
   const artifactDisplayNames = artifactTargetDisplayNames(desktopCapabilities);
+  const canonicalConfigDraft = toDraftPayload(model);
   const configDraftDirty = !projectConfigDraftsEqual(
     configDraft,
-    toDraftPayload(model),
+    canonicalConfigDraft,
   );
-  const runCapabilityBlockReason = configDraftDirty
-    ? "Save configuration changes before starting a run."
-    : desktopCapabilitiesExecutionMode !== model.execution.mode
-      ? "Remote capabilities do not match the active project execution mode."
-      : capabilityRunBlockReason(
-          capabilitiesLoading,
-          capabilitiesError,
-          desktopCapabilities,
-          model.project.evolutionTargets,
-        );
+  const evolutionSelectionsDirty = !jsonValuesEqual(
+    configDraft.evolution.targets,
+    canonicalConfigDraft.evolution.targets,
+  );
+  const evolutionSaveBlockReason = !evolutionSelectionsDirty
+    ? null
+    : capabilitiesLoading
+      ? "Wait for remote capabilities before saving evolution changes."
+      : capabilitiesError
+        ? capabilitiesError
+        : desktopCapabilities === null
+          ? "Remote capabilities are required to save evolution changes."
+          : desktopCapabilitiesExecutionMode !== configDraft.execution_mode
+            ? "Remote capabilities do not match the selected execution mode."
+            : evolutionConfigIssues[0]
+              ? `Evolution configuration is invalid: ${evolutionConfigIssues[0].message}`
+              : null;
+  const runCapabilityBlockReason = evolutionConfigIssues[0]
+    ? `Evolution configuration is invalid: ${evolutionConfigIssues[0].message}`
+    : configDraftDirty
+      ? "Save configuration changes before starting a run."
+      : desktopCapabilitiesExecutionMode !== model.execution.mode
+        ? "Remote capabilities do not match the active project execution mode."
+        : evolutionRunBlockReason(
+            capabilitiesLoading,
+            capabilitiesError,
+            desktopCapabilities,
+            model.project.evolutionTargets,
+          );
 
   const refreshSavedConfigs = async () => {
     catalogRefreshGeneration.current += 1;
@@ -352,61 +378,6 @@ export function OpenEvoDesktop() {
     setConfigDraft((current) => ({ ...current, [field]: value }));
   };
 
-  const handleEvolutionTargetChange = (
-    target: {
-      targetId: string;
-      artifactType: string;
-      methodId: string;
-      defaultConfig: OpenEvoProjectConfigDraft["evolution"]["targets"][string]["config"];
-      resetSelectionOnEnable: boolean;
-    },
-    enabled: boolean,
-  ) => {
-    setConfigDraft((current) => {
-      const selection = current.evolution.targets[target.targetId];
-      if (!selection) {
-        if (!enabled) {
-          return current;
-        }
-        return {
-          ...current,
-          evolution: {
-            targets: {
-              ...current.evolution.targets,
-              [target.targetId]: {
-                enabled: true,
-                method: target.methodId,
-                config: target.defaultConfig,
-              },
-            },
-          },
-        };
-      }
-      return {
-        ...current,
-        evolution: {
-          targets: {
-            ...current.evolution.targets,
-            [target.targetId]: {
-              ...selection,
-              enabled,
-              method:
-                enabled &&
-                (selection.method === null || target.resetSelectionOnEnable)
-                  ? target.methodId
-                  : selection.method,
-              config:
-                enabled &&
-                (selection.method === null || target.resetSelectionOnEnable)
-                  ? target.defaultConfig
-                  : selection.config,
-            },
-          },
-        },
-      };
-    });
-  };
-
   const handleSourceTypeChange = (
     sourceType: OpenEvoProjectConfigDraft["source_type"],
   ) => {
@@ -452,6 +423,13 @@ export function OpenEvoDesktop() {
   };
 
   const handleSaveConfig = async () => {
+    if (configSaving || activatingConfigSlug !== null) {
+      return;
+    }
+    if (evolutionSaveBlockReason) {
+      setConfigError(evolutionSaveBlockReason);
+      return;
+    }
     setConfigSaving(true);
     setConfigError(null);
     const submittedDraft = configDraft;
@@ -473,7 +451,7 @@ export function OpenEvoDesktop() {
   };
 
   const handleActivateConfig = async (config: OpenEvoSavedProjectConfig) => {
-    if (!config.valid) {
+    if (!config.valid || configDraftDirty || configSaving || activatingConfigSlug) {
       return;
     }
     setActivatingConfigSlug(config.projectSlug);
@@ -492,6 +470,14 @@ export function OpenEvoDesktop() {
     } finally {
       setActivatingConfigSlug(null);
     }
+  };
+
+  const handleDiscardConfig = () => {
+    if (configSaving || activatingConfigSlug !== null) {
+      return;
+    }
+    setConfigDraft(canonicalConfigDraft);
+    setConfigError(null);
   };
 
   const handleBootstrap = async () => {
@@ -815,6 +801,11 @@ export function OpenEvoDesktop() {
                   {configCatalogError}
                 </div>
               ) : null}
+              {configDraftDirty ? (
+                <div className="border-l-2 border-amber-300 pl-3 text-sm text-amber-900">
+                  Save or discard current changes before activating another config.
+                </div>
+              ) : null}
               {savedConfigs.length > 0 ? (
                 <div className="divide-y divide-slate-100">
                   {savedConfigs.map((config) => {
@@ -858,6 +849,7 @@ export function OpenEvoDesktop() {
                           disabled={
                             !sidecarConnected ||
                             !config.valid ||
+                            configDraftDirty ||
                             activatingConfigSlug !== null ||
                             configSaving ||
                             workspaceRunning ||
@@ -876,11 +868,17 @@ export function OpenEvoDesktop() {
           ) : null}
         <form
           className="grid grid-cols-1 gap-3 lg:grid-cols-4"
+          aria-busy={configSaving || activatingConfigSlug !== null}
           onSubmit={(event) => {
             event.preventDefault();
             void handleSaveConfig();
           }}
         >
+          <fieldset
+            className="contents"
+            data-testid="project-config-fields"
+            disabled={configSaving || activatingConfigSlug !== null}
+          >
           <TextInput
             label="Project name"
             value={configDraft.project_name}
@@ -1072,35 +1070,37 @@ export function OpenEvoDesktop() {
               />
             </>
           ) : null}
-          <div className="flex flex-wrap items-end gap-3 lg:col-span-4">
-            {evolutionTargets.map((target) => (
-              <div key={target.targetId} className="space-y-1">
-                <CheckboxInput
-                  label={target.displayName}
-                  checked={Boolean(
-                    configDraft.evolution.targets[target.targetId]?.enabled,
-                  )}
-                  disabled={
-                    target.disabled &&
-                    !configDraft.evolution.targets[target.targetId]?.enabled
-                  }
-                  testId="evolution-target"
-                  onChange={(checked) =>
-                    handleEvolutionTargetChange(target, checked)
-                  }
-                />
-                {target.unavailableReason ? (
-                  <div className="max-w-72 text-xs text-rose-700">
-                    {target.unavailableReason}
-                  </div>
-                ) : null}
-              </div>
-            ))}
+          <EvolutionConfigEditor
+            capabilities={desktopCapabilities}
+            selections={configDraft.evolution.targets}
+            onChange={(targets) =>
+              setConfigDraft((current) => ({
+                ...current,
+                evolution: { targets },
+              }))
+            }
+          />
+          <div className="flex flex-wrap items-end justify-end gap-3 lg:col-span-4">
+            <CommandButton
+              icon={<Undo2 size={16} />}
+              label="Discard Changes"
+              disabled={
+                !configDraftDirty ||
+                configSaving ||
+                activatingConfigSlug !== null ||
+                workspaceRunning ||
+                bootstrapRunning ||
+                servicesRunning ||
+                runRunning
+              }
+              onClick={handleDiscardConfig}
+            />
             <CommandButton
               icon={<ShieldCheck size={16} />}
               label={configSaving ? "Saving" : "Save Config"}
               disabled={
                 !sidecarConnected ||
+                evolutionSaveBlockReason !== null ||
                 configSaving ||
                 activatingConfigSlug !== null ||
                 workspaceRunning ||
@@ -1111,6 +1111,11 @@ export function OpenEvoDesktop() {
               onClick={handleSaveConfig}
             />
           </div>
+          {evolutionSelectionsDirty && evolutionSaveBlockReason ? (
+            <div className="text-sm text-rose-700 lg:col-span-4">
+              {evolutionSaveBlockReason}
+            </div>
+          ) : null}
           {capabilitiesLoading ? (
             <div className="text-sm text-slate-600 lg:col-span-4">
               Loading remote capabilities...
@@ -1135,6 +1140,7 @@ export function OpenEvoDesktop() {
               {configError}
             </div>
           ) : null}
+          </fieldset>
         </form>
         </div>
       </Panel>
@@ -1817,180 +1823,6 @@ function stringValue(value: unknown): string | null {
   return typeof value === "string" && value ? value : null;
 }
 
-function desktopEvolutionTargets(
-  capabilities: OpenEvoDesktopCapabilities | null,
-  selections: OpenEvoProjectConfigDraft["evolution"]["targets"],
-) {
-  if (!capabilities) {
-    return Object.entries(selections)
-      .filter(([, selection]) => selection.enabled)
-      .map(([targetId, selection]) => ({
-        targetId,
-        artifactType: targetId,
-        methodId: selection.method ?? "",
-        defaultConfig: selection.config,
-        displayName: sentenceCase(targetId.replaceAll("_", " ")),
-        disabled: true,
-        resetSelectionOnEnable: false,
-        unavailableReason: null,
-      }));
-  }
-
-  const targets = capabilities.targets.map((target) => {
-    const effectiveMethod = target.methods.find(
-      (method) => method.methodId === target.effectiveDefaultMethodId,
-    );
-    const supportedEffectiveMethod =
-      effectiveMethod?.support.overall === "supported" ? effectiveMethod : null;
-    const selection = selections[target.targetId];
-    const selectedAcceptedMethod = target.acceptedMethods.find(
-      (method) => method.methodId === selection?.method,
-    );
-    const selectedResolver = target.selectionResolvers.find(
-      (resolver) => resolver.selectionValue === selection?.method,
-    );
-    const supportedSelectedResolver =
-      selectedResolver &&
-      selectedResolver.resolvedMethods.every(
-        (method) => method.support.overall === "supported",
-      )
-        ? selectedResolver
-        : null;
-    const supportedSelectedMethod =
-      selectedAcceptedMethod?.support.overall === "supported"
-        ? selectedAcceptedMethod
-        : null;
-    const supportedSelection =
-      supportedSelectedMethod !== null || supportedSelectedResolver !== null;
-    const selectedMethodUnavailable =
-      selection?.method !== null &&
-      selection?.method !== undefined &&
-      supportedSelectedMethod === null &&
-      supportedSelectedResolver === null;
-    const enabledReason = selection?.enabled
-      ? selectedEvolutionTargetFailureReason(target, selection.method)
-      : null;
-    return {
-      targetId: target.targetId,
-      artifactType: target.artifactType,
-      methodId:
-        supportedSelectedResolver?.selectionValue ??
-        supportedSelectedMethod?.methodId ??
-        supportedEffectiveMethod?.methodId ??
-        target.configuredDefaultMethodId,
-      defaultConfig:
-        supportedSelection && selection
-          ? selection.config
-          : (supportedEffectiveMethod?.defaultConfig ?? {}),
-      displayName: sentenceCase(target.displayName),
-      disabled: !supportedSelection && supportedEffectiveMethod === null,
-      resetSelectionOnEnable:
-        selection?.method === null || selectedMethodUnavailable,
-      unavailableReason:
-        enabledReason ??
-        (!supportedSelection && supportedEffectiveMethod === null
-          ? capabilityFailureReason(target.configuredDefaultSupport)
-          : null),
-    };
-  });
-
-  const remoteTargetIds = new Set(targets.map((target) => target.targetId));
-  for (const [targetId, selection] of Object.entries(selections)) {
-    if (!selection.enabled || remoteTargetIds.has(targetId)) {
-      continue;
-    }
-    targets.push({
-      targetId,
-      artifactType: targetId,
-      methodId: selection.method ?? "",
-      defaultConfig: {},
-      displayName: sentenceCase(targetId.replaceAll("_", " ")),
-      disabled: true,
-      resetSelectionOnEnable: true,
-      unavailableReason: `Target "${targetId}" is no longer available in the remote registry. Disable it to repair the saved configuration.`,
-    });
-  }
-  return targets;
-}
-
-function selectedEvolutionTargetFailureReason(
-  target: OpenEvoDesktopCapabilities["targets"][number],
-  methodId: string | null,
-): string | null {
-  if (methodId === null) {
-    return `Target "${target.targetId}" has no selected method.`;
-  }
-  const method = target.acceptedMethods.find(
-    (candidate) => candidate.methodId === methodId,
-  );
-  const resolver = target.selectionResolvers.find(
-    (candidate) => candidate.selectionValue === methodId,
-  );
-  if (resolver) {
-    const unsupported = resolver.resolvedMethods.find(
-      (candidate) => candidate.support.overall !== "supported",
-    );
-    return unsupported
-      ? `Selection resolver "${methodId}" is unsupported by the current remote profile. ${capabilityFailureReason(unsupported.support)}`
-      : null;
-  }
-  if (!method) {
-    return `Selected method "${methodId}" is no longer available for target "${target.targetId}" in the remote registry.`;
-  }
-  if (method.support.overall !== "supported") {
-    return `Selected method "${methodId}" is unsupported by the current remote profile. ${capabilityFailureReason(method.support)}`;
-  }
-  return null;
-}
-
-function capabilityRunBlockReason(
-  loading: boolean,
-  error: string | null,
-  capabilities: OpenEvoDesktopCapabilities | null,
-  selections: OpenEvoProjectConfigDraft["evolution"]["targets"],
-): string | null {
-  if (loading) {
-    return "remote capabilities are still loading.";
-  }
-  if (error) {
-    return error;
-  }
-  if (!capabilities) {
-    return "Remote capabilities are unavailable.";
-  }
-  const targetsById = new Map(
-    capabilities.targets.map((target) => [target.targetId, target]),
-  );
-  for (const [targetId, selection] of Object.entries(selections)) {
-    if (!selection.enabled) {
-      continue;
-    }
-    const target = targetsById.get(targetId);
-    if (!target) {
-      return `enabled target "${targetId}" is not available in the remote registry.`;
-    }
-    const reason = selectedEvolutionTargetFailureReason(target, selection.method);
-    if (reason) {
-      return reason;
-    }
-  }
-  return null;
-}
-
-function capabilityFailureReason(
-  support: OpenEvoDesktopCapabilities["targets"][number]["configuredDefaultSupport"],
-): string {
-  const messages = [
-    support.execution,
-    support.capture,
-    support.harness,
-    support.runtime,
-  ]
-    .filter((axis) => axis.state !== "supported")
-    .map((axis) => axis.message);
-  return messages.join(" ") || "The configured default method is unavailable.";
-}
-
 function projectConfigDraftsEqual(
   left: OpenEvoProjectConfigDraft,
   right: OpenEvoProjectConfigDraft,
@@ -1999,6 +1831,10 @@ function projectConfigDraftsEqual(
     JSON.stringify(sortedJsonValue(left)) ===
     JSON.stringify(sortedJsonValue(right))
   );
+}
+
+function jsonValuesEqual(left: unknown, right: unknown): boolean {
+  return JSON.stringify(sortedJsonValue(left)) === JSON.stringify(sortedJsonValue(right));
 }
 
 function sortedJsonValue(value: unknown): unknown {

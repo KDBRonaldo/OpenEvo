@@ -173,28 +173,7 @@ export function getOpenEvoDesktopShellModel(): OpenEvoDesktopShellModel {
       taskId: "new-task",
       source: "Scratch workspace",
       objective: "",
-      evolutionTargets: {
-        text_memory: {
-          enabled: true,
-          method: "text_memory_reflector",
-          config: {},
-        },
-        parametric_memory: {
-          enabled: false,
-          method: "parametric_memory_register",
-          config: {},
-        },
-        skill_bundle: {
-          enabled: true,
-          method: "skill_bundle_reflector",
-          config: {},
-        },
-        agent_system: {
-          enabled: true,
-          method: "auto",
-          config: { target_path: "AGENTS.md" },
-        },
-      },
+      evolutionTargets: {},
     },
     execution: {
       mode: "codex_subscription_transcript",
@@ -235,22 +214,10 @@ export function getOpenEvoDesktopShellModel(): OpenEvoDesktopShellModel {
     ],
     evolution: [
       {
-        id: "text-memory",
-        label: "Text memory",
+        id: "transcript",
+        label: "Transcript capture",
         state: "planned",
-        detail: "Memory updates appear after a run produces trajectories",
-      },
-      {
-        id: "skill-bundle",
-        label: "Skill bundle",
-        state: "planned",
-        detail: "Learned skills appear after evolution jobs complete",
-      },
-      {
-        id: "agent-system",
-        label: "Agent system",
-        state: "planned",
-        detail: "Instruction diffs appear after promoted artifacts exist",
+        detail: "Trajectory capture starts after the first run",
       },
     ],
     developerMode: {

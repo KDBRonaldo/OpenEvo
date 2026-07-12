@@ -19,6 +19,7 @@ from openevo.evolution.models import (
 
 from .contracts import (
     CaptureMode,
+    MAX_JAVASCRIPT_SAFE_INTEGER,
     _Contract,
     _digest,
     _stable_id,
@@ -64,8 +65,16 @@ class MethodInputBinding(_Contract):
     binding_id: str
     source: InputBindingSource
     artifact_type: str
-    min_count: int = Field(default=0, ge=0)
-    max_count: int | None = Field(default=None, ge=1)
+    min_count: int = Field(
+        default=0,
+        ge=0,
+        le=MAX_JAVASCRIPT_SAFE_INTEGER,
+    )
+    max_count: int | None = Field(
+        default=None,
+        ge=1,
+        le=MAX_JAVASCRIPT_SAFE_INTEGER,
+    )
 
     _ids = field_validator("binding_id", "artifact_type")(_stable_id)
 

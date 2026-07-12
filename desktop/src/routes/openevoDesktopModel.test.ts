@@ -19,6 +19,8 @@ describe("OpenEvo Desktop shell model", () => {
     expect(model.developerMode.enabled).toBe(false);
     expect(model.developerMode.benchmarkControlsVisible).toBe(false);
     expect(model.bootstrap.ready).toBe(false);
+    expect(model.project.evolutionTargets).toEqual({});
+    expect(model.evolution.map((step) => step.id)).toEqual(["transcript"]);
     expect(model.bootstrap.readinessNotes).toEqual([
       "Configure a project and remote backend to begin.",
     ]);
@@ -34,7 +36,7 @@ describe("OpenEvo Desktop shell model", () => {
     expect(summary.totalServices).toBe(4);
     expect(summary.bootstrapReady).toBe(false);
     expect(summary.completedEvolutionSteps).toBe(0);
-    expect(summary.totalEvolutionSteps).toBe(3);
+    expect(summary.totalEvolutionSteps).toBe(1);
     expect(summary.readinessNotes).toEqual([
       "Configure a project and remote backend to begin.",
     ]);

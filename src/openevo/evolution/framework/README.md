@@ -6,8 +6,10 @@ The authoritative A2 framework contract is
 A2.2 adds a deterministic built-in catalog and a distribution-backed loader on
 top of the A2.1 contracts. A2.3 uses it for generic project compilation,
 durable plan-bound jobs, verified worker dispatch, and remote Core capabilities
-proxied by Desktop. Generic Desktop configuration/rendering and target-specific
-runtime projection remain assigned to A2.4/A2.5 in the architecture contract.
+proxied by Desktop. Desktop now consumes that projection for target/method
+selection and bounded-schema config editing. Generic handler execution,
+renderer payloads, and removal of target-specific runtime projection remain
+assigned to A2.4/A2.5 in the architecture contract.
 
 Keep implementation-independent rules in the architecture document. Keep module
 usage and code-specific invariants here as the package is adopted.
@@ -51,7 +53,23 @@ verifier always discovers real installed package metadata; provider injection is
 confined to the repository testkit and is not a production API. Target
 descriptors also own project selection resolvers. Capability `methods` remain audience-visible,
 while `accepted_methods` preserves valid hidden selections without exposing
-their config schema as a Desktop choice.
+their config schema as a Desktop choice. Capability DTO validation revalidates
+the bounded schema and partial default, caps encoded contract size, and rejects
+integers outside the JavaScript safe range before the local sidecar forwards a
+remote payload to Desktop. Capability parsing also applies global node,
+collection, and text budgets plus JavaScript-safe outer integer validation. A
+method can declare top-level `project_config_injections`, each binding a field to
+a closed Core source. Registry freeze requires those fields to exist in the full
+schema; capability projection removes them from Desktop schema/default/required
+metadata, while compilation removes stale values, injects the authoritative
+source, and validates the complete config before method execution. Root object
+`default`, `const`, and `enum` annotations must not embed injected fields because
+their correlated projection would be ambiguous.
+Project target maps accept at most 128 entries. Each project method config is
+bounded by depth, node, collection, and text budgets before recursive JSON
+normalization. The Core project-validation HTTP boundary additionally limits the
+actual UTF-8 request body to 1 MiB and rejects excessive JSON nesting before
+parsing; Desktop applies the same byte limit before transport.
 
 Plan-bound jobs dispatch only through `VerifiedExecutableRegistry`. The worker
 publishes exact method identity digests at claim, then checks the plan,

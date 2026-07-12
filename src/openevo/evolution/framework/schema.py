@@ -21,6 +21,7 @@ __all__ = [
     "MAX_SCHEMA_NODES",
     "MAX_STRING_LENGTH",
     "normalize_config",
+    "normalize_config_override",
     "normalize_partial_config",
     "validate_config_schema",
     "validate_schema",
@@ -388,6 +389,11 @@ class _SchemaValidator:
                 raise _error(
                     f"{path}.enum", f"exceeds maximum enum value count {MAX_ENUM_VALUES}"
                 )
+            if _contains_sensitive_value(enum):
+                raise _error(
+                    f"{path}.enum",
+                    "must not contain sensitive field values",
+                )
             _check_json_value(enum, f"{path}.enum", set())
             for index, value in enumerate(enum):
                 try:
@@ -396,6 +402,11 @@ class _SchemaValidator:
                     raise _error(f"{path}.enum[{index}]", "does not satisfy its schema") from error
 
         if "const" in schema:
+            if _contains_sensitive_value(schema["const"]):
+                raise _error(
+                    f"{path}.const",
+                    "must not contain sensitive field values",
+                )
             _check_json_value(schema["const"], f"{path}.const", set())
             try:
                 _normalize_value(schema, schema["const"], f"{path}.const", apply_defaults=False)
@@ -639,6 +650,42 @@ def normalize_config(schema: object, value: object) -> dict[str, Any]:
     if not isinstance(normalized, dict):  # Root validation above makes this unreachable.
         raise _error("config", "root config must be an object")
     return normalized
+
+
+def _copy_config_value(value: object) -> object:
+    if isinstance(value, dict):
+        return {key: _copy_config_value(item) for key, item in value.items()}
+    if isinstance(value, list | tuple):
+        return [_copy_config_value(item) for item in value]
+    return value
+
+
+def _merge_config_value(base: object, override: object) -> object:
+    if isinstance(base, dict) and isinstance(override, dict):
+        merged = {key: _copy_config_value(value) for key, value in base.items()}
+        for key, value in override.items():
+            merged[key] = (
+                _merge_config_value(merged[key], value)
+                if key in merged
+                else _copy_config_value(value)
+            )
+        return merged
+    return _copy_config_value(override)
+
+
+def normalize_config_override(
+    schema: object,
+    default_config: object,
+    override: object,
+) -> dict[str, Any]:
+    """Deep-merge a project override onto method defaults and fully validate it."""
+
+    if not isinstance(default_config, dict) or not isinstance(override, dict):
+        raise _error("config", "default and override configs must be objects")
+    return normalize_config(
+        schema,
+        _merge_config_value(default_config, override),
+    )
 
 
 def normalize_partial_config(schema: object, value: object) -> dict[str, Any]:

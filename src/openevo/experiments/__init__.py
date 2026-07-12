@@ -8,7 +8,9 @@ from .compiler import (
     CompiledEvolutionMethodSpec,
     CompiledExperiment,
     CompiledTask,
+    ProjectEvolutionValidationError,
     compile_experiment,
+    validate_project_evolution_selections,
 )
 from .models import ExperimentConfig, load_experiment_config
 from .runner import dry_run_experiment, run_experiment
@@ -19,10 +21,12 @@ __all__ = [
     "CompiledTask",
     "ExperimentConfig",
     "RolloutHttpClient",
+    "ProjectEvolutionValidationError",
     "compile_experiment",
     "dry_run_experiment",
     "load_experiment_config",
     "promotion",
     "run_experiment",
     "runner",
+    "validate_project_evolution_selections",
 ]

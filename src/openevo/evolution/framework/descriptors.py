@@ -16,6 +16,7 @@ from .contracts import (
     ImplementationRef,
     Maturity,
     MethodInvocationABI,
+    ProjectConfigInjectionSource,
     RendererKind,
     _Contract,
     _contract_version,
@@ -130,6 +131,15 @@ class EvolutionTargetDescriptor(_Descriptor):
         return values
 
 
+class ProjectConfigInjection(_Contract):
+    """One compiler-owned method config field and its authoritative source."""
+
+    field_name: str
+    source: ProjectConfigInjectionSource
+
+    _field = field_validator("field_name")(_stable_id)
+
+
 class EvolutionMethodDescriptor(_Descriptor):
     kind: Literal[DescriptorKind.METHOD] = DescriptorKind.METHOD
     display_name: str
@@ -151,6 +161,7 @@ class EvolutionMethodDescriptor(_Descriptor):
         }
     )
     default_config: dict[str, Any] = Field(default_factory=dict)
+    project_config_injections: tuple[ProjectConfigInjection, ...] = ()
     maturity: Maturity = Maturity.EXPERIMENTAL
 
     _text_fields = field_validator("display_name", "description")(_text)
@@ -162,6 +173,17 @@ class EvolutionMethodDescriptor(_Descriptor):
         "runtime_requirements",
         "output_artifact_types",
     )(_unique_ids)
+
+    @field_validator("project_config_injections")
+    @classmethod
+    def _unique_project_config_injections(
+        cls,
+        values: tuple[ProjectConfigInjection, ...],
+    ) -> tuple[ProjectConfigInjection, ...]:
+        field_names = tuple(value.field_name for value in values)
+        if len(field_names) != len(set(field_names)):
+            raise ValueError("project config injection fields must be unique")
+        return tuple(sorted(values, key=lambda value: value.field_name))
 
     @model_validator(mode="after")
     def _unique_input_bindings(self) -> EvolutionMethodDescriptor:

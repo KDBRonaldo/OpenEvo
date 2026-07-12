@@ -14,6 +14,11 @@ import {
   toProjectConfigPayload,
 } from "../routes/openevoDesktopModel";
 import { artifactPreview, timelineView } from "./evolutionViewModel";
+import {
+  parseEvolutionConfigSchema,
+  validateEvolutionConfig,
+  type OpenEvoObjectSchema,
+} from "./evolutionConfigSchema";
 
 export type OpenEvoExecutionMode =
   | "codex_subscription_transcript"
@@ -363,7 +368,7 @@ export interface OpenEvoEvolutionMethodCapability {
   outputArtifactTypes: string[];
   configSchemaJson: string;
   defaultConfigJson: string;
-  configSchema: OpenEvoJsonObject;
+  configSchema: OpenEvoObjectSchema;
   defaultConfig: OpenEvoJsonObject;
   implementationIdentityDigest: string;
   support: OpenEvoCapabilityMethodSupport;
@@ -850,39 +855,61 @@ export function toOpenEvoDesktopCapabilities(
           support: toCapabilitySupport(method.support),
         })),
       })),
-      methods: target.methods.map((method) => ({
-        methodId: method.method_id,
-        displayName: method.display_name,
-        description: method.description,
-        exposure: method.exposure,
-        maturity: method.maturity,
-        executionModes: method.execution_modes,
-        captureModes: method.capture_modes,
-        supportedHarnessIds: method.supported_harness_ids,
-        harnessRequirements: method.harness_requirements,
-        runtimeRequirements: method.runtime_requirements,
-        inputBindings: method.input_bindings.map((binding) => ({
-          bindingId: binding.binding_id,
-          source: binding.source,
-          artifactType: binding.artifact_type,
-          minCount: binding.min_count,
-          maxCount: binding.max_count,
-        })),
-        outputArtifactTypes: method.output_artifact_types,
-        configSchemaJson: method.config_schema_json,
-        defaultConfigJson: method.default_config_json,
-        configSchema: parseCanonicalJsonObject(
-          method.config_schema_json,
-          "config_schema_json",
-        ),
-        defaultConfig: parseCanonicalJsonObject(
-          method.default_config_json,
-          "default_config_json",
-        ),
-        implementationIdentityDigest: method.implementation_identity_digest,
-        support: toCapabilitySupport(method.support),
-      })),
+      methods: target.methods.map(toEvolutionMethodCapability),
     })),
+  };
+}
+
+function toEvolutionMethodCapability(
+  method: EvolutionMethodCapabilityPayload,
+): OpenEvoEvolutionMethodCapability {
+  const rawSchema = parseCanonicalJsonObject(
+    method.config_schema_json,
+    "config_schema_json",
+  );
+  let configSchema: OpenEvoObjectSchema;
+  try {
+    configSchema = parseEvolutionConfigSchema(rawSchema);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "invalid schema";
+    throw new Error(`config_schema_json is not renderable: ${message}`);
+  }
+  const defaultConfig = parseCanonicalJsonObject(
+    method.default_config_json,
+    "default_config_json",
+  );
+  const defaultValidation = validateEvolutionConfig(configSchema, defaultConfig);
+  if (!defaultValidation.valid) {
+    const first = defaultValidation.errors[0];
+    throw new Error(
+      `default_config_json is not renderable: ${first?.path ?? "config"}: ${first?.message ?? "invalid default"}`,
+    );
+  }
+  return {
+    methodId: method.method_id,
+    displayName: method.display_name,
+    description: method.description,
+    exposure: method.exposure,
+    maturity: method.maturity,
+    executionModes: method.execution_modes,
+    captureModes: method.capture_modes,
+    supportedHarnessIds: method.supported_harness_ids,
+    harnessRequirements: method.harness_requirements,
+    runtimeRequirements: method.runtime_requirements,
+    inputBindings: method.input_bindings.map((binding) => ({
+      bindingId: binding.binding_id,
+      source: binding.source,
+      artifactType: binding.artifact_type,
+      minCount: binding.min_count,
+      maxCount: binding.max_count,
+    })),
+    outputArtifactTypes: method.output_artifact_types,
+    configSchemaJson: method.config_schema_json,
+    defaultConfigJson: method.default_config_json,
+    configSchema,
+    defaultConfig,
+    implementationIdentityDigest: method.implementation_identity_digest,
+    support: toCapabilitySupport(method.support),
   };
 }
 

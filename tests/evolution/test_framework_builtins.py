@@ -292,6 +292,10 @@ def test_reflector_catalog_requires_model_and_codex_harness_provider(
     snapshot: RegistrySnapshot,
 ) -> None:
     for method_id in REFLECTOR_METHOD_IDS:
+        assert tuple(
+            injection.model_dump(mode="json")
+            for injection in snapshot.methods[method_id].project_config_injections
+        ) == ({"field_name": "reflector_llm", "source": "reflector_llm"},)
         with pytest.raises(ValueError, match="required"):
             snapshot.normalize_method_config(method_id, {})
         with pytest.raises(ValueError, match="enum"):
@@ -318,6 +322,42 @@ def test_reflector_catalog_requires_model_and_codex_harness_provider(
             "model": "gpt-5.5",
             "provider": "codex_cli",
         }
+
+
+def test_builtin_method_helper_does_not_infer_project_config_ownership(
+    distribution_identity: ImplementationDistributionIdentity,
+) -> None:
+    descriptor = builtins._method(
+        distribution_identity,
+        method_id="same_name_user_config",
+        display_name="Same-name user config",
+        description="Keep same-name fields editable without a declaration.",
+        target_id="text_memory",
+        execution_modes=("self_deployed",),
+        input_bindings=(),
+        output_artifact_types=("text_memory",),
+        config_schema={
+            "type": "object",
+            "properties": {
+                "reflector_llm": {"type": "string"},
+                "base_model": {"type": "string"},
+            },
+            "additionalProperties": False,
+        },
+    )
+
+    assert descriptor.project_config_injections == ()
+
+
+def test_parametric_registration_explicitly_owns_base_model(
+    snapshot: RegistrySnapshot,
+) -> None:
+    assert tuple(
+        injection.model_dump(mode="json")
+        for injection in snapshot.methods[
+            "parametric_memory_register"
+        ].project_config_injections
+    ) == ({"field_name": "base_model", "source": "agent_model"},)
 
 
 def test_multi_dataset_bindings_preserve_each_legacy_callers_input_order(

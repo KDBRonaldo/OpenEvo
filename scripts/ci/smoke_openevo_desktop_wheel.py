@@ -152,20 +152,33 @@ class _LifecycleSmokeTransport:
 
 
 class _SmokeBackendClient:
-    def capabilities(self, execution_mode: str) -> dict[str, Any]:
-        snapshot = build_builtin_registry(
+    def __init__(self) -> None:
+        self.validation_requests: list[dict[str, Any]] = []
+
+    @staticmethod
+    def _snapshot():
+        return build_builtin_registry(
             ImplementationDistributionIdentity(
                 distribution="openevo-smoke",
                 distribution_version=OPENEVO_VERSION,
                 distribution_digest="d" * 64,
             )
         )
+
+    def capabilities(self, execution_mode: str) -> dict[str, Any]:
         return build_evolution_capabilities(
-            snapshot,
+            self._snapshot(),
             profile=execution_profile_for_release_mode(execution_mode),
             audience=CapabilityAudience.DESKTOP,
             core_version=OPENEVO_VERSION,
         ).model_dump(mode="json")
+
+    def validate_evolution_project(self, payload: dict[str, Any]) -> dict[str, Any]:
+        self.validation_requests.append(payload)
+        return {
+            "valid": True,
+            "registry_digest": self._snapshot().registry_digest,
+        }
 
     def run_timeline(self, run_id: str) -> list[dict[str, Any]]:
         return [
@@ -227,7 +240,7 @@ def main() -> int:
             )
             with TestClient(app) as client:
                 assets = _smoke_packaged_assets(client)
-                _smoke_config_backed_lifecycle(client, transport)
+                _smoke_config_backed_lifecycle(client, transport, backend)
     except SmokeFailure as exc:
         print(str(exc), file=sys.stderr)
         return 1
@@ -254,6 +267,7 @@ def _smoke_packaged_assets(client: TestClient) -> list[str]:
 def _smoke_config_backed_lifecycle(
     client: TestClient,
     transport: _LifecycleSmokeTransport,
+    backend: _SmokeBackendClient,
 ) -> None:
     headers = _mutation_headers(client)
     capabilities_path = (
@@ -347,6 +361,15 @@ def _smoke_config_backed_lifecycle(
         raise SmokeFailure("Desktop services status did not become ready.")
 
     launch = _post_json(client, "/openevo-api/desktop/run", headers=headers)
+    if backend.validation_requests != [
+        {
+            "execution_mode": "codex_subscription_transcript",
+            "expected_registry_digest": capabilities["registry_digest"],
+            "agent_model": draft["codex_model"],
+            "targets": draft["evolution"]["targets"],
+        }
+    ]:
+        raise SmokeFailure("Desktop run did not preflight the full active project.")
     run_id = launch["run"]["id"]
     terminal = _wait_latest_run_state(client, headers, "succeeded")
     if terminal["run"]["id"] != run_id or terminal["run"]["ready"] is not True:

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 from pydantic import ValidationError
 
@@ -10,6 +12,7 @@ from openevo.evolution.framework import (
     EvolutionTargetDescriptor,
     ImplementationRef,
     MethodInputBinding,
+    ProjectConfigInjection,
     TargetHandlerDescriptor,
     build_evolution_capabilities,
     execution_profile_for_release_mode,
@@ -84,6 +87,33 @@ def _snapshot():
                     ),
                 ),
                 output_artifact_types=("text_memory",),
+                config_schema=(
+                    {
+                        "type": "object",
+                        "properties": {
+                            "operator": {"type": "string"},
+                            "runtime_context": {"type": "string"},
+                        },
+                        "required": ["operator", "runtime_context"],
+                        "additionalProperties": False,
+                    }
+                    if method_id == "reflect"
+                    else {
+                        "type": "object",
+                        "properties": {},
+                        "additionalProperties": False,
+                    }
+                ),
+                project_config_injections=(
+                    (
+                        ProjectConfigInjection(
+                            field_name="runtime_context",
+                            source="agent_model",
+                        ),
+                    )
+                    if method_id == "reflect"
+                    else ()
+                ),
                 implementation_ref=_implementation(method_id, digit),
             )
         )
@@ -145,6 +175,12 @@ def test_capabilities_are_versioned_registry_projection_with_four_axis_support()
     assert supported.support.overall.value == "supported"
     assert supported.input_bindings[0].binding_id == "dataset"
     assert supported.config_schema_json.startswith("{")
+    assert json.loads(supported.config_schema_json) == {
+        "additionalProperties": False,
+        "properties": {"operator": {"type": "string"}},
+        "required": ["operator"],
+        "type": "object",
+    }
     assert supported.implementation_identity_digest
 
 
@@ -187,4 +223,162 @@ def test_wire_projection_cannot_substitute_another_supported_default() -> None:
     payload = capabilities.model_dump(mode="python")
     payload["targets"][0]["effective_default_method_id"] = "gpu_reflect"
     with pytest.raises(ValidationError, match="cannot replace configured default"):
+        EvolutionCapabilitiesV1.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    ("field", "encoded", "message"),
+    [
+        (
+            "config_schema_json",
+            '{"$ref":"#","additionalProperties":false,"properties":{},"type":"object"}',
+            "unsupported schema keyword",
+        ),
+        (
+            "default_config_json",
+            '{"unknown":true}',
+            "unknown property",
+        ),
+        (
+            "config_schema_json",
+            (
+                '{"additionalProperties":false,"properties":{"count":'
+                '{"maximum":9007199254740992,"type":"integer"}},"type":"object"}'
+            ),
+            "JavaScript safe integer range",
+        ),
+        (
+            "default_config_json",
+            '{"count":9007199254740992}',
+            "JavaScript safe integer range",
+        ),
+        (
+            "config_schema_json",
+            (
+                '{"additionalProperties":false,"properties":{"count":'
+                '{"maximum":9007199254740992.0,"type":"number"}},"type":"object"}'
+            ),
+            "JavaScript safe integer range",
+        ),
+        (
+            "default_config_json",
+            '{"count":9007199254740992.0}',
+            "JavaScript safe integer range",
+        ),
+    ],
+)
+def test_capability_config_contract_rejects_unrenderable_payloads(
+    field: str,
+    encoded: str,
+    message: str,
+) -> None:
+    capabilities = build_evolution_capabilities(
+        _snapshot(),
+        profile=execution_profile_for_release_mode(
+            "codex_subscription_transcript",
+            harness_capabilities=("stable_transcript",),
+        ),
+        audience="desktop",
+        core_version="0.1.0",
+    )
+    payload = capabilities.model_dump(mode="python")
+    method = next(
+        item
+        for item in payload["targets"][0]["methods"]
+        if item["method_id"] == "reflect"
+    )
+    if field == "default_config_json" and "count" in encoded:
+        method["config_schema_json"] = (
+            '{"additionalProperties":false,"properties":{"count":'
+            '{"type":"integer"}},"type":"object"}'
+        )
+    method[field] = encoded
+
+    with pytest.raises(ValidationError, match=message):
+        EvolutionCapabilitiesV1.model_validate(payload)
+
+
+def test_capability_payload_rejects_oversized_profile_collections() -> None:
+    capabilities = build_evolution_capabilities(
+        _snapshot(),
+        profile=execution_profile_for_release_mode(
+            "codex_subscription_transcript",
+            harness_capabilities=("stable_transcript",),
+        ),
+        audience="desktop",
+        core_version="0.1.0",
+    )
+    payload = capabilities.model_dump(mode="python")
+    payload["evaluated_profile"]["harness_capabilities"] = [
+        f"capability_{index}" for index in range(257)
+    ]
+
+    with pytest.raises(ValidationError, match="at most 256 items"):
+        EvolutionCapabilitiesV1.model_validate(payload)
+
+
+def test_capability_payload_rejects_oversized_support_text() -> None:
+    capabilities = build_evolution_capabilities(
+        _snapshot(),
+        profile=execution_profile_for_release_mode(
+            "codex_subscription_transcript",
+            harness_capabilities=("stable_transcript",),
+        ),
+        audience="desktop",
+        core_version="0.1.0",
+    )
+    payload = capabilities.model_dump(mode="python")
+    payload["targets"][0]["methods"][0]["support"]["runtime"]["message"] = (
+        "x" * 4097
+    )
+
+    with pytest.raises(ValidationError, match="at most 4096 characters"):
+        EvolutionCapabilitiesV1.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda payload: payload["targets"][0].__setitem__(
+            "context_order", 9_007_199_254_740_992
+        ),
+        lambda payload: payload["targets"][0]["methods"][1]["input_bindings"][
+            0
+        ].__setitem__("min_count", 9_007_199_254_740_992),
+    ],
+    ids=["context-order", "input-binding-count"],
+)
+def test_capability_payload_rejects_outer_unsafe_integers(mutate) -> None:
+    capabilities = build_evolution_capabilities(
+        _snapshot(),
+        profile=execution_profile_for_release_mode(
+            "codex_subscription_transcript",
+            harness_capabilities=("stable_transcript",),
+        ),
+        audience="desktop",
+        core_version="0.1.0",
+    )
+    payload = capabilities.model_dump(mode="python")
+    mutate(payload)
+
+    with pytest.raises(ValidationError, match="JavaScript safe range"):
+        EvolutionCapabilitiesV1.model_validate(payload)
+
+
+def test_capability_payload_rejects_single_collection_amplification() -> None:
+    capabilities = build_evolution_capabilities(
+        _snapshot(),
+        profile=execution_profile_for_release_mode(
+            "codex_subscription_transcript",
+            harness_capabilities=("stable_transcript",),
+        ),
+        audience="desktop",
+        core_version="0.1.0",
+    )
+    payload = capabilities.model_dump(mode="python")
+    payload["evaluated_profile"]["runtime_capabilities"] = [
+        f"runtime_{index}" for index in range(4097)
+    ]
+
+    with pytest.raises(ValidationError, match="collection is too large"):
         EvolutionCapabilitiesV1.model_validate(payload)

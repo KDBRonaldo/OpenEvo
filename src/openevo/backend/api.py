@@ -13,6 +13,7 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from openevo import __version__
 from openevo.backend.models import (
@@ -28,6 +29,8 @@ from openevo.backend.models import (
     EnvironmentRepairResponse,
     EnvironmentSettings,
     ErrorCategory,
+    EvolutionProjectValidationRequest,
+    EvolutionProjectValidationResponse,
     HealthResponse,
     LogResponse,
     ProjectCreateRequest,
@@ -38,6 +41,8 @@ from openevo.backend.models import (
     ServiceActionResponse,
     ServiceSummary,
     TimelineEvent,
+    MAX_EVOLUTION_PROJECT_VALIDATION_JSON_DEPTH,
+    MAX_EVOLUTION_PROJECT_VALIDATION_REQUEST_BYTES,
 )
 from openevo.evolution.framework import (
     CapabilityAudience,
@@ -52,6 +57,10 @@ from openevo.evolution.framework.builtins import (
 )
 from openevo.evolution.models import ArtifactResponse
 from openevo.evolution.store import EvolutionStore
+from openevo.experiments import (
+    ProjectEvolutionValidationError,
+    validate_project_evolution_selections,
+)
 
 DISPLAY_ARTIFACT_TYPES = {
     "text_memory",
@@ -99,6 +108,151 @@ def _bad_request(code: str, category: ErrorCategory, message: str) -> BackendHTT
     )
 
 
+class _ProjectValidationRequestGuard:
+    """Bound the public preflight body before JSON or Pydantic parsing."""
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(
+        self,
+        scope: Scope,
+        receive: Receive,
+        send: Send,
+    ) -> None:
+        if not _is_project_validation_request(scope):
+            await self.app(scope, receive, send)
+            return
+
+        declared_length = _content_length(scope)
+        if (
+            declared_length is not None
+            and declared_length > MAX_EVOLUTION_PROJECT_VALIDATION_REQUEST_BYTES
+        ):
+            await _request_guard_response(
+                413,
+                code="request_body_too_large",
+                message="The project validation request exceeds the maximum size.",
+                details={
+                    "max_bytes": MAX_EVOLUTION_PROJECT_VALIDATION_REQUEST_BYTES
+                },
+            )(scope, receive, send)
+            return
+
+        body = bytearray()
+        while True:
+            message = await receive()
+            if message["type"] == "http.disconnect":
+                return
+            chunk = message.get("body", b"")
+            if (
+                len(body) + len(chunk)
+                > MAX_EVOLUTION_PROJECT_VALIDATION_REQUEST_BYTES
+            ):
+                await _request_guard_response(
+                    413,
+                    code="request_body_too_large",
+                    message="The project validation request exceeds the maximum size.",
+                    details={
+                        "max_bytes": MAX_EVOLUTION_PROJECT_VALIDATION_REQUEST_BYTES
+                    },
+                )(scope, receive, send)
+                return
+            body.extend(chunk)
+            if not message.get("more_body", False):
+                break
+
+        if _json_nesting_exceeds(
+            body,
+            MAX_EVOLUTION_PROJECT_VALIDATION_JSON_DEPTH,
+        ):
+            await _request_guard_response(
+                422,
+                code="request_validation_error",
+                message=(
+                    "The request payload does not match the OpenEvo backend contract."
+                ),
+                details={"errors": [{"message": "JSON nesting exceeds the depth budget"}]},
+            )(scope, receive, send)
+            return
+
+        replayed = False
+
+        async def replay_receive() -> Message:
+            nonlocal replayed
+            if replayed:
+                return {"type": "http.request", "body": b"", "more_body": False}
+            replayed = True
+            return {"type": "http.request", "body": bytes(body), "more_body": False}
+
+        await self.app(scope, replay_receive, send)
+
+
+def _is_project_validation_request(scope: Scope) -> bool:
+    return (
+        scope["type"] == "http"
+        and scope.get("method") == "POST"
+        and scope.get("path") == "/evolution/project-validation"
+    )
+
+
+def _content_length(scope: Scope) -> int | None:
+    for name, value in scope.get("headers", ()):
+        if name.lower() != b"content-length":
+            continue
+        try:
+            length = int(value)
+        except ValueError:
+            return None
+        return length if length >= 0 else None
+    return None
+
+
+def _json_nesting_exceeds(body: bytes | bytearray, maximum: int) -> bool:
+    depth = 0
+    in_string = False
+    escaped = False
+    for value in body:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif value == ord("\\"):
+                escaped = True
+            elif value == ord('"'):
+                in_string = False
+            continue
+        if value == ord('"'):
+            in_string = True
+        elif value in (ord("{"), ord("[")):
+            depth += 1
+            if depth > maximum:
+                return True
+        elif value in (ord("}"), ord("]")):
+            depth = max(depth - 1, 0)
+    return False
+
+
+def _request_guard_response(
+    status_code: int,
+    *,
+    code: str,
+    message: str,
+    details: dict[str, Any],
+) -> JSONResponse:
+    return _error_response(
+        status_code,
+        BackendError(
+            code=code,
+            message=message,
+            severity="blocking",
+            category="internal",
+            retryable=False,
+            repair_action="openevo_can_reconfigure",
+            details=details,
+        ),
+    )
+
+
 def create_backend_app(
     state_root: str | Path | None = None,
     *,
@@ -107,6 +261,7 @@ def create_backend_app(
     if evolution_registry is not None:
         require_verified_executable_registry(evolution_registry)
     app = FastAPI(title="OpenEvo Core Backend", version="0.1.0")
+    app.add_middleware(_ProjectValidationRequestGuard)
     app.state.evolution_registry = evolution_registry
     canonical_state_root = _canonical_state_root(state_root)
     project_counter = count(1)
@@ -434,6 +589,78 @@ def create_backend_app(
             audience=CapabilityAudience.DESKTOP,
             core_version=__version__,
         )
+
+    @app.post(
+        "/evolution/project-validation",
+        response_model=EvolutionProjectValidationResponse,
+        responses={
+            409: {"model": BackendError},
+            413: {"model": BackendError},
+            422: {"model": BackendError},
+            503: {"model": BackendError},
+        },
+    )
+    def evolution_project_validation(
+        request: EvolutionProjectValidationRequest,
+    ) -> EvolutionProjectValidationResponse:
+        if evolution_registry is None:
+            raise BackendHTTPError(
+                503,
+                BackendError(
+                    code="evolution_registry_unavailable",
+                    message="Verified evolution validation is unavailable.",
+                    severity="blocking",
+                    category="service",
+                    retryable=True,
+                    repair_action="openevo_can_retry",
+                ),
+            )
+        registry_digest = evolution_registry.snapshot.registry_digest
+        if request.expected_registry_digest != registry_digest:
+            raise BackendHTTPError(
+                409,
+                BackendError(
+                    code="evolution_registry_changed",
+                    message="Evolution capabilities changed before run validation.",
+                    severity="blocking",
+                    category="project",
+                    retryable=True,
+                    repair_action="openevo_can_retry",
+                    details={"registry_digest": registry_digest},
+                ),
+            )
+        try:
+            validate_project_evolution_selections(
+                request.targets,
+                agent_model=request.agent_model,
+                reflector_llm={
+                    "provider": "codex_cli",
+                    "model": request.agent_model,
+                },
+                registry_snapshot=evolution_registry.snapshot,
+                execution_profile=execution_profile_for_release_mode(
+                    request.execution_mode
+                ),
+            )
+        except ProjectEvolutionValidationError as exc:
+            raise BackendHTTPError(
+                409,
+                BackendError(
+                    code="evolution_project_invalid",
+                    message="The active project evolution configuration is invalid.",
+                    severity="blocking",
+                    category="project",
+                    retryable=False,
+                    repair_action="openevo_can_reconfigure",
+                    details={
+                        "target_id": exc.target_id,
+                        "selection": exc.selection,
+                        "reason_code": exc.reason_code,
+                        "registry_digest": registry_digest,
+                    },
+                ),
+            ) from exc
+        return EvolutionProjectValidationResponse(registry_digest=registry_digest)
 
     return app
 
