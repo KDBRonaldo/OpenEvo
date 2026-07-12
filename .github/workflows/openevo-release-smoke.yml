@@ -85,4 +85,5 @@ jobs:
           .openevo-wheel-smoke/bin/openevo-backend --help
           .openevo-wheel-smoke/bin/openevo-backend serve --help
           .openevo-wheel-smoke/bin/openevo-backend run --help
+          PYTHONPATH= .openevo-wheel-smoke/bin/python scripts/ci/smoke_evolution_framework_wheel.py --wheel dist/*.whl
           PYTHONPATH=. .openevo-wheel-smoke/bin/python scripts/ci/smoke_openevo_desktop_wheel.py

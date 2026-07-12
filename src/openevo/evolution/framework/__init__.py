@@ -91,6 +91,14 @@ from .handlers import (
     payload_entries_under_root,
     payload_tree_size,
 )
+from .loading import (
+    DescriptorImplementationAnchor,
+    DistributionArtifactExpectation,
+    FrameworkLoadError,
+    VerifiedDistribution,
+    load_verified_entry_point,
+    verify_distribution_install,
+)
 from .plan import EvolutionPlan, EvolutionTargetSelection, ResolvedEvolutionSelection
 from .profiles import ReleaseExecutionMode, execution_profile_for_release_mode
 from .registry import CanonicalModelView, EvolutionFrameworkRegistry, RegistrySnapshot
@@ -128,6 +136,8 @@ __all__ = [
     "DescriptorKind",
     "CanonicalModelView",
     "DestinationScope",
+    "DescriptorImplementationAnchor",
+    "DistributionArtifactExpectation",
     "EnvironmentBinding",
     "EnvironmentValueKind",
     "EvolutionExecutionProfile",
@@ -145,6 +155,7 @@ __all__ = [
     "Exposure",
     "FileBundleEntry",
     "FileBundleRendererData",
+    "FrameworkLoadError",
     "ImplementationIdentity",
     "ImplementationRef",
     "InlineTextPayloadContribution",
@@ -196,12 +207,14 @@ __all__ = [
     "TargetHandlerInput",
     "TargetHandlerOutput",
     "TargetHandlerServices",
+    "VerifiedDistribution",
     "TrustedArtifactSnapshot",
     "canonical_digest",
     "canonical_json",
     "build_execution_envelope",
     "build_evolution_capabilities",
     "invoke_legacy_method",
+    "load_verified_entry_point",
     "paths_conflict",
     "payload_tree_digest",
     "payload_entries_under_root",
@@ -218,5 +231,6 @@ __all__ = [
     "validate_relative_path",
     "validate_schema",
     "validate_user_config_schema_ownership",
+    "verify_distribution_install",
     "worker_input_artifact_digest",
 ]

@@ -572,8 +572,10 @@ def test_local_version_validation_reads_top_level_desktop_metadata() -> None:
 
 def test_release_smoke_workflow_builds_packaged_assets_and_validates_wheel() -> None:
     workflow = Path(".github/workflows/openevo-release-smoke.yml")
+    framework_smoke = Path("scripts/ci/smoke_evolution_framework_wheel.py")
 
     text = workflow.read_text(encoding="utf-8")
+    framework_smoke_text = framework_smoke.read_text(encoding="utf-8")
 
     assert 'node-version: "22"' in text
     assert "npm test -- --run" in text
@@ -597,9 +599,22 @@ def test_release_smoke_workflow_builds_packaged_assets_and_validates_wheel() -> 
     assert ".openevo-wheel-smoke/bin/openevo-backend serve --help" in text
     assert ".openevo-wheel-smoke/bin/openevo-backend run --help" in text
     assert (
+        "PYTHONPATH= .openevo-wheel-smoke/bin/python "
+        "scripts/ci/smoke_evolution_framework_wheel.py --wheel dist/*.whl"
+    ) in text
+    assert (
         "PYTHONPATH=. .openevo-wheel-smoke/bin/python "
         "scripts/ci/smoke_openevo_desktop_wheel.py"
     ) in text
+    assert "EXPECTED_METHOD_IDS" in framework_smoke_text
+    assert "EXPECTED_TARGET_IDS" in framework_smoke_text
+    assert "EXPECTED_HANDLER_IDS" in framework_smoke_text
+    assert framework_smoke_text.index("verified = verify_distribution_install(") < (
+        framework_smoke_text.index(
+            "from openevo.evolution.framework.builtins import "
+            "load_verified_builtin_registry"
+        )
+    )
 
     assert text.index("npm ci") < text.index("npm test -- --run")
     assert text.index("npm ci") < text.index("npm audit --audit-level=high")

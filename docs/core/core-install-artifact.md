@@ -4,6 +4,12 @@
 > published yet. Workstream B2 implements and tests this format before Desktop
 > or release docs may rely on it.
 
+The A2.2 evolution framework loader already consumes the descriptor's
+distribution name, version, and wheel SHA-256 shape to verify an installed
+distribution and its entry points. That verifier does not implement this full
+descriptor, publish an artifact, or permit Desktop to rely on a missing B2
+resource.
+
 The Core install artifact is the exact OpenEvo Core Backend package that
 OpenEvo Desktop installs on the remote server. Desktop is the ordinary-user
 application, but Core is the backend that owns execution, datasets, evolution

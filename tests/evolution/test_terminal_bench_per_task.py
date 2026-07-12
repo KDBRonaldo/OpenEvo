@@ -2440,3 +2440,156 @@ def test_terminal_bench_group_evolution_cli_live_mode_rejects_parametric_memory(
                 str(output),
             ]
         )
+
+
+@pytest.mark.parametrize(
+    ("selector", "objective_key"),
+    [
+        (per_task_module._select_best_candidate_result, "reward"),
+        (per_task_module._select_best_group_candidate_result, "score"),
+    ],
+)
+def test_gepa_candidate_selectors_order_all_none_objectives_by_generation_then_index(
+    selector,
+    objective_key: str,
+):
+    candidates = [
+        {
+            objective_key: None,
+            "generation": generation,
+            "artifact": EvolutionArtifact(
+                artifact_type="agent_system",
+                artifact_id=artifact_id,
+                path=Path(f"/{artifact_id}.md"),
+                task_id="task-a",
+                round=1,
+                method="agent_system_gepa_reflector",
+                candidate_index=candidate_index,
+            ),
+        }
+        for artifact_id, generation, candidate_index in [
+            ("newer-larger-index", 2, 2),
+            ("older-smaller-index", 1, 1),
+            ("newer-smaller-index", 2, 1),
+        ]
+    ]
+
+    selected = selector(candidates)
+
+    assert selected["artifact"].artifact_id == "newer-smaller-index"
+
+
+@pytest.mark.parametrize(
+    ("selector", "objective_key"),
+    [
+        (per_task_module._select_best_candidate_result, "reward"),
+        (per_task_module._select_best_group_candidate_result, "score"),
+    ],
+)
+def test_gepa_candidate_selectors_preserve_first_input_when_all_keys_tie(
+    selector,
+    objective_key: str,
+):
+    candidates = [
+        {
+            objective_key: 0.5,
+            "generation": 3,
+            "artifact": EvolutionArtifact(
+                artifact_type="agent_system",
+                artifact_id=artifact_id,
+                path=Path(f"/{artifact_id}.md"),
+                task_id="task-a",
+                round=1,
+                method="agent_system_gepa_reflector",
+                candidate_index=2,
+            ),
+        }
+        for artifact_id in ["first", "second"]
+    ]
+
+    selected = selector(candidates)
+
+    assert selected is candidates[0]
+
+
+@pytest.mark.parametrize(
+    ("selector", "objective_key"),
+    [
+        (per_task_module._select_best_candidate_result, "reward"),
+        (per_task_module._select_best_group_candidate_result, "score"),
+    ],
+)
+def test_gepa_candidate_selectors_default_missing_generation_to_zero(
+    selector,
+    objective_key: str,
+):
+    explicit_zero = {
+        objective_key: 1.0,
+        "generation": 0,
+        "artifact": EvolutionArtifact(
+            artifact_type="agent_system",
+            artifact_id="explicit-zero",
+            path=Path("/explicit-zero.md"),
+            task_id="task-a",
+            round=1,
+            method="agent_system_gepa_reflector",
+            candidate_index=2,
+        ),
+    }
+    missing_generation = {
+        objective_key: 1.0,
+        "artifact": EvolutionArtifact(
+            artifact_type="agent_system",
+            artifact_id="missing-generation",
+            path=Path("/missing-generation.md"),
+            task_id="task-a",
+            round=1,
+            method="agent_system_gepa_reflector",
+            candidate_index=1,
+        ),
+    }
+
+    selected = selector([explicit_zero, missing_generation])
+
+    assert selected is missing_generation
+
+
+def test_artifact_candidate_index_infers_id_and_uses_supplied_zero_fallback():
+    inferred = EvolutionArtifact(
+        artifact_type="agent_system",
+        artifact_id="artifact-c7-output",
+        path=Path("/inferred.md"),
+        task_id="task-a",
+        round=1,
+        method="agent_system_gepa_reflector",
+    )
+    uninferrable = EvolutionArtifact(
+        artifact_type="agent_system",
+        artifact_id="artifact-unknown",
+        path=Path("/uninferrable.md"),
+        task_id="task-a",
+        round=1,
+        method="agent_system_gepa_reflector",
+    )
+
+    assert per_task_module._artifact_candidate_index(inferred, 0) == 7
+    assert per_task_module._artifact_candidate_index(uninferrable, 0) == 0
+
+
+@pytest.mark.parametrize(
+    "task_rewards",
+    [
+        {"task-a": None, "task-b": 1.0},
+        {"task-a": 0.0, "task-b": None},
+    ],
+)
+def test_aggregate_group_score_returns_none_when_any_task_reward_is_none(task_rewards):
+    assert per_task_module._aggregate_group_score(task_rewards, "macro_mean_reward") is None
+
+
+def test_aggregate_group_score_rejects_empty_rewards_and_unknown_objective():
+    with pytest.raises(ValueError, match="requires at least one task reward"):
+        per_task_module._aggregate_group_score({}, "macro_mean_reward")
+
+    with pytest.raises(ValueError, match="unsupported Terminal Bench group objective"):
+        per_task_module._aggregate_group_score({"task-a": 1.0}, "unknown")

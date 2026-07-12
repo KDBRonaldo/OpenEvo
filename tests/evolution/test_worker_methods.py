@@ -9,6 +9,7 @@ from typing import Any
 import httpx
 import pytest
 
+from openevo.evolution import methods as methods_module
 from openevo.evolution.cli import _parse_capabilities
 from openevo.evolution.methods import METHOD_REGISTRY, _audit_agent_system_markdown, run_method
 from openevo.evolution.models import (
@@ -16,6 +17,7 @@ from openevo.evolution.models import (
     ContextResolveRequest,
     DatasetCreateRequest,
     EventIngestRequest,
+    WorkerClaimInputArtifact,
     WorkerClaimedJob,
 )
 from openevo.evolution.store import EvolutionStore
@@ -3023,6 +3025,100 @@ def test_agent_system_gepa_reflector_generates_mutation_pool_from_verifier_feedb
         "preservation_gate",
         "xss_corpus",
     ]
+
+
+def test_agent_system_gepa_history_sort_and_best_round_tie_are_stable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_reflector_llm_sequence(
+        monkeypatch,
+        ["# Stable Candidate\n\n- Preserve verified behavior across rounds."],
+    )
+    specifications = (
+        ("round-3", 3, 0.2),
+        ("round-1", 1, 0.8),
+        ("round-2-a", 2, 0.8),
+        ("round-2-b", 2, 0.8),
+    )
+    artifacts: list[dict[str, Any]] = []
+    for label, round_number, f1 in specifications:
+        root = tmp_path / label
+        root.mkdir()
+        artifact = _history_round_dataset_artifact(
+            root,
+            round_number=round_number,
+            precision=f1,
+            recall=f1,
+            f1=f1,
+            record={
+                "event_id": f"evt_{label}",
+                "task_id": "task_gepa_history",
+                "session_id": f"session_{label}",
+                "status": "COMPLETED",
+                "reward": f1,
+                "traces": [
+                    {
+                        "prompt_messages": [{"role": "user", "content": label}],
+                        "response_messages": [
+                            {"role": "assistant", "content": f"observed {label}"}
+                        ],
+                    }
+                ],
+            },
+        )
+        artifact["artifact_id"] = f"artifact_{label}"
+        artifacts.append(artifact)
+
+    round_three_manifest = Path(
+        artifacts[0]["uri"].removeprefix("file://")
+    )
+    payload = json.loads(round_three_manifest.read_text(encoding="utf-8"))
+    payload["metrics"]["f1"] = None
+    round_three_manifest.write_text(json.dumps(payload), encoding="utf-8")
+
+    rounds = methods_module._history_reflection_rounds(
+        [WorkerClaimInputArtifact(**item) for item in artifacts],
+        max_records_per_round=8,
+    )
+    assert [item["artifact"].artifact_id for item in rounds] == [
+        "artifact_round-1",
+        "artifact_round-2-a",
+        "artifact_round-2-b",
+        "artifact_round-3",
+    ]
+    assert methods_module._best_history_round(rounds)["artifact"].artifact_id == (
+        "artifact_round-1"
+    )
+
+    produced = run_method(
+        _job(
+            "agent_system_gepa_reflector",
+            tmp_path,
+            input_artifacts=artifacts,
+            config={
+                "mutation_strategies": ["stable_history"],
+                "reflector_llm": {
+                    "model": "reflector-model",
+                    "base_url": "http://reflector.test/v1",
+                    "api_key": "test-key",
+                },
+            },
+        ),
+        artifact_root=tmp_path / "artifacts",
+    )
+    candidate = next(
+        artifact for artifact in produced if artifact.type == ArtifactType.AGENT_SYSTEM
+    )
+
+    assert candidate.manifest["source_dataset_artifact_ids"] == [
+        "artifact_round-1",
+        "artifact_round-2-a",
+        "artifact_round-2-b",
+        "artifact_round-3",
+    ]
+    assert candidate.manifest["best_round"] == 1
+    assert candidate.manifest["latest_round"] == 3
 
 
 def test_agent_system_gepa_reflector_consumes_human_feedback(

@@ -100,19 +100,25 @@ job config 中记录来源、policy/version、redaction evidence 和兼容性信
 
 OpenEvo Core exposes method registry metadata as a contract, not as Desktop-local
 configuration. UI and automation must discover release-supported methods through
-Core capability metadata derived from the same registry used by workers.
+Core capability metadata derived from the same frozen framework registry used by
+workers after the A2.3 dispatch cutover.
 
 ## OpenEvo Core capability metadata
 
-Desktop 和 developer workflow utilities 不应硬编码 method table。内置 evolution method 的可发现信息由
-`openevo.capabilities` 暴露：
+Desktop 和维护者 automation 不应硬编码 method table。A2.2 已在
+`openevo.evolution.framework.builtins` 建立 target-rooted frozen catalog；A2.3 才把
+现有 `openevo.capabilities` 和 worker dispatch 切到该 catalog。在此之前，旧 capability
+projection 仍是兼容路径，不是新增方法应扩展的权威表。
+
+当前兼容 API：
 
 - `build_core_capabilities()` 返回 frozen Pydantic `CoreCapabilities`，包含 execution modes、
   artifact targets 和 evolution methods。
 - `method_metadata_by_id()` 返回 `dict[str, EvolutionMethodCapability]`，key 与
   `openevo.evolution.methods.METHOD_REGISTRY` 的 method ID 一致。
-- `openevo.evolution.methods.METHOD_METADATA` 是内置 worker method 的 metadata 源；每个
-  `METHOD_REGISTRY` key 都必须有对应 metadata，避免 UI 或开发者工具维护第二份方法表。
+- `openevo.evolution.methods.METHOD_METADATA` 是待删除的 legacy capability metadata；
+  A2.2 测试只要求其与当前 dispatch 不漂移。新增 target/method metadata 应写入 frozen
+  framework descriptor，A2.3/A2.5 完成后旧表不再存在。
 
 当前 Core execution modes 是：
 
@@ -682,7 +688,7 @@ Gateway 在 run 前调用：
 
 ## Adding Methods / 接入新算法
 
-### 方式一：扩展内置 method registry
+### 方式一：扩展内置 method catalog
 
 适合本仓库内的 baseline 或实验方法。
 
@@ -693,18 +699,19 @@ def my_memory_method(job: WorkerClaimedJob, artifact_root: Path) -> list[Artifac
     ...
 ```
 
-2. 在 `METHOD_REGISTRY` 注册：
+2. 在 `openevo.evolution.framework.builtins` 添加
+   `EvolutionMethodDescriptor`，声明 target、ordered inputs、outputs、closed config schema、
+   support axes 和 locked entry point。内置 entry point 使用：
 
 ```python
-METHOD_REGISTRY["my_memory_method"] = my_memory_method
+entry_point="openevo.evolution.methods:my_memory_method"
 ```
 
-3. 在 `METHOD_METADATA` 注册 capability metadata。metadata 的 key 和 payload 内的
-   `method_id` 都必须等于 `METHOD_REGISTRY` key，至少说明 `method_id`、`display_name`、
-   `description`、`artifact_type`、`visibility`、`visible_in_desktop`、`input_requirements`、
-   `supported_execution_modes`、`default_config`、`config_schema` 和 `stability_level`。
-   Desktop 或开发者工具会通过
-   `openevo.capabilities` 读取这份 metadata，不应再硬编码 method table。
+3. A2.2 迁移期若该 built-in 需要立即由 worker dispatch，临时同步 callable 到
+   `METHOD_REGISTRY`，并同步一条 key 相同的 `METHOD_METADATA` 以保持现有 capability contract。
+   descriptor 仍是未来权威 catalog；不要新增第三份 metadata 表。
+   `test_framework_builtins.py` 必须证明 descriptor entry point 与 legacy registry 对象
+   identity 相同。A2.3 dispatch/capability cutover 后删除此兼容步骤。
 
 4. 创建 job 时设置：
 
@@ -713,20 +720,34 @@ METHOD_REGISTRY["my_memory_method"] = my_memory_method
   "job_type": "my_memory_method",
   "method": "my_memory_method",
   "input_artifact_ids": ["art_dataset"],
-  "config": {"promoted": true}
+  "config": {"max_records": 20}
 }
 ```
 
-5. 为 method 输出、worker complete、context resolve 和 Core capability metadata 添加测试。
+5. 为 descriptor identity、locked loading、method 输出、worker complete、context resolve
+   和 Core capability projection 添加测试。
 
-### 方式二：外部 research worker
+### 方式二：显式 research plugin
 
-适合独立仓库、GPU 训练、长任务或 SOTA 方法。外部 worker 只需要实现 worker protocol：
+适合独立仓库、GPU 训练、长任务或 SOTA 方法。插件 wheel 和 catalog entry point 必须由
+维护者通过 distribution name、version、SHA-256 和 entry point lock 显式启用；Core 不扫描
+或自动执行环境中碰巧安装的插件。插件 descriptor 遵守同一 frozen registry contract，专用
+worker 继续实现现有 worker protocol。
 
-1. `POST /v1/jobs/claim`，带上自己的 capabilities。
-2. 读取 claimed job 的 `input_artifacts` 和 `config`。
-3. 运行算法，产出文件或 adapter。
-4. `POST /v1/jobs/{job_id}/complete`，提交一个或多个 `ArtifactRegisterRequest`。
+这是 A2.3 dispatch cutover 后的目标流程。A2.2 仅提供 locked wheel/install、entry-point
+verification 和 registry contracts；当前 worker 不执行动态 plugin handle。A2.2 期间，独立
+research worker 仍可按已有 capability/job protocol claim 已知 method jobs，但不能把自己的
+in-process catalog 动态接入 Core。
+
+A2.3 后：
+
+1. 验证 locked wheel/install，再从该 distribution 加载 verified catalog provider。
+2. 注册 provider 返回的 descriptors 并 freeze/validate descriptor graph。
+3. 验证 frozen graph 中每个 implementation entry point；全部成功后才 publish loaded registry。
+4. `POST /v1/jobs/claim`，带上自己的 capabilities。
+5. 读取 claimed job 的 ordered `input_artifacts` 和 separated config envelope。
+6. 运行算法，产出文件或 adapter。
+7. `POST /v1/jobs/{job_id}/complete`，提交一个或多个 `ArtifactRegisterRequest`。
 
 这种方式不需要修改 backend DB schema。新算法通过 typed artifact 与 Core 通信。
 

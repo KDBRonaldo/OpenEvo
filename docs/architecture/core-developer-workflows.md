@@ -37,33 +37,42 @@ experiments, and monitor results. It should not expose benchmark controls,
 method registry editing, artifact debugging, raw backend mutations, or hidden
 developer-console behavior.
 
-## Method Metadata Lifecycle
+## Method Catalog Lifecycle
 
 OpenEvo Core is the source of truth for built-in method capabilities. Desktop
-and developer workflow utilities must not maintain separate hardcoded method
-tables.
+and maintainer automation must not maintain separate hardcoded method tables.
 
 The lifecycle for a new built-in method is:
 
-1. Add the method implementation to `openevo.evolution.methods.METHOD_REGISTRY`.
-2. Add matching `METHOD_METADATA` with the same method ID.
-3. Include visibility, display text, artifact target, input requirements,
-   supported execution modes, default config, config schema, and stability level.
-4. Expose the metadata through `openevo.capabilities`.
-5. Let Desktop filter to ordinary-user-visible methods with
-   `visible_in_desktop=true`.
-6. Let developer workflow utilities inspect the broader set of `ordinary_user`,
-   `dev_kit`, and internal methods when method development or benchmark work
-   needs them.
+1. Implement the method without adding target-specific scheduler, store, Gateway,
+   benchmark, or Desktop branches.
+2. Add one `EvolutionMethodDescriptor` to the built-in catalog, or return it
+   from an explicitly locked research-plugin catalog.
+3. Declare target, ordered input bindings, output types, four support axes,
+   closed config schema, exposure, maturity, and immutable implementation identity.
+4. Freeze and validate the descriptor graph, then verify every frozen identity's
+   installed distribution and entry point. Publish the loaded registry only if
+   both phases succeed.
+5. Expose the target-rooted capability projection from that same snapshot.
+6. Let Desktop consume only `desktop` exposure; maintainers and benchmark
+   automation may consume `maintainer` and `internal` entries through Core.
 
-`visibility=ordinary_user` methods are eligible for Desktop when also marked
-Desktop-visible. `visibility=dev_kit` methods are for benchmark, research, and
-debugging workflows. `visibility=internal` methods are plumbing or migration
-surfaces and should stay out of ordinary-user UI.
+During A2.2 only, existing built-ins remain in `METHOD_REGISTRY` for unchanged
+worker dispatch, and `METHOD_METADATA` remains for the old capabilities path.
+Any built-in added to one legacy table during this interval must be added to the
+other with the same key; CI enforces equality. Exact-object tests prevent
+callable drift. A2.3 cuts dispatch/capabilities over; A2.5 deletes both duplicate
+legacy tables.
 
-The historical metadata value `dev_kit` means source-checkout developer,
-benchmark, or maintainer workflow visibility only. It does not define or imply
-a separately released developer product surface.
+A2.2 can verify a locked research-plugin wheel and its entry points, but current
+workers do not invoke those handles. In-process plugin execution and registry
+composition are A2.3 behavior. Until then, new plugin code is testable through
+its direct contract or the existing external-worker protocol, not as a claimed
+release capability.
+
+Framework exposure uses `desktop`, `maintainer`, and `internal`. The historical
+legacy metadata values `ordinary_user` and `dev_kit` remain only until A2.5;
+they do not define or imply a separately released developer product surface.
 
 ## Standalone Benchmark Automation
 
@@ -80,8 +89,8 @@ automation. Desktop must not expose benchmark controls or benchmark gates.
 
 Benchmark automation must not implement a separate evolution backend, method
 registry, artifact type system, context resolver, or promotion path. If a
-benchmark needs a new evolution algorithm, add it through the Core method
-registry and metadata lifecycle. If it needs a new output shape, prefer a typed
+benchmark needs a new evolution algorithm, add it through the Core framework
+catalog lifecycle. If it needs a new output shape, prefer a typed
 Core artifact with a manifest before introducing backend schema changes.
 
 Automation should preserve benchmark provenance in structured metadata while

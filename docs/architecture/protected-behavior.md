@@ -20,7 +20,9 @@ The following behavior must remain observable after file and import moves:
 These contracts are exercised in
 `tests/evolution/test_worker_methods.py`. Stable IDs and algorithm-facing input,
 output, execution-mode, and default contracts for these three methods remain
-covered by `tests/evolution/test_algorithm_preservation_contract.py`. Presentation,
+covered by `tests/evolution/test_algorithm_preservation_contract.py`.
+`tests/evolution/test_framework_builtins.py` additionally proves the new method
+entry points resolve to the exact legacy callable objects. Presentation,
 visibility, schema, and unrelated registry entries are not frozen as algorithm
 behavior.
 
@@ -31,6 +33,7 @@ co-located with Terminal Bench automation. Tests in
 - objective value before generation and candidate-index tie-breaking;
 - `None` below every numeric reward or group score;
 - later generation before lower candidate index when objectives tie;
+- complete ties retaining the first candidate in input order;
 - all per-task and group candidate trials feeding the next generation;
 - only the selected per-task or group result feeding the next round;
 - dataset history accumulating across generations and rounds;
@@ -38,7 +41,9 @@ co-located with Terminal Bench automation. Tests in
   with all prior dataset IDs.
 
 Productization may relocate this code but must not alter or duplicate its
-selection policy. A1 adds no algorithm behavior or artifact lifecycle behavior.
+selection policy. A2.2 also freezes stable history-round ordering, best-round
+ties, missing generation/index fallbacks, and group objectives containing a
+missing reward. These fixtures add no algorithm or artifact lifecycle behavior.
 
 ## Protected Stage Boundaries
 

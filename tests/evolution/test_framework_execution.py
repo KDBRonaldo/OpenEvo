@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
 
 from openevo.evolution.framework import (
+    CORE_CONFIG_RESERVED_KEYS,
     HarnessInferenceRequest,
     HarnessInferenceResponse,
     MethodExecutionContext,
@@ -224,6 +226,49 @@ def test_execution_envelope_rejects_core_user_shadowing() -> None:
             core_config={"algorithm_setting": True},
             input_bindings=(),
         )
+
+
+def test_evaluator_and_audit_controls_are_core_owned(tmp_path: Path) -> None:
+    controls = {
+        "agent_system_audit": {"enabled": True},
+        "candidate_evaluations": {"candidate-1": {"f1": 0.5}},
+        "forbidden_literals": {"source_files": ["heldout.txt"]},
+        "promotion_support": {"validation_checks": ["run heldout evaluation"]},
+    }
+
+    envelope = build_execution_envelope(
+        plan_id="plan-controls",
+        target_id="agent_system",
+        method_id="agent_system_gepa_reflector",
+        user_config={},
+        core_config=controls,
+        input_bindings=(),
+    )
+
+    assert json.loads(envelope.core_config_json) == controls
+    for key in controls:
+        assert key in CORE_CONFIG_RESERVED_KEYS
+
+    observed: dict[str, object] = {}
+
+    def legacy_method(job: WorkerClaimedJob, artifact_root: Path):
+        observed["config"] = job.config
+        observed["artifact_root"] = artifact_root
+        return []
+
+    context = MethodExecutionContext(
+        job=WorkerClaimedJob(
+            job_id="job-controls",
+            lease_id="lease-controls",
+            job_type="agent_system_gepa_reflector",
+            method="agent_system_gepa_reflector",
+        ),
+        artifact_root=tmp_path,
+        envelope=envelope,
+        services=MethodExecutionServices(harness=_Harness()),
+    )
+    assert invoke_legacy_method(legacy_method, context) == []
+    assert observed == {"config": controls, "artifact_root": tmp_path}
 
 
 def test_execution_envelope_binds_full_duplicate_artifact_snapshots(

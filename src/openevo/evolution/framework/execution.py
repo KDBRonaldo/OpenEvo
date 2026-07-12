@@ -30,15 +30,19 @@ from .contracts import (
 
 CORE_CONFIG_RESERVED_KEYS = frozenset(
     {
+        "agent_system_audit",
+        "candidate_evaluations",
         "compatibility",
         "experiment_id",
         "experiment_name",
+        "forbidden_literals",
         "lineage",
         "name",
         "policy_version",
         "promoted",
         "promotion_contract",
         "promotion_gate",
+        "promotion_support",
         "round_index",
         "scores",
         "task_id",

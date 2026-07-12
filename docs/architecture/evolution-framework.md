@@ -1,15 +1,18 @@
 # Pluggable Evolution Framework
 
-Status: A2.1 contract only; runtime cutover is deferred
+Status: A2.2 built-in catalog and verified loader; runtime cutover is deferred
 
-Tracking: issue #137, productization step A2. A2.1 implements contracts for
-`PLUG-1` through `PLUG-4`; A1 froze `PLUG-5`, which A2.2 migrates and verifies.
+Tracking: issues #137 and #139, productization step A2. A2.1 implements
+contracts for `PLUG-1` through `PLUG-4`; A2.2 catalogs the existing
+implementations and extends the A1 `PLUG-5` behavior fixtures.
 
 This contract makes evolution targets and methods pluggable without replacing
-the existing OpenEvo Core architecture. A2.1 adds data models, validation, and a
-frozen registry only. Current method dispatch, jobs, worker leases, artifact
-registration, promotion, context resolution, gateway injection, Science config,
-and Desktop behavior remain unchanged until their assigned cutovers.
+the existing OpenEvo Core architecture. A2.1 added the data models and
+validation. A2.2 adds a deterministic built-in catalog and distribution-backed
+entry-point verification. Current method dispatch, jobs, worker leases,
+artifact registration, promotion, context resolution, gateway injection,
+Science config, and Desktop behavior remain unchanged until their assigned
+cutovers.
 
 ## Boundary
 
@@ -46,14 +49,34 @@ Core constructs one registry during startup. Registration is explicit and
 single-threaded. Duplicate IDs, unknown references, incompatible target/artifact
 pairs, malformed entry-point identities, invalid schemas, and unsupported
 renderer contracts fail startup. `freeze()` canonicalizes the registry and
-prevents further registration.
+prevents further registration. Startup then verifies every frozen identity and
+publishes method/handler handles only after verification succeeds; freezing a
+descriptor graph alone does not make it executable.
 
 The registry contains target, method, and target-handler descriptors. It does
 not retain a second method callable table after cutover: the method descriptor's
-verified entry point is the dispatch source. During A2.1 no entry point is
-imported or executed. The verified loader added in A2.2 resolves entry points
-from the installed Core distribution or an explicitly enabled research plugin
-and fails startup on an identity mismatch.
+verified entry point is the dispatch source. A2.2 verifies entry points from a
+locked installed Core distribution or an explicitly supplied research-plugin
+lock and fails on an identity mismatch. It does not discover or auto-enable
+installed plugins.
+
+The expected distribution digest must come from an external release descriptor
+or maintainer plugin lock. The loader never hashes the running code and then
+trusts that self-generated value. For wheel installs it verifies, before target
+module import:
+
+- canonical distribution name, exact version, and wheel SHA-256;
+- a unique non-editable installed distribution;
+- wheel member safety and the installed file inventory byte-for-byte;
+- no symlinked files or untracked importable modules under owned packages;
+- module ownership, import origin, qualified attribute name, and callable
+  signature.
+
+Release mode rejects editable and source-tree installs. Maintainer source use
+requires a separate explicit source lock; it is not a fallback in this loader.
+The future Core install descriptor supplies the same wheel SHA-256 used by
+Desktop bootstrap. A verified lock can describe a research plugin, but the
+plugin remains trusted server code and is never sandboxed by this mechanism.
 
 Each descriptor identity includes:
 
@@ -80,6 +103,61 @@ Snapshot access uses immutable canonical backing or defensive descriptor views.
 Descriptor schema/default dicts and lists are recursively immutable. Canonical
 snapshot backing and fresh defensive views additionally ensure even an explicit
 base-class mutation bypass cannot alter later normalization or stored identity.
+
+## A2.2 Built-In Catalog
+
+`openevo.evolution.framework.builtins` registers four targets, four handler
+identity anchors, and all twelve current legacy method callables. Handler
+anchors are deliberately non-executable contract identities: A2.4 replaces
+them with validated handler callables when context/runtime projection cuts over.
+They are not placeholders that claim current Gateway behavior has migrated.
+
+| Target | Default method | Exposure | Renderer |
+| --- | --- | --- | --- |
+| `agent_system` | `agent_system_gepa_reflector` | Desktop | `markdown` |
+| `text_memory` | `text_memory_expel_reflector` | Desktop | `markdown` |
+| `skill_bundle` | `skill_bundle_reflector` | Desktop | `file_bundle` |
+| `parametric_memory` | `parametric_memory_register` | internal | `adapter` |
+
+All current `METHOD_REGISTRY` keys have exactly one method descriptor whose
+entry point is `openevo.evolution.methods:<method_id>`. During A2.2,
+`load_builtin_method_handles` proves each resolved object is the same callable
+object as the legacy registry. This temporary equality check is an anti-drift
+guard, not a second dispatch path. A2.3 makes descriptor entry points
+authoritative; A2.5 deletes the legacy metadata/callable duplication.
+
+Only the three performance-protected methods are Desktop-exposed in the A2.2
+catalog, and they remain `experimental` until the release performance gates
+pass. Other text methods are maintainer-visible. Incomplete parameter methods
+remain internal. Pareto and GEPA descriptors declare both `agent_system` and
+`report` output, and `parametric_memory_register` correctly declares no input
+artifact.
+
+Descriptor config schemas expose only bounded algorithm settings. Core-owned
+lineage, compatibility, scores, tags, promotion fields, audit policy, evaluator
+results, credentials, endpoints, and arbitrary trainer commands are not user
+schema fields. Reflector plans require a model and the `codex_cli` harness
+provider; the catalog does not expose legacy direct `openai_chat` connection
+settings. Core-owned audit/evaluator fields remain available to the exact legacy
+adapter without becoming user-controlled schema.
+
+Existing callers disagree on whether a current dataset precedes or follows
+history datasets. Multi-dataset legacy methods therefore use one
+`explicit_inputs` dataset binding followed by prior target artifacts. The Core
+caller supplies its existing ordered dataset sequence, and the adapter does not
+reinterpret it. This preserves both experiment-runner and protected benchmark
+ordering instead of imposing a new global current/history order.
+
+The incomplete `parametric_memory_lora_sft` descriptor remains internal and
+requires the unavailable `constrained_trainer_contract` runtime capability. It
+cannot be reported as runnable merely because a machine has `trainer` and
+`adapter_serving`. Skill bundles permit common text, code, data, and image MIME
+types, with `application/octet-stream` as the inventory fallback for other
+auxiliary files.
+
+The legacy dispatch continues accepting its existing flat config until cutover,
+so this cataloging step does not alter current algorithm inputs. A2.3 must map
+Core-owned controls and the harness service before it can replace that path.
 
 ## Selection And Plan
 
@@ -322,3 +400,18 @@ snapshot backing, registration-order/fresh-process identity, reachable closure,
 safe handler contributions, and plan consistency. Existing algorithm, store,
 worker, gateway, trajectory, and rollout regressions prove the contract-only
 stage has no runtime effect.
+
+A2.2 verification adds:
+
+- `test_framework_builtins.py` for catalog completeness, defaults, entry-point
+  equality, closed schemas, ordered inputs, and fresh-process identity;
+- `test_framework_loading.py` for wheel/install tamper, path, symlink, shadowing,
+  origin, qualified-name, signature, and identity failures;
+- protected worker and Terminal Bench fixtures for GEPA history ordering,
+  objective/`None` ordering, generation and candidate tie-breaks, and round
+  transitions.
+
+The release-shaped smoke builds the OpenEvo wheel, installs it into a fresh
+environment outside the repository, verifies the wheel against its SHA-256,
+and loads 12 exact method handles plus 8 target/handler identity anchors. This
+does not replace the final Terminal Bench performance gates.

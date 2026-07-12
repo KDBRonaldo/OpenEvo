@@ -240,24 +240,37 @@ Runtime 消费：
 
 ## 新算法接入流程
 
-优先通过 worker/method registry 接入新方法，不要把方法逻辑硬编码进 gateway、store 或
-调度分支。
+优先通过 evolution framework registry 接入新方法，不要把方法逻辑硬编码进 gateway、
+store 或调度分支。`src/openevo/evolution/framework/builtins.py` 是当前内置 target、handler
+identity 和 method descriptor 的权威目录；研究插件必须由维护者提供明确的 distribution
+lock，不能自动发现或自动启用。
+
+A2.2 只实现 catalog 和 verified loader，尚未把 plugin handles 接到 worker dispatch。
+因此当前可执行路径仍限于已有 `METHOD_REGISTRY` built-ins 和现有 external worker protocol；
+`MethodExecutionContext` plugin 从 A2.3 cutover 后才可端到端执行。现在编写的新 plugin 应先做
+descriptor/loader/direct invocation contract tests，不能在文档或 capability 中声称已经可运行。
 
 1. 明确输入：需要 dataset、旧 artifacts、外部训练产物，还是只需要 `job.config`。
 2. 明确输出 artifact type：`text_memory`、`skill_bundle`、`agent_system`、
    `parametric_memory` 或新的 typed artifact。
-3. 实现 method：接收 `WorkerClaimedJob` 和 `artifact_root`，返回
-   `list[ArtifactRegisterRequest]`。
-4. 注册 method：内置 baseline 放入 `src/openevo/evolution/methods.py` 的
-   `METHOD_REGISTRY`；专用 research worker 可以维护自己的 registry。
-5. 设置 `compatibility`：限制 task tags、agent harness、base model，避免 artifact 污染
+3. 实现 method：A2.3 后的新插件接收 framework `MethodExecutionContext`；当前已有方法继续
+   通过 legacy adapter 接收 `WorkerClaimedJob` 和 `artifact_root`，返回
+   `list[ArtifactRegisterRequest]`。A2.2 阶段的新插件只能 direct-test，不能由 worker dispatch。
+4. 注册 descriptor：声明稳定 method ID、target、ordered input bindings、output artifact
+   types、closed config schema、execution/capture/harness/runtime support、exposure、maturity
+   和 locked implementation entry point。不要从旧 `METHOD_METADATA` 反向生成 descriptor。
+5. A2.2 迁移期兼容：需要立即可 dispatch 的内置方法还必须临时同步到
+   `METHOD_REGISTRY` 和 `METHOD_METADATA`，两表 key 必须一致，并由测试证明 descriptor
+   entry point 与 callable 是同一对象。只做未来 plugin/direct test 时不要加入 legacy 表。
+   A2.3 切换 dispatch/capabilities、A2.5 删除重复表后不再执行此步。
+6. 设置 `compatibility`：限制 task tags、agent harness、base model，避免 artifact 污染
    不兼容 session。
-6. 设置 `lineage`：记录输入 dataset、旧 artifacts、training run、adapter source 等。
-7. 设置 `scores`：至少给 context resolver 可排序的 `quality` 或
+7. 设置 `lineage`：记录输入 dataset、旧 artifacts、training run、adapter source 等。
+8. 设置 `scores`：至少给 context resolver 可排序的 `quality` 或
    `heldout_reward_delta`。
-8. 添加测试：覆盖 method 输出、worker complete、artifact registration、context resolve 和
-   runtime injection 中受影响的路径。
-9. 更新文档：见“文档同步要求”。
+9. 添加测试：覆盖 descriptor graph/identity、verified loading、method 输出、worker complete、
+   artifact registration、context resolve 和 runtime injection 中受影响的路径。
+10. 更新文档：见“文档同步要求”。
 
 除非现有 `ArtifactRegisterRequest.manifest` 无法表达新产物，否则不要新增 backend schema。
 
