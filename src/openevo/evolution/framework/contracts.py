@@ -17,7 +17,9 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 MAX_CONTRIBUTION_TEXT = 1_048_576
 MAX_CONTRACT_JSON_BYTES = 262_144
-MAX_RENDERER_PAYLOAD_BYTES = 262_144
+# One bounded text contribution can expand sixfold under JSON control-character
+# escaping. Renderer payloads must still be able to carry that contribution whole.
+MAX_RENDERER_PAYLOAD_BYTES = 6 * MAX_CONTRIBUTION_TEXT + 1_024
 MAX_HANDLER_ARTIFACTS = 128
 MAX_HANDLER_CONTRIBUTIONS = 256
 MAX_PAYLOAD_ENTRIES = 256
@@ -101,6 +103,7 @@ class EnvironmentValueKind(StrEnum):
     PATH = "path"
     DIRECTORY = "directory"
     JSON_PATHS = "json_paths"
+    SCOPE_ROOT = "scope_root"
 
 
 class ContributionKind(StrEnum):

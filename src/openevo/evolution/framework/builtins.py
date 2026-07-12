@@ -1,7 +1,8 @@
 """Deterministic descriptors for OpenEvo's existing evolution implementations.
 
-A2.2 catalogs the legacy callables without changing worker dispatch.  Target
-and handler entry points are identity anchors until their A2.4 runtime cutover.
+A2.2 catalogs the legacy method callables without changing worker dispatch.
+Targets retain non-executable identity anchors; target handlers are verified
+callables used by the A2.4 runtime projection boundary.
 """
 
 from __future__ import annotations
@@ -39,6 +40,7 @@ from .descriptors import (
     TargetHandlerDescriptor,
 )
 from .execution import EvolutionMethodHandle, LegacyEvolutionMethod, MethodInputBinding
+from .handlers import EvolutionTargetHandler
 from .loading import (
     DescriptorImplementationAnchor,
     VerifiedDistribution,
@@ -64,6 +66,7 @@ BUILTIN_METHOD_IDS = (
 
 _METHODS_MODULE = "openevo.evolution.methods"
 _BUILTINS_MODULE = "openevo.evolution.framework.builtins"
+_BUILTIN_HANDLERS_MODULE = "openevo.evolution.framework.builtin_handlers"
 _BOTH_EXECUTION_MODES = (
     ExecutionMode.SUBSCRIPTION,
     ExecutionMode.SELF_DEPLOYED,
@@ -114,6 +117,7 @@ class VerifiedExecutableRegistry:
 
     snapshot: RegistrySnapshot
     method_handles: Mapping[str, EvolutionMethodHandle]
+    handler_handles: Mapping[str, EvolutionTargetHandler]
     descriptor_anchors: Mapping[str, DescriptorImplementationAnchor]
     distribution_attestations: Mapping[str, VerifiedDistribution]
     _verification_seal: object = field(repr=False, compare=False)
@@ -129,6 +133,11 @@ class VerifiedExecutableRegistry:
             raise ValueError("executable method handles do not match the frozen registry")
         if any(not callable(handle) for handle in self.method_handles.values()):
             raise TypeError("executable method handles must be callable")
+        expected_handlers = set(self.snapshot.target_handlers)
+        if set(self.handler_handles) != expected_handlers:
+            raise ValueError("executable handler handles do not match the frozen registry")
+        if any(not callable(handle) for handle in self.handler_handles.values()):
+            raise TypeError("executable handler handles must be callable")
 
         attestations = dict(self.distribution_attestations)
         for digest, attestation in attestations.items():
@@ -166,16 +175,12 @@ class VerifiedExecutableRegistry:
                 )
 
         expected_anchors = {
-            f"{kind.value}:{descriptor_id}": (kind, descriptor_id)
-            for kind, descriptors in (
-                (DescriptorKind.TARGET, self.snapshot.targets),
-                (DescriptorKind.TARGET_HANDLER, self.snapshot.target_handlers),
-            )
-            for descriptor_id in descriptors
+            f"target:{descriptor_id}": (DescriptorKind.TARGET, descriptor_id)
+            for descriptor_id in self.snapshot.targets
         }
         if set(self.descriptor_anchors) != set(expected_anchors):
             raise ValueError(
-                "descriptor anchors do not match the frozen target and handler registry"
+                "descriptor anchors do not match the frozen target registry"
             )
         for key, (kind, descriptor_id) in expected_anchors.items():
             anchor = self.descriptor_anchors[key]
@@ -194,6 +199,11 @@ class VerifiedExecutableRegistry:
         )
         object.__setattr__(
             self,
+            "handler_handles",
+            MappingProxyType(dict(self.handler_handles)),
+        )
+        object.__setattr__(
+            self,
             "descriptor_anchors",
             MappingProxyType(dict(self.descriptor_anchors)),
         )
@@ -208,12 +218,14 @@ def _publish_verified_executable_registry(
     *,
     snapshot: RegistrySnapshot,
     method_handles: Mapping[str, EvolutionMethodHandle],
+    handler_handles: Mapping[str, EvolutionTargetHandler],
     descriptor_anchors: Mapping[str, DescriptorImplementationAnchor],
     distribution_attestations: Mapping[str, VerifiedDistribution],
 ) -> VerifiedExecutableRegistry:
     registry = object.__new__(VerifiedExecutableRegistry)
     object.__setattr__(registry, "snapshot", snapshot)
     object.__setattr__(registry, "method_handles", method_handles)
+    object.__setattr__(registry, "handler_handles", handler_handles)
     object.__setattr__(registry, "descriptor_anchors", descriptor_anchors)
     object.__setattr__(
         registry,
@@ -255,23 +267,6 @@ agent_system_target_anchor = DescriptorImplementationAnchor(
 parametric_memory_target_anchor = DescriptorImplementationAnchor(
     descriptor_kind=DescriptorKind.TARGET,
     descriptor_id="parametric_memory",
-)
-
-text_memory_handler_anchor = DescriptorImplementationAnchor(
-    descriptor_kind=DescriptorKind.TARGET_HANDLER,
-    descriptor_id="text_memory_handler",
-)
-skill_bundle_handler_anchor = DescriptorImplementationAnchor(
-    descriptor_kind=DescriptorKind.TARGET_HANDLER,
-    descriptor_id="skill_bundle_handler",
-)
-agent_system_handler_anchor = DescriptorImplementationAnchor(
-    descriptor_kind=DescriptorKind.TARGET_HANDLER,
-    descriptor_id="agent_system_handler",
-)
-parametric_memory_handler_anchor = DescriptorImplementationAnchor(
-    descriptor_kind=DescriptorKind.TARGET_HANDLER,
-    descriptor_id="parametric_memory_handler",
 )
 
 
@@ -513,7 +508,7 @@ def _handler_descriptors(
             ),
             exposure=Exposure.DESKTOP,
             implementation_ref=identity.ref(
-                f"{_BUILTINS_MODULE}:text_memory_handler_anchor"
+                f"{_BUILTIN_HANDLERS_MODULE}:text_memory_handler"
             ),
         ),
         TargetHandlerDescriptor(
@@ -549,7 +544,7 @@ def _handler_descriptors(
             ),
             exposure=Exposure.DESKTOP,
             implementation_ref=identity.ref(
-                f"{_BUILTINS_MODULE}:skill_bundle_handler_anchor"
+                f"{_BUILTIN_HANDLERS_MODULE}:skill_bundle_handler"
             ),
         ),
         TargetHandlerDescriptor(
@@ -576,7 +571,7 @@ def _handler_descriptors(
             ),
             exposure=Exposure.DESKTOP,
             implementation_ref=identity.ref(
-                f"{_BUILTINS_MODULE}:agent_system_handler_anchor"
+                f"{_BUILTIN_HANDLERS_MODULE}:agent_system_handler"
             ),
         ),
         TargetHandlerDescriptor(
@@ -590,7 +585,7 @@ def _handler_descriptors(
             allowed_contribution_kinds=(ContributionKind.ADAPTER,),
             exposure=Exposure.INTERNAL,
             implementation_ref=identity.ref(
-                f"{_BUILTINS_MODULE}:parametric_memory_handler_anchor"
+                f"{_BUILTIN_HANDLERS_MODULE}:parametric_memory_handler"
             ),
         ),
     )
@@ -920,6 +915,37 @@ def load_builtin_method_handles(
     return MappingProxyType(handles)
 
 
+def load_builtin_handler_handles(
+    snapshot: RegistrySnapshot,
+    *,
+    verified_loader: Callable[[ImplementationIdentity], object],
+) -> Mapping[str, EvolutionTargetHandler]:
+    """Load the exact built-in target handlers from verified entry points."""
+
+    from . import builtin_handlers
+
+    expected = set(snapshot.target_handlers)
+    actual_registry = set(builtin_handlers.BUILTIN_HANDLER_REGISTRY)
+    if actual_registry != expected:
+        missing = sorted(expected - actual_registry)
+        extra = sorted(actual_registry - expected)
+        raise ValueError(
+            f"built-in handler key mismatch; missing={missing!r}, extra={extra!r}"
+        )
+
+    handles: dict[str, EvolutionTargetHandler] = {}
+    for handler_id in sorted(expected):
+        identity = snapshot.identity_for(DescriptorKind.TARGET_HANDLER, handler_id)
+        loaded = verified_loader(identity)
+        expected_callable = builtin_handlers.BUILTIN_HANDLER_REGISTRY[handler_id]
+        if loaded is not expected_callable:
+            raise ValueError(
+                f"built-in handler callable identity mismatch for {handler_id!r}"
+            )
+        handles[handler_id] = expected_callable
+    return MappingProxyType(handles)
+
+
 def load_verified_builtin_registry(
     verified: VerifiedDistribution,
 ) -> VerifiedExecutableRegistry:
@@ -934,23 +960,32 @@ def load_verified_builtin_registry(
     snapshot = build_builtin_registry(identity)
 
     anchors: dict[str, DescriptorImplementationAnchor] = {}
-    for kind, descriptors in (
-        (DescriptorKind.TARGET, snapshot.targets),
-        (DescriptorKind.TARGET_HANDLER, snapshot.target_handlers),
-    ):
-        for descriptor_id in descriptors:
-            implementation_identity = snapshot.identity_for(kind, descriptor_id)
-            loaded = load_verified_entry_point(
-                implementation_identity.implementation,
-                verified,
-                expected_kind=kind,
-                expected_id=descriptor_id,
+    for descriptor_id in snapshot.targets:
+        implementation_identity = snapshot.identity_for(
+            DescriptorKind.TARGET,
+            descriptor_id,
+        )
+        loaded = load_verified_entry_point(
+            implementation_identity.implementation,
+            verified,
+            expected_kind=DescriptorKind.TARGET,
+            expected_id=descriptor_id,
+        )
+        if not isinstance(loaded, DescriptorImplementationAnchor):
+            raise ValueError(
+                f"built-in descriptor anchor identity mismatch for {descriptor_id!r}"
             )
-            if not isinstance(loaded, DescriptorImplementationAnchor):
-                raise ValueError(
-                    f"built-in descriptor anchor identity mismatch for {descriptor_id!r}"
-                )
-            anchors[f"{kind.value}:{descriptor_id}"] = loaded
+        anchors[f"target:{descriptor_id}"] = loaded
+
+    handler_handles = load_builtin_handler_handles(
+        snapshot,
+        verified_loader=lambda implementation_identity: load_verified_entry_point(
+            implementation_identity.implementation,
+            verified,
+            expected_kind=DescriptorKind.TARGET_HANDLER,
+            expected_id=implementation_identity.descriptor_id,
+        ),
+    )
 
     method_handles = load_builtin_method_handles(
         snapshot,
@@ -967,6 +1002,7 @@ def load_verified_builtin_registry(
     return _publish_verified_executable_registry(
         snapshot=snapshot,
         method_handles=method_handles,
+        handler_handles=handler_handles,
         descriptor_anchors=MappingProxyType(anchors),
         distribution_attestations={
             verified.expectation.distribution_digest: verified,
@@ -978,16 +1014,13 @@ __all__ = [
     "BUILTIN_METHOD_IDS",
     "ImplementationDistributionIdentity",
     "VerifiedExecutableRegistry",
-    "agent_system_handler_anchor",
     "agent_system_target_anchor",
     "build_builtin_registry",
+    "load_builtin_handler_handles",
     "load_builtin_method_handles",
     "load_verified_builtin_registry",
     "require_verified_executable_registry",
-    "parametric_memory_handler_anchor",
     "parametric_memory_target_anchor",
-    "skill_bundle_handler_anchor",
     "skill_bundle_target_anchor",
-    "text_memory_handler_anchor",
     "text_memory_target_anchor",
 ]

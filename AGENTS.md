@@ -109,7 +109,8 @@ integer 应使用 string 表达。
 Evolution capabilities 只能由远程 Core 的同一 `VerifiedExecutableRegistry` 生成。
 该 executable registry 必须携带 frozen snapshot 中全部且仅有的 distribution
 attestation；每个 target、handler 和 method identity 的 distribution/version/digest 都必须
-与对应的已验证安装一致，target/handler anchor 集合也必须与 snapshot 精确相等。
+与对应的已验证安装一致。非执行 target anchor、可执行 handler handle 和 method handle
+集合必须分别与 snapshot 精确相等；handler 不能再退回 identity anchor。
 `VerifiedDistribution` 和 `VerifiedExecutableRegistry` 只能由完成 wheel/install/inventory 与
 逐 entry-point 校验的 loader sealed publication path 创建，不能提供公开构造或 loader 注入
 绕过。公开 distribution verifier 必须只使用真实 installed-distribution discovery；测试 metadata
@@ -307,7 +308,8 @@ Runtime 消费：
 
 优先通过 evolution framework registry 接入新方法，不要把方法逻辑硬编码进 gateway、
 store 或调度分支。`src/openevo/evolution/framework/builtins.py` 是当前内置 target、handler
-identity 和 method descriptor 的权威目录。Release startup 从 Desktop/维护者提供的外部
+和 method descriptor 的权威目录；`builtin_handlers.py` 只实现 descriptor 指向的可信 runtime
+projection callable。Release startup 从 Desktop/维护者提供的外部
 `framework-lock.json` 校验 exact wheel 和安装 inventory，再发布
 `VerifiedExecutableRegistry`；不能自动发现、自动启用插件，也不能从运行中的代码自算 digest
 后信任。
@@ -318,6 +320,16 @@ identity 和 method descriptor 的权威目录。Release startup 从 Desktop/维
 signature。当前 release composition 只加载 built-ins；外部 research plugin 和任意新 target
 仍需完成 registry composition、generic projection 和 release tests，不能只凭 descriptor 测试
 声称端到端可运行。
+
+Target handler 只能返回 data-only contributions。普通环境绑定必须引用 staged payload；需要
+暴露 `harness_skills` 等 Core-resolved 公共根目录时使用 `scope_root` binding，并明确声明一个
+descriptor allowlisted destination scope。Handler 不得返回 host path、命令或自行解析 runtime
+root；payload scanner/materializer 才负责 no-follow 读取、digest 重验和原子 staging。
+只有 source artifact IDs 和正文都完全相等的 instruction/file 投影才能去重；派生 target
+文件受两倍投影预算约束，所有文本投影总量受三倍预算约束。Text source MIME 必须满足
+descriptor allowlist；skill bundle 必须含根目录 `SKILL.md` 并保持 ranked/canonical renderer
+顺序。Adapter manifest 缺失或空的 identity 字段必须由 handler 和 validator 独立按同一
+canonical fallback 计算，不能信任 handler 自报值。
 
 1. 明确输入：需要 dataset、旧 artifacts、外部训练产物，还是只需要 `job.config`。
 2. 明确输出 artifact type：`text_memory`、`skill_bundle`、`agent_system`、

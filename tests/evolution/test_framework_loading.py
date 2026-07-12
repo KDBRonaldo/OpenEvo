@@ -582,6 +582,28 @@ def test_loader_accepts_verified_two_argument_target_handler(
     assert handler("input", "services") == ("input", "services")
 
 
+def test_loader_rejects_identity_anchor_as_target_handler(
+    installed_wheel: InstalledWheel,
+) -> None:
+    rebuilt = installed_wheel.rebuild(
+        "from openevo.evolution.framework.loading import "
+        "DescriptorImplementationAnchor\n"
+        "from openevo.evolution.framework import DescriptorKind\n"
+        "handler = DescriptorImplementationAnchor(\n"
+        "    descriptor_kind=DescriptorKind.TARGET_HANDLER,\n"
+        "    descriptor_id='fixture_handler',\n"
+        ")\n"
+    )
+
+    with pytest.raises(FrameworkLoadError, match="target handler"):
+        load_verified_entry_point(
+            _ref(rebuilt, entry_point=f"{DEFAULT_MODULE}:handler"),
+            rebuilt.verify(),
+            expected_kind=DescriptorKind.TARGET_HANDLER,
+            expected_id="fixture_handler",
+        )
+
+
 @pytest.mark.parametrize(
     "source",
     [

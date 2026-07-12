@@ -129,11 +129,25 @@ class AdapterContribution(_Contract):
 
 class EnvironmentBinding(_Contract):
     name: str
-    value_contribution_ids: tuple[str, ...] = Field(min_length=1)
+    value_contribution_ids: tuple[str, ...] = ()
     value_kind: EnvironmentValueKind
+    destination_scope: DestinationScope | None = None
 
     _name = field_validator("name")(_environment_name)
     _references = field_validator("value_contribution_ids")(_ordered_unique_ids)
+
+    @model_validator(mode="after")
+    def _source(self) -> EnvironmentBinding:
+        if self.value_kind is EnvironmentValueKind.SCOPE_ROOT:
+            if self.value_contribution_ids or self.destination_scope is None:
+                raise ValueError(
+                    "scope-root environment binding requires one destination scope"
+                )
+        elif not self.value_contribution_ids or self.destination_scope is not None:
+            raise ValueError(
+                "staged environment binding requires contribution references"
+            )
+        return self
 
 
 class MarkdownRendererData(_Contract):
@@ -305,6 +319,8 @@ class TargetHandlerOutput(_Contract):
         staged = {item.contribution_id: item for item in self.staged_payloads}
         staged_ids = tuple(staged)
         for binding in self.environment:
+            if binding.value_kind is EnvironmentValueKind.SCOPE_ROOT:
+                continue
             if not set(binding.value_contribution_ids).issubset(staged):
                 raise ValueError("environment binding must reference staged payloads")
             staged_iterator = iter(staged_ids)

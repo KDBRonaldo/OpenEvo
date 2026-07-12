@@ -23,6 +23,7 @@ Module ownership:
   harness service, and the one behavior-preserving current-callable adapter;
 - `contributions.py`: versioned data-only handler output and renderer payloads;
 - `handlers.py`: trusted payload inventories and target-handler invocation input;
+- `builtin_handlers.py`: attested built-in projection callables, without algorithm logic;
 - `handler_validation.py`: payload, renderer, limit, and context-wide conflict
   validation;
 - `support.py`: shared four-axis method support evaluation;
@@ -33,8 +34,8 @@ Module ownership:
 - `registry.py`: startup graph validation, frozen snapshot, and plan compilation;
 - `loading.py`: externally locked wheel/install and entry-point verification;
 - `runtime.py`: external framework-lock parsing and executable-registry startup;
-- `builtins.py`: the four current targets/handler identity anchors and twelve
-  legacy method descriptors.
+- `builtins.py`: four target anchors, four executable handler descriptors, and
+  twelve legacy method descriptors.
 
 `build_builtin_registry()` is safe for deterministic catalog inspection.
 Release startup calls `load_verified_framework_registry()` with the external
@@ -45,7 +46,8 @@ digest from the running package and immediately trust it.
 `VerifiedExecutableRegistry` retains the resulting `VerifiedDistribution`
 attestations. Their digest set must equal the distribution digest set referenced
 by the frozen snapshot, every implementation identity must match its attestation,
-and the target/handler anchor set must exactly match the snapshot. A manually
+and the target-anchor, handler-handle, and method-handle sets must each exactly
+match the snapshot. A manually
 assembled catalog without that evidence is not a release executable registry.
 Their public constructors are closed; only verified install and exact
 entry-point loading paths publish sealed instances. The public distribution
@@ -76,8 +78,19 @@ publishes exact method identity digests at claim, then checks the plan,
 execution envelope, method identity, and artifact snapshots before invoking the
 descriptor's explicit ABI. `run_method()` and
 `METHOD_REGISTRY` remain temporarily available only for unplanned benchmark
-jobs. Target/handler anchors are non-executable identities until A2.4 supplies
-and integrates real contribution handlers.
+jobs. Target descriptors retain non-executable identity anchors; target-handler
+descriptors now load exact attested callables into
+`VerifiedExecutableRegistry.handler_handles`. Resolver invocation, secure payload
+materialization, and gateway cutover remain unfinished A2.4 work.
+
+Text handlers have separate source-consumption and bounded runtime-projection
+budgets. Only equal source IDs plus equal text are deduplicated; derived target
+files are checked under a two-copy projection budget and combined output under
+a three-copy budget. Source MIME is checked against the descriptor allowlist,
+and renderer JSON is bounded to the worst-case escaped representation of one
+1 MiB contribution. Skill bundles require root `SKILL.md` and canonical ranked
+renderer order. Adapter fallback identity is recomputed from the trusted
+artifact snapshot by the validator rather than accepted from handler output.
 
 Release reflector schemas require an explicit model and `codex_cli`; direct API
 credentials and endpoints are not user config. Audit policy, evaluator results,

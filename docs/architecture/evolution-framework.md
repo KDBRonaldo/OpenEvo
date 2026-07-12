@@ -1,8 +1,8 @@
 # Pluggable Evolution Framework
 
-Status: A2.3 Core framework and the A2.4 Desktop config/preflight slice implemented
+Status: A2.3 Core plus A2.4 Desktop config/preflight and executable handlers implemented
 
-Tracking: issues #137, #139, #141, #142, #144, #146, and #148, productization step A2. A2.1
+Tracking: issues #137, #139, #141, #142, #144, #146, #148, and #150, productization step A2. A2.1
 implements contracts for `PLUG-1` through `PLUG-4`; A2.2 catalogs the existing
 implementations; A2.3 covers project configuration, per-round plans, durable
 job identity, verified worker dispatch, and the remote registry capability
@@ -115,10 +115,12 @@ base-class mutation bypass cannot alter later normalization or stored identity.
 ## A2.2 Built-In Catalog
 
 `openevo.evolution.framework.builtins` registers four targets, four handler
-identity anchors, and all twelve current legacy method callables. Handler
-anchors are deliberately non-executable contract identities: A2.4 replaces
-them with validated handler callables when context/runtime projection cuts over.
-They are not placeholders that claim current Gateway behavior has migrated.
+descriptors, and all twelve current legacy method callables. Target descriptors
+retain non-executable identity anchors. Handler descriptors point to the four
+pure callables in `builtin_handlers`; release loading verifies their exact wheel
+inventory, entry point, signature, identity, and distribution attestation before
+sealing them in `VerifiedExecutableRegistry.handler_handles`. This does not claim
+that the current resolver or Gateway runtime has cut over to invoking them.
 
 | Target | Default method | Exposure | Renderer |
 | --- | --- | --- | --- |
@@ -381,20 +383,28 @@ skills, and harness instructions; handlers cannot choose those roots. Entries
 contain relative path, MIME, byte size, and SHA-256. A directory digest is SHA-256 over canonical JSON
 `{contract_version: "1", entries: [...]}`, with entries sorted and relative to
 the selected root. File count, depth, bytes, artifacts, contributions, and text
-are bounded. `TargetHandlerOutput` may contain only:
+are bounded. For text projection, the opaque payload service performs the full
+source identity/digest verification while streaming and returns only a
+`read_utf8_prefix` result bounded by requested character and UTF-8 byte limits;
+handlers cannot request an inventory-sized in-memory read. `TargetHandlerOutput`
+may contain only:
 
 Handler contract v1 limits are: 128 ranked/consumed artifacts, 256 total output
 contributions, 256 inventory/renderer files, depth 32, 4,096-character relative
 paths, 8 GiB per inventory entry, 16 GiB per payload tree, 1 MiB semantic text,
-and 256 KiB for each canonical manifest/scores or renderer JSON payload. Payload
-bytes are streamed/verified by the later materializer rather than loaded as one
-in-memory value.
+and 256 KiB for each canonical manifest/scores payload. Renderer JSON remains
+bounded to the worst-case JSON escaping of one 1 MiB text contribution plus
+fixed envelope overhead, so an otherwise valid text projection cannot fail only
+because it is rendered. Payload bytes are streamed/verified by the later
+materializer rather than loaded as one in-memory value.
 
 - instruction contributions with source artifact IDs;
 - staged payloads referencing the verified inventory or bounded inline merged
   text, plus digest/MIME, destination scope, and safe relative destination;
 - adapter contributions with source artifact, ID/format, model, and weight;
 - Core-approved environment bindings to staged contributions;
+- Core-approved `scope_root` environment bindings for one descriptor-allowlisted
+  logical destination root, such as the shared harness skills directory;
 - one renderer payload referencing output contribution IDs.
 
 Each descriptor allowlists contribution kinds, destination scopes, MIME types,
@@ -407,6 +417,11 @@ future typed contract. Directory entries are each checked against the MIME
 allowlist, and adapter ID/format/base-model values must match both the request
 and the Core-issued source artifact manifest.
 
+Text source entries, not only normalized inline outputs, must satisfy the
+handler descriptor MIME allowlist. A `skill_bundle` must contain a root
+`SKILL.md`; its renderer lists files in ranked bundle order and canonical path
+order within each bundle, and the frozen validator proves that order.
+
 `target_data` resolves under shared `/openevo/session/evolution`, retaining the
 canonical `memory.md`, `agent_system.md`, `skills/`, and `adapters.json` layout.
 Harness scopes are resolved by the harness adapter and instruction paths use the
@@ -416,14 +431,22 @@ Within a target, its handler performs the current semantic merge first: memory
 and agent-system text keep current clipping/concatenation, skills/adapters keep
 their count/order, and subscription suppresses adapters. It emits each final
 destination once. Contribution provenance and renderer order must preserve the
-ranked artifact sequence; the same semantic text projected to instruction and
-file is charged once. Existing clipping remains character-based, while a
-separate 1 MiB UTF-8 byte limit bounds resource use. Core resolves logical scopes to final runtime roots before
-checking context-wide destination/environment conflicts, and binds adapters to
-the requested base model and actual runtime application limit. No
-last-writer-wins behavior is allowed.
+ranked artifact sequence; only projections with exactly equal source artifact
+IDs and text are charged once. Canonical renderer text and all instructions
+must each remain within the source budget. Derived target-file projections are
+charged independently under a two-times checked projection budget, while the
+combined instruction/file output remains capped at three times the source
+character and UTF-8 byte budgets. Existing clipping remains character-based,
+while a separate 1 MiB UTF-8 byte limit bounds resource use.
+Core resolves logical scopes to final runtime roots before checking context-wide
+destination/environment conflicts, and binds adapters to the requested base
+model and actual runtime application limit. Missing or empty adapter manifest
+identity fields use the same deterministic name/artifact-ID, `lora`, and
+requested-model fallbacks in both the handler and validator. No last-writer-wins
+behavior is allowed.
 
-A2.1 validates DTO inventory/digest consistency only. Before A2.4 cutover, the
+A2.1 validates DTO inventory/digest consistency, and the current A2.4 slice
+loads the built-in handlers as verified callables. Before runtime cutover, the
 Core payload scanner/materializer must bind opaque handles to roots and implement
 realpath containment, no-follow opens, symlink/device/FIFO/socket rejection,
 archive limits, post-open identity, and verified staging. An inventory supplied
@@ -482,8 +505,9 @@ fields because their correlated project-schema projection would be ambiguous.
 The executable registry retains the verified distribution evidence used to
 load it. The attestation digest set must equal the complete distribution digest
 set referenced by the snapshot; every implementation identity must match its
-attestation, and the target/handler anchor set must exactly match the frozen
-descriptor set. Capability projection therefore cannot be enabled by supplying
+attestation, and the non-executable target anchors plus executable handler and
+method handle sets must each exactly match the frozen descriptor set.
+Capability projection therefore cannot be enabled by supplying
 an unverified snapshot and callable map alone. Both verified distribution and
 executable registry constructors are closed; only wheel/inventory verification
 and exact entry-point loading can publish their sealed production instances.
@@ -594,5 +618,5 @@ A2.2 verification adds:
 The release-shaped smoke builds the OpenEvo wheel, installs it into a fresh
 environment outside the repository, writes the same external framework lock
 used by Desktop bootstrap, verifies the wheel against its SHA-256, and loads 12
-exact method handles plus 8 target/handler identity anchors. This does not
+exact method handles, four exact handler handles, and four target anchors. This does not
 replace the final Terminal Bench performance gates.

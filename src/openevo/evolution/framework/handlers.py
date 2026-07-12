@@ -237,13 +237,14 @@ class TargetHandlerInput(_Contract):
 class CoreArtifactPayloadService(Protocol):
     """Contained reads for payload handles issued in ``TargetHandlerInput``."""
 
-    def read_bytes(
+    def read_utf8_prefix(
         self,
         payload_handle: str,
         relative_path: str,
         *,
+        max_chars: int,
         max_bytes: int,
-    ) -> bytes: ...
+    ) -> str: ...
 
 
 @dataclass(frozen=True, slots=True)

@@ -93,8 +93,8 @@ A2.3 is implemented as reviewable repository slices, not separate product versio
 2. Implemented: load one verified executable registry; persist plan/job identity, filter methods, validate envelopes, and renew leases.
 3. Implemented: project versioned capabilities from that registry and proxy remote Core without a local catalog fallback.
 A2.3 adds no dual scheduler, fallback registry, or algorithm change. A2.4/A2.5 own generic handler/runtime integration, capability-driven Desktop configuration, and removal of remaining target-specific switches.
-The A2.4 Desktop selector/schema editor is implemented without a local registry;
-A2.4 remains incomplete until generic verified handler/runtime cutover and external-target acceptance.
+The A2.4 Desktop selector/schema editor and verified built-in handler publication are implemented without local fallback;
+A2.4 remains incomplete until scanner/materializer runtime cutover and external-target acceptance.
 
 A2 completion acceptance:
 

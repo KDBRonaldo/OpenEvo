@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 from collections import Counter
 from collections.abc import Iterable, Mapping
 from pathlib import PurePosixPath
@@ -10,7 +11,14 @@ from typing import TYPE_CHECKING
 
 from openevo.evolution.agent_system import is_allowed_agent_system_target_path
 
-from .contracts import ContributionKind, DestinationScope, canonical_json, paths_conflict
+from .contracts import (
+    ContributionKind,
+    DestinationScope,
+    EnvironmentValueKind,
+    PayloadKind,
+    canonical_json,
+    paths_conflict,
+)
 from .contributions import (
     AdapterContribution,
     AdapterRendererData,
@@ -35,6 +43,10 @@ if TYPE_CHECKING:
     from .registry import RegistrySnapshot
 
 
+_STABLE_ID_RE = re.compile(r"[A-Za-z][A-Za-z0-9_.-]{0,127}\Z", re.ASCII)
+_MAX_TEXT_PROJECTION_COPIES = 3
+
+
 def _is_ordered_subsequence(
     selected: tuple[str, ...],
     ranked: tuple[str, ...],
@@ -57,33 +69,27 @@ def _validate_projection_source_order(output: TargetHandlerOutput) -> None:
     rank = {
         artifact_id: index for index, artifact_id in enumerate(output.artifact_ids)
     }
+    category_first_ranks: list[int] = []
     for contributions in (
         output.instructions,
         output.staged_payloads,
         output.adapters,
     ):
-        source_ranks = [
-            rank[artifact_id]
-            for contribution in contributions
-            for artifact_id in _source_artifact_ids(contribution)
+        contribution_ranks = [
+            tuple(rank[artifact_id] for artifact_id in _source_artifact_ids(item))
+            for item in contributions
         ]
-        if source_ranks != sorted(source_ranks):
+        if any(values != tuple(sorted(values)) for values in contribution_ranks):
             raise ValueError("contributions must preserve source artifact order")
-    first_seen: list[int] = []
-    seen_artifacts: set[str] = set()
-    for contributions in (
-        output.instructions,
-        output.staged_payloads,
-        output.adapters,
-    ):
-        for contribution in contributions:
-            for artifact_id in _source_artifact_ids(contribution):
-                if artifact_id in seen_artifacts:
-                    continue
-                seen_artifacts.add(artifact_id)
-                first_seen.append(rank[artifact_id])
-    if first_seen != sorted(first_seen):
-        raise ValueError("contribution categories must preserve source artifact order")
+        first_ranks = [values[0] for values in contribution_ranks if values]
+        if first_ranks != sorted(first_ranks):
+            raise ValueError("contributions must preserve first source artifact order")
+        if first_ranks:
+            category_first_ranks.append(first_ranks[0])
+    if category_first_ranks != sorted(category_first_ranks):
+        raise ValueError(
+            "contribution categories must preserve first source artifact order"
+        )
 
 
 def _resolved_destination(
@@ -145,6 +151,102 @@ def _semantic_text_usage(output: TargetHandlerOutput) -> tuple[int, int]:
         sum(len(text) * count for (_, text), count in counts.items()),
         sum(len(text.encode("utf-8")) * count for (_, text), count in counts.items()),
     )
+
+
+def _projected_text_usage(output: TargetHandlerOutput) -> tuple[int, int]:
+    texts = [item.text for item in output.instructions]
+    texts.extend(
+        item.text
+        for item in output.staged_payloads
+        if isinstance(item, InlineTextPayloadContribution)
+    )
+    return (
+        sum(len(text) for text in texts),
+        sum(len(text.encode("utf-8")) for text in texts),
+    )
+
+
+def _text_usage(texts: Iterable[str]) -> tuple[int, int]:
+    values = tuple(texts)
+    return (
+        sum(len(text) for text in values),
+        sum(len(text.encode("utf-8")) for text in values),
+    )
+
+
+def _renderer_text_usage(output: TargetHandlerOutput) -> tuple[int, int]:
+    data = output.renderer.data
+    if isinstance(data, MarkdownRendererData):
+        return _text_usage((data.markdown,))
+    if isinstance(data, StructuredSummaryRendererData):
+        return _text_usage(field.value for field in data.fields)
+    return (0, 0)
+
+
+def _validate_text_source_media_types(
+    output: TargetHandlerOutput,
+    input_artifacts: Mapping[str, TrustedArtifactSnapshot],
+    allowed_media_types: set[str],
+) -> None:
+    artifact_ids = {
+        artifact_id
+        for contributions in (output.instructions, output.staged_payloads)
+        for contribution in contributions
+        if isinstance(
+            contribution,
+            InstructionContribution | InlineTextPayloadContribution,
+        )
+        for artifact_id in contribution.source_artifact_ids
+    }
+    for artifact_id in artifact_ids:
+        artifact = input_artifacts[artifact_id]
+        manifest = artifact.manifest()
+        content_path = manifest.get("content_path")
+        if content_path is not None:
+            entry = next(
+                (
+                    item
+                    for item in artifact.payload_entries
+                    if item.relative_path == content_path
+                ),
+                None,
+            )
+        else:
+            entry = next(
+                (
+                    item
+                    for item in artifact.payload_entries
+                    if item.media_type.startswith("text/")
+                ),
+                None,
+            )
+        if entry is None or entry.media_type not in allowed_media_types:
+            raise ValueError("handler text source MIME type is not allowed")
+
+
+def _canonical_adapter_manifest(
+    artifact: TrustedArtifactSnapshot,
+    requested_base_model: str,
+) -> dict[str, object]:
+    manifest = artifact.manifest()
+    adapter_id = manifest.get("adapter_id")
+    if adapter_id is None or adapter_id == "":
+        adapter_id = (
+            artifact.name
+            if _STABLE_ID_RE.fullmatch(artifact.name)
+            else artifact.artifact_id
+        )
+    adapter_format = manifest.get("adapter_format")
+    if adapter_format is None or adapter_format == "":
+        adapter_format = "lora"
+    base_model = manifest.get("base_model")
+    if base_model is None or base_model == "":
+        base_model = requested_base_model
+    return {
+        "adapter_id": adapter_id,
+        "adapter_format": adapter_format,
+        "base_model": base_model,
+    }
 
 
 def _validate_staged_payload_source(
@@ -233,17 +335,60 @@ def _validate_renderer_sources(output: TargetHandlerOutput) -> None:
     if isinstance(data, FileBundleRendererData):
         if not all(isinstance(item, StagedPayloadContribution) for item in sources):
             raise ValueError("file bundle renderer requires staged payload sources")
-        entries = tuple(
-            PayloadManifestEntry(
-                relative_path=item.relative_path,
-                media_type=item.media_type,
-                size_bytes=item.size_bytes,
-                sha256=item.sha256,
+        remaining_paths = {item.relative_path for item in data.files}
+        expected_path_order: list[str] = []
+        for source in sources:
+            if source.payload_kind is PayloadKind.FILE:
+                rendered = next(
+                    (
+                        item
+                        for item in data.files
+                        if item.relative_path == source.destination_relative_path
+                    ),
+                    None,
+                )
+                if rendered is None or (
+                    rendered.sha256 != source.source_sha256
+                    or rendered.size_bytes != source.source_size_bytes
+                    or rendered.media_type != source.media_type
+                ):
+                    raise ValueError("file bundle renderer does not match staged payload")
+                remaining_paths.discard(rendered.relative_path)
+                expected_path_order.append(rendered.relative_path)
+                continue
+            prefix = f"{source.destination_relative_path}/"
+            rendered_entries = tuple(
+                PayloadManifestEntry(
+                    relative_path=item.relative_path[len(prefix) :],
+                    media_type=item.media_type,
+                    size_bytes=item.size_bytes,
+                    sha256=item.sha256,
+                )
+                for item in data.files
+                if item.relative_path.startswith(prefix)
             )
-            for item in data.files
-        )
-        if len(sources) != 1 or payload_tree_digest(entries) != sources[0].source_sha256:
-            raise ValueError("file bundle renderer does not match staged payload")
+            if (
+                not rendered_entries
+                or payload_tree_digest(rendered_entries) != source.source_sha256
+                or sum(item.size_bytes for item in rendered_entries)
+                != source.source_size_bytes
+            ):
+                raise ValueError("file bundle renderer does not match staged payload")
+            remaining_paths.difference_update(
+                f"{source.destination_relative_path}/{item.relative_path}"
+                for item in rendered_entries
+            )
+            expected_path_order.extend(
+                sorted(
+                    item.relative_path
+                    for item in data.files
+                    if item.relative_path.startswith(prefix)
+                )
+            )
+        if remaining_paths:
+            raise ValueError("file bundle renderer contains unstaged files")
+        if tuple(item.relative_path for item in data.files) != tuple(expected_path_order):
+            raise ValueError("file bundle renderer file order is not canonical")
         return
     if isinstance(data, AdapterRendererData):
         if len(sources) != 1 or not isinstance(sources[0], AdapterContribution):
@@ -343,6 +488,11 @@ def validate_handler_output(
 
     allowed_scopes = set(handler.allowed_destination_scopes)
     allowed_media_types = set(handler.allowed_media_types)
+    _validate_text_source_media_types(
+        output,
+        input_artifacts,
+        allowed_media_types,
+    )
     destinations: list[str] = []
     payload_bytes = 0
     for payload in output.staged_payloads:
@@ -374,11 +524,28 @@ def validate_handler_output(
 
     if payload_bytes > handler_input.limits.max_payload_bytes:
         raise ValueError("handler output exceeds payload byte limit")
-    text_chars, text_bytes = _semantic_text_usage(output)
-    if text_chars > handler_input.limits.max_text_chars:
+    instruction_chars, instruction_bytes = _text_usage(
+        item.text for item in output.instructions
+    )
+    renderer_chars, renderer_bytes = _renderer_text_usage(output)
+    if max(instruction_chars, renderer_chars) > handler_input.limits.max_text_chars:
         raise ValueError("handler output exceeds text consumption limit")
-    if text_bytes > handler_input.limits.max_text_bytes:
+    if max(instruction_bytes, renderer_bytes) > handler_input.limits.max_text_bytes:
         raise ValueError("handler output exceeds UTF-8 text byte limit")
+    text_chars, text_bytes = _semantic_text_usage(output)
+    if text_chars > handler_input.limits.max_text_chars * 2:
+        raise ValueError("handler output exceeds text projection limit")
+    if text_bytes > handler_input.limits.max_text_bytes * 2:
+        raise ValueError("handler output exceeds UTF-8 text projection limit")
+    projection_chars, projection_bytes = _projected_text_usage(output)
+    if projection_chars > (
+        handler_input.limits.max_text_chars * _MAX_TEXT_PROJECTION_COPIES
+    ):
+        raise ValueError("handler output exceeds text projection limit")
+    if projection_bytes > (
+        handler_input.limits.max_text_bytes * _MAX_TEXT_PROJECTION_COPIES
+    ):
+        raise ValueError("handler output exceeds UTF-8 text projection limit")
     if (
         output.adapters
         and handler_input.execution_profile.execution_mode.value == "subscription"
@@ -393,13 +560,17 @@ def validate_handler_output(
         ):
             raise ValueError("adapter contribution does not match requested base model")
         for adapter in output.adapters:
-            manifest = input_artifacts[adapter.source_artifact_id].manifest()
-            expected = {
+            artifact = input_artifacts[adapter.source_artifact_id]
+            expected = _canonical_adapter_manifest(
+                artifact,
+                handler_input.base_model,
+            )
+            actual = {
                 "adapter_id": adapter.adapter_id,
                 "adapter_format": adapter.adapter_format,
                 "base_model": adapter.base_model,
             }
-            if any(manifest.get(key) != value for key, value in expected.items()):
+            if actual != expected:
                 raise ValueError(
                     "adapter contribution does not match source artifact manifest"
                 )
@@ -414,6 +585,12 @@ def validate_handler_output(
     environment_allowlist = set(handler.environment_allowlist)
     if any(binding.name not in environment_allowlist for binding in output.environment):
         raise ValueError("handler output environment binding is not allowed")
+    if any(
+        binding.value_kind is EnvironmentValueKind.SCOPE_ROOT
+        and binding.destination_scope not in allowed_scopes
+        for binding in output.environment
+    ):
+        raise ValueError("handler output environment scope is not allowed")
     _validate_renderer_sources(output)
     return output
 

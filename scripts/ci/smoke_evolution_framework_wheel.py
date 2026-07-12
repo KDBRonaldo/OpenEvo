@@ -93,12 +93,13 @@ def smoke(wheel_path: Path) -> dict[str, object]:
         raise RuntimeError("installed built-in targets do not match the release contract")
     if set(loaded.snapshot.target_handlers) != EXPECTED_HANDLER_IDS:
         raise RuntimeError("installed target handlers do not match the release contract")
+    if set(loaded.handler_handles) != EXPECTED_HANDLER_IDS:
+        raise RuntimeError("installed target handler callables are incomplete")
     expected_anchor_keys = {
         *(f"target:{target_id}" for target_id in EXPECTED_TARGET_IDS),
-        *(f"target_handler:{handler_id}" for handler_id in EXPECTED_HANDLER_IDS),
     }
     if set(loaded.descriptor_anchors) != expected_anchor_keys:
-        raise RuntimeError("installed target/handler anchors are incomplete")
+        raise RuntimeError("installed target anchors are incomplete")
     return {
         "distribution": "openevo",
         "version": version,
@@ -106,6 +107,7 @@ def smoke(wheel_path: Path) -> dict[str, object]:
         "inventory_digest": verified.inventory_digest,
         "registry_digest": loaded.snapshot.registry_digest,
         "method_count": len(loaded.method_handles),
+        "handler_handle_count": len(loaded.handler_handles),
         "anchor_count": len(loaded.descriptor_anchors),
         "target_count": len(loaded.snapshot.targets),
         "handler_count": len(loaded.snapshot.target_handlers),

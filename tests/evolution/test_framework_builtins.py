@@ -10,12 +10,13 @@ from zipfile import ZIP_DEFLATED, ZipFile
 import pytest
 
 from openevo.evolution import methods
-from openevo.evolution.framework import builtins
+from openevo.evolution.framework import builtin_handlers, builtins
 from openevo.evolution.framework.builtins import (
     BUILTIN_METHOD_IDS,
     ImplementationDistributionIdentity,
     VerifiedExecutableRegistry,
     build_builtin_registry,
+    load_builtin_handler_handles,
     load_builtin_method_handles,
     load_verified_builtin_registry,
 )
@@ -86,6 +87,7 @@ REFLECTOR_METHOD_IDS = {
 
 METHODS_MODULE = "openevo.evolution.methods"
 BUILTINS_MODULE = "openevo.evolution.framework.builtins"
+BUILTIN_HANDLERS_MODULE = "openevo.evolution.framework.builtin_handlers"
 
 
 class _SourceDistribution:
@@ -201,7 +203,7 @@ def test_builtin_catalog_is_complete_frozen_and_has_expected_defaults(
         snapshot.identity_digests["method:text_memory"] = "b" * 64
 
 
-def test_builtin_descriptors_use_exact_method_and_public_anchor_entry_points(
+def test_builtin_descriptors_use_exact_method_target_and_handler_entry_points(
     snapshot: RegistrySnapshot,
 ) -> None:
     for method_id, descriptor in snapshot.methods.items():
@@ -221,20 +223,21 @@ def test_builtin_descriptors_use_exact_method_and_public_anchor_entry_points(
         assert callable(getattr(builtins, attribute_name))
         target_anchor_names.add(attribute_name)
 
-    handler_anchor_names: set[str] = set()
+    handler_names: set[str] = set()
     for descriptor in snapshot.target_handlers.values():
         assert descriptor.implementation_ref is not None
         module_name, attribute_name = _entry_point_parts(
             descriptor.implementation_ref.entry_point
         )
-        assert module_name == BUILTINS_MODULE
+        assert module_name == BUILTIN_HANDLERS_MODULE
         assert not attribute_name.startswith("_")
-        assert callable(getattr(builtins, attribute_name))
-        handler_anchor_names.add(attribute_name)
+        assert getattr(builtin_handlers, attribute_name) is (
+            builtin_handlers.BUILTIN_HANDLER_REGISTRY[descriptor.id]
+        )
+        handler_names.add(attribute_name)
 
     assert len(target_anchor_names) == 4
-    assert len(handler_anchor_names) == 4
-    assert target_anchor_names.isdisjoint(handler_anchor_names)
+    assert len(handler_names) == 4
 
 
 def test_builtin_output_and_protected_method_contracts(
@@ -524,6 +527,74 @@ def test_load_builtin_method_handles_rejects_wrong_callable_identity(
         load_builtin_method_handles(snapshot, verified_loader=verified_loader)
 
 
+def test_load_builtin_handler_handles_returns_exact_callables(
+    snapshot: RegistrySnapshot,
+) -> None:
+    loaded_entry_points: list[str] = []
+
+    def verified_loader(identity: ImplementationIdentity) -> Callable:
+        entry_point = identity.implementation.entry_point
+        loaded_entry_points.append(entry_point)
+        module_name, attribute_name = _entry_point_parts(entry_point)
+        assert module_name == BUILTIN_HANDLERS_MODULE
+        return getattr(builtin_handlers, attribute_name)
+
+    handles = load_builtin_handler_handles(
+        snapshot,
+        verified_loader=verified_loader,
+    )
+
+    assert isinstance(handles, Mapping)
+    assert frozenset(handles) == frozenset(HANDLER_IDS)
+    assert set(loaded_entry_points) == {
+        descriptor.implementation_ref.entry_point
+        for descriptor in snapshot.target_handlers.values()
+        if descriptor.implementation_ref is not None
+    }
+    for handler_id in HANDLER_IDS:
+        assert handles[handler_id] is builtin_handlers.BUILTIN_HANDLER_REGISTRY[handler_id]
+
+
+@pytest.mark.parametrize("failure", ["missing", "extra"])
+def test_load_builtin_handler_handles_rejects_registry_key_drift(
+    snapshot: RegistrySnapshot,
+    failure: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    drifted_registry = dict(builtin_handlers.BUILTIN_HANDLER_REGISTRY)
+    if failure == "missing":
+        drifted_registry.pop("text_memory_handler")
+    else:
+        drifted_registry["not_builtin"] = lambda *_args: None
+    monkeypatch.setattr(
+        builtin_handlers,
+        "BUILTIN_HANDLER_REGISTRY",
+        drifted_registry,
+    )
+
+    with pytest.raises((TypeError, ValueError), match="missing|extra|mismatch"):
+        load_builtin_handler_handles(
+            snapshot,
+            verified_loader=lambda identity: getattr(
+                builtin_handlers,
+                _entry_point_parts(identity.implementation.entry_point)[1],
+            ),
+        )
+
+
+def test_load_builtin_handler_handles_rejects_wrong_callable_identity(
+    snapshot: RegistrySnapshot,
+) -> None:
+    def verified_loader(identity: ImplementationIdentity) -> Callable:
+        _, attribute_name = _entry_point_parts(identity.implementation.entry_point)
+        if attribute_name == "text_memory_handler":
+            return builtin_handlers.skill_bundle_handler
+        return getattr(builtin_handlers, attribute_name)
+
+    with pytest.raises((TypeError, ValueError), match="mismatch|identity"):
+        load_builtin_handler_handles(snapshot, verified_loader=verified_loader)
+
+
 def test_verified_distribution_cannot_be_constructed_publicly() -> None:
     with pytest.raises(TypeError, match="verify_distribution_install"):
         VerifiedDistribution()
@@ -541,14 +612,12 @@ def test_verified_builtin_registry_loads_every_anchor_and_exact_method_handle(
     loaded = load_verified_builtin_registry(verified)
 
     assert frozenset(loaded.method_handles) == frozenset(METHOD_IDS)
+    assert frozenset(loaded.handler_handles) == frozenset(HANDLER_IDS)
     assert loaded.distribution_attestations == {
         verified.expectation.distribution_digest: verified
     }
     assert frozenset(loaded.descriptor_anchors) == frozenset(
-        {
-            *(f"target:{target_id}" for target_id in TARGET_IDS),
-            *(f"target_handler:{handler_id}" for handler_id in HANDLER_IDS),
-        }
+        f"target:{target_id}" for target_id in TARGET_IDS
     )
 
 

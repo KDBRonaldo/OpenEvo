@@ -269,6 +269,28 @@ def test_handler_output_is_bound_to_trusted_payload_manifest() -> None:
             handler_input=zero_text_limit,
         )
 
+    html_entry = PayloadManifestEntry(
+        relative_path="memory.html",
+        media_type="text/html",
+        size_bytes=5,
+        sha256=hashlib.sha256(b"First").hexdigest(),
+    )
+    html_artifact = TrustedArtifactSnapshot(
+        artifact_id="artifact-html",
+        artifact_type="text_memory",
+        name="artifact-html",
+        uri_scheme="file",
+        payload_handle="payload-artifact-html",
+        payload_entries=(html_entry,),
+        payload_manifest_digest=payload_tree_digest((html_entry,)),
+        rank_index=0,
+    )
+    with pytest.raises(ValueError, match="source MIME"):
+        _registry().freeze().validate_handler_output(
+            _inline_output("artifact-html", text="First"),
+            handler_input=_input(html_artifact),
+        )
+
 
 def test_handler_output_artifacts_must_be_ranked_input_subsequence() -> None:
     first = _artifact("artifact-high", b"First", rank_index=0)
@@ -385,6 +407,52 @@ def test_text_limit_does_not_deduplicate_same_category_instructions() -> None:
         snapshot.validate_handler_output(output, handler_input=handler_input)
 
 
+def test_text_projection_has_an_independent_bounded_copy_limit() -> None:
+    snapshot = _registry(
+        contribution_kinds=("instruction", "staged_payload"),
+    ).freeze()
+    artifact = _artifact("artifact-high", b"First", rank_index=0)
+    output = TargetHandlerOutput(
+        target_id="memory",
+        handler_id="memory_handler",
+        artifact_ids=("artifact-high",),
+        instructions=(
+            InstructionContribution(
+                contribution_id="instruction",
+                source_artifact_ids=("artifact-high",),
+                text="x",
+            ),
+        ),
+        staged_payloads=(
+            InlineTextPayloadContribution(
+                contribution_id="memory_file",
+                source_artifact_ids=("artifact-high",),
+                text="y" * 20,
+                media_type="text/markdown",
+                destination_scope="target_data",
+                destination_relative_path="memory.md",
+            ),
+        ),
+        renderer=RendererPayload(
+            kind="markdown",
+            title="Memory",
+            source_contribution_ids=("instruction",),
+            data={"markdown": "x"},
+        ),
+    )
+    handler_input = _input(artifact).model_copy(
+        update={
+            "limits": TargetConsumptionLimits(
+                max_text_chars=10,
+                max_text_bytes=10,
+            )
+        }
+    )
+
+    with pytest.raises(ValueError, match="text projection limit"):
+        snapshot.validate_handler_output(output, handler_input=handler_input)
+
+
 def test_semantic_text_has_an_independent_utf8_byte_limit() -> None:
     snapshot = _registry(contribution_kinds=("instruction",)).freeze()
     artifact = _artifact("artifact-high", b"First", rank_index=0)
@@ -471,7 +539,7 @@ def test_destination_conflicts_use_resolved_runtime_paths() -> None:
         )
 
 
-def test_contribution_categories_preserve_first_artifact_use_order() -> None:
+def test_each_contribution_preserves_first_artifact_use_order() -> None:
     snapshot = _registry(
         contribution_kinds=("instruction", "staged_payload"),
     ).freeze()
@@ -497,10 +565,143 @@ def test_contribution_categories_preserve_first_artifact_use_order() -> None:
             data={"markdown": "First"},
         ),
     )
-    with pytest.raises(ValueError, match="categories.*source artifact order"):
+    with pytest.raises(ValueError, match="first source artifact order"):
         snapshot.validate_handler_output(
             output,
             handler_input=_input(high, low),
+        )
+
+
+def test_scope_root_environment_binding_is_explicit_and_allowlisted() -> None:
+    artifact = _artifact("artifact-high", b"First", rank_index=0)
+    output_data = _output("artifact-high").model_dump(mode="python")
+    output_data["environment"] = [
+        {
+            "name": "OPENEVO_MEMORY_FILE",
+            "value_kind": "scope_root",
+            "destination_scope": "target_data",
+        }
+    ]
+    validated = _registry().freeze().validate_handler_output(
+        TargetHandlerOutput.model_validate(output_data),
+        handler_input=_input(artifact),
+    )
+    assert validated.environment[0].destination_scope == "target_data"
+
+    invalid = output_data.copy()
+    invalid["environment"] = [
+        {
+            "name": "OPENEVO_MEMORY_FILE",
+            "value_contribution_ids": ["memory_file"],
+            "value_kind": "scope_root",
+            "destination_scope": "target_data",
+        }
+    ]
+    with pytest.raises(ValueError, match="scope-root"):
+        TargetHandlerOutput.model_validate(invalid)
+
+
+def test_file_bundle_renderer_can_cover_multiple_staged_directories() -> None:
+    snapshot = _registry(
+        target_id="skills",
+        artifact_type="skill_bundle",
+        handler_id="skills_handler",
+        destination_scopes=("harness_skills",),
+        contribution_kinds=("staged_payload", "environment"),
+        renderer_kind="file_bundle",
+    ).freeze()
+    high_entry = _entry(b"First", "SKILL.md")
+    low_entry = _entry(b"Second", "SKILL.md")
+
+    def skill_artifact(
+        artifact_id: str,
+        entry: PayloadManifestEntry,
+        rank: int,
+    ) -> TrustedArtifactSnapshot:
+        return TrustedArtifactSnapshot(
+            artifact_id=artifact_id,
+            artifact_type="skill_bundle",
+            name=artifact_id,
+            uri_scheme="file",
+            payload_handle=f"payload-{artifact_id}",
+            payload_entries=(entry,),
+            payload_manifest_digest=payload_tree_digest((entry,)),
+            rank_index=rank,
+        )
+
+    artifacts = (
+        skill_artifact("skill-high", high_entry, 0),
+        skill_artifact("skill-low", low_entry, 1),
+    )
+    payloads = tuple(
+        StagedPayloadContribution(
+            contribution_id=f"skill_{index}",
+            source_artifact_id=artifact.artifact_id,
+            source_relative_path=".",
+            source_sha256=artifact.payload_manifest_digest,
+            source_size_bytes=sum(
+                item.size_bytes for item in artifact.payload_entries
+            ),
+            media_type="text/markdown",
+            payload_kind="directory",
+            destination_scope="harness_skills",
+            destination_relative_path=artifact.artifact_id,
+        )
+        for index, artifact in enumerate(artifacts)
+    )
+    output = TargetHandlerOutput(
+        target_id="skills",
+        handler_id="skills_handler",
+        artifact_ids=tuple(item.artifact_id for item in artifacts),
+        staged_payloads=payloads,
+        environment=(
+            EnvironmentBinding(
+                name="OPENEVO_MEMORY_FILE",
+                value_kind="scope_root",
+                destination_scope="harness_skills",
+            ),
+        ),
+        renderer=RendererPayload(
+            kind="file_bundle",
+            title="Skills",
+            source_contribution_ids=tuple(item.contribution_id for item in payloads),
+            data={
+                "files": [
+                    {
+                        "relative_path": f"{artifact.artifact_id}/SKILL.md",
+                        "media_type": entry.media_type,
+                        "size_bytes": entry.size_bytes,
+                        "sha256": entry.sha256,
+                    }
+                    for artifact, entry in zip(artifacts, (high_entry, low_entry))
+                ]
+            },
+        ),
+    )
+    handler_input = TargetHandlerInput(
+        target_id="skills",
+        handler_id="skills_handler",
+        execution_profile=_profile(),
+        destination_roots=_roots(),
+        ranked_artifacts=artifacts,
+    )
+
+    assert snapshot.validate_handler_output(
+        output,
+        handler_input=handler_input,
+    ).artifact_ids == ("skill-high", "skill-low")
+
+    reversed_renderer = output.renderer.model_copy(
+        update={
+            "data": output.renderer.data.model_copy(
+                update={"files": tuple(reversed(output.renderer.data.files))}
+            )
+        }
+    )
+    with pytest.raises(ValueError, match="renderer file order"):
+        snapshot.validate_handler_output(
+            output.model_copy(update={"renderer": reversed_renderer}),
+            handler_input=handler_input,
         )
 
 

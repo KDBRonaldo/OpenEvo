@@ -63,7 +63,7 @@ class DistributionArtifactExpectation(_Contract):
 
 
 class DescriptorImplementationAnchor(_Contract):
-    """Non-executable identity anchor used before a target-handler cutover."""
+    """Non-executable identity anchor for descriptors without runtime code."""
 
     descriptor_kind: DescriptorKind
     descriptor_id: str
@@ -668,9 +668,7 @@ def load_verified_entry_point(
             expected_parameters=method_parameters,
             label="method",
         )
-    elif kind is DescriptorKind.TARGET_HANDLER and not isinstance(
-        value, DescriptorImplementationAnchor
-    ):
+    elif kind is DescriptorKind.TARGET_HANDLER:
         _verify_callable_entry_point(
             value,
             module_name=module_name,
