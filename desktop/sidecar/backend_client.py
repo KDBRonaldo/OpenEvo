@@ -5,6 +5,10 @@ from typing import Any
 from urllib.parse import quote
 
 import httpx
+from pydantic import ValidationError
+
+from openevo.backend.models import BackendError
+from openevo.deployment.profile import DesktopExecutionMode
 
 
 @dataclass(frozen=True)
@@ -36,6 +40,33 @@ class BackendClient:
     def status(self) -> dict[str, Any]:
         return self._get("/status")
 
+    def capabilities(self, execution_mode: DesktopExecutionMode) -> dict[str, Any]:
+        try:
+            return self._get(
+                "/capabilities",
+                params={"execution_mode": execution_mode},
+            )
+        except ValueError as exc:
+            raise DesktopBackendError(
+                502,
+                {
+                    "code": "backend_capabilities_invalid",
+                    "message": (
+                        "Remote OpenEvo backend returned an invalid "
+                        "capabilities payload."
+                    ),
+                    "severity": "blocking",
+                    "category": "internal",
+                    "retryable": False,
+                    "repair_action": "user_action_required",
+                    "details": {
+                        "execution_mode": execution_mode,
+                        "error_type": type(exc).__name__,
+                    },
+                    "logs_ref": "services/openevo-backend",
+                },
+            ) from exc
+
     def environment_doctor(self) -> dict[str, Any]:
         return self._post("/environment/doctor", {"repair": False})
 
@@ -64,9 +95,17 @@ class BackendClient:
         if self._owns_http_client:
             self._http_client.close()
 
-    def _get(self, path: str) -> Any:
+    def _get(
+        self,
+        path: str,
+        *,
+        params: dict[str, str] | None = None,
+    ) -> Any:
         try:
-            response = self._http_client.get(f"{self._connection.base_url}{path}")
+            response = self._http_client.get(
+                f"{self._connection.base_url}{path}",
+                params=params,
+            )
         except httpx.RequestError as exc:
             raise _connection_error(exc) from exc
         self._raise_for_typed_error(response)
@@ -87,19 +126,26 @@ class BackendClient:
         if response.status_code < 400:
             return
         try:
-            error = response.json()
-        except ValueError:
-            error = {
-                "code": "backend_http_error",
-                "message": response.text,
-                "severity": "blocking",
-                "category": "internal",
-                "retryable": False,
-                "repair_action": "user_action_required",
-                "details": {"status_code": response.status_code},
-                "logs_ref": None,
-            }
+            error = BackendError.model_validate(
+                response.json(),
+                strict=True,
+            ).model_dump(mode="json")
+        except (ValueError, ValidationError):
+            error = _http_error(response.status_code)
         raise DesktopBackendError(response.status_code, error)
+
+
+def _http_error(status_code: int) -> dict[str, Any]:
+    return {
+        "code": "backend_http_error",
+        "message": "Remote OpenEvo backend returned an HTTP error.",
+        "severity": "blocking",
+        "category": "internal",
+        "retryable": False,
+        "repair_action": "user_action_required",
+        "details": {"status_code": status_code},
+        "logs_ref": None,
+    }
 
 
 def _connection_error(exc: httpx.RequestError) -> DesktopBackendError:

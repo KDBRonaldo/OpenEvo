@@ -65,9 +65,24 @@ def test_openevo_desktop_workflow_runs_frontend_and_tauri_checks() -> None:
     assert "npm ci" in text
     assert "npm audit --audit-level=high" in text
     assert "npm test -- --run" in text
+    assert "npm run typecheck" in text
     assert "npm run build:openevo" in text
     assert "npm run build:sidecar" in text
     assert text.index("npm run build:sidecar") < text.index("cargo test --locked")
     assert "working-directory: desktop/src-tauri" in text
     assert "cargo metadata --locked --format-version 1" in text
     assert "cargo test --locked" in text
+
+
+def test_release_smoke_path_filter_and_packaged_capability_guard() -> None:
+    workflow = Path(".github/workflows/openevo-release-smoke.yml")
+    remote_smoke = Path("scripts/ci/smoke_openevo_remote_capabilities.py")
+
+    workflow_text = workflow.read_text(encoding="utf-8")
+    remote_smoke_text = remote_smoke.read_text(encoding="utf-8")
+
+    assert '- "scripts/ci/**"' in workflow_text
+    assert "--sidecar \"$sidecar\"" in workflow_text
+    assert "PYTHONPATH= .openevo-remote-wheel-smoke/bin/python" in workflow_text
+    assert "sidecar_smoke.smoke_sidecar" in remote_smoke_text
+    assert "TestClient" not in remote_smoke_text

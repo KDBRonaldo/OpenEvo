@@ -29,12 +29,23 @@ from desktop.sidecar import (
     create_sidecar_app_for_project,
     default_desktop_shell_status,
 )
+from desktop.sidecar.backend_client import BackendConnection
 from openevo.projects.science import ScienceProjectConfig
 from desktop.sidecar import RemoteProfileConfig
 from openevo.backend.api import create_backend_app
 from openevo.deployment import RemoteCommandResult
+from openevo.evolution.framework import (
+    CapabilityAudience,
+    build_evolution_capabilities,
+    execution_profile_for_release_mode,
+)
+from openevo.evolution.framework.builtins import (
+    ImplementationDistributionIdentity,
+    build_builtin_registry,
+)
 from openevo.evolution.models import ArtifactRegisterRequest
 from openevo.evolution.store import EvolutionStore
+from tests.framework_testkit import verified_builtin_registry
 
 
 def test_sidecar_health_endpoint() -> None:
@@ -93,42 +104,275 @@ def test_sidecar_rejects_arbitrary_localhost_cors_preflight() -> None:
     assert "access-control-allow-origin" not in response.headers
 
 
-def test_sidecar_exposes_core_capabilities() -> None:
-    client = TestClient(create_sidecar_app())
+def _remote_capabilities_payload(execution_mode: str) -> dict[str, object]:
+    snapshot = build_builtin_registry(
+        ImplementationDistributionIdentity(
+            distribution="openevo-test",
+            distribution_version="0.1.0-test",
+            distribution_digest="a" * 64,
+        )
+    )
+    return build_evolution_capabilities(
+        snapshot,
+        profile=execution_profile_for_release_mode(execution_mode),
+        audience=CapabilityAudience.DESKTOP,
+        core_version="0.1.0-test",
+    ).model_dump(mode="json")
 
-    response = client.get("/openevo-api/desktop/capabilities")
+
+class _CapabilitiesBackendClient:
+    def __init__(self, payload: object) -> None:
+        self.payload = payload
+        self.calls: list[str] = []
+
+    def capabilities(self, execution_mode: str) -> object:
+        self.calls.append(execution_mode)
+        return self.payload
+
+
+def _capabilities_backend_factory(project: ScienceProjectConfig):
+    payload = _remote_capabilities_payload(project.execution.mode)
+    return lambda: _CapabilitiesBackendClient(payload)
+
+
+@pytest.mark.parametrize(
+    "execution_mode",
+    ["codex_subscription_transcript", "self-deployed"],
+)
+def test_sidecar_forwards_remote_capabilities_for_execution_mode(
+    execution_mode: str,
+) -> None:
+    backend = _CapabilitiesBackendClient(
+        _remote_capabilities_payload(execution_mode)
+    )
+    client = TestClient(
+        create_sidecar_app(backend_client_factory=lambda: backend)
+    )
+    headers = {"X-OpenEvo-Sidecar-Token": _sidecar_token(client)}
+
+    response = client.get(
+        "/openevo-api/desktop/capabilities",
+        params={"execution_mode": execution_mode},
+        headers=headers,
+    )
 
     assert response.status_code == 200
-    payload = response.json()
-    execution_modes = {item["mode"] for item in payload["execution_modes"]}
-    assert {
-        "codex_subscription_transcript",
-        "self-deployed",
-    }.issubset(execution_modes)
-    artifact_targets = {item["artifact_type"] for item in payload["artifact_targets"]}
-    assert {"text_memory", "skill_bundle", "agent_system"}.issubset(
-        artifact_targets
+    assert response.json() == _remote_capabilities_payload(execution_mode)
+    assert backend.calls == [execution_mode]
+
+
+def test_sidecar_capabilities_requires_sidecar_token() -> None:
+    backend = _CapabilitiesBackendClient(
+        _remote_capabilities_payload("self-deployed")
     )
-    methods = {
-        item["method_id"]: item
-        for item in payload["evolution_methods"]
+    client = TestClient(
+        create_sidecar_app(backend_client_factory=lambda: backend)
+    )
+
+    response = client.get(
+        "/openevo-api/desktop/capabilities",
+        params={"execution_mode": "self-deployed"},
+    )
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Invalid OpenEvo sidecar token."
+    assert backend.calls == []
+
+
+def test_sidecar_capabilities_requires_execution_mode_query() -> None:
+    backend = _CapabilitiesBackendClient(
+        _remote_capabilities_payload("self-deployed")
+    )
+    client = TestClient(
+        create_sidecar_app(backend_client_factory=lambda: backend)
+    )
+
+    response = client.get(
+        "/openevo-api/desktop/capabilities",
+        headers={"X-OpenEvo-Sidecar-Token": _sidecar_token(client)},
+    )
+
+    assert response.status_code == 422
+    assert backend.calls == []
+
+
+def test_sidecar_capabilities_reports_typed_setup_error_without_backend() -> None:
+    client = TestClient(create_sidecar_app())
+
+    response = client.get(
+        "/openevo-api/desktop/capabilities",
+        params={"execution_mode": "self-deployed"},
+        headers={"X-OpenEvo-Sidecar-Token": _sidecar_token(client)},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "backend_tunnel_not_configured"
+    assert response.json()["severity"] == "blocking"
+
+
+def test_active_session_capabilities_never_fall_back_to_shared_backend() -> None:
+    project = ScienceProjectConfig.model_validate(_science_project_payload())
+    client = TestClient(
+        create_sidecar_app_for_project(
+            project,
+            _remote_profile(),
+            transport_factory=lambda _profile: _ApiDryRunTransport(),
+            backend_connection=BackendConnection("http://127.0.0.1:9"),
+        )
+    )
+
+    response = client.get(
+        "/openevo-api/desktop/capabilities",
+        params={"execution_mode": project.execution.mode},
+        headers={"X-OpenEvo-Sidecar-Token": _sidecar_token(client)},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "backend_tunnel_not_configured"
+
+
+def test_sidecar_capabilities_preserves_remote_typed_error() -> None:
+    class ErrorBackendClient:
+        def capabilities(self, execution_mode: str) -> object:
+            raise sidecar_api.DesktopBackendError(
+                503,
+                {
+                    "code": "capabilities_unavailable",
+                    "message": "Remote capabilities are unavailable.",
+                    "severity": "blocking",
+                    "category": "service",
+                    "retryable": True,
+                    "repair_action": "openevo_can_retry",
+                    "details": {"execution_mode": execution_mode},
+                    "logs_ref": "services/openevo-backend",
+                },
+            )
+
+    client = TestClient(
+        create_sidecar_app(backend_client_factory=ErrorBackendClient)
+    )
+    response = client.get(
+        "/openevo-api/desktop/capabilities",
+        params={"execution_mode": "codex_subscription_transcript"},
+        headers={"X-OpenEvo-Sidecar-Token": _sidecar_token(client)},
+    )
+
+    assert response.status_code == 503
+    assert response.json()["code"] == "capabilities_unavailable"
+    assert response.json()["details"] == {
+        "execution_mode": "codex_subscription_transcript"
     }
-    text_memory_method = methods["text_memory_reflector"]
-    assert text_memory_method["visibility"]
-    assert isinstance(text_memory_method["default_config"], dict)
-    assert isinstance(text_memory_method["config_schema"], dict)
 
 
-def test_sidecar_exposes_methods_alias() -> None:
+def test_sidecar_capabilities_rejects_invalid_remote_payload() -> None:
+    backend = _CapabilitiesBackendClient(
+        {**_remote_capabilities_payload("self-deployed"), "unexpected": True}
+    )
+    client = TestClient(
+        create_sidecar_app(backend_client_factory=lambda: backend)
+    )
+
+    response = client.get(
+        "/openevo-api/desktop/capabilities",
+        params={"execution_mode": "self-deployed"},
+        headers={"X-OpenEvo-Sidecar-Token": _sidecar_token(client)},
+    )
+
+    assert response.status_code == 502
+    assert response.json()["code"] == "backend_capabilities_invalid"
+    assert response.json()["severity"] == "blocking"
+    assert response.json()["details"]["execution_mode"] == "self-deployed"
+    assert "validation_errors" not in response.json()["details"]
+    assert "unexpected" not in str(response.json()["details"])
+
+
+@pytest.mark.parametrize("mismatch", ["identity", "support"])
+def test_sidecar_capabilities_rejects_resolver_method_metadata_mismatch(
+    mismatch: str,
+) -> None:
+    payload = _remote_capabilities_payload("self-deployed")
+    agent_system = next(
+        target
+        for target in cast(list[dict[str, object]], payload["targets"])
+        if target["target_id"] == "agent_system"
+    )
+    accepted = next(
+        method
+        for method in cast(list[dict[str, object]], agent_system["accepted_methods"])
+        if method["method_id"] == "agent_system_history_reflector"
+    )
+    if mismatch == "identity":
+        accepted["implementation_identity_digest"] = "b" * 64
+    else:
+        support = cast(dict[str, object], accepted["support"])
+        support["overall"] = "unavailable"
+        support["runtime"] = {
+            "state": "unavailable",
+            "reason_code": "missing_runtime_capabilities",
+            "message": "Required runtime capability is unavailable.",
+            "missing_requirements": ["adapter_serving"],
+        }
+    backend = _CapabilitiesBackendClient(payload)
+    client = TestClient(
+        create_sidecar_app(backend_client_factory=lambda: backend)
+    )
+
+    response = client.get(
+        "/openevo-api/desktop/capabilities",
+        params={"execution_mode": "self-deployed"},
+        headers={"X-OpenEvo-Sidecar-Token": _sidecar_token(client)},
+    )
+
+    assert response.status_code == 502
+    assert response.json()["code"] == "backend_capabilities_invalid"
+
+
+@pytest.mark.parametrize(
+    ("execution_mode", "profile_field", "invalid_value"),
+    [
+        ("self-deployed", "execution_mode", "subscription"),
+        ("self-deployed", "capture_mode", "proxy"),
+        ("self-deployed", "harness_id", "claude-code"),
+        ("self-deployed", "harness_capabilities", ["unexpected"]),
+        ("self-deployed", "runtime_capabilities", ["adapter_serving"]),
+        (
+            "codex_subscription_transcript",
+            "execution_mode",
+            "self_deployed",
+        ),
+    ],
+)
+def test_sidecar_capabilities_rejects_release_profile_mismatch(
+    execution_mode: str,
+    profile_field: str,
+    invalid_value: object,
+) -> None:
+    payload = _remote_capabilities_payload(execution_mode)
+    evaluated_profile = cast(dict[str, object], payload["evaluated_profile"])
+    evaluated_profile[profile_field] = invalid_value
+    backend = _CapabilitiesBackendClient(payload)
+    client = TestClient(
+        create_sidecar_app(backend_client_factory=lambda: backend)
+    )
+
+    response = client.get(
+        "/openevo-api/desktop/capabilities",
+        params={"execution_mode": execution_mode},
+        headers={"X-OpenEvo-Sidecar-Token": _sidecar_token(client)},
+    )
+
+    assert response.status_code == 502
+    assert response.json()["code"] == "backend_capabilities_invalid"
+    assert response.json()["details"] == {"execution_mode": execution_mode}
+    assert str(invalid_value) not in str(response.json()["details"])
+
+
+def test_sidecar_methods_endpoint_is_removed() -> None:
     client = TestClient(create_sidecar_app())
 
     response = client.get("/openevo-api/desktop/methods")
 
-    assert response.status_code == 200
-    payload = response.json()
-    assert set(payload) == {"methods"}
-    method_ids = {item["method_id"] for item in payload["methods"]}
-    assert "text_memory_reflector" in method_ids
+    assert response.status_code == 404
 
 
 def assert_desktop_science_payload(payload: dict[str, object]) -> None:
@@ -149,6 +393,9 @@ def test_desktop_science_smoke_exercises_ordinary_user_route_set(
     tmp_path: Path,
 ) -> None:
     class ProductBackendClient:
+        def capabilities(self, execution_mode: str) -> dict[str, object]:
+            return _remote_capabilities_payload(execution_mode)
+
         def run_timeline(self, run_id: str) -> list[dict[str, object]]:
             return [
                 {
@@ -202,8 +449,11 @@ def test_desktop_science_smoke_exercises_ordinary_user_route_set(
     token = _sidecar_token(client)
     headers = {"X-OpenEvo-Sidecar-Token": token}
 
-    capabilities = client.get("/openevo-api/desktop/capabilities")
-    methods = client.get("/openevo-api/desktop/methods")
+    capabilities = client.get(
+        "/openevo-api/desktop/capabilities",
+        params={"execution_mode": "codex_subscription_transcript"},
+        headers=headers,
+    )
     shell = client.get("/openevo-api/desktop/shell")
     project_config = client.post(
         "/openevo-api/desktop/project-config",
@@ -240,7 +490,6 @@ def test_desktop_science_smoke_exercises_ordinary_user_route_set(
 
     for response in (
         capabilities,
-        methods,
         shell,
         project_config,
         project_configs,
@@ -259,11 +508,9 @@ def test_desktop_science_smoke_exercises_ordinary_user_route_set(
     assert_desktop_science_payload(
         cast(dict[str, object], project_config.json()["status"])
     )
-    assert {item["method_id"] for item in methods.json()["methods"]} >= {
-        "text_memory_reflector",
-        "skill_bundle_reflector",
-        "agent_system_reflector",
-    }
+    assert capabilities.json()["evaluated_profile"]["execution_mode"] == (
+        "subscription"
+    )
     assert services_status.json()["ready"] is True
     assert timeline.json()[0]["artifact_ids"] == ["artifact-text-memory"]
     assert artifacts.json()[0]["run_id"] == launch.json()["run"]["id"]
@@ -2273,6 +2520,7 @@ def test_run_endpoint_launches_after_workspace_bootstrap_and_services() -> None:
             project,
             profile,
             transport_factory=lambda _profile: transport,
+            backend_client_factory=_capabilities_backend_factory(project),
         )
     )
     token = _sidecar_token(client)
@@ -2321,6 +2569,53 @@ def test_run_endpoint_launches_after_workspace_bootstrap_and_services() -> None:
     assert evolution["transcript"]["detail"] == "Run completed and transcript captured"
 
 
+def test_run_endpoint_revalidates_active_selections_against_remote_registry() -> None:
+    project = ScienceProjectConfig.model_validate(_science_project_payload())
+    profile = _remote_profile()
+    transport = _ApiDryRunTransport()
+    payload = _remote_capabilities_payload(project.execution.mode)
+    backend = _CapabilitiesBackendClient(payload)
+    client = TestClient(
+        create_sidecar_app_for_project(
+            project,
+            profile,
+            transport_factory=lambda _profile: transport,
+            backend_client_factory=lambda: backend,
+        )
+    )
+    token = _sidecar_token(client)
+    headers = {"X-OpenEvo-Sidecar-Token": token}
+    _prepare_workspace_bootstrap_and_services(client, headers)
+    discovered = client.get(
+        "/openevo-api/desktop/capabilities",
+        params={"execution_mode": project.execution.mode},
+        headers=headers,
+    )
+    assert discovered.status_code == 200
+
+    text_memory = next(
+        target
+        for target in cast(list[dict[str, object]], payload["targets"])
+        if target["target_id"] == "text_memory"
+    )
+    text_memory["accepted_methods"] = [
+        method
+        for method in cast(list[dict[str, object]], text_memory["accepted_methods"])
+        if method["method_id"] != "text_memory_reflector"
+    ]
+
+    response = client.post("/openevo-api/desktop/run", headers=headers)
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "evolution_selection_unavailable"
+    assert response.json()["details"]["target_id"] == "text_memory"
+    assert response.json()["details"]["selection"] == "text_memory_reflector"
+    assert not any(
+        command.startswith('PATH="$HOME/.local/bin:$PATH" openevo-backend run ')
+        for command in transport.commands
+    )
+
+
 def test_run_endpoint_uses_installed_backend_entrypoint() -> None:
     project = ScienceProjectConfig.model_validate(_science_project_payload())
     profile = _remote_profile()
@@ -2330,6 +2625,7 @@ def test_run_endpoint_uses_installed_backend_entrypoint() -> None:
             project,
             profile,
             transport_factory=lambda _profile: transport,
+            backend_client_factory=_capabilities_backend_factory(project),
         )
     )
     token = _sidecar_token(client)
@@ -2358,6 +2654,7 @@ def test_run_endpoint_preserves_command_failure_status() -> None:
             project,
             profile,
             transport_factory=lambda _profile: transport,
+            backend_client_factory=_capabilities_backend_factory(project),
         )
     )
     token = _sidecar_token(client)
@@ -2391,6 +2688,7 @@ def test_run_endpoint_rejects_concurrent_runs() -> None:
             project,
             profile,
             transport_factory=lambda _profile: transport,
+            backend_client_factory=_capabilities_backend_factory(project),
         )
     )
     token = _sidecar_token(client)
@@ -2417,6 +2715,7 @@ def test_run_status_endpoint_returns_latest_running_report() -> None:
             project,
             profile,
             transport_factory=lambda _profile: transport,
+            backend_client_factory=_capabilities_backend_factory(project),
         )
     )
     token = _sidecar_token(client)
@@ -2769,10 +3068,14 @@ class _BackendFacadeTestServer:
 
 class _BackendApiStateRootTestServer:
     def __init__(self, state_root: Path) -> None:
+        registry = verified_builtin_registry(state_root.parent / "verified-registry")
         self._port = _allocate_test_port()
         self._server = uvicorn.Server(
             uvicorn.Config(
-                create_backend_app(state_root=state_root),
+                create_backend_app(
+                    state_root=state_root,
+                    evolution_registry=registry,
+                ),
                 host="127.0.0.1",
                 port=self._port,
                 log_level="critical",

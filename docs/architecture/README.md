@@ -30,7 +30,7 @@ capabilities, and is not a separate product surface.
      method registry.
 6. [Pluggable Evolution Framework Contract](evolution-framework.md)
    - A2 target/method registry, durable plan identity, verified worker dispatch,
-     handler contributions, remaining capability projection, and security contract.
+     remote capability projection, handler contributions, and security contract.
 7. [Protected Evolution Behavior](protected-behavior.md)
    - A1 regression tests for validated methods and the proven stage boundaries
      preserved during productization.

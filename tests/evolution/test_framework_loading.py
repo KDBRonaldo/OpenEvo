@@ -5,9 +5,9 @@ Expected API contract:
 * ``DistributionArtifactExpectation`` has ``distribution``,
   ``distribution_version``, and ``distribution_digest`` fields matching
   ``ImplementationRef``.
-* ``verify_distribution_install`` accepts the expectation, wheel path, and an
-  injectable ``name -> importlib.metadata.Distribution`` provider, and returns
-  a ``VerifiedDistribution`` opaque capability.
+* ``verify_distribution_install`` accepts only the expectation and wheel path,
+  discovers real installed metadata, and returns a ``VerifiedDistribution``
+  opaque capability.
 * ``load_verified_entry_point(ref, verified)`` accepts only a matching ref,
   resolves ``module:qualname`` from verified files, and validates a method
   against its declared invocation ABI or a target handler against its fixed ABI.
@@ -41,6 +41,7 @@ from openevo.evolution.framework.loading import (
     load_verified_entry_point,
     verify_distribution_install,
 )
+from tests.framework_testkit import verify_distribution_install_for_test
 
 
 DIST_NAME = "loader-fixture"
@@ -153,7 +154,7 @@ class InstalledWheel:
         return self.distribution
 
     def verify(self) -> VerifiedDistribution:
-        return verify_distribution_install(
+        return verify_distribution_install_for_test(
             expectation=self.expectation(),
             artifact_path=self.artifact,
             metadata_provider=self.metadata_provider,
@@ -221,6 +222,17 @@ def test_verify_accepts_matching_wheel_and_installed_distribution(
     assert installed_wheel.provider_calls == [DIST_NAME]
 
 
+def test_public_verifier_rejects_metadata_provider_injection(
+    installed_wheel: InstalledWheel,
+) -> None:
+    with pytest.raises(TypeError, match="metadata_provider"):
+        verify_distribution_install(  # type: ignore[call-arg]
+            expectation=installed_wheel.expectation(),
+            artifact_path=installed_wheel.artifact,
+            metadata_provider=installed_wheel.metadata_provider,
+        )
+
+
 @pytest.mark.parametrize("mismatch", ["digest", "version", "distribution"])
 def test_verify_rejects_artifact_identity_mismatch(
     installed_wheel: InstalledWheel,
@@ -238,7 +250,7 @@ def test_verify_rejects_artifact_identity_mismatch(
     }[mismatch]
 
     with pytest.raises(FrameworkLoadError):
-        verify_distribution_install(
+        verify_distribution_install_for_test(
             expectation=installed_wheel.expectation(**values),
             artifact_path=installed_wheel.artifact,
             metadata_provider=installed_wheel.metadata_provider,
@@ -314,7 +326,7 @@ def test_verify_rejects_wheel_member_path_escape(installed_wheel: InstalledWheel
     _write_wheel(installed_wheel.artifact, {**files, "../escape.py": b"escaped = True\n"})
 
     with pytest.raises(FrameworkLoadError):
-        verify_distribution_install(
+        verify_distribution_install_for_test(
             expectation=installed_wheel.expectation(),
             artifact_path=installed_wheel.artifact,
             metadata_provider=installed_wheel.metadata_provider,
@@ -332,7 +344,7 @@ def test_verify_rejects_wheel_data_importable_code(
     installed_wheel.distribution._direct_url = None
 
     with pytest.raises(FrameworkLoadError):
-        verify_distribution_install(
+        verify_distribution_install_for_test(
             expectation=installed_wheel.expectation(),
             artifact_path=installed_wheel.artifact,
             metadata_provider=installed_wheel.metadata_provider,

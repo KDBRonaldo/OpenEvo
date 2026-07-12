@@ -17,7 +17,7 @@ import stat
 import sys
 import zipfile
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from email.parser import Parser
 from importlib import metadata
 from importlib.machinery import PathFinder
@@ -87,12 +87,15 @@ class InstalledDistribution(Protocol):
     def read_text(self, filename: str) -> str | None: ...
 
 
-DistributionProvider = Callable[
+_DistributionProvider = Callable[
     [str], InstalledDistribution | Sequence[InstalledDistribution]
 ]
 
 
-@dataclass(frozen=True, slots=True)
+_VERIFIED_DISTRIBUTION_SEAL = object()
+
+
+@dataclass(frozen=True, slots=True, init=False)
 class VerifiedDistribution:
     """A wheel identity bound to one fully checked installed file inventory."""
 
@@ -100,6 +103,12 @@ class VerifiedDistribution:
     install_root: Path
     inventory: Mapping[str, str]
     inventory_digest: str
+    _verification_seal: object = field(repr=False, compare=False)
+
+    def __new__(cls, *_args: object, **_kwargs: object) -> VerifiedDistribution:
+        raise TypeError(
+            "VerifiedDistribution is issued only by verify_distribution_install"
+        )
 
     def implementation_ref(
         self,
@@ -113,6 +122,33 @@ class VerifiedDistribution:
             distribution_digest=self.expectation.distribution_digest,
             entry_point=entry_point,
             contract_version=contract_version,
+        )
+
+
+def _publish_verified_distribution(
+    *,
+    expectation: DistributionArtifactExpectation,
+    install_root: Path,
+    inventory: Mapping[str, str],
+    inventory_digest: str,
+) -> VerifiedDistribution:
+    verified = object.__new__(VerifiedDistribution)
+    object.__setattr__(verified, "expectation", expectation)
+    object.__setattr__(verified, "install_root", install_root)
+    object.__setattr__(verified, "inventory", inventory)
+    object.__setattr__(verified, "inventory_digest", inventory_digest)
+    object.__setattr__(verified, "_verification_seal", _VERIFIED_DISTRIBUTION_SEAL)
+    return verified
+
+
+def _require_verified_distribution(verified: VerifiedDistribution) -> None:
+    if (
+        type(verified) is not VerifiedDistribution
+        or getattr(verified, "_verification_seal", None)
+        is not _VERIFIED_DISTRIBUTION_SEAL
+    ):
+        raise FrameworkLoadError(
+            "distribution evidence was not issued by verify_distribution_install"
         )
 
 
@@ -295,6 +331,7 @@ def _verify_inventory_at_root(
 
 
 def _reverify_distribution_inventory(verified: VerifiedDistribution) -> None:
+    _require_verified_distribution(verified)
     frozen_inventory = _verify_inventory_at_root(
         verified.install_root,
         verified.inventory,
@@ -312,10 +349,23 @@ def _reverify_distribution_inventory(verified: VerifiedDistribution) -> None:
 def verify_distribution_install(
     expectation: DistributionArtifactExpectation,
     artifact_path: str | Path,
-    *,
-    metadata_provider: DistributionProvider | None = None,
 ) -> VerifiedDistribution:
-    """Bind a pinned wheel to exactly one non-editable installed distribution."""
+    """Bind a pinned wheel to its uniquely discovered installed distribution."""
+
+    return _verify_distribution_install(
+        expectation,
+        artifact_path,
+        metadata_provider=_default_distribution_provider,
+    )
+
+
+def _verify_distribution_install(
+    expectation: DistributionArtifactExpectation,
+    artifact_path: str | Path,
+    *,
+    metadata_provider: _DistributionProvider,
+) -> VerifiedDistribution:
+    """Internal verifier with an injectable metadata source for test isolation."""
 
     artifact = Path(artifact_path)
     try:
@@ -330,8 +380,7 @@ def verify_distribution_install(
     inventory = _read_wheel_inventory(artifact, expectation)
     if _sha256_file(artifact) != expectation.distribution_digest:
         raise FrameworkLoadError("distribution artifact changed during verification")
-    provider = metadata_provider or _default_distribution_provider
-    provided = provider(expectation.distribution)
+    provided = metadata_provider(expectation.distribution)
     candidates = (
         tuple(provided)
         if isinstance(provided, Sequence) and not isinstance(provided, str | bytes)
@@ -376,7 +425,7 @@ def verify_distribution_install(
                     )
 
     root, frozen_inventory = _verify_installed_inventory(distribution, inventory)
-    return VerifiedDistribution(
+    return _publish_verified_distribution(
         expectation=expectation,
         install_root=root,
         inventory=frozen_inventory,
@@ -639,7 +688,6 @@ def load_verified_entry_point(
 __all__ = [
     "DescriptorImplementationAnchor",
     "DistributionArtifactExpectation",
-    "DistributionProvider",
     "FrameworkLoadError",
     "InstalledDistribution",
     "VerifiedDistribution",

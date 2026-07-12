@@ -265,10 +265,19 @@ host, port, user, auth method plus key/reference ids, effective workspace root,
 HTTP/HTTPS proxy, `NO_PROXY`, `PIP_INDEX_URL`, Hugging Face endpoint, and
 `HF_HOME`, plus the complete canonical `evolution.targets` selections. Desktop
 keeps that map through load/edit/save. A toggle preserves every existing
-non-null method and all config; when enabling a missing or method-null visible
-selection, it initializes the method from the corresponding Core capability.
-It cannot discard unknown future targets. The response does not include raw
-passwords or private-key material.
+non-null, remotely supported method and its config. When enabling a missing,
+method-null, removed, or unsupported selection, it binds the remote effective
+default and its default config; config without a valid method has no method
+contract and is not carried across that rebind. Enabled unknown targets remain
+visible and block run launch until disabled. Desktop cannot silently discard
+unknown future targets. The response does not include raw passwords or
+private-key material.
+Valid Core-owned resolver values such as `agent_system.method=auto` and valid
+explicit methods hidden from the ordinary-user picker remain accepted through
+remote `selection_resolvers` and `accepted_methods`. Draft changes must be saved
+and activated before Start Run can use them. After save, Desktop rebuilds the
+draft from the canonical sidecar status so server-side whitespace and config
+normalization cannot leave a false unsaved-change block.
 The response also includes `sidecar.transport` capability metadata for the
 selected local mutating transport. Desktop uses it to block lifecycle actions
 before remote execution when the active auth settings require unsupported

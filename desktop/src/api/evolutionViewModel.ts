@@ -54,12 +54,15 @@ export function artifactPreview(content: ArtifactContent, diff: ArtifactDiff) {
       typeof content.metadata.target_path === "string"
         ? content.metadata.target_path
         : undefined,
-    lineage:
-      typeof content.metadata.lineage === "object" && content.metadata.lineage !== null
-        ? content.metadata.lineage
-        : {},
+    lineage: recordValue(content.metadata.lineage),
     diff,
   };
+}
+
+function recordValue(value: unknown): Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {};
 }
 
 export function nextActionForError(error: BackendError) {

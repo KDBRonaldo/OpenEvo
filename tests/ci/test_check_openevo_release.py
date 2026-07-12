@@ -584,20 +584,24 @@ def test_local_version_validation_reads_top_level_desktop_metadata() -> None:
 def test_release_smoke_workflow_builds_packaged_assets_and_validates_wheel() -> None:
     workflow = Path(".github/workflows/openevo-release-smoke.yml")
     framework_smoke = Path("scripts/ci/smoke_evolution_framework_wheel.py")
+    capability_smoke = Path("scripts/ci/smoke_openevo_remote_capabilities.py")
     desktop_smoke = Path("scripts/ci/smoke_openevo_desktop_wheel.py")
 
     text = workflow.read_text(encoding="utf-8")
     framework_smoke_text = framework_smoke.read_text(encoding="utf-8")
+    capability_smoke_text = capability_smoke.read_text(encoding="utf-8")
     desktop_smoke_text = desktop_smoke.read_text(encoding="utf-8")
 
-    assert text.startswith("name: OpenEvo installed Core + source Desktop outer smoke")
+    assert text.startswith("name: OpenEvo packaged sidecar + installed Core release smoke")
     assert 'node-version: "22"' in text
     assert "npm test -- --run" in text
+    assert "npm run typecheck" in text
     assert "npm audit --audit-level=high" in text
     assert "npm run build:openevo" in text
     assert "diff -qr desktop/dist desktop/packaging/web" in text
     assert '"src/slime_bridge/**"' in text
     assert '"desktop/**"' in text
+    assert '- "scripts/ci/**"' in text
     assert '"tests/**"' in text
     assert "astral-sh/setup-uv@v6" in text
     assert "uv sync --frozen --group dev" in text
@@ -629,6 +633,23 @@ def test_release_smoke_workflow_builds_packaged_assets_and_validates_wheel() -> 
         "scripts/ci/smoke_evolution_framework_wheel.py "
         "--wheel .openevo-remote-wheel/*.whl"
     ) in text
+    assert (
+        "PYTHONPATH= .openevo-remote-wheel-smoke/bin/python "
+        "scripts/ci/smoke_openevo_remote_capabilities.py"
+    ) in text
+    assert "--wheel .openevo-remote-wheel/*.whl" in text
+    assert '--sidecar "$sidecar"' in text
+    assert (
+        'sidecar="desktop/src-tauri/binaries/'
+        'openevo-desktop-sidecar-$(rustc --print host-tuple)"'
+    ) in text
+    assert "openevo-backend" in capability_smoke_text
+    assert "sidecar_smoke.smoke_sidecar" in capability_smoke_text
+    assert "TestClient" not in capability_smoke_text
+    assert "create_sidecar_app" not in capability_smoke_text
+    assert "BackendConnection" not in capability_smoke_text
+    assert "backend_client_factory" not in capability_smoke_text
+    assert "start_new_session=True" in capability_smoke_text
     assert "name: Smoke installed Core with source Desktop harness" in text
     assert "python -m venv .openevo-wheel-smoke" in text
     assert ".openevo-wheel-smoke/bin/python -m pip install dist/*.whl" in text
@@ -655,6 +676,7 @@ def test_release_smoke_workflow_builds_packaged_assets_and_validates_wheel() -> 
         "npm run build:openevo"
     )
     assert text.index("npm test -- --run") < text.index("npm run build:openevo")
+    assert text.index("npm run typecheck") < text.index("npm run build:openevo")
     assert text.index("name: Build and smoke packaged Desktop sidecar") < text.index(
         "name: Build outer smoke wheel from isolated source"
     )
@@ -814,6 +836,7 @@ def test_readme_release_checklist_matches_frontend_audit_gate() -> None:
     assert text.index("npm audit --audit-level=high") < text.index(
         "npm test -- --run"
     )
+    assert "npm run typecheck" in text
     assert smoke_section.startswith("## Pre-External-Beta Release Smoke")
     assert "maintainer-only" in smoke_section
     assert "GitHub Release" in smoke_section

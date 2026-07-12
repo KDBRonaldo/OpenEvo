@@ -21,7 +21,6 @@ from openevo.evolution.framework import (
 )
 from openevo.evolution.framework.builtins import (
     ImplementationDistributionIdentity,
-    VerifiedExecutableRegistry,
     build_builtin_registry,
 )
 from openevo.evolution.models import (
@@ -50,23 +49,29 @@ def _snapshot():
     )
 
 
+class _FakeExecutableRegistry:
+    def __init__(self, snapshot, method_handles) -> None:
+        self.snapshot = snapshot
+        self.method_handles = method_handles
+
+
 def _registry(
     *,
     skill_handle=None,
     method_handles: dict[str, object] | None = None,
-) -> VerifiedExecutableRegistry:
+) -> _FakeExecutableRegistry:
+    snapshot = _snapshot()
     handles = dict(methods_module.METHOD_REGISTRY)
     if skill_handle is not None:
         handles["skill_bundle"] = skill_handle
     handles.update(method_handles or {})
-    return VerifiedExecutableRegistry(
-        snapshot=_snapshot(),
+    return _FakeExecutableRegistry(
+        snapshot=snapshot,
         method_handles=handles,
-        descriptor_anchors={},
     )
 
 
-def _context_registry(skill_handle) -> VerifiedExecutableRegistry:
+def _context_registry(skill_handle) -> _FakeExecutableRegistry:
     source = _snapshot()
     builder = EvolutionFrameworkRegistry()
     for view in (source.targets, source.target_handlers, source.methods):
@@ -80,10 +85,9 @@ def _context_registry(skill_handle) -> VerifiedExecutableRegistry:
     snapshot = builder.freeze()
     handles = dict(methods_module.METHOD_REGISTRY)
     handles["skill_bundle"] = skill_handle
-    return VerifiedExecutableRegistry(
+    return _FakeExecutableRegistry(
         snapshot=snapshot,
         method_handles=handles,
-        descriptor_anchors={},
     )
 
 
@@ -99,7 +103,7 @@ def _store(tmp_path: Path) -> EvolutionStore:
 def _create_skill_job(
     store: EvolutionStore,
     *,
-    registry: VerifiedExecutableRegistry,
+    registry: _FakeExecutableRegistry,
     plan_id: str = "plan-skill-dispatch",
     priority: int = 100,
 ):

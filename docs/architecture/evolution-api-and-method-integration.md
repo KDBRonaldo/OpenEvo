@@ -104,100 +104,50 @@ registry 得到的 method ID -> identity digest mapping；三者都匹配才会�
 ## Method Registry
 
 OpenEvo Core exposes method registry metadata as a contract, not as Desktop-local
-configuration. Plan compiler, plan-bound store, and workers already consume the
-same frozen/verified registry. UI and automation must discover release-supported
-methods through the remaining A2.3 Core capability projection from that registry.
+configuration. Plan compiler, plan-bound store, workers, and capability discovery
+consume the same startup-verified executable registry. Desktop never imports a
+method table from its bundled Core wheel.
 
 ## OpenEvo Core capability metadata
 
-Desktop 和维护者 automation 不应硬编码 method table。
-`openevo.evolution.framework.builtins` 是当前 target-rooted frozen catalog；plan-bound
-worker dispatch 已切换。现有 `openevo.capabilities` 仍是待迁移的兼容 projection，不是新增
-方法应扩展的权威表。
+Desktop 和维护者 automation 不应硬编码 method table。远程 Core endpoint 是：
 
-当前兼容 API：
-
-- `build_core_capabilities()` 返回 frozen Pydantic `CoreCapabilities`，包含 execution modes、
-  artifact targets 和 evolution methods。
-- `method_metadata_by_id()` 返回 `dict[str, EvolutionMethodCapability]`，key 与
-  `openevo.evolution.methods.METHOD_REGISTRY` 的 method ID 一致。
-- `openevo.evolution.methods.METHOD_METADATA` 是待删除的 legacy capability metadata；
-  anti-drift tests 只保证它与已有 built-ins 不漂移。新增 target/method metadata 应写入 frozen
-  framework descriptor；A2.3 capability projection 和 A2.5 cleanup 完成后旧表不再存在。
-
-当前 Core execution modes 是：
-
-- `codex_subscription_transcript`：订阅认证 harness + transcript capture 的 pure-text
-  evolution 模式。它不代表 token-level proxy capture，也不提供 logprob/loss-mask 指标。
-- `self_deployed_reference`：External Beta 的 Self-Deployed Reference mode
-  execution token，用于自部署模型服务、Core proxy 或兼容基础设施的执行模式。
-  历史 spelling `self-deployed` 只允许出现在迁移说明或负向 fixture 中。
-
-当前 artifact targets 是：
-
-| Artifact target | Desktop visible | 说明 |
-|---|---:|---|
-| `text_memory` | yes | 自然语言长期记忆 |
-| `skill_bundle` | yes | harness 可加载 skill bundle |
-| `agent_system` | yes | agent system prompt 或 instruction 文件 |
-| `parametric_memory` | no | LoRA/adapter 等参数化记忆；开发者工作流可发现，Desktop 暂不展示 |
-
-Method metadata contract：
-
-```json
-{
-  "method_id": "text_memory_expel_reflector",
-  "display_name": "Text Memory EXPEL Reflector",
-  "description": "Mine transcript trajectories into reusable text memory.",
-  "artifact_type": "text_memory",
-  "visibility": "ordinary_user",
-  "visible_in_desktop": true,
-  "release_supported": true,
-  "default_enabled": true,
-  "release_baseline_id": "terminal_bench_textual_memory_baseline_failed_v1",
-  "input_requirements": ["dataset"],
-  "supported_execution_modes": [
-    "codex_subscription_transcript",
-    "self_deployed_reference"
-  ],
-  "default_config": {},
-  "config_schema": {"type": "object", "additionalProperties": true},
-  "stability_level": "stable"
-}
+```text
+GET /capabilities?execution_mode=codex_subscription_transcript
+GET /capabilities?execution_mode=self-deployed
 ```
 
-`visibility` 的取值为：
+`execution_mode` 是 release-mode 值。唯一映射将
+`codex_subscription_transcript` 转为 `subscription + transcript + codex`，将
+`self-deployed` 转为 `self_deployed + transcript + codex`。它不会把 subscription
+认证误写成 capture mode，也不会声称 transcript 具有 token-level metrics。
 
-- `ordinary_user`：可面向普通用户展示；External Beta Desktop 只能展示来自
-  Core `/capabilities`、同时满足 `visible_in_desktop=true`、`release_supported=true`、
-  `default_enabled=true`、execution-mode compatible、并且属于当前 release-supported
-  method ID allowlist 的方法。
-- `dev_kit`：开发者、研究和调试工作流可发现；Desktop 默认隐藏。
-- `internal`：内部 plumbing 或暂不面向产品 surface 的方法。
+返回值是 `EvolutionCapabilitiesV1`，包含：
 
-`dev_kit` 是历史 metadata 值，含义是 source-checkout developer、benchmark 或 maintainer
-workflow 可发现；它不定义也不暗示一个单独对外发布的开发者产品面。
+- `schema_version`、`core_version` 和完整 `registry_digest`；
+- 实际用于支持性判断的 `evaluated_profile`；
+- target-rooted `targets`，每个 target 提供 artifact/handler/renderer identity、
+  configured default、nullable effective default、audience-visible `methods`、Core 可接受的
+  `accepted_methods` 和 Core-owned `selection_resolvers`；
+- 每个 method 的 implementation identity、ordered input bindings、output types、
+  canonical JSON schema/default、execution/capture/harness/runtime 声明；
+- execution、capture、harness、runtime 四个独立 support axis，以及稳定的 reason code
+  和 missing requirements。
 
-`input_requirements` 描述 method 运行前需要调用方准备的输入类别，例如 dataset reflector
-方法声明 `["dataset"]`，adapter 注册类 parametric method 声明 `["adapter"]`，纯 config/manual
-注册方法声明空列表。`default_config` 提供 UI 或开发者工具创建 job 时可预填的 method config；
-例如 agent-system 产物默认写入 `{"target_path": "AGENTS.md"}`。`config_schema` 描述可编辑
-config 的 JSON schema，当前内置 baseline 至少提供 object schema，后续可逐步收紧。
+Desktop audience 只包含 descriptor `exposure=desktop` 的 targets 和 methods。未支持或依赖
+尚不可用的方法仍出现在所属 target 中并携带远端 support reason；Core 只在 configured
+default 对当前 profile 为 supported 时设置 `effective_default_method_id`。Desktop 不得自行
+挑选另一个 fallback method。`accepted_methods` 允许 Desktop 无损保留合法但不应显示为新
+选择的已有配置；`selection_resolvers` 当前表达 `agent_system.method=auto`，而不是伪造一个
+method descriptor。Resolver 中每个 concrete method 的 identity 和 support 必须与
+`accepted_methods` 中同 ID 条目完全一致；不一致的远端 payload 无效。
 
-External Beta 普通用户可见的非参数化方法必须由 Core `/capabilities` 标记
-`release_supported=true` 和 `default_enabled=true`，并且只能包含当前 release gate 验证的
-三类方法：`text_memory_expel_reflector`、`skill_bundle_reflector` 和
-`agent_system_gepa_reflector`。它们必须同时支持 `codex_subscription_transcript` 和
-`self_deployed_reference`，这样 Desktop 可以在订阅 transcript 模式和
-Self-Deployed Reference mode 之间复用同一组 memory/skill/agent-system evolution 选项。
-未通过 release gate 的 legacy aliases、
-history/pareto 变体和 parametric-memory 方法可以继续作为 source-checkout maintainer
-workflow 可发现项，但不能作为 release-supported/default-enabled Desktop method，也不能由
-Desktop 维护本地 registry 替代 Core capabilities。
-
-维护者工具可以检查 broader method set，但必须消费 frozen framework registry 或 remote Core
-capabilities，不能维护第二套 method registry。`ordinary_user`、`dev_kit` 和
-`METHOD_METADATA` 只是待删除的 legacy vocabulary/metadata。
+Core 启动时没有 verified executable registry 会返回 typed `503`。Sidecar endpoint
+`/openevo-api/desktop/capabilities` 需要 mutation token 和远端 tunnel，只转发并校验该 payload；
+它不再提供 `/openevo-api/desktop/methods` alias，也不读取 `METHOD_METADATA`。该 legacy
+metadata 在 A2.5 删除前只能服务尚未迁移的内部维护路径，不能作为 capability source。
+Run launch 不信任 UI cache：sidecar 每次按 active project execution mode 重新读取同一 endpoint，
+验证 enabled selections 后才启动远程 Core 命令。
 
 ## Artifact Contract
 

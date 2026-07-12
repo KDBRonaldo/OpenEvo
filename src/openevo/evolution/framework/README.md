@@ -5,9 +5,9 @@ The authoritative A2 framework contract is
 
 A2.2 adds a deterministic built-in catalog and a distribution-backed loader on
 top of the A2.1 contracts. A2.3 uses it for generic project compilation,
-durable plan-bound jobs, and verified worker dispatch. Remote capabilities,
-Desktop projection, and target-specific runtime projection remain assigned to
-later A2 slices in the architecture contract.
+durable plan-bound jobs, verified worker dispatch, and remote Core capabilities
+proxied by Desktop. Generic Desktop configuration/rendering and target-specific
+runtime projection remain assigned to A2.4/A2.5 in the architecture contract.
 
 Keep implementation-independent rules in the architecture document. Keep module
 usage and code-specific invariants here as the package is adopted.
@@ -40,6 +40,18 @@ Release startup calls `load_verified_framework_registry()` with the external
 lock identifies a sibling exact wheel by version and SHA-256; startup verifies
 the installed distribution before publishing handles. Never derive an expected
 digest from the running package and immediately trust it.
+`VerifiedExecutableRegistry` retains the resulting `VerifiedDistribution`
+attestations. Their digest set must equal the distribution digest set referenced
+by the frozen snapshot, every implementation identity must match its attestation,
+and the target/handler anchor set must exactly match the snapshot. A manually
+assembled catalog without that evidence is not a release executable registry.
+Their public constructors are closed; only verified install and exact
+entry-point loading paths publish sealed instances. The public distribution
+verifier always discovers real installed package metadata; provider injection is
+confined to the repository testkit and is not a production API. Target
+descriptors also own project selection resolvers. Capability `methods` remain audience-visible,
+while `accepted_methods` preserves valid hidden selections without exposing
+their config schema as a Desktop choice.
 
 Plan-bound jobs dispatch only through `VerifiedExecutableRegistry`. The worker
 publishes exact method identity digests at claim, then checks the plan,

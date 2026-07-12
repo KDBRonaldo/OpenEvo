@@ -4,6 +4,8 @@ from .capabilities import (
     CapabilityAudience,
     EvolutionCapabilitiesV1,
     EvolutionMethodCapabilityV1,
+    EvolutionResolvedMethodCapabilityV1,
+    EvolutionSelectionResolverCapabilityV1,
     EvolutionTargetCapabilityV1,
     build_evolution_capabilities,
 )
@@ -55,6 +57,7 @@ from .contributions import (
 )
 from .descriptors import (
     EvolutionMethodDescriptor,
+    EvolutionSelectionResolverDescriptor,
     EvolutionTargetDescriptor,
     TargetHandlerDescriptor,
 )
@@ -162,6 +165,9 @@ __all__ = [
     "EvolutionMethodPlugin",
     "EvolutionMethodDescriptor",
     "EvolutionMethodCapabilityV1",
+    "EvolutionResolvedMethodCapabilityV1",
+    "EvolutionSelectionResolverCapabilityV1",
+    "EvolutionSelectionResolverDescriptor",
     "EvolutionPlan",
     "EvolutionTargetDescriptor",
     "EvolutionTargetCapabilityV1",

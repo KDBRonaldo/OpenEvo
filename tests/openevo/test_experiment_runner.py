@@ -22,7 +22,6 @@ from openevo.evolution.framework import (
 )
 from openevo.evolution.framework.builtins import (
     ImplementationDistributionIdentity,
-    VerifiedExecutableRegistry,
     build_builtin_registry,
 )
 from openevo.evolution.models import ReviewRequestCreateRequest
@@ -50,10 +49,15 @@ _EXECUTION_PROFILE = EvolutionExecutionProfile(
         "trainer",
     ),
 )
-_EXECUTABLE_REGISTRY = VerifiedExecutableRegistry(
+class _FakeExecutableRegistry:
+    def __init__(self, snapshot, method_handles) -> None:
+        self.snapshot = snapshot
+        self.method_handles = method_handles
+
+
+_EXECUTABLE_REGISTRY = _FakeExecutableRegistry(
     snapshot=_REGISTRY_SNAPSHOT,
     method_handles=evolution_methods.METHOD_REGISTRY,
-    descriptor_anchors={},
 )
 
 

@@ -106,6 +106,32 @@ method、requested value 和 resolver 输入。为了让 Desktop 无损保存未
 config integer 只允许 JavaScript safe-integer 范围；integral float 规范成 integer，超出范围的
 integer 应使用 string 表达。
 
+Evolution capabilities 只能由远程 Core 的同一 `VerifiedExecutableRegistry` 生成。
+该 executable registry 必须携带 frozen snapshot 中全部且仅有的 distribution
+attestation；每个 target、handler 和 method identity 的 distribution/version/digest 都必须
+与对应的已验证安装一致，target/handler anchor 集合也必须与 snapshot 精确相等。
+`VerifiedDistribution` 和 `VerifiedExecutableRegistry` 只能由完成 wheel/install/inventory 与
+逐 entry-point 校验的 loader sealed publication path 创建，不能提供公开构造或 loader 注入
+绕过。公开 distribution verifier 必须只使用真实 installed-distribution discovery；测试 metadata
+provider 只能通过仓库 testkit 的私有路径注入。
+`GET /capabilities?execution_mode=<release-mode>` 返回 target-rooted
+`EvolutionCapabilitiesV1`，包含 registry digest、evaluated profile、configured/effective
+default 和四个 support axes。Desktop sidecar 的对应 endpoint 必须要求本地 mutation token
+并通过 active Core tunnel 转发；禁止重新引入本地 method table、`/desktop/methods` alias 或
+Desktop-bundled Core fallback。缺 registry、tunnel 或有效 remote payload 时必须 fail closed。
+Target 的 `methods` 是当前 audience 可展示的新选择；`accepted_methods` 是 Core registry
+仍接受、但不一定应在普通用户 UI 展示的已有显式选择；`selection_resolvers` 描述 Core-owned
+项目选择值（当前为 `agent_system.method=auto`）及其可能解析到的 concrete methods。不要把
+三者混成一个 method table；resolver concrete method 的 identity/support 必须与
+`accepted_methods` 同 ID 条目完全一致。
+Desktop 对空 method 或远端已删除/不支持的 method 重新启用时，必须绑定远端 effective
+default 并使用其 default config；仍受支持的显式 method/config 必须原样保留。任何已启用但
+无效的 target/method 都必须可见、可关闭，并阻止 run，capability 获取失败必须提供同 mode
+重试而不能使用本地静态表。未保存 draft 不能放行已激活 session；Sidecar 的 run endpoint
+必须在每次远程启动前重新读取 capabilities，并按 active project/mode fail closed 校验。
+存在 active project session 时，capability 和 run 校验只能使用该 session 的 SSH tunnel，不能
+退回 launcher 的共享 backend URL。
+
 ### `text_memory`
 
 用途：自然语言长期记忆。

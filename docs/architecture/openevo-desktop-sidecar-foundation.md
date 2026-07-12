@@ -163,12 +163,11 @@ Without `--json`, the same payload is printed as YAML for manual inspection.
 OpenEvo Desktop keeps the foundation plan as the source of truth for mutating
 sidecar endpoints:
 
-- `GET /openevo-api/desktop/capabilities` exposes Core execution-mode,
-  artifact-target, and evolution-method metadata. It is read-only and does not
-  require a sidecar mutation token or active project session.
-- `GET /openevo-api/desktop/methods` is a read-only catalog alias that returns
-  `{"methods": [...]}` using the same evolution-method capability objects from
-  Core.
+- `GET /openevo-api/desktop/capabilities?execution_mode=<release-mode>` requires
+  the sidecar mutation token and an active remote Core tunnel. It forwards the
+  query to remote Core, validates the returned `EvolutionCapabilitiesV1`, and
+  returns the target-rooted payload without rebuilding a catalog locally. The
+  duplicate `/openevo-api/desktop/methods` alias no longer exists.
 - `POST /openevo-api/desktop/workspace` consumes the workspace preparation plan.
 - `POST /openevo-api/desktop/bootstrap` compiles the experiment snapshot and
   prepares the remote user-site OpenEvo CLI, state root, and optional Hugging
@@ -194,6 +193,30 @@ sidecar endpoints:
   artifact preview reads to the remote backend. These facade routes require the
   sidecar mutation token, preserve typed backend errors, and do not parse remote
   `summary.json` or define a second artifact registry in the sidecar.
+
+Capability discovery is intentionally unavailable before the remote backend
+tunnel exists. Desktop first obtains its local mutation token from the shell
+status, then requests capabilities after services become ready. A missing
+tunnel is reported as a blocking service error; an invalid remote capability
+payload is reported as a typed upstream-contract error. Neither case falls back
+to the Core wheel bundled in the local sidecar. The sidecar also verifies that
+the complete returned generic profile, including harness/runtime capability
+sets, is the exact profile for the requested release mode. Once a project
+session exists, capability and run validation are bound to that session's SSH
+tunnel; the no-session `--backend-base-url`/environment override used by release
+smoke cannot bypass it. Malformed remote error bodies are normalized to a
+non-leaking typed HTTP error instead of being reflected to Desktop.
+
+Desktop records a capability mode as current only after a successful response.
+A failed request leaves an explicit same-mode retry action. Enabled targets or
+methods absent from a successfully loaded response remain visible so the user
+can disable them, and they block run launch until repaired; supported explicit
+method/config selections are preserved. Unsaved form state cannot authorize the
+active session. The run endpoint independently re-fetches capabilities for the
+active project mode and rejects missing or unsupported targets, explicit
+methods, or selection resolvers before starting the remote command.
+Before any capability response exists, current enabled selections use a neutral
+pending state and are never described as deleted from the remote registry.
 
 The service supervisor is intentionally command based. It exports the remote
 profile proxy/PIP/Hugging Face environment for the full remote command script,

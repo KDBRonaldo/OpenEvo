@@ -302,6 +302,7 @@ describe("OpenEvoDesktop", () => {
       "Remote runtime services have not started",
     );
     expect(buttonByText("Start Run").disabled).toBe(true);
+    expect(apiMocks.fetchOpenEvoDesktopCapabilities).not.toHaveBeenCalled();
 
     await act(async () => {
       buttonByText("Start Services").dispatchEvent(
@@ -338,6 +339,10 @@ describe("OpenEvoDesktop", () => {
 
     expect(document.body.textContent).toContain("Remote runtime services are ready");
     expect(buttonByText("Start Run").disabled).toBe(false);
+    expect(apiMocks.fetchOpenEvoDesktopCapabilities).toHaveBeenCalledTimes(1);
+    expect(apiMocks.fetchOpenEvoDesktopCapabilities).toHaveBeenLastCalledWith(
+      "codex_subscription_transcript",
+    );
     await unmountClient(root);
   });
 
@@ -548,6 +553,7 @@ describe("OpenEvoDesktop", () => {
       remote: {
         ...shellModel.remote,
         host: "configured.gpu.example.edu",
+        port: 2222,
       },
     };
     apiMocks.fetchOpenEvoDesktopShellModel.mockResolvedValue(shellModel);
@@ -597,6 +603,46 @@ describe("OpenEvoDesktop", () => {
     expect(document.body.textContent).toContain("Configured Science Project");
     expect(document.body.textContent).toContain("configured.gpu.example.edu");
     expect(inputByLabel("Remote port").value).toBe("2222");
+    await unmountClient(root);
+  });
+
+  it("adopts the canonical sidecar draft after save normalization", async () => {
+    const shellModel = withBackendService(getOpenEvoDesktopShellModel(), {
+      state: "ready",
+      detail: "Remote runtime services are ready",
+    });
+    const savedModel = {
+      ...shellModel,
+      project: {
+        ...shellModel.project,
+        name: "Normalized Science Project",
+      },
+    };
+    apiMocks.fetchOpenEvoDesktopShellModel.mockResolvedValue(shellModel);
+    apiMocks.saveOpenEvoProjectConfig.mockResolvedValue({
+      config: {
+        science_config_path: "/tmp/normalized/science.yaml",
+        remote_profile_path: "/tmp/normalized/remote.yaml",
+      },
+      status: savedModel,
+    });
+
+    const root = await renderClient();
+    await flushEffects();
+    await changeInput("Project name", "Normalized Science Project  ");
+    await act(async () => {
+      buttonByText("Save Config").click();
+      await Promise.resolve();
+    });
+    await flushEffects();
+
+    expect(inputByLabel("Project name").value).toBe(
+      "Normalized Science Project",
+    );
+    expect(document.body.textContent).not.toContain(
+      "Save configuration changes before starting a run.",
+    );
+    expect(buttonByText("Start Run").disabled).toBe(false);
     await unmountClient(root);
   });
 
@@ -710,79 +756,14 @@ describe("OpenEvoDesktop", () => {
   });
 
   it("renders evolution target controls from desktop capabilities", async () => {
-    const shellModel = getOpenEvoDesktopShellModel();
-    apiMocks.fetchOpenEvoDesktopShellModel.mockResolvedValue(shellModel);
-    apiMocks.fetchOpenEvoDesktopCapabilities.mockResolvedValue({
-      artifactTargets: [
-        {
-          artifactType: "text_memory",
-          displayName: "Text Memory",
-          visibleInDesktop: true,
-          stabilityLevel: "stable",
-        },
-        {
-          artifactType: "skill_bundle",
-          displayName: "Skill Bundle",
-          visibleInDesktop: true,
-          stabilityLevel: "stable",
-        },
-        {
-          artifactType: "agent_system",
-          displayName: "Agent System",
-          visibleInDesktop: true,
-          stabilityLevel: "stable",
-        },
-        {
-          artifactType: "parametric_memory",
-          displayName: "Parametric Memory",
-          visibleInDesktop: false,
-          stabilityLevel: "experimental",
-        },
-      ],
-      evolutionMethods: [
-        {
-          methodId: "text_memory_reflector",
-          displayName: "Text memory",
-          artifactType: "text_memory",
-          supportedExecutionModes: [
-            "codex_subscription_transcript",
-            "self-deployed",
-          ],
-          visibleInDesktop: true,
-          stabilityLevel: "stable",
-        },
-        {
-          methodId: "skill_bundle_reflector",
-          displayName: "Skill bundle",
-          artifactType: "skill_bundle",
-          supportedExecutionModes: [
-            "codex_subscription_transcript",
-            "self-deployed",
-          ],
-          visibleInDesktop: true,
-          stabilityLevel: "stable",
-        },
-        {
-          methodId: "agent_system_reflector",
-          displayName: "Agent system",
-          artifactType: "agent_system",
-          supportedExecutionModes: [
-            "codex_subscription_transcript",
-            "self-deployed",
-          ],
-          visibleInDesktop: true,
-          stabilityLevel: "stable",
-        },
-        {
-          methodId: "parametric_memory_trainer",
-          displayName: "Parametric memory",
-          artifactType: "parametric_memory",
-          supportedExecutionModes: ["self-deployed"],
-          visibleInDesktop: false,
-          stabilityLevel: "experimental",
-        },
-      ],
+    const shellModel = withBackendService(getOpenEvoDesktopShellModel(), {
+      state: "ready",
+      detail: "Remote runtime services are ready",
     });
+    apiMocks.fetchOpenEvoDesktopShellModel.mockResolvedValue(shellModel);
+    apiMocks.fetchOpenEvoDesktopCapabilities.mockResolvedValue(
+      desktopCapabilities(),
+    );
 
     const root = await renderClient();
     await flushEffects();
@@ -796,11 +777,454 @@ describe("OpenEvoDesktop", () => {
       "Agent system",
     ]);
     expect(document.body.textContent).not.toContain("Parametric memory");
+    expect(apiMocks.fetchOpenEvoDesktopCapabilities).toHaveBeenCalledWith(
+      "codex_subscription_transcript",
+    );
+    expect(
+      apiMocks.fetchOpenEvoDesktopShellModel.mock.invocationCallOrder[0],
+    ).toBeLessThan(
+      apiMocks.fetchOpenEvoDesktopCapabilities.mock.invocationCallOrder[0],
+    );
+    await unmountClient(root);
+  });
+
+  it("preserves a supported Core-owned automatic method resolver", async () => {
+    const shellModel = withBackendService(getOpenEvoDesktopShellModel(), {
+      state: "ready",
+      detail: "Remote runtime services are ready",
+    });
+    apiMocks.fetchOpenEvoDesktopShellModel.mockResolvedValue(shellModel);
+    apiMocks.saveOpenEvoProjectConfig.mockResolvedValue({
+      config: {
+        science_config_path: "/tmp/science.yaml",
+        remote_profile_path: "/tmp/remote.yaml",
+      },
+      status: shellModel,
+    });
+
+    const root = await renderClient();
+    await flushEffects();
+
+    expect(document.body.textContent).not.toContain(
+      'Selected method "auto" is no longer available',
+    );
+    expect(buttonByText("Start Run").disabled).toBe(false);
+    await act(async () => inputByLabel("Agent system").click());
+    await act(async () => inputByLabel("Agent system").click());
+    await act(async () => {
+      buttonByText("Save Config").click();
+      await Promise.resolve();
+    });
+
+    expect(
+      apiMocks.saveOpenEvoProjectConfig.mock.calls[0]?.[0].evolution.targets
+        .agent_system,
+    ).toEqual({
+      enabled: true,
+      method: "auto",
+      config: { target_path: "AGENTS.md" },
+    });
+    await unmountClient(root);
+  });
+
+  it("allows an enabled unsupported target to be disabled but not re-enabled", async () => {
+    const shellModel = withBackendService(getOpenEvoDesktopShellModel(), {
+      state: "ready",
+      detail: "Remote runtime services are ready",
+    });
+    shellModel.project.evolutionTargets.text_memory = {
+      enabled: true,
+      method: "text_memory_reflector",
+      config: {},
+    };
+    const capabilities = desktopCapabilities();
+    capabilities.targets[0].effectiveDefaultMethodId = null;
+    capabilities.targets[0].configuredDefaultSupport = unsupportedSupport(
+      "unsupported_execution_mode",
+      "Text memory is unavailable for this execution profile.",
+    );
+    capabilities.targets[0].methods[0].support =
+      capabilities.targets[0].configuredDefaultSupport;
+    capabilities.targets[0].acceptedMethods[0].support =
+      capabilities.targets[0].configuredDefaultSupport;
+    apiMocks.fetchOpenEvoDesktopShellModel.mockResolvedValue(shellModel);
+    apiMocks.fetchOpenEvoDesktopCapabilities.mockResolvedValue(capabilities);
+
+    const root = await renderClient();
+    await flushEffects();
+
+    expect(inputByLabel("Text memory").checked).toBe(true);
+    expect(inputByLabel("Text memory").disabled).toBe(false);
+    expect(document.body.textContent).toContain(
+      "Text memory is unavailable for this execution profile.",
+    );
+    await act(async () => inputByLabel("Text memory").click());
+    expect(inputByLabel("Text memory").checked).toBe(false);
+    expect(inputByLabel("Text memory").disabled).toBe(true);
+    await unmountClient(root);
+  });
+
+  it("shows an enabled target missing from the remote registry and allows disabling it", async () => {
+    const shellModel = withBackendService(getOpenEvoDesktopShellModel(), {
+      state: "ready",
+      detail: "Remote runtime services are ready",
+    });
+    shellModel.project.evolutionTargets.removed_target = {
+      enabled: true,
+      method: "removed_method",
+      config: { retained: true },
+    };
+    apiMocks.fetchOpenEvoDesktopShellModel.mockResolvedValue(shellModel);
+    apiMocks.saveOpenEvoProjectConfig.mockResolvedValue({
+      config: {
+        science_config_path: "/tmp/science.yaml",
+        remote_profile_path: "/tmp/remote.yaml",
+      },
+      status: shellModel,
+    });
+
+    const root = await renderClient();
+    await flushEffects();
+
+    expect(inputByLabel("Removed target").checked).toBe(true);
+    expect(document.body.textContent).toContain(
+      'Target "removed_target" is no longer available in the remote registry.',
+    );
+    expect(buttonByText("Start Run").disabled).toBe(true);
+
+    await act(async () => inputByLabel("Removed target").click());
+    expect(buttonByText("Start Run").disabled).toBe(true);
+    expect(document.body.textContent).toContain(
+      "Save configuration changes before starting a run.",
+    );
+    await act(async () => {
+      buttonByText("Save Config").click();
+      await Promise.resolve();
+    });
+    expect(
+      apiMocks.saveOpenEvoProjectConfig.mock.calls[0]?.[0].evolution.targets
+        .removed_target,
+    ).toEqual({
+      enabled: false,
+      method: "removed_method",
+      config: { retained: true },
+    });
+    await unmountClient(root);
+  });
+
+  it("blocks a missing selected method and resets it to the supported remote default", async () => {
+    const shellModel = withBackendService(getOpenEvoDesktopShellModel(), {
+      state: "ready",
+      detail: "Remote runtime services are ready",
+    });
+    shellModel.project.evolutionTargets.text_memory = {
+      enabled: true,
+      method: "removed_memory_method",
+      config: { stale: true },
+    };
+    const capabilities = desktopCapabilities();
+    capabilities.targets[0].methods[0].defaultConfig = { threshold: 0.5 };
+    apiMocks.fetchOpenEvoDesktopShellModel.mockResolvedValue(shellModel);
+    apiMocks.fetchOpenEvoDesktopCapabilities.mockResolvedValue(capabilities);
+    apiMocks.saveOpenEvoProjectConfig.mockResolvedValue({
+      config: {
+        science_config_path: "/tmp/science.yaml",
+        remote_profile_path: "/tmp/remote.yaml",
+      },
+      status: shellModel,
+    });
+
+    const root = await renderClient();
+    await flushEffects();
+
+    expect(document.body.textContent).toContain(
+      'Selected method "removed_memory_method" is no longer available',
+    );
+    expect(buttonByText("Start Run").disabled).toBe(true);
+    await act(async () => inputByLabel("Text memory").click());
+    expect(inputByLabel("Text memory").disabled).toBe(false);
+    await act(async () => inputByLabel("Text memory").click());
+    await act(async () => {
+      buttonByText("Save Config").click();
+      await Promise.resolve();
+    });
+
+    expect(
+      apiMocks.saveOpenEvoProjectConfig.mock.calls[0]?.[0].evolution.targets
+        .text_memory,
+    ).toEqual({
+      enabled: true,
+      method: "text_memory_reflector",
+      config: { threshold: 0.5 },
+    });
+    await unmountClient(root);
+  });
+
+  it("allows an explicitly selected supported method when the default is unavailable", async () => {
+    const shellModel = withBackendService(getOpenEvoDesktopShellModel(), {
+      state: "ready",
+      detail: "Remote runtime services are ready",
+    });
+    shellModel.project.evolutionTargets.text_memory = {
+      enabled: false,
+      method: "alternate_memory",
+      config: { retained: true },
+    };
+    const capabilities = desktopCapabilities();
+    capabilities.targets[0].effectiveDefaultMethodId = null;
+    capabilities.targets[0].configuredDefaultSupport = unsupportedSupport(
+      "missing_runtime_requirement",
+      "The default method is unavailable.",
+    );
+    capabilities.targets[0].methods[0].support =
+      capabilities.targets[0].configuredDefaultSupport;
+    capabilities.targets[0].methods.push({
+      ...capabilities.targets[0].methods[0],
+      methodId: "alternate_memory",
+      support: supportedSupport(),
+    });
+    capabilities.targets[0].acceptedMethods.push({
+      methodId: "alternate_memory",
+      implementationIdentityDigest: "f".repeat(64),
+      support: supportedSupport(),
+    });
+    apiMocks.fetchOpenEvoDesktopShellModel.mockResolvedValue(shellModel);
+    apiMocks.fetchOpenEvoDesktopCapabilities.mockResolvedValue(capabilities);
+    apiMocks.saveOpenEvoProjectConfig.mockResolvedValue({
+      config: {
+        science_config_path: "/tmp/science.yaml",
+        remote_profile_path: "/tmp/remote.yaml",
+      },
+      status: shellModel,
+    });
+
+    const root = await renderClient();
+    await flushEffects();
+
+    expect(inputByLabel("Text memory").disabled).toBe(false);
+    expect(document.body.textContent).not.toContain(
+      "The default method is unavailable.",
+    );
+    await act(async () => inputByLabel("Text memory").click());
+    await act(async () => {
+      buttonByText("Save Config").click();
+      await Promise.resolve();
+    });
+    expect(
+      apiMocks.saveOpenEvoProjectConfig.mock.calls[0]?.[0].evolution.targets
+        .text_memory,
+    ).toEqual({
+      enabled: true,
+      method: "alternate_memory",
+      config: { retained: true },
+    });
+    await unmountClient(root);
+  });
+
+  it("uses the remote default config when enabling a null method selection", async () => {
+    const shellModel = withBackendService(getOpenEvoDesktopShellModel(), {
+      state: "ready",
+      detail: "Remote runtime services are ready",
+    });
+    shellModel.project.evolutionTargets.text_memory = {
+      enabled: false,
+      method: null,
+      config: { stale: true },
+    };
+    const capabilities = desktopCapabilities();
+    capabilities.targets[0].methods[0].defaultConfig = { threshold: 0.25 };
+    apiMocks.fetchOpenEvoDesktopShellModel.mockResolvedValue(shellModel);
+    apiMocks.fetchOpenEvoDesktopCapabilities.mockResolvedValue(capabilities);
+    apiMocks.saveOpenEvoProjectConfig.mockResolvedValue({
+      config: {
+        science_config_path: "/tmp/science.yaml",
+        remote_profile_path: "/tmp/remote.yaml",
+      },
+      status: shellModel,
+    });
+
+    const root = await renderClient();
+    await flushEffects();
+    await act(async () => inputByLabel("Text memory").click());
+    await act(async () => {
+      buttonByText("Save Config").click();
+      await Promise.resolve();
+    });
+
+    expect(
+      apiMocks.saveOpenEvoProjectConfig.mock.calls[0]?.[0].evolution.targets
+        .text_memory,
+    ).toEqual({
+      enabled: true,
+      method: "text_memory_reflector",
+      config: { threshold: 0.25 },
+    });
+    await unmountClient(root);
+  });
+
+  it("blocks an enabled method unsupported by the current remote profile", async () => {
+    const shellModel = withBackendService(getOpenEvoDesktopShellModel(), {
+      state: "ready",
+      detail: "Remote runtime services are ready",
+    });
+    shellModel.project.evolutionTargets.text_memory = {
+      enabled: true,
+      method: "experimental_memory",
+      config: {},
+    };
+    const capabilities = desktopCapabilities();
+    capabilities.targets[0].methods.push({
+      ...capabilities.targets[0].methods[0],
+      methodId: "experimental_memory",
+      support: unsupportedSupport(
+        "missing_runtime_requirement",
+        "A required runtime is unavailable.",
+      ),
+    });
+    capabilities.targets[0].acceptedMethods.push({
+      methodId: "experimental_memory",
+      implementationIdentityDigest: "f".repeat(64),
+      support: unsupportedSupport(
+        "missing_runtime_requirement",
+        "A required runtime is unavailable.",
+      ),
+    });
+    apiMocks.fetchOpenEvoDesktopShellModel.mockResolvedValue(shellModel);
+    apiMocks.fetchOpenEvoDesktopCapabilities.mockResolvedValue(capabilities);
+
+    const root = await renderClient();
+    await flushEffects();
+
+    expect(document.body.textContent).toContain(
+      'Selected method "experimental_memory" is unsupported by the current remote profile.',
+    );
+    expect(document.body.textContent).toContain("A required runtime is unavailable.");
+    expect(buttonByText("Start Run").disabled).toBe(true);
+    expect(inputByLabel("Text memory").disabled).toBe(false);
+    await unmountClient(root);
+  });
+
+  it("retries failed capabilities with the current execution mode", async () => {
+    const shellModel = withBackendService(getOpenEvoDesktopShellModel(), {
+      state: "ready",
+      detail: "Remote runtime services are ready",
+    });
+    apiMocks.fetchOpenEvoDesktopShellModel.mockResolvedValue(shellModel);
+    apiMocks.fetchOpenEvoDesktopCapabilities
+      .mockRejectedValueOnce(new Error("remote registry unavailable"))
+      .mockResolvedValueOnce(desktopCapabilities());
+
+    const root = await renderClient();
+    await flushEffects();
+
+    expect(buttonByText("Start Run").disabled).toBe(true);
+    expect(document.body.textContent).toContain("remote registry unavailable");
+    await act(async () => buttonByText("Retry Capabilities").click());
+    await flushEffects();
+
+    expect(apiMocks.fetchOpenEvoDesktopCapabilities).toHaveBeenCalledTimes(2);
+    expect(apiMocks.fetchOpenEvoDesktopCapabilities).toHaveBeenLastCalledWith(
+      "codex_subscription_transcript",
+    );
+    expect(buttonByText("Start Run").disabled).toBe(false);
+    await unmountClient(root);
+  });
+
+  it("stores generic remote selections by target id instead of artifact type", async () => {
+    const shellModel = withBackendService(getOpenEvoDesktopShellModel(), {
+      state: "ready",
+      detail: "Remote runtime services are ready",
+    });
+    const target = desktopCapabilityTarget(
+      "novel_memory",
+      "Novel Memory",
+      "novel_memory_reflector",
+    );
+    target.artifactType = "text_memory";
+    target.methods[0].defaultConfig = { threshold: 0.5 };
+    apiMocks.fetchOpenEvoDesktopShellModel.mockResolvedValue(shellModel);
+    apiMocks.fetchOpenEvoDesktopCapabilities.mockResolvedValue({
+      ...desktopCapabilities(),
+      targets: [target],
+    });
+    apiMocks.saveOpenEvoProjectConfig.mockResolvedValue({
+      config: {
+        science_config_path: "/tmp/science.yaml",
+        remote_profile_path: "/tmp/remote.yaml",
+      },
+      status: shellModel,
+    });
+
+    const root = await renderClient();
+    await flushEffects();
+    await act(async () => inputByLabel("Novel memory").click());
+    await act(async () => {
+      buttonByText("Save Config").click();
+      await Promise.resolve();
+    });
+
+    expect(
+      apiMocks.saveOpenEvoProjectConfig.mock.calls[0]?.[0].evolution.targets
+        .novel_memory,
+    ).toEqual({
+      enabled: true,
+      method: "novel_memory_reflector",
+      config: { threshold: 0.5 },
+    });
+    await unmountClient(root);
+  });
+
+  it("shows remote capabilities as unavailable before the backend connects", async () => {
+    apiMocks.fetchOpenEvoDesktopShellModel.mockResolvedValue(
+      getOpenEvoDesktopShellModel(),
+    );
+    const root = await renderClient();
+    await flushEffects();
+
+    expect(apiMocks.fetchOpenEvoDesktopCapabilities).not.toHaveBeenCalled();
+    expect(document.body.textContent).toContain("Remote capabilities unavailable");
+    expect(document.querySelectorAll('[data-testid="evolution-target"]')).toHaveLength(3);
+    expect(document.body.textContent).not.toContain(
+      "is no longer available in the remote registry",
+    );
+    await unmountClient(root);
+  });
+
+  it("clears capabilities when a saved config changes the remote context", async () => {
+    const connectedModel = withBackendService(getOpenEvoDesktopShellModel(), {
+      state: "ready",
+      detail: "Remote runtime services are ready",
+    });
+    const disconnectedModel = getOpenEvoDesktopShellModel();
+    apiMocks.fetchOpenEvoDesktopShellModel.mockResolvedValue(connectedModel);
+    apiMocks.saveOpenEvoProjectConfig.mockResolvedValue({
+      config: {
+        science_config_path: "/tmp/science.yaml",
+        remote_profile_path: "/tmp/remote.yaml",
+      },
+      status: disconnectedModel,
+    });
+
+    const root = await renderClient();
+    await flushEffects();
+    expect(document.querySelectorAll('[data-testid="evolution-target"]')).toHaveLength(3);
+
+    await act(async () => {
+      buttonByText("Save Config").click();
+      await Promise.resolve();
+    });
+
+    expect(document.querySelectorAll('[data-testid="evolution-target"]')).toHaveLength(3);
+    expect(document.body.textContent).toContain("Remote capabilities unavailable");
+    expect(apiMocks.fetchOpenEvoDesktopCapabilities).toHaveBeenCalledTimes(1);
     await unmountClient(root);
   });
 
   it("toggles only enabled while preserving complete evolution selections", async () => {
-    const shellModel = getOpenEvoDesktopShellModel();
+    const shellModel = withBackendService(getOpenEvoDesktopShellModel(), {
+      state: "ready",
+      detail: "Remote runtime services are ready",
+    });
     shellModel.project.evolutionTargets = {
       text_memory: {
         enabled: true,
@@ -854,6 +1278,7 @@ describe("OpenEvoDesktop", () => {
         ...shellModel.project.evolutionTargets.skill_bundle,
         enabled: true,
         method: "skill_bundle_reflector",
+        config: {},
       },
       agent_system: {
         enabled: true,
@@ -904,6 +1329,63 @@ describe("OpenEvoDesktop", () => {
         codex_model: null,
         hf_model: "Qwen/Qwen3-Coder-30B-A3B-Instruct",
       }),
+    );
+    await unmountClient(root);
+  });
+
+  it("refreshes remote capabilities when execution mode changes on a ready backend", async () => {
+    const shellModel = withBackendService(getOpenEvoDesktopShellModel(), {
+      state: "ready",
+      detail: "Remote runtime services are ready",
+    });
+    apiMocks.fetchOpenEvoDesktopShellModel.mockResolvedValue(shellModel);
+
+    const root = await renderClient();
+    await flushEffects();
+    expect(apiMocks.fetchOpenEvoDesktopCapabilities).toHaveBeenCalledTimes(1);
+
+    await changeSelect("Execution mode", "self-deployed");
+    await flushEffects();
+
+    expect(apiMocks.fetchOpenEvoDesktopCapabilities).toHaveBeenCalledTimes(2);
+    expect(apiMocks.fetchOpenEvoDesktopCapabilities).toHaveBeenLastCalledWith(
+      "self-deployed",
+    );
+    await unmountClient(root);
+  });
+
+  it("refetches a previous mode after another mode fails", async () => {
+    const shellModel = withBackendService(getOpenEvoDesktopShellModel(), {
+      state: "ready",
+      detail: "Remote runtime services are ready",
+    });
+    apiMocks.fetchOpenEvoDesktopShellModel.mockResolvedValue(shellModel);
+    apiMocks.fetchOpenEvoDesktopCapabilities
+      .mockResolvedValueOnce(desktopCapabilities())
+      .mockRejectedValueOnce(new Error("self-deployed registry unavailable"))
+      .mockResolvedValueOnce(desktopCapabilities());
+
+    const root = await renderClient();
+    await flushEffects();
+    await changeSelect("Execution mode", "self-deployed");
+    await flushEffects();
+    expect(document.body.textContent).toContain(
+      "self-deployed registry unavailable",
+    );
+
+    await changeSelect("Execution mode", "codex_subscription_transcript");
+    await flushEffects();
+
+    expect(apiMocks.fetchOpenEvoDesktopCapabilities).toHaveBeenCalledTimes(3);
+    expect(apiMocks.fetchOpenEvoDesktopCapabilities).toHaveBeenLastCalledWith(
+      "codex_subscription_transcript",
+    );
+    expect(document.body.textContent).not.toContain(
+      "self-deployed registry unavailable",
+    );
+    expect(buttonByText("Start Run").disabled).toBe(true);
+    expect(document.body.textContent).toContain(
+      "Save configuration changes before starting a run.",
     );
     await unmountClient(root);
   });
@@ -2295,6 +2777,7 @@ function modelWithBootstrap({
     project: {
       ...model.project,
       name: projectName,
+      evolutionTargets: concreteEvolutionTargets(model),
     },
     bootstrap: {
       ...model.bootstrap,
@@ -2393,6 +2876,7 @@ function modelWithRun({
     project: {
       ...model.project,
       name: projectName,
+      evolutionTargets: concreteEvolutionTargets(model),
     },
     services: model.services.map((service) =>
       service.id === "workspace"
@@ -2456,6 +2940,10 @@ function withBackendService(
 ): OpenEvoDesktopShellModel {
   return {
     ...model,
+    project: {
+      ...model.project,
+      evolutionTargets: concreteEvolutionTargets(model),
+    },
     services: model.services.map((service) =>
       service.id === "openevo-backend"
         ? {
@@ -2466,6 +2954,15 @@ function withBackendService(
         : service,
     ),
   };
+}
+
+function concreteEvolutionTargets(model: OpenEvoDesktopShellModel) {
+  return Object.fromEntries(
+    Object.entries(model.project.evolutionTargets).map(([targetId, selection]) => [
+      targetId,
+      selection,
+    ]),
+  );
 }
 
 function deferBootstrap(status: OpenEvoDesktopShellModel) {
@@ -2625,61 +3122,136 @@ function artifactPreview({
 
 function desktopCapabilities() {
   return {
-    artifactTargets: [
+    schemaVersion: "1",
+    coreVersion: "0.1.0",
+    registryDigest: "a".repeat(64),
+    evaluatedProfile: {
+      executionMode: "subscription",
+      captureMode: "transcript",
+      harnessId: "codex",
+      harnessCapabilities: ["stable_transcript"],
+      runtimeCapabilities: [],
+    },
+    targets: [
+      desktopCapabilityTarget("text_memory", "Text Memory", "text_memory_reflector"),
+      desktopCapabilityTarget("skill_bundle", "Skill Bundle", "skill_bundle_reflector"),
+      desktopCapabilityTarget("agent_system", "Agent System", "agent_system_reflector"),
+    ],
+  };
+}
+
+function desktopCapabilityTarget(
+  targetId: string,
+  displayName: string,
+  methodId: string,
+): any {
+  const support = supportedSupport();
+  return {
+    targetId,
+    displayName,
+    description: `${displayName} target`,
+    artifactType: targetId,
+    exposure: "desktop",
+    maturity: "stable",
+    handlerId: `${targetId}_handler`,
+    configuredDefaultMethodId: methodId,
+    effectiveDefaultMethodId: methodId,
+    configuredDefaultSupport: support,
+    rendererKind: "markdown",
+    rendererContractVersion: "1",
+    contributionContractVersion: "1",
+    contextOrder: 10,
+    implementationIdentityDigest: "b".repeat(64),
+    handlerIdentityDigest: "c".repeat(64),
+    acceptedMethods: [
       {
-        artifactType: "text_memory",
-        displayName: "Text Memory",
-        visibleInDesktop: true,
-        stabilityLevel: "stable",
+        methodId,
+        implementationIdentityDigest: "d".repeat(64),
+        support,
       },
+      ...(targetId === "agent_system"
+        ? [
+            {
+              methodId: "agent_system_history_reflector",
+              implementationIdentityDigest: "e".repeat(64),
+              support,
+            },
+          ]
+        : []),
+    ],
+    selectionResolvers:
+      targetId === "agent_system"
+        ? [
+            {
+              selectionValue: "auto",
+              displayName: "Automatic",
+              description: "Resolve from prior datasets.",
+              resolvedMethods: [
+                {
+                  methodId: "agent_system_reflector",
+                  implementationIdentityDigest: "d".repeat(64),
+                  support,
+                },
+                {
+                  methodId: "agent_system_history_reflector",
+                  implementationIdentityDigest: "e".repeat(64),
+                  support,
+                },
+              ],
+            },
+          ]
+        : [],
+    methods: [
       {
-        artifactType: "skill_bundle",
-        displayName: "Skill Bundle",
-        visibleInDesktop: true,
-        stabilityLevel: "stable",
-      },
-      {
-        artifactType: "agent_system",
-        displayName: "Agent System",
-        visibleInDesktop: true,
-        stabilityLevel: "stable",
+        methodId,
+        displayName,
+        description: `${displayName} method`,
+        exposure: "desktop",
+        maturity: "stable",
+        executionModes: ["subscription", "self_deployed"],
+        captureModes: ["transcript"],
+        supportedHarnessIds: ["codex"],
+        harnessRequirements: ["stable_transcript"],
+        runtimeRequirements: [],
+        inputBindings: [],
+        outputArtifactTypes: [targetId],
+        configSchemaJson: '{"additionalProperties":false,"type":"object"}',
+        defaultConfigJson: "{}",
+        configSchema: { additionalProperties: false, type: "object" },
+        defaultConfig: {},
+        implementationIdentityDigest: "d".repeat(64),
+        support,
       },
     ],
-    evolutionMethods: [
-      {
-        methodId: "text_memory_reflector",
-        displayName: "Text memory",
-        artifactType: "text_memory",
-        supportedExecutionModes: [
-          "codex_subscription_transcript",
-          "self-deployed",
-        ],
-        visibleInDesktop: true,
-        stabilityLevel: "stable",
-      },
-      {
-        methodId: "skill_bundle_reflector",
-        displayName: "Skill bundle",
-        artifactType: "skill_bundle",
-        supportedExecutionModes: [
-          "codex_subscription_transcript",
-          "self-deployed",
-        ],
-        visibleInDesktop: true,
-        stabilityLevel: "stable",
-      },
-      {
-        methodId: "agent_system_reflector",
-        displayName: "Agent system",
-        artifactType: "agent_system",
-        supportedExecutionModes: [
-          "codex_subscription_transcript",
-          "self-deployed",
-        ],
-        visibleInDesktop: true,
-        stabilityLevel: "stable",
-      },
-    ],
+  };
+}
+
+function supportedSupport(): any {
+  const axis = {
+    state: "supported",
+    reasonCode: null,
+    message: "Supported.",
+    missingRequirements: [],
+  };
+  return {
+    overall: "supported",
+    execution: { ...axis },
+    capture: { ...axis },
+    harness: { ...axis },
+    runtime: { ...axis },
+  };
+}
+
+function unsupportedSupport(reasonCode: string, message: string): any {
+  return {
+    ...supportedSupport(),
+    overall: "unsupported",
+    execution: {
+      state: "unsupported",
+      reasonCode,
+      message,
+      missingRequirements: [],
+    },
   };
 }
 

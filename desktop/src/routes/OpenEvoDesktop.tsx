@@ -95,6 +95,12 @@ export function OpenEvoDesktop() {
   );
   const [desktopCapabilities, setDesktopCapabilities] =
     useState<OpenEvoDesktopCapabilities | null>(null);
+  const [desktopCapabilitiesExecutionMode, setDesktopCapabilitiesExecutionMode] =
+    useState<OpenEvoProjectConfigDraft["execution_mode"] | null>(null);
+  const [capabilitiesLoading, setCapabilitiesLoading] = useState(false);
+  const [capabilitiesError, setCapabilitiesError] = useState<string | null>(
+    "Remote capabilities unavailable until remote services are ready.",
+  );
   const [diagnosticsOpen, setDiagnosticsOpen] = useState(false);
   const [configSaving, setConfigSaving] = useState(false);
   const [configError, setConfigError] = useState<string | null>(null);
@@ -113,6 +119,16 @@ export function OpenEvoDesktop() {
   );
   const mounted = useRef(true);
   const catalogRefreshGeneration = useRef(0);
+  const capabilitiesRefreshGeneration = useRef(0);
+  const lastCapabilitiesExecutionMode = useRef<
+    OpenEvoProjectConfigDraft["execution_mode"] | null
+  >(null);
+  const capabilitiesRequestExecutionMode = useRef<
+    OpenEvoProjectConfigDraft["execution_mode"] | null
+  >(null);
+  const capabilitiesAttemptedExecutionMode = useRef<
+    OpenEvoProjectConfigDraft["execution_mode"] | null
+  >(null);
   const runPollGeneration = useRef(0);
   const runPollTimer = useRef<number | null>(null);
   const summary = getOpenEvoTimelineSummary(model);
@@ -127,9 +143,23 @@ export function OpenEvoDesktop() {
   );
   const evolutionTargets = desktopEvolutionTargets(
     desktopCapabilities,
-    configDraft.execution_mode,
+    configDraft.evolution.targets,
   );
   const artifactDisplayNames = artifactTargetDisplayNames(desktopCapabilities);
+  const configDraftDirty = !projectConfigDraftsEqual(
+    configDraft,
+    toDraftPayload(model),
+  );
+  const runCapabilityBlockReason = configDraftDirty
+    ? "Save configuration changes before starting a run."
+    : desktopCapabilitiesExecutionMode !== model.execution.mode
+      ? "Remote capabilities do not match the active project execution mode."
+      : capabilityRunBlockReason(
+          capabilitiesLoading,
+          capabilitiesError,
+          desktopCapabilities,
+          model.project.evolutionTargets,
+        );
 
   const refreshSavedConfigs = async () => {
     catalogRefreshGeneration.current += 1;
@@ -156,16 +186,45 @@ export function OpenEvoDesktop() {
     }
   };
 
+  const refreshDesktopCapabilities = async (
+    executionMode: OpenEvoProjectConfigDraft["execution_mode"],
+  ) => {
+    capabilitiesRefreshGeneration.current += 1;
+    const generation = capabilitiesRefreshGeneration.current;
+    capabilitiesRequestExecutionMode.current = executionMode;
+    capabilitiesAttemptedExecutionMode.current = executionMode;
+    setCapabilitiesLoading(true);
+    setCapabilitiesError(null);
+    setDesktopCapabilities(null);
+    setDesktopCapabilitiesExecutionMode(null);
+    try {
+      const capabilities = await fetchOpenEvoDesktopCapabilities(executionMode);
+      if (!mounted.current || generation !== capabilitiesRefreshGeneration.current) {
+        return;
+      }
+      setDesktopCapabilities(capabilities);
+      setDesktopCapabilitiesExecutionMode(executionMode);
+      lastCapabilitiesExecutionMode.current = executionMode;
+    } catch (error) {
+      if (!mounted.current || generation !== capabilitiesRefreshGeneration.current) {
+        return;
+      }
+      setDesktopCapabilities(null);
+      setCapabilitiesError(
+        error instanceof Error
+          ? `Remote capabilities unavailable: ${error.message}`
+          : "Remote capabilities unavailable.",
+      );
+    } finally {
+      if (mounted.current && generation === capabilitiesRefreshGeneration.current) {
+        capabilitiesRequestExecutionMode.current = null;
+        setCapabilitiesLoading(false);
+      }
+    }
+  };
+
   useEffect(() => {
     let cancelled = false;
-
-    fetchOpenEvoDesktopCapabilities()
-      .then((capabilities) => {
-        if (!cancelled) {
-          setDesktopCapabilities(capabilities);
-        }
-      })
-      .catch(() => undefined);
 
     fetchOpenEvoDesktopShellModel()
       .then((nextModel) => {
@@ -174,6 +233,13 @@ export function OpenEvoDesktop() {
           setConfigDraft(toDraftPayload(nextModel));
           setSidecarConnected(true);
           void refreshSavedConfigs();
+          if (backendIsReady(nextModel)) {
+            void refreshDesktopCapabilities(nextModel.execution.mode);
+          } else {
+            setCapabilitiesError(
+              "Remote capabilities unavailable until remote services are ready.",
+            );
+          }
         }
       })
       .catch(() => undefined);
@@ -182,6 +248,27 @@ export function OpenEvoDesktop() {
       cancelled = true;
     };
   }, []);
+
+  useEffect(() => {
+    if (
+      !sidecarConnected ||
+      !runtimeServicesReady ||
+      capabilitiesRequestExecutionMode.current === configDraft.execution_mode ||
+      capabilitiesAttemptedExecutionMode.current === configDraft.execution_mode ||
+      (lastCapabilitiesExecutionMode.current === configDraft.execution_mode &&
+        desktopCapabilities !== null &&
+        desktopCapabilitiesExecutionMode === configDraft.execution_mode)
+    ) {
+      return;
+    }
+    void refreshDesktopCapabilities(configDraft.execution_mode);
+  }, [
+    configDraft.execution_mode,
+    desktopCapabilities,
+    desktopCapabilitiesExecutionMode,
+    runtimeServicesReady,
+    sidecarConnected,
+  ]);
 
   useEffect(() => {
     mounted.current = true;
@@ -221,6 +308,16 @@ export function OpenEvoDesktop() {
     setWorkspaceReport(null);
     setBootstrapReport(null);
     setServicesReport(null);
+    capabilitiesRefreshGeneration.current += 1;
+    lastCapabilitiesExecutionMode.current = null;
+    capabilitiesRequestExecutionMode.current = null;
+    capabilitiesAttemptedExecutionMode.current = null;
+    setDesktopCapabilities(null);
+    setDesktopCapabilitiesExecutionMode(null);
+    setCapabilitiesLoading(false);
+    setCapabilitiesError(
+      "Remote capabilities unavailable until remote services are ready.",
+    );
   };
 
   const handleWorkspaceSync = async () => {
@@ -256,11 +353,17 @@ export function OpenEvoDesktop() {
   };
 
   const handleEvolutionTargetChange = (
-    target: { artifactType: string; methodId: string },
+    target: {
+      targetId: string;
+      artifactType: string;
+      methodId: string;
+      defaultConfig: OpenEvoProjectConfigDraft["evolution"]["targets"][string]["config"];
+      resetSelectionOnEnable: boolean;
+    },
     enabled: boolean,
   ) => {
     setConfigDraft((current) => {
-      const selection = current.evolution.targets[target.artifactType];
+      const selection = current.evolution.targets[target.targetId];
       if (!selection) {
         if (!enabled) {
           return current;
@@ -270,10 +373,10 @@ export function OpenEvoDesktop() {
           evolution: {
             targets: {
               ...current.evolution.targets,
-              [target.artifactType]: {
+              [target.targetId]: {
                 enabled: true,
                 method: target.methodId,
-                config: {},
+                config: target.defaultConfig,
               },
             },
           },
@@ -284,13 +387,19 @@ export function OpenEvoDesktop() {
         evolution: {
           targets: {
             ...current.evolution.targets,
-            [target.artifactType]: {
+            [target.targetId]: {
               ...selection,
               enabled,
               method:
-                enabled && selection.method === null
+                enabled &&
+                (selection.method === null || target.resetSelectionOnEnable)
                   ? target.methodId
                   : selection.method,
+              config:
+                enabled &&
+                (selection.method === null || target.resetSelectionOnEnable)
+                  ? target.defaultConfig
+                  : selection.config,
             },
           },
         },
@@ -349,7 +458,7 @@ export function OpenEvoDesktop() {
     try {
       const response = await saveOpenEvoProjectConfig(submittedDraft);
       setModel(response.status);
-      setConfigDraft(submittedDraft);
+      setConfigDraft(toDraftPayload(response.status));
       clearLifecycleReportsForContextChange();
       clearLatestRunForContextChange();
       setSidecarConnected(true);
@@ -423,6 +532,9 @@ export function OpenEvoDesktop() {
       setServicesReport(response.report);
       clearLatestRunForContextChange();
       setSidecarConnected(true);
+      if (backendIsReady(response.status)) {
+        await refreshDesktopCapabilities(response.status.execution.mode);
+      }
     } catch (error) {
       const message =
         error instanceof Error ? error.message : "Service startup failed";
@@ -435,6 +547,10 @@ export function OpenEvoDesktop() {
   const handleStartRun = async () => {
     if (lifecycleAuthError) {
       setRunError(lifecycleAuthError);
+      return;
+    }
+    if (runCapabilityBlockReason) {
+      setRunError(`Start Run unavailable: ${runCapabilityBlockReason}`);
       return;
     }
     invalidateRunPolling();
@@ -580,70 +696,78 @@ export function OpenEvoDesktop() {
             </span>
           </div>
         </div>
-        <div className="flex flex-wrap gap-2">
-          <CommandButton
-            icon={<Upload size={16} />}
-            label={workspaceRunning ? "Syncing" : "Sync Workspace"}
-            disabled={
-              !sidecarConnected ||
-              workspaceRunning ||
-              bootstrapRunning ||
-              servicesRunning ||
-              runRunning ||
-              configSaving ||
-              activatingConfigSlug !== null ||
-              lifecycleAuthError !== null
-            }
-            onClick={handleWorkspaceSync}
-          />
-          <CommandButton
-            icon={<RefreshCw size={16} />}
-            label={bootstrapRunning ? "Bootstrapping" : "Bootstrap"}
-            disabled={
-              !sidecarConnected ||
-              bootstrapRunning ||
-              workspaceRunning ||
-              servicesRunning ||
-              runRunning ||
-              configSaving ||
-              activatingConfigSlug !== null ||
-              lifecycleAuthError !== null
-            }
-            onClick={handleBootstrap}
-          />
-          <CommandButton
-            icon={<Activity size={16} />}
-            label={servicesRunning ? "Starting Services" : "Start Services"}
-            disabled={
-              !sidecarConnected ||
-              servicesRunning ||
-              workspaceRunning ||
-              bootstrapRunning ||
-              runRunning ||
-              configSaving ||
-              activatingConfigSlug !== null ||
-              !servicesPrerequisitesReady ||
-              lifecycleAuthError !== null
-            }
-            onClick={handleServices}
-          />
-          <CommandButton
-            icon={<Play size={16} />}
-            label={runRunning ? "Running" : "Start Run"}
-            primary
-            disabled={
-              !sidecarConnected ||
-              runRunning ||
-              workspaceRunning ||
-              bootstrapRunning ||
-              servicesRunning ||
-              !runtimeServicesReady ||
-              configSaving ||
-              activatingConfigSlug !== null ||
-              lifecycleAuthError !== null
-            }
-            onClick={handleStartRun}
-          />
+        <div>
+          <div className="flex flex-wrap gap-2">
+            <CommandButton
+              icon={<Upload size={16} />}
+              label={workspaceRunning ? "Syncing" : "Sync Workspace"}
+              disabled={
+                !sidecarConnected ||
+                workspaceRunning ||
+                bootstrapRunning ||
+                servicesRunning ||
+                runRunning ||
+                configSaving ||
+                activatingConfigSlug !== null ||
+                lifecycleAuthError !== null
+              }
+              onClick={handleWorkspaceSync}
+            />
+            <CommandButton
+              icon={<RefreshCw size={16} />}
+              label={bootstrapRunning ? "Bootstrapping" : "Bootstrap"}
+              disabled={
+                !sidecarConnected ||
+                bootstrapRunning ||
+                workspaceRunning ||
+                servicesRunning ||
+                runRunning ||
+                configSaving ||
+                activatingConfigSlug !== null ||
+                lifecycleAuthError !== null
+              }
+              onClick={handleBootstrap}
+            />
+            <CommandButton
+              icon={<Activity size={16} />}
+              label={servicesRunning ? "Starting Services" : "Start Services"}
+              disabled={
+                !sidecarConnected ||
+                servicesRunning ||
+                workspaceRunning ||
+                bootstrapRunning ||
+                runRunning ||
+                configSaving ||
+                activatingConfigSlug !== null ||
+                !servicesPrerequisitesReady ||
+                lifecycleAuthError !== null
+              }
+              onClick={handleServices}
+            />
+            <CommandButton
+              icon={<Play size={16} />}
+              label={runRunning ? "Running" : "Start Run"}
+              primary
+              disabled={
+                !sidecarConnected ||
+                runRunning ||
+                workspaceRunning ||
+                bootstrapRunning ||
+                servicesRunning ||
+                !runtimeServicesReady ||
+                configSaving ||
+                activatingConfigSlug !== null ||
+                lifecycleAuthError !== null ||
+                runCapabilityBlockReason !== null
+              }
+              onClick={handleStartRun}
+            />
+          </div>
+          {runtimeServicesReady && runCapabilityBlockReason ? (
+            <div className="mt-2 max-w-xl text-right text-xs text-rose-700">
+              Start Run unavailable: {runCapabilityBlockReason}
+            </div>
+          ) : null}
         </div>
       </section>
 
@@ -950,17 +1074,27 @@ export function OpenEvoDesktop() {
           ) : null}
           <div className="flex flex-wrap items-end gap-3 lg:col-span-4">
             {evolutionTargets.map((target) => (
-              <CheckboxInput
-                key={target.artifactType}
-                label={target.displayName}
-                checked={Boolean(
-                  configDraft.evolution.targets[target.artifactType]?.enabled,
-                )}
-                testId="evolution-target"
-                onChange={(checked) =>
-                  handleEvolutionTargetChange(target, checked)
-                }
-              />
+              <div key={target.targetId} className="space-y-1">
+                <CheckboxInput
+                  label={target.displayName}
+                  checked={Boolean(
+                    configDraft.evolution.targets[target.targetId]?.enabled,
+                  )}
+                  disabled={
+                    target.disabled &&
+                    !configDraft.evolution.targets[target.targetId]?.enabled
+                  }
+                  testId="evolution-target"
+                  onChange={(checked) =>
+                    handleEvolutionTargetChange(target, checked)
+                  }
+                />
+                {target.unavailableReason ? (
+                  <div className="max-w-72 text-xs text-rose-700">
+                    {target.unavailableReason}
+                  </div>
+                ) : null}
+              </div>
             ))}
             <CommandButton
               icon={<ShieldCheck size={16} />}
@@ -977,6 +1111,25 @@ export function OpenEvoDesktop() {
               onClick={handleSaveConfig}
             />
           </div>
+          {capabilitiesLoading ? (
+            <div className="text-sm text-slate-600 lg:col-span-4">
+              Loading remote capabilities...
+            </div>
+          ) : capabilitiesError ? (
+            <div className="flex flex-wrap items-center gap-2 text-sm text-amber-800 lg:col-span-4">
+              <span>{capabilitiesError}</span>
+              {runtimeServicesReady ? (
+                <CommandButton
+                  icon={<RefreshCw size={16} />}
+                  label="Retry Capabilities"
+                  disabled={capabilitiesLoading}
+                  onClick={() =>
+                    void refreshDesktopCapabilities(configDraft.execution_mode)
+                  }
+                />
+              ) : null}
+            </div>
+          ) : null}
           {configError ? (
             <div className="rounded-md border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-900 lg:col-span-4">
               {configError}
@@ -1666,67 +1819,210 @@ function stringValue(value: unknown): string | null {
 
 function desktopEvolutionTargets(
   capabilities: OpenEvoDesktopCapabilities | null,
-  executionMode: OpenEvoProjectConfigDraft["execution_mode"],
+  selections: OpenEvoProjectConfigDraft["evolution"]["targets"],
 ) {
   if (!capabilities) {
-    return [];
+    return Object.entries(selections)
+      .filter(([, selection]) => selection.enabled)
+      .map(([targetId, selection]) => ({
+        targetId,
+        artifactType: targetId,
+        methodId: selection.method ?? "",
+        defaultConfig: selection.config,
+        displayName: sentenceCase(targetId.replaceAll("_", " ")),
+        disabled: true,
+        resetSelectionOnEnable: false,
+        unavailableReason: null,
+      }));
   }
-  const displayNames = artifactTargetDisplayNames(capabilities);
-  return capabilities.evolutionMethods
-    .filter(
-      (method) =>
-        method.visibleInDesktop &&
-        method.supportedExecutionModes.includes(executionMode),
-    )
-    .map((method) => ({
-      artifactType: method.artifactType,
-      methodId: method.methodId,
-      displayName:
-        displayNames[method.artifactType] ?? sentenceCase(method.displayName),
-    }))
-    .filter(
-      (target): target is {
-        artifactType: "text_memory" | "skill_bundle" | "agent_system";
-        methodId: string;
-        displayName: string;
-      } => configKeyForArtifactType(target.artifactType) !== null,
+
+  const targets = capabilities.targets.map((target) => {
+    const effectiveMethod = target.methods.find(
+      (method) => method.methodId === target.effectiveDefaultMethodId,
     );
+    const supportedEffectiveMethod =
+      effectiveMethod?.support.overall === "supported" ? effectiveMethod : null;
+    const selection = selections[target.targetId];
+    const selectedAcceptedMethod = target.acceptedMethods.find(
+      (method) => method.methodId === selection?.method,
+    );
+    const selectedResolver = target.selectionResolvers.find(
+      (resolver) => resolver.selectionValue === selection?.method,
+    );
+    const supportedSelectedResolver =
+      selectedResolver &&
+      selectedResolver.resolvedMethods.every(
+        (method) => method.support.overall === "supported",
+      )
+        ? selectedResolver
+        : null;
+    const supportedSelectedMethod =
+      selectedAcceptedMethod?.support.overall === "supported"
+        ? selectedAcceptedMethod
+        : null;
+    const supportedSelection =
+      supportedSelectedMethod !== null || supportedSelectedResolver !== null;
+    const selectedMethodUnavailable =
+      selection?.method !== null &&
+      selection?.method !== undefined &&
+      supportedSelectedMethod === null &&
+      supportedSelectedResolver === null;
+    const enabledReason = selection?.enabled
+      ? selectedEvolutionTargetFailureReason(target, selection.method)
+      : null;
+    return {
+      targetId: target.targetId,
+      artifactType: target.artifactType,
+      methodId:
+        supportedSelectedResolver?.selectionValue ??
+        supportedSelectedMethod?.methodId ??
+        supportedEffectiveMethod?.methodId ??
+        target.configuredDefaultMethodId,
+      defaultConfig:
+        supportedSelection && selection
+          ? selection.config
+          : (supportedEffectiveMethod?.defaultConfig ?? {}),
+      displayName: sentenceCase(target.displayName),
+      disabled: !supportedSelection && supportedEffectiveMethod === null,
+      resetSelectionOnEnable:
+        selection?.method === null || selectedMethodUnavailable,
+      unavailableReason:
+        enabledReason ??
+        (!supportedSelection && supportedEffectiveMethod === null
+          ? capabilityFailureReason(target.configuredDefaultSupport)
+          : null),
+    };
+  });
+
+  const remoteTargetIds = new Set(targets.map((target) => target.targetId));
+  for (const [targetId, selection] of Object.entries(selections)) {
+    if (!selection.enabled || remoteTargetIds.has(targetId)) {
+      continue;
+    }
+    targets.push({
+      targetId,
+      artifactType: targetId,
+      methodId: selection.method ?? "",
+      defaultConfig: {},
+      displayName: sentenceCase(targetId.replaceAll("_", " ")),
+      disabled: true,
+      resetSelectionOnEnable: true,
+      unavailableReason: `Target "${targetId}" is no longer available in the remote registry. Disable it to repair the saved configuration.`,
+    });
+  }
+  return targets;
+}
+
+function selectedEvolutionTargetFailureReason(
+  target: OpenEvoDesktopCapabilities["targets"][number],
+  methodId: string | null,
+): string | null {
+  if (methodId === null) {
+    return `Target "${target.targetId}" has no selected method.`;
+  }
+  const method = target.acceptedMethods.find(
+    (candidate) => candidate.methodId === methodId,
+  );
+  const resolver = target.selectionResolvers.find(
+    (candidate) => candidate.selectionValue === methodId,
+  );
+  if (resolver) {
+    const unsupported = resolver.resolvedMethods.find(
+      (candidate) => candidate.support.overall !== "supported",
+    );
+    return unsupported
+      ? `Selection resolver "${methodId}" is unsupported by the current remote profile. ${capabilityFailureReason(unsupported.support)}`
+      : null;
+  }
+  if (!method) {
+    return `Selected method "${methodId}" is no longer available for target "${target.targetId}" in the remote registry.`;
+  }
+  if (method.support.overall !== "supported") {
+    return `Selected method "${methodId}" is unsupported by the current remote profile. ${capabilityFailureReason(method.support)}`;
+  }
+  return null;
+}
+
+function capabilityRunBlockReason(
+  loading: boolean,
+  error: string | null,
+  capabilities: OpenEvoDesktopCapabilities | null,
+  selections: OpenEvoProjectConfigDraft["evolution"]["targets"],
+): string | null {
+  if (loading) {
+    return "remote capabilities are still loading.";
+  }
+  if (error) {
+    return error;
+  }
+  if (!capabilities) {
+    return "Remote capabilities are unavailable.";
+  }
+  const targetsById = new Map(
+    capabilities.targets.map((target) => [target.targetId, target]),
+  );
+  for (const [targetId, selection] of Object.entries(selections)) {
+    if (!selection.enabled) {
+      continue;
+    }
+    const target = targetsById.get(targetId);
+    if (!target) {
+      return `enabled target "${targetId}" is not available in the remote registry.`;
+    }
+    const reason = selectedEvolutionTargetFailureReason(target, selection.method);
+    if (reason) {
+      return reason;
+    }
+  }
+  return null;
+}
+
+function capabilityFailureReason(
+  support: OpenEvoDesktopCapabilities["targets"][number]["configuredDefaultSupport"],
+): string {
+  const messages = [
+    support.execution,
+    support.capture,
+    support.harness,
+    support.runtime,
+  ]
+    .filter((axis) => axis.state !== "supported")
+    .map((axis) => axis.message);
+  return messages.join(" ") || "The configured default method is unavailable.";
+}
+
+function projectConfigDraftsEqual(
+  left: OpenEvoProjectConfigDraft,
+  right: OpenEvoProjectConfigDraft,
+): boolean {
+  return (
+    JSON.stringify(sortedJsonValue(left)) ===
+    JSON.stringify(sortedJsonValue(right))
+  );
+}
+
+function sortedJsonValue(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map(sortedJsonValue);
+  }
+  if (typeof value === "object" && value !== null) {
+    return Object.fromEntries(
+      Object.entries(value)
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([key, item]) => [key, sortedJsonValue(item)]),
+    );
+  }
+  return value;
 }
 
 function artifactTargetDisplayNames(
   capabilities: OpenEvoDesktopCapabilities | null,
 ): Record<string, string> {
   const displayNames: Record<string, string> = {};
-  for (const target of capabilities?.artifactTargets ?? []) {
-    if (target.visibleInDesktop) {
-      displayNames[target.artifactType] = sentenceCase(target.displayName);
-    }
-  }
-  for (const method of capabilities?.evolutionMethods ?? []) {
-    if (
-      method.visibleInDesktop &&
-      !displayNames[method.artifactType] &&
-      configKeyForArtifactType(method.artifactType)
-    ) {
-      displayNames[method.artifactType] = sentenceCase(
-        prettyArtifactType(method.artifactType),
-      );
-    }
+  for (const target of capabilities?.targets ?? []) {
+    displayNames[target.artifactType] = sentenceCase(target.displayName);
   }
   return displayNames;
-}
-
-function configKeyForArtifactType(
-  artifactType: string,
-): "text_memory" | "skill_bundle" | "agent_system" | null {
-  if (
-    artifactType === "text_memory" ||
-    artifactType === "skill_bundle" ||
-    artifactType === "agent_system"
-  ) {
-    return artifactType;
-  }
-  return null;
 }
 
 function firstDisplayArtifactId(
@@ -1855,11 +2151,13 @@ function SelectInput({
 function CheckboxInput({
   label,
   checked,
+  disabled = false,
   testId,
   onChange,
 }: {
   label: string;
   checked: boolean;
+  disabled?: boolean;
   testId?: string;
   onChange: (checked: boolean) => void;
 }) {
@@ -1872,6 +2170,7 @@ function CheckboxInput({
         aria-label={label}
         type="checkbox"
         checked={checked}
+        disabled={disabled}
         onChange={(event) => onChange(event.target.checked)}
       />
       <span>{label}</span>
@@ -1908,6 +2207,12 @@ function unsupportedLifecycleAuthMessage(
     );
   }
   return null;
+}
+
+function backendIsReady(model: OpenEvoDesktopShellModel): boolean {
+  return model.services.some(
+    (service) => service.id === "openevo-backend" && service.state === "ready",
+  );
 }
 
 function StatusBadge({ state }: { state: RemoteServiceState }) {

@@ -517,6 +517,27 @@ class EvolutionFrameworkRegistry:
                 raise ValueError(
                     f"target {target.id!r} default method is hidden from its audience"
                 )
+            target_method_ids = {
+                method.id for method in methods.values() if method.target_id == target.id
+            }
+            for resolver in target.selection_resolvers:
+                if resolver.selection_value in target_method_ids:
+                    raise ValueError(
+                        f"target {target.id!r} selection resolver shadows a method ID"
+                    )
+                for method_id in resolver.resolved_method_ids:
+                    try:
+                        resolved_method = methods[method_id]
+                    except KeyError as exc:
+                        raise ValueError(
+                            f"target {target.id!r} selection resolver references "
+                            f"unknown method {method_id!r}"
+                        ) from exc
+                    if resolved_method.target_id != target.id:
+                        raise ValueError(
+                            f"target {target.id!r} selection resolver method belongs "
+                            "to another target"
+                        )
 
     def _register_typed(
         self,

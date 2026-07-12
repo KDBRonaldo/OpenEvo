@@ -7,7 +7,7 @@ and handler entry points are identity anchors until their A2.4 runtime cutover.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any
 
@@ -32,6 +32,7 @@ from .contracts import (
 )
 from .descriptors import (
     EvolutionMethodDescriptor,
+    EvolutionSelectionResolverDescriptor,
     EvolutionTargetDescriptor,
     TargetHandlerDescriptor,
 )
@@ -90,13 +91,23 @@ class ImplementationDistributionIdentity(_Contract):
         )
 
 
-@dataclass(frozen=True, slots=True)
+_VERIFIED_REGISTRY_SEAL = object()
+
+
+@dataclass(frozen=True, slots=True, init=False)
 class VerifiedExecutableRegistry:
     """Frozen catalog plus the exact handles proven against its distribution."""
 
     snapshot: RegistrySnapshot
     method_handles: Mapping[str, EvolutionMethodHandle]
     descriptor_anchors: Mapping[str, DescriptorImplementationAnchor]
+    distribution_attestations: Mapping[str, VerifiedDistribution]
+    _verification_seal: object = field(repr=False, compare=False)
+
+    def __new__(cls, *_args: object, **_kwargs: object) -> VerifiedExecutableRegistry:
+        raise TypeError(
+            "VerifiedExecutableRegistry is issued only by a verified registry loader"
+        )
 
     def __post_init__(self) -> None:
         expected_methods = set(self.snapshot.methods)
@@ -104,6 +115,64 @@ class VerifiedExecutableRegistry:
             raise ValueError("executable method handles do not match the frozen registry")
         if any(not callable(handle) for handle in self.method_handles.values()):
             raise TypeError("executable method handles must be callable")
+
+        attestations = dict(self.distribution_attestations)
+        for digest, attestation in attestations.items():
+            if digest != attestation.expectation.distribution_digest:
+                raise ValueError("distribution attestation key does not match its digest")
+        expected_distribution_digests = {
+            identity.implementation.distribution_digest
+            for identity in self.snapshot.identities.values()
+        }
+        if not expected_distribution_digests.issubset(attestations):
+            raise ValueError(
+                "registry implementation is missing a distribution attestation"
+            )
+        if set(attestations) != expected_distribution_digests:
+            raise ValueError(
+                "distribution attestations do not match the frozen registry"
+            )
+        for identity in self.snapshot.identities.values():
+            implementation = identity.implementation
+            attestation = attestations.get(implementation.distribution_digest)
+            if attestation is None:
+                raise ValueError(
+                    "registry implementation is missing a distribution attestation"
+                )
+            expectation = attestation.expectation
+            if (
+                expectation.distribution != implementation.distribution
+                or expectation.distribution_version
+                != implementation.distribution_version
+                or expectation.distribution_digest
+                != implementation.distribution_digest
+            ):
+                raise ValueError(
+                    "registry implementation does not match its distribution attestation"
+                )
+
+        expected_anchors = {
+            f"{kind.value}:{descriptor_id}": (kind, descriptor_id)
+            for kind, descriptors in (
+                (DescriptorKind.TARGET, self.snapshot.targets),
+                (DescriptorKind.TARGET_HANDLER, self.snapshot.target_handlers),
+            )
+            for descriptor_id in descriptors
+        }
+        if set(self.descriptor_anchors) != set(expected_anchors):
+            raise ValueError(
+                "descriptor anchors do not match the frozen target and handler registry"
+            )
+        for key, (kind, descriptor_id) in expected_anchors.items():
+            anchor = self.descriptor_anchors[key]
+            if (
+                anchor.descriptor_kind is not kind
+                or anchor.descriptor_id != descriptor_id
+            ):
+                raise ValueError(
+                    "descriptor anchor identity does not match its registry key"
+                )
+
         object.__setattr__(
             self,
             "method_handles",
@@ -114,6 +183,47 @@ class VerifiedExecutableRegistry:
             "descriptor_anchors",
             MappingProxyType(dict(self.descriptor_anchors)),
         )
+        object.__setattr__(
+            self,
+            "distribution_attestations",
+            MappingProxyType(attestations),
+        )
+
+
+def _publish_verified_executable_registry(
+    *,
+    snapshot: RegistrySnapshot,
+    method_handles: Mapping[str, EvolutionMethodHandle],
+    descriptor_anchors: Mapping[str, DescriptorImplementationAnchor],
+    distribution_attestations: Mapping[str, VerifiedDistribution],
+) -> VerifiedExecutableRegistry:
+    registry = object.__new__(VerifiedExecutableRegistry)
+    object.__setattr__(registry, "snapshot", snapshot)
+    object.__setattr__(registry, "method_handles", method_handles)
+    object.__setattr__(registry, "descriptor_anchors", descriptor_anchors)
+    object.__setattr__(
+        registry,
+        "distribution_attestations",
+        distribution_attestations,
+    )
+    object.__setattr__(registry, "_verification_seal", _VERIFIED_REGISTRY_SEAL)
+    registry.__post_init__()
+    return registry
+
+
+def require_verified_executable_registry(
+    registry: VerifiedExecutableRegistry,
+) -> VerifiedExecutableRegistry:
+    """Reject executable registries not published by the verified loader."""
+
+    if (
+        type(registry) is not VerifiedExecutableRegistry
+        or getattr(registry, "_verification_seal", None) is not _VERIFIED_REGISTRY_SEAL
+    ):
+        raise TypeError(
+            "executable registry was not issued by a verified registry loader"
+        )
+    return registry
 
 
 text_memory_target_anchor = DescriptorImplementationAnchor(
@@ -332,6 +442,24 @@ def _target_descriptors(
             handler_id=handler_id,
             renderer_kind=renderer,
             default_method_id=default_method,
+            selection_resolvers=(
+                (
+                    EvolutionSelectionResolverDescriptor(
+                        selection_value="auto",
+                        display_name="Automatic",
+                        description=(
+                            "Select the agent-system reflector from prior-round "
+                            "dataset availability."
+                        ),
+                        resolved_method_ids=(
+                            "agent_system_reflector",
+                            "agent_system_history_reflector",
+                        ),
+                    ),
+                )
+                if target_id == "agent_system"
+                else ()
+            ),
             context_order=context_order,
             exposure=exposure,
             maturity=Maturity.EXPERIMENTAL,
@@ -770,8 +898,6 @@ def load_builtin_method_handles(
 
 def load_verified_builtin_registry(
     verified: VerifiedDistribution,
-    *,
-    entry_point_loader: Callable[..., object] = load_verified_entry_point,
 ) -> VerifiedExecutableRegistry:
     """Build the catalog and verify every built-in entry point before use."""
 
@@ -790,7 +916,7 @@ def load_verified_builtin_registry(
     ):
         for descriptor_id in descriptors:
             implementation_identity = snapshot.identity_for(kind, descriptor_id)
-            loaded = entry_point_loader(
+            loaded = load_verified_entry_point(
                 implementation_identity.implementation,
                 verified,
                 expected_kind=kind,
@@ -804,7 +930,7 @@ def load_verified_builtin_registry(
 
     method_handles = load_builtin_method_handles(
         snapshot,
-        verified_loader=lambda implementation_identity: entry_point_loader(
+        verified_loader=lambda implementation_identity: load_verified_entry_point(
             implementation_identity.implementation,
             verified,
             expected_kind=DescriptorKind.METHOD,
@@ -814,10 +940,13 @@ def load_verified_builtin_registry(
             ].invocation_abi,
         ),
     )
-    return VerifiedExecutableRegistry(
+    return _publish_verified_executable_registry(
         snapshot=snapshot,
         method_handles=method_handles,
         descriptor_anchors=MappingProxyType(anchors),
+        distribution_attestations={
+            verified.expectation.distribution_digest: verified,
+        },
     )
 
 
@@ -830,6 +959,7 @@ __all__ = [
     "build_builtin_registry",
     "load_builtin_method_handles",
     "load_verified_builtin_registry",
+    "require_verified_executable_registry",
     "parametric_memory_handler_anchor",
     "parametric_memory_target_anchor",
     "skill_bundle_handler_anchor",

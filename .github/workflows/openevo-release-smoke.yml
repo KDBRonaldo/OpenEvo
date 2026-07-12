@@ -1,4 +1,4 @@
-name: OpenEvo installed Core + source Desktop outer smoke
+name: OpenEvo packaged sidecar + installed Core release smoke
 
 on:
   pull_request:
@@ -23,7 +23,7 @@ on:
 
 jobs:
   wheel-smoke:
-    name: installed Core + source Desktop harness
+    name: packaged sidecar + installed Core + source outer harness
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -40,6 +40,7 @@ jobs:
           npm ci
           npm audit --audit-level=high
           npm test -- --run
+          npm run typecheck
           npm run build:openevo
 
       - name: Check packaged Desktop assets are current
@@ -97,6 +98,7 @@ jobs:
 
       - name: Smoke exact remote Core wheel
         run: |
+          sidecar="desktop/src-tauri/binaries/openevo-desktop-sidecar-$(rustc --print host-tuple)"
           python -m venv .openevo-remote-wheel-smoke
           .openevo-remote-wheel-smoke/bin/python -m pip install --upgrade pip
           .openevo-remote-wheel-smoke/bin/python -m pip install .openevo-remote-wheel/*.whl
@@ -104,6 +106,10 @@ jobs:
           .openevo-remote-wheel-smoke/bin/openevo-backend serve --help
           .openevo-remote-wheel-smoke/bin/openevo-backend run --help
           PYTHONPATH= .openevo-remote-wheel-smoke/bin/python scripts/ci/smoke_evolution_framework_wheel.py --wheel .openevo-remote-wheel/*.whl
+          PYTHONPATH= .openevo-remote-wheel-smoke/bin/python scripts/ci/smoke_openevo_remote_capabilities.py \
+            --wheel .openevo-remote-wheel/*.whl \
+            --sidecar "$sidecar" \
+            --timeout-seconds 60
 
       - name: Smoke installed Core with source Desktop harness
         run: |

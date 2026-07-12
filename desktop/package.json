@@ -12,7 +12,8 @@
     "build:sidecar": "python packaging/build_sidecar.py",
     "build:desktop": "npm run build:sidecar && npm run tauri:build",
     "preview": "vite preview",
-    "test": "vitest"
+    "test": "vitest",
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "@microsoft/fetch-event-source": "^2.0.1",

@@ -1,6 +1,7 @@
 import { api } from "./client";
 import type {
   EvolutionStepState,
+  OpenEvoJsonObject,
   OpenEvoExecutionModePayload,
   OpenEvoDesktopShellModel,
   OpenEvoProjectConfigDraftPayload,
@@ -18,24 +19,90 @@ export type OpenEvoExecutionMode =
   | "codex_subscription_transcript"
   | "self-deployed";
 
-export interface EvolutionMethodCapability {
-  method_id: string;
-  display_name: string;
-  artifact_type:
-    | "text_memory"
-    | "skill_bundle"
-    | "agent_system"
-    | "parametric_memory";
-  supported_execution_modes: OpenEvoExecutionMode[];
-  visible_in_desktop: boolean;
-  stability_level: "stable" | "experimental" | "internal";
+export type OpenEvoCapabilitySupportState =
+  | "supported"
+  | "unsupported"
+  | "unavailable";
+
+export interface OpenEvoCapabilityAxisSupportPayload {
+  state: OpenEvoCapabilitySupportState;
+  reason_code: string | null;
+  message: string;
+  missing_requirements: string[];
 }
 
-export interface OpenEvoArtifactTargetCapability {
-  artifact_type: EvolutionMethodCapability["artifact_type"];
+export interface OpenEvoCapabilityMethodSupportPayload {
+  overall: OpenEvoCapabilitySupportState;
+  execution: OpenEvoCapabilityAxisSupportPayload;
+  capture: OpenEvoCapabilityAxisSupportPayload;
+  harness: OpenEvoCapabilityAxisSupportPayload;
+  runtime: OpenEvoCapabilityAxisSupportPayload;
+}
+
+export interface OpenEvoCapabilityInputBindingPayload {
+  binding_id: string;
+  source:
+    | "current_dataset"
+    | "history_datasets"
+    | "current_target_artifacts"
+    | "explicit_inputs";
+  artifact_type: string;
+  min_count: number;
+  max_count: number | null;
+}
+
+export interface EvolutionMethodCapabilityPayload {
+  method_id: string;
   display_name: string;
-  visible_in_desktop: boolean;
-  stability_level: "stable" | "experimental" | "internal";
+  description: string;
+  exposure: "desktop" | "maintainer" | "internal";
+  maturity: "stable" | "experimental";
+  execution_modes: Array<"subscription" | "self_deployed">;
+  capture_modes: Array<"transcript" | "token_level">;
+  supported_harness_ids: string[];
+  harness_requirements: string[];
+  runtime_requirements: string[];
+  input_bindings: OpenEvoCapabilityInputBindingPayload[];
+  output_artifact_types: string[];
+  config_schema_json: string;
+  default_config_json: string;
+  implementation_identity_digest: string;
+  support: OpenEvoCapabilityMethodSupportPayload;
+}
+
+export interface OpenEvoResolvedMethodCapabilityPayload {
+  method_id: string;
+  implementation_identity_digest: string;
+  support: OpenEvoCapabilityMethodSupportPayload;
+}
+
+export interface OpenEvoSelectionResolverCapabilityPayload {
+  selection_value: string;
+  display_name: string;
+  description: string;
+  resolved_methods: OpenEvoResolvedMethodCapabilityPayload[];
+}
+
+export interface OpenEvoArtifactTargetCapabilityPayload {
+  target_id: string;
+  display_name: string;
+  description: string;
+  artifact_type: string;
+  exposure: "desktop" | "maintainer" | "internal";
+  maturity: "stable" | "experimental";
+  handler_id: string;
+  configured_default_method_id: string;
+  effective_default_method_id: string | null;
+  configured_default_support: OpenEvoCapabilityMethodSupportPayload;
+  renderer_kind: "markdown" | "file_bundle" | "structured_summary" | "adapter";
+  renderer_contract_version: string;
+  contribution_contract_version: string;
+  context_order: number;
+  implementation_identity_digest: string;
+  handler_identity_digest: string;
+  accepted_methods: OpenEvoResolvedMethodCapabilityPayload[];
+  selection_resolvers: OpenEvoSelectionResolverCapabilityPayload[];
+  methods: EvolutionMethodCapabilityPayload[];
 }
 
 export interface OpenEvoDesktopShellStatusPayload {
@@ -247,25 +314,108 @@ export interface OpenEvoRunArtifactsPayload {
 }
 
 export interface OpenEvoDesktopCapabilitiesPayload {
-  artifact_targets: OpenEvoArtifactTargetCapability[];
-  evolution_methods: EvolutionMethodCapability[];
+  schema_version: "1";
+  core_version: string;
+  registry_digest: string;
+  evaluated_profile: {
+    execution_mode: "subscription" | "self_deployed";
+    capture_mode: "transcript" | "token_level";
+    harness_id: string;
+    harness_capabilities: string[];
+    runtime_capabilities: string[];
+  };
+  targets: OpenEvoArtifactTargetCapabilityPayload[];
+}
+
+export interface OpenEvoCapabilityAxisSupport {
+  state: OpenEvoCapabilitySupportState;
+  reasonCode: string | null;
+  message: string;
+  missingRequirements: string[];
+}
+
+export interface OpenEvoCapabilityMethodSupport {
+  overall: OpenEvoCapabilitySupportState;
+  execution: OpenEvoCapabilityAxisSupport;
+  capture: OpenEvoCapabilityAxisSupport;
+  harness: OpenEvoCapabilityAxisSupport;
+  runtime: OpenEvoCapabilityAxisSupport;
+}
+
+export interface OpenEvoEvolutionMethodCapability {
+  methodId: string;
+  displayName: string;
+  description: string;
+  exposure: EvolutionMethodCapabilityPayload["exposure"];
+  maturity: EvolutionMethodCapabilityPayload["maturity"];
+  executionModes: EvolutionMethodCapabilityPayload["execution_modes"];
+  captureModes: EvolutionMethodCapabilityPayload["capture_modes"];
+  supportedHarnessIds: string[];
+  harnessRequirements: string[];
+  runtimeRequirements: string[];
+  inputBindings: Array<{
+    bindingId: string;
+    source: OpenEvoCapabilityInputBindingPayload["source"];
+    artifactType: string;
+    minCount: number;
+    maxCount: number | null;
+  }>;
+  outputArtifactTypes: string[];
+  configSchemaJson: string;
+  defaultConfigJson: string;
+  configSchema: OpenEvoJsonObject;
+  defaultConfig: OpenEvoJsonObject;
+  implementationIdentityDigest: string;
+  support: OpenEvoCapabilityMethodSupport;
+}
+
+export interface OpenEvoEvolutionTargetCapability {
+  targetId: string;
+  displayName: string;
+  description: string;
+  artifactType: string;
+  exposure: OpenEvoArtifactTargetCapabilityPayload["exposure"];
+  maturity: OpenEvoArtifactTargetCapabilityPayload["maturity"];
+  handlerId: string;
+  configuredDefaultMethodId: string;
+  effectiveDefaultMethodId: string | null;
+  configuredDefaultSupport: OpenEvoCapabilityMethodSupport;
+  rendererKind: OpenEvoArtifactTargetCapabilityPayload["renderer_kind"];
+  rendererContractVersion: string;
+  contributionContractVersion: string;
+  contextOrder: number;
+  implementationIdentityDigest: string;
+  handlerIdentityDigest: string;
+  acceptedMethods: Array<{
+    methodId: string;
+    implementationIdentityDigest: string;
+    support: OpenEvoCapabilityMethodSupport;
+  }>;
+  selectionResolvers: Array<{
+    selectionValue: string;
+    displayName: string;
+    description: string;
+    resolvedMethods: Array<{
+      methodId: string;
+      implementationIdentityDigest: string;
+      support: OpenEvoCapabilityMethodSupport;
+    }>;
+  }>;
+  methods: OpenEvoEvolutionMethodCapability[];
 }
 
 export interface OpenEvoDesktopCapabilities {
-  artifactTargets: Array<{
-    artifactType: OpenEvoArtifactTargetCapability["artifact_type"];
-    displayName: string;
-    visibleInDesktop: boolean;
-    stabilityLevel: OpenEvoArtifactTargetCapability["stability_level"];
-  }>;
-  evolutionMethods: Array<{
-    methodId: string;
-    displayName: string;
-    artifactType: EvolutionMethodCapability["artifact_type"];
-    supportedExecutionModes: OpenEvoExecutionMode[];
-    visibleInDesktop: boolean;
-    stabilityLevel: EvolutionMethodCapability["stability_level"];
-  }>;
+  schemaVersion: "1";
+  coreVersion: string;
+  registryDigest: string;
+  evaluatedProfile: {
+    executionMode: OpenEvoDesktopCapabilitiesPayload["evaluated_profile"]["execution_mode"];
+    captureMode: OpenEvoDesktopCapabilitiesPayload["evaluated_profile"]["capture_mode"];
+    harnessId: string;
+    harnessCapabilities: string[];
+    runtimeCapabilities: string[];
+  };
+  targets: OpenEvoEvolutionTargetCapability[];
 }
 
 export interface OpenEvoArtifactContentPayload {
@@ -555,9 +705,15 @@ export async function fetchOpenEvoBackendRunArtifacts(
   return payload.map(toOpenEvoBackendArtifactSummary);
 }
 
-export async function fetchOpenEvoDesktopCapabilities(): Promise<OpenEvoDesktopCapabilities> {
+export async function fetchOpenEvoDesktopCapabilities(
+  executionMode: OpenEvoExecutionMode,
+): Promise<OpenEvoDesktopCapabilities> {
+  const headers = sidecarMutationToken
+    ? { [sidecarMutationTokenHeader]: sidecarMutationToken }
+    : undefined;
   const payload = await api.get<OpenEvoDesktopCapabilitiesPayload>(
-    "/openevo-api/desktop/capabilities",
+    `/openevo-api/desktop/capabilities?execution_mode=${encodeURIComponent(executionMode)}`,
+    headers,
   );
   return toOpenEvoDesktopCapabilities(payload);
 }
@@ -650,21 +806,122 @@ export function toOpenEvoDesktopCapabilities(
   payload: OpenEvoDesktopCapabilitiesPayload,
 ): OpenEvoDesktopCapabilities {
   return {
-    artifactTargets: payload.artifact_targets.map((target) => ({
+    schemaVersion: payload.schema_version,
+    coreVersion: payload.core_version,
+    registryDigest: payload.registry_digest,
+    evaluatedProfile: {
+      executionMode: payload.evaluated_profile.execution_mode,
+      captureMode: payload.evaluated_profile.capture_mode,
+      harnessId: payload.evaluated_profile.harness_id,
+      harnessCapabilities: payload.evaluated_profile.harness_capabilities,
+      runtimeCapabilities: payload.evaluated_profile.runtime_capabilities,
+    },
+    targets: payload.targets.map((target) => ({
+      targetId: target.target_id,
       artifactType: target.artifact_type,
       displayName: target.display_name,
-      visibleInDesktop: target.visible_in_desktop,
-      stabilityLevel: target.stability_level,
-    })),
-    evolutionMethods: payload.evolution_methods.map((method) => ({
-      methodId: method.method_id,
-      displayName: method.display_name,
-      artifactType: method.artifact_type,
-      supportedExecutionModes: method.supported_execution_modes,
-      visibleInDesktop: method.visible_in_desktop,
-      stabilityLevel: method.stability_level,
+      description: target.description,
+      exposure: target.exposure,
+      maturity: target.maturity,
+      handlerId: target.handler_id,
+      configuredDefaultMethodId: target.configured_default_method_id,
+      effectiveDefaultMethodId: target.effective_default_method_id,
+      configuredDefaultSupport: toCapabilitySupport(
+        target.configured_default_support,
+      ),
+      rendererKind: target.renderer_kind,
+      rendererContractVersion: target.renderer_contract_version,
+      contributionContractVersion: target.contribution_contract_version,
+      contextOrder: target.context_order,
+      implementationIdentityDigest: target.implementation_identity_digest,
+      handlerIdentityDigest: target.handler_identity_digest,
+      acceptedMethods: target.accepted_methods.map((method) => ({
+        methodId: method.method_id,
+        implementationIdentityDigest: method.implementation_identity_digest,
+        support: toCapabilitySupport(method.support),
+      })),
+      selectionResolvers: target.selection_resolvers.map((resolver) => ({
+        selectionValue: resolver.selection_value,
+        displayName: resolver.display_name,
+        description: resolver.description,
+        resolvedMethods: resolver.resolved_methods.map((method) => ({
+          methodId: method.method_id,
+          implementationIdentityDigest: method.implementation_identity_digest,
+          support: toCapabilitySupport(method.support),
+        })),
+      })),
+      methods: target.methods.map((method) => ({
+        methodId: method.method_id,
+        displayName: method.display_name,
+        description: method.description,
+        exposure: method.exposure,
+        maturity: method.maturity,
+        executionModes: method.execution_modes,
+        captureModes: method.capture_modes,
+        supportedHarnessIds: method.supported_harness_ids,
+        harnessRequirements: method.harness_requirements,
+        runtimeRequirements: method.runtime_requirements,
+        inputBindings: method.input_bindings.map((binding) => ({
+          bindingId: binding.binding_id,
+          source: binding.source,
+          artifactType: binding.artifact_type,
+          minCount: binding.min_count,
+          maxCount: binding.max_count,
+        })),
+        outputArtifactTypes: method.output_artifact_types,
+        configSchemaJson: method.config_schema_json,
+        defaultConfigJson: method.default_config_json,
+        configSchema: parseCanonicalJsonObject(
+          method.config_schema_json,
+          "config_schema_json",
+        ),
+        defaultConfig: parseCanonicalJsonObject(
+          method.default_config_json,
+          "default_config_json",
+        ),
+        implementationIdentityDigest: method.implementation_identity_digest,
+        support: toCapabilitySupport(method.support),
+      })),
     })),
   };
+}
+
+function toCapabilitySupport(
+  support: OpenEvoCapabilityMethodSupportPayload,
+): OpenEvoCapabilityMethodSupport {
+  const axis = (value: OpenEvoCapabilityAxisSupportPayload) => ({
+    state: value.state,
+    reasonCode: value.reason_code,
+    message: value.message,
+    missingRequirements: value.missing_requirements,
+  });
+  return {
+    overall: support.overall,
+    execution: axis(support.execution),
+    capture: axis(support.capture),
+    harness: axis(support.harness),
+    runtime: axis(support.runtime),
+  };
+}
+
+function parseCanonicalJsonObject(
+  encoded: string,
+  field: string,
+): OpenEvoJsonObject {
+  let value: unknown;
+  try {
+    value = JSON.parse(encoded);
+  } catch {
+    throw new Error(`${field} must contain canonical JSON`);
+  }
+  if (!isJsonObject(value)) {
+    throw new Error(`${field} must contain canonical JSON`);
+  }
+  return value;
+}
+
+function isJsonObject(value: unknown): value is OpenEvoJsonObject {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 export function toOpenEvoArtifactContent(

@@ -91,8 +91,8 @@ Execute this migration in the following order:
 A2.3 is implemented as reviewable repository slices, not separate product versions:
 1. Implemented: migrate callers to sole `evolution.targets`; preserve order and resolve `auto` from the pre-round dataset snapshot.
 2. Implemented: load one verified executable registry; persist plan/job identity, filter methods, validate envelopes, and renew leases.
-3. Next: project capabilities from that registry and make sidecar proxy remote Core without local fallback.
-Each PR uses `Part of` until A2.3 closes and introduces no dual schema, scheduler, fallback registry, or algorithm change.
+3. Implemented: project versioned capabilities from that registry and proxy remote Core without a local catalog fallback.
+A2.3 adds no dual scheduler, fallback registry, or algorithm change. A2.4/A2.5 own generic handler/runtime integration, capability-driven Desktop configuration, and removal of remaining target-specific switches.
 
 A2 completion acceptance:
 
@@ -393,19 +393,17 @@ independently review:
 
 ## Immediate Execution Order
 
-Continue from the implemented A1/A2.1/A2.2 and first two A2.3 slices:
+Continue from the implemented A1 through A2.3:
 
-1. Finish A2.3 with registry-derived remote Core capabilities and a sidecar
-   proxy that has no local catalog fallback.
-2. Complete A2.4/A2.5 generic target integration, remove duplicate registries
+1. Complete A2.4/A2.5 generic target integration, remove duplicate registries
    and switches, and run protected behavior/performance gates.
-3. Complete A3 by moving Terminal Bench automation out of Core without wrappers
+2. Complete A3 by moving Terminal Bench automation out of Core without wrappers
    or method changes.
-4. Replace B1 direct sidecar orchestration with durable Core-owned project/run/
+3. Replace B1 direct sidecar orchestration with durable Core-owned project/run/
    service state and reconnect Desktop through typed APIs.
-5. Complete exact Core artifact/bootstrap lifecycle B2 and both release execution
+4. Complete exact Core artifact/bootstrap lifecycle B2 and both release execution
    modes, including transcript capture and self-deployed model management.
-6. Expand the mature Desktop workflow and evidence until both science E2Es and
+5. Expand the mature Desktop workflow and evidence until both science E2Es and
    every D/E release gate pass on the same release commit.
 
 This vertical path is the first product milestone. Broader UI polish,

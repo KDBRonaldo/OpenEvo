@@ -87,6 +87,19 @@ class _Descriptor(_Contract):
     _version = field_validator("contract_version")(_contract_version)
 
 
+class EvolutionSelectionResolverDescriptor(_Contract):
+    """A Core-owned project selection resolved to concrete methods later."""
+
+    selection_value: str
+    display_name: str
+    description: str
+    resolved_method_ids: tuple[str, ...] = Field(min_length=1)
+
+    _selection = field_validator("selection_value")(_stable_id)
+    _text_fields = field_validator("display_name", "description")(_text)
+    _methods = field_validator("resolved_method_ids")(_unique_ids)
+
+
 class EvolutionTargetDescriptor(_Descriptor):
     kind: Literal[DescriptorKind.TARGET] = DescriptorKind.TARGET
     display_name: str
@@ -96,6 +109,7 @@ class EvolutionTargetDescriptor(_Descriptor):
     renderer_kind: RendererKind
     renderer_contract_version: Literal["1"] = "1"
     default_method_id: str
+    selection_resolvers: tuple[EvolutionSelectionResolverDescriptor, ...] = ()
     context_order: int = Field(default=100, ge=0, le=10_000)
     maturity: Maturity = Maturity.EXPERIMENTAL
 
@@ -103,6 +117,17 @@ class EvolutionTargetDescriptor(_Descriptor):
     _ids = field_validator(
         "artifact_type", "handler_id", "default_method_id"
     )(_stable_id)
+
+    @field_validator("selection_resolvers")
+    @classmethod
+    def _unique_selection_resolvers(
+        cls,
+        values: tuple[EvolutionSelectionResolverDescriptor, ...],
+    ) -> tuple[EvolutionSelectionResolverDescriptor, ...]:
+        selection_values = tuple(value.selection_value for value in values)
+        if len(selection_values) != len(set(selection_values)):
+            raise ValueError("target selection resolver values must be unique")
+        return values
 
 
 class EvolutionMethodDescriptor(_Descriptor):
@@ -186,6 +211,7 @@ class TargetHandlerDescriptor(_Descriptor):
 
 __all__ = [
     "EvolutionMethodDescriptor",
+    "EvolutionSelectionResolverDescriptor",
     "EvolutionTargetDescriptor",
     "TargetHandlerDescriptor",
 ]

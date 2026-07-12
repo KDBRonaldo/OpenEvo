@@ -28,6 +28,32 @@ The Desktop sidecar owns local app integration and remote bootstrap:
 After Core is healthy, ordinary run, log, artifact, doctor, repair, and service
 operations go through Core APIs.
 
+## Evolution Capabilities
+
+Core owns evolution capability discovery. The release endpoint is:
+
+```text
+GET /capabilities?execution_mode=codex_subscription_transcript
+GET /capabilities?execution_mode=self-deployed
+```
+
+The query value is a product release mode, not a framework execution-mode ID.
+Core maps it once to an `EvolutionExecutionProfile`, evaluates method support,
+and returns `EvolutionCapabilitiesV1` from the same startup-verified frozen
+registry used by planning and worker dispatch. The response includes the Core
+version, registry digest, evaluated profile, target and handler identity,
+configured and effective defaults, schemas, ordered inputs, and four independent
+support axes. Audience-visible `methods` are separate from `accepted_methods`
+used to preserve valid existing configs and from Core-owned
+`selection_resolvers` such as `agent_system.method=auto`.
+
+Core returns a typed `503` when no verified registry was supplied at startup.
+It does not import legacy method metadata or synthesize a static response. The
+Desktop sidecar forwards this endpoint through the active SSH tunnel and also
+fails closed when the tunnel is absent or the remote payload is invalid. It
+re-fetches the payload and validates the active project selections immediately
+before each run launch.
+
 ## State Layout
 
 Remote Core state is rooted in the configured workspace and OpenEvo state root.

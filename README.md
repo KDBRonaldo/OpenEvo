@@ -136,6 +136,7 @@ cd desktop
 npm ci
 npm audit --audit-level=high
 npm test -- --run
+npm run typecheck
 npm run build:openevo
 cd src-tauri
 # Ubuntu/Linux CI runners need Tauri native packages such as

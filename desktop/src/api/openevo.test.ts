@@ -515,83 +515,135 @@ describe("OpenEvo sidecar client", () => {
     );
   });
 
-  it("fetches desktop capabilities for ordinary-user targets", async () => {
-    const calls: Array<{ path: string; method: string }> = [];
+  it("fetches and parses target-rooted remote capabilities for an execution mode", async () => {
+    const calls: Array<{ path: string; method: string; headers: Headers }> = [];
+    const shellPayload = sidecarShellPayload("capabilities-token");
     vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
       const path = String(input);
-      calls.push({ path, method: init?.method ?? "GET" });
-      if (path === "/openevo-api/desktop/capabilities") {
-        return jsonResponse({
-          execution_modes: [],
-          artifact_targets: [
-            {
-              artifact_type: "text_memory",
-              display_name: "Text Memory",
-              visible_in_desktop: true,
-              stability_level: "stable",
-            },
-          ],
-          evolution_methods: [
-            {
-              method_id: "text_memory_reflector",
-              display_name: "Text memory",
-              artifact_type: "text_memory",
-              supported_execution_modes: [
-                "codex_subscription_transcript",
-                "self-deployed",
-              ],
-              visible_in_desktop: true,
-              stability_level: "stable",
-            },
-            {
-              method_id: "parametric_memory_trainer",
-              display_name: "Parametric memory",
-              artifact_type: "parametric_memory",
-              supported_execution_modes: ["self-deployed"],
-              visible_in_desktop: false,
-              stability_level: "experimental",
-            },
-          ],
-        });
+      calls.push({
+        path,
+        method: init?.method ?? "GET",
+        headers: new Headers(init?.headers),
+      });
+      if (path === "/openevo-api/desktop/shell") {
+        return jsonResponse(shellPayload);
+      }
+      if (
+        path ===
+        "/openevo-api/desktop/capabilities?execution_mode=codex_subscription_transcript"
+      ) {
+        return jsonResponse(remoteCapabilitiesPayload());
       }
       return new Response("not found", { status: 404 });
     });
 
-    const capabilities = await fetchOpenEvoDesktopCapabilities();
+    await fetchOpenEvoDesktopShellModel();
+    const capabilities = await fetchOpenEvoDesktopCapabilities(
+      "codex_subscription_transcript",
+    );
 
-    expect(capabilities.evolutionMethods).toEqual([
-      {
-        methodId: "text_memory_reflector",
-        displayName: "Text memory",
-        artifactType: "text_memory",
-        supportedExecutionModes: [
-          "codex_subscription_transcript",
-          "self-deployed",
-        ],
-        visibleInDesktop: true,
-        stabilityLevel: "stable",
+    expect(capabilities.schemaVersion).toBe("1");
+    expect(capabilities.registryDigest).toBe("a".repeat(64));
+    expect(capabilities.evaluatedProfile.executionMode).toBe("subscription");
+    expect(capabilities.targets[0]).toMatchObject({
+      targetId: "text_memory",
+      artifactType: "text_memory",
+      configuredDefaultMethodId: "text_memory_reflector",
+      effectiveDefaultMethodId: "text_memory_reflector",
+      implementationIdentityDigest: "b".repeat(64),
+      handlerIdentityDigest: "c".repeat(64),
+    });
+    expect(capabilities.targets[0]?.methods[0]).toMatchObject({
+      methodId: "text_memory_reflector",
+      configSchema: {
+        additionalProperties: false,
+        properties: { threshold: { type: "number" } },
+        type: "object",
       },
+      defaultConfig: { threshold: 0.75 },
+      implementationIdentityDigest: "d".repeat(64),
+      support: { overall: "supported" },
+    });
+    expect(capabilities.targets[0]?.methods[0]?.configSchemaJson).toBe(
+      '{"additionalProperties":false,"properties":{"threshold":{"type":"number"}},"type":"object"}',
+    );
+    expect(capabilities.targets[0]?.methods[0]?.defaultConfigJson).toBe(
+      '{"threshold":0.75}',
+    );
+    expect(calls[1]?.headers.get("X-OpenEvo-Sidecar-Token")).toBe(
+      "capabilities-token",
+    );
+    expect(calls.map(({ path, method }) => ({ path, method }))).toEqual([
+      { path: "/openevo-api/desktop/shell", method: "GET" },
       {
-        methodId: "parametric_memory_trainer",
-        displayName: "Parametric memory",
-        artifactType: "parametric_memory",
-        supportedExecutionModes: ["self-deployed"],
-        visibleInDesktop: false,
-        stabilityLevel: "experimental",
+        path:
+          "/openevo-api/desktop/capabilities?execution_mode=codex_subscription_transcript",
+        method: "GET",
       },
-    ]);
-    expect(capabilities.artifactTargets).toEqual([
-      {
-        artifactType: "text_memory",
-        displayName: "Text Memory",
-        visibleInDesktop: true,
-        stabilityLevel: "stable",
-      },
-    ]);
-    expect(calls).toEqual([
-      { path: "/openevo-api/desktop/capabilities", method: "GET" },
     ]);
   });
+
+  it("preserves unsupported reasons and a missing effective default", async () => {
+    const payload = remoteCapabilitiesPayload();
+    payload.targets[0].effective_default_method_id = null;
+    payload.targets[0].configured_default_support = unsupportedSupport(
+      "unsupported_execution_mode",
+      "The configured default does not support self-deployed execution.",
+    );
+    payload.targets[0].methods[0].support =
+      payload.targets[0].configured_default_support;
+
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(jsonResponse(payload));
+    const capabilities = await fetchOpenEvoDesktopCapabilities("self-deployed");
+
+    expect(capabilities.targets[0]?.effectiveDefaultMethodId).toBeNull();
+    expect(capabilities.targets[0]?.configuredDefaultSupport).toMatchObject({
+      overall: "unsupported",
+      execution: {
+        state: "unsupported",
+        reasonCode: "unsupported_execution_mode",
+        message: "The configured default does not support self-deployed execution.",
+      },
+    });
+  });
+
+  it("rejects malformed capability config JSON", async () => {
+    const payload = remoteCapabilitiesPayload();
+    payload.targets[0].methods[0].default_config_json = '{"threshold":';
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(jsonResponse(payload));
+
+    await expect(
+      fetchOpenEvoDesktopCapabilities("codex_subscription_transcript"),
+    ).rejects.toThrow("default_config_json must contain canonical JSON");
+  });
+
+  it("accepts Python canonical numeric spellings in validated config JSON", async () => {
+    const payload = remoteCapabilitiesPayload();
+    payload.targets[0].methods[0].default_config_json =
+      '{"float":1.0,"negative_zero":-0.0,"small":1e-07}';
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(jsonResponse(payload));
+
+    const capabilities = await fetchOpenEvoDesktopCapabilities(
+      "codex_subscription_transcript",
+    );
+
+    const config = capabilities.targets[0]?.methods[0]?.defaultConfig;
+    expect(config).toMatchObject({ float: 1, small: 1e-7 });
+    expect(Object.is(config?.negative_zero, -0)).toBe(true);
+  });
+
+  it.each(["null", "[]", "1", '"value"'])(
+    "rejects non-object capability config JSON %s",
+    async (encoded) => {
+      const payload = remoteCapabilitiesPayload();
+      payload.targets[0].methods[0].default_config_json = encoded;
+      vi.spyOn(globalThis, "fetch").mockResolvedValue(jsonResponse(payload));
+
+      await expect(
+        fetchOpenEvoDesktopCapabilities("codex_subscription_transcript"),
+      ).rejects.toThrow("default_config_json must contain canonical JSON");
+    },
+  );
 
   it("fetches backend artifact preview with the sidecar token", async () => {
     const calls: Array<{ path: string; headers: Headers; method: string }> = [];
@@ -677,31 +729,11 @@ describe("OpenEvo sidecar client", () => {
         headers: new Headers(init?.headers),
         method,
       });
-      if (path === "/openevo-api/desktop/capabilities") {
-        return jsonResponse({
-          execution_modes: [],
-          artifact_targets: [
-            {
-              artifact_type: "text_memory",
-              display_name: "Text Memory",
-              visible_in_desktop: true,
-              stability_level: "stable",
-            },
-          ],
-          evolution_methods: [
-            {
-              method_id: "text_memory_reflector",
-              display_name: "Text memory",
-              artifact_type: "text_memory",
-              supported_execution_modes: [
-                "codex_subscription_transcript",
-                "self-deployed",
-              ],
-              visible_in_desktop: true,
-              stability_level: "stable",
-            },
-          ],
-        });
+      if (
+        path ===
+        "/openevo-api/desktop/capabilities?execution_mode=codex_subscription_transcript"
+      ) {
+        return jsonResponse(remoteCapabilitiesPayload());
       }
       if (path === "/openevo-api/desktop/shell") {
         return jsonResponse(shellPayload);
@@ -782,8 +814,10 @@ describe("OpenEvo sidecar client", () => {
       return new Response("not found", { status: 404 });
     });
 
-    const capabilities = await fetchOpenEvoDesktopCapabilities();
     await fetchOpenEvoDesktopShellModel();
+    const capabilities = await fetchOpenEvoDesktopCapabilities(
+      "codex_subscription_transcript",
+    );
     await saveOpenEvoProjectConfig(projectConfigDraft());
     await runOpenEvoWorkspaceSync();
     await runOpenEvoBootstrap();
@@ -800,15 +834,15 @@ describe("OpenEvo sidecar client", () => {
       "artifact-text-memory",
     );
 
-    expect(capabilities.evolutionMethods[0]?.methodId).toBe(
+    expect(capabilities.targets[0]?.methods[0]?.methodId).toBe(
       "text_memory_reflector",
     );
     expect(timeline[0]?.artifactIds).toEqual(["artifact-text-memory"]);
     expect(artifacts[0]?.artifactType).toBe("text_memory");
     expect(content.body).toContain("Prefer stable folds");
     expect(calls.map((call) => `${call.method} ${call.path}`)).toEqual([
-      "GET /openevo-api/desktop/capabilities",
       "GET /openevo-api/desktop/shell",
+      "GET /openevo-api/desktop/capabilities?execution_mode=codex_subscription_transcript",
       "POST /openevo-api/desktop/project-config",
       "POST /openevo-api/desktop/workspace",
       "POST /openevo-api/desktop/bootstrap",
@@ -820,7 +854,7 @@ describe("OpenEvo sidecar client", () => {
       "GET /openevo-api/backend/artifacts/artifact-text-memory/content",
       "GET /openevo-api/backend/artifacts/artifact-text-memory/diff",
     ]);
-    for (const call of calls.slice(2)) {
+    for (const call of calls.slice(1)) {
       expect(call.headers.get("X-OpenEvo-Sidecar-Token")).toBe("smoke-token");
     }
   });
@@ -1201,6 +1235,109 @@ function evolutionTargets() {
       enabled: false,
       method: "future_method",
       config: { opaque: [1, 2, 3] },
+    },
+  };
+}
+
+function remoteCapabilitiesPayload(): any {
+  const support = supportedSupport();
+  return {
+    schema_version: "1",
+    core_version: "0.1.0",
+    registry_digest: "a".repeat(64),
+    evaluated_profile: {
+      execution_mode: "subscription",
+      capture_mode: "transcript",
+      harness_id: "codex",
+      harness_capabilities: ["stable_transcript"],
+      runtime_capabilities: [],
+    },
+    targets: [
+      {
+        target_id: "text_memory",
+        display_name: "Text Memory",
+        description: "Reusable natural-language memory.",
+        artifact_type: "text_memory",
+        exposure: "desktop",
+        maturity: "stable",
+        handler_id: "text_memory_handler",
+        configured_default_method_id: "text_memory_reflector",
+        effective_default_method_id: "text_memory_reflector",
+        configured_default_support: support,
+        renderer_kind: "markdown",
+        renderer_contract_version: "1",
+        contribution_contract_version: "1",
+        context_order: 10,
+        implementation_identity_digest: "b".repeat(64),
+        handler_identity_digest: "c".repeat(64),
+        accepted_methods: [
+          {
+            method_id: "text_memory_reflector",
+            implementation_identity_digest: "d".repeat(64),
+            support,
+          },
+        ],
+        selection_resolvers: [],
+        methods: [
+          {
+            method_id: "text_memory_reflector",
+            display_name: "Text Memory Reflector",
+            description: "Reflects transcripts into reusable memory.",
+            exposure: "desktop",
+            maturity: "stable",
+            execution_modes: ["subscription", "self_deployed"],
+            capture_modes: ["transcript"],
+            supported_harness_ids: ["codex"],
+            harness_requirements: ["stable_transcript"],
+            runtime_requirements: [],
+            input_bindings: [
+              {
+                binding_id: "dataset",
+                source: "current_dataset",
+                artifact_type: "dataset",
+                min_count: 1,
+                max_count: null,
+              },
+            ],
+            output_artifact_types: ["text_memory"],
+            config_schema_json:
+              '{"additionalProperties":false,"properties":{"threshold":{"type":"number"}},"type":"object"}',
+            default_config_json: '{"threshold":0.75}',
+            implementation_identity_digest: "d".repeat(64),
+            support,
+          },
+        ],
+      },
+    ],
+  };
+}
+
+function supportedSupport() {
+  const axis = {
+    state: "supported",
+    reason_code: null,
+    message: "Supported.",
+    missing_requirements: [],
+  };
+  return {
+    overall: "supported",
+    execution: { ...axis },
+    capture: { ...axis },
+    harness: { ...axis },
+    runtime: { ...axis },
+  };
+}
+
+function unsupportedSupport(reasonCode: string, message: string) {
+  const support = supportedSupport();
+  return {
+    ...support,
+    overall: "unsupported",
+    execution: {
+      state: "unsupported",
+      reason_code: reasonCode,
+      message,
+      missing_requirements: [],
     },
   };
 }

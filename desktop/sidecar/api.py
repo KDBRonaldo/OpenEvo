@@ -27,11 +27,6 @@ from pydantic import ValidationError
 
 import openevo
 from openevo import __version__ as OPENEVO_VERSION
-from openevo.capabilities import (
-    CoreCapabilities,
-    EvolutionMethodCapability,
-    build_core_capabilities,
-)
 from openevo.deployment.executor import RemoteExecutorTransport
 from openevo.deployment.lifecycle import (
     RemoteServiceLog,
@@ -41,8 +36,10 @@ from openevo.deployment.lifecycle import (
 from openevo.deployment.preflight import PreflightCheck, PreflightReport, run_preflight
 from openevo.deployment.redaction import sanitize_remote_text
 from openevo.evolution.framework import (
+    EvolutionCapabilitiesV1,
     FrameworkDistributionLock,
     ProjectEvolutionTargetSelection,
+    execution_profile_for_release_mode,
 )
 from openevo.projects.science import ScienceProjectConfig
 from openevo.projects.science.models import EvolutionTargetsConfig
@@ -299,17 +296,6 @@ class OpenEvoDesktopRunResponse(_StrictFrozenModel):
     status: OpenEvoDesktopShellStatus
 
 
-class OpenEvoDesktopMethodsResponse(_StrictFrozenModel):
-    methods: tuple[EvolutionMethodCapability, ...] = Field(default_factory=tuple)
-
-    @field_validator("methods", mode="before")
-    @classmethod
-    def _coerce_methods(cls, value):
-        if isinstance(value, list):
-            return tuple(value)
-        return value
-
-
 @dataclass
 class OpenEvoSidecarSession:
     project: ScienceProjectConfig
@@ -520,7 +506,9 @@ def create_sidecar_app(
             return session
 
     @contextmanager
-    def backend_client_context():
+    def backend_client_context(
+        required_session: OpenEvoSidecarSession | None = None,
+    ):
         if backend_client_factory is not None:
             client = backend_client_factory()
             try:
@@ -529,15 +517,30 @@ def create_sidecar_app(
                 if isinstance(client, BackendClient):
                     client.close()
             return
-        if shared_backend_client is not None:
-            yield shared_backend_client
-            return
-        active_session = current_session()
+        active_session = required_session or current_session()
         if active_session is not None:
             with active_session.backend_lock:
                 if active_session.backend_client is not None:
                     yield active_session.backend_client
                     return
+            raise DesktopBackendError(
+                409,
+                {
+                    "code": "backend_tunnel_not_configured",
+                    "message": (
+                        "Desktop has no active tunnel to the remote OpenEvo backend."
+                    ),
+                    "severity": "blocking",
+                    "category": "service",
+                    "retryable": True,
+                    "repair_action": "openevo_can_reconfigure",
+                    "details": {},
+                    "logs_ref": None,
+                },
+            )
+        if shared_backend_client is not None:
+            yield shared_backend_client
+            return
         raise DesktopBackendError(
             409,
             {
@@ -552,8 +555,24 @@ def create_sidecar_app(
             },
         )
 
+    def remote_capabilities(
+        execution_mode: DesktopExecutionMode,
+        *,
+        required_session: OpenEvoSidecarSession | None = None,
+    ) -> EvolutionCapabilitiesV1:
+        with backend_client_context(required_session) as backend_client:
+            payload = backend_client.capabilities(execution_mode)
+        try:
+            capabilities = EvolutionCapabilitiesV1.model_validate(payload)
+        except ValidationError as exc:
+            raise _invalid_backend_capabilities_error(execution_mode) from exc
+        expected_profile = execution_profile_for_release_mode(execution_mode)
+        if capabilities.evaluated_profile != expected_profile:
+            raise _invalid_backend_capabilities_error(execution_mode)
+        return capabilities
+
     def attach_session_backend_facade(active_session: OpenEvoSidecarSession) -> None:
-        if backend_client_factory is not None or shared_backend_client is not None:
+        if backend_client_factory is not None:
             return
         try:
             transport = active_session.transport_factory(active_session.profile)
@@ -619,10 +638,17 @@ def create_sidecar_app(
 
     @app.get(
         "/openevo-api/desktop/capabilities",
-        response_model=CoreCapabilities,
+        response_model=EvolutionCapabilitiesV1,
     )
-    def desktop_capabilities() -> CoreCapabilities:
-        return build_core_capabilities()
+    def desktop_capabilities(
+        execution_mode: DesktopExecutionMode,
+        token: str | None = Header(
+            default=None,
+            alias=SIDECAR_MUTATION_TOKEN_HEADER,
+        ),
+    ) -> EvolutionCapabilitiesV1:
+        _validate_mutation_token(token, sidecar_token)
+        return remote_capabilities(execution_mode)
 
     @app.get(
         "/openevo-api/desktop/core-artifact",
@@ -630,15 +656,6 @@ def create_sidecar_app(
     )
     def desktop_core_artifact() -> PackagedCoreArtifactIdentity:
         return packaged_core_artifact_identity()
-
-    @app.get(
-        "/openevo-api/desktop/methods",
-        response_model=OpenEvoDesktopMethodsResponse,
-    )
-    def desktop_methods() -> OpenEvoDesktopMethodsResponse:
-        return OpenEvoDesktopMethodsResponse(
-            methods=build_core_capabilities().evolution_methods,
-        )
 
     @app.get("/openevo-api/backend/health")
     def backend_health(
@@ -1291,6 +1308,14 @@ def create_sidecar_app(
                 )
         try:
             experiment_snapshot, state_root = _run_ready_context(active_session)
+            capabilities = remote_capabilities(
+                active_session.project.execution.mode,
+                required_session=active_session,
+            )
+            _validate_project_evolution_capabilities(
+                active_session.project,
+                capabilities,
+            )
             run_status = _initial_run_status(
                 experiment_snapshot=experiment_snapshot,
                 state_root=state_root,
@@ -2008,6 +2033,104 @@ def _validate_mutation_token(candidate: str | None, expected: str) -> None:
             status_code=403,
             detail="Invalid OpenEvo sidecar token.",
         )
+
+
+def _invalid_backend_capabilities_error(
+    execution_mode: DesktopExecutionMode,
+) -> DesktopBackendError:
+    return DesktopBackendError(
+        502,
+        {
+            "code": "backend_capabilities_invalid",
+            "message": (
+                "Remote OpenEvo backend returned an invalid capabilities payload."
+            ),
+            "severity": "blocking",
+            "category": "internal",
+            "retryable": False,
+            "repair_action": "user_action_required",
+            "details": {"execution_mode": execution_mode},
+            "logs_ref": "services/openevo-backend",
+        },
+    )
+
+
+def _validate_project_evolution_capabilities(
+    project: ScienceProjectConfig,
+    capabilities: EvolutionCapabilitiesV1,
+) -> None:
+    targets = {target.target_id: target for target in capabilities.targets}
+    for target_id, selection in project.evolution.targets.items():
+        if not selection.enabled:
+            continue
+        target = targets.get(target_id)
+        if target is None:
+            raise _unavailable_evolution_selection_error(
+                target_id,
+                selection.method,
+                capabilities.registry_digest,
+                "The target is absent from the remote registry capabilities.",
+            )
+        method = next(
+            (
+                candidate
+                for candidate in target.accepted_methods
+                if candidate.method_id == selection.method
+            ),
+            None,
+        )
+        if method is not None and method.support.overall == "supported":
+            continue
+        resolver = next(
+            (
+                candidate
+                for candidate in target.selection_resolvers
+                if candidate.selection_value == selection.method
+            ),
+            None,
+        )
+        if resolver is not None and all(
+            candidate.support.overall == "supported"
+            for candidate in resolver.resolved_methods
+        ):
+            continue
+        reason = (
+            "The selected method is unsupported by the active remote profile."
+            if method is not None
+            else "The selected method or resolver is absent from the remote registry."
+        )
+        raise _unavailable_evolution_selection_error(
+            target_id,
+            selection.method,
+            capabilities.registry_digest,
+            reason,
+        )
+
+
+def _unavailable_evolution_selection_error(
+    target_id: str,
+    selection: str | None,
+    registry_digest: str,
+    reason: str,
+) -> DesktopBackendError:
+    return DesktopBackendError(
+        409,
+        {
+            "code": "evolution_selection_unavailable",
+            "message": "The active project evolution selection cannot run.",
+            "severity": "blocking",
+            "category": "project",
+            "retryable": False,
+            "repair_action": "openevo_can_reconfigure",
+            "details": {
+                "target_id": target_id,
+                "selection": selection,
+                "registry_digest": registry_digest,
+                "reason": reason,
+            },
+            "logs_ref": None,
+        },
+    )
 
 
 def _validation_error_detail(exc: ValidationError):

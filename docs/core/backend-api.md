@@ -19,8 +19,16 @@ after bootstrap.
 Release bootstrap starts Core with the installed release artifact:
 
 ```bash
-openevo-backend serve --host 127.0.0.1 --port 8765 --state-root /home/openevo/.openevo/core-state
+openevo-backend serve \
+  --host 127.0.0.1 \
+  --port 8765 \
+  --state-root /home/openevo/.openevo/core-state \
+  --framework-lock /home/openevo/.openevo/core-state/wheels/framework-lock.json
 ```
+
+The external framework lock names the exact installed Core wheel and pins its
+version and SHA-256. Startup fails before serving capabilities when the lock,
+wheel, installed inventory, or entry points do not match.
 
 `OPENEVO_STATE_ROOT` is the remote root for Core-owned state. The backend must
 report its version, descriptor SHA256, artifact SHA256, source commit, and state
@@ -76,7 +84,7 @@ POST /projects/{project_id}/workspace/sync
 GET  /projects/{project_id}/workspace/{snapshot_id}
 POST /environment/doctor
 POST /environment/repair
-GET  /capabilities
+GET  /capabilities?execution_mode=<codex_subscription_transcript|self-deployed>
 GET  /runs?project_id=<project_id>&state=<state>&after=<cursor>&limit=<n>&sort=<field>
 POST /runs
 GET  /runs/{run_id}
@@ -275,7 +283,15 @@ Desktop maps typed errors to user actions without parsing shell output.
 
 ## Capabilities
 
-`GET /capabilities` is backed by Core method metadata. It advertises supported
-execution modes, capture modes, artifact families, method IDs, required remote
-checks, and user-visible labels. Core must not define a second evolution method
-registry for Desktop.
+`GET /capabilities?execution_mode=<release-mode>` projects
+`EvolutionCapabilitiesV1` from the startup-verified executable registry used by
+planning and dispatch. The response is target-rooted and includes Core version,
+registry digest, evaluated generic profile, descriptor identities, configured
+and effective defaults, schemas, ordered inputs, and four-axis support reasons.
+
+The required query accepts `codex_subscription_transcript` or `self-deployed`;
+Core performs the sole mapping to framework execution/capture/harness axes.
+Missing or invalid values return the normal typed validation error. A Core
+process without a verified registry returns `evolution_registry_unavailable`
+with HTTP 503 and never falls back to method metadata. Both 422 and 503 typed
+errors are declared in the endpoint's OpenAPI contract.

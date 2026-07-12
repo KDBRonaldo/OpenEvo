@@ -61,12 +61,60 @@ def test_backend_client_normalizes_non_json_http_errors() -> None:
     assert exc_info.value.status_code == 503
     assert exc_info.value.error == {
         "code": "backend_http_error",
-        "message": "backend unavailable",
+        "message": "Remote OpenEvo backend returned an HTTP error.",
         "severity": "blocking",
         "category": "internal",
         "retryable": False,
         "repair_action": "user_action_required",
         "details": {"status_code": 503},
+        "logs_ref": None,
+    }
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "backend unavailable",
+        ["backend unavailable"],
+        {"code": "backend_unavailable"},
+        {
+            "code": "backend_unavailable",
+            "message": ["not", "a", "string"],
+            "severity": "blocking",
+            "category": "service",
+            "retryable": "true",
+            "repair_action": "openevo_can_retry",
+            "details": [],
+            "logs_ref": 42,
+        },
+    ],
+    ids=["string", "list", "partial", "wrong-types"],
+)
+def test_backend_client_normalizes_malformed_json_http_errors(
+    payload: object,
+) -> None:
+    http_client = httpx.Client(
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(502, json=payload)
+        )
+    )
+    client = BackendClient(
+        BackendConnection(base_url="http://openevo.test"),
+        http_client=http_client,
+    )
+
+    with pytest.raises(DesktopBackendError) as exc_info:
+        client.status()
+
+    assert exc_info.value.status_code == 502
+    assert exc_info.value.error == {
+        "code": "backend_http_error",
+        "message": "Remote OpenEvo backend returned an HTTP error.",
+        "severity": "blocking",
+        "category": "internal",
+        "retryable": False,
+        "repair_action": "user_action_required",
+        "details": {"status_code": 502},
         "logs_ref": None,
     }
 
@@ -108,6 +156,47 @@ def test_backend_client_quotes_opaque_path_segments() -> None:
     assert seen_urls == [
         "http://openevo.test/runs/run%2Fone%3Fround%3D1/timeline"
     ]
+
+
+@pytest.mark.parametrize(
+    "execution_mode",
+    ["codex_subscription_transcript", "self-deployed"],
+)
+def test_backend_client_forwards_capabilities_execution_mode(
+    execution_mode: str,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/capabilities"
+        assert request.url.params.get("execution_mode") == execution_mode
+        assert len(request.url.params) == 1
+        return httpx.Response(200, json={"mode": execution_mode})
+
+    http_client = httpx.Client(transport=httpx.MockTransport(handler))
+    client = BackendClient(
+        BackendConnection(base_url="http://openevo.test"),
+        http_client=http_client,
+    )
+
+    assert client.capabilities(execution_mode) == {"mode": execution_mode}
+
+
+def test_backend_client_normalizes_invalid_capabilities_json() -> None:
+    http_client = httpx.Client(
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(200, text="not json")
+        )
+    )
+    client = BackendClient(
+        BackendConnection(base_url="http://openevo.test"),
+        http_client=http_client,
+    )
+
+    with pytest.raises(DesktopBackendError) as exc_info:
+        client.capabilities("self-deployed")
+
+    assert exc_info.value.status_code == 502
+    assert exc_info.value.error["code"] == "backend_capabilities_invalid"
+    assert exc_info.value.error["details"]["execution_mode"] == "self-deployed"
 
 
 class _FakeBackendClient:

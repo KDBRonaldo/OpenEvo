@@ -58,10 +58,12 @@ The lifecycle for a new built-in method is:
    automation may consume `maintainer` and `internal` entries through Core.
 
 Existing built-ins remain in `METHOD_REGISTRY` only for unplanned benchmark
-jobs, and `METHOD_METADATA` remains only for the old capability projection.
+jobs, and `METHOD_METADATA` remains only for legacy benchmark/automation
+compatibility that has not completed A2.5 migration. Remote Core capabilities
+do not consume either table.
 Plan-bound product jobs dispatch from `VerifiedExecutableRegistry` and never
 fall back to either table. Exact-object tests protect legacy callable identity;
-A2.5 deletes both duplicate tables after benchmark/capability migration.
+A2.5 deletes both duplicate tables after benchmark migration.
 
 The loader can verify a locked research-plugin wheel and its entry points, and
 the worker can invoke a context-ABI handle present in its executable registry.

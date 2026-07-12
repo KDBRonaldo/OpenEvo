@@ -42,15 +42,25 @@ The repository currently provides:
   publishes nothing.
 
 This scaffolding is not DMG release evidence. The executable sidecar smoke proves
-its local health/static-asset path and discovery of the embedded Core wheel plus
-framework lock, but does not prove that a mounted and copied macOS app starts or
-completes the science workflow.
+its local health/static-asset path, discovery of the embedded Core wheel plus
+framework lock, and its token-protected capability proxy against a real backend.
+It does not prove that a mounted and copied macOS app starts or completes the
+science workflow.
 
 The release workflow's outer smoke installs Core and exercises it through the
 Desktop harness imported from the source checkout. Its workflow and script names
 must not be interpreted as packaged Desktop evidence. The outer smoke wheel is
 assembled from a separate temporary source tree, so staging its embedded Core
 wheel does not alter `src/openevo/wheels` in the checkout.
+
+Before that outer lifecycle harness, the workflow installs the exact remote Core
+wheel in a clean Python environment and runs
+`scripts/ci/smoke_openevo_remote_capabilities.py` with the PyInstaller sidecar
+path. That smoke starts the real `openevo-backend serve --framework-lock`
+process, starts the packaged sidecar on a real listener, and checks mutation-token
+protection, both release profiles, registry identity, and target-rooted methods
+over HTTP. A source `TestClient` or local capability fixture in the outer
+lifecycle harness is not evidence for this packaged proxy path.
 
 ## External Beta Artifacts
 
@@ -145,6 +155,7 @@ source .venv/bin/activate
 cd desktop
 npm ci
 npm test -- --run
+npm run typecheck
 npm run build:openevo
 npm run build:sidecar
 cd src-tauri

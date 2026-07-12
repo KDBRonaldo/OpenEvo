@@ -63,6 +63,7 @@ jobs:
           npm ci
           npm audit --audit-level=high
           npm test -- --run
+          npm run typecheck
           npm run build:openevo
 
       - name: Build packaged OpenEvo Desktop sidecar

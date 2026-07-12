@@ -3,16 +3,31 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
+from openevo import __version__
 from openevo.backend.api import BackendHTTPError, create_backend_app
 from openevo.backend.models import BackendError
+from openevo.evolution.framework import (
+    CapabilityAudience,
+    build_evolution_capabilities,
+    canonical_json,
+    execution_profile_for_release_mode,
+)
+from openevo.evolution.framework.builtins import VerifiedExecutableRegistry
+from openevo.evolution.framework.contracts import DescriptorKind
 from openevo.evolution.models import ArtifactRegisterRequest
 from openevo.evolution.store import EvolutionStore
+from tests.framework_testkit import verified_builtin_registry
 
 
-def _client(*, raise_server_exceptions: bool = True) -> TestClient:
-    app = create_backend_app()
+def _client(
+    *,
+    raise_server_exceptions: bool = True,
+    evolution_registry: VerifiedExecutableRegistry | None = None,
+) -> TestClient:
+    app = create_backend_app(evolution_registry=evolution_registry)
 
     @app.get("/_test/http-error")
     def _test_http_error() -> None:
@@ -121,13 +136,175 @@ def test_backend_health() -> None:
     assert response.json()["status"] == "ok"
 
 
-def test_backend_capabilities() -> None:
-    client = _client()
-    response = client.get("/capabilities")
+@pytest.mark.parametrize(
+    ("release_mode", "generic_execution_mode"),
+    [
+        ("codex_subscription_transcript", "subscription"),
+        ("self-deployed", "self_deployed"),
+    ],
+)
+def test_backend_capabilities_are_registry_snapshot_projection(
+    release_mode: str,
+    generic_execution_mode: str,
+    tmp_path: Path,
+) -> None:
+    registry = verified_builtin_registry(tmp_path / release_mode)
+    client = _client(evolution_registry=registry)
+    response = client.get("/capabilities", params={"execution_mode": release_mode})
+
     assert response.status_code == 200
-    method_ids = {item["method_id"] for item in response.json()["evolution_methods"]}
-    assert "text_memory_reflector" in method_ids
-    assert "skill_bundle_reflector" in method_ids
+    payload = response.json()
+    profile = execution_profile_for_release_mode(release_mode)
+    expected = build_evolution_capabilities(
+        registry.snapshot,
+        profile=profile,
+        audience=CapabilityAudience.DESKTOP,
+        core_version=__version__,
+    ).model_dump(mode="json")
+    assert payload == expected
+    assert payload["schema_version"] == "1"
+    assert payload["core_version"] == __version__
+    assert payload["registry_digest"] == registry.snapshot.registry_digest
+    assert payload["evaluated_profile"] == {
+        "execution_mode": generic_execution_mode,
+        "capture_mode": "transcript",
+        "harness_id": "codex",
+        "harness_capabilities": [],
+        "runtime_capabilities": [],
+    }
+
+    expected_target_ids = {
+        target_id
+        for target_id, target in registry.snapshot.targets.items()
+        if target.exposure.value == "desktop"
+    }
+    targets = payload["targets"]
+    assert {target["target_id"] for target in targets} == expected_target_ids
+    assert "evolution_methods" not in payload
+    for target in targets:
+        target_descriptor = registry.snapshot.targets[target["target_id"]]
+        handler_descriptor = registry.snapshot.target_handlers[
+            target_descriptor.handler_id
+        ]
+        assert target["configured_default_method_id"] == (
+            target_descriptor.default_method_id
+        )
+        configured_default = next(
+            method
+            for method in target["methods"]
+            if method["method_id"] == target_descriptor.default_method_id
+        )
+        assert target["effective_default_method_id"] == (
+            target_descriptor.default_method_id
+            if configured_default["support"]["overall"] == "supported"
+            else None
+        )
+        assert target["configured_default_support"] == configured_default["support"]
+        assert target["implementation_identity_digest"] == (
+            registry.snapshot.identity_digest_for(
+                DescriptorKind.TARGET,
+                target_descriptor.id,
+            )
+        )
+        assert target["handler_identity_digest"] == (
+            registry.snapshot.identity_digest_for(
+                DescriptorKind.TARGET_HANDLER,
+                handler_descriptor.id,
+            )
+        )
+        expected_method_ids = {
+            method_id
+            for method_id, method in registry.snapshot.methods.items()
+            if method.target_id == target["target_id"]
+            and method.exposure.value == "desktop"
+        }
+        assert {method["method_id"] for method in target["methods"]} == expected_method_ids
+        assert {method["method_id"] for method in target["accepted_methods"]} == {
+            method_id
+            for method_id, method in registry.snapshot.methods.items()
+            if method.target_id == target["target_id"]
+        }
+        for method in target["methods"]:
+            method_descriptor = registry.snapshot.methods[method["method_id"]]
+            assert set(method["support"]) == {
+                "overall",
+                "execution",
+                "capture",
+                "harness",
+                "runtime",
+            }
+            assert method["implementation_identity_digest"] == (
+                registry.snapshot.identity_digest_for(
+                    DescriptorKind.METHOD,
+                    method_descriptor.id,
+                )
+            )
+            assert method["config_schema_json"] == canonical_json(
+                method_descriptor.config_schema
+            )
+            assert method["default_config_json"] == canonical_json(
+                method_descriptor.default_config
+            )
+
+
+def test_backend_capabilities_openapi_declares_typed_errors() -> None:
+    operation = create_backend_app().openapi()["paths"]["/capabilities"]["get"]
+
+    for status_code in ("422", "503"):
+        assert operation["responses"][status_code]["content"][
+            "application/json"
+        ]["schema"] == {"$ref": "#/components/schemas/BackendError"}
+
+
+def test_backend_capabilities_fail_closed_without_verified_registry() -> None:
+    response = _client().get(
+        "/capabilities",
+        params={"execution_mode": "codex_subscription_transcript"},
+    )
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "code": "evolution_registry_unavailable",
+        "message": "Verified evolution capabilities are unavailable.",
+        "severity": "blocking",
+        "category": "service",
+        "retryable": True,
+        "repair_action": "openevo_can_retry",
+        "details": {},
+        "logs_ref": None,
+    }
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        {},
+        {"execution_mode": "subscription"},
+        {"execution_mode": "self_deployed"},
+        {"execution_mode": "unknown"},
+    ],
+)
+def test_backend_capabilities_require_valid_release_execution_mode(
+    params: dict,
+    tmp_path: Path,
+) -> None:
+    response = _client(
+        evolution_registry=verified_builtin_registry(tmp_path / "registry")
+    ).get(
+        "/capabilities",
+        params=params,
+    )
+
+    assert response.status_code == 422
+    assert response.json()["code"] == "request_validation_error"
+
+
+def test_backend_rejects_unverified_registry_injection() -> None:
+    class FakeRegistry:
+        snapshot = object()
+
+    with pytest.raises(TypeError, match="verified registry loader"):
+        create_backend_app(evolution_registry=FakeRegistry())  # type: ignore[arg-type]
 
 
 def test_backend_route_surface_is_present() -> None:
@@ -394,7 +571,11 @@ def test_backend_invalid_state_ids_return_typed_client_errors(tmp_path: Path) ->
             assert response.json()["category"] == category
 
 
-def test_backend_accepts_advertised_capability_execution_modes() -> None:
+@pytest.mark.parametrize(
+    "execution_mode",
+    ["codex_subscription_transcript", "self-deployed"],
+)
+def test_backend_accepts_release_execution_modes(execution_mode: str) -> None:
     client = _client()
     project = client.post(
         "/projects",
@@ -403,15 +584,12 @@ def test_backend_accepts_advertised_capability_execution_modes() -> None:
     assert project.status_code == 200
     project_id = project.json()["id"]
 
-    modes = [mode["mode"] for mode in client.get("/capabilities").json()["execution_modes"]]
-    assert modes
-    for mode in modes:
-        response = client.post(
-            "/runs",
-            json=_run_create_payload(project_id, execution_mode=mode),
-        )
-        assert response.status_code == 200
-        assert response.json()["execution_mode"] == mode
+    response = client.post(
+        "/runs",
+        json=_run_create_payload(project_id, execution_mode=execution_mode),
+    )
+    assert response.status_code == 200
+    assert response.json()["execution_mode"] == execution_mode
 
 
 def test_backend_run_create_rejects_benchmark_only_fields() -> None:

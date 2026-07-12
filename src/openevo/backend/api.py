@@ -14,6 +14,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from openevo import __version__
 from openevo.backend.models import (
     ArtifactContent,
     ArtifactDiff,
@@ -38,8 +39,17 @@ from openevo.backend.models import (
     ServiceSummary,
     TimelineEvent,
 )
-from openevo.capabilities import CoreCapabilities, build_core_capabilities
-from openevo.evolution.framework.builtins import VerifiedExecutableRegistry
+from openevo.evolution.framework import (
+    CapabilityAudience,
+    EvolutionCapabilitiesV1,
+    ReleaseExecutionMode,
+    build_evolution_capabilities,
+    execution_profile_for_release_mode,
+)
+from openevo.evolution.framework.builtins import (
+    VerifiedExecutableRegistry,
+    require_verified_executable_registry,
+)
 from openevo.evolution.models import ArtifactResponse
 from openevo.evolution.store import EvolutionStore
 
@@ -94,6 +104,8 @@ def create_backend_app(
     *,
     evolution_registry: VerifiedExecutableRegistry | None = None,
 ) -> FastAPI:
+    if evolution_registry is not None:
+        require_verified_executable_registry(evolution_registry)
     app = FastAPI(title="OpenEvo Core Backend", version="0.1.0")
     app.state.evolution_registry = evolution_registry
     canonical_state_root = _canonical_state_root(state_root)
@@ -397,9 +409,31 @@ def create_backend_app(
         services[service_id] = services[service_id].model_copy(update={"status": "stopped"})
         return ServiceActionResponse(service_id=service_id, status="stopped")
 
-    @app.get("/capabilities", response_model=CoreCapabilities)
-    def capabilities() -> CoreCapabilities:
-        return build_core_capabilities()
+    @app.get(
+        "/capabilities",
+        response_model=EvolutionCapabilitiesV1,
+        responses={422: {"model": BackendError}, 503: {"model": BackendError}},
+    )
+    def capabilities(execution_mode: ReleaseExecutionMode) -> EvolutionCapabilitiesV1:
+        if evolution_registry is None:
+            raise BackendHTTPError(
+                503,
+                BackendError(
+                    code="evolution_registry_unavailable",
+                    message="Verified evolution capabilities are unavailable.",
+                    severity="blocking",
+                    category="service",
+                    retryable=True,
+                    repair_action="openevo_can_retry",
+                ),
+            )
+        profile = execution_profile_for_release_mode(execution_mode)
+        return build_evolution_capabilities(
+            evolution_registry.snapshot,
+            profile=profile,
+            audience=CapabilityAudience.DESKTOP,
+            core_version=__version__,
+        )
 
     return app
 

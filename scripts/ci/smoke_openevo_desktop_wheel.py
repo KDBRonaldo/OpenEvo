@@ -18,8 +18,11 @@ import warnings
 from openevo import __version__ as OPENEVO_VERSION
 from openevo.experiments import compile_experiment
 from openevo.evolution.framework import (
+    CapabilityAudience,
     EvolutionExecutionProfile,
     FrameworkDistributionLock,
+    build_evolution_capabilities,
+    execution_profile_for_release_mode,
 )
 from openevo.evolution.framework.builtins import (
     ImplementationDistributionIdentity,
@@ -149,6 +152,21 @@ class _LifecycleSmokeTransport:
 
 
 class _SmokeBackendClient:
+    def capabilities(self, execution_mode: str) -> dict[str, Any]:
+        snapshot = build_builtin_registry(
+            ImplementationDistributionIdentity(
+                distribution="openevo-smoke",
+                distribution_version=OPENEVO_VERSION,
+                distribution_digest="d" * 64,
+            )
+        )
+        return build_evolution_capabilities(
+            snapshot,
+            profile=execution_profile_for_release_mode(execution_mode),
+            audience=CapabilityAudience.DESKTOP,
+            core_version=OPENEVO_VERSION,
+        ).model_dump(mode="json")
+
     def run_timeline(self, run_id: str) -> list[dict[str, Any]]:
         return [
             {
@@ -238,24 +256,24 @@ def _smoke_config_backed_lifecycle(
     transport: _LifecycleSmokeTransport,
 ) -> None:
     headers = _mutation_headers(client)
-    capabilities = _get_json(client, "/openevo-api/desktop/capabilities")
+    capabilities_path = (
+        "/openevo-api/desktop/capabilities"
+        "?execution_mode=codex_subscription_transcript"
+    )
+    capabilities = _get_json(client, capabilities_path, headers=headers)
     method_ids = {
         method["method_id"]
-        for method in capabilities["evolution_methods"]
-        if method.get("visible_in_desktop")
+        for target in capabilities["targets"]
+        for method in target["methods"]
     }
     if not {
-        "text_memory_reflector",
+        "text_memory_expel_reflector",
         "skill_bundle_reflector",
-        "agent_system_reflector",
+        "agent_system_gepa_reflector",
     }.issubset(method_ids):
-        raise SmokeFailure("Desktop capabilities did not expose science methods.")
-
-    methods = _get_json(client, "/openevo-api/desktop/methods")
-    if "text_memory_reflector" not in {
-        method["method_id"] for method in methods["methods"]
-    }:
-        raise SmokeFailure("Desktop methods alias did not expose text memory.")
+        raise SmokeFailure(
+            "Remote registry capabilities did not expose release science methods."
+        )
 
     draft = _desktop_config_draft_payload()
     config = _post_json(

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+import hashlib
 from pathlib import Path
 import subprocess
 import sys
+from zipfile import ZIP_DEFLATED, ZipFile
 
 import pytest
 
@@ -12,12 +14,12 @@ from openevo.evolution.framework import builtins
 from openevo.evolution.framework.builtins import (
     BUILTIN_METHOD_IDS,
     ImplementationDistributionIdentity,
+    VerifiedExecutableRegistry,
     build_builtin_registry,
     load_builtin_method_handles,
     load_verified_builtin_registry,
 )
 from openevo.evolution.framework.contracts import (
-    DescriptorKind,
     EvolutionExecutionProfile,
     Exposure,
     ImplementationIdentity,
@@ -36,11 +38,13 @@ from openevo.evolution.framework.loading import (
     VerifiedDistribution,
 )
 from openevo.evolution.framework.registry import RegistrySnapshot
+from openevo.evolution.framework.resolution import resolve_agent_system_method
 from openevo.evolution.framework.support import (
     MethodSupportOverall,
     evaluate_method_support,
 )
 from openevo.evolution.models import WorkerClaimInputArtifact, WorkerClaimedJob
+from tests.framework_testkit import verify_distribution_install_for_test
 
 
 TARGET_IDS = {
@@ -78,8 +82,49 @@ REFLECTOR_METHOD_IDS = {
     "agent_system_pareto_reflector",
     "agent_system_gepa_reflector",
 }
+
+
 METHODS_MODULE = "openevo.evolution.methods"
 BUILTINS_MODULE = "openevo.evolution.framework.builtins"
+
+
+class _SourceDistribution:
+    version = "0.1.0"
+    metadata = {"Name": "openevo"}
+
+    def __init__(self, install_root: Path) -> None:
+        self._install_root = install_root
+
+    def locate_file(self, path: str) -> Path:
+        return self._install_root / path
+
+    def read_text(self, filename: str) -> None:
+        return None
+
+
+def _verify_source_distribution(tmp_path: Path) -> VerifiedDistribution:
+    install_root = Path(builtins.__file__).resolve().parents[3]
+    artifact = tmp_path / "openevo-0.1.0-py3-none-any.whl"
+    with ZipFile(artifact, "w", compression=ZIP_DEFLATED) as wheel:
+        for path in sorted((install_root / "openevo").rglob("*")):
+            if path.is_file() and path.name.endswith(
+                (".py", ".pyi", ".so", ".pyd", ".dll", ".dylib")
+            ):
+                wheel.write(path, path.relative_to(install_root).as_posix())
+        wheel.writestr(
+            "openevo-0.1.0.dist-info/METADATA",
+            "Name: openevo\nVersion: 0.1.0\n",
+        )
+    digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
+    return verify_distribution_install_for_test(
+        DistributionArtifactExpectation(
+            distribution="openevo",
+            distribution_version="0.1.0",
+            distribution_digest=digest,
+        ),
+        artifact,
+        lambda _name: _SourceDistribution(install_root),
+    )
 
 
 @pytest.fixture(scope="module")
@@ -139,6 +184,13 @@ def test_builtin_catalog_is_complete_frozen_and_has_expected_defaults(
     assert snapshot.targets["agent_system"].default_method_id == (
         "agent_system_gepa_reflector"
     )
+    auto_resolver = snapshot.targets["agent_system"].selection_resolvers
+    assert len(auto_resolver) == 1
+    assert auto_resolver[0].selection_value == "auto"
+    assert set(auto_resolver[0].resolved_method_ids) == {
+        resolve_agent_system_method("auto", ()),
+        resolve_agent_system_method("auto", ("dataset-prior",)),
+    }
     assert snapshot.targets["parametric_memory"].exposure is Exposure.INTERNAL
     assert all(
         snapshot.targets[target_id].exposure is Exposure.DESKTOP
@@ -432,49 +484,44 @@ def test_load_builtin_method_handles_rejects_wrong_callable_identity(
         load_builtin_method_handles(snapshot, verified_loader=verified_loader)
 
 
+def test_verified_distribution_cannot_be_constructed_publicly() -> None:
+    with pytest.raises(TypeError, match="verify_distribution_install"):
+        VerifiedDistribution()
+
+
+def test_verified_registry_cannot_be_constructed_publicly() -> None:
+    with pytest.raises(TypeError, match="verified registry loader"):
+        VerifiedExecutableRegistry()
+
+
 def test_verified_builtin_registry_loads_every_anchor_and_exact_method_handle(
     tmp_path: Path,
 ) -> None:
-    verified = VerifiedDistribution(
-        expectation=DistributionArtifactExpectation(
-            distribution="openevo",
-            distribution_version="0.1.0",
-            distribution_digest="a" * 64,
-        ),
-        install_root=tmp_path,
-        inventory={},
-        inventory_digest="b" * 64,
-    )
-    loaded_keys: list[tuple[DescriptorKind, str]] = []
-
-    def fake_loader(implementation, verified_distribution, **expected):
-        assert verified_distribution is verified
-        kind = DescriptorKind(expected["expected_kind"])
-        descriptor_id = expected["expected_id"]
-        loaded_keys.append((kind, descriptor_id))
-        if kind is DescriptorKind.METHOD:
-            assert expected["invocation_abi"] == "legacy_worker_job_v1"
-            return methods.METHOD_REGISTRY[descriptor_id]
-        _, attribute_name = _entry_point_parts(implementation.entry_point)
-        return getattr(builtins, attribute_name)
-
-    loaded = load_verified_builtin_registry(
-        verified,
-        entry_point_loader=fake_loader,
-    )
+    verified = _verify_source_distribution(tmp_path)
+    loaded = load_verified_builtin_registry(verified)
 
     assert frozenset(loaded.method_handles) == frozenset(METHOD_IDS)
+    assert loaded.distribution_attestations == {
+        verified.expectation.distribution_digest: verified
+    }
     assert frozenset(loaded.descriptor_anchors) == frozenset(
         {
             *(f"target:{target_id}" for target_id in TARGET_IDS),
             *(f"target_handler:{handler_id}" for handler_id in HANDLER_IDS),
         }
     )
-    assert set(loaded_keys) == {
-        *((DescriptorKind.METHOD, method_id) for method_id in METHOD_IDS),
-        *((DescriptorKind.TARGET, target_id) for target_id in TARGET_IDS),
-        *((DescriptorKind.TARGET_HANDLER, handler_id) for handler_id in HANDLER_IDS),
-    }
+
+
+def test_verified_builtin_registry_has_no_loader_injection_hook(
+    tmp_path: Path,
+) -> None:
+    verified = _verify_source_distribution(tmp_path)
+
+    with pytest.raises(TypeError, match="entry_point_loader"):
+        load_verified_builtin_registry(  # type: ignore[call-arg]
+            verified,
+            entry_point_loader=lambda *_args, **_kwargs: None,
+        )
 
 
 def test_builtin_registry_digest_is_stable_in_fresh_processes() -> None:

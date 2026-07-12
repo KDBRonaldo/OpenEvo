@@ -72,6 +72,36 @@ class EvolutionMethodCapabilityV1(_Contract):
         return self
 
 
+class EvolutionResolvedMethodCapabilityV1(_Contract):
+    method_id: str
+    implementation_identity_digest: str
+    support: MethodSupport
+
+    _id = field_validator("method_id")(_stable_id)
+    _digest = field_validator("implementation_identity_digest")(_digest)
+
+
+class EvolutionSelectionResolverCapabilityV1(_Contract):
+    selection_value: str
+    display_name: str
+    description: str
+    resolved_methods: tuple[EvolutionResolvedMethodCapabilityV1, ...]
+
+    _selection = field_validator("selection_value")(_stable_id)
+    _text_fields = field_validator("display_name", "description")(_text)
+
+    @field_validator("resolved_methods")
+    @classmethod
+    def _canonical_resolved_methods(
+        cls,
+        values: tuple[EvolutionResolvedMethodCapabilityV1, ...],
+    ) -> tuple[EvolutionResolvedMethodCapabilityV1, ...]:
+        method_ids = tuple(value.method_id for value in values)
+        if not method_ids or len(method_ids) != len(set(method_ids)):
+            raise ValueError("selection resolver method IDs must be non-empty and unique")
+        return tuple(sorted(values, key=lambda value: value.method_id))
+
+
 class EvolutionTargetCapabilityV1(_Contract):
     target_id: str
     display_name: str
@@ -89,6 +119,8 @@ class EvolutionTargetCapabilityV1(_Contract):
     context_order: int
     implementation_identity_digest: str
     handler_identity_digest: str
+    accepted_methods: tuple[EvolutionResolvedMethodCapabilityV1, ...]
+    selection_resolvers: tuple[EvolutionSelectionResolverCapabilityV1, ...]
     methods: tuple[EvolutionMethodCapabilityV1, ...]
 
     _ids = field_validator(
@@ -116,14 +148,58 @@ class EvolutionTargetCapabilityV1(_Contract):
             raise ValueError("capability target method IDs must be unique")
         return tuple(sorted(values, key=lambda value: value.method_id))
 
+    @field_validator("accepted_methods")
+    @classmethod
+    def _canonical_accepted_methods(
+        cls,
+        values: tuple[EvolutionResolvedMethodCapabilityV1, ...],
+    ) -> tuple[EvolutionResolvedMethodCapabilityV1, ...]:
+        method_ids = tuple(value.method_id for value in values)
+        if not method_ids or len(method_ids) != len(set(method_ids)):
+            raise ValueError("accepted method IDs must be non-empty and unique")
+        return tuple(sorted(values, key=lambda value: value.method_id))
+
+    @field_validator("selection_resolvers")
+    @classmethod
+    def _canonical_selection_resolvers(
+        cls,
+        values: tuple[EvolutionSelectionResolverCapabilityV1, ...],
+    ) -> tuple[EvolutionSelectionResolverCapabilityV1, ...]:
+        selection_values = tuple(value.selection_value for value in values)
+        if len(selection_values) != len(set(selection_values)):
+            raise ValueError("capability selection resolver values must be unique")
+        return tuple(sorted(values, key=lambda value: value.selection_value))
+
     @model_validator(mode="after")
     def _default_is_visible(self) -> EvolutionTargetCapabilityV1:
         methods = {method.method_id: method for method in self.methods}
+        accepted_methods = {
+            method.method_id: method for method in self.accepted_methods
+        }
         if self.configured_default_method_id not in methods:
             raise ValueError("capability target default method is not visible")
         configured = methods[self.configured_default_method_id]
         if self.configured_default_support != configured.support:
             raise ValueError("capability target default support does not match method")
+        for method in self.methods:
+            accepted = accepted_methods.get(method.method_id)
+            if accepted is None:
+                raise ValueError("visible capability method is not accepted")
+            if (
+                accepted.implementation_identity_digest
+                != method.implementation_identity_digest
+                or accepted.support != method.support
+            ):
+                raise ValueError("visible and accepted method metadata does not match")
+        for resolver in self.selection_resolvers:
+            for method in resolver.resolved_methods:
+                accepted = accepted_methods.get(method.method_id)
+                if accepted is None:
+                    raise ValueError("selection resolver method is not accepted")
+                if accepted != method:
+                    raise ValueError(
+                        "selection resolver and accepted method metadata does not match"
+                    )
         if self.effective_default_method_id is not None:
             if self.effective_default_method_id != self.configured_default_method_id:
                 raise ValueError(
@@ -184,6 +260,20 @@ def build_evolution_capabilities(
         if target.exposure not in visible_exposures:
             continue
         handler = snapshot.target_handlers[target.handler_id]
+        accepted_methods = tuple(
+            EvolutionResolvedMethodCapabilityV1(
+                method_id=method.id,
+                implementation_identity_digest=snapshot.identity_digest_for(
+                    "method", method.id
+                ),
+                support=evaluate_method_support(method, profile),
+            )
+            for method in (
+                snapshot.methods[method_id]
+                for method_id in sorted(snapshot.methods)
+                if snapshot.methods[method_id].target_id == target.id
+            )
+        )
         methods: list[EvolutionMethodCapabilityV1] = []
         for method_id in sorted(snapshot.methods):
             method = snapshot.methods[method_id]
@@ -243,6 +333,28 @@ def build_evolution_capabilities(
                 handler_identity_digest=snapshot.identity_digest_for(
                     "target_handler", handler.id
                 ),
+                accepted_methods=accepted_methods,
+                selection_resolvers=tuple(
+                    EvolutionSelectionResolverCapabilityV1(
+                        selection_value=resolver.selection_value,
+                        display_name=resolver.display_name,
+                        description=resolver.description,
+                        resolved_methods=tuple(
+                            EvolutionResolvedMethodCapabilityV1(
+                                method_id=method_id,
+                                implementation_identity_digest=(
+                                    snapshot.identity_digest_for("method", method_id)
+                                ),
+                                support=evaluate_method_support(
+                                    snapshot.methods[method_id],
+                                    profile,
+                                ),
+                            )
+                            for method_id in resolver.resolved_method_ids
+                        ),
+                    )
+                    for resolver in target.selection_resolvers
+                ),
                 methods=tuple(methods),
             )
         )
@@ -258,6 +370,8 @@ __all__ = [
     "CapabilityAudience",
     "EvolutionCapabilitiesV1",
     "EvolutionMethodCapabilityV1",
+    "EvolutionResolvedMethodCapabilityV1",
+    "EvolutionSelectionResolverCapabilityV1",
     "EvolutionTargetCapabilityV1",
     "build_evolution_capabilities",
 ]

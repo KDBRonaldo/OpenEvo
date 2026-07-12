@@ -13,6 +13,7 @@ from openevo.evolution.framework import (
     EnvironmentBinding,
     EvolutionExecutionProfile,
     EvolutionMethodDescriptor,
+    EvolutionSelectionResolverDescriptor,
     EvolutionTargetDescriptor,
     EvolutionTargetSelection,
     MethodInputBinding,
@@ -258,6 +259,35 @@ def test_visible_target_requires_visible_default_method() -> None:
         exposure="desktop",
     )
     with pytest.raises(ValueError, match="default method is hidden"):
+        _registry(descriptors).freeze()
+
+
+@pytest.mark.parametrize(
+    ("selection_value", "resolved_method_ids", "message"),
+    [
+        ("auto", ("missing",), "references unknown method"),
+        ("reflect", ("reflect",), "shadows a method ID"),
+    ],
+)
+def test_target_selection_resolver_graph_fails_closed(
+    selection_value: str,
+    resolved_method_ids: tuple[str, ...],
+    message: str,
+) -> None:
+    descriptors = _replace(
+        _descriptors(),
+        EvolutionTargetDescriptor,
+        selection_resolvers=(
+            EvolutionSelectionResolverDescriptor(
+                selection_value=selection_value,
+                display_name="Automatic",
+                description="Resolve a concrete method.",
+                resolved_method_ids=resolved_method_ids,
+            ),
+        ),
+    )
+
+    with pytest.raises(ValueError, match=message):
         _registry(descriptors).freeze()
 
 

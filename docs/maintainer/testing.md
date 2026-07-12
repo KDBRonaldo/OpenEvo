@@ -81,6 +81,7 @@ cd desktop
 npm ci
 npm audit --audit-level=high
 npm test -- --run
+npm run typecheck
 npm run build:openevo
 npm run build:sidecar
 cd src-tauri
@@ -101,6 +102,13 @@ artifact inspection, diagnostics export, deletion/cleanup, and upgrade/rollback
 state migration. Fake transports may be used in CI only when the evidence is
 clearly marked as a non-release substitute; the release candidate needs real
 canary evidence for the supported release modes.
+
+Remote capability discovery has an additional artifact-level gate. In a clean
+environment containing the exact Core wheel, run
+`scripts/ci/smoke_openevo_remote_capabilities.py --wheel <exact-core-wheel>
+--sidecar <packaged-sidecar>`. It must start Core with its external framework
+lock and exercise the packaged sidecar over a real HTTP listener; a source
+`TestClient` or local fake capability catalog does not satisfy this gate.
 
 ## Release Identity
 
