@@ -39,6 +39,23 @@ pre-release runtime identity。新 producers 和新文档必须使用 OpenEvo id
 - `/v1/jobs/{job_id}/fail`
 - `/v1/contexts/resolve`
 
+`artifact_payloads.py` 是 handler runtime 的 Core-owned 本地 payload 安全边界。它只扫描
+Evolution Backend 配置的 artifact root 内 normalized `file://` regular
+files/directories，使用 no-follow/nonblocking directory-relative opens，生成 ephemeral
+opaque handles 和 canonical digest inventory。Linux Core 先用 `O_PATH` 固定并验型节点，
+再从 fixed fd 获取可读对象；所有目录/文件节点在排序前受总量限制，snapshot 签发前会重验
+每个后代 identity。Text handler 读取时会重新打开并验证完整文件的 identity、digest 和
+UTF-8，只返回 character/byte 双重上限内的 prefix，并在读取量超过 snapshot size 时立即
+失败。没有 Linux `O_PATH`/`/proc/self/fd` 等价语义的平台会 fail closed。
+
+Issued inventory 不是 source bytes 的 immutable copy 或 lease；source 在签发后仍可能变化。
+因此任何 byte-consuming read/staging 都必须重新校验 exact size、identity 和 digest。当前
+text read 已执行该规则，未来 materializer 必须复用同一规则，不能只信任 inventory metadata。
+
+该 scanner 当前尚未接入 legacy `/v1/contexts/resolve` 和 Gateway materialization；这两处
+仍是 A2.4 后续工作。它不支持远程 `hf`/`https`/`s3` inventory，不解压 archives，也不允许
+把 artifact root 外的任意 host path 加入信任范围。
+
 这个 backend 不负责训练 LoRA adapters，也不负责 serving inference。
 Parametric memory artifacts 会被注册到 backend，并在 context resolve 时以
 adapter merge specs 的形式返回给 trainer 和 inference infrastructure。

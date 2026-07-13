@@ -116,7 +116,7 @@ def payload_tree_size(
 
 
 class TrustedArtifactSnapshot(_Contract):
-    """Core-issued payload inventory; no host path or artifact URI is exposed."""
+    """Core-issued inventory; bytes require service/materializer revalidation."""
 
     artifact_id: str = Field(min_length=1, max_length=256)
     artifact_type: str

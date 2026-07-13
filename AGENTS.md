@@ -56,6 +56,9 @@ harness 只要能提供稳定 transcript，都应能接入 pure-text evolution�
 - `src/openevo/platform/`: observability platform APIs and helpers。
 - `src/openevo/evolution/`: Evolution Backend，包含 events、datasets、jobs、workers、
   artifacts 和 context resolver。
+- `src/openevo/evolution/artifact_payloads.py`: Core-owned `file://` payload scanner、
+  ephemeral opaque handle 和 bounded verified text-read service；只允许 Core-managed
+  artifact root 内的 regular files/directories。
 - `src/openevo/experiments/`: experiment compiler/runner/promotion helpers。
 - `src/openevo/projects/science/`: ordinary-user science project config/compiler。
 - `src/openevo/deployment/`: remote deployment lifecycle、bootstrap、preflight、SSH transport。

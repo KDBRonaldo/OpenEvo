@@ -1,6 +1,6 @@
 # Pluggable Evolution Framework
 
-Status: A2.3 Core plus A2.4 Desktop config/preflight and executable handlers implemented
+Status: A2.3 Core plus A2.4 Desktop config/preflight, executable handlers, and payload scanner implemented
 
 Tracking: issues #137, #139, #141, #142, #144, #146, #148, and #150, productization step A2. A2.1
 implements contracts for `PLUG-1` through `PLUG-4`; A2.2 catalogs the existing
@@ -445,12 +445,39 @@ identity fields use the same deterministic name/artifact-ID, `lora`, and
 requested-model fallbacks in both the handler and validator. No last-writer-wins
 behavior is allowed.
 
-A2.1 validates DTO inventory/digest consistency, and the current A2.4 slice
-loads the built-in handlers as verified callables. Before runtime cutover, the
-Core payload scanner/materializer must bind opaque handles to roots and implement
-realpath containment, no-follow opens, symlink/device/FIFO/socket rejection,
-archive limits, post-open identity, and verified staging. An inventory supplied
-by a handler is never proof that host bytes were read safely.
+A2.1 validates DTO inventory/digest consistency. Current A2.4 loads the built-in
+handlers as verified callables and implements the Core-owned local payload
+scanner in `openevo.evolution.artifact_payloads`. The scanner accepts only
+normalized authority-free `file://` URIs contained by the configured
+Core-managed artifact root. It traverses with directory-relative no-follow,
+nonblocking opens. On the current Linux Core release, `O_PATH|O_NOFOLLOW` first
+fixes and validates every untrusted node before Core obtains a readable fd from
+that fixed object, so a stat/open race cannot open a substituted device as data.
+The scanner rejects symlinks and non-regular/non-directory nodes; bounds all
+visited file/directory nodes before sorting; checks pre-open, opened, post-read,
+and final descendant path identities; streams bounded inventory digests; and
+validates the entire UTF-8 file even when returning only a prefix. A verified
+reread aborts immediately if bytes exceed the issued size. Opaque handles are
+random, process-local, collision-checked, and invalidated when the service
+closes. Unknown suffixes become `application/octet-stream`; descriptor MIME
+validation remains authoritative. Platforms without Linux `O_PATH` fail closed
+until an equivalent fixed-object implementation exists; this does not affect
+the macOS Desktop host because Core payload scanning runs on the remote server.
+
+An issued inventory is not an immutable copy or filesystem lease. The final
+descendant stability pass rejects mutation observed during scanning, but a
+source may change immediately afterward. Therefore inventory metadata alone
+never authorizes byte consumption: `read_utf8_prefix` and the future
+materializer must reopen the fixed object and revalidate identity, exact size,
+and digest. Drift fails closed; Core never returns or stages the changed bytes.
+
+The scanner does not download or invent inventory for `hf`, `https`, or `s3`
+references, and it does not extract archives. Resolver invocation and the
+materializer cutover are still pending: verified staging must repeat inventory
+identity/digest checks and enforce archive limits if extraction is added. Until
+that cutover, the legacy Gateway skill URI copy remains a documented TOCTOU
+risk. An inventory supplied by a handler is never proof that host bytes were
+staged safely.
 Method plugins run with worker permissions. Target handlers are Core-loaded and
 run with Core-process permissions unless a future isolation boundary says
 otherwise. Neither contract claims to sandbox arbitrary Python.

@@ -9,6 +9,14 @@ Runtime context 的注入发生在 gateway session 被 dispatch 之后、agent h
 同时 backend 仍然可以基于真实 task、agent、policy、rollout step 和 served model
 选择上下文。
 
+当前处于 handler runtime cutover 过渡期。Core 已实现只读取 managed artifact root 的
+no-follow payload scanner、opaque handle 和全文件 digest/UTF-8 重验，但现有
+`/v1/contexts/resolve` 和 Gateway staging 还在消费 legacy response/URI。完成 generic
+resolver 和 materializer 切换前，scanner 不代表 skill URI copy 已具备端到端 TOCTOU
+保护；release 路径不得把任意外部 `file://` root 加入 scanner allowlist。当前 scanner
+依赖 Linux Core 的 `O_PATH` 和 `/proc/self/fd` fixed-object reopen；macOS Desktop 不在
+本地执行该 payload scan。
+
 ## 端到端流程
 
 ```mermaid
@@ -105,10 +113,14 @@ flowchart LR
     ContextSkill --> FileURI --> StageDir --> RuntimeDir --> HarnessSkillDir
 ```
 
-支持的 skill artifacts 是 `file://` URIs，指向以下两种之一：
+legacy Gateway 支持的 skill artifacts 是 `file://` URIs，指向以下两种之一：
 
 - 包含 `SKILL.md` 的目录；
 - 单个 skill 文件。
+
+新的 verified `skill_bundle` handler 要求 scanned inventory 的根目录包含 `SKILL.md`
+（直接指向名为 `SKILL.md` 的单文件也满足该 inventory contract）。generic
+materializer 切换后，不再支持把任意文件名当作完整 skill bundle。
 
 坏掉的 skill artifact 会被逐个跳过，并记录到 `context.json["warnings"]`。陈旧或
 非 file URI 的 skill 不会再导致 memory 或 adapter context 被整体丢弃。
