@@ -267,6 +267,92 @@ CREATE TABLE context_materializations (
 );
 """
 
+_REVISION_LEDGER_SCHEMA = """
+CREATE TABLE execution_snapshots (
+    execution_snapshot_id TEXT PRIMARY KEY,
+    created_at TEXT NOT NULL,
+    snapshot_digest TEXT NOT NULL UNIQUE,
+    producer_id TEXT NOT NULL,
+    snapshot_json TEXT NOT NULL
+);
+CREATE TABLE revisions (
+    revision_id TEXT PRIMARY KEY,
+    stream_id TEXT NOT NULL,
+    generation INTEGER NOT NULL CHECK(typeof(generation) = 'integer' AND generation >= 0),
+    predecessor_revision_id TEXT,
+    created_at TEXT NOT NULL,
+    manifest_digest TEXT NOT NULL UNIQUE,
+    manifest_json TEXT NOT NULL,
+    context_id TEXT NOT NULL,
+    context_manifest_digest TEXT NOT NULL,
+    registry_digest TEXT NOT NULL,
+    execution_snapshot_id TEXT NOT NULL,
+    execution_snapshot_digest TEXT NOT NULL,
+    adapter_set_digest TEXT NOT NULL,
+    UNIQUE(stream_id, generation),
+    CHECK(
+        (generation = 0 AND predecessor_revision_id IS NULL)
+        OR (generation > 0 AND predecessor_revision_id IS NOT NULL)
+    ),
+    FOREIGN KEY(predecessor_revision_id) REFERENCES revisions(revision_id),
+    FOREIGN KEY(context_id) REFERENCES context_materializations(context_id),
+    FOREIGN KEY(execution_snapshot_id)
+        REFERENCES execution_snapshots(execution_snapshot_id)
+);
+CREATE TABLE revision_streams (
+    stream_id TEXT PRIMARY KEY,
+    active_revision_id TEXT NOT NULL UNIQUE,
+    active_generation INTEGER NOT NULL CHECK(
+        typeof(active_generation) = 'integer' AND active_generation >= 0
+    ),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(active_revision_id) REFERENCES revisions(revision_id)
+);
+CREATE TABLE task_admissions (
+    admission_id TEXT PRIMARY KEY,
+    stream_id TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    required_generation INTEGER NOT NULL CHECK(
+        typeof(required_generation) = 'integer' AND required_generation >= 0
+    ),
+    request_digest TEXT NOT NULL UNIQUE,
+    request_json TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(
+        status IN ('queued', 'admitted', 'completed', 'failed', 'cancelled')
+    ),
+    reason TEXT,
+    pinned_revision_id TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    finished_at TEXT,
+    UNIQUE(stream_id, task_id),
+    UNIQUE(stream_id, idempotency_key),
+    CHECK(
+        (status = 'queued'
+            AND reason = 'required_revision_uncommitted'
+            AND pinned_revision_id IS NULL
+            AND finished_at IS NULL)
+        OR (status = 'admitted'
+            AND reason IS NULL
+            AND pinned_revision_id IS NOT NULL
+            AND finished_at IS NULL)
+        OR (status IN ('completed', 'failed')
+            AND reason IS NULL
+            AND pinned_revision_id IS NOT NULL
+            AND finished_at IS NOT NULL)
+        OR (status = 'cancelled'
+            AND reason IS NULL
+            AND finished_at IS NOT NULL)
+    ),
+    FOREIGN KEY(stream_id) REFERENCES revision_streams(stream_id),
+    FOREIGN KEY(pinned_revision_id) REFERENCES revisions(revision_id)
+);
+CREATE INDEX idx_task_admissions_active_revision
+ON task_admissions(pinned_revision_id) WHERE status = 'admitted';
+"""
+
 # Independent historical fixtures. These reproduce stable first-parent commits
 # 8462ec039b530bf13005e0919e5c5b319950f9fd,
 # d85df7461b7c66bf29acf982be1db0fb30a6f03b, and
@@ -658,7 +744,15 @@ def test_current_store_directly_upgrades_original_pre_d85_database(tmp_path) -> 
         artifact_columns = {
             str(row[1]) for row in connection.execute("PRAGMA table_info(artifacts)").fetchall()
         }
+        tables = {
+            str(row[0])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
     assert classification.kind == "current_identity"
+    assert classification.underlying.version is not None
+    assert classification.underlying.version.startswith("revision-ledger-")
     assert {
         "lease_duration_seconds",
         "plan_id",
@@ -669,6 +763,12 @@ def test_current_store_directly_upgrades_original_pre_d85_database(tmp_path) -> 
         "declared_output_artifact_types_json",
     }.issubset(job_columns)
     assert {"staging_job_id", "manifest_json"}.issubset(artifact_columns)
+    assert {
+        "execution_snapshots",
+        "revisions",
+        "revision_streams",
+        "task_admissions",
+    }.issubset(tables)
 
 
 def test_identifies_fresh_d85_migrated_by_de048_as_complete(
@@ -866,6 +966,47 @@ def test_classifies_each_current_branch_complete_layout(
         assert with_identity.kind == "current_identity"
         assert with_identity.identity == "exact"
         assert with_identity.underlying.version == expected_version
+
+
+def test_classifies_exact_revision_ledger_layout() -> None:
+    schema = _STABLE_SCHEMA + _CONTEXT_MATERIALIZATIONS_SCHEMA + _REVISION_LEDGER_SCHEMA
+    with _connection(schema) as connection:
+        without_identity = classify_store_schema(connection)
+        connection.executescript(_STORE_IDENTITY_SCHEMA)
+        with_identity = classify_store_schema(connection)
+
+    expected = "revision-ledger-current-from-stable-de0481385cef"
+    assert without_identity.kind == "current"
+    assert without_identity.underlying.version == expected
+    assert with_identity.kind == "current_identity"
+    assert with_identity.identity == "exact"
+    assert with_identity.underlying.version == expected
+
+
+@pytest.mark.parametrize(
+    "changed_schema",
+    [
+        _REVISION_LEDGER_SCHEMA.replace(
+            "active_generation INTEGER NOT NULL CHECK(\n"
+            "        typeof(active_generation) = 'integer' AND active_generation >= 0\n"
+            "    )",
+            "active_generation INTEGER NOT NULL CHECK(active_generation >= 0)",
+        ),
+        _REVISION_LEDGER_SCHEMA.replace(
+            "WHERE status = 'admitted'",
+            "WHERE status IN ('admitted', 'queued')",
+        ),
+        _REVISION_LEDGER_SCHEMA + "CREATE TABLE revision_audit (value TEXT);",
+    ],
+    ids=["column-check", "partial-index", "extra-table"],
+)
+def test_rejects_revision_ledger_near_matches(changed_schema: str) -> None:
+    schema = _STABLE_SCHEMA + _CONTEXT_MATERIALIZATIONS_SCHEMA + changed_schema
+
+    with _connection(schema) as connection:
+        classification = classify_store_schema(connection)
+
+    assert classification.kind == "invalid"
 
 
 def test_classifies_pre_de048_current_migration_window() -> None:

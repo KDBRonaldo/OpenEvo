@@ -44,7 +44,9 @@ from openevo.evolution.context_materialization import (
     _remove_materialized_entry_if_identity,
 )
 from openevo.evolution.context_snapshot_recovery import (
+    MAX_CONTEXT_SNAPSHOT_BYTES,
     MAX_CONTEXT_SNAPSHOT_ENTRIES,
+    MAX_CONTEXT_SNAPSHOT_INVENTORY_BYTES,
     migrate_legacy_context_snapshot_modes,
     reconcile_context_snapshots,
     write_context_snapshot,
@@ -94,6 +96,31 @@ from openevo.evolution.planned_jobs import (
     PlanBoundJobCreateRequest,
     materialize_plan_bound_job,
     validate_plan_against_snapshot,
+)
+from openevo.evolution.revisions import (
+    AdmissionQueueReason,
+    AdmissionStatus,
+    ExecutionSnapshotRecord,
+    ExecutionSnapshotV1,
+    MAX_EXECUTION_SNAPSHOT_BYTES,
+    MAX_REVISION_MANIFEST_BYTES,
+    RevisionCapacityError,
+    RevisionConflictError,
+    RevisionIntegrityError,
+    RevisionManifestV1,
+    RevisionNotFoundError,
+    RevisionRecord,
+    TaskAdmissionConflictError,
+    TaskAdmissionIntent,
+    TaskAdmissionRecord,
+    TaskAdmissionRequest,
+    TaskExecutionEnvelopeV1,
+    VerifiedExecutionSnapshot,
+    admission_id_for_request,
+    bind_task_admission,
+    execution_snapshot_id_for_snapshot,
+    require_verified_execution_snapshot,
+    revision_id_for_manifest,
 )
 from openevo.evolution.time import utc_now_iso
 from openevo.evolution.framework.contracts import (
@@ -219,6 +246,89 @@ CREATE TABLE IF NOT EXISTS context_materializations (
     manifest_json TEXT NOT NULL,
     FOREIGN KEY(context_id) REFERENCES contexts(context_id) ON DELETE CASCADE
 );
+CREATE TABLE IF NOT EXISTS execution_snapshots (
+    execution_snapshot_id TEXT PRIMARY KEY,
+    created_at TEXT NOT NULL,
+    snapshot_digest TEXT NOT NULL UNIQUE,
+    producer_id TEXT NOT NULL,
+    snapshot_json TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS revisions (
+    revision_id TEXT PRIMARY KEY,
+    stream_id TEXT NOT NULL,
+    generation INTEGER NOT NULL CHECK(typeof(generation) = 'integer' AND generation >= 0),
+    predecessor_revision_id TEXT,
+    created_at TEXT NOT NULL,
+    manifest_digest TEXT NOT NULL UNIQUE,
+    manifest_json TEXT NOT NULL,
+    context_id TEXT NOT NULL,
+    context_manifest_digest TEXT NOT NULL,
+    registry_digest TEXT NOT NULL,
+    execution_snapshot_id TEXT NOT NULL,
+    execution_snapshot_digest TEXT NOT NULL,
+    adapter_set_digest TEXT NOT NULL,
+    UNIQUE(stream_id, generation),
+    CHECK(
+        (generation = 0 AND predecessor_revision_id IS NULL)
+        OR (generation > 0 AND predecessor_revision_id IS NOT NULL)
+    ),
+    FOREIGN KEY(predecessor_revision_id) REFERENCES revisions(revision_id),
+    FOREIGN KEY(context_id) REFERENCES context_materializations(context_id),
+    FOREIGN KEY(execution_snapshot_id)
+        REFERENCES execution_snapshots(execution_snapshot_id)
+);
+CREATE TABLE IF NOT EXISTS revision_streams (
+    stream_id TEXT PRIMARY KEY,
+    active_revision_id TEXT NOT NULL UNIQUE,
+    active_generation INTEGER NOT NULL CHECK(
+        typeof(active_generation) = 'integer' AND active_generation >= 0
+    ),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(active_revision_id) REFERENCES revisions(revision_id)
+);
+CREATE TABLE IF NOT EXISTS task_admissions (
+    admission_id TEXT PRIMARY KEY,
+    stream_id TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    required_generation INTEGER NOT NULL CHECK(
+        typeof(required_generation) = 'integer' AND required_generation >= 0
+    ),
+    request_digest TEXT NOT NULL UNIQUE,
+    request_json TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(
+        status IN ('queued', 'admitted', 'completed', 'failed', 'cancelled')
+    ),
+    reason TEXT,
+    pinned_revision_id TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    finished_at TEXT,
+    UNIQUE(stream_id, task_id),
+    UNIQUE(stream_id, idempotency_key),
+    CHECK(
+        (status = 'queued'
+            AND reason = 'required_revision_uncommitted'
+            AND pinned_revision_id IS NULL
+            AND finished_at IS NULL)
+        OR (status = 'admitted'
+            AND reason IS NULL
+            AND pinned_revision_id IS NOT NULL
+            AND finished_at IS NULL)
+        OR (status IN ('completed', 'failed')
+            AND reason IS NULL
+            AND pinned_revision_id IS NOT NULL
+            AND finished_at IS NOT NULL)
+        OR (status = 'cancelled'
+            AND reason IS NULL
+            AND finished_at IS NOT NULL)
+    ),
+    FOREIGN KEY(stream_id) REFERENCES revision_streams(stream_id),
+    FOREIGN KEY(pinned_revision_id) REFERENCES revisions(revision_id)
+);
+CREATE INDEX IF NOT EXISTS idx_task_admissions_active_revision
+ON task_admissions(pinned_revision_id) WHERE status = 'admitted';
 CREATE TABLE IF NOT EXISTS review_packets (
     packet_id TEXT PRIMARY KEY,
     packet_hash TEXT NOT NULL UNIQUE,
@@ -299,6 +409,35 @@ MAX_ARTIFACT_ID_ATTEMPTS = 10
 MAX_DATASET_ID_ATTEMPTS = 10
 MAX_CONTEXT_ID_ATTEMPTS = 10
 MAX_CONTEXT_MATERIALIZATION_RECOVERY_ROWS = 16_384
+MAX_CONTEXT_MATERIALIZATION_RECOVERY_BYTES = 256 * 1024 * 1024
+MAX_CONTEXT_MATERIALIZATION_ROW_BYTES = 4 * 1024 * 1024
+MAX_EXECUTION_SNAPSHOT_RECOVERY_ROWS = 4_096
+MAX_EXECUTION_SNAPSHOT_RECOVERY_BYTES = 64 * 1024 * 1024
+MAX_EXECUTION_SNAPSHOT_ROW_BYTES = 128 * 1024
+MAX_REVISION_RECOVERY_ROWS = 16_384
+MAX_REVISION_RECOVERY_BYTES = 64 * 1024 * 1024
+MAX_REVISION_ROW_BYTES = MAX_REVISION_MANIFEST_BYTES + 16 * 1024
+MAX_REVISION_STREAM_RECOVERY_ROWS = 4_096
+MAX_REVISION_STREAM_RECOVERY_BYTES = 4 * 1024 * 1024
+MAX_REVISION_STREAM_ROW_BYTES = 16 * 1024
+MAX_TASK_ADMISSION_RECOVERY_ROWS = 65_536
+MAX_TASK_ADMISSION_RECOVERY_BYTES = 128 * 1024 * 1024
+MAX_TASK_ADMISSION_ROW_BYTES = 128 * 1024
+_TASK_ADMISSION_TEXT_BLOB_COLUMNS = (
+    "admission_id",
+    "stream_id",
+    "task_id",
+    "idempotency_key",
+    "request_digest",
+    "request_json",
+    "status",
+    "reason",
+    "pinned_revision_id",
+    "created_at",
+    "updated_at",
+    "finished_at",
+)
+RECOVERY_FETCH_ROWS = 128
 _STORE_IDENTITY_FILENAME = ".openevo-store.json"
 _STORE_IDENTITY_MAX_BYTES = 4096
 _STORE_ID_RE = re.compile(r"store_[0-9a-f]{16}\Z", re.ASCII)
@@ -352,6 +491,416 @@ class _OrphanMaterialization:
     identity: _PrivateFileIdentity
 
 
+@dataclass(slots=True)
+class _RecoveryBudget:
+    label: str
+    max_rows: int
+    max_bytes: int
+    max_row_bytes: int
+    rows: int = 0
+    bytes: int = 0
+
+    def consume_lengths(self, lengths: tuple[int, ...]) -> None:
+        if any(type(length) is not int or length < 0 for length in lengths):
+            raise RevisionIntegrityError(f"{self.label} has an invalid SQL byte length")
+        row_bytes = sum(lengths)
+        self.rows += 1
+        self.bytes += row_bytes
+        if row_bytes > self.max_row_bytes:
+            raise RevisionIntegrityError(f"{self.label} exceeds the row byte limit")
+        if self.rows > self.max_rows:
+            raise RevisionIntegrityError(f"{self.label} exceeds the row limit")
+        if self.bytes > self.max_bytes:
+            raise RevisionIntegrityError(f"{self.label} exceeds the aggregate byte limit")
+
+
+@dataclass(frozen=True, slots=True)
+class _GuardedTextSpec:
+    column: str
+    output: str
+    max_bytes: int
+    nullable: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class _GuardedRowPlan:
+    key: str
+    lengths: tuple[int, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _MaterializationRecoveryIdentity:
+    context_id: str
+    manifest_digest: str
+    registry_digest: str
+    request_digest: str
+    base_model: str | None
+    execution_mode: str
+    capture_mode: str
+    artifact_ids: tuple[str, ...]
+    adapter_set_digest: str
+
+
+@dataclass(frozen=True, slots=True)
+class _ExecutionSnapshotRecoveryIdentity:
+    snapshot_digest: str
+    producer_id: str
+    model_id: str
+    execution_mode: str
+    capture_mode: str
+
+
+@dataclass(frozen=True, slots=True)
+class _RevisionRecoveryIdentity:
+    revision_id: str
+    stream_id: str
+    generation: int
+    predecessor_revision_id: str | None
+    project_snapshot_id: str
+    workspace_snapshot_id: str
+    context_id: str
+    context_artifact_ids: tuple[str, ...]
+    context_artifact_set_digest: str
+    execution_snapshot_id: str
+    execution_mode: str
+    capture_mode: str
+
+
+@dataclass(frozen=True, slots=True)
+class _AuthoritativeRevisionClosure:
+    revision_id: str
+    manifest: RevisionManifestV1
+    identity: _RevisionRecoveryIdentity
+
+
+def _sqlite_text_blob_bytes(values: sqlite3.Row | tuple[object, ...]) -> int:
+    total = 0
+    for value in values:
+        if isinstance(value, str):
+            total += len(value.encode("utf-8"))
+        elif isinstance(value, bytes | bytearray | memoryview):
+            total += len(value)
+    return total
+
+
+def _scan_guarded_row_plans(
+    conn: sqlite3.Connection,
+    *,
+    from_sql: str,
+    key_spec: _GuardedTextSpec,
+    text_specs: tuple[_GuardedTextSpec, ...],
+    order_by_sql: str,
+    budget: _RecoveryBudget,
+) -> list[_GuardedRowPlan]:
+    key_length = f"length(CAST({key_spec.column} AS BLOB))"
+    selections = [
+        "CASE WHEN typeof({column}) = 'text' AND {length} <= {maximum} "
+        "THEN {column} END AS __row_key".format(
+            column=key_spec.column,
+            length=key_length,
+            maximum=key_spec.max_bytes,
+        )
+    ]
+    for index, spec in enumerate(text_specs):
+        length = f"length(CAST({spec.column} AS BLOB))"
+        selections.append(
+            f"CASE WHEN {spec.column} IS NULL THEN -1 ELSE {length} END AS __length_{index}"
+        )
+    cursor = conn.execute(
+        f"SELECT {', '.join(selections)} FROM {from_sql} ORDER BY {order_by_sql}"
+    )
+    plans: list[_GuardedRowPlan] = []
+    while True:
+        rows = cursor.fetchmany(RECOVERY_FETCH_ROWS)
+        if not rows:
+            return plans
+        for row in rows:
+            key = row["__row_key"]
+            if not isinstance(key, str):
+                raise RevisionIntegrityError(f"{budget.label} row key is invalid")
+            lengths: list[int] = []
+            for index, spec in enumerate(text_specs):
+                length = row[f"__length_{index}"]
+                if type(length) is not int or length < -1:
+                    raise RevisionIntegrityError(f"{budget.label} has an invalid SQL byte length")
+                if length == -1:
+                    if not spec.nullable:
+                        raise RevisionIntegrityError(
+                            f"{budget.label} has a null required text value"
+                        )
+                    lengths.append(-1)
+                    continue
+                if length > spec.max_bytes:
+                    raise RevisionIntegrityError(f"{budget.label} exceeds the value byte limit")
+                lengths.append(length)
+            budget.consume_lengths(tuple(0 if length == -1 else length for length in lengths))
+            plans.append(_GuardedRowPlan(key=key, lengths=tuple(lengths)))
+
+
+def _guarded_text_select(
+    spec: _GuardedTextSpec,
+    expected_bytes: int,
+) -> tuple[str, str]:
+    if expected_bytes == -1 and spec.nullable:
+        valid = f"{spec.column} IS NULL"
+    else:
+        valid = (
+            f"typeof({spec.column}) = 'text' "
+            f"AND length(CAST({spec.column} AS BLOB)) = {expected_bytes} "
+            f"AND length(CAST({spec.column} AS BLOB)) <= {spec.max_bytes}"
+        )
+    return (
+        f"CASE WHEN {valid} THEN {spec.column} END AS {spec.output}",
+        f"CASE WHEN {valid} THEN 1 ELSE 0 END AS __guard_{spec.output}",
+    )
+
+
+def _fetch_guarded_row(
+    conn: sqlite3.Connection,
+    *,
+    from_sql: str,
+    where_sql: str,
+    key: object,
+    text_specs: tuple[_GuardedTextSpec, ...],
+    lengths: tuple[int, ...],
+    scalar_selections: tuple[str, ...] = (),
+    label: str,
+) -> sqlite3.Row:
+    selections = list(scalar_selections)
+    for spec, expected_bytes in zip(text_specs, lengths, strict=True):
+        value_sql, guard_sql = _guarded_text_select(spec, expected_bytes)
+        selections.extend((value_sql, guard_sql))
+    try:
+        row = conn.execute(
+            f"SELECT {', '.join(selections)} FROM {from_sql} WHERE {where_sql}",
+            (key,),
+        ).fetchone()
+    except sqlite3.Error as exc:
+        raise RevisionIntegrityError(f"{label} guarded read failed") from exc
+    if row is None:
+        raise RevisionIntegrityError(f"{label} row disappeared during recovery")
+    for spec, expected_bytes in zip(text_specs, lengths, strict=True):
+        if row[f"__guard_{spec.output}"] != 1:
+            raise RevisionIntegrityError(f"{label} SQL byte guard failed")
+        value = row[spec.output]
+        if value is None:
+            if not spec.nullable or expected_bytes != -1:
+                raise RevisionIntegrityError(f"{label} guarded text is invalid")
+            continue
+        if (
+            not isinstance(value, str)
+            or len(value.encode("utf-8")) != expected_bytes
+            or expected_bytes > spec.max_bytes
+        ):
+            raise RevisionIntegrityError(f"{label} guarded text byte length changed")
+    return row
+
+
+def _read_guarded_store_identity_row(conn: sqlite3.Connection) -> sqlite3.Row:
+    specs = (
+        _GuardedTextSpec("store_id", "store_id", 64),
+        _GuardedTextSpec(
+            "artifact_root",
+            "artifact_root",
+            _STORE_IDENTITY_MAX_BYTES,
+        ),
+        _GuardedTextSpec("binding_state", "binding_state", 16),
+    )
+    selections = ["CASE WHEN typeof(singleton) = 'integer' THEN singleton END AS singleton"]
+    for index, spec in enumerate(specs):
+        selections.append(
+            f"CASE WHEN {spec.column} IS NULL THEN -1 "
+            f"ELSE length(CAST({spec.column} AS BLOB)) END AS __length_{index}"
+        )
+    try:
+        cursor = conn.execute(
+            f"SELECT {', '.join(selections)} FROM store_identity ORDER BY singleton"
+        )
+        rows = cursor.fetchmany(2)
+    except sqlite3.Error as exc:
+        raise ValueError("evolution database store identity is unavailable") from exc
+    if len(rows) != 1 or type(rows[0]["singleton"]) is not int:
+        raise ValueError("evolution database store identity is invalid")
+    lengths = tuple(rows[0][f"__length_{index}"] for index in range(len(specs)))
+    budget = _RecoveryBudget(
+        label="store identity recovery",
+        max_rows=1,
+        max_bytes=sum(spec.max_bytes for spec in specs),
+        max_row_bytes=sum(spec.max_bytes for spec in specs),
+    )
+    try:
+        for length, spec in zip(lengths, specs, strict=True):
+            if type(length) is not int or length < 0 or length > spec.max_bytes:
+                raise RevisionIntegrityError(
+                    "store identity recovery exceeds the value byte limit"
+                )
+        budget.consume_lengths(lengths)
+        return _fetch_guarded_row(
+            conn,
+            from_sql="store_identity",
+            where_sql="singleton = ?",
+            key=rows[0]["singleton"],
+            text_specs=specs,
+            lengths=lengths,
+            scalar_selections=("singleton",),
+            label="store identity recovery",
+        )
+    except RevisionIntegrityError as exc:
+        raise ValueError("evolution database store identity is invalid") from exc
+
+
+def _ledger_payload_usage(
+    conn: sqlite3.Connection,
+    table: str,
+    text_blob_columns: tuple[str, ...],
+) -> tuple[int, int]:
+    byte_expression = " + ".join(
+        f"COALESCE(length(CAST({column} AS BLOB)), 0)" for column in text_blob_columns
+    )
+    row = conn.execute(
+        f"SELECT COUNT(*), COALESCE(SUM({byte_expression}), 0) FROM {table}"
+    ).fetchone()
+    return int(row[0]), int(row[1])
+
+
+def _enforce_ledger_capacity(
+    conn: sqlite3.Connection,
+    *,
+    table: str,
+    text_blob_columns: tuple[str, ...],
+    new_text_blob_values: tuple[object, ...],
+    max_rows: int,
+    max_bytes: int,
+    max_row_bytes: int,
+    label: str,
+) -> None:
+    new_bytes = _sqlite_text_blob_bytes(new_text_blob_values)
+    if new_bytes > max_row_bytes:
+        raise RevisionCapacityError(f"{label} row byte capacity is exhausted")
+    rows, used_bytes = _ledger_payload_usage(conn, table, text_blob_columns)
+    if rows >= max_rows:
+        raise RevisionCapacityError(f"{label} row capacity is exhausted")
+    if used_bytes + new_bytes > max_bytes:
+        raise RevisionCapacityError(f"{label} byte capacity is exhausted")
+
+
+def _enforce_ledger_update_capacity(
+    conn: sqlite3.Connection,
+    *,
+    table: str,
+    key_column: str,
+    key_value: str,
+    text_blob_columns: tuple[str, ...],
+    new_text_blob_values: tuple[object, ...],
+    max_bytes: int,
+    max_row_bytes: int,
+    label: str,
+) -> int:
+    new_bytes = _sqlite_text_blob_bytes(new_text_blob_values)
+    if new_bytes > max_row_bytes:
+        raise RevisionCapacityError(f"{label} row byte capacity is exhausted")
+    byte_expression = " + ".join(
+        f"COALESCE(length(CAST({column} AS BLOB)), 0)" for column in text_blob_columns
+    )
+    old = conn.execute(
+        f"SELECT {byte_expression} FROM {table} WHERE {key_column} = ?",
+        (key_value,),
+    ).fetchone()
+    if old is None or type(old[0]) is not int or old[0] < 0:
+        raise RevisionIntegrityError(f"{label} update source is invalid")
+    _rows, used_bytes = _ledger_payload_usage(conn, table, text_blob_columns)
+    if used_bytes < old[0]:
+        raise RevisionIntegrityError(f"{label} persisted byte accounting is invalid")
+    if used_bytes - old[0] + new_bytes > max_bytes:
+        raise RevisionCapacityError(f"{label} byte capacity is exhausted")
+    return new_bytes
+
+
+def _enforce_task_admission_transition_capacity(
+    conn: sqlite3.Connection,
+    row: sqlite3.Row,
+    *,
+    status: AdmissionStatus,
+    reason: AdmissionQueueReason | None,
+    pinned_revision_id: str | None,
+    updated_at: str,
+    finished_at: str | None,
+) -> int:
+    overrides = {
+        "status": str(status),
+        "reason": None if reason is None else str(reason),
+        "pinned_revision_id": pinned_revision_id,
+        "updated_at": updated_at,
+        "finished_at": finished_at,
+    }
+    new_values = tuple(
+        overrides[column] if column in overrides else row[column]
+        for column in _TASK_ADMISSION_TEXT_BLOB_COLUMNS
+    )
+    return _enforce_ledger_update_capacity(
+        conn,
+        table="task_admissions",
+        key_column="admission_id",
+        key_value=str(row["admission_id"]),
+        text_blob_columns=_TASK_ADMISSION_TEXT_BLOB_COLUMNS,
+        new_text_blob_values=new_values,
+        max_bytes=MAX_TASK_ADMISSION_RECOVERY_BYTES,
+        max_row_bytes=MAX_TASK_ADMISSION_ROW_BYTES,
+        label="task admission ledger",
+    )
+
+
+def _verify_task_admission_transition_capacity(
+    conn: sqlite3.Connection,
+    row: sqlite3.Row,
+    *,
+    expected_row_bytes: int,
+) -> None:
+    actual_row_bytes = _sqlite_text_blob_bytes(
+        tuple(row[column] for column in _TASK_ADMISSION_TEXT_BLOB_COLUMNS)
+    )
+    if actual_row_bytes != expected_row_bytes:
+        raise RevisionIntegrityError("task admission transition byte accounting is inconsistent")
+    if actual_row_bytes > MAX_TASK_ADMISSION_ROW_BYTES:
+        raise RevisionCapacityError("task admission ledger row byte capacity is exhausted")
+    _rows, used_bytes = _ledger_payload_usage(
+        conn,
+        "task_admissions",
+        _TASK_ADMISSION_TEXT_BLOB_COLUMNS,
+    )
+    if used_bytes > MAX_TASK_ADMISSION_RECOVERY_BYTES:
+        raise RevisionCapacityError("task admission ledger byte capacity is exhausted")
+
+
+def _enforce_materialization_capacity(
+    conn: sqlite3.Connection,
+    new_text_blob_values: tuple[object, ...],
+) -> None:
+    new_bytes = _sqlite_text_blob_bytes(new_text_blob_values)
+    if new_bytes > MAX_CONTEXT_MATERIALIZATION_ROW_BYTES:
+        raise RevisionCapacityError(
+            "context materialization ledger row byte capacity is exhausted"
+        )
+    row = conn.execute(
+        """
+        SELECT COUNT(*), COALESCE(SUM(
+            length(CAST(context_materializations.context_id AS BLOB))
+            + length(CAST(context_materializations.created_at AS BLOB))
+            + length(CAST(context_materializations.registry_digest AS BLOB))
+            + length(CAST(context_materializations.request_digest AS BLOB))
+            + length(CAST(context_materializations.manifest_json AS BLOB))
+            + length(CAST(contexts.request_json AS BLOB))
+            + length(CAST(contexts.response_json AS BLOB))
+        ), 0)
+        FROM context_materializations JOIN contexts USING (context_id)
+        """
+    ).fetchone()
+    if int(row[0]) >= MAX_CONTEXT_MATERIALIZATION_RECOVERY_ROWS:
+        raise RevisionCapacityError("context materialization ledger row capacity is exhausted")
+    if int(row[1]) + new_bytes > MAX_CONTEXT_MATERIALIZATION_RECOVERY_BYTES:
+        raise RevisionCapacityError("context materialization ledger byte capacity is exhausted")
+
+
 class JobLeaseError(ValueError):
     pass
 
@@ -398,6 +947,24 @@ def _parse_utc_iso(value: str) -> datetime:
     if parsed.tzinfo is None:
         return parsed.replace(tzinfo=UTC)
     return parsed.astimezone(UTC)
+
+
+def _parse_canonical_utc_iso(value: object, *, label: str) -> datetime:
+    if not isinstance(value, str):
+        raise ValueError(f"{label} must be a canonical UTC timestamp")
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None or parsed.utcoffset() != timedelta(0):
+        raise ValueError(f"{label} must be a canonical UTC timestamp")
+    normalized = _utc_dt_to_iso(parsed)
+    if value != normalized:
+        raise ValueError(f"{label} must be a canonical UTC timestamp")
+    return parsed
+
+
+def _strict_sqlite_integer(value: object, *, label: str) -> int:
+    if type(value) is not int:
+        raise ValueError(f"{label} must be stored as an INTEGER")
+    return value
 
 
 def _write_json_strict_exclusive(
@@ -1197,9 +1764,15 @@ class EvolutionStore:
                         conn,
                         materialization_root_fd,
                     )
-                    self._verify_referenced_context_materializations(
+                    materialized_contexts = self._verify_referenced_context_materializations(
                         conn,
                         materialization_root_fd,
+                    )
+                    execution_snapshots = self._verify_execution_snapshots(conn)
+                    self._verify_revision_ledger(
+                        conn,
+                        materialized_contexts,
+                        execution_snapshots,
                     )
                     self._verify_bound_store_identity(conn)
                     conn.commit()
@@ -1322,10 +1895,7 @@ class EvolutionStore:
                         raise ValueError(
                             "unverified evolution database cannot claim non-empty managed state"
                         )
-                rows = conn.execute(
-                    "SELECT singleton, store_id, artifact_root, binding_state "
-                    "FROM store_identity ORDER BY singleton"
-                ).fetchall()
+                row = _read_guarded_store_identity_row(conn)
                 conn.commit()
             except BaseException:
                 try:
@@ -1333,16 +1903,14 @@ class EvolutionStore:
                 except sqlite3.Error:
                     pass
                 raise
-            if len(rows) > 1 or (rows and int(rows[0]["singleton"]) != 1):
+            if row["singleton"] != 1:
                 raise ValueError("evolution database store identity is invalid")
-            if not rows:
-                raise ValueError("evolution database store identity row is missing")
-            database_store_id = str(rows[0]["store_id"]) if rows else None
+            database_store_id = str(row["store_id"])
             if database_store_id is not None and _STORE_ID_RE.fullmatch(database_store_id) is None:
                 raise ValueError("evolution database store identity is invalid")
-            if rows and str(rows[0]["artifact_root"]) != os.fspath(self.files.root):
+            if str(row["artifact_root"]) != os.fspath(self.files.root):
                 raise ValueError("evolution database is bound to a different artifact root")
-            binding_state = str(rows[0]["binding_state"]) if rows else None
+            binding_state = str(row["binding_state"])
             if binding_state not in {None, "pending", "bound"}:
                 raise ValueError("evolution database store identity is invalid")
 
@@ -1488,22 +2056,9 @@ class EvolutionStore:
         store_id = self._bound_store_id
         if store_id is None:
             raise ValueError("evolution store identity has not been initialized")
-        try:
-            rows = conn.execute(
-                "SELECT singleton, store_id, artifact_root, binding_state "
-                "FROM store_identity ORDER BY singleton"
-            ).fetchall()
-        except sqlite3.Error as exc:
-            raise ValueError("evolution database store identity is unavailable") from exc
-        if len(rows) != 1:
-            raise ValueError("evolution database store identity is invalid")
-        row = rows[0]
-        try:
-            singleton = int(row["singleton"])
-        except (TypeError, ValueError) as exc:
-            raise ValueError("evolution database store identity is invalid") from exc
+        row = _read_guarded_store_identity_row(conn)
         if (
-            singleton != 1
+            row["singleton"] != 1
             or str(row["store_id"]) != store_id
             or str(row["artifact_root"]) != os.fspath(self.files.root)
             or str(row["binding_state"]) != "bound"
@@ -1641,10 +2196,25 @@ class EvolutionStore:
         conn: sqlite3.Connection,
         root_descriptor: int,
     ) -> list[_OrphanMaterialization]:
-        referenced = {
-            str(row["context_id"])
-            for row in conn.execute("SELECT context_id FROM context_materializations").fetchall()
-        }
+        context_id_spec = _GuardedTextSpec(
+            column="context_id",
+            output="context_id",
+            max_bytes=256,
+        )
+        plans = _scan_guarded_row_plans(
+            conn,
+            from_sql="context_materializations",
+            key_spec=context_id_spec,
+            text_specs=(context_id_spec,),
+            order_by_sql="context_id",
+            budget=_RecoveryBudget(
+                label="context materialization reference recovery",
+                max_rows=MAX_CONTEXT_MATERIALIZATION_RECOVERY_ROWS,
+                max_bytes=MAX_CONTEXT_MATERIALIZATION_RECOVERY_BYTES,
+                max_row_bytes=256,
+            ),
+        )
+        referenced = {plan.key for plan in plans}
         try:
             with os.scandir(root_descriptor) as entries:
                 result: list[_OrphanMaterialization] = []
@@ -1671,26 +2241,72 @@ class EvolutionStore:
         self,
         conn: sqlite3.Connection,
         root_descriptor: int,
-    ) -> None:
-        rows = conn.execute(
-            "SELECT context_materializations.context_id, "
-            "context_materializations.registry_digest, "
-            "context_materializations.request_digest, "
-            "context_materializations.manifest_json, "
-            "contexts.request_json, contexts.response_json "
-            "FROM context_materializations "
-            "JOIN contexts USING (context_id) "
-            "ORDER BY context_materializations.context_id LIMIT ?",
-            (MAX_CONTEXT_MATERIALIZATION_RECOVERY_ROWS + 1,),
-        ).fetchall()
-        if len(rows) > MAX_CONTEXT_MATERIALIZATION_RECOVERY_ROWS:
-            raise ValueError("context materialization recovery exceeds its row limit")
-        if not rows:
-            return
+    ) -> dict[str, _MaterializationRecoveryIdentity]:
+        from_sql = "context_materializations JOIN contexts USING (context_id)"
+        specs = (
+            _GuardedTextSpec(
+                "context_materializations.context_id",
+                "context_id",
+                256,
+            ),
+            _GuardedTextSpec(
+                "context_materializations.registry_digest",
+                "registry_digest",
+                64,
+            ),
+            _GuardedTextSpec(
+                "context_materializations.request_digest",
+                "request_digest",
+                64,
+            ),
+            _GuardedTextSpec(
+                "context_materializations.manifest_json",
+                "manifest_json",
+                MAX_CONTEXT_MATERIALIZATION_ROW_BYTES,
+            ),
+            _GuardedTextSpec(
+                "contexts.request_json",
+                "request_json",
+                MAX_CONTEXT_MATERIALIZATION_ROW_BYTES,
+            ),
+            _GuardedTextSpec(
+                "contexts.response_json",
+                "response_json",
+                MAX_CONTEXT_MATERIALIZATION_ROW_BYTES,
+            ),
+        )
         materializer = self._context_materializer
-        if materializer is None:
+        if (
+            materializer is None
+            and conn.execute("SELECT 1 FROM context_materializations LIMIT 1").fetchone()
+            is not None
+        ):
             raise ValueError("persisted materializations require a verified executable registry")
-        for row in rows:
+        verified: dict[str, _MaterializationRecoveryIdentity] = {}
+        budget = _RecoveryBudget(
+            label="context materialization recovery",
+            max_rows=MAX_CONTEXT_MATERIALIZATION_RECOVERY_ROWS,
+            max_bytes=MAX_CONTEXT_MATERIALIZATION_RECOVERY_BYTES,
+            max_row_bytes=MAX_CONTEXT_MATERIALIZATION_ROW_BYTES,
+        )
+        plans = _scan_guarded_row_plans(
+            conn,
+            from_sql=from_sql,
+            key_spec=specs[0],
+            text_specs=specs,
+            order_by_sql="context_materializations.context_id",
+            budget=budget,
+        )
+        for plan in plans:
+            row = _fetch_guarded_row(
+                conn,
+                from_sql=from_sql,
+                where_sql="context_materializations.context_id = ?",
+                key=plan.key,
+                text_specs=specs,
+                lengths=plan.lengths,
+                label="context materialization recovery",
+            )
             manifest = self._materialized_context_from_row(row)
             try:
                 request = ContextProjectionResolveRequest.model_validate_json(
@@ -1701,36 +2317,423 @@ class EvolutionStore:
                 raise ValueError("persisted materialized context snapshot is invalid") from exc
             if canonical_digest(request) != manifest.request_digest or response != manifest:
                 raise ValueError("persisted materialized context snapshot is inconsistent")
+            if materializer is None:
+                raise ValueError(
+                    "persisted materializations require a verified executable registry"
+                )
             materializer.verify_persisted_materialization(
                 manifest,
                 materialization_root_descriptor=root_descriptor,
             )
+            verified[manifest.context_id] = _MaterializationRecoveryIdentity(
+                context_id=manifest.context_id,
+                manifest_digest=canonical_digest(manifest),
+                registry_digest=manifest.registry_digest,
+                request_digest=manifest.request_digest,
+                base_model=request.base_model,
+                execution_mode=str(request.execution_profile.execution_mode),
+                capture_mode=str(request.execution_profile.capture_mode),
+                artifact_ids=manifest.selection.artifact_ids,
+                adapter_set_digest=canonical_digest(manifest.adapter_merge_spec.adapters),
+            )
+        return verified
+
+    def _verify_execution_snapshots(
+        self,
+        conn: sqlite3.Connection,
+    ) -> dict[str, _ExecutionSnapshotRecoveryIdentity]:
+        verified: dict[str, _ExecutionSnapshotRecoveryIdentity] = {}
+        budget = _RecoveryBudget(
+            label="execution snapshot recovery",
+            max_rows=MAX_EXECUTION_SNAPSHOT_RECOVERY_ROWS,
+            max_bytes=MAX_EXECUTION_SNAPSHOT_RECOVERY_BYTES,
+            max_row_bytes=MAX_EXECUTION_SNAPSHOT_ROW_BYTES,
+        )
+        specs = (
+            _GuardedTextSpec(
+                "execution_snapshot_id",
+                "execution_snapshot_id",
+                128,
+            ),
+            _GuardedTextSpec("created_at", "created_at", 64),
+            _GuardedTextSpec("snapshot_digest", "snapshot_digest", 64),
+            _GuardedTextSpec("producer_id", "producer_id", 128),
+            _GuardedTextSpec(
+                "snapshot_json",
+                "snapshot_json",
+                MAX_EXECUTION_SNAPSHOT_BYTES,
+            ),
+        )
+        plans = _scan_guarded_row_plans(
+            conn,
+            from_sql="execution_snapshots",
+            key_spec=specs[0],
+            text_specs=specs,
+            order_by_sql="execution_snapshot_id",
+            budget=budget,
+        )
+        for plan in plans:
+            row = _fetch_guarded_row(
+                conn,
+                from_sql="execution_snapshots",
+                where_sql="execution_snapshot_id = ?",
+                key=plan.key,
+                text_specs=specs,
+                lengths=plan.lengths,
+                label="execution snapshot recovery",
+            )
+            record = self._execution_snapshot_record_from_row(row)
+            verified[record.execution_snapshot_id] = _ExecutionSnapshotRecoveryIdentity(
+                snapshot_digest=record.snapshot_digest,
+                producer_id=record.producer_id,
+                model_id=record.snapshot.model.model_id,
+                execution_mode=str(record.snapshot.execution_mode),
+                capture_mode=str(record.snapshot.capture_mode),
+            )
+        return verified
+
+    @staticmethod
+    def _validate_recovered_admission_sources(
+        request: TaskAdmissionRequest,
+        *,
+        materialized_contexts: dict[str, _MaterializationRecoveryIdentity],
+        execution_snapshots: dict[str, _ExecutionSnapshotRecoveryIdentity],
+    ) -> None:
+        snapshot = execution_snapshots.get(request.execution_snapshot_id)
+        materialization = materialized_contexts.get(request.context_id)
+        if (
+            request.project_id != request.stream_id
+            or snapshot is None
+            or materialization is None
+            or snapshot.execution_mode != str(request.execution_mode)
+            or snapshot.capture_mode != str(request.capture_mode)
+            or materialization.execution_mode != str(request.execution_mode)
+            or materialization.capture_mode != str(request.capture_mode)
+            or materialization.base_model != snapshot.model_id
+            or materialization.artifact_ids != request.context_artifact_ids
+            or canonical_digest(materialization.artifact_ids)
+            != request.context_artifact_set_digest
+        ):
+            raise RevisionIntegrityError("task admission envelope sources are inconsistent")
+
+    def _verify_revision_ledger(
+        self,
+        conn: sqlite3.Connection,
+        materialized_contexts: dict[str, _MaterializationRecoveryIdentity],
+        execution_snapshots: dict[str, _ExecutionSnapshotRecoveryIdentity],
+    ) -> None:
+        revisions: dict[str, _RevisionRecoveryIdentity] = {}
+        revisions_by_stream: dict[str, dict[int, str]] = {}
+        revision_budget = _RecoveryBudget(
+            label="revision recovery",
+            max_rows=MAX_REVISION_RECOVERY_ROWS,
+            max_bytes=MAX_REVISION_RECOVERY_BYTES,
+            max_row_bytes=MAX_REVISION_ROW_BYTES,
+        )
+        revision_specs = (
+            _GuardedTextSpec("revision_id", "revision_id", 128),
+            _GuardedTextSpec("stream_id", "stream_id", 128),
+            _GuardedTextSpec(
+                "predecessor_revision_id",
+                "predecessor_revision_id",
+                128,
+                nullable=True,
+            ),
+            _GuardedTextSpec("created_at", "created_at", 64),
+            _GuardedTextSpec("manifest_digest", "manifest_digest", 64),
+            _GuardedTextSpec(
+                "manifest_json",
+                "manifest_json",
+                MAX_REVISION_MANIFEST_BYTES,
+            ),
+            _GuardedTextSpec("context_id", "context_id", 256),
+            _GuardedTextSpec(
+                "context_manifest_digest",
+                "context_manifest_digest",
+                64,
+            ),
+            _GuardedTextSpec("registry_digest", "registry_digest", 64),
+            _GuardedTextSpec(
+                "execution_snapshot_id",
+                "execution_snapshot_id",
+                128,
+            ),
+            _GuardedTextSpec(
+                "execution_snapshot_digest",
+                "execution_snapshot_digest",
+                64,
+            ),
+            _GuardedTextSpec("adapter_set_digest", "adapter_set_digest", 64),
+        )
+        revision_plans = _scan_guarded_row_plans(
+            conn,
+            from_sql="revisions",
+            key_spec=revision_specs[0],
+            text_specs=revision_specs,
+            order_by_sql="stream_id, generation",
+            budget=revision_budget,
+        )
+        for plan in revision_plans:
+            row = _fetch_guarded_row(
+                conn,
+                from_sql="revisions",
+                where_sql="revision_id = ?",
+                key=plan.key,
+                text_specs=revision_specs,
+                lengths=plan.lengths,
+                scalar_selections=(
+                    "CASE WHEN typeof(generation) = 'integer' THEN generation END AS generation",
+                ),
+                label="revision recovery",
+            )
+            manifest = self._revision_manifest_from_row(row)
+            self._validate_revision_materialization_binding(
+                manifest,
+                materialized_contexts.get(manifest.context.context_id),
+            )
+            execution_snapshot = execution_snapshots.get(manifest.execution_snapshot_id)
+            if (
+                execution_snapshot is None
+                or execution_snapshot.snapshot_digest != manifest.execution_snapshot_digest
+            ):
+                raise RevisionIntegrityError(
+                    "revision execution snapshot is not registered exactly"
+                )
+            revision_id = str(row["revision_id"])
+            revisions[revision_id] = _RevisionRecoveryIdentity(
+                revision_id=revision_id,
+                stream_id=manifest.stream_id,
+                generation=manifest.generation,
+                predecessor_revision_id=manifest.predecessor_revision_id,
+                project_snapshot_id=manifest.project_snapshot.snapshot_id,
+                workspace_snapshot_id=manifest.workspace_snapshot.snapshot_id,
+                context_id=manifest.context.context_id,
+                context_artifact_ids=manifest.context.artifact_ids,
+                context_artifact_set_digest=canonical_digest(manifest.context.artifact_ids),
+                execution_snapshot_id=manifest.execution_snapshot_id,
+                execution_mode=str(manifest.execution_snapshot.execution_mode),
+                capture_mode=str(manifest.execution_snapshot.capture_mode),
+            )
+            revisions_by_stream.setdefault(manifest.stream_id, {})[manifest.generation] = (
+                revision_id
+            )
+
+        streams: dict[str, tuple[str, int]] = {}
+        stream_budget = _RecoveryBudget(
+            label="revision stream recovery",
+            max_rows=MAX_REVISION_STREAM_RECOVERY_ROWS,
+            max_bytes=MAX_REVISION_STREAM_RECOVERY_BYTES,
+            max_row_bytes=MAX_REVISION_STREAM_ROW_BYTES,
+        )
+        stream_specs = (
+            _GuardedTextSpec("stream_id", "stream_id", 128),
+            _GuardedTextSpec("active_revision_id", "active_revision_id", 128),
+            _GuardedTextSpec("created_at", "created_at", 64),
+            _GuardedTextSpec("updated_at", "updated_at", 64),
+        )
+        stream_plans = _scan_guarded_row_plans(
+            conn,
+            from_sql="revision_streams",
+            key_spec=stream_specs[0],
+            text_specs=stream_specs,
+            order_by_sql="stream_id",
+            budget=stream_budget,
+        )
+        for plan in stream_plans:
+            row = _fetch_guarded_row(
+                conn,
+                from_sql="revision_streams",
+                where_sql="stream_id = ?",
+                key=plan.key,
+                text_specs=stream_specs,
+                lengths=plan.lengths,
+                scalar_selections=(
+                    "CASE WHEN typeof(active_generation) = 'integer' "
+                    "THEN active_generation END AS active_generation",
+                ),
+                label="revision stream recovery",
+            )
+            stream_id = str(row["stream_id"])
+            active_revision_id = str(row["active_revision_id"])
+            try:
+                active_generation = _strict_sqlite_integer(
+                    row["active_generation"],
+                    label="revision stream active generation",
+                )
+                created_at = _parse_canonical_utc_iso(
+                    row["created_at"],
+                    label="revision stream created_at",
+                )
+                updated_at = _parse_canonical_utc_iso(
+                    row["updated_at"],
+                    label="revision stream updated_at",
+                )
+            except (TypeError, ValueError) as exc:
+                raise RevisionIntegrityError("revision stream record is invalid") from exc
+            active_revision = revisions.get(active_revision_id)
+            stream_revisions = revisions_by_stream.get(stream_id)
+            if (
+                active_generation < 0
+                or updated_at < created_at
+                or active_revision is None
+                or active_revision.stream_id != stream_id
+                or active_revision.generation != active_generation
+                or not stream_revisions
+                or max(stream_revisions) != active_generation
+            ):
+                raise RevisionIntegrityError("revision stream active identity is inconsistent")
+            streams[stream_id] = (active_revision_id, active_generation)
+        if set(revisions_by_stream) != set(streams):
+            raise RevisionIntegrityError("revision ledger contains an orphan stream")
+
+        for revision_id, revision in revisions.items():
+            if revision.generation == 0:
+                if revision.predecessor_revision_id is not None:
+                    raise RevisionIntegrityError("genesis revision has a predecessor")
+                continue
+            predecessor = revisions.get(revision.predecessor_revision_id or "")
+            if (
+                predecessor is None
+                or predecessor.stream_id != revision.stream_id
+                or predecessor.generation != revision.generation - 1
+                or revisions_by_stream[revision.stream_id].get(revision.generation) != revision_id
+            ):
+                raise RevisionIntegrityError("revision predecessor chain is inconsistent")
+
+        admission_budget = _RecoveryBudget(
+            label="task admission recovery",
+            max_rows=MAX_TASK_ADMISSION_RECOVERY_ROWS,
+            max_bytes=MAX_TASK_ADMISSION_RECOVERY_BYTES,
+            max_row_bytes=MAX_TASK_ADMISSION_ROW_BYTES,
+        )
+        admission_specs = (
+            _GuardedTextSpec("admission_id", "admission_id", 128),
+            _GuardedTextSpec("stream_id", "stream_id", 128),
+            _GuardedTextSpec("task_id", "task_id", 128),
+            _GuardedTextSpec("idempotency_key", "idempotency_key", 128),
+            _GuardedTextSpec("request_digest", "request_digest", 64),
+            _GuardedTextSpec("request_json", "request_json", 64 * 1024),
+            _GuardedTextSpec("status", "status", 32),
+            _GuardedTextSpec("reason", "reason", 128, nullable=True),
+            _GuardedTextSpec(
+                "pinned_revision_id",
+                "pinned_revision_id",
+                128,
+                nullable=True,
+            ),
+            _GuardedTextSpec("created_at", "created_at", 64),
+            _GuardedTextSpec("updated_at", "updated_at", 64),
+            _GuardedTextSpec("finished_at", "finished_at", 64, nullable=True),
+        )
+        admission_plans = _scan_guarded_row_plans(
+            conn,
+            from_sql="task_admissions",
+            key_spec=admission_specs[0],
+            text_specs=admission_specs,
+            order_by_sql="stream_id, task_id",
+            budget=admission_budget,
+        )
+        for plan in admission_plans:
+            row = _fetch_guarded_row(
+                conn,
+                from_sql="task_admissions",
+                where_sql="admission_id = ?",
+                key=plan.key,
+                text_specs=admission_specs,
+                lengths=plan.lengths,
+                scalar_selections=(
+                    "CASE WHEN typeof(required_generation) = 'integer' "
+                    "THEN required_generation END AS required_generation",
+                ),
+                label="task admission recovery",
+            )
+            record = self._task_admission_from_row(row)
+            stream = streams.get(record.request.stream_id)
+            if stream is None:
+                raise RevisionIntegrityError("task admission references an unknown stream")
+            self._validate_recovered_admission_sources(
+                record.request,
+                materialized_contexts=materialized_contexts,
+                execution_snapshots=execution_snapshots,
+            )
+            active_revision_id, active_generation = stream
+            if record.pinned_revision_id is not None:
+                pinned = revisions.get(record.pinned_revision_id)
+                if (
+                    pinned is None
+                    or pinned.stream_id != record.request.stream_id
+                    or pinned.generation != record.request.required_generation
+                ):
+                    raise RevisionIntegrityError("task admission pin is inconsistent")
+                try:
+                    self._validate_admission_request_against_revision(record.request, pinned)
+                except TaskAdmissionConflictError as exc:
+                    raise RevisionIntegrityError(
+                        "task admission pin identity is inconsistent"
+                    ) from exc
+            else:
+                self._validate_unpinned_admission_authority(
+                    record,
+                    active_generation=active_generation,
+                    active_revision=revisions.get(active_revision_id),
+                )
 
     @staticmethod
     def _expected_context_snapshot_bytes(
         conn: sqlite3.Connection,
     ) -> dict[str, bytes]:
-        rows = conn.execute(
-            "SELECT context_id, request_json, response_json FROM contexts "
-            "ORDER BY context_id LIMIT ?",
-            (MAX_CONTEXT_SNAPSHOT_ENTRIES + 1,),
-        ).fetchall()
-        if len(rows) > MAX_CONTEXT_SNAPSHOT_ENTRIES:
-            raise ValueError("context snapshot recovery exceeds its row limit")
+        specs = (
+            _GuardedTextSpec("context_id", "context_id", 256),
+            _GuardedTextSpec(
+                "request_json",
+                "request_json",
+                MAX_CONTEXT_SNAPSHOT_BYTES,
+            ),
+            _GuardedTextSpec(
+                "response_json",
+                "response_json",
+                MAX_CONTEXT_SNAPSHOT_BYTES,
+            ),
+        )
+        plans = _scan_guarded_row_plans(
+            conn,
+            from_sql="contexts",
+            key_spec=specs[0],
+            text_specs=specs,
+            order_by_sql="context_id",
+            budget=_RecoveryBudget(
+                label="context snapshot recovery",
+                max_rows=MAX_CONTEXT_SNAPSHOT_ENTRIES,
+                max_bytes=MAX_CONTEXT_SNAPSHOT_INVENTORY_BYTES,
+                max_row_bytes=(2 * MAX_CONTEXT_SNAPSHOT_BYTES) + 256,
+            ),
+        )
         expected: dict[str, bytes] = {}
-        for row in rows:
-            context_id = str(row["context_id"])
+        for plan in plans:
+            row = _fetch_guarded_row(
+                conn,
+                from_sql="contexts",
+                where_sql="context_id = ?",
+                key=plan.key,
+                text_specs=specs,
+                lengths=plan.lengths,
+                label="context snapshot recovery",
+            )
+            context_id = row["context_id"]
             try:
-                request_payload = json.loads(str(row["request_json"]))
-                response_payload = json.loads(str(row["response_json"]))
+                request_payload = json.loads(row["request_json"])
+                response_payload = json.loads(row["response_json"])
             except ValueError as exc:
                 raise ValueError("persisted context snapshot JSON is invalid") from exc
             if not isinstance(request_payload, dict) or not isinstance(response_payload, dict):
                 raise ValueError("persisted context snapshot payload is invalid")
-            expected[context_id] = _context_snapshot_bytes(
+            snapshot_bytes = _context_snapshot_bytes(
                 request_payload,
                 response_payload,
             )
+            if len(snapshot_bytes) > MAX_CONTEXT_SNAPSHOT_BYTES:
+                raise ValueError("persisted context snapshot exceeds its byte limit")
+            expected[context_id] = snapshot_bytes
         return expected
 
     def _remove_orphan_context_materializations(
@@ -3204,6 +4207,1075 @@ class EvolutionStore:
             raise ValueError("persisted materialized context identity is inconsistent")
         return manifest
 
+    @staticmethod
+    def _execution_snapshot_record_from_row(row: sqlite3.Row) -> ExecutionSnapshotRecord:
+        snapshot_json = row["snapshot_json"]
+        if (
+            not isinstance(snapshot_json, str)
+            or len(snapshot_json.encode("utf-8")) > MAX_EXECUTION_SNAPSHOT_BYTES
+        ):
+            raise RevisionIntegrityError("persisted execution snapshot is invalid")
+        try:
+            snapshot = ExecutionSnapshotV1.model_validate_json(snapshot_json)
+            created_at = _parse_canonical_utc_iso(
+                row["created_at"],
+                label="execution snapshot created_at",
+            )
+        except (TypeError, ValueError) as exc:
+            raise RevisionIntegrityError("persisted execution snapshot is invalid") from exc
+        digest = canonical_digest(snapshot)
+        if (
+            snapshot_json != canonical_json(snapshot)
+            or row["execution_snapshot_id"] != f"exec-{digest}"
+            or row["snapshot_digest"] != digest
+        ):
+            raise RevisionIntegrityError("persisted execution snapshot identity is inconsistent")
+        try:
+            return ExecutionSnapshotRecord(
+                execution_snapshot_id=str(row["execution_snapshot_id"]),
+                snapshot_digest=str(row["snapshot_digest"]),
+                producer_id=str(row["producer_id"]),
+                snapshot=snapshot,
+                created_at=created_at,
+            )
+        except (TypeError, ValueError) as exc:
+            raise RevisionIntegrityError("persisted execution snapshot is invalid") from exc
+
+    @staticmethod
+    def _revision_manifest_from_row(row: sqlite3.Row) -> RevisionManifestV1:
+        manifest_json = row["manifest_json"]
+        if (
+            not isinstance(manifest_json, str)
+            or len(manifest_json.encode("utf-8")) > MAX_REVISION_MANIFEST_BYTES
+        ):
+            raise RevisionIntegrityError("persisted revision manifest is invalid")
+        try:
+            manifest = RevisionManifestV1.model_validate_json(manifest_json)
+            _strict_sqlite_integer(
+                row["generation"],
+                label="revision generation",
+            )
+            _parse_canonical_utc_iso(
+                row["created_at"],
+                label="revision created_at",
+            )
+        except (TypeError, ValueError) as exc:
+            raise RevisionIntegrityError("persisted revision manifest is invalid") from exc
+        manifest_digest = canonical_digest(manifest)
+        if manifest_json != canonical_json(manifest):
+            raise RevisionIntegrityError("persisted revision manifest is not canonical")
+        expected = {
+            "revision_id": revision_id_for_manifest(manifest),
+            "stream_id": manifest.stream_id,
+            "generation": manifest.generation,
+            "predecessor_revision_id": manifest.predecessor_revision_id,
+            "manifest_digest": manifest_digest,
+            "context_id": manifest.context.context_id,
+            "context_manifest_digest": manifest.context.manifest_digest,
+            "registry_digest": manifest.context.registry_digest,
+            "execution_snapshot_id": manifest.execution_snapshot_id,
+            "execution_snapshot_digest": manifest.execution_snapshot_digest,
+            "adapter_set_digest": canonical_digest(manifest.adapters),
+        }
+        if any(row[key] != value for key, value in expected.items()):
+            raise RevisionIntegrityError("persisted revision identity is inconsistent")
+        return manifest
+
+    @classmethod
+    def _revision_record_from_row(
+        cls,
+        row: sqlite3.Row,
+        *,
+        active: bool,
+    ) -> RevisionRecord:
+        manifest = cls._revision_manifest_from_row(row)
+        try:
+            return RevisionRecord(
+                revision_id=str(row["revision_id"]),
+                manifest_digest=str(row["manifest_digest"]),
+                manifest=manifest,
+                created_at=_parse_canonical_utc_iso(
+                    row["created_at"],
+                    label="revision created_at",
+                ),
+                active=active,
+            )
+        except (TypeError, ValueError) as exc:
+            raise RevisionIntegrityError("persisted revision record is invalid") from exc
+
+    @staticmethod
+    def _task_admission_from_row(row: sqlite3.Row) -> TaskAdmissionRecord:
+        request_json = row["request_json"]
+        if not isinstance(request_json, str) or len(request_json.encode("utf-8")) > 64 * 1024:
+            raise RevisionIntegrityError("persisted task admission request is invalid")
+        try:
+            request = TaskAdmissionRequest.model_validate_json(request_json)
+            _strict_sqlite_integer(
+                row["required_generation"],
+                label="task admission required generation",
+            )
+            created_at = _parse_canonical_utc_iso(
+                row["created_at"],
+                label="task admission created_at",
+            )
+            updated_at = _parse_canonical_utc_iso(
+                row["updated_at"],
+                label="task admission updated_at",
+            )
+            finished_at = (
+                None
+                if row["finished_at"] is None
+                else _parse_canonical_utc_iso(
+                    row["finished_at"],
+                    label="task admission finished_at",
+                )
+            )
+        except (TypeError, ValueError) as exc:
+            raise RevisionIntegrityError("persisted task admission request is invalid") from exc
+        request_digest = canonical_digest(request)
+        expected = {
+            "admission_id": admission_id_for_request(request),
+            "stream_id": request.stream_id,
+            "task_id": request.task_id,
+            "idempotency_key": request.idempotency_key,
+            "required_generation": request.required_generation,
+            "request_digest": request_digest,
+        }
+        if request_json != canonical_json(request) or any(
+            row[key] != value for key, value in expected.items()
+        ):
+            raise RevisionIntegrityError("persisted task admission identity is inconsistent")
+        try:
+            return TaskAdmissionRecord(
+                admission_id=str(row["admission_id"]),
+                request_digest=str(row["request_digest"]),
+                request=request,
+                status=str(row["status"]),
+                reason=None if row["reason"] is None else str(row["reason"]),
+                pinned_revision_id=(
+                    None if row["pinned_revision_id"] is None else str(row["pinned_revision_id"])
+                ),
+                created_at=created_at,
+                updated_at=updated_at,
+                finished_at=finished_at,
+            )
+        except (TypeError, ValueError) as exc:
+            raise RevisionIntegrityError("persisted task admission record is invalid") from exc
+
+    @staticmethod
+    def _validate_revision_materialization_binding(
+        manifest: RevisionManifestV1,
+        binding: _MaterializationRecoveryIdentity | None,
+    ) -> None:
+        if binding is None:
+            raise RevisionIntegrityError("revision materialized context is not persisted")
+        if (
+            manifest.context.context_id != binding.context_id
+            or manifest.context.manifest_digest != binding.manifest_digest
+            or manifest.context.registry_digest != binding.registry_digest
+            or manifest.context.request_digest != binding.request_digest
+        ):
+            raise RevisionIntegrityError("revision materialized context identity does not match")
+        if (
+            binding.base_model is None
+            or binding.base_model != manifest.execution_snapshot.model.model_id
+        ):
+            raise RevisionIntegrityError("revision model does not match materialized context")
+        if binding.execution_mode != str(manifest.execution_snapshot.execution_mode):
+            raise RevisionIntegrityError(
+                "revision serving mode does not match materialized context"
+            )
+        if binding.capture_mode != str(manifest.execution_snapshot.capture_mode):
+            raise RevisionIntegrityError(
+                "revision capture mode does not match materialized context"
+            )
+        if manifest.context.artifact_ids != binding.artifact_ids:
+            raise RevisionIntegrityError(
+                "revision context artifacts do not match materialized context"
+            )
+        if canonical_digest(manifest.adapters) != binding.adapter_set_digest:
+            raise RevisionIntegrityError("revision adapters do not match materialized context")
+
+    def _load_materialization_binding(
+        self,
+        conn: sqlite3.Connection,
+        context_id: str,
+    ) -> _MaterializationRecoveryIdentity:
+        row = conn.execute(
+            """
+            SELECT context_materializations.context_id,
+                   context_materializations.registry_digest,
+                   context_materializations.request_digest,
+                   context_materializations.manifest_json,
+                   contexts.request_json,
+                   contexts.response_json
+            FROM context_materializations
+            JOIN contexts USING (context_id)
+            WHERE context_materializations.context_id = ?
+            """,
+            (context_id,),
+        ).fetchone()
+        if row is None:
+            raise RevisionIntegrityError("revision materialized context is not persisted")
+        try:
+            materialized = self._materialized_context_from_row(row)
+            request = ContextProjectionResolveRequest.model_validate_json(str(row["request_json"]))
+            response = MaterializedContext.model_validate_json(str(row["response_json"]))
+        except (TypeError, ValueError) as exc:
+            raise RevisionIntegrityError(
+                "revision materialized context snapshot is invalid"
+            ) from exc
+        if canonical_digest(request) != materialized.request_digest or response != materialized:
+            raise RevisionIntegrityError("revision materialized context snapshot is inconsistent")
+        binding = _MaterializationRecoveryIdentity(
+            context_id=materialized.context_id,
+            manifest_digest=canonical_digest(materialized),
+            registry_digest=materialized.registry_digest,
+            request_digest=materialized.request_digest,
+            base_model=request.base_model,
+            execution_mode=str(request.execution_profile.execution_mode),
+            capture_mode=str(request.execution_profile.capture_mode),
+            artifact_ids=materialized.selection.artifact_ids,
+            adapter_set_digest=canonical_digest(materialized.adapter_merge_spec.adapters),
+        )
+        return binding
+
+    def _validate_revision_materialization(
+        self,
+        conn: sqlite3.Connection,
+        manifest: RevisionManifestV1,
+    ) -> None:
+        binding = self._load_materialization_binding(
+            conn,
+            manifest.context.context_id,
+        )
+        self._validate_revision_materialization_binding(manifest, binding)
+
+    def _load_execution_snapshot(
+        self,
+        conn: sqlite3.Connection,
+        execution_snapshot_id: str,
+    ) -> ExecutionSnapshotRecord:
+        row = conn.execute(
+            "SELECT * FROM execution_snapshots WHERE execution_snapshot_id = ?",
+            (execution_snapshot_id,),
+        ).fetchone()
+        if row is None:
+            raise RevisionIntegrityError("revision execution snapshot is not registered")
+        return self._execution_snapshot_record_from_row(row)
+
+    def _validate_revision_execution_snapshot(
+        self,
+        conn: sqlite3.Connection,
+        manifest: RevisionManifestV1,
+    ) -> ExecutionSnapshotRecord:
+        record = self._load_execution_snapshot(conn, manifest.execution_snapshot_id)
+        if (
+            record.snapshot_digest != manifest.execution_snapshot_digest
+            or record.snapshot != manifest.execution_snapshot
+        ):
+            raise RevisionIntegrityError(
+                "revision execution snapshot does not match the registered snapshot"
+            )
+        return record
+
+    def register_execution_snapshot(
+        self,
+        verified_snapshot: VerifiedExecutionSnapshot,
+    ) -> ExecutionSnapshotRecord:
+        """Persist one canonical identity already sealed by a verified producer."""
+
+        verified_snapshot = require_verified_execution_snapshot(verified_snapshot)
+        producer_id = verified_snapshot.producer_id
+        snapshot = verified_snapshot.snapshot
+        snapshot = ExecutionSnapshotV1.model_validate(snapshot.model_dump(mode="python"))
+        snapshot_json = canonical_json(snapshot)
+        snapshot_digest = canonical_digest(snapshot)
+        snapshot_id = execution_snapshot_id_for_snapshot(snapshot)
+        with self.connect() as conn:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                self._verify_bound_store_identity(conn)
+                existing = conn.execute(
+                    "SELECT * FROM execution_snapshots WHERE execution_snapshot_id = ? "
+                    "OR snapshot_digest = ?",
+                    (snapshot_id, snapshot_digest),
+                ).fetchone()
+                if existing is not None:
+                    record = self._execution_snapshot_record_from_row(existing)
+                    if record.snapshot != snapshot or record.producer_id != producer_id:
+                        raise RevisionConflictError("execution snapshot identity is already bound")
+                    conn.commit()
+                    return record
+                now = utc_now_iso()
+                _enforce_ledger_capacity(
+                    conn,
+                    table="execution_snapshots",
+                    text_blob_columns=(
+                        "execution_snapshot_id",
+                        "created_at",
+                        "snapshot_digest",
+                        "producer_id",
+                        "snapshot_json",
+                    ),
+                    new_text_blob_values=(
+                        snapshot_id,
+                        now,
+                        snapshot_digest,
+                        producer_id,
+                        snapshot_json,
+                    ),
+                    max_rows=MAX_EXECUTION_SNAPSHOT_RECOVERY_ROWS,
+                    max_bytes=MAX_EXECUTION_SNAPSHOT_RECOVERY_BYTES,
+                    max_row_bytes=MAX_EXECUTION_SNAPSHOT_ROW_BYTES,
+                    label="execution snapshot ledger",
+                )
+                conn.execute(
+                    "INSERT INTO execution_snapshots (execution_snapshot_id, created_at, "
+                    "snapshot_digest, producer_id, snapshot_json) VALUES (?, ?, ?, ?, ?)",
+                    (snapshot_id, now, snapshot_digest, producer_id, snapshot_json),
+                )
+                row = conn.execute(
+                    "SELECT * FROM execution_snapshots WHERE execution_snapshot_id = ?",
+                    (snapshot_id,),
+                ).fetchone()
+                if row is None:
+                    raise RevisionIntegrityError(
+                        "created execution snapshot could not be read back"
+                    )
+                record = self._execution_snapshot_record_from_row(row)
+                self._verify_bound_store_identity(conn)
+                conn.commit()
+                return record
+            except BaseException:
+                try:
+                    conn.rollback()
+                except sqlite3.Error:
+                    pass
+                raise
+
+    @staticmethod
+    def _revision_recovery_identity(
+        revision_id: str,
+        manifest: RevisionManifestV1,
+    ) -> _RevisionRecoveryIdentity:
+        return _RevisionRecoveryIdentity(
+            revision_id=revision_id,
+            stream_id=manifest.stream_id,
+            generation=manifest.generation,
+            predecessor_revision_id=manifest.predecessor_revision_id,
+            project_snapshot_id=manifest.project_snapshot.snapshot_id,
+            workspace_snapshot_id=manifest.workspace_snapshot.snapshot_id,
+            context_id=manifest.context.context_id,
+            context_artifact_ids=manifest.context.artifact_ids,
+            context_artifact_set_digest=canonical_digest(manifest.context.artifact_ids),
+            execution_snapshot_id=manifest.execution_snapshot_id,
+            execution_mode=str(manifest.execution_snapshot.execution_mode),
+            capture_mode=str(manifest.execution_snapshot.capture_mode),
+        )
+
+    @staticmethod
+    def _validate_admission_request_against_revision(
+        request: TaskAdmissionRequest,
+        revision: _RevisionRecoveryIdentity,
+    ) -> None:
+        if request.project_id != request.stream_id or request.project_id != revision.stream_id:
+            raise TaskAdmissionConflictError(
+                "task admission project does not match the revision stream"
+            )
+        if request.project_snapshot.snapshot_id != revision.project_snapshot_id:
+            raise TaskAdmissionConflictError(
+                "task admission project snapshot does not match the pinned revision"
+            )
+        if request.workspace_snapshot.snapshot_id != revision.workspace_snapshot_id:
+            raise TaskAdmissionConflictError(
+                "task admission workspace snapshot does not match the pinned revision"
+            )
+        if request.execution_snapshot_id != revision.execution_snapshot_id:
+            raise TaskAdmissionConflictError(
+                "task admission execution snapshot does not match the pinned revision"
+            )
+        if str(request.execution_mode) != revision.execution_mode:
+            raise TaskAdmissionConflictError(
+                "task admission execution mode does not match the pinned revision"
+            )
+        if str(request.capture_mode) != revision.capture_mode:
+            raise TaskAdmissionConflictError(
+                "task admission capture mode does not match the pinned revision"
+            )
+        if request.context_id != revision.context_id:
+            raise TaskAdmissionConflictError(
+                "task admission context does not match the pinned revision"
+            )
+        if (
+            request.context_artifact_ids != revision.context_artifact_ids
+            or request.context_artifact_set_digest != revision.context_artifact_set_digest
+        ):
+            raise TaskAdmissionConflictError(
+                "task admission context artifact set does not match the pinned revision"
+            )
+
+    @classmethod
+    def _validate_unpinned_admission_authority(
+        cls,
+        record: TaskAdmissionRecord,
+        *,
+        active_generation: int,
+        active_revision: _RevisionRecoveryIdentity | None,
+    ) -> None:
+        if record.pinned_revision_id is not None:
+            raise RevisionIntegrityError("unpinned admission validator received a pin")
+        if record.status is AdmissionStatus.CANCELLED:
+            return
+        if record.status is not AdmissionStatus.QUEUED:
+            raise RevisionIntegrityError("task admission pin is missing")
+        if record.request.required_generation not in {
+            active_generation,
+            active_generation + 1,
+        }:
+            raise RevisionIntegrityError("queued task admission generation is inconsistent")
+        if record.request.required_generation != active_generation:
+            return
+        if active_revision is None:
+            raise RevisionIntegrityError("revision stream active head is missing")
+        try:
+            cls._validate_admission_request_against_revision(
+                record.request,
+                active_revision,
+            )
+        except TaskAdmissionConflictError as exc:
+            raise RevisionIntegrityError(
+                "unpinned task admission identity is inconsistent"
+            ) from exc
+
+    def _validate_revision_authority(
+        self,
+        conn: sqlite3.Connection,
+        revision_id: str,
+        *,
+        expected_stream_id: str | None = None,
+        expected_generation: int | None = None,
+    ) -> _AuthoritativeRevisionClosure:
+        row = conn.execute(
+            "SELECT * FROM revisions WHERE revision_id = ?",
+            (revision_id,),
+        ).fetchone()
+        if row is None:
+            raise RevisionIntegrityError("authoritative revision row is missing")
+        manifest = self._revision_manifest_from_row(row)
+        if (expected_stream_id is not None and manifest.stream_id != expected_stream_id) or (
+            expected_generation is not None and manifest.generation != expected_generation
+        ):
+            raise RevisionIntegrityError("authoritative stream revision identity is inconsistent")
+        self._validate_revision_materialization(conn, manifest)
+        self._validate_revision_execution_snapshot(conn, manifest)
+        return _AuthoritativeRevisionClosure(
+            revision_id=revision_id,
+            manifest=manifest,
+            identity=self._revision_recovery_identity(revision_id, manifest),
+        )
+
+    def _validate_stream_authority(
+        self,
+        conn: sqlite3.Connection,
+        stream_id: str,
+    ) -> tuple[_AuthoritativeRevisionClosure, int]:
+        row = conn.execute(
+            "SELECT stream_id, active_revision_id, active_generation, created_at, "
+            "updated_at FROM revision_streams WHERE stream_id = ?",
+            (stream_id,),
+        ).fetchone()
+        if row is None:
+            raise RevisionNotFoundError("revision stream does not exist")
+        try:
+            active_generation = _strict_sqlite_integer(
+                row["active_generation"],
+                label="revision stream active generation",
+            )
+            created_at = _parse_canonical_utc_iso(
+                row["created_at"],
+                label="revision stream created_at",
+            )
+            updated_at = _parse_canonical_utc_iso(
+                row["updated_at"],
+                label="revision stream updated_at",
+            )
+        except (TypeError, ValueError) as exc:
+            raise RevisionIntegrityError("revision stream record is invalid") from exc
+        if str(row["stream_id"]) != stream_id or updated_at < created_at or active_generation < 0:
+            raise RevisionIntegrityError("revision stream active identity is inconsistent")
+        active_revision_id = row["active_revision_id"]
+        if not isinstance(active_revision_id, str):
+            raise RevisionIntegrityError("revision stream active identity is inconsistent")
+        closure = self._validate_revision_authority(
+            conn,
+            active_revision_id,
+            expected_stream_id=stream_id,
+            expected_generation=active_generation,
+        )
+        return closure, active_generation
+
+    def _validate_admission_request_sources(
+        self,
+        conn: sqlite3.Connection,
+        request: TaskAdmissionRequest,
+    ) -> None:
+        if request.project_id != request.stream_id:
+            raise RevisionIntegrityError(
+                "task admission project does not match the revision stream"
+            )
+        snapshot = self._load_execution_snapshot(
+            conn,
+            request.execution_snapshot_id,
+        ).snapshot
+        binding = self._load_materialization_binding(conn, request.context_id)
+        if (
+            snapshot.execution_mode != request.execution_mode
+            or snapshot.capture_mode != request.capture_mode
+            or binding.execution_mode != str(request.execution_mode)
+            or binding.capture_mode != str(request.capture_mode)
+            or binding.base_model != snapshot.model.model_id
+            or binding.artifact_ids != request.context_artifact_ids
+            or canonical_digest(binding.artifact_ids) != request.context_artifact_set_digest
+        ):
+            raise RevisionIntegrityError("task admission envelope sources are inconsistent")
+
+    def _validate_admission_authority(
+        self,
+        conn: sqlite3.Connection,
+        record: TaskAdmissionRecord,
+    ) -> tuple[_AuthoritativeRevisionClosure, int]:
+        active, active_generation = self._validate_stream_authority(
+            conn,
+            record.request.stream_id,
+        )
+        self._validate_admission_request_sources(conn, record.request)
+        if record.pinned_revision_id is not None:
+            pinned = self._validate_revision_authority(
+                conn,
+                record.pinned_revision_id,
+                expected_stream_id=record.request.stream_id,
+                expected_generation=record.request.required_generation,
+            )
+            try:
+                self._validate_admission_request_against_revision(
+                    record.request,
+                    pinned.identity,
+                )
+            except TaskAdmissionConflictError as exc:
+                raise RevisionIntegrityError(
+                    "task admission pin identity is inconsistent"
+                ) from exc
+        else:
+            self._validate_unpinned_admission_authority(
+                record,
+                active_generation=active_generation,
+                active_revision=active.identity,
+            )
+        return active, active_generation
+
+    def create_genesis_revision(self, manifest: RevisionManifestV1) -> RevisionRecord:
+        """Create one explicit generation-zero stream head, or return its exact retry."""
+
+        manifest = RevisionManifestV1.model_validate(manifest.model_dump(mode="python"))
+        if manifest.generation != 0 or manifest.predecessor_revision_id is not None:
+            raise RevisionConflictError("genesis revision must be generation zero")
+        manifest_json = canonical_json(manifest)
+        manifest_digest = canonical_digest(manifest)
+        revision_id = revision_id_for_manifest(manifest)
+        now = utc_now_iso()
+        with self.connect() as conn:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                self._verify_bound_store_identity(conn)
+                existing_stream = conn.execute(
+                    "SELECT 1 FROM revision_streams WHERE stream_id = ?",
+                    (manifest.stream_id,),
+                ).fetchone()
+                if existing_stream is not None:
+                    active, active_generation = self._validate_stream_authority(
+                        conn,
+                        manifest.stream_id,
+                    )
+                    if active_generation != 0 or active.manifest != manifest:
+                        raise RevisionConflictError(
+                            "revision stream is already bound to a different genesis"
+                        )
+                    row = conn.execute(
+                        "SELECT * FROM revisions WHERE revision_id = ?",
+                        (active.revision_id,),
+                    ).fetchone()
+                    if row is None:
+                        raise RevisionIntegrityError("revision stream active head is missing")
+                    record = self._revision_record_from_row(row, active=True)
+                    conn.commit()
+                    return record
+                self._validate_revision_materialization(conn, manifest)
+                self._validate_revision_execution_snapshot(conn, manifest)
+                collision = conn.execute(
+                    "SELECT 1 FROM revisions WHERE revision_id = ? OR manifest_digest = ?",
+                    (revision_id, manifest_digest),
+                ).fetchone()
+                if collision is not None:
+                    raise RevisionConflictError("revision identity is already bound")
+                _enforce_ledger_capacity(
+                    conn,
+                    table="revisions",
+                    text_blob_columns=(
+                        "revision_id",
+                        "stream_id",
+                        "predecessor_revision_id",
+                        "created_at",
+                        "manifest_digest",
+                        "manifest_json",
+                        "context_id",
+                        "context_manifest_digest",
+                        "registry_digest",
+                        "execution_snapshot_id",
+                        "execution_snapshot_digest",
+                        "adapter_set_digest",
+                    ),
+                    new_text_blob_values=(
+                        revision_id,
+                        manifest.stream_id,
+                        manifest.predecessor_revision_id,
+                        now,
+                        manifest_digest,
+                        manifest_json,
+                        manifest.context.context_id,
+                        manifest.context.manifest_digest,
+                        manifest.context.registry_digest,
+                        manifest.execution_snapshot_id,
+                        manifest.execution_snapshot_digest,
+                        canonical_digest(manifest.adapters),
+                    ),
+                    max_rows=MAX_REVISION_RECOVERY_ROWS,
+                    max_bytes=MAX_REVISION_RECOVERY_BYTES,
+                    max_row_bytes=MAX_REVISION_ROW_BYTES,
+                    label="revision ledger",
+                )
+                _enforce_ledger_capacity(
+                    conn,
+                    table="revision_streams",
+                    text_blob_columns=(
+                        "stream_id",
+                        "active_revision_id",
+                        "created_at",
+                        "updated_at",
+                    ),
+                    new_text_blob_values=(manifest.stream_id, revision_id, now, now),
+                    max_rows=MAX_REVISION_STREAM_RECOVERY_ROWS,
+                    max_bytes=MAX_REVISION_STREAM_RECOVERY_BYTES,
+                    max_row_bytes=MAX_REVISION_STREAM_ROW_BYTES,
+                    label="revision stream ledger",
+                )
+                conn.execute(
+                    """
+                    INSERT INTO revisions (
+                        revision_id, stream_id, generation, predecessor_revision_id,
+                        created_at, manifest_digest, manifest_json, context_id,
+                        context_manifest_digest, registry_digest, execution_snapshot_id,
+                        execution_snapshot_digest, adapter_set_digest
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        revision_id,
+                        manifest.stream_id,
+                        manifest.generation,
+                        manifest.predecessor_revision_id,
+                        now,
+                        manifest_digest,
+                        manifest_json,
+                        manifest.context.context_id,
+                        manifest.context.manifest_digest,
+                        manifest.context.registry_digest,
+                        manifest.execution_snapshot_id,
+                        manifest.execution_snapshot_digest,
+                        canonical_digest(manifest.adapters),
+                    ),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO revision_streams (
+                        stream_id, active_revision_id, active_generation, created_at, updated_at
+                    )
+                    VALUES (?, ?, 0, ?, ?)
+                    """,
+                    (manifest.stream_id, revision_id, now, now),
+                )
+                row = conn.execute(
+                    "SELECT * FROM revisions WHERE revision_id = ?",
+                    (revision_id,),
+                ).fetchone()
+                if row is None:
+                    raise RevisionIntegrityError("created revision could not be read back")
+                record = self._revision_record_from_row(row, active=True)
+                self._verify_bound_store_identity(conn)
+                conn.commit()
+                return record
+            except BaseException:
+                try:
+                    conn.rollback()
+                except sqlite3.Error:
+                    pass
+                raise
+
+    def get_active_revision(self, stream_id: str) -> RevisionRecord:
+        if re.fullmatch(r"[A-Za-z][A-Za-z0-9_.-]{0,127}", stream_id) is None:
+            raise ValueError("revision stream ID is invalid")
+        with self.connect() as conn:
+            try:
+                conn.execute("BEGIN")
+                self._verify_bound_store_identity(conn)
+                active, _active_generation = self._validate_stream_authority(
+                    conn,
+                    stream_id,
+                )
+                row = conn.execute(
+                    "SELECT * FROM revisions WHERE revision_id = ?",
+                    (active.revision_id,),
+                ).fetchone()
+                if row is None:
+                    raise RevisionIntegrityError("revision stream active head is missing")
+                record = self._revision_record_from_row(row, active=True)
+                self._verify_bound_store_identity(conn)
+                conn.commit()
+                return record
+            except BaseException:
+                try:
+                    conn.rollback()
+                except sqlite3.Error:
+                    pass
+                raise
+
+    def admit_task(
+        self,
+        intent: TaskAdmissionIntent,
+        envelope: TaskExecutionEnvelopeV1,
+    ) -> TaskAdmissionRecord:
+        """Persist one exact task request and pin or queue it without stale fallback."""
+
+        intent = TaskAdmissionIntent.model_validate(intent.model_dump(mode="python"))
+        envelope = TaskExecutionEnvelopeV1.model_validate(envelope.model_dump(mode="python"))
+        request = bind_task_admission(intent, envelope)
+        request_json = canonical_json(request)
+        request_digest = canonical_digest(request)
+        admission_id = admission_id_for_request(request)
+        with self.connect() as conn:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                self._verify_bound_store_identity(conn)
+                task_row = conn.execute(
+                    "SELECT * FROM task_admissions WHERE stream_id = ? AND task_id = ?",
+                    (request.stream_id, request.task_id),
+                ).fetchone()
+                key_row = conn.execute(
+                    """
+                    SELECT * FROM task_admissions
+                    WHERE stream_id = ? AND idempotency_key = ?
+                    """,
+                    (request.stream_id, request.idempotency_key),
+                ).fetchone()
+                if task_row is not None and str(task_row["request_digest"]) != request_digest:
+                    raise TaskAdmissionConflictError(
+                        "task identity is already bound to a different admission request"
+                    )
+                if key_row is not None and str(key_row["request_digest"]) != request_digest:
+                    raise TaskAdmissionConflictError(
+                        "idempotency key is already bound to a different admission request"
+                    )
+                if (
+                    task_row is not None
+                    and key_row is not None
+                    and task_row["admission_id"] != key_row["admission_id"]
+                ):
+                    raise RevisionIntegrityError(
+                        "task and idempotency identities resolve to different admissions"
+                    )
+                existing = task_row if task_row is not None else key_row
+                active, active_generation = self._validate_stream_authority(
+                    conn,
+                    request.stream_id,
+                )
+                if existing is not None:
+                    record = self._task_admission_from_row(existing)
+                    if record.request != request:
+                        raise RevisionIntegrityError(
+                            "persisted admission does not match its retry request"
+                        )
+                    self._validate_admission_authority(conn, record)
+                    if record.status is AdmissionStatus.QUEUED:
+                        if active_generation == request.required_generation:
+                            now = utc_now_iso()
+                            expected_row_bytes = _enforce_task_admission_transition_capacity(
+                                conn,
+                                existing,
+                                status=AdmissionStatus.ADMITTED,
+                                reason=None,
+                                pinned_revision_id=active.revision_id,
+                                updated_at=now,
+                                finished_at=None,
+                            )
+                            updated = conn.execute(
+                                """
+                                UPDATE task_admissions
+                                SET status = 'admitted', reason = NULL,
+                                    pinned_revision_id = ?, updated_at = ?
+                                WHERE admission_id = ? AND status = 'queued'
+                                """,
+                                (active.revision_id, now, record.admission_id),
+                            )
+                            if updated.rowcount != 1:
+                                raise RevisionIntegrityError(
+                                    "queued task admission transition was not applied"
+                                )
+                            existing = conn.execute(
+                                "SELECT * FROM task_admissions WHERE admission_id = ?",
+                                (record.admission_id,),
+                            ).fetchone()
+                            if existing is None:
+                                raise RevisionIntegrityError("task admission disappeared")
+                            _verify_task_admission_transition_capacity(
+                                conn,
+                                existing,
+                                expected_row_bytes=expected_row_bytes,
+                            )
+                            record = self._task_admission_from_row(existing)
+                            self._validate_admission_authority(conn, record)
+                    self._verify_bound_store_identity(conn)
+                    conn.commit()
+                    return record
+                if request.project_id != request.stream_id:
+                    raise TaskAdmissionConflictError(
+                        "task admission project does not match the revision stream"
+                    )
+                if request.required_generation < active_generation:
+                    raise TaskAdmissionConflictError(
+                        "required generation is older than the active revision"
+                    )
+                if request.required_generation > active_generation + 1:
+                    raise TaskAdmissionConflictError("required revision has a generation gap")
+                now = utc_now_iso()
+                if request.required_generation == active_generation:
+                    self._validate_admission_request_against_revision(
+                        request,
+                        active.identity,
+                    )
+                    status = AdmissionStatus.ADMITTED
+                    reason = None
+                    pinned_revision_id = active.revision_id
+                else:
+                    try:
+                        self._validate_admission_request_sources(conn, request)
+                    except RevisionIntegrityError as exc:
+                        raise TaskAdmissionConflictError(str(exc)) from exc
+                    status = AdmissionStatus.QUEUED
+                    reason = AdmissionQueueReason.REQUIRED_REVISION_UNCOMMITTED
+                    pinned_revision_id = None
+                _enforce_ledger_capacity(
+                    conn,
+                    table="task_admissions",
+                    text_blob_columns=_TASK_ADMISSION_TEXT_BLOB_COLUMNS,
+                    new_text_blob_values=(
+                        admission_id,
+                        request.stream_id,
+                        request.task_id,
+                        request.idempotency_key,
+                        request_digest,
+                        request_json,
+                        str(status),
+                        None if reason is None else str(reason),
+                        pinned_revision_id,
+                        now,
+                        now,
+                        None,
+                    ),
+                    max_rows=MAX_TASK_ADMISSION_RECOVERY_ROWS,
+                    max_bytes=MAX_TASK_ADMISSION_RECOVERY_BYTES,
+                    max_row_bytes=MAX_TASK_ADMISSION_ROW_BYTES,
+                    label="task admission ledger",
+                )
+                conn.execute(
+                    """
+                    INSERT INTO task_admissions (
+                        admission_id, stream_id, task_id, idempotency_key,
+                        required_generation, request_digest, request_json, status,
+                        reason, pinned_revision_id, created_at, updated_at, finished_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+                    """,
+                    (
+                        admission_id,
+                        request.stream_id,
+                        request.task_id,
+                        request.idempotency_key,
+                        request.required_generation,
+                        request_digest,
+                        request_json,
+                        str(status),
+                        None if reason is None else str(reason),
+                        pinned_revision_id,
+                        now,
+                        now,
+                    ),
+                )
+                row = conn.execute(
+                    "SELECT * FROM task_admissions WHERE admission_id = ?",
+                    (admission_id,),
+                ).fetchone()
+                if row is None:
+                    raise RevisionIntegrityError("created task admission could not be read back")
+                record = self._task_admission_from_row(row)
+                self._validate_admission_authority(conn, record)
+                self._verify_bound_store_identity(conn)
+                conn.commit()
+                return record
+            except BaseException:
+                try:
+                    conn.rollback()
+                except sqlite3.Error:
+                    pass
+                raise
+
+    def get_task_admission(self, admission_id: str) -> TaskAdmissionRecord:
+        if re.fullmatch(r"adm-[0-9a-f]{64}", admission_id) is None:
+            raise ValueError("task admission ID is invalid")
+        with self.connect() as conn:
+            try:
+                conn.execute("BEGIN")
+                self._verify_bound_store_identity(conn)
+                row = conn.execute(
+                    "SELECT * FROM task_admissions WHERE admission_id = ?",
+                    (admission_id,),
+                ).fetchone()
+                if row is None:
+                    raise RevisionNotFoundError("task admission does not exist")
+                record = self._task_admission_from_row(row)
+                self._validate_admission_authority(conn, record)
+                self._verify_bound_store_identity(conn)
+                conn.commit()
+                return record
+            except BaseException:
+                try:
+                    conn.rollback()
+                except sqlite3.Error:
+                    pass
+                raise
+
+    def finish_task_admission(
+        self,
+        admission_id: str,
+        status: AdmissionStatus,
+    ) -> TaskAdmissionRecord:
+        if re.fullmatch(r"adm-[0-9a-f]{64}", admission_id) is None:
+            raise ValueError("task admission ID is invalid")
+        try:
+            terminal = AdmissionStatus(status)
+        except ValueError as exc:
+            raise TaskAdmissionConflictError("task terminal status is invalid") from exc
+        if terminal not in {
+            AdmissionStatus.COMPLETED,
+            AdmissionStatus.FAILED,
+            AdmissionStatus.CANCELLED,
+        }:
+            raise TaskAdmissionConflictError("task status is not terminal")
+        with self.connect() as conn:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                self._verify_bound_store_identity(conn)
+                row = conn.execute(
+                    "SELECT * FROM task_admissions WHERE admission_id = ?",
+                    (admission_id,),
+                ).fetchone()
+                if row is None:
+                    raise RevisionNotFoundError("task admission does not exist")
+                record = self._task_admission_from_row(row)
+                self._validate_admission_authority(conn, record)
+                if record.status in {
+                    AdmissionStatus.COMPLETED,
+                    AdmissionStatus.FAILED,
+                    AdmissionStatus.CANCELLED,
+                }:
+                    if record.status is not terminal:
+                        raise TaskAdmissionConflictError(
+                            "task admission already has a different terminal state"
+                        )
+                    conn.commit()
+                    return record
+                if (
+                    record.status is AdmissionStatus.QUEUED
+                    and terminal is not AdmissionStatus.CANCELLED
+                ):
+                    raise TaskAdmissionConflictError("queued task admission can only be cancelled")
+                now = utc_now_iso()
+                expected_row_bytes = _enforce_task_admission_transition_capacity(
+                    conn,
+                    row,
+                    status=terminal,
+                    reason=None,
+                    pinned_revision_id=record.pinned_revision_id,
+                    updated_at=now,
+                    finished_at=now,
+                )
+                updated = conn.execute(
+                    """
+                    UPDATE task_admissions
+                    SET status = ?, reason = NULL, updated_at = ?, finished_at = ?
+                    WHERE admission_id = ?
+                    """,
+                    (str(terminal), now, now, admission_id),
+                )
+                if updated.rowcount != 1:
+                    raise RevisionIntegrityError(
+                        "task admission terminal transition was not applied"
+                    )
+                row = conn.execute(
+                    "SELECT * FROM task_admissions WHERE admission_id = ?",
+                    (admission_id,),
+                ).fetchone()
+                if row is None:
+                    raise RevisionIntegrityError("task admission disappeared")
+                _verify_task_admission_transition_capacity(
+                    conn,
+                    row,
+                    expected_row_bytes=expected_row_bytes,
+                )
+                result = self._task_admission_from_row(row)
+                self._validate_admission_authority(conn, result)
+                self._verify_bound_store_identity(conn)
+                conn.commit()
+                return result
+            except BaseException:
+                try:
+                    conn.rollback()
+                except sqlite3.Error:
+                    pass
+                raise
+
+    def active_revision_lease_count(self, revision_id: str) -> int:
+        if re.fullmatch(r"rev-[0-9a-f]{64}", revision_id) is None:
+            raise ValueError("revision ID is invalid")
+        with self.connect() as conn:
+            self._verify_bound_store_identity(conn)
+            if (
+                conn.execute(
+                    "SELECT 1 FROM revisions WHERE revision_id = ?",
+                    (revision_id,),
+                ).fetchone()
+                is None
+            ):
+                raise RevisionNotFoundError("revision does not exist")
+            row = conn.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM task_admissions
+                WHERE pinned_revision_id = ? AND status = 'admitted'
+                """,
+                (revision_id,),
+            ).fetchone()
+        return int(row["count"])
+
     def resolve_context(self, request: ContextResolveRequest) -> ContextResolveResponse:
         raw_payload = request.model_dump(mode="python")
         _validate_finite_floats(raw_payload, "request")
@@ -3374,6 +5446,23 @@ class EvolutionStore:
                     if existing is not None:
                         conn.rollback()
                         return False
+                    now = utc_now_iso()
+                    materialization_json = (
+                        None if materialization is None else canonical_json(materialization)
+                    )
+                    if materialization is not None and materialization_json is not None:
+                        _enforce_materialization_capacity(
+                            conn,
+                            (
+                                context_id,
+                                now,
+                                materialization.registry_digest,
+                                materialization.request_digest,
+                                materialization_json,
+                                request_json,
+                                response_json,
+                            ),
+                        )
                     conn.execute(
                         """
                         INSERT INTO contexts (
@@ -3384,7 +5473,7 @@ class EvolutionStore:
                         """,
                         (
                             context_id,
-                            utc_now_iso(),
+                            now,
                             request_json,
                             response_json,
                             selected_ids_json,
@@ -3401,10 +5490,10 @@ class EvolutionStore:
                             """,
                             (
                                 context_id,
-                                utc_now_iso(),
+                                now,
                                 materialization.registry_digest,
                                 materialization.request_digest,
-                                canonical_json(materialization),
+                                materialization_json,
                             ),
                         )
                     with self._opened_bound_artifact_root() as artifact_root_fd:

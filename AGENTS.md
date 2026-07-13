@@ -44,7 +44,7 @@ harness 只要能提供稳定 transcript，都应能接入 pure-text evolution�
 不能静默使用 stale/partial revision。不要在 method descriptor 或 method config 中加入各自的
 online/offline timing、background/barrier 选择或 streaming/in-session ABI。方法差异继续通过
 input bindings、execution/capture/harness/runtime requirements、config 和 typed outputs 表达。
-这是产品目标 contract；当前 cross-session revision/admission/atomic activation 尚未实现，不能把
+这是产品目标 contract；当前完整的 cross-session revision/admission/atomic activation 尚未实现，不能把
 内部 materializer 或现有 legacy Gateway path 描述为已经满足该 contract。
 
 ## 目录结构
@@ -86,6 +86,20 @@ input bindings、execution/capture/harness/runtime requirements、config 和 typ
   rename 原子发布。
   它不得按 target ID 分支，也不得在持久化 contract 中暴露 artifact URI、host path 或 opaque
   scanner handle。
+- `src/openevo/evolution/revisions.py`: immutable cross-session revision 与 task admission contract。
+  Store 当前只允许显式 generation-zero head；当前 generation admission 固定 exact revision，且只把
+  下一 generation 持久化为 queued/not-ready。Successor transition/readiness/atomic activation 尚未
+  实现前，不得增加绕过这些阶段的任意 revision publish 入口。Execution snapshot 使用 closed typed
+  model/runtime/serving data；model source 必须显式声明 `hugging_face`、`managed_snapshot` 或
+  `subscription`，不能持久化 host path/URI。Store 只接受 verified producer sealed 的
+  `VerifiedExecutionSnapshot`，再从 typed canonical bytes 计算 ID/digest 并记录 producer ID；该对象不能
+  由普通调用方构造。当前没有 production issuer，只有仓库私有 testkit 可签发测试对象；#160/B1 managed
+  deployment 接入 verified producer 前，release genesis/admission 必须 fail closed。Revision 必须引用且
+  内嵌 exact registered snapshot；该内部 primitive 不证明 B2 deployment、serving readiness 或
+  attestation。Task admission envelope 只能包含 allowlisted non-secret identity
+  fields 和 content-addressed project/workspace/task refs；schema 不接收 raw instruction、credential、env、
+  setup command 或开放 runtime/model dict；非闭集字段在输入边界直接拒绝。未来 Core run owner 应从 immutable
+  project/workspace snapshots 构造该 envelope；当前尚未接线。Subscription 只能使用 transcript capture。
 - `src/openevo/experiments/`: experiment compiler/runner/promotion helpers。
 - `src/openevo/projects/science/`: ordinary-user science project config/compiler。
 - `src/openevo/deployment/`: remote deployment lifecycle、bootstrap、preflight、SSH transport。
@@ -111,6 +125,26 @@ session/task events -> dataset artifact -> immutable evolution plan
   -> plan-bound job -> verified worker method
   -> typed artifacts -> context resolve -> gateway runtime injection
 ```
+
+Cross-session revision ledger 使用 canonical manifest digest 绑定 project/workspace snapshots、
+materialized context/artifact set、registered execution snapshot 和 ordered adapters。当前 generation 的
+admission 必须在同一 `BEGIN IMMEDIATE` 内 exact 匹配 stream/project、execution/capture mode、snapshot、
+context 和 artifact set；queued row 在 activation 后重启时允许保持未 pin，exact retry 再原子 pin active
+revision。未 pin `cancelled` 是保持完整 request sources 与 no-pin 语义的 closed historical audit row，head
+继续推进后不再要求其 generation 与当前 active generation 相邻；pinned `cancelled` 仍必须验证原 pin 的完整
+闭包，但不要求该 pin 仍是 active head。Task/idempotency identity 不可复用到不同请求；admitted pin 和
+terminal state 不可改写。
+Startup 必须按 exact schema、canonical rows、predecessor chain、stream head 和 pinned identity fail closed
+校验。Store identity、context snapshot/materialization 和 B3 ledger 的 text/blob recovery 必须先只读取
+PK 与 SQL `length(CAST(value AS BLOB))`，在不可退回的 row/aggregate budget 允许后，才以 exact-length
+guarded `CASE` 逐行取值并重验 UTF-8 bytes；不得让超限单值先进入 Python。该保证不泛化到尚未迁移的
+legacy job/artifact recovery。Task admission 首次写入与 recovery 使用同一 row/aggregate byte capacity；每次
+非幂等状态 UPDATE 必须先按 old/new exact UTF-8 byte delta 验证容量，并在 UPDATE 后 readback 重验，exact
+retry 不因已满而失败。`get_active_revision` 与 `get_task_admission` 必须在显式一致 read transaction 内分别
+执行 stream/admission 的完整权威闭包校验。Genesis、queued、admitted 与 terminal retry 以及 terminal
+transition 都必须在同一事务走 active head、revision、materialization、execution snapshot 和完整
+envelope/pin 的统一权威闭包校验。当前内部 ledger 不等于 successor activation，也尚未接入公开 Core API、
+Gateway、run owner 或 Desktop。
 
 新的 Core experiment job 必须通过 `POST /v1/planned-jobs` 创建。Plan-bound job 持久化
 plan、plan digest、target、reachable registry digest、method identity、canonical execution envelope 和有序

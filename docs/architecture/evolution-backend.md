@@ -213,6 +213,64 @@ plan-bound jobs。
 event type 原值，不迁移 pre-release runtime identity。Dataset queries 只匹配
 显式请求的 OpenEvo event identity，例如 `openevo.session_completed`。
 
+## Revision And Admission Ledger（内部 Primitive）
+
+`revisions` 保存 canonical immutable manifest；`revision_id=rev-<manifest sha256>`。Manifest 显式
+绑定 stream/generation/predecessor、content-addressed project/workspace refs、materialized context
+manifest/request/registry digest 与 exact artifact set、registered execution snapshot 和 ordered adapters。
+`execution_snapshots` 保存 closed typed model/runtime/serving identity。Store 只接受 verified producer
+sealed、普通调用方不可构造的 `VerifiedExecutionSnapshot`，随后从 typed canonical bytes 自行计算
+ID/digest 并记录 producer ID。Model source 是 `hugging_face`、`managed_snapshot` 或 `subscription`；identity 只允许
+remote/opaque 名称，拒绝绝对 host path、`file://` 和 URI。Subscription snapshot 必须同时使用
+transcript capture、subscription model/client/serving，且不能带 adapter；self-deployed snapshot 要求
+非 subscription model/runtime 和 managed serving。`revision_streams` 只保存当前 committed head，
+`task_admissions` 保存 canonical request、task/idempotency identity、required generation、
+allowlisted canonical task envelope identity、状态和不可变 pin；不保存原始 task/run payload。
+Envelope schema 只接受 content-addressed project/workspace/task refs、opaque IDs 和明确的 mode/artifact
+identity，不接受 instruction、credential、env、setup command 或开放 task/runtime/model dict；不基于
+字段名或文本猜测处理，非闭集字段直接拒绝。Admission request 持久化完整 closed envelope identity
+字段并重算 envelope digest，调用方不能自报该 digest。未来 Core run owner 应从
+immutable project/workspace snapshots 构造 envelope；本 primitive 尚未接该 owner。当前 self-deployed 与 subscription 的
+genesis/admission contract 均有回归覆盖。
+当前 API 只允许创建 generation-zero head，不能绕过 transition/readiness 任意发布 successor。
+
+Admission 在 `BEGIN IMMEDIATE` 中读取 stream head：请求当前 generation 时写入 `admitted` 和 exact
+`pinned_revision_id`，并在同一事务 exact 匹配 project/stream、project/workspace refs、execution/capture
+mode、registered execution snapshot、materialized context 和 artifact set；请求且只请求下一 generation
+时写入 durable `queued` /
+`required_revision_uncommitted`，pin 必须为空。更旧 generation 和 generation gap 都拒绝。同一请求
+并发或重试返回同一 row；task ID 或 idempotency key 携带不同 canonical request 会冲突。Admitted
+task 终结后保留 pin 供 audit；active admission count 是后续 serving drain 的 lease primitive。若 successor
+activation 后在 retry 前重启，startup 接受 `active_generation == required_generation` 的未 pin queued row；
+retry 重新执行 exact match 后原子 pin，不在 startup 猜测 admission。
+未 pin `cancelled` 是 closed historical audit row；它继续验证完整 request sources、terminal record 和 no-pin
+语义，但 head 推进后不再与当前 active generation 建立相邻关系。Pinned `cancelled` 继续验证其原 revision、
+materialization 和 execution snapshot closure，但原 pin 不必仍为 active head。
+Genesis exact retry、queued/admitted/terminal retry 和 terminal transition 使用同一权威闭包校验：active
+stream head/generation、revision canonical row、materialization、execution snapshot、完整 envelope identity
+和 pin 中任一依赖损坏都在状态写入前 fail closed。
+`get_active_revision` 和 `get_task_admission` 是权威 Store read；二者都显式开启一致 read transaction，并在
+返回前分别执行 stream closure 或完整 admission closure 校验。它们不把单行 parse 当作 live integrity
+证明。
+
+Startup 对 store identity、context snapshots、execution snapshot、revision、stream、admission 和
+materialization binding 使用两阶段读取。第一阶段只把 bounded PK 与
+`length(CAST(value AS BLOB))` 返回 Python，并先消耗不可退回的 row/aggregate byte budget；第二阶段才以
+SQL exact-length/maximum-length guarded `CASE` 逐行读取 text，再重验实际 UTF-8 bytes 后解析 JSON。超限
+单值不会先进入 Python。它复核 exact schema fingerprint、canonical JSON/digest、materialized context
+identity、execution snapshot、predecessor chain、active head、admission request 和完整 pin identity。写事务
+使用同一 row/byte capacity；task admission 每次非幂等 UPDATE 都在写前按 old/new exact UTF-8 byte delta
+验证 row 与 aggregate capacity，并在 UPDATE 后 readback 重验。Exact retry 在 capacity check 前返回；新写入
+不能制造下一次 startup 必然拒绝的 B3 数据库。B3 ledger recovery 只保留 chain/head/pin 所需 compact identities，不保留全部 manifest
+或 execution snapshot model；context snapshot 文件 reconciliation 仍在独立 256 MiB aggregate budget 内持有
+canonical bytes。这里不宣称尚未迁移的 legacy job/artifact startup 路径具有同一预算。
+该内部 contract 尚未暴露 HTTP，也未接 Gateway/run/transition/Desktop。B3.2-B3.4 完成 dataset seal、
+readiness 和 atomic successor activation 前，不得把它描述成完整 cross-session evolution。Execution
+snapshot persistence 也不构成 B2 verified deployment、serving readiness 或 attestation。当前仓库没有
+production `VerifiedExecutionSnapshot` issuer；只有 repo-private testkit 能构造测试 seal。#160/B1 managed
+deployment 提供 verified producer 前，release genesis/admission 没有可用的 snapshot registration 路径，
+必须 fail closed。
+
 ## Context Resolution（当前公开 Legacy Path）
 
 本节描述 Gateway 当前使用的 public v1 path。Verified handler、内部 projection 和 generic
