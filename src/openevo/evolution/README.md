@@ -150,8 +150,47 @@ group/other-writable mode 只在显式 startup migration 中接受，用于原 i
 该内部 projection/materializer 尚未替换公开 legacy `/v1/contexts/resolve` 和 Gateway staging；
 公开 runtime 路径保持原行为，直到严格 v2 client、opaque blob transport 和 Gateway generic
 staging 可以原子切换。
-Cross-session revision pinning、queued/not-ready admission 和 atomic next-revision activation 也尚未
-实现，不能由内部 materializer 的存在推断已经完成。
+Store 已实现 cross-session revision/admission 的内部持久化 primitive：immutable generation-zero
+manifest 绑定 content-addressed project/workspace refs、canonical materialized context 及 artifact set、
+registered execution snapshot 和 ordered adapters。Execution snapshot 是 closed typed
+model/runtime/serving data；Store 只接受 verified producer sealed、普通调用方不可构造的
+`VerifiedExecutionSnapshot`，再从 typed canonical bytes 计算 ID/digest 并记录 producer ID。Revision 同时引用并内嵌 exact
+snapshot，genesis transaction 从 DB 重读并完整比对。Model identity 拒绝 host path/URI；subscription
+snapshot 只能使用 transcript capture、subscription model/client/serving 且不能带 adapter，self-deployed
+snapshot 则要求 Hugging Face 或 managed-snapshot model、非 subscription runtime 和 managed serving。
+
+Task admission 通过同一 `BEGIN IMMEDIATE` exact 匹配 project/stream、project/workspace snapshots、
+execution/capture mode、execution snapshot、materialized context 和 context artifact set，再对当前 generation
+固定 revision；且只把下一 generation 持久化为 `required_revision_uncommitted`，不回退到旧 revision。
+Activation 后重启允许 required generation 已等于 active generation 的 queued row 保持未 pin，exact retry
+重新验证后再原子 pin。Envelope 只含 allowlisted non-secret identity fields、content-addressed refs 和 opaque
+IDs；schema 不接受 raw instruction、credential、env、setup command 或开放 task/runtime/model dict，
+非闭集字段在输入边界直接拒绝。Admission request 保存完整 closed envelope identity 字段并自行重算
+digest；Task/幂等键不能复用到不同 canonical request，调用方不能直接提交 envelope digest。
+
+Admitted pin 与 terminal state 不可改写。未 pin `cancelled` 是 closed historical audit row：仍验证完整
+request sources 和 no-pin 语义，但 head 推进后不再要求其 generation 与当前 active generation 相邻；pinned
+`cancelled` 继续验证原 pin 的完整 closure，但不要求原 pin 仍 active。`get_active_revision` 和
+`get_task_admission` 都在显式一致 read transaction 中验证对应的完整权威 closure 后返回。Genesis、
+queued/admitted/terminal retry 和 terminal transition 都在同一事务使用 active head、revision、
+materialization、execution snapshot、完整 envelope/pin 的权威闭包。
+Startup 会按 exact schema、canonical manifest/request/snapshot、predecessor chain 和 stream head 做校验。
+Store identity、context snapshot/materialization 和 B3 ledger 先只读取 bounded PK 与 SQL octet length并消耗
+不可退回的 row/aggregate budget，再以 exact-length guarded `CASE` 逐行取 text、重验 UTF-8 bytes 后解析；
+超限单值不会先进入 Python。B3 recovery 只保留 compact identity，context snapshot canonical bytes 另受
+独立 aggregate budget。Task admission 非幂等 UPDATE 在写入前按 old/new exact UTF-8 byte delta 检查 row
+和 aggregate capacity，写后 readback 重验；exact retry 在容量检查前返回。该保证不扩展到尚未迁移的
+legacy job/artifact recovery。
+
+这仍不是完整 B3 生命周期。Execution snapshot persistence 只是内部 canonical identity primitive，不是
+B2 verified deployment、serving readiness 或 attestation。当前没有 production issuer，repo-private
+testkit seal 只用于测试；#160/B1 verified deployment producer 接入前 release genesis/admission 必须 fail
+closed。未来 Core run owner 仍需从 immutable
+project/workspace snapshots 构造 admission envelope；当前只允许显式 genesis，不提供任意 successor
+commit/activation；
+dataset seal、transition、readiness、serving prepare、atomic N+1 commit、Core HTTP、Gateway/run admission
+和 Desktop 状态接线均未实现。因而内部 ledger 或 materializer 的存在都不能被描述为已经完成
+端到端 cross-session activation。
 其中也包括 public v1 原有的 subscription auth alias 判定；更通用的 `*_subscription` 识别只
 存在于 internal projection execution-profile 校验中。
 Public legacy artifact read 仍读取 legacy manifest file；immutable `manifest_json` 只由内部

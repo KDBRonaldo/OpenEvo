@@ -70,9 +70,38 @@ link-count-one `0600` regular file。较宽但安全的历史 mode 仅由显式 
 到 `0600`，不会放宽普通读取。
 Adapter 完整 rehash 后还要重新绑定 payload-root pathname，拒绝 root 整体替换。
 
-Cross-session revision pinning、queued/not-ready admission 和 all-or-nothing next-revision activation
-仍是后续 productization 工作；内部 materializer、strict v2 transport 和 Gateway generic cutover
-不能被描述为已经完成这条端到端 revision contract。
+Core Store 现有一个内部 revision/admission ledger primitive。Generation-zero manifest 以 canonical
+digest 绑定 project/workspace content refs、materialized context/registry/artifact set、registered closed
+model/runtime/serving execution snapshot 和 ordered adapters。Store 只接受 verified producer sealed 的
+`VerifiedExecutionSnapshot`，再从 typed canonical bytes 计算 ID/digest 并记录 producer ID；model identity
+只保存 Hugging Face 名称、subscription identity 或 managed
+snapshot opaque ID，拒绝 host path/URI。Subscription 只能使用 transcript capture 且不能带 adapter。
+当前 generation 的 admission 在同一 `BEGIN IMMEDIATE` 中 exact 匹配 project/stream、snapshot、
+execution/capture mode、context 和 artifact set 后固定 revision，下一 generation 则持久化为
+`required_revision_uncommitted` 且 `pinned_revision_id=NULL`。Task identity、idempotency key、pin 和
+terminal state 都采用 immutable/idempotent 语义。Admission envelope 只允许 non-secret identity fields、
+content-addressed refs 和 opaque IDs；schema 不接收 instruction、credential、env、setup command 或开放
+task/runtime/model dict；非闭集字段直接拒绝，也不接受调用方直接提供 digest。Activation 后重启可
+保留 `active_generation == required_generation` 的未 pin queued row，retry exact 验证后原子 pin。
+未 pin `cancelled` 是 closed historical audit row：继续验证 request sources 和 no-pin 语义，但 head 任意推进
+后不再要求其 generation 与当前 active generation 相邻；pinned `cancelled` 仍验证原 pin closure，而不要求
+原 pin 当前 active。权威 `get_active_revision`/`get_task_admission` read 都在显式一致 transaction 中完成对应
+stream/admission closure 校验后返回。
+
+Startup 对 store identity、context snapshot/materialization 和 B3 ledger 使用两阶段读取：先只读取 bounded
+PK 与 SQL octet length 并消耗不可退回的 row/aggregate budget，再以 exact-length guarded `CASE` 逐行
+读取 text、重验 UTF-8 bytes 后解析。B3 ledger 内存只保留 chain/head/pin 所需 compact identity；context
+snapshot reconciliation 的 canonical bytes 受独立 aggregate budget。该保证不扩展到尚未迁移的 legacy
+job/artifact recovery。写入侧使用同一 B3 row/byte capacity；task admission 非幂等 UPDATE 在写前计算
+old/new exact UTF-8 byte delta，并在 UPDATE 后 readback 重验，exact retry 优先于 capacity check。
+
+该 primitive 尚未接入 Gateway、Core run owner、Desktop 或 benchmark automation，也不提供 successor
+revision activation。Transition sealing、所有 enabled target 的 readiness、adapter load/restart、health
+check 和 atomic N+1 commit 仍是 B3.2-B3.4 工作。因此 materializer、strict v2 transport、Gateway
+generic cutover 或当前 genesis ledger 中任何一项都不能单独被描述为完整 revision contract。Execution
+snapshot persistence 不是 B2 verified deployment/readiness attestation。当前无 production snapshot issuer，
+repo-private testkit seal 仅用于测试；#160/B1 verified deployment producer 接入前 release admission 必须 fail
+closed。未来 run owner 仍需从 immutable project/workspace snapshots 构造 admission envelope。
 
 ## 当前公开 Legacy Gateway 流程
 

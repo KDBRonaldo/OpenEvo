@@ -789,6 +789,92 @@ CREATE TABLE context_materializations (
 );
 """
 
+_REVISION_LEDGER_DDL = """
+CREATE TABLE execution_snapshots (
+    execution_snapshot_id TEXT PRIMARY KEY,
+    created_at TEXT NOT NULL,
+    snapshot_digest TEXT NOT NULL UNIQUE,
+    producer_id TEXT NOT NULL,
+    snapshot_json TEXT NOT NULL
+);
+CREATE TABLE revisions (
+    revision_id TEXT PRIMARY KEY,
+    stream_id TEXT NOT NULL,
+    generation INTEGER NOT NULL CHECK(typeof(generation) = 'integer' AND generation >= 0),
+    predecessor_revision_id TEXT,
+    created_at TEXT NOT NULL,
+    manifest_digest TEXT NOT NULL UNIQUE,
+    manifest_json TEXT NOT NULL,
+    context_id TEXT NOT NULL,
+    context_manifest_digest TEXT NOT NULL,
+    registry_digest TEXT NOT NULL,
+    execution_snapshot_id TEXT NOT NULL,
+    execution_snapshot_digest TEXT NOT NULL,
+    adapter_set_digest TEXT NOT NULL,
+    UNIQUE(stream_id, generation),
+    CHECK(
+        (generation = 0 AND predecessor_revision_id IS NULL)
+        OR (generation > 0 AND predecessor_revision_id IS NOT NULL)
+    ),
+    FOREIGN KEY(predecessor_revision_id) REFERENCES revisions(revision_id),
+    FOREIGN KEY(context_id) REFERENCES context_materializations(context_id),
+    FOREIGN KEY(execution_snapshot_id)
+        REFERENCES execution_snapshots(execution_snapshot_id)
+);
+CREATE TABLE revision_streams (
+    stream_id TEXT PRIMARY KEY,
+    active_revision_id TEXT NOT NULL UNIQUE,
+    active_generation INTEGER NOT NULL CHECK(
+        typeof(active_generation) = 'integer' AND active_generation >= 0
+    ),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(active_revision_id) REFERENCES revisions(revision_id)
+);
+CREATE TABLE task_admissions (
+    admission_id TEXT PRIMARY KEY,
+    stream_id TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    required_generation INTEGER NOT NULL CHECK(
+        typeof(required_generation) = 'integer' AND required_generation >= 0
+    ),
+    request_digest TEXT NOT NULL UNIQUE,
+    request_json TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(
+        status IN ('queued', 'admitted', 'completed', 'failed', 'cancelled')
+    ),
+    reason TEXT,
+    pinned_revision_id TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    finished_at TEXT,
+    UNIQUE(stream_id, task_id),
+    UNIQUE(stream_id, idempotency_key),
+    CHECK(
+        (status = 'queued'
+            AND reason = 'required_revision_uncommitted'
+            AND pinned_revision_id IS NULL
+            AND finished_at IS NULL)
+        OR (status = 'admitted'
+            AND reason IS NULL
+            AND pinned_revision_id IS NOT NULL
+            AND finished_at IS NULL)
+        OR (status IN ('completed', 'failed')
+            AND reason IS NULL
+            AND pinned_revision_id IS NOT NULL
+            AND finished_at IS NOT NULL)
+        OR (status = 'cancelled'
+            AND reason IS NULL
+            AND finished_at IS NOT NULL)
+    ),
+    FOREIGN KEY(stream_id) REFERENCES revision_streams(stream_id),
+    FOREIGN KEY(pinned_revision_id) REFERENCES revisions(revision_id)
+);
+CREATE INDEX idx_task_admissions_active_revision
+ON task_admissions(pinned_revision_id) WHERE status = 'admitted';
+"""
+
 _STORE_IDENTITY_DDL = """
 CREATE TABLE store_identity (
     singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
@@ -898,7 +984,7 @@ _KNOWN_SCHEMAS = (
     ),
 )
 
-_CURRENT_SCHEMAS = (
+_PRE_REVISION_CURRENT_SCHEMAS = (
     _KnownSchema(
         match=LegacySchemaMatch(
             kind="complete",
@@ -956,6 +1042,17 @@ _CURRENT_SCHEMAS = (
             _MIGRATED_REVIEW_REQUESTS_COLUMNS,
         ),
     ),
+)
+
+_CURRENT_SCHEMAS = _PRE_REVISION_CURRENT_SCHEMAS + tuple(
+    _KnownSchema(
+        match=LegacySchemaMatch(
+            kind="complete",
+            version=f"revision-ledger-{known.match.version}",
+        ),
+        ddl=known.ddl + _REVISION_LEDGER_DDL,
+    )
+    for known in _PRE_REVISION_CURRENT_SCHEMAS
 )
 
 
