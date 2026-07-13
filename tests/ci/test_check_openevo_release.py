@@ -40,10 +40,7 @@ def _load_module():
 
 
 def _load_desktop_wheel_smoke_module():
-    path = (
-        Path(__file__).resolve().parents[2]
-        / "scripts/ci/smoke_openevo_desktop_wheel.py"
-    )
+    path = Path(__file__).resolve().parents[2] / "scripts/ci/smoke_openevo_desktop_wheel.py"
     spec = importlib.util.spec_from_file_location("smoke_openevo_desktop_wheel", path)
     assert spec is not None
     module = importlib.util.module_from_spec(spec)
@@ -63,10 +60,7 @@ def _load_sha256_module():
 
 
 def _load_sidecar_smoke_module():
-    path = (
-        Path(__file__).resolve().parents[2]
-        / "scripts/ci/smoke_openevo_desktop_sidecar.py"
-    )
+    path = Path(__file__).resolve().parents[2] / "scripts/ci/smoke_openevo_desktop_sidecar.py"
     spec = importlib.util.spec_from_file_location("smoke_openevo_desktop_sidecar", path)
     assert spec is not None
     module = importlib.util.module_from_spec(spec)
@@ -76,10 +70,7 @@ def _load_sidecar_smoke_module():
 
 
 def _load_bundle_smoke_module():
-    path = (
-        Path(__file__).resolve().parents[2]
-        / "scripts/ci/smoke_openevo_desktop_bundle.py"
-    )
+    path = Path(__file__).resolve().parents[2] / "scripts/ci/smoke_openevo_desktop_bundle.py"
     spec = importlib.util.spec_from_file_location("smoke_openevo_desktop_bundle", path)
     assert spec is not None
     module = importlib.util.module_from_spec(spec)
@@ -161,13 +152,7 @@ def test_sidecar_smoke_launches_process_and_checks_assets(tmp_path: Path) -> Non
 
 def test_bundle_smoke_finds_and_launches_app_sidecar(tmp_path: Path) -> None:
     smoke = _load_bundle_smoke_module()
-    sidecar = (
-        tmp_path
-        / "OpenEvo Desktop.app"
-        / "Contents"
-        / "MacOS"
-        / "openevo-desktop-sidecar"
-    )
+    sidecar = tmp_path / "OpenEvo Desktop.app" / "Contents" / "MacOS" / "openevo-desktop-sidecar"
     _write_fake_sidecar(sidecar)
 
     smoked_sidecar = smoke.smoke_bundle(tmp_path, timeout_seconds=5)
@@ -177,13 +162,7 @@ def test_bundle_smoke_finds_and_launches_app_sidecar(tmp_path: Path) -> None:
 
 def test_bundle_smoke_requires_openevo_desktop_app_bundle(tmp_path: Path) -> None:
     smoke = _load_bundle_smoke_module()
-    other_sidecar = (
-        tmp_path
-        / "Other.app"
-        / "Contents"
-        / "MacOS"
-        / "openevo-desktop-sidecar"
-    )
+    other_sidecar = tmp_path / "Other.app" / "Contents" / "MacOS" / "openevo-desktop-sidecar"
     _write_fake_sidecar(other_sidecar)
 
     try:
@@ -264,11 +243,13 @@ def test_requires_exact_openevo_wheel_artifact(tmp_path: Path) -> None:
         artifacts + [openevo_wheel, _write_checksum(openevo_wheel)],
         expected_version="0.1.0",
     ) == ["Release artifacts must include an OpenEvo Desktop macOS .dmg."]
-    assert checker.validate_release_artifacts(
-        artifacts
-        + [openevo_wheel, _write_checksum(openevo_wheel), dmg, _write_checksum(dmg)],
-        expected_version="0.1.0",
-    ) == []
+    assert (
+        checker.validate_release_artifacts(
+            artifacts + [openevo_wheel, _write_checksum(openevo_wheel), dmg, _write_checksum(dmg)],
+            expected_version="0.1.0",
+        )
+        == []
+    )
 
 
 def test_release_dmg_name_uses_canonical_hyphenated_format() -> None:
@@ -449,9 +430,7 @@ def test_release_artifact_list_requires_checksums_and_release_notes(tmp_path: Pa
     )
 
     assert f"{empty_notes} must contain non-empty OpenEvo release notes." in errors
-    assert (
-        f"{bad_checksum} should reference `{dmg.name}`, got `wrong.dmg`."
-    ) in errors
+    assert (f"{bad_checksum} should reference `{dmg.name}`, got `wrong.dmg`.") in errors
 
 
 def test_release_artifact_checksums_must_be_siblings(tmp_path: Path) -> None:
@@ -520,9 +499,7 @@ def test_requires_expected_console_scripts(tmp_path: Path) -> None:
 
     errors = checker.validate_wheel(wheel, expected_version="0.1.0")
 
-    assert any(
-        "openevo-backend = openevo.backend.launcher:main" in error for error in errors
-    )
+    assert any("openevo-backend = openevo.backend.launcher:main" in error for error in errors)
 
 
 def test_rejects_unexpected_console_scripts(tmp_path: Path) -> None:
@@ -633,9 +610,7 @@ def test_rejects_shared_dashboard_static_assets(tmp_path: Path) -> None:
     wheel = _write_wheel(
         tmp_path / "openevo-0.1.0-py3-none-any.whl",
         extra_files={
-            "openevo/platform/desktop/dist/index.html": (
-                "<title>OpenEvo Observability</title>"
-            )
+            "openevo/platform/desktop/dist/index.html": ("<title>OpenEvo Observability</title>")
         },
     )
 
@@ -649,8 +624,7 @@ def test_local_version_validation_reads_top_level_desktop_metadata() -> None:
 
     root = Path(__file__).resolve().parents[2]
     paths = {
-        path.relative_to(root).as_posix()
-        for path in checker._desktop_package_metadata_paths()
+        path.relative_to(root).as_posix() for path in checker._desktop_package_metadata_paths()
     }
 
     assert "desktop/package.json" in paths
@@ -699,8 +673,7 @@ def test_release_smoke_workflow_builds_packaged_assets_and_validates_wheel() -> 
     assert "name: Smoke exact remote Core wheel" in text
     assert "python -m venv .openevo-remote-wheel-smoke" in text
     assert (
-        ".openevo-remote-wheel-smoke/bin/python -m pip install "
-        ".openevo-remote-wheel/*.whl"
+        ".openevo-remote-wheel-smoke/bin/python -m pip install .openevo-remote-wheel/*.whl"
     ) in text
     assert ".openevo-remote-wheel-smoke/bin/openevo-backend --help" in text
     assert ".openevo-remote-wheel-smoke/bin/openevo-backend serve --help" in text
@@ -717,8 +690,7 @@ def test_release_smoke_workflow_builds_packaged_assets_and_validates_wheel() -> 
     assert "--wheel .openevo-remote-wheel/*.whl" in text
     assert '--sidecar "$sidecar"' in text
     assert (
-        'sidecar="desktop/src-tauri/binaries/'
-        'openevo-desktop-sidecar-$(rustc --print host-tuple)"'
+        'sidecar="desktop/src-tauri/binaries/openevo-desktop-sidecar-$(rustc --print host-tuple)"'
     ) in text
     assert "openevo-backend" in capability_smoke_text
     assert "sidecar_smoke.smoke_sidecar" in capability_smoke_text
@@ -731,8 +703,7 @@ def test_release_smoke_workflow_builds_packaged_assets_and_validates_wheel() -> 
     assert "python -m venv .openevo-wheel-smoke" in text
     assert ".openevo-wheel-smoke/bin/python -m pip install dist/*.whl" in text
     assert (
-        "PYTHONPATH=. .openevo-wheel-smoke/bin/python "
-        "scripts/ci/smoke_openevo_desktop_wheel.py"
+        "PYTHONPATH=. .openevo-wheel-smoke/bin/python scripts/ci/smoke_openevo_desktop_wheel.py"
     ) in text
     assert "source Desktop harness, not a packaged app" in desktop_smoke_text
     assert "EXPECTED_METHOD_IDS" in framework_smoke_text
@@ -749,9 +720,7 @@ def test_release_smoke_workflow_builds_packaged_assets_and_validates_wheel() -> 
 
     assert text.index("npm ci") < text.index("npm test -- --run")
     assert text.index("npm ci") < text.index("npm audit --audit-level=high")
-    assert text.index("npm audit --audit-level=high") < text.index(
-        "npm run build:openevo"
-    )
+    assert text.index("npm audit --audit-level=high") < text.index("npm run build:openevo")
     assert text.index("npm test -- --run") < text.index("npm run build:openevo")
     assert text.index("npm run typecheck") < text.index("npm run build:openevo")
     assert text.index("name: Build and smoke packaged Desktop sidecar") < text.index(
@@ -793,9 +762,7 @@ def test_desktop_package_defines_tauri_desktop_scripts_and_cli_dependency() -> N
     assert package["scripts"]["tauri:dev"] == "tauri dev"
     assert package["scripts"]["tauri:build"] == "tauri build"
     assert package["scripts"]["build:sidecar"] == "python packaging/build_sidecar.py"
-    assert package["scripts"]["build:desktop"] == (
-        "npm run build:sidecar && npm run tauri:build"
-    )
+    assert package["scripts"]["build:desktop"] == ("npm run build:sidecar && npm run tauri:build")
     assert "@tauri-apps/cli" in package["devDependencies"]
 
 
@@ -808,16 +775,14 @@ def test_desktop_tailwind_sources_are_explicit_and_exclude_packaged_web() -> Non
     assert "packaging/web" not in styles
 
 
-def test_tauri_macos_config_builds_dmg_release_shell() -> None:
+def test_tauri_macos_config_declares_unreleased_dmg_target() -> None:
     config = json.loads(Path("desktop/src-tauri/tauri.conf.json").read_text(encoding="utf-8"))
     cargo = Path("desktop/src-tauri/Cargo.toml").read_text(encoding="utf-8")
     main = Path("desktop/src-tauri/src/main.rs").read_text(encoding="utf-8")
+    workflow = Path(".github/workflows/openevo-desktop.yml").read_text(encoding="utf-8")
     sidecar_builder = Path("desktop/packaging/build_sidecar.py")
     sidecar_entry = Path("desktop/packaging/sidecar_entry.py")
-    linux_sidecar_stub = Path(
-        "desktop/src-tauri/binaries/"
-        "openevo-desktop-sidecar-x86_64-unknown-linux-gnu"
-    )
+    gitignore = Path(".gitignore").read_text(encoding="utf-8")
 
     assert config["productName"] == "OpenEvo Desktop"
     assert config["version"] == "0.1.0"
@@ -830,7 +795,7 @@ def test_tauri_macos_config_builds_dmg_release_shell() -> None:
     assert config["bundle"]["macOS"]["minimumSystemVersion"] == "12.0"
     assert sidecar_builder.is_file()
     assert sidecar_entry.is_file()
-    assert not linux_sidecar_stub.exists()
+    assert "desktop/src-tauri/binaries/openevo-desktop-sidecar-*" in gitignore
     assert "PyInstaller" in sidecar_builder.read_text(encoding="utf-8")
     assert "_build_core_wheel" in sidecar_builder.read_text(encoding="utf-8")
     assert "_validate_embedded_core_wheel" in sidecar_builder.read_text(encoding="utf-8")
@@ -839,11 +804,13 @@ def test_tauri_macos_config_builds_dmg_release_shell() -> None:
     assert "desktop.server.launcher" in sidecar_entry.read_text(encoding="utf-8")
     assert 'name = "openevo-desktop"' in cargo
     assert 'serde = { version = "1", features = ["derive"] }' in cargo
-    assert 'tauri = ' in cargo
+    assert "tauri = " in cargo
     assert "struct ManagedSidecar" in main
     assert "struct DesktopHostState" in main
-    assert "fn allocate_port()" in main
-    assert "fn sidecar_command(" in main
+    assert "fn allocate_sidecar_listener()" in main
+    assert "fn prepare_packaged_sidecar(" in main
+    assert "libc::O_NOFOLLOW" in main
+    assert "fn terminate_process_group(" in main
     assert "openevo-desktop-sidecar" in main
     assert "check_sidecar_health" in main
     assert "wait_for_sidecar_ready" in main
@@ -851,12 +818,26 @@ def test_tauri_macos_config_builds_dmg_release_shell() -> None:
     assert "fn start_sidecar(" in main
     assert "fn stop_sidecar(" in main
     assert "fn create_ssh_tunnel(" not in main
-    assert "fn keychain_reference(" in main
-    assert "fn app_logs(" in main
+    assert "fn keychain_reference(" not in main
+    assert "fn app_logs(" not in main
     assert "desktop.server.launcher" in main
     assert "Command::new" in main
     assert "Stdio::null()" in main
     assert "tauri::generate_handler!" in main
+    assert "tauri::RunEvent::ExitRequested" in main
+    assert "cargo check --locked --release --all-targets" in workflow
+    assert "cargo clippy --locked --release --all-targets -- -D warnings" in workflow
+    assert "cargo test --locked --release" in workflow
+    assert workflow.index("npm run build:sidecar") < workflow.index(
+        "tests::packaged_external_bin_native_launch_smoke"
+    )
+    assert "macOS FD-bound packaged sidecar launch smoke" in workflow
+    assert "tests::macos_release_executes_the_inherited_fd_through_devfs" in workflow
+    assert "if: always()" in workflow
+    assert 'rm -f "$OPENEVO_PACKAGED_SIDECAR_PATH"' in workflow
+    assert "cargo build --locked --release" in workflow
+    assert "release binary contains the debug source launcher fallback" in workflow
+    assert "release binary contains debug sidecar override code" in workflow
 
 
 def test_pre_external_beta_pypi_publish_workflow_is_disabled() -> None:
@@ -919,9 +900,7 @@ def test_readme_release_checklist_matches_frontend_audit_gate() -> None:
     assert "npm ci" in text
     assert "npm audit --audit-level=high" in text
     assert text.index("npm ci") < text.index("npm audit --audit-level=high")
-    assert text.index("npm audit --audit-level=high") < text.index(
-        "npm test -- --run"
-    )
+    assert text.index("npm audit --audit-level=high") < text.index("npm test -- --run")
     assert "npm run typecheck" in text
     assert smoke_section.startswith("## Pre-External-Beta Release Smoke")
     assert "maintainer-only" in smoke_section

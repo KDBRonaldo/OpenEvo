@@ -123,18 +123,18 @@ def test_build_sidecar_uses_isolated_source_and_preserves_repository_outputs(
     generic_build.mkdir()
     (generic_build / "user-output.txt").write_text("keep", encoding="utf-8")
     (repo / "src/openevo/openevo.egg-info").mkdir()
-    (repo / "src/openevo/openevo.egg-info/PKG-INFO").write_text(
-        "stale", encoding="utf-8"
-    )
+    (repo / "src/openevo/openevo.egg-info/PKG-INFO").write_text("stale", encoding="utf-8")
     commands: list[str] = []
     embedded_wheel: Path | None = None
     embedded_bytes: bytes | None = None
 
+    pyinstaller_root = repo / "fd-bound-pyinstaller"
+
     def fake_run(command, *, check, cwd, **kwargs):
         nonlocal embedded_bytes, embedded_wheel
-        del kwargs
         assert check is True
         if command[2] == "build":
+            assert not kwargs
             commands.append("build")
             source = Path(cwd)
             assert source != repo
@@ -150,6 +150,9 @@ def test_build_sidecar_uses_isolated_source_and_preserves_repository_outputs(
             output_dir = Path(command[command.index("--outdir") + 1])
             _write_core_wheel(output_dir / "openevo-0.1.0-py3-none-any.whl")
         elif command[2] == "PyInstaller":
+            env = kwargs.pop("env")
+            assert not kwargs
+            assert env["PYTHONPATH"].split(os.pathsep)[0] == str(pyinstaller_root)
             commands.append("PyInstaller")
             assert Path(cwd) == repo
             assert ("--clean" in command) is clean
@@ -173,6 +176,12 @@ def test_build_sidecar_uses_isolated_source_and_preserves_repository_outputs(
 
     monkeypatch.setattr(builder, "_repo_root", lambda: repo)
     monkeypatch.setattr(builder, "_target_triple", lambda: "test-target")
+    monkeypatch.setattr(
+        builder,
+        "_prepare_fd_bound_pyinstaller",
+        lambda *_: pyinstaller_root,
+    )
+    monkeypatch.setattr(builder, "_validate_fd_bound_bootloader", lambda _: None)
     monkeypatch.setattr(builder.subprocess, "run", fake_run)
     monkeypatch.setattr(
         builder,
@@ -193,12 +202,9 @@ def test_build_sidecar_uses_isolated_source_and_preserves_repository_outputs(
     )
 
     assert commands == ["build", "PyInstaller"]
-    assert target == (
-        repo
-        / "desktop/src-tauri/binaries"
-        / "openevo-desktop-sidecar-test-target"
-    )
+    assert target == (repo / "desktop/src-tauri/binaries" / "openevo-desktop-sidecar-test-target")
     assert target.read_bytes() == b"packaged-sidecar"
+    assert target.stat().st_mode & 0o777 == 0o755
     assert [wheel.name for wheel in wheel_output.glob("*.whl")] == [
         "openevo-0.1.0-py3-none-any.whl"
     ]
@@ -207,6 +213,49 @@ def test_build_sidecar_uses_isolated_source_and_preserves_repository_outputs(
     assert (generic_build / "user-output.txt").read_text(encoding="utf-8") == "keep"
     assert embedded_wheel is not None
     assert not embedded_wheel.exists()
+
+
+def test_fd_bound_bootloader_patch_is_exact_and_cross_platform(
+    tmp_path: Path,
+) -> None:
+    builder = _load_builder()
+    source_root = tmp_path / "pyinstaller"
+    source = source_root / "bootloader/src/pyi_main.c"
+    source.parent.mkdir(parents=True)
+    source.write_text(builder._BOOTLOADER_RESOLVER_NEEDLE, encoding="utf-8")
+
+    builder._patch_fd_bound_bootloader(source_root)
+
+    patched = source.read_text(encoding="utf-8")
+    assert 'getenv("OPENEVO_NATIVE_EXECUTABLE_FD")' in patched
+    assert 'strcmp(openevo_native_fd, "4")' in patched
+    assert '"/proc/self/fd/4"' in patched
+    assert '"/dev/fd/4"' in patched
+    assert patched.count(builder._BOOTLOADER_RESOLVER_REPLACEMENT) == 1
+
+
+def test_pyinstaller_source_identity_comes_from_exact_uv_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builder = _load_builder()
+    (tmp_path / "uv.lock").write_text(
+        """
+[[package]]
+name = "pyinstaller"
+version = "6.21.0"
+sdist = { url = "https://files.pythonhosted.org/source.tar.gz", hash = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", size = 1234 }
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(builder, "distribution_version", lambda _: "6.21.0")
+
+    assert builder._locked_pyinstaller_sdist(tmp_path) == (
+        "6.21.0",
+        "https://files.pythonhosted.org/source.tar.gz",
+        "a" * 64,
+        1234,
+    )
 
 
 def test_build_sidecar_rejects_nonempty_wheel_output_without_deleting_it(

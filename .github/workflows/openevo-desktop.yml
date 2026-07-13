@@ -68,10 +68,87 @@ jobs:
 
       - name: Build packaged OpenEvo Desktop sidecar
         working-directory: desktop
-        run: npm run build:sidecar
+        run: |
+          npm run build:sidecar
+          sidecar="$GITHUB_WORKSPACE/desktop/src-tauri/binaries/openevo-desktop-sidecar-$(rustc --print host-tuple)"
+          test -x "$sidecar"
+          echo "OPENEVO_PACKAGED_SIDECAR_PATH=$sidecar" >> "$GITHUB_ENV"
 
       - name: Check OpenEvo Desktop Tauri host
         working-directory: desktop/src-tauri
         run: |
           cargo metadata --locked --format-version 1
+          cargo fmt --check
+          cargo check --locked --all-targets
+          cargo check --locked --release --all-targets
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo clippy --locked --release --all-targets -- -D warnings
           cargo test --locked
+          cargo test --locked --release
+          cargo test --locked tests::packaged_external_bin_native_launch_smoke -- --ignored --exact
+          cargo build --locked --release
+          if strings target/release/openevo-desktop | grep -Fq 'desktop.server.launcher'; then
+            echo 'release binary contains the debug source launcher fallback' >&2
+            exit 1
+          fi
+          if strings target/release/openevo-desktop | grep -Fq 'Debug sidecar arguments require'; then
+            echo 'release binary contains debug sidecar override code' >&2
+            exit 1
+          fi
+
+      - name: Remove generated sidecar inventory
+        if: always()
+        run: |
+          if [ -n "${OPENEVO_PACKAGED_SIDECAR_PATH:-}" ]; then
+            rm -f "$OPENEVO_PACKAGED_SIDECAR_PATH"
+          fi
+          rm -rf desktop/packaging/sidecar-build desktop/packaging/sidecar-dist
+
+  macos-native-launch-smoke:
+    name: macOS FD-bound packaged sidecar launch smoke
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - uses: astral-sh/setup-uv@v6
+
+      - name: Install build dependencies
+        run: |
+          uv sync --frozen --group dev
+          echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
+
+      - name: Build frontend and FD-aware PyInstaller externalBin
+        working-directory: desktop
+        run: |
+          npm ci
+          npm run build:openevo
+          npm run build:sidecar
+          sidecar="$GITHUB_WORKSPACE/desktop/src-tauri/binaries/openevo-desktop-sidecar-$(rustc --print host-tuple)"
+          test -x "$sidecar"
+          echo "OPENEVO_PACKAGED_SIDECAR_PATH=$sidecar" >> "$GITHUB_ENV"
+
+      - name: Exercise macOS devfs FD execution and native lifecycle
+        working-directory: desktop/src-tauri
+        run: |
+          cargo test --locked tests::macos_release_executes_the_inherited_fd_through_devfs -- --exact
+          cargo test --locked tests::packaged_external_bin_native_launch_smoke -- --ignored --exact
+
+      - name: Remove generated sidecar inventory
+        if: always()
+        run: |
+          if [ -n "${OPENEVO_PACKAGED_SIDECAR_PATH:-}" ]; then
+            rm -f "$OPENEVO_PACKAGED_SIDECAR_PATH"
+          fi
+          rm -rf desktop/packaging/sidecar-build desktop/packaging/sidecar-dist

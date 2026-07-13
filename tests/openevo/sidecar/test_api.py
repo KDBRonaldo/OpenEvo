@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import socket
 import shlex
@@ -24,6 +25,7 @@ import yaml
 import desktop.sidecar.api as sidecar_api
 from desktop.sidecar import (
     DesktopExecutionStatus,
+    NativeSidecarInstance,
     build_desktop_shell_status,
     create_sidecar_app,
     create_sidecar_app_for_project,
@@ -57,6 +59,109 @@ def test_sidecar_health_endpoint() -> None:
     assert response.json() == {"service": "openevo-sidecar", "status": "ok"}
 
 
+def test_sidecar_native_health_proves_the_instance_credential() -> None:
+    instance_id = "1a" * 16
+    secret = bytes.fromhex("5a" * 32)
+    challenge = "3c" * 32
+    instance = NativeSidecarInstance(
+        instance_id=instance_id,
+        readiness_key=secret,
+    )
+    client = TestClient(create_sidecar_app(native_instance=instance))
+
+    response = client.get(
+        "/health",
+        headers={"X-OpenEvo-Native-Challenge": challenge},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "service": "openevo-sidecar",
+        "status": "ok",
+        "protocol": sidecar_api.NATIVE_SIDECAR_PROTOCOL,
+        "instance_id": instance_id,
+        "instance_proof": hmac.new(
+            secret,
+            (f"{sidecar_api.NATIVE_SIDECAR_PROTOCOL}\0{instance_id}\0{challenge}").encode("ascii"),
+            hashlib.sha256,
+        ).hexdigest(),
+    }
+    assert secret.hex() not in repr(instance)
+
+
+@pytest.mark.parametrize(
+    ("instance_id", "readiness_key", "message"),
+    [
+        ("1a" * 15, b"x" * 32, "native instance id"),
+        ("1A" * 16, b"x" * 32, "native instance id"),
+        ("1a" * 16, b"too-short", "native readiness key"),
+        ("1a" * 16, bytearray(b"x" * 32), "native readiness key"),
+    ],
+)
+def test_sidecar_native_instance_rejects_invalid_closed_values(
+    instance_id: str,
+    readiness_key: bytes,
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        NativeSidecarInstance(
+            instance_id=instance_id,
+            readiness_key=readiness_key,
+        )
+
+
+@pytest.mark.parametrize(
+    "challenge",
+    [None, "", "not-hex", "ab" * 31, "AB" * 32, "ab" * 33],
+)
+def test_sidecar_native_health_rejects_invalid_challenges(
+    challenge: str | None,
+) -> None:
+    client = TestClient(
+        create_sidecar_app(
+            native_instance=NativeSidecarInstance(
+                instance_id="1a" * 16,
+                readiness_key=b"x" * 32,
+            )
+        )
+    )
+    headers = {"X-OpenEvo-Native-Challenge": challenge} if challenge is not None else {}
+
+    response = client.get("/health", headers=headers)
+
+    assert response.status_code == 403
+    assert "instance" not in response.text.casefold()
+
+
+def test_sidecar_native_health_proof_cannot_be_replayed_for_a_fresh_challenge() -> None:
+    instance_id = "1a" * 16
+    secret = bytes.fromhex("5a" * 32)
+    client = TestClient(
+        create_sidecar_app(
+            native_instance=NativeSidecarInstance(
+                instance_id=instance_id,
+                readiness_key=secret,
+            )
+        )
+    )
+    stale_challenge = "11" * 32
+    fresh_challenge = "22" * 32
+
+    stale_proof = client.get(
+        "/health",
+        headers={"X-OpenEvo-Native-Challenge": stale_challenge},
+    ).json()["instance_proof"]
+    fresh_expected = hmac.new(
+        secret,
+        (f"{sidecar_api.NATIVE_SIDECAR_PROTOCOL}\0{instance_id}\0{fresh_challenge}").encode(
+            "ascii"
+        ),
+        hashlib.sha256,
+    ).hexdigest()
+
+    assert not hmac.compare_digest(stale_proof, fresh_expected)
+
+
 def test_sidecar_allows_tauri_localhost_cors_preflight() -> None:
     client = TestClient(create_sidecar_app())
 
@@ -69,9 +174,7 @@ def test_sidecar_allows_tauri_localhost_cors_preflight() -> None:
     )
 
     assert response.status_code == 200
-    assert response.headers["access-control-allow-origin"] == (
-        "http://tauri.localhost"
-    )
+    assert response.headers["access-control-allow-origin"] == ("http://tauri.localhost")
 
 
 def test_sidecar_allows_vite_dev_cors_preflight() -> None:
@@ -161,12 +264,8 @@ def _capabilities_backend_factory(project: ScienceProjectConfig):
 def test_sidecar_forwards_remote_capabilities_for_execution_mode(
     execution_mode: str,
 ) -> None:
-    backend = _CapabilitiesBackendClient(
-        _remote_capabilities_payload(execution_mode)
-    )
-    client = TestClient(
-        create_sidecar_app(backend_client_factory=lambda: backend)
-    )
+    backend = _CapabilitiesBackendClient(_remote_capabilities_payload(execution_mode))
+    client = TestClient(create_sidecar_app(backend_client_factory=lambda: backend))
     headers = {"X-OpenEvo-Sidecar-Token": _sidecar_token(client)}
 
     response = client.get(
@@ -181,12 +280,8 @@ def test_sidecar_forwards_remote_capabilities_for_execution_mode(
 
 
 def test_sidecar_capabilities_requires_sidecar_token() -> None:
-    backend = _CapabilitiesBackendClient(
-        _remote_capabilities_payload("self-deployed")
-    )
-    client = TestClient(
-        create_sidecar_app(backend_client_factory=lambda: backend)
-    )
+    backend = _CapabilitiesBackendClient(_remote_capabilities_payload("self-deployed"))
+    client = TestClient(create_sidecar_app(backend_client_factory=lambda: backend))
 
     response = client.get(
         "/openevo-api/desktop/capabilities",
@@ -199,12 +294,8 @@ def test_sidecar_capabilities_requires_sidecar_token() -> None:
 
 
 def test_sidecar_capabilities_requires_execution_mode_query() -> None:
-    backend = _CapabilitiesBackendClient(
-        _remote_capabilities_payload("self-deployed")
-    )
-    client = TestClient(
-        create_sidecar_app(backend_client_factory=lambda: backend)
-    )
+    backend = _CapabilitiesBackendClient(_remote_capabilities_payload("self-deployed"))
+    client = TestClient(create_sidecar_app(backend_client_factory=lambda: backend))
 
     response = client.get(
         "/openevo-api/desktop/capabilities",
@@ -267,9 +358,7 @@ def test_sidecar_capabilities_preserves_remote_typed_error() -> None:
                 },
             )
 
-    client = TestClient(
-        create_sidecar_app(backend_client_factory=ErrorBackendClient)
-    )
+    client = TestClient(create_sidecar_app(backend_client_factory=ErrorBackendClient))
     response = client.get(
         "/openevo-api/desktop/capabilities",
         params={"execution_mode": "codex_subscription_transcript"},
@@ -278,18 +367,14 @@ def test_sidecar_capabilities_preserves_remote_typed_error() -> None:
 
     assert response.status_code == 503
     assert response.json()["code"] == "capabilities_unavailable"
-    assert response.json()["details"] == {
-        "execution_mode": "codex_subscription_transcript"
-    }
+    assert response.json()["details"] == {"execution_mode": "codex_subscription_transcript"}
 
 
 def test_sidecar_capabilities_rejects_invalid_remote_payload() -> None:
     backend = _CapabilitiesBackendClient(
         {**_remote_capabilities_payload("self-deployed"), "unexpected": True}
     )
-    client = TestClient(
-        create_sidecar_app(backend_client_factory=lambda: backend)
-    )
+    client = TestClient(create_sidecar_app(backend_client_factory=lambda: backend))
 
     response = client.get(
         "/openevo-api/desktop/capabilities",
@@ -317,9 +402,7 @@ def test_sidecar_capabilities_rejects_non_desktop_visible_entries(
         methods = cast(list[dict[str, object]], targets[0]["methods"])
         methods[0]["exposure"] = "maintainer"
     backend = _CapabilitiesBackendClient(payload)
-    client = TestClient(
-        create_sidecar_app(backend_client_factory=lambda: backend)
-    )
+    client = TestClient(create_sidecar_app(backend_client_factory=lambda: backend))
 
     response = client.get(
         "/openevo-api/desktop/capabilities",
@@ -356,9 +439,7 @@ def test_sidecar_capabilities_rejects_unrenderable_method_config_contract(
         )
     method[field] = encoded
     backend = _CapabilitiesBackendClient(payload)
-    client = TestClient(
-        create_sidecar_app(backend_client_factory=lambda: backend)
-    )
+    client = TestClient(create_sidecar_app(backend_client_factory=lambda: backend))
 
     response = client.get(
         "/openevo-api/desktop/capabilities",
@@ -399,9 +480,7 @@ def test_sidecar_capabilities_rejects_resolver_method_metadata_mismatch(
             "missing_requirements": ["adapter_serving"],
         }
     backend = _CapabilitiesBackendClient(payload)
-    client = TestClient(
-        create_sidecar_app(backend_client_factory=lambda: backend)
-    )
+    client = TestClient(create_sidecar_app(backend_client_factory=lambda: backend))
 
     response = client.get(
         "/openevo-api/desktop/capabilities",
@@ -437,9 +516,7 @@ def test_sidecar_capabilities_rejects_release_profile_mismatch(
     evaluated_profile = cast(dict[str, object], payload["evaluated_profile"])
     evaluated_profile[profile_field] = invalid_value
     backend = _CapabilitiesBackendClient(payload)
-    client = TestClient(
-        create_sidecar_app(backend_client_factory=lambda: backend)
-    )
+    client = TestClient(create_sidecar_app(backend_client_factory=lambda: backend))
 
     response = client.get(
         "/openevo-api/desktop/capabilities",
@@ -600,12 +677,8 @@ def test_desktop_science_smoke_exercises_ordinary_user_route_set(
     ):
         assert response.status_code == 200
     assert_desktop_science_payload(cast(dict[str, object], shell.json()))
-    assert_desktop_science_payload(
-        cast(dict[str, object], project_config.json()["status"])
-    )
-    assert capabilities.json()["evaluated_profile"]["execution_mode"] == (
-        "subscription"
-    )
+    assert_desktop_science_payload(cast(dict[str, object], project_config.json()["status"]))
+    assert capabilities.json()["evaluated_profile"]["execution_mode"] == ("subscription")
     assert services_status.json()["ready"] is True
     assert timeline.json()[0]["artifact_ids"] == ["artifact-text-memory"]
     assert artifacts.json()[0]["run_id"] == launch.json()["run"]["id"]
@@ -793,13 +866,9 @@ def test_bootstrap_endpoint_runs_config_backed_dry_run_and_refreshes_status() ->
     payload = response.json()
     assert payload["bootstrap"]["ready"] is True
     assert payload["report"]["ready"] is True
-    assert payload["report"]["prepared_paths"]["bootstrap_manifest"].endswith(
-        "/bootstrap.json"
-    )
+    assert payload["report"]["prepared_paths"]["bootstrap_manifest"].endswith("/bootstrap.json")
     assert payload["status"]["bootstrap"]["ready"] is True
-    assert payload["status"]["bootstrap"]["readiness_notes"] == [
-        "Remote bootstrap is ready."
-    ]
+    assert payload["status"]["bootstrap"]["readiness_notes"] == ["Remote bootstrap is ready."]
     services = {service["id"]: service for service in payload["status"]["services"]}
     assert services["ssh"]["state"] == "ready"
     assert services["ssh"]["detail"] == "Remote preflight passed"
@@ -843,13 +912,9 @@ def test_bootstrap_uploads_exact_core_wheel_when_available(
     uploaded_local, uploaded_remote = transport.uploads[0]
     assert Path(uploaded_local) != wheel_dir
     assert transport.upload_contents == [["framework-lock.json", wheel.name]]
-    assert uploaded_remote == (
-        "/home/alice/.openevo/runs/protein-design/folding-baseline/wheels"
-    )
+    assert uploaded_remote == ("/home/alice/.openevo/runs/protein-design/folding-baseline/wheels")
     ensure_step = next(
-        step
-        for step in payload["report"]["steps"]
-        if step["id"] == "ensure_openevo_cli"
+        step for step in payload["report"]["steps"] if step["id"] == "ensure_openevo_cli"
     )
     remote_wheel = (
         "/home/alice/.openevo/runs/protein-design/"
@@ -892,9 +957,7 @@ def test_bootstrap_reports_sanitized_exact_core_wheel_upload_failure(
     assert payload["report"]["ready"] is False
     assert payload["report"]["steps"][0]["id"] == "ensure_openevo_cli"
     assert payload["report"]["steps"][0]["status"] == "fail"
-    assert payload["report"]["steps"][0]["remediation_kind"] == (
-        "upload_exact_openevo_wheel"
-    )
+    assert payload["report"]["steps"][0]["remediation_kind"] == ("upload_exact_openevo_wheel")
     assert "proxy-secret" not in payload["report"]["steps"][0]["stderr"]
     assert "[REDACTED]" in payload["report"]["steps"][0]["stderr"]
 
@@ -977,14 +1040,10 @@ def test_core_artifact_endpoint_reports_exact_packaged_wheel_identity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     trusted = tmp_path / "trusted"
-    wheel = _write_openevo_wheel(
-        trusted / "openevo-0.1.0-py3-none-any.whl"
-    )
+    wheel = _write_openevo_wheel(trusted / "openevo-0.1.0-py3-none-any.whl")
     monkeypatch.setattr(sidecar_api, "_openevo_wheel_search_dirs", lambda: (trusted,))
 
-    response = TestClient(create_sidecar_app()).get(
-        "/openevo-api/desktop/core-artifact"
-    )
+    response = TestClient(create_sidecar_app()).get("/openevo-api/desktop/core-artifact")
 
     assert response.status_code == 200
     payload = response.json()
@@ -1104,9 +1163,7 @@ def test_bootstrap_endpoint_keeps_unprepared_workspace_planned(
     )
 
     assert response.status_code == 200
-    services = {
-        service["id"]: service for service in response.json()["status"]["services"]
-    }
+    services = {service["id"]: service for service in response.json()["status"]["services"]}
     assert services["bootstrap"]["state"] == "ready"
     assert services["workspace"] == {
         "id": "workspace",
@@ -1149,9 +1206,7 @@ def test_services_endpoint_rejects_until_bootstrap_ready() -> None:
     )
 
     assert response.status_code == 409
-    assert response.json()["detail"] == (
-        "Desktop services require ready workspace and bootstrap."
-    )
+    assert response.json()["detail"] == ("Desktop services require ready workspace and bootstrap.")
 
 
 def test_services_endpoint_starts_after_bootstrap_and_refreshes_status() -> None:
@@ -1185,12 +1240,10 @@ def test_services_endpoint_starts_after_bootstrap_and_refreshes_status() -> None
     assert any("python3 -m openevo.rollout.server" in command for command in transport.commands)
     assert any("python3 -m openevo.gateway.server" in command for command in transport.commands)
     assert any(
-        "python3 -m openevo.rollout.server --config" in command
-        for command in transport.commands
+        "python3 -m openevo.rollout.server --config" in command for command in transport.commands
     )
     assert any(
-        "python3 -m openevo.gateway.server --config" in command
-        for command in transport.commands
+        "python3 -m openevo.gateway.server --config" in command for command in transport.commands
     )
     services = {service["id"]: service for service in payload["status"]["services"]}
     assert services["openevo-backend"] == {
@@ -1301,10 +1354,7 @@ def test_backend_facade_reads_actual_sidecar_run_state_from_remote_backend(
 
     assert launch.status_code == 200
     assert timeline.status_code == 200
-    assert any(
-        artifact_id in event["artifact_ids"]
-        for event in timeline.json()
-    )
+    assert any(artifact_id in event["artifact_ids"] for event in timeline.json())
     assert artifacts.status_code == 200
     assert artifacts.json()[0]["run_id"] == run_id
     assert artifacts.json()[0]["artifact_type"] == "text_memory"
@@ -1367,9 +1417,7 @@ def test_services_endpoint_preserves_failure_status() -> None:
     assert payload["report"]["next_actions"] == [
         "Fix remote service failure and restart services."
     ]
-    rollout = next(
-        step for step in payload["report"]["steps"] if step["id"] == "rollout"
-    )
+    rollout = next(step for step in payload["report"]["steps"] if step["id"] == "rollout")
     assert rollout["status"] == "fail"
     assert rollout["stderr"] == "rollout failed"
     services = {service["id"]: service for service in payload["status"]["services"]}
@@ -1578,7 +1626,9 @@ def test_services_stop_and_restart_endpoints_control_selected_service() -> None:
     assert restart.json()["state"] == "ready"
     assert transport.stopped_services == ["gateway", "gateway"]
     assert any("python3 -m openevo.gateway.server" in command for command in transport.commands)
-    assert not any("python3 -m openevo.rollout.server" in command for command in transport.commands)
+    assert not any(
+        "python3 -m openevo.rollout.server" in command for command in transport.commands
+    )
 
 
 def test_services_control_endpoint_rejects_unknown_service_id() -> None:
@@ -1989,9 +2039,7 @@ def test_bootstrap_rejects_while_workspace_sync_is_running(
     )
     assert workspace.result(timeout=5).status_code == 200
     status_response = client.get("/openevo-api/desktop/shell")
-    services = {
-        service["id"]: service for service in status_response.json()["services"]
-    }
+    services = {service["id"]: service for service in status_response.json()["services"]}
     assert services["workspace"]["state"] == "ready"
     assert services["bootstrap"]["state"] == "planned"
 
@@ -2113,9 +2161,10 @@ def test_project_config_activate_loads_saved_config_after_restart(
     payload = activate.json()
     assert payload["status"]["project"]["name"] == "Protein Design"
     assert payload["status"]["remote"]["host"] == "gpu.example.edu"
-    assert payload["status"]["project"]["evolution_targets"][
-        "quality_notes_external"
-    ] == targets["quality_notes_external"]
+    assert (
+        payload["status"]["project"]["evolution_targets"]["quality_notes_external"]
+        == targets["quality_notes_external"]
+    )
     assert payload["config"]["science_config_path"].endswith(
         "/projects/protein-design/science.yaml"
     )
@@ -2846,8 +2895,9 @@ def test_run_endpoint_requires_remote_validation_for_opaque_config(
     assert response.json()["code"] == "evolution_project_invalid"
     assert response.json()["details"]["target_id"] == target_id
     assert len(backend.validation_calls) == 1
-    assert backend.validation_calls[0]["expected_registry_digest"] == (
-        _remote_capabilities_payload(project.execution.mode)["registry_digest"]
+    assert (
+        backend.validation_calls[0]["expected_registry_digest"]
+        == (_remote_capabilities_payload(project.execution.mode)["registry_digest"])
     )
     assert not any(
         command.startswith('PATH="$HOME/.local/bin:$PATH" openevo-backend run ')
@@ -2874,9 +2924,9 @@ def test_run_endpoint_uses_installed_backend_entrypoint() -> None:
     response = client.post("/openevo-api/desktop/run", headers=headers)
 
     assert response.status_code == 200
-    scripts = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))[
-        "project"
-    ]["scripts"]
+    scripts = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))["project"][
+        "scripts"
+    ]
     tokens = shlex.split(response.json()["run"]["command"])
     assert tokens[0].startswith("PATH=")
     assert tokens[1] == "openevo-backend"
@@ -2973,9 +3023,7 @@ def test_run_status_endpoint_returns_latest_running_report() -> None:
     assert poll.json()["run"]["ready"] is False
     assert poll.json()["run"]["finished_at"] is None
     state_root = bootstrap["report"]["prepared_paths"]["state_root"]
-    assert poll.json()["run"]["output_dir"] == (
-        f"{state_root}/runs/{launch.json()['run']['id']}"
-    )
+    assert poll.json()["run"]["output_dir"] == (f"{state_root}/runs/{launch.json()['run']['id']}")
     services = {service["id"]: service for service in poll.json()["status"]["services"]}
     assert services["openevo-backend"]["state"] == "running"
     evolution = {step["id"]: step for step in poll.json()["status"]["evolution"]}
@@ -3076,9 +3124,10 @@ def test_default_desktop_status_round_trips_as_json() -> None:
     restored = type(status).model_validate(status.model_dump(mode="json"))
 
     assert restored == status
-    assert status.project.evolution_targets == ScienceProjectConfig.model_validate(
-        _science_project_payload()
-    ).evolution.targets
+    assert (
+        status.project.evolution_targets
+        == ScienceProjectConfig.model_validate(_science_project_payload()).evolution.targets
+    )
 
 
 def test_subscription_transcript_status_rejects_token_metrics() -> None:
@@ -3489,9 +3538,7 @@ class _StateRootRunTransport(_BackendTunnelTransport):
                                             "method": "text_memory_reflector",
                                             "worker_status": "succeeded",
                                             "artifact_ids": [artifact.artifact_id],
-                                            "approved_artifact_ids": [
-                                                artifact.artifact_id
-                                            ],
+                                            "approved_artifact_ids": [artifact.artifact_id],
                                             "promotion_status": "approved",
                                         }
                                     ],
@@ -3551,9 +3598,7 @@ class _ApiDryRunTransport:
 class _WheelUploadFailingTransport(_ApiDryRunTransport):
     def upload_dir(self, local_path: str, remote_path: str) -> None:
         self.uploads.append((local_path, remote_path))
-        raise RuntimeError(
-            "upload failed via http://proxy-user:proxy-secret@127.0.0.1:7890"
-        )
+        raise RuntimeError("upload failed via http://proxy-user:proxy-secret@127.0.0.1:7890")
 
 
 class _ApiLifecycleTransport(_ApiDryRunTransport):
@@ -3625,10 +3670,7 @@ class _ApiLifecycleTransport(_ApiDryRunTransport):
                 return_code=0,
                 stdout=self.log_content,
             )
-        if (
-            "service_id =" in command
-            and "os.kill(pid, signal.SIGTERM)" in command
-        ):
+        if "service_id =" in command and "os.kill(pid, signal.SIGTERM)" in command:
             if service_id not in self.pid_states:
                 return RemoteCommandResult(
                     command=command,
@@ -3936,11 +3978,10 @@ def test_build_desktop_shell_status_uses_enabled_generic_targets() -> None:
         "quality-notes-external",
         "text-memory",
     ]
-    assert next(
-        step.label
-        for step in status.evolution
-        if step.id == "quality-notes-external"
-    ) == "Quality notes external"
+    assert (
+        next(step.label for step in status.evolution if step.id == "quality-notes-external")
+        == "Quality notes external"
+    )
 
 
 def test_build_desktop_shell_status_preserves_complete_evolution_target_map() -> None:
@@ -3965,9 +4006,7 @@ def test_build_desktop_shell_status_preserves_complete_evolution_target_map() ->
         _science_project_payload() | {"evolution": {"targets": targets}}
     )
 
-    payload = build_desktop_shell_status(
-        project, _remote_profile()
-    ).model_dump(mode="json")
+    payload = build_desktop_shell_status(project, _remote_profile()).model_dump(mode="json")
 
     assert payload["project"]["evolution_targets"] == targets
 

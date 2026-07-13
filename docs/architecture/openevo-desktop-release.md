@@ -37,7 +37,8 @@ The repository currently provides:
   `--add-data` at `openevo/wheels`. Archive inspection requires one matching
   member whose byte SHA-256 equals the built and optionally exported wheel;
 - source-level frontend, sidecar, Rust, and package-inventory tests;
-- a Linux release smoke that builds and launches the actual packaged sidecar;
+- Linux and macOS CI jobs that build the actual PyInstaller externalBin and
+  exercise it through the production Rust native-launch path;
 - a disabled `.github/workflows/openevo-release-artifact.yml` placeholder that
   publishes nothing.
 
@@ -52,6 +53,103 @@ Desktop harness imported from the source checkout. Its workflow and script names
 must not be interpreted as packaged Desktop evidence. The outer smoke wheel is
 assembled from a separate temporary source tree, so staging its embedded Core
 wheel does not alter `src/openevo/wheels` in the checkout.
+
+### Native host trust boundary, phase one
+
+Part of #158 establishes the first release-only native-host boundary. A release
+build derives the sidecar source path only from the current application
+executable and the `bundle.externalBin` basename. Every bundle directory
+component is opened relative to a held directory FD with `O_NOFOLLOW` and must
+be owned by root or the effective user. The sidecar source owner must exactly
+match the current executable owner, and that app owner must itself be root or
+the effective user. This supports both a root-owned `/Applications` install and
+a user-owned copied app while rejecting a third UID.
+
+The source must be a non-empty, link-count-one regular executable that is not
+group/world writable. Native code hashes the held source FD before copying,
+copies and hashes it, then hashes it again. Before and after those reads it
+requires the source FD and parent-relative pathname to retain the same device,
+inode, size, mode, link count, owner, mtime, and ctime. All three digests must
+match. The private destination is created exclusively in a native-created
+`0700` directory, opened once for writing and separately read-only, and
+inode-bound unlinked before use. After `fsync` and mode `0500`, writer and reader
+identity, size, link count zero, and digest are checked again; only the read-only
+FD survives. The `0700` directory is not treated as protection from another
+same-UID process. Its owner retains a directory FD and performs only an
+identity-checked, non-recursive `rmdir`, so pathname replacement cannot cause
+recursive deletion.
+
+Execution uses inherited FD 4, never the source or private-copy pathname:
+Linux uses `/proc/self/fd/4` and macOS uses `/dev/fd/4`. The sidecar builder
+downloads only the exact size/SHA-256 PyInstaller sdist recorded in `uv.lock`,
+applies an exact-source bootloader patch, and rebuilds it. When the native host
+forces the non-secret `OPENEVO_NATIVE_EXECUTABLE_FD=4` setting, every PyInstaller
+parent/child archive reopen uses that same inherited FD; the entry point removes
+the marker before launcher `main` runs. The parent validates private FD
+identity and digest before and after spawn, and the child validates its inherited
+FD identity immediately before exec. Replacing any final pathname cannot alter
+the launched bytes. Typed failures contain a stable code and user-readable
+message without either host path.
+
+The native host binds the loopback listener before spawn and transfers that
+already-bound socket on inherited FD 3, removing the release-and-rebind port
+window. Native code sends exactly one UTF-8 JSON frame of at most 256 bytes over
+the child's stdin and then closes the pipe. Its exact keys are `protocol`,
+`instance_id`, and `readiness_key`; protocol is
+`openevo-native-sidecar-v1`, instance ID is 128 fresh bits, and readiness key is
+256 fresh bits. Duplicate, missing, unknown, malformed, or trailing input is
+rejected. Neither value is placed in argv, environment, a file, or native
+status. The readiness key is never returned to the renderer; the non-secret
+instance ID is returned only as part of the challenge-bound health response.
+
+Readiness sends a fresh 256-bit challenge to `/health`. The closed Rust response
+model requires the exact protocol and instance ID and verifies HMAC-SHA256 over
+`protocol NUL instance_id NUL challenge`. Unknown fields, stale challenge
+proofs, arbitrary HTTP 200 responses, invalid UTF-8, and responses over the
+fixed byte limit cannot satisfy startup readiness.
+
+Release policy does not read `OPENEVO_DESKTOP_SIDECAR_COMMAND`,
+`OPENEVO_DESKTOP_SIDECAR_PROGRAM`,
+`OPENEVO_DESKTOP_SIDECAR_ARGS_JSON`,
+`OPENEVO_DESKTOP_SIDECAR_WORKDIR`, or
+`OPENEVO_DESKTOP_BACKEND_BASE_URL`, and removes those variables from the child
+environment before spawn. It has no `sh -c`, source-checkout Python, or
+direct-backend fallback. Debug builds retain a development launcher behind
+`cfg(debug_assertions)`: an optional program plus JSON string-array argv is
+passed directly to `Command` without shell parsing, and the local host and port
+arguments, inherited listener, and instance channel remain native-host owned.
+Debug-only override and source-launcher code is absent under production cfg;
+the Desktop workflow compiles, lints, and tests both debug and release cfg.
+
+The child starts in its own process group. Explicit stop, startup failure,
+restart cleanup, and Tauri `ExitRequested`/`Exit` handling signal the complete
+group with TERM, poll for a fixed interval, escalate to KILL, and poll for a
+second fixed interval. Stop and exit first advance a cancellation epoch so an
+in-progress startup cannot publish or spawn after cancellation, and state-lock
+acquisition is also time-bounded. No failure path performs an unbounded
+`Child::wait`. An unexpected TERM, KILL, child-wait, or group-inspection failure
+moves the manager to `cleanup_pending`; it retains `Child`, process-group ID,
+private directory, executable FD, and listener, blocks another start, and lets
+explicit stop retry cleanup. Resources are dropped only after the child is
+reaped and the full process group is confirmed absent.
+
+The exit hook first updates atomically shared cancellation and process-group
+state, so it can issue TERM and KILL even while the manager mutex is busy. It
+then retries manager-owned cleanup with bounded lock access. The configured
+worst case is 250 ms emergency TERM grace, 3 seconds for state-lock access, and
+two 1-second cleanup polls: 5.25 seconds plus constant-time syscalls.
+Sidecar stdout and stderr are connected to the null device. There is no native
+raw-log buffer and no `app_logs` Tauri command, so renderer JavaScript cannot
+receive child output; sidecar status also omits command, path, argv, credential,
+and backend details.
+
+This phase does not implement a macOS Keychain secret broker. In particular,
+`password_ref` and `passphrase_ref` cannot yet be resolved for SSH operations,
+and the native command surface exposes no placeholder Keychain operation. These
+native-host changes and Linux/macOS externalBin combination smokes do not prove
+code signing, notarization, mounted/copied macOS application launch, first-run
+remote bootstrap, or downloaded artifact identity, and do not make the DMG
+release-ready.
 
 Before that outer lifecycle harness, the workflow installs the exact remote Core
 wheel in a clean Python environment and runs
@@ -86,7 +184,9 @@ The release build must use locked and reviewed inputs:
 - the supported Python version and sidecar build dependencies resolved by
   `uv sync --frozen` from `uv.lock`; this includes `build`, `setuptools`, and
   `wheel`, and the Core wheel build disables build isolation so it cannot resolve
-  an unreviewed build environment;
+  an unreviewed build environment. The FD-aware bootloader build additionally
+  fetches the exact PyInstaller sdist URL recorded in that lock and rejects a
+  size, SHA-256, extraction-budget, path, or audited-source mismatch;
 - `desktop/src-tauri/tauri.conf.json`;
 - generated sidecar binary
   `desktop/src-tauri/binaries/openevo-desktop-sidecar-$TARGET_TRIPLE`;
@@ -127,8 +227,10 @@ implemented.
 
 ## Packaged Runtime Rules
 
-- Tauri owns sidecar lifecycle, native state, Keychain references, app logs,
-  file selection, and clean shutdown/recovery.
+- Tauri owns sidecar lifecycle, native state, private launch preparation, local
+  listener allocation, and bounded process-group shutdown/recovery. Keychain
+  resolution and renderer-visible native diagnostics are not implemented in
+  phase one.
 - The sidecar binds locally, opens the SSH/Core connection, and forwards typed
   operations. It does not execute science runs after Core is healthy.
 - Packaged resources contain no credentials, benchmark automation, source
@@ -160,7 +262,15 @@ npm run build:openevo
 npm run build:sidecar
 cd src-tauri
 cargo metadata --locked --format-version 1
+cargo fmt --check
+cargo check --locked --all-targets
+cargo check --locked --release --all-targets
+cargo clippy --locked --all-targets -- -D warnings
+cargo clippy --locked --release --all-targets -- -D warnings
 cargo test --locked
+cargo test --locked --release
+OPENEVO_PACKAGED_SIDECAR_PATH="$PWD/binaries/openevo-desktop-sidecar-$(rustc --print host-tuple)" \
+  cargo test --locked tests::packaged_external_bin_native_launch_smoke -- --ignored --exact
 ```
 
 They do not replace the packaged-DMG and downloaded-draft validation gates.

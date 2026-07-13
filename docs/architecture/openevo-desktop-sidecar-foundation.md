@@ -233,8 +233,10 @@ reconnect, GPU sizing, or dynamic adapter lifecycle.
 
 This foundation slice does not include:
 
-- local credential vault or keychain integration;
-- password-based SSH auth or private-key passphrase resolution;
+- a local credential vault or macOS Keychain secret broker; the phase-one
+  native host deliberately exposes no placeholder Keychain command;
+- password-based SSH auth or private-key passphrase resolution, so
+  `password_ref` and `passphrase_ref` remain unsupported for lifecycle actions;
 - full remote installation or dependency repair beyond later bootstrap layers'
   user-site Python package checks;
 - Docker daemon or Docker Compose lifecycle management;
@@ -244,3 +246,13 @@ This foundation slice does not include:
 
 Those layers should consume this contract instead of duplicating Science Project
 parsing or workspace target derivation.
+
+The phase-one release native-host trust, instance-bound readiness, process-group
+cleanup, and raw-child-output removal tracked as part of #158 do not remove
+these credential limitations and are not evidence that the Desktop DMG is
+release-ready. See
+`docs/architecture/openevo-desktop-release.md` for the implemented launch and
+native process boundary and the remaining packaged-application gates. In that
+boundary, release readiness is tied to the exact inherited listener and a
+single closed `openevo-native-sidecar-v1` stdin frame; the sidecar does not
+accept an argv/environment/disk readiness secret or a free-form health payload.

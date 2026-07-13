@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from _thread import LockType
 import hashlib
+import hmac
 import json
 from pathlib import Path
 import posixpath
@@ -69,6 +70,7 @@ from openevo.deployment.planner import build_sidecar_science_plan
 SIDECAR_MUTATION_TOKEN_HEADER = "X-OpenEvo-Sidecar-Token"
 SidecarTransportKind = Literal["dry-run", "ssh"]
 REMOTE_CORE_BACKEND_PORT = 8765
+NATIVE_SIDECAR_PROTOCOL = "openevo-native-sidecar-v1"
 
 
 class _StrictFrozenModel(BaseModel):
@@ -83,6 +85,28 @@ class _StrictFrozenModel(BaseModel):
 class SidecarHealth(_StrictFrozenModel):
     service: Literal["openevo-sidecar"] = "openevo-sidecar"
     status: Literal["ok"] = "ok"
+    protocol: Literal["openevo-native-sidecar-v1"] | None = None
+    instance_id: str | None = None
+    instance_proof: str | None = None
+
+
+@dataclass(frozen=True)
+class NativeSidecarInstance:
+    instance_id: str
+    readiness_key: bytes = field(repr=False)
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.instance_id) is not str
+            or re.fullmatch(r"[0-9a-f]{32}", self.instance_id) is None
+        ):
+            raise ValueError("native instance id must be 32 lowercase hex characters")
+        if type(self.readiness_key) is not bytes or len(self.readiness_key) != 32:
+            raise ValueError("native readiness key must contain exactly 32 bytes")
+
+
+def _native_readiness_domain(instance_id: str, challenge: str) -> bytes:
+    return (f"{NATIVE_SIDECAR_PROTOCOL}\0{instance_id}\0{challenge}").encode("ascii")
 
 
 class DesktopRemoteProxy(_StrictFrozenModel):
@@ -131,13 +155,9 @@ class DesktopExecutionStatus(_StrictFrozenModel):
 
     @model_validator(mode="after")
     def _validate_subscription_metrics(self) -> DesktopExecutionStatus:
-        if (
-            self.mode == "codex_subscription_transcript"
-            and self.token_metrics_available
-        ):
+        if self.mode == "codex_subscription_transcript" and self.token_metrics_available:
             raise ValueError(
-                "token_metrics_available must be false for "
-                "codex_subscription_transcript"
+                "token_metrics_available must be false for codex_subscription_transcript"
             )
         return self
 
@@ -452,10 +472,10 @@ def create_sidecar_app(
     mutation_token: str | None = None,
     transport_kind: SidecarTransportKind = "dry-run",
     config_root: Path | None = None,
-    transport_factory: Callable[[RemoteProfileConfig], RemoteExecutorTransport]
-    | None = None,
+    transport_factory: Callable[[RemoteProfileConfig], RemoteExecutorTransport] | None = None,
     backend_connection: BackendConnection | None = None,
     backend_client_factory: Callable[[], BackendClient] | None = None,
+    native_instance: NativeSidecarInstance | None = None,
 ) -> FastAPI:
     desktop_status = status or default_desktop_shell_status()
     sidecar_token = _mutation_token(mutation_token)
@@ -530,9 +550,7 @@ def create_sidecar_app(
                 409,
                 {
                     "code": "backend_tunnel_not_configured",
-                    "message": (
-                        "Desktop has no active tunnel to the remote OpenEvo backend."
-                    ),
+                    "message": ("Desktop has no active tunnel to the remote OpenEvo backend."),
                     "severity": "blocking",
                     "category": "service",
                     "retryable": True,
@@ -636,10 +654,7 @@ def create_sidecar_app(
                 503,
                 {
                     "code": "backend_tunnel_failed",
-                    "message": (
-                        "Desktop could not open a tunnel to the remote OpenEvo "
-                        "backend."
-                    ),
+                    "message": ("Desktop could not open a tunnel to the remote OpenEvo backend."),
                     "severity": "blocking",
                     "category": "service",
                     "retryable": True,
@@ -649,9 +664,29 @@ def create_sidecar_app(
                 },
             ) from exc
 
-    @app.get("/health", response_model=SidecarHealth)
-    def health() -> SidecarHealth:
-        return SidecarHealth()
+    @app.get(
+        "/health",
+        response_model=SidecarHealth,
+        response_model_exclude_none=True,
+    )
+    def health(
+        x_openevo_native_challenge: str | None = Header(default=None),
+    ) -> SidecarHealth:
+        if native_instance is None:
+            return SidecarHealth()
+        challenge = x_openevo_native_challenge or ""
+        if re.fullmatch(r"[0-9a-f]{64}", challenge) is None:
+            raise HTTPException(status_code=403, detail="Invalid native health challenge.")
+        proof = hmac.new(
+            native_instance.readiness_key,
+            _native_readiness_domain(native_instance.instance_id, challenge),
+            hashlib.sha256,
+        ).hexdigest()
+        return SidecarHealth(
+            protocol=NATIVE_SIDECAR_PROTOCOL,
+            instance_id=native_instance.instance_id,
+            instance_proof=proof,
+        )
 
     @app.get(
         "/openevo-api/desktop/shell",
@@ -736,9 +771,7 @@ def create_sidecar_app(
     ) -> dict[str, Any]:
         _validate_mutation_token(token, sidecar_token)
         actions = payload.get("actions", [])
-        if not isinstance(actions, list) or not all(
-            isinstance(action, str) for action in actions
-        ):
+        if not isinstance(actions, list) or not all(isinstance(action, str) for action in actions):
             raise HTTPException(
                 status_code=422,
                 detail="actions must be a list of strings.",
@@ -835,8 +868,7 @@ def create_sidecar_app(
             raise HTTPException(
                 status_code=409,
                 detail=(
-                    "Desktop project config requires a writable config root "
-                    "and transport factory."
+                    "Desktop project config requires a writable config root and transport factory."
                 ),
             )
         try:
@@ -986,10 +1018,7 @@ def create_sidecar_app(
             if active_session is None:
                 raise HTTPException(
                     status_code=409,
-                    detail=(
-                        "Desktop workspace sync requires a config-backed sidecar "
-                        "session."
-                    ),
+                    detail=("Desktop workspace sync requires a config-backed sidecar session."),
                 )
             _raise_for_unsupported_lifecycle_auth(
                 active_session.profile,
@@ -1065,8 +1094,7 @@ def create_sidecar_app(
                 raise HTTPException(
                     status_code=409,
                     detail=(
-                        "Desktop bootstrap cannot start while another lifecycle "
-                        "action is running."
+                        "Desktop bootstrap cannot start while another lifecycle action is running."
                     ),
                 )
         try:
@@ -1125,8 +1153,7 @@ def create_sidecar_app(
                 raise HTTPException(
                     status_code=409,
                     detail=(
-                        "Desktop services cannot start while another lifecycle "
-                        "action is running."
+                        "Desktop services cannot start while another lifecycle action is running."
                     ),
                 )
         try:
@@ -1135,9 +1162,7 @@ def create_sidecar_app(
             with active_session.status_lock:
                 active_session.last_services_report = None
                 active_session.latest_run = None
-                active_session.status = _status_services_running(
-                    active_session.status
-                )
+                active_session.status = _status_services_running(active_session.status)
             report = _run_services(active_session)
             attach_error: DesktopBackendError | None = None
             if report.ready:
@@ -1338,8 +1363,7 @@ def create_sidecar_app(
                 raise HTTPException(
                     status_code=409,
                     detail=(
-                        "Desktop run launch requires ready workspace, bootstrap, "
-                        "and services."
+                        "Desktop run launch requires ready workspace, bootstrap, and services."
                     ),
                 )
         try:
@@ -1927,9 +1951,7 @@ def _run_ready_context(session: OpenEvoSidecarSession) -> tuple[str, str]:
         bootstrap_ready = session.status.bootstrap.ready
         bootstrap_report = session.last_bootstrap_report
         services_report = session.last_services_report
-    services_ready = bool(
-        services_report is not None and getattr(services_report, "ready", False)
-    )
+    services_ready = bool(services_report is not None and getattr(services_report, "ready", False))
     if (
         not workspace_ready
         or not bootstrap_ready
@@ -1938,10 +1960,7 @@ def _run_ready_context(session: OpenEvoSidecarSession) -> tuple[str, str]:
     ):
         raise HTTPException(
             status_code=409,
-            detail=(
-                "Desktop run launch requires ready workspace, bootstrap, "
-                "and services."
-            ),
+            detail=("Desktop run launch requires ready workspace, bootstrap, and services."),
         )
     prepared_paths = getattr(bootstrap_report, "prepared_paths", {})
     experiment_snapshot = prepared_paths.get("experiment_snapshot")
@@ -2065,9 +2084,7 @@ def _invalid_backend_capabilities_error(
         502,
         {
             "code": "backend_capabilities_invalid",
-            "message": (
-                "Remote OpenEvo backend returned an invalid capabilities payload."
-            ),
+            "message": ("Remote OpenEvo backend returned an invalid capabilities payload."),
             "severity": "blocking",
             "category": "internal",
             "retryable": False,
@@ -2083,10 +2100,7 @@ def _invalid_remote_project_validation_error() -> DesktopBackendError:
         502,
         {
             "code": "backend_evolution_validation_invalid",
-            "message": (
-                "Remote OpenEvo backend returned an invalid project validation "
-                "payload."
-            ),
+            "message": ("Remote OpenEvo backend returned an invalid project validation payload."),
             "severity": "blocking",
             "category": "internal",
             "retryable": False,
@@ -2153,8 +2167,7 @@ def _validate_project_evolution_capabilities(
             None,
         )
         if resolver is not None and all(
-            candidate.support.overall == "supported"
-            for candidate in resolver.resolved_methods
+            candidate.support.overall == "supported" for candidate in resolver.resolved_methods
         ):
             continue
         reason = (
@@ -2350,8 +2363,7 @@ def _status_after_workspace(
     return status.model_copy(
         update={
             "services": tuple(
-                _service_after_workspace(service, report=report)
-                for service in status.services
+                _service_after_workspace(service, report=report) for service in status.services
             ),
         }
     )
@@ -2367,16 +2379,10 @@ def _service_after_workspace(
             return service.model_copy(
                 update={"state": "ready", "detail": "Remote preflight passed"}
             )
-        return service.model_copy(
-            update={"state": "blocked", "detail": "Remote preflight failed"}
-        )
+        return service.model_copy(update={"state": "blocked", "detail": "Remote preflight failed"})
     if service.id == "workspace":
         if report.ready:
-            detail = (
-                service.detail
-                if service.state == "ready"
-                else "Workspace prepared"
-            )
+            detail = service.detail if service.state == "ready" else "Workspace prepared"
             return service.model_copy(update={"state": "ready", "detail": detail})
         return service.model_copy(
             update={"state": "blocked", "detail": _workspace_blocked_detail(report)}
@@ -2407,8 +2413,7 @@ def _status_after_bootstrap(
                 }
             ),
             "services": tuple(
-                _service_after_bootstrap(service, report=report)
-                for service in status.services
+                _service_after_bootstrap(service, report=report) for service in status.services
             ),
         }
     )
@@ -2424,9 +2429,7 @@ def _service_after_bootstrap(
             return service.model_copy(
                 update={"state": "ready", "detail": "Remote preflight passed"}
             )
-        return service.model_copy(
-            update={"state": "blocked", "detail": "Remote preflight failed"}
-        )
+        return service.model_copy(update={"state": "blocked", "detail": "Remote preflight failed"})
     if service.id == "bootstrap":
         if report.ready:
             return service.model_copy(
@@ -2454,8 +2457,7 @@ def _status_after_services(
     return status.model_copy(
         update={
             "services": tuple(
-                _service_after_services(service, report=report)
-                for service in status.services
+                _service_after_services(service, report=report) for service in status.services
             ),
         }
     )
@@ -2491,9 +2493,7 @@ def _status_services_running(
 ) -> OpenEvoDesktopShellStatus:
     return status.model_copy(
         update={
-            "services": tuple(
-                _service_services_running(service) for service in status.services
-            ),
+            "services": tuple(_service_services_running(service) for service in status.services),
         }
     )
 
@@ -2551,9 +2551,7 @@ def _status_reset_runtime_services(
 ) -> OpenEvoDesktopShellStatus:
     return status.model_copy(
         update={
-            "services": tuple(
-                _reset_runtime_service(service) for service in status.services
-            ),
+            "services": tuple(_reset_runtime_service(service) for service in status.services),
         }
     )
 
@@ -2576,12 +2574,10 @@ def _status_after_run(
     return status.model_copy(
         update={
             "services": tuple(
-                _service_after_run(service, report=report)
-                for service in status.services
+                _service_after_run(service, report=report) for service in status.services
             ),
             "evolution": tuple(
-                _evolution_after_run(step, report=report)
-                for step in status.evolution
+                _evolution_after_run(step, report=report) for step in status.evolution
             ),
         }
     )
@@ -2595,16 +2591,10 @@ def _service_after_run(
     if service.id != "openevo-backend":
         return service
     if report.state == "running":
-        return service.model_copy(
-            update={"state": "running", "detail": "OpenEvo run is running"}
-        )
+        return service.model_copy(update={"state": "running", "detail": "OpenEvo run is running"})
     if report.ready:
-        return service.model_copy(
-            update={"state": "ready", "detail": "Last run completed"}
-        )
-    return service.model_copy(
-        update={"state": "blocked", "detail": _run_blocked_detail(report)}
-    )
+        return service.model_copy(update={"state": "ready", "detail": "Last run completed"})
+    return service.model_copy(update={"state": "blocked", "detail": _run_blocked_detail(report)})
 
 
 def _evolution_after_run(
@@ -2625,9 +2615,7 @@ def _evolution_after_run(
                 "detail": "Run completed and transcript captured",
             }
         )
-    return step.model_copy(
-        update={"state": "blocked", "detail": _run_blocked_detail(report)}
-    )
+    return step.model_copy(update={"state": "blocked", "detail": _run_blocked_detail(report)})
 
 
 def _run_blocked_detail(report: OpenEvoDesktopRunStatus) -> str:

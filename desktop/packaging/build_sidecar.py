@@ -7,14 +7,17 @@ import argparse
 from email.parser import Parser
 import hashlib
 from io import BytesIO
+from importlib.metadata import version as distribution_version
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import shutil
 import subprocess
 import sys
+import tarfile
 from tempfile import TemporaryDirectory
 import tomllib
+from urllib.request import urlopen
 from zipfile import BadZipFile, ZipFile
 
 SIDECAR_NAME = "openevo-desktop-sidecar"
@@ -28,8 +31,7 @@ FORBIDDEN_LEGACY_CORE_MODULE_FILES = frozenset(
     }
 )
 FORBIDDEN_LEGACY_SIDECAR_MODULES = frozenset(
-    path.removesuffix(".py").replace("/", ".")
-    for path in FORBIDDEN_LEGACY_CORE_MODULE_FILES
+    path.removesuffix(".py").replace("/", ".") for path in FORBIDDEN_LEGACY_CORE_MODULE_FILES
 )
 
 
@@ -41,15 +43,45 @@ def _validate_core_inventory(names: set[str], *, container: str) -> None:
     )
     if benchmark_members:
         raise RuntimeError(
-            f"{container} must not contain Terminal Bench automation: "
-            f"{benchmark_members}"
+            f"{container} must not contain Terminal Bench automation: {benchmark_members}"
         )
     legacy_modules = sorted(names & FORBIDDEN_LEGACY_CORE_MODULE_FILES)
     if legacy_modules:
         raise RuntimeError(
-            f"{container} must not contain removed Terminal Bench Core modules: "
-            f"{legacy_modules}"
+            f"{container} must not contain removed Terminal Bench Core modules: {legacy_modules}"
         )
+
+
+NATIVE_EXECUTABLE_FD_ENV = "OPENEVO_NATIVE_EXECUTABLE_FD"
+NATIVE_EXECUTABLE_FD = "4"
+_MAX_PYINSTALLER_SDIST_BYTES = 16 * 1024 * 1024
+_MAX_PYINSTALLER_SOURCE_BYTES = 32 * 1024 * 1024
+_MAX_PYINSTALLER_SOURCE_MEMBERS = 5_000
+_BOOTLOADER_RESOLVER_NEEDLE = """static int
+_pyi_main_resolve_executable(struct PYI_CONTEXT *pyi_ctx)
+{
+    /* Resolve using OS-specific implementation */
+"""
+_BOOTLOADER_RESOLVER_REPLACEMENT = f"""static int
+_pyi_main_resolve_executable(struct PYI_CONTEXT *pyi_ctx)
+{{
+    const char *openevo_native_fd = getenv(\"{NATIVE_EXECUTABLE_FD_ENV}\");
+    if (openevo_native_fd != NULL) {{
+        if (strcmp(openevo_native_fd, \"{NATIVE_EXECUTABLE_FD}\") != 0) {{
+            return -1;
+        }}
+#if defined(__linux__)
+        snprintf(pyi_ctx->executable_filename, PYI_PATH_MAX, \"/proc/self/fd/{NATIVE_EXECUTABLE_FD}\");
+#elif defined(__APPLE__)
+        snprintf(pyi_ctx->executable_filename, PYI_PATH_MAX, \"/dev/fd/{NATIVE_EXECUTABLE_FD}\");
+#else
+        return -1;
+#endif
+        return 0;
+    }}
+
+    /* Resolve using OS-specific implementation */
+"""
 
 
 def _repo_root() -> Path:
@@ -107,25 +139,15 @@ def _validate_core_wheel(wheel: Path, *, name: str, version: str) -> None:
         with ZipFile(wheel) as archive:
             names = set(archive.namelist())
             _validate_core_inventory(names, container="Core wheel")
-            nested_wheels = [
-                member for member in names if member.endswith(".whl")
-            ]
+            nested_wheels = [member for member in names if member.endswith(".whl")]
             if nested_wheels:
-                raise RuntimeError(
-                    f"Core wheel must not contain nested wheels: {nested_wheels}"
-                )
-            metadata_names = [
-                member
-                for member in names
-                if member.endswith(".dist-info/METADATA")
-            ]
+                raise RuntimeError(f"Core wheel must not contain nested wheels: {nested_wheels}")
+            metadata_names = [member for member in names if member.endswith(".dist-info/METADATA")]
             if len(metadata_names) != 1:
                 raise RuntimeError(
                     f"Core wheel must contain one METADATA file, found {len(metadata_names)}"
                 )
-            metadata = Parser().parsestr(
-                archive.read(metadata_names[0]).decode("utf-8")
-            )
+            metadata = Parser().parsestr(archive.read(metadata_names[0]).decode("utf-8"))
     except OSError as exc:
         raise RuntimeError(f"failed to read built Core wheel: {wheel}") from exc
 
@@ -133,8 +155,7 @@ def _validate_core_wheel(wheel: Path, *, name: str, version: str) -> None:
     actual_version = metadata.get("Version")
     if (
         not isinstance(actual_name, str)
-        or _normalized_distribution_name(actual_name)
-        != _normalized_distribution_name(name)
+        or _normalized_distribution_name(actual_name) != _normalized_distribution_name(name)
         or actual_version != version
     ):
         raise RuntimeError(
@@ -168,6 +189,7 @@ def _copy_core_build_source(repo: Path, destination: Path) -> None:
 
 
 def _build_core_wheel(repo: Path, build_root: Path) -> Path:
+    build_root.mkdir(parents=True)
     source_root = build_root / "source"
     output_dir = build_root / "wheel-dist"
     _copy_core_build_source(repo, source_root)
@@ -248,6 +270,164 @@ def _copy_exclusive(source: Path, destination: Path) -> None:
     shutil.copystat(source, destination)
 
 
+def _locked_pyinstaller_sdist(repo: Path) -> tuple[str, str, str, int]:
+    payload = tomllib.loads((repo / "uv.lock").read_text(encoding="utf-8"))
+    packages = [
+        package
+        for package in payload.get("package", [])
+        if isinstance(package, dict) and package.get("name") == "pyinstaller"
+    ]
+    if len(packages) != 1:
+        raise RuntimeError("uv.lock must contain exactly one PyInstaller package")
+    package = packages[0]
+    version = package.get("version")
+    sdist = package.get("sdist")
+    if not isinstance(version, str) or not isinstance(sdist, dict):
+        raise RuntimeError("uv.lock has an invalid PyInstaller source lock")
+    url = sdist.get("url")
+    encoded_hash = sdist.get("hash")
+    size = sdist.get("size")
+    if (
+        not isinstance(url, str)
+        or not url.startswith("https://files.pythonhosted.org/")
+        or not isinstance(encoded_hash, str)
+        or not encoded_hash.startswith("sha256:")
+        or re.fullmatch(r"[0-9a-f]{64}", encoded_hash[7:]) is None
+        or type(size) is not int
+        or size <= 0
+        or size > _MAX_PYINSTALLER_SDIST_BYTES
+    ):
+        raise RuntimeError("uv.lock has an unsafe PyInstaller source lock")
+    if distribution_version("pyinstaller") != version:
+        raise RuntimeError("installed PyInstaller does not match uv.lock")
+    return version, url, encoded_hash[7:], size
+
+
+def _download_locked_file(
+    url: str,
+    destination: Path,
+    *,
+    expected_digest: str,
+    expected_size: int,
+) -> None:
+    hasher = hashlib.sha256()
+    received = 0
+    try:
+        with urlopen(url, timeout=30) as response, destination.open("xb") as output:
+            while chunk := response.read(1024 * 1024):
+                received += len(chunk)
+                if received > expected_size:
+                    raise RuntimeError("PyInstaller sdist exceeded its locked size")
+                hasher.update(chunk)
+                output.write(chunk)
+    except OSError as exc:
+        raise RuntimeError("failed to download locked PyInstaller sdist") from exc
+    if received != expected_size or hasher.hexdigest() != expected_digest:
+        raise RuntimeError("PyInstaller sdist does not match its locked identity")
+
+
+def _extract_locked_pyinstaller_sdist(
+    archive_path: Path,
+    destination: Path,
+    *,
+    version: str,
+) -> Path:
+    expected_root = f"pyinstaller-{version}"
+    extracted_bytes = 0
+    with tarfile.open(archive_path, mode="r:gz") as archive:
+        members = archive.getmembers()
+        if len(members) > _MAX_PYINSTALLER_SOURCE_MEMBERS:
+            raise RuntimeError("PyInstaller sdist contains too many members")
+        for member in members:
+            relative = PurePosixPath(member.name)
+            if (
+                relative.is_absolute()
+                or not relative.parts
+                or relative.parts[0] != expected_root
+                or any(part in {"", ".", ".."} for part in relative.parts)
+            ):
+                raise RuntimeError("PyInstaller sdist contains an unsafe path")
+            target = destination.joinpath(*relative.parts)
+            if member.isdir():
+                target.mkdir(parents=True, exist_ok=True)
+                continue
+            if member.issym():
+                continue
+            if not member.isfile() or member.size < 0:
+                raise RuntimeError("PyInstaller sdist contains an unsafe member")
+            extracted_bytes += member.size
+            if extracted_bytes > _MAX_PYINSTALLER_SOURCE_BYTES:
+                raise RuntimeError("PyInstaller sdist exceeded its extraction budget")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            source = archive.extractfile(member)
+            if source is None:
+                raise RuntimeError("PyInstaller sdist member could not be read")
+            try:
+                with target.open("xb") as output:
+                    shutil.copyfileobj(source, output)
+            finally:
+                source.close()
+            if target.stat().st_size != member.size:
+                raise RuntimeError("PyInstaller sdist member size changed during extraction")
+            target.chmod(member.mode & 0o777)
+    source_root = destination / expected_root
+    if (
+        not (source_root / "PyInstaller/__main__.py").is_file()
+        or not (source_root / "bootloader/waf").is_file()
+    ):
+        raise RuntimeError("PyInstaller sdist is missing required build sources")
+    return source_root
+
+
+def _patch_fd_bound_bootloader(source_root: Path) -> None:
+    source = source_root / "bootloader/src/pyi_main.c"
+    text = source.read_text(encoding="utf-8")
+    if text.count(_BOOTLOADER_RESOLVER_NEEDLE) != 1:
+        raise RuntimeError("PyInstaller bootloader resolver does not match the audited patch")
+    source.write_text(
+        text.replace(
+            _BOOTLOADER_RESOLVER_NEEDLE,
+            _BOOTLOADER_RESOLVER_REPLACEMENT,
+        ),
+        encoding="utf-8",
+    )
+
+
+def _prepare_fd_bound_pyinstaller(repo: Path, temporary_root: Path) -> Path:
+    temporary_root.mkdir(parents=True)
+    version, url, digest, size = _locked_pyinstaller_sdist(repo)
+    archive_path = temporary_root / f"pyinstaller-{version}.tar.gz"
+    source_parent = temporary_root / "pyinstaller-source"
+    source_parent.mkdir()
+    _download_locked_file(
+        url,
+        archive_path,
+        expected_digest=digest,
+        expected_size=size,
+    )
+    source_root = _extract_locked_pyinstaller_sdist(
+        archive_path,
+        source_parent,
+        version=version,
+    )
+    _patch_fd_bound_bootloader(source_root)
+    subprocess.run(
+        [sys.executable, "waf", "all"],
+        check=True,
+        cwd=source_root / "bootloader",
+    )
+    bootloaders = list((source_root / "PyInstaller/bootloader").glob("*/run"))
+    marker = NATIVE_EXECUTABLE_FD_ENV.encode("ascii")
+    if not bootloaders or not any(marker in path.read_bytes() for path in bootloaders):
+        raise RuntimeError("custom PyInstaller bootloader is missing FD execution support")
+    return source_root
+
+
+def _validate_fd_bound_bootloader(executable: Path) -> None:
+    if NATIVE_EXECUTABLE_FD_ENV.encode("ascii") not in executable.read_bytes():
+        raise RuntimeError("packaged sidecar is missing the FD-bound bootloader")
+
+
 def _validate_embedded_core_wheel(executable: Path, wheel: Path) -> str:
     archive_members = set(_archive_member_names(executable))
     benchmark_members = sorted(
@@ -259,14 +439,12 @@ def _validate_embedded_core_wheel(executable: Path, wheel: Path) -> str:
     )
     if benchmark_members:
         raise RuntimeError(
-            "Desktop sidecar must not contain Terminal Bench automation: "
-            f"{benchmark_members}"
+            f"Desktop sidecar must not contain Terminal Bench automation: {benchmark_members}"
         )
     legacy_modules = sorted(
         name
         for name in archive_members
-        if name in FORBIDDEN_LEGACY_CORE_MODULE_FILES
-        or name in FORBIDDEN_LEGACY_SIDECAR_MODULES
+        if name in FORBIDDEN_LEGACY_CORE_MODULE_FILES or name in FORBIDDEN_LEGACY_SIDECAR_MODULES
     )
     if legacy_modules:
         raise RuntimeError(
@@ -277,8 +455,7 @@ def _validate_embedded_core_wheel(executable: Path, wheel: Path) -> str:
     embedded_wheels = sorted(
         name
         for name in archive_members
-        if name.startswith(f"{CORE_WHEEL_ARCHIVE_ROOT.as_posix()}/")
-        and name.endswith(".whl")
+        if name.startswith(f"{CORE_WHEEL_ARCHIVE_ROOT.as_posix()}/") and name.endswith(".whl")
     )
     if embedded_wheels != [expected]:
         raise RuntimeError(
@@ -335,8 +512,13 @@ def build_sidecar(
     target = binary_dir / f"{SIDECAR_NAME}-{_target_triple()}{_platform_extension()}"
     target.unlink(missing_ok=True)
 
-    with TemporaryDirectory(prefix="openevo-sidecar-core-") as temporary_dir:
-        core_wheel = _build_core_wheel(repo, Path(temporary_dir))
+    with TemporaryDirectory(prefix="openevo-sidecar-build-") as temporary_dir:
+        temporary_root = Path(temporary_dir)
+        core_wheel = _build_core_wheel(repo, temporary_root / "core")
+        pyinstaller_root = _prepare_fd_bound_pyinstaller(
+            repo,
+            temporary_root / "pyinstaller",
+        )
 
         command = [
             sys.executable,
@@ -375,18 +557,34 @@ def build_sidecar(
             "uvicorn.protocols.websockets.auto",
             str(entrypoint),
         ]
-        subprocess.run(command, check=True, cwd=repo)
+        pyinstaller_env = os.environ.copy()
+        pyinstaller_env["PYTHONPATH"] = os.pathsep.join(
+            filter(
+                None,
+                [
+                    str(pyinstaller_root),
+                    pyinstaller_env.get("PYTHONPATH"),
+                ],
+            )
+        )
+        subprocess.run(
+            command,
+            check=True,
+            cwd=repo,
+            env=pyinstaller_env,
+        )
 
         built = dist_dir / f"{SIDECAR_NAME}{_platform_extension()}"
         if not built.is_file():
             raise RuntimeError(f"PyInstaller did not produce expected sidecar: {built}")
+        _validate_fd_bound_bootloader(built)
         _validate_embedded_core_wheel(built, core_wheel)
 
         if core_wheel_output_dir is not None:
             _copy_exclusive(core_wheel, core_wheel_output_dir / core_wheel.name)
 
         shutil.copy2(built, target)
-        target.chmod(target.stat().st_mode | 0o755)
+        target.chmod(0o755)
         return target
 
 
