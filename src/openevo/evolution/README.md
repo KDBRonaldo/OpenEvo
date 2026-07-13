@@ -41,7 +41,9 @@ pre-release runtime identity。新 producers 和新文档必须使用 OpenEvo id
 
 `artifact_payloads.py` 是 handler runtime 的 Core-owned 本地 payload 安全边界。它只扫描
 Evolution Backend 配置的 artifact root 内 normalized `file://` regular
-files/directories，使用 no-follow/nonblocking directory-relative opens，生成 ephemeral
+files/directories。构造时从绝对 filesystem anchor 逐组件 no-follow 固定并记录 allowed root，
+持有稳定 root FD；每次操作前后复核 held FD/path binding，payload 只相对该 FD 使用
+no-follow/nonblocking opens。它生成 ephemeral
 opaque handles 和 canonical digest inventory。Linux Core 先用 `O_PATH` 固定并验型节点，
 再从 fixed fd 获取可读对象；所有目录/文件节点在排序前受总量限制，snapshot 签发前会重验
 每个后代 identity。Text handler 读取时会重新打开并验证完整文件的 identity、digest 和
@@ -58,7 +60,8 @@ artifact registration/worker completion 的接受范围不因该内部 contract 
 
 Issued inventory 不是 source bytes 的 immutable copy 或 lease；source 在签发后仍可能变化。
 因此任何 byte-consuming read/staging 都必须重新校验 exact size、identity 和 digest。当前
-text read 已执行该规则，未来 materializer 必须复用同一规则，不能只信任 inventory metadata。
+text read、verified stream copy 和完整 payload content verification 都执行该规则，不能只信任
+inventory metadata。
 
 `context_projection.py` 已把 scanner、verified executable registry 和 target handlers 接成
 内部 projection v1。它保持现有 compatibility filter 和全局 ranking；每个 target 只接收原顺序
@@ -86,8 +89,69 @@ contract 违规或 context-wide conflict 都使本次内部 projection 整体 fa
 通过逐 artifact 猜测来掩盖 handler/registry 缺陷。只有 snapshot/transport policy 无法接受的
 单 artifact 才进入 typed skip。
 
-该内部 resolver 尚未替换公开 legacy `/v1/contexts/resolve` 和 Gateway materialization；公开
-runtime 路径保持原行为，直到 generic materializer、严格 v2 client 和 Gateway 可以原子切换。
+`context_materialization.py` 已实现 Core 内部 generic materializer。它要求与 projection 相同的
+sealed registry digest 和 canonical request digest，按 descriptor 的 `instruction_preamble` 和
+projection 顺序生成 runtime instruction。Instruction view 按 legacy Gateway 语义 trim 每个
+projection 合并正文的首尾 whitespace，但 staged bytes 保持原样。Materializer 通用解析
+destination scope/environment binding，将 file/directory contribution 展开为 private random-ID、
+digest-verified blobs，并完整重验 adapter payload。结果只包含 opaque blob ID、runtime-relative
+destination、digest/size/MIME、env、instruction、renderer/provenance 和 adapter spec，不包含
+artifact URI、host path 或 scanner handle。Bundle 先写入 private temp tree，逐文件 fsync 后
+rename 发布；context 与 materialization manifest 在同一 DB transaction 绑定，DB 失败会 discard
+已验证 bundle。Ephemeral publication receipt 绑定 canonical manifest bytes、bundle/blob directory
+identity 和逐 blob identity，Store 在 SQLite commit 前用同一个 locked root FD 复核。Rename 后
+重新绑定校验失败时不按名称删除可能已被替换的目录，而由下次 startup recovery 保守处理无引用
+entry。最终 rename 是 FD-relative atomic no-replace；竞态同名 entry 不被覆盖，原语不可用时
+fail closed。只有能证明 DB 没有提交对应 context/materialization rows 时才 discard publication；
+已提交或状态不明时保守保留。临时目录初始化失败只按已打开 inode quarantine；Store 在 callback
+后及 locked root 正常退出时复核 binding。发布/commit/startup recovery 共享跨进程锁。DB store ID、resolved
+artifact root 与两个 fsynced identity marker 必须匹配后，启动恢复才会保守 reconcile 没有 DB
+引用的 bundle/temp/symlink entry。
+
+Blob transport/consumer 的唯一入口由 `EvolutionStore` 拥有。该入口持有并复核与上述操作相同的
+locked materialization-root fd、SQLite store identity、artifact-root/materialization-root 双 marker
+以及 root 的 owner/mode/inode binding；它从 `context_materializations.manifest_json` 读取并校验
+权威 `MaterializedContext`，再把该 expected manifest 与同一个 root fd 传给低层 materializer。
+Bundle 内 `manifest.json` 的 bytes 必须与 DB 权威 canonical manifest 逐字节相等；修改 blob 后再
+同步修改磁盘 manifest 不能建立新的可信 binding。低层 reader 相对该 root fd no-follow 打开
+blob，重验 private path identity、exact size 和 digest，并且只向 consumer 暴露受控 read-only
+stream，不暴露 raw fd 或 host path。
+Materialization root 必须由 Core 进程用户拥有且 mode 为 `0700`。Store 将同一个 locked root fd
+传给 publish、DB precommit、discard 和 recovery；清理候选绑定枚举时 inode，随机 quarantine 后
+只清空可安全固定的内容并保留 quarantine/tombstone entry，不能把该处置称为立即删除。
+Identity mismatch 会改名保留，之后的 recovery 持续 fail closed，直到维护者明确处理。Adapter 完整
+rehash 后重新绑定 payload-root pathname。
+
+`EvolutionStore.initialize()` 在 `<artifact-root>/.openevo-store.json` 和
+`<artifact-root>/context_materializations/.openevo-store.json` 写入并 fsync 相同的 closed
+`{contract_version, store_id}`；SQLite `store_identity` 同时持久化该 store ID、resolved
+artifact-root path 和 `pending -> bound` bootstrap 状态。首次新建或从旧数据库迁移时，identity
+DDL 与 pending row 在同一 SQLite transaction 内创建，再 fsync 两个 marker，最后转为 bound；
+只有 pending 可恢复中断的 marker 写入。Bound 状态缺少任一 marker、marker 是 symlink、两个 ID
+不一致或 DB/path mismatch，都会在 recovery 枚举或处置前 fail closed。这两个 marker 是
+Core-owned runtime state，不是 artifact。
+Fresh DB 若发现已有 context materialization 或 managed artifact manifest 会拒绝认领。除
+fresh/recognized pending bootstrap 外，Startup 只接受 exact allowlist 中的 historical/current
+schema fingerprint；`store_identity` schema、row 和双 marker 另行精确校验，且只有 complete
+fingerprint 可认领已有 managed recovery state。伪造或 near-match `store_identity` 必须在任何
+cleanup 前失败并保留 managed state。Legacy 数据库只有在无 identity table 且 fingerprint
+校验发生于 identity DDL/row 或任一 marker 写入之前时，才能迁移已有 Core-managed 状态；仅匹配
+表名不足以获得迁移资格。普通用户预先放在 artifact root 非保留目录中的任务文件不受该检查影响。
+Fresh 检查也包含 `contexts/` 下的任何 snapshot/tombstone/unknown entry。Base schema DDL 在显式
+SQLite transaction 中与 additive migrations、recovery DB changes 一起原子提交；allowlist 包含可由
+当前 Store 直接升级的真实 first-parent 布局。
+
+Context snapshot recovery 由 startup 从 SQLite 读取 canonical request/response bytes 后授权，逐项
+核对 DB-referenced snapshot，并把无引用 snapshot 保守转为 tombstone。普通 read/inventory 只接受
+link-count-one、mode `0600` 的 regular file。历史 owner-readable/writable、non-executable 且非
+group/other-writable mode 只在显式 startup migration 中接受，用于原 inode 收紧到 `0600`；普通
+读取不提供 legacy mode fallback。
+
+该内部 projection/materializer 尚未替换公开 legacy `/v1/contexts/resolve` 和 Gateway staging；
+公开 runtime 路径保持原行为，直到严格 v2 client、opaque blob transport 和 Gateway generic
+staging 可以原子切换。
+Cross-session revision pinning、queued/not-ready admission 和 atomic next-revision activation 也尚未
+实现，不能由内部 materializer 的存在推断已经完成。
 其中也包括 public v1 原有的 subscription auth alias 判定；更通用的 `*_subscription` 识别只
 存在于 internal projection execution-profile 校验中。
 Public legacy artifact read 仍读取 legacy manifest file；immutable `manifest_json` 只由内部
@@ -151,6 +215,9 @@ ordered input snapshots 和 execution envelope 绑定到现有 job/lease lifecyc
 digests；store 在发 lease 前校验 persisted contract，并在 complete 时拒绝未声明 output type。
 
 ## Terminal Bench 离线 transcript bridge
+
+以下命令仅供 OpenEvo 维护者和 benchmark automation 开发使用，不是 Core/Desktop 产品面。
+这些内容将在 A3 机械迁移到 `benchmarks/terminal_bench/`，迁移前不得新增普通用户入口。
 
 Terminal Bench 可以继续由 Harbor/EvoLab 和官方 verifier 执行。若只想让 OpenEvo
 负责后续 skill、memory 或 agent-system evolution，可先把 Harbor/EvoLab 的 trial

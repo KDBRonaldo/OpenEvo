@@ -192,12 +192,14 @@ def test_project_target_map_value_is_strict_frozen_and_deep_copies_json() -> Non
     with pytest.raises(TypeError):
         mutable_view["not_json"] = object()
     assert selection.config == {"nested": {"values": [1, True, None]}}
-    assert ProjectEvolutionTargetSelection.model_validate(
-        selection.model_dump(mode="json")
-    ) == selection
-    assert ProjectEvolutionTargetSelection.model_validate(
-        selection.model_dump(round_trip=True)
-    ) == selection
+    assert (
+        ProjectEvolutionTargetSelection.model_validate(selection.model_dump(mode="json"))
+        == selection
+    )
+    assert (
+        ProjectEvolutionTargetSelection.model_validate(selection.model_dump(round_trip=True))
+        == selection
+    )
     assert selection.model_dump(exclude={"config"}) == {
         "enabled": False,
         "method": "draft_method",
@@ -330,12 +332,7 @@ def test_project_config_and_target_map_are_resource_bounded() -> None:
     with pytest.raises(ValueError, match="text budget"):
         ProjectEvolutionConfig({"text": "x" * (512 * 1024 + 1)})
     with pytest.raises(ValueError, match="at most 128 targets"):
-        ProjectEvolutionTargetMap(
-            {
-                f"target_{index}": {"enabled": False}
-                for index in range(129)
-            }
-        )
+        ProjectEvolutionTargetMap({f"target_{index}": {"enabled": False} for index in range(129)})
 
 
 def test_enabled_project_target_requires_method_or_auto() -> None:
@@ -359,9 +356,7 @@ def test_project_target_selection_revalidates_existing_instances() -> None:
 
 def test_project_target_public_schema_keeps_config_as_an_object() -> None:
     validation = ProjectEvolutionTargetSelection.model_json_schema(mode="validation")
-    serialization = ProjectEvolutionTargetSelection.model_json_schema(
-        mode="serialization"
-    )
+    serialization = ProjectEvolutionTargetSelection.model_json_schema(mode="serialization")
 
     assert validation["properties"]["config"]["type"] == "object"
     assert serialization["properties"]["config"]["type"] == "object"
@@ -372,12 +367,10 @@ def test_project_target_public_schema_keeps_config_as_an_object() -> None:
         enabled=False,
         config={"nested": {"keep": 1, "drop": 2}, "top": 3},
     )
-    assert selection.model_dump(
-        include={"config": {"nested": {"keep"}}}
-    ) == {"config": {"nested": {"keep": 1}}}
-    assert selection.model_dump(
-        exclude={"config": {"nested": {"drop"}}}
-    ) == {
+    assert selection.model_dump(include={"config": {"nested": {"keep"}}}) == {
+        "config": {"nested": {"keep": 1}}
+    }
+    assert selection.model_dump(exclude={"config": {"nested": {"drop"}}}) == {
         "enabled": False,
         "method": None,
         "config": {"nested": {"keep": 1}, "top": 3},
@@ -391,9 +384,7 @@ def test_project_target_public_schema_keeps_config_as_an_object() -> None:
 
 
 def test_canonical_json_and_resolved_config_are_immutable_by_copy() -> None:
-    assert canonical_json({"b": 2, "a": [True, None]}) == (
-        '{"a":[true,null],"b":2}'
-    )
+    assert canonical_json({"b": 2, "a": [True, None]}) == ('{"a":[true,null],"b":2}')
     with pytest.raises(ValueError, match="non-finite"):
         canonical_json({"value": float("nan")})
     with pytest.raises(ValueError, match="surrogate"):
@@ -481,6 +472,8 @@ def test_staged_payload_rejects_unsafe_paths(path: str) -> None:
         ({"allowed_uri_schemes": ("javascript",)}, "URI scheme"),
         ({"allowed_uri_schemes": ("HTTP",)}, "URI scheme"),
         ({"allowed_media_types": ("not-a-mime",)}, "MIME"),
+        ({"instruction_preamble": " trailing "}, "identity text"),
+        ({"instruction_preamble": "x\nsecret"}, "identity text"),
         ({"input_contract_version": "999"}, "input_contract_version"),
         ({"renderer_contract_version": "999"}, "renderer_contract_version"),
         (
@@ -514,9 +507,7 @@ def test_handler_output_is_data_only_and_environment_refs_staged_payload() -> No
         contribution_id="memory_file",
         source_artifact_id="artifact-1",
         source_relative_path="memory.md",
-        source_sha256=hashlib.sha256(
-            b"Remember parser precedence."
-        ).hexdigest(),
+        source_sha256=hashlib.sha256(b"Remember parser precedence.").hexdigest(),
         source_size_bytes=len(b"Remember parser precedence."),
         media_type="text/markdown",
         payload_kind="file",
@@ -593,9 +584,7 @@ def test_file_bundle_renderer_rejects_ancestor_path_collisions() -> None:
         contribution_id="memory_file",
         source_artifact_id="artifact-1",
         source_relative_path="memory.md",
-        source_sha256=hashlib.sha256(
-            b"Remember parser precedence."
-        ).hexdigest(),
+        source_sha256=hashlib.sha256(b"Remember parser precedence.").hexdigest(),
         source_size_bytes=len(b"Remember parser precedence."),
         media_type="text/markdown",
         payload_kind="file",

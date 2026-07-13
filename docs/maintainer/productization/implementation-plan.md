@@ -2,7 +2,7 @@
 
 Status: current execution backlog
 Canonical design: `docs/maintainer/productization/spec.md`
-Tracking issue: #131
+Tracking issues: #131, #154
 Base branch: `stable`
 
 ## How To Use This Plan
@@ -18,8 +18,8 @@ README, test, or workflow instead of expanding this plan.
 
 ## Working Rules
 
-- Work from `stable` on focused branches and merge through PRs linked to #131 or
-  a child issue.
+- Work from `stable` on focused branches and merge through PRs linked to #131,
+  #154, or a child issue.
 - Commit as `ivowang <ziyiwang@ieee.org>` and push branches promptly.
 - Do not modify protected evolution algorithm behavior.
 - Preserve the OpenEvo gateway/rollout/runtime/trajectory/evolution/artifact
@@ -41,7 +41,7 @@ records to prove the work.
 | Workstream | Outcome | Depends on | Complete when |
 | --- | --- | --- | --- |
 | A. Protected and pluggable evolution | Protected methods are frozen, one target/method registry owns evolution planning, and Terminal Bench is standalone automation. | This spec | Behavior guards pass, existing methods use the plugin contracts unchanged, benchmark code is outside Core/Desktop, and three independent gates can run through Core. |
-| B. Core Backend convergence | Remote Core owns real setup, services, runs, artifacts, and injection. | A1/A2 contracts; can overlap with benchmark migration | Clean-install and integration tests pass for both execution modes and artifact reuse. |
+| B. Core Backend convergence | Remote Core owns real setup, services, runs, artifacts, pinned task revisions, and atomic next-revision activation. | A1/A2 contracts; can overlap with benchmark migration | Clean-install and integration tests pass for both execution modes, queued/not-ready admission, and all-or-nothing artifact reuse. |
 | C. Desktop product maturity | A scientist can complete the workflow without CLI use. | Stable Core API slices from B | Packaged-app E2E covers setup, run, monitoring, artifacts, recovery, and diagnostics. |
 | D. Repository, docs, and release engineering | Repository and release artifacts present a coherent External Beta. | A-C interfaces mostly stable | Active identity/docs checks pass and release workflow builds mutually consistent Core/DMG artifacts. |
 | E. Release candidate validation | The exact release commit satisfies every canonical gate. | A-D | Three performance gates, two science E2Es, security/privacy, clean install, DMG smoke, and GitHub draft-release validation pass. |
@@ -93,8 +93,8 @@ A2.3 is implemented as reviewable repository slices, not separate product versio
 2. Implemented: load one verified executable registry; persist plan/job identity, filter methods, validate envelopes, and renew leases.
 3. Implemented: project versioned capabilities from that registry and proxy remote Core without a local catalog fallback.
 A2.3 adds no dual scheduler, fallback registry, or algorithm change. A2.4/A2.5 own generic handler/runtime integration, capability-driven Desktop configuration, and removal of remaining target-specific switches.
-The A2.4 Desktop selector/schema editor, verified built-in handlers, Core-owned local payload scanner, and internal validated projection resolver are implemented without local fallback;
-A2.4 remains incomplete until generic materializer plus strict v2/Gateway cutover and external-target acceptance.
+The A2.4 Desktop/config, verified handlers, scanner, projection, and internal materializer slices are implemented; strict v2/blob transport, Gateway cutover, and external-target acceptance remain.
+The materializer does not implement cross-session revisions; all B3.1-B3.5 identity, admission, atomic activation, recovery, and client state remain backlog.
 
 A2 completion acceptance:
 
@@ -125,8 +125,10 @@ Harbor execution, verifier adapter, materializer, reporting, task configuration,
 and benchmark commands out of `src/openevo/`.
 
 The automation calls public Core contracts for datasets, jobs, workers,
-artifacts, context resolution, injection, and harness runs. Unit tests may call
-methods directly, but release performance runs may not.
+artifacts, context resolution, injection, and harness runs. It controls task
+cadence only by requests that pass Core revision admission; it cannot activate
+staged output, bypass queued/not-ready, or assemble a partial revision. Unit
+tests may call methods directly, but release performance runs may not.
 
 Acceptance:
 
@@ -134,8 +136,9 @@ Acceptance:
   scorer, task list, or benchmark command;
 - old Core benchmark imports are removed rather than wrapped;
 - migrated automation produces equivalent task inputs and result summaries;
-- benchmark automation calls the protected Core selection/transition contract
-  and contains no duplicate or rewritten GEPA selection policy;
+- benchmark automation calls the protected Core selection/transition and
+  revision-admission contracts, cannot bypass queued/not-ready, and contains no
+  duplicate or rewritten GEPA selection policy;
 - algorithm-protection tests remain green.
 
 ### A4. Make Performance Runs Reproducible
@@ -185,23 +188,11 @@ Acceptance:
 
 ### B2. Finish Bootstrap, Doctor, Repair, And Upgrade
 
-Define one Core install artifact and descriptor. Before Core is available, the
-Desktop native host/sidecar uploads or downloads those exact bytes, verifies
-their checksum, installs them in an OpenEvo-owned environment, starts Core, and
-checks version compatibility. After health succeeds, Core owns doctor/repair,
-upgrade, services, and run execution.
+Define one Core install artifact and descriptor. Before Core is available, the Desktop native host/sidecar uploads or downloads those exact bytes, verifies their checksum, installs them in an OpenEvo-owned environment, starts Core, and checks version compatibility. After health succeeds, Core owns doctor/repair, upgrade, services, and run execution.
 
-Doctor and repair cover SSH, proxy, Python environment, container runtime,
-Codex availability/authentication, Hugging Face access, model download, vLLM,
-ports, state permissions, and stale services. Automatic repair remains within
-the boundaries in the canonical spec.
+Doctor and repair cover SSH, proxy, Python environment, container runtime, Codex availability/authentication, Hugging Face access, model download, vLLM, ports, state permissions, and stale services. Automatic repair remains within the boundaries in the canonical spec.
 
-Create and validate the versioned reference lockfile at
-`src/openevo/projects/science/profiles/self-deployed-reference-v1.json`. It pins
-model ID and Hugging Face commit, vLLM version/argv, dtype/context length,
-host/port, GPU and minimum VRAM, disk/cache, proxy behavior, timeouts, health
-probe/served model, and compatible Core versions. Release-mode Desktop uses
-that profile unchanged; custom model IDs are explicitly best effort.
+Create and validate the versioned reference lockfile at `src/openevo/projects/science/profiles/self-deployed-reference-v1.json`. It pins model ID and Hugging Face commit, vLLM version/argv, dtype/context length, host/port, GPU and minimum VRAM, disk/cache, proxy behavior, timeouts, health probe/served model, and compatible Core versions. Release-mode Desktop uses that profile unchanged; custom model IDs are explicitly best effort.
 
 Acceptance:
 
@@ -216,10 +207,15 @@ Acceptance:
 
 ### B3. Complete Execution And Evolution Integration
 
-Codex subscription runs must enforce transcript capture. Self-deployed reference
-runs must manage or connect to the supported vLLM profile. Both paths create
-datasets, run the selected canonical evolution methods, register artifacts, and
-inject promoted artifacts into a later harness session.
+Codex subscription enforces transcript capture; self-deployed runs manage the supported vLLM profile. Both seal datasets, run methods outside inference, and atomically activate the complete output set only for the next task. Implement issue #154 in these independently reviewable phases:
+
+| Phase | Scope | Acceptance |
+| --- | --- | --- |
+| `B3.1 Revision identity and admission` | Persist immutable revision manifests that bind context, model, and adapter state; pin one revision when admitting a task. | Concurrent requests and retries use the pinned revision for the full task; mutation attempts fail; a task requiring an uncommitted successor receives a durable queued or typed not-ready state, never stale fallback. |
+| `B3.2 Seal and dispatch` | Seal the completed task dataset, create one transition for all enabled targets, and dispatch evolution/training through independent workers. | Jobs accept only the sealed dataset snapshot; inference never executes evolution/training; slow parameter training cannot alter an active task; timing/background/barrier fields and streaming/in-session ABIs are rejected. |
+| `B3.3 Stage and prove readiness` | Keep every enabled target output private while validating outputs, resolving/materializing the complete context, and preparing any required adapter/serving change. | Missing or failed outputs invalidate the transition; subscription rejects parametric/incompatible methods; self-deployed planning and execution fail closed when trainer, adapter-load, restart, or health-check requirements are unavailable. |
+| `B3.4 Atomic activation and recovery` | Load adapters or restart serving when required without disturbing active revision leases, pass health checks, then publish outputs, materialization, and serving identity as one next revision. | One commit makes the complete revision admissible; failure/cancellation/crash exposes none, preserves the last committed revision, and leaves the required next task queued/not-ready; restart/retry and staged cleanup are verified. |
+| `B3.5 Clients and cadence` | Expose revision/transition state through Core, Desktop, and benchmark-facing contracts and run end-to-end tests. | Desktop renders pinned, preparing, queued/not-ready, failed, and ready states; benchmark automation controls cadence only by requesting tasks and cannot bypass Core admission; E2E proves no task observes mixed context/model/adapter revisions. |
 
 Acceptance:
 
@@ -229,11 +225,12 @@ Acceptance:
 - context resolution rejects incompatible or stale artifacts;
 - memory, skill, and agent-system payloads are visible to the harness before
   task execution;
-- all three artifact families complete produce, render, promote, stage, and
-  follow-up reuse in each of the two execution modes;
+- a task keeps one context/model/adapter revision through all inference requests;
+- all enabled artifact families produce, render, promote, materialize, and commit as one next revision before follow-up reuse in each execution mode;
+- incomplete evolution/training returns queued/not-ready and never admits a follow-up task with the previous or a partial revision;
 - GEPA reuse consumes the protected algorithm-selected output; Core and Desktop
   do not substitute another candidate;
-- selected artifact IDs and staging results are inspectable through Core.
+- selected artifacts, materialization, serving readiness, transition failure, and committed revision identity are inspectable through Core.
 
 ### B4. Harden API, Security, And Diagnostics
 
@@ -273,7 +270,7 @@ Required views:
 - science task/workspace/evolution configuration;
 - capability-driven target toggles, friendly method selection, and schema-driven
   method settings without exposing internal IDs;
-- run timeline, logs, services, and cancellation/retry;
+- run timeline, logs, services, cancellation/retry, pinned revision, next-revision transition, and queued/not-ready task state;
 - memory, skill, and agent-system artifacts and diffs;
 - diagnostics, data locations, deletion, and application settings.
 
@@ -377,8 +374,9 @@ Run all gates from one candidate commit and retain the direct outputs:
 5. clean Core install and both execution-mode integration tests;
 6. Codex subscription science E2E for text memory, skill, and agent-system;
 7. self-deployed reference science E2E for text memory, skill, and agent-system;
-8. all six mode/family cells render, promote, stage, and reuse the selected
-   artifact in a later run;
+8. all six mode/family cells render, promote, materialize, atomically commit,
+   and reuse the selected artifact in the next task, with queue/not-ready and
+   failure-path checks that prohibit stale or partial revisions;
 9. packaged DMG lifecycle, recovery, security, privacy, and diagnostics tests;
 10. repository identity, docs, dependency, checksum, and draft-release checks.
 
@@ -395,16 +393,18 @@ independently review:
 
 ## Immediate Execution Order
 
-Continue from the implemented A1 through A2.3:
+Continue from the implemented A1/A2.3 and the completed internal A2.4 slices:
 
-1. Complete A2.4/A2.5 generic target integration, remove duplicate registries
-   and switches, and run protected behavior/performance gates.
-2. Complete A3 by moving Terminal Bench automation out of Core without wrappers
-   or method changes.
-3. Replace B1 direct sidecar orchestration with durable Core-owned project/run/
-   service state and reconnect Desktop through typed APIs.
-4. Complete exact Core artifact/bootstrap lifecycle B2 and both release execution
-   modes, including transcript capture and self-deployed model management.
+1. Complete the remaining A2.4/A2.5 strict transport, Gateway cutover, external
+   target E2E, duplicate-registry/switch removal, and protected gates.
+2. In parallel, mechanically move A3 Terminal Bench automation out of Core
+   without wrappers or method changes, and implement B1/B2 plus B3.1-B3.5.
+   Mechanical A3 migration may use the current public Core surface, but it is
+   not accepted as complete before B3 revision admission exists.
+3. Bind the migrated automation to B3 admission/queued/not-ready contracts,
+   then complete A3 equivalence and all three performance gates.
+4. Reconnect Desktop through the durable B1 project/run/service APIs and the
+   B3 revision state, while finishing both release execution-mode E2Es.
 5. Expand the mature Desktop workflow and evidence until both science E2Es and
    every D/E release gate pass on the same release commit.
 

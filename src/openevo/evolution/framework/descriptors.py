@@ -23,6 +23,7 @@ from .contracts import (
     _enum_tuple,
     _environment_name,
     _json_value,
+    _identity_text,
     _mime_type,
     _stable_id,
     _text,
@@ -115,9 +116,7 @@ class EvolutionTargetDescriptor(_Descriptor):
     maturity: Maturity = Maturity.EXPERIMENTAL
 
     _text_fields = field_validator("display_name", "description")(_text)
-    _ids = field_validator(
-        "artifact_type", "handler_id", "default_method_id"
-    )(_stable_id)
+    _ids = field_validator("artifact_type", "handler_id", "default_method_id")(_stable_id)
 
     @field_validator("selection_resolvers")
     @classmethod
@@ -206,6 +205,7 @@ class TargetHandlerDescriptor(_Descriptor):
     target_id: str
     artifact_types: tuple[str, ...] = Field(min_length=1)
     renderer_kind: RendererKind
+    instruction_preamble: str = Field(default="", max_length=4096)
     input_contract_version: Literal["1"] = "1"
     renderer_contract_version: Literal["1"] = "1"
     contribution_contract_version: Literal["2"] = "2"
@@ -216,6 +216,12 @@ class TargetHandlerDescriptor(_Descriptor):
     allowed_contribution_kinds: tuple[ContributionKind, ...] = Field(min_length=1)
 
     _target = field_validator("target_id")(_stable_id)
+
+    @field_validator("instruction_preamble")
+    @classmethod
+    def _instruction_preamble(cls, value: str) -> str:
+        return "" if value == "" else _identity_text(value, max_length=4096)
+
     _artifacts = field_validator("artifact_types")(_unique_ids)
     _schemes = field_validator("allowed_uri_schemes")(
         lambda values: tuple(_uri_scheme(value) for value in _unique_strings(values))
@@ -225,9 +231,7 @@ class TargetHandlerDescriptor(_Descriptor):
     )
     _scopes = field_validator("allowed_destination_scopes")(_enum_tuple)
     _environment = field_validator("environment_allowlist")(
-        lambda values: tuple(
-            _environment_name(value) for value in _unique_strings(values)
-        )
+        lambda values: tuple(_environment_name(value) for value in _unique_strings(values))
     )
     _contributions = field_validator("allowed_contribution_kinds")(_enum_tuple)
 

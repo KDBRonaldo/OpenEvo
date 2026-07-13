@@ -7,9 +7,11 @@ A2.2 adds a deterministic built-in catalog and a distribution-backed loader on
 top of the A2.1 contracts. A2.3 uses it for generic project compilation,
 durable plan-bound jobs, verified worker dispatch, and remote Core capabilities
 proxied by Desktop. Desktop now consumes that projection for target/method
-selection and bounded-schema config editing. Generic handler execution,
-renderer payloads, and removal of target-specific runtime projection remain
-assigned to A2.4/A2.5 in the architecture contract.
+selection and bounded-schema config editing. The implemented A2.4 slice adds
+verified generic handler execution, renderer payloads, internal projection,
+and generic Core materialization. Strict transport, Gateway cutover,
+external-target acceptance, and removal of the remaining target-specific
+runtime path remain assigned to the rest of A2.4/A2.5.
 
 Keep implementation-independent rules in the architecture document. Keep module
 usage and code-specific invariants here as the package is adopted.
@@ -81,14 +83,43 @@ descriptor's explicit ABI. `run_method()` and
 jobs. Target descriptors retain non-executable identity anchors; target-handler
 descriptors now load exact attested callables into
 `VerifiedExecutableRegistry.handler_handles`. Resolver invocation, secure payload
-projection persistence, and payload scanning are implemented. Secure payload
-materialization, strict v2 API/Gateway cutover, and removal of legacy v1 remain
-unfinished A2.4 work.
+projection persistence, payload scanning, and internal generic materialization are
+implemented. Strict v2 API/Gateway cutover and removal of legacy v1 remain unfinished
+A2.4 work.
 
 Every target-handler descriptor identifies input v1, renderer v1, and
 output/contribution v2 independently, and invocation validates all three. Output v2
 requires adapter contributions to bind the approved payload inventory digest and byte
 size; v1 outputs are rejected rather than inferred.
+Handler descriptors may also declare a bounded `instruction_preamble`; generic
+materialization applies it in projection order, so Gateway never needs target-specific
+instruction framing.
+
+`context_materialization.py` consumes only a projection bound to the same sealed
+registry and canonical request digest. It streams verified file/directory contributions
+into private random-ID, digest-verified blobs, fully rehashes adapter payloads, derives
+environment and instruction values from the generic contribution contract, and atomically
+publishes a manifest-backed bundle. Provenance retains target IDs, but no target-ID
+dispatch branch, source URI, host path, or scanner handle is part of materialization or
+blob transport. Publish, precommit, discard, and recovery reuse one owner-verified,
+mode-0700 locked root fd. Its ephemeral publication receipt binds canonical manifest
+bytes, context/blob-directory identities, and every blob identity for precommit
+revalidation. Cleanup moves only an identity-bound candidate to random quarantine,
+clears safely fixed content, and retains a maintenance-owned quarantine/tombstone entry;
+it does not promise immediate deletion. Identity-changing candidates are preserved and
+fail closed. Beyond fresh or recognized pending bootstrap states, startup accepts only
+exact allowlisted historical/current schemas. It independently requires the exact
+`store_identity` schema/row and both markers; only a complete fingerprint may claim
+existing managed recovery state, and forged identity fails before cleanup. Context
+snapshot reconciliation is DB-authorized startup work; normal reads stay strict at
+link-count-one mode `0600`, with a separate
+explicit migration that only tightens eligible historical modes. Blob reads hold an
+anchored verified fd instead of returning a path, and adapter verification finally
+rebinds the complete source-root pathname.
+
+`ArtifactPayloadService` anchors the configured managed root component by component with
+no-follow opens, retains a stable verified root FD, and revalidates its pathname binding
+around every FD-relative scan or reread.
 
 Text handlers have separate source-consumption and bounded runtime-projection
 budgets. Only equal source IDs plus equal text are deduplicated; derived target

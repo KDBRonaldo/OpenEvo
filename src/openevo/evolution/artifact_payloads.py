@@ -11,6 +11,7 @@ import stat
 import threading
 import unicodedata
 from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from types import TracebackType
@@ -40,15 +41,9 @@ _MAX_PAYLOAD_NODES = MAX_PAYLOAD_ENTRIES * MAX_PAYLOAD_TREE_DEPTH + 1
 _BAD_PERCENT_ESCAPE = re.compile(r"%(?![0-9A-Fa-f]{2})")
 _O_PATH = getattr(os, "O_PATH", None)
 _READ_BASE_FLAGS = (
-    os.O_RDONLY
-    | os.O_CLOEXEC
-    | os.O_NOFOLLOW
-    | os.O_NONBLOCK
-    | getattr(os, "O_NOCTTY", 0)
+    os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_NOCTTY", 0)
 )
-_READ_FIXED_FD_FLAGS = (
-    os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK | getattr(os, "O_NOCTTY", 0)
-)
+_READ_FIXED_FD_FLAGS = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK | getattr(os, "O_NOCTTY", 0)
 _MIME_BY_SUFFIX = {
     ".json": "application/json",
     ".toml": "application/toml",
@@ -90,6 +85,15 @@ class _FileIdentity:
 
 
 @dataclass(frozen=True, slots=True)
+class _DirectoryBinding:
+    device: int
+    inode: int
+    mode: int
+    owner: int
+    group: int
+
+
+@dataclass(frozen=True, slots=True)
 class _FileRecord:
     relative_path: str
     identity: _FileIdentity
@@ -103,6 +107,14 @@ class _DirectoryRecord:
     identity: _FileIdentity
 
 
+@dataclass(frozen=True, slots=True)
+class VerifiedFileCopyReceipt:
+    """Observed size and digest for a successfully verified file copy."""
+
+    size_bytes: int
+    sha256: str
+
+
 @dataclass(slots=True)
 class _ScanBudget:
     nodes: int = 0
@@ -113,6 +125,10 @@ class _ScanBudget:
 @dataclass(frozen=True, slots=True)
 class _HandleRecord:
     root_components: tuple[str, ...]
+    payload_root_components: tuple[str, ...]
+    root_identity: _FileIdentity
+    root_is_directory: bool
+    directories: Mapping[tuple[str, ...], _FileIdentity]
     files: Mapping[str, _FileRecord]
 
 
@@ -125,6 +141,16 @@ def _identity(value: os.stat_result) -> _FileIdentity:
         size=value.st_size,
         mtime_ns=value.st_mtime_ns,
         ctime_ns=value.st_ctime_ns,
+    )
+
+
+def _directory_binding(value: os.stat_result) -> _DirectoryBinding:
+    return _DirectoryBinding(
+        device=value.st_dev,
+        inode=value.st_ino,
+        mode=value.st_mode,
+        owner=value.st_uid,
+        group=value.st_gid,
     )
 
 
@@ -202,31 +228,80 @@ class ArtifactPayloadService:
         if _O_PATH is None:
             raise RuntimeError("artifact payload scanning requires Linux O_PATH support")
         try:
-            root = Path(allowed_root).resolve(strict=True)
-        except (OSError, RuntimeError) as exc:
-            raise ValueError("allowed root must resolve to an existing directory") from exc
-        if not root.is_dir():
-            raise ValueError("allowed root must resolve to a directory")
+            raw_root = os.fspath(allowed_root)
+        except TypeError as exc:
+            raise ValueError("allowed root must be a filesystem path") from exc
+        if not isinstance(raw_root, str) or "\x00" in raw_root:
+            raise ValueError("allowed root must be a NUL-free text path")
+        absolute_root = os.path.abspath(raw_root)
+        root_parts = PurePosixPath(absolute_root).parts
+        if not root_parts or root_parts[0] != "/":
+            raise ValueError("allowed root must have an absolute filesystem anchor")
+        root_components = tuple(root_parts[1:])
+
+        anchor_fd: int | None = None
+        current_fd: int | None = None
+        root_fd: int | None = None
         try:
-            root_fd = _open_at(root, _READ_BASE_FLAGS | os.O_DIRECTORY)
-        except OSError as exc:
-            raise ValueError("allowed root could not be opened safely") from exc
-        try:
-            opened = os.fstat(root_fd)
+            anchor_fd = _open_at("/", _READ_BASE_FLAGS | os.O_DIRECTORY)
+            anchor_stat = os.fstat(anchor_fd)
+            if not stat.S_ISDIR(anchor_stat.st_mode):
+                raise ValueError("absolute filesystem anchor must be a directory")
+            anchor_binding = _directory_binding(anchor_stat)
+            current_fd = _open_at(
+                ".",
+                _READ_BASE_FLAGS | os.O_DIRECTORY,
+                dir_fd=anchor_fd,
+            )
+            component_bindings: list[_DirectoryBinding] = []
+            for component in root_components:
+                before = _stat_at(component, current_fd)
+                if stat.S_ISLNK(before.st_mode) or not stat.S_ISDIR(before.st_mode):
+                    raise ValueError("allowed root path must contain only directories")
+                expected = _identity(before)
+                next_fd = self._open_verified_node(
+                    current_fd,
+                    component,
+                    expected,
+                    directory=True,
+                )
+                component_bindings.append(_directory_binding(before))
+                parent_fd = current_fd
+                current_fd = None
+                try:
+                    os.close(parent_fd)
+                except BaseException:
+                    _close_untransferred_fd(next_fd)
+                    raise
+                current_fd = next_fd
+            root_fd = current_fd
+            current_fd = None
+            root_stat = os.fstat(root_fd)
+            if not stat.S_ISDIR(root_stat.st_mode):
+                raise ValueError("allowed root must be a directory")
+
+            self._allowed_root = absolute_root
+            self._allowed_root_components = root_components
+            self._allowed_root_component_bindings = tuple(component_bindings)
+            self._anchor_fd = anchor_fd
+            self._anchor_binding = anchor_binding
+            self._root_fd = root_fd
+            self._root_binding = _directory_binding(root_stat)
+            self._handles: dict[str, _HandleRecord] = {}
+            self._attempted_nodes = 0
+            self._attempted_files = 0
+            self._attempted_bytes = 0
+            self._closed = False
+            self._lock = threading.RLock()
+            self._verify_allowed_root_binding(consume_budget=False)
         except BaseException:
-            os.close(root_fd)
+            if current_fd is not None:
+                _close_untransferred_fd(current_fd)
+            if root_fd is not None:
+                _close_untransferred_fd(root_fd)
+            if anchor_fd is not None:
+                _close_untransferred_fd(anchor_fd)
             raise
-        if not stat.S_ISDIR(opened.st_mode):
-            os.close(root_fd)
-            raise ValueError("allowed root must be a directory")
-        self._allowed_root = os.fspath(root)
-        self._root_fd = root_fd
-        self._handles: dict[str, _HandleRecord] = {}
-        self._attempted_nodes = 0
-        self._attempted_files = 0
-        self._attempted_bytes = 0
-        self._closed = False
-        self._lock = threading.RLock()
 
     def __enter__(self) -> ArtifactPayloadService:
         with self._lock:
@@ -248,7 +323,10 @@ class ArtifactPayloadService:
                 return
             self._closed = True
             self._handles.clear()
-            os.close(self._root_fd)
+            try:
+                os.close(self._root_fd)
+            finally:
+                os.close(self._anchor_fd)
 
     def issue_snapshot(
         self,
@@ -262,15 +340,17 @@ class ArtifactPayloadService:
         rank_index: int,
     ) -> TrustedArtifactSnapshot:
         with self._lock:
-            return self._issue_snapshot(
-                artifact_id=artifact_id,
-                artifact_type=artifact_type,
-                name=name,
-                uri=uri,
-                manifest=manifest,
-                scores=scores,
-                rank_index=rank_index,
-            )
+            self._require_open()
+            with self._verified_allowed_root_operation():
+                return self._issue_snapshot(
+                    artifact_id=artifact_id,
+                    artifact_type=artifact_type,
+                    name=name,
+                    uri=uri,
+                    manifest=manifest,
+                    scores=scores,
+                    rank_index=rank_index,
+                )
 
     def _issue_snapshot(
         self,
@@ -284,11 +364,7 @@ class ArtifactPayloadService:
         rank_index: int,
     ) -> TrustedArtifactSnapshot:
         self._require_open()
-        if (
-            not isinstance(artifact_id, str)
-            or not artifact_id.strip()
-            or len(artifact_id) > 256
-        ):
+        if not isinstance(artifact_id, str) or not artifact_id.strip() or len(artifact_id) > 256:
             raise ValueError("artifact ID must be bounded non-empty text")
         _stable_id(artifact_type)
         if not isinstance(name, str) or not name.strip() or len(name) > 4096:
@@ -320,7 +396,6 @@ class ArtifactPayloadService:
                 raise ValueError("payload root must not be a symlink")
             if stat.S_ISDIR(mode):
                 budget.nodes += 1
-                self._record_attempted(nodes=1)
                 if budget.nodes > _MAX_PAYLOAD_NODES:
                     raise ValueError("payload exceeds maximum node budget")
                 self._require_attempted_budget()
@@ -337,7 +412,7 @@ class ArtifactPayloadService:
                 budget.nodes += 1
                 budget.files += 1
                 budget.total_bytes += node_identity.size
-                self._record_attempted(nodes=1, files=1)
+                self._record_attempted(files=1)
                 if budget.nodes > _MAX_PAYLOAD_NODES:
                     raise ValueError("payload exceeds maximum node budget")
                 if budget.files > MAX_PAYLOAD_ENTRIES:
@@ -347,10 +422,14 @@ class ArtifactPayloadService:
                 self._require_attempted_budget()
                 content_path = manifest.get("content_path")
                 if content_path is None:
-                    logical_path = path_components[-1] if path_components else Path(decoded_path).name
+                    logical_path = (
+                        path_components[-1] if path_components else Path(decoded_path).name
+                    )
                 else:
                     if not isinstance(content_path, str):
-                        raise ValueError("manifest content_path must be a normalized relative path")
+                        raise ValueError(
+                            "manifest content_path must be a normalized relative path"
+                        )
                     try:
                         logical_path = validate_relative_path(content_path)
                     except ValueError as exc:
@@ -365,9 +444,7 @@ class ArtifactPayloadService:
                 root_components = path_components[: len(path_components) - len(logical_components)]
                 if root_components + logical_components != path_components:
                     raise ValueError("manifest content_path does not resolve to artifact URI")
-                records.append(
-                    self._scan_open_file(node_fd, logical_path, node_identity)
-                )
+                records.append(self._scan_open_file(node_fd, logical_path, node_identity))
             else:
                 raise ValueError("payload root must be a regular file or directory")
         finally:
@@ -416,6 +493,12 @@ class ArtifactPayloadService:
         )
         self._handles[handle] = _HandleRecord(
             root_components=root_components,
+            payload_root_components=path_components,
+            root_identity=node_identity,
+            root_is_directory=stat.S_ISDIR(node_identity.mode),
+            directories={
+                directory.relative_components: directory.identity for directory in directories
+            },
             files={record.relative_path: record for record in records},
         )
         return snapshot
@@ -429,12 +512,14 @@ class ArtifactPayloadService:
         max_bytes: int,
     ) -> str:
         with self._lock:
-            return self._read_utf8_prefix(
-                payload_handle,
-                relative_path,
-                max_chars=max_chars,
-                max_bytes=max_bytes,
-            )
+            self._require_open()
+            with self._verified_allowed_root_operation():
+                return self._read_utf8_prefix(
+                    payload_handle,
+                    relative_path,
+                    max_chars=max_chars,
+                    max_bytes=max_bytes,
+                )
 
     def _read_utf8_prefix(
         self,
@@ -453,7 +538,9 @@ class ArtifactPayloadService:
             and 0 <= max_chars <= MAX_CONTRIBUTION_TEXT
             and 0 <= max_bytes <= MAX_CONTRIBUTION_TEXT
         ):
-            raise ValueError("text read limits must be integers from zero to MAX_CONTRIBUTION_TEXT")
+            raise ValueError(
+                "text read limits must be integers from zero to MAX_CONTRIBUTION_TEXT"
+            )
         try:
             handle = self._handles[payload_handle]
         except (KeyError, TypeError) as exc:
@@ -464,7 +551,7 @@ class ArtifactPayloadService:
         except (KeyError, TypeError, ValueError) as exc:
             raise ValueError("unknown payload path for handle") from exc
 
-        self._consume_attempted(nodes=1, files=1)
+        self._consume_attempted(files=1)
         components = handle.root_components + tuple(PurePosixPath(normalized_path).parts)
         fd, opened_identity = self._open_relative(components)
         digest = hashlib.sha256()
@@ -488,7 +575,10 @@ class ArtifactPayloadService:
                     if collecting:
                         for character in decoded:
                             encoded_size = len(character.encode("utf-8"))
-                            if prefix_chars + 1 > max_chars or prefix_bytes + encoded_size > max_bytes:
+                            if (
+                                prefix_chars + 1 > max_chars
+                                or prefix_bytes + encoded_size > max_bytes
+                            ):
                                 collecting = False
                                 break
                             prefix.append(character)
@@ -515,8 +605,223 @@ class ArtifactPayloadService:
             or digest.hexdigest() != expected.sha256
         ):
             raise ValueError("payload file digest or identity drifted from issued inventory")
-        self._verify_path_identity(components, expected.identity, mutation_label="payload file drift")
+        self._verify_path_identity(
+            components, expected.identity, mutation_label="payload file drift"
+        )
         return "".join(prefix)
+
+    def copy_verified_file(
+        self,
+        payload_handle: str,
+        relative_path: str,
+        destination_fd: int,
+    ) -> VerifiedFileCopyReceipt:
+        """Copy one issued file to an already-open regular destination fd."""
+
+        with self._lock:
+            self._require_open()
+            with self._verified_allowed_root_operation():
+                return self._copy_verified_file(
+                    payload_handle,
+                    relative_path,
+                    destination_fd,
+                )
+
+    def _copy_verified_file(
+        self,
+        payload_handle: str,
+        relative_path: str,
+        destination_fd: int,
+    ) -> VerifiedFileCopyReceipt:
+        self._require_open()
+        handle, normalized_path, expected = self._issued_file(
+            payload_handle,
+            relative_path,
+        )
+        if not isinstance(destination_fd, int) or isinstance(destination_fd, bool):
+            raise ValueError("destination fd must identify an open regular file")
+        try:
+            destination_identity = os.fstat(destination_fd)
+            destination_offset = os.lseek(destination_fd, 0, os.SEEK_CUR)
+        except OSError as exc:
+            raise ValueError("destination fd must identify a fresh private regular file") from exc
+        if (
+            not stat.S_ISREG(destination_identity.st_mode)
+            or destination_identity.st_nlink != 1
+            or destination_identity.st_size != 0
+            or destination_offset != 0
+        ):
+            raise ValueError("destination fd must identify a fresh private regular file")
+
+        self._consume_attempted(files=1)
+        components = handle.root_components + tuple(PurePosixPath(normalized_path).parts)
+        fd, opened_identity = self._open_relative(components)
+        digest = hashlib.sha256()
+        size = 0
+        try:
+            if not stat.S_ISREG(opened_identity.mode) or opened_identity != expected.identity:
+                raise ValueError("payload file identity drifted from issued inventory")
+            for chunk in _stream_fd_chunks(fd):
+                self._consume_attempted(total_bytes=len(chunk))
+                size += len(chunk)
+                if size > expected.size_bytes:
+                    raise ValueError("payload file size drifted from issued inventory")
+                digest.update(chunk)
+                pending = memoryview(chunk)
+                while pending:
+                    written = os.write(destination_fd, pending)
+                    if written <= 0:
+                        raise OSError("destination write made no progress")
+                    pending = pending[written:]
+            after_read = _identity(os.fstat(fd))
+        except BaseException:
+            _close_untransferred_fd(fd)
+            raise
+        else:
+            os.close(fd)
+
+        actual_digest = digest.hexdigest()
+        if (
+            after_read != expected.identity
+            or size != expected.size_bytes
+            or actual_digest != expected.sha256
+        ):
+            raise ValueError("payload file digest or identity drifted from issued inventory")
+        self._verify_path_identity(
+            components,
+            expected.identity,
+            mutation_label="payload file drift",
+        )
+        return VerifiedFileCopyReceipt(size_bytes=size, sha256=actual_digest)
+
+    def verify_inventory_identity(self, payload_handle: str) -> None:
+        """Re-enumerate an issued payload and verify its path and identity inventory."""
+
+        with self._lock:
+            self._require_open()
+            with self._verified_allowed_root_operation():
+                self._verify_inventory_identity(payload_handle)
+
+    def verify_payload_content(self, payload_handle: str) -> None:
+        """Rehash every issued file and then revalidate the complete inventory."""
+
+        with self._lock:
+            self._require_open()
+            with self._verified_allowed_root_operation():
+                try:
+                    handle = self._handles[payload_handle]
+                except (KeyError, TypeError) as exc:
+                    raise ValueError("unknown payload handle") from exc
+                for relative_path in sorted(handle.files):
+                    self._verify_issued_file_content(
+                        handle,
+                        relative_path,
+                        handle.files[relative_path],
+                    )
+                self._verify_inventory_identity(payload_handle)
+
+    def _verify_issued_file_content(
+        self,
+        handle: _HandleRecord,
+        normalized_path: str,
+        expected: _FileRecord,
+    ) -> None:
+        self._consume_attempted(files=1)
+        components = handle.root_components + tuple(PurePosixPath(normalized_path).parts)
+        fd, opened_identity = self._open_relative(components)
+        digest = hashlib.sha256()
+        size = 0
+        try:
+            if not stat.S_ISREG(opened_identity.mode) or opened_identity != expected.identity:
+                raise ValueError("payload file identity drifted from issued inventory")
+            for chunk in _stream_fd_chunks(fd):
+                self._consume_attempted(total_bytes=len(chunk))
+                size += len(chunk)
+                if size > expected.size_bytes:
+                    raise ValueError("payload file size drifted from issued inventory")
+                digest.update(chunk)
+            after_read = _identity(os.fstat(fd))
+        finally:
+            os.close(fd)
+        if (
+            after_read != expected.identity
+            or size != expected.size_bytes
+            or digest.hexdigest() != expected.sha256
+        ):
+            raise ValueError("payload file digest or identity drifted from issued inventory")
+        self._verify_path_identity(
+            components,
+            expected.identity,
+            mutation_label="payload file drift",
+        )
+
+    def _verify_inventory_identity(self, payload_handle: str) -> None:
+        self._require_open()
+        try:
+            handle = self._handles[payload_handle]
+        except (KeyError, TypeError) as exc:
+            raise ValueError("unknown payload handle") from exc
+
+        self._consume_attempted(files=not handle.root_is_directory)
+        root_fd, current_root = self._open_relative(handle.payload_root_components)
+        if not handle.root_is_directory:
+            os.close(root_fd)
+            if not stat.S_ISREG(current_root.mode) or current_root != handle.root_identity:
+                raise ValueError("payload inventory root identity drifted")
+            self._verify_path_identity(
+                handle.payload_root_components,
+                handle.root_identity,
+                mutation_label="payload inventory root",
+            )
+            return
+
+        current_directories: dict[tuple[str, ...], _FileIdentity] = {}
+        current_files: dict[str, _FileIdentity] = {}
+        try:
+            if not stat.S_ISDIR(current_root.mode):
+                raise ValueError("payload inventory root type drifted")
+            self._enumerate_inventory_directory(
+                root_fd,
+                (),
+                current_directories,
+                current_files,
+                current_root,
+            )
+            after_root = _identity(os.fstat(root_fd))
+        finally:
+            os.close(root_fd)
+
+        expected_files = {
+            relative_path: record.identity for relative_path, record in handle.files.items()
+        }
+        if (
+            current_root != handle.root_identity
+            or after_root != handle.root_identity
+            or current_directories != dict(handle.directories)
+            or current_files != expected_files
+        ):
+            raise ValueError("payload inventory path or identity drifted")
+        self._verify_path_identity(
+            handle.payload_root_components,
+            handle.root_identity,
+            mutation_label="payload inventory root",
+        )
+
+    def _issued_file(
+        self,
+        payload_handle: str,
+        relative_path: str,
+    ) -> tuple[_HandleRecord, str, _FileRecord]:
+        try:
+            handle = self._handles[payload_handle]
+        except (KeyError, TypeError) as exc:
+            raise ValueError("unknown payload handle") from exc
+        try:
+            normalized_path = validate_relative_path(relative_path)
+            expected = handle.files[normalized_path]
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("unknown payload path for handle") from exc
+        return handle, normalized_path, expected
 
     def _require_open(self) -> None:
         if self._closed:
@@ -551,17 +856,11 @@ class ArtifactPayloadService:
 
     def _require_attempted_budget(self) -> None:
         if self._attempted_nodes > _MAX_PAYLOAD_NODES:
-            raise ArtifactPayloadBudgetExceeded(
-                "payload service exceeds aggregate node budget"
-            )
+            raise ArtifactPayloadBudgetExceeded("payload service exceeds aggregate node budget")
         if self._attempted_files > MAX_PAYLOAD_ENTRIES:
-            raise ArtifactPayloadBudgetExceeded(
-                "payload service exceeds aggregate entries"
-            )
+            raise ArtifactPayloadBudgetExceeded("payload service exceeds aggregate entries")
         if self._attempted_bytes > MAX_PAYLOAD_TOTAL_BYTES:
-            raise ArtifactPayloadBudgetExceeded(
-                "payload service exceeds aggregate total bytes"
-            )
+            raise ArtifactPayloadBudgetExceeded("payload service exceeds aggregate total bytes")
 
     def _allocate_handle(self) -> str:
         for _ in range(_MAX_HANDLE_ATTEMPTS):
@@ -571,16 +870,80 @@ class ArtifactPayloadService:
         raise RuntimeError("could not allocate a unique payload handle")
 
     def _contained_components(self, decoded_path: str) -> tuple[str, ...]:
-        real_path = os.path.realpath(decoded_path)
-        try:
-            lexical_common = os.path.commonpath((self._allowed_root, decoded_path))
-            real_common = os.path.commonpath((self._allowed_root, real_path))
-        except ValueError as exc:
-            raise ValueError("artifact payload is outside allowed root") from exc
-        if lexical_common != self._allowed_root or real_common != self._allowed_root:
+        path_parts = PurePosixPath(decoded_path).parts
+        root_parts = ("/",) + self._allowed_root_components
+        if path_parts[: len(root_parts)] != root_parts:
             raise ValueError("artifact payload is outside allowed root")
-        relative = os.path.relpath(decoded_path, self._allowed_root)
-        return () if relative == "." else tuple(PurePosixPath(relative).parts)
+        return tuple(path_parts[len(root_parts) :])
+
+    @contextmanager
+    def _verified_allowed_root_operation(self) -> Iterator[None]:
+        self._verify_allowed_root_binding()
+        try:
+            yield
+        except BaseException:
+            try:
+                self._verify_allowed_root_binding()
+            except ArtifactPayloadBudgetExceeded:
+                pass
+            raise
+        else:
+            self._verify_allowed_root_binding()
+
+    def _verify_allowed_root_binding(self, *, consume_budget: bool = True) -> None:
+        if consume_budget:
+            self._record_attempted(nodes=1)
+        held_before = _directory_binding(os.fstat(self._root_fd))
+        anchor_before = _directory_binding(os.fstat(self._anchor_fd))
+        if held_before != self._root_binding or anchor_before != self._anchor_binding:
+            raise ValueError("allowed root held identity drifted")
+
+        current_fd: int | None = _open_at(
+            ".",
+            _READ_BASE_FLAGS | os.O_DIRECTORY,
+            dir_fd=self._anchor_fd,
+        )
+        try:
+            if _directory_binding(os.fstat(current_fd)) != self._anchor_binding:
+                raise ValueError("allowed root anchor identity drifted")
+            for component, expected_binding in zip(
+                self._allowed_root_components,
+                self._allowed_root_component_bindings,
+                strict=True,
+            ):
+                before = _stat_at(component, current_fd)
+                if (
+                    stat.S_ISLNK(before.st_mode)
+                    or not stat.S_ISDIR(before.st_mode)
+                    or _directory_binding(before) != expected_binding
+                ):
+                    raise ValueError("allowed root pathname identity drifted")
+                next_fd = self._open_verified_node(
+                    current_fd,
+                    component,
+                    _identity(before),
+                    directory=True,
+                )
+                parent_fd = current_fd
+                current_fd = None
+                try:
+                    os.close(parent_fd)
+                except BaseException:
+                    _close_untransferred_fd(next_fd)
+                    raise
+                current_fd = next_fd
+            if _directory_binding(os.fstat(current_fd)) != self._root_binding:
+                raise ValueError("allowed root pathname identity drifted")
+        finally:
+            if current_fd is not None:
+                _close_untransferred_fd(current_fd)
+
+        held_after = _directory_binding(os.fstat(self._root_fd))
+        anchor_after = _directory_binding(os.fstat(self._anchor_fd))
+        if held_after != self._root_binding or anchor_after != self._anchor_binding:
+            raise ValueError("allowed root held identity drifted")
+        if consume_budget:
+            self._require_attempted_budget()
 
     def _open_relative(self, components: tuple[str, ...]) -> tuple[int, _FileIdentity]:
         current_fd: int | None = _open_at(
@@ -588,18 +951,18 @@ class ArtifactPayloadService:
         )
         try:
             if not components:
+                self._consume_attempted(nodes=1)
                 current_identity = _identity(os.fstat(current_fd))
                 result_fd = current_fd
                 current_fd = None
                 return result_fd, current_identity
             for index, component in enumerate(components):
+                self._consume_attempted(nodes=1)
                 before = _stat_at(component, current_fd)
                 if stat.S_ISLNK(before.st_mode):
                     raise ValueError("payload path must not contain a symlink")
                 is_final = index == len(components) - 1
-                if is_final and not (
-                    stat.S_ISREG(before.st_mode) or stat.S_ISDIR(before.st_mode)
-                ):
+                if is_final and not (stat.S_ISREG(before.st_mode) or stat.S_ISDIR(before.st_mode)):
                     raise ValueError("payload root must be a regular file or directory")
                 if not is_final and not stat.S_ISDIR(before.st_mode):
                     raise ValueError("payload path parent must be a directory")
@@ -707,6 +1070,80 @@ class ArtifactPayloadService:
                 raise ValueError("payload entries must be a regular file or directory")
         if _identity(os.fstat(directory_fd)) != initial_identity:
             raise ValueError("payload directory mutated during scan")
+
+    def _enumerate_inventory_directory(
+        self,
+        directory_fd: int,
+        prefix: tuple[str, ...],
+        directories: dict[tuple[str, ...], _FileIdentity],
+        files: dict[str, _FileIdentity],
+        initial_identity: _FileIdentity,
+    ) -> None:
+        try:
+            with os.scandir(directory_fd) as entries:
+                names = []
+                for entry in entries:
+                    self._consume_attempted(nodes=1)
+                    names.append(entry.name)
+        except OSError as exc:
+            raise ValueError("payload inventory directory could not be listed") from exc
+
+        for name in sorted(names):
+            relative_parts = prefix + (name,)
+            relative_path = "/".join(relative_parts)
+            try:
+                validate_relative_path(relative_path)
+            except ValueError as exc:
+                raise ValueError("payload inventory contains a non-canonical path") from exc
+            if len(relative_parts) > MAX_PAYLOAD_TREE_DEPTH:
+                raise ValueError("payload inventory exceeds maximum tree depth")
+
+            before = _stat_at(name, directory_fd)
+            if stat.S_ISLNK(before.st_mode):
+                raise ValueError("payload inventory must not contain a symlink")
+            observed = _identity(before)
+            if stat.S_ISDIR(before.st_mode):
+                directories[relative_parts] = observed
+                child_fd = self._open_child(
+                    directory_fd,
+                    name,
+                    observed,
+                    directory=True,
+                )
+                try:
+                    self._enumerate_inventory_directory(
+                        child_fd,
+                        relative_parts,
+                        directories,
+                        files,
+                        observed,
+                    )
+                    after_fd = _identity(os.fstat(child_fd))
+                finally:
+                    os.close(child_fd)
+                after_path = _identity(_stat_at(name, directory_fd))
+                if after_fd != observed or after_path != observed:
+                    raise ValueError("payload inventory directory mutated during enumeration")
+            elif stat.S_ISREG(before.st_mode):
+                self._consume_attempted(files=1)
+                child_fd = self._open_child(
+                    directory_fd,
+                    name,
+                    observed,
+                    directory=False,
+                )
+                try:
+                    after_fd = _identity(os.fstat(child_fd))
+                finally:
+                    os.close(child_fd)
+                after_path = _identity(_stat_at(name, directory_fd))
+                if after_fd != observed or after_path != observed:
+                    raise ValueError("payload inventory file mutated during enumeration")
+                files[relative_path] = observed
+            else:
+                raise ValueError("payload inventory entries must be regular files or directories")
+        if _identity(os.fstat(directory_fd)) != initial_identity:
+            raise ValueError("payload inventory directory mutated during enumeration")
 
     def _open_child(
         self,
@@ -819,4 +1256,8 @@ class ArtifactPayloadService:
             raise ValueError(f"{mutation_label} mutated")
 
 
-__all__ = ["ArtifactPayloadBudgetExceeded", "ArtifactPayloadService"]
+__all__ = [
+    "ArtifactPayloadBudgetExceeded",
+    "ArtifactPayloadService",
+    "VerifiedFileCopyReceipt",
+]

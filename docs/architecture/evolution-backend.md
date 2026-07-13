@@ -213,7 +213,11 @@ plan-bound jobs。
 event type 原值，不迁移 pre-release runtime identity。Dataset queries 只匹配
 显式请求的 OpenEvo event identity，例如 `openevo.session_completed`。
 
-## Context Resolution
+## Context Resolution（当前公开 Legacy Path）
+
+本节描述 Gateway 当前使用的 public v1 path。Verified handler、内部 projection 和 generic
+materializer 的已实现边界及 strict v2 cutover 缺口见
+`docs/architecture/evolution-runtime-context.md`。
 
 ```mermaid
 flowchart TB
