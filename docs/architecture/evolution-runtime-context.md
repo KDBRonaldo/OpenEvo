@@ -10,8 +10,10 @@ Runtime context 的注入发生在 gateway session 被 dispatch 之后、agent h
 选择上下文。
 
 当前处于 handler runtime cutover 过渡期。Core 已实现只读取 managed artifact root 的
-no-follow payload scanner、opaque handle、全文件 digest/UTF-8 重验，以及内部 projection
-v1 resolver。内部 resolver 通过完整 verified executable registry 调用 handler，持久化
+no-follow payload scanner、opaque handle、全文件 digest/UTF-8 重验、内部 projection v1
+resolver 和 generic materializer。Scanner 从绝对 filesystem anchor 逐组件 no-follow 固定
+allowed root，持有稳定 root FD，并在每次相对 traversal 前后复核 held FD/path binding。内部
+resolver 通过完整 verified executable registry 调用 handler，持久化
 validated ordered contributions、registry digest、runtime roots 和实际 consumed selection；
 不持久化 URI、host source path 或 handle。Adapter projection 额外保留批准时的 payload
 inventory digest/size；manifest 语义绑定注册事务中的 deterministic immutable DB record，payload 走 managed
@@ -22,15 +24,57 @@ registration/worker completion。显式 artifact IDs 下推 SQL，implicit
 selection 优先保留 local manifest-bound candidates；rejected rows 只以 bounded
 compatibility routing data 与 identity/reason markers 进入 Python，且必须先通过
 compatibility filter 才能持久化 typed skip；source URI、name、manifest、scores 不进入该
-路径。现有
-`/v1/contexts/resolve` 和 Gateway staging
-仍在消费 legacy response/URI，内部 projection 尚未成为公开 runtime path。完成 generic
-materializer 与 strict v2/Gateway 原子切换前，scanner 不代表 skill URI copy 已具备端到端
+路径。Internal materializer 绑定同一 registry 和 canonical request digest，重新签发并校验
+staged/adapter inventory，把目录展开成 private random-ID、digest-verified blobs，按 descriptor
+生成 instruction framing，并通用解析 env 和 adapter spec；其 manifest 不包含 source URI、host
+path 或 scanner handle。Instruction view 延续 legacy trim 语义而不改变 staged bytes。Bundle 使用
+temp tree、fsync 和 rename 发布；发布/DB commit/startup recovery 共用跨进程 root lock，并在 DB
+store ID、resolved root、artifact-root marker 和 materialization-root marker 全部匹配后才保守
+reconcile 无引用 bundle。Identity DDL 与 pending row 在一个 SQLite transaction 创建；首次/legacy binding 随后使用
+pending -> 两个 marker fsync -> bound，bound 状态缺少任一 marker 都不自动重建。rename 后最终
+路径校验失败时不按名称删除可能已替换的目录，而留给该 recovery。
+Publication receipt 绑定 canonical manifest bytes、bundle/blob directory identity 和逐 blob
+identity；Store 在 SQLite commit 前使用同一个 locked root FD 全量复核 receipt。
+最终 temp bundle 使用 FD-relative atomic no-replace rename 发布；同名竞态 entry 保持不变，缺少
+该平台原语时 fail closed。只有能证明 DB 未提交时才 discard publication；已提交或状态不明时保留。
+临时目录初始化失败同样只能按已打开 inode quarantine。Store 在 precommit callback 后及 locked
+root 正常退出时再次验证 materialization-root binding。
+
+Blob transport/consumer 只能从 `EvolutionStore` 拥有的入口进入。该入口持有并复核同一个 locked
+materialization-root fd、store identity 双 marker 与 root owner/mode/inode binding，从 SQLite
+`context_materializations.manifest_json` 读取权威 `MaterializedContext`，然后把 expected manifest
+和同一个 root fd 交给低层 materializer。磁盘 `manifest.json` 必须逐字节匹配 DB canonical
+manifest，不能靠同时替换 blob 和磁盘 manifest 自证。Reader 相对 root fd no-follow 打开 blob，
+重验 exact size、digest 和 path identity，只暴露受控 read-only stream，不暴露 raw fd 或 host path。
+现有
+`/v1/contexts/resolve` 和 Gateway staging 仍在消费 legacy response/URI，内部
+projection/materializer 尚未成为公开 runtime path。完成 strict v2/blob transport 与 Gateway
+原子切换前，scanner 不代表 skill URI copy 已具备端到端
 TOCTOU 保护；release 路径不得把任意外部 `file://` root 加入 scanner allowlist。当前
 scanner 依赖 Linux Core 的 `O_PATH` 和 `/proc/self/fd` fixed-object reopen；macOS Desktop
 不在本地执行该 payload scan。
+Materialization root 必须由当前 Core 用户拥有且 mode 为 `0700`；publish、DB precommit、discard
+和 recovery 复用同一个 locked fd，并在 commit 前重新核对 root inode 与两个 marker。Orphan
+候选绑定枚举时 inode，移动到随机 quarantine 后只清空可安全固定的内容并保留 maintenance-owned
+quarantine/tombstone entry；这不是立即删除。Identity mismatch 会保留并使 recovery 失败。Startup
+除 fresh/recognized pending bootstrap 外只识别 exact allowlisted historical/current schema，并独立
+精确校验 `store_identity` schema/row 与双 marker；只有 complete fingerprint 可认领已有 managed
+recovery state。伪造或 near-match identity 在任何 cleanup 前失败且不清理。Fresh DB 不得认领已有 Core-managed recovery
+state；legacy DB 必须在任何 identity DDL/row 或 marker 写入前通过上述识别才可迁移，不能只按
+表名识别。
+Fresh DB 同时检查 context snapshots、materializations 和 managed artifact manifests。Base schema
+DDL 在一个显式 SQLite transaction 内安装，exact historical allowlist 支持直接升级真实 first-parent
+旧布局，不要求先运行中间版本。Base DDL、additive migrations 与 recovery DB changes 同事务提交。
+Context snapshot 只在 startup 按 DB canonical bytes reconciliation；普通 read/inventory 始终要求
+link-count-one `0600` regular file。较宽但安全的历史 mode 仅由显式 startup migration 接受并收紧
+到 `0600`，不会放宽普通读取。
+Adapter 完整 rehash 后还要重新绑定 payload-root pathname，拒绝 root 整体替换。
 
-## 端到端流程
+Cross-session revision pinning、queued/not-ready admission 和 all-or-nothing next-revision activation
+仍是后续 productization 工作；内部 materializer、strict v2 transport 和 Gateway generic cutover
+不能被描述为已经完成这条端到端 revision contract。
+
+## 当前公开 Legacy Gateway 流程
 
 ```mermaid
 sequenceDiagram

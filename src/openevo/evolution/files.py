@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
+import re
+import stat
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +19,14 @@ ARTIFACT_TYPE_DIRECTORIES = {
     "reports": "reports",
     "context_snapshot": "contexts",
 }
+
+_MANAGED_IDENTIFIER_RE = re.compile(r"[A-Za-z][A-Za-z0-9_.-]{0,127}\Z", re.ASCII)
+
+
+def _managed_identifier(value: str, label: str) -> str:
+    if not isinstance(value, str) or _MANAGED_IDENTIFIER_RE.fullmatch(value) is None:
+        raise ValueError(f"{label} must be a stable managed identifier")
+    return value
 
 
 class ArtifactFileStore:
@@ -36,6 +47,52 @@ class ArtifactFileStore:
             "contexts",
         ):
             (self.root / relative).mkdir(parents=True, exist_ok=True)
+        root_descriptor = os.open(
+            self.root,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_DIRECTORY,
+        )
+        contexts_descriptor: int | None = None
+        materialization_descriptor: int | None = None
+        try:
+            contexts_descriptor = os.open(
+                "contexts",
+                os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_DIRECTORY,
+                dir_fd=root_descriptor,
+            )
+            contexts_opened = os.fstat(contexts_descriptor)
+            if contexts_opened.st_uid != os.geteuid() or not stat.S_ISDIR(contexts_opened.st_mode):
+                raise ValueError("context snapshot root must be an owned directory")
+            os.fchmod(contexts_descriptor, 0o700)
+            if stat.S_IMODE(os.fstat(contexts_descriptor).st_mode) != 0o700:
+                raise ValueError("context snapshot root must have mode 0700")
+            try:
+                os.mkdir("context_materializations", mode=0o700, dir_fd=root_descriptor)
+            except FileExistsError:
+                pass
+            materialization_descriptor = os.open(
+                "context_materializations",
+                os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_DIRECTORY,
+                dir_fd=root_descriptor,
+            )
+            opened = os.fstat(materialization_descriptor)
+            if opened.st_uid != os.geteuid() or not stat.S_ISDIR(opened.st_mode):
+                raise ValueError("context materialization root must be an owned directory")
+            os.fchmod(materialization_descriptor, 0o700)
+            if stat.S_IMODE(os.fstat(materialization_descriptor).st_mode) != 0o700:
+                raise ValueError("context materialization root must have mode 0700")
+            os.fsync(contexts_descriptor)
+            os.fsync(materialization_descriptor)
+            os.fsync(root_descriptor)
+        except OSError as exc:
+            raise ValueError(
+                "context materialization root could not be initialized safely"
+            ) from exc
+        finally:
+            if materialization_descriptor is not None:
+                os.close(materialization_descriptor)
+            if contexts_descriptor is not None:
+                os.close(contexts_descriptor)
+            os.close(root_descriptor)
 
     def safe_path(self, *parts: str) -> Path:
         path = (self.root / Path(*parts)).resolve()
@@ -65,3 +122,9 @@ class ArtifactFileStore:
 
     def context_snapshot_path(self, context_id: str) -> Path:
         return self.safe_path("contexts", f"{context_id}.json")
+
+    def context_materialization_dir(self, context_id: str) -> Path:
+        return self.safe_path(
+            "context_materializations",
+            _managed_identifier(context_id, "context ID"),
+        )

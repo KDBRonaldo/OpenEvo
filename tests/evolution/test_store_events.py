@@ -10,6 +10,7 @@ import pytest
 from openevo.evolution.files import ArtifactFileStore
 from openevo.evolution.models import EventIngestRequest
 from openevo.evolution.store import EvolutionStore
+from openevo.evolution import store_schema_identity as store_schema_identity_module
 
 
 def test_store_initializes_schema(tmp_path):
@@ -34,6 +35,130 @@ def test_store_initializes_schema(tmp_path):
         "artifact_lineage",
         "contexts",
     }.issubset(tables)
+
+
+def test_fake_legacy_schema_cannot_claim_managed_recovery_state(tmp_path):
+    db_path = tmp_path / "forged.db"
+    artifact_root = tmp_path / "managed"
+    materialization_root = artifact_root / "context_materializations"
+    recovery_entry = materialization_root / "ctx-recovery"
+    recovery_entry.mkdir(parents=True)
+    sentinel = recovery_entry / "keep.txt"
+    sentinel.write_text("keep", encoding="utf-8")
+    with sqlite3.connect(db_path) as conn:
+        for table_name in ("events", "artifacts", "contexts"):
+            conn.execute(f"CREATE TABLE {table_name} (x TEXT)")
+
+    with pytest.raises(ValueError, match="schema identity is not recognized"):
+        EvolutionStore(db_path=db_path, artifact_root=artifact_root).initialize()
+
+    assert sentinel.read_text(encoding="utf-8") == "keep"
+    assert not (artifact_root / ".openevo-store.json").exists()
+    assert not (materialization_root / ".openevo-store.json").exists()
+    with sqlite3.connect(db_path) as conn:
+        identity_table = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'store_identity'"
+        ).fetchone()
+        forged_columns = {
+            table_name: conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+            for table_name in ("events", "artifacts", "contexts")
+        }
+
+    assert identity_table is None
+    assert all([(0, "x", "TEXT", 0, None, 0)] == columns for columns in forged_columns.values())
+
+
+def test_partial_legacy_schema_cannot_claim_managed_recovery_state(tmp_path):
+    db_path = tmp_path / "partial.db"
+    artifact_root = tmp_path / "managed"
+    materialization_root = artifact_root / "context_materializations"
+    recovery_entry = materialization_root / "ctx-recovery"
+    recovery_entry.mkdir(parents=True)
+    sentinel = recovery_entry / "keep.txt"
+    sentinel.write_text("keep", encoding="utf-8")
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE jobs (
+                job_id TEXT PRIMARY KEY,
+                job_type TEXT NOT NULL,
+                method TEXT NOT NULL,
+                state TEXT NOT NULL,
+                priority INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                claimed_by TEXT,
+                lease_id TEXT,
+                lease_expires_at TEXT,
+                input_artifact_ids_json TEXT NOT NULL,
+                config_json TEXT NOT NULL,
+                error TEXT,
+                attempt_count INTEGER NOT NULL
+            )
+            """
+        )
+
+    with pytest.raises(ValueError, match="cannot claim non-empty managed state"):
+        EvolutionStore(db_path=db_path, artifact_root=artifact_root).initialize()
+
+    assert sentinel.read_text(encoding="utf-8") == "keep"
+    assert not (artifact_root / ".openevo-store.json").exists()
+    assert not (materialization_root / ".openevo-store.json").exists()
+    with sqlite3.connect(db_path) as conn:
+        assert (
+            conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'store_identity'"
+            ).fetchone()
+            is None
+        )
+
+
+def test_recognized_legacy_schema_claims_managed_recovery_state(tmp_path):
+    db_path = tmp_path / "legacy.db"
+    artifact_root = tmp_path / "managed"
+    files = ArtifactFileStore(artifact_root)
+    files.initialize()
+    manifest_path = files.artifact_manifest_path("text_memory", "artifact-legacy")
+    manifest_path.parent.mkdir(parents=True)
+    manifest_path.write_text("{}", encoding="utf-8")
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript(store_schema_identity_module._STABLE_DE0481385CEF_DDL)
+        conn.execute(
+            "INSERT INTO artifacts "
+            "(artifact_id, type, name, version, state, created_at, uri, "
+            "manifest_path, manifest_json, lineage_json, compatibility_json, "
+            "scores_json, tags_json, promoted, staging_job_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "artifact-legacy",
+                "text_memory",
+                "legacy memory",
+                1,
+                "active",
+                "2026-07-13T00:00:00Z",
+                "file:///legacy-memory.md",
+                str(manifest_path),
+                "{}",
+                "{}",
+                "{}",
+                "{}",
+                "{}",
+                1,
+                None,
+            ),
+        )
+        conn.commit()
+
+    EvolutionStore(db_path=db_path, artifact_root=artifact_root).initialize()
+
+    assert manifest_path.read_text(encoding="utf-8") == "{}"
+    assert (artifact_root / ".openevo-store.json").is_file()
+    assert (artifact_root / "context_materializations" / ".openevo-store.json").is_file()
+    with sqlite3.connect(db_path) as conn:
+        identity = conn.execute(
+            "SELECT binding_state FROM store_identity WHERE singleton = 1"
+        ).fetchone()
+    assert identity == ("bound",)
 
 
 def test_store_initializes_artifact_directories(tmp_path):
@@ -71,10 +196,7 @@ def test_events_schema_has_source_event_uniqueness(tmp_path):
     }
 
     with sqlite3.connect(db_path) as conn:
-        columns = {
-            row[1]: row[2]
-            for row in conn.execute("pragma table_info(events)").fetchall()
-        }
+        columns = {row[1]: row[2] for row in conn.execute("pragma table_info(events)").fetchall()}
         assert columns["event_id"] == "TEXT"
         assert columns["source"] == "TEXT"
         assert columns["event_type"] == "TEXT"
@@ -222,7 +344,7 @@ def test_initialize_keeps_distinct_non_openevo_and_openevo_session_events(tmp_pa
             "event_id": non_openevo.event_id,
             "source": "openevo",
             "event_type": non_openevo_event_type,
-        }
+        },
     ]
     assert [row["event_id"] for row in dataset_links] == [non_openevo.event_id]
 
@@ -318,6 +440,17 @@ def test_artifact_manifest_path_rejects_empty_or_unknown_type(tmp_path, artifact
 
     with pytest.raises(ValueError, match="unknown artifact type"):
         files.artifact_manifest_path(artifact_type, "artifact-1")
+
+
+def test_context_materialization_directory_is_core_managed(tmp_path):
+    files = ArtifactFileStore(tmp_path / "managed")
+    files.initialize()
+
+    root = files.context_materialization_dir("ctx_1")
+
+    assert root == tmp_path / "managed" / "context_materializations" / "ctx_1"
+    with pytest.raises(ValueError, match="stable managed identifier"):
+        files.context_materialization_dir("../../outside")
 
 
 def test_ingest_event_is_idempotent(tmp_path):

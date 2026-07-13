@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 import hashlib
@@ -10,7 +10,8 @@ import os
 from pathlib import Path
 import re
 import sqlite3
-from typing import Any, Iterator
+import stat
+from typing import Any, Callable, Iterator
 from urllib.parse import urlparse, urlunparse
 
 from openevo.evolution.agent_system import normalize_agent_system_target_path
@@ -32,8 +33,26 @@ from openevo.evolution.context_projection import (
     ContextProjectionResolveResponse,
     ContextProjectionResolver,
 )
+from openevo.evolution.context_materialization import (
+    MAX_CONTEXT_MANIFEST_BYTES,
+    ContextMaterializer,
+    MaterializedBlobLease,
+    MaterializedContext,
+    _PRESERVED_ENTRY_PREFIX,
+    _PrivateFileIdentity,
+    _private_file_identity,
+    _remove_materialized_entry_if_identity,
+)
+from openevo.evolution.context_snapshot_recovery import (
+    MAX_CONTEXT_SNAPSHOT_ENTRIES,
+    migrate_legacy_context_snapshot_modes,
+    reconcile_context_snapshots,
+    write_context_snapshot,
+)
 from openevo.evolution.files import ARTIFACT_TYPE_DIRECTORIES, ArtifactFileStore
 from openevo.evolution.ids import new_id
+from openevo.evolution.materialization_root_lock import get_materialization_root_lock
+from openevo.evolution.store_schema_identity import classify_store_schema
 from openevo.evolution.models import (
     ArtifactPromotionUpdateRequest,
     AdapterMergeSpec,
@@ -95,7 +114,6 @@ from openevo.evolution.framework.registry import RegistrySnapshot
 
 
 SCHEMA = """
-PRAGMA journal_mode=WAL;
 CREATE TABLE IF NOT EXISTS events (
     event_id TEXT PRIMARY KEY,
     source TEXT NOT NULL,
@@ -193,6 +211,14 @@ CREATE TABLE IF NOT EXISTS contexts (
     response_json TEXT NOT NULL,
     selected_artifact_ids_json TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS context_materializations (
+    context_id TEXT PRIMARY KEY,
+    created_at TEXT NOT NULL,
+    registry_digest TEXT NOT NULL,
+    request_digest TEXT NOT NULL,
+    manifest_json TEXT NOT NULL,
+    FOREIGN KEY(context_id) REFERENCES contexts(context_id) ON DELETE CASCADE
+);
 CREATE TABLE IF NOT EXISTS review_packets (
     packet_id TEXT PRIMARY KEY,
     packet_hash TEXT NOT NULL UNIQUE,
@@ -272,10 +298,58 @@ WHERE query_decision_id IS NOT NULL;
 MAX_ARTIFACT_ID_ATTEMPTS = 10
 MAX_DATASET_ID_ATTEMPTS = 10
 MAX_CONTEXT_ID_ATTEMPTS = 10
+MAX_CONTEXT_MATERIALIZATION_RECOVERY_ROWS = 16_384
+_STORE_IDENTITY_FILENAME = ".openevo-store.json"
+_STORE_IDENTITY_MAX_BYTES = 4096
+_STORE_ID_RE = re.compile(r"store_[0-9a-f]{16}\Z", re.ASCII)
+_STORE_IDENTITY_SCHEMA = """
+CREATE TABLE store_identity (
+    singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+    store_id TEXT NOT NULL UNIQUE,
+    artifact_root TEXT NOT NULL,
+    binding_state TEXT NOT NULL CHECK(binding_state IN ('pending', 'bound'))
+)
+"""
 ACTIVE_JOB_STATES = {str(JobState.CLAIMED), str(JobState.RUNNING)}
 OPENEVO_SESSION_EVENT_SOURCE = "openevo"
 OPENEVO_SESSION_EVENT_TYPE = "openevo.session_completed"
 _ARTIFACT_MANIFEST_DIRECTORIES = frozenset(ARTIFACT_TYPE_DIRECTORIES.values())
+
+
+def _after_store_identity_schema_created(conn: sqlite3.Connection) -> None:
+    """Private no-op hook used by deterministic identity-bootstrap tests."""
+
+    del conn
+
+
+def _stat_identity(value: os.stat_result) -> tuple[int, int, int, int, int, int, int]:
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_mode,
+        value.st_nlink,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
+
+
+def _directory_binding_identity(
+    value: os.stat_result,
+) -> tuple[int, int, int, int, int]:
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_mode,
+        value.st_uid,
+        value.st_gid,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _OrphanMaterialization:
+    name: str
+    identity: _PrivateFileIdentity
 
 
 class JobLeaseError(ValueError):
@@ -346,6 +420,19 @@ def _write_json_strict_exclusive(
             path.unlink(missing_ok=True)
         raise
     return path
+
+
+def _context_snapshot_bytes(
+    request_payload: dict[str, object],
+    response_payload: dict[str, object],
+) -> bytes:
+    return _json_dumps(
+        {
+            "request": request_payload,
+            "response": response_payload,
+        },
+        indent=2,
+    ).encode("utf-8")
 
 
 def _write_jsonl_strict_exclusive(
@@ -419,9 +506,7 @@ _RELATIVE_URI_REF_RE = re.compile(
     r"(?<![\w:/])(?:[A-Za-z0-9._~!$&'()*+,;=@%-]+/)*"
     r"[A-Za-z0-9._~!$&'()*+,;=@%-]+[?#](?:<redacted>|[^\s\"'<>])+"
 )
-_QUERY_OR_FRAGMENT_REF_RE = re.compile(
-    r"(?<![\w])(?:[?#](?:<redacted>|[^\s\"'<>])+)"
-)
+_QUERY_OR_FRAGMENT_REF_RE = re.compile(r"(?<![\w])(?:[?#](?:<redacted>|[^\s\"'<>])+)")
 _POSIX_ABSOLUTE_PATH_RE = re.compile(r"(?<![\w:/])/(?!/)(?:[^\s,;:/]+/)*[^\s,;]+")
 _WINDOWS_UNC_PATH_RE = re.compile(
     r"\\\\[^\s\\/:*?\"<>|,;]+\\(?:[^\\/:*?\"<>|\r\n,;]+\\)*[^\s\\/:*?\"<>|,;]+"
@@ -473,15 +558,9 @@ def _sanitize_review_boundary_payload(value: Any, *, uri_context: bool = False) 
             )
         return sanitized
     if isinstance(value, list):
-        return [
-            _sanitize_review_boundary_payload(item, uri_context=uri_context)
-            for item in value
-        ]
+        return [_sanitize_review_boundary_payload(item, uri_context=uri_context) for item in value]
     if isinstance(value, tuple):
-        return [
-            _sanitize_review_boundary_payload(item, uri_context=uri_context)
-            for item in value
-        ]
+        return [_sanitize_review_boundary_payload(item, uri_context=uri_context) for item in value]
     if isinstance(value, str):
         return _sanitize_review_boundary_text(value, uri_context=uri_context)
     return value
@@ -547,9 +626,7 @@ def _is_sensitive_uri_scheme(scheme: str) -> bool:
     normalized = scheme.lower()
     if not normalized:
         return False
-    return normalized in {"bearer", "basic"} or bool(
-        _SENSITIVE_KEY_RE.search(normalized)
-    )
+    return normalized in {"bearer", "basic"} or bool(_SENSITIVE_KEY_RE.search(normalized))
 
 
 def _is_uri_field_key(key: object) -> bool:
@@ -637,9 +714,7 @@ def _looks_like_absolute_local_path(value: str) -> bool:
     stripped = value.strip()
     if not stripped or any(char in stripped for char in "\r\n\x00"):
         return False
-    if _WINDOWS_UNC_PATH_RE.fullmatch(stripped) or _WINDOWS_ABSOLUTE_PATH_RE.fullmatch(
-        stripped
-    ):
+    if _WINDOWS_UNC_PATH_RE.fullmatch(stripped) or _WINDOWS_ABSOLUTE_PATH_RE.fullmatch(stripped):
         return True
     return stripped.startswith("/")
 
@@ -1045,21 +1120,34 @@ class EvolutionStore:
         if verified_registry is not None:
             if (
                 registry_snapshot is not None
-                and registry_snapshot.registry_digest
-                != verified_registry.snapshot.registry_digest
+                and registry_snapshot.registry_digest != verified_registry.snapshot.registry_digest
             ):
-                raise ValueError(
-                    "registry snapshot does not match executable registry"
-                )
+                raise ValueError("registry snapshot does not match executable registry")
             registry_snapshot = verified_registry.snapshot
         self.db_path = Path(db_path)
         self.files = ArtifactFileStore(artifact_root)
+        self._context_materialization_root = self.files.root / "context_materializations"
+        self._context_materialization_lock = get_materialization_root_lock(
+            self._context_materialization_root
+        )
+        self._bound_store_id: str | None = None
+        self._artifact_root_binding_identity: tuple[int, int, int, int, int] | None = None
+        self._materialization_root_binding_identity: tuple[int, int, int, int, int] | None = None
         self._registry_snapshot = registry_snapshot
         self._executable_registry = verified_registry
         self._context_projection_resolver = (
             None
             if verified_registry is None
             else ContextProjectionResolver(self.files.root, verified_registry)
+        )
+        self._context_materializer = (
+            None
+            if verified_registry is None
+            else ContextMaterializer(
+                self.files.root,
+                self._context_materialization_root,
+                verified_registry,
+            )
         )
 
     def _bind_registry_snapshot(self, snapshot: RegistrySnapshot) -> None:
@@ -1073,22 +1161,602 @@ class EvolutionStore:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.files.initialize()
         orphan_manifest_paths: list[Path] = []
-        with self.connect() as conn:
-            conn.executescript(SCHEMA)
-            conn.execute("BEGIN IMMEDIATE")
-            self._ensure_schema(conn)
-            self._requeue_expired_jobs(conn, datetime.now(UTC))
-            self._delete_recoverable_staged_artifacts(conn)
-            orphan_manifest_paths = self._orphan_managed_artifact_manifests(
-                conn,
+        orphan_materializations: list[_OrphanMaterialization] = []
+        with self._locked_context_materialization_root() as materialization_root_fd:
+            with self.connect() as conn:
+                store_id, artifact_root_identity = self._ensure_store_identity(
+                    conn,
+                    materialization_root_descriptor=materialization_root_fd,
+                )
+                self._bound_store_id = store_id
+                self._artifact_root_binding_identity = artifact_root_identity
+                self._materialization_root_binding_identity = _directory_binding_identity(
+                    os.fstat(materialization_root_fd)
+                )
+                self._verify_bound_materialization_root(materialization_root_fd)
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    self._verify_bound_store_identity(conn)
+                    self._install_base_schema(conn)
+                    self._ensure_schema(conn)
+                    self._verify_bound_store_identity(conn)
+                    expected_context_snapshots = self._expected_context_snapshot_bytes(conn)
+                    with self._opened_bound_artifact_root() as artifact_root_fd:
+                        migrate_legacy_context_snapshot_modes(artifact_root_fd)
+                        reconcile_context_snapshots(
+                            artifact_root_fd,
+                            expected_context_snapshots,
+                        )
+                    self._requeue_expired_jobs(conn, datetime.now(UTC))
+                    self._delete_recoverable_staged_artifacts(conn)
+                    orphan_manifest_paths = self._orphan_managed_artifact_manifests(
+                        conn,
+                    )
+                    orphan_materializations = self._orphan_context_materializations(
+                        conn,
+                        materialization_root_fd,
+                    )
+                    self._verify_referenced_context_materializations(
+                        conn,
+                        materialization_root_fd,
+                    )
+                    self._verify_bound_store_identity(conn)
+                    conn.commit()
+                except BaseException:
+                    try:
+                        conn.rollback()
+                    except sqlite3.Error:
+                        pass
+                    raise
+            self._remove_orphan_context_materializations(
+                orphan_materializations,
+                materialization_root_fd,
             )
-            conn.commit()
         self._unlink_artifact_manifests(orphan_manifest_paths)
+
+    @staticmethod
+    def _install_base_schema(conn: sqlite3.Connection) -> None:
+        pending: list[str] = []
+        for line in SCHEMA.splitlines(keepends=True):
+            pending.append(line)
+            statement = "".join(pending)
+            if not sqlite3.complete_statement(statement):
+                continue
+            if statement.strip():
+                conn.execute(statement)
+            pending.clear()
+        if "".join(pending).strip():
+            raise RuntimeError("base schema contains an incomplete SQL statement")
+
+    @contextmanager
+    def _locked_context_materialization_root(self) -> Iterator[int]:
+        with ExitStack() as stack:
+            try:
+                descriptor = stack.enter_context(self._context_materialization_lock.locked())
+            except OSError as exc:
+                raise ValueError(
+                    "context materialization root could not be opened safely"
+                ) from exc
+            if self._bound_store_id is not None:
+                self._verify_bound_materialization_root(descriptor)
+            yield descriptor
+            if self._bound_store_id is not None:
+                self._verify_bound_materialization_root(descriptor)
+
+    def _ensure_store_identity(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        materialization_root_descriptor: int,
+    ) -> tuple[str, tuple[int, int, int, int, int]]:
+        root_descriptor = os.open(
+            self.files.root,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_DIRECTORY,
+        )
+        try:
+            root_marker_store_id = self._read_store_identity_marker(root_descriptor)
+            materialization_marker_store_id = self._read_store_identity_marker(
+                materialization_root_descriptor
+            )
+            marker_store_ids = {
+                value
+                for value in (
+                    root_marker_store_id,
+                    materialization_marker_store_id,
+                )
+                if value is not None
+            }
+            created_identity = False
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                schema = classify_store_schema(conn)
+                if schema.kind == "invalid":
+                    raise ValueError("evolution database schema identity is not recognized")
+                table_exists = schema.identity == "exact"
+                if not table_exists:
+                    if schema.kind not in {"empty", "legacy", "current"}:
+                        raise ValueError("evolution database schema identity is not recognized")
+                    if marker_store_ids:
+                        raise ValueError(
+                            "artifact root is already bound to a different evolution database"
+                        )
+                    has_unclaimed_managed_state = self._has_unclaimed_managed_state(
+                        root_descriptor,
+                        materialization_root_descriptor,
+                    )
+                    if has_unclaimed_managed_state and (
+                        schema.kind == "empty"
+                        or not schema.underlying.can_claim_managed_recovery_state
+                    ):
+                        raise ValueError(
+                            "fresh evolution database cannot claim non-empty managed state"
+                        )
+                    database_store_id = new_id("store")
+                    if _STORE_ID_RE.fullmatch(database_store_id) is None:
+                        raise RuntimeError("generated evolution store identity is invalid")
+                    conn.execute(_STORE_IDENTITY_SCHEMA)
+                    _after_store_identity_schema_created(conn)
+                    conn.execute(
+                        "INSERT INTO store_identity "
+                        "(singleton, store_id, artifact_root, binding_state) "
+                        "VALUES (1, ?, ?, 'pending')",
+                        (database_store_id, os.fspath(self.files.root)),
+                    )
+                    created_identity = True
+                else:
+                    if schema.kind not in {
+                        "identity_only",
+                        "legacy_identity_crash_window",
+                        "current_identity",
+                    }:
+                        raise ValueError("evolution database schema identity is not recognized")
+                    has_unclaimed_managed_state = self._has_unclaimed_managed_state(
+                        root_descriptor,
+                        materialization_root_descriptor,
+                    )
+                    if has_unclaimed_managed_state and (
+                        schema.kind == "identity_only"
+                        or not schema.underlying.can_claim_managed_recovery_state
+                    ):
+                        raise ValueError(
+                            "unverified evolution database cannot claim non-empty managed state"
+                        )
+                rows = conn.execute(
+                    "SELECT singleton, store_id, artifact_root, binding_state "
+                    "FROM store_identity ORDER BY singleton"
+                ).fetchall()
+                conn.commit()
+            except BaseException:
+                try:
+                    conn.rollback()
+                except sqlite3.Error:
+                    pass
+                raise
+            if len(rows) > 1 or (rows and int(rows[0]["singleton"]) != 1):
+                raise ValueError("evolution database store identity is invalid")
+            if not rows:
+                raise ValueError("evolution database store identity row is missing")
+            database_store_id = str(rows[0]["store_id"]) if rows else None
+            if database_store_id is not None and _STORE_ID_RE.fullmatch(database_store_id) is None:
+                raise ValueError("evolution database store identity is invalid")
+            if rows and str(rows[0]["artifact_root"]) != os.fspath(self.files.root):
+                raise ValueError("evolution database is bound to a different artifact root")
+            binding_state = str(rows[0]["binding_state"]) if rows else None
+            if binding_state not in {None, "pending", "bound"}:
+                raise ValueError("evolution database store identity is invalid")
+
+            if created_identity and binding_state != "pending":
+                raise ValueError("evolution database store identity is invalid")
+
+            if binding_state == "bound":
+                if root_marker_store_id is None or materialization_marker_store_id is None:
+                    raise ValueError("bound artifact root identity marker is missing")
+                if marker_store_ids != {database_store_id}:
+                    raise ValueError("artifact root is bound to a different evolution database")
+                return database_store_id, _directory_binding_identity(os.fstat(root_descriptor))
+
+            if root_marker_store_id is None:
+                self._write_store_identity_marker(
+                    root_descriptor,
+                    database_store_id,
+                )
+            elif root_marker_store_id != database_store_id:
+                raise ValueError("artifact root is bound to a different evolution database")
+            if materialization_marker_store_id is None:
+                self._write_store_identity_marker(
+                    materialization_root_descriptor,
+                    database_store_id,
+                )
+            elif materialization_marker_store_id != database_store_id:
+                raise ValueError("artifact root is bound to a different evolution database")
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                updated = conn.execute(
+                    "UPDATE store_identity SET binding_state = 'bound' "
+                    "WHERE singleton = 1 AND store_id = ? AND binding_state = 'pending'",
+                    (database_store_id,),
+                )
+                if updated.rowcount != 1:
+                    raise ValueError("evolution database store identity changed during binding")
+                conn.commit()
+            except BaseException:
+                try:
+                    conn.rollback()
+                except sqlite3.Error:
+                    pass
+                raise
+            return database_store_id, _directory_binding_identity(os.fstat(root_descriptor))
+        finally:
+            os.close(root_descriptor)
+
+    def _has_unclaimed_managed_state(
+        self,
+        artifact_root_descriptor: int,
+        materialization_root_descriptor: int,
+    ) -> bool:
+        contexts_descriptor: int | None = None
+        try:
+            contexts_descriptor = os.open(
+                "contexts",
+                os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_DIRECTORY,
+                dir_fd=artifact_root_descriptor,
+            )
+            with os.scandir(contexts_descriptor) as entries:
+                if any(True for _entry in entries):
+                    return True
+            with os.scandir(materialization_root_descriptor) as entries:
+                if any(entry.name != _STORE_IDENTITY_FILENAME for entry in entries):
+                    return True
+        except OSError as exc:
+            raise ValueError(
+                "evolution managed recovery state could not be enumerated safely"
+            ) from exc
+        finally:
+            if contexts_descriptor is not None:
+                os.close(contexts_descriptor)
+        return bool(self._managed_artifact_manifests())
+
+    @contextmanager
+    def _opened_bound_artifact_root(self) -> Iterator[int]:
+        try:
+            descriptor = os.open(
+                self.files.root,
+                os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_DIRECTORY,
+            )
+        except OSError as exc:
+            raise ValueError("evolution store artifact root could not be verified") from exc
+        try:
+            self._verify_bound_artifact_root_descriptor(descriptor)
+            yield descriptor
+            self._verify_bound_artifact_root_descriptor(descriptor)
+        finally:
+            os.close(descriptor)
+
+    def _verify_bound_artifact_root_descriptor(self, descriptor: int) -> None:
+        store_id = self._bound_store_id
+        expected = self._artifact_root_binding_identity
+        if store_id is None or expected is None:
+            raise ValueError("evolution store identity has not been initialized")
+        if _directory_binding_identity(os.fstat(descriptor)) != expected:
+            raise ValueError("evolution store artifact root identity changed")
+        if self._read_store_identity_marker(descriptor) != store_id:
+            raise ValueError("evolution store artifact root identity marker changed")
+
+    def _verify_bound_materialization_root(self, descriptor: int) -> None:
+        store_id = self._bound_store_id
+        expected_artifact_root = self._artifact_root_binding_identity
+        expected_materialization_root = self._materialization_root_binding_identity
+        if (
+            store_id is None
+            or expected_artifact_root is None
+            or expected_materialization_root is None
+        ):
+            raise ValueError("evolution store identity has not been initialized")
+        artifact_root_descriptor: int | None = None
+        try:
+            artifact_root_descriptor = os.open(
+                self.files.root,
+                os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_DIRECTORY,
+            )
+            self._verify_bound_artifact_root_descriptor(artifact_root_descriptor)
+            if _directory_binding_identity(os.fstat(descriptor)) != expected_materialization_root:
+                raise ValueError("evolution store root identity changed")
+            child = os.stat(
+                "context_materializations",
+                dir_fd=artifact_root_descriptor,
+                follow_symlinks=False,
+            )
+            if _directory_binding_identity(child) != expected_materialization_root:
+                raise ValueError("context materialization root binding changed")
+            opened = os.fstat(descriptor)
+            if (
+                opened.st_uid != os.geteuid()
+                or not stat.S_ISDIR(opened.st_mode)
+                or stat.S_IMODE(opened.st_mode) != 0o700
+            ):
+                raise ValueError("context materialization root is not private")
+            if self._read_store_identity_marker(descriptor) != store_id:
+                raise ValueError("evolution store root identity marker changed")
+        except OSError as exc:
+            raise ValueError("evolution store root binding could not be verified") from exc
+        finally:
+            if artifact_root_descriptor is not None:
+                os.close(artifact_root_descriptor)
+
+    def _verify_bound_store_identity(self, conn: sqlite3.Connection) -> None:
+        store_id = self._bound_store_id
+        if store_id is None:
+            raise ValueError("evolution store identity has not been initialized")
+        try:
+            rows = conn.execute(
+                "SELECT singleton, store_id, artifact_root, binding_state "
+                "FROM store_identity ORDER BY singleton"
+            ).fetchall()
+        except sqlite3.Error as exc:
+            raise ValueError("evolution database store identity is unavailable") from exc
+        if len(rows) != 1:
+            raise ValueError("evolution database store identity is invalid")
+        row = rows[0]
+        try:
+            singleton = int(row["singleton"])
+        except (TypeError, ValueError) as exc:
+            raise ValueError("evolution database store identity is invalid") from exc
+        if (
+            singleton != 1
+            or str(row["store_id"]) != store_id
+            or str(row["artifact_root"]) != os.fspath(self.files.root)
+            or str(row["binding_state"]) != "bound"
+        ):
+            raise ValueError("evolution database store identity changed")
+
+    @staticmethod
+    def _read_store_identity_marker(root_descriptor: int) -> str | None:
+        try:
+            descriptor = os.open(
+                _STORE_IDENTITY_FILENAME,
+                os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                dir_fd=root_descriptor,
+            )
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise ValueError("artifact root store identity could not be opened safely") from exc
+        try:
+            opened = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or opened.st_nlink != 1
+                or opened.st_size <= 0
+                or opened.st_size > _STORE_IDENTITY_MAX_BYTES
+            ):
+                raise ValueError("artifact root store identity is invalid")
+            chunks: list[bytes] = []
+            size = 0
+            while chunk := os.read(descriptor, 1024):
+                size += len(chunk)
+                if size > _STORE_IDENTITY_MAX_BYTES:
+                    raise ValueError("artifact root store identity is invalid")
+                chunks.append(chunk)
+            after = os.fstat(descriptor)
+            try:
+                path_after = os.stat(
+                    _STORE_IDENTITY_FILENAME,
+                    dir_fd=root_descriptor,
+                    follow_symlinks=False,
+                )
+            except OSError as exc:
+                raise ValueError("artifact root store identity changed while being read") from exc
+        finally:
+            os.close(descriptor)
+        if (
+            size != opened.st_size
+            or _stat_identity(opened) != _stat_identity(after)
+            or _stat_identity(after) != _stat_identity(path_after)
+        ):
+            raise ValueError("artifact root store identity changed while being read")
+        try:
+            payload = json.loads(b"".join(chunks))
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise ValueError("artifact root store identity is invalid") from exc
+        if (
+            not isinstance(payload, dict)
+            or set(payload) != {"contract_version", "store_id"}
+            or payload.get("contract_version") != "1"
+            or not isinstance(payload.get("store_id"), str)
+            or _STORE_ID_RE.fullmatch(payload["store_id"]) is None
+        ):
+            raise ValueError("artifact root store identity is invalid")
+        return payload["store_id"]
+
+    @staticmethod
+    def _write_store_identity_marker(root_descriptor: int, store_id: str) -> None:
+        if _STORE_ID_RE.fullmatch(store_id) is None:
+            raise ValueError("evolution database store identity is invalid")
+        encoded = _json_dumps({"contract_version": "1", "store_id": store_id}).encode("utf-8")
+        descriptor: int | None = None
+        created = False
+        try:
+            descriptor = os.open(
+                _STORE_IDENTITY_FILENAME,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=root_descriptor,
+            )
+            created = True
+            view = memoryview(encoded)
+            while view:
+                written = os.write(descriptor, view)
+                if written <= 0:
+                    raise OSError("store identity write made no progress")
+                view = view[written:]
+            os.fsync(descriptor)
+            opened = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or opened.st_nlink != 1
+                or opened.st_size != len(encoded)
+            ):
+                raise ValueError("artifact root store identity was not written safely")
+            try:
+                path_opened = os.stat(
+                    _STORE_IDENTITY_FILENAME,
+                    dir_fd=root_descriptor,
+                    follow_symlinks=False,
+                )
+            except OSError as exc:
+                raise ValueError(
+                    "artifact root store identity path changed while being written"
+                ) from exc
+            if _stat_identity(opened) != _stat_identity(path_opened):
+                raise ValueError("artifact root store identity path changed while being written")
+            os.fsync(root_descriptor)
+        except BaseException:
+            if created:
+                try:
+                    fixed = os.fstat(descriptor) if descriptor is not None else None
+                    current = os.stat(
+                        _STORE_IDENTITY_FILENAME,
+                        dir_fd=root_descriptor,
+                        follow_symlinks=False,
+                    )
+                    if fixed is not None and (
+                        fixed.st_dev,
+                        fixed.st_ino,
+                    ) == (
+                        current.st_dev,
+                        current.st_ino,
+                    ):
+                        os.unlink(_STORE_IDENTITY_FILENAME, dir_fd=root_descriptor)
+                        os.fsync(root_descriptor)
+                except OSError:
+                    pass
+            raise
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+
+    def _orphan_context_materializations(
+        self,
+        conn: sqlite3.Connection,
+        root_descriptor: int,
+    ) -> list[_OrphanMaterialization]:
+        referenced = {
+            str(row["context_id"])
+            for row in conn.execute("SELECT context_id FROM context_materializations").fetchall()
+        }
+        try:
+            with os.scandir(root_descriptor) as entries:
+                result: list[_OrphanMaterialization] = []
+                for entry in entries:
+                    if entry.name == _STORE_IDENTITY_FILENAME:
+                        continue
+                    if entry.name.startswith(_PRESERVED_ENTRY_PREFIX):
+                        raise ValueError("preserved materialization requires manual recovery")
+                    if entry.name in referenced:
+                        continue
+                    result.append(
+                        _OrphanMaterialization(
+                            name=entry.name,
+                            identity=_private_file_identity(entry.stat(follow_symlinks=False)),
+                        )
+                    )
+                return sorted(result, key=lambda candidate: candidate.name)
+        except OSError as exc:
+            raise ValueError(
+                "context materialization root could not be enumerated safely"
+            ) from exc
+
+    def _verify_referenced_context_materializations(
+        self,
+        conn: sqlite3.Connection,
+        root_descriptor: int,
+    ) -> None:
+        rows = conn.execute(
+            "SELECT context_materializations.context_id, "
+            "context_materializations.registry_digest, "
+            "context_materializations.request_digest, "
+            "context_materializations.manifest_json, "
+            "contexts.request_json, contexts.response_json "
+            "FROM context_materializations "
+            "JOIN contexts USING (context_id) "
+            "ORDER BY context_materializations.context_id LIMIT ?",
+            (MAX_CONTEXT_MATERIALIZATION_RECOVERY_ROWS + 1,),
+        ).fetchall()
+        if len(rows) > MAX_CONTEXT_MATERIALIZATION_RECOVERY_ROWS:
+            raise ValueError("context materialization recovery exceeds its row limit")
+        if not rows:
+            return
+        materializer = self._context_materializer
+        if materializer is None:
+            raise ValueError("persisted materializations require a verified executable registry")
+        for row in rows:
+            manifest = self._materialized_context_from_row(row)
+            try:
+                request = ContextProjectionResolveRequest.model_validate_json(
+                    str(row["request_json"])
+                )
+                response = MaterializedContext.model_validate_json(str(row["response_json"]))
+            except (TypeError, ValueError) as exc:
+                raise ValueError("persisted materialized context snapshot is invalid") from exc
+            if canonical_digest(request) != manifest.request_digest or response != manifest:
+                raise ValueError("persisted materialized context snapshot is inconsistent")
+            materializer.verify_persisted_materialization(
+                manifest,
+                materialization_root_descriptor=root_descriptor,
+            )
+
+    @staticmethod
+    def _expected_context_snapshot_bytes(
+        conn: sqlite3.Connection,
+    ) -> dict[str, bytes]:
+        rows = conn.execute(
+            "SELECT context_id, request_json, response_json FROM contexts "
+            "ORDER BY context_id LIMIT ?",
+            (MAX_CONTEXT_SNAPSHOT_ENTRIES + 1,),
+        ).fetchall()
+        if len(rows) > MAX_CONTEXT_SNAPSHOT_ENTRIES:
+            raise ValueError("context snapshot recovery exceeds its row limit")
+        expected: dict[str, bytes] = {}
+        for row in rows:
+            context_id = str(row["context_id"])
+            try:
+                request_payload = json.loads(str(row["request_json"]))
+                response_payload = json.loads(str(row["response_json"]))
+            except ValueError as exc:
+                raise ValueError("persisted context snapshot JSON is invalid") from exc
+            if not isinstance(request_payload, dict) or not isinstance(response_payload, dict):
+                raise ValueError("persisted context snapshot payload is invalid")
+            expected[context_id] = _context_snapshot_bytes(
+                request_payload,
+                response_payload,
+            )
+        return expected
+
+    def _remove_orphan_context_materializations(
+        self,
+        candidates: list[_OrphanMaterialization],
+        root_descriptor: int,
+    ) -> None:
+        if not candidates:
+            return
+        mismatched: list[str] = []
+        for candidate in candidates:
+            result = _remove_materialized_entry_if_identity(
+                root_descriptor,
+                candidate.name,
+                candidate.identity,
+            )
+            if result == "mismatch":
+                mismatched.append(candidate.name)
+        if mismatched:
+            raise ValueError(
+                "orphan materialization identity changed during cleanup and was preserved"
+            )
 
     def _ensure_schema(self, conn: sqlite3.Connection) -> None:
         artifact_columns = {
-            str(row["name"])
-            for row in conn.execute("PRAGMA table_info(artifacts)").fetchall()
+            str(row["name"]) for row in conn.execute("PRAGMA table_info(artifacts)").fetchall()
         }
         if "staging_job_id" not in artifact_columns:
             conn.execute("ALTER TABLE artifacts ADD COLUMN staging_job_id TEXT")
@@ -1100,8 +1768,7 @@ class EvolutionStore:
             "ON artifacts(staging_job_id) WHERE staging_job_id IS NOT NULL"
         )
         job_columns = {
-            str(row["name"])
-            for row in conn.execute("PRAGMA table_info(jobs)").fetchall()
+            str(row["name"]) for row in conn.execute("PRAGMA table_info(jobs)").fetchall()
         }
         if "lease_duration_seconds" not in job_columns:
             conn.execute("ALTER TABLE jobs ADD COLUMN lease_duration_seconds INTEGER")
@@ -1210,9 +1877,7 @@ class EvolutionStore:
                 raise ValueError(
                     "review request cannot include both query_decision and query_decision_id"
                 )
-            inline_request = HumanQueryDecisionCreateRequest.model_validate(
-                inline_query_decision
-            )
+            inline_request = HumanQueryDecisionCreateRequest.model_validate(inline_query_decision)
             _validate_finite_floats(
                 inline_request.model_dump(mode="python"),
                 "query_decision",
@@ -1695,9 +2360,7 @@ class EvolutionStore:
                     raise ValueError(f"unknown review: {review_id}")
                 status = str(row["status"])
                 if status not in _STALEABLE_REVIEW_STATUSES:
-                    raise ValueError(
-                        f"cannot mark review {review_id} stale from status {status}"
-                    )
+                    raise ValueError(f"cannot mark review {review_id} stale from status {status}")
                 conn.execute(
                     """
                     UPDATE review_requests
@@ -1750,7 +2413,9 @@ class EvolutionStore:
                 if feedback_row is None:
                     raise ValueError(f"unknown feedback: {request.feedback_id}")
                 if feedback_row["status"] not in _CONSUMABLE_FEEDBACK_STATUSES:
-                    raise ValueError(f"feedback is not available for evolution: {request.feedback_id}")
+                    raise ValueError(
+                        f"feedback is not available for evolution: {request.feedback_id}"
+                    )
                 review_row = conn.execute(
                     """
                     SELECT status
@@ -2142,17 +2807,14 @@ class EvolutionStore:
                     raise ValueError(f"unknown artifact: {artifact_id}")
                 manifest_path = Path(str(row["manifest_path"]))
                 try:
-                    manifest_payload = json.loads(
-                        manifest_path.read_text(encoding="utf-8")
-                    )
+                    manifest_payload = json.loads(manifest_path.read_text(encoding="utf-8"))
                 except FileNotFoundError as exc:
                     raise ValueError(
                         f"artifact {artifact_id} manifest file is missing: {manifest_path}"
                     ) from exc
                 except json.JSONDecodeError as exc:
                     raise ValueError(
-                        f"artifact {artifact_id} manifest file is not valid JSON: "
-                        f"{manifest_path}"
+                        f"artifact {artifact_id} manifest file is not valid JSON: {manifest_path}"
                     ) from exc
                 if not isinstance(manifest_payload, dict):
                     raise ValueError(
@@ -2208,9 +2870,9 @@ class EvolutionStore:
             ordered_artifact_ids = tuple(sorted(artifact_ids))
             if not ordered_artifact_ids:
                 return []
-            artifact_clause = " AND artifact_id IN (" + ", ".join(
-                "?" for _ in ordered_artifact_ids
-            ) + ")"
+            artifact_clause = (
+                " AND artifact_id IN (" + ", ".join("?" for _ in ordered_artifact_ids) + ")"
+            )
             artifact_parameters = ordered_artifact_ids
         parameters: tuple[object, ...] = (
             str(ArtifactState.ACTIVE),
@@ -2261,9 +2923,7 @@ class EvolutionStore:
                     ),
                 ).fetchall()
                 if len(eligible_rows) > maximum:
-                    raise ValueError(
-                        "context projection exceeds the promoted candidate budget"
-                    )
+                    raise ValueError("context projection exceeds the promoted candidate budget")
                 remaining = maximum - len(eligible_rows)
                 skipped_rows = []
                 if remaining:
@@ -2325,23 +2985,14 @@ class EvolutionStore:
         _validate_finite_floats(raw_payload, "request")
         resolver = self._context_projection_resolver
         if resolver is None:
-            raise ValueError(
-                "context projection requires a verified executable registry"
-            )
+            raise ValueError("context projection requires a verified executable registry")
         registry = self._executable_registry
         if registry is None:  # Kept explicit for type narrowing and fail-closed wiring.
-            raise ValueError(
-                "context projection requires a verified executable registry"
-            )
-        requested_artifact_ids = requested_context_artifact_ids(
-            request.compatibility_facts()
-        )
+            raise ValueError("context projection requires a verified executable registry")
+        requested_artifact_ids = requested_context_artifact_ids(request.compatibility_facts())
         rows = self._promoted_artifact_rows(
             maximum=MAX_CONTEXT_PROJECTION_CANDIDATES,
-            artifact_types={
-                target.artifact_type
-                for target in registry.snapshot.targets.values()
-            },
+            artifact_types={target.artifact_type for target in registry.snapshot.targets.values()},
             artifact_ids=requested_artifact_ids,
         )
         for _ in range(MAX_CONTEXT_ID_ATTEMPTS):
@@ -2363,6 +3014,196 @@ class EvolutionStore:
                 return response
         raise RuntimeError("could not allocate unique context id")
 
+    def resolve_materialized_context(
+        self,
+        request: ContextProjectionResolveRequest,
+    ) -> MaterializedContext:
+        """Resolve and atomically materialize one registry-bound internal context."""
+
+        raw_payload = request.model_dump(mode="python")
+        _validate_finite_floats(raw_payload, "request")
+        resolver = self._context_projection_resolver
+        materializer = self._context_materializer
+        registry = self._executable_registry
+        if resolver is None or materializer is None or registry is None:
+            raise ValueError("materialized context requires a verified executable registry")
+        requested_artifact_ids = requested_context_artifact_ids(request.compatibility_facts())
+        rows = self._promoted_artifact_rows(
+            maximum=MAX_CONTEXT_PROJECTION_CANDIDATES,
+            artifact_types={target.artifact_type for target in registry.snapshot.targets.values()},
+            artifact_ids=requested_artifact_ids,
+        )
+        for _ in range(MAX_CONTEXT_ID_ATTEMPTS):
+            context_id = new_id("ctx")
+            response = resolver.resolve(
+                request,
+                rows,
+                context_id=context_id,
+            )
+            with self._locked_context_materialization_root() as materialization_root_fd:
+                with self.connect() as conn:
+                    self._verify_bound_store_identity(conn)
+                try:
+                    publication = materializer.materialize_for_publication(
+                        request,
+                        response,
+                        rows,
+                        materialization_root_descriptor=materialization_root_fd,
+                    )
+                except ValueError as exc:
+                    if str(exc) == "materialized context already exists":
+                        continue
+                    raise
+                result = publication.materialized_context
+
+                def verify_publication() -> None:
+                    self._verify_bound_materialization_root(materialization_root_fd)
+                    materializer.verify_publication(
+                        publication,
+                        materialization_root_descriptor=materialization_root_fd,
+                    )
+
+                try:
+                    self._verify_bound_materialization_root(materialization_root_fd)
+                    persisted = self._persist_context(
+                        context_id=context_id,
+                        request_payload=request.model_dump(mode="json"),
+                        response_payload=result.model_dump(mode="json"),
+                        selected_ids=list(result.selection.artifact_ids),
+                        materialization=result,
+                        precommit=verify_publication,
+                    )
+                except BaseException as exc:
+                    try:
+                        persistence_state = self._materialized_context_persistence_state(
+                            context_id,
+                            result,
+                        )
+                    except (OSError, sqlite3.Error, ValueError) as state_error:
+                        persistence_state = "unknown"
+                        exc.add_note(
+                            "materialized context persistence state could not be proven; "
+                            f"publication cleanup was skipped: {state_error}"
+                        )
+                    if persistence_state != "absent":
+                        exc.add_note(
+                            "materialized context publication cleanup was skipped after "
+                            f"persistence state {persistence_state!r}"
+                        )
+                        raise
+                    try:
+                        cleanup = materializer.discard_publication(
+                            publication,
+                            materialization_root_descriptor=materialization_root_fd,
+                        )
+                    except ValueError as cleanup_error:
+                        exc.add_note(f"materialized context cleanup failed: {cleanup_error}")
+                    else:
+                        if cleanup not in {"removed", "missing"}:
+                            exc.add_note(
+                                f"materialized context cleanup was safely deferred: {cleanup}"
+                            )
+                    raise
+                if persisted:
+                    return result
+                cleanup = materializer.discard_publication(
+                    publication,
+                    materialization_root_descriptor=materialization_root_fd,
+                )
+                if cleanup == "mismatch":
+                    raise ValueError(
+                        "materialized context path changed while resolving an ID collision"
+                    )
+        raise RuntimeError("could not allocate unique context id")
+
+    def _materialized_context_persistence_state(
+        self,
+        context_id: str,
+        materialization: MaterializedContext,
+    ) -> str:
+        expected_response = _json_dumps(materialization.model_dump(mode="json"))
+        expected_manifest = canonical_json(materialization)
+        with self.connect() as conn:
+            context_row = conn.execute(
+                "SELECT response_json FROM contexts WHERE context_id = ?",
+                (context_id,),
+            ).fetchone()
+            materialization_row = conn.execute(
+                "SELECT manifest_json FROM context_materializations WHERE context_id = ?",
+                (context_id,),
+            ).fetchone()
+        if context_row is None and materialization_row is None:
+            return "absent"
+        if (
+            context_row is not None
+            and materialization_row is not None
+            and str(context_row["response_json"]) == expected_response
+            and str(materialization_row["manifest_json"]) == expected_manifest
+        ):
+            return "committed"
+        return "unknown"
+
+    @contextmanager
+    def open_materialized_blob(
+        self,
+        context_id: str,
+        blob_id: str,
+    ) -> Iterator[MaterializedBlobLease]:
+        """Open one DB-authorized materialized blob through the bound store root."""
+
+        materializer = self._context_materializer
+        if materializer is None:
+            raise ValueError("materialized blob access requires a verified executable registry")
+        if self._bound_store_id is None:
+            raise ValueError("evolution store identity has not been initialized")
+        with self._locked_context_materialization_root() as materialization_root_fd:
+            with self.connect() as conn:
+                self._verify_bound_store_identity(conn)
+                row = conn.execute(
+                    "SELECT context_id, registry_digest, request_digest, manifest_json "
+                    "FROM context_materializations WHERE context_id = ?",
+                    (context_id,),
+                ).fetchone()
+            if row is None:
+                raise ValueError("materialized context is not persisted")
+            manifest = self._materialized_context_from_row(row)
+            if manifest.context_id != context_id:
+                raise ValueError("persisted materialized context identity is inconsistent")
+            try:
+                with materializer._open_blob(
+                    context_id,
+                    blob_id,
+                    expected_manifest=manifest,
+                    materialization_root_descriptor=materialization_root_fd,
+                ) as lease:
+                    yield lease
+            finally:
+                self._verify_bound_materialization_root(materialization_root_fd)
+                with self.connect() as conn:
+                    self._verify_bound_store_identity(conn)
+
+    @staticmethod
+    def _materialized_context_from_row(row: sqlite3.Row) -> MaterializedContext:
+        manifest_json = row["manifest_json"]
+        if (
+            not isinstance(manifest_json, str)
+            or len(manifest_json.encode("utf-8")) > MAX_CONTEXT_MANIFEST_BYTES
+        ):
+            raise ValueError("persisted materialized context manifest is invalid")
+        try:
+            manifest = MaterializedContext.model_validate_json(manifest_json)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("persisted materialized context manifest is invalid") from exc
+        if manifest_json != canonical_json(manifest):
+            raise ValueError("persisted materialized context manifest is not canonical")
+        if (
+            manifest.context_id != str(row["context_id"])
+            or manifest.registry_digest != str(row["registry_digest"])
+            or manifest.request_digest != str(row["request_digest"])
+        ):
+            raise ValueError("persisted materialized context identity is inconsistent")
+        return manifest
+
     def resolve_context(self, request: ContextResolveRequest) -> ContextResolveResponse:
         raw_payload = request.model_dump(mode="python")
         _validate_finite_floats(raw_payload, "request")
@@ -2371,8 +3212,7 @@ class EvolutionStore:
         rows = [
             row
             for row in self._promoted_artifact_rows()
-            if _artifact_id_allowed(row, requested_artifact_ids)
-            and artifact_matches(request, row)
+            if _artifact_id_allowed(row, requested_artifact_ids) and artifact_matches(request, row)
         ]
         rows = sort_candidates(rows)
 
@@ -2515,63 +3355,79 @@ class EvolutionStore:
         request_payload: dict[str, object],
         response_payload: dict[str, object],
         selected_ids: list[str],
+        materialization: MaterializedContext | None = None,
+        precommit: Callable[[], None] | None = None,
     ) -> bool:
         request_json = _json_dumps(request_payload)
         response_json = _json_dumps(response_payload)
         selected_ids_json = _json_dumps(selected_ids)
-        snapshot_path = self.files.context_snapshot_path(context_id)
-        snapshot_created = False
-        with self.connect() as conn:
-            try:
-                conn.execute("BEGIN IMMEDIATE")
-                existing = conn.execute(
-                    "SELECT 1 FROM contexts WHERE context_id = ?",
-                    (context_id,),
-                ).fetchone()
-                if existing is not None or snapshot_path.exists():
-                    conn.rollback()
-                    return False
-                conn.execute(
-                    """
-                    INSERT INTO contexts (
-                        context_id, created_at, request_json, response_json,
-                        selected_artifact_ids_json
-                    )
-                    VALUES (?, ?, ?, ?, ?)
-                    """,
-                    (
-                        context_id,
-                        utc_now_iso(),
-                        request_json,
-                        response_json,
-                        selected_ids_json,
-                    ),
-                )
+        snapshot_bytes = _context_snapshot_bytes(request_payload, response_payload)
+        with self._locked_context_materialization_root() as materialization_root_fd:
+            with self.connect() as conn:
                 try:
-                    _write_json_strict_exclusive(
-                        self.files,
-                        snapshot_path,
-                        {
-                            "request": request_payload,
-                            "response": response_payload,
-                        },
+                    conn.execute("BEGIN IMMEDIATE")
+                    self._verify_bound_store_identity(conn)
+                    existing = conn.execute(
+                        "SELECT 1 FROM contexts WHERE context_id = ?",
+                        (context_id,),
+                    ).fetchone()
+                    if existing is not None:
+                        conn.rollback()
+                        return False
+                    conn.execute(
+                        """
+                        INSERT INTO contexts (
+                            context_id, created_at, request_json, response_json,
+                            selected_artifact_ids_json
+                        )
+                        VALUES (?, ?, ?, ?, ?)
+                        """,
+                        (
+                            context_id,
+                            utc_now_iso(),
+                            request_json,
+                            response_json,
+                            selected_ids_json,
+                        ),
                     )
-                except FileExistsError:
-                    conn.rollback()
-                    return False
-                snapshot_created = True
-                conn.commit()
-            except Exception:
-                try:
-                    conn.rollback()
-                except sqlite3.Error:
-                    pass
-                if snapshot_created:
+                    if materialization is not None:
+                        conn.execute(
+                            """
+                            INSERT INTO context_materializations (
+                                context_id, created_at, registry_digest,
+                                request_digest, manifest_json
+                            )
+                            VALUES (?, ?, ?, ?, ?)
+                            """,
+                            (
+                                context_id,
+                                utc_now_iso(),
+                                materialization.registry_digest,
+                                materialization.request_digest,
+                                canonical_json(materialization),
+                            ),
+                        )
+                    with self._opened_bound_artifact_root() as artifact_root_fd:
+                        try:
+                            write_context_snapshot(
+                                artifact_root_fd,
+                                context_id,
+                                snapshot_bytes,
+                            )
+                        except FileExistsError:
+                            conn.rollback()
+                            return False
+                        self._verify_bound_store_identity(conn)
+                        if precommit is not None:
+                            precommit()
+                        self._verify_bound_materialization_root(materialization_root_fd)
+                        conn.commit()
+                except BaseException:
                     try:
-                        snapshot_path.unlink(missing_ok=True)
-                    except OSError:
+                        conn.rollback()
+                    except sqlite3.Error:
                         pass
-                raise
+                    raise
         return True
 
     def create_plan_bound_job(
@@ -2582,8 +3438,7 @@ class EvolutionStore:
     ) -> JobCreateResponse:
         self._bind_registry_snapshot(snapshot)
         artifact_ids_by_binding = {
-            binding.binding_id: list(binding.artifact_ids)
-            for binding in request.input_bindings
+            binding.binding_id: list(binding.artifact_ids) for binding in request.input_bindings
         }
         plan_json = canonical_json(request.plan)
         plan_digest = canonical_digest(request.plan)
@@ -2619,9 +3474,7 @@ class EvolutionStore:
                 config_json = _json_dumps(config)
                 envelope_json = canonical_json(materialized.envelope)
                 envelope_digest = canonical_digest(materialized.envelope)
-                output_types_json = _json_dumps(
-                    list(materialized.output_artifact_types)
-                )
+                output_types_json = _json_dumps(list(materialized.output_artifact_types))
                 existing_plan = conn.execute(
                     """
                     SELECT schema_version, registry_snapshot_digest, plan_digest, plan_json
@@ -2648,8 +3501,7 @@ class EvolutionStore:
                         ),
                     )
                 elif (
-                    str(existing_plan["schema_version"])
-                    != request.plan.schema_version
+                    str(existing_plan["schema_version"]) != request.plan.schema_version
                     or str(existing_plan["registry_snapshot_digest"])
                     != request.plan.registry_snapshot_digest
                     or str(existing_plan["plan_digest"]) != plan_digest
@@ -2675,9 +3527,7 @@ class EvolutionStore:
                         "declared_output_artifact_types_json": output_types_json,
                     }
                     if any(existing_job[key] != value for key, value in expected.items()):
-                        raise ValueError(
-                            "plan target is already bound to a different job request"
-                        )
+                        raise ValueError("plan target is already bound to a different job request")
                     conn.commit()
                     return JobCreateResponse(
                         job_id=str(existing_job["job_id"]),
@@ -2813,14 +3663,11 @@ class EvolutionStore:
             or canonical_json(plan) != str(plan_row["plan_json"])
             or plan_digest != str(plan_row["plan_digest"])
             or plan.schema_version != str(plan_row["schema_version"])
-            or plan.registry_snapshot_digest
-            != str(plan_row["registry_snapshot_digest"])
+            or plan.registry_snapshot_digest != str(plan_row["registry_snapshot_digest"])
         ):
             raise ValueError("persisted evolution plan identity is invalid")
         selections = tuple(
-            selection
-            for selection in plan.selections
-            if selection.target_id == row["target_id"]
+            selection for selection in plan.selections if selection.target_id == row["target_id"]
         )
         if len(selections) != 1:
             raise ValueError("plan-bound job target is not selected by its plan")
@@ -2871,10 +3718,7 @@ class EvolutionStore:
         if (
             len(input_artifacts) != len(input_artifact_ids)
             or tuple(input_artifact_ids) != envelope.input_artifact_ids()
-            or tuple(
-                worker_input_artifact_digest(artifact)
-                for artifact in input_artifacts
-            )
+            or tuple(worker_input_artifact_digest(artifact) for artifact in input_artifacts)
             != envelope.input_artifact_digests()
         ):
             raise ValueError("plan-bound job input artifact snapshots are invalid")
@@ -2902,17 +3746,13 @@ class EvolutionStore:
         base_where = "state = ?"
         base_params: list[object] = [str(JobState.PENDING)]
         if request.capabilities:
-            base_where += (
-                f" AND job_type IN ({','.join('?' for _ in request.capabilities)})"
-            )
+            base_where += f" AND job_type IN ({','.join('?' for _ in request.capabilities)})"
             base_params.extend(request.capabilities)
         if request.method_capabilities is not None:
             if not request.method_capabilities:
                 return WorkerClaimResponse(job=None)
             base_where += (
-                " AND method IN ("
-                + ",".join("?" for _ in request.method_capabilities)
-                + ")"
+                " AND method IN (" + ",".join("?" for _ in request.method_capabilities) + ")"
             )
             base_params.extend(request.method_capabilities)
 
@@ -2923,8 +3763,7 @@ class EvolutionStore:
             where += " AND plan_id IS NULL"
         elif method_identities:
             identity_terms = " OR ".join(
-                "(method = ? AND method_identity_digest = ?)"
-                for _ in method_identities
+                "(method = ? AND method_identity_digest = ?)" for _ in method_identities
             )
             where += f" AND (plan_id IS NULL OR ({identity_terms}))"
             for method_id, identity_digest in method_identities.items():
@@ -2966,24 +3805,17 @@ class EvolutionStore:
                     try:
                         validated = self._validate_plan_bound_job_contract(conn, row)
                     except (KeyError, TypeError, ValueError):
-                        manifest_paths.extend(
-                            self._quarantine_plan_bound_job(conn, row)
-                        )
+                        manifest_paths.extend(self._quarantine_plan_bound_job(conn, row))
                         conn.commit()
                         self._unlink_artifact_manifests(manifest_paths)
                         return WorkerClaimResponse(job=None)
                     input_artifacts = [
-                        artifact.model_dump(mode="json")
-                        for artifact in validated.input_artifacts
+                        artifact.model_dump(mode="json") for artifact in validated.input_artifacts
                     ]
                     config = validated.envelope.legacy_flat_config()
                     plan_payload = validated.plan.model_dump(mode="json")
-                    registry_snapshot_digest = (
-                        validated.plan.registry_snapshot_digest
-                    )
-                    execution_envelope_payload = validated.envelope.model_dump(
-                        mode="json"
-                    )
+                    registry_snapshot_digest = validated.plan.registry_snapshot_digest
+                    execution_envelope_payload = validated.envelope.model_dump(mode="json")
                 elif any(
                     row[column] is not None
                     for column in (
@@ -2996,9 +3828,7 @@ class EvolutionStore:
                 ):
                     raise ValueError("unplanned job contains partial plan identity")
                 else:
-                    input_artifact_ids = json.loads(
-                        str(row["input_artifact_ids_json"])
-                    )
+                    input_artifact_ids = json.loads(str(row["input_artifact_ids_json"]))
                     if not isinstance(input_artifact_ids, list) or any(
                         not isinstance(artifact_id, str) or not artifact_id
                         for artifact_id in input_artifact_ids
@@ -3027,9 +3857,7 @@ class EvolutionStore:
                         "registry_snapshot_digest": registry_snapshot_digest,
                         "method_identity_digest": row["method_identity_digest"],
                         "execution_envelope": execution_envelope_payload,
-                        "execution_envelope_digest": row[
-                            "execution_envelope_digest"
-                        ],
+                        "execution_envelope_digest": row["execution_envelope_digest"],
                     }
                 )
                 cursor = conn.execute(
@@ -3075,8 +3903,7 @@ class EvolutionStore:
         if not method_identities:
             return []
         identity_terms = " OR ".join(
-            "(method = ? AND method_identity_digest = ?)"
-            for _ in method_identities
+            "(method = ? AND method_identity_digest = ?)" for _ in method_identities
         )
         identity_params: list[object] = []
         for method_id, identity_digest in method_identities.items():
@@ -3135,9 +3962,7 @@ class EvolutionStore:
         keep_clause = ""
         params: list[object] = [str(ArtifactState.STAGED), job_id]
         if keep_ids:
-            keep_clause = " AND artifact_id NOT IN (%s)" % ",".join(
-                "?" for _ in keep_ids
-            )
+            keep_clause = " AND artifact_id NOT IN (%s)" % ",".join("?" for _ in keep_ids)
             params.extend(keep_ids)
         rows = conn.execute(
             f"""
@@ -3246,9 +4071,7 @@ class EvolutionStore:
     ) -> list[Path]:
         referenced_paths = set()
         for row in conn.execute("SELECT manifest_path FROM artifacts").fetchall():
-            managed_path = self._managed_artifact_manifest_path(
-                Path(str(row["manifest_path"]))
-            )
+            managed_path = self._managed_artifact_manifest_path(Path(str(row["manifest_path"])))
             if managed_path is not None:
                 referenced_paths.add(managed_path)
         return sorted(self._managed_artifact_manifests() - referenced_paths)
@@ -3277,9 +4100,7 @@ class EvolutionStore:
             lease_expires_at = _parse_utc_iso(str(row["lease_expires_at"]))
         except (TypeError, ValueError):
             return None
-        duration_seconds = math.ceil(
-            (lease_expires_at - updated_at).total_seconds()
-        )
+        duration_seconds = math.ceil((lease_expires_at - updated_at).total_seconds())
         return duration_seconds if duration_seconds >= 1 else None
 
     def _requeue_expired_jobs(
@@ -3414,19 +4235,10 @@ class EvolutionStore:
                 row = self._assert_job_lease(conn, job_id, request.lease_id)
                 lease_duration_seconds = row["lease_duration_seconds"]
                 if lease_duration_seconds is None:
-                    lease_duration_seconds = self._infer_legacy_lease_duration_seconds(
-                        row
-                    )
-                if (
-                    not isinstance(lease_duration_seconds, int)
-                    or lease_duration_seconds < 1
-                ):
-                    raise JobLeaseError(
-                        f"invalid lease duration for job: {job_id}"
-                    )
-                renewed_expires_at = datetime.now(UTC) + timedelta(
-                    seconds=lease_duration_seconds
-                )
+                    lease_duration_seconds = self._infer_legacy_lease_duration_seconds(row)
+                if not isinstance(lease_duration_seconds, int) or lease_duration_seconds < 1:
+                    raise JobLeaseError(f"invalid lease duration for job: {job_id}")
+                renewed_expires_at = datetime.now(UTC) + timedelta(seconds=lease_duration_seconds)
                 lease_expires_at = _utc_dt_to_iso(renewed_expires_at)
                 conn.execute(
                     """
@@ -3499,20 +4311,13 @@ class EvolutionStore:
                         "plan_digest": validated.envelope.plan_digest,
                         "target_id": validated.selection.target_id,
                         "method_id": validated.selection.method_id,
-                        "method_identity_digest": (
-                            validated.selection.method_identity_digest
-                        ),
+                        "method_identity_digest": (validated.selection.method_identity_digest),
                         "execution_envelope_digest": canonical_digest(envelope),
-                        "registry_snapshot_digest": (
-                            validated.plan.registry_snapshot_digest
-                        ),
+                        "registry_snapshot_digest": (validated.plan.registry_snapshot_digest),
                         "input_bindings": [
-                            binding.model_dump(mode="json")
-                            for binding in envelope.input_bindings
+                            binding.model_dump(mode="json") for binding in envelope.input_bindings
                         ],
-                        "declared_output_artifact_types": list(
-                            declared_output_types
-                        ),
+                        "declared_output_artifact_types": list(declared_output_types),
                     }
                 conn.rollback()
             except Exception:
@@ -3533,9 +4338,7 @@ class EvolutionStore:
                         **artifact_payload["lineage"],
                         "openevo_execution": store_owned_execution_lineage,
                     }
-                    artifact_request = ArtifactRegisterRequest.model_validate(
-                        artifact_payload
-                    )
+                    artifact_request = ArtifactRegisterRequest.model_validate(artifact_payload)
                 request_to_register = (
                     artifact_request.model_copy(update={"promoted": False})
                     if force_unpromoted_outputs
@@ -3560,13 +4363,9 @@ class EvolutionStore:
                             conn,
                             job_row,
                         )
-                        input_artifact_ids = list(
-                            final_validation.input_artifact_ids
-                        )
+                        input_artifact_ids = list(final_validation.input_artifact_ids)
                     else:
-                        input_artifact_ids = json.loads(
-                            str(job_row["input_artifact_ids_json"])
-                        )
+                        input_artifact_ids = json.loads(str(job_row["input_artifact_ids_json"]))
                         if not isinstance(input_artifact_ids, list):
                             raise ValueError("job input artifact IDs are invalid")
                     unique_input_artifact_ids = list(dict.fromkeys(input_artifact_ids))
@@ -3803,8 +4602,7 @@ class EvolutionStore:
                         (artifact_id, artifact_id),
                     ).fetchone()
                     job_reference = any(
-                        artifact_id
-                        in json.loads(str(row["input_artifact_ids_json"]))
+                        artifact_id in json.loads(str(row["input_artifact_ids_json"]))
                         for row in conn.execute(
                             "SELECT input_artifact_ids_json FROM jobs"
                         ).fetchall()
@@ -4149,6 +4947,7 @@ class EvolutionStore:
     def connect(self) -> Iterator[sqlite3.Connection]:
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON")
         try:
             yield conn
         finally:
@@ -4168,9 +4967,7 @@ def _artifact_id_allowed(
 def _artifact_response_from_row(row: sqlite3.Row) -> ArtifactResponse:
     manifest_path = Path(str(row["manifest_path"]))
     manifest_payload = json.loads(manifest_path.read_text(encoding="utf-8"))
-    manifest = (
-        manifest_payload.get("manifest") if isinstance(manifest_payload, dict) else {}
-    )
+    manifest = manifest_payload.get("manifest") if isinstance(manifest_payload, dict) else {}
     if not isinstance(manifest, dict):
         manifest = {}
     return ArtifactResponse(

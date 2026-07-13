@@ -37,6 +37,16 @@ OpenEvo Core 的核心目标是把 agent 运行过程稳定地转成可训练、
 Codex subscription 只是第一个落地 case，Claude Code、Gemini CLI、OpenHands 或其他
 harness 只要能提供稳定 transcript，都应能接入 pure-text evolution。
 
+所有 evolution/training 方法统一只在下一 task/session 生效。一个 task/session 从 admission
+到结束必须 pin 同一 context/model/adapter revision；task 完成后才封存 dataset、在 inference
+进程外运行 enabled methods，并把全部 target outputs、materialization 和必要 serving preparation
+作为一个 next revision 原子提交。下一 task 在该 revision 未完成时必须明确 queued/not-ready，
+不能静默使用 stale/partial revision。不要在 method descriptor 或 method config 中加入各自的
+online/offline timing、background/barrier 选择或 streaming/in-session ABI。方法差异继续通过
+input bindings、execution/capture/harness/runtime requirements、config 和 typed outputs 表达。
+这是产品目标 contract；当前 cross-session revision/admission/atomic activation 尚未实现，不能把
+内部 materializer 或现有 legacy Gateway path 描述为已经满足该 contract。
+
 ## 目录结构
 
 - `src/openevo/`: OpenEvo Core Backend package、Core-owned science/project config
@@ -58,13 +68,21 @@ harness 只要能提供稳定 transcript，都应能接入 pure-text evolution�
   artifacts 和 context resolver。
 - `src/openevo/evolution/artifact_payloads.py`: Core-owned `file://` payload scanner、
   ephemeral opaque handle 和 bounded verified text-read service；只允许 Core-managed
-  artifact root 内 link-count-one regular files/directories，并对一个 service 生命周期内
+  artifact root 内 link-count-one regular files/directories。Scanner 从绝对 filesystem anchor
+  逐组件 no-follow 固定并记录 allowed-root identity，持有稳定 root FD，并在每次操作前后复核
+  pathname 与 held FD binding；payload traversal 只相对该 FD 进行。它对一个 service 生命周期内
   所有 scan 和 verified-reread attempts 施加不可退回的累计 node/file/byte budget；失败
   snapshot/read 已经消耗的枚举与 hashing 资源同样计入。
 - `src/openevo/evolution/context_projection.py`: 内部 projection v1 resolver；只通过
   verified executable registry 调用 target handlers，并持久化 validated data-only
   contributions。它使用有元素与总 byte 上限的 strict closed agent/metadata contract，
   不持久化任意 env/secret 字段，也不是 legacy `/v1/contexts/resolve` 的公开兼容 response。
+- `src/openevo/evolution/context_materialization.py`: Core 内部 generic materializer；绑定同一
+  verified executable registry，把 validated contributions 流式复制为 private opaque-ID、
+  digest-verified blobs，解析 runtime env/instruction/adapter spec，并通过临时目录、fsync 和
+  rename 原子发布。
+  它不得按 target ID 分支，也不得在持久化 contract 中暴露 artifact URI、host path 或 opaque
+  scanner handle。
 - `src/openevo/experiments/`: experiment compiler/runner/promotion helpers。
 - `src/openevo/projects/science/`: ordinary-user science project config/compiler。
 - `src/openevo/deployment/`: remote deployment lifecycle、bootstrap、preflight、SSH transport。
@@ -334,9 +352,52 @@ Target handler 只能返回 data-only contributions。普通环境绑定必须�
 暴露 `harness_skills` 等 Core-resolved 公共根目录时使用 `scope_root` binding，并明确声明一个
 descriptor allowlisted destination scope。Handler 不得返回 host path、命令或自行解析 runtime
 root；payload scanner/materializer 才负责 no-follow 读取、digest 重验和原子 staging。
+Materializer 必须重新签发 staged/adapter payload inventory；每个 staged file 在复制时验证
+identity、size 和 digest，adapter inventory 必须完整重新 hash。Bundle 先作为 private 临时目录
+写入并 fsync，再原子发布；publication receipt 必须绑定 canonical manifest bytes、bundle/blob
+directory identity 和逐 blob identity，DB commit 前在同一个 locked root FD 下重新复核。DB
+持久化失败与启动恢复只能对已绑定 inode 做保守 discard/reconciliation：随机 quarantine 后清空
+可安全固定的内容并保留 quarantine/tombstone entry，不得声称 pathname 已立即删除。rename 后的
+最终路径校验失败不得按名称删除可能已被替换的目录，应留给启动恢复。数据库 store ID、
+resolved artifact root、artifact root marker 和 materialization-root marker 必须全部匹配；
+identity DDL 与 pending row 必须在同一 SQLite transaction
+创建，首次/legacy binding 使用可恢复的 pending -> 两个 marker fsync -> bound 协议，bound 状态
+缺少任一 marker 必须 fail closed。发布/DB commit/恢复清理共享跨进程锁。Blob transport/consumer
+只能通过 `EvolutionStore` 拥有的入口；该入口持有并复核同一个 locked materialization-root fd、
+store identity 双 marker、owner/mode/inode binding，从 SQLite
+`context_materializations.manifest_json` 读取权威 `MaterializedContext`，再把 expected manifest
+和 root fd 传给低层 materializer。磁盘 `manifest.json` 必须逐字节匹配 DB 中的 canonical
+manifest，不能通过同时修改 blob 和磁盘 manifest 自证。低层 reader 必须 no-follow 打开 blob，
+重验 size/digest/path identity，并且只暴露受控 read-only stream，不能暴露 raw fd 或 host path。
+公开 strict v2/Gateway 尚未切换前，内部 materializer 不能作为 legacy
+`/v1/contexts/resolve` 的 fallback 或 shadow response。
+Materialization root 必须 owner-verified 且 mode `0700`；publish、precommit、discard 和 recovery
+必须复用同一个 locked root fd。清理必须绑定首次观察到的 inode；随机 quarantine/tombstone 是
+保守处置而不是删除完成。Identity mismatch 应保留，且后续 recovery 持续 fail closed 直到明确
+处理。除 fresh/recognized pending bootstrap 外，Startup 只接受精确 allowlist 中的
+historical/current schema fingerprint，并独立精确校验 `store_identity` schema/row 和双 marker；
+只有 complete fingerprint 可认领已有 managed recovery state。伪造或 near-match identity 必须在
+任何 recovery cleanup 前失败且不清理。Fresh DB 不得认领已有 Core-managed recovery state；
+legacy DB 只有在任何 identity DDL/row 或 marker 写入前通过上述识别才可迁移，不能只按表名识别。
+最终 bundle 发布必须使用 FD-relative atomic no-replace rename，不能覆盖竞态同名目录；平台不支持
+该原语时 fail closed。临时目录初始化失败也只能按已打开 inode 保守 quarantine，不能 pathname
+删除。Base schema DDL、additive migrations 和 recovery DB changes 必须在同一个显式 SQLite
+transaction 内完成；历史 fingerprint 包含可直接升级的真实 first-parent 布局。Fresh DB 的 managed-state 检查必须同时覆盖 context
+snapshots、materializations 和 artifact manifests。DB commit 后或提交状态无法证明时不得 discard
+publication，只能保守保留并由后续 recovery 校验。Precommit callback 返回后和 locked root 正常
+退出时都必须再次复核 materialization-root binding。
+Context snapshot reconciliation 只在 startup 以 DB canonical bytes 授权；普通 read/inventory 始终
+要求 link-count-one `0600` regular
+file，较宽但安全的历史 mode 只能经显式 startup migration 收紧到 `0600`。Adapter 完整 inventory
+rehash 后必须重新绑定 payload-root pathname。
 当前 descriptor 必须分别声明 handler input v1、renderer v1 和 output/contribution v2，Core
 在 invocation 时逐项校验；output v2 的 adapter contribution 必须绑定 source payload digest
 和 byte size，不能把 v1 output 当作 v2 推断。
+需要在 runtime instruction 前保留固定 framing 的 target，应在 handler descriptor 的
+`instruction_preamble` 声明；materializer 按 projection 顺序使用该数据，禁止 Gateway 按
+target ID 拼接文案。Projection response 必须绑定 canonical request digest；materializer 必须复核。
+Instruction view 对每个 projection 的合并正文执行 legacy-compatible 首尾 whitespace trim，但
+staged artifact/blob 必须保留算法产出的原始 bytes。
 只有 source artifact IDs 和正文都完全相等的 instruction/file 投影才能去重；派生 target
 文件受两倍投影预算约束，所有文本投影总量受三倍预算约束。Text source MIME 必须满足
 descriptor allowlist；skill bundle 必须含根目录 `SKILL.md` 并保持 ranked/canonical renderer

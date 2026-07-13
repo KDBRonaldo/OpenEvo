@@ -1,7 +1,7 @@
 # OpenEvo Productization And External Beta Spec
 
 Status: canonical product and release specification
-Tracking issue: #131
+Tracking issues: #131, #154
 Target: unsigned macOS External Beta
 ## Purpose
 
@@ -34,6 +34,8 @@ command line or benchmark workflow.
   authoritative Core registry drives planning, worker dispatch, capabilities,
   and Desktop configuration; those consumers must not maintain method-specific
   branches or duplicate registries.
+- Evolution and training outputs take effect only in the next task/session. Each task pins one immutable context/model/adapter revision for its full lifetime; Core never mutates a running task's revision.
+- The next revision is one all-or-nothing Core commit across every enabled target, materialized context, and required serving change. A next task that requires that revision is explicitly queued or not ready until the commit succeeds; it never falls back to stale or partially activated state.
 - Preserve the proven OpenEvo Core architecture inherited from the legacy
   upstream: gateway, rollout, runtime,
   capture/trajectory, evolution backend, worker, artifact, context resolution,
@@ -97,8 +99,7 @@ After it is installed and started, Core owns:
   capability discovery;
 - datasets, evolution jobs, workers, artifacts, lineage, compatibility,
   promotion, and context resolution;
-- staging promoted memory, skills, and agent-system artifacts before a later
-  harness run;
+- sealing task datasets and atomically publishing promoted, materialized evolution outputs as the next task revision;
 - model download and vLLM lifecycle for the supported self-deployed profile;
 - typed status, capabilities, doctor, repair, artifact, log, and diagnostics
   APIs.
@@ -141,56 +142,58 @@ server and both use a real harness.
   interactive subscription authentication remains a Desktop-mediated user
   action.
 - Subscription mode does not claim token-level RL or parameter updates.
+- Subscription accepts only non-parametric methods whose declared execution, capture, harness, and runtime requirements are compatible with the active profile; incompatible enabled targets fail validation.
 
 ### Self-Deployed Reference
 
-- The release-supported reference profile uses
-  `Qwen/Qwen3-Coder-30B-A3B-Instruct` with a pinned model revision, vLLM
-  configuration, and hardware assumptions recorded in the shipped profile.
-- The canonical profile path is
-  `src/openevo/projects/science/profiles/self-deployed-reference-v1.json`. It is
-  a versioned lockfile, not user prose. It must pin the Hugging Face commit,
-  vLLM version and arguments, dtype/context length, host/port, GPU count and
-  minimum VRAM, disk/cache assumptions, startup/download timeouts, proxy/cache
-  behavior, health endpoint and expected served model, and compatible Core
-  version range.
-- Desktop may accept another Hugging Face model ID as an advanced best-effort
-  configuration, but it is not release-supported unless added to this spec and
-  the release test matrix.
-- Desktop/Core can configure HTTP/HTTPS proxy settings, install supported user
-  space dependencies, download model snapshots, start vLLM, and verify its
-  health.
-- Automatic repair stops before root-only system changes, driver installation,
-  license acceptance, unavailable credentials, or unsupported hardware. The UI
-  then reports the exact unresolved action.
-- The architecture must remain extensible to parametric evolution, but this
-  release does not design or validate new parametric methods.
+- The release-supported reference profile uses `Qwen/Qwen3-Coder-30B-A3B-Instruct` with a pinned model revision, vLLM configuration, and hardware assumptions recorded in the shipped profile.
+- The canonical profile path is `src/openevo/projects/science/profiles/self-deployed-reference-v1.json`. It is a versioned lockfile, not user prose. It must pin the Hugging Face commit, vLLM version and arguments, dtype/context length, host/port, GPU count and minimum VRAM, disk/cache assumptions, startup/download timeouts, proxy/cache behavior, health endpoint and expected served model, and compatible Core version range.
+- Desktop may accept another Hugging Face model ID as an advanced best-effort configuration, but it is not release-supported unless added to this spec and the release test matrix.
+- Desktop/Core can configure HTTP/HTTPS proxy settings, install supported user space dependencies, download model snapshots, start vLLM, and verify its health.
+- Automatic repair stops before root-only system changes, driver installation, license acceptance, unavailable credentials, or unsupported hardware. The UI then reports the exact unresolved action.
+- Self-deployed plans fail closed when an enabled method's trainer or serving requirements cannot be satisfied, including adapter load, serving restart, or health verification required for its next revision.
+- The architecture must remain extensible to parametric evolution, but this release does not design or validate new parametric methods.
 
 ## Evolution Contract
+
+This is the release target, not current status: strict v2 transport, Gateway generic staging, and cross-session revision activation remain unimplemented; the public Gateway path is legacy.
 
 Core converts harness execution into evolution inputs and typed artifacts:
 
 ```text
-session events or transcript
--> dataset artifact
--> evolution job and registered method
--> typed artifact
--> promotion and context resolution
--> staging before a later harness session
+task/session pinned to revision N
+-> completed task dataset sealed
+-> evolution/training jobs run outside inference
+-> all enabled target outputs staged and materialized
+-> required adapter load or serving restart passes health checks
+-> revision N+1 committed atomically
+-> next task/session admitted on revision N+1
 ```
 
 The release-supported non-parametric artifact families are:
 
 | Artifact | Required runtime behavior |
 | --- | --- |
-| `text_memory` | Stage a readable memory payload and expose it to the next harness instruction. |
-| `skill_bundle` | Stage a bundle containing `SKILL.md`; evolved skills take precedence over static skills. |
-| `agent_system` | Stage the canonical instruction payload and write only to an allowlisted harness instruction path. |
+| `text_memory` | Materialize a readable memory payload in the next revision and expose it to the next harness instruction. |
+| `skill_bundle` | Materialize a bundle containing `SKILL.md` in the next revision; evolved skills take precedence over static skills. |
+| `agent_system` | Materialize the canonical instruction payload in the next revision and write only to an allowlisted harness instruction path. |
 
 Artifacts retain source dataset/job lineage, compatibility, scores when
 produced by the method, promotion state, and payload integrity. Core and
 Desktop consume one artifact contract; Desktop must not hide drift through a
 separate adapter.
+
+### Task Revision And Activation
+
+Issue #154 defines one activation contract for every evolution and training method. Method latency and implementation differ, but activation timing does not:
+
+| Requirement | Contract |
+| --- | --- |
+| `REV-1 Task pinning` | Task admission resolves exactly one immutable context/model/adapter revision. Every inference request and retry in that task uses it; evolution, training, materialization, adapter loading, and serving lifecycle work cannot alter it. |
+| `REV-2 Sealed transition input` | Task completion seals the transition dataset. Evolution and training consume sealed inputs in workers outside the inference process. Parameter training may be long-running but cannot update an active task. |
+| `REV-3 Atomic next revision` | All enabled targets form one transition. Outputs remain staged until every output validates, context materialization completes, and required adapter load or serving restart passes health checks without disturbing active revision leases. Core then publishes one next revision atomically; failure publishes none. |
+| `REV-4 Admission barrier` | A next task that requires evolution is queued or gets typed not-ready until the revision commits. Failure is explicit; Core, Desktop, and automation cannot admit it on the previous revision or a subset of enabled outputs. |
+| `REV-5 Uniform method contract` | Update timing is not method config or descriptor metadata. There is no per-method online/offline timing, background-versus-barrier choice, or streaming/in-session ABI. Methods differ through ordered inputs, execution/capture/harness/runtime requirements, typed config, and output contracts. |
 
 Candidate generation, evaluation, and best-result selection belong to the
 evolution algorithm. This protected algorithm logic includes GEPA orchestration
@@ -228,12 +231,15 @@ document wording.
   methods, config fields, or incompatible modes fail validation; disabled
   unknown targets remain non-executable draft state. Project
   `agent_system.method=auto` is one narrow prior-dataset resolver, not a method
-  plugin or scheduler; plans/jobs store its concrete result.
+  plugin or scheduler; plans/jobs store its concrete result. Method descriptors
+  do not declare activation timing; every selection follows `REV-1` through
+  `REV-5`.
 - `PLUG-2 Registry and identity`: one startup-frozen Core registry is the only
   source for planning, dispatch, capabilities, lineage, and defaults. Every
   target, method, and target handler has an identity built from its canonical
   descriptor, immutable distribution digest/version, entry point, and contract
-  version, including an explicit legacy or context-plugin invocation ABI.
+  version, including an explicit legacy or context-plugin invocation ABI. Both
+  ABIs are whole-job worker contracts, not streaming or in-session update ABIs.
   `registry_snapshot_digest` hashes only identities reachable from the enabled
   selections. Release methods are loaded from the verified Core install;
   explicitly enabled research plugins bind their own immutable digest. Core
@@ -254,7 +260,9 @@ document wording.
   retains run-scoped `job_type` capabilities but also filters exact loaded method
   identity digests. Workers renew the existing lease while a method runs;
   deterministic registry/identity failures are non-retryable. Outputs remain
-  transiently invisible until artifact publication and job success commit together.
+  transiently invisible until artifact publication and job success commit
+  together, then remain unavailable to task admission until the complete
+  `REV-3` transition commits.
 - `PLUG-4 Safe target integration`: a target handler consumes the current
   resolver-ranked artifacts for one target without reranking and returns
   versioned data-only
@@ -345,10 +353,13 @@ configuration, are never installed automatically by Desktop, and are not
 claimed to be sandboxed by contract validation.
 
 The exact framework contract is `docs/architecture/evolution-framework.md`.
-A2.1 validates contracts only; current dispatch, store, capabilities, Desktop,
-and algorithm paths remain unchanged until their assigned A2 cutovers. The
-framework preserves the existing worker/job/artifact boundaries and OpenEvo
-data flow.
+A2.3 planning, verified dispatch, store identity, remote capabilities, and
+capability-driven Desktop configuration are implemented. The implemented A2.4
+slices add verified handlers, payload scanning, internal projection, and the
+generic Core materializer. Strict v2 transport, Gateway cutover,
+external-target E2E, and removal of the legacy target switches remain. These
+cutovers preserve the worker/job/artifact boundaries and protected algorithm
+behavior.
 
 ## Algorithm Preservation And Performance Gate
 
@@ -427,6 +438,8 @@ job, worker, artifact registration, context resolution, runtime injection, and
 harness execution. A direct call to a method function is useful for unit tests
 but is not release performance evidence.
 
+Benchmark automation decides when tasks are requested and therefore preserves benchmark-specific cadence. Each request still goes through Core task admission and the `REV-1` through `REV-5` contract; automation cannot activate artifacts, bypass queued/not-ready, or launch with a stale or partial revision.
+
 ## OpenEvo Desktop
 
 Desktop is a macOS application for scientists, not a developer dashboard or a
@@ -450,7 +463,8 @@ install DMG
 -> select memory, skill, and/or agent-system evolution
 -> start and monitor the run
 -> inspect transcripts, rounds, artifacts, lineage, and diffs
--> reuse promoted artifacts in a later run
+-> observe the next task queued while its required revision is prepared
+-> run the next task on the atomically committed revision
 -> export redacted diagnostics when needed
 ```
 
@@ -461,6 +475,7 @@ Desktop release requirements:
 - remote profile, proxy, workspace, model, and evolution configuration;
 - safe bootstrap progress with retry and user-action boundaries;
 - run list/detail, cancellation, retry, timeline, logs, and service health;
+- pinned revision, transition progress, and explicit queued/not-ready state for the next task;
 - memory preview/diff, skill bundle contents, agent-system diff, lineage, and
   promotion/reuse state;
 - long operations remain responsive and resumable after restart;
@@ -577,9 +592,9 @@ or screenshot. A prose-only signoff cannot replace a failed executable gate.
 | Gate | Release acceptance |
 | --- | --- |
 | Algorithm preservation | Protected method behavior is unchanged and all three pass@1 rescue thresholds pass. |
-| Core | Clean install starts a managed backend; both execution modes, run lifecycle, artifact resolution, injection, logs, doctor/repair, and typed errors pass integration tests. |
+| Core | Clean install starts a managed backend; both execution modes, pinned task revisions, atomic next-revision activation, queued/not-ready admission, run lifecycle, artifact resolution, injection, logs, doctor/repair, and typed errors pass integration tests. |
 | Desktop | A packaged DMG completes first-run, remote setup, a science workflow, monitoring, artifact inspection/reuse, restart recovery, and diagnostics export without CLI use. |
-| Science workflow | In both execution modes, each of `text_memory`, `skill_bundle`, and `agent_system` is produced, rendered, promoted, staged, and consumed by a follow-up run through Desktop and Core. |
+| Science workflow | In both execution modes, each of `text_memory`, `skill_bundle`, and `agent_system` is produced, rendered, promoted, materialized, atomically committed with all other enabled outputs, and consumed by a follow-up task through Desktop and Core. |
 | Product boundary | Core/Desktop packages contain no benchmark automation, public CLI/devkit surface, legacy product identity, or release-only development overrides. |
 | Security and privacy | Secret canary, local-bind/auth, diagnostics redaction, deletion containment, and no-default-telemetry checks pass. |
 | Repository and docs | Required docs exist, links work, examples match current behavior, and release claims are conservative. |
@@ -598,7 +613,8 @@ OpenEvo is External Beta ready only when:
 4. Textual memory, trajectory-to-skill, and agent-system performance gates meet
    12/21, 14/25, and 17/25 respectively with unchanged algorithm behavior.
 5. The complete three-artifact-by-two-mode science matrix demonstrably produces,
-   renders, promotes, stages, and consumes the selected artifacts in later runs.
+   renders, promotes, materializes, atomically commits, and consumes selected
+   artifacts in the next task without stale or partial revision fallback.
 6. Security, privacy, diagnostics, documentation, clean-install, packaged-DMG,
    and release-artifact checks pass on the release commit.
 7. The GitHub Release clearly identifies the build as unsigned External Beta
@@ -607,6 +623,7 @@ OpenEvo is External Beta ready only when:
 ## Out Of Scope
 
 - Designing or improving evolution algorithms.
+- Per-method activation timing, background-versus-barrier policy choices, or streaming/in-session evolution method ABIs.
 - Making unfinished parametric memory or OPSD methods release-blocking.
 - Supporting additional harnesses beyond Codex in this release.
 - A public CLI or Dev Kit product.
@@ -626,7 +643,7 @@ Any proposal to change the protected OpenEvo architecture or evolution
 algorithm is a separate research/architecture decision outside this goal and
 must not be bundled into release cleanup.
 
-Implementation work follows `implementation-plan.md`, issue #131, and the
+Implementation work follows `implementation-plan.md`, issues #131 and #154, and the
 repository process in `AGENTS.md`. Each substantial PR records focused tests,
 docs impact, and whether protected evolution behavior can be affected. Fresh
 independent reviews use `gpt-5.6-sol` with high reasoning at workstream and

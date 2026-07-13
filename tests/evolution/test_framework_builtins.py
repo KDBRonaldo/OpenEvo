@@ -173,19 +173,13 @@ def test_builtin_catalog_is_complete_frozen_and_has_expected_defaults(
     assert frozenset(snapshot.targets) == frozenset(TARGET_IDS)
     assert frozenset(snapshot.target_handlers) == frozenset(HANDLER_IDS)
     assert frozenset(snapshot.methods) == frozenset(METHOD_IDS)
-    assert {
-        descriptor.invocation_abi.value for descriptor in snapshot.methods.values()
-    } == {"legacy_worker_job_v1"}
+    assert {descriptor.invocation_abi.value for descriptor in snapshot.methods.values()} == {
+        "legacy_worker_job_v1"
+    }
 
-    assert snapshot.targets["text_memory"].default_method_id == (
-        "text_memory_expel_reflector"
-    )
-    assert snapshot.targets["skill_bundle"].default_method_id == (
-        "skill_bundle_reflector"
-    )
-    assert snapshot.targets["agent_system"].default_method_id == (
-        "agent_system_gepa_reflector"
-    )
+    assert snapshot.targets["text_memory"].default_method_id == ("text_memory_expel_reflector")
+    assert snapshot.targets["skill_bundle"].default_method_id == ("skill_bundle_reflector")
+    assert snapshot.targets["agent_system"].default_method_id == ("agent_system_gepa_reflector")
     auto_resolver = snapshot.targets["agent_system"].selection_resolvers
     assert len(auto_resolver) == 1
     assert auto_resolver[0].selection_value == "auto"
@@ -208,16 +202,12 @@ def test_builtin_descriptors_use_exact_method_target_and_handler_entry_points(
 ) -> None:
     for method_id, descriptor in snapshot.methods.items():
         assert descriptor.implementation_ref is not None
-        assert descriptor.implementation_ref.entry_point == (
-            f"{METHODS_MODULE}:{method_id}"
-        )
+        assert descriptor.implementation_ref.entry_point == (f"{METHODS_MODULE}:{method_id}")
 
     target_anchor_names: set[str] = set()
     for descriptor in snapshot.targets.values():
         assert descriptor.implementation_ref is not None
-        module_name, attribute_name = _entry_point_parts(
-            descriptor.implementation_ref.entry_point
-        )
+        module_name, attribute_name = _entry_point_parts(descriptor.implementation_ref.entry_point)
         assert module_name == BUILTINS_MODULE
         assert not attribute_name.startswith("_")
         assert callable(getattr(builtins, attribute_name))
@@ -229,13 +219,22 @@ def test_builtin_descriptors_use_exact_method_target_and_handler_entry_points(
         assert descriptor.input_contract_version == "1"
         assert descriptor.renderer_contract_version == "1"
         assert descriptor.contribution_contract_version == "2"
-        module_name, attribute_name = _entry_point_parts(
-            descriptor.implementation_ref.entry_point
+        expected_preambles = {
+            "agent_system_handler": (
+                "Use the following evolved agent system instructions for this task:"
+            ),
+            "text_memory_handler": ("Use the following long-term memory for this task:"),
+        }
+        assert descriptor.instruction_preamble == expected_preambles.get(
+            descriptor.id,
+            "",
         )
+        module_name, attribute_name = _entry_point_parts(descriptor.implementation_ref.entry_point)
         assert module_name == BUILTIN_HANDLERS_MODULE
         assert not attribute_name.startswith("_")
-        assert getattr(builtin_handlers, attribute_name) is (
-            builtin_handlers.BUILTIN_HANDLER_REGISTRY[descriptor.id]
+        assert (
+            getattr(builtin_handlers, attribute_name)
+            is (builtin_handlers.BUILTIN_HANDLER_REGISTRY[descriptor.id])
         )
         handler_names.add(attribute_name)
 
@@ -246,21 +245,18 @@ def test_builtin_descriptors_use_exact_method_target_and_handler_entry_points(
 def test_builtin_output_and_protected_method_contracts(
     snapshot: RegistrySnapshot,
 ) -> None:
-    assert "report" in snapshot.methods[
-        "agent_system_pareto_reflector"
-    ].output_artifact_types
-    assert "report" in snapshot.methods[
-        "agent_system_gepa_reflector"
-    ].output_artifact_types
+    assert "report" in snapshot.methods["agent_system_pareto_reflector"].output_artifact_types
+    assert "report" in snapshot.methods["agent_system_gepa_reflector"].output_artifact_types
     register_bindings = snapshot.methods["parametric_memory_register"].input_bindings
     assert [binding.binding_id for binding in register_bindings] == [
         "current_dataset",
         "prior_target_artifacts",
     ]
     assert register_bindings[0].min_count == 0
-    assert "constrained_trainer_contract" in snapshot.methods[
-        "parametric_memory_lora_sft"
-    ].runtime_requirements
+    assert (
+        "constrained_trainer_contract"
+        in snapshot.methods["parametric_memory_lora_sft"].runtime_requirements
+    )
 
     for method_id in PROTECTED_METHOD_IDS:
         descriptor = snapshot.methods[method_id]
@@ -360,9 +356,7 @@ def test_parametric_registration_explicitly_owns_base_model(
 ) -> None:
     assert tuple(
         injection.model_dump(mode="json")
-        for injection in snapshot.methods[
-            "parametric_memory_register"
-        ].project_config_injections
+        for injection in snapshot.methods["parametric_memory_register"].project_config_injections
     ) == ({"field_name": "base_model", "source": "agent_model"},)
 
 
@@ -423,9 +417,7 @@ def test_gepa_descriptor_and_legacy_adapter_keep_caller_dataset_order(
         target_id="agent_system",
         method_id="agent_system_gepa_reflector",
         method_identity_digest="c" * 64,
-        user_config={
-            "reflector_llm": {"model": "gpt-5.5", "provider": "codex_cli"}
-        },
+        user_config={"reflector_llm": {"model": "gpt-5.5", "provider": "codex_cli"}},
         core_config={},
         input_bindings=resolution.bindings,
         output_artifact_types=descriptor.output_artifact_types,
@@ -616,9 +608,7 @@ def test_verified_builtin_registry_loads_every_anchor_and_exact_method_handle(
 
     assert frozenset(loaded.method_handles) == frozenset(METHOD_IDS)
     assert frozenset(loaded.handler_handles) == frozenset(HANDLER_IDS)
-    assert loaded.distribution_attestations == {
-        verified.expectation.distribution_digest: verified
-    }
+    assert loaded.distribution_attestations == {verified.expectation.distribution_digest: verified}
     assert frozenset(loaded.descriptor_anchors) == frozenset(
         f"target:{target_id}" for target_id in TARGET_IDS
     )

@@ -581,11 +581,12 @@ artifacts deterministically, and returns the exact payloads that gateway runtime
 injection stages.
 
 Runtime cutover currently has two deliberately non-overlapping stages. The public
-`POST /v1/contexts/resolve` contract below remains the sole Gateway path until the
-generic materializer is ready. Separately, Core has an internal projection v1
+`POST /v1/contexts/resolve` contract below remains the sole Gateway path until strict
+v2 transport and Gateway can switch atomically. Separately, Core has an internal projection v1
 resolver that issues managed payload snapshots, invokes only handlers from the
 sealed executable registry, performs single-target and context-wide validation,
-and persists ordered `TargetHandlerOutput` values. That internal response contains
+and persists ordered `TargetHandlerOutput` values plus the canonical request digest.
+That internal response contains
 `registry_digest`, `destination_roots`, `projections`, and actual consumed-artifact
 selection; it contains no source URI, host path, opaque handle, or legacy
 `memory`/`skills` shadow fields. It is not a public API and has no client fallback.
@@ -597,7 +598,10 @@ DB record committed during registration, not the mutable legacy manifest file;
 legacy rows without that binding are quarantined with a bounded reason code and must
 be re-registered rather than silently backfilled;
 managed payload reads reject symlinks, multiply linked regular files, root escapes,
-and drift. Candidate counts are bounded before payload I/O. Manifest/scores are
+and drift. The scanner fixes the configured root from an absolute filesystem anchor
+one component at a time with no-follow opens, holds that verified root FD, and
+revalidates the held-FD/path binding around every relative traversal. Candidate
+counts are bounded before payload I/O. Manifest/scores are
 validated before scanning; compatibility/scores are bounded before filtering or
 ranking, and explicit artifact IDs are applied in the store query. Implicit selection
 reserves its bounded row budget for local manifest-bound candidates before bounded
@@ -611,8 +615,50 @@ carry the approved payload digest and size; typed skips never expose a rejected 
 or host path. Routing metadata outside the internal projection policy is quarantined
 without changing legacy artifact-registration acceptance. Semantically invalid promoted artifacts and handler/aggregate contract
 violations fail the entire projection instead of triggering an inferred subset.
-Materializer plus strict v2 client/Gateway switching must land atomically before v1
-is removed.
+The internal generic materializer binds the same sealed registry and request digests,
+reissues and verifies staged/adapter inventories, streams private random-ID,
+digest-verified blobs, resolves generic
+destination/env/instruction/adapter contributions, and publishes a fsync-backed bundle
+without source URIs, host paths, or scanner handles. Context and materialization rows
+are transactionally bound. The ephemeral publication receipt binds canonical manifest
+bytes, context/blob-directory identities, and every blob identity; the store revalidates
+that receipt under the same locked root FD immediately before DB commit. Publication and
+startup reconciliation share a cross-process root lock and require matching DB/root
+identity. Identity DDL and its pending row are created atomically; initial/legacy binding
+then uses a recoverable pending -> two redundant
+marker fsyncs -> bound protocol. A bound row with either marker missing fails closed.
+Post-rename verification failure leaves the unreferenced name for identity-bound startup
+recovery rather than deleting a potentially substituted directory.
+
+Blob transport and consumers may enter only through an `EvolutionStore`-owned API. It
+holds and revalidates the same locked materialization-root fd, both store-identity
+markers, and the owner/mode/inode root binding; loads the authoritative
+`MaterializedContext` from SQLite `context_materializations.manifest_json`; and passes
+that expected manifest plus the same root fd to the lower-level materializer. The disk
+`manifest.json` must byte-match the canonical DB manifest. Replacing a blob and rewriting
+the disk manifest therefore cannot self-authorize content. The lower-level reader opens
+the blob no-follow, revalidates size, digest, and path identity, and returns only a
+controlled read-only stream, never a raw fd or host path. Strict v2 metadata/blob
+transport plus Gateway switching must still land atomically before v1 is removed.
+The materialization root is owner-verified mode `0700`; publish, precommit verification,
+discard, and recovery reuse one locked fd. Orphan cleanup quarantines and rechecks the
+enumerated inode, clears only safely fixed content, and retains a maintenance-owned
+quarantine/tombstone entry; this is conservative containment, not proof of immediate
+deletion. Identity mismatch is preserved and fails closed. Beyond fresh or recognized
+pending bootstrap states, startup accepts only exact allowlisted historical/current schema
+fingerprints and independently validates the exact `store_identity` schema, row, and two
+markers; only a complete fingerprint may claim existing managed recovery state. A forged
+or near-match identity fails before cleanup and leaves managed state untouched. A fresh
+database cannot claim non-empty Core-managed recovery state. A legacy database may
+migrate it only after that recognition, before any identity DDL/row or marker is written;
+matching table names alone is not recognition.
+
+Context snapshot reconciliation is a startup-only, DB-authorized operation: SQLite
+supplies the canonical bytes for every referenced snapshot. Ordinary read and inventory
+remain strict link-count-one mode-`0600` operations. Historical owner-readable/writable,
+non-executable, non-group/other-writable modes are accepted only by the explicit startup
+migration that tightens them to `0600`; they are never accepted by the normal reader.
+Complete adapter verification finally rebinds the source-root path.
 
 ## Context Resolve Contract
 

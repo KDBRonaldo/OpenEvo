@@ -123,9 +123,7 @@ class VerifiedExecutableRegistry:
     _verification_seal: object = field(repr=False, compare=False)
 
     def __new__(cls, *_args: object, **_kwargs: object) -> VerifiedExecutableRegistry:
-        raise TypeError(
-            "VerifiedExecutableRegistry is issued only by a verified registry loader"
-        )
+        raise TypeError("VerifiedExecutableRegistry is issued only by a verified registry loader")
 
     def __post_init__(self) -> None:
         expected_methods = set(self.snapshot.methods)
@@ -148,27 +146,19 @@ class VerifiedExecutableRegistry:
             for identity in self.snapshot.identities.values()
         }
         if not expected_distribution_digests.issubset(attestations):
-            raise ValueError(
-                "registry implementation is missing a distribution attestation"
-            )
+            raise ValueError("registry implementation is missing a distribution attestation")
         if set(attestations) != expected_distribution_digests:
-            raise ValueError(
-                "distribution attestations do not match the frozen registry"
-            )
+            raise ValueError("distribution attestations do not match the frozen registry")
         for identity in self.snapshot.identities.values():
             implementation = identity.implementation
             attestation = attestations.get(implementation.distribution_digest)
             if attestation is None:
-                raise ValueError(
-                    "registry implementation is missing a distribution attestation"
-                )
+                raise ValueError("registry implementation is missing a distribution attestation")
             expectation = attestation.expectation
             if (
                 expectation.distribution != implementation.distribution
-                or expectation.distribution_version
-                != implementation.distribution_version
-                or expectation.distribution_digest
-                != implementation.distribution_digest
+                or expectation.distribution_version != implementation.distribution_version
+                or expectation.distribution_digest != implementation.distribution_digest
             ):
                 raise ValueError(
                     "registry implementation does not match its distribution attestation"
@@ -179,18 +169,11 @@ class VerifiedExecutableRegistry:
             for descriptor_id in self.snapshot.targets
         }
         if set(self.descriptor_anchors) != set(expected_anchors):
-            raise ValueError(
-                "descriptor anchors do not match the frozen target registry"
-            )
+            raise ValueError("descriptor anchors do not match the frozen target registry")
         for key, (kind, descriptor_id) in expected_anchors.items():
             anchor = self.descriptor_anchors[key]
-            if (
-                anchor.descriptor_kind is not kind
-                or anchor.descriptor_id != descriptor_id
-            ):
-                raise ValueError(
-                    "descriptor anchor identity does not match its registry key"
-                )
+            if anchor.descriptor_kind is not kind or anchor.descriptor_id != descriptor_id:
+                raise ValueError("descriptor anchor identity does not match its registry key")
 
         object.__setattr__(
             self,
@@ -246,9 +229,7 @@ def require_verified_executable_registry(
         type(registry) is not VerifiedExecutableRegistry
         or getattr(registry, "_verification_seal", None) is not _VERIFIED_REGISTRY_SEAL
     ):
-        raise TypeError(
-            "executable registry was not issued by a verified registry loader"
-        )
+        raise TypeError("executable registry was not issued by a verified registry loader")
     return registry
 
 
@@ -497,6 +478,7 @@ def _handler_descriptors(
             target_id="text_memory",
             artifact_types=("text_memory",),
             renderer_kind=RendererKind.MARKDOWN,
+            instruction_preamble=("Use the following long-term memory for this task:"),
             allowed_uri_schemes=("file",),
             allowed_media_types=("text/markdown", "text/plain"),
             allowed_destination_scopes=(DestinationScope.TARGET_DATA,),
@@ -507,9 +489,7 @@ def _handler_descriptors(
                 ContributionKind.ENVIRONMENT,
             ),
             exposure=Exposure.DESKTOP,
-            implementation_ref=identity.ref(
-                f"{_BUILTIN_HANDLERS_MODULE}:text_memory_handler"
-            ),
+            implementation_ref=identity.ref(f"{_BUILTIN_HANDLERS_MODULE}:text_memory_handler"),
         ),
         TargetHandlerDescriptor(
             id="skill_bundle_handler",
@@ -543,15 +523,16 @@ def _handler_descriptors(
                 ContributionKind.ENVIRONMENT,
             ),
             exposure=Exposure.DESKTOP,
-            implementation_ref=identity.ref(
-                f"{_BUILTIN_HANDLERS_MODULE}:skill_bundle_handler"
-            ),
+            implementation_ref=identity.ref(f"{_BUILTIN_HANDLERS_MODULE}:skill_bundle_handler"),
         ),
         TargetHandlerDescriptor(
             id="agent_system_handler",
             target_id="agent_system",
             artifact_types=("agent_system",),
             renderer_kind=RendererKind.MARKDOWN,
+            instruction_preamble=(
+                "Use the following evolved agent system instructions for this task:"
+            ),
             allowed_uri_schemes=("file",),
             allowed_media_types=("text/markdown", "text/plain"),
             allowed_destination_scopes=(
@@ -570,9 +551,7 @@ def _handler_descriptors(
                 ContributionKind.ENVIRONMENT,
             ),
             exposure=Exposure.DESKTOP,
-            implementation_ref=identity.ref(
-                f"{_BUILTIN_HANDLERS_MODULE}:agent_system_handler"
-            ),
+            implementation_ref=identity.ref(f"{_BUILTIN_HANDLERS_MODULE}:agent_system_handler"),
         ),
         TargetHandlerDescriptor(
             id="parametric_memory_handler",
@@ -886,9 +865,7 @@ def load_builtin_method_handles(
     if actual_descriptors != expected:
         missing = sorted(expected - actual_descriptors)
         extra = sorted(actual_descriptors - expected)
-        raise ValueError(
-            f"built-in method key mismatch; missing={missing!r}, extra={extra!r}"
-        )
+        raise ValueError(f"built-in method key mismatch; missing={missing!r}, extra={extra!r}")
 
     loaded_handles: dict[str, object] = {}
     for method_id in BUILTIN_METHOD_IDS:
@@ -901,9 +878,7 @@ def load_builtin_method_handles(
     if actual_registry != expected:
         missing = sorted(expected - actual_registry)
         extra = sorted(actual_registry - expected)
-        raise ValueError(
-            f"built-in method key mismatch; missing={missing!r}, extra={extra!r}"
-        )
+        raise ValueError(f"built-in method key mismatch; missing={missing!r}, extra={extra!r}")
 
     handles: dict[str, LegacyEvolutionMethod] = {}
     for method_id in BUILTIN_METHOD_IDS:
@@ -929,9 +904,7 @@ def load_builtin_handler_handles(
     if actual_registry != expected:
         missing = sorted(expected - actual_registry)
         extra = sorted(actual_registry - expected)
-        raise ValueError(
-            f"built-in handler key mismatch; missing={missing!r}, extra={extra!r}"
-        )
+        raise ValueError(f"built-in handler key mismatch; missing={missing!r}, extra={extra!r}")
 
     handles: dict[str, EvolutionTargetHandler] = {}
     for handler_id in sorted(expected):
@@ -939,9 +912,7 @@ def load_builtin_handler_handles(
         loaded = verified_loader(identity)
         expected_callable = builtin_handlers.BUILTIN_HANDLER_REGISTRY[handler_id]
         if loaded is not expected_callable:
-            raise ValueError(
-                f"built-in handler callable identity mismatch for {handler_id!r}"
-            )
+            raise ValueError(f"built-in handler callable identity mismatch for {handler_id!r}")
         handles[handler_id] = expected_callable
     return MappingProxyType(handles)
 
@@ -972,9 +943,7 @@ def load_verified_builtin_registry(
             expected_id=descriptor_id,
         )
         if not isinstance(loaded, DescriptorImplementationAnchor):
-            raise ValueError(
-                f"built-in descriptor anchor identity mismatch for {descriptor_id!r}"
-            )
+            raise ValueError(f"built-in descriptor anchor identity mismatch for {descriptor_id!r}")
         anchors[f"target:{descriptor_id}"] = loaded
 
     handler_handles = load_builtin_handler_handles(
@@ -994,9 +963,7 @@ def load_verified_builtin_registry(
             verified,
             expected_kind=DescriptorKind.METHOD,
             expected_id=implementation_identity.descriptor_id,
-            invocation_abi=snapshot.methods[
-                implementation_identity.descriptor_id
-            ].invocation_abi,
+            invocation_abi=snapshot.methods[implementation_identity.descriptor_id].invocation_abi,
         ),
     )
     return _publish_verified_executable_registry(

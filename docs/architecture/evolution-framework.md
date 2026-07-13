@@ -1,6 +1,6 @@
 # Pluggable Evolution Framework
 
-Status: A2.3 Core plus A2.4 Desktop config/preflight, executable handlers, payload scanner, and internal projection resolver implemented
+Status: A2.3 Core plus A2.4 Desktop config/preflight, executable handlers, payload scanner, internal projection, and generic Core materializer implemented
 
 Tracking: issues #137, #139, #141, #142, #144, #146, #148, and #150, productization step A2. A2.1
 implements contracts for `PLUG-1` through `PLUG-4`; A2.2 catalogs the existing
@@ -17,10 +17,22 @@ dataset snapshot, persists the resulting plan with each new experiment job,
 dispatches that job only through its verified method handle, and publishes
 capabilities from the same frozen registry. Artifact registration keeps its
 existing contract. The implemented A2.4 slice adds capability-driven Desktop
-selection/config editing, compiler-owned config injection, and registry-bound
-remote project preflight. Generic target-handler runtime cutover, context
-resolution, gateway injection, and removal of remaining target-specific runtime
-switches remain assigned to the unfinished A2.4/A2.5 work.
+selection/config editing, compiler-owned config injection, registry-bound remote
+project preflight, and a generic Core materializer for validated projections.
+Strict v2 transport, Gateway injection, external-target acceptance, and removal
+of remaining target-specific runtime switches remain assigned to unfinished
+A2.4/A2.5 work.
+
+Issue #154 defines one product-wide cross-session activation contract rather
+than per-method scheduling: every admitted task pins one immutable
+context/model/adapter revision; evolution and training consume the sealed
+completed-task dataset outside inference; all enabled target outputs and any
+required serving preparation become one all-or-nothing revision for the next
+task. No method descriptor or config selects online/offline timing,
+background/barrier behavior, or an in-session streaming ABI. This revision
+lifecycle is specified but not implemented by the current internal A2
+materializer; strict transport, Gateway cutover, admission, and atomic revision
+state remain subsequent work.
 
 ## Boundary
 
@@ -43,12 +55,13 @@ framework does not introduce a generic schedule engine, stage ledger, or score
 reranker. In particular, `agent_system_gepa_reflector` remains one method whose
 existing GEPA behavior is protected by equivalence and performance gates.
 
-The existing Core path remains authoritative:
+The existing Core evolution path remains authoritative through artifact publication:
 
 ```text
 session/task events -> dataset artifact -> existing evolution job and lease
   -> registered method -> ArtifactRegisterRequest -> existing artifact store
-  -> promotion/context resolve -> validated target handler -> gateway injection
+internal implemented path: promotion -> validated target handler -> generic materializer
+current public path: promotion -> legacy v1 context resolve -> legacy Gateway injection
 ```
 
 ## Registry And Identity
@@ -119,8 +132,9 @@ descriptors, and all twelve current legacy method callables. Target descriptors
 retain non-executable identity anchors. Handler descriptors point to the four
 pure callables in `builtin_handlers`; release loading verifies their exact wheel
 inventory, entry point, signature, identity, and distribution attestation before
-sealing them in `VerifiedExecutableRegistry.handler_handles`. This does not claim
-that the current resolver or Gateway runtime has cut over to invoking them.
+sealing them in `VerifiedExecutableRegistry.handler_handles`. The internal projection
+resolver invokes these verified handles; the public legacy resolver and Gateway runtime
+have not yet cut over.
 
 | Target | Default method | Exposure | Renderer |
 | --- | --- | --- | --- |
@@ -400,6 +414,12 @@ fixed envelope overhead, so an otherwise valid text projection cannot fail only
 because it is rendered. Payload bytes are streamed/verified by the later
 materializer rather than loaded as one in-memory value.
 
+An optional bounded `instruction_preamble` belongs to the handler descriptor identity.
+It preserves target-owned runtime framing without teaching the materializer or Gateway
+any target ID. The contribution text, renderer text, and staged payload remain the
+handler's evolved content; the generic materializer applies the preamble only when
+building the ordered runtime instruction prefix.
+
 - instruction contributions with source artifact IDs;
 - staged payloads referencing the verified inventory or bounded inline merged
   text, plus digest/MIME, destination scope, and safe relative destination;
@@ -457,10 +477,13 @@ A2.1 validates DTO inventory/digest consistency. Current A2.4 loads the built-in
 handlers as verified callables and implements the Core-owned local payload
 scanner in `openevo.evolution.artifact_payloads`. The scanner accepts only
 normalized authority-free `file://` URIs contained by the configured
-Core-managed artifact root. It traverses with directory-relative no-follow,
-nonblocking opens. On the current Linux Core release, `O_PATH|O_NOFOLLOW` first
-fixes and validates every untrusted node before Core obtains a readable fd from
-that fixed object, so a stat/open race cannot open a substituted device as data.
+Core-managed artifact root. Construction walks from the absolute filesystem anchor,
+fixes each configured root component no-follow, records its identity, and retains a
+verified root FD. Every operation revalidates the held-FD/path binding and traverses
+only relative to that FD with no-follow, nonblocking opens. On the current Linux Core
+release, `O_PATH|O_NOFOLLOW` first fixes and validates every untrusted node before Core
+obtains a readable fd from that fixed object, so a stat/open race cannot open a substituted
+device as data.
 The scanner rejects symlinks and non-regular/non-directory nodes; bounds all
 visited file/directory nodes before sorting; checks pre-open, opened, post-read,
 and final descendant path identities; streams bounded inventory digests; and
@@ -480,9 +503,10 @@ the macOS Desktop host because Core payload scanning runs on the remote server.
 An issued inventory is not an immutable copy or filesystem lease. The final
 descendant stability pass rejects mutation observed during scanning, but a
 source may change immediately afterward. Therefore inventory metadata alone
-never authorizes byte consumption: `read_utf8_prefix` and the future
-materializer must reopen the fixed object and revalidate identity, exact size,
-and digest. Drift fails closed; Core never returns or stages the changed bytes.
+never authorizes byte consumption: `read_utf8_prefix`, verified stream copy, and
+full payload content verification reopen the fixed object and revalidate identity,
+exact size, and digest. Drift fails closed; Core never returns or stages changed
+bytes.
 
 The scanner does not download or invent inventory for `hf`, `https`, or `s3`
 references, and it does not extract archives. The internal projection v1 resolver
@@ -528,14 +552,76 @@ semantics, invalid output, or context-wide conflicts fail the full projection. C
 does not invoke handlers speculatively per artifact to guess a valid subset, because
 that would change handler semantics and hide registry defects.
 
-This projection service is internal while materialization is unfinished. Public
-`/v1/contexts/resolve` and Gateway still use the legacy response, so there is no
-Gateway dual-parser or shadow response. The next cutover must materialize the same
-projection contract, repeat inventory identity/digest checks, enforce archive limits
-if extraction is added, and atomically switch a strict v2 client plus Gateway before
-removing v1. Until then, the legacy Gateway skill URI copy remains a documented
-TOCTOU risk. An inventory supplied by a handler is never proof that host bytes were
-staged safely.
+The internal generic materializer is bound to the same sealed registry digest as the
+projection and verifies the projection's canonical request digest. It reissues required
+staged/adapter inventories, streams each selected file into a private random-ID,
+digest-verified blob, rehashes complete adapter payloads, flattens
+directory contributions without extracting archives, and derives env/instruction/
+adapter values solely from validated contribution vocabulary. Handler descriptor
+`instruction_preamble` preserves existing framing without a target-ID switch; only the
+instruction view trims per-projection leading/trailing whitespace to match legacy Gateway,
+while staged bytes remain unchanged. The
+serialized result contains runtime destinations and opaque blob IDs, never source
+URIs, host paths, or scanner handles. A temp tree plus file/directory fsync and rename
+publishes each bundle atomically. Context and materialization metadata are committed
+together under the same cross-process lock used by startup recovery. An ephemeral
+publication receipt binds canonical manifest bytes, the context/blob-directory identities,
+and every blob identity; Store precommit revalidates it against the same locked root FD
+before SQLite commit. Final publication uses FD-relative atomic no-replace rename and fails
+closed where that primitive is unavailable. Failed persistence discards the receipt-bound
+bundle only after proving no DB row committed; committed or unknown state is preserved.
+Temporary-directory setup failures use the same inode-bound quarantine rule, and Store
+rechecks the materialization-root binding after the callback and on normal lock exit.
+If final-path rebinding fails after rename, cleanup leaves the
+unreferenced path for startup recovery instead of deleting a potentially substituted name.
+A mode-0700, owner-verified materialization root fd is locked once and passed through
+publish, precommit verification, rollback discard, and startup reconciliation. Cleanup
+binds the initially observed inode, moves a matching candidate to a random quarantine,
+clears only safely fixed content, and retains a maintenance-owned quarantine/tombstone
+entry. That is conservative containment, not immediate deletion. Identity mismatch is
+preserved and fails closed; later recovery keeps failing until the preserved entry is
+handled explicitly. Beyond fresh or recognized pending bootstrap states, startup recognizes
+only exact allowlisted historical/current schema fingerprints and independently requires
+the exact `store_identity` table/row and both markers; only a complete fingerprint may claim
+existing managed recovery state. Forged or near-match identity state fails before any
+cleanup and remains untouched. A fresh database refuses pre-existing Core-managed
+recovery state. A legacy database authorizes migration only after that recognition, before
+any identity DDL/row or marker is written; table-name presence alone is insufficient.
+A fresh database treats context snapshots, materializations, and managed artifact manifests
+as unclaimed state. Base schema DDL is one explicit SQLite transaction, and the exact
+historical allowlist includes directly upgradable first-parent layouts rather than requiring
+users to launch intermediate releases. Base DDL, additive migrations, and startup recovery
+DB changes commit in that same transaction, so no base-only schema can survive a crash.
+A DB store ID/resolved-root binding must match identical fsynced markers at the artifact
+root and materialization root before reconciliation quarantines unreferenced
+bundle/temp/symlink entries. Identity DDL and its first pending row are one SQLite
+transaction. Initial and legacy binding then uses a recoverable pending -> both markers
+fsync -> bound protocol; a bound row never recreates either missing marker.
+
+Context snapshot reconciliation is separately authorized by SQLite at startup: the store
+passes canonical request/response bytes for every referenced snapshot and fails if disk
+differs. Ordinary snapshot reads and inventories accept only link-count-one mode-`0600`
+regular files. A distinct startup migration may accept the narrowly safe historical mode
+set solely to tighten it to `0600`; normal reads never inherit that legacy allowance.
+
+Blob transport and consumers may enter only through an `EvolutionStore`-owned API. That
+entry holds and revalidates the same locked materialization-root fd, both store-identity
+markers, and the root owner/mode/inode binding. It loads the authoritative
+`MaterializedContext` from SQLite `context_materializations.manifest_json`, then passes
+that expected manifest and the same root fd to the lower-level materializer. The on-disk
+`manifest.json` must byte-match the authoritative canonical DB manifest, so replacing a
+blob and rewriting the disk manifest cannot self-authorize new content. The lower-level
+reader opens the blob no-follow relative to the anchored root, revalidates exact size,
+digest, and path identity, and exposes only a controlled read-only stream, never a raw fd
+or host path.
+Adapter final verification also rebinds the payload-root pathname after the complete
+inventory rehash, so an atomically replaced source root fails closed.
+
+This materializer remains an internal Core path. Public `/v1/contexts/resolve` and
+Gateway still use the legacy response, so there is no Gateway dual-parser or shadow
+response. The next cutover must add strict v2 metadata/blob transport and atomically
+switch Gateway generic staging before removing v1. Until then, the legacy Gateway
+skill URI copy remains a documented TOCTOU risk.
 The legacy resolver also retains its original subscription alias set; generalized
 `*_subscription` recognition is internal to projection execution-profile validation.
 Legacy artifact GET/list responses continue to read the legacy manifest file; the

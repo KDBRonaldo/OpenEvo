@@ -38,6 +38,7 @@ from openevo.evolution.framework.contracts import (
     MAX_RENDERER_PAYLOAD_BYTES,
     _Contract,
     _bounded_canonical_json_object,
+    canonical_digest,
     canonical_json,
     _digest,
     _stable_id,
@@ -57,9 +58,7 @@ MAX_CONTEXT_CANDIDATES_PER_TARGET = MAX_HANDLER_ARTIFACTS * 2
 MAX_ARTIFACT_ROUTING_JSON_BYTES = 16_384
 MAX_CONTEXT_ARTIFACT_NAME_BYTES = 16_384
 MAX_CONTEXT_ARTIFACT_URI_BYTES = 8_192
-MAX_CONTEXT_PROJECTION_REQUEST_BYTES = (
-    MAX_RENDERER_PAYLOAD_BYTES + MAX_CONTRACT_JSON_BYTES
-)
+MAX_CONTEXT_PROJECTION_REQUEST_BYTES = MAX_RENDERER_PAYLOAD_BYTES + MAX_CONTRACT_JSON_BYTES
 MAX_CONTEXT_ARTIFACT_ID_LENGTH = 256
 MAX_CONTEXT_TASK_TAG_LENGTH = 4096
 
@@ -83,17 +82,13 @@ def _projection_uses_subscription_auth(
     request: ContextCompatibilityRequest,
 ) -> bool:
     auth_mode = request_auth_mode(request)
-    return auth_mode == "subscription" or bool(
-        auth_mode and auth_mode.endswith("_subscription")
-    )
+    return auth_mode == "subscription" or bool(auth_mode and auth_mode.endswith("_subscription"))
 
 
 def _registered_artifact_manifest(row: Mapping[str, object]) -> dict[str, object]:
     encoded = row.get("manifest_json")
     if not isinstance(encoded, str) or not encoded:
-        raise _UnboundLegacyArtifact(
-            "artifact lacks immutable registered manifest metadata"
-        )
+        raise _UnboundLegacyArtifact("artifact lacks immutable registered manifest metadata")
     if len(encoded.encode("utf-8")) > MAX_CONTRACT_JSON_BYTES:
         raise _ProjectionMetadataRejected(
             "registered artifact manifest exceeds the projection limit"
@@ -276,9 +271,7 @@ class ContextProjectionResolveRequest(_ProjectionContract):
         ge=0,
         le=MAX_JAVASCRIPT_SAFE_INTEGER,
     )
-    metadata: ContextProjectionMetadata = Field(
-        default_factory=ContextProjectionMetadata
-    )
+    metadata: ContextProjectionMetadata = Field(default_factory=ContextProjectionMetadata)
     execution_profile: EvolutionExecutionProfile
     destination_roots: RuntimeDestinationRoots
     target_limits: dict[str, TargetConsumptionLimits] = Field(
@@ -395,9 +388,7 @@ class ContextProjectionSelection(_ProjectionContract):
     _artifact_ids = field_validator("artifact_ids")(
         lambda values: tuple(_text(value) for value in values)
     )
-    _reasons = field_validator("reasons")(
-        lambda values: tuple(_text(value) for value in values)
-    )
+    _reasons = field_validator("reasons")(lambda values: tuple(_text(value) for value in values))
 
     @model_validator(mode="after")
     def _unique_artifacts(self) -> ContextProjectionSelection:
@@ -418,6 +409,7 @@ class ContextProjectionSelection(_ProjectionContract):
 class ContextProjectionResolveResponse(_ProjectionContract):
     projection_contract_version: Literal["1"] = "1"
     context_id: str = Field(max_length=256)
+    request_digest: str
     registry_digest: str
     base_model: str | None = None
     destination_roots: RuntimeDestinationRoots
@@ -428,7 +420,7 @@ class ContextProjectionResolveResponse(_ProjectionContract):
     selection: ContextProjectionSelection
 
     _context = field_validator("context_id")(_stable_id)
-    _registry = field_validator("registry_digest")(_digest)
+    _digests = field_validator("request_digest", "registry_digest")(_digest)
 
     @field_validator("base_model")
     @classmethod
@@ -476,33 +468,28 @@ class ContextProjectionResolver:
         compatibility_facts = request.compatibility_facts()
         auth_mode = request_auth_mode(compatibility_facts)
         if auth_mode is not None:
-            declared_subscription = _projection_uses_subscription_auth(
-                compatibility_facts
-            )
+            declared_subscription = _projection_uses_subscription_auth(compatibility_facts)
             if declared_subscription != (
-                request.execution_profile.execution_mode
-                is ExecutionMode.SUBSCRIPTION
+                request.execution_profile.execution_mode is ExecutionMode.SUBSCRIPTION
             ):
-                raise ValueError(
-                    "context execution profile does not match agent auth mode"
-                )
+                raise ValueError("context execution profile does not match agent auth mode")
         agent_harness = request.agent.harness
         if agent_harness != request.execution_profile.harness_id:
-            raise ValueError(
-                "context execution profile does not match agent harness"
-            )
+            raise ValueError("context execution profile does not match agent harness")
         requested_ids = requested_context_artifact_ids(compatibility_facts)
         compatible_rows: list[dict[str, object]] = []
         pre_skipped_rows: list[dict[str, object]] = []
         pre_skipped_reasons: dict[str, str] = {}
         for row in promoted_rows:
-            if row.get("promoted") not in (True, 1) or str(
-                row.get("state") or ""
-            ) not in {"active", "experimental"}:
+            if row.get("promoted") not in (True, 1) or str(row.get("state") or "") not in {
+                "active",
+                "experimental",
+            }:
                 continue
-            if requested_ids is not None and str(
-                row.get("artifact_id") or ""
-            ) not in requested_ids:
+            if (
+                requested_ids is not None
+                and str(row.get("artifact_id") or "") not in requested_ids
+            ):
                 continue
             try:
                 compatibility_row = _validated_compatibility_row(row)
@@ -525,9 +512,7 @@ class ContextProjectionResolver:
                 pre_skipped_rows.append(skipped_row)
                 pre_skipped_reasons[artifact_id] = str(projected_skip_reason)
                 continue
-            if not isinstance(row.get("manifest_json"), str) or not row.get(
-                "manifest_json"
-            ):
+            if not isinstance(row.get("manifest_json"), str) or not row.get("manifest_json"):
                 skipped_row = compatibility_row
                 artifact_id = str(row.get("artifact_id") or "")
                 pre_skipped_rows.append(skipped_row)
@@ -554,9 +539,7 @@ class ContextProjectionResolver:
             services = TargetHandlerServices(payloads=payloads)
             for target in targets:
                 handler_descriptor = snapshot.target_handlers[target.handler_id]
-                contribution_kinds = set(
-                    handler_descriptor.allowed_contribution_kinds
-                )
+                contribution_kinds = set(handler_descriptor.allowed_contribution_kinds)
                 if (
                     request.execution_profile.execution_mode is ExecutionMode.SUBSCRIPTION
                     and ContributionKind.ADAPTER in contribution_kinds
@@ -603,9 +586,7 @@ class ContextProjectionResolver:
                         continue
                     payload_attempts += 1
                     if payload_attempts > MAX_CONTEXT_CANDIDATES_PER_TARGET:
-                        raise ValueError(
-                            "context target exceeds the payload attempt budget"
-                        )
+                        raise ValueError("context target exceeds the payload attempt budget")
                     try:
                         trusted_artifacts.append(
                             payloads.issue_snapshot(
@@ -643,9 +624,7 @@ class ContextProjectionResolver:
             projections = snapshot.validate_handler_outputs(pairs)
 
         consumed_ids = {
-            artifact_id
-            for projection in projections
-            for artifact_id in projection.artifact_ids
+            artifact_id for projection in projections for artifact_id in projection.artifact_ids
         }
         selection_ids = tuple(
             str(row["artifact_id"])
@@ -664,6 +643,7 @@ class ContextProjectionResolver:
         )
         return ContextProjectionResolveResponse(
             context_id=context_id,
+            request_digest=canonical_digest(request),
             registry_digest=snapshot.registry_digest,
             base_model=request.base_model,
             destination_roots=request.destination_roots,

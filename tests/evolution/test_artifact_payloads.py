@@ -10,7 +10,10 @@ from pathlib import Path
 import pytest
 
 from openevo.evolution import artifact_payloads
-from openevo.evolution.artifact_payloads import ArtifactPayloadService
+from openevo.evolution.artifact_payloads import (
+    ArtifactPayloadBudgetExceeded,
+    ArtifactPayloadService,
+)
 from openevo.evolution.framework import (
     MAX_CONTRACT_JSON_BYTES,
     canonical_json,
@@ -42,19 +45,23 @@ def test_file_snapshot_inventory_and_read(tmp_path: Path) -> None:
     with ArtifactPayloadService(tmp_path) as service:
         snapshot = _issue(service, payload)
 
-        assert [(entry.relative_path, entry.media_type, entry.size_bytes) for entry in snapshot.payload_entries] == [
-            ("memory.md", "text/markdown", 5)
-        ]
+        assert [
+            (entry.relative_path, entry.media_type, entry.size_bytes)
+            for entry in snapshot.payload_entries
+        ] == [("memory.md", "text/markdown", 5)]
         assert snapshot.payload_entries[0].sha256 == hashlib.sha256(b"hello").hexdigest()
         assert snapshot.payload_manifest_digest == payload_tree_digest(snapshot.payload_entries)
         assert snapshot.manifest_json == "{}"
         assert snapshot.scores_json == canonical_json({"quality": 0.75})
-        assert service.read_utf8_prefix(
-            snapshot.payload_handle,
-            "memory.md",
-            max_chars=100,
-            max_bytes=100,
-        ) == "hello"
+        assert (
+            service.read_utf8_prefix(
+                snapshot.payload_handle,
+                "memory.md",
+                max_chars=100,
+                max_bytes=100,
+            )
+            == "hello"
+        )
 
 
 def test_directory_inventory_is_recursive_canonical_and_has_deterministic_mime(
@@ -105,7 +112,9 @@ def test_inventory_mime_map_covers_builtin_handler_contract(tmp_path: Path) -> N
     with ArtifactPayloadService(tmp_path) as service:
         snapshot = _issue(service, payload)
 
-    assert {entry.relative_path: entry.media_type for entry in snapshot.payload_entries} == expected
+    assert {
+        entry.relative_path: entry.media_type for entry in snapshot.payload_entries
+    } == expected
 
 
 def test_file_content_path_reconstructs_payload_root(tmp_path: Path) -> None:
@@ -116,12 +125,15 @@ def test_file_content_path_reconstructs_payload_root(tmp_path: Path) -> None:
     with ArtifactPayloadService(tmp_path) as service:
         snapshot = _issue(service, payload, manifest={"content_path": "content/memory.md"})
         assert [entry.relative_path for entry in snapshot.payload_entries] == ["content/memory.md"]
-        assert service.read_utf8_prefix(
-            snapshot.payload_handle,
-            "content/memory.md",
-            max_chars=10,
-            max_bytes=10,
-        ) == "memory"
+        assert (
+            service.read_utf8_prefix(
+                snapshot.payload_handle,
+                "content/memory.md",
+                max_chars=10,
+                max_bytes=10,
+            )
+            == "memory"
+        )
 
 
 @pytest.mark.parametrize(
@@ -161,6 +173,240 @@ def test_issue_snapshot_rejects_payload_outside_allowed_root(tmp_path: Path) -> 
     with ArtifactPayloadService(allowed) as service:
         with pytest.raises(ValueError, match="allowed root"):
             _issue(service, outside)
+
+
+def test_allowed_root_initialization_rejects_restored_ancestor_race(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    container = tmp_path / "container"
+    allowed_ancestor = container / "ancestor"
+    allowed_root = allowed_ancestor / "root"
+    allowed_root.mkdir(parents=True)
+    (allowed_root / "payload.txt").write_text("safe", encoding="utf-8")
+
+    attacker_ancestor = container / "attacker"
+    attacker_root = attacker_ancestor / "root"
+    attacker_root.mkdir(parents=True)
+    secret = attacker_root / "payload.txt"
+    secret.write_text("outside secret", encoding="utf-8")
+    attacker_root_identity = (secret.parent.stat().st_dev, secret.parent.stat().st_ino)
+    displaced = container / "displaced"
+    restored_attacker = container / "restored-attacker"
+    original_open = artifact_payloads._open_at
+    original_open_verified = ArtifactPayloadService._open_verified_node
+    swapped = False
+    restored = False
+
+    def swap_in_attacker() -> None:
+        nonlocal swapped
+        allowed_ancestor.rename(displaced)
+        attacker_ancestor.rename(allowed_ancestor)
+        swapped = True
+
+    def restore_allowed_path() -> None:
+        nonlocal restored
+        allowed_ancestor.rename(restored_attacker)
+        displaced.rename(allowed_ancestor)
+        restored = True
+
+    def race_open(
+        path: str | os.PathLike[str],
+        flags: int,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        path_text = os.fspath(path)
+        if not swapped and path_text == os.fspath(allowed_root):
+            # Reproduces the former resolve-to-absolute-open window.
+            swap_in_attacker()
+            fd = original_open(path, flags, dir_fd=dir_fd)
+            restore_allowed_path()
+            return fd
+        fd = original_open(path, flags, dir_fd=dir_fd)
+        if (
+            swapped
+            and not restored
+            and path_text == "."
+            and dir_fd is not None
+            and (os.fstat(dir_fd).st_dev, os.fstat(dir_fd).st_ino) == attacker_root_identity
+        ):
+            restore_allowed_path()
+        return fd
+
+    def race_open_verified(
+        self: ArtifactPayloadService,
+        parent_fd: int,
+        name: str,
+        expected,
+        *,
+        directory: bool,
+    ) -> int:
+        fd = original_open_verified(
+            self,
+            parent_fd,
+            name,
+            expected,
+            directory=directory,
+        )
+        if not swapped and name == container.name:
+            # Swap after the stable parent FD has been acquired but before the
+            # next allowed-root component is inspected.
+            swap_in_attacker()
+        return fd
+
+    monkeypatch.setattr(artifact_payloads, "_open_at", race_open)
+    monkeypatch.setattr(
+        ArtifactPayloadService,
+        "_open_verified_node",
+        race_open_verified,
+    )
+
+    def construct_service() -> None:
+        service = ArtifactPayloadService(allowed_root)
+        service.close()
+
+    with pytest.raises(ValueError, match="allowed root|identity|drift|mutated"):
+        construct_service()
+
+    assert swapped and restored
+    assert (allowed_root / "payload.txt").read_text(encoding="utf-8") == "safe"
+    assert (restored_attacker / "root" / "payload.txt").read_text(encoding="utf-8") == (
+        "outside secret"
+    )
+
+
+@pytest.mark.parametrize("operation", ["snapshot", "read", "copy", "inventory"])
+def test_allowed_root_replacement_fails_closed_for_service_operations(
+    tmp_path: Path,
+    operation: str,
+) -> None:
+    container = tmp_path / "container"
+    allowed_ancestor = container / "ancestor"
+    allowed_root = allowed_ancestor / "root"
+    allowed_root.mkdir(parents=True)
+    payload = allowed_root / "payload.txt"
+    payload.write_text("safe", encoding="utf-8")
+
+    attacker_ancestor = container / "attacker"
+    attacker_root = attacker_ancestor / "root"
+    attacker_root.mkdir(parents=True)
+    (attacker_root / "payload.txt").write_text("outside secret", encoding="utf-8")
+    displaced = container / "displaced"
+    destination = container / "destination.txt"
+
+    with ArtifactPayloadService(allowed_root) as service:
+        snapshot = _issue(service, payload)
+        attempted_before = service._attempted_nodes
+        allowed_ancestor.rename(displaced)
+        attacker_ancestor.rename(allowed_ancestor)
+
+        def invoke() -> None:
+            if operation == "snapshot":
+                _issue(service, payload)
+            elif operation == "read":
+                service.read_utf8_prefix(
+                    snapshot.payload_handle,
+                    "payload.txt",
+                    max_chars=100,
+                    max_bytes=100,
+                )
+            elif operation == "copy":
+                with destination.open("wb") as output:
+                    service.copy_verified_file(
+                        snapshot.payload_handle,
+                        "payload.txt",
+                        output.fileno(),
+                    )
+            else:
+                service.verify_inventory_identity(snapshot.payload_handle)
+
+        with pytest.raises(ValueError, match="allowed root|identity|drift"):
+            invoke()
+        attempted_after_first_failure = service._attempted_nodes
+        assert attempted_after_first_failure > attempted_before
+
+        with pytest.raises(ValueError, match="allowed root|identity|drift"):
+            invoke()
+        assert service._attempted_nodes > attempted_after_first_failure
+
+    if destination.exists():
+        assert destination.read_bytes() != b"outside secret"
+
+
+@pytest.mark.parametrize(
+    ("operation", "private_method"),
+    [
+        ("snapshot", "_issue_snapshot"),
+        ("read", "_read_utf8_prefix"),
+        ("copy", "_copy_verified_file"),
+        ("inventory", "_verify_inventory_identity"),
+    ],
+)
+def test_allowed_root_replacement_during_operation_fails_postcheck(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+    private_method: str,
+) -> None:
+    container = tmp_path / "container"
+    allowed_ancestor = container / "ancestor"
+    allowed_root = allowed_ancestor / "root"
+    allowed_root.mkdir(parents=True)
+    payload = allowed_root / "payload.txt"
+    payload.write_text("safe", encoding="utf-8")
+
+    attacker_ancestor = container / "attacker"
+    attacker_root = attacker_ancestor / "root"
+    attacker_root.mkdir(parents=True)
+    (attacker_root / "payload.txt").write_text("outside secret", encoding="utf-8")
+    displaced = container / "displaced"
+    destination = container / "destination.txt"
+
+    with ArtifactPayloadService(allowed_root) as service:
+        snapshot = _issue(service, payload)
+        original_operation = getattr(ArtifactPayloadService, private_method)
+        replaced = False
+
+        def replace_after_operation(self: ArtifactPayloadService, *args, **kwargs):
+            nonlocal replaced
+            result = original_operation(self, *args, **kwargs)
+            if not replaced:
+                allowed_ancestor.rename(displaced)
+                attacker_ancestor.rename(allowed_ancestor)
+                replaced = True
+            return result
+
+        monkeypatch.setattr(
+            ArtifactPayloadService,
+            private_method,
+            replace_after_operation,
+        )
+
+        with pytest.raises(ValueError, match="allowed root|identity|drift"):
+            if operation == "snapshot":
+                _issue(service, payload)
+            elif operation == "read":
+                service.read_utf8_prefix(
+                    snapshot.payload_handle,
+                    "payload.txt",
+                    max_chars=100,
+                    max_bytes=100,
+                )
+            elif operation == "copy":
+                with destination.open("wb") as output:
+                    service.copy_verified_file(
+                        snapshot.payload_handle,
+                        "payload.txt",
+                        output.fileno(),
+                    )
+            else:
+                service.verify_inventory_identity(snapshot.payload_handle)
+
+        assert replaced
+
+    if destination.exists():
+        assert destination.read_bytes() == b"safe"
 
 
 def test_issue_snapshot_normalizes_missing_payload_to_validation_error(
@@ -246,9 +492,25 @@ def test_payload_node_budget_counts_empty_directories(
     monkeypatch.setattr(artifact_payloads, "_MAX_PAYLOAD_NODES", 3, raising=False)
 
     with ArtifactPayloadService(tmp_path) as service:
-        with pytest.raises(ValueError, match="nodes|entries"):
+        with pytest.raises(ValueError, match="nodes|entries|node budget"):
             _issue(service, bundle)
-        assert service._attempted_nodes == 4
+        assert service._attempted_nodes == 5
+
+
+def test_payload_node_budget_counts_ancestor_traversal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "root"
+    payload = root / "one" / "two" / "three" / "payload.txt"
+    payload.parent.mkdir(parents=True)
+    payload.write_text("payload", encoding="utf-8")
+    monkeypatch.setattr(artifact_payloads, "_MAX_PAYLOAD_NODES", 1, raising=False)
+
+    with ArtifactPayloadService(root) as service:
+        with pytest.raises(ArtifactPayloadBudgetExceeded, match="aggregate node budget"):
+            _issue(service, payload)
+        assert service._attempted_nodes == 3
 
 
 def test_payload_entry_and_total_byte_limits_are_enforced(
@@ -294,12 +556,15 @@ def test_verified_reread_consumes_aggregate_byte_budget(
 
     with ArtifactPayloadService(tmp_path) as service:
         snapshot = _issue(service, payload)
-        assert service.read_utf8_prefix(
-            snapshot.payload_handle,
-            "payload.txt",
-            max_chars=3,
-            max_bytes=3,
-        ) == "123"
+        assert (
+            service.read_utf8_prefix(
+                snapshot.payload_handle,
+                "payload.txt",
+                max_chars=3,
+                max_bytes=3,
+            )
+            == "123"
+        )
         assert service._attempted_bytes == 6
 
         with pytest.raises(
@@ -323,12 +588,15 @@ def test_verified_reread_consumes_node_and_file_attempt_budget(
 
     with ArtifactPayloadService(tmp_path) as service:
         snapshot = _issue(service, payload)
-        assert service.read_utf8_prefix(
-            snapshot.payload_handle,
-            "empty.txt",
-            max_chars=0,
-            max_bytes=0,
-        ) == ""
+        assert (
+            service.read_utf8_prefix(
+                snapshot.payload_handle,
+                "empty.txt",
+                max_chars=0,
+                max_bytes=0,
+            )
+            == ""
+        )
         assert service._attempted_files == 2
 
         with pytest.raises(
@@ -584,15 +852,24 @@ def test_read_clips_by_character_and_utf8_byte_boundaries(tmp_path: Path) -> Non
     payload.write_text("A界BC", encoding="utf-8")
     with ArtifactPayloadService(tmp_path) as service:
         snapshot = _issue(service, payload)
-        assert service.read_utf8_prefix(
-            snapshot.payload_handle, "payload.txt", max_chars=2, max_bytes=4
-        ) == "A界"
-        assert service.read_utf8_prefix(
-            snapshot.payload_handle, "payload.txt", max_chars=4, max_bytes=3
-        ) == "A"
-        assert service.read_utf8_prefix(
-            snapshot.payload_handle, "payload.txt", max_chars=0, max_bytes=0
-        ) == ""
+        assert (
+            service.read_utf8_prefix(
+                snapshot.payload_handle, "payload.txt", max_chars=2, max_bytes=4
+            )
+            == "A界"
+        )
+        assert (
+            service.read_utf8_prefix(
+                snapshot.payload_handle, "payload.txt", max_chars=4, max_bytes=3
+            )
+            == "A"
+        )
+        assert (
+            service.read_utf8_prefix(
+                snapshot.payload_handle, "payload.txt", max_chars=0, max_bytes=0
+            )
+            == ""
+        )
 
 
 def test_read_validates_invalid_utf8_after_prefix(tmp_path: Path) -> None:
@@ -643,7 +920,11 @@ def test_read_rejects_unknown_handle_path_and_invalid_limits(tmp_path: Path) -> 
             service.read_utf8_prefix(
                 snapshot.payload_handle, "missing.txt", max_chars=1, max_bytes=1
             )
-        for max_chars, max_bytes in ((-1, 1), (1, -1), (artifact_payloads.MAX_CONTRIBUTION_TEXT + 1, 1)):
+        for max_chars, max_bytes in (
+            (-1, 1),
+            (1, -1),
+            (artifact_payloads.MAX_CONTRIBUTION_TEXT + 1, 1),
+        ):
             with pytest.raises(ValueError, match="limits"):
                 service.read_utf8_prefix(
                     snapshot.payload_handle,
@@ -651,6 +932,418 @@ def test_read_rejects_unknown_handle_path_and_invalid_limits(tmp_path: Path) -> 
                     max_chars=max_chars,
                     max_bytes=max_bytes,
                 )
+
+
+def test_copy_verified_file_streams_content_and_returns_receipt(tmp_path: Path) -> None:
+    payload = tmp_path / "payload.bin"
+    payload.write_bytes(b"verified payload")
+    destination = tmp_path / "destination.bin"
+
+    with ArtifactPayloadService(tmp_path) as service, destination.open("wb") as output:
+        snapshot = _issue(service, payload)
+        receipt = service.copy_verified_file(
+            snapshot.payload_handle,
+            "payload.bin",
+            output.fileno(),
+        )
+
+    assert destination.read_bytes() == b"verified payload"
+    assert receipt.size_bytes == len(b"verified payload")
+    assert receipt.sha256 == hashlib.sha256(b"verified payload").hexdigest()
+
+
+def test_copy_verified_file_retries_partial_writes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    payload = tmp_path / "payload.bin"
+    payload.write_bytes(b"abcdefgh")
+    destination = tmp_path / "destination.bin"
+    original_write = artifact_payloads.os.write
+    write_sizes: list[int] = []
+
+    def partial_write(fd: int, data: bytes | memoryview) -> int:
+        limited = data[:2]
+        write_sizes.append(len(limited))
+        return original_write(fd, limited)
+
+    with ArtifactPayloadService(tmp_path) as service, destination.open("wb") as output:
+        snapshot = _issue(service, payload)
+        monkeypatch.setattr(artifact_payloads.os, "write", partial_write)
+        service.copy_verified_file(
+            snapshot.payload_handle,
+            "payload.bin",
+            output.fileno(),
+        )
+
+    assert destination.read_bytes() == b"abcdefgh"
+    assert len(write_sizes) > 1
+
+
+@pytest.mark.parametrize("mutation", ["same_size", "replacement"])
+def test_copy_verified_file_rejects_source_identity_drift(tmp_path: Path, mutation: str) -> None:
+    payload = tmp_path / "payload.bin"
+    payload.write_bytes(b"first")
+    destination = tmp_path / "destination.bin"
+
+    with ArtifactPayloadService(tmp_path) as service, destination.open("wb") as output:
+        snapshot = _issue(service, payload)
+        if mutation == "same_size":
+            payload.write_bytes(b"other")
+        else:
+            replacement = tmp_path / "replacement.bin"
+            replacement.write_bytes(b"first")
+            os.replace(replacement, payload)
+
+        with pytest.raises(ValueError, match="identity|digest|drift"):
+            service.copy_verified_file(
+                snapshot.payload_handle,
+                "payload.bin",
+                output.fileno(),
+            )
+
+
+def test_copy_verified_file_propagates_destination_write_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    payload = tmp_path / "payload.bin"
+    payload.write_bytes(b"payload")
+    destination = tmp_path / "destination.bin"
+
+    def fail_write(_fd: int, _data: bytes | memoryview) -> int:
+        raise OSError("injected destination failure")
+
+    with ArtifactPayloadService(tmp_path) as service, destination.open("wb") as output:
+        snapshot = _issue(service, payload)
+        monkeypatch.setattr(artifact_payloads.os, "write", fail_write)
+        with pytest.raises(OSError, match="injected destination failure"):
+            service.copy_verified_file(
+                snapshot.payload_handle,
+                "payload.bin",
+                output.fileno(),
+            )
+        assert service._attempted_bytes == len(b"payload") * 2
+
+
+@pytest.mark.parametrize("destination_state", ["nonempty", "offset", "hardlink"])
+def test_copy_verified_file_requires_fresh_private_destination(
+    tmp_path: Path,
+    destination_state: str,
+) -> None:
+    payload = tmp_path / "payload.bin"
+    payload.write_bytes(b"payload")
+    destination = tmp_path / "destination.bin"
+    destination.touch()
+    if destination_state == "nonempty":
+        destination.write_bytes(b"existing")
+    elif destination_state == "hardlink":
+        os.link(destination, tmp_path / "destination-alias.bin")
+
+    with ArtifactPayloadService(tmp_path) as service, destination.open("r+b") as output:
+        snapshot = _issue(service, payload)
+        if destination_state == "offset":
+            os.lseek(output.fileno(), 1, os.SEEK_SET)
+        with pytest.raises(ValueError, match="fresh private regular file"):
+            service.copy_verified_file(
+                snapshot.payload_handle,
+                "payload.bin",
+                output.fileno(),
+            )
+
+    assert destination.read_bytes() in {b"", b"existing"}
+
+
+@pytest.mark.parametrize("mutation", ["added", "deleted"])
+def test_verify_inventory_identity_rejects_directory_path_set_drift(
+    tmp_path: Path, mutation: str
+) -> None:
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    payload = bundle / "payload.txt"
+    payload.write_text("payload", encoding="utf-8")
+
+    with ArtifactPayloadService(tmp_path) as service:
+        snapshot = _issue(service, bundle)
+        if mutation == "added":
+            (bundle / "added.txt").write_text("added", encoding="utf-8")
+        else:
+            payload.unlink()
+
+        with pytest.raises(ValueError, match="inventory|path|drift"):
+            service.verify_inventory_identity(snapshot.payload_handle)
+
+
+def test_verify_inventory_identity_rejects_directory_root_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    (bundle / "payload.txt").write_text("payload", encoding="utf-8")
+    replacement = tmp_path / "replacement"
+    replacement.mkdir()
+    (replacement / "payload.txt").write_text("payload", encoding="utf-8")
+    displaced = tmp_path / "displaced"
+
+    with ArtifactPayloadService(tmp_path) as service:
+        snapshot = _issue(service, bundle)
+        attempted_nodes = service._attempted_nodes
+        attempted_files = service._attempted_files
+        original_enumerate = ArtifactPayloadService._enumerate_inventory_directory
+        original_close = artifact_payloads.os.close
+        root_fd: int | None = None
+        replaced = False
+
+        def capture_root_fd(
+            self: ArtifactPayloadService,
+            directory_fd: int,
+            prefix: tuple[str, ...],
+            directories,
+            files,
+            initial_identity,
+        ) -> None:
+            nonlocal root_fd
+            if not prefix:
+                root_fd = directory_fd
+            original_enumerate(
+                self,
+                directory_fd,
+                prefix,
+                directories,
+                files,
+                initial_identity,
+            )
+
+        def replace_when_root_fd_closes(fd: int) -> None:
+            nonlocal replaced
+            original_close(fd)
+            if fd == root_fd and not replaced:
+                bundle.rename(displaced)
+                replacement.rename(bundle)
+                replaced = True
+
+        monkeypatch.setattr(
+            ArtifactPayloadService,
+            "_enumerate_inventory_directory",
+            capture_root_fd,
+        )
+        monkeypatch.setattr(artifact_payloads.os, "close", replace_when_root_fd_closes)
+        with pytest.raises(ValueError, match="inventory|root|identity|drift"):
+            service.verify_inventory_identity(snapshot.payload_handle)
+
+        assert replaced
+        assert service._attempted_nodes == attempted_nodes + 5
+        assert service._attempted_files == attempted_files + 1
+
+
+def test_verify_inventory_identity_succeeds_without_reading_payload_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bundle = tmp_path / "bundle"
+    nested = bundle / "nested"
+    nested.mkdir(parents=True)
+    (nested / "payload.txt").write_text("payload", encoding="utf-8")
+
+    with ArtifactPayloadService(tmp_path) as service:
+        snapshot = _issue(service, bundle)
+        attempted_bytes = service._attempted_bytes
+
+        def unexpected_read(_fd: int):
+            raise AssertionError("inventory verification read payload bytes")
+            yield b""  # pragma: no cover
+
+        monkeypatch.setattr(artifact_payloads, "_stream_fd_chunks", unexpected_read)
+        service.verify_inventory_identity(snapshot.payload_handle)
+
+        assert service._attempted_bytes == attempted_bytes
+
+
+@pytest.mark.parametrize("mutation", ["replacement", "type"])
+def test_verify_inventory_identity_rejects_entry_identity_or_type_drift(
+    tmp_path: Path, mutation: str
+) -> None:
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    payload = bundle / "payload.txt"
+    payload.write_text("first", encoding="utf-8")
+
+    with ArtifactPayloadService(tmp_path) as service:
+        snapshot = _issue(service, bundle)
+        if mutation == "replacement":
+            replacement = bundle / "replacement.txt"
+            replacement.write_text("first", encoding="utf-8")
+            os.replace(replacement, payload)
+        else:
+            payload.unlink()
+            payload.mkdir()
+
+        with pytest.raises(ValueError, match="inventory|identity|type|drift"):
+            service.verify_inventory_identity(snapshot.payload_handle)
+
+
+@pytest.mark.parametrize("mutation", ["symlink", "hardlink"])
+def test_verify_inventory_identity_rejects_links(tmp_path: Path, mutation: str) -> None:
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    payload = bundle / "payload.txt"
+    payload.write_text("payload", encoding="utf-8")
+
+    with ArtifactPayloadService(tmp_path) as service:
+        snapshot = _issue(service, bundle)
+        if mutation == "symlink":
+            (bundle / "link.txt").symlink_to(payload)
+        else:
+            os.link(payload, tmp_path / "outside-bundle-link.txt")
+
+        with pytest.raises(ValueError, match="symlink|hard link|link count|inventory"):
+            service.verify_inventory_identity(snapshot.payload_handle)
+
+
+def test_verify_payload_content_rehashes_every_issued_file(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    bundle = root / "bundle"
+    bundle.mkdir(parents=True)
+    (bundle / "a.bin").write_bytes(b"a")
+    (bundle / "b.bin").write_bytes(b"bb")
+
+    with ArtifactPayloadService(root) as service:
+        snapshot = _issue(service, bundle)
+        service.verify_payload_content(snapshot.payload_handle)
+
+        (bundle / "b.bin").write_bytes(b"changed")
+        with pytest.raises(ValueError, match="digest|identity|drift"):
+            service.verify_payload_content(snapshot.payload_handle)
+
+
+def test_verify_payload_content_rejects_single_file_root_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    payload = tmp_path / "payload.bin"
+    payload.write_bytes(b"payload")
+    replacement = tmp_path / "replacement.bin"
+    replacement.write_bytes(b"payload")
+    displaced = tmp_path / "displaced.bin"
+
+    with ArtifactPayloadService(tmp_path) as service:
+        snapshot = _issue(service, payload)
+        attempted_nodes = service._attempted_nodes
+        attempted_files = service._attempted_files
+        attempted_bytes = service._attempted_bytes
+        original_verify = ArtifactPayloadService._verify_issued_file_content
+        original_open = ArtifactPayloadService._open_relative
+        armed = False
+        replaced = False
+
+        def arm_after_content_read(self: ArtifactPayloadService, *args) -> None:
+            nonlocal armed
+            original_verify(self, *args)
+            armed = True
+
+        def replace_after_root_open(self: ArtifactPayloadService, components: tuple[str, ...]):
+            nonlocal replaced
+            fd, identity = original_open(self, components)
+            if armed and not replaced:
+                payload.rename(displaced)
+                replacement.rename(payload)
+                replaced = True
+            return fd, identity
+
+        monkeypatch.setattr(
+            ArtifactPayloadService,
+            "_verify_issued_file_content",
+            arm_after_content_read,
+        )
+        monkeypatch.setattr(
+            ArtifactPayloadService,
+            "_open_relative",
+            replace_after_root_open,
+        )
+        with pytest.raises(ValueError, match="inventory|root|identity|drift"):
+            service.verify_payload_content(snapshot.payload_handle)
+
+        assert replaced
+        assert service._attempted_nodes == attempted_nodes + 6
+        assert service._attempted_files == attempted_files + 2
+        assert service._attempted_bytes == attempted_bytes + len(b"payload")
+
+
+def test_verify_payload_content_consumes_nonrefundable_byte_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    payload = root / "payload.bin"
+    payload.write_bytes(b"abc")
+    monkeypatch.setattr(artifact_payloads, "MAX_PAYLOAD_TOTAL_BYTES", 5)
+
+    with ArtifactPayloadService(root) as service:
+        snapshot = _issue(service, payload)
+        with pytest.raises(ArtifactPayloadBudgetExceeded, match="aggregate total bytes"):
+            service.verify_payload_content(snapshot.payload_handle)
+
+        with pytest.raises(ArtifactPayloadBudgetExceeded, match="aggregate total bytes"):
+            service.verify_inventory_identity(snapshot.payload_handle)
+
+
+def test_verified_materialization_primitives_consume_aggregate_budgets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    payload = tmp_path / "payload.bin"
+    payload.write_bytes(b"123")
+    destination = tmp_path / "destination.bin"
+    monkeypatch.setattr(artifact_payloads, "MAX_PAYLOAD_TOTAL_BYTES", 5)
+
+    with ArtifactPayloadService(tmp_path) as service, destination.open("wb") as output:
+        snapshot = _issue(service, payload)
+        with pytest.raises(
+            artifact_payloads.ArtifactPayloadBudgetExceeded,
+            match="aggregate total bytes",
+        ):
+            service.copy_verified_file(
+                snapshot.payload_handle,
+                "payload.bin",
+                output.fileno(),
+            )
+        assert service._attempted_bytes == 6
+
+    monkeypatch.setattr(artifact_payloads, "MAX_PAYLOAD_TOTAL_BYTES", 10)
+    monkeypatch.setattr(artifact_payloads, "MAX_PAYLOAD_ENTRIES", 1)
+    with ArtifactPayloadService(tmp_path) as service:
+        snapshot = _issue(service, payload)
+        with pytest.raises(
+            artifact_payloads.ArtifactPayloadBudgetExceeded,
+            match="aggregate entries",
+        ):
+            service.verify_inventory_identity(snapshot.payload_handle)
+        assert service._attempted_files == 2
+
+
+def test_materialization_primitives_reject_invalid_inputs_and_closed_service(
+    tmp_path: Path,
+) -> None:
+    payload = tmp_path / "payload.bin"
+    payload.write_bytes(b"payload")
+    destination = tmp_path / "destination.bin"
+    service = ArtifactPayloadService(tmp_path)
+    snapshot = _issue(service, payload)
+
+    with destination.open("wb") as output:
+        with pytest.raises(ValueError, match="handle"):
+            service.copy_verified_file("payload-unknown", "payload.bin", output.fileno())
+        with pytest.raises(ValueError, match="path"):
+            service.copy_verified_file(snapshot.payload_handle, "../payload.bin", output.fileno())
+        with pytest.raises(ValueError, match="destination"):
+            service.copy_verified_file(snapshot.payload_handle, "payload.bin", -1)
+        with pytest.raises(ValueError, match="handle"):
+            service.verify_inventory_identity("payload-unknown")
+
+    service.close()
+    with pytest.raises(RuntimeError, match="closed"):
+        service.verify_inventory_identity(snapshot.payload_handle)
+    with destination.open("wb") as output, pytest.raises(RuntimeError, match="closed"):
+        service.copy_verified_file(
+            snapshot.payload_handle,
+            "payload.bin",
+            output.fileno(),
+        )
 
 
 def test_close_invalidates_handles_and_service(tmp_path: Path) -> None:
@@ -662,9 +1355,7 @@ def test_close_invalidates_handles_and_service(tmp_path: Path) -> None:
     service.close()
 
     with pytest.raises(RuntimeError, match="closed"):
-        service.read_utf8_prefix(
-            snapshot.payload_handle, "payload.txt", max_chars=1, max_bytes=1
-        )
+        service.read_utf8_prefix(snapshot.payload_handle, "payload.txt", max_chars=1, max_bytes=1)
     with pytest.raises(RuntimeError, match="closed"):
         _issue(service, payload)
 
@@ -682,12 +1373,15 @@ def test_handle_collision_never_rebinds_existing_payload(
         snapshot = _issue(service, first)
         with pytest.raises(RuntimeError, match="unique payload handle"):
             _issue(service, second)
-        assert service.read_utf8_prefix(
-            snapshot.payload_handle,
-            "first.txt",
-            max_chars=10,
-            max_bytes=10,
-        ) == "first"
+        assert (
+            service.read_utf8_prefix(
+                snapshot.payload_handle,
+                "first.txt",
+                max_chars=10,
+                max_bytes=10,
+            )
+            == "first"
+        )
 
 
 def test_concurrent_handle_collision_is_atomic(
@@ -714,9 +1408,10 @@ def test_concurrent_handle_collision_is_atomic(
         "_allocate_handle",
         synchronize_after_allocation,
     )
-    with ArtifactPayloadService(tmp_path) as service, ThreadPoolExecutor(
-        max_workers=2
-    ) as executor:
+    with (
+        ArtifactPayloadService(tmp_path) as service,
+        ThreadPoolExecutor(max_workers=2) as executor,
+    ):
         futures = [executor.submit(_issue, service, path) for path in (first, second)]
         results = []
         errors = []
