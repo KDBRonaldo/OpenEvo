@@ -3,12 +3,19 @@ from __future__ import annotations
 import json
 import math
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 from urllib.parse import unquote, urlparse
 
-from openevo.evolution.models import ArtifactType, ContextResolveRequest
+from openevo.evolution.models import ArtifactType
+
 
 _SUBSCRIPTION_AUTH_MODES = {"subscription", "chatgpt_subscription"}
+
+
+class ContextCompatibilityRequest(Protocol):
+    agent: dict[str, Any]
+    base_model: str | None
+    metadata: dict[str, Any]
 
 
 def _json_object(value: object) -> dict[str, Any]:
@@ -60,7 +67,7 @@ def _normalized_text(value: object) -> str | None:
     return normalized or None
 
 
-def request_auth_mode(request: ContextResolveRequest) -> str | None:
+def request_auth_mode(request: ContextCompatibilityRequest) -> str | None:
     settings = request.agent.get("settings")
     if isinstance(settings, dict):
         value = _normalized_text(settings.get("auth_mode"))
@@ -82,11 +89,13 @@ def request_auth_mode(request: ContextResolveRequest) -> str | None:
     return None
 
 
-def request_uses_subscription_auth(request: ContextResolveRequest) -> bool:
+def request_uses_subscription_auth(request: ContextCompatibilityRequest) -> bool:
     return request_auth_mode(request) in _SUBSCRIPTION_AUTH_MODES
 
 
-def requested_context_artifact_ids(request: ContextResolveRequest) -> set[str] | None:
+def requested_context_artifact_ids(
+    request: ContextCompatibilityRequest,
+) -> set[str] | None:
     evolution_metadata = request.metadata.get("evolution")
     if not isinstance(evolution_metadata, dict):
         return None
@@ -99,7 +108,10 @@ def requested_context_artifact_ids(request: ContextResolveRequest) -> set[str] |
     return {value for value in values if value}
 
 
-def artifact_matches(request: ContextResolveRequest, row: dict[str, object]) -> bool:
+def artifact_matches(
+    request: ContextCompatibilityRequest,
+    row: dict[str, object],
+) -> bool:
     compatibility = _compatibility_object(row.get("compatibility_json"))
     if compatibility is None:
         return False
@@ -193,3 +205,7 @@ def artifact_manifest(row: dict[str, object]) -> dict[str, Any]:
     if not isinstance(manifest, dict):
         return {}
     return manifest
+
+
+def artifact_scores(row: dict[str, object]) -> dict[str, Any]:
+    return _json_object(row.get("scores_json"))

@@ -23,6 +23,15 @@ from openevo.evolution.context import (
     request_uses_subscription_auth,
     sort_candidates,
 )
+from openevo.evolution.context_projection import (
+    MAX_ARTIFACT_ROUTING_JSON_BYTES,
+    MAX_CONTEXT_ARTIFACT_NAME_BYTES,
+    MAX_CONTEXT_ARTIFACT_URI_BYTES,
+    MAX_CONTEXT_PROJECTION_CANDIDATES,
+    ContextProjectionResolveRequest,
+    ContextProjectionResolveResponse,
+    ContextProjectionResolver,
+)
 from openevo.evolution.files import ARTIFACT_TYPE_DIRECTORIES, ArtifactFileStore
 from openevo.evolution.ids import new_id
 from openevo.evolution.models import (
@@ -68,7 +77,15 @@ from openevo.evolution.planned_jobs import (
     validate_plan_against_snapshot,
 )
 from openevo.evolution.time import utc_now_iso
-from openevo.evolution.framework.contracts import canonical_digest, canonical_json
+from openevo.evolution.framework.contracts import (
+    MAX_CONTRACT_JSON_BYTES,
+    canonical_digest,
+    canonical_json,
+)
+from openevo.evolution.framework.builtins import (
+    VerifiedExecutableRegistry,
+    require_verified_executable_registry,
+)
 from openevo.evolution.framework.execution import (
     MethodExecutionEnvelope,
     worker_input_artifact_digest,
@@ -155,6 +172,7 @@ CREATE TABLE IF NOT EXISTS artifacts (
     created_at TEXT NOT NULL,
     uri TEXT NOT NULL,
     manifest_path TEXT NOT NULL,
+    manifest_json TEXT NOT NULL,
     lineage_json TEXT NOT NULL,
     compatibility_json TEXT NOT NULL,
     scores_json TEXT NOT NULL,
@@ -1017,10 +1035,32 @@ class EvolutionStore:
         db_path: str | Path,
         artifact_root: str | Path,
         registry_snapshot: RegistrySnapshot | None = None,
+        executable_registry: VerifiedExecutableRegistry | None = None,
     ) -> None:
+        verified_registry = (
+            None
+            if executable_registry is None
+            else require_verified_executable_registry(executable_registry)
+        )
+        if verified_registry is not None:
+            if (
+                registry_snapshot is not None
+                and registry_snapshot.registry_digest
+                != verified_registry.snapshot.registry_digest
+            ):
+                raise ValueError(
+                    "registry snapshot does not match executable registry"
+                )
+            registry_snapshot = verified_registry.snapshot
         self.db_path = Path(db_path)
         self.files = ArtifactFileStore(artifact_root)
         self._registry_snapshot = registry_snapshot
+        self._executable_registry = verified_registry
+        self._context_projection_resolver = (
+            None
+            if verified_registry is None
+            else ContextProjectionResolver(self.files.root, verified_registry)
+        )
 
     def _bind_registry_snapshot(self, snapshot: RegistrySnapshot) -> None:
         if self._registry_snapshot is None:
@@ -1052,6 +1092,9 @@ class EvolutionStore:
         }
         if "staging_job_id" not in artifact_columns:
             conn.execute("ALTER TABLE artifacts ADD COLUMN staging_job_id TEXT")
+        if "manifest_json" not in artifact_columns:
+            # Existing artifacts are not backfilled from mutable legacy files.
+            conn.execute("ALTER TABLE artifacts ADD COLUMN manifest_json TEXT")
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_artifacts_staging_job "
             "ON artifacts(staging_job_id) WHERE staging_job_id IS NOT NULL"
@@ -1975,6 +2018,7 @@ class EvolutionStore:
             )
             request_payload["manifest"] = manifest
         lineage_json = _json_dumps(request_payload["lineage"])
+        manifest_json = _json_dumps(request_payload["manifest"])
         compatibility_json = _json_dumps(request_payload["compatibility"])
         scores_json = _json_dumps(request_payload["scores"])
         tags_json = _json_dumps(request_payload["tags"])
@@ -2010,10 +2054,11 @@ class EvolutionStore:
                         """
                         INSERT INTO artifacts (
                             artifact_id, type, name, version, state, created_at, uri,
-                            manifest_path, lineage_json, compatibility_json, scores_json,
-                            tags_json, promoted, staging_job_id
+                            manifest_path, manifest_json, lineage_json,
+                            compatibility_json, scores_json, tags_json, promoted,
+                            staging_job_id
                         )
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             artifact_id,
@@ -2024,6 +2069,7 @@ class EvolutionStore:
                             created_at,
                             request_payload["uri"],
                             str(manifest_path),
+                            manifest_json,
                             lineage_json,
                             compatibility_json,
                             scores_json,
@@ -2141,16 +2187,181 @@ class EvolutionStore:
             promoted=request.promoted,
         )
 
-    def _promoted_artifact_rows(self) -> list[dict[str, object]]:
+    def _promoted_artifact_rows(
+        self,
+        *,
+        maximum: int | None = None,
+        artifact_types: set[str] | None = None,
+        artifact_ids: set[str] | None = None,
+    ) -> list[dict[str, object]]:
+        type_clause = ""
+        type_parameters: tuple[str, ...] = ()
+        if artifact_types is not None:
+            ordered_types = tuple(sorted(artifact_types))
+            if not ordered_types:
+                return []
+            type_clause = " AND type IN (" + ", ".join("?" for _ in ordered_types) + ")"
+            type_parameters = ordered_types
+        artifact_clause = ""
+        artifact_parameters: tuple[str, ...] = ()
+        if artifact_ids is not None:
+            ordered_artifact_ids = tuple(sorted(artifact_ids))
+            if not ordered_artifact_ids:
+                return []
+            artifact_clause = " AND artifact_id IN (" + ", ".join(
+                "?" for _ in ordered_artifact_ids
+            ) + ")"
+            artifact_parameters = ordered_artifact_ids
+        parameters: tuple[object, ...] = (
+            str(ArtifactState.ACTIVE),
+            str(ArtifactState.EXPERIMENTAL),
+            *type_parameters,
+            *artifact_parameters,
+        )
+        projection_eligible_expression = """
+            uri LIKE 'file:%'
+            AND length(CAST(uri AS BLOB)) <= ?
+            AND length(CAST(name AS BLOB)) <= ?
+            AND manifest_json IS NOT NULL
+            AND manifest_json <> ''
+            AND length(CAST(manifest_json AS BLOB)) <= ?
+            AND length(CAST(compatibility_json AS BLOB)) <= ?
+            AND json_valid(compatibility_json) = 1
+            AND substr(ltrim(compatibility_json), 1, 1) = '{'
+            AND length(CAST(scores_json AS BLOB)) <= ?
+            AND json_valid(scores_json) = 1
+            AND substr(ltrim(scores_json), 1, 1) = '{'
+        """
+        projection_compatibility_expression = f"""
+            length(CAST(compatibility_json AS BLOB)) <= {MAX_ARTIFACT_ROUTING_JSON_BYTES}
+            AND json_valid(compatibility_json) = 1
+            AND substr(ltrim(compatibility_json), 1, 1) = '{{'
+        """
         with self.connect() as conn:
-            rows = conn.execute(
-                """
-                SELECT * FROM artifacts
-                WHERE promoted = 1 AND state IN (?, ?)
-                """,
-                (str(ArtifactState.ACTIVE), str(ArtifactState.EXPERIMENTAL)),
-            ).fetchall()
+            if maximum is not None:
+                eligible_rows = conn.execute(
+                    f"""
+                    SELECT artifact_id, type, name, state, created_at, uri,
+                           manifest_json, compatibility_json, scores_json, promoted
+                    FROM artifacts
+                    WHERE promoted = 1 AND state IN (?, ?)
+                    {type_clause}
+                    {artifact_clause}
+                      AND ({projection_eligible_expression})
+                    LIMIT ?
+                    """,  # noqa: S608 - placeholders bind every dynamic value.
+                    (
+                        *parameters,
+                        MAX_CONTEXT_ARTIFACT_URI_BYTES,
+                        MAX_CONTEXT_ARTIFACT_NAME_BYTES,
+                        MAX_CONTRACT_JSON_BYTES,
+                        MAX_ARTIFACT_ROUTING_JSON_BYTES,
+                        MAX_ARTIFACT_ROUTING_JSON_BYTES,
+                        maximum + 1,
+                    ),
+                ).fetchall()
+                if len(eligible_rows) > maximum:
+                    raise ValueError(
+                        "context projection exceeds the promoted candidate budget"
+                    )
+                remaining = maximum - len(eligible_rows)
+                skipped_rows = []
+                if remaining:
+                    skipped_rows = conn.execute(
+                        f"""
+                        SELECT artifact_id, type, artifact_id AS name, state,
+                               created_at, '' AS uri, NULL AS manifest_json,
+                               CASE
+                                   WHEN ({projection_compatibility_expression})
+                                       THEN compatibility_json
+                                   ELSE NULL
+                               END AS compatibility_json,
+                               '{{}}' AS scores_json,
+                               promoted,
+                               CASE
+                                   WHEN NOT ({projection_compatibility_expression})
+                                       THEN 'metadata_policy_rejected'
+                                   WHEN manifest_json IS NULL OR manifest_json = ''
+                                       THEN 'unbound_legacy_metadata'
+                                   WHEN lower(substr(uri, 1, 5)) <> 'file:'
+                                       THEN 'unsupported_uri_scheme'
+                                   ELSE 'metadata_policy_rejected'
+                               END AS projection_skip_reason
+                        FROM artifacts
+                        WHERE promoted = 1 AND state IN (?, ?)
+                        {type_clause}
+                        {artifact_clause}
+                          AND NOT ({projection_eligible_expression})
+                        LIMIT ?
+                        """,  # noqa: S608 - placeholders bind every dynamic value.
+                        (
+                            *parameters,
+                            MAX_CONTEXT_ARTIFACT_URI_BYTES,
+                            MAX_CONTEXT_ARTIFACT_NAME_BYTES,
+                            MAX_CONTRACT_JSON_BYTES,
+                            MAX_ARTIFACT_ROUTING_JSON_BYTES,
+                            MAX_ARTIFACT_ROUTING_JSON_BYTES,
+                            remaining,
+                        ),
+                    ).fetchall()
+                rows = [*eligible_rows, *skipped_rows]
+            else:
+                rows = conn.execute(
+                    f"""
+                    SELECT * FROM artifacts
+                    WHERE promoted = 1 AND state IN (?, ?)
+                    {type_clause}
+                    {artifact_clause}
+                    """,  # noqa: S608 - placeholders bind every dynamic value.
+                    parameters,
+                ).fetchall()
         return [dict(row) for row in rows]
+
+    def resolve_context_projections(
+        self,
+        request: ContextProjectionResolveRequest,
+    ) -> ContextProjectionResolveResponse:
+        raw_payload = request.model_dump(mode="python")
+        _validate_finite_floats(raw_payload, "request")
+        resolver = self._context_projection_resolver
+        if resolver is None:
+            raise ValueError(
+                "context projection requires a verified executable registry"
+            )
+        registry = self._executable_registry
+        if registry is None:  # Kept explicit for type narrowing and fail-closed wiring.
+            raise ValueError(
+                "context projection requires a verified executable registry"
+            )
+        requested_artifact_ids = requested_context_artifact_ids(
+            request.compatibility_facts()
+        )
+        rows = self._promoted_artifact_rows(
+            maximum=MAX_CONTEXT_PROJECTION_CANDIDATES,
+            artifact_types={
+                target.artifact_type
+                for target in registry.snapshot.targets.values()
+            },
+            artifact_ids=requested_artifact_ids,
+        )
+        for _ in range(MAX_CONTEXT_ID_ATTEMPTS):
+            context_id = new_id("ctx")
+            response = resolver.resolve(
+                request,
+                rows,
+                context_id=context_id,
+            )
+            request_payload = request.model_dump(mode="json")
+            response_payload = response.model_dump(mode="json")
+            selected_ids = list(response.selection.artifact_ids)
+            if self._persist_context(
+                context_id=context_id,
+                request_payload=request_payload,
+                response_payload=response_payload,
+                selected_ids=selected_ids,
+            ):
+                return response
+        raise RuntimeError("could not allocate unique context id")
 
     def resolve_context(self, request: ContextResolveRequest) -> ContextResolveResponse:
         raw_payload = request.model_dump(mode="python")
@@ -2288,64 +2499,80 @@ class EvolutionStore:
             )
             request_payload = request.model_dump(mode="json")
             response_payload = response.model_dump(mode="json")
-            request_json = _json_dumps(request_payload)
-            response_json = _json_dumps(response_payload)
-            selected_ids_json = _json_dumps(selected_ids)
-            snapshot_path = self.files.context_snapshot_path(context_id)
-            snapshot_created = False
-            with self.connect() as conn:
-                try:
-                    conn.execute("BEGIN IMMEDIATE")
-                    existing = conn.execute(
-                        "SELECT 1 FROM contexts WHERE context_id = ?",
-                        (context_id,),
-                    ).fetchone()
-                    if existing is not None or snapshot_path.exists():
-                        conn.rollback()
-                        continue
-                    conn.execute(
-                        """
-                        INSERT INTO contexts (
-                            context_id, created_at, request_json, response_json,
-                            selected_artifact_ids_json
-                        )
-                        VALUES (?, ?, ?, ?, ?)
-                        """,
-                        (
-                            context_id,
-                            utc_now_iso(),
-                            request_json,
-                            response_json,
-                            selected_ids_json,
-                        ),
-                    )
-                    try:
-                        _write_json_strict_exclusive(
-                            self.files,
-                            snapshot_path,
-                            {
-                                "request": request_payload,
-                                "response": response_payload,
-                            },
-                        )
-                    except FileExistsError:
-                        conn.rollback()
-                        continue
-                    snapshot_created = True
-                    conn.commit()
-                except Exception:
-                    try:
-                        conn.rollback()
-                    except sqlite3.Error:
-                        pass
-                    if snapshot_created:
-                        try:
-                            snapshot_path.unlink(missing_ok=True)
-                        except OSError:
-                            pass
-                    raise
-            return response
+            if self._persist_context(
+                context_id=context_id,
+                request_payload=request_payload,
+                response_payload=response_payload,
+                selected_ids=selected_ids,
+            ):
+                return response
         raise RuntimeError("could not allocate unique context id")
+
+    def _persist_context(
+        self,
+        *,
+        context_id: str,
+        request_payload: dict[str, object],
+        response_payload: dict[str, object],
+        selected_ids: list[str],
+    ) -> bool:
+        request_json = _json_dumps(request_payload)
+        response_json = _json_dumps(response_payload)
+        selected_ids_json = _json_dumps(selected_ids)
+        snapshot_path = self.files.context_snapshot_path(context_id)
+        snapshot_created = False
+        with self.connect() as conn:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                existing = conn.execute(
+                    "SELECT 1 FROM contexts WHERE context_id = ?",
+                    (context_id,),
+                ).fetchone()
+                if existing is not None or snapshot_path.exists():
+                    conn.rollback()
+                    return False
+                conn.execute(
+                    """
+                    INSERT INTO contexts (
+                        context_id, created_at, request_json, response_json,
+                        selected_artifact_ids_json
+                    )
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        context_id,
+                        utc_now_iso(),
+                        request_json,
+                        response_json,
+                        selected_ids_json,
+                    ),
+                )
+                try:
+                    _write_json_strict_exclusive(
+                        self.files,
+                        snapshot_path,
+                        {
+                            "request": request_payload,
+                            "response": response_payload,
+                        },
+                    )
+                except FileExistsError:
+                    conn.rollback()
+                    return False
+                snapshot_created = True
+                conn.commit()
+            except Exception:
+                try:
+                    conn.rollback()
+                except sqlite3.Error:
+                    pass
+                if snapshot_created:
+                    try:
+                        snapshot_path.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                raise
+        return True
 
     def create_plan_bound_job(
         self,
@@ -3941,7 +4168,9 @@ def _artifact_id_allowed(
 def _artifact_response_from_row(row: sqlite3.Row) -> ArtifactResponse:
     manifest_path = Path(str(row["manifest_path"]))
     manifest_payload = json.loads(manifest_path.read_text(encoding="utf-8"))
-    manifest = manifest_payload.get("manifest") if isinstance(manifest_payload, dict) else {}
+    manifest = (
+        manifest_payload.get("manifest") if isinstance(manifest_payload, dict) else {}
+    )
     if not isinstance(manifest, dict):
         manifest = {}
     return ArtifactResponse(

@@ -27,6 +27,9 @@ MAX_PAYLOAD_ENTRY_BYTES = 8 * 1024 * 1024 * 1024
 MAX_PAYLOAD_TOTAL_BYTES = 16 * 1024 * 1024 * 1024
 MAX_PAYLOAD_TREE_DEPTH = 32
 MAX_JAVASCRIPT_SAFE_INTEGER = (1 << 53) - 1
+_MAX_CONTRACT_JSON_DEPTH = 16
+_MAX_CONTRACT_JSON_NODES = 8192
+_MAX_CONTRACT_JSON_COLLECTION_ITEMS = 4096
 
 _STABLE_ID_RE = re.compile(r"[A-Za-z][A-Za-z0-9_.-]{0,127}\Z", re.ASCII)
 _URI_SCHEME_RE = re.compile(r"[a-z][a-z0-9+.-]{0,31}\Z", re.ASCII)
@@ -248,6 +251,57 @@ def canonical_json(value: Any) -> str:
         separators=(",", ":"),
         sort_keys=True,
     )
+
+
+def _bounded_canonical_json_object(
+    value: Any,
+    *,
+    label: str,
+    max_bytes: int = MAX_CONTRACT_JSON_BYTES,
+) -> str:
+    """Validate one bounded JSON object before recursive canonicalization."""
+
+    if not isinstance(value, Mapping):
+        raise TypeError(f"{label} must be a JSON object")
+    stack: list[tuple[Any, int]] = [(value, 1)]
+    nodes = 0
+    while stack:
+        current, depth = stack.pop()
+        if isinstance(current, BaseModel):
+            current = current.model_dump(mode="json")
+        if isinstance(current, Enum):
+            current = current.value
+        nodes += 1
+        if nodes > _MAX_CONTRACT_JSON_NODES:
+            raise ValueError(f"{label} exceeds the JSON node budget")
+        if depth > _MAX_CONTRACT_JSON_DEPTH:
+            raise ValueError(f"{label} exceeds the JSON depth budget")
+        if isinstance(current, Mapping):
+            if len(current) > _MAX_CONTRACT_JSON_COLLECTION_ITEMS:
+                raise ValueError(f"{label} exceeds the JSON collection budget")
+            if not all(isinstance(key, str) for key in current):
+                raise TypeError(f"{label} object keys must be strings")
+            stack.extend((item, depth + 1) for item in current.values())
+        elif isinstance(current, (list, tuple)):
+            if len(current) > _MAX_CONTRACT_JSON_COLLECTION_ITEMS:
+                raise ValueError(f"{label} exceeds the JSON collection budget")
+            stack.extend((item, depth + 1) for item in current)
+        elif isinstance(current, str):
+            _validated_string(current, label)
+        elif current is None or isinstance(current, (bool, int)):
+            continue
+        elif isinstance(current, float):
+            if not math.isfinite(current):
+                raise ValueError(f"{label} contains a non-finite number")
+        else:
+            raise TypeError(
+                f"{label} contains unsupported JSON value {type(current).__name__}"
+            )
+
+    encoded = canonical_json(value)
+    if len(encoded.encode("utf-8")) > max_bytes:
+        raise ValueError(f"{label} exceeds the JSON byte budget")
+    return encoded
 
 
 def canonical_digest(value: Any) -> str:

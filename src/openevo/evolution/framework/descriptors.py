@@ -206,8 +206,9 @@ class TargetHandlerDescriptor(_Descriptor):
     target_id: str
     artifact_types: tuple[str, ...] = Field(min_length=1)
     renderer_kind: RendererKind
+    input_contract_version: Literal["1"] = "1"
     renderer_contract_version: Literal["1"] = "1"
-    contribution_contract_version: Literal["1"] = "1"
+    contribution_contract_version: Literal["2"] = "2"
     allowed_uri_schemes: tuple[str, ...] = Field(min_length=1)
     allowed_media_types: tuple[str, ...] = Field(min_length=1)
     allowed_destination_scopes: tuple[DestinationScope, ...] = Field(min_length=1)

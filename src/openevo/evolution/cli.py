@@ -1021,7 +1021,7 @@ def main(argv: list[str] | None = None) -> int:
         app = create_app(
             db_path=Path(args.db),
             artifact_root=Path(args.artifact_root),
-            registry_snapshot=registry.snapshot,
+            executable_registry=registry,
         )
         uvicorn.run(app, host=args.host, port=args.port)
         return 0

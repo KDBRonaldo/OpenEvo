@@ -155,6 +155,7 @@ def test_capabilities_are_versioned_registry_projection_with_four_axis_support()
     assert target.target_id == "memory"
     assert target.renderer_kind.value == "markdown"
     assert target.renderer_contract_version == "1"
+    assert target.contribution_contract_version == "2"
     assert target.configured_default_method_id == "reflect"
     assert target.effective_default_method_id == "reflect"
     assert [method.method_id for method in target.methods] == [

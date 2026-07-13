@@ -481,7 +481,12 @@ def test_staged_payload_rejects_unsafe_paths(path: str) -> None:
         ({"allowed_uri_schemes": ("javascript",)}, "URI scheme"),
         ({"allowed_uri_schemes": ("HTTP",)}, "URI scheme"),
         ({"allowed_media_types": ("not-a-mime",)}, "MIME"),
+        ({"input_contract_version": "999"}, "input_contract_version"),
         ({"renderer_contract_version": "999"}, "renderer_contract_version"),
+        (
+            {"contribution_contract_version": "999"},
+            "contribution_contract_version",
+        ),
     ],
 )
 def test_handler_descriptor_rejects_unsafe_policies(
@@ -544,7 +549,13 @@ def test_handler_output_is_data_only_and_environment_refs_staged_payload() -> No
             data={"markdown": "Remember parser precedence."},
         ),
     )
+    assert output.contract_version == "2"
     assert output.renderer.kind.value == "markdown"
+
+    incompatible = output.model_dump(mode="python")
+    incompatible["contract_version"] = "1"
+    with pytest.raises(ValidationError, match="literal_error"):
+        TargetHandlerOutput.model_validate(incompatible)
 
     with pytest.raises(ValidationError, match="reference staged payloads"):
         TargetHandlerOutput(

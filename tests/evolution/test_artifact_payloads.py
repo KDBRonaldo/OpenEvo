@@ -11,7 +11,11 @@ import pytest
 
 from openevo.evolution import artifact_payloads
 from openevo.evolution.artifact_payloads import ArtifactPayloadService
-from openevo.evolution.framework import canonical_json, payload_tree_digest
+from openevo.evolution.framework import (
+    MAX_CONTRACT_JSON_BYTES,
+    canonical_json,
+    payload_tree_digest,
+)
 
 
 def _issue(
@@ -186,6 +190,17 @@ def test_issue_snapshot_rejects_root_and_descendant_symlinks(tmp_path: Path) -> 
             _issue(service, bundle)
 
 
+def test_issue_snapshot_rejects_multiply_linked_regular_file(tmp_path: Path) -> None:
+    outside = tmp_path.parent / f"{tmp_path.name}-outside-secret.txt"
+    outside.write_text("outside secret", encoding="utf-8")
+    linked = tmp_path / "linked-secret.txt"
+    os.link(outside, linked)
+
+    with ArtifactPayloadService(tmp_path) as service:
+        with pytest.raises(ValueError, match="hard link|link count"):
+            _issue(service, linked)
+
+
 def test_issue_snapshot_rejects_fifo_and_socket(tmp_path: Path) -> None:
     fifo = tmp_path / "pipe"
     os.mkfifo(fifo)
@@ -233,6 +248,7 @@ def test_payload_node_budget_counts_empty_directories(
     with ArtifactPayloadService(tmp_path) as service:
         with pytest.raises(ValueError, match="nodes|entries"):
             _issue(service, bundle)
+        assert service._attempted_nodes == 4
 
 
 def test_payload_entry_and_total_byte_limits_are_enforced(
@@ -250,6 +266,147 @@ def test_payload_entry_and_total_byte_limits_are_enforced(
     with ArtifactPayloadService(tmp_path) as service:
         with pytest.raises(ValueError, match="total bytes"):
             _issue(service, payload)
+
+
+def test_service_enforces_aggregate_snapshot_byte_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first = tmp_path / "first.bin"
+    second = tmp_path / "second.bin"
+    first.write_bytes(b"123")
+    second.write_bytes(b"456")
+    monkeypatch.setattr(artifact_payloads, "MAX_PAYLOAD_ENTRY_BYTES", 5)
+    monkeypatch.setattr(artifact_payloads, "MAX_PAYLOAD_TOTAL_BYTES", 5)
+
+    with ArtifactPayloadService(tmp_path) as service:
+        _issue(service, first)
+        with pytest.raises(ValueError, match="service.*total bytes|aggregate"):
+            _issue(service, second)
+
+
+def test_verified_reread_consumes_aggregate_byte_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    payload = tmp_path / "payload.txt"
+    payload.write_bytes(b"123")
+    monkeypatch.setattr(artifact_payloads, "MAX_PAYLOAD_ENTRY_BYTES", 6)
+    monkeypatch.setattr(artifact_payloads, "MAX_PAYLOAD_TOTAL_BYTES", 6)
+
+    with ArtifactPayloadService(tmp_path) as service:
+        snapshot = _issue(service, payload)
+        assert service.read_utf8_prefix(
+            snapshot.payload_handle,
+            "payload.txt",
+            max_chars=3,
+            max_bytes=3,
+        ) == "123"
+        assert service._attempted_bytes == 6
+
+        with pytest.raises(
+            artifact_payloads.ArtifactPayloadBudgetExceeded,
+            match="aggregate total bytes",
+        ):
+            service.read_utf8_prefix(
+                snapshot.payload_handle,
+                "payload.txt",
+                max_chars=3,
+                max_bytes=3,
+            )
+
+
+def test_verified_reread_consumes_node_and_file_attempt_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    payload = tmp_path / "empty.txt"
+    payload.write_bytes(b"")
+    monkeypatch.setattr(artifact_payloads, "MAX_PAYLOAD_ENTRIES", 2)
+
+    with ArtifactPayloadService(tmp_path) as service:
+        snapshot = _issue(service, payload)
+        assert service.read_utf8_prefix(
+            snapshot.payload_handle,
+            "empty.txt",
+            max_chars=0,
+            max_bytes=0,
+        ) == ""
+        assert service._attempted_files == 2
+
+        with pytest.raises(
+            artifact_payloads.ArtifactPayloadBudgetExceeded,
+            match="aggregate entries",
+        ):
+            service.read_utf8_prefix(
+                snapshot.payload_handle,
+                "empty.txt",
+                max_chars=0,
+                max_bytes=0,
+            )
+        assert service._attempted_files == 3
+
+
+def test_failed_snapshot_scan_consumes_attempted_aggregate_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    oversized = tmp_path / "oversized"
+    oversized.mkdir()
+    (oversized / "a.bin").write_bytes(b"12345")
+    (oversized / "z.bin").write_bytes(b"6")
+    next_payload = tmp_path / "next.bin"
+    next_payload.write_bytes(b"7")
+    monkeypatch.setattr(artifact_payloads, "MAX_PAYLOAD_ENTRY_BYTES", 5)
+    monkeypatch.setattr(artifact_payloads, "MAX_PAYLOAD_TOTAL_BYTES", 5)
+
+    with ArtifactPayloadService(tmp_path) as service:
+        with pytest.raises(ValueError, match="maximum total bytes"):
+            _issue(service, oversized)
+        assert service._attempted_bytes == 5
+
+        with pytest.raises(
+            artifact_payloads.ArtifactPayloadBudgetExceeded,
+            match="aggregate total bytes",
+        ):
+            _issue(service, next_payload)
+        assert service._attempted_bytes == 6
+
+
+def test_snapshot_metadata_is_validated_before_payload_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    payload = tmp_path / "payload.bin"
+    payload.write_bytes(b"payload")
+
+    def unexpected_read(_fd: int):
+        raise AssertionError("invalid metadata reached payload hashing")
+        yield b""  # pragma: no cover
+
+    monkeypatch.setattr(artifact_payloads, "_stream_fd_chunks", unexpected_read)
+    with ArtifactPayloadService(tmp_path) as service:
+        with pytest.raises(ValueError, match="scores.*JSON byte budget"):
+            service.issue_snapshot(
+                artifact_id="artifact-1",
+                artifact_type="text_memory",
+                name="Memory",
+                uri=payload.as_uri(),
+                manifest={},
+                scores={"oversized": "x" * MAX_CONTRACT_JSON_BYTES},
+                rank_index=0,
+            )
+        assert service._attempted_bytes == 0
+
+
+def test_local_file_overflow_records_final_attempt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    (bundle / "a.txt").write_text("a", encoding="utf-8")
+    (bundle / "b.txt").write_text("b", encoding="utf-8")
+    monkeypatch.setattr(artifact_payloads, "MAX_PAYLOAD_ENTRIES", 1)
+
+    with ArtifactPayloadService(tmp_path) as service:
+        with pytest.raises(ValueError, match="maximum entries"):
+            _issue(service, bundle)
+        assert service._attempted_files == 2
 
 
 def test_scan_fails_closed_when_file_mutates_during_digest(

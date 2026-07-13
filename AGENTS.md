@@ -58,7 +58,13 @@ harness 只要能提供稳定 transcript，都应能接入 pure-text evolution�
   artifacts 和 context resolver。
 - `src/openevo/evolution/artifact_payloads.py`: Core-owned `file://` payload scanner、
   ephemeral opaque handle 和 bounded verified text-read service；只允许 Core-managed
-  artifact root 内的 regular files/directories。
+  artifact root 内 link-count-one regular files/directories，并对一个 service 生命周期内
+  所有 scan 和 verified-reread attempts 施加不可退回的累计 node/file/byte budget；失败
+  snapshot/read 已经消耗的枚举与 hashing 资源同样计入。
+- `src/openevo/evolution/context_projection.py`: 内部 projection v1 resolver；只通过
+  verified executable registry 调用 target handlers，并持久化 validated data-only
+  contributions。它使用有元素与总 byte 上限的 strict closed agent/metadata contract，
+  不持久化任意 env/secret 字段，也不是 legacy `/v1/contexts/resolve` 的公开兼容 response。
 - `src/openevo/experiments/`: experiment compiler/runner/promotion helpers。
 - `src/openevo/projects/science/`: ordinary-user science project config/compiler。
 - `src/openevo/deployment/`: remote deployment lifecycle、bootstrap、preflight、SSH transport。
@@ -328,6 +334,9 @@ Target handler 只能返回 data-only contributions。普通环境绑定必须�
 暴露 `harness_skills` 等 Core-resolved 公共根目录时使用 `scope_root` binding，并明确声明一个
 descriptor allowlisted destination scope。Handler 不得返回 host path、命令或自行解析 runtime
 root；payload scanner/materializer 才负责 no-follow 读取、digest 重验和原子 staging。
+当前 descriptor 必须分别声明 handler input v1、renderer v1 和 output/contribution v2，Core
+在 invocation 时逐项校验；output v2 的 adapter contribution 必须绑定 source payload digest
+和 byte size，不能把 v1 output 当作 v2 推断。
 只有 source artifact IDs 和正文都完全相等的 instruction/file 投影才能去重；派生 target
 文件受两倍投影预算约束，所有文本投影总量受三倍预算约束。Text source MIME 必须满足
 descriptor allowlist；skill bundle 必须含根目录 `SKILL.md` 并保持 ranked/canonical renderer

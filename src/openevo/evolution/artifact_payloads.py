@@ -18,11 +18,13 @@ from urllib.parse import unquote_to_bytes, urlsplit
 
 from .framework.contracts import (
     MAX_CONTRIBUTION_TEXT,
+    MAX_HANDLER_ARTIFACTS,
     MAX_PAYLOAD_ENTRIES,
     MAX_PAYLOAD_ENTRY_BYTES,
     MAX_PAYLOAD_TOTAL_BYTES,
     MAX_PAYLOAD_TREE_DEPTH,
-    canonical_json,
+    _bounded_canonical_json_object,
+    _stable_id,
     validate_relative_path,
 )
 from .framework.handlers import (
@@ -72,11 +74,16 @@ _MIME_BY_SUFFIX = {
 }
 
 
+class ArtifactPayloadBudgetExceeded(ValueError):
+    """The request-scoped payload service exhausted an aggregate budget."""
+
+
 @dataclass(frozen=True, slots=True)
 class _FileIdentity:
     device: int
     inode: int
     mode: int
+    link_count: int
     size: int
     mtime_ns: int
     ctime_ns: int
@@ -114,6 +121,7 @@ def _identity(value: os.stat_result) -> _FileIdentity:
         device=value.st_dev,
         inode=value.st_ino,
         mode=value.st_mode,
+        link_count=value.st_nlink,
         size=value.st_size,
         mtime_ns=value.st_mtime_ns,
         ctime_ns=value.st_ctime_ns,
@@ -214,6 +222,9 @@ class ArtifactPayloadService:
         self._allowed_root = os.fspath(root)
         self._root_fd = root_fd
         self._handles: dict[str, _HandleRecord] = {}
+        self._attempted_nodes = 0
+        self._attempted_files = 0
+        self._attempted_bytes = 0
         self._closed = False
         self._lock = threading.RLock()
 
@@ -273,16 +284,46 @@ class ArtifactPayloadService:
         rank_index: int,
     ) -> TrustedArtifactSnapshot:
         self._require_open()
+        if (
+            not isinstance(artifact_id, str)
+            or not artifact_id.strip()
+            or len(artifact_id) > 256
+        ):
+            raise ValueError("artifact ID must be bounded non-empty text")
+        _stable_id(artifact_type)
+        if not isinstance(name, str) or not name.strip() or len(name) > 4096:
+            raise ValueError("artifact name must be bounded non-empty text")
+        if (
+            not isinstance(rank_index, int)
+            or isinstance(rank_index, bool)
+            or not 0 <= rank_index < MAX_HANDLER_ARTIFACTS
+        ):
+            raise ValueError("artifact rank must be within the handler input budget")
+        manifest_json = _bounded_canonical_json_object(
+            dict(manifest),
+            label="artifact manifest",
+        )
+        scores_json = _bounded_canonical_json_object(
+            dict(scores),
+            label="artifact scores",
+        )
+
         decoded_path = _decoded_file_uri(uri)
         path_components = self._contained_components(decoded_path)
         node_fd, node_identity = self._open_relative(path_components)
         records: list[_FileRecord] = []
         directories: list[_DirectoryRecord] = []
+        budget = _ScanBudget()
         try:
             mode = node_identity.mode
             if stat.S_ISLNK(mode):
                 raise ValueError("payload root must not be a symlink")
             if stat.S_ISDIR(mode):
+                budget.nodes += 1
+                self._record_attempted(nodes=1)
+                if budget.nodes > _MAX_PAYLOAD_NODES:
+                    raise ValueError("payload exceeds maximum node budget")
+                self._require_attempted_budget()
                 root_components = path_components
                 self._scan_directory(
                     node_fd,
@@ -290,11 +331,20 @@ class ArtifactPayloadService:
                     records,
                     directories,
                     node_identity,
-                    _ScanBudget(),
+                    budget,
                 )
             elif stat.S_ISREG(mode):
-                if MAX_PAYLOAD_ENTRIES < 1:
+                budget.nodes += 1
+                budget.files += 1
+                budget.total_bytes += node_identity.size
+                self._record_attempted(nodes=1, files=1)
+                if budget.nodes > _MAX_PAYLOAD_NODES:
+                    raise ValueError("payload exceeds maximum node budget")
+                if budget.files > MAX_PAYLOAD_ENTRIES:
                     raise ValueError("payload exceeds maximum entries")
+                if budget.total_bytes > MAX_PAYLOAD_TOTAL_BYTES:
+                    raise ValueError("payload exceeds maximum total bytes")
+                self._require_attempted_budget()
                 content_path = manifest.get("content_path")
                 if content_path is None:
                     logical_path = path_components[-1] if path_components else Path(decoded_path).name
@@ -315,7 +365,9 @@ class ArtifactPayloadService:
                 root_components = path_components[: len(path_components) - len(logical_components)]
                 if root_components + logical_components != path_components:
                     raise ValueError("manifest content_path does not resolve to artifact URI")
-                records.append(self._scan_open_file(node_fd, logical_path, node_identity))
+                records.append(
+                    self._scan_open_file(node_fd, logical_path, node_identity)
+                )
             else:
                 raise ValueError("payload root must be a regular file or directory")
         finally:
@@ -358,8 +410,8 @@ class ArtifactPayloadService:
             payload_handle=handle,
             payload_entries=entries,
             payload_manifest_digest=payload_tree_digest(entries),
-            manifest_json=canonical_json(dict(manifest)),
-            scores_json=canonical_json(dict(scores)),
+            manifest_json=manifest_json,
+            scores_json=scores_json,
             rank_index=rank_index,
         )
         self._handles[handle] = _HandleRecord(
@@ -412,6 +464,7 @@ class ArtifactPayloadService:
         except (KeyError, TypeError, ValueError) as exc:
             raise ValueError("unknown payload path for handle") from exc
 
+        self._consume_attempted(nodes=1, files=1)
         components = handle.root_components + tuple(PurePosixPath(normalized_path).parts)
         fd, opened_identity = self._open_relative(components)
         digest = hashlib.sha256()
@@ -426,6 +479,7 @@ class ArtifactPayloadService:
                 raise ValueError("payload file identity drifted from issued inventory")
             try:
                 for chunk in _stream_fd_chunks(fd):
+                    self._consume_attempted(total_bytes=len(chunk))
                     digest.update(chunk)
                     size += len(chunk)
                     if size > expected.size_bytes:
@@ -467,6 +521,47 @@ class ArtifactPayloadService:
     def _require_open(self) -> None:
         if self._closed:
             raise RuntimeError("artifact payload service is closed")
+
+    def _consume_attempted(
+        self,
+        *,
+        nodes: int = 0,
+        files: int = 0,
+        total_bytes: int = 0,
+    ) -> None:
+        """Consume request-wide scan resources without rollback on failure."""
+
+        self._record_attempted(
+            nodes=nodes,
+            files=files,
+            total_bytes=total_bytes,
+        )
+        self._require_attempted_budget()
+
+    def _record_attempted(
+        self,
+        *,
+        nodes: int = 0,
+        files: int = 0,
+        total_bytes: int = 0,
+    ) -> None:
+        self._attempted_nodes += nodes
+        self._attempted_files += files
+        self._attempted_bytes += total_bytes
+
+    def _require_attempted_budget(self) -> None:
+        if self._attempted_nodes > _MAX_PAYLOAD_NODES:
+            raise ArtifactPayloadBudgetExceeded(
+                "payload service exceeds aggregate node budget"
+            )
+        if self._attempted_files > MAX_PAYLOAD_ENTRIES:
+            raise ArtifactPayloadBudgetExceeded(
+                "payload service exceeds aggregate entries"
+            )
+        if self._attempted_bytes > MAX_PAYLOAD_TOTAL_BYTES:
+            raise ArtifactPayloadBudgetExceeded(
+                "payload service exceeds aggregate total bytes"
+            )
 
     def _allocate_handle(self) -> str:
         for _ in range(_MAX_HANDLE_ATTEMPTS):
@@ -545,8 +640,10 @@ class ArtifactPayloadService:
             with os.scandir(directory_fd) as entries:
                 for entry in entries:
                     budget.nodes += 1
+                    self._record_attempted(nodes=1)
                     if budget.nodes > _MAX_PAYLOAD_NODES:
                         raise ValueError("payload exceeds maximum nodes or entries")
+                    self._require_attempted_budget()
                     names.append(entry.name)
         except OSError as exc:
             raise ValueError("payload directory could not be listed") from exc
@@ -588,8 +685,10 @@ class ArtifactPayloadService:
                     raise ValueError("payload directory mutated during scan")
             elif stat.S_ISREG(before.st_mode):
                 budget.files += 1
+                self._record_attempted(files=1)
                 if budget.files > MAX_PAYLOAD_ENTRIES:
                     raise ValueError("payload exceeds maximum entries")
+                self._require_attempted_budget()
                 if before.st_size > MAX_PAYLOAD_ENTRY_BYTES:
                     raise ValueError("payload file exceeds maximum entry bytes")
                 budget.total_bytes += before.st_size
@@ -644,6 +743,8 @@ class ArtifactPayloadService:
             fixed_identity = _identity(os.fstat(path_fd))
             if fixed_identity != expected:
                 raise ValueError("payload entry mutated while being fixed")
+            if stat.S_ISREG(fixed_identity.mode) and fixed_identity.link_count != 1:
+                raise ValueError("payload regular file must have link count one")
             if directory != stat.S_ISDIR(fixed_identity.mode):
                 raise ValueError("payload entry type mutated while being fixed")
             if not directory and not stat.S_ISREG(fixed_identity.mode):
@@ -688,6 +789,7 @@ class ArtifactPayloadService:
         digest = hashlib.sha256()
         size = 0
         for chunk in _stream_fd_chunks(fd):
+            self._consume_attempted(total_bytes=len(chunk))
             digest.update(chunk)
             size += len(chunk)
             if size > initial_identity.size:
@@ -717,4 +819,4 @@ class ArtifactPayloadService:
             raise ValueError(f"{mutation_label} mutated")
 
 
-__all__ = ["ArtifactPayloadService"]
+__all__ = ["ArtifactPayloadBudgetExceeded", "ArtifactPayloadService"]

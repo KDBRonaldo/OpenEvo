@@ -942,6 +942,10 @@ def test_adapter_output_is_bound_to_request_model_and_runtime_limit() -> None:
     wrong_model = AdapterContribution(
         contribution_id="adapter",
         source_artifact_id="adapter-artifact",
+        source_payload_digest=artifact.payload_manifest_digest,
+        source_size_bytes=sum(
+            entry.size_bytes for entry in artifact.payload_entries
+        ),
         adapter_id="adapter-1",
         adapter_format="lora",
         base_model="Other/base",
@@ -963,6 +967,15 @@ def test_adapter_output_is_bound_to_request_model_and_runtime_limit() -> None:
     forged = first_adapter.model_copy(update={"adapter_id": "forged"})
     with pytest.raises(ValueError, match="source artifact manifest"):
         snapshot.validate_handler_output(output(forged), handler_input=handler_input)
+
+    forged_payload = first_adapter.model_copy(
+        update={"source_payload_digest": "0" * 64}
+    )
+    with pytest.raises(ValueError, match="source payload inventory"):
+        snapshot.validate_handler_output(
+            output(forged_payload),
+            handler_input=handler_input,
+        )
 
 
 def test_adapter_application_limit_is_context_wide() -> None:
@@ -1013,6 +1026,10 @@ def test_adapter_application_limit_is_context_wide() -> None:
         adapter = AdapterContribution(
             contribution_id=f"contribution_{adapter_id.replace('-', '_')}",
             source_artifact_id=artifact_id,
+            source_payload_digest=artifact.payload_manifest_digest,
+            source_size_bytes=sum(
+                entry.size_bytes for entry in artifact.payload_entries
+            ),
             adapter_id=adapter_id,
             adapter_format="lora",
             base_model="Qwen/base",

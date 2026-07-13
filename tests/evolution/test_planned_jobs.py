@@ -29,6 +29,7 @@ from openevo.evolution.planned_jobs import (
 )
 from openevo.evolution.store import EvolutionStore
 from openevo.evolution.server import create_app
+from tests.framework_testkit import verified_builtin_registry
 
 
 def _snapshot():
@@ -454,3 +455,21 @@ def test_planned_job_api_requires_and_uses_the_active_registry(tmp_path) -> None
 
     assert response.status_code == 200
     assert response.json()["job_id"].startswith("job_")
+
+
+def test_planned_job_api_uses_snapshot_from_executable_registry(tmp_path) -> None:
+    registry = verified_builtin_registry(tmp_path / "verified-registry")
+    app = create_app(
+        db_path=tmp_path / "evolution-api.db",
+        artifact_root=tmp_path / "api-artifacts",
+        executable_registry=registry,
+    )
+    request = _request(app.state.store)
+
+    response = TestClient(app).post(
+        "/v1/planned-jobs",
+        json=request.model_dump(mode="json"),
+    )
+
+    assert response.status_code == 422
+    assert "active verified registry" not in response.text

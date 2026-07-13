@@ -115,6 +115,8 @@ PayloadContribution: TypeAlias = (
 class AdapterContribution(_Contract):
     contribution_id: str
     source_artifact_id: str
+    source_payload_digest: str
+    source_size_bytes: int = Field(ge=0)
     adapter_id: str
     adapter_format: str
     base_model: str
@@ -124,6 +126,7 @@ class AdapterContribution(_Contract):
         _stable_id
     )
     _artifact = field_validator("source_artifact_id")(_text)
+    _payload_digest = field_validator("source_payload_digest")(_digest)
     _model = field_validator("base_model")(_text)
 
 
@@ -242,7 +245,7 @@ class RendererPayload(_Contract):
 
 
 class TargetHandlerOutput(_Contract):
-    contract_version: Literal["1"] = "1"
+    contract_version: Literal["2"] = "2"
     target_id: str
     handler_id: str
     artifact_ids: tuple[str, ...] = Field(min_length=1, max_length=MAX_HANDLER_ARTIFACTS)

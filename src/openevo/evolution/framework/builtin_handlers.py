@@ -397,6 +397,10 @@ def parametric_memory_handler(
             AdapterContribution(
                 contribution_id=f"adapter_{index}",
                 source_artifact_id=artifact.artifact_id,
+                source_payload_digest=artifact.payload_manifest_digest,
+                source_size_bytes=sum(
+                    entry.size_bytes for entry in artifact.payload_entries
+                ),
                 adapter_id=adapter_id,
                 adapter_format=adapter_format,
                 base_model=manifest_base_model,

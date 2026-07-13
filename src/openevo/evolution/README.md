@@ -46,15 +46,55 @@ opaque handles 和 canonical digest inventory。Linux Core 先用 `O_PATH` 固�
 再从 fixed fd 获取可读对象；所有目录/文件节点在排序前受总量限制，snapshot 签发前会重验
 每个后代 identity。Text handler 读取时会重新打开并验证完整文件的 identity、digest 和
 UTF-8，只返回 character/byte 双重上限内的 prefix，并在读取量超过 snapshot size 时立即
-失败。没有 Linux `O_PATH`/`/proc/self/fd` 等价语义的平台会 fail closed。
+失败。Regular file 必须只有一个 hardlink，避免 managed root 内的 link 仍指向 root 外可见
+inode；同一个 request-scoped service 的 snapshots 共享累计 node/file/byte budget。没有
+Linux `O_PATH`/`/proc/self/fd` 等价语义的平台会 fail closed。
+该累计预算按 scan/verified-reread attempt 即时消费，而不是只在 snapshot 成功签发后记账：
+失败候选已经枚举的 node/file 和所有已经读取、hash 的 bytes 不会退回预算。Internal
+projection 在 compatibility filter/ranking 前对 DB routing metadata 施加 JSON
+depth/node/collection/byte limits，snapshot I/O 前再绑定 canonical manifest/scores；legacy
+artifact registration/worker completion 的接受范围不因该内部 contract 改变，超限候选只以
+`metadata_policy_rejected` 隔离。
 
 Issued inventory 不是 source bytes 的 immutable copy 或 lease；source 在签发后仍可能变化。
 因此任何 byte-consuming read/staging 都必须重新校验 exact size、identity 和 digest。当前
 text read 已执行该规则，未来 materializer 必须复用同一规则，不能只信任 inventory metadata。
 
-该 scanner 当前尚未接入 legacy `/v1/contexts/resolve` 和 Gateway materialization；这两处
-仍是 A2.4 后续工作。它不支持远程 `hf`/`https`/`s3` inventory，不解压 archives，也不允许
-把 artifact root 外的任意 host path 加入信任范围。
+`context_projection.py` 已把 scanner、verified executable registry 和 target handlers 接成
+内部 projection v1。它保持现有 compatibility filter 和全局 ranking；每个 target 只接收原顺序
+的连续 snapshot ranks，handler output 经过单 target 及 context-wide validation，再以
+`registry_digest + destination_roots + projections + selection` 持久化。Response 不包含 artifact
+URI、host source path 或 opaque handle。无法安全 snapshot 的单个 artifact 会被排除；handler
+或 registry contract 失败不会回退 legacy resolver。Subscription profile 在调用 adapter-only
+handler 前通用抑制该 target。Skip 只暴露 bounded reason code，不回显 URI/path/error。Artifact
+manifest 语义来自注册事务写入 DB 的 deterministic immutable `manifest_json`，projection 不读取可变的 legacy
+manifest file；升级前缺少该绑定的 artifact 会以 `unbound_legacy_metadata` 隔离，不能从文件
+静默回填，重新注册后才能被新 projection 消费。Payload 的
+symlink、hardlink 或 root escape 会被拒绝。Adapter contribution 记录 resolve 时批准的 payload digest 和 byte size，供
+materializer 重新扫描后比对。Store 在加载 promoted rows 前施加总 candidate 上限，每个 target
+在 payload I/O 前施加 attempt 上限。显式 artifact allowlist 会下推到 SQL；implicit selection
+的总上限优先分配给具备 local `file://` 与 immutable manifest binding 的候选，bounded
+remote/unbound/metadata-policy skip 不能挤掉可投影候选；skip query 只返回 bounded
+compatibility routing data 与 identity/reason markers，不把被拒绝的 source URI、name、
+manifest 或 scores 搬入 Python；只有先通过 compatibility filter 的 artifact 才会持久化
+typed skip，无法验证 compatibility 的行不会进入 context。Projection request 使用 strict closed agent/metadata schema，
+不接受 agent env 或任意 secret-shaped metadata；task tag、artifact ID 元素和完整 canonical
+request bytes 都有显式上限。
+
+安全扫描成功不等于 artifact 语义有效。缺少 `SKILL.md`、非法 target path、handler output
+contract 违规或 context-wide conflict 都使本次内部 projection 整体 fail closed；Core 不尝试
+通过逐 artifact 猜测来掩盖 handler/registry 缺陷。只有 snapshot/transport policy 无法接受的
+单 artifact 才进入 typed skip。
+
+该内部 resolver 尚未替换公开 legacy `/v1/contexts/resolve` 和 Gateway materialization；公开
+runtime 路径保持原行为，直到 generic materializer、严格 v2 client 和 Gateway 可以原子切换。
+其中也包括 public v1 原有的 subscription auth alias 判定；更通用的 `*_subscription` 识别只
+存在于 internal projection execution-profile 校验中。
+Public legacy artifact read 仍读取 legacy manifest file；immutable `manifest_json` 只由内部
+projection 使用，直到后续有显式 versioned public migration。Target 的 `max_artifacts=0`
+表示本次 projection 禁用该 target，不调用 handler。
+scanner 不支持远程 `hf`/`https`/`s3` inventory，不解压 archives，也不允许把 artifact root 外
+的任意 host path 加入信任范围。
 
 这个 backend 不负责训练 LoRA adapters，也不负责 serving inference。
 Parametric memory artifacts 会被注册到 backend，并在 context resolve 时以

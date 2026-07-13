@@ -580,6 +580,40 @@ artifacts and the next harness session. It filters compatibility, ranks promoted
 artifacts deterministically, and returns the exact payloads that gateway runtime
 injection stages.
 
+Runtime cutover currently has two deliberately non-overlapping stages. The public
+`POST /v1/contexts/resolve` contract below remains the sole Gateway path until the
+generic materializer is ready. Separately, Core has an internal projection v1
+resolver that issues managed payload snapshots, invokes only handlers from the
+sealed executable registry, performs single-target and context-wide validation,
+and persists ordered `TargetHandlerOutput` values. That internal response contains
+`registry_digest`, `destination_roots`, `projections`, and actual consumed-artifact
+selection; it contains no source URI, host path, opaque handle, or legacy
+`memory`/`skills` shadow fields. It is not a public API and has no client fallback.
+Its strict request accepts only harness/auth facts, task tags, explicit context
+artifact IDs, bounded target limits, and Core runtime facts; arbitrary agent env and
+metadata are rejected rather than persisted. Collection elements and the complete
+canonical request have explicit byte/length bounds. Manifest semantics use the deterministic immutable
+DB record committed during registration, not the mutable legacy manifest file;
+legacy rows without that binding are quarantined with a bounded reason code and must
+be re-registered rather than silently backfilled;
+managed payload reads reject symlinks, multiply linked regular files, root escapes,
+and drift. Candidate counts are bounded before payload I/O. Manifest/scores are
+validated before scanning; compatibility/scores are bounded before filtering or
+ranking, and explicit artifact IDs are applied in the store query. Implicit selection
+reserves its bounded row budget for local manifest-bound candidates before bounded
+remote/unbound/metadata-policy skip rows. Rejected rows are projected by SQL to bounded
+compatibility routing data plus identity/reason markers rather than returning their
+source manifest, scores, name, or URI. Compatibility is validated before even a typed
+skip is persisted; unverifiable or incompatible rows do not enter the context.
+Aggregate node/file/byte resources are consumed during
+every scan and verified-reread attempt without rollback when a candidate fails. Adapter projections
+carry the approved payload digest and size; typed skips never expose a rejected URI
+or host path. Routing metadata outside the internal projection policy is quarantined
+without changing legacy artifact-registration acceptance. Semantically invalid promoted artifacts and handler/aggregate contract
+violations fail the entire projection instead of triggering an inferred subset.
+Materializer plus strict v2 client/Gateway switching must land atomically before v1
+is removed.
+
 ## Context Resolve Contract
 
 Gateway 在 run 前调用：

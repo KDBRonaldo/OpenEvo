@@ -454,6 +454,10 @@ def validate_handler_output(
     if output.handler_id != target.handler_id:
         raise ValueError("handler output does not match target handler")
     handler = snapshot.target_handlers[target.handler_id]
+    if handler_input.contract_version != handler.input_contract_version:
+        raise ValueError("handler input contract mismatch")
+    if output.contract_version != handler.contribution_contract_version:
+        raise ValueError("handler output contribution contract mismatch")
     input_artifacts = {
         artifact.artifact_id: artifact for artifact in handler_input.ranked_artifacts
     }
@@ -561,6 +565,15 @@ def validate_handler_output(
             raise ValueError("adapter contribution does not match requested base model")
         for adapter in output.adapters:
             artifact = input_artifacts[adapter.source_artifact_id]
+            if (
+                adapter.source_payload_digest
+                != artifact.payload_manifest_digest
+                or adapter.source_size_bytes
+                != sum(entry.size_bytes for entry in artifact.payload_entries)
+            ):
+                raise ValueError(
+                    "adapter contribution does not match source payload inventory"
+                )
             expected = _canonical_adapter_manifest(
                 artifact,
                 handler_input.base_model,

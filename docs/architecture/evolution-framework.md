@@ -1,6 +1,6 @@
 # Pluggable Evolution Framework
 
-Status: A2.3 Core plus A2.4 Desktop config/preflight, executable handlers, and payload scanner implemented
+Status: A2.3 Core plus A2.4 Desktop config/preflight, executable handlers, payload scanner, and internal projection resolver implemented
 
 Tracking: issues #137, #139, #141, #142, #144, #146, #148, and #150, productization step A2. A2.1
 implements contracts for `PLUG-1` through `PLUG-4`; A2.2 catalogs the existing
@@ -389,8 +389,10 @@ source identity/digest verification while streaming and returns only a
 handlers cannot request an inventory-sized in-memory read. `TargetHandlerOutput`
 may contain only:
 
-Handler contract v1 limits are: 128 ranked/consumed artifacts, 256 total output
-contributions, 256 inventory/renderer files, depth 32, 4,096-character relative
+Each handler descriptor identifies input v1, renderer v1, and output/contribution
+v2 independently; Core checks all three at invocation. Their limits are: 128
+ranked/consumed artifacts, 256 total output contributions, 256 inventory/renderer
+files, depth 32, 4,096-character relative
 paths, 8 GiB per inventory entry, 16 GiB per payload tree, 1 MiB semantic text,
 and 256 KiB for each canonical manifest/scores payload. Renderer JSON remains
 bounded to the worst-case JSON escaping of one 1 MiB text contribution plus
@@ -401,11 +403,17 @@ materializer rather than loaded as one in-memory value.
 - instruction contributions with source artifact IDs;
 - staged payloads referencing the verified inventory or bounded inline merged
   text, plus digest/MIME, destination scope, and safe relative destination;
-- adapter contributions with source artifact, ID/format, model, and weight;
+- adapter contributions with source artifact, approved payload digest/size,
+  ID/format, model, and weight;
 - Core-approved environment bindings to staged contributions;
 - Core-approved `scope_root` environment bindings for one descriptor-allowlisted
   logical destination root, such as the shared harness skills directory;
 - one renderer payload referencing output contribution IDs.
+
+Output/contribution v2 adds the mandatory approved payload digest and byte size to
+adapter contributions. This is intentionally versioned separately from renderer v1;
+v1 handler outputs are not accepted as v2, so installed handlers and consumers cannot
+silently disagree about adapter provenance.
 
 Each descriptor allowlists contribution kinds, destination scopes, MIME types,
 URI schemes, and environment names. Renderer v1 has closed `markdown`,
@@ -459,7 +467,12 @@ and final descendant path identities; streams bounded inventory digests; and
 validates the entire UTF-8 file even when returning only a prefix. A verified
 reread aborts immediately if bytes exceed the issued size. Opaque handles are
 random, process-local, collision-checked, and invalidated when the service
-closes. Unknown suffixes become `application/octet-stream`; descriptor MIME
+closes. Regular files with a link count other than one are rejected, so a managed
+path cannot authorize an inode that remains linked outside the managed root. All
+snapshot scans and verified rereads in one request-scoped service share aggregate
+node, file, and byte budgets in addition to per-entry limits. Failed attempts do not
+refund enumeration or hashing resources. Unknown suffixes become
+`application/octet-stream`; descriptor MIME
 validation remains authoritative. Platforms without Linux `O_PATH` fail closed
 until an equivalent fixed-object implementation exists; this does not affect
 the macOS Desktop host because Core payload scanning runs on the remote server.
@@ -472,12 +485,63 @@ materializer must reopen the fixed object and revalidate identity, exact size,
 and digest. Drift fails closed; Core never returns or stages the changed bytes.
 
 The scanner does not download or invent inventory for `hf`, `https`, or `s3`
-references, and it does not extract archives. Resolver invocation and the
-materializer cutover are still pending: verified staging must repeat inventory
-identity/digest checks and enforce archive limits if extraction is added. Until
-that cutover, the legacy Gateway skill URI copy remains a documented TOCTOU
-risk. An inventory supplied by a handler is never proof that host bytes were
+references, and it does not extract archives. The internal projection v1 resolver
+now preserves the existing compatibility filter and global candidate ranking,
+issues contiguous per-target snapshots, invokes only the exact callable from the
+verified executable registry, validates each output and the context-wide aggregate,
+and persists the ordered `TargetHandlerOutput` collection with registry digest,
+runtime destination roots, and actual consumed-artifact selection. Snapshot-local
+handles and source URIs never enter that persisted contract. Individual artifacts
+that cannot be safely snapshotted are excluded; handler, registry, or aggregate
+validation failures fail closed without a legacy fallback. Subscription execution
+skips adapter-only handlers using contribution vocabulary rather than a target ID.
+Skip records contain only an artifact ID and bounded `unsupported_uri_scheme`,
+`payload_policy_rejected`, `metadata_policy_rejected`, or
+`unbound_legacy_metadata` code. Artifact semantics come from deterministic immutable
+`manifest_json` committed in the artifact registration transaction; projection never
+trusts the mutable legacy manifest file. A migrated artifact without that immutable
+binding is quarantined with `unbound_legacy_metadata` and must be registered again
+rather than backfilled from a file. A malformed registration binding fails the
+projection closed; metadata that is valid for legacy registration but outside the
+internal projection policy is quarantined.
+The request is a strict closed Core-to-Core schema: agent harness/auth and task
+tags/explicit artifact IDs are allowed, while arbitrary agent env and metadata are
+not. Its collection elements and complete canonical JSON representation are bounded.
+Explicit artifact IDs are applied in the SQL query. Store-level and per-target attempt
+limits apply before payload scanning; implicit selection gives local manifest-bound
+candidates priority over bounded remote/unbound/metadata-policy skip rows. The internal
+resolver bounds DB compatibility/scores before filtering or ranking without changing
+legacy registration or worker-completion acceptance. SQL returns only bounded
+compatibility routing data plus identity/reason markers for rejected rows; it never
+returns their source URI, name, manifest, or scores. Resolver validates compatibility
+before persisting either a selection or a typed skip, and omits rows whose compatibility
+cannot be established. Static snapshot metadata is validated
+before payload I/O, while every attempted node/file and every byte read for scan or
+verified-reread hashing consumes the request-scoped aggregate budget immediately; a
+failed snapshot/read does not refund those resources.
+Adapter contributions retain the approved payload inventory digest and total size,
+so later materialization can reject source drift.
+
+A safely scanned but semantically invalid promoted artifact is not an artifact-local
+transport failure. Handler errors such as a missing root `SKILL.md`, invalid target
+semantics, invalid output, or context-wide conflicts fail the full projection. Core
+does not invoke handlers speculatively per artifact to guess a valid subset, because
+that would change handler semantics and hide registry defects.
+
+This projection service is internal while materialization is unfinished. Public
+`/v1/contexts/resolve` and Gateway still use the legacy response, so there is no
+Gateway dual-parser or shadow response. The next cutover must materialize the same
+projection contract, repeat inventory identity/digest checks, enforce archive limits
+if extraction is added, and atomically switch a strict v2 client plus Gateway before
+removing v1. Until then, the legacy Gateway skill URI copy remains a documented
+TOCTOU risk. An inventory supplied by a handler is never proof that host bytes were
 staged safely.
+The legacy resolver also retains its original subscription alias set; generalized
+`*_subscription` recognition is internal to projection execution-profile validation.
+Legacy artifact GET/list responses continue to read the legacy manifest file; the
+immutable DB binding is internal to projection until a versioned public API migration.
+Setting a target's `max_artifacts` to zero disables that target for the projection and
+does not invoke its handler.
 Method plugins run with worker permissions. Target handlers are Core-loaded and
 run with Core-process permissions unless a future isolation boundary says
 otherwise. Neither contract claims to sandbox arbitrary Python.

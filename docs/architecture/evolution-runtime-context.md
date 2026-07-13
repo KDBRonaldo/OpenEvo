@@ -10,12 +10,25 @@ Runtime context 的注入发生在 gateway session 被 dispatch 之后、agent h
 选择上下文。
 
 当前处于 handler runtime cutover 过渡期。Core 已实现只读取 managed artifact root 的
-no-follow payload scanner、opaque handle 和全文件 digest/UTF-8 重验，但现有
-`/v1/contexts/resolve` 和 Gateway staging 还在消费 legacy response/URI。完成 generic
-resolver 和 materializer 切换前，scanner 不代表 skill URI copy 已具备端到端 TOCTOU
-保护；release 路径不得把任意外部 `file://` root 加入 scanner allowlist。当前 scanner
-依赖 Linux Core 的 `O_PATH` 和 `/proc/self/fd` fixed-object reopen；macOS Desktop 不在
-本地执行该 payload scan。
+no-follow payload scanner、opaque handle、全文件 digest/UTF-8 重验，以及内部 projection
+v1 resolver。内部 resolver 通过完整 verified executable registry 调用 handler，持久化
+validated ordered contributions、registry digest、runtime roots 和实际 consumed selection；
+不持久化 URI、host source path 或 handle。Adapter projection 额外保留批准时的 payload
+inventory digest/size；manifest 语义绑定注册事务中的 deterministic immutable DB record，payload 走 managed
+no-follow reader，candidate 与累计扫描资源有硬上限；所有 scan attempt 在枚举/读取时即时消费
+不可退回的累计 node/file/byte budget，verified reread 的 hashing 也消费同一预算；internal
+ranking 前对 artifact metadata 施加结构/byte 上限，超限只隔离于新 projection，不改变 legacy
+registration/worker completion。显式 artifact IDs 下推 SQL，implicit
+selection 优先保留 local manifest-bound candidates；rejected rows 只以 bounded
+compatibility routing data 与 identity/reason markers 进入 Python，且必须先通过
+compatibility filter 才能持久化 typed skip；source URI、name、manifest、scores 不进入该
+路径。现有
+`/v1/contexts/resolve` 和 Gateway staging
+仍在消费 legacy response/URI，内部 projection 尚未成为公开 runtime path。完成 generic
+materializer 与 strict v2/Gateway 原子切换前，scanner 不代表 skill URI copy 已具备端到端
+TOCTOU 保护；release 路径不得把任意外部 `file://` root 加入 scanner allowlist。当前
+scanner 依赖 Linux Core 的 `O_PATH` 和 `/proc/self/fd` fixed-object reopen；macOS Desktop
+不在本地执行该 payload scan。
 
 ## 端到端流程
 

@@ -100,6 +100,75 @@ def smoke(wheel_path: Path) -> dict[str, object]:
     }
     if set(loaded.descriptor_anchors) != expected_anchor_keys:
         raise RuntimeError("installed target anchors are incomplete")
+
+    from openevo.evolution.context_projection import ContextProjectionResolveRequest
+    from openevo.evolution.framework import (
+        EvolutionExecutionProfile,
+        RuntimeDestinationRoots,
+    )
+    from openevo.evolution.models import ArtifactRegisterRequest, ArtifactType
+    from openevo.evolution.store import EvolutionStore
+
+    with tempfile.TemporaryDirectory(prefix="openevo-migration-projection-smoke-") as temp_dir:
+        state_root = Path(temp_dir)
+        db_path = state_root / "evolution.db"
+        artifact_root = state_root / "artifacts"
+        legacy_store = EvolutionStore(db_path=db_path, artifact_root=artifact_root)
+        legacy_store.initialize()
+        legacy_payload = artifact_root / "payloads" / "legacy.md"
+        legacy_payload.parent.mkdir()
+        legacy_payload.write_text("legacy memory", encoding="utf-8")
+        legacy_artifact = legacy_store.register_artifact(
+            ArtifactRegisterRequest(
+                type=ArtifactType.TEXT_MEMORY,
+                name="legacy memory",
+                uri=legacy_payload.as_uri(),
+                manifest={"content_path": legacy_payload.name},
+                promoted=True,
+            )
+        )
+        with legacy_store.connect() as connection:
+            connection.execute("ALTER TABLE artifacts DROP COLUMN manifest_json")
+            connection.commit()
+
+        migrated_store = EvolutionStore(
+            db_path=db_path,
+            artifact_root=artifact_root,
+            executable_registry=loaded,
+        )
+        migrated_store.initialize()
+        current_payload = artifact_root / "payloads" / "current.md"
+        current_payload.write_text("current memory", encoding="utf-8")
+        current_artifact = migrated_store.register_artifact(
+            ArtifactRegisterRequest(
+                type=ArtifactType.TEXT_MEMORY,
+                name="current memory",
+                uri=current_payload.as_uri(),
+                manifest={"content_path": current_payload.name},
+                promoted=True,
+            )
+        )
+        projection = migrated_store.resolve_context_projections(
+            ContextProjectionResolveRequest(
+                task_id="installed-wheel-migration-smoke",
+                instruction="Continue.",
+                agent={"harness": "codex"},
+                execution_profile=EvolutionExecutionProfile(
+                    execution_mode="self_deployed",
+                    capture_mode="transcript",
+                    harness_id="codex",
+                ),
+                destination_roots=RuntimeDestinationRoots(
+                    target_data="/openevo/session/evolution",
+                    harness_skills="/openevo/session/evolution/skills",
+                    harness_instruction="/workspace/repository",
+                ),
+            )
+        )
+        if projection.selection.artifact_ids != (current_artifact.artifact_id,):
+            raise RuntimeError("installed migrated store did not project current artifact")
+        if projection.selection.skipped_artifact_ids != (legacy_artifact.artifact_id,):
+            raise RuntimeError("installed migrated store did not quarantine legacy artifact")
     return {
         "distribution": "openevo",
         "version": version,

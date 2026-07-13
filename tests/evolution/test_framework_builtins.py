@@ -226,6 +226,9 @@ def test_builtin_descriptors_use_exact_method_target_and_handler_entry_points(
     handler_names: set[str] = set()
     for descriptor in snapshot.target_handlers.values():
         assert descriptor.implementation_ref is not None
+        assert descriptor.input_contract_version == "1"
+        assert descriptor.renderer_contract_version == "1"
+        assert descriptor.contribution_contract_version == "2"
         module_name, attribute_name = _entry_point_parts(
             descriptor.implementation_ref.entry_point
         )

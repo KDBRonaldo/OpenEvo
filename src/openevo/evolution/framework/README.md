@@ -81,7 +81,14 @@ descriptor's explicit ABI. `run_method()` and
 jobs. Target descriptors retain non-executable identity anchors; target-handler
 descriptors now load exact attested callables into
 `VerifiedExecutableRegistry.handler_handles`. Resolver invocation, secure payload
-materialization, and gateway cutover remain unfinished A2.4 work.
+projection persistence, and payload scanning are implemented. Secure payload
+materialization, strict v2 API/Gateway cutover, and removal of legacy v1 remain
+unfinished A2.4 work.
+
+Every target-handler descriptor identifies input v1, renderer v1, and
+output/contribution v2 independently, and invocation validates all three. Output v2
+requires adapter contributions to bind the approved payload inventory digest and byte
+size; v1 outputs are rejected rather than inferred.
 
 Text handlers have separate source-consumption and bounded runtime-projection
 budgets. Only equal source IDs plus equal text are deduplicated; derived target
