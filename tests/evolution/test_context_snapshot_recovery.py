@@ -220,6 +220,72 @@ def test_legacy_mode_migration_rejects_unsafe_permissions(
         assert stat.S_IMODE(snapshot.stat().st_mode) == mode
 
 
+def test_legacy_mode_migration_rejects_unreadable_snapshot_before_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artifact_root = tmp_path / "managed"
+    with _artifact_root_descriptor(artifact_root) as artifact_root_fd:
+        snapshot = artifact_root / "contexts" / "ctx_unreadable.json"
+        snapshot.write_bytes(_canonical("ctx_unreadable"))
+        snapshot.chmod(0o200)
+
+        def unexpected_open(_directory_fd: int, _name: str, _flags: int) -> int:
+            raise AssertionError("unsafe legacy snapshot must be rejected before open")
+
+        monkeypatch.setattr(recovery, "_open_snapshot_file", unexpected_open)
+        with pytest.raises(ContextSnapshotIntegrityError, match="owner-readable and writable"):
+            migrate_legacy_context_snapshot_modes(artifact_root_fd)
+
+        assert stat.S_IMODE(snapshot.stat().st_mode) == 0o200
+
+
+def test_legacy_mode_migration_rechecks_identity_after_preflight(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artifact_root = tmp_path / "managed"
+    original_contents = _canonical("ctx_preflight_race")
+    replacement_contents = _canonical("ctx_replacement")
+    with _artifact_root_descriptor(artifact_root) as artifact_root_fd:
+        contexts = artifact_root / "contexts"
+        snapshot = contexts / "ctx_preflight_race.json"
+        snapshot.write_bytes(original_contents)
+        snapshot.chmod(0o644)
+        original_open = recovery._open_snapshot_file
+
+        def replace_before_open(directory_fd: int, name: str, flags: int) -> int:
+            os.rename(
+                name,
+                "ctx_original.json",
+                src_dir_fd=directory_fd,
+                dst_dir_fd=directory_fd,
+            )
+            replacement_fd = os.open(
+                name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC,
+                0o644,
+                dir_fd=directory_fd,
+            )
+            try:
+                os.write(replacement_fd, replacement_contents)
+                os.fchmod(replacement_fd, 0o644)
+                os.fsync(replacement_fd)
+            finally:
+                os.close(replacement_fd)
+            return original_open(directory_fd, name, flags)
+
+        monkeypatch.setattr(recovery, "_open_snapshot_file", replace_before_open)
+        with pytest.raises(ContextSnapshotIntegrityError, match="changed before it was opened"):
+            migrate_legacy_context_snapshot_modes(artifact_root_fd)
+
+        moved = contexts / "ctx_original.json"
+        assert moved.read_bytes() == original_contents
+        assert stat.S_IMODE(moved.stat().st_mode) == 0o644
+        assert snapshot.read_bytes() == replacement_contents
+        assert stat.S_IMODE(snapshot.stat().st_mode) == 0o644
+
+
 def test_legacy_mode_migration_preflights_unknown_entries_before_chmod(
     tmp_path: Path,
 ) -> None:

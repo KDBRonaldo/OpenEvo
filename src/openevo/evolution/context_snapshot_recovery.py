@@ -568,17 +568,28 @@ def _legacy_mode_candidate_at(
     context_id: str,
 ) -> _LegacyModeCandidate:
     name = _snapshot_name(context_id)
+    label = f"legacy context snapshot {name!r}"
+    try:
+        path_stat = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except OSError as exc:
+        raise ContextSnapshotIntegrityError(f"{label} changed or disappeared") from exc
+    path_identity, path_permissions = _require_legacy_mode_candidate(
+        path_stat,
+        label=label,
+    )
     descriptor = _open_snapshot_file(directory_fd, name, os.O_RDONLY)
     try:
         identity, permissions = _require_legacy_mode_candidate(
             os.fstat(descriptor),
-            label=f"legacy context snapshot {name!r}",
+            label=label,
         )
+        if identity != path_identity or permissions != path_permissions:
+            raise ContextSnapshotIntegrityError(f"{label} changed before it was opened")
         _require_exact_path_identity(
             directory_fd,
             name,
             identity,
-            label=f"legacy context snapshot {name!r}",
+            label=label,
         )
         return _LegacyModeCandidate(
             context_id=context_id,
