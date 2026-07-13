@@ -14,7 +14,7 @@ from typing import Any
 
 import httpx
 
-from openevo.evolution.terminal_bench_per_task import (
+from openevo_terminal_bench.per_task import (
     DEFAULT_TERMINAL_BENCH_ENVIRONMENT_IMPORT_PATH,
     DEFAULT_TERMINAL_BENCH_EXTRA_DOCKER_COMPOSE,
     DEFAULT_TERMINAL_BENCH_PACKAGE_ROOT,

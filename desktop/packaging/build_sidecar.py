@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 from email.parser import Parser
 import hashlib
+from io import BytesIO
 import os
 from pathlib import Path
 import re
@@ -14,10 +15,41 @@ import subprocess
 import sys
 from tempfile import TemporaryDirectory
 import tomllib
-from zipfile import ZipFile
+from zipfile import BadZipFile, ZipFile
 
 SIDECAR_NAME = "openevo-desktop-sidecar"
 CORE_WHEEL_ARCHIVE_ROOT = Path("openevo/wheels")
+FORBIDDEN_LEGACY_CORE_MODULE_FILES = frozenset(
+    {
+        "openevo/evolution/terminal_bench_bridge.py",
+        "openevo/evolution/terminal_bench_local_parametric.py",
+        "openevo/evolution/terminal_bench_per_task.py",
+        "openevo/evolution/terminal_bench_task_local_parametric.py",
+    }
+)
+FORBIDDEN_LEGACY_SIDECAR_MODULES = frozenset(
+    path.removesuffix(".py").replace("/", ".")
+    for path in FORBIDDEN_LEGACY_CORE_MODULE_FILES
+)
+
+
+def _validate_core_inventory(names: set[str], *, container: str) -> None:
+    benchmark_members = sorted(
+        member
+        for member in names
+        if member.startswith(("openevo_terminal_bench/", "benchmarks/terminal_bench/"))
+    )
+    if benchmark_members:
+        raise RuntimeError(
+            f"{container} must not contain Terminal Bench automation: "
+            f"{benchmark_members}"
+        )
+    legacy_modules = sorted(names & FORBIDDEN_LEGACY_CORE_MODULE_FILES)
+    if legacy_modules:
+        raise RuntimeError(
+            f"{container} must not contain removed Terminal Bench Core modules: "
+            f"{legacy_modules}"
+        )
 
 
 def _repo_root() -> Path:
@@ -73,8 +105,10 @@ def _project_identity(repo: Path) -> tuple[str, str]:
 def _validate_core_wheel(wheel: Path, *, name: str, version: str) -> None:
     try:
         with ZipFile(wheel) as archive:
+            names = set(archive.namelist())
+            _validate_core_inventory(names, container="Core wheel")
             nested_wheels = [
-                member for member in archive.namelist() if member.endswith(".whl")
+                member for member in names if member.endswith(".whl")
             ]
             if nested_wheels:
                 raise RuntimeError(
@@ -82,7 +116,7 @@ def _validate_core_wheel(wheel: Path, *, name: str, version: str) -> None:
                 )
             metadata_names = [
                 member
-                for member in archive.namelist()
+                for member in names
                 if member.endswith(".dist-info/METADATA")
             ]
             if len(metadata_names) != 1:
@@ -163,11 +197,18 @@ def _build_core_wheel(repo: Path, build_root: Path) -> Path:
 
 def _archive_member_names(executable: Path) -> tuple[str, ...]:
     try:
-        from PyInstaller.archive.readers import CArchiveReader
+        from PyInstaller.archive.readers import CArchiveReader, NotAnArchiveError
     except ImportError as exc:
         raise RuntimeError("PyInstaller is required to inspect the sidecar archive") from exc
     archive = CArchiveReader(str(executable))
-    return tuple(str(name).replace("\\", "/") for name in archive.toc)
+    names = {str(name).replace("\\", "/") for name in archive.toc}
+    for member_name in archive.toc:
+        try:
+            embedded = archive.open_embedded_archive(member_name)
+        except NotAnArchiveError:
+            continue
+        names.update(str(name).replace("\\", "/") for name in embedded.toc)
+    return tuple(sorted(names))
 
 
 def _archive_member_bytes(executable: Path, member_name: str) -> bytes:
@@ -208,10 +249,34 @@ def _copy_exclusive(source: Path, destination: Path) -> None:
 
 
 def _validate_embedded_core_wheel(executable: Path, wheel: Path) -> str:
+    archive_members = set(_archive_member_names(executable))
+    benchmark_members = sorted(
+        name
+        for name in archive_members
+        if name == "openevo_terminal_bench"
+        or name.startswith(("openevo_terminal_bench.", "openevo_terminal_bench/"))
+        or name.startswith("benchmarks/terminal_bench/")
+    )
+    if benchmark_members:
+        raise RuntimeError(
+            "Desktop sidecar must not contain Terminal Bench automation: "
+            f"{benchmark_members}"
+        )
+    legacy_modules = sorted(
+        name
+        for name in archive_members
+        if name in FORBIDDEN_LEGACY_CORE_MODULE_FILES
+        or name in FORBIDDEN_LEGACY_SIDECAR_MODULES
+    )
+    if legacy_modules:
+        raise RuntimeError(
+            "Desktop sidecar must not contain removed Terminal Bench Core modules: "
+            f"{legacy_modules}"
+        )
     expected = (CORE_WHEEL_ARCHIVE_ROOT / wheel.name).as_posix()
     embedded_wheels = sorted(
         name
-        for name in _archive_member_names(executable)
+        for name in archive_members
         if name.startswith(f"{CORE_WHEEL_ARCHIVE_ROOT.as_posix()}/")
         and name.endswith(".whl")
     )
@@ -221,7 +286,16 @@ def _validate_embedded_core_wheel(executable: Path, wheel: Path) -> str:
             f"expected {[expected]}, found {embedded_wheels}"
         )
     source_digest = _sha256_bytes(wheel.read_bytes())
-    embedded_digest = _sha256_bytes(_archive_member_bytes(executable, expected))
+    embedded_payload = _archive_member_bytes(executable, expected)
+    try:
+        with ZipFile(BytesIO(embedded_payload)) as embedded_wheel:
+            _validate_core_inventory(
+                set(embedded_wheel.namelist()),
+                container="Desktop sidecar embedded Core wheel",
+            )
+    except BadZipFile as exc:
+        raise RuntimeError("Desktop sidecar embedded Core wheel is unreadable") from exc
+    embedded_digest = _sha256_bytes(embedded_payload)
     if embedded_digest != source_digest:
         raise RuntimeError(
             "sidecar embedded Core wheel digest does not match the built wheel: "

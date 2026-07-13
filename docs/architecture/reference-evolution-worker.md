@@ -592,15 +592,15 @@ Trainer contract:
   `qwen3_xml` tool parser。
 
 Task-local Terminal Bench parametric jobs can be prepared without going through
-the event store. The command below is a legacy source-checkout benchmark
-automation entrypoint. Productization should move Terminal Bench-specific
-automation out of Core; this section documents the worker contract it currently
-uses, not a long-term Core CLI surface:
+the event store. `openevo-terminal-bench` is already the standalone maintainer
+automation package under `benchmarks/terminal_bench/`; it is not a Core entrypoint
+awaiting migration. The command below uses that package and documents the Core
+worker contract it consumes:
 
 <!-- openevo:maintainer-only-command -->
 ```sh {.openevo-maintainer-only}
 OPEN_EVO_REPO=/path/to/OpenEvo
-uv run python -m openevo.evolution.cli terminal-bench-task-local-parametric-memory-job \
+openevo-terminal-bench terminal-bench-task-local-parametric-memory-job \
   --trajectory-pool /path/to/trajectory_pool.jsonl \
   --task-id train-fasttext \
   --output-root /tmp/tb21-task-local-parametric/train-fasttext \

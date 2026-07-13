@@ -1,0 +1,28 @@
+{
+  "schema_version": 2,
+  "profile_id": "tb21-skill-bundle-codex-gpt55-v1",
+  "status": "historical_configuration_only",
+  "benchmark": "Terminal Bench 2.1",
+  "harness": "Codex subscription",
+  "model": "gpt-5.5",
+  "method": "skill_bundle_reflector",
+  "task_manifest": "baseline_failed_tasks.json",
+  "historical_threshold": {
+    "metric": "pass_at_1_rescue_count",
+    "minimum": 14,
+    "denominator": 25
+  },
+  "evidence": {
+    "status": "unverified_historical_aggregate",
+    "source": "user_provided",
+    "aggregate": {
+      "metric": "pass_at_1_rescue_count",
+      "rescued": 14,
+      "denominator": 25
+    },
+    "per_task_evidence_status": "unavailable",
+    "gate_execution_status": "not_executed_by_this_change"
+  },
+  "executed_by_this_change": false,
+  "proves_release_gate": false
+}

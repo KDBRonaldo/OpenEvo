@@ -363,8 +363,8 @@ behavior.
 
 ## Algorithm Preservation And Performance Gate
 
-Three method families have already demonstrated useful evolution and block the
-release if productization regresses them:
+Three method families have frozen historical thresholds and block the release if
+the final candidate does not meet them:
 
 | Family | Canonical method ID | Frozen baseline-failed subset | Required pass@1 rescue count |
 | --- | --- | ---: | ---: |
@@ -398,10 +398,8 @@ Release-candidate benchmark rules:
   to reproduce the count;
 - block release when any family misses its threshold.
 
-The historical raw runs are no longer available. The counts above are the
-maintainer-confirmed targets; they must not be silently lowered. The first
-clean reproducible run becomes the durable release evidence while source and
-behavioral guards protect against productization drift.
+Historical raw runs are unavailable. Skill bundle's 14/25 is an unverified, user-provided aggregate with no per-task evidence; this migration did not run the gate, so it proves no algorithm performance.
+Thresholds cannot be lowered: every final candidate must rerun each complete frozen gate, including all 25 skill-bundle tasks, and retain task-level evidence as the durable release record.
 
 Methods still under development, including parametric memory and OPSD paths,
 may retain tests but do not satisfy or block these three performance gates
@@ -424,21 +422,23 @@ are sibling packages. Core may expose generic reusable contracts, but it must
 not contain Terminal Bench runners, scorers, materializers, task lists, or
 benchmark CLI commands. Desktop exposes no benchmark controls.
 
-Code location does not determine algorithm ownership. The current
-`terminal_bench_per_task.py` also contains GEPA candidate evaluation,
-best-result selection, and cross-generation/round transition behavior that
-produced the protected 17/25 result. A1 freezes that logic and A2 preserves it
-inside the algorithm-owned `agent_system_gepa_reflector` method before registry
-cutover. A3 then moves only task acquisition, Harbor/Terminal Bench
-execution, verifier adaptation, and benchmark reporting to
-`benchmarks/terminal_bench/`.
+Code location does not determine algorithm ownership. The protected GEPA
+candidate evaluation, best-result selection, and cross-generation/round
+transition policy remains in Core's `agent_system_gepa_kernel.py`. The
+standalone `benchmarks/terminal_bench/` runner calls that kernel while owning
+task acquisition, Harbor/Terminal Bench execution, verifier adaptation, and
+benchmark reporting.
 
 The release performance run must exercise the real Core path through dataset,
 job, worker, artifact registration, context resolution, runtime injection, and
 harness execution. A direct call to a method function is useful for unit tests
 but is not release performance evidence.
 
-Benchmark automation decides when tasks are requested and therefore preserves benchmark-specific cadence. Each request still goes through Core task admission and the `REV-1` through `REV-5` contract; automation cannot activate artifacts, bypass queued/not-ready, or launch with a stale or partial revision.
+Benchmark automation decides when tasks are requested and therefore preserves
+benchmark-specific cadence. The A3 mechanical package migration does not yet
+bind those requests to the `REV-1` through `REV-5` admission contract. That
+queued/not-ready integration is required in the next Issue #156 PR before a
+release performance run can claim the cross-session contract.
 
 ## OpenEvo Desktop
 

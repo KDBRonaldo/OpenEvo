@@ -30,8 +30,8 @@ GEPA evaluation and transition are algorithm behavior. A3 PR1 mechanically
 extracts their data-only state and selection kernel to
 `openevo.evolution.agent_system_gepa_kernel`; it does not change the method,
 registry, worker, or artifact lifecycle. Golden event tapes in
-`tests/evolution/test_agent_system_gepa_kernel.py` and the existing runner tests
-in `tests/evolution/test_terminal_bench_per_task.py` protect:
+`tests/evolution/test_agent_system_gepa_kernel.py` and the standalone runner tests
+in `benchmarks/terminal_bench/tests/test_per_task.py` protect:
 
 - objective value before generation and candidate-index tie-breaking;
 - `None` below every numeric reward or group score;
@@ -48,12 +48,12 @@ selection policy. A2.2 also freezes stable history-round ordering, best-round
 ties, missing generation/index fallbacks, and group objectives containing a
 missing reward. These fixtures add no algorithm or artifact lifecycle behavior.
 
-This extraction is only A3 PR1. Terminal Bench acquisition, Harbor execution,
-attempt selection, verifier adaptation, materialization, reporting, and CLI
-wiring remain in `src/openevo/evolution/terminal_bench_per_task.py` and related
-Core modules until the later standalone automation migration. In particular,
-`_select_best_attempt` remains benchmark policy and is not part of the Core GEPA
-kernel.
+A3 PR2 moves Terminal Bench acquisition, Harbor execution, attempt selection,
+verifier adaptation, materialization, reporting, and CLI wiring to
+`benchmarks/terminal_bench/` without a Core wrapper. `_select_best_attempt`
+remains benchmark policy, while selection and round transition continue to call
+the protected Core GEPA kernel. This mechanical migration does not add B3
+revision admission; queued/not-ready integration remains a subsequent PR.
 
 ## Protected Stage Boundaries
 
@@ -82,7 +82,7 @@ pytest -q \
   tests/evolution/test_algorithm_preservation_contract.py \
   tests/evolution/test_agent_system_gepa_kernel.py \
   tests/evolution/test_worker_methods.py \
-  tests/evolution/test_terminal_bench_per_task.py \
+  benchmarks/terminal_bench/tests/test_per_task.py \
   tests/evolution/test_architecture_flow.py \
   tests/gateway/test_evolution_integration.py \
   tests/gateway/test_session_lifecycle.py \

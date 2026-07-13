@@ -549,6 +549,8 @@ def test_rejects_core_wheel_packaging_desktop_control_plane(tmp_path: Path) -> N
     wheel = _write_wheel(
         tmp_path / "openevo-0.1.0-py3-none-any.whl",
         extra_files={
+            "openevo_terminal_bench/cli.py": "",
+            "benchmarks/terminal_bench/README.md": "",
             "openevo/desktop/web/index.html": "<title>OpenEvo Desktop</title>",
             "openevo/sidecar/api.py": "",
             "openevo/cli.py": "",
@@ -562,6 +564,8 @@ def test_rejects_core_wheel_packaging_desktop_control_plane(tmp_path: Path) -> N
 
     errors = checker.validate_wheel(wheel, expected_version="0.1.0")
 
+    assert any("openevo_terminal_bench/" in error for error in errors)
+    assert any("benchmarks/terminal_bench/" in error for error in errors)
     assert any("openevo/desktop/" in error for error in errors)
     assert any("openevo/sidecar/" in error for error in errors)
     assert any("openevo/cli.py" in error for error in errors)
@@ -570,6 +574,58 @@ def test_rejects_core_wheel_packaging_desktop_control_plane(tmp_path: Path) -> N
     assert any("desktop/src/" in error for error in errors)
     assert any("desktop/src-tauri/" in error for error in errors)
     assert any("desktop/packaging/web/" in error for error in errors)
+
+
+def test_rejects_removed_terminal_bench_modules_in_core_wheel(tmp_path: Path) -> None:
+    checker = _load_module()
+    legacy_modules = {
+        "openevo/evolution/terminal_bench_bridge.py": "",
+        "openevo/evolution/terminal_bench_local_parametric.py": "",
+        "openevo/evolution/terminal_bench_per_task.py": "",
+        "openevo/evolution/terminal_bench_task_local_parametric.py": "",
+    }
+    wheel = _write_wheel(
+        tmp_path / "openevo-0.1.0-py3-none-any.whl",
+        extra_files=legacy_modules,
+    )
+
+    errors = checker.validate_wheel(wheel, expected_version="0.1.0")
+
+    boundary_error = next(
+        error for error in errors if "removed Terminal Bench modules" in error
+    )
+    assert all(path in boundary_error for path in legacy_modules)
+
+
+def test_rejects_removed_terminal_bench_modules_in_nested_core_wheel(
+    tmp_path: Path,
+) -> None:
+    checker = _load_module()
+    legacy_path = "openevo/evolution/terminal_bench_per_task.py"
+    wheel = _write_wheel(
+        tmp_path / "openevo-0.1.0-py3-none-any.whl",
+        nested_remote_wheel_extra_files={legacy_path: ""},
+    )
+
+    errors = checker.validate_wheel(wheel, expected_version="0.1.0")
+
+    assert any(
+        "openevo/wheels/openevo-0.1.0-py3-none-any.whl" in error
+        and legacy_path in error
+        for error in errors
+    )
+
+
+def test_core_wheel_boundary_allows_unrelated_similar_module_name(
+    tmp_path: Path,
+) -> None:
+    checker = _load_module()
+    wheel = _write_wheel(
+        tmp_path / "openevo-0.1.0-py3-none-any.whl",
+        extra_files={"openevo/evolution/terminal_bench_bridge_v2.py": ""},
+    )
+
+    assert checker.validate_wheel(wheel, expected_version="0.1.0") == []
 
 
 def test_rejects_shared_dashboard_static_assets(tmp_path: Path) -> None:
@@ -885,6 +941,7 @@ def _write_wheel(
     entry_points: str = GOOD_ENTRY_POINTS,
     include_nested_remote_wheel: bool = True,
     nested_remote_wheel_metadata: str = GOOD_METADATA,
+    nested_remote_wheel_extra_files: dict[str, str] | None = None,
     extra_files: dict[str, str] | None = None,
 ) -> Path:
     dist_info = "openevo-0.1.0.dist-info"
@@ -894,17 +951,26 @@ def _write_wheel(
         if include_nested_remote_wheel:
             wheel.writestr(
                 "openevo/wheels/openevo-0.1.0-py3-none-any.whl",
-                _nested_wheel_bytes(metadata=nested_remote_wheel_metadata),
+                _nested_wheel_bytes(
+                    metadata=nested_remote_wheel_metadata,
+                    extra_files=nested_remote_wheel_extra_files,
+                ),
             )
         for name, content in (extra_files or {}).items():
             wheel.writestr(name, content)
     return path
 
 
-def _nested_wheel_bytes(*, metadata: str) -> bytes:
+def _nested_wheel_bytes(
+    *,
+    metadata: str,
+    extra_files: dict[str, str] | None = None,
+) -> bytes:
     buffer = BytesIO()
     with ZipFile(buffer, "w") as wheel:
         wheel.writestr("openevo-0.1.0.dist-info/METADATA", metadata)
+        for name, content in (extra_files or {}).items():
+            wheel.writestr(name, content)
     return buffer.getvalue()
 
 

@@ -12,16 +12,6 @@ def test_evolution_cli_defaults_use_openevo_state_root() -> None:
     cases = [
         ["serve", "--framework-lock", "/tmp/framework-lock.json"],
         ["worker"],
-        ["terminal-bench-dataset", "--input", "trial", "--name", "tb"],
-        ["terminal-bench-agent-system-job", "--reflector-model", "gpt-5.5"],
-        ["terminal-bench-text-memory-job", "--reflector-model", "gpt-5.5"],
-        [
-            "terminal-bench-parametric-memory-job",
-            "--base-model",
-            "Qwen/Qwen3.6-27B",
-            "--trainer-command",
-            "train.sh",
-        ],
     ]
 
     for argv in cases:

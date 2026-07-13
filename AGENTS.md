@@ -55,6 +55,9 @@ input bindings、execution/capture/harness/runtime requirements、config 和 typ
 - `desktop/`: OpenEvo Desktop 的 React/Vite/Tauri 前端、native host、sidecar 和打包资源。
 - `benchmarks/`: standalone benchmark automation packages。Benchmark-specific code
   must live outside `src/openevo` and `desktop` and import/call Core capabilities。
+- `benchmarks/terminal_bench/`: independently installable Terminal Bench maintainer
+  automation、Harbor I/O、reporting、frozen gate manifests 和 package-local tests；
+  Core/Desktop 不得 import 或 package 它。
 - `src/openevo/harness/`: agent harness contract 和 Codex、Claude Code、OpenHands 等 presets。
 - `src/openevo/gateway/`: gateway server、LLM proxy、runtime lifecycle、completion capture、
   evolution context 注入。

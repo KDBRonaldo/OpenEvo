@@ -18,7 +18,7 @@ from openevo.evolution.models import (
     WorkerHeartbeatRequest,
 )
 from openevo.evolution.store import EvolutionStore
-from openevo.evolution.terminal_bench_bridge import (
+from openevo_terminal_bench.bridge import (
     TerminalBenchBridgeError,
     build_terminal_bench_events,
 )
@@ -373,11 +373,7 @@ def _create_agent_system_job_command(
     else:
         method = agent_system_method
     command = [
-        "uv",
-        "run",
-        "python",
-        "-m",
-        "openevo.evolution.cli",
+        "openevo-terminal-bench",
         "terminal-bench-agent-system-job",
         "--db",
         str(db_path),
@@ -429,11 +425,7 @@ def _create_text_memory_job_command(
         raise ValueError("text memory job command requires at least one input trial")
     input_round = round_number - 1
     command = [
-        "uv",
-        "run",
-        "python",
-        "-m",
-        "openevo.evolution.cli",
+        "openevo-terminal-bench",
         "terminal-bench-text-memory-job",
         "--db",
         str(db_path),

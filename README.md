@@ -71,6 +71,9 @@ desktop/
   sidecar/       local Desktop facade
   packaging/     bundled sidecar and packaged web assets
 
+benchmarks/
+  terminal_bench/  standalone release-maintainer benchmark automation
+
 docs/
   user/          ordinary-user Desktop guidance
   core/          Core Backend contracts
@@ -85,8 +88,9 @@ examples/
   research-benchmarks/
 ```
 
-The dependency direction is `desktop -> src/openevo`; Core Backend must not
-import Desktop code.
+The product dependency direction is `desktop -> src/openevo`; Core Backend must
+not import Desktop code. Standalone benchmark packages may import Core
+contracts, while Core and Desktop must not import or package benchmark code.
 
 ## Core Backend
 
@@ -117,6 +121,7 @@ openevo-backend run examples/science-minimal/experiment.yaml --dry-run --json
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -e .
+pip install -e benchmarks/terminal_bench
 pip install pytest pytest-asyncio ruff build twine
 ```
 
@@ -124,8 +129,9 @@ Focused Python checks:
 
 <!-- openevo:maintainer-only-command -->
 ```bash {.openevo-maintainer-only}
-ruff check src tests scripts
+ruff check src tests scripts benchmarks/terminal_bench
 PYTHONPATH=src:. python -m pytest tests/ci tests/openevo tests/evolution -q
+python -m pytest benchmarks/terminal_bench/tests -q
 ```
 
 Desktop checks:

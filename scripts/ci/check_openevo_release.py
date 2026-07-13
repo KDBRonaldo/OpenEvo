@@ -28,6 +28,8 @@ REQUIRED_RELEASE_NOTES = "release-notes.md"
 RELEASE_BINARY_SUFFIXES = (".whl", ".dmg")
 ALLOWED_DMG_TARGETS = {"aarch64", "x64", "universal"}
 FORBIDDEN_CORE_PACKAGE_PREFIXES = (
+    "openevo_terminal_bench/",
+    "benchmarks/terminal_bench/",
     "openevo/desktop/",
     "openevo/sidecar/",
     "desktop/server/",
@@ -38,6 +40,14 @@ FORBIDDEN_CORE_PACKAGE_PREFIXES = (
 )
 FORBIDDEN_CORE_PACKAGE_FILES = (
     "openevo/cli.py",
+)
+FORBIDDEN_LEGACY_CORE_MODULE_FILES = frozenset(
+    {
+        "openevo/evolution/terminal_bench_bridge.py",
+        "openevo/evolution/terminal_bench_local_parametric.py",
+        "openevo/evolution/terminal_bench_per_task.py",
+        "openevo/evolution/terminal_bench_task_local_parametric.py",
+    }
 )
 FORBIDDEN_SHARED_DASHBOARD_PREFIXES = (
     "openevo/platform/desktop/dist/",
@@ -155,7 +165,7 @@ def _validate_core_package_boundaries(names: set[str]) -> list[str]:
         packaged = sorted(name for name in names if name.startswith(prefix))
         if packaged:
             errors.append(
-                "OpenEvo Core wheel must not package Desktop control-plane files under "
+                "OpenEvo Core wheel must not package non-Core files under "
                 f"{prefix}; found {packaged[0]}."
             )
     for filename in FORBIDDEN_CORE_PACKAGE_FILES:
@@ -164,6 +174,12 @@ def _validate_core_package_boundaries(names: set[str]) -> list[str]:
                 "OpenEvo Core wheel must not expose the removed product CLI file "
                 f"{filename}."
             )
+    legacy_modules = sorted(names & FORBIDDEN_LEGACY_CORE_MODULE_FILES)
+    if legacy_modules:
+        errors.append(
+            "OpenEvo Core wheel must not package removed Terminal Bench modules: "
+            f"{legacy_modules}."
+        )
     for prefix in FORBIDDEN_SHARED_DASHBOARD_PREFIXES:
         forbidden_dashboard = sorted(name for name in names if name.startswith(prefix))
         if forbidden_dashboard:
@@ -213,10 +229,12 @@ def _validate_nested_remote_install_wheel(
             if metadata_path is None:
                 return ["Nested remote-install wheel is missing a .dist-info/METADATA file."]
             metadata = Parser().parsestr(_read_text(nested, metadata_path))
+            boundary_errors = _validate_core_package_boundaries(names)
     except BadZipFile:
         return ["Nested remote-install wheel is not a readable zip archive."]
 
     errors: list[str] = []
+    errors.extend(boundary_errors)
     if metadata.get("Name") != EXPECTED_PROJECT_NAME:
         errors.append(
             "Nested remote-install wheel METADATA Name should be "
