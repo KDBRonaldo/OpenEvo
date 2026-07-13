@@ -9,6 +9,7 @@ import subprocess
 from typing import Any
 from urllib.parse import unquote, urlparse
 
+import openevo.evolution.agent_system_gepa_kernel as gepa_kernel
 from openevo.evolution.methods import run_method
 from openevo.evolution.models import (
     WorkerClaimRequest,
@@ -745,7 +746,8 @@ def run_per_task_evolution(
         artifact_root = task_store_root / "artifacts"
         input_trial_dir = baseline_trial
         previous_reward = baseline_reward
-        previous_dataset_artifact_ids: list[str] = []
+        next_round_inputs = (baseline_trial,)
+        dataset_history: tuple[str, ...] = ()
         effective_gepa_generations = (
             max(1, gepa_generations)
             if (
@@ -758,13 +760,18 @@ def run_per_task_evolution(
         for round_number in range(1, rounds + 1):
             round_root = run_root / "tasks" / task_id / f"r{round_number}"
             round_root.mkdir(parents=True, exist_ok=True)
-            generation_input_trials = [input_trial_dir]
-            round_dataset_artifact_ids: list[str] = []
+            round_state = gepa_kernel.begin_round(
+                generation_inputs=next_round_inputs,
+                dataset_history=dataset_history,
+            )
             round_generation_summaries: list[dict[str, Any]] = []
             round_candidate_results: list[dict[str, Any]] = []
-            round_history_dataset_ids = list(previous_dataset_artifact_ids)
+            round_candidate_evaluations: list[
+                gepa_kernel.CandidateEvaluation[Path]
+            ] = []
 
             for generation_number in range(1, effective_gepa_generations + 1):
+                generation_inputs = list(round_state.generation_inputs)
                 generation_root = (
                     round_root
                     if effective_gepa_generations == 1
@@ -776,8 +783,8 @@ def run_per_task_evolution(
                     job_command = _create_agent_system_job_command(
                         task_id=task_id,
                         round_number=round_number,
-                        input_trial_dirs=generation_input_trials,
-                        previous_dataset_artifact_ids=round_history_dataset_ids,
+                        input_trial_dirs=generation_inputs,
+                        previous_dataset_artifact_ids=list(round_state.dataset_history),
                         agent_system_method=agent_system_method,
                         gepa_candidate_count=gepa_candidate_count,
                         gepa_generation=(
@@ -796,8 +803,8 @@ def run_per_task_evolution(
                     job_command = _create_text_memory_job_command(
                         task_id=task_id,
                         round_number=round_number,
-                        input_trial_dirs=generation_input_trials,
-                        previous_dataset_artifact_ids=round_history_dataset_ids,
+                        input_trial_dirs=generation_inputs,
+                        previous_dataset_artifact_ids=list(round_state.dataset_history),
                         memory_method=memory_method,
                         db_path=db_path,
                         artifact_root=artifact_root,
@@ -822,8 +829,10 @@ def run_per_task_evolution(
                         and raw_dataset_artifact_id.strip()
                     ):
                         dataset_artifact_id = raw_dataset_artifact_id
-                        round_history_dataset_ids.append(dataset_artifact_id)
-                        round_dataset_artifact_ids.append(dataset_artifact_id)
+                round_state = gepa_kernel.record_dataset(
+                    round_state,
+                    dataset_artifact_id,
+                )
 
                 completed_artifacts = worker_runner(db_path=db_path, artifact_root=artifact_root)
                 evolution_artifacts = discover_evolution_artifact_paths(
@@ -840,9 +849,10 @@ def run_per_task_evolution(
                 ):
                     materializer = ArtifactMaterializer()
                     agent_kwargs = materializer.materialize(artifact)
-                    candidate_index = _artifact_candidate_index(
-                        artifact,
-                        candidate_position,
+                    candidate_index = gepa_kernel.resolve_candidate_index(
+                        candidate_id=artifact.artifact_id,
+                        explicit_candidate_index=artifact.candidate_index,
+                        fallback_candidate_index=candidate_position,
                     )
                     generation_suffix = (
                         "" if effective_gepa_generations == 1 else f"-g{generation_number}"
@@ -907,11 +917,27 @@ def run_per_task_evolution(
                         }
                     )
 
+                generation_candidate_evaluations = [
+                    gepa_kernel.per_task_candidate(
+                        candidate_id=result["artifact"].artifact_id,
+                        source_index=len(round_candidate_results) + position - 1,
+                        explicit_candidate_index=result["artifact"].candidate_index,
+                        fallback_candidate_index=0,
+                        generation=generation_number,
+                        reward=result["reward"],
+                        trial=result["trial_dir"],
+                    )
+                    for position, result in enumerate(
+                        generation_candidate_results,
+                        start=1,
+                    )
+                ]
                 round_candidate_results.extend(generation_candidate_results)
+                round_candidate_evaluations.extend(generation_candidate_evaluations)
                 round_generation_summaries.append(
                     {
                         "generation": generation_number,
-                        "input_trials": [str(path) for path in generation_input_trials],
+                        "input_trials": [str(path) for path in generation_inputs],
                         "dataset_artifact_id": dataset_artifact_id,
                         "candidate_trials": [
                             _candidate_trial_summary(
@@ -926,11 +952,16 @@ def run_per_task_evolution(
                         ],
                     }
                 )
-                generation_input_trials = [
-                    result["trial_dir"] for result in generation_candidate_results
-                ]
+                round_state = gepa_kernel.advance_generation(
+                    round_state,
+                    generation_candidate_evaluations,
+                )
 
-            best_candidate = _select_best_candidate_result(round_candidate_results)
+            round_transition = gepa_kernel.complete_round(
+                round_state,
+                round_candidate_evaluations,
+            )
+            best_candidate = round_candidate_results[round_transition.winner.source_index]
             artifact = best_candidate["artifact"]
             materializer = best_candidate["materializer"]
             evolved_trial = best_candidate["trial_dir"]
@@ -971,16 +1002,19 @@ def run_per_task_evolution(
                     )
                     for position, result in enumerate(round_candidate_results, start=1)
                 ]
-            if round_dataset_artifact_ids:
-                round_summary["dataset_artifact_id"] = round_dataset_artifact_ids[0]
-                round_summary["dataset_artifact_ids"] = list(round_dataset_artifact_ids)
-                previous_dataset_artifact_ids = list(round_history_dataset_ids)
+            if round_transition.round_dataset_ids:
+                round_summary["dataset_artifact_id"] = round_transition.round_dataset_ids[0]
+                round_summary["dataset_artifact_ids"] = list(
+                    round_transition.round_dataset_ids
+                )
             if effective_gepa_generations > 1:
                 round_summary["gepa_generations"] = len(round_generation_summaries)
                 round_summary["generations"] = round_generation_summaries
 
             task_summary["rounds"].append(round_summary)
-            input_trial_dir = evolved_trial
+            next_round_inputs = round_transition.next_round_inputs
+            dataset_history = round_transition.dataset_history
+            input_trial_dir = next_round_inputs[0]
             previous_reward = reward
 
         summary["tasks"].append(task_summary)
@@ -1060,9 +1094,9 @@ def run_group_evolution(
         group_store_root = run_root / "groups" / group.group_id / "evolution"
         db_path = group_store_root / "evolution.db"
         artifact_root = group_store_root / "artifacts"
-        input_trials_by_task = dict(baseline_trials_by_task)
+        next_round_inputs = tuple(baseline_trials_by_task[task_id] for task_id in task_ids)
         previous_rewards_by_task = dict(baseline_rewards_by_task)
-        previous_dataset_artifact_ids: list[str] = []
+        dataset_history: tuple[str, ...] = ()
         effective_gepa_generations = (
             max(1, gepa_generations) if agent_system_method == "agent_system_gepa_reflector" else 1
         )
@@ -1085,15 +1119,21 @@ def run_group_evolution(
         for round_number in range(1, rounds + 1):
             round_root = run_root / "groups" / group.group_id / f"r{round_number}"
             round_root.mkdir(parents=True, exist_ok=True)
-            generation_input_trials = [
-                input_trials_by_task[task_id] for task_id in task_ids
-            ]
-            round_dataset_artifact_ids: list[str] = []
+            round_input_trials_by_task = dict(
+                zip(task_ids, next_round_inputs, strict=True)
+            )
+            round_state = gepa_kernel.begin_round(
+                generation_inputs=next_round_inputs,
+                dataset_history=dataset_history,
+            )
             round_generation_summaries: list[dict[str, Any]] = []
             round_candidate_results: list[dict[str, Any]] = []
-            round_history_dataset_ids = list(previous_dataset_artifact_ids)
+            round_candidate_evaluations: list[
+                gepa_kernel.CandidateEvaluation[Path]
+            ] = []
 
             for generation_number in range(1, effective_gepa_generations + 1):
+                generation_inputs = list(round_state.generation_inputs)
                 generation_root = (
                     round_root
                     if effective_gepa_generations == 1
@@ -1104,8 +1144,8 @@ def run_group_evolution(
                 job_command = _create_agent_system_job_command(
                     task_id=group.group_id,
                     round_number=round_number,
-                    input_trial_dirs=generation_input_trials,
-                    previous_dataset_artifact_ids=round_history_dataset_ids,
+                    input_trial_dirs=generation_inputs,
+                    previous_dataset_artifact_ids=list(round_state.dataset_history),
                     agent_system_method=agent_system_method,
                     gepa_candidate_count=gepa_candidate_count,
                     gepa_generation=(
@@ -1134,8 +1174,10 @@ def run_group_evolution(
                         and raw_dataset_artifact_id.strip()
                     ):
                         dataset_artifact_id = raw_dataset_artifact_id
-                        round_history_dataset_ids.append(dataset_artifact_id)
-                        round_dataset_artifact_ids.append(dataset_artifact_id)
+                round_state = gepa_kernel.record_dataset(
+                    round_state,
+                    dataset_artifact_id,
+                )
 
                 completed_artifacts = worker_runner(db_path=db_path, artifact_root=artifact_root)
                 agent_system_artifacts = discover_agent_system_artifact_paths(
@@ -1145,15 +1187,19 @@ def run_group_evolution(
                     job_payload=job_payload,
                 )
                 generation_candidate_results: list[dict[str, Any]] = []
+                generation_candidate_evaluations: list[
+                    gepa_kernel.CandidateEvaluation[Path]
+                ] = []
                 for candidate_position, artifact in enumerate(
                     agent_system_artifacts,
                     start=1,
                 ):
                     materializer = ArtifactMaterializer()
                     agent_kwargs = materializer.materialize(artifact)
-                    candidate_index = _artifact_candidate_index(
-                        artifact,
-                        candidate_position,
+                    candidate_index = gepa_kernel.resolve_candidate_index(
+                        candidate_id=artifact.artifact_id,
+                        explicit_candidate_index=artifact.candidate_index,
+                        fallback_candidate_index=candidate_position,
                     )
                     generation_suffix = (
                         "" if effective_gepa_generations == 1 else f"-g{generation_number}"
@@ -1194,23 +1240,34 @@ def run_group_evolution(
                         )
                         task_trials[task_id] = evolved_trial
                         task_rewards[task_id] = _trial_reward(evolved_trial)
-                    score = _aggregate_group_score(task_rewards, group.objective)
-                    generation_candidate_results.append(
-                        {
-                            "artifact": artifact,
-                            "materializer": materializer,
-                            "task_trials": task_trials,
-                            "task_rewards": task_rewards,
-                            "score": score,
-                            "generation": generation_number,
-                        }
+                    candidate_result = {
+                        "artifact": artifact,
+                        "materializer": materializer,
+                        "task_trials": task_trials,
+                        "task_rewards": task_rewards,
+                        "generation": generation_number,
+                    }
+                    candidate_evaluation = gepa_kernel.group_candidate(
+                        candidate_id=artifact.artifact_id,
+                        source_index=(
+                            len(round_candidate_results) + candidate_position - 1
+                        ),
+                        explicit_candidate_index=artifact.candidate_index,
+                        fallback_candidate_index=0,
+                        generation=generation_number,
+                        task_rewards=(task_rewards[task_id] for task_id in task_ids),
+                        task_trials=(task_trials[task_id] for task_id in task_ids),
                     )
+                    candidate_result["score"] = candidate_evaluation.objective
+                    generation_candidate_results.append(candidate_result)
+                    generation_candidate_evaluations.append(candidate_evaluation)
 
                 round_candidate_results.extend(generation_candidate_results)
+                round_candidate_evaluations.extend(generation_candidate_evaluations)
                 round_generation_summaries.append(
                     {
                         "generation": generation_number,
-                        "input_trials": [str(path) for path in generation_input_trials],
+                        "input_trials": [str(path) for path in generation_inputs],
                         "dataset_artifact_id": dataset_artifact_id,
                         "candidate_trials": [
                             _group_candidate_trial_summary(
@@ -1226,13 +1283,17 @@ def run_group_evolution(
                         ],
                     }
                 )
-                generation_input_trials = [
-                    result["task_trials"][task_id]
-                    for result in generation_candidate_results
-                    for task_id in task_ids
-                ]
+                round_state = gepa_kernel.advance_generation(
+                    round_state,
+                    generation_candidate_evaluations,
+                )
 
-            best_candidate = _select_best_group_candidate_result(round_candidate_results)
+            round_transition = gepa_kernel.complete_round(
+                round_state,
+                round_candidate_evaluations,
+                empty_error="no group candidate trials were evaluated",
+            )
+            best_candidate = round_candidate_results[round_transition.winner.source_index]
             artifact = best_candidate["artifact"]
             materializer = best_candidate["materializer"]
             task_trials = best_candidate["task_trials"]
@@ -1242,7 +1303,7 @@ def run_group_evolution(
             round_summary = {
                 "round": round_number,
                 "input_trials": {
-                    task_id: str(input_trials_by_task[task_id]) for task_id in task_ids
+                    task_id: str(round_input_trials_by_task[task_id]) for task_id in task_ids
                 },
                 "task_trials": {
                     task_id: str(task_trials[task_id]) for task_id in task_ids
@@ -1274,16 +1335,18 @@ def run_group_evolution(
                     for position, result in enumerate(round_candidate_results, start=1)
                 ],
             }
-            if round_dataset_artifact_ids:
-                round_summary["dataset_artifact_id"] = round_dataset_artifact_ids[0]
-                round_summary["dataset_artifact_ids"] = list(round_dataset_artifact_ids)
-                previous_dataset_artifact_ids = list(round_history_dataset_ids)
+            if round_transition.round_dataset_ids:
+                round_summary["dataset_artifact_id"] = round_transition.round_dataset_ids[0]
+                round_summary["dataset_artifact_ids"] = list(
+                    round_transition.round_dataset_ids
+                )
             if effective_gepa_generations > 1:
                 round_summary["gepa_generations"] = len(round_generation_summaries)
                 round_summary["generations"] = round_generation_summaries
 
             group_summary["rounds"].append(round_summary)
-            input_trials_by_task = dict(task_trials)
+            next_round_inputs = round_transition.next_round_inputs
+            dataset_history = round_transition.dataset_history
             previous_rewards_by_task = dict(task_rewards)
 
         summary["groups"].append(group_summary)
@@ -1396,19 +1459,6 @@ def _default_terminal_bench_artifact_method(artifact_type: str) -> str:
     return "agent_system_reflector"
 
 
-def _select_best_candidate_result(candidate_results: list[dict[str, Any]]) -> dict[str, Any]:
-    if not candidate_results:
-        raise ValueError("no candidate trials were evaluated")
-    return max(
-        candidate_results,
-        key=lambda result: (
-            float("-inf") if result["reward"] is None else float(result["reward"]),
-            int(result.get("generation", 0)),
-            -_artifact_candidate_index(result["artifact"], 0),
-        ),
-    )
-
-
 def _select_best_attempt(attempts: list[dict[str, Any]]) -> dict[str, Any]:
     if not attempts:
         raise ValueError("no Terminal Bench attempts were evaluated")
@@ -1421,19 +1471,6 @@ def _select_best_attempt(attempts: list[dict[str, Any]]) -> dict[str, Any]:
     )
 
 
-def _select_best_group_candidate_result(candidate_results: list[dict[str, Any]]) -> dict[str, Any]:
-    if not candidate_results:
-        raise ValueError("no group candidate trials were evaluated")
-    return max(
-        candidate_results,
-        key=lambda result: (
-            float("-inf") if result["score"] is None else float(result["score"]),
-            int(result.get("generation", 0)),
-            -_artifact_candidate_index(result["artifact"], 0),
-        ),
-    )
-
-
 def _candidate_trial_summary(
     result: dict[str, Any],
     position: int,
@@ -1442,7 +1479,11 @@ def _candidate_trial_summary(
 ) -> dict[str, Any]:
     artifact = result["artifact"]
     summary = {
-        "candidate_index": _artifact_candidate_index(artifact, position),
+        "candidate_index": gepa_kernel.resolve_candidate_index(
+            candidate_id=artifact.artifact_id,
+            explicit_candidate_index=artifact.candidate_index,
+            fallback_candidate_index=position,
+        ),
         "artifact_id": artifact.artifact_id,
         "strategy": _artifact_candidate_strategy(artifact),
         "reward": result["reward"],
@@ -1475,7 +1516,11 @@ def _group_candidate_trial_summary(
     task_rewards = result["task_rewards"]
     task_trials = result["task_trials"]
     summary = {
-        "candidate_index": _artifact_candidate_index(artifact, position),
+        "candidate_index": gepa_kernel.resolve_candidate_index(
+            candidate_id=artifact.artifact_id,
+            explicit_candidate_index=artifact.candidate_index,
+            fallback_candidate_index=position,
+        ),
         "artifact_id": artifact.artifact_id,
         "strategy": _artifact_candidate_strategy(artifact),
         "score": result["score"],
@@ -1489,15 +1534,6 @@ def _group_candidate_trial_summary(
     if include_generation:
         summary["generation"] = int(result.get("generation", 0))
     return summary
-
-
-def _artifact_candidate_index(artifact: EvolutionArtifact, fallback: int) -> int:
-    if artifact.candidate_index is not None:
-        return artifact.candidate_index
-    match = re.search(r"(?:^|[-_])c?(\d+)(?:$|[-_])", artifact.artifact_id)
-    if match:
-        return int(match.group(1))
-    return fallback
 
 
 def _artifact_candidate_strategy(artifact: EvolutionArtifact) -> str | None:
@@ -1545,19 +1581,6 @@ def _safe_path_component(value: str) -> str:
     if not cleaned:
         raise ValueError(f"cannot derive a safe path component from {value!r}")
     return cleaned
-
-
-def _aggregate_group_score(
-    task_rewards: dict[str, float | None],
-    objective: str,
-) -> float | None:
-    if objective != "macro_mean_reward":
-        raise ValueError(f"unsupported Terminal Bench group objective: {objective!r}")
-    if not task_rewards:
-        raise ValueError("group score requires at least one task reward")
-    if any(reward is None for reward in task_rewards.values()):
-        return None
-    return sum(float(reward) for reward in task_rewards.values()) / len(task_rewards)
 
 
 def summarize_transition(before: float | None, after: float | None) -> str:

@@ -219,6 +219,12 @@ digests；store 在发 lease 前校验 persisted contract，并在 complete 时�
 以下命令仅供 OpenEvo 维护者和 benchmark automation 开发使用，不是 Core/Desktop 产品面。
 这些内容将在 A3 机械迁移到 `benchmarks/terminal_bench/`，迁移前不得新增普通用户入口。
 
+A3 PR1 只把 agent-system GEPA 的 data-only selection/state kernel 机械提取到
+`agent_system_gepa_kernel.py`。Terminal Bench task I/O、Harbor execution、attempt
+selection、materialization、reporting 和下列 CLI 仍暂留本模块范围；这不代表 A3 主迁移或
+Core release inventory 清理已经完成。后续迁移必须直接删除旧 automation 位置，不能增加
+compatibility wrapper。
+
 Terminal Bench 可以继续由 Harbor/EvoLab 和官方 verifier 执行。若只想让 OpenEvo
 负责后续 skill、memory 或 agent-system evolution，可先把 Harbor/EvoLab 的 trial
 或 job 目录转换成 OpenEvo event JSONL：

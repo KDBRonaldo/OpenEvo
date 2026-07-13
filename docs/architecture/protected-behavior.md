@@ -26,9 +26,12 @@ entry points resolve to the exact legacy callable objects. Presentation,
 visibility, schema, and unrelated registry entries are not frozen as algorithm
 behavior.
 
-GEPA evaluation and transition are algorithm behavior even while their code is
-co-located with Terminal Bench automation. Tests in
-`tests/evolution/test_terminal_bench_per_task.py` protect:
+GEPA evaluation and transition are algorithm behavior. A3 PR1 mechanically
+extracts their data-only state and selection kernel to
+`openevo.evolution.agent_system_gepa_kernel`; it does not change the method,
+registry, worker, or artifact lifecycle. Golden event tapes in
+`tests/evolution/test_agent_system_gepa_kernel.py` and the existing runner tests
+in `tests/evolution/test_terminal_bench_per_task.py` protect:
 
 - objective value before generation and candidate-index tie-breaking;
 - `None` below every numeric reward or group score;
@@ -44,6 +47,13 @@ Productization may relocate this code but must not alter or duplicate its
 selection policy. A2.2 also freezes stable history-round ordering, best-round
 ties, missing generation/index fallbacks, and group objectives containing a
 missing reward. These fixtures add no algorithm or artifact lifecycle behavior.
+
+This extraction is only A3 PR1. Terminal Bench acquisition, Harbor execution,
+attempt selection, verifier adaptation, materialization, reporting, and CLI
+wiring remain in `src/openevo/evolution/terminal_bench_per_task.py` and related
+Core modules until the later standalone automation migration. In particular,
+`_select_best_attempt` remains benchmark policy and is not part of the Core GEPA
+kernel.
 
 ## Protected Stage Boundaries
 
@@ -70,6 +80,7 @@ Run the A1-focused set with the repository Python 3.11 environment:
 ```bash
 pytest -q \
   tests/evolution/test_algorithm_preservation_contract.py \
+  tests/evolution/test_agent_system_gepa_kernel.py \
   tests/evolution/test_worker_methods.py \
   tests/evolution/test_terminal_bench_per_task.py \
   tests/evolution/test_architecture_flow.py \

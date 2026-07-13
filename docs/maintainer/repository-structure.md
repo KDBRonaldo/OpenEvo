@@ -37,6 +37,14 @@ call Core APIs and import stable Core contracts, but Core and Desktop release
 artifacts must not package benchmark runners, scorers, materializers, or
 benchmark-specific command entrypoints.
 
+A3 PR1 is an intermediate mechanical extraction, not completion of this
+boundary. Core now owns the data-only agent-system GEPA selection/state kernel
+in `src/openevo/evolution/agent_system_gepa_kernel.py`, while Terminal Bench
+task I/O, Harbor execution, attempt policy, reports, and commands still remain
+under `src/openevo/evolution/`. A later A3 PR must move that automation to
+`benchmarks/terminal_bench/` and remove the old modules and CLI wiring rather
+than wrapping or re-exporting them.
+
 ## Legacy Quarantine
 
 Historical legacy identity, old runtime markers, old Terminal Bench paths, and

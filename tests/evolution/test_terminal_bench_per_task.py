@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 import openevo.evolution.cli as cli_module
+import openevo.evolution.agent_system_gepa_kernel as gepa_kernel
 import openevo.evolution.terminal_bench_per_task as per_task_module
 from openevo.evolution.cli import _parse_key_value_entries, main
 from openevo.evolution.models import ArtifactRegisterRequest, ArtifactType
@@ -345,13 +346,6 @@ def test_summarize_transition_classifies_pass_fail_changes():
 
 
 @pytest.mark.parametrize(
-    ("selector", "objective_key"),
-    [
-        (per_task_module._select_best_candidate_result, "reward"),
-        (per_task_module._select_best_group_candidate_result, "score"),
-    ],
-)
-@pytest.mark.parametrize(
     ("candidate_specs", "expected_artifact_id"),
     [
         ([("none", None, 99, 0), ("negative", -1.0, 0, 99)], "negative"),
@@ -361,47 +355,38 @@ def test_summarize_transition_classifies_pass_fail_changes():
     ],
 )
 def test_gepa_candidate_selectors_apply_objective_generation_and_index_order(
-    selector,
-    objective_key: str,
     candidate_specs: list[tuple[str, float | None, int, int]],
     expected_artifact_id: str,
 ):
     candidates = [
-        {
-            objective_key: objective,
-            "generation": generation,
-            "artifact": EvolutionArtifact(
-                artifact_type="agent_system",
-                artifact_id=artifact_id,
-                path=Path(f"/{artifact_id}.md"),
-                task_id="task-a",
-                round=1,
-                method="agent_system_gepa_reflector",
-                source_dataset_artifact_ids=[],
-                candidate_index=candidate_index,
-            ),
-        }
-        for artifact_id, objective, generation, candidate_index in candidate_specs
+        gepa_kernel.CandidateEvaluation(
+            objective=objective,
+            generation=generation,
+            candidate_id=artifact_id,
+            source_index=position,
+            candidate_index=candidate_index,
+            trials=(),
+        )
+        for position, (artifact_id, objective, generation, candidate_index) in enumerate(
+            candidate_specs
+        )
     ]
 
-    selected = selector(candidates)
+    selected = gepa_kernel.select_round_winner(candidates)
 
-    assert selected["artifact"].artifact_id == expected_artifact_id
+    assert selected.candidate_id == expected_artifact_id
 
 
 @pytest.mark.parametrize(
-    ("selector", "message"),
+    "message",
     [
-        (per_task_module._select_best_candidate_result, "no candidate trials were evaluated"),
-        (
-            per_task_module._select_best_group_candidate_result,
-            "no group candidate trials were evaluated",
-        ),
+        "no candidate trials were evaluated",
+        "no group candidate trials were evaluated",
     ],
 )
-def test_gepa_candidate_selectors_reject_empty_input(selector, message: str):
+def test_gepa_candidate_selectors_reject_empty_input(message: str):
     with pytest.raises(ValueError, match=message):
-        selector([])
+        gepa_kernel.select_round_winner([], empty_error=message)
 
 
 @pytest.mark.parametrize(
@@ -2442,114 +2427,90 @@ def test_terminal_bench_group_evolution_cli_live_mode_rejects_parametric_memory(
         )
 
 
-@pytest.mark.parametrize(
-    ("selector", "objective_key"),
-    [
-        (per_task_module._select_best_candidate_result, "reward"),
-        (per_task_module._select_best_group_candidate_result, "score"),
-    ],
-)
 def test_gepa_candidate_selectors_order_all_none_objectives_by_generation_then_index(
-    selector,
-    objective_key: str,
 ):
     candidates = [
-        {
-            objective_key: None,
-            "generation": generation,
-            "artifact": EvolutionArtifact(
-                artifact_type="agent_system",
-                artifact_id=artifact_id,
-                path=Path(f"/{artifact_id}.md"),
-                task_id="task-a",
-                round=1,
-                method="agent_system_gepa_reflector",
-                candidate_index=candidate_index,
-            ),
-        }
-        for artifact_id, generation, candidate_index in [
-            ("newer-larger-index", 2, 2),
-            ("older-smaller-index", 1, 1),
-            ("newer-smaller-index", 2, 1),
-        ]
+        gepa_kernel.CandidateEvaluation(
+            objective=None,
+            generation=generation,
+            candidate_id=artifact_id,
+            source_index=position,
+            candidate_index=candidate_index,
+            trials=(),
+        )
+        for position, (artifact_id, generation, candidate_index) in enumerate(
+            [
+                ("newer-larger-index", 2, 2),
+                ("older-smaller-index", 1, 1),
+                ("newer-smaller-index", 2, 1),
+            ]
+        )
     ]
 
-    selected = selector(candidates)
+    selected = gepa_kernel.select_round_winner(candidates)
 
-    assert selected["artifact"].artifact_id == "newer-smaller-index"
+    assert selected.candidate_id == "newer-smaller-index"
 
 
-@pytest.mark.parametrize(
-    ("selector", "objective_key"),
-    [
-        (per_task_module._select_best_candidate_result, "reward"),
-        (per_task_module._select_best_group_candidate_result, "score"),
-    ],
-)
 def test_gepa_candidate_selectors_preserve_first_input_when_all_keys_tie(
-    selector,
-    objective_key: str,
 ):
     candidates = [
-        {
-            objective_key: 0.5,
-            "generation": 3,
-            "artifact": EvolutionArtifact(
-                artifact_type="agent_system",
-                artifact_id=artifact_id,
-                path=Path(f"/{artifact_id}.md"),
-                task_id="task-a",
-                round=1,
-                method="agent_system_gepa_reflector",
-                candidate_index=2,
-            ),
-        }
-        for artifact_id in ["first", "second"]
+        gepa_kernel.CandidateEvaluation(
+            objective=0.5,
+            generation=3,
+            candidate_id=artifact_id,
+            source_index=position,
+            candidate_index=2,
+            trials=(),
+        )
+        for position, artifact_id in enumerate(["first", "second"])
     ]
 
-    selected = selector(candidates)
+    selected = gepa_kernel.select_round_winner(candidates)
 
     assert selected is candidates[0]
 
 
-@pytest.mark.parametrize(
-    ("selector", "objective_key"),
-    [
-        (per_task_module._select_best_candidate_result, "reward"),
-        (per_task_module._select_best_group_candidate_result, "score"),
-    ],
-)
 def test_gepa_candidate_selectors_default_missing_generation_to_zero(
-    selector,
-    objective_key: str,
 ):
-    explicit_zero = {
-        objective_key: 1.0,
-        "generation": 0,
-        "artifact": EvolutionArtifact(
-            artifact_type="agent_system",
-            artifact_id="explicit-zero",
-            path=Path("/explicit-zero.md"),
-            task_id="task-a",
-            round=1,
-            method="agent_system_gepa_reflector",
-            candidate_index=2,
-        ),
-    }
-    missing_generation = {
-        objective_key: 1.0,
-        "artifact": EvolutionArtifact(
-            artifact_type="agent_system",
-            artifact_id="missing-generation",
-            path=Path("/missing-generation.md"),
-            task_id="task-a",
-            round=1,
-            method="agent_system_gepa_reflector",
-            candidate_index=1,
-        ),
-    }
+    explicit_zero_artifact = EvolutionArtifact(
+        artifact_type="agent_system",
+        artifact_id="explicit-zero",
+        path=Path("/explicit-zero.md"),
+        task_id="task-a",
+        round=1,
+        method="agent_system_gepa_reflector",
+        candidate_index=2,
+    )
+    missing_generation_artifact = EvolutionArtifact(
+        artifact_type="agent_system",
+        artifact_id="missing-generation",
+        path=Path("/missing-generation.md"),
+        task_id="task-a",
+        round=1,
+        method="agent_system_gepa_reflector",
+        candidate_index=1,
+    )
+    explicit_zero = gepa_kernel.per_task_candidate(
+        candidate_id=explicit_zero_artifact.artifact_id,
+        source_index=0,
+        explicit_candidate_index=explicit_zero_artifact.candidate_index,
+        fallback_candidate_index=0,
+        generation=0,
+        reward=1.0,
+        trial="explicit-zero-trial",
+    )
+    missing_generation = gepa_kernel.per_task_candidate(
+        candidate_id=missing_generation_artifact.artifact_id,
+        source_index=1,
+        explicit_candidate_index=missing_generation_artifact.candidate_index,
+        fallback_candidate_index=0,
+        generation=None,
+        reward=1.0,
+        trial="missing-generation-trial",
+    )
 
-    selected = selector([explicit_zero, missing_generation])
+    selected = gepa_kernel.select_round_winner([explicit_zero, missing_generation])
 
     assert selected is missing_generation
 
@@ -2572,8 +2533,16 @@ def test_artifact_candidate_index_infers_id_and_uses_supplied_zero_fallback():
         method="agent_system_gepa_reflector",
     )
 
-    assert per_task_module._artifact_candidate_index(inferred, 0) == 7
-    assert per_task_module._artifact_candidate_index(uninferrable, 0) == 0
+    assert gepa_kernel.resolve_candidate_index(
+        candidate_id=inferred.artifact_id,
+        explicit_candidate_index=inferred.candidate_index,
+        fallback_candidate_index=0,
+    ) == 7
+    assert gepa_kernel.resolve_candidate_index(
+        candidate_id=uninferrable.artifact_id,
+        explicit_candidate_index=uninferrable.candidate_index,
+        fallback_candidate_index=0,
+    ) == 0
 
 
 @pytest.mark.parametrize(
@@ -2584,12 +2553,18 @@ def test_artifact_candidate_index_infers_id_and_uses_supplied_zero_fallback():
     ],
 )
 def test_aggregate_group_score_returns_none_when_any_task_reward_is_none(task_rewards):
-    assert per_task_module._aggregate_group_score(task_rewards, "macro_mean_reward") is None
+    assert gepa_kernel.macro_mean(task_rewards.values()) is None
 
 
 def test_aggregate_group_score_rejects_empty_rewards_and_unknown_objective():
     with pytest.raises(ValueError, match="requires at least one task reward"):
-        per_task_module._aggregate_group_score({}, "macro_mean_reward")
+        gepa_kernel.macro_mean([])
 
     with pytest.raises(ValueError, match="unsupported Terminal Bench group objective"):
-        per_task_module._aggregate_group_score({"task-a": 1.0}, "unknown")
+        per_task_module._validate_task_group(
+            TerminalBenchTaskGroup(
+                group_id="group-a",
+                task_ids=["task-a", "task-b"],
+                objective="unknown",
+            )
+        )
