@@ -6,7 +6,7 @@ from urllib.parse import unquote
 
 import pytest
 
-from openevo.evolution.cli import (
+from openevo_terminal_bench.cli import (
     _terminal_bench_forbidden_literals_from_dataset_artifacts,
     _terminal_bench_forbidden_literals_from_events,
     _terminal_bench_task_tags,
@@ -14,7 +14,7 @@ from openevo.evolution.cli import (
 )
 from openevo.evolution.models import DatasetCreateRequest, EventIngestRequest, WorkerClaimRequest
 from openevo.evolution.store import EvolutionStore
-from openevo.evolution.terminal_bench_bridge import (
+from openevo_terminal_bench.bridge import (
     TerminalBenchBridgeError,
     build_terminal_bench_events,
 )

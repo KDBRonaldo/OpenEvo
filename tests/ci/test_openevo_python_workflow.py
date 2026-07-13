@@ -16,9 +16,14 @@ def test_openevo_python_workflow_runs_focused_regressions() -> None:
     assert '"src/slime_bridge/**"' in text
     assert '"scripts/**"' in text
     assert '"tests/**"' in text
-    assert "python -m pip install -e ." in text
-    assert "python -m pip install pytest pytest-asyncio ruff build twine" in text
-    assert "ruff check src tests scripts" in text
+    assert '"benchmarks/terminal_bench/**"' in text
+    core_job, benchmark_job = text.split("  terminal-bench-tests:", maxsplit=1)
+    assert "python -m pip install -e ." in core_job
+    assert "python -m pip install -e benchmarks/terminal_bench" not in core_job
+    assert "python -m pip install pytest pytest-asyncio ruff build twine" in core_job
+    assert "ruff check src tests scripts" in core_job
+    assert "benchmarks/terminal_bench/tests" not in core_job
+    assert "smoke_terminal_bench_package.py" not in core_job
     assert "tests/ci" in text
     assert "tests/config" in text
     assert "tests/platform" in text
@@ -36,6 +41,12 @@ def test_openevo_python_workflow_runs_focused_regressions() -> None:
     assert "tests/openevo/test_experiment_models.py" in text
     assert "tests/openevo/test_experiment_runner.py" in text
     assert "tests/openevo/test_core_capabilities.py" in text
+    assert "needs:" not in benchmark_job
+    assert "python -m pip install -e ." in benchmark_job
+    assert "python -m pip install -e benchmarks/terminal_bench" in benchmark_job
+    assert "ruff check benchmarks/terminal_bench" in benchmark_job
+    assert "benchmarks/terminal_bench/tests" in benchmark_job
+    assert "smoke_terminal_bench_package.py" in benchmark_job
     assert "-q" in text
 
 

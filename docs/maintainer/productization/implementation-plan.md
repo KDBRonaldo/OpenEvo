@@ -124,11 +124,9 @@ Mechanically move only Terminal Bench task acquisition,
 Harbor execution, verifier adapter, materializer, reporting, task configuration,
 and benchmark commands out of `src/openevo/`.
 
-The automation calls public Core contracts for datasets, jobs, workers,
-artifacts, context resolution, injection, and harness runs. It controls task
-cadence only by requests that pass Core revision admission; it cannot activate
-staged output, bypass queued/not-ready, or assemble a partial revision. Unit
-tests may call methods directly, but release performance runs may not.
+The migration calls Core dataset, job, worker, artifact, method, and protected GEPA contracts.
+Revision admission and queued/not-ready handling remain for the next Issue #156 PR.
+Unit tests may call methods directly; release runs cannot claim that contract yet.
 
 Acceptance:
 
@@ -136,9 +134,9 @@ Acceptance:
   scorer, task list, or benchmark command;
 - old Core benchmark imports are removed rather than wrapped;
 - migrated automation produces equivalent task inputs and result summaries;
-- benchmark automation calls the protected Core selection/transition and
-  revision-admission contracts, cannot bypass queued/not-ready, and contains no
-  duplicate or rewritten GEPA selection policy;
+- benchmark automation calls the protected Core selection/transition contract without duplicating or rewriting GEPA selection policy;
+- a subsequent PR binds automation to revision admission and proves it cannot
+  bypass queued/not-ready;
 - algorithm-protection tests remain green.
 
 ### A4. Make Performance Runs Reproducible
@@ -147,6 +145,8 @@ Freeze the task lists and run configuration for the three independent gates.
 The benchmark summary needs only the information required to audit pass@1:
 task ID, selected artifact, attempt outcome, infrastructure rerun status, and
 aggregate rescue count.
+
+Skill bundle's 14/25 is an unverified, user-provided aggregate without per-task evidence; A3 did not run the gate, and every final candidate must rerun all 25 tasks and retain task-level results.
 
 For agent-system GEPA, recover the candidate-generation, candidate-evaluation,
 best-result selection, and transition rule from the pre-productization

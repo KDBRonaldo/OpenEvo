@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "profile_id": "tb21-text-memory-codex-gpt55-v1",
+  "status": "historical_configuration_only",
+  "benchmark": "Terminal Bench 2.1",
+  "harness": "Codex subscription",
+  "model": "gpt-5.5",
+  "method": "text_memory_expel_reflector",
+  "task_source": "docs/dev/terminal-bench-memory-eval.md#live-evidence-so-far",
+  "tasks": [
+    "gcode-to-text",
+    "password-recovery",
+    "large-scale-text-editing",
+    "filter-js-from-html",
+    "chess-best-move",
+    "dna-insert",
+    "overfull-hbox",
+    "configure-git-webserver",
+    "pypi-server",
+    "pytorch-model-recovery",
+    "raman-fitting",
+    "qemu-alpine-ssh",
+    "video-processing",
+    "protein-assembly",
+    "regex-chess",
+    "pytorch-model-cli",
+    "query-optimize",
+    "make-mips-interpreter",
+    "vulnerable-secret",
+    "mteb-retrieve",
+    "train-fasttext"
+  ],
+  "historical_threshold": {
+    "metric": "pass_at_1_rescue_count",
+    "minimum": 12,
+    "denominator": 21
+  },
+  "executed_by_this_change": false,
+  "proves_release_gate": false
+}

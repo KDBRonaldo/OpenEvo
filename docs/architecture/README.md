@@ -11,6 +11,8 @@ packaged workflow already exists. The product surfaces are:
 Developer automation and source-checkout utilities are Core Backend workflows.
 Standalone benchmark automation lives outside Core and Desktop, imports Core
 capabilities, and is not a separate product surface.
+Terminal Bench maintainer commands and package boundaries are documented in
+`../../benchmarks/terminal_bench/README.md`.
 
 ## Recommended Reading Order
 

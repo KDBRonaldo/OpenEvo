@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "profile_id": "tb21-agent-system-codex-gpt55-v1",
+  "status": "historical_configuration_only",
+  "benchmark": "Terminal Bench 2.1",
+  "harness": "Codex subscription",
+  "model": "gpt-5.5",
+  "method": "agent_system_gepa_reflector",
+  "task_manifest": "baseline_failed_tasks.json",
+  "historical_threshold": {
+    "metric": "pass_at_1_rescue_count",
+    "minimum": 17,
+    "denominator": 25
+  },
+  "executed_by_this_change": false,
+  "proves_release_gate": false
+}

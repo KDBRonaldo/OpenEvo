@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+from io import BytesIO
 import os
 from pathlib import Path
 import subprocess
@@ -59,6 +60,51 @@ def test_validate_core_wheel_rejects_nested_wheel(tmp_path: Path) -> None:
 
     with pytest.raises(RuntimeError, match="must not contain nested wheels"):
         builder._validate_core_wheel(wheel, name="openevo", version="0.1.0")
+
+
+def test_validate_core_wheel_rejects_terminal_bench_automation(tmp_path: Path) -> None:
+    builder = _load_builder()
+    wheel = tmp_path / "openevo-0.1.0-py3-none-any.whl"
+    _write_core_wheel(wheel)
+    with ZipFile(wheel, "a") as archive:
+        archive.writestr("openevo_terminal_bench/cli.py", b"")
+
+    with pytest.raises(RuntimeError, match="Terminal Bench automation"):
+        builder._validate_core_wheel(wheel, name="openevo", version="0.1.0")
+
+
+def test_validate_core_wheel_rejects_removed_terminal_bench_modules(
+    tmp_path: Path,
+) -> None:
+    builder = _load_builder()
+    wheel = tmp_path / "openevo-0.1.0-py3-none-any.whl"
+    _write_core_wheel(wheel)
+    legacy_modules = {
+        "openevo/evolution/terminal_bench_bridge.py",
+        "openevo/evolution/terminal_bench_local_parametric.py",
+        "openevo/evolution/terminal_bench_per_task.py",
+        "openevo/evolution/terminal_bench_task_local_parametric.py",
+    }
+    with ZipFile(wheel, "a") as archive:
+        for name in legacy_modules:
+            archive.writestr(name, b"")
+
+    with pytest.raises(RuntimeError, match="removed Terminal Bench Core modules") as exc:
+        builder._validate_core_wheel(wheel, name="openevo", version="0.1.0")
+
+    assert all(path in str(exc.value) for path in legacy_modules)
+
+
+def test_validate_core_wheel_allows_unrelated_similar_module_name(
+    tmp_path: Path,
+) -> None:
+    builder = _load_builder()
+    wheel = tmp_path / "openevo-0.1.0-py3-none-any.whl"
+    _write_core_wheel(wheel)
+    with ZipFile(wheel, "a") as archive:
+        archive.writestr("openevo/evolution/terminal_bench_bridge_v2.py", b"")
+
+    builder._validate_core_wheel(wheel, name="openevo", version="0.1.0")
 
 
 @pytest.mark.parametrize("clean", [False, True])
@@ -261,6 +307,74 @@ def test_sidecar_archive_rejects_missing_or_extra_core_wheels(
         )
 
 
+def test_sidecar_archive_rejects_terminal_bench_automation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builder = _load_builder()
+    executable = tmp_path / "sidecar"
+    executable.write_bytes(b"sidecar")
+    wheel = tmp_path / "openevo-0.1.0-py3-none-any.whl"
+    _write_core_wheel(wheel)
+    monkeypatch.setattr(
+        builder,
+        "_archive_member_names",
+        lambda _: (
+            "openevo/wheels/openevo-0.1.0-py3-none-any.whl",
+            "openevo_terminal_bench/cli.py",
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="Terminal Bench automation"):
+        builder._validate_embedded_core_wheel(executable, wheel)
+
+
+def test_sidecar_archive_rejects_removed_terminal_bench_module(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builder = _load_builder()
+    executable = tmp_path / "sidecar"
+    executable.write_bytes(b"sidecar")
+    wheel = tmp_path / "openevo-0.1.0-py3-none-any.whl"
+    _write_core_wheel(wheel)
+    monkeypatch.setattr(
+        builder,
+        "_archive_member_names",
+        lambda _: (
+            "openevo/wheels/openevo-0.1.0-py3-none-any.whl",
+            "openevo.evolution.terminal_bench_local_parametric",
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="removed Terminal Bench Core modules"):
+        builder._validate_embedded_core_wheel(executable, wheel)
+
+
+def test_sidecar_archive_rejects_tampered_embedded_core_wheel(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builder = _load_builder()
+    executable = tmp_path / "sidecar"
+    executable.write_bytes(b"sidecar")
+    wheel = tmp_path / "openevo-0.1.0-py3-none-any.whl"
+    _write_core_wheel(wheel)
+    member = "openevo/wheels/openevo-0.1.0-py3-none-any.whl"
+    tampered = BytesIO()
+    with ZipFile(tampered, "w") as archive:
+        archive.writestr("openevo-0.1.0.dist-info/METADATA", "")
+        archive.writestr(
+            "openevo/evolution/terminal_bench_task_local_parametric.py",
+            b"",
+        )
+    monkeypatch.setattr(builder, "_archive_member_names", lambda _: (member,))
+    monkeypatch.setattr(builder, "_archive_member_bytes", lambda *_: tampered.getvalue())
+
+    with pytest.raises(RuntimeError, match="removed Terminal Bench Core modules"):
+        builder._validate_embedded_core_wheel(executable, wheel)
+
+
 def test_sidecar_archive_rejects_embedded_core_wheel_digest_mismatch(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -271,8 +385,15 @@ def test_sidecar_archive_rejects_embedded_core_wheel_digest_mismatch(
     wheel = tmp_path / "openevo-0.1.0-py3-none-any.whl"
     _write_core_wheel(wheel)
     member = "openevo/wheels/openevo-0.1.0-py3-none-any.whl"
+    tampered = BytesIO()
+    with ZipFile(tampered, "w") as archive:
+        archive.writestr(
+            "openevo-0.1.0.dist-info/METADATA",
+            "Metadata-Version: 2.1\nName: openevo\nVersion: 0.1.0\n",
+        )
+        archive.writestr("openevo/unexpected.py", b"")
     monkeypatch.setattr(builder, "_archive_member_names", lambda _: (member,))
-    monkeypatch.setattr(builder, "_archive_member_bytes", lambda *_: b"tampered")
+    monkeypatch.setattr(builder, "_archive_member_bytes", lambda *_: tampered.getvalue())
 
     with pytest.raises(RuntimeError, match="digest does not match"):
         builder._validate_embedded_core_wheel(executable, wheel)

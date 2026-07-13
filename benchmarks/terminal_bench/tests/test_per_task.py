@@ -1,17 +1,19 @@
 from __future__ import annotations
 
+import ast
+import inspect
 import json
 import os
 from pathlib import Path
 
 import pytest
 
-import openevo.evolution.cli as cli_module
 import openevo.evolution.agent_system_gepa_kernel as gepa_kernel
-import openevo.evolution.terminal_bench_per_task as per_task_module
-from openevo.evolution.cli import _parse_key_value_entries, main
 from openevo.evolution.models import ArtifactRegisterRequest, ArtifactType
-from openevo.evolution.terminal_bench_per_task import (
+import openevo_terminal_bench.cli as cli_module
+import openevo_terminal_bench.per_task as per_task_module
+from openevo_terminal_bench.cli import _parse_key_value_entries, main
+from openevo_terminal_bench.per_task import (
     ArtifactMaterializer,
     EvolutionArtifact,
     TerminalBenchTaskGroup,
@@ -26,6 +28,65 @@ from openevo.evolution.terminal_bench_per_task import (
     run_per_task_evolution,
     summarize_transition,
 )
+
+
+def test_runner_delegates_gepa_kernel_without_duplicate_state_policy() -> None:
+    tree = ast.parse(inspect.getsource(per_task_module))
+    definitions = {
+        node.name
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
+    }
+    assert definitions.isdisjoint(
+        {
+            "_select_best_candidate_result",
+            "_select_best_group_candidate_result",
+            "_aggregate_group_score",
+            "_artifact_candidate_index",
+        }
+    )
+
+    required_calls = {
+        "begin_round",
+        "record_dataset",
+        "per_task_candidate",
+        "group_candidate",
+        "advance_generation",
+        "complete_round",
+    }
+    for function_name in ("run_per_task_evolution", "run_group_evolution"):
+        function = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == function_name
+        )
+        call_names = {
+            node.func.attr
+            for node in ast.walk(function)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "gepa_kernel"
+        }
+        expected = required_calls - (
+            {"group_candidate"}
+            if function_name == "run_per_task_evolution"
+            else {"per_task_candidate"}
+        )
+        assert call_names >= expected
+
+        assigned_names = {
+            node.id
+            for node in ast.walk(function)
+            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)
+        }
+        assert assigned_names.isdisjoint(
+            {
+                "previous_dataset_artifact_ids",
+                "round_history_dataset_ids",
+                "generation_input_trials",
+            }
+        )
 
 
 def test_agent_system_materializer_sets_harbor_kwargs(tmp_path: Path):
