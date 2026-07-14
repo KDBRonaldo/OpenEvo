@@ -283,24 +283,44 @@ runtime authority under the existing recovery rule. Ordinary demote/archive
 transitions also preserve that observation, while any project intent patch
 clears both the remote projection and revision because they describe the
 previous intent. This closed projection has a separate 256 KiB per-row limit and
-16 MiB aggregate recovery limit. Schema v4 keeps one closed
-`remote_payload_usage` authority row containing the exact non-null payload count,
-aggregate bytes, and a domain-separated HMAC sealed with the separate owner-only
-cursor key. Canonical SQLite triggers update count/bytes and invalidate the seal
-for every project insert, payload replacement/clear, and project delete; the same
-write transaction reseals it before commit, so rollback restores project and usage
-authority together. An independently edited counter or payload cannot retain a
-valid seal. Normal transactions validate this singleton in O(1) and never run a
-remote-payload aggregate scan. Project get/list validates the authority and each
-guarded row in the same SQLite read snapshot before parsing payload bytes.
+16 MiB aggregate recovery limit. Schema v5 keeps one closed
+`provider_storage_usage` authority row containing the complete provider recovery
+row/byte totals, remote payload count/bytes, four remote-content accumulators,
+fixed live-action reservation counts, a generation, and a domain-separated HMAC
+sealed with the separate owner-only cursor key. Every mutable provider table has
+canonical insert/update/delete triggers that update this authority, invalidate
+its seal, and require exactly one affected singleton row. The write transaction
+reseals before commit, so rollback restores resource, operation, idempotency,
+cursor, and usage state together. Normal transactions validate only this primary
+key row and the fixed-size schema; they do not aggregate-scan provider tables.
+Recovery accounting charges the singleton a fixed conservative 512-byte
+reservation instead of recursively measuring its changing decimal counters.
 
-Startup first validates the sealed bounded counters, applies the existing
-100,000-row and recovery-byte budgets, then performs one length-only reconciliation
-of the authority against the actual project rows before any remote payload is
-selected or decoded. Migration from schema v3 performs that same bounded
-reconciliation and publishes the counters, triggers, migration row, and schema
-version in one SQLite transaction. Oversized state fails before JSON decoding,
-and bounded noncanonical state fails during strict decoding.
+The singleton cannot be inserted or deleted after v5 initialization, and the
+migration ledger is immutable. `DELETE` plus reinsert and `INSERT OR REPLACE`
+therefore fail even with `recursive_triggers=0`. Each remote payload also stores
+a per-project HMAC-derived token over its project ID and exact canonical bytes.
+Triggers maintain the authenticated modular token accumulators, while project
+get/list recomputes each selected row token before JSON parsing. A process-local
+last-committed generation/seal snapshot rejects online replay of an older signed
+authority row.
+
+Startup validates the seal, applies the existing 100,000-row and recovery-byte
+budgets, and then performs one bounded reconciliation of real table totals,
+remote lengths/tokens, and live reservations before decoding remote payloads.
+The v4 -> v5 migration does the same and publishes project tokens, the authority,
+triggers, migration row, and schema version in one SQLite transaction. Oversized,
+noncanonical, trigger-tampered, partially replayed, or equal-length rewritten
+state fails closed.
+
+The authority assumes the owner-only signing key remains confidential and is not
+an external monotonic anchor. An offline attacker who restores a complete earlier
+database snapshot, or who reads the key and coherently rewrites every authenticated
+row, is outside this SQLite module's detection boundary. Detecting complete offline
+rollback requires a platform-protected monotonic value outside both the database
+and key file. Budget-changing edits, remote-content edits, and process-lifetime
+authority replay are detected; same-length model-valid edits to other resource
+fields remain inside the owner-only state-directory threat boundary.
 
 Project intent remains editable after activation so the UI can activate once to
 obtain remote capabilities, edit evolution configuration, and activate again.

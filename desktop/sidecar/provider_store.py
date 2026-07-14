@@ -49,7 +49,7 @@ from desktop.sidecar.contracts.v1.models import (
 from desktop.sidecar.workspace_identity import project_id_for_native_import
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 DATABASE_FILENAME = "provider.sqlite3"
 JOURNAL_FILENAME = f"{DATABASE_FILENAME}-journal"
 WAL_FILENAME = f"{DATABASE_FILENAME}-wal"
@@ -68,7 +68,7 @@ MAX_DATABASE_BYTES = 536_870_912
 MAX_JOURNAL_BYTES = 1_073_741_824
 MAX_RECOVERY_ROWS = 100_000
 MAX_RECOVERY_BYTES = 402_653_184
-MAX_SCHEMA_OBJECTS = 40
+MAX_SCHEMA_OBJECTS = 48
 MAX_SCHEMA_BYTES = 98_304
 STARTUP_OPERATION_BATCH_ROWS = 128
 MAX_STARTUP_OPERATION_ROW_BYTES = MAX_DOCUMENT_BYTES + 16_384
@@ -95,6 +95,11 @@ _CURSOR_TOKEN = struct.Struct(">BQQ32s16s")
 _CURSOR_KEY_TEMP_PREFIX = f".{CURSOR_KEY_FILENAME}.tmp-"
 _ACTION_AUTHORITY_DOMAIN = b"openevo.desktop.local-action-authority.v1\0"
 _REMOTE_PAYLOAD_USAGE_AUTHORITY_DOMAIN = b"openevo.desktop.remote-payload-usage-authority.v1\0"
+_REMOTE_PAYLOAD_CONTENT_AUTHORITY_DOMAIN = b"openevo.desktop.remote-payload-content-authority.v1\0"
+_PROVIDER_STORAGE_USAGE_AUTHORITY_DOMAIN = b"openevo.desktop.provider-storage-usage-authority.v1\0"
+_REMOTE_CONTENT_ACCUMULATOR_MODULUS = (1 << 61) - 1
+_REMOTE_CONTENT_TOKEN_BYTES = 7
+_PROVIDER_USAGE_ACCOUNTED_BYTES = 512
 _RENAME_NOREPLACE = 1
 _RENAME_EXCL = 0x00000004
 _ETAG_RE = re.compile(r'^"[0-9a-f]{64}"$')
@@ -187,6 +192,102 @@ _ACTION_ROUTE_SUFFIXES = {
     "bootstrap": "bootstrap",
     "workspace_sync": "workspace-sync",
 }
+
+_PROVIDER_USAGE_COLUMNS = (
+    "total_rows",
+    "total_bytes",
+    "remote_payload_count",
+    "remote_payload_bytes",
+    "remote_accumulator_0",
+    "remote_accumulator_1",
+    "remote_accumulator_2",
+    "remote_accumulator_3",
+    "profile_reservations",
+    "project_reservations",
+    "generation",
+    "authority_tag",
+)
+_RECOVERY_USAGE_SPECIFICATIONS = (
+    (
+        "remote_profiles",
+        (
+            "profile_id",
+            "name",
+            "document_json",
+            "connection_state",
+            "credential_slots_json",
+            "host_key_fingerprint",
+            "created_at",
+            "updated_at",
+        ),
+    ),
+    (
+        "projects",
+        (
+            "project_id",
+            "profile_id",
+            "name",
+            "document_json",
+            "state",
+            "current_revision_id",
+            "created_at",
+            "updated_at",
+        ),
+    ),
+    (
+        "idempotency_records",
+        (
+            "principal",
+            "method",
+            "route",
+            "resource_scope",
+            "idempotency_key",
+            "request_digest",
+            "operation_id",
+            "response_type",
+            "response_bytes",
+        ),
+    ),
+    (
+        "local_operations",
+        (
+            "operation_id",
+            "operation_kind",
+            "state",
+            "resource_type",
+            "resource_id",
+            "action_identity_digest",
+            "document_json",
+            "created_at",
+            "finished_at",
+        ),
+    ),
+    (
+        "pagination_cursors",
+        ("cursor_digest", "query_digest", "anchor_id", "anchor_value"),
+    ),
+    ("schema_migrations", ("applied_at",)),
+)
+_LIVE_OPERATION_STATES_SQL = "'queued', 'running', 'cancelling'"
+_PROFILE_OPERATION_KINDS_SQL = ", ".join(
+    f"'{value}'" for value in sorted(_PROFILE_OPERATION_KINDS)
+)
+_PROJECT_OPERATION_KINDS_SQL = ", ".join(
+    f"'{value}'" for value in sorted(_PROJECT_OPERATION_KINDS)
+)
+
+
+def _usage_length_sql(columns: tuple[str, ...], *, prefix: str) -> str:
+    return " + ".join(
+        f"coalesce(length(CAST({prefix}.{column} AS BLOB)), 0)" for column in columns
+    )
+
+
+def _operation_reservation_sql(*, prefix: str, kinds: str) -> str:
+    return (
+        f"CASE WHEN {prefix}.state IN ({_LIVE_OPERATION_STATES_SQL}) "
+        f"AND {prefix}.operation_kind IN ({kinds}) THEN 1 ELSE 0 END"
+    )
 
 
 def _rename_noreplace(source: str, destination: str, *, directory_fd: int) -> None:
@@ -571,6 +672,216 @@ _SCHEMA_V4 = (
     _REMOTE_PAYLOAD_DELETE_TRIGGER_V4,
 )
 
+_PROJECTS_TABLE_V5 = f"""
+CREATE TABLE projects (
+    project_id TEXT PRIMARY KEY,
+    profile_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    document_json BLOB NOT NULL,
+    state TEXT NOT NULL,
+    current_revision_id TEXT,
+    remote_state_json BLOB,
+    remote_state_token_0 INTEGER,
+    remote_state_token_1 INTEGER,
+    remote_state_token_2 INTEGER,
+    remote_state_token_3 INTEGER,
+    resource_version INTEGER NOT NULL CHECK (resource_version >= 1),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (profile_id) REFERENCES remote_profiles(profile_id) ON DELETE RESTRICT,
+    CHECK (
+        remote_state_json IS NULL OR
+        length(remote_state_json) <= {MAX_REMOTE_PROJECT_STATE_BYTES}
+    ),
+    CHECK (
+        (remote_state_json IS NULL AND
+         remote_state_token_0 IS NULL AND remote_state_token_1 IS NULL AND
+         remote_state_token_2 IS NULL AND remote_state_token_3 IS NULL) OR
+        (remote_state_json IS NOT NULL AND
+         remote_state_token_0 BETWEEN 0 AND {_REMOTE_CONTENT_ACCUMULATOR_MODULUS - 1} AND
+         remote_state_token_1 BETWEEN 0 AND {_REMOTE_CONTENT_ACCUMULATOR_MODULUS - 1} AND
+         remote_state_token_2 BETWEEN 0 AND {_REMOTE_CONTENT_ACCUMULATOR_MODULUS - 1} AND
+         remote_state_token_3 BETWEEN 0 AND {_REMOTE_CONTENT_ACCUMULATOR_MODULUS - 1})
+    )
+) STRICT
+"""
+
+_PROVIDER_STORAGE_USAGE_TABLE_V5 = f"""
+CREATE TABLE provider_storage_usage (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    total_rows INTEGER NOT NULL CHECK (total_rows >= 1),
+    total_bytes INTEGER NOT NULL CHECK (total_bytes >= 0),
+    remote_payload_count INTEGER NOT NULL CHECK (remote_payload_count >= 0),
+    remote_payload_bytes INTEGER NOT NULL CHECK (remote_payload_bytes >= 0),
+    remote_accumulator_0 INTEGER NOT NULL
+        CHECK (remote_accumulator_0 BETWEEN 0 AND {_REMOTE_CONTENT_ACCUMULATOR_MODULUS - 1}),
+    remote_accumulator_1 INTEGER NOT NULL
+        CHECK (remote_accumulator_1 BETWEEN 0 AND {_REMOTE_CONTENT_ACCUMULATOR_MODULUS - 1}),
+    remote_accumulator_2 INTEGER NOT NULL
+        CHECK (remote_accumulator_2 BETWEEN 0 AND {_REMOTE_CONTENT_ACCUMULATOR_MODULUS - 1}),
+    remote_accumulator_3 INTEGER NOT NULL
+        CHECK (remote_accumulator_3 BETWEEN 0 AND {_REMOTE_CONTENT_ACCUMULATOR_MODULUS - 1}),
+    profile_reservations INTEGER NOT NULL CHECK (profile_reservations >= 0),
+    project_reservations INTEGER NOT NULL CHECK (project_reservations >= 0),
+    generation INTEGER NOT NULL CHECK (generation BETWEEN 0 AND 9223372036854775806),
+    authority_tag BLOB NOT NULL CHECK (length(authority_tag) IN (0, 32)),
+    CHECK (
+        (remote_payload_count = 0 AND remote_payload_bytes = 0) OR
+        (remote_payload_count > 0 AND remote_payload_bytes >= remote_payload_count)
+    )
+) STRICT, WITHOUT ROWID
+"""
+
+
+def _provider_usage_trigger_v5(table: str, columns: tuple[str, ...], operation: str) -> str:
+    operation_lower = operation.lower()
+    if operation == "INSERT":
+        row_delta = "1"
+        byte_delta = _usage_length_sql(columns, prefix="NEW")
+    elif operation == "DELETE":
+        row_delta = "-1"
+        byte_delta = f"-({_usage_length_sql(columns, prefix='OLD')})"
+    else:
+        row_delta = "0"
+        byte_delta = (
+            f"({_usage_length_sql(columns, prefix='NEW')}) - "
+            f"({_usage_length_sql(columns, prefix='OLD')})"
+        )
+    extra_assignments = ""
+    if table == "projects":
+        if operation == "INSERT":
+            count_delta = "CASE WHEN NEW.remote_state_json IS NULL THEN 0 ELSE 1 END"
+            remote_byte_delta = "coalesce(length(CAST(NEW.remote_state_json AS BLOB)), 0)"
+            token_expression = tuple(
+                f"coalesce(NEW.remote_state_token_{index}, 0)" for index in range(4)
+            )
+        elif operation == "DELETE":
+            count_delta = "-CASE WHEN OLD.remote_state_json IS NULL THEN 0 ELSE 1 END"
+            remote_byte_delta = "-coalesce(length(CAST(OLD.remote_state_json AS BLOB)), 0)"
+            token_expression = tuple(
+                f"-coalesce(OLD.remote_state_token_{index}, 0)" for index in range(4)
+            )
+        else:
+            count_delta = (
+                "CASE WHEN NEW.remote_state_json IS NULL THEN 0 ELSE 1 END - "
+                "CASE WHEN OLD.remote_state_json IS NULL THEN 0 ELSE 1 END"
+            )
+            remote_byte_delta = (
+                "coalesce(length(CAST(NEW.remote_state_json AS BLOB)), 0) - "
+                "coalesce(length(CAST(OLD.remote_state_json AS BLOB)), 0)"
+            )
+            token_expression = tuple(
+                f"-coalesce(OLD.remote_state_token_{index}, 0) + "
+                f"coalesce(NEW.remote_state_token_{index}, 0)"
+                for index in range(4)
+            )
+        extra_assignments += (
+            f", remote_payload_count = remote_payload_count + ({count_delta})"
+            f", remote_payload_bytes = remote_payload_bytes + ({remote_byte_delta})"
+        )
+        extra_assignments += "".join(
+            f", remote_accumulator_{index} = "
+            f"(remote_accumulator_{index} + ({expression}) + "
+            f"{_REMOTE_CONTENT_ACCUMULATOR_MODULUS}) % "
+            f"{_REMOTE_CONTENT_ACCUMULATOR_MODULUS}"
+            for index, expression in enumerate(token_expression)
+        )
+    if table == "local_operations":
+        profile_new = _operation_reservation_sql(prefix="NEW", kinds=_PROFILE_OPERATION_KINDS_SQL)
+        profile_old = _operation_reservation_sql(prefix="OLD", kinds=_PROFILE_OPERATION_KINDS_SQL)
+        project_new = _operation_reservation_sql(prefix="NEW", kinds=_PROJECT_OPERATION_KINDS_SQL)
+        project_old = _operation_reservation_sql(prefix="OLD", kinds=_PROJECT_OPERATION_KINDS_SQL)
+        if operation == "INSERT":
+            profile_delta, project_delta = profile_new, project_new
+        elif operation == "DELETE":
+            profile_delta, project_delta = f"-({profile_old})", f"-({project_old})"
+        else:
+            profile_delta = f"({profile_new}) - ({profile_old})"
+            project_delta = f"({project_new}) - ({project_old})"
+        extra_assignments += (
+            f", profile_reservations = profile_reservations + ({profile_delta})"
+            f", project_reservations = project_reservations + ({project_delta})"
+        )
+    return f"""
+CREATE TRIGGER provider_usage_{table}_{operation_lower}
+AFTER {operation} ON {table}
+BEGIN
+    UPDATE provider_storage_usage
+    SET total_rows = total_rows + ({row_delta}),
+        total_bytes = total_bytes + ({byte_delta}),
+        generation = generation + 1,
+        authority_tag = X''
+        {extra_assignments}
+    WHERE singleton = 1;
+    SELECT CASE WHEN changes() != 1
+        THEN RAISE(ABORT, 'provider storage usage authority is missing') END;
+END
+"""
+
+
+_PROVIDER_USAGE_MAINTENANCE_TRIGGERS_V5 = tuple(
+    _provider_usage_trigger_v5(table, columns, operation)
+    for table, columns in _RECOVERY_USAGE_SPECIFICATIONS
+    for operation in ("INSERT", "UPDATE", "DELETE")
+)
+_PROVIDER_USAGE_INSERT_GUARD_V5 = """
+CREATE TRIGGER provider_storage_usage_no_insert
+BEFORE INSERT ON provider_storage_usage
+WHEN EXISTS (SELECT 1 FROM provider_storage_usage)
+  OR (SELECT count(*) FROM schema_migrations) >= 5
+BEGIN
+    SELECT RAISE(ABORT, 'provider storage usage authority cannot be inserted');
+END
+"""
+_PROVIDER_USAGE_DELETE_GUARD_V5 = """
+CREATE TRIGGER provider_storage_usage_no_delete
+BEFORE DELETE ON provider_storage_usage
+BEGIN
+    SELECT RAISE(ABORT, 'provider storage usage authority cannot be deleted');
+END
+"""
+_SCHEMA_MIGRATION_INSERT_GUARD_V5 = """
+CREATE TRIGGER schema_migrations_no_insert
+BEFORE INSERT ON schema_migrations
+WHEN (SELECT count(*) FROM schema_migrations) >= 5
+BEGIN
+    SELECT RAISE(ABORT, 'provider migration ledger is immutable');
+END
+"""
+_SCHEMA_MIGRATION_UPDATE_GUARD_V5 = """
+CREATE TRIGGER schema_migrations_no_update
+BEFORE UPDATE ON schema_migrations
+BEGIN
+    SELECT RAISE(ABORT, 'provider migration ledger is immutable');
+END
+"""
+_SCHEMA_MIGRATION_DELETE_GUARD_V5 = """
+CREATE TRIGGER schema_migrations_no_delete
+BEFORE DELETE ON schema_migrations
+BEGIN
+    SELECT RAISE(ABORT, 'provider migration ledger is immutable');
+END
+"""
+
+_SCHEMA_V5 = (
+    """
+    CREATE TABLE schema_migrations (
+        version INTEGER PRIMARY KEY CHECK (version BETWEEN 1 AND 5),
+        applied_at TEXT NOT NULL CHECK (length(CAST(applied_at AS BLOB)) = 27)
+    ) STRICT
+    """,
+    _SCHEMA_V3[1],
+    _PROJECTS_TABLE_V5,
+    *_SCHEMA_V3[3:],
+    _PROVIDER_STORAGE_USAGE_TABLE_V5,
+    *_PROVIDER_USAGE_MAINTENANCE_TRIGGERS_V5,
+    _PROVIDER_USAGE_INSERT_GUARD_V5,
+    _PROVIDER_USAGE_DELETE_GUARD_V5,
+    _SCHEMA_MIGRATION_INSERT_GUARD_V5,
+    _SCHEMA_MIGRATION_UPDATE_GUARD_V5,
+    _SCHEMA_MIGRATION_DELETE_GUARD_V5,
+)
+
 
 def _schema_rows(connection: sqlite3.Connection) -> tuple[tuple[object, ...], ...]:
     count, byte_count = connection.execute(
@@ -628,7 +939,8 @@ def _canonical_json_bytes(value: Any) -> bytes:
 _EXPECTED_SCHEMA_V1_ROWS, _EXPECTED_SCHEMA_V1_DIGEST = _expected_schema(_SCHEMA_V1)
 _EXPECTED_SCHEMA_V2_ROWS, _EXPECTED_SCHEMA_V2_DIGEST = _expected_schema(_SCHEMA_V2)
 _EXPECTED_SCHEMA_V3_ROWS, _EXPECTED_SCHEMA_V3_DIGEST = _expected_schema(_SCHEMA_V3)
-_EXPECTED_SCHEMA_ROWS, _EXPECTED_SCHEMA_DIGEST = _expected_schema(_SCHEMA_V4)
+_EXPECTED_SCHEMA_V4_ROWS, _EXPECTED_SCHEMA_V4_DIGEST = _expected_schema(_SCHEMA_V4)
+_EXPECTED_SCHEMA_ROWS, _EXPECTED_SCHEMA_DIGEST = _expected_schema(_SCHEMA_V5)
 
 
 def _decode_json_object(raw: bytes, *, label: str) -> dict[str, Any]:
@@ -665,7 +977,7 @@ def _validate_json_model(model_type: type[_ModelT], value: object) -> _ModelT:
 class ProviderMutation:
     """Restricted state changes available inside an idempotent store transaction."""
 
-    __slots__ = ("_connection", "_if_match", "_store")
+    __slots__ = ("_connection", "_created_operation_ids", "_if_match", "_store")
 
     def __init__(
         self,
@@ -677,6 +989,7 @@ class ProviderMutation:
         self._store = store
         self._connection = connection
         self._if_match = if_match
+        self._created_operation_ids: list[str] = []
 
     def _require_bound_if_match(self, if_match: str) -> None:
         if self._if_match is not None and not hmac.compare_digest(self._if_match, if_match):
@@ -748,6 +1061,10 @@ class ProviderMutation:
                     "project activation requires a ready remote project state"
                 )
             remote_state_bytes = self._store._encode_remote_project_state(validated_remote)
+            remote_state_token = self._store._remote_payload_content_token(
+                project_id=project_id,
+                payload=remote_state_bytes,
+            )
             self._store._require_project_operation_reservation_available(
                 self._connection,
                 project_id,
@@ -767,12 +1084,15 @@ class ProviderMutation:
                 """
                 UPDATE projects
                 SET state = 'active', current_revision_id = ?, remote_state_json = ?,
+                    remote_state_token_0 = ?, remote_state_token_1 = ?,
+                    remote_state_token_2 = ?, remote_state_token_3 = ?,
                     resource_version = resource_version + 1, updated_at = ?
                 WHERE project_id = ?
                 """,
                 (
                     active_revision.id,
                     remote_state_bytes,
+                    *remote_state_token,
                     self._store._timestamp(),
                     project_id,
                 ),
@@ -975,7 +1295,25 @@ class ProviderMutation:
                 operation.finished_at,
             ),
         )
+        self._created_operation_ids.append(operation.operation_id)
         return operation
+
+    def _validate_created_operations_bound(self) -> None:
+        for operation_id in self._created_operation_ids:
+            row = self._store._require_operation_row(self._connection, operation_id)
+            if (
+                type(row["action_identity_digest"]) is not str
+                or _DIGEST_RE.fullmatch(row["action_identity_digest"]) is None
+            ):
+                raise ProviderDataCorruptionError(
+                    "operation action authority digest is missing or invalid"
+                )
+            operation = self._store._operation_from_row(row)
+            self._store._idempotency_rows_for_operation(
+                self._connection,
+                operation,
+                bytes(row["document_json"]),
+            )
 
     def _create_profile(self, request: RemoteProfileCreateV1) -> RemoteProfileV1:
         profile_id = self._store._new_id()
@@ -1478,14 +1816,31 @@ class DesktopProviderStore:
                 }
                 if existing:
                     raise ProviderSchemaError("unversioned provider database is not empty")
-                for statement in _SCHEMA_V4:
+                for statement in _SCHEMA_V5:
                     connection.execute(statement)
                 timestamp = self._timestamp()
+                self._insert_provider_storage_usage(
+                    connection,
+                    total_rows=1,
+                    total_bytes=_PROVIDER_USAGE_ACCOUNTED_BYTES,
+                    remote_payload_count=0,
+                    remote_payload_bytes=0,
+                    remote_accumulators=(0, 0, 0, 0),
+                    profile_reservations=0,
+                    project_reservations=0,
+                    generation=0,
+                )
                 connection.executemany(
                     "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
-                    ((1, timestamp), (2, timestamp), (3, timestamp), (4, timestamp)),
+                    (
+                        (1, timestamp),
+                        (2, timestamp),
+                        (3, timestamp),
+                        (4, timestamp),
+                        (5, timestamp),
+                    ),
                 )
-                self._insert_remote_payload_usage(connection, payload_count=0, payload_bytes=0)
+                self._seal_provider_storage_usage(connection)
                 connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             elif version == 1:
                 self._validate_schema_version(
@@ -1505,6 +1860,7 @@ class DesktopProviderStore:
                 self._validate_migration_rows(connection, expected_version=2)
                 self._migrate_v2_to_v3(connection)
                 self._migrate_v3_to_v4(connection)
+                self._migrate_v4_to_v5(connection)
             elif version == 2:
                 self._validate_schema_version(
                     connection,
@@ -1515,6 +1871,7 @@ class DesktopProviderStore:
                 self._validate_migration_rows(connection, expected_version=2)
                 self._migrate_v2_to_v3(connection)
                 self._migrate_v3_to_v4(connection)
+                self._migrate_v4_to_v5(connection)
             elif version == 3:
                 self._validate_schema_version(
                     connection,
@@ -1524,6 +1881,16 @@ class DesktopProviderStore:
                 )
                 self._validate_migration_rows(connection, expected_version=3)
                 self._migrate_v3_to_v4(connection)
+                self._migrate_v4_to_v5(connection)
+            elif version == 4:
+                self._validate_schema_version(
+                    connection,
+                    rows=_EXPECTED_SCHEMA_V4_ROWS,
+                    digest=_EXPECTED_SCHEMA_V4_DIGEST,
+                    label="v4",
+                )
+                self._validate_migration_rows(connection, expected_version=4)
+                self._migrate_v4_to_v5(connection)
             elif version != SCHEMA_VERSION:
                 raise ProviderSchemaError(f"unsupported provider schema version {version}")
             self._validate_schema(connection)
@@ -1631,7 +1998,7 @@ class DesktopProviderStore:
         connection.execute("PRAGMA user_version = 3")
 
     def _migrate_v3_to_v4(self, connection: sqlite3.Connection) -> None:
-        self._validate_recovery_budget(
+        self._validate_recovery_budget_v4(
             connection,
             include_remote_payload_usage=False,
         )
@@ -1656,7 +2023,7 @@ class DesktopProviderStore:
         )
         connection.execute("DROP TABLE schema_migrations_v3")
         connection.execute(_REMOTE_PAYLOAD_USAGE_TABLE_V4)
-        self._insert_remote_payload_usage(
+        self._insert_remote_payload_usage_v4(
             connection,
             payload_count=payload_count,
             payload_bytes=payload_bytes,
@@ -1666,13 +2033,132 @@ class DesktopProviderStore:
         connection.execute(_REMOTE_PAYLOAD_DELETE_TRIGGER_V4)
         connection.execute("PRAGMA user_version = 4")
 
+    def _migrate_v4_to_v5(self, connection: sqlite3.Connection) -> None:
+        self._validate_remote_payload_usage_authority_v4(connection)
+        self._validate_recovery_budget_v4(connection)
+        self._reconcile_remote_payload_usage_v4(connection)
+
+        for trigger_name in (
+            "projects_remote_payload_insert",
+            "projects_remote_payload_update",
+            "projects_remote_payload_delete",
+        ):
+            connection.execute(f"DROP TRIGGER {trigger_name}")
+        for index_name in (
+            "projects_updated_idx",
+            "projects_created_idx",
+            "projects_name_idx",
+            "projects_profile_idx",
+            "projects_single_active_idx",
+        ):
+            connection.execute(f"DROP INDEX {index_name}")
+        connection.execute("ALTER TABLE projects RENAME TO projects_v4")
+        connection.execute(_PROJECTS_TABLE_V5)
+        connection.execute(
+            """
+            INSERT INTO projects(
+                project_id, profile_id, name, document_json, state,
+                current_revision_id, remote_state_json,
+                remote_state_token_0, remote_state_token_1,
+                remote_state_token_2, remote_state_token_3,
+                resource_version, created_at, updated_at
+            )
+            SELECT project_id, profile_id, name, document_json, state,
+                   current_revision_id, remote_state_json,
+                   CASE WHEN remote_state_json IS NULL THEN NULL ELSE 0 END,
+                   CASE WHEN remote_state_json IS NULL THEN NULL ELSE 0 END,
+                   CASE WHEN remote_state_json IS NULL THEN NULL ELSE 0 END,
+                   CASE WHEN remote_state_json IS NULL THEN NULL ELSE 0 END,
+                   resource_version, created_at, updated_at
+            FROM projects_v4
+            """
+        )
+        for row in connection.execute(
+            """
+            SELECT project_id, remote_state_json
+            FROM projects_v4
+            WHERE remote_state_json IS NOT NULL
+            ORDER BY project_id
+            """
+        ):
+            project_id = cast(str, row["project_id"])
+            payload = bytes(row["remote_state_json"])
+            token = self._remote_payload_content_token(project_id=project_id, payload=payload)
+            updated = connection.execute(
+                """
+                UPDATE projects
+                SET remote_state_token_0 = ?, remote_state_token_1 = ?,
+                    remote_state_token_2 = ?, remote_state_token_3 = ?
+                WHERE project_id = ?
+                """,
+                (*token, project_id),
+            )
+            if updated.rowcount != 1:
+                raise ProviderDataCorruptionError(
+                    "remote project state identity migration changed unexpectedly"
+                )
+        connection.execute("DROP TABLE projects_v4")
+        for statement in _SCHEMA_V3:
+            if " INDEX projects_" in statement:
+                connection.execute(statement)
+
+        connection.execute("ALTER TABLE schema_migrations RENAME TO schema_migrations_v4")
+        connection.execute(_SCHEMA_V5[0])
+        connection.execute(
+            """
+            INSERT INTO schema_migrations(version, applied_at)
+            SELECT version, applied_at FROM schema_migrations_v4 ORDER BY version
+            """
+        )
+        connection.execute("DROP TABLE schema_migrations_v4")
+        connection.execute("DROP TABLE remote_payload_usage")
+        connection.execute(_PROVIDER_STORAGE_USAGE_TABLE_V5)
+
+        total_rows, total_bytes = self._recovery_usage(connection)
+        remote_count, maximum_bytes, remote_bytes = self._remote_state_recovery_usage(connection)
+        self._validate_remote_state_recovery_usage(
+            payload_count=remote_count,
+            maximum_bytes=maximum_bytes,
+            payload_bytes=remote_bytes,
+        )
+        remote_accumulators = self._remote_content_accumulators(connection)
+        profile_reservations, project_reservations = self._validate_live_action_authorities(
+            connection
+        )
+        self._insert_provider_storage_usage(
+            connection,
+            total_rows=total_rows,
+            total_bytes=total_bytes,
+            remote_payload_count=remote_count,
+            remote_payload_bytes=remote_bytes,
+            remote_accumulators=remote_accumulators,
+            profile_reservations=profile_reservations,
+            project_reservations=project_reservations,
+            generation=0,
+        )
+        for statement in (
+            *_PROVIDER_USAGE_MAINTENANCE_TRIGGERS_V5,
+            _PROVIDER_USAGE_INSERT_GUARD_V5,
+            _PROVIDER_USAGE_DELETE_GUARD_V5,
+            _SCHEMA_MIGRATION_INSERT_GUARD_V5,
+            _SCHEMA_MIGRATION_UPDATE_GUARD_V5,
+            _SCHEMA_MIGRATION_DELETE_GUARD_V5,
+        ):
+            connection.execute(statement)
+        connection.execute(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (5, ?)",
+            (self._timestamp(),),
+        )
+        self._seal_provider_storage_usage(connection)
+        connection.execute("PRAGMA user_version = 5")
+
     @staticmethod
     def _validate_schema(connection: sqlite3.Connection) -> None:
         DesktopProviderStore._validate_schema_version(
             connection,
             rows=_EXPECTED_SCHEMA_ROWS,
             digest=_EXPECTED_SCHEMA_DIGEST,
-            label="v4",
+            label="v5",
         )
 
     @staticmethod
@@ -1698,14 +2184,14 @@ class DesktopProviderStore:
         try:
             connection.execute("BEGIN EXCLUSIVE")
             self._validate_schema(connection)
-            self._validate_remote_payload_usage_authority(connection)
+            self._validate_provider_storage_usage_authority(connection)
             integrity = connection.execute("PRAGMA integrity_check(1)").fetchall()
             if [tuple(row) for row in integrity] != [("ok",)]:
                 raise ProviderDataCorruptionError("provider SQLite integrity check failed")
             if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
                 raise ProviderDataCorruptionError("provider foreign key check failed")
             self._validate_recovery_budget(connection)
-            self._reconcile_remote_payload_usage(connection)
+            self._reconcile_provider_storage_usage(connection)
             self._validate_migration_rows(connection)
             for row in connection.execute("SELECT * FROM remote_profiles"):
                 self._validate_profile_recovery_row(cast(sqlite3.Row, row))
@@ -1749,9 +2235,11 @@ class DesktopProviderStore:
                 (timestamp,),
             )
             self._reconcile_operations_at_startup(connection)
+            sealed_snapshot = self._seal_provider_storage_usage(connection)
             self._validate_write_budget(connection)
             self._verify_storage_files()
             connection.commit()
+            self._provider_usage_snapshot = sealed_snapshot
         except ProviderStoreError:
             connection.rollback()
             raise
@@ -1763,52 +2251,33 @@ class DesktopProviderStore:
             raise
 
     @staticmethod
-    def _recovery_usage(
+    def _recovery_usage_v4(
         connection: sqlite3.Connection,
         *,
-        include_remote_payload_usage: bool = True,
+        include_remote_payload_usage: bool,
     ) -> tuple[int, int]:
         total_rows = 0
         total_bytes = 0
-        specifications = (
-            (
-                "remote_profiles",
-                "profile_id, name, document_json, connection_state, "
-                "credential_slots_json, host_key_fingerprint, created_at, updated_at",
-            ),
-            (
-                "projects",
-                "project_id, profile_id, name, document_json, state, "
-                "current_revision_id, created_at, updated_at",
-            ),
-            (
-                "idempotency_records",
-                "principal, method, route, resource_scope, idempotency_key, request_digest, "
-                "operation_id, response_type, response_bytes",
-            ),
-            (
-                "local_operations",
-                "operation_id, operation_kind, state, resource_type, resource_id, "
-                "action_identity_digest, document_json, created_at, finished_at",
-            ),
-            (
-                "pagination_cursors",
-                "cursor_digest, query_digest, anchor_id, anchor_value",
-            ),
-            ("schema_migrations", "applied_at"),
-        )
+        specifications = list(_RECOVERY_USAGE_SPECIFICATIONS)
         if include_remote_payload_usage:
-            specifications += (
-                (
-                    "remote_payload_usage",
-                    "payload_count, payload_bytes, authority_tag",
-                ),
+            specifications.append(
+                ("remote_payload_usage", ("payload_count", "payload_bytes", "authority_tag"))
             )
         for table, columns in specifications:
-            length_sum = " + ".join(
-                f"coalesce(length(CAST({column.strip()} AS BLOB)), 0)"
-                for column in columns.split(",")
-            )
+            length_sum = _usage_length_sql(columns, prefix=table)
+            row = connection.execute(
+                f"SELECT count(*), coalesce(sum({length_sum}), 0) FROM {table}"
+            ).fetchone()
+            total_rows += cast(int, row[0])
+            total_bytes += cast(int, row[1])
+        return total_rows, total_bytes
+
+    @staticmethod
+    def _recovery_usage(connection: sqlite3.Connection) -> tuple[int, int]:
+        total_rows = 1
+        total_bytes = _PROVIDER_USAGE_ACCOUNTED_BYTES
+        for table, columns in _RECOVERY_USAGE_SPECIFICATIONS:
+            length_sum = _usage_length_sql(columns, prefix=table)
             row = connection.execute(
                 f"SELECT count(*), coalesce(sum({length_sum}), 0) FROM {table}"
             ).fetchone()
@@ -1817,16 +2286,22 @@ class DesktopProviderStore:
         return total_rows, total_bytes
 
     @classmethod
-    def _validate_recovery_budget(
+    def _validate_recovery_budget_v4(
         cls,
         connection: sqlite3.Connection,
         *,
         include_remote_payload_usage: bool = True,
     ) -> None:
-        total_rows, total_bytes = cls._recovery_usage(
+        total_rows, total_bytes = cls._recovery_usage_v4(
             connection,
             include_remote_payload_usage=include_remote_payload_usage,
         )
+        if total_rows > MAX_RECOVERY_ROWS or total_bytes > MAX_RECOVERY_BYTES:
+            raise ProviderDataCorruptionError("provider recovery budget exceeded")
+
+    @classmethod
+    def _validate_recovery_budget(cls, connection: sqlite3.Connection) -> None:
+        total_rows, total_bytes = cls._recovery_usage(connection)
         if total_rows > MAX_RECOVERY_ROWS or total_bytes > MAX_RECOVERY_BYTES:
             raise ProviderDataCorruptionError("provider recovery budget exceeded")
 
@@ -1881,7 +2356,7 @@ class DesktopProviderStore:
             "sha256",
         )
 
-    def _insert_remote_payload_usage(
+    def _insert_remote_payload_usage_v4(
         self,
         connection: sqlite3.Connection,
         *,
@@ -1905,7 +2380,7 @@ class DesktopProviderStore:
         )
 
     @staticmethod
-    def _remote_payload_usage_row(connection: sqlite3.Connection) -> sqlite3.Row:
+    def _remote_payload_usage_row_v4(connection: sqlite3.Connection) -> sqlite3.Row:
         row = connection.execute(
             """
             SELECT singleton, payload_count, payload_bytes, authority_tag
@@ -1918,7 +2393,9 @@ class DesktopProviderStore:
         return cast(sqlite3.Row, row)
 
     @staticmethod
-    def _validate_remote_payload_usage_scalars(row: sqlite3.Row) -> tuple[int, int, bytes]:
+    def _validate_remote_payload_usage_scalars_v4(
+        row: sqlite3.Row,
+    ) -> tuple[int, int, bytes]:
         payload_count = row["payload_count"]
         payload_bytes = row["payload_bytes"]
         authority_tag = row["authority_tag"]
@@ -1937,12 +2414,14 @@ class DesktopProviderStore:
             raise ProviderDataCorruptionError("remote project state usage authority is invalid")
         return payload_count, payload_bytes, authority_tag
 
-    def _validate_remote_payload_usage_authority(
+    def _validate_remote_payload_usage_authority_v4(
         self,
         connection: sqlite3.Connection,
     ) -> tuple[int, int]:
-        payload_count, payload_bytes, authority_tag = self._validate_remote_payload_usage_scalars(
-            self._remote_payload_usage_row(connection)
+        payload_count, payload_bytes, authority_tag = (
+            self._validate_remote_payload_usage_scalars_v4(
+                self._remote_payload_usage_row_v4(connection)
+            )
         )
         expected = self._remote_payload_usage_authority_tag(
             payload_count=payload_count,
@@ -1952,37 +2431,10 @@ class DesktopProviderStore:
             raise ProviderDataCorruptionError("remote project state usage authority is invalid")
         return payload_count, payload_bytes
 
-    def _seal_remote_payload_usage(self, connection: sqlite3.Connection) -> None:
-        row = self._remote_payload_usage_row(connection)
-        payload_count, payload_bytes, authority_tag = self._validate_remote_payload_usage_scalars(
-            row
+    def _reconcile_remote_payload_usage_v4(self, connection: sqlite3.Connection) -> None:
+        expected_count, expected_bytes = self._validate_remote_payload_usage_authority_v4(
+            connection
         )
-        expected = self._remote_payload_usage_authority_tag(
-            payload_count=payload_count,
-            payload_bytes=payload_bytes,
-        )
-        if hmac.compare_digest(authority_tag, expected):
-            return
-        if authority_tag:
-            raise ProviderDataCorruptionError(
-                "remote project state usage authority changed unexpectedly"
-            )
-        updated = connection.execute(
-            """
-            UPDATE remote_payload_usage
-            SET authority_tag = ?
-            WHERE singleton = 1 AND payload_count = ? AND payload_bytes = ?
-              AND authority_tag = X''
-            """,
-            (expected, payload_count, payload_bytes),
-        )
-        if updated.rowcount != 1:
-            raise ProviderDataCorruptionError(
-                "remote project state usage authority changed during seal"
-            )
-
-    def _reconcile_remote_payload_usage(self, connection: sqlite3.Connection) -> None:
-        expected_count, expected_bytes = self._validate_remote_payload_usage_authority(connection)
         payload_count, maximum_bytes, payload_bytes = self._remote_state_recovery_usage(connection)
         self._validate_remote_state_recovery_usage(
             payload_count=payload_count,
@@ -1994,12 +2446,233 @@ class DesktopProviderStore:
                 "remote project state usage authority differs from project rows"
             )
 
-    def _validate_write_budget(self, connection: sqlite3.Connection) -> None:
-        self._validate_remote_payload_usage_authority(connection)
+    def _remote_payload_content_token(
+        self,
+        *,
+        project_id: str,
+        payload: bytes,
+    ) -> tuple[int, int, int, int]:
+        project_bytes = project_id.encode("utf-8")
+        digest = hmac.digest(
+            self._cursor_key,
+            _REMOTE_PAYLOAD_CONTENT_AUTHORITY_DOMAIN
+            + struct.pack(">Q", len(project_bytes))
+            + project_bytes
+            + payload,
+            "sha256",
+        )
+        return cast(
+            tuple[int, int, int, int],
+            tuple(
+                int.from_bytes(
+                    digest[
+                        index * _REMOTE_CONTENT_TOKEN_BYTES : (index + 1)
+                        * _REMOTE_CONTENT_TOKEN_BYTES
+                    ],
+                    "big",
+                )
+                for index in range(4)
+            ),
+        )
+
+    @staticmethod
+    def _remote_content_accumulators(
+        connection: sqlite3.Connection,
+    ) -> tuple[int, int, int, int]:
+        accumulators = [0, 0, 0, 0]
+        for row in connection.execute(
+            """
+            SELECT remote_state_token_0, remote_state_token_1,
+                   remote_state_token_2, remote_state_token_3
+            FROM projects
+            WHERE remote_state_json IS NOT NULL
+            ORDER BY project_id
+            """
+        ):
+            for index in range(4):
+                value = row[index]
+                if type(value) is not int or not 0 <= value < _REMOTE_CONTENT_ACCUMULATOR_MODULUS:
+                    raise ProviderDataCorruptionError(
+                        "remote project state content authority is invalid"
+                    )
+                accumulators[index] = (
+                    accumulators[index] + value
+                ) % _REMOTE_CONTENT_ACCUMULATOR_MODULUS
+        return cast(tuple[int, int, int, int], tuple(accumulators))
+
+    def _provider_storage_usage_authority_tag(self, values: tuple[int, ...]) -> bytes:
+        if len(values) != 11:
+            raise ProviderDataCorruptionError("provider storage usage authority is invalid")
+        return hmac.digest(
+            self._cursor_key,
+            _PROVIDER_STORAGE_USAGE_AUTHORITY_DOMAIN + struct.pack(">11Q", *values),
+            "sha256",
+        )
+
+    def _insert_provider_storage_usage(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        total_rows: int,
+        total_bytes: int,
+        remote_payload_count: int,
+        remote_payload_bytes: int,
+        remote_accumulators: tuple[int, int, int, int],
+        profile_reservations: int,
+        project_reservations: int,
+        generation: int,
+    ) -> None:
+        values = (
+            total_rows,
+            total_bytes,
+            remote_payload_count,
+            remote_payload_bytes,
+            *remote_accumulators,
+            profile_reservations,
+            project_reservations,
+            generation,
+        )
+        inserted = connection.execute(
+            """
+            INSERT INTO provider_storage_usage(
+                singleton, total_rows, total_bytes,
+                remote_payload_count, remote_payload_bytes,
+                remote_accumulator_0, remote_accumulator_1,
+                remote_accumulator_2, remote_accumulator_3,
+                profile_reservations, project_reservations,
+                generation, authority_tag
+            ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (*values, self._provider_storage_usage_authority_tag(values)),
+        )
+        if inserted.rowcount != 1:
+            raise ProviderDataCorruptionError(
+                "provider storage usage authority was not created exactly once"
+            )
+
+    @staticmethod
+    def _provider_storage_usage_row(connection: sqlite3.Connection) -> sqlite3.Row:
+        row = connection.execute(
+            f"SELECT singleton, {', '.join(_PROVIDER_USAGE_COLUMNS)} "
+            "FROM provider_storage_usage WHERE singleton = 1"
+        ).fetchone()
+        if row is None:
+            raise ProviderDataCorruptionError("provider storage usage authority is missing")
+        return cast(sqlite3.Row, row)
+
+    @staticmethod
+    def _provider_storage_usage_scalars(
+        row: sqlite3.Row,
+    ) -> tuple[tuple[int, ...], bytes]:
+        values = tuple(row[column] for column in _PROVIDER_USAGE_COLUMNS[:-1])
+        authority_tag = row["authority_tag"]
+        if (
+            row["singleton"] != 1
+            or any(type(value) is not int for value in values)
+            or type(authority_tag) is not bytes
+            or len(authority_tag) not in {0, 32}
+        ):
+            raise ProviderDataCorruptionError("provider storage usage authority is invalid")
+        typed_values = cast(tuple[int, ...], values)
+        (
+            total_rows,
+            total_bytes,
+            remote_count,
+            remote_bytes,
+            *remaining,
+        ) = typed_values
+        accumulators = remaining[:4]
+        profile_reservations, project_reservations, generation = remaining[4:]
+        if (
+            total_rows < 1
+            or total_bytes < 0
+            or remote_count < 0
+            or remote_bytes < 0
+            or (remote_count == 0) != (remote_bytes == 0)
+            or remote_bytes < remote_count
+            or any(not 0 <= value < _REMOTE_CONTENT_ACCUMULATOR_MODULUS for value in accumulators)
+            or profile_reservations < 0
+            or project_reservations < 0
+            or not 0 <= generation < 9223372036854775807
+        ):
+            raise ProviderDataCorruptionError("provider storage usage authority is invalid")
+        return typed_values, authority_tag
+
+    def _validate_provider_storage_usage_authority(
+        self,
+        connection: sqlite3.Connection,
+    ) -> tuple[tuple[int, ...], bytes]:
+        values, authority_tag = self._provider_storage_usage_scalars(
+            self._provider_storage_usage_row(connection)
+        )
+        expected = self._provider_storage_usage_authority_tag(values)
+        if not hmac.compare_digest(authority_tag, expected):
+            raise ProviderDataCorruptionError("provider storage usage authority is invalid")
+        return values, authority_tag
+
+    def _validate_remote_payload_usage_authority(
+        self,
+        connection: sqlite3.Connection,
+    ) -> tuple[int, int]:
+        values, _ = self._validate_provider_storage_usage_authority(connection)
+        return values[2], values[3]
+
+    def _seal_provider_storage_usage(
+        self,
+        connection: sqlite3.Connection,
+    ) -> tuple[tuple[int, ...], bytes]:
+        row = self._provider_storage_usage_row(connection)
+        values, authority_tag = self._provider_storage_usage_scalars(row)
+        expected = self._provider_storage_usage_authority_tag(values)
+        if hmac.compare_digest(authority_tag, expected):
+            return values, authority_tag
+        if authority_tag:
+            raise ProviderDataCorruptionError(
+                "provider storage usage authority changed unexpectedly"
+            )
+        updated = connection.execute(
+            f"UPDATE provider_storage_usage SET authority_tag = ? "
+            f"WHERE singleton = 1 AND {' AND '.join(f'{column} = ?' for column in _PROVIDER_USAGE_COLUMNS[:-1])} "
+            "AND authority_tag = X''",
+            (expected, *values),
+        )
+        if updated.rowcount != 1:
+            raise ProviderDataCorruptionError(
+                "provider storage usage authority changed during seal"
+            )
+        return values, expected
+
+    def _reconcile_provider_storage_usage(self, connection: sqlite3.Connection) -> None:
+        expected, _ = self._validate_provider_storage_usage_authority(connection)
         total_rows, total_bytes = self._recovery_usage(connection)
+        payload_count, maximum_bytes, payload_bytes = self._remote_state_recovery_usage(connection)
+        self._validate_remote_state_recovery_usage(
+            payload_count=payload_count,
+            maximum_bytes=maximum_bytes,
+            payload_bytes=payload_bytes,
+        )
+        accumulators = self._remote_content_accumulators(connection)
         profile_reservations, project_reservations = self._validate_live_action_authorities(
             connection
         )
+        actual = (
+            total_rows,
+            total_bytes,
+            payload_count,
+            payload_bytes,
+            *accumulators,
+            profile_reservations,
+            project_reservations,
+        )
+        if actual != expected[:-1]:
+            raise ProviderDataCorruptionError(
+                "provider storage usage authority differs from provider rows"
+            )
+
+    def _validate_write_budget(self, connection: sqlite3.Connection) -> None:
+        values, _ = self._validate_provider_storage_usage_authority(connection)
+        total_rows, total_bytes = values[:2]
+        profile_reservations, project_reservations = values[8:10]
         reserved_bytes = (
             profile_reservations * PROFILE_RUNTIME_TERMINAL_RESERVATION_BYTES
             + project_reservations * PROJECT_RUNTIME_TERMINAL_RESERVATION_BYTES
@@ -2007,6 +2680,8 @@ class DesktopProviderStore:
         if (
             total_rows > MAX_RECOVERY_ROWS
             or total_bytes > MAX_RECOVERY_BYTES
+            or values[2] > MAX_RECOVERY_ROWS
+            or values[3] > MAX_REMOTE_PROJECT_STATE_RECOVERY_BYTES
             or reserved_bytes > MAX_RECOVERY_BYTES - total_bytes
         ):
             raise ProviderDataCorruptionError("provider recovery budget exceeded")
@@ -2263,13 +2938,21 @@ class DesktopProviderStore:
             connection = self._connection
             try:
                 connection.execute("BEGIN IMMEDIATE" if write else "BEGIN")
-                self._validate_remote_payload_usage_authority(connection)
+                self._validate_schema(connection)
+                initial_snapshot = self._validate_provider_storage_usage_authority(connection)
+                if initial_snapshot != self._provider_usage_snapshot:
+                    raise ProviderDataCorruptionError(
+                        "provider storage usage authority was replayed during this process"
+                    )
                 yield connection
+                final_snapshot = initial_snapshot
                 if write:
-                    self._seal_remote_payload_usage(connection)
+                    final_snapshot = self._seal_provider_storage_usage(connection)
                     self._validate_write_budget(connection)
+                    self._validate_schema(connection)
                     self._verify_storage_files()
                 connection.commit()
+                self._provider_usage_snapshot = final_snapshot
             except BaseException:
                 connection.rollback()
                 raise
@@ -2540,6 +3223,8 @@ class DesktopProviderStore:
                         ELSE state
                     END,
                     current_revision_id = NULL, remote_state_json = NULL,
+                    remote_state_token_0 = NULL, remote_state_token_1 = NULL,
+                    remote_state_token_2 = NULL, remote_state_token_3 = NULL,
                     resource_version = ?, updated_at = ?
                 WHERE project_id = ?
                 """,
@@ -2694,6 +3379,7 @@ class DesktopProviderStore:
                 response_bytes=response_bytes,
                 now_epoch=now_epoch,
             )
+            transaction._validate_created_operations_bound()
             return ProfileRuntimeActionReservation(operation, profile, False)
 
     def complete_profile_runtime_action(
@@ -3022,6 +3708,7 @@ class DesktopProviderStore:
                 response_bytes=response_bytes,
                 now_epoch=now_epoch,
             )
+            transaction._validate_created_operations_bound()
             return ProjectRuntimeActionReservation(operation, project, False)
 
     def start_project_runtime_action(
@@ -3457,9 +4144,8 @@ class DesktopProviderStore:
             if count >= self._max_idempotency_records:
                 raise IdempotencyCapacityError("live idempotency record capacity is exhausted")
 
-            status_code, response = mutation(
-                ProviderMutation(self, connection, if_match=bound_if_match)
-            )
+            transaction = ProviderMutation(self, connection, if_match=bound_if_match)
+            status_code, response = mutation(transaction)
             if type(status_code) is not int or not 100 <= status_code <= 599:
                 raise ProviderStoreError("idempotent mutation returned an invalid status code")
             if (
@@ -3505,6 +4191,7 @@ class DesktopProviderStore:
                 response_bytes=response_bytes,
                 now_epoch=now_epoch,
             )
+            transaction._validate_created_operations_bound()
             return IdempotencyResult(status_code, response_bytes, False)
 
     @staticmethod
@@ -3921,19 +4608,20 @@ class DesktopProviderStore:
             f"length(CAST(remote_state_json AS BLOB)) <= {MAX_REMOTE_PROJECT_STATE_BYTES} "
             "THEN remote_state_json ELSE NULL END AS remote_state_json, "
             "length(CAST(remote_state_json AS BLOB)) AS remote_state_bytes, "
+            "remote_state_token_0, remote_state_token_1, "
+            "remote_state_token_2, remote_state_token_3, "
             "resource_version, created_at, updated_at"
         )
 
-    @classmethod
-    def _require_project_row(cls, connection: sqlite3.Connection, project_id: str) -> sqlite3.Row:
+    def _require_project_row(self, connection: sqlite3.Connection, project_id: str) -> sqlite3.Row:
         row = connection.execute(
-            f"SELECT {cls._project_select_columns()} FROM projects WHERE project_id = ?",
+            f"SELECT {self._project_select_columns()} FROM projects WHERE project_id = ?",
             (project_id,),
         ).fetchone()
         if row is None:
             raise ResourceNotFoundError("project", project_id)
         guarded = cast(sqlite3.Row, row)
-        cls._validate_remote_state_cell(guarded)
+        self._validate_remote_state_cell(guarded)
         return guarded
 
     @staticmethod
@@ -3958,9 +4646,8 @@ class DesktopProviderStore:
         if row is not None:
             raise ResourceInUseError("project", project_id)
 
-    @classmethod
     def _require_project_operation_reservation_available(
-        cls,
+        self,
         connection: sqlite3.Connection,
         project_id: str,
         *,
@@ -3972,7 +4659,7 @@ class DesktopProviderStore:
         if operation_kind not in _PROJECT_OPERATION_KINDS:
             raise ContractValidationError("project runtime operation kind is invalid")
         if excluded_operation_id is not None:
-            excluded = cls._require_operation_row(connection, excluded_operation_id)
+            excluded = self._require_operation_row(connection, excluded_operation_id)
             if (
                 excluded["operation_kind"] != operation_kind
                 or excluded["resource_type"] != "project"
@@ -3982,12 +4669,12 @@ class DesktopProviderStore:
                 raise ContractValidationError(
                     "project reservation exclusion differs from its operation authority"
                 )
-        cls._require_project_not_busy(
+        self._require_project_not_busy(
             connection,
             project_id,
             excluded_operation_id=excluded_operation_id,
         )
-        project = cls._require_project_row(connection, project_id)
+        project = self._require_project_row(connection, project_id)
         if operation_kind == "project_activate":
             competing_activation = connection.execute(
                 """
@@ -4016,7 +4703,7 @@ class DesktopProviderStore:
             ).fetchone()
             if active is not None:
                 active_project_id = cast(str, active["project_id"])
-                cls._require_project_not_busy(
+                self._require_project_not_busy(
                     connection,
                     active_project_id,
                     excluded_operation_id=excluded_operation_id,
@@ -4024,7 +4711,7 @@ class DesktopProviderStore:
             return
 
         if project["state"] == "active":
-            cls._require_active_project_activation_authority_available(
+            self._require_active_project_activation_authority_available(
                 connection,
                 project_id,
                 excluded_operation_id=excluded_operation_id,
@@ -4142,14 +4829,14 @@ class DesktopProviderStore:
         }
         return _validate_json_model(ProjectV1, payload)
 
-    @staticmethod
-    def _validate_remote_state_cell(row: sqlite3.Row) -> None:
+    def _validate_remote_state_cell(self, row: sqlite3.Row) -> None:
         remote_state_bytes = row["remote_state_bytes"]
         remote_state_raw = row["remote_state_json"]
+        token = tuple(row[f"remote_state_token_{index}"] for index in range(4))
         if remote_state_bytes is None:
-            if remote_state_raw is not None:
+            if remote_state_raw is not None or token != (None, None, None, None):
                 raise ProviderDataCorruptionError(
-                    "stored remote project state has an invalid byte length"
+                    "stored remote project state has an invalid null identity"
                 )
             return
         if (
@@ -4161,6 +4848,14 @@ class DesktopProviderStore:
         if type(remote_state_raw) is not bytes or len(remote_state_raw) != remote_state_bytes:
             raise ProviderDataCorruptionError(
                 "stored remote project state changed during guarded read"
+            )
+        expected_token = self._remote_payload_content_token(
+            project_id=cast(str, row["project_id"]),
+            payload=remote_state_raw,
+        )
+        if token != expected_token:
+            raise ProviderDataCorruptionError(
+                "stored remote project state content authority is invalid"
             )
 
     def _operation_from_row(self, row: sqlite3.Row) -> LocalOperationV1:

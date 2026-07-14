@@ -3,10 +3,12 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 import errno
+import hmac
 import os
 from pathlib import Path
 import sqlite3
 import stat
+import struct
 import subprocess
 import sys
 import threading
@@ -169,6 +171,52 @@ def _activate_project(
     return operation, remote
 
 
+def _reseal_provider_usage(
+    connection: sqlite3.Connection,
+    root: Path,
+) -> tuple[tuple[int, ...], bytes]:
+    values = tuple(
+        cast(
+            tuple[int, ...],
+            connection.execute(
+                "SELECT total_rows, total_bytes, remote_payload_count, "
+                "remote_payload_bytes, remote_accumulator_0, remote_accumulator_1, "
+                "remote_accumulator_2, remote_accumulator_3, profile_reservations, "
+                "project_reservations, generation FROM provider_storage_usage"
+            ).fetchone(),
+        )
+    )
+    tag = hmac.digest(
+        (root / "cursor-signing.key").read_bytes(),
+        provider_store_module._PROVIDER_STORAGE_USAGE_AUTHORITY_DOMAIN
+        + struct.pack(">11Q", *values),
+        "sha256",
+    )
+    updated = connection.execute(
+        "UPDATE provider_storage_usage SET authority_tag = ? WHERE singleton = 1",
+        (tag,),
+    )
+    assert updated.rowcount == 1
+    return values, tag
+
+
+def _provider_usage_row(connection: sqlite3.Connection) -> tuple[object, ...]:
+    return tuple(connection.execute("SELECT * FROM provider_storage_usage").fetchone())
+
+
+def _replay_provider_usage(
+    connection: sqlite3.Connection,
+    row: tuple[object, ...],
+) -> None:
+    columns = provider_store_module._PROVIDER_USAGE_COLUMNS
+    updated = connection.execute(
+        f"UPDATE provider_storage_usage SET "
+        f"{', '.join(f'{column} = ?' for column in columns)} WHERE singleton = 1",
+        row[1:],
+    )
+    assert updated.rowcount == 1
+
+
 def test_initializes_versioned_private_sqlite_store(tmp_path: Path) -> None:
     root = tmp_path / "state"
     store = DesktopProviderStore(root)
@@ -183,7 +231,7 @@ def test_initializes_versioned_private_sqlite_store(tmp_path: Path) -> None:
     }
     assert all(path.stat().st_mode & 0o777 == 0o600 for path in managed_files)
 
-    assert tuple(store._connection.execute("PRAGMA user_version").fetchone()) == (4,)
+    assert tuple(store._connection.execute("PRAGMA user_version").fetchone()) == (5,)
     assert tuple(store._connection.execute("PRAGMA journal_mode").fetchone()) == ("delete",)
     assert tuple(store._connection.execute("PRAGMA max_page_count").fetchone()) == (
         store._max_page_count,
@@ -196,12 +244,13 @@ def test_initializes_versioned_private_sqlite_store(tmp_path: Path) -> None:
         for row in store._connection.execute(
             "SELECT version FROM schema_migrations ORDER BY version"
         ).fetchall()
-    ] == [(1,), (2,), (3,), (4,)]
+    ] == [(1,), (2,), (3,), (4,), (5,)]
     assert tuple(
         store._connection.execute(
-            "SELECT payload_count, payload_bytes, length(authority_tag) FROM remote_payload_usage"
+            "SELECT total_rows, remote_payload_count, remote_payload_bytes, "
+            "length(authority_tag) FROM provider_storage_usage"
         ).fetchone()
-    ) == (0, 0, 32)
+    ) == (8, 0, 0, 32)
     assert not (root / "provider.sqlite3-wal").exists()
     assert not (root / "provider.sqlite3-shm").exists()
 
@@ -503,7 +552,7 @@ def test_rejects_unknown_schema_version(tmp_path: Path) -> None:
         DesktopProviderStore(root)
 
 
-def test_migrates_a_canonical_v1_store_to_v4(tmp_path: Path) -> None:
+def test_migrates_a_canonical_v1_store_to_v5(tmp_path: Path) -> None:
     root = tmp_path / "state"
     root.mkdir(mode=0o700)
     os.chmod(root, 0o700)
@@ -523,18 +572,18 @@ def test_migrates_a_canonical_v1_store_to_v4(tmp_path: Path) -> None:
 
     store = DesktopProviderStore(root)
 
-    assert tuple(store._connection.execute("PRAGMA user_version").fetchone()) == (4,)
+    assert tuple(store._connection.execute("PRAGMA user_version").fetchone()) == (5,)
     assert [
         tuple(row)
         for row in store._connection.execute(
             "SELECT version FROM schema_migrations ORDER BY version"
         ).fetchall()
-    ] == [(1,), (2,), (3,), (4,)]
+    ] == [(1,), (2,), (3,), (4,), (5,)]
     profile = _create_profile(store, key="post-migration-create")
     assert store.get_profile(profile.profile_id) == profile
 
 
-def test_migrates_a_canonical_v2_store_to_v4(tmp_path: Path) -> None:
+def test_migrates_a_canonical_v2_store_to_v5(tmp_path: Path) -> None:
     root = tmp_path / "state"
     root.mkdir(mode=0o700)
     os.chmod(root, 0o700)
@@ -590,13 +639,13 @@ def test_migrates_a_canonical_v2_store_to_v4(tmp_path: Path) -> None:
 
     store = DesktopProviderStore(root)
 
-    assert tuple(store._connection.execute("PRAGMA user_version").fetchone()) == (4,)
+    assert tuple(store._connection.execute("PRAGMA user_version").fetchone()) == (5,)
     assert [
         tuple(row)
         for row in store._connection.execute(
             "SELECT version FROM schema_migrations ORDER BY version"
         ).fetchall()
-    ] == [(1,), (2,), (3,), (4,)]
+    ] == [(1,), (2,), (3,), (4,), (5,)]
     assert [row[1] for row in store._connection.execute("PRAGMA table_info(projects)")] == [
         "project_id",
         "profile_id",
@@ -605,6 +654,10 @@ def test_migrates_a_canonical_v2_store_to_v4(tmp_path: Path) -> None:
         "state",
         "current_revision_id",
         "remote_state_json",
+        "remote_state_token_0",
+        "remote_state_token_1",
+        "remote_state_token_2",
+        "remote_state_token_3",
         "resource_version",
         "created_at",
         "updated_at",
@@ -635,7 +688,7 @@ def test_migrates_a_canonical_v2_store_to_v4(tmp_path: Path) -> None:
         )
 
 
-def test_migrates_v3_remote_payload_usage_as_one_reconciled_authority(
+def test_migrates_v3_remote_payload_usage_into_provider_authority(
     tmp_path: Path,
 ) -> None:
     root = tmp_path / "state"
@@ -685,10 +738,11 @@ def test_migrates_v3_remote_payload_usage_as_one_reconciled_authority(
 
     store = DesktopProviderStore(root)
 
-    assert tuple(store._connection.execute("PRAGMA user_version").fetchone()) == (4,)
+    assert tuple(store._connection.execute("PRAGMA user_version").fetchone()) == (5,)
     assert tuple(
         store._connection.execute(
-            "SELECT payload_count, payload_bytes, length(authority_tag) FROM remote_payload_usage"
+            "SELECT remote_payload_count, remote_payload_bytes, length(authority_tag) "
+            "FROM provider_storage_usage"
         ).fetchone()
     ) == (1, len(remote_bytes), 32)
     migrated = store.get_project("project-v3")
@@ -736,6 +790,59 @@ def test_v3_to_v4_usage_migration_is_one_crash_transaction(
         assert connection.execute(
             "SELECT version FROM schema_migrations ORDER BY version"
         ).fetchall() == [(1,), (2,), (3,)]
+
+
+def test_v4_to_v5_provider_authority_migration_is_one_crash_transaction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "state"
+    root.mkdir(mode=0o700)
+    os.chmod(root, 0o700)
+    (root / "provider.lock").touch(mode=0o600)
+    key = b"k" * 32
+    (root / "cursor-signing.key").write_bytes(key)
+    os.chmod(root / "cursor-signing.key", 0o600)
+    timestamp = "2026-07-14T12:00:00.000000Z"
+    authority_tag = hmac.digest(
+        key,
+        provider_store_module._REMOTE_PAYLOAD_USAGE_AUTHORITY_DOMAIN + struct.pack(">QQ", 0, 0),
+        "sha256",
+    )
+    with sqlite3.connect(root / "provider.sqlite3") as connection:
+        for statement in provider_store_module._SCHEMA_V4:
+            connection.execute(statement)
+        connection.executemany(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+            ((version, timestamp) for version in range(1, 5)),
+        )
+        connection.execute(
+            "INSERT INTO remote_payload_usage VALUES (1, 0, 0, ?)",
+            (authority_tag,),
+        )
+        connection.execute("PRAGMA user_version = 4")
+    os.chmod(root / "provider.sqlite3", 0o600)
+    original = DesktopProviderStore._migrate_v4_to_v5
+
+    def crash_after_migration(self: DesktopProviderStore, connection: sqlite3.Connection) -> None:
+        original(self, connection)
+        raise RuntimeError("injected v5 authority migration crash")
+
+    monkeypatch.setattr(DesktopProviderStore, "_migrate_v4_to_v5", crash_after_migration)
+    with pytest.raises(RuntimeError, match="v5 authority migration crash"):
+        DesktopProviderStore(root)
+
+    with sqlite3.connect(root / "provider.sqlite3") as connection:
+        assert connection.execute("PRAGMA user_version").fetchone() == (4,)
+        assert connection.execute(
+            "SELECT payload_count, payload_bytes FROM remote_payload_usage"
+        ).fetchone() == (0, 0)
+        assert (
+            connection.execute(
+                "SELECT name FROM sqlite_schema WHERE name = 'provider_storage_usage'"
+            ).fetchone()
+            is None
+        )
 
 
 def test_v3_usage_migration_applies_recovery_budget_before_payload_scan(
@@ -956,6 +1063,7 @@ def test_startup_rejects_foreign_key_corruption(tmp_path: Path) -> None:
     with sqlite3.connect(root / "provider.sqlite3") as connection:
         connection.execute("PRAGMA foreign_keys = OFF")
         connection.execute("UPDATE projects SET profile_id = 'missing-profile'")
+        _reseal_provider_usage(connection, root)
 
     with pytest.raises(ProviderDataCorruptionError, match="foreign key"):
         DesktopProviderStore(root)
@@ -971,6 +1079,7 @@ def test_startup_revalidates_typed_idempotency_response(tmp_path: Path) -> None:
             "UPDATE idempotency_records SET response_bytes = ?",
             (b'{"schema_version":"1"}',),
         )
+        _reseal_provider_usage(connection, root)
 
     with pytest.raises(ProviderDataCorruptionError, match="idempotent"):
         DesktopProviderStore(root)
@@ -1100,7 +1209,6 @@ def test_remote_project_projection_recovery_fails_closed(tmp_path: Path, corrupt
         project,
         key=f"remote-corrupt-{corruption}-activate",
     )
-    store.close()
     if corruption == "noncanonical":
         remote_bytes = (
             provider_store_module._canonical_json_bytes(remote.model_dump(mode="json")) + b" "
@@ -1114,11 +1222,23 @@ def test_remote_project_projection_recovery_fails_closed(tmp_path: Path, corrupt
         else:
             cast(dict[str, object], remote_value["active_revision"])["id"] = "different-revision"
         remote_bytes = provider_store_module._canonical_json_bytes(remote_value)
+    remote_token = store._remote_payload_content_token(
+        project_id=project.project_id,
+        payload=remote_bytes,
+    )
+    store.close()
     with sqlite3.connect(root / "provider.sqlite3") as connection:
         connection.execute(
-            "UPDATE projects SET remote_state_json = ? WHERE project_id = ?",
-            (remote_bytes, project.project_id),
+            """
+            UPDATE projects
+            SET remote_state_json = ?,
+                remote_state_token_0 = ?, remote_state_token_1 = ?,
+                remote_state_token_2 = ?, remote_state_token_3 = ?
+            WHERE project_id = ?
+            """,
+            (remote_bytes, *remote_token, project.project_id),
         )
+        _reseal_provider_usage(connection, root)
 
     with pytest.raises(ProviderDataCorruptionError, match="remote project"):
         DesktopProviderStore(root)
@@ -1219,7 +1339,9 @@ def test_remote_payload_usage_tamper_fails_before_project_payload_fetch(
     _, remote = _activate_project(store, project, key=f"usage-tamper-{corruption}-activate")
     with sqlite3.connect(root / "provider.sqlite3") as connection:
         if corruption == "counter":
-            connection.execute("UPDATE remote_payload_usage SET payload_bytes = payload_bytes + 1")
+            connection.execute(
+                "UPDATE provider_storage_usage SET remote_payload_bytes = remote_payload_bytes + 1"
+            )
         else:
             changed = remote.model_copy(update={"observed_at": "2026-07-14T12:00:01Z"})
             connection.execute(
@@ -1238,7 +1360,7 @@ def test_remote_payload_usage_tamper_fails_before_project_payload_fetch(
         return original_decode(raw, label=label)
 
     monkeypatch.setattr(provider_store_module, "_decode_json_object", decode_probe)
-    with pytest.raises(ProviderDataCorruptionError, match="usage authority"):
+    with pytest.raises(ProviderDataCorruptionError, match="storage usage authority"):
         store.get_profile(profile.profile_id)
 
 
@@ -1252,25 +1374,172 @@ def test_startup_reconciles_sealed_usage_authority_against_project_rows(
         _project(profile.profile_id), idempotency_key="usage-reconcile-create"
     )
     _activate_project(store, project, key="usage-reconcile-activate")
-    count, byte_count = store._validate_remote_payload_usage_authority(store._connection)
-    forged_bytes = byte_count + 1
-    forged_authority = store._remote_payload_usage_authority_tag(
-        payload_count=count,
-        payload_bytes=forged_bytes,
+    authority = tuple(
+        store._connection.execute(
+            "SELECT total_rows, total_bytes, remote_payload_count, remote_payload_bytes, "
+            "remote_accumulator_0, remote_accumulator_1, remote_accumulator_2, "
+            "remote_accumulator_3, profile_reservations, project_reservations, generation "
+            "FROM provider_storage_usage"
+        ).fetchone()
     )
+    forged = (*authority[:3], authority[3] + 1, *authority[4:])
+    forged_authority = store._provider_storage_usage_authority_tag(forged)
     store.close()
     with sqlite3.connect(root / "provider.sqlite3") as connection:
         connection.execute(
             """
-            UPDATE remote_payload_usage
-            SET payload_bytes = ?, authority_tag = ?
+            UPDATE provider_storage_usage
+            SET remote_payload_bytes = ?, authority_tag = ?
             WHERE singleton = 1
             """,
-            (forged_bytes, forged_authority),
+            (forged[3], forged_authority),
         )
 
-    with pytest.raises(ProviderDataCorruptionError, match="differs from project rows"):
+    with pytest.raises(ProviderDataCorruptionError, match="differs from provider rows"):
         DesktopProviderStore(root)
+
+
+def test_provider_usage_singleton_rejects_delete_and_replace_with_recursive_triggers_off(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "state"
+    store = DesktopProviderStore(root)
+    row = _provider_usage_row(store._connection)
+
+    with sqlite3.connect(root / "provider.sqlite3") as connection:
+        connection.execute("PRAGMA recursive_triggers = OFF")
+        with pytest.raises(sqlite3.IntegrityError, match="cannot be deleted"):
+            connection.execute("DELETE FROM provider_storage_usage WHERE singleton = 1")
+        with pytest.raises(sqlite3.IntegrityError, match="cannot be inserted"):
+            connection.execute(
+                f"INSERT OR REPLACE INTO provider_storage_usage "
+                f"(singleton, {', '.join(provider_store_module._PROVIDER_USAGE_COLUMNS)}) "
+                f"VALUES ({', '.join('?' for _ in row)})",
+                row,
+            )
+
+    assert _provider_usage_row(store._connection) == row
+    store.get_profile(_create_profile(store, key="singleton-guard-profile").profile_id)
+
+
+@pytest.mark.parametrize("probe", ["online", "restart"])
+def test_signed_provider_usage_replay_is_rejected(
+    tmp_path: Path,
+    probe: str,
+) -> None:
+    root = tmp_path / "state"
+    store = DesktopProviderStore(root)
+    profile = _create_profile(store)
+    project = store.create_project(
+        _project(profile.profile_id), idempotency_key=f"authority-replay-{probe}-create"
+    )
+    _, remote = _activate_project(store, project, key=f"authority-replay-{probe}-activate")
+    stale_authority = _provider_usage_row(store._connection)
+    changed = remote.model_copy(update={"observed_at": "2026-07-14T12:00:01Z"})
+    changed_bytes = provider_store_module._canonical_json_bytes(changed.model_dump(mode="json"))
+    old_bytes = provider_store_module._canonical_json_bytes(remote.model_dump(mode="json"))
+    assert len(changed_bytes) == len(old_bytes)
+    token = store._remote_payload_content_token(
+        project_id=project.project_id,
+        payload=changed_bytes,
+    )
+    with store._transaction(write=True) as connection:
+        connection.execute(
+            """
+            UPDATE projects
+            SET remote_state_json = ?,
+                remote_state_token_0 = ?, remote_state_token_1 = ?,
+                remote_state_token_2 = ?, remote_state_token_3 = ?
+            WHERE project_id = ?
+            """,
+            (changed_bytes, *token, project.project_id),
+        )
+    assert store.get_project(project.project_id).remote == changed
+
+    with sqlite3.connect(root / "provider.sqlite3") as connection:
+        _replay_provider_usage(connection, stale_authority)
+
+    if probe == "online":
+        with pytest.raises(ProviderDataCorruptionError, match="replayed during this process"):
+            store.get_profile(profile.profile_id)
+    else:
+        store.close()
+        with pytest.raises(ProviderDataCorruptionError, match="differs from provider rows"):
+            DesktopProviderStore(root)
+
+
+@pytest.mark.parametrize("probe", ["online", "restart"])
+def test_equal_length_remote_payload_rewrite_cannot_reuse_signed_aggregate(
+    tmp_path: Path,
+    probe: str,
+) -> None:
+    root = tmp_path / "state"
+    store = DesktopProviderStore(root)
+    profile = _create_profile(store)
+    project = store.create_project(
+        _project(profile.profile_id), idempotency_key=f"content-rewrite-{probe}-create"
+    )
+    _, remote = _activate_project(store, project, key=f"content-rewrite-{probe}-activate")
+    signed_authority = _provider_usage_row(store._connection)
+    changed = remote.model_copy(update={"observed_at": "2026-07-14T12:00:01Z"})
+    original_bytes = provider_store_module._canonical_json_bytes(remote.model_dump(mode="json"))
+    changed_bytes = provider_store_module._canonical_json_bytes(changed.model_dump(mode="json"))
+    assert changed_bytes != original_bytes
+    assert len(changed_bytes) == len(original_bytes)
+
+    with sqlite3.connect(root / "provider.sqlite3") as connection:
+        connection.execute(
+            "UPDATE projects SET remote_state_json = ? WHERE project_id = ?",
+            (changed_bytes, project.project_id),
+        )
+        _replay_provider_usage(connection, signed_authority)
+
+    if probe == "restart":
+        store.close()
+        with pytest.raises(
+            ProviderDataCorruptionError,
+            match="remote project state content authority",
+        ):
+            DesktopProviderStore(root)
+    else:
+        with pytest.raises(
+            ProviderDataCorruptionError,
+            match="remote project state content authority",
+        ):
+            store.get_project(project.project_id)
+
+
+@pytest.mark.parametrize("mutation", ["removed", "corrupt"])
+@pytest.mark.parametrize("probe", ["online", "restart"])
+def test_provider_usage_trigger_tamper_fails_closed(
+    tmp_path: Path,
+    mutation: str,
+    probe: str,
+) -> None:
+    root = tmp_path / "state"
+    store = DesktopProviderStore(root)
+    profile = _create_profile(store)
+    trigger_sql = provider_store_module._provider_usage_trigger_v5(
+        "projects",
+        next(
+            columns
+            for table, columns in provider_store_module._RECOVERY_USAGE_SPECIFICATIONS
+            if table == "projects"
+        ),
+        "UPDATE",
+    )
+    with sqlite3.connect(root / "provider.sqlite3") as connection:
+        connection.execute("DROP TRIGGER provider_usage_projects_update")
+        if mutation == "corrupt":
+            connection.execute(trigger_sql.replace("generation + 1", "generation + 2"))
+
+    if probe == "restart":
+        store.close()
+        with pytest.raises(ProviderSchemaError, match="fingerprint"):
+            DesktopProviderStore(root)
+    else:
+        with pytest.raises(ProviderSchemaError, match="fingerprint"):
+            store.get_profile(profile.profile_id)
 
 
 def test_profile_point_read_does_not_scan_one_hundred_thousand_projects(
@@ -1284,6 +1553,11 @@ def test_profile_point_read_does_not_scan_one_hundred_thousand_projects(
         ).model_dump(mode="json")
     )
     timestamp = "2026-07-14T12:00:00.000000Z"
+    current_rows = cast(
+        int,
+        store._connection.execute("SELECT total_rows FROM provider_storage_usage").fetchone()[0],
+    )
+    project_count = provider_store_module.MAX_RECOVERY_ROWS - current_rows
     store._connection.execute("BEGIN IMMEDIATE")
     try:
         store._connection.executemany(
@@ -1302,10 +1576,12 @@ def test_profile_point_read_does_not_scan_one_hundred_thousand_projects(
                     timestamp,
                     timestamp,
                 )
-                for index in range(provider_store_module.MAX_RECOVERY_ROWS)
+                for index in range(project_count)
             ),
         )
+        sealed = store._seal_provider_storage_usage(store._connection)
         store._connection.commit()
+        store._provider_usage_snapshot = sealed
     except BaseException:
         store._connection.rollback()
         raise
@@ -1319,14 +1595,34 @@ def test_profile_point_read_does_not_scan_one_hundred_thousand_projects(
     )
     assert any("SEARCH remote_profiles" in step for step in plan)
     assert not any("SCAN remote_profiles" in step for step in plan)
+    authority_plan = tuple(
+        str(row[3])
+        for row in store._connection.execute(
+            "EXPLAIN QUERY PLAN SELECT * FROM provider_storage_usage WHERE singleton = 1"
+        )
+    )
+    assert any(
+        "SEARCH provider_storage_usage USING PRIMARY KEY" in step for step in authority_plan
+    )
+    assert not any("SCAN provider_storage_usage" in step for step in authority_plan)
     statements: list[str] = []
     store._connection.set_trace_callback(
         lambda statement: statements.append(" ".join(statement.lower().split()))
     )
 
-    assert store.get_profile(profile.profile_id) == profile
+    patched = store.patch_profile(
+        profile.profile_id,
+        {"name": "Research serveX"},
+        if_match=profile.etag,
+    )
+    assert patched.name == "Research serveX"
     assert not any(" from projects" in statement for statement in statements)
-    assert sum("from remote_payload_usage" in statement for statement in statements) == 1
+    assert sum("from provider_storage_usage" in statement for statement in statements) == 3
+    for table, _ in provider_store_module._RECOVERY_USAGE_SPECIFICATIONS:
+        assert not any(
+            ("count(" in statement or "sum(" in statement) and f" from {table}" in statement
+            for statement in statements
+        )
 
 
 def test_project_pagination_never_runs_remote_payload_aggregate_scans(
@@ -1360,6 +1656,49 @@ def test_project_pagination_never_runs_remote_payload_aggregate_scans(
         or "max(length(cast(remote_state_json as blob)))" in statement
         for statement in statements
     )
+
+
+def test_provider_usage_authority_tracks_crud_replay_and_operation_lifecycle(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "state"
+    store = DesktopProviderStore(root)
+
+    def assert_reconciled() -> None:
+        store._reconcile_provider_storage_usage(store._connection)
+
+    profile = _create_profile(store, key="usage-lifecycle-profile")
+    assert_reconciled()
+    replayed = store.create_profile(_profile(), idempotency_key="usage-lifecycle-profile")
+    assert replayed == profile
+    assert_reconciled()
+    project = store.create_project(
+        _project(profile.profile_id), idempotency_key="usage-lifecycle-project"
+    )
+    assert_reconciled()
+    patched = store.patch_project(project.project_id, {"name": "Changed"}, if_match=project.etag)
+    assert_reconciled()
+    action = {
+        "route": f"/desktop/v1/projects/{patched.project_id}/workspace-sync",
+        "operation_kind": "workspace_sync",
+        "project_id": patched.project_id,
+        "key": "usage-lifecycle-operation",
+        "body": {},
+        "if_match": patched.etag,
+    }
+    reservation = store.begin_project_runtime_action(**action)
+    assert_reconciled()
+    store.start_project_runtime_action(reservation=reservation, **action)
+    assert_reconciled()
+    store.complete_project_runtime_action(reservation=reservation, remote_state=None, **action)
+    assert_reconciled()
+    store.delete_project(patched.project_id, if_match=patched.etag)
+    assert_reconciled()
+    store.delete_profile(profile.profile_id, if_match=profile.etag)
+    assert_reconciled()
+    store.close()
+    reopened = DesktopProviderStore(root)
+    reopened._reconcile_provider_storage_usage(reopened._connection)
 
 
 def test_active_project_intent_patch_invalidates_remote_and_allows_reactivation(
@@ -2561,11 +2900,6 @@ def test_project_activation_remote_publication_rolls_back_as_one_transaction(
         store, first, key="remote-atomic-first-activate", revision_id="first-revision"
     )
     first_active = store.get_project(first.project_id)
-    usage_before = tuple(
-        store._connection.execute(
-            "SELECT payload_count, payload_bytes, authority_tag FROM remote_payload_usage"
-        ).fetchone()
-    )
     action = {
         "route": f"/desktop/v1/projects/{second.project_id}/activate",
         "operation_kind": "project_activate",
@@ -2576,6 +2910,9 @@ def test_project_activation_remote_publication_rolls_back_as_one_transaction(
     }
     reservation = store.begin_project_runtime_action(**action)
     running = store.start_project_runtime_action(reservation=reservation, **action)
+    usage_before = tuple(
+        store._connection.execute("SELECT * FROM provider_storage_usage").fetchone()
+    )
 
     def fail_terminal_write(*_args: object, **_kwargs: object) -> LocalOperationV1:
         raise RuntimeError("injected terminal write fault")
@@ -2593,11 +2930,7 @@ def test_project_activation_remote_publication_rolls_back_as_one_transaction(
     assert store.get_project(second.project_id) == second
     assert store.get_local_operation(running.operation_id) == running
     assert (
-        tuple(
-            store._connection.execute(
-                "SELECT payload_count, payload_bytes, authority_tag FROM remote_payload_usage"
-            ).fetchone()
-        )
+        tuple(store._connection.execute("SELECT * FROM provider_storage_usage").fetchone())
         == usage_before
     )
 
@@ -3155,7 +3488,9 @@ def test_project_action_replay_rejects_cross_project_operation_substitution(
         "UPDATE idempotency_records SET response_bytes = ? WHERE idempotency_key = ?",
         (second_bytes, first_action["key"]),
     )
+    snapshot = _reseal_provider_usage(store._connection, store.state_root)
     store._connection.commit()
+    store._provider_usage_snapshot = snapshot
 
     with pytest.raises(ProviderDataCorruptionError, match="operation"):
         store.begin_project_runtime_action(**first_action)
@@ -3202,6 +3537,7 @@ def test_project_action_rejects_same_scope_operation_substitution(
                 "UPDATE idempotency_records SET response_bytes = ? WHERE idempotency_key = ?",
                 (second_bytes, first_action["key"]),
             )
+            _reseal_provider_usage(connection, root)
         with pytest.raises(ProviderDataCorruptionError, match="operation"):
             DesktopProviderStore(root)
     else:
@@ -3209,7 +3545,9 @@ def test_project_action_rejects_same_scope_operation_substitution(
             "UPDATE idempotency_records SET response_bytes = ? WHERE idempotency_key = ?",
             (second_bytes, first_action["key"]),
         )
+        snapshot = _reseal_provider_usage(store._connection, store.state_root)
         store._connection.commit()
+        store._provider_usage_snapshot = snapshot
         with pytest.raises(ProviderDataCorruptionError, match="operation"):
             store.begin_project_runtime_action(**first_action)
 
@@ -3253,6 +3591,7 @@ def test_startup_rejects_cross_project_operation_replay_substitution(tmp_path: P
             "UPDATE idempotency_records SET response_bytes = ? WHERE idempotency_key = ?",
             (second_bytes, first_action["key"]),
         )
+        _reseal_provider_usage(connection, root)
 
     with pytest.raises(ProviderDataCorruptionError, match="operation"):
         DesktopProviderStore(root)
@@ -3301,6 +3640,7 @@ def test_startup_rejects_rebinding_operation_id_to_another_action_authority(
             """,
             (second.operation.operation_id, second_bytes, first_action["key"]),
         )
+        _reseal_provider_usage(connection, root)
 
     with pytest.raises(ProviderDataCorruptionError, match="action authority"):
         DesktopProviderStore(root)
@@ -3392,6 +3732,7 @@ def test_startup_rejects_unbound_nonterminal_operation_before_cancellation(
                 """,
                 (reservation.operation.operation_id,),
             )
+        _reseal_provider_usage(connection, root)
 
     with pytest.raises(ProviderDataCorruptionError, match="action authority"):
         DesktopProviderStore(root)

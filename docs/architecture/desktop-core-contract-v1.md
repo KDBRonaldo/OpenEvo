@@ -153,29 +153,55 @@ same OS user: such a process can race pathname checks or modify owner-readable
 state. Desktop relies on the macOS user-account boundary and the owner-only
 state directory for that threat boundary.
 
-Schema v3 has an exact canonical `sqlite_schema` fingerprint. Fresh stores are
-created directly in canonical v3; canonical v1 stores pass exact v1 validation
-before transactional v1 -> v2 -> v3 migration, and canonical v2 stores pass
-exact v2 schema and ledger validation before v2 -> v3 migration. Every DDL,
-ledger, project-copy, and `user_version` change is in the same crash transaction.
-Forged ledgers, near-match historical schemas, and partial migrations fail
-closed. Startup performs a database-size-bounded
-`integrity_check(1)`, `foreign_key_check`, bounded row and byte accounting, and
+Schema v5 has an exact canonical `sqlite_schema` fingerprint and retains exact
+v1-v4 historical fingerprints. Each historical layout and migration ledger is
+validated before the next transactional migration; DDL, ledger, project-copy,
+authority publication, and `user_version` changes share one crash transaction.
+Forged ledgers, near-match schemas, unknown views/triggers/indexes, and partial
+migrations fail closed. Startup performs a database-size-bounded
+`integrity_check(1)`, `foreign_key_check`, bounded row/byte reconciliation, and
 complete validation of migration, resource, operation, cursor, canonical
 JSON/blob, duplicated scalar, timestamp, version, and typed idempotency rows.
-Unknown views, triggers, indexes, or altered DDL are rejected. Database and
-journal byte limits, SQLite `max_page_count`, and `journal_size_limit` are set
-before schema or resource writes and are checked again before commit, so a
-budget rejection rolls the transaction back rather than reporting failure after
-a successful commit.
 
-The v3 project row stores `RemoteProjectStateV1` canonical JSON in a nullable
+The v5 `provider_storage_usage` singleton is the normal-transaction authority
+for the complete provider recovery row/byte budget, the 256 KiB per-value and
+16 MiB aggregate remote-state budget, and fixed terminal reservations. It also
+contains a generation and four modular remote-content accumulators. Canonical
+row triggers update it transactionally and require exactly one affected
+authority row; its seal is a domain-separated HMAC under the owner-only signing
+key. The migration ledger becomes immutable at v5. The authority singleton
+rejects every later insert and delete, so `DELETE` followed by insert and
+`INSERT OR REPLACE` are rejected even when SQLite recursive triggers are off.
+Rollback restores data and authority together.
+
+Each non-null `RemoteProjectStateV1` BLOB has a per-project HMAC-derived content
+token over the project ID and exact canonical bytes. Project triggers add and
+subtract those tokens from the authenticated accumulators, and guarded project
+reads recompute the token before JSON parsing. Normal reads and writes validate
+the fixed-size schema and singleton in O(1) relative to provider data; they do
+not run table `count`/`sum(length(...))` scans. The process caches the last
+committed generation and seal, which rejects replay of an older signed authority
+during that process lifetime. Startup and v4 -> v5 migration may perform one
+bounded reconciliation of actual table totals, remote lengths/tokens, and live
+reservations before any remote payload is decoded. The singleton itself consumes
+a fixed conservative 512-byte recovery reservation, avoiding recursive accounting
+of its changing decimal counter representation.
+
+This authentication detects budget-changing partial SQLite edits and remote
+content edits while the signing key remains confidential, including equal-length
+remote JSON replacement, counter replay, and trigger removal or alteration. Other
+same-length, model-valid resource-field edits remain within the owner-only state
+directory threat boundary. The authority is not a trusted monotonic clock:
+an offline attacker who can restore a complete earlier, internally consistent
+database snapshot, or who can read the owner-only signing key and coherently
+rewrite all authenticated state, is outside this module's detection boundary.
+Detecting that rollback requires a platform-protected monotonic anchor outside
+the SQLite database and key file. Database and journal byte limits, SQLite
+`max_page_count`, and `journal_size_limit` remain independently enforced before
+commit.
+
+The project row stores `RemoteProjectStateV1` canonical JSON in a nullable
 private BLOB separate from the canonical `ProjectCreateV1` intent document.
-Each value is limited to 256 KiB and the table aggregate is limited to 16 MiB.
-Every ordinary transaction checks both limits after `BEGIN` and before any
-remote-state payload query. Project get/list therefore use the same SQLite
-snapshot for the aggregate check and guarded payload read, and fail before
-payload materialization or list `fetchall()` when the aggregate is over budget.
 Activation accepts only a ready projection whose active revision project matches
 its Core-owned `core_project_id` and whose revision ID matches the local
 `current_revision_id`; Local and Core project IDs remain distinct identities.
