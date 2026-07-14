@@ -47,6 +47,16 @@ input bindings、execution/capture/harness/runtime requirements、config 和 typ
 这是产品目标 contract；当前完整的 cross-session revision/admission/atomic activation 尚未实现，不能把
 内部 materializer 或现有 legacy Gateway path 描述为已经满足该 contract。
 
+Desktop/Core 的发布边界以 `docs/architecture/desktop-core-contract-v1.md` 为准。React
+renderer 只能调用带 Desktop session 鉴权的 `/desktop/v1/*` 本地 sidecar API，不能看到
+SSH command、Core URL、backend token、secret reference、host path 或 benchmark 概念。
+Sidecar 只在 Core 存在前负责 SSH/bootstrap；Core 通过兼容性检查后，run、service、artifact、
+revision 和 diagnostics 必须走 active project tunnel 上的 `/v1/*` Core Control API，不能退回
+SSH 直接执行。两个 API 都必须有严格 closed model、version/digest negotiation、typed error、
+幂等 action、游标和可恢复事件语义。Contract simulator 只能用于显式 debug/test build；release
+遇到 simulator、scaffold、dry-run、legacy route fallback、无 verified registry 或不兼容 digest
+时必须 fail closed。
+
 ## 目录结构
 
 - `src/openevo/`: OpenEvo Core Backend package、Core-owned science/project config
