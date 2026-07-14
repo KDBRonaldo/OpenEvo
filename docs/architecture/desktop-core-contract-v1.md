@@ -268,14 +268,16 @@ submission remains bounded client-owned retry work. A close action failure
 permanently rejects new leases for that client. `close()` waits only to its hard
 deadline, and accepted old resources cannot create replacement-session threads.
 
-Sealing also advances a per-client session generation. A JSON call's
-copy-on-write authority/cache transaction surrounds its generation lease. The
-lease exits through the same delivery barrier used by `close()`; a winning seal
-overrides the pending return with `core_client_closed` and rolls back the
-transaction. Core SSE is an explicit iterator whose every `__next__` uses the
-same transaction and lease-exit commit. A body or frame rejected by the seal
-cannot be returned, applied, or recorded as replay authority for the retired
-session, and `close()` need not wait for a stalled application thread.
+Sealing also advances a per-client session generation. A JSON call's generation
+admission surrounds its copy-on-write authority/cache transaction. The
+transaction's final exit uses the same delivery barrier as `close()` to perform
+the deadline/generation check, cache commit or rollback, delivery linearization,
+and lease release as one critical section. A winning seal overrides the pending
+return with `core_client_closed` and rolls back the transaction. Core SSE is an
+explicit iterator whose every `__next__` uses the same atomic transaction exit.
+A body or frame rejected by the seal cannot be returned, applied, or recorded as
+replay authority for the retired session, and `close()` need not wait for a
+stalled application thread.
 
 Local SSE carries Desktop state changes and resource invalidations. Every
 resource invalidation includes the authoritative ETag or content digest and

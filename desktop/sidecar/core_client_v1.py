@@ -270,6 +270,8 @@ class _CapabilityAuthority:
 class _GenerationLeaseToken:
     generation: int
     deadline: float
+    owner: int
+    released: bool = False
 
 
 def _generation_bound(method: Callable[MethodP, ResponseT]) -> Callable[MethodP, ResponseT]:
@@ -278,8 +280,8 @@ def _generation_bound(method: Callable[MethodP, ResponseT]) -> Callable[MethodP,
         client = args[0]
         if not isinstance(client, CoreControlClientV1):
             raise TypeError("generation-bound method requires CoreControlClientV1")
-        with client._registration_batch():
-            with client._generation_lease() as token:
+        with client._generation_lease() as token:
+            with client._registration_batch(delivery_token=token):
                 result = method(*args, **kwargs)
                 client._linearize_generation_result(token.generation, token.deadline)
                 return result
@@ -1902,7 +1904,6 @@ class CoreControlClientV1:
         self,
         *,
         expected_generation: int | None = None,
-        delivery: bool = False,
     ) -> Iterator[int]:
         owner = threading.get_ident()
         with self._state:
@@ -1918,50 +1919,53 @@ class CoreControlClientV1:
             self._leases += 1
             self._lease_owners[owner] = self._lease_owners.get(owner, 0) + 1
             session_generation = self._session_generation
-        succeeded = False
         try:
             yield session_generation
-            succeeded = True
         finally:
-            delivery_rejected = False
-            lock = self._delivery_lock if delivery and succeeded else self._state
-            with lock:
-                with self._state:
-                    if delivery and succeeded:
-                        delivery_rejected = (
-                            self._closing
-                            or self._closed
-                            or self._close_failed
-                            or session_generation != self._session_generation
-                        )
-                    self._leases -= 1
-                    remaining = self._lease_owners[owner] - 1
-                    if remaining:
-                        self._lease_owners[owner] = remaining
-                    else:
-                        del self._lease_owners[owner]
-                    self._state.notify_all()
-            if delivery_rejected:
-                _raise_local(CoreClientLocalErrorCodeV1.CLIENT_CLOSED, 503)
+            with self._state:
+                self._release_lease_locked(owner)
 
     @contextmanager
-    def _generation_lease(self) -> Iterator[_GenerationLeaseToken]:
-        with self._lease(delivery=True) as session_generation:
-            stack = getattr(self._generation_local, "stack", None)
-            if stack is None:
-                stack = []
-                self._generation_local.stack = stack
-            deadline = time.monotonic() + self._request_deadline_seconds
-            if stack:
-                deadline = min(deadline, stack[-1].deadline)
-            token = _GenerationLeaseToken(session_generation, deadline)
-            stack.append(token)
-            try:
-                yield token
-            finally:
-                popped = stack.pop()
-                if popped is not token:
-                    raise RuntimeError("generation lease stack corrupted")
+    def _generation_lease(
+        self,
+        *,
+        expected_generation: int | None = None,
+        deadline: float | None = None,
+    ) -> Iterator[_GenerationLeaseToken]:
+        owner = threading.get_ident()
+        with self._state:
+            if self._closing or self._closed or self._close_failed:
+                _raise_local(CoreClientLocalErrorCodeV1.CLIENT_CLOSED, 503)
+            if (
+                expected_generation is not None
+                and expected_generation != self._session_generation
+            ):
+                _raise_local(CoreClientLocalErrorCodeV1.CLIENT_CLOSED, 503)
+            if self._close_tasks_pending + self._leases >= MAX_CORE_CLOSE_QUEUE_SIZE - 1:
+                _raise_local(CoreClientLocalErrorCodeV1.CONNECTION_FAILED, 503)
+            self._leases += 1
+            self._lease_owners[owner] = self._lease_owners.get(owner, 0) + 1
+            session_generation = self._session_generation
+        stack = getattr(self._generation_local, "stack", None)
+        if stack is None:
+            stack = []
+            self._generation_local.stack = stack
+        lease_deadline = time.monotonic() + self._request_deadline_seconds
+        if deadline is not None:
+            lease_deadline = min(lease_deadline, deadline)
+        if stack:
+            lease_deadline = min(lease_deadline, stack[-1].deadline)
+        token = _GenerationLeaseToken(session_generation, lease_deadline, owner)
+        stack.append(token)
+        try:
+            yield token
+        finally:
+            popped = stack.pop()
+            if popped is not token:
+                raise RuntimeError("generation lease stack corrupted")
+            if not token.released:
+                with self._state:
+                    self._release_generation_token_locked(token)
 
     @contextmanager
     def _sse_delivery_lease(
@@ -1970,9 +1974,27 @@ class CoreControlClientV1:
         deadline: float,
     ) -> Iterator[None]:
         _check_deadline(deadline)
-        with self._registration_batch():
-            with self._lease(expected_generation=session_generation, delivery=True):
+        with self._generation_lease(
+            expected_generation=session_generation,
+            deadline=deadline,
+        ) as token:
+            with self._registration_batch(delivery_token=token):
                 yield
+
+    def _release_lease_locked(self, owner: int) -> None:
+        self._leases -= 1
+        remaining = self._lease_owners[owner] - 1
+        if remaining:
+            self._lease_owners[owner] = remaining
+        else:
+            del self._lease_owners[owner]
+        self._state.notify_all()
+
+    def _release_generation_token_locked(self, token: _GenerationLeaseToken) -> None:
+        if token.released:
+            return
+        self._release_lease_locked(token.owner)
+        token.released = True
 
     @contextmanager
     def _json_generation_lease(self) -> Iterator[tuple[int, float]]:
@@ -2061,7 +2083,11 @@ class CoreControlClientV1:
         )
 
     @contextmanager
-    def _registration_batch(self) -> Iterator[None]:
+    def _registration_batch(
+        self,
+        *,
+        delivery_token: _GenerationLeaseToken | None = None,
+    ) -> Iterator[None]:
         with self._membership_lock:
             original = (
                 self._members,
@@ -2090,26 +2116,64 @@ class CoreControlClientV1:
             self._operations = self._operations.copy()
             self._diagnostics = self._diagnostics.copy()
             self._sse_event_digests = self._sse_event_digests.copy()
+            succeeded = False
             try:
                 yield
-            except BaseException:
-                (
-                    self._members,
-                    self._log_refs,
-                    self._workspace_uploads,
-                    self._workspace_etag_representations,
-                    self._workspace_representation_etags,
-                    self._project_state,
-                    self._runs,
-                    self._services,
-                    self._artifacts,
-                    self._operations,
-                    self._diagnostics,
-                    self._sse_event_digests,
-                    self._capability_authority,
-                    self._version_authority,
-                ) = original
-                raise
+                succeeded = True
+            finally:
+                delivery_error: CoreClientErrorV1 | None = None
+                if succeeded and delivery_token is not None:
+                    with self._delivery_lock:
+                        try:
+                            _check_deadline(delivery_token.deadline)
+                        except CoreClientErrorV1 as exc:
+                            delivery_error = exc
+                        with self._state:
+                            delivery_rejected = (
+                                self._closing
+                                or self._closed
+                                or self._close_failed
+                                or delivery_token.generation != self._session_generation
+                            )
+                            if delivery_error is not None or delivery_rejected:
+                                (
+                                    self._members,
+                                    self._log_refs,
+                                    self._workspace_uploads,
+                                    self._workspace_etag_representations,
+                                    self._workspace_representation_etags,
+                                    self._project_state,
+                                    self._runs,
+                                    self._services,
+                                    self._artifacts,
+                                    self._operations,
+                                    self._diagnostics,
+                                    self._sse_event_digests,
+                                    self._capability_authority,
+                                    self._version_authority,
+                                ) = original
+                            self._release_generation_token_locked(delivery_token)
+                        if delivery_rejected:
+                            _raise_local(CoreClientLocalErrorCodeV1.CLIENT_CLOSED, 503)
+                        if delivery_error is not None:
+                            raise delivery_error
+                elif not succeeded:
+                    (
+                        self._members,
+                        self._log_refs,
+                        self._workspace_uploads,
+                        self._workspace_etag_representations,
+                        self._workspace_representation_etags,
+                        self._project_state,
+                        self._runs,
+                        self._services,
+                        self._artifacts,
+                        self._operations,
+                        self._diagnostics,
+                        self._sse_event_digests,
+                        self._capability_authority,
+                        self._version_authority,
+                    ) = original
 
     def _bind_resource(
         self,

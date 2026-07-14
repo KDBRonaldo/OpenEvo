@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+from contextlib import contextmanager
 import hashlib
 import json
 import secrets
@@ -1976,6 +1977,62 @@ def test_generation_lease_exit_rejects_json_after_final_delivery_check(monkeypat
     assert results == []
     assert errors[0].error.code is CoreClientLocalErrorCodeV1.CLIENT_CLOSED
     assert client._capability_authority is None
+    assert client._leases == 0
+    assert client._lease_owners == {}
+
+
+def test_close_seals_json_in_post_lease_cache_transaction_window(monkeypatch) -> None:
+    capabilities = _capabilities()
+    client = _client(
+        lambda _request: httpx.Response(
+            200,
+            json=capabilities.model_dump(mode="json"),
+        )
+    )
+    original_batch = client._registration_batch
+    transaction_ready = threading.Event()
+    release_transaction = threading.Event()
+    depth = threading.local()
+    results: list[v1.CapabilitiesResponseV1] = []
+    errors: list[CoreClientErrorV1] = []
+
+    @contextmanager
+    def pause_before_outer_transaction_exit(*args, **kwargs):
+        current_depth = getattr(depth, "value", 0) + 1
+        depth.value = current_depth
+        try:
+            with original_batch(*args, **kwargs):
+                yield
+                if current_depth == 1:
+                    transaction_ready.set()
+                    release_transaction.wait(1)
+        finally:
+            depth.value = current_depth - 1
+
+    def read_capabilities() -> None:
+        try:
+            results.append(client.capabilities(v1.ExecutionMode.SELF_DEPLOYED))
+        except CoreClientErrorV1 as exc:
+            errors.append(exc)
+
+    monkeypatch.setattr(client, "_registration_batch", pause_before_outer_transaction_exit)
+    request_thread = threading.Thread(target=read_capabilities)
+    request_thread.start()
+    assert transaction_ready.wait(1)
+
+    started_at = time.monotonic()
+    client.close()
+    close_elapsed = time.monotonic() - started_at
+    release_transaction.set()
+    request_thread.join(1)
+
+    assert not request_thread.is_alive()
+    assert close_elapsed < 0.25
+    assert results == []
+    assert errors[0].error.code is CoreClientLocalErrorCodeV1.CLIENT_CLOSED
+    assert client._capability_authority is None
+    assert client._leases == 0
+    assert client._lease_owners == {}
 
 
 def test_nested_artifact_diff_cannot_hold_close_past_deadline(monkeypatch) -> None:
@@ -2542,6 +2599,69 @@ def test_sse_next_exit_rejects_frame_after_final_delivery_check(monkeypatch) -> 
     assert frames == []
     assert errors[0].error.code is CoreClientLocalErrorCodeV1.CLIENT_CLOSED
     assert "event-final-check" not in client._sse_event_digests
+
+
+def test_close_seals_sse_in_post_lease_cache_transaction_window(monkeypatch) -> None:
+    payload = {
+        "schema_version": "1",
+        "id": "event-post-lease",
+        "sequence": 1,
+        "occurred_at": "2026-07-14T12:00:00Z",
+        "event": "heartbeat.v1",
+        "payload": {"active_run_count": 0},
+    }
+    client = _client(
+        lambda _request: httpx.Response(
+            200,
+            headers={"Content-Type": "text/event-stream"},
+            content=_sse_bytes(payload),
+        )
+    )
+    original_batch = client._registration_batch
+    transaction_ready = threading.Event()
+    release_transaction = threading.Event()
+    depth = threading.local()
+    frames: list[v1.SseFrameV1] = []
+    errors: list[CoreClientErrorV1] = []
+
+    @contextmanager
+    def pause_before_outer_transaction_exit(*args, **kwargs):
+        current_depth = getattr(depth, "value", 0) + 1
+        depth.value = current_depth
+        try:
+            with original_batch(*args, **kwargs):
+                yield
+                if current_depth == 1:
+                    transaction_ready.set()
+                    release_transaction.wait(1)
+        finally:
+            depth.value = current_depth - 1
+
+    monkeypatch.setattr(client, "_registration_batch", pause_before_outer_transaction_exit)
+    with client.events() as stream:
+        def read_frame() -> None:
+            try:
+                frames.append(next(stream))
+            except CoreClientErrorV1 as exc:
+                errors.append(exc)
+
+        reader = threading.Thread(target=read_frame)
+        reader.start()
+        assert transaction_ready.wait(1)
+
+        started_at = time.monotonic()
+        client.close()
+        close_elapsed = time.monotonic() - started_at
+        release_transaction.set()
+        reader.join(1)
+
+    assert not reader.is_alive()
+    assert close_elapsed < 0.25
+    assert frames == []
+    assert errors[0].error.code is CoreClientLocalErrorCodeV1.CLIENT_CLOSED
+    assert "event-post-lease" not in client._sse_event_digests
+    assert client._leases == 0
+    assert client._lease_owners == {}
 
 
 def test_sse_wait_does_not_hold_the_client_cache_transaction_lock() -> None:

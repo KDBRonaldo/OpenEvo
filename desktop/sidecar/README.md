@@ -66,19 +66,23 @@ The close seal increments a client session generation. Each public JSON call own
 one generation token and a copy-on-write authority/cache transaction. Network
 I/O, bounded body reads, response-model validation, nested public calls, and
 cache validation do not hold the close state lock. After all validation succeeds,
-the generation lease exits through a dedicated delivery barrier shared with
-`close()`. Cache transaction commit and lease exit are one linearization: if the
-seal starts first, the transaction rolls back and the pending return is replaced
-with `core_client_closed`; if delivery commits first, close linearizes after it.
-`close()` need not wait for a stalled request thread, and after it returns no
-uncommitted result from the sealed generation can be delivered.
+generation admission surrounds the copy-on-write cache transaction. On the
+transaction's final exit, one delivery-barrier critical section shared with
+`close()` performs the deadline/generation check, cache commit or rollback,
+delivery linearization, and lease release. If the seal starts first, the
+transaction rolls back and the pending return is replaced with
+`core_client_closed`; if delivery commits first,
+close linearizes after it. `close()` need not wait for a stalled request thread,
+and after it returns no uncommitted result from the sealed generation can be
+delivered.
 
 SSE parsing and cache validation likewise happen outside the close state lock.
-The stream is an explicit iterator; every `__next__` owns a generation lease and
-one replay-ledger/cache transaction whose exit uses the same delivery barrier.
-A seal that wins replaces the pending return with `core_client_closed` and rolls
-back replay authority. `close()` returning is a hard boundary: no uncommitted old
-frame may be yielded afterward.
+The stream is an explicit iterator; every `__next__` owns one generation
+admission around one replay-ledger/cache transaction. Its final exit uses the
+same atomic delivery-barrier commit and lease release as JSON. A seal that wins
+replaces the pending return with `core_client_closed` and rolls back replay
+authority. `close()` returning is a hard boundary: no uncommitted old frame may
+be yielded afterward.
 
 Before URL/request construction, path segments (including their decoded form),
 query values, cursors, caller-provided headers, and decoded request bodies are
