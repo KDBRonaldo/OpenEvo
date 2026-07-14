@@ -522,7 +522,7 @@ def test_current_generation_admission_is_idempotent_and_concurrent(tmp_path: Pat
     assert store.active_revision_lease_count(revision.revision_id) == 1
 
 
-def _activate_successor_directly(
+def _activate_successor(
     store: EvolutionStore,
     context: MaterializedContext,
     snapshot: ExecutionSnapshotV1,
@@ -536,46 +536,239 @@ def _activate_successor_directly(
         generation=generation,
         predecessor_revision_id=predecessor_id,
     )
-    now = "2027-01-01T00:00:00Z"
+    return store.activate_successor_revision(manifest).manifest
+
+
+def test_successor_activation_is_atomic_idempotent_and_restart_safe(
+    tmp_path: Path,
+) -> None:
+    store, context, snapshot = _initialized_store(tmp_path)
+    genesis = store.create_genesis_revision(_manifest(context, snapshot))
+    manifest = _manifest(
+        context,
+        snapshot,
+        generation=1,
+        predecessor_revision_id=genesis.revision_id,
+        project_marker="project-v2",
+        workspace_marker="workspace-v2",
+    )
+
+    activated = store.activate_successor_revision(manifest)
+    assert activated.active is True
+    assert activated.manifest == manifest
+    assert store.activate_successor_revision(manifest) == activated
+    assert store.get_active_revision(manifest.stream_id) == activated
+
+    restarted = _restart(tmp_path)
+    assert restarted.get_active_revision(manifest.stream_id) == activated
+    assert restarted.activate_successor_revision(manifest) == activated
+
+
+def test_successor_activation_preserves_existing_task_pin(tmp_path: Path) -> None:
+    store, context, snapshot = _initialized_store(tmp_path)
+    genesis = store.create_genesis_revision(_manifest(context, snapshot))
+    admitted = _admit(store, context, snapshot, _intent())
+    successor = _manifest(
+        context,
+        snapshot,
+        generation=1,
+        predecessor_revision_id=genesis.revision_id,
+    )
+
+    activated = store.activate_successor_revision(successor)
+
+    assert activated.revision_id != genesis.revision_id
+    assert store.get_task_admission(admitted.admission_id) == admitted
+    assert admitted.pinned_revision_id == genesis.revision_id
+    assert store.active_revision_lease_count(genesis.revision_id) == 1
+
+
+def test_successor_activation_rejects_stale_fork_and_generation_gap(
+    tmp_path: Path,
+) -> None:
+    store, context, snapshot = _initialized_store(tmp_path)
+    genesis = store.create_genesis_revision(_manifest(context, snapshot))
+
+    with pytest.raises(RevisionConflictError, match="generation|successor"):
+        store.activate_successor_revision(
+            _manifest(
+                context,
+                snapshot,
+                generation=2,
+                predecessor_revision_id=genesis.revision_id,
+            )
+        )
+
+    first = store.activate_successor_revision(
+        _manifest(
+            context,
+            snapshot,
+            generation=1,
+            predecessor_revision_id=genesis.revision_id,
+        )
+    )
+    with pytest.raises(RevisionConflictError, match="predecessor|successor"):
+        store.activate_successor_revision(
+            _manifest(
+                context,
+                snapshot,
+                generation=1,
+                predecessor_revision_id=genesis.revision_id,
+                workspace_marker="competing-workspace",
+            )
+        )
+
+    second_manifest = _manifest(
+        context,
+        snapshot,
+        generation=2,
+        predecessor_revision_id=first.revision_id,
+    )
+    second = store.activate_successor_revision(second_manifest)
+    historical_retry = store.activate_successor_revision(first.manifest)
+    assert historical_retry.revision_id == first.revision_id
+    assert historical_retry.active is False
+    assert store.get_active_revision(second_manifest.stream_id) == second
+
+
+def test_concurrent_successor_activation_has_one_authoritative_result(
+    tmp_path: Path,
+) -> None:
+    store, context, snapshot = _initialized_store(tmp_path)
+    genesis = store.create_genesis_revision(_manifest(context, snapshot))
+    manifest = _manifest(
+        context,
+        snapshot,
+        generation=1,
+        predecessor_revision_id=genesis.revision_id,
+    )
+    barrier = threading.Barrier(3)
+    results = []
+    errors: list[BaseException] = []
+
+    def activate() -> None:
+        barrier.wait()
+        try:
+            results.append(store.activate_successor_revision(manifest))
+        except BaseException as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    threads = [threading.Thread(target=activate) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    barrier.wait()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert errors == []
+    assert len(results) == 2 and results[0] == results[1]
+    assert store.get_active_revision(manifest.stream_id) == results[0]
+
+
+def test_competing_concurrent_successors_cannot_fork_stream(tmp_path: Path) -> None:
+    store, context, snapshot = _initialized_store(tmp_path)
+    genesis = store.create_genesis_revision(_manifest(context, snapshot))
+    manifests = [
+        _manifest(
+            context,
+            snapshot,
+            generation=1,
+            predecessor_revision_id=genesis.revision_id,
+            workspace_marker=marker,
+        )
+        for marker in ("workspace-successor-a", "workspace-successor-b")
+    ]
+    barrier = threading.Barrier(3)
+    results = []
+    errors: list[BaseException] = []
+
+    def activate(manifest: RevisionManifestV1) -> None:
+        barrier.wait()
+        try:
+            results.append(store.activate_successor_revision(manifest))
+        except BaseException as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=activate, args=(manifest,)) for manifest in manifests
+    ]
+    for thread in threads:
+        thread.start()
+    barrier.wait()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert len(results) == 1
+    assert len(errors) == 1 and isinstance(errors[0], RevisionConflictError)
+    assert store.get_active_revision(genesis.manifest.stream_id) == results[0]
+
+
+def test_successor_activation_revalidates_context_and_execution_snapshot(
+    tmp_path: Path,
+) -> None:
+    store, context, snapshot = _initialized_store(tmp_path)
+    genesis = store.create_genesis_revision(_manifest(context, snapshot))
+    valid = _manifest(
+        context,
+        snapshot,
+        generation=1,
+        predecessor_revision_id=genesis.revision_id,
+    )
+    invalid_context = valid.model_copy(
+        update={
+            "context": valid.context.model_copy(
+                update={"manifest_digest": "0" * 64}
+            )
+        }
+    )
+    unregistered_snapshot = _execution_snapshot(token_limit=16_384)
+    invalid_execution = _manifest(
+        context,
+        unregistered_snapshot,
+        generation=1,
+        predecessor_revision_id=genesis.revision_id,
+    )
+
+    with pytest.raises(RevisionIntegrityError, match="materialized context"):
+        store.activate_successor_revision(invalid_context)
+    with pytest.raises(RevisionIntegrityError, match="execution snapshot"):
+        store.activate_successor_revision(invalid_execution)
+    assert store.get_active_revision(valid.stream_id) == genesis
+
+
+def test_successor_activation_rolls_back_capacity_failure_and_exact_retry_precedes_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, context, snapshot = _initialized_store(tmp_path)
+    genesis = store.create_genesis_revision(_manifest(context, snapshot))
+    manifest = _manifest(
+        context,
+        snapshot,
+        generation=1,
+        predecessor_revision_id=genesis.revision_id,
+    )
+
+    monkeypatch.setattr(store_module, "MAX_REVISION_STREAM_RECOVERY_BYTES", 0)
+    with pytest.raises(RevisionCapacityError, match="stream ledger"):
+        store.activate_successor_revision(manifest)
+    assert store.get_active_revision(manifest.stream_id) == genesis
     with store.connect() as connection:
-        connection.execute("BEGIN IMMEDIATE")
-        connection.execute(
-            """
-            INSERT INTO revisions (
-                revision_id, stream_id, generation, predecessor_revision_id, created_at,
-                manifest_digest, manifest_json, context_id, context_manifest_digest,
-                registry_digest, execution_snapshot_id, execution_snapshot_digest,
-                adapter_set_digest
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                revision_id_for_manifest(manifest),
-                manifest.stream_id,
-                manifest.generation,
-                manifest.predecessor_revision_id,
-                now,
-                canonical_digest(manifest),
-                canonical_json(manifest),
-                manifest.context.context_id,
-                manifest.context.manifest_digest,
-                manifest.context.registry_digest,
-                manifest.execution_snapshot_id,
-                manifest.execution_snapshot_digest,
-                canonical_digest(manifest.adapters),
-            ),
-        )
-        connection.execute(
-            "UPDATE revision_streams SET active_revision_id = ?, active_generation = ?, "
-            "updated_at = ? WHERE stream_id = ?",
-            (
-                revision_id_for_manifest(manifest),
-                generation,
-                now,
-                manifest.stream_id,
-            ),
-        )
-        connection.commit()
-    return manifest
+        row = connection.execute(
+            "SELECT 1 FROM revisions WHERE revision_id = ?",
+            (revision_id_for_manifest(manifest),),
+        ).fetchone()
+    assert row is None
+
+    monkeypatch.setattr(
+        store_module,
+        "MAX_REVISION_STREAM_RECOVERY_BYTES",
+        4 * 1024 * 1024,
+    )
+    activated = store.activate_successor_revision(manifest)
+    monkeypatch.setattr(store_module, "MAX_REVISION_RECOVERY_ROWS", 0)
+    monkeypatch.setattr(store_module, "MAX_REVISION_STREAM_RECOVERY_BYTES", 0)
+    assert store.activate_successor_revision(manifest) == activated
 
 
 def test_queued_active_generation_survives_restart_and_retry_pins_atomically(
@@ -588,7 +781,7 @@ def test_queued_active_generation_survives_restart_and_retry_pins_atomically(
     queued = _admit(store, context, snapshot, intent, envelope)
     assert queued.status is AdmissionStatus.QUEUED
 
-    successor = _activate_successor_directly(store, context, snapshot, genesis.revision_id)
+    successor = _activate_successor(store, context, snapshot, genesis.revision_id)
     restarted = _restart(tmp_path)
     still_queued = restarted.get_task_admission(queued.admission_id)
     assert still_queued.status is AdmissionStatus.QUEUED
@@ -607,7 +800,7 @@ def test_queued_recovery_still_rejects_older_or_gap_generation(tmp_path: Path) -
         snapshot,
         _intent(task_id="task-next", generation=1, idempotency_key="next"),
     )
-    _activate_successor_directly(store, context, snapshot, genesis.revision_id)
+    _activate_successor(store, context, snapshot, genesis.revision_id)
     with sqlite3.connect(tmp_path / "evolution.db") as connection:
         connection.execute("PRAGMA ignore_check_constraints = ON")
         connection.execute(
@@ -908,7 +1101,7 @@ def test_task_admission_transition_enforces_exact_byte_delta_capacity(
         initial = _admit(store, context, snapshot, intent, envelope)
 
     if transition == "queued_to_admitted":
-        successor = _activate_successor_directly(
+        successor = _activate_successor(
             store,
             context,
             snapshot,
@@ -1011,13 +1204,13 @@ def test_unpinned_cancelled_remains_historical_after_arbitrary_head_advance(
     )
     assert unpinned.pinned_revision_id is None
 
-    first = _activate_successor_directly(
+    first = _activate_successor(
         store,
         context,
         snapshot,
         genesis.revision_id,
     )
-    _activate_successor_directly(
+    _activate_successor(
         store,
         context,
         snapshot,

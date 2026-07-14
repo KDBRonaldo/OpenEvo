@@ -95,9 +95,12 @@ snapshot reconciliation 的 canonical bytes 受独立 aggregate budget。该保�
 job/artifact recovery。写入侧使用同一 B3 row/byte capacity；task admission 非幂等 UPDATE 在写前计算
 old/new exact UTF-8 byte delta，并在 UPDATE 后 readback 重验，exact retry 优先于 capacity check。
 
-该 primitive 尚未接入 Gateway、Core run owner、Desktop 或 benchmark automation，也不提供 successor
-revision activation。Transition sealing、所有 enabled target 的 readiness、adapter load/restart、health
-check 和 atomic N+1 commit 仍是 B3.2-B3.4 工作。因此 materializer、strict v2 transport、Gateway
+Store 的内部 `activate_successor_revision` 已提供严格相邻 N+1 的最终 ledger commit：它在一个写事务中
+重验 predecessor、materialized context、registered execution snapshot 和容量，再写 revision 与推进 head；
+并发/重试幂等，竞争 fork 和 generation gap fail closed，旧 task pin 保持不变。该 primitive 尚未接入
+Gateway、Core run owner、Desktop 或 benchmark automation，也不自行证明 transition readiness。
+Transition sealing、所有 enabled target 的 readiness、adapter load/restart、health check 和调用该 commit
+的 run-owner 编排仍是 B3.2-B3.4 工作。因此 materializer、strict v2 transport、Gateway
 generic cutover 或当前 genesis ledger 中任何一项都不能单独被描述为完整 revision contract。Execution
 snapshot persistence 不是 B2 verified deployment/readiness attestation。当前无 production snapshot issuer，
 repo-private testkit seal 仅用于测试；#160/B1 verified deployment producer 接入前 release admission 必须 fail
