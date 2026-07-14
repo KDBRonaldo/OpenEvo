@@ -2770,9 +2770,15 @@ class CoreControlStoreV1:
                 (expectation.upload_id,),
             ).fetchone()
         except Exception:
-            connection.execute("ROLLBACK")
+            try:
+                connection.execute("ROLLBACK")
+            finally:
+                self._verify_database_transaction_boundary()
             raise
-        connection.execute("COMMIT")
+        try:
+            connection.execute("COMMIT")
+        finally:
+            self._verify_database_transaction_boundary()
 
         if upload_row is None:
             raise StoreCorruptionError(
@@ -3469,6 +3475,9 @@ class CoreControlStoreV1:
             return
         expected = self._database_identities[name]
         current = os.fstat(fd)
+        if name in self._consumed_database_sidecars:
+            self._verify_consumed_database_sidecar(name, current)
+            return
         _require_same_identity(current, expected, "database rollback journal")
         try:
             path_identity = os.stat(name, dir_fd=self._root_fd, follow_symlinks=False)
@@ -3634,7 +3643,15 @@ class CoreControlStoreV1:
         )
 
     def _transaction(self):
-        return _Transaction(self._connection, self._verify_lifecycle_storage)
+        return _Transaction(
+            self._connection,
+            self._verify_lifecycle_storage,
+            self._reconcile_rollback_journal_authority,
+        )
+
+    def _verify_database_transaction_boundary(self) -> None:
+        self._reconcile_rollback_journal_authority()
+        self._verify_lifecycle_storage()
 
 
 class _Transaction:
@@ -3642,9 +3659,11 @@ class _Transaction:
         self,
         connection: sqlite3.Connection,
         verify_storage: Callable[[], None],
+        reconcile_rollback_journal: Callable[[], None],
     ) -> None:
         self.connection = connection
         self.verify_storage = verify_storage
+        self.reconcile_rollback_journal = reconcile_rollback_journal
         self.outcome: Literal["pending", "rolled_back", "committed", "unknown"] = "pending"
 
     def __enter__(self):
@@ -3654,31 +3673,29 @@ class _Transaction:
 
     def __exit__(self, exc_type, exc, traceback) -> bool:
         if exc_type is not None:
-            try:
-                self.connection.execute("ROLLBACK")
-            except sqlite3.Error as rollback_exc:
-                self.outcome = "unknown"
-                raise CommitOutcomeUnknownError(
-                    "Core Control transaction rollback outcome is unknown"
-                ) from rollback_exc
-            else:
-                self.outcome = "rolled_back"
+            self._rollback()
             return False
         try:
             self.verify_storage()
         except Exception:
-            self.connection.execute("ROLLBACK")
-            self.outcome = "rolled_back"
+            self._rollback()
             raise
         try:
             self.connection.execute("COMMIT")
         except Exception as exc:
             self.outcome = "unknown"
+            try:
+                self._verify_after_transaction_boundary()
+            except Exception as authority_exc:
+                raise CommitOutcomeUnknownError(
+                    "Core Control transaction commit authority is unknown"
+                ) from authority_exc
             raise CommitOutcomeUnknownError(
                 "Core Control transaction commit outcome is unknown"
             ) from exc
         except BaseException:
             self.outcome = "unknown"
+            self._verify_after_transaction_boundary()
             raise
         self.outcome = "committed"
         try:
@@ -3689,7 +3706,32 @@ class _Transaction:
             ) from exc
         return False
 
+    def _rollback(self) -> None:
+        try:
+            self.connection.execute("ROLLBACK")
+        except sqlite3.Error as rollback_exc:
+            self.outcome = "unknown"
+            try:
+                self._verify_after_transaction_boundary()
+            except Exception as authority_exc:
+                raise CommitOutcomeUnknownError(
+                    "Core Control transaction rollback authority is unknown"
+                ) from authority_exc
+            raise CommitOutcomeUnknownError(
+                "Core Control transaction rollback outcome is unknown"
+            ) from rollback_exc
+        except BaseException:
+            self.outcome = "unknown"
+            self._verify_after_transaction_boundary()
+            raise
+        self.outcome = "rolled_back"
+        self._verify_after_transaction_boundary()
+
     def _verify_after_commit(self) -> None:
+        self._verify_after_transaction_boundary()
+
+    def _verify_after_transaction_boundary(self) -> None:
+        self.reconcile_rollback_journal()
         self.verify_storage()
 
 

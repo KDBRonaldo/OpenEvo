@@ -144,8 +144,12 @@ an owner-owned, link-count-one `0600` regular file at the exact canonical
 pathname. After hot-journal recovery, the original rollback-journal inode must
 either remain bound there or be the now-unlinked inode SQLite consumed while the
 canonical pathname remains absent. A replacement pathname, unsafe original
-inode, or ambiguous consumption fails closed. Journal, WAL, and main-database
-byte budgets are checked independently.
+inode, or ambiguous consumption fails closed. After every explicit SQLite
+`COMMIT` or `ROLLBACK` boundary, including a boundary whose result is reported
+as unknown, Core reconciles that held rollback-journal inode before general
+lifecycle authority verification. The held state may only remain bound to the
+same pathname or advance once to consumed; a consumed inode cannot be rebound.
+Journal, WAL, and main-database byte budgets are checked independently.
 Python sqlite has no native attach-existing-FD API, so on Linux Core opens the
 main connection through `/proc/self/fd/<authority-fd>`, verifies SQLite's
 resolved `main` path, and rechecks the held root, pathname, and inode around

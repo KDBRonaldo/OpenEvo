@@ -2850,6 +2850,80 @@ def test_pending_store_identity_crash_window_recovers(
     )
 
 
+def test_first_restart_recovers_identity_bind_crash_before_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    script = """
+import os
+import sys
+
+from openevo.backend.contracts.v1 import store as store_module
+
+original_exit = store_module._Transaction.__exit__
+
+def crash_before_identity_bind_commit(transaction, exc_type, exc, traceback):
+    if exc_type is None:
+        try:
+            row = transaction.connection.execute(
+                "SELECT binding_state FROM store_identity WHERE singleton = 1"
+            ).fetchone()
+        except Exception:
+            row = None
+        if row is not None and row[0] == "bound":
+            os._exit(92)
+    return original_exit(transaction, exc_type, exc, traceback)
+
+store_module._Transaction.__exit__ = crash_before_identity_bind_commit
+store_module.CoreControlStoreV1(sys.argv[1])
+raise SystemExit(3)
+"""
+    crashed = subprocess.run(
+        [sys.executable, "-c", script, os.fspath(tmp_path)],
+        check=False,
+        capture_output=True,
+        text=True,
+        cwd=Path(__file__).parents[2],
+    )
+    assert crashed.returncode == 92, crashed.stderr
+
+    root = tmp_path / "core-control-v1"
+    marker = root / "provider.identity"
+    journal = root / "provider.sqlite3-journal"
+    journal_identity = journal.stat(follow_symlinks=False)
+    assert marker.is_file()
+    recovery_observations = 0
+
+    def observe_non_hot_journal() -> None:
+        nonlocal recovery_observations
+        current = journal.stat(follow_symlinks=False)
+        assert (current.st_dev, current.st_ino) == (
+            journal_identity.st_dev,
+            journal_identity.st_ino,
+        )
+        assert current.st_nlink == 1
+        recovery_observations += 1
+
+    monkeypatch.setattr(store_module, "_after_sqlite_recovery", observe_non_hot_journal)
+
+    recovered = CoreControlStoreV1(tmp_path)
+    try:
+        assert recovery_observations == 1
+        row = recovered._read_store_identity_row()
+        assert row["binding_state"] == "bound"
+        authority_name = "provider.sqlite3-journal"
+        assert authority_name in recovered._database_fds
+        consumed = os.fstat(recovered._database_fds[authority_name])
+        assert (consumed.st_dev, consumed.st_ino) == (
+            journal_identity.st_dev,
+            journal_identity.st_ino,
+        )
+        assert consumed.st_nlink == 0
+        assert not journal.exists()
+    finally:
+        recovered.close()
+
+
 def test_pending_identity_recovers_after_unpublished_marker_temp(tmp_path: Path) -> None:
     CoreControlStoreV1(tmp_path).close()
     root = tmp_path / "core-control-v1"
@@ -3064,6 +3138,148 @@ os._exit(91)
     journal = database.with_name("provider.sqlite3-journal")
     assert journal.is_file()
     return journal, signing_key
+
+
+def _test_rollback_journal_authority(
+    tmp_path: Path,
+) -> tuple[CoreControlStoreV1, Path, int, int]:
+    root = tmp_path / "journal-authority"
+    root.mkdir(mode=0o700)
+    journal = root / "provider.sqlite3-journal"
+    journal.write_bytes(b"held rollback journal")
+    journal.chmod(0o600)
+    root_fd = os.open(
+        root,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+    )
+    journal_fd = os.open(
+        journal.name,
+        os.O_RDWR | getattr(os, "O_NOFOLLOW", 0),
+        dir_fd=root_fd,
+    )
+    authority = object.__new__(CoreControlStoreV1)
+    authority._root_fd = root_fd
+    authority._database_fds = {journal.name: journal_fd}
+    authority._database_identities = {journal.name: os.fstat(journal_fd)}
+    authority._consumed_database_sidecars = set()
+    return authority, journal, root_fd, journal_fd
+
+
+@pytest.mark.parametrize("boundary", ["COMMIT", "ROLLBACK"])
+@pytest.mark.parametrize("journal_outcome", ["preserved", "consumed"])
+def test_transaction_boundary_reconciles_allowed_rollback_journal_states(
+    tmp_path: Path,
+    boundary: str,
+    journal_outcome: str,
+) -> None:
+    authority, journal, root_fd, journal_fd = _test_rollback_journal_authority(tmp_path)
+    connection = sqlite3.connect(":memory:", isolation_level=None)
+    events: list[str] = []
+    mutated = False
+
+    def mutate_at_boundary(statement: str) -> None:
+        nonlocal mutated
+        if statement.strip().upper() != boundary or mutated:
+            return
+        mutated = True
+        if journal_outcome == "consumed":
+            journal.unlink()
+
+    def reconcile() -> None:
+        events.append("reconcile")
+        authority._reconcile_rollback_journal_authority()
+
+    def verify() -> None:
+        events.append("verify")
+        authority._verify_database_authority()
+
+    connection.set_trace_callback(mutate_at_boundary)
+    transaction = store_module._Transaction(connection, verify, reconcile)
+    try:
+        if boundary == "COMMIT":
+            with transaction:
+                connection.execute("SELECT 1")
+            assert transaction.outcome == "committed"
+        else:
+            with pytest.raises(RuntimeError, match="force rollback"):
+                with transaction:
+                    raise RuntimeError("force rollback")
+            assert transaction.outcome == "rolled_back"
+        assert mutated
+        assert events[-2:] == ["reconcile", "verify"]
+        assert (journal.name in authority._consumed_database_sidecars) is (
+            journal_outcome == "consumed"
+        )
+    finally:
+        connection.close()
+        os.close(journal_fd)
+        os.close(root_fd)
+
+
+@pytest.mark.parametrize("boundary", ["COMMIT", "ROLLBACK"])
+@pytest.mark.parametrize(
+    "damage",
+    ["replacement", "replacement_after_consumed", "mode", "hardlink", "owner"],
+)
+def test_transaction_boundary_rejects_unsafe_rollback_journal_transition(
+    tmp_path: Path,
+    boundary: str,
+    damage: str,
+) -> None:
+    if damage == "owner" and os.geteuid() != 0:
+        pytest.skip("changing journal ownership requires root")
+    authority, journal, root_fd, journal_fd = _test_rollback_journal_authority(tmp_path)
+    connection = sqlite3.connect(":memory:", isolation_level=None)
+    alias = tmp_path / "journal-alias"
+    events: list[str] = []
+    mutated = False
+
+    def damage_at_boundary(statement: str) -> None:
+        nonlocal mutated
+        if statement.strip().upper() != boundary or mutated:
+            return
+        mutated = True
+        if damage == "replacement":
+            journal.unlink()
+            journal.write_bytes(b"replacement journal")
+            journal.chmod(0o600)
+        elif damage == "replacement_after_consumed":
+            journal.unlink()
+            authority._reconcile_rollback_journal_authority()
+            journal.write_bytes(b"replacement after consumption")
+            journal.chmod(0o600)
+        elif damage == "mode":
+            os.fchmod(journal_fd, 0o640)
+        elif damage == "hardlink":
+            os.link(journal, alias)
+        else:
+            os.fchown(journal_fd, 1, -1)
+
+    def reconcile() -> None:
+        events.append("reconcile")
+        authority._reconcile_rollback_journal_authority()
+
+    def verify() -> None:
+        events.append("verify")
+        authority._verify_database_authority()
+
+    connection.set_trace_callback(damage_at_boundary)
+    transaction = store_module._Transaction(connection, verify, reconcile)
+    expected_error = (
+        store_module.PostCommitStoreError if boundary == "COMMIT" else StoreCorruptionError
+    )
+    try:
+        with pytest.raises(expected_error):
+            with transaction:
+                if boundary == "ROLLBACK":
+                    raise RuntimeError("force rollback")
+                connection.execute("SELECT 1")
+        assert mutated
+        assert events[-1] == "reconcile"
+    finally:
+        connection.close()
+        os.close(journal_fd)
+        os.close(root_fd)
 
 
 def test_startup_pins_and_recovers_real_hot_rollback_journal(tmp_path: Path) -> None:
