@@ -14,6 +14,11 @@ Desktop may request repair or restart through typed APIs, but it must not
 directly execute release-mode gateway, rollout, worker, benchmark, or run
 commands after bootstrap.
 
+The Core Control API itself is one host/user-global loopback daemon, not one
+daemon per project or run. Its filesystem, release identity, pidfd lifecycle,
+readiness, and attach contract are defined in
+`docs/architecture/core-control-host-service.md`.
+
 ## Sidecar Boundary
 
 The Desktop sidecar owns local app integration and remote bootstrap:
@@ -56,7 +61,10 @@ before each run launch.
 
 ## State Layout
 
-Remote Core state is rooted in the configured workspace and OpenEvo state root.
+Core Control service state is rooted once per remote host and OS user. Project
+and task state is stored as Core-owned resources beneath that service boundary;
+it does not choose a second backend root or listener. Remote evolution state is
+rooted in the configured OpenEvo state root.
 Evolution state uses `.openevo/evolution` for datasets, jobs, artifacts, and
 context records. Per-session runtime state uses `/openevo/session` inside the
 runtime. Release docs and diagnostics must not introduce legacy runtime markers.

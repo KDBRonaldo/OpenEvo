@@ -32,7 +32,6 @@ def test_service_plan_starts_subscription_runtime_services() -> None:
     assert plan.topology_path == f"{plan.state_root}/services/topology.yaml"
     assert [step.id for step in plan.steps] == [
         "write_topology",
-        "openevo_backend",
         "evolution_backend",
         "rollout",
         "gateway",
@@ -42,24 +41,7 @@ def test_service_plan_starts_subscription_runtime_services() -> None:
     assert "gateway:" in topology.command
     assert "model_served: gpt-5.1-codex-mini" in topology.command
     assert "backend_url: http://127.0.0.1:8200" in topology.command
-    backend = plan.step_by_id("openevo_backend")
-    assert backend.manifest["service_id"] == "openevo_backend"
-    assert backend.manifest["pid_path"].endswith("/services/pids/openevo_backend.pid")
-    assert backend.manifest["log_path"].endswith("/services/logs/openevo_backend.log")
-    assert backend.manifest["identity_path"].endswith(
-        "/services/pids/openevo_backend.identity"
-    )
-    assert backend.manifest["port"] == 8765
-    assert 'kill -0 "$(cat' not in backend.command
-    _assert_before(backend.command, "if pid <= 0:", "os.kill(pid, 0)")
-    assert "openevo-backend serve --host 127.0.0.1 --port 8765" in backend.command
-    assert f"--state-root {plan.state_root}" in backend.command
     framework_lock = f"{plan.state_root}/wheels/framework-lock.json"
-    assert backend.manifest["identity_source_path"] == framework_lock
-    assert backend.manifest["identity_scheme"] == "framework_lock_and_argv_sha256_v1"
-    assert f"--framework-lock {framework_lock}" in backend.command
-    assert backend.health_command is not None
-    assert "http://127.0.0.1:8765/health" in backend.health_command
     gateway = plan.step_by_id("gateway")
     assert gateway.manifest["service_id"] == "gateway"
     assert gateway.manifest["pid_path"].endswith("/services/pids/gateway.pid")
@@ -175,7 +157,6 @@ def test_service_plan_starts_vllm_for_managed_local_inference() -> None:
     assert [step.id for step in plan.steps] == [
         "write_topology",
         "vllm",
-        "openevo_backend",
         "evolution_backend",
         "rollout",
         "gateway",
@@ -212,7 +193,8 @@ def test_execute_remote_services_plan_runs_start_and_health_checks() -> None:
     assert [step.status for step in report.steps] == ["pass"] * len(plan.steps)
     assert transport.commands[0][0] == plan.steps[0].command
     assert any("python3 -m openevo.rollout.server" in command for command, _env in transport.commands)
-    assert any("openevo-backend serve" in command for command, _env in transport.commands)
+    assert not any("openevo-backend serve" in command for command, _env in transport.commands)
+    assert not any("127.0.0.1:8765" in command for command, _env in transport.commands)
     assert any(
         "http://127.0.0.1:8080/health" in command
         for command, _env in transport.commands
@@ -231,7 +213,6 @@ def test_execute_remote_services_plan_stops_on_required_failure() -> None:
     assert rollout.stderr == "boom"
     assert [step.id for step in report.steps] == [
         "write_topology",
-        "openevo_backend",
         "evolution_backend",
         "rollout",
     ]
@@ -299,7 +280,6 @@ def test_inspect_remote_services_reports_ready_running_and_failed_states() -> No
     plan = build_remote_services_plan(_bootstrap_plan())
     transport = _LifecycleTransport(
         pid_states={
-            "openevo_backend": {"pid": 127, "alive": True},
             "gateway": {"pid": 123, "alive": True},
             "rollout": {"pid": 124, "alive": True},
             "evolution_backend": {"pid": 125, "alive": True},
@@ -720,7 +700,6 @@ def _assert_process_is_not_alive(pid: int) -> None:
 
 def _service_id_from_command(command: str) -> str | None:
     url_services = {
-        "127.0.0.1:8765": "openevo_backend",
         "127.0.0.1:8200": "evolution_backend",
         "127.0.0.1:8080": "rollout",
         "127.0.0.1:8100": "gateway",
@@ -730,7 +709,6 @@ def _service_id_from_command(command: str) -> str | None:
         if url_fragment in command:
             return service_id
     for service_id in (
-        "openevo_backend",
         "evolution_backend",
         "evolution_worker",
         "gateway",

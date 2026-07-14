@@ -18,7 +18,8 @@ def test_openevo_python_workflow_runs_focused_regressions() -> None:
     assert '"scripts/**"' in text
     assert '"tests/**"' in text
     assert '"benchmarks/terminal_bench/**"' in text
-    core_job, benchmark_job = text.split("  terminal-bench-tests:", maxsplit=1)
+    core_job, remaining_jobs = text.split("  macos-ssh-transport:", maxsplit=1)
+    macos_job, benchmark_job = remaining_jobs.split("  terminal-bench-tests:", maxsplit=1)
     assert "python -m pip install -e ." in core_job
     assert "python -m pip install -e benchmarks/terminal_bench" not in core_job
     assert "python -m pip install pytest pytest-asyncio ruff build twine" in core_job
@@ -42,6 +43,10 @@ def test_openevo_python_workflow_runs_focused_regressions() -> None:
     assert "tests/openevo/test_experiment_models.py" in text
     assert "tests/openevo/test_experiment_runner.py" in text
     assert "tests/openevo/test_core_capabilities.py" in text
+    assert "runs-on: macos-14" in macos_job
+    assert "python -m pip install -e ." in macos_job
+    assert "python -m pip install pytest" in macos_job
+    assert "tests/openevo/remote/test_ssh_transport.py -q" in macos_job
     assert "needs:" not in benchmark_job
     assert "python -m pip install -e ." in benchmark_job
     assert "python -m pip install -e benchmarks/terminal_bench" in benchmark_job
@@ -94,7 +99,7 @@ def test_release_smoke_path_filter_and_packaged_capability_guard() -> None:
     remote_smoke_text = remote_smoke.read_text(encoding="utf-8")
 
     assert '- "scripts/ci/**"' in workflow_text
-    assert "--sidecar \"$sidecar\"" in workflow_text
+    assert '--sidecar "$sidecar"' in workflow_text
     assert "PYTHONPATH= .openevo-remote-wheel-smoke/bin/python" in workflow_text
     assert "sidecar_smoke.smoke_sidecar" in remote_smoke_text
     assert "TestClient" not in remote_smoke_text

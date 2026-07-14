@@ -69,7 +69,6 @@ from openevo.deployment.planner import build_sidecar_science_plan
 
 SIDECAR_MUTATION_TOKEN_HEADER = "X-OpenEvo-Sidecar-Token"
 SidecarTransportKind = Literal["dry-run", "ssh"]
-REMOTE_CORE_BACKEND_PORT = 8765
 NATIVE_SIDECAR_PROTOCOL = "openevo-native-sidecar-v1"
 
 
@@ -625,45 +624,6 @@ def create_sidecar_app(
         if response.registry_digest != capabilities.registry_digest:
             raise _invalid_remote_project_validation_error()
 
-    def attach_session_backend_facade(active_session: OpenEvoSidecarSession) -> None:
-        if backend_client_factory is not None:
-            return
-        try:
-            transport = active_session.transport_factory(active_session.profile)
-            open_tunnel = getattr(transport, "open_tunnel", None)
-            if open_tunnel is None:
-                return
-            tunnel = open_tunnel(
-                remote_port=REMOTE_CORE_BACKEND_PORT,
-                remote_host="127.0.0.1",
-            )
-            base_url = getattr(tunnel, "base_url", None)
-            if not isinstance(base_url, str) or not base_url.strip():
-                _close_backend_tunnel(tunnel)
-                raise RuntimeError("SSH tunnel did not expose a backend base URL.")
-            client = BackendClient(BackendConnection(base_url.rstrip("/")))
-            try:
-                client.health()
-            except Exception:
-                client.close()
-                _close_backend_tunnel(tunnel)
-                raise
-            _replace_session_backend(active_session, client=client, tunnel=tunnel)
-        except Exception as exc:
-            raise DesktopBackendError(
-                503,
-                {
-                    "code": "backend_tunnel_failed",
-                    "message": ("Desktop could not open a tunnel to the remote OpenEvo backend."),
-                    "severity": "blocking",
-                    "category": "service",
-                    "retryable": True,
-                    "repair_action": "openevo_can_retry",
-                    "details": {"error_type": type(exc).__name__},
-                    "logs_ref": "services/openevo_backend",
-                },
-            ) from exc
-
     @app.get(
         "/health",
         response_model=SidecarHealth,
@@ -1164,30 +1124,17 @@ def create_sidecar_app(
                 active_session.latest_run = None
                 active_session.status = _status_services_running(active_session.status)
             report = _run_services(active_session)
-            attach_error: DesktopBackendError | None = None
-            if report.ready:
-                try:
-                    attach_session_backend_facade(active_session)
-                except DesktopBackendError as exc:
-                    attach_error = exc
             with active_session.status_lock:
                 active_session.last_services_report = report
                 active_session.status = _status_after_services(
                     active_session.status,
                     report,
                 )
-                if attach_error is not None:
-                    active_session.status = _status_after_backend_tunnel_failure(
-                        active_session.status,
-                        attach_error,
-                    )
                 response_status = _status_with_mutation_token(
                     active_session.status,
                     sidecar_token,
                     transport_kind=transport_kind,
                 )
-            if attach_error is not None:
-                raise attach_error
         finally:
             active_session.services_lock.release()
         return OpenEvoDesktopServicesResponse(
@@ -1769,20 +1716,6 @@ def _is_valid_openevo_wheel(path: Path, *, expected_version: str) -> bool:
     except (BadZipFile, KeyError, UnicodeDecodeError, OSError):
         return False
     return metadata.get("Name") == "openevo" and metadata.get("Version") == expected_version
-
-
-def _replace_session_backend(
-    session: OpenEvoSidecarSession,
-    *,
-    client: BackendClient,
-    tunnel: Any,
-) -> None:
-    with session.backend_lock:
-        old_client = session.backend_client
-        old_tunnel = session.backend_tunnel
-        session.backend_client = client
-        session.backend_tunnel = tunnel
-    _close_backend_resources(old_client, old_tunnel)
 
 
 def _close_session_backend(session: OpenEvoSidecarSession) -> None:
@@ -2461,31 +2394,6 @@ def _status_after_services(
             ),
         }
     )
-
-
-def _status_after_backend_tunnel_failure(
-    status: OpenEvoDesktopShellStatus,
-    error: DesktopBackendError,
-) -> OpenEvoDesktopShellStatus:
-    detail = str(error.error.get("message") or "Backend tunnel failed.")
-    return status.model_copy(
-        update={
-            "services": tuple(
-                _service_after_backend_tunnel_failure(service, detail=detail)
-                for service in status.services
-            ),
-        }
-    )
-
-
-def _service_after_backend_tunnel_failure(
-    service: DesktopServiceStatus,
-    *,
-    detail: str,
-) -> DesktopServiceStatus:
-    if service.id != "openevo-backend":
-        return service
-    return service.model_copy(update={"state": "blocked", "detail": detail})
 
 
 def _status_services_running(

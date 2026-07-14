@@ -16,9 +16,11 @@ transport layers. The goal is to let a local Desktop app prepare a remote GPU
 server for a Science run, return a structured readiness report, and expose data
 models that the UI can render while later service supervisors are built.
 
-Bootstrap itself prepares run state and dependencies. The Desktop service
-lifecycle endpoint starts the OpenEvo backend, gateway, rollout server,
-evolution worker, and optional vLLM server after bootstrap readiness. No current
+Bootstrap itself prepares run state and dependencies. The historical Desktop
+service lifecycle plan now excludes Core: host-global Core startup and attach
+are owned only by `openevo.deployment.core_control`. The remaining legacy plan
+can still start gateway, rollout, Evolution backend/worker, and optional vLLM
+services where older development flows require them. No current
 Desktop path starts a Docker Compose stack.
 
 ## Input Boundary
@@ -50,6 +52,12 @@ alias at config boundaries and normalizes to `self-deployed`.
 No bootstrap path directly calls model APIs.
 
 ## Bootstrap Plan
+
+This section describes the older per-run science bootstrap scaffold. It does
+not own the formal Core Control daemon. Release integration must use the
+host-global service contract in `core-control-host-service.md`; after attach it
+must not use this scaffold to launch Core, science runs, Gateway, workers, or
+model serving over SSH.
 
 `RemoteBootstrapPlan` is a strict, frozen Pydantic model. It records:
 
@@ -83,7 +91,7 @@ The current builder emits idempotent remote steps:
 | `ensure_state_root` | Creates the per-run state directory. |
 | `write_experiment_snapshot` | Writes `<state_root>/experiment.json`. |
 | `write_bootstrap_manifest` | Writes `<state_root>/bootstrap.json`. |
-| `ensure_openevo_cli` | Ensures the remote OpenEvo Core package and `openevo-backend` console script exactly match the local packaged version. Desktop uploads the selected `openevo-<version>-*.whl` together with `framework-lock.json`, whose version, sibling wheel basename, and SHA-256 bind evolution startup to those exact bytes. Bootstrap installs that wheel with user-site `pip --force-reinstall` and then verifies package metadata plus `openevo-backend --version` and `openevo-backend --help`. If no bundled wheel is available, the step passes only when the remote package and backend launcher already report the exact expected version, but release evolution startup still requires a valid external lock. |
+| `ensure_openevo_cli` | Legacy run-scoped maintainer compatibility only. Its user-site package check is not the release Core host-service installer and must not be used to replace an active daemon. The Core Control product path uploads the exact wheel and sibling `framework-lock.json`, creates a fresh isolated generation under `~/.openevo/core/releases/`, verifies that generation's complete lock-declared Core distribution inventory, and only then enters controlled daemon attach/replacement. |
 | `check_codex_cli` | Subscription mode only; verifies `codex --version`. |
 | `check_codex_subscription` | Subscription mode only; verifies `~/.codex/auth.json`. |
 | `docker_pull_runtime` | For custom images, pulls the image declared by the compiled experiment. For managed OpenEvo Science images, writes a managed runtime Dockerfile under `<state_root>/runtime-images/` and runs `docker pull <image> || docker build ... -t <image> ...`. |
@@ -252,7 +260,7 @@ exact match is idempotent. A missing or changed identity stops the old managed P
 before starting a replacement; if the old PID cannot be stopped, startup fails
 instead of running two service generations.
 An unreadable framework lock also fails closed and never reuses the live daemon.
-This binds gateway, rollout, vLLM, Core backend, Evolution backend, and Evolution
+This binds gateway, rollout, vLLM, Evolution backend, and Evolution
 worker processes to the release wheel/lock and their startup command without
 adding a separate supervisor.
 
@@ -272,11 +280,13 @@ If log tailing itself fails due to a transport exception, the logs endpoint
 still returns a `RemoteServiceLog` with sanitized diagnostic content instead of
 surfacing an unstructured server error.
 
-This facade is still command-based. It does not add systemd units, persistent
-restart policies, cross-session process ownership tracking, or a new daemon
-supervisor. The identity file binds intended argv/release/environment, but a PID
-file alone does not protect against OS PID reuse; stronger process ownership is
-still a B2 lifecycle requirement.
+This legacy per-run service facade remains command-based and its PID files do
+not protect its Gateway, rollout, worker, or model-serving processes against PID
+reuse. It is not the release Core launcher. The formal host-global Core Control
+service separately uses pidfd plus boot-ID/start-time identity, an exclusive
+lifecycle lock, pending-start recovery, and authenticated readiness as defined
+in `core-control-host-service.md`. That does not upgrade or attest the other
+legacy service processes.
 
 ## Validation
 
@@ -310,9 +320,8 @@ This slice intentionally does not implement:
 - Docker, NVIDIA driver, CUDA, or system package installation;
 - sudo, systemd, or daemon configuration;
 - Docker daemon proxy or registry mirror repair;
-- full Python dependency repair beyond the exact bundled user-site `openevo`
-  wheel, `openevo-backend` launcher, and `huggingface_hub` installs attempted
-  by bootstrap;
+- migration of legacy run-scoped user-site package repair and the
+  `huggingface_hub` helper into the verified Core host-service generation;
 - Docker Compose stack startup;
 - production vLLM tuning, restart policy, or dynamic adapter loading;
 - physical LoRA merge or request-level adapter lifecycle changes;

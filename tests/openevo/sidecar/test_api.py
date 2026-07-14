@@ -31,7 +31,7 @@ from desktop.sidecar import (
     create_sidecar_app_for_project,
     default_desktop_shell_status,
 )
-from desktop.sidecar.backend_client import BackendConnection
+from desktop.sidecar.backend_client import BackendClient, BackendConnection
 from openevo.projects.science import ScienceProjectConfig
 from desktop.sidecar import RemoteProfileConfig
 from openevo.backend.api import create_backend_app
@@ -1231,7 +1231,6 @@ def test_services_endpoint_starts_after_bootstrap_and_refreshes_status() -> None
     assert payload["services"]["ready"] is True
     assert [step["id"] for step in payload["report"]["steps"]] == [
         "write_topology",
-        "openevo_backend",
         "evolution_backend",
         "rollout",
         "gateway",
@@ -1254,7 +1253,7 @@ def test_services_endpoint_starts_after_bootstrap_and_refreshes_status() -> None
     }
 
 
-def test_services_endpoint_attaches_backend_facade_through_remote_tunnel() -> None:
+def test_legacy_services_endpoint_does_not_open_a_core_tunnel() -> None:
     project = ScienceProjectConfig.model_validate(_science_project_payload())
     profile = _remote_profile()
     with _BackendFacadeTestServer() as backend:
@@ -1279,26 +1278,17 @@ def test_services_endpoint_attaches_backend_facade_through_remote_tunnel() -> No
                 headers=headers,
             )
 
-        assert transport.tunnel_requests == [("127.0.0.1", 8765)]
-        assert transport.tunnel is not None
-        assert transport.tunnel.closed is True
+        assert transport.tunnel_requests == []
+        assert transport.tunnel is None
 
     assert before_services.status_code == 409
     assert before_services.json()["code"] == "backend_tunnel_not_configured"
     assert services.status_code == 200
     assert services.json()["services"]["ready"] is True
-    assert health.status_code == 200
-    assert health.json() == {"status": "ok"}
-    assert timeline.status_code == 200
-    assert timeline.json() == [
-        {
-            "id": "run-1-created",
-            "phase": "created",
-            "title": "Run created",
-            "message": "codex run is queued.",
-            "artifact_ids": ["artifact-1"],
-        }
-    ]
+    assert health.status_code == 409
+    assert health.json()["code"] == "backend_tunnel_not_configured"
+    assert timeline.status_code == 409
+    assert timeline.json()["code"] == "backend_tunnel_not_configured"
 
 
 def test_backend_facade_reads_actual_sidecar_run_state_from_remote_backend(
@@ -1325,6 +1315,9 @@ def test_backend_facade_reads_actual_sidecar_run_state_from_remote_backend(
                 profile,
                 transport_factory=lambda _profile: transport,
                 transport_kind="ssh",
+                backend_client_factory=lambda: BackendClient(
+                    BackendConnection(backend.base_url)
+                ),
             )
         ) as client:
             token = _sidecar_token(client)
@@ -1365,7 +1358,7 @@ def test_backend_facade_reads_actual_sidecar_run_state_from_remote_backend(
     assert diff.json()["after"].startswith("# Learned Memory")
 
 
-def test_services_endpoint_records_blocked_status_when_backend_tunnel_fails() -> None:
+def test_services_endpoint_ignores_removed_legacy_backend_tunnel() -> None:
     project = ScienceProjectConfig.model_validate(_science_project_payload())
     profile = _remote_profile()
     transport = _FailingBackendTunnelTransport()
@@ -1385,13 +1378,11 @@ def test_services_endpoint_records_blocked_status_when_backend_tunnel_fails() ->
     services = client.post("/openevo-api/desktop/services", headers=headers)
     shell = client.get("/openevo-api/desktop/shell")
 
-    assert services.status_code == 503
-    assert services.json()["code"] == "backend_tunnel_failed"
+    assert services.status_code == 200
+    assert transport.tunnel_requests == []
     service_rows = {item["id"]: item for item in shell.json()["services"]}
-    assert service_rows["openevo-backend"]["state"] == "blocked"
-    assert service_rows["openevo-backend"]["detail"] == (
-        "Desktop could not open a tunnel to the remote OpenEvo backend."
-    )
+    assert service_rows["openevo-backend"]["state"] == "ready"
+    assert service_rows["openevo-backend"]["detail"] == "Remote runtime services are ready"
 
 
 def test_services_endpoint_preserves_failure_status() -> None:
@@ -1490,7 +1481,6 @@ def test_services_status_and_health_endpoints_inspect_remote_services() -> None:
     profile = _remote_profile()
     transport = _ApiLifecycleTransport(
         pid_states={
-            "openevo_backend": {"pid": 119, "alive": True},
             "evolution_backend": {"pid": 120, "alive": True},
             "rollout": {"pid": 121, "alive": True},
             "gateway": {"pid": 122, "alive": True},
@@ -3271,7 +3261,6 @@ def _wait_latest_run_state(
 
 def _ready_service_pid_states() -> dict[str, dict[str, object]]:
     return {
-        "openevo_backend": {"pid": 119, "alive": True},
         "evolution_backend": {"pid": 120, "alive": True},
         "rollout": {"pid": 121, "alive": True},
         "gateway": {"pid": 122, "alive": True},
@@ -3409,7 +3398,6 @@ class _BackendTunnel:
         if port is None:
             raise AssertionError("test backend URL must include a port")
         self.local_port = port
-        self.remote_port = 8765
         self.base_url = base_url
         self.closed = False
 
@@ -3697,7 +3685,6 @@ class _ApiLifecycleTransport(_ApiDryRunTransport):
 
 def _service_id_from_command(command: str) -> str | None:
     url_services = {
-        "127.0.0.1:8765": "openevo_backend",
         "127.0.0.1:8200": "evolution_backend",
         "127.0.0.1:8080": "rollout",
         "127.0.0.1:8100": "gateway",
@@ -3707,7 +3694,6 @@ def _service_id_from_command(command: str) -> str | None:
         if url_fragment in command:
             return service_id
     for service_id in (
-        "openevo_backend",
         "evolution_backend",
         "evolution_worker",
         "gateway",

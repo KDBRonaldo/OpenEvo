@@ -11,6 +11,18 @@ from openevo.deployment.bootstrap import (
     ensure_remote_openevo_cli_step,
     execute_remote_bootstrap_plan,
 )
+from openevo.deployment.core_control import (
+    CoreControlBootstrapError,
+    CoreControlBootstrapErrorCode,
+    CoreControlBootstrapPlan,
+    CoreBootstrapTransport,
+    RemoteCoreControlAttachment,
+    VerifiedCoreControlTunnel,
+    build_core_control_bootstrap_plan,
+    execute_core_control_bootstrap,
+    open_core_control_tunnel,
+    parse_core_control_attachment,
+)
 from openevo.deployment.executor import (
     RemoteExecutorTransport,
     SidecarExecutionReport,
@@ -75,6 +87,10 @@ from openevo.deployment.workspace import (
 
 __all__ = [
     "PreflightCheck",
+    "CoreControlBootstrapError",
+    "CoreControlBootstrapErrorCode",
+    "CoreControlBootstrapPlan",
+    "CoreBootstrapTransport",
     "ProxySettings",
     "RemoteBootstrapPlan",
     "RemoteBootstrapReport",
@@ -82,9 +98,13 @@ __all__ = [
     "RemoteBootstrapStepExecution",
     "RemoteBootstrapStepKind",
     "RemoteBootstrapStepStatus",
+    "RemoteCoreControlAttachment",
+    "VerifiedCoreControlTunnel",
     "build_remote_bootstrap_plan",
+    "build_core_control_bootstrap_plan",
     "ensure_remote_openevo_cli_step",
     "execute_remote_bootstrap_plan",
+    "execute_core_control_bootstrap",
     "RemoteDaemonLaunchSpec",
     "RemoteExecutorTransport",
     "RemoteLifecycleEvent",
@@ -124,6 +144,8 @@ __all__ = [
     "load_remote_profile_config",
     "managed_service_step_by_id",
     "managed_service_steps",
+    "open_core_control_tunnel",
+    "parse_core_control_attachment",
     "plan_workspace_preparation",
     "preflight_settings_for_project",
     "read_remote_service_logs",

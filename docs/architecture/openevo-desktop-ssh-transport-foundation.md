@@ -183,6 +183,55 @@ concurrent recovery paths cannot unregister or close the lease twice. Until one
 path proves exit, revoke and rotation remain blocked by the shared trust lease
 instead of leaving an unmanaged child behind.
 
+Authenticated Core Control traffic uses parent-created connection endpoints
+rather than the general developer TCP forward or an OpenSSH-created streamlocal
+pathname. For each HTTP connection the Desktop process creates an anonymous
+`AF_UNIX`/`SOCK_STREAM` socketpair and validates the declared and kernel socket
+type, effective UID, empty local/peer names, and the initial identity of both
+held FDs. It revalidates both identities after child creation and the parent
+identity again before returning the HTTP endpoint. It retains the HTTP side and
+transfers only the peer FD through the exact `pass_fds` set to a dedicated
+`ssh -W 127.0.0.1:<remote-port>` child as stdin/stdout. The child uses the same
+pinned known-host lease and explicit auth argv as command execution.
+
+Anonymous socketpair endpoints have no filesystem pathname contract. In
+particular, the transport does not call `fchmod` and does not treat permission
+bits or link count as an authority boundary; Darwin may reject `fchmod` on these
+FDs with `EINVAL`, and those filesystem fields do not establish socket
+ownership. A changed FD identity, socket type, owner, or anonymous address fails
+the connection and triggers bounded child cleanup. An exception from the child
+`poll()` authority probe is also a connection failure; it can never be treated
+as proof that the child is running.
+
+There is no `-L` listener, `-S` control socket, control master, filesystem
+pathname, hard-link pre-pin window, or temporary TCP-port reservation in this
+Core path. Every forwarding connection therefore has one explicit SSH child
+authority that is checked before returning the local socket and again after
+bearer-authenticated response reads. A nonzero child exit is a service failure;
+an SSH operation timeout remains a retryable deadline failure across the Core
+bootstrap layer.
+
+Construction transfers the trust lease to the tunnel owner before registration
+or child creation can fail. `BaseException`, including cancellation, closes
+untransferred socket FDs and is re-raised unchanged. Close performs bounded
+terminate/wait/kill for every owned child. If exit cannot be proven, a
+process-local quarantine retains the child and trust lease for retry, so trust
+rotation cannot leave an unowned forwarding authority. Any connection setup or
+authority failure permanently marks that Core endpoint closing and registers
+quarantine ownership while still holding its state lock. Only then are the two
+socket endpoints closed independently and bounded child cleanup attempted, so an
+`EBADF` or another close failure cannot hide the original typed failure or skip
+process cleanup. A concurrent open observes the poison before cleanup completes
+and cannot create another child generation. The endpoint finalizes immediately
+when every owned child exit is confirmed; otherwise quarantine retains it for
+later retry. A child returned by the connection starter is first held in the
+endpoint's single pending-child ownership slot before generation advancement or
+insertion into the registered-child map. Cancellation and registry insertion
+failure therefore poison the endpoint while retaining that exact child. Close
+deduplicates pending and registered references by object identity, and neither
+unregisters the closer nor releases the trust lease until bounded cleanup proves
+that every such child exited.
+
 `SshRemoteExecutorTransport` requires a `TrustedKnownHostsBinding` and revalidates
 it before building every command. A release call without a binding fails closed.
 This slice deliberately does not add a UI, native host route, contract DTO, or

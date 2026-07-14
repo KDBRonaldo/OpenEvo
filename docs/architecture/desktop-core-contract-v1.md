@@ -26,6 +26,17 @@ The sidecar owns local profiles and drafts, pre-Core SSH/bootstrap operations,
 the active tunnel, version negotiation, response validation, error
 normalization, and event aggregation. Once Core reports compatible readiness,
 the sidecar must not launch science runs or Core child services through SSH.
+The host-service layer exports a secret-bearing attachment and a verified tunnel
+handle only after bearer-authenticated `/version` and `/v1/status` bind the
+tunnel to the attachment generation, release identity, registry identity, and
+status proof. The Desktop bridge/release provider owns retaining that handle and
+routing later `/v1/*` calls; host-service code does not synthesize provider
+handlers, and release startup fails closed until that integration is wired.
+For the macOS Desktop path, the local endpoint is an owner-only OpenSSH
+streamlocal socket rather than a released-and-reacquired TCP port. The handle's
+HTTP connector revalidates its pinned socket inode guards, SSH process, and
+control-master authority for each connection before bearer-bearing bytes are
+sent.
 
 Core owns durable projects, immutable task/workspace snapshots, capabilities,
 validation, services, runs and attempts, transcript capture, datasets,

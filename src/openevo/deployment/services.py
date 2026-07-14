@@ -264,40 +264,6 @@ def build_remote_services_plan(bootstrap_plan: RemoteBootstrapPlan) -> RemoteSer
     steps.extend(
         [
             RemoteServiceStep(
-                id="openevo_backend",
-                label="OpenEvo core backend",
-                command=_daemon_command(
-                    "openevo_backend",
-                    [
-                        "openevo-backend",
-                        "serve",
-                        "--host",
-                        "127.0.0.1",
-                        "--port",
-                        "8765",
-                        "--state-root",
-                        state_root,
-                        "--framework-lock",
-                        framework_lock_path,
-                    ],
-                    log_dir=log_dir,
-                    pid_dir=pid_dir,
-                    framework_lock_path=framework_lock_path,
-                    identity_env=bootstrap_plan.proxy_env,
-                ),
-                health_command=_http_health_command("http://127.0.0.1:8765/health"),
-                env=dict(bootstrap_plan.proxy_env),
-                timeout_seconds=60.0,
-                health_timeout_seconds=35.0,
-                manifest=_daemon_manifest(
-                    "openevo_backend",
-                    log_dir=log_dir,
-                    pid_dir=pid_dir,
-                    framework_lock_path=framework_lock_path,
-                    port=8765,
-                ),
-            ),
-            RemoteServiceStep(
                 id="evolution_backend",
                 label="Evolution backend",
                 command=_daemon_command(

@@ -174,14 +174,11 @@ sidecar endpoints:
   Face model snapshot.
 - `POST /openevo-api/desktop/services` writes a deterministic topology file
   under the bootstrap state root, then starts and health-checks the remote
-  OpenEvo Core backend (`openevo_backend` on port `8765`), evolution backend,
-  rollout, gateway, evolution worker, and managed vLLM when the execution mode
-  requires local inference. When the service report is ready, the sidecar opens
-  a session-scoped SSH local-forward to the remote Core backend so the Desktop
-  facade can serve timeline, artifact, and service-log reads.
-  `openevo_backend` receives the same bootstrap `state_root`, so its typed
-  facade reads canonical `<state_root>/runs/<run-id>/summary.json` files and
-  `<state_root>/evolution/` artifacts produced by the Core run command.
+  evolution backend, rollout, gateway, evolution worker, and managed vLLM when
+  the execution mode requires local inference. It no longer starts or tunnels a
+  per-run `openevo_backend`; host-global Core attach and the authenticated
+  tunnel are owned by `openevo.deployment.core_control` and the release-provider
+  integration described by the current Desktop/Core contract.
 - `POST /openevo-api/desktop/run` launches `openevo-backend run` only after
   workspace, bootstrap, and services are all ready.
 - `GET /openevo-api/backend/runs/{run_id}/timeline` and

@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import ipaddress
 import logging
+import os
 import re
 import secrets
 import shlex
 import socket
+import stat
 import subprocess
 import threading
 import time
@@ -13,7 +15,9 @@ from collections.abc import Callable
 from contextlib import AbstractContextManager
 from enum import Enum
 from pathlib import Path
-from typing import Protocol
+from typing import NoReturn, Protocol
+
+from pydantic import SecretStr
 
 from openevo.deployment.host_keys import TrustedKnownHostsBinding
 from openevo.deployment.preflight import RemoteCommandResult
@@ -22,6 +26,7 @@ from openevo.deployment.profile import RemoteProfileConfig
 CompletedRunner = Callable[[list[str], float], subprocess.CompletedProcess[str]]
 PortAllocator = Callable[[], int]
 TunnelStarter = Callable[[list[str]], "TunnelProcess"]
+CoreConnectionStarter = Callable[[list[str], int], "TunnelProcess"]
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +35,8 @@ _TUNNEL_KILL_GRACE_SECONDS = 1.0
 _TUNNEL_MONITOR_INTERVAL_SECONDS = 0.05
 _ORPHANED_TUNNEL_GUARD = threading.Lock()
 _ORPHANED_TUNNELS: dict[int, "SshTunnel"] = {}
+_ORPHANED_CORE_TUNNELS: dict[int, "_CoreTunnelEndpoint"] = {}
+_ORPHANED_TRUST_LEASES: dict[int, AbstractContextManager[Path]] = {}
 
 
 class SshTransportErrorCode(str, Enum):
@@ -69,6 +76,259 @@ class TunnelProcess(Protocol):
     def wait(self, timeout: float | None = None) -> int: ...
 
 
+class _CoreTunnelEndpoint:
+    def __init__(
+        self,
+        *,
+        connection_starter: CoreConnectionStarter,
+        connection_argv: list[str],
+        trust_lease: AbstractContextManager[Path],
+        trusted_host: TrustedKnownHostsBinding,
+    ) -> None:
+        self._connection_starter = connection_starter
+        self._connection_argv = connection_argv
+        self._trust_lease: AbstractContextManager[Path] | None = trust_lease
+        self._guard = threading.RLock()
+        self._close_guard = threading.Lock()
+        self._children: dict[int, TunnelProcess] = {}
+        self._pending_child: TunnelProcess | None = None
+        self._next_generation = 0
+        self._close_requested = False
+        self._finalized = threading.Event()
+        self._orphaned = False
+        self._unregister: Callable[[], None] | None = None
+        try:
+            self._unregister = trusted_host._register_tunnel(self.close)
+        except BaseException:
+            try:
+                self._finalize()
+            except BaseException:
+                pass
+            raise
+
+    def verify_authority(self, *, timeout_seconds: float = 1.0) -> None:
+        del timeout_seconds
+        failure: BaseException | None = None
+        with self._guard:
+            if self._close_requested or self._finalized.is_set():
+                raise SshTransportError(SshTransportErrorCode.CONNECTION_FAILED)
+            try:
+                self._verify_locked()
+                return
+            except BaseException as exc:
+                failure = exc
+                self._poison_locked()
+        if failure is None:
+            raise SshTransportError(SshTransportErrorCode.CONNECTION_FAILED)
+        self._finish_failed_operation(failure)
+
+    def open_verified_socket(self, *, timeout_seconds: float) -> socket.socket:
+        if not 0 < timeout_seconds <= 60:
+            raise SshTransportError(SshTransportErrorCode.INVALID_REQUEST)
+        local_stream: socket.socket | None = None
+        child_stream: socket.socket | None = None
+        process: TunnelProcess | None = None
+        failure: BaseException | None = None
+        with self._guard:
+            if self._close_requested or self._finalized.is_set():
+                raise SshTransportError(SshTransportErrorCode.CONNECTION_FAILED)
+            try:
+                self._verify_locked()
+                local_stream, child_stream = socket.socketpair(
+                    socket.AF_UNIX,
+                    socket.SOCK_STREAM,
+                )
+                local_identity = _require_parent_owned_stream(local_stream)
+                child_identity = _require_parent_owned_stream(child_stream)
+                local_stream.settimeout(timeout_seconds)
+                process = self._connection_starter(
+                    list(self._connection_argv),
+                    child_stream.fileno(),
+                )
+                self._pending_child = process
+                generation = self._next_generation
+                self._next_generation += 1
+                self._children[generation] = process
+                _require_parent_owned_stream(
+                    local_stream,
+                    expected_identity=local_identity,
+                )
+                _require_parent_owned_stream(
+                    child_stream,
+                    expected_identity=child_identity,
+                )
+                child_stream.close()
+                if not _tunnel_process_is_running(process):
+                    raise SshTransportError(SshTransportErrorCode.CONNECTION_FAILED)
+                _require_parent_owned_stream(
+                    local_stream,
+                    expected_identity=local_identity,
+                )
+                self._pending_child = None
+                return local_stream
+            except BaseException as exc:
+                failure = exc
+                self._poison_locked(pending_child=process)
+        if failure is None:
+            raise SshTransportError(SshTransportErrorCode.CONNECTION_FAILED)
+        self._finish_failed_operation(
+            failure,
+            streams=(local_stream, child_stream),
+        )
+
+    def _poison_locked(self, *, pending_child: TunnelProcess | None = None) -> None:
+        if pending_child is not None:
+            self._pending_child = pending_child
+        self._close_requested = True
+        self._retain_orphan()
+
+    def _finish_failed_operation(
+        self,
+        failure: BaseException,
+        *,
+        streams: tuple[socket.socket | None, ...] = (),
+    ) -> NoReturn:
+        for stream in streams:
+            if stream is None:
+                continue
+            try:
+                stream.close()
+            except BaseException:
+                _log_transport_failure(SshTransportErrorCode.CONNECTION_FAILED)
+        try:
+            self.close()
+        except BaseException:
+            _log_transport_failure(SshTransportErrorCode.CONNECTION_FAILED)
+        if isinstance(failure, Exception):
+            _log_transport_failure(SshTransportErrorCode.CONNECTION_FAILED)
+            raise SshTransportError(SshTransportErrorCode.CONNECTION_FAILED) from None
+        raise failure
+
+    @property
+    def closed(self) -> bool:
+        return self._finalized.is_set()
+
+    def close(self) -> None:
+        with self._close_guard:
+            if self._finalized.is_set():
+                return
+            failures: list[BaseException] = []
+            with self._guard:
+                self._close_requested = True
+                children = list(self._children.values())
+                pending_child = self._pending_child
+                if pending_child is not None and not any(
+                    process is pending_child for process in children
+                ):
+                    children.append(pending_child)
+            all_exited = True
+            for process in children:
+                exited, failure = _terminate_tunnel_process(process)
+                all_exited = all_exited and exited
+                if failure is not None:
+                    failures.append(failure)
+            if all_exited:
+                self._finalize()
+            else:
+                self._retain_orphan()
+            if failures:
+                raise failures[0]
+
+    def _verify_locked(self) -> None:
+        if self._close_requested or self._finalized.is_set():
+            raise SshTransportError(SshTransportErrorCode.CONNECTION_FAILED)
+        completed: list[int] = []
+        for generation, process in self._children.items():
+            try:
+                return_code = process.poll()
+            except BaseException:
+                raise SshTransportError(SshTransportErrorCode.CONNECTION_FAILED) from None
+            if return_code is None:
+                continue
+            if return_code != 0:
+                raise SshTransportError(SshTransportErrorCode.CONNECTION_FAILED)
+            completed.append(generation)
+        for generation in completed:
+            self._children.pop(generation, None)
+
+    def _retain_orphan(self) -> None:
+        with self._guard:
+            if self._finalized.is_set() or self._orphaned:
+                return
+            self._orphaned = True
+        with _ORPHANED_TUNNEL_GUARD:
+            _ORPHANED_CORE_TUNNELS[id(self)] = self
+
+    def _finalize(self) -> None:
+        with self._guard:
+            if self._finalized.is_set():
+                return
+            unregister = self._unregister
+            trust_lease = self._trust_lease
+        failure: BaseException | None = None
+        unregister_complete = unregister is None
+        lease_complete = trust_lease is None
+        if unregister is not None:
+            try:
+                unregister()
+                unregister_complete = True
+            except BaseException as exc:
+                failure = exc
+        if trust_lease is not None:
+            try:
+                trust_lease.__exit__(None, None, None)
+                lease_complete = True
+            except BaseException as exc:
+                if failure is None:
+                    failure = exc
+        with self._guard:
+            if unregister_complete:
+                self._unregister = None
+            if lease_complete:
+                self._trust_lease = None
+            finalized = self._unregister is None and self._trust_lease is None
+            if finalized:
+                self._children.clear()
+                self._pending_child = None
+                self._orphaned = False
+                self._finalized.set()
+        if finalized:
+            with _ORPHANED_TUNNEL_GUARD:
+                _ORPHANED_CORE_TUNNELS.pop(id(self), None)
+        else:
+            self._retain_orphan()
+        if failure is not None:
+            raise failure
+
+
+class SshCoreTunnel(AbstractContextManager["SshCoreTunnel"]):
+    """Parent-owned per-connection forwarding for authenticated Core traffic."""
+
+    base_url = "http://openevo-core.local"
+
+    def __init__(self, endpoint: _CoreTunnelEndpoint) -> None:
+        self._endpoint = endpoint
+
+    @property
+    def closed(self) -> bool:
+        return self._endpoint.closed
+
+    def verify_authority(self) -> None:
+        self._endpoint.verify_authority()
+
+    def open_verified_socket(self, *, timeout_seconds: float) -> socket.socket:
+        return self._endpoint.open_verified_socket(timeout_seconds=timeout_seconds)
+
+    def close(self) -> None:
+        self._endpoint.close()
+
+    def __enter__(self) -> SshCoreTunnel:
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        self.close()
+
+
 _ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _REMOTE_HOST_RE = re.compile(r"^[A-Za-z0-9._%-]+$")
 _REMOTE_PATH_RE = re.compile(r"^/[A-Za-z0-9._/@%+=,-]*$")
@@ -88,6 +348,7 @@ class SshTunnel(AbstractContextManager["SshTunnel"]):
         process: TunnelProcess,
         trust_lease: AbstractContextManager[Path],
         trusted_host: TrustedKnownHostsBinding,
+        on_finalize: Callable[[], None] | None = None,
     ) -> None:
         self.local_port = local_port
         self.remote_port = remote_port
@@ -102,22 +363,20 @@ class SshTunnel(AbstractContextManager["SshTunnel"]):
         self._orphaned = False
         self._unregister: Callable[[], None] | None = None
         self._monitor: threading.Thread | None = None
-        construction_failed = False
+        self._on_finalize = on_finalize
         try:
-            self._unregister = trusted_host._register_tunnel(
-                self._request_registered_close
-            )
+            self._unregister = trusted_host._register_tunnel(self._request_registered_close)
             self._monitor = threading.Thread(
                 target=self._monitor_exit,
                 name="openevo-ssh-tunnel-monitor",
                 daemon=True,
             )
             self._monitor.start()
-        except Exception:
-            construction_failed = True
-        if construction_failed:
+        except BaseException as exc:
             self._rollback_failed_construction()
-            raise SshTransportError(SshTransportErrorCode.START_FAILED)
+            if isinstance(exc, Exception):
+                raise SshTransportError(SshTransportErrorCode.START_FAILED) from None
+            raise
 
     @property
     def base_url(self) -> str:
@@ -143,11 +402,24 @@ class SshTunnel(AbstractContextManager["SshTunnel"]):
             if self._closed.is_set() or (self._close_requested and not retry):
                 return
             self._close_requested = True
-        if _tunnel_process_is_running(self.process):
+        probe_failure: BaseException | None = None
+        try:
+            running = _tunnel_process_is_running(self.process)
+        except BaseException as exc:
+            running = True
+            probe_failure = exc
+        if running:
             try:
                 self.process.terminate()
-            except Exception:
+            except BaseException as exc:
+                self._retain_orphan()
                 _log_transport_failure(SshTransportErrorCode.CONNECTION_FAILED)
+                if not isinstance(exc, Exception):
+                    raise
+        if probe_failure is not None:
+            _log_transport_failure(SshTransportErrorCode.CONNECTION_FAILED)
+            if not isinstance(probe_failure, Exception):
+                raise probe_failure
 
     def _request_registered_close(self) -> None:
         with self._state_guard:
@@ -162,25 +434,17 @@ class SshTunnel(AbstractContextManager["SshTunnel"]):
             self._close_once()
 
     def _close_once(self) -> None:
-        self._request_process_termination(retry=True)
         if self._closed.is_set():
             return
-        if _wait_for_tunnel_process_exit(
-            self.process,
-            timeout_seconds=_TUNNEL_CLOSE_GRACE_SECONDS,
-        ):
+        with self._state_guard:
+            self._close_requested = True
+        exited, failure = _terminate_tunnel_process(self.process)
+        if exited:
             self._finalize()
-            return
-        if _tunnel_process_is_running(self.process):
-            try:
-                self.process.kill()
-            except Exception:
-                _log_transport_failure(SshTransportErrorCode.CONNECTION_FAILED)
-        if _wait_for_tunnel_process_exit(
-            self.process,
-            timeout_seconds=_TUNNEL_KILL_GRACE_SECONDS,
-        ):
-            self._finalize()
+        else:
+            self._retain_orphan()
+        if failure is not None:
+            raise failure
 
     def _monitor_exit(self) -> None:
         while not self._closed.wait(_TUNNEL_MONITOR_INTERVAL_SECONDS):
@@ -193,7 +457,10 @@ class SshTunnel(AbstractContextManager["SshTunnel"]):
                 continue
 
     def _rollback_failed_construction(self) -> None:
-        self.close()
+        try:
+            self.close()
+        except BaseException:
+            pass
         if not self._closed.is_set():
             self._retain_orphan()
 
@@ -216,22 +483,63 @@ class SshTunnel(AbstractContextManager["SshTunnel"]):
 
     def _monitor_orphan_cleanup(self) -> None:
         while not self._closed.wait(_TUNNEL_MONITOR_INTERVAL_SECONDS):
-            self.close()
+            try:
+                self.close()
+            except BaseException:
+                _log_transport_failure(SshTransportErrorCode.CONNECTION_FAILED)
 
     def _finalize(self) -> None:
         with self._state_guard:
             if self._closed.is_set():
                 return
             unregister = self._unregister
-            self._unregister = None
             trust_lease = self._trust_lease
-            self._trust_lease = None
-            self._orphaned = False
-            self._closed.set()
-        _forget_orphaned_tunnel(self)
+            on_finalize = self._on_finalize
+        failure: BaseException | None = None
+        unregister_complete = unregister is None
+        lease_complete = trust_lease is None
+        callback_complete = on_finalize is None
         if unregister is not None:
-            _call_without_error(unregister)
-        _release_trust_lease(trust_lease)
+            try:
+                unregister()
+                unregister_complete = True
+            except BaseException as exc:
+                failure = exc
+        if trust_lease is not None:
+            try:
+                trust_lease.__exit__(None, None, None)
+                lease_complete = True
+            except BaseException as exc:
+                if failure is None:
+                    failure = exc
+        if on_finalize is not None:
+            try:
+                on_finalize()
+                callback_complete = True
+            except BaseException as exc:
+                if failure is None:
+                    failure = exc
+        with self._state_guard:
+            if unregister_complete:
+                self._unregister = None
+            if lease_complete:
+                self._trust_lease = None
+            if callback_complete:
+                self._on_finalize = None
+            finalized = (
+                self._unregister is None
+                and self._trust_lease is None
+                and self._on_finalize is None
+            )
+            if finalized:
+                self._orphaned = False
+                self._closed.set()
+        if finalized:
+            _forget_orphaned_tunnel(self)
+        else:
+            self._retain_orphan()
+        if failure is not None:
+            raise failure
 
 
 class SshRemoteExecutorTransport:
@@ -245,6 +553,7 @@ class SshRemoteExecutorTransport:
         runner: CompletedRunner | None = None,
         tunnel_starter: TunnelStarter | None = None,
         port_allocator: PortAllocator | None = None,
+        core_connection_starter: CoreConnectionStarter | None = None,
     ) -> None:
         invalid_request = False
         try:
@@ -268,6 +577,9 @@ class SshRemoteExecutorTransport:
         self._runner = runner or _run_subprocess
         self._tunnel_starter = tunnel_starter or _start_tunnel_subprocess
         self._port_allocator = port_allocator or _allocate_local_port
+        self._core_connection_starter = (
+            core_connection_starter or _start_core_connection_subprocess
+        )
 
     def run(
         self,
@@ -327,9 +639,7 @@ class SshRemoteExecutorTransport:
         return RemoteCommandResult(
             command=command,
             return_code=(
-                remote_return_code
-                if remote_return_code is not None
-                else int(completed.returncode)
+                remote_return_code if remote_return_code is not None else int(completed.returncode)
             ),
             stdout=completed.stdout or "",
             stderr=stderr,
@@ -378,6 +688,55 @@ class SshRemoteExecutorTransport:
             _log_transport_failure(SshTransportErrorCode.RSYNC_FAILED)
             raise SshTransportError(SshTransportErrorCode.RSYNC_FAILED)
 
+    def run_secret(
+        self,
+        command: str,
+        *,
+        timeout_seconds: float = 30.0,
+    ) -> SecretStr:
+        try:
+            remote_command = _remote_command(command, cwd=None, env=None)
+        except Exception:
+            raise SshTransportError(SshTransportErrorCode.INVALID_REQUEST) from None
+        completion_marker = f"__OPENEVO_REMOTE_COMPLETION_{secrets.token_hex(16)}__="
+        marked_command = _with_completion_marker(remote_command, completion_marker)
+        completed: subprocess.CompletedProcess[str] | None = None
+        phase = "trust"
+        failure_code: SshTransportErrorCode | None = None
+        try:
+            with self._trusted_host.open_for_spawn(self._profile) as known_hosts_file:
+                phase = "process"
+                completed = self._runner(
+                    self._ssh_argv(marked_command, known_hosts_file),
+                    timeout_seconds,
+                )
+                phase = "trust"
+        except subprocess.TimeoutExpired:
+            failure_code = SshTransportErrorCode.TIMEOUT
+        except Exception:
+            failure_code = (
+                SshTransportErrorCode.START_FAILED
+                if phase == "process"
+                else SshTransportErrorCode.HOST_KEY_VERIFICATION_FAILED
+            )
+        if failure_code is not None:
+            _log_transport_failure(failure_code)
+            raise SshTransportError(failure_code)
+        assert completed is not None
+        _stderr, remote_return_code = _extract_remote_completion(
+            completed.stderr or "",
+            completion_marker,
+        )
+        if (
+            remote_return_code is None
+            or completed.returncode == 255
+            or int(completed.returncode) != remote_return_code
+            or remote_return_code != 0
+        ):
+            _log_transport_failure(SshTransportErrorCode.CONNECTION_FAILED)
+            raise SshTransportError(SshTransportErrorCode.CONNECTION_FAILED)
+        return SecretStr(completed.stdout or "")
+
     def open_tunnel(
         self,
         *,
@@ -403,19 +762,21 @@ class SshRemoteExecutorTransport:
             raise SshTransportError(SshTransportErrorCode.INVALID_REQUEST)
         forward_spec = f"{local_host}:{local_port}:{remote_host}:{remote_port}"
         trust_lease = self._trusted_host.open_for_spawn(self._profile)
-        lease_failed = False
         try:
             known_hosts_file = trust_lease.__enter__()
-        except Exception:
-            lease_failed = True
-            known_hosts_file = Path(".")
-        if lease_failed:
-            raise SshTransportError(SshTransportErrorCode.HOST_KEY_VERIFICATION_FAILED)
-        start_failed = False
+        except BaseException as exc:
+            _release_trust_lease(trust_lease)
+            if isinstance(exc, Exception):
+                raise SshTransportError(
+                    SshTransportErrorCode.HOST_KEY_VERIFICATION_FAILED
+                ) from None
+            raise
         try:
             process = self._tunnel_starter(
                 [
                     *self._ssh_base_argv(known_hosts_file),
+                    "-o",
+                    "ExitOnForwardFailure=yes",
                     "-N",
                     "-L",
                     forward_spec,
@@ -423,13 +784,12 @@ class SshRemoteExecutorTransport:
                     self._profile.host,
                 ]
             )
-        except Exception:
-            start_failed = True
-            process = None
-        if start_failed or process is None:
+        except BaseException as exc:
             _release_trust_lease(trust_lease)
-            _log_transport_failure(SshTransportErrorCode.START_FAILED)
-            raise SshTransportError(SshTransportErrorCode.START_FAILED)
+            if isinstance(exc, Exception):
+                _log_transport_failure(SshTransportErrorCode.START_FAILED)
+                raise SshTransportError(SshTransportErrorCode.START_FAILED) from None
+            raise
         tunnel_failed = False
         try:
             tunnel = SshTunnel(
@@ -460,9 +820,72 @@ class SshRemoteExecutorTransport:
             except Exception:
                 ready_failure = SshTransportErrorCode.CONNECTION_FAILED
             if ready_failure is not None:
-                tunnel.close()
+                try:
+                    tunnel.close()
+                except BaseException:
+                    pass
                 _log_transport_failure(ready_failure)
                 raise SshTransportError(ready_failure)
+        return tunnel
+
+    def open_core_tunnel(
+        self,
+        *,
+        remote_port: int,
+        remote_host: str = "127.0.0.1",
+        wait_for_ready: bool = True,
+        timeout_seconds: float = 10.0,
+    ) -> SshCoreTunnel:
+        _retry_orphaned_tunnel_cleanup()
+        try:
+            _validate_port(remote_port, "remote_port")
+            _validate_remote_identity(remote_host, "remote_host", _REMOTE_HOST_RE)
+            if not 0 < timeout_seconds <= 60:
+                raise ValueError("invalid timeout")
+        except Exception:
+            raise SshTransportError(SshTransportErrorCode.INVALID_REQUEST) from None
+
+        trust_lease = self._trusted_host.open_for_spawn(self._profile)
+        try:
+            known_hosts_file = trust_lease.__enter__()
+        except BaseException as exc:
+            _release_trust_lease(trust_lease)
+            if isinstance(exc, Exception):
+                raise SshTransportError(
+                    SshTransportErrorCode.HOST_KEY_VERIFICATION_FAILED
+                ) from None
+            raise
+        connection_argv = [
+            *self._ssh_base_argv(known_hosts_file),
+            "-o",
+            "ExitOnForwardFailure=yes",
+            "-W",
+            f"{remote_host}:{remote_port}",
+            "--",
+            self._profile.host,
+        ]
+        try:
+            endpoint = _CoreTunnelEndpoint(
+                connection_starter=self._core_connection_starter,
+                connection_argv=connection_argv,
+                trust_lease=trust_lease,
+                trusted_host=self._trusted_host,
+            )
+        except BaseException as exc:
+            if isinstance(exc, Exception):
+                _log_transport_failure(SshTransportErrorCode.START_FAILED)
+                raise SshTransportError(SshTransportErrorCode.START_FAILED) from None
+            raise
+        tunnel = SshCoreTunnel(endpoint)
+        if wait_for_ready:
+            try:
+                endpoint.verify_authority(timeout_seconds=timeout_seconds)
+            except BaseException:
+                try:
+                    tunnel.close()
+                except BaseException:
+                    pass
+                raise
         return tunnel
 
     def _ssh_argv(self, remote_command: str, known_hosts_file: Path) -> list[str]:
@@ -525,9 +948,7 @@ class SshRemoteExecutorTransport:
         remote_path: str,
         known_hosts_file: Path,
     ) -> list[str]:
-        ssh_command = " ".join(
-            shlex.quote(part) for part in self._ssh_base_argv(known_hosts_file)
-        )
+        ssh_command = " ".join(shlex.quote(part) for part in self._ssh_base_argv(known_hosts_file))
         return [
             "rsync",
             "-az",
@@ -559,6 +980,91 @@ def _start_tunnel_subprocess(argv: list[str]) -> subprocess.Popen[str]:
     )
 
 
+def _start_core_connection_subprocess(
+    argv: list[str],
+    stream_fd: int,
+) -> subprocess.Popen[str]:
+    return subprocess.Popen(
+        argv,
+        stdin=stream_fd,
+        stdout=stream_fd,
+        stderr=subprocess.DEVNULL,
+        close_fds=True,
+        pass_fds=(stream_fd,),
+        text=False,
+    )
+
+
+def _require_parent_owned_stream(
+    stream: socket.socket,
+    *,
+    expected_identity: tuple[int, int, int, int] | None = None,
+) -> tuple[int, int, int, int]:
+    stream_fd = stream.fileno()
+    metadata = os.fstat(stream_fd)
+    identity = (stream_fd, metadata.st_dev, metadata.st_ino, metadata.st_ctime_ns)
+    if (
+        stream.family != socket.AF_UNIX
+        or stream.type != socket.SOCK_STREAM
+        or stream.getsockopt(socket.SOL_SOCKET, socket.SO_TYPE) != socket.SOCK_STREAM
+        or not stat.S_ISSOCK(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or stream.getsockname() not in ("", b"")
+        or stream.getpeername() not in ("", b"")
+        or (expected_identity is not None and identity != expected_identity)
+    ):
+        raise SshTransportError(SshTransportErrorCode.CONNECTION_FAILED)
+    return identity
+
+
+def _terminate_tunnel_process(
+    process: TunnelProcess,
+) -> tuple[bool, BaseException | None]:
+    failure: BaseException | None = None
+    try:
+        running = _tunnel_process_is_running(process)
+    except BaseException as exc:
+        running = True
+        failure = exc
+    if running:
+        try:
+            process.terminate()
+        except BaseException as exc:
+            if failure is None:
+                failure = exc
+    try:
+        exited = _wait_for_tunnel_process_exit(
+            process,
+            timeout_seconds=_TUNNEL_CLOSE_GRACE_SECONDS,
+        )
+    except BaseException as exc:
+        exited = False
+        if failure is None:
+            failure = exc
+    try:
+        running = _tunnel_process_is_running(process)
+    except BaseException as exc:
+        running = True
+        if failure is None:
+            failure = exc
+    if not exited and running:
+        try:
+            process.kill()
+        except BaseException as exc:
+            if failure is None:
+                failure = exc
+        try:
+            exited = _wait_for_tunnel_process_exit(
+                process,
+                timeout_seconds=_TUNNEL_KILL_GRACE_SECONDS,
+            )
+        except BaseException as exc:
+            exited = False
+            if failure is None:
+                failure = exc
+    return exited, failure
+
+
 def _wait_for_tunnel_process_exit(
     process: TunnelProcess,
     *,
@@ -575,11 +1081,7 @@ def _wait_for_tunnel_process_exit(
 
 
 def _tunnel_process_is_running(process: TunnelProcess) -> bool:
-    try:
-        return process.poll() is None
-    except Exception:
-        _log_transport_failure(SshTransportErrorCode.CONNECTION_FAILED)
-        return True
+    return process.poll() is None
 
 
 def _forget_orphaned_tunnel(tunnel: SshTunnel) -> None:
@@ -590,8 +1092,20 @@ def _forget_orphaned_tunnel(tunnel: SshTunnel) -> None:
 def _retry_orphaned_tunnel_cleanup() -> None:
     with _ORPHANED_TUNNEL_GUARD:
         tunnels = tuple(_ORPHANED_TUNNELS.values())
+        core_tunnels = tuple(_ORPHANED_CORE_TUNNELS.values())
+        trust_leases = tuple(_ORPHANED_TRUST_LEASES.values())
     for tunnel in tunnels:
-        tunnel.close()
+        try:
+            tunnel.close()
+        except Exception:
+            _log_transport_failure(SshTransportErrorCode.CONNECTION_FAILED)
+    for tunnel in core_tunnels:
+        try:
+            tunnel.close()
+        except Exception:
+            _log_transport_failure(SshTransportErrorCode.CONNECTION_FAILED)
+    for trust_lease in trust_leases:
+        _release_trust_lease(trust_lease)
 
 
 def _release_trust_lease(trust_lease: AbstractContextManager[Path] | None) -> None:
@@ -599,17 +1113,13 @@ def _release_trust_lease(trust_lease: AbstractContextManager[Path] | None) -> No
         return
     try:
         trust_lease.__exit__(None, None, None)
-    except Exception:
+    except BaseException:
+        with _ORPHANED_TUNNEL_GUARD:
+            _ORPHANED_TRUST_LEASES[id(trust_lease)] = trust_lease
         _log_transport_failure(SshTransportErrorCode.HOST_KEY_VERIFICATION_FAILED)
-
-
-def _call_without_error(callback: Callable[[], None] | None) -> None:
-    if callback is None:
-        return
-    try:
-        callback()
-    except Exception:
-        _log_transport_failure(SshTransportErrorCode.CONNECTION_FAILED)
+    else:
+        with _ORPHANED_TUNNEL_GUARD:
+            _ORPHANED_TRUST_LEASES.pop(id(trust_lease), None)
 
 
 def _log_transport_failure(
