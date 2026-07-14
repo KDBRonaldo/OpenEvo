@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import ipaddress
+import locale
 import logging
 import os
 import re
+import selectors
 import secrets
 import shlex
 import socket
@@ -46,6 +48,9 @@ logger = logging.getLogger(__name__)
 _TUNNEL_CLOSE_GRACE_SECONDS = 1.0
 _TUNNEL_KILL_GRACE_SECONDS = 1.0
 _TUNNEL_MONITOR_INTERVAL_SECONDS = 0.05
+_MAX_SUBPROCESS_CAPTURE_BYTES = 4 * 1024 * 1024
+_SUBPROCESS_CAPTURE_CHUNK_BYTES = 64 * 1024
+_SUBPROCESS_TERMINATE_GRACE_SECONDS = 1.0
 _ORPHANED_TUNNEL_GUARD = threading.Lock()
 _ORPHANED_TUNNELS: dict[int, "SshTunnel"] = {}
 _ORPHANED_CORE_TUNNELS: dict[int, "_CoreTunnelEndpoint"] = {}
@@ -1157,13 +1162,105 @@ class SshRemoteExecutorTransport:
 
 
 def _run_subprocess(argv: list[str], timeout_seconds: float) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
+    process = subprocess.Popen(
         argv,
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=timeout_seconds,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=False,
     )
+    assert process.stdout is not None
+    assert process.stderr is not None
+    try:
+        stdout, stderr = _capture_subprocess_output(
+            process,
+            argv=argv,
+            timeout_seconds=timeout_seconds,
+        )
+    except BaseException:
+        try:
+            _terminate_and_reap_subprocess(process)
+        except BaseException:
+            pass
+        raise
+    finally:
+        process.stdout.close()
+        process.stderr.close()
+    encoding = locale.getpreferredencoding(False)
+    return subprocess.CompletedProcess(
+        argv,
+        process.returncode,
+        stdout=stdout.decode(encoding),
+        stderr=stderr.decode(encoding),
+    )
+
+
+class _SubprocessCaptureLimitExceeded(RuntimeError):
+    """Internal signal translated to an existing renderer-safe transport error."""
+
+
+def _capture_subprocess_output(
+    process: subprocess.Popen[bytes],
+    *,
+    argv: list[str],
+    timeout_seconds: float,
+) -> tuple[bytes, bytes]:
+    assert process.stdout is not None
+    assert process.stderr is not None
+    deadline = time.monotonic() + timeout_seconds
+    captured_bytes = 0
+    chunks: dict[str, list[bytes]] = {"stdout": [], "stderr": []}
+    selector = selectors.DefaultSelector()
+    selector.register(process.stdout, selectors.EVENT_READ, "stdout")
+    selector.register(process.stderr, selectors.EVENT_READ, "stderr")
+    try:
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(argv, timeout_seconds)
+            events = selector.select(remaining)
+            if not events:
+                raise subprocess.TimeoutExpired(argv, timeout_seconds)
+            for key, _mask in events:
+                read_size = min(
+                    _SUBPROCESS_CAPTURE_CHUNK_BYTES,
+                    _MAX_SUBPROCESS_CAPTURE_BYTES - captured_bytes + 1,
+                )
+                chunk = os.read(key.fd, read_size)
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    continue
+                captured_bytes += len(chunk)
+                if captured_bytes > _MAX_SUBPROCESS_CAPTURE_BYTES:
+                    raise _SubprocessCaptureLimitExceeded
+                chunks[key.data].append(chunk)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise subprocess.TimeoutExpired(argv, timeout_seconds)
+        process.wait(timeout=remaining)
+    finally:
+        selector.close()
+    return b"".join(chunks["stdout"]), b"".join(chunks["stderr"])
+
+
+def _terminate_and_reap_subprocess(process: subprocess.Popen[bytes]) -> None:
+    if process.poll() is not None:
+        process.wait()
+        return
+    try:
+        process.terminate()
+    except ProcessLookupError:
+        pass
+    try:
+        process.wait(timeout=_SUBPROCESS_TERMINATE_GRACE_SECONDS)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        process.kill()
+    except ProcessLookupError:
+        pass
+    process.wait()
 
 
 def _start_tunnel_subprocess(argv: list[str]) -> subprocess.Popen[str]:

@@ -305,7 +305,51 @@ def test_remote_asset_scripts_prepare_an_empty_private_root_and_publish_exactly(
         monkeypatch=monkeypatch,
     )
     assert json.loads(capsys.readouterr().out) == finalized
+    assert not incoming.exists()
     assert (final_root / WHEEL_NAME).read_bytes() == assets[0].read_bytes()
+
+
+def test_remote_asset_prepare_reconciles_partial_incoming_with_a_bounded_scan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    _execute_remote_script(
+        core_assets._REMOTE_PREPARE_SCRIPT,
+        [BUNDLE_ID],
+        home=home,
+        monkeypatch=monkeypatch,
+    )
+    capsys.readouterr()
+    incoming = home / ".openevo" / "core" / "asset-staging" / f"incoming-{BUNDLE_ID}"
+    (incoming / "partial-wheel").write_bytes(b"x" * (5 * 1024 * 1024))
+    (incoming / "partial-lock").write_bytes(b"partial")
+    for path in incoming.iterdir():
+        path.chmod(0o600)
+
+    _execute_remote_script(
+        core_assets._REMOTE_PREPARE_SCRIPT,
+        [BUNDLE_ID],
+        home=home,
+        monkeypatch=monkeypatch,
+    )
+    capsys.readouterr()
+    assert list(incoming.iterdir()) == []
+
+    for index in range(17):
+        path = incoming / f"partial-{index}"
+        path.write_bytes(b"x")
+        path.chmod(0o600)
+    with pytest.raises(SystemExit):
+        _execute_remote_script(
+            core_assets._REMOTE_PREPARE_SCRIPT,
+            [BUNDLE_ID],
+            home=home,
+            monkeypatch=monkeypatch,
+        )
+    assert len(list(incoming.iterdir())) == 17
 
 
 def stat_mode(path: Path) -> int:

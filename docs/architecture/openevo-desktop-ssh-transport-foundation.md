@@ -309,7 +309,9 @@ opaque diagnostic ID. It never records raw SSH/rsync
 stdout/stderr, exception text, local paths, or usernames. Command output remains
 available only through the existing restricted result/diagnostic handling path;
 known trust paths are redacted from returned remote-command stderr as defense in
-depth.
+depth. Synchronous SSH and rsync subprocesses incrementally drain both streams
+under one 4 MiB aggregate byte cap. A timeout or cap overflow terminates and
+reaps the process before the existing typed error translation runs.
 
 `env` is injected into the remote command as POSIX assignments:
 
@@ -349,6 +351,11 @@ during preflight or workspace execution.
 
 The trailing slash semantics intentionally upload the contents of the local
 folder into the prepared remote workspace path.
+
+Core bootstrap asset retries reconcile an existing incoming directory through a
+held no-follow directory descriptor with a 16-entry scan bound before upload.
+After an exact final bundle is verified, finalize removes that retry's incoming
+copy while retaining the verified published bundle.
 
 ## Limitations
 

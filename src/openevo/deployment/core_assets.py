@@ -469,7 +469,7 @@ def _require_bundle_id(bundle_id: str) -> None:
 
 
 _REMOTE_PREPARE_SCRIPT = r"""
-import json, os, pwd, stat, sys
+import fcntl, json, os, pwd, stat, sys
 
 bundle = sys.argv[1]
 if len(bundle) != 64 or any(c not in "0123456789abcdef" for c in bundle):
@@ -484,6 +484,8 @@ if (not hasattr(os, "O_NOFOLLOW") or not home_parts
     raise SystemExit(71)
 
 flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+file_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+max_incoming_entries = 16
 
 def open_absolute(path):
     fd = os.open("/", flags)
@@ -517,6 +519,31 @@ def ensure(parent, name):
         raise SystemExit(74)
     return fd
 
+def bounded_names(fd):
+    names = []
+    with os.scandir(fd) as entries:
+        for entry in entries:
+            if len(names) >= max_incoming_entries:
+                raise SystemExit(75)
+            names.append(entry.name)
+    return names
+
+def clear_incoming(fd):
+    names = bounded_names(fd)
+    for name in names:
+        child_fd = os.open(name, file_flags, dir_fd=fd)
+        try:
+            opened = os.fstat(child_fd)
+            current = os.stat(name, dir_fd=fd, follow_symlinks=False)
+            if (not stat.S_ISREG(opened.st_mode) or opened.st_uid != uid
+                    or opened.st_nlink != 1
+                    or (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino)):
+                raise SystemExit(76)
+            os.unlink(name, dir_fd=fd)
+        finally:
+            os.close(child_fd)
+    os.fsync(fd)
+
 home_fd = open_absolute(home)
 try:
     require_dir(home_fd)
@@ -524,15 +551,27 @@ try:
     try:
         core_fd = ensure(openevo_fd, "core")
         try:
-            staging_fd = ensure(core_fd, "asset-staging")
-            assets_fd = ensure(core_fd, "assets")
+            lock_fd = os.open("asset-publish.lock", os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600, dir_fd=core_fd)
             try:
-                incoming = "incoming-" + bundle
-                incoming_fd = ensure(staging_fd, incoming)
-                os.close(incoming_fd)
+                lock_meta = os.fstat(lock_fd)
+                if (not stat.S_ISREG(lock_meta.st_mode) or lock_meta.st_uid != uid
+                        or lock_meta.st_nlink != 1 or stat.S_IMODE(lock_meta.st_mode) != 0o600):
+                    raise SystemExit(77)
+                fcntl.flock(lock_fd, fcntl.LOCK_EX)
+                staging_fd = ensure(core_fd, "asset-staging")
+                assets_fd = ensure(core_fd, "assets")
+                try:
+                    incoming = "incoming-" + bundle
+                    incoming_fd = ensure(staging_fd, incoming)
+                    try:
+                        clear_incoming(incoming_fd)
+                    finally:
+                        os.close(incoming_fd)
+                finally:
+                    os.close(assets_fd)
+                    os.close(staging_fd)
             finally:
-                os.close(assets_fd)
-                os.close(staging_fd)
+                os.close(lock_fd)
         finally:
             os.close(core_fd)
     finally:
@@ -645,7 +684,13 @@ def no_duplicates(pairs):
 def verify_bundle(parent, name):
     fd = open_child_dir(parent, name)
     try:
-        if set(os.listdir(fd)) != {wheel_name, "framework-lock.json"}:
+        names = []
+        with os.scandir(fd) as entries:
+            for entry in entries:
+                if len(names) >= 2:
+                    raise SystemExit(79)
+                names.append(entry.name)
+        if set(names) != {wheel_name, "framework-lock.json"}:
             raise SystemExit(79)
         verify_file(fd, wheel_name, wheel_size, wheel_digest)
         lock_bytes = verify_file(fd, "framework-lock.json", lock_size, lock_digest)
@@ -663,6 +708,34 @@ def verify_bundle(parent, name):
     except BaseException:
         os.close(fd)
         raise
+
+def discard_incoming(parent, name, fd):
+    before = os.fstat(fd)
+    names = []
+    with os.scandir(fd) as entries:
+        for entry in entries:
+            if len(names) >= 2:
+                raise SystemExit(83)
+            names.append(entry.name)
+    if set(names) != {wheel_name, "framework-lock.json"}:
+        raise SystemExit(83)
+    for child_name in names:
+        child_fd = os.open(child_name, file_flags, dir_fd=fd)
+        try:
+            child = os.fstat(child_fd)
+            current_child = os.stat(child_name, dir_fd=fd, follow_symlinks=False)
+            if (not stat.S_ISREG(child.st_mode) or child.st_uid != uid or child.st_nlink != 1
+                    or (child.st_dev, child.st_ino) != (current_child.st_dev, current_child.st_ino)):
+                raise SystemExit(83)
+            os.unlink(child_name, dir_fd=fd)
+        finally:
+            os.close(child_fd)
+    os.fsync(fd)
+    current = os.stat(name, dir_fd=parent, follow_symlinks=False)
+    if (before.st_dev, before.st_ino) != (current.st_dev, current.st_ino):
+        raise SystemExit(83)
+    os.rmdir(name, dir_fd=parent)
+    os.fsync(parent)
 
 def rename_noreplace(source_parent, source_name, destination_parent, destination_name):
     libc = ctypes.CDLL(None, use_errno=True)
@@ -700,20 +773,27 @@ try:
         try:
             incoming_name = "incoming-" + bundle
             incoming_fd = verify_bundle(staging_fd, incoming_name)
-            incoming_meta = os.fstat(incoming_fd)
-            os.close(incoming_fd)
             try:
-                final_fd = verify_bundle(assets_fd, bundle)
-            except FileNotFoundError:
-                published = rename_noreplace(staging_fd, incoming_name, assets_fd, bundle)
-                if published:
-                    os.fsync(assets_fd)
-                    os.fsync(staging_fd)
-                final_fd = verify_bundle(assets_fd, bundle)
-                final_meta = os.fstat(final_fd)
-                if published and (incoming_meta.st_dev, incoming_meta.st_ino) != (final_meta.st_dev, final_meta.st_ino):
-                    raise SystemExit(82)
-            os.close(final_fd)
+                incoming_meta = os.fstat(incoming_fd)
+                published = False
+                try:
+                    final_fd = verify_bundle(assets_fd, bundle)
+                except FileNotFoundError:
+                    published = rename_noreplace(staging_fd, incoming_name, assets_fd, bundle)
+                    if published:
+                        os.fsync(assets_fd)
+                        os.fsync(staging_fd)
+                    final_fd = verify_bundle(assets_fd, bundle)
+                try:
+                    final_meta = os.fstat(final_fd)
+                    if published and (incoming_meta.st_dev, incoming_meta.st_ino) != (final_meta.st_dev, final_meta.st_ino):
+                        raise SystemExit(82)
+                finally:
+                    os.close(final_fd)
+                if not published:
+                    discard_incoming(staging_fd, incoming_name, incoming_fd)
+            finally:
+                os.close(incoming_fd)
         finally:
             os.close(assets_fd)
             os.close(staging_fd)

@@ -2161,6 +2161,50 @@ def test_ssh_timeout_discards_command_output_and_exception_chain(tmp_path: Path)
         assert secret not in rendered
 
 
+def test_default_runner_bounds_output_and_reaps_overflowing_process(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pid_path = tmp_path / "overflow.pid"
+    producer = tmp_path / "produce-output.py"
+    producer.write_text(
+        "\n".join(
+            (
+                "import os",
+                "import sys",
+                "import time",
+                "with open(sys.argv[1], 'w', encoding='ascii') as stream:",
+                "    stream.write(str(os.getpid()))",
+                "    stream.flush()",
+                "    os.fsync(stream.fileno())",
+                "os.write(1, b'SECRET_STDOUT_CANARY' * (3 * 1024 * 1024 // 20))",
+                "os.write(2, b'SECRET_STDERR_CANARY' * (3 * 1024 * 1024 // 20))",
+                "time.sleep(30)",
+            )
+        ),
+        encoding="ascii",
+    )
+    transport = _transport(tmp_path)
+    monkeypatch.setattr(
+        transport,
+        "_ssh_argv",
+        lambda _command, _known_hosts: [sys.executable, str(producer), str(pid_path)],
+    )
+
+    secret_command = "SECRET_REMOTE_COMMAND"
+    with pytest.raises(SshTransportError) as exc_info:
+        transport.run(secret_command, timeout_seconds=10)
+
+    assert exc_info.value.code is SshTransportErrorCode.START_FAILED
+    rendered = "".join(traceback.format_exception(exc_info.value))
+    assert "SECRET_REMOTE_COMMAND" not in rendered
+    assert "SECRET_STDOUT_CANARY" not in rendered
+    assert "SECRET_STDERR_CANARY" not in rendered
+    process_id = int(pid_path.read_text(encoding="ascii"))
+    with pytest.raises(ProcessLookupError):
+        os.kill(process_id, 0)
+
+
 def test_tunnel_context_manager_and_exit_monitor_release_trust_lease(
     tmp_path: Path,
 ) -> None:
