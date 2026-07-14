@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Mapping
+import base64
+import binascii
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import StrEnum
+import json
 import re
 import threading
+import time
 from typing import Any, Literal, TypeVar
 from urllib.parse import quote, urlsplit
 
@@ -26,6 +30,7 @@ MAX_CORE_REQUEST_BYTES = 2 * 1024 * 1024
 MAX_CORE_WORKSPACE_CHUNK_REQUEST_BYTES = ((v1.MAX_WORKSPACE_CHUNK_BYTES + 2) // 3) * 4 + 4096
 MAX_CORE_SSE_FRAME_BYTES = 4 * 1024 * 1024
 MAX_CORE_SSE_RESPONSE_BYTES = 64 * 1024 * 1024
+MAX_CORE_CLOSE_WAIT_SECONDS = 5.0
 
 _BEARER = re.compile(r"[A-Za-z0-9._~+/\-]{43,510}={0,2}\Z", re.ASCII)
 _ETAG = re.compile(r'"[0-9a-f]{64}"\Z', re.ASCII)
@@ -47,6 +52,7 @@ class CoreClientLocalErrorCodeV1(StrEnum):
     REDIRECT_REJECTED = "core_redirect_rejected"
     ACTIVE_PROJECT_MISMATCH = "active_project_mismatch"
     SSE_PROTOCOL_ERROR = "core_sse_protocol_error"
+    SNAPSHOT_REFRESH_REQUIRED = "core_snapshot_refresh_required"
 
 
 _LOCAL_ERROR_MESSAGES: dict[CoreClientLocalErrorCodeV1, str] = {
@@ -62,6 +68,9 @@ _LOCAL_ERROR_MESSAGES: dict[CoreClientLocalErrorCodeV1, str] = {
         "The Core resource does not belong to the active project."
     ),
     CoreClientLocalErrorCodeV1.SSE_PROTOCOL_ERROR: "Core returned an invalid v1 event stream.",
+    CoreClientLocalErrorCodeV1.SNAPSHOT_REFRESH_REQUIRED: (
+        "Core event membership is unknown; reload snapshots before resuming events."
+    ),
 }
 
 
@@ -100,11 +109,16 @@ class CoreTunnelConnectionV1:
     origin: str = field(init=False)
 
     def __post_init__(self) -> None:
+        invalid_url = False
         try:
             parsed = urlsplit(self.endpoint)
             port = parsed.port
-        except (TypeError, ValueError) as exc:
-            raise _local_exception(CoreClientLocalErrorCodeV1.INVALID_CONNECTION, 400) from exc
+        except (TypeError, ValueError):
+            invalid_url = True
+            parsed = urlsplit("http://127.0.0.1")
+            port = None
+        if invalid_url:
+            _raise_local(CoreClientLocalErrorCodeV1.INVALID_CONNECTION, 400)
         if (
             parsed.scheme != "http"
             or parsed.hostname not in {"127.0.0.1", "::1"}
@@ -121,11 +135,16 @@ class CoreTunnelConnectionV1:
             _raise_local(CoreClientLocalErrorCodeV1.INVALID_CONNECTION, 400)
         if len(set(self.bearer_token.rstrip("="))) < 8:
             _raise_local(CoreClientLocalErrorCodeV1.INVALID_CONNECTION, 400)
+        invalid_identity = False
         try:
             project_id = _OPAQUE_ID.validate_python(self.project_id, strict=True)
             session_id = _OPAQUE_ID.validate_python(self.session_id, strict=True)
-        except ValidationError as exc:
-            raise _local_exception(CoreClientLocalErrorCodeV1.INVALID_CONNECTION, 400) from exc
+        except ValidationError:
+            invalid_identity = True
+            project_id = ""
+            session_id = ""
+        if invalid_identity:
+            _raise_local(CoreClientLocalErrorCodeV1.INVALID_CONNECTION, 400)
         host = f"[{parsed.hostname}]" if parsed.hostname == "::1" else parsed.hostname
         object.__setattr__(self, "project_id", project_id)
         object.__setattr__(self, "session_id", session_id)
@@ -139,34 +158,57 @@ class CoreSseStreamV1:
         self,
         chunks: Iterator[bytes],
         *,
-        active_project_id: str,
-        bearer_token: str,
+        validate_event: Callable[[v1.EventEnvelopeV1], None],
+        private_values: tuple[str, ...],
         declared_length: int | None,
+        close_started: Callable[[], bool],
     ) -> None:
         self._chunks = chunks
-        self._active_project_id = active_project_id
-        self._bearer_token = bearer_token.encode("utf-8")
+        self._validate_event = validate_event
+        self._private_values = private_values
         self._declared_length = declared_length
+        self._close_started = close_started
         self._started = False
 
     def __iter__(self) -> Iterator[v1.SseFrameV1]:
         if self._started:
-            raise RuntimeError("Core SSE streams are single-pass")
+            _raise_local(CoreClientLocalErrorCodeV1.SSE_PROTOCOL_ERROR, 502)
         self._started = True
+        boundary_error = False
         try:
             for frame in _iter_sse_frames(
                 self._chunks,
                 declared_length=self._declared_length,
             ):
-                if self._bearer_token in frame:
-                    _raise_local(CoreClientLocalErrorCodeV1.SSE_PROTOCOL_ERROR, 502)
-                validated_frame = _validate_sse_frame(frame)
-                _ensure_event_project(validated_frame.data, self._active_project_id)
+                validated_frame = _validate_sse_frame(frame, self._private_values)
+                self._validate_event(validated_frame.data)
                 yield validated_frame
         except CoreClientErrorV1:
             raise
-        except (httpx.HTTPError, UnicodeError, ValueError, ValidationError) as exc:
-            raise _local_exception(CoreClientLocalErrorCodeV1.SSE_PROTOCOL_ERROR, 502) from exc
+        except (httpx.HTTPError, OSError, UnicodeError, RuntimeError, ValueError, ValidationError):
+            boundary_error = True
+        if boundary_error:
+            closed = self._close_started()
+            code = (
+                CoreClientLocalErrorCodeV1.CLIENT_CLOSED
+                if closed
+                else CoreClientLocalErrorCodeV1.SSE_PROTOCOL_ERROR
+            )
+            _raise_local(code, 503 if closed else 502)
+
+
+@dataclass(frozen=True, slots=True)
+class _ResourceBinding:
+    project_id: str
+    parent_type: v1.ResourceChangeType | None = None
+    parent_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _LogRefBinding:
+    project_id: str
+    parent_type: v1.ResourceChangeType
+    parent_id: str
 
 
 class CoreControlClientV1:
@@ -182,8 +224,21 @@ class CoreControlClientV1:
         if not isinstance(connection, CoreTunnelConnectionV1):
             raise TypeError("connection must be CoreTunnelConnectionV1")
         self._connection = connection
-        self._state_lock = threading.Lock()
+        self._state = threading.Condition(threading.Lock())
+        self._membership_lock = threading.RLock()
+        self._closing = False
         self._closed = False
+        self._leases = 0
+        self._lease_owners: dict[int, int] = {}
+        self._active_responses: set[httpx.Response] = set()
+        self._members: dict[tuple[v1.ResourceChangeType, str], _ResourceBinding] = {}
+        self._log_refs: dict[str, _LogRefBinding] = {}
+        self._workspace_uploads: dict[str, v1.WorkspaceUploadSessionV1] = {}
+        self._project_state: v1.ProjectSummaryV1 | None = None
+        self._runs: dict[str, v1.RunSummaryV1] = {}
+        self._artifacts: dict[str, v1.ArtifactSummaryBaseV1] = {}
+        self._operations: dict[str, v1.OperationV1] = {}
+        self._diagnostics: dict[str, v1.DiagnosticV1] = {}
         self._http = httpx.Client(
             base_url=f"{connection.origin}/",
             transport=transport,
@@ -192,6 +247,7 @@ class CoreControlClientV1:
             follow_redirects=False,
             headers={"Accept-Encoding": "identity", "User-Agent": "OpenEvo-Desktop-CoreClient/1"},
         )
+        self._bind_resource(v1.ResourceChangeType.PROJECT, connection.project_id)
 
     def __enter__(self) -> CoreControlClientV1:
         self._ensure_open()
@@ -201,12 +257,43 @@ class CoreControlClientV1:
         self.close()
 
     def close(self) -> None:
-        """Idempotently stop new calls and close active HTTP/SSE transports."""
-        with self._state_lock:
+        """Idempotently stop admission, cancel transports, and boundedly drain leases."""
+        deadline = time.monotonic() + MAX_CORE_CLOSE_WAIT_SECONDS
+        with self._state:
             if self._closed:
                 return
+            if self._closing:
+                while not self._closed:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return
+                    self._state.wait(remaining)
+                return
+            self._closing = True
+            responses = tuple(self._active_responses)
+
+        close_failed = False
+        for response in responses:
+            try:
+                response.close()
+            except (httpx.HTTPError, OSError, UnicodeError, RuntimeError, ValueError):
+                close_failed = True
+        try:
+            self._http.close()
+        except (httpx.HTTPError, OSError, UnicodeError, RuntimeError, ValueError):
+            close_failed = True
+
+        with self._state:
+            caller_leases = self._lease_owners.get(threading.get_ident(), 0)
+            while self._leases > caller_leases:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                self._state.wait(remaining)
             self._closed = True
-        self._http.close()
+            self._state.notify_all()
+        if close_failed:
+            raise _local_exception(CoreClientLocalErrorCodeV1.CLIENT_CLOSED, 503) from None
 
     def version(self) -> v1.VersionResponseV1:
         return self._json("GET", "/version", v1.VersionResponseV1, authenticated=False)
@@ -215,7 +302,10 @@ class CoreControlClientV1:
         return self._json("GET", "/health", v1.HealthResponseV1, authenticated=False)
 
     def status(self) -> v1.CoreStatusV1:
-        return self._json("GET", "/v1/status", v1.CoreStatusV1)
+        result = self._json("GET", "/v1/status", v1.CoreStatusV1)
+        for service in result.services:
+            self._register_service(service)
+        return result
 
     def environment_doctor(
         self,
@@ -238,7 +328,7 @@ class CoreControlClientV1:
         *,
         idempotency_key: str,
     ) -> v1.OperationV1:
-        return self._mutation(
+        result = self._mutation(
             "POST",
             "/v1/environment/repair",
             request,
@@ -247,6 +337,12 @@ class CoreControlClientV1:
             idempotency_key=idempotency_key,
             expected_status=202,
         )
+        if not isinstance(result.request, v1.EnvironmentRepairOperationRequestV1) or (
+            result.request.request != request
+        ):
+            _raise_local(CoreClientLocalErrorCodeV1.INVALID_RESPONSE, 502)
+        self._register_operation(result)
+        return result
 
     def capabilities(self, execution_mode: v1.ExecutionMode) -> v1.CapabilitiesResponseV1:
         mode = _enum_query(execution_mode, v1.ExecutionMode)
@@ -270,10 +366,12 @@ class CoreControlClientV1:
             "GET",
             "/v1/projects",
             v1.ProjectPageV1,
-            params=_page_query(limit, after, sort, direction, {"created_at", "updated_at", "name"}),
+            params=_page_query(
+                limit, after, sort, direction, {"created_at", "updated_at", "name"}
+            ),
         )
         for project in result.items:
-            self._ensure_active_project(project.id)
+            self._register_project(project)
         return result
 
     def create_project(
@@ -291,13 +389,13 @@ class CoreControlClientV1:
             idempotency_key=idempotency_key,
             expected_status=201,
         )
-        self._ensure_active_project(result.id)
+        self._register_project(result)
         return result
 
     def get_project(self, project_id: str | None = None) -> v1.ProjectV1:
         project_id = self._active_project(project_id)
         result = self._json("GET", f"/v1/projects/{_segment(project_id)}", v1.ProjectV1)
-        self._ensure_active_project(result.id)
+        self._register_project(result, expected_id=project_id)
         return result
 
     def patch_project(
@@ -318,7 +416,7 @@ class CoreControlClientV1:
             if_match=if_match,
             idempotency_key=idempotency_key,
         )
-        self._ensure_active_project(result.id)
+        self._register_project(result, expected_id=project_id)
         return result
 
     def delete_project(
@@ -368,12 +466,16 @@ class CoreControlClientV1:
             "GET", f"/v1/projects/{_segment(project_id)}/revisions/head", v1.RevisionHeadV1
         )
         self._ensure_active_project(result.project_id)
+        if result.project_id != project_id:
+            _raise_local(CoreClientLocalErrorCodeV1.INVALID_RESPONSE, 502)
         return result
 
     def get_revision(self, revision_id: str, *, project_id: str) -> v1.RevisionV1:
         self._ensure_active_project(project_id)
         result = self._json("GET", f"/v1/revisions/{_segment(revision_id)}", v1.RevisionV1)
         self._ensure_active_project(result.revision.project_id)
+        if result.revision.id != revision_id or result.revision.project_id != project_id:
+            _raise_local(CoreClientLocalErrorCodeV1.INVALID_RESPONSE, 502)
         return result
 
     def create_workspace_upload(
@@ -385,6 +487,15 @@ class CoreControlClientV1:
         project_id: str | None = None,
     ) -> v1.WorkspaceUploadSessionV1:
         project_id = self._active_project(project_id)
+        if_match = _etag(if_match)
+        with self._membership_lock:
+            project = self._project_state
+        if (
+            project is None
+            or request.project_snapshot != project.current_project_snapshot
+            or if_match != project.etag
+        ):
+            _raise_local(CoreClientLocalErrorCodeV1.ACTIVE_PROJECT_MISMATCH, 409)
         result = self._mutation(
             "POST",
             f"/v1/projects/{_segment(project_id)}/workspace-uploads",
@@ -395,7 +506,9 @@ class CoreControlClientV1:
             idempotency_key=idempotency_key,
             expected_status=201,
         )
-        self._ensure_active_project(result.project_id)
+        self._validate_new_workspace_upload(result, request, project_id, if_match)
+        with self._membership_lock:
+            self._workspace_uploads[result.id] = result
         return result
 
     def get_workspace_upload(
@@ -410,7 +523,12 @@ class CoreControlClientV1:
             f"/v1/projects/{_segment(project_id)}/workspace-uploads/{_segment(upload_id)}",
             v1.WorkspaceUploadSessionV1,
         )
-        self._ensure_active_project(result.project_id)
+        self._validate_workspace_upload_identity(result, upload_id, project_id)
+        with self._membership_lock:
+            prior = self._workspace_uploads.get(upload_id)
+            if prior is not None:
+                _ensure_upload_stable(prior, result)
+            self._workspace_uploads[upload_id] = result
         return result
 
     def put_workspace_upload_chunk(
@@ -423,6 +541,16 @@ class CoreControlClientV1:
         project_id: str | None = None,
     ) -> v1.WorkspaceUploadSessionV1:
         project_id = self._active_project(project_id)
+        if_match = _etag(if_match)
+        upload = self._require_workspace_upload(upload_id, project_id)
+        decoded_length = _decoded_chunk_length(request)
+        if (
+            upload.status is not v1.WorkspaceUploadStatus.OPEN
+            or request.offset != upload.accepted_offset
+            or request.offset + decoded_length > upload.archive.byte_size
+            or if_match != upload.etag
+        ):
+            _raise_local(CoreClientLocalErrorCodeV1.INVALID_REQUEST, 400)
         result = self._mutation(
             "PUT",
             f"/v1/projects/{_segment(project_id)}/workspace-uploads/{_segment(upload_id)}/chunk",
@@ -433,7 +561,16 @@ class CoreControlClientV1:
             idempotency_key=idempotency_key,
             max_request_bytes=MAX_CORE_WORKSPACE_CHUNK_REQUEST_BYTES,
         )
-        self._ensure_active_project(result.project_id)
+        self._validate_workspace_upload_identity(result, upload_id, project_id)
+        _ensure_upload_stable(upload, result)
+        if (
+            result.status is not v1.WorkspaceUploadStatus.OPEN
+            or result.publication is not None
+            or result.accepted_offset != request.offset + decoded_length
+        ):
+            _raise_local(CoreClientLocalErrorCodeV1.INVALID_RESPONSE, 502)
+        with self._membership_lock:
+            self._workspace_uploads[upload_id] = result
         return result
 
     def finalize_workspace_upload(
@@ -447,6 +584,17 @@ class CoreControlClientV1:
         project_id: str | None = None,
     ) -> v1.WorkspaceUploadFinalizeResponseV1:
         project_id = self._active_project(project_id)
+        if_match = _etag(if_match)
+        if_project_match = _etag(if_project_match)
+        upload = self._require_workspace_upload(upload_id, project_id)
+        if (
+            upload.status is not v1.WorkspaceUploadStatus.OPEN
+            or upload.accepted_offset != upload.archive.byte_size
+            or request.content_sha256 != upload.archive.content_sha256
+            or if_match != upload.etag
+            or if_project_match != upload.project_etag
+        ):
+            _raise_local(CoreClientLocalErrorCodeV1.INVALID_REQUEST, 400)
         result = self._mutation(
             "POST",
             f"/v1/projects/{_segment(project_id)}/workspace-uploads/{_segment(upload_id)}/finalize",
@@ -459,6 +607,23 @@ class CoreControlClientV1:
             expected_status=201,
         )
         self._ensure_active_project(result.project_id)
+        self._validate_workspace_upload_identity(result.upload, upload_id, project_id)
+        _ensure_upload_stable(upload, result.upload)
+        if (
+            result.project_id != project_id
+            or result.upload.status is not v1.WorkspaceUploadStatus.FINALIZED
+            or result.upload.accepted_offset != upload.archive.byte_size
+            or result.upload.publication != result.publication
+            or result.publication.archive != upload.archive
+            or result.publication.content_ref.sha256 != request.content_sha256
+            or result.project.id != project_id
+            or result.project.current_project_snapshot == upload.project_snapshot
+            or result.project.current_workspace_snapshot != result.publication.workspace_snapshot
+        ):
+            _raise_local(CoreClientLocalErrorCodeV1.INVALID_RESPONSE, 502)
+        with self._membership_lock:
+            self._workspace_uploads[upload_id] = result.upload
+        self._register_project(result.project, expected_id=project_id)
         return result
 
     def abort_workspace_upload(
@@ -471,6 +636,10 @@ class CoreControlClientV1:
         project_id: str | None = None,
     ) -> v1.WorkspaceUploadSessionV1:
         project_id = self._active_project(project_id)
+        if_match = _etag(if_match)
+        upload = self._require_workspace_upload(upload_id, project_id)
+        if upload.status is not v1.WorkspaceUploadStatus.OPEN or if_match != upload.etag:
+            _raise_local(CoreClientLocalErrorCodeV1.INVALID_REQUEST, 400)
         result = self._mutation(
             "POST",
             f"/v1/projects/{_segment(project_id)}/workspace-uploads/{_segment(upload_id)}/abort",
@@ -480,7 +649,16 @@ class CoreControlClientV1:
             if_match=if_match,
             idempotency_key=idempotency_key,
         )
-        self._ensure_active_project(result.project_id)
+        self._validate_workspace_upload_identity(result, upload_id, project_id)
+        _ensure_upload_stable(upload, result)
+        if (
+            result.status is not v1.WorkspaceUploadStatus.ABORTED
+            or result.accepted_offset != upload.accepted_offset
+            or result.publication is not None
+        ):
+            _raise_local(CoreClientLocalErrorCodeV1.INVALID_RESPONSE, 502)
+        with self._membership_lock:
+            self._workspace_uploads[upload_id] = result
         return result
 
     def validate_project(
@@ -521,7 +699,7 @@ class CoreControlClientV1:
             params["status"] = _enum_query(status, v1.RunStatus)
         result = self._json("GET", "/v1/runs", v1.RunPageV1, params=params)
         for run in result.items:
-            self._ensure_active_project(run.project_id)
+            self._register_run(run)
         return result
 
     def create_run(
@@ -540,13 +718,20 @@ class CoreControlClientV1:
             idempotency_key=idempotency_key,
             expected_status=202,
         )
-        self._ensure_active_project(result.project_id)
+        if (
+            result.project_snapshot != request.project_snapshot
+            or result.task_snapshot != request.task_snapshot
+            or result.workspace_snapshot != request.workspace_snapshot
+            or result.required_revision != request.required_revision
+        ):
+            _raise_local(CoreClientLocalErrorCodeV1.INVALID_RESPONSE, 502)
+        self._register_run(result)
         return result
 
     def get_run(self, run_id: str, *, project_id: str) -> v1.RunV1:
         self._ensure_active_project(project_id)
         result = self._json("GET", f"/v1/runs/{_segment(run_id)}", v1.RunV1)
-        self._ensure_active_project(result.project_id)
+        self._register_run(result, expected_id=run_id)
         return result
 
     def delete_run(
@@ -558,6 +743,7 @@ class CoreControlClientV1:
         idempotency_key: str,
     ) -> None:
         self._ensure_active_project(project_id)
+        self._require_member(v1.ResourceChangeType.RUN, run_id)
         self._no_content_mutation(
             "DELETE",
             f"/v1/runs/{_segment(run_id)}",
@@ -575,6 +761,7 @@ class CoreControlClientV1:
         idempotency_key: str,
     ) -> v1.RunV1:
         self._ensure_active_project(project_id)
+        self._require_member(v1.ResourceChangeType.RUN, run_id)
         result = self._mutation(
             "POST",
             f"/v1/runs/{_segment(run_id)}/cancel",
@@ -585,7 +772,7 @@ class CoreControlClientV1:
             idempotency_key=idempotency_key,
             expected_status=202,
         )
-        self._ensure_active_project(result.project_id)
+        self._register_run(result, expected_id=run_id)
         return result
 
     def retry_run(
@@ -598,6 +785,7 @@ class CoreControlClientV1:
         idempotency_key: str,
     ) -> v1.RunV1:
         self._ensure_active_project(project_id)
+        self._require_member(v1.ResourceChangeType.RUN, run_id)
         result = self._mutation(
             "POST",
             f"/v1/runs/{_segment(run_id)}/retry",
@@ -608,7 +796,7 @@ class CoreControlClientV1:
             idempotency_key=idempotency_key,
             expected_status=202,
         )
-        self._ensure_active_project(result.project_id)
+        self._register_run(result, expected_id=run_id)
         return result
 
     def run_timeline(
@@ -622,12 +810,17 @@ class CoreControlClientV1:
         direction: Literal["asc", "desc"] = "asc",
     ) -> v1.RunTimelinePageV1:
         self._ensure_active_project(project_id)
-        return self._json(
+        self._require_member(v1.ResourceChangeType.RUN, run_id)
+        result = self._json(
             "GET",
             f"/v1/runs/{_segment(run_id)}/timeline",
             v1.RunTimelinePageV1,
             params=_page_query(limit, after, sort, direction, {"sequence", "occurred_at"}),
         )
+        for entry in result.items:
+            if entry.run_id != run_id:
+                _raise_local(CoreClientLocalErrorCodeV1.INVALID_RESPONSE, 502)
+        return result
 
     def run_logs(
         self,
@@ -641,21 +834,43 @@ class CoreControlClientV1:
         stream: v1.LogStream | None = None,
     ) -> v1.LogPageV1:
         self._ensure_active_project(project_id)
+        self._require_member(v1.ResourceChangeType.RUN, run_id)
         params = _page_query(limit, after, sort, direction, {"sequence", "occurred_at"})
         if stream is not None:
             params["stream"] = _enum_query(stream, v1.LogStream)
-        return self._json(
+        result = self._json(
             "GET",
             f"/v1/runs/{_segment(run_id)}/logs",
             v1.LogPageV1,
             params=params,
             max_response_bytes=MAX_CORE_LOG_RESPONSE_BYTES,
         )
+        for entry in result.items:
+            if entry.run_id != run_id:
+                _raise_local(CoreClientLocalErrorCodeV1.INVALID_RESPONSE, 502)
+        return result
 
     def run_context(self, run_id: str, *, project_id: str) -> v1.RunContextV1:
         self._ensure_active_project(project_id)
+        self._require_member(v1.ResourceChangeType.RUN, run_id)
         result = self._json("GET", f"/v1/runs/{_segment(run_id)}/context", v1.RunContextV1)
         self._ensure_active_project(result.project_id)
+        if result.run_id != run_id:
+            _raise_local(CoreClientLocalErrorCodeV1.INVALID_RESPONSE, 502)
+        with self._membership_lock:
+            run = self._runs.get(run_id)
+        if run is None or any(
+            (
+                result.project_snapshot != run.project_snapshot,
+                result.task_snapshot != run.task_snapshot,
+                result.workspace_snapshot != run.workspace_snapshot,
+                result.required_revision != run.required_revision,
+                result.registry_digest != run.registry_digest,
+                result.execution_mode is not run.execution_mode,
+                result.capture_mode is not run.capture_mode,
+            )
+        ):
+            _raise_local(CoreClientLocalErrorCodeV1.INVALID_RESPONSE, 502)
         return result
 
     def run_artifacts(
@@ -670,6 +885,7 @@ class CoreControlClientV1:
         artifact_type: v1.ArtifactType | None = None,
     ) -> v1.ArtifactPageV1:
         self._ensure_active_project(project_id)
+        self._require_member(v1.ResourceChangeType.RUN, run_id)
         params = _page_query(
             limit,
             after,
@@ -683,27 +899,33 @@ class CoreControlClientV1:
             "GET", f"/v1/runs/{_segment(run_id)}/artifacts", v1.ArtifactPageV1, params=params
         )
         for artifact in result.items:
-            self._ensure_active_project(artifact.project_id)
+            if artifact.run_id != run_id:
+                _raise_local(CoreClientLocalErrorCodeV1.INVALID_RESPONSE, 502)
+            self._register_artifact(artifact)
         return result
 
     def get_artifact(self, artifact_id: str, *, project_id: str) -> v1.ArtifactSummaryV1:
         self._ensure_active_project(project_id)
-        result = self._json(
-            "GET", f"/v1/artifacts/{_segment(artifact_id)}", v1.ArtifactSummaryV1
-        )
-        self._ensure_active_project(result.project_id)
+        result = self._json("GET", f"/v1/artifacts/{_segment(artifact_id)}", v1.ArtifactSummaryV1)
+        self._register_artifact(result, expected_id=artifact_id)
         return result
 
-    def artifact_content(
-        self, artifact_id: str, *, project_id: str
-    ) -> v1.ArtifactContentV1:
+    def artifact_content(self, artifact_id: str, *, project_id: str) -> v1.ArtifactContentV1:
         self._ensure_active_project(project_id)
-        return self._json(
+        self._require_member(v1.ResourceChangeType.ARTIFACT, artifact_id)
+        result = self._json(
             "GET",
             f"/v1/artifacts/{_segment(artifact_id)}/content",
             v1.ArtifactContentV1,
             max_response_bytes=MAX_CORE_ARTIFACT_RESPONSE_BYTES,
         )
+        if result.artifact_id != artifact_id:
+            _raise_local(CoreClientLocalErrorCodeV1.INVALID_RESPONSE, 502)
+        with self._membership_lock:
+            artifact = self._artifacts.get(artifact_id)
+        if artifact is None or result.artifact_type is not artifact.artifact_type:
+            _raise_local(CoreClientLocalErrorCodeV1.INVALID_RESPONSE, 502)
+        return result
 
     def artifact_diff(
         self,
@@ -713,16 +935,36 @@ class CoreControlClientV1:
         previous_artifact_id: str | None = None,
     ) -> v1.ArtifactDiffV1:
         self._ensure_active_project(project_id)
+        self._require_member(v1.ResourceChangeType.ARTIFACT, artifact_id)
         params = None
         if previous_artifact_id is not None:
-            params = {"previous_artifact_id": _opaque(previous_artifact_id)}
-        return self._json(
+            self._require_member(v1.ResourceChangeType.ARTIFACT, previous_artifact_id)
+            params = {"previous_artifact_id": _opaque_request(previous_artifact_id)}
+        result = self._json(
             "GET",
             f"/v1/artifacts/{_segment(artifact_id)}/diff",
             v1.ArtifactDiffV1,
             params=params,
             max_response_bytes=MAX_CORE_ARTIFACT_RESPONSE_BYTES,
         )
+        if result.artifact_id != artifact_id or (
+            previous_artifact_id is not None
+            and result.previous_artifact_id != previous_artifact_id
+        ):
+            _raise_local(CoreClientLocalErrorCodeV1.INVALID_RESPONSE, 502)
+        if previous_artifact_id is None:
+            self.get_artifact(result.previous_artifact_id, project_id=project_id)
+        with self._membership_lock:
+            current = self._artifacts.get(artifact_id)
+            previous = self._artifacts.get(result.previous_artifact_id)
+        if (
+            current is None
+            or previous is None
+            or result.artifact_content_sha256 != current.content_sha256
+            or result.previous_artifact_content_sha256 != previous.content_sha256
+        ):
+            _raise_local(CoreClientLocalErrorCodeV1.INVALID_RESPONSE, 502)
+        return result
 
     def list_services(
         self,
@@ -732,15 +974,20 @@ class CoreControlClientV1:
         sort: Literal["kind", "status", "updated_at"] = "kind",
         direction: Literal["asc", "desc"] = "asc",
     ) -> v1.ServicePageV1:
-        return self._json(
+        result = self._json(
             "GET",
             "/v1/services",
             v1.ServicePageV1,
             params=_page_query(limit, after, sort, direction, {"kind", "status", "updated_at"}),
         )
+        for service in result.items:
+            self._register_service(service)
+        return result
 
     def get_service(self, service_id: str) -> v1.ServiceSummaryV1:
-        return self._json("GET", f"/v1/services/{_segment(service_id)}", v1.ServiceSummaryV1)
+        result = self._json("GET", f"/v1/services/{_segment(service_id)}", v1.ServiceSummaryV1)
+        self._register_service(result, expected_id=service_id)
+        return result
 
     def restart_service(
         self,
@@ -750,7 +997,8 @@ class CoreControlClientV1:
         if_match: str,
         idempotency_key: str,
     ) -> v1.OperationV1:
-        return self._mutation(
+        self._require_member(v1.ResourceChangeType.SERVICE, service_id)
+        result = self._mutation(
             "POST",
             f"/v1/services/{_segment(service_id)}/restart",
             request,
@@ -760,6 +1008,12 @@ class CoreControlClientV1:
             idempotency_key=idempotency_key,
             expected_status=202,
         )
+        if not isinstance(result.request, v1.ServiceRestartOperationRequestV1) or (
+            result.request.service_id != service_id or result.request.request != request
+        ):
+            _raise_local(CoreClientLocalErrorCodeV1.INVALID_RESPONSE, 502)
+        self._register_operation(result)
+        return result
 
     def service_logs(
         self,
@@ -770,18 +1024,25 @@ class CoreControlClientV1:
         sort: Literal["sequence", "occurred_at"] = "sequence",
         direction: Literal["asc", "desc"] = "asc",
     ) -> v1.LogPageV1:
-        return self._json(
+        self._require_member(v1.ResourceChangeType.SERVICE, service_id)
+        result = self._json(
             "GET",
             f"/v1/services/{_segment(service_id)}/logs",
             v1.LogPageV1,
             params=_page_query(limit, after, sort, direction, {"sequence", "occurred_at"}),
             max_response_bytes=MAX_CORE_LOG_RESPONSE_BYTES,
         )
+        for entry in result.items:
+            if entry.service_id != service_id:
+                _raise_local(CoreClientLocalErrorCodeV1.INVALID_RESPONSE, 502)
+            if entry.run_id is not None:
+                self._require_member(v1.ResourceChangeType.RUN, entry.run_id)
+        return result
 
     def get_operation(self, operation_id: str) -> v1.OperationV1:
-        return self._json(
-            "GET", f"/v1/operations/{_segment(operation_id)}", v1.OperationV1
-        )
+        result = self._json("GET", f"/v1/operations/{_segment(operation_id)}", v1.OperationV1)
+        self._register_operation(result, expected_id=operation_id)
+        return result
 
     def cancel_operation(
         self,
@@ -791,7 +1052,8 @@ class CoreControlClientV1:
         if_match: str,
         idempotency_key: str,
     ) -> v1.OperationV1:
-        return self._mutation(
+        self._require_member(v1.ResourceChangeType.OPERATION, operation_id)
+        result = self._mutation(
             "POST",
             f"/v1/operations/{_segment(operation_id)}/cancel",
             request,
@@ -801,6 +1063,8 @@ class CoreControlClientV1:
             idempotency_key=idempotency_key,
             expected_status=202,
         )
+        self._register_operation(result, expected_id=operation_id)
+        return result
 
     def logs_by_ref(
         self,
@@ -811,6 +1075,11 @@ class CoreControlClientV1:
         sort: Literal["sequence", "occurred_at"] = "sequence",
         direction: Literal["asc", "desc"] = "asc",
     ) -> v1.ReferencedLogPageV1:
+        logs_ref = _opaque_request(logs_ref)
+        with self._membership_lock:
+            binding = self._log_refs.get(logs_ref)
+        if binding is None or binding.project_id != self._connection.project_id:
+            _raise_local(CoreClientLocalErrorCodeV1.ACTIVE_PROJECT_MISMATCH, 409)
         result = self._json(
             "GET",
             f"/v1/logs/{_segment(logs_ref)}",
@@ -820,6 +1089,10 @@ class CoreControlClientV1:
         )
         if result.logs_ref != logs_ref:
             _raise_local(CoreClientLocalErrorCodeV1.INVALID_RESPONSE, 502)
+        for entry in result.items:
+            self._require_member(v1.ResourceChangeType.SERVICE, entry.service_id)
+            if entry.run_id is not None:
+                self._require_member(v1.ResourceChangeType.RUN, entry.run_id)
         return result
 
     def create_diagnostic(
@@ -829,6 +1102,8 @@ class CoreControlClientV1:
         idempotency_key: str,
     ) -> v1.DiagnosticV1:
         _ensure_diagnostic_request_project(request, self._connection.project_id)
+        if isinstance(request.target, v1.RunDiagnosticTargetV1):
+            self._require_member(v1.ResourceChangeType.RUN, request.target.run_id)
         result = self._mutation(
             "POST",
             "/v1/diagnostics",
@@ -838,14 +1113,14 @@ class CoreControlClientV1:
             idempotency_key=idempotency_key,
             expected_status=202,
         )
-        _ensure_diagnostic_project(result, self._connection.project_id)
+        if result.scopes != request.scopes or result.target != request.target:
+            _raise_local(CoreClientLocalErrorCodeV1.INVALID_RESPONSE, 502)
+        self._register_diagnostic(result)
         return result
 
     def get_diagnostic(self, diagnostic_id: str) -> v1.DiagnosticV1:
-        result = self._json(
-            "GET", f"/v1/diagnostics/{_segment(diagnostic_id)}", v1.DiagnosticV1
-        )
-        _ensure_diagnostic_project(result, self._connection.project_id)
+        result = self._json("GET", f"/v1/diagnostics/{_segment(diagnostic_id)}", v1.DiagnosticV1)
+        self._register_diagnostic(result, expected_id=diagnostic_id)
         return result
 
     def delete_diagnostic(
@@ -855,6 +1130,7 @@ class CoreControlClientV1:
         if_match: str,
         idempotency_key: str,
     ) -> None:
+        self._require_member(v1.ResourceChangeType.DIAGNOSTIC, diagnostic_id)
         self._no_content_mutation(
             "DELETE",
             f"/v1/diagnostics/{_segment(diagnostic_id)}",
@@ -868,7 +1144,7 @@ class CoreControlClientV1:
         *,
         idempotency_key: str,
     ) -> v1.OperationV1:
-        return self._mutation(
+        result = self._mutation(
             "POST",
             "/v1/maintenance/cache-cleanup",
             request,
@@ -877,47 +1153,70 @@ class CoreControlClientV1:
             idempotency_key=idempotency_key,
             expected_status=202,
         )
+        if not isinstance(result.request, v1.CacheCleanupOperationRequestV1) or (
+            result.request.request != request
+        ):
+            _raise_local(CoreClientLocalErrorCodeV1.INVALID_RESPONSE, 502)
+        self._register_operation(result)
+        return result
 
     @contextmanager
     def events(self, *, last_event_id: str | None = None) -> Iterator[CoreSseStreamV1]:
         """Open the authenticated event stream; closing the context closes the response."""
         headers = self._headers(authenticated=True, accept="text/event-stream")
         if last_event_id is not None:
-            headers["Last-Event-ID"] = _cursor(last_event_id)
-        self._ensure_open()
-        try:
-            with self._http.stream(
-                "GET", "/v1/events", headers=headers, follow_redirects=False
-            ) as response:
-                self._ensure_response_origin(response)
-                if 300 <= response.status_code < 400:
-                    _read_bounded(response, MAX_CORE_ERROR_RESPONSE_BYTES)
-                    _raise_local(CoreClientLocalErrorCodeV1.REDIRECT_REJECTED, 502)
-                if response.status_code != 200:
-                    body = _read_bounded(response, MAX_CORE_ERROR_RESPONSE_BYTES)
-                    _require_content_type(response, "application/json", error_response=True)
-                    self._raise_http_error(response.status_code, body)
-                _require_content_type(response, "text/event-stream")
-                if response.headers.get("content-encoding", "identity").lower() not in {
-                    "",
-                    "identity",
-                }:
-                    _raise_local(CoreClientLocalErrorCodeV1.INVALID_RESPONSE, 502)
-                declared_length = _bounded_content_length(
-                    response,
-                    MAX_CORE_SSE_RESPONSE_BYTES,
-                    invalid_code=CoreClientLocalErrorCodeV1.SSE_PROTOCOL_ERROR,
-                )
-                yield CoreSseStreamV1(
-                    response.iter_bytes(),
-                    active_project_id=self._connection.project_id,
-                    bearer_token=self._connection.bearer_token,
-                    declared_length=declared_length,
-                )
-        except CoreClientErrorV1:
-            raise
-        except httpx.HTTPError as exc:
-            raise _local_exception(CoreClientLocalErrorCodeV1.CONNECTION_FAILED, 503) from exc
+            cursor = _visible_ascii_header(_cursor(last_event_id))
+            _scan_private_strings(
+                cursor,
+                self._private_values(),
+                CoreClientLocalErrorCodeV1.INVALID_REQUEST,
+                400,
+            )
+            headers["Last-Event-ID"] = cursor
+        with self._lease():
+            transport_error = False
+            try:
+                with self._http.stream(
+                    "GET", "/v1/events", headers=headers, follow_redirects=False
+                ) as response:
+                    self._register_response(response)
+                    try:
+                        self._ensure_response_origin(response)
+                        if 300 <= response.status_code < 400:
+                            _read_bounded(response, MAX_CORE_ERROR_RESPONSE_BYTES)
+                            _raise_local(CoreClientLocalErrorCodeV1.REDIRECT_REJECTED, 502)
+                        if response.status_code != 200:
+                            body = _read_bounded(response, MAX_CORE_ERROR_RESPONSE_BYTES)
+                            _require_content_type(
+                                response, "application/json", error_response=True
+                            )
+                            self._raise_http_error(response.status_code, body)
+                        _require_content_type(response, "text/event-stream")
+                        if response.headers.get("content-encoding", "identity").lower() not in {
+                            "",
+                            "identity",
+                        }:
+                            _raise_local(CoreClientLocalErrorCodeV1.INVALID_RESPONSE, 502)
+                        declared_length = _bounded_content_length(
+                            response,
+                            MAX_CORE_SSE_RESPONSE_BYTES,
+                            invalid_code=CoreClientLocalErrorCodeV1.SSE_PROTOCOL_ERROR,
+                        )
+                        yield CoreSseStreamV1(
+                            response.iter_bytes(),
+                            validate_event=self._validate_event_membership,
+                            private_values=self._private_values(),
+                            declared_length=declared_length,
+                            close_started=self._close_started,
+                        )
+                    finally:
+                        self._unregister_response(response)
+            except CoreClientErrorV1:
+                raise
+            except (httpx.HTTPError, OSError, UnicodeError, RuntimeError, ValueError):
+                transport_error = True
+            if transport_error:
+                self._raise_transport_error()
 
     def _mutation(
         self,
@@ -934,8 +1233,12 @@ class CoreControlClientV1:
         max_request_bytes: int = MAX_CORE_REQUEST_BYTES,
     ) -> Any:
         body = _encode_request(request, request_model, max_request_bytes)
-        if self._connection.bearer_token.encode("utf-8") in body:
-            _raise_local(CoreClientLocalErrorCodeV1.INVALID_REQUEST, 400)
+        _scan_private_strings(
+            request.model_dump(mode="json"),
+            self._private_values(),
+            CoreClientLocalErrorCodeV1.INVALID_REQUEST,
+            400,
+        )
         headers = self._mutation_headers(
             idempotency_key=idempotency_key,
             if_match=if_match,
@@ -981,29 +1284,36 @@ class CoreControlClientV1:
         request_headers = self._headers(authenticated=authenticated, accept="application/json")
         if headers:
             request_headers.update(headers)
-        self._ensure_open()
-        try:
-            with self._http.stream(
-                method,
-                path,
-                params=params,
-                content=content,
-                headers=request_headers,
-                follow_redirects=False,
-            ) as response:
-                self._ensure_response_origin(response)
-                limit = (
-                    max_response_bytes
-                    if response.status_code == expected_status
-                    else MAX_CORE_ERROR_RESPONSE_BYTES
-                )
-                body = _read_bounded(response, limit)
-                status_code = response.status_code
-                content_type = response.headers.get("content-type")
-        except CoreClientErrorV1:
-            raise
-        except httpx.HTTPError as exc:
-            raise _local_exception(CoreClientLocalErrorCodeV1.CONNECTION_FAILED, 503) from exc
+        with self._lease():
+            transport_error = False
+            try:
+                with self._http.stream(
+                    method,
+                    path,
+                    params=params,
+                    content=content,
+                    headers=request_headers,
+                    follow_redirects=False,
+                ) as response:
+                    self._register_response(response)
+                    try:
+                        self._ensure_response_origin(response)
+                        limit = (
+                            max_response_bytes
+                            if response.status_code == expected_status
+                            else MAX_CORE_ERROR_RESPONSE_BYTES
+                        )
+                        body = _read_bounded(response, limit)
+                        status_code = response.status_code
+                        content_type = response.headers.get("content-type")
+                    finally:
+                        self._unregister_response(response)
+            except CoreClientErrorV1:
+                raise
+            except (httpx.HTTPError, OSError, UnicodeError, RuntimeError, ValueError):
+                transport_error = True
+            if transport_error:
+                self._raise_transport_error()
         if 300 <= status_code < 400:
             _raise_local(CoreClientLocalErrorCodeV1.REDIRECT_REJECTED, 502)
         if status_code != expected_status:
@@ -1016,29 +1326,43 @@ class CoreControlClientV1:
             if body:
                 _raise_local(CoreClientLocalErrorCodeV1.INVALID_RESPONSE, 502)
             return None
-        if content_type is None or content_type.split(";", 1)[0].strip().lower() != "application/json":
+        if (
+            content_type is None
+            or content_type.split(";", 1)[0].strip().lower() != "application/json"
+        ):
             _raise_local(CoreClientLocalErrorCodeV1.INVALID_RESPONSE, 502)
-        if self._connection.bearer_token.encode("utf-8") in body:
-            _raise_local(CoreClientLocalErrorCodeV1.INVALID_RESPONSE, 502)
+        _decode_json_checked(
+            body,
+            self._private_values(),
+            CoreClientLocalErrorCodeV1.INVALID_RESPONSE,
+        )
+        validation_failed = False
         try:
             if isinstance(response_model, type) and issubclass(response_model, BaseModel):
                 return response_model.model_validate_json(body, strict=True)
             return TypeAdapter(response_model).validate_json(body, strict=True)
-        except (ValidationError, ValueError) as exc:
-            raise _local_exception(CoreClientLocalErrorCodeV1.INVALID_RESPONSE, 502) from exc
+        except (ValidationError, ValueError, TypeError, RecursionError):
+            validation_failed = True
+        if validation_failed:
+            _raise_local(CoreClientLocalErrorCodeV1.INVALID_RESPONSE, 502)
 
     def _raise_http_error(self, status_code: int, body: bytes) -> None:
-        if self._connection.bearer_token.encode("utf-8") in body:
-            _raise_local(CoreClientLocalErrorCodeV1.INVALID_ERROR_RESPONSE, 502)
+        _decode_json_checked(
+            body,
+            self._private_values(),
+            CoreClientLocalErrorCodeV1.INVALID_ERROR_RESPONSE,
+        )
+        validation_failed = False
         try:
             error = v1.ApiErrorV1.model_validate_json(body, strict=True)
-        except (ValidationError, ValueError) as exc:
-            raise _local_exception(
-                CoreClientLocalErrorCodeV1.INVALID_ERROR_RESPONSE, 502
-            ) from exc
+        except (ValidationError, ValueError, TypeError, RecursionError):
+            validation_failed = True
+            error = None
+        if validation_failed or error is None:
+            _raise_local(CoreClientLocalErrorCodeV1.INVALID_ERROR_RESPONSE, 502)
         if error.http_status != status_code:
             _raise_local(CoreClientLocalErrorCodeV1.INVALID_ERROR_RESPONSE, 502)
-        raise CoreClientErrorV1(status_code, error)
+        raise CoreClientErrorV1(status_code, error) from None
 
     def _headers(self, *, authenticated: bool, accept: str) -> dict[str, str]:
         headers = {"Accept": accept}
@@ -1053,15 +1377,347 @@ class CoreControlClientV1:
         if_match: str | None = None,
         if_project_match: str | None = None,
     ) -> dict[str, str]:
-        key = _header(idempotency_key)
-        if self._connection.bearer_token in key:
-            _raise_local(CoreClientLocalErrorCodeV1.INVALID_REQUEST, 400)
+        key = _visible_ascii_header(idempotency_key)
+        _scan_private_strings(
+            key,
+            self._private_values(),
+            CoreClientLocalErrorCodeV1.INVALID_REQUEST,
+            400,
+        )
         headers = {"Idempotency-Key": key}
         if if_match is not None:
             headers["If-Match"] = _etag(if_match)
         if if_project_match is not None:
             headers["If-Project-Match"] = _etag(if_project_match)
         return headers
+
+    @contextmanager
+    def _lease(self) -> Iterator[None]:
+        owner = threading.get_ident()
+        with self._state:
+            if self._closing or self._closed:
+                _raise_local(CoreClientLocalErrorCodeV1.CLIENT_CLOSED, 503)
+            self._leases += 1
+            self._lease_owners[owner] = self._lease_owners.get(owner, 0) + 1
+        try:
+            yield
+        finally:
+            with self._state:
+                self._leases -= 1
+                remaining = self._lease_owners[owner] - 1
+                if remaining:
+                    self._lease_owners[owner] = remaining
+                else:
+                    del self._lease_owners[owner]
+                self._state.notify_all()
+
+    def _register_response(self, response: httpx.Response) -> None:
+        with self._state:
+            if self._closing or self._closed:
+                try:
+                    response.close()
+                except (httpx.HTTPError, OSError, UnicodeError, RuntimeError, ValueError):
+                    pass
+                _raise_local(CoreClientLocalErrorCodeV1.CLIENT_CLOSED, 503)
+            self._active_responses.add(response)
+
+    def _unregister_response(self, response: httpx.Response) -> None:
+        with self._state:
+            self._active_responses.discard(response)
+
+    def _close_started(self) -> bool:
+        with self._state:
+            return self._closing or self._closed
+
+    def _raise_transport_error(self) -> None:
+        if self._close_started():
+            _raise_local(CoreClientLocalErrorCodeV1.CLIENT_CLOSED, 503)
+        _raise_local(CoreClientLocalErrorCodeV1.CONNECTION_FAILED, 503)
+
+    def _private_values(self) -> tuple[str, ...]:
+        return (
+            self._connection.bearer_token,
+            self._connection.origin,
+            self._connection.endpoint,
+            self._connection.session_id,
+        )
+
+    def _bind_resource(
+        self,
+        resource_type: v1.ResourceChangeType,
+        resource_id: str,
+        *,
+        parent_type: v1.ResourceChangeType | None = None,
+        parent_id: str | None = None,
+    ) -> None:
+        resource_id = _opaque_or_response_error(resource_id)
+        if (parent_type is None) != (parent_id is None):
+            _raise_local(CoreClientLocalErrorCodeV1.INVALID_RESPONSE, 502)
+        if parent_type is not None and parent_id is not None:
+            parent_id = _opaque_or_response_error(parent_id)
+            self._require_member(parent_type, parent_id)
+        binding = _ResourceBinding(
+            project_id=self._connection.project_id,
+            parent_type=parent_type,
+            parent_id=parent_id,
+        )
+        key = (resource_type, resource_id)
+        with self._membership_lock:
+            existing = self._members.get(key)
+            if existing is not None and existing != binding:
+                _raise_local(CoreClientLocalErrorCodeV1.ACTIVE_PROJECT_MISMATCH, 409)
+            self._members[key] = binding
+
+    def _require_member(self, resource_type: v1.ResourceChangeType, resource_id: str) -> None:
+        resource_id = _opaque_request(resource_id)
+        with self._membership_lock:
+            binding = self._members.get((resource_type, resource_id))
+        if binding is None or binding.project_id != self._connection.project_id:
+            _raise_local(CoreClientLocalErrorCodeV1.ACTIVE_PROJECT_MISMATCH, 409)
+
+    def _bind_log_ref(
+        self,
+        logs_ref: str,
+        parent_type: v1.ResourceChangeType,
+        parent_id: str,
+    ) -> None:
+        self._require_member(parent_type, parent_id)
+        binding = _LogRefBinding(self._connection.project_id, parent_type, parent_id)
+        with self._membership_lock:
+            existing = self._log_refs.get(logs_ref)
+            if existing is not None and existing != binding:
+                _raise_local(CoreClientLocalErrorCodeV1.ACTIVE_PROJECT_MISMATCH, 409)
+            self._log_refs[logs_ref] = binding
+
+    def _register_run(self, run: v1.RunSummaryV1, *, expected_id: str | None = None) -> None:
+        self._ensure_active_project(run.project_id)
+        if expected_id is not None and run.id != expected_id:
+            _raise_local(CoreClientLocalErrorCodeV1.INVALID_RESPONSE, 502)
+        self._bind_resource(
+            v1.ResourceChangeType.RUN,
+            run.id,
+            parent_type=v1.ResourceChangeType.PROJECT,
+            parent_id=run.project_id,
+        )
+        with self._membership_lock:
+            previous = self._runs.get(run.id)
+            if previous is not None and (
+                previous.project_id != run.project_id
+                or previous.project_snapshot != run.project_snapshot
+                or previous.task_snapshot != run.task_snapshot
+                or previous.workspace_snapshot != run.workspace_snapshot
+                or previous.registry_digest != run.registry_digest
+                or previous.execution_mode is not run.execution_mode
+                or previous.capture_mode is not run.capture_mode
+                or previous.required_revision != run.required_revision
+                or previous.created_at != run.created_at
+            ):
+                _raise_local(CoreClientLocalErrorCodeV1.INVALID_RESPONSE, 502)
+            self._runs[run.id] = run
+
+    def _register_project(
+        self, project: v1.ProjectSummaryV1, *, expected_id: str | None = None
+    ) -> None:
+        self._ensure_active_project(project.id)
+        if expected_id is not None and project.id != expected_id:
+            _raise_local(CoreClientLocalErrorCodeV1.INVALID_RESPONSE, 502)
+        with self._membership_lock:
+            self._project_state = project
+
+    def _register_service(
+        self, service: v1.ServiceSummaryV1, *, expected_id: str | None = None
+    ) -> None:
+        if expected_id is not None and service.id != expected_id:
+            _raise_local(CoreClientLocalErrorCodeV1.INVALID_RESPONSE, 502)
+        self._bind_resource(
+            v1.ResourceChangeType.SERVICE,
+            service.id,
+            parent_type=v1.ResourceChangeType.PROJECT,
+            parent_id=self._connection.project_id,
+        )
+
+    def _register_artifact(
+        self, artifact: v1.ArtifactSummaryBaseV1, *, expected_id: str | None = None
+    ) -> None:
+        self._ensure_active_project(artifact.project_id)
+        if expected_id is not None and artifact.id != expected_id:
+            _raise_local(CoreClientLocalErrorCodeV1.INVALID_RESPONSE, 502)
+        self._bind_resource(
+            v1.ResourceChangeType.ARTIFACT,
+            artifact.id,
+            parent_type=v1.ResourceChangeType.PROJECT,
+            parent_id=artifact.project_id,
+        )
+        with self._membership_lock:
+            previous = self._artifacts.get(artifact.id)
+            if previous is not None and (
+                previous.project_id != artifact.project_id
+                or previous.run_id != artifact.run_id
+                or previous.artifact_type is not artifact.artifact_type
+                or previous.content_sha256 != artifact.content_sha256
+                or previous.created_at != artifact.created_at
+            ):
+                _raise_local(CoreClientLocalErrorCodeV1.INVALID_RESPONSE, 502)
+            self._artifacts[artifact.id] = artifact
+
+    def _register_operation(
+        self, operation: v1.OperationV1, *, expected_id: str | None = None
+    ) -> None:
+        if expected_id is not None and operation.id != expected_id:
+            _raise_local(CoreClientLocalErrorCodeV1.INVALID_RESPONSE, 502)
+        parent_type = v1.ResourceChangeType.PROJECT
+        parent_id = self._connection.project_id
+        if isinstance(operation.request, v1.ServiceRestartOperationRequestV1):
+            parent_type = v1.ResourceChangeType.SERVICE
+            parent_id = operation.request.service_id
+        self._bind_resource(
+            v1.ResourceChangeType.OPERATION,
+            operation.id,
+            parent_type=parent_type,
+            parent_id=parent_id,
+        )
+        self._bind_log_ref(operation.logs_ref, v1.ResourceChangeType.OPERATION, operation.id)
+        with self._membership_lock:
+            previous = self._operations.get(operation.id)
+            if previous is not None and (
+                previous.kind is not operation.kind
+                or previous.descriptor != operation.descriptor
+                or previous.request != operation.request
+                or previous.logs_ref != operation.logs_ref
+                or previous.created_at != operation.created_at
+            ):
+                _raise_local(CoreClientLocalErrorCodeV1.INVALID_RESPONSE, 502)
+            self._operations[operation.id] = operation
+
+    def _register_diagnostic(
+        self, diagnostic: v1.DiagnosticV1, *, expected_id: str | None = None
+    ) -> None:
+        if expected_id is not None and diagnostic.id != expected_id:
+            _raise_local(CoreClientLocalErrorCodeV1.INVALID_RESPONSE, 502)
+        _ensure_diagnostic_project(diagnostic, self._connection.project_id)
+        target = diagnostic.target
+        if isinstance(target, v1.RunDiagnosticTargetV1):
+            self._require_member(v1.ResourceChangeType.RUN, target.run_id)
+        self._bind_resource(
+            v1.ResourceChangeType.DIAGNOSTIC,
+            diagnostic.id,
+            parent_type=v1.ResourceChangeType.PROJECT,
+            parent_id=self._connection.project_id,
+        )
+        for check in diagnostic.checks:
+            if check.logs_ref is not None:
+                self._bind_log_ref(check.logs_ref, v1.ResourceChangeType.DIAGNOSTIC, diagnostic.id)
+        with self._membership_lock:
+            previous = self._diagnostics.get(diagnostic.id)
+            if previous is not None and (
+                previous.scopes != diagnostic.scopes
+                or previous.target != diagnostic.target
+                or previous.created_at != diagnostic.created_at
+            ):
+                _raise_local(CoreClientLocalErrorCodeV1.INVALID_RESPONSE, 502)
+            self._diagnostics[diagnostic.id] = diagnostic
+
+    def _validate_new_workspace_upload(
+        self,
+        upload: v1.WorkspaceUploadSessionV1,
+        request: v1.WorkspaceUploadCreateV1,
+        project_id: str,
+        project_etag: str,
+    ) -> None:
+        self._validate_workspace_upload_identity(upload, upload.id, project_id)
+        if (
+            upload.status is not v1.WorkspaceUploadStatus.OPEN
+            or upload.accepted_offset != 0
+            or upload.project_snapshot != request.project_snapshot
+            or upload.project_etag != project_etag
+            or upload.archive != request.archive
+            or upload.base_workspace_snapshot != request.base_workspace_snapshot
+            or upload.publication is not None
+        ):
+            _raise_local(CoreClientLocalErrorCodeV1.INVALID_RESPONSE, 502)
+
+    def _validate_workspace_upload_identity(
+        self, upload: v1.WorkspaceUploadSessionV1, upload_id: str, project_id: str
+    ) -> None:
+        self._ensure_active_project(upload.project_id)
+        if upload.id != upload_id or upload.project_id != project_id:
+            _raise_local(CoreClientLocalErrorCodeV1.INVALID_RESPONSE, 502)
+
+    def _require_workspace_upload(
+        self, upload_id: str, project_id: str
+    ) -> v1.WorkspaceUploadSessionV1:
+        upload_id = _opaque_request(upload_id)
+        with self._membership_lock:
+            upload = self._workspace_uploads.get(upload_id)
+        if upload is None or upload.project_id != project_id:
+            _raise_local(CoreClientLocalErrorCodeV1.ACTIVE_PROJECT_MISMATCH, 409)
+        return upload
+
+    def _has_member(self, resource_type: v1.ResourceChangeType, resource_id: str) -> bool:
+        with self._membership_lock:
+            binding = self._members.get((resource_type, resource_id))
+        return binding is not None and binding.project_id == self._connection.project_id
+
+    def _require_event_member(
+        self, resource_type: v1.ResourceChangeType, resource_id: str
+    ) -> None:
+        if not self._has_member(resource_type, resource_id):
+            _raise_local(CoreClientLocalErrorCodeV1.SNAPSHOT_REFRESH_REQUIRED, 409)
+
+    def _validate_event_membership(self, envelope: v1.EventEnvelopeV1) -> None:
+        event = envelope.root
+        if isinstance(event, v1.HeartbeatEventV1):
+            return
+        if isinstance(event, v1.ProjectUpdatedEventV1):
+            self._register_project(event.payload, expected_id=self._connection.project_id)
+            return
+        if isinstance(event, v1.RunUpdatedEventV1):
+            self._register_run(event.payload, expected_id=event.change.resource_id)
+            return
+        if isinstance(event, v1.ArtifactUpdatedEventV1):
+            self._register_artifact(event.payload, expected_id=event.change.resource_id)
+            return
+        if isinstance(
+            event,
+            (v1.RevisionSuccessorTransitionUpdatedEventV1, v1.RevisionActivatedEventV1),
+        ):
+            _ensure_event_project(envelope, self._connection.project_id)
+            return
+        if isinstance(event, v1.RunTimelineAppendedEventV1):
+            self._require_event_member(v1.ResourceChangeType.RUN, event.payload.run_id)
+            return
+        if isinstance(event, v1.LogAppendedEventV1):
+            parent_type = (
+                v1.ResourceChangeType.RUN
+                if event.payload.run_id is not None
+                else v1.ResourceChangeType.SERVICE
+            )
+            parent_id = event.payload.run_id or event.payload.service_id
+            self._require_event_member(parent_type, parent_id)
+            return
+        if isinstance(event, v1.ServiceUpdatedEventV1):
+            self._require_event_member(v1.ResourceChangeType.SERVICE, event.payload.id)
+            return
+        if isinstance(event, v1.DiagnosticUpdatedEventV1):
+            target = event.payload.target
+            if isinstance(target, v1.ProjectDiagnosticTargetV1):
+                self._ensure_active_project(target.project_id)
+            elif isinstance(target, v1.RunDiagnosticTargetV1):
+                self._ensure_active_project(target.project_id)
+                self._require_event_member(v1.ResourceChangeType.RUN, target.run_id)
+            else:
+                self._require_event_member(v1.ResourceChangeType.DIAGNOSTIC, event.payload.id)
+            self._register_diagnostic(event.payload, expected_id=event.change.resource_id)
+            return
+        if isinstance(event, v1.OperationUpdatedEventV1):
+            request = event.payload.request
+            if isinstance(request, v1.ServiceRestartOperationRequestV1):
+                self._require_event_member(v1.ResourceChangeType.SERVICE, request.service_id)
+            else:
+                self._require_event_member(v1.ResourceChangeType.OPERATION, event.payload.id)
+            self._register_operation(event.payload, expected_id=event.change.resource_id)
+            return
+        _raise_local(CoreClientLocalErrorCodeV1.SSE_PROTOCOL_ERROR, 502)
 
     def _active_project(self, project_id: str | None) -> str:
         if project_id is None:
@@ -1070,18 +1726,20 @@ class CoreControlClientV1:
         return project_id
 
     def _ensure_active_project(self, project_id: str) -> None:
+        invalid = False
         try:
             candidate = _opaque(project_id)
-        except ValueError as exc:
-            raise _local_exception(
-                CoreClientLocalErrorCodeV1.ACTIVE_PROJECT_MISMATCH, 409
-            ) from exc
+        except ValueError:
+            invalid = True
+            candidate = ""
+        if invalid:
+            _raise_local(CoreClientLocalErrorCodeV1.ACTIVE_PROJECT_MISMATCH, 409)
         if candidate != self._connection.project_id:
             _raise_local(CoreClientLocalErrorCodeV1.ACTIVE_PROJECT_MISMATCH, 409)
 
     def _ensure_open(self) -> None:
-        with self._state_lock:
-            if self._closed:
+        with self._state:
+            if self._closing or self._closed:
                 _raise_local(CoreClientLocalErrorCodeV1.CLIENT_CLOSED, 503)
 
     def _ensure_response_origin(self, response: httpx.Response) -> None:
@@ -1095,13 +1753,90 @@ class CoreControlClientV1:
 def _encode_request(request: BaseModel, request_model: type[BaseModel], limit: int) -> bytes:
     if type(request) is not request_model:
         _raise_local(CoreClientLocalErrorCodeV1.INVALID_REQUEST, 400)
+    encoding_failed = False
     try:
         body = request.model_dump_json().encode("utf-8")
-    except (UnicodeError, ValueError) as exc:
-        raise _local_exception(CoreClientLocalErrorCodeV1.INVALID_REQUEST, 400) from exc
+    except (UnicodeError, ValueError, TypeError, RecursionError):
+        encoding_failed = True
+        body = b""
+    if encoding_failed:
+        _raise_local(CoreClientLocalErrorCodeV1.INVALID_REQUEST, 400)
     if len(body) > limit:
         _raise_local(CoreClientLocalErrorCodeV1.INVALID_REQUEST, 400)
     return body
+
+
+def _decode_json_checked(
+    body: bytes,
+    private_values: tuple[str, ...],
+    code: CoreClientLocalErrorCodeV1,
+) -> object:
+    decoding_failed = False
+    try:
+        value = json.loads(
+            body.decode("utf-8", errors="strict"),
+            parse_constant=lambda _value: (_ for _ in ()).throw(ValueError()),
+        )
+    except (UnicodeError, ValueError, TypeError, RecursionError):
+        decoding_failed = True
+        value = None
+    if decoding_failed:
+        _raise_local(code, 502)
+    _scan_private_strings(value, private_values, code, 502)
+    return value
+
+
+def _scan_private_strings(
+    value: object,
+    private_values: tuple[str, ...],
+    code: CoreClientLocalErrorCodeV1,
+    status_code: int,
+) -> None:
+    bearer, origin, endpoint, session_id = private_values
+    folded_urls = (origin.casefold(), endpoint.casefold())
+    stack = [value]
+    while stack:
+        current = stack.pop()
+        if isinstance(current, str):
+            if (
+                bearer in current
+                or any(url in current.casefold() for url in folded_urls)
+                or session_id in current
+            ):
+                _raise_local(code, status_code)
+        elif isinstance(current, Mapping):
+            stack.extend(current.keys())
+            stack.extend(current.values())
+        elif isinstance(current, (list, tuple)):
+            stack.extend(current)
+
+
+def _decoded_chunk_length(request: v1.WorkspaceUploadChunkV1) -> int:
+    decoding_failed = False
+    try:
+        decoded = base64.b64decode(request.content_base64, validate=True)
+    except (binascii.Error, ValueError):
+        decoding_failed = True
+        decoded = b""
+    if decoding_failed:
+        _raise_local(CoreClientLocalErrorCodeV1.INVALID_REQUEST, 400)
+    return len(decoded)
+
+
+def _ensure_upload_stable(
+    previous: v1.WorkspaceUploadSessionV1,
+    current: v1.WorkspaceUploadSessionV1,
+) -> None:
+    if (
+        current.id != previous.id
+        or current.project_id != previous.project_id
+        or current.project_snapshot != previous.project_snapshot
+        or current.project_etag != previous.project_etag
+        or current.archive != previous.archive
+        or current.base_workspace_snapshot != previous.base_workspace_snapshot
+        or current.created_at != previous.created_at
+    ):
+        _raise_local(CoreClientLocalErrorCodeV1.INVALID_RESPONSE, 502)
 
 
 def _read_bounded(response: httpx.Response, limit: int) -> bytes:
@@ -1110,16 +1845,11 @@ def _read_bounded(response: httpx.Response, limit: int) -> bytes:
     declared = _bounded_content_length(response, limit)
     chunks: list[bytes] = []
     total = 0
-    try:
-        for chunk in response.iter_bytes():
-            total += len(chunk)
-            if total > limit:
-                _raise_local(CoreClientLocalErrorCodeV1.RESPONSE_TOO_LARGE, 502)
-            chunks.append(chunk)
-    except CoreClientErrorV1:
-        raise
-    except httpx.HTTPError as exc:
-        raise _local_exception(CoreClientLocalErrorCodeV1.CONNECTION_FAILED, 503) from exc
+    for chunk in response.iter_bytes():
+        total += len(chunk)
+        if total > limit:
+            _raise_local(CoreClientLocalErrorCodeV1.RESPONSE_TOO_LARGE, 502)
+        chunks.append(chunk)
     if declared is not None and total != declared:
         _raise_local(CoreClientLocalErrorCodeV1.INVALID_RESPONSE, 502)
     return b"".join(chunks)
@@ -1134,12 +1864,15 @@ def _bounded_content_length(
     content_length = response.headers.get("content-length")
     if content_length is None:
         return None
+    invalid = not re.fullmatch(r"0|[1-9][0-9]*", content_length)
+    if invalid:
+        _raise_local(invalid_code, 502)
     try:
-        if not re.fullmatch(r"0|[1-9][0-9]*", content_length):
-            raise ValueError
         declared = int(content_length)
-    except ValueError as exc:
-        raise _local_exception(invalid_code, 502) from exc
+    except (ValueError, UnicodeError):
+        declared = -1
+    if declared < 0:
+        _raise_local(invalid_code, 502)
     if declared > limit:
         _raise_local(CoreClientLocalErrorCodeV1.RESPONSE_TOO_LARGE, 502)
     return declared
@@ -1169,28 +1902,71 @@ def _enum_query(value: object, enum_type: type[StrEnum]) -> str:
 
 
 def _opaque(value: str) -> str:
+    invalid = False
     try:
-        return _OPAQUE_ID.validate_python(value, strict=True)
-    except ValidationError as exc:
-        raise ValueError("invalid opaque identity") from exc
+        result = _OPAQUE_ID.validate_python(value, strict=True)
+    except ValidationError:
+        invalid = True
+        result = ""
+    if invalid:
+        raise ValueError("invalid opaque identity") from None
+    return result
+
+
+def _opaque_or_response_error(value: str) -> str:
+    invalid = False
+    try:
+        result = _opaque(value)
+    except ValueError:
+        invalid = True
+        result = ""
+    if invalid:
+        _raise_local(CoreClientLocalErrorCodeV1.INVALID_RESPONSE, 502)
+    return result
+
+
+def _opaque_request(value: str) -> str:
+    invalid = False
+    try:
+        result = _opaque(value)
+    except ValueError:
+        invalid = True
+        result = ""
+    if invalid:
+        _raise_local(CoreClientLocalErrorCodeV1.INVALID_REQUEST, 400)
+    return result
 
 
 def _cursor(value: str) -> str:
+    invalid = False
     try:
-        return _CURSOR.validate_python(value, strict=True)
-    except ValidationError as exc:
-        raise _local_exception(CoreClientLocalErrorCodeV1.INVALID_REQUEST, 400) from exc
+        result = _CURSOR.validate_python(value, strict=True)
+    except ValidationError:
+        invalid = True
+        result = ""
+    if invalid:
+        _raise_local(CoreClientLocalErrorCodeV1.INVALID_REQUEST, 400)
+    return result
 
 
 def _segment(value: str) -> str:
+    invalid = False
     try:
-        return quote(_opaque(value), safe="")
-    except ValueError as exc:
-        raise _local_exception(CoreClientLocalErrorCodeV1.INVALID_REQUEST, 400) from exc
+        result = quote(_opaque(value), safe="")
+    except ValueError:
+        invalid = True
+        result = ""
+    if invalid:
+        _raise_local(CoreClientLocalErrorCodeV1.INVALID_REQUEST, 400)
+    return result
 
 
-def _header(value: str) -> str:
-    if not isinstance(value, str) or not _HEADER_VALUE.fullmatch(value):
+def _visible_ascii_header(value: str) -> str:
+    if (
+        not isinstance(value, str)
+        or not _HEADER_VALUE.fullmatch(value)
+        or any(not 0x21 <= ord(char) <= 0x7E for char in value)
+    ):
         _raise_local(CoreClientLocalErrorCodeV1.INVALID_REQUEST, 400)
     return value
 
@@ -1261,7 +2037,7 @@ def _iter_sse_frames(
         raise ValueError("SSE stream length differs from Content-Length")
 
 
-def _validate_sse_frame(frame: bytes) -> v1.SseFrameV1:
+def _validate_sse_frame(frame: bytes, private_values: tuple[str, ...]) -> v1.SseFrameV1:
     fields: dict[str, bytes] = {}
     for line in frame.split(b"\n"):
         name, separator, raw_value = line.partition(b":")
@@ -1275,11 +2051,32 @@ def _validate_sse_frame(frame: bytes) -> v1.SseFrameV1:
         raise ValueError("incomplete SSE frame")
     event_id = fields["id"].decode("utf-8", errors="strict")
     event_name = fields["event"].decode("utf-8", errors="strict")
+    _visible_ascii_sse_id(event_id)
+    _scan_private_strings(
+        (event_id, event_name),
+        private_values,
+        CoreClientLocalErrorCodeV1.SSE_PROTOCOL_ERROR,
+        502,
+    )
+    _decode_json_checked(
+        fields["data"], private_values, CoreClientLocalErrorCodeV1.SSE_PROTOCOL_ERROR
+    )
     envelope = v1.EventEnvelopeV1.model_validate_json(fields["data"], strict=True)
     return v1.SseFrameV1.model_validate(
         {"id": event_id, "event": event_name, "data": envelope},
         strict=True,
     )
+
+
+def _visible_ascii_sse_id(value: str) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > 512
+        or any(not 0x21 <= ord(char) <= 0x7E for char in value)
+    ):
+        _raise_local(CoreClientLocalErrorCodeV1.SSE_PROTOCOL_ERROR, 502)
+    return value
 
 
 def _ensure_diagnostic_request_project(
@@ -1328,16 +2125,18 @@ def _local_exception(
         CoreClientLocalErrorV1(
             code=code,
             message=_LOCAL_ERROR_MESSAGES[code],
-            retryable=code in {
+            retryable=code
+            in {
                 CoreClientLocalErrorCodeV1.CONNECTION_FAILED,
                 CoreClientLocalErrorCodeV1.CLIENT_CLOSED,
+                CoreClientLocalErrorCodeV1.SNAPSHOT_REFRESH_REQUIRED,
             },
         ),
     )
 
 
 def _raise_local(code: CoreClientLocalErrorCodeV1, status_code: int) -> None:
-    raise _local_exception(code, status_code)
+    raise _local_exception(code, status_code) from None
 
 
 __all__ = [
