@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 import errno
+import fcntl
 import hashlib
 import io
+import itertools
 import json
 import multiprocessing
 import os
@@ -21,6 +23,7 @@ from desktop.sidecar.workspace_imports import (
     WorkspaceImportError,
     WorkspaceImportIntegrityError,
     WorkspaceImportNotFoundError,
+    WorkspaceImportOwnership,
     WorkspaceImportStore,
     WorkspaceImportStoreConfigurationError,
 )
@@ -28,6 +31,8 @@ from desktop.sidecar.workspace_imports import (
 
 BLOCK = 512
 ZERO_BLOCK = bytes(BLOCK)
+_OWNER_SEQUENCE = itertools.count()
+_OWNERS_BY_IMPORT: dict[str, WorkspaceImportOwnership] = {}
 
 
 def _put(header: bytearray, start: int, end: int, value: bytes) -> None:
@@ -42,7 +47,11 @@ def _split_header_path(header_path: bytes) -> tuple[bytes, bytes]:
     for index in range(len(header_path) - 1, -1, -1):
         prefix = header_path[:index]
         name = header_path[index + 1 :]
-        if header_path[index : index + 1] == b"/" and 1 <= len(prefix) <= 155 and 1 <= len(name) <= 100:
+        if (
+            header_path[index : index + 1] == b"/"
+            and 1 <= len(prefix) <= 155
+            and 1 <= len(name) <= 100
+        ):
             return name, prefix
     raise ValueError("path cannot be encoded in ustar")
 
@@ -88,9 +97,7 @@ def _archive(
     for path, content, mode in entries:
         directory = content is None
         body = b"" if content is None else content
-        result.extend(
-            _header(path, directory=directory, size=len(body), mode=mode)
-        )
+        result.extend(_header(path, directory=directory, size=len(body), mode=mode))
         result.extend(body)
         result.extend(bytes((-len(body)) % BLOCK))
     result.extend(terminator)
@@ -120,10 +127,32 @@ def _source(tmp_path: Path, archive: bytes, *, name: str = "source.tar") -> Path
     return path
 
 
-def _ingest(store: WorkspaceImportStore, tmp_path: Path, archive: bytes) -> WorkspaceImportRefV1:
+def _new_ownership(*, project_id: str = "project-test") -> WorkspaceImportOwnership:
+    sequence = next(_OWNER_SEQUENCE)
+    return WorkspaceImportOwnership(
+        project_id=project_id,
+        operation_id=f"workspace-sync-{sequence}",
+        idempotency_key=f"workspace-sync-idempotency-{sequence:016d}",
+    )
+
+
+def _ownership(import_ref: WorkspaceImportRefV1) -> WorkspaceImportOwnership:
+    return _OWNERS_BY_IMPORT[import_ref.import_id]
+
+
+def _ingest(
+    store: WorkspaceImportStore,
+    tmp_path: Path,
+    archive: bytes,
+    *,
+    ownership: WorkspaceImportOwnership | None = None,
+) -> WorkspaceImportRefV1:
     path = _source(tmp_path, archive)
+    selected_ownership = ownership or _new_ownership()
     with path.open("rb", buffering=0) as stream:
-        return store.ingest(stream)
+        import_ref = store.ingest(stream, ownership=selected_ownership)
+    _OWNERS_BY_IMPORT[import_ref.import_id] = selected_ownership
+    return import_ref
 
 
 def _simple_archive(content: bytes = b"hello") -> bytes:
@@ -142,8 +171,13 @@ def _stored_directory(root: Path, import_ref: WorkspaceImportRefV1) -> Path:
 def _process_ingest(root: str, source: str, results: multiprocessing.Queue[object]) -> None:
     try:
         store = WorkspaceImportStore(root)
+        ownership = WorkspaceImportOwnership(
+            project_id="project-process",
+            operation_id=f"workspace-sync-{Path(source).name}",
+            idempotency_key=f"workspace-sync-process-{Path(source).name}-00000000",
+        )
         with open(source, "rb", buffering=0) as stream:
-            import_ref = store.ingest(stream)
+            import_ref = store.ingest(stream, ownership=ownership)
         results.put(("ok", import_ref.import_id, import_ref.content_sha256))
     except BaseException as exc:
         results.put(("error", repr(exc)))
@@ -160,8 +194,13 @@ def _process_capacity_ingest(
             root,
             max_retained_imports=max_retained_imports,
         )
+        ownership = WorkspaceImportOwnership(
+            project_id="project-capacity",
+            operation_id=f"workspace-sync-{Path(source).name}",
+            idempotency_key=f"workspace-sync-capacity-{Path(source).name}-00000000",
+        )
         with open(source, "rb", buffering=0) as stream:
-            import_ref = store.ingest(stream)
+            import_ref = store.ingest(stream, ownership=ownership)
         results.put(("ok", import_ref.import_id))
     except BaseException as exc:
         results.put(("error", repr(exc)))
@@ -190,7 +229,7 @@ def test_ingest_returns_exact_contract_ref_and_verified_handle(tmp_path: Path) -
     assert stat.S_IMODE((stored / "archive.tar").stat().st_mode) == 0o600
     assert stat.S_IMODE((stored / "metadata.json").stat().st_mode) == 0o600
 
-    with store.resolve(import_ref) as stream:
+    with store.resolve(import_ref, ownership=_ownership(import_ref)) as stream:
         assert isinstance(stream.name, int)
         assert stream.read() == archive
     assert stream.closed
@@ -224,7 +263,9 @@ def test_ingest_accepts_an_integer_fd_without_changing_its_offset(tmp_path: Path
     descriptor = os.open(path, os.O_RDONLY)
     try:
         os.lseek(descriptor, 17, os.SEEK_SET)
-        import_ref = store.ingest(descriptor)
+        ownership = _new_ownership()
+        import_ref = store.ingest(descriptor, ownership=ownership)
+        _OWNERS_BY_IMPORT[import_ref.import_id] = ownership
         assert os.lseek(descriptor, 0, os.SEEK_CUR) == 17
     finally:
         os.close(descriptor)
@@ -239,7 +280,7 @@ def test_ingest_never_accepts_a_host_path_or_unverifiable_stream(
     store = WorkspaceImportStore(tmp_path / "imports")
 
     with pytest.raises(TypeError):
-        store.ingest(source)  # type: ignore[arg-type]
+        store.ingest(source, ownership=_new_ownership())  # type: ignore[arg-type]
 
 
 def test_ingest_rejects_nonregular_and_symlink_descriptors(tmp_path: Path) -> None:
@@ -247,7 +288,7 @@ def test_ingest_rejects_nonregular_and_symlink_descriptors(tmp_path: Path) -> No
     read_descriptor, write_descriptor = os.pipe()
     try:
         with pytest.raises(WorkspaceArchiveValidationError, match="regular file"):
-            store.ingest(read_descriptor)
+            store.ingest(read_descriptor, ownership=_new_ownership())
     finally:
         os.close(read_descriptor)
         os.close(write_descriptor)
@@ -260,12 +301,14 @@ def test_ingest_rejects_nonregular_and_symlink_descriptors(tmp_path: Path) -> No
     descriptor = os.open(link, os.O_PATH | os.O_NOFOLLOW)
     try:
         with pytest.raises(WorkspaceArchiveValidationError, match="regular file"):
-            store.ingest(descriptor)
+            store.ingest(descriptor, ownership=_new_ownership())
     finally:
         os.close(descriptor)
 
 
-def test_ingest_detects_source_identity_mutation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_ingest_detects_source_identity_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     store = WorkspaceImportStore(tmp_path / "imports")
     path = _source(tmp_path, _simple_archive(b"x" * 2048))
     descriptor = os.open(path, os.O_RDWR)
@@ -283,7 +326,7 @@ def test_ingest_detects_source_identity_mutation(tmp_path: Path, monkeypatch: py
     monkeypatch.setattr(workspace_imports_module.os, "pread", mutate_after_read)
     try:
         with pytest.raises(WorkspaceArchiveValidationError, match="identity changed"):
-            store.ingest(descriptor)
+            store.ingest(descriptor, ownership=_new_ownership())
     finally:
         os.close(descriptor)
     assert list((tmp_path / "imports").iterdir()) == []
@@ -421,9 +464,7 @@ def test_rejects_path_depth_and_accepts_exact_header_path_byte_limit(tmp_path: P
     top = "a" * 55
     parent = f"{top}/{'c' * 99}"
     maximum_file = f"{parent}/{'b' * 100}"
-    boundary = _archive(
-        [(top, None, 0o755), (parent, None, 0o755), (maximum_file, b"", 0o644)]
-    )
+    boundary = _archive([(top, None, 0o755), (parent, None, 0o755), (maximum_file, b"", 0o644)])
     assert _ingest(store, tmp_path, boundary).entry_count == 3
 
 
@@ -467,9 +508,12 @@ def test_concurrent_ingests_of_same_and_different_archives_are_isolated(tmp_path
 
     def ingest_one(index: int) -> WorkspaceImportRefV1:
         path = _source(tmp_path, archives[index], name=f"source-{index}.tar")
+        ownership = _new_ownership()
         with path.open("rb", buffering=0) as stream:
             barrier.wait()
-            return store.ingest(stream)
+            import_ref = store.ingest(stream, ownership=ownership)
+        _OWNERS_BY_IMPORT[import_ref.import_id] = ownership
+        return import_ref
 
     with ThreadPoolExecutor(max_workers=len(archives)) as executor:
         refs = list(executor.map(ingest_one, range(len(archives))))
@@ -479,7 +523,7 @@ def test_concurrent_ingests_of_same_and_different_archives_are_isolated(tmp_path
         hashlib.sha256(archive).hexdigest() for archive in archives
     }
     for import_ref, archive in zip(refs, archives, strict=True):
-        with store.resolve(import_ref) as stream:
+        with store.resolve(import_ref, ownership=_ownership(import_ref)) as stream:
             assert stream.read() == archive
 
 
@@ -558,9 +602,13 @@ def test_retained_limits_reserve_complete_reconciliation_cost(tmp_path: Path) ->
     WorkspaceImportStore(root, **options)
 
     with pytest.raises(ValueError, match="exceed reconciliation budgets"):
-        WorkspaceImportStore(tmp_path / "node-short", **(options | {"reconcile_max_nodes": required_nodes - 1}))
+        WorkspaceImportStore(
+            tmp_path / "node-short", **(options | {"reconcile_max_nodes": required_nodes - 1})
+        )
     with pytest.raises(ValueError, match="exceed reconciliation budgets"):
-        WorkspaceImportStore(tmp_path / "byte-short", **(options | {"reconcile_max_bytes": required_bytes - 1}))
+        WorkspaceImportStore(
+            tmp_path / "byte-short", **(options | {"reconcile_max_bytes": required_bytes - 1})
+        )
 
 
 def test_cross_process_capacity_check_cannot_overcommit_retained_count(tmp_path: Path) -> None:
@@ -568,8 +616,7 @@ def test_cross_process_capacity_check_cannot_overcommit_retained_count(tmp_path:
     WorkspaceImportStore(root, max_retained_imports=2)
     archive = _simple_archive()
     sources = [
-        _source(tmp_path, archive, name=f"capacity-source-{index}.tar")
-        for index in range(3)
+        _source(tmp_path, archive, name=f"capacity-source-{index}.tar") for index in range(3)
     ]
     context = multiprocessing.get_context("fork")
     results = context.Queue()
@@ -595,7 +642,9 @@ def test_cross_process_capacity_check_cannot_overcommit_retained_count(tmp_path:
     assert len(list(root.iterdir())) == 2
 
 
-@pytest.mark.parametrize("hook", ["_after_archive_fsync", "_after_metadata_fsync", "_before_import_publish"])
+@pytest.mark.parametrize(
+    "hook", ["_after_archive_fsync", "_after_metadata_fsync", "_before_import_publish"]
+)
 def test_fault_before_publish_cleans_private_temp(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -660,14 +709,14 @@ def test_resolve_rejects_archive_tamper_and_replacement(tmp_path: Path) -> None:
         stream.flush()
         os.fsync(stream.fileno())
     with pytest.raises(WorkspaceImportIntegrityError, match="digest"):
-        with store.resolve(import_ref):
+        with store.resolve(import_ref, ownership=_ownership(import_ref)):
             pass
 
     archive_path.unlink()
     archive_path.write_bytes(_simple_archive())
     os.chmod(archive_path, 0o600)
     with pytest.raises(WorkspaceImportIntegrityError):
-        with store.resolve(import_ref):
+        with store.resolve(import_ref, ownership=_ownership(import_ref)):
             pass
 
 
@@ -681,7 +730,7 @@ def test_resolve_rejects_metadata_tamper_symlink_and_reference_mismatch(tmp_path
     metadata_path.write_text(json.dumps(raw), encoding="ascii")
     os.chmod(metadata_path, 0o600)
     with pytest.raises(WorkspaceImportIntegrityError, match="closed JSON|canonical"):
-        with store.resolve(import_ref):
+        with store.resolve(import_ref, ownership=_ownership(import_ref)):
             pass
 
     metadata_path.unlink()
@@ -689,12 +738,14 @@ def test_resolve_rejects_metadata_tamper_symlink_and_reference_mismatch(tmp_path
     target.write_text("outside", encoding="ascii")
     metadata_path.symlink_to(target)
     with pytest.raises(WorkspaceImportIntegrityError, match="metadata"):
-        with store.resolve(import_ref):
+        with store.resolve(import_ref, ownership=_ownership(import_ref)):
             pass
     assert target.read_text(encoding="ascii") == "outside"
 
 
-def test_resolve_detects_mutation_during_rehash(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_resolve_detects_mutation_during_rehash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     root = tmp_path / "imports"
     archive = _simple_archive(b"x" * (2 * 1024 * 1024))
     store = WorkspaceImportStore(root)
@@ -717,7 +768,7 @@ def test_resolve_detects_mutation_during_rehash(tmp_path: Path, monkeypatch: pyt
 
     monkeypatch.setattr(workspace_imports_module.os, "read", mutate_after_archive_read)
     with pytest.raises(WorkspaceImportIntegrityError, match="changed"):
-        with store.resolve(import_ref):
+        with store.resolve(import_ref, ownership=_ownership(import_ref)):
             pass
 
 
@@ -729,12 +780,12 @@ def test_release_and_delete_require_exact_ref_and_remove_import(tmp_path: Path) 
     mismatched = first.model_copy(update={"content_sha256": second.content_sha256})
 
     with pytest.raises(WorkspaceImportIntegrityError, match="reference"):
-        store.release(mismatched)
-    store.release(first)
+        store.release(mismatched, ownership=_ownership(first))
+    store.release(first, ownership=_ownership(first))
     assert not _stored_directory(root, first).exists()
-    store.delete(second)
+    store.delete(second, ownership=_ownership(second))
     with pytest.raises(WorkspaceImportNotFoundError):
-        with store.resolve(second):
+        with store.resolve(second, ownership=_ownership(second)):
             pass
 
 
@@ -769,10 +820,10 @@ def test_external_refs_require_exact_store_id_before_filesystem_access(
     monkeypatch.setattr(store, "_locked_root", forbidden_root_lock)
     with pytest.raises(WorkspaceImportIntegrityError, match="not issued by this store"):
         if operation == "resolve":
-            with store.resolve(external_ref):
+            with store.resolve(external_ref, ownership=_ownership(valid_ref)):
                 pass
         else:
-            getattr(store, operation)(external_ref)
+            getattr(store, operation)(external_ref, ownership=_ownership(valid_ref))
     assert not filesystem_reached
     assert _stored_directory(root, valid_ref).is_dir()
 
@@ -846,8 +897,15 @@ def test_reconcile_preserves_import_on_transient_filesystem_errors(
     else:
         real_operation = workspace_imports_module.os.getxattr
 
-        def fail_archive_xattr(*_args: object, **_kwargs: object) -> bytes:
-            raise OSError(errno.EIO, "injected archive xattr failure")
+        def fail_archive_xattr(
+            descriptor: int,
+            attribute: str,
+            *_args: object,
+            **_kwargs: object,
+        ) -> bytes:
+            if attribute == workspace_imports_module._ARCHIVE_TOKEN_XATTR:
+                raise OSError(errno.EIO, "injected archive xattr failure")
+            return real_operation(descriptor, attribute)
 
         monkeypatch.setattr(workspace_imports_module.os, "getxattr", fail_archive_xattr)
 
@@ -864,7 +922,7 @@ def test_reconcile_preserves_import_on_transient_filesystem_errors(
     else:
         monkeypatch.setattr(workspace_imports_module.os, "getxattr", real_operation)
     store.reconcile()
-    with store.resolve(import_ref) as stream:
+    with store.resolve(import_ref, ownership=_ownership(import_ref)) as stream:
         assert stream.read() == _simple_archive()
 
 
@@ -875,12 +933,12 @@ def test_root_and_stored_modes_fail_closed(tmp_path: Path) -> None:
     with pytest.raises(WorkspaceImportStoreConfigurationError, match="0700"):
         WorkspaceImportStore(root)
 
-    os.chmod(root, 0o700)
+    root.rmdir()
     store = WorkspaceImportStore(root)
     import_ref = _ingest(store, tmp_path, _simple_archive())
     os.chmod(_stored_directory(root, import_ref) / "archive.tar", 0o644)
     with pytest.raises(WorkspaceImportIntegrityError, match="0600"):
-        with store.resolve(import_ref):
+        with store.resolve(import_ref, ownership=_ownership(import_ref)):
             pass
 
 
@@ -893,7 +951,11 @@ def test_reconcile_refuses_to_follow_nested_orphan_directories(tmp_path: Path) -
 
     with pytest.raises(WorkspaceImportIntegrityError, match="nested directories"):
         WorkspaceImportStore(root)
-    assert (nested / "child").is_dir()
+    quarantined = [
+        entry for entry in root.iterdir() if entry.name.startswith(".workspace-import-quarantine-")
+    ]
+    assert len(quarantined) == 1
+    assert (quarantined[0] / "child").is_dir()
 
 
 def test_reconcile_does_not_delete_a_pathname_replacement(
@@ -921,3 +983,185 @@ def test_reconcile_does_not_delete_a_pathname_replacement(
         store.reconcile()
     assert replacement_marker.read_text(encoding="ascii") == "replacement"
     assert preserved.is_dir()
+
+
+def test_root_identity_rejects_live_and_restart_path_replacement(tmp_path: Path) -> None:
+    parent = tmp_path / "state"
+    root = parent / "imports"
+    parent.mkdir(mode=0o700)
+    store = WorkspaceImportStore(root)
+    _ingest(store, tmp_path, _simple_archive())
+    original = parent / "original-imports"
+    root.rename(original)
+    root.mkdir(mode=0o700)
+    sentinel = root / "replacement-sentinel"
+    sentinel.write_text("preserve", encoding="ascii")
+
+    with pytest.raises(WorkspaceImportIntegrityError, match="root binding"):
+        store.reconcile()
+    with pytest.raises(WorkspaceImportStoreConfigurationError, match="root binding"):
+        WorkspaceImportStore(root)
+
+    assert sentinel.read_text(encoding="ascii") == "preserve"
+    assert original.is_dir()
+
+
+def test_ancestor_replacement_and_symlinked_ancestor_fail_closed(tmp_path: Path) -> None:
+    parent = tmp_path / "state"
+    root = parent / "imports"
+    parent.mkdir(mode=0o700)
+    store = WorkspaceImportStore(root)
+    moved_parent = tmp_path / "original-state"
+    parent.rename(moved_parent)
+    parent.mkdir(mode=0o700)
+    root.mkdir(mode=0o700)
+    sentinel = root / "replacement-sentinel"
+    sentinel.write_text("preserve", encoding="ascii")
+
+    with pytest.raises(WorkspaceImportIntegrityError, match="ancestor binding"):
+        store.reconcile()
+    with pytest.raises(WorkspaceImportStoreConfigurationError, match="marker|existing root"):
+        WorkspaceImportStore(root)
+    assert sentinel.read_text(encoding="ascii") == "preserve"
+
+    symlink_parent = tmp_path / "symlink-state"
+    symlink_parent.symlink_to(moved_parent, target_is_directory=True)
+    with pytest.raises(WorkspaceImportStoreConfigurationError, match="no-follow ancestor"):
+        WorkspaceImportStore(symlink_parent / "other-imports")
+
+
+def test_fresh_root_marker_recovers_after_parent_entry_fsync_crash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "state" / "imports"
+    root.parent.mkdir(mode=0o700)
+
+    def fail(_parent_descriptor: int, _root_name: str) -> None:
+        raise OSError("injected root initialization crash")
+
+    monkeypatch.setattr(workspace_imports_module, "_after_fresh_root_parent_fsync", fail)
+    with pytest.raises(OSError, match="initialization crash"):
+        WorkspaceImportStore(root)
+
+    monkeypatch.setattr(
+        workspace_imports_module,
+        "_after_fresh_root_parent_fsync",
+        lambda *_args: None,
+    )
+    restarted = WorkspaceImportStore(root)
+    import_ref = _ingest(restarted, tmp_path, _simple_archive())
+    with restarted.resolve(import_ref, ownership=_ownership(import_ref)) as stream:
+        assert stream.read() == _simple_archive()
+
+
+def test_ownership_is_atomic_idempotent_and_project_scoped(tmp_path: Path) -> None:
+    root = tmp_path / "imports"
+    store = WorkspaceImportStore(root)
+    archive = _simple_archive()
+    owner = _new_ownership(project_id="project-a")
+    first = _ingest(store, tmp_path, archive, ownership=owner)
+    retry = _ingest(store, tmp_path, archive, ownership=owner)
+
+    assert retry == first
+    assert [entry.name for entry in root.iterdir()] == [first.import_id]
+
+    with pytest.raises(WorkspaceImportIntegrityError, match="idempotency"):
+        _ingest(store, tmp_path, _simple_archive(b"different"), ownership=owner)
+
+    other_owner = WorkspaceImportOwnership(
+        project_id="project-b",
+        operation_id=owner.operation_id,
+        idempotency_key=owner.idempotency_key,
+    )
+    with pytest.raises(WorkspaceImportIntegrityError, match="ownership"):
+        with store.resolve(first, ownership=other_owner):
+            pass
+    with pytest.raises(WorkspaceImportIntegrityError, match="ownership"):
+        store.release(first, ownership=other_owner)
+    with store.resolve(first, ownership=owner) as stream:
+        assert stream.read() == archive
+
+    independent_owner = _new_ownership(project_id="project-b")
+    independent = _ingest(
+        store,
+        tmp_path,
+        archive,
+        ownership=independent_owner,
+    )
+    store.release(first, ownership=owner)
+    with store.resolve(independent, ownership=independent_owner) as stream:
+        assert stream.read() == archive
+
+
+def test_publish_crash_is_reclaimed_by_exact_ownership_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "imports"
+    store = WorkspaceImportStore(root)
+    archive = _simple_archive()
+    owner = _new_ownership(project_id="project-crash")
+
+    def fail(*_args: object) -> None:
+        raise OSError("post-publish crash")
+
+    monkeypatch.setattr(workspace_imports_module, "_after_import_publish", fail)
+    with pytest.raises(OSError, match="post-publish crash"):
+        _ingest(store, tmp_path, archive, ownership=owner)
+
+    monkeypatch.setattr(workspace_imports_module, "_after_import_publish", lambda *_args: None)
+    restarted = WorkspaceImportStore(root)
+    recovered = _ingest(restarted, tmp_path, archive, ownership=owner)
+    assert [entry.name for entry in root.iterdir()] == [recovered.import_id]
+    with restarted.resolve(recovered, ownership=owner) as stream:
+        assert stream.read() == archive
+
+
+def test_resolve_rejects_same_uid_in_place_rewrite_before_snapshot_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "imports"
+    store = WorkspaceImportStore(root)
+    archive = _simple_archive(b"original")
+    import_ref = _ingest(store, tmp_path, archive)
+    archive_path = _stored_directory(root, import_ref) / "archive.tar"
+
+    def rewrite_before_commit(*_args: object) -> None:
+        with archive_path.open("r+b", buffering=0) as stream:
+            stream.seek(BLOCK)
+            stream.write(b"X")
+            stream.flush()
+            os.fsync(stream.fileno())
+
+    monkeypatch.setattr(
+        workspace_imports_module,
+        "_before_snapshot_commit",
+        rewrite_before_commit,
+    )
+    with pytest.raises(WorkspaceImportIntegrityError, match="changed|digest"):
+        with store.resolve(import_ref, ownership=_ownership(import_ref)):
+            pass
+
+
+def test_resolve_yields_unlinked_read_only_snapshot_not_mutable_store_inode(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "imports"
+    store = WorkspaceImportStore(root)
+    archive = _simple_archive(b"stable snapshot")
+    import_ref = _ingest(store, tmp_path, archive)
+    archive_path = _stored_directory(root, import_ref) / "archive.tar"
+
+    with store.resolve(import_ref, ownership=_ownership(import_ref)) as stream:
+        assert fcntl.fcntl(stream.fileno(), fcntl.F_GETFL) & os.O_ACCMODE == os.O_RDONLY
+        with archive_path.open("r+b", buffering=0) as stored:
+            stored.seek(BLOCK)
+            stored.write(b"X")
+            stored.flush()
+            os.fsync(stored.fileno())
+        assert stream.read() == archive
+        assert all(
+            not entry.name.startswith(".workspace-import-snapshot-") for entry in root.iterdir()
+        )

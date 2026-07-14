@@ -42,8 +42,13 @@ _ARCHIVE_NAME = "archive.tar"
 _METADATA_MAX_BYTES = 4096
 _MAX_FLAT_CLEANUP_NODES = 8
 _ARCHIVE_TOKEN_XATTR = "user.openevo.workspace-import-token"
+_ROOT_TOKEN_XATTR = "user.openevo.workspace-import-root-token"
 _IMPORT_ID_PREFIX = "workspace-import-"
 _TEMP_PREFIX = ".workspace-import-tmp-"
+_SNAPSHOT_PREFIX = ".workspace-import-snapshot-"
+_QUARANTINE_PREFIX = ".workspace-import-quarantine-"
+_ROOT_MARKER_PREFIX = ".openevo-workspace-import-root-"
+_ROOT_MARKER_MAX_BYTES = 2048
 _IMPORT_ID_RE = re.compile(r"^workspace-import-[0-9a-f]{48}$")
 _DEFAULT_RECONCILE_MAX_NODES = 300_000
 _DEFAULT_RECONCILE_MAX_BYTES = 64 * 1024 * 1024 * 1024
@@ -91,6 +96,29 @@ class _ReconcileBudgetExceeded(WorkspaceImportIntegrityError):
 
 class _DeterministicImportCorruption(WorkspaceImportIntegrityError):
     """State proven invalid from successfully observed filesystem contents."""
+
+
+@dataclass(frozen=True, slots=True)
+class WorkspaceImportOwnership:
+    """Store-internal principal and idempotency binding for one workspace sync."""
+
+    project_id: str
+    operation_id: str
+    idempotency_key: str
+
+    def __post_init__(self) -> None:
+        for label, value, minimum in (
+            ("project_id", self.project_id, 1),
+            ("operation_id", self.operation_id, 1),
+            ("idempotency_key", self.idempotency_key, 16),
+        ):
+            if (
+                not isinstance(value, str)
+                or not minimum <= len(value) <= 256
+                or value != value.strip()
+                or any(ord(character) < 0x20 or ord(character) == 0x7F for character in value)
+            ):
+                raise ValueError(f"workspace import {label} is invalid")
 
 
 @dataclass(frozen=True, slots=True)
@@ -147,8 +175,7 @@ def _required_reconcile_budget(import_count: int, archive_bytes: int) -> tuple[i
     """Return the worst reconciliation cost for retained imports plus one crash temp."""
 
     return (
-        _RECONCILE_CRASH_TEMP_NODES
-        + (import_count * _RECONCILE_NODES_PER_RETAINED_IMPORT),
+        _RECONCILE_CRASH_TEMP_NODES + (import_count * _RECONCILE_NODES_PER_RETAINED_IMPORT),
         _RECONCILE_CRASH_TEMP_BYTES
         + (import_count * _RECONCILE_FIXED_BYTES_PER_RETAINED_IMPORT)
         + (2 * archive_bytes),
@@ -196,6 +223,7 @@ def _write_all(descriptor: int, data: bytes | memoryview) -> None:
 @dataclass(frozen=True, slots=True)
 class _StoredMetadata:
     import_ref: WorkspaceImportRefV1
+    ownership: WorkspaceImportOwnership
     directory_device: int
     directory_inode: int
     archive_device: int
@@ -203,10 +231,48 @@ class _StoredMetadata:
     archive_token: str
 
 
+@dataclass(frozen=True, slots=True)
+class _RootMarker:
+    store_token: str
+    root_name: str
+    parent_device: int
+    parent_inode: int
+    root_device: int | None = None
+    root_inode: int | None = None
+
+
+def _canonical_root_marker(marker: _RootMarker) -> bytes:
+    payload: dict[str, object] = {
+        "parent_identity": {
+            "device": marker.parent_device,
+            "inode": marker.parent_inode,
+        },
+        "root_name": marker.root_name,
+        "schema_version": "1",
+        "store_token": marker.store_token,
+    }
+    if marker.root_device is not None and marker.root_inode is not None:
+        payload["root_identity"] = {
+            "device": marker.root_device,
+            "inode": marker.root_inode,
+        }
+    return json.dumps(
+        payload,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("ascii")
+
+
 def _canonical_metadata(metadata: _StoredMetadata) -> bytes:
     return json.dumps(
         {
             "import_ref": metadata.import_ref.model_dump(mode="json"),
+            "ownership": {
+                "idempotency_key": metadata.ownership.idempotency_key,
+                "operation_id": metadata.ownership.operation_id,
+                "project_id": metadata.ownership.project_id,
+            },
             "schema_version": "1",
             "storage_identity": {
                 "archive_device": metadata.archive_device,
@@ -271,6 +337,9 @@ def _rename_noreplace(source: str, destination: str, *, directory_fd: int) -> No
         raise OSError(error, os.strerror(error), destination)
 
 
+_quarantine_noreplace = _rename_noreplace
+
+
 def _after_archive_fsync(_temporary_descriptor: int) -> None:
     """Private fault-injection hook."""
 
@@ -284,6 +353,14 @@ def _before_import_publish(_root_descriptor: int, _import_id: str) -> None:
 
 
 def _after_import_publish(_root_descriptor: int, _import_id: str) -> None:
+    """Private fault-injection hook."""
+
+
+def _after_fresh_root_parent_fsync(_parent_descriptor: int, _root_name: str) -> None:
+    """Private fault-injection hook."""
+
+
+def _before_snapshot_commit(_root_descriptor: int, _archive_descriptor: int) -> None:
     """Private fault-injection hook."""
 
 
@@ -343,7 +420,9 @@ def _source_sha256(descriptor: int, size: int) -> str:
         except InterruptedError:
             continue
         if not chunk:
-            raise WorkspaceArchiveValidationError("workspace import source changed while rehashing")
+            raise WorkspaceArchiveValidationError(
+                "workspace import source changed while rehashing"
+            )
         digest.update(chunk)
         offset += len(chunk)
     if os.pread(descriptor, 1, size):
@@ -389,7 +468,9 @@ def _canonical_path_fields(header_path: bytes) -> tuple[bytes, bytes]:
     raise WorkspaceArchiveValidationError("workspace path has no canonical ustar split")
 
 
-def _validate_logical_path(header_path: bytes, *, is_directory: bool) -> tuple[str, tuple[str, ...]]:
+def _validate_logical_path(
+    header_path: bytes, *, is_directory: bool
+) -> tuple[str, tuple[str, ...]]:
     if len(header_path) > _MAX_PATH_BYTES:
         raise WorkspaceArchiveValidationError("workspace archive path exceeds 256 bytes")
     if is_directory:
@@ -452,16 +533,24 @@ def _parse_header(
     if any(block[157:257]) or block[257:263] != b"ustar\0" or block[263:265] != b"00":
         raise WorkspaceArchiveValidationError("workspace archive is not canonical POSIX ustar")
     if any(block[265:345]) or any(block[500:512]):
-        raise WorkspaceArchiveValidationError("workspace archive unused header fields must be zero")
+        raise WorkspaceArchiveValidationError(
+            "workspace archive unused header fields must be zero"
+        )
     header_path = prefix + (b"/" if prefix else b"") + name
     expected_name, expected_prefix = _canonical_path_fields(header_path)
     if name != expected_name or prefix != expected_prefix:
-        raise WorkspaceArchiveValidationError("workspace path does not use the canonical ustar split")
+        raise WorkspaceArchiveValidationError(
+            "workspace path does not use the canonical ustar split"
+        )
     logical_path, parts = _validate_logical_path(header_path, is_directory=is_directory)
     if prior_header_path is not None and header_path <= prior_header_path:
-        raise WorkspaceArchiveValidationError("workspace entries are not in header-path byte order")
+        raise WorkspaceArchiveValidationError(
+            "workspace entries are not in header-path byte order"
+        )
     if logical_path in entries:
-        raise WorkspaceArchiveValidationError("workspace archive contains a duplicate logical path")
+        raise WorkspaceArchiveValidationError(
+            "workspace archive contains a duplicate logical path"
+        )
     for index in range(1, len(parts)):
         parent = "/".join(parts[:index])
         if entries.get(parent) is not True:
@@ -487,7 +576,9 @@ def _copy_and_validate_archive(
         if not any(block):
             second = reader.read_exact(_BLOCK_SIZE, label="end marker")
             if any(second):
-                raise WorkspaceArchiveValidationError("workspace archive needs two zero end blocks")
+                raise WorkspaceArchiveValidationError(
+                    "workspace archive needs two zero end blocks"
+                )
             if reader.offset != source_size:
                 raise WorkspaceArchiveValidationError("workspace archive has trailing bytes")
             break
@@ -547,9 +638,7 @@ class WorkspaceImportStore:
             max_retained_archive_bytes,
         )
         if required_nodes > reconcile_max_nodes or required_bytes > reconcile_max_bytes:
-            raise ValueError(
-                "retained workspace import limits exceed reconciliation budgets"
-            )
+            raise ValueError("retained workspace import limits exceed reconciliation budgets")
         self._root = os.path.abspath(os.fspath(root))
         self._max_archive_bytes = max_archive_bytes
         self._max_entries = max_entries
@@ -558,33 +647,362 @@ class WorkspaceImportStore:
         self._max_retained_archive_bytes = max_retained_archive_bytes
         self._reconcile_max_nodes = reconcile_max_nodes
         self._reconcile_max_bytes = reconcile_max_bytes
-        self._prepare_root()
-        self.reconcile()
+        self._parent_descriptor = -1
+        self._root_descriptor = -1
+        self._parent_components = tuple(
+            component for component in os.path.dirname(self._root).split(os.sep) if component
+        )
+        self._root_name = os.path.basename(self._root)
+        if not self._root_name or self._root == os.path.abspath(os.sep):
+            raise WorkspaceImportStoreConfigurationError(
+                "workspace import root must have a dedicated parent directory"
+            )
+        marker_suffix = hashlib.sha256(os.fsencode(self._root_name)).hexdigest()[:32]
+        self._marker_name = f"{_ROOT_MARKER_PREFIX}{marker_suffix}.json"
+        self._pending_marker_name = f"{self._marker_name}.pending"
+        self._ancestor_identities: tuple[tuple[int, int], ...] = ()
+        self._root_identity = (0, 0)
+        self._root_marker: _RootMarker | None = None
+        try:
+            self._prepare_root()
+            self.reconcile()
+        except BaseException:
+            self.close()
+            raise
+
+    def close(self) -> None:
+        """Close stable root anchors held by this store instance."""
+
+        for attribute in ("_root_descriptor", "_parent_descriptor"):
+            descriptor = getattr(self, attribute, -1)
+            if descriptor >= 0:
+                try:
+                    os.close(descriptor)
+                finally:
+                    setattr(self, attribute, -1)
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except OSError:
+            pass
+
+    def _open_parent_chain(self) -> tuple[int, tuple[tuple[int, int], ...]]:
+        try:
+            descriptor = os.open(os.path.abspath(os.sep), _ROOT_OPEN_FLAGS)
+        except OSError as exc:  # pragma: no cover - a usable host always has an openable root
+            raise WorkspaceImportStoreConfigurationError(
+                "workspace import no-follow ancestor root is unavailable"
+            ) from exc
+        identities = []
+        try:
+            value = os.fstat(descriptor)
+            identities.append((value.st_dev, value.st_ino))
+            for component in self._parent_components:
+                try:
+                    child = os.open(component, _DIR_OPEN_FLAGS, dir_fd=descriptor)
+                except OSError as exc:
+                    raise WorkspaceImportStoreConfigurationError(
+                        "workspace import path has an unavailable no-follow ancestor"
+                    ) from exc
+                previous = descriptor
+                descriptor = child
+                os.close(previous)
+                value = os.fstat(descriptor)
+                if not stat.S_ISDIR(value.st_mode):
+                    raise WorkspaceImportStoreConfigurationError(
+                        "workspace import no-follow ancestor is not a directory"
+                    )
+                identities.append((value.st_dev, value.st_ino))
+            return descriptor, tuple(identities)
+        except BaseException:
+            os.close(descriptor)
+            raise
+
+    @staticmethod
+    def _require_private_marker(value: os.stat_result, *, label: str) -> None:
+        if (
+            not stat.S_ISREG(value.st_mode)
+            or value.st_uid != os.geteuid()
+            or stat.S_IMODE(value.st_mode) != 0o600
+            or value.st_nlink != 1
+        ):
+            raise WorkspaceImportStoreConfigurationError(
+                f"{label} must be a private regular file mode 0600 link-count one"
+            )
+
+    def _read_root_marker(self, parent_descriptor: int, name: str) -> _RootMarker | None:
+        try:
+            descriptor = os.open(name, _FILE_READ_FLAGS, dir_fd=parent_descriptor)
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise WorkspaceImportStoreConfigurationError(
+                "workspace import root marker is unavailable"
+            ) from exc
+        try:
+            before = os.fstat(descriptor)
+            self._require_private_marker(before, label="workspace import root marker")
+            if before.st_size > _ROOT_MARKER_MAX_BYTES:
+                raise WorkspaceImportStoreConfigurationError(
+                    "workspace import root marker exceeds its byte limit"
+                )
+            raw = self._read_bounded_file(
+                descriptor,
+                before.st_size,
+                label="workspace import root marker",
+            )
+            after = os.fstat(descriptor)
+            current = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+            if _identity(before) != _identity(after) or not _same_inode(after, current):
+                raise WorkspaceImportStoreConfigurationError(
+                    "workspace import root marker changed while reading"
+                )
+            try:
+                payload = json.loads(raw)
+                if not isinstance(payload, dict):
+                    raise ValueError("marker is not an object")
+                expected = {"parent_identity", "root_name", "schema_version", "store_token"}
+                if "root_identity" in payload:
+                    expected.add("root_identity")
+                if set(payload) != expected or payload["schema_version"] != "1":
+                    raise ValueError("marker fields are not closed")
+                parent = payload["parent_identity"]
+                root = payload.get("root_identity")
+                if not isinstance(parent, dict) or set(parent) != {"device", "inode"}:
+                    raise ValueError("parent identity is invalid")
+                if root is not None and (
+                    not isinstance(root, dict) or set(root) != {"device", "inode"}
+                ):
+                    raise ValueError("root identity is invalid")
+                values = [parent["device"], parent["inode"]]
+                if root is not None:
+                    values.extend((root["device"], root["inode"]))
+                if any(
+                    isinstance(value, bool) or not isinstance(value, int) or value < 0
+                    for value in values
+                ):
+                    raise ValueError("marker identity values are invalid")
+                token = payload["store_token"]
+                if not isinstance(token, str) or re.fullmatch(r"[0-9a-f]{64}", token) is None:
+                    raise ValueError("marker token is invalid")
+                if payload["root_name"] != self._root_name:
+                    raise ValueError("marker root name is invalid")
+                marker = _RootMarker(
+                    store_token=token,
+                    root_name=payload["root_name"],
+                    parent_device=parent["device"],
+                    parent_inode=parent["inode"],
+                    root_device=None if root is None else root["device"],
+                    root_inode=None if root is None else root["inode"],
+                )
+            except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+                raise WorkspaceImportStoreConfigurationError(
+                    "workspace import root marker is invalid"
+                ) from exc
+            if raw != _canonical_root_marker(marker):
+                raise WorkspaceImportStoreConfigurationError(
+                    "workspace import root marker is not canonical"
+                )
+            return marker
+        finally:
+            os.close(descriptor)
+
+    @staticmethod
+    def _create_private_file(parent_descriptor: int, name: str, content: bytes) -> None:
+        if len(content) > _ROOT_MARKER_MAX_BYTES:
+            raise WorkspaceImportStoreConfigurationError(
+                "workspace import root marker exceeds its byte limit"
+            )
+        descriptor = os.open(
+            name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=parent_descriptor,
+        )
+        try:
+            os.fchmod(descriptor, 0o600)
+            _write_all(descriptor, content)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+    def _remove_parent_marker(self, name: str) -> None:
+        try:
+            value = os.stat(name, dir_fd=self._parent_descriptor, follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        quarantine = f"{_QUARANTINE_PREFIX}{secrets.token_hex(24)}"
+        _quarantine_noreplace(name, quarantine, directory_fd=self._parent_descriptor)
+        moved = os.stat(quarantine, dir_fd=self._parent_descriptor, follow_symlinks=False)
+        if not _same_inode(value, moved):
+            raise WorkspaceImportStoreConfigurationError(
+                "workspace import parent marker changed during cleanup"
+            )
+        os.unlink(quarantine, dir_fd=self._parent_descriptor)
+        os.fsync(self._parent_descriptor)
+
+    def _finish_root_binding(self, pending: _RootMarker, root_descriptor: int) -> _RootMarker:
+        root_status = os.fstat(root_descriptor)
+        self._require_private_directory(root_status, label="workspace import root")
+        try:
+            observed_token = os.getxattr(root_descriptor, _ROOT_TOKEN_XATTR)
+        except OSError as exc:
+            if exc.errno not in {errno.ENODATA, getattr(errno, "ENOATTR", errno.ENODATA)}:
+                raise WorkspaceImportStoreConfigurationError(
+                    "workspace import root identity token is unavailable"
+                ) from exc
+            os.setxattr(root_descriptor, _ROOT_TOKEN_XATTR, bytes.fromhex(pending.store_token))
+        else:
+            if observed_token != bytes.fromhex(pending.store_token):
+                raise WorkspaceImportStoreConfigurationError(
+                    "workspace import root identity token changed"
+                )
+        os.fsync(root_descriptor)
+        final = _RootMarker(
+            store_token=pending.store_token,
+            root_name=self._root_name,
+            parent_device=pending.parent_device,
+            parent_inode=pending.parent_inode,
+            root_device=root_status.st_dev,
+            root_inode=root_status.st_ino,
+        )
+        existing = self._read_root_marker(self._parent_descriptor, self._marker_name)
+        if existing is None:
+            self._create_private_file(
+                self._parent_descriptor,
+                self._marker_name,
+                _canonical_root_marker(final),
+            )
+            os.fsync(self._parent_descriptor)
+        elif existing != final:
+            raise WorkspaceImportStoreConfigurationError(
+                "workspace import root binding marker conflicts with recovery"
+            )
+        self._remove_parent_marker(self._pending_marker_name)
+        return final
 
     def _prepare_root(self) -> None:
-        created = False
+        parent_descriptor, ancestor_identities = self._open_parent_chain()
+        self._parent_descriptor = parent_descriptor
+        self._ancestor_identities = ancestor_identities
+        parent_status = os.fstat(parent_descriptor)
+        parent_identity = (parent_status.st_dev, parent_status.st_ino)
+        final = self._read_root_marker(parent_descriptor, self._marker_name)
+        pending = self._read_root_marker(parent_descriptor, self._pending_marker_name)
+        if final is not None and (final.root_device is None or final.root_inode is None):
+            raise WorkspaceImportStoreConfigurationError(
+                "workspace import final root marker has no root identity"
+            )
+        if pending is not None and (
+            pending.root_device is not None or pending.root_inode is not None
+        ):
+            raise WorkspaceImportStoreConfigurationError(
+                "workspace import pending root marker already has a root identity"
+            )
+        if final is None and pending is None:
+            try:
+                existing = os.stat(
+                    self._root_name,
+                    dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                existing = None
+            if existing is not None:
+                self._require_private_directory(existing, label="workspace import root")
+                raise WorkspaceImportStoreConfigurationError(
+                    "workspace import existing root has no durable binding marker"
+                )
+            pending = _RootMarker(
+                store_token=secrets.token_hex(32),
+                root_name=self._root_name,
+                parent_device=parent_identity[0],
+                parent_inode=parent_identity[1],
+            )
+            self._create_private_file(
+                parent_descriptor,
+                self._pending_marker_name,
+                _canonical_root_marker(pending),
+            )
+            os.fsync(parent_descriptor)
+        selected = final or pending
+        assert selected is not None
+        if (selected.parent_device, selected.parent_inode) != parent_identity:
+            raise WorkspaceImportStoreConfigurationError(
+                "workspace import root marker parent binding changed"
+            )
         try:
-            os.mkdir(self._root, 0o700)
-            created = True
-        except FileExistsError:
-            pass
-        try:
-            descriptor = os.open(self._root, _ROOT_OPEN_FLAGS)
+            root_descriptor = os.open(
+                self._root_name,
+                _ROOT_OPEN_FLAGS,
+                dir_fd=parent_descriptor,
+            )
+        except FileNotFoundError:
+            if final is not None:
+                raise WorkspaceImportStoreConfigurationError(
+                    "workspace import root binding target is missing"
+                ) from None
+            os.mkdir(self._root_name, 0o700, dir_fd=parent_descriptor)
+            os.fsync(parent_descriptor)
+            _after_fresh_root_parent_fsync(parent_descriptor, self._root_name)
+            root_descriptor = os.open(
+                self._root_name,
+                _ROOT_OPEN_FLAGS,
+                dir_fd=parent_descriptor,
+            )
+            os.fchmod(root_descriptor, 0o700)
         except OSError as exc:
             raise WorkspaceImportStoreConfigurationError(
                 "workspace import root must be a no-follow directory"
             ) from exc
-        try:
-            if created:
-                os.fchmod(descriptor, 0o700)
-            self._require_private_directory(os.fstat(descriptor), label="workspace import root")
-            path_status = os.stat(self._root, follow_symlinks=False)
-            if not _same_inode(os.fstat(descriptor), path_status):
+        self._root_descriptor = root_descriptor
+        root_status = os.fstat(root_descriptor)
+        self._require_private_directory(root_status, label="workspace import root")
+        path_status = os.stat(
+            self._root_name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        if not _same_inode(root_status, path_status):
+            raise WorkspaceImportStoreConfigurationError(
+                "workspace import root changed while it was opened"
+            )
+        if final is None:
+            with os.scandir(root_descriptor) as entries:
+                if next(entries, None) is not None:
+                    raise WorkspaceImportStoreConfigurationError(
+                        "workspace import pending root is not empty"
+                    )
+            final = self._finish_root_binding(selected, root_descriptor)
+        else:
+            if (final.root_device, final.root_inode) != (root_status.st_dev, root_status.st_ino):
                 raise WorkspaceImportStoreConfigurationError(
-                    "workspace import root changed while it was opened"
+                    "workspace import root binding changed"
                 )
-        finally:
-            os.close(descriptor)
+            try:
+                token = os.getxattr(root_descriptor, _ROOT_TOKEN_XATTR)
+            except OSError as exc:
+                raise WorkspaceImportStoreConfigurationError(
+                    "workspace import root identity token is unavailable"
+                ) from exc
+            if token != bytes.fromhex(final.store_token):
+                raise WorkspaceImportStoreConfigurationError(
+                    "workspace import root identity token changed"
+                )
+            if pending is not None:
+                if pending != _RootMarker(
+                    store_token=final.store_token,
+                    root_name=final.root_name,
+                    parent_device=final.parent_device,
+                    parent_inode=final.parent_inode,
+                ):
+                    raise WorkspaceImportStoreConfigurationError(
+                        "workspace import pending root marker conflicts"
+                    )
+                self._remove_parent_marker(self._pending_marker_name)
+        self._root_identity = (root_status.st_dev, root_status.st_ino)
+        self._root_marker = final
 
     @staticmethod
     def _require_private_directory(value: os.stat_result, *, label: str) -> None:
@@ -616,26 +1034,62 @@ class WorkspaceImportStore:
     @contextmanager
     def _locked_root(self) -> Iterator[int]:
         with _thread_lock_for(self._root):
-            descriptor = os.open(self._root, _ROOT_OPEN_FLAGS)
+            self._verify_root_path_binding()
+            descriptor = os.dup(self._root_descriptor)
             locked = False
             try:
                 fcntl.flock(descriptor, fcntl.LOCK_EX)
                 locked = True
                 opened = os.fstat(descriptor)
                 self._require_private_directory(opened, label="workspace import root")
-                current = os.stat(self._root, follow_symlinks=False)
-                if not _same_inode(opened, current):
+                if (opened.st_dev, opened.st_ino) != self._root_identity:
                     raise WorkspaceImportIntegrityError("workspace import root binding changed")
+                self._verify_root_path_binding()
                 yield descriptor
-                current = os.stat(self._root, follow_symlinks=False)
-                if not _same_inode(opened, current):
-                    raise WorkspaceImportIntegrityError("workspace import root binding changed")
+                self._verify_root_path_binding()
             finally:
                 try:
                     if locked:
                         fcntl.flock(descriptor, fcntl.LOCK_UN)
                 finally:
                     os.close(descriptor)
+
+    def _verify_root_path_binding(self) -> None:
+        try:
+            parent_descriptor, identities = self._open_parent_chain()
+        except WorkspaceImportStoreConfigurationError as exc:
+            raise WorkspaceImportIntegrityError(
+                "workspace import ancestor binding changed"
+            ) from exc
+        try:
+            if identities != self._ancestor_identities:
+                raise WorkspaceImportIntegrityError("workspace import ancestor binding changed")
+            current = os.stat(
+                self._root_name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+            if (current.st_dev, current.st_ino) != self._root_identity:
+                raise WorkspaceImportIntegrityError("workspace import root binding changed")
+            opened = os.fstat(self._root_descriptor)
+            self._require_private_directory(opened, label="workspace import root")
+            if (opened.st_dev, opened.st_ino) != self._root_identity:
+                raise WorkspaceImportIntegrityError("workspace import root binding changed")
+            marker = self._read_root_marker(parent_descriptor, self._marker_name)
+            if marker != self._root_marker:
+                raise WorkspaceImportIntegrityError("workspace import root binding marker changed")
+            token = os.getxattr(self._root_descriptor, _ROOT_TOKEN_XATTR)
+            assert self._root_marker is not None
+            if token != bytes.fromhex(self._root_marker.store_token):
+                raise WorkspaceImportIntegrityError("workspace import root identity token changed")
+        except FileNotFoundError as exc:
+            raise WorkspaceImportIntegrityError("workspace import root binding changed") from exc
+        except (OSError, WorkspaceImportStoreConfigurationError) as exc:
+            raise WorkspaceImportIntegrityError(
+                "workspace import root binding verification failed"
+            ) from exc
+        finally:
+            os.close(parent_descriptor)
 
     @staticmethod
     def _source_descriptor(source: int | BinaryIO) -> int:
@@ -654,9 +1108,16 @@ class WorkspaceImportStore:
             raise TypeError("workspace import source descriptor is invalid")
         return descriptor
 
-    def ingest(self, source: int | BinaryIO) -> WorkspaceImportRefV1:
+    def ingest(
+        self,
+        source: int | BinaryIO,
+        *,
+        ownership: WorkspaceImportOwnership,
+    ) -> WorkspaceImportRefV1:
         """Validate and persist one already-open native archive handoff."""
 
+        if not isinstance(ownership, WorkspaceImportOwnership):
+            raise TypeError("ingest requires WorkspaceImportOwnership")
         source_descriptor = self._source_descriptor(source)
         before = os.fstat(source_descriptor)
         if not stat.S_ISREG(before.st_mode):
@@ -664,11 +1125,31 @@ class WorkspaceImportStore:
         if before.st_size < 1024 or before.st_size > self._max_archive_bytes:
             raise WorkspaceArchiveValidationError("workspace archive byte-size budget exceeded")
         source_identity = _identity(before)
+        source_digest = _source_sha256(source_descriptor, before.st_size)
+        if _identity(os.fstat(source_descriptor)) != source_identity:
+            raise WorkspaceArchiveValidationError(
+                "workspace import source identity changed while reading"
+            )
         import_id = f"{_IMPORT_ID_PREFIX}{secrets.token_hex(24)}"
         temporary_name = f"{_TEMP_PREFIX}{secrets.token_hex(24)}"
         published = False
         with self._locked_root() as root_descriptor:
-            retained = self._retained_usage(root_descriptor)
+            retained, existing_ref = self._retained_usage(
+                root_descriptor,
+                requested_ownership=ownership,
+                requested_size=before.st_size,
+                requested_digest=source_digest,
+            )
+            if existing_ref is not None:
+                if (
+                    _identity(os.fstat(source_descriptor)) != source_identity
+                    or _source_sha256(source_descriptor, before.st_size) != source_digest
+                    or _identity(os.fstat(source_descriptor)) != source_identity
+                ):
+                    raise WorkspaceArchiveValidationError(
+                        "workspace import source identity changed while reading"
+                    )
+                return existing_ref
             self._require_retained_capacity(
                 retained.import_count + 1,
                 retained.archive_bytes + before.st_size,
@@ -693,13 +1174,23 @@ class WorkspaceImportStore:
                     dir_fd=temporary_descriptor,
                 )
                 os.fchmod(archive_descriptor, 0o600)
-                result = _copy_and_validate_archive(
-                    source_descriptor,
-                    archive_descriptor,
-                    before.st_size,
-                    max_entries=self._max_entries,
-                    max_extracted_bytes=self._max_extracted_bytes,
-                )
+                try:
+                    result = _copy_and_validate_archive(
+                        source_descriptor,
+                        archive_descriptor,
+                        before.st_size,
+                        max_entries=self._max_entries,
+                        max_extracted_bytes=self._max_extracted_bytes,
+                    )
+                except WorkspaceArchiveValidationError as exc:
+                    if (
+                        _identity(os.fstat(source_descriptor)) != source_identity
+                        or _source_sha256(source_descriptor, before.st_size) != source_digest
+                    ):
+                        raise WorkspaceArchiveValidationError(
+                            "workspace import source identity changed while reading"
+                        ) from exc
+                    raise
                 archive_token = secrets.token_hex(32)
                 os.setxattr(
                     archive_descriptor,
@@ -715,8 +1206,7 @@ class WorkspaceImportStore:
                 after = os.fstat(source_descriptor)
                 if (
                     _identity(after) != source_identity
-                    or _source_sha256(source_descriptor, before.st_size)
-                    != result.content_sha256
+                    or _source_sha256(source_descriptor, before.st_size) != result.content_sha256
                     or _identity(os.fstat(source_descriptor)) != source_identity
                 ):
                     raise WorkspaceArchiveValidationError(
@@ -732,6 +1222,7 @@ class WorkspaceImportStore:
                 directory_status = os.fstat(temporary_descriptor)
                 stored_metadata = _StoredMetadata(
                     import_ref=import_ref,
+                    ownership=ownership,
                     directory_device=directory_status.st_dev,
                     directory_inode=directory_status.st_ino,
                     archive_device=archive_status.st_dev,
@@ -739,6 +1230,10 @@ class WorkspaceImportStore:
                     archive_token=archive_token,
                 )
                 metadata = _canonical_metadata(stored_metadata)
+                if len(metadata) > _METADATA_MAX_BYTES:
+                    raise WorkspaceImportError(
+                        "workspace import ownership metadata exceeds its byte limit"
+                    )
                 metadata_descriptor = os.open(
                     _METADATA_NAME,
                     os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
@@ -756,7 +1251,6 @@ class WorkspaceImportStore:
                 _before_import_publish(root_descriptor, import_id)
                 _rename_noreplace(temporary_name, import_id, directory_fd=root_descriptor)
                 published = True
-                _after_import_publish(root_descriptor, import_id)
                 self._verify_directory_binding(
                     root_descriptor,
                     import_id,
@@ -764,6 +1258,7 @@ class WorkspaceImportStore:
                     label="published workspace import",
                 )
                 os.fsync(root_descriptor)
+                _after_import_publish(root_descriptor, import_id)
                 return import_ref
             finally:
                 if archive_descriptor is not None:
@@ -779,16 +1274,27 @@ class WorkspaceImportStore:
         if archive_bytes > self._max_retained_archive_bytes:
             raise WorkspaceImportError("workspace retained archive byte budget exceeded")
         required_nodes, required_bytes = _required_reconcile_budget(import_count, archive_bytes)
-        if required_nodes > self._reconcile_max_nodes or required_bytes > self._reconcile_max_bytes:
+        if (
+            required_nodes > self._reconcile_max_nodes
+            or required_bytes > self._reconcile_max_bytes
+        ):
             raise WorkspaceImportError("workspace retained reconciliation budget exceeded")
 
-    def _retained_usage(self, root_descriptor: int) -> _RetainedUsage:
+    def _retained_usage(
+        self,
+        root_descriptor: int,
+        *,
+        requested_ownership: WorkspaceImportOwnership | None = None,
+        requested_size: int | None = None,
+        requested_digest: str | None = None,
+    ) -> tuple[_RetainedUsage, WorkspaceImportRefV1 | None]:
         budget = _ScanBudget(
             remaining_nodes=self._reconcile_max_nodes,
             remaining_bytes=self._reconcile_max_bytes,
         )
         import_count = 0
         archive_bytes = 0
+        existing_ref: WorkspaceImportRefV1 | None = None
         with os.scandir(root_descriptor) as entries:
             names = []
             for entry in entries:
@@ -799,7 +1305,7 @@ class WorkspaceImportStore:
                 raise WorkspaceImportIntegrityError(
                     "workspace import store requires reconciliation before ingest"
                 )
-            stored_ref, archive_descriptor, _directory_identity = (
+            stored_ref, stored_ownership, archive_descriptor, _directory_identity = (
                 self._validate_import_contents(
                     root_descriptor,
                     name,
@@ -811,7 +1317,29 @@ class WorkspaceImportStore:
             import_count += 1
             archive_bytes += stored_ref.byte_size
             self._require_retained_capacity(import_count, archive_bytes)
-        return _RetainedUsage(import_count=import_count, archive_bytes=archive_bytes)
+            if requested_ownership is None:
+                continue
+            if stored_ownership == requested_ownership:
+                if existing_ref is not None and existing_ref != stored_ref:
+                    raise WorkspaceImportIntegrityError(
+                        "workspace import ownership ledger has duplicate claims"
+                    )
+                if (
+                    stored_ref.byte_size != requested_size
+                    or stored_ref.content_sha256 != requested_digest
+                ):
+                    raise WorkspaceImportIntegrityError(
+                        "workspace import idempotency key was reused for different content"
+                    )
+                existing_ref = stored_ref
+            elif (
+                stored_ownership.operation_id == requested_ownership.operation_id
+                or stored_ownership.idempotency_key == requested_ownership.idempotency_key
+            ):
+                raise WorkspaceImportIntegrityError(
+                    "workspace import ownership or idempotency binding conflicts"
+                )
+        return _RetainedUsage(import_count=import_count, archive_bytes=archive_bytes), existing_ref
 
     @staticmethod
     def _verify_directory_binding(
@@ -871,7 +1399,9 @@ class WorkspaceImportStore:
         try:
             descriptor = os.open(_METADATA_NAME, _FILE_READ_FLAGS, dir_fd=directory_descriptor)
         except OSError as exc:
-            raise WorkspaceImportIntegrityError("workspace import metadata is unavailable") from exc
+            raise WorkspaceImportIntegrityError(
+                "workspace import metadata is unavailable"
+            ) from exc
         try:
             before = os.fstat(descriptor)
             self._require_private_file(before, label="workspace import metadata")
@@ -887,17 +1417,27 @@ class WorkspaceImportStore:
                 follow_symlinks=False,
             )
             if _identity(before) != _identity(after) or not _same_inode(after, current):
-                raise WorkspaceImportIntegrityError("workspace import metadata changed while reading")
+                raise WorkspaceImportIntegrityError(
+                    "workspace import metadata changed while reading"
+                )
             try:
                 payload = json.loads(raw)
                 if not isinstance(payload, dict) or set(payload) != {
                     "import_ref",
+                    "ownership",
                     "schema_version",
                     "storage_identity",
                 }:
                     raise ValueError("metadata fields are not closed")
                 if payload["schema_version"] != "1":
                     raise ValueError("metadata schema version is invalid")
+                ownership_payload = payload["ownership"]
+                if not isinstance(ownership_payload, dict) or set(ownership_payload) != {
+                    "idempotency_key",
+                    "operation_id",
+                    "project_id",
+                }:
+                    raise ValueError("ownership fields are not closed")
                 storage_identity = payload["storage_identity"]
                 if not isinstance(storage_identity, dict) or set(storage_identity) != {
                     "archive_device",
@@ -929,6 +1469,11 @@ class WorkspaceImportStore:
                     raise ValueError("archive storage token is invalid")
                 metadata = _StoredMetadata(
                     import_ref=WorkspaceImportRefV1.model_validate(payload["import_ref"]),
+                    ownership=WorkspaceImportOwnership(
+                        project_id=ownership_payload["project_id"],
+                        operation_id=ownership_payload["operation_id"],
+                        idempotency_key=ownership_payload["idempotency_key"],
+                    ),
                     directory_device=storage_identity["directory_device"],
                     directory_inode=storage_identity["directory_inode"],
                     archive_device=storage_identity["archive_device"],
@@ -964,9 +1509,7 @@ class WorkspaceImportStore:
             before = os.fstat(descriptor)
             self._require_private_file(before, label="workspace import archive")
             if (before.st_dev, before.st_ino) != archive_identity:
-                raise _DeterministicImportCorruption(
-                    "workspace import archive identity changed"
-                )
+                raise _DeterministicImportCorruption("workspace import archive identity changed")
             try:
                 observed_token = os.getxattr(descriptor, _ARCHIVE_TOKEN_XATTR)
             except OSError as exc:
@@ -986,13 +1529,17 @@ class WorkspaceImportStore:
                 while remaining:
                     chunk = os.read(descriptor, min(remaining, _COPY_CHUNK_BYTES))
                     if not chunk:
-                        raise WorkspaceImportIntegrityError("workspace import archive was truncated")
+                        raise WorkspaceImportIntegrityError(
+                            "workspace import archive was truncated"
+                        )
                     if budget is not None:
                         budget.charge_bytes(len(chunk))
                     digest.update(chunk)
                     remaining -= len(chunk)
                 if os.read(descriptor, 1):
-                    raise WorkspaceImportIntegrityError("workspace import archive grew while reading")
+                    raise WorkspaceImportIntegrityError(
+                        "workspace import archive grew while reading"
+                    )
                 digests.append(digest.hexdigest())
                 os.lseek(descriptor, 0, os.SEEK_SET)
             after = os.fstat(descriptor)
@@ -1002,11 +1549,11 @@ class WorkspaceImportStore:
                 follow_symlinks=False,
             )
             if _identity(before) != _identity(after) or not _same_inode(after, current):
-                raise WorkspaceImportIntegrityError("workspace import archive changed while hashing")
-            if any(digest != import_ref.content_sha256 for digest in digests):
-                raise _DeterministicImportCorruption(
-                    "workspace import archive digest changed"
+                raise WorkspaceImportIntegrityError(
+                    "workspace import archive changed while hashing"
                 )
+            if any(digest != import_ref.content_sha256 for digest in digests):
+                raise _DeterministicImportCorruption("workspace import archive digest changed")
             return descriptor
         except BaseException:
             os.close(descriptor)
@@ -1018,8 +1565,9 @@ class WorkspaceImportStore:
         import_id: str,
         expected_ref: WorkspaceImportRefV1 | None,
         *,
+        expected_ownership: WorkspaceImportOwnership | None = None,
         budget: _ScanBudget | None = None,
-    ) -> tuple[WorkspaceImportRefV1, int, tuple[int, int]]:
+    ) -> tuple[WorkspaceImportRefV1, WorkspaceImportOwnership, int, tuple[int, int]]:
         self._require_store_import_id(import_id)
         directory_descriptor = self._open_import_directory(root_descriptor, import_id)
         archive_descriptor: int | None = None
@@ -1031,25 +1579,25 @@ class WorkspaceImportStore:
                         budget.charge_node(entry.name)
                     names.add(entry.name)
             if names != {_ARCHIVE_NAME, _METADATA_NAME}:
-                raise _DeterministicImportCorruption(
-                    "workspace import directory shape is invalid"
-                )
+                raise _DeterministicImportCorruption("workspace import directory shape is invalid")
             metadata = self._load_metadata(directory_descriptor, budget=budget)
             stored_ref = metadata.import_ref
             if stored_ref.import_id != import_id:
-                raise _DeterministicImportCorruption(
-                    "workspace import metadata ID does not match"
-                )
+                raise _DeterministicImportCorruption("workspace import metadata ID does not match")
             if expected_ref is not None and stored_ref != expected_ref:
-                raise WorkspaceImportIntegrityError("workspace import reference does not match storage")
+                raise WorkspaceImportIntegrityError(
+                    "workspace import reference does not match storage"
+                )
+            if expected_ownership is not None and metadata.ownership != expected_ownership:
+                raise WorkspaceImportIntegrityError(
+                    "workspace import ownership does not match storage"
+                )
             directory_status = os.fstat(directory_descriptor)
             if (directory_status.st_dev, directory_status.st_ino) != (
                 metadata.directory_device,
                 metadata.directory_inode,
             ):
-                raise _DeterministicImportCorruption(
-                    "workspace import directory identity changed"
-                )
+                raise _DeterministicImportCorruption("workspace import directory identity changed")
             archive_descriptor = self._open_verified_archive(
                 directory_descriptor,
                 stored_ref,
@@ -1065,6 +1613,7 @@ class WorkspaceImportStore:
             )
             return (
                 stored_ref,
+                metadata.ownership,
                 archive_descriptor,
                 (directory_status.st_dev, directory_status.st_ino),
             )
@@ -1078,9 +1627,7 @@ class WorkspaceImportStore:
     @staticmethod
     def _require_store_import_id(import_id: str) -> None:
         if _IMPORT_ID_RE.fullmatch(import_id) is None:
-            raise WorkspaceImportIntegrityError(
-                "workspace import ID was not issued by this store"
-            )
+            raise WorkspaceImportIntegrityError("workspace import ID was not issued by this store")
 
     @classmethod
     def _require_external_import_ref(
@@ -1093,42 +1640,225 @@ class WorkspaceImportStore:
             raise TypeError(f"{operation} requires WorkspaceImportRefV1")
         cls._require_store_import_id(import_ref.import_id)
 
+    @staticmethod
+    def _require_ownership(
+        ownership: WorkspaceImportOwnership,
+        *,
+        operation: str,
+    ) -> None:
+        if not isinstance(ownership, WorkspaceImportOwnership):
+            raise TypeError(f"{operation} requires WorkspaceImportOwnership")
+
+    @staticmethod
+    def _unlink_bound_file(
+        directory_descriptor: int,
+        name: str,
+        *,
+        expected_identity: tuple[int, int],
+        missing_ok: bool,
+    ) -> None:
+        try:
+            value = os.stat(name, dir_fd=directory_descriptor, follow_symlinks=False)
+        except FileNotFoundError:
+            if missing_ok:
+                return
+            raise WorkspaceImportNotFoundError(
+                "workspace import temporary file is missing"
+            ) from None
+        if (value.st_dev, value.st_ino) != expected_identity:
+            raise WorkspaceImportIntegrityError("workspace import file changed before cleanup")
+        if stat.S_ISDIR(value.st_mode):
+            raise WorkspaceImportIntegrityError(
+                "workspace import file cleanup refuses a directory"
+            )
+        quarantine = f"{_QUARANTINE_PREFIX}{secrets.token_hex(24)}"
+        _quarantine_noreplace(name, quarantine, directory_fd=directory_descriptor)
+        moved = os.stat(
+            quarantine,
+            dir_fd=directory_descriptor,
+            follow_symlinks=False,
+        )
+        if (moved.st_dev, moved.st_ino) != expected_identity:
+            raise WorkspaceImportIntegrityError("workspace import file changed during quarantine")
+        os.unlink(quarantine, dir_fd=directory_descriptor)
+
+    def _snapshot_verified_archive(
+        self,
+        root_descriptor: int,
+        archive_descriptor: int,
+        import_ref: WorkspaceImportRefV1,
+    ) -> int:
+        snapshot_name = f"{_SNAPSHOT_PREFIX}{secrets.token_hex(24)}"
+        writer = os.open(
+            snapshot_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=root_descriptor,
+        )
+        snapshot_identity: tuple[int, int] | None = None
+        reader: int | None = None
+        try:
+            os.fchmod(writer, 0o600)
+            initial_snapshot = os.fstat(writer)
+            snapshot_identity = (initial_snapshot.st_dev, initial_snapshot.st_ino)
+            source_before = os.fstat(archive_descriptor)
+            source_identity = _identity(source_before)
+            digest = hashlib.sha256()
+            offset = 0
+            while offset < import_ref.byte_size:
+                try:
+                    chunk = os.pread(
+                        archive_descriptor,
+                        min(_COPY_CHUNK_BYTES, import_ref.byte_size - offset),
+                        offset,
+                    )
+                except InterruptedError:
+                    continue
+                if not chunk:
+                    raise WorkspaceImportIntegrityError(
+                        "workspace import archive was truncated during snapshot"
+                    )
+                _write_all(writer, chunk)
+                digest.update(chunk)
+                offset += len(chunk)
+            if os.pread(archive_descriptor, 1, import_ref.byte_size):
+                raise WorkspaceImportIntegrityError(
+                    "workspace import archive grew during snapshot"
+                )
+            os.fsync(writer)
+            snapshot_status = os.fstat(writer)
+            if (snapshot_status.st_dev, snapshot_status.st_ino) != snapshot_identity:
+                raise WorkspaceImportIntegrityError(
+                    "workspace import private snapshot identity changed"
+                )
+            if (
+                snapshot_status.st_size != import_ref.byte_size
+                or digest.hexdigest() != import_ref.content_sha256
+            ):
+                raise WorkspaceImportIntegrityError(
+                    "workspace import snapshot digest or size does not match"
+                )
+            _before_snapshot_commit(root_descriptor, archive_descriptor)
+            source_after = os.fstat(archive_descriptor)
+            try:
+                source_digest = _source_sha256(
+                    archive_descriptor,
+                    import_ref.byte_size,
+                )
+            except WorkspaceArchiveValidationError as exc:
+                raise WorkspaceImportIntegrityError(
+                    "workspace import archive changed before snapshot commit"
+                ) from exc
+            if (
+                _identity(source_after) != source_identity
+                or source_digest != import_ref.content_sha256
+                or _identity(os.fstat(archive_descriptor)) != source_identity
+            ):
+                raise WorkspaceImportIntegrityError(
+                    "workspace import archive changed before snapshot commit"
+                )
+            os.close(writer)
+            writer = -1
+            reader = os.open(snapshot_name, _FILE_READ_FLAGS, dir_fd=root_descriptor)
+            opened = os.fstat(reader)
+            self._require_private_file(opened, label="workspace import private snapshot")
+            current = os.stat(
+                snapshot_name,
+                dir_fd=root_descriptor,
+                follow_symlinks=False,
+            )
+            if (
+                (opened.st_dev, opened.st_ino) != snapshot_identity
+                or not _same_inode(opened, current)
+                or opened.st_size != import_ref.byte_size
+            ):
+                raise WorkspaceImportIntegrityError(
+                    "workspace import private snapshot binding changed"
+                )
+            self._unlink_bound_file(
+                root_descriptor,
+                snapshot_name,
+                expected_identity=snapshot_identity,
+                missing_ok=False,
+            )
+            snapshot_identity = None
+            os.fsync(root_descriptor)
+            return reader
+        except BaseException:
+            if reader is not None:
+                os.close(reader)
+            raise
+        finally:
+            if writer >= 0:
+                os.close(writer)
+            if snapshot_identity is not None:
+                self._unlink_bound_file(
+                    root_descriptor,
+                    snapshot_name,
+                    expected_identity=snapshot_identity,
+                    missing_ok=True,
+                )
+
     @contextmanager
-    def resolve(self, import_ref: WorkspaceImportRefV1) -> Iterator[BinaryIO]:
-        """Yield a digest-verified read handle without exposing a host path."""
+    def resolve(
+        self,
+        import_ref: WorkspaceImportRefV1,
+        *,
+        ownership: WorkspaceImportOwnership,
+    ) -> Iterator[BinaryIO]:
+        """Yield an unlinked private snapshot without exposing a host path."""
 
         self._require_external_import_ref(import_ref, operation="resolve")
+        self._require_ownership(ownership, operation="resolve")
         archive_descriptor: int | None = None
+        snapshot_descriptor: int | None = None
         try:
             with self._locked_root() as root_descriptor:
-                _stored_ref, archive_descriptor, _directory_identity = (
+                _stored_ref, _stored_ownership, archive_descriptor, _directory_identity = (
                     self._validate_import_contents(
                         root_descriptor,
                         import_ref.import_id,
                         import_ref,
+                        expected_ownership=ownership,
                     )
                 )
-            stream = os.fdopen(archive_descriptor, "rb", closefd=True)
-            archive_descriptor = None
+                snapshot_descriptor = self._snapshot_verified_archive(
+                    root_descriptor,
+                    archive_descriptor,
+                    import_ref,
+                )
+                os.close(archive_descriptor)
+                archive_descriptor = None
+            stream = os.fdopen(snapshot_descriptor, "rb", closefd=True)
+            snapshot_descriptor = None
         except BaseException:
             if archive_descriptor is not None:
                 os.close(archive_descriptor)
+            if snapshot_descriptor is not None:
+                os.close(snapshot_descriptor)
             raise
         try:
             yield stream
         finally:
             stream.close()
 
-    def release(self, import_ref: WorkspaceImportRefV1) -> None:
+    def release(
+        self,
+        import_ref: WorkspaceImportRefV1,
+        *,
+        ownership: WorkspaceImportOwnership,
+    ) -> None:
         """Delete the exact verified import referenced by ``import_ref``."""
 
         self._require_external_import_ref(import_ref, operation="release")
+        self._require_ownership(ownership, operation="release")
         with self._locked_root() as root_descriptor:
-            _stored_ref, archive_descriptor, directory_identity = (
+            _stored_ref, _stored_ownership, archive_descriptor, directory_identity = (
                 self._validate_import_contents(
                     root_descriptor,
                     import_ref.import_id,
                     import_ref,
+                    expected_ownership=ownership,
                 )
             )
             os.close(archive_descriptor)
@@ -1140,10 +1870,15 @@ class WorkspaceImportStore:
             )
             os.fsync(root_descriptor)
 
-    def delete(self, import_ref: WorkspaceImportRefV1) -> None:
+    def delete(
+        self,
+        import_ref: WorkspaceImportRefV1,
+        *,
+        ownership: WorkspaceImportOwnership,
+    ) -> None:
         """Alias for explicit lifecycle callers that use delete terminology."""
 
-        self.release(import_ref)
+        self.release(import_ref, ownership=ownership)
 
     def _discard_flat_directory(
         self,
@@ -1161,10 +1896,25 @@ class WorkspaceImportStore:
                 return
             raise WorkspaceImportNotFoundError("workspace import does not exist") from None
         opened = os.fstat(descriptor)
+        quarantine_name: str | None = None
         try:
-            if expected_identity is not None and (opened.st_dev, opened.st_ino) != expected_identity:
+            if (
+                expected_identity is not None
+                and (opened.st_dev, opened.st_ino) != expected_identity
+            ):
                 raise WorkspaceImportIntegrityError(
                     "workspace import changed before directory cleanup"
+                )
+            quarantine_name = f"{_QUARANTINE_PREFIX}{secrets.token_hex(24)}"
+            _quarantine_noreplace(name, quarantine_name, directory_fd=root_descriptor)
+            moved = os.stat(
+                quarantine_name,
+                dir_fd=root_descriptor,
+                follow_symlinks=False,
+            )
+            if not _same_inode(opened, moved):
+                raise WorkspaceImportIntegrityError(
+                    "workspace import changed during directory quarantine"
                 )
             with os.scandir(descriptor) as entries:
                 child_names = []
@@ -1182,16 +1932,26 @@ class WorkspaceImportStore:
                     raise WorkspaceImportIntegrityError(
                         "workspace import cleanup refuses nested directories"
                     )
-                os.unlink(child_name, dir_fd=descriptor)
+                self._unlink_bound_file(
+                    descriptor,
+                    child_name,
+                    expected_identity=(child.st_dev, child.st_ino),
+                    missing_ok=False,
+                )
             os.fsync(descriptor)
-            current = os.stat(name, dir_fd=root_descriptor, follow_symlinks=False)
+            current = os.stat(
+                quarantine_name,
+                dir_fd=root_descriptor,
+                follow_symlinks=False,
+            )
             if not _same_inode(opened, current):
                 raise WorkspaceImportIntegrityError(
                     "workspace import changed before directory cleanup"
                 )
         finally:
             os.close(descriptor)
-        os.rmdir(name, dir_fd=root_descriptor)
+        assert quarantine_name is not None
+        os.rmdir(quarantine_name, dir_fd=root_descriptor)
 
     def _discard_root_entry(
         self,
@@ -1215,7 +1975,12 @@ class WorkspaceImportStore:
                 budget=budget,
             )
         else:
-            os.unlink(name, dir_fd=root_descriptor)
+            self._unlink_bound_file(
+                root_descriptor,
+                name,
+                expected_identity=expected_identity,
+                missing_ok=False,
+            )
 
     def reconcile(self) -> None:
         """Boundedly remove temp, malformed, tampered, and non-store root entries."""
@@ -1247,7 +2012,7 @@ class WorkspaceImportStore:
                     )
                     continue
                 try:
-                    _stored_ref, archive_descriptor, directory_identity = (
+                    _stored_ref, _stored_ownership, archive_descriptor, directory_identity = (
                         self._validate_import_contents(
                             root_descriptor,
                             name,
@@ -1279,6 +2044,7 @@ __all__ = [
     "WorkspaceImportError",
     "WorkspaceImportIntegrityError",
     "WorkspaceImportNotFoundError",
+    "WorkspaceImportOwnership",
     "WorkspaceImportStore",
     "WorkspaceImportStoreConfigurationError",
 ]
