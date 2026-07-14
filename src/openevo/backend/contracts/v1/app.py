@@ -1,11 +1,16 @@
-"""Schema-only FastAPI application for the Core Control API v1 contract."""
+"""Canonical FastAPI routes and optional Core Control API v1 provider binding."""
 
 from __future__ import annotations
 
-from typing import Annotated, Literal
+from collections.abc import Mapping
+import re
+import secrets
+from typing import Annotated, Literal, Protocol
 
-from fastapi import APIRouter, Depends, FastAPI, Header, Query, Security
+from fastapi import APIRouter, Depends, FastAPI, Header, Query, Request, Security
+from fastapi.exceptions import RequestValidationError
 from fastapi.openapi.utils import get_openapi
+from fastapi.routing import APIRoute
 from fastapi.responses import JSONResponse, Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
@@ -13,6 +18,7 @@ from . import models as m
 
 
 _CONTRACT_ONLY_MESSAGE = "This app defines the Core Control API v1 contract and has no provider."
+_VERSIONED_PATH = re.compile(r"^/v([0-9]+)(?:/|$)")
 _bearer = HTTPBearer(
     auto_error=False,
     scheme_name="CoreBearerAuth",
@@ -27,6 +33,77 @@ async def _declare_bearer_security(
     ],
 ) -> None:
     """Declare the security scheme without implementing an auth provider."""
+
+
+class CoreControlApiProviderV1(Protocol):
+    """Business provider dispatched through the frozen operation IDs."""
+
+    def authenticate(self, authorization_values: tuple[bytes, ...]) -> bool: ...
+
+    def invoke(self, operation_id: str, arguments: Mapping[str, object]) -> object: ...
+
+
+class CoreControlHTTPError(Exception):
+    """Typed provider error rendered as the frozen ``ApiErrorV1`` shape."""
+
+    def __init__(
+        self,
+        status_code: int,
+        *,
+        code: str,
+        message: str,
+        category: m.ErrorCategory,
+        retryable: bool,
+        repair_action: m.RepairAction,
+        next_action: str,
+        headers: Mapping[str, str] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.error = m.ApiErrorV1(
+            request_id=f"request-{secrets.token_hex(16)}",
+            code=code,
+            http_status=status_code,
+            message=message,
+            severity=m.ErrorSeverity.BLOCKING,
+            category=category,
+            retryable=retryable,
+            repair_action=repair_action,
+            next_action=next_action,
+        )
+        self.headers = dict(headers or {})
+
+    @classmethod
+    def from_error(cls, error: m.ApiErrorV1) -> CoreControlHTTPError:
+        instance = cls.__new__(cls)
+        Exception.__init__(instance, error.message)
+        instance.status_code = error.http_status
+        instance.error = error
+        instance.headers = {}
+        return instance
+
+
+def _provider_error_response(exc: CoreControlHTTPError) -> JSONResponse:
+    return JSONResponse(
+        status_code=exc.status_code,
+        content=exc.error.model_dump(mode="json"),
+        headers=exc.headers,
+    )
+
+
+def _bind_provider(app: FastAPI, provider: CoreControlApiProviderV1) -> None:
+    for route in app.routes:
+        if not isinstance(route, APIRoute) or route.operation_id is None:
+            continue
+        operation_id = route.operation_id
+
+        async def invoke_provider(
+            _operation_id: str = operation_id, **arguments: object
+        ) -> object:
+            return provider.invoke(_operation_id, arguments)
+
+        route.endpoint = invoke_provider
+        route.dependant.call = invoke_provider
 
 
 def _not_implemented() -> JSONResponse:
@@ -94,8 +171,10 @@ LastEventId = Annotated[
 ]
 
 
-def create_core_control_contract_app() -> FastAPI:
-    """Create a non-provider app used only to generate and validate schemas."""
+def create_core_control_contract_app(
+    provider: CoreControlApiProviderV1 | None = None,
+) -> FastAPI:
+    """Create the canonical app, optionally bound to a real business provider."""
 
     app = FastAPI(
         title="OpenEvo Core Control API v1 Contract (Schema Only)",
@@ -734,6 +813,83 @@ def create_core_control_contract_app() -> FastAPI:
 
     app.include_router(router)
 
+    if provider is not None:
+        app.state.core_control_provider = provider
+
+        @app.middleware("http")
+        async def enforce_provider_boundary(request: Request, call_next):
+            version_match = _VERSIONED_PATH.match(request.url.path)
+            if version_match is not None:
+                authorization_values = tuple(
+                    value
+                    for name, value in request.scope.get("headers", ())
+                    if name.lower() == b"authorization"
+                )
+                if not provider.authenticate(authorization_values):
+                    return _provider_error_response(
+                        CoreControlHTTPError(
+                            401,
+                            code="core_bearer_invalid",
+                            message="The Core bearer credential is missing or invalid.",
+                            category=m.ErrorCategory.AUTHENTICATION,
+                            retryable=False,
+                            repair_action=m.RepairAction.USER_ACTION_REQUIRED,
+                            next_action="Reconnect with the bearer issued for this Core instance.",
+                            headers={"WWW-Authenticate": "Bearer"},
+                        )
+                    )
+                if version_match.group(1) != "1":
+                    return _provider_error_response(
+                        CoreControlHTTPError(
+                            426,
+                            code="contract_version_unsupported",
+                            message="The requested Core Control API major version is unsupported.",
+                            category=m.ErrorCategory.CONTRACT,
+                            retryable=False,
+                            repair_action=m.RepairAction.USER_ACTION_REQUIRED,
+                            next_action="Negotiate a supported major through GET /version.",
+                        )
+                    )
+            return await call_next(request)
+
+        @app.exception_handler(CoreControlHTTPError)
+        async def provider_http_error(
+            _request: Request, exc: CoreControlHTTPError
+        ) -> JSONResponse:
+            return _provider_error_response(exc)
+
+        @app.exception_handler(RequestValidationError)
+        async def provider_validation_error(
+            _request: Request, _exc: RequestValidationError
+        ) -> JSONResponse:
+            return _provider_error_response(
+                CoreControlHTTPError(
+                    422,
+                    code="request_validation_error",
+                    message="The request does not satisfy the closed Core Control API v1 contract.",
+                    category=m.ErrorCategory.CONTRACT,
+                    retryable=False,
+                    repair_action=m.RepairAction.OPENEVO_CAN_RECONFIGURE,
+                    next_action="Correct the request fields and retry.",
+                )
+            )
+
+        @app.exception_handler(Exception)
+        async def provider_internal_error(_request: Request, _exc: Exception) -> JSONResponse:
+            return _provider_error_response(
+                CoreControlHTTPError(
+                    500,
+                    code="core_control_internal_error",
+                    message="Core Control could not complete the request.",
+                    category=m.ErrorCategory.INTERNAL,
+                    retryable=True,
+                    repair_action=m.RepairAction.OPENEVO_CAN_RETRY,
+                    next_action="Inspect Core diagnostics before retrying.",
+                )
+            )
+
+        _bind_provider(app, provider)
+
     def contract_openapi() -> dict[str, object]:
         if app.openapi_schema is not None:
             return app.openapi_schema
@@ -765,4 +921,9 @@ def create_core_control_contract_app() -> FastAPI:
 core_control_contract_app = create_core_control_contract_app()
 
 
-__all__ = ["core_control_contract_app", "create_core_control_contract_app"]
+__all__ = [
+    "CoreControlApiProviderV1",
+    "CoreControlHTTPError",
+    "core_control_contract_app",
+    "create_core_control_contract_app",
+]
