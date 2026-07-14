@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
@@ -8,7 +9,7 @@ import hmac
 import logging
 import re
 import sqlite3
-from threading import Lock
+from threading import BoundedSemaphore, Lock
 from typing import Literal, NoReturn, cast
 
 from fastapi.responses import JSONResponse, Response, StreamingResponse
@@ -38,12 +39,18 @@ from desktop.sidecar.contracts.v1.models import (
     VersionV1,
     WorkspaceImportRefV1,
 )
-from desktop.sidecar.core_bridge_v1 import DesktopCoreBridgeV1
-from desktop.sidecar.event_broker_v1 import DesktopEventBrokerV1
+from desktop.sidecar.core_bridge_v1 import (
+    CoreActivationV1,
+    DesktopCoreBridgeErrorV1,
+    DesktopCoreBridgeV1,
+)
+from desktop.sidecar.core_client_v1 import CORE_OPENAPI_SHA256
+from desktop.sidecar.event_broker_v1 import DesktopEventBrokerError, DesktopEventBrokerV1
 from desktop.sidecar.provider_store import (
     DesktopProviderStore,
     ETagConflictError,
     ProfileRuntimeActionReservation,
+    ProjectRuntimeActionReservation,
     ProviderStoreError,
     ResourceNotFoundError,
     ResourceInUseError,
@@ -100,6 +107,55 @@ class _ConnectionActionGate:
     users: int = 0
 
 
+@dataclass(frozen=True, slots=True)
+class _ProjectActivationWork:
+    reservation: ProjectRuntimeActionReservation
+    route: str
+    project_id: str
+    key: str
+    if_match: str
+
+
+class _BoundedProjectExecutor:
+    """One serialized project authority queue with a hard admission bound."""
+
+    def __init__(self, *, max_pending: int = 16) -> None:
+        self._slots = BoundedSemaphore(max_pending)
+        self._lock = Lock()
+        self._closed = False
+        self._executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="openevo-project-runtime",
+        )
+
+    def submit(self, action: Callable[[], None]) -> bool:
+        if not self._slots.acquire(blocking=False):
+            return False
+        with self._lock:
+            if self._closed:
+                self._slots.release()
+                return False
+            try:
+                self._executor.submit(self._run, action)
+            except RuntimeError:
+                self._slots.release()
+                return False
+        return True
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+        self._executor.shutdown(wait=True, cancel_futures=False)
+
+    def _run(self, action: Callable[[], None]) -> None:
+        try:
+            action()
+        finally:
+            self._slots.release()
+
+
 class DesktopReleaseProvider:
     """First release provider slice backed by ``DesktopProviderStore``."""
 
@@ -133,6 +189,9 @@ class DesktopReleaseProvider:
         self._connection_action_lock = Lock()
         self._connection_gate_lock = Lock()
         self._connection_gates: dict[tuple[str, str, str], _ConnectionActionGate] = {}
+        self._close_lock = Lock()
+        self._closed = False
+        self._project_executor = _BoundedProjectExecutor()
         self._core_state = CoreConnectionStateV1(state="disconnected", active_tunnel=False)
         self._instance_id = instance_id
         self._readiness_key = readiness_key
@@ -163,6 +222,7 @@ class DesktopReleaseProvider:
             "getProject": self._get_project,
             "updateProject": self._update_project,
             "deleteProject": self._delete_project,
+            "activateProject": self._activate_project,
             "getProjectCapabilities": self._get_project_capabilities,
             "validateProject": self._validate_project,
             "getLocalOperation": self._get_local_operation,
@@ -192,21 +252,28 @@ class DesktopReleaseProvider:
         }
 
     def close(self) -> None:
+        with self._close_lock:
+            if self._closed:
+                return
+            self._closed = True
         try:
-            if self._event_broker is not None:
-                self._event_broker.close()
+            if self._core_bridge is not None:
+                self._core_bridge.close()
         finally:
             try:
-                if self._core_bridge is not None:
-                    self._core_bridge.close()
+                self._project_executor.close()
             finally:
                 try:
-                    self._remote_lifecycle.close()
+                    if self._event_broker is not None:
+                        self._event_broker.close()
                 finally:
                     try:
-                        self._store.close()
+                        self._remote_lifecycle.close()
                     finally:
-                        self._workspace_import_store.close()
+                        try:
+                            self._store.close()
+                        finally:
+                            self._workspace_import_store.close()
 
     @property
     def workspace_import_store(self) -> WorkspaceImportStore:
@@ -238,28 +305,50 @@ class DesktopReleaseProvider:
     def _get_state(self, arguments: Mapping[str, object]) -> DesktopStateV1:
         del arguments
         active_projects = self._store.list_projects(limit=2, filters={"state": "active"}).items
+        with self._connection_state_lock:
+            core_state = self._core_state
         active_project = None
         if active_projects:
             project = active_projects[0]
+            if (
+                core_state.state == "online"
+                and core_state.profile_id == project.profile_id
+                and project.remote is not None
+            ):
+                connection_state = "ready"
+            elif (
+                core_state.state
+                in {
+                    "connecting",
+                    "checking",
+                    "bootstrapping",
+                    "core_starting",
+                    "reconnecting",
+                }
+                and core_state.profile_id == project.profile_id
+            ):
+                connection_state = "connecting"
+            else:
+                connection_state = "offline"
             active_project = ActiveProjectStateV1(
                 project_id=project.project_id,
                 project_etag=project.etag,
                 profile_id=project.profile_id,
-                connection_state="offline",
+                connection_state=connection_state,
             )
-        with self._connection_state_lock:
-            core_state = self._core_state
         return DesktopStateV1(
             observed_at=self._timestamp(),
             contract=ContractNegotiationV1(
                 selected_major=1,
                 desktop_openapi_sha256=DESKTOP_OPENAPI_SHA256,
-                core_openapi_sha256=None,
+                core_openapi_sha256=(
+                    core_state.core.contract_digest if core_state.core is not None else None
+                ),
                 compatible=True,
             ),
             core=core_state,
             active_project=active_project,
-            pending_operation_ids=(),
+            pending_operation_ids=self._store.pending_operation_ids(),
         )
 
     def _list_profiles(self, arguments: Mapping[str, object]) -> object:
@@ -825,6 +914,9 @@ class DesktopReleaseProvider:
             self._adopt_project_source(project.source, project_id=project_id)
         if previous.source.import_ref != project.source.import_ref:
             self._release_project_source(previous.source, project_id=project_id)
+        if previous.state == "active" and project.state != "active":
+            self._retire_edited_project(project_id, project.profile_id)
+        self.publish_state_changed()
         return self._resource_response(project)
 
     def _delete_project(self, arguments: Mapping[str, object]) -> Response:
@@ -836,7 +928,270 @@ class DesktopReleaseProvider:
                 if_match=cast(str, arguments["if_match"]),
             )
         self._release_project_source(project.source, project_id=project_id)
+        self.publish_state_changed()
         return Response(status_code=204)
+
+    def _activate_project(self, arguments: Mapping[str, object]) -> JSONResponse:
+        project_id = cast(str, arguments["project_id"])
+        if_match = cast(str, arguments["if_match"])
+        key = cast(str, arguments["idempotency_key"])
+        route = f"/desktop/v1/projects/{project_id}/activate"
+        reservation = self._store.begin_project_runtime_action(
+            route=route,
+            operation_kind="project_activate",
+            project_id=project_id,
+            key=key,
+            body={},
+            if_match=if_match,
+        )
+        if reservation.replayed:
+            return self._project_operation_response(reservation.operation)
+        work = _ProjectActivationWork(
+            reservation=reservation,
+            route=route,
+            project_id=project_id,
+            key=key,
+            if_match=if_match,
+        )
+        accepted = self._project_executor.submit(lambda: self._execute_project_activation(work))
+        operation = reservation.operation
+        if not accepted:
+            operation = self._store.fail_project_runtime_action(
+                reservation=reservation,
+                route=route,
+                operation_kind="project_activate",
+                project_id=project_id,
+                key=key,
+                body={},
+                if_match=if_match,
+                error=self._project_queue_capacity_error(reservation),
+            )
+        self.publish_state_changed()
+        return self._project_operation_response(operation)
+
+    def _execute_project_activation(self, work: _ProjectActivationWork) -> None:
+        reservation = work.reservation
+        activation: CoreActivationV1 | None = None
+        try:
+            operation = self._store.start_project_runtime_action(
+                reservation=reservation,
+                route=work.route,
+                operation_kind="project_activate",
+                project_id=work.project_id,
+                key=work.key,
+                body={},
+                if_match=work.if_match,
+            )
+            if operation.state != "running":
+                return
+            project = reservation.project
+            if project is None:
+                raise ProviderStoreError(
+                    "project activation reservation lost its project snapshot"
+                )
+            with self._connection_state_lock:
+                self._core_state = CoreConnectionStateV1(
+                    state="bootstrapping",
+                    profile_id=project.profile_id,
+                    active_tunnel=False,
+                    operation_id=operation.operation_id,
+                )
+            self.publish_state_changed()
+            bridge = self._require_bridge("activateProject")
+            activation = bridge.activate_project(project, idempotency_key=work.key)
+            self._validate_activation_identity(project, activation)
+            operation = self._store.complete_project_runtime_action(
+                reservation=reservation,
+                route=work.route,
+                operation_kind="project_activate",
+                project_id=work.project_id,
+                key=work.key,
+                body={},
+                if_match=work.if_match,
+                remote_state=self._remote_project_state(activation),
+            )
+            if operation.state != "succeeded":
+                raise ProviderStoreError("project activation did not reach succeeded state")
+            active_project = self._store.get_project(work.project_id)
+            bridge.commit_local_activation(active_project, activation=activation)
+            with self._connection_state_lock:
+                self._core_state = CoreConnectionStateV1(
+                    state="online",
+                    profile_id=active_project.profile_id,
+                    active_tunnel=True,
+                    core=local_v1.CoreCompatibilityV1(
+                        contract_digest=CORE_OPENAPI_SHA256,
+                        core_version=activation.capabilities.core_version,
+                    ),
+                )
+        except Exception as exc:
+            error = self._project_activation_error(reservation, exc)
+            operation = self._finalize_project_runtime_failure(work, error)
+            if activation is not None:
+                try:
+                    self._require_bridge("activateProject").deactivate_project(work.project_id)
+                except Exception:
+                    _LOGGER.warning(
+                        "could not retire Core session after failed activation commit",
+                        extra={"project_id": work.project_id},
+                    )
+            profile_id = (
+                reservation.project.profile_id if reservation.project is not None else None
+            )
+            if profile_id is not None:
+                with self._connection_state_lock:
+                    self._core_state = CoreConnectionStateV1(
+                        state="offline",
+                        profile_id=profile_id,
+                        active_tunnel=False,
+                        failure=ConnectionFailureV1(
+                            code=error.code,
+                            message=error.message,
+                            retryable=error.retryable,
+                            next_action=error.next_action,
+                        ),
+                    )
+            _LOGGER.warning(
+                "Desktop project activation failed",
+                extra={"project_id": work.project_id, "error_code": error.code},
+            )
+        finally:
+            self.publish_state_changed()
+
+    def _finalize_project_runtime_failure(
+        self,
+        work: _ProjectActivationWork,
+        error: ApiErrorV1,
+    ) -> LocalOperationV1:
+        for attempt in range(2):
+            try:
+                return self._store.fail_project_runtime_action(
+                    reservation=work.reservation,
+                    route=work.route,
+                    operation_kind="project_activate",
+                    project_id=work.project_id,
+                    key=work.key,
+                    body={},
+                    if_match=work.if_match,
+                    error=error,
+                )
+            except (ProviderStoreError, sqlite3.Error):
+                observed = self._store.observe_project_runtime_action(
+                    reservation=work.reservation,
+                    route=work.route,
+                    operation_kind="project_activate",
+                    project_id=work.project_id,
+                    key=work.key,
+                    body={},
+                    if_match=work.if_match,
+                )
+                if observed.state not in {"queued", "running"}:
+                    return observed
+                if attempt != 0:
+                    raise
+        raise AssertionError("project failure finalization loop did not return")
+
+    @staticmethod
+    def _validate_activation_identity(
+        project: ProjectV1,
+        activation: CoreActivationV1,
+    ) -> None:
+        active_revision = activation.revision_head.active_revision
+        if (
+            active_revision is None
+            or activation.local_project_id != project.project_id
+            or activation.profile_id != project.profile_id
+            or activation.local_project_etag != project.etag
+            or activation.core_project.id != active_revision.project_id
+            or activation.core_project.active_revision != active_revision
+            or activation.core_project.registry_digest != activation.capabilities.registry_digest
+        ):
+            raise ProviderStoreError("Core activation authority does not match the local project")
+
+    def _remote_project_state(self, activation: CoreActivationV1) -> local_v1.RemoteProjectStateV1:
+        project = activation.core_project
+        return local_v1.RemoteProjectStateV1(
+            core_project_id=project.id,
+            status=project.status.value,
+            active_revision=project.active_revision,
+            registry_digest=project.registry_digest,
+            model_preparation=project.model_preparation,
+            observed_at=self._timestamp(),
+            etag=project.etag,
+        )
+
+    @staticmethod
+    def _project_activation_error(
+        reservation: ProjectRuntimeActionReservation,
+        exc: Exception,
+    ) -> ApiErrorV1:
+        if isinstance(exc, DesktopCoreBridgeErrorV1):
+            return exc.error.model_copy(update={"request_id": reservation.operation.operation_id})
+        return ApiErrorV1(
+            request_id=reservation.operation.operation_id,
+            code="project_activation_failed",
+            http_status=503,
+            message="OpenEvo Desktop could not activate the remote project.",
+            severity=ErrorSeverity.BLOCKING,
+            category=ErrorCategory.SERVICE,
+            retryable=True,
+            repair_action=RepairAction.OPENEVO_CAN_RETRY,
+            next_action="Retry project activation from OpenEvo Desktop.",
+        )
+
+    @staticmethod
+    def _project_queue_capacity_error(
+        reservation: ProjectRuntimeActionReservation,
+    ) -> ApiErrorV1:
+        return ApiErrorV1(
+            request_id=reservation.operation.operation_id,
+            code="project_operation_capacity_exhausted",
+            http_status=503,
+            message="OpenEvo Desktop cannot queue another project operation.",
+            severity=ErrorSeverity.BLOCKING,
+            category=ErrorCategory.SERVICE,
+            retryable=True,
+            repair_action=RepairAction.OPENEVO_CAN_RETRY,
+            next_action="Wait for the current project operation, then retry.",
+        )
+
+    @staticmethod
+    def _project_operation_response(operation: LocalOperationV1) -> JSONResponse:
+        return JSONResponse(
+            status_code=202,
+            content=operation.model_dump(mode="json"),
+            headers={"ETag": operation.etag},
+        )
+
+    def _retire_edited_project(self, project_id: str, profile_id: str) -> None:
+        if self._core_bridge is None:
+            return
+        try:
+            self._core_bridge.deactivate_project(project_id)
+        except DesktopCoreBridgeErrorV1 as exc:
+            with self._connection_state_lock:
+                self._core_state = CoreConnectionStateV1(
+                    state="offline",
+                    profile_id=profile_id,
+                    active_tunnel=False,
+                    failure=ConnectionFailureV1(
+                        code=exc.error.code,
+                        message=exc.error.message,
+                        retryable=exc.error.retryable,
+                        next_action=exc.error.next_action,
+                    ),
+                )
+            _LOGGER.warning(
+                "local project changed after Core session retirement failed",
+                extra={"project_id": project_id, "error_code": exc.error.code},
+            )
+        except Exception:
+            with self._connection_state_lock:
+                self._core_state = self._local_provider_failure_state(profile_id)
+            _LOGGER.exception(
+                "local project changed after Core session retirement failed",
+                extra={"project_id": project_id},
+            )
 
     def _get_project_capabilities(
         self, arguments: Mapping[str, object]
@@ -1018,7 +1373,10 @@ class DesktopReleaseProvider:
         """Publish one invalidation snapshot after a durable Desktop transition."""
 
         if self._event_broker is not None:
-            self._event_broker.publish(StateEventV1(state=self._get_state({})))
+            try:
+                self._event_broker.publish(StateEventV1(state=self._get_state({})))
+            except DesktopEventBrokerError:
+                _LOGGER.warning("Desktop state event could not be published")
 
     def _require_bridge(self, operation_id: str) -> DesktopCoreBridgeV1:
         if self._core_bridge is None:

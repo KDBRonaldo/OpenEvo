@@ -276,8 +276,9 @@ project or clear its revision/remote projection. Activation success requires a
 complete ready `RemoteProjectStateV1` and atomically records the active project,
 its matching Core revision, the canonical remote projection, the terminal
 operation, and its idempotency replay. Other project operations cannot publish
-remote state or invent a project result. The remote projection is a durable observation carrying
-Core's `observed_at`, not proof that the SSH tunnel or Core remains live. Startup
+remote state or invent a project result. The remote projection is a durable
+observation carrying the sidecar observation time, not proof that the SSH tunnel
+or Core remains live. Startup
 therefore preserves it as history while resetting local active/current-revision
 runtime authority under the existing recovery rule. Ordinary demote/archive
 transitions also preserve that observation, while any project intent patch
@@ -300,10 +301,18 @@ A typed failure keeps the project draft and is replayable without repeating
 remote work. Startup cancels every nonterminal
 reservation exactly once and updates the replay in the same recovery
 transaction, releasing all direct and implicit activation exclusions before
-new work is accepted. The release provider/controller is responsible for
-putting these reservations on its bounded executor and for translating Core
-outcomes; it must not perform external SSH/Core work while a SQLite transaction
-is open.
+new work is accepted. The release provider places activation reservations on one
+serialized executor with a hard 16-item admission bound. The HTTP route returns
+the durable queued operation without waiting for SSH or Core. The worker
+publishes `running`, calls the project-bound bridge outside SQLite transactions,
+validates the returned project/revision/registry identity, and commits the
+complete remote projection and terminal operation atomically. It then
+acknowledges that exact activation authority against the post-commit Local ETag
+before reporting Core `online`. Bridge failures retain their typed error with
+the Local operation request ID; unexpected local failures are sanitized. A
+published Core session is retired whenever Local completion or acknowledgement
+fails, including when the terminal operation is already durable, so a stale
+tunnel cannot retain Local authority.
 
 `pending_operation_ids()` exposes only queued, running, and cancelling operation
 IDs in stable identity order, with the same recovery-row upper bound, for
@@ -326,10 +335,11 @@ Core URL or bearer. Without an injected bridge these routes remain fail-closed.
 
 When release composition also supplies `DesktopEventBrokerV1`, the provider
 serves its bounded SSE subscription directly and maps expired cursors to the
-frozen 410 reset response. Core bootstrap/tunnel composition, Local
-activation/doctor/repair/workspace-sync operations, Local operation
-logs/cancellation, and the Core-to-Desktop event relay remain unavailable in
-this provider slice. The advertised feature set therefore remains
+frozen 410 reset response. Project activation now uses the durable bounded
+executor and project-bound bridge described above. Release adapter composition,
+Local doctor/repair/workspace-sync operations, Local operation logs/cancellation,
+and the Core-to-Desktop event relay remain unavailable in this provider slice.
+The advertised feature set therefore remains
 `remote_profiles` only; direct route and broker wiring are not sufficient to
 claim a complete release feature. Unavailable routes return a closed
 `ApiErrorV1` with HTTP 503 and never fixture data or a synthetic ready/success
