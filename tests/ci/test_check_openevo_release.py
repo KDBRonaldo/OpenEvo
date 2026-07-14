@@ -832,7 +832,7 @@ def test_tauri_macos_config_declares_unreleased_dmg_target() -> None:
         "tests::packaged_external_bin_native_launch_smoke"
     )
     assert "macOS FD-bound packaged sidecar launch smoke" in workflow
-    assert "tests::macos_release_executes_the_inherited_fd_through_devfs" in workflow
+    assert "tests::macos_release_uses_private_path_and_keeps_the_verified_fd" in workflow
     assert "if: always()" in workflow
     assert 'rm -f "$OPENEVO_PACKAGED_SIDECAR_PATH"' in workflow
     assert "cargo build --locked --release" in workflow
