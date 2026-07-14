@@ -13,7 +13,7 @@ import subprocess
 import sys
 import threading
 import time
-from typing import Literal, cast
+from typing import Callable, Literal, cast
 
 import pytest
 
@@ -182,14 +182,15 @@ def _reseal_provider_usage(
                 "SELECT total_rows, total_bytes, remote_payload_count, "
                 "remote_payload_bytes, remote_accumulator_0, remote_accumulator_1, "
                 "remote_accumulator_2, remote_accumulator_3, profile_reservations, "
-                "project_reservations, generation FROM provider_storage_usage"
+                "project_reservations, idempotency_record_count, "
+                "pagination_cursor_count, generation FROM provider_storage_usage"
             ).fetchone(),
         )
     )
     tag = hmac.digest(
         (root / "cursor-signing.key").read_bytes(),
         provider_store_module._PROVIDER_STORAGE_USAGE_AUTHORITY_DOMAIN
-        + struct.pack(">11Q", *values),
+        + struct.pack(f">{len(values)}Q", *values),
         "sha256",
     )
     updated = connection.execute(
@@ -215,6 +216,39 @@ def _replay_provider_usage(
         row[1:],
     )
     assert updated.rowcount == 1
+
+
+def _initialize_empty_v4_provider_store(root: Path) -> tuple[int, int]:
+    root.mkdir(mode=0o700)
+    os.chmod(root, 0o700)
+    (root / "provider.lock").touch(mode=0o600)
+    key = b"k" * 32
+    (root / "cursor-signing.key").write_bytes(key)
+    os.chmod(root / "cursor-signing.key", 0o600)
+    timestamp = "2026-07-14T12:00:00.000000Z"
+    authority_tag = hmac.digest(
+        key,
+        provider_store_module._REMOTE_PAYLOAD_USAGE_AUTHORITY_DOMAIN + struct.pack(">QQ", 0, 0),
+        "sha256",
+    )
+    with sqlite3.connect(root / "provider.sqlite3") as connection:
+        for statement in provider_store_module._SCHEMA_V4:
+            connection.execute(statement)
+        connection.executemany(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+            ((version, timestamp) for version in range(1, 5)),
+        )
+        connection.execute(
+            "INSERT INTO remote_payload_usage VALUES (1, 0, 0, ?)",
+            (authority_tag,),
+        )
+        connection.execute("PRAGMA user_version = 4")
+        usage = DesktopProviderStore._recovery_usage_v4(
+            connection,
+            include_remote_payload_usage=True,
+        )
+    os.chmod(root / "provider.sqlite3", 0o600)
+    return usage
 
 
 def test_initializes_versioned_private_sqlite_store(tmp_path: Path) -> None:
@@ -845,6 +879,56 @@ def test_v4_to_v5_provider_authority_migration_is_one_crash_transaction(
         )
 
 
+@pytest.mark.parametrize(
+    ("budget_name", "usage_index"),
+    (("MAX_RECOVERY_ROWS", 0), ("MAX_RECOVERY_BYTES", 1)),
+    ids=("row-boundary", "byte-boundary"),
+)
+def test_v4_to_v5_migration_validates_final_write_budget_before_seal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    budget_name: str,
+    usage_index: int,
+) -> None:
+    root = tmp_path / "state"
+    v4_usage = _initialize_empty_v4_provider_store(root)
+    original_budget = getattr(provider_store_module, budget_name)
+    original_seal = DesktopProviderStore._seal_provider_storage_usage
+    seal_called = False
+
+    def unexpected_seal(
+        _self: DesktopProviderStore,
+        _connection: sqlite3.Connection,
+    ) -> tuple[tuple[int, ...], bytes]:
+        nonlocal seal_called
+        seal_called = True
+        raise AssertionError("v5 authority was sealed before final budget validation")
+
+    monkeypatch.setattr(provider_store_module, budget_name, v4_usage[usage_index])
+    monkeypatch.setattr(DesktopProviderStore, "_seal_provider_storage_usage", unexpected_seal)
+
+    with pytest.raises(ProviderDataCorruptionError, match="provider recovery budget exceeded"):
+        DesktopProviderStore(root)
+
+    assert seal_called is False
+    with sqlite3.connect(root / "provider.sqlite3") as connection:
+        assert connection.execute("PRAGMA user_version").fetchone() == (4,)
+        assert connection.execute(
+            "SELECT version FROM schema_migrations ORDER BY version"
+        ).fetchall() == [(1,), (2,), (3,), (4,)]
+        assert (
+            connection.execute(
+                "SELECT name FROM sqlite_schema WHERE name = 'provider_storage_usage'"
+            ).fetchone()
+            is None
+        )
+
+    monkeypatch.setattr(provider_store_module, budget_name, original_budget)
+    monkeypatch.setattr(DesktopProviderStore, "_seal_provider_storage_usage", original_seal)
+    reopened = DesktopProviderStore(root)
+    assert tuple(reopened._connection.execute("PRAGMA user_version").fetchone()) == (5,)
+
+
 def test_v3_usage_migration_applies_recovery_budget_before_payload_scan(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1378,7 +1462,8 @@ def test_startup_reconciles_sealed_usage_authority_against_project_rows(
         store._connection.execute(
             "SELECT total_rows, total_bytes, remote_payload_count, remote_payload_bytes, "
             "remote_accumulator_0, remote_accumulator_1, remote_accumulator_2, "
-            "remote_accumulator_3, profile_reservations, project_reservations, generation "
+            "remote_accumulator_3, profile_reservations, project_reservations, "
+            "idempotency_record_count, pagination_cursor_count, generation "
             "FROM provider_storage_usage"
         ).fetchone()
     )
@@ -1656,6 +1741,144 @@ def test_project_pagination_never_runs_remote_payload_aggregate_scans(
         or "max(length(cast(remote_state_json as blob)))" in statement
         for statement in statements
     )
+
+
+def test_normal_provider_writes_use_o1_counters_and_bounded_expiry_cleanup(
+    tmp_path: Path,
+) -> None:
+    store = DesktopProviderStore(tmp_path / "state")
+    profile = _create_profile(store)
+    project = store.create_project(
+        _project(profile.profile_id),
+        idempotency_key="sql-plan-project-create",
+    )
+
+    def traced(write: Callable[[], object]) -> tuple[str, ...]:
+        statements: list[str] = []
+        store._connection.set_trace_callback(
+            lambda statement: statements.append(" ".join(statement.lower().split()))
+        )
+        try:
+            write()
+        finally:
+            store._connection.set_trace_callback(None)
+        return tuple(statements)
+
+    traces = {
+        "create": traced(
+            lambda: _create_profile(
+                store,
+                name="SQL trace profile",
+                key="sql-trace-profile-create",
+            )
+        ),
+        "profile-action": traced(
+            lambda: store.begin_profile_runtime_action(
+                route=f"/desktop/v1/profiles/{profile.profile_id}/disconnect",
+                operation_kind="profile_disconnect",
+                profile_id=profile.profile_id,
+                key="sql-trace-profile-action",
+                body={},
+                if_match=profile.etag,
+                displace_existing=False,
+            )
+        ),
+        "project-action": traced(
+            lambda: store.begin_project_runtime_action(
+                route=f"/desktop/v1/projects/{project.project_id}/workspace-sync",
+                operation_kind="workspace_sync",
+                project_id=project.project_id,
+                key="sql-trace-project-action",
+                body={},
+                if_match=project.etag,
+            )
+        ),
+        "cursor": traced(lambda: store.list_profiles(limit=1, sort="name", direction="asc")),
+    }
+
+    for path in ("create", "profile-action", "project-action"):
+        statements = traces[path]
+        assert not any("select count(*) from idempotency_records" in sql for sql in statements)
+        assert any(
+            "from idempotency_records indexed by idempotency_expiry_idx" in sql and "limit" in sql
+            for sql in statements
+        )
+        assert any(
+            "idempotency_record_count" in sql
+            and "from provider_storage_usage where singleton = 1" in sql
+            for sql in statements
+        )
+    cursor_statements = traces["cursor"]
+    assert not any("select count(*) from pagination_cursors" in sql for sql in cursor_statements)
+    assert any(
+        "delete from pagination_cursors" in sql
+        and "pagination_cursors_expiry_idx" in sql
+        and "limit" in sql
+        for sql in cursor_statements
+    )
+    assert any(
+        "pagination_cursor_count" in sql
+        and "from provider_storage_usage where singleton = 1" in sql
+        for sql in cursor_statements
+    )
+
+
+def test_normal_cleanup_queries_are_indexed_and_return_a_fixed_batch(tmp_path: Path) -> None:
+    store = DesktopProviderStore(tmp_path / "state")
+    idempotency_plan = tuple(
+        str(row[3])
+        for row in store._connection.execute(
+            """
+            EXPLAIN QUERY PLAN
+            SELECT * FROM idempotency_records INDEXED BY idempotency_expiry_idx
+            WHERE cleanup_eligible = 1 AND expires_at_epoch <= ?
+            ORDER BY expires_at_epoch
+            LIMIT ?
+            """,
+            (0, provider_store_module.NORMAL_WRITE_CLEANUP_ROWS),
+        )
+    )
+    assert any(
+        "SEARCH idempotency_records USING INDEX idempotency_expiry_idx" in step
+        for step in idempotency_plan
+    )
+    assert not any("SCAN idempotency_records" in step for step in idempotency_plan)
+
+    cursor_plan = tuple(
+        str(row[3])
+        for row in store._connection.execute(
+            """
+            EXPLAIN QUERY PLAN
+            DELETE FROM pagination_cursors
+            WHERE cursor_digest IN (
+                SELECT cursor_digest
+                FROM pagination_cursors INDEXED BY pagination_cursors_expiry_idx
+                WHERE expires_at_epoch <= ?
+                ORDER BY expires_at_epoch
+                LIMIT ?
+            )
+            """,
+            (0, provider_store_module.NORMAL_WRITE_CLEANUP_ROWS),
+        )
+    )
+    assert any(
+        "SEARCH pagination_cursors USING INDEX pagination_cursors_expiry_idx" in step
+        for step in cursor_plan
+    )
+    assert not any("SCAN pagination_cursors" in step for step in cursor_plan)
+
+    counter_plan = tuple(
+        str(row[3])
+        for row in store._connection.execute(
+            """
+            EXPLAIN QUERY PLAN
+            SELECT idempotency_record_count, pagination_cursor_count
+            FROM provider_storage_usage WHERE singleton = 1
+            """
+        )
+    )
+    assert any("SEARCH provider_storage_usage USING PRIMARY KEY" in step for step in counter_plan)
+    assert not any("SCAN provider_storage_usage" in step for step in counter_plan)
 
 
 def test_provider_usage_authority_tracks_crud_replay_and_operation_lifecycle(

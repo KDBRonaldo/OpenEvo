@@ -286,15 +286,27 @@ previous intent. This closed projection has a separate 256 KiB per-row limit and
 16 MiB aggregate recovery limit. Schema v5 keeps one closed
 `provider_storage_usage` authority row containing the complete provider recovery
 row/byte totals, remote payload count/bytes, four remote-content accumulators,
-fixed live-action reservation counts, a generation, and a domain-separated HMAC
-sealed with the separate owner-only cursor key. Every mutable provider table has
-canonical insert/update/delete triggers that update this authority, invalidate
-its seal, and require exactly one affected singleton row. The write transaction
-reseals before commit, so rollback restores resource, operation, idempotency,
-cursor, and usage state together. Normal transactions validate only this primary
-key row and the fixed-size schema; they do not aggregate-scan provider tables.
+fixed live-action reservation counts, exact idempotency/cursor row counts, a
+generation, and a domain-separated HMAC sealed with the separate owner-only
+cursor key. Every mutable provider table has canonical insert/update/delete
+triggers that update this authority, invalidate its seal, and require exactly one
+affected singleton row. The write transaction reseals before commit, so rollback
+restores resource, operation, idempotency, cursor, and usage state together.
+Normal capacity checks are primary-key reads of the singleton; they do not run
+provider-table `count(*)` or aggregate scans.
 Recovery accounting charges the singleton a fixed conservative 512-byte
 reservation instead of recursively measuring its changing decimal counters.
+
+Normal idempotent create, profile-action, and project-action writes reclaim at
+most 128 expired cleanup-eligible replay rows per transaction through the v5
+`(cleanup_eligible, expires_at_epoch)` index. Nonterminal operation replays are
+not cleanup eligible, so they remain available even after their original
+retention time; terminal publication atomically makes the replay eligible.
+Pagination cursor writes similarly remove at most 128 expired rows through the
+expiry index. The authenticated counters are then used for exact capacity
+decisions. This bounds foreground cleanup work independently of table size while
+preserving live-action replay and hard capacity limits; additional expired rows
+are reclaimed by later writes.
 
 The singleton cannot be inserted or deleted after v5 initialization, and the
 migration ledger is immutable. `DELETE` plus reinsert and `INSERT OR REPLACE`
@@ -309,9 +321,12 @@ Startup validates the seal, applies the existing 100,000-row and recovery-byte
 budgets, and then performs one bounded reconciliation of real table totals,
 remote lengths/tokens, and live reservations before decoding remote payloads.
 The v4 -> v5 migration does the same and publishes project tokens, the authority,
-triggers, migration row, and schema version in one SQLite transaction. Oversized,
-noncanonical, trigger-tampered, partially replayed, or equal-length rewritten
-state fails closed.
+triggers, migration row, and schema version in one SQLite transaction. After the
+singleton and v5 migration row exist, but before the authority is sealed or
+`user_version` changes, migration validates the final authority against the full
+write row/byte/reservation budgets. Failure rolls the transaction back to the
+reopenable v4 layout. Oversized, noncanonical, trigger-tampered, partially
+replayed, or equal-length rewritten state fails closed.
 
 The authority assumes the owner-only signing key remains confidential and is not
 an external monotonic anchor. An offline attacker who restores a complete earlier

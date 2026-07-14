@@ -166,13 +166,13 @@ JSON/blob, duplicated scalar, timestamp, version, and typed idempotency rows.
 The v5 `provider_storage_usage` singleton is the normal-transaction authority
 for the complete provider recovery row/byte budget, the 256 KiB per-value and
 16 MiB aggregate remote-state budget, and fixed terminal reservations. It also
-contains a generation and four modular remote-content accumulators. Canonical
-row triggers update it transactionally and require exactly one affected
-authority row; its seal is a domain-separated HMAC under the owner-only signing
-key. The migration ledger becomes immutable at v5. The authority singleton
-rejects every later insert and delete, so `DELETE` followed by insert and
-`INSERT OR REPLACE` are rejected even when SQLite recursive triggers are off.
-Rollback restores data and authority together.
+contains exact idempotency/cursor row counts, a generation, and four modular
+remote-content accumulators. Canonical row triggers update it transactionally
+and require exactly one affected authority row; its seal is a domain-separated
+HMAC under the owner-only signing key. The migration ledger becomes immutable at
+v5. The authority singleton rejects every later insert and delete, so `DELETE`
+followed by insert and `INSERT OR REPLACE` are rejected even when SQLite
+recursive triggers are off. Rollback restores data and authority together.
 
 Each non-null `RemoteProjectStateV1` BLOB has a per-project HMAC-derived content
 token over the project ID and exact canonical bytes. Project triggers add and
@@ -181,11 +181,20 @@ reads recompute the token before JSON parsing. Normal reads and writes validate
 the fixed-size schema and singleton in O(1) relative to provider data; they do
 not run table `count`/`sum(length(...))` scans. The process caches the last
 committed generation and seal, which rejects replay of an older signed authority
-during that process lifetime. Startup and v4 -> v5 migration may perform one
-bounded reconciliation of actual table totals, remote lengths/tokens, and live
-reservations before any remote payload is decoded. The singleton itself consumes
-a fixed conservative 512-byte recovery reservation, avoiding recursive accounting
-of its changing decimal counter representation.
+during that process lifetime. Foreground idempotent writes use the singleton's
+exact count and reclaim at most 128 expired cleanup-eligible rows through the v5
+`(cleanup_eligible, expires_at_epoch)` index; a nonterminal operation remains
+ineligible until terminal publication atomically changes that state. Cursor
+writes perform the same fixed 128-row maximum through their expiry index. Thus
+cleanup work is bounded independently of table size, live action replay remains
+available, and later writes converge any remaining expired backlog. Startup and
+v4 -> v5 migration may perform one bounded reconciliation of actual table totals,
+remote lengths/tokens, exact idempotency/cursor counts, and live reservations
+before any remote payload is decoded. After creating the singleton and migration
+row, migration validates the final write budget before seal, `user_version`, and
+commit; a row/byte overflow rolls the entire transaction back to v4. The
+singleton itself consumes a fixed conservative 512-byte recovery reservation,
+avoiding recursive accounting of its changing decimal counter representation.
 
 This authentication detects budget-changing partial SQLite edits and remote
 content edits while the signing key remains confidential, including equal-length
