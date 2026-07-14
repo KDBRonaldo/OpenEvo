@@ -13,22 +13,29 @@ from openevo.backend.contracts.v1.models import (
     ArtifactContentV1,
     ArtifactDiffV1,
     CapabilitiesResponseV1,
+    DiagnosticsRequestV1,
+    EnvironmentCheckV1,
     EventEnvelopeV1,
     ExecutionMode,
     ImmutableSnapshotRefV1,
+    OperationV1,
     ParametricMemoryArtifactSummaryV1,
     ProjectCreateV1,
     ProjectSpecV1,
     ProjectV1,
     ReachableRequiredRevisionRefV1,
+    RevisionV1,
     RevisionTransitionState,
     RunCreateV1,
     RunContextV1,
     RunSummaryV1,
+    RunV1,
+    ServiceSummaryV1,
     StrongETag,
     TaskSpecV1,
-    WorkspaceArchiveV1,
+    WorkspaceArchiveDeclarationV1,
     WorkspaceUploadChunkV1,
+    WorkspaceUploadFinalizeResponseV1,
 )
 from openevo.evolution.framework.capabilities import EvolutionCapabilitiesV1
 from openevo.evolution.framework.profiles import ReleaseExecutionMode
@@ -82,6 +89,8 @@ EXPECTED_OPERATIONS = {
     ("GET", "/v1/services/{service_id}"),
     ("POST", "/v1/services/{service_id}/restart"),
     ("GET", "/v1/services/{service_id}/logs"),
+    ("GET", "/v1/operations/{operation_id}"),
+    ("GET", "/v1/logs/{logs_ref}"),
     ("POST", "/v1/diagnostics"),
     ("GET", "/v1/diagnostics/{diagnostic_id}"),
     ("DELETE", "/v1/diagnostics/{diagnostic_id}"),
@@ -166,6 +175,34 @@ def _transition() -> dict[str, Any]:
     }
 
 
+def _revision() -> dict[str, Any]:
+    transition = _transition()
+    transition.update(
+        {
+            "state": "active",
+            "progress_completed": 6,
+            "progress_total": 6,
+            "message": "The successor is active.",
+        }
+    )
+    return {
+        "schema_version": "1",
+        "revision": _revision_ref(),
+        "status": "active",
+        "predecessor_revision": transition["predecessor_revision"],
+        "project_snapshot": _snapshot_ref("project", "project-snapshot-2", "4"),
+        "task_snapshot": _snapshot_ref("task", "task-snapshot-2", "5"),
+        "workspace_snapshot": _snapshot_ref("workspace", "workspace-snapshot-2", "6"),
+        "registry_digest": "a" * 64,
+        "transition": transition,
+        "created_at": "2026-07-14T00:00:00Z",
+        "updated_at": "2026-07-14T00:00:06Z",
+        "activated_at": "2026-07-14T00:00:06Z",
+        "error": None,
+        "etag": '"' + "7" * 64 + '"',
+    }
+
+
 def _valid_run_summary() -> dict[str, Any]:
     return {
         "id": "run-1",
@@ -203,7 +240,8 @@ def _content_ref(content_id: str = "content-1") -> dict[str, Any]:
 
 def _workspace_archive() -> dict[str, Any]:
     return {
-        "content_ref": _content_ref("workspace-archive-1"),
+        "content_sha256": "c" * 64,
+        "byte_size": 2560,
         "format": "openevo_deterministic_tar_v1",
         "entry_count": 2,
         "extracted_byte_size": 100,
@@ -211,9 +249,12 @@ def _workspace_archive() -> dict[str, Any]:
             "media_type": "application/vnd.openevo.workspace-tar",
             "tar_format": "posix_ustar",
             "entry_types": "regular_files_and_directories",
-            "path_policy": "utf8_nfc_posix_relative",
-            "entry_order": "lexicographic",
+            "path_policy": "utf8_nfc_posix_relative_ustar_split_v1",
+            "entry_order": "header_path_byte_lexicographic_parents_first",
             "metadata_policy": "uid_gid_zero_names_empty_mtime_zero",
+            "header_policy": "posix_ustar_canonical_header_v1",
+            "body_policy": "zero_pad_to_512_bytes",
+            "terminator_policy": "two_zero_blocks_no_trailing_bytes",
             "file_mode_policy": "0644_or_0755",
             "directory_mode": "0755",
             "allow_symlinks": False,
@@ -224,8 +265,8 @@ def _workspace_archive() -> dict[str, Any]:
             "allow_tar_extensions": False,
             "max_entries": 100_000,
             "max_path_depth": 32,
-            "max_path_bytes": 1024,
-            "max_file_bytes": 8 * 1024 * 1024 * 1024,
+            "max_path_bytes": 256,
+            "max_file_bytes": 0o77777777777,
             "max_extracted_bytes": 16 * 1024 * 1024 * 1024,
         },
     }
@@ -235,7 +276,7 @@ def test_openapi_snapshot_is_exactly_rebuildable() -> None:
     rebuilt = canonical_json_bytes(build_openapi_document())
     assert OPENAPI_SNAPSHOT_PATH.read_bytes() == rebuilt
     assert hashlib.sha256(rebuilt).hexdigest() == openapi_sha256()
-    assert openapi_sha256() == ("5670a279cfeb4c424098c1ca01e5d84ab426b820f4b3a67e8855ed785d84db61")
+    assert openapi_sha256() == ("6ebb4df8d2d80d39c343e2f4db540584fbe95da06d4d05b8bcf028091aeb978f")
 
 
 def test_event_schema_snapshot_is_exactly_rebuildable() -> None:
@@ -243,7 +284,7 @@ def test_event_schema_snapshot_is_exactly_rebuildable() -> None:
     assert EVENTS_SCHEMA_SNAPSHOT_PATH.read_bytes() == rebuilt
     assert hashlib.sha256(rebuilt).hexdigest() == events_schema_sha256()
     assert events_schema_sha256() == (
-        "80944325e12ce9beb3844a573e4930df2e00e19e646a2df2cf4044d7701e52a1"
+        "9c698ac990bac7d82c03516777b89a59ad2f3a3832fa1a11281fd57fcd5bb20e"
     )
 
 
@@ -328,6 +369,23 @@ def test_capability_response_is_the_authoritative_registry_contract() -> None:
     } <= set(method)
 
 
+def test_capability_support_axes_preserve_framework_three_state_values() -> None:
+    schema = build_openapi_document()["components"]["schemas"]
+    assert set(schema["MethodSupportOverall"]["enum"]) == {
+        "supported",
+        "unsupported",
+        "unavailable",
+    }
+    assert set(schema["SupportState"]["enum"]) == {
+        "supported",
+        "unsupported",
+        "unavailable",
+    }
+    support = schema["MethodSupport"]["properties"]
+    for axis in ("execution", "capture", "harness", "runtime"):
+        assert support[axis] == {"$ref": "#/components/schemas/AxisSupport"}
+
+
 def test_project_spec_uses_the_core_owned_evolution_target_map() -> None:
     spec = _json_model(
         ProjectSpecV1,
@@ -394,7 +452,6 @@ def test_project_lifecycle_owns_task_and_workspace_snapshot_inputs() -> None:
     task = {
         "title": "Prove the theorem",
         "objective": "Produce a checked proof and explain each inference.",
-        "content_ref": _content_ref("task-content-1"),
     }
     assert _json_model(TaskSpecV1, task).title == "Prove the theorem"
     for forbidden, value in (
@@ -405,6 +462,9 @@ def test_project_lifecycle_owns_task_and_workspace_snapshot_inputs() -> None:
         malicious = {**task, forbidden: value}
         with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
             _json_model(TaskSpecV1, malicious)
+
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        _json_model(TaskSpecV1, {**task, "content_ref": _content_ref("unissued")})
 
 
 def test_scratch_project_create_has_a_core_signed_empty_workspace_path() -> None:
@@ -422,7 +482,6 @@ def test_scratch_project_create_has_a_core_signed_empty_workspace_path() -> None
         "task": {
             "title": "Explore",
             "objective": "Create the result in a new empty workspace.",
-            "content_ref": None,
         },
         "workspace": {"kind": "scratch", "display_name": "Empty workspace"},
     }
@@ -464,14 +523,43 @@ def test_scratch_project_create_has_a_core_signed_empty_workspace_path() -> None
     assert _json_model(ProjectV1, project).current_workspace_snapshot is not None
 
 
+def test_imported_workspace_request_declares_content_without_a_core_id() -> None:
+    create = {
+        "schema_version": "1",
+        "name": "Imported science",
+        "description": None,
+        "spec": {
+            "execution_mode": "self-deployed",
+            "capture_mode": "transcript",
+            "harness_id": "codex",
+            "agent_model_ref": "openai/gpt-oss-20b",
+            "evolution": {"targets": {}},
+        },
+        "task": {"title": "Analyze", "objective": "Analyze the imported workspace."},
+        "workspace": {
+            "kind": "native_folder_snapshot",
+            "display_name": "Imported workspace",
+            "archive": _workspace_archive(),
+        },
+    }
+    assert _json_model(ProjectCreateV1, create).workspace.archive.byte_size == 2560
+
+    invented = json.loads(json.dumps(create))
+    invented["workspace"]["archive"]["content_id"] = "caller-invented"
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        _json_model(ProjectCreateV1, invented)
+
+
 def test_workspace_archive_format_and_extraction_policy_are_frozen() -> None:
-    archive = _json_model(WorkspaceArchiveV1, _workspace_archive())
+    archive = _json_model(WorkspaceArchiveDeclarationV1, _workspace_archive())
     assert archive.format.value == "openevo_deterministic_tar_v1"
     assert archive.policy.allow_symlinks is False
     assert archive.policy.allow_hardlinks is False
     assert archive.policy.allow_devices is False
     assert archive.policy.max_entries == 100_000
     assert archive.policy.max_extracted_bytes == 16 * 1024 * 1024 * 1024
+    assert archive.policy.max_file_bytes == 0o77777777777
+    assert archive.policy.max_path_bytes == 256
 
     for field in (
         "allow_symlinks",
@@ -484,18 +572,32 @@ def test_workspace_archive_format_and_extraction_policy_are_frozen() -> None:
         unsafe = _workspace_archive()
         unsafe["policy"][field] = True
         with pytest.raises(ValidationError):
-            _json_model(WorkspaceArchiveV1, unsafe)
+            _json_model(WorkspaceArchiveDeclarationV1, unsafe)
 
     unsupported = _workspace_archive()
     unsupported["format"] = "zip"
     with pytest.raises(ValidationError):
-        _json_model(WorkspaceArchiveV1, unsupported)
+        _json_model(WorkspaceArchiveDeclarationV1, unsupported)
+
+    impossible_size = _workspace_archive()
+    impossible_size["byte_size"] = 1024
+    with pytest.raises(ValidationError, match="too small"):
+        _json_model(WorkspaceArchiveDeclarationV1, impossible_size)
 
     schema = build_openapi_document()["components"]["schemas"]
     assert schema["WorkspaceArchivePolicyV1"]["additionalProperties"] is False
     assert "dot-dot" in schema["WorkspaceArchivePolicyV1"]["properties"]["path_policy"][
         "description"
     ]
+    assert "rightmost" in schema["WorkspaceArchivePolicyV1"]["properties"]["path_policy"][
+        "description"
+    ]
+    assert "0000644\\0" in schema["WorkspaceArchivePolicyV1"]["properties"]["header_policy"][
+        "description"
+    ]
+    assert "six octal digits" in schema["WorkspaceArchivePolicyV1"]["properties"][
+        "header_policy"
+    ]["description"]
     assert "regular-file and directory" in schema["WorkspaceArchivePolicyV1"][
         "properties"
     ]["entry_types"]["description"]
@@ -506,7 +608,122 @@ def test_workspace_archive_format_and_extraction_policy_are_frozen() -> None:
         "schema_version",
         "archive",
         "base_workspace_snapshot",
+        "project_snapshot",
     }
+    assert "content_id" not in json.dumps(
+        schema["WorkspaceUploadCreateV1"], sort_keys=True
+    )
+
+
+def test_workspace_finalize_closes_upload_and_project_cas() -> None:
+    openapi = build_openapi_document()
+    create = openapi["paths"]["/v1/projects/{project_id}/workspace-uploads"]["post"]
+    finalize = openapi["paths"][
+        "/v1/projects/{project_id}/workspace-uploads/{upload_id}/finalize"
+    ]["post"]
+    assert {parameter["name"] for parameter in create["parameters"]} >= {
+        "project_id",
+        "If-Match",
+        "Idempotency-Key",
+    }
+    assert {parameter["name"] for parameter in finalize["parameters"]} >= {
+        "project_id",
+        "upload_id",
+        "If-Match",
+        "If-Project-Match",
+        "Idempotency-Key",
+    }
+    project_match = next(
+        parameter
+        for parameter in finalize["parameters"]
+        if parameter["name"] == "If-Project-Match"
+    )
+    assert project_match["schema"]["pattern"] == r'^"[0-9a-f]{64}"$'
+    assert project_match["required"] is True
+    assert _response_schema_name(finalize) == "WorkspaceUploadFinalizeResponseV1"
+    response_schema = openapi["components"]["schemas"][
+        "WorkspaceUploadFinalizeResponseV1"
+    ]
+    assert {"project", "upload", "content_ref", "workspace_snapshot"} <= set(
+        response_schema["properties"]
+    )
+    assert WorkspaceUploadFinalizeResponseV1 is not None
+
+    workspace_snapshot = _snapshot_ref("workspace", "workspace-snapshot-2", "6")
+    content_ref = {
+        "content_id": "content-1",
+        "sha256": "c" * 64,
+        "byte_size": 2560,
+    }
+    upload = {
+        "schema_version": "1",
+        "id": "upload-1",
+        "project_id": "project-1",
+        "status": "finalized",
+        "accepted_offset": 2560,
+        "project_snapshot": _snapshot_ref("project", "project-snapshot-1", "1"),
+        "project_etag": '"' + "a" * 64 + '"',
+        "archive": _workspace_archive(),
+        "base_workspace_snapshot": None,
+        "content_ref": content_ref,
+        "workspace_snapshot": workspace_snapshot,
+        "created_at": "2026-07-14T00:00:00Z",
+        "updated_at": "2026-07-14T00:00:02Z",
+        "etag": '"' + "b" * 64 + '"',
+    }
+    project = {
+        "id": "project-1",
+        "name": "Imported science",
+        "description": None,
+        "status": "draft",
+        "execution_mode": "self-deployed",
+        "workspace_kind": "native_folder_snapshot",
+        "current_project_snapshot": _snapshot_ref("project", "project-snapshot-2", "4"),
+        "current_task_snapshot": _snapshot_ref("task", "task-snapshot-1", "2"),
+        "current_workspace_snapshot": workspace_snapshot,
+        "active_revision": None,
+        "registry_digest": None,
+        "model_preparation": {
+            "model_ref": "openai/gpt-oss-20b",
+            "status": "unresolved",
+            "downloaded_bytes": None,
+            "total_bytes": None,
+            "error": None,
+            "updated_at": "2026-07-14T00:00:02Z",
+        },
+        "created_at": "2026-07-14T00:00:00Z",
+        "updated_at": "2026-07-14T00:00:02Z",
+        "etag": '"' + "c" * 64 + '"',
+        "spec": {
+            "execution_mode": "self-deployed",
+            "capture_mode": "transcript",
+            "harness_id": "codex",
+            "agent_model_ref": "openai/gpt-oss-20b",
+            "evolution": {"targets": {}},
+        },
+        "task": {"title": "Explore", "objective": "Analyze the imported workspace."},
+        "workspace": {
+            "kind": "native_folder_snapshot",
+            "display_name": "Imported workspace",
+            "archive": _workspace_archive(),
+        },
+    }
+    response = {
+        "schema_version": "1",
+        "project_id": "project-1",
+        "upload": upload,
+        "content_ref": content_ref,
+        "workspace_snapshot": workspace_snapshot,
+        "project": project,
+    }
+    assert _json_model(WorkspaceUploadFinalizeResponseV1, response).project.etag == project[
+        "etag"
+    ]
+
+    stale = json.loads(json.dumps(response))
+    stale["project"]["current_project_snapshot"] = upload["project_snapshot"]
+    with pytest.raises(ValidationError, match="new project snapshot"):
+        _json_model(WorkspaceUploadFinalizeResponseV1, stale)
 
 
 def test_revision_transition_includes_model_serving_preparation() -> None:
@@ -624,6 +841,30 @@ def test_run_state_shape_enforces_queue_and_terminal_invariants() -> None:
     with pytest.raises(ValidationError):
         _json_model(RunSummaryV1, unknown_state)
 
+    active_required = _valid_run_summary()
+    active_required["required_revision"] = {
+        "revision": _revision_ref("revision-6"),
+        "reachable_from_revision_id": "revision-6",
+        "relation": "active",
+    }
+    active_required["revision_transition"] = None
+    assert _json_model(RunSummaryV1, active_required).revision_transition is None
+
+    missing_successor_transition = _valid_run_summary()
+    missing_successor_transition["revision_transition"] = None
+    with pytest.raises(ValidationError, match="successor"):
+        _json_model(RunSummaryV1, missing_successor_transition)
+
+    cancelled_before_admission = _valid_run_summary()
+    cancelled_before_admission.update(
+        {
+            "status": "cancelled",
+            "queued_reason": None,
+            "finished_at": "2026-07-14T00:00:01Z",
+        }
+    )
+    assert _json_model(RunSummaryV1, cancelled_before_admission).pinned_revision is None
+
 
 def test_run_list_shape_contains_current_attempt_error_and_transition() -> None:
     properties = build_openapi_document()["components"]["schemas"]["RunSummaryV1"][
@@ -638,6 +879,82 @@ def test_run_list_shape_contains_current_attempt_error_and_transition() -> None:
         "updated_at",
         "etag",
     } <= set(properties)
+    assert properties["attempt_count"]["maximum"] == 100
+    assert build_openapi_document()["components"]["schemas"]["AttemptV1"]["properties"][
+        "number"
+    ]["maximum"] == 100
+
+
+def test_run_detail_closes_attempt_order_status_and_revision_identity() -> None:
+    detail = _valid_run_summary()
+    detail.update(
+        {
+            "status": "running",
+            "queued_reason": None,
+            "current_attempt_id": "attempt-2",
+            "current_attempt": {
+                "id": "attempt-2",
+                "run_id": "run-1",
+                "number": 2,
+                "status": "running",
+                "queued_reason": None,
+                "created_at": "2026-07-14T00:00:03Z",
+                "updated_at": "2026-07-14T00:00:04Z",
+                "started_at": "2026-07-14T00:00:04Z",
+                "finished_at": None,
+                "error": None,
+            },
+            "attempt_count": 2,
+            "pinned_revision": _revision_ref(),
+            "started_at": "2026-07-14T00:00:01Z",
+            "attempts": [
+                {
+                    "id": "attempt-1",
+                    "run_id": "run-1",
+                    "number": 1,
+                    "status": "cancelled",
+                    "queued_reason": None,
+                    "created_at": "2026-07-14T00:00:01Z",
+                    "updated_at": "2026-07-14T00:00:02Z",
+                    "started_at": None,
+                    "finished_at": "2026-07-14T00:00:02Z",
+                    "error": None,
+                },
+            ],
+        }
+    )
+    detail["revision_transition"].update(
+        {"state": "active", "progress_completed": 6, "progress_total": 6}
+    )
+    detail["attempts"].append(detail["current_attempt"])
+    assert _json_model(RunV1, detail).attempt_count == 2
+
+    wrong_status = json.loads(json.dumps(detail))
+    wrong_status["current_attempt"]["status"] = "preparing"
+    wrong_status["attempts"][-1]["status"] = "preparing"
+    with pytest.raises(ValidationError, match="statuses differ"):
+        _json_model(RunV1, wrong_status)
+
+    wrong_order = json.loads(json.dumps(detail))
+    wrong_order["attempts"][0]["number"] = 2
+    with pytest.raises(ValidationError, match="contiguous"):
+        _json_model(RunV1, wrong_order)
+
+    cross_wired_current = json.loads(json.dumps(detail))
+    cross_wired_current["attempts"][-1]["updated_at"] = "2026-07-14T00:00:05Z"
+    with pytest.raises(ValidationError, match="equal the last attempt"):
+        _json_model(RunV1, cross_wired_current)
+
+
+def test_revision_resource_binds_nested_transition_identity() -> None:
+    assert _json_model(RevisionV1, _revision()).revision.id == "revision-7"
+    mismatched = _revision()
+    mismatched["transition"]["successor_revision"] = {
+        **_revision_ref("revision-other"),
+        "generation": 7,
+    }
+    with pytest.raises(ValidationError, match="bind predecessor and revision"):
+        _json_model(RevisionV1, mismatched)
 
 
 def test_queued_run_and_context_never_fabricate_a_pinned_revision() -> None:
@@ -794,9 +1111,25 @@ def test_artifact_diff_is_bounded_structured_data() -> None:
     payload = {
         "schema_version": "1",
         "artifact_id": "artifact-2",
+        "artifact_content_sha256": "2" * 64,
         "previous_artifact_id": "artifact-1",
+        "previous_artifact_content_sha256": "1" * 64,
         "hunks": [
             {
+                "old_document": {
+                    "artifact_id": "artifact-1",
+                    "artifact_content_sha256": "1" * 64,
+                    "document_id": "doc-1",
+                    "relative_path": "memory.md",
+                    "content_sha256": "a" * 64,
+                },
+                "new_document": {
+                    "artifact_id": "artifact-2",
+                    "artifact_content_sha256": "2" * 64,
+                    "document_id": "doc-2",
+                    "relative_path": "memory.md",
+                    "content_sha256": "b" * 64,
+                },
                 "old_start": 1,
                 "old_count": 1,
                 "new_start": 1,
@@ -818,6 +1151,397 @@ def test_artifact_diff_is_bounded_structured_data() -> None:
     diff = _json_model(ArtifactDiffV1, payload)
     assert diff.hunks[0].lines[0].kind.value == "context"
 
+    wrong_side = json.loads(json.dumps(payload))
+    wrong_side["hunks"][0]["old_document"]["artifact_id"] = "artifact-2"
+    with pytest.raises(ValidationError, match="old document"):
+        _json_model(ArtifactDiffV1, wrong_side)
+
+    unsafe_path = json.loads(json.dumps(payload))
+    unsafe_path["hunks"][0]["new_document"]["relative_path"] = "../secret"
+    with pytest.raises(ValidationError, match="unsafe path"):
+        _json_model(ArtifactDiffV1, unsafe_path)
+
+
+def test_model_preparation_is_present_iff_resource_is_model_backed() -> None:
+    service = {
+        "id": "service-1",
+        "display_name": "Inference",
+        "kind": "inference",
+        "status": "running",
+        "restartable": True,
+        "status_message": None,
+        "error": None,
+        "model_preparation": None,
+        "updated_at": "2026-07-14T00:00:00Z",
+        "observed_at": "2026-07-14T00:00:00Z",
+        "etag": '"' + "e" * 64 + '"',
+    }
+    with pytest.raises(ValidationError, match="inference"):
+        _json_model(ServiceSummaryV1, service)
+
+    preparation = {
+        "model_ref": "openai/gpt-oss-20b",
+        "status": "unresolved",
+        "downloaded_bytes": None,
+        "total_bytes": None,
+        "error": None,
+        "updated_at": "2026-07-14T00:00:00Z",
+    }
+    service["model_preparation"] = preparation
+    assert _json_model(ServiceSummaryV1, service).kind.value == "inference"
+    service["kind"] = "control"
+    with pytest.raises(ValidationError, match="inference"):
+        _json_model(ServiceSummaryV1, service)
+
+    check = {
+        "id": "check-1",
+        "kind": "model_service",
+        "status": "blocking",
+        "message": "Model is unresolved.",
+        "repair_action": "openevo_can_install",
+        "next_action": "Prepare the model.",
+        "logs_ref": None,
+        "model_preparation": None,
+    }
+    with pytest.raises(ValidationError, match="model-service"):
+        _json_model(EnvironmentCheckV1, check)
+    check["model_preparation"] = preparation
+    assert _json_model(EnvironmentCheckV1, check).kind.value == "model_service"
+    check["kind"] = "network"
+    with pytest.raises(ValidationError, match="model-service"):
+        _json_model(EnvironmentCheckV1, check)
+
+
+@pytest.mark.parametrize(
+    ("payload", "valid"),
+    [
+        ({"schema_version": "1", "scopes": ["environment"], "target": {"kind": "global"}}, True),
+        (
+            {
+                "schema_version": "1",
+                "scopes": ["project"],
+                "target": {"kind": "project", "project_id": "project-1"},
+            },
+            True,
+        ),
+        (
+            {
+                "schema_version": "1",
+                "scopes": ["run"],
+                "target": {
+                    "kind": "run",
+                    "project_id": "project-1",
+                    "run_id": "run-1",
+                },
+            },
+            True,
+        ),
+        (
+            {
+                "schema_version": "1",
+                "scopes": ["run"],
+                "target": {"kind": "run", "run_id": "run-1"},
+            },
+            False,
+        ),
+        (
+            {
+                "schema_version": "1",
+                "scopes": ["services"],
+                "target": {"kind": "project", "project_id": "project-1"},
+            },
+            False,
+        ),
+    ],
+)
+def test_diagnostic_scopes_require_exact_resource_identity(
+    payload: dict[str, Any], valid: bool
+) -> None:
+    if valid:
+        _json_model(DiagnosticsRequestV1, payload)
+    else:
+        with pytest.raises(ValidationError):
+            _json_model(DiagnosticsRequestV1, payload)
+
+
+def test_diagnostic_target_identity_is_closed_in_openapi() -> None:
+    schemas = build_openapi_document()["components"]["schemas"]
+    assert set(schemas["GlobalDiagnosticTargetV1"]["properties"]) == {"kind"}
+    assert set(schemas["ProjectDiagnosticTargetV1"]["required"]) == {
+        "kind",
+        "project_id",
+    }
+    assert "run_id" not in schemas["ProjectDiagnosticTargetV1"]["properties"]
+    assert set(schemas["RunDiagnosticTargetV1"]["required"]) == {
+        "kind",
+        "project_id",
+        "run_id",
+    }
+
+
+def test_every_non_heartbeat_event_binds_change_and_parent_identity() -> None:
+    run = _valid_run_summary()
+    event = {
+        "schema_version": "1",
+        "id": "event-1",
+        "sequence": 1,
+        "occurred_at": "2026-07-14T00:00:00Z",
+        "event": "run.updated.v1",
+        "change": {
+            "change_id": "change-1",
+            "resource_type": "run",
+            "resource_id": "run-1",
+            "parent_resource_type": "project",
+            "parent_resource_id": "project-1",
+            "resource_etag": run["etag"],
+            "content_sha256": None,
+        },
+        "payload": run,
+    }
+    EventEnvelopeV1.model_validate_json(json.dumps(event))
+    event["change"]["resource_id"] = "run-2"
+    with pytest.raises(ValidationError, match="change"):
+        EventEnvelopeV1.model_validate_json(json.dumps(event))
+
+
+def test_each_sse_event_validator_rejects_a_mismatched_change_resource() -> None:
+    etag = '"' + "e" * 64 + '"'
+    service = {
+        "id": "service-1",
+        "display_name": "Core",
+        "kind": "control",
+        "status": "running",
+        "restartable": True,
+        "status_message": None,
+        "error": None,
+        "model_preparation": None,
+        "updated_at": "2026-07-14T00:00:00Z",
+        "observed_at": "2026-07-14T00:00:00Z",
+        "etag": etag,
+    }
+    project = {
+        "id": "project-1",
+        "name": "Science",
+        "description": None,
+        "status": "draft",
+        "execution_mode": "self-deployed",
+        "workspace_kind": "scratch",
+        "current_project_snapshot": _snapshot_ref("project", "project-snapshot-1", "1"),
+        "current_task_snapshot": _snapshot_ref("task", "task-snapshot-1", "2"),
+        "current_workspace_snapshot": _snapshot_ref(
+            "workspace", "workspace-snapshot-1", "3"
+        ),
+        "active_revision": None,
+        "registry_digest": None,
+        "model_preparation": {
+            "model_ref": "openai/gpt-oss-20b",
+            "status": "unresolved",
+            "downloaded_bytes": None,
+            "total_bytes": None,
+            "error": None,
+            "updated_at": "2026-07-14T00:00:00Z",
+        },
+        "created_at": "2026-07-14T00:00:00Z",
+        "updated_at": "2026-07-14T00:00:00Z",
+        "etag": etag,
+    }
+    timeline = {
+        "id": "timeline-1",
+        "run_id": "run-1",
+        "attempt_id": None,
+        "sequence": 1,
+        "service_id": "service-1",
+        "phase": "admission",
+        "status": "running",
+        "title": "Admission",
+        "message": "Admission is running.",
+        "occurred_at": "2026-07-14T00:00:00Z",
+        "artifact_ids": [],
+        "content_sha256": "1" * 64,
+        "error": None,
+    }
+    diagnostic = {
+        "schema_version": "1",
+        "id": "diagnostic-1",
+        "status": "queued",
+        "scopes": ["environment"],
+        "target": {"kind": "global"},
+        "checks": [],
+        "created_at": "2026-07-14T00:00:00Z",
+        "updated_at": "2026-07-14T00:00:00Z",
+        "observed_at": "2026-07-14T00:00:00Z",
+        "finished_at": None,
+        "error": None,
+        "etag": etag,
+    }
+    artifact = {
+        "id": "artifact-1",
+        "project_id": "project-1",
+        "run_id": "run-1",
+        "target_id": "text_memory",
+        "display_name": "Memory",
+        "summary": "A memory artifact.",
+        "byte_size": 10,
+        "produced_revision": _revision_ref(),
+        "membership_revisions": [_revision_ref()],
+        "content_sha256": "a" * 64,
+        "selected": True,
+        "promoted": True,
+        "release_enabled": True,
+        "compatibility": {
+            "execution_modes": ["self-deployed"],
+            "harness_ids": ["codex"],
+            "base_model_refs": ["openai/gpt-oss-20b"],
+        },
+        "lineage": {
+            "method_id": "memory-method",
+            "job_id": "job-1",
+            "source_dataset_ids": ["dataset-1"],
+            "source_artifact_ids": [],
+        },
+        "scores": [],
+        "created_at": "2026-07-14T00:00:00Z",
+        "artifact_type": "text_memory",
+        "metadata": {"record_count": 1, "source_dataset_ids": ["dataset-1"]},
+    }
+    log = {
+        "id": "log-1",
+        "sequence": 1,
+        "occurred_at": "2026-07-14T00:00:00Z",
+        "stream": "core",
+        "level": "info",
+        "message": "Core started.",
+        "run_id": None,
+        "attempt_id": None,
+        "service_id": "service-1",
+        "content_sha256": "b" * 64,
+    }
+    transition = _transition()
+    revision_head = {
+        "schema_version": "1",
+        "project_id": "project-1",
+        "active_revision": transition["predecessor_revision"],
+        "successor_revision": transition["successor_revision"],
+        "transition": transition,
+        "updated_at": "2026-07-14T00:00:04Z",
+        "etag": etag,
+    }
+    operation = {
+        "schema_version": "1",
+        "id": "operation-1",
+        "kind": "service_restart",
+        "status": "queued",
+        "service_id": "service-1",
+        "cache_scopes": [],
+        "service": None,
+        "cache_cleanup": None,
+        "logs_ref": "logs-1",
+        "created_at": "2026-07-14T00:00:00Z",
+        "updated_at": "2026-07-14T00:00:00Z",
+        "observed_at": "2026-07-14T00:00:00Z",
+        "finished_at": None,
+        "error": None,
+        "etag": etag,
+    }
+
+    cases = [
+        ("run.updated.v1", "run", "run-1", "project", "project-1", etag, None, _valid_run_summary()),
+        (
+            "run.timeline_appended.v1",
+            "timeline_entry",
+            "timeline-1",
+            "run",
+            "run-1",
+            None,
+            "1" * 64,
+            {"run_id": "run-1", "entry": timeline},
+        ),
+        ("project.updated.v1", "project", "project-1", None, None, etag, None, project),
+        ("service.updated.v1", "service", "service-1", None, None, etag, None, service),
+        (
+            "diagnostic.updated.v1",
+            "diagnostic",
+            "diagnostic-1",
+            None,
+            None,
+            etag,
+            None,
+            diagnostic,
+        ),
+        (
+            "artifact.updated.v1",
+            "artifact",
+            "artifact-1",
+            "project",
+            "project-1",
+            None,
+            "a" * 64,
+            artifact,
+        ),
+        ("log.appended.v1", "log_entry", "log-1", "service", "service-1", None, "b" * 64, log),
+        (
+            "revision.successor_transition_updated.v1",
+            "revision_head",
+            "project-1",
+            None,
+            None,
+            etag,
+            None,
+            revision_head,
+        ),
+        (
+            "revision.activated.v1",
+            "revision",
+            "revision-7",
+            "project",
+            "project-1",
+            _revision()["etag"],
+            None,
+            _revision(),
+        ),
+        (
+            "operation.updated.v1",
+            "operation",
+            "operation-1",
+            "service",
+            "service-1",
+            etag,
+            None,
+            operation,
+        ),
+    ]
+    for index, (
+        event_name,
+        resource_type,
+        resource_id,
+        parent_type,
+        parent_id,
+        resource_etag,
+        content_sha256,
+        payload,
+    ) in enumerate(cases, start=1):
+        event = {
+            "schema_version": "1",
+            "id": f"event-{index}",
+            "sequence": index,
+            "occurred_at": "2026-07-14T00:00:00Z",
+            "event": event_name,
+            "change": {
+                "change_id": f"change-{index}",
+                "resource_type": resource_type,
+                "resource_id": resource_id,
+                "parent_resource_type": parent_type,
+                "parent_resource_id": parent_id,
+                "resource_etag": resource_etag,
+                "content_sha256": content_sha256,
+            },
+            "payload": payload,
+        }
+        EventEnvelopeV1.model_validate_json(json.dumps(event))
+        event["change"]["resource_id"] = "wrong-resource"
+        with pytest.raises(ValidationError, match="change"):
+            EventEnvelopeV1.model_validate_json(json.dumps(event))
+
 
 def _response_schema_name(operation: dict[str, Any]) -> str | None:
     for status in ("200", "201", "202"):
@@ -827,6 +1551,47 @@ def _response_schema_name(operation: dict[str, Any]) -> str | None:
                 "/", 1
             )[-1]
     return None
+
+
+def test_async_service_and_cache_actions_are_recoverable_operations() -> None:
+    openapi = build_openapi_document()
+    for method, path in (
+        ("post", "/v1/services/{service_id}/restart"),
+        ("post", "/v1/maintenance/cache-cleanup"),
+    ):
+        operation = openapi["paths"][path][method]
+        assert set(code for code in operation["responses"] if code.startswith("2")) == {"202"}
+        assert _response_schema_name(operation) == "OperationV1"
+
+    get_operation = openapi["paths"]["/v1/operations/{operation_id}"]["get"]
+    assert _response_schema_name(get_operation) == "OperationV1"
+    assert "etag" in openapi["components"]["schemas"]["OperationV1"]["properties"]
+    assert openapi["components"]["schemas"]["ReferencedLogPageV1"]["properties"][
+        "items"
+    ]["maxItems"] == 100
+    assert OperationV1 is not None
+
+
+def test_every_202_response_has_a_recoverable_get_resource() -> None:
+    openapi = build_openapi_document()
+    recoverable = {
+        "RunV1": ("/v1/runs/{run_id}", "RunV1"),
+        "DiagnosticV1": ("/v1/diagnostics/{diagnostic_id}", "DiagnosticV1"),
+        "OperationV1": ("/v1/operations/{operation_id}", "OperationV1"),
+    }
+    observed_response_models: set[str] = set()
+    for path_item in openapi["paths"].values():
+        for method, operation in path_item.items():
+            if method not in {"post", "put", "patch", "delete"}:
+                continue
+            if "202" not in operation["responses"]:
+                continue
+            response_model = _response_schema_name(operation)
+            assert response_model in recoverable
+            observed_response_models.add(response_model)
+            get_path, expected_model = recoverable[response_model]
+            assert _response_schema_name(openapi["paths"][get_path]["get"]) == expected_model
+    assert observed_response_models == set(recoverable)
 
 
 def test_every_if_match_resource_has_the_same_strict_etag_on_read_or_action() -> None:
@@ -865,6 +1630,7 @@ def test_every_if_match_resource_has_the_same_strict_etag_on_read_or_action() ->
     conditional_actions = {
         ("patch", "/v1/projects/{project_id}"),
         ("delete", "/v1/projects/{project_id}"),
+        ("post", "/v1/projects/{project_id}/workspace-uploads"),
         (
             "put",
             "/v1/projects/{project_id}/workspace-uploads/{upload_id}/chunk",
@@ -906,6 +1672,7 @@ def test_revision_surface_is_read_only_and_mutation_status_codes_are_exact() -> 
     assert not any("activate" in path or "promote" in path for path in openapi["paths"])
 
     expected = {
+        ("post", "/v1/environment/repair"): "200",
         ("post", "/v1/projects"): "201",
         ("post", "/v1/projects/{project_id}/workspace-uploads"): "201",
         (

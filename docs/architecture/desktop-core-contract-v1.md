@@ -315,6 +315,8 @@ GET    /v1/services
 GET    /v1/services/{service_id}
 POST   /v1/services/{service_id}/restart
 GET    /v1/services/{service_id}/logs
+GET    /v1/operations/{operation_id}
+GET    /v1/logs/{logs_ref}
 POST   /v1/diagnostics
 GET    /v1/diagnostics/{diagnostic_id}
 DELETE /v1/diagnostics/{diagnostic_id}
@@ -332,22 +334,30 @@ model table. Project, model-service doctor checks, and inference services report
 that reference as `unresolved`, `downloading`, `ready`, or `failed`, including a
 typed error and observation time where applicable.
 
-Project create, patch, and detail carry a closed `TaskSpecV1` with title,
-objective, and an optional content-addressed provenance reference. The task
-object is self-contained; Core signs a new immutable task snapshot on create
-and whenever the task changes. `current_task_snapshot` is therefore never null,
-and run creation must submit that exact Core-owned reference. Task input does
-not accept benchmark IDs, host paths, commands, environment, or open metadata.
+Project create, patch, and detail carry a closed `TaskSpecV1` with only title
+and objective. There is no task `content_ref`: a caller cannot provide a
+Core-owned content ID before Core has accepted content, and v1 has no separate
+bounded task-resource upload. Core signs a new immutable task snapshot on
+create and whenever the task changes. `current_task_snapshot` is therefore
+never null, and run creation must submit that exact Core-owned reference. Task
+input does not accept benchmark IDs, host paths, commands, environment, or open
+metadata.
 
 Project responses return the current content-addressed project, task, and
 workspace snapshot references plus the active revision reference. Every
 reference is a closed object containing its opaque ID and authoritative digest;
-callers do not construct IDs by parsing paths. Workspace handoff uses a
-Core-owned upload session. Desktop creates a session with the total byte size
-and SHA-256, transfers canonical base64 chunks at explicit bounded offsets,
-then finalizes or aborts with `If-Match`. Finalization returns the authoritative
-workspace snapshot reference. No workspace request accepts a host path, URI,
-command, or setup script.
+callers do not construct IDs by parsing paths. An imported workspace request
+contains only its archive SHA-256, byte size, entry count, extracted size, and
+frozen format declaration. It never contains a caller-authored Core content ID.
+Workspace handoff uses a Core-owned upload session bound to the exact project
+snapshot and project ETag observed at creation. Desktop transfers canonical
+base64 chunks at explicit bounded offsets. Finalization requires both the
+upload `If-Match` and `If-Project-Match`; Core atomically compares both mutable
+resources, verifies the archive, issues the first `ContentRefV1` and workspace
+snapshot, signs a new project snapshot, and returns the finalized upload plus
+the updated `ProjectV1`. A stale upload cannot overwrite a later project
+workspace declaration. No workspace request accepts a host path, URI, command,
+or setup script.
 
 `workspace.kind=scratch` is closed during project creation: Core atomically
 creates and returns an immutable empty workspace snapshot, so scratch never
@@ -360,17 +370,34 @@ model readiness are all present.
 
 The only v1 upload format is uncompressed
 `openevo_deterministic_tar_v1` (`application/vnd.openevo.workspace-tar`), using
-POSIX ustar headers, zero-padded bodies, exactly two 512-byte zero terminator
-blocks, and no trailing bytes. Entries are unique and sorted by UTF-8 path
-bytes. Paths are NFC UTF-8 POSIX-relative names; absolute names, empty, `.`, or
-`..` segments, backslashes, NUL, and control characters are rejected. Only
-regular files and directories are allowed. Files use normalized `0644` or
-`0755`, directories use `0755`, uid/gid/mtime are zero, and uname/gname are
-empty. Symlinks, hardlinks, devices, FIFOs, sparse files, PAX/GNU extensions,
-compressed tar, and ZIP are rejected. Limits are 100,000 entries, depth 32,
-1,024 path bytes, 8 GiB per file, 16 GiB extracted total, 16 GiB archive total,
-and 8 MiB per transfer chunk. Core verifies declared counts/sizes and the full
-archive digest before extraction and snapshot publication.
+POSIX ustar only. Logical paths are unique NFC UTF-8 POSIX-relative names
+without trailing slash. A file header uses the logical path; a directory header
+appends `/`. Header paths up to 100 bytes occupy `name`; longer paths split at
+the rightmost slash yielding a 1-155 byte `prefix` and 1-100 byte `name`. No
+valid split is an error. Every non-root parent directory is emitted once, and
+entries sort by encoded header-path bytes.
+
+The 512-byte header offsets are frozen as `name[0:100]`, `mode[100:108]`,
+`uid[108:116]`, `gid[116:124]`, `size[124:136]`, `mtime[136:148]`,
+`checksum[148:156]`, `typeflag[156:157]`, `linkname[157:257]`,
+`magic[257:263]`, `version[263:265]`, `uname[265:297]`, `gname[297:329]`,
+`devmajor[329:337]`, `devminor[337:345]`, `prefix[345:500]`, and
+`pad[500:512]`. Numeric fields are zero-padded ASCII octal plus NUL; mode is
+`0000644\0` or `0000755\0`, zero IDs/devices are `0000000\0`, and size/mtime
+use eleven digits plus NUL. Checksum is computed with eight spaces in its field
+and encoded as six octal digits, NUL, space. Typeflag is `0` or `5`, magic is
+`ustar\0`, version is `00`, and all unused bytes are NUL. Base-256 numbers are
+invalid. File bodies are NUL-padded to 512 bytes, followed finally by exactly
+two zero blocks and no trailing data.
+
+Absolute names, empty, `.`, or `..` segments, backslashes, NUL, and control
+characters are rejected. Symlinks, hardlinks, devices, FIFOs, sparse files,
+PAX/GNU extensions, compressed tar, and ZIP are rejected. Limits are 100,000
+entries, depth 32, 256 header-path bytes (a directory logical path is therefore
+at most 255), `0o77777777777` bytes per file (8,589,934,591, the largest
+11-digit octal value), 16 GiB extracted total, 16 GiB archive total, and 8 MiB
+per transfer chunk. Core verifies declared counts/sizes and the full archive
+digest before extraction and snapshot publication.
 
 Revision resources are read-only. Desktop can page a project's revisions, read
 its active head and pending successor transition, and fetch a revision by ID.
@@ -397,10 +424,16 @@ additional transient `cancelling` state. A queued run includes a closed reason
 with code, user-safe summary, and optional retry delay;
 `required_revision_uncommitted` means the requested next session cannot start
 yet. A run that has not passed admission has a null `pinned_revision`; Core must
-not copy the required revision into that field. List, detail, and context
-responses include the immutable refs, required and nullable pinned revisions,
-current attempt and error, complete successor transition, `updated_at`, and
-strong ETag. Retry creates a new attempt; it never rewrites a terminal attempt.
+not copy the required revision into that field. A cancellation before admission
+may also remain unpinned. `required_revision` always preserves the complete
+revision, reachable-head ID, and `active|successor` relation. An active required
+revision has no successor transition, so `revision_transition` is null; a
+successor relation requires a transition whose full predecessor and successor
+refs match the required relation. List, detail, and context responses preserve
+those identities, current attempt/error, `updated_at`, and strong ETag. A run
+has at most 100 attempts; detail embeds all of them in contiguous number order,
+and current attempt ID, number, status, error, and run ID must match the run.
+Retry creates a new attempt; it never rewrites a terminal attempt.
 
 Evolution is cross-session. A successful task seals its dataset, runs every
 enabled target, validates and materializes all outputs, and then atomically
@@ -419,6 +452,10 @@ document-preview shape for every artifact type: at most 128 documents and 2 MiB
 of aggregate UTF-8 text, with authoritative totals and truncation state. Diff
 uses bounded structured hunks and lines instead of an unbounded unified-text
 blob.
+Each diff identifies both artifacts and their content digests. Every hunk also
+binds old and new document IDs, safe relative paths, document content digests,
+and the corresponding artifact/content identity; a hunk cannot cross-wire
+documents from another artifact version.
 
 Timeline and log records preserve remote sequence, attempt, and service
 identity. Service and diagnostic resources report authoritative status, typed
@@ -427,9 +464,27 @@ ordinary service recovery. It deliberately has no service stop action; the
 Desktop Local stop route is therefore not forwardable and should be removed in
 the later Local-contract convergence rather than implemented through SSH.
 
-Core SSE adds artifact, log, successor-transition, and revision-activated
-events. Every non-heartbeat event carries a replay-stable change ID and an
-authoritative resource ETag or content digest. `Last-Event-ID` remains opaque;
+Inference services carry `model_preparation` if and only if
+`kind=inference`; environment checks carry it if and only if
+`kind=model_service`. Diagnostic requests use a closed global, project, or run
+target. Global scopes forbid project/run IDs, project scope requires exactly a
+project ID, and run scope requires both project and run IDs. Providers still
+verify that the run belongs to the project.
+
+Environment repair is synchronous HTTP 200 in v1. Service restart and cache
+cleanup return HTTP 202 with one `OperationV1`; it is recoverable through
+`GET /v1/operations/{operation_id}`, carries a strong ETag and logs reference,
+and emits `operation.updated.v1`. Runs and diagnostics remain their own
+recoverable 202 resources. Any bounded `logs_ref` from an error, check, or
+operation is readable through paginated `GET /v1/logs/{logs_ref}`.
+
+Core SSE adds artifact, log, operation, successor-transition, and
+revision-activated events. Every non-heartbeat event carries a replay-stable
+change ID, exactly one authoritative resource ETag or content digest, and the
+applicable parent resource type/ID. Per-event validators bind those values to
+the typed payload; an event cannot cross-wire a project, run, service, artifact,
+revision, diagnostic, operation, timeline entry, or log entry.
+`Last-Event-ID` remains opaque;
 delivery is at least once with a 10,000-event bounded replay window, and an
 expired cursor returns HTTP 410 so Desktop reloads snapshots before resuming.
 
@@ -443,6 +498,15 @@ must not copy, rename, narrow, or reinterpret its target, method, resolver,
 identity, schema, evaluated-profile, or four-axis support fields. The sidecar
 may project that payload into renderer-oriented fields only through a tested,
 loss-aware adapter.
+The framework's `supported`, `unsupported`, and `unavailable` values are
+preserved independently for execution, capture, harness, and runtime support,
+including the overall three-state result.
+
+The Python app in `src/openevo/backend/contracts/v1` is a schema source only.
+Every route returns 501 and no production Core provider is wired here. The
+contract and tests define required provider behavior; they are not evidence
+that workspace publication, operations, logs-by-ref, or revision admission are
+implemented end to end.
 
 The v1 release profiles are:
 

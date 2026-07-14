@@ -72,6 +72,16 @@ IfMatch = Annotated[
         description="ETag of the mutable resource.",
     ),
 ]
+IfProjectMatch = Annotated[
+    str,
+    m.StringConstraints(pattern=r'^"[0-9a-f]{64}"$'),
+    Header(
+        alias="If-Project-Match",
+        min_length=66,
+        max_length=66,
+        description="Current project ETag for atomic workspace publication.",
+    ),
+]
 ResourceId = Annotated[str, m.StringConstraints(min_length=1, max_length=128)]
 PageLimit = Annotated[int, Query(ge=1, le=100)]
 PageCursor = Annotated[str | None, Query(min_length=1, max_length=512)]
@@ -149,7 +159,6 @@ def create_core_control_contract_app() -> FastAPI:
         "/environment/repair",
         operation_id="repairCoreEnvironmentV1",
         response_model=m.EnvironmentRepairResponseV1,
-        status_code=202,
         responses=_ERROR_RESPONSES,
         tags=["environment"],
     )
@@ -288,6 +297,7 @@ def create_core_control_contract_app() -> FastAPI:
     async def create_workspace_upload(
         project_id: ResourceId,
         request: m.WorkspaceUploadCreateV1,
+        if_match: IfMatch,
         idempotency_key: IdempotencyKey,
     ) -> Response:
         return _not_implemented()
@@ -321,7 +331,7 @@ def create_core_control_contract_app() -> FastAPI:
     @router.post(
         "/projects/{project_id}/workspace-uploads/{upload_id}/finalize",
         operation_id="finalizeCoreWorkspaceUploadV1",
-        response_model=m.WorkspaceSnapshotV1,
+        response_model=m.WorkspaceUploadFinalizeResponseV1,
         status_code=201,
         responses=_ERROR_RESPONSES,
         tags=["workspace"],
@@ -331,6 +341,7 @@ def create_core_control_contract_app() -> FastAPI:
         upload_id: ResourceId,
         request: m.WorkspaceUploadFinalizeV1,
         if_match: IfMatch,
+        if_project_match: IfProjectMatch,
         idempotency_key: IdempotencyKey,
     ) -> Response:
         return _not_implemented()
@@ -575,7 +586,7 @@ def create_core_control_contract_app() -> FastAPI:
     @router.post(
         "/services/{service_id}/restart",
         operation_id="restartCoreServiceV1",
-        response_model=m.ServiceActionV1,
+        response_model=m.OperationV1,
         status_code=202,
         responses=_ERROR_RESPONSES,
         tags=["services"],
@@ -597,6 +608,32 @@ def create_core_control_contract_app() -> FastAPI:
     )
     async def service_logs(
         service_id: ResourceId,
+        limit: PageLimit = 100,
+        after: PageCursor = None,
+        sort: Annotated[Literal["sequence", "occurred_at"], Query()] = "sequence",
+        direction: Annotated[Literal["asc", "desc"], Query()] = "asc",
+    ) -> Response:
+        return _not_implemented()
+
+    @router.get(
+        "/operations/{operation_id}",
+        operation_id="getCoreOperationV1",
+        response_model=m.OperationV1,
+        responses=_ERROR_RESPONSES,
+        tags=["operations"],
+    )
+    async def get_operation(operation_id: ResourceId) -> Response:
+        return _not_implemented()
+
+    @router.get(
+        "/logs/{logs_ref}",
+        operation_id="getCoreLogsByRefV1",
+        response_model=m.ReferencedLogPageV1,
+        responses=_ERROR_RESPONSES,
+        tags=["logs"],
+    )
+    async def logs_by_ref(
+        logs_ref: ResourceId,
         limit: PageLimit = 100,
         after: PageCursor = None,
         sort: Annotated[Literal["sequence", "occurred_at"], Query()] = "sequence",
@@ -645,7 +682,7 @@ def create_core_control_contract_app() -> FastAPI:
     @router.post(
         "/maintenance/cache-cleanup",
         operation_id="cleanupCoreCachesV1",
-        response_model=m.CacheCleanupV1,
+        response_model=m.OperationV1,
         status_code=202,
         responses=_ERROR_RESPONSES,
         tags=["maintenance"],

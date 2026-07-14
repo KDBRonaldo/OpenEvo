@@ -35,8 +35,8 @@ MAX_WORKSPACE_UPLOAD_BYTES = 16 * 1024 * 1024 * 1024
 MAX_WORKSPACE_CHUNK_BYTES = 8 * 1024 * 1024
 MAX_WORKSPACE_ENTRIES = 100_000
 MAX_WORKSPACE_PATH_DEPTH = 32
-MAX_WORKSPACE_PATH_BYTES = 1024
-MAX_WORKSPACE_FILE_BYTES = 8 * 1024 * 1024 * 1024
+MAX_WORKSPACE_PATH_BYTES = 256
+MAX_WORKSPACE_FILE_BYTES = 0o77777777777
 MAX_CONTENT_REF_BYTES = 1_000_000_000_000
 MAX_ARTIFACT_PREVIEW_DOCUMENTS = 128
 MAX_ARTIFACT_PREVIEW_UTF8_BYTES = 2 * 1024 * 1024
@@ -353,8 +353,8 @@ class ServiceSummaryV1(ContractModel):
     def _failed_service_has_error(self) -> ServiceSummaryV1:
         if (self.status is ServiceStatus.FAILED) != (self.error is not None):
             raise ValueError("error is required only for failed services")
-        if self.kind is not ServiceKind.INFERENCE and self.model_preparation is not None:
-            raise ValueError("model preparation belongs only to inference services")
+        if (self.kind is ServiceKind.INFERENCE) != (self.model_preparation is not None):
+            raise ValueError("model preparation is required only for inference services")
         return self
 
 
@@ -423,11 +423,10 @@ class EnvironmentCheckV1(ContractModel):
 
     @model_validator(mode="after")
     def _model_check_shape(self) -> EnvironmentCheckV1:
-        if (
-            self.kind is not EnvironmentCheckKind.MODEL_SERVICE
-            and self.model_preparation is not None
+        if (self.kind is EnvironmentCheckKind.MODEL_SERVICE) != (
+            self.model_preparation is not None
         ):
-            raise ValueError("model preparation belongs only to model-service checks")
+            raise ValueError("model preparation is required only for model-service checks")
         return self
 
 
@@ -548,7 +547,6 @@ class ContentRefV1(ContractModel):
 class TaskSpecV1(ContractModel):
     title: ShortText
     objective: Annotated[str, StringConstraints(min_length=1, max_length=65_536)]
-    content_ref: ContentRefV1 | None = None
 
 
 class WorkspaceArchiveFormat(StrEnum):
@@ -566,17 +564,54 @@ class WorkspaceArchivePolicyV1(ContractModel):
     entry_types: Literal["regular_files_and_directories"] = Field(
         description="Only regular-file and directory ustar entries are accepted."
     )
-    path_policy: Literal["utf8_nfc_posix_relative"] = Field(
+    path_policy: Literal["utf8_nfc_posix_relative_ustar_split_v1"] = Field(
         description=(
-            "Unique NFC UTF-8 POSIX relative paths; absolute paths, empty/dot/dot-dot "
-            "segments, backslashes, NUL, and control characters are forbidden."
+            "Logical paths are unique NFC UTF-8 POSIX relative paths without a trailing "
+            "slash. Absolute paths, empty/dot/dot-dot segments, backslashes, NUL, and "
+            "control characters are forbidden. A regular-file header path is the logical "
+            "path; a directory header path is the logical path plus '/'. If the encoded "
+            "header path is at most 100 bytes, name is that path and prefix is empty. "
+            "Otherwise split at the rightmost slash for which prefix is 1..155 bytes and "
+            "name is 1..100 bytes; no valid split rejects the archive."
         )
     )
-    entry_order: Literal["lexicographic"] = Field(
-        description="Entries are unique and sorted by their encoded UTF-8 path bytes."
+    entry_order: Literal["header_path_byte_lexicographic_parents_first"] = Field(
+        description=(
+            "Every non-root parent directory appears exactly once. Entries are sorted by "
+            "encoded header-path bytes, which places each required directory before its "
+            "children; the root has no entry."
+        )
     )
     metadata_policy: Literal["uid_gid_zero_names_empty_mtime_zero"] = Field(
         description="uid/gid/mtime are zero and uname/gname are empty in every header."
+    )
+    header_policy: Literal["posix_ustar_canonical_header_v1"] = Field(
+        description=(
+            "Each 512-byte header uses these half-open offsets: name[0:100], "
+            "mode[100:108], uid[108:116], gid[116:124], size[124:136], "
+            "mtime[136:148], checksum[148:156], typeflag[156:157], "
+            "linkname[157:257], magic[257:263], version[263:265], uname[265:297], "
+            "gname[297:329], devmajor[329:337], devminor[337:345], prefix[345:500], "
+            "and pad[500:512]. Name and prefix contain UTF-8 bytes then NUL padding; "
+            "mode is 0000644\\0 or 0000755\\0; uid/gid/devmajor/devminor are "
+            "0000000\\0; size and mtime are eleven octal digits plus NUL (directory "
+            "size is zero); checksum bytes are spaces while summing all unsigned header "
+            "bytes, then six octal digits, NUL, space; typeflag is '0' for files or '5' "
+            "for directories; linkname, uname, gname, and pad are NUL; magic is ustar\\0 "
+            "and version is 00. Base-256 numbers and non-ASCII numeric fields are forbidden."
+        )
+    )
+    body_policy: Literal["zero_pad_to_512_bytes"] = Field(
+        description=(
+            "A regular-file body follows its header and is padded with NUL bytes to the "
+            "next 512-byte boundary; directories have no body bytes."
+        )
+    )
+    terminator_policy: Literal["two_zero_blocks_no_trailing_bytes"] = Field(
+        description=(
+            "The final entry is followed by exactly two all-zero 512-byte blocks and no "
+            "trailing bytes. PAX, GNU, sparse, long-name, and all other extensions are invalid."
+        )
     )
     file_mode_policy: Literal["0644_or_0755"] = Field(
         description="Regular files use only 0644 or 0755; setuid/setgid/sticky bits are forbidden."
@@ -590,13 +625,14 @@ class WorkspaceArchivePolicyV1(ContractModel):
     allow_tar_extensions: Literal[False]
     max_entries: Literal[100_000]
     max_path_depth: Literal[32]
-    max_path_bytes: Literal[1024]
-    max_file_bytes: Literal[8_589_934_592]
+    max_path_bytes: Literal[256]
+    max_file_bytes: Literal[8_589_934_591]
     max_extracted_bytes: Literal[17_179_869_184]
 
 
-class WorkspaceArchiveV1(ContractModel):
-    content_ref: ContentRefV1
+class WorkspaceArchiveDeclarationV1(ContractModel):
+    content_sha256: Sha256Digest
+    byte_size: int = Field(ge=1024, le=MAX_WORKSPACE_UPLOAD_BYTES)
     format: WorkspaceArchiveFormat = Field(
         description="The only release workspace transfer format; ZIP and compressed tar are invalid."
     )
@@ -605,11 +641,17 @@ class WorkspaceArchiveV1(ContractModel):
     policy: WorkspaceArchivePolicyV1
 
     @model_validator(mode="after")
-    def _valid_archive_bounds(self) -> WorkspaceArchiveV1:
-        if self.content_ref.byte_size > MAX_WORKSPACE_UPLOAD_BYTES:
-            raise ValueError("workspace archive exceeds the upload byte limit")
+    def _valid_archive_bounds(self) -> WorkspaceArchiveDeclarationV1:
+        if self.byte_size % 512 != 0:
+            raise ValueError("workspace archive byte size must be a multiple of 512")
         if self.entry_count == 0 and self.extracted_byte_size != 0:
             raise ValueError("an empty archive cannot declare extracted bytes")
+        minimum_body_bytes = ((self.extracted_byte_size + 511) // 512) * 512
+        minimum_archive_bytes = (self.entry_count + 2) * 512 + minimum_body_bytes
+        if self.byte_size < minimum_archive_bytes:
+            raise ValueError("workspace archive is too small for its headers and file bodies")
+        if self.entry_count == 0 and self.byte_size != 1024:
+            raise ValueError("an empty deterministic archive is exactly two zero blocks")
         return self
 
 
@@ -632,7 +674,7 @@ class ImportedWorkspaceSpecV1(ContractModel):
         WorkspaceSourceKind.REMOTE_SNAPSHOT,
     ]
     display_name: ShortText
-    archive: WorkspaceArchiveV1
+    archive: WorkspaceArchiveDeclarationV1
 
 
 ProjectWorkspaceSpecV1: TypeAlias = Annotated[
@@ -775,11 +817,14 @@ class WorkspaceUploadStatus(StrEnum):
 
 class WorkspaceUploadCreateV1(ContractModel):
     schema_version: Literal["1"] = "1"
-    archive: WorkspaceArchiveV1
+    project_snapshot: ImmutableSnapshotRefV1
+    archive: WorkspaceArchiveDeclarationV1
     base_workspace_snapshot: ImmutableSnapshotRefV1 | None = None
 
     @model_validator(mode="after")
     def _base_is_workspace(self) -> WorkspaceUploadCreateV1:
+        if self.project_snapshot.kind is not SnapshotKind.PROJECT:
+            raise ValueError("project_snapshot has the wrong kind")
         if (
             self.base_workspace_snapshot is not None
             and self.base_workspace_snapshot.kind is not SnapshotKind.WORKSPACE
@@ -794,8 +839,11 @@ class WorkspaceUploadSessionV1(ContractModel):
     project_id: OpaqueId
     status: WorkspaceUploadStatus
     accepted_offset: int = Field(ge=0, le=MAX_WORKSPACE_UPLOAD_BYTES)
-    archive: WorkspaceArchiveV1
+    project_snapshot: ImmutableSnapshotRefV1
+    project_etag: StrongETag
+    archive: WorkspaceArchiveDeclarationV1
     base_workspace_snapshot: ImmutableSnapshotRefV1 | None = None
+    content_ref: ContentRefV1 | None = None
     workspace_snapshot: ImmutableSnapshotRefV1 | None = None
     created_at: UtcTimestamp
     updated_at: UtcTimestamp
@@ -803,13 +851,14 @@ class WorkspaceUploadSessionV1(ContractModel):
 
     @model_validator(mode="after")
     def _valid_upload_state(self) -> WorkspaceUploadSessionV1:
-        archive_byte_size = self.archive.content_ref.byte_size
+        archive_byte_size = self.archive.byte_size
         if self.accepted_offset > archive_byte_size:
             raise ValueError("accepted offset exceeds declared upload size")
-        if (self.status is WorkspaceUploadStatus.FINALIZED) != (
-            self.workspace_snapshot is not None
+        finalized = self.status is WorkspaceUploadStatus.FINALIZED
+        if finalized != (self.workspace_snapshot is not None) or finalized != (
+            self.content_ref is not None
         ):
-            raise ValueError("only a finalized upload has a workspace snapshot")
+            raise ValueError("only a finalized upload has Core content and workspace refs")
         if (
             self.status is WorkspaceUploadStatus.FINALIZED
             and self.accepted_offset != archive_byte_size
@@ -818,6 +867,13 @@ class WorkspaceUploadSessionV1(ContractModel):
         for snapshot in (self.base_workspace_snapshot, self.workspace_snapshot):
             if snapshot is not None and snapshot.kind is not SnapshotKind.WORKSPACE:
                 raise ValueError("upload snapshots must be workspace snapshots")
+        if self.project_snapshot.kind is not SnapshotKind.PROJECT:
+            raise ValueError("upload project_snapshot has the wrong kind")
+        if self.content_ref is not None and (
+            self.content_ref.sha256 != self.archive.content_sha256
+            or self.content_ref.byte_size != self.archive.byte_size
+        ):
+            raise ValueError("Core content ref does not match the archive declaration")
         return self
 
 
@@ -856,23 +912,34 @@ class WorkspaceUploadAbortV1(ContractModel):
     reason: Annotated[str, StringConstraints(min_length=1, max_length=512)]
 
 
-class WorkspaceSnapshotV1(ContractModel):
+class WorkspaceUploadFinalizeResponseV1(ContractModel):
     schema_version: Literal["1"] = "1"
     project_id: OpaqueId
     upload: WorkspaceUploadSessionV1
+    content_ref: ContentRefV1
     workspace_snapshot: ImmutableSnapshotRefV1
-    etag: StrongETag
+    project: ProjectV1
 
     @model_validator(mode="after")
-    def _finalized_upload_matches_snapshot(self) -> WorkspaceSnapshotV1:
+    def _finalized_upload_matches_snapshot(self) -> WorkspaceUploadFinalizeResponseV1:
         if self.upload.project_id != self.project_id:
             raise ValueError("upload belongs to another project")
         if self.upload.status is not WorkspaceUploadStatus.FINALIZED:
             raise ValueError("workspace snapshot requires a finalized upload")
         if self.upload.workspace_snapshot != self.workspace_snapshot:
             raise ValueError("upload and response workspace snapshots differ")
-        if self.etag != self.upload.etag:
-            raise ValueError("response ETag must match the finalized upload ETag")
+        if self.upload.content_ref != self.content_ref:
+            raise ValueError("upload and response content refs differ")
+        if self.project.id != self.project_id:
+            raise ValueError("returned project has the wrong ID")
+        if self.project.current_workspace_snapshot != self.workspace_snapshot:
+            raise ValueError("returned project does not publish the workspace snapshot")
+        if self.project.current_project_snapshot == self.upload.project_snapshot:
+            raise ValueError("workspace finalization must sign a new project snapshot")
+        if self.project.workspace.kind == WorkspaceSourceKind.SCRATCH:
+            raise ValueError("an imported workspace upload cannot finalize a scratch project")
+        if self.project.workspace.archive != self.upload.archive:
+            raise ValueError("returned project workspace declaration differs from the upload")
         return self
 
 
@@ -958,7 +1025,7 @@ _TERMINAL_RUN_STATES = frozenset({RunStatus.SUCCEEDED, RunStatus.FAILED, RunStat
 class AttemptV1(ContractModel):
     id: OpaqueId
     run_id: OpaqueId
-    number: int = Field(ge=1, le=10_000)
+    number: int = Field(ge=1, le=100)
     status: RunStatus
     queued_reason: QueuedReasonV1 | None = None
     created_at: UtcTimestamp
@@ -1066,6 +1133,47 @@ class RevisionV1(ContractModel):
                 raise ValueError("revision predecessor belongs to another project")
             if self.predecessor_revision.generation + 1 != self.revision.generation:
                 raise ValueError("revision generation does not follow predecessor")
+        elif self.revision.generation != 0:
+            raise ValueError("only generation zero may omit a predecessor")
+        if self.transition is not None:
+            if self.predecessor_revision is None:
+                raise ValueError("a transition requires a predecessor")
+            if (
+                self.transition.predecessor_revision != self.predecessor_revision
+                or self.transition.successor_revision != self.revision
+            ):
+                raise ValueError("revision transition does not bind predecessor and revision")
+        if self.status is RevisionStatus.ACTIVE and (
+            self.transition is not None
+            and self.transition.state is not RevisionTransitionState.ACTIVE
+        ):
+            raise ValueError("an active revision transition must be active")
+        if self.status is RevisionStatus.QUEUED and (
+            self.transition is None
+            or self.transition.state is not RevisionTransitionState.NOT_STARTED
+        ):
+            raise ValueError("a queued revision requires a not-started transition")
+        if self.status is RevisionStatus.PREPARING and (
+            self.transition is None
+            or self.transition.state
+            in {
+                RevisionTransitionState.NOT_STARTED,
+                RevisionTransitionState.ACTIVE,
+                RevisionTransitionState.FAILED,
+            }
+        ):
+            raise ValueError("a preparing revision requires an in-progress transition")
+        if self.status is RevisionStatus.FAILED and (
+            self.transition is None
+            or self.transition.state is not RevisionTransitionState.FAILED
+        ):
+            raise ValueError("a failed revision requires a failed transition")
+        if self.status is RevisionStatus.CANCELLED and (
+            self.transition is not None
+            and self.transition.state
+            in {RevisionTransitionState.ACTIVE, RevisionTransitionState.FAILED}
+        ):
+            raise ValueError("a cancelled revision cannot have an active or failed transition")
         return self
 
 
@@ -1101,6 +1209,8 @@ class RevisionHeadV1(ContractModel):
                 or self.transition.successor_revision != self.successor_revision
             ):
                 raise ValueError("head transition does not bind active and successor revisions")
+            if self.transition.state is RevisionTransitionState.ACTIVE:
+                raise ValueError("an activated successor must already be the active head")
         return self
 
 
@@ -1117,11 +1227,11 @@ class RunSummaryV1(ContractModel):
     queued_reason: QueuedReasonV1 | None = None
     current_attempt_id: OpaqueId | None = None
     current_attempt: AttemptV1 | None = None
-    attempt_count: int = Field(ge=0, le=10_000)
+    attempt_count: int = Field(ge=0, le=100)
     current_error: ApiErrorV1 | None = None
     pinned_revision: RevisionRefV1 | None = None
     required_revision: ReachableRequiredRevisionRefV1
-    revision_transition: RevisionTransitionV1
+    revision_transition: RevisionTransitionV1 | None = None
     created_at: UtcTimestamp
     updated_at: UtcTimestamp
     started_at: UtcTimestamp | None = None
@@ -1156,12 +1266,25 @@ class RunSummaryV1(ContractModel):
                 raise ValueError("current_attempt belongs to another run")
             if self.current_attempt.error != self.current_error:
                 raise ValueError("run and current attempt errors differ")
+            if self.current_attempt.number != self.attempt_count:
+                raise ValueError("current attempt number must match attempt_count")
+            if self.current_attempt.status is not self.status:
+                raise ValueError("run and current attempt statuses differ")
         if self.pinned_revision is not None and (
             self.pinned_revision != self.required_revision.revision
         ):
             raise ValueError("a run may pin only its required revision")
         if self.status is RunStatus.QUEUED and self.pinned_revision is not None:
             raise ValueError("a queued run cannot claim an admission revision pin")
+        pin_required = self.status in {
+            RunStatus.PREPARING,
+            RunStatus.RUNNING,
+            RunStatus.CANCELLING,
+            RunStatus.SUCCEEDED,
+            RunStatus.FAILED,
+        } or (self.status is RunStatus.CANCELLED and self.started_at is not None)
+        if pin_required and self.pinned_revision is None:
+            raise ValueError("an admitted run requires its exact revision pin")
         if self.project_snapshot.kind is not SnapshotKind.PROJECT:
             raise ValueError("project_snapshot has the wrong kind")
         if self.task_snapshot.kind is not SnapshotKind.TASK:
@@ -1170,6 +1293,23 @@ class RunSummaryV1(ContractModel):
             raise ValueError("workspace_snapshot has the wrong kind")
         if self.required_revision.revision.project_id != self.project_id:
             raise ValueError("required revision belongs to another project")
+        if self.required_revision.relation is RequiredRevisionRelation.ACTIVE:
+            if self.revision_transition is not None:
+                raise ValueError("an active required revision has no successor transition")
+        else:
+            if self.revision_transition is None:
+                raise ValueError("a successor required revision requires its transition")
+            if (
+                self.revision_transition.predecessor_revision.id
+                != self.required_revision.reachable_from_revision_id
+                or self.revision_transition.successor_revision
+                != self.required_revision.revision
+            ):
+                raise ValueError("successor transition does not prove the required revision")
+            if self.pinned_revision is not None and (
+                self.revision_transition.state is not RevisionTransitionState.ACTIVE
+            ):
+                raise ValueError("an admitted successor revision transition must be active")
         if (self.status is RunStatus.FAILED) != (self.current_error is not None):
             raise ValueError("current_error is required only for failed runs")
         if (
@@ -1191,8 +1331,16 @@ class RunV1(RunSummaryV1):
             raise ValueError("attempt IDs must be unique")
         if any(attempt.run_id != self.id for attempt in self.attempts):
             raise ValueError("attempt belongs to another run")
+        if [attempt.number for attempt in self.attempts] != list(
+            range(1, len(self.attempts) + 1)
+        ):
+            raise ValueError("attempt numbers must be contiguous and ordered")
         if self.attempts and self.attempts[-1].id != self.current_attempt_id:
             raise ValueError("current_attempt_id must identify the last attempt")
+        if self.attempts and self.attempts[-1] != self.current_attempt:
+            raise ValueError("current_attempt must equal the last attempt")
+        if any(attempt.status not in _TERMINAL_RUN_STATES for attempt in self.attempts[:-1]):
+            raise ValueError("every superseded attempt must be terminal")
         return self
 
 
@@ -1251,6 +1399,7 @@ class TimelineEntryV1(ContractModel):
     message: Description
     occurred_at: UtcTimestamp
     artifact_ids: list[OpaqueId] = Field(default_factory=list, max_length=128)
+    content_sha256: Sha256Digest
     error: ApiErrorV1 | None = None
 
     @model_validator(mode="after")
@@ -1291,6 +1440,15 @@ class LogEntryV1(ContractModel):
     run_id: OpaqueId | None = None
     attempt_id: OpaqueId | None = None
     service_id: OpaqueId
+    content_sha256: Sha256Digest
+
+    @model_validator(mode="after")
+    def _attempt_belongs_to_run(self) -> LogEntryV1:
+        if self.attempt_id is not None and self.run_id is None:
+            raise ValueError("attempt_id requires run_id")
+        if self.stream in {LogStream.AGENT, LogStream.EVOLUTION} and self.run_id is None:
+            raise ValueError("agent and evolution logs require run identity")
+        return self
 
 
 class LogPageV1(ContractModel):
@@ -1298,6 +1456,10 @@ class LogPageV1(ContractModel):
     items: list[LogEntryV1] = Field(max_length=100)
     next_cursor: Cursor | None = None
     has_more: bool
+
+
+class ReferencedLogPageV1(LogPageV1):
+    logs_ref: OpaqueId
 
 
 class ContextArtifactRefV1(ContractModel):
@@ -1325,11 +1487,11 @@ class RunContextV1(ContractModel):
     queued_reason: QueuedReasonV1 | None = None
     current_attempt_id: OpaqueId | None = None
     current_attempt: AttemptV1 | None = None
-    attempt_count: int = Field(ge=0, le=10_000)
+    attempt_count: int = Field(ge=0, le=100)
     current_error: ApiErrorV1 | None = None
     pinned_revision: RevisionRefV1 | None = None
     required_revision: ReachableRequiredRevisionRefV1
-    revision_transition: RevisionTransitionV1
+    revision_transition: RevisionTransitionV1 | None = None
     registry_digest: Sha256Digest
     execution_mode: ExecutionMode
     capture_mode: CaptureMode
@@ -1370,12 +1532,25 @@ class RunContextV1(ContractModel):
                 raise ValueError("current_attempt belongs to another run")
             if self.current_attempt.error != self.current_error:
                 raise ValueError("run and current attempt errors differ")
+            if self.current_attempt.number != self.attempt_count:
+                raise ValueError("current attempt number must match attempt_count")
+            if self.current_attempt.status is not self.status:
+                raise ValueError("run and current attempt statuses differ")
         if self.pinned_revision is not None and (
             self.pinned_revision != self.required_revision.revision
         ):
             raise ValueError("a run may pin only its required revision")
         if self.status is RunStatus.QUEUED and self.pinned_revision is not None:
             raise ValueError("a queued run cannot claim an admission revision pin")
+        pin_required = self.status in {
+            RunStatus.PREPARING,
+            RunStatus.RUNNING,
+            RunStatus.CANCELLING,
+            RunStatus.SUCCEEDED,
+            RunStatus.FAILED,
+        } or (self.status is RunStatus.CANCELLED and self.started_at is not None)
+        if pin_required and self.pinned_revision is None:
+            raise ValueError("an admitted run requires its exact revision pin")
         if (self.status is RunStatus.FAILED) != (self.current_error is not None):
             raise ValueError("current_error is required only for failed runs")
         if self.project_snapshot.kind is not SnapshotKind.PROJECT:
@@ -1386,6 +1561,23 @@ class RunContextV1(ContractModel):
             raise ValueError("workspace_snapshot has the wrong kind")
         if self.required_revision.revision.project_id != self.project_id:
             raise ValueError("required revision belongs to another project")
+        if self.required_revision.relation is RequiredRevisionRelation.ACTIVE:
+            if self.revision_transition is not None:
+                raise ValueError("an active required revision has no successor transition")
+        else:
+            if self.revision_transition is None:
+                raise ValueError("a successor required revision requires its transition")
+            if (
+                self.revision_transition.predecessor_revision.id
+                != self.required_revision.reachable_from_revision_id
+                or self.revision_transition.successor_revision
+                != self.required_revision.revision
+            ):
+                raise ValueError("successor transition does not prove the required revision")
+            if self.pinned_revision is not None and (
+                self.revision_transition.state is not RevisionTransitionState.ACTIVE
+            ):
+                raise ValueError("an admitted successor revision transition must be active")
         if self.capture_mode is CaptureMode.TRANSCRIPT and self.token_level_metrics_available:
             raise ValueError("transcript capture has no token-level metrics")
         if (
@@ -1621,7 +1813,31 @@ class ArtifactDiffLineV1(ContractModel):
         return self
 
 
+class ArtifactDiffDocumentIdentityV1(ContractModel):
+    artifact_id: OpaqueId
+    artifact_content_sha256: Sha256Digest
+    document_id: OpaqueId
+    relative_path: Annotated[
+        str,
+        StringConstraints(
+            min_length=1,
+            max_length=256,
+            pattern=r"^[^/\\\x00-\x1f\x7f][^\\\x00-\x1f\x7f]*$",
+        ),
+    ]
+    content_sha256: Sha256Digest
+
+    @field_validator("relative_path")
+    @classmethod
+    def _safe_relative_path(cls, value: str) -> str:
+        if any(segment in {"", ".", ".."} for segment in value.split("/")):
+            raise ValueError("relative_path contains an unsafe path segment")
+        return value
+
+
 class ArtifactDiffHunkV1(ContractModel):
+    old_document: ArtifactDiffDocumentIdentityV1
+    new_document: ArtifactDiffDocumentIdentityV1
     old_start: int = Field(ge=0, le=MAX_JAVASCRIPT_SAFE_INTEGER)
     old_count: int = Field(ge=0, le=MAX_JAVASCRIPT_SAFE_INTEGER)
     new_start: int = Field(ge=0, le=MAX_JAVASCRIPT_SAFE_INTEGER)
@@ -1632,7 +1848,9 @@ class ArtifactDiffHunkV1(ContractModel):
 class ArtifactDiffV1(ContractModel):
     schema_version: Literal["1"] = "1"
     artifact_id: OpaqueId
-    previous_artifact_id: OpaqueId | None = None
+    artifact_content_sha256: Sha256Digest
+    previous_artifact_id: OpaqueId
+    previous_artifact_content_sha256: Sha256Digest
     hunks: list[ArtifactDiffHunkV1] = Field(max_length=MAX_ARTIFACT_DIFF_HUNKS)
     total_hunks: int = Field(ge=0, le=MAX_JAVASCRIPT_SAFE_INTEGER)
     total_lines: int = Field(ge=0, le=MAX_JAVASCRIPT_SAFE_INTEGER)
@@ -1640,6 +1858,19 @@ class ArtifactDiffV1(ContractModel):
 
     @model_validator(mode="after")
     def _valid_diff_budget(self) -> ArtifactDiffV1:
+        for hunk in self.hunks:
+            if (
+                hunk.old_document.artifact_id != self.previous_artifact_id
+                or hunk.old_document.artifact_content_sha256
+                != self.previous_artifact_content_sha256
+            ):
+                raise ValueError("old document identity does not match the previous artifact")
+            if (
+                hunk.new_document.artifact_id != self.artifact_id
+                or hunk.new_document.artifact_content_sha256
+                != self.artifact_content_sha256
+            ):
+                raise ValueError("new document identity does not match the current artifact")
         line_count = sum(len(hunk.lines) for hunk in self.hunks)
         if line_count > MAX_ARTIFACT_DIFF_LINES:
             raise ValueError("artifact diff exceeds the line budget")
@@ -1668,21 +1899,6 @@ class ServiceRestartRequestV1(ContractModel):
     reason: Annotated[str, StringConstraints(min_length=1, max_length=512)]
 
 
-class ServiceActionV1(ContractModel):
-    schema_version: Literal["1"] = "1"
-    action_id: OpaqueId
-    action: Literal["restart"]
-    service: ServiceSummaryV1
-    accepted_at: UtcTimestamp
-    etag: StrongETag
-
-    @model_validator(mode="after")
-    def _etag_matches_service(self) -> ServiceActionV1:
-        if self.etag != self.service.etag:
-            raise ValueError("action ETag must match the returned service ETag")
-        return self
-
-
 class DiagnosticScope(StrEnum):
     ENVIRONMENT = "environment"
     PROJECT = "project"
@@ -1692,11 +1908,37 @@ class DiagnosticScope(StrEnum):
     STORAGE = "storage"
 
 
+class DiagnosticTargetKind(StrEnum):
+    GLOBAL = "global"
+    PROJECT = "project"
+    RUN = "run"
+
+
+class GlobalDiagnosticTargetV1(ContractModel):
+    kind: Literal[DiagnosticTargetKind.GLOBAL]
+
+
+class ProjectDiagnosticTargetV1(ContractModel):
+    kind: Literal[DiagnosticTargetKind.PROJECT]
+    project_id: OpaqueId
+
+
+class RunDiagnosticTargetV1(ContractModel):
+    kind: Literal[DiagnosticTargetKind.RUN]
+    project_id: OpaqueId
+    run_id: OpaqueId
+
+
+DiagnosticTargetV1: TypeAlias = Annotated[
+    GlobalDiagnosticTargetV1 | ProjectDiagnosticTargetV1 | RunDiagnosticTargetV1,
+    Field(discriminator="kind"),
+]
+
+
 class DiagnosticsRequestV1(ContractModel):
     schema_version: Literal["1"] = "1"
     scopes: list[DiagnosticScope] = Field(min_length=1, max_length=16)
-    project_id: OpaqueId | None = None
-    run_id: OpaqueId | None = None
+    target: DiagnosticTargetV1
 
     @field_validator("scopes")
     @classmethod
@@ -1704,6 +1946,25 @@ class DiagnosticsRequestV1(ContractModel):
         if len(value) != len(set(value)):
             raise ValueError("diagnostic scopes must be unique")
         return value
+
+    @model_validator(mode="after")
+    def _scopes_match_target(self) -> DiagnosticsRequestV1:
+        scopes = set(self.scopes)
+        global_scopes = {
+            DiagnosticScope.ENVIRONMENT,
+            DiagnosticScope.SERVICES,
+            DiagnosticScope.REGISTRY,
+            DiagnosticScope.STORAGE,
+        }
+        if isinstance(self.target, GlobalDiagnosticTargetV1) and not scopes <= global_scopes:
+            raise ValueError("global diagnostics accept only global scopes")
+        if isinstance(self.target, ProjectDiagnosticTargetV1) and scopes != {
+            DiagnosticScope.PROJECT
+        }:
+            raise ValueError("project diagnostics require exactly the project scope")
+        if isinstance(self.target, RunDiagnosticTargetV1) and scopes != {DiagnosticScope.RUN}:
+            raise ValueError("run diagnostics require exactly the run scope")
+        return self
 
 
 class DiagnosticStatus(StrEnum):
@@ -1727,6 +1988,7 @@ class DiagnosticV1(ContractModel):
     id: OpaqueId
     status: DiagnosticStatus
     scopes: list[DiagnosticScope] = Field(min_length=1, max_length=16)
+    target: DiagnosticTargetV1
     checks: list[DiagnosticCheckV1] = Field(max_length=256)
     created_at: UtcTimestamp
     updated_at: UtcTimestamp
@@ -1742,6 +2004,9 @@ class DiagnosticV1(ContractModel):
             raise ValueError("finished_at is required only for terminal diagnostics")
         if (self.status is DiagnosticStatus.FAILED) != (self.error is not None):
             raise ValueError("error is required only for failed diagnostics")
+        request = DiagnosticsRequestV1(scopes=self.scopes, target=self.target)
+        if any(check.scope not in request.scopes for check in self.checks):
+            raise ValueError("diagnostic check has an unrequested scope")
         return self
 
 
@@ -1765,24 +2030,67 @@ class CacheCleanupRequestV1(ContractModel):
         return value
 
 
-class CacheCleanupV1(ContractModel):
-    schema_version: Literal["1"] = "1"
-    id: OpaqueId
-    status: DiagnosticStatus
+class CacheCleanupResultV1(ContractModel):
     scopes: list[CacheScope] = Field(min_length=1, max_length=8)
     removed_entries: int = Field(ge=0, le=100_000_000)
     reclaimed_bytes: int = Field(ge=0, le=MAX_JAVASCRIPT_SAFE_INTEGER)
+
+
+class OperationKind(StrEnum):
+    SERVICE_RESTART = "service_restart"
+    CACHE_CLEANUP = "cache_cleanup"
+
+
+class OperationStatus(StrEnum):
+    QUEUED = "queued"
+    RUNNING = "running"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+
+
+class OperationV1(ContractModel):
+    schema_version: Literal["1"] = "1"
+    id: OpaqueId
+    kind: OperationKind
+    status: OperationStatus
+    service_id: OpaqueId | None = None
+    cache_scopes: list[CacheScope] = Field(default_factory=list, max_length=8)
+    service: ServiceSummaryV1 | None = None
+    cache_cleanup: CacheCleanupResultV1 | None = None
+    logs_ref: OpaqueId
     created_at: UtcTimestamp
+    updated_at: UtcTimestamp
+    observed_at: UtcTimestamp
     finished_at: UtcTimestamp | None = None
     error: ApiErrorV1 | None = None
+    etag: StrongETag
 
     @model_validator(mode="after")
-    def _valid_status_shape(self) -> CacheCleanupV1:
-        terminal = self.status in {DiagnosticStatus.SUCCEEDED, DiagnosticStatus.FAILED}
+    def _valid_operation(self) -> OperationV1:
+        terminal = self.status in {OperationStatus.SUCCEEDED, OperationStatus.FAILED}
         if terminal != (self.finished_at is not None):
-            raise ValueError("finished_at is required only for terminal cleanup")
-        if (self.status is DiagnosticStatus.FAILED) != (self.error is not None):
-            raise ValueError("error is required only for failed cleanup")
+            raise ValueError("finished_at is required only for terminal operations")
+        if (self.status is OperationStatus.FAILED) != (self.error is not None):
+            raise ValueError("error is required only for failed operations")
+        succeeded = self.status is OperationStatus.SUCCEEDED
+        if self.kind is OperationKind.SERVICE_RESTART:
+            if self.service_id is None or self.cache_scopes or self.cache_cleanup is not None:
+                raise ValueError("service restart operation has an invalid subject")
+            if succeeded != (self.service is not None):
+                raise ValueError("successful service restart requires the service result")
+            if self.service is not None and self.service.id != self.service_id:
+                raise ValueError("service result has the wrong ID")
+        else:
+            if self.service_id is not None or self.service is not None or not self.cache_scopes:
+                raise ValueError("cache cleanup operation has an invalid subject")
+            if len(self.cache_scopes) != len(set(self.cache_scopes)):
+                raise ValueError("cache cleanup scopes must be unique")
+            if succeeded != (self.cache_cleanup is not None):
+                raise ValueError("successful cache cleanup requires its result")
+            if self.cache_cleanup is not None and self.cache_cleanup.scopes != self.cache_scopes:
+                raise ValueError("cache cleanup result scopes differ from the operation")
+        if not succeeded and (self.service is not None or self.cache_cleanup is not None):
+            raise ValueError("only successful operations carry a result")
         return self
 
 
@@ -1800,28 +2108,67 @@ class ResourceChangeType(StrEnum):
     LOG_ENTRY = "log_entry"
     ARTIFACT = "artifact"
     REVISION = "revision"
+    REVISION_HEAD = "revision_head"
     SERVICE = "service"
     DIAGNOSTIC = "diagnostic"
+    OPERATION = "operation"
 
 
 class ResourceChangeIdentityV1(ContractModel):
     change_id: OpaqueId
     resource_type: ResourceChangeType
     resource_id: OpaqueId
+    parent_resource_type: ResourceChangeType | None = None
+    parent_resource_id: OpaqueId | None = None
     resource_etag: StrongETag | None = None
     content_sha256: Sha256Digest | None = None
 
     @model_validator(mode="after")
     def _has_authoritative_identity(self) -> ResourceChangeIdentityV1:
-        if self.resource_etag is None and self.content_sha256 is None:
-            raise ValueError("resource change requires an ETag or content digest")
+        if (self.resource_etag is None) == (self.content_sha256 is None):
+            raise ValueError("resource change requires exactly one ETag or content digest")
+        if (self.parent_resource_type is None) != (self.parent_resource_id is None):
+            raise ValueError("parent resource type and ID must appear together")
         return self
+
+
+def _validate_change(
+    change: ResourceChangeIdentityV1,
+    *,
+    resource_type: ResourceChangeType,
+    resource_id: str,
+    resource_etag: str | None = None,
+    content_sha256: str | None = None,
+    parent_type: ResourceChangeType | None = None,
+    parent_id: str | None = None,
+) -> None:
+    if (
+        change.resource_type is not resource_type
+        or change.resource_id != resource_id
+        or change.resource_etag != resource_etag
+        or change.content_sha256 != content_sha256
+        or change.parent_resource_type is not parent_type
+        or change.parent_resource_id != parent_id
+    ):
+        raise ValueError("change identity does not bind the event payload")
 
 
 class RunUpdatedEventV1(EventBaseV1):
     event: Literal["run.updated.v1"]
     change: ResourceChangeIdentityV1
     payload: RunSummaryV1
+
+    @model_validator(mode="after")
+    def _change_matches_payload(self) -> RunUpdatedEventV1:
+        _validate_change(
+            self.change,
+            resource_type=ResourceChangeType.RUN,
+            resource_id=self.payload.id,
+            resource_etag=self.payload.etag,
+            parent_type=ResourceChangeType.PROJECT,
+            parent_id=self.payload.project_id,
+        )
+        return self
 
 
 class TimelineAppendedPayloadV1(ContractModel):
@@ -1834,11 +2181,35 @@ class RunTimelineAppendedEventV1(EventBaseV1):
     change: ResourceChangeIdentityV1
     payload: TimelineAppendedPayloadV1
 
+    @model_validator(mode="after")
+    def _change_matches_payload(self) -> RunTimelineAppendedEventV1:
+        if self.payload.entry.run_id != self.payload.run_id:
+            raise ValueError("timeline entry belongs to another run")
+        _validate_change(
+            self.change,
+            resource_type=ResourceChangeType.TIMELINE_ENTRY,
+            resource_id=self.payload.entry.id,
+            content_sha256=self.payload.entry.content_sha256,
+            parent_type=ResourceChangeType.RUN,
+            parent_id=self.payload.run_id,
+        )
+        return self
+
 
 class ProjectUpdatedEventV1(EventBaseV1):
     event: Literal["project.updated.v1"]
     change: ResourceChangeIdentityV1
     payload: ProjectSummaryV1
+
+    @model_validator(mode="after")
+    def _change_matches_payload(self) -> ProjectUpdatedEventV1:
+        _validate_change(
+            self.change,
+            resource_type=ResourceChangeType.PROJECT,
+            resource_id=self.payload.id,
+            resource_etag=self.payload.etag,
+        )
+        return self
 
 
 class ServiceUpdatedEventV1(EventBaseV1):
@@ -1846,11 +2217,41 @@ class ServiceUpdatedEventV1(EventBaseV1):
     change: ResourceChangeIdentityV1
     payload: ServiceSummaryV1
 
+    @model_validator(mode="after")
+    def _change_matches_payload(self) -> ServiceUpdatedEventV1:
+        _validate_change(
+            self.change,
+            resource_type=ResourceChangeType.SERVICE,
+            resource_id=self.payload.id,
+            resource_etag=self.payload.etag,
+        )
+        return self
+
 
 class DiagnosticUpdatedEventV1(EventBaseV1):
     event: Literal["diagnostic.updated.v1"]
     change: ResourceChangeIdentityV1
     payload: DiagnosticV1
+
+    @model_validator(mode="after")
+    def _change_matches_payload(self) -> DiagnosticUpdatedEventV1:
+        parent_type: ResourceChangeType | None = None
+        parent_id: str | None = None
+        if isinstance(self.payload.target, ProjectDiagnosticTargetV1):
+            parent_type = ResourceChangeType.PROJECT
+            parent_id = self.payload.target.project_id
+        elif isinstance(self.payload.target, RunDiagnosticTargetV1):
+            parent_type = ResourceChangeType.RUN
+            parent_id = self.payload.target.run_id
+        _validate_change(
+            self.change,
+            resource_type=ResourceChangeType.DIAGNOSTIC,
+            resource_id=self.payload.id,
+            resource_etag=self.payload.etag,
+            parent_type=parent_type,
+            parent_id=parent_id,
+        )
+        return self
 
 
 class ArtifactUpdatedEventV1(EventBaseV1):
@@ -1858,11 +2259,41 @@ class ArtifactUpdatedEventV1(EventBaseV1):
     change: ResourceChangeIdentityV1
     payload: ArtifactSummaryV1
 
+    @model_validator(mode="after")
+    def _change_matches_payload(self) -> ArtifactUpdatedEventV1:
+        _validate_change(
+            self.change,
+            resource_type=ResourceChangeType.ARTIFACT,
+            resource_id=self.payload.id,
+            content_sha256=self.payload.content_sha256,
+            parent_type=ResourceChangeType.PROJECT,
+            parent_id=self.payload.project_id,
+        )
+        return self
+
 
 class LogAppendedEventV1(EventBaseV1):
     event: Literal["log.appended.v1"]
     change: ResourceChangeIdentityV1
     payload: LogEntryV1
+
+    @model_validator(mode="after")
+    def _change_matches_payload(self) -> LogAppendedEventV1:
+        parent_type = (
+            ResourceChangeType.RUN
+            if self.payload.run_id is not None
+            else ResourceChangeType.SERVICE
+        )
+        parent_id = self.payload.run_id or self.payload.service_id
+        _validate_change(
+            self.change,
+            resource_type=ResourceChangeType.LOG_ENTRY,
+            resource_id=self.payload.id,
+            content_sha256=self.payload.content_sha256,
+            parent_type=parent_type,
+            parent_id=parent_id,
+        )
+        return self
 
 
 class RevisionSuccessorTransitionUpdatedEventV1(EventBaseV1):
@@ -1870,11 +2301,56 @@ class RevisionSuccessorTransitionUpdatedEventV1(EventBaseV1):
     change: ResourceChangeIdentityV1
     payload: RevisionHeadV1
 
+    @model_validator(mode="after")
+    def _change_matches_payload(self) -> RevisionSuccessorTransitionUpdatedEventV1:
+        _validate_change(
+            self.change,
+            resource_type=ResourceChangeType.REVISION_HEAD,
+            resource_id=self.payload.project_id,
+            resource_etag=self.payload.etag,
+        )
+        return self
+
 
 class RevisionActivatedEventV1(EventBaseV1):
     event: Literal["revision.activated.v1"]
     change: ResourceChangeIdentityV1
     payload: RevisionV1
+
+    @model_validator(mode="after")
+    def _change_matches_payload(self) -> RevisionActivatedEventV1:
+        _validate_change(
+            self.change,
+            resource_type=ResourceChangeType.REVISION,
+            resource_id=self.payload.revision.id,
+            resource_etag=self.payload.etag,
+            parent_type=ResourceChangeType.PROJECT,
+            parent_id=self.payload.revision.project_id,
+        )
+        return self
+
+
+class OperationUpdatedEventV1(EventBaseV1):
+    event: Literal["operation.updated.v1"]
+    change: ResourceChangeIdentityV1
+    payload: OperationV1
+
+    @model_validator(mode="after")
+    def _change_matches_payload(self) -> OperationUpdatedEventV1:
+        parent_type = None
+        parent_id = None
+        if self.payload.service_id is not None:
+            parent_type = ResourceChangeType.SERVICE
+            parent_id = self.payload.service_id
+        _validate_change(
+            self.change,
+            resource_type=ResourceChangeType.OPERATION,
+            resource_id=self.payload.id,
+            resource_etag=self.payload.etag,
+            parent_type=parent_type,
+            parent_id=parent_id,
+        )
+        return self
 
 
 class HeartbeatPayloadV1(ContractModel):
@@ -1896,6 +2372,7 @@ _EventEnvelopeUnion: TypeAlias = Annotated[
     | LogAppendedEventV1
     | RevisionSuccessorTransitionUpdatedEventV1
     | RevisionActivatedEventV1
+    | OperationUpdatedEventV1
     | HeartbeatEventV1,
     Field(discriminator="event"),
 ]
