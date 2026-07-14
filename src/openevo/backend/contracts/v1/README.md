@@ -71,6 +71,13 @@ the owning idempotency row. That binding survives project deletion for the
 idempotency retention window and is cascade-cleaned when the response expires.
 Legacy revision rows retain their old identity until a still-retained
 activation response is validated and atomically backfills both bindings.
+Startup guarded reads and ordinary write transactions use one closed
+recovery-table accounting specification. Every transaction rechecks its final
+row count, bounded TEXT/BLOB byte count, and per-value lengths before `COMMIT`,
+including revision, activation-binding, event, and idempotency rows written by
+the same request. Startup recovery performs the same check again after legacy
+request-binding backfill, so an over-budget backfill rolls back rather than
+publishing state that the next startup must reject.
 Successful idempotency rows retain the
 canonical request and semantic headers, validate each operation's
 request/response relationship, and require a ready project response to name the

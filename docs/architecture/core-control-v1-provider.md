@@ -175,6 +175,13 @@ the SQL aggregate and per-value length budgets before a guarded value enters
 Python. Metadata is a one-key closed set; signing-key key/value lengths are
 checked before the value is read, and unknown metadata fails startup. Provider
 recovery and project/revision listing do not use unbounded `fetchall()`.
+The same closed recovery-table specification, bounded columns, per-table row
+limits, aggregate row/byte limits, and per-value limits are evaluated inside
+every SQLite write transaction immediately before `COMMIT`. The check observes
+the transaction's final revision, activation-binding, idempotency, event,
+upload, and cleanup state, so a successful mutation cannot create a database
+that the same configured process cannot recover. A quota failure follows the
+ordinary rollback path and is not reported as a post-commit or unknown outcome.
 
 `project_revisions` is an immutable per-project ledger with a unique contiguous
 generation and exact predecessor. Its Core-owned revision ID authenticates a
@@ -192,7 +199,12 @@ identity. It survives project deletion but is removed by the idempotency row's
 retention cascade, preserving exact historical replay without unbounded audit
 growth. Revision documents and activation bindings count against the same
 irreversible startup row, per-value, and aggregate byte budgets as other
-provider state.
+provider state. Legacy ledger migration first preserves the old rows in the
+current schema; retained idempotency validation then backfills request digests
+and activation bindings inside the startup recovery transaction. A final shared
+pre-commit accounting pass includes those newly written rows and bytes. If the
+backfill would cross a recovery limit, both the digest updates and binding
+inserts roll back atomically.
 
 Project and upload ETags hash the complete validated canonical resource model,
 including model-populated defaults, plus an internal monotonic resource version.

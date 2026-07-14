@@ -31,6 +31,18 @@ from .workspace import (
 
 
 _ModelT = TypeVar("_ModelT", bound=BaseModel)
+_RecoveryTableName = Literal[
+    "projects",
+    "project_revisions",
+    "revision_activation_bindings",
+    "workspace_uploads",
+    "workspace_publication_owners",
+    "idempotency_records",
+    "managed_cleanup_intents",
+    "failed_idempotency_records",
+    "events",
+    "metadata",
+]
 _EMPTY_WORKSPACE_DIGEST = hashlib.sha256(b"\0" * 1024).hexdigest()
 _IDEMPOTENCY_RETENTION_SECONDS = 7 * 24 * 60 * 60
 _IDEMPOTENCY_LIMIT = 10_000
@@ -199,6 +211,26 @@ class _WorkspaceChunkCommitExpectation:
     old_offset: int
     content: bytes
     result: StoredResult
+
+
+@dataclass(frozen=True)
+class _RecoveryTableSpec:
+    table: _RecoveryTableName
+    bounded_columns: tuple[str, ...]
+    max_rows: int
+
+
+@dataclass(frozen=True)
+class _RecoveryTableUsage:
+    rows: int
+    blob_bytes: int
+
+
+@dataclass(frozen=True)
+class _RecoveryBudgetSnapshot:
+    rows: int
+    blob_bytes: int
+    tables: Mapping[_RecoveryTableName, _RecoveryTableUsage]
 
 
 @dataclass
@@ -2788,53 +2820,177 @@ class CoreControlStoreV1:
             raise CursorExpiredError("project cursor expired")
         return payload["boundary"][0], payload["boundary"][1]
 
+    def _recovery_table_specs(self) -> tuple[_RecoveryTableSpec, ...]:
+        return (
+            _RecoveryTableSpec("metadata", ("key", "value"), 1),
+            _RecoveryTableSpec(
+                "workspace_publication_owners",
+                (
+                    "snapshot_id",
+                    "content_id",
+                    "publication_sha256",
+                    "project_id",
+                    "upload_id",
+                    "identity_hmac",
+                    "published_at",
+                ),
+                _MAX_PUBLICATION_OWNERS,
+            ),
+            _RecoveryTableSpec(
+                "projects",
+                (
+                    "project_id",
+                    "identity_hmac",
+                    "document_json",
+                    "created_at",
+                    "updated_at",
+                ),
+                _MAX_PROJECTS,
+            ),
+            _RecoveryTableSpec(
+                "project_revisions",
+                (
+                    "revision_id",
+                    "project_id",
+                    "identity_hmac",
+                    "activation_request_digest",
+                    "document_json",
+                    "created_at",
+                    "updated_at",
+                ),
+                _MAX_REVISIONS,
+            ),
+            _RecoveryTableSpec(
+                "revision_activation_bindings",
+                (
+                    "revision_id",
+                    "project_id",
+                    "operation_id",
+                    "resource_scope",
+                    "idempotency_key",
+                    "request_digest",
+                    "identity_hmac",
+                ),
+                _MAX_REVISIONS,
+            ),
+            _RecoveryTableSpec(
+                "workspace_uploads",
+                (
+                    "upload_id",
+                    "project_id",
+                    "identity_hmac",
+                    "document_json",
+                    "file_name",
+                    "created_at",
+                    "updated_at",
+                ),
+                _MAX_UPLOADS,
+            ),
+            _RecoveryTableSpec(
+                "events",
+                ("event_id", "frame_json"),
+                self._event_replay_limit,
+            ),
+            _RecoveryTableSpec(
+                "idempotency_records",
+                (
+                    "operation_id",
+                    "resource_scope",
+                    "idempotency_key",
+                    "request_digest",
+                    "request_json",
+                    "semantic_headers_json",
+                    "response_type",
+                    "response_json",
+                    "etag",
+                ),
+                _IDEMPOTENCY_LIMIT,
+            ),
+            _RecoveryTableSpec(
+                "failed_idempotency_records",
+                (
+                    "operation_id",
+                    "resource_scope",
+                    "idempotency_key",
+                    "request_digest",
+                    "error_json",
+                ),
+                _IDEMPOTENCY_LIMIT,
+            ),
+            _RecoveryTableSpec(
+                "managed_cleanup_intents",
+                (
+                    "cleanup_id",
+                    "operation_id",
+                    "resource_scope",
+                    "idempotency_key",
+                    "root_kind",
+                    "entry_name",
+                    "identity_hmac",
+                ),
+                _MAX_CLEANUP_INTENTS,
+            ),
+        )
+
+    def _recovery_budget_snapshot(self) -> _RecoveryBudgetSnapshot:
+        total_rows = 0
+        total_bytes = 0
+        tables: dict[_RecoveryTableName, _RecoveryTableUsage] = {}
+        for spec in self._recovery_table_specs():
+            totals = ["COUNT(*)"] + [
+                f"COALESCE(SUM(length(CAST({column} AS BLOB))), 0)"
+                for column in spec.bounded_columns
+            ]
+            aggregate = self._connection.execute(
+                f"SELECT {', '.join(totals)} FROM {spec.table}"
+            ).fetchone()
+            if aggregate is None:
+                raise StoreCorruptionError(
+                    f"Core Control {spec.table} recovery accounting is unavailable"
+                )
+            row_count = int(aggregate[0])
+            blob_bytes = sum(int(aggregate[index]) for index in range(1, len(aggregate)))
+            if row_count > spec.max_rows or blob_bytes > _MAX_STARTUP_BLOB_BYTES:
+                raise StoreCorruptionError(
+                    f"Core Control {spec.table} recovery quota is exceeded"
+                )
+            for column in spec.bounded_columns:
+                oversized = self._connection.execute(
+                    f"SELECT 1 FROM {spec.table} WHERE {column} IS NOT NULL AND "
+                    f"length(CAST({column} AS BLOB)) > "
+                    f"{_MAX_STARTUP_VALUE_BYTES} LIMIT 1"
+                ).fetchone()
+                if oversized is not None:
+                    raise StoreCorruptionError(
+                        f"Core Control {spec.table} recovery quota is exceeded"
+                    )
+            total_rows += row_count
+            total_bytes += blob_bytes
+            if (
+                total_rows > _MAX_STARTUP_ROWS
+                or total_bytes > _MAX_STARTUP_BLOB_BYTES
+            ):
+                raise StoreCorruptionError(
+                    "Core Control aggregate startup quota is exceeded"
+                )
+            tables[spec.table] = _RecoveryTableUsage(row_count, blob_bytes)
+        return _RecoveryBudgetSnapshot(total_rows, total_bytes, tables)
+
     def _recovery_rows(
         self,
-        table: Literal[
-            "projects",
-            "project_revisions",
-            "revision_activation_bindings",
-            "workspace_uploads",
-            "workspace_publication_owners",
-            "idempotency_records",
-            "managed_cleanup_intents",
-            "failed_idempotency_records",
-            "events",
-            "metadata",
-        ],
+        table: _RecoveryTableName,
         *,
         columns: tuple[str, ...],
-        bounded_columns: tuple[str, ...],
-        max_rows: int,
     ):
-        totals = ["COUNT(*)"] + [
-            f"COALESCE(SUM(length(CAST({column} AS BLOB))), 0)" for column in bounded_columns
-        ]
-        aggregate = self._connection.execute(f"SELECT {', '.join(totals)} FROM {table}").fetchone()
-        assert aggregate is not None
-        row_count = int(aggregate[0])
-        blob_bytes = sum(int(aggregate[index]) for index in range(1, len(aggregate)))
-        self._startup_scan_rows += row_count
-        self._startup_scan_bytes += blob_bytes
-        if row_count > max_rows or blob_bytes > _MAX_STARTUP_BLOB_BYTES:
-            raise StoreCorruptionError(f"Core Control {table} recovery quota is exceeded")
-        if (
-            self._startup_scan_rows > _MAX_STARTUP_ROWS
-            or self._startup_scan_bytes > _MAX_STARTUP_BLOB_BYTES
-        ):
-            raise StoreCorruptionError("Core Control aggregate startup quota is exceeded")
-        for column in bounded_columns:
-            oversized = self._connection.execute(
-                f"SELECT 1 FROM {table} WHERE {column} IS NOT NULL AND "
-                f"length(CAST({column} AS BLOB)) > {_MAX_STARTUP_VALUE_BYTES} LIMIT 1"
-            ).fetchone()
-            if oversized is not None:
-                raise StoreCorruptionError(f"Core Control {table} recovery quota is exceeded")
-
+        specs = {spec.table: spec for spec in self._recovery_table_specs()}
+        spec = specs.get(table)
+        expected = self._startup_budget_snapshot.tables.get(table)
+        if spec is None or expected is None:
+            raise StoreCorruptionError("Core Control recovery table is not accounted")
         last_rowid = 0
         guarded_columns = []
         for column in columns:
-            if column in bounded_columns:
+            if column in spec.bounded_columns:
                 guarded_columns.append(
                     f"CASE WHEN length(CAST({column} AS BLOB)) "
                     f"<= {_MAX_STARTUP_VALUE_BYTES} "
@@ -2856,25 +3012,24 @@ class CoreControlStoreV1:
                 break
             for row in page:
                 seen += 1
-                if seen > max_rows:
+                if seen > spec.max_rows:
                     raise StoreCorruptionError(f"Core Control {table} recovery quota is exceeded")
                 last_rowid = int(row["_recovery_rowid"])
                 yield row
-        if seen != row_count:
+        if seen != expected.rows:
             raise StoreCorruptionError(f"Core Control {table} recovery scan changed")
 
     def _recover_and_validate(self) -> None:
         with self._mutex, self._transaction():
             self._verify_schema_fingerprint()
             self._verify_database_integrity()
-            self._startup_scan_rows = 0
-            self._startup_scan_bytes = 0
+            self._startup_budget_snapshot = self._recovery_budget_snapshot()
+            self._startup_scan_rows = self._startup_budget_snapshot.rows
+            self._startup_scan_bytes = self._startup_budget_snapshot.blob_bytes
             metadata_rows = list(
                 self._recovery_rows(
                     "metadata",
                     columns=("key", "value"),
-                    bounded_columns=("key", "value"),
-                    max_rows=1,
                 )
             )
             if (
@@ -2896,16 +3051,6 @@ class CoreControlStoreV1:
                     "identity_hmac",
                     "published_at",
                 ),
-                bounded_columns=(
-                    "snapshot_id",
-                    "content_id",
-                    "publication_sha256",
-                    "project_id",
-                    "upload_id",
-                    "identity_hmac",
-                    "published_at",
-                ),
-                max_rows=_MAX_PUBLICATION_OWNERS,
             ):
                 project_id, upload_id = self._validate_publication_owner_row(row)
                 if row["snapshot_id"] in publication_owner_rows:
@@ -2928,14 +3073,6 @@ class CoreControlStoreV1:
                     "created_at",
                     "updated_at",
                 ),
-                bounded_columns=(
-                    "project_id",
-                    "identity_hmac",
-                    "document_json",
-                    "created_at",
-                    "updated_at",
-                ),
-                max_rows=_MAX_PROJECTS,
             ):
                 project = _validate_bytes(m.ProjectV1, row["document_json"])
                 version = int(row["resource_version"])
@@ -3013,16 +3150,6 @@ class CoreControlStoreV1:
                     "created_at",
                     "updated_at",
                 ),
-                bounded_columns=(
-                    "revision_id",
-                    "project_id",
-                    "identity_hmac",
-                    "activation_request_digest",
-                    "document_json",
-                    "created_at",
-                    "updated_at",
-                ),
-                max_rows=_MAX_REVISIONS,
             ):
                 revision = _validate_bytes(m.RevisionV1, row["document_json"])
                 revision_data = revision.model_dump(mode="python", exclude={"etag"})
@@ -3097,16 +3224,6 @@ class CoreControlStoreV1:
                     "request_digest",
                     "identity_hmac",
                 ),
-                bounded_columns=(
-                    "revision_id",
-                    "project_id",
-                    "operation_id",
-                    "resource_scope",
-                    "idempotency_key",
-                    "request_digest",
-                    "identity_hmac",
-                ),
-                max_rows=_MAX_REVISIONS,
             ):
                 self._validate_revision_activation_binding_row(row)
                 revision = revisions_by_id.get(row["revision_id"])
@@ -3132,16 +3249,6 @@ class CoreControlStoreV1:
                     "created_at",
                     "updated_at",
                 ),
-                bounded_columns=(
-                    "upload_id",
-                    "project_id",
-                    "identity_hmac",
-                    "document_json",
-                    "file_name",
-                    "created_at",
-                    "updated_at",
-                ),
-                max_rows=_MAX_UPLOADS,
             ):
                 upload = _validate_bytes(m.WorkspaceUploadSessionV1, row["document_json"])
                 version = int(row["resource_version"])
@@ -3226,8 +3333,6 @@ class CoreControlStoreV1:
             for row in self._recovery_rows(
                 "events",
                 columns=("sequence", "event_id", "frame_json", "created_at_epoch"),
-                bounded_columns=("event_id", "frame_json"),
-                max_rows=self._event_replay_limit,
             ):
                 frame = _validate_bytes(m.SseFrameV1, row["frame_json"])
                 if (
@@ -3268,18 +3373,6 @@ class CoreControlStoreV1:
                     "created_at_epoch",
                     "expires_at_epoch",
                 ),
-                bounded_columns=(
-                    "operation_id",
-                    "resource_scope",
-                    "idempotency_key",
-                    "request_digest",
-                    "request_json",
-                    "semantic_headers_json",
-                    "response_type",
-                    "response_json",
-                    "etag",
-                ),
-                max_rows=_IDEMPOTENCY_LIMIT,
             ):
                 idempotency_model = _validate_idempotency_row(
                     row,
@@ -3309,14 +3402,6 @@ class CoreControlStoreV1:
                     "created_at_epoch",
                     "expires_at_epoch",
                 ),
-                bounded_columns=(
-                    "operation_id",
-                    "resource_scope",
-                    "idempotency_key",
-                    "request_digest",
-                    "error_json",
-                ),
-                max_rows=_IDEMPOTENCY_LIMIT,
             ):
                 success_scope = _success_scope_for_failed_idempotency(row)
                 if (
@@ -3368,16 +3453,6 @@ class CoreControlStoreV1:
                     "identity_hmac",
                     "created_at_epoch",
                 ),
-                bounded_columns=(
-                    "cleanup_id",
-                    "operation_id",
-                    "resource_scope",
-                    "idempotency_key",
-                    "root_kind",
-                    "entry_name",
-                    "identity_hmac",
-                ),
-                max_rows=_MAX_CLEANUP_INTENTS,
             ):
                 self._validate_cleanup_intent_row(row)
                 success_identity = (
@@ -4529,6 +4604,7 @@ class CoreControlStoreV1:
             self._connection,
             self._verify_lifecycle_storage,
             self._reconcile_rollback_journal_authority,
+            self._recovery_budget_snapshot,
         )
 
     def _verify_database_transaction_boundary(self) -> None:
@@ -4542,10 +4618,12 @@ class _Transaction:
         connection: sqlite3.Connection,
         verify_storage: Callable[[], None],
         reconcile_rollback_journal: Callable[[], None],
+        verify_recovery_budget: Callable[[], _RecoveryBudgetSnapshot],
     ) -> None:
         self.connection = connection
         self.verify_storage = verify_storage
         self.reconcile_rollback_journal = reconcile_rollback_journal
+        self.verify_recovery_budget = verify_recovery_budget
         self.outcome: Literal["pending", "rolled_back", "committed", "unknown"] = "pending"
 
     def __enter__(self):
@@ -4558,6 +4636,7 @@ class _Transaction:
             self._rollback()
             return False
         try:
+            self.verify_recovery_budget()
             self.verify_storage()
         except Exception:
             self._rollback()

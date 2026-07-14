@@ -2881,6 +2881,76 @@ def test_project_revision_reads_paginate_and_return_typed_not_found(
         assert revision.headers["etag"] == revision.json()["etag"]
 
 
+@pytest.mark.parametrize("budget_kind", ["rows", "bytes"])
+def test_ready_project_write_cannot_commit_state_that_startup_cannot_recover(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    budget_kind: str,
+) -> None:
+    registry = verified_builtin_registry(tmp_path / "registry")
+    probe_root = tmp_path / "probe"
+    with TestClient(_app(probe_root, registry=registry)) as probe:
+        _create_project(probe, _project_create())
+    recovered_probe = CoreControlStoreV1(probe_root)
+    try:
+        populated_usage = {
+            "rows": recovered_probe._startup_scan_rows,
+            "bytes": recovered_probe._startup_scan_bytes,
+        }
+    finally:
+        recovered_probe.close()
+
+    state_root = tmp_path / "state"
+    app = _app(state_root, registry=registry)
+    store = app.state.core_control_provider.store
+    baseline_usage = {
+        "rows": store._startup_scan_rows,
+        "bytes": store._startup_scan_bytes,
+    }
+    assert populated_usage[budget_kind] > baseline_usage[budget_kind] + 1
+    reduced_limit = (
+        baseline_usage[budget_kind]
+        + (populated_usage[budget_kind] - baseline_usage[budget_kind]) // 2
+    )
+    monkeypatch.setattr(
+        store_module,
+        "_MAX_STARTUP_ROWS" if budget_kind == "rows" else "_MAX_STARTUP_BLOB_BYTES",
+        reduced_limit,
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/projects",
+            headers={**AUTH, "Idempotency-Key": f"recovery-budget-{budget_kind}"},
+            json=_project_create(),
+        )
+        assert response.status_code == 500
+        assert response.json()["code"] == "core_control_store_corrupt"
+        assert client.get("/v1/projects", headers=AUTH).json()["items"] == []
+
+    database = state_root / "core-control-v1" / "provider.sqlite3"
+    with sqlite3.connect(database) as connection:
+        for table in (
+            "projects",
+            "project_revisions",
+            "revision_activation_bindings",
+            "events",
+            "idempotency_records",
+        ):
+            assert connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0
+
+    reopened = CoreControlStoreV1(state_root)
+    try:
+        assert reopened.list_projects(
+            limit=1,
+            after=None,
+            sort="created_at",
+            direction="asc",
+        ).items == []
+    finally:
+        reopened.close()
+
+
 def test_project_revision_schema_migrates_exact_previous_store_with_state(
     tmp_path: Path,
 ) -> None:
@@ -2973,6 +3043,80 @@ def test_project_revision_schema_migrates_v1_ledger_and_backfills_request_bindin
         assert connection.execute(
             "SELECT COUNT(*) FROM revision_activation_bindings"
         ).fetchone()[0] == 2
+
+
+@pytest.mark.parametrize("budget_kind", ["rows", "bytes"])
+def test_revision_ledger_backfill_cannot_exceed_startup_recovery_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    budget_kind: str,
+) -> None:
+    registry = verified_builtin_registry(tmp_path / "registry")
+    with TestClient(_app(tmp_path, registry=registry)) as client:
+        project, project_etag = _create_project(client, _project_create())
+        patched = client.patch(
+            f"/v1/projects/{project['id']}",
+            headers={
+                **AUTH,
+                "Idempotency-Key": "patch-project-budgeted-backfill",
+                "If-Match": project_etag,
+            },
+            json={"schema_version": "1", "name": "Budgeted ledger successor"},
+        )
+        assert patched.status_code == 200, patched.text
+
+    recovered = CoreControlStoreV1(tmp_path)
+    try:
+        populated_usage = {
+            "rows": recovered._startup_scan_rows,
+            "bytes": recovered._startup_scan_bytes,
+        }
+    finally:
+        recovered.close()
+
+    database = tmp_path / "core-control-v1" / "provider.sqlite3"
+    with sqlite3.connect(database) as connection:
+        signing_key = bytes(
+            connection.execute("SELECT value FROM metadata WHERE key = 'signing_key'").fetchone()[
+                0
+            ]
+        )
+        revisions = connection.execute(
+            "SELECT revision_id, project_id, generation, document_json, resource_version, "
+            "created_at, updated_at FROM project_revisions"
+        ).fetchall()
+        assert len(revisions) == 2
+        connection.execute("DROP TABLE revision_activation_bindings")
+        connection.execute("DROP TABLE project_revisions")
+        connection.execute(store_module._PROJECT_REVISIONS_SCHEMA_V1)
+        for revision in revisions:
+            revision_id = revision[0]
+            identity_hmac = hmac.new(
+                signing_key,
+                f"resource.v1:revision:{revision_id}".encode("ascii"),
+                hashlib.sha256,
+            ).hexdigest()
+            connection.execute(
+                "INSERT INTO project_revisions VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (*revision[:3], identity_hmac, *revision[3:]),
+            )
+
+    monkeypatch.setattr(
+        store_module,
+        "_MAX_STARTUP_ROWS" if budget_kind == "rows" else "_MAX_STARTUP_BLOB_BYTES",
+        populated_usage[budget_kind] - 1,
+    )
+    with pytest.raises(StoreCorruptionError, match="aggregate startup quota"):
+        CoreControlStoreV1(tmp_path)
+
+    with sqlite3.connect(database) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM revision_activation_bindings"
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT COUNT(*) FROM project_revisions "
+            "WHERE activation_request_digest IS NOT NULL"
+        ).fetchone()[0] == 0
 
 
 def test_project_revision_manifest_corruption_fails_closed_on_restart(
@@ -3987,7 +4131,7 @@ def test_transaction_boundary_reconciles_allowed_rollback_journal_states(
         authority._verify_database_authority()
 
     connection.set_trace_callback(mutate_at_boundary)
-    transaction = store_module._Transaction(connection, verify, reconcile)
+    transaction = store_module._Transaction(connection, verify, reconcile, lambda: None)
     try:
         if boundary == "COMMIT":
             with transaction:
@@ -4057,7 +4201,7 @@ def test_transaction_boundary_rejects_unsafe_rollback_journal_transition(
         authority._verify_database_authority()
 
     connection.set_trace_callback(damage_at_boundary)
-    transaction = store_module._Transaction(connection, verify, reconcile)
+    transaction = store_module._Transaction(connection, verify, reconcile, lambda: None)
     expected_error = (
         store_module.PostCommitStoreError if boundary == "COMMIT" else StoreCorruptionError
     )
