@@ -743,11 +743,13 @@ The framework's `supported`, `unsupported`, and `unavailable` values are
 preserved independently for execution, capture, harness, and runtime support,
 including the overall three-state result.
 
-The Python app in `src/openevo/backend/contracts/v1` is a schema source only.
-Every route returns 501 and no production Core provider is wired here. The
-contract and tests define required provider behavior; they are not evidence
-that workspace publication, operations, logs-by-ref, or revision admission are
-implemented end to end.
+The default Python app in `src/openevo/backend/contracts/v1` remains a
+schema-only 501 source. The phase-one provider binds durable project and
+workspace publication, verified capabilities and project validation, service
+observation, and recoverable SSE to the same operation IDs. Run ownership,
+revision activation, service actions, diagnostics, artifacts, and referenced
+logs remain explicit typed 503 gaps. See
+`docs/architecture/core-control-v1-provider.md` for the exact ownership table.
 
 The v1 release profiles are:
 

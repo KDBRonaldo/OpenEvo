@@ -1,8 +1,10 @@
 # Core Control API v1 Contract
 
-This directory is the canonical, schema-only contract between the Desktop
-sidecar and remote OpenEvo Core. It is not a business provider: every route in
-`app.py` returns HTTP 501.
+This directory owns the canonical contract between the Desktop sidecar and
+remote OpenEvo Core, plus the phase-one business provider. Calling
+`create_core_control_contract_app()` without a provider remains schema-only and
+returns HTTP 501. `create_core_control_app()` binds the real provider to those
+same routes by canonical operation ID without changing the snapshots.
 
 ## Sources And Snapshots
 
@@ -12,6 +14,9 @@ sidecar and remote OpenEvo Core. It is not a business provider: every route in
 - `openapi.json` and `events.schema.json` are canonical generated snapshots.
 - `tests/backend/test_contract_v1.py` owns contract behavior, malicious-input,
   closure, and snapshot digest tests.
+- `provider.py`, `store.py`, and `workspace.py` implement the phase-one provider;
+  `docs/architecture/core-control-v1-provider.md` records endpoint ownership and
+  explicit fail-closed gaps.
 
 Regenerate snapshots only after model and route tests pass:
 
@@ -57,6 +62,31 @@ closure and active transition state.
 `CapabilitiesResponseV1` remains the framework-owned `EvolutionCapabilitiesV1`
 type without a local copy or projection.
 
+The provider's private SQLite schema is fresh-only and exact-fingerprinted; it
+is not part of the frozen HTTP schema. Successful idempotency rows retain the
+canonical request and semantic headers and validate each operation's
+request/response relationship during replay and startup. Project validation
+constructs its framework profile from the persisted execution mode, capture
+mode, and harness ID. SQLite/workspace recovery is descriptor-bound and
+quota-limited across every persisted TEXT/BLOB value. The Linux provider opens
+SQLite through its held `/proc/self/fd` authority path and verifies the resolved
+managed path around connection setup. It fixes any pre-existing rollback
+journal by no-follow FD before that connection and accepts recovery only when
+the same inode remains canonically bound or SQLite consumes that inode without a
+replacement pathname. Fresh, legacy, and pending identity binds hold both
+managed-root FDs across the initial inventory, durable identity-marker
+publication, and the final pre-bound inventory; a new node or root replacement
+fails before cleanup. Workspace publication ownership is unique
+to one project/upload pair and is enforced by a signed, transactionally inserted
+private owner row. Abort/delete success persists cleanup intents; exact replay
+and startup must converge them before dropping those intents. Linux cleanup uses random
+atomic no-replace quarantine names, revalidates the first observed inode after
+rename, and applies one cumulative recovery budget before quota is checked over
+live owned entries only.
+Synchronous store work runs on a bounded executor rather than the ASGI event
+loop.
+
 See `docs/architecture/desktop-core-contract-v1.md` for the product boundary and
-provider requirements. Do not use this schema-only module as evidence that a
-production provider or cross-session activation path is implemented.
+`docs/architecture/core-control-v1-provider.md` for implemented ownership. The
+provider does not implement the run owner, successor activation, service
+restart, diagnostics, or artifact exhibition paths; those routes fail closed.

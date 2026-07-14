@@ -427,8 +427,10 @@ class CheckStatus(StrEnum):
 
 class EnvironmentDoctorRequestV1(ContractModel):
     schema_version: Literal["1"] = "1"
-    execution_mode: ExecutionMode
-    checks: list[EnvironmentCheckKind] = Field(default_factory=list, max_length=16)
+    execution_mode: ExecutionMode = Field(strict=False)
+    checks: list[Annotated[EnvironmentCheckKind, Field(strict=False)]] = Field(
+        default_factory=list, max_length=16
+    )
 
     @field_validator("checks")
     @classmethod
@@ -480,8 +482,10 @@ class EnvironmentRepairAction(StrEnum):
 
 class EnvironmentRepairRequestV1(ContractModel):
     schema_version: Literal["1"] = "1"
-    execution_mode: ExecutionMode
-    actions: list[EnvironmentRepairAction] = Field(min_length=1, max_length=16)
+    execution_mode: ExecutionMode = Field(strict=False)
+    actions: list[Annotated[EnvironmentRepairAction, Field(strict=False)]] = Field(
+        min_length=1, max_length=16
+    )
 
     @field_validator("actions")
     @classmethod
@@ -528,7 +532,7 @@ class SnapshotKind(StrEnum):
 
 class ImmutableSnapshotRefV1(ContractModel):
     id: OpaqueId
-    kind: SnapshotKind
+    kind: SnapshotKind = Field(strict=False)
     content_sha256: Sha256Digest
     created_at: UtcTimestamp
 
@@ -548,7 +552,7 @@ class RequiredRevisionRelation(StrEnum):
 class ReachableRequiredRevisionRefV1(ContractModel):
     revision: RevisionRefV1
     reachable_from_revision_id: OpaqueId
-    relation: RequiredRevisionRelation
+    relation: RequiredRevisionRelation = Field(strict=False)
 
     @model_validator(mode="after")
     def _valid_reachability(self) -> ReachableRequiredRevisionRefV1:
@@ -661,7 +665,8 @@ class WorkspaceArchiveDeclarationV1(ContractModel):
     content_sha256: Sha256Digest
     byte_size: int = Field(ge=1024, le=MAX_WORKSPACE_UPLOAD_BYTES)
     format: WorkspaceArchiveFormat = Field(
-        description="The only release workspace transfer format; ZIP and compressed tar are invalid."
+        strict=False,
+        description="The only release workspace transfer format; ZIP and compressed tar are invalid.",
     )
     entry_count: int = Field(ge=0, le=MAX_WORKSPACE_ENTRIES)
     extracted_byte_size: int = Field(ge=0, le=MAX_WORKSPACE_UPLOAD_BYTES)
@@ -729,8 +734,10 @@ ProjectWorkspaceSpecV1: TypeAlias = Annotated[
 
 
 class ProjectSpecV1(ContractModel):
-    execution_mode: ExecutionMode
-    capture_mode: CaptureMode
+    # FastAPI validates decoded JSON as Python values. These two enum fields must
+    # accept their exact JSON string values while the surrounding model stays strict.
+    execution_mode: ExecutionMode = Field(strict=False)
+    capture_mode: CaptureMode = Field(strict=False)
     harness_id: OpaqueId
     agent_model_ref: AgentModelRef = Field(
         description=(
@@ -1470,7 +1477,7 @@ class RunCancelReason(StrEnum):
 
 class RunCancelRequestV1(ContractModel):
     schema_version: Literal["1"] = "1"
-    reason: RunCancelReason
+    reason: RunCancelReason = Field(strict=False)
 
 
 class RunRetryRequestV1(ContractModel):
@@ -2173,7 +2180,9 @@ DiagnosticTargetV1: TypeAlias = Annotated[
 
 class DiagnosticsRequestV1(ContractModel):
     schema_version: Literal["1"] = "1"
-    scopes: list[DiagnosticScope] = Field(min_length=1, max_length=16)
+    scopes: list[Annotated[DiagnosticScope, Field(strict=False)]] = Field(
+        min_length=1, max_length=16
+    )
     target: DiagnosticTargetV1
 
     @field_validator("scopes")
@@ -2255,7 +2264,7 @@ class CacheScope(StrEnum):
 
 class CacheCleanupRequestV1(ContractModel):
     schema_version: Literal["1"] = "1"
-    scopes: list[CacheScope] = Field(min_length=1, max_length=8)
+    scopes: list[Annotated[CacheScope, Field(strict=False)]] = Field(min_length=1, max_length=8)
     older_than_days: int = Field(ge=1, le=3650)
 
     @field_validator("scopes")
@@ -2352,7 +2361,7 @@ class OperationCancelReason(StrEnum):
 
 class OperationCancelRequestV1(ContractModel):
     schema_version: Literal["1"] = "1"
-    reason: OperationCancelReason
+    reason: OperationCancelReason = Field(strict=False)
 
 
 class OperationCancellationV1(ContractModel):
