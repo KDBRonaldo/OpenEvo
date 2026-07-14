@@ -1235,7 +1235,13 @@ function RemoteWorkspaceDrawer({
     }
   }, [observedProfiles, onCreateObserved]);
   return (
-    <div className="drawer-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) guardedClose.requestClose(); }}>
+    <div className="drawer-backdrop" role="presentation" onMouseDown={(event) => {
+      if (guardedClose.confirming) {
+        event.preventDefault();
+      } else if (event.target === event.currentTarget) {
+        guardedClose.requestClose();
+      }
+    }}>
       <aside ref={dialogRef} className="settings-drawer" role="dialog" aria-modal="true" aria-labelledby="workspace-settings-title" tabIndex={-1}>
         <div className="drawer-head" inert={guardedClose.confirming ? true : undefined} aria-hidden={guardedClose.confirming || undefined}><div><span className="panel-kicker">Remote workspace</span><h2 id="workspace-settings-title">Server connection</h2></div><IconButton label="Close connection settings" onClick={guardedClose.requestClose}><X size={18} /></IconButton></div>
         <div className="drawer-content" inert={guardedClose.confirming ? true : undefined} aria-hidden={guardedClose.confirming || undefined}>
@@ -1453,7 +1459,13 @@ function SettingsDrawer({
     }
   };
   return (
-    <div className="drawer-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) requestClose(); }}>
+    <div className="drawer-backdrop" role="presentation" onMouseDown={(event) => {
+      if (guardedClose.confirming) {
+        event.preventDefault();
+      } else if (event.target === event.currentTarget) {
+        requestClose();
+      }
+    }}>
       <aside ref={dialogRef} className="settings-drawer" role="dialog" aria-modal="true" aria-labelledby="settings-title" tabIndex={-1}>
         <div className="drawer-head" inert={guardedClose.confirming ? true : undefined} aria-hidden={guardedClose.confirming || undefined}><div><span className="panel-kicker">{project ? "Project settings" : "New project"}</span><h2 id="settings-title">Research configuration</h2></div><IconButton label="Close settings" onClick={requestClose}><X size={18} /></IconButton></div>
         <div className="drawer-content" inert={guardedClose.confirming ? true : undefined} aria-hidden={guardedClose.confirming || undefined}>
@@ -1559,9 +1571,19 @@ function DiscardChangesPrompt({ onKeep, onDiscard }: { onKeep: () => void; onDis
         keepRef.current?.focus();
       }
     };
+    const preventOutsidePointerFocus = (event: MouseEvent) => {
+      if (event.target instanceof Node && !promptRef.current?.contains(event.target)) {
+        event.preventDefault();
+        keepRef.current?.focus();
+      }
+    };
     keepRef.current?.focus();
     document.addEventListener("focusin", keepFocusInside);
-    return () => document.removeEventListener("focusin", keepFocusInside);
+    document.addEventListener("mousedown", preventOutsidePointerFocus, true);
+    return () => {
+      document.removeEventListener("focusin", keepFocusInside);
+      document.removeEventListener("mousedown", preventOutsidePointerFocus, true);
+    };
   }, []);
   const handleKeyDown = (event: React.KeyboardEvent<HTMLDivElement>) => {
     event.stopPropagation();

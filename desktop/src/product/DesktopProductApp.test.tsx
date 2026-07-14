@@ -1332,6 +1332,15 @@ describe("DesktopProductApp", () => {
     await act(async () => backdrop.dispatchEvent(new MouseEvent("mousedown", { bubbles: true })));
     expect(document.querySelector('[role="dialog"]')).not.toBeNull();
     expect(screenText()).toContain("Discard unsaved changes?");
+    const keepEditing = button("Keep editing");
+    expect(document.activeElement).toBe(keepEditing);
+    await act(async () => backdrop.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true })));
+    expect(document.activeElement).toBe(keepEditing);
+    await pressKey(keepEditing, "Escape");
+    expect(screenText()).not.toContain("Discard unsaved changes?");
+
+    await act(async () => backdrop.dispatchEvent(new MouseEvent("mousedown", { bubbles: true })));
+    expect(screenText()).toContain("Discard unsaved changes?");
     await clickButton("Keep editing");
 
     await clickAria("Close settings");
