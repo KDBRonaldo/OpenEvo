@@ -216,11 +216,15 @@ or child creation can fail. `BaseException`, including cancellation, closes
 untransferred socket FDs and is re-raised unchanged. Close performs bounded
 terminate/wait/kill for every owned child. If exit cannot be proven, a
 process-local quarantine retains the child and trust lease for retry, so trust
-rotation cannot leave an unowned forwarding authority. A connection setup
-failure with an unconfirmed child permanently marks that Core endpoint closing
-before releasing its state lock. The endpoint cannot create another child
-generation while quarantine retries retain ownership, and it finalizes only
-after every owned child exit is confirmed.
+rotation cannot leave an unowned forwarding authority. Any connection setup or
+authority failure permanently marks that Core endpoint closing and registers
+quarantine ownership while still holding its state lock. Only then are the two
+socket endpoints closed independently and bounded child cleanup attempted, so an
+`EBADF` or another close failure cannot hide the original typed failure or skip
+process cleanup. A concurrent open observes the poison before cleanup completes
+and cannot create another child generation. The endpoint finalizes immediately
+when every owned child exit is confirmed; otherwise quarantine retains it for
+later retry.
 
 `SshRemoteExecutorTransport` requires a `TrustedKnownHostsBinding` and revalidates
 it before building every command. A release call without a binding fails closed.

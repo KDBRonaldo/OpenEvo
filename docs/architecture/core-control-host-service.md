@@ -158,11 +158,14 @@ Every path that does not return the verified handle, including cancellation or
 another `BaseException`, executes the tunnel's bounded terminate/wait/kill close
 path in `finally`. Trust leases are released only after every connection child
 exit is confirmed; otherwise process-local orphan quarantine retains ownership
-and retries on later tunnel operations or matching trust mutation. When setup
-fails and child exit cannot be confirmed, the endpoint is permanently marked
-closing before its lock is released and cannot create another connection child;
-quarantine retains the endpoint until bounded cleanup can prove exit and finish
-closure.
+and retries on later tunnel operations or matching trust mutation. Every setup
+or authority failure permanently marks the endpoint closing and registers
+quarantine ownership under its state lock before either anonymous socket is
+closed. Each socket close and the bounded child cleanup then run independently,
+so `EBADF` cannot replace the original typed failure or skip process ownership
+cleanup. Concurrent opens observe the poison and cannot create another child.
+Confirmed child exit completes endpoint closure; otherwise quarantine retains
+the endpoint until a later bounded retry can prove exit.
 
 The exhibition release path uses this attachment for subscription execution and
 transcript capture. After attach, this bootstrap layer does not start a science run, Gateway,

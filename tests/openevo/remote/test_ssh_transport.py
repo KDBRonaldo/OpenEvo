@@ -1174,6 +1174,74 @@ def test_core_tunnel_child_authority_poll_failure_fails_closed_and_cleans_up(
     tunnel.close()
 
 
+def test_core_tunnel_verify_authority_failure_permanently_poisons_endpoint(
+    tmp_path: Path,
+) -> None:
+    class RecoverableAuthorityProcess(FakeTunnelProcess):
+        authority_fails = False
+        cleanup_fails = True
+
+        def poll(self) -> int | None:
+            if self.authority_fails:
+                raise OSError("authority probe failed")
+            return None if self.cleanup_fails else super().poll()
+
+        def terminate(self) -> None:
+            self.terminated = True
+            if not self.cleanup_fails:
+                self.return_code = -15
+
+        def wait(self, timeout: float | None = None) -> int:
+            self.waited = True
+            if self.cleanup_fails:
+                raise subprocess.TimeoutExpired("ssh", timeout)
+            assert self.return_code is not None
+            return self.return_code
+
+        def kill(self) -> None:
+            self.killed = True
+            if not self.cleanup_fails:
+                self.return_code = -9
+
+    process = RecoverableAuthorityProcess()
+    starts = 0
+
+    def start(_argv: list[str], _stream_fd: int) -> FakeTunnelProcess:
+        nonlocal starts
+        starts += 1
+        return process
+
+    tunnel = _transport(
+        tmp_path,
+        core_connection_starter=start,
+    ).open_core_tunnel(remote_port=8765)
+    connection = tunnel.open_verified_socket(timeout_seconds=1.0)
+    connection.close()
+    process.authority_fails = True
+
+    with pytest.raises(SshTransportError) as rejected:
+        tunnel.verify_authority()
+
+    assert rejected.value.code is SshTransportErrorCode.CONNECTION_FAILED
+    assert process.terminated is True
+    assert process.waited is True
+    assert process.killed is True
+    assert tunnel._endpoint._close_requested is True
+    assert id(tunnel._endpoint) in ssh_module._ORPHANED_CORE_TUNNELS
+
+    process.authority_fails = False
+    with pytest.raises(SshTransportError) as poisoned:
+        tunnel.open_verified_socket(timeout_seconds=1.0)
+
+    assert poisoned.value.code is SshTransportErrorCode.CONNECTION_FAILED
+    assert starts == 1
+
+    process.cleanup_fails = False
+    ssh_module._retry_orphaned_tunnel_cleanup()
+    assert tunnel.closed is True
+    assert id(tunnel._endpoint) not in ssh_module._ORPHANED_CORE_TUNNELS
+
+
 def test_core_tunnel_identity_failure_poisons_endpoint_when_child_exit_is_unconfirmed(
     tmp_path: Path,
 ) -> None:
@@ -1241,6 +1309,222 @@ def test_core_tunnel_identity_failure_poisons_endpoint_when_child_exit_is_unconf
     finally:
         replacement_local.close()
         replacement_peer.close()
+
+
+@pytest.mark.parametrize("closed_side", ["local", "peer"])
+def test_core_tunnel_closed_connection_fd_preserves_typed_failure_and_closes_endpoint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    closed_side: str,
+) -> None:
+    socketpair = socket.socketpair
+    pairs: list[tuple[socket.socket, socket.socket]] = []
+    process = FakeTunnelProcess()
+    starts = 0
+
+    def recording_socketpair(
+        family: socket.AddressFamily,
+        socket_type: socket.SocketKind,
+    ) -> tuple[socket.socket, socket.socket]:
+        streams = socketpair(family, socket_type)
+        pairs.append(streams)
+        return streams
+
+    def close_connection_fd(_argv: list[str], _stream_fd: int) -> FakeTunnelProcess:
+        nonlocal starts
+        starts += 1
+        selected = pairs[-1][0 if closed_side == "local" else 1]
+        os.close(selected.fileno())
+        return process
+
+    monkeypatch.setattr(ssh_module.socket, "socketpair", recording_socketpair)
+    tunnel = _transport(
+        tmp_path,
+        core_connection_starter=close_connection_fd,
+    ).open_core_tunnel(remote_port=8765)
+    try:
+        with pytest.raises(SshTransportError) as rejected:
+            tunnel.open_verified_socket(timeout_seconds=1.0)
+
+        assert rejected.value.code is SshTransportErrorCode.CONNECTION_FAILED
+        assert rejected.value.__cause__ is None
+        assert rejected.value.__context__ is None
+        assert process.terminated is True
+        assert process.waited is True
+        assert tunnel.closed is True
+
+        with pytest.raises(SshTransportError) as closed:
+            tunnel.open_verified_socket(timeout_seconds=1.0)
+
+        assert closed.value.code is SshTransportErrorCode.CONNECTION_FAILED
+        assert starts == 1
+    finally:
+        if not tunnel.closed:
+            tunnel.close()
+        for streams in pairs:
+            for stream in streams:
+                try:
+                    stream.close()
+                except OSError:
+                    pass
+
+
+def test_core_tunnel_poisons_before_dual_close_failures_and_concurrent_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class RecoverableProcess(FakeTunnelProcess):
+        cleanup_fails = True
+
+        def poll(self) -> int | None:
+            return None if self.cleanup_fails else super().poll()
+
+        def terminate(self) -> None:
+            self.terminated = True
+            if not self.cleanup_fails:
+                self.return_code = -15
+
+        def wait(self, timeout: float | None = None) -> int:
+            self.waited = True
+            if self.cleanup_fails:
+                raise subprocess.TimeoutExpired("ssh", timeout)
+            assert self.return_code is not None
+            return self.return_code
+
+        def kill(self) -> None:
+            self.killed = True
+            if not self.cleanup_fails:
+                self.return_code = -9
+
+    class PausingCloseSocket:
+        def __init__(self, stream: socket.socket, side: str) -> None:
+            self._stream = stream
+            self._side = side
+
+        def __getattr__(self, name: str) -> object:
+            return getattr(self._stream, name)
+
+        def close(self) -> None:
+            close_calls[self._side] += 1
+            if self._side == "local":
+                local_close_started.set()
+                release_local_close.wait(timeout=5)
+            try:
+                self._stream.close()
+            except OSError:
+                close_failures[self._side] += 1
+                raise
+            close_failures[self._side] += 1
+            raise OSError(errno.EBADF, "injected closed socket")
+
+    socketpair = socket.socketpair
+    raw_pairs: list[tuple[socket.socket, socket.socket]] = []
+    close_calls = {"local": 0, "peer": 0}
+    close_failures = {"local": 0, "peer": 0}
+    local_close_started = threading.Event()
+    release_local_close = threading.Event()
+    first_process = RecoverableProcess()
+    later_processes: list[FakeTunnelProcess] = []
+    starts = 0
+
+    def pausing_socketpair(
+        family: socket.AddressFamily,
+        socket_type: socket.SocketKind,
+    ) -> tuple[PausingCloseSocket, PausingCloseSocket]:
+        local_stream, child_stream = socketpair(family, socket_type)
+        raw_pairs.append((local_stream, child_stream))
+        return (
+            PausingCloseSocket(local_stream, "local"),
+            PausingCloseSocket(child_stream, "peer"),
+        )
+
+    def close_both_fds(_argv: list[str], _stream_fd: int) -> FakeTunnelProcess:
+        nonlocal starts
+        starts += 1
+        if starts == 1:
+            local_stream, child_stream = raw_pairs[-1]
+            os.close(local_stream.fileno())
+            os.close(child_stream.fileno())
+            return first_process
+        process = FakeTunnelProcess()
+        later_processes.append(process)
+        return process
+
+    monkeypatch.setattr(ssh_module.socket, "socketpair", pausing_socketpair)
+    tunnel = _transport(
+        tmp_path,
+        core_connection_starter=close_both_fds,
+    ).open_core_tunnel(remote_port=8765)
+    results: dict[str, BaseException | object] = {}
+    first_done = threading.Event()
+    second_done = threading.Event()
+
+    def open_connection(name: str, done: threading.Event) -> None:
+        try:
+            results[name] = tunnel.open_verified_socket(timeout_seconds=1.0)
+        except BaseException as exc:
+            results[name] = exc
+        finally:
+            done.set()
+
+    first = threading.Thread(target=open_connection, args=("first", first_done))
+    second = threading.Thread(target=open_connection, args=("second", second_done))
+    try:
+        first.start()
+        assert local_close_started.wait(timeout=2)
+        second.start()
+        second_rejected_during_cleanup = second_done.wait(timeout=2)
+        release_local_close.set()
+        first.join(timeout=5)
+        second.join(timeout=5)
+
+        assert second_rejected_during_cleanup is True
+        assert first_done.is_set()
+        assert second_done.is_set()
+        assert isinstance(results["first"], SshTransportError)
+        assert results["first"].code is SshTransportErrorCode.CONNECTION_FAILED
+        assert results["first"].__cause__ is None
+        assert results["first"].__context__ is None
+        assert isinstance(results["second"], SshTransportError)
+        assert results["second"].code is SshTransportErrorCode.CONNECTION_FAILED
+        assert starts == 1
+        assert later_processes == []
+        assert close_calls == {"local": 1, "peer": 1}
+        assert close_failures == {"local": 1, "peer": 1}
+        assert first_process.terminated is True
+        assert first_process.waited is True
+        assert first_process.killed is True
+        assert tunnel._endpoint._close_requested is True
+        assert id(tunnel._endpoint) in ssh_module._ORPHANED_CORE_TUNNELS
+        assert tunnel.closed is False
+
+        first_process.cleanup_fails = False
+        ssh_module._retry_orphaned_tunnel_cleanup()
+        assert tunnel.closed is True
+        assert id(tunnel._endpoint) not in ssh_module._ORPHANED_CORE_TUNNELS
+    finally:
+        release_local_close.set()
+        first.join(timeout=5)
+        if second.ident is not None:
+            second.join(timeout=5)
+        for result in results.values():
+            if isinstance(result, PausingCloseSocket):
+                try:
+                    result.close()
+                except OSError:
+                    pass
+        first_process.cleanup_fails = False
+        if not tunnel.closed:
+            try:
+                tunnel.close()
+            except BaseException:
+                pass
+        for local_stream, child_stream in raw_pairs:
+            for stream in (local_stream, child_stream):
+                try:
+                    stream.close()
+                except OSError:
+                    pass
 
 
 def test_core_connection_subprocess_passes_only_peer_fd_to_exact_ssh_child(

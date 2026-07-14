@@ -15,7 +15,7 @@ from collections.abc import Callable
 from contextlib import AbstractContextManager
 from enum import Enum
 from pathlib import Path
-from typing import Protocol
+from typing import NoReturn, Protocol
 
 from pydantic import SecretStr
 
@@ -107,18 +107,35 @@ class _CoreTunnelEndpoint:
 
     def verify_authority(self, *, timeout_seconds: float = 1.0) -> None:
         del timeout_seconds
+        failure: BaseException | None = None
         with self._guard:
-            self._verify_locked()
+            if self._close_requested or self._finalized.is_set():
+                raise SshTransportError(SshTransportErrorCode.CONNECTION_FAILED)
+            try:
+                self._verify_locked()
+                return
+            except BaseException as exc:
+                failure = exc
+                self._poison_locked()
+        if failure is None:
+            raise SshTransportError(SshTransportErrorCode.CONNECTION_FAILED)
+        self._finish_failed_operation(failure)
 
     def open_verified_socket(self, *, timeout_seconds: float) -> socket.socket:
         if not 0 < timeout_seconds <= 60:
             raise SshTransportError(SshTransportErrorCode.INVALID_REQUEST)
+        local_stream: socket.socket | None = None
+        child_stream: socket.socket | None = None
+        failure: BaseException | None = None
         with self._guard:
-            self._verify_locked()
-            local_stream, child_stream = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
-            process: TunnelProcess | None = None
-            generation: int | None = None
+            if self._close_requested or self._finalized.is_set():
+                raise SshTransportError(SshTransportErrorCode.CONNECTION_FAILED)
             try:
+                self._verify_locked()
+                local_stream, child_stream = socket.socketpair(
+                    socket.AF_UNIX,
+                    socket.SOCK_STREAM,
+                )
                 local_identity = _require_parent_owned_stream(local_stream)
                 child_identity = _require_parent_owned_stream(child_stream)
                 local_stream.settimeout(timeout_seconds)
@@ -146,19 +163,40 @@ class _CoreTunnelEndpoint:
                 )
                 return local_stream
             except BaseException as exc:
-                local_stream.close()
-                child_stream.close()
-                if process is not None and generation is not None:
-                    exited, _failure = _terminate_tunnel_process(process)
-                    if exited:
-                        self._children.pop(generation, None)
-                    else:
-                        self._close_requested = True
-                        self._retain_orphan()
-                if isinstance(exc, Exception):
-                    _log_transport_failure(SshTransportErrorCode.CONNECTION_FAILED)
-                    raise SshTransportError(SshTransportErrorCode.CONNECTION_FAILED) from None
-                raise
+                failure = exc
+                self._poison_locked()
+        if failure is None:
+            raise SshTransportError(SshTransportErrorCode.CONNECTION_FAILED)
+        self._finish_failed_operation(
+            failure,
+            streams=(local_stream, child_stream),
+        )
+
+    def _poison_locked(self) -> None:
+        self._close_requested = True
+        self._retain_orphan()
+
+    def _finish_failed_operation(
+        self,
+        failure: BaseException,
+        *,
+        streams: tuple[socket.socket | None, ...] = (),
+    ) -> NoReturn:
+        for stream in streams:
+            if stream is None:
+                continue
+            try:
+                stream.close()
+            except BaseException:
+                _log_transport_failure(SshTransportErrorCode.CONNECTION_FAILED)
+        try:
+            self.close()
+        except BaseException:
+            _log_transport_failure(SshTransportErrorCode.CONNECTION_FAILED)
+        if isinstance(failure, Exception):
+            _log_transport_failure(SshTransportErrorCode.CONNECTION_FAILED)
+            raise SshTransportError(SshTransportErrorCode.CONNECTION_FAILED) from None
+        raise failure
 
     @property
     def closed(self) -> bool:
