@@ -390,6 +390,31 @@ Provider and request-validation failures are normalized by `release_app.py`.
 Error responses must remain user-safe: do not include local paths, SQLite
 messages, credentials, session tokens, remote commands, or backend URLs.
 
+## Desktop Local event broker
+
+`event_broker_v1.py` is the process-owned publication authority for the Local
+`GET /desktop/v1/events` SSE route. Producers publish only the closed
+`StateEventV1`, `ResourceEventV1`, or `HeartbeatEventV1` models. The broker adds
+one monotonic JavaScript-safe sequence, a sequence-bound opaque event ID, the
+canonical event name, and a UTC timestamp before serializing the frozen
+`EventEnvelopeV1` contract. A rejected timestamp, model, identity, or oversized
+SSE frame consumes neither sequence authority nor replay capacity.
+
+The retained ledger and every subscriber queue are independently bounded. A
+subscription with no `Last-Event-ID` starts at the live head; an exact retained
+cursor replays only later records and registers for live delivery under the
+same lock. Unknown, evicted, or too-old cursors fail synchronously before the
+stream response starts. A subscriber that cannot keep up receives a terminal
+gap rather than a non-contiguous stream. Idle streams emit an SSE comment every
+15 seconds, which carries no sequence or replay authority. Closing the broker
+atomically prevents publication and terminates all existing subscriptions.
+
+This module does not infer resource state or cache partial Core payloads. The
+release composition remains responsible for mapping validated Core events to
+ETag/digest-bound Local invalidations and for publishing Desktop-owned state and
+operation changes. The renderer responds to those invalidations by reloading
+the authoritative resource snapshot.
+
 ## Core Control API v1 Client
 
 `core_client_v1.py` is the strict post-bootstrap transport from the Desktop
