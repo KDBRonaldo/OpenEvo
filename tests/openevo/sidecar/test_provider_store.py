@@ -1297,7 +1297,7 @@ def test_store_accepts_contract_valid_aggregate_method_configs(tmp_path: Path) -
                 "method": f"plugin.future.{index}",
                 "config": {"content": "x" * 250_000},
             }
-            for index in range(5)
+            for index in range(4)
         }
     }
     validated = ProjectCreateV1.model_validate(project)
@@ -1360,7 +1360,13 @@ def test_startup_atomically_converges_interrupted_operations_and_resources(
     recovered_operation = reopened.get_local_operation(operation.operation_id)
     assert recovered_profile.connection_state == "disconnected"
     assert recovered_project.state == "draft"
-    assert recovered_project.current_revision_id is None
+    with reopened._transaction(write=False) as connection:
+        persisted_revision = connection.execute(
+            "SELECT current_revision_id FROM projects WHERE project_id = ?",
+            (project.project_id,),
+        ).fetchone()
+    assert persisted_revision is not None
+    assert persisted_revision[0] is None
     assert recovered_operation.state == "cancelled"
     assert recovered_operation.finished_at is not None
     assert recovered_operation.result == ConnectionOperationResultV1(

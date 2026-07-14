@@ -161,11 +161,9 @@ change host, port, user, authentication kind, or proxy settings. This prevents
 persisted configuration from diverging from the process-owned session that was
 admitted from it.
 
-Project evolution config is accepted exactly to the aggregate range currently
-accepted by `ProjectCreateV1`/`ProjectPatchV1`; the store adds no per-project
-method-config aggregate limit. The Local contract work tracked separately must
-add any future aggregate budget to those authoritative models first, after
-which the store can consume the same exported bound rather than define one.
+Project evolution config is accepted exactly to the aggregate range enforced
+by `ProjectCreateV1`/`ProjectPatchV1`; the store consumes that authoritative
+contract budget and adds no divergent per-project method-config limit.
 
 List routes use `limit` (maximum 100), `after`, `sort`, and `direction`, and
 return `{items, next_cursor, has_more}`. A cursor is bound to the filters and

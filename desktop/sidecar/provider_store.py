@@ -2133,7 +2133,6 @@ class DesktopProviderStore:
             **document,
             "project_id": row["project_id"],
             "state": row["state"],
-            "current_revision_id": row["current_revision_id"],
             "etag": self._etag("project", row["project_id"], row["resource_version"]),
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
