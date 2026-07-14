@@ -132,6 +132,11 @@ cannot subsequently adopt.
 Every JSON model is closed: unknown fields are errors. IDs are opaque UTF-8
 strings and must never be parsed for host paths or implementation identity.
 Timestamps are UTC RFC 3339 strings. Digests are lowercase SHA-256 hex.
+JSON arrays are the wire representation for ordered collection fields even when
+the sidecar keeps the validated value as an immutable Python tuple. Request
+validation may normalize an actual decoded JSON list to that tuple, but must
+reject strings, mappings, scalars, and other container types instead of coercing
+them into an array.
 
 Every error uses `ApiErrorV1`:
 
@@ -435,7 +440,10 @@ default omitted capture fields to `capture_mode="transcript"` and
 `token_level_metrics_available=false`. Subscription execution carries only
 `codex_model`; self-deployed execution carries only the bounded, trimmed
 user-provided Hugging Face `hf_model`. The sidecar maps `hf_model` to Core's
-stable `agent_model_ref` boundary.
+stable `agent_model_ref` boundary. `proxy.no_proxy` follows the common ordered
+collection rule: React sends a JSON array, the request boundary validates each
+bounded string and stores an immutable tuple, and responses serialize it back
+to an array.
 
 PATCH request properties are optional but not nullable: omission means the
 stored value is unchanged, while an explicit top-level `null` is invalid.

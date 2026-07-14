@@ -206,6 +206,68 @@ def _create_profile(client: TestClient, *, name: str, key: str):
     )
 
 
+def test_profile_create_accepts_json_array_for_no_proxy(tmp_path: Path) -> None:
+    app = _app(tmp_path / "state")
+    request = {
+        "name": "Exhibition GPU server",
+        "host": "127.0.0.1",
+        "port": 22472,
+        "user": "root",
+        "authentication_kind": "ssh_agent",
+        "proxy": {
+            "http_url": None,
+            "https_url": None,
+            "no_proxy": ["127.0.0.1", "localhost"],
+        },
+    }
+
+    with TestClient(app) as client:
+        created = client.post(
+            "/desktop/v1/profiles",
+            headers={
+                **SESSION_HEADERS,
+                "Idempotency-Key": "profile-create-json-array-0001",
+            },
+            json=request,
+        )
+        assert created.status_code == 201
+        response = client.patch(
+            f"/desktop/v1/profiles/{created.json()['profile_id']}",
+            headers={**SESSION_HEADERS, "If-Match": created.json()["etag"]},
+            json={"proxy": {**request["proxy"], "no_proxy": ["compute.internal"]}},
+        )
+
+    assert created.json()["proxy"]["no_proxy"] == ["127.0.0.1", "localhost"]
+    assert response.status_code == 200
+    assert response.json()["proxy"]["no_proxy"] == ["compute.internal"]
+
+
+@pytest.mark.parametrize("no_proxy", ["localhost", {"host": "localhost"}, 1, True])
+def test_profile_create_rejects_non_array_no_proxy(
+    tmp_path: Path, no_proxy: object
+) -> None:
+    app = _app(tmp_path / "state")
+    request = _profile()
+    request["proxy"] = {
+        "http_url": None,
+        "https_url": None,
+        "no_proxy": no_proxy,
+    }
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/desktop/v1/profiles",
+            headers={
+                **SESSION_HEADERS,
+                "Idempotency-Key": "profile-create-invalid-array-0001",
+            },
+            json=request,
+        )
+
+    assert response.status_code == 422
+    assert response.json()["code"] == "contract_validation_failed"
+
+
 def test_project_create_rejects_an_unregistered_native_workspace_reference(
     tmp_path: Path,
 ) -> None:
