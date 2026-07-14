@@ -88,6 +88,16 @@ status. Replaying the same request returns the same result; reusing the key for
 a different request returns `409 idempotency_key_reused`. Mutable resources use
 ETag and `If-Match`.
 
+The release sidecar stores Local API v1 profiles, project drafts, and bounded
+idempotency records in its versioned SQLite provider store. The private state
+root is a real owner-only `0700` directory; the database and cursor-signing
+side file are regular owner-only `0600` files. Resource and idempotency writes
+commit in one transaction. The store persists only closed Local API fields: it
+does not persist native credential references or secrets, host paths, commands,
+raw process output, Core URLs, or bearer/session tokens. Idempotency responses
+are retained for a bounded seven-day replay window and the live record count is
+bounded; exhaustion fails closed without evicting an unexpired replay.
+
 List routes use `limit` (maximum 100), `after`, `sort`, and `direction`, and
 return `{items, next_cursor, has_more}`. A cursor is bound to the filters and
 sort order. `has_more` is true if and only if `next_cursor` is non-null. Invalid
