@@ -1,0 +1,2641 @@
+from __future__ import annotations
+
+import base64
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
+import ctypes
+from dataclasses import dataclass
+from datetime import datetime, timezone
+import errno
+import fcntl
+from hashlib import sha256
+import hmac
+import json
+import os
+from pathlib import Path
+import re
+import secrets
+import sqlite3
+import stat
+import struct
+import sys
+import threading
+from typing import Any, Literal, TypeVar, cast
+import unicodedata
+
+from pydantic import BaseModel, ValidationError
+
+from desktop.sidecar.contracts.v1.models import (
+    ApiErrorV1,
+    ConnectionOperationResultV1,
+    CredentialSlotStatusV1,
+    LocalOperationResultV1,
+    LocalOperationV1,
+    NormalizedCheckV1,
+    OperationProgressV1,
+    ProjectCreateV1,
+    ProjectOperationResultV1,
+    ProjectPageV1,
+    ProjectPatchV1,
+    ProjectV1,
+    RemoteProfileCreateV1,
+    RemoteProfilePageV1,
+    RemoteProfilePatchV1,
+    RemoteProfileV1,
+    ResourceRefV1,
+)
+
+
+SCHEMA_VERSION = 2
+DATABASE_FILENAME = "provider.sqlite3"
+JOURNAL_FILENAME = f"{DATABASE_FILENAME}-journal"
+WAL_FILENAME = f"{DATABASE_FILENAME}-wal"
+SHM_FILENAME = f"{DATABASE_FILENAME}-shm"
+OWNER_LOCK_FILENAME = "provider.lock"
+CURSOR_KEY_FILENAME = "cursor-signing.key"
+LOCAL_PRINCIPAL = "desktop-local-v1"
+MAX_DOCUMENT_BYTES = 136_314_880
+MAX_REQUEST_BYTES = MAX_DOCUMENT_BYTES
+MAX_RESPONSE_BYTES = MAX_DOCUMENT_BYTES
+MAX_CURSOR_BYTES = 2_048
+MAX_RENDERED_CURSOR_BYTES = 256
+MAX_IDEMPOTENCY_KEY_BYTES = 256
+MAX_IDENTITY_BYTES = 512
+MAX_DATABASE_BYTES = 536_870_912
+MAX_JOURNAL_BYTES = 1_073_741_824
+MAX_RECOVERY_ROWS = 100_000
+MAX_RECOVERY_BYTES = 402_653_184
+MAX_SCHEMA_OBJECTS = 40
+MAX_SCHEMA_BYTES = 98_304
+STARTUP_OPERATION_BATCH_ROWS = 128
+MAX_STARTUP_OPERATION_ROW_BYTES = MAX_DOCUMENT_BYTES + 16_384
+DEFAULT_IDEMPOTENCY_RECORD_LIMIT = 10_000
+DEFAULT_CURSOR_RECORD_LIMIT = 10_000
+DEFAULT_IDEMPOTENCY_RETENTION_SECONDS = 7 * 24 * 60 * 60
+DEFAULT_CURSOR_TTL_SECONDS = 15 * 60
+
+_RESOURCE_ID_BYTES = 32
+_CURSOR_KEY_BYTES = 32
+_CURSOR_NONCE_BYTES = 16
+_CURSOR_TOKEN_VERSION = 1
+_CURSOR_TOKEN = struct.Struct(">BQQ32s16s")
+_CURSOR_KEY_TEMP_PREFIX = f".{CURSOR_KEY_FILENAME}.tmp-"
+_RENAME_NOREPLACE = 1
+_RENAME_EXCL = 0x00000004
+_ETAG_RE = re.compile(r'^"[0-9a-f]{64}"$')
+_B64_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
+_TIMESTAMP_RE = re.compile(
+    r"^\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])"
+    r"T(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d\.\d{6}Z$"
+)
+_OPERATION_KINDS = {
+    "profile_connect",
+    "profile_disconnect",
+    "host_key_accept",
+    "project_activate",
+    "project_doctor",
+    "project_repair",
+    "bootstrap",
+    "workspace_sync",
+    "service_restart",
+    "service_stop",
+    "diagnostics",
+    "cache_cleanup",
+}
+_OPERATION_STATES = {"queued", "running", "succeeded", "failed", "cancelling", "cancelled"}
+_PERSISTENCE_DENIED_CONFIG_KEYS = {
+    "apikey",
+    "apitoken",
+    "authorization",
+    "bearertoken",
+    "clientsecret",
+    "credential",
+    "credentials",
+    "credentialslot",
+    "filesystempath",
+    "hostpath",
+    "homedir",
+    "homedirectory",
+    "keychainslot",
+    "localpath",
+    "password",
+    "passwd",
+    "privatekey",
+    "processoutput",
+    "processstderr",
+    "processstdout",
+    "rawdiagnostic",
+    "rawdiagnostics",
+    "rawlog",
+    "rawlogs",
+    "refreshtoken",
+    "secret",
+    "secretkey",
+    "sessiontoken",
+    "sshkey",
+    "stacktrace",
+    "stderr",
+    "stdout",
+    "token",
+    "traceback",
+    "workingdirectory",
+    "workdir",
+}
+_PERSISTENCE_DENIED_CONFIG_SUFFIXES = tuple(sorted(_PERSISTENCE_DENIED_CONFIG_KEYS))
+_ALLOWED_PROJECT_CONFIG_PATH_KEYS = {"targetpath"}
+_SECRET_KEY_SUFFIXES = (
+    "apikey",
+    "credential",
+    "credentials",
+    "password",
+    "passwd",
+    "privatekey",
+    "secret",
+    "token",
+)
+_PROFILE_OPERATION_KINDS = {"profile_connect", "profile_disconnect", "host_key_accept"}
+_PROJECT_OPERATION_KINDS = {"project_activate", "project_doctor", "project_repair"}
+
+
+def _rename_noreplace(source: str, destination: str, *, directory_fd: int) -> None:
+    libc = ctypes.CDLL(None, use_errno=True)
+    if sys.platform == "linux":
+        rename = getattr(libc, "renameat2", None)
+        flags = _RENAME_NOREPLACE
+    elif sys.platform == "darwin":
+        rename = getattr(libc, "renameatx_np", None)
+        flags = _RENAME_EXCL
+    else:
+        rename = None
+        flags = 0
+    if rename is None:
+        raise OSError(errno.ENOSYS, "atomic no-replace rename is unavailable")
+    rename.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    rename.restype = ctypes.c_int
+    result = rename(
+        directory_fd,
+        os.fsencode(source),
+        directory_fd,
+        os.fsencode(destination),
+        flags,
+    )
+    if result != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), destination)
+
+
+class ProviderStoreError(Exception):
+    """Base class for local provider persistence failures."""
+
+
+class ProviderStateRootError(ProviderStoreError):
+    """The private provider state root or one of its files is unsafe."""
+
+
+class ProviderSchemaError(ProviderStoreError):
+    """The SQLite schema cannot be safely opened or migrated."""
+
+
+class ProviderDataCorruptionError(ProviderStoreError):
+    """Persisted provider data no longer satisfies its closed contract."""
+
+
+class ContractValidationError(ProviderStoreError):
+    """A caller supplied data that does not satisfy a Desktop v1 model."""
+
+
+class ResourceNotFoundError(ProviderStoreError):
+    def __init__(self, resource_type: str, resource_id: str) -> None:
+        super().__init__(f"{resource_type} resource was not found")
+        self.resource_type = resource_type
+        self.resource_id = resource_id
+
+
+class ResourceInUseError(ProviderStoreError):
+    def __init__(self, resource_type: str, resource_id: str) -> None:
+        super().__init__(f"{resource_type} resource is active or in use")
+        self.resource_type = resource_type
+        self.resource_id = resource_id
+
+
+class ETagConflictError(ProviderStoreError):
+    def __init__(self, resource_type: str, resource_id: str, current_etag: str) -> None:
+        super().__init__(f"{resource_type} resource ETag does not match")
+        self.resource_type = resource_type
+        self.resource_id = resource_id
+        self.current_etag = current_etag
+
+
+class IdempotencyConflictError(ProviderStoreError):
+    """An idempotency key was reused with a different canonical request."""
+
+
+class IdempotencyCapacityError(ProviderStoreError):
+    """The bounded live idempotency record capacity is exhausted."""
+
+
+class CursorInvalidError(ProviderStoreError):
+    """A cursor is malformed, tampered with, or bound to another query."""
+
+
+class CursorExpiredError(ProviderStoreError):
+    """A valid provider cursor is outside its bounded replay window."""
+
+
+@dataclass(frozen=True)
+class IdempotencyResult:
+    status_code: int
+    response_bytes: bytes
+    replayed: bool
+
+
+_ModelT = TypeVar("_ModelT", bound=BaseModel)
+_Direction = Literal["asc", "desc"]
+
+
+_SCHEMA_V1 = (
+    """
+    CREATE TABLE schema_migrations (
+        version INTEGER PRIMARY KEY CHECK (version = 1),
+        applied_at TEXT NOT NULL CHECK (length(CAST(applied_at AS BLOB)) = 27)
+    ) STRICT
+    """,
+    """
+    CREATE TABLE remote_profiles (
+        profile_id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        document_json BLOB NOT NULL,
+        connection_state TEXT NOT NULL,
+        credential_slots_json BLOB NOT NULL,
+        host_key_fingerprint TEXT,
+        resource_version INTEGER NOT NULL CHECK (resource_version >= 1),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    ) STRICT
+    """,
+    """
+    CREATE TABLE projects (
+        project_id TEXT PRIMARY KEY,
+        profile_id TEXT NOT NULL,
+        name TEXT NOT NULL,
+        document_json BLOB NOT NULL,
+        state TEXT NOT NULL,
+        current_revision_id TEXT,
+        resource_version INTEGER NOT NULL CHECK (resource_version >= 1),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        FOREIGN KEY (profile_id) REFERENCES remote_profiles(profile_id) ON DELETE RESTRICT
+    ) STRICT
+    """,
+    """
+    CREATE TABLE idempotency_records (
+        principal TEXT NOT NULL,
+        method TEXT NOT NULL,
+        route TEXT NOT NULL,
+        resource_scope TEXT NOT NULL,
+        idempotency_key TEXT NOT NULL,
+        request_digest TEXT NOT NULL,
+        response_type TEXT NOT NULL,
+        status_code INTEGER NOT NULL CHECK (status_code BETWEEN 100 AND 599),
+        response_bytes BLOB NOT NULL,
+        created_at_epoch INTEGER NOT NULL,
+        expires_at_epoch INTEGER NOT NULL,
+        PRIMARY KEY (principal, method, route, resource_scope, idempotency_key),
+        CHECK (principal = 'desktop-local-v1'),
+        CHECK (length(CAST(method AS BLOB)) BETWEEN 1 AND 512),
+        CHECK (length(CAST(route AS BLOB)) BETWEEN 1 AND 512),
+        CHECK (length(CAST(resource_scope AS BLOB)) BETWEEN 1 AND 512),
+        CHECK (length(CAST(idempotency_key AS BLOB)) BETWEEN 16 AND 256),
+        CHECK (length(request_digest) = 64),
+        CHECK (response_type IN ('ProjectV1', 'RemoteProfileV1')),
+        CHECK (length(response_bytes) <= 136314880),
+        CHECK (expires_at_epoch > created_at_epoch)
+    ) STRICT
+    """,
+    "CREATE INDEX remote_profiles_updated_idx ON remote_profiles(updated_at, profile_id)",
+    "CREATE INDEX remote_profiles_created_idx ON remote_profiles(created_at, profile_id)",
+    "CREATE INDEX remote_profiles_name_idx ON remote_profiles(name, profile_id)",
+    "CREATE INDEX projects_updated_idx ON projects(updated_at, project_id)",
+    "CREATE INDEX projects_created_idx ON projects(created_at, project_id)",
+    "CREATE INDEX projects_name_idx ON projects(name, project_id)",
+    "CREATE INDEX projects_profile_idx ON projects(profile_id, project_id)",
+    "CREATE UNIQUE INDEX projects_single_active_idx ON projects((1)) WHERE state = 'active'",
+    "CREATE INDEX idempotency_expiry_idx ON idempotency_records(expires_at_epoch)",
+)
+
+_SCHEMA_V2 = (
+    """
+    CREATE TABLE schema_migrations (
+        version INTEGER PRIMARY KEY CHECK (version BETWEEN 1 AND 2),
+        applied_at TEXT NOT NULL CHECK (length(CAST(applied_at AS BLOB)) = 27)
+    ) STRICT
+    """,
+    _SCHEMA_V1[1],
+    _SCHEMA_V1[2],
+    """
+    CREATE TABLE local_operations (
+        operation_id TEXT PRIMARY KEY,
+        operation_kind TEXT NOT NULL,
+        state TEXT NOT NULL,
+        resource_type TEXT NOT NULL,
+        resource_id TEXT NOT NULL,
+        document_json BLOB NOT NULL,
+        resource_version INTEGER NOT NULL CHECK (resource_version >= 1),
+        created_at TEXT NOT NULL,
+        finished_at TEXT,
+        CHECK (operation_kind IN (
+            'profile_connect', 'profile_disconnect', 'host_key_accept',
+            'project_activate', 'project_doctor', 'project_repair', 'bootstrap',
+            'workspace_sync', 'service_restart', 'service_stop', 'diagnostics',
+            'cache_cleanup'
+        )),
+        CHECK (state IN (
+            'queued', 'running', 'succeeded', 'failed', 'cancelling', 'cancelled'
+        )),
+        CHECK (resource_type IN (
+            'profile', 'project', 'operation', 'run', 'artifact', 'service',
+            'diagnostic', 'maintenance'
+        ))
+    ) STRICT
+    """,
+    """
+    CREATE TABLE idempotency_records (
+        principal TEXT NOT NULL,
+        method TEXT NOT NULL,
+        route TEXT NOT NULL,
+        resource_scope TEXT NOT NULL,
+        idempotency_key TEXT NOT NULL,
+        request_digest TEXT NOT NULL,
+        response_type TEXT NOT NULL,
+        status_code INTEGER NOT NULL CHECK (status_code BETWEEN 100 AND 599),
+        response_bytes BLOB NOT NULL,
+        created_at_epoch INTEGER NOT NULL,
+        expires_at_epoch INTEGER NOT NULL,
+        PRIMARY KEY (principal, method, route, resource_scope, idempotency_key),
+        CHECK (principal = 'desktop-local-v1'),
+        CHECK (length(CAST(method AS BLOB)) BETWEEN 1 AND 512),
+        CHECK (length(CAST(route AS BLOB)) BETWEEN 1 AND 512),
+        CHECK (length(CAST(resource_scope AS BLOB)) BETWEEN 1 AND 512),
+        CHECK (length(CAST(idempotency_key AS BLOB)) BETWEEN 16 AND 256),
+        CHECK (length(request_digest) = 64),
+        CHECK (response_type IN ('ProjectV1', 'RemoteProfileV1', 'LocalOperationV1')),
+        CHECK (length(response_bytes) <= 136314880),
+        CHECK (expires_at_epoch > created_at_epoch)
+    ) STRICT
+    """,
+    """
+    CREATE TABLE pagination_cursors (
+        cursor_digest TEXT PRIMARY KEY CHECK (length(cursor_digest) = 64),
+        query_digest TEXT NOT NULL CHECK (length(query_digest) = 64),
+        anchor_id TEXT NOT NULL,
+        anchor_value TEXT NOT NULL,
+        created_at_epoch INTEGER NOT NULL,
+        expires_at_epoch INTEGER NOT NULL,
+        CHECK (length(CAST(anchor_id AS BLOB)) BETWEEN 1 AND 256),
+        CHECK (length(CAST(anchor_value AS BLOB)) <= 4096),
+        CHECK (expires_at_epoch > created_at_epoch)
+    ) STRICT
+    """,
+    *_SCHEMA_V1[4:12],
+    "CREATE INDEX local_operations_resource_idx ON local_operations(resource_type, resource_id)",
+    "CREATE INDEX local_operations_state_idx ON local_operations(state, operation_id)",
+    _SCHEMA_V1[12],
+    "CREATE INDEX pagination_cursors_expiry_idx ON pagination_cursors(expires_at_epoch)",
+)
+
+
+def _schema_rows(connection: sqlite3.Connection) -> tuple[tuple[object, ...], ...]:
+    count, byte_count = connection.execute(
+        """
+        SELECT count(*), coalesce(sum(
+            length(CAST(type AS BLOB)) + length(CAST(name AS BLOB)) +
+            length(CAST(tbl_name AS BLOB)) + coalesce(length(CAST(sql AS BLOB)), 0)
+        ), 0)
+        FROM sqlite_schema
+        WHERE name NOT LIKE 'sqlite_%'
+        """
+    ).fetchone()
+    if count > MAX_SCHEMA_OBJECTS or byte_count > MAX_SCHEMA_BYTES:
+        raise ProviderSchemaError("provider schema exceeds its fingerprint bounds")
+    return tuple(
+        tuple(row)
+        for row in connection.execute(
+            """
+            SELECT type, name, tbl_name, sql
+            FROM sqlite_schema
+            WHERE name NOT LIKE 'sqlite_%'
+            ORDER BY type, name, tbl_name
+            """
+        )
+    )
+
+
+def _expected_schema(
+    statements: tuple[str, ...],
+) -> tuple[tuple[tuple[object, ...], ...], str]:
+    connection = sqlite3.connect(":memory:")
+    try:
+        for statement in statements:
+            connection.execute(statement)
+        rows = _schema_rows(connection)
+    finally:
+        connection.close()
+    digest = sha256(_canonical_json_bytes(rows)).hexdigest()
+    return rows, digest
+
+
+def _canonical_json_bytes(value: Any) -> bytes:
+    try:
+        return json.dumps(
+            value,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise ContractValidationError("value is not canonical JSON data") from exc
+
+
+_EXPECTED_SCHEMA_V1_ROWS, _EXPECTED_SCHEMA_V1_DIGEST = _expected_schema(_SCHEMA_V1)
+_EXPECTED_SCHEMA_ROWS, _EXPECTED_SCHEMA_DIGEST = _expected_schema(_SCHEMA_V2)
+
+
+def _decode_json_object(raw: bytes, *, label: str) -> dict[str, Any]:
+    try:
+        value = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ProviderDataCorruptionError(f"stored {label} is not valid JSON") from exc
+    if type(value) is not dict:
+        raise ProviderDataCorruptionError(f"stored {label} is not a JSON object")
+    try:
+        canonical = _canonical_json_bytes(value)
+    except ContractValidationError as exc:
+        raise ProviderDataCorruptionError(f"stored {label} is not canonical JSON") from exc
+    if canonical != raw:
+        raise ProviderDataCorruptionError(f"stored {label} is not canonical JSON")
+    return cast(dict[str, Any], value)
+
+
+def _validate_model(model_type: type[_ModelT], value: object) -> _ModelT:
+    try:
+        return model_type.model_validate(value)
+    except ValidationError as exc:
+        raise ContractValidationError(f"{model_type.__name__} validation failed") from exc
+
+
+def _validate_json_model(model_type: type[_ModelT], value: object) -> _ModelT:
+    try:
+        encoded = _canonical_json_bytes(value)
+        return model_type.model_validate_json(encoded)
+    except (ContractValidationError, ValidationError) as exc:
+        raise ProviderDataCorruptionError(f"stored data violates {model_type.__name__}") from exc
+
+
+class ProviderMutation:
+    """Restricted state changes available inside an idempotent store transaction."""
+
+    __slots__ = ("_connection", "_if_match", "_store")
+
+    def __init__(
+        self,
+        store: DesktopProviderStore,
+        connection: sqlite3.Connection,
+        *,
+        if_match: str | None = None,
+    ) -> None:
+        self._store = store
+        self._connection = connection
+        self._if_match = if_match
+
+    def _require_bound_if_match(self, if_match: str) -> None:
+        if self._if_match is not None and not hmac.compare_digest(self._if_match, if_match):
+            raise ContractValidationError(
+                "action mutation If-Match differs from its idempotency envelope"
+            )
+
+    def set_project_state(
+        self,
+        project_id: str,
+        *,
+        if_match: str,
+        state: Literal["draft", "active", "archived", "blocked"],
+        current_revision_id: str | None = None,
+    ) -> ProjectV1:
+        self._store._validate_resource_id(project_id)
+        self._store._validate_if_match(if_match)
+        self._require_bound_if_match(if_match)
+        if state not in {"draft", "active", "archived", "blocked"}:
+            raise ContractValidationError("project state is not a Desktop v1 state")
+        if current_revision_id is not None:
+            self._store._validate_resource_id(current_revision_id)
+        row = self._store._require_project_row(self._connection, project_id)
+        self._store._require_etag("project", project_id, row, if_match)
+        if state == "active":
+            self._connection.execute(
+                """
+                UPDATE projects
+                SET state = 'draft', current_revision_id = NULL,
+                    resource_version = resource_version + 1, updated_at = ?
+                WHERE state = 'active' AND project_id != ?
+                """,
+                (self._store._timestamp(), project_id),
+            )
+        self._connection.execute(
+            """
+            UPDATE projects
+            SET state = ?, current_revision_id = ?,
+                resource_version = resource_version + 1, updated_at = ?
+            WHERE project_id = ?
+            """,
+            (state, current_revision_id, self._store._timestamp(), project_id),
+        )
+        return self._store._project_from_row(
+            self._store._require_project_row(self._connection, project_id)
+        )
+
+    def set_profile_runtime_state(
+        self,
+        profile_id: str,
+        *,
+        if_match: str,
+        connection_state: Literal[
+            "disconnected",
+            "connecting",
+            "host_key_required",
+            "connected",
+            "failed",
+        ],
+        credential_slots: tuple[CredentialSlotStatusV1, ...],
+        host_key_fingerprint: str | None,
+    ) -> RemoteProfileV1:
+        self._store._validate_resource_id(profile_id)
+        self._store._validate_if_match(if_match)
+        self._require_bound_if_match(if_match)
+        if connection_state not in {
+            "disconnected",
+            "connecting",
+            "host_key_required",
+            "connected",
+            "failed",
+        }:
+            raise ContractValidationError("profile connection state is not a Desktop v1 state")
+        row = self._store._require_profile_row(self._connection, profile_id)
+        self._store._require_etag("profile", profile_id, row, if_match)
+        timestamp = self._store._timestamp()
+        current = self._store._profile_from_row(row)
+        proposed = _validate_model(
+            RemoteProfileV1,
+            {
+                **current.model_dump(mode="python"),
+                "connection_state": connection_state,
+                "credential_slots": credential_slots,
+                "host_key_fingerprint": host_key_fingerprint,
+                "etag": self._store._etag(
+                    "profile", profile_id, cast(int, row["resource_version"]) + 1
+                ),
+                "updated_at": timestamp,
+            },
+        )
+        self._connection.execute(
+            """
+            UPDATE remote_profiles
+            SET connection_state = ?, credential_slots_json = ?,
+                host_key_fingerprint = ?, resource_version = resource_version + 1,
+                updated_at = ?
+            WHERE profile_id = ?
+            """,
+            (
+                connection_state,
+                _canonical_json_bytes(
+                    [slot.model_dump(mode="json") for slot in proposed.credential_slots]
+                ),
+                proposed.host_key_fingerprint,
+                timestamp,
+                profile_id,
+            ),
+        )
+        return self._store._profile_from_row(
+            self._store._require_profile_row(self._connection, profile_id)
+        )
+
+    def create_local_operation(
+        self,
+        *,
+        operation_kind: str,
+        resource: ResourceRefV1,
+        state: Literal["queued", "running", "succeeded", "failed", "cancelling", "cancelled"],
+        progress: OperationProgressV1 | None = None,
+        checks: tuple[NormalizedCheckV1, ...] = (),
+        result: LocalOperationResultV1 | None = None,
+        error: ApiErrorV1 | None = None,
+    ) -> LocalOperationV1:
+        if operation_kind not in _OPERATION_KINDS or state not in _OPERATION_STATES:
+            raise ContractValidationError("local operation kind or state is invalid")
+        operation_id = self._store._new_id()
+        timestamp = self._store._timestamp()
+        terminal = state in {"succeeded", "failed", "cancelled"}
+        operation = _validate_model(
+            LocalOperationV1,
+            {
+                "operation_id": operation_id,
+                "operation_kind": operation_kind,
+                "state": state,
+                "resource": resource,
+                "progress": progress,
+                "checks": checks,
+                "result": result,
+                "error": error,
+                "created_at": timestamp,
+                "started_at": None if state == "queued" else timestamp,
+                "finished_at": timestamp if terminal else None,
+                "etag": self._store._etag("operation", operation_id, 1),
+            },
+        )
+        self._store._validate_operation_authority(self._connection, operation)
+        document = _canonical_json_bytes(operation.model_dump(mode="json"))
+        self._connection.execute(
+            """
+            INSERT INTO local_operations(
+                operation_id, operation_kind, state, resource_type, resource_id,
+                document_json, resource_version, created_at, finished_at
+            ) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)
+            """,
+            (
+                operation.operation_id,
+                operation.operation_kind,
+                operation.state,
+                operation.resource.resource_type,
+                operation.resource.resource_id,
+                document,
+                operation.created_at,
+                operation.finished_at,
+            ),
+        )
+        return operation
+
+    def _create_profile(self, request: RemoteProfileCreateV1) -> RemoteProfileV1:
+        profile_id = self._store._new_id()
+        timestamp = self._store._timestamp()
+        document = _canonical_json_bytes(request.model_dump(mode="json"))
+        self._connection.execute(
+            """
+            INSERT INTO remote_profiles(
+                profile_id, name, document_json, connection_state,
+                credential_slots_json, host_key_fingerprint, resource_version,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, 'disconnected', ?, NULL, 1, ?, ?)
+            """,
+            (profile_id, request.name, document, b"[]", timestamp, timestamp),
+        )
+        return self._store._profile_from_row(
+            self._store._require_profile_row(self._connection, profile_id)
+        )
+
+    def _create_project(self, request: ProjectCreateV1) -> ProjectV1:
+        self._store._require_profile_row(self._connection, request.profile_id)
+        project_id = self._store._new_id()
+        timestamp = self._store._timestamp()
+        self._connection.execute(
+            """
+            INSERT INTO projects(
+                project_id, profile_id, name, document_json, state,
+                current_revision_id, resource_version, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, 'draft', NULL, 1, ?, ?)
+            """,
+            (
+                project_id,
+                request.profile_id,
+                request.name,
+                _canonical_json_bytes(request.model_dump(mode="json")),
+                timestamp,
+                timestamp,
+            ),
+        )
+        return self._store._project_from_row(
+            self._store._require_project_row(self._connection, project_id)
+        )
+
+
+class DesktopProviderStore:
+    """Durable, local-only persistence for Desktop Local API v1 resources."""
+
+    def __init__(
+        self,
+        state_root: Path | str,
+        *,
+        clock: Callable[[], datetime] | None = None,
+        cursor_ttl_seconds: int = DEFAULT_CURSOR_TTL_SECONDS,
+        idempotency_retention_seconds: int = DEFAULT_IDEMPOTENCY_RETENTION_SECONDS,
+        max_idempotency_records: int = DEFAULT_IDEMPOTENCY_RECORD_LIMIT,
+        max_cursor_records: int = DEFAULT_CURSOR_RECORD_LIMIT,
+    ) -> None:
+        self._require_secure_platform()
+        if type(cursor_ttl_seconds) is not int or cursor_ttl_seconds < 1:
+            raise ValueError("cursor_ttl_seconds must be a positive integer")
+        if type(idempotency_retention_seconds) is not int or idempotency_retention_seconds < 1:
+            raise ValueError("idempotency_retention_seconds must be a positive integer")
+        if type(max_idempotency_records) is not int or max_idempotency_records < 1:
+            raise ValueError("max_idempotency_records must be a positive integer")
+        if type(max_cursor_records) is not int or max_cursor_records < 1:
+            raise ValueError("max_cursor_records must be a positive integer")
+
+        self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self._cursor_ttl_seconds = cursor_ttl_seconds
+        self._idempotency_retention_seconds = idempotency_retention_seconds
+        self._max_idempotency_records = max_idempotency_records
+        self._max_cursor_records = max_cursor_records
+        self._closed = False
+        self._transaction_lock = threading.RLock()
+
+        root = Path(os.path.abspath(os.fspath(Path(state_root).expanduser())))
+        self._create_or_validate_root(root)
+        self._state_root = root
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            self._root_fd = os.open(root, flags)
+        except OSError as exc:
+            raise ProviderStateRootError(
+                "provider state root could not be securely opened"
+            ) from exc
+        root_stat = os.fstat(self._root_fd)
+        self._root_identity = (root_stat.st_dev, root_stat.st_ino)
+
+        try:
+            self._ensure_empty_private_file(OWNER_LOCK_FILENAME)
+            self._acquire_owner_lock()
+            self._ensure_empty_private_file(DATABASE_FILENAME)
+            self._cursor_key = self._load_or_create_cursor_key()
+            self._verify_storage_files()
+            self._connection = self._open_database_connection()
+            self._migrate()
+            self._recover_and_validate()
+            self._verify_storage_files()
+        except BaseException:
+            self._close_resources()
+            raise
+
+    @property
+    def database_path(self) -> Path:
+        return self._state_root / DATABASE_FILENAME
+
+    @property
+    def state_root(self) -> Path:
+        return self._state_root
+
+    def close(self) -> None:
+        with self._transaction_lock:
+            if not self._closed:
+                self._close_resources()
+
+    def _close_resources(self) -> None:
+        connection = getattr(self, "_connection", None)
+        if connection is not None:
+            try:
+                connection.close()
+            finally:
+                del self._connection
+        owner_lock_fd = getattr(self, "_owner_lock_fd", None)
+        if owner_lock_fd is not None:
+            try:
+                fcntl.flock(owner_lock_fd, fcntl.LOCK_UN)
+            finally:
+                os.close(owner_lock_fd)
+                del self._owner_lock_fd
+        root_fd = getattr(self, "_root_fd", None)
+        if root_fd is not None:
+            os.close(root_fd)
+            del self._root_fd
+        self._closed = True
+
+    def __enter__(self) -> DesktopProviderStore:
+        self._verify_root()
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        del args
+        self.close()
+
+    def __del__(self) -> None:
+        if getattr(self, "_closed", True) is False:
+            try:
+                self.close()
+            except OSError:
+                pass
+
+    @staticmethod
+    def _require_secure_platform() -> None:
+        if (
+            not hasattr(os, "O_NOFOLLOW")
+            or not hasattr(os, "O_DIRECTORY")
+            or os.open not in os.supports_dir_fd
+            or os.stat not in os.supports_dir_fd
+            or os.stat not in os.supports_follow_symlinks
+        ):
+            raise ProviderStateRootError(
+                "platform lacks no-follow descriptor-relative provider storage"
+            )
+
+    @staticmethod
+    def _create_or_validate_root(root: Path) -> None:
+        try:
+            root_stat = os.lstat(root)
+        except FileNotFoundError:
+            root.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                os.mkdir(root, 0o700)
+            except FileExistsError:
+                root_stat = os.lstat(root)
+            else:
+                os.chmod(root, 0o700, follow_symlinks=False)
+                root_stat = os.lstat(root)
+        if not stat.S_ISDIR(root_stat.st_mode) or stat.S_ISLNK(root_stat.st_mode):
+            raise ProviderStateRootError("provider state root must be a real directory")
+        if hasattr(os, "getuid") and root_stat.st_uid != os.getuid():
+            raise ProviderStateRootError("provider state root must be owned by this user")
+        if stat.S_IMODE(root_stat.st_mode) != 0o700:
+            raise ProviderStateRootError("provider state root mode must be 0700")
+
+    def _verify_root(self) -> None:
+        if self._closed:
+            raise ProviderStateRootError("provider store is closed")
+        try:
+            path_stat = os.lstat(self._state_root)
+            fd_stat = os.fstat(self._root_fd)
+        except OSError as exc:
+            raise ProviderStateRootError("provider state root is unavailable") from exc
+        if (
+            not stat.S_ISDIR(path_stat.st_mode)
+            or stat.S_ISLNK(path_stat.st_mode)
+            or (path_stat.st_dev, path_stat.st_ino) != self._root_identity
+            or (fd_stat.st_dev, fd_stat.st_ino) != self._root_identity
+        ):
+            raise ProviderStateRootError("provider state root identity changed")
+        if hasattr(os, "getuid") and path_stat.st_uid != os.getuid():
+            raise ProviderStateRootError("provider state root ownership changed")
+        if stat.S_IMODE(path_stat.st_mode) != 0o700:
+            raise ProviderStateRootError("provider state root mode changed")
+
+    def _ensure_empty_private_file(self, name: str) -> None:
+        self._verify_root()
+        flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            fd = os.open(name, flags, 0o600, dir_fd=self._root_fd)
+        except FileExistsError:
+            self._verify_private_file(name)
+            return
+        except OSError as exc:
+            raise ProviderStateRootError(f"could not create private provider file {name}") from exc
+        try:
+            os.fchmod(fd, 0o600)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.fsync(self._root_fd)
+
+    def _verify_private_file(self, name: str) -> os.stat_result:
+        self._verify_root()
+        try:
+            file_stat = os.stat(name, dir_fd=self._root_fd, follow_symlinks=False)
+        except OSError as exc:
+            raise ProviderStateRootError(f"private provider file {name} is unavailable") from exc
+        return self._validate_private_file_stat(name, file_stat)
+
+    @staticmethod
+    def _validate_private_file_stat(name: str, file_stat: os.stat_result) -> os.stat_result:
+        if not stat.S_ISREG(file_stat.st_mode) or stat.S_ISLNK(file_stat.st_mode):
+            raise ProviderStateRootError(f"private provider file {name} must be regular")
+        if file_stat.st_nlink != 1:
+            raise ProviderStateRootError(f"private provider file {name} must have one link")
+        if hasattr(os, "getuid") and file_stat.st_uid != os.getuid():
+            raise ProviderStateRootError(f"private provider file {name} has the wrong owner")
+        if stat.S_IMODE(file_stat.st_mode) != 0o600:
+            raise ProviderStateRootError(f"private provider file {name} mode must be 0600")
+        return file_stat
+
+    def _optional_private_file(self, name: str) -> os.stat_result | None:
+        self._verify_root()
+        try:
+            file_stat = os.stat(name, dir_fd=self._root_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise ProviderStateRootError(
+                f"SQLite side file {name} could not be inspected"
+            ) from exc
+        return self._validate_private_file_stat(name, file_stat)
+
+    def _acquire_owner_lock(self) -> None:
+        flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+        expected_stat = self._verify_private_file(OWNER_LOCK_FILENAME)
+        try:
+            descriptor = os.open(OWNER_LOCK_FILENAME, flags, dir_fd=self._root_fd)
+        except OSError as exc:
+            raise ProviderStateRootError("provider owner lock could not be opened") from exc
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            os.close(descriptor)
+            raise ProviderStateRootError(
+                "provider state root is already owned by another process"
+            ) from exc
+        except OSError:
+            os.close(descriptor)
+            raise
+        descriptor_stat = os.fstat(descriptor)
+        if (descriptor_stat.st_dev, descriptor_stat.st_ino) != (
+            expected_stat.st_dev,
+            expected_stat.st_ino,
+        ):
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            os.close(descriptor)
+            raise ProviderStateRootError("provider owner lock identity changed")
+        self._owner_lock_fd = descriptor
+
+    def _open_database_connection(self) -> sqlite3.Connection:
+        self._verify_storage_files()
+        connection = sqlite3.connect(
+            self.database_path,
+            timeout=30,
+            isolation_level=None,
+            check_same_thread=False,
+        )
+        connection.row_factory = sqlite3.Row
+        try:
+            database_rows = connection.execute("PRAGMA database_list").fetchall()
+            if len(database_rows) != 1:
+                raise ProviderStateRootError("SQLite opened an unexpected database set")
+            opened_path = os.path.abspath(cast(str, database_rows[0][2]))
+            if opened_path != os.path.abspath(self.database_path):
+                raise ProviderStateRootError("SQLite opened an unexpected provider database")
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute("PRAGMA busy_timeout = 30000")
+            journal_mode = connection.execute("PRAGMA journal_mode = DELETE").fetchone()[0]
+            if journal_mode != "delete":
+                raise ProviderStateRootError("SQLite rollback journal mode is unavailable")
+            connection.execute("PRAGMA synchronous = FULL")
+            connection.execute("PRAGMA temp_store = MEMORY")
+            connection.execute("PRAGMA trusted_schema = OFF")
+            page_size = cast(int, connection.execute("PRAGMA page_size").fetchone()[0])
+            if page_size < 512 or page_size > 65_536:
+                raise ProviderStateRootError("SQLite page size is outside provider bounds")
+            self._max_page_count = MAX_DATABASE_BYTES // page_size
+            configured_pages = cast(
+                int,
+                connection.execute(f"PRAGMA max_page_count = {self._max_page_count}").fetchone()[
+                    0
+                ],
+            )
+            if configured_pages != self._max_page_count:
+                raise ProviderStateRootError("SQLite max_page_count could not be enforced")
+            self._journal_size_limit = MAX_JOURNAL_BYTES
+            configured_journal = cast(
+                int,
+                connection.execute(
+                    f"PRAGMA journal_size_limit = {self._journal_size_limit}"
+                ).fetchone()[0],
+            )
+            if configured_journal != self._journal_size_limit:
+                raise ProviderStateRootError("SQLite journal_size_limit could not be enforced")
+            self._verify_storage_files()
+        except BaseException:
+            connection.close()
+            raise
+        return connection
+
+    def _load_or_create_cursor_key(self) -> bytes:
+        self._verify_root()
+        try:
+            key_stat = os.stat(
+                CURSOR_KEY_FILENAME,
+                dir_fd=self._root_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            if not self._database_is_never_initialized():
+                raise ProviderStateRootError(
+                    "cursor signing key is missing from an initialized provider store"
+                )
+        except OSError as exc:
+            raise ProviderStateRootError("could not inspect cursor signing key") from exc
+        else:
+            self._validate_private_file_stat(CURSOR_KEY_FILENAME, key_stat)
+            if key_stat.st_size == _CURSOR_KEY_BYTES:
+                return self._read_cursor_key()
+            if not self._database_is_never_initialized():
+                raise ProviderStateRootError("cursor signing key has an invalid size")
+            self._unlink_invalid_cursor_key(key_stat)
+        return self._create_cursor_key()
+
+    def _database_is_never_initialized(self) -> bool:
+        database_stat = self._verify_private_file(DATABASE_FILENAME)
+        if database_stat.st_size != 0:
+            return False
+        return all(
+            self._optional_private_file(name) is None
+            for name in (JOURNAL_FILENAME, WAL_FILENAME, SHM_FILENAME)
+        )
+
+    def _unlink_invalid_cursor_key(self, expected_stat: os.stat_result) -> None:
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(CURSOR_KEY_FILENAME, flags, dir_fd=self._root_fd)
+        except OSError as exc:
+            raise ProviderStateRootError("could not open invalid cursor signing key") from exc
+        try:
+            descriptor_stat = os.fstat(descriptor)
+            if (descriptor_stat.st_dev, descriptor_stat.st_ino) != (
+                expected_stat.st_dev,
+                expected_stat.st_ino,
+            ):
+                raise ProviderStateRootError("cursor signing key identity changed")
+            os.unlink(CURSOR_KEY_FILENAME, dir_fd=self._root_fd)
+        finally:
+            os.close(descriptor)
+
+    def _create_cursor_key(self) -> bytes:
+        key = secrets.token_bytes(_CURSOR_KEY_BYTES)
+        temporary_name = f"{_CURSOR_KEY_TEMP_PREFIX}{secrets.token_hex(16)}"
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+        descriptor: int | None = None
+        try:
+            descriptor = os.open(temporary_name, flags, 0o600, dir_fd=self._root_fd)
+            os.fchmod(descriptor, 0o600)
+            remaining = memoryview(key)
+            while remaining:
+                written = os.write(descriptor, remaining)
+                if written <= 0:
+                    raise OSError(errno.EIO, "cursor signing key write made no progress")
+                remaining = remaining[written:]
+            os.fsync(descriptor)
+            os.close(descriptor)
+            descriptor = None
+            try:
+                _rename_noreplace(
+                    temporary_name,
+                    CURSOR_KEY_FILENAME,
+                    directory_fd=self._root_fd,
+                )
+            except FileExistsError:
+                return self._read_cursor_key()
+            os.fsync(self._root_fd)
+            self._verify_private_file(CURSOR_KEY_FILENAME)
+            return key
+        except ProviderStoreError:
+            raise
+        except OSError as exc:
+            action = "publish" if descriptor is None else "create"
+            raise ProviderStateRootError(
+                f"could not {action} cursor signing key"
+            ) from exc
+        finally:
+            cleanup_error: OSError | None = None
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError as exc:
+                    cleanup_error = exc
+            removed_temporary = False
+            try:
+                os.unlink(temporary_name, dir_fd=self._root_fd)
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                cleanup_error = cleanup_error or exc
+            else:
+                removed_temporary = True
+            if removed_temporary:
+                try:
+                    os.fsync(self._root_fd)
+                except OSError as exc:
+                    cleanup_error = cleanup_error or exc
+            if cleanup_error is not None:
+                raise ProviderStateRootError(
+                    "could not clean up cursor signing key temporary file"
+                ) from cleanup_error
+
+    def _read_cursor_key(self) -> bytes:
+        self._verify_private_file(CURSOR_KEY_FILENAME)
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            fd = os.open(CURSOR_KEY_FILENAME, flags, dir_fd=self._root_fd)
+        except OSError as exc:
+            raise ProviderStateRootError("could not open cursor signing key") from exc
+        try:
+            key = os.read(fd, _CURSOR_KEY_BYTES + 1)
+        finally:
+            os.close(fd)
+        if len(key) != _CURSOR_KEY_BYTES:
+            raise ProviderStateRootError("cursor signing key has an invalid size")
+        return key
+
+    def _verify_storage_files(self) -> None:
+        self._verify_root()
+        for name in (DATABASE_FILENAME, OWNER_LOCK_FILENAME, CURSOR_KEY_FILENAME):
+            self._verify_private_file(name)
+        for name in (JOURNAL_FILENAME, WAL_FILENAME, SHM_FILENAME):
+            self._optional_private_file(name)
+        for name in (WAL_FILENAME, SHM_FILENAME):
+            if self._optional_private_file(name) is not None:
+                raise ProviderStateRootError(f"SQLite side file {name} is forbidden")
+        self._verify_storage_budget()
+
+    def _verify_storage_budget(self) -> None:
+        database_stat = self._verify_private_file(DATABASE_FILENAME)
+        if database_stat.st_size > MAX_DATABASE_BYTES:
+            raise ProviderStateRootError("provider database exceeds its byte budget")
+        journal_stat = self._optional_private_file(JOURNAL_FILENAME)
+        if journal_stat is None:
+            return
+        if journal_stat.st_size > MAX_JOURNAL_BYTES:
+            raise ProviderStateRootError("provider journal exceeds its byte budget")
+
+    def _migrate(self) -> None:
+        connection = self._connection
+        try:
+            connection.execute("BEGIN EXCLUSIVE")
+            version = cast(int, connection.execute("PRAGMA user_version").fetchone()[0])
+            if version == 0:
+                existing = {
+                    row[0]
+                    for row in connection.execute(
+                        "SELECT name FROM sqlite_master WHERE type = 'table'"
+                    )
+                }
+                if existing:
+                    raise ProviderSchemaError("unversioned provider database is not empty")
+                for statement in _SCHEMA_V2:
+                    connection.execute(statement)
+                timestamp = self._timestamp()
+                connection.executemany(
+                    "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+                    ((1, timestamp), (2, timestamp)),
+                )
+                connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+            elif version == 1:
+                self._validate_schema_version(
+                    connection,
+                    rows=_EXPECTED_SCHEMA_V1_ROWS,
+                    digest=_EXPECTED_SCHEMA_V1_DIGEST,
+                    label="v1",
+                )
+                self._migrate_v1_to_v2(connection)
+            elif version != SCHEMA_VERSION:
+                raise ProviderSchemaError(f"unsupported provider schema version {version}")
+            self._validate_schema(connection)
+            self._verify_storage_files()
+            connection.commit()
+        except ProviderStoreError:
+            connection.rollback()
+            raise
+        except sqlite3.DatabaseError as exc:
+            connection.rollback()
+            raise ProviderSchemaError("provider schema migration validation failed") from exc
+        except BaseException:
+            connection.rollback()
+            raise
+        os.fsync(self._root_fd)
+
+    def _migrate_v1_to_v2(self, connection: sqlite3.Connection) -> None:
+        timestamp = self._timestamp()
+        connection.execute("DROP INDEX idempotency_expiry_idx")
+        connection.execute("ALTER TABLE idempotency_records RENAME TO idempotency_records_v1")
+        connection.execute("ALTER TABLE schema_migrations RENAME TO schema_migrations_v1")
+        connection.execute(_SCHEMA_V2[0])
+        connection.execute(_SCHEMA_V2[3])
+        connection.execute(_SCHEMA_V2[4])
+        connection.execute(_SCHEMA_V2[5])
+        connection.execute(
+            """
+            INSERT INTO schema_migrations(version, applied_at)
+            SELECT version, applied_at FROM schema_migrations_v1
+            """
+        )
+        connection.execute(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (2, ?)",
+            (timestamp,),
+        )
+        connection.execute(
+            """
+            INSERT INTO idempotency_records(
+                principal, method, route, resource_scope, idempotency_key,
+                request_digest, response_type, status_code, response_bytes,
+                created_at_epoch, expires_at_epoch
+            )
+            SELECT principal, method, route, resource_scope, idempotency_key,
+                   request_digest, response_type, status_code, response_bytes,
+                   created_at_epoch, expires_at_epoch
+            FROM idempotency_records_v1
+            """
+        )
+        connection.execute("DROP TABLE idempotency_records_v1")
+        connection.execute("DROP TABLE schema_migrations_v1")
+        for statement in _SCHEMA_V2[14:18]:
+            connection.execute(statement)
+        connection.execute("PRAGMA user_version = 2")
+
+    @staticmethod
+    def _validate_schema(connection: sqlite3.Connection) -> None:
+        DesktopProviderStore._validate_schema_version(
+            connection,
+            rows=_EXPECTED_SCHEMA_ROWS,
+            digest=_EXPECTED_SCHEMA_DIGEST,
+            label="v2",
+        )
+
+    @staticmethod
+    def _validate_schema_version(
+        connection: sqlite3.Connection,
+        *,
+        rows: tuple[tuple[object, ...], ...],
+        digest: str,
+        label: str,
+    ) -> None:
+        try:
+            actual_rows = _schema_rows(connection)
+        except sqlite3.DatabaseError as exc:
+            raise ProviderSchemaError("provider schema could not be read") from exc
+        actual_digest = sha256(_canonical_json_bytes(actual_rows)).hexdigest()
+        if actual_digest != digest or actual_rows != rows:
+            raise ProviderSchemaError(
+                f"provider schema fingerprint does not match canonical {label}"
+            )
+
+    def _recover_and_validate(self) -> None:
+        connection = self._connection
+        try:
+            connection.execute("BEGIN EXCLUSIVE")
+            self._validate_schema(connection)
+            integrity = connection.execute("PRAGMA integrity_check(1)").fetchall()
+            if [tuple(row) for row in integrity] != [("ok",)]:
+                raise ProviderDataCorruptionError("provider SQLite integrity check failed")
+            if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
+                raise ProviderDataCorruptionError("provider foreign key check failed")
+            self._validate_recovery_budget(connection)
+            self._validate_migration_rows(connection)
+            for row in connection.execute("SELECT * FROM remote_profiles"):
+                self._validate_profile_recovery_row(cast(sqlite3.Row, row))
+            for row in connection.execute("SELECT * FROM projects"):
+                self._validate_project_recovery_row(cast(sqlite3.Row, row))
+            for row in connection.execute("SELECT * FROM local_operations"):
+                self._validate_operation_recovery_row(cast(sqlite3.Row, row))
+            for row in connection.execute("SELECT * FROM idempotency_records"):
+                self._validate_idempotency_recovery_row(cast(sqlite3.Row, row))
+            for row in connection.execute("SELECT * FROM pagination_cursors"):
+                self._validate_cursor_recovery_row(cast(sqlite3.Row, row))
+            timestamp = self._timestamp()
+            connection.execute(
+                """
+                UPDATE remote_profiles
+                SET connection_state = 'disconnected',
+                    resource_version = resource_version + 1, updated_at = ?
+                WHERE connection_state != 'disconnected'
+                """,
+                (timestamp,),
+            )
+            connection.execute(
+                """
+                UPDATE projects
+                SET state = CASE WHEN state = 'active' THEN 'draft' ELSE state END,
+                    current_revision_id = NULL,
+                    resource_version = resource_version + 1, updated_at = ?
+                WHERE state = 'active' OR current_revision_id IS NOT NULL
+                """,
+                (timestamp,),
+            )
+            self._reconcile_operations_at_startup(connection)
+            self._verify_storage_files()
+            connection.commit()
+        except ProviderStoreError:
+            connection.rollback()
+            raise
+        except sqlite3.DatabaseError as exc:
+            connection.rollback()
+            raise ProviderDataCorruptionError("provider SQLite recovery failed") from exc
+        except BaseException:
+            connection.rollback()
+            raise
+
+    @staticmethod
+    def _validate_recovery_budget(connection: sqlite3.Connection) -> None:
+        total_rows = 0
+        total_bytes = 0
+        specifications = (
+            (
+                "remote_profiles",
+                "profile_id, name, document_json, connection_state, "
+                "credential_slots_json, host_key_fingerprint, created_at, updated_at",
+            ),
+            (
+                "projects",
+                "project_id, profile_id, name, document_json, state, "
+                "current_revision_id, created_at, updated_at",
+            ),
+            (
+                "idempotency_records",
+                "principal, method, route, resource_scope, idempotency_key, request_digest, "
+                "response_type, response_bytes",
+            ),
+            (
+                "local_operations",
+                "operation_id, operation_kind, state, resource_type, resource_id, "
+                "document_json, created_at, finished_at",
+            ),
+            (
+                "pagination_cursors",
+                "cursor_digest, query_digest, anchor_id, anchor_value",
+            ),
+            ("schema_migrations", "applied_at"),
+        )
+        for table, columns in specifications:
+            length_sum = " + ".join(
+                f"coalesce(length(CAST({column.strip()} AS BLOB)), 0)"
+                for column in columns.split(",")
+            )
+            row = connection.execute(
+                f"SELECT count(*), coalesce(sum({length_sum}), 0) FROM {table}"
+            ).fetchone()
+            total_rows += cast(int, row[0])
+            total_bytes += cast(int, row[1])
+            if total_rows > MAX_RECOVERY_ROWS or total_bytes > MAX_RECOVERY_BYTES:
+                raise ProviderDataCorruptionError("provider recovery budget exceeded")
+
+    def _validate_migration_rows(self, connection: sqlite3.Connection) -> None:
+        rows = connection.execute(
+            "SELECT version, applied_at FROM schema_migrations ORDER BY version"
+        ).fetchall()
+        if [row["version"] for row in rows] != [1, 2]:
+            raise ProviderSchemaError("provider migration ledger does not match schema v2")
+        for row in rows:
+            self._validate_persisted_timestamp(cast(str, row["applied_at"]))
+
+    @staticmethod
+    def _validate_persisted_timestamp(value: str) -> datetime:
+        if type(value) is not str or _TIMESTAMP_RE.fullmatch(value) is None:
+            raise ProviderDataCorruptionError("provider timestamp is not canonical UTC")
+        try:
+            return datetime.fromisoformat(f"{value[:-1]}+00:00")
+        except ValueError as exc:
+            raise ProviderDataCorruptionError("provider timestamp is invalid") from exc
+
+    def _validate_common_resource_row(self, row: sqlite3.Row, id_column: str) -> None:
+        self._validate_resource_id(cast(str, row[id_column]))
+        if type(row["resource_version"]) is not int or row["resource_version"] < 1:
+            raise ProviderDataCorruptionError("provider resource version is invalid")
+        created_at = self._validate_persisted_timestamp(cast(str, row["created_at"]))
+        updated_at = self._validate_persisted_timestamp(cast(str, row["updated_at"]))
+        if updated_at < created_at:
+            raise ProviderDataCorruptionError("provider resource timestamps are reversed")
+
+    def _validate_profile_recovery_row(self, row: sqlite3.Row) -> None:
+        self._validate_common_resource_row(row, "profile_id")
+        document = _decode_json_object(bytes(row["document_json"]), label="profile")
+        if document.get("name") != row["name"]:
+            raise ProviderDataCorruptionError("profile name scalar differs from its document")
+        slots_raw = bytes(row["credential_slots_json"])
+        try:
+            slots = json.loads(slots_raw)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ProviderDataCorruptionError("stored credential slots are invalid") from exc
+        if _canonical_json_bytes(slots) != slots_raw:
+            raise ProviderDataCorruptionError("stored credential slots are not canonical")
+        self._profile_from_row(row)
+
+    def _validate_project_recovery_row(self, row: sqlite3.Row) -> None:
+        self._validate_common_resource_row(row, "project_id")
+        document = _decode_json_object(bytes(row["document_json"]), label="project")
+        if document.get("name") != row["name"] or document.get("profile_id") != row["profile_id"]:
+            raise ProviderDataCorruptionError(
+                "project indexed scalars differ from its canonical document"
+            )
+        self._project_from_row(row)
+        try:
+            self._validate_project_config_for_persistence(ProjectCreateV1.model_validate(document))
+        except (ValidationError, ContractValidationError) as exc:
+            raise ProviderDataCorruptionError(
+                "stored project config contains a persistence-denied key"
+            ) from exc
+
+    def _validate_operation_recovery_row(self, row: sqlite3.Row) -> None:
+        operation = self._operation_from_row(row)
+        if (
+            operation.operation_kind != row["operation_kind"]
+            or operation.state != row["state"]
+            or operation.resource.resource_type != row["resource_type"]
+            or operation.resource.resource_id != row["resource_id"]
+            or operation.created_at != row["created_at"]
+            or operation.finished_at != row["finished_at"]
+        ):
+            raise ProviderDataCorruptionError(
+                "operation indexed scalars differ from its canonical document"
+            )
+        try:
+            self._validate_operation_authority(self._connection, operation, allow_historical=True)
+        except (ContractValidationError, ResourceNotFoundError) as exc:
+            raise ProviderDataCorruptionError(
+                "stored operation differs from its authoritative resource"
+            ) from exc
+
+    def _validate_cursor_recovery_row(self, row: sqlite3.Row) -> None:
+        if (
+            _DIGEST_RE.fullmatch(cast(str, row["cursor_digest"])) is None
+            or _DIGEST_RE.fullmatch(cast(str, row["query_digest"])) is None
+        ):
+            raise ProviderDataCorruptionError("provider cursor digest is invalid")
+        try:
+            self._validate_resource_id(cast(str, row["anchor_id"]))
+        except ContractValidationError as exc:
+            raise ProviderDataCorruptionError("provider cursor anchor is invalid") from exc
+        if len(cast(str, row["anchor_value"]).encode("utf-8")) > 4096:
+            raise ProviderDataCorruptionError("provider cursor value exceeds its byte bound")
+        if (
+            type(row["created_at_epoch"]) is not int
+            or type(row["expires_at_epoch"]) is not int
+            or row["expires_at_epoch"] <= row["created_at_epoch"]
+        ):
+            raise ProviderDataCorruptionError("provider cursor timestamps are invalid")
+
+    def _validate_idempotency_recovery_row(self, row: sqlite3.Row) -> None:
+        if row["principal"] != LOCAL_PRINCIPAL:
+            raise ProviderDataCorruptionError("idempotency principal is not local")
+        for label, column, maximum, minimum in (
+            ("method", "method", MAX_IDENTITY_BYTES, 1),
+            ("route", "route", MAX_IDENTITY_BYTES, 1),
+            ("resource scope", "resource_scope", MAX_IDENTITY_BYTES, 1),
+            (
+                "idempotency key",
+                "idempotency_key",
+                MAX_IDEMPOTENCY_KEY_BYTES,
+                16,
+            ),
+        ):
+            try:
+                self._bounded_identity(label, cast(str, row[column]), maximum, minimum=minimum)
+            except ContractValidationError as exc:
+                raise ProviderDataCorruptionError("idempotency identity is invalid") from exc
+        if _DIGEST_RE.fullmatch(cast(str, row["request_digest"])) is None:
+            raise ProviderDataCorruptionError("idempotency request digest is invalid")
+        if (
+            type(row["created_at_epoch"]) is not int
+            or type(row["expires_at_epoch"]) is not int
+            or row["expires_at_epoch"] <= row["created_at_epoch"]
+        ):
+            raise ProviderDataCorruptionError("idempotency retention timestamps are invalid")
+        response_model = self._response_model_for_name(cast(str, row["response_type"]))
+        response_bytes = bytes(row["response_bytes"])
+        response = self._model_from_response(response_model, response_bytes)
+        if _canonical_json_bytes(response.model_dump(mode="json")) != response_bytes:
+            raise ProviderDataCorruptionError("idempotency response is not canonical")
+        if isinstance(response, LocalOperationV1):
+            try:
+                self._require_operation_row(self._connection, response.operation_id)
+            except ResourceNotFoundError as exc:
+                raise ProviderDataCorruptionError(
+                    "idempotency response references a missing local operation"
+                ) from exc
+
+    @contextmanager
+    def _transaction(self, *, write: bool) -> Iterator[sqlite3.Connection]:
+        with self._transaction_lock:
+            self._verify_storage_files()
+            connection = self._connection
+            try:
+                connection.execute("BEGIN IMMEDIATE" if write else "BEGIN")
+                yield connection
+                if write:
+                    self._validate_recovery_budget(connection)
+                    self._verify_storage_files()
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
+
+    def _now(self) -> datetime:
+        value = self._clock()
+        if not isinstance(value, datetime) or value.tzinfo is None:
+            raise ProviderStoreError("provider clock must return a timezone-aware datetime")
+        return value.astimezone(timezone.utc)
+
+    def _timestamp(self) -> str:
+        return self._now().isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+    @staticmethod
+    def _new_id() -> str:
+        return secrets.token_urlsafe(_RESOURCE_ID_BYTES)
+
+    @staticmethod
+    def _etag(resource_type: str, resource_id: str, version: int) -> str:
+        digest = sha256(
+            _canonical_json_bytes(
+                {"resource_id": resource_id, "resource_type": resource_type, "version": version}
+            )
+        ).hexdigest()
+        return f'"{digest}"'
+
+    @staticmethod
+    def _validate_if_match(if_match: str) -> None:
+        if type(if_match) is not str or _ETAG_RE.fullmatch(if_match) is None:
+            raise ContractValidationError("If-Match is not a Desktop v1 ETag")
+
+    def create_profile(
+        self,
+        request: RemoteProfileCreateV1 | Mapping[str, object],
+        *,
+        idempotency_key: str,
+    ) -> RemoteProfileV1:
+        validated = _validate_model(RemoteProfileCreateV1, request)
+
+        def mutation(transaction: ProviderMutation) -> tuple[int, BaseModel]:
+            return 201, transaction._create_profile(validated)
+
+        result = self._execute_idempotent(
+            method="POST",
+            route="/desktop/v1/profiles",
+            resource_scope="profiles",
+            key=idempotency_key,
+            request_value=validated.model_dump(mode="json"),
+            response_model=RemoteProfileV1,
+            bound_if_match=None,
+            mutation=mutation,
+        )
+        return self._model_from_response(RemoteProfileV1, result.response_bytes)
+
+    def get_profile(self, profile_id: str) -> RemoteProfileV1:
+        self._validate_resource_id(profile_id)
+        with self._transaction(write=False) as connection:
+            return self._profile_from_row(self._require_profile_row(connection, profile_id))
+
+    def patch_profile(
+        self,
+        profile_id: str,
+        patch: RemoteProfilePatchV1 | Mapping[str, object],
+        *,
+        if_match: str,
+    ) -> RemoteProfileV1:
+        self._validate_resource_id(profile_id)
+        validated_patch = _validate_model(RemoteProfilePatchV1, patch)
+        self._validate_if_match(if_match)
+        with self._transaction(write=True) as connection:
+            row = self._require_profile_row(connection, profile_id)
+            self._require_etag("profile", profile_id, row, if_match)
+            protected_connection_fields = {
+                "host",
+                "port",
+                "user",
+                "authentication_kind",
+                "proxy",
+            }
+            if row["connection_state"] != "disconnected" and (
+                validated_patch.model_fields_set & protected_connection_fields
+            ):
+                raise ResourceInUseError("profile", profile_id)
+            current = _decode_json_object(bytes(row["document_json"]), label="profile")
+            current.update(validated_patch.model_dump(mode="json", exclude_unset=True))
+            validated = _validate_json_model(RemoteProfileCreateV1, current)
+            version = cast(int, row["resource_version"]) + 1
+            timestamp = self._timestamp()
+            connection.execute(
+                """
+                UPDATE remote_profiles
+                SET name = ?, document_json = ?, resource_version = ?, updated_at = ?
+                WHERE profile_id = ?
+                """,
+                (
+                    validated.name,
+                    _canonical_json_bytes(validated.model_dump(mode="json")),
+                    version,
+                    timestamp,
+                    profile_id,
+                ),
+            )
+            return self._profile_from_row(self._require_profile_row(connection, profile_id))
+
+    def delete_profile(self, profile_id: str, *, if_match: str) -> None:
+        self._validate_resource_id(profile_id)
+        self._validate_if_match(if_match)
+        with self._transaction(write=True) as connection:
+            row = self._require_profile_row(connection, profile_id)
+            self._require_etag("profile", profile_id, row, if_match)
+            referenced = connection.execute(
+                "SELECT 1 FROM projects WHERE profile_id = ? LIMIT 1", (profile_id,)
+            ).fetchone()
+            if row["connection_state"] != "disconnected" or referenced is not None:
+                raise ResourceInUseError("profile", profile_id)
+            connection.execute("DELETE FROM remote_profiles WHERE profile_id = ?", (profile_id,))
+
+    def list_profiles(
+        self,
+        *,
+        limit: int = 50,
+        after: str | None = None,
+        sort: str = "updated_at",
+        direction: _Direction = "desc",
+        filters: Mapping[str, str] | None = None,
+    ) -> RemoteProfilePageV1:
+        rows, next_cursor = self._list_rows(
+            resource="profiles",
+            table="remote_profiles",
+            id_column="profile_id",
+            limit=limit,
+            after=after,
+            sort=sort,
+            direction=direction,
+            filters=filters,
+            filter_columns={"connection_state": "connection_state"},
+        )
+        return RemoteProfilePageV1(
+            items=tuple(self._profile_from_row(row) for row in rows),
+            next_cursor=next_cursor,
+            has_more=next_cursor is not None,
+        )
+
+    def create_project(
+        self,
+        request: ProjectCreateV1 | Mapping[str, object],
+        *,
+        idempotency_key: str,
+    ) -> ProjectV1:
+        validated = _validate_model(ProjectCreateV1, request)
+        self._validate_project_config_for_persistence(validated)
+
+        def mutation(transaction: ProviderMutation) -> tuple[int, BaseModel]:
+            return 201, transaction._create_project(validated)
+
+        result = self._execute_idempotent(
+            method="POST",
+            route="/desktop/v1/projects",
+            resource_scope="projects",
+            key=idempotency_key,
+            request_value=validated.model_dump(mode="json"),
+            response_model=ProjectV1,
+            bound_if_match=None,
+            mutation=mutation,
+        )
+        return self._model_from_response(ProjectV1, result.response_bytes)
+
+    def get_project(self, project_id: str) -> ProjectV1:
+        self._validate_resource_id(project_id)
+        with self._transaction(write=False) as connection:
+            return self._project_from_row(self._require_project_row(connection, project_id))
+
+    def get_local_operation(self, operation_id: str) -> LocalOperationV1:
+        self._validate_resource_id(operation_id)
+        with self._transaction(write=True) as connection:
+            return self._reconcile_operation_with_authority(
+                connection,
+                self._require_operation_row(connection, operation_id),
+                force_cancel_nonterminal=False,
+            )
+
+    def patch_project(
+        self,
+        project_id: str,
+        patch: ProjectPatchV1 | Mapping[str, object],
+        *,
+        if_match: str,
+    ) -> ProjectV1:
+        self._validate_resource_id(project_id)
+        validated_patch = _validate_model(ProjectPatchV1, patch)
+        self._validate_if_match(if_match)
+        with self._transaction(write=True) as connection:
+            row = self._require_project_row(connection, project_id)
+            self._require_etag("project", project_id, row, if_match)
+            if row["state"] == "active" or row["current_revision_id"] is not None:
+                raise ResourceInUseError("project", project_id)
+            current = _decode_json_object(bytes(row["document_json"]), label="project")
+            current.update(validated_patch.model_dump(mode="json", exclude_unset=True))
+            validated = _validate_json_model(ProjectCreateV1, current)
+            self._validate_project_config_for_persistence(validated)
+            self._require_profile_row(connection, validated.profile_id)
+            version = cast(int, row["resource_version"]) + 1
+            timestamp = self._timestamp()
+            connection.execute(
+                """
+                UPDATE projects
+                SET profile_id = ?, name = ?, document_json = ?,
+                    resource_version = ?, updated_at = ?
+                WHERE project_id = ?
+                """,
+                (
+                    validated.profile_id,
+                    validated.name,
+                    _canonical_json_bytes(validated.model_dump(mode="json")),
+                    version,
+                    timestamp,
+                    project_id,
+                ),
+            )
+            return self._project_from_row(self._require_project_row(connection, project_id))
+
+    def delete_project(self, project_id: str, *, if_match: str) -> None:
+        self._validate_resource_id(project_id)
+        self._validate_if_match(if_match)
+        with self._transaction(write=True) as connection:
+            row = self._require_project_row(connection, project_id)
+            self._require_etag("project", project_id, row, if_match)
+            if row["state"] == "active" or row["current_revision_id"] is not None:
+                raise ResourceInUseError("project", project_id)
+            connection.execute("DELETE FROM projects WHERE project_id = ?", (project_id,))
+
+    def list_projects(
+        self,
+        *,
+        limit: int = 50,
+        after: str | None = None,
+        sort: str = "updated_at",
+        direction: _Direction = "desc",
+        filters: Mapping[str, str] | None = None,
+    ) -> ProjectPageV1:
+        rows, next_cursor = self._list_rows(
+            resource="projects",
+            table="projects",
+            id_column="project_id",
+            limit=limit,
+            after=after,
+            sort=sort,
+            direction=direction,
+            filters=filters,
+            filter_columns={"state": "state", "profile_id": "profile_id"},
+        )
+        return ProjectPageV1(
+            items=tuple(self._project_from_row(row) for row in rows),
+            next_cursor=next_cursor,
+            has_more=next_cursor is not None,
+        )
+
+    def execute_idempotent_action(
+        self,
+        *,
+        route: str,
+        resource_scope: str,
+        key: str,
+        body: BaseModel | Mapping[str, object],
+        if_match: str,
+        semantic_headers: Mapping[str, str],
+        response_model: type[_ModelT],
+        mutation: Callable[[ProviderMutation], tuple[int, BaseModel]],
+    ) -> IdempotencyResult:
+        self._validate_if_match(if_match)
+        headers = self._normalize_semantic_headers(semantic_headers)
+        headers["if-match"] = if_match
+        body_value = body.model_dump(mode="json") if isinstance(body, BaseModel) else dict(body)
+        return self._execute_idempotent(
+            method="POST",
+            route=route,
+            resource_scope=resource_scope,
+            key=key,
+            request_value={"body": body_value, "headers": headers},
+            response_model=response_model,
+            bound_if_match=if_match,
+            mutation=mutation,
+        )
+
+    def _execute_idempotent(
+        self,
+        *,
+        method: str,
+        route: str,
+        resource_scope: str,
+        key: str,
+        request_value: object,
+        response_model: type[_ModelT],
+        bound_if_match: str | None,
+        mutation: Callable[[ProviderMutation], tuple[int, BaseModel]],
+    ) -> IdempotencyResult:
+        response_type = self._response_type_name(response_model)
+        method = self._bounded_identity("method", method, MAX_IDENTITY_BYTES)
+        route = self._bounded_identity("route", route, MAX_IDENTITY_BYTES)
+        resource_scope = self._bounded_identity(
+            "resource_scope", resource_scope, MAX_IDENTITY_BYTES
+        )
+        key = self._bounded_identity("idempotency key", key, MAX_IDEMPOTENCY_KEY_BYTES, minimum=16)
+        self._reject_credential_bearing_keys(request_value)
+        request_bytes = _canonical_json_bytes(request_value)
+        if len(request_bytes) > MAX_REQUEST_BYTES:
+            raise ContractValidationError("canonical idempotency request exceeds the byte limit")
+        request_digest = sha256(request_bytes).hexdigest()
+        now_epoch = int(self._now().timestamp())
+
+        with self._transaction(write=True) as connection:
+            connection.execute(
+                "DELETE FROM idempotency_records WHERE expires_at_epoch <= ?", (now_epoch,)
+            )
+            existing = connection.execute(
+                """
+                SELECT request_digest, response_type, status_code, response_bytes
+                FROM idempotency_records
+                WHERE principal = ? AND method = ? AND route = ?
+                  AND resource_scope = ? AND idempotency_key = ?
+                """,
+                (LOCAL_PRINCIPAL, method, route, resource_scope, key),
+            ).fetchone()
+            if existing is not None:
+                if existing["request_digest"] != request_digest:
+                    raise IdempotencyConflictError(
+                        "idempotency key is already bound to a different request"
+                    )
+                if existing["response_type"] != response_type:
+                    raise ProviderDataCorruptionError(
+                        "idempotency replay response type differs from the typed route"
+                    )
+                response_bytes = bytes(existing["response_bytes"])
+                replay_response = self._model_from_response(response_model, response_bytes)
+                if (
+                    _canonical_json_bytes(replay_response.model_dump(mode="json"))
+                    != response_bytes
+                ):
+                    raise ProviderDataCorruptionError(
+                        "stored idempotency replay response is not canonical"
+                    )
+                if isinstance(replay_response, LocalOperationV1):
+                    replay_response = cast(
+                        _ModelT,
+                        self._reconcile_operation_with_authority(
+                            connection,
+                            self._require_operation_row(connection, replay_response.operation_id),
+                            force_cancel_nonterminal=False,
+                        ),
+                    )
+                    response_bytes = _canonical_json_bytes(replay_response.model_dump(mode="json"))
+                return IdempotencyResult(
+                    status_code=cast(int, existing["status_code"]),
+                    response_bytes=response_bytes,
+                    replayed=True,
+                )
+
+            count = cast(
+                int, connection.execute("SELECT count(*) FROM idempotency_records").fetchone()[0]
+            )
+            if count >= self._max_idempotency_records:
+                raise IdempotencyCapacityError("live idempotency record capacity is exhausted")
+
+            status_code, response = mutation(
+                ProviderMutation(self, connection, if_match=bound_if_match)
+            )
+            if type(status_code) is not int or not 100 <= status_code <= 599:
+                raise ProviderStoreError("idempotent mutation returned an invalid status code")
+            if (
+                type(response) is not response_model
+                or type(response).__module__ != "desktop.sidecar.contracts.v1.models"
+                or response.model_config.get("extra") != "forbid"
+            ):
+                raise ProviderStoreError(
+                    "idempotent mutation must return a closed Desktop v1 response model"
+                )
+            response_bytes = _canonical_json_bytes(response.model_dump(mode="json"))
+            if len(response_bytes) > MAX_RESPONSE_BYTES:
+                raise ProviderStoreError("idempotent response exceeds the byte limit")
+            self._insert_idempotency_record(
+                connection,
+                principal=LOCAL_PRINCIPAL,
+                method=method,
+                route=route,
+                resource_scope=resource_scope,
+                key=key,
+                request_digest=request_digest,
+                response_type=response_type,
+                status_code=status_code,
+                response_bytes=response_bytes,
+                now_epoch=now_epoch,
+            )
+            return IdempotencyResult(status_code, response_bytes, False)
+
+    @staticmethod
+    def _normalize_semantic_headers(headers: Mapping[str, str]) -> dict[str, str]:
+        if not isinstance(headers, Mapping):
+            raise ContractValidationError("semantic headers must be a mapping")
+        normalized: dict[str, str] = {}
+        forbidden = {"authorization", "cookie", "idempotency-key", "if-match"}
+        for key, value in headers.items():
+            normalized_key = key.lower() if type(key) is str else ""
+            if (
+                type(key) is not str
+                or re.fullmatch(r"[a-z0-9][a-z0-9-]{0,127}", normalized_key) is None
+                or normalized_key in forbidden
+                or "session-token" in normalized_key
+                or normalized_key in normalized
+            ):
+                raise ContractValidationError(
+                    "semantic header name is invalid or credential-bearing"
+                )
+            normalized[normalized_key] = DesktopProviderStore._bounded_identity(
+                "semantic header value", value, MAX_IDENTITY_BYTES
+            )
+        return dict(sorted(normalized.items()))
+
+    @staticmethod
+    def _response_type_name(model_type: type[BaseModel]) -> str:
+        allowed = {
+            RemoteProfileV1: "RemoteProfileV1",
+            ProjectV1: "ProjectV1",
+            LocalOperationV1: "LocalOperationV1",
+        }
+        try:
+            return allowed[model_type]
+        except KeyError as exc:
+            raise ContractValidationError(
+                "idempotent response model is not a persisted Desktop resource type"
+            ) from exc
+
+    @staticmethod
+    def _response_model_for_name(name: str) -> type[BaseModel]:
+        allowed: dict[str, type[BaseModel]] = {
+            "RemoteProfileV1": RemoteProfileV1,
+            "ProjectV1": ProjectV1,
+            "LocalOperationV1": LocalOperationV1,
+        }
+        try:
+            return allowed[name]
+        except KeyError as exc:
+            raise ProviderDataCorruptionError("idempotency response type is invalid") from exc
+
+    def _insert_idempotency_record(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        principal: str,
+        method: str,
+        route: str,
+        resource_scope: str,
+        key: str,
+        request_digest: str,
+        response_type: str,
+        status_code: int,
+        response_bytes: bytes,
+        now_epoch: int,
+    ) -> None:
+        connection.execute(
+            """
+            INSERT INTO idempotency_records(
+                principal, method, route, resource_scope, idempotency_key,
+                request_digest, response_type, status_code, response_bytes,
+                created_at_epoch, expires_at_epoch
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                principal,
+                method,
+                route,
+                resource_scope,
+                key,
+                request_digest,
+                response_type,
+                status_code,
+                response_bytes,
+                now_epoch,
+                now_epoch + self._idempotency_retention_seconds,
+            ),
+        )
+
+    @staticmethod
+    def _normalized_persistence_key(value: str) -> str:
+        normalized = unicodedata.normalize("NFKC", value).casefold()
+        return "".join(character for character in normalized if character.isalnum())
+
+    @classmethod
+    def _walk_persisted_keys(cls, value: object) -> Iterator[str]:
+        pending = [value]
+        while pending:
+            current = pending.pop()
+            if isinstance(current, Mapping):
+                for key, child in current.items():
+                    if type(key) is str:
+                        yield cls._normalized_persistence_key(key)
+                    pending.append(child)
+            elif isinstance(current, (list, tuple)):
+                pending.extend(current)
+
+    @classmethod
+    def _reject_credential_bearing_keys(cls, value: object) -> None:
+        for key in cls._walk_persisted_keys(value):
+            if key in _PERSISTENCE_DENIED_CONFIG_KEYS or key.endswith(_SECRET_KEY_SUFFIXES):
+                if key in {
+                    "filesystempath",
+                    "hostpath",
+                    "homedir",
+                    "homedirectory",
+                    "localpath",
+                    "processoutput",
+                    "processstderr",
+                    "processstdout",
+                    "rawdiagnostic",
+                    "rawdiagnostics",
+                    "rawlog",
+                    "rawlogs",
+                    "stacktrace",
+                    "stderr",
+                    "stdout",
+                    "traceback",
+                    "workingdirectory",
+                    "workdir",
+                }:
+                    continue
+                raise ContractValidationError(
+                    "idempotency request contains a credential-bearing key"
+                )
+
+    @classmethod
+    def _validate_project_config_for_persistence(cls, project: ProjectCreateV1) -> None:
+        for selection in project.evolution.targets.root.values():
+            for key in cls._walk_persisted_keys(selection.config.root):
+                denied = key in _PERSISTENCE_DENIED_CONFIG_KEYS or key.endswith(
+                    _PERSISTENCE_DENIED_CONFIG_SUFFIXES
+                )
+                host_path = key.endswith(("path", "directory", "workdir")) and (
+                    key not in _ALLOWED_PROJECT_CONFIG_PATH_KEYS
+                )
+                if denied or host_path:
+                    raise ContractValidationError(
+                        "project method config contains a persistence-denied key"
+                    )
+
+    @staticmethod
+    def _bounded_identity(label: str, value: str, maximum: int, *, minimum: int = 1) -> str:
+        if (
+            type(value) is not str
+            or value != value.strip()
+            or any(ord(char) < 0x20 for char in value)
+        ):
+            raise ContractValidationError(f"{label} must be trimmed text without controls")
+        size = len(value.encode("utf-8"))
+        if not minimum <= size <= maximum:
+            raise ContractValidationError(f"{label} exceeds its byte bounds")
+        return value
+
+    @staticmethod
+    def _validate_resource_id(resource_id: str) -> None:
+        DesktopProviderStore._bounded_identity("resource id", resource_id, 256)
+
+    @staticmethod
+    def _model_from_response(model_type: type[_ModelT], response_bytes: bytes) -> _ModelT:
+        try:
+            return model_type.model_validate_json(response_bytes)
+        except ValidationError as exc:
+            raise ProviderDataCorruptionError(
+                f"stored idempotent {model_type.__name__} response is invalid"
+            ) from exc
+
+    @staticmethod
+    def _require_profile_row(connection: sqlite3.Connection, profile_id: str) -> sqlite3.Row:
+        row = connection.execute(
+            "SELECT * FROM remote_profiles WHERE profile_id = ?", (profile_id,)
+        ).fetchone()
+        if row is None:
+            raise ResourceNotFoundError("profile", profile_id)
+        return cast(sqlite3.Row, row)
+
+    @staticmethod
+    def _require_project_row(connection: sqlite3.Connection, project_id: str) -> sqlite3.Row:
+        row = connection.execute(
+            "SELECT * FROM projects WHERE project_id = ?", (project_id,)
+        ).fetchone()
+        if row is None:
+            raise ResourceNotFoundError("project", project_id)
+        return cast(sqlite3.Row, row)
+
+    @staticmethod
+    def _require_operation_row(connection: sqlite3.Connection, operation_id: str) -> sqlite3.Row:
+        row = connection.execute(
+            "SELECT * FROM local_operations WHERE operation_id = ?", (operation_id,)
+        ).fetchone()
+        if row is None:
+            raise ResourceNotFoundError("operation", operation_id)
+        return cast(sqlite3.Row, row)
+
+    def _profile_from_row(self, row: sqlite3.Row) -> RemoteProfileV1:
+        document = _decode_json_object(bytes(row["document_json"]), label="profile")
+        try:
+            slots = json.loads(bytes(row["credential_slots_json"]))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ProviderDataCorruptionError("stored credential slot status is invalid") from exc
+        payload = {
+            **document,
+            "profile_id": row["profile_id"],
+            "credential_slots": slots,
+            "connection_state": row["connection_state"],
+            "host_key_fingerprint": row["host_key_fingerprint"],
+            "etag": self._etag("profile", row["profile_id"], row["resource_version"]),
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+        return _validate_json_model(RemoteProfileV1, payload)
+
+    def _project_from_row(self, row: sqlite3.Row) -> ProjectV1:
+        document = _decode_json_object(bytes(row["document_json"]), label="project")
+        payload = {
+            **document,
+            "project_id": row["project_id"],
+            "state": row["state"],
+            "etag": self._etag("project", row["project_id"], row["resource_version"]),
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+        return _validate_json_model(ProjectV1, payload)
+
+    def _operation_from_row(self, row: sqlite3.Row) -> LocalOperationV1:
+        document = _decode_json_object(bytes(row["document_json"]), label="operation")
+        operation = _validate_json_model(LocalOperationV1, document)
+        expected_etag = self._etag(
+            "operation", operation.operation_id, cast(int, row["resource_version"])
+        )
+        if operation.etag != expected_etag:
+            raise ProviderDataCorruptionError("operation ETag differs from its stored version")
+        return operation
+
+    def _validate_operation_authority(
+        self,
+        connection: sqlite3.Connection,
+        operation: LocalOperationV1,
+        *,
+        allow_historical: bool = False,
+    ) -> None:
+        result = operation.result
+        if (
+            operation.operation_kind in _PROFILE_OPERATION_KINDS
+            and operation.resource.resource_type != "profile"
+        ) or (
+            operation.operation_kind in _PROJECT_OPERATION_KINDS
+            and operation.resource.resource_type != "project"
+        ):
+            raise ContractValidationError("local operation kind differs from its resource type")
+        if operation.operation_kind in _PROFILE_OPERATION_KINDS:
+            try:
+                row = self._require_profile_row(connection, operation.resource.resource_id)
+            except ResourceNotFoundError:
+                if allow_historical and operation.state in {
+                    "succeeded",
+                    "failed",
+                    "cancelled",
+                }:
+                    return
+                raise
+            if isinstance(result, ConnectionOperationResultV1):
+                if result.profile_id != operation.resource.resource_id:
+                    raise ContractValidationError(
+                        "connection operation result differs from its resource"
+                    )
+                current_state = cast(str, row["connection_state"])
+                expected_state = (
+                    current_state
+                    if current_state in {"connected", "disconnected", "host_key_required"}
+                    else "disconnected"
+                )
+                if not allow_historical and result.connection_state != expected_state:
+                    raise ContractValidationError(
+                        "connection operation result differs from profile state"
+                    )
+            elif result is not None:
+                raise ContractValidationError("profile operation has a non-connection result")
+            elif operation.state == "succeeded":
+                raise ContractValidationError(
+                    "succeeded profile operation requires a connection result"
+                )
+        elif operation.operation_kind == "project_activate":
+            try:
+                row = self._require_project_row(connection, operation.resource.resource_id)
+            except ResourceNotFoundError:
+                if allow_historical and operation.state in {
+                    "succeeded",
+                    "failed",
+                    "cancelled",
+                }:
+                    return
+                raise
+            if isinstance(result, ProjectOperationResultV1):
+                expected_etag = self._etag(
+                    "project", operation.resource.resource_id, row["resource_version"]
+                )
+                if result.project_id != operation.resource.resource_id or (
+                    not allow_historical
+                    and (
+                        result.project_etag != expected_etag
+                        or result.active != (row["state"] == "active")
+                    )
+                ):
+                    raise ContractValidationError(
+                        "project operation result differs from project state"
+                    )
+            elif result is not None:
+                raise ContractValidationError("project operation has a non-project result")
+            elif operation.state == "succeeded":
+                raise ContractValidationError(
+                    "succeeded project operation requires a project result"
+                )
+
+    def _authoritative_operation_result(
+        self, connection: sqlite3.Connection, operation: LocalOperationV1
+    ) -> LocalOperationResultV1 | None:
+        if operation.operation_kind in _PROFILE_OPERATION_KINDS:
+            try:
+                row = self._require_profile_row(connection, operation.resource.resource_id)
+            except ResourceNotFoundError:
+                return ConnectionOperationResultV1(
+                    profile_id=operation.resource.resource_id,
+                    connection_state="disconnected",
+                )
+            state = cast(str, row["connection_state"])
+            result_state = (
+                state
+                if state in {"connected", "disconnected", "host_key_required"}
+                else "disconnected"
+            )
+            return ConnectionOperationResultV1(
+                profile_id=operation.resource.resource_id,
+                connection_state=cast(
+                    Literal["connected", "disconnected", "host_key_required"],
+                    result_state,
+                ),
+            )
+        if operation.operation_kind == "project_activate":
+            try:
+                row = self._require_project_row(connection, operation.resource.resource_id)
+            except ResourceNotFoundError:
+                if isinstance(operation.result, ProjectOperationResultV1):
+                    return operation.result.model_copy(update={"active": False})
+                return operation.result
+            return ProjectOperationResultV1(
+                project_id=operation.resource.resource_id,
+                project_etag=self._etag(
+                    "project", operation.resource.resource_id, row["resource_version"]
+                ),
+                active=row["state"] == "active",
+            )
+        return operation.result
+
+    def _reconcile_operation_with_authority(
+        self,
+        connection: sqlite3.Connection,
+        row: sqlite3.Row,
+        *,
+        force_cancel_nonterminal: bool,
+    ) -> LocalOperationV1:
+        operation = self._operation_from_row(row)
+        authoritative_result = self._authoritative_operation_result(connection, operation)
+        nonterminal = operation.state not in {"succeeded", "failed", "cancelled"}
+        if not (
+            (force_cancel_nonterminal and nonterminal) or operation.result != authoritative_result
+        ):
+            return operation
+        version = cast(int, row["resource_version"]) + 1
+        timestamp = self._timestamp()
+        reconciled = _validate_model(
+            LocalOperationV1,
+            {
+                **operation.model_dump(mode="python"),
+                "state": "cancelled",
+                "result": authoritative_result,
+                "error": None,
+                "finished_at": timestamp,
+                "etag": self._etag("operation", operation.operation_id, version),
+            },
+        )
+        connection.execute(
+            """
+            UPDATE local_operations
+            SET state = 'cancelled', document_json = ?, resource_version = ?,
+                finished_at = ?
+            WHERE operation_id = ?
+            """,
+            (
+                _canonical_json_bytes(reconciled.model_dump(mode="json")),
+                version,
+                reconciled.finished_at,
+                reconciled.operation_id,
+            ),
+        )
+        return reconciled
+
+    def _reconcile_operations_at_startup(self, connection: sqlite3.Connection) -> None:
+        after_operation_id = ""
+        while True:
+            metadata_rows = connection.execute(
+                """
+                SELECT operation_id,
+                       length(CAST(document_json AS BLOB)) AS document_bytes,
+                       length(CAST(operation_id AS BLOB))
+                         + length(CAST(operation_kind AS BLOB))
+                         + length(CAST(state AS BLOB))
+                         + length(CAST(resource_type AS BLOB))
+                         + length(CAST(resource_id AS BLOB))
+                         + length(CAST(document_json AS BLOB))
+                         + length(CAST(created_at AS BLOB))
+                         + coalesce(length(CAST(finished_at AS BLOB)), 0)
+                         + 16 AS row_bytes
+                FROM local_operations
+                WHERE operation_id > ?
+                ORDER BY operation_id
+                LIMIT ?
+                """,
+                (after_operation_id, STARTUP_OPERATION_BATCH_ROWS),
+            ).fetchmany(STARTUP_OPERATION_BATCH_ROWS)
+            if not metadata_rows:
+                return
+            for metadata in metadata_rows:
+                operation_id = cast(str, metadata["operation_id"])
+                document_bytes = metadata["document_bytes"]
+                row_bytes = metadata["row_bytes"]
+                if (
+                    type(document_bytes) is not int
+                    or document_bytes < 1
+                    or document_bytes > MAX_DOCUMENT_BYTES
+                    or type(row_bytes) is not int
+                    or row_bytes > MAX_STARTUP_OPERATION_ROW_BYTES
+                ):
+                    raise ProviderDataCorruptionError(
+                        "startup operation row exceeds its recovery bound"
+                    )
+                row = connection.execute(
+                    """
+                    SELECT * FROM local_operations
+                    WHERE operation_id = ?
+                      AND length(CAST(document_json AS BLOB)) = ?
+                    """,
+                    (operation_id, document_bytes),
+                ).fetchone()
+                if row is None:
+                    raise ProviderDataCorruptionError(
+                        "startup operation row changed during recovery"
+                    )
+                self._reconcile_operation_with_authority(
+                    connection,
+                    cast(sqlite3.Row, row),
+                    force_cancel_nonterminal=True,
+                )
+                after_operation_id = operation_id
+            if len(metadata_rows) < STARTUP_OPERATION_BATCH_ROWS:
+                return
+
+    def _require_etag(
+        self,
+        resource_type: str,
+        resource_id: str,
+        row: sqlite3.Row,
+        if_match: str,
+    ) -> None:
+        current = self._etag(resource_type, resource_id, row["resource_version"])
+        if not hmac.compare_digest(current, if_match):
+            raise ETagConflictError(resource_type, resource_id, current)
+
+    def _list_rows(
+        self,
+        *,
+        resource: Literal["profiles", "projects"],
+        table: Literal["remote_profiles", "projects"],
+        id_column: Literal["profile_id", "project_id"],
+        limit: int,
+        after: str | None,
+        sort: str,
+        direction: _Direction,
+        filters: Mapping[str, str] | None,
+        filter_columns: Mapping[str, str],
+    ) -> tuple[list[sqlite3.Row], str | None]:
+        if type(limit) is not int or not 1 <= limit <= 100:
+            raise ContractValidationError("pagination limit must be between 1 and 100")
+        sort_columns = {"created_at": "created_at", "updated_at": "updated_at", "name": "name"}
+        if sort not in sort_columns:
+            raise ContractValidationError("unsupported provider sort key")
+        if direction not in {"asc", "desc"}:
+            raise ContractValidationError("pagination direction must be asc or desc")
+        normalized_filters = self._normalize_filters(filters, filter_columns)
+        anchor: tuple[str, str] | None = None
+        if after is not None:
+            anchor = self._decode_cursor(
+                after,
+                resource=resource,
+                filters=normalized_filters,
+                sort=sort,
+                direction=direction,
+            )
+
+        clauses: list[str] = []
+        parameters: list[object] = []
+        for key, value in normalized_filters.items():
+            clauses.append(f"{filter_columns[key]} = ?")
+            parameters.append(value)
+        sort_column = sort_columns[sort]
+        sql_direction = "ASC" if direction == "asc" else "DESC"
+        with self._transaction(write=False) as connection:
+            if anchor is not None:
+                anchor_value, anchor_id = anchor
+                operator = ">" if direction == "asc" else "<"
+                clauses.append(
+                    f"({sort_column} {operator} ? OR "
+                    f"({sort_column} = ? AND {id_column} {operator} ?))"
+                )
+                parameters.extend((anchor_value, anchor_value, anchor_id))
+            where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+            parameters.append(limit + 1)
+            fetched = connection.execute(
+                f"SELECT * FROM {table}{where} "
+                f"ORDER BY {sort_column} {sql_direction}, {id_column} {sql_direction} LIMIT ?",
+                tuple(parameters),
+            ).fetchall()
+        has_more = len(fetched) > limit
+        rows = list(fetched[:limit])
+        next_cursor = None
+        if has_more and rows:
+            last = rows[-1]
+            next_cursor = self._encode_cursor(
+                resource=resource,
+                filters=normalized_filters,
+                sort=sort,
+                direction=direction,
+                anchor_id=last[id_column],
+                sort_value=last[sort_column],
+            )
+        return rows, next_cursor
+
+    @staticmethod
+    def _normalize_filters(
+        filters: Mapping[str, str] | None, supported: Mapping[str, str]
+    ) -> dict[str, str]:
+        if filters is None:
+            return {}
+        normalized: dict[str, str] = {}
+        for key, value in filters.items():
+            if key not in supported or type(value) is not str:
+                raise ContractValidationError("unsupported provider pagination filter")
+            if len(value.encode("utf-8")) > 256 or "\x00" in value:
+                raise ContractValidationError("provider pagination filter exceeds its bounds")
+            normalized[key] = value
+        return dict(sorted(normalized.items()))
+
+    def _encode_cursor(
+        self,
+        *,
+        resource: str,
+        filters: Mapping[str, str],
+        sort: str,
+        direction: _Direction,
+        anchor_id: str,
+        sort_value: str,
+    ) -> str:
+        query_digest = sha256(
+            _canonical_json_bytes(
+                {
+                    "direction": direction,
+                    "filters": dict(filters),
+                    "resource": resource,
+                    "sort": sort,
+                }
+            )
+        ).hexdigest()
+        self._validate_resource_id(anchor_id)
+        if len(sort_value.encode("utf-8")) > 4096:
+            raise ProviderStoreError("provider cursor sort boundary exceeds its byte bound")
+        now_epoch = int(self._now().timestamp())
+        expires_at_epoch = now_epoch + self._cursor_ttl_seconds
+        try:
+            token = _CURSOR_TOKEN.pack(
+                _CURSOR_TOKEN_VERSION,
+                now_epoch,
+                expires_at_epoch,
+                bytes.fromhex(query_digest),
+                secrets.token_bytes(_CURSOR_NONCE_BYTES),
+            )
+        except (OverflowError, struct.error, ValueError) as exc:
+            raise ProviderStoreError("provider cursor timestamps are outside token bounds") from exc
+        cursor = (
+            f"{self._b64encode(token)}."
+            f"{self._b64encode(hmac.digest(self._cursor_key, token, 'sha256'))}"
+        )
+        if len(cursor.encode("ascii")) > MAX_RENDERED_CURSOR_BYTES:
+            raise ProviderStoreError("provider cursor exceeds its byte limit")
+        with self._transaction(write=True) as connection:
+            connection.execute(
+                "DELETE FROM pagination_cursors WHERE expires_at_epoch <= ?",
+                (now_epoch,),
+            )
+            count = cast(
+                int,
+                connection.execute("SELECT count(*) FROM pagination_cursors").fetchone()[0],
+            )
+            if count >= self._max_cursor_records:
+                raise ProviderStoreError("live provider cursor capacity is exhausted")
+            connection.execute(
+                """
+                INSERT INTO pagination_cursors(
+                    cursor_digest, query_digest, anchor_id, anchor_value,
+                    created_at_epoch, expires_at_epoch
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    sha256(cursor.encode("ascii")).hexdigest(),
+                    query_digest,
+                    anchor_id,
+                    sort_value,
+                    now_epoch,
+                    expires_at_epoch,
+                ),
+            )
+        return cursor
+
+    def _decode_cursor(
+        self,
+        cursor: str,
+        *,
+        resource: str,
+        filters: Mapping[str, str],
+        sort: str,
+        direction: _Direction,
+    ) -> tuple[str, str]:
+        if type(cursor) is not str or not 1 <= len(cursor.encode("utf-8")) <= MAX_CURSOR_BYTES:
+            raise CursorInvalidError("provider cursor is outside its byte bounds")
+        parts = cursor.split(".")
+        if len(parts) != 2:
+            raise CursorInvalidError("provider cursor has an invalid envelope")
+        try:
+            token = self._b64decode(parts[0])
+            signature = self._b64decode(parts[1])
+        except ValueError as exc:
+            raise CursorInvalidError("provider cursor encoding is invalid") from exc
+        if len(token) != _CURSOR_TOKEN.size or len(signature) != sha256().digest_size:
+            raise CursorInvalidError("provider cursor has an invalid token size")
+        if not hmac.compare_digest(signature, hmac.digest(self._cursor_key, token, "sha256")):
+            raise CursorInvalidError("provider cursor signature is invalid")
+        try:
+            version, issued_at_epoch, expires_at_epoch, bound_query_digest, _nonce = (
+                _CURSOR_TOKEN.unpack(token)
+            )
+        except struct.error as exc:
+            raise CursorInvalidError("provider cursor token is malformed") from exc
+        if version != _CURSOR_TOKEN_VERSION or expires_at_epoch <= issued_at_epoch:
+            raise CursorInvalidError("provider cursor token structure is invalid")
+        query_digest = sha256(
+            _canonical_json_bytes(
+                {
+                    "direction": direction,
+                    "filters": dict(filters),
+                    "resource": resource,
+                    "sort": sort,
+                }
+            )
+        ).hexdigest()
+        if not hmac.compare_digest(bound_query_digest, bytes.fromhex(query_digest)):
+            raise CursorInvalidError("provider cursor is bound to another query")
+        if expires_at_epoch <= int(self._now().timestamp()):
+            raise CursorExpiredError("provider cursor has expired")
+        with self._transaction(write=False) as connection:
+            row = connection.execute(
+                """
+                SELECT query_digest, anchor_id, anchor_value,
+                       created_at_epoch, expires_at_epoch
+                FROM pagination_cursors WHERE cursor_digest = ?
+                """,
+                (sha256(cursor.encode("ascii")).hexdigest(),),
+            ).fetchone()
+        if row is None:
+            raise CursorInvalidError("provider cursor is unknown")
+        if (
+            row["query_digest"] != query_digest
+            or row["created_at_epoch"] != issued_at_epoch
+            or row["expires_at_epoch"] != expires_at_epoch
+        ):
+            raise CursorInvalidError("provider cursor record differs from its signed token")
+        try:
+            self._validate_resource_id(cast(str, row["anchor_id"]))
+        except ContractValidationError as exc:
+            raise CursorInvalidError("provider cursor resource boundary is invalid") from exc
+        if len(cast(str, row["anchor_value"]).encode("utf-8")) > 4096:
+            raise CursorInvalidError("provider cursor sort boundary exceeds its byte bound")
+        return cast(str, row["anchor_value"]), cast(str, row["anchor_id"])
+
+    @staticmethod
+    def _b64encode(value: bytes) -> str:
+        return base64.urlsafe_b64encode(value).rstrip(b"=").decode("ascii")
+
+    @staticmethod
+    def _b64decode(value: str) -> bytes:
+        if not value or _B64_RE.fullmatch(value) is None:
+            raise ValueError("invalid base64url")
+        padding = "=" * (-len(value) % 4)
+        decoded = base64.b64decode(value + padding, altchars=b"-_", validate=True)
+        if DesktopProviderStore._b64encode(decoded) != value:
+            raise ValueError("non-canonical base64url")
+        return decoded
+
+
+__all__ = (
+    "ContractValidationError",
+    "CursorExpiredError",
+    "CursorInvalidError",
+    "DesktopProviderStore",
+    "ETagConflictError",
+    "IdempotencyCapacityError",
+    "IdempotencyConflictError",
+    "IdempotencyResult",
+    "ProviderDataCorruptionError",
+    "ProviderMutation",
+    "ProviderSchemaError",
+    "ProviderStateRootError",
+    "ProviderStoreError",
+    "ResourceInUseError",
+    "ResourceNotFoundError",
+)

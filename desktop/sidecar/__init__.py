@@ -34,6 +34,8 @@ from desktop.sidecar.config import (
     save_desktop_project_config,
 )
 from desktop.sidecar.contracts.v1 import WorkspaceImportRefV1
+from desktop.sidecar.release_app import create_release_desktop_local_api_app
+from desktop.sidecar.release_provider import DesktopReleaseProvider
 from desktop.sidecar.workspace_imports import (
     WorkspaceArchiveValidationError,
     WorkspaceImportError,
@@ -61,6 +63,7 @@ from openevo.deployment.workspace import (
 
 __all__ = [
     "DesktopExecutionStatus",
+    "DesktopReleaseProvider",
     "BackendClient",
     "BackendConnection",
     "DesktopBackendError",
@@ -95,6 +98,7 @@ __all__ = [
     "build_desktop_shell_status",
     "create_sidecar_app",
     "create_sidecar_app_for_project",
+    "create_release_desktop_local_api_app",
     "default_desktop_shell_status",
     "list_desktop_project_configs",
     "load_desktop_project_config",

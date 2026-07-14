@@ -35,7 +35,7 @@ canonical release scope is unchanged, but work proceeds in this order:
 Other backend workstreams pause unless they are required to satisfy the frozen
 Core Control API for that real Desktop flow. Contract simulators can unblock UI
 work but cannot satisfy release or exhibition evidence. No step may modify the
-protected evolution algorithms or replace the existing Polar-based execution,
+protected evolution algorithms or replace the existing legacy upstream execution,
 capture, dataset/job/worker, artifact, context, or runtime path.
 
 ## Working Rules
@@ -415,58 +415,20 @@ independently review:
 
 ## Immediate Execution Order
 
-Continue from the implemented A1/A2.3 and the completed internal A2.4 slices:
+Issue #163 owns the exhibition critical path:
 
-1. Complete the remaining A2.4/A2.5 strict transport, Gateway cutover, external
-   target E2E, duplicate-registry/switch removal, and protected gates.
-2. In parallel, mechanically move A3 Terminal Bench automation out of Core
-   without wrappers or method changes, and implement B1/B2 plus B3.1-B3.5.
-   Mechanical A3 migration may use the current public Core surface, but it is
-   not accepted as complete before B3 revision admission exists.
-3. Bind the migrated automation to B3 admission/queued/not-ready contracts,
-   then complete A3 equivalence and all three performance gates.
-4. Reconnect Desktop through the durable B1 project/run/service APIs and the
-   B3 revision state, while finishing both release execution-mode E2Es.
-5. Expand the mature Desktop workflow and evidence until both science E2Es and
-   every D/E release gate pass on the same release commit.
+1. Merge the frozen Desktop Local API v1 and Core Control API v1 contracts after
+   conformance, packaging, and CI checks pass.
+2. Integrate the reviewed Desktop UI, local store, Core client, SSH/bootstrap,
+   native host, release provider, and workspace-import workstreams.
+3. Replace contract-only and legacy release paths with the production sidecar,
+   native credential/file bridge, and Core-backed run controller.
+4. Run the copied app on macOS against the exhibition GPU server, proving Codex
+   subscription execution, all three non-parametric artifact families, restart
+   recovery, and next-session reuse.
+5. Build the unsigned DMG, verify it from a clean macOS account, and rehearse the
+   complete exhibition workflow with retained diagnostics.
+6. Resume the remaining A-E backlog only after the Desktop path is demonstrable.
 
-This vertical path is the first product milestone. Broader UI polish,
-self-deployed automation, all artifact viewers, packaging, and final benchmark
-runs build on it rather than being designed in isolation.
-
-## PR And Verification Template
-
-Each implementation PR records:
-
-```text
-Issue: Fixes/Part of #...
-Workstream: A/B/C/D/E
-Behavior changed:
-Protected algorithm impact: none / requires preservation rerun
-Tests run:
-Docs updated:
-Remaining follow-up:
-```
-
-Use the smallest focused command set that proves the change, then broaden tests
-for shared contracts. Typical suites include:
-
-```bash
-pytest tests/test_evolution_agent_harnesses.py -q
-pytest tests/trajectory -q
-pytest tests/evolution -q
-pytest tests/gateway/test_evolution_integration.py -q
-pytest tests/backend -q
-pytest tests/ci -q
-
-cd desktop
-npm test -- --run
-npm run build
-npm run build:sidecar
-cd src-tauri
-cargo test --locked
-
-git diff --check
-```
-
-Do not treat this list as a substitute for testing the actual changed workflow.
+Every PR follows `AGENTS.md`, links its issue, states protected-algorithm impact,
+records focused and broad verification, and documents user-visible behavior.

@@ -8,8 +8,11 @@ vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn(),
 }));
 
+const SESSION_TOKEN = "s".repeat(32);
+
 describe("OpenEvo API client host routing", () => {
   afterEach(() => {
+    vi.useRealTimers();
     vi.clearAllMocks();
     vi.restoreAllMocks();
     resetOpenEvoSidecarForTests();
@@ -33,13 +36,7 @@ describe("OpenEvo API client host routing", () => {
 
   it("starts the native sidecar once and routes Tauri API calls to localhost", async () => {
     window.__TAURI_INTERNALS__ = {};
-    vi.mocked(invoke).mockResolvedValue({
-      state: "running",
-      port: 49152,
-      pid: 42,
-      url: "http://127.0.0.1:49152/openevo",
-      command: "python3 -m desktop.server.launcher --port 49152",
-    });
+    vi.mocked(invoke).mockResolvedValue(bootstrapContext(49152, SESSION_TOKEN));
     const fetchMock = vi
       .spyOn(globalThis, "fetch")
       .mockImplementation(() => Promise.resolve(jsonResponse({ status: "ok" })));
@@ -53,19 +50,18 @@ describe("OpenEvo API client host routing", () => {
       "http://127.0.0.1:49152/openevo-api/desktop/shell",
       "http://127.0.0.1:49152/openevo-api/desktop/bootstrap",
     ]);
+    for (const [, init] of fetchMock.mock.calls) {
+      expect(new Headers(init?.headers).get("X-OpenEvo-Desktop-Session")).toBe(
+        SESSION_TOKEN,
+      );
+    }
   });
 
   it("retries sidecar startup after a failed native invoke", async () => {
     window.__TAURI__ = {};
     vi.mocked(invoke)
       .mockRejectedValueOnce(new Error("sidecar missing"))
-      .mockResolvedValueOnce({
-        state: "running",
-        port: 3766,
-        pid: 51,
-        url: null,
-        command: "python3 -m desktop.server.launcher --port 3766",
-      });
+      .mockResolvedValueOnce(bootstrapContext(3766, "t".repeat(32)));
     vi.spyOn(globalThis, "fetch").mockImplementation(() =>
       Promise.resolve(jsonResponse({ status: "ok" })),
     );
@@ -77,10 +73,151 @@ describe("OpenEvo API client host routing", () => {
 
     expect(invoke).toHaveBeenCalledTimes(2);
   });
+
+  it("bootstraps a fresh endpoint after a network-level sidecar failure", async () => {
+    window.__TAURI_INTERNALS__ = {};
+    const replacementToken = "t".repeat(32);
+    vi.mocked(invoke)
+      .mockResolvedValueOnce(bootstrapContext(49152, SESSION_TOKEN))
+      .mockResolvedValueOnce(bootstrapContext(49153, replacementToken));
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockRejectedValueOnce(new TypeError("Failed to fetch"))
+      .mockResolvedValueOnce(jsonResponse({ status: "ok" }));
+
+    await expect(api.get("/openevo-api/desktop/projects")).rejects.toThrow(
+      "Failed to fetch",
+    );
+    await api.get("/openevo-api/desktop/projects");
+
+    expect(invoke).toHaveBeenCalledTimes(2);
+    expect(fetchMock.mock.calls.map(([input]) => String(input))).toEqual([
+      "http://127.0.0.1:49152/openevo-api/desktop/projects",
+      "http://127.0.0.1:49153/openevo-api/desktop/projects",
+    ]);
+    expect(
+      new Headers(fetchMock.mock.calls[1][1]?.headers).get(
+        "X-OpenEvo-Desktop-Session",
+      ),
+    ).toBe(replacementToken);
+  });
+
+  it("times out an ordinary request and reboots through native startup", async () => {
+    vi.useFakeTimers();
+    window.__TAURI_INTERNALS__ = {};
+    const replacementToken = "t".repeat(32);
+    vi.mocked(invoke)
+      .mockResolvedValueOnce(bootstrapContext(49152, SESSION_TOKEN))
+      .mockResolvedValueOnce(bootstrapContext(49153, replacementToken));
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockImplementationOnce((_input, init) => {
+        const signal = init?.signal;
+        return new Promise((_resolve, reject) => {
+          signal?.addEventListener("abort", () => reject(signal.reason), {
+            once: true,
+          });
+        });
+      })
+      .mockResolvedValueOnce(jsonResponse({ status: "ok" }));
+
+    const firstRequest = api.get("/openevo-api/desktop/projects");
+    const timedOut = expect(firstRequest).rejects.toMatchObject({
+      name: "TimeoutError",
+    });
+    await vi.advanceTimersByTimeAsync(15_000);
+    await timedOut;
+    await api.get("/openevo-api/desktop/projects");
+
+    expect(invoke).toHaveBeenCalledTimes(2);
+    expect(fetchMock.mock.calls.map(([input]) => String(input))).toEqual([
+      "http://127.0.0.1:49152/openevo-api/desktop/projects",
+      "http://127.0.0.1:49153/openevo-api/desktop/projects",
+    ]);
+    expect(fetchMock.mock.calls[0][1]?.signal).toBeInstanceOf(AbortSignal);
+    expect(
+      new Headers(fetchMock.mock.calls[1][1]?.headers).get(
+        "X-OpenEvo-Desktop-Session",
+      ),
+    ).toBe(replacementToken);
+  });
+
+  it("does not rebootstrap for auth, contract, or other HTTP errors", async () => {
+    window.__TAURI__ = {};
+    vi.mocked(invoke).mockResolvedValue(bootstrapContext(49152, SESSION_TOKEN));
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse({ detail: "unauthorized" }, 401))
+      .mockResolvedValueOnce(jsonResponse({ code: "contract_mismatch" }, 409))
+      .mockResolvedValueOnce(jsonResponse({ detail: "unavailable" }, 503))
+      .mockResolvedValueOnce(jsonResponse({ status: "ok" }));
+
+    await expect(api.get("/openevo-api/desktop/projects")).rejects.toThrow(
+      "HTTP 401",
+    );
+    await expect(api.get("/openevo-api/desktop/projects")).rejects.toThrow(
+      "HTTP 409",
+    );
+    await expect(api.get("/openevo-api/desktop/projects")).rejects.toThrow(
+      "HTTP 503",
+    );
+    await api.get("/openevo-api/desktop/projects");
+
+    expect(invoke).toHaveBeenCalledTimes(1);
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+  });
+
+  it("does not rebootstrap after a successful response fails contract parsing", async () => {
+    window.__TAURI_INTERNALS__ = {};
+    vi.mocked(invoke).mockResolvedValue(bootstrapContext(49152, SESSION_TOKEN));
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(
+        new Response("{", {
+          headers: { "Content-Type": "application/json" },
+        }),
+      )
+      .mockResolvedValueOnce(jsonResponse({ status: "ok" }));
+
+    await expect(api.get("/openevo-api/desktop/projects")).rejects.toThrow();
+    await api.get("/openevo-api/desktop/projects");
+
+    expect(invoke).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not rebootstrap after a non-network fetch cancellation", async () => {
+    window.__TAURI_INTERNALS__ = {};
+    vi.mocked(invoke).mockResolvedValue(bootstrapContext(49152, SESSION_TOKEN));
+    vi.spyOn(globalThis, "fetch")
+      .mockRejectedValueOnce(new DOMException("Aborted", "AbortError"))
+      .mockResolvedValueOnce(jsonResponse({ status: "ok" }));
+
+    await expect(api.get("/openevo-api/desktop/projects")).rejects.toMatchObject(
+      { name: "AbortError" },
+    );
+    await api.get("/openevo-api/desktop/projects");
+
+    expect(invoke).toHaveBeenCalledTimes(1);
+  });
 });
 
-function jsonResponse(payload: unknown): Response {
+function bootstrapContext(port: number, sessionToken: string) {
+  return {
+    schema_version: "1",
+    endpoint: `http://127.0.0.1:${port}`,
+    session_token: sessionToken,
+    negotiated_contract: {
+      major: 1,
+      openapi_sha256:
+        "3a86582d04dcd233096337c737ba91d75854746848aedc319025d86213a03d36",
+      provider_kind: "desktop_sidecar",
+      feature_flags: ["remote_profiles"],
+    },
+  } as const;
+}
+
+function jsonResponse(payload: unknown, status = 200): Response {
   return new Response(JSON.stringify(payload), {
+    status,
     headers: { "Content-Type": "application/json" },
   });
 }

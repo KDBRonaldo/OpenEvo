@@ -8,7 +8,7 @@ artifacts, and command-based service facades are superseded by
 
 # OpenEvo Desktop SSH Transport Foundation
 
-Tracked by #43.
+Tracked by #43 and hardened for the provider-owned host-key boundary in #163.
 
 This document describes the first concrete transport behind the OpenEvo Desktop
 sidecar executor contract. It lets the local Desktop sidecar run remote
@@ -60,23 +60,144 @@ environment variables, `cwd`, and rsync-created remote paths.
 The local machine running OpenEvo Desktop must have:
 
 - `ssh` available on `PATH`;
+- `ssh-keyscan` available on `PATH` for the controlled host-key probe;
 - `rsync` available on `PATH` for local-folder workspace uploads;
-- network access from the local machine to the remote SSH server;
-- a known-hosts policy configured by the user or operating system.
+- network access from the local machine to the remote SSH server.
 
-Remote `host` values in this slice support OpenSSH host aliases, DNS names, and
-IPv4-style addresses that do not contain `@` or `:`. IPv6 literal hosts are not
-supported yet because rsync destination syntax needs separate bracket handling.
+Remote `host` values support DNS names, IPv4 addresses, and IPv6 literals. IPv6
+rsync destinations use the required bracketed form. Host values that can be
+interpreted as local option or destination injection are rejected before any
+subprocess starts.
 
-The transport does not disable host-key checking. Users should configure
-`~/.ssh/known_hosts` or their OpenSSH config before first real execution.
+Desktop does not read or modify the user's `~/.ssh/known_hosts`. It also disables
+global known-host lookup for every SSH subprocess.
+
+## Provider-Owned Host-Key Trust
+
+`ProviderKnownHostStore` owns enrollment and persistence. Its root must be a
+direct child of a sidecar-owned secure ancestor. The ancestor must be an
+owner-controlled, non-symlink directory that is not group/world writable; the
+store root must be an owner-controlled, non-symlink directory with mode `0700`.
+The store holds no-follow ancestor/root descriptors. Its owner-only root also
+contains the link-count-one `0600` cross-process lock file, so independent store
+instances use one verifiable lock namespace rather than per-instance lock paths.
+Every operation rechecks root and lock pathname-to-descriptor identity and uses
+a shared/exclusive `flock`. Both shared and exclusive acquisition use monotonic,
+nonblocking retry with the same short bounded timeout and return typed
+`host_key_in_use` instead of waiting indefinitely. Each profile
+is mapped to an opaque SHA-256 filename, and each known-host file must be a
+link-count-one, owner-controlled regular file with mode `0600`. Reads are
+descriptor-relative and no-follow. Publication writes and fsyncs a private
+temporary file, publishes it with an atomic no-replace hard link, removes the
+temporary name, and fsyncs the directory. Existing records are immutable unless
+an explicit compare-and-swap rotation succeeds. Store paths reject whitespace,
+quoting, backslashes, and OpenSSH `%` token expansion.
+
+The threat model is an owner-only trust root plus advisory locking among
+cooperating Desktop processes. This prevents non-owner modification and avoids
+accidental or concurrent mutation by cooperating processes. It does not claim
+that pathname or inode checks can stop a malicious process running under the
+same UID. Such a process can inspect process memory, replace owner files, or
+interfere with subprocesses; that means the Desktop account is already
+compromised and is outside this boundary.
+
+OpenSSH accepts a pathname rather than an already-verified file descriptor. For
+each command, rsync, or tunnel spawn, Core therefore copies the validated record
+to a random `0700` lease directory directly under the held secure ancestor. The
+lease file is `0600`, is independent of the mutable trust-store root, and is
+created while the shared store lock is held. Synchronous command/rsync leases
+remain present through subprocess completion; tunnel leases remain present
+until the tunnel closes. Replacing or renaming the trust-store root after
+validation cannot redirect that in-flight pathname to a different key.
+
+A stored record contains both canonical metadata and an OpenSSH known-host line.
+The metadata binds all of:
+
+- remote profile ID;
+- exact host and port;
+- selected host-key algorithm;
+- full public key, including key type and encoded key blob;
+- independently computed `SHA256:` fingerprint.
+
+The fingerprint is not a substitute for the public key. Loading a binding
+recomputes the fingerprint from the stored key and requires the metadata and
+OpenSSH line to be byte-canonical.
+
+Enrollment is explicitly two phase:
+
+1. `probe(profile)` runs `ssh-keyscan` with an argv list and a closed request set
+   of Ed25519, NIST P-256 ECDSA, and RSA keys. It accepts only exact host/port
+   lines and rejects markers, hashed hosts, host lists, duplicate algorithms,
+   comments, extra fields, malformed key blobs, and unsupported algorithms.
+2. The caller independently verifies and submits an exact algorithm and
+   fingerprint from the pending result. `confirm(...)` requires the current
+   profile ID/host/port to match, repeats the probe, and requires the complete
+   candidate set to be unchanged before it persists the selected full key.
+
+The second `ssh-keyscan` only detects a change between the two observations. It
+does not authenticate the server, because an active attacker can answer both
+probes consistently. A TOFU enrollment must display the fingerprint for
+independent verification through an administrator, provider console, or another
+authenticated channel before confirmation.
+
+RSA known-host records use the OpenSSH public-key type `ssh-rsa`; the transport
+pins `rsa-sha2-512` as the corresponding host-key signature algorithm. Probe
+results reject RSA moduli smaller than 2048 bits and never mutate trust state,
+so first contact is not silent TOFU.
+
+Persisted trust is loaded only with an expected fingerprint retained by the
+profile owner. Recreating the same profile ID/host/port without that expected
+fingerprint does not inherit the old binding. `revoke(profile,
+expected_fingerprint=...)` is an atomic compare-and-swap operation.
+`rotate_from_pending(...)` is the only rotation entry: the store verifies its
+private pending seal and canonical digest, exact profile/store identity and
+candidate, repeats the complete probe, then checks the old fingerprint under the
+exclusive lock before replacement. There is no caller-constructible confirmed
+pending capability. Rotation fully rereads and canonical-validates its private
+temporary record before `os.replace`; successful return from `os.replace` is the
+irreversible commit point. Any directory fsync, authoritative reread, or
+canonical-validation failure after that point, including shared context-manager
+unlock or lock-fd close failure, returns sanitized typed
+`host_key_rotation_indeterminate`. Lock cleanup always makes a best-effort
+unlock and fd close. The typed error identifies the confirmed candidate
+fingerprint as the authoritative reload key; callers must reload with that
+fingerprint and must not assume that old trust remains installed. Cleanup
+failure before `os.replace` remains an ordinary fail-closed operation failure.
+
+Before revoke or rotation attempts the exclusive lock, the store requests closure
+of matching tunnels registered in the current process. `SshTunnel` is a context
+manager with idempotent bounded `close()` and a daemon exit monitor that releases
+the trust lease when SSH exits independently. A tunnel in another process must be
+closed by that owner; otherwise mutation fails with `host_key_in_use` after the
+bounded lock timeout. Synchronous commands intentionally keep their shared lease
+until completion. Revoking the store record is not a general remote-session
+termination mechanism. Registration and exit-monitor startup are one constructor
+transaction. A failure after process creation performs bounded
+terminate/wait/kill cleanup, but unregisters the closer and releases the trust
+lease only after `wait` or `poll` proves that the child exited. If cleanup cannot
+confirm exit, a process-local quarantine registry retains the tunnel ownership,
+registration, and lease while a daemon monitor retries. Matching trust mutation
+also retries quarantined cleanup when constructor registration succeeded; later
+tunnel creation retries every quarantined entry. Finalization is idempotent, so
+concurrent recovery paths cannot unregister or close the lease twice. Until one
+path proves exit, revoke and rotation remain blocked by the shared trust lease
+instead of leaving an unmanaged child behind.
+
+`SshRemoteExecutorTransport` requires a `TrustedKnownHostsBinding` and revalidates
+it before building every command. A release call without a binding fails closed.
+This slice deliberately does not add a UI, native host route, contract DTO, or
+Core API for confirmation; those callers must be wired separately before release
+SSH actions can proceed.
 
 ## Supported Auth Modes
 
 Supported:
 
-- `ssh_agent`: uses the local OpenSSH agent or default OpenSSH identity lookup.
-- `private_key`: passes `-i <private_key_path>` as a subprocess argv element.
+- `ssh_agent`: uses OpenSSH agent/default identity lookup without loading user
+  SSH configuration.
+- `private_key`: passes `-i <private_key_path>` as a subprocess argv element,
+  clears default identities with `IdentityFile=none`, sets `IdentitiesOnly=yes`,
+  and disables agent use with `IdentityAgent=none`.
 
 Unsupported in this slice:
 
@@ -102,8 +223,44 @@ the SSH transport.
 `run(command, env=..., cwd=...)` builds:
 
 ```text
-ssh -p <port> [-i <key>] -o BatchMode=yes -l <user> -- <host> <remote-command>
+ssh -F /dev/null -p <port> \
+  [-o IdentityFile=none -i <key> \
+   -o IdentitiesOnly=yes -o IdentityAgent=none] \
+  -o StrictHostKeyChecking=yes \
+  -o UserKnownHostsFile=<private-lease-file> \
+  -o GlobalKnownHostsFile=/dev/null \
+  -o UpdateHostKeys=no \
+  -o CheckHostIP=no \
+  -o VerifyHostKeyDNS=no \
+  -o KnownHostsCommand=none \
+  -o HashKnownHosts=no \
+  -o HostKeyAlgorithms=<confirmed-algorithm> \
+  -o BatchMode=yes -l <user> -- <host> <remote-command>
 ```
+
+`-F /dev/null` prevents `IdentityFile`, `Match`, or `Include` entries in user SSH
+configuration from extending private-key authentication. The same base argv is
+used for remote commands, the rsync remote shell, and SSH tunnels. Neither
+keyscan nor transport subprocesses use `shell=True`.
+
+Remote commands run inside a small shell wrapper that appends a random controlled
+completion marker and the remote exit status to stderr. The transport removes
+that marker before returning output. A verified marker preserves a legitimate
+remote exit `255` as `RemoteCommandResult(return_code=255)`; exit `255` without a
+valid marker is a typed connection failure. Host-key-specific failures may only
+come from a separately verified transport setup/protocol signal, never by parsing
+arbitrary stderr text.
+
+Configuration, host-key, timeout, process-start, connection, and rsync failures
+are renderer-safe closed typed errors. Translation discards the original
+exception object and chain, so exception strings and formatted tracebacks cannot
+expose subprocess argv, stdout/stderr, local or remote paths, lease tokens, or
+credentials. The deployment logger records only the typed code and a random
+opaque diagnostic ID. It never records raw SSH/rsync
+stdout/stderr, exception text, local paths, or usernames. Command output remains
+available only through the existing restricted result/diagnostic handling path;
+known trust paths are redacted from returned remote-command stderr as defense in
+depth.
 
 `env` is injected into the remote command as POSIX assignments:
 
@@ -124,8 +281,9 @@ cd <quoted-cwd> && <command>
 ```
 
 Non-zero remote exit codes are returned as `RemoteCommandResult` values. They do
-not raise. Timeouts raise `TimeoutError`, which the executor converts into
-structured failure reports during preflight or workspace execution.
+not raise, including a marker-verified remote `255`. Timeouts raise
+`TimeoutError`, which the executor converts into structured failure reports
+during preflight or workspace execution.
 
 ## Workspace Upload
 
@@ -134,8 +292,10 @@ structured failure reports during preflight or workspace execution.
 1. verifies the local path exists and is a directory;
 2. verifies the remote path is absolute and uses only the SSH transport safe
    path characters;
-3. creates the remote target directory with `mkdir -p`;
-4. runs `rsync -az --delete -e "ssh ... -l <user>"` from `local_path/` to
+3. creates the remote target directory with `mkdir -p` through the trusted SSH
+   binding;
+4. runs `rsync -az --delete -e "ssh ... <provider trust options> -l <user>"`
+   from `local_path/` to
    `<host>:remote_path/`.
 
 The trailing slash semantics intentionally upload the contents of the local
@@ -147,6 +307,7 @@ This slice does not include:
 
 - password or passphrase vault integration;
 - OpenSSH config editing;
+- UI/native/sidecar contract wiring for host-key confirmation;
 - Windows-specific rsync packaging;
 - host-wide remote dependency installation or repair beyond bootstrap's
   user-site `openevo` and `huggingface_hub` installs;
@@ -163,8 +324,12 @@ the sidecar science plan schema.
 Focused validation:
 
 ```bash
-PYTHONPATH=src /home/ziyi/ProRL-Agent-Server/.venv/bin/python -m pytest tests/openevo/test_cli.py tests/openevo/sidecar tests/openevo/remote tests/openevo/science tests/evolution/test_models.py -q
-PYTHONPATH=src /home/ziyi/ProRL-Agent-Server/.venv/bin/python -m pytest tests/openevo/science tests/evolution/test_models.py --collect-only -q >/tmp/openevo-ssh-transport-collect.txt
-/home/ziyi/ProRL-Agent-Server/.venv/bin/ruff check src/openevo/deployment src/openevo/backend/launcher.py tests/openevo/remote tests/openevo/test_cli.py
+PYTHONPATH=src /home/ziyi/ProRL-Agent-Server/.venv/bin/python -m pytest tests/openevo/remote/test_host_keys.py tests/openevo/remote/test_ssh_transport.py -q
+PYTHONPATH=src /home/ziyi/ProRL-Agent-Server/.venv/bin/python -m pytest tests/openevo/remote -q
+/home/ziyi/ProRL-Agent-Server/.venv/bin/ruff check src/openevo/deployment src/openevo/backend/launcher.py tests/openevo/remote
 git diff --check openevo/stable...HEAD
 ```
+
+The host-key and SSH transport tests use only Python, POSIX file APIs available
+on macOS, OpenSSH when present, and `flock`; they do not depend on Linux `/proc`,
+Linux-only namespaces, or GNU command behavior.

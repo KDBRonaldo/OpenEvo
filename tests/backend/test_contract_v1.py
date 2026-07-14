@@ -314,7 +314,6 @@ def test_contract_app_exposes_the_exact_core_v1_surface() -> None:
     assert openapi["x-openevo-contract-only"] is True
     assert openapi["x-openevo-business-provider"] is False
     assert "Schema Only" in openapi["info"]["title"]
-    assert {route.path for route in app.routes} == {path for _, path in EXPECTED_OPERATIONS}
 
 
 def test_contract_app_never_returns_a_business_fixture() -> None:

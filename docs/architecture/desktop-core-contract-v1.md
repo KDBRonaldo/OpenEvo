@@ -83,15 +83,122 @@ Every error uses `ApiErrorV1`:
 ```
 
 Create and action requests require `Idempotency-Key`. A provider persists the
-principal, route, resource scope, key, canonical request digest, response, and
-status. Replaying the same request returns the same result; reusing the key for
-a different request returns `409 idempotency_key_reused`. Mutable resources use
-ETag and `If-Match`.
+fixed `desktop-local-v1` principal, route, resource scope, key, canonical
+request digest, typed response, and status. Action digests cover the canonical
+body, `If-Match`, and every declared semantic header; callers cannot substitute
+an ETag copied into the body. Replaying the same request revalidates the stored
+response against the route's exact closed response model before returning it.
+Reusing the key for a different request returns `409 idempotency_key_reused`.
+Desktop session tokens and other credential-bearing headers are not accepted as
+principal or semantic idempotency data. Mutable resources use ETag and
+`If-Match`.
+
+The release sidecar stores Local API v1 profiles, project drafts, local
+operations, bounded server-side pagination cursors, and idempotency records in
+its versioned SQLite provider store. The private state root is a real owner-only
+`0700` directory. A non-blocking process-lifetime owner lock prevents two
+cooperating sidecars from owning it concurrently. Before opening SQLite and
+before each write, the provider uses `lstat`/no-follow checks to require the main
+database and any rollback-journal side file to be owner-only, link-count-one
+regular files. WAL/SHM files are rejected. SQLite opens the canonical database
+path normally and uses the standard `DELETE` rollback-journal and `FULL`
+synchronous crash-recovery path; there is no custom VFS, `/dev/fd` database
+opening, journal inode pin, or claim that Python's `sqlite3` provides those
+properties.
+
+The cursor signing key is fully written to an owner-only temporary file,
+fsynced, atomically published with no-replace semantics, and followed by a
+state-root directory fsync. Concurrent first initialization cannot replace the
+winning key. An invalid-size final key left by an interrupted first
+initialization may be recovered only while the database is still the
+never-initialized empty file and no SQLite side file exists; an initialized or
+ambiguous store fails closed.
+
+This filesystem boundary protects against accidental sharing, symlink or
+hard-link setup present at a validation point, and concurrent cooperating
+sidecars. It does not isolate the store from a malicious process running as the
+same OS user: such a process can race pathname checks or modify owner-readable
+state. Desktop relies on the macOS user-account boundary and the owner-only
+state directory for that threat boundary.
+
+Schema v2 has an exact canonical `sqlite_schema` fingerprint and migrates the
+canonical v1 layout transactionally. Startup performs a database-size-bounded
+`integrity_check(1)`, `foreign_key_check`, bounded row and byte accounting, and
+complete validation of migration, resource, operation, cursor, canonical
+JSON/blob, duplicated scalar, timestamp, version, and typed idempotency rows.
+Unknown views, triggers, indexes, or altered DDL are rejected. Database and
+journal byte limits, SQLite `max_page_count`, and `journal_size_limit` are set
+before schema or resource writes and are checked again before commit, so a
+budget rejection rolls the transaction back rather than reporting failure after
+a successful commit.
+
+Startup atomically recovers process-owned transient state: remote profiles
+become disconnected, active project sessions return to draft with stale
+revision pins cleared, and interrupted or now-stale local operations are
+cancelled against that authoritative resource state. Action idempotency stores
+the exact `LocalOperationV1`; replay resolves its current authoritative
+operation row and cannot return an obsolete connected/active result. Resource,
+operation, and idempotency writes commit in one transaction. Local-operation
+reconciliation uses bounded keyset batches and fetches each bounded document
+row individually; startup never materializes the complete operation BLOB set in
+memory.
+
+The store persists only closed Local API fields. Unknown evolution method
+config is recursively checked with case- and separator-normalized denylisted
+keys for credentials/secrets, host paths, and raw diagnostics. The only
+credential data persisted here is Keychain slot status; secret values, native
+credential references, commands, raw process output, Core URLs, and
+bearer/session tokens are not persisted in resource or idempotency data.
+Idempotency responses are retained for a bounded seven-day replay window and
+the live record count is bounded; exhaustion fails closed without evicting an
+unexpired replay. Pagination uses bounded, signed opaque tokens whose UTF-8 sort
+anchors are stored server-side, so all contract-valid names fit without
+expanding the public cursor limit.
+
+At most one project row may be active. Activation switches projects atomically.
+An active project cannot be patched in place, and a connected profile cannot
+change host, port, user, authentication kind, or proxy settings. This prevents
+persisted configuration from diverging from the process-owned session that was
+admitted from it.
+
+Project evolution config is accepted exactly to the aggregate range enforced
+by `ProjectCreateV1`/`ProjectPatchV1`; the store consumes that authoritative
+contract budget and adds no divergent per-project method-config limit.
+
+### Release Local provider phase one
+
+The first production provider slice is created by
+`desktop.sidecar.create_release_desktop_local_api_app`. It binds an implementation
+to the existing contract app by canonical `operation_id`; it does not register a
+second route table. Calling `create_contract_app()` without a provider retains
+the contract-only 501 behavior used for schema generation, and the release app's
+generated OpenAPI document must remain byte-for-byte canonical with that app.
+
+This phase owns the challenge-bound native health proof, Desktop session
+authentication, disconnected local state snapshot, and durable profile/project
+list/create/get/patch/delete routes. Resource responses carry the same ETag in
+the response header and closed response body. Store cursor, idempotency, ETag,
+recovery, and restart behavior is surfaced directly, while store failures are
+normalized to user-safe `ApiErrorV1` responses without filesystem or SQLite
+details.
+
+SSH, Core tunnel, capability validation, operation execution, run, artifact,
+service, diagnostic, maintenance, and event providers are not part of this
+phase. Their contract routes return typed HTTP 503 rather than fixture 501 or a
+synthetic ready/success response. Subsequent providers extend the same
+`DesktopLocalApiProviderV1` operation dispatch after they can satisfy the
+corresponding SSH/Core ownership and attestation requirements.
 
 List routes use `limit` (maximum 100), `after`, `sort`, and `direction`, and
 return `{items, next_cursor, has_more}`. A cursor is bound to the filters and
-sort order. `has_more` is true if and only if `next_cursor` is non-null. Invalid
-cursors return 400; expired cursors return 410.
+sort order. Its server-side boundary contains the typed sort value and resource
+ID; continuation never re-reads a mutable anchor row, so deleting or editing
+that row does not change the next-page boundary. `has_more` is true if and only
+if `next_cursor` is non-null. Invalid cursors return 400; expired cursors return
+410. The bounded HMAC token carries its version, issued and expiry times, and
+query binding. Providers verify the signature, structure, and binding before
+expiry, so TTL cleanup of the server-side boundary cannot turn a valid expired
+cursor into an unknown-cursor 400.
 
 Core SSE uses closed `SseFrameV1` objects whose wire `id` and versioned `event`
 must exactly match `data.id` and `data.event` in the typed `EventEnvelopeV1`.

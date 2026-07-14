@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { Link, NavLink, Route, Routes, useLocation } from "react-router-dom";
 import { useQueryClient } from "@tanstack/react-query";
 import { Dashboard } from "./routes/Dashboard";
@@ -8,6 +8,9 @@ import { SessionDetail } from "./routes/SessionDetail";
 import { Compare } from "./routes/Compare";
 import { OpenEvoDesktop } from "./routes/OpenEvoDesktop";
 import { subscribeOpenEvoEvents } from "./api/sse";
+import { DesktopProductApp } from "./product/DesktopProductApp";
+import { type DesktopProductProvider, unavailableDesktopProductProvider } from "./product/provider";
+import { createReleaseDesktopProductProvider } from "./product/releaseProvider";
 
 const isOpenEvoDesktopOnlyBuild =
   import.meta.env.VITE_OPENEVO_DESKTOP_ONLY === "true";
@@ -125,29 +128,35 @@ export function SharedDashboardShell() {
   );
 }
 
-export function OpenEvoDesktopOnlyShell() {
+export function OpenEvoDesktopOnlyShell({ provider }: { provider?: DesktopProductProvider }) {
   return (
-    <div className="min-h-full bg-slate-50 text-slate-900">
-      <main className="mx-auto w-full max-w-7xl px-4 py-4">
-        <Routes>
-          <Route path="/" element={<OpenEvoDesktop />} />
-          <Route path="/openevo/*" element={<OpenEvoDesktop />} />
-          <Route path="*" element={<OpenEvoDesktop />} />
-        </Routes>
-      </main>
-    </div>
+    <Routes>
+      <Route path="*" element={<DesktopProductApp provider={provider} />} />
+    </Routes>
   );
 }
 
-export function AppShell({ desktopOnly = false }: { desktopOnly?: boolean }) {
-  return desktopOnly ? <OpenEvoDesktopOnlyShell /> : <SharedDashboardShell />;
+export function AppShell({ desktopOnly = false, productProvider }: { desktopOnly?: boolean; productProvider?: DesktopProductProvider }) {
+  return desktopOnly ? <OpenEvoDesktopOnlyShell provider={productProvider} /> : <SharedDashboardShell />;
+}
+
+function ReleaseDesktopProductShell() {
+  const [provider, setProvider] = useState<DesktopProductProvider>(unavailableDesktopProductProvider);
+  useEffect(() => {
+    let active = true;
+    void createReleaseDesktopProductProvider()
+      .then((negotiated) => { if (active) setProvider(negotiated); })
+      .catch(() => { if (active) setProvider(unavailableDesktopProductProvider); });
+    return () => { active = false; };
+  }, []);
+  return <OpenEvoDesktopOnlyShell provider={provider} />;
 }
 
 // Keep this build-time branch at the entrypoint so Vite can drop shared
 // dashboard code from OpenEvo-only bundles.
 export default function App() {
   return isOpenEvoDesktopOnlyBuild ? (
-    <OpenEvoDesktopOnlyShell />
+    <ReleaseDesktopProductShell />
   ) : (
     <SharedDashboardShell />
   );
