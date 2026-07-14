@@ -8,6 +8,8 @@ import { SessionDetail } from "./routes/SessionDetail";
 import { Compare } from "./routes/Compare";
 import { OpenEvoDesktop } from "./routes/OpenEvoDesktop";
 import { subscribeOpenEvoEvents } from "./api/sse";
+import { DesktopProductApp } from "./product/DesktopProductApp";
+import type { DesktopProductProvider } from "./product/provider";
 
 const isOpenEvoDesktopOnlyBuild =
   import.meta.env.VITE_OPENEVO_DESKTOP_ONLY === "true";
@@ -125,22 +127,16 @@ export function SharedDashboardShell() {
   );
 }
 
-export function OpenEvoDesktopOnlyShell() {
+export function OpenEvoDesktopOnlyShell({ provider }: { provider?: DesktopProductProvider }) {
   return (
-    <div className="min-h-full bg-slate-50 text-slate-900">
-      <main className="mx-auto w-full max-w-7xl px-4 py-4">
-        <Routes>
-          <Route path="/" element={<OpenEvoDesktop />} />
-          <Route path="/openevo/*" element={<OpenEvoDesktop />} />
-          <Route path="*" element={<OpenEvoDesktop />} />
-        </Routes>
-      </main>
-    </div>
+    <Routes>
+      <Route path="*" element={<DesktopProductApp provider={provider} />} />
+    </Routes>
   );
 }
 
-export function AppShell({ desktopOnly = false }: { desktopOnly?: boolean }) {
-  return desktopOnly ? <OpenEvoDesktopOnlyShell /> : <SharedDashboardShell />;
+export function AppShell({ desktopOnly = false, productProvider }: { desktopOnly?: boolean; productProvider?: DesktopProductProvider }) {
+  return desktopOnly ? <OpenEvoDesktopOnlyShell provider={productProvider} /> : <SharedDashboardShell />;
 }
 
 // Keep this build-time branch at the entrypoint so Vite can drop shared
