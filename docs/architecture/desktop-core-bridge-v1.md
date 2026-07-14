@@ -106,6 +106,18 @@ checks generation and deadline before and after the call, and cannot overlap
 successful retirement. The strict client supplies the inner HTTP/SSE response
 and cache delivery barrier.
 
+The published session and `CoreActivationV1` retain a non-secret Local binding:
+the Local project ID, profile ID, saved Local ETag, and SHA-256 of the canonical
+mapped `ProjectCreateV1` intent. Bridge capabilities, project validation, and
+run creation accept the complete saved Local `ProjectV1`, not a project ID.
+They recompute and compare that binding after acquiring the active generation's
+external lease. Every following Core transport re-enters the same token gate,
+so cancellation between the comparison and transport fails with
+`active_project_session_superseded` without sending the request. A different
+project ID fails with `active_project_mismatch`; profile, ETag, or mapped-intent
+drift fails with `active_local_project_version_mismatch`. Both are typed 409
+errors raised before Core transport.
+
 Activation, switch, and close are serialized. A switch first cancels and fully
 retires the previous candidate or active token; no new host/Core work starts
 until its clients, adapter work, archive contexts, and tunnel are closed. A
@@ -182,19 +194,27 @@ even though their predecessor request digest equals the current request digest.
 
 ## Run And Resource Proxy
 
-Local run creation supplies only the active local project ID and idempotency
-key. The bridge rereads the Core project, pinned capabilities, validation, and
-revision head. A reachable successor whose transition is not failed, cancelled,
-or unavailable is required; otherwise the active head is required. The bridge
-then constructs Core `RunCreateV1` from the authoritative project/task/workspace
-snapshot refs and registry digest.
+The renderer-facing run route still supplies only the active local project ID
+and idempotency key. Its future release-routing adapter must atomically load the
+saved `ProjectV1` selected by the route's Local ETag and pass that complete
+object to the bridge. The bridge verifies its activation binding, then rereads
+the Core project, pinned capabilities, validation, and revision head. A
+reachable successor whose transition is not failed, cancelled, or unavailable
+is required; otherwise the active head is required. The bridge then constructs
+Core `RunCreateV1` from the authoritative project/task/workspace snapshot refs
+and registry digest. A Core-only direct revision successor may change Core ETag
+and revision authority without requiring a new Local ETag because it does not
+change the saved Local binding.
 
 Run list/get/cancel/retry/timeline/log/context, artifacts, services, Core
 operations and referenced logs, diagnostics, maintenance, and events delegate
 to `CoreControlClientV1`. Core DTOs are returned unchanged. The strict client
 continues to enforce project membership, private-value scanning, bounded
-responses, ETags, idempotency, and release contract pins. Core HTTP 503 errors
-remain the exact typed Core error; the bridge does not synthesize readiness.
+responses, ETags, idempotency, and release contract pins. No public bridge
+method exposes `CoreClientErrorV1`: an exact Core `ApiErrorV1`, including HTTP
+503, is retained inside `DesktopCoreBridgeErrorV1`, while a strict-client local
+error is converted to a closed user-safe `ApiErrorV1`. The same rule covers
+deferred SSE iteration. The bridge does not synthesize readiness.
 
 ## Release Wiring Status
 

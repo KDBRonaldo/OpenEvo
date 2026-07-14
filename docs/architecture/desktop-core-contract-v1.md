@@ -366,6 +366,13 @@ SSH tunnel, fetches the current Core project snapshots, verified capabilities,
 revision head, and model readiness, calls Core validation, and only then
 constructs the Core run-admission request. React never creates or caches an
 authoritative snapshot, registry digest, or required revision reference.
+The bridge generation is bound to that saved project's ID, profile ID, Local
+ETag, and canonical mapped-intent digest. Capability, validation, and run calls
+compare the complete saved `ProjectV1` under the same generation lease that
+guards their Core transport; drift returns a typed 409 before transport rather
+than reusing the prior tunnel. Core-only revision and Core ETag successors do
+not imply a Local configuration edit and therefore do not require a new Local
+ETag.
 
 Capability responses wrap the complete framework-owned
 `EvolutionCapabilitiesV1`; they preserve `supported`, `unsupported`, and

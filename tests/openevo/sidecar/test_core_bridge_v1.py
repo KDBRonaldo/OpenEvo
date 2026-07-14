@@ -4,6 +4,7 @@ from concurrent.futures import Future, TimeoutError as FutureTimeoutError
 from dataclasses import fields, replace
 import hashlib
 import io
+import json
 import secrets
 import threading
 import time
@@ -854,14 +855,26 @@ def test_activate_then_create_run_uses_real_strict_clients_and_core_authority() 
         local_project,
         idempotency_key="activate-local-project-0001",
     )
+    capabilities = bridge.capabilities(local_project)
+    validation = bridge.validate_project(
+        local_project,
+        idempotency_key="validate-local-project-0001",
+    )
     run = bridge.create_run(
-        LOCAL_PROJECT_ID,
+        local_project,
         idempotency_key="create-run-local-project-0001",
     )
 
     assert activation.local_project_id == LOCAL_PROJECT_ID
+    assert activation.profile_id == PROFILE_ID
+    assert activation.local_project_etag == ETAG_A
+    assert activation.local_project_intent_sha256 == bridge_module._model_digest(
+        map_project_create_v1(local_project)
+    )
     assert activation.core_project.id == CORE_PROJECT_ID
     assert activation.validation.valid is True
+    assert capabilities.registry_digest == REGISTRY_DIGEST
+    assert validation.valid is True
     assert persistence.events[0] == "reserve_create"
     assert persistence.mapping is not None
     assert fake_core.created is True
@@ -1118,7 +1131,7 @@ def test_unknown_project_create_outcome_retries_exact_persisted_intent() -> None
         fake_core=fake_core,
     )
 
-    with pytest.raises(CoreClientErrorV1):
+    with pytest.raises(DesktopCoreBridgeErrorV1):
         first.activate_project(
             local_project,
             idempotency_key="activate-unknown-outcome-0001",
@@ -1153,7 +1166,7 @@ def test_unknown_project_create_outcome_rejects_a_different_retry_key() -> None:
         persistence=persistence,
         fake_core=fake_core,
     )
-    with pytest.raises(CoreClientErrorV1):
+    with pytest.raises(DesktopCoreBridgeErrorV1):
         first.activate_project(
             local_project,
             idempotency_key="activate-unknown-outcome-0001",
@@ -1204,7 +1217,7 @@ def test_create_run_requires_reachable_nonterminal_successor() -> None:
     )
 
     bridge.create_run(
-        LOCAL_PROJECT_ID,
+        local_project,
         idempotency_key="create-run-successor-0001",
     )
 
@@ -1222,12 +1235,160 @@ def test_cross_project_proxy_fails_before_transport() -> None:
     bridge, _, fake_core, _ = _bridge(local_project)
     bridge.activate_project(local_project, idempotency_key="activate-local-project-0001")
     calls_before = len(fake_core.calls)
+    other_project = local_project.model_copy(update={"project_id": "another-local-project"})
 
     with pytest.raises(DesktopCoreBridgeErrorV1) as exc_info:
-        bridge.capabilities("another-local-project")
+        bridge.capabilities(other_project)
 
     assert exc_info.value.error.code == "active_project_mismatch"
     assert len(fake_core.calls) == calls_before
+
+
+@pytest.mark.parametrize("method", ["capabilities", "validate", "create_run"])
+def test_local_project_etag_drift_fails_before_core_transport(method: str) -> None:
+    local_project = _local_project()
+    bridge, _, fake_core, _ = _bridge(local_project)
+    bridge.activate_project(local_project, idempotency_key="activate-binding-a-0001")
+    edited = local_project.model_copy(
+        update={"etag": ETAG_B, "updated_at": "2026-07-14T12:01:00Z"}
+    )
+    calls_before = len(fake_core.calls)
+
+    with pytest.raises(DesktopCoreBridgeErrorV1) as exc_info:
+        if method == "capabilities":
+            bridge.capabilities(edited)
+        elif method == "validate":
+            bridge.validate_project(edited, idempotency_key="validate-binding-b-0001")
+        else:
+            bridge.create_run(edited, idempotency_key="create-run-binding-b-0001")
+
+    assert exc_info.value.error.code == "active_local_project_version_mismatch"
+    assert exc_info.value.error.http_status == 409
+    assert len(fake_core.calls) == calls_before
+
+
+@pytest.mark.parametrize(
+    "update",
+    [
+        {"profile_id": "profile-2"},
+        {"name": "Edited without a matching activation"},
+    ],
+    ids=["profile", "mapped-intent"],
+)
+def test_local_project_binding_drift_fails_before_core_transport(
+    update: dict[str, object],
+) -> None:
+    local_project = _local_project()
+    bridge, _, fake_core, _ = _bridge(local_project)
+    bridge.activate_project(local_project, idempotency_key="activate-binding-a-0001")
+    edited = local_project.model_copy(update=update)
+    calls_before = len(fake_core.calls)
+
+    with pytest.raises(DesktopCoreBridgeErrorV1) as exc_info:
+        bridge.capabilities(edited)
+
+    assert exc_info.value.error.code == "active_local_project_version_mismatch"
+    assert len(fake_core.calls) == calls_before
+
+
+def test_authority_only_revision_successor_keeps_local_project_binding_valid() -> None:
+    local_project = _local_project()
+    bridge, _, fake_core, _ = _bridge(local_project)
+    bridge.activate_project(local_project, idempotency_key="activate-authority-a-0001")
+    successor = core_v1.RevisionRefV1(
+        id="revision-1",
+        project_id=CORE_PROJECT_ID,
+        generation=1,
+        manifest_sha256="7" * 64,
+    )
+    successor_etag = '"' + "7" * 64 + '"'
+    fake_core.active_revision = successor
+    fake_core.project_etag = successor_etag
+    fake_core.project_updated_at = "2026-07-14T12:02:00Z"
+    fake_core.head = _head(active_revision=successor, etag=successor_etag)
+
+    run = bridge.create_run(
+        local_project,
+        idempotency_key="create-run-authority-successor-0001",
+    )
+
+    assert run.required_revision.revision == successor
+    assert fake_core.run_requests[-1].project_snapshot == READY_PROJECT_SNAPSHOT
+
+
+def test_project_binding_and_core_transport_share_one_generation_lease(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    local_project = _local_project()
+    bridge, _, _, _ = _bridge(local_project)
+    bridge.activate_project(local_project, idempotency_key="activate-lease-a-0001")
+    assert bridge._active is not None
+    old_client = bridge._active.client
+    original_check = bridge._ensure_local_project_binding
+    check_entered = threading.Event()
+    check_release = threading.Event()
+    old_transport_called = threading.Event()
+    first_check = True
+
+    def blocking_check(
+        session: bridge_module.DesktopCoreActiveSessionV1,
+        project: local_v1.ProjectV1,
+    ) -> None:
+        nonlocal first_check
+        original_check(session, project)
+        if first_check:
+            first_check = False
+            check_entered.set()
+            assert check_release.wait(timeout=2)
+
+    def old_capabilities(
+        _mode: core_v1.ExecutionMode,
+    ) -> core_v1.CapabilitiesResponseV1:
+        old_transport_called.set()
+        return _capabilities()
+
+    monkeypatch.setattr(bridge, "_ensure_local_project_binding", blocking_check)
+    monkeypatch.setattr(old_client, "capabilities", old_capabilities)
+    capability_result: list[object] = []
+    activation_result: list[object] = []
+
+    def read_capabilities() -> None:
+        try:
+            capability_result.append(bridge.capabilities(local_project))
+        except BaseException as exc:
+            capability_result.append(exc)
+
+    edited = local_project.model_copy(
+        update={"etag": ETAG_B, "updated_at": "2026-07-14T12:03:00Z"}
+    )
+
+    def activate_edited() -> None:
+        try:
+            activation_result.append(
+                bridge.activate_project(edited, idempotency_key="activate-lease-b-0002")
+            )
+        except BaseException as exc:
+            activation_result.append(exc)
+
+    reader = threading.Thread(target=read_capabilities)
+    reader.start()
+    assert check_entered.wait(timeout=1)
+    activator = threading.Thread(target=activate_edited)
+    activator.start()
+    for _ in range(100):
+        if bridge._active is not None and bridge._active.token.cancelled:
+            break
+        time.sleep(0.01)
+    assert bridge._active is not None
+    assert bridge._active.token.cancelled is True
+    check_release.set()
+    reader.join(timeout=2)
+    activator.join(timeout=2)
+
+    assert isinstance(capability_result[0], DesktopCoreBridgeErrorV1)
+    assert capability_result[0].error.code == "active_project_session_superseded"
+    assert old_transport_called.is_set() is False
+    assert isinstance(activation_result[0], bridge_module.CoreActivationV1)
 
 
 def test_mapping_snapshot_drift_fails_closed() -> None:
@@ -1454,7 +1615,7 @@ def test_unfinalized_import_patch_aborts_stale_upload_and_only_finalizes_new_wor
         archive_source=FakeArchiveSource(archive_b),
     )
 
-    with pytest.raises(CoreClientErrorV1):
+    with pytest.raises(DesktopCoreBridgeErrorV1):
         second.activate_project(modified, idempotency_key="draft-import-b-0002")
 
     assert fake_core.uploads["upload-1"].status is core_v1.WorkspaceUploadStatus.ABORTED
@@ -1508,7 +1669,7 @@ def test_unknown_patch_outcome_replays_the_exact_versioned_request_key() -> None
     )
     fake_core.lose_patch_before_apply_once = True
 
-    with pytest.raises(CoreClientErrorV1):
+    with pytest.raises(DesktopCoreBridgeErrorV1):
         bridge.activate_project(modified, idempotency_key="local-patch-action-0001")
 
     original_mapping = persistence.mapping
@@ -1546,7 +1707,7 @@ def test_unknown_patch_outcome_already_applied_is_replayed_exactly() -> None:
     )
     fake_core.lose_patch_after_apply_once = True
 
-    with pytest.raises(CoreClientErrorV1):
+    with pytest.raises(DesktopCoreBridgeErrorV1):
         bridge.activate_project(modified, idempotency_key="applied-patch-action-0001")
 
     activation = bridge.activate_project(
@@ -2781,11 +2942,70 @@ def test_core_503_is_preserved_without_synthetic_capability_success() -> None:
     bridge, _, fake_core, _ = _bridge(local_project)
     fake_core.fail_capabilities_with_503 = True
 
-    with pytest.raises(CoreClientErrorV1) as exc_info:
+    with pytest.raises(DesktopCoreBridgeErrorV1) as exc_info:
         bridge.activate_project(local_project, idempotency_key="activate-local-project-0001")
 
     assert exc_info.value.error.http_status == 503
     assert exc_info.value.error.code == "route_not_implemented"
+
+
+def test_active_proxy_preserves_exact_core_api_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    local_project = _local_project()
+    bridge, _, _, _ = _bridge(local_project)
+    bridge.activate_project(local_project, idempotency_key="activate-error-boundary-0001")
+    assert bridge._active is not None
+    api_error = core_v1.ApiErrorV1.model_validate_json(
+        json.dumps(_core_error(), separators=(",", ":"))
+    )
+
+    def fail_list_runs(**_kwargs: object) -> core_v1.RunPageV1:
+        raise CoreClientErrorV1(api_error.http_status, api_error)
+
+    monkeypatch.setattr(bridge._active.client, "list_runs", fail_list_runs)
+
+    with pytest.raises(DesktopCoreBridgeErrorV1) as exc_info:
+        bridge.list_runs()
+
+    assert exc_info.value.error is api_error
+
+
+def test_event_iteration_translates_core_client_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    local_project = _local_project()
+    bridge, _, _, _ = _bridge(local_project)
+    bridge.activate_project(local_project, idempotency_key="activate-event-error-0001")
+    assert bridge._active is not None
+    api_error = core_v1.ApiErrorV1.model_validate_json(
+        json.dumps(_core_error(), separators=(",", ":"))
+    )
+
+    class FailingEventContext:
+        def __enter__(self) -> FailingEventContext:
+            return self
+
+        def __exit__(self, *_exc: object) -> None:
+            return None
+
+        def __iter__(self) -> FailingEventContext:
+            return self
+
+        def __next__(self) -> core_v1.SseFrameV1:
+            raise CoreClientErrorV1(api_error.http_status, api_error)
+
+    monkeypatch.setattr(
+        bridge._active.client,
+        "events",
+        lambda **_kwargs: FailingEventContext(),
+    )
+
+    with bridge.events() as events:
+        with pytest.raises(DesktopCoreBridgeErrorV1) as exc_info:
+            next(events)
+
+    assert exc_info.value.error is api_error
 
 
 def test_switch_and_close_seal_old_client_before_new_delivery(
@@ -2860,7 +3080,7 @@ def test_new_activation_retires_an_inflight_candidate_before_starting_core_work(
     first.join(timeout=2)
     second.join(timeout=2)
 
-    assert isinstance(first_result[0], DesktopCoreBridgeErrorV1 | CoreClientErrorV1)
+    assert isinstance(first_result[0], DesktopCoreBridgeErrorV1)
     assert isinstance(second_result[0], bridge_module.CoreActivationV1)
     create_calls = [
         request
@@ -2882,9 +3102,10 @@ def test_private_identity_is_rejected_before_proxy_transport() -> None:
     calls_before = len(fake_core.calls)
     bearer = bridge._active.attachment.bearer_token
 
-    with pytest.raises(CoreClientErrorV1):
+    with pytest.raises(DesktopCoreBridgeErrorV1) as exc_info:
         bridge.get_run(bearer)
 
+    assert exc_info.value.error.code == "invalid_core_request"
     assert len(fake_core.calls) == calls_before
 
 
@@ -2969,7 +3190,7 @@ def test_close_rejects_new_calls_and_is_idempotent() -> None:
     bridge.close()
 
     with pytest.raises(DesktopCoreBridgeErrorV1) as exc_info:
-        bridge.capabilities(LOCAL_PROJECT_ID)
+        bridge.capabilities(local_project)
     assert exc_info.value.error.code == "desktop_core_bridge_closed"
 
 
@@ -3341,7 +3562,7 @@ def test_close_seals_inflight_candidate_before_any_later_core_mutation(
     close_thread.join(timeout=2)
 
     assert close_result == ["closed"]
-    assert isinstance(activation_result[0], DesktopCoreBridgeErrorV1 | CoreClientErrorV1)
+    assert isinstance(activation_result[0], DesktopCoreBridgeErrorV1)
     assert all(request.url.path != forbidden_path for request in fake_core.calls)
     if path.endswith("/validate"):
         assert persistence.mapping is None
@@ -3506,7 +3727,7 @@ def test_deterministic_precreate_failure_allows_a_new_local_retry_key() -> None:
         persistence=persistence,
         fake_core=fake_core,
     )
-    with pytest.raises(CoreClientErrorV1):
+    with pytest.raises(DesktopCoreBridgeErrorV1):
         first.activate_project(local_project, idempotency_key="precreate-failure-key-0001")
 
     assert persistence.operation is not None

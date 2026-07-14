@@ -284,6 +284,15 @@ receives only the profile identity and remote Core port, while the bearer
 remains between the host service and the strict client and is excluded from
 dataclass representations and normalized errors.
 
+The active session and activation result also bind the non-secret Local
+project ID, profile ID, saved ETag, and canonical mapped-intent digest.
+Capabilities, validation, and run creation receive the complete saved
+`ProjectV1` and compare all four values only after entering the generation
+lease. Their Core transports re-enter the same token gate, so a project edit or
+session replacement cannot race a successful precheck into an old-tunnel
+request. Project-ID drift and Local-version drift return distinct typed 409
+errors before transport.
+
 Activation negotiates version and verified capabilities, performs an exact
 idempotent Core project create only when no durable mapping exists, publishes a
 native-folder workspace through the bounded chunk protocol, validates the
@@ -363,12 +372,17 @@ switch waits for that work and all resources; if bounded retirement cannot
 prove completion, it returns a typed retryable error instead of announcing the
 transition.
 
-Run creation accepts only the active local project ID. The bridge rereads Core
-project snapshots, capabilities, validation, and revision head, chooses a
-reachable nonterminal successor before the active head, and builds Core's
-`RunCreateV1`. Other run, artifact, service, Core operation, log, diagnostic,
-maintenance, and event methods preserve the strict Core DTOs and project
-membership checks.
+The renderer-facing run contract accepts only the active local project ID; the
+later release-routing adapter must load its ETag-selected saved `ProjectV1` and
+pass that complete object to the bridge. The bridge rereads Core project
+snapshots, capabilities, validation, and revision head, chooses a reachable
+nonterminal successor before the active head, and builds Core's `RunCreateV1`.
+Core-only direct revision successors do not require a Local ETag change. Other
+run, artifact, service, Core operation, log, diagnostic, maintenance, and event
+methods preserve strict Core DTOs and project membership checks. Every public
+bridge method exposes only `DesktopCoreBridgeErrorV1`: exact Core `ApiErrorV1`
+values are retained, strict-client local errors become closed `ApiErrorV1`
+values, and deferred event-iterator failures use the same boundary.
 
 This module is not yet wired into `DesktopReleaseProvider` or
 `DesktopProviderStore`. The store has no durable Core mapping/create/patch-operation

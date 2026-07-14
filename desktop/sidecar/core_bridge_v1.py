@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import base64
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from concurrent.futures import Future, TimeoutError as FutureTimeoutError
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, replace
@@ -22,6 +22,7 @@ import httpx
 from desktop.sidecar.contracts.v1 import models as local_v1
 from desktop.sidecar.core_client_v1 import (
     CoreBootstrapTunnelConnectionV1,
+    CoreClientErrorV1,
     CoreControlClientV1,
     CoreProjectBootstrapClientV1,
     CoreTunnelConnectionV1,
@@ -602,6 +603,9 @@ class DesktopCoreBridgePersistence(Protocol):
 @dataclass(frozen=True, slots=True)
 class CoreActivationV1:
     local_project_id: str
+    profile_id: str
+    local_project_etag: str
+    local_project_intent_sha256: str
     core_project: core_v1.ProjectV1
     capabilities: core_v1.CapabilitiesResponseV1
     revision_head: core_v1.RevisionHeadV1
@@ -614,6 +618,8 @@ class DesktopCoreActiveSessionV1:
     generation: int
     local_project_id: str
     profile_id: str
+    local_project_etag: str
+    local_project_intent_sha256: str
     attachment: CoreHostAttachmentV1
     tunnel: CoreTunnelHandleV1
     client: CoreControlClientV1
@@ -1039,6 +1045,8 @@ class DesktopCoreBridgeV1:
                 generation=generation,
                 local_project_id=project.project_id,
                 profile_id=project.profile_id,
+                local_project_etag=project.etag,
+                local_project_intent_sha256=request_sha256,
                 attachment=attachment,
                 tunnel=tunnel,
                 client=client,
@@ -1049,6 +1057,9 @@ class DesktopCoreBridgeV1:
             self._publish_activation(candidate)
             return CoreActivationV1(
                 local_project_id=project.project_id,
+                profile_id=project.profile_id,
+                local_project_etag=project.etag,
+                local_project_intent_sha256=request_sha256,
                 core_project=core_project,
                 capabilities=capabilities,
                 revision_head=revision_head,
@@ -1059,19 +1070,30 @@ class DesktopCoreBridgeV1:
                 self._cleanup_failed_candidate(token, deadline=deadline)
             except BaseException as cleanup_exc:
                 raise cleanup_exc from exc
+            if isinstance(exc, CoreClientErrorV1):
+                raise _bridge_client_error(exc) from None
             raise
 
-    def capabilities(self, local_project_id: str) -> core_v1.CapabilitiesResponseV1:
-        def call(session: DesktopCoreActiveSessionV1) -> core_v1.CapabilitiesResponseV1:
-            return session.client.capabilities(session.project.spec.execution_mode)
+    def capabilities(self, project: local_v1.ProjectV1) -> core_v1.CapabilitiesResponseV1:
+        def call(
+            session: DesktopCoreActiveSessionV1,
+            deadline: float,
+        ) -> core_v1.CapabilitiesResponseV1:
+            return self._core_external(
+                session.token,
+                deadline,
+                lambda: session.client.capabilities(session.project.spec.execution_mode),
+            )
 
-        return self._invoke(local_project_id, call)
+        return self._invoke_project(project, call)
 
     def validate_project(
-        self, local_project_id: str, *, idempotency_key: str
+        self, project: local_v1.ProjectV1, *, idempotency_key: str
     ) -> core_v1.ProjectValidationResponseV1:
-        def call(session: DesktopCoreActiveSessionV1) -> core_v1.ProjectValidationResponseV1:
-            deadline = time.monotonic() + self._timeout
+        def call(
+            session: DesktopCoreActiveSessionV1,
+            deadline: float,
+        ) -> core_v1.ProjectValidationResponseV1:
             project, capabilities = self._refresh_authority(session, deadline)
             return self._validate_current(
                 session.token,
@@ -1082,11 +1104,15 @@ class DesktopCoreBridgeV1:
                 idempotency_key=idempotency_key,
             )
 
-        return self._invoke(local_project_id, call)
+        return self._invoke_project(project, call)
 
-    def create_run(self, local_project_id: str, *, idempotency_key: str) -> core_v1.RunV1:
-        def call(session: DesktopCoreActiveSessionV1) -> core_v1.RunV1:
-            deadline = time.monotonic() + self._timeout
+    def create_run(
+        self,
+        project: local_v1.ProjectV1,
+        *,
+        idempotency_key: str,
+    ) -> core_v1.RunV1:
+        def call(session: DesktopCoreActiveSessionV1, deadline: float) -> core_v1.RunV1:
             project, capabilities = self._refresh_authority(session, deadline)
             head = self._core_external(session.token, deadline, session.client.revision_head)
             if head.active_revision != project.active_revision:
@@ -1133,7 +1159,7 @@ class DesktopCoreBridgeV1:
                 ),
             )
 
-        return self._invoke(local_project_id, call)
+        return self._invoke_project(project, call)
 
     def list_runs(self, **kwargs: Any) -> core_v1.RunPageV1:
         return self._invoke_active(lambda session: session.client.list_runs(**kwargs))
@@ -1333,7 +1359,7 @@ class DesktopCoreBridgeV1:
         )
 
     def events(self, *, last_event_id: str | None = None):
-        session, generation = self._session(None)
+        session, generation = self._session()
         return _BridgeEventContext(self, session, generation, last_event_id)
 
     def _begin_activation(self, deadline: float) -> _GenerationToken:
@@ -1517,7 +1543,10 @@ class DesktopCoreBridgeV1:
         deadline: float,
         action: Callable[[], _ResponseT],
     ) -> _ResponseT:
-        return self._external_call(token, deadline, action)
+        try:
+            return self._external_call(token, deadline, action)
+        except CoreClientErrorV1 as exc:
+            raise _bridge_client_error(exc) from None
 
     def _adapter_external(
         self,
@@ -1577,6 +1606,8 @@ class DesktopCoreBridgeV1:
             ) from None
         except DesktopCoreBridgeErrorV1:
             raise
+        except CoreClientErrorV1 as exc:
+            raise _bridge_client_error(exc) from None
         except BaseException:
             raise _bridge_error(
                 "core_bridge_adapter_failed",
@@ -2384,7 +2415,7 @@ class DesktopCoreBridgeV1:
                 retryable=True,
             )
 
-    def _session(self, local_project_id: str | None) -> tuple[DesktopCoreActiveSessionV1, int]:
+    def _session(self) -> tuple[DesktopCoreActiveSessionV1, int]:
         with self._lock:
             if self._closed or self._close_requested:
                 raise _bridge_error(
@@ -2398,37 +2429,55 @@ class DesktopCoreBridgeV1:
                     "Desktop has no active project Core tunnel.",
                     retryable=True,
                 )
-            if local_project_id is not None and session.local_project_id != local_project_id:
-                raise _bridge_error(
-                    "active_project_mismatch",
-                    "The requested resource does not belong to the active local project.",
-                    status=409,
-                )
             return session, self._generation
 
-    def _invoke(
+    def _invoke_project(
         self,
-        local_project_id: str,
-        call: Callable[[DesktopCoreActiveSessionV1], _ResponseT],
+        project: local_v1.ProjectV1,
+        call: Callable[[DesktopCoreActiveSessionV1, float], _ResponseT],
     ) -> _ResponseT:
-        session, _generation = self._session(local_project_id)
+        session, _generation = self._session()
         deadline = time.monotonic() + self._timeout
-        return self._external_call(
-            session.token,
-            deadline,
-            lambda: call(session),
-        )
+
+        def bound_call() -> _ResponseT:
+            self._ensure_local_project_binding(session, project)
+            return call(session, deadline)
+
+        return self._core_external(session.token, deadline, bound_call)
 
     def _invoke_active(
         self, call: Callable[[DesktopCoreActiveSessionV1], _ResponseT]
     ) -> _ResponseT:
-        session, _generation = self._session(None)
+        session, _generation = self._session()
         deadline = time.monotonic() + self._timeout
-        return self._external_call(
+        return self._core_external(
             session.token,
             deadline,
             lambda: call(session),
         )
+
+    @staticmethod
+    def _ensure_local_project_binding(
+        session: DesktopCoreActiveSessionV1,
+        project: local_v1.ProjectV1,
+    ) -> None:
+        if session.local_project_id != project.project_id:
+            raise _bridge_error(
+                "active_project_mismatch",
+                "The requested resource does not belong to the active local project.",
+                status=409,
+            )
+        intent_sha256 = _model_digest(map_project_create_v1(project))
+        if (
+            session.profile_id != project.profile_id
+            or session.local_project_etag != project.etag
+            or session.local_project_intent_sha256 != intent_sha256
+        ):
+            raise _bridge_error(
+                "active_local_project_version_mismatch",
+                "The saved local project changed after this Core session was activated.",
+                status=409,
+            )
 
     def _ensure_generation(self, session: DesktopCoreActiveSessionV1, generation: int) -> None:
         with self._lock:
@@ -2473,10 +2522,16 @@ class _BridgeEventContext:
             return self._context.__enter__()
 
         try:
-            return self._bridge._core_external(
+            stream = self._bridge._core_external(
                 self._session.token,
                 deadline,
                 enter,
+            )
+            return _BridgeEventIterator(
+                self._bridge,
+                self._session,
+                self._generation,
+                iter(stream),
             )
         except BaseException:
             if self._context is not None:
@@ -2496,6 +2551,32 @@ class _BridgeEventContext:
                 lambda: self._context.__exit__(*exc),
                 label="Core event stream close",
             )
+
+
+class _BridgeEventIterator:
+    def __init__(
+        self,
+        bridge: DesktopCoreBridgeV1,
+        session: DesktopCoreActiveSessionV1,
+        generation: int,
+        stream: Iterator[core_v1.SseFrameV1],
+    ) -> None:
+        self._bridge = bridge
+        self._session = session
+        self._generation = generation
+        self._stream = stream
+
+    def __iter__(self) -> _BridgeEventIterator:
+        return self
+
+    def __next__(self) -> core_v1.SseFrameV1:
+        self._bridge._ensure_generation(self._session, self._generation)
+        try:
+            frame = next(self._stream)
+        except CoreClientErrorV1 as exc:
+            raise _bridge_client_error(exc) from None
+        self._bridge._ensure_generation(self._session, self._generation)
+        return frame
 
 
 def _workspace_archive_policy() -> core_v1.WorkspaceArchivePolicyV1:
@@ -3301,6 +3382,33 @@ def _bridge_error(
             next_action=(
                 "Retry after the active Core session is ready."
                 if retryable
+                else "Reconnect and activate the saved project."
+            ),
+        )
+    )
+
+
+def _bridge_client_error(exc: CoreClientErrorV1) -> DesktopCoreBridgeErrorV1:
+    if isinstance(exc.error, core_v1.ApiErrorV1):
+        return DesktopCoreBridgeErrorV1(exc.error)
+    error = exc.error
+    return DesktopCoreBridgeErrorV1(
+        core_v1.ApiErrorV1(
+            request_id=f"desktop-core-client-{secrets.token_hex(8)}",
+            code=error.code.value,
+            http_status=exc.status_code,
+            message=error.message,
+            severity=core_v1.ErrorSeverity.BLOCKING,
+            category=core_v1.ErrorCategory.CONTRACT,
+            retryable=error.retryable,
+            repair_action=(
+                core_v1.RepairAction.OPENEVO_CAN_RETRY
+                if error.retryable
+                else core_v1.RepairAction.UNSUPPORTED
+            ),
+            next_action=(
+                "Retry after reconnecting the active Core session."
+                if error.retryable
                 else "Reconnect and activate the saved project."
             ),
         )
