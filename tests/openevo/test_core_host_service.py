@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import json
 import os
 from pathlib import Path
@@ -599,6 +600,77 @@ def test_endpoint_probe_authenticates_version_and_rejects_wrong_generation(
     ]
 
 
+def test_endpoint_probe_uses_verified_unix_socket_transport() -> None:
+    generation = "3" * 32
+    requests: list[bytes] = []
+    servers: list[threading.Thread] = []
+
+    class Endpoint:
+        def open_verified_socket(self, *, timeout_seconds: float) -> socket.socket:
+            client, server_socket = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+            client.settimeout(timeout_seconds)
+
+            def serve() -> None:
+                with server_socket:
+                    request = bytearray()
+                    while b"\r\n\r\n" not in request:
+                        request.extend(server_socket.recv(4096))
+                    requests.append(bytes(request))
+                    path = request.split(b" ", 2)[1]
+                    payload = json.dumps(
+                        {
+                            "provider_kind": "openevo_core",
+                            "build_channel": "release",
+                            "source_commit": SOURCE_COMMIT,
+                            "openapi_sha256": "4" * 64,
+                            "build_version": "0.1.0",
+                        }
+                        if path == b"/version"
+                        else {
+                            "registry_status": "verified",
+                            "registry_digest": RELEASE_A.registry_digest,
+                        },
+                        separators=(",", ":"),
+                    ).encode("ascii")
+                    response = (
+                        b"HTTP/1.1 200 OK\r\n"
+                        b"Content-Type: application/json\r\n"
+                        + f"Content-Length: {len(payload)}\r\n".encode("ascii")
+                        + f"X-OpenEvo-Core-Generation: {generation}\r\n".encode("ascii")
+                        + (f"X-OpenEvo-Core-Release-Identity: {RELEASE_A.digest}\r\n").encode(
+                            "ascii"
+                        )
+                        + b"Connection: close\r\n\r\n"
+                        + payload
+                    )
+                    server_socket.sendall(response)
+
+            thread = threading.Thread(target=serve)
+            thread.start()
+            servers.append(thread)
+            return client
+
+    proof = service.authenticate_core_service_endpoint(
+        host=None,
+        port=None,
+        bearer="S" * 64,
+        release_identity=RELEASE_A.digest,
+        registry_digest=RELEASE_A.registry_digest,
+        source_commit=SOURCE_COMMIT,
+        generation=generation,
+        deadline=time.monotonic() + 2,
+        endpoint=Endpoint(),
+    )
+    for thread in servers:
+        thread.join(timeout=1)
+
+    assert len(proof) == 64
+    assert len(requests) == 2
+    assert requests[0].startswith(b"GET /version HTTP/1.1\r\n")
+    assert requests[1].startswith(b"GET /v1/status HTTP/1.1\r\n")
+    assert all(f"Authorization: Bearer {'S' * 64}".encode("ascii") in value for value in requests)
+
+
 def test_identity_mismatch_requires_controlled_replacement(
     tmp_path: Path,
     service_fakes: tuple[FakeController, list[FakeChild]],
@@ -900,6 +972,55 @@ def test_stop_terminates_exact_service_and_clears_publication(
     assert len(controller.terminated) == 1
     assert not (root / "service.json").exists()
     assert not (root / "ready.json").exists()
+
+
+def test_pidfd_esrch_is_already_stopped_and_stop_cleans_publication(
+    tmp_path: Path,
+    service_fakes: tuple[FakeController, list[FakeChild]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_controller, _children = service_fakes
+    root = _root(tmp_path)
+    lock = tmp_path / "framework-lock.json"
+    lock.write_text("{}", encoding="ascii")
+    ensure_core_service(
+        service_root=root,
+        framework_lock=lock,
+        source_commit=SOURCE_COMMIT,
+        process_controller=fake_controller,
+    )
+    with HostServiceRoot(root) as pinned:
+        ledger = pinned.read_json("service.json")
+    identity = ProcessIdentity(
+        pid=ledger["pid"],
+        boot_id=ledger["boot_id"],
+        start_time_ticks=ledger["start_time_ticks"],
+    )
+    controller = service.LinuxProcessController.__new__(service.LinuxProcessController)
+    monkeypatch.setattr(controller, "is_alive", lambda _identity: True)
+    monkeypatch.setattr(controller, "capture", lambda _pid: identity)
+    monkeypatch.setattr(
+        service.os,
+        "pidfd_open",
+        lambda _pid, _flags: os.open("/dev/null", os.O_RDONLY),
+        raising=False,
+    )
+
+    def already_stopped(*_args: object) -> None:
+        raise OSError(errno.ESRCH, "gone")
+
+    monkeypatch.setattr(
+        service.signal,
+        "pidfd_send_signal",
+        already_stopped,
+        raising=False,
+    )
+
+    service.stop_core_service(service_root=root, process_controller=controller)
+
+    assert not (root / "service.json").exists()
+    assert not (root / "ready.json").exists()
+    assert not (root / "pending.json").exists()
 
 
 @pytest.mark.asyncio

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass, field
 from enum import StrEnum
+import errno
 import fcntl
 import hashlib
 import hmac
@@ -17,7 +18,7 @@ import socket
 import subprocess
 import sys
 import time
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Protocol, Sequence
 
 from pydantic import SecretStr
 
@@ -100,6 +101,25 @@ class CoreServiceAttachment:
     @property
     def bearer_token(self) -> str:
         return self._bearer.get_secret_value()
+
+
+class CoreServiceEndpoint(Protocol):
+    def open_verified_socket(self, *, timeout_seconds: float) -> socket.socket: ...
+
+
+class _EndpointHTTPConnection(http.client.HTTPConnection):
+    def __init__(
+        self,
+        endpoint: CoreServiceEndpoint,
+        *,
+        timeout: float,
+    ) -> None:
+        super().__init__("openevo-core.local", timeout=timeout)
+        self._endpoint = endpoint
+
+    def connect(self) -> None:
+        timeout = self.timeout if isinstance(self.timeout, (int, float)) else 1.0
+        self.sock = self._endpoint.open_verified_socket(timeout_seconds=timeout)
 
 
 class LinuxProcessController:
@@ -239,7 +259,12 @@ class LinuxProcessController:
                     return
             except ProcessLookupError:
                 return
-            signal.pidfd_send_signal(pid_fd, signal.SIGTERM)
+            try:
+                signal.pidfd_send_signal(pid_fd, signal.SIGTERM)
+            except OSError as exc:
+                if exc.errno == errno.ESRCH:
+                    return
+                raise
             poller = select.poll()
             poller.register(pid_fd, select.POLLIN | select.POLLHUP | select.POLLERR)
             remaining_ms = max(0, int((deadline - time.monotonic()) * 1000))
@@ -779,18 +804,18 @@ def _authenticated_status_proof(
 
 def authenticate_core_service_endpoint(
     *,
-    host: str,
-    port: int,
+    host: str | None,
+    port: int | None,
     bearer: str,
     release_identity: str,
     registry_digest: str,
     source_commit: str,
     generation: str,
     deadline: float,
+    endpoint: CoreServiceEndpoint | None = None,
 ) -> str:
     if (
-        host != "127.0.0.1"
-        or not 1 <= port <= 65535
+        ((endpoint is None) != (host == "127.0.0.1" and type(port) is int and 1 <= port <= 65535))
         or re.fullmatch(r"[A-Za-z0-9_-]{64}", bearer) is None
         or re.fullmatch(r"[0-9a-f]{64}", release_identity) is None
         or re.fullmatch(r"[0-9a-f]{64}", registry_digest) is None
@@ -813,6 +838,7 @@ def authenticate_core_service_endpoint(
         bearer=bearer,
         deadline=deadline,
         expected_headers=expected_headers,
+        endpoint=endpoint,
     )
     status = _fetch_json(
         host,
@@ -821,6 +847,7 @@ def authenticate_core_service_endpoint(
         bearer=bearer,
         deadline=deadline,
         expected_headers=expected_headers,
+        endpoint=endpoint,
     )
     if (
         not isinstance(version, dict)
@@ -858,13 +885,14 @@ def authenticate_core_service_endpoint(
 
 
 def _fetch_json(
-    host: str,
-    port: int,
+    host: str | None,
+    port: int | None,
     path: str,
     *,
     bearer: str | None,
     deadline: float,
     expected_headers: dict[str, str] | None = None,
+    endpoint: CoreServiceEndpoint | None = None,
 ) -> Any:
     last_error: Exception | None = None
     while True:
@@ -876,11 +904,18 @@ def _fetch_json(
                 retryable=True,
             ) from last_error
         headers = {"Authorization": f"Bearer {bearer}"} if bearer else {}
-        connection = http.client.HTTPConnection(
-            host,
-            port,
-            timeout=min(1.0, remaining),
-        )
+        if endpoint is None:
+            assert host is not None and port is not None
+            connection: http.client.HTTPConnection = http.client.HTTPConnection(
+                host,
+                port,
+                timeout=min(1.0, remaining),
+            )
+        else:
+            connection = _EndpointHTTPConnection(
+                endpoint,
+                timeout=min(1.0, remaining),
+            )
         try:
             connection.request("GET", path, headers=headers)
             response = connection.getresponse()

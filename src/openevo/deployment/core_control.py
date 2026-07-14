@@ -6,13 +6,19 @@ import hmac
 import re
 import secrets
 import shlex
+import socket
+import sys
 import time
 from typing import Literal, Protocol
 
 from pydantic import SecretStr
 
 from openevo.backend.runtime_identity import RuntimeIdentityError, load_bounded_json
-from openevo.backend.service import authenticate_core_service_endpoint
+from openevo.backend.service import (
+    CoreServiceError,
+    CoreServiceErrorCode,
+    authenticate_core_service_endpoint,
+)
 from openevo.deployment.executor import RemoteExecutorTransport
 from openevo.deployment.preflight import RemoteCommandResult
 
@@ -91,11 +97,12 @@ class RemoteCoreControlAttachment:
 
 
 class CoreTunnelHandle(Protocol):
-    local_host: str
-    local_port: int
-
     @property
     def base_url(self) -> str: ...
+
+    def verify_authority(self) -> None: ...
+
+    def open_verified_socket(self, *, timeout_seconds: float) -> socket.socket: ...
 
     def close(self) -> None: ...
 
@@ -110,7 +117,7 @@ class CoreBootstrapTransport(RemoteExecutorTransport, Protocol):
 
 
 class CoreTunnelTransport(Protocol):
-    def open_tunnel(
+    def open_core_tunnel(
         self,
         *,
         remote_port: int,
@@ -134,6 +141,12 @@ class VerifiedCoreControlTunnel:
     @property
     def bearer_token(self) -> str:
         return self._bearer.get_secret_value()
+
+    def verify_authority(self) -> None:
+        self._tunnel.verify_authority()
+
+    def open_verified_socket(self, *, timeout_seconds: float) -> socket.socket:
+        return self._tunnel.open_verified_socket(timeout_seconds=timeout_seconds)
 
     def close(self) -> None:
         self._tunnel.close()
@@ -358,7 +371,7 @@ def open_core_control_tunnel(
             retryable=False,
         )
     try:
-        tunnel = transport.open_tunnel(
+        tunnel = transport.open_core_tunnel(
             remote_port=attachment.remote_port,
             remote_host="127.0.0.1",
             wait_for_ready=True,
@@ -370,27 +383,25 @@ def open_core_control_tunnel(
             "The Core Control tunnel could not be opened.",
             retryable=True,
         ) from None
+    verified: VerifiedCoreControlTunnel | None = None
     try:
-        expected_base_url = f"http://127.0.0.1:{tunnel.local_port}"
-        if (
-            tunnel.local_host != "127.0.0.1"
-            or not 1 <= tunnel.local_port <= 65535
-            or tunnel.base_url != expected_base_url
-        ):
+        expected_base_url = "http://openevo-core.local"
+        if tunnel.base_url != expected_base_url:
             raise CoreControlBootstrapError(
                 CoreControlBootstrapErrorCode.RESPONSE_INVALID,
                 "The Core Control tunnel endpoint is invalid.",
                 retryable=False,
             )
         proof = authenticate_core_service_endpoint(
-            host=tunnel.local_host,
-            port=tunnel.local_port,
+            host=None,
+            port=None,
             bearer=attachment.bearer_token,
             release_identity=attachment.release_identity,
             registry_digest=attachment.registry_digest,
             source_commit=attachment.source_commit,
             generation=attachment.generation,
             deadline=time.monotonic() + timeout_seconds,
+            endpoint=tunnel,
         )
         if not hmac.compare_digest(proof, attachment.status_proof):
             raise CoreControlBootstrapError(
@@ -398,7 +409,8 @@ def open_core_control_tunnel(
                 "The Core Control tunnel identity did not match its attachment.",
                 retryable=False,
             )
-        return VerifiedCoreControlTunnel(
+        tunnel.verify_authority()
+        verified = VerifiedCoreControlTunnel(
             base_url=expected_base_url,
             release_identity=attachment.release_identity,
             registry_digest=attachment.registry_digest,
@@ -408,16 +420,36 @@ def open_core_control_tunnel(
             _tunnel=tunnel,
             _bearer=SecretStr(attachment.bearer_token),
         )
-    except Exception:
-        try:
-            tunnel.close()
-        except Exception:
-            pass
+        return verified
+    except CoreControlBootstrapError:
+        raise
+    except CoreServiceError as exc:
+        if exc.code is CoreServiceErrorCode.DEADLINE_EXCEEDED:
+            code = CoreControlBootstrapErrorCode.DEADLINE_EXCEEDED
+            message = "Core Control tunnel authentication exceeded its deadline."
+        elif exc.code is CoreServiceErrorCode.STATUS_INVALID:
+            code = CoreControlBootstrapErrorCode.RESPONSE_INVALID
+            message = "The Core Control tunnel identity response was invalid."
+        else:
+            code = CoreControlBootstrapErrorCode.SERVICE_FAILED
+            message = "The Core Control tunnel could not reach the remote daemon."
         raise CoreControlBootstrapError(
-            CoreControlBootstrapErrorCode.RESPONSE_INVALID,
-            "The Core Control tunnel failed authenticated identity verification.",
-            retryable=False,
+            code,
+            message,
+            retryable=exc.retryable,
         ) from None
+    except Exception:
+        raise CoreControlBootstrapError(
+            CoreControlBootstrapErrorCode.SERVICE_FAILED,
+            "The Core Control tunnel could not reach the remote daemon.",
+            retryable=True,
+        ) from None
+    finally:
+        if verified is None or sys.exc_info()[0] is not None:
+            try:
+                tunnel.close()
+            except BaseException:
+                pass
 
 
 def _valid_digest(value: object) -> bool:

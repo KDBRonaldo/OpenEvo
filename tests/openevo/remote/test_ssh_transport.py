@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import os
 import re
 import shlex
 import shutil
+import socket
 import subprocess
 import struct
 import threading
@@ -157,6 +159,8 @@ def _transport(
     runner: RecordingRunner | None = None,
     tunnel_starter: RecordingTunnelStarter | None = None,
     port_allocator=None,
+    control_runner=None,
+    tunnel_directory_allocator=None,
 ) -> SshRemoteExecutorTransport:
     active_profile = profile or _profile()
     return SshRemoteExecutorTransport(
@@ -165,6 +169,8 @@ def _transport(
         runner=runner,
         tunnel_starter=tunnel_starter,
         port_allocator=port_allocator,
+        control_runner=control_runner,
+        tunnel_directory_allocator=tunnel_directory_allocator,
     )
 
 
@@ -871,6 +877,8 @@ def test_open_tunnel_starts_ssh_local_forwarding_and_closes_process(
     assert starter.calls == [
         [
             *expected_base,
+            "-o",
+            "ExitOnForwardFailure=yes",
             "-N",
             "-L",
             "127.0.0.1:49155:127.0.0.1:8765",
@@ -888,6 +896,150 @@ def test_open_tunnel_starts_ssh_local_forwarding_and_closes_process(
 
     tunnel.close()
     assert tunnel.closed is True
+
+
+def test_core_tunnel_uses_private_streamlocal_endpoint_and_pins_authority(
+    tmp_path: Path,
+) -> None:
+    class StreamLocalStarter(RecordingTunnelStarter):
+        def __init__(self) -> None:
+            super().__init__()
+            self.listeners: list[socket.socket] = []
+            self.creator: threading.Thread | None = None
+
+        def __call__(self, argv: list[str]) -> FakeTunnelProcess:
+            process = super().__call__(argv)
+            forward = argv[argv.index("-L") + 1]
+            local_socket = Path(forward.split(":", 1)[0])
+            control_socket = Path(argv[argv.index("-S") + 1])
+
+            def publish_sockets() -> None:
+                time.sleep(0.05)
+                for path in (local_socket, control_socket):
+                    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                    listener.bind(str(path))
+                    listener.listen(1)
+                    os.chmod(path, 0o600)
+                    self.listeners.append(listener)
+
+            self.creator = threading.Thread(target=publish_sockets)
+            self.creator.start()
+            return process
+
+    control_calls: list[list[str]] = []
+
+    def control_runner(
+        argv: list[str], timeout_seconds: float
+    ) -> subprocess.CompletedProcess[str]:
+        assert timeout_seconds > 0
+        control_calls.append(argv)
+        return subprocess.CompletedProcess(
+            argv,
+            1 if len(control_calls) == 1 else 0,
+            stdout="",
+            stderr="",
+        )
+
+    root = tmp_path / "core-tunnel"
+    starter = StreamLocalStarter()
+    transport = _transport(
+        tmp_path,
+        tunnel_starter=starter,
+        control_runner=control_runner,
+        tunnel_directory_allocator=lambda: root,
+    )
+
+    tunnel = transport.open_core_tunnel(remote_port=8765)
+
+    assert root.stat().st_mode & 0o777 == 0o700
+    assert tunnel.base_url == "http://openevo-core.local"
+    argv = starter.calls[0]
+    assert "ExitOnForwardFailure=yes" in argv
+    assert "StreamLocalBindUnlink=no" in argv
+    assert "StreamLocalBindMask=0177" in argv
+    assert "ControlMaster=yes" in argv
+    assert "ControlPersist=no" in argv
+    assert argv[argv.index("-L") + 1] == f"{root / 'forward.sock'}:127.0.0.1:8765"
+    assert argv[argv.index("-S") + 1] == str(root / "control.sock")
+    for socket_name, guard_name in (
+        ("forward.sock", "forward.guard"),
+        ("control.sock", "control.guard"),
+    ):
+        socket_metadata = os.lstat(root / socket_name)
+        guard_metadata = os.lstat(root / guard_name)
+        assert socket_metadata.st_uid == os.geteuid()
+        assert socket_metadata.st_mode & 0o777 == 0o600
+        assert socket_metadata.st_nlink == 2
+        assert (socket_metadata.st_dev, socket_metadata.st_ino) == (
+            guard_metadata.st_dev,
+            guard_metadata.st_ino,
+        )
+
+    connection = tunnel.open_verified_socket(timeout_seconds=1.0)
+    connection.close()
+    tunnel.verify_authority()
+    assert len(control_calls) >= 4
+
+    starter.processes[0].return_code = 255
+    with pytest.raises(SshTransportError) as exited:
+        tunnel.verify_authority()
+    assert exited.value.code is SshTransportErrorCode.CONNECTION_FAILED
+
+    tunnel.close()
+    assert starter.creator is not None
+    starter.creator.join(timeout=1)
+    for listener in starter.listeners:
+        listener.close()
+    assert not root.exists()
+
+
+def test_core_tunnel_rejects_replaced_socket_before_connect(
+    tmp_path: Path,
+) -> None:
+    class StreamLocalStarter(RecordingTunnelStarter):
+        def __init__(self) -> None:
+            super().__init__()
+            self.listeners: dict[Path, socket.socket] = {}
+
+        def __call__(self, argv: list[str]) -> FakeTunnelProcess:
+            process = super().__call__(argv)
+            forward = Path(argv[argv.index("-L") + 1].split(":", 1)[0])
+            control = Path(argv[argv.index("-S") + 1])
+            for path in (forward, control):
+                listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                listener.bind(str(path))
+                listener.listen(1)
+                os.chmod(path, 0o600)
+                self.listeners[path] = listener
+            return process
+
+    root = tmp_path / "core-tunnel"
+    starter = StreamLocalStarter()
+    transport = _transport(
+        tmp_path,
+        tunnel_starter=starter,
+        control_runner=lambda argv, timeout: subprocess.CompletedProcess(argv, 0),
+        tunnel_directory_allocator=lambda: root,
+    )
+    tunnel = transport.open_core_tunnel(remote_port=8765)
+    forward = root / "forward.sock"
+
+    starter.listeners[forward].close()
+    forward.unlink()
+    replacement = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    replacement.bind(str(forward))
+    replacement.listen(1)
+    os.chmod(forward, 0o600)
+    with pytest.raises(SshTransportError) as replaced:
+        tunnel.open_verified_socket(timeout_seconds=1.0)
+    assert replaced.value.code is SshTransportErrorCode.CONNECTION_FAILED
+    replacement.settimeout(0.05)
+    with pytest.raises(TimeoutError):
+        replacement.accept()
+
+    tunnel.close()
+    replacement.close()
+    starter.listeners[root / "control.sock"].close()
 
 
 def test_open_tunnel_thread_start_failure_cleans_process_registration_and_lease(

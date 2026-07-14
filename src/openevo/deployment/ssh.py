@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import ipaddress
 import logging
+import os
 import re
 import secrets
 import shlex
 import socket
+import stat
 import subprocess
+import tempfile
 import threading
 import time
 from collections.abc import Callable
@@ -24,6 +27,7 @@ from openevo.deployment.profile import RemoteProfileConfig
 CompletedRunner = Callable[[list[str], float], subprocess.CompletedProcess[str]]
 PortAllocator = Callable[[], int]
 TunnelStarter = Callable[[list[str]], "TunnelProcess"]
+TunnelDirectoryAllocator = Callable[[], Path]
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +75,181 @@ class TunnelProcess(Protocol):
     def wait(self, timeout: float | None = None) -> int: ...
 
 
+class _CoreTunnelEndpoint:
+    def __init__(
+        self,
+        *,
+        root: Path,
+        process: TunnelProcess,
+        control_runner: CompletedRunner,
+        control_argv: list[str],
+    ) -> None:
+        self.root = root
+        self.forward_path = root / "forward.sock"
+        self.control_path = root / "control.sock"
+        self.forward_guard_path = root / "forward.guard"
+        self.control_guard_path = root / "control.guard"
+        self.process = process
+        self._control_runner = control_runner
+        self._control_argv = control_argv
+        self._guard = threading.Lock()
+        root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            root_metadata = os.fstat(root_fd)
+            _require_private_tunnel_directory(root, root_metadata)
+        except BaseException:
+            os.close(root_fd)
+            raise
+        self._root_fd = root_fd
+        self._root_identity = (root_metadata.st_dev, root_metadata.st_ino)
+        self._socket_identities: tuple[tuple[int, int, int], tuple[int, int, int]] | None = None
+
+    def bind_authority(self, *, timeout_seconds: float) -> None:
+        with self._guard:
+            if self._socket_identities is not None:
+                self._verify_locked(timeout_seconds=timeout_seconds)
+                return
+            self._require_process()
+            self._require_root()
+            _pin_socket_inodes(
+                (
+                    (self.forward_path, self.forward_guard_path),
+                    (self.control_path, self.control_guard_path),
+                )
+            )
+            identities = self._read_socket_identities()
+            self._socket_identities = identities
+            self._check_control(timeout_seconds=timeout_seconds)
+            if self._read_socket_identities() != identities:
+                raise SshTransportError(SshTransportErrorCode.CONNECTION_FAILED)
+
+    def verify_authority(self, *, timeout_seconds: float = 1.0) -> None:
+        with self._guard:
+            self._verify_locked(timeout_seconds=timeout_seconds)
+
+    def open_verified_socket(self, *, timeout_seconds: float) -> socket.socket:
+        if not 0 < timeout_seconds <= 60:
+            raise SshTransportError(SshTransportErrorCode.INVALID_REQUEST)
+        with self._guard:
+            self._verify_locked(timeout_seconds=timeout_seconds)
+            connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                connection.settimeout(timeout_seconds)
+                connection.connect(str(self.forward_path))
+                self._verify_locked(timeout_seconds=timeout_seconds)
+            except Exception:
+                connection.close()
+                raise SshTransportError(SshTransportErrorCode.CONNECTION_FAILED) from None
+            except BaseException:
+                connection.close()
+                raise
+            return connection
+
+    def cleanup(self) -> None:
+        with self._guard:
+            root_fd = self._root_fd
+            if root_fd < 0:
+                return
+            self._root_fd = -1
+            try:
+                self._require_root_fd(root_fd)
+                for name in (
+                    "forward.sock",
+                    "forward.guard",
+                    "control.sock",
+                    "control.guard",
+                ):
+                    try:
+                        os.unlink(name, dir_fd=root_fd)
+                    except FileNotFoundError:
+                        pass
+            except OSError:
+                _log_transport_failure(SshTransportErrorCode.CONNECTION_FAILED)
+            finally:
+                os.close(root_fd)
+            try:
+                metadata = os.lstat(self.root)
+                if (metadata.st_dev, metadata.st_ino) == self._root_identity:
+                    os.rmdir(self.root)
+            except OSError:
+                _log_transport_failure(SshTransportErrorCode.CONNECTION_FAILED)
+
+    def _verify_locked(self, *, timeout_seconds: float) -> None:
+        if self._socket_identities is None:
+            raise SshTransportError(SshTransportErrorCode.CONNECTION_FAILED)
+        self._require_process()
+        self._require_root()
+        if self._read_socket_identities() != self._socket_identities:
+            raise SshTransportError(SshTransportErrorCode.CONNECTION_FAILED)
+        self._check_control(timeout_seconds=timeout_seconds)
+        if self._read_socket_identities() != self._socket_identities:
+            raise SshTransportError(SshTransportErrorCode.CONNECTION_FAILED)
+        self._require_process()
+
+    def _require_process(self) -> None:
+        if not _tunnel_process_is_running(self.process):
+            raise SshTransportError(SshTransportErrorCode.CONNECTION_FAILED)
+
+    def _require_root(self) -> None:
+        self._require_root_fd(self._root_fd)
+        metadata = os.lstat(self.root)
+        if (metadata.st_dev, metadata.st_ino) != self._root_identity:
+            raise SshTransportError(SshTransportErrorCode.CONNECTION_FAILED)
+        _require_private_tunnel_directory(self.root, metadata)
+
+    def _require_root_fd(self, root_fd: int) -> None:
+        metadata = os.fstat(root_fd)
+        if (metadata.st_dev, metadata.st_ino) != self._root_identity:
+            raise OSError("Core tunnel root identity changed")
+        _require_private_tunnel_directory(self.root, metadata)
+
+    def _read_socket_identities(self) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
+        return (
+            _guarded_socket_identity(self.forward_path, self.forward_guard_path),
+            _guarded_socket_identity(self.control_path, self.control_guard_path),
+        )
+
+    def _check_control(self, *, timeout_seconds: float) -> None:
+        try:
+            completed = self._control_runner(
+                self._control_argv,
+                min(1.0, timeout_seconds),
+            )
+        except Exception:
+            raise SshTransportError(SshTransportErrorCode.CONNECTION_FAILED) from None
+        if completed.returncode != 0:
+            raise SshTransportError(SshTransportErrorCode.CONNECTION_FAILED)
+
+
+class SshCoreTunnel(AbstractContextManager["SshCoreTunnel"]):
+    """Owner-pinned streamlocal forwarding for authenticated Core traffic."""
+
+    base_url = "http://openevo-core.local"
+
+    def __init__(self, lifecycle: SshTunnel, endpoint: _CoreTunnelEndpoint) -> None:
+        self._lifecycle = lifecycle
+        self._endpoint = endpoint
+
+    @property
+    def closed(self) -> bool:
+        return self._lifecycle.closed
+
+    def verify_authority(self) -> None:
+        self._endpoint.verify_authority()
+
+    def open_verified_socket(self, *, timeout_seconds: float) -> socket.socket:
+        return self._endpoint.open_verified_socket(timeout_seconds=timeout_seconds)
+
+    def close(self) -> None:
+        self._lifecycle.close()
+
+    def __enter__(self) -> SshCoreTunnel:
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        self.close()
+
+
 _ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _REMOTE_HOST_RE = re.compile(r"^[A-Za-z0-9._%-]+$")
 _REMOTE_PATH_RE = re.compile(r"^/[A-Za-z0-9._/@%+=,-]*$")
@@ -90,6 +269,7 @@ class SshTunnel(AbstractContextManager["SshTunnel"]):
         process: TunnelProcess,
         trust_lease: AbstractContextManager[Path],
         trusted_host: TrustedKnownHostsBinding,
+        on_finalize: Callable[[], None] | None = None,
     ) -> None:
         self.local_port = local_port
         self.remote_port = remote_port
@@ -104,6 +284,7 @@ class SshTunnel(AbstractContextManager["SshTunnel"]):
         self._orphaned = False
         self._unregister: Callable[[], None] | None = None
         self._monitor: threading.Thread | None = None
+        self._on_finalize = on_finalize
         construction_failed = False
         try:
             self._unregister = trusted_host._register_tunnel(
@@ -228,12 +409,15 @@ class SshTunnel(AbstractContextManager["SshTunnel"]):
             self._unregister = None
             trust_lease = self._trust_lease
             self._trust_lease = None
+            on_finalize = self._on_finalize
+            self._on_finalize = None
             self._orphaned = False
             self._closed.set()
         _forget_orphaned_tunnel(self)
         if unregister is not None:
             _call_without_error(unregister)
         _release_trust_lease(trust_lease)
+        _call_without_error(on_finalize)
 
 
 class SshRemoteExecutorTransport:
@@ -247,6 +431,8 @@ class SshRemoteExecutorTransport:
         runner: CompletedRunner | None = None,
         tunnel_starter: TunnelStarter | None = None,
         port_allocator: PortAllocator | None = None,
+        control_runner: CompletedRunner | None = None,
+        tunnel_directory_allocator: TunnelDirectoryAllocator | None = None,
     ) -> None:
         invalid_request = False
         try:
@@ -270,6 +456,8 @@ class SshRemoteExecutorTransport:
         self._runner = runner or _run_subprocess
         self._tunnel_starter = tunnel_starter or _start_tunnel_subprocess
         self._port_allocator = port_allocator or _allocate_local_port
+        self._control_runner = control_runner or _run_subprocess
+        self._tunnel_directory_allocator = tunnel_directory_allocator or _allocate_tunnel_directory
 
     def run(
         self,
@@ -467,6 +655,8 @@ class SshRemoteExecutorTransport:
             process = self._tunnel_starter(
                 [
                     *self._ssh_base_argv(known_hosts_file),
+                    "-o",
+                    "ExitOnForwardFailure=yes",
                     "-N",
                     "-L",
                     forward_spec,
@@ -514,6 +704,139 @@ class SshRemoteExecutorTransport:
                 tunnel.close()
                 _log_transport_failure(ready_failure)
                 raise SshTransportError(ready_failure)
+        return tunnel
+
+    def open_core_tunnel(
+        self,
+        *,
+        remote_port: int,
+        remote_host: str = "127.0.0.1",
+        wait_for_ready: bool = True,
+        timeout_seconds: float = 10.0,
+    ) -> SshCoreTunnel:
+        _retry_orphaned_tunnel_cleanup()
+        root: Path | None = None
+        try:
+            _validate_port(remote_port, "remote_port")
+            _validate_remote_identity(remote_host, "remote_host", _REMOTE_HOST_RE)
+            if not 0 < timeout_seconds <= 60:
+                raise ValueError("invalid timeout")
+            root = self._tunnel_directory_allocator()
+            if not root.exists():
+                root.mkdir(mode=0o700)
+            root_metadata = os.lstat(root)
+            _require_private_tunnel_directory(root, root_metadata)
+            forward_path = root / "forward.sock"
+            control_path = root / "control.sock"
+            if max(len(os.fsencode(forward_path)), len(os.fsencode(control_path))) > 100:
+                raise ValueError("streamlocal path is too long")
+        except Exception:
+            if root is not None:
+                _discard_unstarted_tunnel_root(root)
+            raise SshTransportError(SshTransportErrorCode.INVALID_REQUEST) from None
+
+        try:
+            trust_lease = self._trusted_host.open_for_spawn(self._profile)
+            known_hosts_file = trust_lease.__enter__()
+        except Exception:
+            _discard_unstarted_tunnel_root(root)
+            raise SshTransportError(SshTransportErrorCode.HOST_KEY_VERIFICATION_FAILED) from None
+        control_argv = [
+            *self._ssh_base_argv(known_hosts_file),
+            "-S",
+            str(control_path),
+            "-O",
+            "check",
+            "--",
+            self._profile.host,
+        ]
+        try:
+            process = self._tunnel_starter(
+                [
+                    *self._ssh_base_argv(known_hosts_file),
+                    "-o",
+                    "ExitOnForwardFailure=yes",
+                    "-o",
+                    "StreamLocalBindUnlink=no",
+                    "-o",
+                    "StreamLocalBindMask=0177",
+                    "-o",
+                    "ControlMaster=yes",
+                    "-o",
+                    "ControlPersist=no",
+                    "-S",
+                    str(control_path),
+                    "-N",
+                    "-L",
+                    f"{forward_path}:{remote_host}:{remote_port}",
+                    "--",
+                    self._profile.host,
+                ]
+            )
+        except Exception:
+            _release_trust_lease(trust_lease)
+            _discard_unstarted_tunnel_root(root)
+            _log_transport_failure(SshTransportErrorCode.START_FAILED)
+            raise SshTransportError(SshTransportErrorCode.START_FAILED) from None
+        endpoint: _CoreTunnelEndpoint | None = None
+        try:
+            endpoint = _CoreTunnelEndpoint(
+                root=root,
+                process=process,
+                control_runner=self._control_runner,
+                control_argv=control_argv,
+            )
+            lifecycle = SshTunnel(
+                local_port=0,
+                remote_port=remote_port,
+                local_host="",
+                remote_host=remote_host,
+                process=process,
+                trust_lease=trust_lease,
+                trusted_host=self._trusted_host,
+                on_finalize=endpoint.cleanup,
+            )
+            tunnel = SshCoreTunnel(lifecycle, endpoint)
+        except Exception:
+            if endpoint is None:
+                _quarantine_failed_core_tunnel(
+                    process=process,
+                    trust_lease=trust_lease,
+                    trusted_host=self._trusted_host,
+                    remote_port=remote_port,
+                    remote_host=remote_host,
+                    root=root,
+                )
+            raise SshTransportError(SshTransportErrorCode.START_FAILED) from None
+        except BaseException:
+            if endpoint is None:
+                _quarantine_failed_core_tunnel(
+                    process=process,
+                    trust_lease=trust_lease,
+                    trusted_host=self._trusted_host,
+                    remote_port=remote_port,
+                    remote_host=remote_host,
+                    root=root,
+                )
+            raise
+        if wait_for_ready:
+            try:
+                _wait_for_core_endpoint(
+                    endpoint,
+                    process=process,
+                    timeout_seconds=timeout_seconds,
+                )
+            except TimeoutError:
+                tunnel.close()
+                _log_transport_failure(SshTransportErrorCode.TIMEOUT)
+                raise SshTransportError(SshTransportErrorCode.TIMEOUT) from None
+            except Exception:
+                tunnel.close()
+                _log_transport_failure(SshTransportErrorCode.CONNECTION_FAILED)
+                raise SshTransportError(SshTransportErrorCode.CONNECTION_FAILED) from None
+            except BaseException:
+                tunnel.close()
+                raise
         return tunnel
 
     def _ssh_argv(self, remote_command: str, known_hosts_file: Path) -> list[str]:
@@ -704,6 +1027,123 @@ def _allocate_local_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
         return int(sock.getsockname()[1])
+
+
+def _allocate_tunnel_directory() -> Path:
+    return Path(tempfile.mkdtemp(prefix="oe-core-", dir="/tmp"))
+
+
+def _require_private_tunnel_directory(path: Path, metadata: os.stat_result) -> None:
+    if (
+        not path.is_absolute()
+        or not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or metadata.st_nlink < 1
+        or stat.S_IMODE(metadata.st_mode) != 0o700
+    ):
+        raise OSError("Core tunnel directory is not private")
+
+
+def _socket_identity(path: Path, *, expected_links: int) -> tuple[int, int, int]:
+    metadata = os.stat(path, follow_symlinks=False)
+    if (
+        not stat.S_ISSOCK(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or metadata.st_nlink != expected_links
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+    ):
+        raise SshTransportError(SshTransportErrorCode.CONNECTION_FAILED)
+    return metadata.st_dev, metadata.st_ino, metadata.st_ctime_ns
+
+
+def _pin_socket_inodes(pairs: tuple[tuple[Path, Path], ...]) -> None:
+    for path, _guard_path in pairs:
+        _socket_identity(path, expected_links=1)
+    linked: list[Path] = []
+    try:
+        for path, guard_path in pairs:
+            os.link(path, guard_path, follow_symlinks=False)
+            linked.append(guard_path)
+        for path, guard_path in pairs:
+            _guarded_socket_identity(path, guard_path)
+    except BaseException:
+        for guard_path in reversed(linked):
+            try:
+                guard_path.unlink()
+            except OSError:
+                pass
+        raise
+
+
+def _guarded_socket_identity(path: Path, guard_path: Path) -> tuple[int, int, int]:
+    identity = _socket_identity(path, expected_links=2)
+    if _socket_identity(guard_path, expected_links=2) != identity:
+        raise SshTransportError(SshTransportErrorCode.CONNECTION_FAILED)
+    return identity
+
+
+def _wait_for_core_endpoint(
+    endpoint: _CoreTunnelEndpoint,
+    *,
+    process: TunnelProcess,
+    timeout_seconds: float,
+) -> None:
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        if not _tunnel_process_is_running(process):
+            raise SshTransportError(SshTransportErrorCode.CONNECTION_FAILED)
+        try:
+            endpoint.bind_authority(
+                timeout_seconds=max(0.001, min(1.0, deadline - time.monotonic()))
+            )
+            return
+        except (OSError, SshTransportError):
+            time.sleep(0.05)
+    raise TimeoutError("Core SSH tunnel did not become ready")
+
+
+def _quarantine_failed_core_tunnel(
+    *,
+    process: TunnelProcess,
+    trust_lease: AbstractContextManager[Path],
+    trusted_host: TrustedKnownHostsBinding,
+    remote_port: int,
+    remote_host: str,
+    root: Path,
+) -> None:
+    try:
+        failed = SshTunnel(
+            local_port=0,
+            remote_port=remote_port,
+            local_host="",
+            remote_host=remote_host,
+            process=process,
+            trust_lease=trust_lease,
+            trusted_host=trusted_host,
+            on_finalize=lambda: _discard_unstarted_tunnel_root(root),
+        )
+    except Exception:
+        return
+    failed._rollback_failed_construction()
+
+
+def _discard_unstarted_tunnel_root(root: Path) -> None:
+    try:
+        metadata = os.lstat(root)
+        _require_private_tunnel_directory(root, metadata)
+        for name in (
+            "forward.sock",
+            "forward.guard",
+            "control.sock",
+            "control.guard",
+        ):
+            try:
+                os.unlink(root / name)
+            except FileNotFoundError:
+                pass
+        os.rmdir(root)
+    except OSError:
+        _log_transport_failure(SshTransportErrorCode.CONNECTION_FAILED)
 
 
 def _wait_for_local_port(

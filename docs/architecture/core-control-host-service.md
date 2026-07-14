@@ -99,8 +99,13 @@ service.
    service root;
 3. consume and unlink that file through the SSH transport's dedicated
    `SecretStr` result channel, never `RemoteCommandResult.stdout`;
-4. open a tunnel to the selected loopback port;
-5. call `/version` and `/v1/status` through that tunnel with the bearer and
+4. start one `ExitOnForwardFailure` OpenSSH control master that forwards an
+   owner-only Unix-domain stream socket to the selected remote loopback port;
+5. pin the forwarding and control socket inodes with private hard-link guards,
+   require exact owner/mode/path identity plus a successful control-master
+   authority check, and call `/version` and `/v1/status` through a UDS-backed
+   HTTP connection with the bearer;
+6. recheck that same socket/process/control authority after authentication and
    require generation, release, registry, and status-proof equality before
    returning a verified tunnel handle.
 
@@ -120,6 +125,24 @@ The secret result has no general serializer or diagnostic projection, and its
 `repr` is redacted. The bearer may exist only in the dedicated transport result,
 attachment, and verified tunnel handle in sidecar process memory; it must never
 be persisted in Desktop resources, logs, operations, or renderer responses.
+
+The local forwarding endpoint is never selected by binding and then closing a
+temporary TCP socket. Each Core tunnel receives a short random directory under
+`/tmp`, held and repeatedly validated as an owner-owned `0700` directory. OpenSSH
+creates `forward.sock` and `control.sock` as owner-owned `0600` stream sockets
+with unlink-on-bind disabled. The sidecar hard-links each socket to a private
+guard name, preventing inode reuse while the tunnel is live, and requires both
+names to retain the same pinned inode before and after every local connect. It
+also requires the original SSH child to remain alive and `ssh -O check` to
+authenticate the exact control socket. The connected AF_UNIX socket is returned
+to the HTTP layer only after the post-connect authority check, so process exit or
+endpoint replacement cannot redirect a bearer request to another listener.
+
+Tunnel authentication preserves retryable deadline and daemon-exit failures.
+Every path that does not return the verified handle, including cancellation or
+another `BaseException`, executes the tunnel's bounded terminate/wait/kill close
+path in `finally`. Endpoint paths and trust leases are released only after SSH
+exit is confirmed; otherwise existing orphan quarantine retains ownership.
 
 The exhibition release path uses this attachment for subscription execution and
 transcript capture. After attach, this bootstrap layer does not start a science run, Gateway,

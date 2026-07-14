@@ -2,11 +2,13 @@ from __future__ import annotations
 
 from dataclasses import asdict
 import json
+import sys
 
 import pytest
 from pydantic import SecretStr
 
 from openevo.deployment import core_control
+from openevo.backend.service import CoreServiceError, CoreServiceErrorCode
 from openevo.deployment.core_control import (
     CoreControlBootstrapError,
     CoreControlBootstrapErrorCode,
@@ -38,12 +40,14 @@ def _attachment_json(**updates: object) -> str:
 
 
 class FakeTunnel:
-    local_host = "127.0.0.1"
-    local_port = 43123
-    base_url = "http://127.0.0.1:43123"
+    base_url = "http://openevo-core.local"
 
     def __init__(self) -> None:
         self.closed = False
+        self.authority_checks = 0
+
+    def verify_authority(self) -> None:
+        self.authority_checks += 1
 
     def close(self) -> None:
         self.closed = True
@@ -76,7 +80,7 @@ class FakeTransport:
             stdout='{"bootstrapped":true,"schema_version":1}',
         )
 
-    def open_tunnel(self, **kwargs: object) -> object:
+    def open_core_tunnel(self, **kwargs: object) -> object:
         self.tunnel_kwargs = kwargs
         return self.tunnel
 
@@ -191,6 +195,8 @@ def test_tunnel_authenticates_generation_and_identity(
     assert calls[0]["generation"] == attachment.generation
     assert calls[0]["release_identity"] == attachment.release_identity
     assert calls[0]["registry_digest"] == attachment.registry_digest
+    assert calls[0]["endpoint"] is transport.tunnel
+    assert transport.tunnel.authority_checks == 1
     assert transport.tunnel_kwargs == {
         "remote_port": 8765,
         "remote_host": "127.0.0.1",
@@ -235,3 +241,59 @@ def test_tunnel_rejects_base_url_not_bound_to_verified_local_endpoint(
 
     assert exc_info.value.code is CoreControlBootstrapErrorCode.RESPONSE_INVALID
     assert transport.tunnel.closed is True
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected_code"),
+    [
+        (
+            CoreServiceError(
+                CoreServiceErrorCode.DEADLINE_EXCEEDED,
+                "deadline",
+                retryable=True,
+            ),
+            CoreControlBootstrapErrorCode.DEADLINE_EXCEEDED,
+        ),
+        (RuntimeError("ssh daemon exited"), CoreControlBootstrapErrorCode.SERVICE_FAILED),
+    ],
+)
+def test_tunnel_authentication_preserves_retryable_failures_and_closes(
+    monkeypatch: pytest.MonkeyPatch,
+    failure: BaseException,
+    expected_code: CoreControlBootstrapErrorCode,
+) -> None:
+    attachment = parse_core_control_attachment(SecretStr(_attachment_json()))
+    transport = FakeTransport("")
+
+    def fail_authenticate(**_kwargs: object) -> str:
+        raise failure
+
+    monkeypatch.setattr(core_control, "authenticate_core_service_endpoint", fail_authenticate)
+
+    with pytest.raises(CoreControlBootstrapError) as exc_info:
+        open_core_control_tunnel(attachment, transport)
+
+    assert exc_info.value.code is expected_code
+    assert exc_info.value.retryable is True
+    assert transport.tunnel.closed is True
+
+
+def test_tunnel_authentication_base_exception_closes_before_propagation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attachment = parse_core_control_attachment(SecretStr(_attachment_json()))
+    transport = FakeTransport("")
+
+    class Cancelled(BaseException):
+        pass
+
+    def cancel(**_kwargs: object) -> str:
+        raise Cancelled
+
+    monkeypatch.setattr(core_control, "authenticate_core_service_endpoint", cancel)
+
+    with pytest.raises(Cancelled):
+        open_core_control_tunnel(attachment, transport)
+
+    assert transport.tunnel.closed is True
+    assert sys.exc_info() == (None, None, None)

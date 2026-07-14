@@ -183,6 +183,18 @@ concurrent recovery paths cannot unregister or close the lease twice. Until one
 path proves exit, revoke and rotation remain blocked by the shared trust lease
 instead of leaving an unmanaged child behind.
 
+Authenticated Core Control traffic uses the transport's dedicated streamlocal
+tunnel rather than the general developer TCP forward. OpenSSH receives
+`ExitOnForwardFailure=yes`, `StreamLocalBindUnlink=no`, an owner-only bind mask,
+and a non-persistent control-master socket in the same random `0700` directory as
+the forwarding socket. The transport validates owner, `0600` mode, socket type,
+directory identity, child liveness, and control authority. Private hard-link
+guards hold both socket inodes for the tunnel lifetime, so unlink-and-rebind or
+immediate filesystem inode reuse fails the endpoint check. HTTP obtains an
+AF_UNIX connection only after authority checks on both sides of `connect()`.
+This path therefore does not reserve a TCP port by closing a temporary listener
+and does not infer tunnel ownership from a successful connect probe.
+
 `SshRemoteExecutorTransport` requires a `TrustedKnownHostsBinding` and revalidates
 it before building every command. A release call without a binding fails closed.
 This slice deliberately does not add a UI, native host route, contract DTO, or
