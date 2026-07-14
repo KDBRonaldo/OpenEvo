@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
+import json
 from pathlib import Path
 
 import pytest
@@ -9,10 +10,15 @@ from pydantic import ValidationError
 from desktop.sidecar.contracts.v1 import (
     DESKTOP_EVENTS_SCHEMA_SHA256,
     DESKTOP_OPENAPI_SHA256,
+    ArtifactContentV1,
     ArtifactPageV1,
     BoundedJsonObjectV1,
+    CoreConnectionStateV1,
+    DiffLineV1,
+    DesktopStateV1,
     EventEnvelopeV1,
     ExecutionSettingsV1,
+    HealthV1,
     PageV1,
     RemoteProfileCreateV1,
     RemoteProfileV1,
@@ -221,8 +227,8 @@ def test_snapshots_are_canonical_and_digests_are_stable() -> None:
 
     assert openapi_digest == DESKTOP_OPENAPI_SHA256
     assert events_digest == DESKTOP_EVENTS_SCHEMA_SHA256
-    assert openapi_digest == "a653666cc71040ac056ba61fd6a9449b3e947dbcffa074440f80d61345c77d35"
-    assert events_digest == "7d1f21c827cf8238fa4ad0fd79278956eddf3c88f8970d5aa89746b04a0d132b"
+    assert openapi_digest == "e877eab5b97a540486a82a4dfadf123b3324022460403362710bc06cecd6a051"
+    assert events_digest == "dd425b6050f1cb329d8a178ba77e0012aba7bbfc612cf04e258c0f9cd8480ad7"
     snapshot_root = Path(__file__).parents[3] / "desktop/sidecar/contracts/v1"
     assert (snapshot_root / "openapi.json").read_bytes() == canonical_json_bytes(
         desktop_openapi_document()
@@ -365,10 +371,118 @@ def test_run_contract_rejects_runtime_model_path_and_command_overrides() -> None
         with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
             RunCreateV1.model_validate(valid | {field: value})
 
-    with pytest.raises(ValidationError, match="must be active"):
+    queued = RunCreateV1.model_validate(
+        valid | {"required_revision": valid["required_revision"] | {"state": "queued"}}
+    )
+    assert queued.required_revision.state == "queued"
+
+    with pytest.raises(ValidationError, match="cannot require a terminal revision"):
         RunCreateV1.model_validate(
-            valid | {"required_revision": valid["required_revision"] | {"state": "queued"}}
+            valid | {"required_revision": valid["required_revision"] | {"state": "failed"}}
         )
+
+
+def test_connection_contract_uses_the_renderer_remote_connection_phases() -> None:
+    state = CoreConnectionStateV1.model_validate(
+        {
+            "state": "host_key_review",
+            "profile_id": "profile-1",
+            "active_tunnel": False,
+            "operation_id": "operation-1",
+            "host_key_review": {
+                "algorithm": "ssh-ed25519",
+                "fingerprint": "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+            },
+        }
+    )
+    assert state.state == "host_key_review"
+
+    with pytest.raises(ValidationError):
+        CoreConnectionStateV1.model_validate(
+            {"state": "tunnel_ready", "profile_id": "profile-1", "active_tunnel": True}
+        )
+
+
+def test_health_contract_preserves_native_instance_proof() -> None:
+    plain = HealthV1.model_validate({"service": "openevo-sidecar", "status": "ok"})
+    assert plain.protocol is None
+
+    native = HealthV1.model_validate(
+        {
+            "service": "openevo-sidecar",
+            "status": "ok",
+            "protocol": "openevo-native-sidecar-v1",
+            "instance_id": "a" * 32,
+            "instance_proof": "b" * 64,
+        }
+    )
+    assert native.instance_id == "a" * 32
+
+    with pytest.raises(ValidationError, match="all be present"):
+        HealthV1.model_validate(
+            {
+                "service": "openevo-sidecar",
+                "status": "ok",
+                "protocol": "openevo-native-sidecar-v1",
+            }
+        )
+
+
+def test_artifact_preview_has_an_aggregate_budget_and_allows_empty_diff_lines() -> None:
+    content = ArtifactContentV1.model_validate_json(
+        json.dumps(
+            {
+                "artifact_id": "artifact-1",
+                "content_digest": _DIGEST,
+                "documents": [
+                    {
+                        "document_id": "memory",
+                        "title": "Memory",
+                        "media_type": "text/markdown",
+                        "content": "hello",
+                    }
+                ],
+                "total_documents": 1,
+                "truncated": False,
+            }
+        )
+    )
+    assert content.total_documents == 1
+    assert DiffLineV1(kind="context", old_line=1, new_line=1, text="").text == ""
+
+    with pytest.raises(ValidationError, match="aggregate byte budget"):
+        ArtifactContentV1.model_validate_json(
+            json.dumps(
+                {
+                    "artifact_id": "artifact-1",
+                    "content_digest": _DIGEST,
+                    "documents": [
+                        {
+                            "document_id": f"document-{index}",
+                            "title": "Large",
+                            "media_type": "text/plain",
+                            "content": "x" * 65_536,
+                        }
+                        for index in range(33)
+                    ],
+                    "total_documents": 33,
+                    "truncated": False,
+                }
+            )
+        )
+
+
+def test_cross_language_critical_fixture_matches_python_contract() -> None:
+    fixture_path = (
+        Path(__file__).parents[3] / "desktop/sidecar/contracts/v1/fixtures/contract-critical.json"
+    )
+    fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
+
+    HealthV1.model_validate_json(json.dumps(fixture["health"]))
+    DesktopStateV1.model_validate_json(json.dumps(fixture["state"]))
+    RunCreateV1.model_validate_json(json.dumps(fixture["run_create"]))
+    ArtifactContentV1.model_validate_json(json.dumps(fixture["artifact_content"]))
+    assert fixture["artifact_diff"]["hunks"][0]["lines"][0]["text"] == ""
 
 
 def test_bounded_json_detail_enforces_closed_resource_budgets() -> None:

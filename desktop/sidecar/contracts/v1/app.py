@@ -129,9 +129,23 @@ def create_contract_app() -> FastAPI:
         "/health",
         operation_id="getDesktopHealth",
         response_model=HealthV1,
+        responses={
+            403: {"model": ApiErrorV1, "description": "Invalid native health challenge."},
+            422: _ERROR_RESPONSES[422],
+        },
         tags=["discovery"],
     )
-    def get_health() -> HealthV1:
+    def get_health(
+        x_openevo_native_challenge: Annotated[
+            str | None,
+            Header(
+                alias="X-OpenEvo-Native-Challenge",
+                pattern=r"^[0-9a-f]{64}$",
+                description="Fresh native-host challenge used to prove sidecar instance identity.",
+            ),
+        ] = None,
+    ) -> HealthV1:
+        del x_openevo_native_challenge
         _contract_only()
 
     router = APIRouter(

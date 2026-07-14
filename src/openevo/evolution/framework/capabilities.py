@@ -155,8 +155,8 @@ class EvolutionMethodCapabilityV1(_Contract):
     description: str = Field(max_length=4096)
     exposure: Exposure
     maturity: Maturity
-    execution_modes: tuple[ExecutionMode, ...]
-    capture_modes: tuple[CaptureMode, ...]
+    execution_modes: tuple[ExecutionMode, ...] = Field(max_length=len(ExecutionMode))
+    capture_modes: tuple[CaptureMode, ...] = Field(max_length=len(CaptureMode))
     supported_harness_ids: tuple[str, ...] = Field(max_length=256)
     harness_requirements: tuple[str, ...] = Field(max_length=256)
     runtime_requirements: tuple[str, ...] = Field(max_length=256)

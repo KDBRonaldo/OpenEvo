@@ -10,11 +10,16 @@ from pydantic import ValidationError
 
 from openevo.backend.contracts.v1.app import create_core_control_contract_app
 from openevo.backend.contracts.v1.models import (
+    CapabilitiesResponseV1,
     EventEnvelopeV1,
     ParametricMemoryArtifactSummaryV1,
+    ProjectSpecV1,
+    RevisionTransitionState,
     RunCreateV1,
     RunSummaryV1,
+    SkillBundleContentV1,
 )
+from openevo.evolution.framework.capabilities import EvolutionCapabilitiesV1
 from openevo.backend.contracts.v1.snapshots import (
     EVENTS_SCHEMA_SNAPSHOT_PATH,
     OPENAPI_SNAPSHOT_PATH,
@@ -116,7 +121,7 @@ def test_openapi_snapshot_is_exactly_rebuildable() -> None:
     rebuilt = canonical_json_bytes(build_openapi_document())
     assert OPENAPI_SNAPSHOT_PATH.read_bytes() == rebuilt
     assert hashlib.sha256(rebuilt).hexdigest() == openapi_sha256()
-    assert openapi_sha256() == ("1589c7141f00acdee9de1c3a1c01c77805ad3d9460d717755af81ab86b755279")
+    assert openapi_sha256() == ("6e23280c7b32c078777006f7381dc14815cd673fd317571e4c6cccd0dfbdc4c5")
 
 
 def test_event_schema_snapshot_is_exactly_rebuildable() -> None:
@@ -179,6 +184,98 @@ def test_capability_request_is_bound_only_by_the_release_execution_mode() -> Non
         parameter["name"] for parameter in operation["parameters"] if parameter["in"] == "query"
     }
     assert query_parameters == {"execution_mode"}
+
+
+def test_capability_response_is_the_authoritative_registry_contract() -> None:
+    assert CapabilitiesResponseV1 is EvolutionCapabilitiesV1
+    schema = build_openapi_document()["components"]["schemas"]
+    target = schema["EvolutionTargetCapabilityV1"]["properties"]
+    method = schema["EvolutionMethodCapabilityV1"]["properties"]
+
+    assert {
+        "exposure",
+        "maturity",
+        "handler_id",
+        "renderer_kind",
+        "renderer_contract_version",
+        "contribution_contract_version",
+        "implementation_identity_digest",
+        "handler_identity_digest",
+        "accepted_methods",
+        "selection_resolvers",
+    } <= set(target)
+    assert {
+        "input_bindings",
+        "output_artifact_types",
+        "config_schema_json",
+        "default_config_json",
+        "support",
+    } <= set(method)
+
+
+def test_project_spec_uses_the_core_owned_evolution_target_map() -> None:
+    spec = _json_model(
+        ProjectSpecV1,
+        {
+            "execution_mode": "self-deployed",
+            "capture_mode": "transcript",
+            "harness_id": "codex",
+            "agent_model_ref": "model-1",
+            "evolution": {
+                "targets": {
+                    "text_memory": {
+                        "enabled": True,
+                        "method": "reference_text_memory",
+                        "config": {"max_records": 10},
+                    }
+                }
+            },
+        },
+    )
+
+    assert spec.evolution.targets["text_memory"].method == "reference_text_memory"
+    assert spec.model_dump(mode="json")["evolution"]["targets"]["text_memory"] == {
+        "enabled": True,
+        "method": "reference_text_memory",
+        "config": {"max_records": 10},
+    }
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        _json_model(
+            ProjectSpecV1,
+            {
+                "execution_mode": "self-deployed",
+                "capture_mode": "transcript",
+                "harness_id": "codex",
+                "agent_model_ref": "model-1",
+                "evolution_targets": [],
+            },
+        )
+
+
+def test_revision_transition_includes_model_serving_preparation() -> None:
+    assert RevisionTransitionState.PREPARING_SERVING.value == "preparing_serving"
+
+
+def test_skill_bundle_content_has_unique_paths_and_an_aggregate_budget() -> None:
+    def file(path: str, content: str) -> dict[str, str]:
+        return {
+            "relative_path": path,
+            "mime_type": "text/markdown",
+            "content": content,
+            "content_sha256": "a" * 64,
+        }
+
+    duplicate = {"artifact_type": "skill_bundle", "files": [file("SKILL.md", "a")] * 2}
+    with pytest.raises(ValidationError, match="unique"):
+        _json_model(SkillBundleContentV1, duplicate)
+
+    oversized = {
+        "artifact_type": "skill_bundle",
+        "files": [file("SKILL.md", "x" * (2 * 1024 * 1024))]
+        + [file(f"notes-{index}.md", "x" * (2 * 1024 * 1024)) for index in range(4)],
+    }
+    with pytest.raises(ValidationError, match="aggregate byte budget"):
+        _json_model(SkillBundleContentV1, oversized)
 
 
 def test_openapi_object_models_are_closed_and_collections_are_bounded() -> None:

@@ -46,10 +46,11 @@ export const CONTRACT_FIXTURE_V1 = {
     },
   },
   health: {
-    schema_version: "1",
-    service: "openevo-desktop-sidecar",
+    service: "openevo-sidecar",
     status: "ok",
-    checked_at: NOW,
+    protocol: "openevo-native-sidecar-v1",
+    instance_id: "1".repeat(32),
+    instance_proof: A,
   },
   error: {
     schema_version: "1",
@@ -274,6 +275,8 @@ export const CONTRACT_FIXTURE_V1 = {
     documents: [
       { document_id: "memory", title: "Task memory", media_type: "text/markdown", content: "# Memory\n\nValidated behavior." },
     ],
+    total_documents: 1,
+    truncated: false,
   },
   artifactDiff: {
     schema_version: "1",
@@ -357,7 +360,15 @@ export const CONTRACT_FIXTURE_V1 = {
     schema_version: "1",
     observed_at: NOW,
     contract: { selected_major: 1, desktop_openapi_sha256: A, core_openapi_sha256: B, compatible: true },
-    core: { state: "core_ready", profile_id: "profile-fixture-1", active_tunnel: true, last_error_code: null },
+    core: {
+      state: "online",
+      profile_id: "profile-fixture-1",
+      active_tunnel: true,
+      operation_id: null,
+      host_key_review: null,
+      core: { contract_version: "1", contract_digest: B, core_version: "0.1.0" },
+      failure: null,
+    },
     active_project: {
       project_id: "project-fixture-1",
       project_etag: ETAG_B,

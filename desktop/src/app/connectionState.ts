@@ -1,3 +1,5 @@
+import type { CoreConnectionStateV1 } from "../api/v1/schemas";
+
 export const connectionPhases = [
   "local_starting",
   "local_ready",
@@ -80,6 +82,44 @@ export const initialConnectionState: ConnectionSnapshot = Object.freeze({
   core: null,
   failure: null,
 });
+
+export function connectionSnapshotFromContract(
+  incoming: CoreConnectionStateV1,
+  sequence: number,
+): ConnectionSnapshot {
+  const snapshot: ConnectionSnapshot = {
+    sequence,
+    phase: incoming.state,
+    profileId: incoming.profile_id,
+    operationId: incoming.operation_id,
+    hostKeyReview:
+      incoming.host_key_review === null
+        ? null
+        : {
+            algorithm: incoming.host_key_review.algorithm,
+            fingerprint: incoming.host_key_review.fingerprint,
+          },
+    core:
+      incoming.core === null
+        ? null
+        : {
+            contractVersion: incoming.core.contract_version,
+            contractDigest: incoming.core.contract_digest,
+            coreVersion: incoming.core.core_version,
+          },
+    failure:
+      incoming.failure === null
+        ? null
+        : {
+            code: incoming.failure.code,
+            message: incoming.failure.message,
+            retryable: incoming.failure.retryable,
+            nextAction: incoming.failure.next_action,
+          },
+  };
+  validateConnectionSnapshot(snapshot);
+  return freezeConnectionSnapshot(snapshot);
+}
 
 /**
  * Reconciles authoritative sidecar snapshots without inventing local progress.

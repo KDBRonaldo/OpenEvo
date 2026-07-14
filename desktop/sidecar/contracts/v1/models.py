@@ -28,6 +28,8 @@ MAX_JSON_COLLECTION_ITEMS = 1_024
 MAX_JSON_TEXT_BYTES = 262_144
 MAX_JSON_TOTAL_BYTES = 1_048_576
 MAX_SAFE_INTEGER = 9_007_199_254_740_991
+MAX_ARTIFACT_PREVIEW_BYTES = 2 * 1024 * 1024
+MAX_ARTIFACT_PREVIEW_DOCUMENTS = 128
 
 JsonValueV1 = TypeAliasType(
     "JsonValueV1",
@@ -92,6 +94,11 @@ ShortText = Annotated[
 LongText = Annotated[
     str,
     StringConstraints(strict=True, min_length=1, max_length=65_536),
+    AfterValidator(_validate_user_text),
+]
+DiffText = Annotated[
+    str,
+    StringConstraints(strict=True, max_length=65_536),
     AfterValidator(_validate_user_text),
 ]
 Digest = Annotated[
@@ -278,10 +285,24 @@ class VersionV1(StrictModel):
 
 
 class HealthV1(StrictModel):
-    schema_version: Literal["1"] = SCHEMA_VERSION
-    service: Literal["openevo-desktop-sidecar"] = "openevo-desktop-sidecar"
+    service: Literal["openevo-sidecar"] = "openevo-sidecar"
     status: Literal["ok", "degraded", "starting"]
-    checked_at: UtcTimestamp
+    protocol: Literal["openevo-native-sidecar-v1"] | None = None
+    instance_id: (
+        Annotated[str, StringConstraints(strict=True, pattern=r"^[0-9a-f]{32}$")] | None
+    ) = None
+    instance_proof: Digest | None = None
+
+    @model_validator(mode="after")
+    def _native_proof_is_atomic(self) -> HealthV1:
+        values = (self.protocol, self.instance_id, self.instance_proof)
+        if any(value is not None for value in values) and not all(
+            value is not None for value in values
+        ):
+            raise ValueError("native health proof fields must all be present or all be absent")
+        if self.protocol is not None and self.status != "ok":
+            raise ValueError("native readiness proof is valid only for an ok sidecar")
+        return self
 
 
 class ContractNegotiationV1(StrictModel):
@@ -291,20 +312,77 @@ class ContractNegotiationV1(StrictModel):
     compatible: bool
 
 
+class HostKeyReviewV1(StrictModel):
+    algorithm: Literal["ssh-ed25519", "ecdsa-sha2-nistp256", "rsa-sha2-512"]
+    fingerprint: Annotated[
+        str,
+        StringConstraints(strict=True, pattern=r"^SHA256:[A-Za-z0-9+/]{20,88}={0,2}$"),
+    ]
+
+
+class CoreCompatibilityV1(StrictModel):
+    contract_version: Literal["1"] = "1"
+    contract_digest: Digest
+    core_version: ShortText
+
+
+class ConnectionFailureV1(StrictModel):
+    code: Annotated[str, StringConstraints(strict=True, pattern=r"^[a-z][a-z0-9_]{0,127}$")]
+    message: ShortText
+    retryable: bool
+    next_action: ShortText | None = None
+
+
 class CoreConnectionStateV1(StrictModel):
     state: Literal[
         "disconnected",
         "connecting",
-        "host_key_required",
+        "host_key_review",
+        "checking",
         "bootstrapping",
-        "tunnel_ready",
-        "core_ready",
-        "incompatible",
-        "failed",
+        "core_starting",
+        "online",
+        "degraded",
+        "reconnecting",
+        "offline",
     ]
     profile_id: OpaqueId | None = None
     active_tunnel: bool
-    last_error_code: ShortText | None = None
+    operation_id: OpaqueId | None = None
+    host_key_review: HostKeyReviewV1 | None = None
+    core: CoreCompatibilityV1 | None = None
+    failure: ConnectionFailureV1 | None = None
+
+    @model_validator(mode="after")
+    def _valid_state_shape(self) -> CoreConnectionStateV1:
+        operation_states = {
+            "connecting",
+            "host_key_review",
+            "checking",
+            "bootstrapping",
+            "core_starting",
+            "reconnecting",
+        }
+        active_states = operation_states | {"online", "degraded", "offline"}
+        if self.state in operation_states and self.operation_id is None:
+            raise ValueError(f"{self.state} requires an operation_id")
+        if self.state in active_states and self.profile_id is None:
+            raise ValueError(f"{self.state} requires a profile_id")
+        if (self.state == "host_key_review") != (self.host_key_review is not None):
+            raise ValueError("host_key_review data is valid only in host_key_review state")
+        if self.state == "online":
+            if not self.active_tunnel or self.core is None:
+                raise ValueError("online requires an active tunnel and compatible Core metadata")
+        elif self.state not in {"degraded", "reconnecting"} and self.core is not None:
+            raise ValueError("Core metadata is valid only after a compatible connection")
+        if self.state in {"degraded", "offline"}:
+            if self.failure is None:
+                raise ValueError(f"{self.state} requires a typed failure")
+        elif self.failure is not None:
+            raise ValueError("failure data is valid only in degraded or offline state")
+        if self.state in {"disconnected", "offline"} and self.active_tunnel:
+            raise ValueError(f"{self.state} cannot report an active tunnel")
+        return self
 
 
 class ActiveProjectStateV1(StrictModel):
@@ -795,9 +873,9 @@ class RunCreateV1(StrictModel):
     required_revision: RevisionRefV1
 
     @model_validator(mode="after")
-    def _required_revision_must_be_active(self) -> RunCreateV1:
-        if self.required_revision.state != "active":
-            raise ValueError("required_revision must be active")
+    def _required_revision_must_be_reachable(self) -> RunCreateV1:
+        if self.required_revision.state in {"failed", "cancelled"}:
+            raise ValueError("a run cannot require a terminal revision")
         return self
 
 
@@ -974,14 +1052,29 @@ class ArtifactContentV1(StrictModel):
     schema_version: Literal["1"] = SCHEMA_VERSION
     artifact_id: OpaqueId
     content_digest: Digest
-    documents: tuple[ArtifactDocumentV1, ...] = Field(min_length=1, max_length=1_024)
+    documents: tuple[ArtifactDocumentV1, ...] = Field(
+        min_length=1, max_length=MAX_ARTIFACT_PREVIEW_DOCUMENTS
+    )
+    total_documents: int = Field(ge=1, le=1_000_000)
+    truncated: bool
+
+    @model_validator(mode="after")
+    def _bounded_preview(self) -> ArtifactContentV1:
+        if self.total_documents < len(self.documents):
+            raise ValueError("total_documents cannot be smaller than the returned preview")
+        if self.truncated != (self.total_documents > len(self.documents)):
+            raise ValueError("truncated must agree with total_documents")
+        aggregate_bytes = sum(len(document.content.encode("utf-8")) for document in self.documents)
+        if aggregate_bytes > MAX_ARTIFACT_PREVIEW_BYTES:
+            raise ValueError("artifact preview exceeds the aggregate byte budget")
+        return self
 
 
 class DiffLineV1(StrictModel):
     kind: Literal["context", "added", "removed"]
     old_line: int | None = Field(default=None, ge=1)
     new_line: int | None = Field(default=None, ge=1)
-    text: LongText
+    text: DiffText
 
 
 class DiffHunkV1(StrictModel):

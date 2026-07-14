@@ -1,0 +1,96 @@
+{
+  "artifact_content": {
+    "artifact_id": "artifact-fixture-1",
+    "content_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "documents": [
+      {
+        "content": "# Memory\n\nValidated behavior.",
+        "document_id": "memory",
+        "media_type": "text/markdown",
+        "title": "Task memory"
+      }
+    ],
+    "schema_version": "1",
+    "total_documents": 1,
+    "truncated": false
+  },
+  "artifact_diff": {
+    "artifact_id": "artifact-fixture-1",
+    "base_artifact_id": null,
+    "hunks": [
+      {
+        "heading": "Task memory",
+        "hunk_id": "memory-hunk-1",
+        "lines": [
+          {
+            "kind": "context",
+            "new_line": 1,
+            "old_line": 1,
+            "text": ""
+          }
+        ]
+      }
+    ],
+    "schema_version": "1",
+    "truncated": false
+  },
+  "health": {
+    "instance_id": "11111111111111111111111111111111",
+    "instance_proof": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "protocol": "openevo-native-sidecar-v1",
+    "service": "openevo-sidecar",
+    "status": "ok"
+  },
+  "run_create": {
+    "capability_registry_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "project_id": "project-fixture-1",
+    "project_snapshot": {
+      "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "snapshot_id": "project-snapshot-fixture-1"
+    },
+    "required_revision": {
+      "generation": 2,
+      "manifest_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "revision_id": "revision-fixture-2",
+      "state": "queued"
+    },
+    "task_snapshot": {
+      "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "snapshot_id": "task-snapshot-fixture-1"
+    },
+    "workspace_snapshot": {
+      "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "snapshot_id": "workspace-snapshot-fixture-1"
+    }
+  },
+  "state": {
+    "active_project": {
+      "connection_state": "ready",
+      "profile_id": "profile-fixture-1",
+      "project_etag": "\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"",
+      "project_id": "project-fixture-1"
+    },
+    "contract": {
+      "compatible": true,
+      "core_openapi_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "desktop_openapi_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "selected_major": 1
+    },
+    "core": {
+      "active_tunnel": true,
+      "core": {
+        "contract_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "contract_version": "1",
+        "core_version": "0.1.0"
+      },
+      "failure": null,
+      "host_key_review": null,
+      "operation_id": null,
+      "profile_id": "profile-fixture-1",
+      "state": "online"
+    },
+    "observed_at": "2026-07-14T12:00:00Z",
+    "pending_operation_ids": [],
+    "schema_version": "1"
+  }
+}

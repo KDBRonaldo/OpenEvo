@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
+import criticalFixture from "../../sidecar/contracts/v1/fixtures/contract-critical.json";
+import { coreConnectionStateV1Schema } from "../api/v1/schemas";
 import {
   connectionActions,
+  connectionSnapshotFromContract,
   initialConnectionState,
   reconcileConnectionSnapshot,
   validateConnectionSnapshot,
@@ -23,6 +26,16 @@ function snapshot(
 }
 
 describe("connection snapshot reconciliation", () => {
+  it("maps the authoritative Local API state without inventing progress", () => {
+    const state = coreConnectionStateV1Schema.parse(criticalFixture.state.core);
+    const mapped = connectionSnapshotFromContract(state, 7);
+
+    expect(mapped.phase).toBe("online");
+    expect(mapped.sequence).toBe(7);
+    expect(mapped.core?.contractDigest).toBe("a".repeat(64));
+    expect(connectionActions(mapped).canRun).toBe(true);
+  });
+
   it("ignores stale delivery and accepts identical at-least-once replay", () => {
     const online = snapshot({
       sequence: 8,

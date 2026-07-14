@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import criticalFixture from "../../../sidecar/contracts/v1/fixtures/contract-critical.json";
 import { CONTRACT_FIXTURE_V1, EVENT_FIXTURE_V1, PROFILE_PAGE_FIXTURE_V1, RUN_PAGE_FIXTURE_V1 } from "./fixtures";
 import {
   apiErrorV1Schema,
@@ -17,6 +18,7 @@ import {
   projectV1Schema,
   projectValidationV1Schema,
   remoteProfileV1Schema,
+  runCreateV1Schema,
   runContextV1Schema,
   runPageV1Schema,
   runV1Schema,
@@ -53,6 +55,14 @@ describe("Desktop Local API v1 schemas", () => {
     expect(projectValidationV1Schema.parse(CONTRACT_FIXTURE_V1.validation).valid).toBe(true);
   });
 
+  it("parses the Python-owned cross-language critical fixture", () => {
+    expect(healthV1Schema.parse(criticalFixture.health).protocol).toBe("openevo-native-sidecar-v1");
+    expect(desktopStateV1Schema.parse(criticalFixture.state).core.state).toBe("online");
+    expect(runCreateV1Schema.parse(criticalFixture.run_create).required_revision.state).toBe("queued");
+    expect(artifactContentV1Schema.parse(criticalFixture.artifact_content).total_documents).toBe(1);
+    expect(artifactDiffV1Schema.parse(criticalFixture.artifact_diff).hunks[0]?.lines[0]?.text).toBe("");
+  });
+
   it("rejects unknown response fields instead of stripping them", () => {
     expect(() =>
       remoteProfileV1Schema.parse({
@@ -81,6 +91,41 @@ describe("Desktop Local API v1 schemas", () => {
         },
       }),
     ).toThrow(/sensitive or implementation-detail/i);
+  });
+
+  it("accepts a follow-up run while its required revision is still queued", () => {
+    const run = runCreateV1Schema.parse({
+      project_id: "project-1",
+      project_snapshot: { snapshot_id: "project-snapshot-1", digest: "a".repeat(64) },
+      task_snapshot: { snapshot_id: "task-snapshot-1", digest: "b".repeat(64) },
+      workspace_snapshot: { snapshot_id: "workspace-snapshot-1", digest: "c".repeat(64) },
+      capability_registry_digest: "d".repeat(64),
+      required_revision: {
+        revision_id: "revision-2",
+        generation: 2,
+        manifest_digest: "e".repeat(64),
+        state: "queued",
+      },
+    });
+    expect(run.required_revision.state).toBe("queued");
+  });
+
+  it("accepts empty context lines in a bounded artifact diff", () => {
+    expect(
+      artifactDiffV1Schema.parse({
+        schema_version: "1",
+        artifact_id: "artifact-1",
+        base_artifact_id: null,
+        hunks: [
+          {
+            hunk_id: "hunk-1",
+            heading: "Memory",
+            lines: [{ kind: "context", old_line: 1, new_line: 1, text: "" }],
+          },
+        ],
+        truncated: false,
+      }).hunks[0]?.lines[0]?.text,
+    ).toBe("");
   });
 
   it("accepts only the exact self-deployed execution mode spelling", () => {

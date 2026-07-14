@@ -20,6 +20,7 @@ export const opaqueIdSchema = z
   .refine((value) => value === value.trim() && !CONTROL_CHARACTERS.test(value), "must be trimmed text without control characters");
 export const shortTextSchema = z.string().min(1).max(512).refine((value) => !value.includes("\0"));
 export const longTextSchema = z.string().min(1).max(65_536).refine((value) => !value.includes("\0"));
+export const diffTextSchema = z.string().max(65_536).refine((value) => !value.includes("\0"));
 export const utcTimestampSchema = z.string().regex(UTC_RFC3339, "must be a UTC RFC 3339 timestamp");
 export const sha256DigestSchema = z.string().regex(SHA256, "must be lowercase SHA-256 hex");
 export const etagSchema = z.string().regex(/^"[0-9a-f]{64}"$/);
@@ -95,12 +96,19 @@ export const desktopBootstrapContextV1Schema = z
 
 export const healthV1Schema = z
   .object({
-    schema_version: schemaVersionV1Schema,
-    service: z.literal("openevo-desktop-sidecar"),
+    service: z.literal("openevo-sidecar"),
     status: z.enum(["ok", "degraded", "starting"]),
-    checked_at: utcTimestampSchema,
+    protocol: z.literal("openevo-native-sidecar-v1").nullable().default(null),
+    instance_id: z.string().regex(/^[0-9a-f]{32}$/).nullable().default(null),
+    instance_proof: sha256DigestSchema.nullable().default(null),
   })
-  .strict();
+  .strict()
+  .superRefine((value, context) => {
+    const proof = [value.protocol, value.instance_id, value.instance_proof];
+    const present = proof.filter((entry) => entry !== null).length;
+    if (present !== 0 && present !== proof.length) issue(context, ["protocol"], "native health proof fields must be atomic");
+    if (present === proof.length && value.status !== "ok") issue(context, ["status"], "native readiness proof requires ok status");
+  });
 
 export const apiErrorV1Schema = z
   .object({
@@ -122,14 +130,37 @@ export const apiErrorV1Schema = z
 export const contractNegotiationV1Schema = z
   .object({ selected_major: z.literal(1), desktop_openapi_sha256: sha256DigestSchema, core_openapi_sha256: sha256DigestSchema.nullable().default(null), compatible: z.boolean() })
   .strict();
+export const hostKeyReviewV1Schema = z
+  .object({ algorithm: z.enum(["ssh-ed25519", "ecdsa-sha2-nistp256", "rsa-sha2-512"]), fingerprint: z.string().regex(/^SHA256:[A-Za-z0-9+/]{20,88}={0,2}$/) })
+  .strict();
+export const coreCompatibilityV1Schema = z
+  .object({ contract_version: schemaVersionV1Schema, contract_digest: sha256DigestSchema, core_version: shortTextSchema })
+  .strict();
+export const connectionFailureV1Schema = z
+  .object({ code: z.string().regex(/^[a-z][a-z0-9_]{0,127}$/), message: shortTextSchema, retryable: z.boolean(), next_action: shortTextSchema.nullable().default(null) })
+  .strict();
 export const coreConnectionStateV1Schema = z
   .object({
-    state: z.enum(["disconnected", "connecting", "host_key_required", "bootstrapping", "tunnel_ready", "core_ready", "incompatible", "failed"]),
+    state: z.enum(["disconnected", "connecting", "host_key_review", "checking", "bootstrapping", "core_starting", "online", "degraded", "reconnecting", "offline"]),
     profile_id: opaqueIdSchema.nullable().default(null),
     active_tunnel: z.boolean(),
-    last_error_code: shortTextSchema.nullable().default(null),
+    operation_id: opaqueIdSchema.nullable().default(null),
+    host_key_review: hostKeyReviewV1Schema.nullable().default(null),
+    core: coreCompatibilityV1Schema.nullable().default(null),
+    failure: connectionFailureV1Schema.nullable().default(null),
   })
-  .strict();
+  .strict()
+  .superRefine((value, context) => {
+    const operationStates = new Set(["connecting", "host_key_review", "checking", "bootstrapping", "core_starting", "reconnecting"]);
+    const activeStates = new Set([...operationStates, "online", "degraded", "offline"]);
+    if (operationStates.has(value.state) && value.operation_id === null) issue(context, ["operation_id"], `${value.state} requires an operation ID`);
+    if (activeStates.has(value.state) && value.profile_id === null) issue(context, ["profile_id"], `${value.state} requires a profile`);
+    if ((value.state === "host_key_review") !== (value.host_key_review !== null)) issue(context, ["host_key_review"], "host-key review data must agree with state");
+    if (value.state === "online" && (!value.active_tunnel || value.core === null)) issue(context, ["core"], "online requires an active tunnel and compatible Core");
+    if (!["online", "degraded", "reconnecting"].includes(value.state) && value.core !== null) issue(context, ["core"], "Core metadata is invalid before compatibility succeeds");
+    if (["degraded", "offline"].includes(value.state) !== (value.failure !== null)) issue(context, ["failure"], "typed failure must agree with connection state");
+    if (["disconnected", "offline"].includes(value.state) && value.active_tunnel) issue(context, ["active_tunnel"], "offline state cannot have an active tunnel");
+  });
 export const activeProjectStateV1Schema = z
   .object({ project_id: opaqueIdSchema, project_etag: etagSchema, profile_id: opaqueIdSchema, connection_state: z.enum(["offline", "connecting", "ready", "blocked"]) })
   .strict();
@@ -342,7 +373,7 @@ export const revisionRefV1Schema = z
 export const runCreateV1Schema = z
   .object({ project_id: opaqueIdSchema, project_snapshot: immutableSnapshotRefV1Schema, task_snapshot: immutableSnapshotRefV1Schema, workspace_snapshot: immutableSnapshotRefV1Schema, capability_registry_digest: sha256DigestSchema, required_revision: revisionRefV1Schema })
   .strict()
-  .refine((value) => value.required_revision.state === "active", { path: ["required_revision", "state"], message: "required revision must be active" });
+  .refine((value) => !["failed", "cancelled"].includes(value.required_revision.state), { path: ["required_revision", "state"], message: "required revision must be reachable" });
 export const runQueuedReasonV1Schema = z
   .object({ code: z.enum(["capacity_unavailable", "required_revision_uncommitted", "service_starting", "project_activation_pending"]), summary: shortTextSchema, retry_after_seconds: z.number().int().min(1).max(86_400).nullable().default(null) })
   .strict();
@@ -414,8 +445,16 @@ export const agentSystemArtifactV1Schema = z.object({ ...artifactBase, artifact_
 export const parametricMemoryArtifactV1Schema = z.object({ ...artifactBase, artifact_type: z.literal("parametric_memory"), release_enabled: z.literal(false), adapter_id: opaqueIdSchema, base_model_id: opaqueIdSchema, adapter_format: shortTextSchema }).strict();
 export const artifactV1Schema = z.discriminatedUnion("artifact_type", [textMemoryArtifactV1Schema, skillBundleArtifactV1Schema, agentSystemArtifactV1Schema, parametricMemoryArtifactV1Schema]);
 export const artifactDocumentV1Schema = z.object({ document_id: opaqueIdSchema, title: shortTextSchema, media_type: z.enum(["text/markdown", "text/plain"]), content: longTextSchema }).strict();
-export const artifactContentV1Schema = z.object({ schema_version: schemaVersionV1Schema, artifact_id: opaqueIdSchema, content_digest: sha256DigestSchema, documents: z.array(artifactDocumentV1Schema).min(1).max(1_024) }).strict();
-export const diffLineV1Schema = z.object({ kind: z.enum(["context", "added", "removed"]), old_line: z.number().int().positive().nullable().default(null), new_line: z.number().int().positive().nullable().default(null), text: longTextSchema }).strict();
+export const artifactContentV1Schema = z
+  .object({ schema_version: schemaVersionV1Schema, artifact_id: opaqueIdSchema, content_digest: sha256DigestSchema, documents: z.array(artifactDocumentV1Schema).min(1).max(128), total_documents: z.number().int().min(1).max(1_000_000), truncated: z.boolean() })
+  .strict()
+  .superRefine((value, context) => {
+    if (value.total_documents < value.documents.length) issue(context, ["total_documents"], "total document count is smaller than the preview");
+    if (value.truncated !== (value.total_documents > value.documents.length)) issue(context, ["truncated"], "truncation must agree with total document count");
+    const bytes = value.documents.reduce((total, document) => total + new TextEncoder().encode(document.content).byteLength, 0);
+    if (bytes > 2 * 1024 * 1024) issue(context, ["documents"], "artifact preview exceeds aggregate byte budget");
+  });
+export const diffLineV1Schema = z.object({ kind: z.enum(["context", "added", "removed"]), old_line: z.number().int().positive().nullable().default(null), new_line: z.number().int().positive().nullable().default(null), text: diffTextSchema }).strict();
 export const diffHunkV1Schema = z.object({ hunk_id: opaqueIdSchema, heading: shortTextSchema, lines: z.array(diffLineV1Schema).max(10_000) }).strict();
 export const artifactDiffV1Schema = z.object({ schema_version: schemaVersionV1Schema, artifact_id: opaqueIdSchema, base_artifact_id: opaqueIdSchema.nullable().default(null), hunks: z.array(diffHunkV1Schema).max(1_024), truncated: z.boolean() }).strict();
 export const serviceV1Schema = z
@@ -478,6 +517,7 @@ export type DesktopBootstrapContextV1 = z.infer<typeof desktopBootstrapContextV1
 export type HealthV1 = z.infer<typeof healthV1Schema>;
 export type ApiErrorV1 = z.infer<typeof apiErrorV1Schema>;
 export type DesktopStateV1 = z.infer<typeof desktopStateV1Schema>;
+export type CoreConnectionStateV1 = z.infer<typeof coreConnectionStateV1Schema>;
 export type RemoteProfileV1 = z.infer<typeof remoteProfileV1Schema>;
 export type ProfileCreateV1 = z.input<typeof profileCreateV1Schema>;
 export type ProfilePatchV1 = z.input<typeof profilePatchV1Schema>;

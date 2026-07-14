@@ -18,12 +18,16 @@ from pydantic import (
     model_validator,
 )
 
+from openevo.evolution.framework.capabilities import EvolutionCapabilitiesV1
+from openevo.evolution.framework.plan import ProjectEvolutionTargetMap
+
 
 MAX_CANONICAL_JSON_BYTES = 256 * 1024
 MAX_CANONICAL_JSON_DEPTH = 16
 MAX_CANONICAL_JSON_NODES = 8192
 MAX_CANONICAL_JSON_COLLECTION_ITEMS = 4096
 MAX_JAVASCRIPT_SAFE_INTEGER = (1 << 53) - 1
+MAX_SKILL_BUNDLE_CONTENT_BYTES = 8 * 1024 * 1024
 
 
 class ContractModel(BaseModel):
@@ -400,57 +404,6 @@ class EnvironmentRepairResponseV1(ContractModel):
     checked_at: UtcTimestamp
 
 
-class SupportStatus(StrEnum):
-    SUPPORTED = "supported"
-    UNAVAILABLE = "unavailable"
-    UNSUPPORTED = "unsupported"
-
-
-class SupportReason(StrEnum):
-    AVAILABLE = "available"
-    EXECUTION_MODE_UNSUPPORTED = "execution_mode_unsupported"
-    CAPTURE_MODE_UNSUPPORTED = "capture_mode_unsupported"
-    HARNESS_UNSUPPORTED = "harness_unsupported"
-    RUNTIME_UNAVAILABLE = "runtime_unavailable"
-    MODEL_SERVICE_UNHEALTHY = "model_service_unhealthy"
-    RELEASE_DISABLED = "release_disabled"
-
-
-class CapabilitySupportAxisV1(ContractModel):
-    status: SupportStatus
-    reason: SupportReason
-    message: Description | None = None
-
-
-class MethodCapabilityV1(ContractModel):
-    method_id: OpaqueId
-    display_name: DisplayName
-    description: Description
-    maturity: Literal["stable", "experimental"]
-    config_schema_json: CanonicalJsonObject
-    default_config_json: CanonicalJsonObject
-    implementation_identity_digest: Sha256Digest
-    execution: CapabilitySupportAxisV1
-    capture: CapabilitySupportAxisV1
-    harness: CapabilitySupportAxisV1
-    runtime: CapabilitySupportAxisV1
-
-
-class ResolvedMethodCapabilityV1(ContractModel):
-    method_id: OpaqueId
-    implementation_identity_digest: Sha256Digest
-    execution: CapabilitySupportAxisV1
-    capture: CapabilitySupportAxisV1
-    harness: CapabilitySupportAxisV1
-    runtime: CapabilitySupportAxisV1
-
-
-class SelectionResolverCapabilityV1(ContractModel):
-    selection_value: OpaqueId
-    display_name: DisplayName
-    resolved_methods: list[ResolvedMethodCapabilityV1] = Field(min_length=1, max_length=256)
-
-
 class ArtifactType(StrEnum):
     TEXT_MEMORY = "text_memory"
     SKILL_BUNDLE = "skill_bundle"
@@ -458,39 +411,11 @@ class ArtifactType(StrEnum):
     PARAMETRIC_MEMORY = "parametric_memory"
 
 
-class TargetCapabilityV1(ContractModel):
-    target_id: OpaqueId
-    display_name: DisplayName
-    description: Description
-    artifact_type: ArtifactType
-    configured_default_method_id: OpaqueId
-    effective_default_method_id: OpaqueId | None
-    methods: list[MethodCapabilityV1] = Field(max_length=256)
-    accepted_methods: list[ResolvedMethodCapabilityV1] = Field(min_length=1, max_length=256)
-    selection_resolvers: list[SelectionResolverCapabilityV1] = Field(max_length=64)
+CapabilitiesResponseV1 = EvolutionCapabilitiesV1
 
 
-class CapabilitiesResponseV1(ContractModel):
-    schema_version: Literal["1"] = "1"
-    core_version: ShortText
-    registry_digest: Sha256Digest
-    execution_mode: ExecutionMode
-    capture_mode: CaptureMode
-    harness_id: OpaqueId
-    targets: list[TargetCapabilityV1] = Field(max_length=128)
-
-
-class EvolutionTargetSelectionV1(ContractModel):
-    target_id: OpaqueId
-    enabled: bool
-    method_id: OpaqueId | None = None
-    config_json: CanonicalJsonObject = "{}"
-
-    @model_validator(mode="after")
-    def _enabled_target_has_method(self) -> EvolutionTargetSelectionV1:
-        if self.enabled and self.method_id is None:
-            raise ValueError("an enabled target requires a method_id")
-        return self
+class EvolutionConfigV1(ContractModel):
+    targets: ProjectEvolutionTargetMap
 
 
 class ProjectSpecV1(ContractModel):
@@ -498,17 +423,7 @@ class ProjectSpecV1(ContractModel):
     capture_mode: CaptureMode
     harness_id: OpaqueId
     agent_model_ref: OpaqueId
-    evolution_targets: list[EvolutionTargetSelectionV1] = Field(max_length=128)
-
-    @field_validator("evolution_targets")
-    @classmethod
-    def _unique_targets(
-        cls, value: list[EvolutionTargetSelectionV1]
-    ) -> list[EvolutionTargetSelectionV1]:
-        target_ids = [target.target_id for target in value]
-        if len(target_ids) != len(set(target_ids)):
-            raise ValueError("target IDs must be unique")
-        return value
+    evolution: EvolutionConfigV1
 
     @model_validator(mode="after")
     def _subscription_requires_transcript(self) -> ProjectSpecV1:
@@ -689,6 +604,7 @@ class RevisionTransitionState(StrEnum):
     RUNNING_METHODS = "running_methods"
     VALIDATING = "validating"
     MATERIALIZING = "materializing"
+    PREPARING_SERVING = "preparing_serving"
     COMMITTING = "committing"
     ACTIVE = "active"
     FAILED = "failed"
@@ -1013,9 +929,16 @@ class SkillBundleContentV1(ContractModel):
     files: list[SkillFileV1] = Field(min_length=1, max_length=128)
 
     @model_validator(mode="after")
-    def _contains_root_skill(self) -> SkillBundleContentV1:
-        if "SKILL.md" not in {item.relative_path for item in self.files}:
+    def _valid_bundle_content(self) -> SkillBundleContentV1:
+        paths = [item.relative_path for item in self.files]
+        if "SKILL.md" not in paths:
             raise ValueError("skill bundle requires root SKILL.md")
+        if len(paths) != len(set(paths)):
+            raise ValueError("skill bundle file paths must be unique")
+        if sum(len(item.content.encode("utf-8")) for item in self.files) > (
+            MAX_SKILL_BUNDLE_CONTENT_BYTES
+        ):
+            raise ValueError("skill bundle content exceeds the aggregate byte budget")
         return self
 
 

@@ -45,6 +45,13 @@ and declared feature flags. Client and server select the highest common major.
 No common major returns HTTP 426 with `contract_version_unsupported`; there is
 no compatibility fallback to legacy routes.
 
+Desktop Local `/health` also serves as the native-host readiness proof. Tauri
+sends a fresh lowercase 32-byte challenge in
+`X-OpenEvo-Native-Challenge`; a packaged sidecar returns the closed
+`openevo-native-sidecar-v1` protocol, instance ID, and challenge-bound HMAC
+proof. The three proof fields are all present or all absent. The Desktop
+session token is never part of this unauthenticated response.
+
 Release builds reject providers that report `contract_simulator`, `scaffold`,
 `dry_run`, an unknown contract digest, an unverified Core registry, or a Core
 connection outside the active project tunnel. Such providers may be used only
@@ -165,6 +172,12 @@ Backend and bootstrap reports are normalized into typed checks, progress, and
 user-safe logs. Raw commands, stdout/stderr blobs, PIDs, and remote paths are
 not renderer contracts.
 
+`DesktopStateV1.core.state` is the renderer's authoritative remote connection
+phase: `disconnected`, `connecting`, `host_key_review`, `checking`,
+`bootstrapping`, `core_starting`, `online`, `degraded`, `reconnecting`, or
+`offline`. Native process startup phases remain Tauri-local and are mapped into
+the same renderer state machine; the renderer does not infer remote progress.
+
 ## Core Control API v1
 
 Only `GET /version` and `GET /health` are unauthenticated. The sidecar owns a
@@ -211,10 +224,18 @@ POST   /v1/maintenance/cache-cleanup
 GET    /v1/events
 ```
 
+Project specifications carry evolution choices only as
+`evolution.targets.<target_id> = {enabled, method, config}` and use Core's
+bounded `ProjectEvolutionTargetMap`. The API does not define a second flat or
+list-shaped selection format.
+
 `RunCreateV1` references Core-owned immutable project, task, and workspace
-snapshots, an expected capability registry digest, and a required committed
-revision. It does not accept arbitrary runtime/model maps, host paths, shell
-commands, benchmark fields, or a client-authored admission envelope.
+snapshots, an expected capability registry digest, and a required revision.
+The required revision may still be queued or preparing: Core accepts the run
+but keeps it queued until that exact revision is atomically active. A failed or
+cancelled revision cannot be required. The request does not accept arbitrary
+runtime/model maps, host paths, shell commands, benchmark fields, or a
+client-authored admission envelope.
 
 The run state machine is
 `queued -> preparing -> running -> succeeded|failed|cancelled`, with the
@@ -232,13 +253,20 @@ The exhibition artifact union contains `text_memory`, `skill_bundle`, and
 `agent_system`. `parametric_memory` remains a reserved typed variant but is not
 release-enabled. Artifact responses expose content, diff, compatibility,
 lineage, scores, selected/promoted state, and revision membership without raw
-`file://` URIs or host paths.
+`file://` URIs or host paths. Desktop content responses are bounded previews:
+at most 128 documents and 2 MiB of aggregate UTF-8 text, with explicit total
+document count and truncation state.
 
 ## Capability And Mode Rules
 
 Capabilities come only from the active remote Core verified executable
 registry. The sidecar has no method table or fallback defaults. Validation and
-run creation bind the exact registry digest.
+run creation bind the exact registry digest. Core returns the existing
+framework-owned `EvolutionCapabilitiesV1` object directly; the Core Control API
+must not copy, rename, narrow, or reinterpret its target, method, resolver,
+identity, schema, evaluated-profile, or four-axis support fields. The sidecar
+may project that payload into renderer-oriented fields only through a tested,
+loss-aware adapter.
 
 The v1 release profiles are:
 

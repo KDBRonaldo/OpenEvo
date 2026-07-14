@@ -77,34 +77,34 @@ Core exposes typed JSON routes. Minimum release endpoint surface:
 GET  /version
 GET  /health
 GET  /v1/status
-GET  /v1/projects?state=<state>&after=<cursor>&limit=<n>&sort=<field>
+GET  /v1/projects
 POST /v1/projects
 GET  /v1/projects/{project_id}
 PATCH /v1/projects/{project_id}
-DELETE /v1/projects/{project_id}?dry_run=<bool>&delete_remote_state=<bool>&delete_workspace_snapshots=<bool>&delete_diagnostics=<bool>
+DELETE /v1/projects/{project_id}
 POST /v1/projects/{project_id}/workspace-sync
 POST /v1/projects/{project_id}/validate
 POST /v1/environment/doctor
 POST /v1/environment/repair
 GET  /v1/capabilities?execution_mode=<codex_subscription_transcript|self-deployed>
-GET  /v1/runs?project_id=<project_id>&state=<state>&after=<cursor>&limit=<n>&sort=<field>
+GET  /v1/runs
 POST /v1/runs
 GET  /v1/runs/{run_id}
-DELETE /v1/runs/{run_id}?dry_run=<bool>&delete_artifacts=<bool>&delete_logs=<bool>
+DELETE /v1/runs/{run_id}
 POST /v1/runs/{run_id}/cancel
 POST /v1/runs/{run_id}/retry
-GET  /v1/runs/{run_id}/context?attempt_id=<attempt-id>
-GET  /v1/runs/{run_id}/timeline?attempt_id=<attempt-id>&after=<cursor>&limit=<n>
-GET  /v1/runs/{run_id}/logs?attempt_id=<attempt-id>&source=<source>&tail=<n>
-GET  /v1/runs/{run_id}/artifacts?attempt_id=<attempt-id>&type=<type>&state=<promotion_state>
+GET  /v1/runs/{run_id}/context
+GET  /v1/runs/{run_id}/timeline
+GET  /v1/runs/{run_id}/logs
+GET  /v1/runs/{run_id}/artifacts
 GET  /v1/artifacts/{artifact_id}
-GET  /v1/artifacts/{artifact_id}/content?path=<path>&max_bytes=<n>
-GET  /v1/artifacts/{artifact_id}/diff?against=<artifact_id>
+GET  /v1/artifacts/{artifact_id}/content
+GET  /v1/artifacts/{artifact_id}/diff
 POST /v1/diagnostics
 GET  /v1/diagnostics/{diagnostic_id}
 DELETE /v1/diagnostics/{diagnostic_id}
 GET  /v1/services
-GET  /v1/services/{service_id}/logs?tail=<n>
+GET  /v1/services/{service_id}/logs
 POST /v1/services/{service_id}/restart
 POST /v1/services/{service_id}/stop
 POST /v1/maintenance/cache-cleanup
@@ -158,19 +158,19 @@ edits, and SSH private-key edits are out of scope.
 
 ## Runs
 
-`POST /v1/runs` creates a science run from `RunCreateRequest`. Core validates the
-task schema, execution mode, capture mode, method IDs, runtime settings,
-context artifact allowlist, and idempotency key. Ordinary-user science requests
-must reject benchmark-only fields at any nesting level. Clients do not submit
-`token_level_metrics_available`; Core derives it from the verified capture path
-and rejects client capability claims as unknown request fields.
+`POST /v1/runs` creates a science run from `RunCreateV1`. The request contains
+only Core-owned immutable project, task, and workspace snapshot IDs, the
+expected verified-registry digest, the required revision ID, and the release
+execution/capture modes. Runtime maps, model maps, host paths, commands,
+benchmark fields, context allowlists, and client-authored admission envelopes
+are rejected. Project method selections are read from the immutable project
+snapshot, whose sole evolution shape is
+`evolution.targets.<target_id> = {enabled, method, config}`.
 
-The `RunCreateRequest`, `RunAttempt`, and response Pydantic models plus API tests
-define required fields, enum values, defaults, forbidden fields, success
-responses, and validation errors. `RunAttempt` persists `execution_mode`,
-`capture_mode`, enabled and disabled artifact families, `method_ids`,
-runtime/model config, `context_artifact_ids`,
-server-derived `token_level_metrics_available`, and `state_identity`.
+The required revision may be active, queued, or preparing. For queued or
+preparing revisions Core persists the run with
+`required_revision_uncommitted`; it starts only after that exact revision is
+atomically active. Failed or cancelled revisions are rejected.
 
 `POST /v1/runs/{run_id}/cancel` asks Core to cancel a queued, preparing, or running
 attempt. `POST /v1/runs/{run_id}/retry` creates a new attempt from the immutable
@@ -182,15 +182,9 @@ the maintenance cleanup API.
 
 ## Run Context
 
-`GET /v1/runs/{run_id}/context?attempt_id=<attempt-id>` returns the persisted or
-reconstructible context resolution and runtime injection outcome for one
-attempt. The response includes `run_id`, `attempt_id`, `context_id`,
-`selected_artifact_ids`, `rejected_artifact_ids`, `selection_policy`,
-candidate ordering evidence, compatibility decisions,
-`runtime_injection_manifest_ref`, `runtime_injection_manifest_sha256`, staged
-paths, target write status, environment variables, warnings, pre-task probe
-refs, and `state_identity`. The implemented response is governed by its Core
-model and API tests.
+`GET /v1/runs/{run_id}/context` returns the pinned revision, successor
+transition, and selected typed artifact references used by the run. It exposes
+no host path, runtime environment, artifact URI, secret, or scanner handle.
 
 The context response must survive backend restart without replaying raw logs.
 It is redacted before reaching Desktop, diagnostics, or release evidence:
@@ -211,10 +205,11 @@ line count, truncation state, and redaction summary.
 
 ## Artifacts
 
-`GET /v1/runs/{run_id}/artifacts` returns Core-registered artifact summaries:
-artifact ID, type, URI ref, manifest, lineage, compatibility, scores, tags,
-promotion state, payload hash, and display metadata. Content and diff routes
-must enforce artifact compatibility and redaction rules before returning data.
+`GET /v1/runs/{run_id}/artifacts` returns typed Core-registered artifact
+summaries with lineage, compatibility, scores, selection state, revision
+membership, payload digest, and display metadata. It never returns `file://`
+URIs or host paths. Content and diff routes return bounded verified text views
+and enforce compatibility and redaction before returning data.
 
 ## Diagnostics
 
