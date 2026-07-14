@@ -394,20 +394,31 @@ messages, credentials, session tokens, remote commands, or backend URLs.
 
 `event_broker_v1.py` is the process-owned publication authority for the Local
 `GET /desktop/v1/events` SSE route. Producers publish only the closed
-`StateEventV1`, `ResourceEventV1`, or `HeartbeatEventV1` models. The broker adds
-one monotonic JavaScript-safe sequence, a sequence-bound opaque event ID, the
-canonical event name, and a UTC timestamp before serializing the frozen
-`EventEnvelopeV1` contract. A rejected timestamp, model, identity, or oversized
-SSE frame consumes neither sequence authority nor replay capacity.
+exact `StateEventV1`, `ResourceEventV1`, or `HeartbeatEventV1` models; subclasses
+are rejected even if they inherit the same fields. The broker snapshots the
+accepted frozen model, adds one monotonic JavaScript-safe sequence, a
+sequence-bound opaque event ID, the canonical event name, and a UTC timestamp,
+then serializes and bounds the canonical `EventEnvelopeV1` frame exactly once.
+The retained ledger and subscriber queues hold only that immutable event ID and
+frame bytes. Later mutation of a producer-owned or returned model therefore
+cannot rewrite replay or live delivery. A rejected timestamp, model, identity,
+or oversized SSE frame consumes neither sequence authority nor replay capacity.
+Publication callbacks cannot recursively enter the same broker; a rejected
+recursive call does not reserve or duplicate a sequence.
 
-The retained ledger and every subscriber queue are independently bounded. A
-subscription with no `Last-Event-ID` starts at the live head; an exact retained
-cursor replays only later records and registers for live delivery under the
-same lock. Unknown, evicted, or too-old cursors fail synchronously before the
-stream response starts. A subscriber that cannot keep up receives a terminal
-gap rather than a non-contiguous stream. Idle streams emit an SSE comment every
-15 seconds, which carries no sequence or replay authority. Closing the broker
-atomically prevents publication and terminates all existing subscriptions.
+The retained ledger, every subscriber queue, and the process-wide subscriber
+count are independently bounded. The default total subscriber limit is 256 and
+cannot be configured above the hard limit of 4,096, keeping publication fanout
+bounded. A subscription with no `Last-Event-ID` starts at the live head; an exact
+retained cursor replays only later records and registers for live delivery under
+the same lock. Unknown, evicted, or too-old cursors fail synchronously before
+the stream response starts. A subscriber that cannot keep up receives a
+terminal gap rather than a non-contiguous stream. Cancellation of a pending
+`__anext__`, stream disconnect through `aclose()`, and abandoned-subscription GC
+all unregister the subscriber and release its queue. Idle streams emit an SSE
+comment every 15 seconds, which carries no sequence or replay authority.
+Closing the broker atomically prevents publication and terminates all existing
+subscriptions.
 
 This module does not infer resource state or cache partial Core payloads. The
 release composition remains responsible for mapping validated Core events to

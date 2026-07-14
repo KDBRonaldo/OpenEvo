@@ -2,13 +2,15 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Coroutine, Iterator
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+import json
 import secrets
 import threading
 import time
-from typing import Final
+from typing import Any, Final
+import weakref
 
 from desktop.sidecar.contracts.v1.models import (
     EventDataV1,
@@ -23,13 +25,15 @@ MAX_EVENT_SEQUENCE: Final = 9_007_199_254_740_991
 MAX_EVENT_FRAME_BYTES: Final = 1_048_576
 DEFAULT_MAX_EVENTS: Final = 4_096
 DEFAULT_MAX_SUBSCRIBER_EVENTS: Final = 512
+DEFAULT_MAX_SUBSCRIBERS: Final = 256
+MAX_SUBSCRIBERS: Final = 4_096
 DEFAULT_HEARTBEAT_INTERVAL_SECONDS: Final = 15.0
 DEFAULT_POLL_INTERVAL_SECONDS: Final = 0.05
 
-_EVENT_NAMES = {
-    "state_changed": "desktop.v1.state.changed",
-    "resource_changed": "desktop.v1.resource.changed",
-    "heartbeat": "desktop.v1.heartbeat",
+_EVENT_NAMES_BY_TYPE = {
+    StateEventV1: "desktop.v1.state.changed",
+    ResourceEventV1: "desktop.v1.resource.changed",
+    HeartbeatEventV1: "desktop.v1.heartbeat",
 }
 
 
@@ -49,10 +53,24 @@ class DesktopEventGapError(DesktopEventBrokerError):
     """A subscriber cannot receive a contiguous sequence."""
 
 
+class DesktopEventSubscriberLimitError(DesktopEventBrokerError):
+    """The process-wide subscriber capacity has been reached."""
+
+
+class DesktopEventReentrantPublishError(DesktopEventBrokerError):
+    """A broker callback attempted to publish recursively."""
+
+
+@dataclass(frozen=True, slots=True)
+class _PublishedFrame:
+    event_id: str
+    frame: bytes
+
+
 @dataclass(slots=True)
 class _Subscriber:
     token: str
-    pending: deque[EventEnvelopeV1] = field(default_factory=deque)
+    pending: deque[_PublishedFrame] = field(default_factory=deque)
     overflowed: bool = False
     closed: bool = False
 
@@ -65,38 +83,97 @@ class DesktopEventSubscriptionV1:
         self._subscriber = subscriber
         self._last_delivery = time.monotonic()
         self._closed = False
+        self._finalizer = weakref.finalize(self, broker._unsubscribe, subscriber)
+        self._finalizer.atexit = False
 
     def __aiter__(self) -> DesktopEventSubscriptionV1:
         return self
 
-    async def __anext__(self) -> bytes:
-        while True:
-            outcome = self._broker._next_for(self._subscriber)
-            if outcome is _CLOSED:
-                self._closed = True
-                raise StopAsyncIteration
-            if outcome is _GAP:
-                await self.aclose()
-                raise DesktopEventGapError("Desktop event subscriber exceeded its replay bound")
-            if isinstance(outcome, EventEnvelopeV1):
-                self._last_delivery = time.monotonic()
-                return _sse_frame(outcome)
-            now = time.monotonic()
-            if now - self._last_delivery >= self._broker.heartbeat_interval:
-                self._last_delivery = now
-                return b": heartbeat\n\n"
-            await asyncio.sleep(
-                min(
-                    self._broker.poll_interval,
-                    max(0.0, self._broker.heartbeat_interval - (now - self._last_delivery)),
+    def __anext__(self) -> Coroutine[Any, Any, bytes]:
+        return _SubscriptionAdvance(self)
+
+    async def _next_frame(self) -> bytes:
+        if self._closed:
+            raise StopAsyncIteration
+        try:
+            while True:
+                outcome = self._broker._next_for(self._subscriber)
+                if outcome is _CLOSED:
+                    raise StopAsyncIteration
+                if outcome is _GAP:
+                    raise DesktopEventGapError(
+                        "Desktop event subscriber exceeded its replay bound"
+                    )
+                if isinstance(outcome, _PublishedFrame):
+                    self._last_delivery = time.monotonic()
+                    return outcome.frame
+                now = time.monotonic()
+                if now - self._last_delivery >= self._broker.heartbeat_interval:
+                    self._last_delivery = now
+                    return b": heartbeat\n\n"
+                await asyncio.sleep(
+                    min(
+                        self._broker.poll_interval,
+                        max(
+                            0.0,
+                            self._broker.heartbeat_interval - (now - self._last_delivery),
+                        ),
+                    )
                 )
-            )
+        except BaseException:
+            self._close()
+            raise
 
     async def aclose(self) -> None:
+        self._close()
+
+    def _close(self) -> None:
         if self._closed:
             return
         self._closed = True
-        self._broker._unsubscribe(self._subscriber)
+        self._finalizer()
+
+
+class _SubscriptionAdvance(Coroutine[Any, Any, bytes]):
+    """Cancellation-aware awaitable, including cancellation before first send."""
+
+    def __init__(self, subscription: DesktopEventSubscriptionV1) -> None:
+        self._subscription = subscription
+        self._coroutine = subscription._next_frame()
+
+    def __await__(self) -> Iterator[Any]:
+        return self
+
+    def __iter__(self) -> Iterator[Any]:
+        return self
+
+    def __next__(self) -> Any:
+        return self.send(None)
+
+    def send(self, value: Any) -> Any:
+        return self._coroutine.send(value)
+
+    def throw(
+        self,
+        typ: type[BaseException] | BaseException,
+        val: object | None = None,
+        tb: object | None = None,
+    ) -> Any:
+        try:
+            if val is None and tb is None:
+                return self._coroutine.throw(typ)
+            if tb is None:
+                return self._coroutine.throw(typ, val)
+            return self._coroutine.throw(typ, val, tb)
+        except BaseException:
+            self._subscription._close()
+            raise
+
+    def close(self) -> None:
+        try:
+            self._coroutine.close()
+        finally:
+            self._subscription._close()
 
 
 _CLOSED = object()
@@ -112,6 +189,7 @@ class DesktopEventBrokerV1:
         *,
         max_events: int = DEFAULT_MAX_EVENTS,
         max_subscriber_events: int | None = None,
+        max_subscribers: int = DEFAULT_MAX_SUBSCRIBERS,
         heartbeat_interval: float = DEFAULT_HEARTBEAT_INTERVAL_SECONDS,
         poll_interval: float = DEFAULT_POLL_INTERVAL_SECONDS,
         event_id_factory: Callable[[], str] | None = None,
@@ -123,18 +201,22 @@ class DesktopEventBrokerV1:
             max_subscriber_events = min(DEFAULT_MAX_SUBSCRIBER_EVENTS, max_events)
         if not 1 <= max_subscriber_events <= max_events:
             raise ValueError("subscriber capacity is outside the replay bound")
+        if not 1 <= max_subscribers <= MAX_SUBSCRIBERS:
+            raise ValueError("subscriber count is outside the process-wide bound")
         if not 0 < heartbeat_interval <= 60:
             raise ValueError("heartbeat interval must be positive and at most 60 seconds")
         if not 0 < poll_interval <= 1:
             raise ValueError("poll interval must be positive and at most one second")
         self._max_events = max_events
         self._max_subscriber_events = max_subscriber_events
+        self._max_subscribers = max_subscribers
         self._heartbeat_interval = float(heartbeat_interval)
         self._poll_interval = float(poll_interval)
         self._event_id_factory = event_id_factory or (lambda: secrets.token_urlsafe(24))
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._lock = threading.RLock()
-        self._events: deque[EventEnvelopeV1] = deque(maxlen=max_events)
+        self._publish_state = threading.local()
+        self._events: deque[_PublishedFrame] = deque(maxlen=max_events)
         self._subscribers: dict[str, _Subscriber] = {}
         self._next_sequence = 0
         self._closed = False
@@ -152,42 +234,60 @@ class DesktopEventBrokerV1:
         with self._lock:
             return self._next_sequence
 
-    def publish(self, data: EventDataV1) -> EventEnvelopeV1:
-        if not isinstance(data, (StateEventV1, ResourceEventV1, HeartbeatEventV1)):
-            raise TypeError("Desktop event data must be a closed v1 event model")
+    @property
+    def subscriber_count(self) -> int:
         with self._lock:
-            self._require_open()
-            if self._next_sequence > MAX_EVENT_SEQUENCE:
-                raise DesktopEventGapError("Desktop event sequence is exhausted")
-            occurred_at = _timestamp(self._clock())
-            sequence = self._next_sequence
-            raw_id = self._event_id_factory()
-            if type(raw_id) is not str:
-                raise ValueError("event identity factory must return a string")
-            event = EventEnvelopeV1(
-                event_id=f"{sequence:x}.{raw_id}",
-                event_name=_EVENT_NAMES[data.kind],
-                occurred_at=occurred_at,
-                sequence=sequence,
-                data=data,
-            )
-            _sse_frame(event)
-            self._next_sequence += 1
-            self._events.append(event)
-            for subscriber in self._subscribers.values():
-                if subscriber.closed or subscriber.overflowed:
-                    continue
-                if len(subscriber.pending) >= self._max_subscriber_events:
-                    subscriber.pending.clear()
-                    subscriber.overflowed = True
-                    continue
-                subscriber.pending.append(event)
-            return event
+            return len(self._subscribers)
+
+    def publish(self, data: EventDataV1) -> EventEnvelopeV1:
+        if getattr(self._publish_state, "active", False):
+            raise DesktopEventReentrantPublishError("Desktop event publication is not reentrant")
+        self._publish_state.active = True
+        try:
+            event_type = type(data)
+            event_name = _EVENT_NAMES_BY_TYPE.get(event_type)
+            if event_name is None:
+                raise TypeError("Desktop event data must be an exact frozen v1 event model")
+            event_data = event_type.model_validate(data.model_dump(mode="json"))
+            with self._lock:
+                self._require_open()
+                if self._next_sequence > MAX_EVENT_SEQUENCE:
+                    raise DesktopEventGapError("Desktop event sequence is exhausted")
+                occurred_at = _timestamp(self._clock())
+                sequence = self._next_sequence
+                raw_id = self._event_id_factory()
+                if type(raw_id) is not str:
+                    raise ValueError("event identity factory must return a string")
+                event = EventEnvelopeV1(
+                    event_id=f"{sequence:x}.{raw_id}",
+                    event_name=event_name,
+                    occurred_at=occurred_at,
+                    sequence=sequence,
+                    data=event_data,
+                )
+                published = _PublishedFrame(event_id=event.event_id, frame=_sse_frame(event))
+                self._next_sequence += 1
+                self._events.append(published)
+                for subscriber in self._subscribers.values():
+                    if subscriber.closed or subscriber.overflowed:
+                        continue
+                    if len(subscriber.pending) >= self._max_subscriber_events:
+                        subscriber.pending.clear()
+                        subscriber.overflowed = True
+                        continue
+                    subscriber.pending.append(published)
+                return event
+        finally:
+            self._publish_state.active = False
 
     def subscribe(self, last_event_id: str | None = None) -> DesktopEventSubscriptionV1:
         with self._lock:
             self._require_open()
-            replay: tuple[EventEnvelopeV1, ...] = ()
+            if len(self._subscribers) >= self._max_subscribers:
+                raise DesktopEventSubscriberLimitError(
+                    "Desktop event subscriber capacity is exhausted"
+                )
+            replay: tuple[_PublishedFrame, ...] = ()
             if last_event_id is not None:
                 event_ids = tuple(event.event_id for event in self._events)
                 try:
@@ -250,7 +350,13 @@ def _timestamp(now: datetime) -> str:
 
 
 def _sse_frame(event: EventEnvelopeV1) -> bytes:
-    payload = event.model_dump_json().encode("utf-8")
+    payload = json.dumps(
+        event.model_dump(mode="json"),
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
     frame = (
         b"id: "
         + event.event_id.encode("utf-8")
@@ -270,5 +376,7 @@ __all__ = (
     "DesktopEventBrokerV1",
     "DesktopEventCursorExpiredError",
     "DesktopEventGapError",
+    "DesktopEventReentrantPublishError",
+    "DesktopEventSubscriberLimitError",
     "DesktopEventSubscriptionV1",
 )
