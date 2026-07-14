@@ -9,11 +9,13 @@ import os
 from pathlib import Path
 import pwd
 import re
+import shutil
 import shlex
 import struct
 import subprocess
 import sys
 import threading
+import tempfile
 import time
 from types import SimpleNamespace
 
@@ -282,6 +284,39 @@ def _execute_remote_script(
         exec(compile(script, "<core-assets-remote>", "exec"), {"__name__": "__main__"})
 
 
+def _execute_remote_script_as_user(
+    script: str,
+    argv: list[str],
+    *,
+    home: Path,
+    uid: int,
+    gid: int,
+) -> subprocess.CompletedProcess[str]:
+    wrapper = (
+        "import pwd,sys,types\n"
+        "home = sys.argv.pop(1)\n"
+        "pwd.getpwuid = lambda _uid: types.SimpleNamespace(pw_dir=home)\n"
+        f"exec(compile({script!r}, '<core-assets-remote>', 'exec'), "
+        "{'__name__': '__main__'})\n"
+    )
+
+    def demote() -> None:
+        if os.geteuid() == 0:
+            os.setgroups([])
+            os.setgid(gid)
+            os.setuid(uid)
+
+    executable = "/usr/bin/python3" if os.geteuid() == 0 else sys.executable
+    return subprocess.run(
+        [executable, "-I", "-c", wrapper, str(home), *argv],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        preexec_fn=demote if os.geteuid() == 0 else None,
+    )
+
+
 def test_remote_asset_scripts_prepare_an_empty_private_root_and_publish_exactly(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -380,6 +415,82 @@ def test_remote_asset_scripts_prepare_an_empty_private_root_and_publish_exactly(
     assert json.loads(capsys.readouterr().out) == finalized
     assert not retried_incoming.exists()
     assert (final_root / WHEEL_NAME).read_bytes() == assets[0].read_bytes()
+
+
+def test_remote_asset_finalize_publishes_as_unprivileged_remote_user() -> None:
+    if os.geteuid() == 0:
+        account = pwd.getpwnam("nobody")
+        uid, gid = account.pw_uid, account.pw_gid
+    else:
+        uid, gid = os.geteuid(), os.getegid()
+
+    root = Path(tempfile.mkdtemp(prefix="openevo-assets-nonroot-", dir="/tmp"))
+    home = root / "home"
+    home.mkdir(mode=0o700)
+    if os.geteuid() == 0:
+        os.chown(root, uid, gid)
+        os.chown(home, uid, gid)
+    try:
+        prepared_result = _execute_remote_script_as_user(
+            core_assets._REMOTE_PREPARE_SCRIPT,
+            [BUNDLE_ID],
+            home=home,
+            uid=uid,
+            gid=gid,
+        )
+        assert prepared_result.returncode == 0, prepared_result.stderr
+        prepared = json.loads(prepared_result.stdout)
+        incoming = Path(prepared["incoming_root"])
+        wheel_bytes = b"sealed wheel bytes"
+        wheel_digest = hashlib.sha256(wheel_bytes).hexdigest()
+        lock_bytes = json.dumps(
+            {
+                "schema_version": "1",
+                "distribution": "openevo",
+                "distribution_version": "0.1.0",
+                "distribution_digest": wheel_digest,
+                "wheel_filename": WHEEL_NAME,
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode()
+        for target, content in (
+            (incoming / WHEEL_NAME, wheel_bytes),
+            (incoming / "framework-lock.json", lock_bytes),
+        ):
+            target.write_bytes(content)
+            target.chmod(0o600)
+            if os.geteuid() == 0:
+                os.chown(target, uid, gid)
+
+        service_root = home / ".openevo" / "core"
+        finalized_result = _execute_remote_script_as_user(
+            core_assets._REMOTE_FINALIZE_SCRIPT,
+            [
+                str(service_root),
+                BUNDLE_ID,
+                prepared["transfer_id"],
+                WHEEL_NAME,
+                wheel_digest,
+                str(len(wheel_bytes)),
+                hashlib.sha256(lock_bytes).hexdigest(),
+                str(len(lock_bytes)),
+            ],
+            home=home,
+            uid=uid,
+            gid=gid,
+        )
+        assert finalized_result.returncode == 0, finalized_result.stderr
+        finalized = json.loads(finalized_result.stdout)
+        final_root = service_root / "assets" / BUNDLE_ID
+        assert finalized["bundle_inode"] == final_root.stat().st_ino
+        assert stat_mode(final_root) == 0o500
+        assert stat_mode(final_root / WHEEL_NAME) == 0o400
+        assert (final_root / WHEEL_NAME).read_bytes() == wheel_bytes
+    finally:
+        for directory, _names, _files in os.walk(root, topdown=False):
+            os.chmod(directory, 0o700)
+        shutil.rmtree(root)
 
 
 def test_remote_asset_publication_isolated_from_held_writer_and_incoming_dir_fd(
@@ -563,6 +674,7 @@ def test_remote_asset_publication_exposes_no_member_writer_during_copy_or_after_
         if writer_fd is not None:
             return
         candidates = list(staging.glob(f"publish-{BUNDLE_ID}-*/{WHEEL_NAME}"))
+        candidates.extend((service_root / "assets").glob(f"publish-{BUNDLE_ID}-*/{WHEEL_NAME}"))
         candidates.extend((service_root / "assets").glob(f"{BUNDLE_ID}/{WHEEL_NAME}"))
         for candidate in candidates:
             if candidate in attempted_paths:
@@ -809,6 +921,14 @@ def test_remote_asset_attempts_are_unique_and_reconcile_retired_partial_uploads(
         path.write_bytes(b"private crashed candidate")
         path.chmod(0o400)
     sealed_candidate.chmod(0o500)
+    assets_root = home / ".openevo" / "core" / "assets"
+    moved_candidate = assets_root / f"publish-{BUNDLE_ID}-{'d' * 32}"
+    moved_candidate.mkdir(mode=0o700)
+    for name in (WHEEL_NAME, "framework-lock.json"):
+        path = moved_candidate / name
+        path.write_bytes(b"private moved crashed candidate")
+        path.chmod(0o400)
+    moved_candidate.chmod(0o500)
 
     _execute_remote_script(
         core_assets._REMOTE_PREPARE_SCRIPT,
@@ -819,6 +939,7 @@ def test_remote_asset_attempts_are_unique_and_reconcile_retired_partial_uploads(
     retried = json.loads(capsys.readouterr().out)
     assert retried["transfer_id"] != prepared["transfer_id"]
     assert list(staging.iterdir()) == [Path(retried["incoming_root"])]
+    assert list(assets_root.iterdir()) == []
 
 
 def test_remote_asset_prepare_bounds_concurrent_incoming_authorities(

@@ -714,6 +714,7 @@ file_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
 max_staging_entries = 32
 max_incoming_attempts = 16
 stale_incoming_seconds = 600
+max_asset_entries = 1024
 
 def open_absolute(path):
     fd = os.open("/", flags)
@@ -894,6 +895,17 @@ def reconcile_staging(fd):
     if len(remaining) >= max_incoming_attempts:
         raise SystemExit(75)
 
+def reconcile_assets(fd):
+    names = bounded_names(fd, max_asset_entries)
+    for name in names:
+        if closed_attempt_name(name, "publish-"):
+            try:
+                clear_private_attempt(fd, name)
+            except FileNotFoundError:
+                pass
+        elif len(name) != 64 or any(c not in "0123456789abcdef" for c in name):
+            raise SystemExit(75)
+
 home_fd = open_absolute(home)
 try:
     require_dir(home_fd)
@@ -925,6 +937,7 @@ try:
                 assets_fd = ensure(core_fd, "assets")
                 try:
                     reconcile_staging(staging_fd)
+                    reconcile_assets(assets_fd)
                     for unused in range(4):
                         transfer = secrets.token_hex(16)
                         incoming = "incoming-" + bundle + "-" + transfer
@@ -1407,7 +1420,7 @@ def verify_bundle(parent, name, directory_mode, file_mode, require_transfer_leas
         os.close(fd)
         raise
 
-def seal_bundle(fd):
+def seal_bundle_members(fd):
     for name in (wheel_name, "framework-lock.json"):
         child_fd = os.open(name, file_flags, dir_fd=fd)
         try:
@@ -1415,7 +1428,6 @@ def seal_bundle(fd):
             os.fsync(child_fd)
         finally:
             os.close(child_fd)
-    os.fchmod(fd, 0o500)
     os.fsync(fd)
 
 def discard_private_bundle(parent, name, fd):
@@ -1530,7 +1542,7 @@ try:
             transfer_lease_fd = None
             candidate_fd = None
             candidate_name = None
-            published = False
+            candidate_parent = staging_fd
             try:
                 try:
                     final_fd, receipt = verify_bundle(assets_fd, bundle, 0o500, 0o400)
@@ -1563,12 +1575,41 @@ try:
                             or lock.get("distribution_digest") != wheel_digest
                             or lock.get("wheel_filename") != wheel_name):
                         raise SystemExit(80)
-                    seal_bundle(candidate_fd)
+                    seal_bundle_members(candidate_fd)
+                    verify_bundle_fd(candidate_fd, 0o700, 0o400)
+                    moved = rename_noreplace(
+                        staging_fd, candidate_name, assets_fd, candidate_name
+                    )
+                    if not moved:
+                        raise SystemExit(82)
+                    candidate_parent = assets_fd
+                    os.fsync(assets_fd)
+                    os.fsync(staging_fd)
+                    current = os.stat(
+                        candidate_name, dir_fd=assets_fd, follow_symlinks=False
+                    )
+                    opened = os.fstat(candidate_fd)
+                    if (current.st_dev, current.st_ino) != (
+                        opened.st_dev,
+                        opened.st_ino,
+                    ):
+                        raise SystemExit(82)
+                    os.fchmod(candidate_fd, 0o500)
+                    os.fsync(candidate_fd)
                     candidate_receipt = verify_bundle_fd(candidate_fd, 0o500, 0o400)
-                    published = rename_noreplace(staging_fd, candidate_name, assets_fd, bundle)
+                    current = os.stat(
+                        candidate_name, dir_fd=assets_fd, follow_symlinks=False
+                    )
+                    if (current.st_dev, current.st_ino) != (
+                        candidate_receipt["bundle_device"],
+                        candidate_receipt["bundle_inode"],
+                    ):
+                        raise SystemExit(82)
+                    published = rename_noreplace(
+                        assets_fd, candidate_name, assets_fd, bundle
+                    )
                     if published:
                         os.fsync(assets_fd)
-                        os.fsync(staging_fd)
                         current = os.stat(bundle, dir_fd=assets_fd, follow_symlinks=False)
                         if (current.st_dev, current.st_ino) != (
                             candidate_receipt["bundle_device"],
@@ -1597,9 +1638,13 @@ try:
                     os.close(candidate_fd)
                 if candidate_name is not None:
                     try:
-                        private_fd = os.open(candidate_name, dir_flags, dir_fd=staging_fd)
+                        private_fd = os.open(
+                            candidate_name, dir_flags, dir_fd=candidate_parent
+                        )
                         try:
-                            discard_private_bundle(staging_fd, candidate_name, private_fd)
+                            discard_private_bundle(
+                                candidate_parent, candidate_name, private_fd
+                            )
                         finally:
                             os.close(private_fd)
                     except (FileNotFoundError, OSError, SystemExit):

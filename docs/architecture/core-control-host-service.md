@@ -192,12 +192,17 @@ closed, so repeated interruption cannot strand all 16 remote slots.
 Finalize copies verified bytes into an owner-only private
 candidate whose inode and pathname were never exposed to rsync. Members are
 created as `0400` and populated only through publisher-held writer FDs that are
-closed before rename; the directory is then sealed to `0500`. Finalize keeps the
-verified candidate FD pinned across atomic no-replace rename and final
-pathname verification. Finalize returns a receipt binding the directory and
-both member inodes, then retires the incoming authority. The SSH transport holds
-that receipt for bootstrap: under the publication lock it revalidates modes,
-identities, and digests, then substitutes a
+closed before publication. The candidate directory remains `0700` only while it
+is atomically moved from the staging parent to a random private name under the
+asset parent, which permits ordinary non-root Linux users to complete the
+cross-parent directory rename. There it is sealed to `0500`, reverified through
+the pinned FD, and atomically renamed within the same parent to the deterministic
+bundle ID. Startup removes bounded, recognized private candidates left in either
+parent by a crash. Finalize keeps the verified candidate FD pinned across both
+atomic no-replace renames and every pathname verification. Finalize returns a
+receipt binding the directory and both member inodes, then retires the incoming
+authority. The SSH transport holds that receipt for bootstrap: under the
+publication lock it revalidates modes, identities, and digests, then substitutes a
 `/proc/<wrapper-pid>/fd/<pinned-bundle-fd>` root while the generation installer
 and its nested pip child run. Same-name replacement cannot redirect consumer
 reads, and post-consumption revalidation fails closed on mutation or pathname
