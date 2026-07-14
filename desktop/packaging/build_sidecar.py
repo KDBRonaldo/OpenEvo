@@ -39,13 +39,22 @@ CORE_WHEEL_ARCHIVE_ROOT = Path("openevo/wheels")
 CORE_FRAMEWORK_LOCK_BASENAME = "framework-lock.json"
 CORE_RELEASE_TRANSACTION_MARKER = "transaction.json"
 CORE_RELEASE_TRANSACTION_READY = "transaction.ready"
+CORE_RELEASE_CLEANUP_AUTHORITY_CANDIDATE = ".openevo-core-release-cleanup.ready"
 _CORE_RELEASE_TRANSACTION_PATTERN = re.compile(r"\.openevo-core-release-([0-9a-f]{32})")
 _CORE_RELEASE_STAGING_PATTERN = re.compile(r"\.member-([0-9a-f]{32})")
 _CORE_RELEASE_RETIRED_MARKER_PATTERN = re.compile(r"\.marker-retired-([0-9a-f]+)-([0-9a-f]+)")
 _CORE_RELEASE_PURGE_PATTERN = re.compile(r"\.purge-([0-9a-f]+)-([0-9a-f]+)")
+_CORE_RELEASE_CLEANUP_AUTHORITY_PATTERN = re.compile(
+    r"\.openevo-core-release-cleanup-([0-9a-f]+)-([0-9a-f]+)-([0-9a-f]+)-([0-9a-f]+)"
+)
+_CORE_RELEASE_CLEANUP_AUTHORITY_PURGE_PATTERN = re.compile(
+    r"\.openevo-core-release-cleanup-purge-"
+    r"([0-9a-f]+)-([0-9a-f]+)-([0-9a-f]+)-([0-9a-f]+)"
+)
 _MAX_CORE_RELEASE_ROOT_MEMBERS = 4
 _MAX_CORE_RELEASE_TRANSACTION_MEMBERS = 16
 _MAX_CORE_RELEASE_MARKER_BYTES = 4096
+_MAX_CORE_RELEASE_PARENT_RECOVERY_MEMBERS = 4096
 _DARWIN_ACL_TYPE_EXTENDED = 0x0000_0100
 _DARWIN_ACL_FIRST_ENTRY = 0
 _DARWIN_ACL_NEXT_ENTRY = -1
@@ -1198,6 +1207,53 @@ def _bounded_listdir(directory_fd: int, *, limit: int, container: str) -> tuple[
     return second
 
 
+def _bounded_directory_identity_scan(
+    directory_fd: int,
+    *,
+    limit: int,
+    container: str,
+) -> tuple[tuple[str, int, int], ...]:
+    def scan() -> tuple[tuple[str, int, int], ...]:
+        entries: list[tuple[str, int, int]] = []
+        try:
+            with os.scandir(directory_fd) as iterator:
+                for entry in iterator:
+                    descriptor = entry.stat(follow_symlinks=False)
+                    entries.append((entry.name, descriptor.st_dev, descriptor.st_ino))
+                    if len(entries) > limit:
+                        raise RuntimeError(f"{container} contains too many entries")
+        except FileNotFoundError as exc:
+            raise RuntimeError(f"{container} changed while it was enumerated") from exc
+        entries.sort()
+        return tuple(entries)
+
+    first = scan()
+    second = scan()
+    if first != second:
+        raise RuntimeError(f"{container} changed while it was enumerated")
+    return second
+
+
+def _core_release_cleanup_authority_identities(
+    name: str,
+) -> tuple[tuple[int, int], tuple[int, int]] | None:
+    match = _CORE_RELEASE_CLEANUP_AUTHORITY_PATTERN.fullmatch(name)
+    if match is None:
+        match = _CORE_RELEASE_CLEANUP_AUTHORITY_PURGE_PATTERN.fullmatch(name)
+    if match is None:
+        return None
+    return (
+        (int(match.group(1), 16), int(match.group(2), 16)),
+        (int(match.group(3), 16), int(match.group(4), 16)),
+    )
+
+
+def _is_core_release_cleanup_authority(name: str) -> bool:
+    return name == CORE_RELEASE_CLEANUP_AUTHORITY_CANDIDATE or (
+        _core_release_cleanup_authority_identities(name) is not None
+    )
+
+
 def _classify_core_release_inventory(directory_fd: int) -> tuple[str, ...]:
     names = _bounded_listdir(
         directory_fd,
@@ -1207,16 +1263,23 @@ def _classify_core_release_inventory(directory_fd: int) -> tuple[str, ...]:
     if not names:
         return names
     transactions = [name for name in names if _CORE_RELEASE_TRANSACTION_PATTERN.fullmatch(name)]
-    ordinary = [name for name in names if name not in transactions]
+    cleanup_authorities = [name for name in names if _is_core_release_cleanup_authority(name)]
+    ordinary = [
+        name for name in names if name not in transactions and name not in cleanup_authorities
+    ]
     wheels = [name for name in ordinary if name.endswith(".whl")]
     locks = [name for name in ordinary if name == CORE_FRAMEWORK_LOCK_BASENAME]
-    if len(transactions) > 1 or len(wheels) > 1 or len(locks) > 1:
+    if len(transactions) > 1 or len(cleanup_authorities) > 1 or len(wheels) > 1 or len(locks) > 1:
         raise RuntimeError("Core wheel output has an ambiguous release transaction")
     if any(name not in {*wheels, *locks} for name in ordinary):
         raise RuntimeError("Core wheel output contains an unknown entry")
     if transactions:
         return names
-    if len(wheels) == 1 and len(locks) == 1 and len(names) == 2:
+    if cleanup_authorities and (
+        not ordinary or (len(wheels) == 1 and len(locks) == 1 and len(ordinary) == 2)
+    ):
+        return names
+    if len(wheels) == 1 and len(locks) == 1 and len(ordinary) == 2:
         return names
     raise RuntimeError(
         "Core wheel output must be empty or contain one complete recoverable release pair"
@@ -1319,6 +1382,69 @@ def _marker_bytes(
     if cleanup_index is not None:
         payload["cleanup_index"] = cleanup_index
     return (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+
+
+def _core_release_cleanup_authority_name(
+    cleanup_identity: tuple[int, int],
+    file_identity: tuple[int, int],
+    *,
+    purging: bool = False,
+) -> str:
+    prefix = (
+        ".openevo-core-release-cleanup-purge-" if purging else ".openevo-core-release-cleanup-"
+    )
+    return (
+        f"{prefix}{cleanup_identity[0]:x}-{cleanup_identity[1]:x}-"
+        f"{file_identity[0]:x}-{file_identity[1]:x}"
+    )
+
+
+def _core_release_cleanup_authority_bytes(
+    authority: _CoreReleaseOutput,
+    cleanup_identity: tuple[int, int],
+) -> bytes:
+    parent = os.fstat(authority.parent_fd)
+    payload = {
+        "schema_version": "1",
+        "parent_device": parent.st_dev,
+        "parent_inode": parent.st_ino,
+        "output_device": authority.device,
+        "output_inode": authority.inode,
+        "cleanup_device": cleanup_identity[0],
+        "cleanup_inode": cleanup_identity[1],
+        "tombstone_name": _core_release_tombstone_name(authority),
+        "purge_name": _core_release_directory_purge_name(authority),
+        "members": [
+            {
+                "name": source.name,
+                "byte_size": source.byte_size,
+                "sha256": source.sha256,
+            }
+            for source in authority.sources
+        ],
+    }
+    return (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+
+
+def _validate_core_release_cleanup_authority(
+    authority: _CoreReleaseOutput,
+    payload: bytes,
+) -> tuple[int, int]:
+    marker = _decode_marker(payload)
+    cleanup_device = marker.get("cleanup_device")
+    cleanup_inode = marker.get("cleanup_inode")
+    if (
+        type(cleanup_device) is not int
+        or type(cleanup_inode) is not int
+        or cleanup_device < 0
+        or cleanup_inode <= 0
+    ):
+        raise RuntimeError("Core release cleanup authority identity is invalid")
+    cleanup_identity = (cleanup_device, cleanup_inode)
+    expected = _core_release_cleanup_authority_bytes(authority, cleanup_identity)
+    if payload != expected:
+        raise RuntimeError("Core release cleanup authority does not match current inputs")
+    return cleanup_identity
 
 
 def _write_bound_member(
@@ -1707,6 +1833,151 @@ def _after_core_release_tombstone_window(
     del authority, window
 
 
+def _publish_core_release_cleanup_authority(
+    authority: _CoreReleaseOutput,
+    cleanup_identity: tuple[int, int],
+) -> tuple[str, tuple[int, int], tuple[int, int]]:
+    payload = _core_release_cleanup_authority_bytes(authority, cleanup_identity)
+    file_fd, file_identity = _write_bound_member(
+        authority.directory_fd,
+        CORE_RELEASE_CLEANUP_AUTHORITY_CANDIDATE,
+        payload,
+        mode=0o600,
+    )
+    try:
+        os.fsync(authority.directory_fd)
+        _after_core_release_tombstone_window(authority, "cleanup-authority-candidate")
+        name = _core_release_cleanup_authority_name(cleanup_identity, file_identity)
+        _rename_noreplace(
+            authority.directory_fd,
+            CORE_RELEASE_CLEANUP_AUTHORITY_CANDIDATE,
+            authority.directory_fd,
+            name,
+        )
+        os.fsync(authority.directory_fd)
+        _after_core_release_tombstone_window(authority, "cleanup-authority-published")
+        actual_payload, actual_identity = _read_marker(authority.directory_fd, name)
+        if actual_payload != payload or actual_identity != file_identity:
+            raise RuntimeError("Core release cleanup authority changed during publication")
+        return name, cleanup_identity, file_identity
+    finally:
+        os.close(file_fd)
+
+
+def _recover_core_release_cleanup_authority(
+    authority: _CoreReleaseOutput,
+) -> tuple[str, tuple[int, int], tuple[int, int]] | None:
+    names = [
+        name for name in authority.initial_inventory if _is_core_release_cleanup_authority(name)
+    ]
+    if not names:
+        return None
+    if len(names) != 1:
+        raise RuntimeError("Core release cleanup authority is ambiguous")
+    name = names[0]
+    payload, file_identity = _read_marker(authority.directory_fd, name)
+    cleanup_identity = _validate_core_release_cleanup_authority(authority, payload)
+    encoded = _core_release_cleanup_authority_identities(name)
+    if name == CORE_RELEASE_CLEANUP_AUTHORITY_CANDIDATE:
+        final_name = _core_release_cleanup_authority_name(cleanup_identity, file_identity)
+        try:
+            _rename_noreplace(
+                authority.directory_fd,
+                name,
+                authority.directory_fd,
+                final_name,
+            )
+        except FileExistsError as exc:
+            raise RuntimeError("Core release cleanup authority replacement was preserved") from exc
+        os.fsync(authority.directory_fd)
+        payload, recovered_identity = _read_marker(authority.directory_fd, final_name)
+        if (
+            recovered_identity != file_identity
+            or _validate_core_release_cleanup_authority(authority, payload) != cleanup_identity
+        ):
+            raise RuntimeError("Core release cleanup authority changed during recovery")
+        return final_name, cleanup_identity, file_identity
+    if encoded != (cleanup_identity, file_identity):
+        raise RuntimeError("Core release cleanup authority filename identity changed")
+    return name, cleanup_identity, file_identity
+
+
+def _discard_core_release_cleanup_authority(
+    authority: _CoreReleaseOutput,
+    name: str,
+    cleanup_identity: tuple[int, int],
+    file_identity: tuple[int, int],
+) -> None:
+    payload, actual_identity = _read_marker(authority.directory_fd, name)
+    if (
+        actual_identity != file_identity
+        or _validate_core_release_cleanup_authority(authority, payload) != cleanup_identity
+    ):
+        raise RuntimeError("Core release cleanup authority identity changed")
+    file_fd = os.open(
+        name,
+        os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+        dir_fd=authority.directory_fd,
+    )
+    try:
+        descriptor = os.fstat(file_fd)
+        _require_member_attributes(
+            descriptor,
+            name=name,
+            mode=0o600,
+            identity=file_identity,
+        )
+        _require_fd_acl_free(file_fd, name="Core release cleanup authority")
+        purge_name = _core_release_cleanup_authority_name(
+            cleanup_identity,
+            file_identity,
+            purging=True,
+        )
+        if name != purge_name:
+            _rename_noreplace(
+                authority.directory_fd,
+                name,
+                authority.directory_fd,
+                purge_name,
+            )
+            os.fsync(authority.directory_fd)
+            _after_core_release_tombstone_window(authority, "cleanup-authority-quarantined")
+        current = os.stat(purge_name, dir_fd=authority.directory_fd, follow_symlinks=False)
+        if (current.st_dev, current.st_ino) != file_identity:
+            raise RuntimeError("Core release cleanup authority replacement was preserved")
+        os.unlink(purge_name, dir_fd=authority.directory_fd)
+        if os.fstat(file_fd).st_nlink != 0:
+            raise RuntimeError("Core release cleanup authority remained linked")
+        os.fsync(authority.directory_fd)
+        _after_core_release_tombstone_window(authority, "cleanup-authority-removed")
+    finally:
+        os.close(file_fd)
+
+
+def _core_release_parent_bindings(
+    authority: _CoreReleaseOutput,
+    identity: tuple[int, int],
+) -> tuple[str, ...]:
+    inventory = _bounded_directory_identity_scan(
+        authority.parent_fd,
+        limit=_MAX_CORE_RELEASE_PARENT_RECOVERY_MEMBERS,
+        container="Core release output parent",
+    )
+    return tuple(name for name, device, inode in inventory if (device, inode) == identity)
+
+
+def _core_release_output_bindings(
+    authority: _CoreReleaseOutput,
+    identity: tuple[int, int],
+) -> tuple[str, ...]:
+    inventory = _bounded_directory_identity_scan(
+        authority.directory_fd,
+        limit=_MAX_CORE_RELEASE_ROOT_MEMBERS,
+        container="Core wheel output",
+    )
+    return tuple(name for name, device, inode in inventory if (device, inode) == identity)
+
+
 def _after_core_release_cleanup_identity_verified(
     source_fd: int,
     source_name: str,
@@ -1761,6 +2032,7 @@ def _quarantine_regular_path(
 def _open_core_release_tombstone(
     authority: _CoreReleaseOutput,
     name: str,
+    identity: tuple[int, int],
 ) -> tuple[int, os.stat_result]:
     directory_fd = os.open(
         name,
@@ -1774,7 +2046,10 @@ def _open_core_release_tombstone(
             raise RuntimeError("Core release transaction tombstone mode changed")
         _require_fd_acl_free(directory_fd, name="Core release transaction tombstone")
         current = os.stat(name, dir_fd=authority.parent_fd, follow_symlinks=False)
-        if (current.st_dev, current.st_ino) != (descriptor.st_dev, descriptor.st_ino):
+        if (descriptor.st_dev, descriptor.st_ino) != identity or (
+            current.st_dev,
+            current.st_ino,
+        ) != identity:
             raise RuntimeError("Core release transaction tombstone pathname changed")
         return directory_fd, descriptor
     except BaseException:
@@ -2067,6 +2342,7 @@ def _retire_transaction_directory(
         or stat.S_IMODE(current.st_mode) != 0o700
     ):
         raise RuntimeError("Core release transaction directory changed before cleanup")
+    cleanup_authority = _publish_core_release_cleanup_authority(authority, identity)
     _after_core_release_cleanup_identity_verified(authority.directory_fd, name)
     tombstone = _core_release_tombstone_name(authority)
     try:
@@ -2093,32 +2369,67 @@ def _retire_transaction_directory(
         tombstone,
         identity=identity,
     )
+    _discard_core_release_cleanup_authority(authority, *cleanup_authority)
 
 
 def _recover_core_release_tombstone(authority: _CoreReleaseOutput) -> None:
     tombstone = _core_release_tombstone_name(authority)
     purge = _core_release_directory_purge_name(authority)
-    present: list[str] = []
+    present: list[tuple[str, tuple[int, int]]] = []
     for name in (tombstone, purge):
         try:
-            os.stat(name, dir_fd=authority.parent_fd, follow_symlinks=False)
+            descriptor = os.stat(name, dir_fd=authority.parent_fd, follow_symlinks=False)
         except FileNotFoundError:
             continue
-        present.append(name)
-    if not present:
-        return
+        present.append((name, (descriptor.st_dev, descriptor.st_ino)))
     if len(present) != 1:
-        raise RuntimeError("Core release cleanup has ambiguous sibling state")
-    name = present[0]
-    directory_fd, descriptor = _open_core_release_tombstone(authority, name)
-    identity = (descriptor.st_dev, descriptor.st_ino)
+        if present:
+            raise RuntimeError("Core release cleanup has ambiguous sibling state")
+    cleanup_authority = _recover_core_release_cleanup_authority(authority)
+    if cleanup_authority is None:
+        if present:
+            raise RuntimeError("Core release cleanup sibling has no durable authority")
+        return
+    authority_name, cleanup_identity, authority_identity = cleanup_authority
+    if not present:
+        output_bindings = _core_release_output_bindings(authority, cleanup_identity)
+        if output_bindings:
+            _discard_core_release_cleanup_authority(
+                authority,
+                authority_name,
+                cleanup_identity,
+                authority_identity,
+            )
+            authority.initial_inventory = _classify_core_release_inventory(authority.directory_fd)
+            authority.require_bound_path()
+            return
+        bindings = _core_release_parent_bindings(authority, cleanup_identity)
+        if bindings:
+            raise RuntimeError(
+                "Core release cleanup directory was renamed and preserved: " + ", ".join(bindings)
+            )
+        _discard_core_release_cleanup_authority(
+            authority,
+            authority_name,
+            cleanup_identity,
+            authority_identity,
+        )
+        authority.initial_inventory = _classify_core_release_inventory(authority.directory_fd)
+        authority.require_bound_path()
+        return
+    name, observed_identity = present[0]
+    if observed_identity != cleanup_identity:
+        bindings = _core_release_parent_bindings(authority, cleanup_identity)
+        detail = f"; authorized inode remains at {', '.join(bindings)}" if bindings else ""
+        raise RuntimeError("Core release cleanup directory replacement was preserved" + detail)
+    directory_fd, _ = _open_core_release_tombstone(authority, name, cleanup_identity)
     try:
         if name == purge:
             _remove_empty_core_release_tombstone(
                 authority,
                 directory_fd,
                 name,
-                identity=identity,
+                identity=cleanup_identity,
                 already_quarantined=True,
             )
         else:
@@ -2126,10 +2437,22 @@ def _recover_core_release_tombstone(authority: _CoreReleaseOutput) -> None:
                 authority,
                 directory_fd,
                 name,
-                identity=identity,
+                identity=cleanup_identity,
             )
     finally:
         os.close(directory_fd)
+    bindings = _core_release_parent_bindings(authority, cleanup_identity)
+    if bindings:
+        raise RuntimeError(
+            "Core release cleanup directory remained bound after recovery: " + ", ".join(bindings)
+        )
+    _discard_core_release_cleanup_authority(
+        authority,
+        authority_name,
+        cleanup_identity,
+        authority_identity,
+    )
+    authority.initial_inventory = _classify_core_release_inventory(authority.directory_fd)
     authority.require_bound_path()
 
 

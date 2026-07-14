@@ -1712,6 +1712,232 @@ def test_repeated_tombstone_crashes_recover_without_growth(
     assert not list(tmp_path.glob(".openevo-core-release-purge-*"))
 
 
+@pytest.mark.parametrize(
+    "tombstone_window",
+    ["cleanup-authority-candidate", "cleanup-authority-published"],
+)
+def test_repeated_pre_retirement_authority_crashes_recover_without_growth(
+    tmp_path: Path,
+    tombstone_window: str,
+) -> None:
+    builder_path = Path("desktop/packaging/build_sidecar.py").resolve()
+    builder = _load_builder()
+    output = tmp_path / "output"
+    wheel, lock = _write_export_inputs(builder, tmp_path)
+
+    for _ in range(3):
+        crashed = _run_crashing_core_export(
+            builder_path=builder_path,
+            output=output,
+            wheel=wheel,
+            lock=lock,
+            mode="tombstone",
+            stage_window=tombstone_window,
+        )
+        assert crashed.returncode == 77
+        assert len(list(output.glob(".openevo-core-release-*"))) == 2
+        assert len(list(output.glob(".openevo-core-release-cleanup*"))) == 1
+        assert (
+            len(
+                [
+                    path
+                    for path in output.iterdir()
+                    if builder._CORE_RELEASE_TRANSACTION_PATTERN.fullmatch(path.name)
+                ]
+            )
+            == 1
+        )
+        assert not list(tmp_path.glob(".openevo-core-release-tombstone-*"))
+        assert not list(tmp_path.glob(".openevo-core-release-purge-*"))
+
+    with builder._open_core_release_output(output) as authority:
+        builder._export_core_release_inputs(authority, wheel, lock)
+
+    assert sorted(path.name for path in output.iterdir()) == sorted((wheel.name, lock.name))
+    assert not list(output.glob(".openevo-core-release-cleanup*"))
+
+
+@pytest.mark.parametrize(
+    "tombstone_window",
+    ["directory-removed", "cleanup-authority-quarantined"],
+)
+def test_repeated_cleanup_authority_crashes_recover_without_growth(
+    tmp_path: Path,
+    tombstone_window: str,
+) -> None:
+    builder_path = Path("desktop/packaging/build_sidecar.py").resolve()
+    builder = _load_builder()
+    output = tmp_path / "output"
+    wheel, lock = _write_export_inputs(builder, tmp_path)
+
+    for _ in range(3):
+        crashed = _run_crashing_core_export(
+            builder_path=builder_path,
+            output=output,
+            wheel=wheel,
+            lock=lock,
+            mode="tombstone",
+            stage_window=tombstone_window,
+        )
+        assert crashed.returncode == 77
+        assert not list(tmp_path.glob(".openevo-core-release-tombstone-*"))
+        assert not list(tmp_path.glob(".openevo-core-release-purge-*"))
+        assert len(list(output.glob(".openevo-core-release-cleanup*"))) == 1
+
+    with builder._open_core_release_output(output) as authority:
+        builder._export_core_release_inputs(authority, wheel, lock)
+
+    assert sorted(path.name for path in output.iterdir()) == sorted((wheel.name, lock.name))
+    assert not list(output.glob(".openevo-core-release-cleanup*"))
+
+
+@pytest.mark.parametrize(
+    ("tombstone_window", "sibling_pattern"),
+    [
+        ("tombstone-empty", ".openevo-core-release-tombstone-*"),
+        ("directory-quarantined", ".openevo-core-release-purge-*"),
+    ],
+)
+def test_restart_preserves_cleanup_directory_replacement_and_original(
+    tmp_path: Path,
+    tombstone_window: str,
+    sibling_pattern: str,
+) -> None:
+    builder_path = Path("desktop/packaging/build_sidecar.py").resolve()
+    builder = _load_builder()
+    output = tmp_path / "output"
+    wheel, lock = _write_export_inputs(builder, tmp_path)
+
+    crashed = _run_crashing_core_export(
+        builder_path=builder_path,
+        output=output,
+        wheel=wheel,
+        lock=lock,
+        mode="tombstone",
+        stage_window=tombstone_window,
+    )
+    assert crashed.returncode == 77
+    cleanup_paths = list(tmp_path.glob(sibling_pattern))
+    assert len(cleanup_paths) == 1
+    cleanup_path = cleanup_paths[0]
+    original_identity = (cleanup_path.stat().st_dev, cleanup_path.stat().st_ino)
+    preserved = tmp_path / f".preserved-{tombstone_window}"
+    cleanup_path.rename(preserved)
+    cleanup_path.mkdir(mode=0o700)
+    replacement_identity = (cleanup_path.stat().st_dev, cleanup_path.stat().st_ino)
+    assert replacement_identity != original_identity
+
+    with pytest.raises(RuntimeError, match="cleanup.*replacement.*preserved"):
+        with builder._open_core_release_output(output) as authority:
+            builder._export_core_release_inputs(authority, wheel, lock)
+
+    assert cleanup_path.is_dir()
+    assert (cleanup_path.stat().st_dev, cleanup_path.stat().st_ino) == replacement_identity
+    assert preserved.is_dir()
+    assert (preserved.stat().st_dev, preserved.stat().st_ino) == original_identity
+
+
+@pytest.mark.parametrize(
+    ("tombstone_window", "sibling_pattern"),
+    [
+        ("tombstone-empty", ".openevo-core-release-tombstone-*"),
+        ("directory-quarantined", ".openevo-core-release-purge-*"),
+    ],
+)
+def test_restart_detects_renamed_cleanup_directory_without_replacement(
+    tmp_path: Path,
+    tombstone_window: str,
+    sibling_pattern: str,
+) -> None:
+    builder_path = Path("desktop/packaging/build_sidecar.py").resolve()
+    builder = _load_builder()
+    output = tmp_path / "output"
+    wheel, lock = _write_export_inputs(builder, tmp_path)
+    crashed = _run_crashing_core_export(
+        builder_path=builder_path,
+        output=output,
+        wheel=wheel,
+        lock=lock,
+        mode="tombstone",
+        stage_window=tombstone_window,
+    )
+    assert crashed.returncode == 77
+    cleanup_path = next(tmp_path.glob(sibling_pattern))
+    original_identity = (cleanup_path.stat().st_dev, cleanup_path.stat().st_ino)
+    preserved = tmp_path / f".preserved-only-{tombstone_window}"
+    cleanup_path.rename(preserved)
+
+    with pytest.raises(RuntimeError, match="cleanup directory was renamed and preserved"):
+        with builder._open_core_release_output(output) as authority:
+            builder._export_core_release_inputs(authority, wheel, lock)
+
+    assert preserved.is_dir()
+    assert (preserved.stat().st_dev, preserved.stat().st_ino) == original_identity
+
+
+def test_restart_rejects_cleanup_authority_same_name_replacement(tmp_path: Path) -> None:
+    builder_path = Path("desktop/packaging/build_sidecar.py").resolve()
+    builder = _load_builder()
+    output = tmp_path / "output"
+    wheel, lock = _write_export_inputs(builder, tmp_path)
+    crashed = _run_crashing_core_export(
+        builder_path=builder_path,
+        output=output,
+        wheel=wheel,
+        lock=lock,
+        mode="tombstone",
+        stage_window="tombstone-empty",
+    )
+    assert crashed.returncode == 77
+    authority_path = next(output.glob(".openevo-core-release-cleanup-*"))
+    authority_payload = authority_path.read_bytes()
+    original_identity = (authority_path.stat().st_dev, authority_path.stat().st_ino)
+    preserved = tmp_path / ".preserved-cleanup-authority"
+    authority_path.rename(preserved)
+    authority_path.write_bytes(authority_payload)
+    authority_path.chmod(0o600)
+    replacement_identity = (authority_path.stat().st_dev, authority_path.stat().st_ino)
+    assert replacement_identity != original_identity
+
+    with pytest.raises(RuntimeError, match="authority filename identity changed"):
+        with builder._open_core_release_output(output) as authority:
+            builder._export_core_release_inputs(authority, wheel, lock)
+
+    assert authority_path.read_bytes() == authority_payload
+    assert (authority_path.stat().st_dev, authority_path.stat().st_ino) == replacement_identity
+    assert preserved.read_bytes() == authority_payload
+    assert (preserved.stat().st_dev, preserved.stat().st_ino) == original_identity
+
+
+def test_cleanup_recovery_parent_identity_scan_is_bounded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builder_path = Path("desktop/packaging/build_sidecar.py").resolve()
+    builder = _load_builder()
+    output = tmp_path / "output"
+    wheel, lock = _write_export_inputs(builder, tmp_path)
+    crashed = _run_crashing_core_export(
+        builder_path=builder_path,
+        output=output,
+        wheel=wheel,
+        lock=lock,
+        mode="tombstone",
+        stage_window="tombstone-empty",
+    )
+    assert crashed.returncode == 77
+    cleanup_path = next(tmp_path.glob(".openevo-core-release-tombstone-*"))
+    preserved = tmp_path / ".preserved-bounded-cleanup"
+    cleanup_path.rename(preserved)
+    monkeypatch.setattr(builder, "_MAX_CORE_RELEASE_PARENT_RECOVERY_MEMBERS", 1)
+
+    with pytest.raises(RuntimeError, match="output parent contains too many entries"):
+        with builder._open_core_release_output(output) as authority:
+            builder._export_core_release_inputs(authority, wheel, lock)
+
+    assert preserved.is_dir()
+
+
 def test_core_release_crash_between_names_is_reconciled_on_retry(tmp_path: Path) -> None:
     builder_path = Path("desktop/packaging/build_sidecar.py").resolve()
     builder = _load_builder()

@@ -92,19 +92,31 @@ The repository currently provides:
   each scan rejects on `limit + 1`, and changing consecutive snapshots fail
   closed without first materializing or sorting an unbounded directory. An empty
   marker-less transaction directory beside an exact complete pair is a bounded
-  bootstrap crash state. Cleanup never uses a final stat-then-unlink/rmdir step:
-  authorized root members move under deterministic transaction quarantine names,
-  then the held transaction inode moves with atomic no-replace rename to one
-  deterministic sibling tombstone bound to the output device/inode. Each
-  authorized tombstone member moves no-replace to an inode-named quarantine,
-  member bytes are cleared through the held descriptor, and the binding is
+  bootstrap crash state. Cleanup never authorizes unlink or `rmdir` from a newly
+  observed pathname identity. Authorized root members move under deterministic
+  transaction quarantine names. Before the held transaction leaves the locked
+  output, a canonical cleanup-authority receipt binds the parent, output, exact
+  wheel/lock inputs, and transaction inode. Its candidate is file-fsynced and
+  output-directory-fsynced, then published no-replace under a filename that also
+  binds the receipt inode and directory-fsynced again. Only then may the held
+  transaction inode move with atomic no-replace rename to the deterministic
+  sibling tombstone or any tombstone marker be removed. Each
+  authorized tombstone member then moves no-replace to an inode-named quarantine;
+  member bytes are cleared through the held descriptor and the binding is
   rechecked before unlink. Markers are removed last. The empty held directory
-  then moves no-replace to one deterministic purge name and is rechecked before
-  `rmdir`. A retry accepts at most one exact tombstone/purge state and resumes this
-  bounded cleanup before output transaction recovery. Crashes at every boundary
-  therefore consume no additional sibling names or payload copies, while normal
-  success and candidate builds leave no cleanup sibling. A replacement observed
-  in an entry or directory removal window is retained, and the build fails closed;
+  moves no-replace to one deterministic purge name and is rechecked against the
+  durable receipt before `rmdir`.
+  A retry accepts at most one exact receipt and one tombstone/purge state. It never
+  derives cleanup authority from the current same-name inode. A mismatch preserves
+  the replacement and uses a no-follow, double-snapshot parent identity scan with
+  a fixed 4096-entry limit to detect a renamed authorized inode; either result
+  fails closed. If a crash follows the authorized `rmdir`, the same bounded scan
+  must prove that inode has no remaining sibling binding before the receipt itself
+  is quarantined and removed. Crashes at every boundary therefore consume no
+  additional names or payload copies, while normal success and candidate builds
+  leave no cleanup receipt or sibling. A receipt interrupted before the transaction
+  leaves the output is first matched to that still marker-authorized transaction,
+  retired, and then recreated by ordinary transaction recovery;
 - source-level frontend, sidecar, Rust, and package-inventory tests;
 - Linux and macOS CI jobs that build the actual PyInstaller externalBin and
   exercise it through the production Rust native-launch path;
@@ -813,12 +825,16 @@ product graph as before.
 The repository does not carry a shell-script sidecar fallback; the generated
 target-triple binary is a required build input.
 
-The sidecar builder never removes repository-global `build/`, existing
-`src/openevo/wheels`, or prior files in a caller-selected Core wheel output
-directory. A selected output directory must be empty before the build and the
-wheel is created there exclusively; non-empty or path-overlapping output fails
-closed. `--no-clean` only preserves the sidecar-owned `sidecar-dist` and
-`sidecar-build` paths, matching the existing clean/no-clean contract.
+The sidecar builder never removes repository-global `build/` or existing
+`src/openevo/wheels`. A caller-selected Core wheel output may be empty, contain
+the exact wheel/lock pair for the current inputs, or contain one recognized
+transaction or cleanup-authority recovery state. The builder removes only
+inode-bound entries authorized by that durable state; any unrelated prior file,
+partial pair, replacement, ambiguous recovery state, or path overlap is preserved
+and fails closed. The Core wheel is built in a private temporary tree and only the
+verified exact wheel/lock pair is transactionally exported. `--no-clean` only
+preserves the sidecar-owned `sidecar-dist` and `sidecar-build` paths, matching the
+existing clean/no-clean contract.
 
 ## Release Build Sequence
 

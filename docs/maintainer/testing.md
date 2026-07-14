@@ -195,19 +195,29 @@ The same preservation rule applies to a `preparing` transaction containing a
 staged entry whose inode has not yet reached the ready marker; only empty and
 marker-only bootstrap remnants are automatically reclaimed before readiness.
 
-After root members are quarantined, the held transaction inode moves by atomic
-no-replace rename to one deterministic sibling tombstone bound to the output
-device/inode. Cleanup moves each authorized regular entry to an identity-named
-quarantine, clears member payloads through the held descriptor, rechecks the
-quarantine binding, unlinks it, and removes the marker last. The empty held
-tombstone is then moved no-replace to one deterministic purge name, revalidated,
-and removed. Recovery accepts at most one of those two exact sibling states and
-resumes the bounded sequence before inspecting output transactions. Replacement
-tests at both final entry unlink and directory removal windows require the checked
-inode and replacement to be preserved and the build to fail closed. Repeated
-`os._exit` tests cover every tombstone/purge boundary, and twenty successful
-exports prove that normal and recovered operation leaves no sibling cleanup state
-or wheel/lock byte growth. Candidate builds have the same zero-residue requirement.
+After root members are quarantined, cleanup prepares to move the held transaction
+inode out of the output. Before that rename, the builder file-fsyncs a canonical
+receipt that binds the held parent/output, exact wheel/lock inputs, and cleanup
+inode; directory-fsyncs its candidate; publishes it no-replace under a name that
+also binds the receipt inode; and directory-fsyncs again. Only then does the held
+transaction inode move by atomic no-replace rename to one deterministic sibling
+tombstone bound to the output device/inode. Cleanup moves each authorized entry
+to an identity-named quarantine, clears member payloads through the held descriptor,
+rechecks the quarantine binding, unlinks it, and removes the transaction marker
+last. The empty held tombstone is then moved no-replace to one deterministic purge
+name, checked against the receipt, and removed.
+
+Recovery accepts at most one receipt and one of those two exact sibling states; it
+must not adopt the inode currently found at a known name. Real `os._exit` tests at
+the empty-tombstone and purge windows rename the authorized directory, install a
+different empty inode at the expected name, and require restart to preserve both
+objects and fail explicitly. A double-snapshot no-follow parent identity scan is
+capped at 4096 entries and detects the renamed authorized inode; exceeding that
+budget also fails closed. Additional repeated crashes cover receipt candidate,
+publication while the transaction remains marker-authorized in the output,
+directory removal, and receipt quarantine. Twenty successful exports prove that
+normal and recovered operation leaves no receipt/sibling state or wheel/lock byte
+growth. Candidate builds have the same zero-residue requirement.
 
 ## Release Identity
 
