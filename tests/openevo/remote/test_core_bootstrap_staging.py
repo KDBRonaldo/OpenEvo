@@ -30,6 +30,8 @@ from openevo.deployment.ssh import (
 
 WHEEL_NAME = "openevo-0.1.0-py3-none-any.whl"
 BUNDLE_ID = "a" * 64
+TRANSFER_ID = "b" * 32
+SECOND_TRANSFER_ID = "c" * 32
 
 
 class RecordingRunner:
@@ -133,9 +135,11 @@ def _assets(tmp_path: Path) -> tuple[Path, str, Path, str]:
 def _stage_responses(
     wheel_digest: str,
     lock_digest: str,
+    *,
+    transfer_id: str = TRANSFER_ID,
 ) -> list[SecretStr]:
     root = "/home/alice/.openevo/core"
-    incoming = f"{root}/asset-staging/incoming-{BUNDLE_ID}"
+    incoming = f"{root}/asset-staging/incoming-{BUNDLE_ID}-{transfer_id}"
     final = f"{root}/assets/{BUNDLE_ID}"
     return [
         SecretStr(
@@ -144,6 +148,7 @@ def _stage_responses(
                     "schema_version": 1,
                     "service_root": root,
                     "incoming_root": incoming,
+                    "transfer_id": transfer_id,
                 },
                 separators=(",", ":"),
                 sort_keys=True,
@@ -240,12 +245,15 @@ def test_remote_asset_scripts_prepare_an_empty_private_root_and_publish_exactly(
     )
     prepared = json.loads(capsys.readouterr().out)
     service_root = home / ".openevo" / "core"
-    incoming = service_root / "asset-staging" / f"incoming-{BUNDLE_ID}"
+    transfer_id = prepared["transfer_id"]
+    incoming = Path(prepared["incoming_root"])
     assert prepared == {
         "schema_version": 1,
         "service_root": str(service_root),
         "incoming_root": str(incoming),
+        "transfer_id": transfer_id,
     }
+    assert re.fullmatch(r"[0-9a-f]{32}", transfer_id)
     for source, target in (
         (assets[0], incoming / WHEEL_NAME),
         (assets[2], incoming / "framework-lock.json"),
@@ -258,6 +266,7 @@ def test_remote_asset_scripts_prepare_an_empty_private_root_and_publish_exactly(
         [
             str(service_root),
             BUNDLE_ID,
+            transfer_id,
             WHEEL_NAME,
             assets[1],
             str(assets[0].stat().st_size),
@@ -283,10 +292,13 @@ def test_remote_asset_scripts_prepare_an_empty_private_root_and_publish_exactly(
         home=home,
         monkeypatch=monkeypatch,
     )
-    capsys.readouterr()
+    retried_prepare = json.loads(capsys.readouterr().out)
+    retried_incoming = Path(retried_prepare["incoming_root"])
+    assert retried_prepare["transfer_id"] != transfer_id
+    assert retried_incoming != incoming
     for source, target in (
-        (assets[0], incoming / WHEEL_NAME),
-        (assets[2], incoming / "framework-lock.json"),
+        (assets[0], retried_incoming / WHEEL_NAME),
+        (assets[2], retried_incoming / "framework-lock.json"),
     ):
         target.write_bytes(source.read_bytes())
         target.chmod(0o600)
@@ -295,6 +307,7 @@ def test_remote_asset_scripts_prepare_an_empty_private_root_and_publish_exactly(
         [
             str(service_root),
             BUNDLE_ID,
+            retried_prepare["transfer_id"],
             WHEEL_NAME,
             assets[1],
             str(assets[0].stat().st_size),
@@ -305,11 +318,89 @@ def test_remote_asset_scripts_prepare_an_empty_private_root_and_publish_exactly(
         monkeypatch=monkeypatch,
     )
     assert json.loads(capsys.readouterr().out) == finalized
-    assert not incoming.exists()
+    assert not retried_incoming.exists()
     assert (final_root / WHEEL_NAME).read_bytes() == assets[0].read_bytes()
 
 
-def test_remote_asset_prepare_reconciles_partial_incoming_with_a_bounded_scan(
+def test_remote_asset_publication_isolated_from_held_writer_and_incoming_dir_fd(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    assets = _assets(tmp_path)
+    _execute_remote_script(
+        core_assets._REMOTE_PREPARE_SCRIPT,
+        [BUNDLE_ID],
+        home=home,
+        monkeypatch=monkeypatch,
+    )
+    prepared = json.loads(capsys.readouterr().out)
+    incoming = Path(prepared["incoming_root"])
+    for source, target in (
+        (assets[0], incoming / WHEEL_NAME),
+        (assets[2], incoming / "framework-lock.json"),
+    ):
+        target.write_bytes(source.read_bytes())
+        target.chmod(0o600)
+
+    writer_fd = os.open(incoming / WHEEL_NAME, os.O_WRONLY | os.O_CLOEXEC)
+    incoming_fd = os.open(incoming, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    incoming_wheel_identity = os.fstat(writer_fd).st_dev, os.fstat(writer_fd).st_ino
+    try:
+        service_root = home / ".openevo" / "core"
+        _execute_remote_script(
+            core_assets._REMOTE_FINALIZE_SCRIPT,
+            [
+                str(service_root),
+                BUNDLE_ID,
+                prepared["transfer_id"],
+                WHEEL_NAME,
+                assets[1],
+                str(assets[0].stat().st_size),
+                assets[3],
+                str(assets[2].stat().st_size),
+            ],
+            home=home,
+            monkeypatch=monkeypatch,
+        )
+        capsys.readouterr()
+        final_wheel = service_root / "assets" / BUNDLE_ID / WHEEL_NAME
+        final_identity = final_wheel.stat().st_dev, final_wheel.stat().st_ino
+        assert final_identity != incoming_wheel_identity
+
+        os.lseek(writer_fd, 0, os.SEEK_SET)
+        os.write(writer_fd, b"X" * assets[0].stat().st_size)
+        os.fsync(writer_fd)
+        try:
+            late_fd = os.open(
+                "late-write",
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC,
+                0o600,
+                dir_fd=incoming_fd,
+            )
+        except FileNotFoundError:
+            late_fd = -1
+        if late_fd >= 0:
+            try:
+                os.write(late_fd, b"late")
+                os.fsync(late_fd)
+            finally:
+                os.close(late_fd)
+    finally:
+        os.close(incoming_fd)
+        os.close(writer_fd)
+
+    final_root = home / ".openevo" / "core" / "assets" / BUNDLE_ID
+    assert {path.name for path in final_root.iterdir()} == {
+        WHEEL_NAME,
+        "framework-lock.json",
+    }
+    assert (final_root / WHEEL_NAME).read_bytes() == assets[0].read_bytes()
+
+
+def test_remote_asset_attempts_are_unique_and_reconcile_retired_partial_uploads(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -322,12 +413,24 @@ def test_remote_asset_prepare_reconciles_partial_incoming_with_a_bounded_scan(
         home=home,
         monkeypatch=monkeypatch,
     )
-    capsys.readouterr()
-    incoming = home / ".openevo" / "core" / "asset-staging" / f"incoming-{BUNDLE_ID}"
+    prepared = json.loads(capsys.readouterr().out)
+    incoming = Path(prepared["incoming_root"])
     (incoming / "partial-wheel").write_bytes(b"x" * (5 * 1024 * 1024))
     (incoming / "partial-lock").write_bytes(b"partial")
     for path in incoming.iterdir():
         path.chmod(0o600)
+
+    _execute_remote_script(
+        core_assets._REMOTE_DISCARD_SCRIPT,
+        [
+            str(home / ".openevo" / "core"),
+            BUNDLE_ID,
+            prepared["transfer_id"],
+        ],
+        home=home,
+        monkeypatch=monkeypatch,
+    )
+    assert not incoming.exists()
 
     _execute_remote_script(
         core_assets._REMOTE_PREPARE_SCRIPT,
@@ -335,13 +438,30 @@ def test_remote_asset_prepare_reconciles_partial_incoming_with_a_bounded_scan(
         home=home,
         monkeypatch=monkeypatch,
     )
-    capsys.readouterr()
-    assert list(incoming.iterdir()) == []
+    retried = json.loads(capsys.readouterr().out)
+    assert retried["transfer_id"] != prepared["transfer_id"]
+    staging = home / ".openevo" / "core" / "asset-staging"
+    assert list(staging.iterdir()) == [Path(retried["incoming_root"])]
 
-    for index in range(17):
-        path = incoming / f"partial-{index}"
-        path.write_bytes(b"x")
-        path.chmod(0o600)
+
+def test_remote_asset_prepare_bounds_concurrent_incoming_authorities(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    transfers: set[str] = set()
+    for _index in range(16):
+        _execute_remote_script(
+            core_assets._REMOTE_PREPARE_SCRIPT,
+            [BUNDLE_ID],
+            home=home,
+            monkeypatch=monkeypatch,
+        )
+        transfers.add(json.loads(capsys.readouterr().out)["transfer_id"])
+
+    assert len(transfers) == 16
     with pytest.raises(SystemExit):
         _execute_remote_script(
             core_assets._REMOTE_PREPARE_SCRIPT,
@@ -349,7 +469,8 @@ def test_remote_asset_prepare_reconciles_partial_incoming_with_a_bounded_scan(
             home=home,
             monkeypatch=monkeypatch,
         )
-    assert len(list(incoming.iterdir())) == 17
+    staging = home / ".openevo" / "core" / "asset-staging"
+    assert len(list(staging.iterdir())) == 16
 
 
 def stat_mode(path: Path) -> int:
@@ -370,9 +491,9 @@ def test_remote_asset_finalize_rejects_tampered_upload_before_publication(
         home=home,
         monkeypatch=monkeypatch,
     )
-    capsys.readouterr()
+    prepared = json.loads(capsys.readouterr().out)
     service_root = home / ".openevo" / "core"
-    incoming = service_root / "asset-staging" / f"incoming-{BUNDLE_ID}"
+    incoming = Path(prepared["incoming_root"])
     (incoming / WHEEL_NAME).write_bytes(b"tampered wheel byt")
     (incoming / "framework-lock.json").write_bytes(assets[2].read_bytes())
     (incoming / WHEEL_NAME).chmod(0o600)
@@ -384,6 +505,7 @@ def test_remote_asset_finalize_rejects_tampered_upload_before_publication(
             [
                 str(service_root),
                 BUNDLE_ID,
+                prepared["transfer_id"],
                 WHEEL_NAME,
                 assets[1],
                 str(assets[0].stat().st_size),
@@ -520,7 +642,10 @@ def test_core_staging_closed_payloads_reject_boolean_numeric_aliases() -> None:
                     {
                         "schema_version": True,
                         "service_root": root,
-                        "incoming_root": (f"{root}/asset-staging/incoming-{BUNDLE_ID}"),
+                        "incoming_root": (
+                            f"{root}/asset-staging/incoming-{BUNDLE_ID}-{TRANSFER_ID}"
+                        ),
+                        "transfer_id": TRANSFER_ID,
                     }
                 )
             ),
@@ -542,6 +667,7 @@ def test_core_staging_closed_payloads_reject_boolean_numeric_aliases() -> None:
         core_assets.build_core_asset_finalize_command(
             service_root=root,
             bundle_id=BUNDLE_ID,
+            transfer_id=TRANSFER_ID,
             wheel_filename=WHEEL_NAME,
             wheel_sha256="a" * 64,
             wheel_size=True,
@@ -648,8 +774,13 @@ def test_stage_core_assets_partial_upload_retry_converges_to_same_remote_identit
     assets = _assets(tmp_path)
     runner = RecordingRunner([23, 0])
     transport = _transport(tmp_path, runner)
-    responses = _stage_responses(assets[1], assets[3])
-    responses = [responses[0], responses[0], responses[1]]
+    first = _stage_responses(assets[1], assets[3], transfer_id=TRANSFER_ID)
+    second = _stage_responses(
+        assets[1],
+        assets[3],
+        transfer_id=SECOND_TRANSFER_ID,
+    )
+    responses = [first[0], SecretStr(""), second[0], second[1]]
     _install_secret_responses(monkeypatch, transport, responses)
 
     with pytest.raises(SshTransportError) as partial:

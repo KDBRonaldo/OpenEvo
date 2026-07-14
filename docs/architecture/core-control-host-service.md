@@ -145,10 +145,14 @@ private no-follow local snapshot, while `SshRemoteExecutorTransport` prepares
 the canonical owner-only `~/.openevo/core` subdirectories and performs the
 rsync on the same authenticated transport. A remote standard-library verifier
 requires an exact two-file inventory, owner/mode/link identity, both digests,
-and the closed lock-to-wheel binding. It publishes to a deterministic bundle
-directory with atomic no-replace rename and treats an already published exact
-bundle as an idempotent retry. Remote paths are outputs of this verifier, never
-Desktop configuration or user-preplaced `/srv` inputs.
+and the closed lock-to-wheel binding. Every transfer uses a unique random
+incoming authority. Finalize copies verified bytes into an owner-only private
+candidate whose inode and pathname were never exposed to rsync, revalidates and
+fsyncs that candidate, and publishes it to the deterministic bundle directory
+with atomic no-replace rename. It then retires the incoming authority, so held
+writers or directory FDs cannot mutate the publication. An already published
+exact bundle is an idempotent retry. Remote paths are outputs of this verifier,
+never Desktop configuration or user-preplaced `/srv` inputs.
 
 The attachment keeps the bearer out of `repr` and has no general serializer or
 renderer-facing response model. Its loopback host/port, release identity, and

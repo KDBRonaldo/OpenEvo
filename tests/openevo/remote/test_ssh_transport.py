@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import errno
 import hashlib
+import json
 import os
 import re
 import shlex
@@ -2165,16 +2166,19 @@ def test_default_runner_bounds_output_and_reaps_overflowing_process(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    pid_path = tmp_path / "overflow.pid"
+    pid_path = tmp_path / "overflow-pids.json"
     producer = tmp_path / "produce-output.py"
     producer.write_text(
         "\n".join(
             (
                 "import os",
+                "import json",
+                "import subprocess",
                 "import sys",
                 "import time",
+                "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])",
                 "with open(sys.argv[1], 'w', encoding='ascii') as stream:",
-                "    stream.write(str(os.getpid()))",
+                "    json.dump([os.getpid(), os.getpgid(0), os.getsid(0), child.pid], stream)",
                 "    stream.flush()",
                 "    os.fsync(stream.fileno())",
                 "os.write(1, b'SECRET_STDOUT_CANARY' * (3 * 1024 * 1024 // 20))",
@@ -2200,9 +2204,109 @@ def test_default_runner_bounds_output_and_reaps_overflowing_process(
     assert "SECRET_REMOTE_COMMAND" not in rendered
     assert "SECRET_STDOUT_CANARY" not in rendered
     assert "SECRET_STDERR_CANARY" not in rendered
-    process_id = int(pid_path.read_text(encoding="ascii"))
-    with pytest.raises(ProcessLookupError):
-        os.kill(process_id, 0)
+    leader_id, process_group_id, session_id, descendant_id = json.loads(
+        pid_path.read_text(encoding="ascii")
+    )
+    assert (process_group_id, session_id) == (leader_id, leader_id)
+    _assert_processes_gone(leader_id, descendant_id)
+
+
+def test_default_runner_timeout_terminates_and_reaps_entire_process_group(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pid_path = tmp_path / "timeout-pids.json"
+    producer = tmp_path / "timeout-with-descendant.py"
+    producer.write_text(
+        "\n".join(
+            (
+                "import json",
+                "import os",
+                "import subprocess",
+                "import sys",
+                "import time",
+                "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])",
+                "with open(sys.argv[1], 'w', encoding='ascii') as stream:",
+                "    json.dump([os.getpid(), child.pid], stream)",
+                "    stream.flush()",
+                "    os.fsync(stream.fileno())",
+                "time.sleep(30)",
+            )
+        ),
+        encoding="ascii",
+    )
+    transport = _transport(tmp_path)
+    monkeypatch.setattr(ssh_module, "_SUBPROCESS_TERMINATE_GRACE_SECONDS", 0.05)
+    monkeypatch.setattr(
+        transport,
+        "_ssh_argv",
+        lambda _command, _known_hosts: [sys.executable, str(producer), str(pid_path)],
+    )
+
+    with pytest.raises(SshTransportError) as exc_info:
+        transport.run("private command", timeout_seconds=0.2)
+
+    assert exc_info.value.code is SshTransportErrorCode.TIMEOUT
+    leader_id, descendant_id = json.loads(pid_path.read_text(encoding="ascii"))
+    _assert_processes_gone(leader_id, descendant_id)
+
+
+def test_default_runner_cancellation_terminates_and_reaps_entire_process_group(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pid_path = tmp_path / "cancel-pids.json"
+    producer = tmp_path / "cancel-with-descendant.py"
+    producer.write_text(
+        "\n".join(
+            (
+                "import json",
+                "import os",
+                "import subprocess",
+                "import sys",
+                "import time",
+                "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])",
+                "with open(sys.argv[1], 'w', encoding='ascii') as stream:",
+                "    json.dump([os.getpid(), child.pid], stream)",
+                "    stream.flush()",
+                "    os.fsync(stream.fileno())",
+                "time.sleep(30)",
+            )
+        ),
+        encoding="ascii",
+    )
+
+    def cancel_after_spawn(*_args: object, **_kwargs: object) -> tuple[bytes, bytes]:
+        deadline = time.monotonic() + 3
+        while not pid_path.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(ssh_module, "_SUBPROCESS_TERMINATE_GRACE_SECONDS", 0.05)
+    monkeypatch.setattr(ssh_module, "_capture_subprocess_output", cancel_after_spawn)
+
+    with pytest.raises(KeyboardInterrupt):
+        ssh_module._run_subprocess(
+            [sys.executable, str(producer), str(pid_path)],
+            5,
+        )
+
+    leader_id, descendant_id = json.loads(pid_path.read_text(encoding="ascii"))
+    _assert_processes_gone(leader_id, descendant_id)
+
+
+def _assert_processes_gone(*process_ids: int) -> None:
+    deadline = time.monotonic() + 3
+    remaining = set(process_ids)
+    while remaining and time.monotonic() < deadline:
+        for process_id in tuple(remaining):
+            try:
+                os.kill(process_id, 0)
+            except ProcessLookupError:
+                remaining.remove(process_id)
+        if remaining:
+            time.sleep(0.01)
+    assert remaining == set()
 
 
 def test_tunnel_context_manager_and_exit_monitor_release_trust_lease(

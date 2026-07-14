@@ -311,7 +311,15 @@ available only through the existing restricted result/diagnostic handling path;
 known trust paths are redacted from returned remote-command stderr as defense in
 depth. Synchronous SSH and rsync subprocesses incrementally drain both streams
 under one 4 MiB aggregate byte cap. A timeout or cap overflow terminates and
-reaps the process before the existing typed error translation runs.
+reaps the process before the existing typed error translation runs. Every such
+subprocess starts a new session whose leader PID is the process-group ID. Error
+and cancellation cleanup keeps the direct child unreaped while that PID fixes
+the group identity, sends `SIGTERM` and then `SIGKILL` to the complete group,
+and only then waits/reaps the direct child. Normal completion also observes the
+leader without reaping it, removes any residual descendants, and then reaps it.
+This ordering prevents PID/PGID reuse from redirecting cleanup, treats `ESRCH`
+as an already-empty group, never signals the Desktop process group, and keeps a
+descendant from writing after an error return or trust-lease release.
 
 `env` is injected into the remote command as POSIX assignments:
 
@@ -352,10 +360,25 @@ during preflight or workspace execution.
 The trailing slash semantics intentionally upload the contents of the local
 folder into the prepared remote workspace path.
 
-Core bootstrap asset retries reconcile an existing incoming directory through a
-held no-follow directory descriptor with a 16-entry scan bound before upload.
-After an exact final bundle is verified, finalize removes that retry's incoming
-copy while retaining the verified published bundle.
+Each Core bootstrap transfer receives an unpredictable 128-bit transfer ID and
+a unique owner-only `incoming-<bundle>-<transfer>` directory. Prepare, discard,
+and finalize validate that closed authority under the same publication lock;
+concurrent or exact retries never reuse an incoming pathname or inode. Staging
+admits at most 16 live incoming attempts and scans at most 32 staging entries.
+An rsync failure discards its exact authority within the shared operation
+deadline when time remains. Timeout remnants stay private and bounded; later
+locked reconciliation only cleans retired or private publish candidates and
+never mistakes another live incoming attempt for stale state.
+
+Finalize verifies the exact two-file incoming inventory, then digest-verifies a
+streaming copy into a random private publish candidate that was never disclosed
+to rsync. It rechecks source identity and metadata after each copy, verifies and
+fsyncs the candidate, and atomically publishes that candidate with no-replace.
+Only after final verification does it retire the incoming pathname and attempt
+bounded cleanup. A stale rsync process, held wheel writer, or held incoming
+directory FD can therefore mutate only an unpublishable retired inode; no inode
+that was ever writable through transfer authority becomes part of the final
+bundle. An already published exact bundle remains an idempotent finalize retry.
 
 ## Limitations
 

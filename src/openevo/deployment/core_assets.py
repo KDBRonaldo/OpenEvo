@@ -19,6 +19,7 @@ MAX_CORE_WHEEL_BYTES = 512 * 1024 * 1024
 MAX_FRAMEWORK_LOCK_BYTES = 64 * 1024
 _DIGEST = re.compile(r"[0-9a-f]{64}\Z")
 _BUNDLE_ID = _DIGEST
+_TRANSFER_ID = re.compile(r"[0-9a-f]{32}\Z")
 _WHEEL_NAME = re.compile(r"[A-Za-z0-9_.+-]+\.whl\Z")
 _REMOTE_PATH = re.compile(r"/(?:[A-Za-z0-9._@%+=,-]+/)*[A-Za-z0-9._@%+=,-]+\Z")
 _MAX_STAGE_RESPONSE_BYTES = 4096
@@ -144,35 +145,40 @@ def parse_core_asset_prepare(
     payload: SecretStr,
     *,
     bundle_id: str,
-) -> tuple[str, str]:
+) -> tuple[str, str, str]:
     _require_bundle_id(bundle_id)
     value = _load_secret_json(payload)
     if not isinstance(value, dict) or set(value) != {
         "incoming_root",
         "schema_version",
         "service_root",
+        "transfer_id",
     }:
         raise ValueError("Core asset prepare response is invalid")
     service_root = value.get("service_root")
     incoming_root = value.get("incoming_root")
+    transfer_id = value.get("transfer_id")
     if (
         type(value.get("schema_version")) is not int
         or value.get("schema_version") != 1
         or not isinstance(service_root, str)
         or not isinstance(incoming_root, str)
+        or not isinstance(transfer_id, str)
+        or _TRANSFER_ID.fullmatch(transfer_id) is None
     ):
         raise ValueError("Core asset prepare response is invalid")
     _require_remote_path(service_root)
     _require_remote_path(incoming_root)
-    if incoming_root != f"{service_root}/asset-staging/incoming-{bundle_id}":
+    if incoming_root != (f"{service_root}/asset-staging/incoming-{bundle_id}-{transfer_id}"):
         raise ValueError("Core asset prepare response identity is invalid")
-    return service_root, incoming_root
+    return service_root, incoming_root, transfer_id
 
 
 def build_core_asset_finalize_command(
     *,
     service_root: str,
     bundle_id: str,
+    transfer_id: str,
     wheel_filename: str,
     wheel_sha256: str,
     wheel_size: int,
@@ -186,6 +192,8 @@ def build_core_asset_finalize_command(
         or not isinstance(wheel_sha256, str)
         or not isinstance(framework_lock_sha256, str)
         or _WHEEL_NAME.fullmatch(wheel_filename) is None
+        or not isinstance(transfer_id, str)
+        or _TRANSFER_ID.fullmatch(transfer_id) is None
         or _DIGEST.fullmatch(wheel_sha256) is None
         or _DIGEST.fullmatch(framework_lock_sha256) is None
         or type(wheel_size) is not int
@@ -197,6 +205,7 @@ def build_core_asset_finalize_command(
     arguments = (
         service_root,
         bundle_id,
+        transfer_id,
         wheel_filename,
         wheel_sha256,
         str(wheel_size),
@@ -206,6 +215,29 @@ def build_core_asset_finalize_command(
     return " ".join(
         ["python3", "-I", "-c", shlex.quote(_REMOTE_FINALIZE_SCRIPT)]
         + [shlex.quote(value) for value in arguments]
+    )
+
+
+def build_core_asset_discard_command(
+    *,
+    service_root: str,
+    bundle_id: str,
+    transfer_id: str,
+) -> str:
+    _require_remote_path(service_root)
+    _require_bundle_id(bundle_id)
+    if not isinstance(transfer_id, str) or _TRANSFER_ID.fullmatch(transfer_id) is None:
+        raise ValueError("Core asset transfer identity is invalid")
+    return " ".join(
+        [
+            "python3",
+            "-I",
+            "-c",
+            shlex.quote(_REMOTE_DISCARD_SCRIPT),
+            shlex.quote(service_root),
+            shlex.quote(bundle_id),
+            shlex.quote(transfer_id),
+        ]
     )
 
 
@@ -469,7 +501,7 @@ def _require_bundle_id(bundle_id: str) -> None:
 
 
 _REMOTE_PREPARE_SCRIPT = r"""
-import fcntl, json, os, pwd, stat, sys
+import fcntl, json, os, pwd, secrets, stat, sys
 
 bundle = sys.argv[1]
 if len(bundle) != 64 or any(c not in "0123456789abcdef" for c in bundle):
@@ -485,7 +517,8 @@ if (not hasattr(os, "O_NOFOLLOW") or not home_parts
 
 flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
 file_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
-max_incoming_entries = 16
+max_staging_entries = 32
+max_incoming_attempts = 16
 
 def open_absolute(path):
     fd = os.open("/", flags)
@@ -519,30 +552,61 @@ def ensure(parent, name):
         raise SystemExit(74)
     return fd
 
-def bounded_names(fd):
+def bounded_names(fd, maximum):
     names = []
     with os.scandir(fd) as entries:
         for entry in entries:
-            if len(names) >= max_incoming_entries:
+            if len(names) >= maximum:
                 raise SystemExit(75)
             names.append(entry.name)
     return names
 
-def clear_incoming(fd):
-    names = bounded_names(fd)
+def closed_attempt_name(name, prefix):
+    value = name[len(prefix):] if name.startswith(prefix) else ""
+    parts = value.split("-")
+    return (len(parts) == 2 and len(parts[0]) == 64 and len(parts[1]) == 32
+            and all(c in "0123456789abcdef" for part in parts for c in part))
+
+def clear_private_attempt(parent, attempt_name):
+    fd = os.open(attempt_name, flags, dir_fd=parent)
+    try:
+        require_dir(fd, 0o700)
+        before = os.fstat(fd)
+        names = bounded_names(fd, max_staging_entries)
+        for child_name in names:
+            child_fd = os.open(child_name, file_flags, dir_fd=fd)
+            try:
+                opened = os.fstat(child_fd)
+                current = os.stat(child_name, dir_fd=fd, follow_symlinks=False)
+                if (not stat.S_ISREG(opened.st_mode) or opened.st_uid != uid
+                        or opened.st_nlink != 1
+                        or (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino)):
+                    raise SystemExit(76)
+                os.unlink(child_name, dir_fd=fd)
+            finally:
+                os.close(child_fd)
+        os.fsync(fd)
+        current = os.stat(attempt_name, dir_fd=parent, follow_symlinks=False)
+        if (before.st_dev, before.st_ino) != (current.st_dev, current.st_ino):
+            raise SystemExit(76)
+    finally:
+        os.close(fd)
+    os.rmdir(attempt_name, dir_fd=parent)
+    os.fsync(parent)
+
+def reconcile_staging(fd):
+    names = bounded_names(fd, max_staging_entries)
     for name in names:
-        child_fd = os.open(name, file_flags, dir_fd=fd)
-        try:
-            opened = os.fstat(child_fd)
-            current = os.stat(name, dir_fd=fd, follow_symlinks=False)
-            if (not stat.S_ISREG(opened.st_mode) or opened.st_uid != uid
-                    or opened.st_nlink != 1
-                    or (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino)):
-                raise SystemExit(76)
-            os.unlink(name, dir_fd=fd)
-        finally:
-            os.close(child_fd)
-    os.fsync(fd)
+        if closed_attempt_name(name, "retired-") or closed_attempt_name(name, "publish-"):
+            try:
+                clear_private_attempt(fd, name)
+            except FileNotFoundError:
+                pass
+    remaining = bounded_names(fd, max_staging_entries)
+    if any(not closed_attempt_name(name, "incoming-") for name in remaining):
+        raise SystemExit(75)
+    if len(remaining) >= max_incoming_attempts:
+        raise SystemExit(75)
 
 home_fd = open_absolute(home)
 try:
@@ -561,10 +625,21 @@ try:
                 staging_fd = ensure(core_fd, "asset-staging")
                 assets_fd = ensure(core_fd, "assets")
                 try:
-                    incoming = "incoming-" + bundle
-                    incoming_fd = ensure(staging_fd, incoming)
+                    reconcile_staging(staging_fd)
+                    for unused in range(4):
+                        transfer = secrets.token_hex(16)
+                        incoming = "incoming-" + bundle + "-" + transfer
+                        try:
+                            os.mkdir(incoming, 0o700, dir_fd=staging_fd)
+                            os.fsync(staging_fd)
+                            break
+                        except FileExistsError:
+                            continue
+                    else:
+                        raise SystemExit(78)
+                    incoming_fd = os.open(incoming, flags, dir_fd=staging_fd)
                     try:
-                        clear_incoming(incoming_fd)
+                        require_dir(incoming_fd, 0o700)
                     finally:
                         os.close(incoming_fd)
                 finally:
@@ -583,15 +658,144 @@ root = home + "/.openevo/core"
 print(json.dumps({
     "schema_version": 1,
     "service_root": root,
-    "incoming_root": root + "/asset-staging/incoming-" + bundle,
+    "incoming_root": root + "/asset-staging/" + incoming,
+    "transfer_id": transfer,
 }, sort_keys=True, separators=(",", ":")))
 """.strip()
 
 
-_REMOTE_FINALIZE_SCRIPT = r"""
-import ctypes, errno, fcntl, hashlib, json, os, pwd, stat, sys
+_REMOTE_DISCARD_SCRIPT = r"""
+import ctypes, errno, fcntl, os, pwd, stat, sys
 
-service_root, bundle, wheel_name, wheel_digest, wheel_size, lock_digest, lock_size = sys.argv[1:]
+service_root, bundle, transfer = sys.argv[1:]
+uid = os.geteuid()
+home = pwd.getpwuid(uid).pw_dir
+home_parts = home.split("/")[1:]
+allowed = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._@%+=,-")
+if (not hasattr(os, "O_NOFOLLOW") or not home_parts
+        or any(not part or part in {".", ".."} or any(c not in allowed for c in part) for part in home_parts)
+        or home != "/" + "/".join(home_parts)
+        or service_root != home + "/.openevo/core"
+        or len(bundle) != 64 or any(c not in "0123456789abcdef" for c in bundle)
+        or len(transfer) != 32 or any(c not in "0123456789abcdef" for c in transfer)):
+    raise SystemExit(70)
+
+dir_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+file_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+
+def open_absolute(path):
+    fd = os.open("/", dir_flags)
+    try:
+        for part in [item for item in path.split("/") if item]:
+            child = os.open(part, dir_flags, dir_fd=fd)
+            os.close(fd)
+            fd = child
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+def require_dir(fd):
+    meta = os.fstat(fd)
+    if not stat.S_ISDIR(meta.st_mode) or meta.st_uid != uid or stat.S_IMODE(meta.st_mode) != 0o700:
+        raise SystemExit(71)
+
+def open_child_dir(parent, name):
+    fd = os.open(name, dir_flags, dir_fd=parent)
+    require_dir(fd)
+    current = os.stat(name, dir_fd=parent, follow_symlinks=False)
+    opened = os.fstat(fd)
+    if (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino):
+        raise SystemExit(72)
+    return fd
+
+def rename_noreplace(parent, source_name, destination_name):
+    libc = ctypes.CDLL(None, use_errno=True)
+    renameat2 = getattr(libc, "renameat2", None)
+    if renameat2 is None:
+        raise SystemExit(73)
+    renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    renameat2.restype = ctypes.c_int
+    result = renameat2(parent, os.fsencode(source_name), parent, os.fsencode(destination_name), 1)
+    if result == 0:
+        return
+    error = ctypes.get_errno()
+    if error == errno.EEXIST:
+        raise SystemExit(73)
+    raise OSError(error, "Core asset transfer retirement failed")
+
+def clear_retired(parent, name, fd):
+    before = os.fstat(fd)
+    names = []
+    with os.scandir(fd) as entries:
+        for entry in entries:
+            if len(names) >= 16:
+                return
+            names.append(entry.name)
+    for child_name in names:
+        try:
+            child_fd = os.open(child_name, file_flags, dir_fd=fd)
+        except OSError:
+            return
+        try:
+            child = os.fstat(child_fd)
+            current = os.stat(child_name, dir_fd=fd, follow_symlinks=False)
+            if (not stat.S_ISREG(child.st_mode) or child.st_uid != uid or child.st_nlink != 1
+                    or (child.st_dev, child.st_ino) != (current.st_dev, current.st_ino)):
+                return
+            os.unlink(child_name, dir_fd=fd)
+        except OSError:
+            return
+        finally:
+            os.close(child_fd)
+    try:
+        os.fsync(fd)
+        current = os.stat(name, dir_fd=parent, follow_symlinks=False)
+        if (before.st_dev, before.st_ino) != (current.st_dev, current.st_ino):
+            return
+        os.rmdir(name, dir_fd=parent)
+        os.fsync(parent)
+    except OSError:
+        pass
+
+core_fd = open_absolute(service_root)
+try:
+    require_dir(core_fd)
+    lock_fd = os.open("asset-publish.lock", os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600, dir_fd=core_fd)
+    try:
+        lock_meta = os.fstat(lock_fd)
+        if (not stat.S_ISREG(lock_meta.st_mode) or lock_meta.st_uid != uid
+                or lock_meta.st_nlink != 1 or stat.S_IMODE(lock_meta.st_mode) != 0o600):
+            raise SystemExit(74)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        staging_fd = open_child_dir(core_fd, "asset-staging")
+        try:
+            incoming_name = "incoming-" + bundle + "-" + transfer
+            retired_name = "retired-" + bundle + "-" + transfer
+            try:
+                incoming_fd = open_child_dir(staging_fd, incoming_name)
+            except FileNotFoundError:
+                incoming_fd = None
+            if incoming_fd is not None:
+                try:
+                    rename_noreplace(staging_fd, incoming_name, retired_name)
+                    os.fsync(staging_fd)
+                    clear_retired(staging_fd, retired_name, incoming_fd)
+                finally:
+                    os.close(incoming_fd)
+        finally:
+            os.close(staging_fd)
+    finally:
+        os.close(lock_fd)
+finally:
+    os.close(core_fd)
+""".strip()
+
+
+_REMOTE_FINALIZE_SCRIPT = r"""
+import ctypes, errno, fcntl, hashlib, json, os, pwd, secrets, stat, sys
+
+service_root, bundle, transfer, wheel_name, wheel_digest, wheel_size, lock_digest, lock_size = sys.argv[1:]
 wheel_size = int(wheel_size)
 lock_size = int(lock_size)
 uid = os.geteuid()
@@ -603,7 +807,8 @@ if (not hasattr(os, "O_NOFOLLOW") or not home_parts
         or any(not part or part in {".", ".."} or any(c not in allowed for c in part) for part in home_parts)
         or home != "/" + "/".join(home_parts)
         or service_root != expected_root or len(bundle) != 64
-        or any(c not in "0123456789abcdef" for c in bundle)):
+        or any(c not in "0123456789abcdef" for c in bundle)
+        or len(transfer) != 32 or any(c not in "0123456789abcdef" for c in transfer)):
     raise SystemExit(70)
 if not wheel_name.endswith(".whl") or "/" in wheel_name or "\\" in wheel_name:
     raise SystemExit(71)
@@ -614,6 +819,7 @@ if not 0 < wheel_size <= 536870912 or not 0 < lock_size <= 65536:
 
 dir_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
 file_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+create_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW
 
 def open_absolute(path):
     fd = os.open("/", dir_flags)
@@ -673,6 +879,57 @@ def verify_file(parent, name, size, digest):
     finally:
         os.close(fd)
 
+def copy_verified_file(source_parent, destination_parent, name, size, digest):
+    source_fd = os.open(name, file_flags, dir_fd=source_parent)
+    destination_fd = -1
+    chunks = []
+    try:
+        before = os.fstat(source_fd)
+        current = os.stat(name, dir_fd=source_parent, follow_symlinks=False)
+        if (not stat.S_ISREG(before.st_mode) or before.st_uid != uid or before.st_nlink != 1
+                or stat.S_IMODE(before.st_mode) != 0o600 or before.st_size != size
+                or (before.st_dev, before.st_ino) != (current.st_dev, current.st_ino)):
+            raise SystemExit(75)
+        destination_fd = os.open(name, create_flags, 0o600, dir_fd=destination_parent)
+        value = hashlib.sha256()
+        remaining = size
+        while remaining:
+            chunk = os.read(source_fd, min(1024 * 1024, remaining))
+            if not chunk:
+                raise SystemExit(76)
+            value.update(chunk)
+            if size <= 65536:
+                chunks.append(chunk)
+            offset = 0
+            while offset < len(chunk):
+                written = os.write(destination_fd, chunk[offset:])
+                if written <= 0:
+                    raise SystemExit(76)
+                offset += written
+            remaining -= len(chunk)
+        if os.read(source_fd, 1) or value.hexdigest() != digest:
+            raise SystemExit(77)
+        os.fchmod(destination_fd, 0o600)
+        os.fsync(destination_fd)
+        after = os.fstat(source_fd)
+        current = os.stat(name, dir_fd=source_parent, follow_symlinks=False)
+        destination = os.fstat(destination_fd)
+        current_destination = os.stat(name, dir_fd=destination_parent, follow_symlinks=False)
+        identity = ("st_dev", "st_ino", "st_mode", "st_uid", "st_nlink", "st_size", "st_mtime_ns", "st_ctime_ns")
+        if (any(getattr(before, field) != getattr(after, field) for field in identity)
+                or (after.st_dev, after.st_ino) != (current.st_dev, current.st_ino)
+                or not stat.S_ISREG(destination.st_mode) or destination.st_uid != uid
+                or destination.st_nlink != 1 or stat.S_IMODE(destination.st_mode) != 0o600
+                or destination.st_size != size
+                or (destination.st_dev, destination.st_ino)
+                    != (current_destination.st_dev, current_destination.st_ino)):
+            raise SystemExit(78)
+        return b"".join(chunks)
+    finally:
+        if destination_fd >= 0:
+            os.close(destination_fd)
+        os.close(source_fd)
+
 def no_duplicates(pairs):
     result = {}
     for key, value in pairs:
@@ -709,7 +966,7 @@ def verify_bundle(parent, name):
         os.close(fd)
         raise
 
-def discard_incoming(parent, name, fd):
+def discard_private_bundle(parent, name, fd):
     before = os.fstat(fd)
     names = []
     with os.scandir(fd) as entries:
@@ -758,6 +1015,31 @@ def rename_noreplace(source_parent, source_name, destination_parent, destination
         return False
     raise OSError(error, "atomic Core asset publication failed")
 
+def create_private_candidate(parent):
+    for unused in range(4):
+        name = "publish-" + bundle + "-" + secrets.token_hex(16)
+        try:
+            os.mkdir(name, 0o700, dir_fd=parent)
+            os.fsync(parent)
+            return name, open_child_dir(parent, name)
+        except FileExistsError:
+            continue
+    raise SystemExit(82)
+
+def retire_incoming(parent, incoming_name, incoming_fd):
+    current = os.stat(incoming_name, dir_fd=parent, follow_symlinks=False)
+    opened = os.fstat(incoming_fd)
+    if (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino):
+        raise SystemExit(83)
+    retired_name = "retired-" + bundle + "-" + transfer
+    if not rename_noreplace(parent, incoming_name, parent, retired_name):
+        raise SystemExit(83)
+    os.fsync(parent)
+    try:
+        discard_private_bundle(parent, retired_name, incoming_fd)
+    except (FileNotFoundError, OSError, SystemExit):
+        pass
+
 core_fd = open_absolute(service_root)
 try:
     require_dir(core_fd)
@@ -771,29 +1053,71 @@ try:
         staging_fd = open_child_dir(core_fd, "asset-staging")
         assets_fd = open_child_dir(core_fd, "assets")
         try:
-            incoming_name = "incoming-" + bundle
-            incoming_fd = verify_bundle(staging_fd, incoming_name)
+            incoming_name = "incoming-" + bundle + "-" + transfer
+            incoming_fd = None
+            candidate_fd = None
+            candidate_name = None
+            published = False
             try:
-                incoming_meta = os.fstat(incoming_fd)
-                published = False
                 try:
                     final_fd = verify_bundle(assets_fd, bundle)
                 except FileNotFoundError:
-                    published = rename_noreplace(staging_fd, incoming_name, assets_fd, bundle)
+                    incoming_fd = verify_bundle(staging_fd, incoming_name)
+                    candidate_name, candidate_fd = create_private_candidate(staging_fd)
+                    copy_verified_file(incoming_fd, candidate_fd, wheel_name, wheel_size, wheel_digest)
+                    lock_bytes = copy_verified_file(
+                        incoming_fd,
+                        candidate_fd,
+                        "framework-lock.json",
+                        lock_size,
+                        lock_digest,
+                    )
+                    lock = json.loads(lock_bytes, object_pairs_hook=no_duplicates)
+                    if (not isinstance(lock, dict) or set(lock) != {"schema_version", "distribution",
+                            "distribution_version", "distribution_digest", "wheel_filename"}
+                            or lock.get("schema_version") != "1" or lock.get("distribution") != "openevo"
+                            or not isinstance(lock.get("distribution_version"), str)
+                            or not lock.get("distribution_version")
+                            or lock.get("distribution_digest") != wheel_digest
+                            or lock.get("wheel_filename") != wheel_name):
+                        raise SystemExit(80)
+                    os.fsync(candidate_fd)
+                    os.close(candidate_fd)
+                    candidate_fd = None
+                    verified_candidate = verify_bundle(staging_fd, candidate_name)
+                    os.close(verified_candidate)
+                    published = rename_noreplace(staging_fd, candidate_name, assets_fd, bundle)
                     if published:
                         os.fsync(assets_fd)
                         os.fsync(staging_fd)
+                        candidate_name = None
                     final_fd = verify_bundle(assets_fd, bundle)
                 try:
-                    final_meta = os.fstat(final_fd)
-                    if published and (incoming_meta.st_dev, incoming_meta.st_ino) != (final_meta.st_dev, final_meta.st_ino):
-                        raise SystemExit(82)
+                    os.fsync(final_fd)
                 finally:
                     os.close(final_fd)
-                if not published:
-                    discard_incoming(staging_fd, incoming_name, incoming_fd)
             finally:
-                os.close(incoming_fd)
+                if candidate_fd is not None:
+                    os.close(candidate_fd)
+                if candidate_name is not None:
+                    try:
+                        private_fd = open_child_dir(staging_fd, candidate_name)
+                        try:
+                            discard_private_bundle(staging_fd, candidate_name, private_fd)
+                        finally:
+                            os.close(private_fd)
+                    except (FileNotFoundError, OSError, SystemExit):
+                        pass
+                if incoming_fd is None:
+                    try:
+                        incoming_fd = open_child_dir(staging_fd, incoming_name)
+                    except FileNotFoundError:
+                        pass
+                if incoming_fd is not None:
+                    try:
+                        retire_incoming(staging_fd, incoming_name, incoming_fd)
+                    finally:
+                        os.close(incoming_fd)
         finally:
             os.close(assets_fd)
             os.close(staging_fd)
@@ -820,6 +1144,7 @@ __all__ = (
     "MAX_CORE_WHEEL_BYTES",
     "MAX_FRAMEWORK_LOCK_BYTES",
     "StagedCoreBootstrapAssets",
+    "build_core_asset_discard_command",
     "build_core_asset_finalize_command",
     "build_core_asset_prepare_command",
     "parse_core_asset_prepare",
