@@ -149,6 +149,7 @@ def test_codex_subscription_auth_is_staged_into_runtime_session(
     source = home / ".codex" / "auth.json"
     source.parent.mkdir(parents=True)
     source.write_text('{"subscription": true}\n', encoding="utf-8")
+    source.chmod(0o600)
     monkeypatch.setenv("HOME", str(home))
     session_dir = tmp_path / "session"
     session_dir.mkdir()
@@ -170,6 +171,8 @@ def test_codex_subscription_auth_is_staged_into_runtime_session(
 
     staged = session_dir / ".codex" / "auth.json"
     assert staged.read_text(encoding="utf-8") == '{"subscription": true}\n'
+    assert staged.stat().st_mode & 0o777 == 0o600
+    assert staged.parent.stat().st_mode & 0o777 == 0o700
 
 
 def test_codex_subscription_auth_staging_reports_missing_host_login(

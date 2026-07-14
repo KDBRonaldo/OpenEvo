@@ -57,6 +57,7 @@ class RuntimeSpec(BaseModel):
     """Container runtime configuration for one rollout session."""
 
     backend: Literal["docker", "apptainer"] = "docker"
+    container_user: Literal["image", "host"] = "image"
     image: str
     prepare: list[PrepareAction] = Field(default_factory=list)
     eval_prepare: list[PrepareAction] | None = None

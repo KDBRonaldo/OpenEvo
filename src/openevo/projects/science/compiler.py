@@ -82,6 +82,9 @@ def _runtime_payload(project: ScienceProjectConfig) -> dict[str, Any]:
 
     return {
         "image": _runtime_image(project),
+        "container_user": (
+            "image" if project.environment.profile == "custom_image" else "host"
+        ),
         "workdir": _WORKDIR,
         "env": env,
         "prepare": [

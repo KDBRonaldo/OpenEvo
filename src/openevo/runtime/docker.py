@@ -47,6 +47,8 @@ class DockerRuntime(BaseRuntime):
         if self._destroyed:
             raise RuntimeError("docker runtime was already destroyed")
         create_args = ["docker", "create", "--name", self._container_name]
+        if self.spec.container_user == "host":
+            create_args.extend(["--user", f"{os.getuid()}:{os.getgid()}"])
         if not self.spec.allow_internet:
             create_args.extend(["--network", "none"])
         elif self.spec.network:
@@ -77,7 +79,11 @@ class DockerRuntime(BaseRuntime):
         # Skip the chmod when container and host UIDs match — recursive chmod
         # over a large session dir can be expensive and is only needed when the
         # container user can't write to host-owned bind-mounted files.
-        self._chmod_needed = await self._detect_chmod_needed()
+        self._chmod_needed = (
+            False
+            if self.spec.container_user == "host"
+            else await self._detect_chmod_needed()
+        )
         if self._chmod_needed:
             await self._run_local_command(
                 "docker", "exec", "--user", "root",

@@ -55,3 +55,17 @@ limits. Apptainer is daemonless (good for clusters that forbid the Docker
 socket), uses a host-backed overlay, and exposes GPUs with `--nv`. Both
 bind-mount the session directory and run commands via `bash -lc`, so harnesses
 and evaluators behave the same on either.
+
+## Container user policy
+
+`RuntimeSpec.container_user` is a closed `image | host` choice. `image` keeps
+the image's declared user and is the default for benchmark automation, custom
+images, and existing experiment configs. Docker `host` starts the container
+with the Core process UID/GID and therefore keeps the bind-mounted session
+writable without recursively widening host file permissions.
+
+OpenEvo-managed Science profiles use `host`; user-supplied custom images keep
+`image`. This distinction is required for Codex subscription sessions because
+the per-session `auth.json` remains a host-owned `0600` file. It is not a
+general compatibility promise that arbitrary images can run under a replaced
+user identity.

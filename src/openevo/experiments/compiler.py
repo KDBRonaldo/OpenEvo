@@ -858,6 +858,8 @@ def _runtime_payload(config: ExperimentConfig) -> dict[str, Any]:
         "backend": config.runtime.kind,
         "workdir": config.runtime.workdir,
     }
+    if config.runtime.container_user != "image":
+        payload["container_user"] = config.runtime.container_user
     if config.runtime.image is not None:
         payload["image"] = config.runtime.image
     if config.runtime.env:

@@ -675,7 +675,10 @@ class GatewayNodeManager:
             )
 
         target_home.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source, target_home / "auth.json")
+        target_home.chmod(0o700)
+        target = target_home / "auth.json"
+        shutil.copyfile(source, target)
+        target.chmod(0o600)
 
     async def _run_runtime_prepare(
         self,

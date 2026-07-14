@@ -130,6 +130,7 @@ class RuntimePrepareActionConfig(_StrictModel):
 
 class RuntimeConfig(_StrictModel):
     kind: Literal["docker", "apptainer"] = "docker"
+    container_user: Literal["image", "host"] = "image"
     workdir: str = "/openevo/session/workspace"
     image: str | None = None
     env: dict[str, str] = Field(default_factory=dict)

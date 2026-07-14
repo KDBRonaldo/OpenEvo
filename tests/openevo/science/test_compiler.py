@@ -69,6 +69,7 @@ def test_subscription_project_compiles_to_transcript_experiment_config() -> None
     }
     assert compiled.runtime.image == MANAGED_RUNTIME_IMAGES["managed_science"]
     assert compiled.runtime.workdir == "/openevo/session/workspace"
+    assert compiled.runtime.container_user == "host"
     assert [action.model_dump(mode="json") for action in compiled.runtime.prepare] == [
         {
             "type": "exec",
@@ -129,10 +130,25 @@ def test_local_inference_compiles_to_transcript_proxy_auth_and_hf_model_metadata
         "SCIENCE_DATASET": "folding",
         "OPENEVO_MANAGED_HF_MODEL": "Qwen/Qwen3-Coder-30B-A3B-Instruct",
     }
+    assert compiled.runtime.container_user == "host"
     assert compiled.tasks[0].metadata["openevo"]["execution_mode"] == (
         "self-deployed"
     )
     assert compiled.evolution.targets["parametric_memory"].enabled is False
+
+
+def test_custom_runtime_image_does_not_override_the_image_user() -> None:
+    compiled = compile_science_project(
+        _project(
+            environment={
+                "profile": "custom_image",
+                "custom_image": "ghcr.io/example/science:latest",
+            }
+        )
+    )
+
+    assert compiled.runtime.image == "ghcr.io/example/science:latest"
+    assert compiled.runtime.container_user == "image"
 
 
 def test_science_compiler_preserves_generic_targets_without_loss() -> None:
@@ -309,6 +325,7 @@ def test_scratch_source_has_no_workspace_and_keeps_runtime_and_setup_commands() 
     )
 
     assert compiled.runtime.image == MANAGED_RUNTIME_IMAGES["python_research"]
+    assert compiled.runtime.container_user == "host"
     assert compiled.tasks[0].workspace is None
     assert [action.model_dump(mode="json") for action in compiled.runtime.prepare] == [
         {
@@ -336,6 +353,7 @@ def test_experiment_compiler_uploads_workspace_before_science_prepare_actions() 
 
     payload = compiled.tasks[0].rollout_payload_for_round(0, context_artifact_ids=[])
 
+    assert payload["runtime"]["container_user"] == "host"
     assert payload["runtime"]["prepare"] == [
         {
             "type": "upload_dir",

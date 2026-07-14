@@ -79,6 +79,11 @@ Remote preflight checks that the remote user has `codex` and
 `~/.codex/auth.json`. During each gateway runtime session, that host auth file
 is staged into the container-visible `CODEX_HOME` under `/openevo/session`, so the
 user does not need to log in again inside the managed runtime image.
+The staged directory and file are forced to `0700` and `0600`. Managed Science
+containers run with the remote Core process UID/GID, so the bind mount remains
+writable without applying a recursive world-readable/world-writable permission
+fallback. Custom images retain their image-declared user and are not allowed to
+change this managed credential ownership rule implicitly.
 
 `self-deployed` uses proxy authentication and requires `execution.hf_model`.
 The legacy config value `codex_managed_local_inference` remains accepted as an
