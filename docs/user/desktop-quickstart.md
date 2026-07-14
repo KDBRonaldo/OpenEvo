@@ -4,11 +4,14 @@
 
 1. Install OpenEvo Desktop from the macOS `.dmg`.
 2. Launch the app and create a project.
-3. Enter the remote server host, port, user, and SSH auth reference.
+3. Enter the remote server host, port, and user. This release uses the macOS SSH
+   agent; password and private-key entry are not exposed until the native
+   credential broker is implemented.
 4. Configure proxy, pip index, and Hugging Face mirror settings if needed.
 5. Run remote doctor/bootstrap from Desktop.
 6. Start the remote OpenEvo Core Backend.
-7. Choose Codex subscription transcript or self-deployed reference mode.
+7. Use the default Codex subscription transcript mode, or explicitly choose the
+   self-deployed reference mode when that remote runtime is available.
 8. Start the science run and monitor its timeline, logs, and artifacts.
 
 Desktop must show setup-required or typed error states until a real sidecar and

@@ -9,7 +9,7 @@ import {
   type RemoteProfileV1,
 } from "../api/v1/schemas";
 import { createLocalApiDesktopProductProvider } from "./localApiProvider";
-import type { DesktopProductProvider, ProjectSourceSelectionIntent } from "./provider";
+import { DesktopProductUserError, type DesktopProductProvider, type ProjectSourceSelectionIntent } from "./provider";
 import { DESKTOP_PRODUCT_RELEASE_CONTRACT } from "./releaseContract";
 
 export interface ReleaseNativeBridge {
@@ -60,12 +60,9 @@ const tauriNativeBridge: ReleaseNativeBridge = {
     actionId,
     outcome,
   }),
-  configureCredential: (profileId, slotKind, etag, actionId) => invoke("configure_credential", {
-    profileId,
-    slotKind,
-    etag,
-    actionId,
-  }),
+  configureCredential: async () => {
+    throw new DesktopProductUserError("SSH agent is the only supported authentication method in this release.");
+  },
 };
 
 export async function stopReleaseDesktopProductProvider(): Promise<void> {

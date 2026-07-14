@@ -1900,13 +1900,28 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
       });
   }
 
-  addDraftProject(): ProjectV1 {
+  addDraftProject(options: { subscription?: boolean } = {}): ProjectV1 {
     const base = this.makeProjectFixture();
+    const subscriptionFields = options.subscription ? {
+      execution: {
+        mode: "codex_subscription_transcript",
+        capture_mode: "transcript",
+        token_level_metrics_available: false,
+        codex_model: "gpt-5.5",
+        hf_model: null,
+      },
+      evolution: { targets: {} },
+    } : {};
     const project = projectV1Schema.parse({
       ...base,
       project_id: "project-fixture-2",
       name: "Second research project",
-      task: { ...base.task, title: "Second research task" },
+      task: {
+        ...base.task,
+        title: "Second research task",
+        ...(options.subscription ? { objective: "Second project objective." } : {}),
+      },
+      ...subscriptionFields,
       state: "draft",
       remote: null,
       etag: ETAG_A,

@@ -48,9 +48,24 @@ replacement, reset, stale completion, and failed save paths discard, while a
 successful create/patch settles as adopted only after the sidecar has durably
 committed the project reference. Only the opaque source reference enters the
 renderer DTO or public Desktop Local API. The
-remaining `configure_credential` command is still a required release
-integration dependency; the provider continues to fail closed until it is
-implemented.
+release UI exposes only SSH agent authentication. Password, private-key, and
+proxy-secret credential brokers remain contract extension points, but the
+default native bridge rejects those calls without invoking a nonexistent Tauri
+command. They must not appear as usable release controls until the native broker
+is implemented and reviewed.
+
+New projects default to the Core-owned Codex subscription transcript profile and
+its release-tested `gpt-5.5` model default. They save an empty evolution target
+map until the created and activated project has remote capabilities for its own
+identity and execution mode; another project or mode can never provide defaults.
+`Self-deployed` is the explicit UI label for remote user-selected inference, and
+the renderer does not route a first-time user into that path before its remote
+service lifecycle is ready.
+
+The project drawer is keyed by the explicit form identity (`create` or exact
+project ID). Changing that identity discards the previous component-local draft
+and pending capability UI before rendering the new form. Project-only workspace
+sync is exposed only when the drawer is editing that exact saved project.
 
 `App.tsx` owns the release startup state machine. It does not mount the product
 renderer until native bootstrap, Local API negotiation, and provider creation
