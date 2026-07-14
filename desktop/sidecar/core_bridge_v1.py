@@ -308,6 +308,12 @@ class CoreWorkspaceUploadAbortStateV1(StrEnum):
     UNKNOWN = "unknown"
 
 
+class CoreWorkspaceUploadFinalizeStateV1(StrEnum):
+    PRE_FINALIZE = "pre_finalize"
+    UNKNOWN = "unknown"
+    APPLIED = "applied"
+
+
 @dataclass(frozen=True, slots=True)
 class CoreWorkspaceUploadAbortOperationV1:
     upload: core_v1.WorkspaceUploadSessionV1
@@ -329,22 +335,37 @@ class CoreWorkspaceUploadFinalizeAuthorityV1:
     request_sha256: str
     request: core_v1.WorkspaceUploadFinalizeV1
     idempotency_key: str
-    outcome: core_v1.WorkspaceUploadFinalizeResponseV1
+    upload_etag: str
+    project_etag: str
+    state: CoreWorkspaceUploadFinalizeStateV1 = CoreWorkspaceUploadFinalizeStateV1.PRE_FINALIZE
+    outcome: core_v1.WorkspaceUploadFinalizeResponseV1 | None = None
     outcome_sha256: str | None = None
 
     def __post_init__(self) -> None:
         self.verify()
 
     def verify(self) -> None:
-        finalized = self.outcome.upload
         if _model_digest(self.request) != self.request_sha256:
             raise ValueError("workspace finalize request digest does not match canonical request")
-        if self.outcome_sha256 is None or _model_digest(self.outcome) != self.outcome_sha256:
-            raise ValueError("workspace finalize outcome digest does not match canonical outcome")
         if self.upload.status is not core_v1.WorkspaceUploadStatus.OPEN or (
             self.upload.accepted_offset != self.upload.archive.byte_size
             or self.request.content_sha256 != self.upload.archive.content_sha256
-            or self.outcome.project_id != self.upload.project_id
+            or self.upload_etag != self.upload.etag
+            or self.project_etag != self.upload.project_etag
+        ):
+            raise ValueError("workspace finalize authority is not an exact open upload request")
+        has_outcome = self.outcome is not None and self.outcome_sha256 is not None
+        if (self.state is CoreWorkspaceUploadFinalizeStateV1.APPLIED) != has_outcome:
+            raise ValueError("only applied workspace finalize authority has an outcome")
+        if self.outcome is None:
+            if self.outcome_sha256 is not None:
+                raise ValueError("workspace finalize outcome binding is incomplete")
+            return
+        if _model_digest(self.outcome) != self.outcome_sha256:
+            raise ValueError("workspace finalize outcome digest does not match canonical outcome")
+        finalized = self.outcome.upload
+        if (
+            self.outcome.project_id != self.upload.project_id
             or finalized.id != self.upload.id
             or finalized.project_id != self.upload.project_id
             or finalized.status is not core_v1.WorkspaceUploadStatus.FINALIZED
@@ -495,9 +516,8 @@ class CoreProjectPatchOperationV1:
         has_complete_outcome = all(value is not None for value in outcome_fields)
         has_any_outcome = any(value is not None for value in outcome_fields)
         if (
-            (self.state is CoreProjectPatchStateV1.APPLIED) != has_complete_outcome
-            or has_any_outcome != has_complete_outcome
-        ):
+            self.state is CoreProjectPatchStateV1.APPLIED
+        ) != has_complete_outcome or has_any_outcome != has_complete_outcome:
             raise ValueError("only an applied project patch has complete durable authority")
         if self.outcome is not None and self.outcome.id != self.core_project_id:
             raise ValueError("project patch outcome belongs to another project")
@@ -892,6 +912,18 @@ class DesktopCoreBridgeV1:
                 lambda: self._persistence.load_patch(project.project_id),
                 label="project patch operation read",
             )
+            pending_finalize = operation.workspace_upload_finalize
+            if (
+                pending_finalize is not None
+                and pending_finalize.state is not CoreWorkspaceUploadFinalizeStateV1.APPLIED
+            ):
+                core_project, operation = self._resume_workspace_finalize(
+                    token=token,
+                    deadline=deadline,
+                    client=client,
+                    operation=operation,
+                    expected_project=core_project,
+                )
             initial_revision_authority: core_v1.RevisionRefV1 | None = None
             if mapping is None:
                 authority_anchor = (
@@ -1010,8 +1042,13 @@ class DesktopCoreBridgeV1:
                 completed_patch = new_patch or completed_patch
             else:
                 _ensure_project_identity(core_project, create_request)
+            pending_finalize = operation.workspace_upload_finalize
             if isinstance(create_request.workspace, core_v1.ImportedWorkspaceSpecV1) and (
                 core_project.workspace_publication is None
+                or (
+                    pending_finalize is not None
+                    and pending_finalize.state is not CoreWorkspaceUploadFinalizeStateV1.APPLIED
+                )
             ):
                 core_project, operation = self._publish_imported_workspace(
                     token=token,
@@ -2022,9 +2059,7 @@ class DesktopCoreBridgeV1:
             _patch_immutable_authority(current),
             allow_project_patch=True,
             mismatch_code="core_project_patch_replay_mismatch",
-            mismatch_message=(
-                "Current Core project changed immutable patch base identity."
-            ),
+            mismatch_message=("Current Core project changed immutable patch base identity."),
         )
         if operation.state is CoreProjectPatchStateV1.APPLIED:
             assert operation.outcome is not None
@@ -2118,6 +2153,41 @@ class DesktopCoreBridgeV1:
                 "The imported workspace does not have an adopted archive reference.",
                 status=422,
             )
+        finalize = operation.workspace_upload_finalize
+        if finalize is not None:
+            _ensure_workspace_finalize_authority_binding(finalize)
+            matches_current_request = not (
+                finalize.request.content_sha256 != import_ref.content_sha256
+                or finalize.upload.archive != core_project.workspace.archive
+                or finalize.upload.project_id != operation.core_project_id
+                or finalize.upload.id != operation.workspace_upload_id
+            )
+            if (
+                finalize.state is not CoreWorkspaceUploadFinalizeStateV1.APPLIED
+                and not matches_current_request
+            ):
+                raise _bridge_error(
+                    "workspace_finalize_authority_mismatch",
+                    "The durable workspace finalize request does not match Local authority.",
+                    status=409,
+                )
+            if (
+                finalize.state is CoreWorkspaceUploadFinalizeStateV1.APPLIED
+                and matches_current_request
+            ):
+                raise _bridge_error(
+                    "workspace_finalize_authority_mismatch",
+                    "Core lost the durable finalized workspace publication.",
+                    status=409,
+                )
+            if finalize.state is not CoreWorkspaceUploadFinalizeStateV1.APPLIED:
+                return self._resume_workspace_finalize(
+                    token=token,
+                    deadline=deadline,
+                    client=client,
+                    operation=operation,
+                    expected_project=core_project,
+                )
         if (
             operation.workspace_upload_id is not None
             and operation.workspace_upload_project_snapshot
@@ -2274,34 +2344,108 @@ class DesktopCoreBridgeV1:
         finalize_request = core_v1.WorkspaceUploadFinalizeV1(
             content_sha256=import_ref.content_sha256
         )
-        finalized = self._core_external(
-            token,
-            deadline,
-            lambda: client.finalize_workspace_upload(
-                upload.id,
-                finalize_request,
-                if_match=upload.etag,
-                if_project_match=upload.project_etag,
-                idempotency_key=_derived_key(upload_key_seed, "finalize"),
-            ),
-        )
-        _ensure_immutable_authority_transition(
-            _patch_immutable_authority(core_project),
-            _patch_immutable_authority(finalized.project),
-            mismatch_code="workspace_finalize_authority_mismatch",
-            mismatch_message="Core workspace finalize changed immutable project authority.",
-        )
         finalize_authority = CoreWorkspaceUploadFinalizeAuthorityV1(
             upload=upload,
             request_sha256=_model_digest(finalize_request),
             request=finalize_request,
             idempotency_key=_derived_key(upload_key_seed, "finalize"),
+            upload_etag=upload.etag,
+            project_etag=upload.project_etag,
+        )
+        prepared_operation = replace(
+            operation,
+            workspace_upload_finalize=finalize_authority,
+        )
+        stored_operation = self._adapter_external(
+            token,
+            deadline,
+            lambda: self._persistence.update_create(
+                prepared_operation,
+                expected_previous=operation,
+            ),
+            label="workspace finalize request reservation",
+        )
+        operation = _ensure_create_transition(
+            stored_operation,
+            prepared_operation,
+            label="workspace-finalize-reserved",
+        )
+        return self._resume_workspace_finalize(
+            token=token,
+            deadline=deadline,
+            client=client,
+            operation=operation,
+            expected_project=core_project,
+        )
+
+    def _resume_workspace_finalize(
+        self,
+        *,
+        token: _GenerationToken,
+        deadline: float,
+        client: CoreControlClientV1,
+        operation: CoreProjectCreateOperationV1,
+        expected_project: core_v1.ProjectV1,
+    ) -> tuple[core_v1.ProjectV1, CoreProjectCreateOperationV1]:
+        authority = operation.workspace_upload_finalize
+        if authority is None:
+            raise ValueError("workspace finalize resume requires durable authority")
+        _ensure_workspace_finalize_authority_binding(authority)
+        if authority.state is CoreWorkspaceUploadFinalizeStateV1.PRE_FINALIZE:
+            unknown_authority = replace(
+                authority,
+                state=CoreWorkspaceUploadFinalizeStateV1.UNKNOWN,
+            )
+            unknown_operation = replace(
+                operation,
+                workspace_upload_finalize=unknown_authority,
+            )
+            stored_operation = self._adapter_external(
+                token,
+                deadline,
+                lambda: self._persistence.update_create(
+                    unknown_operation,
+                    expected_previous=operation,
+                ),
+                label="workspace finalize outcome transition",
+            )
+            operation = _ensure_create_transition(
+                stored_operation,
+                unknown_operation,
+                label="workspace-finalize-unknown",
+            )
+            authority = unknown_authority
+        if authority.state is CoreWorkspaceUploadFinalizeStateV1.APPLIED:
+            assert authority.outcome is not None
+            return authority.outcome.project, operation
+        # Re-establish only the persisted open-upload membership needed for an exact replay.
+        client._register_workspace_upload(authority.upload, exact_replay=True)
+        finalized = self._core_external(
+            token,
+            deadline,
+            lambda: client.finalize_workspace_upload(
+                authority.upload.id,
+                authority.request,
+                if_match=authority.upload_etag,
+                if_project_match=authority.project_etag,
+                idempotency_key=authority.idempotency_key,
+            ),
+        )
+        _ensure_immutable_authority_transition(
+            _patch_immutable_authority(expected_project),
+            _patch_immutable_authority(finalized.project),
+            mismatch_code="workspace_finalize_authority_mismatch",
+            mismatch_message="Core workspace finalize changed immutable project authority.",
+        )
+        applied_authority = replace(
+            authority,
+            state=CoreWorkspaceUploadFinalizeStateV1.APPLIED,
             outcome=finalized,
             outcome_sha256=_model_digest(finalized),
         )
         finalized_operation = replace(
             operation,
-            workspace_upload_finalize=finalize_authority,
+            workspace_upload_finalize=applied_authority,
         )
         stored_operation = self._adapter_external(
             token,
@@ -2537,9 +2681,7 @@ class DesktopCoreBridgeV1:
             _patch_immutable_authority(previous),
             _patch_immutable_authority(project),
             mismatch_code="core_project_identity_mismatch",
-            mismatch_message=(
-                "The refreshed Core project changed immutable project authority."
-            ),
+            mismatch_message=("The refreshed Core project changed immutable project authority."),
         )
         _ensure_mapping_content_snapshots(mapping, project)
         _ensure_mutable_authority_transition(
@@ -2653,10 +2795,7 @@ class DesktopCoreBridgeV1:
                 "The requested resource does not belong to the active local project.",
                 status=409,
             )
-        if (
-            session.profile_id != project.profile_id
-            or session.local_project_etag != project.etag
-        ):
+        if session.profile_id != project.profile_id or session.local_project_etag != project.etag:
             raise _bridge_error(
                 "active_local_project_version_mismatch",
                 "The saved local project changed after this Core session was activated.",
@@ -2855,9 +2994,16 @@ def _model_digest(model: core_v1.ContractModel) -> str:
 
 def _ensure_workspace_finalize_authority_binding(
     authority: CoreWorkspaceUploadFinalizeAuthorityV1,
+    *,
+    require_applied: bool = False,
 ) -> None:
     try:
         authority.verify()
+        if require_applied and (
+            authority.state is not CoreWorkspaceUploadFinalizeStateV1.APPLIED
+            or authority.outcome is None
+        ):
+            raise ValueError("workspace finalize outcome is not applied")
     except (AttributeError, TypeError, ValueError):
         raise _bridge_error(
             "workspace_finalize_authority_mismatch",
@@ -2902,23 +3048,24 @@ def _ensure_create_operation(
     idempotency_key: str,
     core_host_identity: str,
 ) -> None:
-    if operation.workspace_upload_finalize is not None:
-        _ensure_workspace_finalize_authority_binding(operation.workspace_upload_finalize)
+    finalize = operation.workspace_upload_finalize
+    if finalize is not None:
+        _ensure_workspace_finalize_authority_binding(finalize)
     bound = operation.state is CoreProjectCreateStateV1.BOUND
-    if bound:
+    if (
+        bound
+        and finalize is not None
+        and (finalize.state is CoreWorkspaceUploadFinalizeStateV1.APPLIED)
+    ):
+        assert finalize.outcome is not None
         create_immutable = _create_immutable_authority(operation)
-        if operation.workspace_upload_finalize is not None:
-            _ensure_immutable_authority_transition(
-                create_immutable,
-                _patch_immutable_authority(
-                    operation.workspace_upload_finalize.outcome.project
-                ),
-                allow_project_patch=True,
-                mismatch_code="core_project_create_replay_mismatch",
-                mismatch_message=(
-                    "Workspace finalize changed immutable project create identity."
-                ),
-            )
+        _ensure_immutable_authority_transition(
+            create_immutable,
+            _patch_immutable_authority(finalize.outcome.project),
+            allow_project_patch=True,
+            mismatch_code="core_project_create_replay_mismatch",
+            mismatch_message=("Workspace finalize changed immutable project create identity."),
+        )
     if (
         operation.local_project_id != project.project_id
         or operation.profile_id != project.profile_id
@@ -3047,9 +3194,7 @@ def _ensure_persisted_patch_outcome(
         operation.outcome_immutable,
         _patch_immutable_authority(current),
         mismatch_code="core_project_patch_outcome_mismatch",
-        mismatch_message=(
-            "Core no longer matches the immutable applied project patch authority."
-        ),
+        mismatch_message=("Core no longer matches the immutable applied project patch authority."),
     )
     _ensure_project_identity(operation.outcome, operation.new_project_create)
     _ensure_patch_signed_new_snapshots(
@@ -3118,7 +3263,7 @@ def _ensure_workspace_finalize_proof(
     assert operation.outcome_mutable is not None
     assert operation.outcome_immutable is not None
     if authority is not None:
-        _ensure_workspace_finalize_authority_binding(authority)
+        _ensure_workspace_finalize_authority_binding(authority, require_applied=True)
     requested_workspace = operation.new_project_create.workspace
     upload = authority.upload if authority is not None else None
     finalized_project = authority.outcome.project if authority is not None else None
@@ -3135,9 +3280,7 @@ def _ensure_workspace_finalize_proof(
             _patch_immutable_authority(finalized_project),
             _patch_immutable_authority(current),
             mismatch_code="core_project_patch_outcome_mismatch",
-            mismatch_message=(
-                "Core no longer matches immutable workspace finalize authority."
-            ),
+            mismatch_message=("Core no longer matches immutable workspace finalize authority."),
         )
     if not isinstance(requested_workspace, core_v1.ImportedWorkspaceSpecV1) or (
         authority is None
@@ -3166,9 +3309,7 @@ def _ensure_workspace_finalize_proof(
         _effective_applied_revision_authority(operation),
         finalized_mutable.active_revision,
         project_id=operation.core_project_id,
-        label=(
-            "durable applied patch outcome (durable workspace finalize predecessor)"
-        ),
+        label=("durable applied patch outcome (durable workspace finalize predecessor)"),
     )
     _ensure_mutable_authority_transition(
         finalized_mutable,
@@ -3328,26 +3469,23 @@ def _ensure_bound_operation(
             status=409,
         )
     if operation.workspace_upload_finalize is not None:
-        _ensure_workspace_finalize_authority_binding(operation.workspace_upload_finalize)
-        _ensure_immutable_authority_transition(
-            _create_immutable_authority(operation),
-            _patch_immutable_authority(
-                operation.workspace_upload_finalize.outcome.project
-            ),
-            allow_project_patch=True,
-            mismatch_code="core_project_create_binding_mismatch",
-            mismatch_message=(
-                "Workspace finalize changed immutable project create identity."
-            ),
-        )
+        finalize = operation.workspace_upload_finalize
+        _ensure_workspace_finalize_authority_binding(finalize)
+        if finalize.state is CoreWorkspaceUploadFinalizeStateV1.APPLIED:
+            assert finalize.outcome is not None
+            _ensure_immutable_authority_transition(
+                _create_immutable_authority(operation),
+                _patch_immutable_authority(finalize.outcome.project),
+                allow_project_patch=True,
+                mismatch_code="core_project_create_binding_mismatch",
+                mismatch_message=("Workspace finalize changed immutable project create identity."),
+            )
     _ensure_immutable_authority_transition(
         _create_immutable_authority(operation),
         _mapping_immutable_authority(mapping),
         allow_project_patch=True,
         mismatch_code="core_project_create_binding_mismatch",
-        mismatch_message=(
-            "The Core mapping changed immutable project create identity."
-        ),
+        mismatch_message=("The Core mapping changed immutable project create identity."),
     )
     return operation
 
@@ -3399,45 +3537,45 @@ def _ensure_initial_publication_authority(
         create_immutable,
         _patch_immutable_authority(descendant),
         mismatch_code="core_project_initial_publication_mismatch",
-        mismatch_message=(
-            "Core does not match the immutable project create authority."
-        ),
+        mismatch_message=("Core does not match the immutable project create authority."),
     )
     finalize = operation.workspace_upload_finalize
     finalized_project: core_v1.ProjectV1 | None = None
     if finalize is not None:
         _ensure_workspace_finalize_authority_binding(finalize)
-        candidate = finalize.outcome.project
-        if _project_identity_matches(candidate, operation.project_create):
-            _ensure_immutable_authority_transition(
-                create_immutable,
-                _patch_immutable_authority(candidate),
-                mismatch_code="core_project_initial_publication_mismatch",
-                mismatch_message=(
-                    "The durable workspace finalize changed project create authority."
-                ),
-            )
-            finalized_project = candidate
-        elif (
-            pending_patch is not None
-            and pending_patch.state is CoreProjectPatchStateV1.APPLIED
-            and pending_patch.outcome_immutable is not None
-            and _project_identity_matches(candidate, pending_patch.new_project_create)
-        ):
-            _ensure_immutable_authority_transition(
-                pending_patch.outcome_immutable,
-                _patch_immutable_authority(candidate),
-                mismatch_code="core_project_initial_publication_mismatch",
-                mismatch_message=(
-                    "The durable workspace finalize changed applied patch authority."
-                ),
-            )
-        else:
-            raise _bridge_error(
-                "core_project_initial_publication_mismatch",
-                "The durable workspace publication does not match a proven project intent.",
-                status=409,
-            )
+        if finalize.state is CoreWorkspaceUploadFinalizeStateV1.APPLIED:
+            assert finalize.outcome is not None
+            candidate = finalize.outcome.project
+            if _project_identity_matches(candidate, operation.project_create):
+                _ensure_immutable_authority_transition(
+                    create_immutable,
+                    _patch_immutable_authority(candidate),
+                    mismatch_code="core_project_initial_publication_mismatch",
+                    mismatch_message=(
+                        "The durable workspace finalize changed project create authority."
+                    ),
+                )
+                finalized_project = candidate
+            elif (
+                pending_patch is not None
+                and pending_patch.state is CoreProjectPatchStateV1.APPLIED
+                and pending_patch.outcome_immutable is not None
+                and _project_identity_matches(candidate, pending_patch.new_project_create)
+            ):
+                _ensure_immutable_authority_transition(
+                    pending_patch.outcome_immutable,
+                    _patch_immutable_authority(candidate),
+                    mismatch_code="core_project_initial_publication_mismatch",
+                    mismatch_message=(
+                        "The durable workspace finalize changed applied patch authority."
+                    ),
+                )
+            else:
+                raise _bridge_error(
+                    "core_project_initial_publication_mismatch",
+                    "The durable workspace publication does not match a proven project intent.",
+                    status=409,
+                )
 
     authority = finalized_project.active_revision if finalized_project is not None else None
     if finalized_project is not None:
@@ -3451,8 +3589,7 @@ def _ensure_initial_publication_authority(
         )
         same_content_authority = (
             finalized_project.id == operation.core_project_id == descendant.id
-            and descendant.current_project_snapshot
-            == finalized_project.current_project_snapshot
+            and descendant.current_project_snapshot == finalized_project.current_project_snapshot
             and descendant.current_workspace_snapshot
             == finalized_project.current_workspace_snapshot
             and descendant.workspace_publication == finalized_project.workspace_publication

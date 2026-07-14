@@ -23,6 +23,7 @@ from desktop.sidecar.core_bridge_v1 import (
     CoreProjectPatchStateV1,
     CoreTunnelHandleV1,
     CoreWorkspaceUploadAbortStateV1,
+    CoreWorkspaceUploadFinalizeStateV1,
     DesktopCoreBridgeErrorV1,
     DesktopCoreBridgeV1,
     map_project_create_v1,
@@ -453,11 +454,16 @@ class FakeCore:
         self.lose_patch_before_apply_once = False
         self.lose_patch_after_apply_once = False
         self.lose_finalize_before_apply_once = False
+        self.lose_finalize_after_apply_once = False
         self.lose_abort_after_apply_once = False
         self.upload: core_v1.WorkspaceUploadSessionV1 | None = None
         self.uploads: dict[str, core_v1.WorkspaceUploadSessionV1] = {}
         self.abort_requests: list[tuple[str, core_v1.WorkspaceUploadAbortV1, str, str]] = []
         self.abort_replays: dict[str, core_v1.WorkspaceUploadSessionV1] = {}
+        self.finalize_requests: list[
+            tuple[str, core_v1.WorkspaceUploadFinalizeV1, str, str, str]
+        ] = []
+        self.finalize_replays: dict[str, core_v1.WorkspaceUploadFinalizeResponseV1] = {}
         self.head = _head()
         self.block_method: str | None = None
         self.block_path: str | None = None
@@ -564,9 +570,15 @@ class FakeCore:
                 imported_patch = isinstance(
                     self.request.workspace, core_v1.ImportedWorkspaceSpecV1
                 )
+                imported_published = (
+                    imported_patch
+                    and self.upload is not None
+                    and self.upload.status is core_v1.WorkspaceUploadStatus.FINALIZED
+                )
                 patched_project = _project(
                     self.request,
-                    ready=not imported_patch,
+                    ready=not imported_patch or imported_published,
+                    imported_published=imported_published,
                     project_snapshot=self.project_snapshot,
                     task_snapshot=self.task_snapshot,
                     workspace_snapshot=self.workspace_snapshot,
@@ -637,6 +649,22 @@ class FakeCore:
         if path.endswith("/finalize") and "/workspace-uploads/" in path:
             assert self.upload is not None
             assert path.endswith(f"/workspace-uploads/{self.upload.id}/finalize")
+            finalize_request = core_v1.WorkspaceUploadFinalizeV1.model_validate_json(
+                request.content, strict=True
+            )
+            finalize_key = request.headers["Idempotency-Key"]
+            self.finalize_requests.append(
+                (
+                    self.upload.id,
+                    finalize_request,
+                    request.headers["If-Match"],
+                    request.headers["If-Project-Match"],
+                    finalize_key,
+                )
+            )
+            replay = self.finalize_replays.get(finalize_key)
+            if replay is not None:
+                return httpx.Response(201, json=replay.model_dump(mode="json"))
             if self.lose_finalize_before_apply_once:
                 self.lose_finalize_before_apply_once = False
                 raise httpx.ReadError("finalize response lost", request=request)
@@ -676,15 +704,17 @@ class FakeCore:
             )
             self.upload = finalized_upload
             self.uploads[finalized_upload.id] = finalized_upload
-            return httpx.Response(
-                201,
-                json=core_v1.WorkspaceUploadFinalizeResponseV1(
-                    project_id=CORE_PROJECT_ID,
-                    upload=finalized_upload,
-                    publication=published.workspace_publication,
-                    project=published,
-                ).model_dump(mode="json"),
+            outcome = core_v1.WorkspaceUploadFinalizeResponseV1(
+                project_id=CORE_PROJECT_ID,
+                upload=finalized_upload,
+                publication=published.workspace_publication,
+                project=published,
             )
+            self.finalize_replays[finalize_key] = outcome
+            if self.lose_finalize_after_apply_once:
+                self.lose_finalize_after_apply_once = False
+                raise httpx.ReadError("finalize response lost", request=request)
+            return httpx.Response(201, json=outcome.model_dump(mode="json"))
         if path.endswith("/abort") and "/workspace-uploads/" in path:
             upload_id = path.rsplit("/", 2)[-2]
             abort_request = core_v1.WorkspaceUploadAbortV1.model_validate_json(
@@ -981,9 +1011,7 @@ def test_local_activation_rebind_rejects_a_mismatched_projection(mutation: str) 
     assert remote is not None
     if mutation == "core_etag":
         committed = committed.model_copy(
-            update={
-                "remote": remote.model_copy(update={"etag": '"' + "d" * 64 + '"'})
-            }
+            update={"remote": remote.model_copy(update={"etag": '"' + "d" * 64 + '"'})}
         )
     elif mutation == "registry":
         committed = committed.model_copy(
@@ -1030,9 +1058,7 @@ def test_local_activation_acknowledgement_rejects_substituted_authority(
     else:
         acknowledgement = replace(
             activation,
-            core_project=activation.core_project.model_copy(
-                update={"etag": '"' + "d" * 64 + '"'}
-            ),
+            core_project=activation.core_project.model_copy(update={"etag": '"' + "d" * 64 + '"'}),
         )
 
     with pytest.raises(DesktopCoreBridgeErrorV1) as exc_info:
@@ -1531,7 +1557,12 @@ def test_workspace_finalize_rejects_project_created_at_drift_before_persistence(
     assert exc_info.value.error.code == "workspace_finalize_authority_mismatch"
     assert exc_info.value.error.http_status == 409
     assert persistence.operation is not None
-    assert persistence.operation.workspace_upload_finalize is None
+    assert persistence.operation.workspace_upload_finalize is not None
+    assert (
+        persistence.operation.workspace_upload_finalize.state
+        is CoreWorkspaceUploadFinalizeStateV1.UNKNOWN
+    )
+    assert persistence.operation.workspace_upload_finalize.outcome is None
     assert persistence.mapping is None
 
 
@@ -2588,8 +2619,7 @@ def _workspace_mutation_count(fake_core: FakeCore) -> int:
         [
             request
             for request in fake_core.calls
-            if request.method in {"POST", "PUT"}
-            and "/workspace-uploads" in request.url.path
+            if request.method in {"POST", "PUT"} and "/workspace-uploads" in request.url.path
         ]
     )
 
@@ -2667,9 +2697,7 @@ def _set_current_revision(
 def test_initial_finalize_recovery_rejects_unproven_generation_jump_before_mutation(
     changed_intent: bool,
 ) -> None:
-    original, archive, persistence, fake_core = (
-        _prepare_initial_import_finalize_mapping_crash()
-    )
+    original, archive, persistence, fake_core = _prepare_initial_import_finalize_mapping_crash()
     requested = _edited_initial_import(original) if changed_intent else original
     requested_archive = b"\1" * 1024 if changed_intent else archive
     jumped_revision = core_v1.RevisionRefV1(
@@ -2707,9 +2735,7 @@ def test_initial_finalize_recovery_rejects_unproven_generation_jump_before_mutat
 def test_initial_finalize_recovery_accepts_direct_revision_successor(
     changed_intent: bool,
 ) -> None:
-    original, archive, persistence, fake_core = (
-        _prepare_initial_import_finalize_mapping_crash()
-    )
+    original, archive, persistence, fake_core = _prepare_initial_import_finalize_mapping_crash()
     requested = _edited_initial_import(original) if changed_intent else original
     requested_archive = b"\1" * 1024 if changed_intent else archive
     successor_etag = '"' + "7" * 64 + '"'
@@ -2767,9 +2793,7 @@ def test_initial_finalize_recovery_rejects_nonmonotonic_revision_authority(
     finalize_revision: core_v1.RevisionRefV1,
     reported_revision: core_v1.RevisionRefV1,
 ) -> None:
-    project, archive, persistence, fake_core = (
-        _prepare_initial_import_finalize_mapping_crash()
-    )
+    project, archive, persistence, fake_core = _prepare_initial_import_finalize_mapping_crash()
     _replace_finalize_revision_authority(persistence, finalize_revision)
     reported_etag = '"' + "9" * 64 + '"'
     _set_current_revision(fake_core, reported_revision, etag=reported_etag)
@@ -2797,9 +2821,7 @@ def test_initial_finalize_recovery_rejects_nonmonotonic_revision_authority(
 
 
 def test_initial_finalize_recovery_rejects_tampered_finalize_outcome() -> None:
-    project, archive, persistence, fake_core = (
-        _prepare_initial_import_finalize_mapping_crash()
-    )
+    project, archive, persistence, fake_core = _prepare_initial_import_finalize_mapping_crash()
     operation = persistence.operation
     assert operation is not None
     authority = operation.workspace_upload_finalize
@@ -2845,9 +2867,7 @@ def test_initial_finalize_recovery_rejects_tampered_finalize_outcome() -> None:
 
 
 def test_initial_finalize_recovery_rejects_outcome_revision_substitution_matching_core() -> None:
-    project, archive, persistence, fake_core = (
-        _prepare_initial_import_finalize_mapping_crash()
-    )
+    project, archive, persistence, fake_core = _prepare_initial_import_finalize_mapping_crash()
     jumped_revision = core_v1.RevisionRefV1(
         id="revision-2",
         project_id=CORE_PROJECT_ID,
@@ -2892,9 +2912,7 @@ def test_workspace_finalize_authority_binds_request_and_outcome_independently() 
     assert authority is not None
     substituted_request = core_v1.WorkspaceUploadFinalizeV1(content_sha256="9" * 64)
     substituted_project = core_v1.ProjectV1.model_validate(
-        authority.outcome.project.model_copy(
-            update={"active_revision": REVISION_1}
-        ).model_dump(),
+        authority.outcome.project.model_copy(update={"active_revision": REVISION_1}).model_dump(),
         strict=True,
     )
     substituted_outcome = core_v1.WorkspaceUploadFinalizeResponseV1.model_validate(
@@ -2913,9 +2931,7 @@ def test_workspace_finalize_authority_binds_request_and_outcome_independently() 
 
 
 def test_initial_finalize_recovery_rejects_request_substitution() -> None:
-    project, archive, persistence, fake_core = (
-        _prepare_initial_import_finalize_mapping_crash()
-    )
+    project, archive, persistence, fake_core = _prepare_initial_import_finalize_mapping_crash()
     operation = persistence.operation
     assert operation is not None
     authority = operation.workspace_upload_finalize
@@ -2953,9 +2969,7 @@ def test_initial_finalize_recovery_rejects_request_substitution() -> None:
 
 
 def test_initial_finalize_recovery_rejects_record_without_outcome_binding() -> None:
-    project, archive, persistence, fake_core = (
-        _prepare_initial_import_finalize_mapping_crash()
-    )
+    project, archive, persistence, fake_core = _prepare_initial_import_finalize_mapping_crash()
     operation = persistence.operation
     assert operation is not None
     authority = operation.workspace_upload_finalize
@@ -3212,8 +3226,8 @@ def test_finalize_after_crash_rejects_nonmonotonic_revision_authority(
     finalize_revision: core_v1.RevisionRefV1,
     reported_revision: core_v1.RevisionRefV1,
 ) -> None:
-    edited, archive, persistence, fake_core, mapping_o = (
-        _prepare_finalized_import_patch_crash(finalize_revision=finalize_revision)
+    edited, archive, persistence, fake_core, mapping_o = _prepare_finalized_import_patch_crash(
+        finalize_revision=finalize_revision
     )
     fake_core.active_revision = reported_revision
     reported_etag = '"' + "9" * 64 + '"'
@@ -3242,8 +3256,8 @@ def test_finalize_after_crash_rejects_nonmonotonic_revision_authority(
 
 
 def test_finalize_after_crash_accepts_direct_revision_successor() -> None:
-    edited, archive, persistence, fake_core, mapping_o = (
-        _prepare_finalized_import_patch_crash(finalize_revision=REVISION)
+    edited, archive, persistence, fake_core, mapping_o = _prepare_finalized_import_patch_crash(
+        finalize_revision=REVISION
     )
     successor = core_v1.RevisionRefV1(
         id="revision-1",
@@ -3578,9 +3592,7 @@ def test_finalized_import_patch_recovery_commits_a_then_patches_b_from_latest_au
     assert mapping_a is not None
     assert recovered_a.core_project.status is core_v1.ProjectStatus.READY
     assert recovered_a.core_project.workspace_publication == finalized_publication
-    assert mapping_a.request_sha256 == bridge_module._model_digest(
-        map_project_create_v1(edited_a)
-    )
+    assert mapping_a.request_sha256 == bridge_module._model_digest(map_project_create_v1(edited_a))
     assert mapping_a.project_snapshot == recovered_a.core_project.current_project_snapshot
     assert mapping_a.workspace_snapshot == finalized_publication.workspace_snapshot
     assert mapping_a.project_etag == successor_etag
