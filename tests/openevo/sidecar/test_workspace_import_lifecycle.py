@@ -65,6 +65,21 @@ def _import_source(
     action_id: str,
     project_id: str | None = None,
 ) -> dict[str, object]:
+    return _import_pending(
+        client,
+        source_root,
+        action_id=action_id,
+        project_id=project_id,
+    )["source"]
+
+
+def _import_pending(
+    client: TestClient,
+    source_root: Path,
+    *,
+    action_id: str,
+    project_id: str | None = None,
+) -> dict[str, object]:
     status = source_root.stat()
     request: dict[str, object] = {
         "schema_version": "1",
@@ -82,7 +97,37 @@ def _import_source(
         json=request,
     )
     assert response.status_code == 201
-    return response.json()
+    payload = response.json()
+    assert set(payload) == {"schema_version", "source", "lease_token"}
+    assert payload["schema_version"] == "1"
+    assert isinstance(payload["source"], dict)
+    assert isinstance(payload["lease_token"], str)
+    return payload
+
+
+def _discard_pending(
+    client: TestClient,
+    pending: dict[str, object],
+    *,
+    action_id: str,
+    project_id: str | None = None,
+) -> HttpResponse:
+    source = pending["source"]
+    assert isinstance(source, dict)
+    import_ref = source["import_ref"]
+    request: dict[str, object] = {
+        "schema_version": "1",
+        "action_id": action_id,
+        "import_ref": import_ref,
+        "lease_token": pending["lease_token"],
+    }
+    if project_id is not None:
+        request["project_id"] = project_id
+    return client.post(
+        "/openevo-native/workspace-imports/discard",
+        headers=HANDOFF_HEADERS,
+        json=request,
+    )
 
 
 def _create_project(
@@ -120,6 +165,101 @@ def _import_directory(config_root: Path, source: dict[str, object]) -> Path:
         / "workspace-imports"
         / import_id
     )
+
+
+def test_picker_discard_and_failed_save_remove_pending_imports(tmp_path: Path) -> None:
+    config_root = tmp_path / "config"
+    static_root = _static_root(tmp_path / "static")
+    source_root = tmp_path / "research"
+    source_root.mkdir()
+    (source_root / "notes.txt").write_text("observation", encoding="utf-8")
+
+    with TestClient(_app(config_root, static_root)) as client:
+        action_id = "native-source-failed-save-0001"
+        pending = _import_pending(client, source_root, action_id=action_id)
+        source = pending["source"]
+        assert isinstance(source, dict)
+        import_directory = _import_directory(config_root, source)
+        failed = client.post(
+            "/desktop/v1/projects",
+            headers={**SESSION_HEADERS, "Idempotency-Key": "failed-project-save-0001"},
+            json={
+                "name": "Missing profile",
+                "profile_id": "profile-does-not-exist",
+                "task": {"title": "Design", "objective": "Cannot commit."},
+                "source": source,
+                "execution": {
+                    "mode": "codex_subscription_transcript",
+                    "codex_model": "gpt-5",
+                },
+                "evolution": {"targets": {}},
+            },
+        )
+        assert failed.status_code >= 400
+        assert import_directory.is_dir()
+
+        discarded = _discard_pending(client, pending, action_id=action_id)
+        assert discarded.status_code == 204
+        assert not import_directory.exists()
+        assert _discard_pending(client, pending, action_id=action_id).status_code == 204
+
+
+def test_discard_rereads_references_after_a_concurrent_project_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_root = tmp_path / "config"
+    static_root = _static_root(tmp_path / "static")
+    source_root = tmp_path / "research"
+    source_root.mkdir()
+    (source_root / "notes.txt").write_text("observation", encoding="utf-8")
+    app = _app(config_root, static_root)
+
+    with TestClient(app) as client:
+        profile = _create_profile(client)
+        action_id = "native-source-concurrent-commit-0001"
+        pending = _import_pending(client, source_root, action_id=action_id)
+        source = pending["source"]
+        assert isinstance(source, dict)
+        import_directory = _import_directory(config_root, source)
+        provider = app.state.desktop_release_provider
+        original_adopt = provider._adopt_project_source
+        commit_durable = threading.Event()
+        allow_adopt = threading.Event()
+
+        def delayed_adopt(source_to_adopt, *, project_id: str) -> None:
+            commit_durable.set()
+            assert allow_adopt.wait(timeout=5)
+            original_adopt(source_to_adopt, project_id=project_id)
+
+        monkeypatch.setattr(provider, "_adopt_project_source", delayed_adopt)
+        create_responses: list[HttpResponse] = []
+        discard_responses: list[HttpResponse] = []
+
+        creator = threading.Thread(
+            target=lambda: create_responses.append(
+                _create_project(client, str(profile["profile_id"]), source)
+            )
+        )
+        creator.start()
+        assert commit_durable.wait(timeout=5)
+        discarder = threading.Thread(
+            target=lambda: discard_responses.append(
+                _discard_pending(client, pending, action_id=action_id)
+            )
+        )
+        discarder.start()
+        assert not allow_adopt.wait(timeout=0.1)
+        allow_adopt.set()
+        creator.join(timeout=5)
+        discarder.join(timeout=5)
+
+        assert not creator.is_alive()
+        assert not discarder.is_alive()
+        assert len(create_responses) == 1
+        assert len(discard_responses) == 1
+        assert discard_responses[0].status_code == 204
+        assert import_directory.is_dir()
 
 
 def test_project_source_replacement_and_delete_release_committed_imports(
@@ -288,11 +428,13 @@ def test_startup_reconciliation_discards_orphans_and_retains_project_sources(
 
     with TestClient(_app(config_root, static_root)) as client:
         profile = _create_profile(client)
-        retained = _import_source(
+        retained_pending = _import_pending(
             client,
             source_root,
             action_id="native-source-retained-0001",
         )
+        retained = retained_pending["source"]
+        assert isinstance(retained, dict)
         project = _create_project(client, str(profile["profile_id"]), retained)
         (source_root / "new-observation.txt").write_text("changed", encoding="utf-8")
         orphan = _import_source(
@@ -313,6 +455,14 @@ def test_startup_reconciliation_discards_orphans_and_retains_project_sources(
         )
         assert fetched.status_code == 200
         assert fetched.json()["source"] == retained
+        assert (
+            _discard_pending(
+                client,
+                retained_pending,
+                action_id="native-source-retained-0001",
+            ).status_code
+            == 204
+        )
         assert retained_directory.is_dir()
         assert not orphan_directory.exists()
 

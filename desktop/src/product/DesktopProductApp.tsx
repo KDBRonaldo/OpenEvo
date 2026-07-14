@@ -71,7 +71,11 @@ type ActionAttemptResult = {
   readonly error: unknown | null;
   readonly refreshedSnapshot: DesktopProductSnapshot | null;
 };
-type SaveAttemptResult = { readonly saved: boolean; readonly replaceActionId: boolean };
+type SaveAttemptResult = {
+  readonly saved: boolean;
+  readonly replaceActionId: boolean;
+  readonly pendingSourceOutcome: "adopted" | "discarded" | null;
+};
 type ProfileSaveIntent = {
   readonly canonicalPayload: string;
   readonly input: ProfileCreateV1;
@@ -354,12 +358,17 @@ export function DesktopProductApp({
           busy={actionState === "working"}
           onClose={() => setSettingsOpen(false)}
           onRetryCapabilities={() => refresh()}
-          onSave={async (input, actionId) => {
+          onSave={async (input, actionId, pendingSourceActionId) => {
             const requestEpoch = snapshot.stream.epoch;
             const requestEtag = project && !creatingProject ? project.etag : null;
+            let pendingSourceOutcome: SaveAttemptResult["pendingSourceOutcome"] = null;
             const result = await act(async () => {
               if (project && !creatingProject) {
                 await provider.updateProject(project.project_id, input, resourceIntent(snapshot, project.etag, actionId));
+                if (pendingSourceActionId) {
+                  await provider.settleProjectSource(pendingSourceActionId, "adopt");
+                  pendingSourceOutcome = "adopted";
+                }
               } else {
                 if (!profile) throw new DesktopProductUserError("Add a remote workspace before creating a project.");
                 const created = await provider.createProject({
@@ -370,21 +379,35 @@ export function DesktopProductApp({
                   execution: input.execution ?? selfDeployedExecution("Qwen/Qwen3-8B"),
                   evolution: input.evolution ?? { targets: {} },
                 }, mutationIntent(snapshot, actionId));
+                if (pendingSourceActionId) {
+                  await provider.settleProjectSource(pendingSourceActionId, "adopt");
+                  pendingSourceOutcome = "adopted";
+                }
                 await provider.activateProject(created.project_id, resourceIntent(snapshot, created.etag, `${actionId}-activate`));
                 setSelectedProjectId(created.project_id);
               }
             });
+            if (pendingSourceActionId && pendingSourceOutcome === null) {
+              try {
+                await provider.settleProjectSource(pendingSourceActionId, "discard");
+                pendingSourceOutcome = "discarded";
+              } catch {
+                // The native host retains failed settles for retry or startup recovery.
+              }
+            }
             if (result.saved) setSettingsOpen(false);
             return {
               saved: result.saved,
               replaceActionId: requestPreconditionChanged(result, requestEpoch, requestEtag === null ? null : { kind: "project", id: project!.project_id, etag: requestEtag }),
+              pendingSourceOutcome,
             };
           }}
-          onSelectSource={() => provider.selectProjectSource({
-            ...mutationIntent(snapshot),
+          onSelectSource={(actionId) => provider.selectProjectSource({
+            ...mutationIntent(snapshot, actionId),
             kind: "native_folder_snapshot",
             ...(project && !creatingProject ? { projectId: project.project_id } : {}),
           })}
+          onSettleSource={(actionId, outcome) => provider.settleProjectSource(actionId, outcome)}
           onSyncSource={project?.source.kind === "native_folder_snapshot" ? () => act(() => provider.syncProjectWorkspace(project.project_id, resourceIntent(snapshot, project.etag))).then((result) => result.saved) : undefined}
         />
       ) : null}
@@ -1062,6 +1085,7 @@ function SettingsDrawer({
   onRetryCapabilities,
   onSave,
   onSelectSource,
+  onSettleSource,
   onSyncSource,
 }: {
   project: ProjectV1 | null;
@@ -1071,8 +1095,13 @@ function SettingsDrawer({
   busy: boolean;
   onClose: () => void;
   onRetryCapabilities: () => Promise<unknown>;
-  onSave: (input: ProjectPatchV1, actionId: string) => Promise<SaveAttemptResult>;
-  onSelectSource: () => Promise<ProjectSourceV1>;
+  onSave: (
+    input: ProjectPatchV1,
+    actionId: string,
+    pendingSourceActionId: string | null,
+  ) => Promise<SaveAttemptResult>;
+  onSelectSource: (actionId: string) => Promise<ProjectSourceV1>;
+  onSettleSource: (actionId: string, outcome: "adopt" | "discard") => Promise<void>;
   onSyncSource?: () => Promise<boolean>;
 }) {
   const [name, setName] = useState(project?.name ?? "New research project");
@@ -1090,14 +1119,26 @@ function SettingsDrawer({
   const sourceSelectionGeneration = useRef(0);
   const sourceSelectionInFlight = useRef(false);
   const sourceSelectionMounted = useRef(true);
+  const pendingSourceActionId = useRef<string | null>(null);
+  const onSettleSourceRef = useRef(onSettleSource);
+  onSettleSourceRef.current = onSettleSource;
   const invalidateSourceSelection = useCallback(() => {
     // Invalidation suppresses state application; only the request's finally releases the physical lock.
     sourceSelectionGeneration.current += 1;
   }, []);
+  const takePendingSourceAction = useCallback(() => {
+    const actionId = pendingSourceActionId.current;
+    pendingSourceActionId.current = null;
+    return actionId;
+  }, []);
+  const settlePendingSource = useCallback(async (outcome: "adopt" | "discard") => {
+    const actionId = takePendingSourceAction();
+    if (actionId !== null) await onSettleSource(actionId, outcome);
+  }, [onSettleSource, takePendingSourceAction]);
   const close = useCallback(() => {
     invalidateSourceSelection();
-    onClose();
-  }, [invalidateSourceSelection, onClose]);
+    void settlePendingSource("discard").finally(onClose);
+  }, [invalidateSourceSelection, onClose, settlePendingSource]);
   const guardedClose = useGuardedDrawerClose(dirty, close);
   const requestClose = () => {
     invalidateSourceSelection();
@@ -1114,8 +1155,9 @@ function SettingsDrawer({
   const capabilityRetryable = capabilityMatchesDraft && capability?.status === "unavailable";
   const markDirty = () => { saveActionId.current = newActionId(); setDirty(true); };
   const change = (setter: (value: string) => void) => (event: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement>) => { setter(event.target.value); markDirty(); };
-  const reset = () => {
+  const reset = async () => {
     invalidateSourceSelection();
+    await settlePendingSource("discard");
     setName(project?.name ?? "New research project");
     setTitle(project?.task.title ?? "Research task");
     setObjective(project?.task.objective ?? "");
@@ -1134,12 +1176,23 @@ function SettingsDrawer({
     sourceSelectionGeneration.current = generation;
     setSelectingSource(true);
     setSourceError(null);
+    const actionId = newActionId();
     try {
-      const selected = await onSelectSource();
-      if (sourceSelectionGeneration.current !== generation) return;
+      await settlePendingSource("discard");
+      const selected = await onSelectSource(actionId);
+      if (sourceSelectionGeneration.current !== generation) {
+        await onSettleSource(actionId, "discard");
+        return;
+      }
+      pendingSourceActionId.current = actionId;
       setSource(selected);
       markDirty();
     } catch (error) {
+      try {
+        await onSettleSource(actionId, "discard");
+      } catch {
+        // The native host keeps a failed settle pending for retry or startup recovery.
+      }
       if (sourceSelectionGeneration.current !== generation) return;
       if (!isWorkspaceSelectionCancelled(error)) setSourceError(userMessage(error));
     } finally {
@@ -1152,8 +1205,10 @@ function SettingsDrawer({
     return () => {
       sourceSelectionMounted.current = false;
       sourceSelectionGeneration.current += 1;
+      const actionId = takePendingSourceAction();
+      if (actionId !== null) void onSettleSourceRef.current(actionId, "discard");
     };
-  }, []);
+  }, [takePendingSourceAction]);
   const rows = evolutionTargetRows(modeCapabilities, evolution);
   const valid = name.trim().length > 0
     && title.trim().length > 0
@@ -1183,7 +1238,7 @@ function SettingsDrawer({
           <section className="form-section">
             <h3>Research source</h3>
             <div className="segmented-control wide" role="tablist" aria-label="Research source">
-              <button type="button" role="tab" aria-selected={source.kind === "scratch"} tabIndex={source.kind === "scratch" ? 0 : -1} className={source.kind === "scratch" ? "active" : ""} disabled={selectingSource || busy} onClick={() => { invalidateSourceSelection(); setSource({ kind: "scratch", display_name: "New workspace", import_ref: null }); setSourceError(null); markDirty(); }}>Scratch</button>
+              <button type="button" role="tab" aria-selected={source.kind === "scratch"} tabIndex={source.kind === "scratch" ? 0 : -1} className={source.kind === "scratch" ? "active" : ""} disabled={selectingSource || busy} onClick={() => { invalidateSourceSelection(); void settlePendingSource("discard").then(() => { setSource({ kind: "scratch", display_name: "New workspace", import_ref: null }); setSourceError(null); markDirty(); }); }}>Scratch</button>
               <button type="button" role="tab" aria-selected={source.kind === "native_folder_snapshot"} tabIndex={source.kind === "native_folder_snapshot" ? 0 : -1} className={source.kind === "native_folder_snapshot" ? "active" : ""} disabled={selectingSource || busy} onClick={() => void selectSource()}>{selectingSource ? "Selecting..." : "Folder snapshot"}</button>
             </div>
             <div className="source-summary"><FolderOpen size={17} /><span><strong>{source.display_name}</strong><small>{source.kind === "scratch" ? "A new managed workspace will be created." : "A native snapshot reference is ready."}</small></span></div>
@@ -1235,13 +1290,21 @@ function SettingsDrawer({
           </section>
         </div>
         {guardedClose.confirming ? <DiscardChangesPrompt onKeep={guardedClose.keepEditing} onDiscard={guardedClose.discard} /> : null}
-        <div className="drawer-footer"><button className="secondary-button" type="button" onClick={reset} disabled={!dirty || busy || selectingSource} title={!dirty ? "No unsaved changes" : "Undo changes"}><RotateCcw size={15} /> Undo</button><button className="primary-button" type="button" disabled={!valid || busy || selectingSource || (project !== null && !dirty)} title={!profileId ? "Add a remote workspace first" : !valid ? "Complete all required fields and valid method settings" : project && !dirty ? "No unsaved changes" : "Save project settings"} onClick={() => { invalidateSourceSelection(); void onSave({
+        <div className="drawer-footer"><button className="secondary-button" type="button" onClick={() => void reset()} disabled={!dirty || busy || selectingSource} title={!dirty ? "No unsaved changes" : "Undo changes"}><RotateCcw size={15} /> Undo</button><button className="primary-button" type="button" disabled={!valid || busy || selectingSource || (project !== null && !dirty)} title={!profileId ? "Add a remote workspace first" : !valid ? "Complete all required fields and valid method settings" : project && !dirty ? "No unsaved changes" : "Save project settings"} onClick={() => { invalidateSourceSelection(); const pendingActionId = pendingSourceActionId.current; void onSave({
           name: name.trim(),
           task: { title: title.trim(), objective: objective.trim() },
           source,
           execution: mode === "self-deployed" ? selfDeployedExecution(activeModel.trim()) : subscriptionExecution(activeModel.trim()),
           evolution: { targets: evolution },
-        }, saveActionId.current).then((result) => { if (result.replaceActionId) saveActionId.current = newActionId(); }); }}><Save size={15} /> {busy ? "Saving..." : "Save"}</button></div>
+        }, saveActionId.current, pendingActionId).then((result) => {
+          if (result.replaceActionId) saveActionId.current = newActionId();
+          if (pendingActionId !== null && result.pendingSourceOutcome !== null && pendingSourceActionId.current === pendingActionId) {
+            pendingSourceActionId.current = null;
+            if (result.pendingSourceOutcome === "discarded") {
+              setSource(project?.source ?? { kind: "scratch", display_name: "New workspace", import_ref: null });
+            }
+          }
+        }); }}><Save size={15} /> {busy ? "Saving..." : "Save"}</button></div>
       </aside>
     </div>
   );

@@ -15,6 +15,7 @@ import { DESKTOP_PRODUCT_RELEASE_CONTRACT } from "./releaseContract";
 export interface ReleaseNativeBridge {
   bootstrap(): Promise<unknown>;
   selectProjectSource(intent: ProjectSourceSelectionIntent): Promise<unknown>;
+  settleProjectSource(actionId: string, outcome: "adopt" | "discard"): Promise<unknown>;
   configureCredential(
     profileId: string,
     slotKind: RemoteProfileV1["credential_slots"][number]["kind"],
@@ -27,6 +28,7 @@ export interface ReleaseProviderAdapterContext {
   readonly client: DesktopApiClientV1;
   readonly native: {
     selectProjectSource(intent: ProjectSourceSelectionIntent): Promise<ProjectSourceV1>;
+    settleProjectSource(actionId: string, outcome: "adopt" | "discard"): Promise<void>;
     configureCredential(
       profileId: string,
       slotKind: RemoteProfileV1["credential_slots"][number]["kind"],
@@ -48,6 +50,10 @@ const tauriNativeBridge: ReleaseNativeBridge = {
     kind: intent.kind,
     actionId: intent.actionId,
     ...(intent.projectId === undefined ? {} : { projectId: intent.projectId }),
+  }),
+  settleProjectSource: (actionId, outcome) => invoke("settle_project_source", {
+    actionId,
+    outcome,
   }),
   configureCredential: (profileId, slotKind, etag, actionId) => invoke("configure_credential", {
     profileId,
@@ -85,6 +91,9 @@ export async function createReleaseDesktopProductProvider(
           throw new DesktopContractError("Native project source does not match the requested kind");
         }
         return source;
+      },
+      settleProjectSource: async (actionId, outcome) => {
+        await native.settleProjectSource(actionId, outcome);
       },
       configureCredential: async (profileId, slotKind, etag, actionId) => {
         const profile = remoteProfileV1Schema.parse(

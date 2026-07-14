@@ -573,14 +573,16 @@ def test_native_workspace_route_is_private_idempotent_and_project_bound(tmp_path
                 **request,
                 "action_id": "native-source-action-0002",
                 "project_id": project_id_for_native_import(
-                    imported.json()["import_ref"]["import_id"]
+                    imported.json()["source"]["import_ref"]["import_id"]
                 ),
             },
         )
 
         assert imported.status_code == replayed.status_code == reselected.status_code == 201
         assert imported.json() == replayed.json() == reselected.json()
-        source = imported.json()
+        payload = imported.json()
+        assert set(payload) == {"schema_version", "source", "lease_token"}
+        source = payload["source"]
         assert source["kind"] == "native_folder_snapshot"
         assert source["display_name"] == "research-data"
         assert source["import_ref"]["import_id"].startswith("workspace-import-")

@@ -19,6 +19,7 @@ import pytest
 from desktop.sidecar.contracts.v1 import WorkspaceImportRefV1
 from desktop.sidecar import workspace_imports as workspace_imports_module
 from desktop.sidecar.workspace_imports import (
+    PendingWorkspaceImport,
     WorkspaceArchiveValidationError,
     WorkspaceImportError,
     WorkspaceImportIntegrityError,
@@ -610,6 +611,81 @@ def test_retained_count_and_archive_byte_limits_are_exact_boundaries(tmp_path: P
     with pytest.raises(WorkspaceImportError, match="retained archive byte"):
         _ingest(byte_store, tmp_path, archive)
     assert len(list(byte_root.iterdir())) == 2
+
+
+def test_pending_import_lease_adopts_and_discards_idempotently(tmp_path: Path) -> None:
+    root = tmp_path / "imports"
+    store = WorkspaceImportStore(root)
+    ownership = _new_ownership()
+    source = _source(tmp_path, _simple_archive())
+
+    with source.open("rb", buffering=0) as stream:
+        pending = store.ingest_pending(stream, ownership=ownership)
+
+    assert isinstance(pending, PendingWorkspaceImport)
+    assert pending.import_ref.model_dump().keys() == {
+        "import_id",
+        "content_sha256",
+        "byte_size",
+        "entry_count",
+        "extracted_byte_size",
+    }
+    assert len(pending.lease_token) == 64
+    assert _stored_directory(root, pending.import_ref).is_dir()
+    with pytest.raises(WorkspaceImportIntegrityError, match="lease token"):
+        store.discard_pending(
+            pending.import_ref,
+            ownership=ownership,
+            lease_token="0" * 64,
+        )
+
+    store.adopt_pending(pending.import_ref, ownership=ownership)
+    store.adopt_pending(pending.import_ref, ownership=ownership)
+    store.discard_pending(
+        pending.import_ref,
+        ownership=ownership,
+        lease_token=pending.lease_token,
+    )
+    assert _stored_directory(root, pending.import_ref).is_dir()
+
+    second_ownership = _new_ownership()
+    with source.open("rb", buffering=0) as stream:
+        abandoned = store.ingest_pending(stream, ownership=second_ownership)
+    store.discard_pending(
+        abandoned.import_ref,
+        ownership=second_ownership,
+        lease_token=abandoned.lease_token,
+    )
+    store.discard_pending(
+        abandoned.import_ref,
+        ownership=second_ownership,
+        lease_token=abandoned.lease_token,
+    )
+    assert not _stored_directory(root, abandoned.import_ref).exists()
+
+
+def test_pending_import_capacity_is_bounded_independently(tmp_path: Path) -> None:
+    archive = _simple_archive()
+    source = _source(tmp_path, archive)
+    store = WorkspaceImportStore(
+        tmp_path / "imports",
+        max_retained_imports=3,
+        max_retained_archive_bytes=3 * len(archive),
+        max_pending_imports=1,
+        max_pending_archive_bytes=len(archive),
+    )
+    first_ownership = _new_ownership()
+    with source.open("rb", buffering=0) as stream:
+        first = store.ingest_pending(stream, ownership=first_ownership)
+
+    with source.open("rb", buffering=0) as stream:
+        with pytest.raises(WorkspaceImportError, match="pending import count"):
+            store.ingest_pending(stream, ownership=_new_ownership())
+
+    store.adopt_pending(first.import_ref, ownership=first_ownership)
+    with source.open("rb", buffering=0) as stream:
+        second = store.ingest_pending(stream, ownership=_new_ownership())
+    assert second.import_ref != first.import_ref
 
 
 def test_retained_limits_reserve_complete_reconciliation_cost(tmp_path: Path) -> None:

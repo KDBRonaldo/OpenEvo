@@ -6,6 +6,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 import errno
 import hashlib
+from itertools import islice
 import os
 from pathlib import Path
 import re
@@ -22,6 +23,7 @@ from openevo.backend.contracts.v1.models import (
 
 
 _BLOCK_SIZE = 512
+_STAT_BLOCK_BYTES = 512
 _COPY_BYTES = 1024 * 1024
 _MAX_FILE_BYTES = 0o77777777777
 _MAX_PATH_BYTES = 256
@@ -183,6 +185,20 @@ def _seek_extent(descriptor: int, offset: int, whence: int) -> int:
 def _require_non_sparse_file(descriptor: int, size: int) -> None:
     if size == 0:
         return
+    status = os.fstat(descriptor)
+    blocks = getattr(status, "st_blocks", None)
+    if status.st_size != size:
+        raise NativeWorkspaceArchiveError("workspace file changed during sparse-file detection")
+    if type(blocks) is not int or blocks < 0:
+        raise NativeWorkspaceArchiveError(
+            "workspace file allocation metadata is unavailable; sparse or compressed files "
+            "are unsupported"
+        )
+    if blocks * _STAT_BLOCK_BYTES < size:
+        raise NativeWorkspaceArchiveError(
+            "workspace file allocation cannot prove a fully allocated file; sparse or "
+            "compressed files are unsupported"
+        )
     seek_data = getattr(os, "SEEK_DATA", None)
     seek_hole = getattr(os, "SEEK_HOLE", None)
     if type(seek_data) is not int or type(seek_hole) is not int:
@@ -257,6 +273,7 @@ def _scan_directory(
     entries: list[_Entry],
     seen_directories: set[tuple[int, int]],
     extracted_bytes: list[int],
+    entry_budget: list[int],
 ) -> None:
     before = os.fstat(descriptor)
     directory_identity = _Identity.from_stat(before)
@@ -266,13 +283,14 @@ def _scan_directory(
     seen_directories.add(directory_key)
     try:
         with os.scandir(descriptor) as iterator:
-            children = list(iterator)
+            children = list(islice(iterator, entry_budget[0] + 1))
     except OSError as exc:
         raise NativeWorkspaceArchiveError("workspace directory cannot be enumerated") from exc
+    if len(children) > entry_budget[0]:
+        raise NativeWorkspaceArchiveError("workspace entry budget exceeded")
+    entry_budget[0] -= len(children)
     children.sort(key=lambda entry: os.fsencode(entry.name))
     for child in children:
-        if len(entries) >= MAX_WORKSPACE_ENTRIES:
-            raise NativeWorkspaceArchiveError("workspace entry budget exceeded")
         if type(child.name) is not str:
             raise NativeWorkspaceArchiveError("workspace path is not valid UTF-8")
         name = _safe_component(child.name)
@@ -304,6 +322,7 @@ def _scan_directory(
                     entries=entries,
                     seen_directories=seen_directories,
                     extracted_bytes=extracted_bytes,
+                    entry_budget=entry_budget,
                 )
                 if not _same_identity(os.fstat(child_descriptor), identity):
                     raise NativeWorkspaceArchiveError("workspace directory changed")
@@ -353,6 +372,7 @@ def _scan(root_descriptor: int) -> tuple[tuple[_Entry, ...], int]:
         entries=entries,
         seen_directories=set(),
         extracted_bytes=extracted_bytes,
+        entry_budget=[MAX_WORKSPACE_ENTRIES],
     )
     entries.sort(key=lambda entry: entry.header_path)
     if len({entry.logical_path for entry in entries}) != len(entries):

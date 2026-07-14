@@ -50,6 +50,7 @@ type CredentialSlotKind = RemoteProfileV1["credential_slots"][number]["kind"];
 
 export interface LocalApiNativeBridge {
   selectProjectSource(intent: ProjectSourceSelectionIntent): Promise<unknown>;
+  settleProjectSource(actionId: string, outcome: "adopt" | "discard"): Promise<unknown>;
   configureCredential(profileId: string, slotKind: CredentialSlotKind, etag: string, actionId: string): Promise<unknown>;
 }
 
@@ -259,6 +260,13 @@ export class LocalApiDesktopProductProvider implements DesktopProductProvider {
     const source = projectSourceV1Schema.parse(await this.native.selectProjectSource(intent));
     assertProjectSource(source, intent.kind);
     return source;
+  }
+
+  async settleProjectSource(actionId: string, outcome: "adopt" | "discard"): Promise<void> {
+    if (actionId.length < 16 || actionId.length > 256 || actionId.trim() !== actionId) {
+      throw new DesktopContractError("Native project source action identity is invalid");
+    }
+    await this.native.settleProjectSource(actionId, outcome);
   }
 
   async startRun(intent: ProductRunIntent): Promise<RunV1> {

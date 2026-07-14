@@ -144,6 +144,7 @@ export interface DesktopProductProvider {
   activateProject(projectId: string, intent: ProductResourceMutationIntent): Promise<LocalOperationV1>;
   syncProjectWorkspace(projectId: string, intent: ProductResourceMutationIntent): Promise<LocalOperationV1>;
   selectProjectSource(intent: ProjectSourceSelectionIntent): Promise<ProjectSourceV1>;
+  settleProjectSource(actionId: string, outcome: "adopt" | "discard"): Promise<void>;
   startRun(intent: ProductRunIntent): Promise<RunV1>;
   cancelRun(runId: string, intent: ProductResourceMutationIntent): Promise<RunV1>;
   getArtifactContent(artifactId: string): Promise<ArtifactContentV1>;
@@ -186,6 +187,7 @@ export const unavailableDesktopProductProvider: DesktopProductProvider = {
   activateProject: unavailable,
   syncProjectWorkspace: unavailable,
   selectProjectSource: unavailable,
+  settleProjectSource: unavailable,
   startRun: unavailable,
   cancelRun: unavailable,
   getArtifactContent: unavailable,

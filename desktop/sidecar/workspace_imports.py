@@ -43,6 +43,7 @@ _ARCHIVE_NAME = "archive.tar"
 _METADATA_MAX_BYTES = 4096
 _MAX_FLAT_CLEANUP_NODES = 8
 _ARCHIVE_TOKEN_XATTR = "user.openevo.workspace-import-token"
+_PENDING_LEASE_XATTR = "user.openevo.workspace-import-pending-lease"
 _ROOT_TOKEN_XATTR = "user.openevo.workspace-import-root-token"
 _IMPORT_ID_PREFIX = "workspace-import-"
 _TEMP_PREFIX = ".workspace-import-tmp-"
@@ -58,12 +59,15 @@ _INITIALIZATION_TEMP_PREFIX = ".openevo-workspace-import-init-tmp-"
 _ROOT_AUTH_DOMAIN = b"openevo.workspace-import.root.v2\0"
 _METADATA_AUTH_DOMAIN = b"openevo.workspace-import.metadata.v2\0"
 _BOOTSTRAP_AUTH_DOMAIN = b"openevo.workspace-import.bootstrap.v1\0"
+_PENDING_LEASE_DOMAIN = b"openevo.workspace-import.pending-lease.v1\0"
 _CREATION_LOCK_CONTENT = b"openevo.workspace-import.creation-lock.v1\n"
 _IMPORT_ID_RE = re.compile(r"^workspace-import-[0-9a-f]{48}$")
 _DEFAULT_RECONCILE_MAX_NODES = 300_000
 _DEFAULT_RECONCILE_MAX_BYTES = 64 * 1024 * 1024 * 1024
 _DEFAULT_MAX_RETAINED_IMPORTS = 10_000
 _DEFAULT_MAX_RETAINED_ARCHIVE_BYTES = 24 * 1024 * 1024 * 1024
+_DEFAULT_MAX_PENDING_IMPORTS = 64
+_DEFAULT_MAX_PENDING_ARCHIVE_BYTES = MAX_WORKSPACE_UPLOAD_BYTES
 _IMPORT_ID_BYTES = len(os.fsencode(f"{_IMPORT_ID_PREFIX}{'0' * 48}"))
 _TEMP_NAME_BYTES = len(os.fsencode(f"{_TEMP_PREFIX}{'0' * 48}"))
 _CHILD_NAME_BYTES = len(os.fsencode(_ARCHIVE_NAME)) + len(os.fsencode(_METADATA_NAME))
@@ -132,6 +136,14 @@ class WorkspaceImportOwnership:
 
 
 @dataclass(frozen=True, slots=True)
+class PendingWorkspaceImport:
+    """Private native-host lease paired with the public opaque import reference."""
+
+    import_ref: WorkspaceImportRefV1
+    lease_token: str
+
+
+@dataclass(frozen=True, slots=True)
 class _FileIdentity:
     device: int
     inode: int
@@ -179,6 +191,8 @@ class _ScanBudget:
 class _RetainedUsage:
     import_count: int
     archive_bytes: int
+    pending_count: int
+    pending_archive_bytes: int
 
 
 def _required_reconcile_budget(import_count: int, archive_bytes: int) -> tuple[int, int]:
@@ -401,6 +415,23 @@ def _canonical_metadata(metadata: _StoredMetadata) -> bytes:
     payload = _metadata_payload(metadata)
     payload["authentication"] = metadata.authentication
     return _canonical_json(payload)
+
+
+def _pending_lease_payload(
+    import_ref: WorkspaceImportRefV1,
+    ownership: WorkspaceImportOwnership,
+) -> bytes:
+    return _canonical_json(
+        {
+            "import_ref": import_ref.model_dump(mode="json"),
+            "ownership": {
+                "idempotency_key": ownership.idempotency_key,
+                "operation_id": ownership.operation_id,
+                "project_id": ownership.project_id,
+            },
+            "schema_version": "1",
+        }
+    )
 
 
 def _rename_noreplace(source: str, destination: str, *, directory_fd: int) -> None:
@@ -743,6 +774,8 @@ class WorkspaceImportStore:
         max_extracted_bytes: int = MAX_WORKSPACE_UPLOAD_BYTES,
         max_retained_imports: int = _DEFAULT_MAX_RETAINED_IMPORTS,
         max_retained_archive_bytes: int = _DEFAULT_MAX_RETAINED_ARCHIVE_BYTES,
+        max_pending_imports: int | None = None,
+        max_pending_archive_bytes: int | None = None,
         reconcile_max_nodes: int = _DEFAULT_RECONCILE_MAX_NODES,
         reconcile_max_bytes: int = _DEFAULT_RECONCILE_MAX_BYTES,
         reconcile_on_open: bool = True,
@@ -757,6 +790,20 @@ class WorkspaceImportStore:
             raise ValueError("reconciliation budgets must be positive")
         if max_retained_imports < 0 or max_retained_archive_bytes < 0:
             raise ValueError("retained workspace import limits must be non-negative")
+        if max_pending_imports is None:
+            max_pending_imports = min(_DEFAULT_MAX_PENDING_IMPORTS, max_retained_imports)
+        if max_pending_archive_bytes is None:
+            max_pending_archive_bytes = min(
+                _DEFAULT_MAX_PENDING_ARCHIVE_BYTES,
+                max_retained_archive_bytes,
+            )
+        if (
+            max_pending_imports < 0
+            or max_pending_imports > max_retained_imports
+            or max_pending_archive_bytes < 0
+            or max_pending_archive_bytes > max_retained_archive_bytes
+        ):
+            raise ValueError("pending workspace import limits exceed retained limits")
         if type(reconcile_on_open) is not bool:
             raise TypeError("reconcile_on_open must be a boolean")
         required_nodes, required_bytes = _required_reconcile_budget(
@@ -771,6 +818,8 @@ class WorkspaceImportStore:
         self._max_extracted_bytes = max_extracted_bytes
         self._max_retained_imports = max_retained_imports
         self._max_retained_archive_bytes = max_retained_archive_bytes
+        self._max_pending_imports = max_pending_imports
+        self._max_pending_archive_bytes = max_pending_archive_bytes
         self._reconcile_max_nodes = reconcile_max_nodes
         self._reconcile_max_bytes = reconcile_max_bytes
         self._parent_descriptor = -1
@@ -1702,6 +1751,51 @@ class WorkspaceImportStore:
             raise TypeError("workspace import source descriptor is invalid")
         return descriptor
 
+    def _pending_lease_token(
+        self,
+        import_ref: WorkspaceImportRefV1,
+        ownership: WorkspaceImportOwnership,
+    ) -> str:
+        return _authentication(
+            self._auth_key,
+            _PENDING_LEASE_DOMAIN,
+            _pending_lease_payload(import_ref, ownership),
+        )
+
+    def _pending_lease_marker(
+        self,
+        import_ref: WorkspaceImportRefV1,
+        ownership: WorkspaceImportOwnership,
+    ) -> bytes:
+        token = bytes.fromhex(self._pending_lease_token(import_ref, ownership))
+        return hashlib.sha256(token).digest()
+
+    def _archive_is_pending(
+        self,
+        archive_descriptor: int,
+        import_ref: WorkspaceImportRefV1,
+        ownership: WorkspaceImportOwnership,
+    ) -> bool:
+        try:
+            marker = os.getxattr(archive_descriptor, _PENDING_LEASE_XATTR)
+        except OSError as exc:
+            missing_xattr = {errno.ENODATA}
+            if hasattr(errno, "ENOATTR"):
+                missing_xattr.add(errno.ENOATTR)
+            if exc.errno in missing_xattr:
+                return False
+            raise WorkspaceImportIntegrityError(
+                "workspace import pending lease state is unavailable"
+            ) from exc
+        if not hmac.compare_digest(
+            marker,
+            self._pending_lease_marker(import_ref, ownership),
+        ):
+            raise _DeterministicImportCorruption(
+                "workspace import pending lease state is invalid"
+            )
+        return True
+
     def ingest(
         self,
         source: int | BinaryIO,
@@ -1709,7 +1803,44 @@ class WorkspaceImportStore:
         ownership: WorkspaceImportOwnership,
         import_id: str | None = None,
     ) -> WorkspaceImportRefV1:
-        """Validate and persist one already-open native archive handoff."""
+        """Validate and persist one already-open adopted archive handoff."""
+
+        return self._ingest(
+            source,
+            ownership=ownership,
+            import_id=import_id,
+            pending=False,
+        )
+
+    def ingest_pending(
+        self,
+        source: int | BinaryIO,
+        *,
+        ownership: WorkspaceImportOwnership,
+        import_id: str | None = None,
+    ) -> PendingWorkspaceImport:
+        """Persist one native-picker import under a private pending lease."""
+
+        import_ref = self._ingest(
+            source,
+            ownership=ownership,
+            import_id=import_id,
+            pending=True,
+        )
+        return PendingWorkspaceImport(
+            import_ref=import_ref,
+            lease_token=self._pending_lease_token(import_ref, ownership),
+        )
+
+    def _ingest(
+        self,
+        source: int | BinaryIO,
+        *,
+        ownership: WorkspaceImportOwnership,
+        import_id: str | None = None,
+        pending: bool,
+    ) -> WorkspaceImportRefV1:
+        """Shared validated publication path for adopted and pending imports."""
 
         if not isinstance(ownership, WorkspaceImportOwnership):
             raise TypeError("ingest requires WorkspaceImportOwnership")
@@ -1754,6 +1885,11 @@ class WorkspaceImportStore:
                 retained.import_count + 1,
                 retained.archive_bytes + before.st_size,
             )
+            if pending:
+                self._require_pending_capacity(
+                    retained.pending_count + 1,
+                    retained.pending_archive_bytes + before.st_size,
+                )
             os.mkdir(temporary_name, 0o700, dir_fd=root_descriptor)
             created_temporary = os.stat(
                 temporary_name,
@@ -1814,12 +1950,25 @@ class WorkspaceImportStore:
                             "workspace import source identity changed while reading"
                         ) from exc
                     raise
+                import_ref = WorkspaceImportRefV1(
+                    import_id=import_id,
+                    content_sha256=result.content_sha256,
+                    byte_size=result.byte_size,
+                    entry_count=result.entry_count,
+                    extracted_byte_size=result.extracted_byte_size,
+                )
                 archive_token = secrets.token_hex(32)
                 os.setxattr(
                     archive_descriptor,
                     _ARCHIVE_TOKEN_XATTR,
                     bytes.fromhex(archive_token),
                 )
+                if pending:
+                    os.setxattr(
+                        archive_descriptor,
+                        _PENDING_LEASE_XATTR,
+                        self._pending_lease_marker(import_ref, ownership),
+                    )
                 os.fsync(archive_descriptor)
                 archive_status = os.fstat(archive_descriptor)
                 self._require_private_file(archive_status, label="temporary workspace archive")
@@ -1835,13 +1984,6 @@ class WorkspaceImportStore:
                     raise WorkspaceArchiveValidationError(
                         "workspace import source identity changed while reading"
                     )
-                import_ref = WorkspaceImportRefV1(
-                    import_id=import_id,
-                    content_sha256=result.content_sha256,
-                    byte_size=result.byte_size,
-                    entry_count=result.entry_count,
-                    extracted_byte_size=result.extracted_byte_size,
-                )
                 directory_status = os.fstat(temporary_descriptor)
                 metadata_descriptor = os.open(
                     _METADATA_NAME,
@@ -1952,6 +2094,12 @@ class WorkspaceImportStore:
         ):
             raise WorkspaceImportError("workspace retained reconciliation budget exceeded")
 
+    def _require_pending_capacity(self, import_count: int, archive_bytes: int) -> None:
+        if import_count > self._max_pending_imports:
+            raise WorkspaceImportError("workspace pending import count budget exceeded")
+        if archive_bytes > self._max_pending_archive_bytes:
+            raise WorkspaceImportError("workspace pending archive byte budget exceeded")
+
     def _retained_usage(
         self,
         root_descriptor: int,
@@ -1967,6 +2115,8 @@ class WorkspaceImportStore:
         )
         import_count = 0
         archive_bytes = 0
+        pending_count = 0
+        pending_archive_bytes = 0
         existing_ref: WorkspaceImportRefV1 | None = None
         with os.scandir(root_descriptor) as entries:
             names = []
@@ -1986,7 +2136,20 @@ class WorkspaceImportStore:
                     budget=budget,
                 )
             )
-            os.close(archive_descriptor)
+            try:
+                if self._archive_is_pending(
+                    archive_descriptor,
+                    stored_ref,
+                    stored_ownership,
+                ):
+                    pending_count += 1
+                    pending_archive_bytes += stored_ref.byte_size
+                    self._require_pending_capacity(
+                        pending_count,
+                        pending_archive_bytes,
+                    )
+            finally:
+                os.close(archive_descriptor)
             import_count += 1
             archive_bytes += stored_ref.byte_size
             self._require_retained_capacity(import_count, archive_bytes)
@@ -2020,7 +2183,15 @@ class WorkspaceImportStore:
                 raise WorkspaceImportIntegrityError(
                     "workspace import ownership or idempotency binding conflicts"
                 )
-        return _RetainedUsage(import_count=import_count, archive_bytes=archive_bytes), existing_ref
+        return (
+            _RetainedUsage(
+                import_count=import_count,
+                archive_bytes=archive_bytes,
+                pending_count=pending_count,
+                pending_archive_bytes=pending_archive_bytes,
+            ),
+            existing_ref,
+        )
 
     @staticmethod
     def _verify_directory_binding(
@@ -2209,6 +2380,7 @@ class WorkspaceImportStore:
         *,
         archive_identity: tuple[int, int],
         archive_token: str,
+        ownership: WorkspaceImportOwnership,
         budget: _ScanBudget | None = None,
     ) -> int:
         try:
@@ -2230,6 +2402,7 @@ class WorkspaceImportStore:
                 raise _DeterministicImportCorruption(
                     "workspace import archive storage token changed"
                 )
+            self._archive_is_pending(descriptor, import_ref, ownership)
             if before.st_size != import_ref.byte_size:
                 raise _DeterministicImportCorruption("workspace import archive size changed")
             digests: list[str] = []
@@ -2303,6 +2476,7 @@ class WorkspaceImportStore:
                 expected_metadata.archive_inode,
             ),
             archive_token=expected_metadata.archive_token,
+            ownership=expected_metadata.ownership,
         )
         os.close(archive_descriptor)
         if _identity(os.fstat(directory_descriptor)) != _identity(directory_status):
@@ -2354,6 +2528,7 @@ class WorkspaceImportStore:
                 stored_ref,
                 archive_identity=(metadata.archive_device, metadata.archive_inode),
                 archive_token=metadata.archive_token,
+                ownership=metadata.ownership,
                 budget=budget,
             )
             self._verify_directory_binding(
@@ -2598,6 +2773,83 @@ class WorkspaceImportStore:
                 )
             )
             os.close(archive_descriptor)
+
+    def adopt_pending(
+        self,
+        import_ref: WorkspaceImportRefV1,
+        *,
+        ownership: WorkspaceImportOwnership,
+    ) -> None:
+        """Idempotently make a verified pending import durable."""
+
+        self._require_external_import_ref(import_ref, operation="adopt")
+        self._require_ownership(ownership, operation="adopt")
+        with self._locked_root() as root_descriptor:
+            _stored_ref, _stored_ownership, archive_descriptor, _directory_identity = (
+                self._validate_import_contents(
+                    root_descriptor,
+                    import_ref.import_id,
+                    import_ref,
+                    expected_ownership=ownership,
+                )
+            )
+            try:
+                if not self._archive_is_pending(archive_descriptor, import_ref, ownership):
+                    return
+                os.removexattr(archive_descriptor, _PENDING_LEASE_XATTR)
+                os.fsync(archive_descriptor)
+                if self._archive_is_pending(archive_descriptor, import_ref, ownership):
+                    raise WorkspaceImportIntegrityError(
+                        "workspace import pending lease adoption did not persist"
+                    )
+            finally:
+                os.close(archive_descriptor)
+            os.fsync(root_descriptor)
+
+    def discard_pending(
+        self,
+        import_ref: WorkspaceImportRefV1,
+        *,
+        ownership: WorkspaceImportOwnership,
+        lease_token: str,
+    ) -> None:
+        """Delete an exact unadopted native-picker lease, idempotently."""
+
+        self._require_external_import_ref(import_ref, operation="discard")
+        self._require_ownership(ownership, operation="discard")
+        if type(lease_token) is not str or re.fullmatch(r"[0-9a-f]{64}", lease_token) is None:
+            raise ValueError("workspace import pending lease token is invalid")
+        if not hmac.compare_digest(
+            lease_token,
+            self._pending_lease_token(import_ref, ownership),
+        ):
+            raise WorkspaceImportIntegrityError(
+                "workspace import pending lease token does not match"
+            )
+        with self._locked_root() as root_descriptor:
+            try:
+                _stored_ref, _stored_ownership, archive_descriptor, directory_identity = (
+                    self._validate_import_contents(
+                        root_descriptor,
+                        import_ref.import_id,
+                        import_ref,
+                        expected_ownership=ownership,
+                    )
+                )
+            except WorkspaceImportNotFoundError:
+                return
+            try:
+                if not self._archive_is_pending(archive_descriptor, import_ref, ownership):
+                    return
+            finally:
+                os.close(archive_descriptor)
+            self._discard_flat_directory(
+                root_descriptor,
+                import_ref.import_id,
+                missing_ok=False,
+                expected_identity=directory_identity,
+            )
+            os.fsync(root_descriptor)
 
     @contextmanager
     def resolve(
@@ -2872,6 +3124,21 @@ class WorkspaceImportStore:
                             raise WorkspaceImportIntegrityError(
                                 "referenced workspace import changed during reconciliation"
                             )
+                        if self._archive_is_pending(
+                            archive_descriptor,
+                            import_ref,
+                            ownership,
+                        ):
+                            os.removexattr(archive_descriptor, _PENDING_LEASE_XATTR)
+                            os.fsync(archive_descriptor)
+                            if self._archive_is_pending(
+                                archive_descriptor,
+                                import_ref,
+                                ownership,
+                            ):
+                                raise WorkspaceImportIntegrityError(
+                                    "referenced workspace import adoption did not persist"
+                                )
                     finally:
                         os.close(archive_descriptor)
 
@@ -2927,6 +3194,7 @@ class WorkspaceImportStore:
 
 
 __all__ = [
+    "PendingWorkspaceImport",
     "WorkspaceArchiveValidationError",
     "WorkspaceImportError",
     "WorkspaceImportIntegrityError",

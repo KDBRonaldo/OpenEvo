@@ -15,6 +15,21 @@ the authenticated private loopback route. `native_workspace.py` reopens every
 absolute component with no-follow semantics, requires the final directory to
 match that exact identity, creates the canonical archive in an unlinked private
 temporary file, and passes only that open regular-file stream to this store.
+Each directory enumeration consumes the single global entry budget as soon as
+names are yielded, including siblings not yet visited recursively. The scanner
+collects at most the remaining budget plus one before rejecting or sorting, so
+an oversized directory cannot force an unbounded list, sort, or sequence of
+directory-entry system calls.
+
+Every non-empty file must independently pass both allocation and extent checks.
+`st_blocks` is interpreted in its POSIX 512-byte units and must cover the complete
+logical size; `SEEK_DATA`/`SEEK_HOLE` must then prove one data extent from zero to
+EOF. A filesystem's permitted minimal extent implementation can therefore not
+hide a low-allocation sparse file. Platforms without either proof fail closed.
+Ordinary fully allocated APFS files are accepted even when extent calls return
+the minimal `0, size` map; compressed, dataless, or other files whose allocation
+metadata is below logical size are rejected with an explicit sparse/compressed
+unsupported error because the bridge cannot prove a complete snapshot.
 
 Ingest validates uncompressed `openevo_deterministic_tar_v1` byte for byte while
 streaming it into an owner-only store. Validation covers the frozen POSIX ustar
@@ -90,7 +105,22 @@ corruption without following symlinks. Filesystem and xattr `OSError` failures a
 treated as infrastructure failures: reconciliation keeps the observed entry and
 fails closed for a later retry.
 
-The only ingest result is the existing closed contract model:
+Native picker ingest first creates a pending lease. The lease token is a
+domain-separated HMAC over the exact import reference and ownership; only its
+one-way marker is persisted as an authenticated archive xattr. The hidden native
+response carries the token only to Rust, which keeps at most 64 pending handoffs
+keyed by renderer action ID and returns only `ProjectSourceV1` to React. The
+renderer can request native `adopt` or `discard` by action ID but never receives
+the token or hidden route. Create/patch commits adopt only after project state is
+durable. Close, reselect, reset, stale picker completion, and failed save paths
+discard. Discard first takes the provider reference guard, rereads all durable
+project references, and only then takes the import lock, so it cannot remove an
+import concurrently committed by another request. Referenced pending imports are
+adopted during startup recovery; unreferenced leases are removed. Total retained
+limits remain 10,000 imports/24 GiB, while pending state is separately capped at
+64 imports and 16 GiB by default.
+
+The only renderer/public ingest result remains the existing closed contract model:
 
 ```text
 WorkspaceImportRefV1 {
@@ -123,10 +153,11 @@ restart and replacement guarantees above therefore require that the key has not
 leaked and that the private state directory has not been compromised. Stronger
 same-UID isolation requires a platform credential boundary outside this module.
 
-The private route is excluded from OpenAPI and requires a process-owned native
+The private import and discard routes are excluded from OpenAPI and require a process-owned native
 handoff token that is distinct from the renderer's Desktop session token. Its
-bounded request is the only path-bearing message; success returns the closed
-`ProjectSourceV1` and never echoes that path. Native
+bounded import request is the only path-bearing message; its private success
+envelope contains `ProjectSourceV1` plus the native-only lease and never echoes
+that path. Rust strips the lease before returning to React. Native
 import ownership is reproducible from project identity and archive digest. A new
 project created from a native import receives a deterministic project ID derived
 from the opaque import ID; an existing project supplies its own ID privately.

@@ -172,6 +172,144 @@ def test_native_workspace_fails_closed_without_extent_queries(
             pass
 
 
+def test_native_workspace_extent_fallback_cannot_hide_low_allocation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "research"
+    source.mkdir()
+    sparse_file = source / "sparse.bin"
+    with sparse_file.open("w+b") as stream:
+        stream.write(b"x" * 4096)
+        stream.truncate(8 * 1024 * 1024)
+    status = sparse_file.stat()
+    if status.st_blocks * 512 >= status.st_size:
+        pytest.skip("filesystem allocated the complete logical file")
+    private_root = tmp_path / "private"
+    private_root.mkdir(mode=0o700)
+
+    def minimal_extent_map(_descriptor: int, _offset: int, whence: int) -> int:
+        return 0 if whence == os.SEEK_DATA else status.st_size
+
+    monkeypatch.setattr(native_workspace_module, "_seek_extent", minimal_extent_map)
+
+    with pytest.raises(NativeWorkspaceArchiveError, match="allocation"):
+        with _prepare(source, private_root, "native-source-minimal-extent-0001"):
+            pass
+
+
+def test_native_workspace_accepts_a_fully_allocated_normal_file_with_minimal_extents(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "research"
+    source.mkdir()
+    normal_file = source / "normal.bin"
+    normal_file.write_bytes(os.urandom(8193))
+    status = normal_file.stat()
+    if status.st_blocks * 512 < status.st_size:
+        pytest.skip("filesystem does not report full allocation for a normal file")
+    private_root = tmp_path / "private"
+    private_root.mkdir(mode=0o700)
+
+    def minimal_extent_map(_descriptor: int, _offset: int, whence: int) -> int:
+        return 0 if whence == os.SEEK_DATA else status.st_size
+
+    monkeypatch.setattr(native_workspace_module, "_seek_extent", minimal_extent_map)
+
+    with _prepare(source, private_root, "native-source-normal-allocation-0001") as prepared:
+        assert prepared.import_ref.entry_count == 1
+
+
+def test_native_workspace_directory_enumeration_is_bounded_before_sort(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "research"
+    source.mkdir()
+    descriptor = os.open(source, native_workspace_module._DIRECTORY_FLAGS)
+    calls = 0
+
+    class Entry:
+        name = "entry"
+
+    class Iterator:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            nonlocal calls
+            calls += 1
+            if calls > 4:
+                raise AssertionError("directory enumeration exceeded remaining budget plus one")
+            return Entry()
+
+    monkeypatch.setattr(native_workspace_module, "MAX_WORKSPACE_ENTRIES", 3)
+    monkeypatch.setattr(native_workspace_module.os, "scandir", lambda _descriptor: Iterator())
+    try:
+        with pytest.raises(NativeWorkspaceArchiveError, match="entry budget"):
+            native_workspace_module._scan(descriptor)
+    finally:
+        os.close(descriptor)
+
+    assert calls == 4
+
+
+def test_native_workspace_real_directories_share_one_global_enumeration_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "research"
+    source.mkdir()
+    (source / "a").mkdir()
+    (source / "b").mkdir()
+    (source / "c").mkdir()
+    (source / "a" / "one").touch()
+    (source / "a" / "two").touch()
+    (source / "a" / "three").touch()
+    private_root = tmp_path / "private"
+    private_root.mkdir(mode=0o700)
+    monkeypatch.setattr(native_workspace_module, "MAX_WORKSPACE_ENTRIES", 4)
+    real_scandir = os.scandir
+    yielded = 0
+
+    class CountingScandir:
+        def __init__(self, descriptor: int) -> None:
+            self.context = real_scandir(descriptor)
+            self.iterator = None
+
+        def __enter__(self):
+            self.iterator = self.context.__enter__()
+            return self
+
+        def __exit__(self, *args: object):
+            return self.context.__exit__(*args)
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            nonlocal yielded
+            assert self.iterator is not None
+            entry = next(self.iterator)
+            yielded += 1
+            return entry
+
+    monkeypatch.setattr(native_workspace_module.os, "scandir", CountingScandir)
+
+    with pytest.raises(NativeWorkspaceArchiveError, match="entry budget"):
+        with _prepare(source, private_root, "native-source-global-entry-budget-0001"):
+            pass
+
+    assert yielded == 5
+
+
 def test_native_workspace_detects_inventory_change_before_handoff(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

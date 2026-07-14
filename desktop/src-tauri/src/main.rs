@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::ffi::CString;
 use std::fs::{self, File, Metadata, OpenOptions};
 use std::io::{Read, Write};
@@ -34,6 +35,7 @@ const DESKTOP_LOCAL_API_OPENAPI_SHA256: &str =
 const LEGACY_DESKTOP_SHELL_ROUTE: &str = "/openevo-api/desktop/shell";
 const NATIVE_SESSION_PROBE_ROUTE: &str = "/openevo-native/session";
 const NATIVE_WORKSPACE_IMPORT_ROUTE: &str = "/openevo-native/workspace-imports";
+const NATIVE_WORKSPACE_DISCARD_ROUTE: &str = "/openevo-native/workspace-imports/discard";
 const NATIVE_SESSION_HEADER: &str = "X-OpenEvo-Desktop-Session";
 const NATIVE_HANDOFF_HEADER: &str = "X-OpenEvo-Native-Handoff";
 const NATIVE_EXECUTABLE_FD_ENV: &str = "OPENEVO_NATIVE_EXECUTABLE_FD";
@@ -53,6 +55,7 @@ const SIDECAR_HEALTH_CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
 const SIDECAR_HEALTH_RESPONSE_MAX_BYTES: usize = 4096;
 const NATIVE_WORKSPACE_RESPONSE_MAX_BYTES: usize = 8192;
 const NATIVE_WORKSPACE_IMPORT_TIMEOUT: Duration = Duration::from_secs(300);
+const MAX_PENDING_WORKSPACE_IMPORTS: usize = 64;
 const SIDECAR_TERM_TIMEOUT: Duration = Duration::from_secs(1);
 const SIDECAR_KILL_TIMEOUT: Duration = Duration::from_secs(1);
 const SIDECAR_STOP_POLL_INTERVAL: Duration = Duration::from_millis(20);
@@ -633,7 +636,7 @@ struct NativeWorkspaceSelection<'a> {
     project_id: Option<&'a str>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct NativeWorkspaceImportRefV1 {
     import_id: String,
@@ -643,12 +646,39 @@ struct NativeWorkspaceImportRefV1 {
     extracted_byte_size: u64,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct NativeProjectSourceV1 {
     kind: String,
     display_name: String,
     import_ref: NativeWorkspaceImportRefV1,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NativeWorkspaceImportResponseV1 {
+    schema_version: String,
+    source: NativeProjectSourceV1,
+    lease_token: String,
+}
+
+#[derive(Debug, Serialize)]
+struct NativeWorkspaceDiscardRequestV1<'a> {
+    schema_version: &'static str,
+    action_id: &'a str,
+    import_ref: &'a NativeWorkspaceImportRefV1,
+    lease_token: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    project_id: Option<&'a str>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PendingNativeWorkspaceImport {
+    sidecar_instance: [u8; INSTANCE_ID_BYTES],
+    action_id: String,
+    project_id: Option<String>,
+    source: NativeProjectSourceV1,
+    lease_token: String,
 }
 
 #[derive(Clone, Debug)]
@@ -753,6 +783,7 @@ struct DesktopHostStateInner {
     launch_state: AtomicU64,
     shutdown_requested: AtomicBool,
     picker_in_progress: AtomicBool,
+    pending_workspace_imports: Mutex<HashMap<String, PendingNativeWorkspaceImport>>,
 }
 
 #[derive(Clone)]
@@ -777,6 +808,7 @@ impl Default for DesktopHostState {
             launch_state: AtomicU64::new(encode_launch_state(0, LaunchPhase::Idle)),
             shutdown_requested: AtomicBool::new(false),
             picker_in_progress: AtomicBool::new(false),
+            pending_workspace_imports: Mutex::new(HashMap::new()),
         }))
     }
 }
@@ -2429,7 +2461,11 @@ fn loopback_http_request_on_stream(
             );
         }
     }
-    let content_length = content_length.ok_or_else(sidecar_health_error)?;
+    let content_length = match content_length {
+        Some(content_length) => content_length,
+        None if status == 204 => 0,
+        None => return Err(sidecar_health_error()),
+    };
     if content_length > response_limit.saturating_sub(header_end) {
         return Err(sidecar_health_error());
     }
@@ -2586,7 +2622,7 @@ fn register_native_workspace_source(
     stream: &mut TcpStream,
     handoff_token: &str,
     selection: NativeWorkspaceSelection<'_>,
-) -> HostResult<NativeProjectSourceV1> {
+) -> HostResult<NativeWorkspaceImportResponseV1> {
     if selection.kind != "native_folder_snapshot"
         || selection.action_id.len() < 16
         || selection.action_id.len() > 256
@@ -2629,10 +2665,45 @@ fn register_native_workspace_source(
     if response.status != 201 {
         return Err(workspace_import_error());
     }
-    let source: NativeProjectSourceV1 =
+    let pending: NativeWorkspaceImportResponseV1 =
         serde_json::from_str(&response.body).map_err(|_| workspace_import_error())?;
-    validate_native_project_source(&source)?;
-    Ok(source)
+    if pending.schema_version != "1"
+        || pending.lease_token.len() != 64
+        || !pending.lease_token.bytes().all(is_lower_hex)
+    {
+        return Err(workspace_import_error());
+    }
+    validate_native_project_source(&pending.source)?;
+    Ok(pending)
+}
+
+fn discard_native_workspace_source(
+    stream: &mut TcpStream,
+    handoff_token: &str,
+    pending: &PendingNativeWorkspaceImport,
+) -> HostResult<()> {
+    let body = serde_json::to_vec(&NativeWorkspaceDiscardRequestV1 {
+        schema_version: "1",
+        action_id: &pending.action_id,
+        import_ref: &pending.source.import_ref,
+        lease_token: &pending.lease_token,
+        project_id: pending.project_id.as_deref(),
+    })
+    .map_err(|_| workspace_import_error())?;
+    let response = loopback_http_request_on_stream(
+        stream,
+        "POST",
+        NATIVE_WORKSPACE_DISCARD_ROUTE,
+        Some((NATIVE_HANDOFF_HEADER, handoff_token)),
+        Some(&body),
+        Instant::now() + NATIVE_WORKSPACE_IMPORT_TIMEOUT,
+        NATIVE_WORKSPACE_RESPONSE_MAX_BYTES,
+    )
+    .map_err(|_| workspace_import_error())?;
+    if response.status != 204 || !response.body.is_empty() {
+        return Err(workspace_import_error());
+    }
+    Ok(())
 }
 
 fn validate_native_project_source(source: &NativeProjectSourceV1) -> HostResult<()> {
@@ -2664,6 +2735,55 @@ fn validate_native_project_source(source: &NativeProjectSourceV1) -> HostResult<
         return Err(workspace_import_error());
     }
     Ok(())
+}
+
+fn remember_pending_workspace_import(
+    state: &DesktopHostState,
+    pending: PendingNativeWorkspaceImport,
+) -> HostResult<()> {
+    let mut imports = state
+        .pending_workspace_imports
+        .lock()
+        .map_err(|_| workspace_import_error())?;
+    imports.retain(|_, value| value.sidecar_instance == pending.sidecar_instance);
+    if let Some(existing) = imports.get(&pending.action_id) {
+        return if existing == &pending {
+            Ok(())
+        } else {
+            Err(workspace_import_error())
+        };
+    }
+    if imports.len() >= MAX_PENDING_WORKSPACE_IMPORTS {
+        return Err(workspace_import_error());
+    }
+    imports.insert(pending.action_id.clone(), pending);
+    Ok(())
+}
+
+fn take_pending_workspace_import(
+    state: &DesktopHostState,
+    action_id: &str,
+) -> HostResult<Option<PendingNativeWorkspaceImport>> {
+    if !is_valid_native_text(action_id) || action_id.len() < 16 {
+        return Err(workspace_selection_error());
+    }
+    let pending = state
+        .pending_workspace_imports
+        .lock()
+        .map_err(|_| workspace_import_error())?
+        .remove(action_id);
+    Ok(pending)
+}
+
+fn restore_pending_workspace_import(
+    state: &DesktopHostState,
+    pending: PendingNativeWorkspaceImport,
+) {
+    if let Ok(mut imports) = state.pending_workspace_imports.lock() {
+        if imports.len() < MAX_PENDING_WORKSPACE_IMPORTS {
+            imports.entry(pending.action_id.clone()).or_insert(pending);
+        }
+    }
 }
 
 fn is_valid_native_text(value: &str) -> bool {
@@ -4087,7 +4207,9 @@ async fn select_project_source(
         mut stream,
         handoff_token,
     } = active_sidecar_connection(&state, expected_instance)?;
-    tauri::async_runtime::spawn_blocking(move || {
+    let pending_action_id = action_id.clone();
+    let pending_project_id = project_id.clone();
+    let response = tauri::async_runtime::spawn_blocking(move || {
         register_native_workspace_source(
             &mut stream,
             handoff_token.expose(),
@@ -4102,7 +4224,73 @@ async fn select_project_source(
         )
     })
     .await
-    .map_err(|_| workspace_import_error())?
+    .map_err(|_| workspace_import_error())??;
+    let pending = PendingNativeWorkspaceImport {
+        sidecar_instance: expected_instance,
+        action_id: pending_action_id,
+        project_id: pending_project_id,
+        source: response.source.clone(),
+        lease_token: response.lease_token,
+    };
+    if let Err(error) = remember_pending_workspace_import(&state, pending.clone()) {
+        if let Ok(ActiveSidecarConnection {
+            mut stream,
+            handoff_token,
+        }) = active_sidecar_connection(&state, expected_instance)
+        {
+            let _ = tauri::async_runtime::spawn_blocking(move || {
+                discard_native_workspace_source(&mut stream, handoff_token.expose(), &pending)
+            })
+            .await;
+        }
+        return Err(error);
+    }
+    Ok(response.source)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+async fn settle_project_source(
+    state: tauri::State<'_, DesktopHostState>,
+    action_id: String,
+    outcome: String,
+) -> HostResult<()> {
+    if !matches!(outcome.as_str(), "adopt" | "discard") {
+        return Err(workspace_selection_error());
+    }
+    let Some(pending) = take_pending_workspace_import(&state, &action_id)? else {
+        return Ok(());
+    };
+    if outcome == "adopt" {
+        return Ok(());
+    }
+    let current_instance = match active_sidecar_instance(&state) {
+        Ok(instance) => instance,
+        Err(_) => return Ok(()),
+    };
+    if current_instance != pending.sidecar_instance {
+        return Ok(());
+    }
+    let ActiveSidecarConnection {
+        mut stream,
+        handoff_token,
+    } = match active_sidecar_connection(&state, pending.sidecar_instance) {
+        Ok(connection) => connection,
+        Err(error) => {
+            restore_pending_workspace_import(&state, pending);
+            return Err(error);
+        }
+    };
+    let (pending, result) = tauri::async_runtime::spawn_blocking(move || {
+        let result = discard_native_workspace_source(&mut stream, handoff_token.expose(), &pending);
+        (pending, result)
+    })
+    .await
+    .map_err(|_| workspace_import_error())?;
+    if let Err(error) = result {
+        restore_pending_workspace_import(&state, pending);
+        return Err(error);
+    }
+    Ok(())
 }
 
 fn sidecar_state_error() -> NativeHostError {
@@ -4127,7 +4315,8 @@ fn main() {
             host_status,
             start_sidecar,
             stop_sidecar,
-            select_project_source
+            select_project_source,
+            settle_project_source
         ])
         .build(tauri::generate_context!())
     {
@@ -5085,6 +5274,25 @@ mod tests {
     }
 
     #[test]
+    fn loopback_http_accepts_a_204_without_content_length() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = read_http_request(&mut stream);
+            stream
+                .write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
+                .unwrap();
+        });
+
+        let response = loopback_http_get(port, "/openevo-native/session", None).unwrap();
+        server.join().unwrap();
+
+        assert_eq!(response.status, 204);
+        assert!(response.body.is_empty());
+    }
+
+    #[test]
     fn native_workspace_request_stays_bound_to_the_pre_restart_listener() {
         let state = DesktopHostState::default();
         let (managed, _private_root, old_port) = managed_test_sidecar();
@@ -5116,15 +5324,19 @@ mod tests {
                 &mut accepted,
                 201,
                 serde_json::json!({
-                    "kind": "native_folder_snapshot",
-                    "display_name": "study",
-                    "import_ref": {
-                        "import_id": format!("workspace-import-{}", "1a".repeat(24)),
-                        "content_sha256": "2b".repeat(32),
-                        "byte_size": 1024,
-                        "entry_count": 1,
-                        "extracted_byte_size": 4,
-                    }
+                    "schema_version": "1",
+                    "lease_token": "3c".repeat(32),
+                    "source": {
+                        "kind": "native_folder_snapshot",
+                        "display_name": "study",
+                        "import_ref": {
+                            "import_id": format!("workspace-import-{}", "1a".repeat(24)),
+                            "content_sha256": "2b".repeat(32),
+                            "byte_size": 1024,
+                            "entry_count": 1,
+                            "extracted_byte_size": 4,
+                        }
+                    },
                 }),
             );
         });
@@ -5144,7 +5356,7 @@ mod tests {
         .unwrap();
         old_server.join().unwrap();
 
-        assert_eq!(source.display_name, "study");
+        assert_eq!(source.source.display_name, "study");
         assert_eq!(old_port, stream.peer_addr().unwrap().port());
         assert!(matches!(
             replacement_probe.accept(),
@@ -5168,6 +5380,102 @@ mod tests {
 
         drop(first);
         PickerClaim::acquire(&state).unwrap();
+    }
+
+    #[test]
+    fn native_workspace_pending_handoffs_have_a_fixed_capacity() {
+        let state = DesktopHostState::default();
+        for index in 0..MAX_PENDING_WORKSPACE_IMPORTS {
+            let action_id = format!("native-pending-action-{index:04}");
+            remember_pending_workspace_import(
+                &state,
+                PendingNativeWorkspaceImport {
+                    sidecar_instance: [0x11; INSTANCE_ID_BYTES],
+                    action_id,
+                    project_id: None,
+                    source: NativeProjectSourceV1 {
+                        kind: "native_folder_snapshot".to_string(),
+                        display_name: "study".to_string(),
+                        import_ref: NativeWorkspaceImportRefV1 {
+                            import_id: format!("workspace-import-{:048x}", index),
+                            content_sha256: format!("{:064x}", index),
+                            byte_size: 1024,
+                            entry_count: 1,
+                            extracted_byte_size: 4,
+                        },
+                    },
+                    lease_token: format!("{:064x}", index),
+                },
+            )
+            .unwrap();
+        }
+        let overflow = PendingNativeWorkspaceImport {
+            sidecar_instance: [0x11; INSTANCE_ID_BYTES],
+            action_id: "native-pending-action-overflow".to_string(),
+            project_id: None,
+            source: state
+                .pending_workspace_imports
+                .lock()
+                .unwrap()
+                .values()
+                .next()
+                .unwrap()
+                .source
+                .clone(),
+            lease_token: "ff".repeat(32),
+        };
+
+        assert!(remember_pending_workspace_import(&state, overflow).is_err());
+        assert_eq!(
+            state.pending_workspace_imports.lock().unwrap().len(),
+            MAX_PENDING_WORKSPACE_IMPORTS
+        );
+    }
+
+    #[test]
+    fn native_workspace_discard_uses_the_hidden_lease_route() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handoff_token = "8d".repeat(HANDOFF_TOKEN_BYTES);
+        let expected_token = handoff_token.clone();
+        let pending = PendingNativeWorkspaceImport {
+            sidecar_instance: [0x11; INSTANCE_ID_BYTES],
+            action_id: "native-pending-action-discard-0001".to_string(),
+            project_id: Some("project-existing-1".to_string()),
+            source: NativeProjectSourceV1 {
+                kind: "native_folder_snapshot".to_string(),
+                display_name: "study".to_string(),
+                import_ref: NativeWorkspaceImportRefV1 {
+                    import_id: format!("workspace-import-{}", "1a".repeat(24)),
+                    content_sha256: "2b".repeat(32),
+                    byte_size: 1024,
+                    entry_count: 1,
+                    extracted_byte_size: 4,
+                },
+            },
+            lease_token: "3c".repeat(32),
+        };
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let (headers, body) = read_http_request_with_body(&mut stream);
+            assert!(headers.starts_with(&format!(
+                "POST {NATIVE_WORKSPACE_DISCARD_ROUTE} HTTP/1.1\r\n"
+            )));
+            assert!(headers
+                .lines()
+                .any(|line| line == format!("{NATIVE_HANDOFF_HEADER}: {expected_token}")));
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["lease_token"], "3c".repeat(32));
+            assert_eq!(body["action_id"], "native-pending-action-discard-0001");
+            assert!(body.get("selected_path").is_none());
+            stream
+                .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+                .unwrap();
+        });
+
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        discard_native_workspace_source(&mut stream, &handoff_token, &pending).unwrap();
+        server.join().unwrap();
     }
 
     #[test]
@@ -5261,15 +5569,19 @@ mod tests {
                 &mut stream,
                 201,
                 serde_json::json!({
-                    "kind": "native_folder_snapshot",
-                    "display_name": "study",
-                    "import_ref": {
-                        "import_id": format!("workspace-import-{}", "1a".repeat(24)),
-                        "content_sha256": "2b".repeat(32),
-                        "byte_size": 1024,
-                        "entry_count": 1,
-                        "extracted_byte_size": 4,
-                    }
+                    "schema_version": "1",
+                    "lease_token": "3c".repeat(32),
+                    "source": {
+                        "kind": "native_folder_snapshot",
+                        "display_name": "study",
+                        "import_ref": {
+                            "import_id": format!("workspace-import-{}", "1a".repeat(24)),
+                            "content_sha256": "2b".repeat(32),
+                            "byte_size": 1024,
+                            "entry_count": 1,
+                            "extracted_byte_size": 4,
+                        }
+                    },
                 }),
             );
         });
@@ -5290,8 +5602,9 @@ mod tests {
         .unwrap();
         server.join().unwrap();
 
-        let renderer_data = serde_json::to_string(&source).unwrap();
-        assert_eq!(source.display_name, "study");
+        let renderer_data = serde_json::to_string(&source.source).unwrap();
+        assert_eq!(source.source.display_name, "study");
+        assert!(!renderer_data.contains(&source.lease_token));
         assert!(!renderer_data.contains("/Users"));
         assert!(!renderer_data.contains("private"));
         assert!(!renderer_data.contains("selected_path"));
@@ -5301,38 +5614,50 @@ mod tests {
     fn native_workspace_registration_rejects_open_or_malformed_responses() {
         for body in [
             serde_json::json!({
-                "kind": "native_folder_snapshot",
-                "display_name": "study",
-                "selected_path": "/private/study",
-                "import_ref": {
-                    "import_id": format!("workspace-import-{}", "1a".repeat(24)),
-                    "content_sha256": "2b".repeat(32),
-                    "byte_size": 1024,
-                    "entry_count": 1,
-                    "extracted_byte_size": 4,
-                }
+                "schema_version": "1",
+                "lease_token": "3c".repeat(32),
+                "source": {
+                    "kind": "native_folder_snapshot",
+                    "display_name": "study",
+                    "selected_path": "/private/study",
+                    "import_ref": {
+                        "import_id": format!("workspace-import-{}", "1a".repeat(24)),
+                        "content_sha256": "2b".repeat(32),
+                        "byte_size": 1024,
+                        "entry_count": 1,
+                        "extracted_byte_size": 4,
+                    }
+                },
             }),
             serde_json::json!({
-                "kind": "native_folder_snapshot",
-                "display_name": "study",
-                "import_ref": {
-                    "import_id": "workspace-import-not-opaque",
-                    "content_sha256": "2b".repeat(32),
-                    "byte_size": 1024,
-                    "entry_count": 1,
-                    "extracted_byte_size": 4,
-                }
+                "schema_version": "1",
+                "lease_token": "3c".repeat(32),
+                "source": {
+                    "kind": "native_folder_snapshot",
+                    "display_name": "study",
+                    "import_ref": {
+                        "import_id": "workspace-import-not-opaque",
+                        "content_sha256": "2b".repeat(32),
+                        "byte_size": 1024,
+                        "entry_count": 1,
+                        "extracted_byte_size": 4,
+                    }
+                },
             }),
             serde_json::json!({
-                "kind": "native_folder_snapshot",
-                "display_name": "/Users/researcher/private/study",
-                "import_ref": {
-                    "import_id": format!("workspace-import-{}", "1a".repeat(24)),
-                    "content_sha256": "2b".repeat(32),
-                    "byte_size": 1024,
-                    "entry_count": 1,
-                    "extracted_byte_size": 4,
-                }
+                "schema_version": "1",
+                "lease_token": "3c".repeat(32),
+                "source": {
+                    "kind": "native_folder_snapshot",
+                    "display_name": "/Users/researcher/private/study",
+                    "import_ref": {
+                        "import_id": format!("workspace-import-{}", "1a".repeat(24)),
+                        "content_sha256": "2b".repeat(32),
+                        "byte_size": 1024,
+                        "entry_count": 1,
+                        "extracted_byte_size": 4,
+                    }
+                },
             }),
         ] {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();

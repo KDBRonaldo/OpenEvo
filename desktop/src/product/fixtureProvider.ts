@@ -447,6 +447,11 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
     });
   }
 
+  async settleProjectSource(
+    _actionId: string,
+    _outcome: "adopt" | "discard",
+  ): Promise<void> {}
+
   async startRun(intent: ProductRunIntent): Promise<RunV1> {
     this.runAdmissionAttempts += 1;
     if (this.nextRunStartConflict) {

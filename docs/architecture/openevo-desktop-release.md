@@ -293,6 +293,19 @@ referenced import and ownership without deleting anything; only a successful fir
 phase removes unreferenced picker snapshots. Missing or corrupt references preserve
 the observed store and fail startup closed.
 
+Picker snapshots have an explicit pending lease before they become project
+authority. The lease is persisted as a keyed, one-way archive-xattr marker and
+the raw token exists only in the hidden sidecar response and Rust host memory.
+Rust caps that map at 64 entries and exposes only action-ID `adopt`/`discard`
+commands to React. A create or patch adopts only after its provider transaction
+is durable. Drawer close, reset, source replacement, stale completion, and save
+failure all request discard. Discard takes the provider reference guard first,
+rereads the full durable reference set, and then takes the import lock; a
+concurrent commit therefore either retains/adopts the exact import or fails its
+own pre-commit verification after an earlier discard. Startup adopts referenced
+pending markers and removes unreferenced ones within the retained and pending
+count/byte capacities.
+
 This is not an OS isolation boundary against an arbitrary process running as
 the same UID. Such a process can read the durable authentication key and can
 write an already-open regular-file inode despite mode `0600`; no portable file
@@ -313,11 +326,19 @@ final identity mismatch, scans the complete tree twice around archive creation,
 and checks every reopened entry against its first-scan identity. It accepts only
 NFC UTF-8 regular files and directories within the frozen entry, path, depth,
 file, extracted-byte, and archive-byte budgets. Symlinks and special files fail
-closed. Non-empty regular files must expose a complete no-hole extent through
-`SEEK_DATA`/`SEEK_HOLE`; unavailable or inconsistent extent queries fail closed,
-including allocated unwritten extents that `st_blocks` rounding cannot detect.
+closed. Directory names are charged to one global entry budget when enumerated,
+before recursive processing; each `scandir` materializes at most the remaining
+budget plus one before rejection and sorting. Non-empty regular files must have
+POSIX 512-byte `st_blocks` allocation covering their logical size and expose a
+complete no-hole extent through `SEEK_DATA`/`SEEK_HOLE`. This rejects a low-block
+sparse file even when the filesystem returns the standard's minimal `0,size`
+extent map. Unavailable or inconsistent allocation/extent evidence fails closed,
+including allocated unwritten extents. Fully allocated ordinary APFS files are
+accepted under minimal extent semantics; compressed, dataless, or other files
+whose reported allocation is smaller than logical size are explicitly unsupported
+because the bridge cannot prove them non-sparse.
 The deterministic tar is an unlinked mode-`0600` temporary regular file before
-`WorkspaceImportStore.ingest` sees it.
+`WorkspaceImportStore.ingest_pending` sees it.
 
 The private action deterministically selects the opaque import ID, so an exact
 retry with the same folder bytes converges and a changed body conflicts. A new

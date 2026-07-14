@@ -17,7 +17,7 @@ from pydantic import BaseModel, ConfigDict, Field, StringConstraints, Validation
 from starlette.concurrency import run_in_threadpool
 
 from desktop.server.app import create_desktop_app
-from desktop.sidecar.contracts.v1 import ProjectSourceV1
+from desktop.sidecar.contracts.v1 import ProjectSourceV1, WorkspaceImportRefV1
 from desktop.sidecar.native_workspace import (
     NativeWorkspaceArchiveError,
     prepare_native_workspace,
@@ -40,6 +40,7 @@ NATIVE_HANDOFF_HEADER = "X-OpenEvo-Native-Handoff"
 _NATIVE_HANDOFF_HEADER_BYTES = NATIVE_HANDOFF_HEADER.lower().encode("ascii")
 _NATIVE_SESSION_PROBE_ROUTE = "/openevo-native/session"
 _NATIVE_WORKSPACE_IMPORT_ROUTE = "/openevo-native/workspace-imports"
+_NATIVE_WORKSPACE_DISCARD_ROUTE = "/openevo-native/workspace-imports/discard"
 _NATIVE_WORKSPACE_REQUEST_MAX_BYTES = 8192
 _SOURCE_COMMIT_PATTERN = re.compile(r"[0-9a-f]{7,40}")
 
@@ -80,6 +81,38 @@ class _NativeWorkspaceImportRequest(BaseModel):
     selected_path: Annotated[str, StringConstraints(strict=True, min_length=1, max_length=4096)]
     selected_device: Annotated[int, Field(strict=True, ge=0, le=2**64 - 1)]
     selected_inode: Annotated[int, Field(strict=True, ge=1, le=2**64 - 1)]
+    project_id: _NativeText | None = None
+
+
+class _NativeWorkspaceImportResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    schema_version: Literal["1"] = "1"
+    source: ProjectSourceV1
+    lease_token: Annotated[
+        str,
+        StringConstraints(strict=True, pattern=r"^[0-9a-f]{64}$"),
+    ]
+
+
+class _NativeWorkspaceDiscardRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    schema_version: Literal["1"]
+    action_id: Annotated[
+        str,
+        StringConstraints(
+            strict=True,
+            min_length=16,
+            max_length=256,
+            pattern=r"^[^\x00-\x20\x7f](?:[^\x00-\x1f\x7f]*[^\x00-\x20\x7f])?$",
+        ),
+    ]
+    import_ref: WorkspaceImportRefV1
+    lease_token: Annotated[
+        str,
+        StringConstraints(strict=True, pattern=r"^[0-9a-f]{64}$"),
+    ]
     project_id: _NativeText | None = None
 
 
@@ -148,7 +181,7 @@ def create_app(
         except (UnicodeDecodeError, json.JSONDecodeError, ValueError, ValidationError):
             return _native_workspace_error(status_code=422)
         try:
-            source = await run_in_threadpool(
+            pending = await run_in_threadpool(
                 _ingest_native_workspace,
                 workspace_import_store,
                 parsed,
@@ -156,7 +189,42 @@ def create_app(
             )
         except (NativeWorkspaceArchiveError, WorkspaceImportError, OSError):
             return _native_workspace_error(status_code=409)
-        return JSONResponse(status_code=201, content=source.model_dump(mode="json"))
+        return JSONResponse(status_code=201, content=pending.model_dump(mode="json"))
+
+    @app.post(
+        _NATIVE_WORKSPACE_DISCARD_ROUTE,
+        include_in_schema=False,
+        status_code=204,
+    )
+    async def native_workspace_discard(request: Request) -> Response:
+        if not _native_credential_matches(
+            request,
+            header_name=_NATIVE_HANDOFF_HEADER_BYTES,
+            expected=expected_handoff_token,
+        ):
+            return _native_workspace_error(status_code=403)
+        content_type = request.headers.get("content-type", "").partition(";")[0].strip().lower()
+        if content_type != "application/json":
+            return _native_workspace_error(status_code=415)
+        try:
+            encoded = await _read_bounded_native_body(request)
+            document = json.loads(
+                encoded.decode("utf-8", errors="strict"),
+                object_pairs_hook=_strict_json_object,
+            )
+            parsed = _NativeWorkspaceDiscardRequest.model_validate(document)
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError, ValidationError):
+            return _native_workspace_error(status_code=422)
+        try:
+            await run_in_threadpool(
+                app.state.desktop_release_provider.discard_pending_workspace_import,
+                parsed.import_ref,
+                project_id=parsed.project_id,
+                lease_token=parsed.lease_token,
+            )
+        except (WorkspaceImportError, OSError):
+            return _native_workspace_error(status_code=409)
+        return Response(status_code=204)
 
     return create_desktop_app(app, static_root=static_root)
 
@@ -202,7 +270,7 @@ def _ingest_native_workspace(
     store: WorkspaceImportStore,
     request: _NativeWorkspaceImportRequest,
     temporary_root: Path,
-) -> ProjectSourceV1:
+) -> _NativeWorkspaceImportResponse:
     import_id = native_import_id_for_action(request.action_id)
     with prepare_native_workspace(
         request.selected_path,
@@ -215,15 +283,18 @@ def _ingest_native_workspace(
             prepared.import_ref,
             project_id=request.project_id,
         )
-        imported = store.ingest(
+        pending = store.ingest_pending(
             prepared.stream,
             ownership=ownership,
             import_id=import_id,
         )
-        return ProjectSourceV1(
-            kind="native_folder_snapshot",
-            display_name=prepared.display_name,
-            import_ref=imported,
+        return _NativeWorkspaceImportResponse(
+            source=ProjectSourceV1(
+                kind="native_folder_snapshot",
+                display_name=prepared.display_name,
+                import_ref=pending.import_ref,
+            ),
+            lease_token=pending.lease_token,
         )
 
 

@@ -309,6 +309,7 @@ describe("LocalApiDesktopProductProvider", () => {
         display_name: "Selected source",
         import_ref: CONTRACT_FIXTURE_V1.workspaceImport,
       }),
+      settleProjectSource: vi.fn(),
       configureCredential: vi.fn().mockResolvedValue(profile()),
     };
     const provider = new LocalApiDesktopProductProvider({ client, native, fetch: vi.fn<FetchLike>() });
@@ -473,6 +474,7 @@ function createProvider(client: DesktopApiClientV1, fetch: FetchLike = vi.fn<Fet
     client,
     native: {
       selectProjectSource: vi.fn(),
+      settleProjectSource: vi.fn(),
       configureCredential: vi.fn(),
     },
     fetch,

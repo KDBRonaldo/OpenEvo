@@ -212,6 +212,7 @@ class DesktopReleaseProvider:
                 request,
                 idempotency_key=cast(str, arguments["idempotency_key"]),
             )
+            self._adopt_project_source(project.source, project_id=project.project_id)
         return self._resource_response(project, status_code=201)
 
     def _get_project(self, arguments: Mapping[str, object]) -> Response:
@@ -230,6 +231,7 @@ class DesktopReleaseProvider:
                 request,
                 if_match=cast(str, arguments["if_match"]),
             )
+            self._adopt_project_source(project.source, project_id=project_id)
         if previous.source.import_ref != project.source.import_ref:
             self._release_project_source(previous.source, project_id=project_id)
         return self._resource_response(project)
@@ -271,6 +273,39 @@ class DesktopReleaseProvider:
             references = self._workspace_import_references()
             self._workspace_import_store.reconcile_references(references)
 
+    def discard_pending_workspace_import(
+        self,
+        import_ref: WorkspaceImportRefV1,
+        *,
+        project_id: str | None,
+        lease_token: str,
+    ) -> None:
+        """Discard one native picker lease unless durable project state references it."""
+
+        requested_ownership = ownership_for_native_import(
+            import_ref,
+            project_id=project_id,
+        )
+        with self._store.workspace_import_reference_guard():
+            references = self._workspace_import_references()
+            durable = references.get(import_ref.import_id)
+            if durable is not None:
+                durable_ref, durable_ownership = durable
+                if durable_ref != import_ref or durable_ownership != requested_ownership:
+                    raise WorkspaceImportError(
+                        "workspace import durable reference conflicts with pending lease"
+                    )
+                self._workspace_import_store.adopt_pending(
+                    durable_ref,
+                    ownership=durable_ownership,
+                )
+                return
+            self._workspace_import_store.discard_pending(
+                import_ref,
+                ownership=requested_ownership,
+                lease_token=lease_token,
+            )
+
     def _workspace_import_references(
         self,
     ) -> dict[str, tuple[WorkspaceImportRefV1, WorkspaceImportOwnership]]:
@@ -309,6 +344,17 @@ class DesktopReleaseProvider:
                 "deferred workspace import cleanup after committed project mutation",
                 extra={"project_id": project_id},
             )
+
+    def _adopt_project_source(self, source: ProjectSourceV1, *, project_id: str) -> None:
+        if source.kind != "native_folder_snapshot" or source.import_ref is None:
+            return
+        self._workspace_import_store.adopt_pending(
+            source.import_ref,
+            ownership=ownership_for_native_import(
+                source.import_ref,
+                project_id=project_id,
+            ),
+        )
 
     @staticmethod
     def _resource_response(

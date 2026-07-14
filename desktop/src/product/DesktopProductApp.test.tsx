@@ -556,6 +556,8 @@ describe("DesktopProductApp", () => {
 
   it("keeps create action identities when profile and project responses are uncertain", async () => {
     provider = createFixtureDesktopProductProvider({ newUser: true });
+    const selectSource = vi.spyOn(provider, "selectProjectSource");
+    const settleSource = vi.spyOn(provider, "settleProjectSource");
     root = await renderProduct(provider);
 
     await clickButton("Add workspace");
@@ -571,8 +573,11 @@ describe("DesktopProductApp", () => {
 
     await clickAria("Create project");
     setInput("Objective", "Keep one project create identity.");
+    await clickButton("Folder snapshot");
+    const pendingAction = selectSource.mock.calls[0]?.[0].actionId;
     provider.failNextProjectCreateWithUnknownError();
     await clickButton("Save");
+    expect(settleSource).toHaveBeenCalledWith(pendingAction, "discard");
     await clickButton("Save");
     expect(provider.projectCreateActionIds()[0]).toBe(provider.projectCreateActionIds()[1]);
   });
@@ -626,6 +631,7 @@ describe("DesktopProductApp", () => {
   it("selects and syncs a native folder through opaque source references", async () => {
     provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
     const selectSource = vi.spyOn(provider, "selectProjectSource");
+    const settleSource = vi.spyOn(provider, "settleProjectSource");
     root = await renderProduct(provider);
 
     await clickAria("Project settings");
@@ -634,6 +640,10 @@ describe("DesktopProductApp", () => {
     expect(screenText()).toContain("Selected research folder");
     expect(document.querySelector('input[type="file"]')).toBeNull();
     await clickButton("Save");
+    expect(settleSource).toHaveBeenCalledWith(
+      selectSource.mock.calls[0]?.[0].actionId,
+      "adopt",
+    );
     await clickAria("Project settings");
     await clickButton("Sync snapshot");
     await clickAria("Close settings");
@@ -645,6 +655,34 @@ describe("DesktopProductApp", () => {
       display_name: "Selected research folder",
       import_ref: { import_id: "source-fixture-1" },
     });
+  });
+
+  it("discards pending picker imports on close, reselection, and save failure", async () => {
+    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
+    const selectSource = vi.spyOn(provider, "selectProjectSource");
+    const settleSource = vi.spyOn(provider, "settleProjectSource");
+    root = await renderProduct(provider);
+
+    await clickAria("Project settings");
+    await clickButton("Folder snapshot");
+    const closedAction = selectSource.mock.calls[0]?.[0].actionId;
+    await clickAria("Close settings");
+    await clickButton("Discard changes");
+    await flush();
+    expect(settleSource).toHaveBeenCalledWith(closedAction, "discard");
+
+    await clickAria("Project settings");
+    await clickButton("Folder snapshot");
+    const replacedAction = selectSource.mock.calls[1]?.[0].actionId;
+    await clickButton("Folder snapshot");
+    expect(settleSource).toHaveBeenCalledWith(replacedAction, "discard");
+
+    provider.failNextProjectSave();
+    const failedAction = selectSource.mock.calls[2]?.[0].actionId;
+    await clickButton("Save");
+    await flush();
+    expect(settleSource).toHaveBeenCalledWith(failedAction, "discard");
+    expect(screenText()).toContain("New workspace");
   });
 
   it("keeps the source and dirty state when the native picker is cancelled", async () => {
@@ -723,6 +761,7 @@ describe("DesktopProductApp", () => {
     const selectSource = vi.spyOn(provider, "selectProjectSource")
       .mockImplementationOnce(() => first.promise)
       .mockResolvedValueOnce({ ...selected, display_name: "Current research folder" });
+    const settleSource = vi.spyOn(provider, "settleProjectSource");
     root = await renderProduct(provider);
 
     await clickAria("Project settings");
@@ -743,6 +782,10 @@ describe("DesktopProductApp", () => {
     await act(async () => first.resolve({ ...selected, display_name: "Stale research folder" }));
     await flush();
     expect(screenText()).not.toContain("Stale research folder");
+    expect(settleSource).toHaveBeenCalledWith(
+      selectSource.mock.calls[0]?.[0].actionId,
+      "discard",
+    );
 
     expect(folderButton.disabled).toBe(false);
     await clickButton("Folder snapshot");
