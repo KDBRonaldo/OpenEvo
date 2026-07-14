@@ -14,6 +14,16 @@ from fastapi.responses import JSONResponse
 
 from desktop.sidecar.contracts.v1.app import DESKTOP_SESSION_HEADER, create_contract_app
 from desktop.sidecar.contracts.v1.models import ApiErrorV1
+from desktop.sidecar.core_bridge_v1 import DesktopCoreBridgeErrorV1, DesktopCoreBridgeV1
+from desktop.sidecar.core_client_v1 import CoreClientErrorV1, CoreClientLocalErrorV1
+from desktop.sidecar.event_broker_v1 import (
+    DesktopEventBrokerClosedError,
+    DesktopEventBrokerError,
+    DesktopEventBrokerV1,
+    DesktopEventCapacityError,
+    DesktopEventCursorExpiredError,
+    DesktopEventSubscriberLimitError,
+)
 from desktop.sidecar.provider_store import (
     ContractValidationError,
     CursorExpiredError,
@@ -33,6 +43,10 @@ from desktop.sidecar.release_provider import (
     DesktopReleaseProvider,
     InvalidNativeChallengeError,
     ProviderCapabilityUnavailableError,
+)
+from desktop.sidecar.release_runtime import (
+    DesktopReleaseCoreRuntimeV1,
+    create_release_core_runtime,
 )
 from desktop.sidecar.remote_lifecycle import (
     DesktopRemoteLifecycle,
@@ -257,6 +271,9 @@ def create_release_desktop_local_api_app(
     build_channel: Literal["release", "development", "test"] = "release",
     clock: Callable[[], datetime] | None = None,
     remote_lifecycle: DesktopRemoteLifecycle | None = None,
+    core_assets_root: Path | str | None = None,
+    core_bridge: DesktopCoreBridgeV1 | None = None,
+    event_broker: DesktopEventBrokerV1 | None = None,
 ) -> FastAPI:
     """Create the release Desktop Local API v1 app and own its durable store."""
 
@@ -266,10 +283,13 @@ def create_release_desktop_local_api_app(
         or re.search(r"[\x00-\x1f\x7f]", session_token) is not None
     ):
         raise ValueError("Desktop session token must be 32-4096 characters without controls")
+    if core_assets_root is not None and (core_bridge is not None or event_broker is not None):
+        raise ValueError("packaged Core assets cannot be combined with injected Core resources")
     encoded_session_token = session_token.encode("utf-8")
     store = DesktopProviderStore(state_root, clock=clock)
     lifecycle = remote_lifecycle
     workspace_import_store: WorkspaceImportStore | None = None
+    core_runtime: DesktopReleaseCoreRuntimeV1 | None = None
     try:
         if lifecycle is None:
             lifecycle = DesktopRemoteLifecycle(
@@ -282,6 +302,14 @@ def create_release_desktop_local_api_app(
             store.state_root / "workspace-imports",
             reconcile_on_open=False,
         )
+        if core_assets_root is not None:
+            core_runtime = create_release_core_runtime(
+                provider_store=store,
+                workspace_store=workspace_import_store,
+                remote_lifecycle=lifecycle,
+                asset_root=core_assets_root,
+                source_commit=source_commit,
+            )
         provider = DesktopReleaseProvider(
             store,
             workspace_import_store,
@@ -291,15 +319,32 @@ def create_release_desktop_local_api_app(
             instance_id=instance_id,
             readiness_key=readiness_key,
             remote_lifecycle=lifecycle,
+            core_runtime=core_runtime,
+            core_bridge=core_bridge,
+            event_broker=event_broker,
             clock=clock,
         )
         app = create_contract_app(provider)
     except BaseException:
-        if lifecycle is not None:
-            lifecycle.close()
-        if workspace_import_store is not None:
-            workspace_import_store.close()
-        store.close()
+        try:
+            if core_runtime is not None:
+                core_runtime.close()
+            elif event_broker is not None:
+                event_broker.close()
+        finally:
+            try:
+                if core_runtime is None and core_bridge is not None:
+                    core_bridge.close()
+            finally:
+                try:
+                    if lifecycle is not None:
+                        lifecycle.close()
+                finally:
+                    try:
+                        store.close()
+                    finally:
+                        if workspace_import_store is not None:
+                            workspace_import_store.close()
         raise
     app.state.desktop_release_provider = provider
 
@@ -351,9 +396,7 @@ def create_release_desktop_local_api_app(
         )
 
     @app.exception_handler(RemoteLifecycleError)
-    async def handle_remote_lifecycle(
-        request: Request, exc: RemoteLifecycleError
-    ) -> JSONResponse:
+    async def handle_remote_lifecycle(request: Request, exc: RemoteLifecycleError) -> JSONResponse:
         if isinstance(exc, RemoteCredentialUnavailableError):
             return _error_response(
                 request,
@@ -384,6 +427,88 @@ def create_release_desktop_local_api_app(
             retryable=True,
             repair_action="openevo_can_retry",
             next_action="Check the server and SSH settings, then retry.",
+        )
+
+    @app.exception_handler(DesktopCoreBridgeErrorV1)
+    async def handle_core_bridge_error(
+        request: Request, exc: DesktopCoreBridgeErrorV1
+    ) -> JSONResponse:
+        del request
+        return JSONResponse(
+            status_code=exc.error.http_status,
+            content=exc.error.model_dump(mode="json"),
+        )
+
+    @app.exception_handler(CoreClientErrorV1)
+    async def handle_core_client_error(request: Request, exc: CoreClientErrorV1) -> JSONResponse:
+        if isinstance(exc.error, ApiErrorV1):
+            return JSONResponse(
+                status_code=exc.status_code,
+                content=exc.error.model_dump(mode="json"),
+            )
+        if not isinstance(exc.error, CoreClientLocalErrorV1):
+            return _error_response(
+                request,
+                status_code=502,
+                code="invalid_core_error",
+                message="OpenEvo Core returned an invalid error response.",
+                category="service",
+            )
+        category: ErrorCategory
+        if exc.error.code.value in {"invalid_core_request", "invalid_core_response"}:
+            category = "contract"
+        elif exc.error.code.value in {
+            "active_project_mismatch",
+            "core_snapshot_refresh_required",
+        }:
+            category = "project"
+        else:
+            category = "connection"
+        return _error_response(
+            request,
+            status_code=exc.status_code,
+            code=exc.error.code.value,
+            message=exc.error.message,
+            category=category,
+            retryable=exc.error.retryable,
+            repair_action=("openevo_can_retry" if exc.error.retryable else "none"),
+        )
+
+    @app.exception_handler(DesktopEventCursorExpiredError)
+    async def handle_event_cursor_expired(
+        request: Request, exc: DesktopEventCursorExpiredError
+    ) -> JSONResponse:
+        del exc
+        return _error_response(
+            request,
+            status_code=410,
+            code="event_cursor_expired",
+            message="The Desktop event cursor is outside the replay window.",
+            category="operation",
+            repair_action="openevo_can_retry",
+            next_action="Refresh Desktop state and reconnect the event stream.",
+        )
+
+    @app.exception_handler(DesktopEventBrokerError)
+    async def handle_event_broker_error(
+        request: Request, exc: DesktopEventBrokerError
+    ) -> JSONResponse:
+        retryable = isinstance(
+            exc,
+            (
+                DesktopEventBrokerClosedError,
+                DesktopEventCapacityError,
+                DesktopEventSubscriberLimitError,
+            ),
+        )
+        return _error_response(
+            request,
+            status_code=503,
+            code="event_stream_unavailable",
+            message="The Desktop event stream is temporarily unavailable.",
+            category="operation",
+            retryable=retryable,
+            repair_action="openevo_can_retry" if retryable else "none",
         )
 
     @app.exception_handler(RequestValidationError)
@@ -426,9 +551,7 @@ def create_release_desktop_local_api_app(
         return _error_response(
             request,
             status_code=422 if invalid_reference else 503,
-            code="workspace_import_invalid"
-            if invalid_reference
-            else "local_provider_unavailable",
+            code="workspace_import_invalid" if invalid_reference else "local_provider_unavailable",
             message="The selected workspace snapshot is unavailable."
             if invalid_reference
             else "The local Desktop provider is unavailable.",

@@ -35,6 +35,8 @@ from openevo.backend.contracts.v1 import models as core_v1
 
 
 NOW = "2026-07-14T12:00:00Z"
+LATER = "2026-07-14T12:01:00Z"
+LATEST = "2026-07-14T12:02:00Z"
 LOCAL_PROJECT_ID = "local-project-1"
 CORE_PROJECT_ID = "core-project-1"
 PROFILE_ID = "profile-1"
@@ -249,10 +251,10 @@ def _mapping(
         project_etag=etag,
         active_revision=REVISION,
         project_updated_at=NOW,
-        mapping_generation=generation,
-        predecessor_request_sha256=predecessor,
         immutable_authority=bridge_module._patch_immutable_authority(project),
         mutable_authority=bridge_module._patch_mutable_authority(project),
+        mapping_generation=generation,
+        predecessor_request_sha256=predecessor,
     )
 
 
@@ -812,9 +814,20 @@ def test_mapping_history_is_ordered_and_capacity_is_fail_closed(tmp_path: Path) 
         predecessor=None,
     )
     store.commit_mapping(operation, mapping_a, expected_previous=None, completed_patch=None)
+    successor = REVISION.model_copy(
+        update={"id": "revision-1", "generation": 1, "manifest_sha256": "7" * 64}
+    )
     mapping_b = replace(
         mapping_a,
+        active_revision=successor,
         project_etag=ETAG_B,
+        project_updated_at=LATER,
+        mutable_authority=replace(
+            mapping_a.mutable_authority,
+            active_revision=successor,
+            etag=ETAG_B,
+            updated_at=LATER,
+        ),
         mapping_generation=2,
         predecessor_request_sha256=mapping_a.request_sha256,
     )
@@ -845,6 +858,11 @@ def test_mapping_commit_rejects_same_revision_generation_rewrite(tmp_path: Path)
         mapping_a,
         active_revision=rewritten_revision,
         project_etag=ETAG_B,
+        mutable_authority=replace(
+            mapping_a.mutable_authority,
+            active_revision=rewritten_revision,
+            etag=ETAG_B,
+        ),
         mapping_generation=2,
         predecessor_request_sha256=mapping_a.request_sha256,
     )
@@ -867,9 +885,20 @@ def test_mapping_history_rejects_nonadjacent_etag_reuse(tmp_path: Path) -> None:
         predecessor=None,
     )
     store.commit_mapping(operation, mapping_a, expected_previous=None, completed_patch=None)
+    successor_b = REVISION.model_copy(
+        update={"id": "revision-1", "generation": 1, "manifest_sha256": "7" * 64}
+    )
     mapping_b = replace(
         mapping_a,
+        active_revision=successor_b,
         project_etag=ETAG_B,
+        project_updated_at=LATER,
+        mutable_authority=replace(
+            mapping_a.mutable_authority,
+            active_revision=successor_b,
+            etag=ETAG_B,
+            updated_at=LATER,
+        ),
         mapping_generation=2,
         predecessor_request_sha256=mapping_a.request_sha256,
     )
@@ -879,9 +908,20 @@ def test_mapping_history_rejects_nonadjacent_etag_reuse(tmp_path: Path) -> None:
         expected_previous=mapping_a,
         completed_patch=None,
     )
+    successor_c = REVISION.model_copy(
+        update={"id": "revision-2", "generation": 2, "manifest_sha256": "8" * 64}
+    )
     mapping_rollback = replace(
         mapping_b,
+        active_revision=successor_c,
         project_etag=ETAG_A,
+        project_updated_at=LATEST,
+        mutable_authority=replace(
+            mapping_b.mutable_authority,
+            active_revision=successor_c,
+            etag=ETAG_A,
+            updated_at=LATEST,
+        ),
         mapping_generation=3,
         predecessor_request_sha256=mapping_b.request_sha256,
     )
@@ -966,16 +1006,21 @@ def test_mapping_commit_rejects_revision_successor_reusing_applied_etag(
             "manifest_sha256": "7" * 64,
         }
     )
+    mapping_b_base = _mapping(
+        request_b,
+        generation=2,
+        project_snapshot=PROJECT_SNAPSHOT_B,
+        task_snapshot=TASK_SNAPSHOT_B,
+        etag=ETAG_B,
+        predecessor=mapping_a.request_sha256,
+    )
     mapping_b = replace(
-        _mapping(
-            request_b,
-            generation=2,
-            project_snapshot=PROJECT_SNAPSHOT_B,
-            task_snapshot=TASK_SNAPSHOT_B,
-            etag=ETAG_B,
-            predecessor=mapping_a.request_sha256,
-        ),
+        mapping_b_base,
         active_revision=successor,
+        mutable_authority=replace(
+            mapping_b_base.mutable_authority,
+            active_revision=successor,
+        ),
     )
 
     with pytest.raises(CoreBridgeStoreContractError, match="applied patch"):
@@ -1018,7 +1063,14 @@ def test_first_imported_mapping_is_bound_to_finalize_outcome(
         core_host_identity=HOST_IDENTITY,
         previous_mapping=None,
     )
-    unbound = replace(mapping, project_snapshot=PROJECT_SNAPSHOT_A)
+    unbound = replace(
+        mapping,
+        project_snapshot=PROJECT_SNAPSHOT_A,
+        mutable_authority=replace(
+            mapping.mutable_authority,
+            project_snapshot=PROJECT_SNAPSHOT_A,
+        ),
+    )
 
     with pytest.raises(CoreBridgeStoreContractError, match="finalize outcome"):
         store.commit_mapping(

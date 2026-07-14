@@ -39,6 +39,7 @@ from desktop.sidecar.contracts.v1.models import (
     ProjectPatchV1,
     ProjectSourceV1,
     ProjectV1,
+    RemoteProjectStateV1,
     RemoteProfileCreateV1,
     RemoteProfilePageV1,
     RemoteProfilePatchV1,
@@ -48,7 +49,7 @@ from desktop.sidecar.contracts.v1.models import (
 from desktop.sidecar.workspace_identity import project_id_for_native_import
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 DATABASE_FILENAME = "provider.sqlite3"
 JOURNAL_FILENAME = f"{DATABASE_FILENAME}-journal"
 WAL_FILENAME = f"{DATABASE_FILENAME}-wal"
@@ -71,6 +72,10 @@ MAX_SCHEMA_OBJECTS = 40
 MAX_SCHEMA_BYTES = 98_304
 STARTUP_OPERATION_BATCH_ROWS = 128
 MAX_STARTUP_OPERATION_ROW_BYTES = MAX_DOCUMENT_BYTES + 16_384
+# RemoteProjectStateV1 is a closed, scalar-heavy projection rather than a general
+# provider document. Keep both one observation and the recovered history small.
+MAX_REMOTE_PROJECT_STATE_BYTES = 262_144
+MAX_REMOTE_PROJECT_STATE_RECOVERY_BYTES = 16_777_216
 # Profile reservations always have empty progress/checks; this bounds their largest
 # success, cancellation, or bounded ApiErrorV1 terminal document with ample margin.
 PROFILE_RUNTIME_TERMINAL_SLOT_BYTES = 1_048_576
@@ -463,6 +468,36 @@ _SCHEMA_V2 = (
     "CREATE INDEX pagination_cursors_expiry_idx ON pagination_cursors(expires_at_epoch)",
 )
 
+_SCHEMA_V3 = (
+    """
+    CREATE TABLE schema_migrations (
+        version INTEGER PRIMARY KEY CHECK (version BETWEEN 1 AND 3),
+        applied_at TEXT NOT NULL CHECK (length(CAST(applied_at AS BLOB)) = 27)
+    ) STRICT
+    """,
+    _SCHEMA_V2[1],
+    f"""
+    CREATE TABLE projects (
+        project_id TEXT PRIMARY KEY,
+        profile_id TEXT NOT NULL,
+        name TEXT NOT NULL,
+        document_json BLOB NOT NULL,
+        state TEXT NOT NULL,
+        current_revision_id TEXT,
+        remote_state_json BLOB,
+        resource_version INTEGER NOT NULL CHECK (resource_version >= 1),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        FOREIGN KEY (profile_id) REFERENCES remote_profiles(profile_id) ON DELETE RESTRICT,
+        CHECK (
+            remote_state_json IS NULL OR
+            length(remote_state_json) <= {MAX_REMOTE_PROJECT_STATE_BYTES}
+        )
+    ) STRICT
+    """,
+    *_SCHEMA_V2[3:],
+)
+
 
 def _schema_rows(connection: sqlite3.Connection) -> tuple[tuple[object, ...], ...]:
     count, byte_count = connection.execute(
@@ -518,7 +553,8 @@ def _canonical_json_bytes(value: Any) -> bytes:
 
 
 _EXPECTED_SCHEMA_V1_ROWS, _EXPECTED_SCHEMA_V1_DIGEST = _expected_schema(_SCHEMA_V1)
-_EXPECTED_SCHEMA_ROWS, _EXPECTED_SCHEMA_DIGEST = _expected_schema(_SCHEMA_V2)
+_EXPECTED_SCHEMA_V2_ROWS, _EXPECTED_SCHEMA_V2_DIGEST = _expected_schema(_SCHEMA_V2)
+_EXPECTED_SCHEMA_ROWS, _EXPECTED_SCHEMA_DIGEST = _expected_schema(_SCHEMA_V3)
 
 
 def _decode_json_object(raw: bytes, *, label: str) -> dict[str, Any]:
@@ -610,7 +646,7 @@ class ProviderMutation:
         *,
         if_match: str,
         state: Literal["draft", "active", "archived", "blocked"],
-        current_revision_id: str | None = None,
+        remote_state: RemoteProjectStateV1 | None = None,
         _reservation_operation_id: str | None = None,
     ) -> ProjectV1:
         self._store._validate_resource_id(project_id)
@@ -618,11 +654,26 @@ class ProviderMutation:
         self._require_bound_if_match(if_match)
         if state not in {"draft", "active", "archived", "blocked"}:
             raise ContractValidationError("project state is not a Desktop v1 state")
-        if current_revision_id is not None:
-            self._store._validate_resource_id(current_revision_id)
         row = self._store._require_project_row(self._connection, project_id)
         self._store._require_etag("project", project_id, row, if_match)
         if state == "active":
+            if remote_state is None:
+                raise ContractValidationError(
+                    "project activation requires a ready remote project state"
+                )
+            try:
+                validated_remote = _validate_model(RemoteProjectStateV1, remote_state)
+            except ContractValidationError as exc:
+                raise ContractValidationError(
+                    "project activation requires a valid remote project state"
+                ) from exc
+            self._store._validate_activation_remote_state(validated_remote)
+            active_revision = validated_remote.active_revision
+            if active_revision is None:
+                raise ContractValidationError(
+                    "project activation requires a ready remote project state"
+                )
+            remote_state_bytes = self._store._encode_remote_project_state(validated_remote)
             self._store._require_project_operation_reservation_available(
                 self._connection,
                 project_id,
@@ -638,15 +689,34 @@ class ProviderMutation:
                 """,
                 (self._store._timestamp(), project_id),
             )
-        self._connection.execute(
-            """
-            UPDATE projects
-            SET state = ?, current_revision_id = ?,
-                resource_version = resource_version + 1, updated_at = ?
-            WHERE project_id = ?
-            """,
-            (state, current_revision_id, self._store._timestamp(), project_id),
-        )
+            self._connection.execute(
+                """
+                UPDATE projects
+                SET state = 'active', current_revision_id = ?, remote_state_json = ?,
+                    resource_version = resource_version + 1, updated_at = ?
+                WHERE project_id = ?
+                """,
+                (
+                    active_revision.id,
+                    remote_state_bytes,
+                    self._store._timestamp(),
+                    project_id,
+                ),
+            )
+        else:
+            if remote_state is not None:
+                raise ContractValidationError(
+                    "non-activation project state cannot publish remote project state"
+                )
+            self._connection.execute(
+                """
+                UPDATE projects
+                SET state = ?, current_revision_id = NULL,
+                    resource_version = resource_version + 1, updated_at = ?
+                WHERE project_id = ?
+                """,
+                (state, self._store._timestamp(), project_id),
+            )
         return self._store._project_from_row(
             self._store._require_project_row(self._connection, project_id)
         )
@@ -864,8 +934,8 @@ class ProviderMutation:
             """
             INSERT INTO projects(
                 project_id, profile_id, name, document_json, state,
-                current_revision_id, resource_version, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, 'draft', NULL, 1, ?, ?)
+                current_revision_id, remote_state_json, resource_version, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, 'draft', NULL, NULL, 1, ?, ?)
             """,
             (
                 project_id,
@@ -1334,12 +1404,12 @@ class DesktopProviderStore:
                 }
                 if existing:
                     raise ProviderSchemaError("unversioned provider database is not empty")
-                for statement in _SCHEMA_V2:
+                for statement in _SCHEMA_V3:
                     connection.execute(statement)
                 timestamp = self._timestamp()
                 connection.executemany(
                     "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
-                    ((1, timestamp), (2, timestamp)),
+                    ((1, timestamp), (2, timestamp), (3, timestamp)),
                 )
                 connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             elif version == 1:
@@ -1349,7 +1419,25 @@ class DesktopProviderStore:
                     digest=_EXPECTED_SCHEMA_V1_DIGEST,
                     label="v1",
                 )
+                self._validate_migration_rows(connection, expected_version=1)
                 self._migrate_v1_to_v2(connection)
+                self._validate_schema_version(
+                    connection,
+                    rows=_EXPECTED_SCHEMA_V2_ROWS,
+                    digest=_EXPECTED_SCHEMA_V2_DIGEST,
+                    label="v2",
+                )
+                self._validate_migration_rows(connection, expected_version=2)
+                self._migrate_v2_to_v3(connection)
+            elif version == 2:
+                self._validate_schema_version(
+                    connection,
+                    rows=_EXPECTED_SCHEMA_V2_ROWS,
+                    digest=_EXPECTED_SCHEMA_V2_DIGEST,
+                    label="v2",
+                )
+                self._validate_migration_rows(connection, expected_version=2)
+                self._migrate_v2_to_v3(connection)
             elif version != SCHEMA_VERSION:
                 raise ProviderSchemaError(f"unsupported provider schema version {version}")
             self._validate_schema(connection)
@@ -1404,13 +1492,65 @@ class DesktopProviderStore:
             connection.execute(statement)
         connection.execute("PRAGMA user_version = 2")
 
+    def _migrate_v2_to_v3(self, connection: sqlite3.Connection) -> None:
+        timestamp = self._timestamp()
+        for index_name in (
+            "projects_updated_idx",
+            "projects_created_idx",
+            "projects_name_idx",
+            "projects_profile_idx",
+            "projects_single_active_idx",
+        ):
+            connection.execute(f"DROP INDEX {index_name}")
+        connection.execute("ALTER TABLE projects RENAME TO projects_v2")
+        connection.execute("ALTER TABLE schema_migrations RENAME TO schema_migrations_v2")
+        connection.execute(_SCHEMA_V3[0])
+        connection.execute(_SCHEMA_V3[2])
+        connection.execute(
+            """
+            INSERT INTO schema_migrations(version, applied_at)
+            SELECT version, applied_at FROM schema_migrations_v2
+            """
+        )
+        connection.execute(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (3, ?)",
+            (timestamp,),
+        )
+        connection.execute(
+            """
+            INSERT INTO projects(
+                project_id, profile_id, name, document_json, state,
+                current_revision_id, remote_state_json, resource_version,
+                created_at, updated_at
+            )
+            SELECT project_id, profile_id, name, document_json,
+                   CASE WHEN state = 'active' THEN 'draft' ELSE state END,
+                   NULL, NULL,
+                   resource_version + CASE
+                       WHEN state = 'active' OR current_revision_id IS NOT NULL THEN 1 ELSE 0
+                   END,
+                   created_at,
+                   CASE
+                       WHEN state = 'active' OR current_revision_id IS NOT NULL THEN ?
+                       ELSE updated_at
+                   END
+            FROM projects_v2
+            """,
+            (timestamp,),
+        )
+        connection.execute("DROP TABLE projects_v2")
+        connection.execute("DROP TABLE schema_migrations_v2")
+        for statement in _SCHEMA_V3[9:14]:
+            connection.execute(statement)
+        connection.execute("PRAGMA user_version = 3")
+
     @staticmethod
     def _validate_schema(connection: sqlite3.Connection) -> None:
         DesktopProviderStore._validate_schema_version(
             connection,
             rows=_EXPECTED_SCHEMA_ROWS,
             digest=_EXPECTED_SCHEMA_DIGEST,
-            label="v2",
+            label="v3",
         )
 
     @staticmethod
@@ -1436,6 +1576,7 @@ class DesktopProviderStore:
         try:
             connection.execute("BEGIN EXCLUSIVE")
             self._validate_schema(connection)
+            self._validate_remote_state_recovery_budget(connection)
             integrity = connection.execute("PRAGMA integrity_check(1)").fetchall()
             if [tuple(row) for row in integrity] != [("ok",)]:
                 raise ProviderDataCorruptionError("provider SQLite integrity check failed")
@@ -1445,8 +1586,13 @@ class DesktopProviderStore:
             self._validate_migration_rows(connection)
             for row in connection.execute("SELECT * FROM remote_profiles"):
                 self._validate_profile_recovery_row(cast(sqlite3.Row, row))
-            for row in connection.execute("SELECT * FROM projects"):
-                self._validate_project_recovery_row(cast(sqlite3.Row, row))
+            for identity_row in connection.execute(
+                "SELECT project_id FROM projects ORDER BY project_id"
+            ):
+                project_id = cast(str, identity_row["project_id"])
+                self._validate_project_recovery_row(
+                    self._require_project_row(connection, project_id)
+                )
             for row in connection.execute("SELECT * FROM local_operations"):
                 self._validate_operation_recovery_row(cast(sqlite3.Row, row))
             for row in connection.execute("SELECT * FROM idempotency_records"):
@@ -1542,7 +1688,31 @@ class DesktopProviderStore:
         if total_rows > MAX_RECOVERY_ROWS or total_bytes > MAX_RECOVERY_BYTES:
             raise ProviderDataCorruptionError("provider recovery budget exceeded")
 
+    @staticmethod
+    def _remote_state_recovery_usage(connection: sqlite3.Connection) -> tuple[int, int]:
+        maximum_bytes, total_bytes = connection.execute(
+            """
+            SELECT coalesce(max(length(CAST(remote_state_json AS BLOB))), 0),
+                   coalesce(sum(length(CAST(remote_state_json AS BLOB))), 0)
+            FROM projects
+            WHERE remote_state_json IS NOT NULL
+            """
+        ).fetchone()
+        if type(maximum_bytes) is not int or type(total_bytes) is not int:
+            raise ProviderDataCorruptionError("remote project state recovery usage is invalid")
+        return maximum_bytes, total_bytes
+
+    @classmethod
+    def _validate_remote_state_recovery_budget(cls, connection: sqlite3.Connection) -> None:
+        maximum_bytes, total_bytes = cls._remote_state_recovery_usage(connection)
+        if (
+            maximum_bytes > MAX_REMOTE_PROJECT_STATE_BYTES
+            or total_bytes > MAX_REMOTE_PROJECT_STATE_RECOVERY_BYTES
+        ):
+            raise ProviderDataCorruptionError("remote project state recovery budget exceeded")
+
     def _validate_write_budget(self, connection: sqlite3.Connection) -> None:
+        self._validate_remote_state_recovery_budget(connection)
         total_rows, total_bytes = self._recovery_usage(connection)
         profile_reservations, project_reservations = self._validate_live_action_authorities(
             connection
@@ -1624,12 +1794,19 @@ class DesktopProviderStore:
             if len(operation_ids) < STARTUP_OPERATION_BATCH_ROWS:
                 return profile_reservations, project_reservations
 
-    def _validate_migration_rows(self, connection: sqlite3.Connection) -> None:
+    def _validate_migration_rows(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        expected_version: int = SCHEMA_VERSION,
+    ) -> None:
         rows = connection.execute(
             "SELECT version, applied_at FROM schema_migrations ORDER BY version"
         ).fetchall()
-        if [row["version"] for row in rows] != [1, 2]:
-            raise ProviderSchemaError("provider migration ledger does not match schema v2")
+        if [row["version"] for row in rows] != list(range(1, expected_version + 1)):
+            raise ProviderSchemaError(
+                f"provider migration ledger does not match schema v{expected_version}"
+            )
         for row in rows:
             self._validate_persisted_timestamp(cast(str, row["applied_at"]))
 
@@ -1679,6 +1856,28 @@ class DesktopProviderStore:
             raise ProviderDataCorruptionError(
                 "stored project config contains a persistence-denied key"
             ) from exc
+
+    @classmethod
+    def _validate_activation_remote_state(
+        cls,
+        remote_state: RemoteProjectStateV1,
+    ) -> None:
+        if (
+            remote_state.status != "ready"
+            or remote_state.active_revision is None
+            or remote_state.active_revision.project_id != remote_state.core_project_id
+        ):
+            raise ContractValidationError(
+                "project activation requires a matching ready remote project state"
+            )
+        cls._validate_resource_id(remote_state.active_revision.id)
+
+    @staticmethod
+    def _encode_remote_project_state(remote_state: RemoteProjectStateV1) -> bytes:
+        encoded = _canonical_json_bytes(remote_state.model_dump(mode="json"))
+        if len(encoded) > MAX_REMOTE_PROJECT_STATE_BYTES:
+            raise ContractValidationError("remote project state exceeds its byte bound")
+        return encoded
 
     def _validate_operation_recovery_row(self, row: sqlite3.Row) -> None:
         operation = self._operation_from_row(row)
@@ -1976,17 +2175,19 @@ class DesktopProviderStore:
         """Return the bounded persisted source set used for private-store recovery."""
 
         with self._transaction(write=False) as connection:
-            rows = connection.execute(
-                "SELECT * FROM projects ORDER BY project_id ASC LIMIT ?",
+            identity_rows = connection.execute(
+                "SELECT project_id FROM projects ORDER BY project_id ASC LIMIT ?",
                 (MAX_RECOVERY_ROWS + 1,),
             ).fetchall()
-            if len(rows) > MAX_RECOVERY_ROWS:
+            if len(identity_rows) > MAX_RECOVERY_ROWS:
                 raise ProviderDataCorruptionError(
                     "project recovery row count exceeds the startup limit"
                 )
             sources = []
-            for row in rows:
-                project = self._project_from_row(row)
+            for identity_row in identity_rows:
+                project = self._project_from_row(
+                    self._require_project_row(connection, cast(str, identity_row["project_id"]))
+                )
                 if project.source.kind == "native_folder_snapshot":
                     sources.append((project.project_id, project.source))
             return tuple(sources)
@@ -1995,6 +2196,32 @@ class DesktopProviderStore:
         self._validate_resource_id(operation_id)
         with self._transaction(write=False) as connection:
             return self._operation_from_row(self._require_operation_row(connection, operation_id))
+
+    def pending_operation_ids(self) -> tuple[str, ...]:
+        """Return the bounded, stable set of operations that may still make progress."""
+
+        with self._transaction(write=False) as connection:
+            rows = connection.execute(
+                """
+                SELECT operation_id
+                FROM local_operations
+                WHERE state IN ('queued', 'running', 'cancelling')
+                ORDER BY operation_id ASC
+                LIMIT ?
+                """,
+                (MAX_RECOVERY_ROWS + 1,),
+            ).fetchall()
+            if len(rows) > MAX_RECOVERY_ROWS:
+                raise ProviderDataCorruptionError(
+                    "pending operation row count exceeds the recovery limit"
+                )
+            operation_ids = tuple(cast(str, row["operation_id"]) for row in rows)
+            try:
+                for operation_id in operation_ids:
+                    self._validate_resource_id(operation_id)
+            except ContractValidationError as exc:
+                raise ProviderDataCorruptionError("pending operation identity is invalid") from exc
+            return operation_ids
 
     def patch_project(
         self,
@@ -2010,8 +2237,8 @@ class DesktopProviderStore:
             row = self._require_project_row(connection, project_id)
             self._require_etag("project", project_id, row, if_match)
             self._require_project_not_busy(connection, project_id)
-            if row["state"] == "active" or row["current_revision_id"] is not None:
-                raise ResourceInUseError("project", project_id)
+            if row["state"] == "active":
+                self._require_active_project_activation_authority_available(connection, project_id)
             current = _decode_json_object(bytes(row["document_json"]), label="project")
             current.update(validated_patch.model_dump(mode="json", exclude_unset=True))
             validated = _validate_json_model(ProjectCreateV1, current)
@@ -2023,6 +2250,11 @@ class DesktopProviderStore:
                 """
                 UPDATE projects
                 SET profile_id = ?, name = ?, document_json = ?,
+                    state = CASE
+                        WHEN state IN ('active', 'blocked') THEN 'draft'
+                        ELSE state
+                    END,
+                    current_revision_id = NULL, remote_state_json = NULL,
                     resource_version = ?, updated_at = ?
                 WHERE project_id = ?
                 """,
@@ -2566,8 +2798,25 @@ class DesktopProviderStore:
         key: str,
         body: BaseModel | Mapping[str, object],
         if_match: str,
-        current_revision_id: str | None,
+        remote_state: RemoteProjectStateV1 | None,
     ) -> LocalOperationV1:
+        validated_remote: RemoteProjectStateV1 | None = None
+        if operation_kind == "project_activate":
+            if remote_state is None:
+                raise ContractValidationError(
+                    "project activation completion requires a remote project state"
+                )
+            try:
+                validated_remote = _validate_model(RemoteProjectStateV1, remote_state)
+            except ContractValidationError as exc:
+                raise ContractValidationError(
+                    "project activation completion requires a valid remote project state"
+                ) from exc
+            self._validate_activation_remote_state(validated_remote)
+        elif remote_state is not None:
+            raise ContractValidationError(
+                "non-activation project completion cannot publish remote project state"
+            )
         identity = self._project_action_identity(
             route=route,
             operation_kind=operation_kind,
@@ -2587,27 +2836,22 @@ class DesktopProviderStore:
                 raise ProviderStoreError("project runtime action is no longer completable")
             result = operation.result
             if operation_kind == "project_activate":
-                if current_revision_id is None:
-                    raise ContractValidationError(
-                        "project activation completion requires a revision identity"
+                if validated_remote is None:
+                    raise ProviderStoreError(
+                        "validated activation remote project state is unavailable"
                     )
-                self._validate_resource_id(current_revision_id)
                 current = self._project_from_row(self._require_project_row(connection, project_id))
                 active = ProviderMutation(self, connection).set_project_state(
                     project_id,
                     if_match=current.etag,
                     state="active",
-                    current_revision_id=current_revision_id,
+                    remote_state=validated_remote,
                     _reservation_operation_id=operation.operation_id,
                 )
                 result = ProjectOperationResultV1(
                     project_id=project_id,
                     project_etag=active.etag,
                     active=True,
-                )
-            elif current_revision_id is not None:
-                raise ContractValidationError(
-                    "non-activation project completion cannot bind a revision identity"
                 )
             return self._finish_reserved_project_action(
                 connection,
@@ -3385,13 +3629,27 @@ class DesktopProviderStore:
         return cast(sqlite3.Row, row)
 
     @staticmethod
-    def _require_project_row(connection: sqlite3.Connection, project_id: str) -> sqlite3.Row:
+    def _project_select_columns() -> str:
+        return (
+            "project_id, profile_id, name, document_json, state, current_revision_id, "
+            "CASE WHEN remote_state_json IS NULL OR "
+            f"length(CAST(remote_state_json AS BLOB)) <= {MAX_REMOTE_PROJECT_STATE_BYTES} "
+            "THEN remote_state_json ELSE NULL END AS remote_state_json, "
+            "length(CAST(remote_state_json AS BLOB)) AS remote_state_bytes, "
+            "resource_version, created_at, updated_at"
+        )
+
+    @classmethod
+    def _require_project_row(cls, connection: sqlite3.Connection, project_id: str) -> sqlite3.Row:
         row = connection.execute(
-            "SELECT * FROM projects WHERE project_id = ?", (project_id,)
+            f"SELECT {cls._project_select_columns()} FROM projects WHERE project_id = ?",
+            (project_id,),
         ).fetchone()
         if row is None:
             raise ResourceNotFoundError("project", project_id)
-        return cast(sqlite3.Row, row)
+        guarded = cast(sqlite3.Row, row)
+        cls._validate_remote_state_cell(guarded)
+        return guarded
 
     @staticmethod
     def _require_project_not_busy(
@@ -3481,22 +3739,35 @@ class DesktopProviderStore:
             return
 
         if project["state"] == "active":
-            displacing_activation = connection.execute(
-                """
-                SELECT operation_id
-                FROM local_operations
-                WHERE operation_kind = 'project_activate'
-                  AND resource_type = 'project'
-                  AND resource_id != ?
-                  AND state IN ('queued', 'running', 'cancelling')
-                  AND operation_id != ?
-                ORDER BY operation_id
-                LIMIT 1
-                """,
-                (project_id, excluded_operation_id or ""),
-            ).fetchone()
-            if displacing_activation is not None:
-                raise ResourceInUseError("project", project_id)
+            cls._require_active_project_activation_authority_available(
+                connection,
+                project_id,
+                excluded_operation_id=excluded_operation_id,
+            )
+
+    @staticmethod
+    def _require_active_project_activation_authority_available(
+        connection: sqlite3.Connection,
+        project_id: str,
+        *,
+        excluded_operation_id: str | None = None,
+    ) -> None:
+        displacing_activation = connection.execute(
+            """
+            SELECT operation_id
+            FROM local_operations
+            WHERE operation_kind = 'project_activate'
+              AND resource_type = 'project'
+              AND resource_id != ?
+              AND state IN ('queued', 'running', 'cancelling')
+              AND operation_id != ?
+            ORDER BY operation_id
+            LIMIT 1
+            """,
+            (project_id, excluded_operation_id or ""),
+        ).fetchone()
+        if displacing_activation is not None:
+            raise ResourceInUseError("project", project_id)
 
     @staticmethod
     def _require_operation_row(connection: sqlite3.Connection, operation_id: str) -> sqlite3.Row:
@@ -3527,15 +3798,85 @@ class DesktopProviderStore:
 
     def _project_from_row(self, row: sqlite3.Row) -> ProjectV1:
         document = _decode_json_object(bytes(row["document_json"]), label="project")
+        remote_state: RemoteProjectStateV1 | None = None
+        remote_state_raw = row["remote_state_json"]
+        if remote_state_raw is not None:
+            if type(remote_state_raw) is not bytes:
+                raise ProviderDataCorruptionError(
+                    "stored remote project state is not canonical bytes"
+                )
+            remote_document = _decode_json_object(
+                remote_state_raw,
+                label="remote project state",
+            )
+            try:
+                remote_state = _validate_json_model(RemoteProjectStateV1, remote_document)
+            except ProviderDataCorruptionError as exc:
+                raise ProviderDataCorruptionError(
+                    "stored remote project state violates RemoteProjectStateV1"
+                ) from exc
+        current_revision_id = row["current_revision_id"]
+        if current_revision_id is not None:
+            try:
+                self._validate_resource_id(current_revision_id)
+            except ContractValidationError as exc:
+                raise ProviderDataCorruptionError(
+                    "stored project revision identity is invalid"
+                ) from exc
+            if (
+                remote_state is None
+                or remote_state.active_revision is None
+                or remote_state.active_revision.id != current_revision_id
+            ):
+                raise ProviderDataCorruptionError(
+                    "stored remote project revision differs from current revision"
+                )
+        if row["state"] == "active":
+            if current_revision_id is None or remote_state is None:
+                raise ProviderDataCorruptionError(
+                    "active project is missing its remote project projection"
+                )
+            try:
+                self._validate_activation_remote_state(remote_state)
+            except ContractValidationError as exc:
+                raise ProviderDataCorruptionError(
+                    "active project has an invalid remote project projection"
+                ) from exc
+        elif current_revision_id is not None:
+            raise ProviderDataCorruptionError(
+                "inactive project retains a current revision identity"
+            )
         payload = {
             **document,
             "project_id": row["project_id"],
             "state": row["state"],
+            "remote": (remote_state.model_dump(mode="json") if remote_state is not None else None),
             "etag": self._etag("project", row["project_id"], row["resource_version"]),
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
         }
         return _validate_json_model(ProjectV1, payload)
+
+    @staticmethod
+    def _validate_remote_state_cell(row: sqlite3.Row) -> None:
+        remote_state_bytes = row["remote_state_bytes"]
+        remote_state_raw = row["remote_state_json"]
+        if remote_state_bytes is None:
+            if remote_state_raw is not None:
+                raise ProviderDataCorruptionError(
+                    "stored remote project state has an invalid byte length"
+                )
+            return
+        if (
+            type(remote_state_bytes) is not int
+            or remote_state_bytes < 1
+            or remote_state_bytes > MAX_REMOTE_PROJECT_STATE_BYTES
+        ):
+            raise ProviderDataCorruptionError("stored remote project state exceeds its byte bound")
+        if type(remote_state_raw) is not bytes or len(remote_state_raw) != remote_state_bytes:
+            raise ProviderDataCorruptionError(
+                "stored remote project state changed during guarded read"
+            )
 
     def _operation_from_row(self, row: sqlite3.Row) -> LocalOperationV1:
         document = _decode_json_object(bytes(row["document_json"]), label="operation")
@@ -3975,11 +4316,15 @@ class DesktopProviderStore:
                 parameters.extend((anchor_value, anchor_value, anchor_id))
             where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
             parameters.append(limit + 1)
+            selected_columns = self._project_select_columns() if table == "projects" else "*"
             fetched = connection.execute(
-                f"SELECT * FROM {table}{where} "
+                f"SELECT {selected_columns} FROM {table}{where} "
                 f"ORDER BY {sort_column} {sql_direction}, {id_column} {sql_direction} LIMIT ?",
                 tuple(parameters),
             ).fetchall()
+            if table == "projects":
+                for row in fetched:
+                    self._validate_remote_state_cell(cast(sqlite3.Row, row))
         has_more = len(fetched) > limit
         rows = list(fetched[:limit])
         next_cursor = None

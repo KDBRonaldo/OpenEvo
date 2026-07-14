@@ -279,16 +279,65 @@ reserved, it symmetrically excludes new work on the active project and any
 competing activation. The store checks the same exclusion again in the atomic
 activation completion transaction, excluding only that activation's own
 reservation, so an authority conflict cannot be hidden by an earlier start-time
-ETag check. Activation success atomically records the active project, the Core
-revision identity, and the matching project result; other project operations do
-not invent a project result. A typed failure keeps the project draft and is
-replayable without repeating remote work. Startup cancels every nonterminal
+ETag check. Project intent patch uses that same global activation-authority
+check: while another project's queued/running/cancelling activation owns the
+replacement of the current active project, patch cannot demote that active
+project or clear its revision/remote projection. Activation success requires a
+complete ready `RemoteProjectStateV1` and atomically records the active project,
+its matching Core revision, the canonical remote projection, the terminal
+operation, and its idempotency replay. Other project operations cannot publish
+remote state or invent a project result. The remote projection is a durable
+observation carrying the sidecar observation time, not proof that the SSH tunnel
+or Core remains live. Startup
+therefore preserves it as history while resetting local active/current-revision
+runtime authority under the existing recovery rule. Ordinary demote/archive
+transitions also preserve that observation, while any project intent patch
+clears both the remote projection and revision because they describe the
+previous intent. This closed projection has a separate 256 KiB per-row limit and
+16 MiB aggregate recovery limit. Startup measures both from SQLite length
+metadata before reading or parsing a projection, and project reads use a bounded
+guarded column projection rather than `SELECT *`. Oversized state fails before
+JSON decoding, and bounded noncanonical state fails during strict decoding.
+
+Project intent remains editable after activation so the UI can activate once to
+obtain remote capabilities, edit evolution configuration, and activate again.
+When no project operation is queued, running, or cancelling, patch commits the
+new `ProjectCreateV1` document, demotes local `active` or `blocked` state to
+`draft`, clears revision/remote state, and advances the project ETag exactly once
+in one transaction. A busy project still rejects patch. The saved draft must be
+reactivated before any prior remote projection can be used.
+
+A typed failure keeps the project draft and is replayable without repeating
+remote work. Startup cancels every nonterminal
 reservation exactly once and updates the replay in the same recovery
 transaction, releasing all direct and implicit activation exclusions before
-new work is accepted. The release provider/controller is responsible for
-putting these reservations on its bounded executor and for translating Core
-outcomes; it must not perform external SSH/Core work while a SQLite transaction
-is open.
+new work is accepted. The release provider places activation reservations on one
+serialized executor with a hard 16-item admission bound. The HTTP route returns
+the durable queued operation without waiting for SSH or Core. Once executor
+admission succeeds, a start gate first publishes `bootstrapping` with
+`active_tunnel=false` and the accepted operation ID; the worker cannot execute
+before that non-readable state is observable. Queue rejection fails only the new
+reservation and preserves the prior session authority. The worker then publishes
+`running`, calls the project-bound bridge outside SQLite transactions,
+validates the returned project/revision/registry identity, and commits the
+complete remote projection and terminal operation atomically. It then
+acknowledges that exact activation authority against the post-commit Local ETag
+before reporting Core `online`. Bridge failures retain their typed error with
+the Local operation request ID; unexpected local failures are sanitized. A
+published Core session is retired whenever Local completion or acknowledgement
+fails, including when the terminal operation is already durable, so a stale
+tunnel cannot retain Local authority.
+Profile lifecycle actions, activation start gates, and project retirement share
+one process-local session generation. Admission is ordered under the
+project-session transition lock, while external work remains outside the state
+lock. Every terminal path rechecks the generation. A stale profile success or
+failure finalizes its durable operation without changing the replacement Core
+state or disconnecting its transport; a stale activation cannot publish its
+Local project projection.
+
+`pending_operation_ids()` exposes only queued, running, and cancelling operation
+IDs in stable identity order, with the same recovery-row upper bound, for
+assembling `DesktopStateV1` without an unbounded query.
 
 The production credential resolver currently supports `ssh_agent`. Profiles
 that select native private-key or password authentication fail closed with
@@ -297,11 +346,136 @@ ephemeral `SSHAuthConfig`; credential values must never enter the Local API or
 provider store. Profile proxy URLs and `no_proxy` are projected into the remote
 profile, but user information in proxy URLs is rejected by the contract.
 
-Core bootstrap/tunnel operations, activation, validation, runs, artifacts,
-services, diagnostics, maintenance, and events remain unavailable in this
-provider slice and return a closed `ApiErrorV1` with HTTP 503. They never return
-fixture data or a synthetic ready/success state. A successful SSH check reports
-Core as `offline` with `core_not_started`; it does not claim a live tunnel.
+When release composition supplies an active `DesktopCoreBridgeV1`, the provider
+forwards capability and validation reads plus Core-owned runs, timelines, logs,
+artifacts, services, diagnostics, maintenance, and operations through that
+bridge. Run admission first matches the saved Local project ETag; capability and
+validation envelopes bind the returned Core authority to the current Local
+project identity and ETag. Typed Core failures are preserved without exposing a
+Core URL or bearer. Without an injected bridge these routes remain fail-closed.
+Ordinary bridge calls and the Core SSE relay report session loss through one
+provider callback carrying the exact project/profile/ETag and process-local
+session generation. Only the closed local allowlist (`core_client_closed`,
+`desktop_core_bridge_closed`, `active_project_session_unavailable`, and a
+generation-matched `active_project_session_superseded`) changes `core` to
+`offline`, clears `active_tunnel`, and publishes state invalidation. A stale
+generation cannot downgrade its replacement. Remote business errors and
+`core_connection_failed` do not change connection authority because the latter
+also represents request deadline expiry and therefore does not prove tunnel
+loss.
+
+When release composition also supplies `DesktopEventBrokerV1`, the provider
+serves its bounded SSE subscription directly and maps expired cursors to the
+frozen 410 reset response. Project activation now uses the durable bounded
+executor and project-bound bridge described above. Packaged startup now creates
+the production SSH adapter, bridge store, bridge, event broker, and Core event
+relay from the exact embedded Core wheel/framework-lock pair. It advertises the
+complete frozen release feature set: `remote_profiles`, `project_validation`,
+`operation_events`, `run_observability`, `artifact_inspection`,
+`service_control`, and `diagnostics`. A composition failure aborts startup; it
+never falls back to a local method table, direct backend URL, fixture data, or a
+synthetic ready/success state.
+
+Every direct Core request first loads the one durable active Local
+`ProjectV1` plus its exact process-local session binding while holding the
+provider's project-session transition lock, and it keeps that lock through
+bridge delivery. Editing or retiring that project must
+therefore wait for the in-flight result, after which the bridge generation is
+retired before another project can use the provider. The event relay separately
+passes the same complete active project and captured session generation to the
+bridge SSE boundary. It ignores
+Core heartbeats and translates every other validated Core frame into a Desktop
+state invalidation; it does not copy, reinterpret, or persist Core event
+payloads. The relay advances the Core resume cursor only after that invalidation
+has been accepted by the Desktop broker and only across a contiguous Core event
+sequence. Publication failure reconnects from the prior cursor; duplicate and
+out-of-order records may repeat invalidation, but cannot move the cursor past an
+unpublished or missing event. A typed local session-loss error is returned to the provider owner
+through the same authority-bound callback used by ordinary calls. The renderer
+reloads authoritative resources through the frozen Local API after each
+invalidation.
+
+Local doctor/repair/workspace-sync operations and Local operation
+logs/cancellation remain outside this composition slice. A successful SSH check
+alone still reports Core as `offline` with `core_not_started`; only project
+activation can publish an online project-bound tunnel.
+
+`core_bridge_adapters_v1.py` supplies the production adapters used by packaged
+release composition. `CoreBootstrapConfigV1`
+accepts composition-sealed local wheel and framework-lock paths together with
+their exact byte sizes and SHA-256 digests, plus the source commit, requested
+port, and replacement policy. Local paths are private in representations; no
+remote service or asset path is a configuration input.
+
+`DesktopCoreSshBridgeAdapterV1` accepts only the currently connected
+`DesktopRemoteLifecycle` transport for the requested profile. Before upload it
+runs a closed remote `python3 -I` supervisor preflight under the same total
+deadline. The selected interpreter must be Linux Python 3.11 or newer, expose
+callable `os.pidfd_open` and `signal.pidfd_send_signal`, provide the kernel boot
+identity, and pass a no-signal pidfd probe. Failure is the typed,
+non-retryable `core_supervisor_runtime_unsupported` blocker and occurs before
+asset staging or bootstrap. In particular, a uv-managed Python without those
+wrappers is not silently replaced with system Python, and this adapter does not
+claim automatic fresh-server success pending a separately reviewed Core syscall
+compatibility layer.
+
+On a supported runtime, the same transport snapshots the sealed local files
+with component-wise no-follow checks, uploads them into an automatically derived
+owner-only `~/.openevo/core/asset-staging` directory, and remotely rechecks file
+identity, mode, size, digest, and the closed lock-to-wheel binding. Only an
+atomic no-replace rename publishes the deterministic asset bundle; retries
+re-verify an existing exact bundle and partial uploads remain non-authoritative.
+The remaining deadline then runs the real isolated Core bootstrap/attach flow.
+The returned bearer is bound to the profile plus complete remote release,
+registry, generation, port, and status-proof identity with a one-way host
+identity. Transport object identity is checked after preflight, staging, and
+bootstrap, so reconnecting even the same profile invalidates in-flight
+authority.
+
+The same adapter implements `CoreTunnelFactory`. It opens the authenticated
+`ssh -W` Core endpoint through that exact transport and requires
+`open_core_control_tunnel` to match `/version` and `/v1/status` to the bootstrap
+attachment before publishing a bridge handle. `new_http_transport` is the
+corresponding bridge `transport_factory`: every HTTP request gets a newly
+verified anonymous socketpair connection and rechecks SSH child authority after
+response traffic. Per-I/O tunnel timeouts are capped at the endpoint's 60-second
+limit while the strict client retains its total deadline. Unknown-length request
+bodies are sent only with valid HTTP chunk framing; unsupported transfer
+encodings fail before wire I/O. Response `read1` delivery does not wait for a
+64-KiB buffer, so small SSE frames and heartbeats are visible while a chunked
+connection remains open. A generation/in-flight barrier prevents socket
+adoption after close begins, cancels active connect/send/stream work, and waits
+before close returns, so bearer bytes cannot be sent by a late request. The
+handle's `127.0.0.1:1` endpoint is only the private HTTP origin used by the
+strict client; no TCP listener is bound or reserved. Handle close delegates to
+the existing bounded, idempotent, observable bridge close state and retains the
+verified tunnel on timeout or callback failure for an exact retry.
+
+`AdoptedWorkspaceArchiveSourceV1` is constructed from a frozen set of exact
+`WorkspaceImportRefV1` plus private `WorkspaceImportOwnership` bindings that
+composition has already durably adopted. It rejects any changed or unbound
+reference before store access and calls only `WorkspaceImportStore.resolve`
+with the bound ownership. The yielded object must remain the store's unlinked,
+regular, read-only descriptor-backed stream; the adapter never accepts or
+returns a host path, URI, or archive bytes object.
+
+`release_runtime.py` is the single production composition owner. It derives
+`openevo/wheels` from the absolute PyInstaller extraction root, opens that
+directory without following its final component, and requires an owner-controlled
+non-writable directory containing exactly one wheel and one canonical
+`framework-lock.json`. Both files must be owner-controlled, link-count-one
+regular files within their byte limits. Their bytes are read through pinned
+descriptors, rechecked against their directory names, hashed, and required to
+form the exact lock-to-wheel binding before any remote connection can start.
+The runtime allocates `core-bridge-v1` under the private provider state root and
+owns shutdown of bridge, relay, broker, and persistence.
+
+The production workspace archive source is deliberately dynamic rather than a
+startup snapshot. Under the provider reference guard, every upload read finds
+the exact durable native import binding for the supplied opaque reference,
+requires exactly one owning project, derives its private ownership, and only
+then delegates to the verified import store. A source edit therefore cannot
+leave a stale adopted-import table available to a later activation.
 
 `core_bridge_v1.py` now provides the strict active-project bridge needed by the
 next provider slice. It injects a host-global `CoreHostService`, a tunnel
@@ -537,6 +711,11 @@ this transition when editing an active project returns it to draft. Local
 activation acknowledgement uses the same transition lock, so it linearizes
 before a concurrent deactivate, close, or replacement activation, or observes
 that transition's newer generation and fails without touching the new session.
+The release provider enters retirement in the shared session generation before
+calling this method. Success clears the exact process-local binding and publishes
+`offline`/`active_tunnel=false` atomically; failure retains the retirement
+binding and publishes the typed error so the renderer can diagnose the lost
+authority without treating the tunnel as online.
 
 The renderer-facing run contract accepts only the active local project ID; the
 later release-routing adapter must load its ETag-selected saved `ProjectV1` and
@@ -617,6 +796,14 @@ subscriber and release its queue charges. Idle streams emit an SSE comment
 every 15 seconds, which carries no sequence or replay authority. Closing the
 broker atomically prevents publication, clears all memory charges, and
 terminates all existing subscriptions.
+
+`DesktopReleaseProvider` returns a `StreamingResponse` over this subscription
+when the broker is part of release composition. It uses no-cache/no-buffering
+headers, rejects an unknown cursor before sending HTTP 200, and closes the
+broker before bridge and store shutdown so connected renderers terminate. The
+provider's state-change publisher emits the complete current `DesktopStateV1`;
+it remains an invalidation signal, and the renderer still reloads authoritative
+resources.
 
 This module does not infer resource state or cache partial Core payloads. The
 release composition remains responsible for mapping validated Core events to

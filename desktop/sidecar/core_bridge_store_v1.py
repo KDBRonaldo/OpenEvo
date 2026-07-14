@@ -755,13 +755,27 @@ def _mapping_value(value: CoreProjectMappingV1) -> dict[str, Any]:
         or value.active_revision.project_id != value.core_project_id
     ):
         raise CoreBridgeStoreContractError("mapping typed authority is inconsistent")
+    if (
+        value.immutable_authority.project_id != value.core_project_id
+        or value.immutable_authority.project_create != value.project_create
+        or value.immutable_authority.task_snapshot != value.task_snapshot
+        or value.mutable_authority.project_snapshot != value.project_snapshot
+        or value.mutable_authority.workspace_snapshot != value.workspace_snapshot
+        or value.mutable_authority.registry_digest != value.registry_digest
+        or value.mutable_authority.etag != value.project_etag
+        or value.mutable_authority.active_revision != value.active_revision
+        or value.mutable_authority.updated_at != value.project_updated_at
+    ):
+        raise CoreBridgeStoreContractError(
+            "mapping flattened fields do not match complete project authority"
+        )
     return {
         "active_revision": _model_value(value.active_revision),
         "core_host_identity": _bounded_text(value.core_host_identity, label="Core host identity"),
         "core_project_id": _bounded_text(value.core_project_id, label="Core project ID"),
         "local_project_id": _bounded_text(value.local_project_id, label="Local project ID"),
-        "mapping_generation": value.mapping_generation,
         "immutable_authority": _immutable_value(value.immutable_authority),
+        "mapping_generation": value.mapping_generation,
         "mutable_authority": _mutable_value(value.mutable_authority),
         "predecessor_request_sha256": _optional(
             value.predecessor_request_sha256,
@@ -804,6 +818,8 @@ _MAPPING_KEYS = frozenset(
         "immutable_authority",
         "mutable_authority",
         "predecessor_request_sha256",
+        "immutable_authority",
+        "mutable_authority",
     }
 )
 
@@ -851,9 +867,9 @@ def _mapping_from_value(value: object) -> CoreProjectMappingV1:
             project_updated_at=_bounded_text(
                 data["project_updated_at"], label="project updated timestamp"
             ),
-            mapping_generation=data["mapping_generation"],
             immutable_authority=_immutable_from_value(data["immutable_authority"]),
             mutable_authority=_mutable_from_value(data["mutable_authority"]),
+            mapping_generation=data["mapping_generation"],
             predecessor_request_sha256=_optional(
                 data["predecessor_request_sha256"],
                 lambda item: _digest(item, label="predecessor request digest"),
@@ -2339,15 +2355,30 @@ class DesktopCoreBridgeStoreV1:
         operation: CoreProjectCreateOperationV1,
         mapping: CoreProjectMappingV1,
     ) -> None:
+        create_authority = operation.project_immutable_authority
+        mapping_authority = mapping.immutable_authority
         if (
             operation.state is not CoreProjectCreateStateV1.BOUND
             or operation.local_project_id != mapping.local_project_id
             or operation.profile_id != mapping.profile_id
             or operation.core_host_identity != mapping.core_host_identity
             or operation.core_project_id != mapping.core_project_id
+            or create_authority is None
+            or create_authority.project_id != mapping.core_project_id
+            or mapping_authority.project_id != mapping.core_project_id
+            or create_authority.created_at != mapping_authority.created_at
         ):
             raise CoreBridgeStoreContractError(
                 "mapping authority does not match the bound create operation"
+            )
+        expected_mapping_authority = replace(
+            create_authority,
+            project_create=mapping.project_create,
+            task_snapshot=mapping.task_snapshot,
+        )
+        if mapping_authority != expected_mapping_authority:
+            raise CoreBridgeStoreContractError(
+                "mapping immutable authority does not descend from project creation"
             )
 
     @classmethod
@@ -2747,8 +2778,9 @@ class DesktopCoreBridgeStoreV1:
     ) -> CoreProjectCreateOperationV1:
         _create_value(operation)
         core_project_id = _bounded_text(core_project_id, label="Core project ID")
-        if type(immutable_authority) is not CoreProjectPatchImmutableAuthorityV1:
-            raise CoreBridgeStoreContractError("create immutable authority has the wrong type")
+        _immutable_value(immutable_authority)
+        if operation.state is not CoreProjectCreateStateV1.UNKNOWN:
+            raise CoreBridgeStoreContractError("only unknown create may become bound")
         if (
             immutable_authority.project_id != core_project_id
             or immutable_authority.project_create != operation.project_create
@@ -2756,8 +2788,6 @@ class DesktopCoreBridgeStoreV1:
             raise CoreBridgeStoreContractError(
                 "create immutable authority does not match the created project"
             )
-        if operation.state is not CoreProjectCreateStateV1.UNKNOWN:
-            raise CoreBridgeStoreContractError("only unknown create may become bound")
         updated = replace(
             operation,
             state=CoreProjectCreateStateV1.BOUND,
@@ -3083,27 +3113,54 @@ class DesktopCoreBridgeStoreV1:
         project: core_v1.ProjectV1,
         mapping: CoreProjectMappingV1,
     ) -> bool:
-        project_revision = project.active_revision
+        project_immutable = CoreProjectPatchImmutableAuthorityV1(
+            project_id=project.id,
+            project_create=core_v1.ProjectCreateV1(
+                name=project.name,
+                description=project.description,
+                spec=project.spec,
+                task=project.task,
+                workspace=project.workspace,
+            ),
+            task_snapshot=project.current_task_snapshot,
+            created_at=project.created_at,
+        )
+        project_mutable = CoreProjectPatchMutableAuthorityV1(
+            status=project.status,
+            project_snapshot=project.current_project_snapshot,
+            workspace_snapshot=project.current_workspace_snapshot,
+            workspace_publication=project.workspace_publication,
+            active_revision=project.active_revision,
+            registry_digest=project.registry_digest,
+            model_preparation=project.model_preparation,
+            updated_at=project.updated_at,
+            etag=project.etag,
+        )
+        mapping_mutable = mapping.mutable_authority
+        if project_immutable != mapping.immutable_authority:
+            return False
+        if mapping_mutable.active_revision == project_mutable.active_revision:
+            return mapping_mutable == project_mutable
+        project_revision = project_mutable.active_revision
+        mapping_revision = mapping_mutable.active_revision
+        if (
+            project_revision is None
+            or mapping_revision is None
+            or not cls._revision_is_same_or_successor(project_revision, mapping_revision)
+        ):
+            return False
+        expected_successor = replace(
+            project_mutable,
+            active_revision=mapping_revision,
+            registry_digest=mapping_mutable.registry_digest,
+            updated_at=mapping_mutable.updated_at,
+            etag=mapping_mutable.etag,
+        )
         return bool(
-            project.id == mapping.core_project_id
-            and project.current_project_snapshot == mapping.project_snapshot
-            and project.current_task_snapshot == mapping.task_snapshot
-            and project.current_workspace_snapshot == mapping.workspace_snapshot
-            and project.registry_digest == mapping.registry_digest
-            and project_revision is not None
-            and cls._revision_is_same_or_successor(project_revision, mapping.active_revision)
-            and (
-                (
-                    project_revision == mapping.active_revision
-                    and project.etag == mapping.project_etag
-                    and project.updated_at == mapping.project_updated_at
-                )
-                or (
-                    project.etag != mapping.project_etag
-                    and cls._timestamp(mapping.project_updated_at)
-                    >= cls._timestamp(project.updated_at)
-                )
-            )
+            mapping_mutable == expected_successor
+            and mapping_mutable.etag != project_mutable.etag
+            and cls._timestamp(mapping_mutable.updated_at)
+            > cls._timestamp(project_mutable.updated_at)
         )
 
     @staticmethod

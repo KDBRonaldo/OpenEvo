@@ -392,13 +392,17 @@ export class LocalApiDesktopProductProvider implements DesktopProductProvider {
 
   private async loadSnapshot(): Promise<Omit<DesktopProductSnapshot, "stream">> {
     const budget = new RefreshBudget();
-    const [state, profiles, projects, runSummaries, services] = await Promise.all([
+    const [state, profiles, projects] = await Promise.all([
       this.client.state(),
       collectPages((options) => this.client.listProfiles(options), budget),
       collectPages((options) => this.client.listProjects(options), budget),
-      collectPages((options) => this.client.listRuns(options), budget),
-      collectPages((options) => this.client.listServices(options), budget),
     ]);
+    const [runSummaries, services] = hasReadableCoreCollections(state)
+      ? await Promise.all([
+        collectPages((options) => this.client.listRuns(options), budget),
+        collectPages((options) => this.client.listServices(options), budget),
+      ])
+      : [[], []] as const;
 
     assertUniqueIdentity(profiles, (profile) => profile.profile_id, "Desktop profile collection contains a duplicate identity");
     assertUniqueIdentity(projects, (project) => project.project_id, "Desktop project collection contains a duplicate identity");
@@ -763,6 +767,18 @@ export class LocalApiDesktopProductProvider implements DesktopProductProvider {
     this.lastEventId = eventId;
     return "accepted";
   }
+}
+
+function hasReadableCoreCollections(
+  state: Awaited<ReturnType<DesktopApiClientV1["state"]>>,
+): boolean {
+  const active = state.active_project;
+  return active !== null
+    && active.connection_state === "ready"
+    && state.core.active_tunnel
+    && state.core.core !== null
+    && state.core.profile_id === active.profile_id
+    && ["online", "degraded"].includes(state.core.state);
 }
 
 export function createLocalApiDesktopProductProvider(

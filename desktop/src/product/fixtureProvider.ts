@@ -393,12 +393,40 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
       this.failProjectSaveWithUnknownError = false;
       throw new Error("internal host path and process details");
     }
-    const updated = projectV1Schema.parse({ ...current, ...input, etag: ETAG_D, updated_at: NOW });
+    const wasActive = this.state.active_project?.project_id === projectId;
+    const updated = projectV1Schema.parse({
+      ...current,
+      ...input,
+      state: wasActive ? "draft" : current.state,
+      remote: wasActive ? null : current.remote,
+      etag: ETAG_D,
+      updated_at: NOW,
+    });
     this.projects = this.projects.map((project) => (project.project_id === projectId ? updated : project));
-    this.capabilities = this.state.core.state === "online" ? this.makeCapabilities(projectId, updated.execution.mode) : null;
-    this.validation = this.capabilities ? this.makeValidation(updated, this.capabilities) : null;
-    if (this.state.active_project?.project_id === projectId) {
-      this.state = desktopStateV1Schema.parse({ ...this.state, active_project: { ...this.state.active_project, project_etag: updated.etag } });
+    if (wasActive) {
+      this.capabilities = null;
+      this.validation = null;
+      this.state = desktopStateV1Schema.parse({
+        ...this.state,
+        core: {
+          state: "offline",
+          profile_id: updated.profile_id,
+          active_tunnel: false,
+          operation_id: null,
+          host_key_review: null,
+          core: null,
+          failure: {
+            code: "core_not_started",
+            message: "SSH is connected; OpenEvo Core has not been started for a project.",
+            retryable: true,
+            next_action: "Create or activate a project to prepare OpenEvo Core.",
+          },
+        },
+        active_project: null,
+      });
+    } else {
+      this.capabilities = this.state.core.state === "online" ? this.makeCapabilities(projectId, updated.execution.mode) : null;
+      this.validation = this.capabilities ? this.makeValidation(updated, this.capabilities) : null;
     }
     this.emit();
     return structuredClone(updated);
@@ -1853,6 +1881,30 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
     this.emit();
   }
 
+  restoreOnlineActiveProject(): void {
+    const project = this.projects[0];
+    if (!project) return;
+    const remote = project.remote ?? structuredClone(CONTRACT_FIXTURE_V1.project.remote);
+    const active = projectV1Schema.parse({
+      ...project,
+      state: "active",
+      remote,
+    });
+    this.projects = this.projects.map((item) => item.project_id === active.project_id ? active : item);
+    this.state = desktopStateV1Schema.parse({
+      ...this.makeState("online"),
+      active_project: {
+        project_id: active.project_id,
+        project_etag: active.etag,
+        profile_id: active.profile_id,
+        connection_state: "ready",
+      },
+    });
+    this.capabilities = this.makeCapabilities(active.project_id, active.execution.mode);
+    this.validation = this.makeValidation(active, this.capabilities);
+    this.emit();
+  }
+
   failNextProfileSaveWithUnknownError(): void {
     this.failProfileSaveWithUnknownError = true;
   }
@@ -1929,6 +1981,30 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
     this.projects = [...this.projects, project];
     this.emit();
     return structuredClone(project);
+  }
+
+  loseActiveCoreSession(): void {
+    this.state = desktopStateV1Schema.parse({
+      ...this.state,
+      core: {
+        state: "offline",
+        profile_id: this.state.active_project?.profile_id ?? CONTRACT_FIXTURE_V1.profile.profile_id,
+        active_tunnel: false,
+        operation_id: null,
+        host_key_review: null,
+        core: null,
+        failure: {
+          code: "core_client_closed",
+          message: "The active Core client closed.",
+          retryable: true,
+          next_action: "Reactivate the project.",
+        },
+      },
+      active_project: this.state.active_project
+        ? { ...this.state.active_project, connection_state: "offline" }
+        : null,
+    });
+    this.emit();
   }
 
   useUnsupportedSavedMethod(): void {

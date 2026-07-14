@@ -81,6 +81,17 @@ Recovery scans `/proc/*/fd` for that exact inode, captures each holder's process
 identity, terminates it through pidfd, acquires the spawn lock as a barrier, and
 then removes the intent. Invalid or ambiguous ledgers fail closed.
 
+The current supervisor additionally requires the selected Python interpreter to
+provide callable `os.pidfd_open` and `signal.pidfd_send_signal`; kernel pidfd
+support alone is insufficient when a Python build omits those wrappers. The
+Desktop production adapter therefore runs a closed `python3 -I` preflight before
+upload, including a boot-ID check and a no-signal pidfd probe. A missing wrapper
+is reported as `core_supervisor_runtime_unsupported` before any bootstrap claim.
+Some uv-managed CPython 3.11/3.12 builds have this limitation, while an available
+system Python 3.10 remains below Core's Python requirement. Until a separate
+Core syscall compatibility layer is implemented and reviewed, such a host is an
+explicit release blocker rather than an automatically supported fresh server.
+
 The supervisor binds and listens on one IPv4 loopback socket before spawning
 Core. Release bootstrap requests port `0`, so the kernel chooses an available
 ephemeral port; that selected port is pinned in the service ledger and reused
@@ -132,6 +143,30 @@ platform path separator. The script receives no bearer and uses an allowlisted
 environment. All Core imports, attachment consumption, verification, lifecycle,
 and daemon launch after installation use the generation interpreter with no
 `PYTHONPATH` semantics.
+
+The composition-independent adapter adds a transport-owned asset stage before
+that plan. Composition supplies only sealed local wheel/framework-lock paths,
+sizes, and digests. `openevo.deployment.core_assets` copies those files into a
+private no-follow local snapshot, while `SshRemoteExecutorTransport` prepares
+the canonical owner-only `~/.openevo/core` subdirectories and performs the
+rsync on the same authenticated transport. A remote standard-library verifier
+requires an exact two-file inventory, owner/mode/link identity, both digests,
+and the closed lock-to-wheel binding. Every transfer uses a unique random
+incoming authority. Finalize copies verified bytes into an owner-only private
+candidate whose inode and pathname were never exposed to rsync. Members are
+created as `0400` and populated only through publisher-held writer FDs that are
+closed before rename; the directory is then sealed to `0500`. Finalize keeps the
+verified candidate FD pinned across atomic no-replace rename and final
+pathname verification. Finalize returns a receipt binding the directory and
+both member inodes, then retires the incoming authority. The SSH transport holds
+that receipt for bootstrap: under the publication lock it revalidates modes,
+identities, and digests, then substitutes a
+`/proc/<wrapper-pid>/fd/<pinned-bundle-fd>` root while the generation installer
+and its nested pip child run. Same-name replacement cannot redirect consumer
+reads, and post-consumption revalidation fails closed on mutation or pathname
+replacement. An already published exact sealed bundle is an idempotent retry.
+Remote paths are outputs of this verifier, never Desktop configuration or
+user-preplaced `/srv` inputs.
 
 The attachment keeps the bearer out of `repr` and has no general serializer or
 renderer-facing response model. Its loopback host/port, release identity, and
@@ -200,3 +235,21 @@ storage, reconnect policy, provider handlers, and routing Core operations over
 that handle. This branch deliberately does not fabricate a release-provider
 handler or modify those integration files; release startup remains fail closed
 until that downstream wiring is complete.
+
+`desktop.sidecar.core_bridge_adapters_v1` now provides that downstream primitive
+adapter without performing app composition. It uses only the exact transport
+currently owned by `DesktopRemoteLifecycle`, converts the attachment into the
+bridge's secret-bearing host authority, and computes a domain-separated
+bearer-HMAC identity over the profile and complete release/registry/generation/
+status tuple. Its tunnel method requires the same transport object and exact
+remote port, calls `open_core_control_tunnel`, and publishes a bridge handle only
+after authenticated attachment matching succeeds. The paired HTTPX transport
+opens all traffic through `VerifiedCoreControlTunnel.open_verified_socket`; its
+synthetic loopback origin never creates a local TCP listener. Deadline,
+transport replacement, SSH, bootstrap, and identity failures are normalized to
+closed renderer-safe bridge errors without paths, commands, output, or bearer
+values. Its HTTP transport uses incrementally decoded response reads for open
+SSE streams, valid chunk encoding for unknown-length requests, a 60-second
+endpoint I/O ceiling, and a generation/in-flight close barrier that prevents
+late socket adoption or bearer transmission. Release provider/app composition
+remains intentionally out of scope.

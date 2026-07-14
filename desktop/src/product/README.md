@@ -15,6 +15,13 @@ features. The contract simulator is test-only and is not a release fallback.
 bounded cursor pages, reloads exact run details, and marks artifacts complete
 only when every run artifact page succeeds. Capabilities and validation are
 read only for the authoritative active project over its ready tunnel. Native
+state, profiles, and projects are loaded before project-bound Core collections;
+runs and services are requested only when that same active project reports a
+ready, compatible tunnel. A fresh install, draft project, offline server, or
+activation in progress therefore remains a usable Local UI with empty remote
+collections instead of turning the expected Core 503 into a failed whole-app
+refresh. Once the tunnel becomes ready, the next authoritative refresh loads
+those collections normally. Native
 folder and credential operations remain native-host calls whose results are
 strictly parsed as `ProjectSourceV1` and `RemoteProfileV1`; renderer file inputs,
 raw paths, and secret values are not accepted.
@@ -115,9 +122,16 @@ Run outcomes are rendered from `RunV1.status`, `current_attempt`,
 `current_error`, exact revision refs, and `revision_transition`. Queued reasons
 and failed run errors remain visible, and recovery creates a fresh admission
 instead of rewriting a terminal attempt. Service rows consume `ServiceV1.id`,
-`status`, and `status_message`. Service restart returns the typed Core
-`OperationV1`; connection, activation, and workspace mutations continue to use
-the separate local `LocalOperationV1` lifecycle. HTTP 409, 410, and 412 responses trigger an
+`status`, and `status_message`. The renderer exposes those rows and the Research
+model-service projection only when the selected `ProjectV1` exactly matches the
+active project's project ID, profile ID, and ETag and that connection is ready.
+Selecting project B while A is active, or losing A's tunnel, produces an empty
+service view; restart lookup uses that same gated collection and cannot target
+A through B's screen. An active project whose connection is no longer ready
+shows activation again so it can establish a new session. Service restart
+returns the typed Core `OperationV1`; connection, activation, and workspace
+mutations continue to use the separate local `LocalOperationV1` lifecycle. HTTP
+409, 410, and 412 responses trigger an
 authoritative snapshot reload; an expired cursor is reset before reload.
 Re-admission is offered only for an allowlisted retryable admission conflict
 when the refreshed snapshot has no equivalent active or pending run. Drawer
@@ -139,6 +153,13 @@ the drawer retains the created project identity and creates a new activation
 intent against the refreshed ETag. Retry activates that project instead of
 issuing another create; an unknown activation result retains its original
 action ID for exact retry.
+
+Editing a saved active project demotes it to a draft and retires its Core
+session. After a successful save, the authoritative snapshot has no active
+project binding, reports `active_tunnel=false`, and requires connection and
+activation again before `Start session` is enabled. The simulator mirrors this
+terminal provider state so UI tests cannot accidentally continue on the stale
+pre-edit tunnel.
 
 Revision generation is shown only from the authoritative
 `ProjectV1.remote.active_revision`. Core-owned runs and artifacts are associated

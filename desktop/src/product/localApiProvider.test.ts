@@ -489,6 +489,26 @@ describe("LocalApiDesktopProductProvider", () => {
     expect(result.snapshot.validation?.status).toBe("unavailable");
     expect(client.validateProject).not.toHaveBeenCalled();
   });
+
+  it("loads a fresh install without requesting project-bound Core collections", async () => {
+    const client = mockClient();
+    client.state = vi.fn().mockResolvedValue(disconnectedState());
+    client.listProfiles = vi.fn().mockResolvedValue(page([]));
+    client.listProjects = vi.fn().mockResolvedValue(page([]));
+
+    const result = await createProvider(client).refresh();
+
+    expect(result.status).toBe("fresh");
+    if (result.status !== "fresh") return;
+    expect(result.snapshot.profiles).toEqual([]);
+    expect(result.snapshot.projects).toEqual([]);
+    expect(result.snapshot.runs).toEqual([]);
+    expect(result.snapshot.services).toEqual([]);
+    expect(result.snapshot.capability).toBeNull();
+    expect(result.snapshot.validation).toBeNull();
+    expect(client.listRuns).not.toHaveBeenCalled();
+    expect(client.listServices).not.toHaveBeenCalled();
+  });
 });
 
 function mockClient(): DesktopApiClientV1 & Record<string, ReturnType<typeof vi.fn>> {
@@ -565,6 +585,30 @@ function onlineState(pendingOperationIds: string[] = []) {
       connection_state: "ready",
     },
     pending_operation_ids: pendingOperationIds,
+  });
+}
+
+function disconnectedState() {
+  return desktopStateV1Schema.parse({
+    schema_version: "1",
+    observed_at: NOW,
+    contract: {
+      selected_major: 1,
+      desktop_openapi_sha256: A,
+      core_openapi_sha256: null,
+      compatible: true,
+    },
+    core: {
+      state: "disconnected",
+      profile_id: null,
+      active_tunnel: false,
+      operation_id: null,
+      host_key_review: null,
+      core: null,
+      failure: null,
+    },
+    active_project: null,
+    pending_operation_ids: [],
   });
 }
 

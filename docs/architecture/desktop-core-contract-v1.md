@@ -38,6 +38,40 @@ HTTP connector revalidates its pinned socket inode guards, SSH process, and
 control-master authority for each connection before bearer-bearing bytes are
 sent.
 
+The composition-independent production implementation lives in
+`desktop.sidecar.core_bridge_adapters_v1`. Its host and tunnel protocols share
+one in-memory attachment authority bound to the exact active
+`DesktopRemoteLifecycle` transport object and profile. Bootstrap delegates to
+the verified generation installer/service attachment in
+`openevo.deployment.core_control`, but only after a same-transport runtime
+preflight and sealed-asset stage. Composition provides exact local wheel and
+framework-lock identities; the transport derives the private remote root,
+re-hashes both files, verifies their lock binding, and atomically publishes the
+bundle before bootstrap. It never depends on a user-preplaced remote file.
+
+The runtime preflight requires Linux Python 3.11+, kernel process identity, and
+callable `os.pidfd_open` plus `signal.pidfd_send_signal`. Missing Python wrappers
+produce the typed `core_supervisor_runtime_unsupported` blocker before upload.
+The adapter does not select a lower-version system Python or claim general
+fresh-server readiness; a Core-owned syscall compatibility layer remains a
+separate implementation and review item.
+
+Tunnel publication delegates to the authenticated Core tunnel verifier. The
+bridge HTTP transport opens a fresh anonymous socketpair plus `ssh -W` child for
+each connection and treats the loopback URL in `CoreTunnelHandleV1` only as
+client origin authority, never as a bound TCP listener. It incrementally
+delivers small chunked/SSE frames, applies legal request chunk framing, caps
+individual endpoint I/O at 60 seconds, and closes through a generation/in-flight
+barrier that rejects late socket adoption. The adapter also exposes only exact,
+pre-adopted workspace import ownership to `WorkspaceImportStore.resolve`, whose
+unlinked read-only snapshot is the sole archive stream. No adapter exposes a
+host path.
+
+This module is not instantiated by the release provider in this change.
+Release app composition, local operation routing, bridge persistence, and
+provider-owned adopted-import binding remain separate work; unavailable routes
+must continue to fail closed until all of those owners are injected together.
+
 Core owns durable projects, immutable task/workspace snapshots, capabilities,
 validation, services, runs and attempts, transcript capture, datasets,
 evolution jobs, artifacts, revision transitions, diagnostics, and recovery.
@@ -153,8 +187,13 @@ same OS user: such a process can race pathname checks or modify owner-readable
 state. Desktop relies on the macOS user-account boundary and the owner-only
 state directory for that threat boundary.
 
-Schema v2 has an exact canonical `sqlite_schema` fingerprint and migrates the
-canonical v1 layout transactionally. Startup performs a database-size-bounded
+Schema v3 has an exact canonical `sqlite_schema` fingerprint. Fresh stores are
+created directly in canonical v3; canonical v1 stores pass exact v1 validation
+before transactional v1 -> v2 -> v3 migration, and canonical v2 stores pass
+exact v2 schema and ledger validation before v2 -> v3 migration. Every DDL,
+ledger, project-copy, and `user_version` change is in the same crash transaction.
+Forged ledgers, near-match historical schemas, and partial migrations fail
+closed. Startup performs a database-size-bounded
 `integrity_check(1)`, `foreign_key_check`, bounded row and byte accounting, and
 complete validation of migration, resource, operation, cursor, canonical
 JSON/blob, duplicated scalar, timestamp, version, and typed idempotency rows.
@@ -164,10 +203,27 @@ before schema or resource writes and are checked again before commit, so a
 budget rejection rolls the transaction back rather than reporting failure after
 a successful commit.
 
+The v3 project row stores `RemoteProjectStateV1` canonical JSON in a nullable
+private BLOB separate from the canonical `ProjectCreateV1` intent document.
+Activation accepts only a ready projection whose active revision project matches
+its Core-owned `core_project_id` and whose revision ID matches the local
+`current_revision_id`; Local and Core project IDs remain distinct identities.
+Activation demotion, target publication, terminal operation result, and
+idempotency replay commit in one SQLite transaction. Non-activation completions
+cannot publish a remote projection.
+
 Startup atomically recovers process-owned transient state: remote profiles
-become disconnected, active project sessions return to draft with stale
+become disconnected, active project sessions return to draft with stale local
 revision pins cleared, and interrupted or now-stale local operations are
-cancelled against that authoritative resource state. Action idempotency stores
+cancelled against that authoritative resource state. The remote project value
+is retained with its `observed_at` as a historical observation, but is not live
+tunnel/Core authority; after local runtime reset it cannot authorize a run or
+revision use. Ordinary demote/archive transitions preserve the same history.
+Any project intent patch clears both revision and remote state, and demotes
+`active`/`blocked` to `draft`, in the same single-version ETag update. This lets
+Desktop activate to obtain capabilities, save edited evolution intent, and then
+require reactivation. Queued/running/cancelling project operations still block
+the patch. Action idempotency stores
 the exact `LocalOperationV1`; replay resolves its current authoritative
 operation row and cannot return an obsolete connected/active result. Resource,
 operation, and idempotency writes commit in one transaction. Local-operation
@@ -454,6 +510,32 @@ phase: `disconnected`, `connecting`, `host_key_review`, `checking`,
 `bootstrapping`, `core_starting`, `online`, `degraded`, `reconnecting`, or
 `offline`. Native process startup phases remain Tauri-local and are mapped into
 the same renderer state machine; the renderer does not infer remote progress.
+Executor admission for project activation publishes a non-readable
+`bootstrapping` state with `active_tunnel=false` before the worker start gate is
+released. A rejected admission leaves the previous state untouched.
+
+The release owner binds readable state to the exact Local project ID, profile
+ID, ETag, and a process-local session generation. SSH profile actions, project
+activation, and active-project retirement all admit against that same
+generation. Completion must revalidate it before changing Core state or
+cleaning a transport, so a late profile result cannot overwrite or disconnect
+its replacement and a stale activation cannot publish a Local active project.
+Ordinary Core calls and the event relay may invalidate readable state only for
+closed local errors proving that the bound client/session no longer exists.
+Remote 503 responses, validation or capability failures, and
+`core_connection_failed` are not such proof; the last code also covers finite
+request deadline expiry. A matching loss atomically publishes `offline` with
+`active_tunnel=false`. A callback from an older project or generation cannot
+change the replacement session. Successful edit retirement clears the binding
+and Core tunnel state atomically; failure keeps the retirement binding together
+with its typed diagnostic failure.
+
+The renderer independently requires the selected `ProjectV1` to match the
+active project ID, profile ID, and ETag and requires a ready compatible tunnel
+before exposing service rows or the inference-service projection. Restart is
+resolved only from that gated collection. Therefore selecting B cannot display
+or mutate A's services, and the same active project can request reactivation
+after its connection becomes unreadable.
 
 ### Sidecar Mapping
 
@@ -762,6 +844,13 @@ remains stable if that mutation is retried, replayed, or emitted in a later stre
 record with a different frame ID. `Last-Event-ID` remains opaque;
 delivery is at least once with a 10,000-event bounded replay window, and an
 expired cursor returns HTTP 410 so Desktop reloads snapshots before resuming.
+The release relay treats successful Desktop invalidation publication as the
+commit point for each non-heartbeat frame. It updates its Core resume cursor
+only after publication and only for a contiguous Core event sequence; a
+broker/store/publication fault therefore reconnects with the previous
+`Last-Event-ID` and accepts replay. Duplicate or out-of-order frame delivery may
+produce duplicate invalidation, but cannot regress the cursor or advance it past
+an unpublished or missing frame.
 Within one active-tunnel client lifetime, including reconnects, the sidecar
 binds each SSE frame ID to the digest of canonical validated event bytes. The
 same ID and semantic payload may replay with different JSON formatting; the
