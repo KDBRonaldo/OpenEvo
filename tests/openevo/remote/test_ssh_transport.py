@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import base64
+import errno
 import hashlib
 import os
 import re
 import shlex
 import shutil
 import socket
-import stat
 import subprocess
 import struct
 import sys
@@ -81,24 +81,32 @@ class RecordingTunnelStarter:
 
 class RecordingCoreConnectionStarter:
     def __init__(self) -> None:
-        self.calls: list[tuple[list[str], tuple[int, int, int, int]]] = []
+        self.calls: list[tuple[list[str], tuple[object, ...]]] = []
         self.processes: list[FakeTunnelProcess] = []
         self.streams: list[socket.socket] = []
 
     def __call__(self, argv: list[str], stream_fd: int) -> "FakeTunnelProcess":
         metadata = os.fstat(stream_fd)
+        stream = socket.socket(fileno=os.dup(stream_fd))
         self.calls.append(
             (
                 argv,
                 (
+                    stream.family,
+                    stream.type,
+                    stream.getsockopt(socket.SOL_SOCKET, socket.SO_TYPE),
                     metadata.st_uid,
-                    metadata.st_mode & 0o777,
-                    metadata.st_nlink,
-                    metadata.st_ino,
+                    (
+                        stream_fd,
+                        metadata.st_dev,
+                        metadata.st_ino,
+                        metadata.st_ctime_ns,
+                    ),
+                    stream.getsockname(),
                 ),
             )
         )
-        self.streams.append(socket.socket(fileno=os.dup(stream_fd)))
+        self.streams.append(stream)
         process = FakeTunnelProcess()
         self.processes.append(process)
         return process
@@ -926,20 +934,26 @@ def test_core_tunnel_uses_parent_owned_socketpair_and_per_connection_ssh_child(
     connection = tunnel.open_verified_socket(timeout_seconds=1.0)
     second_connection = tunnel.open_verified_socket(timeout_seconds=1.0)
     assert len(starter.calls) == 2
-    for argv, (uid, mode, links, inode) in starter.calls:
+    for argv, (family, declared_type, kernel_type, uid, identity, local_name) in starter.calls:
         assert argv[-4:] == ["-W", "127.0.0.1:8765", "--", "gpu.example.edu"]
         assert "-L" not in argv
         assert "-S" not in argv
         assert "ControlMaster=yes" not in argv
+        assert family == socket.AF_UNIX
+        assert declared_type == socket.SOCK_STREAM
+        assert kernel_type == socket.SOCK_STREAM
         assert uid == os.geteuid()
-        assert mode == 0o600
-        assert links == 1
-        assert inode > 0
+        assert isinstance(identity, tuple)
+        assert len(identity) == 4
+        assert all(isinstance(value, int) for value in identity)
+        assert local_name in ("", b"")
     local_metadata = os.fstat(connection.fileno())
-    assert stat.S_ISSOCK(local_metadata.st_mode)
+    assert connection.family == socket.AF_UNIX
+    assert connection.type == socket.SOCK_STREAM
+    assert connection.getsockopt(socket.SOL_SOCKET, socket.SO_TYPE) == socket.SOCK_STREAM
     assert local_metadata.st_uid == os.geteuid()
-    assert local_metadata.st_mode & 0o777 == 0o600
-    assert local_metadata.st_nlink == 1
+    assert connection.getsockname() in ("", b"")
+    assert connection.getpeername() in ("", b"")
     connection.close()
     second_connection.close()
     tunnel.verify_authority()
@@ -981,11 +995,186 @@ def test_core_tunnel_connection_start_cancellation_closes_parent_stream_and_prop
     tunnel.close()
 
 
+def test_core_tunnel_never_fchmods_anonymous_socketpair_on_darwin(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    starter = RecordingCoreConnectionStarter()
+    tunnel = _transport(
+        tmp_path,
+        core_connection_starter=starter,
+    ).open_core_tunnel(remote_port=8765)
+    fchmod_calls: list[tuple[int, int]] = []
+
+    def darwin_fchmod(descriptor: int, mode: int) -> None:
+        fchmod_calls.append((descriptor, mode))
+        raise OSError(errno.EINVAL, "Invalid argument")
+
+    monkeypatch.setattr(ssh_module.os, "fchmod", darwin_fchmod)
+
+    connection = tunnel.open_verified_socket(timeout_seconds=1.0)
+
+    assert fchmod_calls == []
+    assert connection.family == socket.AF_UNIX
+    connection.close()
+    tunnel.close()
+    for stream in starter.streams:
+        stream.close()
+
+
+def test_core_tunnel_rejects_non_stream_socketpair(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    starter = RecordingCoreConnectionStarter()
+    tunnel = _transport(
+        tmp_path,
+        core_connection_starter=starter,
+    ).open_core_tunnel(remote_port=8765)
+    socketpair = socket.socketpair
+
+    def datagram_socketpair(
+        family: socket.AddressFamily,
+        socket_type: socket.SocketKind,
+    ) -> tuple[socket.socket, socket.socket]:
+        assert family == socket.AF_UNIX
+        assert socket_type == socket.SOCK_STREAM
+        return socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)
+
+    monkeypatch.setattr(ssh_module.socket, "socketpair", datagram_socketpair)
+
+    with pytest.raises(SshTransportError) as rejected:
+        tunnel.open_verified_socket(timeout_seconds=1.0)
+
+    assert rejected.value.code is SshTransportErrorCode.CONNECTION_FAILED
+    assert starter.calls == []
+    tunnel.close()
+
+
+def test_core_tunnel_rejects_socketpair_not_owned_by_effective_uid(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    starter = RecordingCoreConnectionStarter()
+    tunnel = _transport(
+        tmp_path,
+        core_connection_starter=starter,
+    ).open_core_tunnel(remote_port=8765)
+    socketpair = socket.socketpair
+    fstat = os.fstat
+    socket_fds: set[int] = set()
+
+    def recording_socketpair(
+        family: socket.AddressFamily,
+        socket_type: socket.SocketKind,
+    ) -> tuple[socket.socket, socket.socket]:
+        streams = socketpair(family, socket_type)
+        socket_fds.update(stream.fileno() for stream in streams)
+        return streams
+
+    def foreign_fstat(descriptor: int) -> os.stat_result:
+        metadata = fstat(descriptor)
+        if descriptor not in socket_fds:
+            return metadata
+        values = list(metadata)
+        values[4] = os.geteuid() + 1
+        return os.stat_result(values)
+
+    monkeypatch.setattr(ssh_module.socket, "socketpair", recording_socketpair)
+    monkeypatch.setattr(ssh_module.os, "fstat", foreign_fstat)
+
+    with pytest.raises(SshTransportError) as rejected:
+        tunnel.open_verified_socket(timeout_seconds=1.0)
+
+    assert rejected.value.code is SshTransportErrorCode.CONNECTION_FAILED
+    assert starter.calls == []
+    tunnel.close()
+
+
+def test_core_tunnel_rejects_peer_fd_replacement_after_child_spawn(
+    tmp_path: Path,
+) -> None:
+    replacement_local, replacement_peer = socket.socketpair(
+        socket.AF_UNIX,
+        socket.SOCK_STREAM,
+    )
+    process = FakeTunnelProcess()
+
+    def replace_peer(_argv: list[str], stream_fd: int) -> FakeTunnelProcess:
+        os.dup2(replacement_peer.fileno(), stream_fd)
+        return process
+
+    tunnel = _transport(
+        tmp_path,
+        core_connection_starter=replace_peer,
+    ).open_core_tunnel(remote_port=8765)
+    try:
+        with pytest.raises(SshTransportError) as rejected:
+            tunnel.open_verified_socket(timeout_seconds=1.0)
+
+        assert rejected.value.code is SshTransportErrorCode.CONNECTION_FAILED
+        assert process.terminated is True
+        assert process.waited is True
+        assert tunnel._endpoint._children == {}
+    finally:
+        tunnel.close()
+        replacement_local.close()
+        replacement_peer.close()
+
+
+def test_core_tunnel_rejects_child_that_exits_during_connection_start(
+    tmp_path: Path,
+) -> None:
+    process = FakeTunnelProcess()
+    process.return_code = 255
+
+    tunnel = _transport(
+        tmp_path,
+        core_connection_starter=lambda _argv, _fd: process,
+    ).open_core_tunnel(remote_port=8765)
+
+    with pytest.raises(SshTransportError) as rejected:
+        tunnel.open_verified_socket(timeout_seconds=1.0)
+
+    assert rejected.value.code is SshTransportErrorCode.CONNECTION_FAILED
+    assert tunnel._endpoint._children == {}
+    tunnel.close()
+
+
+def test_core_connection_subprocess_passes_only_peer_fd_to_exact_ssh_child(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: list[tuple[list[str], dict[str, object]]] = []
+    process = FakeTunnelProcess()
+
+    def popen(argv: list[str], **kwargs: object) -> FakeTunnelProcess:
+        observed.append((argv, kwargs))
+        return process
+
+    monkeypatch.setattr(ssh_module.subprocess, "Popen", popen)
+    argv = ["ssh", "-F", "/dev/null", "-W", "127.0.0.1:8765", "--", "host"]
+
+    result = ssh_module._start_core_connection_subprocess(argv, 42)
+
+    assert result is process
+    assert observed == [
+        (
+            argv,
+            {
+                "stdin": 42,
+                "stdout": 42,
+                "stderr": subprocess.DEVNULL,
+                "close_fds": True,
+                "pass_fds": (42,),
+                "text": False,
+            },
+        )
+    ]
+
+
 def test_core_connection_subprocess_bridges_a_real_parent_owned_af_unix_stream() -> None:
     local_stream, child_stream = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
-        for stream in (local_stream, child_stream):
-            os.fchmod(stream.fileno(), 0o600)
         child = ssh_module._start_core_connection_subprocess(
             [
                 sys.executable,

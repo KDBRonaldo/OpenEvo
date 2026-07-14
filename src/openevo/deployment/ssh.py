@@ -116,37 +116,46 @@ class _CoreTunnelEndpoint:
         with self._guard:
             self._verify_locked()
             local_stream, child_stream = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+            process: TunnelProcess | None = None
+            generation: int | None = None
             try:
-                for stream in (local_stream, child_stream):
-                    os.fchmod(stream.fileno(), 0o600)
-                    _require_parent_owned_stream(stream.fileno())
+                local_identity = _require_parent_owned_stream(local_stream)
+                child_identity = _require_parent_owned_stream(child_stream)
                 local_stream.settimeout(timeout_seconds)
                 process = self._connection_starter(
                     list(self._connection_argv),
                     child_stream.fileno(),
                 )
+                generation = self._next_generation
+                self._next_generation += 1
+                self._children[generation] = process
+                _require_parent_owned_stream(
+                    local_stream,
+                    expected_identity=local_identity,
+                )
+                _require_parent_owned_stream(
+                    child_stream,
+                    expected_identity=child_identity,
+                )
+                child_stream.close()
+                if not _tunnel_process_is_running(process):
+                    raise SshTransportError(SshTransportErrorCode.CONNECTION_FAILED)
+                _require_parent_owned_stream(
+                    local_stream,
+                    expected_identity=local_identity,
+                )
+                return local_stream
             except BaseException as exc:
                 local_stream.close()
                 child_stream.close()
+                if process is not None and generation is not None:
+                    exited, _failure = _terminate_tunnel_process(process)
+                    if exited:
+                        self._children.pop(generation, None)
                 if isinstance(exc, Exception):
                     _log_transport_failure(SshTransportErrorCode.CONNECTION_FAILED)
                     raise SshTransportError(SshTransportErrorCode.CONNECTION_FAILED) from None
                 raise
-            child_stream.close()
-            generation = self._next_generation
-            self._next_generation += 1
-            self._children[generation] = process
-            try:
-                running = _tunnel_process_is_running(process)
-            except BaseException:
-                local_stream.close()
-                raise
-            if not running:
-                self._children.pop(generation, None)
-                local_stream.close()
-                raise SshTransportError(SshTransportErrorCode.CONNECTION_FAILED)
-            _require_parent_owned_stream(local_stream.fileno())
-            return local_stream
 
     @property
     def closed(self) -> bool:
@@ -923,16 +932,26 @@ def _start_core_connection_subprocess(
     )
 
 
-def _require_parent_owned_stream(stream_fd: int) -> tuple[int, int, int]:
+def _require_parent_owned_stream(
+    stream: socket.socket,
+    *,
+    expected_identity: tuple[int, int, int, int] | None = None,
+) -> tuple[int, int, int, int]:
+    stream_fd = stream.fileno()
     metadata = os.fstat(stream_fd)
+    identity = (stream_fd, metadata.st_dev, metadata.st_ino, metadata.st_ctime_ns)
     if (
-        not stat.S_ISSOCK(metadata.st_mode)
+        stream.family != socket.AF_UNIX
+        or stream.type != socket.SOCK_STREAM
+        or stream.getsockopt(socket.SOL_SOCKET, socket.SO_TYPE) != socket.SOCK_STREAM
+        or not stat.S_ISSOCK(metadata.st_mode)
         or metadata.st_uid != os.geteuid()
-        or metadata.st_nlink != 1
-        or stat.S_IMODE(metadata.st_mode) != 0o600
+        or stream.getsockname() not in ("", b"")
+        or stream.getpeername() not in ("", b"")
+        or (expected_identity is not None and identity != expected_identity)
     ):
         raise SshTransportError(SshTransportErrorCode.CONNECTION_FAILED)
-    return metadata.st_dev, metadata.st_ino, metadata.st_ctime_ns
+    return identity
 
 
 def _terminate_tunnel_process(

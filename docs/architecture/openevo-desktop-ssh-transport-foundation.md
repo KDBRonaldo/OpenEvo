@@ -186,11 +186,20 @@ instead of leaving an unmanaged child behind.
 Authenticated Core Control traffic uses parent-created connection endpoints
 rather than the general developer TCP forward or an OpenSSH-created streamlocal
 pathname. For each HTTP connection the Desktop process creates an anonymous
-`AF_UNIX` socketpair, sets both held FDs to mode `0600`, and validates socket
-type, effective UID, link count one, and FD identity. It retains the HTTP side
-and transfers only the peer FD to a dedicated
+`AF_UNIX`/`SOCK_STREAM` socketpair and validates the declared and kernel socket
+type, effective UID, empty local/peer names, and the initial identity of both
+held FDs. It revalidates both identities after child creation and the parent
+identity again before returning the HTTP endpoint. It retains the HTTP side and
+transfers only the peer FD through the exact `pass_fds` set to a dedicated
 `ssh -W 127.0.0.1:<remote-port>` child as stdin/stdout. The child uses the same
 pinned known-host lease and explicit auth argv as command execution.
+
+Anonymous socketpair endpoints have no filesystem pathname contract. In
+particular, the transport does not call `fchmod` and does not treat permission
+bits or link count as an authority boundary; Darwin may reject `fchmod` on these
+FDs with `EINVAL`, and those filesystem fields do not establish socket
+ownership. A changed FD identity, socket type, owner, or anonymous address fails
+the connection and triggers bounded child cleanup.
 
 There is no `-L` listener, `-S` control socket, control master, filesystem
 pathname, hard-link pre-pin window, or temporary TCP-port reservation in this

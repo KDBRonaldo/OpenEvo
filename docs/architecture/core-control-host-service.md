@@ -112,8 +112,9 @@ service.
    the SSH transport's dedicated `SecretStr` result channel, never
    `RemoteCommandResult.stdout`;
 5. for each Core HTTP connection, create a parent-owned `AF_UNIX` socketpair,
-   validate both held FDs as owner-owned, mode `0600`, link-count-one sockets,
-   and transfer only the peer FD to one new `ssh -W` child;
+   validate both held FDs as anonymous owner-owned `SOCK_STREAM` endpoints with
+   stable descriptor identities, and transfer only the peer FD to one new
+   `ssh -W` child;
 6. check that connection's child authority before and after authenticated status
    traffic, then
    require generation, release, registry, and status-proof equality before
@@ -139,13 +140,17 @@ be persisted in Desktop resources, logs, operations, or renderer responses.
 
 Core authentication does not use a filesystem pathname created by OpenSSH and
 does not reserve a temporary TCP port. For every HTTP connection the Desktop
-parent creates a fresh anonymous `AF_UNIX` socketpair, changes both endpoints to
-mode `0600`, and validates socket type, effective UID, link count, and held-FD
-identity before transfer. The parent retains the HTTP endpoint; exactly one
-`ssh -W 127.0.0.1:<port>` child receives the peer as stdin/stdout. There is no
-`-L` listener, control master, control socket, pathname pre-pin window, or
-same-UID unlink/rebind target. The HTTP layer rechecks child authority after
-reading each bearer-authenticated response.
+parent creates a fresh anonymous `AF_UNIX`/`SOCK_STREAM` socketpair and validates
+the declared and kernel socket type, effective UID, empty local/peer names, and
+initial identity of both held FDs. The identities are rechecked after child
+creation, and the parent endpoint is checked again before it is returned. The
+parent retains the HTTP endpoint; exactly one
+`ssh -W 127.0.0.1:<port>` child receives the peer as stdin/stdout through the
+exact `pass_fds` set. There is no `fchmod`: anonymous socket mode and link count
+are not an authority boundary, and Darwin may return `EINVAL` for that operation.
+There is also no `-L` listener, control master, control socket, pathname pre-pin
+window, or same-UID unlink/rebind target. The HTTP layer rechecks child authority
+after reading each bearer-authenticated response.
 
 Tunnel authentication preserves retryable deadline and daemon-exit failures.
 Every path that does not return the verified handle, including cancellation or

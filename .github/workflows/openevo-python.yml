@@ -61,6 +61,25 @@ jobs:
             tests/openevo/test_core_capabilities.py \
             -q
 
+  macos-ssh-transport:
+    name: macOS anonymous Core SSH transport
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install focused test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .
+          python -m pip install pytest
+
+      - name: Test anonymous AF_UNIX Core transport
+        run: python -m pytest tests/openevo/remote/test_ssh_transport.py -q
+
   terminal-bench-tests:
     name: standalone Terminal Bench package
     runs-on: ubuntu-latest
