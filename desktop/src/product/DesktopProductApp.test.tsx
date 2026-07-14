@@ -192,10 +192,13 @@ describe("DesktopProductApp", () => {
     expect(screenText()).not.toContain("Private key");
     expect(screenText()).not.toContain("Password");
     await clickButton("Save workspace");
+    expect(screenText()).toContain("Connect the remote workspace");
+    expect(document.querySelector<HTMLButtonElement>('button[aria-label="Create project"]')?.disabled).toBe(true);
 
     await clickButton("Connect");
     await advance(25);
     expect(screenText()).toContain("Confirm server identity");
+    expect(document.querySelector<HTMLButtonElement>('button[aria-label="Create project"]')?.disabled).toBe(true);
     await clickButton("Trust and continue");
     expect(screenText()).toContain("Checking environment");
     await advance(25);
@@ -842,7 +845,8 @@ describe("DesktopProductApp", () => {
   });
 
   it("keeps create action identities when profile and project responses are uncertain", async () => {
-    provider = createFixtureDesktopProductProvider({ newUser: true });
+    vi.useFakeTimers();
+    provider = createFixtureDesktopProductProvider({ newUser: true, stepDelayMs: 20 });
     const selectSource = vi.spyOn(provider, "selectProjectSource");
     const settleSource = vi.spyOn(provider, "settleProjectSource");
     root = await renderProduct(provider);
@@ -857,6 +861,11 @@ describe("DesktopProductApp", () => {
     await clickButton("Save workspace");
     expect(provider.profileCreateActionIds()[0]).toBe(provider.profileCreateActionIds()[1]);
     expect(provider.profileUpdateActionIds()).toHaveLength(0);
+
+    await clickButton("Connect");
+    await advance(25);
+    await clickButton("Trust and continue");
+    await advance(50);
 
     await clickAria("Create project");
     setInput("Objective", "Keep one project create identity.");
@@ -917,7 +926,7 @@ describe("DesktopProductApp", () => {
     expect(screenText()).toContain("Research server");
   });
 
-  it("marks segmented controls as tabs with an explicit selected state", async () => {
+  it("supports roving keyboard selection in project and artifact tabs", async () => {
     provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
     root = await renderProduct(provider);
     await clickAria("Project settings");
@@ -925,6 +934,41 @@ describe("DesktopProductApp", () => {
     const tablists = document.querySelectorAll('[role="tablist"]');
     expect(tablists.length).toBeGreaterThanOrEqual(2);
     expect(document.querySelector('[role="tab"][aria-selected="true"]')).not.toBeNull();
+
+    const sourceTabs = document.querySelector<HTMLElement>('[role="tablist"][aria-label="Research source"]');
+    const scratch = sourceTabs?.querySelector<HTMLButtonElement>('[role="tab"][aria-selected="true"]');
+    if (!scratch) throw new Error("Selected research source tab was not found.");
+    scratch.focus();
+    await pressKey(scratch, "ArrowRight");
+    expect(sourceTabs?.querySelector('[role="tab"][aria-selected="true"]')?.textContent).toContain("Folder snapshot");
+
+    const modelTabs = document.querySelector<HTMLElement>('[role="tablist"][aria-label="Model mode"]');
+    const selectedModel = modelTabs?.querySelector<HTMLButtonElement>('[role="tab"][aria-selected="true"]');
+    if (!selectedModel) throw new Error("Selected model tab was not found.");
+    selectedModel.focus();
+    await pressKey(selectedModel, "ArrowRight");
+    expect(modelTabs?.querySelector('[role="tab"][aria-selected="true"]')?.textContent).not.toBe(selectedModel.textContent);
+
+    await clickAria("Close settings");
+    await clickButton("Discard changes");
+    await clickButton("Evolution");
+    const artifactTabs = document.querySelector<HTMLElement>('[role="tablist"][aria-label="Artifact view"]');
+    const content = artifactTabs?.querySelector<HTMLButtonElement>('[role="tab"][aria-selected="true"]');
+    if (!content) throw new Error("Selected artifact tab was not found.");
+    content.focus();
+    await pressKey(content, "ArrowRight");
+    expect(artifactTabs?.querySelector('[role="tab"][aria-selected="true"]')?.textContent).toContain("Changes");
+  });
+
+  it("reports completed diagnostics with warnings without claiming all checks passed", async () => {
+    provider = createFixtureDesktopProductProvider({ startOnline: true, degraded: true });
+    root = await renderProduct(provider);
+
+    await clickButton("System");
+    expect(screenText()).toContain("Checks completed with warnings");
+    expect(screenText()).not.toContain("All checks passed");
+    expect(screenText()).toContain("Repair available");
+    expect(screenText()).toContain("Needs attention");
   });
 
   it("requires explicit activation after a project switch", async () => {
@@ -976,12 +1020,9 @@ describe("DesktopProductApp", () => {
     await clickButton("System");
     expect(screenText()).toContain("Services are unavailable for this project.");
     expect(document.querySelector('button[aria-label^="Restart "]')).toBeNull();
-    expect(button("Activate project").disabled).toBe(false);
-    await clickButton("Activate project");
-    expect(activateProject).toHaveBeenCalledWith(
-      "project-fixture-1",
-      expect.objectContaining({ etag: expect.any(String) }),
-    );
+    expect(button("Activate project").disabled).toBe(true);
+    expect(button("Activate project").title).toContain("Reconnect");
+    expect(activateProject).not.toHaveBeenCalled();
   });
 
   it("loads project B when selection changes while project A's drawer remains open", async () => {
@@ -1257,6 +1298,9 @@ describe("DesktopProductApp", () => {
     await pressEscape();
     expect(document.querySelector('[role="dialog"]')).not.toBeNull();
     expect(screenText()).toContain("Discard unsaved changes?");
+    const alertDialog = document.querySelector<HTMLElement>('[role="alertdialog"]');
+    expect(alertDialog?.contains(document.activeElement)).toBe(true);
+    expect(document.activeElement?.textContent).toContain("Keep editing");
     await clickButton("Keep editing");
 
     const backdrop = document.querySelector<HTMLElement>(".drawer-backdrop");
@@ -1371,6 +1415,11 @@ function setCheckbox(label: string, checked: boolean): void {
 
 async function pressEscape(): Promise<void> {
   await act(async () => document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true })));
+  await flush();
+}
+
+async function pressKey(target: HTMLElement, key: string): Promise<void> {
+  await act(async () => target.dispatchEvent(new KeyboardEvent("keydown", { key, bubbles: true })));
   await flush();
 }
 

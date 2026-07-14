@@ -3,16 +3,30 @@
 > Pre-release target: no public DMG currently implements this complete flow.
 
 1. Install OpenEvo Desktop from the macOS `.dmg`.
-2. Launch the app and create a project.
+2. Launch the app and add a remote workspace.
 3. Enter the remote server host, port, and user. This release uses the macOS SSH
    agent; password and private-key entry are not exposed until the native
    credential broker is implemented.
-4. Configure proxy, pip index, and Hugging Face mirror settings if needed.
-5. Run remote doctor/bootstrap from Desktop.
-6. Start the remote OpenEvo Core Backend.
+4. Configure proxy, pip index, and Hugging Face mirror settings if needed, then
+   connect. Verify the server fingerprint when Desktop asks for host trust.
+5. Desktop runs remote checks, provisions the supported Python runtime when
+   needed, installs the bundled OpenEvo Core release, and starts the remote
+   backend. Project creation remains disabled until the workspace is connected.
+6. Create and activate a research project. An existing project that loses its
+   tunnel remains visible, but activation and runs stay disabled until its
+   assigned workspace reconnects.
 7. Use the default Codex subscription transcript mode, or explicitly choose the
    self-deployed reference mode when that remote runtime is available.
 8. Start the science run and monitor its timeline, logs, and artifacts.
+
+The System view distinguishes passing checks from completed checks that contain
+warnings or require attention. A warning state never appears as "All checks
+passed"; follow the visible repair or reconnect action before starting a run.
+
+Project and artifact mode controls support the standard tab keyboard behavior:
+arrow keys change the active choice, while Home and End select the first and
+last choice. When closing a form with unsaved changes, focus remains inside the
+confirmation until the draft is kept or discarded.
 
 Desktop must show setup-required or typed error states until a real sidecar and
 remote Core Backend are reachable. This document becomes a user quickstart only
