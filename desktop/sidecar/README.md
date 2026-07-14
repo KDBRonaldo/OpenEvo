@@ -222,6 +222,16 @@ The current provider implements:
   committed/startup lifecycle cleanup;
   this route is deliberately absent from the public Local API OpenAPI document.
 
+The dedicated Core bridge store commits a generation-zero `pending` identity
+before publishing its root-local marker and parent anchor, then marks the row
+`bound`. Restart completes only that exact empty, inode-bound pending bootstrap.
+A torn first-slot write is replaceable only while that row remains `pending` and
+the never-published backup slot is still zero; malformed, empty, or missing
+markers in a `bound` store fail closed. Unknown old state is never adopted.
+Durable unknown workspace finalize authority is replayed with its original
+request, ETags, and key before the bridge applies any newer Local project or
+workspace patch.
+
 Connection mutations atomically reserve idempotency capacity, two fixed terminal
 response slots for the operation and idempotency documents, profile action
 ownership, and a running operation before external SSH work. One process-wide
@@ -542,15 +552,86 @@ outcome becomes the predecessor, a same-revision reread must equal its complete
 mutable projection; a later direct successor must satisfy the same new-ETag,
 strict-time, and fixed-publication constraints as mapping recovery.
 Recovery performs both checks before another workspace mutation, mapping commit,
-or current ETag adoption. Finalize authority CAS-persists both the canonical
-request digest and the complete validated canonical outcome digest before mapping
-commit, and recovery recomputes both bindings before reading outcome authority.
-An older record without the outcome binding fails closed; live Core state cannot
+or current ETag adoption. Finalize authority CAS-persists the canonical request,
+request digest, upload/project ETags, idempotency key, and complete open upload
+authority before sending the mutation. Its `pre_finalize` state advances to
+`unknown` before transport; response loss or restart can therefore only replay
+that exact mutation. `applied` then CAS-binds the complete validated canonical
+outcome and outcome digest. Reads never infer finalize success, and recovery
+recomputes both bindings before reading outcome authority. An older record
+without this request/outcome state machine fails closed; live Core state cannot
 upgrade or repair it. Mapping CAS and matching
 applied-operation cleanup are atomic. After an O-to-A patch whose
 mapping commit failed, a same-A retry commits the finalized A mapping; a later
 Local B edit first commits that proven A generation, then issues one distinct
 A-to-B patch from A's latest ETag without another project create.
+
+`core_bridge_store_v1.py` is the production persistence implementation of that
+callback protocol. It owns a dedicated sidecar-private state directory rather
+than extending the public provider database. The directory must remain a real,
+owner-held mode-`0700` inode. Its database and owner-lock files are no-follow,
+link-count-one mode-`0600` regular files whose device/inode identities are pinned
+for the store lifetime. The database remains held by a no-follow descriptor and
+SQLite opens `/dev/fd/<fd>` in `mode=rw`; the connection-reported inode, held FD,
+and managed pathname must all match before configuration or schema writes. This
+uses the native SQLite VFS on macOS and Linux and closes the pathname swap window
+around `sqlite3.connect`. A nonblocking `flock` permits one process owner, a
+process-local reentrant lock serializes SQLite use. Every public read, write, and
+close checks the creator PID before it can acquire an inherited lock, so a
+post-fork child fails closed without deadlocking or unlocking its parent owner.
+
+The store uses SQLite's rollback journal with `synchronous=FULL`, forbids WAL/SHM,
+caps the database at 1 GiB and journal at 2 GiB, and validates an exact private
+schema fingerprint and metadata row in every transaction. Private persistence
+schema v3 is independent of the public Core/Desktop API version. Fresh
+eligibility is decided only after SQLite has recovered any hot rollback journal
+through the pinned connection. The held database FD must then have zero bytes,
+and that same connection must report zero pages, `user_version=0`, and no
+`sqlite_schema` rows; both markers must still be unpublished. This permits a
+crashed, uncommitted first schema transaction to roll back to the genuine empty
+generation-zero state without trusting its nonempty pre-open size. A physically
+nonempty empty-schema file, marker mismatch, failed rollback, nonempty
+unversioned, v1, v2, markerless bound, or otherwise unrecognized partial store
+fails closed. An eligible database may create v3 by atomically committing its
+schema and exact generation-zero `pending` identity before publishing either
+marker. Restart may finish only that recognized empty pending bootstrap.
+There is no inference-based migration. Startup performs SQLite and foreign-key
+integrity checks before decoding authority. Recovery is bounded to 120,000 rows
+and 512 MiB of indexed/document bytes; each closed document is at most 4 MiB.
+SQL length probes and exact-length guarded reads run before a document BLOB
+enters Python. Mapping history is contiguous per project and bounded to 100,000
+rows by default.
+
+The database has a random non-secret store identity bound to the exact root,
+database, owner lock, root marker, and external pathname anchor identities. The
+mode-`0600` anchor lives in the owner-controlled parent directory and prevents a
+self-consistent foreign or old root from being moved onto the managed pathname.
+Both marker files use two fixed-size bounded canonical-JSON slots and retain the
+latest authority generation/digest outside SQLite. Each write commits the next
+database generation first, then fsyncs the root marker and external anchor. On
+startup only an exact one-generation marker lag whose previous digest matches the
+database proof may be completed forward. A database behind either marker, a
+same-generation digest rewrite, a foreign store ID, or any physical identity
+substitution is durable rollback/cross-store corruption and fails closed. For
+the first generation only, the exact empty `pending` database row authorizes
+retrying an empty or torn primary slot when its inactive slot remains all-zero.
+A valid different marker, a dirty inactive slot, or any invalid marker after the
+row becomes `bound` is not an unpublished state and fails closed.
+
+Create, patch, mapping, abort, and finalize authority use explicit closed
+canonical JSON records with a per-row SHA-256 binding. Decode strictly rebuilds
+the Core DTOs and bridge dataclasses, reruns their invariants, and requires
+byte-identical reserialization. The store does not use pickle or accept generic
+environment, credential, secret, URI, command, or host-path fields. Create and
+patch transitions compare the complete previous canonical row. Mapping commit
+compares the complete create and prior mapping authority, appends the exact next
+history generation with the historical create/finalize and completed-patch
+transition proof, and removes only the supplied matching `applied` patch in one
+transaction. Commit and startup independently require exact generation
+succession, immutable same-generation revisions, direct revision successors,
+monotonic timestamps/ETags, and snapshot changes authorized by a persisted
+applied outcome. Exact committed-state retries resolve a lost commit response;
+rollback retains the old mapping and pending patch.
 
 Host, tunnel, archive open/read/close, and persistence callbacks run through a
 fixed bounded executor. A deadline stops result delivery, while any callback
@@ -580,12 +661,14 @@ bridge method exposes only `DesktopCoreBridgeErrorV1`: exact Core `ApiErrorV1`
 values are retained, strict-client local errors become closed `ApiErrorV1`
 values, and deferred event-iterator failures use the same boundary.
 
-This module is not yet wired into `DesktopReleaseProvider` or
-`DesktopProviderStore`. The store has no durable Core mapping/create/patch-operation
-schema, and the release app has no production host-service, tunnel-factory, or
-adopted-archive adapter. Consequently the provider routes above intentionally
-remain typed 503 and the release feature flags remain unchanged. Tests use
-fake adapters and `httpx.MockTransport`; those fakes are not a release provider.
+The bridge and `DesktopCoreBridgeStoreV1` are not yet wired into
+`DesktopReleaseProvider` or `DesktopProviderStore`. The release app still has no
+complete production composition of the host service, tunnel factory, adopted
+archive source, bridge, and dedicated bridge-state root. Consequently the
+provider routes above intentionally remain typed 503 and the release feature
+flags remain unchanged. Conformance tests inject the real durable store while
+the remaining adapters use `httpx.MockTransport`; that composition is not a
+release provider.
 
 ### Provider extension
 
