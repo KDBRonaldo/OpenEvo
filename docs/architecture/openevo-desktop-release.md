@@ -130,6 +130,18 @@ The repository currently provides:
 - source-level frontend, sidecar, Rust, and package-inventory tests;
 - Linux and macOS CI jobs that build the actual PyInstaller externalBin and
   exercise it through the production Rust native-launch path;
+- `.github/workflows/openevo-release-smoke.yml`, whose macOS packaging job is
+  the sole producer of the exact Core wheel and canonical
+  `framework-lock.json` used by that workflow. The job verifies a two-entry
+  SHA-256 manifest, exports its digest as a job output, and uploads the pair and
+  manifest under a source-commit-qualified Actions artifact name. The dependent
+  Linux Core job downloads that exact artifact, verifies the transferred
+  manifest against the producer's digest and then verifies both members before
+  install. It does not rebuild either release input. The macOS job separately
+  asserts that its temporary volume is APFS and runs a real held-descriptor to
+  `FSRef` to `FSUnlinkObject` probe through the release cleanup implementation;
+  the Linux job owns the actual `openevo-core-service` lifecycle and frozen
+  registry identity smoke;
 - `.github/workflows/openevo-desktop-candidate.yml`, a manual macOS candidate
   job that uses locked inputs, clean-installs the exact embedded Core wheel,
   runs renderer and release-mode Rust checks, builds the unsigned DMG, mounts

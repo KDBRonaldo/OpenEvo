@@ -109,7 +109,7 @@ def test_openevo_desktop_workflow_runs_frontend_and_tauri_checks() -> None:
     assert "cargo test --locked" in text
 
 
-def test_release_smoke_path_filter_and_packaged_capability_guard() -> None:
+def test_release_smoke_path_filter_and_platform_separation_guard() -> None:
     workflow = Path(".github/workflows/openevo-release-smoke.yml")
     remote_smoke = Path("scripts/ci/smoke_openevo_remote_capabilities.py")
 
@@ -117,7 +117,12 @@ def test_release_smoke_path_filter_and_packaged_capability_guard() -> None:
     remote_smoke_text = remote_smoke.read_text(encoding="utf-8")
 
     assert '- "scripts/ci/**"' in workflow_text
-    assert '--sidecar "$sidecar"' in workflow_text
-    assert "PYTHONPATH= .openevo-remote-wheel-smoke/bin/python" in workflow_text
+    macos_job, linux_job = workflow_text.split("  linux-core-smoke:\n", maxsplit=1)
+    assert "runs-on: macos-14" in macos_job
+    assert "scripts/ci/smoke_openevo_desktop_sidecar.py" in macos_job
+    assert "openevo-core-service ensure" not in macos_job
+    assert "runs-on: ubuntu-latest" in linux_job
+    assert "needs: macos-packaging-smoke" in linux_job
+    assert "openevo-core-service ensure" in linux_job
     assert "sidecar_smoke.smoke_sidecar" in remote_smoke_text
     assert "TestClient" not in remote_smoke_text

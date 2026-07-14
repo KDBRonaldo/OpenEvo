@@ -134,6 +134,22 @@ the separate remote-profile/SSH/active-project gate validates their production
 forwarding composition. A source `TestClient` or local fake capability catalog
 does not satisfy either gate.
 
+The pull-request release workflow splits this coverage across operating systems
+without splitting artifact identity. `macos-packaging-smoke` is the only job
+that builds the exact Core wheel and `framework-lock.json`; it writes and
+verifies `SHA256SUMS`, exports the manifest digest, and uploads those three files
+under a source-commit-qualified artifact name. `linux-core-smoke` has an
+explicit dependency on that job, downloads the same artifact, verifies the
+manifest digest and both payload digests before installation, then owns the
+actual Core service ensure/attachment/capability/stop smoke. It never rebuilds
+the release inputs. The macOS job owns sidecar packaging and runs a direct probe
+on APFS through the held object FD, `FSPathMakeRef`/`FSRef`, and
+`FSUnlinkObject` implementation; it does not call the Linux-only Core service
+lifecycle. Linux focused tests exercise the unsupported-platform fail-closed
+behavior and their explicit conditional-removal testkit, but cannot establish
+that the Carbon/APFS primitive works. That final boundary remains pending until
+the `macos-14` job passes.
+
 The exact Core wheel/lock export keeps the output directory open for the whole
 sidecar build and verifies its pathname/inode binding before and after writes.
 Before creating the output, it holds and validates the immediate parent's owner,

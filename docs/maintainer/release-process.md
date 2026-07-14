@@ -84,6 +84,16 @@ cleanup state and fails closed. Do not manually remove a preserved unknown path,
 hardlink, symlink, identity-mismatched replacement, or failed-cleanup tombstone
 without first investigating the release workspace.
 
+The pull-request release smoke keeps platform responsibilities separate. Its
+macOS packaging job builds the wheel/lock pair once, verifies a two-member
+SHA-256 manifest, runs the APFS held-FD/`FSRef`/`FSUnlinkObject` probe, and
+uploads the exact inputs under an artifact name bound to the source commit. The
+Linux Core job depends on that producer, verifies the downloaded manifest
+against the digest passed through the job output, rechecks both member digests,
+and only then installs the wheel and runs `openevo-core-service`. It must not
+rebuild the wheel or lock. Conversely, the macOS packaging job must not run the
+Linux-only Core service lifecycle.
+
 Any product or benchmark failure creates a new candidate after the fix.
 Infrastructure-only retries must be recorded and may not be used to select the
 best stochastic result.

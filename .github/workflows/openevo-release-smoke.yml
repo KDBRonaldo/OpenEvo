@@ -21,10 +21,15 @@ on:
       - "desktop/**"
       - "tests/**"
 
+permissions:
+  contents: read
+
 jobs:
-  wheel-smoke:
-    name: packaged sidecar + installed Core + source outer harness
+  macos-packaging-smoke:
+    name: macOS packaging + APFS held-FD cleanup
     runs-on: macos-14
+    outputs:
+      manifest_sha256: ${{ steps.release_inputs.outputs.manifest_sha256 }}
     steps:
       - uses: actions/checkout@v4
 
@@ -33,6 +38,25 @@ jobs:
           node-version: "22"
           cache: npm
           cache-dependency-path: desktop/package-lock.json
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - uses: astral-sh/setup-uv@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Test release validator and packaging contracts
+        run: |
+          uv sync --frozen --group dev
+          uv run python -m pytest \
+            tests/ci/test_build_sidecar.py \
+            tests/ci/test_check_openevo_release.py \
+            tests/ci/test_openevo_productization_workflow.py \
+            tests/ci/test_productization_spec.py \
+            -q
+          uv run python scripts/ci/audit_openevo_identity.py
 
       - name: Build OpenEvo Desktop assets
         working-directory: desktop
@@ -47,39 +71,222 @@ jobs:
         run: |
           diff -qr desktop/dist desktop/packaging/web
 
+      - name: Build and smoke packaged macOS Desktop sidecar
+        run: |
+          uv run python desktop/packaging/build_sidecar.py \
+            --core-wheel-output-dir .openevo-release-inputs
+          sidecar="desktop/src-tauri/binaries/openevo-desktop-sidecar-$(rustc --print host-tuple)"
+          uv run python scripts/ci/smoke_openevo_desktop_sidecar.py \
+            "$sidecar" \
+            --timeout-seconds 60
+
+      - name: Probe APFS held-FD to FSRef to FSUnlinkObject cleanup
+        run: |
+          diskutil info "$RUNNER_TEMP" \
+            | grep -Eiq '^[[:space:]]*(File System Personality|Type \(Bundle\)):[[:space:]]*APFS'
+          uv run python - <<'PY'
+          import importlib.util
+          import os
+          from pathlib import Path
+          import tempfile
+
+          path = Path("desktop/packaging/build_sidecar.py").resolve()
+          spec = importlib.util.spec_from_file_location("openevo_build_sidecar_probe", path)
+          if spec is None or spec.loader is None:
+              raise SystemExit("could not load the sidecar builder")
+          builder = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(builder)
+          if not builder._core_release_fd_removal_supported():
+              raise SystemExit("macOS identity-bound cleanup is unavailable")
+
+          native_calls = []
+          prepare_fsref = builder._prepare_core_release_fd_removal
+          execute_fsunlink = builder._execute_core_release_fd_removal
+
+          def record_prepare(object_fd, *, is_directory):
+              token = prepare_fsref(object_fd, is_directory=is_directory)
+              native_calls.append("FSPathMakeRef")
+              return token
+
+          def record_execute(token, parent_fd, name, object_fd, *, is_directory):
+              execute_fsunlink(
+                  token,
+                  parent_fd,
+                  name,
+                  object_fd,
+                  is_directory=is_directory,
+              )
+              native_calls.append("FSUnlinkObject")
+
+          builder._prepare_core_release_fd_removal = record_prepare
+          builder._execute_core_release_fd_removal = record_execute
+
+          with tempfile.TemporaryDirectory(dir=os.environ["RUNNER_TEMP"]) as temporary:
+              root = Path(temporary)
+              target = root / "held-fd-fsref-probe"
+              target.write_bytes(b"openevo-fsref-probe")
+              target.chmod(0o600)
+              parent_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+              object_fd = os.open(target, os.O_RDONLY | os.O_NOFOLLOW)
+              try:
+                  descriptor = os.fstat(object_fd)
+                  builder._remove_core_release_fd_bound_entry(
+                      parent_fd,
+                      target.name,
+                      object_fd,
+                      identity=(descriptor.st_dev, descriptor.st_ino),
+                      is_directory=False,
+                      subject="APFS held-FD FSRef probe",
+                  )
+              finally:
+                  os.close(object_fd)
+                  os.close(parent_fd)
+              if target.exists():
+                  raise SystemExit("FSUnlinkObject did not unlink the held object")
+          if native_calls != ["FSPathMakeRef", "FSUnlinkObject"]:
+              raise SystemExit(f"unexpected native cleanup calls: {native_calls}")
+          PY
+
+      - name: Create and verify exact Core release input manifest
+        id: release_inputs
+        run: |
+          test "$(find .openevo-release-inputs -maxdepth 1 -name 'openevo-*.whl' | wc -l | tr -d ' ')" = 1
+          test -f .openevo-release-inputs/framework-lock.json
+          (
+            cd .openevo-release-inputs
+            shasum -a 256 openevo-*.whl framework-lock.json > SHA256SUMS
+            test "$(wc -l < SHA256SUMS | tr -d ' ')" = 2
+            shasum -a 256 --check SHA256SUMS
+          )
+          test "$(find .openevo-release-inputs -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ')" = 3
+          manifest_sha256="$(shasum -a 256 .openevo-release-inputs/SHA256SUMS | awk '{print $1}')"
+          test "${#manifest_sha256}" = 64
+          echo "manifest_sha256=$manifest_sha256" >> "$GITHUB_OUTPUT"
+
+      - name: Upload exact Core release inputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: openevo-core-release-inputs-${{ github.sha }}
+          path: |
+            .openevo-release-inputs/openevo-*.whl
+            .openevo-release-inputs/framework-lock.json
+            .openevo-release-inputs/SHA256SUMS
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 1
+
+  linux-core-smoke:
+    name: Linux Core service + exact release identity
+    runs-on: ubuntu-latest
+    needs: macos-packaging-smoke
+    steps:
+      - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
       - uses: astral-sh/setup-uv@v6
 
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Linux release smoke dependencies
+        run: uv sync --frozen --group dev
 
-      - name: Test release validator
-        run: |
-          uv sync --frozen --group dev
-          uv run python -m pytest \
-            tests/ci/test_build_sidecar.py \
-            tests/ci/test_check_openevo_release.py \
-            tests/ci/test_openevo_productization_workflow.py \
-            tests/ci/test_productization_spec.py \
-            -q
-          uv run python scripts/ci/audit_openevo_identity.py
+      - name: Download exact Core release inputs
+        uses: actions/download-artifact@v4
+        with:
+          name: openevo-core-release-inputs-${{ github.sha }}
+          path: .openevo-release-inputs
 
-      - name: Build and smoke packaged Desktop sidecar
+      - name: Verify transferred Core release input manifest
+        env:
+          EXPECTED_MANIFEST_SHA256: ${{ needs.macos-packaging-smoke.outputs.manifest_sha256 }}
         run: |
-          uv run python desktop/packaging/build_sidecar.py \
-            --core-wheel-output-dir .openevo-remote-wheel
-          test "$(find .openevo-remote-wheel -maxdepth 1 -type f -name 'openevo-*.whl' | wc -l)" -eq 1
-          test -f .openevo-remote-wheel/framework-lock.json
-          test "$(find .openevo-remote-wheel -mindepth 1 -maxdepth 1 -type f | wc -l)" -eq 2
-          uv run python scripts/ci/smoke_openevo_desktop_sidecar.py \
-            "desktop/src-tauri/binaries/openevo-desktop-sidecar-$(rustc --print host-tuple)" \
-            --timeout-seconds 60
+          test "${#EXPECTED_MANIFEST_SHA256}" = 64
+          printf '%s  %s\n' "$EXPECTED_MANIFEST_SHA256" .openevo-release-inputs/SHA256SUMS \
+            | sha256sum --check -
+          (
+            cd .openevo-release-inputs
+            test "$(wc -l < SHA256SUMS | tr -d ' ')" = 2
+            sha256sum --check SHA256SUMS
+          )
+          test "$(find .openevo-release-inputs -maxdepth 1 -name 'openevo-*.whl' | wc -l | tr -d ' ')" = 1
+          test -f .openevo-release-inputs/framework-lock.json
+          test "$(find .openevo-release-inputs -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ')" = 3
 
-      - name: Build outer smoke wheel from isolated source
+      - name: Install and verify exact Core release identity
         run: |
-          test "$(find .openevo-remote-wheel -maxdepth 1 -name 'openevo-*.whl' | wc -l)" -eq 1
+          python -m venv .openevo-core-smoke
+          .openevo-core-smoke/bin/python -m pip install --upgrade pip
+          .openevo-core-smoke/bin/python -m pip install .openevo-release-inputs/openevo-*.whl
+          PYTHONPATH= .openevo-core-smoke/bin/openevo-backend --help
+          PYTHONPATH= .openevo-core-smoke/bin/openevo-backend serve --help
+          PYTHONPATH= .openevo-core-smoke/bin/openevo-backend run --help
+          PYTHONPATH= .openevo-core-smoke/bin/python scripts/ci/smoke_evolution_framework_wheel.py \
+            --wheel .openevo-release-inputs/openevo-*.whl \
+            --framework-lock .openevo-release-inputs/framework-lock.json
+
+      - name: Smoke Linux Core service lifecycle
+        run: |
+          set -euo pipefail
+          service_root="$RUNNER_TEMP/openevo-core-service-smoke"
+          attachment_name="release-smoke-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.json"
+          service_json="$RUNNER_TEMP/openevo-core-service.json"
+          attachment_json="$RUNNER_TEMP/openevo-core-attachment.json"
+          cleanup() {
+            PYTHONPATH= .openevo-core-smoke/bin/openevo-core-service stop \
+              --service-root "$service_root" \
+              --deadline-seconds 15 >/dev/null 2>&1 || true
+            rm -f "$service_json" "$attachment_json"
+          }
+          trap cleanup EXIT
+          umask 077
+          PYTHONPATH= .openevo-core-smoke/bin/openevo-core-service ensure \
+            --service-root "$service_root" \
+            --framework-lock "$GITHUB_WORKSPACE/.openevo-release-inputs/framework-lock.json" \
+            --source-commit "$GITHUB_SHA" \
+            --port 0 \
+            --deadline-seconds 60 \
+            --replace-mismatched \
+            --attachment-name "$attachment_name" > "$service_json"
+          PYTHONPATH= .openevo-core-smoke/bin/openevo-core-service consume-attachment \
+            --service-root "$service_root" \
+            --attachment-name "$attachment_name" > "$attachment_json"
+          PYTHONPATH= .openevo-core-smoke/bin/python - \
+            "$service_json" "$attachment_json" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+          from urllib.parse import urlencode
+          from urllib.request import ProxyHandler, Request, build_opener
+
+          service = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          attachment = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
+          port = service.get("port")
+          token = attachment.get("bearer_token")
+          if type(port) is not int or not 0 < port <= 65535:
+              raise SystemExit("Core service returned an invalid port")
+          if type(token) is not str or len(token) < 43:
+              raise SystemExit("Core service returned an invalid attachment token")
+          opener = build_opener(ProxyHandler({}))
+          digests = set()
+          for mode in ("codex_subscription_transcript", "self-deployed"):
+              query = urlencode({"execution_mode": mode})
+              request = Request(
+                  f"http://127.0.0.1:{port}/v1/capabilities?{query}",
+                  headers={"Authorization": f"Bearer {token}"},
+              )
+              with opener.open(request, timeout=10) as response:
+                  payload = json.load(response)
+              digest = payload.get("registry_digest")
+              if type(digest) is not str or len(digest) != 64:
+                  raise SystemExit("Core capability response omitted registry identity")
+              digests.add(digest)
+          if len(digests) != 1:
+              raise SystemExit("release modes resolved different registry identities")
+          PY
+
+      - name: Build outer smoke wheel from the transferred Core wheel
+        run: |
           rm -rf dist
           outer_source="$(mktemp -d)"
           trap 'rm -rf "$outer_source"' EXIT
@@ -91,33 +298,13 @@ jobs:
             --exclude '__pycache__/' \
             src/ "$outer_source/src/"
           mkdir -p "$outer_source/src/openevo/wheels"
-          cp .openevo-remote-wheel/openevo-*.whl "$outer_source/src/openevo/wheels/"
+          cp .openevo-release-inputs/openevo-*.whl "$outer_source/src/openevo/wheels/"
           uv run python -m build --wheel --no-isolation \
             --outdir "$GITHUB_WORKSPACE/dist" "$outer_source"
 
       - name: Validate OpenEvo wheel
         run: |
           uv run python scripts/ci/check_openevo_release.py --wheel dist/*.whl
-
-      - name: Smoke exact remote Core wheel
-        run: |
-          sidecar="desktop/src-tauri/binaries/openevo-desktop-sidecar-$(rustc --print host-tuple)"
-          python -m venv .openevo-remote-wheel-smoke
-          .openevo-remote-wheel-smoke/bin/python -m pip install --upgrade pip
-          .openevo-remote-wheel-smoke/bin/python -m pip install .openevo-remote-wheel/*.whl
-          .openevo-remote-wheel-smoke/bin/openevo-backend --help
-          .openevo-remote-wheel-smoke/bin/openevo-backend serve --help
-          .openevo-remote-wheel-smoke/bin/openevo-backend run --help
-          .openevo-remote-wheel-smoke/bin/openevo-core-service --help
-          PYTHONPATH= .openevo-remote-wheel-smoke/bin/python scripts/ci/smoke_evolution_framework_wheel.py \
-            --wheel .openevo-remote-wheel/*.whl \
-            --framework-lock .openevo-remote-wheel/framework-lock.json
-          PYTHONPATH= .openevo-remote-wheel-smoke/bin/python scripts/ci/smoke_openevo_remote_capabilities.py \
-            --wheel .openevo-remote-wheel/*.whl \
-            --framework-lock .openevo-remote-wheel/framework-lock.json \
-            --sidecar "$sidecar" \
-            --source-commit "$(git rev-parse HEAD)" \
-            --timeout-seconds 60
 
       - name: Smoke installed Core with source Desktop harness
         run: |

@@ -1220,91 +1220,136 @@ def test_local_version_validation_reads_top_level_desktop_metadata() -> None:
     assert not any(path.startswith("web/") for path in paths)
 
 
-def test_release_smoke_workflow_builds_packaged_assets_and_validates_wheel() -> None:
+def test_release_smoke_workflow_splits_macos_packaging_from_linux_core() -> None:
     workflow = Path(".github/workflows/openevo-release-smoke.yml")
     framework_smoke = Path("scripts/ci/smoke_evolution_framework_wheel.py")
     capability_smoke = Path("scripts/ci/smoke_openevo_remote_capabilities.py")
+    sidecar_process_smoke = Path("scripts/ci/smoke_openevo_desktop_sidecar.py")
     desktop_smoke = Path("scripts/ci/smoke_openevo_desktop_wheel.py")
 
     text = workflow.read_text(encoding="utf-8")
     framework_smoke_text = framework_smoke.read_text(encoding="utf-8")
     capability_smoke_text = capability_smoke.read_text(encoding="utf-8")
+    sidecar_process_smoke_text = sidecar_process_smoke.read_text(encoding="utf-8")
     desktop_smoke_text = desktop_smoke.read_text(encoding="utf-8")
 
     assert text.startswith("name: OpenEvo packaged sidecar + installed Core release smoke")
-    assert "runs-on: macos-14" in text
-    assert 'node-version: "22"' in text
-    assert "npm test -- --run" in text
-    assert "npm run typecheck" in text
-    assert "npm audit --audit-level=high" in text
-    assert "npm run build:openevo" in text
-    assert "diff -qr desktop/dist desktop/packaging/web" in text
     assert '"src/slime_bridge/**"' in text
     assert '"desktop/**"' in text
     assert '- "scripts/ci/**"' in text
     assert '"tests/**"' in text
-    assert "astral-sh/setup-uv@v6" in text
-    assert "uv sync --frozen --group dev" in text
-    assert "tests/ci/test_build_sidecar.py" in text
-    assert "tests/ci/test_check_openevo_release.py" in text
-    assert "name: Build and smoke packaged Desktop sidecar" in text
-    assert "uv run python desktop/packaging/build_sidecar.py" in text
-    assert "--core-wheel-output-dir .openevo-remote-wheel" in text
-    assert "test -f .openevo-remote-wheel/framework-lock.json" in text
+    jobs = text.split("jobs:\n", maxsplit=1)[1]
+    macos_job, linux_job = jobs.split("  linux-core-smoke:\n", maxsplit=1)
+    assert macos_job.startswith("  macos-packaging-smoke:\n")
+    assert "runs-on: macos-14" in macos_job
+    assert "runs-on: ubuntu" not in macos_job
+    assert "runs-on: ubuntu-latest" in linux_job
+    assert "runs-on: macos" not in linux_job
+    assert "needs: macos-packaging-smoke" in linux_job
+
+    assert 'node-version: "22"' in macos_job
+    assert "npm test -- --run" in macos_job
+    assert "npm run typecheck" in macos_job
+    assert "npm audit --audit-level=high" in macos_job
+    assert "npm run build:openevo" in macos_job
+    assert "diff -qr desktop/dist desktop/packaging/web" in macos_job
+    assert "uv sync --frozen --group dev" in macos_job
+    assert "tests/ci/test_build_sidecar.py" in macos_job
+    assert "tests/ci/test_check_openevo_release.py" in macos_job
+    assert "uv run python desktop/packaging/build_sidecar.py" in macos_job
+    assert "--core-wheel-output-dir .openevo-release-inputs" in macos_job
+    assert "scripts/ci/smoke_openevo_desktop_sidecar.py" in macos_job
+    assert text.count("desktop/packaging/build_sidecar.py") == 2
+    assert "desktop/packaging/build_sidecar.py" not in linux_job
+
+    assert "name: Probe APFS held-FD to FSRef to FSUnlinkObject cleanup" in macos_job
+    assert 'diskutil info "$RUNNER_TEMP"' in macos_job
+    assert "File System Personality|Type \\(Bundle\\)" in macos_job
+    assert "_core_release_fd_removal_supported" in macos_job
+    assert "_remove_core_release_fd_bound_entry" in macos_job
+    assert "prepare_fsref = builder._prepare_core_release_fd_removal" in macos_job
+    assert "execute_fsunlink = builder._execute_core_release_fd_removal" in macos_job
+    assert 'native_calls.append("FSPathMakeRef")' in macos_job
+    assert 'native_calls.append("FSUnlinkObject")' in macos_job
+    assert "object_fd = os.open(target, os.O_RDONLY | os.O_NOFOLLOW)" in macos_job
+    assert 'subject="APFS held-FD FSRef probe"' in macos_job
+    assert "FSUnlinkObject did not unlink the held object" in macos_job
+    assert "openevo-core-service ensure" not in macos_job
+
+    artifact_name = "openevo-core-release-inputs-${{ github.sha }}"
+    assert "outputs:\n      manifest_sha256: " in macos_job
+    assert "steps.release_inputs.outputs.manifest_sha256" in macos_job
+    assert "id: release_inputs" in macos_job
+    assert "shasum -a 256 openevo-*.whl framework-lock.json > SHA256SUMS" in macos_job
+    assert "shasum -a 256 --check SHA256SUMS" in macos_job
+    assert macos_job.count("-mindepth 1 -maxdepth 1") == 1
+    assert "actions/upload-artifact@v4" in macos_job
+    assert f"name: {artifact_name}" in macos_job
+    assert ".openevo-release-inputs/openevo-*.whl" in macos_job
+    assert ".openevo-release-inputs/framework-lock.json" in macos_job
+    assert ".openevo-release-inputs/SHA256SUMS" in macos_job
+    assert "include-hidden-files: true" in macos_job
+
+    assert "actions/download-artifact@v4" in linux_job
+    assert f"name: {artifact_name}" in linux_job
+    assert "path: .openevo-release-inputs" in linux_job
     assert (
-        "find .openevo-remote-wheel -mindepth 1 -maxdepth 1 -type f | wc -l"
-        in text
+        "EXPECTED_MANIFEST_SHA256: "
+        "${{ needs.macos-packaging-smoke.outputs.manifest_sha256 }}"
+    ) in linux_job
+    assert "sha256sum --check -" in linux_job
+    assert "sha256sum --check SHA256SUMS" in linux_job
+    assert linux_job.count("-mindepth 1 -maxdepth 1") == 1
+    assert "uv sync --frozen --group dev" in linux_job
+    assert linux_job.index("actions/download-artifact@v4") < linux_job.index(
+        "Verify transferred Core release input manifest"
     )
-    assert "scripts/ci/smoke_openevo_desktop_sidecar.py" in text
-    assert "name: Build outer smoke wheel from isolated source" in text
-    assert "python -m build --wheel --outdir .openevo-remote-wheel" not in text
+    assert linux_job.index("Verify transferred Core release input manifest") < linux_job.index(
+        "pip install .openevo-release-inputs/openevo-*.whl"
+    )
+
+    assert "openevo-core-service ensure" in linux_job
+    assert "openevo-core-service consume-attachment" in linux_job
+    assert "openevo-core-service stop" in linux_job
+    assert '--framework-lock "$GITHUB_WORKSPACE/.openevo-release-inputs/framework-lock.json"' in (
+        linux_job
+    )
+    assert '--source-commit "$GITHUB_SHA"' in linux_job
+    assert "scripts/ci/smoke_evolution_framework_wheel.py" in linux_job
+    assert "--wheel .openevo-release-inputs/openevo-*.whl" in linux_job
+    assert "--framework-lock .openevo-release-inputs/framework-lock.json" in linux_job
+    assert "codex_subscription_transcript" in linux_job
+    assert '"self-deployed"' in linux_job
+
+    assert "name: Build outer smoke wheel from the transferred Core wheel" in linux_job
+    assert "python -m build --wheel --outdir .openevo-release-inputs" not in text
     assert "rm -rf src/openevo/wheels" not in text
     assert "mkdir -p src/openevo/wheels" not in text
-    assert 'mkdir -p "$outer_source/src/openevo/wheels"' in text
-    assert 'src/ "$outer_source/src/"' in text
-    assert "uv run python -m build --wheel --no-isolation" in text
-    assert "scripts/ci/check_openevo_release.py --wheel dist/*.whl" in text
-    assert "name: Smoke exact remote Core wheel" in text
-    assert "python -m venv .openevo-remote-wheel-smoke" in text
+    assert 'mkdir -p "$outer_source/src/openevo/wheels"' in linux_job
+    assert 'src/ "$outer_source/src/"' in linux_job
+    assert "uv run python -m build --wheel --no-isolation" in linux_job
+    assert "scripts/ci/check_openevo_release.py --wheel dist/*.whl" in linux_job
+    assert "name: Smoke installed Core with source Desktop harness" in linux_job
+    assert "python -m venv .openevo-wheel-smoke" in linux_job
+    assert ".openevo-wheel-smoke/bin/python -m pip install dist/*.whl" in linux_job
     assert (
-        ".openevo-remote-wheel-smoke/bin/python -m pip install .openevo-remote-wheel/*.whl"
-    ) in text
-    assert ".openevo-remote-wheel-smoke/bin/openevo-backend --help" in text
-    assert ".openevo-remote-wheel-smoke/bin/openevo-backend serve --help" in text
-    assert ".openevo-remote-wheel-smoke/bin/openevo-backend run --help" in text
-    assert ".openevo-remote-wheel-smoke/bin/openevo-core-service --help" in text
-    assert (
-        "PYTHONPATH= .openevo-remote-wheel-smoke/bin/python "
-        "scripts/ci/smoke_evolution_framework_wheel.py "
-        "--wheel .openevo-remote-wheel/*.whl"
-    ) in text
-    assert (
-        "PYTHONPATH= .openevo-remote-wheel-smoke/bin/python "
-        "scripts/ci/smoke_openevo_remote_capabilities.py"
-    ) in text
-    assert "--wheel .openevo-remote-wheel/*.whl" in text
-    assert '--sidecar "$sidecar"' in text
-    assert '--source-commit "$(git rev-parse HEAD)"' in text
-    assert (
-        'sidecar="desktop/src-tauri/binaries/openevo-desktop-sidecar-$(rustc --print host-tuple)"'
-    ) in text
+        "PYTHONPATH=. .openevo-wheel-smoke/bin/python scripts/ci/smoke_openevo_desktop_wheel.py"
+    ) in linux_job
     assert "ensure_core_service" in capability_smoke_text
     assert "stop_core_service" in capability_smoke_text
     assert 'parser.add_argument("--source-commit", required=True)' in capability_smoke_text
-    assert '"--host"' not in capability_smoke_text
-    assert '"--port"' not in capability_smoke_text
     assert "sidecar_smoke.smoke_sidecar" in capability_smoke_text
     assert "TestClient" not in capability_smoke_text
     assert "create_sidecar_app" not in capability_smoke_text
     assert "BackendConnection" not in capability_smoke_text
     assert "backend_client_factory" not in capability_smoke_text
     assert "subprocess.Popen" not in capability_smoke_text
-    assert "name: Smoke installed Core with source Desktop harness" in text
-    assert "python -m venv .openevo-wheel-smoke" in text
-    assert ".openevo-wheel-smoke/bin/python -m pip install dist/*.whl" in text
-    assert (
-        "PYTHONPATH=. .openevo-wheel-smoke/bin/python scripts/ci/smoke_openevo_desktop_wheel.py"
-    ) in text
+    assert "start_new_session=True" in sidecar_process_smoke_text
+    assert '"--listener-fd"' in sidecar_process_smoke_text
+    assert '"--native-instance-stdin"' in sidecar_process_smoke_text
+    assert "pass_fds=" in sidecar_process_smoke_text
+    assert "--backend-base-url" not in sidecar_process_smoke_text
+    assert "/openevo-api/desktop/capabilities" in sidecar_process_smoke_text
     assert "source Desktop harness, not a packaged app" in desktop_smoke_text
     assert "EXPECTED_METHOD_IDS" in framework_smoke_text
     assert "EXPECTED_TARGET_IDS" in framework_smoke_text
@@ -1318,21 +1363,17 @@ def test_release_smoke_workflow_builds_packaged_assets_and_validates_wheel() -> 
         framework_smoke_text.index("loaded = load_verified_framework_registry(lock_path)")
     )
 
-    assert text.index("npm ci") < text.index("npm test -- --run")
-    assert text.index("npm ci") < text.index("npm audit --audit-level=high")
-    assert text.index("npm audit --audit-level=high") < text.index("npm run build:openevo")
-    assert text.index("npm test -- --run") < text.index("npm run build:openevo")
-    assert text.index("npm run typecheck") < text.index("npm run build:openevo")
-    assert text.index("name: Build and smoke packaged Desktop sidecar") < text.index(
-        "name: Build outer smoke wheel from isolated source"
+    assert macos_job.index("npm ci") < macos_job.index("npm test -- --run")
+    assert macos_job.index("npm ci") < macos_job.index("npm audit --audit-level=high")
+    assert macos_job.index("npm audit --audit-level=high") < macos_job.index(
+        "npm run build:openevo"
     )
-    assert text.index("name: Build outer smoke wheel from isolated source") < text.index(
-        "name: Validate OpenEvo wheel"
+    assert macos_job.index("npm test -- --run") < macos_job.index("npm run build:openevo")
+    assert macos_job.index("npm run typecheck") < macos_job.index("npm run build:openevo")
+    assert linux_job.index("Build outer smoke wheel from the transferred Core wheel") < (
+        linux_job.index("name: Validate OpenEvo wheel")
     )
-    assert text.index("name: Validate OpenEvo wheel") < text.index(
-        "name: Smoke exact remote Core wheel"
-    )
-    assert text.index("name: Smoke exact remote Core wheel") < text.index(
+    assert linux_job.index("name: Validate OpenEvo wheel") < linux_job.index(
         "name: Smoke installed Core with source Desktop harness"
     )
 
