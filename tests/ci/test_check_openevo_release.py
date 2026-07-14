@@ -568,9 +568,7 @@ def test_rejects_removed_terminal_bench_modules_in_core_wheel(tmp_path: Path) ->
 
     errors = checker.validate_wheel(wheel, expected_version="0.1.0")
 
-    boundary_error = next(
-        error for error in errors if "removed Terminal Bench modules" in error
-    )
+    boundary_error = next(error for error in errors if "removed Terminal Bench modules" in error)
     assert all(path in boundary_error for path in legacy_modules)
 
 
@@ -587,8 +585,7 @@ def test_rejects_removed_terminal_bench_modules_in_nested_core_wheel(
     errors = checker.validate_wheel(wheel, expected_version="0.1.0")
 
     assert any(
-        "openevo/wheels/openevo-0.1.0-py3-none-any.whl" in error
-        and legacy_path in error
+        "openevo/wheels/openevo-0.1.0-py3-none-any.whl" in error and legacy_path in error
         for error in errors
     )
 
@@ -796,12 +793,18 @@ def test_tauri_macos_config_declares_unreleased_dmg_target() -> None:
     assert sidecar_builder.is_file()
     assert sidecar_entry.is_file()
     assert "desktop/src-tauri/binaries/openevo-desktop-sidecar-*" in gitignore
-    assert "PyInstaller" in sidecar_builder.read_text(encoding="utf-8")
-    assert "_build_core_wheel" in sidecar_builder.read_text(encoding="utf-8")
-    assert "_validate_embedded_core_wheel" in sidecar_builder.read_text(encoding="utf-8")
-    assert "--add-data" in sidecar_builder.read_text(encoding="utf-8")
-    assert "desktop/packaging/web" in sidecar_builder.read_text(encoding="utf-8")
-    assert "desktop.server.launcher" in sidecar_entry.read_text(encoding="utf-8")
+    sidecar_builder_text = sidecar_builder.read_text(encoding="utf-8")
+    sidecar_entry_text = sidecar_entry.read_text(encoding="utf-8")
+    assert "PyInstaller" in sidecar_builder_text
+    assert "_build_core_wheel" in sidecar_builder_text
+    assert "_validate_embedded_core_wheel" in sidecar_builder_text
+    assert "--add-data" in sidecar_builder_text
+    assert "desktop/packaging/web" in sidecar_builder_text
+    assert "sidecar-build-metadata.json" in sidecar_builder_text
+    assert '"rev-parse", "--verify", "HEAD^{commit}"' in sidecar_builder_text
+    assert "_write_sidecar_build_metadata" in sidecar_builder_text
+    assert "desktop.server.launcher" in sidecar_entry_text
+    assert "_load_packaged_build_metadata" in sidecar_entry_text
     assert 'name = "openevo-desktop"' in cargo
     assert 'serde = { version = "1", features = ["derive"] }' in cargo
     assert "tauri = " in cargo
@@ -810,6 +813,19 @@ def test_tauri_macos_config_declares_unreleased_dmg_target() -> None:
     assert "fn allocate_sidecar_listener()" in main
     assert "fn prepare_packaged_sidecar(" in main
     assert "libc::O_NOFOLLOW" in main
+    assert "acl_get_fd_np" in main
+    assert "struct SpawnHandoff" in main
+    assert "run_parent_liveness_watchdog" in main
+    assert "libc::WNOWAIT" in main
+    assert "GroupSignalAuthority::Finalizing" in main
+    assert main.count("const DESKTOP_LOCAL_API_OPENAPI_SHA256") == 1
+    assert "3a86582d04dcd233096337c737ba91d75854746848aedc319025d86213a03d36" in main
+    assert "fn macos_proc_listpgrppids_call(" in main
+    assert "fn sanitize_pyinstaller_launch_environment(" in main
+    assert 'command.env(PYINSTALLER_RESET_ENVIRONMENT, "1")' in main
+    assert "fn monitor_running_sidecar(" in main
+    assert "launch_gate" not in main
+    assert "emergency_process_group" not in main
     assert "fn terminate_process_group(" in main
     assert "openevo-desktop-sidecar" in main
     assert "check_sidecar_health" in main
@@ -838,6 +854,48 @@ def test_tauri_macos_config_declares_unreleased_dmg_target() -> None:
     assert "cargo build --locked --release" in workflow
     assert "release binary contains the debug source launcher fallback" in workflow
     assert "release binary contains debug sidecar override code" in workflow
+
+
+def test_sidecar_bootloader_separates_verified_archive_fd_from_macos_exec_path(
+    tmp_path: Path,
+) -> None:
+    builder = Path("desktop/packaging/build_sidecar.py").read_text(encoding="utf-8")
+
+    assert 'NATIVE_EXECUTABLE_FD_ENV = "OPENEVO_NATIVE_EXECUTABLE_FD"' in builder
+    assert 'NATIVE_EXECUTABLE_PATH_ENV = "OPENEVO_NATIVE_EXECUTABLE_PATH"' in builder
+    assert "/dev/fd/{NATIVE_EXECUTABLE_FD}" in builder
+    assert "pyi_ctx->archive = pyi_archive_open(openevo_archive_path);" in builder
+    assert "snprintf(pyi_ctx->executable_filename, PYI_PATH_MAX" in builder
+    assert "realpath(openevo_native_path, openevo_resolved_path)" in builder
+    assert "fstat({NATIVE_EXECUTABLE_FD}, &openevo_fd_stat)" in builder
+    assert "lstat(openevo_native_path, &openevo_path_stat)" in builder
+    assert "openevo_fd_stat.st_ino != openevo_path_stat.st_ino" in builder
+    assert "openevo_path_stat.st_nlink != 1" in builder
+    assert "openevo_path_stat.st_uid != geteuid()" in builder
+    assert "NATIVE_EXECUTABLE_PATH_ENV.encode" in builder
+
+    path = Path("desktop/packaging/build_sidecar.py").resolve()
+    spec = importlib.util.spec_from_file_location("openevo_sidecar_builder", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    source = tmp_path / "bootloader/src/pyi_main.c"
+    source.parent.mkdir(parents=True)
+    source.write_text(
+        module._BOOTLOADER_MACOS_INCLUDE_NEEDLE
+        + module._BOOTLOADER_RESOLVER_NEEDLE
+        + module._BOOTLOADER_ARCHIVE_NEEDLE,
+        encoding="utf-8",
+    )
+
+    module._patch_fd_bound_bootloader(tmp_path)
+
+    patched = source.read_text(encoding="utf-8")
+    assert patched.count('getenv("OPENEVO_NATIVE_EXECUTABLE_PATH")') == 1
+    assert patched.count("pyi_archive_open(openevo_archive_path)") == 1
+    assert patched.count("fstat(4, &openevo_fd_stat)") == 1
+    assert patched.count("lstat(openevo_native_path, &openevo_path_stat)") == 1
+    assert patched.count("lstat(openevo_resolved_path, &openevo_resolved_stat)") == 1
 
 
 def test_pre_external_beta_pypi_publish_workflow_is_disabled() -> None:

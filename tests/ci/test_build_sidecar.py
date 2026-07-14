@@ -374,6 +374,48 @@ def test_fd_bound_bootloader_patch_is_exact_and_cross_platform(
     assert patched.count(builder._BOOTLOADER_RESOLVER_REPLACEMENT) == 1
 
 
+@pytest.mark.parametrize(
+    ("platform", "platform_markers"),
+    [
+        ("linux", (b"/proc/self/fd/4",)),
+        ("darwin", (b"/dev/fd/4", b"openevo-desktop-sidecar")),
+    ],
+)
+def test_native_bootloader_validation_uses_the_compiled_platform_branch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    platform: str,
+    platform_markers: tuple[bytes, ...],
+) -> None:
+    builder = _load_builder()
+    executable = tmp_path / "sidecar"
+    executable.write_bytes(
+        b"\0".join(
+            (
+                b"OPENEVO_NATIVE_EXECUTABLE_FD",
+                b"OPENEVO_NATIVE_EXECUTABLE_PATH",
+                *platform_markers,
+            )
+        )
+    )
+    monkeypatch.setattr(builder.sys, "platform", platform)
+
+    builder._validate_fd_bound_bootloader(executable)
+
+
+def test_native_bootloader_validation_rejects_an_unsupported_platform(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builder = _load_builder()
+    executable = tmp_path / "sidecar"
+    executable.write_bytes(b"OPENEVO_NATIVE_EXECUTABLE_FD\0OPENEVO_NATIVE_EXECUTABLE_PATH")
+    monkeypatch.setattr(builder.sys, "platform", "win32")
+
+    with pytest.raises(RuntimeError, match="platform is unsupported"):
+        builder._validate_fd_bound_bootloader(executable)
+
+
 def test_pyinstaller_source_identity_comes_from_exact_uv_lock(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

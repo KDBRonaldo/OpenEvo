@@ -15,6 +15,7 @@ import sys
 import time
 
 import pytest
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from desktop.server import (
@@ -26,7 +27,7 @@ from desktop.server import (
 
 import desktop.server.launcher as desktop_launcher
 from desktop.server.launcher import DEFAULT_DESKTOP_CONFIG_ROOT, create_app
-from desktop.sidecar import create_sidecar_app
+import desktop.packaging.sidecar_entry as sidecar_entry
 
 
 class _BinaryStdin:
@@ -161,13 +162,12 @@ def test_packaged_desktop_assets_expose_self_deployed_mode() -> None:
     assert "codex_subscription_transcript`,`codex_managed_local_inference" not in packaged_text
 
 
-def test_create_desktop_app_serves_spa_and_sidecar_api(tmp_path: Path) -> None:
-    app = create_desktop_app(create_sidecar_app(), static_root=_static_root(tmp_path))
+def test_create_desktop_app_serves_spa_without_adding_legacy_api(tmp_path: Path) -> None:
+    app = create_desktop_app(FastAPI(), static_root=_static_root(tmp_path))
     client = TestClient(app)
 
     shell_response = client.get("/openevo-api/desktop/shell")
-    assert shell_response.status_code == 200
-    assert shell_response.json()["execution"]["mode"] == "codex_subscription_transcript"
+    assert shell_response.status_code == 404
 
     index_response = client.get("/openevo")
     assert index_response.status_code == 200
@@ -194,7 +194,7 @@ def test_create_desktop_app_serves_spa_and_sidecar_api(tmp_path: Path) -> None:
 
 
 def test_create_desktop_app_redirects_root_to_openevo(tmp_path: Path) -> None:
-    app = create_desktop_app(create_sidecar_app(), static_root=_static_root(tmp_path))
+    app = create_desktop_app(FastAPI(), static_root=_static_root(tmp_path))
     client = TestClient(app, follow_redirects=False)
 
     response = client.get("/")
@@ -204,11 +204,19 @@ def test_create_desktop_app_redirects_root_to_openevo(tmp_path: Path) -> None:
 
 
 def test_create_app_launcher_uses_default_config_root(tmp_path: Path) -> None:
-    app = create_app(static_root=_static_root(tmp_path))
-    client = TestClient(app)
-
-    shell_response = client.get("/openevo-api/desktop/shell")
-    assert shell_response.status_code == 200
+    app = create_app(
+        static_root=_static_root(tmp_path),
+        native_frame=desktop_launcher._NativeLauncherFrame(
+            instance_id="1a" * 16,
+            readiness_key=bytes.fromhex("5a" * 32),
+            session_token="7c" * 32,
+        ),
+        source_commit="89baeb26",
+        build_channel="test",
+    )
+    with TestClient(app) as client:
+        assert client.get("/openevo").status_code == 200
+        assert client.get("/openevo-api/desktop/shell").status_code == 404
     assert DEFAULT_DESKTOP_CONFIG_ROOT.as_posix() == "~/.openevo/desktop"
 
 
@@ -216,6 +224,7 @@ def _native_instance_frame(
     *,
     instance_id: str = "1a" * 16,
     readiness_key: str = "5a" * 32,
+    session_token: str = "7c" * 32,
     protocol: str = desktop_launcher.NATIVE_SIDECAR_PROTOCOL,
 ) -> bytes:
     return (
@@ -224,6 +233,7 @@ def _native_instance_frame(
                 "protocol": protocol,
                 "instance_id": instance_id,
                 "readiness_key": readiness_key,
+                "session_token": session_token,
             },
             separators=(",", ":"),
         ).encode("ascii")
@@ -240,11 +250,31 @@ def test_launcher_reads_exact_bounded_native_instance_frame(
         _BinaryStdin(_native_instance_frame()),
     )
 
-    instance = desktop_launcher._read_native_instance_frame()
+    frame = desktop_launcher._read_native_instance_frame()
 
-    assert instance.instance_id == "1a" * 16
-    assert instance.readiness_key == bytes.fromhex("5a" * 32)
-    assert "5a" * 32 not in repr(instance)
+    assert frame.instance_id == "1a" * 16
+    assert frame.readiness_key == bytes.fromhex("5a" * 32)
+    assert frame.session_token == "7c" * 32
+    assert desktop_launcher.NATIVE_INSTANCE_FRAME_MAX_BYTES == 512
+    assert "5a" * 32 not in repr(frame)
+    assert "7c" * 32 not in repr(frame)
+
+
+def test_launcher_accepts_native_frame_at_rust_byte_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    compact = _native_instance_frame()
+    padded = (
+        compact[:-1]
+        + b" " * (desktop_launcher.NATIVE_INSTANCE_FRAME_MAX_BYTES - len(compact))
+        + b"\n"
+    )
+    assert len(padded) == desktop_launcher.NATIVE_INSTANCE_FRAME_MAX_BYTES
+    monkeypatch.setattr(desktop_launcher.sys, "stdin", _BinaryStdin(padded))
+
+    frame = desktop_launcher._read_native_instance_frame()
+
+    assert frame.session_token == "7c" * 32
 
 
 @pytest.mark.parametrize(
@@ -265,6 +295,8 @@ def test_launcher_reads_exact_bounded_native_instance_frame(
         _native_instance_frame(protocol="openevo-native-sidecar-v2"),
         _native_instance_frame(instance_id="1A" * 16),
         _native_instance_frame(readiness_key="5a" * 31),
+        _native_instance_frame(session_token="7c" * 31),
+        _native_instance_frame(session_token="7C" * 32),
         _native_instance_frame()[:-2] + b',"unknown":true}\n',
         b"x" * (desktop_launcher.NATIVE_INSTANCE_FRAME_MAX_BYTES + 1) + b"\n",
     ],
@@ -288,6 +320,7 @@ def test_launcher_serves_on_inherited_listener_with_instance_proof(
     port = listener.getsockname()[1]
     instance_id = "1a" * 16
     secret = bytes.fromhex("5a" * 32)
+    session_token = "7c" * 32
     process = subprocess.Popen(
         [
             sys.executable,
@@ -304,6 +337,10 @@ def test_launcher_serves_on_inherited_listener_with_instance_proof(
             str(_static_root(tmp_path)),
             "--desktop-config-root",
             str(tmp_path / "config"),
+            "--source-commit",
+            "89baeb26",
+            "--build-channel",
+            "test",
         ],
         stdin=subprocess.PIPE,
         stdout=subprocess.DEVNULL,
@@ -313,7 +350,12 @@ def test_launcher_serves_on_inherited_listener_with_instance_proof(
     )
     try:
         assert process.stdin is not None
-        process.stdin.write(_native_instance_frame(instance_id=instance_id))
+        process.stdin.write(
+            _native_instance_frame(
+                instance_id=instance_id,
+                session_token=session_token,
+            )
+        )
         process.stdin.close()
         process.stdin = None
         listener.close()
@@ -352,6 +394,80 @@ def test_launcher_serves_on_inherited_listener_with_instance_proof(
                 hashlib.sha256,
             ).hexdigest(),
         }
+
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=0.25)
+        connection.request("GET", "/version")
+        version_response = connection.getresponse()
+        assert version_response.status == 200
+        assert json.loads(version_response.read()) == {
+            "schema_version": "1",
+            "api_name": "openevo-desktop-local-api",
+            "preferred_major": 1,
+            "supported_majors": [1],
+            "openapi_sha256": "3a86582d04dcd233096337c737ba91d75854746848aedc319025d86213a03d36",
+            "build_version": "0.1.0",
+            "source_commit": "89baeb26",
+            "build_channel": "test",
+            "provider_kind": "desktop_sidecar",
+            "feature_flags": ["remote_profiles"],
+        }
+        connection.close()
+
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=0.25)
+        connection.request(
+            "GET",
+            "/openevo-native/session",
+            headers={desktop_launcher.NATIVE_SESSION_HEADER: session_token},
+        )
+        probe_response = connection.getresponse()
+        assert probe_response.status == 204
+        assert probe_response.read() == b""
+        connection.close()
+
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=0.25)
+        connection.request("GET", "/openevo-native/session")
+        assert connection.getresponse().status == 403
+        connection.close()
+
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=0.25)
+        connection.request(
+            "GET",
+            "/openevo-native/session",
+            headers={desktop_launcher.NATIVE_SESSION_HEADER: "8d" * 32},
+        )
+        assert connection.getresponse().status == 403
+        connection.close()
+
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=0.25)
+        connection.putrequest("GET", "/openevo-native/session")
+        connection.putheader(desktop_launcher.NATIVE_SESSION_HEADER, session_token)
+        connection.putheader(desktop_launcher.NATIVE_SESSION_HEADER, session_token)
+        connection.endheaders()
+        assert connection.getresponse().status == 403
+        connection.close()
+
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=0.25)
+        connection.request(
+            "GET",
+            "/openevo-api/desktop/run",
+            headers={desktop_launcher.NATIVE_SESSION_HEADER: session_token},
+        )
+        assert connection.getresponse().status == 404
+        connection.close()
+
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=0.25)
+        connection.request(
+            "GET",
+            "/openevo-api/desktop/run",
+            headers={"X-OpenEvo-Sidecar-Token": session_token},
+        )
+        assert connection.getresponse().status == 404
+        connection.close()
+
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=0.25)
+        connection.request("GET", "/openevo-api/desktop/shell")
+        assert connection.getresponse().status == 404
+        connection.close()
     finally:
         listener.close()
         if process.poll() is None:
@@ -368,88 +484,90 @@ def test_create_app_launcher_accepts_config_root_override(tmp_path: Path) -> Non
     app = create_app(
         static_root=_static_root(tmp_path),
         desktop_config_root=config_root,
+        native_frame=desktop_launcher._NativeLauncherFrame(
+            instance_id="1a" * 16,
+            readiness_key=bytes.fromhex("5a" * 32),
+            session_token="7c" * 32,
+        ),
+        source_commit="89baeb26",
+        build_channel="test",
     )
-    client = TestClient(app)
-    token = client.get("/openevo-api/desktop/shell").json()["sidecar"]["mutation_token"]
+    with TestClient(app) as client:
+        authenticated = client.get(
+            "/desktop/v1/state",
+            headers={desktop_launcher.NATIVE_SESSION_HEADER: "7c" * 32},
+        )
+        assert authenticated.status_code == 200
+        assert client.get("/desktop/v1/state").status_code == 401
+        assert client.get("/openevo-api/backend/status").status_code == 404
 
-    response = client.get(
-        "/openevo-api/desktop/project-configs",
-        headers={"X-OpenEvo-Sidecar-Token": token},
+    assert (config_root / desktop_launcher.LOCAL_API_STATE_DIRECTORY).is_dir()
+    assert (
+        config_root / desktop_launcher.LOCAL_API_STATE_DIRECTORY / "provider.sqlite3"
+    ).is_file()
+
+
+@pytest.mark.parametrize(
+    ("source_commit", "build_channel"),
+    [
+        ("ABCDEF0", "test"),
+        ("123456", "test"),
+        ("0" * 40, "release"),
+    ],
+)
+def test_create_app_launcher_rejects_invalid_source_commit(
+    tmp_path: Path,
+    source_commit: str,
+    build_channel: str,
+) -> None:
+    with pytest.raises(ValueError, match="source commit"):
+        create_app(
+            static_root=_static_root(tmp_path),
+            native_frame=desktop_launcher._NativeLauncherFrame(
+                instance_id="1a" * 16,
+                readiness_key=bytes.fromhex("5a" * 32),
+                session_token="7c" * 32,
+            ),
+            source_commit=source_commit,
+            build_channel=build_channel,
+        )
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b'{"schema_version":"1","source_commit":"0000000"}\n',
+        b'{"schema_version":"1","source_commit":"89BAEB26"}\n',
+        b'{"schema_version":"1","source_commit":"89baeb26","extra":true}\n',
+        b'{"schema_version":"1","schema_version":"1","source_commit":"89baeb26"}\n',
+    ],
+)
+def test_packaged_sidecar_build_metadata_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    payload: bytes,
+) -> None:
+    path = tmp_path / sidecar_entry.BUILD_METADATA_RELATIVE_PATH
+    path.parent.mkdir(parents=True)
+    path.write_bytes(payload)
+    monkeypatch.setattr(sidecar_entry.sys, "_MEIPASS", str(tmp_path), raising=False)
+
+    with pytest.raises(ValueError, match="invalid packaged sidecar build metadata"):
+        sidecar_entry._load_packaged_build_metadata()
+
+
+def test_packaged_sidecar_build_metadata_returns_baked_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / sidecar_entry.BUILD_METADATA_RELATIVE_PATH
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        '{"schema_version":"1","source_commit":"89baeb26"}\n',
+        encoding="utf-8",
     )
+    monkeypatch.setattr(sidecar_entry.sys, "_MEIPASS", str(tmp_path), raising=False)
 
-    assert response.status_code == 200
-    assert response.json() == {"configs": []}
+    metadata = sidecar_entry._load_packaged_build_metadata()
 
-
-def test_create_app_launcher_wires_backend_facade_base_url(tmp_path: Path) -> None:
-    app = create_app(
-        static_root=_static_root(tmp_path),
-        backend_base_url="http://127.0.0.1:9",
-    )
-    client = TestClient(app)
-    token = client.get("/openevo-api/desktop/shell").json()["sidecar"]["mutation_token"]
-
-    response = client.get(
-        "/openevo-api/backend/status",
-        headers={"X-OpenEvo-Sidecar-Token": token},
-    )
-
-    assert response.status_code == 503
-    assert response.json()["code"] == "backend_connection_failed"
-
-
-def test_create_app_launcher_saves_first_project_config(tmp_path: Path) -> None:
-    config_root = tmp_path / "config"
-    app = create_app(
-        static_root=_static_root(tmp_path),
-        desktop_config_root=config_root,
-    )
-    client = TestClient(app)
-    token = client.get("/openevo-api/desktop/shell").json()["sidecar"]["mutation_token"]
-
-    response = client.post(
-        "/openevo-api/desktop/project-config",
-        headers={"X-OpenEvo-Sidecar-Token": token},
-        json={
-            "project_name": "Protein Design",
-            "task_id": "folding-baseline",
-            "objective": "Improve the folding baseline.",
-            "source_type": "remote_path",
-            "source_path": "/datasets/folding-baseline",
-            "remote_profile_id": "science-team",
-            "remote_host": "gpu.example.edu",
-            "remote_port": 22,
-            "remote_user": "alice",
-            "auth_method": "ssh_agent",
-            "codex_model": "gpt-5.1-codex-mini",
-            "evolution": {
-                "targets": {
-                    "text_memory": {
-                        "enabled": True,
-                        "method": "text_memory_reflector",
-                        "config": {},
-                    },
-                    "skill_bundle": {
-                        "enabled": True,
-                        "method": "skill_bundle_reflector",
-                        "config": {},
-                    },
-                    "agent_system": {
-                        "enabled": True,
-                        "method": "auto",
-                        "config": {"target_path": "AGENTS.md"},
-                    },
-                    "parametric_memory": {
-                        "enabled": False,
-                        "method": "parametric_memory_register",
-                        "config": {},
-                    },
-                }
-            },
-        },
-    )
-
-    assert response.status_code == 200
-    payload = response.json()
-    assert payload["status"]["remote"]["id"] == "science-team"
-    assert payload["status"]["sidecar"]["transport"]["id"] == "ssh"
+    assert metadata.source_commit == "89baeb26"
