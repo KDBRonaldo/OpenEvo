@@ -415,6 +415,15 @@ A body or frame rejected by the seal cannot be returned, applied, or recorded as
 replay authority for the retired session, and `close()` need not wait for a
 stalled application thread.
 
+The sidecar may recover an unknown stale-upload abort only through the strict
+client's generation-bound persisted-upload abort transaction. That operation
+validates the durable open session, exact ETag, and idempotency key before
+transport, then restores upload authority, dispatches abort, validates the
+terminal response, and publishes cache/result delivery in the same
+copy-on-write generation barrier. A close or project-session switch that seals
+the generation rolls back both restored and returned upload authority; bridge
+code cannot seed the client's private upload cache directly.
+
 Local SSE carries Desktop state changes and resource invalidations. Every
 resource invalidation includes the authoritative ETag or content digest and
 an explicit `desktop` or `core` authority, and causes the renderer to reload
@@ -450,6 +459,17 @@ invalid project config, incomplete workspace upload, unprepared model, or a
 non-reachable revision produces a typed blocking error. None of these cases may
 fall back to an SSH run command, cached capability table, or renderer-generated
 reference.
+
+Persisted Desktop mapping, applied-patch, and workspace-finalize revision refs
+are monotonic authority. Before mapping reconciliation, same-intent activation,
+patch/finalize recovery, or an A-to-B patch can use current mutable authority,
+the sidecar requires Core's active revision to be either the exact persisted ref
+or its same-project, generation-adjacent successor. A lower generation, a
+same-generation ID or manifest rewrite, or an unproven generation skip returns a
+typed conflict before recovery workspace mutation, mapping commit, or use of the
+reported ETag. An applied imported-draft outcome with no active revision retains
+its pre-patch base revision as effective authority. If the base is also empty,
+only `null` or a same-project generation-zero first revision is accepted.
 
 Required-revision selection is fixed: if Core reports a reachable queued or
 preparing successor for the active head, the new task requires that successor

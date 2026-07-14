@@ -3707,6 +3707,127 @@ def test_workspace_abort_and_wrong_upload_response_are_bound_to_route() -> None:
     assert exc_info.value.error.code is CoreClientLocalErrorCodeV1.INVALID_RESPONSE
 
 
+def test_persisted_workspace_abort_replays_exact_authority_without_a_read() -> None:
+    open_upload = _upload(accepted_offset=512, etag='"' + ("7" * 64) + '"')
+    aborted = open_upload.model_copy(
+        update={
+            "status": v1.WorkspaceUploadStatus.ABORTED,
+            "updated_at": "2026-07-14T12:00:03Z",
+            "etag": '"' + ("8" * 64) + '"',
+        }
+    )
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json=aborted.model_dump(mode="json"))
+
+    client = _client(handler)
+    request = v1.WorkspaceUploadAbortV1(reason="Replay the durable abort.")
+    result = client.abort_persisted_workspace_upload(
+        open_upload,
+        request,
+        if_match=open_upload.etag,
+        idempotency_key="workspace-persisted-abort-1",
+    )
+
+    assert result == aborted
+    assert [request.method for request in seen] == ["POST"]
+    assert seen[0].headers["If-Match"] == open_upload.etag
+    assert seen[0].headers["Idempotency-Key"] == "workspace-persisted-abort-1"
+    assert client._workspace_uploads[open_upload.id] == aborted
+
+
+@pytest.mark.parametrize(
+    ("if_match", "idempotency_key"),
+    [
+        ('"' + ("9" * 64) + '"', "workspace-persisted-abort-invalid-etag"),
+        ('"' + ("7" * 64) + '"', "workspace-persisted-abort\ninvalid"),
+    ],
+)
+def test_persisted_workspace_abort_rejects_invalid_authority_before_restore(
+    if_match: str,
+    idempotency_key: str,
+) -> None:
+    open_upload = _upload(accepted_offset=512, etag='"' + ("7" * 64) + '"')
+    calls = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        raise AssertionError("invalid persisted abort must fail before transport")
+
+    client = _client(handler)
+
+    with pytest.raises(CoreClientErrorV1) as exc_info:
+        client.abort_persisted_workspace_upload(
+            open_upload,
+            v1.WorkspaceUploadAbortV1(reason="Replay the durable abort."),
+            if_match=if_match,
+            idempotency_key=idempotency_key,
+        )
+
+    assert exc_info.value.error.code is CoreClientLocalErrorCodeV1.INVALID_REQUEST
+    assert calls == 0
+    assert open_upload.id not in client._workspace_uploads
+
+
+def test_close_rolls_back_persisted_workspace_abort_authority_before_delivery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    open_upload = _upload(accepted_offset=512, etag='"' + ("7" * 64) + '"')
+    aborted = open_upload.model_copy(
+        update={
+            "status": v1.WorkspaceUploadStatus.ABORTED,
+            "updated_at": "2026-07-14T12:00:03Z",
+            "etag": '"' + ("8" * 64) + '"',
+        }
+    )
+    client = _client(
+        lambda _request: httpx.Response(200, json=aborted.model_dump(mode="json"))
+    )
+    original_batch = client._registration_batch
+    transaction_ready = threading.Event()
+    release_transaction = threading.Event()
+    results: list[v1.WorkspaceUploadSessionV1] = []
+    errors: list[CoreClientErrorV1] = []
+
+    @contextmanager
+    def pause_before_transaction_exit(*args, **kwargs):
+        with original_batch(*args, **kwargs):
+            yield
+            transaction_ready.set()
+            release_transaction.wait(1)
+
+    def abort() -> None:
+        try:
+            results.append(
+                client.abort_persisted_workspace_upload(
+                    open_upload,
+                    v1.WorkspaceUploadAbortV1(reason="Replay the durable abort."),
+                    if_match=open_upload.etag,
+                    idempotency_key="workspace-persisted-abort-close-1",
+                )
+            )
+        except CoreClientErrorV1 as exc:
+            errors.append(exc)
+
+    monkeypatch.setattr(client, "_registration_batch", pause_before_transaction_exit)
+    request_thread = threading.Thread(target=abort)
+    request_thread.start()
+    assert transaction_ready.wait(1)
+    client.close()
+    release_transaction.set()
+    request_thread.join(1)
+
+    assert not request_thread.is_alive()
+    assert results == []
+    assert errors[0].error.code is CoreClientLocalErrorCodeV1.CLIENT_CLOSED
+    assert open_upload.id not in client._workspace_uploads
+    assert not any(key[0] == open_upload.id for key in client._workspace_etag_representations)
+    assert not any(key[0] == open_upload.id for key in client._workspace_representation_etags)
+
+
 def test_workspace_upload_create_requires_a_new_resource_etag() -> None:
     project = _project()
     upload = _upload(etag=project.etag)

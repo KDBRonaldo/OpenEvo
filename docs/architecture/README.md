@@ -51,7 +51,10 @@ Terminal Bench maintainer commands and package boundaries are documented in
 Pre-release Desktop workflow notes live under `docs/user/`; Core target
 contracts live under `docs/core/`. [Desktop Release Packaging](openevo-desktop-release.md)
 separates the currently executable sidecar build from the still-blocked macOS
-DMG release gates. Older Desktop foundation notes remain implementation history.
+DMG release gates. [Desktop Active-Tunnel Core Bridge v1](desktop-core-bridge-v1.md)
+documents the strict project-session bridge and its still-unwired release
+persistence boundary. Older Desktop foundation notes remain implementation
+history.
 
 ## Core Backend Internals
 

@@ -266,6 +266,117 @@ provider slice and return a closed `ApiErrorV1` with HTTP 503. They never return
 fixture data or a synthetic ready/success state. A successful SSH check reports
 Core as `offline` with `core_not_started`; it does not claim a live tunnel.
 
+`core_bridge_v1.py` now provides the strict active-project bridge needed by the
+next provider slice. It injects a host-global `CoreHostService`, a tunnel
+factory, an opaque adopted-archive source, and a durable persistence adapter.
+The bridge owns exactly one generation-linearized project tunnel and
+`CoreControlClientV1`; switching or closing seals the previous client before a
+new session can publish. Candidate and active generations also own tunnel,
+archive-context, and blocking-adapter cleanup. Core and adapter calls pass a
+generation/deadline gate before and after external work. Tunnel close is
+bounded, observable, and retryable: a timeout or callback failure leaves the
+handle and bridge unclosed and blocks a replacement session. A close future
+that succeeds at the timeout boundary is consumed as success and is not
+resubmitted. Deadline expiry immediately after submit also retains that future,
+so retry waits for the same callback; only a callback exception permits a new
+attempt. The tunnel factory
+receives only the profile identity and remote Core port, while the bearer
+remains between the host service and the strict client and is excluded from
+dataclass representations and normalized errors.
+
+Activation negotiates version and verified capabilities, performs an exact
+idempotent Core project create only when no durable mapping exists, publishes a
+native-folder workspace through the bounded chunk protocol, validates the
+authoritative project/head, and persists the host-bound Core mapping. Scratch
+projects use Core's signed initial empty workspace. Imported projects accept
+only `WorkspaceImportRefV1` and a read-only stream from the archive source; the
+bridge contract contains no host path. A lost create response can be retried
+only with the persisted canonical create request, its digest, and its
+idempotency key. Durable create state distinguishes `pre_create`, `unknown`,
+and `bound`: a proven pre-transport failure may accept a new Local action key,
+unknown outcome requires exact replay, and a bound project resumes without
+another create. If mapping commit is interrupted and the Local draft is edited,
+the bound operation first verifies the original request against that Core
+project and then converges the new intent through a versioned patch. For an
+initial imported workspace, the durable exact finalize outcome is the revision
+authority at the unmapped boundary. Recovery validates its project snapshots,
+publication, and every revision edge through current authority before using the
+current ETag, issuing a patch or upload, or committing the first mapping.
+
+Mapped Local edits use Core `patch_project`, the freshly read project ETag, and
+a deterministic old/new request key. The mapping records canonical mapped
+intent and immutable project/task/workspace content snapshots separately from
+mutable Core authority: project ETag, active revision, project `updated_at`, and
+registry digest. A legitimate cross-session successor may change only that
+mutable authority. Every initial-publication, mapped, patch-recovery, and
+finalize-recovery read validates active revision authority monotonically before
+using the current ETag:
+the same generation must preserve the complete revision ref, while a changed ref
+must be the same-project direct successor on every proven authority edge.
+Generation rollback, identity rewrite, and unproven generation skips fail closed
+without committing a mapping. An
+applied imported draft may have no outcome revision; recovery then retains its
+pre-patch base revision as the effective lower bound. If both are absent, only
+no revision or a same-project generation-zero revision is valid. After
+capabilities, project/head agreement, and validation succeed, compare-and-swap
+commit increments the mapping generation and retains the previous version in
+adapter-owned history; an authority-only version may repeat the predecessor
+request digest. Core must sign the required new snapshots before Desktop accepts
+task, model/execution, evolution, or workspace changes.
+Imported workspace upload IDs are additionally bound to the exact Core project
+snapshot, so a workspace revision cannot reuse an earlier upload session. A
+superseded open upload is durably aborted before its binding is cleared. Its
+canonical request, digest, original ETag/key, open upload authority, and unknown
+state survive restart, and every unknown result is replayed exactly before the
+new workspace is uploaded or finalized.
+
+Project patches use a separate durable `pre_patch`/`unknown`/`applied`
+operation. It binds canonical old/new Local intent, patch digest and key, the
+pre-patch Core project/ETag/snapshots, the validated Core outcome, and explicit
+immutable-content and mutable-publication/runtime projections covering that
+outcome. Reads are not used to infer an unknown result; the exact mutation is
+replayed. An imported patch may then be finalized without invalidating its
+durable proof: recovery requires the persisted upload's predecessor snapshot
+and ETag plus the durable exact finalize response's project/workspace snapshots
+and publication before accepting current status/ETag or later successor
+authority. The finalize project's active revision must descend from the applied
+patch's effective lower bound and is then durable authority for later reads. A
+recovered mapping may cross multiple generations only when the durable patch
+base, applied outcome, and finalize outcome form a complete ordered chain of
+same-revision or direct-successor edges through the current revision. Missing
+intermediates do not authorize a generation jump.
+Recovery performs both checks before another workspace mutation, mapping commit,
+or current ETag adoption. Finalize authority CAS-persists both the canonical
+request digest and the complete validated canonical outcome digest before mapping
+commit, and recovery recomputes both bindings before reading outcome authority.
+An older record without the outcome binding fails closed; live Core state cannot
+upgrade or repair it. Mapping CAS and matching
+applied-operation cleanup are atomic. After an O-to-A patch whose
+mapping commit failed, a same-A retry commits the finalized A mapping; a later
+Local B edit first commits that proven A generation, then issues one distinct
+A-to-B patch from A's latest ETag without another project create.
+
+Host, tunnel, archive open/read/close, and persistence callbacks run through a
+fixed bounded executor. A deadline stops result delivery, while any callback
+still running remains owned by the cancelled generation. Successful close or
+switch waits for that work and all resources; if bounded retirement cannot
+prove completion, it returns a typed retryable error instead of announcing the
+transition.
+
+Run creation accepts only the active local project ID. The bridge rereads Core
+project snapshots, capabilities, validation, and revision head, chooses a
+reachable nonterminal successor before the active head, and builds Core's
+`RunCreateV1`. Other run, artifact, service, Core operation, log, diagnostic,
+maintenance, and event methods preserve the strict Core DTOs and project
+membership checks.
+
+This module is not yet wired into `DesktopReleaseProvider` or
+`DesktopProviderStore`. The store has no durable Core mapping/create/patch-operation
+schema, and the release app has no production host-service, tunnel-factory, or
+adopted-archive adapter. Consequently the provider routes above intentionally
+remain typed 503 and the release feature flags remain unchanged. Tests use
+fake adapters and `httpx.MockTransport`; those fakes are not a release provider.
+
 ### Provider extension
 
 `DesktopLocalApiProviderV1.invoke()` receives the canonical OpenAPI
@@ -423,3 +534,10 @@ response may retain its upload ETag. Chunk, abort, and finalize responses change
 upload state and therefore must issue a new upload ETag. Finalization
 independently requires the returned project ETag to differ from the upload's
 frozen project ETag.
+
+Durable stale-upload abort recovery uses the public generation-bound
+`abort_persisted_workspace_upload` client operation. Exact persisted authority
+restore, upload ETag and idempotency validation, abort transport, cache update,
+and return delivery are one copy-on-write transaction. If close seals that
+generation before delivery, neither the open authority nor the abort result is
+retained; the bridge never calls the client's private upload registration helper.
