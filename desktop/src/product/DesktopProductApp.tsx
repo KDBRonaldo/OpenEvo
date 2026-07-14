@@ -236,6 +236,9 @@ export function DesktopProductApp({
   const displayedConnectionState = connection.state === "online" && profile && connection.profile_id !== profile.profile_id
     ? "disconnected"
     : connection.state;
+  const settingsProject = creatingProject ? null : project;
+  const settingsFormIdentity = settingsProject ? `project:${settingsProject.project_id}` : "create";
+  const settingsCapability = projectCapability(snapshot, settingsProject);
   const startReason = getStartReason(snapshot, project, profile, activeRun, actionState);
   const canStart = startReason === null;
 
@@ -366,10 +369,11 @@ export function DesktopProductApp({
 
       {settingsOpen ? (
         <SettingsDrawer
-          project={creatingProject ? null : project}
+          key={settingsFormIdentity}
+          project={settingsProject}
           profileId={profile?.profile_id ?? null}
-          capability={snapshot.capability}
-          capabilities={readyCapabilities(snapshot, creatingProject ? null : project)}
+          capability={settingsCapability}
+          capabilities={readyCapabilities(settingsCapability, settingsProject)}
           busy={actionState === "working"}
           onClose={() => {
             const pending = pendingProjectActivation.current;
@@ -383,11 +387,11 @@ export function DesktopProductApp({
           onRetryCapabilities={() => refresh()}
           onSave={async (input, actionId, pendingSourceActionId) => {
             const requestEpoch = snapshot.stream.epoch;
-            const requestEtag = project && !creatingProject ? project.etag : null;
+            const requestProject = settingsProject;
             let pendingSourceOutcome: SaveAttemptResult["pendingSourceOutcome"] = null;
             const result = await act(async () => {
-              if (project && !creatingProject) {
-                await provider.updateProject(project.project_id, input, resourceIntent(snapshot, project.etag, actionId));
+              if (requestProject) {
+                await provider.updateProject(requestProject.project_id, input, resourceIntent(snapshot, requestProject.etag, actionId));
                 if (pendingSourceActionId) {
                   await provider.settleProjectSource(pendingSourceActionId, "adopt");
                   pendingSourceOutcome = "adopted";
@@ -444,18 +448,18 @@ export function DesktopProductApp({
             if (result.saved) setSettingsOpen(false);
             return {
               saved: result.saved,
-              replaceActionId: requestPreconditionChanged(result, requestEpoch, requestEtag === null ? null : { kind: "project", id: project!.project_id, etag: requestEtag }),
+              replaceActionId: requestPreconditionChanged(result, requestEpoch, requestProject ? { kind: "project", id: requestProject.project_id, etag: requestProject.etag } : null),
               pendingSourceOutcome,
             };
           }}
           onSelectSource={(actionId) => provider.selectProjectSource({
             ...mutationIntent(snapshot, actionId),
             kind: "native_folder_snapshot",
-            ...(project && !creatingProject ? { projectId: project.project_id } : {}),
+            ...(settingsProject ? { projectId: settingsProject.project_id } : {}),
           })}
           onCancelSource={(actionId) => provider.cancelProjectSource(actionId)}
           onSettleSource={(actionId, outcome) => provider.settleProjectSource(actionId, outcome)}
-          onSyncSource={project?.source.kind === "native_folder_snapshot" ? () => act(() => provider.syncProjectWorkspace(project.project_id, resourceIntent(snapshot, project.etag))).then((result) => result.saved) : undefined}
+          onSyncSource={settingsProject?.source.kind === "native_folder_snapshot" ? () => act(() => provider.syncProjectWorkspace(settingsProject.project_id, resourceIntent(snapshot, settingsProject.etag))).then((result) => result.saved) : undefined}
         />
       ) : null}
       {connectionSettingsOpen ? (
@@ -1909,12 +1913,21 @@ function isWorkspaceSelectionCancelled(error: unknown): boolean {
     && error.code === "workspace_selection_cancelled";
 }
 
-function readyCapabilities(snapshot: DesktopProductSnapshot, project: ProjectV1 | null): EvolutionCapabilitiesV1 | null {
+function projectCapability(
+  snapshot: DesktopProductSnapshot,
+  project: ProjectV1 | null,
+): DesktopProductSnapshot["capability"] {
   const state = snapshot.capability;
+  if (!project || !state) return null;
+  return state.projectId === project.project_id && state.executionMode === project.execution.mode ? state : null;
+}
+
+function readyCapabilities(
+  state: DesktopProductSnapshot["capability"],
+  project: ProjectV1 | null,
+): EvolutionCapabilitiesV1 | null {
   if (!project || !state || state.status !== "ready") return null;
-  return state.projectId === project.project_id
-    && state.executionMode === project.execution.mode
-    && state.value.project_id === project.project_id
+  return state.value.project_id === project.project_id
     && capabilityExecutionMode(state.value.capabilities) === project.execution.mode
     ? state.value.capabilities
     : null;

@@ -62,6 +62,11 @@ identity and execution mode; another project or mode can never provide defaults.
 the renderer does not route a first-time user into that path before its remote
 service lifecycle is ready.
 
+The project drawer is keyed by the explicit form identity (`create` or exact
+project ID). Changing that identity discards the previous component-local draft
+and pending capability UI before rendering the new form. Project-only workspace
+sync is exposed only when the drawer is editing that exact saved project.
+
 `App.tsx` owns the release startup state machine. It does not mount the product
 renderer until native bootstrap, Local API negotiation, and provider creation
 all succeed. Native transitions are serialized through Tauri: initial startup,

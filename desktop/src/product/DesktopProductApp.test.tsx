@@ -261,6 +261,48 @@ describe("DesktopProductApp", () => {
     expect(created?.evolution.targets).toEqual({});
   });
 
+  it("resets a mounted project drawer before creating and cannot sync the existing project", async () => {
+    provider = createFixtureDesktopProductProvider({ startOnline: true });
+    const syncWorkspace = vi.spyOn(provider, "syncProjectWorkspace");
+    root = await renderProduct(provider);
+
+    await clickAria("Project settings");
+    await clickButton("Folder snapshot");
+    await clickButton("Save");
+    await clickAria("Project settings");
+    expect(optionalButton("Sync snapshot")).not.toBeNull();
+    setInput("Project name", "Stale project A draft");
+    setInput("Hugging Face model", "example/stale-a-model");
+
+    await clickAria("Create project");
+    expect(screenText()).toContain("New project");
+    expect(labelledControl<HTMLInputElement>("Project name", "input").value).toBe("New research project");
+    expect(button("Subscription").getAttribute("aria-selected")).toBe("true");
+    expect(labelledControl<HTMLInputElement>("Codex model", "input").value).toBe("gpt-5.5");
+    expect(screenText()).not.toContain("example/stale-a-model");
+    expect(document.querySelectorAll(".target-toggle")).toHaveLength(0);
+    expect(optionalButton("Sync snapshot")).toBeNull();
+
+    await act(async () => provider?.emitAuthoritativeRefresh());
+    await flush();
+    expect(labelledControl<HTMLInputElement>("Project name", "input").value).toBe("New research project");
+    expect(labelledControl<HTMLInputElement>("Codex model", "input").value).toBe("gpt-5.5");
+    expect(document.querySelectorAll(".target-toggle")).toHaveLength(0);
+    expect(optionalButton("Sync snapshot")).toBeNull();
+
+    setInput("Objective", "Create without project A state.");
+    await clickButton("Save");
+    expect(syncWorkspace).not.toHaveBeenCalled();
+    const refreshed = await provider.refresh();
+    if (refreshed.status !== "fresh") throw new Error("Expected a fresh fixture snapshot.");
+    const created = refreshed.snapshot.projects.find((project) => project.task.objective === "Create without project A state.");
+    expect(created).toMatchObject({
+      name: "New research project",
+      execution: { mode: "codex_subscription_transcript", codex_model: "gpt-5.5" },
+      evolution: { targets: {} },
+    });
+  });
+
   it("lets an older unsupported credential profile migrate to SSH agent", async () => {
     provider = createFixtureDesktopProductProvider();
     await provider.createProfile({
@@ -864,6 +906,69 @@ describe("DesktopProductApp", () => {
     await clickButton("Activate project");
     expect(screenText()).toContain("Second research task");
     expect(button("Start session").disabled).toBe(false);
+  });
+
+  it("loads project B when selection changes while project A's drawer remains open", async () => {
+    provider = createFixtureDesktopProductProvider({ startOnline: true });
+    provider.addDraftProject({ subscription: true });
+    const before = await provider.refresh();
+    if (before.status !== "fresh") throw new Error("Expected a fresh fixture snapshot.");
+    const projectA = before.snapshot.projects.find((project) => project.project_id === "project-fixture-1");
+    if (!projectA) throw new Error("Expected project A.");
+    const updateProject = vi.spyOn(provider, "updateProject");
+    root = await renderProduct(provider);
+
+    await clickAria("Project settings");
+    const projectADialog = document.querySelector('[role="dialog"]');
+    setInput("Project name", "Stale project A draft");
+    setInput("Hugging Face model", "example/stale-a-model");
+    const staleRefresh = deferred<Awaited<ReturnType<FixtureDesktopProductProvider["refresh"]>>>();
+    vi.spyOn(provider, "refresh").mockImplementationOnce(() => staleRefresh.promise);
+    await act(async () => provider?.emitAuthoritativeRefresh());
+    const switcher = document.querySelector<HTMLSelectElement>("#project-switcher");
+    if (!switcher) throw new Error("Project switcher was not found.");
+    await act(async () => {
+      switcher.value = "project-fixture-2";
+      switcher.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    await flush();
+
+    const projectBDialog = document.querySelector('[role="dialog"]');
+    expect(projectBDialog).not.toBeNull();
+    expect(projectBDialog).not.toBe(projectADialog);
+    expect(labelledControl<HTMLInputElement>("Project name", "input").value).toBe("Second research project");
+    expect(labelledControl<HTMLInputElement>("Task title", "input").value).toBe("Second research task");
+    expect(button("Subscription").getAttribute("aria-selected")).toBe("true");
+    expect(labelledControl<HTMLInputElement>("Codex model", "input").value).toBe("gpt-5.5");
+    expect(screenText()).not.toContain("example/stale-a-model");
+    expect(document.querySelectorAll(".target-toggle")).toHaveLength(0);
+    expect(screenText()).toContain("Capabilities are unavailable for this project and mode.");
+
+    await act(async () => staleRefresh.resolve(before));
+    await flush();
+    expect(labelledControl<HTMLInputElement>("Project name", "input").value).toBe("Second research project");
+    expect(document.querySelectorAll(".target-toggle")).toHaveLength(0);
+
+    setInput("Objective", "Updated project B objective.");
+    await clickButton("Save");
+    expect(updateProject).toHaveBeenCalledWith(
+      "project-fixture-2",
+      expect.objectContaining({
+        name: "Second research project",
+        execution: expect.objectContaining({ mode: "codex_subscription_transcript", codex_model: "gpt-5.5" }),
+        evolution: { targets: {} },
+      }),
+      expect.anything(),
+    );
+    const refreshed = await provider.refresh();
+    if (refreshed.status !== "fresh") throw new Error("Expected a fresh fixture snapshot.");
+    expect(refreshed.snapshot.projects.find((project) => project.project_id === "project-fixture-1")?.name).toBe(projectA.name);
+    expect(refreshed.snapshot.projects.find((project) => project.project_id === "project-fixture-2")).toMatchObject({
+      name: "Second research project",
+      task: { title: "Second research task", objective: "Updated project B objective." },
+      execution: { mode: "codex_subscription_transcript", codex_model: "gpt-5.5" },
+      evolution: { targets: {} },
+    });
   });
 
   it("selects and syncs a native folder through opaque source references", async () => {
