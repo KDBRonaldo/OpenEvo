@@ -25,11 +25,12 @@ release integration dependencies and are not implemented by the current Rust
 host yet. Release-native integration must add those commands before this flow
 can ship; the provider must continue to fail closed until they exist.
 
-The remaining bootstrap-retry integration point is `App.tsx`. It currently
-replaces a failed `createReleaseDesktopProductProvider` call with the unavailable
-provider. A later startup-state change must expose an explicit retry that calls
-the release factory again, obtaining a fresh `start_sidecar` bootstrap context;
-it must not retain or retry with a failed session token.
+`App.tsx` owns the release startup state machine. It does not mount the product
+renderer until native bootstrap, Local API negotiation, and provider creation
+all succeed. A failed startup exposes one explicit retry action; every attempt
+calls the release factory again and obtains a fresh `start_sidecar` bootstrap
+context. Superseded or unmounted attempts cannot publish their provider, and a
+failed session token is never retained or replayed.
 
 The Local API release digest is
 `3a86582d04dcd233096337c737ba91d75854746848aedc319025d86213a03d36`.
