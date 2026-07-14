@@ -102,11 +102,12 @@ GET  /v1/artifacts/{artifact_id}/content?path=<path>&max_bytes=<n>
 GET  /v1/artifacts/{artifact_id}/diff?against=<artifact_id>
 POST /v1/diagnostics
 GET  /v1/diagnostics/{diagnostic_id}
+DELETE /v1/diagnostics/{diagnostic_id}
 GET  /v1/services
 GET  /v1/services/{service_id}/logs?tail=<n>
 POST /v1/services/{service_id}/restart
 POST /v1/services/{service_id}/stop
-POST /v1/maintenance/cache/cleanup
+POST /v1/maintenance/cache-cleanup
 ```
 
 ## Version

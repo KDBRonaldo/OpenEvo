@@ -117,6 +117,8 @@ GET    /desktop/v1/projects/{project_id}
 PATCH  /desktop/v1/projects/{project_id}
 DELETE /desktop/v1/projects/{project_id}
 POST   /desktop/v1/projects/{project_id}/activate
+POST   /desktop/v1/projects/{project_id}/doctor
+POST   /desktop/v1/projects/{project_id}/repair
 POST   /desktop/v1/projects/{project_id}/bootstrap
 POST   /desktop/v1/projects/{project_id}/workspace-sync
 GET    /desktop/v1/projects/{project_id}/capabilities
@@ -129,6 +131,7 @@ POST   /desktop/v1/operations/{operation_id}/cancel
 GET    /desktop/v1/runs
 POST   /desktop/v1/runs
 GET    /desktop/v1/runs/{run_id}
+DELETE /desktop/v1/runs/{run_id}
 POST   /desktop/v1/runs/{run_id}/cancel
 POST   /desktop/v1/runs/{run_id}/retry
 GET    /desktop/v1/runs/{run_id}/timeline
@@ -141,8 +144,12 @@ GET    /desktop/v1/artifacts/{artifact_id}/diff
 
 GET    /desktop/v1/services
 POST   /desktop/v1/services/{service_id}/restart
+POST   /desktop/v1/services/{service_id}/stop
 GET    /desktop/v1/services/{service_id}/logs
 POST   /desktop/v1/diagnostics
+GET    /desktop/v1/diagnostics/{diagnostic_id}
+DELETE /desktop/v1/diagnostics/{diagnostic_id}
+POST   /desktop/v1/maintenance/cache-cleanup
 GET    /desktop/v1/events
 ```
 
@@ -183,6 +190,7 @@ POST   /v1/projects/{project_id}/validate
 GET    /v1/runs
 POST   /v1/runs
 GET    /v1/runs/{run_id}
+DELETE /v1/runs/{run_id}
 POST   /v1/runs/{run_id}/cancel
 POST   /v1/runs/{run_id}/retry
 GET    /v1/runs/{run_id}/timeline
@@ -198,6 +206,8 @@ POST   /v1/services/{service_id}/restart
 GET    /v1/services/{service_id}/logs
 POST   /v1/diagnostics
 GET    /v1/diagnostics/{diagnostic_id}
+DELETE /v1/diagnostics/{diagnostic_id}
+POST   /v1/maintenance/cache-cleanup
 GET    /v1/events
 ```
 
