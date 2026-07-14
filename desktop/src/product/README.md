@@ -55,7 +55,7 @@ command. They must not appear as usable release controls until the native broker
 is implemented and reviewed.
 
 New projects default to the Core-owned Codex subscription transcript profile and
-its `gpt-5.1-codex-mini` model default. Self-deployed inference remains an
+its release-tested `gpt-5.5` model default. Self-deployed inference remains an
 explicit user selection; the renderer does not route a first-time user into that
 path before its remote service lifecycle is ready.
 

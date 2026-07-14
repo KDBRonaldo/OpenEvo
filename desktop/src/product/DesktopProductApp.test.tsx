@@ -206,7 +206,7 @@ describe("DesktopProductApp", () => {
     setInput("Project name", "Catalyst study");
     setInput("Task title", "Compare catalyst candidates");
     setInput("Objective", "Rank candidates using reproducible evidence.");
-    expect(labelledControl<HTMLInputElement>("Codex model", "input").value).toBe("gpt-5.1-codex-mini");
+    expect(labelledControl<HTMLInputElement>("Codex model", "input").value).toBe("gpt-5.5");
     expect(screenText()).not.toContain("Hugging Face model");
     await clickButton("Save");
     expect(screenText()).toContain("Compare catalyst candidates");
@@ -216,7 +216,7 @@ describe("DesktopProductApp", () => {
     if (snapshot.status !== "fresh") throw new Error("Expected a fresh fixture snapshot.");
     expect(snapshot.snapshot.projects[0]?.execution).toMatchObject({
       mode: "codex_subscription_transcript",
-      codex_model: "gpt-5.1-codex-mini",
+      codex_model: "gpt-5.5",
     });
   });
 

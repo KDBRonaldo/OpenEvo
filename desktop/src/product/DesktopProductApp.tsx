@@ -69,7 +69,7 @@ type ProductEvolutionTargets = ProjectV1["evolution"]["targets"];
 type EvolutionCapabilitiesV1 = ProjectCapabilitiesV1["capabilities"];
 type RevisionRefV1 = NonNullable<NonNullable<ProjectV1["remote"]>["active_revision"]>;
 
-const DEFAULT_CODEX_MODEL = "gpt-5.1-codex-mini";
+const DEFAULT_CODEX_MODEL = "gpt-5.5";
 const DEFAULT_HF_MODEL = "Qwen/Qwen3-8B";
 
 type Workspace = "research" | "evolution" | "system";
