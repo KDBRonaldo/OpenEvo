@@ -110,9 +110,12 @@ remain present until complete process-group cleanup and leader reap; tunnel
 leases remain present until the tunnel closes. Lease construction and
 synchronous runner exit handle every `BaseException`: partial lease directories
 and FDs are cleaned before propagation, or the exact lease is retained under
-bounded subprocess ownership for retry. Replacing or renaming the trust-store
-root after validation cannot redirect that in-flight pathname to a different
-key.
+bounded subprocess ownership for retry. The caller retains lease cleanup
+responsibility through runner entry and transfers it only after the process
+authority exists. Secret prepare/finalize/discard and runtime-preflight commands
+use the same handoff as ordinary commands and rsync. Replacing or renaming the
+trust-store root after validation cannot redirect that in-flight pathname to a
+different key.
 
 A stored record contains both canonical metadata and an OpenSSH known-host line.
 The metadata binds all of:
@@ -330,23 +333,27 @@ envelope. There is no portable waiter thread that can call `wait()` early. If no
 non-reaping observer is available, closed capture pipes or the operation
 deadline initiate cleanup conservatively. Error and cancellation cleanup keeps
 the direct child unreaped while that PID fixes the group identity, sends
-`SIGTERM`, and performs two successful `SIGKILL` process-group sweeps before
-marking group cleanup confirmed. Only then may it wait/reap the direct child,
-remove the registry entry, release the subprocess slot, and close the known-host
-lease. Any group signal, confirmation, reap, or lease cleanup failure retains
-the complete authority in the bounded process-local registry. Later command,
-tunnel, close, or recovery calls retry up to four retained entries
-synchronously. Full ownership capacity rejects a new command before `Popen`, so
-it cannot create an unrecorded process. All waits remain bounded.
+`SIGTERM`, and then escalates to `SIGKILL`. Successful signals do not mark group
+cleanup confirmed. A bounded observer enumerates process state through Linux
+`/proc` or portable `ps`, requires the pinned leader to remain observable, and
+requires every member of that PGID to be dead or a zombie. Only then may the
+owner wait/reap the direct child, remove the registry entry, release the
+subprocess slot, and close the known-host lease. Any group signal, observation,
+reap, or lease cleanup failure retains the complete authority in the bounded
+process-local registry. Later command, tunnel, close, or recovery calls retry up
+to four retained entries synchronously. Full ownership capacity rejects a new
+command before `Popen`, so it cannot create an unrecorded process. All waits
+remain bounded.
 
 Capture polls the unreaped leader at a bounded interval through `waitid`,
 `kqueue`, or Linux proc status instead of reaping it. Once the leader exits,
 inherited descendant pipes receive a 100 ms drain grace; capture keeps bytes
 already delivered, kills the still-pinned process group, closes any remaining
 pipes, and returns the leader's actual exit code. This ordering prevents
-PID/PGID reuse from redirecting cleanup, treats `ESRCH` as an already-empty
-group, never signals the Desktop process group, and keeps a descendant from
-writing after an error return or trust-lease release.
+PID/PGID reuse from redirecting cleanup, never treats `killpg` success or
+`ESRCH` alone as group-termination proof, never signals the Desktop process
+group, and keeps a descendant from writing after an error return or trust-lease
+release.
 
 `env` is injected into the remote command as POSIX assignments:
 
@@ -404,7 +411,13 @@ timeout, authenticated failure, cancellation, or malformed receipt is an
 unknown outcome. Cleanup first repeats the exact idempotent finalize transaction
 and validates its receipt. It discards only after that reconciliation completes
 with a definite non-publication result, so cleanup cannot remove an exact bundle
-that was published before the first response was lost.
+that was published before the first response was lost. The upload-to-finalize
+state update, remote finalize, and receipt publication retain one active owner,
+which concurrent cleanup must skip. A `finally` retires that active state on
+every `BaseException`: an interruption before the finalize state update leaves
+recoverable discard authority, while an interruption after it leaves exact
+finalize-reconciliation authority. Repeated interrupted handoffs therefore
+reuse bounded cleanup capacity instead of permanently consuming active slots.
 
 Timeout remnants stay private and bounded. Prepare creates a validated `0600`
 `.openevo-transfer.lock` in every incoming directory. The rsync server runs

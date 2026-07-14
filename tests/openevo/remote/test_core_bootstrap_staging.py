@@ -13,6 +13,7 @@ import signal
 import struct
 import subprocess
 import sys
+import threading
 import time
 from types import SimpleNamespace
 
@@ -1512,6 +1513,151 @@ def test_malformed_finalize_receipts_hit_cleanup_authority_backpressure(
     assert prepare_calls == 2
     assert len(transport._core_asset_cleanup_authorities) == 2
     assert transport._core_asset_pending_admissions == 0
+
+
+@pytest.mark.parametrize("interruption", [KeyboardInterrupt, SystemExit])
+@pytest.mark.parametrize("handoff_timing", ["before_update", "after_update"])
+def test_finalize_authority_handoff_interruptions_remain_bounded_and_retryable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    interruption: type[BaseException],
+    handoff_timing: str,
+) -> None:
+    assets = _assets(tmp_path)
+    runner = RecordingRunner()
+    transport = _transport(tmp_path, runner)
+    prepare_command = core_assets.build_core_asset_prepare_command(BUNDLE_ID)
+    original_remember = transport._remember_core_asset_transfer
+    prepare_calls = 0
+    interrupted_handoffs = 0
+
+    def remote_response(
+        command: str,
+        *,
+        timeout_seconds: float,
+        remote_failure_code: SshTransportErrorCode,
+    ) -> SecretStr:
+        nonlocal prepare_calls
+        del timeout_seconds, remote_failure_code
+        if command == prepare_command:
+            prepare_calls += 1
+            return _stage_responses(
+                assets[1],
+                assets[3],
+                transfer_id=f"{prepare_calls:032x}",
+            )[0]
+        if shlex.quote(core_assets._REMOTE_DISCARD_SCRIPT) in command:
+            return SecretStr("")
+        if shlex.quote(core_assets._REMOTE_FINALIZE_SCRIPT) in command:
+            return _stage_responses(assets[1], assets[3])[1]
+        raise AssertionError("unexpected core asset command")
+
+    def interrupt_finalize_handoff(
+        authority: ssh_module._CoreAssetTransferAuthority,
+        *,
+        active: bool = False,
+        consume_admission: bool = False,
+    ) -> None:
+        nonlocal interrupted_handoffs
+        if authority.finalize_started and interrupted_handoffs < 16:
+            if handoff_timing == "after_update":
+                original_remember(
+                    authority,
+                    active=active,
+                    consume_admission=consume_admission,
+                )
+            interrupted_handoffs += 1
+            raise interruption
+        original_remember(
+            authority,
+            active=active,
+            consume_admission=consume_admission,
+        )
+
+    monkeypatch.setattr(transport, "_run_secret_with_remote_failure", remote_response)
+    monkeypatch.setattr(
+        transport,
+        "_remember_core_asset_transfer",
+        interrupt_finalize_handoff,
+    )
+
+    for _index in range(16):
+        with pytest.raises(interruption):
+            _stage(transport, assets)
+        assert transport._core_asset_active_transfers == set()
+        assert len(transport._core_asset_cleanup_authorities) <= 1
+        assert transport._core_asset_pending_admissions == 0
+
+    staged = _stage(transport, assets)
+
+    assert staged.bundle_inode == 12
+    assert interrupted_handoffs == 16
+    assert prepare_calls == 17
+    assert len(runner.calls) == 17
+    assert transport._core_asset_active_transfers == set()
+    assert transport._core_asset_cleanup_authorities == {}
+    assert transport._core_asset_pending_admissions == 0
+
+
+def test_concurrent_cleanup_skips_an_owned_finalize_operation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assets = _assets(tmp_path)
+    transport = _transport(tmp_path, RecordingRunner())
+    prepared, receipt = _stage_responses(assets[1], assets[3])
+    prepare_command = core_assets.build_core_asset_prepare_command(BUNDLE_ID)
+    finalize_started = threading.Event()
+    allow_finalize = threading.Event()
+    discard_calls: list[str] = []
+
+    def remote_response(
+        command: str,
+        *,
+        timeout_seconds: float,
+        remote_failure_code: SshTransportErrorCode,
+    ) -> SecretStr:
+        del timeout_seconds, remote_failure_code
+        if command == prepare_command:
+            return prepared
+        if shlex.quote(core_assets._REMOTE_FINALIZE_SCRIPT) in command:
+            finalize_started.set()
+            assert allow_finalize.wait(timeout=3)
+            return receipt
+        if shlex.quote(core_assets._REMOTE_DISCARD_SCRIPT) in command:
+            discard_calls.append(command)
+            return SecretStr("")
+        raise AssertionError("unexpected core asset command")
+
+    monkeypatch.setattr(transport, "_run_secret_with_remote_failure", remote_response)
+    staged: list[StagedCoreBootstrapAssets] = []
+    failures: list[BaseException] = []
+
+    def stage() -> None:
+        try:
+            staged.append(_stage(transport, assets))
+        except BaseException as exc:
+            failures.append(exc)
+
+    worker = threading.Thread(target=stage)
+    worker.start()
+    try:
+        assert finalize_started.wait(timeout=3)
+        assert len(transport._core_asset_active_transfers) == 1
+
+        transport._retry_core_asset_transfer_cleanup(deadline=time.monotonic() + 1)
+
+        assert discard_calls == []
+        assert len(transport._core_asset_cleanup_authorities) == 1
+    finally:
+        allow_finalize.set()
+        worker.join(timeout=3)
+
+    assert not worker.is_alive()
+    assert failures == []
+    assert len(staged) == 1
+    assert transport._core_asset_active_transfers == set()
+    assert transport._core_asset_cleanup_authorities == {}
 
 
 def test_stage_core_assets_rejects_tampered_finalize_without_leaking_paths(

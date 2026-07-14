@@ -14,13 +14,16 @@ macOS and Linux hosts. Local leader-exit observation uses Linux
 `waitid(..., WNOWAIT)` when available and Darwin `kqueue` process-exit events
 otherwise, with non-reaping Linux proc status as the fallback. No portable
 waiter may reap the leader before group cleanup. All paths retain the 100 ms
-descendant-pipe drain, perform two successful kill sweeps over the owned process
-group on leader exit, timeout, or cancellation, and only then reap the leader.
-Ownership capacity is reserved before `Popen`; observer construction, capture,
-and cleanup `BaseException` paths cannot lose the PID or PGID. Unconfirmed
-cleanup retains its subprocess slot, registry entry, and known-host lease in a
-bounded process-local registry for later command/tunnel/close recovery. All
-waits remain bounded.
+descendant-pipe drain and signal the owned process group on leader exit,
+timeout, or cancellation. Signal success is not termination evidence. A bounded
+Linux `/proc` or portable `ps` observer must still find the pinned leader and
+must prove that every member of that PGID is dead or a zombie before the leader
+is reaped. Ownership capacity is reserved before `Popen`; observer construction,
+capture, and cleanup `BaseException` paths cannot lose the PID or PGID. The
+entered known-host lease remains caller-owned until the subprocess authority is
+constructed and explicitly accepts it. Unconfirmed cleanup retains its
+subprocess slot, registry entry, and known-host lease in a bounded process-local
+registry for later command/tunnel/close recovery. All waits remain bounded.
 This local portability does not extend the remote contract: the Core host must
 be Linux and the preflight rejects every other remote platform.
 
@@ -191,7 +194,13 @@ discard. Upload cleanup has an independent 10-second deadline. Once finalize
 starts, timeout, cancellation, authenticated failure, or malformed receipt first
 replays the exact finalize transaction and validates its receipt; only a
 definitive non-publication result permits incoming discard. A later staging call
-retries retained authority before prepare. Under the same publication lock,
+retries retained authority before prepare. Upload-to-finalize authority handoff,
+remote finalize, and local receipt publication remain one active owned operation,
+so concurrent cleanup skips it. A surrounding `finally` always retires that
+active marker: interruption before the finalize state is recorded leaves an
+inactive upload authority that can be discarded, while interruption after the
+record leaves an inactive finalize authority that must be reconciled. Under the
+same publication lock,
 prepare also reclaims closed incoming attempts inactive for more than 600
 seconds only after acquiring the exact transfer lease exclusively. The rsync
 server holds that lease across exec, so process restart can recover unlocked
