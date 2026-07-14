@@ -20,6 +20,7 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tauri::Manager;
+use tauri_plugin_dialog::DialogExt;
 use tempfile::TempDir;
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -32,6 +33,7 @@ const DESKTOP_LOCAL_API_OPENAPI_SHA256: &str =
     "3a86582d04dcd233096337c737ba91d75854746848aedc319025d86213a03d36";
 const LEGACY_DESKTOP_SHELL_ROUTE: &str = "/openevo-api/desktop/shell";
 const NATIVE_SESSION_PROBE_ROUTE: &str = "/openevo-native/session";
+const NATIVE_WORKSPACE_IMPORT_ROUTE: &str = "/openevo-native/workspace-imports";
 const NATIVE_SESSION_HEADER: &str = "X-OpenEvo-Desktop-Session";
 const NATIVE_EXECUTABLE_FD_ENV: &str = "OPENEVO_NATIVE_EXECUTABLE_FD";
 const NATIVE_EXECUTABLE_PATH_ENV: &str = "OPENEVO_NATIVE_EXECUTABLE_PATH";
@@ -47,6 +49,8 @@ const SIDECAR_STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
 const SIDECAR_HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const SIDECAR_HEALTH_CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
 const SIDECAR_HEALTH_RESPONSE_MAX_BYTES: usize = 4096;
+const NATIVE_WORKSPACE_RESPONSE_MAX_BYTES: usize = 8192;
+const NATIVE_WORKSPACE_IMPORT_TIMEOUT: Duration = Duration::from_secs(300);
 const SIDECAR_TERM_TIMEOUT: Duration = Duration::from_secs(1);
 const SIDECAR_KILL_TIMEOUT: Duration = Duration::from_secs(1);
 const SIDECAR_STOP_POLL_INTERVAL: Duration = Duration::from_millis(20);
@@ -574,6 +578,32 @@ struct DesktopBootstrapContextV1 {
 #[derive(Clone, Debug, Serialize)]
 struct HostStatus {
     state: String,
+}
+
+#[derive(Debug, Serialize)]
+struct NativeWorkspaceImportRequest<'a> {
+    schema_version: &'static str,
+    kind: &'static str,
+    action_id: &'a str,
+    selected_path: &'a str,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct NativeWorkspaceImportRefV1 {
+    import_id: String,
+    content_sha256: String,
+    byte_size: u64,
+    entry_count: u64,
+    extracted_byte_size: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct NativeProjectSourceV1 {
+    kind: String,
+    display_name: String,
+    import_ref: NativeWorkspaceImportRefV1,
 }
 
 #[derive(Clone, Debug)]
@@ -2146,30 +2176,72 @@ fn loopback_http_get(
     path: &str,
     header: Option<(&str, &str)>,
 ) -> HostResult<LoopbackHttpResponse> {
+    loopback_http_request(
+        port,
+        "GET",
+        path,
+        header,
+        None,
+        SIDECAR_HEALTH_CONNECT_TIMEOUT,
+        SIDECAR_HEALTH_RESPONSE_MAX_BYTES,
+    )
+}
+
+fn loopback_http_request(
+    port: u16,
+    method: &str,
+    path: &str,
+    header: Option<(&str, &str)>,
+    body: Option<&[u8]>,
+    timeout: Duration,
+    response_limit: usize,
+) -> HostResult<LoopbackHttpResponse> {
+    if !matches!(method, "GET" | "POST")
+        || !path.starts_with('/')
+        || path.contains(['\r', '\n'])
+        || header.is_some_and(|(name, value)| {
+            name.is_empty() || name.contains([':', '\r', '\n']) || value.contains(['\r', '\n'])
+        })
+        || response_limit == 0
+    {
+        return Err(sidecar_health_error());
+    }
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
-    let mut stream = TcpStream::connect_timeout(&addr, SIDECAR_HEALTH_CONNECT_TIMEOUT)
+    let mut stream =
+        TcpStream::connect_timeout(&addr, timeout).map_err(|_| sidecar_health_error())?;
+    stream
+        .set_read_timeout(Some(timeout))
         .map_err(|_| sidecar_health_error())?;
     stream
-        .set_read_timeout(Some(SIDECAR_HEALTH_CONNECT_TIMEOUT))
-        .map_err(|_| sidecar_health_error())?;
-    stream
-        .set_write_timeout(Some(SIDECAR_HEALTH_CONNECT_TIMEOUT))
+        .set_write_timeout(Some(timeout))
         .map_err(|_| sidecar_health_error())?;
     let extra_header = header
         .map(|(name, value)| format!("{name}: {value}\r\n"))
         .unwrap_or_default();
+    let body = body.unwrap_or_default();
+    let content_headers = if body.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "Content-Type: application/json\r\nContent-Length: {}\r\n",
+            body.len()
+        )
+    };
     let request = format!(
-        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n{extra_header}Connection: close\r\n\r\n"
+        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n{extra_header}{content_headers}Connection: close\r\n\r\n"
     );
     stream
         .write_all(request.as_bytes())
         .map_err(|_| sidecar_health_error())?;
+    if !body.is_empty() {
+        stream.write_all(body).map_err(|_| sidecar_health_error())?;
+    }
     let mut response = Vec::new();
     stream
-        .take((SIDECAR_HEALTH_RESPONSE_MAX_BYTES + 1) as u64)
+        .take((response_limit + 1) as u64)
         .read_to_end(&mut response)
         .map_err(|_| sidecar_health_error())?;
-    if response.len() > SIDECAR_HEALTH_RESPONSE_MAX_BYTES {
+    if response.len() > response_limit {
         return Err(sidecar_health_error());
     }
     let response = String::from_utf8(response).map_err(|_| sidecar_health_error())?;
@@ -2324,6 +2396,92 @@ fn check_sidecar_session_binding(port: u16, session_token: &str) -> HostResult<(
     Ok(())
 }
 
+fn register_native_workspace_source(
+    port: u16,
+    session_token: &str,
+    kind: &str,
+    action_id: &str,
+    selected_path: &Path,
+) -> HostResult<NativeProjectSourceV1> {
+    if kind != "native_folder_snapshot"
+        || action_id.len() < 16
+        || action_id.len() > 256
+        || action_id.trim() != action_id
+        || action_id
+            .chars()
+            .any(|character| character <= '\u{1f}' || character == '\u{7f}')
+    {
+        return Err(workspace_selection_error());
+    }
+    let selected_path = selected_path
+        .to_str()
+        .ok_or_else(workspace_selection_error)?;
+    let request = NativeWorkspaceImportRequest {
+        schema_version: "1",
+        kind: "native_folder_snapshot",
+        action_id,
+        selected_path,
+    };
+    let body = serde_json::to_vec(&request).map_err(|_| workspace_import_error())?;
+    let response = loopback_http_request(
+        port,
+        "POST",
+        NATIVE_WORKSPACE_IMPORT_ROUTE,
+        Some((NATIVE_SESSION_HEADER, session_token)),
+        Some(&body),
+        NATIVE_WORKSPACE_IMPORT_TIMEOUT,
+        NATIVE_WORKSPACE_RESPONSE_MAX_BYTES,
+    )
+    .map_err(|_| workspace_import_error())?;
+    if response.status != 201 {
+        return Err(workspace_import_error());
+    }
+    let source: NativeProjectSourceV1 =
+        serde_json::from_str(&response.body).map_err(|_| workspace_import_error())?;
+    validate_native_project_source(&source)?;
+    Ok(source)
+}
+
+fn validate_native_project_source(source: &NativeProjectSourceV1) -> HostResult<()> {
+    let import = &source.import_ref;
+    let import_suffix = import
+        .import_id
+        .strip_prefix("workspace-import-")
+        .ok_or_else(workspace_import_error)?;
+    if source.kind != "native_folder_snapshot"
+        || source.display_name.is_empty()
+        || source.display_name.len() > 256
+        || source.display_name.trim() != source.display_name
+        || source
+            .display_name
+            .chars()
+            .any(|character| character <= '\u{1f}' || character == '\u{7f}')
+        || import_suffix.len() != 48
+        || !import_suffix.bytes().all(is_lower_hex)
+        || import.content_sha256.len() != 64
+        || !import.content_sha256.bytes().all(is_lower_hex)
+        || !(1024..=16 * 1024 * 1024 * 1024).contains(&import.byte_size)
+        || !import.byte_size.is_multiple_of(512)
+        || import.entry_count > 100_000
+        || import.extracted_byte_size > 16 * 1024 * 1024 * 1024
+        || (import.entry_count == 0 && import.extracted_byte_size != 0)
+    {
+        return Err(workspace_import_error());
+    }
+    Ok(())
+}
+
+fn active_sidecar_session(state: &DesktopHostState) -> HostResult<(u16, String)> {
+    let sidecar = lock_sidecar_bounded(state, SIDECAR_STATE_LOCK_TIMEOUT)?;
+    let managed = sidecar.as_ref().ok_or_else(sidecar_state_error)?;
+    if managed.lifecycle != ManagedLifecycle::Running {
+        return Err(sidecar_state_error());
+    }
+    let port = managed.status.port.ok_or_else(sidecar_state_error)?;
+    let bootstrap = managed.bootstrap.as_ref().ok_or_else(sidecar_state_error)?;
+    Ok((port, bootstrap.session_credential.expose()))
+}
+
 fn readiness_hmac_domain(instance_id: &str, challenge: &str) -> String {
     format!("{NATIVE_SIDECAR_PROTOCOL}\0{instance_id}\0{challenge}")
 }
@@ -2423,6 +2581,27 @@ fn sidecar_contract_incompatible_error() -> NativeHostError {
     NativeHostError::new(
         "sidecar_contract_incompatible",
         "The OpenEvo Desktop sidecar does not match the frozen Local API contract.",
+    )
+}
+
+fn workspace_selection_error() -> NativeHostError {
+    NativeHostError::new(
+        "workspace_selection_invalid",
+        "OpenEvo Desktop could not use the selected research folder.",
+    )
+}
+
+fn workspace_selection_cancelled_error() -> NativeHostError {
+    NativeHostError::new(
+        "workspace_selection_cancelled",
+        "No research folder was selected.",
+    )
+}
+
+fn workspace_import_error() -> NativeHostError {
+    NativeHostError::new(
+        "workspace_import_failed",
+        "OpenEvo Desktop could not prepare the selected research folder.",
     )
 }
 
@@ -3611,6 +3790,37 @@ fn stop_sidecar(state: tauri::State<'_, DesktopHostState>) -> HostResult<HostSta
     stop_sidecar_inner(&state)
 }
 
+#[tauri::command(rename_all = "camelCase")]
+async fn select_project_source(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, DesktopHostState>,
+    kind: String,
+    action_id: String,
+) -> HostResult<NativeProjectSourceV1> {
+    if kind != "native_folder_snapshot" {
+        return Err(workspace_selection_error());
+    }
+    let selected =
+        tauri::async_runtime::spawn_blocking(move || app.dialog().file().blocking_pick_folder())
+            .await
+            .map_err(|_| workspace_selection_error())?
+            .ok_or_else(workspace_selection_cancelled_error)?;
+    let selected = selected
+        .into_path()
+        .map_err(|_| workspace_selection_error())?;
+    let selected = fs::canonicalize(selected).map_err(|_| workspace_selection_error())?;
+    let metadata = fs::metadata(&selected).map_err(|_| workspace_selection_error())?;
+    if !metadata.is_dir() {
+        return Err(workspace_selection_error());
+    }
+    let (port, session_token) = active_sidecar_session(&state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        register_native_workspace_source(port, &session_token, &kind, &action_id, &selected)
+    })
+    .await
+    .map_err(|_| workspace_import_error())?
+}
+
 fn sidecar_state_error() -> NativeHostError {
     NativeHostError::new(
         "sidecar_state_unavailable",
@@ -3627,11 +3837,13 @@ fn sidecar_inspection_error() -> NativeHostError {
 
 fn main() {
     let app = match tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .manage(DesktopHostState::default())
         .invoke_handler(tauri::generate_handler![
             host_status,
             start_sidecar,
-            stop_sidecar
+            stop_sidecar,
+            select_project_source
         ])
         .build(tauri::generate_context!())
     {
@@ -4583,6 +4795,115 @@ mod tests {
         server.join().unwrap();
 
         assert_eq!(error.code, "sidecar_session_unavailable");
+    }
+
+    #[test]
+    fn native_workspace_registration_keeps_the_selected_path_out_of_renderer_data() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let session_token = "7c".repeat(SESSION_TOKEN_BYTES);
+        let expected_token = session_token.clone();
+        let selected_path = PathBuf::from("/Users/researcher/private/study");
+        let expected_path = selected_path.clone();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let (headers, body) = read_http_request_with_body(&mut stream);
+            assert!(headers.starts_with(&format!(
+                "POST {NATIVE_WORKSPACE_IMPORT_ROUTE} HTTP/1.1\r\n"
+            )));
+            assert!(headers
+                .lines()
+                .any(|line| { line == format!("{NATIVE_SESSION_HEADER}: {expected_token}") }));
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+                serde_json::json!({
+                    "schema_version": "1",
+                    "kind": "native_folder_snapshot",
+                    "action_id": "native-source-action-0001",
+                    "selected_path": expected_path.to_str().unwrap(),
+                })
+            );
+            write_json_response(
+                &mut stream,
+                201,
+                serde_json::json!({
+                    "kind": "native_folder_snapshot",
+                    "display_name": "study",
+                    "import_ref": {
+                        "import_id": format!("workspace-import-{}", "1a".repeat(24)),
+                        "content_sha256": "2b".repeat(32),
+                        "byte_size": 1024,
+                        "entry_count": 1,
+                        "extracted_byte_size": 4,
+                    }
+                }),
+            );
+        });
+
+        let source = register_native_workspace_source(
+            port,
+            &session_token,
+            "native_folder_snapshot",
+            "native-source-action-0001",
+            &selected_path,
+        )
+        .unwrap();
+        server.join().unwrap();
+
+        let renderer_data = serde_json::to_string(&source).unwrap();
+        assert_eq!(source.display_name, "study");
+        assert!(!renderer_data.contains("/Users"));
+        assert!(!renderer_data.contains("private"));
+        assert!(!renderer_data.contains("selected_path"));
+    }
+
+    #[test]
+    fn native_workspace_registration_rejects_open_or_malformed_responses() {
+        for body in [
+            serde_json::json!({
+                "kind": "native_folder_snapshot",
+                "display_name": "study",
+                "selected_path": "/private/study",
+                "import_ref": {
+                    "import_id": format!("workspace-import-{}", "1a".repeat(24)),
+                    "content_sha256": "2b".repeat(32),
+                    "byte_size": 1024,
+                    "entry_count": 1,
+                    "extracted_byte_size": 4,
+                }
+            }),
+            serde_json::json!({
+                "kind": "native_folder_snapshot",
+                "display_name": "study",
+                "import_ref": {
+                    "import_id": "workspace-import-not-opaque",
+                    "content_sha256": "2b".repeat(32),
+                    "byte_size": 1024,
+                    "entry_count": 1,
+                    "extracted_byte_size": 4,
+                }
+            }),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let _ = read_http_request_with_body(&mut stream);
+                write_json_response(&mut stream, 201, body);
+            });
+
+            let error = register_native_workspace_source(
+                port,
+                &"7c".repeat(SESSION_TOKEN_BYTES),
+                "native_folder_snapshot",
+                "native-source-action-0002",
+                Path::new("/private/study"),
+            )
+            .unwrap_err();
+            server.join().unwrap();
+
+            assert_eq!(error.code, "workspace_import_failed");
+        }
     }
 
     #[test]
@@ -6088,6 +6409,25 @@ mod tests {
             }
         }
         String::from_utf8(request).unwrap()
+    }
+
+    fn read_http_request_with_body(stream: &mut TcpStream) -> (String, Vec<u8>) {
+        let mut headers = Vec::new();
+        let mut byte = [0_u8; 1];
+        while !headers.ends_with(b"\r\n\r\n") {
+            stream.read_exact(&mut byte).unwrap();
+            headers.push(byte[0]);
+            assert!(headers.len() <= 8192);
+        }
+        let headers = String::from_utf8(headers).unwrap();
+        let content_length = headers
+            .lines()
+            .find_map(|line| line.strip_prefix("Content-Length: "))
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(0);
+        let mut body = vec![0_u8; content_length];
+        stream.read_exact(&mut body).unwrap();
+        (headers, body)
     }
 
     fn write_json_response(stream: &mut TcpStream, status: u16, body: serde_json::Value) {

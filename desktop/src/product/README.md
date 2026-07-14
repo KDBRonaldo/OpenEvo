@@ -20,10 +20,13 @@ strictly parsed as `ProjectSourceV1` and `RemoteProfileV1`; renderer file inputs
 raw paths, and secret values are not accepted.
 
 The release adapter deliberately has no fallback for those native calls. The
-Tauri commands `select_project_source` and `configure_credential` are required
-release integration dependencies and are not implemented by the current Rust
-host yet. Release-native integration must add those commands before this flow
-can ship; the provider must continue to fail closed until they exist.
+Rust host implements `select_project_source` with the operating-system folder
+picker. It canonicalizes the selected directory, sends the path only over an
+authenticated private loopback route to the process-owned sidecar, and returns
+only a validated opaque workspace-import reference to the renderer. The path is
+never part of the renderer DTO or the public Desktop Local API. The remaining
+`configure_credential` command is still a required release integration
+dependency; the provider continues to fail closed until it is implemented.
 
 The remaining bootstrap-retry integration point is `App.tsx`. It currently
 replaces a failed `createReleaseDesktopProductProvider` call with the unavailable
