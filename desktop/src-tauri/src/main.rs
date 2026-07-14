@@ -1158,9 +1158,14 @@ fn inspect_linux_proc_stat(
 ) -> std::io::Result<Option<bool>> {
     match stat {
         Ok(stat) => linux_proc_stat_is_live_group_member(&stat, process_group).map(Some),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) if linux_proc_member_disappeared(&error) => Ok(None),
         Err(error) => Err(error),
     }
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn linux_proc_member_disappeared(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH)
 }
 
 #[cfg(any(test, target_os = "linux"))]
@@ -5090,6 +5095,11 @@ mod tests {
                 4100,
             )
             .unwrap(),
+            None
+        );
+        assert_eq!(
+            inspect_linux_proc_stat(Err(std::io::Error::from_raw_os_error(libc::ESRCH)), 4100,)
+                .unwrap(),
             None
         );
     }

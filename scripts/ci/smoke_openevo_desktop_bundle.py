@@ -33,6 +33,12 @@ NATIVE_LOG_LIMIT = 64 * 1024
 NATIVE_LOG_READ_SIZE = 16 * 1024
 NATIVE_GROUP_TERM_TIMEOUT_SECONDS = 5.0
 NATIVE_GROUP_KILL_TIMEOUT_SECONDS = 5.0
+_DIRECTORY_OPEN_FLAGS = (
+    os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
+)
+_FILE_OPEN_FLAGS = (
+    os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
+)
 
 
 def _find_app_bundle(bundle_root: Path) -> Path:
@@ -74,30 +80,169 @@ def find_bundled_sidecar(bundle_root: Path) -> Path:
 
 def find_native_executable(bundle_root: Path) -> Path:
     app_bundle = _find_app_bundle(bundle_root)
-    info_path = app_bundle / "Contents" / "Info.plist"
-    try:
-        info = plistlib.loads(info_path.read_bytes())
-    except (OSError, plistlib.InvalidFileException, ValueError) as exc:
-        raise SmokeFailure(f"OpenEvo Desktop has an invalid Info.plist: {info_path}") from exc
-    if not isinstance(info, dict):
-        raise SmokeFailure("OpenEvo Desktop Info.plist must contain a top-level dictionary")
-    executable_name = info.get("CFBundleExecutable")
-    if (
-        not isinstance(executable_name, str)
-        or not executable_name
-        or executable_name in {".", ".."}
-        or Path(executable_name).name != executable_name
-        or "\x00" in executable_name
-    ):
-        raise SmokeFailure("OpenEvo Desktop Info.plist has an invalid CFBundleExecutable")
-    executable = app_bundle / "Contents" / "MacOS" / executable_name
-    try:
-        metadata = executable.lstat()
-    except OSError as exc:
-        raise SmokeFailure(f"OpenEvo Desktop native executable is missing: {executable}") from exc
-    if not stat.S_ISREG(metadata.st_mode) or metadata.st_mode & 0o111 == 0:
-        raise SmokeFailure(f"OpenEvo Desktop native executable is not executable: {executable}")
-    return executable
+    with _PinnedNativeExecutable.open(app_bundle) as pinned:
+        pinned.validate()
+        return pinned.path
+
+
+def _file_identity(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_nlink,
+        metadata.st_uid,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+class _PinnedNativeExecutable:
+    def __init__(
+        self,
+        *,
+        app_bundle: Path,
+        executable_name: str,
+        descriptors: list[int],
+        bindings: list[tuple[int, str, int, tuple[int, ...]]],
+    ) -> None:
+        self.app_bundle = app_bundle
+        self.path = app_bundle / "Contents" / "MacOS" / executable_name
+        self._descriptors = descriptors
+        self._bindings = bindings
+
+    @classmethod
+    def open(cls, app_bundle: Path) -> _PinnedNativeExecutable:
+        descriptors: list[int] = []
+        bindings: list[tuple[int, str, int, tuple[int, ...]]] = []
+
+        def open_component(parent_fd: int, name: str, flags: int) -> int:
+            try:
+                descriptor = os.open(name, flags, dir_fd=parent_fd)
+                descriptors.append(descriptor)
+                expected = _file_identity(os.fstat(descriptor))
+                linked = _file_identity(
+                    os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+                )
+            except OSError as exc:
+                raise SmokeFailure(
+                    f"OpenEvo Desktop native executable path is not trustworthy: {app_bundle}"
+                ) from exc
+            if linked != expected:
+                raise SmokeFailure(
+                    f"OpenEvo Desktop native executable path changed: {app_bundle}"
+                )
+            bindings.append((parent_fd, name, descriptor, expected))
+            return descriptor
+
+        try:
+            parent_fd = os.open(app_bundle.parent, _DIRECTORY_OPEN_FLAGS)
+            descriptors.append(parent_fd)
+            app_fd = open_component(parent_fd, app_bundle.name, _DIRECTORY_OPEN_FLAGS)
+            contents_fd = open_component(app_fd, "Contents", _DIRECTORY_OPEN_FLAGS)
+            info_fd = open_component(contents_fd, "Info.plist", _FILE_OPEN_FLAGS)
+            info_path = app_bundle / "Contents" / "Info.plist"
+            if not stat.S_ISREG(os.fstat(info_fd).st_mode):
+                raise SmokeFailure(f"OpenEvo Desktop has an invalid Info.plist: {info_path}")
+            try:
+                with os.fdopen(os.dup(info_fd), "rb") as info_file:
+                    info = plistlib.load(info_file)
+            except (OSError, plistlib.InvalidFileException, ValueError) as exc:
+                raise SmokeFailure(
+                    f"OpenEvo Desktop has an invalid Info.plist: {info_path}"
+                ) from exc
+            if not isinstance(info, dict):
+                raise SmokeFailure(
+                    "OpenEvo Desktop Info.plist must contain a top-level dictionary"
+                )
+            executable_name = info.get("CFBundleExecutable")
+            if (
+                not isinstance(executable_name, str)
+                or not executable_name
+                or executable_name in {".", ".."}
+                or Path(executable_name).name != executable_name
+                or "\x00" in executable_name
+            ):
+                raise SmokeFailure(
+                    "OpenEvo Desktop Info.plist has an invalid CFBundleExecutable"
+                )
+            macos_fd = open_component(contents_fd, "MacOS", _DIRECTORY_OPEN_FLAGS)
+            executable_fd = open_component(macos_fd, executable_name, _FILE_OPEN_FLAGS)
+            metadata = os.fstat(executable_fd)
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_mode & 0o111 == 0:
+                raise SmokeFailure(
+                    "OpenEvo Desktop native executable is not executable: "
+                    f"{app_bundle / 'Contents' / 'MacOS' / executable_name}"
+                )
+            pinned = cls(
+                app_bundle=app_bundle,
+                executable_name=executable_name,
+                descriptors=descriptors,
+                bindings=bindings,
+            )
+            pinned.validate()
+            return pinned
+        except BaseException:
+            for descriptor in reversed(descriptors):
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+            raise
+
+    @property
+    def executable_fd(self) -> int:
+        return self._bindings[-1][2]
+
+    @property
+    def inherited_fds(self) -> tuple[int, ...]:
+        return tuple(self._descriptors)
+
+    def execution_path(self) -> str:
+        descriptor = self.executable_fd
+        if sys.platform == "darwin":
+            return f"/dev/fd/{descriptor}"
+        if Path("/proc/self/fd").is_dir():
+            return f"/proc/self/fd/{descriptor}"
+        raise SmokeFailure("OpenEvo Desktop cannot execute the pinned native executable")
+
+    def validate(self) -> None:
+        try:
+            for parent_fd, name, descriptor, expected in self._bindings:
+                if _file_identity(os.fstat(descriptor)) != expected:
+                    raise SmokeFailure(
+                        f"OpenEvo Desktop native executable authority changed: {self.path}"
+                    )
+                linked = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+                if _file_identity(linked) != expected:
+                    raise SmokeFailure(
+                        f"OpenEvo Desktop native executable path changed: {self.path}"
+                    )
+        except OSError as exc:
+            raise SmokeFailure(
+                f"OpenEvo Desktop native executable path changed: {self.path}"
+            ) from exc
+
+    def prepare_exec(self) -> None:
+        self.validate()
+        for descriptor in self._descriptors:
+            if descriptor != self.executable_fd:
+                os.close(descriptor)
+
+    def close(self) -> None:
+        while self._descriptors:
+            descriptor = self._descriptors.pop()
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+    def __enter__(self) -> _PinnedNativeExecutable:
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.close()
 
 
 class _NativeLogReader:
@@ -200,21 +345,27 @@ def _terminate_native_process(process: subprocess.Popen[bytes]) -> None:
 
 
 def smoke_native_app(bundle_root: Path, *, timeout_seconds: float) -> Path:
-    executable = find_native_executable(bundle_root)
     app_bundle = _find_app_bundle(bundle_root)
-    with TemporaryDirectory(prefix="openevo-native-smoke-") as temporary:
+    with _PinnedNativeExecutable.open(app_bundle) as pinned, TemporaryDirectory(
+        prefix="openevo-native-smoke-"
+    ) as temporary:
+        executable = pinned.path
         log_path = Path(temporary) / "native.log"
         try:
             with log_path.open("wb") as output:
+                pinned.validate()
                 process = subprocess.Popen(
                     [str(executable)],
+                    executable=pinned.execution_path(),
                     cwd=app_bundle.parent,
                     stdin=subprocess.DEVNULL,
                     stdout=output,
                     stderr=subprocess.STDOUT,
                     start_new_session=True,
+                    pass_fds=pinned.inherited_fds,
+                    preexec_fn=pinned.prepare_exec,
                 )
-        except OSError as exc:
+        except (OSError, subprocess.SubprocessError) as exc:
             raise SmokeFailure(
                 f"OpenEvo Desktop native executable could not start: {executable}"
             ) from exc

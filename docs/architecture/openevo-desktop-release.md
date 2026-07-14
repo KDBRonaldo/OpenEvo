@@ -54,15 +54,24 @@ not complete the ordinary science E2E, create/redownload a draft GitHub Release,
 or authorize a public tag. The executable sidecar smoke proves
 its local health/static-asset path, discovery of the embedded Core wheel plus
 framework lock, and its token-protected capability proxy against a real backend.
-The native application smoke requires `Info.plist` to contain a top-level
-dictionary and launches the bundle executable named by `CFBundleExecutable`.
-The release renderer reports readiness only after Local API negotiation. Tauri
-performs a non-reaping leader check, reproves the private sidecar session, and
-then rechecks the same managed instance, lifecycle, contract, and leader under
-the manager lock before accepting that report. This proves that the mounted and
-copied application reaches the React renderer through Tauri IPC and its live
-local sidecar. It does not prove remote bootstrap or completion of the science
-workflow.
+The native application smoke opens the app parent and then pins the `.app`,
+`Contents`, `Info.plist`, `MacOS`, and the executable named by
+`CFBundleExecutable` with component-relative no-follow descriptors. It parses a
+regular `Info.plist` through its held descriptor, records each descriptor and
+pathname identity, and rechecks the complete chain before spawn and again in the
+child immediately before exec. The executable itself is launched through its
+inherited descriptor (`/dev/fd` on macOS and `/proc/self/fd` in Linux regression
+tests), so replacement after the last pathname check cannot redirect execution.
+Detected symlink, directory, or leaf replacement fails closed. Only the macOS
+candidate job proves that the real copied Mach-O app launches through the macOS
+descriptor authority; Linux tests prove the chain and replacement behavior but
+are not macOS launch evidence. The release renderer reports readiness only after
+Local API negotiation. Tauri performs a non-reaping leader check, reproves the
+private sidecar session, and then rechecks the same managed instance, lifecycle,
+contract, and leader under the manager lock before accepting that report. This
+proves that the mounted and copied application reaches the React renderer
+through Tauri IPC and its live local sidecar. It does not prove remote bootstrap
+or completion of the science workflow.
 
 The release workflow's outer smoke installs Core and exercises it through the
 Desktop harness imported from the source checkout. Its workflow and script names
@@ -448,7 +457,8 @@ Immediately before every TERM or KILL, cleanup repeats that non-reaping child
 check; an inspection error authorizes no numeric-PGID signal. While the manager
 is `Anchored`, the retained child identity prevents PID/PGID reuse and authorizes
 TERM/KILL to the group. Linux enumerates `/proc`; a visible PID's denied or
-malformed `stat` data fails closed, while only a real `NotFound` race is skipped.
+malformed `stat` data fails closed, while `NotFound` and raw `ESRCH` from a member
+exiting during `stat` inspection are treated as that member having disappeared.
 macOS treats both return values from `proc_listpgrppids` as PID counts. Only the
 buffer call receives byte capacity. A full buffer causes bounded growth and
 retry. Native code clears `errno` immediately before every count and buffer call;

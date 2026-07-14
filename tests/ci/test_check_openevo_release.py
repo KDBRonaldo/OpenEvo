@@ -210,6 +210,95 @@ def test_bundle_smoke_launches_the_native_app_until_renderer_is_ready(tmp_path: 
     assert launched == executable
 
 
+@pytest.mark.parametrize("component", ["app", "Contents", "MacOS"])
+def test_bundle_smoke_rejects_symlinked_native_path_components(
+    tmp_path: Path,
+    component: str,
+) -> None:
+    smoke = _load_bundle_smoke_module()
+    app = tmp_path / "OpenEvo Desktop.app"
+    external_contents = tmp_path / "external" / "Contents"
+    executable = external_contents / "MacOS" / "openevo-desktop"
+    executable.parent.mkdir(parents=True)
+    (external_contents / "Info.plist").write_bytes(
+        plistlib.dumps({"CFBundleExecutable": executable.name})
+    )
+    executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    executable.chmod(0o755)
+
+    if component == "app":
+        app.symlink_to(external_contents.parent, target_is_directory=True)
+    elif component == "Contents":
+        app.mkdir()
+        (app / "Contents").symlink_to(external_contents, target_is_directory=True)
+    else:
+        contents = app / "Contents"
+        contents.mkdir(parents=True)
+        (contents / "Info.plist").write_bytes(
+            plistlib.dumps({"CFBundleExecutable": executable.name})
+        )
+        (contents / "MacOS").symlink_to(
+            external_contents / "MacOS", target_is_directory=True
+        )
+
+    with pytest.raises(smoke.SmokeFailure, match="native executable path"):
+        smoke.find_native_executable(app)
+
+
+@pytest.mark.parametrize("replacement", ["Contents", "MacOS", "leaf"])
+def test_bundle_smoke_fails_closed_on_native_path_replacement_at_exec(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    replacement: str,
+) -> None:
+    smoke = _load_bundle_smoke_module()
+    app = tmp_path / "OpenEvo Desktop.app"
+    executable = app / "Contents" / "MacOS" / "openevo-desktop"
+    executable.parent.mkdir(parents=True)
+    (app / "Contents" / "Info.plist").write_bytes(
+        plistlib.dumps({"CFBundleExecutable": executable.name})
+    )
+    executable.write_text(
+        f"#!/bin/sh\nprintf '%s\\n' '{smoke.RENDERER_READY_MARKER}'\nsleep 30\n",
+        encoding="utf-8",
+    )
+    executable.chmod(0o755)
+    escaped_marker = tmp_path / f"{replacement.lower()}-escaped"
+    external_contents = tmp_path / f"external-{replacement}" / "Contents"
+    external_executable = external_contents / "MacOS" / executable.name
+    external_executable.parent.mkdir(parents=True)
+    (external_contents / "Info.plist").write_bytes(
+        plistlib.dumps({"CFBundleExecutable": external_executable.name})
+    )
+    external_executable.write_text(
+        f"#!/bin/sh\ntouch '{escaped_marker}'\n"
+        f"printf '%s\\n' '{smoke.RENDERER_READY_MARKER}'\nsleep 30\n",
+        encoding="utf-8",
+    )
+    external_executable.chmod(0o755)
+    real_popen = smoke.subprocess.Popen
+
+    def replacing_popen(*args: object, **kwargs: object):
+        if replacement == "Contents":
+            contents = app / "Contents"
+            contents.rename(app / "Contents.original")
+            contents.symlink_to(external_contents, target_is_directory=True)
+        elif replacement == "MacOS":
+            macos = executable.parent
+            macos.rename(macos.with_name("MacOS.original"))
+            macos.symlink_to(external_executable.parent, target_is_directory=True)
+        else:
+            executable.unlink()
+            executable.symlink_to(external_executable)
+        return real_popen(*args, **kwargs)
+
+    monkeypatch.setattr(smoke.subprocess, "Popen", replacing_popen)
+
+    with pytest.raises(smoke.SmokeFailure, match="native executable"):
+        smoke.smoke_native_app(app, timeout_seconds=1)
+    assert not escaped_marker.exists()
+
+
 def test_bundle_smoke_requires_an_exact_complete_renderer_marker_line(tmp_path: Path) -> None:
     smoke = _load_bundle_smoke_module()
     app = tmp_path / "OpenEvo Desktop.app"
