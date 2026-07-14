@@ -152,6 +152,12 @@ cargo metadata --locked --format-version 1
 cargo test --locked
 ```
 
+Desktop's local provider store keeps the idempotency reservation for every
+nonterminal local operation even after the normal retention deadline. Startup
+and replay require that reservation's canonical response, route, resource
+scope, resource kind, and operation kind to match the exact operation row;
+terminal reservations become eligible for ordinary retention cleanup.
+
 Current release smoke checks are pre-External-Beta maintainer checks. They
 validate Core Backend wheel identity and Desktop asset packaging, but they do
 not publish GitHub Release assets, PyPI artifacts, or a release-ready `.dmg`.

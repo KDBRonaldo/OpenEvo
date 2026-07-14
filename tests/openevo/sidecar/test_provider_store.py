@@ -1338,6 +1338,189 @@ def test_project_runtime_action_is_durable_idempotent_and_completes_atomically(
     assert store.begin_project_runtime_action(**action).operation == finished
 
 
+def test_expired_live_project_action_survives_cleanup_and_can_finish(
+    tmp_path: Path,
+) -> None:
+    clock = MutableClock()
+    store = DesktopProviderStore(
+        tmp_path / "state",
+        clock=clock,
+        idempotency_retention_seconds=1,
+    )
+    profile = _create_profile(store)
+    project = store.create_project(
+        _project(profile.profile_id), idempotency_key="project-live-expiry-create"
+    )
+    action = {
+        "route": f"/desktop/v1/projects/{project.project_id}/workspace-sync",
+        "operation_kind": "workspace_sync",
+        "project_id": project.project_id,
+        "key": "project-live-expiry-action",
+        "body": {},
+        "if_match": project.etag,
+    }
+    reservation = store.begin_project_runtime_action(**action)
+    clock.now += timedelta(seconds=2)
+
+    _create_profile(store, name="Cleanup trigger", key="profile-cleanup-trigger")
+
+    persisted = store._connection.execute(
+        "SELECT response_bytes FROM idempotency_records WHERE idempotency_key = ?",
+        (action["key"],),
+    ).fetchone()
+    assert persisted is not None
+    running = store.start_project_runtime_action(reservation=reservation, **action)
+    finished = store.complete_project_runtime_action(
+        reservation=reservation,
+        current_revision_id=None,
+        **action,
+    )
+    assert running.state == "running"
+    assert finished.state == "succeeded"
+    _create_profile(store, name="Terminal cleanup trigger", key="profile-terminal-cleanup")
+    assert (
+        store._connection.execute(
+            "SELECT 1 FROM idempotency_records WHERE idempotency_key = ?",
+            (action["key"],),
+        ).fetchone()
+        is None
+    )
+
+
+def test_project_action_replay_rejects_cross_project_operation_substitution(
+    tmp_path: Path,
+) -> None:
+    store = DesktopProviderStore(tmp_path / "state")
+    profile = _create_profile(store)
+    first = store.create_project(
+        _project(profile.profile_id, name="First"),
+        idempotency_key="project-replay-first-create",
+    )
+    second = store.create_project(
+        _project(profile.profile_id, name="Second"),
+        idempotency_key="project-replay-second-create",
+    )
+    first_action = {
+        "route": f"/desktop/v1/projects/{first.project_id}/workspace-sync",
+        "operation_kind": "workspace_sync",
+        "project_id": first.project_id,
+        "key": "project-replay-first-action",
+        "body": {},
+        "if_match": first.etag,
+    }
+    second_action = {
+        "route": f"/desktop/v1/projects/{second.project_id}/workspace-sync",
+        "operation_kind": "workspace_sync",
+        "project_id": second.project_id,
+        "key": "project-replay-second-action",
+        "body": {},
+        "if_match": second.etag,
+    }
+    store.begin_project_runtime_action(**first_action)
+    second_reservation = store.begin_project_runtime_action(**second_action)
+    second_bytes = provider_store_module._canonical_json_bytes(
+        second_reservation.operation.model_dump(mode="json")
+    )
+    store._connection.execute(
+        "UPDATE idempotency_records SET response_bytes = ? WHERE idempotency_key = ?",
+        (second_bytes, first_action["key"]),
+    )
+    store._connection.commit()
+
+    with pytest.raises(ProviderDataCorruptionError, match="operation"):
+        store.begin_project_runtime_action(**first_action)
+
+
+def test_startup_rejects_cross_project_operation_replay_substitution(tmp_path: Path) -> None:
+    root = tmp_path / "state"
+    store = DesktopProviderStore(root)
+    profile = _create_profile(store)
+    first = store.create_project(
+        _project(profile.profile_id, name="First"),
+        idempotency_key="project-startup-first-create",
+    )
+    second = store.create_project(
+        _project(profile.profile_id, name="Second"),
+        idempotency_key="project-startup-second-create",
+    )
+    first_action = {
+        "route": f"/desktop/v1/projects/{first.project_id}/workspace-sync",
+        "operation_kind": "workspace_sync",
+        "project_id": first.project_id,
+        "key": "project-startup-first-action",
+        "body": {},
+        "if_match": first.etag,
+    }
+    second_action = {
+        "route": f"/desktop/v1/projects/{second.project_id}/workspace-sync",
+        "operation_kind": "workspace_sync",
+        "project_id": second.project_id,
+        "key": "project-startup-second-action",
+        "body": {},
+        "if_match": second.etag,
+    }
+    store.begin_project_runtime_action(**first_action)
+    second_reservation = store.begin_project_runtime_action(**second_action)
+    second_bytes = provider_store_module._canonical_json_bytes(
+        second_reservation.operation.model_dump(mode="json")
+    )
+    store.close()
+    with sqlite3.connect(root / "provider.sqlite3") as connection:
+        connection.execute(
+            "UPDATE idempotency_records SET response_bytes = ? WHERE idempotency_key = ?",
+            (second_bytes, first_action["key"]),
+        )
+
+    with pytest.raises(ProviderDataCorruptionError, match="operation"):
+        DesktopProviderStore(root)
+
+
+def test_project_action_operation_kind_is_part_of_idempotency_identity(tmp_path: Path) -> None:
+    store = DesktopProviderStore(tmp_path / "state")
+    profile = _create_profile(store)
+    project = store.create_project(
+        _project(profile.profile_id), idempotency_key="project-kind-create"
+    )
+    action = {
+        "route": f"/desktop/v1/projects/{project.project_id}/workspace-sync",
+        "operation_kind": "workspace_sync",
+        "project_id": project.project_id,
+        "key": "project-kind-action",
+        "body": {},
+        "if_match": project.etag,
+    }
+    store.begin_project_runtime_action(**action)
+
+    with pytest.raises(IdempotencyConflictError):
+        store.begin_project_runtime_action(**{**action, "operation_kind": "project_doctor"})
+
+
+def test_project_reservation_fails_when_terminal_slots_do_not_fit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = DesktopProviderStore(tmp_path / "state")
+    profile = _create_profile(store)
+    project = store.create_project(
+        _project(profile.profile_id), idempotency_key="project-capacity-create"
+    )
+    _, used_bytes = store._recovery_usage(store._connection)
+    monkeypatch.setattr(
+        provider_store_module,
+        "MAX_RECOVERY_BYTES",
+        used_bytes + provider_store_module.PROJECT_RUNTIME_TERMINAL_RESERVATION_BYTES,
+    )
+
+    with pytest.raises(ProviderDataCorruptionError, match="recovery budget exceeded"):
+        store.begin_project_runtime_action(
+            route=f"/desktop/v1/projects/{project.project_id}/workspace-sync",
+            operation_kind="workspace_sync",
+            project_id=project.project_id,
+            key="project-no-terminal-capacity",
+            body={},
+            if_match=project.etag,
+        )
+
+
 def test_project_runtime_action_failure_is_replayable_and_keeps_project_draft(
     tmp_path: Path,
 ) -> None:
@@ -1475,6 +1658,30 @@ def test_project_runtime_action_restart_cancels_once_and_updates_replay(
     frozen_etag = replay.operation.etag
     assert reopened.get_local_operation(replay.operation.operation_id).etag == frozen_etag
     assert reopened.begin_project_runtime_action(**action).operation.etag == frozen_etag
+
+
+def test_project_startup_cancellation_rejects_terminal_slot_overflow(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "state"
+    store = DesktopProviderStore(root)
+    profile = _create_profile(store)
+    project = store.create_project(
+        _project(profile.profile_id), idempotency_key="project-slot-create"
+    )
+    store.begin_project_runtime_action(
+        route=f"/desktop/v1/projects/{project.project_id}/workspace-sync",
+        operation_kind="workspace_sync",
+        project_id=project.project_id,
+        key="project-slot-action",
+        body={},
+        if_match=project.etag,
+    )
+    store.close()
+    monkeypatch.setattr(provider_store_module, "PROJECT_RUNTIME_TERMINAL_SLOT_BYTES", 1)
+
+    with pytest.raises(ProviderDataCorruptionError, match="project runtime cancellation"):
+        DesktopProviderStore(root)
 
 
 def test_non_activation_project_runtime_action_succeeds_without_project_result(
