@@ -153,7 +153,12 @@ auth，transcript capture 负责 evolution 可消费的行为记录。
 `managed_science` 的 runtime binding 不以 subscription 为条件。无论 execution mode 是
 subscription 还是 self-deployed，Experiment config、`RuntimeSpec`、Core launcher 和 Gateway
 admission 都要求 Docker、profile 对应的 exact canonical image 和 host user，并拒绝 custom
-runtime loader/options。所有 prepare/eval-prepare upload target 在 runtime 创建前必须是
+runtime loader/options。canonical image tag 仅用于内部 profile binding；release contract
+另行声明完整 trusted `sha256`。Bootstrap 只拉取 `repository@digest` 并 inspect
+`RepoDigests`/image ID；DockerRuntime 在 create 前再次复核并改用 immutable reference，之后才
+允许 credential mount 进入 create argv。tag 漂移、无 digest、inspect 不一致都 fail closed。
+显式 development fallback 才可现场 build，且两个 base image 必须 digest-pinned、最终 image
+仍须匹配 release digest。所有 prepare/eval-prepare upload target 在 runtime 创建前必须是
 `/openevo/session` 下的 canonical absolute path；实际 bind copy 从 held session-root FD 逐级
 `openat`/no-follow，拒绝 symlink、special file、hard-linked leaf 和并发 ancestor replacement。
 Evolution context 的临时源位于 agent 不可挂载的 Core 临时目录，不在 session bind 中 staging。
@@ -177,11 +182,14 @@ output 或 artifact。scan 在任何写入前完成 per-file、aggregate byte、
 执行 deadline 耗尽后，transcript byte recovery/build 使用独立有界 finalization budget，保留
 timeout/cancel 前已经捕获的输出和原终态。结果发布前还会递归执行一次内存脱敏。失败时
 post-run 先做固定次数的 stop/absence retry，仍失败则释放 stage worker，由运行期周期
-reconciliation 继续。private v3 cleanup journal 除 runtime/container/session/log/credential
+reconciliation 继续。private v4 cleanup journal 除 runtime/container/session/log/credential
 identities 外，还保存闭集、已脱敏的 request/agent terminal/optional result/pending status/timer
-finalization authority，不保存 auth bytes。重启从私有 credential root 重新验证并构造 redactor，
-证明容器 absent 后继续构造或发布原 terminal result，最后才删除 roots；无法证明 absence 时
-ownership 和 journal 持续保留。
+finalization authority，以及 canonical result digest 和单调的 export/callback success proof，
+不保存 auth bytes。Evolution export 由稳定 source event identity 去重，callback 带稳定 result
+digest/idempotency key；响应失败或未知保持 pending，成功 phase 必须先持久化。重启从私有
+credential root 重新验证并构造 redactor（仅在仍需重建 transcript 时），证明容器 absent 后
+只重试 pending phase。两项 required proof 都持久成功后才删除 completion storage、session、
+credential、log roots 和 journal；无法证明时 authority 持续保留。
 
 ## 主要模块
 

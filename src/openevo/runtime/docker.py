@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import fcntl
+import json
 import logging
 import os
 import re
@@ -14,7 +15,7 @@ from pathlib import Path
 from typing import Final, Literal
 
 from openevo.runtime.base import BaseRuntime
-from openevo.runtime.managed import MANAGED_CODEX_HOME
+from openevo.runtime.managed import MANAGED_CODEX_HOME, managed_runtime_image_release
 from openevo.runtime.models import ExecResult, RuntimeSpec
 
 logger = logging.getLogger(__name__)
@@ -234,6 +235,7 @@ class DockerRuntime(BaseRuntime):
     async def start(self) -> None:
         if self._destroyed:
             raise RuntimeError("docker runtime was already destroyed")
+        create_image = await self._verified_create_image()
         self._prepare_create_ownership()
         create_args = [
             "docker",
@@ -261,7 +263,7 @@ class DockerRuntime(BaseRuntime):
         # Additional volumes from kwargs (e.g., Docker socket for agents that need DinD)
         for vol in self.spec.kwargs.get("volumes", []):
             create_args.extend(["-v", vol])
-        create_args.extend([self.spec.image, "sleep", "infinity"])
+        create_args.extend([create_image, "sleep", "infinity"])
         try:
             rc, _, stderr = await self._run_local_command(
                 *create_args,
@@ -322,6 +324,53 @@ class DockerRuntime(BaseRuntime):
                 self.runtime_session_dir,
                 timeout=self._STOP_TIMEOUT,
             )
+
+    async def _verified_create_image(self) -> str:
+        release = managed_runtime_image_release(
+            profile=self.spec.profile,
+            image=self.spec.image,
+        )
+        if release is None:
+            return self.spec.image
+        rc, stdout, _ = await self._run_local_command(
+            "docker",
+            "image",
+            "inspect",
+            self.spec.image,
+            capture=True,
+            timeout=self._START_TIMEOUT,
+        )
+        if rc != 0:
+            raise RuntimeError("managed runtime image inspect failed")
+        try:
+            payload = json.loads(str(stdout or ""))
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("managed runtime image inspect returned invalid JSON") from exc
+        if not isinstance(payload, list) or len(payload) != 1:
+            raise RuntimeError("managed runtime image inspect was not singular")
+        record = payload[0]
+        if not isinstance(record, dict):
+            raise RuntimeError("managed runtime image inspect record is invalid")
+        repo_digests = record.get("RepoDigests")
+        image_id = record.get("Id")
+        matched_reference = (
+            next(
+                (
+                    item
+                    for item in repo_digests
+                    if isinstance(item, str)
+                    and item.endswith(f"@{release.trusted_digest}")
+                ),
+                None,
+            )
+            if isinstance(repo_digests, list)
+            else None
+        )
+        if image_id == release.trusted_digest:
+            return release.trusted_digest
+        if matched_reference is not None:
+            return matched_reference
+        raise RuntimeError("managed runtime image digest mismatch")
 
     _START_TIMEOUT = 600.0  # seconds for docker create / start under high rollout load
     _STOP_TIMEOUT = 30.0  # seconds per cleanup command

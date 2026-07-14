@@ -120,14 +120,20 @@ Docker always follows removal with an absence `inspect`, including after
 successful `rm -f`. Subscription teardown retries failed stop/absence checks a
 fixed number of times in the post-run worker. A still-unproven runtime is moved
 to periodic reconciliation instead of occupying that worker indefinitely.
-The private v3 cleanup journal contains runtime/container and pinned-root
+The private v4 cleanup journal contains runtime/container and pinned-root
 ownership plus a redacted, closed finalization authority: request identity,
 agent terminal state, optional terminal result, pending status, and timer marks.
-It does not contain auth bytes. Startup reloads that authority, re-verifies the
-staged private auth file to rebuild the redactor, proves every owned container
-absent, and resumes transcript/result publication before deleting any session,
-credential, or log root. The live retry loop handles temporary failures after
-startup; ownership remains retained while absence cannot be proved.
+Once a result exists, it also stores its canonical digest and monotonic
+`export_succeeded`/`callback_succeeded` proofs. It does not contain auth bytes.
+Evolution export uses the stable session source-event identity, and callbacks
+carry a result-derived `Idempotency-Key` and digest header. A failed or unknown
+response leaves that phase pending; a successful phase is fsynced before the
+next cleanup decision and is skipped on retry. Startup reloads the authority,
+re-verifies staged auth only when transcript rebuilding is still needed, proves
+every owned container absent, and resumes pending publication. Completion
+storage, session/transcript, credential, log roots, and the journal are removed
+only after every required export and callback phase is durably successful. The
+live retry loop applies the same state machine between restarts.
 
 ## What it captures
 

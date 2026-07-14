@@ -78,9 +78,16 @@ writable without recursively widening host file permissions.
 OpenEvo-managed Science profiles use `host`; user-supplied custom images keep
 `image`. Every `managed_science` runtime, including subscription and
 self-deployed execution, is bound to Docker and the profile's exact
-Core-managed image at experiment config, `RuntimeSpec`, launcher, and Gateway
-admission boundaries. Custom runtime loaders/options are forbidden for that
-profile. It is not a general compatibility
+Core-managed image alias at experiment config, `RuntimeSpec`, launcher, and
+Gateway admission boundaries. The release contract separately binds that alias
+to a full trusted `sha256` digest; the tag is never an identity proof. Bootstrap
+pulls the immutable `repository@digest` reference and verifies Docker
+`RepoDigests`/image ID. Immediately before `docker create`, DockerRuntime repeats
+that inspection and creates from the matched immutable reference, before adding
+any subscription credential volume. A missing digest, tag drift, empty
+`RepoDigests` with a different image ID, or malformed inspect response fails
+closed. Custom runtime loaders/options are forbidden for that profile. It is not
+a general compatibility
 promise that arbitrary images can run under a replaced user identity. A custom
 image, loader, option/volume, entrypoint, image-user runtime, or non-literal
 transcript capture mode is rejected before credential bytes are staged.
@@ -122,6 +129,12 @@ container ID was written, Core retains it as a candidate and requires
 Unreadable or unverified creates retain their ownership files without using
 stdout, a name, or a partial ID as fallback.
 
+Release bootstrap never builds a managed image on the target host. The explicit
+development mode may fall back to the Core-owned Dockerfile, but both base
+images are digest-pinned and the built image must still match the release
+contract digest before use. Ordinary Desktop users select a managed profile and
+never supply either the image alias or digest.
+
 Gateway startup scans only complete private lock/cidfile pairs, acquires the
 abandoned lock, and performs bounded recovery against the exact ID. A lock held
 by another live Core process or an incomplete/tampered record fails closed.
@@ -130,8 +143,11 @@ destroyed only when a final inspect proves that exact ID absent. Gateway does
 not remove either bind root until that proof succeeds; cleanup ownership remains
 in the private authority root and durable retry journal otherwise. Subscription
 post-run uses bounded immediate retries and then periodic reconciliation. Its
-private journal also carries redacted finalization state, allowing a restarted
-Gateway to publish the same terminal result (or rebuild it from the pinned Core
-transcript authority) after absence proof and only then remove owned roots.
+private v4 journal also carries redacted finalization state and a canonical
+result digest with monotonic export/callback success proofs. Evolution export is
+idempotent by stable source event identity; callback retries carry a stable
+result-derived idempotency key. A restarted Gateway skips a durably successful
+phase, retries an unknown/failed phase, and removes storage and owned roots only
+after both required phases are fsynced successful.
 Workspace and artifact files are not redaction write targets; files larger than
 the Core capture scan limit retain their exact bytes.

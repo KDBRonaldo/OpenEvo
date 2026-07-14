@@ -94,11 +94,12 @@ The current builder emits idempotent remote steps:
 | `ensure_openevo_cli` | Legacy run-scoped maintainer compatibility only. Its user-site package check is not the release Core host-service installer and must not be used to replace an active daemon. The Core Control product path uploads the exact wheel and sibling `framework-lock.json`, creates a fresh isolated generation under `~/.openevo/core/releases/`, verifies that generation's complete lock-declared Core distribution inventory, and only then enters controlled daemon attach/replacement. |
 | `check_codex_cli` | Subscription mode only; verifies `codex --version`. |
 | `check_codex_subscription` | Subscription mode only; verifies `~/.codex/auth.json`. |
-| `docker_pull_runtime` | For custom images, pulls the image declared by the compiled experiment. Only an exact closed managed profile-to-image binding writes a managed runtime Dockerfile under `<state_root>/runtime-images/` and runs `docker pull <image> || docker build ... -t <image> ...`. |
+| `docker_pull_runtime` | For custom images, pulls the image declared by the compiled experiment. A managed release pulls the Core contract's `repository@sha256`, creates the internal alias, and fails unless inspect matches that digest. Only explicit development mode may write the digest-pinned managed Dockerfile under `<state_root>/runtime-images/` as fallback, and its result must match the same trusted digest. |
 | `hf_snapshot_download` | Managed local inference only; installs `huggingface_hub` for the remote user and downloads the HF model snapshot. |
 
 `bootstrap.json` records the state root, workspace root, experiment snapshot
-path, runtime image, and managed HF model name when one is present.
+path, runtime image alias, managed release mode and trusted image digest, and
+the managed HF model name when one is present.
 
 Managed runtime fallback images are built from public Python and Node bases and
 install the pinned Codex CLI used by the existing Codex harness examples. The

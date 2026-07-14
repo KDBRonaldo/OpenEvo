@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import shutil
 import stat
@@ -14,7 +15,7 @@ import pytest
 
 from openevo.runtime.base import RuntimePathSecurityError
 from openevo.runtime.docker import DockerRuntime
-from openevo.runtime.managed import MANAGED_CODEX_HOME
+from openevo.runtime.managed import MANAGED_CODEX_HOME, MANAGED_RUNTIME_RELEASES
 from openevo.runtime.models import RuntimeSpec
 
 
@@ -391,6 +392,9 @@ async def test_private_credential_root_is_mounted_outside_the_session_tree(
 
     async def run_command_impl(*args, **kwargs):
         del kwargs
+        if args[1:3] == ("image", "inspect"):
+            digest = MANAGED_RUNTIME_RELEASES["managed_science"].trusted_digest
+            return 0, f'[{{"Id":"{digest}","RepoDigests":[]}}]', None
         if args[1] == "create":
             _write_mock_cidfile(args, container_id)
             return 0, container_id + "\n", None
@@ -403,12 +407,102 @@ async def test_private_credential_root_is_mounted_outside_the_session_tree(
 
     await runtime.start()
 
-    create = run_command.await_args_list[0].args
+    create = next(
+        call.args for call in run_command.await_args_list if call.args[1] == "create"
+    )
     assert ("-v", f"{credential_dir}:{MANAGED_CODEX_HOME}") in zip(
         create,
         create[1:],
     )
     assert not credential_dir.is_relative_to(session_dir)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("repo_digests", [None, [], ["example/runtime@sha256:" + "b" * 64]])
+async def test_managed_image_drift_fails_before_credential_mount_or_create(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    repo_digests: list[str] | None,
+) -> None:
+    session_dir = tmp_path / "session"
+    credential_dir = tmp_path / "credentials"
+    session_dir.mkdir()
+    credential_dir.mkdir(mode=0o700)
+    runtime = DockerRuntime(
+        RuntimeSpec(
+            profile="managed_science",
+            image="openevo/science-runtime:0.1.0",
+            container_user="host",
+        ),
+        "drifted-science-session",
+        session_dir,
+        credential_dir=credential_dir,
+    )
+    inspected = {
+        "Id": "sha256:" + "c" * 64,
+        "RepoDigests": repo_digests,
+    }
+    run_command = AsyncMock(return_value=(0, json.dumps([inspected]), None))
+    monkeypatch.setattr(runtime, "_run_local_command", run_command)
+
+    with pytest.raises(RuntimeError, match="image digest mismatch"):
+        await runtime.start()
+
+    assert [call.args[1:3] for call in run_command.await_args_list] == [
+        ("image", "inspect")
+    ]
+    assert str(credential_dir) not in repr(run_command.await_args_list)
+
+
+@pytest.mark.asyncio
+async def test_managed_repo_digest_is_the_immutable_docker_create_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    container_id = "7" * 64
+    release = MANAGED_RUNTIME_RELEASES["managed_science"]
+    runtime = DockerRuntime(
+        RuntimeSpec(
+            profile="managed_science",
+            image=release.image,
+            container_user="host",
+        ),
+        "repo-digest-session",
+        tmp_path,
+    )
+
+    async def run_command_impl(*args, **kwargs):
+        del kwargs
+        if args[1:3] == ("image", "inspect"):
+            return (
+                0,
+                json.dumps(
+                    [
+                        {
+                            "Id": "sha256:" + "d" * 64,
+                            "RepoDigests": [release.immutable_reference],
+                        }
+                    ]
+                ),
+                None,
+            )
+        if args[1] == "create":
+            _write_mock_cidfile(args, container_id)
+            return 0, container_id, None
+        if args[1:3] == ("container", "inspect"):
+            return 0, container_id, None
+        return 0, None, None
+
+    run_command = AsyncMock(side_effect=run_command_impl)
+    monkeypatch.setattr(runtime, "_run_local_command", run_command)
+
+    await runtime.start()
+
+    create = next(
+        call.args for call in run_command.await_args_list if call.args[1] == "create"
+    )
+    assert release.immutable_reference in create
+    assert release.image not in create
 
 
 @pytest.mark.asyncio

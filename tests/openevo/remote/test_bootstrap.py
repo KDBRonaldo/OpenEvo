@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pytest
+import openevo.deployment.bootstrap as bootstrap_module
 
 from openevo.deployment.bootstrap import (
     RemoteBootstrapPlan,
@@ -21,6 +22,7 @@ from openevo.deployment.preflight import (
 from openevo.projects.science import ScienceProjectConfig
 from openevo.deployment import RemoteProfileConfig, build_sidecar_science_plan
 from openevo.deployment.planner import SidecarSciencePlan
+from openevo.runtime.managed import MANAGED_RUNTIME_RELEASES
 
 
 class RecordingTransport:
@@ -526,10 +528,21 @@ def test_build_remote_bootstrap_plan_derives_subscription_steps() -> None:
         "/bootstrap.json"
     )
     assert '"experiment_snapshot":' in steps_by_id["write_bootstrap_manifest"].command
-    assert "docker pull openevo/science-runtime:0.1.0 || docker build" in (
-        steps_by_id["docker_pull_runtime"].command
+    assert '"managed_runtime_mode": "release"' in (
+        steps_by_id["write_bootstrap_manifest"].command
     )
+    release = MANAGED_RUNTIME_RELEASES["managed_science"]
+    assert f'"runtime_image_digest": "{release.trusted_digest}"' in (
+        steps_by_id["write_bootstrap_manifest"].command
+    )
+    docker_command = steps_by_id["docker_pull_runtime"].command
+    assert f"docker pull {release.immutable_reference}" in docker_command
+    assert "docker build" not in docker_command
+    assert "['docker', 'image', 'inspect', image]" in docker_command
     assert steps_by_id["docker_pull_runtime"].manifest["managed_runtime"] is True
+    assert steps_by_id["docker_pull_runtime"].manifest["trusted_digest"] == (
+        release.trusted_digest
+    )
     assert steps_by_id["docker_pull_runtime"].env["HTTPS_PROXY"] == (
         "http://127.0.0.1:7890"
     )
@@ -537,19 +550,27 @@ def test_build_remote_bootstrap_plan_derives_subscription_steps() -> None:
     assert steps_by_id["check_codex_subscription"].command == (
         "test -f ~/.codex/auth.json"
     )
+    step_ids = [step.id for step in plan.steps]
+    assert step_ids.index("docker_pull_runtime") < step_ids.index("check_codex_cli")
+    assert step_ids.index("docker_pull_runtime") < step_ids.index(
+        "check_codex_subscription"
+    )
     assert "hf_snapshot_download" not in steps_by_id
 
 
 def test_managed_runtime_bootstrap_builds_image_when_pull_fails() -> None:
     sidecar_plan = build_sidecar_science_plan(_project(), _profile())
 
-    plan = build_remote_bootstrap_plan(sidecar_plan)
+    plan = build_remote_bootstrap_plan(
+        sidecar_plan,
+        managed_runtime_mode="development",
+    )
     docker_step = {step.id: step for step in plan.steps}["docker_pull_runtime"]
 
-    assert "docker pull openevo/science-runtime:0.1.0 || docker build" in (
-        docker_step.command
-    )
-    assert "node:22-bookworm-slim" in docker_step.command
+    release = MANAGED_RUNTIME_RELEASES["managed_science"]
+    assert f"if docker pull {release.immutable_reference}" in docker_step.command
+    assert "node:22-bookworm-slim@sha256:" in docker_step.command
+    assert "python:3.12-slim-bookworm@sha256:" in docker_step.command
     assert "@openai/codex@0.121.0" in docker_step.command
     assert "https://deb.debian.org" in docker_step.command
     assert "allow-unauthenticated" not in docker_step.command.lower()
@@ -564,6 +585,8 @@ def test_managed_runtime_bootstrap_builds_image_when_pull_fails() -> None:
     assert docker_step.env["HTTPS_PROXY"] not in docker_step.command
     assert docker_step.env["HTTPS_PROXY"] not in str(docker_step.manifest)
     assert docker_step.manifest["managed_runtime"] is True
+    assert docker_step.manifest["managed_runtime_mode"] == "development"
+    assert docker_step.manifest["trusted_digest"] == release.trusted_digest
 
 
 def test_managed_runtime_bootstrap_preserves_complete_explicit_proxy_environment() -> None:
@@ -582,7 +605,10 @@ def test_managed_runtime_bootstrap_preserves_complete_explicit_proxy_environment
         _profile(proxy={"extra_env": proxy_values}),
     )
 
-    plan = build_remote_bootstrap_plan(sidecar_plan)
+    plan = build_remote_bootstrap_plan(
+        sidecar_plan,
+        managed_runtime_mode="development",
+    )
     docker_step = {step.id: step for step in plan.steps}["docker_pull_runtime"]
 
     assert docker_step.command.splitlines()[0] == ":"
@@ -597,12 +623,15 @@ def test_python_research_runtime_bootstrap_builds_image_when_pull_fails() -> Non
         _profile(),
     )
 
-    plan = build_remote_bootstrap_plan(sidecar_plan)
+    plan = build_remote_bootstrap_plan(
+        sidecar_plan,
+        managed_runtime_mode="development",
+    )
     docker_step = {step.id: step for step in plan.steps}["docker_pull_runtime"]
 
-    assert "docker pull openevo/python-research-runtime:0.1.0 || docker build" in (
-        docker_step.command
-    )
+    release = MANAGED_RUNTIME_RELEASES["python_research"]
+    assert f"if docker pull {release.immutable_reference}" in docker_step.command
+    assert "docker build" in docker_step.command
     assert docker_step.manifest["managed_runtime"] is True
 
 
@@ -679,9 +708,11 @@ def test_build_remote_bootstrap_plan_adds_managed_inference_hf_prefetch() -> Non
     assert plan.state_root == "/srv/openevo/runs/protein-design/folding-baseline"
     assert "check_codex_cli" not in steps_by_id
     assert "check_codex_subscription" not in steps_by_id
-    assert "docker pull openevo/science-runtime:0.1.0 || docker build" in (
+    release = MANAGED_RUNTIME_RELEASES["managed_science"]
+    assert f"docker pull {release.immutable_reference}" in (
         steps_by_id["docker_pull_runtime"].command
     )
+    assert "docker build" not in steps_by_id["docker_pull_runtime"].command
     assert steps_by_id["docker_pull_runtime"].manifest["managed_runtime"] is True
     assert steps_by_id["hf_snapshot_download"].kind == (
         RemoteBootstrapStepKind.HF_SNAPSHOT_DOWNLOAD
@@ -693,6 +724,23 @@ def test_build_remote_bootstrap_plan_adds_managed_inference_hf_prefetch() -> Non
     assert "snapshot_download('Qwen/Qwen3-Coder-30B-A3B-Instruct')" in (
         steps_by_id["hf_snapshot_download"].command
     )
+
+
+def test_managed_runtime_development_fallback_rejects_unpinned_base(
+    monkeypatch,
+) -> None:
+    sidecar_plan = build_sidecar_science_plan(_project(), _profile())
+    monkeypatch.setattr(
+        bootstrap_module,
+        "_MANAGED_RUNTIME_BASE_IMAGE",
+        "node:22-bookworm-slim",
+    )
+
+    with pytest.raises(ValueError, match="base images must be digest-pinned"):
+        build_remote_bootstrap_plan(
+            sidecar_plan,
+            managed_runtime_mode="development",
+        )
 
 
 def test_execute_remote_bootstrap_plan_runs_steps_and_reports_ready() -> None:

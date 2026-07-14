@@ -495,6 +495,31 @@ async def test_export_evolution_event_skips_when_disabled(evolution):
 
 
 @pytest.mark.asyncio
+async def test_required_export_without_client_remains_pending() -> None:
+    manager = GatewayNodeManager.__new__(GatewayNodeManager)
+    manager.evolution = EvolutionConfig(
+        enabled=True,
+        event_export={"fail_open": True},
+    )
+    manager.evolution_client = None
+
+    assert await manager._export_evolution_event(_session_result()) is False
+
+
+@pytest.mark.asyncio
+async def test_required_fail_closed_export_without_client_raises() -> None:
+    manager = GatewayNodeManager.__new__(GatewayNodeManager)
+    manager.evolution = EvolutionConfig(
+        enabled=True,
+        event_export={"fail_open": False},
+    )
+    manager.evolution_client = None
+
+    with pytest.raises(RuntimeError, match="export client is unavailable"):
+        await manager._export_evolution_event(_session_result())
+
+
+@pytest.mark.asyncio
 async def test_export_evolution_event_fail_open_returns(caplog):
     client = FakeEvolutionClient(export_error=RuntimeError("backend down"))
     manager = GatewayNodeManager.__new__(GatewayNodeManager)
@@ -567,6 +592,10 @@ class RecordingSessionRegistry:
         self.calls = calls
         self.results: list[SessionResult] = []
         self.cleared: list[str] = []
+
+    def get(self, session_id: str) -> object:
+        del session_id
+        return self
 
     def set_result(self, session_id: str, result: SessionResult) -> None:
         self.calls.append("set_result")
@@ -698,9 +727,9 @@ async def test_handle_postrun_exports_after_set_result_before_cleanup_and_callba
         "drain_eval",
         "set_result",
         "export",
-        "delete_session",
         "callback_push",
         "clear_result_payload",
+        "delete_session",
         "remove_session_dir",
     ]
     assert client.exported_events[0]["source_event_id"] == "session:ses_1"
@@ -1139,6 +1168,7 @@ async def test_subscription_finalization_rebuilds_transcript_after_restart(
         task_id="task_1",
         instruction="Do work.",
         remaining_timeout_seconds=60,
+        callback_url="http://rollout.test/callback",
         agent=AgentSpec(
             harness="codex",
             settings={"auth_mode": "subscription", "capture_mode": "transcript"},
@@ -1192,11 +1222,19 @@ async def test_subscription_finalization_rebuilds_transcript_after_restart(
     serialized = delivered[0].model_dump_json()
     assert "scientific answer 42" in serialized
     assert "access-canary" not in serialized
+    assert list(journal_dir.glob("*.json"))
+    assert session_dir.exists()
+    assert credential_dir.exists()
+
+    restarted._push_result = AsyncMock(return_value=True)
+    await restarted._reconcile_cleanup_retries()
+
+    assert len(delivered) == 1
     assert list(journal_dir.glob("*.json")) == []
 
 
 @pytest.mark.asyncio
-async def test_handle_postrun_fail_open_export_error_still_cleans_and_callbacks(
+async def test_handle_postrun_fail_open_export_error_retains_authority_and_callbacks(
     tmp_path,
 ):
     calls: list[str] = []
@@ -1217,11 +1255,19 @@ async def test_handle_postrun_fail_open_export_error_still_cleans_and_callbacks(
         "drain_eval",
         "set_result",
         "export",
-        "delete_session",
         "callback_push",
         "clear_result_payload",
-        "remove_session_dir",
     ]
+    assert "ses_1" in manager._cleanup_retries
+
+    client.export_error = None
+    await manager._reconcile_cleanup_retries()
+
+    assert calls.count("export") == 2
+    assert calls.count("callback_push") == 1
+    assert calls.count("delete_session") == 1
+    assert calls.count("remove_session_dir") == 1
+    assert "ses_1" not in manager._cleanup_retries
 
 
 @pytest.mark.asyncio
@@ -1239,16 +1285,123 @@ async def test_handle_postrun_fail_closed_export_error_skips_delete_and_callback
         evolution_client=client,
     )
 
-    with pytest.raises(RuntimeError, match="backend down"):
-        await manager._handle_postrun(_managed_postrun_session(tmp_path, _session_result()))
+    await manager._handle_postrun(
+        _managed_postrun_session(tmp_path, _session_result())
+    )
 
     assert calls == [
         "postrun_steps",
         "drain_eval",
         "set_result",
         "export",
-        "remove_session_dir",
     ]
+    assert "ses_1" in manager._cleanup_retries
+
+
+@pytest.mark.asyncio
+async def test_terminal_delivery_restart_skips_export_after_durable_success(
+    tmp_path: Path,
+) -> None:
+    calls: list[str] = []
+    client = FakeEvolutionClient(calls=calls)
+    journal_dir = tmp_path / "journal"
+    session_dir = tmp_path / "session"
+    credential_dir = tmp_path / "credentials"
+    log_dir = tmp_path / "logs"
+    for root in (session_dir, credential_dir, log_dir):
+        root.mkdir(mode=0o700)
+    managed = _managed_postrun_session(session_dir, _session_result())
+    managed.request.agent = AgentSpec(
+        harness="codex",
+        settings={"auth_mode": "subscription", "capture_mode": "transcript"},
+    )
+    managed.session_root_identity = capture_session_root_identity(session_dir)
+    managed.credential_dir = credential_dir
+    managed.credential_root_identity = capture_session_root_identity(credential_dir)
+    managed.log_authority_dir = log_dir
+    managed.log_authority_identity = capture_session_root_identity(log_dir)
+
+    first = _postrun_manager(
+        calls=calls,
+        evolution=EvolutionConfig(enabled=True),
+        evolution_client=client,
+    )
+    first._cleanup_journal_dir = journal_dir
+    first._push_result = AsyncMock(return_value=False)
+
+    assert await first._deliver_terminal_result(managed, managed.final_result) is False
+    assert calls.count("export") == 1
+    assert first.storage.deleted == []
+    journal_path = next(journal_dir.glob("*.json"))
+    journal = json.loads(journal_path.read_text(encoding="utf-8"))
+    assert journal["terminal_delivery"]["export_succeeded"] is True
+    assert journal["terminal_delivery"]["callback_succeeded"] is False
+
+    restarted = _postrun_manager(
+        calls=calls,
+        evolution=EvolutionConfig(enabled=True),
+        evolution_client=client,
+    )
+    restarted._cleanup_journal_dir = journal_dir
+    restarted._push_result = AsyncMock(side_effect=[False, True])
+    restarted._load_cleanup_retries()
+
+    await restarted._reconcile_cleanup_retries()
+    assert calls.count("export") == 1
+    assert journal_path.exists()
+    assert restarted.storage.deleted == []
+
+    await restarted._reconcile_cleanup_retries()
+    assert calls.count("export") == 1
+    assert not journal_path.exists()
+    assert restarted.storage.deleted == [managed.session_id]
+
+
+@pytest.mark.asyncio
+async def test_terminal_delivery_journal_rejects_result_digest_tampering(
+    tmp_path: Path,
+) -> None:
+    calls: list[str] = []
+    journal_dir = tmp_path / "journal"
+    session_dir = tmp_path / "session"
+    session_dir.mkdir(mode=0o700)
+    managed = _managed_postrun_session(session_dir, _session_result())
+    managed.session_root_identity = capture_session_root_identity(session_dir)
+    manager = _postrun_manager(calls=calls)
+    manager._cleanup_journal_dir = journal_dir
+    manager._push_result = AsyncMock(return_value=False)
+
+    assert await manager._deliver_terminal_result(managed, managed.final_result) is False
+    journal_path = next(journal_dir.glob("*.json"))
+    journal = json.loads(journal_path.read_text(encoding="utf-8"))
+    journal["terminal_delivery"]["result_digest"] = "0" * 64
+    journal_path.write_text(json.dumps(journal), encoding="utf-8")
+    journal_path.chmod(0o600)
+
+    restarted = _postrun_manager(calls=[])
+    restarted._cleanup_journal_dir = journal_dir
+    with pytest.raises(RuntimeError, match="cleanup ownership journal is invalid"):
+        restarted._load_cleanup_retries()
+
+
+@pytest.mark.asyncio
+async def test_callback_retries_use_stable_result_idempotency_proof() -> None:
+    manager = GatewayNodeManager.__new__(GatewayNodeManager)
+    response = Mock()
+    response.raise_for_status.return_value = None
+    manager._client = AsyncMock()
+    manager._client.post.return_value = response
+    result = _session_result()
+    expected_digest = manager._terminal_result_digest(result)
+
+    assert await manager._push_result("http://rollout.test/callback", result)
+    assert await manager._push_result("http://rollout.test/callback", result)
+
+    for call in manager._client.post.await_args_list:
+        assert call.kwargs["headers"] == {
+            "Idempotency-Key": f"openevo-session-result-{expected_digest}",
+            "X-OpenEvo-Result-SHA256": expected_digest,
+        }
 
 
 class FakeRuntime:

@@ -108,8 +108,9 @@ That layer prepares the remote run directory, writes `experiment.json` and
 `bootstrap.json`, verifies the remote user-site `openevo` package and
 `openevo-backend` launcher exactly match the local packaged version, installs
 only the uploaded bundled OpenEvo wheel when one is available, checks
-subscription-mode Codex readiness, pulls custom runtime images, pull-or-builds
-managed OpenEvo Science runtime images, and prefetches the HF model for managed
+subscription-mode Codex readiness, pulls custom runtime images, pulls and
+digest-verifies managed OpenEvo Science release images (with an explicit
+digest-pinned development build fallback), and prefetches the HF model for managed
 local inference.
 
 ## Limitations

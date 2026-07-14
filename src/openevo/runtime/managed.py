@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import dataclass
+import re
 from typing import Final, Literal, TypeAlias
 
 
@@ -11,6 +13,48 @@ ManagedRuntimeProfile: TypeAlias = Literal["managed_science", "python_research"]
 MANAGED_RUNTIME_IMAGES: Final[dict[ManagedRuntimeProfile, str]] = {
     "managed_science": "openevo/science-runtime:0.1.0",
     "python_research": "openevo/python-research-runtime:0.1.0",
+}
+_SHA256_DIGEST_RE: Final[re.Pattern[str]] = re.compile(r"^sha256:[0-9a-f]{64}$")
+
+
+@dataclass(frozen=True, slots=True)
+class ManagedRuntimeImageRelease:
+    """Core-owned immutable image identity shipped by a release."""
+
+    image: str
+    trusted_digest: str
+
+    def __post_init__(self) -> None:
+        if "@" in self.image or not self.image.strip():
+            raise ValueError("managed runtime image alias must be a non-empty tag")
+        if _SHA256_DIGEST_RE.fullmatch(self.trusted_digest) is None:
+            raise ValueError("managed runtime release digest must be a full sha256")
+
+    @property
+    def repository(self) -> str:
+        final_slash = self.image.rfind("/")
+        final_colon = self.image.rfind(":")
+        if final_colon <= final_slash:
+            raise ValueError("managed runtime image alias must include an explicit tag")
+        return self.image[:final_colon]
+
+    @property
+    def immutable_reference(self) -> str:
+        return f"{self.repository}@{self.trusted_digest}"
+
+
+# The profile aliases remain internal compiler/runtime wiring. Trust comes only
+# from these full release digests; a tag is never accepted as image identity.
+MANAGED_RUNTIME_RELEASES: Final[
+    dict[ManagedRuntimeProfile, ManagedRuntimeImageRelease]
+] = {
+    profile: ManagedRuntimeImageRelease(
+        image=image,
+        trusted_digest=(
+            "sha256:16837a0db8af654383ea9af8af4f81a1175fbb0add74b98d7692cbaa87f44a5c"
+        ),
+    )
+    for profile, image in MANAGED_RUNTIME_IMAGES.items()
 }
 MANAGED_HOME: Final[str] = "/openevo/session/home"
 MANAGED_CODEX_HOME: Final[str] = "/openevo/credentials/codex"
@@ -70,6 +114,19 @@ def require_exact_managed_runtime_binding(
     return True
 
 
+def managed_runtime_image_release(
+    *,
+    profile: str | None,
+    image: str | None,
+) -> ManagedRuntimeImageRelease | None:
+    """Return the trusted release only for an exact managed profile binding."""
+
+    if not require_exact_managed_runtime_binding(profile=profile, image=image):
+        return None
+    assert profile is not None
+    return MANAGED_RUNTIME_RELEASES[profile]
+
+
 def require_managed_subscription_runtime(
     *,
     profile: str | None,
@@ -125,9 +182,12 @@ __all__ = [
     "MANAGED_HOME",
     "MANAGED_PATH",
     "MANAGED_RUNTIME_IMAGES",
+    "MANAGED_RUNTIME_RELEASES",
     "MANAGED_SUBSCRIPTION_ENV",
     "MANAGED_SUBSCRIPTION_ENV_KEYS",
     "ManagedRuntimeProfile",
+    "ManagedRuntimeImageRelease",
+    "managed_runtime_image_release",
     "reject_managed_subscription_env",
     "require_exact_managed_runtime_binding",
     "require_managed_runtime_binding",

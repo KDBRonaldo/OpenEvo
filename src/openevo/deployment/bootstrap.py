@@ -26,14 +26,23 @@ from openevo.deployment.preflight import (
     run_preflight,
 )
 from openevo.deployment.redaction import sanitize_remote_text
-from openevo.runtime.managed import require_exact_managed_runtime_binding
+from openevo.runtime.managed import (
+    ManagedRuntimeImageRelease,
+    managed_runtime_image_release,
+)
 
 if TYPE_CHECKING:
     from openevo.deployment.planner import SidecarSciencePlan
 
 
-_MANAGED_RUNTIME_BASE_IMAGE = "node:22-bookworm-slim"
-_MANAGED_RUNTIME_PYTHON_IMAGE = "python:3.12-slim-bookworm"
+_MANAGED_RUNTIME_BASE_IMAGE = (
+    "node:22-bookworm-slim@"
+    "sha256:6c74791e557ce11fc957704f6d4fe134a7bc8d6f5ca4403205b2966bd488f6b3"
+)
+_MANAGED_RUNTIME_PYTHON_IMAGE = (
+    "python:3.12-slim-bookworm@"
+    "sha256:d50fb7611f86d04a3b0471b46d7557818d88983fc3136726336b2a4c657aa30b"
+)
 _MANAGED_RUNTIME_CODEX_PACKAGE = "@openai/codex@0.121.0"
 _DOCKER_PROXY_BUILD_ARGS = (
     "ALL_PROXY",
@@ -264,6 +273,7 @@ def build_remote_bootstrap_plan(
     *,
     expected_openevo_version: str | None = None,
     bundled_wheel_remote_path: str | None = None,
+    managed_runtime_mode: Literal["release", "development"] = "release",
 ) -> RemoteBootstrapPlan:
     experiment_snapshot = _thaw_json(plan.experiment)
     if not isinstance(experiment_snapshot, dict):
@@ -276,10 +286,11 @@ def build_remote_bootstrap_plan(
     )
     runtime_image = _runtime_image(experiment_snapshot)
     runtime_profile = _runtime_profile(experiment_snapshot)
-    is_managed_runtime = require_exact_managed_runtime_binding(
+    managed_runtime_release = managed_runtime_image_release(
         profile=runtime_profile,
         image=runtime_image,
     )
+    is_managed_runtime = managed_runtime_release is not None
     hf_model = _managed_hf_model(experiment_snapshot)
     proxy_env = dict(plan.proxy_env)
     expected_version = expected_openevo_version or OPENEVO_VERSION
@@ -322,6 +333,14 @@ def build_remote_bootstrap_plan(
                     state_root=state_root,
                     experiment_path=experiment_path,
                     runtime_image=runtime_image,
+                    runtime_image_digest=(
+                        None
+                        if managed_runtime_release is None
+                        else managed_runtime_release.trusted_digest
+                    ),
+                    managed_runtime_mode=(
+                        managed_runtime_mode if is_managed_runtime else None
+                    ),
                     hf_model=hf_model,
                 ),
             ),
@@ -335,6 +354,38 @@ def build_remote_bootstrap_plan(
             proxy_env=proxy_env,
         ),
     ]
+
+    if runtime_image is not None:
+        steps.append(
+            RemoteBootstrapStep(
+                id="docker_pull_runtime",
+                kind=RemoteBootstrapStepKind.DOCKER_PULL,
+                command=_runtime_image_command(
+                    runtime_image,
+                    managed_runtime_release=managed_runtime_release,
+                    managed_runtime_mode=managed_runtime_mode,
+                    state_root=state_root,
+                    proxy_env=proxy_env,
+                ),
+                env=proxy_env,
+                timeout_seconds=900.0,
+                network=True,
+                required=True,
+                remediation_kind="openevo_retry",
+                manifest={
+                    "image": runtime_image,
+                    "managed_runtime": is_managed_runtime,
+                    "managed_runtime_mode": (
+                        managed_runtime_mode if is_managed_runtime else None
+                    ),
+                    "trusted_digest": (
+                        None
+                        if managed_runtime_release is None
+                        else managed_runtime_release.trusted_digest
+                    ),
+                },
+            )
+        )
 
     if _uses_codex_subscription(experiment_snapshot):
         steps.extend(
@@ -356,29 +407,6 @@ def build_remote_bootstrap_plan(
                     remediation_kind="user_action",
                 ),
             ]
-        )
-
-    if runtime_image is not None:
-        steps.append(
-            RemoteBootstrapStep(
-                id="docker_pull_runtime",
-                kind=RemoteBootstrapStepKind.DOCKER_PULL,
-                command=_runtime_image_command(
-                    runtime_image,
-                    managed_runtime=is_managed_runtime,
-                    state_root=state_root,
-                    proxy_env=proxy_env,
-                ),
-                env=proxy_env,
-                timeout_seconds=900.0,
-                network=True,
-                required=True,
-                remediation_kind="openevo_retry",
-                manifest={
-                    "image": runtime_image,
-                    "managed_runtime": is_managed_runtime,
-                },
-            )
         )
 
     if hf_model is not None:
@@ -556,7 +584,8 @@ def _runtime_profile(experiment_snapshot: Mapping[str, Any]) -> str | None:
 def _runtime_image_command(
     runtime_image: str,
     *,
-    managed_runtime: bool,
+    managed_runtime_release: ManagedRuntimeImageRelease | None,
+    managed_runtime_mode: Literal["release", "development"],
     state_root: str,
     proxy_env: Mapping[str, str],
 ) -> str:
@@ -566,7 +595,7 @@ def _runtime_image_command(
     unset_proxy = (
         "unset " + " ".join(inherited_proxy_keys) if inherited_proxy_keys else ":"
     )
-    if not managed_runtime:
+    if managed_runtime_release is None:
         return f"{unset_proxy}\ndocker pull {shlex.quote(runtime_image)}"
 
     context_dir = posixpath.join(
@@ -579,22 +608,83 @@ def _runtime_image_command(
         f"--build-arg {arg_name}" for arg_name in _DOCKER_PROXY_BUILD_ARGS
     )
     image_ref = shlex.quote(runtime_image)
+    immutable_ref = shlex.quote(managed_runtime_release.immutable_reference)
+    commands = [unset_proxy]
+    if managed_runtime_mode == "development":
+        commands.extend(
+            [
+                _write_text_command(
+                    dockerfile_path,
+                    _managed_runtime_dockerfile(),
+                ),
+                (
+                    f"if docker pull {immutable_ref}; then "
+                    f"docker tag {immutable_ref} {image_ref}; else "
+                    f"docker build {build_args} --network=host --pull "
+                    f"-t {image_ref} {shlex.quote(context_dir)}; fi"
+                ),
+            ]
+        )
+    else:
+        commands.extend(
+            [
+                f"docker pull {immutable_ref}",
+                f"docker tag {immutable_ref} {image_ref}",
+            ]
+        )
+    commands.append(
+        _managed_runtime_inspect_command(runtime_image, managed_runtime_release)
+    )
+    return "\n".join(commands)
+
+
+def _managed_runtime_inspect_command(
+    runtime_image: str,
+    release: ManagedRuntimeImageRelease,
+) -> str:
     return "\n".join(
         [
-            unset_proxy,
-            _write_text_command(
-                dockerfile_path,
-                _managed_runtime_dockerfile(),
-            ),
-            (
-                f"docker pull {image_ref} || docker build {build_args} "
-                f"--network=host --pull -t {image_ref} {shlex.quote(context_dir)}"
-            ),
+            "python3 - <<'PY'",
+            "import json",
+            "import subprocess",
+            "import sys",
+            f"image = {runtime_image!r}",
+            f"expected = {release.trusted_digest!r}",
+            "probe = subprocess.run(",
+            "    ['docker', 'image', 'inspect', image],",
+            "    check=False, capture_output=True, text=True,",
+            ")",
+            "if probe.returncode != 0:",
+            "    print('managed runtime image inspect failed', file=sys.stderr)",
+            "    raise SystemExit(1)",
+            "try:",
+            "    payload = json.loads(probe.stdout)",
+            "except json.JSONDecodeError:",
+            "    print('managed runtime image inspect returned invalid JSON', file=sys.stderr)",
+            "    raise SystemExit(1)",
+            "if not isinstance(payload, list) or len(payload) != 1:",
+            "    print('managed runtime image inspect was not singular', file=sys.stderr)",
+            "    raise SystemExit(1)",
+            "record = payload[0]",
+            "repo_digests = record.get('RepoDigests')",
+            "image_id = record.get('Id')",
+            "matched_repo = isinstance(repo_digests, list) and any(",
+            "    isinstance(item, str) and item.endswith('@' + expected)",
+            "    for item in repo_digests",
+            ")",
+            "if image_id != expected and not matched_repo:",
+            "    print('managed runtime image digest mismatch', file=sys.stderr)",
+            "    raise SystemExit(1)",
+            "print(expected)",
+            "PY",
         ]
     )
 
 
 def _managed_runtime_dockerfile() -> str:
+    for image in (_MANAGED_RUNTIME_BASE_IMAGE, _MANAGED_RUNTIME_PYTHON_IMAGE):
+        if re.fullmatch(r"[^@\s]+@sha256:[0-9a-f]{64}", image) is None:
+            raise ValueError("managed runtime fallback base images must be digest-pinned")
     return f"""\
 FROM {_MANAGED_RUNTIME_BASE_IMAGE} AS node
 
@@ -645,6 +735,8 @@ def _bootstrap_manifest(
     state_root: str,
     experiment_path: str,
     runtime_image: str | None,
+    runtime_image_digest: str | None,
+    managed_runtime_mode: Literal["release", "development"] | None,
     hf_model: str | None,
 ) -> dict[str, Any]:
     return {
@@ -656,6 +748,8 @@ def _bootstrap_manifest(
         "workspace_root": plan.workspace.workspace_root,
         "experiment_snapshot": experiment_path,
         "runtime_image": runtime_image,
+        "runtime_image_digest": runtime_image_digest,
+        "managed_runtime_mode": managed_runtime_mode,
         "managed_hf_model": hf_model,
     }
 

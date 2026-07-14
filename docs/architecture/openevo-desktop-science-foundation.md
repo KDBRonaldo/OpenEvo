@@ -69,16 +69,20 @@ For managed profiles, users do not upload or choose a runtime image in Desktop.
 Every `managed_science` run, including `codex_subscription_transcript` and
 `self-deployed`, must reach Core as Docker + the exact canonical profile image +
 host-user execution. Runtime config, compiled `RuntimeSpec`, Core launcher, and
-Gateway admission independently enforce this binding; Apptainer, an attacker
-image, image-user execution, and custom runtime loaders/options fail closed.
-Remote bootstrap grants fallback build behavior only when the closed runtime
-profile and its image exactly match Core's profile-to-image table. A custom or
-unknown profile that reuses a managed-looking tag is pull-only or rejected and
-never receives build or host-network privileges. For an exact binding,
-bootstrap first attempts to pull the image and, if unavailable, writes an
-OpenEvo-managed Dockerfile under the run state directory and builds the same
-tag. The generated image contains Python, Node, common build tools, and the
-pinned Codex CLI required by the Codex harness. The fallback
+Gateway admission independently enforce the profile alias, while the release
+contract binds that alias to a full trusted `sha256` rather than trusting the
+tag. Release bootstrap pulls `repository@digest`, tags it only as a local alias,
+and verifies Docker `RepoDigests`/image ID. DockerRuntime repeats the proof
+immediately before create and uses the matched immutable reference before any
+subscription credential mount is added. Registry tag drift, no digest, or an
+identity mismatch fails closed.
+
+Release mode does not build on the remote host. Explicit development mode may
+write the OpenEvo-managed Dockerfile under the run state directory and build on
+pull failure; a custom/unknown profile never receives that privilege. Both
+Dockerfile base images are digest-pinned and the final image must still match
+the trusted release digest. The generated image contains Python, Node, common
+build tools, and the pinned Codex CLI required by the Codex harness. The fallback
 build fetches Debian package metadata over HTTPS and retains the distribution's
 archive signature verification; proxy or mirror failures never downgrade that
 verification. Build proxy args come only from the selected project/profile
@@ -155,9 +159,13 @@ subscription transcript trajectory or result until all credential-capable
 containers have been removed by pinned container ID and proven absent. It then
 uses a separate bounded finalization budget to preserve transcript bytes already
 captured before execution timeout/cancel, then defensively redacts the in-memory
-result before export. A private identity-only cleanup journal drives independent
-startup/shutdown retries; Docker kill/remove failure keeps the runtime retryable
-and the session, log, and credential roots intact.
+result before export. A private v4 cleanup journal drives independent
+startup/shutdown retries. It persists a canonical result digest and monotonic
+evolution-export/callback success proofs; an unknown callback or failed export
+retains completion data, transcript/session, log, credential roots, and the
+journal. Stable event identity and callback idempotency headers make retries
+non-polluting. Cleanup begins only after both required phases are durably
+successful.
 
 `self-deployed` uses proxy authentication and requires `execution.hf_model`.
 The legacy config value `codex_managed_local_inference` remains accepted as an
@@ -516,11 +524,13 @@ expected version; otherwise it fails clearly and does not install an unpinned
 latest package from PyPI.
 For managed Science runtime profiles, bootstrap also prepares the runtime image
 without requiring the user to provide one. It runs
-`docker pull <managed-image> || docker build ... -t <managed-image> ...`; Docker
-build receives the same proxy environment and standard proxy build args. If the
-remote Docker daemon itself needs registry mirrors or daemon-level proxy
-configuration, bootstrap reports the failure instead of editing host-wide Docker
-settings.
+`docker pull <repository>@<trusted-digest>`, creates the internal alias, and
+fails unless inspect proves the expected RepoDigest/image ID. Explicit developer
+mode may instead use the digest-pinned fallback Dockerfile and receives the same
+proxy environment and standard proxy build args, but it must produce the same
+trusted digest. If the remote Docker daemon needs registry mirrors or
+daemon-level proxy configuration, bootstrap reports the failure instead of
+editing host-wide Docker settings.
 For self-deployed configs, the compiled experiment contains
 `OPENEVO_MANAGED_HF_MODEL`, so the remote bootstrap plan also attempts a
 Hugging Face snapshot download using the configured `HF_ENDPOINT`, `HF_HOME`,
