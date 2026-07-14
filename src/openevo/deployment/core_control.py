@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import StrEnum
 import hmac
+import os
 import re
 import secrets
 import shlex
@@ -21,12 +22,92 @@ from openevo.backend.service import (
 )
 from openevo.deployment.executor import RemoteExecutorTransport
 from openevo.deployment.preflight import RemoteCommandResult
+from openevo.deployment.ssh import SshTransportError, SshTransportErrorCode
 
 
 _BEARER_PATTERN = re.compile(r"[A-Za-z0-9_-]{64}\Z")
 _DIGEST_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
 _SOURCE_COMMIT_PATTERN = re.compile(r"[0-9a-f]{40}\Z")
 _MAX_BOOTSTRAP_JSON_BYTES = 4096
+_REMOTE_PATH_PATTERN = re.compile(r"/(?:[A-Za-z0-9._@%+=,-]+/)*[A-Za-z0-9._@%+=,-]+\Z")
+_GENERATION_BOOTSTRAP = """
+import os
+from pathlib import Path
+import subprocess
+import stat
+import sys
+import venv
+
+install_root = Path(sys.argv[1])
+wheel_path = Path(sys.argv[2])
+service_argv = sys.argv[3:]
+parent = install_root.parent
+service_root = parent.parent
+service_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+service_metadata = service_root.lstat()
+if (
+    not stat.S_ISDIR(service_metadata.st_mode)
+    or service_metadata.st_uid != os.geteuid()
+    or service_metadata.st_mode & 0o777 != 0o700
+):
+    raise SystemExit(71)
+parent.mkdir(mode=0o700, exist_ok=True)
+parent_metadata = parent.lstat()
+if (
+    not stat.S_ISDIR(parent_metadata.st_mode)
+    or parent_metadata.st_uid != os.geteuid()
+    or parent_metadata.st_mode & 0o777 != 0o700
+):
+    raise SystemExit(72)
+install_root.mkdir(mode=0o700)
+venv.EnvBuilder(with_pip=True, symlinks=False).create(install_root)
+interpreter = install_root / "bin" / "python"
+environment = {
+    key: value
+    for key, value in os.environ.items()
+    if key
+    in {
+        "HOME",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "LANG",
+        "LC_ALL",
+        "NO_PROXY",
+        "PATH",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "http_proxy",
+        "https_proxy",
+        "no_proxy",
+    }
+}
+completed = subprocess.run(
+    [
+        str(interpreter),
+        "-I",
+        "-m",
+        "pip",
+        "install",
+        "--isolated",
+        "--disable-pip-version-check",
+        "--only-binary=:all:",
+        "--no-compile",
+        str(wheel_path),
+    ],
+    env=environment,
+    stdin=subprocess.DEVNULL,
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL,
+    check=False,
+)
+if completed.returncode != 0:
+    raise SystemExit(73)
+os.execve(
+    interpreter,
+    [str(interpreter), "-I", "-m", "openevo.backend.service", *service_argv],
+    environment,
+)
+""".strip()
 
 
 class CoreControlBootstrapErrorCode(StrEnum):
@@ -198,17 +279,24 @@ def execute_core_control_bootstrap(
 ) -> RemoteCoreControlAttachment:
     deadline = time.monotonic() + plan.deadline_seconds
     attachment_name = f"bootstrap-{secrets.token_hex(16)}.json"
-    service_command = (
-        f"env PYTHONPATH={shlex.quote(plan._wheel_path)} "
-        "python3 -m openevo.backend.service bootstrap"
+    install_generation = secrets.token_hex(16)
+    install_root = f"{plan._service_root}/releases/{install_generation}"
+    service_arguments = (
+        "bootstrap"
         f" --service-root {shlex.quote(plan._service_root)}"
         f" --wheel-path {shlex.quote(plan._wheel_path)}"
         f" --framework-lock {shlex.quote(plan._framework_lock)}"
         f" --source-commit {plan.source_commit}"
         f" --attachment-name {attachment_name}"
+        f" --install-generation {install_generation}"
         f" --port {plan.port}"
         f" --deadline-seconds {max(1.0, plan.deadline_seconds)}"
         + (" --replace-mismatched" if plan.replace_mismatched else "")
+    )
+    service_command = (
+        f"python3 -I -c {shlex.quote(_GENERATION_BOOTSTRAP)} "
+        f"{shlex.quote(install_root)} {shlex.quote(plan._wheel_path)} "
+        f"{service_arguments}"
     )
     service = _run_bootstrap_command(
         transport,
@@ -224,7 +312,8 @@ def execute_core_control_bootstrap(
             retryable=True,
         )
     consume_command = (
-        "python3 -m openevo.backend.service consume-attachment"
+        f"{shlex.quote(install_root + '/bin/python')} -I "
+        "-m openevo.backend.service consume-attachment"
         f" --service-root {shlex.quote(plan._service_root)}"
         f" --attachment-name {attachment_name}"
     )
@@ -237,6 +326,18 @@ def execute_core_control_bootstrap(
         )
     try:
         payload = transport.run_secret(consume_command, timeout_seconds=remaining)
+    except SshTransportError as exc:
+        if exc.code is SshTransportErrorCode.TIMEOUT:
+            raise CoreControlBootstrapError(
+                CoreControlBootstrapErrorCode.DEADLINE_EXCEEDED,
+                "Core bootstrap exceeded its total deadline.",
+                retryable=True,
+            ) from None
+        raise CoreControlBootstrapError(
+            CoreControlBootstrapErrorCode.RESPONSE_INVALID,
+            "Core bootstrap attachment could not be read securely.",
+            retryable=True,
+        ) from None
     except Exception:
         raise CoreControlBootstrapError(
             CoreControlBootstrapErrorCode.RESPONSE_INVALID,
@@ -263,6 +364,14 @@ def _run_bootstrap_command(
         )
     try:
         return transport.run(command, timeout_seconds=remaining)
+    except SshTransportError as exc:
+        if exc.code is SshTransportErrorCode.TIMEOUT:
+            raise CoreControlBootstrapError(
+                CoreControlBootstrapErrorCode.DEADLINE_EXCEEDED,
+                "Core bootstrap exceeded its total deadline.",
+                retryable=True,
+            ) from None
+        raise CoreControlBootstrapError(code, message, retryable=True) from None
     except Exception:
         raise CoreControlBootstrapError(code, message, retryable=True) from None
 
@@ -377,6 +486,18 @@ def open_core_control_tunnel(
             wait_for_ready=True,
             timeout_seconds=timeout_seconds,
         )
+    except SshTransportError as exc:
+        code = (
+            CoreControlBootstrapErrorCode.DEADLINE_EXCEEDED
+            if exc.code is SshTransportErrorCode.TIMEOUT
+            else CoreControlBootstrapErrorCode.SERVICE_FAILED
+        )
+        message = (
+            "Core Control tunnel opening exceeded its deadline."
+            if code is CoreControlBootstrapErrorCode.DEADLINE_EXCEEDED
+            else "The Core Control tunnel could not be opened."
+        )
+        raise CoreControlBootstrapError(code, message, retryable=True) from None
     except Exception:
         raise CoreControlBootstrapError(
             CoreControlBootstrapErrorCode.SERVICE_FAILED,
@@ -459,7 +580,8 @@ def _valid_digest(value: object) -> bool:
 def _is_remote_absolute_path(value: str) -> bool:
     return (
         isinstance(value, str)
-        and value.startswith("/")
+        and _REMOTE_PATH_PATTERN.fullmatch(value) is not None
+        and os.pathsep not in value
         and "\0" not in value
         and all(part not in {"", ".", ".."} for part in value.split("/")[1:])
     )

@@ -15,8 +15,10 @@ import re
 import select
 import signal
 import socket
+import stat
 import subprocess
 import sys
+import threading
 import time
 from typing import Any, Callable, Protocol, Sequence
 
@@ -34,7 +36,10 @@ from openevo.backend.runtime_identity import (
     require_host_global_service_root,
     rotate_core_bearer_token,
 )
-from openevo.evolution.framework import load_verified_framework_registry
+from openevo.evolution.framework import (
+    load_framework_distribution_lock,
+    load_verified_framework_registry,
+)
 
 
 _BOOT_ID_PATH = Path("/proc/sys/kernel/random/boot_id")
@@ -47,6 +52,8 @@ _PENDING_NAME = "pending.json"
 _SPAWN_LOCK_NAME = "spawn.lock"
 _SERVICE_GENERATION_HEADER = "X-OpenEvo-Core-Generation"
 _RELEASE_IDENTITY_HEADER = "X-OpenEvo-Core-Release-Identity"
+_ORPHANED_SERVICE_CHILDREN_GUARD = threading.Lock()
+_ORPHANED_SERVICE_CHILDREN: dict[int, subprocess.Popen[bytes]] = {}
 
 
 class CoreServiceErrorCode(StrEnum):
@@ -105,6 +112,8 @@ class CoreServiceAttachment:
 
 class CoreServiceEndpoint(Protocol):
     def open_verified_socket(self, *, timeout_seconds: float) -> socket.socket: ...
+
+    def verify_authority(self) -> None: ...
 
 
 class _EndpointHTTPConnection(http.client.HTTPConnection):
@@ -290,6 +299,7 @@ def ensure_core_service(
     _fault_injector: Callable[[str, int], None] | None = None,
     _bootstrap_lock_fd: int | None = None,
 ) -> CoreServiceAttachment:
+    _retry_orphaned_service_children()
     if not 0 <= port <= 65535 or deadline_seconds <= 0 or deadline_seconds > 300:
         raise CoreServiceError(
             CoreServiceErrorCode.START_FAILED,
@@ -436,6 +446,7 @@ def bootstrap_core_service(
     framework_lock: str | Path,
     source_commit: str,
     attachment_name: str,
+    install_generation: str,
     port: int = 0,
     deadline_seconds: float = 90.0,
     replace_mismatched: bool = False,
@@ -444,6 +455,7 @@ def bootstrap_core_service(
         not Path(wheel_path).is_absolute()
         or not Path(framework_lock).is_absolute()
         or re.fullmatch(r"[0-9a-f]{40}", source_commit) is None
+        or re.fullmatch(r"[0-9a-f]{32}", install_generation) is None
         or not 0 <= port <= 65535
         or not 1 <= deadline_seconds <= 300
     ):
@@ -463,45 +475,21 @@ def bootstrap_core_service(
             "Core service root failed private ownership validation.",
             retryable=False,
         ) from exc
-    verification_argv = [
-        sys.executable,
-        "-c",
-        (
-            "from openevo.evolution.framework import "
-            "load_verified_framework_registry as load; import sys; load(sys.argv[1])"
-        ),
-        str(framework_lock),
-    ]
     with root:
         bootstrap_lock_fd = root.open_lock("bootstrap.lock")
         try:
             _flock_until(bootstrap_lock_fd, deadline)
             root.unlink_regular(attachment_name)
-            if _run_private_command(verification_argv, deadline=deadline) != 0:
-                install_argv = [
-                    sys.executable,
-                    "-m",
-                    "pip",
-                    "install",
-                    "--user",
-                    "--no-deps",
-                    "--force-reinstall",
-                    str(wheel_path),
-                ]
-                if _run_private_command(install_argv, deadline=deadline) != 0:
-                    raise CoreServiceError(
-                        CoreServiceErrorCode.INSTALL_FAILED,
-                        "The verified Core wheel could not be installed.",
-                        retryable=True,
-                    )
-                if _run_private_command(verification_argv, deadline=deadline) != 0:
-                    raise CoreServiceError(
-                        CoreServiceErrorCode.VERIFICATION_FAILED,
-                        "The installed Core release did not match its framework lock.",
-                        retryable=False,
-                    )
+            _verify_generation_install(
+                service_root=Path(service_root),
+                wheel_path=Path(wheel_path),
+                framework_lock=Path(framework_lock),
+                source_commit=source_commit,
+                install_generation=install_generation,
+            )
             ensure_argv = [
                 sys.executable,
+                "-I",
                 "-m",
                 "openevo.backend.service",
                 "ensure",
@@ -537,6 +525,57 @@ def bootstrap_core_service(
                 )
         finally:
             os.close(bootstrap_lock_fd)
+
+
+def _verify_generation_install(
+    *,
+    service_root: Path,
+    wheel_path: Path,
+    framework_lock: Path,
+    source_commit: str,
+    install_generation: str,
+) -> None:
+    expected_root = service_root / "releases" / install_generation
+    executable = Path(sys.executable)
+    module_path = Path(__file__)
+    try:
+        root_metadata = os.lstat(expected_root)
+        executable_metadata = os.lstat(executable)
+        _lock, locked_wheel = load_framework_distribution_lock(framework_lock)
+        wheel_matches = os.path.samefile(wheel_path, locked_wheel)
+    except (OSError, ValueError) as exc:
+        raise CoreServiceError(
+            CoreServiceErrorCode.VERIFICATION_FAILED,
+            "The isolated Core generation could not be verified.",
+            retryable=False,
+        ) from exc
+    if (
+        re.fullmatch(r"[0-9a-f]{40}", source_commit) is None
+        or re.fullmatch(r"[0-9a-f]{32}", install_generation) is None
+        or Path(sys.prefix) != expected_root
+        or executable.parent != expected_root / "bin"
+        or not module_path.is_relative_to(expected_root)
+        or not stat_is_regular(executable_metadata.st_mode)
+        or executable_metadata.st_uid != os.geteuid()
+        or executable_metadata.st_nlink != 1
+        or not stat.S_ISDIR(root_metadata.st_mode)
+        or root_metadata.st_uid != os.geteuid()
+        or stat.S_IMODE(root_metadata.st_mode) != 0o700
+        or not wheel_matches
+    ):
+        raise CoreServiceError(
+            CoreServiceErrorCode.VERIFICATION_FAILED,
+            "The isolated Core generation did not match its release inputs.",
+            retryable=False,
+        )
+    try:
+        load_verified_framework_registry(framework_lock)
+    except Exception as exc:
+        raise CoreServiceError(
+            CoreServiceErrorCode.VERIFICATION_FAILED,
+            "The isolated Core generation did not match its framework lock.",
+            retryable=False,
+        ) from exc
 
 
 def consume_core_service_attachment(
@@ -765,14 +804,18 @@ def _ensure_locked(
             attached=False,
         )
     except BaseException:
+        child_exit_confirmed = True
         if child is not None:
-            _terminate_spawned_child(child)
-        try:
-            root.unlink_regular(_LEDGER_NAME)
-            root.unlink_regular(_READY_NAME)
-            root.unlink_regular(_PENDING_NAME)
-        except Exception:
-            pass
+            child_exit_confirmed = _terminate_spawned_child(child)
+            if not child_exit_confirmed:
+                _retain_orphaned_service_child(child)
+        if child_exit_confirmed:
+            try:
+                root.unlink_regular(_LEDGER_NAME)
+                root.unlink_regular(_READY_NAME)
+                root.unlink_regular(_PENDING_NAME)
+            except Exception:
+                pass
         raise
     finally:
         for descriptor in (ready_read, ready_write, spawn_lock_fd):
@@ -960,13 +1003,16 @@ def _fetch_json(
                     retryable=False,
                 )
             try:
-                return load_bounded_json(payload, max_bytes=_MAX_HTTP_BYTES)
+                value = load_bounded_json(payload, max_bytes=_MAX_HTTP_BYTES)
             except RuntimeIdentityError as exc:
                 raise CoreServiceError(
                     CoreServiceErrorCode.STATUS_INVALID,
                     "Core service status response is invalid.",
                     retryable=False,
                 ) from exc
+            if endpoint is not None:
+                endpoint.verify_authority()
+            return value
         except CoreServiceError:
             raise
         except (OSError, ValueError, http.client.HTTPException) as exc:
@@ -1492,15 +1538,47 @@ def _validate_attachment_name(value: str) -> None:
         )
 
 
-def _terminate_spawned_child(child: subprocess.Popen[bytes]) -> None:
-    if child.poll() is not None:
-        return
-    child.terminate()
+def _terminate_spawned_child(child: subprocess.Popen[bytes]) -> bool:
+    try:
+        if child.poll() is not None:
+            return True
+    except BaseException:
+        pass
+    try:
+        child.terminate()
+    except BaseException:
+        pass
     try:
         child.wait(timeout=5)
-    except subprocess.TimeoutExpired:
+        return True
+    except BaseException:
+        pass
+    try:
         child.kill()
+    except BaseException:
+        pass
+    try:
         child.wait(timeout=5)
+        return True
+    except BaseException:
+        try:
+            return child.poll() is not None
+        except BaseException:
+            return False
+
+
+def _retain_orphaned_service_child(child: subprocess.Popen[bytes]) -> None:
+    with _ORPHANED_SERVICE_CHILDREN_GUARD:
+        _ORPHANED_SERVICE_CHILDREN[id(child)] = child
+
+
+def _retry_orphaned_service_children() -> None:
+    with _ORPHANED_SERVICE_CHILDREN_GUARD:
+        children = tuple(_ORPHANED_SERVICE_CHILDREN.values())
+    for child in children:
+        if _terminate_spawned_child(child):
+            with _ORPHANED_SERVICE_CHILDREN_GUARD:
+                _ORPHANED_SERVICE_CHILDREN.pop(id(child), None)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1521,6 +1599,7 @@ def build_parser() -> argparse.ArgumentParser:
     bootstrap.add_argument("--framework-lock", type=Path, required=True)
     bootstrap.add_argument("--source-commit", required=True)
     bootstrap.add_argument("--attachment-name", required=True)
+    bootstrap.add_argument("--install-generation", required=True)
     bootstrap.add_argument("--port", type=int, default=0)
     bootstrap.add_argument("--deadline-seconds", type=float, default=90.0)
     bootstrap.add_argument("--replace-mismatched", action="store_true")
@@ -1593,6 +1672,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 framework_lock=args.framework_lock,
                 source_commit=args.source_commit,
                 attachment_name=args.attachment_name,
+                install_generation=args.install_generation,
                 port=args.port,
                 deadline_seconds=args.deadline_seconds,
                 replace_mismatched=args.replace_mismatched,

@@ -91,7 +91,7 @@ The current builder emits idempotent remote steps:
 | `ensure_state_root` | Creates the per-run state directory. |
 | `write_experiment_snapshot` | Writes `<state_root>/experiment.json`. |
 | `write_bootstrap_manifest` | Writes `<state_root>/bootstrap.json`. |
-| `ensure_openevo_cli` | Ensures the remote OpenEvo Core package and `openevo-backend` console script exactly match the local packaged version. Desktop uploads the selected `openevo-<version>-*.whl` together with `framework-lock.json`, whose version, sibling wheel basename, and SHA-256 bind evolution startup to those exact bytes. Bootstrap installs that wheel with user-site `pip --force-reinstall` and then verifies package metadata plus `openevo-backend --version` and `openevo-backend --help`. If no bundled wheel is available, the step passes only when the remote package and backend launcher already report the exact expected version, but release evolution startup still requires a valid external lock. |
+| `ensure_openevo_cli` | Legacy run-scoped maintainer compatibility only. Its user-site package check is not the release Core host-service installer and must not be used to replace an active daemon. The Core Control product path uploads the exact wheel and sibling `framework-lock.json`, creates a fresh isolated generation under `~/.openevo/core/releases/`, verifies that generation's complete lock-declared Core distribution inventory, and only then enters controlled daemon attach/replacement. |
 | `check_codex_cli` | Subscription mode only; verifies `codex --version`. |
 | `check_codex_subscription` | Subscription mode only; verifies `~/.codex/auth.json`. |
 | `docker_pull_runtime` | For custom images, pulls the image declared by the compiled experiment. For managed OpenEvo Science images, writes a managed runtime Dockerfile under `<state_root>/runtime-images/` and runs `docker pull <image> || docker build ... -t <image> ...`. |
@@ -320,9 +320,8 @@ This slice intentionally does not implement:
 - Docker, NVIDIA driver, CUDA, or system package installation;
 - sudo, systemd, or daemon configuration;
 - Docker daemon proxy or registry mirror repair;
-- full Python dependency repair beyond the exact bundled user-site `openevo`
-  wheel, `openevo-backend` launcher, and `huggingface_hub` installs attempted
-  by bootstrap;
+- migration of legacy run-scoped user-site package repair and the
+  `huggingface_hub` helper into the verified Core host-service generation;
 - Docker Compose stack startup;
 - production vLLM tuning, restart policy, or dynamic adapter loading;
 - physical LoRA merge or request-level adapter lifecycle changes;

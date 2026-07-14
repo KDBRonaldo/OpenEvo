@@ -183,17 +183,29 @@ concurrent recovery paths cannot unregister or close the lease twice. Until one
 path proves exit, revoke and rotation remain blocked by the shared trust lease
 instead of leaving an unmanaged child behind.
 
-Authenticated Core Control traffic uses the transport's dedicated streamlocal
-tunnel rather than the general developer TCP forward. OpenSSH receives
-`ExitOnForwardFailure=yes`, `StreamLocalBindUnlink=no`, an owner-only bind mask,
-and a non-persistent control-master socket in the same random `0700` directory as
-the forwarding socket. The transport validates owner, `0600` mode, socket type,
-directory identity, child liveness, and control authority. Private hard-link
-guards hold both socket inodes for the tunnel lifetime, so unlink-and-rebind or
-immediate filesystem inode reuse fails the endpoint check. HTTP obtains an
-AF_UNIX connection only after authority checks on both sides of `connect()`.
-This path therefore does not reserve a TCP port by closing a temporary listener
-and does not infer tunnel ownership from a successful connect probe.
+Authenticated Core Control traffic uses parent-created connection endpoints
+rather than the general developer TCP forward or an OpenSSH-created streamlocal
+pathname. For each HTTP connection the Desktop process creates an anonymous
+`AF_UNIX` socketpair, sets both held FDs to mode `0600`, and validates socket
+type, effective UID, link count one, and FD identity. It retains the HTTP side
+and transfers only the peer FD to a dedicated
+`ssh -W 127.0.0.1:<remote-port>` child as stdin/stdout. The child uses the same
+pinned known-host lease and explicit auth argv as command execution.
+
+There is no `-L` listener, `-S` control socket, control master, filesystem
+pathname, hard-link pre-pin window, or temporary TCP-port reservation in this
+Core path. Every forwarding connection therefore has one explicit SSH child
+authority that is checked before returning the local socket and again after
+bearer-authenticated response reads. A nonzero child exit is a service failure;
+an SSH operation timeout remains a retryable deadline failure across the Core
+bootstrap layer.
+
+Construction transfers the trust lease to the tunnel owner before registration
+or child creation can fail. `BaseException`, including cancellation, closes
+untransferred socket FDs and is re-raised unchanged. Close performs bounded
+terminate/wait/kill for every owned child. If exit cannot be proven, a
+process-local quarantine retains the child and trust lease for retry, so trust
+rotation cannot leave an unowned forwarding authority.
 
 `SshRemoteExecutorTransport` requires a `TrustedKnownHostsBinding` and revalidates
 it before building every command. A release call without a binding fails closed.

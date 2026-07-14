@@ -34,16 +34,24 @@ The release identity covers:
 - every verified distribution artifact digest and installed inventory digest;
 - the release source commit.
 
-Concurrent Desktop bootstrap calls take the same host bootstrap lock across
-installed-inventory verification, any user-site wheel mutation, repeated
-verification in a fresh interpreter, release identity construction, and the
-service lifecycle operation. This prevents two Desktop processes from running
-concurrent `pip` mutations or verifying an inventory while another process is
-changing it. Direct service ensure calls additionally hold the lifecycle lock
-inside that same host lock while loading the verified registry and constructing
-release identity. The host-locked bootstrap passes its already-held lock FD to
-the fresh ensure interpreter, which validates the owner/mode/inode and held-lock
-state before entering lifecycle work. An exact live release
+Each Desktop bootstrap creates a new random generation under the canonical
+owner-only `~/.openevo/core/releases/` root. A system interpreter running with
+`-I` creates that generation's venv with copied interpreter binaries and installs
+the uploaded wheel only into that new root. It never imports the wheel through
+`PYTHONPATH`, never writes the user site, and never reuses or force-reinstalls an
+existing generation. The installed generation interpreter then takes the host
+bootstrap lock, proves its prefix/import origin/executable metadata, requires the
+explicit wheel to be the framework lock's sibling artifact, and verifies the
+complete lock-declared Core distribution inventory before entering lifecycle work. A verification
+failure leaves the live generation and daemon untouched.
+
+Concurrent verified generation interpreters serialize daemon attachment and
+replacement with the same host bootstrap lock. Direct service ensure calls
+additionally hold the lifecycle lock inside that host lock while loading the
+verified registry and constructing release identity. The host-locked bootstrap
+passes its already-held lock FD to the isolated ensure interpreter, which
+validates the owner/mode/inode and held-lock state before entering lifecycle
+work. An exact live release
 performs an authenticated status check and attaches to the existing daemon. A
 different live identity returns `core_service_identity_mismatch` unless the
 caller explicitly requests controlled replacement. Replacement stops the exact
@@ -92,28 +100,31 @@ service.
 `openevo.deployment.core_control` provides the API intended for a future
 `DesktopReleaseProvider` integration. Its plan is limited to:
 
-1. run one host-locked remote bootstrap operation that verifies the installed
-   inventory, conditionally installs the exact uploaded wheel, verifies again
-   in a fresh interpreter, and ensures the user-global daemon;
-2. write the bounded attachment to a unique owner-only file under the pinned
+1. create a fresh generation-scoped isolated venv, install the exact uploaded
+   wheel there without user-site mutation, and run the remaining bootstrap with
+   that generation's interpreter;
+2. under the host lock, verify the generation prefix, import origin, wheel/lock
+   binding, and complete lock-declared Core distribution inventory before
+   ensuring or replacing the user-global daemon;
+3. write the bounded attachment to a unique owner-only file under the pinned
    service root;
-3. consume and unlink that file through the SSH transport's dedicated
-   `SecretStr` result channel, never `RemoteCommandResult.stdout`;
-4. start one `ExitOnForwardFailure` OpenSSH control master that forwards an
-   owner-only Unix-domain stream socket to the selected remote loopback port;
-5. pin the forwarding and control socket inodes with private hard-link guards,
-   require exact owner/mode/path identity plus a successful control-master
-   authority check, and call `/version` and `/v1/status` through a UDS-backed
-   HTTP connection with the bearer;
-6. recheck that same socket/process/control authority after authentication and
+4. consume and unlink that file with the same generation interpreter through
+   the SSH transport's dedicated `SecretStr` result channel, never
+   `RemoteCommandResult.stdout`;
+5. for each Core HTTP connection, create a parent-owned `AF_UNIX` socketpair,
+   validate both held FDs as owner-owned, mode `0600`, link-count-one sockets,
+   and transfer only the peer FD to one new `ssh -W` child;
+6. check that connection's child authority before and after authenticated status
+   traffic, then
    require generation, release, registry, and status-proof equality before
    returning a verified tunnel handle.
 
-The bootstrap helper itself is imported directly from the uploaded wheel via a
-command-scoped `PYTHONPATH`; it does not depend on an earlier uncoordinated
-installation of that release. Child verification and lifecycle interpreters
-remove that bootstrap `PYTHONPATH`, so they verify and execute the installed
-inventory rather than the uploaded archive.
+The first-stage installer is a closed standard-library script invoked by
+`python3 -I`; remote paths use a closed absolute-path grammar and reject the
+platform path separator. The script receives no bearer and uses an allowlisted
+environment. All Core imports, attachment consumption, verification, lifecycle,
+and daemon launch after installation use the generation interpreter with no
+`PYTHONPATH` semantics.
 
 The attachment keeps the bearer out of `repr` and has no general serializer or
 renderer-facing response model. Its loopback host/port, release identity, and
@@ -126,23 +137,22 @@ The secret result has no general serializer or diagnostic projection, and its
 attachment, and verified tunnel handle in sidecar process memory; it must never
 be persisted in Desktop resources, logs, operations, or renderer responses.
 
-The local forwarding endpoint is never selected by binding and then closing a
-temporary TCP socket. Each Core tunnel receives a short random directory under
-`/tmp`, held and repeatedly validated as an owner-owned `0700` directory. OpenSSH
-creates `forward.sock` and `control.sock` as owner-owned `0600` stream sockets
-with unlink-on-bind disabled. The sidecar hard-links each socket to a private
-guard name, preventing inode reuse while the tunnel is live, and requires both
-names to retain the same pinned inode before and after every local connect. It
-also requires the original SSH child to remain alive and `ssh -O check` to
-authenticate the exact control socket. The connected AF_UNIX socket is returned
-to the HTTP layer only after the post-connect authority check, so process exit or
-endpoint replacement cannot redirect a bearer request to another listener.
+Core authentication does not use a filesystem pathname created by OpenSSH and
+does not reserve a temporary TCP port. For every HTTP connection the Desktop
+parent creates a fresh anonymous `AF_UNIX` socketpair, changes both endpoints to
+mode `0600`, and validates socket type, effective UID, link count, and held-FD
+identity before transfer. The parent retains the HTTP endpoint; exactly one
+`ssh -W 127.0.0.1:<port>` child receives the peer as stdin/stdout. There is no
+`-L` listener, control master, control socket, pathname pre-pin window, or
+same-UID unlink/rebind target. The HTTP layer rechecks child authority after
+reading each bearer-authenticated response.
 
 Tunnel authentication preserves retryable deadline and daemon-exit failures.
 Every path that does not return the verified handle, including cancellation or
 another `BaseException`, executes the tunnel's bounded terminate/wait/kill close
-path in `finally`. Endpoint paths and trust leases are released only after SSH
-exit is confirmed; otherwise existing orphan quarantine retains ownership.
+path in `finally`. Trust leases are released only after every connection child
+exit is confirmed; otherwise process-local orphan quarantine retains ownership
+and retries on later tunnel operations or matching trust mutation.
 
 The exhibition release path uses this attachment for subscription execution and
 transcript capture. After attach, this bootstrap layer does not start a science run, Gateway,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict
 import json
+import os
 import sys
 
 import pytest
@@ -18,6 +19,7 @@ from openevo.deployment.core_control import (
     parse_core_control_attachment,
 )
 from openevo.deployment.preflight import RemoteCommandResult
+from openevo.deployment.ssh import SshTransportError, SshTransportErrorCode
 
 
 def _attachment_json(**updates: object) -> str:
@@ -94,6 +96,7 @@ class FakeTransport:
 
 
 def test_core_bootstrap_uses_one_host_locked_command_and_secret_channel() -> None:
+    compile(core_control._GENERATION_BOOTSTRAP, "<generation-bootstrap>", "exec")
     plan = build_core_control_bootstrap_plan(
         wheel_path="/home/user/upload/openevo.whl",
         framework_lock="/home/user/upload/framework-lock.json",
@@ -113,16 +116,69 @@ def test_core_bootstrap_uses_one_host_locked_command_and_secret_channel() -> Non
     assert "bearer_token" not in repr(attachment)
     assert "E" * 64 not in repr(asdict(attachment))
     assert len(transport.commands) == 1
-    assert "openevo.backend.service bootstrap" in transport.commands[0]
+    assert "openevo.backend.service" in transport.commands[0]
+    assert " bootstrap " in transport.commands[0]
     assert "--wheel-path" in transport.commands[0]
     assert "--port 0" in transport.commands[0]
+    assert "PYTHONPATH" not in transport.commands[0]
+    assert "--force-reinstall" not in transport.commands[0]
+    assert " -I " in transport.commands[0]
+    assert "/releases/" in transport.commands[0]
     assert len(transport.secret_commands) == 1
     assert "consume-attachment" in transport.secret_commands[0]
+    assert "/releases/" in transport.secret_commands[0]
+    assert " -I " in transport.secret_commands[0]
+    assert "python3 -m openevo" not in transport.secret_commands[0]
     combined = " ".join(transport.commands)
     assert "gateway" not in combined
     assert "worker" not in combined
     assert "vllm" not in combined.lower()
     assert all(0 < timeout <= plan.deadline_seconds for timeout in transport.timeouts)
+
+
+def test_core_bootstrap_rejects_pathsep_and_non_closed_remote_paths() -> None:
+    for path in (
+        f"/home/user/upload{os.pathsep}/tmp/openevo.whl",
+        "/home/user/upload/openevo wheel.whl",
+        "/home/user/upload/openevo\\wheel.whl",
+    ):
+        with pytest.raises(CoreControlBootstrapError) as exc_info:
+            build_core_control_bootstrap_plan(
+                wheel_path=path,
+                framework_lock="/home/user/upload/framework-lock.json",
+                service_root="/home/user/.openevo/core",
+                source_commit="1" * 40,
+            )
+        assert exc_info.value.code is CoreControlBootstrapErrorCode.INVALID_PLAN
+
+
+@pytest.mark.parametrize("secret_phase", [False, True])
+def test_core_bootstrap_preserves_ssh_timeout_as_retryable_deadline(
+    secret_phase: bool,
+) -> None:
+    plan = build_core_control_bootstrap_plan(
+        wheel_path="/home/user/upload/openevo.whl",
+        framework_lock="/home/user/upload/framework-lock.json",
+        service_root="/home/user/.openevo/core",
+        source_commit="1" * 40,
+    )
+
+    class TimeoutTransport(FakeTransport):
+        def run(self, command: str, **kwargs: object) -> RemoteCommandResult:
+            if not secret_phase:
+                raise SshTransportError(SshTransportErrorCode.TIMEOUT)
+            return super().run(command, **kwargs)
+
+        def run_secret(self, command: str, **kwargs: object) -> SecretStr:
+            if secret_phase:
+                raise SshTransportError(SshTransportErrorCode.TIMEOUT)
+            return super().run_secret(command, **kwargs)
+
+    with pytest.raises(CoreControlBootstrapError) as exc_info:
+        execute_core_control_bootstrap(plan, TimeoutTransport(_attachment_json()))
+
+    assert exc_info.value.code is CoreControlBootstrapErrorCode.DEADLINE_EXCEEDED
+    assert exc_info.value.retryable is True
 
 
 def test_bootstrap_does_not_expose_bearer_in_normal_command_result() -> None:
@@ -241,6 +297,21 @@ def test_tunnel_rejects_base_url_not_bound_to_verified_local_endpoint(
 
     assert exc_info.value.code is CoreControlBootstrapErrorCode.RESPONSE_INVALID
     assert transport.tunnel.closed is True
+
+
+def test_tunnel_open_preserves_ssh_timeout_as_retryable_deadline() -> None:
+    attachment = parse_core_control_attachment(SecretStr(_attachment_json()))
+
+    class TimeoutTransport(FakeTransport):
+        def open_core_tunnel(self, **kwargs: object) -> object:
+            del kwargs
+            raise SshTransportError(SshTransportErrorCode.TIMEOUT)
+
+    with pytest.raises(CoreControlBootstrapError) as exc_info:
+        open_core_control_tunnel(attachment, TimeoutTransport(""))
+
+    assert exc_info.value.code is CoreControlBootstrapErrorCode.DEADLINE_EXCEEDED
+    assert exc_info.value.retryable is True
 
 
 @pytest.mark.parametrize(

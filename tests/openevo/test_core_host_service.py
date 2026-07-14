@@ -213,6 +213,9 @@ def test_bootstrap_lock_serializes_verification_install_and_lifecycle(
     thread_invocations: dict[int, int] = {}
     guard = threading.Lock()
 
+    def verify_generation(**kwargs: object) -> None:
+        assert kwargs["install_generation"] == "a" * 32
+
     def run_private(
         argv: list[str],
         *,
@@ -240,9 +243,10 @@ def test_bootstrap_lock_serializes_verification_install_and_lifecycle(
             thread_id = threading.get_ident()
             invocation = thread_invocations.get(thread_id, 0) + 1
             thread_invocations[thread_id] = invocation
-        return 1 if invocation == 1 else 0
+        return 0
 
     monkeypatch.setattr(service, "require_host_global_service_root", lambda path: Path(path))
+    monkeypatch.setattr(service, "_verify_generation_install", verify_generation)
     monkeypatch.setattr(service, "_run_private_command", run_private)
     barrier = threading.Barrier(2)
     failures: list[BaseException] = []
@@ -256,6 +260,7 @@ def test_bootstrap_lock_serializes_verification_install_and_lifecycle(
                 framework_lock=framework_lock,
                 source_commit=SOURCE_COMMIT,
                 attachment_name=f"bootstrap-{suffix * 32}.json",
+                install_generation="a" * 32,
             )
         except BaseException as exc:
             failures.append(exc)
@@ -268,7 +273,7 @@ def test_bootstrap_lock_serializes_verification_install_and_lifecycle(
 
     assert failures == []
     assert max_active == 1
-    assert len(calls) == 16
+    assert len(calls) == 4
 
 
 def test_real_process_bootstrap_lock_serializes_mutation_window(tmp_path: Path) -> None:
@@ -301,12 +306,14 @@ def run_private(argv, *, deadline, pass_fds=()):
     return 0
 
 service._run_private_command = run_private
+service._verify_generation_install = lambda **kwargs: None
 service.bootstrap_core_service(
     service_root=root,
     wheel_path=wheel,
     framework_lock=framework_lock,
     source_commit="1" * 40,
     attachment_name=f"bootstrap-{suffix * 32}.json",
+    install_generation="a" * 32,
 )
 """
     env = {**os.environ, "PYTHONPATH": str(Path(__file__).parents[2] / "src")}
@@ -328,11 +335,111 @@ service.bootstrap_core_service(
     ]
     assert [process.wait(timeout=10) for process in processes] == [0, 0]
     process_order = [line.split()[0] for line in events.read_text(encoding="ascii").splitlines()]
-    assert len(process_order) == 8
+    assert len(process_order) == 4
     assert process_order in (
-        [str(processes[0].pid)] * 4 + [str(processes[1].pid)] * 4,
-        [str(processes[1].pid)] * 4 + [str(processes[0].pid)] * 4,
+        [str(processes[0].pid)] * 2 + [str(processes[1].pid)] * 2,
+        [str(processes[1].pid)] * 2 + [str(processes[0].pid)] * 2,
     )
+
+
+def test_generation_verification_failure_never_enters_daemon_lifecycle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = _root(tmp_path)
+    wheel = tmp_path / "openevo.whl"
+    framework_lock = tmp_path / "framework-lock.json"
+    wheel.write_bytes(b"wheel-b")
+    framework_lock.write_text("{}", encoding="ascii")
+    lifecycle_commands: list[list[str]] = []
+
+    monkeypatch.setattr(service, "require_host_global_service_root", lambda path: Path(path))
+
+    def reject_generation(**_kwargs: object) -> None:
+        raise CoreServiceError(
+            CoreServiceErrorCode.VERIFICATION_FAILED,
+            "generation mismatch",
+            retryable=False,
+        )
+
+    monkeypatch.setattr(service, "_verify_generation_install", reject_generation)
+    monkeypatch.setattr(
+        service,
+        "_run_private_command",
+        lambda argv, **_kwargs: lifecycle_commands.append(argv) or 0,
+    )
+
+    with pytest.raises(CoreServiceError) as exc_info:
+        service.bootstrap_core_service(
+            service_root=root,
+            wheel_path=wheel,
+            framework_lock=framework_lock,
+            source_commit=SOURCE_COMMIT,
+            attachment_name=f"bootstrap-{'b' * 32}.json",
+            install_generation="a" * 32,
+            replace_mismatched=True,
+        )
+
+    assert exc_info.value.code is CoreServiceErrorCode.VERIFICATION_FAILED
+    assert lifecycle_commands == []
+
+
+def test_generation_verification_binds_exact_prefix_interpreter_and_wheel(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = _root(tmp_path)
+    generation = "a" * 32
+    generation_root = root / "releases" / generation
+    generation_root.mkdir(parents=True, mode=0o700)
+    interpreter = generation_root / "bin" / "python"
+    interpreter.parent.mkdir()
+    interpreter.write_bytes(b"python")
+    interpreter.chmod(0o755)
+    module_path = (
+        generation_root / "lib" / "python" / "site-packages" / "openevo" / "backend" / "service.py"
+    )
+    module_path.parent.mkdir(parents=True)
+    module_path.write_bytes(b"module")
+    wheel = tmp_path / "openevo.whl"
+    wheel.write_bytes(b"wheel")
+    framework_lock = tmp_path / "framework-lock.json"
+    framework_lock.write_text("{}", encoding="ascii")
+    verified: list[Path] = []
+
+    monkeypatch.setattr(service.sys, "prefix", str(generation_root))
+    monkeypatch.setattr(service.sys, "executable", str(interpreter))
+    monkeypatch.setattr(service, "__file__", str(module_path))
+    monkeypatch.setattr(
+        service,
+        "load_framework_distribution_lock",
+        lambda _path: (object(), wheel),
+    )
+    monkeypatch.setattr(
+        service,
+        "load_verified_framework_registry",
+        lambda path: verified.append(Path(path)) or object(),
+    )
+
+    service._verify_generation_install(
+        service_root=root,
+        wheel_path=wheel,
+        framework_lock=framework_lock,
+        source_commit=SOURCE_COMMIT,
+        install_generation=generation,
+    )
+    assert verified == [framework_lock]
+
+    monkeypatch.setattr(service.sys, "prefix", str(root / "releases" / ("b" * 32)))
+    with pytest.raises(CoreServiceError) as exc_info:
+        service._verify_generation_install(
+            service_root=root,
+            wheel_path=wheel,
+            framework_lock=framework_lock,
+            source_commit=SOURCE_COMMIT,
+            install_generation=generation,
+        )
+    assert exc_info.value.code is CoreServiceErrorCode.VERIFICATION_FAILED
 
 
 def test_inherited_bootstrap_lock_must_be_bound_and_held(tmp_path: Path) -> None:
@@ -405,6 +512,69 @@ def test_deterministic_fault_injection_runs_after_spawn_before_publication(
     assert injected == [("after_spawn", children[0].pid)]
     assert children[0].returncode == -15
     assert not (root / "service.json").exists()
+
+
+def test_spawn_cancellation_retains_unconfirmed_child_and_propagates_original(
+    tmp_path: Path,
+    service_fakes: tuple[FakeController, list[FakeChild]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    controller, children = service_fakes
+    root = _root(tmp_path)
+    lock = tmp_path / "framework-lock.json"
+    lock.write_text("{}", encoding="ascii")
+
+    class Cancelled(BaseException):
+        pass
+
+    cleanup_fails = True
+
+    def cancel_after_spawn(_phase: str, _pid: int) -> None:
+        child = children[-1]
+
+        def terminate() -> None:
+            if cleanup_fails:
+                raise OSError("terminate failed")
+            child.returncode = -15
+
+        def wait(timeout: float | None = None) -> int:
+            if cleanup_fails:
+                raise subprocess.TimeoutExpired("core", timeout)
+            assert child.returncode is not None
+            return child.returncode
+
+        def kill() -> None:
+            if cleanup_fails:
+                raise OSError("kill failed")
+            child.returncode = -9
+
+        monkeypatch.setattr(child, "terminate", terminate)
+        monkeypatch.setattr(child, "wait", wait)
+        monkeypatch.setattr(child, "kill", kill)
+        raise Cancelled
+
+    with pytest.raises(Cancelled):
+        ensure_core_service(
+            service_root=root,
+            framework_lock=lock,
+            source_commit=SOURCE_COMMIT,
+            process_controller=controller,
+            _fault_injector=cancel_after_spawn,
+        )
+
+    child = children[-1]
+    assert id(child) in service._ORPHANED_SERVICE_CHILDREN
+    assert (root / "pending.json").exists()
+    cleanup_fails = False
+    service._retry_orphaned_service_children()
+    assert id(child) not in service._ORPHANED_SERVICE_CHILDREN
+    assert (root / "pending.json").exists()
+    with HostServiceRoot(root) as pinned:
+        service._recover_pending(
+            pinned,
+            controller=controller,
+            deadline=time.monotonic() + 1,
+        )
     assert not (root / "pending.json").exists()
 
 
@@ -606,6 +776,9 @@ def test_endpoint_probe_uses_verified_unix_socket_transport() -> None:
     servers: list[threading.Thread] = []
 
     class Endpoint:
+        def verify_authority(self) -> None:
+            return None
+
         def open_verified_socket(self, *, timeout_seconds: float) -> socket.socket:
             client, server_socket = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
             client.settimeout(timeout_seconds)

@@ -7,8 +7,10 @@ import re
 import shlex
 import shutil
 import socket
+import stat
 import subprocess
 import struct
+import sys
 import threading
 import time
 import traceback
@@ -72,6 +74,31 @@ class RecordingTunnelStarter:
 
     def __call__(self, argv: list[str]) -> "FakeTunnelProcess":
         self.calls.append(argv)
+        process = FakeTunnelProcess()
+        self.processes.append(process)
+        return process
+
+
+class RecordingCoreConnectionStarter:
+    def __init__(self) -> None:
+        self.calls: list[tuple[list[str], tuple[int, int, int, int]]] = []
+        self.processes: list[FakeTunnelProcess] = []
+        self.streams: list[socket.socket] = []
+
+    def __call__(self, argv: list[str], stream_fd: int) -> "FakeTunnelProcess":
+        metadata = os.fstat(stream_fd)
+        self.calls.append(
+            (
+                argv,
+                (
+                    metadata.st_uid,
+                    metadata.st_mode & 0o777,
+                    metadata.st_nlink,
+                    metadata.st_ino,
+                ),
+            )
+        )
+        self.streams.append(socket.socket(fileno=os.dup(stream_fd)))
         process = FakeTunnelProcess()
         self.processes.append(process)
         return process
@@ -159,8 +186,7 @@ def _transport(
     runner: RecordingRunner | None = None,
     tunnel_starter: RecordingTunnelStarter | None = None,
     port_allocator=None,
-    control_runner=None,
-    tunnel_directory_allocator=None,
+    core_connection_starter=None,
 ) -> SshRemoteExecutorTransport:
     active_profile = profile or _profile()
     return SshRemoteExecutorTransport(
@@ -169,8 +195,7 @@ def _transport(
         runner=runner,
         tunnel_starter=tunnel_starter,
         port_allocator=port_allocator,
-        control_runner=control_runner,
-        tunnel_directory_allocator=tunnel_directory_allocator,
+        core_connection_starter=core_connection_starter,
     )
 
 
@@ -503,9 +528,7 @@ def test_private_key_final_openssh_config_contains_only_explicit_identity(
                 effective.setdefault(name, []).append(value)
             return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
 
-    profile = _profile(
-        auth={"method": "private_key", "private_key_path": str(key)}
-    )
+    profile = _profile(auth={"method": "private_key", "private_key_path": str(key)})
     transport = _transport(tmp_path, profile=profile, runner=EffectiveConfigRunner())
 
     transport.run("true")
@@ -522,9 +545,7 @@ def test_private_key_isolation_is_identical_for_command_rsync_and_tunnel(
     key.write_text("key", encoding="utf-8")
     local = tmp_path / "workspace"
     local.mkdir()
-    profile = _profile(
-        auth={"method": "private_key", "private_key_path": str(key)}
-    )
+    profile = _profile(auth={"method": "private_key", "private_key_path": str(key)})
     runner = RecordingRunner()
     starter = RecordingTunnelStarter()
     transport = _transport(
@@ -536,9 +557,7 @@ def test_private_key_isolation_is_identical_for_command_rsync_and_tunnel(
 
     transport.run("true")
     transport.upload_dir(str(local), "/remote/workspace")
-    tunnel = transport.open_tunnel(
-        remote_port=8765, local_port=49155, wait_for_ready=False
-    )
+    tunnel = transport.open_tunnel(remote_port=8765, local_port=49155, wait_for_ready=False)
 
     command_argv = runner.calls[0][0]
     rsync_shell = runner.calls[2][0][4]
@@ -580,9 +599,7 @@ def test_spawn_lease_survives_trust_root_rename_and_replacement(tmp_path: Path) 
             )
             original_root.rename(moved_root)
             original_root.mkdir(mode=0o700)
-            (original_root / binding.known_hosts_file.name).write_text(
-                canary, encoding="utf-8"
-            )
+            (original_root / binding.known_hosts_file.name).write_text(canary, encoding="utf-8")
             assert binding.public_key in lease_path.read_text(encoding="utf-8")
             assert canary not in lease_path.read_text(encoding="utf-8")
             return subprocess.CompletedProcess(argv, 0, stdout="ok", stderr="")
@@ -825,14 +842,12 @@ def test_upload_dir_creates_remote_parent_and_runs_rsync(tmp_path: Path) -> None
         "mkdir -p /home/alice/.openevo/workspaces/task",
     )
     actual_shell = shlex.split(runner.calls[1][0][4])
-    lease_option = next(
-        value for value in actual_shell if value.startswith("UserKnownHostsFile=")
-    )
+    lease_option = next(value for value in actual_shell if value.startswith("UserKnownHostsFile="))
     assert str(binding.known_hosts_file) not in lease_option
     expected_shell = _expected_ssh_base(profile, binding)
-    expected_shell[
-        expected_shell.index(f"UserKnownHostsFile={binding.known_hosts_file}")
-    ] = lease_option
+    expected_shell[expected_shell.index(f"UserKnownHostsFile={binding.known_hosts_file}")] = (
+        lease_option
+    )
     assert runner.calls[1][0] == [
         "rsync",
         "-az",
@@ -864,16 +879,14 @@ def test_open_tunnel_starts_ssh_local_forwarding_and_closes_process(
     assert tunnel.remote_port == 8765
     assert tunnel.base_url == "http://127.0.0.1:49155"
     lease_option = next(
-        value
-        for value in starter.calls[0]
-        if value.startswith("UserKnownHostsFile=")
+        value for value in starter.calls[0] if value.startswith("UserKnownHostsFile=")
     )
     lease_path = Path(lease_option.removeprefix("UserKnownHostsFile="))
     assert lease_path.exists()
     expected_base = _expected_ssh_base(profile, binding)
-    expected_base[
-        expected_base.index(f"UserKnownHostsFile={binding.known_hosts_file}")
-    ] = lease_option
+    expected_base[expected_base.index(f"UserKnownHostsFile={binding.known_hosts_file}")] = (
+        lease_option
+    )
     assert starter.calls == [
         [
             *expected_base,
@@ -898,148 +911,197 @@ def test_open_tunnel_starts_ssh_local_forwarding_and_closes_process(
     assert tunnel.closed is True
 
 
-def test_core_tunnel_uses_private_streamlocal_endpoint_and_pins_authority(
+def test_core_tunnel_uses_parent_owned_socketpair_and_per_connection_ssh_child(
     tmp_path: Path,
 ) -> None:
-    class StreamLocalStarter(RecordingTunnelStarter):
-        def __init__(self) -> None:
-            super().__init__()
-            self.listeners: list[socket.socket] = []
-            self.creator: threading.Thread | None = None
-
-        def __call__(self, argv: list[str]) -> FakeTunnelProcess:
-            process = super().__call__(argv)
-            forward = argv[argv.index("-L") + 1]
-            local_socket = Path(forward.split(":", 1)[0])
-            control_socket = Path(argv[argv.index("-S") + 1])
-
-            def publish_sockets() -> None:
-                time.sleep(0.05)
-                for path in (local_socket, control_socket):
-                    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-                    listener.bind(str(path))
-                    listener.listen(1)
-                    os.chmod(path, 0o600)
-                    self.listeners.append(listener)
-
-            self.creator = threading.Thread(target=publish_sockets)
-            self.creator.start()
-            return process
-
-    control_calls: list[list[str]] = []
-
-    def control_runner(
-        argv: list[str], timeout_seconds: float
-    ) -> subprocess.CompletedProcess[str]:
-        assert timeout_seconds > 0
-        control_calls.append(argv)
-        return subprocess.CompletedProcess(
-            argv,
-            1 if len(control_calls) == 1 else 0,
-            stdout="",
-            stderr="",
-        )
-
-    root = tmp_path / "core-tunnel"
-    starter = StreamLocalStarter()
+    starter = RecordingCoreConnectionStarter()
     transport = _transport(
         tmp_path,
-        tunnel_starter=starter,
-        control_runner=control_runner,
-        tunnel_directory_allocator=lambda: root,
+        core_connection_starter=starter,
     )
 
     tunnel = transport.open_core_tunnel(remote_port=8765)
 
-    assert root.stat().st_mode & 0o777 == 0o700
     assert tunnel.base_url == "http://openevo-core.local"
-    argv = starter.calls[0]
-    assert "ExitOnForwardFailure=yes" in argv
-    assert "StreamLocalBindUnlink=no" in argv
-    assert "StreamLocalBindMask=0177" in argv
-    assert "ControlMaster=yes" in argv
-    assert "ControlPersist=no" in argv
-    assert argv[argv.index("-L") + 1] == f"{root / 'forward.sock'}:127.0.0.1:8765"
-    assert argv[argv.index("-S") + 1] == str(root / "control.sock")
-    for socket_name, guard_name in (
-        ("forward.sock", "forward.guard"),
-        ("control.sock", "control.guard"),
-    ):
-        socket_metadata = os.lstat(root / socket_name)
-        guard_metadata = os.lstat(root / guard_name)
-        assert socket_metadata.st_uid == os.geteuid()
-        assert socket_metadata.st_mode & 0o777 == 0o600
-        assert socket_metadata.st_nlink == 2
-        assert (socket_metadata.st_dev, socket_metadata.st_ino) == (
-            guard_metadata.st_dev,
-            guard_metadata.st_ino,
-        )
-
     connection = tunnel.open_verified_socket(timeout_seconds=1.0)
+    second_connection = tunnel.open_verified_socket(timeout_seconds=1.0)
+    assert len(starter.calls) == 2
+    for argv, (uid, mode, links, inode) in starter.calls:
+        assert argv[-4:] == ["-W", "127.0.0.1:8765", "--", "gpu.example.edu"]
+        assert "-L" not in argv
+        assert "-S" not in argv
+        assert "ControlMaster=yes" not in argv
+        assert uid == os.geteuid()
+        assert mode == 0o600
+        assert links == 1
+        assert inode > 0
+    local_metadata = os.fstat(connection.fileno())
+    assert stat.S_ISSOCK(local_metadata.st_mode)
+    assert local_metadata.st_uid == os.geteuid()
+    assert local_metadata.st_mode & 0o777 == 0o600
+    assert local_metadata.st_nlink == 1
     connection.close()
+    second_connection.close()
     tunnel.verify_authority()
-    assert len(control_calls) >= 4
 
-    starter.processes[0].return_code = 255
+    starter.processes[1].return_code = 255
     with pytest.raises(SshTransportError) as exited:
         tunnel.verify_authority()
     assert exited.value.code is SshTransportErrorCode.CONNECTION_FAILED
 
     tunnel.close()
-    assert starter.creator is not None
-    starter.creator.join(timeout=1)
-    for listener in starter.listeners:
-        listener.close()
-    assert not root.exists()
+    for stream in starter.streams:
+        stream.close()
 
 
-def test_core_tunnel_rejects_replaced_socket_before_connect(
+def test_core_tunnel_connection_start_cancellation_closes_parent_stream_and_propagates(
     tmp_path: Path,
 ) -> None:
-    class StreamLocalStarter(RecordingTunnelStarter):
-        def __init__(self) -> None:
-            super().__init__()
-            self.listeners: dict[Path, socket.socket] = {}
+    class Cancelled(BaseException):
+        pass
 
-        def __call__(self, argv: list[str]) -> FakeTunnelProcess:
-            process = super().__call__(argv)
-            forward = Path(argv[argv.index("-L") + 1].split(":", 1)[0])
-            control = Path(argv[argv.index("-S") + 1])
-            for path in (forward, control):
-                listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-                listener.bind(str(path))
-                listener.listen(1)
-                os.chmod(path, 0o600)
-                self.listeners[path] = listener
-            return process
+    observed_fd = -1
 
-    root = tmp_path / "core-tunnel"
-    starter = StreamLocalStarter()
+    def cancel(_argv: list[str], stream_fd: int) -> FakeTunnelProcess:
+        nonlocal observed_fd
+        observed_fd = stream_fd
+        raise Cancelled
+
     transport = _transport(
         tmp_path,
-        tunnel_starter=starter,
-        control_runner=lambda argv, timeout: subprocess.CompletedProcess(argv, 0),
-        tunnel_directory_allocator=lambda: root,
+        core_connection_starter=cancel,
     )
     tunnel = transport.open_core_tunnel(remote_port=8765)
-    forward = root / "forward.sock"
 
-    starter.listeners[forward].close()
-    forward.unlink()
-    replacement = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    replacement.bind(str(forward))
-    replacement.listen(1)
-    os.chmod(forward, 0o600)
-    with pytest.raises(SshTransportError) as replaced:
+    with pytest.raises(Cancelled):
         tunnel.open_verified_socket(timeout_seconds=1.0)
-    assert replaced.value.code is SshTransportErrorCode.CONNECTION_FAILED
-    replacement.settimeout(0.05)
-    with pytest.raises(TimeoutError):
-        replacement.accept()
+    with pytest.raises(OSError):
+        os.fstat(observed_fd)
 
     tunnel.close()
-    replacement.close()
-    starter.listeners[root / "control.sock"].close()
+
+
+def test_core_connection_subprocess_bridges_a_real_parent_owned_af_unix_stream() -> None:
+    local_stream, child_stream = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        for stream in (local_stream, child_stream):
+            os.fchmod(stream.fileno(), 0o600)
+        child = ssh_module._start_core_connection_subprocess(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import sys; data=sys.stdin.buffer.read(); "
+                    "sys.stdout.buffer.write(data.upper()); sys.stdout.buffer.flush()"
+                ),
+            ],
+            child_stream.fileno(),
+        )
+        child_stream.close()
+        local_stream.sendall(b"core relay")
+        local_stream.shutdown(socket.SHUT_WR)
+        assert local_stream.recv(64) == b"CORE RELAY"
+        assert child.wait(timeout=5) == 0
+    finally:
+        local_stream.close()
+        child_stream.close()
+
+
+def test_core_tunnel_close_quarantines_unconfirmed_connection_child(
+    tmp_path: Path,
+) -> None:
+    class RecoverableProcess(FakeTunnelProcess):
+        def __init__(self) -> None:
+            super().__init__()
+            self.cleanup_fails = True
+
+        def terminate(self) -> None:
+            if self.cleanup_fails:
+                raise OSError("terminate failed")
+            self.return_code = -15
+
+        def wait(self, timeout: float | None = None) -> int:
+            if self.cleanup_fails:
+                raise subprocess.TimeoutExpired("ssh", timeout)
+            assert self.return_code is not None
+            return self.return_code
+
+        def kill(self) -> None:
+            if self.cleanup_fails:
+                raise OSError("kill failed")
+            self.return_code = -9
+
+    process = RecoverableProcess()
+
+    def start(_argv: list[str], _stream_fd: int) -> FakeTunnelProcess:
+        return process
+
+    tunnel = _transport(
+        tmp_path,
+        core_connection_starter=start,
+    ).open_core_tunnel(remote_port=8765)
+    connection = tunnel.open_verified_socket(timeout_seconds=1.0)
+    connection.close()
+
+    with pytest.raises(OSError):
+        tunnel.close()
+
+    assert id(tunnel._endpoint) in ssh_module._ORPHANED_CORE_TUNNELS
+    assert tunnel.closed is False
+    process.cleanup_fails = False
+    ssh_module._retry_orphaned_tunnel_cleanup()
+    assert tunnel.closed is True
+    assert id(tunnel._endpoint) not in ssh_module._ORPHANED_CORE_TUNNELS
+
+
+def test_core_tunnel_close_quarantines_lease_cleanup_cancellation() -> None:
+    class Cancelled(BaseException):
+        pass
+
+    class Lease:
+        cleanup_fails = True
+
+        def __exit__(self, *_args: object) -> None:
+            if self.cleanup_fails:
+                raise Cancelled
+
+    class TrustedHost:
+        def _register_tunnel(self, _closer) -> object:
+            return lambda: None
+
+    lease = Lease()
+    endpoint = ssh_module._CoreTunnelEndpoint(
+        connection_starter=lambda _argv, _fd: FakeTunnelProcess(),
+        connection_argv=["ssh"],
+        trust_lease=lease,
+        trusted_host=TrustedHost(),
+    )
+
+    with pytest.raises(Cancelled):
+        endpoint.close()
+
+    assert endpoint.closed is False
+    assert id(endpoint) in ssh_module._ORPHANED_CORE_TUNNELS
+    lease.cleanup_fails = False
+    ssh_module._retry_orphaned_tunnel_cleanup()
+    assert endpoint.closed is True
+    assert id(endpoint) not in ssh_module._ORPHANED_CORE_TUNNELS
+
+
+def test_untransferred_trust_lease_cleanup_failure_is_retryable() -> None:
+    class Lease:
+        cleanup_fails = True
+
+        def __exit__(self, *_args: object) -> None:
+            if self.cleanup_fails:
+                raise OSError("lease cleanup failed")
+
+    lease = Lease()
+    ssh_module._release_trust_lease(lease)
+    assert id(lease) in ssh_module._ORPHANED_TRUST_LEASES
+    lease.cleanup_fails = False
+    ssh_module._retry_orphaned_tunnel_cleanup()
+    assert id(lease) not in ssh_module._ORPHANED_TRUST_LEASES
 
 
 def test_open_tunnel_thread_start_failure_cleans_process_registration_and_lease(
@@ -1098,9 +1160,7 @@ def test_open_tunnel_thread_start_failure_cleans_process_registration_and_lease(
     assert not lease_path.exists()
     assert error.__cause__ is None
     assert error.__context__ is None
-    assert "SECRET_THREAD_START_FAILURE" not in "".join(
-        traceback.format_exception(error)
-    )
+    assert "SECRET_THREAD_START_FAILURE" not in "".join(traceback.format_exception(error))
 
     store = ProviderKnownHostStore(
         binding.known_hosts_file.parent,
@@ -1108,6 +1168,32 @@ def test_open_tunnel_thread_start_failure_cleans_process_registration_and_lease(
         lock_timeout_seconds=0.05,
     )
     store.revoke(profile, expected_fingerprint=binding.fingerprint)
+
+
+def test_open_tunnel_constructor_cancellation_cleans_child_and_propagates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Cancelled(BaseException):
+        pass
+
+    starter = RecordingTunnelStarter()
+    transport = _transport(
+        tmp_path,
+        tunnel_starter=starter,
+        port_allocator=lambda: 49155,
+    )
+
+    def cancel_start(_self: threading.Thread) -> None:
+        raise Cancelled
+
+    monkeypatch.setattr(threading.Thread, "start", cancel_start)
+
+    with pytest.raises(Cancelled):
+        transport.open_tunnel(remote_port=8765, wait_for_ready=False)
+
+    assert starter.processes[0].terminated is True
+    assert starter.processes[0].waited is True
 
 
 def test_failed_tunnel_construction_retains_lease_until_exit_is_confirmed(
@@ -1162,18 +1248,10 @@ def test_failed_tunnel_construction_retains_lease_until_exit_is_confirmed(
         tunnel_starter=starter,
         port_allocator=lambda: 49155,
     )
-    real_release_trust_lease = ssh_module._release_trust_lease
-    release_calls = 0
-
-    def record_release_trust_lease(trust_lease) -> None:
-        nonlocal release_calls
-        release_calls += 1
-        real_release_trust_lease(trust_lease)
 
     def fail_start(self: threading.Thread) -> None:
         raise RuntimeError("SECRET_THREAD_START_FAILURE")
 
-    monkeypatch.setattr(ssh_module, "_release_trust_lease", record_release_trust_lease)
     monkeypatch.setattr(threading.Thread, "start", fail_start)
 
     with pytest.raises(SshTransportError) as exc_info:
@@ -1190,9 +1268,7 @@ def test_failed_tunnel_construction_retains_lease_until_exit_is_confirmed(
         )
     )
     orphan = next(
-        tunnel
-        for tunnel in ssh_module._ORPHANED_TUNNELS.values()
-        if tunnel.process is process
+        tunnel for tunnel in ssh_module._ORPHANED_TUNNELS.values() if tunnel.process is process
     )
     assert error.code is SshTransportErrorCode.START_FAILED
     assert error.__cause__ is None
@@ -1203,7 +1279,6 @@ def test_failed_tunnel_construction_retains_lease_until_exit_is_confirmed(
     assert process.kill_calls == 1
     assert orphan.closed is False
     assert lease_path.exists()
-    assert release_calls == 0
 
     store = ProviderKnownHostStore(
         binding.known_hosts_file.parent,
@@ -1220,7 +1295,6 @@ def test_failed_tunnel_construction_retains_lease_until_exit_is_confirmed(
     assert process.terminate_calls == 2
     assert process.wait_calls == 4
     assert process.kill_calls == 2
-    assert release_calls == 0
 
     process.cleanup_fails = False
     store.revoke(profile, expected_fingerprint=binding.fingerprint)
@@ -1229,7 +1303,6 @@ def test_failed_tunnel_construction_retains_lease_until_exit_is_confirmed(
     assert not lease_path.exists()
     assert not binding.known_hosts_file.exists()
     assert id(orphan) not in ssh_module._ORPHANED_TUNNELS
-    assert release_calls == 1
     assert process.terminate_calls == 3
     assert process.wait_calls == 5
     assert process.kill_calls == 2
@@ -1244,7 +1317,6 @@ def test_failed_tunnel_construction_retains_lease_until_exit_is_confirmed(
         process.wait_calls,
         process.kill_calls,
     )
-    assert release_calls == 1
 
 
 def test_ssh_errors_do_not_expose_secret_exception_state(
@@ -1338,9 +1410,7 @@ def test_tunnel_context_manager_and_exit_monitor_release_trust_lease(
 
     with transport.open_tunnel(remote_port=8765, wait_for_ready=False) as tunnel:
         lease_option = next(
-            value
-            for value in starter.calls[0]
-            if value.startswith("UserKnownHostsFile=")
+            value for value in starter.calls[0] if value.startswith("UserKnownHostsFile=")
         )
         lease_path = Path(lease_option.removeprefix("UserKnownHostsFile="))
         assert lease_path.exists()
