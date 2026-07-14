@@ -28,10 +28,15 @@ identity-bound directory with no-follow traversal and builds the canonical
 archive before returning a validated opaque workspace-import reference. The
 private response also contains a pending lease token retained only by Rust;
 React receives the source and later settles it by non-secret action ID. Drawer
-close, source replacement, reset, stale completion, and failed save paths
-discard, while a successful create/patch settles as adopted only after the
-sidecar has durably committed the project reference. Only the opaque source
-reference enters the renderer DTO or public Desktop Local API. The
+close and source invalidation also send that action ID to a native cancel command.
+Rust binds cancellation to a private random token, promptly releases the picker
+claim, and lets Python stop traversal, archive, and store work at bounded
+checkpoints. A lease published concurrently with cancellation is retained by Rust
+before guarded discard, so the renderer never owns recovery authority. Source
+replacement, reset, stale completion, and failed save paths discard, while a
+successful create/patch settles as adopted only after the sidecar has durably
+committed the project reference. Only the opaque source reference enters the
+renderer DTO or public Desktop Local API. The
 remaining `configure_credential` command is still a required release
 integration dependency; the provider continues to fail closed until it is
 implemented.

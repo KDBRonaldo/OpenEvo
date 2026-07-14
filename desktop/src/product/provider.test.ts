@@ -56,6 +56,7 @@ describe("Desktop product provider boundary", () => {
           extracted_byte_size: 12,
         },
       }),
+      cancelProjectSource: vi.fn(),
       settleProjectSource: vi.fn(),
       configureCredential: vi.fn(),
     };
@@ -82,6 +83,7 @@ describe("Desktop product provider boundary", () => {
       native: {
         bootstrap: vi.fn().mockResolvedValue(releaseBootstrap(digest, flags)),
         selectProjectSource: vi.fn(),
+        cancelProjectSource: vi.fn(),
         settleProjectSource: vi.fn(),
         configureCredential: vi.fn(),
       },
@@ -106,6 +108,7 @@ describe("Desktop product provider boundary", () => {
     invokeMock.mockImplementation(async (command: string) => {
       if (command === "start_sidecar") return releaseBootstrap(digest, flags);
       if (command === "select_project_source") return source;
+      if (command === "cancel_project_source") return undefined;
       if (command === "settle_project_source") return undefined;
       throw new Error(`Unexpected Tauri command: ${command}`);
     });
@@ -119,6 +122,7 @@ describe("Desktop product provider boundary", () => {
           actionId: "source-action-existing",
           streamEpoch: 7,
         });
+        await native.cancelProjectSource("source-action-existing");
         await native.settleProjectSource("source-action-new", "discard");
         await native.selectProjectSource({
           kind: "native_folder_snapshot",
@@ -142,6 +146,9 @@ describe("Desktop product provider boundary", () => {
       }],
     ]);
     expect(selectionCalls[1]?.[1]).not.toHaveProperty("projectId");
+    expect(invokeMock).toHaveBeenCalledWith("cancel_project_source", {
+      actionId: "source-action-existing",
+    });
     expect(invokeMock).toHaveBeenCalledWith("settle_project_source", {
       actionId: "source-action-new",
       outcome: "discard",
@@ -160,6 +167,7 @@ describe("Desktop product provider boundary", () => {
           negotiated_contract: { ...releaseBootstrap(digest, flags).negotiated_contract, provider_kind: "contract_simulator" },
         }),
         selectProjectSource: vi.fn(),
+        cancelProjectSource: vi.fn(),
         settleProjectSource: vi.fn(),
         configureCredential: vi.fn(),
       },
@@ -172,6 +180,7 @@ describe("Desktop product provider boundary", () => {
       native: {
         bootstrap: vi.fn().mockResolvedValue(releaseBootstrap(digest, incompleteFlags)),
         selectProjectSource: vi.fn(),
+        cancelProjectSource: vi.fn(),
         settleProjectSource: vi.fn(),
         configureCredential: vi.fn(),
       },
@@ -199,6 +208,7 @@ describe("Desktop product provider boundary", () => {
           },
           path: "/private/source",
         }),
+        cancelProjectSource: vi.fn(),
         settleProjectSource: vi.fn(),
         configureCredential: vi.fn(),
       },
@@ -217,6 +227,7 @@ describe("Desktop product provider boundary", () => {
           display_name: "Cross-wired scratch source",
           import_ref: null,
         }),
+        cancelProjectSource: vi.fn(),
         settleProjectSource: vi.fn(),
         configureCredential: vi.fn(),
       },
@@ -235,6 +246,7 @@ describe("Desktop product provider boundary", () => {
       native: {
         bootstrap: vi.fn().mockResolvedValue(releaseBootstrap(digest, flags)),
         selectProjectSource: vi.fn(),
+        cancelProjectSource: vi.fn(),
         settleProjectSource: vi.fn(),
         configureCredential: vi.fn().mockResolvedValue({
           ...CONTRACT_FIXTURE_V1.profile,

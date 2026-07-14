@@ -13,6 +13,7 @@ _ACTION_ID_RE = re.compile(r"^[^\x00-\x20\x7f](?:[^\x00-\x1f\x7f]*[^\x00-\x20\x7
 _IMPORT_ID_RE = re.compile(r"^workspace-import-[0-9a-f]{48}$")
 _PROJECT_DOMAIN = b"openevo.desktop.native-project.v1\0"
 _IMPORT_DOMAIN = b"openevo.desktop.native-import.v1\0"
+_OWNERSHIP_DOMAIN = b"openevo.desktop.native-ownership.v2\0"
 
 
 def native_import_id_for_action(action_id: str) -> str:
@@ -47,7 +48,15 @@ def ownership_for_native_import(
     if not isinstance(import_ref, WorkspaceImportRefV1):
         raise TypeError("native workspace ownership requires WorkspaceImportRefV1")
     owner = project_id or project_id_for_native_import(import_ref.import_id)
-    operation_id = f"workspace-source-{import_ref.content_sha256}"
+    owner_bytes = owner.encode("utf-8", errors="strict")
+    authority = sha256(
+        _OWNERSHIP_DOMAIN
+        + len(owner_bytes).to_bytes(4, "big")
+        + owner_bytes
+        + import_ref.import_id.encode("ascii")
+        + bytes.fromhex(import_ref.content_sha256)
+    ).hexdigest()
+    operation_id = f"workspace-source-{authority}"
     return WorkspaceImportOwnership(
         project_id=owner,
         operation_id=operation_id,

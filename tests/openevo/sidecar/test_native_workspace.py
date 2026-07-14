@@ -3,11 +3,13 @@ from __future__ import annotations
 import os
 from pathlib import Path
 import stat
+import sys
 
 import pytest
 
 from desktop.sidecar import native_workspace as native_workspace_module
 from desktop.sidecar.native_workspace import (
+    NativeWorkspaceArchiveCancelled,
     NativeWorkspaceArchiveError,
     prepare_native_workspace,
 )
@@ -91,6 +93,35 @@ def test_native_workspace_action_and_store_ingest_are_idempotent(tmp_path: Path)
 
     assert first == second
     assert native_import_id_for_action("native-source-action-0002") == first.import_id
+
+
+def test_native_workspace_cancellation_stops_before_the_second_inventory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "research"
+    source.mkdir()
+    (source / "payload.bin").write_bytes(os.urandom(2 * 1024 * 1024))
+    private_root = tmp_path / "private"
+    private_root.mkdir(mode=0o700)
+    cancelled = False
+
+    def cancel_after_archive(_root_descriptor: int) -> None:
+        nonlocal cancelled
+        cancelled = True
+
+    monkeypatch.setattr(native_workspace_module, "_after_archive_write", cancel_after_archive)
+
+    with pytest.raises(NativeWorkspaceArchiveCancelled):
+        with prepare_native_workspace(
+            str(source.resolve()),
+            import_id=native_import_id_for_action("native-source-cancelled-0001"),
+            temporary_root=private_root,
+            expected_device=source.stat().st_dev,
+            expected_inode=source.stat().st_ino,
+            cancel_check=lambda: cancelled,
+        ):
+            pass
 
 
 def test_native_workspace_rejects_links_special_files_and_noncanonical_names(
@@ -219,6 +250,40 @@ def test_native_workspace_accepts_a_fully_allocated_normal_file_with_minimal_ext
 
     with _prepare(source, private_root, "native-source-normal-allocation-0001") as prepared:
         assert prepared.import_ref.entry_count == 1
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="requires the macOS APFS runner")
+def test_macos_apfs_accepts_a_normal_allocated_file(tmp_path: Path) -> None:
+    source = tmp_path / "apfs-normal"
+    source.mkdir()
+    normal_file = source / "normal.bin"
+    normal_file.write_bytes(os.urandom(2 * 1024 * 1024 + 17))
+    status = normal_file.stat()
+    assert status.st_blocks * 512 >= status.st_size
+    private_root = tmp_path / "private"
+    private_root.mkdir(mode=0o700)
+
+    with _prepare(source, private_root, "native-source-apfs-normal-0001") as prepared:
+        assert prepared.import_ref.entry_count == 1
+        assert prepared.import_ref.extracted_byte_size == status.st_size
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="requires the macOS APFS runner")
+def test_macos_apfs_rejects_a_low_allocation_sparse_file(tmp_path: Path) -> None:
+    source = tmp_path / "apfs-sparse"
+    source.mkdir()
+    sparse_file = source / "sparse.bin"
+    with sparse_file.open("w+b") as stream:
+        stream.write(b"x" * 4096)
+        stream.truncate(8 * 1024 * 1024)
+    status = sparse_file.stat()
+    assert status.st_blocks * 512 < status.st_size
+    private_root = tmp_path / "private"
+    private_root.mkdir(mode=0o700)
+
+    with pytest.raises(NativeWorkspaceArchiveError, match="allocation"):
+        with _prepare(source, private_root, "native-source-apfs-sparse-0001"):
+            pass
 
 
 def test_native_workspace_directory_enumeration_is_bounded_before_sort(

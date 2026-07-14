@@ -81,7 +81,11 @@ same-name replacement binding is preserved for bounded startup reconciliation.
 Metadata binds the exact `WorkspaceImportRefV1`, private storage identity, random
 archive generation token, and a store-internal `WorkspaceImportOwnership`
 containing the Desktop `project_id`, workspace-sync `operation_id`, and request
-idempotency key. The
+idempotency key. Native operation/idempotency authority is domain-separated over
+the project/import owner, opaque import ID, and archive digest. Two projects may
+therefore retain byte-identical snapshots, including empty archives, while an
+exact action replay for the same owner converges and an owner/content conflict
+fails closed. The
 native/provider adapter must pass that exact ownership to `ingest`, `resolve`,
 and `release`; these fields are not added to the frozen HTTP DTO. Retrying ingest
 with the same ownership and content returns the already-published reference,
@@ -110,15 +114,23 @@ domain-separated HMAC over the exact import reference and ownership; only its
 one-way marker is persisted as an authenticated archive xattr. The hidden native
 response carries the token only to Rust, which keeps at most 64 pending handoffs
 keyed by renderer action ID and returns only `ProjectSourceV1` to React. The
-renderer can request native `adopt` or `discard` by action ID but never receives
-the token or hidden route. Create/patch commits adopt only after project state is
-durable. Close, reselect, reset, stale picker completion, and failed save paths
-discard. Discard first takes the provider reference guard, rereads all durable
-project references, and only then takes the import lock, so it cannot remove an
-import concurrently committed by another request. Referenced pending imports are
-adopted during startup recovery; unreferenced leases are removed. Total retained
-limits remain 10,000 imports/24 GiB, while pending state is separately capped at
-64 imports and 16 GiB by default.
+renderer can request native `cancel`, `adopt`, or `discard` by action ID but never
+receives the cancellation secret, lease token, or hidden route. Rust releases the
+action claim immediately on cancel, sends the secret-bound request, and limits a
+cancelled import response wait to three seconds. Both native and sidecar retain
+64-entry cancel-before-start tombstones so close/invalidation cannot race a queued
+picker command into a new ingest. Python checks cancellation while traversing,
+copying, hashing, validating, and waiting for either import lock. Publication is
+the linearization point: cancellation before rename removes only the bound
+temporary inode; cancellation after rename returns the recoverable pending lease
+to Rust, which records it before requesting guarded discard. Create/patch commits
+adopt only after project state is durable. Close, reselect, reset, stale picker
+completion, and failed save paths discard. Discard first takes the provider
+reference guard, rereads all durable project references, and only then takes the
+import lock, so it cannot remove an import concurrently committed by another
+request. Referenced pending imports are adopted during startup recovery;
+unreferenced leases are removed. Total retained limits remain 10,000 imports/24
+GiB, while pending state is separately capped at 64 imports and 16 GiB by default.
 
 The only renderer/public ingest result remains the existing closed contract model:
 
@@ -153,14 +165,15 @@ restart and replacement guarantees above therefore require that the key has not
 leaked and that the private state directory has not been compromised. Stronger
 same-UID isolation requires a platform credential boundary outside this module.
 
-The private import and discard routes are excluded from OpenAPI and require a process-owned native
-handoff token that is distinct from the renderer's Desktop session token. Its
-bounded import request is the only path-bearing message; its private success
-envelope contains `ProjectSourceV1` plus the native-only lease and never echoes
-that path. Rust strips the lease before returning to React. Native
-import ownership is reproducible from project identity and archive digest. A new
-project created from a native import receives a deterministic project ID derived
-from the opaque import ID; an existing project supplies its own ID privately.
+The private import, cancel, and discard routes are excluded from OpenAPI and
+require a process-owned native handoff token that is distinct from the renderer's
+Desktop session token. Its bounded import request is the only path-bearing
+message; its private success envelope contains `ProjectSourceV1` plus the
+native-only lease and never echoes that path. Rust strips the lease before
+returning to React. Native import ownership is reproducible from project/import
+owner, opaque import identity, and archive digest. A new project created from a
+native import receives a deterministic project ID derived from the opaque import
+ID; an existing project supplies its own ID privately.
 The release provider verifies the exact import and ownership before persisting a
 native project source. Project reference mutations and import cleanup use one
 fixed lock order: provider reference guard, then import-store root lock. A source

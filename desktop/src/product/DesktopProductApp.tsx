@@ -407,6 +407,7 @@ export function DesktopProductApp({
             kind: "native_folder_snapshot",
             ...(project && !creatingProject ? { projectId: project.project_id } : {}),
           })}
+          onCancelSource={(actionId) => provider.cancelProjectSource(actionId)}
           onSettleSource={(actionId, outcome) => provider.settleProjectSource(actionId, outcome)}
           onSyncSource={project?.source.kind === "native_folder_snapshot" ? () => act(() => provider.syncProjectWorkspace(project.project_id, resourceIntent(snapshot, project.etag))).then((result) => result.saved) : undefined}
         />
@@ -1085,6 +1086,7 @@ function SettingsDrawer({
   onRetryCapabilities,
   onSave,
   onSelectSource,
+  onCancelSource,
   onSettleSource,
   onSyncSource,
 }: {
@@ -1101,6 +1103,7 @@ function SettingsDrawer({
     pendingSourceActionId: string | null,
   ) => Promise<SaveAttemptResult>;
   onSelectSource: (actionId: string) => Promise<ProjectSourceV1>;
+  onCancelSource: (actionId: string) => Promise<void>;
   onSettleSource: (actionId: string, outcome: "adopt" | "discard") => Promise<void>;
   onSyncSource?: () => Promise<boolean>;
 }) {
@@ -1119,13 +1122,20 @@ function SettingsDrawer({
   const sourceSelectionGeneration = useRef(0);
   const sourceSelectionInFlight = useRef(false);
   const sourceSelectionMounted = useRef(true);
+  const activeSourceActionId = useRef<string | null>(null);
   const pendingSourceActionId = useRef<string | null>(null);
+  const onCancelSourceRef = useRef(onCancelSource);
+  onCancelSourceRef.current = onCancelSource;
   const onSettleSourceRef = useRef(onSettleSource);
   onSettleSourceRef.current = onSettleSource;
   const invalidateSourceSelection = useCallback(() => {
-    // Invalidation suppresses state application; only the request's finally releases the physical lock.
     sourceSelectionGeneration.current += 1;
   }, []);
+  const cancelActiveSource = useCallback(async () => {
+    const actionId = activeSourceActionId.current;
+    activeSourceActionId.current = null;
+    if (actionId !== null) await onCancelSource(actionId);
+  }, [onCancelSource]);
   const takePendingSourceAction = useCallback(() => {
     const actionId = pendingSourceActionId.current;
     pendingSourceActionId.current = null;
@@ -1137,11 +1147,13 @@ function SettingsDrawer({
   }, [onSettleSource, takePendingSourceAction]);
   const close = useCallback(() => {
     invalidateSourceSelection();
+    void cancelActiveSource();
     void settlePendingSource("discard").finally(onClose);
-  }, [invalidateSourceSelection, onClose, settlePendingSource]);
+  }, [cancelActiveSource, invalidateSourceSelection, onClose, settlePendingSource]);
   const guardedClose = useGuardedDrawerClose(dirty, close);
   const requestClose = () => {
     invalidateSourceSelection();
+    void cancelActiveSource();
     guardedClose.requestClose();
   };
   const dialogRef = useDialogFocus(requestClose);
@@ -1157,7 +1169,7 @@ function SettingsDrawer({
   const change = (setter: (value: string) => void) => (event: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement>) => { setter(event.target.value); markDirty(); };
   const reset = async () => {
     invalidateSourceSelection();
-    await settlePendingSource("discard");
+    await Promise.all([cancelActiveSource(), settlePendingSource("discard")]);
     setName(project?.name ?? "New research project");
     setTitle(project?.task.title ?? "Research task");
     setObjective(project?.task.objective ?? "");
@@ -1179,7 +1191,10 @@ function SettingsDrawer({
     const actionId = newActionId();
     try {
       await settlePendingSource("discard");
+      if (sourceSelectionGeneration.current !== generation) return;
+      activeSourceActionId.current = actionId;
       const selected = await onSelectSource(actionId);
+      if (activeSourceActionId.current === actionId) activeSourceActionId.current = null;
       if (sourceSelectionGeneration.current !== generation) {
         await onSettleSource(actionId, "discard");
         return;
@@ -1196,6 +1211,7 @@ function SettingsDrawer({
       if (sourceSelectionGeneration.current !== generation) return;
       if (!isWorkspaceSelectionCancelled(error)) setSourceError(userMessage(error));
     } finally {
+      if (activeSourceActionId.current === actionId) activeSourceActionId.current = null;
       sourceSelectionInFlight.current = false;
       if (sourceSelectionMounted.current) setSelectingSource(false);
     }
@@ -1205,6 +1221,9 @@ function SettingsDrawer({
     return () => {
       sourceSelectionMounted.current = false;
       sourceSelectionGeneration.current += 1;
+      const activeActionId = activeSourceActionId.current;
+      activeSourceActionId.current = null;
+      if (activeActionId !== null) void onCancelSourceRef.current(activeActionId);
       const actionId = takePendingSourceAction();
       if (actionId !== null) void onSettleSourceRef.current(actionId, "discard");
     };

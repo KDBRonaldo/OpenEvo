@@ -544,6 +544,7 @@ def test_native_workspace_route_is_private_idempotent_and_project_bound(tmp_path
         "selected_path": str(source_root.resolve()),
         "selected_device": source_root.stat().st_dev,
         "selected_inode": source_root.stat().st_ino,
+        "cancellation_token": "9c" * 32,
     }
 
     with TestClient(app) as client:
@@ -572,6 +573,7 @@ def test_native_workspace_route_is_private_idempotent_and_project_bound(tmp_path
             json={
                 **request,
                 "action_id": "native-source-action-0002",
+                "cancellation_token": "9d" * 32,
                 "project_id": project_id_for_native_import(
                     imported.json()["source"]["import_ref"]["import_id"]
                 ),
@@ -579,7 +581,15 @@ def test_native_workspace_route_is_private_idempotent_and_project_bound(tmp_path
         )
 
         assert imported.status_code == replayed.status_code == reselected.status_code == 201
-        assert imported.json() == replayed.json() == reselected.json()
+        assert imported.json() == replayed.json()
+        assert (
+            imported.json()["source"]["import_ref"]["content_sha256"]
+            == reselected.json()["source"]["import_ref"]["content_sha256"]
+        )
+        assert (
+            imported.json()["source"]["import_ref"]["import_id"]
+            != reselected.json()["source"]["import_ref"]["import_id"]
+        )
         payload = imported.json()
         assert set(payload) == {"schema_version", "source", "lease_token"}
         source = payload["source"]

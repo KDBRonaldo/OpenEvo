@@ -12,7 +12,7 @@ from pathlib import Path
 import re
 import stat
 import tempfile
-from typing import BinaryIO, Iterator
+from typing import BinaryIO, Callable, Iterator
 import unicodedata
 
 from desktop.sidecar.contracts.v1 import WorkspaceImportRefV1
@@ -35,6 +35,18 @@ _FILE_FLAGS = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
 
 class NativeWorkspaceArchiveError(ValueError):
     """The selected folder cannot become a deterministic workspace archive."""
+
+
+class NativeWorkspaceArchiveCancelled(NativeWorkspaceArchiveError):
+    """The native snapshot was cooperatively cancelled at a bounded checkpoint."""
+
+
+CancellationCheck = Callable[[], bool]
+
+
+def _check_cancel(cancel_check: CancellationCheck | None) -> None:
+    if cancel_check is not None and cancel_check():
+        raise NativeWorkspaceArchiveCancelled("workspace import was cancelled")
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,10 +98,16 @@ def _after_archive_write(_root_descriptor: int) -> None:
     """Test seam immediately before the source inventory is revalidated."""
 
 
-def _write_all(descriptor: int, payload: bytes) -> None:
+def _write_all(
+    descriptor: int,
+    payload: bytes,
+    *,
+    cancel_check: CancellationCheck | None = None,
+) -> None:
     view = memoryview(payload)
     offset = 0
     while offset < len(view):
+        _check_cancel(cancel_check)
         try:
             written = os.write(descriptor, view[offset:])
         except InterruptedError:
@@ -210,17 +228,13 @@ def _require_non_sparse_file(descriptor: int, size: int) -> None:
     except OSError as exc:
         if exc.errno == errno.ENXIO:
             raise NativeWorkspaceArchiveError("workspace sparse files are unsupported") from None
-        raise NativeWorkspaceArchiveError(
-            "workspace sparse-file detection failed closed"
-        ) from exc
+        raise NativeWorkspaceArchiveError("workspace sparse-file detection failed closed") from exc
     if first_data != 0:
         raise NativeWorkspaceArchiveError("workspace sparse files are unsupported")
     try:
         first_hole = _seek_extent(descriptor, 0, seek_hole)
     except OSError as exc:
-        raise NativeWorkspaceArchiveError(
-            "workspace sparse-file detection failed closed"
-        ) from exc
+        raise NativeWorkspaceArchiveError("workspace sparse-file detection failed closed") from exc
     if first_hole != size:
         if 0 <= first_hole < size:
             raise NativeWorkspaceArchiveError("workspace sparse files are unsupported")
@@ -232,7 +246,9 @@ def _open_selected_root(
     *,
     expected_device: int,
     expected_inode: int,
+    cancel_check: CancellationCheck | None = None,
 ) -> tuple[int, str]:
+    _check_cancel(cancel_check)
     if type(selected_path) is not str or not selected_path.startswith("/"):
         raise NativeWorkspaceArchiveError("workspace path must be absolute")
     try:
@@ -247,6 +263,7 @@ def _open_selected_root(
     descriptor = os.open("/", _DIRECTORY_FLAGS)
     try:
         for component in components:
+            _check_cancel(cancel_check)
             child = os.open(component, _DIRECTORY_FLAGS, dir_fd=descriptor)
             os.close(descriptor)
             descriptor = child
@@ -260,6 +277,7 @@ def _open_selected_root(
         display_name = components[-1]
         if len(display_name) > 256:
             raise NativeWorkspaceArchiveError("workspace display name is too long")
+        _check_cancel(cancel_check)
         return descriptor, display_name
     except BaseException:
         os.close(descriptor)
@@ -274,7 +292,9 @@ def _scan_directory(
     seen_directories: set[tuple[int, int]],
     extracted_bytes: list[int],
     entry_budget: list[int],
+    cancel_check: CancellationCheck | None,
 ) -> None:
+    _check_cancel(cancel_check)
     before = os.fstat(descriptor)
     directory_identity = _Identity.from_stat(before)
     directory_key = (before.st_dev, before.st_ino)
@@ -283,7 +303,10 @@ def _scan_directory(
     seen_directories.add(directory_key)
     try:
         with os.scandir(descriptor) as iterator:
-            children = list(islice(iterator, entry_budget[0] + 1))
+            children = []
+            for child in islice(iterator, entry_budget[0] + 1):
+                _check_cancel(cancel_check)
+                children.append(child)
     except OSError as exc:
         raise NativeWorkspaceArchiveError("workspace directory cannot be enumerated") from exc
     if len(children) > entry_budget[0]:
@@ -291,6 +314,7 @@ def _scan_directory(
     entry_budget[0] -= len(children)
     children.sort(key=lambda entry: os.fsencode(entry.name))
     for child in children:
+        _check_cancel(cancel_check)
         if type(child.name) is not str:
             raise NativeWorkspaceArchiveError("workspace path is not valid UTF-8")
         name = _safe_component(child.name)
@@ -323,6 +347,7 @@ def _scan_directory(
                     seen_directories=seen_directories,
                     extracted_bytes=extracted_bytes,
                     entry_budget=entry_budget,
+                    cancel_check=cancel_check,
                 )
                 if not _same_identity(os.fstat(child_descriptor), identity):
                     raise NativeWorkspaceArchiveError("workspace directory changed")
@@ -340,7 +365,9 @@ def _scan_directory(
             try:
                 if not _same_identity(os.fstat(file_descriptor), identity):
                     raise NativeWorkspaceArchiveError("workspace file changed")
+                _check_cancel(cancel_check)
                 _require_non_sparse_file(file_descriptor, value.st_size)
+                _check_cancel(cancel_check)
                 if not _same_identity(os.fstat(file_descriptor), identity):
                     raise NativeWorkspaceArchiveError("workspace file changed")
             finally:
@@ -359,11 +386,16 @@ def _scan_directory(
             )
         else:
             raise NativeWorkspaceArchiveError("workspace contains an unsupported entry type")
+    _check_cancel(cancel_check)
     if not _same_identity(os.fstat(descriptor), directory_identity):
         raise NativeWorkspaceArchiveError("workspace directory changed")
 
 
-def _scan(root_descriptor: int) -> tuple[tuple[_Entry, ...], int]:
+def _scan(
+    root_descriptor: int,
+    *,
+    cancel_check: CancellationCheck | None = None,
+) -> tuple[tuple[_Entry, ...], int]:
     entries: list[_Entry] = []
     extracted_bytes = [0]
     _scan_directory(
@@ -373,7 +405,9 @@ def _scan(root_descriptor: int) -> tuple[tuple[_Entry, ...], int]:
         seen_directories=set(),
         extracted_bytes=extracted_bytes,
         entry_budget=[MAX_WORKSPACE_ENTRIES],
+        cancel_check=cancel_check,
     )
+    _check_cancel(cancel_check)
     entries.sort(key=lambda entry: entry.header_path)
     if len({entry.logical_path for entry in entries}) != len(entries):
         raise NativeWorkspaceArchiveError("workspace contains duplicate paths")
@@ -392,10 +426,13 @@ def _open_entry(
     root_descriptor: int,
     entry: _Entry,
     directories: dict[str, _Entry],
+    *,
+    cancel_check: CancellationCheck | None = None,
 ) -> int:
     descriptor = os.dup(root_descriptor)
     try:
         for index, name in enumerate(entry.parts):
+            _check_cancel(cancel_check)
             final = index == len(entry.parts) - 1
             flags = _DIRECTORY_FLAGS if (not final or entry.directory) else _FILE_FLAGS
             child = os.open(name, flags, dir_fd=descriptor)
@@ -410,16 +447,29 @@ def _open_entry(
         raise
 
 
-def _write_archive(root_descriptor: int, entries: tuple[_Entry, ...], archive: int) -> None:
+def _write_archive(
+    root_descriptor: int,
+    entries: tuple[_Entry, ...],
+    archive: int,
+    *,
+    cancel_check: CancellationCheck | None = None,
+) -> None:
     directories = {entry.logical_path: entry for entry in entries if entry.directory}
     for entry in entries:
-        opened = _open_entry(root_descriptor, entry, directories)
+        _check_cancel(cancel_check)
+        opened = _open_entry(
+            root_descriptor,
+            entry,
+            directories,
+            cancel_check=cancel_check,
+        )
         try:
-            _write_all(archive, _tar_header(entry))
+            _write_all(archive, _tar_header(entry), cancel_check=cancel_check)
             if entry.directory:
                 continue
             offset = 0
             while offset < entry.identity.size:
+                _check_cancel(cancel_check)
                 try:
                     chunk = os.pread(
                         opened,
@@ -430,7 +480,7 @@ def _write_archive(root_descriptor: int, entries: tuple[_Entry, ...], archive: i
                     continue
                 if not chunk:
                     raise NativeWorkspaceArchiveError("workspace file changed while reading")
-                _write_all(archive, chunk)
+                _write_all(archive, chunk, cancel_check=cancel_check)
                 offset += len(chunk)
             if os.pread(opened, 1, entry.identity.size):
                 raise NativeWorkspaceArchiveError("workspace file changed while reading")
@@ -438,16 +488,22 @@ def _write_archive(root_descriptor: int, entries: tuple[_Entry, ...], archive: i
                 raise NativeWorkspaceArchiveError("workspace file changed while reading")
             padding = (-entry.identity.size) % _BLOCK_SIZE
             if padding:
-                _write_all(archive, bytes(padding))
+                _write_all(archive, bytes(padding), cancel_check=cancel_check)
         finally:
             os.close(opened)
-    _write_all(archive, bytes(2 * _BLOCK_SIZE))
+    _write_all(archive, bytes(2 * _BLOCK_SIZE), cancel_check=cancel_check)
 
 
-def _sha256(descriptor: int, size: int) -> str:
+def _sha256(
+    descriptor: int,
+    size: int,
+    *,
+    cancel_check: CancellationCheck | None = None,
+) -> str:
     digest = hashlib.sha256()
     offset = 0
     while offset < size:
+        _check_cancel(cancel_check)
         try:
             chunk = os.pread(descriptor, min(_COPY_BYTES, size - offset), offset)
         except InterruptedError:
@@ -469,6 +525,7 @@ def prepare_native_workspace(
     temporary_root: Path | str,
     expected_device: int,
     expected_inode: int,
+    cancel_check: CancellationCheck | None = None,
 ) -> Iterator[PreparedNativeWorkspace]:
     """Yield one private deterministic tar and its exact opaque contract ref."""
 
@@ -485,15 +542,25 @@ def prepare_native_workspace(
         selected_path,
         expected_device=expected_device,
         expected_inode=expected_inode,
+        cancel_check=cancel_check,
     )
     try:
-        entries, extracted_bytes = _scan(root_descriptor)
+        entries, extracted_bytes = _scan(root_descriptor, cancel_check=cancel_check)
         with tempfile.TemporaryFile(mode="w+b", dir=temporary_root) as stream:
             os.fchmod(stream.fileno(), 0o600)
-            _write_archive(root_descriptor, entries, stream.fileno())
+            _write_archive(
+                root_descriptor,
+                entries,
+                stream.fileno(),
+                cancel_check=cancel_check,
+            )
             os.fsync(stream.fileno())
             _after_archive_write(root_descriptor)
-            verified_entries, verified_extracted_bytes = _scan(root_descriptor)
+            _check_cancel(cancel_check)
+            verified_entries, verified_extracted_bytes = _scan(
+                root_descriptor,
+                cancel_check=cancel_check,
+            )
             if verified_entries != entries or verified_extracted_bytes != extracted_bytes:
                 raise NativeWorkspaceArchiveError("workspace changed while creating its snapshot")
             archive_status = os.fstat(stream.fileno())
@@ -506,7 +573,11 @@ def prepare_native_workspace(
                 raise NativeWorkspaceArchiveError("workspace archive size is invalid")
             import_ref = WorkspaceImportRefV1(
                 import_id=import_id,
-                content_sha256=_sha256(stream.fileno(), archive_status.st_size),
+                content_sha256=_sha256(
+                    stream.fileno(),
+                    archive_status.st_size,
+                    cancel_check=cancel_check,
+                ),
                 byte_size=archive_status.st_size,
                 entry_count=len(entries),
                 extracted_byte_size=extracted_bytes,
@@ -524,6 +595,7 @@ def prepare_native_workspace(
 
 
 __all__ = (
+    "NativeWorkspaceArchiveCancelled",
     "NativeWorkspaceArchiveError",
     "PreparedNativeWorkspace",
     "prepare_native_workspace",

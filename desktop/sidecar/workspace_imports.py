@@ -22,7 +22,8 @@ import secrets
 import stat
 import sys
 import threading
-from typing import BinaryIO, Iterator, Mapping
+import time
+from typing import BinaryIO, Callable, Iterator, Mapping
 import unicodedata
 
 from openevo.backend.contracts.v1.models import (
@@ -82,10 +83,23 @@ _RENAME_EXCL = 0x00000004
 _ROOT_OPEN_FLAGS = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_DIRECTORY
 _DIR_OPEN_FLAGS = _ROOT_OPEN_FLAGS
 _FILE_READ_FLAGS = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
+_LOCK_CANCEL_POLL_SECONDS = 0.01
 
 
 class WorkspaceImportError(RuntimeError):
     """Base error for the private workspace import store."""
+
+
+class WorkspaceImportCancelled(WorkspaceImportError):
+    """An ingest stopped cooperatively before or just after publication."""
+
+
+CancellationCheck = Callable[[], bool]
+
+
+def _check_cancel(cancel_check: CancellationCheck | None) -> None:
+    if cancel_check is not None and cancel_check():
+        raise WorkspaceImportCancelled("workspace import was cancelled")
 
 
 class WorkspaceArchiveValidationError(WorkspaceImportError, ValueError):
@@ -519,12 +533,19 @@ def _before_snapshot_commit(_root_descriptor: int, _archive_descriptor: int) -> 
 
 
 class _ArchiveReader:
-    def __init__(self, source: int, destination: int, source_size: int) -> None:
+    def __init__(
+        self,
+        source: int,
+        destination: int,
+        source_size: int,
+        cancel_check: CancellationCheck | None,
+    ) -> None:
         self.source = source
         self.destination = destination
         self.source_size = source_size
         self.offset = 0
         self.digest = hashlib.sha256()
+        self.cancel_check = cancel_check
 
     def read_exact(self, count: int, *, label: str) -> bytes:
         if count < 0 or self.offset + count > self.source_size:
@@ -532,6 +553,7 @@ class _ArchiveReader:
         chunks: list[bytes] = []
         remaining = count
         while remaining:
+            _check_cancel(self.cancel_check)
             try:
                 chunk = os.pread(
                     self.source,
@@ -565,10 +587,16 @@ class _ArchiveResult:
     extracted_byte_size: int
 
 
-def _source_sha256(descriptor: int, size: int) -> str:
+def _source_sha256(
+    descriptor: int,
+    size: int,
+    *,
+    cancel_check: CancellationCheck | None = None,
+) -> str:
     digest = hashlib.sha256()
     offset = 0
     while offset < size:
+        _check_cancel(cancel_check)
         try:
             chunk = os.pread(descriptor, min(size - offset, _COPY_CHUNK_BYTES), offset)
         except InterruptedError:
@@ -720,12 +748,14 @@ def _copy_and_validate_archive(
     *,
     max_entries: int,
     max_extracted_bytes: int,
+    cancel_check: CancellationCheck | None = None,
 ) -> _ArchiveResult:
-    reader = _ArchiveReader(source, destination, source_size)
+    reader = _ArchiveReader(source, destination, source_size, cancel_check)
     entries: dict[str, bool] = {}
     prior_header_path: bytes | None = None
     extracted_bytes = 0
     while True:
+        _check_cancel(cancel_check)
         block = reader.read_exact(_BLOCK_SIZE, label="header")
         if not any(block):
             second = reader.read_exact(_BLOCK_SIZE, label="end marker")
@@ -1654,14 +1684,37 @@ class WorkspaceImportStore:
             raise _DeterministicImportCorruption(f"{label} must be owner-only mode 0700")
 
     @contextmanager
-    def _locked_root(self) -> Iterator[int]:
-        with _thread_lock_for(self._root):
+    def _locked_root(
+        self,
+        *,
+        cancel_check: CancellationCheck | None = None,
+    ) -> Iterator[int]:
+        thread_lock = _thread_lock_for(self._root)
+        if cancel_check is None:
+            thread_lock.acquire()
+        else:
+            while True:
+                _check_cancel(cancel_check)
+                if thread_lock.acquire(timeout=_LOCK_CANCEL_POLL_SECONDS):
+                    break
+        try:
+            _check_cancel(cancel_check)
             self._verify_root_path_binding()
             descriptor = os.dup(self._root_descriptor)
             locked = False
             try:
-                fcntl.flock(descriptor, fcntl.LOCK_EX)
+                if cancel_check is None:
+                    fcntl.flock(descriptor, fcntl.LOCK_EX)
+                else:
+                    while True:
+                        _check_cancel(cancel_check)
+                        try:
+                            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                            break
+                        except BlockingIOError:
+                            time.sleep(_LOCK_CANCEL_POLL_SECONDS)
                 locked = True
+                _check_cancel(cancel_check)
                 opened = os.fstat(descriptor)
                 self._require_private_directory(opened, label="workspace import root")
                 if (opened.st_dev, opened.st_ino) != self._root_identity:
@@ -1675,6 +1728,8 @@ class WorkspaceImportStore:
                         fcntl.flock(descriptor, fcntl.LOCK_UN)
                 finally:
                     os.close(descriptor)
+        finally:
+            thread_lock.release()
 
     def _verify_root_path_binding(self) -> None:
         try:
@@ -1714,8 +1769,7 @@ class WorkspaceImportStore:
                 (key_status.st_dev, key_status.st_ino) != self._auth_key_identity
                 or not _same_inode(key_status, current_key)
                 or key_status.st_size != _AUTH_KEY_BYTES
-                or os.pread(self._auth_key_descriptor, _AUTH_KEY_BYTES, 0)
-                != self._auth_key
+                or os.pread(self._auth_key_descriptor, _AUTH_KEY_BYTES, 0) != self._auth_key
                 or _identity(os.fstat(self._auth_key_descriptor)) != _identity(key_status)
             ):
                 raise WorkspaceImportIntegrityError(
@@ -1791,9 +1845,7 @@ class WorkspaceImportStore:
             marker,
             self._pending_lease_marker(import_ref, ownership),
         ):
-            raise _DeterministicImportCorruption(
-                "workspace import pending lease state is invalid"
-            )
+            raise _DeterministicImportCorruption("workspace import pending lease state is invalid")
         return True
 
     def ingest(
@@ -1818,6 +1870,7 @@ class WorkspaceImportStore:
         *,
         ownership: WorkspaceImportOwnership,
         import_id: str | None = None,
+        cancel_check: CancellationCheck | None = None,
     ) -> PendingWorkspaceImport:
         """Persist one native-picker import under a private pending lease."""
 
@@ -1826,6 +1879,7 @@ class WorkspaceImportStore:
             ownership=ownership,
             import_id=import_id,
             pending=True,
+            cancel_check=cancel_check,
         )
         return PendingWorkspaceImport(
             import_ref=import_ref,
@@ -1839,11 +1893,13 @@ class WorkspaceImportStore:
         ownership: WorkspaceImportOwnership,
         import_id: str | None = None,
         pending: bool,
+        cancel_check: CancellationCheck | None = None,
     ) -> WorkspaceImportRefV1:
         """Shared validated publication path for adopted and pending imports."""
 
         if not isinstance(ownership, WorkspaceImportOwnership):
             raise TypeError("ingest requires WorkspaceImportOwnership")
+        _check_cancel(cancel_check)
         source_descriptor = self._source_descriptor(source)
         before = os.fstat(source_descriptor)
         if not stat.S_ISREG(before.st_mode):
@@ -1851,7 +1907,11 @@ class WorkspaceImportStore:
         if before.st_size < 1024 or before.st_size > self._max_archive_bytes:
             raise WorkspaceArchiveValidationError("workspace archive byte-size budget exceeded")
         source_identity = _identity(before)
-        source_digest = _source_sha256(source_descriptor, before.st_size)
+        source_digest = _source_sha256(
+            source_descriptor,
+            before.st_size,
+            cancel_check=cancel_check,
+        )
         if _identity(os.fstat(source_descriptor)) != source_identity:
             raise WorkspaceArchiveValidationError(
                 "workspace import source identity changed while reading"
@@ -1863,18 +1923,25 @@ class WorkspaceImportStore:
         temporary_name = f"{_TEMP_PREFIX}{secrets.token_hex(24)}"
         temporary_identity: tuple[int, int] | None = None
         published = False
-        with self._locked_root() as root_descriptor:
+        with self._locked_root(cancel_check=cancel_check) as root_descriptor:
             retained, existing_ref = self._retained_usage(
                 root_descriptor,
                 requested_import_id=import_id,
                 requested_ownership=ownership,
                 requested_size=before.st_size,
                 requested_digest=source_digest,
+                cancel_check=cancel_check,
             )
             if existing_ref is not None:
+                _check_cancel(cancel_check)
                 if (
                     _identity(os.fstat(source_descriptor)) != source_identity
-                    or _source_sha256(source_descriptor, before.st_size) != source_digest
+                    or _source_sha256(
+                        source_descriptor,
+                        before.st_size,
+                        cancel_check=cancel_check,
+                    )
+                    != source_digest
                     or _identity(os.fstat(source_descriptor)) != source_identity
                 ):
                     raise WorkspaceArchiveValidationError(
@@ -1940,11 +2007,17 @@ class WorkspaceImportStore:
                         before.st_size,
                         max_entries=self._max_entries,
                         max_extracted_bytes=self._max_extracted_bytes,
+                        cancel_check=cancel_check,
                     )
                 except WorkspaceArchiveValidationError as exc:
                     if (
                         _identity(os.fstat(source_descriptor)) != source_identity
-                        or _source_sha256(source_descriptor, before.st_size) != source_digest
+                        or _source_sha256(
+                            source_descriptor,
+                            before.st_size,
+                            cancel_check=cancel_check,
+                        )
+                        != source_digest
                     ):
                         raise WorkspaceArchiveValidationError(
                             "workspace import source identity changed while reading"
@@ -1978,7 +2051,12 @@ class WorkspaceImportStore:
                 after = os.fstat(source_descriptor)
                 if (
                     _identity(after) != source_identity
-                    or _source_sha256(source_descriptor, before.st_size) != result.content_sha256
+                    or _source_sha256(
+                        source_descriptor,
+                        before.st_size,
+                        cancel_check=cancel_check,
+                    )
+                    != result.content_sha256
                     or _identity(os.fstat(source_descriptor)) != source_identity
                 ):
                     raise WorkspaceArchiveValidationError(
@@ -2024,7 +2102,9 @@ class WorkspaceImportStore:
                     os.close(metadata_descriptor)
                 _after_metadata_fsync(temporary_descriptor)
                 os.fsync(temporary_descriptor)
+                _check_cancel(cancel_check)
                 _before_import_publish(root_descriptor, import_id)
+                _check_cancel(cancel_check)
                 self._verify_directory_binding(
                     root_descriptor,
                     temporary_name,
@@ -2034,7 +2114,9 @@ class WorkspaceImportStore:
                 self._validate_open_import_contents(
                     temporary_descriptor,
                     stored_metadata,
+                    cancel_check=cancel_check,
                 )
+                _check_cancel(cancel_check)
                 _rename_noreplace(temporary_name, import_id, directory_fd=root_descriptor)
                 published = True
                 self._verify_directory_binding(
@@ -2046,9 +2128,11 @@ class WorkspaceImportStore:
                 os.fsync(root_descriptor)
                 _after_import_publish(root_descriptor, import_id)
                 try:
+                    _check_cancel(cancel_check)
                     self._validate_open_import_contents(
                         temporary_descriptor,
                         stored_metadata,
+                        cancel_check=cancel_check,
                     )
                     self._verify_directory_binding(
                         root_descriptor,
@@ -2056,6 +2140,8 @@ class WorkspaceImportStore:
                         temporary_descriptor,
                         label="published workspace import",
                     )
+                except WorkspaceImportCancelled:
+                    return import_ref
                 except _DeterministicImportCorruption:
                     self._discard_flat_directory(
                         root_descriptor,
@@ -2108,6 +2194,7 @@ class WorkspaceImportStore:
         requested_ownership: WorkspaceImportOwnership | None = None,
         requested_size: int | None = None,
         requested_digest: str | None = None,
+        cancel_check: CancellationCheck | None = None,
     ) -> tuple[_RetainedUsage, WorkspaceImportRefV1 | None]:
         budget = _ScanBudget(
             remaining_nodes=self._reconcile_max_nodes,
@@ -2121,9 +2208,11 @@ class WorkspaceImportStore:
         with os.scandir(root_descriptor) as entries:
             names = []
             for entry in entries:
+                _check_cancel(cancel_check)
                 budget.charge_node(entry.name)
                 names.append(entry.name)
         for name in names:
+            _check_cancel(cancel_check)
             if _IMPORT_ID_RE.fullmatch(name) is None:
                 raise WorkspaceImportIntegrityError(
                     "workspace import store requires reconciliation before ingest"
@@ -2134,6 +2223,7 @@ class WorkspaceImportStore:
                     name,
                     None,
                     budget=budget,
+                    cancel_check=cancel_check,
                 )
             )
             try:
@@ -2358,9 +2448,7 @@ class WorkspaceImportStore:
                 metadata.metadata_device,
                 metadata.metadata_inode,
             ):
-                raise _DeterministicImportCorruption(
-                    "workspace import metadata identity changed"
-                )
+                raise _DeterministicImportCorruption("workspace import metadata identity changed")
             authenticated = _authenticated_metadata(metadata, self._auth_key)
             if not hmac.compare_digest(
                 metadata.authentication,
@@ -2382,7 +2470,9 @@ class WorkspaceImportStore:
         archive_token: str,
         ownership: WorkspaceImportOwnership,
         budget: _ScanBudget | None = None,
+        cancel_check: CancellationCheck | None = None,
     ) -> int:
+        _check_cancel(cancel_check)
         try:
             descriptor = os.open(_ARCHIVE_NAME, _FILE_READ_FLAGS, dir_fd=directory_descriptor)
         except OSError as exc:
@@ -2407,9 +2497,11 @@ class WorkspaceImportStore:
                 raise _DeterministicImportCorruption("workspace import archive size changed")
             digests: list[str] = []
             for _attempt in range(2):
+                _check_cancel(cancel_check)
                 digest = hashlib.sha256()
                 remaining = before.st_size
                 while remaining:
+                    _check_cancel(cancel_check)
                     chunk = os.read(descriptor, min(remaining, _COPY_CHUNK_BYTES))
                     if not chunk:
                         raise WorkspaceImportIntegrityError(
@@ -2446,28 +2538,26 @@ class WorkspaceImportStore:
         self,
         directory_descriptor: int,
         expected_metadata: _StoredMetadata,
+        *,
+        cancel_check: CancellationCheck | None = None,
     ) -> None:
+        _check_cancel(cancel_check)
         names: set[str] = set()
         with os.scandir(directory_descriptor) as entries:
             for entry in entries:
+                _check_cancel(cancel_check)
                 names.add(entry.name)
         if names != {_ARCHIVE_NAME, _METADATA_NAME}:
-            raise _DeterministicImportCorruption(
-                "workspace import directory shape is invalid"
-            )
+            raise _DeterministicImportCorruption("workspace import directory shape is invalid")
         directory_status = os.fstat(directory_descriptor)
         if (directory_status.st_dev, directory_status.st_ino) != (
             expected_metadata.directory_device,
             expected_metadata.directory_inode,
         ):
-            raise _DeterministicImportCorruption(
-                "workspace import directory identity changed"
-            )
+            raise _DeterministicImportCorruption("workspace import directory identity changed")
         observed_metadata = self._load_metadata(directory_descriptor)
         if observed_metadata != expected_metadata:
-            raise _DeterministicImportCorruption(
-                "workspace import persisted metadata changed"
-            )
+            raise _DeterministicImportCorruption("workspace import persisted metadata changed")
         archive_descriptor = self._open_verified_archive(
             directory_descriptor,
             expected_metadata.import_ref,
@@ -2477,6 +2567,7 @@ class WorkspaceImportStore:
             ),
             archive_token=expected_metadata.archive_token,
             ownership=expected_metadata.ownership,
+            cancel_check=cancel_check,
         )
         os.close(archive_descriptor)
         if _identity(os.fstat(directory_descriptor)) != _identity(directory_status):
@@ -2492,14 +2583,17 @@ class WorkspaceImportStore:
         *,
         expected_ownership: WorkspaceImportOwnership | None = None,
         budget: _ScanBudget | None = None,
+        cancel_check: CancellationCheck | None = None,
     ) -> tuple[WorkspaceImportRefV1, WorkspaceImportOwnership, int, tuple[int, int]]:
         self._require_store_import_id(import_id)
+        _check_cancel(cancel_check)
         directory_descriptor = self._open_import_directory(root_descriptor, import_id)
         archive_descriptor: int | None = None
         try:
             names: set[str] = set()
             with os.scandir(directory_descriptor) as entries:
                 for entry in entries:
+                    _check_cancel(cancel_check)
                     if budget is not None:
                         budget.charge_node(entry.name)
                     names.add(entry.name)
@@ -2530,6 +2624,7 @@ class WorkspaceImportStore:
                 archive_token=metadata.archive_token,
                 ownership=metadata.ownership,
                 budget=budget,
+                cancel_check=cancel_check,
             )
             self._verify_directory_binding(
                 root_descriptor,
@@ -2727,8 +2822,7 @@ class WorkspaceImportStore:
                 ) from exc
             unlinked_after = os.fstat(reader)
             if (
-                (unlinked_before.st_dev, unlinked_before.st_ino)
-                != (opened.st_dev, opened.st_ino)
+                (unlinked_before.st_dev, unlinked_before.st_ino) != (opened.st_dev, opened.st_ino)
                 or unlinked_before.st_nlink != 0
                 or _identity(unlinked_before) != _identity(unlinked_after)
                 or unlinked_digest != import_ref.content_sha256
@@ -3052,11 +3146,7 @@ class WorkspaceImportStore:
             tuple[WorkspaceImportRefV1, WorkspaceImportOwnership],
         ] = {}
         for import_id, value in references.items():
-            if (
-                type(import_id) is not str
-                or not isinstance(value, tuple)
-                or len(value) != 2
-            ):
+            if type(import_id) is not str or not isinstance(value, tuple) or len(value) != 2:
                 raise TypeError("workspace import reference entry is invalid")
             import_ref, ownership = value
             self._require_external_import_ref(import_ref, operation="reconcile")
@@ -3088,7 +3178,9 @@ class WorkspaceImportStore:
                         (entry.name, (value.st_dev, value.st_ino), value.st_mode)
                     )
             observed_entries.sort(key=lambda value: os.fsencode(value[0]))
-            observed_by_name = {name: (identity, mode) for name, identity, mode in observed_entries}
+            observed_by_name = {
+                name: (identity, mode) for name, identity, mode in observed_entries
+            }
 
             # Durable references are authoritative. Validate all of them before
             # performing any destructive orphan or corruption cleanup.
@@ -3196,6 +3288,7 @@ class WorkspaceImportStore:
 __all__ = [
     "PendingWorkspaceImport",
     "WorkspaceArchiveValidationError",
+    "WorkspaceImportCancelled",
     "WorkspaceImportError",
     "WorkspaceImportIntegrityError",
     "WorkspaceImportNotFoundError",

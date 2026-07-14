@@ -749,6 +749,30 @@ describe("DesktopProductApp", () => {
     expect(button("Save").disabled).toBe(false);
   });
 
+  it("cancels an in-flight native ingest and closes without waiting for its original promise", async () => {
+    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
+    const pending = deferred<ProjectSourceV1>();
+    const selectSource = vi.spyOn(provider, "selectProjectSource").mockImplementation(() => pending.promise);
+    const cancelSource = vi.spyOn(provider, "cancelProjectSource").mockImplementation(async () => {
+      pending.reject({
+        code: "workspace_selection_cancelled",
+        message: "No research folder was selected.",
+      });
+    });
+    root = await renderProduct(provider);
+
+    await clickAria("Project settings");
+    setInput("Objective", "Cancel this in-flight snapshot.");
+    await clickElement(button("Folder snapshot"));
+    const actionId = selectSource.mock.calls[0]?.[0].actionId;
+    await clickAria("Close settings");
+    expect(cancelSource).toHaveBeenCalledWith(actionId);
+    await clickButton("Discard changes");
+    await flush();
+
+    expect(document.querySelector('[role="dialog"]')).toBeNull();
+  });
+
   it("ignores a picker completion after a close request and a later selection wins", async () => {
     provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
     const first = deferred<ProjectSourceV1>();
@@ -762,6 +786,7 @@ describe("DesktopProductApp", () => {
       .mockImplementationOnce(() => first.promise)
       .mockResolvedValueOnce({ ...selected, display_name: "Current research folder" });
     const settleSource = vi.spyOn(provider, "settleProjectSource");
+    const cancelSource = vi.spyOn(provider, "cancelProjectSource");
     root = await renderProduct(provider);
 
     await clickAria("Project settings");
@@ -770,6 +795,7 @@ describe("DesktopProductApp", () => {
     await clickElement(folderButton);
     await clickAria("Close settings");
     expect(screenText()).toContain("Discard unsaved changes?");
+    expect(cancelSource).toHaveBeenCalledWith(selectSource.mock.calls[0]?.[0].actionId);
     await clickButton("Keep editing");
 
     expect(folderButton.disabled).toBe(true);

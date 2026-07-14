@@ -13,6 +13,9 @@ on:
       - "scripts/ci/write_sha256.py"
       - "tests/ci/test_build_sidecar.py"
       - "tests/ci/test_check_openevo_release.py"
+      - "tests/openevo/sidecar/test_native_workspace.py"
+      - "tests/openevo/sidecar/test_workspace_import_lifecycle.py"
+      - "tests/openevo/sidecar/test_workspace_imports.py"
 
 jobs:
   desktop-tests:
@@ -128,6 +131,14 @@ jobs:
         run: |
           uv sync --frozen --group dev
           echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
+
+      - name: Exercise macOS APFS workspace ingest and store lifecycle
+        run: |
+          uv run python -m pytest \
+            tests/openevo/sidecar/test_native_workspace.py \
+            tests/openevo/sidecar/test_workspace_imports.py \
+            tests/openevo/sidecar/test_workspace_import_lifecycle.py \
+            -q
 
       - name: Build frontend and FD-aware PyInstaller externalBin
         working-directory: desktop

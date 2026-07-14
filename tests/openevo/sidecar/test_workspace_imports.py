@@ -21,6 +21,7 @@ from desktop.sidecar import workspace_imports as workspace_imports_module
 from desktop.sidecar.workspace_imports import (
     PendingWorkspaceImport,
     WorkspaceArchiveValidationError,
+    WorkspaceImportCancelled,
     WorkspaceImportError,
     WorkspaceImportIntegrityError,
     WorkspaceImportNotFoundError,
@@ -870,10 +871,14 @@ def test_ingest_revalidates_persisted_files_after_atomic_publish(
     store = WorkspaceImportStore(root)
 
     def rewrite_published_file(_root_descriptor: int, import_id: str) -> None:
-        path = root / import_id / (
-            workspace_imports_module._ARCHIVE_NAME
-            if target == "archive"
-            else workspace_imports_module._METADATA_NAME
+        path = (
+            root
+            / import_id
+            / (
+                workspace_imports_module._ARCHIVE_NAME
+                if target == "archive"
+                else workspace_imports_module._METADATA_NAME
+            )
         )
         with path.open("r+b", buffering=0) as stream:
             if target == "archive":
@@ -1624,6 +1629,109 @@ def test_publish_crash_is_reclaimed_by_exact_ownership_retry(
     assert [entry.name for entry in root.iterdir()] == [recovered.import_id]
     with restarted.resolve(recovered, ownership=owner) as stream:
         assert stream.read() == archive
+
+
+def test_cancel_before_publication_removes_the_bound_temporary_import(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "imports"
+    store = WorkspaceImportStore(root)
+    archive = _simple_archive(b"cancel before publication")
+    source = _source(tmp_path, archive)
+    owner = _new_ownership(project_id="project-cancel-before")
+    cancelled = False
+
+    def cancel_at_publish(_root_descriptor: int, _import_id: str) -> None:
+        nonlocal cancelled
+        cancelled = True
+
+    monkeypatch.setattr(workspace_imports_module, "_before_import_publish", cancel_at_publish)
+    with source.open("rb", buffering=0) as stream:
+        with pytest.raises(WorkspaceImportCancelled):
+            store.ingest_pending(
+                stream,
+                ownership=owner,
+                import_id="workspace-import-" + ("1a" * 24),
+                cancel_check=lambda: cancelled,
+            )
+
+    assert list(root.iterdir()) == []
+
+
+def test_cancel_after_publication_returns_a_recoverable_pending_lease(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "imports"
+    store = WorkspaceImportStore(root)
+    archive = _simple_archive(b"cancel after publication")
+    source = _source(tmp_path, archive)
+    owner = _new_ownership(project_id="project-cancel-after")
+    cancelled = False
+
+    def cancel_after_publish(_root_descriptor: int, _import_id: str) -> None:
+        nonlocal cancelled
+        cancelled = True
+
+    monkeypatch.setattr(workspace_imports_module, "_after_import_publish", cancel_after_publish)
+    with source.open("rb", buffering=0) as stream:
+        pending = store.ingest_pending(
+            stream,
+            ownership=owner,
+            import_id="workspace-import-" + ("2b" * 24),
+            cancel_check=lambda: cancelled,
+        )
+
+    assert (root / pending.import_ref.import_id).is_dir()
+    store.discard_pending(
+        pending.import_ref,
+        ownership=owner,
+        lease_token=pending.lease_token,
+    )
+    assert list(root.iterdir()) == []
+
+
+def test_cancel_interrupts_wait_for_the_in_process_import_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = WorkspaceImportStore(tmp_path / "imports")
+    source = _source(tmp_path, _simple_archive(b"cancel lock wait"))
+    ownership = _new_ownership(project_id="project-cancel-lock-wait")
+    source_hashed = threading.Event()
+    cancelled = threading.Event()
+    errors: list[BaseException] = []
+    original_sha256 = workspace_imports_module._source_sha256
+
+    def observed_sha256(*args, **kwargs):
+        result = original_sha256(*args, **kwargs)
+        source_hashed.set()
+        return result
+
+    def ingest(stream) -> None:
+        try:
+            store.ingest_pending(
+                stream,
+                ownership=ownership,
+                cancel_check=cancelled.is_set,
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    monkeypatch.setattr(workspace_imports_module, "_source_sha256", observed_sha256)
+    thread_lock = workspace_imports_module._thread_lock_for(store._root)
+    with thread_lock, source.open("rb", buffering=0) as stream:
+        worker = threading.Thread(target=ingest, args=(stream,))
+        worker.start()
+        assert source_hashed.wait(timeout=5)
+        cancelled.set()
+        worker.join(timeout=1)
+        assert not worker.is_alive()
+
+    assert len(errors) == 1
+    assert isinstance(errors[0], WorkspaceImportCancelled)
+    assert list((tmp_path / "imports").iterdir()) == []
 
 
 def test_resolve_rejects_same_uid_in_place_rewrite_before_snapshot_commit(

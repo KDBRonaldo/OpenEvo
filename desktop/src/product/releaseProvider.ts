@@ -15,6 +15,7 @@ import { DESKTOP_PRODUCT_RELEASE_CONTRACT } from "./releaseContract";
 export interface ReleaseNativeBridge {
   bootstrap(): Promise<unknown>;
   selectProjectSource(intent: ProjectSourceSelectionIntent): Promise<unknown>;
+  cancelProjectSource(actionId: string): Promise<unknown>;
   settleProjectSource(actionId: string, outcome: "adopt" | "discard"): Promise<unknown>;
   configureCredential(
     profileId: string,
@@ -28,6 +29,7 @@ export interface ReleaseProviderAdapterContext {
   readonly client: DesktopApiClientV1;
   readonly native: {
     selectProjectSource(intent: ProjectSourceSelectionIntent): Promise<ProjectSourceV1>;
+    cancelProjectSource(actionId: string): Promise<void>;
     settleProjectSource(actionId: string, outcome: "adopt" | "discard"): Promise<void>;
     configureCredential(
       profileId: string,
@@ -51,6 +53,7 @@ const tauriNativeBridge: ReleaseNativeBridge = {
     actionId: intent.actionId,
     ...(intent.projectId === undefined ? {} : { projectId: intent.projectId }),
   }),
+  cancelProjectSource: (actionId) => invoke("cancel_project_source", { actionId }),
   settleProjectSource: (actionId, outcome) => invoke("settle_project_source", {
     actionId,
     outcome,
@@ -91,6 +94,9 @@ export async function createReleaseDesktopProductProvider(
           throw new DesktopContractError("Native project source does not match the requested kind");
         }
         return source;
+      },
+      cancelProjectSource: async (actionId) => {
+        await native.cancelProjectSource(actionId);
       },
       settleProjectSource: async (actionId, outcome) => {
         await native.settleProjectSource(actionId, outcome);

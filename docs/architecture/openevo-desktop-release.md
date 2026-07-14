@@ -296,15 +296,27 @@ the observed store and fail startup closed.
 Picker snapshots have an explicit pending lease before they become project
 authority. The lease is persisted as a keyed, one-way archive-xattr marker and
 the raw token exists only in the hidden sidecar response and Rust host memory.
-Rust caps that map at 64 entries and exposes only action-ID `adopt`/`discard`
-commands to React. A create or patch adopts only after its provider transaction
-is durable. Drawer close, reset, source replacement, stale completion, and save
-failure all request discard. Discard takes the provider reference guard first,
+Rust caps that map at 64 entries and exposes only action-ID
+`cancel`/`adopt`/`discard` commands to React. A create or patch adopts only after
+its provider transaction is durable. Drawer close, reset, source replacement,
+stale completion, and save failure all request discard. Discard takes the provider reference guard first,
 rereads the full durable reference set, and then takes the import lock; a
 concurrent commit therefore either retains/adopts the exact import or fails its
 own pre-commit verification after an earlier discard. Startup adopts referenced
 pending markers and removes unreferenced ones within the retained and pending
 count/byte capacities.
+
+Picker cancellation is a separate hidden action lifecycle. Rust generates a
+per-action secret, releases the active claim immediately, and calls the private
+cancel route; neither the secret nor route enters the renderer contract. Bounded
+cancel-before-start tombstones close command-order races in both native host and
+sidecar. The import HTTP reader polls cancellation and stops waiting within a
+three-second grace period instead of retaining the 300-second import deadline.
+Python checks the same operation identity during scan, archive I/O, hashing,
+validation, and cancellable acquisition of both in-process and cross-process
+store locks. The atomic no-replace publish is the linearization point. Before it,
+cancellation quarantines/removes only the known temporary inode; after it, ingest
+returns the recoverable lease so Rust can remember it before guarded discard.
 
 This is not an OS isolation boundary against an arbitrary process running as
 the same UID. Such a process can read the durable authentication key and can
@@ -339,16 +351,22 @@ whose reported allocation is smaller than logical size are explicitly unsupporte
 because the bridge cannot prove them non-sparse.
 The deterministic tar is an unlinked mode-`0600` temporary regular file before
 `WorkspaceImportStore.ingest_pending` sees it.
+The macOS workflow executes the focused scanner/store/lifecycle suite on APFS,
+including a fully allocated ordinary file and an 8-MiB logical sparse file with
+only one 4-KiB write; Linux continues to run the same portable suite and its
+existing extent semantics.
 
 The private action deterministically selects the opaque import ID, so an exact
 retry with the same folder bytes converges and a changed body conflicts. A new
 project ID derives from that opaque import ID; existing-project replacement
 passes the saved project ID only on the private native boundary. Ownership is
-then reproducible from project ID and archive digest for verification and later
-Core upload. The private route is excluded from OpenAPI, uses the separate
-process-owned native handoff credential rather than the renderer's Desktop session
-token, bounds the JSON request before parsing, and returns only the frozen
-path-free `ProjectSourceV1` shape.
+then reproducible from the project/import owner, opaque import ID, and archive
+digest for verification and later Core upload. This lets distinct projects own
+identical archives without sharing operation/idempotency authority while exact
+same-action replay converges across restart. The private route is excluded from
+OpenAPI, uses the separate process-owned native handoff credential rather than
+the renderer's Desktop session token, bounds the JSON request before parsing,
+and returns only the frozen path-free `ProjectSourceV1` shape.
 
 The child calls `setsid`, so its PID is also the ID of a new session and process
 group. Before exec, it forks a minimal watchdog in that group. The native host

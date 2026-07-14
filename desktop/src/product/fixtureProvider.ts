@@ -447,6 +447,8 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
     });
   }
 
+  async cancelProjectSource(_actionId: string): Promise<void> {}
+
   async settleProjectSource(
     _actionId: string,
     _outcome: "adopt" | "discard",
