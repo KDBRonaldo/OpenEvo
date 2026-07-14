@@ -1049,6 +1049,43 @@ def test_mapped_revision_authority_rejects_nonmonotonic_core_head(
     assert len(fake_core.patch_requests) == patch_count
 
 
+def test_mapped_revision_authority_rejects_unproven_two_generation_jump() -> None:
+    local_project = _local_project()
+    first, persistence, fake_core, _ = _bridge(local_project)
+    first.activate_project(local_project, idempotency_key="mapped-jump-base-0001")
+    first.close()
+    mapping = persistence.mapping
+    assert mapping is not None
+
+    jumped_revision = core_v1.RevisionRefV1(
+        id="revision-2",
+        project_id=CORE_PROJECT_ID,
+        generation=2,
+        manifest_sha256="2" * 64,
+    )
+    jumped_etag = '"' + "2" * 64 + '"'
+    fake_core.active_revision = jumped_revision
+    fake_core.project_etag = jumped_etag
+    fake_core.project_updated_at = "2026-07-14T12:12:00Z"
+    fake_core.head = _head(active_revision=jumped_revision, etag=jumped_etag)
+    history_count = len(persistence.mapping_history)
+    patch_count = len(fake_core.patch_requests)
+    second, _, _, _ = _bridge(
+        local_project,
+        persistence=persistence,
+        fake_core=fake_core,
+    )
+
+    with pytest.raises(DesktopCoreBridgeErrorV1) as exc_info:
+        second.activate_project(local_project, idempotency_key="mapped-jump-reject-0002")
+
+    assert exc_info.value.error.code == "core_project_revision_authority_mismatch"
+    assert persistence.mapping == mapping
+    assert persistence.mapping.project_etag != jumped_etag
+    assert len(persistence.mapping_history) == history_count
+    assert len(fake_core.patch_requests) == patch_count
+
+
 def test_import_activation_reads_only_opaque_archive_and_finalizes_workspace() -> None:
     local_project = _local_project(imported=True)
     bridge, persistence, fake_core, _ = _bridge(local_project)
@@ -2002,6 +2039,155 @@ def test_finalize_after_crash_accepts_direct_revision_successor() -> None:
     assert persistence.mapping.active_revision == successor
     assert persistence.mapping.mapping_generation == mapping_o.mapping_generation + 1
     assert persistence.patch_operation is None
+
+
+def test_finalize_after_crash_accepts_durable_two_edge_revision_chain() -> None:
+    edited, archive, persistence, fake_core, mapping_o = _prepare_finalized_import_patch_crash(
+        finalize_revision=REVISION
+    )
+    _replace_finalize_revision_authority(persistence, REVISION_1)
+    successor = core_v1.RevisionRefV1(
+        id="revision-2",
+        project_id=CORE_PROJECT_ID,
+        generation=2,
+        manifest_sha256="2" * 64,
+    )
+    successor_etag = '"' + "2" * 64 + '"'
+    fake_core.active_revision = successor
+    fake_core.project_etag = successor_etag
+    fake_core.project_updated_at = "2026-07-14T12:47:00Z"
+    fake_core.head = _head(active_revision=successor, etag=successor_etag)
+    recovered, _, _, _ = _bridge(
+        edited,
+        persistence=persistence,
+        fake_core=fake_core,
+        archive_source=FakeArchiveSource(archive),
+    )
+
+    activation = recovered.activate_project(
+        edited,
+        idempotency_key="finalize-revision-chain-0003",
+    )
+
+    assert activation.core_project.active_revision == successor
+    assert persistence.mapping is not None
+    assert persistence.mapping.active_revision == successor
+    assert persistence.mapping.mapping_generation == mapping_o.mapping_generation + 1
+    assert persistence.patch_operation is None
+
+
+def test_durable_revision_chain_rejects_tampered_finalize_outcome() -> None:
+    edited, archive, persistence, fake_core, mapping_o = _prepare_finalized_import_patch_crash(
+        finalize_revision=REVISION
+    )
+    _replace_finalize_revision_authority(persistence, REVISION_1)
+    operation = persistence.operation
+    assert operation is not None
+    authority = operation.workspace_upload_finalize
+    assert authority is not None
+    tampered_snapshot = _snapshot(
+        "tampered-finalize-project-snapshot",
+        core_v1.SnapshotKind.PROJECT,
+        "9",
+    )
+    tampered_project = core_v1.ProjectV1.model_validate(
+        authority.outcome.project.model_copy(
+            update={"current_project_snapshot": tampered_snapshot}
+        ).model_dump(),
+        strict=True,
+    )
+    tampered_outcome = core_v1.WorkspaceUploadFinalizeResponseV1.model_validate(
+        authority.outcome.model_copy(update={"project": tampered_project}).model_dump(),
+        strict=True,
+    )
+    persistence.operation = replace(
+        operation,
+        workspace_upload_finalize=replace(authority, outcome=tampered_outcome),
+    )
+    successor = core_v1.RevisionRefV1(
+        id="revision-2",
+        project_id=CORE_PROJECT_ID,
+        generation=2,
+        manifest_sha256="2" * 64,
+    )
+    successor_etag = '"' + "2" * 64 + '"'
+    fake_core.active_revision = successor
+    fake_core.project_etag = successor_etag
+    fake_core.project_updated_at = "2026-07-14T12:47:00Z"
+    fake_core.head = _head(active_revision=successor, etag=successor_etag)
+    history_count = len(persistence.mapping_history)
+    workspace_mutations = _workspace_mutation_count(fake_core)
+    recovered, _, _, _ = _bridge(
+        edited,
+        persistence=persistence,
+        fake_core=fake_core,
+        archive_source=FakeArchiveSource(archive),
+    )
+
+    with pytest.raises(DesktopCoreBridgeErrorV1) as exc_info:
+        recovered.activate_project(
+            edited,
+            idempotency_key="finalize-tampered-outcome-0003",
+        )
+
+    assert exc_info.value.error.code == "core_project_patch_outcome_mismatch"
+    assert persistence.mapping == mapping_o
+    assert persistence.mapping.project_etag != successor_etag
+    assert len(persistence.mapping_history) == history_count
+    assert _workspace_mutation_count(fake_core) == workspace_mutations
+
+
+@pytest.mark.parametrize(
+    "reported_revision",
+    [
+        REVISION,
+        core_v1.RevisionRefV1(
+            id="revision-1-rewritten",
+            project_id=CORE_PROJECT_ID,
+            generation=1,
+            manifest_sha256=REVISION_1.manifest_sha256,
+        ),
+        core_v1.RevisionRefV1(
+            id=REVISION_1.id,
+            project_id=CORE_PROJECT_ID,
+            generation=1,
+            manifest_sha256="9" * 64,
+        ),
+    ],
+    ids=["rollback", "same-generation-id-rewrite", "same-generation-manifest-rewrite"],
+)
+def test_durable_revision_chain_rejects_nonmonotonic_current_authority(
+    reported_revision: core_v1.RevisionRefV1,
+) -> None:
+    edited, archive, persistence, fake_core, mapping_o = _prepare_finalized_import_patch_crash(
+        finalize_revision=REVISION
+    )
+    _replace_finalize_revision_authority(persistence, REVISION_1)
+    reported_etag = '"' + "9" * 64 + '"'
+    fake_core.active_revision = reported_revision
+    fake_core.project_etag = reported_etag
+    fake_core.project_updated_at = "2026-07-14T12:47:00Z"
+    fake_core.head = _head(active_revision=reported_revision, etag=reported_etag)
+    history_count = len(persistence.mapping_history)
+    workspace_mutations = _workspace_mutation_count(fake_core)
+    recovered, _, _, _ = _bridge(
+        edited,
+        persistence=persistence,
+        fake_core=fake_core,
+        archive_source=FakeArchiveSource(archive),
+    )
+
+    with pytest.raises(DesktopCoreBridgeErrorV1) as exc_info:
+        recovered.activate_project(
+            edited,
+            idempotency_key="finalize-nonmonotonic-current-0003",
+        )
+
+    assert exc_info.value.error.code == "core_project_revision_authority_mismatch"
+    assert persistence.mapping == mapping_o
+    assert persistence.mapping.project_etag != reported_etag
+    assert len(persistence.mapping_history) == history_count
+    assert _workspace_mutation_count(fake_core) == workspace_mutations
 
 
 def test_finalized_import_patch_recovery_commits_a_then_patches_b_from_latest_authority() -> None:

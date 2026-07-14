@@ -117,8 +117,9 @@ registry digest. A legitimate cross-session successor may change only that
 mutable authority. Every mapped, patch-recovery, and finalize-recovery read
 validates active revision authority monotonically before using the current ETag:
 the same generation must preserve the complete revision ref, while a changed ref
-must be the same-project direct successor. Generation rollback, identity rewrite,
-and unproven generation skips fail closed without committing a mapping. An
+must be the same-project direct successor on every proven authority edge.
+Generation rollback, identity rewrite, and unproven generation skips fail closed
+without committing a mapping. An
 applied imported draft may have no outcome revision; recovery then retains its
 pre-patch base revision as the effective lower bound. If both are absent, only
 no revision or a same-project generation-zero revision is valid. After
@@ -144,7 +145,11 @@ durable proof: recovery requires the persisted upload's predecessor snapshot
 and ETag plus the durable exact finalize response's project/workspace snapshots
 and publication before accepting current status/ETag or later successor
 authority. The finalize project's active revision must descend from the applied
-patch's effective lower bound and is then durable authority for later reads.
+patch's effective lower bound and is then durable authority for later reads. A
+recovered mapping may cross multiple generations only when the durable patch
+base, applied outcome, and finalize outcome form a complete ordered chain of
+same-revision or direct-successor edges through the current revision. Missing
+intermediates do not authorize a generation jump.
 Recovery performs both checks before another workspace mutation, mapping commit,
 or current ETag adoption. Finalize authority is CAS-persisted before mapping
 commit. Mapping CAS and matching

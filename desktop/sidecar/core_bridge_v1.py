@@ -843,6 +843,7 @@ class DesktopCoreBridgeV1:
                 label="project patch operation read",
             )
             completed_patch: CoreProjectPatchOperationV1 | None = None
+            revision_authorities: tuple[core_v1.RevisionRefV1 | None, ...] = ()
             recovered_requested_patch = False
             if pending_patch is not None:
                 _ensure_patch_operation_authority(
@@ -852,7 +853,7 @@ class DesktopCoreBridgeV1:
                     mapping=mapping,
                     core_host_identity=attachment.bearer_identity,
                 )
-                core_project, pending_patch = self._resume_project_patch(
+                core_project, pending_patch, revision_authorities = self._resume_project_patch(
                     token=token,
                     deadline=deadline,
                     client=client,
@@ -895,6 +896,7 @@ class DesktopCoreBridgeV1:
                         capabilities=capabilities,
                         core_host_identity=attachment.bearer_identity,
                         previous_mapping=mapping,
+                        revision_authorities=revision_authorities,
                     )
                     self._adapter_external(
                         token,
@@ -949,6 +951,12 @@ class DesktopCoreBridgeV1:
                     deadline=deadline,
                 )
             self._ensure_project_ready(core_project, capabilities)
+            if completed_patch is not None:
+                revision_authorities = _ensure_persisted_patch_outcome(
+                    completed_patch,
+                    core_project,
+                    finalize_authority=operation.workspace_upload_finalize,
+                )
             revision_head = self._core_external(token, deadline, client.revision_head)
             if revision_head.active_revision != core_project.active_revision:
                 raise _bridge_error(
@@ -976,6 +984,7 @@ class DesktopCoreBridgeV1:
                 capabilities,
                 core_host_identity=attachment.bearer_identity,
                 previous_mapping=mapping,
+                revision_authorities=revision_authorities,
             )
             if mapping != completed_mapping:
                 self._adapter_external(
@@ -1778,7 +1787,7 @@ class DesktopCoreBridgeV1:
             label="project patch reservation",
         )
         operation = _ensure_patch_transition(stored, proposed, label="reservation")
-        patched, operation = self._resume_project_patch(
+        patched, operation, _ = self._resume_project_patch(
             token=token,
             deadline=deadline,
             client=client,
@@ -1796,7 +1805,11 @@ class DesktopCoreBridgeV1:
         current: core_v1.ProjectV1,
         operation: CoreProjectPatchOperationV1,
         workspace_authority: CoreProjectCreateOperationV1 | None = None,
-    ) -> tuple[core_v1.ProjectV1, CoreProjectPatchOperationV1]:
+    ) -> tuple[
+        core_v1.ProjectV1,
+        CoreProjectPatchOperationV1,
+        tuple[core_v1.RevisionRefV1 | None, ...],
+    ]:
         if operation.state is CoreProjectPatchStateV1.APPLIED:
             assert operation.outcome is not None
             finalize_authority: CoreWorkspaceUploadFinalizeAuthorityV1 | None = None
@@ -1808,12 +1821,12 @@ class DesktopCoreBridgeV1:
                         status=409,
                     )
                 finalize_authority = workspace_authority.workspace_upload_finalize
-            _ensure_persisted_patch_outcome(
+            revision_authorities = _ensure_persisted_patch_outcome(
                 operation,
                 current,
                 finalize_authority=finalize_authority,
             )
-            return current, operation
+            return current, operation, revision_authorities
         if operation.state is CoreProjectPatchStateV1.PRE_PATCH:
             expected_unknown = replace(
                 operation,
@@ -1868,7 +1881,7 @@ class DesktopCoreBridgeV1:
             expected_applied,
             label="applied-outcome",
         )
-        return patched, operation
+        return patched, operation, ()
 
     def _publish_imported_workspace(
         self,
@@ -2623,7 +2636,7 @@ def _ensure_persisted_patch_outcome(
     current: core_v1.ProjectV1,
     *,
     finalize_authority: CoreWorkspaceUploadFinalizeAuthorityV1 | None,
-) -> None:
+) -> tuple[core_v1.RevisionRefV1 | None, ...]:
     assert operation.outcome is not None
     assert operation.outcome_immutable is not None
     assert operation.outcome_mutable is not None
@@ -2639,15 +2652,28 @@ def _ensure_persisted_patch_outcome(
         operation.outcome,
         operation.new_project_create,
     )
-    _ensure_revision_authority_successor(
-        _effective_applied_revision_authority(operation),
-        current.active_revision,
+    effective_authority = _effective_applied_revision_authority(operation)
+    _ensure_revision_authority_chain(
+        (
+            operation.base_project.active_revision,
+            effective_authority,
+        ),
         project_id=operation.core_project_id,
-        label="durable applied patch outcome",
+        labels=("durable applied patch predecessor",),
+    )
+    revision_authorities = (
+        operation.base_project.active_revision,
+        effective_authority,
     )
     current_mutable = _patch_mutable_authority(current)
     if current_mutable == operation.outcome_mutable:
-        return
+        _ensure_revision_authority_successor(
+            effective_authority,
+            current.active_revision,
+            project_id=operation.core_project_id,
+            label="durable applied patch outcome",
+        )
+        return revision_authorities
     if _utc_timestamp(current.updated_at) < _utc_timestamp(
         operation.outcome_mutable.updated_at
     ):
@@ -2668,8 +2694,19 @@ def _ensure_persisted_patch_outcome(
         and current.workspace_publication == operation.outcome_mutable.workspace_publication
     )
     if same_content_authority:
-        return
-    _ensure_workspace_finalize_proof(operation, current, finalize_authority)
+        _ensure_revision_authority_successor(
+            effective_authority,
+            current.active_revision,
+            project_id=operation.core_project_id,
+            label="durable applied patch outcome",
+        )
+        return revision_authorities
+    finalized_revision = _ensure_workspace_finalize_proof(
+        operation,
+        current,
+        finalize_authority,
+    )
+    return (*revision_authorities, finalized_revision)
 
 
 def _patch_outcome_needs_workspace_finalize_proof(
@@ -2690,7 +2727,7 @@ def _ensure_workspace_finalize_proof(
     operation: CoreProjectPatchOperationV1,
     current: core_v1.ProjectV1,
     authority: CoreWorkspaceUploadFinalizeAuthorityV1 | None,
-) -> None:
+) -> core_v1.RevisionRefV1 | None:
     assert operation.outcome_mutable is not None
     assert operation.outcome_immutable is not None
     requested_workspace = operation.new_project_create.workspace
@@ -2720,17 +2757,17 @@ def _ensure_workspace_finalize_proof(
         )
     finalized_mutable = _patch_mutable_authority(finalized_project)
     current_mutable = _patch_mutable_authority(current)
-    _ensure_revision_authority_successor(
-        _effective_applied_revision_authority(operation),
-        finalized_mutable.active_revision,
+    _ensure_revision_authority_chain(
+        (
+            _effective_applied_revision_authority(operation),
+            finalized_mutable.active_revision,
+            current_mutable.active_revision,
+        ),
         project_id=operation.core_project_id,
-        label="durable workspace finalize predecessor",
-    )
-    _ensure_revision_authority_successor(
-        finalized_mutable.active_revision,
-        current_mutable.active_revision,
-        project_id=operation.core_project_id,
-        label="durable workspace finalize",
+        labels=(
+            "durable applied patch outcome (durable workspace finalize predecessor)",
+            "durable workspace finalize",
+        ),
     )
     if current_mutable != finalized_mutable and (
         _utc_timestamp(current.updated_at) < _utc_timestamp(finalized_project.updated_at)
@@ -2741,6 +2778,7 @@ def _ensure_workspace_finalize_proof(
             "Core mutable authority does not descend from the durable workspace finalize.",
             status=409,
         )
+    return finalized_mutable.active_revision
 
 
 def _patch_immutable_authority(
@@ -2953,6 +2991,23 @@ def _ensure_revision_authority_successor(
         )
 
 
+def _ensure_revision_authority_chain(
+    authorities: tuple[core_v1.RevisionRefV1 | None, ...],
+    *,
+    project_id: str,
+    labels: tuple[str, ...],
+) -> None:
+    if len(authorities) < 2 or len(labels) != len(authorities) - 1:
+        raise ValueError("revision authority chain labels must describe every edge")
+    for authority, current, label in zip(authorities[:-1], authorities[1:], labels, strict=True):
+        _ensure_revision_authority_successor(
+            authority,
+            current,
+            project_id=project_id,
+            label=label,
+        )
+
+
 def _ensure_workspace_upload_authority(
     upload: core_v1.WorkspaceUploadSessionV1,
     project: core_v1.ProjectV1,
@@ -2981,6 +3036,7 @@ def _mapping_from_project(
     *,
     core_host_identity: str,
     previous_mapping: CoreProjectMappingV1 | None,
+    revision_authorities: tuple[core_v1.RevisionRefV1 | None, ...] = (),
 ) -> CoreProjectMappingV1:
     return _mapping_from_request(
         local_project_id=local_project.project_id,
@@ -2991,6 +3047,7 @@ def _mapping_from_project(
         capabilities=capabilities,
         core_host_identity=core_host_identity,
         previous_mapping=previous_mapping,
+        revision_authorities=revision_authorities,
     )
 
 
@@ -3004,6 +3061,7 @@ def _mapping_from_request(
     capabilities: core_v1.CapabilitiesResponseV1,
     core_host_identity: str,
     previous_mapping: CoreProjectMappingV1 | None,
+    revision_authorities: tuple[core_v1.RevisionRefV1 | None, ...] = (),
 ) -> CoreProjectMappingV1:
     workspace_snapshot = project.current_workspace_snapshot
     active_revision = project.active_revision
@@ -3013,11 +3071,15 @@ def _mapping_from_request(
             "Core has not published the project workspace snapshot and active revision.",
         )
     if previous_mapping is not None:
-        _ensure_revision_authority_successor(
+        authorities = (
             previous_mapping.active_revision,
+            *revision_authorities,
             active_revision,
+        )
+        _ensure_revision_authority_chain(
+            authorities,
             project_id=project.id,
-            label="previous project mapping",
+            labels=("previous project mapping",) * (len(authorities) - 1),
         )
     if previous_mapping is None:
         mapping_generation = 1
