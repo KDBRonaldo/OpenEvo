@@ -24,9 +24,15 @@ from desktop.sidecar.contracts.v1.models import (
 MAX_EVENT_SEQUENCE: Final = 9_007_199_254_740_991
 MAX_EVENT_FRAME_BYTES: Final = 1_048_576
 DEFAULT_MAX_EVENTS: Final = 4_096
+DEFAULT_MAX_LEDGER_BYTES: Final = 16 * 1_048_576
+MAX_LEDGER_BYTES: Final = 256 * 1_048_576
 DEFAULT_MAX_SUBSCRIBER_EVENTS: Final = 512
 DEFAULT_MAX_SUBSCRIBERS: Final = 256
 MAX_SUBSCRIBERS: Final = 4_096
+DEFAULT_MAX_QUEUED_EVENTS: Final = 16_384
+MAX_QUEUED_EVENTS: Final = 262_144
+DEFAULT_MAX_QUEUED_BYTES: Final = 64 * 1_048_576
+MAX_QUEUED_BYTES: Final = 256 * 1_048_576
 DEFAULT_HEARTBEAT_INTERVAL_SECONDS: Final = 15.0
 DEFAULT_POLL_INTERVAL_SECONDS: Final = 0.05
 
@@ -57,6 +63,10 @@ class DesktopEventSubscriberLimitError(DesktopEventBrokerError):
     """The process-wide subscriber capacity has been reached."""
 
 
+class DesktopEventCapacityError(DesktopEventBrokerError):
+    """A process-wide event memory budget cannot admit more data."""
+
+
 class DesktopEventReentrantPublishError(DesktopEventBrokerError):
     """A broker callback attempted to publish recursively."""
 
@@ -71,6 +81,7 @@ class _PublishedFrame:
 class _Subscriber:
     token: str
     pending: deque[_PublishedFrame] = field(default_factory=deque)
+    pending_bytes: int = 0
     overflowed: bool = False
     closed: bool = False
 
@@ -188,8 +199,11 @@ class DesktopEventBrokerV1:
         self,
         *,
         max_events: int = DEFAULT_MAX_EVENTS,
+        max_ledger_bytes: int = DEFAULT_MAX_LEDGER_BYTES,
         max_subscriber_events: int | None = None,
         max_subscribers: int = DEFAULT_MAX_SUBSCRIBERS,
+        max_queued_events: int = DEFAULT_MAX_QUEUED_EVENTS,
+        max_queued_bytes: int = DEFAULT_MAX_QUEUED_BYTES,
         heartbeat_interval: float = DEFAULT_HEARTBEAT_INTERVAL_SECONDS,
         poll_interval: float = DEFAULT_POLL_INTERVAL_SECONDS,
         event_id_factory: Callable[[], str] | None = None,
@@ -197,27 +211,39 @@ class DesktopEventBrokerV1:
     ) -> None:
         if not 2 <= max_events <= 100_000:
             raise ValueError("event replay capacity is outside the supported bound")
+        if not 1 <= max_ledger_bytes <= MAX_LEDGER_BYTES:
+            raise ValueError("ledger byte capacity is outside the supported bound")
         if max_subscriber_events is None:
             max_subscriber_events = min(DEFAULT_MAX_SUBSCRIBER_EVENTS, max_events)
         if not 1 <= max_subscriber_events <= max_events:
             raise ValueError("subscriber capacity is outside the replay bound")
         if not 1 <= max_subscribers <= MAX_SUBSCRIBERS:
             raise ValueError("subscriber count is outside the process-wide bound")
+        if not 1 <= max_queued_events <= MAX_QUEUED_EVENTS:
+            raise ValueError("queued event capacity is outside the process-wide bound")
+        if not 1 <= max_queued_bytes <= MAX_QUEUED_BYTES:
+            raise ValueError("queued byte capacity is outside the process-wide bound")
         if not 0 < heartbeat_interval <= 60:
             raise ValueError("heartbeat interval must be positive and at most 60 seconds")
         if not 0 < poll_interval <= 1:
             raise ValueError("poll interval must be positive and at most one second")
         self._max_events = max_events
+        self._max_ledger_bytes = max_ledger_bytes
         self._max_subscriber_events = max_subscriber_events
         self._max_subscribers = max_subscribers
+        self._max_queued_events = max_queued_events
+        self._max_queued_bytes = max_queued_bytes
         self._heartbeat_interval = float(heartbeat_interval)
         self._poll_interval = float(poll_interval)
         self._event_id_factory = event_id_factory or (lambda: secrets.token_urlsafe(24))
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._lock = threading.RLock()
         self._publish_state = threading.local()
-        self._events: deque[_PublishedFrame] = deque(maxlen=max_events)
+        self._events: deque[_PublishedFrame] = deque()
         self._subscribers: dict[str, _Subscriber] = {}
+        self._ledger_bytes = 0
+        self._queued_events = 0
+        self._queued_bytes = 0
         self._next_sequence = 0
         self._closed = False
 
@@ -248,16 +274,24 @@ class DesktopEventBrokerV1:
             event_name = _EVENT_NAMES_BY_TYPE.get(event_type)
             if event_name is None:
                 raise TypeError("Desktop event data must be an exact frozen v1 event model")
-            event_data = event_type.model_validate(data.model_dump(mode="json"))
+            event_data = event_type.model_validate(
+                data.model_dump(mode="python", round_trip=True, warnings="none")
+            )
             with self._lock:
                 self._require_open()
                 if self._next_sequence > MAX_EVENT_SEQUENCE:
                     raise DesktopEventGapError("Desktop event sequence is exhausted")
-                occurred_at = _timestamp(self._clock())
+            occurred_at = _timestamp(self._clock())
+            with self._lock:
+                self._require_open()
+            raw_id = self._event_id_factory()
+            if type(raw_id) is not str:
+                raise ValueError("event identity factory must return a string")
+            with self._lock:
+                self._require_open()
+                if self._next_sequence > MAX_EVENT_SEQUENCE:
+                    raise DesktopEventGapError("Desktop event sequence is exhausted")
                 sequence = self._next_sequence
-                raw_id = self._event_id_factory()
-                if type(raw_id) is not str:
-                    raise ValueError("event identity factory must return a string")
                 event = EventEnvelopeV1(
                     event_id=f"{sequence:x}.{raw_id}",
                     event_name=event_name,
@@ -266,16 +300,35 @@ class DesktopEventBrokerV1:
                     data=event_data,
                 )
                 published = _PublishedFrame(event_id=event.event_id, frame=_sse_frame(event))
+                if len(published.frame) > self._max_ledger_bytes:
+                    raise DesktopEventCapacityError(
+                        "Desktop event frame exceeds the ledger byte capacity"
+                    )
+                while self._events and (
+                    len(self._events) >= self._max_events
+                    or self._ledger_bytes + len(published.frame) > self._max_ledger_bytes
+                ):
+                    evicted = self._events.popleft()
+                    self._ledger_bytes -= len(evicted.frame)
                 self._next_sequence += 1
                 self._events.append(published)
+                self._ledger_bytes += len(published.frame)
                 for subscriber in self._subscribers.values():
                     if subscriber.closed or subscriber.overflowed:
                         continue
                     if len(subscriber.pending) >= self._max_subscriber_events:
-                        subscriber.pending.clear()
-                        subscriber.overflowed = True
+                        self._overflow_subscriber(subscriber)
+                        continue
+                    if (
+                        self._queued_events >= self._max_queued_events
+                        or self._queued_bytes + len(published.frame) > self._max_queued_bytes
+                    ):
+                        self._overflow_subscriber(subscriber)
                         continue
                     subscriber.pending.append(published)
+                    subscriber.pending_bytes += len(published.frame)
+                    self._queued_events += 1
+                    self._queued_bytes += len(published.frame)
                 return event
         finally:
             self._publish_state.active = False
@@ -301,11 +354,25 @@ class DesktopEventBrokerV1:
                     raise DesktopEventCursorExpiredError(
                         "Desktop event cursor exceeds the subscriber replay bound"
                     )
+            replay_bytes = sum(len(event.frame) for event in replay)
+            if (
+                self._queued_events + len(replay) > self._max_queued_events
+                or self._queued_bytes + replay_bytes > self._max_queued_bytes
+            ):
+                raise DesktopEventCapacityError(
+                    "Desktop event replay exceeds the process-wide queue capacity"
+                )
             token = secrets.token_urlsafe(24)
             while token in self._subscribers:
                 token = secrets.token_urlsafe(24)
-            subscriber = _Subscriber(token=token, pending=deque(replay))
+            subscriber = _Subscriber(
+                token=token,
+                pending=deque(replay),
+                pending_bytes=replay_bytes,
+            )
             self._subscribers[token] = subscriber
+            self._queued_events += len(replay)
+            self._queued_bytes += replay_bytes
             return DesktopEventSubscriptionV1(self, subscriber)
 
     def close(self) -> None:
@@ -315,9 +382,10 @@ class DesktopEventBrokerV1:
             self._closed = True
             for subscriber in self._subscribers.values():
                 subscriber.closed = True
-                subscriber.pending.clear()
+                self._clear_pending(subscriber)
             self._subscribers.clear()
             self._events.clear()
+            self._ledger_bytes = 0
 
     def _next_for(self, subscriber: _Subscriber) -> object:
         with self._lock:
@@ -327,7 +395,11 @@ class DesktopEventBrokerV1:
             if subscriber.overflowed:
                 return _GAP
             if subscriber.pending:
-                return subscriber.pending.popleft()
+                published = subscriber.pending.popleft()
+                subscriber.pending_bytes -= len(published.frame)
+                self._queued_events -= 1
+                self._queued_bytes -= len(published.frame)
+                return published
             return _EMPTY
 
     def _unsubscribe(self, subscriber: _Subscriber) -> None:
@@ -336,7 +408,17 @@ class DesktopEventBrokerV1:
             if current is subscriber:
                 del self._subscribers[subscriber.token]
             subscriber.closed = True
-            subscriber.pending.clear()
+            self._clear_pending(subscriber)
+
+    def _overflow_subscriber(self, subscriber: _Subscriber) -> None:
+        self._clear_pending(subscriber)
+        subscriber.overflowed = True
+
+    def _clear_pending(self, subscriber: _Subscriber) -> None:
+        self._queued_events -= len(subscriber.pending)
+        self._queued_bytes -= subscriber.pending_bytes
+        subscriber.pending.clear()
+        subscriber.pending_bytes = 0
 
     def _require_open(self) -> None:
         if self._closed:
@@ -372,6 +454,7 @@ def _sse_frame(event: EventEnvelopeV1) -> bytes:
 
 
 __all__ = (
+    "DesktopEventCapacityError",
     "DesktopEventBrokerClosedError",
     "DesktopEventBrokerV1",
     "DesktopEventCursorExpiredError",

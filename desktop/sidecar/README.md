@@ -396,29 +396,45 @@ messages, credentials, session tokens, remote commands, or backend URLs.
 `GET /desktop/v1/events` SSE route. Producers publish only the closed
 exact `StateEventV1`, `ResourceEventV1`, or `HeartbeatEventV1` models; subclasses
 are rejected even if they inherit the same fields. The broker snapshots the
-accepted frozen model, adds one monotonic JavaScript-safe sequence, a
-sequence-bound opaque event ID, the canonical event name, and a UTC timestamp,
-then serializes and bounds the canonical `EventEnvelopeV1` frame exactly once.
+accepted frozen model through strict Python validation, preserving tuple and
+other model-only types before the JSON boundary. It then adds one monotonic
+JavaScript-safe sequence, a sequence-bound opaque event ID, the canonical event
+name, and a UTC timestamp, then serializes and bounds the canonical
+`EventEnvelopeV1` frame exactly once.
 The retained ledger and subscriber queues hold only that immutable event ID and
 frame bytes. Later mutation of a producer-owned or returned model therefore
 cannot rewrite replay or live delivery. A rejected timestamp, model, identity,
 or oversized SSE frame consumes neither sequence authority nor replay capacity.
-Publication callbacks cannot recursively enter the same broker; a rejected
-recursive call does not reserve or duplicate a sequence.
+Clock and event-ID callbacks run outside the broker state lock. A publication
+linearizes only in its final locked commit, where it rechecks close state,
+assigns the next sequence, and atomically updates replay and subscriber state.
+Callback failure consumes no sequence; same-thread recursive callback entry is
+rejected, while synchronous cross-thread callback publication can reach its own
+commit without deadlocking. If `close()` commits while a callback is running,
+the pending publication fails without consuming a sequence.
 
-The retained ledger, every subscriber queue, and the process-wide subscriber
-count are independently bounded. The default total subscriber limit is 256 and
-cannot be configured above the hard limit of 4,096, keeping publication fanout
-bounded. A subscription with no `Last-Event-ID` starts at the live head; an exact
+The retained ledger is bounded by both event count and total frame bytes. Its
+defaults are 4,096 events and 16 MiB; configuration cannot exceed 100,000 events
+or 256 MiB. A successful publication evicts complete oldest frames until both
+bounds hold. One frame that cannot fit the configured ledger fails before
+commit. Subscriber queues retain shared frame references but are charged their
+logical bytes: all queues together default to at most 16,384 references and
+64 MiB, with hard limits of 262,144 references and 256 MiB. Each queue remains
+independently bounded, and the default total subscriber limit is 256 with a
+hard limit of 4,096. If live fanout would cross a per-subscriber or global queue
+bound, that subscriber's pending references are released and it receives a
+terminal gap. Replay admission that cannot fit the global queue budget fails
+synchronously before the stream response starts.
+
+A subscription with no `Last-Event-ID` starts at the live head; an exact
 retained cursor replays only later records and registers for live delivery under
 the same lock. Unknown, evicted, or too-old cursors fail synchronously before
-the stream response starts. A subscriber that cannot keep up receives a
-terminal gap rather than a non-contiguous stream. Cancellation of a pending
-`__anext__`, stream disconnect through `aclose()`, and abandoned-subscription GC
-all unregister the subscriber and release its queue. Idle streams emit an SSE
-comment every 15 seconds, which carries no sequence or replay authority.
-Closing the broker atomically prevents publication and terminates all existing
-subscriptions.
+the stream response starts. Cancellation of a pending `__anext__`, stream
+disconnect through `aclose()`, and abandoned-subscription GC all unregister the
+subscriber and release its queue charges. Idle streams emit an SSE comment
+every 15 seconds, which carries no sequence or replay authority. Closing the
+broker atomically prevents publication, clears all memory charges, and
+terminates all existing subscriptions.
 
 This module does not infer resource state or cache partial Core payloads. The
 release composition remains responsible for mapping validated Core events to
