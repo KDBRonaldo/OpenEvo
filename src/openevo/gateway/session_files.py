@@ -13,7 +13,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import mkdtemp
-from typing import Final, TypeAlias
+from typing import Callable, Final, TypeAlias
 
 
 SessionRootIdentity: TypeAlias = tuple[int, int, int]
@@ -575,6 +575,7 @@ def stage_codex_subscription_auth(
     session_dir: Path,
     session_identity: SessionRootIdentity,
     target_home_parts: tuple[str, ...],
+    on_identity: Callable[[CredentialFileIdentity], None] | None = None,
 ) -> StagedCodexCredential:
     """Validate auth inside a managed private root, then atomically publish it."""
 
@@ -652,6 +653,8 @@ def stage_codex_subscription_auth(
             expected_owner=staging_root_identity[2],
         )
         staged_file_identity = _object_identity(staged_opened)
+        if on_identity is not None:
+            on_identity(_auth_identity(staged_opened))
 
         _copy_exact(source_fd, staged_fd, source_opened.st_size)
         os.fsync(staged_fd)
@@ -762,10 +765,25 @@ def stage_codex_subscription_auth(
         )
         target_pin.verify(label="credential root")
         staging_pin.verify(label="credential staging root")
-        return StagedCodexCredential(
+        credential = StagedCodexCredential(
             redactor=redactor,
             auth_identity=_auth_identity(target_final),
         )
+        if on_identity is not None:
+            on_identity(credential.auth_identity)
+            target_after_callback = os.fstat(staged_fd)
+            if _auth_identity(target_after_callback) != credential.auth_identity:
+                raise SessionFileSecurityError(
+                    "staged Codex auth changed during publication handoff"
+                )
+            _require_path_identity(
+                target_parent_fd,
+                "auth.json",
+                target_after_callback,
+                label="staged Codex auth",
+            )
+            target_pin.verify(label="credential root")
+        return credential
     except FileNotFoundError as exc:
         _scrub_staged_auth(staged_fd, staged_file_identity)
         _unlink_if_same_identity(
@@ -789,7 +807,7 @@ def stage_codex_subscription_auth(
             staged_file_identity,
         )
         raise
-    except (OSError, ValueError) as exc:
+    except Exception as exc:
         _scrub_staged_auth(staged_fd, staged_file_identity)
         _unlink_if_same_identity(
             target_parent_fd
@@ -967,26 +985,36 @@ def remove_credential_tree(
     *,
     max_depth: int = _CLEANUP_MAX_DEPTH,
     max_nodes: int = _CLEANUP_MAX_NODES,
+    max_auth_nodes: int = _CLEANUP_MAX_NODES,
 ) -> None:
-    """Scrub the journal-bound auth inode before bounded root cleanup."""
+    """Scrub credential inodes before bounded root cleanup."""
 
     root_path_fd, parent_fd, root_name = _open_pinned_session_root(
         credential_dir,
         credential_identity,
     )
-    budget = [max_nodes]
     try:
         _fchmod_stable(root_path_fd, 0o700, label="credential root")
         root_fd = _open_readable_directory(root_path_fd, label="credential root")
         try:
-            if auth_identity is not None:
-                _scrub_bound_credential_auth(root_fd, auth_identity)
+            matches = _scrub_credential_auth_inodes(
+                root_fd,
+                expected=auth_identity,
+                expected_owner=credential_identity[2],
+                depth=0,
+                max_depth=max_depth,
+                budget=[max_auth_nodes],
+            )
+            if auth_identity is not None and matches == 0:
+                raise SessionFileSecurityError(
+                    "journal-bound credential auth was not found during cleanup"
+                )
             _remove_directory_contents(
                 root_fd,
                 expected_owner=credential_identity[2],
                 depth=0,
                 max_depth=max_depth,
-                budget=budget,
+                budget=[max_nodes],
             )
         finally:
             os.close(root_fd)
@@ -1007,72 +1035,128 @@ def remove_credential_tree(
         os.close(parent_fd)
 
 
-def _scrub_bound_credential_auth(
-    credential_root_fd: int,
-    expected: CredentialFileIdentity,
+def _scrub_credential_auth_inodes(
+    directory_fd: int,
+    *,
+    expected: CredentialFileIdentity | None,
+    expected_owner: int,
+    depth: int,
+    max_depth: int,
+    budget: list[int],
+) -> int:
+    if depth > max_depth:
+        raise SessionFileSecurityError("credential auth scan exceeds the depth limit")
+    names: list[str] = []
+    try:
+        with os.scandir(directory_fd) as entries:
+            for entry in entries:
+                names.append(entry.name)
+                if len(names) > budget[0]:
+                    raise SessionFileSecurityError("credential auth scan exceeds the node limit")
+    except OSError as exc:
+        raise SessionFileSecurityError(
+            "credential auth directory could not be inventoried"
+        ) from exc
+    names.sort()
+
+    matches = 0
+    for name in names:
+        budget[0] -= 1
+        if budget[0] < 0:
+            raise SessionFileSecurityError("credential auth scan exceeds the node limit")
+        try:
+            before = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        except OSError as exc:
+            raise SessionFileSecurityError("credential auth entry changed during scan") from exc
+        if before.st_uid != expected_owner:
+            raise SessionFileSecurityError(
+                "credential auth scan found an entry owned by another user"
+            )
+        entry_fd = -1
+        try:
+            entry_fd = os.open(name, _PATH_FLAGS, dir_fd=directory_fd)
+            opened = os.fstat(entry_fd)
+            if _full_object_identity(before) != _full_object_identity(opened):
+                raise SessionFileSecurityError("credential auth entry changed while it was opened")
+            if stat.S_ISDIR(opened.st_mode):
+                _fchmod_stable(entry_fd, 0o700, label="credential auth directory")
+                child_fd = _open_readable_directory(
+                    entry_fd,
+                    label="credential auth directory",
+                )
+                try:
+                    matches += _scrub_credential_auth_inodes(
+                        child_fd,
+                        expected=expected,
+                        expected_owner=expected_owner,
+                        depth=depth + 1,
+                        max_depth=max_depth,
+                        budget=budget,
+                    )
+                finally:
+                    os.close(child_fd)
+                _require_named_identity(
+                    directory_fd,
+                    name,
+                    _object_identity(opened),
+                    label="credential auth directory",
+                    expected_owner=expected_owner,
+                )
+            elif stat.S_ISREG(opened.st_mode) and (
+                expected is None or _object_identity(opened) == expected[:2]
+            ):
+                if expected is not None and opened.st_uid != expected[3]:
+                    raise SessionFileSecurityError("journal-bound credential auth owner changed")
+                _scrub_named_credential_inode(
+                    directory_fd,
+                    name,
+                    opened,
+                    expected_owner=expected_owner,
+                )
+                matches += 1
+        except SessionFileSecurityError:
+            raise
+        except OSError as exc:
+            raise SessionFileSecurityError("credential auth scan failed safely") from exc
+        finally:
+            if entry_fd >= 0:
+                os.close(entry_fd)
+    return matches
+
+
+def _scrub_named_credential_inode(
+    directory_fd: int,
+    name: str,
+    expected: os.stat_result,
+    *,
+    expected_owner: int,
 ) -> None:
-    matching_names: list[str] = []
     descriptor = -1
     try:
-        with os.scandir(credential_root_fd) as entries:
-            for entry in entries:
-                try:
-                    named = entry.stat(follow_symlinks=False)
-                except FileNotFoundError:
-                    continue
-                if _object_identity(named) == expected[:2]:
-                    matching_names.append(entry.name)
-        if not matching_names:
-            return
-        if len(matching_names) != 1:
-            raise SessionFileSecurityError(
-                "journal-bound credential auth has multiple root entries"
-            )
-        auth_name = matching_names[0]
-        named = os.stat(
-            auth_name,
-            dir_fd=credential_root_fd,
-            follow_symlinks=False,
-        )
         descriptor = os.open(
-            auth_name,
+            name,
             os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
-            dir_fd=credential_root_fd,
+            dir_fd=directory_fd,
         )
         opened = os.fstat(descriptor)
         if (
             not stat.S_ISREG(opened.st_mode)
-            or opened.st_uid != expected[3]
-            or _object_identity(named) != expected[:2]
-            or _object_identity(opened) != expected[:2]
+            or opened.st_uid != expected_owner
+            or _full_object_identity(opened) != _full_object_identity(expected)
         ):
-            raise SessionFileSecurityError("journal-bound credential auth identity changed")
-        _require_path_identity(
-            credential_root_fd,
-            auth_name,
-            opened,
-            label="journal-bound credential auth",
-        )
+            raise SessionFileSecurityError("credential auth inode changed while it was opened")
         os.ftruncate(descriptor, 0)
         os.fsync(descriptor)
         scrubbed = os.fstat(descriptor)
         if _object_identity(scrubbed) != _object_identity(opened) or scrubbed.st_size != 0:
-            raise SessionFileSecurityError("journal-bound credential auth scrub was not stable")
+            raise SessionFileSecurityError("credential auth inode scrub was not stable")
         _require_named_identity(
-            credential_root_fd,
-            auth_name,
+            directory_fd,
+            name,
             _object_identity(opened),
-            label="journal-bound credential auth",
-            expected_owner=expected[3],
+            label="credential auth inode",
+            expected_owner=expected_owner,
         )
-        os.unlink(auth_name, dir_fd=credential_root_fd)
-        os.fsync(credential_root_fd)
-    except SessionFileSecurityError:
-        raise
-    except OSError as exc:
-        raise SessionFileSecurityError(
-            "journal-bound credential auth cleanup failed safely"
-        ) from exc
     finally:
         if descriptor >= 0:
             os.close(descriptor)

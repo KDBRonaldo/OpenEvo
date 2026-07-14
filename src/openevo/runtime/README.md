@@ -143,7 +143,7 @@ destroyed only when a final inspect proves that exact ID absent. Gateway does
 not remove either bind root until that proof succeeds; cleanup ownership remains
 in the private authority root and durable retry journal otherwise. Subscription
 post-run uses bounded immediate retries and then periodic reconciliation. Its
-    private v6 journal also carries the exact staged auth identity, an explicit recovery phase, redacted
+private v6 journal also carries the exact staged auth identity, an explicit recovery phase, redacted
 finalization state, and a canonical result digest with monotonic export/callback
 success proofs. The terminal agent result is journaled before its in-memory
 terminal transition. Required export authority includes the normalized backend
@@ -162,23 +162,33 @@ Subscription auth bytes are validated before `DockerRuntime` is created. Core
 uses a random `0700` staging child inside the already journaled private
 credential root, verifies the complete source and staged file identities,
 digest, bounded JSON, and redactor, then publishes the `0600` inode with Linux
-atomic no-replace rename. `ManagedCredentialMount` binds the root and auth-file
-identities. DockerRuntime reopens both no-follow, revalidates them, and retains
-both descriptors through runtime absence. Because a daemon cannot reliably see
-the client's PID namespace, Docker binds one daemon-visible absolute root
-pathname read-only and fixes `restart=no`. Core verifies the create-time mount
-record (`Source`, destination, and `RW=false`) and rechecks pathname-to-FD binding
-before create, after create, and before start. After Docker starts only the trusted
-inert command, Core stats the adopted directory and auth file inside the exact
-container ID and compares their full mount identities before any prepare or
-agent command. Stable container ID/PID/start/restart state brackets that check.
-A final host pathname-to-FD check follows the process/adoption check; a mismatch
-stops the container. After terminal delivery, Core finds the journal-bound auth
-inode by stable device/inode even after a same-root rename, then verifies, scrubs,
-fsyncs, and unlinks only that inode before applying the bounded recursive budget
-to the remaining credential tree. A replacement at `auth.json` is not redaction
-authority, and credential-bearing v5 terminal finalization without an exact auth
-identity fails closed. A publication race, symlink, owner/mode/link mismatch, or unavailable
-rename primitive fails before agent execution.
+atomic no-replace rename. As soon as the empty staging inode exists, Core durably
+journals its device/inode identity before copying any secret bytes; publication
+then durably replaces that record with the final full identity. Thus a crash on
+either side of rename never leaves an unbound secret-bearing inode.
+
+`ManagedCredentialMount` binds the root and auth-file identities. DockerRuntime
+creates and pins a separate empty home-view directory and empty `auth.json`
+placeholder under that root. Because a daemon cannot reliably see the client's
+PID namespace, Docker receives two daemon-visible absolute sources: the empty
+view is mounted read-only at `CODEX_HOME`, and the exact auth file, which is a
+sibling rather than a member of that view, is mounted read-only over its
+placeholder. This prevents a host rename of the auth source from moving the
+container mountpoint and exposing a replacement. Runtime holds and revalidates
+root, view, placeholder, and exact-auth descriptors through container absence,
+fixes `restart=no`, verifies both create-time mount records, and compares the
+adopted view/auth identities inside the stable exact container before any prepare
+or agent command.
+
+After terminal delivery, Core performs a separate bounded no-follow recursive
+scan before ordinary tree deletion. It locates the journal-bound auth by stable
+device/inode even after a nested rename, truncates and fsyncs that inode, and
+fails without deleting the root if the inode cannot be located or the scan
+budget is exhausted. Historical cleanup authority without an auth identity
+scrubs every owned regular file in the dedicated credential root before deletion.
+That recovery rule does not make a replacement redaction authority:
+credential-bearing v5 terminal finalization still fails closed. A publication
+race, symlink, owner/mode/link mismatch, or unavailable rename primitive fails
+before agent execution.
 Workspace and artifact files are not redaction write targets; files larger than
 the Core capture scan limit retain their exact bytes.

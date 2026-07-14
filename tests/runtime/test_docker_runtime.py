@@ -15,7 +15,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from openevo.runtime.base import RuntimePathSecurityError
-from openevo.runtime.docker import DockerRuntime
+from openevo.runtime.docker import DockerRuntime, _CREDENTIAL_VIEW_NAME
 from openevo.runtime.managed import (
     MANAGED_CODEX_HOME,
     MANAGED_RUNTIME_RELEASES,
@@ -48,15 +48,24 @@ async def _probe_real_docker_credential_mount(tmp_path: Path) -> None:
     runtime._credential_docker_source = daemon_parent / "credential-root"
     try:
         await runtime.start()
-        result = await runtime.exec(
-            f"test -r {MANAGED_CODEX_HOME}/auth.json "
-            f"&& ! mv {MANAGED_CODEX_HOME}/auth.json "
-            f"{MANAGED_CODEX_HOME}/renamed.json "
-            f"&& test -f {MANAGED_CODEX_HOME}/auth.json"
+        original_auth = authority.root / "auth.json"
+        renamed_auth = authority.root / "renamed-by-host.json"
+        original_auth.rename(renamed_auth)
+        original_auth.write_text(
+            '{"access_token":"replacement-runtime-canary"}\n',
+            encoding="utf-8",
         )
-        assert result.return_code == 0, result.stderr
-        assert (authority.root / "auth.json").is_file()
-        assert not (authority.root / "renamed.json").exists()
+        original_auth.chmod(0o600)
+        read_result = await runtime.exec(f"cat {MANAGED_CODEX_HOME}/auth.json")
+        assert read_result.return_code == 0, read_result.stderr
+        assert read_result.stdout == '{"access_token":"runtime-canary"}\n'
+        move_result = await runtime.exec(
+            f"mv {MANAGED_CODEX_HOME}/auth.json {MANAGED_CODEX_HOME}/agent-move.json"
+        )
+        assert move_result.return_code != 0
+        assert renamed_auth.is_file()
+        assert "replacement-runtime-canary" in original_auth.read_text(encoding="utf-8")
+        assert not (authority.root / _CREDENTIAL_VIEW_NAME / "agent-move.json").exists()
     finally:
         if runtime.container_id is not None and not runtime.absence_proven:
             await runtime.stop()
@@ -161,7 +170,7 @@ def _credential_mount(root: Path) -> ManagedCredentialMount:
 
 
 def _credential_stat_output(authority: ManagedCredentialMount) -> str:
-    root = authority.root.stat(follow_symlinks=False)
+    root = (authority.root / _CREDENTIAL_VIEW_NAME).stat(follow_symlinks=False)
     auth = (authority.root / "auth.json").stat(follow_symlinks=False)
     return (
         f"{root.st_dev} {root.st_ino} {root.st_mode:x} {root.st_uid} "
@@ -176,10 +185,16 @@ def _credential_mount_inspect_output(authority: ManagedCredentialMount) -> str:
         [
             {
                 "Type": "bind",
-                "Source": str(authority.root),
+                "Source": str(authority.root / _CREDENTIAL_VIEW_NAME),
                 "Destination": MANAGED_CODEX_HOME,
                 "RW": False,
-            }
+            },
+            {
+                "Type": "bind",
+                "Source": str(authority.root / "auth.json"),
+                "Destination": f"{MANAGED_CODEX_HOME}/auth.json",
+                "RW": False,
+            },
         ]
     )
 
@@ -541,7 +556,14 @@ async def test_private_credential_root_is_mounted_outside_the_session_tree(
     mounts = [create[index + 1] for index, value in enumerate(create) if value == "--mount"]
     credential_mounts = [mount for mount in mounts if MANAGED_CODEX_HOME in mount]
     assert credential_mounts == [
-        f"type=bind,source={credential_dir},target={MANAGED_CODEX_HOME},readonly"
+        "type=bind,"
+        f"source={credential_dir / _CREDENTIAL_VIEW_NAME},"
+        f"target={MANAGED_CODEX_HOME},"
+        "readonly",
+        "type=bind,"
+        f"source={credential_dir / 'auth.json'},"
+        f"target={MANAGED_CODEX_HOME}/auth.json,"
+        "readonly",
     ]
     assert not credential_dir.is_relative_to(session_dir)
 
@@ -586,7 +608,14 @@ async def test_credential_mount_rejects_path_replacement_adopted_by_docker(
                 if value == "--mount" and MANAGED_CODEX_HOME in args[index + 1]
             ]
             assert credential_mounts == [
-                f"type=bind,source={authority.root},target={MANAGED_CODEX_HOME},readonly"
+                "type=bind,"
+                f"source={authority.root / _CREDENTIAL_VIEW_NAME},"
+                f"target={MANAGED_CODEX_HOME},"
+                "readonly",
+                "type=bind,"
+                f"source={authority.root / 'auth.json'},"
+                f"target={MANAGED_CODEX_HOME}/auth.json,"
+                "readonly",
             ]
             _write_mock_cidfile(args, container_id)
             return 0, container_id, None
@@ -611,6 +640,8 @@ async def test_credential_mount_rejects_path_replacement_adopted_by_docker(
         await runtime.start()
 
     assert runtime._credential_root_fd == -1
+    assert runtime._credential_view_fd == -1
+    assert runtime._credential_target_fd == -1
     assert runtime._credential_auth_fd == -1
 
 
@@ -1468,6 +1499,34 @@ async def test_real_docker_name_collision_preserves_running_external_container(
 
 
 @pytest.mark.asyncio
+async def test_real_docker_credential_auth_inode_remains_pinned_after_host_replacement(
+    tmp_path: Path,
+) -> None:
+    if shutil.which("docker") is None:
+        _real_docker_unavailable("docker CLI is unavailable")
+    info = subprocess.run(
+        ["docker", "info", "--format", "{{.ServerVersion}}"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if info.returncode != 0:
+        _real_docker_unavailable("docker daemon is unavailable")
+    image = subprocess.run(
+        ["docker", "image", "inspect", _REAL_DOCKER_IMAGE],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if image.returncode != 0:
+        _real_docker_unavailable(
+            f"required local probe image is unavailable: {_REAL_DOCKER_IMAGE}"
+        )
+
+    await _probe_real_docker_credential_mount(tmp_path)
+
+
+@pytest.mark.asyncio
 async def test_real_docker_cancel_after_cidfile_is_recoverably_owned(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1492,8 +1551,6 @@ async def test_real_docker_cancel_after_cidfile_is_recoverably_owned(
         _real_docker_unavailable(
             f"required local probe image is unavailable: {_REAL_DOCKER_IMAGE}"
         )
-
-    await _probe_real_docker_credential_mount(tmp_path)
 
     session_dir = tmp_path / "session"
     session_dir.mkdir()

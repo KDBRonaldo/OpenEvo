@@ -501,12 +501,12 @@ async def test_subscription_initialization_exception_log_redacts_credential_cana
     manager._cleanup_journal_dir = tmp_path / "journal"
     manager._docker_ownership_root = tmp_path / "docker-ownership"
 
-    def stage_auth(_request, credential_dir, _identity):
+    def stage_auth(_request, credential_dir, _identity, *, on_identity=None):
         auth = credential_dir / "auth.json"
         auth.write_text(f'{{"access_token":"{secret}"}}\n', encoding="utf-8")
         auth.chmod(0o600)
         state = auth.stat(follow_symlinks=False)
-        return session_files.StagedCodexCredential(
+        credential = session_files.StagedCodexCredential(
             redactor=session_files.CredentialRedactor.from_auth_json(auth.read_bytes()),
             auth_identity=(
                 state.st_dev,
@@ -519,6 +519,9 @@ async def test_subscription_initialization_exception_log_redacts_credential_cana
                 state.st_ctime_ns,
             ),
         )
+        if on_identity is not None:
+            on_identity(credential.auth_identity)
+        return credential
 
     monkeypatch.setattr(manager, "_stage_codex_subscription_auth", stage_auth)
     monkeypatch.setattr(
@@ -1397,10 +1400,95 @@ async def test_recovery_scrubs_journal_bound_auth_before_cleanup_budget_exhausti
 
     await restarted._reconcile_cleanup_retries()
 
-    assert not auth.exists()
+    assert auth.stat(follow_symlinks=False).st_size == 0
     assert credential_dir.exists()
     assert journal_path.exists()
     assert restarted._cleanup_retries[managed.session_id].credential_auth_identity == auth_identity
+
+
+@pytest.mark.asyncio
+async def test_recovery_scrubs_auth_published_after_prewrite_identity_journal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class SimulatedProcessCrash(BaseException):
+        pass
+
+    source = tmp_path / "home" / ".codex" / "auth.json"
+    source.parent.mkdir(parents=True)
+    source.write_text('{"access_token":"publication-crash-canary"}\n', encoding="utf-8")
+    source.chmod(0o600)
+    session_dir = tmp_path / "session"
+    credential_dir = tmp_path / "credentials"
+    session_dir.mkdir(mode=0o700)
+    credential_dir.mkdir(mode=0o700)
+    managed = ManagedSession(
+        request=SessionDispatchRequest(
+            session_id="credential-publication-crash",
+            task_id="task-publication-crash",
+            instruction="Do work.",
+            remaining_timeout_seconds=60,
+            agent=AgentSpec(
+                harness="codex",
+                settings={"auth_mode": "subscription", "capture_mode": "transcript"},
+            ),
+        ),
+        timer=StageTimer(),
+        session_dir=session_dir,
+        artifacts_dir=session_dir / "artifacts",
+        session_root_identity=capture_session_root_identity(session_dir),
+        credential_dir=credential_dir,
+        credential_root_identity=capture_session_root_identity(credential_dir),
+    )
+    journal_dir = tmp_path / "journal"
+    manager = GatewayNodeManager.__new__(GatewayNodeManager)
+    manager._cleanup_journal_dir = journal_dir
+    manager._persist_cleanup_ownership(manager._cleanup_ownership_for(managed))
+
+    def persist_identity(identity: session_files.CredentialFileIdentity) -> None:
+        managed.credential_auth_identity = identity
+        manager._persist_cleanup_ownership(manager._cleanup_ownership_for(managed))
+
+    real_rename = session_files._rename_noreplace
+
+    def publish_then_crash(*args, **kwargs) -> None:
+        real_rename(*args, **kwargs)
+        raise SimulatedProcessCrash
+
+    monkeypatch.setattr(session_files, "_rename_noreplace", publish_then_crash)
+
+    with pytest.raises(SimulatedProcessCrash):
+        session_files.stage_codex_subscription_auth(
+            source=source,
+            session_dir=credential_dir,
+            session_identity=managed.credential_root_identity,
+            target_home_parts=(),
+            on_identity=persist_identity,
+        )
+
+    published = credential_dir / "auth.json"
+    journal_path = next(journal_dir.glob("*.json"))
+    journal = json.loads(journal_path.read_text(encoding="utf-8"))
+    journal_identity = tuple(journal["credential_root"]["auth_identity"])
+    published_state = published.stat(follow_symlinks=False)
+    assert journal_identity[:2] == (published_state.st_dev, published_state.st_ino)
+    assert journal_identity[5] == 0
+    held_auth = os.open(published, os.O_RDONLY | os.O_CLOEXEC)
+
+    try:
+        restarted = GatewayNodeManager.__new__(GatewayNodeManager)
+        restarted._cleanup_retries = {}
+        restarted._cleanup_journal_dir = journal_dir
+        restarted._load_cleanup_retries()
+
+        await restarted._reconcile_cleanup_retries()
+
+        assert os.pread(held_auth, 1, 0) == b""
+        assert not credential_dir.exists()
+        assert not session_dir.exists()
+        assert not journal_path.exists()
+    finally:
+        os.close(held_auth)
 
 
 @pytest.mark.asyncio
@@ -1985,7 +2073,9 @@ async def test_credential_capable_exception_logs_never_emit_traceback_canary(
     )
     managed.credential_dir = credential_dir
     managed.credential_root_identity = capture_session_root_identity(credential_dir)
-    managed.credential_redactor = session_files.CredentialRedactor.from_auth_json(auth.read_bytes())
+    managed.credential_redactor = session_files.CredentialRedactor.from_auth_json(
+        auth.read_bytes()
+    )
     manager = _postrun_manager(
         calls=[],
         evolution=EvolutionConfig(enabled=True),

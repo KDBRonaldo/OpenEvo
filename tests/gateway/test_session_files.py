@@ -673,6 +673,7 @@ def test_credential_cleanup_scrubs_bound_auth_before_node_budget_exhaustion(
     auth.chmod(0o600)
     auth_state = auth.stat(follow_symlinks=False)
     auth_identity = session_files._auth_identity(auth_state)
+    held_auth = os.open(auth, os.O_RDONLY | os.O_CLOEXEC)
     moved_auth = root / "renamed-secret.json"
     auth.rename(moved_auth)
     auth.write_text('{"access_token":"replacement-canary"}\n', encoding="utf-8")
@@ -682,12 +683,80 @@ def test_credential_cleanup_scrubs_bound_auth_before_node_budget_exhaustion(
         directory.mkdir()
         (directory / "entry").write_text("budget", encoding="utf-8")
 
-    with pytest.raises(SessionFileSecurityError, match="node limit"):
-        remove_credential_tree(root, identity, auth_identity, max_nodes=1)
+    try:
+        with pytest.raises(SessionFileSecurityError, match="node limit"):
+            remove_credential_tree(root, identity, auth_identity, max_nodes=1)
 
-    assert not moved_auth.exists()
-    assert auth.read_text(encoding="utf-8") == '{"access_token":"replacement-canary"}\n'
+        assert moved_auth.stat(follow_symlinks=False).st_size == 0
+        assert os.pread(held_auth, 1, 0) == b""
+        assert auth.read_text(encoding="utf-8") == '{"access_token":"replacement-canary"}\n'
+        assert root.exists()
+    finally:
+        os.close(held_auth)
+
+
+def test_credential_cleanup_recursively_scrubs_nested_bound_auth_inode(
+    tmp_path: Path,
+) -> None:
+    root, identity = _session_root(tmp_path)
+    auth = root / "auth.json"
+    auth.write_text('{"access_token":"nested-cleanup-canary"}\n', encoding="utf-8")
+    auth.chmod(0o600)
+    auth_identity = session_files._auth_identity(auth.stat(follow_symlinks=False))
+    held_auth = os.open(auth, os.O_RDONLY | os.O_CLOEXEC)
+    nested = root / "moved" / "twice"
+    nested.mkdir(parents=True)
+    auth.rename(nested / "renamed-auth.json")
+    auth.write_text('{"access_token":"replacement-canary"}\n', encoding="utf-8")
+    auth.chmod(0o600)
+
+    try:
+        remove_credential_tree(root, identity, auth_identity)
+
+        assert not root.exists()
+        assert os.pread(held_auth, 1, 0) == b""
+    finally:
+        os.close(held_auth)
+
+
+def test_credential_cleanup_without_journal_identity_scrubs_handoff_inode(
+    tmp_path: Path,
+) -> None:
+    root, identity = _session_root(tmp_path)
+    staging = root / ".openevo-credential-staging-crash"
+    staging.mkdir(mode=0o700)
+    auth = staging / "auth.json"
+    auth.write_text('{"access_token":"handoff-cleanup-canary"}\n', encoding="utf-8")
+    auth.chmod(0o600)
+    held_auth = os.open(auth, os.O_RDONLY | os.O_CLOEXEC)
+
+    try:
+        remove_credential_tree(root, identity, None)
+
+        assert not root.exists()
+        assert os.pread(held_auth, 1, 0) == b""
+    finally:
+        os.close(held_auth)
+
+
+def test_credential_auth_scan_budget_failure_keeps_nested_inode_linked(
+    tmp_path: Path,
+) -> None:
+    root, identity = _session_root(tmp_path)
+    blocker = root / "000-blocker"
+    blocker.mkdir()
+    nested = root / "zzz-secret" / "deeper"
+    nested.mkdir(parents=True)
+    auth = nested / "renamed-auth.json"
+    auth.write_text('{"access_token":"bounded-cleanup-canary"}\n', encoding="utf-8")
+    auth.chmod(0o600)
+    auth_identity = session_files._auth_identity(auth.stat(follow_symlinks=False))
+
+    with pytest.raises(SessionFileSecurityError, match="auth scan exceeds the node limit"):
+        remove_credential_tree(root, identity, auth_identity, max_auth_nodes=1)
+
     assert root.exists()
+    assert auth.read_text(encoding="utf-8") == '{"access_token":"bounded-cleanup-canary"}\n'
 
 
 def test_recovery_redactor_rejects_replaced_journal_bound_auth(tmp_path: Path) -> None:

@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Awaitable, Callable, Final
 
 from openevo.harness.models import AgentRunResult
-from openevo.gateway.session_files import CredentialRedactor
+from openevo.gateway.session_files import CredentialFileIdentity, CredentialRedactor
 from openevo.rollout.models import SessionDispatchRequest, SessionResult, SessionStatus
 from openevo.rollout.timer import StageTimer
 from openevo.runtime.base import BaseRuntime
@@ -74,6 +74,7 @@ class ManagedSession:
     log_authority_identity: tuple[int, int, int] | None = None
     credential_dir: Path | None = None
     credential_root_identity: tuple[int, int, int] | None = None
+    credential_auth_identity: CredentialFileIdentity | None = None
     credential_mount: ManagedCredentialMount | None = None
     credential_redactor: CredentialRedactor | None = None
     runtime: BaseRuntime | None = None

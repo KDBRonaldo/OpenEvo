@@ -75,23 +75,24 @@ random `0700` staging child inside that managed root. Size, digest, UTF-8 JSON,
 redactor construction, owner, mode, link count, inode, and source/staging path
 chains are all verified there. Linux
 `renameat2(RENAME_NOREPLACE)` then publishes the complete `0600` inode as the
-credential root's final `auth.json`. DockerRuntime reopens and revalidates the
-resulting root and file identities and keeps both descriptors alive through
-mount adoption. Docker daemons cannot reliably resolve descriptors in the
-client's PID namespace, so Docker receives one Core-owned, daemon-visible
-absolute credential-root pathname as a read-only bind source; the managed
-container also fixes `restart=no`. After create, Core inspects the exact
-container ID and requires the recorded source, destination, and `RW=false` to
-match before start. Held root/auth descriptors are rebound to their pathnames
-before create, after create, and immediately before start.
-Docker starts only the trusted inert container command, then,
-before any prepare or agent command, stats the adopted root/auth mount inside
-the exact container ID and compares device, inode, mode, owner, link count, and
-size with the held authority. Container ID, PID, start time, running state, and
-restart count are stable across this check, followed by one final pathname-to-FD
-binding check. A mismatch stops the container and fails closed. Crash and bounded staging-cleanup windows remain covered by the
-journaled credential-root cleanup authority; an empty staging-child cleanup
-fault after publication does not negate success.
+credential root's final `auth.json`. The empty staging inode's device/inode is
+durably added to the cleanup journal before any secret bytes are copied; after
+publication, its final full identity is durably recorded before staging returns.
+
+DockerRuntime reopens and revalidates the root and exact auth identities. It
+creates a separate empty home view plus an empty target placeholder and pins all
+four objects. Docker daemons cannot reliably resolve descriptors in the client's
+PID namespace, so Docker receives two Core-owned, daemon-visible sources: the
+empty view is bound read-only at `CODEX_HOME`, while the sibling exact auth file
+is bound read-only over the view's `auth.json`. Keeping source auth outside the
+view prevents a host rename from moving the target mountpoint and revealing a
+replacement at the original source pathname. The managed container fixes
+`restart=no`; after create, Core requires both mount records' source,
+destination, and `RW=false` to match. It rechecks every host pathname-to-FD
+binding before create, after create, and before start. Docker starts only the
+trusted inert command, then Core compares the adopted view/auth identities inside
+a stable exact container before any prepare or agent command. A mismatch stops
+the container and fails closed.
 
 Verified auth JSON supplies a bounded set of exact sensitive leaf values. The
 gateway redacts those values from stdout/stderr and transcript logs and performs
@@ -169,14 +170,15 @@ re-verifies staged auth only when transcript rebuilding is still needed, proves
 every owned container absent, and resumes pending publication. Completion
 storage, session/transcript, credential, log roots, and the journal are removed
 only after every required export and callback phase is durably successful. Once
-authorized, cleanup locates the journal-bound auth inode by stable device/inode
-among direct credential-root entries before enumerating any attacker-inflatable
-inventory. A same-root rename is therefore scrubbed and unlinked without treating
-an `auth.json` replacement as that authority. The remaining walk is still bounded;
-budget exhaustion retains replacement entries, the root, and the journal, but not
-the original auth bytes. Credential-bearing v5 terminal-finalization journals lack
-this exact authority and fail closed rather than rebuilding a redactor from a
-replacement pathname. The
+authorized, cleanup first uses a separate bounded, recursive, no-follow scan to
+locate the journal-bound auth inode by stable device/inode. Same-root and nested
+renames are therefore scrubbed without treating an `auth.json` replacement as
+authority. A scan limit, race, or missing exact inode fails before ordinary
+recursive deletion and retains the root and journal. Historical
+publication-handoff records without an auth identity scrub every owned regular
+file in this dedicated root before deletion; this is cleanup authority only.
+Credential-bearing v5 terminal-finalization journals still fail closed rather
+than rebuilding a redactor from a replacement pathname. The
 live retry loop applies the same state machine between restarts.
 
 ## What it captures

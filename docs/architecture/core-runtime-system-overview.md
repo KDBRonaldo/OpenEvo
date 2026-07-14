@@ -170,18 +170,21 @@ filesystem anchor 逐组件固定并复核宿主机 `~/.codex/auth.json`，把 b
 内随机 `0700` staging child。在这里完成 no-follow、owner、mode、regular、link-count-one、
 size、digest、UTF-8 JSON、redactor 和全路径 identity 校验后，才用 Linux
 `renameat2(RENAME_NOREPLACE)` 把完整 `0600` inode 原子发布为私有 credential root 的最终
-`auth.json`。Gateway 把 root/auth exact identity 交给 runtime；DockerRuntime no-follow
-重开并复核两者、持有两个 FD 到 container absence。Docker daemon 不能可靠访问 client
-PID namespace 中的 `/proc/<core-pid>/fd`，因此 runtime 把 Core-owned、daemon-visible 的绝对
-credential-root pathname 作为单个 read-only bind source，并显式固定 `restart=no`。`docker create`
-后、start 前还会 inspect exact immutable container ID，要求该 mount 的 source、destination 和
-`RW=false` 精确匹配；create 前后及 start 前都重验 pathname 与 held FD binding。Docker 只先启动 trusted inert command，
-随后 Core 在任何 prepare/agent command 前，对 exact container ID 内已经 adopted 的 root/auth
-执行 stat，将 device/inode/mode/owner/link-count/size 与 held authority 精确比较，并在前后绑定
-container ID、PID、start time、running state 和 restart count，最后再次复核 host pathname 与
-held FD binding。任一 identity mismatch 会先 stop container 再 fail closed。SIGKILL 或 staging cleanup
-fault 留下的内容仍在 journaled credential root 内；最终发布成功后的空 staging-child cleanup
-fault 不会把成功误报为不可恢复。
+`auth.json`。空 staging inode 一经创建，Gateway 就在写入任何 secret bytes 前先 durable journal
+其 device/inode；发布完成后再把 final full identity durable 更新，之后 staging 才返回。因此
+copy、rename 两侧的 SIGKILL 都不会产生未绑定 cleanup authority 的 secret-bearing inode。
+
+Gateway 把 root/auth exact identity 交给 runtime。DockerRuntime 另建并固定一个不含 secret 的
+home view 和其中的空 `auth.json` placeholder，no-follow 持有 root/view/placeholder/exact-auth
+四个 FD 到 container absence。Docker daemon 不能可靠访问 client PID namespace 中的
+`/proc/<core-pid>/fd`，因此 runtime 给 Docker 两个 daemon-visible absolute source：把空 view
+read-only bind 到 `CODEX_HOME`，再把作为 view sibling 的 exact auth file read-only bind 到
+placeholder。auth source 不在 view 内，host rename source 后 mountpoint 不会随 inode 移到新名字，
+原 pathname replacement 也就不会暴露给容器。Runtime 固定 `restart=no`；`docker create` 后、start
+前 inspect exact immutable container ID，要求两个 mount 的 source/destination/`RW=false` 精确匹配，
+并在 create 前后及 start 前重验全部 pathname 与 held FD binding。Docker 只先启动 trusted inert
+command；任何 prepare/agent command 前，Core 对 stable exact container 内 adopted view/auth identity
+做精确比较。任一 mismatch 会先 stop container 再 fail closed。
 
 Subscription post-run 先结束所有仍可访问 credential 的进程，并按 `docker create` 返回的
 container ID 执行 remove + absence inspect。只有 absence proof 成功、最终 fd-relative
@@ -213,12 +216,13 @@ credential root 重新验证并构造 redactor（仅在仍需重建 transcript �
 只重试 pending phase。两项 required proof 都持久成功后才删除 completion storage、session、
 credential、log roots 和 journal；无法证明时 authority 持续保留。
 获得 cleanup 授权后，Core 在枚举 credential root 的普通 inventory budget 之前，先按 journal
-稳定 device/inode identity 在 root 直接条目中定位原 auth inode；即使 agent 把它 rename 为其他
-名字，也会 no-follow 打开、复核、截断、fsync 并只 unlink 该 inode。被放回 `auth.json` 的
-replacement 不会被误当成 redaction authority；剩余递归清理仍受 node/depth budget 限制，预算
-耗尽会保留 replacement、root/journal 供重试，但不会继续保留原 auth bytes。缺少 exact auth
-identity 的 credential-bearing v5 terminal-finalization journal 在 startup fail closed，不能从当前
-pathname 重建 redactor。Credential-capable dispatcher shutdown/cancel/stage、Docker create
+稳定 device/inode identity 做一轮独立 node/depth budget 的递归 no-follow scan；即使 agent 把
+exact inode 移入 nested subdirectory，也会复核后截断并 fsync。scan 超限、竞态或完整遍历后找不到
+exact inode 时，在普通递归删除前 fail closed 并保留 root/journal。历史 publication-handoff
+authority 没有 auth identity 时，会先递归擦除该专属 credential root 中全部 owned regular files，
+再允许删除；这不构成 redaction authority。缺少 exact auth identity 的 credential-bearing v5
+terminal-finalization journal 仍在 startup fail closed，绝不能从当前 pathname 重建 redactor。
+Credential-capable dispatcher shutdown/cancel/stage、Docker create
 reconciliation、init、agent postprocess、export、cleanup 和 teardown 异常日志不使用原始
 `exc_info`/traceback；始终保留 exception type，只有存在 verified `CredentialRedactor` 时才附加
 脱敏后的 exception text。

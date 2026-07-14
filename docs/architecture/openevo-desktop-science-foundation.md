@@ -132,11 +132,16 @@ source/target size, SHA-256 digest, identity, link count, and change times. Both
 source and credential-root absolute pathname chains are pinned component by
 component and rechecked before and after publication. Docker daemon PID
 namespaces do not reliably expose Core's `/proc/<pid>/fd/<fd>` paths, so Docker
-receives one Core-owned, daemon-visible absolute credential-root pathname as a
-read-only bind source and uses `restart=no`. Core verifies the create-time mount
-source/destination and `RW=false`, then rechecks pathname-to-FD binding before
-start. Stable container process identity brackets the in-container adoption check,
-followed by a final host pathname binding check.
+receives two Core-owned, daemon-visible sources. DockerRuntime creates and pins an
+empty home view and empty auth placeholder under the journaled root, mounts that
+view read-only at `CODEX_HOME`, then mounts the sibling exact auth file read-only
+over the placeholder. Because the auth source is outside the view, renaming it on
+the host cannot move the container mountpoint to another name or reveal a
+replacement. Core verifies both create-time mount records and every held
+root/view/placeholder/auth binding, uses `restart=no`, and brackets in-container
+view/auth adoption with stable container process identity. The empty staging
+inode is durably journaled before secret bytes are copied, then its final full
+identity is journaled after publication.
 
 Core derives a bounded exact-value redactor from the verified auth JSON and its
 string leaves. Core stdout/stderr and transcript logs live in a node-private,
@@ -173,8 +178,12 @@ retains completion data, transcript/session, log, credential roots, and the
 journal. Stable event identity and callback idempotency headers make retries
 non-polluting. Terminal pending status/error is published to live memory only
 after the journal transition is durable. Cleanup begins only after both required
-phases are durably successful, then scrubs and unlinks the journal-bound auth inode
-before applying the bounded recursive walk to the rest of the credential root.
+phases are durably successful. A separate bounded no-follow recursive scan first
+finds and scrubs the journal-bound auth inode even after a nested rename; a limit,
+race, or missing inode retains the root and journal before ordinary deletion.
+Historical publication-handoff cleanup without an auth identity scrubs every
+owned regular file in the dedicated root, while v5 terminal finalization still
+fails closed rather than trusting a replacement as redaction authority.
 
 `self-deployed` uses proxy authentication and requires `execution.hf_model`.
 The legacy config value `codex_managed_local_inference` remains accepted as an

@@ -31,6 +31,7 @@ _DEFAULT_OWNERSHIP_ROOT: Path = Path("/tmp") / f".openevo-core-docker-ownership-
 _CONTAINER_ID_PATTERN: Final[re.Pattern[str]] = re.compile(r"^[0-9a-f]{64}$")
 _OWNERSHIP_KEY_PATTERN: Final[re.Pattern[str]] = re.compile(r"^[0-9a-f]{64}$")
 _OWNERSHIP_RECORD_LIMIT: Final[int] = 1024
+_CREDENTIAL_VIEW_NAME: Final[str] = ".openevo-codex-home"
 _OwnershipState = Literal[
     "none",
     "create_pending",
@@ -176,7 +177,13 @@ class DockerRuntime(BaseRuntime):
         self._credential_docker_source = credential_docker_source
         self._credential_mount = credential_mount
         self._credential_root_fd = -1
+        self._credential_view_fd = -1
+        self._credential_target_fd = -1
         self._credential_auth_fd = -1
+        self._credential_view_identity: tuple[int, int, int, int] | None = None
+        self._credential_target_identity: tuple[int, int, int, int, int, int, int, int] | None = (
+            None
+        )
         # Use enough of the session_id to preserve the "-eval" suffix used by
         # fresh evaluator runtimes, avoiding collisions with the agent runtime.
         safe_name = session_id.replace("/", "-")[:55]
@@ -244,10 +251,20 @@ class DockerRuntime(BaseRuntime):
         authority = self._credential_mount
         if authority is None:
             return
-        if self._credential_root_fd >= 0 or self._credential_auth_fd >= 0:
+        if any(
+            descriptor >= 0
+            for descriptor in (
+                self._credential_root_fd,
+                self._credential_view_fd,
+                self._credential_target_fd,
+                self._credential_auth_fd,
+            )
+        ):
             raise RuntimeError("managed credential mount is already pinned")
 
         root_fd = -1
+        view_fd = -1
+        target_fd = -1
         auth_fd = -1
         try:
             root_fd = _open_private_ownership_directory(authority.root)
@@ -278,14 +295,81 @@ class DockerRuntime(BaseRuntime):
                 or stat.S_IMODE(opened_auth.st_mode) != 0o600
             ):
                 raise RuntimeError("managed credential file identity changed")
+            os.mkdir(_CREDENTIAL_VIEW_NAME, mode=0o700, dir_fd=root_fd)
+            view_fd = os.open(_CREDENTIAL_VIEW_NAME, _DIRECTORY_FLAGS, dir_fd=root_fd)
+            target_fd = os.open(
+                "auth.json",
+                os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=view_fd,
+            )
+            os.fchmod(target_fd, 0o600)
+            os.fsync(target_fd)
+            os.fsync(view_fd)
+            os.fsync(root_fd)
+            view_state = os.fstat(view_fd)
+            target_state = os.fstat(target_fd)
+            named_view = os.stat(
+                _CREDENTIAL_VIEW_NAME,
+                dir_fd=root_fd,
+                follow_symlinks=False,
+            )
+            named_target = os.stat(
+                "auth.json",
+                dir_fd=view_fd,
+                follow_symlinks=False,
+            )
+            view_identity = (
+                view_state.st_dev,
+                view_state.st_ino,
+                view_state.st_mode,
+                view_state.st_uid,
+            )
+            if (
+                not stat.S_ISDIR(view_state.st_mode)
+                or view_state.st_uid != authority.root_identity[2]
+                or stat.S_IMODE(view_state.st_mode) != 0o700
+                or (
+                    named_view.st_dev,
+                    named_view.st_ino,
+                    named_view.st_mode,
+                    named_view.st_uid,
+                )
+                != view_identity
+            ):
+                raise RuntimeError("managed credential view is invalid")
+            target_identity = _full_file_identity(target_state)
+            if (
+                not stat.S_ISREG(target_state.st_mode)
+                or target_state.st_uid != authority.root_identity[2]
+                or target_state.st_nlink != 1
+                or stat.S_IMODE(target_state.st_mode) != 0o600
+                or target_state.st_size != 0
+                or _full_file_identity(named_target) != target_identity
+            ):
+                raise RuntimeError("managed credential target is invalid")
             self._credential_root_fd = root_fd
+            self._credential_view_fd = view_fd
+            self._credential_target_fd = target_fd
             self._credential_auth_fd = auth_fd
+            self._credential_view_identity = view_identity
+            self._credential_target_identity = target_identity
             root_fd = -1
+            view_fd = -1
+            target_fd = -1
             auth_fd = -1
-            self._verify_credential_mount_pins()
+            try:
+                self._verify_credential_mount_pins()
+            except Exception:
+                self._release_credential_mount_pins()
+                raise
         except OSError as exc:
             raise RuntimeError("managed credential mount could not be pinned") from exc
         finally:
+            if target_fd >= 0:
+                os.close(target_fd)
+            if view_fd >= 0:
+                os.close(view_fd)
             if auth_fd >= 0:
                 os.close(auth_fd)
             if root_fd >= 0:
@@ -293,10 +377,30 @@ class DockerRuntime(BaseRuntime):
 
     def _verify_credential_mount_pins(self) -> None:
         authority = self._credential_mount
-        if authority is None or self._credential_root_fd < 0 or self._credential_auth_fd < 0:
+        if (
+            authority is None
+            or self._credential_root_fd < 0
+            or self._credential_view_fd < 0
+            or self._credential_target_fd < 0
+            or self._credential_auth_fd < 0
+            or self._credential_view_identity is None
+            or self._credential_target_identity is None
+        ):
             raise RuntimeError("managed credential mount authority is incomplete")
         root_state = os.fstat(self._credential_root_fd)
         named_root = os.stat(authority.root, follow_symlinks=False)
+        view_state = os.fstat(self._credential_view_fd)
+        named_view = os.stat(
+            _CREDENTIAL_VIEW_NAME,
+            dir_fd=self._credential_root_fd,
+            follow_symlinks=False,
+        )
+        target_state = os.fstat(self._credential_target_fd)
+        named_target = os.stat(
+            "auth.json",
+            dir_fd=self._credential_view_fd,
+            follow_symlinks=False,
+        )
         auth_state = os.fstat(self._credential_auth_fd)
         named_auth = os.stat(
             "auth.json",
@@ -305,34 +409,60 @@ class DockerRuntime(BaseRuntime):
         )
         if (
             (root_state.st_dev, root_state.st_ino, root_state.st_uid) != authority.root_identity
-            or (named_root.st_dev, named_root.st_ino, named_root.st_uid)
-            != authority.root_identity
+            or (named_root.st_dev, named_root.st_ino, named_root.st_uid) != authority.root_identity
             or stat.S_IMODE(root_state.st_mode) != 0o700
             or stat.S_IMODE(named_root.st_mode) != 0o700
+            or (
+                view_state.st_dev,
+                view_state.st_ino,
+                view_state.st_mode,
+                view_state.st_uid,
+            )
+            != self._credential_view_identity
+            or (
+                named_view.st_dev,
+                named_view.st_ino,
+                named_view.st_mode,
+                named_view.st_uid,
+            )
+            != self._credential_view_identity
+            or _full_file_identity(target_state) != self._credential_target_identity
+            or _full_file_identity(named_target) != self._credential_target_identity
             or _full_file_identity(auth_state) != authority.auth_identity
             or _full_file_identity(named_auth) != authority.auth_identity
         ):
             raise RuntimeError("managed credential mount authority changed")
 
     def _release_credential_mount_pins(self) -> None:
-        for name in ("_credential_auth_fd", "_credential_root_fd"):
+        for name in (
+            "_credential_auth_fd",
+            "_credential_target_fd",
+            "_credential_view_fd",
+            "_credential_root_fd",
+        ):
             descriptor = getattr(self, name)
             if descriptor >= 0:
                 os.close(descriptor)
                 setattr(self, name, -1)
+        self._credential_view_identity = None
+        self._credential_target_identity = None
 
-    def _credential_mount_source(self) -> str:
+    def _credential_mount_sources(self) -> tuple[str, str]:
         self._verify_credential_mount_pins()
         source = self._credential_docker_source
         if source is None or "," in str(source):
             raise RuntimeError("managed credential Docker source is invalid")
-        return str(source)
+        auth_source = source / "auth.json"
+        view_source = source / _CREDENTIAL_VIEW_NAME
+        if "," in str(auth_source) or "," in str(view_source):
+            raise RuntimeError("managed credential Docker auth source is invalid")
+        return str(view_source), str(auth_source)
 
     async def _verify_created_credential_mount(self) -> None:
         authority = self._credential_mount
         if authority is None:
             return
-        self._verify_credential_mount_pins()
+        root_source, auth_source = self._credential_mount_sources()
         rc, stdout, _ = await self._run_local_command(
             "docker",
             "container",
@@ -347,24 +477,33 @@ class DockerRuntime(BaseRuntime):
             mounts = json.loads(str(stdout or ""))
         except json.JSONDecodeError as exc:
             raise RuntimeError("managed credential mount inspect returned invalid JSON") from exc
+        destinations = {
+            MANAGED_CODEX_HOME: root_source,
+            f"{MANAGED_CODEX_HOME}/auth.json": auth_source,
+        }
         matches = (
             [
                 mount
                 for mount in mounts
-                if isinstance(mount, dict) and mount.get("Destination") == MANAGED_CODEX_HOME
+                if isinstance(mount, dict) and mount.get("Destination") in destinations
             ]
             if isinstance(mounts, list)
             else []
         )
-        if rc != 0 or len(matches) != 1:
-            raise RuntimeError("managed credential mount inspect is invalid")
-        mount = matches[0]
         if (
-            mount.get("Type") != "bind"
-            or mount.get("Source") != str(self._credential_docker_source)
-            or mount.get("RW") is not False
+            rc != 0
+            or len(matches) != len(destinations)
+            or {mount.get("Destination") for mount in matches} != set(destinations)
         ):
-            raise RuntimeError("managed credential mount configuration changed")
+            raise RuntimeError("managed credential mount inspect is invalid")
+        for mount in matches:
+            destination = mount.get("Destination")
+            if (
+                mount.get("Type") != "bind"
+                or mount.get("Source") != destinations[destination]
+                or mount.get("RW") is not False
+            ):
+                raise RuntimeError("managed credential mount configuration changed")
         self._verify_credential_mount_pins()
 
     async def start(self) -> None:
@@ -401,7 +540,7 @@ class DockerRuntime(BaseRuntime):
         create_args.extend(["-v", f"{self.session_dir}:{self.runtime_session_dir}"])
         if self._credential_mount is not None:
             try:
-                root_source = self._credential_mount_source()
+                root_source, auth_source = self._credential_mount_sources()
             except Exception:
                 self._mark_no_ownership()
                 raise
@@ -409,6 +548,11 @@ class DockerRuntime(BaseRuntime):
                 [
                     "--mount",
                     f"type=bind,source={root_source},target={MANAGED_CODEX_HOME},readonly",
+                    "--mount",
+                    "type=bind,"
+                    f"source={auth_source},"
+                    f"target={MANAGED_CODEX_HOME}/auth.json,"
+                    "readonly",
                 ]
             )
         # Additional volumes from kwargs (e.g., Docker socket for agents that need DinD)
@@ -581,16 +725,10 @@ class DockerRuntime(BaseRuntime):
             )
         except ValueError as exc:
             raise RuntimeError("managed credential mount stat is invalid") from exc
-        if (
-            root_identity
-            != (
-                authority.root_identity[0],
-                authority.root_identity[1],
-                stat.S_IFDIR | 0o700,
-                authority.root_identity[2],
-            )
-            or auth_identity != authority.auth_identity[:6]
-        ):
+        view_identity = self._credential_view_identity
+        if view_identity is None:
+            raise RuntimeError("managed credential view authority is missing")
+        if root_identity != view_identity or auth_identity != authority.auth_identity[:6]:
             raise RuntimeError("managed credential mount identity changed")
         self._verify_credential_mount_pins()
         if await self._credential_container_process_identity() != first:

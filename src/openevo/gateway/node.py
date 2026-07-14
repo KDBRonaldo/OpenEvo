@@ -15,7 +15,7 @@ import stat
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 from tempfile import TemporaryDirectory, mkdtemp
-from typing import Any, cast
+from typing import Any, Callable, cast
 from urllib.parse import unquote, urlparse
 
 import httpx
@@ -795,12 +795,19 @@ class GatewayNodeManager:
                 managed.credential_dir = credential_dir
                 managed.credential_root_identity = capture_session_root_identity(credential_dir)
                 self._persist_cleanup_ownership(self._cleanup_ownership_for(managed))
+
+                def persist_auth_identity(auth_identity: CredentialFileIdentity) -> None:
+                    managed.credential_auth_identity = auth_identity
+                    self._persist_cleanup_ownership(self._cleanup_ownership_for(managed))
+
                 staged_credential = self._stage_codex_subscription_auth(
                     request,
                     managed.credential_dir,
                     managed.credential_root_identity,
+                    on_identity=persist_auth_identity,
                 )
                 managed.credential_redactor = staged_credential.redactor
+                managed.credential_auth_identity = staged_credential.auth_identity
                 managed.credential_mount = ManagedCredentialMount(
                     root=managed.credential_dir,
                     root_identity=managed.credential_root_identity,
@@ -926,6 +933,8 @@ class GatewayNodeManager:
         request: SessionDispatchRequest,
         credential_dir: Path,
         credential_root_identity: tuple[int, int, int] | None = None,
+        *,
+        on_identity: Callable[[CredentialFileIdentity], None] | None = None,
     ) -> StagedCodexCredential:
         if not _is_codex_subscription_agent(request.agent):
             raise RuntimeError("credential staging requires a Codex subscription agent")
@@ -937,6 +946,7 @@ class GatewayNodeManager:
                 session_dir=credential_dir,
                 session_identity=identity,
                 target_home_parts=(),
+                on_identity=on_identity,
             )
         except SessionFileSecurityError as exc:
             raise RuntimeError(str(exc)) from exc
@@ -2442,9 +2452,12 @@ class GatewayNodeManager:
                 managed.session_id,
                 managed.credential_root_identity,
                 (
-                    None
-                    if managed.credential_mount is None
-                    else managed.credential_mount.auth_identity
+                    managed.credential_auth_identity
+                    or (
+                        None
+                        if managed.credential_mount is None
+                        else managed.credential_mount.auth_identity
+                    )
                 ),
             )
         tasks = [
@@ -2708,9 +2721,7 @@ class GatewayNodeManager:
             else cast(SessionStatus | None, pending_status)
         )
         effective_pending_error = (
-            managed.pending_error
-            if pending_error is _UNSET
-            else cast(str | None, pending_error)
+            managed.pending_error if pending_error is _UNSET else cast(str | None, pending_error)
         )
         if effective_pending_error is not None and redactor is not None:
             effective_pending_error = redactor.redact(str(effective_pending_error))
@@ -2749,9 +2760,12 @@ class GatewayNodeManager:
             credential_dir=managed.credential_dir,
             credential_root_identity=managed.credential_root_identity,
             credential_auth_identity=(
-                None
-                if managed.credential_mount is None
-                else managed.credential_mount.auth_identity
+                managed.credential_auth_identity
+                or (
+                    None
+                    if managed.credential_mount is None
+                    else managed.credential_mount.auth_identity
+                )
             ),
             runtime_id=(str(getattr(runtime, "runtime_id", "")) or None),
             container_id=getattr(runtime, "container_id", None),
@@ -3122,9 +3136,7 @@ class GatewayNodeManager:
             expected_keys.add("phase")
         if set(payload) != expected_keys:
             raise ValueError("cleanup ownership payload is not closed")
-        if version not in {1, 2, 3, 4, 5, 6} or not isinstance(
-            payload["session_id"], str
-        ):
+        if version not in {1, 2, 3, 4, 5, 6} or not isinstance(payload["session_id"], str):
             raise ValueError("cleanup ownership identity is invalid")
         phase = payload.get("phase")
         if version in {5, 6} and phase not in _RECOVERY_PHASES:
@@ -3201,9 +3213,7 @@ class GatewayNodeManager:
                     )
                 ):
                     raise ValueError("cleanup credential auth identity is invalid")
-                credential_auth_identity = (
-                    tuple(auth_identity) if auth_identity else None
-                )
+                credential_auth_identity = tuple(auth_identity) if auth_identity else None
             else:
                 credential_dir, credential_identity = root_identity(credential_payload)
                 credential_auth_identity = None
@@ -3509,6 +3519,7 @@ class GatewayNodeManager:
             log_authority_identity=ownership.log_authority_identity,
             credential_dir=ownership.credential_dir,
             credential_root_identity=ownership.credential_root_identity,
+            credential_auth_identity=ownership.credential_auth_identity,
             credential_mount=(
                 None
                 if ownership.credential_auth_identity is None
