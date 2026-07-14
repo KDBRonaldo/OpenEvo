@@ -91,14 +91,21 @@ bounded scalar filter before storage. URI filtering follows the closed scheme
 syntax and removes userinfo, query, and fragment data for non-HTTP schemes such
 as PostgreSQL and Redis as well as HTTP. Space-separated secret options and
 environment forms such as `--api-key value` and `OPENAI_API_KEY value` redact
-only the value. Allowlisted JSON strings use the same scalar sanitizer as plain
-text. A per-process streaming redactor retains only one
+only the value. Values may be unquoted tokens or complete single-/double-quoted
+values with backslash escapes; an opening quote without a matching close redacts
+the complete remaining line instead of retaining a quote tail. Allowlisted JSON
+strings use this same closed scalar grammar as plain text. A per-process streaming
+redactor retains only one
 bounded incomplete line, so every secret form is recognized even when any token,
 JSON field, URL, or header is split across arbitrary stdout/stderr chunks. Lines
 over 16 KiB are discarded through the next newline and represented only by
 `<redacted-oversize-line>`; an unterminated oversize line receives the same marker
-at EOF. Normal residual lines are sanitized at EOF. No raw prefix is emitted
-before the complete line has passed the generic and generation-credential filters.
+at EOF. Normal residual lines are sanitized at EOF. An exact generation credential
+suffix is treated as a sensitive partial prefix only from a deterministic eight-byte
+minimum, preserving benign text that happens to end in the credential's random first
+character while still suppressing meaningful partial credentials. No raw prefix is
+emitted before the complete line has passed the generic and generation-credential
+filters.
 
 The real subprocess backend starts a dedicated session/process group and binds
 the leader PID to `/proc` start ticks, uid, exact cmdline digest, SID, PGID, and
@@ -194,7 +201,10 @@ supervisor closes; eviction cannot silently turn an old replay into a new restar
 Release restart requests reverify the sealed installed inventory after acquiring
 the lifecycle mutex and validating the supervisor root, before any completed
 replay can return. An attestation change therefore fails closed without spawning
-or mutating service state.
+or mutating service state. A new restart performs its second plan-execution
+reverification through a private force-restart path; both checks complete before
+the active plan key, process group, ledger, replay table, or spawn backend can
+change. This keeps a change detected between the two inventory reads transactional.
 Because auth,
 registration, and health are generation-scoped, a restart rotates the credential
 and replaces the complete four-service group rather than leaving a mixed

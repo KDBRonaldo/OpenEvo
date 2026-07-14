@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import os
 from pathlib import Path
@@ -710,6 +711,119 @@ def test_plain_and_allowlisted_json_strings_use_the_same_sanitizer(
     assert all(value in plain for value in preserved)
 
 
+def test_structured_unknown_field_names_retain_scalar_uri_sanitization() -> None:
+    rendered = supervisor_module._sanitize(
+        json.dumps(
+            {
+                "message": "worker ready",
+                "https://user:pass@example.test/path?token=secret#tail": "ignored",
+            }
+        )
+    )
+    structured = json.loads(rendered)
+
+    assert structured["message"] == "worker ready"
+    assert "user:pass" not in rendered
+    assert "token=secret" not in rendered
+    assert "#tail" not in rendered
+    safe_key = "https://<redacted>@example.test/path?<redacted>"
+    assert structured[safe_key] == "<redacted>"
+
+
+@pytest.mark.parametrize(
+    ("message", "expected", "forbidden"),
+    [
+        (
+            'worker --api-key "cli secret with spaces and \\"escaped\\" text" --model gpt-5',
+            "worker --api-key <redacted> --model gpt-5",
+            ("cli secret", "escaped", 'text"'),
+        ),
+        (
+            "OPENAI_API_KEY 'env secret with spaces and \\'escaped\\' text' worker ready",
+            "OPENAI_API_KEY <redacted> worker ready",
+            ("env secret", "escaped", "text'"),
+        ),
+        (
+            'worker --api-key "closed secret"quote-tail --model gpt-5',
+            "worker --api-key <redacted> --model gpt-5",
+            ("closed secret", "quote-tail"),
+        ),
+        (
+            'worker --password "unterminated secret with quote tail --model gpt-5',
+            "worker --password <redacted>",
+            ("unterminated", "quote tail", "--model", 'gpt-5'),
+        ),
+        (
+            "OPENAI_API_KEY 'unterminated env secret worker ready",
+            "OPENAI_API_KEY <redacted>",
+            ("unterminated", "worker ready"),
+        ),
+    ],
+)
+def test_secret_option_and_env_quoted_values_use_closed_plain_and_json_grammar(
+    message: str,
+    expected: str,
+    forbidden: tuple[str, ...],
+) -> None:
+    plain = supervisor_module._sanitize(message)
+    structured = json.loads(
+        supervisor_module._sanitize(json.dumps({"event": "probe", "message": message}))
+    )["message"]
+
+    assert plain == expected
+    assert structured == expected
+    assert all(value not in plain for value in forbidden)
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        '状态 ready --api-key "cli secret with spaces and \\"escaped\\" text" worker healthy',
+        "状态 ready OPENAI_API_KEY 'env secret with spaces and \\'escaped\\' text' worker healthy",
+        '状态 ready --api-key "unterminated secret with quote tail worker healthy',
+        "状态 ready OPENAI_API_KEY 'unterminated env secret worker healthy",
+    ],
+)
+@pytest.mark.parametrize("terminator", [b"\n", b""])
+def test_quoted_secret_redaction_is_chunk_utf8_and_eof_invariant(
+    message: str,
+    terminator: bytes,
+) -> None:
+    payload = message.encode("utf-8") + terminator
+    expected = supervisor_module._sanitize(message).encode("utf-8") + b"\n"
+
+    for chunk_size in (1, 2, 3, 5, 13, len(payload) + 1):
+        redactor = supervisor_module._BoundedLogStreamRedactor(
+            "supervisor-credential-secret"
+        )
+        rendered = bytearray()
+        for offset in range(0, len(payload), chunk_size):
+            rendered.extend(redactor.feed(payload[offset : offset + chunk_size]))
+        rendered.extend(redactor.flush())
+
+        assert bytes(rendered) == expected
+        assert b"secret" not in rendered
+        assert b"quote tail" not in rendered
+        assert redactor.buffered_bytes == 0
+
+
+def test_credential_eof_partial_prefix_has_deterministic_sensitive_minimum() -> None:
+    urlsafe_alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+
+    for first_character in urlsafe_alphabet:
+        credential = first_character + "ensitive-credential-material-for-supervisor"
+        benign = f"healthy worker marker {first_character}".encode("ascii")
+        benign_redactor = supervisor_module._BoundedLogStreamRedactor(credential)
+        assert benign_redactor.feed(benign) + benign_redactor.flush() == benign + b"\n"
+
+        sensitive_prefix = credential[:16].encode("ascii")
+        prefix_redactor = supervisor_module._BoundedLogStreamRedactor(credential)
+        rendered = prefix_redactor.feed(b"request " + sensitive_prefix)
+        rendered += prefix_redactor.flush()
+        assert rendered == b"request <redacted>\n"
+        assert sensitive_prefix not in rendered
+
+
 @pytest.mark.parametrize(
     "chunk_sizes",
     [
@@ -913,6 +1027,85 @@ def test_release_restart_completed_replay_reverifies_inventory_before_return(
             tmp_path / "release-restart-services" / "ledger.json"
         ).read_bytes() == ledger_before
         assert supervisor._restart_results["release-replay"] == ("gateway", completed)
+    finally:
+        supervisor.close()
+
+
+def test_release_restart_inventory_failure_is_transactional_between_reverifications(
+    tmp_path: Path,
+    framework_lock: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = verified_builtin_registry(tmp_path / "verified-transaction-registry")
+    backend = FakeProcessBackend()
+    runtime_probe = FakeManagedScienceRuntimeProbe()
+
+    class ReleaseHealthChecker(FakeHealthChecker):
+        pass
+
+    monkeypatch.setattr(supervisor_module, "RealSubprocessBackend", lambda: backend)
+    monkeypatch.setattr(supervisor_module, "DefaultHealthChecker", ReleaseHealthChecker)
+    monkeypatch.setattr(supervisor_module, "SocketPortProbe", FakePortProbe)
+    monkeypatch.setattr(
+        supervisor_module,
+        "_probe_rollout_registration",
+        lambda *_args: (True, "healthy"),
+    )
+    monkeypatch.setattr(
+        supervisor_module,
+        "LocalManagedScienceRuntimeProbe",
+        lambda: runtime_probe,
+    )
+    supervisor = CoreServiceSupervisor(
+        launch_mode=ServiceLaunchMode.RELEASE,
+        service_root=tmp_path / "release-transaction-services",
+        framework_lock=framework_lock,
+        verified_registry=registry,
+    )
+    try:
+        assert _ensure_subscription(supervisor).services_available
+        real_identity = supervisor_module.release_identity_from_verified_registry
+        reverify_calls = 0
+
+        def change_between_reverifications(candidate: object) -> ServiceReleaseIdentity:
+            nonlocal reverify_calls
+            reverify_calls += 1
+            if reverify_calls == 2:
+                raise RuntimeError("controlled inventory change between restart checks")
+            return real_identity(candidate)
+
+        monkeypatch.setattr(
+            supervisor_module,
+            "release_identity_from_verified_registry",
+            change_between_reverifications,
+        )
+        plan_key_before = supervisor._active_plan_key
+        handles_before = dict(supervisor._handles)
+        specs_before = dict(supervisor._specs)
+        credential_before = supervisor._active_credential
+        runtime_request_before = supervisor._active_runtime_request
+        ledger_before = copy.deepcopy(supervisor._ledger)
+        ledger_bytes_before = (
+            tmp_path / "release-transaction-services" / "ledger.json"
+        ).read_bytes()
+        replay_before = dict(supervisor._restart_results)
+        spawned_before = list(backend.spawned)
+
+        with pytest.raises(SupervisorStateError, match="could not be revalidated"):
+            supervisor.restart("gateway", operation_id="inventory-race")
+
+        assert reverify_calls == 2
+        assert supervisor._active_plan_key == plan_key_before
+        assert supervisor._handles == handles_before
+        assert supervisor._specs == specs_before
+        assert supervisor._active_credential == credential_before
+        assert supervisor._active_runtime_request == runtime_request_before
+        assert supervisor._ledger == ledger_before
+        assert (
+            tmp_path / "release-transaction-services" / "ledger.json"
+        ).read_bytes() == ledger_bytes_before
+        assert supervisor._restart_results == replay_before
+        assert backend.spawned == spawned_before
     finally:
         supervisor.close()
 

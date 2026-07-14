@@ -69,15 +69,14 @@ _SECRET_RE = re.compile(
     r"|bearer\s+[A-Za-z0-9._~+/=-]+"
 )
 _SECRET_KEY_RE = re.compile(rf"(?i)^{_SECRET_KEY_PATTERN}$")
-_SPACE_SEPARATED_OPTION_SECRET_RE = re.compile(
-    rf"(?i)(?P<prefix>(?<![A-Za-z0-9_-])--(?:{_SECRET_KEY_PATTERN})\s+)"
-    r"(?P<secret>\S+)"
+_SPACE_SEPARATED_OPTION_SECRET_PREFIX_RE = re.compile(
+    rf"(?i)(?<![A-Za-z0-9_-])--(?:{_SECRET_KEY_PATTERN})\s+(?=\S)"
 )
-_SPACE_SEPARATED_ENV_SECRET_RE = re.compile(
-    r"(?P<prefix>(?<![A-Za-z0-9_])(?:[A-Z][A-Z0-9]*_)*(?:"
+_SPACE_SEPARATED_ENV_SECRET_PREFIX_RE = re.compile(
+    r"(?<![A-Za-z0-9_])(?:[A-Z][A-Z0-9]*_)*(?:"
     r"AUTHORIZATION|COOKIE|CREDENTIAL|API_KEY|ACCESS_TOKEN|REFRESH_TOKEN|TOKEN|"
     r"PASSWORD|PASSWD|SECRET|PRIVATE_KEY|AWS_SECRET_ACCESS_KEY|AWS_SESSION_TOKEN"
-    r")\s+)(?P<secret>\S+)"
+    r")\s+(?=\S)"
 )
 _SAFE_STRUCTURED_LOG_KEYS = frozenset(
     {
@@ -110,6 +109,7 @@ _MAX_FRAMEWORK_LOCK_BYTES = 4 * 1024 * 1024
 _ROOT_MODE = 0o700
 _FILE_MODE = 0o600
 _MAX_LOG_LINE_BYTES = 16_384
+_MIN_SENSITIVE_CREDENTIAL_PREFIX_BYTES = 8
 
 
 def _state_digest(value: str) -> str:
@@ -838,11 +838,14 @@ class _BoundedLogStreamRedactor:
 
     def _sanitize_line(self, line: bytes, *, eof: bool) -> bytes:
         line = line.replace(self._credential, b"<redacted>")
-        if eof:
+        if eof and len(self._credential) > _MIN_SENSITIVE_CREDENTIAL_PREFIX_BYTES:
             prefix_size = min(len(line), len(self._credential) - 1)
-            while prefix_size > 0 and not self._credential.startswith(line[-prefix_size:]):
+            while (
+                prefix_size >= _MIN_SENSITIVE_CREDENTIAL_PREFIX_BYTES
+                and not self._credential.startswith(line[-prefix_size:])
+            ):
                 prefix_size -= 1
-            if prefix_size:
+            if prefix_size >= _MIN_SENSITIVE_CREDENTIAL_PREFIX_BYTES:
                 line = line[:-prefix_size] + b"<redacted>"
         safe = _sanitize(line.decode("utf-8", errors="replace"))
         return (safe.encode("utf-8") + b"\n") if safe else b""
@@ -1547,6 +1550,25 @@ class CoreServiceSupervisor:
         runtime_image: str | None = None,
         total_timeout: float | None = None,
     ) -> ServiceGroupSnapshot:
+        return self._ensure_locked(
+            execution_mode,
+            model_ref=model_ref,
+            codex_model=codex_model,
+            runtime_image=runtime_image,
+            total_timeout=total_timeout,
+            force_restart=False,
+        )
+
+    def _ensure_locked(
+        self,
+        execution_mode: ServiceExecutionMode,
+        *,
+        model_ref: str | None = None,
+        codex_model: str | None = None,
+        runtime_image: str | None = None,
+        total_timeout: float | None = None,
+        force_restart: bool,
+    ) -> ServiceGroupSnapshot:
         with self._mutex:
             self._require_open()
             self._verify_release_installation()
@@ -1593,7 +1615,8 @@ class CoreServiceSupervisor:
                 }
             )
             if (
-                runtime.ready
+                not force_restart
+                and runtime.ready
                 and self._active_plan_key == plan_key
                 and self._active_credential is not None
                 and self._specs
@@ -1804,12 +1827,12 @@ class CoreServiceSupervisor:
             runtime_request = self._active_runtime_request
             if runtime_request is None:
                 raise SupervisorStateError("subscription runtime request is unavailable")
-            self._active_plan_key = None
-            snapshot = self.ensure(
+            snapshot = self._ensure_locked(
                 ServiceExecutionMode.CODEX_SUBSCRIPTION_TRANSCRIPT,
                 codex_model=runtime_request.codex_model,
                 runtime_image=runtime_request.runtime_image,
                 total_timeout=total_timeout,
+                force_restart=True,
             )
             result = snapshot.service(service_id)
             self._restart_results[operation_id] = (service_id, result)
@@ -3087,24 +3110,68 @@ def _sanitize(value: str) -> str:
             structured = json.loads(text)
         except json.JSONDecodeError:
             return "<redacted-structured-log>"
-        text = json.dumps(
+        serialized = json.dumps(
             _sanitize_structured_log(structured),
             ensure_ascii=True,
             allow_nan=False,
             sort_keys=True,
             separators=(",", ":"),
         )
+        return serialized if len(serialized) <= 16_384 else "<redacted-oversize-structured-log>"
     return _sanitize_scalar_text(text, max_chars=16_384)
 
 
 def _sanitize_scalar_text(value: str, *, max_chars: int) -> str:
     text = value.replace("\x00", "").replace("\r", " ").replace("\n", " ")
     text = _URI_RE.sub(_sanitize_uri_match, text)
-    text = _SPACE_SEPARATED_OPTION_SECRET_RE.sub(r"\g<prefix><redacted>", text)
-    text = _SPACE_SEPARATED_ENV_SECRET_RE.sub(r"\g<prefix><redacted>", text)
+    text = _redact_space_separated_secrets(text)
     text = _SECRET_RE.sub("<redacted>", text)
     text = _ABSOLUTE_PATH_RE.sub("<path>", text)
     return " ".join(text.split())[:max_chars]
+
+
+def _redact_space_separated_secrets(value: str) -> str:
+    output: list[str] = []
+    cursor = 0
+    while cursor < len(value):
+        matches = tuple(
+            match
+            for pattern in (
+                _SPACE_SEPARATED_OPTION_SECRET_PREFIX_RE,
+                _SPACE_SEPARATED_ENV_SECRET_PREFIX_RE,
+            )
+            if (match := pattern.search(value, cursor)) is not None
+        )
+        if not matches:
+            output.append(value[cursor:])
+            break
+        match = min(matches, key=lambda candidate: (candidate.start(), candidate.end()))
+        output.append(value[cursor : match.end()])
+        output.append("<redacted>")
+        secret_start = match.end()
+        quote = value[secret_start]
+        if quote not in {"'", '"'}:
+            secret_end = secret_start + 1
+            while secret_end < len(value) and not value[secret_end].isspace():
+                secret_end += 1
+            cursor = secret_end
+            continue
+        secret_end = secret_start + 1
+        while secret_end < len(value):
+            character = value[secret_end]
+            if character == "\\":
+                secret_end += 2
+                continue
+            secret_end += 1
+            if character == quote:
+                while secret_end < len(value) and not value[secret_end].isspace():
+                    secret_end += 1
+                break
+        else:
+            cursor = len(value)
+            continue
+        cursor = secret_end
+    return "".join(output)
 
 
 def _sanitize_uri_match(match: re.Match[str]) -> str:
@@ -3127,12 +3194,15 @@ def _sanitize_structured_log(value: object, *, key: str | None = None) -> object
         result: dict[str, object] = {}
         for raw_key, item in value.items():
             field_name = str(raw_key)
+            safe_field_name = _sanitize_scalar_text(field_name, max_chars=256)
+            if not safe_field_name:
+                safe_field_name = "<redacted-field>"
             if _SECRET_KEY_RE.fullmatch(field_name) is not None:
-                result[field_name] = "<redacted>"
+                result[safe_field_name] = "<redacted>"
             elif field_name in _SAFE_STRUCTURED_LOG_KEYS:
-                result[field_name] = _sanitize_structured_log(item, key=field_name)
+                result[safe_field_name] = _sanitize_structured_log(item, key=field_name)
             else:
-                result[field_name] = "<redacted>"
+                result[safe_field_name] = "<redacted>"
         return result
     if isinstance(value, list):
         return ["<redacted>" for _item in value[:128]]
