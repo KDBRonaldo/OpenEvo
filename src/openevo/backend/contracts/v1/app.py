@@ -64,10 +64,11 @@ IdempotencyKey = Annotated[
 ]
 IfMatch = Annotated[
     str,
+    m.StringConstraints(pattern=r'^"[0-9a-f]{64}"$'),
     Header(
         alias="If-Match",
-        min_length=1,
-        max_length=256,
+        min_length=66,
+        max_length=66,
         description="ETag of the mutable resource.",
     ),
 ]
@@ -76,7 +77,7 @@ PageLimit = Annotated[int, Query(ge=1, le=100)]
 PageCursor = Annotated[str | None, Query(min_length=1, max_length=512)]
 LastEventId = Annotated[
     str | None,
-    Header(alias="Last-Event-ID", min_length=1, max_length=128),
+    Header(alias="Last-Event-ID", min_length=1, max_length=512),
 ]
 
 
@@ -238,17 +239,114 @@ def create_core_control_contract_app() -> FastAPI:
     ) -> Response:
         return _not_implemented()
 
+    @router.get(
+        "/projects/{project_id}/revisions",
+        operation_id="listCoreProjectRevisionsV1",
+        response_model=m.RevisionPageV1,
+        responses=_ERROR_RESPONSES,
+        tags=["revisions"],
+    )
+    async def list_revisions(
+        project_id: ResourceId,
+        limit: PageLimit = 50,
+        after: PageCursor = None,
+        sort: Annotated[Literal["generation", "created_at", "updated_at"], Query()] = (
+            "generation"
+        ),
+        direction: Annotated[Literal["asc", "desc"], Query()] = "desc",
+    ) -> Response:
+        return _not_implemented()
+
+    @router.get(
+        "/projects/{project_id}/revisions/head",
+        operation_id="getCoreProjectRevisionHeadV1",
+        response_model=m.RevisionHeadV1,
+        responses=_ERROR_RESPONSES,
+        tags=["revisions"],
+    )
+    async def revision_head(project_id: ResourceId) -> Response:
+        return _not_implemented()
+
+    @router.get(
+        "/revisions/{revision_id}",
+        operation_id="getCoreRevisionV1",
+        response_model=m.RevisionV1,
+        responses=_ERROR_RESPONSES,
+        tags=["revisions"],
+    )
+    async def get_revision(revision_id: ResourceId) -> Response:
+        return _not_implemented()
+
     @router.post(
-        "/projects/{project_id}/workspace-sync",
-        operation_id="syncCoreProjectWorkspaceV1",
+        "/projects/{project_id}/workspace-uploads",
+        operation_id="createCoreWorkspaceUploadV1",
+        response_model=m.WorkspaceUploadSessionV1,
+        status_code=201,
+        responses=_ERROR_RESPONSES,
+        tags=["workspace"],
+    )
+    async def create_workspace_upload(
+        project_id: ResourceId,
+        request: m.WorkspaceUploadCreateV1,
+        idempotency_key: IdempotencyKey,
+    ) -> Response:
+        return _not_implemented()
+
+    @router.get(
+        "/projects/{project_id}/workspace-uploads/{upload_id}",
+        operation_id="getCoreWorkspaceUploadV1",
+        response_model=m.WorkspaceUploadSessionV1,
+        responses=_ERROR_RESPONSES,
+        tags=["workspace"],
+    )
+    async def get_workspace_upload(project_id: ResourceId, upload_id: ResourceId) -> Response:
+        return _not_implemented()
+
+    @router.put(
+        "/projects/{project_id}/workspace-uploads/{upload_id}/chunk",
+        operation_id="putCoreWorkspaceUploadChunkV1",
+        response_model=m.WorkspaceUploadSessionV1,
+        responses=_ERROR_RESPONSES,
+        tags=["workspace"],
+    )
+    async def put_workspace_upload_chunk(
+        project_id: ResourceId,
+        upload_id: ResourceId,
+        request: m.WorkspaceUploadChunkV1,
+        if_match: IfMatch,
+        idempotency_key: IdempotencyKey,
+    ) -> Response:
+        return _not_implemented()
+
+    @router.post(
+        "/projects/{project_id}/workspace-uploads/{upload_id}/finalize",
+        operation_id="finalizeCoreWorkspaceUploadV1",
         response_model=m.WorkspaceSnapshotV1,
         status_code=201,
         responses=_ERROR_RESPONSES,
-        tags=["projects"],
+        tags=["workspace"],
     )
-    async def workspace_sync(
+    async def finalize_workspace_upload(
         project_id: ResourceId,
-        request: m.WorkspaceSyncRequestV1,
+        upload_id: ResourceId,
+        request: m.WorkspaceUploadFinalizeV1,
+        if_match: IfMatch,
+        idempotency_key: IdempotencyKey,
+    ) -> Response:
+        return _not_implemented()
+
+    @router.post(
+        "/projects/{project_id}/workspace-uploads/{upload_id}/abort",
+        operation_id="abortCoreWorkspaceUploadV1",
+        response_model=m.WorkspaceUploadSessionV1,
+        responses=_ERROR_RESPONSES,
+        tags=["workspace"],
+    )
+    async def abort_workspace_upload(
+        project_id: ResourceId,
+        upload_id: ResourceId,
+        request: m.WorkspaceUploadAbortV1,
+        if_match: IfMatch,
         idempotency_key: IdempotencyKey,
     ) -> Response:
         return _not_implemented()
@@ -335,6 +433,7 @@ def create_core_control_contract_app() -> FastAPI:
     async def cancel_run(
         run_id: ResourceId,
         request: m.RunCancelRequestV1,
+        if_match: IfMatch,
         idempotency_key: IdempotencyKey,
     ) -> Response:
         return _not_implemented()
@@ -350,6 +449,7 @@ def create_core_control_contract_app() -> FastAPI:
     async def retry_run(
         run_id: ResourceId,
         request: m.RunRetryRequestV1,
+        if_match: IfMatch,
         idempotency_key: IdempotencyKey,
     ) -> Response:
         return _not_implemented()
@@ -462,6 +562,16 @@ def create_core_control_contract_app() -> FastAPI:
     ) -> Response:
         return _not_implemented()
 
+    @router.get(
+        "/services/{service_id}",
+        operation_id="getCoreServiceV1",
+        response_model=m.ServiceSummaryV1,
+        responses=_ERROR_RESPONSES,
+        tags=["services"],
+    )
+    async def get_service(service_id: ResourceId) -> Response:
+        return _not_implemented()
+
     @router.post(
         "/services/{service_id}/restart",
         operation_id="restartCoreServiceV1",
@@ -473,21 +583,7 @@ def create_core_control_contract_app() -> FastAPI:
     async def restart_service(
         service_id: ResourceId,
         request: m.ServiceRestartRequestV1,
-        idempotency_key: IdempotencyKey,
-    ) -> Response:
-        return _not_implemented()
-
-    @router.post(
-        "/services/{service_id}/stop",
-        operation_id="stopCoreServiceV1",
-        response_model=m.ServiceActionV1,
-        status_code=202,
-        responses=_ERROR_RESPONSES,
-        tags=["services"],
-    )
-    async def stop_service(
-        service_id: ResourceId,
-        request: m.ServiceStopRequestV1,
+        if_match: IfMatch,
         idempotency_key: IdempotencyKey,
     ) -> Response:
         return _not_implemented()
@@ -588,6 +684,8 @@ def create_core_control_contract_app() -> FastAPI:
         events_operation["x-sse-delivery"] = "at-least-once"
         events_operation["x-sse-heartbeat-seconds"] = 15
         events_operation["x-sse-replay"] = "bounded"
+        events_operation["x-sse-replay-max-events"] = 10_000
+        events_operation["x-sse-cursor-expired-status"] = 410
         events_operation["responses"]["200"]["content"] = {
             "text/event-stream": {"schema": {"$ref": "#/components/schemas/EventEnvelopeV1"}}
         }
