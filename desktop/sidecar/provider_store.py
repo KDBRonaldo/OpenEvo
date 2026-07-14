@@ -88,6 +88,7 @@ _CURSOR_NONCE_BYTES = 16
 _CURSOR_TOKEN_VERSION = 1
 _CURSOR_TOKEN = struct.Struct(">BQQ32s16s")
 _CURSOR_KEY_TEMP_PREFIX = f".{CURSOR_KEY_FILENAME}.tmp-"
+_ACTION_AUTHORITY_DOMAIN = b"openevo.desktop.local-action-authority.v1\0"
 _RENAME_NOREPLACE = 1
 _RENAME_EXCL = 0x00000004
 _ETAG_RE = re.compile(r'^"[0-9a-f]{64}"$')
@@ -384,6 +385,7 @@ _SCHEMA_V2 = (
         state TEXT NOT NULL,
         resource_type TEXT NOT NULL,
         resource_id TEXT NOT NULL,
+        action_identity_digest TEXT UNIQUE,
         document_json BLOB NOT NULL,
         resource_version INTEGER NOT NULL CHECK (resource_version >= 1),
         created_at TEXT NOT NULL,
@@ -400,7 +402,10 @@ _SCHEMA_V2 = (
         CHECK (resource_type IN (
             'profile', 'project', 'operation', 'run', 'artifact', 'service',
             'diagnostic', 'maintenance'
-        ))
+        )),
+        CHECK (
+            action_identity_digest IS NULL OR length(action_identity_digest) = 64
+        )
     ) STRICT
     """,
     """
@@ -411,6 +416,7 @@ _SCHEMA_V2 = (
         resource_scope TEXT NOT NULL,
         idempotency_key TEXT NOT NULL,
         request_digest TEXT NOT NULL,
+        operation_id TEXT UNIQUE,
         response_type TEXT NOT NULL,
         status_code INTEGER NOT NULL CHECK (status_code BETWEEN 100 AND 599),
         response_bytes BLOB NOT NULL,
@@ -423,9 +429,18 @@ _SCHEMA_V2 = (
         CHECK (length(CAST(resource_scope AS BLOB)) BETWEEN 1 AND 512),
         CHECK (length(CAST(idempotency_key AS BLOB)) BETWEEN 16 AND 256),
         CHECK (length(request_digest) = 64),
+        CHECK (
+            operation_id IS NULL OR
+            length(CAST(operation_id AS BLOB)) BETWEEN 1 AND 512
+        ),
         CHECK (response_type IN ('ProjectV1', 'RemoteProfileV1', 'LocalOperationV1')),
         CHECK (length(response_bytes) <= 136314880),
-        CHECK (expires_at_epoch > created_at_epoch)
+        CHECK (expires_at_epoch > created_at_epoch),
+        CHECK (
+            (response_type = 'LocalOperationV1' AND operation_id IS NOT NULL) OR
+            (response_type != 'LocalOperationV1' AND operation_id IS NULL)
+        ),
+        FOREIGN KEY (operation_id) REFERENCES local_operations(operation_id) ON DELETE RESTRICT
     ) STRICT
     """,
     """
@@ -738,12 +753,11 @@ class ProviderMutation:
             (profile_id,),
         ).fetchall()
         for row in rows:
-            self._store._reconcile_operation_with_authority(
+            self._store._cancel_operation_with_authority(
                 self._connection,
                 self._store._require_operation_row(
                     self._connection, cast(str, row["operation_id"])
                 ),
-                force_cancel_nonterminal=True,
             )
 
     def create_local_operation(
@@ -781,6 +795,11 @@ class ProviderMutation:
         )
         self._store._validate_operation_authority(self._connection, operation)
         document = _canonical_json_bytes(operation.model_dump(mode="json"))
+        if not terminal:
+            self._store._validate_nonterminal_operation_terminal_capacity(
+                self._connection,
+                operation,
+            )
         self._connection.execute(
             """
             INSERT INTO local_operations(
@@ -1357,11 +1376,11 @@ class DesktopProviderStore:
             """
             INSERT INTO idempotency_records(
                 principal, method, route, resource_scope, idempotency_key,
-                request_digest, response_type, status_code, response_bytes,
+                request_digest, operation_id, response_type, status_code, response_bytes,
                 created_at_epoch, expires_at_epoch
             )
             SELECT principal, method, route, resource_scope, idempotency_key,
-                   request_digest, response_type, status_code, response_bytes,
+                   request_digest, NULL, response_type, status_code, response_bytes,
                    created_at_epoch, expires_at_epoch
             FROM idempotency_records_v1
             """
@@ -1419,6 +1438,7 @@ class DesktopProviderStore:
                 self._validate_operation_recovery_row(cast(sqlite3.Row, row))
             for row in connection.execute("SELECT * FROM idempotency_records"):
                 self._validate_idempotency_recovery_row(cast(sqlite3.Row, row))
+            self._validate_live_action_authorities(connection)
             for row in connection.execute("SELECT * FROM pagination_cursors"):
                 self._validate_cursor_recovery_row(cast(sqlite3.Row, row))
             timestamp = self._timestamp()
@@ -1478,12 +1498,12 @@ class DesktopProviderStore:
             (
                 "idempotency_records",
                 "principal, method, route, resource_scope, idempotency_key, request_digest, "
-                "response_type, response_bytes",
+                "operation_id, response_type, response_bytes",
             ),
             (
                 "local_operations",
                 "operation_id, operation_kind, state, resource_type, resource_id, "
-                "document_json, created_at, finished_at",
+                "action_identity_digest, document_json, created_at, finished_at",
             ),
             (
                 "pagination_cursors",
@@ -1512,6 +1532,7 @@ class DesktopProviderStore:
     @classmethod
     def _validate_write_budget(cls, connection: sqlite3.Connection) -> None:
         total_rows, total_bytes = cls._recovery_usage(connection)
+        cls._validate_live_action_authorities(connection)
         profile_reservations = cast(
             int,
             connection.execute(
@@ -1525,6 +1546,7 @@ class DesktopProviderStore:
                     SELECT 1
                     FROM idempotency_records AS idempotency
                     WHERE idempotency.response_type = 'LocalOperationV1'
+                      AND idempotency.operation_id = operation.operation_id
                       AND idempotency.response_bytes = operation.document_json
                   )
                 """
@@ -1544,6 +1566,7 @@ class DesktopProviderStore:
                     SELECT 1
                     FROM idempotency_records AS idempotency
                     WHERE idempotency.response_type = 'LocalOperationV1'
+                      AND idempotency.operation_id = operation.operation_id
                       AND idempotency.response_bytes = operation.document_json
                   )
                 """
@@ -1559,6 +1582,29 @@ class DesktopProviderStore:
             or reserved_bytes > MAX_RECOVERY_BYTES - total_bytes
         ):
             raise ProviderDataCorruptionError("provider recovery budget exceeded")
+
+    @staticmethod
+    def _validate_live_action_authorities(connection: sqlite3.Connection) -> None:
+        missing = connection.execute(
+            """
+            SELECT 1
+            FROM local_operations AS operation
+            WHERE operation.state IN ('queued', 'running', 'cancelling')
+              AND operation.action_identity_digest IS NOT NULL
+              AND NOT EXISTS (
+                SELECT 1
+                FROM idempotency_records AS idempotency
+                WHERE idempotency.operation_id = operation.operation_id
+                  AND idempotency.response_type = 'LocalOperationV1'
+                  AND idempotency.response_bytes = operation.document_json
+              )
+            LIMIT 1
+            """
+        ).fetchone()
+        if missing is not None:
+            raise ProviderDataCorruptionError(
+                "live operation action authority has no exact idempotency record"
+            )
 
     def _validate_migration_rows(self, connection: sqlite3.Connection) -> None:
         rows = connection.execute(
@@ -1618,6 +1664,12 @@ class DesktopProviderStore:
 
     def _validate_operation_recovery_row(self, row: sqlite3.Row) -> None:
         operation = self._operation_from_row(row)
+        action_identity_digest = row["action_identity_digest"]
+        if action_identity_digest is not None and (
+            type(action_identity_digest) is not str
+            or _DIGEST_RE.fullmatch(action_identity_digest) is None
+        ):
+            raise ProviderDataCorruptionError("operation action authority digest is invalid")
         if (
             operation.operation_kind != row["operation_kind"]
             or operation.state != row["state"]
@@ -1675,6 +1727,14 @@ class DesktopProviderStore:
                 raise ProviderDataCorruptionError("idempotency identity is invalid") from exc
         if _DIGEST_RE.fullmatch(cast(str, row["request_digest"])) is None:
             raise ProviderDataCorruptionError("idempotency request digest is invalid")
+        operation_id = row["operation_id"]
+        if operation_id is not None:
+            try:
+                self._validate_resource_id(cast(str, operation_id))
+            except ContractValidationError as exc:
+                raise ProviderDataCorruptionError(
+                    "idempotency operation identity is invalid"
+                ) from exc
         if (
             type(row["created_at_epoch"]) is not int
             or type(row["expires_at_epoch"]) is not int
@@ -1908,12 +1968,8 @@ class DesktopProviderStore:
 
     def get_local_operation(self, operation_id: str) -> LocalOperationV1:
         self._validate_resource_id(operation_id)
-        with self._transaction(write=True) as connection:
-            return self._reconcile_operation_with_authority(
-                connection,
-                self._require_operation_row(connection, operation_id),
-                force_cancel_nonterminal=False,
-            )
+        with self._transaction(write=False) as connection:
+            return self._operation_from_row(self._require_operation_row(connection, operation_id))
 
     def patch_project(
         self,
@@ -2090,6 +2146,7 @@ class DesktopProviderStore:
                 resource_scope=identity[2],
                 key=identity[3],
                 request_digest=identity[4],
+                operation_id=operation.operation_id,
                 response_type="LocalOperationV1",
                 status_code=202,
                 response_bytes=response_bytes,
@@ -2338,8 +2395,15 @@ class DesktopProviderStore:
             SET status_code = ?, response_bytes = ?
             WHERE principal = ? AND method = ? AND route = ?
               AND resource_scope = ? AND idempotency_key = ? AND request_digest = ?
+              AND operation_id = ?
             """,
-            (status_code, response_bytes, LOCAL_PRINCIPAL, *identity[:5]),
+            (
+                status_code,
+                response_bytes,
+                LOCAL_PRINCIPAL,
+                *identity[:5],
+                operation.operation_id,
+            ),
         )
         if updated.rowcount != 1:
             raise ProviderStoreError("profile action idempotency reservation changed")
@@ -2410,6 +2474,7 @@ class DesktopProviderStore:
                 resource_scope=identity[2],
                 key=identity[3],
                 request_digest=identity[4],
+                operation_id=operation.operation_id,
                 response_type="LocalOperationV1",
                 status_code=202,
                 response_bytes=response_bytes,
@@ -2713,8 +2778,15 @@ class DesktopProviderStore:
             SET status_code = ?, response_bytes = ?
             WHERE principal = ? AND method = ? AND route = ?
               AND resource_scope = ? AND idempotency_key = ? AND request_digest = ?
+              AND operation_id = ?
             """,
-            (status_code, response_bytes, LOCAL_PRINCIPAL, *identity[:5]),
+            (
+                status_code,
+                response_bytes,
+                LOCAL_PRINCIPAL,
+                *identity[:5],
+                operation.operation_id,
+            ),
         )
         if updated.rowcount != 1:
             raise ProviderStoreError("project action idempotency reservation changed")
@@ -2812,15 +2884,9 @@ class DesktopProviderStore:
                 if isinstance(replay_response, LocalOperationV1):
                     replay_response = cast(
                         _ModelT,
-                        self._reconcile_operation_with_authority(
+                        self._operation_for_idempotency_record(
                             connection,
-                            self._require_operation_row(
-                                connection,
-                                self._operation_for_idempotency_record(
-                                    connection, cast(sqlite3.Row, existing)
-                                ).operation_id,
-                            ),
-                            force_cancel_nonterminal=False,
+                            cast(sqlite3.Row, existing),
                         ),
                     )
                     response_bytes = _canonical_json_bytes(replay_response.model_dump(mode="json"))
@@ -2876,6 +2942,9 @@ class DesktopProviderStore:
                 resource_scope=resource_scope,
                 key=key,
                 request_digest=request_digest,
+                operation_id=(
+                    response.operation_id if isinstance(response, LocalOperationV1) else None
+                ),
                 response_type=response_type,
                 status_code=status_code,
                 response_bytes=response_bytes,
@@ -2949,8 +3018,7 @@ class DesktopProviderStore:
         else:
             raise ContractValidationError("local action operation kind is not persistable")
         expected_route = (
-            f"/desktop/v1/{collection}/{resource_scope}/"
-            f"{_ACTION_ROUTE_SUFFIXES[operation_kind]}"
+            f"/desktop/v1/{collection}/{resource_scope}/{_ACTION_ROUTE_SUFFIXES[operation_kind]}"
         )
         if resource_type != expected_resource_type or route != expected_route:
             raise ContractValidationError(
@@ -2970,6 +3038,10 @@ class DesktopProviderStore:
         stored = self._model_from_response(LocalOperationV1, response_bytes)
         if _canonical_json_bytes(stored.model_dump(mode="json")) != response_bytes:
             raise ProviderDataCorruptionError("operation idempotency response is not canonical")
+        if row["operation_id"] != stored.operation_id:
+            raise ProviderDataCorruptionError(
+                "operation idempotency authority references another operation"
+            )
         try:
             operation_row = self._require_operation_row(connection, stored.operation_id)
         except ResourceNotFoundError as exc:
@@ -2981,6 +3053,22 @@ class DesktopProviderStore:
         if response_bytes != operation_bytes or stored != operation:
             raise ProviderDataCorruptionError(
                 "operation idempotency response differs from its exact operation row"
+            )
+        expected_authority = self._action_authority_digest(
+            principal=cast(str, row["principal"]),
+            method=cast(str, row["method"]),
+            route=cast(str, row["route"]),
+            resource_scope=cast(str, row["resource_scope"]),
+            key=cast(str, row["idempotency_key"]),
+            request_digest=cast(str, row["request_digest"]),
+            operation=operation,
+        )
+        if not hmac.compare_digest(
+            cast(str | None, operation_row["action_identity_digest"]) or "",
+            expected_authority,
+        ):
+            raise ProviderDataCorruptionError(
+                "operation row differs from its exact idempotency action authority"
             )
         if (
             row["principal"] != LOCAL_PRINCIPAL
@@ -3004,60 +3092,98 @@ class DesktopProviderStore:
         return operation
 
     @staticmethod
+    def _action_authority_digest(
+        *,
+        principal: str,
+        method: str,
+        route: str,
+        resource_scope: str,
+        key: str,
+        request_digest: str,
+        operation: LocalOperationV1,
+    ) -> str:
+        identity_bytes = _canonical_json_bytes(
+            {
+                "principal": principal,
+                "method": method,
+                "route": route,
+                "resource_scope": resource_scope,
+                "idempotency_key": key,
+                "request_digest": request_digest,
+                "operation_id": operation.operation_id,
+                "operation_kind": operation.operation_kind,
+            }
+        )
+        return sha256(_ACTION_AUTHORITY_DOMAIN + identity_bytes).hexdigest()
+
     def _cleanup_expired_idempotency_records(
+        self,
         connection: sqlite3.Connection,
         now_epoch: int,
     ) -> None:
         connection.execute(
             """
             DELETE FROM idempotency_records
-            WHERE expires_at_epoch <= ?
-              AND NOT EXISTS (
-                SELECT 1
-                FROM local_operations AS operation
-                WHERE idempotency_records.response_type = 'LocalOperationV1'
-                  AND idempotency_records.method = 'POST'
-                  AND idempotency_records.resource_scope = operation.resource_id
-                  AND idempotency_records.response_bytes = operation.document_json
-                  AND operation.state IN ('queued', 'running', 'cancelling')
-                  AND (
-                    (operation.operation_kind = 'profile_connect'
-                      AND operation.resource_type = 'profile'
-                      AND idempotency_records.route = '/desktop/v1/profiles/'
-                        || operation.resource_id || '/connect')
-                    OR (operation.operation_kind = 'profile_disconnect'
-                      AND operation.resource_type = 'profile'
-                      AND idempotency_records.route = '/desktop/v1/profiles/'
-                        || operation.resource_id || '/disconnect')
-                    OR (operation.operation_kind = 'host_key_accept'
-                      AND operation.resource_type = 'profile'
-                      AND idempotency_records.route = '/desktop/v1/profiles/'
-                        || operation.resource_id || '/host-key/accept')
-                    OR (operation.operation_kind = 'project_activate'
-                      AND operation.resource_type = 'project'
-                      AND idempotency_records.route = '/desktop/v1/projects/'
-                        || operation.resource_id || '/activate')
-                    OR (operation.operation_kind = 'project_doctor'
-                      AND operation.resource_type = 'project'
-                      AND idempotency_records.route = '/desktop/v1/projects/'
-                        || operation.resource_id || '/doctor')
-                    OR (operation.operation_kind = 'project_repair'
-                      AND operation.resource_type = 'project'
-                      AND idempotency_records.route = '/desktop/v1/projects/'
-                        || operation.resource_id || '/repair')
-                    OR (operation.operation_kind = 'bootstrap'
-                      AND operation.resource_type = 'project'
-                      AND idempotency_records.route = '/desktop/v1/projects/'
-                        || operation.resource_id || '/bootstrap')
-                    OR (operation.operation_kind = 'workspace_sync'
-                      AND operation.resource_type = 'project'
-                      AND idempotency_records.route = '/desktop/v1/projects/'
-                        || operation.resource_id || '/workspace-sync')
-                  )
-              )
+            WHERE expires_at_epoch <= ? AND response_type != 'LocalOperationV1'
             """,
             (now_epoch,),
         )
+        after_operation_id = ""
+        while True:
+            operation_ids = connection.execute(
+                """
+                SELECT operation_id
+                FROM idempotency_records
+                WHERE expires_at_epoch <= ? AND response_type = 'LocalOperationV1'
+                  AND operation_id > ?
+                ORDER BY operation_id
+                LIMIT ?
+                """,
+                (now_epoch, after_operation_id, STARTUP_OPERATION_BATCH_ROWS),
+            ).fetchall()
+            if not operation_ids:
+                return
+            for operation_id_row in operation_ids:
+                operation_id = cast(str, operation_id_row["operation_id"])
+                row = connection.execute(
+                    "SELECT * FROM idempotency_records WHERE operation_id = ?",
+                    (operation_id,),
+                ).fetchone()
+                if row is None:
+                    raise ProviderDataCorruptionError(
+                        "operation idempotency record changed during cleanup"
+                    )
+                row = cast(sqlite3.Row, row)
+                operation = self._operation_for_idempotency_record(connection, row)
+                if operation.state not in {"queued", "running", "cancelling"}:
+                    deleted = connection.execute(
+                        """
+                        DELETE FROM idempotency_records
+                        WHERE principal = ? AND method = ? AND route = ?
+                          AND resource_scope = ? AND idempotency_key = ?
+                          AND request_digest = ? AND operation_id = ?
+                          AND response_type = 'LocalOperationV1' AND response_bytes = ?
+                          AND expires_at_epoch <= ?
+                        """,
+                        (
+                            row["principal"],
+                            row["method"],
+                            row["route"],
+                            row["resource_scope"],
+                            row["idempotency_key"],
+                            row["request_digest"],
+                            row["operation_id"],
+                            row["response_bytes"],
+                            now_epoch,
+                        ),
+                    )
+                    if deleted.rowcount != 1:
+                        raise ProviderDataCorruptionError(
+                            "terminal operation idempotency record changed during cleanup"
+                        )
+                after_operation_id = operation_id
+            if len(operation_ids) < STARTUP_OPERATION_BATCH_ROWS:
+                return
 
     def _insert_idempotency_record(
         self,
@@ -3069,18 +3195,54 @@ class DesktopProviderStore:
         resource_scope: str,
         key: str,
         request_digest: str,
+        operation_id: str | None,
         response_type: str,
         status_code: int,
         response_bytes: bytes,
         now_epoch: int,
     ) -> None:
+        if (response_type == "LocalOperationV1") != (operation_id is not None):
+            raise ProviderStoreError(
+                "operation idempotency response requires an exact operation identity"
+            )
+        if operation_id is not None:
+            operation_row = self._require_operation_row(connection, operation_id)
+            operation = self._operation_from_row(operation_row)
+            if bytes(operation_row["document_json"]) != response_bytes:
+                raise ProviderStoreError(
+                    "operation idempotency response differs from the operation row"
+                )
+            authority_digest = self._action_authority_digest(
+                principal=principal,
+                method=method,
+                route=route,
+                resource_scope=resource_scope,
+                key=key,
+                request_digest=request_digest,
+                operation=operation,
+            )
+            bound = connection.execute(
+                """
+                UPDATE local_operations
+                SET action_identity_digest = ?
+                WHERE operation_id = ?
+                  AND (
+                    action_identity_digest IS NULL OR action_identity_digest = ?
+                  )
+                """,
+                (authority_digest, operation_id, authority_digest),
+            )
+            if bound.rowcount != 1:
+                raise ProviderStoreError(
+                    "operation is already bound to another idempotency action"
+                )
         connection.execute(
             """
             INSERT INTO idempotency_records(
                 principal, method, route, resource_scope, idempotency_key,
-                request_digest, response_type, status_code, response_bytes,
+                request_digest, operation_id, response_type, status_code, response_bytes,
                 created_at_epoch, expires_at_epoch
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 principal,
@@ -3089,6 +3251,7 @@ class DesktopProviderStore:
                 resource_scope,
                 key,
                 request_digest,
+                operation_id,
                 response_type,
                 status_code,
                 response_bytes,
@@ -3351,6 +3514,57 @@ class DesktopProviderStore:
                     "succeeded project operation requires a project result"
                 )
 
+    @staticmethod
+    def _operation_terminal_slot_bytes(operation_kind: str) -> int:
+        if operation_kind in _PROFILE_OPERATION_KINDS:
+            return PROFILE_RUNTIME_TERMINAL_SLOT_BYTES
+        if operation_kind in _PROJECT_OPERATION_KINDS:
+            return PROJECT_RUNTIME_TERMINAL_SLOT_BYTES
+        raise ContractValidationError("local operation kind has no terminal capacity slot")
+
+    def _validate_nonterminal_operation_terminal_capacity(
+        self,
+        connection: sqlite3.Connection,
+        operation: LocalOperationV1,
+    ) -> None:
+        cancelled = _validate_model(
+            LocalOperationV1,
+            {
+                **operation.model_dump(mode="python"),
+                "state": "cancelled",
+                "result": self._startup_cancellation_result(connection, operation),
+                "error": None,
+                "finished_at": operation.created_at,
+                "etag": self._etag("operation", operation.operation_id, 2),
+            },
+        )
+        terminal_bytes = _canonical_json_bytes(cancelled.model_dump(mode="json"))
+        if len(terminal_bytes) > self._operation_terminal_slot_bytes(operation.operation_kind):
+            raise ContractValidationError(
+                "nonterminal local operation exceeds its fixed terminal slot"
+            )
+
+    def _startup_cancellation_result(
+        self,
+        connection: sqlite3.Connection,
+        operation: LocalOperationV1,
+    ) -> LocalOperationResultV1 | None:
+        if operation.operation_kind in _PROFILE_OPERATION_KINDS:
+            return ConnectionOperationResultV1(
+                profile_id=operation.resource.resource_id,
+                connection_state="disconnected",
+            )
+        if operation.operation_kind == "project_activate":
+            row = self._require_project_row(connection, operation.resource.resource_id)
+            return ProjectOperationResultV1(
+                project_id=operation.resource.resource_id,
+                project_etag=self._etag(
+                    "project", operation.resource.resource_id, row["resource_version"] + 1
+                ),
+                active=False,
+            )
+        return operation.result
+
     def _authoritative_operation_result(
         self, connection: sqlite3.Connection, operation: LocalOperationV1
     ) -> LocalOperationResultV1 | None:
@@ -3391,22 +3605,15 @@ class DesktopProviderStore:
             )
         return operation.result
 
-    def _reconcile_operation_with_authority(
+    def _cancel_operation_with_authority(
         self,
         connection: sqlite3.Connection,
         row: sqlite3.Row,
-        *,
-        force_cancel_nonterminal: bool,
     ) -> LocalOperationV1:
         operation = self._operation_from_row(row)
         if operation.state in {"succeeded", "failed", "cancelled"}:
             return operation
         authoritative_result = self._authoritative_operation_result(connection, operation)
-        nonterminal = operation.state not in {"succeeded", "failed", "cancelled"}
-        if not (
-            (force_cancel_nonterminal and nonterminal) or operation.result != authoritative_result
-        ):
-            return operation
         version = cast(int, row["resource_version"]) + 1
         timestamp = self._timestamp()
         reconciled = _validate_model(
@@ -3421,20 +3628,13 @@ class DesktopProviderStore:
             },
         )
         response_bytes = _canonical_json_bytes(reconciled.model_dump(mode="json"))
-        if (
-            operation.operation_kind in _PROFILE_OPERATION_KINDS
-            and len(response_bytes) > PROFILE_RUNTIME_TERMINAL_SLOT_BYTES
-        ):
-            raise ProviderDataCorruptionError(
-                "profile runtime cancellation exceeds its reserved slot"
+        if len(response_bytes) > self._operation_terminal_slot_bytes(operation.operation_kind):
+            label = (
+                "profile runtime"
+                if operation.operation_kind in _PROFILE_OPERATION_KINDS
+                else "project runtime"
             )
-        if (
-            operation.operation_kind in _PROJECT_OPERATION_KINDS
-            and len(response_bytes) > PROJECT_RUNTIME_TERMINAL_SLOT_BYTES
-        ):
-            raise ProviderDataCorruptionError(
-                "project runtime cancellation exceeds its reserved slot"
-            )
+            raise ProviderDataCorruptionError(f"{label} cancellation exceeds its reserved slot")
         previous_bytes = bytes(row["document_json"])
         idempotency_rows = self._idempotency_rows_for_operation(
             connection,
@@ -3463,7 +3663,7 @@ class DesktopProviderStore:
                 WHERE principal = ? AND method = ? AND route = ?
                   AND resource_scope = ? AND idempotency_key = ?
                   AND request_digest = ? AND response_type = 'LocalOperationV1'
-                  AND response_bytes = ?
+                  AND operation_id = ? AND response_bytes = ?
                 """,
                 (
                     response_bytes,
@@ -3473,6 +3673,7 @@ class DesktopProviderStore:
                     idempotency_row["resource_scope"],
                     idempotency_row["idempotency_key"],
                     idempotency_row["request_digest"],
+                    operation.operation_id,
                     previous_bytes,
                 ),
             )
@@ -3494,14 +3695,17 @@ class DesktopProviderStore:
                 """
                 SELECT *
                 FROM idempotency_records
-                WHERE response_type = 'LocalOperationV1' AND response_bytes = ?
+                WHERE response_type = 'LocalOperationV1' AND operation_id = ?
                 """,
-                (response_bytes,),
+                (operation.operation_id,),
             )
         )
         for row in rows:
             referenced = self._operation_for_idempotency_record(connection, row)
-            if referenced.operation_id != operation.operation_id:
+            if (
+                referenced.operation_id != operation.operation_id
+                or bytes(row["response_bytes"]) != response_bytes
+            ):
                 raise ProviderDataCorruptionError(
                     "operation idempotency response references another operation"
                 )
@@ -3529,10 +3733,9 @@ class DesktopProviderStore:
                 return
             for operation_id_row in operation_ids:
                 operation_id = cast(str, operation_id_row["operation_id"])
-                self._reconcile_operation_with_authority(
+                self._cancel_operation_with_authority(
                     connection,
                     self._require_operation_row(connection, operation_id),
-                    force_cancel_nonterminal=True,
                 )
                 after_operation_id = operation_id
             if len(operation_ids) < STARTUP_OPERATION_BATCH_ROWS:
@@ -3589,10 +3792,9 @@ class DesktopProviderStore:
                     raise ProviderDataCorruptionError(
                         "startup operation row changed during recovery"
                     )
-                self._reconcile_operation_with_authority(
+                self._cancel_operation_with_authority(
                     connection,
                     cast(sqlite3.Row, row),
-                    force_cancel_nonterminal=True,
                 )
                 after_operation_id = operation_id
             if len(metadata_rows) < STARTUP_OPERATION_BATCH_ROWS:

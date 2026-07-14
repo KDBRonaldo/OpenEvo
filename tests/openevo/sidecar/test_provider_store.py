@@ -21,6 +21,7 @@ from desktop.sidecar.contracts.v1.models import (
     ConnectionOperationResultV1,
     CredentialSlotStatusV1,
     LocalOperationV1,
+    NormalizedCheckV1,
     ProjectCreateV1,
     ProjectOperationResultV1,
     ProjectPatchV1,
@@ -461,6 +462,68 @@ def test_migrates_a_canonical_v1_store_to_v2(tmp_path: Path) -> None:
     ] == [(1,), (2,)]
     profile = _create_profile(store, key="post-migration-create")
     assert store.get_profile(profile.profile_id) == profile
+
+
+def test_rejects_unreleased_intermediate_v2_without_exact_action_authority(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "state"
+    root.mkdir(mode=0o700)
+    os.chmod(root, 0o700)
+    (root / "provider.lock").touch(mode=0o600)
+    (root / "cursor-signing.key").write_bytes(b"k" * 32)
+    os.chmod(root / "cursor-signing.key", 0o600)
+    intermediate_schema = list(provider_store_module._SCHEMA_V2)
+    intermediate_schema[3] = (
+        intermediate_schema[3]
+        .replace("        action_identity_digest TEXT UNIQUE,\n", "")
+        .replace(
+            ",\n        CHECK (\n"
+            "            action_identity_digest IS NULL OR "
+            "length(action_identity_digest) = 64\n"
+            "        )",
+            "",
+        )
+    )
+    intermediate_schema[4] = (
+        intermediate_schema[4]
+        .replace("        operation_id TEXT UNIQUE,\n", "")
+        .replace(
+            "        CHECK (\n"
+            "            operation_id IS NULL OR\n"
+            "            length(CAST(operation_id AS BLOB)) BETWEEN 1 AND 512\n"
+            "        ),\n",
+            "",
+        )
+        .replace(
+            ",\n        CHECK (\n"
+            "            (response_type = 'LocalOperationV1' "
+            "AND operation_id IS NOT NULL) OR\n"
+            "            (response_type != 'LocalOperationV1' "
+            "AND operation_id IS NULL)\n"
+            "        ),\n"
+            "        FOREIGN KEY (operation_id) REFERENCES "
+            "local_operations(operation_id) ON DELETE RESTRICT",
+            "",
+        )
+    )
+    assert "action_identity_digest" not in intermediate_schema[3]
+    assert "operation_id TEXT UNIQUE" not in intermediate_schema[4]
+    with sqlite3.connect(root / "provider.sqlite3") as connection:
+        for statement in intermediate_schema:
+            connection.execute(statement)
+        connection.executemany(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+            (
+                (1, "2026-07-14T12:00:00.000000Z"),
+                (2, "2026-07-14T12:00:00.000000Z"),
+            ),
+        )
+        connection.execute("PRAGMA user_version = 2")
+    os.chmod(root / "provider.sqlite3", 0o600)
+
+    with pytest.raises(ProviderSchemaError, match="fingerprint"):
+        DesktopProviderStore(root)
 
 
 @pytest.mark.parametrize(
@@ -1053,6 +1116,91 @@ def test_profile_failure_finalizes_inside_reserved_terminal_slots(
     assert replay.operation == failed
 
 
+def test_live_profile_operation_get_and_replay_are_read_only_and_completion_wins(
+    tmp_path: Path,
+) -> None:
+    store = DesktopProviderStore(tmp_path / "state")
+    profile = _create_profile(store)
+    action = {
+        "route": f"/desktop/v1/profiles/{profile.profile_id}/connect",
+        "operation_kind": "profile_connect",
+        "profile_id": profile.profile_id,
+        "key": "profile-read-only-observation",
+        "body": {},
+        "if_match": profile.etag,
+        "displace_existing": True,
+    }
+    reservation = store.begin_profile_runtime_action(**action)
+    initial = reservation.operation
+
+    observed = store.get_local_operation(initial.operation_id)
+    replay = store.begin_profile_runtime_action(**action)
+
+    assert observed == initial
+    assert replay.replayed is True
+    assert replay.operation == initial
+    assert store.get_profile(profile.profile_id).connection_state == "connecting"
+    finished = store.complete_profile_runtime_action(
+        reservation=reservation,
+        route=cast(str, action["route"]),
+        profile_id=profile.profile_id,
+        key=cast(str, action["key"]),
+        body={},
+        if_match=profile.etag,
+        connection_state="connected",
+        host_key_fingerprint="SHA256:read-only-observation",
+    )
+    assert finished.state == "succeeded"
+    assert finished.result == ConnectionOperationResultV1(
+        profile_id=profile.profile_id,
+        connection_state="connected",
+    )
+
+
+def test_generic_live_operation_replay_does_not_reconcile_or_cancel(tmp_path: Path) -> None:
+    store = DesktopProviderStore(tmp_path / "state")
+    profile = _create_profile(store)
+
+    def begin(transaction: ProviderMutation):
+        transaction.set_profile_runtime_state(
+            profile.profile_id,
+            if_match=profile.etag,
+            connection_state="connecting",
+            credential_slots=(),
+            host_key_fingerprint=None,
+        )
+        return 202, transaction.create_local_operation(
+            operation_kind="profile_connect",
+            resource=ResourceRefV1(resource_type="profile", resource_id=profile.profile_id),
+            state="running",
+        )
+
+    action = {
+        "route": f"/desktop/v1/profiles/{profile.profile_id}/connect",
+        "resource_scope": profile.profile_id,
+        "key": "profile-generic-read-only-replay",
+        "body": {},
+        "if_match": profile.etag,
+        "semantic_headers": {},
+        "response_model": LocalOperationV1,
+        "mutation": begin,
+    }
+    first = store.execute_idempotent_action(**action)
+    replay = store.execute_idempotent_action(
+        **{
+            **action,
+            "mutation": lambda transaction: pytest.fail(f"unexpected mutation: {transaction}"),
+        }
+    )
+
+    operation = LocalOperationV1.model_validate_json(replay.response_bytes)
+    assert replay.replayed is True
+    assert replay.response_bytes == first.response_bytes
+    assert operation.state == "running"
+    assert operation.result is None
+    assert store.get_local_operation(operation.operation_id) == operation
+
+
 def test_connecting_second_profile_atomically_displaces_first_profile(
     tmp_path: Path,
 ) -> None:
@@ -1431,6 +1579,59 @@ def test_project_action_replay_rejects_cross_project_operation_substitution(
         store.begin_project_runtime_action(**first_action)
 
 
+@pytest.mark.parametrize("recovery", [False, True], ids=["replay", "startup"])
+def test_project_action_rejects_same_scope_operation_substitution(
+    tmp_path: Path,
+    recovery: bool,
+) -> None:
+    root = tmp_path / "state"
+    store = DesktopProviderStore(root)
+    profile = _create_profile(store)
+    project = store.create_project(
+        _project(profile.profile_id), idempotency_key="project-same-scope-create"
+    )
+    first_action = {
+        "route": f"/desktop/v1/projects/{project.project_id}/workspace-sync",
+        "operation_kind": "workspace_sync",
+        "project_id": project.project_id,
+        "key": "project-same-scope-first-action",
+        "body": {},
+        "if_match": project.etag,
+    }
+    first_reservation = store.begin_project_runtime_action(**first_action)
+    store.start_project_runtime_action(reservation=first_reservation, **first_action)
+    store.complete_project_runtime_action(
+        reservation=first_reservation,
+        current_revision_id=None,
+        **first_action,
+    )
+    second_action = {
+        **first_action,
+        "key": "project-same-scope-second-action",
+    }
+    second_reservation = store.begin_project_runtime_action(**second_action)
+    second_bytes = provider_store_module._canonical_json_bytes(
+        second_reservation.operation.model_dump(mode="json")
+    )
+    if recovery:
+        store.close()
+        with sqlite3.connect(root / "provider.sqlite3") as connection:
+            connection.execute(
+                "UPDATE idempotency_records SET response_bytes = ? WHERE idempotency_key = ?",
+                (second_bytes, first_action["key"]),
+            )
+        with pytest.raises(ProviderDataCorruptionError, match="operation"):
+            DesktopProviderStore(root)
+    else:
+        store._connection.execute(
+            "UPDATE idempotency_records SET response_bytes = ? WHERE idempotency_key = ?",
+            (second_bytes, first_action["key"]),
+        )
+        store._connection.commit()
+        with pytest.raises(ProviderDataCorruptionError, match="operation"):
+            store.begin_project_runtime_action(**first_action)
+
+
 def test_startup_rejects_cross_project_operation_replay_substitution(tmp_path: Path) -> None:
     root = tmp_path / "state"
     store = DesktopProviderStore(root)
@@ -1472,6 +1673,54 @@ def test_startup_rejects_cross_project_operation_replay_substitution(tmp_path: P
         )
 
     with pytest.raises(ProviderDataCorruptionError, match="operation"):
+        DesktopProviderStore(root)
+
+
+def test_startup_rejects_rebinding_operation_id_to_another_action_authority(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "state"
+    store = DesktopProviderStore(root)
+    profile = _create_profile(store)
+    project = store.create_project(
+        _project(profile.profile_id), idempotency_key="project-authority-create"
+    )
+    first_action = {
+        "route": f"/desktop/v1/projects/{project.project_id}/workspace-sync",
+        "operation_kind": "workspace_sync",
+        "project_id": project.project_id,
+        "key": "project-authority-first-action",
+        "body": {},
+        "if_match": project.etag,
+    }
+    first = store.begin_project_runtime_action(**first_action)
+    store.start_project_runtime_action(reservation=first, **first_action)
+    store.complete_project_runtime_action(
+        reservation=first,
+        current_revision_id=None,
+        **first_action,
+    )
+    second_action = {**first_action, "key": "project-authority-second-action"}
+    second = store.begin_project_runtime_action(**second_action)
+    second_bytes = provider_store_module._canonical_json_bytes(
+        second.operation.model_dump(mode="json")
+    )
+    store.close()
+    with sqlite3.connect(root / "provider.sqlite3") as connection:
+        connection.execute(
+            "DELETE FROM idempotency_records WHERE idempotency_key = ?",
+            (second_action["key"],),
+        )
+        connection.execute(
+            """
+            UPDATE idempotency_records
+            SET operation_id = ?, response_bytes = ?
+            WHERE idempotency_key = ?
+            """,
+            (second.operation.operation_id, second_bytes, first_action["key"]),
+        )
+
+    with pytest.raises(ProviderDataCorruptionError, match="action authority"):
         DesktopProviderStore(root)
 
 
@@ -1519,6 +1768,57 @@ def test_project_reservation_fails_when_terminal_slots_do_not_fit(
             body={},
             if_match=project.etag,
         )
+
+
+def test_generic_nonterminal_operation_rejects_oversized_terminal_shape(
+    tmp_path: Path,
+) -> None:
+    store = DesktopProviderStore(tmp_path / "state")
+    profile = _create_profile(store)
+    project = store.create_project(
+        _project(profile.profile_id), idempotency_key="project-large-operation-create"
+    )
+    checks = tuple(
+        NormalizedCheckV1(
+            check_id=f"check-{index}",
+            label="l" * 512,
+            status="running",
+            summary="s" * 512,
+        )
+        for index in range(1_425)
+    )
+    checks_bytes = provider_store_module._canonical_json_bytes(
+        [check.model_dump(mode="json") for check in checks]
+    )
+    assert 1_580_000 <= len(checks_bytes) <= 1_600_000
+
+    def create_large_operation(transaction: ProviderMutation):
+        return 202, transaction.create_local_operation(
+            operation_kind="workspace_sync",
+            resource=ResourceRefV1(resource_type="project", resource_id=project.project_id),
+            state="running",
+            checks=checks,
+        )
+
+    with pytest.raises(ContractValidationError, match="terminal slot"):
+        store.execute_idempotent_action(
+            route=f"/desktop/v1/projects/{project.project_id}/workspace-sync",
+            resource_scope=project.project_id,
+            key="project-large-operation-action",
+            body={},
+            if_match=project.etag,
+            semantic_headers={},
+            response_model=LocalOperationV1,
+            mutation=create_large_operation,
+        )
+    assert store._connection.execute("SELECT count(*) FROM local_operations").fetchone()[0] == 0
+    assert (
+        store._connection.execute(
+            "SELECT 1 FROM idempotency_records WHERE idempotency_key = ?",
+            ("project-large-operation-action",),
+        ).fetchone()
+        is None
+    )
 
 
 def test_project_runtime_action_failure_is_replayable_and_keeps_project_draft(
