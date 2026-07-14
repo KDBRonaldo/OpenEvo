@@ -877,20 +877,24 @@ def test_nonterminal_profile_reservation_is_cancelled_exactly_once_on_restart(
     assert late_success == recovered.operation
     assert late_failure == recovered.operation
     assert reopened.get_profile(profile.profile_id).connection_state == "disconnected"
-    assert bytes(
-        reopened._connection.execute(
-            "SELECT response_bytes FROM idempotency_records WHERE idempotency_key = ?",
-            (action["key"],),
-        ).fetchone()[0]
-    ) == frozen
+    assert (
+        bytes(
+            reopened._connection.execute(
+                "SELECT response_bytes FROM idempotency_records WHERE idempotency_key = ?",
+                (action["key"],),
+            ).fetchone()[0]
+        )
+        == frozen
+    )
     reopened.close()
 
     reopened_again = DesktopProviderStore(root)
     replay = reopened_again.begin_profile_runtime_action(**action)
     assert replay.replayed is True
-    assert provider_store_module._canonical_json_bytes(
-        replay.operation.model_dump(mode="json")
-    ) == frozen
+    assert (
+        provider_store_module._canonical_json_bytes(replay.operation.model_dump(mode="json"))
+        == frozen
+    )
     assert replay.operation.etag == recovered_etag
 
 
@@ -1256,6 +1260,251 @@ def test_action_idempotency_binds_if_match_headers_and_response_type(tmp_path: P
         store.execute_idempotent_action(**{**arguments, "if_match": f'"{"0" * 64}"'})
     with pytest.raises(ProviderDataCorruptionError, match="response type"):
         store.execute_idempotent_action(**{**arguments, "response_model": type(profile)})
+
+
+def test_project_runtime_action_is_durable_idempotent_and_completes_atomically(
+    tmp_path: Path,
+) -> None:
+    store = DesktopProviderStore(tmp_path / "state")
+    profile = _create_profile(store)
+    project = store.create_project(
+        _project(profile.profile_id), idempotency_key="project-runtime-create-01"
+    )
+    action = {
+        "route": f"/desktop/v1/projects/{project.project_id}/activate",
+        "operation_kind": "project_activate",
+        "project_id": project.project_id,
+        "key": "project-runtime-activate-01",
+        "body": {},
+        "if_match": project.etag,
+    }
+
+    reservation = store.begin_project_runtime_action(**action)
+    assert reservation.replayed is False
+    assert reservation.project == project
+    assert reservation.operation.state == "queued"
+    assert reservation.operation.started_at is None
+    assert reservation.operation.result == ProjectOperationResultV1(
+        project_id=project.project_id,
+        project_etag=project.etag,
+        active=False,
+    )
+
+    replay = store.begin_project_runtime_action(**action)
+    assert replay.replayed is True
+    assert replay.project is None
+    assert replay.operation == reservation.operation
+    with pytest.raises(ResourceInUseError):
+        store.patch_project(project.project_id, {"name": "Changed"}, if_match=project.etag)
+    with pytest.raises(ResourceInUseError):
+        store.delete_project(project.project_id, if_match=project.etag)
+    with pytest.raises(ResourceInUseError):
+        store.begin_project_runtime_action(
+            **{
+                **action,
+                "route": f"/desktop/v1/projects/{project.project_id}/doctor",
+                "operation_kind": "project_doctor",
+                "key": "project-runtime-doctor-0001",
+            }
+        )
+
+    running = store.start_project_runtime_action(reservation=reservation, **action)
+    assert running.state == "running"
+    assert running.started_at is not None
+    assert store.begin_project_runtime_action(**action).operation == running
+
+    finished = store.complete_project_runtime_action(
+        reservation=reservation,
+        current_revision_id="core-revision-0001",
+        **action,
+    )
+    active = store.get_project(project.project_id)
+    assert finished.state == "succeeded"
+    assert finished.finished_at is not None
+    assert finished.result == ProjectOperationResultV1(
+        project_id=project.project_id,
+        project_etag=active.etag,
+        active=True,
+    )
+    assert active.state == "active"
+    with store._transaction(write=False) as connection:
+        assert (
+            connection.execute(
+                "SELECT current_revision_id FROM projects WHERE project_id = ?",
+                (project.project_id,),
+            ).fetchone()[0]
+            == "core-revision-0001"
+        )
+    assert store.begin_project_runtime_action(**action).operation == finished
+
+
+def test_project_runtime_action_failure_is_replayable_and_keeps_project_draft(
+    tmp_path: Path,
+) -> None:
+    store = DesktopProviderStore(tmp_path / "state")
+    profile = _create_profile(store)
+    project = store.create_project(
+        _project(profile.profile_id), idempotency_key="project-runtime-fail-create"
+    )
+    action = {
+        "route": f"/desktop/v1/projects/{project.project_id}/activate",
+        "operation_kind": "project_activate",
+        "project_id": project.project_id,
+        "key": "project-runtime-fail-action",
+        "body": {},
+        "if_match": project.etag,
+    }
+    reservation = store.begin_project_runtime_action(**action)
+    store.start_project_runtime_action(reservation=reservation, **action)
+    error = ApiErrorV1(
+        request_id=reservation.operation.operation_id,
+        code="core_activation_failed",
+        http_status=503,
+        message="OpenEvo Core activation failed.",
+        severity=ErrorSeverity.BLOCKING,
+        category=ErrorCategory.PROJECT,
+        retryable=True,
+        repair_action=RepairAction.OPENEVO_CAN_RETRY,
+        next_action="Retry project activation.",
+    )
+
+    failed = store.fail_project_runtime_action(
+        reservation=reservation,
+        error=error,
+        **action,
+    )
+
+    assert failed.state == "failed"
+    assert failed.error == error
+    assert failed.result == reservation.operation.result
+    assert store.get_project(project.project_id).state == "draft"
+    assert store.begin_project_runtime_action(**action).operation == failed
+
+
+def test_project_runtime_failure_rebinds_result_after_another_activation(
+    tmp_path: Path,
+) -> None:
+    store = DesktopProviderStore(tmp_path / "state")
+    profile = _create_profile(store)
+    first = store.create_project(
+        _project(profile.profile_id, name="First"),
+        idempotency_key="project-runtime-first-create",
+    )
+    second = store.create_project(
+        _project(profile.profile_id, name="Second"),
+        idempotency_key="project-runtime-second-create",
+    )
+    with store._transaction(write=True) as connection:
+        first = ProviderMutation(store, connection).set_project_state(
+            first.project_id,
+            if_match=first.etag,
+            state="active",
+            current_revision_id="first-revision",
+        )
+    action = {
+        "route": f"/desktop/v1/projects/{first.project_id}/activate",
+        "operation_kind": "project_activate",
+        "project_id": first.project_id,
+        "key": "project-runtime-first-reactivate",
+        "body": {},
+        "if_match": first.etag,
+    }
+    reservation = store.begin_project_runtime_action(**action)
+    store.start_project_runtime_action(reservation=reservation, **action)
+    with store._transaction(write=True) as connection:
+        ProviderMutation(store, connection).set_project_state(
+            second.project_id,
+            if_match=second.etag,
+            state="active",
+            current_revision_id="second-revision",
+        )
+    current_first = store.get_project(first.project_id)
+    error = ApiErrorV1(
+        request_id=reservation.operation.operation_id,
+        code="activation_superseded",
+        http_status=409,
+        message="A newer activation superseded this project.",
+        severity=ErrorSeverity.BLOCKING,
+        category=ErrorCategory.PROJECT,
+        retryable=True,
+        repair_action=RepairAction.OPENEVO_CAN_RETRY,
+        next_action="Retry project activation.",
+    )
+
+    failed = store.fail_project_runtime_action(
+        reservation=reservation,
+        error=error,
+        **action,
+    )
+
+    assert failed.state == "failed"
+    assert failed.result == ProjectOperationResultV1(
+        project_id=first.project_id,
+        project_etag=current_first.etag,
+        active=False,
+    )
+
+
+def test_project_runtime_action_restart_cancels_once_and_updates_replay(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "state"
+    store = DesktopProviderStore(root)
+    profile = _create_profile(store)
+    project = store.create_project(
+        _project(profile.profile_id), idempotency_key="project-runtime-crash-create"
+    )
+    action = {
+        "route": f"/desktop/v1/projects/{project.project_id}/workspace-sync",
+        "operation_kind": "workspace_sync",
+        "project_id": project.project_id,
+        "key": "project-runtime-crash-action",
+        "body": {},
+        "if_match": project.etag,
+    }
+    reservation = store.begin_project_runtime_action(**action)
+    running = store.start_project_runtime_action(reservation=reservation, **action)
+    assert running.state == "running"
+    store.close()
+
+    reopened = DesktopProviderStore(root)
+    replay = reopened.begin_project_runtime_action(**action)
+    assert replay.replayed is True
+    assert replay.operation.state == "cancelled"
+    assert replay.operation.finished_at is not None
+    frozen_etag = replay.operation.etag
+    assert reopened.get_local_operation(replay.operation.operation_id).etag == frozen_etag
+    assert reopened.begin_project_runtime_action(**action).operation.etag == frozen_etag
+
+
+def test_non_activation_project_runtime_action_succeeds_without_project_result(
+    tmp_path: Path,
+) -> None:
+    store = DesktopProviderStore(tmp_path / "state")
+    profile = _create_profile(store)
+    project = store.create_project(
+        _project(profile.profile_id), idempotency_key="project-runtime-sync-create"
+    )
+    action = {
+        "route": f"/desktop/v1/projects/{project.project_id}/workspace-sync",
+        "operation_kind": "workspace_sync",
+        "project_id": project.project_id,
+        "key": "project-runtime-sync-action",
+        "body": {},
+        "if_match": project.etag,
+    }
+    reservation = store.begin_project_runtime_action(**action)
+    store.start_project_runtime_action(reservation=reservation, **action)
+
+    finished = store.complete_project_runtime_action(
+        reservation=reservation,
+        current_revision_id=None,
+        **action,
+    )
+
+    assert finished.state == "succeeded"
+    assert finished.result is None
+    assert store.get_project(project.project_id) == project
 
 
 def test_active_project_switch_is_atomic_and_active_config_is_immutable(tmp_path: Path) -> None:
@@ -1732,9 +1981,7 @@ def test_startup_reconciliation_streams_large_operation_sets_in_bounded_batches(
         for _index in range(operation_count):
             transaction.create_local_operation(
                 operation_kind="profile_connect",
-                resource=ResourceRefV1(
-                    resource_type="profile", resource_id=profile.profile_id
-                ),
+                resource=ResourceRefV1(resource_type="profile", resource_id=profile.profile_id),
                 state="running",
             )
     store.close()
@@ -1805,9 +2052,12 @@ def test_startup_reconciliation_streams_large_operation_sets_in_bounded_batches(
 
     assert len(batch_limits) >= 3
     assert max(batch_limits) <= provider_store_module.STARTUP_OPERATION_BATCH_ROWS
-    assert reopened._connection.execute(
-        "SELECT count(*) FROM local_operations WHERE state = 'cancelled'"
-    ).fetchone()[0] == operation_count
+    assert (
+        reopened._connection.execute(
+            "SELECT count(*) FROM local_operations WHERE state = 'cancelled'"
+        ).fetchone()[0]
+        == operation_count
+    )
     reopened.close()
 
 

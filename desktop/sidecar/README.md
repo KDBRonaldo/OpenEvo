@@ -253,6 +253,23 @@ the same write transaction as the delete, so even a non-displacing disconnect on
 an already-disconnected profile retains its resource authority through terminal
 publication. Terminal historical operations do not prevent later deletion.
 
+Long-running project work uses a separate durable reservation lifecycle. The
+store binds the route, project, request body, `If-Match`, and idempotency key in
+one transaction, publishes a `queued` `LocalOperationV1`, and reserves bounded
+space for both the operation and replay documents before an executor is allowed
+to submit work. Starting and terminal publication update the operation and its
+idempotency replay atomically. While a project reservation is queued, running,
+or cancelling, project patch/delete and a second project action fail closed so
+the immutable project snapshot consumed by Core cannot change underneath the
+worker. Activation success atomically records the active project, the Core
+revision identity, and the matching project result; other project operations do
+not invent a project result. A typed failure keeps the project draft and is
+replayable without repeating remote work. Startup cancels every nonterminal
+reservation exactly once and updates the replay in the same recovery
+transaction. The release provider/controller is responsible for putting these
+reservations on its bounded executor and for translating Core outcomes; it must
+not perform external SSH/Core work while a SQLite transaction is open.
+
 The production credential resolver currently supports `ssh_agent`. Profiles
 that select native private-key or password authentication fail closed with
 `ssh_credential_unavailable` until the Tauri credential broker supplies an
