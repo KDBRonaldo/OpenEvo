@@ -35,6 +35,7 @@ const LEGACY_DESKTOP_SHELL_ROUTE: &str = "/openevo-api/desktop/shell";
 const NATIVE_SESSION_PROBE_ROUTE: &str = "/openevo-native/session";
 const NATIVE_WORKSPACE_IMPORT_ROUTE: &str = "/openevo-native/workspace-imports";
 const NATIVE_SESSION_HEADER: &str = "X-OpenEvo-Desktop-Session";
+const NATIVE_HANDOFF_HEADER: &str = "X-OpenEvo-Native-Handoff";
 const NATIVE_EXECUTABLE_FD_ENV: &str = "OPENEVO_NATIVE_EXECUTABLE_FD";
 const NATIVE_EXECUTABLE_PATH_ENV: &str = "OPENEVO_NATIVE_EXECUTABLE_PATH";
 const PYINSTALLER_PRIVATE_ENV_PREFIX: &[u8] = b"_PYI_";
@@ -44,6 +45,7 @@ const INHERITED_EXECUTABLE_FD: libc::c_int = 4;
 const INSTANCE_ID_BYTES: usize = 16;
 const READINESS_KEY_BYTES: usize = 32;
 const SESSION_TOKEN_BYTES: usize = 32;
+const HANDOFF_TOKEN_BYTES: usize = 32;
 const NATIVE_INSTANCE_FRAME_MAX_BYTES: usize = 512;
 const SIDECAR_STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
 const SIDECAR_HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -432,6 +434,7 @@ struct NativeInstanceCredential {
     instance_id: [u8; INSTANCE_ID_BYTES],
     readiness_key: [u8; READINESS_KEY_BYTES],
     session_token: [u8; SESSION_TOKEN_BYTES],
+    handoff_token: [u8; HANDOFF_TOKEN_BYTES],
 }
 
 struct EncodedSecret(String);
@@ -460,6 +463,7 @@ struct NativeInstanceFrame<'a> {
     instance_id: &'a str,
     readiness_key: &'a str,
     session_token: &'a str,
+    handoff_token: &'a str,
 }
 
 impl NativeInstanceCredential {
@@ -467,6 +471,7 @@ impl NativeInstanceCredential {
         let mut instance_id = [0_u8; INSTANCE_ID_BYTES];
         let mut readiness_key = [0_u8; READINESS_KEY_BYTES];
         let mut session_token = [0_u8; SESSION_TOKEN_BYTES];
+        let mut handoff_token = [0_u8; HANDOFF_TOKEN_BYTES];
         OsRng
             .try_fill_bytes(&mut instance_id)
             .map_err(|_| instance_credential_error())?;
@@ -476,10 +481,14 @@ impl NativeInstanceCredential {
         OsRng
             .try_fill_bytes(&mut session_token)
             .map_err(|_| instance_credential_error())?;
+        OsRng
+            .try_fill_bytes(&mut handoff_token)
+            .map_err(|_| instance_credential_error())?;
         Ok(Self {
             instance_id,
             readiness_key,
             session_token,
+            handoff_token,
         })
     }
 
@@ -492,11 +501,13 @@ impl NativeInstanceCredential {
         let instance_id = self.instance_id_hex();
         let readiness_key = EncodedSecret::new(&self.readiness_key);
         let session_token = EncodedSecret::new(&self.session_token);
+        let handoff_token = EncodedSecret::new(&self.handoff_token);
         let frame = NativeInstanceFrame {
             protocol: NATIVE_SIDECAR_PROTOCOL,
             instance_id: &instance_id,
             readiness_key: readiness_key.expose(),
             session_token: session_token.expose(),
+            handoff_token: handoff_token.expose(),
         };
         let mut encoded = serde_json::to_vec(&frame).map_err(|_| instance_channel_error())?;
         encoded.push(b'\n');
@@ -515,6 +526,13 @@ impl NativeInstanceCredential {
             [0_u8; SESSION_TOKEN_BYTES],
         ))
     }
+
+    fn take_handoff_credential(&mut self) -> HandoffCredential {
+        HandoffCredential(std::mem::replace(
+            &mut self.handoff_token,
+            [0_u8; HANDOFF_TOKEN_BYTES],
+        ))
+    }
 }
 
 impl Drop for NativeInstanceCredential {
@@ -522,11 +540,13 @@ impl Drop for NativeInstanceCredential {
         self.instance_id.fill(0);
         self.readiness_key.fill(0);
         self.session_token.fill(0);
+        self.handoff_token.fill(0);
     }
 }
 
 struct SessionCredential([u8; SESSION_TOKEN_BYTES]);
 struct ReadinessCredential([u8; READINESS_KEY_BYTES]);
+struct HandoffCredential([u8; HANDOFF_TOKEN_BYTES]);
 
 impl SessionCredential {
     fn expose(&self) -> String {
@@ -541,6 +561,18 @@ impl Drop for SessionCredential {
 }
 
 impl Drop for ReadinessCredential {
+    fn drop(&mut self) {
+        self.0.fill(0);
+    }
+}
+
+impl HandoffCredential {
+    fn expose(&self) -> EncodedSecret {
+        EncodedSecret::new(&self.0)
+    }
+}
+
+impl Drop for HandoffCredential {
     fn drop(&mut self) {
         self.0.fill(0);
     }
@@ -630,6 +662,7 @@ struct LifecycleStatus {
 struct SidecarBootstrapState {
     session_credential: SessionCredential,
     readiness_credential: ReadinessCredential,
+    handoff_credential: HandoffCredential,
     negotiated_contract: NegotiatedContractV1,
 }
 
@@ -719,6 +752,7 @@ struct DesktopHostStateInner {
     cancellation_epoch: AtomicU64,
     launch_state: AtomicU64,
     shutdown_requested: AtomicBool,
+    picker_in_progress: AtomicBool,
 }
 
 #[derive(Clone)]
@@ -742,6 +776,7 @@ impl Default for DesktopHostState {
             cancellation_epoch: AtomicU64::new(0),
             launch_state: AtomicU64::new(encode_launch_state(0, LaunchPhase::Idle)),
             shutdown_requested: AtomicBool::new(false),
+            picker_in_progress: AtomicBool::new(false),
         }))
     }
 }
@@ -806,6 +841,33 @@ impl<'a> StartupClaim<'a> {
 }
 
 impl Drop for StartupClaim<'_> {
+    fn drop(&mut self) {
+        self.in_progress.store(false, Ordering::Release);
+    }
+}
+
+struct PickerClaim<'a> {
+    in_progress: &'a AtomicBool,
+}
+
+impl<'a> PickerClaim<'a> {
+    fn acquire(state: &'a DesktopHostState) -> HostResult<Self> {
+        state
+            .picker_in_progress
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| {
+                NativeHostError::new(
+                    "workspace_selection_in_progress",
+                    "OpenEvo Desktop is already selecting a research folder.",
+                )
+            })?;
+        Ok(Self {
+            in_progress: &state.picker_in_progress,
+        })
+    }
+}
+
+impl Drop for PickerClaim<'_> {
     fn drop(&mut self) {
         self.in_progress.store(false, Ordering::Release);
     }
@@ -2187,7 +2249,14 @@ struct LoopbackHttpResponse {
 
 struct ActiveSidecarConnection {
     stream: TcpStream,
-    session_token: String,
+    handoff_token: EncodedSecret,
+}
+
+struct SelectedDirectory {
+    _descriptor: File,
+    path: PathBuf,
+    device: u64,
+    inode: u64,
 }
 
 fn loopback_http_get(
@@ -2515,7 +2584,7 @@ fn check_sidecar_session_binding(port: u16, session_token: &str) -> HostResult<(
 
 fn register_native_workspace_source(
     stream: &mut TcpStream,
-    session_token: &str,
+    handoff_token: &str,
     selection: NativeWorkspaceSelection<'_>,
 ) -> HostResult<NativeProjectSourceV1> {
     if selection.kind != "native_folder_snapshot"
@@ -2551,7 +2620,7 @@ fn register_native_workspace_source(
         stream,
         "POST",
         NATIVE_WORKSPACE_IMPORT_ROUTE,
-        Some((NATIVE_SESSION_HEADER, session_token)),
+        Some((NATIVE_HANDOFF_HEADER, handoff_token)),
         Some(&body),
         Instant::now() + NATIVE_WORKSPACE_IMPORT_TIMEOUT,
         NATIVE_WORKSPACE_RESPONSE_MAX_BYTES,
@@ -2606,10 +2675,22 @@ fn is_valid_native_text(value: &str) -> bool {
             .any(|character| character <= '\u{1f}' || character == '\u{7f}')
 }
 
-fn active_sidecar_connection(state: &DesktopHostState) -> HostResult<ActiveSidecarConnection> {
+fn active_sidecar_instance(state: &DesktopHostState) -> HostResult<[u8; INSTANCE_ID_BYTES]> {
     let sidecar = lock_sidecar_bounded(state, SIDECAR_STATE_LOCK_TIMEOUT)?;
     let managed = sidecar.as_ref().ok_or_else(sidecar_state_error)?;
     if managed.lifecycle != ManagedLifecycle::Running {
+        return Err(sidecar_state_error());
+    }
+    Ok(managed.instance_id)
+}
+
+fn active_sidecar_connection(
+    state: &DesktopHostState,
+    expected_instance: [u8; INSTANCE_ID_BYTES],
+) -> HostResult<ActiveSidecarConnection> {
+    let sidecar = lock_sidecar_bounded(state, SIDECAR_STATE_LOCK_TIMEOUT)?;
+    let managed = sidecar.as_ref().ok_or_else(sidecar_state_error)?;
+    if managed.lifecycle != ManagedLifecycle::Running || managed.instance_id != expected_instance {
         return Err(sidecar_state_error());
     }
     let port = managed.status.port.ok_or_else(sidecar_state_error)?;
@@ -2617,8 +2698,58 @@ fn active_sidecar_connection(state: &DesktopHostState) -> HostResult<ActiveSidec
     let stream = connect_loopback_until(port, Instant::now() + SIDECAR_HEALTH_CONNECT_TIMEOUT)?;
     Ok(ActiveSidecarConnection {
         stream,
-        session_token: bootstrap.session_credential.expose(),
+        handoff_token: bootstrap.handoff_credential.expose(),
     })
+}
+
+fn open_selected_directory(selected: &Path) -> HostResult<SelectedDirectory> {
+    let descriptor = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(selected)
+        .map_err(|_| workspace_selection_error())?;
+    let metadata = descriptor
+        .metadata()
+        .map_err(|_| workspace_selection_error())?;
+    if !metadata.is_dir() {
+        return Err(workspace_selection_error());
+    }
+    let path = path_for_open_directory(&descriptor)?;
+    let current = fs::symlink_metadata(&path).map_err(|_| workspace_selection_error())?;
+    if !current.is_dir()
+        || current.dev() != metadata.dev()
+        || current.ino() != metadata.ino()
+        || path.parent().is_none()
+    {
+        return Err(workspace_selection_error());
+    }
+    Ok(SelectedDirectory {
+        _descriptor: descriptor,
+        path,
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn path_for_open_directory(descriptor: &File) -> HostResult<PathBuf> {
+    fs::canonicalize(PathBuf::from("/proc/self/fd").join(descriptor.as_raw_fd().to_string()))
+        .map_err(|_| workspace_selection_error())
+}
+
+#[cfg(target_os = "macos")]
+fn path_for_open_directory(descriptor: &File) -> HostResult<PathBuf> {
+    use std::ffi::{CStr, OsStr};
+
+    let mut buffer = [0_i8; libc::PATH_MAX as usize];
+    if unsafe { libc::fcntl(descriptor.as_raw_fd(), libc::F_GETPATH, buffer.as_mut_ptr()) } == -1 {
+        return Err(workspace_selection_error());
+    }
+    let bytes = unsafe { CStr::from_ptr(buffer.as_ptr()) }.to_bytes();
+    if bytes.is_empty() {
+        return Err(workspace_selection_error());
+    }
+    Ok(PathBuf::from(OsStr::from_bytes(bytes)))
 }
 
 fn readiness_hmac_domain(instance_id: &str, challenge: &str) -> String {
@@ -3873,6 +4004,7 @@ fn start_sidecar_inner_with<C: ProcessControl>(
             &mut credential.readiness_key,
             [0_u8; READINESS_KEY_BYTES],
         )),
+        handoff_credential: credential.take_handoff_credential(),
         negotiated_contract,
     };
     match publish_sidecar_gated(state, startup_epoch, bootstrap) {
@@ -3940,6 +4072,8 @@ async fn select_project_source(
     if kind != "native_folder_snapshot" {
         return Err(workspace_selection_error());
     }
+    let _picker_claim = PickerClaim::acquire(&state)?;
+    let expected_instance = active_sidecar_instance(&state)?;
     let selected =
         tauri::async_runtime::spawn_blocking(move || app.dialog().file().blocking_pick_folder())
             .await
@@ -3948,27 +4082,21 @@ async fn select_project_source(
     let selected = selected
         .into_path()
         .map_err(|_| workspace_selection_error())?;
-    let selected = fs::canonicalize(selected).map_err(|_| workspace_selection_error())?;
-    let metadata = fs::metadata(&selected).map_err(|_| workspace_selection_error())?;
-    if !metadata.is_dir() {
-        return Err(workspace_selection_error());
-    }
-    let selected_device = metadata.dev();
-    let selected_inode = metadata.ino();
+    let selected = open_selected_directory(&selected)?;
     let ActiveSidecarConnection {
         mut stream,
-        session_token,
-    } = active_sidecar_connection(&state)?;
+        handoff_token,
+    } = active_sidecar_connection(&state, expected_instance)?;
     tauri::async_runtime::spawn_blocking(move || {
         register_native_workspace_source(
             &mut stream,
-            &session_token,
+            handoff_token.expose(),
             NativeWorkspaceSelection {
                 kind: &kind,
                 action_id: &action_id,
-                selected_path: &selected,
-                selected_device,
-                selected_inode,
+                selected_path: &selected.path,
+                selected_device: selected.device,
+                selected_inode: selected.inode,
                 project_id: project_id.as_deref(),
             },
         )
@@ -4119,11 +4247,13 @@ mod tests {
         let instance_id = credential.instance_id_hex();
         let readiness_key = encode_hex(&credential.readiness_key);
         let session_token = encode_hex(&credential.session_token);
+        let handoff_token = encode_hex(&credential.handoff_token);
         let frame = serde_json::to_value(NativeInstanceFrame {
             protocol: NATIVE_SIDECAR_PROTOCOL,
             instance_id: &instance_id,
             readiness_key: &readiness_key,
             session_token: &session_token,
+            handoff_token: &handoff_token,
         })
         .unwrap();
 
@@ -4134,9 +4264,16 @@ mod tests {
                 .keys()
                 .cloned()
                 .collect::<Vec<_>>(),
-            ["instance_id", "protocol", "readiness_key", "session_token"]
+            [
+                "handoff_token",
+                "instance_id",
+                "protocol",
+                "readiness_key",
+                "session_token"
+            ]
         );
         assert_eq!(session_token.len(), SESSION_TOKEN_BYTES * 2);
+        assert_eq!(handoff_token.len(), HANDOFF_TOKEN_BYTES * 2);
     }
 
     #[test]
@@ -4952,12 +5089,13 @@ mod tests {
         let state = DesktopHostState::default();
         let (managed, _private_root, old_port) = managed_test_sidecar();
         let old_listener = managed._listener.try_clone().unwrap();
+        let expected_instance = managed.instance_id;
         *state.sidecar.lock().unwrap() = Some(managed);
 
         let ActiveSidecarConnection {
             mut stream,
-            session_token,
-        } = active_sidecar_connection(&state).unwrap();
+            handoff_token,
+        } = active_sidecar_connection(&state, expected_instance).unwrap();
 
         let replacement = TcpListener::bind("127.0.0.1:0").unwrap();
         let replacement_port = replacement.local_addr().unwrap().port();
@@ -4993,7 +5131,7 @@ mod tests {
 
         let source = register_native_workspace_source(
             &mut stream,
-            &session_token,
+            handoff_token.expose(),
             NativeWorkspaceSelection {
                 kind: "native_folder_snapshot",
                 action_id: "native-source-action-pinned-0001",
@@ -5013,6 +5151,38 @@ mod tests {
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
         ));
 
+        let mut managed = state.sidecar.lock().unwrap().take().unwrap();
+        if let Some(mut child) = managed.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+
+    #[test]
+    fn native_workspace_picker_rejects_parallel_physical_selection() {
+        let state = DesktopHostState::default();
+        let first = PickerClaim::acquire(&state).unwrap();
+
+        let error = PickerClaim::acquire(&state).err().unwrap();
+        assert_eq!(error.code, "workspace_selection_in_progress");
+
+        drop(first);
+        PickerClaim::acquire(&state).unwrap();
+    }
+
+    #[test]
+    fn native_workspace_picker_rejects_a_restarted_sidecar_instance() {
+        let state = DesktopHostState::default();
+        let (managed, _private_root, _port) = managed_test_sidecar();
+        let expected_instance = managed.instance_id;
+        *state.sidecar.lock().unwrap() = Some(managed);
+        state.sidecar.lock().unwrap().as_mut().unwrap().instance_id = [0x44; INSTANCE_ID_BYTES];
+
+        let error = active_sidecar_connection(&state, expected_instance)
+            .err()
+            .unwrap();
+
+        assert_eq!(error.code, "sidecar_state_unavailable");
         let mut managed = state.sidecar.lock().unwrap().take().unwrap();
         if let Some(mut child) = managed.child.take() {
             let _ = child.kill();
@@ -5062,8 +5232,8 @@ mod tests {
     fn native_workspace_registration_keeps_the_selected_path_out_of_renderer_data() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
-        let session_token = "7c".repeat(SESSION_TOKEN_BYTES);
-        let expected_token = session_token.clone();
+        let handoff_token = "8d".repeat(HANDOFF_TOKEN_BYTES);
+        let expected_token = handoff_token.clone();
         let selected_path = PathBuf::from("/Users/researcher/private/study");
         let expected_path = selected_path.clone();
         let server = thread::spawn(move || {
@@ -5074,7 +5244,7 @@ mod tests {
             )));
             assert!(headers
                 .lines()
-                .any(|line| { line == format!("{NATIVE_SESSION_HEADER}: {expected_token}") }));
+                .any(|line| { line == format!("{NATIVE_HANDOFF_HEADER}: {expected_token}") }));
             assert_eq!(
                 serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
                 serde_json::json!({
@@ -5107,7 +5277,7 @@ mod tests {
         let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
         let source = register_native_workspace_source(
             &mut stream,
-            &session_token,
+            &handoff_token,
             NativeWorkspaceSelection {
                 kind: "native_folder_snapshot",
                 action_id: "native-source-action-0001",
@@ -5450,6 +5620,7 @@ mod tests {
             bootstrap: Some(SidecarBootstrapState {
                 session_credential: SessionCredential([0x11; SESSION_TOKEN_BYTES]),
                 readiness_credential: ReadinessCredential([0x11; READINESS_KEY_BYTES]),
+                handoff_credential: HandoffCredential([0x11; HANDOFF_TOKEN_BYTES]),
                 negotiated_contract: test_bootstrap_state().negotiated_contract,
             }),
             lifecycle: ManagedLifecycle::Running,
@@ -5500,6 +5671,7 @@ mod tests {
         replacement.bootstrap = Some(SidecarBootstrapState {
             session_credential: SessionCredential([0x22; SESSION_TOKEN_BYTES]),
             readiness_credential: ReadinessCredential([0x22; READINESS_KEY_BYTES]),
+            handoff_credential: HandoffCredential([0x22; HANDOFF_TOKEN_BYTES]),
             negotiated_contract: test_bootstrap_state().negotiated_contract,
         });
         let probe_listener = replacement._listener.try_clone().unwrap();
@@ -6864,6 +7036,7 @@ mod tests {
             instance_id: [0x1a; INSTANCE_ID_BYTES],
             readiness_key: [0x5a; READINESS_KEY_BYTES],
             session_token: [0x7c; SESSION_TOKEN_BYTES],
+            handoff_token: [0x8d; HANDOFF_TOKEN_BYTES],
         }
     }
 
@@ -6871,6 +7044,7 @@ mod tests {
         SidecarBootstrapState {
             session_credential: SessionCredential([0x7c; SESSION_TOKEN_BYTES]),
             readiness_credential: ReadinessCredential([0x5a; READINESS_KEY_BYTES]),
+            handoff_credential: HandoffCredential([0x8d; HANDOFF_TOKEN_BYTES]),
             negotiated_contract: NegotiatedContractV1 {
                 major: 1,
                 openapi_sha256: DESKTOP_LOCAL_API_OPENAPI_SHA256.to_string(),

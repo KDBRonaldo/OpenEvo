@@ -22,7 +22,7 @@ import secrets
 import stat
 import sys
 import threading
-from typing import BinaryIO, Iterator
+from typing import BinaryIO, Iterator, Mapping
 import unicodedata
 
 from openevo.backend.contracts.v1.models import (
@@ -2778,6 +2778,48 @@ class WorkspaceImportStore:
     def reconcile(self) -> None:
         """Boundedly remove temp, malformed, tampered, and non-store root entries."""
 
+        self._reconcile_references(None)
+
+    def reconcile_references(
+        self,
+        references: Mapping[
+            str,
+            tuple[WorkspaceImportRefV1, WorkspaceImportOwnership],
+        ],
+    ) -> None:
+        """Retain exactly the verified imports referenced by durable project state."""
+
+        if not isinstance(references, Mapping):
+            raise TypeError("workspace import references must be a mapping")
+        expected: dict[
+            str,
+            tuple[WorkspaceImportRefV1, WorkspaceImportOwnership],
+        ] = {}
+        for import_id, value in references.items():
+            if (
+                type(import_id) is not str
+                or not isinstance(value, tuple)
+                or len(value) != 2
+            ):
+                raise TypeError("workspace import reference entry is invalid")
+            import_ref, ownership = value
+            self._require_external_import_ref(import_ref, operation="reconcile")
+            self._require_ownership(ownership, operation="reconcile")
+            if import_ref.import_id != import_id:
+                raise ValueError("workspace import reference key does not match its ID")
+            expected[import_id] = (import_ref, ownership)
+        self._reconcile_references(expected)
+
+    def _reconcile_references(
+        self,
+        expected: Mapping[
+            str,
+            tuple[WorkspaceImportRefV1, WorkspaceImportOwnership],
+        ]
+        | None,
+    ) -> None:
+        retained: set[str] = set()
+
         budget = _ScanBudget(
             remaining_nodes=self._reconcile_max_nodes,
             remaining_bytes=self._reconcile_max_bytes,
@@ -2804,12 +2846,16 @@ class WorkspaceImportStore:
                         budget=budget,
                     )
                     continue
+                expected_entry = expected.get(name) if expected is not None else None
                 try:
                     _stored_ref, _stored_ownership, archive_descriptor, directory_identity = (
                         self._validate_import_contents(
                             root_descriptor,
                             name,
-                            None,
+                            expected_entry[0] if expected_entry is not None else None,
+                            expected_ownership=(
+                                expected_entry[1] if expected_entry is not None else None
+                            ),
                             budget=budget,
                         )
                     )
@@ -2821,6 +2867,10 @@ class WorkspaceImportStore:
                 except _ReconcileBudgetExceeded:
                     raise
                 except _DeterministicImportCorruption:
+                    if expected_entry is not None:
+                        raise WorkspaceImportIntegrityError(
+                            "referenced workspace import is corrupt"
+                        ) from None
                     self._discard_root_entry(
                         root_descriptor,
                         name,
@@ -2829,6 +2879,21 @@ class WorkspaceImportStore:
                     )
                 else:
                     os.close(archive_descriptor)
+                    if expected is not None and expected_entry is None:
+                        self._discard_root_entry(
+                            root_descriptor,
+                            name,
+                            expected_identity=observed_identity,
+                            budget=budget,
+                        )
+                    elif expected_entry is not None:
+                        retained.add(name)
+            if expected is not None:
+                missing = set(expected).difference(retained)
+                if missing:
+                    raise WorkspaceImportNotFoundError(
+                        "a referenced workspace import does not exist"
+                    )
             os.fsync(root_descriptor)
 
 

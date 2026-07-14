@@ -211,6 +211,7 @@ def test_create_app_launcher_uses_default_config_root(tmp_path: Path) -> None:
             instance_id="1a" * 16,
             readiness_key=bytes.fromhex("5a" * 32),
             session_token="7c" * 32,
+            handoff_token="8d" * 32,
         ),
         source_commit="89baeb26",
         build_channel="test",
@@ -226,6 +227,7 @@ def _native_instance_frame(
     instance_id: str = "1a" * 16,
     readiness_key: str = "5a" * 32,
     session_token: str = "7c" * 32,
+    handoff_token: str = "8d" * 32,
     protocol: str = desktop_launcher.NATIVE_SIDECAR_PROTOCOL,
 ) -> bytes:
     return (
@@ -235,6 +237,7 @@ def _native_instance_frame(
                 "instance_id": instance_id,
                 "readiness_key": readiness_key,
                 "session_token": session_token,
+                "handoff_token": handoff_token,
             },
             separators=(",", ":"),
         ).encode("ascii")
@@ -256,9 +259,11 @@ def test_launcher_reads_exact_bounded_native_instance_frame(
     assert frame.instance_id == "1a" * 16
     assert frame.readiness_key == bytes.fromhex("5a" * 32)
     assert frame.session_token == "7c" * 32
+    assert frame.handoff_token == "8d" * 32
     assert desktop_launcher.NATIVE_INSTANCE_FRAME_MAX_BYTES == 512
     assert "5a" * 32 not in repr(frame)
     assert "7c" * 32 not in repr(frame)
+    assert "8d" * 32 not in repr(frame)
 
 
 def test_launcher_accepts_native_frame_at_rust_byte_limit(
@@ -298,6 +303,8 @@ def test_launcher_accepts_native_frame_at_rust_byte_limit(
         _native_instance_frame(readiness_key="5a" * 31),
         _native_instance_frame(session_token="7c" * 31),
         _native_instance_frame(session_token="7C" * 32),
+        _native_instance_frame(handoff_token="8d" * 31),
+        _native_instance_frame(handoff_token="8D" * 32),
         _native_instance_frame()[:-2] + b',"unknown":true}\n',
         b"x" * (desktop_launcher.NATIVE_INSTANCE_FRAME_MAX_BYTES + 1) + b"\n",
     ],
@@ -489,6 +496,7 @@ def test_create_app_launcher_accepts_config_root_override(tmp_path: Path) -> Non
             instance_id="1a" * 16,
             readiness_key=bytes.fromhex("5a" * 32),
             session_token="7c" * 32,
+            handoff_token="8d" * 32,
         ),
         source_commit="89baeb26",
         build_channel="test",
@@ -514,7 +522,9 @@ def test_native_workspace_route_is_private_idempotent_and_project_bound(tmp_path
     source_root.mkdir()
     (source_root / "observations.csv").write_text("sample,value\na,7\n", encoding="utf-8")
     session_token = "7c" * 32
+    handoff_token = "8d" * 32
     session_headers = {desktop_launcher.NATIVE_SESSION_HEADER: session_token}
+    handoff_headers = {desktop_launcher.NATIVE_HANDOFF_HEADER: handoff_token}
     app = create_app(
         static_root=_static_root(tmp_path),
         desktop_config_root=config_root,
@@ -522,6 +532,7 @@ def test_native_workspace_route_is_private_idempotent_and_project_bound(tmp_path
             instance_id="1a" * 16,
             readiness_key=bytes.fromhex("5a" * 32),
             session_token=session_token,
+            handoff_token=handoff_token,
         ),
         source_commit="89baeb26",
         build_channel="test",
@@ -537,19 +548,38 @@ def test_native_workspace_route_is_private_idempotent_and_project_bound(tmp_path
 
     with TestClient(app) as client:
         assert client.post("/openevo-native/workspace-imports", json=request).status_code == 403
+        assert (
+            client.post(
+                "/openevo-native/workspace-imports",
+                headers=session_headers,
+                json=request,
+            ).status_code
+            == 403
+        )
         imported = client.post(
             "/openevo-native/workspace-imports",
-            headers=session_headers,
+            headers=handoff_headers,
             json=request,
         )
         replayed = client.post(
             "/openevo-native/workspace-imports",
-            headers=session_headers,
+            headers=handoff_headers,
             json=request,
         )
+        reselected = client.post(
+            "/openevo-native/workspace-imports",
+            headers=handoff_headers,
+            json={
+                **request,
+                "action_id": "native-source-action-0002",
+                "project_id": project_id_for_native_import(
+                    imported.json()["import_ref"]["import_id"]
+                ),
+            },
+        )
 
-        assert imported.status_code == replayed.status_code == 201
-        assert imported.json() == replayed.json()
+        assert imported.status_code == replayed.status_code == reselected.status_code == 201
+        assert imported.json() == replayed.json() == reselected.json()
         source = imported.json()
         assert source["kind"] == "native_folder_snapshot"
         assert source["display_name"] == "research-data"
@@ -611,6 +641,7 @@ def test_create_app_launcher_rejects_invalid_source_commit(
                 instance_id="1a" * 16,
                 readiness_key=bytes.fromhex("5a" * 32),
                 session_token="7c" * 32,
+                handoff_token="8d" * 32,
             ),
             source_commit=source_commit,
             build_channel=build_channel,

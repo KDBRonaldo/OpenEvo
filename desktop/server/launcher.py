@@ -36,6 +36,8 @@ LOCAL_API_STATE_DIRECTORY = "local-api-v1"
 NATIVE_INSTANCE_FRAME_MAX_BYTES = 512
 NATIVE_SESSION_HEADER = "X-OpenEvo-Desktop-Session"
 _NATIVE_SESSION_HEADER_BYTES = NATIVE_SESSION_HEADER.lower().encode("ascii")
+NATIVE_HANDOFF_HEADER = "X-OpenEvo-Native-Handoff"
+_NATIVE_HANDOFF_HEADER_BYTES = NATIVE_HANDOFF_HEADER.lower().encode("ascii")
 _NATIVE_SESSION_PROBE_ROUTE = "/openevo-native/session"
 _NATIVE_WORKSPACE_IMPORT_ROUTE = "/openevo-native/workspace-imports"
 _NATIVE_WORKSPACE_REQUEST_MAX_BYTES = 8192
@@ -47,6 +49,7 @@ class _NativeLauncherFrame:
     instance_id: str
     readiness_key: bytes = field(repr=False)
     session_token: str = field(repr=False)
+    handoff_token: str = field(repr=False)
 
 
 _NativeText = Annotated[
@@ -103,6 +106,7 @@ def create_app(
         build_channel=build_channel,
     )
     expected_session_token = native_frame.session_token.encode("ascii")
+    expected_handoff_token = native_frame.handoff_token.encode("ascii")
     workspace_import_store = app.state.desktop_release_provider.workspace_import_store
 
     @app.get(
@@ -111,7 +115,11 @@ def create_app(
         status_code=204,
     )
     def native_session_probe(request: Request) -> Response:
-        if not _native_session_matches(request, expected_session_token):
+        if not _native_credential_matches(
+            request,
+            header_name=_NATIVE_SESSION_HEADER_BYTES,
+            expected=expected_session_token,
+        ):
             return Response(status_code=403)
         return Response(status_code=204)
 
@@ -121,7 +129,11 @@ def create_app(
         status_code=201,
     )
     async def native_workspace_import(request: Request) -> Response:
-        if not _native_session_matches(request, expected_session_token):
+        if not _native_credential_matches(
+            request,
+            header_name=_NATIVE_HANDOFF_HEADER_BYTES,
+            expected=expected_handoff_token,
+        ):
             return _native_workspace_error(status_code=403)
         content_type = request.headers.get("content-type", "").partition(";")[0].strip().lower()
         if content_type != "application/json":
@@ -149,14 +161,19 @@ def create_app(
     return create_desktop_app(app, static_root=static_root)
 
 
-def _native_session_matches(request: Request, expected_session_token: bytes) -> bool:
+def _native_credential_matches(
+    request: Request,
+    *,
+    header_name: bytes,
+    expected: bytes,
+) -> bool:
     candidates = [
         value
         for name, value in request.scope["headers"]
-        if name == _NATIVE_SESSION_HEADER_BYTES
+        if name == header_name
     ]
     candidate = candidates[0] if len(candidates) == 1 else b""
-    matches = secrets.compare_digest(candidate, expected_session_token)
+    matches = secrets.compare_digest(candidate, expected)
     return len(candidates) == 1 and matches
 
 
@@ -203,8 +220,6 @@ def _ingest_native_workspace(
             ownership=ownership,
             import_id=import_id,
         )
-        if imported != prepared.import_ref:
-            raise WorkspaceImportError("workspace import result changed during private handoff")
         return ProjectSourceV1(
             kind="native_folder_snapshot",
             display_name=prepared.display_name,
@@ -228,12 +243,14 @@ def _read_native_instance_frame() -> _NativeLauncherFrame:
         "instance_id",
         "readiness_key",
         "session_token",
+        "handoff_token",
     }:
         raise ValueError("invalid native instance frame")
     protocol = payload["protocol"]
     instance_id = payload["instance_id"]
     readiness_key = payload["readiness_key"]
     session_token = payload["session_token"]
+    handoff_token = payload["handoff_token"]
     if (
         type(protocol) is not str
         or protocol != NATIVE_SIDECAR_PROTOCOL
@@ -243,12 +260,15 @@ def _read_native_instance_frame() -> _NativeLauncherFrame:
         or re.fullmatch(r"[0-9a-f]{64}", readiness_key) is None
         or type(session_token) is not str
         or re.fullmatch(r"[0-9a-f]{64}", session_token) is None
+        or type(handoff_token) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", handoff_token) is None
     ):
         raise ValueError("invalid native instance frame")
     return _NativeLauncherFrame(
         instance_id=instance_id,
         readiness_key=bytes.fromhex(readiness_key),
         session_token=session_token,
+        handoff_token=handoff_token,
     )
 
 

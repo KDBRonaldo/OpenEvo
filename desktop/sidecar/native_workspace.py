@@ -43,6 +43,7 @@ class _Identity:
     gid: int
     links: int
     size: int
+    blocks: int
     modified_ns: int
     changed_ns: int
 
@@ -56,6 +57,7 @@ class _Identity:
             gid=value.st_gid,
             links=value.st_nlink,
             size=value.st_size,
+            blocks=value.st_blocks,
             modified_ns=value.st_mtime_ns,
             changed_ns=value.st_ctime_ns,
         )
@@ -268,8 +270,12 @@ def _scan_directory(
             finally:
                 os.close(child_descriptor)
         elif stat.S_ISREG(value.st_mode):
+            if value.st_nlink != 1:
+                raise NativeWorkspaceArchiveError("workspace files must have one link")
             if value.st_size < 0 or value.st_size > _MAX_FILE_BYTES:
                 raise NativeWorkspaceArchiveError("workspace file exceeds its size limit")
+            if value.st_blocks * _BLOCK_SIZE < value.st_size:
+                raise NativeWorkspaceArchiveError("workspace sparse files are unsupported")
             if value.st_size > MAX_WORKSPACE_UPLOAD_BYTES - extracted_bytes[0]:
                 raise NativeWorkspaceArchiveError("workspace extracted-byte budget exceeded")
             extracted_bytes[0] += value.st_size

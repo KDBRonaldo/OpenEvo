@@ -116,6 +116,20 @@ def test_native_workspace_rejects_links_special_files_and_noncanonical_names(
     (noncanonical / "e\u0301.txt").write_text("text", encoding="utf-8")
     cases.append(noncanonical)
 
+    hardlinked = tmp_path / "hardlinked"
+    hardlinked.mkdir()
+    outside = tmp_path / "outside.txt"
+    outside.write_text("outside", encoding="utf-8")
+    os.link(outside, hardlinked / "outside.txt")
+    cases.append(hardlinked)
+
+    sparse = tmp_path / "sparse"
+    sparse.mkdir()
+    with (sparse / "sparse.bin").open("wb") as stream:
+        stream.seek(1024 * 1024 - 1)
+        stream.write(b"\0")
+    cases.append(sparse)
+
     for index, source in enumerate(cases):
         with pytest.raises(NativeWorkspaceArchiveError):
             with _prepare(source, private_root, f"native-source-invalid-{index:04d}"):

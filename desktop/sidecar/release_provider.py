@@ -4,6 +4,7 @@ from collections.abc import Callable, Mapping
 from datetime import datetime, timezone
 import hashlib
 import hmac
+import logging
 import re
 from typing import NoReturn, cast
 
@@ -27,10 +28,11 @@ from desktop.sidecar.contracts.v1.models import (
 )
 from desktop.sidecar.provider_store import DesktopProviderStore
 from desktop.sidecar.workspace_identity import ownership_for_native_import
-from desktop.sidecar.workspace_imports import WorkspaceImportStore
+from desktop.sidecar.workspace_imports import WorkspaceImportError, WorkspaceImportStore
 
 
 NATIVE_SIDECAR_PROTOCOL = "openevo-native-sidecar-v1"
+_LOGGER = logging.getLogger(__name__)
 
 
 class ProviderCapabilityUnavailableError(Exception):
@@ -72,6 +74,7 @@ class DesktopReleaseProvider:
         self._instance_id = instance_id
         self._readiness_key = readiness_key
         self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self._reconcile_workspace_imports()
         self._version = VersionV1(
             openapi_sha256=DESKTOP_OPENAPI_SHA256,
             build_version=build_version,
@@ -212,6 +215,7 @@ class DesktopReleaseProvider:
     def _update_project(self, arguments: Mapping[str, object]) -> Response:
         project_id = cast(str, arguments["project_id"])
         request = cast(ProjectPatchV1, arguments["request"])
+        previous = self._store.get_project(project_id)
         if request.source is not None:
             self._verify_project_source(request.source, project_id=project_id)
         project = self._store.patch_project(
@@ -219,13 +223,18 @@ class DesktopReleaseProvider:
             request,
             if_match=cast(str, arguments["if_match"]),
         )
+        if previous.source != project.source:
+            self._release_project_source(previous.source, project_id=project_id)
         return self._resource_response(project)
 
     def _delete_project(self, arguments: Mapping[str, object]) -> Response:
+        project_id = cast(str, arguments["project_id"])
+        project = self._store.get_project(project_id)
         self._store.delete_project(
-            cast(str, arguments["project_id"]),
+            project_id,
             if_match=cast(str, arguments["if_match"]),
         )
+        self._release_project_source(project.source, project_id=project_id)
         return Response(status_code=204)
 
     def _timestamp(self) -> str:
@@ -248,6 +257,39 @@ class DesktopReleaseProvider:
             import_ref,
             ownership=ownership_for_native_import(import_ref, project_id=project_id),
         )
+
+    def _reconcile_workspace_imports(self) -> None:
+        references = {}
+        for project_id, source in self._store.native_workspace_sources():
+            import_ref = source.import_ref
+            if import_ref is None:
+                raise ValueError("native folder source requires an import reference")
+            if import_ref.import_id in references:
+                raise ValueError("workspace import is referenced by multiple projects")
+            references[import_ref.import_id] = (
+                import_ref,
+                ownership_for_native_import(import_ref, project_id=project_id),
+            )
+        self._workspace_import_store.reconcile_references(references)
+
+    def _release_project_source(self, source: ProjectSourceV1, *, project_id: str) -> None:
+        if source.kind != "native_folder_snapshot" or source.import_ref is None:
+            return
+        try:
+            self._workspace_import_store.release(
+                source.import_ref,
+                ownership=ownership_for_native_import(
+                    source.import_ref,
+                    project_id=project_id,
+                ),
+            )
+        except (OSError, WorkspaceImportError):
+            # The project transaction is already durable. Startup reconciliation
+            # retries cleanup and fails closed if referenced storage is damaged.
+            _LOGGER.warning(
+                "deferred workspace import cleanup after committed project mutation",
+                extra={"project_id": project_id},
+            )
 
     @staticmethod
     def _resource_response(

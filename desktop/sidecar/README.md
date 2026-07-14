@@ -119,14 +119,19 @@ restart and replacement guarantees above therefore require that the key has not
 leaked and that the private state directory has not been compromised. Stronger
 same-UID isolation requires a platform credential boundary outside this module.
 
-The private route is excluded from OpenAPI and requires the exact process-owned
-Desktop session token. Its bounded request is the only path-bearing message;
-success returns the closed `ProjectSourceV1` and never echoes that path. Native
+The private route is excluded from OpenAPI and requires a process-owned native
+handoff token that is distinct from the renderer's Desktop session token. Its
+bounded request is the only path-bearing message; success returns the closed
+`ProjectSourceV1` and never echoes that path. Native
 import ownership is reproducible from project identity and archive digest. A new
 project created from a native import receives a deterministic project ID derived
 from the opaque import ID; an existing project supplies its own ID privately.
 The release provider verifies the exact import and ownership before persisting a
-native project source. Core upload consumption remains the next integration step.
+native project source. Replacing or deleting a committed project source releases
+its exact verified private import after the database commit. Startup then
+reconciles the private store against all durable project references, retaining
+only exact reference/ownership matches and removing abandoned picker imports.
+Core upload consumption remains the next integration step.
 
 ## Release Local Provider
 
@@ -154,7 +159,8 @@ This phase implements:
 - profile and project list/create/get/patch/delete through
   `DesktopProviderStore`, including durable idempotency, signed cursors, ETags,
   and restart recovery.
-- private identity-bound native folder import plus project-source verification;
+- private identity-bound native folder import, project-source verification, and
+  committed/startup lifecycle cleanup;
   this route is deliberately absent from the public Local API OpenAPI document.
 
 No SSH or Core operation is claimed by this slice. Connection actions,

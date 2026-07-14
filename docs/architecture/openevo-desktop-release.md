@@ -248,6 +248,15 @@ the Desktop workflow compiles, lints, and tests both debug and release cfg.
 
 ### Workspace import store trust boundary
 
+The Rust host holds the selected directory open with no-follow directory flags
+for the complete archive handoff and revalidates the path against that descriptor's
+device/inode identity. Only one OS picker may be physically active at a time. A
+selection captures the current sidecar instance before opening the picker and is
+rejected if that instance restarts before handoff. The renderer-visible Desktop
+session credential cannot call the hidden import route; Rust uses a separate
+per-instance native handoff credential delivered only through the inherited child
+channel.
+
 The private workspace import store uses a store authentication key that is a
 separate raw 256-bit file in the root's parent directory. The key is not stored
 in the root marker, archive xattr, or self-describing import metadata. A
@@ -271,6 +280,14 @@ an inode-bound private snapshot, reopens and hashes that snapshot, unlinks the
 verified pathname, then hashes the unlinked read-only descriptor again before
 yielding it. These checks close the previously identified replacement and
 equal-length rewrite windows at the store's verification boundaries.
+
+Project persistence and private import storage are separate durable authorities.
+After a successful source replacement or project deletion, the release provider
+removes the previous exact import without changing the already-committed project
+result if cleanup must be retried. On every sidecar start, a bounded reconciliation
+derives the complete retained set from durable project rows, verifies each exact
+reference and ownership, removes unreferenced picker snapshots, and fails closed
+when a referenced import is missing or corrupt.
 
 This is not an OS isolation boundary against an arbitrary process running as
 the same UID. Such a process can read the durable authentication key and can

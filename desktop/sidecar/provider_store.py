@@ -37,6 +37,7 @@ from desktop.sidecar.contracts.v1.models import (
     ProjectOperationResultV1,
     ProjectPageV1,
     ProjectPatchV1,
+    ProjectSourceV1,
     ProjectV1,
     RemoteProfileCreateV1,
     RemoteProfilePageV1,
@@ -1690,6 +1691,25 @@ class DesktopProviderStore:
         self._validate_resource_id(project_id)
         with self._transaction(write=False) as connection:
             return self._project_from_row(self._require_project_row(connection, project_id))
+
+    def native_workspace_sources(self) -> tuple[tuple[str, ProjectSourceV1], ...]:
+        """Return the bounded persisted source set used for private-store recovery."""
+
+        with self._transaction(write=False) as connection:
+            rows = connection.execute(
+                "SELECT * FROM projects ORDER BY project_id ASC LIMIT ?",
+                (MAX_RECOVERY_ROWS + 1,),
+            ).fetchall()
+            if len(rows) > MAX_RECOVERY_ROWS:
+                raise ProviderDataCorruptionError(
+                    "project recovery row count exceeds the startup limit"
+                )
+            sources = []
+            for row in rows:
+                project = self._project_from_row(row)
+                if project.source.kind == "native_folder_snapshot":
+                    sources.append((project.project_id, project.source))
+            return tuple(sources)
 
     def get_local_operation(self, operation_id: str) -> LocalOperationV1:
         self._validate_resource_id(operation_id)
