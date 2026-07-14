@@ -171,11 +171,13 @@ filesystem anchor 逐组件固定并复核宿主机 `~/.codex/auth.json`，把 b
 size、digest、UTF-8 JSON、redactor 和全路径 identity 校验后，才用 Linux
 `renameat2(RENAME_NOREPLACE)` 把完整 `0600` inode 原子发布为私有 credential root 的最终
 `auth.json`。Gateway 把 root/auth exact identity 交给 runtime；DockerRuntime no-follow
-重开并复核两者、持有两个 FD 到 container absence。Docker 只先启动 trusted inert command，
+重开并复核两者、持有两个 FD 到 container absence，并把
+`/proc/<core-pid>/fd/<held-fd>` 形式的 root/auth 分离 source 交给 Docker bind mount，显式固定
+`restart=no`；初次 adoption 和任何 restart 都不能重新解析到替换 pathname。Docker 只先启动 trusted inert command，
 随后 Core 在任何 prepare/agent command 前，对 exact container ID 内已经 adopted 的 root/auth
 执行 stat，将 device/inode/mode/owner/link-count/size 与 held authority 精确比较，并在前后绑定
-container ID、PID、start time、running state 和 restart count。Docker 若在验证后采用了替换
-pathname，identity mismatch 会先 stop container 再 fail closed。SIGKILL 或 staging cleanup
+container ID、PID、start time、running state 和 restart count，最后再次复核 host pathname 与
+held FD binding。任一 identity mismatch 会先 stop container 再 fail closed。SIGKILL 或 staging cleanup
 fault 留下的内容仍在 journaled credential root 内；最终发布成功后的空 staging-child cleanup
 fault 不会把成功误报为不可恢复。
 
@@ -191,8 +193,8 @@ output 或 artifact。scan 在任何写入前完成 per-file、aggregate byte、
 执行 deadline 耗尽后，transcript byte recovery/build 使用独立有界 finalization budget，保留
 timeout/cancel 前已经捕获的输出和原终态。结果发布前还会递归执行一次内存脱敏。失败时
 post-run 先做固定次数的 stop/absence retry，仍失败则释放 stage worker，由运行期周期
-reconciliation 继续。private v5 cleanup journal 除 runtime/container/session/log/credential
-identities 外，还保存显式 recovery phase、闭集且已脱敏的
+reconciliation 继续。private v6 cleanup journal 除 runtime/container/session/log/credential
+identities 和 exact staged auth identity 外，还保存显式 recovery phase、闭集且已脱敏的
 request/agent terminal/optional result/pending status/timer finalization authority，以及 canonical
 result digest 和单调的 export/callback success proof；agent terminal state 必须先 fsync 该
 authority 再落入 live memory，不保存 auth bytes。Required evolution export 还绑定 normalized
@@ -200,7 +202,7 @@ backend URL、finite positive timeout、fail-open policy 及其 canonical identi
 Journal transition 使用 durable pending marker、candidate fsync、atomic replace 和 directory
 fsync；全部成功后才 copy-on-write 发布 live phase/proof。replace/fsync 失败会回滚旧 journal 并
 保留 pending marker，restart 因而不能把不确定 terminal transition 当成删除 completion/root 的
-授权，live exact retry 成功后才清 marker。Evolution export 由稳定
+授权，live pending status/error 也保持不变，exact retry 成功后才清 marker。Evolution export 由稳定
 source event identity 去重，callback 带稳定 result digest/idempotency key；响应失败或未知保持
 pending，成功 phase 必须先持久化。恢复缺 phase/authority，或当前 evolution config/client
 缺失、禁用、destination/config identity 漂移时，必须保留 transcript、event/callback authority
@@ -208,8 +210,12 @@ pending，成功 phase 必须先持久化。恢复缺 phase/authority，或当�
 credential root 重新验证并构造 redactor（仅在仍需重建 transcript 时），证明容器 absent 后
 只重试 pending phase。两项 required proof 都持久成功后才删除 completion storage、session、
 credential、log roots 和 journal；无法证明时 authority 持续保留。
-Credential-capable init、agent postprocess、finalization 和 teardown 异常日志只记录经
-`CredentialRedactor` 处理的 exception text，不附带原始 traceback。
+获得 cleanup 授权后，Core 在枚举 credential root 之前先按 journal exact identity no-follow
+复核、截断、fsync 并 unlink `auth.json`；剩余递归清理仍受 node/depth budget 限制，预算耗尽会
+保留 root/journal 供重试，但不会继续保留 auth bytes。Credential-capable init、agent
+postprocess、export、reconciliation、cleanup 和 teardown 异常日志不使用原始
+`exc_info`/traceback；始终保留 exception type，只有存在 verified `CredentialRedactor` 时才附加
+脱敏后的 exception text。
 
 ## 主要模块
 

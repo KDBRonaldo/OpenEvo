@@ -77,12 +77,15 @@ chains are all verified there. Linux
 `renameat2(RENAME_NOREPLACE)` then publishes the complete `0600` inode as the
 credential root's final `auth.json`. DockerRuntime reopens and revalidates the
 resulting root and file identities and keeps both descriptors alive through
-mount adoption. Docker starts only the trusted inert container command, then,
+mount adoption. The root and auth file are separate bind sources addressed as
+`/proc/<core-pid>/fd/<held-fd>`, so pathname replacement cannot change initial
+adoption or a later restart; the managed container also fixes `restart=no`.
+Docker starts only the trusted inert container command, then,
 before any prepare or agent command, stats the adopted root/auth mount inside
 the exact container ID and compares device, inode, mode, owner, link count, and
 size with the held authority. Container ID, PID, start time, running state, and
-restart count are stable across this check. A mismatch stops the container and
-fails closed. Crash and bounded staging-cleanup windows remain covered by the
+restart count are stable across this check, followed by one final pathname-to-FD
+binding check. A mismatch stops the container and fails closed. Crash and bounded staging-cleanup windows remain covered by the
 journaled credential-root cleanup authority; an empty staging-child cleanup
 fault after publication does not negate success.
 
@@ -94,8 +97,10 @@ write targets. The scanner preflights the complete per-file, aggregate-byte,
 node, and depth budgets before changing a Core capture; a limit breach fails
 finalization explicitly and leaves all original bytes unchanged. Result objects
 receive a separate recursive in-memory redaction before persistence or delivery.
-Credential-capable initialization, execution/postprocess, finalization, and
-teardown exception logs contain only redacted exception text and no raw traceback.
+Credential-capable initialization, execution/postprocess, export, reconciliation,
+and teardown exception logs never include `exc_info` or a raw traceback. They
+retain the exception type and include exception text only after verified
+credential redaction.
 The Codex harness remains a necessary trusted consumer of the credential.
 OpenEvo cannot prevent that process from actively transforming or transmitting a
 secret; that behavior is outside this boundary.
@@ -132,8 +137,8 @@ Docker always follows removal with an absence `inspect`, including after
 successful `rm -f`. Subscription teardown retries failed stop/absence checks a
 fixed number of times in the post-run worker. A still-unproven runtime is moved
 to periodic reconciliation instead of occupying that worker indefinitely.
-The private v5 cleanup journal contains runtime/container and pinned-root
-ownership plus an explicit recovery phase and a redacted, closed finalization
+The private v6 cleanup journal contains runtime/container and pinned-root
+ownership, the exact staged auth-file identity, an explicit recovery phase, and a redacted, closed finalization
 authority: request identity, agent terminal state, optional terminal result,
 pending status, and timer marks. A terminal agent result is fsynced into that
 authority before it becomes the live in-memory terminal state. Once a result
@@ -146,7 +151,8 @@ copy-on-write: a durable pending marker, candidate fsync, atomic replace, and
 directory fsync complete before the new phase or proof enters live memory.
 Replace/fsync failures roll back the old authority and retain the pending marker,
 so restart cannot treat an uncertain transition as permission to delete storage
-or roots; an exact live retry can finish the transition and clear the marker.
+or roots; live pending status/error likewise remain unchanged until persistence
+succeeds. An exact live retry can finish the transition and clear the marker.
 Evolution export uses the stable session source-event identity, and callbacks
 carry a result-derived `Idempotency-Key` and digest header. A failed or unknown
 response leaves that phase pending; a successful phase is fsynced before the
@@ -157,7 +163,10 @@ keeps a required export pending instead of converting it to a no-op. Startup rel
 re-verifies staged auth only when transcript rebuilding is still needed, proves
 every owned container absent, and resumes pending publication. Completion
 storage, session/transcript, credential, log roots, and the journal are removed
-only after every required export and callback phase is durably successful. The
+only after every required export and callback phase is durably successful. Once
+authorized, cleanup verifies and scrubs the journal-bound `auth.json` inode before
+enumerating any attacker-inflatable credential-root tree. The remaining walk is
+still bounded; budget exhaustion retains the root and journal but not auth bytes. The
 live retry loop applies the same state machine between restarts.
 
 ## What it captures

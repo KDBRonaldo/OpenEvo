@@ -442,7 +442,12 @@ async def test_private_credential_root_is_mounted_outside_the_session_tree(
     create = next(call.args for call in run_command.await_args_list if call.args[1] == "create")
     volumes = [create[index + 1] for index, value in enumerate(create) if value == "-v"]
     credential_volumes = [volume for volume in volumes if MANAGED_CODEX_HOME in volume]
-    assert credential_volumes == [f"{credential_dir}:{MANAGED_CODEX_HOME}"]
+    assert len(credential_volumes) == 2
+    assert credential_volumes[0].startswith(f"/proc/{os.getpid()}/fd/")
+    assert credential_volumes[0].endswith(f":{MANAGED_CODEX_HOME}")
+    assert credential_volumes[1].startswith(f"/proc/{os.getpid()}/fd/")
+    assert credential_volumes[1].endswith(f":{MANAGED_CODEX_HOME}/auth.json")
+    assert str(credential_dir) not in credential_volumes
     assert not credential_dir.is_relative_to(session_dir)
 
 
@@ -480,7 +485,13 @@ async def test_credential_mount_rejects_path_replacement_adopted_by_docker(
             credential_dir.rename(displaced)
             replacement = _credential_mount(credential_dir)
             assert replacement.root_identity != authority.root_identity
-            assert f"{credential_dir}:{MANAGED_CODEX_HOME}" in args
+            credential_volumes = [
+                args[index + 1]
+                for index, value in enumerate(args)
+                if value == "-v" and MANAGED_CODEX_HOME in args[index + 1]
+            ]
+            assert len(credential_volumes) == 2
+            assert all(value.startswith(f"/proc/{os.getpid()}/fd/") for value in credential_volumes)
             _write_mock_cidfile(args, container_id)
             return 0, container_id, None
         if args[1:3] == ("container", "inspect"):
@@ -502,6 +513,66 @@ async def test_credential_mount_rejects_path_replacement_adopted_by_docker(
 
     assert runtime._credential_root_fd == -1
     assert runtime._credential_auth_fd == -1
+
+
+@pytest.mark.asyncio
+async def test_credential_mount_rejects_replacement_after_final_process_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    container_id = "8" * 64
+    session_dir = tmp_path / "session"
+    credential_dir = tmp_path / "credentials"
+    displaced = tmp_path / "displaced-credentials"
+    session_dir.mkdir()
+    authority = _credential_mount(credential_dir)
+    runtime = DockerRuntime(
+        RuntimeSpec(
+            profile="managed_science",
+            image="openevo/science-runtime:0.1.0",
+            container_user="host",
+        ),
+        "credential-final-race-session",
+        session_dir,
+        credential_mount=authority,
+    )
+    process_inspects = 0
+    container_present = True
+
+    async def run_command_impl(*args, **kwargs):
+        nonlocal container_present, process_inspects
+        del kwargs
+        if args[1:3] == ("image", "inspect"):
+            digest = MANAGED_RUNTIME_RELEASES["managed_science"].trusted_digest
+            return 0, f'[{{"Id":"{digest}","RepoDigests":[]}}]', None
+        if args[1] == "create":
+            _write_mock_cidfile(args, container_id)
+            return 0, container_id, None
+        if args[1:3] == ("container", "inspect"):
+            if not container_present:
+                return 1, None, f"Error: No such object: {container_id}"
+            if any("State.Pid" in str(value) for value in args):
+                process_inspects += 1
+                if process_inspects == 2:
+                    credential_dir.rename(displaced)
+                    _credential_mount(credential_dir)
+                return 0, f"{container_id}|9012|started-at|true|0\n", None
+            return 0, container_id, None
+        if args[1] == "exec" and "/usr/bin/stat" in args:
+            return 0, _credential_stat_output(authority), None
+        if args[1] == "rm":
+            container_present = False
+        return 0, None, None
+
+    run_command = AsyncMock(side_effect=run_command_impl)
+    monkeypatch.setattr(runtime, "_run_local_command", run_command)
+
+    with pytest.raises(RuntimeError, match="did not adopt"):
+        await runtime.start()
+
+    assert process_inspects == 2
+    assert any(call.args[1] == "rm" for call in run_command.await_args_list)
+    assert runtime.absence_proven is True
 
 
 @pytest.mark.asyncio

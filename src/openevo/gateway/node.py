@@ -15,7 +15,7 @@ import stat
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 from tempfile import TemporaryDirectory, mkdtemp
-from typing import Any
+from typing import Any, cast
 from urllib.parse import unquote, urlparse
 
 import httpx
@@ -29,6 +29,7 @@ from openevo.gateway.dispatcher import (
 )
 from openevo.gateway.session import SessionRegistry
 from openevo.gateway.session_files import (
+    CredentialFileIdentity,
     CredentialRedactor,
     SessionFileSecurityError,
     StagedCodexCredential,
@@ -38,6 +39,7 @@ from openevo.gateway.session_files import (
     load_staged_codex_subscription_redactor,
     read_verified_session_transcript,
     redact_core_capture_tree,
+    remove_credential_tree,
     remove_session_tree,
     stage_codex_subscription_auth,
     write_verified_session_log,
@@ -101,6 +103,7 @@ _RECOVERY_PHASES = {
     _RECOVERY_PHASE_TERMINAL_FINALIZATION,
     _RECOVERY_PHASE_TERMINAL_DELIVERY,
 }
+_UNSET = object()
 
 
 class GatewayExecutionTimeout(TimeoutError):
@@ -159,6 +162,7 @@ class CleanupRetryOwnership:
     log_authority_identity: tuple[int, int, int] | None
     credential_dir: Path | None
     credential_root_identity: tuple[int, int, int] | None
+    credential_auth_identity: CredentialFileIdentity | None
     runtime_id: str | None
     container_id: str | None
     eval_runtime_id: str | None
@@ -802,6 +806,7 @@ class GatewayNodeManager:
                     root_identity=managed.credential_root_identity,
                     auth_identity=staged_credential.auth_identity,
                 )
+                self._persist_cleanup_ownership(self._cleanup_ownership_for(managed))
             if managed.credential_dir is None:
                 runtime = create_runtime(
                     runtime_spec,
@@ -1220,10 +1225,11 @@ class GatewayNodeManager:
                 "context_injected": False,
                 "error": str(exc),
             }
-            logger.warning(
-                "Evolution context resolution failed for session %s: %s",
-                request.session_id,
+            self._log_credential_safe_exception(
+                managed,
+                "Evolution context resolution failed",
                 exc,
+                level=logging.WARNING,
             )
             return {}
 
@@ -1303,10 +1309,12 @@ class GatewayNodeManager:
         except Exception as exc:
             if not authority.fail_open:
                 raise
-            logger.warning(
-                "Evolution event export failed for session %s: %s",
-                result.session_id,
+            self._log_credential_safe_exception(
+                None,
+                "Evolution event export failed",
                 exc,
+                session_id=result.session_id,
+                level=logging.WARNING,
             )
             return False
         return True
@@ -1389,6 +1397,8 @@ class GatewayNodeManager:
         managed: ManagedSession,
         *,
         agent_result: AgentRunResult | None = None,
+        pending_status: SessionStatus | None | object = _UNSET,
+        pending_error: str | None | object = _UNSET,
     ) -> None:
         retries = getattr(self, "_cleanup_retries", None)
         if retries is None:
@@ -1409,6 +1419,8 @@ class GatewayNodeManager:
             finalization_state=self._subscription_finalization_state(
                 managed,
                 agent_result=agent_result,
+                pending_status=pending_status,
+                pending_error=pending_error,
             ),
         )
         self._persist_cleanup_ownership(updated)
@@ -1472,10 +1484,11 @@ class GatewayNodeManager:
                 managed.runtime_cleanup_blocked = True
             raise
         except Exception as exc:
-            logger.warning(
-                "Eval runtime prewarm failed for session %s: %s",
-                request.session_id,
+            self._log_credential_safe_exception(
+                managed,
+                "Eval runtime prewarm failed",
                 exc,
+                level=logging.WARNING,
             )
             try:
                 await eval_runtime.stop()
@@ -1558,9 +1571,10 @@ class GatewayNodeManager:
             try:
                 self._redact_core_capture_authority(managed)
             except Exception as exc:
-                logger.exception(
-                    "Credential capture redaction failed for session %s",
-                    request.session_id,
+                self._log_credential_safe_exception(
+                    managed,
+                    "Credential capture redaction failed",
+                    exc,
                 )
                 result = self._error_result(
                     request,
@@ -1848,13 +1862,18 @@ class GatewayNodeManager:
                 )
         except GatewayExecutionTimeout as exc:
             # Preserve the built trajectory even when eval times out.
-            logger.warning("Eval timed out for session %s: %s", request.session_id, exc)
+            self._log_credential_safe_exception(
+                managed,
+                "Eval timed out",
+                exc,
+                level=logging.WARNING,
+            )
             if trajectory.status not in ("TIMEOUT", "ERROR"):
                 trajectory = trajectory.model_copy(
                     update={"status": "TIMEOUT", "error": f"eval timed out: {exc}"}
                 )
         except Exception as exc:
-            logger.exception("Eval failed for session %s", request.session_id)
+            self._log_credential_safe_exception(managed, "Eval failed", exc)
             trajectory = trajectory.model_copy(
                 update={"status": "ERROR", "error": f"evaluator failed: {exc}"}
             )
@@ -1984,10 +2003,10 @@ class GatewayNodeManager:
                 managed,
             )
         except Exception as exc:
-            logger.exception(
-                "Evaluator %s failed for session %s",
-                evaluator_spec.strategy,
-                request.session_id,
+            self._log_credential_safe_exception(
+                managed,
+                f"Evaluator {evaluator_spec.strategy} failed",
+                exc,
             )
             return trajectory.model_copy(
                 update={"status": "ERROR", "error": f"evaluator failed: {exc}"}
@@ -2150,9 +2169,13 @@ class GatewayNodeManager:
         if _is_codex_subscription_agent(managed.request.agent) and (
             managed.runtime is not None or managed.credential_dir is not None
         ):
+            self._persist_subscription_finalization_authority(
+                managed,
+                pending_status=status,
+                pending_error=error,
+            )
             managed.pending_status = status
             managed.pending_error = error
-            self._persist_subscription_finalization_authority(managed)
             return
         if status == SessionStatus.TIMEOUT:
             managed.final_result = self._timeout_result(
@@ -2225,12 +2248,13 @@ class GatewayNodeManager:
             )
             response.raise_for_status()
             return True
-        except Exception:
-            logger.warning(
-                "Failed to deliver callback for session %s to %s",
-                result.session_id,
-                callback_url,
-                exc_info=True,
+        except Exception as exc:
+            self._log_credential_safe_exception(
+                None,
+                "Failed to deliver terminal callback",
+                exc,
+                session_id=result.session_id,
+                level=logging.WARNING,
             )
             return False
 
@@ -2354,12 +2378,13 @@ class GatewayNodeManager:
         try:
             await runtime.stop()
             return True
-        except Exception:
-            logger.warning(
-                "Failed to stop %s for session %s",
-                label,
-                session_id,
-                exc_info=True,
+        except Exception as exc:
+            self._log_credential_safe_exception(
+                None,
+                f"Failed to stop {label}",
+                exc,
+                session_id=session_id,
+                level=logging.WARNING,
             )
             return False
 
@@ -2387,21 +2412,41 @@ class GatewayNodeManager:
 
     @staticmethod
     def _log_credential_safe_exception(
-        managed: ManagedSession,
+        managed: ManagedSession | None,
         message: str,
         exc: Exception,
+        *,
+        session_id: str | None = None,
+        level: int = logging.ERROR,
     ) -> None:
-        rendered = str(exc)
-        if managed.credential_redactor is not None:
-            rendered = managed.credential_redactor.redact(rendered)
-        logger.error(
-            "%s for session %s: %s",
+        exception_type = type(exc).__name__
+        redactor = None if managed is None else managed.credential_redactor
+        rendered = exception_type
+        if redactor is not None:
+            detail = redactor.redact(str(exc))
+            if detail:
+                rendered = f"{exception_type}: {detail}"
+        logger.log(
+            level,
+            "%s for session %s [%s]",
             message,
-            managed.session_id,
+            session_id or (managed.session_id if managed is not None else "unknown"),
             rendered,
         )
 
     async def _remove_owned_roots(self, managed: ManagedSession) -> bool:
+        credential_removed = True
+        if managed.credential_dir is not None:
+            credential_removed = await self._remove_credential_dir_best_effort(
+                managed.credential_dir,
+                managed.session_id,
+                managed.credential_root_identity,
+                (
+                    None
+                    if managed.credential_mount is None
+                    else managed.credential_mount.auth_identity
+                ),
+            )
         tasks = [
             self._remove_session_dir_best_effort(
                 managed.session_dir,
@@ -2409,14 +2454,6 @@ class GatewayNodeManager:
                 managed.session_root_identity,
             )
         ]
-        if managed.credential_dir is not None:
-            tasks.append(
-                self._remove_credential_dir_best_effort(
-                    managed.credential_dir,
-                    managed.session_id,
-                    managed.credential_root_identity,
-                )
-            )
         if managed.log_authority_dir is not None:
             tasks.append(
                 self._remove_log_authority_best_effort(
@@ -2426,7 +2463,7 @@ class GatewayNodeManager:
                 )
             )
         outcomes = await asyncio.gather(*tasks, return_exceptions=True)
-        return all(
+        return credential_removed and all(
             outcome is not False and not isinstance(outcome, BaseException) for outcome in outcomes
         )
 
@@ -2449,6 +2486,8 @@ class GatewayNodeManager:
         previous = retries.get(managed.session_id)
         if previous is not None:
             ownership.delivery_state = previous.delivery_state
+            if ownership.credential_auth_identity is None:
+                ownership.credential_auth_identity = previous.credential_auth_identity
             if previous.delivery_state is not None:
                 ownership.phase = previous.phase
             if ownership.finalization_state is None:
@@ -2562,11 +2601,13 @@ class GatewayNodeManager:
                     result,
                     authority,
                 )
-            except Exception:
-                logger.warning(
-                    "Terminal evolution export remains pending for session %s",
-                    session_id,
-                    exc_info=True,
+            except Exception as exc:
+                self._log_credential_safe_exception(
+                    ownership.managed,
+                    "Terminal evolution export remains pending",
+                    exc,
+                    session_id=session_id,
+                    level=logging.WARNING,
                 )
                 return False
             if exported:
@@ -2647,6 +2688,8 @@ class GatewayNodeManager:
         managed: ManagedSession,
         *,
         agent_result: AgentRunResult | None = None,
+        pending_status: SessionStatus | None | object = _UNSET,
+        pending_error: str | None | object = _UNSET,
     ) -> SubscriptionFinalizationState:
         redactor = managed.credential_redactor
 
@@ -2659,9 +2702,18 @@ class GatewayNodeManager:
             )
             return model_type.model_validate(payload)
 
-        pending_error = managed.pending_error
-        if pending_error is not None and redactor is not None:
-            pending_error = redactor.redact(pending_error)
+        effective_pending_status = (
+            managed.pending_status
+            if pending_status is _UNSET
+            else cast(SessionStatus | None, pending_status)
+        )
+        effective_pending_error = (
+            managed.pending_error
+            if pending_error is _UNSET
+            else cast(str | None, pending_error)
+        )
+        if effective_pending_error is not None and redactor is not None:
+            effective_pending_error = redactor.redact(str(effective_pending_error))
         return SubscriptionFinalizationState(
             request=redacted_model(managed.request, SessionDispatchRequest),
             agent_result=redacted_model(
@@ -2669,8 +2721,8 @@ class GatewayNodeManager:
                 AgentRunResult,
             ),
             final_result=redacted_model(managed.final_result, SessionResult),
-            pending_status=managed.pending_status,
-            pending_error=pending_error,
+            pending_status=effective_pending_status,
+            pending_error=effective_pending_error,
             cancel_requested=managed.cancel_requested,
             timer_marks=dict(managed.timer._marks),
         )
@@ -2696,6 +2748,11 @@ class GatewayNodeManager:
             log_authority_identity=managed.log_authority_identity,
             credential_dir=managed.credential_dir,
             credential_root_identity=managed.credential_root_identity,
+            credential_auth_identity=(
+                None
+                if managed.credential_mount is None
+                else managed.credential_mount.auth_identity
+            ),
             runtime_id=(str(getattr(runtime, "runtime_id", "")) or None),
             container_id=getattr(runtime, "container_id", None),
             eval_runtime_id=(str(getattr(eval_runtime, "runtime_id", "")) or None),
@@ -2725,7 +2782,7 @@ class GatewayNodeManager:
         state = ownership.finalization_state
         delivery = ownership.delivery_state
         payload = {
-            "version": 5,
+            "version": 6,
             "session_id": ownership.session_id,
             "phase": ownership.phase,
             "runtime": {
@@ -2754,6 +2811,7 @@ class GatewayNodeManager:
                 else {
                     "path": str(ownership.credential_dir),
                     "identity": list(ownership.credential_root_identity or ()),
+                    "auth_identity": list(ownership.credential_auth_identity or ()),
                 }
             ),
             "subscription_finalization": (
@@ -3054,22 +3112,24 @@ class GatewayNodeManager:
             "session_root",
             "credential_root",
         }
-        if version in {2, 3, 4, 5}:
+        if version in {2, 3, 4, 5, 6}:
             expected_keys.add("log_root")
-        if version in {3, 4, 5}:
+        if version in {3, 4, 5, 6}:
             expected_keys.add("subscription_finalization")
-        if version in {4, 5}:
+        if version in {4, 5, 6}:
             expected_keys.add("terminal_delivery")
-        if version == 5:
+        if version in {5, 6}:
             expected_keys.add("phase")
         if set(payload) != expected_keys:
             raise ValueError("cleanup ownership payload is not closed")
-        if version not in {1, 2, 3, 4, 5} or not isinstance(payload["session_id"], str):
+        if version not in {1, 2, 3, 4, 5, 6} or not isinstance(
+            payload["session_id"], str
+        ):
             raise ValueError("cleanup ownership identity is invalid")
         phase = payload.get("phase")
-        if version == 5 and phase not in _RECOVERY_PHASES:
+        if version in {5, 6} and phase not in _RECOVERY_PHASES:
             raise ValueError("cleanup recovery phase is invalid")
-        if version != 5:
+        if version not in {5, 6}:
             phase = None
         session_id = payload["session_id"]
         expected_name = f"{hashlib.sha256(session_id.encode('utf-8')).hexdigest()}.json"
@@ -3117,8 +3177,36 @@ class GatewayNodeManager:
         if credential_payload is None:
             credential_dir = None
             credential_identity = None
+            credential_auth_identity = None
         else:
-            credential_dir, credential_identity = root_identity(credential_payload)
+            if version == 6:
+                if not isinstance(credential_payload, dict) or set(credential_payload) != {
+                    "path",
+                    "identity",
+                    "auth_identity",
+                }:
+                    raise ValueError("cleanup credential identity is invalid")
+                credential_dir, credential_identity = root_identity(
+                    {
+                        "path": credential_payload["path"],
+                        "identity": credential_payload["identity"],
+                    }
+                )
+                auth_identity = credential_payload["auth_identity"]
+                if not isinstance(auth_identity, list) or (
+                    auth_identity
+                    and (
+                        len(auth_identity) != 8
+                        or any(not isinstance(item, int) for item in auth_identity)
+                    )
+                ):
+                    raise ValueError("cleanup credential auth identity is invalid")
+                credential_auth_identity = (
+                    tuple(auth_identity) if auth_identity else None
+                )
+            else:
+                credential_dir, credential_identity = root_identity(credential_payload)
+                credential_auth_identity = None
         finalization_state = None
         finalization_payload = payload.get("subscription_finalization")
         if finalization_payload is not None:
@@ -3194,7 +3282,7 @@ class GatewayNodeManager:
                 "callback_required",
                 "callback_succeeded",
             }
-            if version == 5:
+            if version in {5, 6}:
                 delivery_keys.add("export_authority")
             if (
                 not isinstance(delivery_payload, dict)
@@ -3267,7 +3355,7 @@ class GatewayNodeManager:
             callback_succeeded = delivery_payload["callback_succeeded"]
             if callback_required != (callback_url is not None):
                 raise ValueError("terminal delivery callback authority is invalid")
-            if version == 5 and export_required != (export_authority is not None):
+            if version in {5, 6} and export_required != (export_authority is not None):
                 raise ValueError("terminal delivery export authority is invalid")
             if (not export_required and not export_succeeded) or (
                 not callback_required and not callback_succeeded
@@ -3307,6 +3395,7 @@ class GatewayNodeManager:
             log_authority_identity=log_authority_identity,
             credential_dir=credential_dir,
             credential_root_identity=credential_identity,
+            credential_auth_identity=credential_auth_identity,
             runtime_id=runtime_id,
             container_id=container_id,
             eval_runtime_id=eval_runtime_id,
@@ -3375,11 +3464,13 @@ class GatewayNodeManager:
             for session_id, ownership in list(retries.items()):
                 try:
                     await self._reconcile_cleanup_ownership(ownership)
-                except Exception:
-                    logger.warning(
-                        "Cleanup reconciliation failed for session %s",
-                        session_id,
-                        exc_info=True,
+                except Exception as exc:
+                    self._log_credential_safe_exception(
+                        ownership.managed,
+                        "Cleanup reconciliation failed",
+                        exc,
+                        session_id=session_id,
+                        level=logging.WARNING,
                     )
 
     def _restore_subscription_finalization(
@@ -3394,6 +3485,7 @@ class GatewayNodeManager:
         redactor = load_staged_codex_subscription_redactor(
             ownership.credential_dir,
             ownership.credential_root_identity,
+            ownership.credential_auth_identity,
         )
         timer = StageTimer()
         timer._marks = dict(state.timer_marks)
@@ -3407,6 +3499,15 @@ class GatewayNodeManager:
             log_authority_identity=ownership.log_authority_identity,
             credential_dir=ownership.credential_dir,
             credential_root_identity=ownership.credential_root_identity,
+            credential_mount=(
+                None
+                if ownership.credential_auth_identity is None
+                else ManagedCredentialMount(
+                    root=ownership.credential_dir,
+                    root_identity=ownership.credential_root_identity,
+                    auth_identity=ownership.credential_auth_identity,
+                )
+            ),
             credential_redactor=redactor,
             agent_result=state.agent_result,
             final_result=state.final_result,
@@ -3473,6 +3574,15 @@ class GatewayNodeManager:
                     result=ownership.finalization_state.final_result,
                 )
                 return
+            if ownership.credential_dir is not None:
+                credential_removed = await self._remove_credential_dir_best_effort(
+                    ownership.credential_dir,
+                    session_id,
+                    ownership.credential_root_identity,
+                    ownership.credential_auth_identity,
+                )
+            else:
+                credential_removed = True
             root_tasks = [
                 self._remove_session_dir_best_effort(
                     ownership.session_dir,
@@ -3480,14 +3590,6 @@ class GatewayNodeManager:
                     ownership.session_root_identity,
                 )
             ]
-            if ownership.credential_dir is not None:
-                root_tasks.append(
-                    self._remove_credential_dir_best_effort(
-                        ownership.credential_dir,
-                        session_id,
-                        ownership.credential_root_identity,
-                    )
-                )
             if ownership.log_authority_dir is not None:
                 root_tasks.append(
                     self._remove_log_authority_best_effort(
@@ -3500,7 +3602,7 @@ class GatewayNodeManager:
                 *root_tasks,
                 return_exceptions=True,
             )
-            if all(
+            if credential_removed and all(
                 outcome is not False and not isinstance(outcome, BaseException)
                 for outcome in root_outcomes
             ):
@@ -3555,11 +3657,13 @@ class GatewayNodeManager:
             return True
         except FileNotFoundError:
             return True
-        except Exception:
-            logger.warning(
-                "Failed to remove session directory for session %s",
-                session_id,
-                exc_info=True,
+        except Exception as exc:
+            self._log_credential_safe_exception(
+                None,
+                "Failed to remove session directory",
+                exc,
+                session_id=session_id,
+                level=logging.WARNING,
             )
             return False
 
@@ -3568,18 +3672,26 @@ class GatewayNodeManager:
         credential_dir: Path,
         session_id: str,
         credential_root_identity: tuple[int, int, int] | None = None,
+        credential_auth_identity: CredentialFileIdentity | None = None,
     ) -> bool:
         try:
             identity = credential_root_identity or capture_session_root_identity(credential_dir)
-            await asyncio.to_thread(remove_session_tree, credential_dir, identity)
+            await asyncio.to_thread(
+                remove_credential_tree,
+                credential_dir,
+                identity,
+                credential_auth_identity,
+            )
             return True
         except FileNotFoundError:
             return True
-        except Exception:
-            logger.warning(
-                "Failed to remove credential directory for session %s",
-                session_id,
-                exc_info=True,
+        except Exception as exc:
+            self._log_credential_safe_exception(
+                None,
+                "Failed to remove credential directory",
+                exc,
+                session_id=session_id,
+                level=logging.WARNING,
             )
             return False
 
@@ -3607,10 +3719,12 @@ class GatewayNodeManager:
             return True
         except FileNotFoundError:
             return True
-        except Exception:
-            logger.warning(
-                "Failed to remove log authority for session %s",
-                session_id,
-                exc_info=True,
+        except Exception as exc:
+            self._log_credential_safe_exception(
+                None,
+                "Failed to remove log authority",
+                exc,
+                session_id=session_id,
+                level=logging.WARNING,
             )
             return False

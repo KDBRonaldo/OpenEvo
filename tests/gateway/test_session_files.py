@@ -9,6 +9,8 @@ from openevo.gateway import session_files
 from openevo.gateway.session_files import (
     SessionFileSecurityError,
     capture_session_root_identity,
+    load_staged_codex_subscription_redactor,
+    remove_credential_tree,
     remove_session_tree,
     stage_codex_subscription_auth,
 )
@@ -660,3 +662,40 @@ def test_cleanup_enforces_node_budget(tmp_path: Path) -> None:
 
     with pytest.raises(SessionFileSecurityError, match="node limit"):
         remove_session_tree(root, identity, max_nodes=1)
+
+
+def test_credential_cleanup_scrubs_bound_auth_before_node_budget_exhaustion(
+    tmp_path: Path,
+) -> None:
+    root, identity = _session_root(tmp_path)
+    auth = root / "auth.json"
+    auth.write_text('{"access_token":"cleanup-budget-canary"}\n', encoding="utf-8")
+    auth.chmod(0o600)
+    auth_state = auth.stat(follow_symlinks=False)
+    auth_identity = session_files._auth_identity(auth_state)
+    for name in ("000-attacker", "001-attacker"):
+        directory = root / name
+        directory.mkdir()
+        (directory / "entry").write_text("budget", encoding="utf-8")
+
+    with pytest.raises(SessionFileSecurityError, match="node limit"):
+        remove_credential_tree(root, identity, auth_identity, max_nodes=1)
+
+    assert not auth.exists()
+    assert root.exists()
+
+
+def test_recovery_redactor_rejects_replaced_journal_bound_auth(tmp_path: Path) -> None:
+    root, identity = _session_root(tmp_path)
+    auth = root / "auth.json"
+    auth.write_text('{"access_token":"original-canary"}\n', encoding="utf-8")
+    auth.chmod(0o600)
+    auth_identity = session_files._auth_identity(auth.stat(follow_symlinks=False))
+    auth.unlink()
+    auth.write_text('{"access_token":"replacement-canary"}\n', encoding="utf-8")
+    auth.chmod(0o600)
+
+    with pytest.raises(SessionFileSecurityError, match="journal-bound.*identity"):
+        load_staged_codex_subscription_redactor(root, identity, auth_identity)
+
+    assert "replacement-canary" in auth.read_text(encoding="utf-8")

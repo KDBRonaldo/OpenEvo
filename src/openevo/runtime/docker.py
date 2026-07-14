@@ -292,6 +292,7 @@ class DockerRuntime(BaseRuntime):
         if authority is None or self._credential_root_fd < 0 or self._credential_auth_fd < 0:
             raise RuntimeError("managed credential mount authority is incomplete")
         root_state = os.fstat(self._credential_root_fd)
+        named_root = os.stat(authority.root, follow_symlinks=False)
         auth_state = os.fstat(self._credential_auth_fd)
         named_auth = os.stat(
             "auth.json",
@@ -300,7 +301,10 @@ class DockerRuntime(BaseRuntime):
         )
         if (
             (root_state.st_dev, root_state.st_ino, root_state.st_uid) != authority.root_identity
+            or (named_root.st_dev, named_root.st_ino, named_root.st_uid)
+            != authority.root_identity
             or stat.S_IMODE(root_state.st_mode) != 0o700
+            or stat.S_IMODE(named_root.st_mode) != 0o700
             or _full_file_identity(auth_state) != authority.auth_identity
             or _full_file_identity(named_auth) != authority.auth_identity
         ):
@@ -312,6 +316,22 @@ class DockerRuntime(BaseRuntime):
             if descriptor >= 0:
                 os.close(descriptor)
                 setattr(self, name, -1)
+
+    def _credential_mount_sources(self) -> tuple[str, str]:
+        self._verify_credential_mount_pins()
+        process_root = f"/proc/{os.getpid()}/fd"
+        root_source = f"{process_root}/{self._credential_root_fd}"
+        auth_source = f"{process_root}/{self._credential_auth_fd}"
+        authority = self._credential_mount
+        assert authority is not None
+        root_state = os.stat(root_source)
+        auth_state = os.stat(auth_source)
+        if (
+            root_state.st_dev,
+            root_state.st_ino,
+        ) != authority.root_identity[:2] or _full_file_identity(auth_state) != authority.auth_identity:
+            raise RuntimeError("managed credential descriptor mount source changed")
+        return root_source, auth_source
 
     async def start(self) -> None:
         if self._destroyed:
@@ -347,15 +367,22 @@ class DockerRuntime(BaseRuntime):
         create_args.extend(["-v", f"{self.session_dir}:{self.runtime_session_dir}"])
         if self._credential_mount is not None:
             try:
-                self._verify_credential_mount_pins()
+                root_source, auth_source = self._credential_mount_sources()
             except Exception:
                 self._mark_no_ownership()
                 raise
-            create_args.extend(["-v", f"{self._credential_dir}:{MANAGED_CODEX_HOME}"])
+            create_args.extend(
+                [
+                    "-v",
+                    f"{root_source}:{MANAGED_CODEX_HOME}",
+                    "-v",
+                    f"{auth_source}:{MANAGED_CODEX_HOME}/auth.json",
+                ]
+            )
         # Additional volumes from kwargs (e.g., Docker socket for agents that need DinD)
         for vol in self.spec.kwargs.get("volumes", []):
             create_args.extend(["-v", vol])
-        create_args.extend([create_image, "sleep", "infinity"])
+        create_args.extend(["--restart", "no", create_image, "sleep", "infinity"])
         try:
             rc, _, stderr = await self._run_local_command(
                 *create_args,
@@ -527,6 +554,10 @@ class DockerRuntime(BaseRuntime):
         self._verify_credential_mount_pins()
         if await self._credential_container_process_identity() != first:
             raise RuntimeError("managed credential container process changed")
+        # A process restart can only re-adopt the held descriptor sources. This
+        # final pathname check closes a replacement triggered by the last
+        # process inspect without moving the adoption authority back to paths.
+        self._verify_credential_mount_pins()
 
     async def _credential_container_process_identity(
         self,

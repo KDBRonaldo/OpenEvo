@@ -130,7 +130,10 @@ replacement are rejected. The gateway copies from a verified no-follow file
 descriptor into an exclusive `0600` target under a `0700` root and rechecks
 source/target size, SHA-256 digest, identity, link count, and change times. Both
 source and credential-root absolute pathname chains are pinned component by
-component and rechecked before and after publication.
+component and rechecked before and after publication. Docker receives separate
+root/auth bind sources through the Core process's held `/proc/<pid>/fd/<fd>`
+descriptors and uses `restart=no`; stable container process identity brackets the
+in-container adoption check, followed by a final host pathname binding check.
 
 Core derives a bounded exact-value redactor from the verified auth JSON and its
 string leaves. Core stdout/stderr and transcript logs live in a node-private,
@@ -159,13 +162,16 @@ subscription transcript trajectory or result until all credential-capable
 containers have been removed by pinned container ID and proven absent. It then
 uses a separate bounded finalization budget to preserve transcript bytes already
 captured before execution timeout/cancel, then defensively redacts the in-memory
-result before export. A private v4 cleanup journal drives independent
-startup/shutdown retries. It persists a canonical result digest and monotonic
+result before export. A private v6 cleanup journal drives independent
+startup/shutdown retries. It binds the exact staged auth inode and persists a
+canonical result digest and monotonic
 evolution-export/callback success proofs; an unknown callback or failed export
 retains completion data, transcript/session, log, credential roots, and the
 journal. Stable event identity and callback idempotency headers make retries
-non-polluting. Cleanup begins only after both required phases are durably
-successful.
+non-polluting. Terminal pending status/error is published to live memory only
+after the journal transition is durable. Cleanup begins only after both required
+phases are durably successful, then scrubs and unlinks the journal-bound auth inode
+before applying the bounded recursive walk to the rest of the credential root.
 
 `self-deployed` uses proxy authentication and requires `execution.hf_model`.
 The legacy config value `codex_managed_local_inference` remains accepted as an

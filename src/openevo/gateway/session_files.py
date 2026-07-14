@@ -17,6 +17,7 @@ from typing import Final, TypeAlias
 
 
 SessionRootIdentity: TypeAlias = tuple[int, int, int]
+CredentialFileIdentity: TypeAlias = tuple[int, int, int, int, int, int, int, int]
 
 _AUTH_MAX_BYTES: Final[int] = 1024 * 1024
 _AUTH_JSON_MAX_DEPTH: Final[int] = 32
@@ -55,7 +56,7 @@ class StagedCodexCredential:
     """Validated redactor and exact published auth-file identity."""
 
     redactor: CredentialRedactor
-    auth_identity: tuple[int, int, int, int, int, int, int, int]
+    auth_identity: CredentialFileIdentity
 
 
 @dataclass(slots=True)
@@ -831,6 +832,7 @@ def stage_codex_subscription_auth(
 def load_staged_codex_subscription_redactor(
     credential_dir: Path,
     credential_identity: SessionRootIdentity,
+    auth_identity: CredentialFileIdentity | None = None,
 ) -> CredentialRedactor:
     """Rebuild a redactor from the pinned private credential authority."""
 
@@ -850,10 +852,14 @@ def load_staged_codex_subscription_redactor(
             opened,
             expected_owner=credential_identity[2],
         )
+        if auth_identity is not None and _auth_identity(opened) != auth_identity:
+            raise SessionFileSecurityError("journal-bound credential auth identity changed")
         content = _read_fd_exact(descriptor, opened.st_size)
         after = os.fstat(descriptor)
         if _auth_identity(opened) != _auth_identity(after):
             raise SessionFileSecurityError("staged Codex auth changed during recovery read")
+        if auth_identity is not None and _auth_identity(after) != auth_identity:
+            raise SessionFileSecurityError("journal-bound credential auth identity changed")
         _require_path_identity(
             root_pin.descriptor,
             "auth.json",
@@ -952,6 +958,109 @@ def remove_session_tree(
     finally:
         os.close(root_path_fd)
         os.close(parent_fd)
+
+
+def remove_credential_tree(
+    credential_dir: Path,
+    credential_identity: SessionRootIdentity,
+    auth_identity: CredentialFileIdentity | None,
+    *,
+    max_depth: int = _CLEANUP_MAX_DEPTH,
+    max_nodes: int = _CLEANUP_MAX_NODES,
+) -> None:
+    """Scrub the journal-bound auth inode before bounded root cleanup."""
+
+    root_path_fd, parent_fd, root_name = _open_pinned_session_root(
+        credential_dir,
+        credential_identity,
+    )
+    budget = [max_nodes]
+    try:
+        _fchmod_stable(root_path_fd, 0o700, label="credential root")
+        root_fd = _open_readable_directory(root_path_fd, label="credential root")
+        try:
+            if auth_identity is not None:
+                _scrub_bound_credential_auth(root_fd, auth_identity)
+            _remove_directory_contents(
+                root_fd,
+                expected_owner=credential_identity[2],
+                depth=0,
+                max_depth=max_depth,
+                budget=budget,
+            )
+        finally:
+            os.close(root_fd)
+        _require_named_identity(
+            parent_fd,
+            root_name,
+            credential_identity[:2],
+            label="credential root",
+            expected_owner=credential_identity[2],
+        )
+        os.rmdir(root_name, dir_fd=parent_fd)
+    except SessionFileSecurityError:
+        raise
+    except OSError as exc:
+        raise SessionFileSecurityError("credential root cleanup failed safely") from exc
+    finally:
+        os.close(root_path_fd)
+        os.close(parent_fd)
+
+
+def _scrub_bound_credential_auth(
+    credential_root_fd: int,
+    expected: CredentialFileIdentity,
+) -> None:
+    descriptor = -1
+    try:
+        try:
+            named = os.stat(
+                "auth.json",
+                dir_fd=credential_root_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            return
+        descriptor = os.open(
+            "auth.json",
+            os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+            dir_fd=credential_root_fd,
+        )
+        opened = os.fstat(descriptor)
+        _require_private_staged_auth(
+            opened,
+            expected_owner=expected[3],
+            expected_size=expected[5],
+        )
+        if _auth_identity(named) != expected or _auth_identity(opened) != expected:
+            raise SessionFileSecurityError("journal-bound credential auth identity changed")
+        _require_path_identity(
+            credential_root_fd,
+            "auth.json",
+            opened,
+            label="journal-bound credential auth",
+        )
+        os.ftruncate(descriptor, 0)
+        os.fsync(descriptor)
+        scrubbed = os.fstat(descriptor)
+        if _object_identity(scrubbed) != _object_identity(opened) or scrubbed.st_size != 0:
+            raise SessionFileSecurityError("journal-bound credential auth scrub was not stable")
+        _require_named_identity(
+            credential_root_fd,
+            "auth.json",
+            _object_identity(opened),
+            label="journal-bound credential auth",
+            expected_owner=expected[3],
+        )
+        os.unlink("auth.json", dir_fd=credential_root_fd)
+        os.fsync(credential_root_fd)
+    except SessionFileSecurityError:
+        raise
+    except OSError as exc:
+        raise SessionFileSecurityError("journal-bound credential auth cleanup failed safely") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
 
 
 def redact_core_capture_tree(

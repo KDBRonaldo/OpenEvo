@@ -143,7 +143,7 @@ destroyed only when a final inspect proves that exact ID absent. Gateway does
 not remove either bind root until that proof succeeds; cleanup ownership remains
 in the private authority root and durable retry journal otherwise. Subscription
 post-run uses bounded immediate retries and then periodic reconciliation. Its
-private v5 journal also carries an explicit recovery phase, redacted
+    private v6 journal also carries the exact staged auth identity, an explicit recovery phase, redacted
 finalization state, and a canonical result digest with monotonic export/callback
 success proofs. The terminal agent result is journaled before its in-memory
 terminal transition. Required export authority includes the normalized backend
@@ -155,7 +155,8 @@ an unknown/failed phase, and removes storage and owned roots only after both
 required phases are fsynced successful. Missing phase/finalization authority or
 export config drift retains the journal and all transcript/session roots. An
 incomplete journal update also retains a durable pending marker and blocks
-restart cleanup until the exact transition is successfully retried.
+restart cleanup until the exact transition is successfully retried. Live terminal
+status/error authority changes only after that durable transition succeeds.
 
 Subscription auth bytes are validated before `DockerRuntime` is created. Core
 uses a random `0700` staging child inside the already journaled private
@@ -163,12 +164,16 @@ credential root, verifies the complete source and staged file identities,
 digest, bounded JSON, and redactor, then publishes the `0600` inode with Linux
 atomic no-replace rename. `ManagedCredentialMount` binds the root and auth-file
 identities. DockerRuntime reopens both no-follow, revalidates them, and retains
-both descriptors through runtime absence. After Docker starts only the trusted
+both descriptors through runtime absence. Docker binds the root and auth file
+separately from `/proc/<core-pid>/fd/<held-fd>` sources and fixes `restart=no`, so
+neither initial adoption nor a restart can resolve a replacement pathname. After Docker starts only the trusted
 inert command, Core stats the adopted directory and auth file inside the exact
 container ID and compares their full mount identities before any prepare or
 agent command. Stable container ID/PID/start/restart state brackets that check.
-A pathname replacement adopted by Docker therefore mismatches and the container
-is stopped. A publication race, symlink, owner/mode/link mismatch, or unavailable
+A final host pathname-to-FD check follows the process/adoption check; a mismatch
+stops the container. After terminal delivery, Core verifies, scrubs, fsyncs, and
+unlinks the journal-bound auth inode before applying the bounded recursive budget
+to the remaining credential tree. A publication race, symlink, owner/mode/link mismatch, or unavailable
 rename primitive fails before agent execution.
 Workspace and artifact files are not redaction write targets; files larger than
 the Core capture scan limit retain their exact bytes.
