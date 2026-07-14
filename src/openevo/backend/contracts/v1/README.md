@@ -40,8 +40,10 @@ nullable pre-admission pins, and at most 100 ordered attempts. Environment
 repair, service restart, and cache cleanup use the recoverable `OperationV1`
 resource with typed request/result, logs, ETag, and a kind-bound cancellation
 descriptor. Only cancellable kinds may enter `cancelling|cancelled`; unsupported
-cancel requests return the typed 409 contract. Every page satisfies `has_more`
-if and only if `next_cursor` is present.
+cancel requests return `409 ApiErrorV1` with code
+`operation_kind_not_cancellable`; the same response also admits the global
+`idempotency_key_reused` conflict. Every page satisfies `has_more` if and only if
+`next_cursor` is present.
 
 `SseFrameV1` freezes matching wire `id`, `event`, and typed `data`; every
 non-heartbeat envelope binds its change resource identity, ETag or digest, and
@@ -49,6 +51,9 @@ applicable parent identity. A frame ID is a stream record cursor, while
 `change_id` remains stable for the same logical mutation across replay or
 re-emission. Artifact diffs use an `added|removed|modified|renamed` document
 change union and retain document identity on every hunk.
+`revision.activated.v1` accepts only an active `RevisionV1`; non-genesis
+transition payloads retain the revision model's exact predecessor/successor
+closure and active transition state.
 `CapabilitiesResponseV1` remains the framework-owned `EvolutionCapabilitiesV1`
 type without a local copy or projection.
 

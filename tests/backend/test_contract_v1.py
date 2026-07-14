@@ -25,6 +25,7 @@ from openevo.backend.contracts.v1.models import (
     ParametricMemoryArtifactSummaryV1,
     ProjectCreateV1,
     ProjectPageV1,
+    ProjectPatchV1,
     ProjectSpecV1,
     ProjectV1,
     ReachableRequiredRevisionRefV1,
@@ -287,7 +288,7 @@ def test_openapi_snapshot_is_exactly_rebuildable() -> None:
     rebuilt = canonical_json_bytes(build_openapi_document())
     assert OPENAPI_SNAPSHOT_PATH.read_bytes() == rebuilt
     assert hashlib.sha256(rebuilt).hexdigest() == openapi_sha256()
-    assert openapi_sha256() == ("4d7dcbe2f0829c101a290677819c74123c8a02cc09dba5a9f8813faeb4ec8c3c")
+    assert openapi_sha256() == ("315dc90907f14347d07f7903d360009b271372302b38a1e4adca5bc14486497a")
 
 
 def test_event_schema_snapshot_is_exactly_rebuildable() -> None:
@@ -295,7 +296,7 @@ def test_event_schema_snapshot_is_exactly_rebuildable() -> None:
     assert EVENTS_SCHEMA_SNAPSHOT_PATH.read_bytes() == rebuilt
     assert hashlib.sha256(rebuilt).hexdigest() == events_schema_sha256()
     assert events_schema_sha256() == (
-        "6c496833d3903be4f2960d1c701e28838178fa4cea1528185fd0873624ae4c4c"
+        "48678a1054cc205ff82d97fd38cf76fccf9ad84ea790c167af3bbb1fa52f1f65"
     )
 
 
@@ -476,6 +477,36 @@ def test_project_lifecycle_owns_task_and_workspace_snapshot_inputs() -> None:
 
     with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
         _json_model(TaskSpecV1, {**task, "content_ref": _content_ref("unissued")})
+
+
+@pytest.mark.parametrize("field", ["name", "spec", "task", "workspace"])
+def test_project_patch_rejects_explicit_null_for_non_nullable_fields(field: str) -> None:
+    with pytest.raises(ValidationError, match="must not be null"):
+        _json_model(
+            ProjectPatchV1,
+            {
+                "schema_version": "1",
+                "description": "A valid simultaneous change.",
+                field: None,
+            },
+        )
+
+
+def test_project_patch_preserves_nullable_description_clear_semantics() -> None:
+    patch = _json_model(ProjectPatchV1, {"schema_version": "1", "description": None})
+    assert patch.description is None
+    assert "description" in patch.model_fields_set
+
+
+def test_project_patch_openapi_fields_are_optional_with_exact_nullability() -> None:
+    schema = build_openapi_document()["components"]["schemas"]["ProjectPatchV1"]
+    assert not (
+        {"name", "description", "spec", "task", "workspace"} & set(schema.get("required", []))
+    )
+
+    for field in ("name", "spec", "task", "workspace"):
+        assert {"type": "null"} not in schema["properties"][field].get("anyOf", [])
+    assert {"type": "null"} in schema["properties"]["description"]["anyOf"]
 
 
 def test_scratch_project_create_has_a_core_signed_empty_workspace_path() -> None:
@@ -1024,6 +1055,73 @@ def test_revision_resource_binds_nested_transition_identity() -> None:
     }
     with pytest.raises(ValidationError, match="bind predecessor and revision"):
         _json_model(RevisionV1, mismatched)
+
+
+@pytest.mark.parametrize(
+    ("status", "transition_state"),
+    [
+        ("queued", "not_started"),
+        ("preparing", "materializing"),
+        ("failed", "failed"),
+        ("cancelled", "cancelled"),
+    ],
+)
+def test_revision_activated_event_rejects_non_active_revision_payloads(
+    status: str, transition_state: str
+) -> None:
+    revision = _revision()
+    revision.update({"status": status, "activated_at": None})
+    revision["transition"].update(
+        {
+            "state": transition_state,
+            "progress_completed": 0 if status == "queued" else 4,
+            "message": f"The successor is {status}.",
+        }
+    )
+    if status == "failed":
+        error = {
+            "schema_version": "1",
+            "request_id": "request-1",
+            "code": "revision_failed",
+            "http_status": 500,
+            "message": "Revision preparation failed.",
+            "severity": "blocking",
+            "category": "internal",
+            "retryable": False,
+            "repair_action": "openevo_can_retry",
+            "next_action": "Retry the revision preparation.",
+            "details": {"field_issues": [], "conflicts": []},
+            "logs_ref": None,
+        }
+        revision["error"] = error
+        revision["transition"]["error"] = error
+
+    event = {
+        "schema_version": "1",
+        "id": "event-1",
+        "sequence": 1,
+        "occurred_at": "2026-07-14T00:00:07Z",
+        "event": "revision.activated.v1",
+        "change": {
+            "change_id": "change-1",
+            "resource_type": "revision",
+            "resource_id": revision["revision"]["id"],
+            "parent_resource_type": "project",
+            "parent_resource_id": revision["revision"]["project_id"],
+            "resource_etag": revision["etag"],
+            "content_sha256": None,
+        },
+        "payload": revision,
+    }
+    with pytest.raises(ValidationError):
+        EventEnvelopeV1.model_validate_json(json.dumps(event))
+
+
+def test_revision_activated_event_schema_requires_active_revision_status() -> None:
+    definitions = build_events_schema_document()["$defs"]
+    payload_ref = definitions["RevisionActivatedEventV1"]["properties"]["payload"]["$ref"]
+    payload_schema = definitions[payload_ref.rsplit("/", 1)[-1]]
+    assert payload_schema["properties"]["status"]["const"] == "active"
 
 
 def test_cancelled_revision_requires_cancelled_transition() -> None:
@@ -1845,8 +1943,11 @@ def test_async_core_actions_are_recoverable_operations() -> None:
     cancel = openapi["paths"]["/v1/operations/{operation_id}/cancel"]["post"]
     assert _response_schema_name(cancel) == "OperationV1"
     assert cancel["responses"]["409"]["content"]["application/json"]["schema"] == {
-        "$ref": "#/components/schemas/OperationCancelConflictV1"
+        "$ref": "#/components/schemas/ApiErrorV1"
     }
+    conflict_description = cancel["responses"]["409"]["description"]
+    assert "operation_kind_not_cancellable" in conflict_description
+    assert "idempotency_key_reused" in conflict_description
     assert {parameter["name"] for parameter in cancel["parameters"]} >= {
         "If-Match",
         "Idempotency-Key",
