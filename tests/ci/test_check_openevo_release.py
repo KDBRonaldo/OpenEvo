@@ -802,6 +802,7 @@ def test_desktop_package_defines_tauri_desktop_scripts_and_cli_dependency() -> N
     package = json.loads(Path("desktop/package.json").read_text(encoding="utf-8"))
 
     assert package["name"] == "openevo-desktop"
+    assert package["scripts"]["dev:openevo"] == "vite --mode openevo-desktop"
     assert package["scripts"]["tauri:dev"] == "tauri dev"
     assert package["scripts"]["tauri:build"] == "tauri build"
     assert package["scripts"]["build:sidecar"] == "python packaging/build_sidecar.py"
@@ -831,6 +832,7 @@ def test_tauri_macos_config_declares_unreleased_dmg_target() -> None:
     assert config["version"] == "0.1.0"
     assert config["identifier"] == "org.openevo.desktop"
     assert config["build"]["beforeBuildCommand"] == "npm run build:openevo"
+    assert config["build"]["beforeDevCommand"] == "npm run dev:openevo"
     assert config["build"]["frontendDist"] == "../dist"
     assert config["bundle"]["active"] is True
     assert config["bundle"]["targets"] == ["dmg"]

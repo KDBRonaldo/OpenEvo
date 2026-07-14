@@ -19,6 +19,12 @@ served only by Vite during development; the Tauri release build starts from
 therefore exercises the real product components against strict contract
 fixtures without becoming a release provider or fallback.
 
+Native development uses `npm run tauri:dev`. Tauri starts Vite through
+`dev:openevo`, which selects the same product-only entrypoint as the release
+build before attaching the native bridge. The plain `npm run dev` command
+remains available for the separate shared observability pages; it is not the
+Desktop native development surface.
+
 The first-run renderer exposes one next action at a time. Until a remote profile
 exists, the Research workspace owns the `Add workspace` action and project
 creation is disabled. Once a profile is present, project creation becomes
