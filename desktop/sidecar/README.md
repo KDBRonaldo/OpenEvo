@@ -35,24 +35,34 @@ The shared HTTP client is safe for concurrent calls; `close()` is idempotent and
 immediately seals the client against new leases. Every response and transport
 close, including ordinary response-context exit and a response that arrives
 after sealing, is submitted outside the state lock to that client's
-fixed-worker, fixed-capacity daemon closer. An uninterruptible synchronous
-close therefore cannot exceed the caller's total wait bound. On timeout the client remains
-permanently closed while the bounded closer retains accepted old resources
-until their close calls return. Enqueue and worker retirement share one lock, so
-an idle worker rechecks the queue before exiting. If starting the first worker
-fails, ownership remains with the submitting client, which runs that close action
-synchronously; a later submission can retry worker creation. A closed connection
+fixed-capacity daemon closer. Each client prestarts a dedicated ownership worker;
+additional bounded workers may be started on submission. An uninterruptible
+synchronous close therefore cannot exceed the caller's total wait bound. On
+timeout the client remains permanently closed while the bounded closer retains
+accepted old resources until their close calls return. Enqueue and worker
+retirement share one lock, so an idle worker rechecks the queue before exiting.
+If an additional worker fails to start, the action remains queued and the
+prestarted owner executes it; the caller never runs the close action. The owner
+is sealed after the closed client has no remaining leases. A closed connection
 cannot send its bearer after Desktop switches to another project session or tunnel.
 
 The close seal increments a client session generation. Each public JSON call owns
-one generation token from admission through response-model validation, authority
-cache application, and its final return. After the bounded body is released, the
-token takes the close state lock before validation and retains it through the
-public method's cache commit and return linearization point. SSE rechecks the
-generation around frame parsing, state/replay-ledger
-application, and yield; frame application holds the same state lock as the close
-linearization point. Bodies and frames released after the seal therefore cannot
-be returned or mutate the retired session's authority caches.
+one generation token and a copy-on-write authority/cache transaction. Network
+I/O, bounded body reads, response-model validation, nested public calls, and
+cache validation do not hold the close state lock. After all validation succeeds,
+the call takes that lock only long enough to linearize its cache transaction and
+normal return against close. If the seal linearizes first, the transaction rolls
+back and the call returns `core_client_closed`; if the result linearizes first,
+close may subsequently seal while the calling thread is rescheduled after the
+return point.
+
+SSE parsing and cache validation likewise happen outside the close state lock.
+The replay-ledger/cache transaction and frame delivery share one final, short
+generation linearization point. A seal that wins that point rejects the frame
+without cache or replay authority. If delivery wins first, `close()` may return
+before Python resumes the generator at `yield`; the consumer may then observe
+that already-linearized frame, which is defined as pre-seal delivery. No frame
+whose delivery linearization occurs after the seal is yielded.
 
 After JSON decoding, every nested string key and value is checked for the
 bearer, fixed Core tunnel URL/origin, and private Desktop session identity. The

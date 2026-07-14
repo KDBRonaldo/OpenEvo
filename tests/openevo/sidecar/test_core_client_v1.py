@@ -1493,7 +1493,10 @@ def test_close_generation_rejects_json_body_released_after_linearization() -> No
     assert errors[0].error.code is CoreClientLocalErrorCodeV1.CLIENT_CLOSED
 
 
-def test_close_generation_guard_covers_public_validation_cache_and_return(monkeypatch) -> None:
+def test_close_generation_rejects_public_validation_cache_and_return(monkeypatch) -> None:
+    import desktop.sidecar.core_client_v1 as core_client_module
+
+    monkeypatch.setattr(core_client_module, "MAX_CORE_CLOSE_WAIT_SECONDS", 0.05)
     capabilities = _capabilities()
     client = _client(
         lambda _request: httpx.Response(200, json=capabilities.model_dump(mode="json"))
@@ -1506,7 +1509,6 @@ def test_close_generation_guard_covers_public_validation_cache_and_return(monkey
     results: list[v1.CapabilitiesResponseV1] = []
     request_errors: list[CoreClientErrorV1] = []
     close_errors: list[CoreClientErrorV1] = []
-    completion_order: list[str] = []
 
     def pause_after_json(*args, **kwargs):
         result = original_json(*args, **kwargs)
@@ -1517,7 +1519,6 @@ def test_close_generation_guard_covers_public_validation_cache_and_return(monkey
     def read_capabilities() -> None:
         try:
             results.append(client.capabilities(v1.ExecutionMode.SELF_DEPLOYED))
-            completion_order.append("request")
         except CoreClientErrorV1 as exc:
             request_errors.append(exc)
 
@@ -1525,7 +1526,6 @@ def test_close_generation_guard_covers_public_validation_cache_and_return(monkey
         close_attempted.set()
         try:
             client.close()
-            completion_order.append("close")
         except CoreClientErrorV1 as exc:
             close_errors.append(exc)
         finally:
@@ -1538,36 +1538,115 @@ def test_close_generation_guard_covers_public_validation_cache_and_return(monkey
     assert json_returned.wait(1)
     close_thread.start()
     assert close_attempted.wait(1)
-    assert not close_returned.wait(0.05)
+    assert close_returned.wait(0.25)
     release_validation.set()
     request_thread.join(1)
     close_thread.join(1)
 
     assert not request_thread.is_alive()
     assert not close_thread.is_alive()
-    assert results == [capabilities]
-    assert request_errors == []
+    assert results == []
+    assert request_errors[0].error.code is CoreClientLocalErrorCodeV1.CLIENT_CLOSED
     assert close_errors == []
-    assert completion_order == ["request", "close"]
-    assert client._capability_authority is not None
-    assert client._capability_authority.registry_digest == capabilities.registry_digest
+    assert client._capability_authority is None
 
 
-def test_bounded_closer_start_failure_runs_close_action_synchronously(monkeypatch) -> None:
+def test_nested_artifact_diff_cannot_hold_close_past_deadline(monkeypatch) -> None:
+    import desktop.sidecar.core_client_v1 as core_client_module
+
+    monkeypatch.setattr(core_client_module, "MAX_CORE_CLOSE_WAIT_SECONDS", 0.05)
+    payload = {
+        "schema_version": "1",
+        "artifact_id": "artifact-current",
+        "artifact_content_sha256": "a" * 64,
+        "previous_artifact_id": "artifact-previous",
+        "previous_artifact_content_sha256": "b" * 64,
+        "document_changes": [],
+        "total_document_changes": 0,
+        "total_hunks": 0,
+        "total_lines": 0,
+        "truncated": False,
+    }
+    nested_request_started = threading.Event()
+    release_nested_request = threading.Event()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/artifacts/artifact-current":
+            artifact = _artifact("artifact-current", digest="a" * 64)
+            return httpx.Response(200, json=artifact.model_dump(mode="json"))
+        if request.url.path == "/v1/artifacts/artifact-previous":
+            nested_request_started.set()
+            release_nested_request.wait(1)
+            artifact = _artifact("artifact-previous", digest="b" * 64)
+            return httpx.Response(200, json=artifact.model_dump(mode="json"))
+        return httpx.Response(200, json=payload)
+
+    client = _client(handler)
+    client.get_artifact("artifact-current", project_id=PROJECT_ID)
+    results: list[v1.ArtifactDiffV1] = []
+    request_errors: list[CoreClientErrorV1] = []
+    close_errors: list[CoreClientErrorV1] = []
+    close_elapsed: list[float] = []
+
+    def read_diff() -> None:
+        try:
+            results.append(client.artifact_diff("artifact-current", project_id=PROJECT_ID))
+        except CoreClientErrorV1 as exc:
+            request_errors.append(exc)
+
+    def close_client() -> None:
+        started_at = time.monotonic()
+        try:
+            client.close()
+        except CoreClientErrorV1 as exc:
+            close_errors.append(exc)
+        finally:
+            close_elapsed.append(time.monotonic() - started_at)
+
+    request_thread = threading.Thread(target=read_diff)
+    close_thread = threading.Thread(target=close_client)
+    request_thread.start()
+    assert nested_request_started.wait(1)
+    close_thread.start()
+    try:
+        close_thread.join(0.25)
+        assert not close_thread.is_alive()
+    finally:
+        release_nested_request.set()
+        request_thread.join(1)
+        close_thread.join(1)
+
+    assert results == []
+    assert request_errors[0].error.code is CoreClientLocalErrorCodeV1.CLIENT_CLOSED
+    assert close_errors == []
+    assert close_elapsed[0] < 0.25
+    assert "artifact-previous" not in client._artifacts
+
+
+def test_bounded_closer_start_failure_uses_prestarted_owner_for_blocking_action(
+    monkeypatch,
+) -> None:
+    import desktop.sidecar.core_client_v1 as core_client_module
+
+    monkeypatch.setattr(core_client_module, "MAX_CORE_CLOSE_WAIT_SECONDS", 0.05)
+
     class CloseTrackingTransport(httpx.BaseTransport):
         def __init__(self) -> None:
-            self.close_called = False
+            self.close_started = threading.Event()
+            self.release_close = threading.Event()
 
         def handle_request(self, request: httpx.Request) -> httpx.Response:
             return httpx.Response(200, json=_health_payload(), request=request)
 
         def close(self) -> None:
-            self.close_called = True
+            self.close_started.set()
+            self.release_close.wait(1)
 
     original_start = threading.Thread.start
+    fail_starts = True
 
     def fail_closer_start(thread: threading.Thread) -> None:
-        if thread.name.startswith("openevo-core-resource-closer-"):
+        if fail_starts and thread.name.startswith("openevo-core-resource-closer-"):
             raise RuntimeError("injected start failure")
         original_start(thread)
 
@@ -1575,12 +1654,24 @@ def test_bounded_closer_start_failure_runs_close_action_synchronously(monkeypatc
     client = CoreControlClientV1(_connection(), transport=transport)
     monkeypatch.setattr(threading.Thread, "start", fail_closer_start)
 
+    started_at = time.monotonic()
     client.close()
+    elapsed = time.monotonic() - started_at
 
-    assert transport.close_called is True
+    try:
+        assert elapsed < 0.25
+        assert transport.close_started.is_set() is True
+        assert client._close_tasks_pending == 1
+        assert client._resource_closer._workers == 0
+        assert client._close_failed is False
+    finally:
+        fail_starts = False
+        transport.release_close.set()
+
+    deadline = time.monotonic() + 1
+    while client._close_tasks_pending and time.monotonic() < deadline:
+        time.sleep(0.01)
     assert client._close_tasks_pending == 0
-    assert client._resource_closer._workers == 0
-    assert client._close_failed is False
 
 
 def test_bounded_closer_idle_submit_race_keeps_worker_for_accepted_action(
@@ -1796,6 +1887,111 @@ def test_close_generation_rejects_late_sse_frame_without_replay_update() -> None
     assert errors[0].error.code is CoreClientLocalErrorCodeV1.CLIENT_CLOSED
     assert "event-1" in client._sse_event_digests
     assert "event-2" not in client._sse_event_digests
+
+
+def test_sse_seal_before_delivery_linearization_rejects_frame(monkeypatch) -> None:
+    payload = {
+        "schema_version": "1",
+        "id": "event-1",
+        "sequence": 1,
+        "occurred_at": "2026-07-14T12:00:00Z",
+        "event": "heartbeat.v1",
+        "payload": {"active_run_count": 0},
+    }
+    client = _client(
+        lambda _request: httpx.Response(
+            200,
+            headers={"Content-Type": "text/event-stream"},
+            content=_sse_bytes(payload),
+        )
+    )
+    original_linearize = client._linearize_sse_frame_delivery
+    delivery_ready = threading.Event()
+    release_delivery = threading.Event()
+    frames: list[v1.SseFrameV1] = []
+    errors: list[CoreClientErrorV1] = []
+
+    def pause_before_linearization(frame: v1.SseFrameV1, generation: int) -> None:
+        delivery_ready.set()
+        release_delivery.wait(1)
+        original_linearize(frame, generation)
+
+    monkeypatch.setattr(client, "_linearize_sse_frame_delivery", pause_before_linearization)
+
+    with client.events() as stream:
+        iterator = iter(stream)
+
+        def read_frame() -> None:
+            try:
+                frames.append(next(iterator))
+            except CoreClientErrorV1 as exc:
+                errors.append(exc)
+
+        reader = threading.Thread(target=read_frame)
+        reader.start()
+        assert delivery_ready.wait(1)
+        client.close()
+        release_delivery.set()
+        reader.join(1)
+
+    assert not reader.is_alive()
+    assert frames == []
+    assert errors[0].error.code is CoreClientLocalErrorCodeV1.CLIENT_CLOSED
+    assert "event-1" not in client._sse_event_digests
+
+
+def test_sse_delivery_linearized_before_seal_may_yield_after_close(monkeypatch) -> None:
+    payload = {
+        "schema_version": "1",
+        "id": "event-1",
+        "sequence": 1,
+        "occurred_at": "2026-07-14T12:00:00Z",
+        "event": "heartbeat.v1",
+        "payload": {"active_run_count": 0},
+    }
+    client = _client(
+        lambda _request: httpx.Response(
+            200,
+            headers={"Content-Type": "text/event-stream"},
+            content=_sse_bytes(payload),
+        )
+    )
+    original_linearize = client._linearize_sse_frame_delivery
+    delivery_linearized = threading.Event()
+    release_yield = threading.Event()
+    frames: list[v1.SseFrameV1] = []
+    errors: list[CoreClientErrorV1] = []
+
+    def pause_after_linearization(frame: v1.SseFrameV1, generation: int) -> None:
+        original_linearize(frame, generation)
+        delivery_linearized.set()
+        release_yield.wait(1)
+
+    monkeypatch.setattr(client, "_linearize_sse_frame_delivery", pause_after_linearization)
+
+    with client.events() as stream:
+        iterator = iter(stream)
+
+        def read_frame() -> None:
+            try:
+                frames.append(next(iterator))
+            except CoreClientErrorV1 as exc:
+                errors.append(exc)
+
+        reader = threading.Thread(target=read_frame)
+        reader.start()
+        assert delivery_linearized.wait(1)
+        started_at = time.monotonic()
+        client.close()
+        close_elapsed = time.monotonic() - started_at
+        release_yield.set()
+        reader.join(1)
+
+    assert not reader.is_alive()
+    assert close_elapsed < 0.25
+    assert errors == []
+    assert [frame.id for frame in frames] == ["event-1"]
+    assert "event-1" in client._sse_event_digests
 
 
 def test_sse_event_id_is_bound_to_canonical_payload_across_reconnects() -> None:

@@ -168,14 +168,14 @@ class CoreSseStreamV1:
         self,
         chunks: Iterator[bytes],
         *,
-        validate_frame: Callable[[v1.SseFrameV1], None],
+        linearize_frame_delivery: Callable[[v1.SseFrameV1], None],
         private_values: tuple[str, ...],
         declared_length: int | None,
         close_started: Callable[[], bool],
         session_guard: Callable[[], None],
     ) -> None:
         self._chunks = chunks
-        self._validate_frame = validate_frame
+        self._linearize_frame_delivery = linearize_frame_delivery
         self._private_values = private_values
         self._declared_length = declared_length
         self._close_started = close_started
@@ -196,8 +196,7 @@ class CoreSseStreamV1:
                 self._session_guard()
                 validated_frame = _validate_sse_frame(frame, self._private_values)
                 self._session_guard()
-                self._validate_frame(validated_frame)
-                self._session_guard()
+                self._linearize_frame_delivery(validated_frame)
                 yield validated_frame
                 self._session_guard()
         except CoreClientErrorV1:
@@ -238,7 +237,6 @@ class _CapabilityAuthority:
 @dataclass(slots=True)
 class _GenerationLeaseToken:
     generation: int
-    result_guarded: bool = False
 
 
 def _generation_bound(method: Callable[MethodP, ResponseT]) -> Callable[MethodP, ResponseT]:
@@ -248,9 +246,10 @@ def _generation_bound(method: Callable[MethodP, ResponseT]) -> Callable[MethodP,
         if not isinstance(client, CoreControlClientV1):
             raise TypeError("generation-bound method requires CoreControlClientV1")
         with client._generation_lease() as token:
-            result = method(*args, **kwargs)
-            client._guard_generation_result(token, token.generation)
-            return result
+            with client._registration_batch():
+                result = method(*args, **kwargs)
+                client._linearize_generation_result(token.generation)
+                return result
 
     return wrapped
 
@@ -265,17 +264,22 @@ class _BoundedResourceCloser:
         self._lock = threading.Lock()
         self._workers = 0
         self._worker_sequence = 0
+        self._sealed = False
+        self._owner = threading.Thread(
+            target=self._owner_worker,
+            name="openevo-core-resource-owner",
+            daemon=True,
+        )
+        self._owner.start()
 
     def submit(self, action: Callable[[], None]) -> bool:
-        accepted, _caller_retains = self.submit_with_ownership(action)
-        return accepted
-
-    def submit_with_ownership(self, action: Callable[[], None]) -> tuple[bool, bool]:
         with self._lock:
+            if self._sealed:
+                return False
             try:
                 self._queue.put_nowait(action)
             except queue.Full:
-                return False, False
+                return False
             if self._workers < CORE_CLOSE_WORKER_COUNT:
                 self._worker_sequence += 1
                 self._workers += 1
@@ -288,13 +292,30 @@ class _BoundedResourceCloser:
                     worker.start()
                 except RuntimeError:
                     self._workers -= 1
-                    if self._workers == 0:
-                        retained_action = self._queue.get_nowait()
-                        self._queue.task_done()
-                        if retained_action is not action:
-                            raise RuntimeError("close queue ownership invariant violated")
-                        return False, True
-            return True, False
+                    # The prestarted owner retains the queued action without making
+                    # this caller run a possibly blocking close.
+                    return True
+            return True
+
+    def seal(self) -> None:
+        with self._lock:
+            self._sealed = True
+
+    def _owner_worker(self) -> None:
+        while True:
+            try:
+                action = self._queue.get(timeout=1.0)
+            except queue.Empty:
+                with self._lock:
+                    if self._sealed and self._queue.empty():
+                        return
+                continue
+            try:
+                action()
+            except BaseException:
+                pass
+            finally:
+                self._queue.task_done()
 
     def _worker(self) -> None:
         while True:
@@ -336,7 +357,6 @@ class CoreControlClientV1:
         self._generation_local = threading.local()
         self._close_tasks_pending = 0
         self._close_failed = False
-        self._resource_closer = _BoundedResourceCloser()
         self._leases = 0
         self._lease_owners: dict[int, int] = {}
         self._active_responses: set[httpx.Response] = set()
@@ -361,6 +381,7 @@ class CoreControlClientV1:
             follow_redirects=False,
             headers={"Accept-Encoding": "identity", "User-Agent": "OpenEvo-Desktop-CoreClient/1"},
         )
+        self._resource_closer = _BoundedResourceCloser()
         self._bind_resource(v1.ResourceChangeType.PROJECT, connection.project_id)
 
     def __enter__(self) -> CoreControlClientV1:
@@ -405,6 +426,9 @@ class CoreControlClientV1:
             self._active_responses.clear()
             self._state.notify_all()
             close_failed = self._close_failed
+            seal_closer = self._leases == 0
+        if seal_closer:
+            self._resource_closer.seal()
         if close_failed:
             raise _local_exception(CoreClientLocalErrorCodeV1.CLIENT_CLOSED, 503) from None
 
@@ -425,10 +449,7 @@ class CoreControlClientV1:
                     self._close_tasks_pending -= 1
                     self._state.notify_all()
 
-        accepted, caller_retains = self._resource_closer.submit_with_ownership(tracked_close)
-        if caller_retains:
-            tracked_close()
-        elif not accepted:
+        if not self._resource_closer.submit(tracked_close):
             with self._state:
                 self._close_failed = True
                 self._close_tasks_pending -= 1
@@ -1429,7 +1450,7 @@ class CoreControlClientV1:
                 self._ensure_session_generation(session_generation)
                 yield CoreSseStreamV1(
                     response.iter_bytes(),
-                    validate_frame=lambda frame: self._validate_sse_frame(
+                    linearize_frame_delivery=lambda frame: self._linearize_sse_frame_delivery(
                         frame, session_generation
                     ),
                     private_values=self._private_values(),
@@ -1553,7 +1574,7 @@ class CoreControlClientV1:
                 self._raise_transport_error()
             if release_failed:
                 self._raise_transport_error()
-            self._guard_generation_result(self._current_generation_token(), session_generation)
+            self._ensure_session_generation(session_generation)
             if 300 <= status_code < 400:
                 _raise_local(CoreClientLocalErrorCodeV1.REDIRECT_REJECTED, 502)
             if status_code != expected_status:
@@ -1654,6 +1675,7 @@ class CoreControlClientV1:
         try:
             yield session_generation
         finally:
+            seal_closer = False
             with self._state:
                 self._leases -= 1
                 remaining = self._lease_owners[owner] - 1
@@ -1661,7 +1683,10 @@ class CoreControlClientV1:
                     self._lease_owners[owner] = remaining
                 else:
                     del self._lease_owners[owner]
+                seal_closer = self._closed and self._leases == 0
                 self._state.notify_all()
+            if seal_closer:
+                self._resource_closer.seal()
 
     @contextmanager
     def _generation_lease(self) -> Iterator[_GenerationLeaseToken]:
@@ -1675,8 +1700,6 @@ class CoreControlClientV1:
             try:
                 yield token
             finally:
-                if token.result_guarded:
-                    self._state.release()
                 popped = stack.pop()
                 if popped is not token:
                     raise RuntimeError("generation lease stack corrupted")
@@ -1693,24 +1716,10 @@ class CoreControlClientV1:
             raise RuntimeError("JSON request requires a public generation lease")
         return stack[-1]
 
-    def _guard_generation_result(
-        self,
-        token: _GenerationLeaseToken,
-        session_generation: int,
-    ) -> None:
-        if token.generation != session_generation:
-            _raise_local(CoreClientLocalErrorCodeV1.CLIENT_CLOSED, 503)
-        if token.result_guarded:
-            self._ensure_session_generation(session_generation)
-            return
-        self._state.acquire()
-        try:
+    def _linearize_generation_result(self, session_generation: int) -> None:
+        with self._state:
             if self._closing or self._closed or session_generation != self._session_generation:
                 _raise_local(CoreClientLocalErrorCodeV1.CLIENT_CLOSED, 503)
-            token.result_guarded = True
-        except BaseException:
-            self._state.release()
-            raise
 
     def _register_response(self, response: httpx.Response, session_generation: int) -> None:
         close_late_response = False
@@ -2199,7 +2208,7 @@ class CoreControlClientV1:
             return
         _raise_local(CoreClientLocalErrorCodeV1.SSE_PROTOCOL_ERROR, 502)
 
-    def _validate_sse_frame(self, frame: v1.SseFrameV1, session_generation: int) -> None:
+    def _linearize_sse_frame_delivery(self, frame: v1.SseFrameV1, session_generation: int) -> None:
         canonical_event = json.dumps(
             frame.data.model_dump(mode="json"),
             ensure_ascii=False,
@@ -2208,19 +2217,18 @@ class CoreControlClientV1:
             separators=(",", ":"),
         ).encode("utf-8")
         event_digest = hashlib.sha256(canonical_event).hexdigest()
-        with self._state:
-            if self._closing or self._closed or session_generation != self._session_generation:
-                _raise_local(CoreClientLocalErrorCodeV1.CLIENT_CLOSED, 503)
+        with self._registration_batch():
             with self._membership_lock:
                 previous_digest = self._sse_event_digests.get(frame.id)
                 if previous_digest is not None:
                     if previous_digest != event_digest:
                         _raise_local(CoreClientLocalErrorCodeV1.SSE_PROTOCOL_ERROR, 502)
-                    return
-                if len(self._sse_event_digests) >= MAX_CORE_SSE_EVENT_BINDINGS:
-                    _raise_local(CoreClientLocalErrorCodeV1.SSE_PROTOCOL_ERROR, 502)
-                self._validate_event_membership(frame.data)
-                self._sse_event_digests[frame.id] = event_digest
+                else:
+                    if len(self._sse_event_digests) >= MAX_CORE_SSE_EVENT_BINDINGS:
+                        _raise_local(CoreClientLocalErrorCodeV1.SSE_PROTOCOL_ERROR, 502)
+                    self._validate_event_membership(frame.data)
+                    self._sse_event_digests[frame.id] = event_digest
+            self._linearize_generation_result(session_generation)
 
     def _active_project(self, project_id: str | None) -> str:
         if project_id is None:
