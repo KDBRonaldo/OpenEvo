@@ -174,6 +174,66 @@ class CoreTunnelConnectionV1:
         object.__setattr__(self, "origin", origin)
 
 
+@dataclass(frozen=True, slots=True)
+class CoreBootstrapTunnelConnectionV1:
+    """Private tunnel authority before Core has issued the project identity."""
+
+    endpoint: str
+    bearer_token: str = field(repr=False)
+    session_id: str
+    origin: str = field(init=False)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.endpoint, str) or not isinstance(self.session_id, str):
+            _raise_local(CoreClientLocalErrorCodeV1.INVALID_CONNECTION, 400)
+        validated = self._temporary_binding()
+        object.__setattr__(self, "endpoint", validated.endpoint)
+        object.__setattr__(self, "bearer_token", validated.bearer_token)
+        object.__setattr__(self, "session_id", validated.session_id)
+        object.__setattr__(self, "origin", validated.origin)
+
+    def bind(self, project_id: str) -> CoreTunnelConnectionV1:
+        """Issue the ordinary project-bound authority after a verified create response."""
+
+        return CoreTunnelConnectionV1(
+            endpoint=self.endpoint,
+            bearer_token=self.bearer_token,
+            project_id=project_id,
+            session_id=self.session_id,
+        )
+
+    def _temporary_binding(self) -> CoreTunnelConnectionV1:
+        try:
+            seed = f"openevo-core-bootstrap-v1\0{self.endpoint}\0{self.session_id}".encode(
+                "utf-8"
+            )
+        except UnicodeEncodeError:
+            _raise_local(CoreClientLocalErrorCodeV1.INVALID_CONNECTION, 400)
+        digest = hashlib.sha256(seed).hexdigest()
+        return CoreTunnelConnectionV1(
+            endpoint=self.endpoint,
+            bearer_token=self.bearer_token,
+            project_id=f"project-bootstrap-{digest[:32]}",
+            session_id=self.session_id,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class CoreProjectBootstrapResultV1:
+    """A Core-created project and the exact authority for its bound client."""
+
+    project: v1.ProjectV1
+    connection: CoreTunnelConnectionV1
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.project, v1.ProjectV1):
+            raise TypeError("project must be ProjectV1")
+        if not isinstance(self.connection, CoreTunnelConnectionV1):
+            raise TypeError("connection must be CoreTunnelConnectionV1")
+        if self.connection.project_id != self.project.id:
+            raise ValueError("bootstrap connection must bind the created project")
+
+
 class CoreSseStreamV1(Iterator[v1.SseFrameV1]):
     """Single-pass, bounded SSE adapter yielding validated contract envelopes."""
 
@@ -734,17 +794,10 @@ class CoreControlClientV1:
         *,
         idempotency_key: str,
     ) -> v1.ProjectV1:
-        result = self._mutation(
-            "POST",
-            "/v1/projects",
-            request,
-            v1.ProjectCreateV1,
-            v1.ProjectV1,
-            idempotency_key=idempotency_key,
-            expected_status=201,
-        )
-        self._register_project(result)
-        return result
+        del request, idempotency_key
+        # Core owns new project IDs. A project-bound client cannot predict that
+        # identity and must never create an orphan before rejecting the response.
+        _raise_local(CoreClientLocalErrorCodeV1.INVALID_REQUEST, 400)
 
     @_generation_bound
     def get_project(self, project_id: str | None = None) -> v1.ProjectV1:
@@ -2647,6 +2700,151 @@ class CoreControlClientV1:
             _raise_local(CoreClientLocalErrorCodeV1.INVALID_RESPONSE, 502)
 
 
+class CoreProjectBootstrapClientV1:
+    """One-shot project creation client for a negotiated private Core tunnel.
+
+    The ordinary client is project-bound. This narrow bootstrap surface exists
+    only because Core, not Desktop, issues a new project's identity.
+    """
+
+    def __init__(
+        self,
+        connection: CoreBootstrapTunnelConnectionV1,
+        *,
+        transport: httpx.BaseTransport | None = None,
+        timeout: float | httpx.Timeout = 30.0,
+    ) -> None:
+        if not isinstance(connection, CoreBootstrapTunnelConnectionV1):
+            raise TypeError("connection must be CoreBootstrapTunnelConnectionV1")
+        self._connection = connection
+        self._client = CoreControlClientV1(
+            connection._temporary_binding(),
+            transport=transport,
+            timeout=timeout,
+        )
+        self._create_lock = threading.Lock()
+        self._submitted_request: v1.ProjectCreateV1 | None = None
+        self._submitted_idempotency_key: str | None = None
+        self._delivered_result: CoreProjectBootstrapResultV1 | None = None
+
+    def __enter__(self) -> CoreProjectBootstrapClientV1:
+        self._client._ensure_open()
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.close()
+
+    def close(self) -> None:
+        self._client.close()
+
+    def version(self) -> v1.VersionResponseV1:
+        return self._client.version()
+
+    def health(self) -> v1.HealthResponseV1:
+        return self._client.health()
+
+    def status(self) -> v1.CoreStatusV1:
+        return self._client.status()
+
+    def capabilities(self, execution_mode: v1.ExecutionMode) -> v1.CapabilitiesResponseV1:
+        return self._client.capabilities(execution_mode)
+
+    def create_project(
+        self,
+        request: v1.ProjectCreateV1,
+        *,
+        idempotency_key: str,
+    ) -> CoreProjectBootstrapResultV1:
+        deadline = time.monotonic() + self._client._request_deadline_seconds
+        _encode_request(request, v1.ProjectCreateV1, MAX_CORE_REQUEST_BYTES)
+        # Validate the header even for a local exact-success replay or rejected retry.
+        normalized_key = self._client._mutation_headers(
+            idempotency_key=idempotency_key
+        )["Idempotency-Key"]
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or not self._create_lock.acquire(timeout=remaining):
+            _raise_local(CoreClientLocalErrorCodeV1.CONNECTION_FAILED, 503)
+        try:
+            with self._client._generation_lease(deadline=deadline) as token:
+                self._client._require_version_authority()
+                if self._submitted_request is not None and (
+                    request != self._submitted_request
+                    or normalized_key != self._submitted_idempotency_key
+                ):
+                    _raise_local(CoreClientLocalErrorCodeV1.INVALID_REQUEST, 400)
+                if self._delivered_result is not None:
+                    return self._deliver(token, self._delivered_result, commit=False)
+
+                # Freeze identity before the first transport submission. An unknown
+                # outcome may be retried only with this exact request and key.
+                self._submitted_request = request
+                self._submitted_idempotency_key = normalized_key
+                project = self._client._mutation(
+                    "POST",
+                    "/v1/projects",
+                    request,
+                    v1.ProjectCreateV1,
+                    v1.ProjectV1,
+                    idempotency_key=normalized_key,
+                    expected_status=201,
+                )
+                _ensure_project_create_response(request, project)
+                result = CoreProjectBootstrapResultV1(
+                    project=project,
+                    connection=self._connection.bind(project.id),
+                )
+                return self._deliver(token, result, commit=True)
+        finally:
+            self._create_lock.release()
+
+    def _deliver(
+        self,
+        token: _GenerationLeaseToken,
+        result: CoreProjectBootstrapResultV1,
+        *,
+        commit: bool,
+    ) -> CoreProjectBootstrapResultV1:
+        with self._client._delivery_lock:
+            _check_deadline(token.deadline)
+            with self._client._state:
+                if (
+                    self._client._closing
+                    or self._client._closed
+                    or self._client._close_failed
+                    or token.generation != self._client._session_generation
+                ):
+                    _raise_local(CoreClientLocalErrorCodeV1.CLIENT_CLOSED, 503)
+                if commit:
+                    self._delivered_result = result
+                self._client._release_generation_token_locked(token)
+        return result
+
+
+def _ensure_project_create_response(
+    request: v1.ProjectCreateV1,
+    project: v1.ProjectV1,
+) -> None:
+    if (
+        project.name != request.name
+        or project.description != request.description
+        or project.spec != request.spec
+        or project.task != request.task
+        or project.workspace != request.workspace
+        or project.status is not v1.ProjectStatus.DRAFT
+        or project.active_revision is not None
+        or project.workspace_publication is not None
+        or (
+            isinstance(request.workspace, v1.ScratchWorkspaceSpecV1)
+            and project.current_workspace_snapshot is None
+        )
+        or (
+            isinstance(request.workspace, v1.ImportedWorkspaceSpecV1)
+            and project.current_workspace_snapshot is not None
+        )
+    ):
+        _raise_local(CoreClientLocalErrorCodeV1.INVALID_RESPONSE, 502)
+
+
 def _encode_request(request: BaseModel, request_model: type[BaseModel], limit: int) -> bytes:
     if type(request) is not request_model:
         _raise_local(CoreClientLocalErrorCodeV1.INVALID_REQUEST, 400)
@@ -3303,10 +3501,13 @@ def _raise_local(code: CoreClientLocalErrorCodeV1, status_code: int) -> NoReturn
 
 __all__ = [
     "CORE_OPENAPI_SHA256",
+    "CoreBootstrapTunnelConnectionV1",
     "CoreClientErrorV1",
     "CoreClientLocalErrorCodeV1",
     "CoreClientLocalErrorV1",
     "CoreControlClientV1",
+    "CoreProjectBootstrapClientV1",
+    "CoreProjectBootstrapResultV1",
     "CoreSseStreamV1",
     "CoreTunnelConnectionV1",
 ]

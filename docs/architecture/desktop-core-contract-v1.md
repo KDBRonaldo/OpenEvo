@@ -63,6 +63,20 @@ The Desktop release Core client accepts only `provider_kind=openevo_core`,
 It pins the complete first accepted version response. Every bearer-authenticated
 `/v1` request requires that pin and fails before transport without it.
 
+The Core client authority is project-bound after project creation. Because
+Core assigns a new project's opaque ID, Desktop first creates it through a
+one-shot bootstrap authority on the active private tunnel. That authority uses
+the same release version pin, idempotency contract, bounded transport, and
+response validation as the ordinary client. It verifies the complete returned
+draft against the submitted `ProjectCreateV1` before deriving the project-bound
+connection. The first canonical request and idempotency key are frozen before
+transport; an unknown outcome permits only an exact retry. The returned draft
+must have the documented initial workspace shape and no prior publication or
+active revision. Validation, binding, replay-state commit, and delivery are one
+close-generation transaction. A project-bound client cannot call project
+creation; it fails before transport rather than creating a Core project it
+cannot subsequently adopt.
+
 ## Common Protocol
 
 Every JSON model is closed: unknown fields are errors. IDs are opaque UTF-8
