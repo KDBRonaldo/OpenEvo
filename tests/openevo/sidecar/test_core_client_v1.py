@@ -22,6 +22,14 @@ from desktop.sidecar.core_client_v1 import (
     MAX_CORE_SSE_RESPONSE_BYTES,
 )
 from openevo.backend.contracts.v1 import models as v1
+from openevo.evolution.framework import (
+    CapabilityAudience,
+    build_evolution_capabilities,
+)
+from openevo.evolution.framework.builtins import (
+    ImplementationDistributionIdentity,
+    build_builtin_registry,
+)
 from openevo.evolution.framework.profiles import execution_profile_for_release_mode
 
 
@@ -71,6 +79,24 @@ def _capabilities(
         registry_digest="4" * 64,
         evaluated_profile=execution_profile_for_release_mode(execution_mode),
         targets=(),
+    )
+
+
+def _full_capabilities(
+    execution_mode: v1.ExecutionMode = v1.ExecutionMode.SELF_DEPLOYED,
+) -> v1.CapabilitiesResponseV1:
+    snapshot = build_builtin_registry(
+        ImplementationDistributionIdentity(
+            distribution="openevo-test",
+            distribution_version="0.1.0-test",
+            distribution_digest="a" * 64,
+        )
+    )
+    return build_evolution_capabilities(
+        snapshot,
+        profile=execution_profile_for_release_mode(execution_mode),
+        audience=CapabilityAudience.DESKTOP,
+        core_version="0.1.0-test",
     )
 
 
@@ -732,6 +758,97 @@ def test_capabilities_response_profile_matches_requested_release_mode() -> None:
     assert exc_info.value.error.code is CoreClientLocalErrorCodeV1.INVALID_RESPONSE
 
 
+def test_capabilities_recursively_rejects_scalar_coercion_in_nested_schema() -> None:
+    payload = _full_capabilities().model_dump(mode="json")
+    payload["targets"][0]["context_order"] = True
+    client = _client(lambda _request: httpx.Response(200, json=payload))
+
+    with pytest.raises(CoreClientErrorV1) as exc_info:
+        client.capabilities(v1.ExecutionMode.SELF_DEPLOYED)
+
+    assert exc_info.value.error.code is CoreClientLocalErrorCodeV1.INVALID_RESPONSE
+
+
+def test_capabilities_pin_session_registry_and_execution_profile_authority() -> None:
+    capabilities = _capabilities()
+    changed_registry = capabilities.model_copy(update={"registry_digest": "5" * 64})
+    subscription = _capabilities(v1.ExecutionMode.CODEX_SUBSCRIPTION_TRANSCRIPT)
+    responses = iter([capabilities, changed_registry, subscription])
+    client = _client(
+        lambda _request: httpx.Response(
+            200,
+            json=next(responses).model_dump(mode="json"),
+        )
+    )
+
+    assert client.capabilities(v1.ExecutionMode.SELF_DEPLOYED) == capabilities
+    with pytest.raises(CoreClientErrorV1) as changed_digest:
+        client.capabilities(v1.ExecutionMode.SELF_DEPLOYED)
+    with pytest.raises(CoreClientErrorV1) as changed_profile:
+        client.capabilities(v1.ExecutionMode.CODEX_SUBSCRIPTION_TRANSCRIPT)
+
+    assert changed_digest.value.error.code is CoreClientLocalErrorCodeV1.INVALID_RESPONSE
+    assert changed_profile.value.error.code is CoreClientLocalErrorCodeV1.INVALID_RESPONSE
+
+
+def test_validation_and_run_admission_require_exact_capability_authority() -> None:
+    capabilities = _capabilities()
+    run = _run()
+    validation = v1.ProjectValidationResponseV1(
+        valid=True,
+        registry_digest=capabilities.registry_digest,
+        checks=[],
+        validated_at="2026-07-14T12:00:00Z",
+    )
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.path)
+        if request.url.path == "/v1/capabilities":
+            return httpx.Response(200, json=capabilities.model_dump(mode="json"))
+        if request.url.path.endswith("/validate"):
+            return httpx.Response(200, json=validation.model_dump(mode="json"))
+        return httpx.Response(202, json=run.model_dump(mode="json"))
+
+    client = _client(handler)
+    client.capabilities(v1.ExecutionMode.SELF_DEPLOYED)
+    wrong_validation = v1.ProjectValidationRequestV1(
+        project_snapshot=run.project_snapshot,
+        workspace_snapshot=run.workspace_snapshot,
+        expected_registry_digest="5" * 64,
+    )
+    wrong_run = _run_create(run).model_copy(update={"expected_registry_digest": "5" * 64})
+
+    with pytest.raises(CoreClientErrorV1) as validation_error:
+        client.validate_project(wrong_validation, idempotency_key="validate-authority")
+    with pytest.raises(CoreClientErrorV1) as run_error:
+        client.create_run(wrong_run, idempotency_key="run-authority")
+
+    assert validation_error.value.error.code is CoreClientLocalErrorCodeV1.INVALID_REQUEST
+    assert run_error.value.error.code is CoreClientLocalErrorCodeV1.INVALID_REQUEST
+    assert seen == ["/v1/capabilities"]
+
+
+def test_run_response_execution_mode_must_match_capability_profile() -> None:
+    capabilities = _capabilities()
+    run = _run().model_copy(
+        update={"execution_mode": v1.ExecutionMode.CODEX_SUBSCRIPTION_TRANSCRIPT}
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/capabilities":
+            return httpx.Response(200, json=capabilities.model_dump(mode="json"))
+        return httpx.Response(202, json=run.model_dump(mode="json"))
+
+    client = _client(handler)
+    client.capabilities(v1.ExecutionMode.SELF_DEPLOYED)
+
+    with pytest.raises(CoreClientErrorV1) as exc_info:
+        client.create_run(_run_create(run), idempotency_key="run-profile")
+
+    assert exc_info.value.error.code is CoreClientLocalErrorCodeV1.INVALID_RESPONSE
+
+
 def test_valid_api_error_is_returned_as_exact_contract_type() -> None:
     payload = _api_error_payload()
     client = _client(lambda _request: httpx.Response(409, json=payload))
@@ -856,7 +973,14 @@ def test_project_validation_response_binds_expected_registry_digest() -> None:
         checks=[],
         validated_at="2026-07-14T12:00:00Z",
     )
-    client = _client(lambda _request: httpx.Response(200, json=response.model_dump(mode="json")))
+    capabilities = _capabilities().model_copy(update={"registry_digest": "5" * 64})
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = capabilities if request.url.path == "/v1/capabilities" else response
+        return httpx.Response(200, json=payload.model_dump(mode="json"))
+
+    client = _client(handler)
+    client.capabilities(v1.ExecutionMode.SELF_DEPLOYED)
 
     with pytest.raises(CoreClientErrorV1) as exc_info:
         client.validate_project(request, idempotency_key="validate-1")
@@ -867,12 +991,15 @@ def test_project_validation_response_binds_expected_registry_digest() -> None:
 def test_run_create_response_binds_expected_registry_digest() -> None:
     run = _run()
     request = _run_create(run).model_copy(update={"expected_registry_digest": "5" * 64})
-    client = _client(
-        lambda _request: httpx.Response(
-            202,
-            json=run.model_dump(mode="json"),
-        )
-    )
+    capabilities = _capabilities().model_copy(update={"registry_digest": "5" * 64})
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/capabilities":
+            return httpx.Response(200, json=capabilities.model_dump(mode="json"))
+        return httpx.Response(202, json=run.model_dump(mode="json"))
+
+    client = _client(handler)
+    client.capabilities(v1.ExecutionMode.SELF_DEPLOYED)
 
     with pytest.raises(CoreClientErrorV1) as exc_info:
         client.create_run(request, idempotency_key="run-1")
@@ -1247,6 +1374,96 @@ def test_close_deadline_covers_blocking_response_close(monkeypatch) -> None:
         client.health()
 
 
+def test_late_response_close_is_handed_to_bounded_closer_without_state_lock(
+    monkeypatch,
+) -> None:
+    import desktop.sidecar.core_client_v1 as core_client_module
+
+    monkeypatch.setattr(core_client_module, "MAX_CORE_CLOSE_WAIT_SECONDS", 0.05)
+    handler_entered = threading.Event()
+    release_handler = threading.Event()
+
+    class BlockingCloseStream(httpx.SyncByteStream):
+        def __init__(self) -> None:
+            self.close_started = threading.Event()
+            self.release_close = threading.Event()
+
+        def __iter__(self):
+            yield json.dumps(_health_payload()).encode()
+
+        def close(self) -> None:
+            self.close_started.set()
+            self.release_close.wait(1)
+
+    body = BlockingCloseStream()
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        handler_entered.set()
+        release_handler.wait(1)
+        return httpx.Response(200, headers={"Content-Type": "application/json"}, stream=body)
+
+    client = _client(handler)
+    errors: list[CoreClientErrorV1] = []
+
+    def request_health() -> None:
+        try:
+            client.health()
+        except CoreClientErrorV1 as exc:
+            errors.append(exc)
+
+    request_thread = threading.Thread(target=request_health)
+    request_thread.start()
+    assert handler_entered.wait(1)
+    client.close()
+    release_handler.set()
+    try:
+        request_thread.join(0.25)
+        assert not request_thread.is_alive()
+        assert body.close_started.wait(0.25)
+        assert client._state.acquire(timeout=0.1)
+        client._state.release()
+    finally:
+        body.release_close.set()
+        request_thread.join(1)
+
+    assert errors[0].error.code is CoreClientLocalErrorCodeV1.CLIENT_CLOSED
+
+
+def test_normal_sse_context_exit_uses_bounded_response_closer() -> None:
+    class BlockingCloseStream(httpx.SyncByteStream):
+        def __init__(self) -> None:
+            self.started = threading.Event()
+            self.release = threading.Event()
+
+        def __iter__(self):
+            yield b""
+
+        def close(self) -> None:
+            self.started.set()
+            self.release.wait(1)
+
+    body = BlockingCloseStream()
+    client = _client(
+        lambda _request: httpx.Response(
+            200,
+            headers={"Content-Type": "text/event-stream"},
+            stream=body,
+        )
+    )
+
+    started_at = time.monotonic()
+    try:
+        with client.events():
+            pass
+        elapsed = time.monotonic() - started_at
+        assert body.started.wait(0.25)
+    finally:
+        body.release.set()
+        client.close()
+
+    assert elapsed < 0.25
+
+
 def test_sse_stream_validates_and_yields_final_wire_frame() -> None:
     payload = {
         "schema_version": "1",
@@ -1308,6 +1525,48 @@ def test_sse_event_id_is_bound_to_canonical_payload_across_reconnects() -> None:
             list(stream)
 
     assert exc_info.value.error.code is CoreClientLocalErrorCodeV1.SSE_PROTOCOL_ERROR
+
+
+def test_identical_sse_replay_is_digest_checked_without_reapplying_state(
+    monkeypatch,
+) -> None:
+    payload = {
+        "schema_version": "1",
+        "id": "event-1",
+        "sequence": 1,
+        "occurred_at": "2026-07-14T12:00:00Z",
+        "event": "heartbeat.v1",
+        "payload": {"active_run_count": 0},
+    }
+    alternate = json.dumps(payload, sort_keys=True).encode()
+    frames = iter(
+        [
+            _sse_bytes(payload),
+            b"id: event-1\nevent: heartbeat.v1\ndata: " + alternate + b"\n\n",
+        ]
+    )
+    client = _client(
+        lambda _request: httpx.Response(
+            200,
+            headers={"Content-Type": "text/event-stream"},
+            content=next(frames),
+        )
+    )
+    applications: list[v1.EventEnvelopeV1] = []
+    original = client._validate_event_membership
+
+    def count_application(envelope: v1.EventEnvelopeV1) -> None:
+        applications.append(envelope)
+        original(envelope)
+
+    monkeypatch.setattr(client, "_validate_event_membership", count_application)
+
+    with client.events() as stream:
+        assert len(list(stream)) == 1
+    with client.events(last_event_id="event-1") as stream:
+        assert len(list(stream)) == 1
+
+    assert len(applications) == 1
 
 
 def test_sse_event_identity_ledger_fails_closed_at_bound(monkeypatch) -> None:
@@ -2005,6 +2264,47 @@ def test_workspace_upload_finalize_state_change_requires_new_etag() -> None:
     assert exc_info.value.error.code is CoreClientLocalErrorCodeV1.INVALID_RESPONSE
 
 
+def test_workspace_upload_etag_uniquely_binds_canonical_representation() -> None:
+    original = _upload()
+    same_etag_changed_offset = _upload(accepted_offset=1024, etag=original.etag)
+    same_representation_changed_etag = original.model_copy(update={"etag": '"' + ("9" * 64) + '"'})
+
+    for changed in (same_etag_changed_offset, same_representation_changed_etag):
+        responses = iter([original, changed])
+        client = _client(
+            lambda _request: httpx.Response(
+                200,
+                json=next(responses).model_dump(mode="json"),
+            )
+        )
+        client.get_workspace_upload(original.id)
+
+        with pytest.raises(CoreClientErrorV1) as exc_info:
+            client.get_workspace_upload(original.id)
+
+        assert exc_info.value.error.code is CoreClientLocalErrorCodeV1.INVALID_RESPONSE
+
+
+def test_workspace_upload_rejects_stale_state_rollback_with_fresh_etag() -> None:
+    original = _upload()
+    advanced = _upload(accepted_offset=1024, etag='"' + ("8" * 64) + '"')
+    stale = original.model_copy(update={"etag": '"' + ("9" * 64) + '"'})
+    responses = iter([original, advanced, stale])
+    client = _client(
+        lambda _request: httpx.Response(
+            200,
+            json=next(responses).model_dump(mode="json"),
+        )
+    )
+    client.get_workspace_upload(original.id)
+    client.get_workspace_upload(original.id)
+
+    with pytest.raises(CoreClientErrorV1) as exc_info:
+        client.get_workspace_upload(original.id)
+
+    assert exc_info.value.error.code is CoreClientLocalErrorCodeV1.INVALID_RESPONSE
+
+
 @pytest.mark.parametrize(
     ("route", "expected_code"),
     [
@@ -2113,6 +2413,63 @@ def test_diagnostic_registration_failure_does_not_grant_member_or_log_access() -
 
     assert (v1.ResourceChangeType.DIAGNOSTIC, colliding_log.id) not in client._members
     assert changed_identity.checks[0].logs_ref not in client._log_refs
+
+
+def test_run_page_registration_is_atomic_on_late_item_failure() -> None:
+    first = _run("run-new")
+    conflicting = _run("run-conflict")
+    changed = conflicting.model_copy(
+        update={"project_snapshot": _snapshot("project-snapshot-2", v1.SnapshotKind.PROJECT, "8")}
+    )
+    responses = iter(
+        [
+            _page([conflicting.model_dump(mode="json", exclude={"attempts"})]),
+            _page(
+                [
+                    first.model_dump(mode="json", exclude={"attempts"}),
+                    changed.model_dump(mode="json", exclude={"attempts"}),
+                ]
+            ),
+        ]
+    )
+    client = _client(lambda _request: httpx.Response(200, json=next(responses)))
+    client.list_runs()
+
+    with pytest.raises(CoreClientErrorV1) as exc_info:
+        client.list_runs()
+
+    assert exc_info.value.error.code is CoreClientLocalErrorCodeV1.INVALID_RESPONSE
+    assert first.id not in client._runs
+    assert (v1.ResourceChangeType.RUN, first.id) not in client._members
+
+
+def test_artifact_page_registration_is_atomic_on_late_item_failure() -> None:
+    run = _run()
+    first = _artifact("artifact-new", digest="a" * 64)
+    conflicting = _artifact("artifact-conflict", digest="b" * 64)
+    changed = conflicting.model_copy(update={"content_sha256": "c" * 64})
+    pages = iter(
+        [
+            _page([conflicting.model_dump(mode="json")]),
+            _page([first.model_dump(mode="json"), changed.model_dump(mode="json")]),
+        ]
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/runs/run-1":
+            return httpx.Response(200, json=run.model_dump(mode="json"))
+        return httpx.Response(200, json=next(pages))
+
+    client = _client(handler)
+    client.get_run(run.id, project_id=PROJECT_ID)
+    client.run_artifacts(run.id, project_id=PROJECT_ID)
+
+    with pytest.raises(CoreClientErrorV1) as exc_info:
+        client.run_artifacts(run.id, project_id=PROJECT_ID)
+
+    assert exc_info.value.error.code is CoreClientLocalErrorCodeV1.INVALID_RESPONSE
+    assert first.id not in client._artifacts
+    assert (v1.ResourceChangeType.ARTIFACT, first.id) not in client._members
 
 
 def test_run_child_and_artifact_content_bind_requested_parent_ids() -> None:

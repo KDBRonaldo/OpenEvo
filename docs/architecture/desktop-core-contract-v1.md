@@ -230,12 +230,31 @@ Capability responses wrap the complete framework-owned
 `unavailable`, the evaluated profile, accepted methods, selection resolvers,
 identity digests, canonical config JSON, defaults, and all support axes. The
 sidecar has no reduced method table. The evaluated profile must equal the
-profile selected by the requested release execution mode. Core project
-validation must return the request's exact expected registry digest, and run
-admission must return that digest together with the request's exact project,
-task, workspace, and required-revision references. Project responses expose
+profile selected by the requested release execution mode. The first valid
+response pins that complete profile and registry digest as the active-tunnel
+client authority. Later capability responses, Core project snapshots,
+validation requests/responses, and run requests/responses must match the pin;
+a different profile or digest requires a new project-session client. Run
+admission must also return the request's exact project, task, workspace, and
+required-revision references. Project responses expose
 typed remote model preparation and active-revision state rather than asking
 React to infer them.
+
+The Core client reads bounded JSON into native JSON values, recursively checks
+scalar and container types against the response model's generated JSON Schema,
+then invokes Pydantic contract validation. This rejects nested coercions such as
+`true` for an integer without rejecting a JSON array that encodes a tuple field.
+Status and paginated project, run, service, and artifact responses validate in
+temporary membership/cache copies and commit only after the complete response
+passes; one bad late item leaves the prior cache unchanged.
+
+Client shutdown seals request admission under its state lock, but no response
+or transport `close()` runs under that lock or on a request/context-exit thread.
+Normal response completion, normal SSE context exit, active responses, and
+responses arriving after the seal all submit close ownership to a fixed-worker,
+fixed-capacity daemon closer owned by that client. `close()` waits only to its
+hard deadline; accepted late close work remains owned by that bounded closer
+and cannot consume a replacement session's workers.
 
 Local SSE carries Desktop state changes and resource invalidations. Every
 resource invalidation includes the authoritative ETag or content digest and
@@ -392,6 +411,10 @@ idempotent replay of the complete create response may preserve that upload ETag;
 the same upload ID cannot return a different representation as a create replay.
 Accepted chunks, abort, and finalize each change the upload representation and
 must therefore issue an upload ETag different from the preconditioned session.
+For one upload ID, the sidecar binds each observed strong ETag one-to-one to the
+canonical DTO representation and rejects both same-ETag/different-state and
+same-state/different-ETag responses. Accepted offset, status, and update time are
+monotonic, so a fresh ETag cannot make an older upload state authoritative.
 
 `workspace.kind=scratch` is closed during project creation: Core atomically
 creates and returns an immutable empty workspace snapshot, so scratch never
@@ -549,7 +572,9 @@ binds each SSE frame ID to the digest of canonical validated event bytes. The
 same ID and semantic payload may replay with different JSON formatting; the
 same ID with different payload fails closed before event authorization state
 changes. The client ledger is bounded and fails closed before accepting a new
-ID once full.
+ID once full. Once an identical replay's canonical digest matches, it is a
+no-op: the sidecar yields the replay record but does not reapply resource or
+authorization state.
 
 Operation and diagnostic responses are authorization-bearing snapshots. The
 sidecar validates immutable identity, parent membership, and all log references

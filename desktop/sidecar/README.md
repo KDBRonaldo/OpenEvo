@@ -17,22 +17,26 @@ precondition headers. Public list methods expose only each route's closed query
 set and runs are always filtered to the active project.
 
 Requests are exact Pydantic v1 DTOs. JSON responses and `ApiErrorV1` bodies are
-read with route-class byte limits before contract-model validation. The models'
-strict and closed configuration rejects coercion and unknown fields while JSON
-arrays remain valid encodings of tuple fields. Capabilities must carry the
-profile selected by the requested release execution mode; project validation
-and run admission must echo the request's expected registry digest, in addition
-to the run snapshot and required-revision bindings. Malformed, oversized,
+read with route-class byte limits before contract-model validation. A generic
+model-generated JSON Schema pass recursively rejects scalar coercion and
+unknown object fields before Pydantic validation while preserving JSON arrays
+as valid encodings of tuple fields. The first valid capabilities response pins
+the client lifetime's exact release execution profile and registry digest.
+Later capability reads, project validation requests/responses, project
+snapshots, and run requests/responses must match that authority, in addition to
+the run snapshot and required-revision bindings. Malformed, oversized,
 redirected, cross-project, or connection failures become closed local errors
 without raw bodies, headers, URLs, paths, or credentials.
 
 The shared HTTP client is safe for concurrent calls; `close()` is idempotent and
-immediately seals the client against new leases. Response and transport close
-calls move to daemon resource owners so an uninterruptible synchronous close
-cannot exceed the caller's total wait bound. On timeout the client remains
-permanently closed while detached owners retain the old resources until their
-close calls return. A closed connection cannot send its bearer after Desktop
-switches to another project session or tunnel.
+immediately seals the client against new leases. Every response and transport
+close, including ordinary response-context exit and a response that arrives
+after sealing, is submitted outside the state lock to that client's
+fixed-worker, fixed-capacity daemon closer. An uninterruptible synchronous
+close therefore cannot exceed the caller's total wait bound. On timeout the client remains
+permanently closed while the bounded closer retains accepted old resources
+until their close calls return. A closed connection cannot send its bearer
+after Desktop switches to another project session or tunnel.
 
 After JSON decoding, every nested string key and value is checked for the
 bearer, fixed Core tunnel URL/origin, and private Desktop session identity. The
@@ -49,21 +53,28 @@ frame and each reconnectable stream window, accepts only `id`, `event`, and
 validates the complete `SseFrameV1` before yielding it. A client-lifetime,
 bounded ledger binds every SSE ID to the canonical validated event digest across
 reconnects. Exact semantic replays are accepted even if JSON formatting differs;
-an ID reused for different event data, or a ledger that reaches its bound, fails
-closed. The client does not reconstruct event payloads. Workspace publication,
+after their canonical digest matches, they are no-ops and do not reapply
+authorization or resource state. An ID reused for different event data, or a
+ledger that reaches its bound, fails closed. The client does not reconstruct event payloads. Workspace publication,
 document-change artifact diffs, and
 operation request/result/cancellation are likewise validated only through
 their Core-owned response models. Strict project, run, service, artifact,
 operation, and diagnostic reads establish opaque project-membership bindings.
 Operation and diagnostic identity, parent membership, and every log reference
 are validated under one lock before any authorization cache entry is committed.
+Status and paginated project, run, service, and artifact snapshots validate into
+temporary cache copies and publish as one update; a late invalid item leaves no
+membership or resource-cache residue.
 Events without a direct project identity are yielded only when their declared
 run or service parent is already bound to the active project; otherwise the
 stream fails closed with snapshot-refresh-required semantics.
 
-Workspace upload mutations bind ETags to representation changes. A newly
-created upload must issue an ETag distinct from the project `If-Match`; an exact
-idempotent replay of the complete create response may retain its upload ETag.
-Chunk, abort, and finalize responses change upload state and therefore must
-issue a new upload ETag. Finalization independently requires the returned
-project ETag to differ from the upload's frozen project ETag.
+Workspace upload snapshots bind each strong ETag one-to-one to one canonical
+representation for that upload: neither the same ETag with different state nor
+the same state with a different ETag is accepted. Offset, status, and update
+time cannot move backward. A newly created upload must issue an ETag distinct
+from the project `If-Match`; an exact idempotent replay of the complete create
+response may retain its upload ETag. Chunk, abort, and finalize responses change
+upload state and therefore must issue a new upload ETag. Finalization
+independently requires the returned project ETag to differ from the upload's
+frozen project ETag.
