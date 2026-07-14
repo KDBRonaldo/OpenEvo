@@ -593,6 +593,84 @@ def test_disconnect_of_non_owner_does_not_displace_actual_owner(tmp_path: Path) 
         assert restarted_lifecycle.disconnect_calls == 0
 
 
+def test_disconnect_reservation_blocks_concurrent_profile_delete_until_terminal(
+    tmp_path: Path,
+) -> None:
+    lifecycle = FakeRemoteLifecycle()
+    disconnect_started = Event()
+    release_disconnect = Event()
+
+    def disconnect(profile_id: str | None = None) -> None:
+        lifecycle.disconnect_calls += 1
+        assert profile_id is not None
+        disconnect_started.set()
+        assert release_disconnect.wait(5)
+        lifecycle.current = RemoteLifecycleSnapshot(None, "disconnected")
+
+    lifecycle.disconnect = disconnect  # type: ignore[method-assign]
+    app = _app(tmp_path / "state", remote_lifecycle=lifecycle)
+    with TestClient(app) as client:
+        profile = _create_profile(
+            client, name="Delete reservation", key="profile-delete-reservation-create"
+        ).json()
+        disconnect_headers = {
+            **SESSION_HEADERS,
+            "If-Match": profile["etag"],
+            "Idempotency-Key": "profile-delete-reservation-disconnect",
+        }
+        responses: list[Any] = []
+        thread = Thread(
+            target=lambda: responses.append(
+                client.post(
+                    f"/desktop/v1/profiles/{profile['profile_id']}/disconnect",
+                    headers=disconnect_headers,
+                )
+            )
+        )
+        thread.start()
+        assert disconnect_started.wait(2)
+        try:
+            blocked = client.delete(
+                f"/desktop/v1/profiles/{profile['profile_id']}",
+                headers={**SESSION_HEADERS, "If-Match": profile["etag"]},
+            )
+            assert blocked.status_code == 409
+            assert blocked.json()["code"] == "resource_in_use"
+        finally:
+            release_disconnect.set()
+        thread.join(5)
+
+        assert not thread.is_alive()
+        assert len(responses) == 1
+        completed = responses[0]
+        replay = client.post(
+            f"/desktop/v1/profiles/{profile['profile_id']}/disconnect",
+            headers=disconnect_headers,
+        )
+        assert completed.status_code == replay.status_code == 202
+        assert completed.content == replay.content
+        assert completed.headers["etag"] == replay.headers["etag"]
+        assert completed.json()["state"] == "succeeded"
+        assert lifecycle.disconnect_calls == 1
+
+        terminal_profile = client.get(
+            f"/desktop/v1/profiles/{profile['profile_id']}", headers=SESSION_HEADERS
+        ).json()
+        deleted = client.delete(
+            f"/desktop/v1/profiles/{profile['profile_id']}",
+            headers={**SESSION_HEADERS, "If-Match": terminal_profile["etag"]},
+        )
+        assert deleted.status_code == 204
+        replay_after_delete = client.post(
+            f"/desktop/v1/profiles/{profile['profile_id']}/disconnect",
+            headers=disconnect_headers,
+        )
+        assert replay_after_delete.status_code == 202
+        assert replay_after_delete.content == completed.content
+        assert replay_after_delete.headers["etag"] == completed.headers["etag"]
+        assert lifecycle.disconnect_calls == 1
+
+
 def test_remote_connection_failure_is_typed_and_does_not_persist_details(
     tmp_path: Path,
 ) -> None:

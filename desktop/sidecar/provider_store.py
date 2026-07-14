@@ -1746,7 +1746,21 @@ class DesktopProviderStore:
             referenced = connection.execute(
                 "SELECT 1 FROM projects WHERE profile_id = ? LIMIT 1", (profile_id,)
             ).fetchone()
-            if row["connection_state"] != "disconnected" or referenced is not None:
+            operation_in_flight = connection.execute(
+                """
+                SELECT 1
+                FROM local_operations
+                WHERE resource_type = 'profile' AND resource_id = ?
+                  AND state IN ('queued', 'running', 'cancelling')
+                LIMIT 1
+                """,
+                (profile_id,),
+            ).fetchone()
+            if (
+                row["connection_state"] != "disconnected"
+                or referenced is not None
+                or operation_in_flight is not None
+            ):
                 raise ResourceInUseError("profile", profile_id)
             connection.execute("DELETE FROM remote_profiles WHERE profile_id = ?", (profile_id,))
 

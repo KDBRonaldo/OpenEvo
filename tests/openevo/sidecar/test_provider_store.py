@@ -11,7 +11,7 @@ import subprocess
 import sys
 import threading
 import time
-from typing import cast
+from typing import Literal, cast
 
 import pytest
 
@@ -892,6 +892,71 @@ def test_nonterminal_profile_reservation_is_cancelled_exactly_once_on_restart(
         replay.operation.model_dump(mode="json")
     ) == frozen
     assert replay.operation.etag == recovered_etag
+
+
+@pytest.mark.parametrize("state", ["queued", "running", "cancelling"])
+def test_nonterminal_profile_runtime_operation_blocks_delete(
+    tmp_path: Path,
+    state: Literal["queued", "running", "cancelling"],
+) -> None:
+    store = DesktopProviderStore(tmp_path / "state")
+    profile = _create_profile(store)
+    with store._transaction(write=True) as connection:
+        ProviderMutation(store, connection).create_local_operation(
+            operation_kind="profile_disconnect",
+            resource=ResourceRefV1(resource_type="profile", resource_id=profile.profile_id),
+            state=state,
+        )
+
+    with pytest.raises(ResourceInUseError):
+        store.delete_profile(profile.profile_id, if_match=profile.etag)
+
+    assert store.get_profile(profile.profile_id) == profile
+
+
+def test_disconnected_profile_disconnect_reservation_blocks_delete_until_terminal(
+    tmp_path: Path,
+) -> None:
+    store = DesktopProviderStore(tmp_path / "state")
+    profile = _create_profile(store)
+    action = {
+        "route": f"/desktop/v1/profiles/{profile.profile_id}/disconnect",
+        "operation_kind": "profile_disconnect",
+        "profile_id": profile.profile_id,
+        "key": "profile-disconnect-delete-guard",
+        "body": {},
+        "if_match": profile.etag,
+        "displace_existing": False,
+    }
+    reservation = store.begin_profile_runtime_action(**action)
+    assert reservation.operation.state == "running"
+    assert store.get_profile(profile.profile_id).connection_state == "disconnected"
+
+    with pytest.raises(ResourceInUseError):
+        store.delete_profile(profile.profile_id, if_match=profile.etag)
+
+    completed = store.complete_profile_runtime_action(
+        reservation=reservation,
+        route=cast(str, action["route"]),
+        profile_id=profile.profile_id,
+        key=cast(str, action["key"]),
+        body={},
+        if_match=profile.etag,
+        connection_state="disconnected",
+        host_key_fingerprint=None,
+    )
+    replay = store.begin_profile_runtime_action(**action)
+
+    assert completed.state == "succeeded"
+    assert replay.replayed is True
+    assert replay.operation == completed
+    terminal_profile = store.get_profile(profile.profile_id)
+    store.delete_profile(profile.profile_id, if_match=terminal_profile.etag)
+    with pytest.raises(ResourceNotFoundError):
+        store.get_profile(profile.profile_id)
+    replay_after_delete = store.begin_profile_runtime_action(**action)
+    assert replay_after_delete.replayed is True
+    assert replay_after_delete.operation == completed
 
 
 def test_profile_reservation_fails_before_ssh_when_terminal_slots_do_not_fit(

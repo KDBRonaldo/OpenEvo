@@ -387,9 +387,13 @@ success remains success and keeps its transport, even if concurrent CRUD fills
 the now-released budget. Every persisted terminal body and ETag is permanently
 frozen; late complete/fail calls return it unchanged and only close a transport
 still owned by their own stale result. The failed operation embeds the exact API
-error used by later replays, and exact replay never repeats remote work. Process
-restart resets persisted runtime connection state to disconnected and does not
-claim a surviving tunnel. It only reconciles nonterminal reservations, writing
+error used by later replays, and exact replay never repeats remote work. Profile
+deletion atomically rejects any queued, running, or cancelling profile operation,
+including a disconnect reservation that deliberately leaves an already-
+disconnected profile state unchanged. Once that operation is terminal, its
+historical record no longer blocks deletion. Process restart resets persisted
+runtime connection state to disconnected and does not claim a surviving tunnel.
+It only reconciles nonterminal reservations, writing
 their cancelled operation and idempotency response together. SSH success alone
 reports `core_not_started`, not an online Core.
 

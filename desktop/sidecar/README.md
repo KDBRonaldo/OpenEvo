@@ -52,6 +52,10 @@ terminal, its body and ETag are immutable; a late complete/fail call only return
 that terminal and may close the transport owned by its own stale result. Restart
 only cancels truly nonterminal reservations, updating their operation and
 idempotency documents in the same recovery transaction.
+Profile deletion checks for queued, running, or cancelling profile operations in
+the same write transaction as the delete, so even a non-displacing disconnect on
+an already-disconnected profile retains its resource authority through terminal
+publication. Terminal historical operations do not prevent later deletion.
 
 The production credential resolver currently supports `ssh_agent`. Profiles
 that select native private-key or password authentication fail closed with
