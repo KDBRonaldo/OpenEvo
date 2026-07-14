@@ -134,11 +134,30 @@ the separate remote-profile/SSH/active-project gate validates their production
 forwarding composition. A source `TestClient` or local fake capability catalog
 does not satisfy either gate.
 
-The exact Core wheel/lock export keeps the initially empty output directory open
-for the whole sidecar build and verifies its pathname/inode binding before and
-after writes. Failure injection must show that a replaced path receives no
-files, a partial copy is removed, and failure of the second member removes the
-first so the release job can retry from an empty directory.
+The exact Core wheel/lock export keeps the output directory open for the whole
+sidecar build and verifies its pathname/inode binding before and after writes.
+It stages under a private transaction directory, publishes without replacement,
+keeps every source/export descriptor open, and exits the output context last so
+a `TemporaryDirectory` cleanup failure rolls the pair back. Before success, the
+test gate requires an exact wheel/lock root inventory and rechecks each pathname,
+inode/device, regular-file type, link count, owner/mode, byte size, and SHA-256
+against the source and canonical lock.
+The wheel build fixes `SOURCE_DATE_EPOCH` to the trusted candidate commit time;
+reproducibility tests must build twice from the same source and compare exact
+wheel and generated lock bytes so a post-commit retry can recognize the pair.
+
+Failure injection covers partial copy, second-member failure, output-path
+replacement, exported-member unlink/rename/same-name replacement, and extra
+members. A real child-process crash after the wheel name is published but before
+the lock name is published must leave a bounded marker-authorized state that the
+next run reconciles and replaces with one complete pair. Rollback may remove only
+the inode it recorded. If a pathname contains an identity-mismatched replacement
+or an owned inode has an unbound residual link, cleanup reports an unverifiable
+rollback, preserves the unknown entry and transaction marker, and subsequent
+retries remain fail closed until a maintainer resolves that output directory.
+The same preservation rule applies to a `preparing` transaction containing a
+staged entry whose inode has not yet reached the ready marker; only empty and
+marker-only bootstrap remnants are automatically reclaimed before readiness.
 
 ## Release Identity
 

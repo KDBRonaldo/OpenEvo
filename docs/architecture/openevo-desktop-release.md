@@ -43,12 +43,27 @@ The repository currently provides:
   root to be the closed set of exactly one wheel and one lock, rejects additional
   and path-escaping members, rechecks both source digests, and reloads the
   extracted pair through the Core lock loader. Raw CArchive TOC multiplicity is
-  verified before accepting PyInstaller's parsed inventory, and
-  `--core-wheel-output-dir` exports the pair only to an empty path with no
-  symbolic-link component. The builder pins that
-  directory by an open no-follow descriptor and inode for the complete build,
-  writes through the descriptor, and rolls back every file it created if either
-  member or the final path binding cannot be verified;
+  verified before accepting PyInstaller's parsed inventory.
+  `--core-wheel-output-dir` exports the same pair
+  only to a path with no symbolic-link component that is empty or contains one
+  recognized recoverable transaction/exact pair. The builder pins that directory
+  by an open no-follow descriptor and inode for the complete build.
+  Core wheel construction fixes `SOURCE_DATE_EPOCH` to the trusted source commit
+  time so a retry can reproduce and recognize a fully committed pair.
+  It stages the pair under a private `0700` transaction directory whose bounded,
+  canonical marker records the output and transaction identities plus each
+  member's name, inode, size, and SHA-256. Publication uses no-replace hard links,
+  retains the source and destination descriptors, and commits only after the
+  temporary build tree has cleaned up and an exact root inventory revalidates
+  both regular, link-count-one, owner-only-written members against the source and
+  lock contract. A crash after the ready marker but before both names are
+  published leaves complete inode-bound recovery authority; the next build
+  removes only that exact transaction and retries. Empty or marker-only bootstrap
+  transactions are also bounded recovery states. Any inode-unbound staged entry,
+  unknown root entry, or identity-mismatched replacement is preserved and fails
+  closed. An empty marker-less transaction directory beside an exact complete
+  pair is the bounded crash state after marker removal and is removed before that
+  pair is accepted;
 - source-level frontend, sidecar, Rust, and package-inventory tests;
 - Linux and macOS CI jobs that build the actual PyInstaller externalBin and
   exercise it through the production Rust native-launch path;

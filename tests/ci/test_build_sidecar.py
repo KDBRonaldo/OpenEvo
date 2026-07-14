@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import struct
 import subprocess
+import sys
 from types import ModuleType
 from zipfile import ZipFile
 
@@ -30,6 +31,13 @@ def _write_core_wheel(path: Path, *, name: str = "openevo", version: str = "0.1.
             f"openevo-{version}.dist-info/METADATA",
             f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n",
         )
+
+
+def _write_export_inputs(builder: ModuleType, root: Path) -> tuple[Path, Path]:
+    wheel = root / "openevo-0.1.0-py3-none-any.whl"
+    wheel.write_bytes(b"wheel")
+    lock = builder._write_core_framework_lock(wheel, version="0.1.0")
+    return wheel, lock
 
 
 def _write_repo_skeleton(repo: Path) -> None:
@@ -133,6 +141,19 @@ def test_core_framework_lock_is_canonical_and_bound_to_exact_wheel(tmp_path: Pat
         ).model_dump(mode="json")
         == expected
     )
+
+
+def test_core_wheel_and_lock_build_are_reproducible(tmp_path: Path) -> None:
+    builder = _load_builder()
+    repo = Path.cwd()
+
+    first = builder._build_core_wheel(repo, tmp_path / "first")
+    second = builder._build_core_wheel(repo, tmp_path / "second")
+    first_lock = builder._core_framework_lock_bytes(first, version="0.1.0")
+    second_lock = builder._core_framework_lock_bytes(second, version="0.1.0")
+
+    assert first.read_bytes() == second.read_bytes()
+    assert first_lock == second_lock
 
 
 def test_validate_core_wheel_rejects_nested_wheel(tmp_path: Path) -> None:
@@ -333,7 +354,9 @@ def test_build_sidecar_uses_isolated_source_and_preserves_repository_outputs(
             assert Path(cwd) == repo / "desktop"
             commands.append("product-web")
         elif command[2] == "build":
+            env = kwargs.pop("env")
             assert not kwargs
+            assert env["SOURCE_DATE_EPOCH"] == str(builder._BUILD_SOURCE_DATE_EPOCH)
             commands.append("build")
             source = Path(cwd)
             assert source != repo
@@ -618,10 +641,7 @@ def test_core_release_export_stays_bound_to_original_output_directory(
     output = tmp_path / "output"
     redirected = tmp_path / "redirected"
     redirected.mkdir()
-    wheel = tmp_path / "openevo-0.1.0-py3-none-any.whl"
-    lock = tmp_path / "framework-lock.json"
-    wheel.write_bytes(b"wheel")
-    lock.write_bytes(b"lock")
+    wheel, lock = _write_export_inputs(builder, tmp_path)
 
     original = tmp_path / "original-output"
     with pytest.raises(RuntimeError, match="changed during the sidecar build"):
@@ -640,10 +660,7 @@ def test_core_release_export_removes_partial_file_after_copy_failure(
 ) -> None:
     builder = _load_builder()
     output = tmp_path / "output"
-    wheel = tmp_path / "openevo-0.1.0-py3-none-any.whl"
-    lock = tmp_path / "framework-lock.json"
-    wheel.write_bytes(b"wheel")
-    lock.write_bytes(b"lock")
+    wheel, lock = _write_export_inputs(builder, tmp_path)
 
     def fail_after_partial_copy(source, destination) -> None:
         del source
@@ -653,8 +670,8 @@ def test_core_release_export_removes_partial_file_after_copy_failure(
 
     monkeypatch.setattr(builder.shutil, "copyfileobj", fail_after_partial_copy)
 
-    with builder._open_core_release_output(output) as authority:
-        with pytest.raises(OSError, match="injected copy failure"):
+    with pytest.raises(OSError, match="injected copy failure"):
+        with builder._open_core_release_output(output) as authority:
             builder._export_core_release_inputs(authority, wheel, lock)
 
     assert list(output.iterdir()) == []
@@ -666,21 +683,18 @@ def test_core_release_export_rolls_back_wheel_when_lock_copy_fails(
 ) -> None:
     builder = _load_builder()
     output = tmp_path / "output"
-    wheel = tmp_path / "openevo-0.1.0-py3-none-any.whl"
-    lock = tmp_path / "framework-lock.json"
-    wheel.write_bytes(b"wheel")
-    lock.write_bytes(b"lock")
-    original_copy = builder._copy_exclusive
+    wheel, lock = _write_export_inputs(builder, tmp_path)
+    original_copy = builder._copy_core_release_member
 
-    def fail_lock(source, authority, name):
-        if name == builder.CORE_FRAMEWORK_LOCK_BASENAME:
+    def fail_lock(authority, source):
+        if source.name == builder.CORE_FRAMEWORK_LOCK_BASENAME:
             raise OSError("injected lock copy failure")
-        return original_copy(source, authority, name)
+        return original_copy(authority, source)
 
-    monkeypatch.setattr(builder, "_copy_exclusive", fail_lock)
+    monkeypatch.setattr(builder, "_copy_core_release_member", fail_lock)
 
-    with builder._open_core_release_output(output) as authority:
-        with pytest.raises(OSError, match="injected lock copy failure"):
+    with pytest.raises(OSError, match="injected lock copy failure"):
+        with builder._open_core_release_output(output) as authority:
             builder._export_core_release_inputs(authority, wheel, lock)
 
     assert list(output.iterdir()) == []
@@ -691,10 +705,7 @@ def test_core_release_output_rolls_back_pair_when_later_build_step_fails(
 ) -> None:
     builder = _load_builder()
     output = tmp_path / "output"
-    wheel = tmp_path / "openevo-0.1.0-py3-none-any.whl"
-    lock = tmp_path / "framework-lock.json"
-    wheel.write_bytes(b"wheel")
-    lock.write_bytes(b"lock")
+    wheel, lock = _write_export_inputs(builder, tmp_path)
 
     with pytest.raises(OSError, match="injected later build failure"):
         with builder._open_core_release_output(output) as authority:
@@ -711,10 +722,7 @@ def test_core_release_output_rolls_back_pair_when_path_changes_after_export(
     output = tmp_path / "output"
     redirected = tmp_path / "redirected"
     redirected.mkdir()
-    wheel = tmp_path / "openevo-0.1.0-py3-none-any.whl"
-    lock = tmp_path / "framework-lock.json"
-    wheel.write_bytes(b"wheel")
-    lock.write_bytes(b"lock")
+    wheel, lock = _write_export_inputs(builder, tmp_path)
     original = tmp_path / "original-output"
 
     with pytest.raises(RuntimeError, match="changed during the sidecar build"):
@@ -725,6 +733,270 @@ def test_core_release_output_rolls_back_pair_when_path_changes_after_export(
 
     assert list(original.iterdir()) == []
     assert list(redirected.iterdir()) == []
+
+
+def test_core_release_commit_verifies_exact_member_contract(tmp_path: Path) -> None:
+    builder = _load_builder()
+    output = tmp_path / "output"
+    wheel, lock = _write_export_inputs(builder, tmp_path)
+
+    with builder._open_core_release_output(output) as authority:
+        builder._export_core_release_inputs(authority, wheel, lock)
+
+    assert sorted(path.name for path in output.iterdir()) == sorted(
+        (wheel.name, builder.CORE_FRAMEWORK_LOCK_BASENAME)
+    )
+    for source, exported in ((wheel, output / wheel.name), (lock, output / lock.name)):
+        descriptor = exported.stat()
+        assert descriptor.st_nlink == 1
+        assert descriptor.st_uid == os.geteuid()
+        assert descriptor.st_mode & 0o777 == 0o644
+        assert exported.read_bytes() == source.read_bytes()
+        assert hashlib.sha256(exported.read_bytes()).digest() == hashlib.sha256(
+            source.read_bytes()
+        ).digest()
+
+
+@pytest.mark.parametrize("fault", ["unlink", "rename", "extra"])
+def test_core_release_member_path_faults_fail_before_commit_and_roll_back(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fault: str,
+) -> None:
+    builder = _load_builder()
+    output = tmp_path / "output"
+    wheel, lock = _write_export_inputs(builder, tmp_path)
+    injected = False
+
+    def fault_after_wheel(authority, member) -> None:
+        nonlocal injected
+        if injected or member.source.name != wheel.name:
+            return
+        injected = True
+        if fault == "unlink":
+            os.unlink(wheel.name, dir_fd=authority.directory_fd)
+        elif fault == "rename":
+            os.rename(
+                wheel.name,
+                "renamed-wheel.whl",
+                src_dir_fd=authority.directory_fd,
+                dst_dir_fd=authority.directory_fd,
+            )
+        else:
+            extra_fd = os.open(
+                "unexpected.txt",
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+                dir_fd=authority.directory_fd,
+            )
+            os.close(extra_fd)
+
+    monkeypatch.setattr(builder, "_after_core_release_member_published", fault_after_wheel)
+
+    expected = "rollback could not be verified" if fault == "extra" else "inventory changed"
+    with pytest.raises(RuntimeError, match=expected):
+        with builder._open_core_release_output(output) as authority:
+            builder._export_core_release_inputs(authority, wheel, lock)
+
+    if fault == "extra":
+        assert (output / "unexpected.txt").read_bytes() == b""
+        assert len(list(output.glob(".openevo-core-release-*"))) == 1
+    else:
+        assert list(output.iterdir()) == []
+
+
+def test_core_release_same_name_replacement_is_preserved_and_blocks_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builder = _load_builder()
+    output = tmp_path / "output"
+    wheel, lock = _write_export_inputs(builder, tmp_path)
+    replacement = b"unowned replacement"
+    injected = False
+
+    def replace_after_wheel(authority, member) -> None:
+        nonlocal injected
+        if injected or member.source.name != wheel.name:
+            return
+        injected = True
+        os.unlink(wheel.name, dir_fd=authority.directory_fd)
+        replacement_fd = os.open(
+            wheel.name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o644,
+            dir_fd=authority.directory_fd,
+        )
+        try:
+            os.write(replacement_fd, replacement)
+            os.fsync(replacement_fd)
+        finally:
+            os.close(replacement_fd)
+
+    monkeypatch.setattr(builder, "_after_core_release_member_published", replace_after_wheel)
+
+    with pytest.raises(RuntimeError, match="rollback could not be verified"):
+        with builder._open_core_release_output(output) as authority:
+            builder._export_core_release_inputs(authority, wheel, lock)
+
+    assert (output / wheel.name).read_bytes() == replacement
+    assert len(list(output.glob(".openevo-core-release-*"))) == 1
+
+    with pytest.raises(RuntimeError, match="identity or permissions changed|content changed"):
+        with builder._open_core_release_output(output) as authority:
+            builder._export_core_release_inputs(authority, wheel, lock)
+
+    assert (output / wheel.name).read_bytes() == replacement
+    assert len(list(output.glob(".openevo-core-release-*"))) == 1
+
+
+def test_core_release_crash_between_names_is_reconciled_on_retry(tmp_path: Path) -> None:
+    builder_path = Path("desktop/packaging/build_sidecar.py").resolve()
+    builder = _load_builder()
+    output = tmp_path / "output"
+    wheel, lock = _write_export_inputs(builder, tmp_path)
+    script = f"""
+import importlib.util
+import os
+from pathlib import Path
+
+spec = importlib.util.spec_from_file_location("crash_build_sidecar", {str(builder_path)!r})
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+
+def crash_after_first_member(authority, member):
+    del authority, member
+    os._exit(73)
+
+module._after_core_release_member_published = crash_after_first_member
+with module._open_core_release_output(Path({str(output)!r})) as authority:
+    module._export_core_release_inputs(
+        authority,
+        Path({str(wheel)!r}),
+        Path({str(lock)!r}),
+    )
+"""
+
+    crashed = subprocess.run([sys.executable, "-c", script], check=False)
+
+    assert crashed.returncode == 73
+    assert (output / wheel.name).read_bytes() == wheel.read_bytes()
+    assert not (output / lock.name).exists()
+    assert len(list(output.glob(".openevo-core-release-*"))) == 1
+
+    with builder._open_core_release_output(output) as authority:
+        builder._export_core_release_inputs(authority, wheel, lock)
+
+    assert sorted(path.name for path in output.iterdir()) == sorted((wheel.name, lock.name))
+    assert (output / wheel.name).read_bytes() == wheel.read_bytes()
+    assert (output / lock.name).read_bytes() == lock.read_bytes()
+
+
+@pytest.mark.parametrize("marker_payload", [None, b'{"schema_version":'])
+def test_core_release_bootstrap_crash_is_reconciled_before_publication(
+    tmp_path: Path,
+    marker_payload: bytes | None,
+) -> None:
+    builder = _load_builder()
+    output = tmp_path / "output"
+    output.mkdir()
+    transaction = output / f".openevo-core-release-{'a' * 32}"
+    transaction.mkdir(mode=0o700)
+    if marker_payload is not None:
+        marker = transaction / builder.CORE_RELEASE_TRANSACTION_MARKER
+        marker.write_bytes(marker_payload)
+        marker.chmod(0o600)
+    wheel, lock = _write_export_inputs(builder, tmp_path)
+
+    with builder._open_core_release_output(output) as authority:
+        builder._export_core_release_inputs(authority, wheel, lock)
+
+    assert sorted(path.name for path in output.iterdir()) == sorted((wheel.name, lock.name))
+
+
+def test_preparing_recovery_preserves_inode_unbound_staged_member(tmp_path: Path) -> None:
+    builder = _load_builder()
+    output = tmp_path / "output"
+    output.mkdir()
+    transaction = output / f".openevo-core-release-{'b' * 32}"
+    transaction.mkdir(mode=0o700)
+    wheel, lock = _write_export_inputs(builder, tmp_path)
+    marker_payload = {
+        "schema_version": "1",
+        "phase": "preparing",
+        "output_device": output.stat().st_dev,
+        "output_inode": output.stat().st_ino,
+        "transaction_device": transaction.stat().st_dev,
+        "transaction_inode": transaction.stat().st_ino,
+        "members": [
+            {
+                "name": source.name,
+                "byte_size": source.stat().st_size,
+                "sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+            }
+            for source in (wheel, lock)
+        ],
+    }
+    marker = transaction / builder.CORE_RELEASE_TRANSACTION_MARKER
+    marker.write_bytes(
+        (json.dumps(marker_payload, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    )
+    marker.chmod(0o600)
+    staged = transaction / wheel.name
+    staged.write_bytes(b"partial staged bytes")
+    staged.chmod(0o600)
+
+    with pytest.raises(RuntimeError, match="inode-unbound entry"):
+        with builder._open_core_release_output(output) as authority:
+            builder._export_core_release_inputs(authority, wheel, lock)
+
+    assert staged.read_bytes() == b"partial staged bytes"
+    assert marker.exists()
+
+
+def test_temporary_directory_cleanup_failure_rolls_back_release_pair(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builder = _load_builder()
+    repo = tmp_path / "repo"
+    _write_repo_skeleton(repo)
+    output = tmp_path / "output"
+
+    class FailingTemporaryDirectory(builder.TemporaryDirectory):
+        def __exit__(self, exc_type, exc_value, traceback):
+            super().__exit__(exc_type, exc_value, traceback)
+            raise OSError("injected TemporaryDirectory cleanup failure")
+
+    def fake_core_wheel(_repo: Path, build_root: Path) -> Path:
+        wheel = build_root / "openevo-0.1.0-py3-none-any.whl"
+        wheel.parent.mkdir(parents=True)
+        wheel.write_bytes(b"wheel")
+        return wheel
+
+    def fake_pyinstaller(command, **kwargs):
+        del kwargs
+        dist = Path(command[command.index("--distpath") + 1])
+        dist.mkdir(parents=True, exist_ok=True)
+        (dist / builder.SIDECAR_NAME).write_bytes(b"sidecar")
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(builder, "TemporaryDirectory", FailingTemporaryDirectory)
+    monkeypatch.setattr(builder, "_repo_root", lambda: repo)
+    monkeypatch.setattr(builder, "_target_triple", lambda: "test-target")
+    monkeypatch.setattr(builder, "_build_core_wheel", fake_core_wheel)
+    monkeypatch.setattr(builder, "_build_product_web", lambda _: "0" * 64)
+    monkeypatch.setattr(builder, "_prepare_fd_bound_pyinstaller", lambda *args: Path(args[1]))
+    monkeypatch.setattr(builder.subprocess, "run", fake_pyinstaller)
+    monkeypatch.setattr(builder, "_validate_fd_bound_bootloader", lambda _: None)
+    monkeypatch.setattr(builder, "_validate_embedded_core_wheel", lambda *_: None)
+    monkeypatch.setattr(builder, "_validate_embedded_core_framework_lock", lambda *args, **kwargs: None)
+    monkeypatch.setattr(builder, "_validate_embedded_product_web", lambda *args: None)
+
+    with pytest.raises(OSError, match="TemporaryDirectory cleanup failure"):
+        builder.build_sidecar(clean=True, core_wheel_output_dir=output)
+
+    assert list(output.iterdir()) == []
 
 
 @pytest.mark.parametrize(
