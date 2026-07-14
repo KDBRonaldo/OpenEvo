@@ -646,8 +646,5 @@ Any proposal to change the protected OpenEvo architecture or evolution
 algorithm is a separate research/architecture decision outside this goal and
 must not be bundled into release cleanup.
 
-Implementation work follows `implementation-plan.md`, issues #131 and #154, and the
-repository process in `AGENTS.md`. Each substantial PR records focused tests,
-docs impact, and whether protected evolution behavior can be affected. Fresh
-independent reviews use `gpt-5.6-sol` with high reasoning at workstream and
-release boundaries.
+Implementation work follows `implementation-plan.md`, issues #131 and #154, and `AGENTS.md`. Each substantial PR records focused tests, docs impact, and whether protected evolution behavior can be affected.
+Fresh independent reviews use `gpt-5.6-sol` with high reasoning at workstream and release boundaries.
