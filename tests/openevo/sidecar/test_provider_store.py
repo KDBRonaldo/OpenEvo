@@ -11,11 +11,13 @@ import subprocess
 import sys
 import threading
 import time
+from typing import Literal, cast
 
 import pytest
 
 import desktop.sidecar.provider_store as provider_store_module
 from desktop.sidecar.contracts.v1.models import (
+    ApiErrorV1,
     ConnectionOperationResultV1,
     CredentialSlotStatusV1,
     LocalOperationV1,
@@ -23,6 +25,7 @@ from desktop.sidecar.contracts.v1.models import (
     ProjectOperationResultV1,
     ProjectPatchV1,
     RemoteProfilePatchV1,
+    RemoteProfileV1,
     ResourceRefV1,
 )
 from desktop.sidecar.provider_store import (
@@ -40,6 +43,7 @@ from desktop.sidecar.provider_store import (
     ResourceInUseError,
     ResourceNotFoundError,
 )
+from openevo.backend.contracts.v1.models import ErrorCategory, ErrorSeverity, RepairAction
 
 
 class MutableClock:
@@ -726,7 +730,7 @@ def test_idempotent_action_state_change_is_atomic_replayed_and_blocks_delete(
         store.delete_project(project.project_id, if_match=active.etag)
 
 
-def test_profile_runtime_state_is_closed_and_recovered_on_restart(
+def test_profile_runtime_state_resets_but_terminal_replay_is_frozen_on_restart(
     tmp_path: Path,
 ) -> None:
     root = tmp_path / "state"
@@ -789,15 +793,356 @@ def test_profile_runtime_state_is_closed_and_recovered_on_restart(
     )
     replayed_operation = LocalOperationV1.model_validate_json(replay.response_bytes)
     assert replay.replayed is True
-    assert replay.response_bytes != first.response_bytes
-    assert replayed_operation.state == "cancelled"
+    assert replay.response_bytes == first.response_bytes
+    assert replayed_operation.state == "succeeded"
     assert replayed_operation.result == ConnectionOperationResultV1(
         profile_id=profile.profile_id,
-        connection_state="disconnected",
+        connection_state="connected",
     )
 
 
-def test_deleted_profile_action_replay_cannot_return_connected(tmp_path: Path) -> None:
+def test_nonterminal_profile_reservation_is_cancelled_exactly_once_on_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "state"
+    store = DesktopProviderStore(root)
+    profile = _create_profile(store)
+    action = {
+        "route": f"/desktop/v1/profiles/{profile.profile_id}/connect",
+        "operation_kind": "profile_connect",
+        "profile_id": profile.profile_id,
+        "key": "profile-crash-connect-0001",
+        "body": {},
+        "if_match": profile.etag,
+        "displace_existing": True,
+    }
+    reservation = store.begin_profile_runtime_action(**action)
+    assert reservation.operation.state == "running"
+    assert store.get_profile(profile.profile_id).connection_state == "connecting"
+    _, used_bytes = store._recovery_usage(store._connection)
+    monkeypatch.setattr(
+        provider_store_module,
+        "MAX_RECOVERY_BYTES",
+        used_bytes + provider_store_module.PROFILE_RUNTIME_TERMINAL_RESERVATION_BYTES,
+    )
+    store.close()
+
+    reopened = DesktopProviderStore(root)
+    recovered = reopened.begin_profile_runtime_action(**action)
+    assert recovered.replayed is True
+    assert recovered.operation.state == "cancelled"
+    assert recovered.operation.result == ConnectionOperationResultV1(
+        profile_id=profile.profile_id,
+        connection_state="disconnected",
+    )
+    frozen = provider_store_module._canonical_json_bytes(
+        recovered.operation.model_dump(mode="json")
+    )
+    persisted = reopened._connection.execute(
+        "SELECT response_bytes FROM idempotency_records WHERE idempotency_key = ?",
+        (action["key"],),
+    ).fetchone()
+    assert persisted is not None and bytes(persisted[0]) == frozen
+    recovered_etag = recovered.operation.etag
+    late_success = reopened.complete_profile_runtime_action(
+        reservation=reservation,
+        route=cast(str, action["route"]),
+        profile_id=profile.profile_id,
+        key=cast(str, action["key"]),
+        body={},
+        if_match=profile.etag,
+        connection_state="connected",
+        host_key_fingerprint="SHA256:late-success-must-not-publish",
+    )
+    late_error = ApiErrorV1(
+        request_id=reservation.operation.operation_id,
+        code="connection_operation_superseded",
+        http_status=409,
+        message="A newer connection action replaced this SSH operation.",
+        severity=ErrorSeverity.BLOCKING,
+        category=ErrorCategory.AUTHENTICATION,
+        retryable=True,
+        repair_action=RepairAction.OPENEVO_CAN_RETRY,
+        next_action="Reload the connection state before retrying.",
+    )
+    late_failure = reopened.fail_profile_runtime_action(
+        reservation=reservation,
+        route=cast(str, action["route"]),
+        profile_id=profile.profile_id,
+        key=cast(str, action["key"]),
+        body={},
+        if_match=profile.etag,
+        error=late_error,
+    )
+    assert late_success == recovered.operation
+    assert late_failure == recovered.operation
+    assert reopened.get_profile(profile.profile_id).connection_state == "disconnected"
+    assert bytes(
+        reopened._connection.execute(
+            "SELECT response_bytes FROM idempotency_records WHERE idempotency_key = ?",
+            (action["key"],),
+        ).fetchone()[0]
+    ) == frozen
+    reopened.close()
+
+    reopened_again = DesktopProviderStore(root)
+    replay = reopened_again.begin_profile_runtime_action(**action)
+    assert replay.replayed is True
+    assert provider_store_module._canonical_json_bytes(
+        replay.operation.model_dump(mode="json")
+    ) == frozen
+    assert replay.operation.etag == recovered_etag
+
+
+@pytest.mark.parametrize("state", ["queued", "running", "cancelling"])
+def test_nonterminal_profile_runtime_operation_blocks_delete(
+    tmp_path: Path,
+    state: Literal["queued", "running", "cancelling"],
+) -> None:
+    store = DesktopProviderStore(tmp_path / "state")
+    profile = _create_profile(store)
+    with store._transaction(write=True) as connection:
+        ProviderMutation(store, connection).create_local_operation(
+            operation_kind="profile_disconnect",
+            resource=ResourceRefV1(resource_type="profile", resource_id=profile.profile_id),
+            state=state,
+        )
+
+    with pytest.raises(ResourceInUseError):
+        store.delete_profile(profile.profile_id, if_match=profile.etag)
+
+    assert store.get_profile(profile.profile_id) == profile
+
+
+def test_disconnected_profile_disconnect_reservation_blocks_delete_until_terminal(
+    tmp_path: Path,
+) -> None:
+    store = DesktopProviderStore(tmp_path / "state")
+    profile = _create_profile(store)
+    action = {
+        "route": f"/desktop/v1/profiles/{profile.profile_id}/disconnect",
+        "operation_kind": "profile_disconnect",
+        "profile_id": profile.profile_id,
+        "key": "profile-disconnect-delete-guard",
+        "body": {},
+        "if_match": profile.etag,
+        "displace_existing": False,
+    }
+    reservation = store.begin_profile_runtime_action(**action)
+    assert reservation.operation.state == "running"
+    assert store.get_profile(profile.profile_id).connection_state == "disconnected"
+
+    with pytest.raises(ResourceInUseError):
+        store.delete_profile(profile.profile_id, if_match=profile.etag)
+
+    completed = store.complete_profile_runtime_action(
+        reservation=reservation,
+        route=cast(str, action["route"]),
+        profile_id=profile.profile_id,
+        key=cast(str, action["key"]),
+        body={},
+        if_match=profile.etag,
+        connection_state="disconnected",
+        host_key_fingerprint=None,
+    )
+    replay = store.begin_profile_runtime_action(**action)
+
+    assert completed.state == "succeeded"
+    assert replay.replayed is True
+    assert replay.operation == completed
+    terminal_profile = store.get_profile(profile.profile_id)
+    store.delete_profile(profile.profile_id, if_match=terminal_profile.etag)
+    with pytest.raises(ResourceNotFoundError):
+        store.get_profile(profile.profile_id)
+    replay_after_delete = store.begin_profile_runtime_action(**action)
+    assert replay_after_delete.replayed is True
+    assert replay_after_delete.operation == completed
+
+
+def test_profile_reservation_fails_before_ssh_when_terminal_slots_do_not_fit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = DesktopProviderStore(tmp_path / "state")
+    profile = _create_profile(store)
+    before_profile = store.get_profile(profile.profile_id)
+    before_operations = cast(
+        int, store._connection.execute("SELECT count(*) FROM local_operations").fetchone()[0]
+    )
+    before_idempotency = cast(
+        int, store._connection.execute("SELECT count(*) FROM idempotency_records").fetchone()[0]
+    )
+    _, used_bytes = store._recovery_usage(store._connection)
+    monkeypatch.setattr(
+        provider_store_module,
+        "MAX_RECOVERY_BYTES",
+        used_bytes + provider_store_module.PROFILE_RUNTIME_TERMINAL_RESERVATION_BYTES,
+    )
+
+    with pytest.raises(ProviderDataCorruptionError, match="recovery budget exceeded"):
+        store.begin_profile_runtime_action(
+            route=f"/desktop/v1/profiles/{profile.profile_id}/connect",
+            operation_kind="profile_connect",
+            profile_id=profile.profile_id,
+            key="profile-no-terminal-capacity",
+            body={},
+            if_match=profile.etag,
+            displace_existing=True,
+        )
+
+    assert store.get_profile(profile.profile_id) == before_profile
+    assert store._connection.execute("SELECT count(*) FROM local_operations").fetchone()[0] == (
+        before_operations
+    )
+    assert store._connection.execute("SELECT count(*) FROM idempotency_records").fetchone()[0] == (
+        before_idempotency
+    )
+
+
+def test_profile_failure_finalizes_inside_reserved_terminal_slots(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = DesktopProviderStore(tmp_path / "state")
+    profile = _create_profile(store)
+    action = {
+        "route": f"/desktop/v1/profiles/{profile.profile_id}/connect",
+        "operation_kind": "profile_connect",
+        "profile_id": profile.profile_id,
+        "key": "profile-capacity-failure",
+        "body": {},
+        "if_match": profile.etag,
+        "displace_existing": True,
+    }
+    reservation = store.begin_profile_runtime_action(**action)
+    _, used_bytes = store._recovery_usage(store._connection)
+    monkeypatch.setattr(
+        provider_store_module,
+        "MAX_RECOVERY_BYTES",
+        used_bytes + provider_store_module.PROFILE_RUNTIME_TERMINAL_RESERVATION_BYTES,
+    )
+    error = ApiErrorV1(
+        request_id=reservation.operation.operation_id,
+        code="ssh_connection_failed",
+        http_status=503,
+        message="OpenEvo Desktop could not establish the SSH connection.",
+        severity=ErrorSeverity.BLOCKING,
+        category=ErrorCategory.AUTHENTICATION,
+        retryable=True,
+        repair_action=RepairAction.OPENEVO_CAN_RETRY,
+        next_action="Check the server and SSH settings, then retry.",
+    )
+
+    failed = store.fail_profile_runtime_action(
+        reservation=reservation,
+        route=cast(str, action["route"]),
+        profile_id=profile.profile_id,
+        key=cast(str, action["key"]),
+        body={},
+        if_match=profile.etag,
+        error=error,
+    )
+
+    assert failed.state == "failed"
+    assert failed.error == error
+    assert store.get_profile(profile.profile_id).connection_state == "disconnected"
+    replay = store.begin_profile_runtime_action(**action)
+    assert replay.replayed is True
+    assert replay.operation == failed
+
+
+def test_connecting_second_profile_atomically_displaces_first_profile(
+    tmp_path: Path,
+) -> None:
+    store = DesktopProviderStore(tmp_path / "state")
+    first = _create_profile(store, name="First", key="profile-create-first")
+    second = _create_profile(store, name="Second", key="profile-create-second")
+
+    def connect(profile: RemoteProfileV1, key: str) -> LocalOperationV1:
+        def mutation(transaction: ProviderMutation):
+            updated = transaction.set_profile_runtime_state(
+                profile.profile_id,
+                if_match=profile.etag,
+                connection_state="connected",
+                credential_slots=(),
+                host_key_fingerprint="SHA256:verified",
+            )
+            return 202, transaction.create_local_operation(
+                operation_kind="profile_connect",
+                resource=ResourceRefV1(resource_type="profile", resource_id=profile.profile_id),
+                state="succeeded",
+                result=ConnectionOperationResultV1(
+                    profile_id=profile.profile_id,
+                    connection_state=updated.connection_state,
+                ),
+            )
+
+        result = store.execute_idempotent_action(
+            route=f"/desktop/v1/profiles/{profile.profile_id}/connect",
+            resource_scope=profile.profile_id,
+            key=key,
+            body={},
+            if_match=profile.etag,
+            semantic_headers={},
+            response_model=LocalOperationV1,
+            mutation=mutation,
+        )
+        return LocalOperationV1.model_validate_json(result.response_bytes)
+
+    first_operation = connect(first, "profile-connect-first")
+    second_operation = connect(second, "profile-connect-second")
+
+    assert store.get_profile(first.profile_id).connection_state == "disconnected"
+    assert store.get_profile(second.profile_id).connection_state == "connected"
+    displaced = store.get_local_operation(first_operation.operation_id)
+    assert displaced.state == "succeeded"
+    assert displaced.result == ConnectionOperationResultV1(
+        profile_id=first.profile_id,
+        connection_state="connected",
+    )
+    assert store.get_local_operation(second_operation.operation_id) == second_operation
+
+
+def test_startup_discards_unconfirmed_host_key_fingerprint(tmp_path: Path) -> None:
+    root = tmp_path / "state"
+    store = DesktopProviderStore(root)
+    profile = _create_profile(store)
+
+    def review(transaction: ProviderMutation):
+        reviewed = transaction.set_profile_runtime_state(
+            profile.profile_id,
+            if_match=profile.etag,
+            connection_state="host_key_required",
+            credential_slots=(),
+            host_key_fingerprint="SHA256:unconfirmed-candidate",
+        )
+        return 202, transaction.create_local_operation(
+            operation_kind="profile_connect",
+            resource=ResourceRefV1(resource_type="profile", resource_id=profile.profile_id),
+            state="succeeded",
+            result=ConnectionOperationResultV1(
+                profile_id=profile.profile_id,
+                connection_state=reviewed.connection_state,
+            ),
+        )
+
+    store.execute_idempotent_action(
+        route=f"/desktop/v1/profiles/{profile.profile_id}/connect",
+        resource_scope=profile.profile_id,
+        key="profile-review-unconfirmed",
+        body={},
+        if_match=profile.etag,
+        semantic_headers={},
+        response_model=LocalOperationV1,
+        mutation=review,
+    )
+    store.close()
+
+    reopened = DesktopProviderStore(root)
+    recovered = reopened.get_profile(profile.profile_id)
+    assert recovered.connection_state == "disconnected"
+    assert recovered.host_key_fingerprint is None
+
+
+def test_deleted_profile_keeps_historical_terminal_action_replay_frozen(tmp_path: Path) -> None:
     root = tmp_path / "state"
     store = DesktopProviderStore(root)
     profile = _create_profile(store)
@@ -852,10 +1197,10 @@ def test_deleted_profile_action_replay_cannot_return_connected(tmp_path: Path) -
         }
     )
     operation = LocalOperationV1.model_validate_json(replay.response_bytes)
-    assert operation.state == "cancelled"
+    assert operation.state == "succeeded"
     assert operation.result == ConnectionOperationResultV1(
         profile_id=profile.profile_id,
-        connection_state="disconnected",
+        connection_state="connected",
     )
 
 

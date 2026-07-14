@@ -218,6 +218,17 @@ failures preserve the cache and cannot cause a blind restart loop. Long-lived
 SSE uses the separate `fetchEventSource` path and is not subject to the ordinary
 request timeout.
 
+Release SSH profile actions reserve three seconds of that renderer deadline for
+HTTP and response handling. Credential resolution, trust-store load/probe and
+confirmation, transport construction, and the trusted SSH connectivity check
+share one 12-second monotonic deadline rather than receiving independent
+timeouts. Connection ownership is generation-bound: replacing A with B first
+persists A as disconnected, cancels A's obsolete local operation, and closes its
+transport before B's synchronous credential or trust parsing can fail.
+Unconfirmed host-key candidates are process-only review data and are never a
+verified profile fingerprint. Connect, host-key accept, and disconnect return
+the frozen operation ETag in the response header as well as the body.
+
 Before `start_sidecar` reuses a managed process that is still alive, native code
 repeats the authenticated and unauthenticated session probes using the retained
 credential. A failed probe marks the old process cleanup-pending, performs the
@@ -350,9 +361,56 @@ does not infer it from environment variables or Git, and release startup rejects
 an all-zero placeholder. Development and test apps must inject their source
 commit and non-release channel explicitly. There is no direct-backend fallback.
 
-This phase does not implement a macOS Keychain secret broker. In particular,
-`password_ref` and `passphrase_ref` cannot yet be resolved for SSH operations,
-and the native command surface exposes no placeholder Keychain operation. These
+The release sidecar now owns the initial SSH lifecycle behind the frozen Local
+API profile routes. A connect action atomically validates its idempotency
+envelope and profile ETag, reserves live idempotency capacity plus fixed-size
+terminal slots for both persisted response copies, publishes the profile as the
+current `connecting` owner, and creates a running local operation before
+external work. A process-wide action lock spans that entire sequence, including
+the SSH call and terminal publication, for all profiles and idempotency keys; the
+provider reservation order therefore cannot diverge from lifecycle invocation
+order. The action then either loads an exact profile/host/port/fingerprint trust
+binding or performs a non-mutating `ssh-keyscan`. A new key is returned only as
+an explicit `host_key_review` state. Acceptance repeats the probe, requires the
+same algorithm and fingerprint, publishes the private known-host binding, and
+runs a bounded SSH connectivity check. Success, failure, and crash cancellation
+update the reserved profile, operation, and idempotency response in one
+transaction, so concurrent capacity consumption and the request's now-stale
+ETag cannot break finalization.
+Disconnect reservations are non-displacing and do not publish `connecting`; the
+sidecar checks the process lifecycle owner before invoking disconnect, so a
+request for profile B cannot rewrite profile A or close A's transport. A
+pre-commit completion error leaves the nonterminal reservation and its terminal
+capacity intact until the same finalizer transaction publishes failure. A
+commit-return error instead observes the persisted terminal first: committed
+success remains success and keeps its transport, even if concurrent CRUD fills
+the now-released budget. Failure finalization uses the same exact reservation,
+request digest, profile, and operation identity for a read-only observation after
+any commit-return error. An observed terminal is authoritative; an observed
+`running` state is retried once and is never inferred to have committed. After a
+terminal failure is durable, transport cleanup runs only when the current durable
+profile remains disconnected and the process lifecycle still names that same
+profile as owner. Exact failed replay repeats that owner-checked cleanup, repairing
+a prior cleanup interruption without repeating SSH work or disconnecting a newer
+owner. Every persisted terminal body and ETag is permanently frozen; late
+complete/fail calls return it unchanged and only close a transport still owned by
+their own stale result. The failed operation embeds the exact API error used by
+later replays. Profile deletion atomically rejects any queued, running, or
+cancelling profile operation, including a disconnect reservation that deliberately
+leaves an already-disconnected profile state unchanged. Once that operation is
+terminal and its owned transport is closed, its historical record no longer
+blocks deletion. Process restart resets persisted runtime connection state to
+disconnected and does not claim a surviving tunnel. It only reconciles
+nonterminal reservations, writing
+their cancelled operation and idempotency response together. SSH success alone
+reports `core_not_started`, not an online Core.
+
+This phase does not implement a macOS Keychain secret broker. The production
+resolver therefore supports `ssh_agent` only; native private-key and password
+profiles fail closed with a typed credential-unavailable response. Secret
+material, local key paths, raw SSH commands, and trust-store paths never enter
+the Local API models, idempotency envelope, error response, or renderer state.
+The native command surface exposes no placeholder Keychain operation. These
 native-host changes and Linux/macOS externalBin combination smokes do not prove
 code signing, notarization, closure of the same-UID pathname TOCTOU described
 above, mounted/copied macOS application launch, first-run
