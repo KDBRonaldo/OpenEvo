@@ -485,6 +485,15 @@ class NetworkProxyV1(StrictModel):
     https_url: ShortText | None = None
     no_proxy: tuple[ShortText, ...] = ()
 
+    @field_validator("no_proxy", mode="before")
+    @classmethod
+    def _normalize_no_proxy_json_array(cls, value: Any) -> tuple[Any, ...]:
+        if isinstance(value, tuple):
+            return value
+        if isinstance(value, list):
+            return tuple(value)
+        raise ValueError("no_proxy must be a JSON array")
+
     @field_validator("http_url", "https_url")
     @classmethod
     def _safe_proxy_url(cls, value: str | None) -> str | None:

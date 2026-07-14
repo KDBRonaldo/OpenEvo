@@ -283,6 +283,7 @@ describe("Desktop Local API v1 client", () => {
     await expect(
       client.createProfile(profileCreateInput(), { idempotencyKey: "profile-create-fixture" }),
     ).resolves.toMatchObject({ profile_id: CONTRACT_FIXTURE_V1.profile.profile_id });
+    expect(JSON.parse(String(fetchMock.mock.calls[0][1]?.body)).proxy.no_proxy).toEqual(["localhost"]);
     await expect(
       client.createRun(runCreateInput(), {
         idempotencyKey: "run-create-fixture",

@@ -812,6 +812,13 @@ behind this interface while keeping the decorators and signatures in
 Provider and request-validation failures are normalized by `release_app.py`.
 Error responses must remain user-safe: do not include local paths, SQLite
 messages, credentials, session tokens, remote commands, or backend URLs.
+Ordered request collections use JSON arrays on the Local API wire. Where a
+closed sidecar model retains an immutable tuple, its request validator accepts
+only an actual decoded list (or an already typed tuple for internal calls), then
+validates the existing item bounds and patterns. It does not coerce strings,
+mappings, scalars, or unrelated containers. This applies to
+`NetworkProxyV1.no_proxy` for profile create and patch requests; tuple responses
+continue to serialize as JSON arrays.
 
 ## Desktop Local event broker
 
