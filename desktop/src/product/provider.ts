@@ -7,6 +7,7 @@ import type {
   DiagnosticReportV1,
   HostKeyAcceptV1,
   LocalOperationV1,
+  LogEntryV1,
   OperationV1,
   ProfileCreateV1,
   ProfilePatchV1,
@@ -145,6 +146,7 @@ export interface DesktopProductProvider {
   selectProjectSource(intent: ProjectSourceSelectionIntent): Promise<ProjectSourceV1>;
   startRun(intent: ProductRunIntent): Promise<RunV1>;
   cancelRun(runId: string, intent: ProductResourceMutationIntent): Promise<RunV1>;
+  getRunLogs(runId: string): Promise<readonly LogEntryV1[]>;
   getArtifactContent(artifactId: string): Promise<ArtifactContentV1>;
   getArtifactDiff(artifactId: string): Promise<ArtifactDiffV1>;
   repairProject(projectId: string, intent: ProductResourceMutationIntent): Promise<LocalOperationV1>;
@@ -187,6 +189,7 @@ export const unavailableDesktopProductProvider: DesktopProductProvider = {
   selectProjectSource: unavailable,
   startRun: unavailable,
   cancelRun: unavailable,
+  getRunLogs: unavailable,
   getArtifactContent: unavailable,
   getArtifactDiff: unavailable,
   repairProject: unavailable,

@@ -243,6 +243,15 @@ credential. A failed probe marks the old process cleanup-pending, performs the
 bounded TERM/KILL group cleanup, removes the old endpoint and credential, and
 continues through a fresh launch. It never returns the stale bootstrap context.
 
+The release renderer startup owner uses stricter retry semantics than ordinary
+request cache recovery. Initial mount, retry, React StrictMode supersession, and
+renderer unmount invoke `stop_sidecar`; a subsequent provider bootstrap waits
+for both the superseded bootstrap and native stop to settle before invoking
+`start_sidecar`. Cancellation is issued immediately rather than queued behind an
+in-flight start, allowing the native cancellation epoch and bounded join path to
+reclaim a not-yet-published child. Therefore a release startup retry crosses a
+real native lifecycle boundary and cannot adopt the failed attempt's credential.
+
 Release policy does not read `OPENEVO_DESKTOP_SIDECAR_COMMAND`,
 `OPENEVO_DESKTOP_SIDECAR_PROGRAM`,
 `OPENEVO_DESKTOP_SIDECAR_ARGS_JSON`,

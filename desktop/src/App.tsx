@@ -1,4 +1,5 @@
-import { useEffect, useState } from "react";
+import { AlertCircle, LoaderCircle, RefreshCw } from "lucide-react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Link, NavLink, Route, Routes, useLocation } from "react-router-dom";
 import { useQueryClient } from "@tanstack/react-query";
 import { Dashboard } from "./routes/Dashboard";
@@ -9,8 +10,11 @@ import { Compare } from "./routes/Compare";
 import { OpenEvoDesktop } from "./routes/OpenEvoDesktop";
 import { subscribeOpenEvoEvents } from "./api/sse";
 import { DesktopProductApp } from "./product/DesktopProductApp";
-import { type DesktopProductProvider, unavailableDesktopProductProvider } from "./product/provider";
-import { createReleaseDesktopProductProvider } from "./product/releaseProvider";
+import type { DesktopProductProvider } from "./product/provider";
+import {
+  createReleaseDesktopProductProvider,
+  stopReleaseDesktopProductProvider,
+} from "./product/releaseProvider";
 
 const isOpenEvoDesktopOnlyBuild =
   import.meta.env.VITE_OPENEVO_DESKTOP_ONLY === "true";
@@ -140,16 +144,93 @@ export function AppShell({ desktopOnly = false, productProvider }: { desktopOnly
   return desktopOnly ? <OpenEvoDesktopOnlyShell provider={productProvider} /> : <SharedDashboardShell />;
 }
 
-function ReleaseDesktopProductShell() {
-  const [provider, setProvider] = useState<DesktopProductProvider>(unavailableDesktopProductProvider);
-  useEffect(() => {
-    let active = true;
-    void createReleaseDesktopProductProvider()
-      .then((negotiated) => { if (active) setProvider(negotiated); })
-      .catch(() => { if (active) setProvider(unavailableDesktopProductProvider); });
-    return () => { active = false; };
+type ReleaseDesktopStartupState =
+  | { readonly status: "loading" }
+  | { readonly status: "ready"; readonly provider: DesktopProductProvider }
+  | { readonly status: "failed" };
+
+export function ReleaseDesktopProductShell({
+  createProvider = createReleaseDesktopProductProvider,
+  stopProvider = stopReleaseDesktopProductProvider,
+}: {
+  createProvider?: () => Promise<DesktopProductProvider>;
+  stopProvider?: () => Promise<void>;
+}) {
+  const generation = useRef(0);
+  const lifecycle = useRef<Promise<void>>(Promise.resolve());
+  const [startup, setStartup] = useState<ReleaseDesktopStartupState>({ status: "loading" });
+
+  const enqueueLifecycle = useCallback((operation: () => Promise<void>): Promise<void> => {
+    const next = lifecycle.current.catch(() => {}).then(operation);
+    lifecycle.current = next.catch(() => {});
+    return next;
   }, []);
-  return <OpenEvoDesktopOnlyShell provider={provider} />;
+
+  const cancelLifecycle = useCallback(() => {
+    // Do not queue cancellation behind an in-flight bootstrap. Tauri's stop
+    // command cancels and joins a native start that has not published yet.
+    const cancellation = stopProvider().catch(() => {});
+    lifecycle.current = Promise.all([lifecycle.current.catch(() => {}), cancellation]).then(() => {});
+  }, [stopProvider]);
+
+  const start = useCallback(() => {
+    const requestGeneration = generation.current + 1;
+    generation.current = requestGeneration;
+    setStartup({ status: "loading" });
+    void enqueueLifecycle(async () => {
+      try {
+        // Revoke the previous native session before requesting another
+        // credential from the Tauri host.
+        await stopProvider();
+        if (generation.current !== requestGeneration) return;
+        const provider = await createProvider();
+        if (generation.current !== requestGeneration) {
+          await stopProvider();
+          return;
+        }
+        setStartup({ status: "ready", provider });
+      } catch {
+        try {
+          await stopProvider();
+        } catch {
+          // Native cleanup is bounded; startup remains explicitly retryable.
+        }
+        if (generation.current === requestGeneration) {
+          setStartup({ status: "failed" });
+        }
+      }
+    });
+  }, [createProvider, enqueueLifecycle, stopProvider]);
+
+  useEffect(() => {
+    start();
+    return () => {
+      generation.current += 1;
+      cancelLifecycle();
+    };
+  }, [cancelLifecycle, start]);
+
+  if (startup.status === "ready") {
+    return <OpenEvoDesktopOnlyShell provider={startup.provider} />;
+  }
+  return (
+    <div className="product-boot">
+      {startup.status === "loading" ? (
+        <div className="product-loading-row" role="status" aria-live="polite">
+          <LoaderCircle className="spin" size={18} /> Starting OpenEvo Desktop...
+        </div>
+      ) : (
+        <div className="blocking-state" role="alert">
+          <span className="product-mark large"><AlertCircle size={22} /></span>
+          <h1>OpenEvo Desktop could not start</h1>
+          <p>The local service did not become ready. Retry startup to create a new secure session.</p>
+          <button type="button" className="primary-button" onClick={start}>
+            <RefreshCw size={16} /> Retry startup
+          </button>
+        </div>
+      )}
+    </div>
+  );
 }
 
 // Keep this build-time branch at the entrypoint so Vite can drop shared

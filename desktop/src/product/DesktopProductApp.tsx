@@ -29,7 +29,7 @@ import {
   XCircle,
   type LucideIcon,
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { DesktopApiError } from "../api/v1/client";
 import type { OpenEvoJsonObject } from "../api/evolutionConfigSchema";
 import type {
@@ -37,6 +37,7 @@ import type {
   ArtifactContentV1,
   ArtifactDiffV1,
   ArtifactV1,
+  LogEntryV1,
   ProfileCreateV1,
   ProjectCapabilitiesV1,
   ProjectPatchV1,
@@ -58,6 +59,11 @@ import {
   unavailableDesktopProductProvider,
 } from "./provider";
 import { MethodConfigEditor, methodConfigErrors } from "./MethodConfigEditor";
+import {
+  sameSessionOutputIdentity,
+  sessionOutputIdentity,
+  type SessionOutputIdentity,
+} from "./sessionOutputIdentity";
 
 type ProductEvolutionTargets = ProjectV1["evolution"]["targets"];
 type EvolutionCapabilitiesV1 = ProjectCapabilitiesV1["capabilities"];
@@ -70,6 +76,10 @@ type ActionAttemptResult = {
   readonly saved: boolean;
   readonly error: unknown | null;
   readonly refreshedSnapshot: DesktopProductSnapshot | null;
+};
+type PendingProjectActivation = {
+  readonly projectId: string;
+  readonly activationActionId: string;
 };
 type SaveAttemptResult = { readonly saved: boolean; readonly replaceActionId: boolean };
 type ProfileSaveIntent = {
@@ -98,6 +108,7 @@ export function DesktopProductApp({
   const [actionState, setActionState] = useState<AsyncState>("idle");
   const [actionError, setActionError] = useState<string | null>(null);
   const [actionRecovery, setActionRecovery] = useState<ActionRecovery>(null);
+  const pendingProjectActivation = useRef<PendingProjectActivation | null>(null);
   const refreshOrder = useRef(new ProductRefreshOrder());
 
   const refresh = useCallback(async (): Promise<DesktopProductSnapshot | null> => {
@@ -305,6 +316,8 @@ export function DesktopProductApp({
               runs={projectRuns}
               activeRun={activeRun}
               timelines={snapshot.timelines}
+              provider={provider}
+              streamEpoch={snapshot.stream.epoch}
               modelService={snapshot.services.find((service) => service.kind === "inference") ?? null}
               canStart={canStart}
               startReason={startReason}
@@ -352,7 +365,15 @@ export function DesktopProductApp({
           capability={snapshot.capability}
           capabilities={capabilities}
           busy={actionState === "working"}
-          onClose={() => setSettingsOpen(false)}
+          onClose={() => {
+            const pending = pendingProjectActivation.current;
+            if (pending) {
+              setSelectedProjectId(pending.projectId);
+              setCreatingProject(false);
+              pendingProjectActivation.current = null;
+            }
+            setSettingsOpen(false);
+          }}
           onRetryCapabilities={() => refresh()}
           onSave={async (input, actionId) => {
             const requestEpoch = snapshot.stream.epoch;
@@ -362,18 +383,41 @@ export function DesktopProductApp({
                 await provider.updateProject(project.project_id, input, resourceIntent(snapshot, project.etag, actionId));
               } else {
                 if (!profile) throw new DesktopProductUserError("Add a remote workspace before creating a project.");
-                const created = await provider.createProject({
-                  name: input.name ?? "Untitled research",
-                  profile_id: profile.profile_id,
-                  task: input.task ?? { title: "Research task", objective: "Describe the research objective." },
-                  source: input.source ?? { kind: "scratch", display_name: "New workspace" },
-                  execution: input.execution ?? selfDeployedExecution("Qwen/Qwen3-8B"),
-                  evolution: input.evolution ?? { targets: {} },
-                }, mutationIntent(snapshot, actionId));
-                await provider.activateProject(created.project_id, resourceIntent(snapshot, created.etag, `${actionId}-activate`));
-                setSelectedProjectId(created.project_id);
+                let pending = pendingProjectActivation.current;
+                if (!pending) {
+                  const created = await provider.createProject({
+                    name: input.name ?? "Untitled research",
+                    profile_id: profile.profile_id,
+                    task: input.task ?? { title: "Research task", objective: "Describe the research objective." },
+                    source: input.source ?? { kind: "scratch", display_name: "New workspace" },
+                    execution: input.execution ?? selfDeployedExecution("Qwen/Qwen3-8B"),
+                    evolution: input.evolution ?? { targets: {} },
+                  }, mutationIntent(snapshot, actionId));
+                  pending = { projectId: created.project_id, activationActionId: `${actionId}-activate` };
+                  pendingProjectActivation.current = pending;
+                }
+                const afterCreate = await refresh();
+                const current = afterCreate?.projects.find((item) => item.project_id === pending.projectId);
+                if (!afterCreate || !current) {
+                  throw new DesktopProductUserError("The new project is not available for activation. Refresh and try again.");
+                }
+                await provider.activateProject(
+                  current.project_id,
+                  resourceIntent(afterCreate, current.etag, pending.activationActionId),
+                );
+                pendingProjectActivation.current = null;
+                setSelectedProjectId(current.project_id);
               }
             });
+            if (!result.saved
+              && pendingProjectActivation.current
+              && result.error instanceof DesktopApiError
+              && [409, 412].includes(result.error.apiError.http_status)) {
+              pendingProjectActivation.current = {
+                ...pendingProjectActivation.current,
+                activationActionId: `${newActionId()}-activate`,
+              };
+            }
             if (result.saved) setSettingsOpen(false);
             return {
               saved: result.saved,
@@ -556,6 +600,8 @@ function ResearchWorkspace({
   runs,
   activeRun,
   timelines,
+  provider,
+  streamEpoch,
   modelService,
   canStart,
   startReason,
@@ -571,6 +617,8 @@ function ResearchWorkspace({
   runs: readonly RunV1[];
   activeRun: RunV1 | null;
   timelines: DesktopProductSnapshot["timelines"];
+  provider: DesktopProductProvider;
+  streamEpoch: number;
   modelService: ServiceV1 | null;
   canStart: boolean;
   startReason: string | null;
@@ -586,6 +634,7 @@ function ResearchWorkspace({
     return <EmptyState icon={FolderOpen} title="Create a research project" detail="Define a task and source to begin a session." action="Create project" onAction={onOpenSettings} />;
   }
   const latestTerminal = runs.find((run) => isTerminal(run.status));
+  const outputRun = activeRun ?? latestTerminal ?? null;
   const recover = (run: RunV1) => {
     const action = run.current_error?.repair_action;
     if (action === "openevo_can_install" || action === "openevo_can_reconfigure" || action === "unsupported") return { label: "Open System", onClick: onOpenSystem };
@@ -645,6 +694,10 @@ function ResearchWorkspace({
         </section>
       </div>
 
+      {outputRun ? (
+        <SessionOutput run={outputRun} provider={provider} streamEpoch={streamEpoch} />
+      ) : null}
+
       <section className="history-section">
         <div className="section-heading"><div><History size={17} /><h2>Session history</h2></div><span>{runs.length} total</span></div>
         {runs.length ? <SessionTable runs={runs} activeRun={activeRun} modelService={modelService} onRefresh={onRefresh} onRecover={recover} /> : <div className="empty-row">Completed and active sessions will appear here.</div>}
@@ -677,6 +730,139 @@ function Timeline({ entries }: { entries: readonly DesktopProductSnapshot["timel
       ))}
     </ol>
   );
+}
+
+type SessionLogFilter = "all" | "agent" | "evolution" | "system";
+
+function SessionOutput({
+  run,
+  provider,
+  streamEpoch,
+}: {
+  run: RunV1;
+  provider: DesktopProductProvider;
+  streamEpoch: number;
+}) {
+  const identity = useMemo(
+    () => sessionOutputIdentity(run),
+    [run.current_attempt_id, run.id],
+  );
+  const [output, setOutput] = useState<{
+    readonly identity: SessionOutputIdentity;
+    readonly logs: readonly LogEntryV1[];
+    readonly loading: boolean;
+    readonly error: string | null;
+  }>({ identity, logs: [], loading: true, error: null });
+  const [filter, setFilter] = useState<SessionLogFilter>("all");
+  const [retry, setRetry] = useState(0);
+  const requestSequence = useRef(0);
+  const currentIdentity = useRef(identity);
+
+  useLayoutEffect(() => {
+    currentIdentity.current = identity;
+  }, [identity]);
+
+  useEffect(() => {
+    setFilter("all");
+  }, [identity]);
+
+  useEffect(() => {
+    const request = requestSequence.current + 1;
+    requestSequence.current = request;
+    setOutput({ identity, logs: [], loading: true, error: null });
+    void provider.getRunLogs(identity.runId)
+      .then((next) => {
+        if (requestSequence.current === request
+          && sameSessionOutputIdentity(currentIdentity.current, identity)) {
+          setOutput({ identity, logs: next, loading: false, error: null });
+        }
+      })
+      .catch((reason) => {
+        if (requestSequence.current === request
+          && sameSessionOutputIdentity(currentIdentity.current, identity)) {
+          setOutput({ identity, logs: [], loading: false, error: userMessage(reason) });
+        }
+      });
+    return () => {
+      if (requestSequence.current === request) requestSequence.current += 1;
+    };
+  }, [identity, provider, retry, run.updated_at, streamEpoch]);
+
+  const currentOutput = sameSessionOutputIdentity(output.identity, identity)
+    ? output
+    : { identity, logs: [] as readonly LogEntryV1[], loading: true, error: null };
+  const { logs, loading, error } = currentOutput;
+
+  const filtered = logs.filter((entry) => {
+    if (filter === "all") return true;
+    if (filter === "system") return entry.stream === "core" || entry.stream === "service";
+    return entry.stream === filter;
+  });
+  const visible = filtered.slice(-200);
+  return (
+    <section className="product-panel session-output-panel" aria-label="Session output">
+      <div className="panel-heading">
+        <div><span className="panel-kicker">Live transcript</span><h2>Session output</h2></div>
+        <div className="session-output-state">
+          {loading ? <LoaderCircle className="spin" size={14} aria-label="Refreshing session output" /> : null}
+          <span>{logs.length} records</span>
+        </div>
+      </div>
+      <div className="session-output-toolbar" role="group" aria-label="Session output filter">
+        {([
+          ["all", "All logs"],
+          ["agent", "Agent logs"],
+          ["evolution", "Evolution logs"],
+          ["system", "System logs"],
+        ] as const).map(([value, label]) => (
+          <button
+            key={value}
+            type="button"
+            className={filter === value ? "active" : ""}
+            aria-pressed={filter === value}
+            onClick={() => setFilter(value)}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+      {error ? (
+        <div className="session-output-error" role="alert">
+          <AlertCircle size={16} />
+          <span>{error}</span>
+          <button type="button" className="text-button" onClick={() => setRetry((value) => value + 1)}>
+            <RefreshCw size={14} /> Retry output
+          </button>
+        </div>
+      ) : visible.length > 0 ? (
+        <div className="session-output-list" aria-live="polite">
+          {filtered.length > visible.length ? (
+            <div className="session-output-limit">Showing the latest 200 matching records.</div>
+          ) : null}
+          {visible.map((entry) => (
+            <article key={entry.id} className={`session-output-entry ${entry.level}`}>
+              <div className="session-output-meta">
+                <span className={`session-stream ${entry.stream}`}>{sessionStreamLabel(entry.stream)}</span>
+                <time dateTime={entry.occurred_at}>{formatTime(entry.occurred_at)}</time>
+              </div>
+              <div className="session-output-message">{entry.message}</div>
+            </article>
+          ))}
+        </div>
+      ) : loading ? (
+        <div className="session-output-empty">Loading session output...</div>
+      ) : (
+        <div className="session-output-empty">No {filter === "all" ? "session" : filter} output has been reported.</div>
+      )}
+    </section>
+  );
+}
+
+function sessionStreamLabel(stream: LogEntryV1["stream"]): string {
+  if (stream === "agent") return "Agent";
+  if (stream === "evolution") return "Evolution";
+  if (stream === "service") return "Service";
+  return "Core";
 }
 
 function SessionTable({

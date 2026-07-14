@@ -9,6 +9,7 @@ import {
   artifactV1Schema,
   desktopStateV1Schema,
   localOperationV1Schema,
+  logEntryV1Schema,
   operationV1Schema,
   projectCapabilitiesV1Schema,
   projectSourceV1Schema,
@@ -152,6 +153,57 @@ describe("LocalApiDesktopProductProvider", () => {
       const client = mockClient();
       client.runTimeline = vi.fn().mockResolvedValue(page([entry]));
       expect((await createProvider(client).refresh()).status).toBe("error");
+    }
+  });
+
+  it("loads every run log page on demand and verifies exact run ownership", async () => {
+    const client = mockClient();
+    const first = logEntryV1Schema.parse(CONTRACT_FIXTURE_V1.log);
+    const second = logEntryV1Schema.parse({
+      ...CONTRACT_FIXTURE_V1.log,
+      id: "log-fixture-2",
+      sequence: first.sequence + 1,
+      stream: "evolution",
+      message: "Evolution outputs were materialized.",
+    });
+    client.runLogs = runPagedMock([[first], [second]]);
+    const provider = createProvider(client);
+    expect((await provider.refresh()).status).toBe("fresh");
+
+    const logs = await provider.getRunLogs(CONTRACT_FIXTURE_V1.run.id);
+
+    expect(logs).toEqual([first, second]);
+    expect(client.runLogs).toHaveBeenNthCalledWith(1, CONTRACT_FIXTURE_V1.run.id, {
+      limit: 100,
+      sort: "sequence",
+      direction: "asc",
+    });
+    expect(client.runLogs).toHaveBeenNthCalledWith(2, CONTRACT_FIXTURE_V1.run.id, {
+      limit: 100,
+      after: "cursor-1",
+      sort: "sequence",
+      direction: "asc",
+    });
+  });
+
+  it("rejects run logs with cross-wired or non-monotonic identities", async () => {
+    const base = logEntryV1Schema.parse(CONTRACT_FIXTURE_V1.log);
+    const cases = [
+      [logEntryV1Schema.parse({ ...base, run_id: "run-cross-wired" })],
+      [logEntryV1Schema.parse({ ...base, attempt_id: "attempt-cross-wired" })],
+      [logEntryV1Schema.parse({ ...base, service_id: "service-cross-wired" })],
+      [base, logEntryV1Schema.parse({ ...base, id: "log-fixture-2" })],
+      [
+        logEntryV1Schema.parse({ ...base, sequence: 9 }),
+        logEntryV1Schema.parse({ ...base, id: "log-fixture-2", sequence: 8 }),
+      ],
+    ];
+    for (const entries of cases) {
+      const client = mockClient();
+      client.runLogs = vi.fn().mockResolvedValue(page(entries));
+      const provider = createProvider(client);
+      expect((await provider.refresh()).status).toBe("fresh");
+      await expect(provider.getRunLogs(CONTRACT_FIXTURE_V1.run.id)).rejects.toThrow();
     }
   });
 
@@ -443,6 +495,7 @@ function mockClient(): DesktopApiClientV1 & Record<string, ReturnType<typeof vi.
     listRuns: vi.fn().mockResolvedValue(page([CONTRACT_FIXTURE_V1.runSummary])),
     getRun: vi.fn().mockResolvedValue(runV1Schema.parse(CONTRACT_FIXTURE_V1.run)),
     runTimeline: vi.fn().mockResolvedValue(page([timelineEntryV1Schema.parse(CONTRACT_FIXTURE_V1.timeline)])),
+    runLogs: vi.fn().mockResolvedValue(page([logEntryV1Schema.parse(CONTRACT_FIXTURE_V1.log)])),
     runArtifacts: vi.fn().mockResolvedValue(page([CONTRACT_FIXTURE_V1.artifacts[0]])),
     listServices: vi.fn().mockResolvedValue(page([serviceV1Schema.parse(CONTRACT_FIXTURE_V1.service)])),
     projectCapabilities: vi.fn().mockResolvedValue(projectCapabilitiesV1Schema.parse(CONTRACT_FIXTURE_V1.capabilities)),

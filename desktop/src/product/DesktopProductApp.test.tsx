@@ -5,6 +5,8 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DesktopProductApp } from "./DesktopProductApp";
 import { createFixtureDesktopProductProvider, type FixtureDesktopProductProvider } from "./fixtureProvider";
+import type { DesktopProductSnapshot } from "./provider";
+import { sameSessionOutputIdentity } from "./sessionOutputIdentity";
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -38,6 +40,138 @@ describe("DesktopProductApp", () => {
     expect(screenText()).toContain("Remote environment");
     await clickButton("Research");
     expect(screenText()).toContain("Session history");
+  });
+
+  it("shows bounded session output and filters agent and evolution records", async () => {
+    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
+    root = await renderProduct(provider);
+
+    expect(screenText()).toContain("Session output");
+    expect(screenText()).toContain("Evidence synthesis completed with three supported findings.");
+    expect(screenText()).toContain("Memory and skills were prepared for the next session.");
+
+    await clickButton("Evolution logs");
+    expect(screenText()).not.toContain("Evidence synthesis completed with three supported findings.");
+    expect(screenText()).toContain("Memory and skills were prepared for the next session.");
+
+    await clickButton("Agent logs");
+    expect(screenText()).toContain("Evidence synthesis completed with three supported findings.");
+    expect(screenText()).not.toContain("Memory and skills were prepared for the next session.");
+  });
+
+  it("refreshes live session output after authoritative stream updates", async () => {
+    vi.useFakeTimers();
+    provider = createFixtureDesktopProductProvider({ startOnline: true, stepDelayMs: 20 });
+    root = await renderProduct(provider);
+
+    await clickButton("Start session");
+    expect(screenText()).toContain("Session admitted with an immutable project snapshot.");
+    expect(screenText()).not.toContain("Research execution is using the selected workspace");
+
+    await advance(45);
+    expect(screenText()).toContain("Research execution is using the selected workspace and evidence sources.");
+  });
+
+  it("never publishes a superseded run-log request into the next run", async () => {
+    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
+    const initial = await provider.refresh();
+    if (initial.status !== "fresh") throw new Error("Expected a fresh fixture snapshot.");
+    const previousRun = initial.snapshot.runs[0];
+    if (!previousRun) throw new Error("Expected a completed fixture run.");
+    const staleLogs = (await provider.getRunLogs(previousRun.id)).map((entry, index) => ({
+      ...entry,
+      message: index === 0 ? "STALE PREVIOUS RUN OUTPUT" : entry.message,
+    }));
+    const staleRequest = deferred<typeof staleLogs>();
+    const loadLogs = vi.spyOn(provider, "getRunLogs");
+    loadLogs.mockImplementationOnce(() => staleRequest.promise);
+    root = await renderProduct(provider);
+
+    expect(screenText()).not.toContain("STALE PREVIOUS RUN OUTPUT");
+    await clickButton("Start session");
+    expect(screenText()).toContain("Session admitted with an immutable project snapshot.");
+
+    await act(async () => {
+      staleRequest.resolve(staleLogs);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(screenText()).not.toContain("STALE PREVIOUS RUN OUTPUT");
+  });
+
+  it("keeps opaque run and nullable attempt identities structurally distinct", () => {
+    expect(sameSessionOutputIdentity(
+      { runId: "run:segment", attemptId: "attempt" },
+      { runId: "run", attemptId: "segment:attempt" },
+    )).toBe(false);
+    expect(sameSessionOutputIdentity(
+      { runId: "run", attemptId: null },
+      { runId: "run", attemptId: "no-attempt" },
+    )).toBe(false);
+  });
+
+  it("hides resolved output synchronously when a colliding attempt identity becomes current", async () => {
+    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
+    const initial = await provider.refresh();
+    if (initial.status !== "fresh") throw new Error("Expected a fresh fixture snapshot.");
+    const baseRun = initial.snapshot.runs[0];
+    if (!baseRun) throw new Error("Expected a completed fixture run.");
+    const baseLogs = await provider.getRunLogs(baseRun.id);
+    const oldSnapshot = withRunOutputIdentity(initial.snapshot, "run-collision", null);
+    const nextSnapshot = withRunOutputIdentity(initial.snapshot, "run-collision", "no-attempt");
+    const oldLogs = relabelLogs(baseLogs, "run-collision", null, "OLD NO-ATTEMPT OUTPUT");
+    const nextRequest = deferred<ReturnType<typeof relabelLogs>>();
+    vi.spyOn(provider, "refresh")
+      .mockResolvedValueOnce({ status: "fresh", snapshot: oldSnapshot })
+      .mockResolvedValueOnce({ status: "fresh", snapshot: nextSnapshot });
+    vi.spyOn(provider, "getRunLogs")
+      .mockResolvedValueOnce(oldLogs)
+      .mockImplementationOnce(() => nextRequest.promise);
+    root = await renderProduct(provider);
+
+    expect(screenText()).toContain("OLD NO-ATTEMPT OUTPUT");
+    await act(async () => provider?.emitAuthoritativeRefresh());
+    await flush();
+
+    expect(screenText()).not.toContain("OLD NO-ATTEMPT OUTPUT");
+    expect(document.querySelector('[aria-label="Refreshing session output"]')).not.toBeNull();
+
+    await act(async () => {
+      nextRequest.resolve(relabelLogs(baseLogs, "run-collision", "no-attempt", "CURRENT ATTEMPT OUTPUT"));
+      await Promise.resolve();
+    });
+    expect(screenText()).toContain("CURRENT ATTEMPT OUTPUT");
+  });
+
+  it("never publishes an old colliding request after a rapid attempt switch", async () => {
+    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
+    const initial = await provider.refresh();
+    if (initial.status !== "fresh") throw new Error("Expected a fresh fixture snapshot.");
+    const baseRun = initial.snapshot.runs[0];
+    if (!baseRun) throw new Error("Expected a completed fixture run.");
+    const baseLogs = await provider.getRunLogs(baseRun.id);
+    const oldSnapshot = withRunOutputIdentity(initial.snapshot, "run-collision", null);
+    const nextSnapshot = withRunOutputIdentity(initial.snapshot, "run-collision", "no-attempt");
+    const oldRequest = deferred<ReturnType<typeof relabelLogs>>();
+    vi.spyOn(provider, "refresh")
+      .mockResolvedValueOnce({ status: "fresh", snapshot: oldSnapshot })
+      .mockResolvedValueOnce({ status: "fresh", snapshot: nextSnapshot });
+    vi.spyOn(provider, "getRunLogs")
+      .mockImplementationOnce(() => oldRequest.promise)
+      .mockResolvedValueOnce(relabelLogs(baseLogs, "run-collision", "no-attempt", "CURRENT ATTEMPT OUTPUT"));
+    root = await renderProduct(provider);
+
+    await act(async () => provider?.emitAuthoritativeRefresh());
+    await flush();
+    expect(screenText()).toContain("CURRENT ATTEMPT OUTPUT");
+
+    await act(async () => {
+      oldRequest.resolve(relabelLogs(baseLogs, "run-collision", null, "STALE NO-ATTEMPT OUTPUT"));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(screenText()).toContain("CURRENT ATTEMPT OUTPUT");
+    expect(screenText()).not.toContain("STALE NO-ATTEMPT OUTPUT");
   });
 
   it("gates sessions offline and completes first-time workspace setup", async () => {
@@ -81,6 +215,7 @@ describe("DesktopProductApp", () => {
     setInput("Hugging Face model", "Qwen/Qwen3-8B");
     await clickButton("Save");
     expect(screenText()).toContain("Compare catalyst candidates");
+    expect(button("Start session").title).toBe("Start a new research session");
     expect(button("Start session").disabled).toBe(false);
   });
 
@@ -123,7 +258,7 @@ describe("DesktopProductApp", () => {
     expect(document.querySelectorAll(".artifact-list-item")).toHaveLength(4);
   });
 
-  it("clears terminal run and attempt fields when a fixture transition re-enters preparation", async () => {
+  it("keeps a terminal fixture run immutable when scheduled steps fire later", async () => {
     vi.useFakeTimers();
     provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true, stepDelayMs: 20 });
     const initial = await provider.refresh();
@@ -138,12 +273,12 @@ describe("DesktopProductApp", () => {
     if (transitioned.status !== "fresh") throw new Error("Fixture refresh was not fresh.");
     const current = transitioned.snapshot.runs.find((candidate) => candidate.id === run.id);
 
-    expect(current?.status).toBe("preparing");
-    expect(current?.finished_at).toBeNull();
+    expect(current?.status).toBe("cancelled");
+    expect(current?.finished_at).not.toBeNull();
     expect(current?.current_error).toBeNull();
-    expect(current?.current_attempt?.finished_at).toBeNull();
+    expect(current?.current_attempt?.finished_at).not.toBeNull();
     expect(current?.current_attempt?.error).toBeNull();
-    expect(current?.attempts.at(-1)?.finished_at).toBeNull();
+    expect(current?.attempts.at(-1)?.finished_at).not.toBeNull();
     expect(current?.attempts.at(-1)?.error).toBeNull();
   });
 
@@ -576,6 +711,37 @@ describe("DesktopProductApp", () => {
     expect(provider.projectCreateActionIds()[0]).toBe(provider.projectCreateActionIds()[1]);
   });
 
+  it.each([409, 412] as const)("retries activation after HTTP %s without creating another project", async (status) => {
+    provider = createFixtureDesktopProductProvider({ startOnline: true });
+    root = await renderProduct(provider);
+
+    await clickAria("Create project");
+    setInput("Objective", `Activate the authoritative project after ${status}.`);
+    provider.failNextProjectActivation(status);
+    await clickButton("Save");
+
+    expect(provider.projectCreateActionIds()).toHaveLength(1);
+    expect(provider.projectActivationActionIds()).toHaveLength(1);
+    await clickButton("Save");
+
+    expect(provider.projectCreateActionIds()).toHaveLength(1);
+    expect(provider.projectActivationActionIds()).toHaveLength(2);
+    expect(provider.projectActivationActionIds()[0]).not.toBe(provider.projectActivationActionIds()[1]);
+    expect(document.querySelector('[role="dialog"]')).toBeNull();
+    expect(screenText()).toContain(`Activate the authoritative project after ${status}.`);
+  });
+
+  it("uses a single-column bounded System layout at the 760px minimum window", async () => {
+    provider = createFixtureDesktopProductProvider({ startOnline: true });
+    root = await renderProduct(provider);
+    await clickButton("System");
+
+    const grid = document.querySelector(".system-grid");
+    expect(grid).not.toBeNull();
+    expect(grid?.children).toHaveLength(2);
+    expect(Array.from(grid?.children ?? []).every((child) => child.classList.contains("product-panel"))).toBe(true);
+  });
+
   it("adopts a profile created before its response was lost without replaying it as an update", async () => {
     provider = createFixtureDesktopProductProvider({ newUser: true });
     root = await renderProduct(provider);
@@ -789,4 +955,57 @@ function labelledControl<T extends HTMLElement>(text: string, selector: string):
 
 function screenText(): string {
   return document.body.textContent ?? "";
+}
+
+function withRunOutputIdentity(
+  snapshot: DesktopProductSnapshot,
+  runId: string,
+  attemptId: string | null,
+): DesktopProductSnapshot {
+  const source = snapshot.runs[0];
+  if (!source) throw new Error("Expected a run fixture.");
+  const sourceAttempt = source.current_attempt ?? source.attempts[0];
+  if (attemptId !== null && !sourceAttempt) throw new Error("Expected an attempt fixture.");
+  const attempt = attemptId === null
+    ? null
+    : { ...sourceAttempt, id: attemptId, run_id: runId };
+  const run = {
+    ...source,
+    id: runId,
+    current_attempt_id: attemptId,
+    current_attempt: attempt,
+    attempt_count: attempt === null ? 0 : 1,
+    attempts: attempt === null ? [] : [attempt],
+  };
+  return {
+    ...snapshot,
+    runs: [run],
+    timelines: { [runId]: snapshot.timelines[source.id] ?? [] },
+  };
+}
+
+function relabelLogs(
+  logs: Awaited<ReturnType<FixtureDesktopProductProvider["getRunLogs"]>>,
+  runId: string,
+  attemptId: string | null,
+  message: string,
+) {
+  return logs.map((entry, index) => ({
+    ...entry,
+    id: `${runId}-log-${index}`,
+    run_id: runId,
+    attempt_id: attemptId,
+    message: index === 0 ? message : entry.message,
+  }));
+}
+
+function deferred<T>(): {
+  readonly promise: Promise<T>;
+  readonly resolve: (value: T) => void;
+} {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
 }

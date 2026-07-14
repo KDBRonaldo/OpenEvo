@@ -19,17 +19,31 @@ folder and credential operations remain native-host calls whose results are
 strictly parsed as `ProjectSourceV1` and `RemoteProfileV1`; renderer file inputs,
 raw paths, and secret values are not accepted.
 
+Run output is loaded on demand through the frozen run-log route rather than
+stored in the global renderer snapshot. The provider applies the same bounded
+pagination rules and rejects cross-wired run, attempt, service, duplicate, or
+non-monotonic log identities. Renderer request state is tagged with separate
+opaque run ID and nullable current-attempt ID fields, without delimiter or
+sentinel encoding. A transition renders an empty loading state until its own
+request resolves, and superseded requests cannot publish into the new identity.
+The Research view renders at most the latest 200
+matching records and separates agent, evolution, and system streams; SSE
+snapshot epochs trigger an authoritative output refresh while a session runs.
+
 The release adapter deliberately has no fallback for those native calls. The
 Tauri commands `select_project_source` and `configure_credential` are required
 release integration dependencies and are not implemented by the current Rust
 host yet. Release-native integration must add those commands before this flow
 can ship; the provider must continue to fail closed until they exist.
 
-The remaining bootstrap-retry integration point is `App.tsx`. It currently
-replaces a failed `createReleaseDesktopProductProvider` call with the unavailable
-provider. A later startup-state change must expose an explicit retry that calls
-the release factory again, obtaining a fresh `start_sidecar` bootstrap context;
-it must not retain or retry with a failed session token.
+`App.tsx` owns the release startup state machine. It does not mount the product
+renderer until native bootstrap, Local API negotiation, and provider creation
+all succeed. Native transitions are serialized through Tauri: initial startup,
+retry, StrictMode supersession, and renderer unmount first complete
+`stop_sidecar` before another `start_sidecar` can issue a credential. Failed or
+superseded attempts are stopped before the next transition, so they cannot
+leave an unowned sidecar or publish/reuse their session token. A bounded native
+cleanup failure remains visible as retryable startup failure.
 
 The Local API release digest is
 `3a86582d04dcd233096337c737ba91d75854746848aedc319025d86213a03d36`.
@@ -85,6 +99,15 @@ profile appears, an unchanged draft retries the original create intent. Editing
 the draft or establishing a new update precondition creates a new
 route-appropriate intent. Drafts survive reloads and require confirmation
 before Escape, overlay, or close-button dismissal.
+
+First-time project creation and activation are two distinct authoritative
+mutations. After create succeeds, the renderer reloads the saved project and
+uses that fresh stream epoch and ETag for activation; it never chains activation
+with the pre-create renderer snapshot. If activation returns HTTP 409 or 412,
+the drawer retains the created project identity and creates a new activation
+intent against the refreshed ETag. Retry activates that project instead of
+issuing another create; an unknown activation result retains its original
+action ID for exact retry.
 
 Revision generation is shown only from the authoritative
 `ProjectV1.remote.active_revision`. Core-owned runs and artifacts are associated
