@@ -467,7 +467,7 @@ reuse bounded cleanup capacity instead of permanently consuming active slots.
 
 Timeout remnants stay private and bounded. Prepare creates a validated `0600`
 `.openevo-transfer.lock` in every incoming directory. The rsync server runs
-through a closed Python wrapper that holds a shared flock on that inode across
+through a closed Python wrapper that holds an exclusive flock on that inode across
 `exec`; rsync deletion rules protect the marker. Prepare, discard, and finalize
 must acquire a nonblocking exclusive flock before retiring an incoming
 directory. A recognized owner-only `0700` incoming directory with no marker is

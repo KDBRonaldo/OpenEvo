@@ -111,14 +111,22 @@ SSH/rsync caller; it does not replace or relax those remote Linux primitives.
 
 The Desktop production adapter uses the system Python only as a fixed Ubuntu
 bootstrap selector, not as the Core runtime. It searches verified Python 3.13
-through 3.11 candidates and may use an existing verified `uv` to find or install
-Python 3.11. Selection probes the same direct pidfd syscall ABI as the service,
+through 3.11 candidates and may use a verified `uv` to find or install Python
+3.11. When uv is absent, x86-64 and AArch64 hosts automatically download a
+pinned official uv archive through the configured server proxy, verify its
+embedded SHA-256, and execute only its exact uv member from a private unlinked
+FD. Selection probes the same direct pidfd syscall ABI as the service,
 so uv-managed Python builds without the convenience wrappers remain eligible.
 It returns a canonical executable authority that binds path, inode, metadata,
 digest, and version. Every later asset and generation command revalidates that
 authority and executes its held FD; it never resolves `python3` from PATH again.
 Missing Python, failed uv provisioning, and missing kernel syscalls remain
 distinct typed failures before any bootstrap claim.
+
+The uv/Python provisioning and wheel-install subprocesses receive the configured
+proxy and bootstrap TLS environment. The eventual Core service does not: its
+`execve` receives a newly constructed allowlist containing only home, locale,
+and PATH values.
 
 The supervisor binds and listens on one IPv4 loopback socket before spawning
 Core. Release bootstrap requests port `0`, so the kernel chooses an available

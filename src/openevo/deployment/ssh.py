@@ -27,6 +27,7 @@ from typing import BinaryIO, NoReturn, Protocol
 from pydantic import SecretStr
 
 from openevo.deployment.core_assets import (
+    CORE_ASSET_TRANSFER_LEASE,
     CoreBootstrapAssetSnapshotError,
     StagedCoreBootstrapAssets,
     build_core_asset_consumer_command,
@@ -1688,7 +1689,7 @@ class SshRemoteExecutorTransport:
             "rsync",
             "--recursive",
             "--delete",
-            "--filter=protect /.openevo-transfer.lock",
+            f"--filter=protect /{CORE_ASSET_TRANSFER_LEASE}",
             "--chmod=F600,D700",
             "--no-owner",
             "--no-group",

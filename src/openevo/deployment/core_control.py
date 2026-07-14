@@ -71,7 +71,7 @@ if (
 install_root.mkdir(mode=0o700)
 venv.EnvBuilder(with_pip=True, symlinks=False).create(install_root)
 interpreter = install_root / "bin" / "python"
-environment = {
+install_environment = {
     key: value
     for key, value in os.environ.items()
     if key
@@ -103,7 +103,7 @@ completed = subprocess.run(
         "--no-compile",
         str(wheel_path),
     ],
-    env=environment,
+    env=install_environment,
     stdin=subprocess.DEVNULL,
     stdout=subprocess.DEVNULL,
     stderr=subprocess.DEVNULL,
@@ -111,10 +111,15 @@ completed = subprocess.run(
 )
 if completed.returncode != 0:
     raise SystemExit(73)
+service_environment = {
+    key: value
+    for key, value in os.environ.items()
+    if key in {"HOME", "LANG", "LC_ALL", "PATH"}
+}
 os.execve(
     interpreter,
     [str(interpreter), "-I", "-m", "openevo.backend.service", *service_argv],
-    environment,
+    service_environment,
 )
 """.strip()
 

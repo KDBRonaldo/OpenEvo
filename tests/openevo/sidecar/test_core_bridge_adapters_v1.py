@@ -391,13 +391,13 @@ def test_core_host_rejects_local_asset_tamper_before_upload(tmp_path: Path) -> N
         (
             SshTransportErrorCode.CORE_PYTHON_UNAVAILABLE,
             "core_python_runtime_unavailable",
-            "Python 3.11",
+            "server architecture",
             False,
         ),
         (
             SshTransportErrorCode.CORE_PYTHON_PROVISION_FAILED,
             "core_python_runtime_provision_failed",
-            "could not provision",
+            "download, verify, or provision",
             True,
         ),
         (

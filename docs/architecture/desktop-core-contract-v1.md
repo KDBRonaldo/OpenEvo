@@ -53,7 +53,11 @@ The pre-Core SSH phase selects one Linux Python 3.11+ runtime authority before
 upload. Selection checks PATH Python 3.13 through 3.11 and then verified `uv`
 executables in PATH and standard user locations. If `uv python find 3.11` has no
 candidate, Desktop may run `uv python install 3.11` with the configured
-HTTP(S)/NO_PROXY environment. This contract does not download `uv` itself.
+HTTP(S)/NO_PROXY environment. If uv is also absent on x86-64 or AArch64 Linux,
+Desktop fetches a pinned official uv 0.11.28 archive through that same proxy
+environment, enforces a 64 MiB response bound and an embedded platform SHA-256,
+and extracts only the exact regular uv member into a private temporary inode.
+It never runs `curl | sh` or the upstream installer script.
 
 Candidate stdout is not an authority. The selector canonicalizes and no-follow
 opens the absolute executable, checks regular-file ownership, mode, link count,
@@ -68,6 +72,12 @@ independent SSH processes never re-resolve PATH. Runtime errors separately name
 missing Python, uv provisioning/network failure, unsupported kernel syscalls,
 and invalid selection responses. This internal change does not alter frozen
 Desktop/Core OpenAPI or event contracts.
+
+Network proxy and bootstrap TLS variables are scoped to uv/Python provisioning
+and isolated wheel installation. Before the generation interpreter becomes the
+long-running Core service, the launcher builds a separate environment containing
+only `HOME`, locale, and `PATH`; proxy and proxy-CA variables cannot cross the
+service `execve` boundary.
 
 Tunnel publication delegates to the authenticated Core tunnel verifier. The
 bridge HTTP transport opens a fresh anonymous socketpair plus `ssh -W` child for

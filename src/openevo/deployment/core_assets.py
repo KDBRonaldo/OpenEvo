@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import stat
 import tempfile
 from typing import Iterator
@@ -27,6 +28,7 @@ _TRANSFER_ID = re.compile(r"[0-9a-f]{32}\Z")
 _WHEEL_NAME = re.compile(r"[A-Za-z0-9_.+-]+\.whl\Z")
 _REMOTE_PATH = re.compile(r"/(?:[A-Za-z0-9._@%+=,-]+/)*[A-Za-z0-9._@%+=,-]+\Z")
 _MAX_STAGE_RESPONSE_BYTES = 4096
+CORE_ASSET_TRANSFER_LEASE = ".openevo-transfer.lock"
 
 
 class CoreBootstrapAssetSnapshotError(ValueError):
@@ -192,12 +194,12 @@ def build_core_asset_rsync_path(
     arguments = (service_root, bundle_id, transfer_id)
     return " ".join(
         (
-            "python3",
+            "/usr/bin/python3",
             "-I",
             "-c",
             shlex.quote(_REMOTE_RSYNC_LEASE_SCRIPT),
             *(shlex.quote(value) for value in arguments),
-            "rsync",
+            "/usr/bin/rsync",
         )
     )
 
@@ -628,7 +630,7 @@ if (not hasattr(os, "O_NOFOLLOW") or not home_parts
         or service_root != home + "/.openevo/core"
         or len(bundle) != 64 or any(c not in "0123456789abcdef" for c in bundle)
         or len(transfer) != 32 or any(c not in "0123456789abcdef" for c in transfer)
-        or executable != "rsync" or not arguments):
+        or executable != "/usr/bin/rsync" or not arguments):
     raise SystemExit(70)
 
 dir_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
@@ -676,7 +678,7 @@ try:
                     or (lease.st_dev, lease.st_ino)
                         != (current_lease.st_dev, current_lease.st_ino)):
                 raise SystemExit(73)
-            fcntl.flock(lease_fd, fcntl.LOCK_SH)
+            fcntl.flock(lease_fd, fcntl.LOCK_EX)
             current_lease = os.stat(
                 ".openevo-transfer.lock", dir_fd=incoming_fd, follow_symlinks=False
             )
@@ -690,7 +692,7 @@ try:
 finally:
     os.close(core_fd)
 
-os.execvp(executable, [executable, *arguments])
+os.execv(executable, [executable, *arguments])
 """.strip()
 
 
@@ -1883,6 +1885,7 @@ __all__ = (
     "CoreBootstrapAssetSnapshot",
     "MAX_CORE_WHEEL_BYTES",
     "MAX_FRAMEWORK_LOCK_BYTES",
+    "CORE_ASSET_TRANSFER_LEASE",
     "StagedCoreBootstrapAssets",
     "build_core_asset_discard_command",
     "build_core_asset_consumer_command",

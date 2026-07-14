@@ -473,9 +473,13 @@ remote service or asset path is a configuration input.
 `DesktopRemoteLifecycle` transport for the requested profile. Before upload it
 runs a closed remote runtime selection under the same total deadline. It checks
 PATH Python 3.13 through 3.11, then an owner-safe `uv` from PATH or the standard
-user install locations. An existing `uv` may run `uv python install 3.11`; that
-download inherits the profile's `HTTP_PROXY`, `HTTPS_PROXY`, and `NO_PROXY`
-settings. Desktop does not download `uv` itself in this contract.
+user install locations. When neither is present on x86-64 or AArch64 Linux,
+Desktop downloads the pinned official uv 0.11.28 release archive through the
+profile's `HTTP_PROXY`, `HTTPS_PROXY`, and `NO_PROXY` settings. It bounds the
+archive in memory, verifies the platform-specific SHA-256 embedded in Core,
+extracts only the exact regular `uv` member, and executes it from a private
+unlinked FD. It never executes the upstream installer script. The verified uv
+then finds or installs Python 3.11 under the same deadline and proxy settings.
 
 Every candidate is reduced to an absolute canonical path and checked as an
 owner/root-owned, non-writable, regular executable before an isolated version
@@ -504,6 +508,11 @@ registry, generation, port, and status-proof identity with a one-way host
 identity. Transport object identity is checked after preflight, staging, and
 bootstrap, so reconnecting even the same profile invalidates in-flight
 authority.
+
+Proxy and TLS-bootstrap variables are passed only to uv/Python provisioning and
+the isolated wheel install. The generation launcher constructs a separate
+closed environment for the long-running Core service, excluding all proxy and
+proxy-CA variables before `execve`.
 
 The same adapter implements `CoreTunnelFactory`. It opens the authenticated
 `ssh -W` Core endpoint through that exact transport and requires

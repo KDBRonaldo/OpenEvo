@@ -32,19 +32,21 @@ catalog and packaged UI.
 
 OpenEvo Desktop automatically looks for remote Python 3.13, 3.12, or 3.11. On a
 typical Ubuntu 22.04 GPU server whose system Python is 3.10, Desktop also checks
-an existing `uv` in PATH, `~/.local/bin/uv`, or `~/.cargo/bin/uv`. It first uses
-an already installed uv Python 3.11 and otherwise asks uv to install Python 3.11.
-Configured HTTP proxy, HTTPS proxy, and no-proxy values are inherited by that uv
-operation. You do not need to change PATH or replace the system Python.
+an existing `uv` in PATH, `~/.local/bin/uv`, or `~/.cargo/bin/uv`. If uv is not
+installed, Desktop automatically downloads a pinned, SHA-256-verified official
+uv build on x86-64 and AArch64 Linux, then uses it to install Python 3.11.
+Configured HTTP proxy, HTTPS proxy, and no-proxy values apply to both downloads.
+You do not need to SSH into the server, change PATH, install uv, or replace the
+system Python.
 
 The following activation failures have different repairs:
 
-- `core_python_runtime_unavailable`: no Python 3.11+ and no verified existing
-  uv were found. Install uv in a standard user location or install Python 3.11+
-  and retry.
-- `core_python_runtime_provision_failed`: uv was found but its Python download
-  or verification failed. Check the remote network, configured proxy, TLS
-  certificates, and available home-directory space, then retry.
+- `core_python_runtime_unavailable`: the server CPU/platform has no supported
+  automatic runtime path. Use a supported x86-64 or AArch64 Ubuntu server.
+- `core_python_runtime_provision_failed`: the pinned uv download, integrity
+  check, or Python download failed. Check the configured server proxy, remote
+  network, TLS certificates, and available home-directory space, then use the
+  Desktop retry action.
 - `core_supervisor_kernel_unsupported`: the Linux kernel does not support the
   pidfd syscalls required for safe Core process supervision. Use a newer
   supported Linux server/kernel.

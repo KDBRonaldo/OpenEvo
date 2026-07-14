@@ -1037,17 +1037,16 @@ def _ssh_runtime_preflight_error(exc: SshTransportError) -> DesktopCoreBridgeErr
     if exc.code is SshTransportErrorCode.CORE_PYTHON_UNAVAILABLE:
         return _adapter_error(
             "core_python_runtime_unavailable",
-            "No executable Python 3.11 or newer is available on the remote server.",
+            "OpenEvo could not select a supported Python runtime on this server architecture.",
             status=409,
             next_action=(
-                "Install uv in the standard user location or install Python 3.11 or newer, "
-                "then retry activation."
+                "Use a supported x86-64 or AArch64 Ubuntu server, then retry activation."
             ),
         )
     if exc.code is SshTransportErrorCode.CORE_PYTHON_PROVISION_FAILED:
         return _adapter_error(
             "core_python_runtime_provision_failed",
-            "OpenEvo found uv but could not provision and verify remote Python 3.11.",
+            "OpenEvo could not download, verify, or provision remote Python 3.11.",
             status=409,
             retryable=True,
             next_action=(

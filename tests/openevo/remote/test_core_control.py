@@ -4,7 +4,11 @@ from dataclasses import asdict
 import json
 import hashlib
 import os
+from pathlib import Path
+import subprocess
 import sys
+from types import SimpleNamespace
+import venv
 
 import pytest
 from pydantic import SecretStr
@@ -168,6 +172,76 @@ def test_core_bootstrap_uses_one_host_locked_command_and_secret_channel() -> Non
     assert "worker" not in combined
     assert "vllm" not in combined.lower()
     assert all(0 < timeout <= plan.deadline_seconds for timeout in transport.timeouts)
+
+
+def test_generation_bootstrap_keeps_proxy_only_in_install_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    install_root = tmp_path / "core" / "releases" / "generation"
+    wheel = tmp_path / "openevo.whl"
+    wheel.write_bytes(b"wheel")
+    captured_install: dict[str, str] = {}
+    captured_service: dict[str, str] = {}
+
+    class FakeEnvBuilder:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def create(self, root: Path) -> None:
+            interpreter = Path(root) / "bin" / "python"
+            interpreter.parent.mkdir(parents=True)
+            interpreter.write_bytes(b"python")
+
+    def fake_run(*_args: object, **kwargs: object) -> SimpleNamespace:
+        captured_install.update(kwargs["env"])
+        return SimpleNamespace(returncode=0)
+
+    class ExecveCalled(RuntimeError):
+        pass
+
+    def fake_execve(_path: object, _argv: object, env: dict[str, str]) -> None:
+        captured_service.update(env)
+        raise ExecveCalled
+
+    monkeypatch.setattr(venv, "EnvBuilder", FakeEnvBuilder)
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(core_control.os, "execve", fake_execve)
+    monkeypatch.setattr(sys, "executable", sys.executable)
+    monkeypatch.setattr(sys, "_base_executable", sys._base_executable)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "generation-bootstrap",
+            str(install_root),
+            str(wheel),
+            "/verified/python3.11",
+            "bootstrap",
+        ],
+    )
+    proxy = "http://proxy-user:proxy-password@127.0.0.1:7890"
+    for name in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
+        monkeypatch.setenv(name, proxy)
+    monkeypatch.setenv("NO_PROXY", "127.0.0.1")
+    monkeypatch.setenv("SSL_CERT_FILE", "/private/proxy-ca.pem")
+
+    with pytest.raises(ExecveCalled):
+        exec(compile(core_control._GENERATION_BOOTSTRAP, "<bootstrap>", "exec"), {})
+
+    assert captured_install["HTTPS_PROXY"] == proxy
+    assert captured_install["SSL_CERT_FILE"] == "/private/proxy-ca.pem"
+    assert captured_service
+    assert not {
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "NO_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "no_proxy",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+    }.intersection(captured_service)
 
 
 def test_core_bootstrap_rejects_pathsep_and_non_closed_remote_paths() -> None:

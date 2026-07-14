@@ -4,6 +4,7 @@ import base64
 import fcntl
 from dataclasses import asdict
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -14,8 +15,9 @@ import shlex
 import struct
 import subprocess
 import sys
-import threading
+import tarfile
 import tempfile
+import threading
 import time
 from types import SimpleNamespace
 
@@ -979,17 +981,23 @@ def test_remote_asset_prepare_recovers_sixteen_proven_stale_incoming_authorities
     home = tmp_path / "home"
     home.mkdir(mode=0o700)
     incoming: list[Path] = []
-    for _index in range(16):
+    for index in range(16):
         _execute_remote_script(
             core_assets._REMOTE_PREPARE_SCRIPT,
             [BUNDLE_ID],
             home=home,
             monkeypatch=monkeypatch,
         )
-        incoming.append(Path(json.loads(capsys.readouterr().out)["incoming_root"]))
+        incoming_root = Path(json.loads(capsys.readouterr().out)["incoming_root"])
+        partial = incoming_root / f"partial-{index}"
+        partial.write_bytes(b"interrupted upload")
+        partial.chmod(0o600)
+        incoming.append(incoming_root)
 
     stale_time = time.time() - 601
     for path in incoming:
+        for child in path.iterdir():
+            os.utime(child, (stale_time, stale_time), follow_symlinks=False)
         os.utime(path, (stale_time, stale_time), follow_symlinks=False)
 
     _execute_remote_script(
@@ -1002,6 +1010,7 @@ def test_remote_asset_prepare_recovers_sixteen_proven_stale_incoming_authorities
     staging = home / ".openevo" / "core" / "asset-staging"
     assert list(staging.iterdir()) == [recovered]
     assert recovered not in incoming
+    assert all(not path.exists() for path in incoming)
 
 
 @pytest.mark.parametrize("interruption", [KeyboardInterrupt, SystemExit])
@@ -1025,7 +1034,7 @@ def test_remote_asset_prepare_recovers_marker_publication_interruptions(
     ) -> int:
         nonlocal injections
         if (
-            path == ".openevo-transfer.lock"
+            path == core_assets.CORE_ASSET_TRANSFER_LEASE
             and flags & os.O_CREAT
             and flags & os.O_EXCL
             and injections < 16
@@ -1057,7 +1066,7 @@ def test_remote_asset_prepare_recovers_marker_publication_interruptions(
     staging = home / ".openevo" / "core" / "asset-staging"
     assert injections == 16
     assert list(staging.iterdir()) == [recovered]
-    assert (recovered / ".openevo-transfer.lock").is_file()
+    assert (recovered / core_assets.CORE_ASSET_TRANSFER_LEASE).is_file()
 
 
 def test_remote_asset_prepare_rejects_nonempty_markerless_incoming_shape(
@@ -1116,7 +1125,7 @@ def test_stale_prepare_and_discard_preserve_cross_process_active_transfer(
     )
     prepared = json.loads(capsys.readouterr().out)
     incoming = Path(prepared["incoming_root"])
-    lease_path = incoming / ".openevo-transfer.lock"
+    lease_path = incoming / core_assets.CORE_ASSET_TRANSFER_LEASE
     ready_path = tmp_path / "lease-ready"
     active_write_path = incoming / "partial-wheel"
     holder = subprocess.Popen(
@@ -1199,12 +1208,12 @@ def test_remote_rsync_wrapper_holds_transfer_lease_through_exec(
         monkeypatch=monkeypatch,
     )
     prepared = json.loads(capsys.readouterr().out)
-    lease_path = Path(prepared["incoming_root"]) / ".openevo-transfer.lock"
+    lease_path = Path(prepared["incoming_root"]) / core_assets.CORE_ASSET_TRANSFER_LEASE
     namespace: dict[str, object] = {"__name__": "__main__"}
 
     def observe_exec(executable: str, arguments: list[str]) -> None:
-        assert executable == "rsync"
-        assert arguments == ["rsync", "--server"]
+        assert executable == "/usr/bin/rsync"
+        assert arguments == ["/usr/bin/rsync", "--server"]
         contender_fd = os.open(lease_path, os.O_RDWR | os.O_CLOEXEC)
         try:
             with pytest.raises(BlockingIOError):
@@ -1223,11 +1232,11 @@ def test_remote_rsync_wrapper_holds_transfer_lease_through_exec(
                 prepared["service_root"],
                 BUNDLE_ID,
                 prepared["transfer_id"],
-                "rsync",
+                "/usr/bin/rsync",
                 "--server",
             ],
         )
-        scoped.setattr(os, "execvp", observe_exec)
+        scoped.setattr(os, "execv", observe_exec)
         with pytest.raises(ExecObserved):
             exec(
                 compile(
@@ -1322,11 +1331,12 @@ def test_stage_core_assets_prepares_fresh_host_uploads_private_snapshot_and_fina
     assert len(runner.calls) == 1
     argv, timeout = runner.calls[0]
     assert argv[0] == "rsync"
+    compile(core_assets._REMOTE_RSYNC_LEASE_SCRIPT, "<rsync-lease>", "exec")
     assert "--chmod=F600,D700" in argv
-    assert "--filter=protect /.openevo-transfer.lock" in argv
+    assert f"--filter=protect /{core_assets.CORE_ASSET_TRANSFER_LEASE}" in argv
     rsync_path_index = argv.index("--rsync-path")
-    assert "python3 -I -c" in argv[rsync_path_index + 1]
-    assert "rsync" in argv[rsync_path_index + 1]
+    assert argv[rsync_path_index + 1].startswith("/usr/bin/python3 -I -c ")
+    assert "/usr/bin/rsync" in argv[rsync_path_index + 1]
     assert "--no-perms" not in argv
     assert "--links" not in argv
     assert timeout <= 20
@@ -1451,6 +1461,83 @@ def test_core_python_runtime_probe_accepts_direct_pidfd_syscalls_without_wrapper
     assert "libc.syscall" in core_runtime._REMOTE_SELECTION_SCRIPT
 
 
+def test_core_python_runtime_bootstraps_verified_uv_when_python_and_uv_are_absent(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    empty_path = tmp_path / "empty-path"
+    empty_path.mkdir()
+    provisioned = home / ".local" / "share" / "uv" / "python" / "python3.11"
+    fake_python = (
+        "#!/usr/bin/python3\n"
+        "import json\n"
+        "print(json.dumps({'platform':'linux','version':[3,11,99]},"
+        "sort_keys=True,separators=(',',':')))\n"
+    )
+    fake_uv = (
+        "#!/usr/bin/python3\n"
+        "import os,pathlib,sys\n"
+        f"target = pathlib.Path({str(provisioned)!r})\n"
+        "if sys.argv[1:4] == ['python','find','3.11']:\n"
+        "    if not target.exists(): raise SystemExit(1)\n"
+        "    print(target)\n"
+        "elif sys.argv[1:4] == ['python','install','3.11']:\n"
+        "    target.parent.mkdir(parents=True, exist_ok=True)\n"
+        f"    target.write_text({fake_python!r}, encoding='utf-8')\n"
+        "    os.chmod(target, 0o755)\n"
+        "else:\n"
+        "    raise SystemExit(2)\n"
+    ).encode()
+    archive_buffer = io.BytesIO()
+    with tarfile.open(fileobj=archive_buffer, mode="w:gz") as archive:
+        member = tarfile.TarInfo("uv-x86_64-unknown-linux-gnu/uv")
+        member.mode = 0o755
+        member.size = len(fake_uv)
+        archive.addfile(member, io.BytesIO(fake_uv))
+    archive_path = tmp_path / "uv.tar.gz"
+    archive_path.write_bytes(archive_buffer.getvalue())
+    archive_digest = hashlib.sha256(archive_path.read_bytes()).hexdigest()
+    script = core_runtime._REMOTE_SELECTION_SCRIPT.replace(
+        "home = pwd.getpwuid(uid).pw_dir",
+        f"home = {str(home)!r}",
+        1,
+    )
+    script = script.replace(
+        "https://github.com/astral-sh/uv/releases/download/0.11.28/uv-x86_64-unknown-linux-gnu.tar.gz",
+        archive_path.as_uri(),
+    ).replace(
+        "e490a6464492183c5d4534a5527fb4440f7f2bb2f228162ad7e4afe076dc0224",
+        archive_digest,
+    )
+
+    completed = subprocess.run(
+        ["/usr/bin/python3", "-I", "-c", script, "30"],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=35,
+        env={
+            "HOME": str(home),
+            "PATH": str(empty_path),
+            "HTTPS_PROXY": "http://127.0.0.1:9",
+            "https_proxy": "http://127.0.0.1:9",
+        },
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    selection = core_runtime.parse_core_supervisor_runtime_preflight(
+        SecretStr(completed.stdout)
+    )
+    assert selection.reason == "ready"
+    assert selection.authority is not None
+    assert selection.authority.executable_path == str(provisioned)
+    assert selection.authority.version == (3, 11, 99)
+    assert provisioned.is_file()
+    assert "curl" not in core_runtime._REMOTE_SELECTION_SCRIPT
+    assert "uv-installer.sh" not in core_runtime._REMOTE_SELECTION_SCRIPT
+
+
 @pytest.mark.parametrize(
     ("reason", "expected"),
     [
@@ -1569,19 +1656,23 @@ def test_core_supervisor_runtime_script_rejects_non_linux_remote_host(
     with monkeypatch.context() as scoped:
         scoped.setattr(sys, "platform", "darwin")
         scoped.setattr(sys, "version_info", (3, 11, 0))
-        exec(
-            compile(
-                core_runtime._REMOTE_PREFLIGHT_SCRIPT,
-                "<core-runtime-preflight>",
-                "exec",
-            ),
-            {"__name__": "__main__"},
-        )
+        scoped.setattr(sys, "argv", ["core-runtime-selection", "30"])
+        with pytest.raises(SystemExit) as stopped:
+            exec(
+                compile(
+                    core_runtime._REMOTE_SELECTION_SCRIPT,
+                    "<core-runtime-selection>",
+                    "exec",
+                ),
+                {"__name__": "__main__"},
+            )
+        assert stopped.value.code == 0
 
-    reason = core_runtime.parse_core_supervisor_runtime_preflight(
+    selection = core_runtime.parse_core_supervisor_runtime_preflight(
         SecretStr(capsys.readouterr().out)
     )
-    assert reason == "unsupported_platform"
+    assert selection.reason == "unsupported_platform"
+    assert selection.authority is None
 
 
 def test_core_staging_closed_payloads_reject_boolean_numeric_aliases() -> None:
@@ -1883,7 +1974,7 @@ def test_malformed_finalize_receipts_hit_cleanup_authority_backpressure(
 ) -> None:
     assets = _assets(tmp_path)
     transport = _transport(tmp_path, RecordingRunner())
-    prepare_command = core_assets.build_core_asset_prepare_command(BUNDLE_ID)
+    prepare_command = core_assets.build_core_asset_prepare_command(BUNDLE_ID, _runtime())
     prepare_calls = 0
 
     def malformed_receipts(
@@ -1936,7 +2027,7 @@ def test_prepare_authority_handoff_interruptions_remain_bounded_and_retryable(
     assets = _assets(tmp_path)
     runner = RecordingRunner()
     transport = _transport(tmp_path, runner)
-    prepare_command = core_assets.build_core_asset_prepare_command(BUNDLE_ID)
+    prepare_command = core_assets.build_core_asset_prepare_command(BUNDLE_ID, _runtime())
     original_remember = transport._remember_core_asset_transfer
     prepare_calls = 0
     interrupted_handoffs = 0
@@ -2020,7 +2111,7 @@ def test_finalize_authority_handoff_interruptions_remain_bounded_and_retryable(
     assets = _assets(tmp_path)
     runner = RecordingRunner()
     transport = _transport(tmp_path, runner)
-    prepare_command = core_assets.build_core_asset_prepare_command(BUNDLE_ID)
+    prepare_command = core_assets.build_core_asset_prepare_command(BUNDLE_ID, _runtime())
     original_remember = transport._remember_core_asset_transfer
     prepare_calls = 0
     interrupted_handoffs = 0
@@ -2100,7 +2191,7 @@ def test_concurrent_cleanup_skips_an_owned_finalize_operation(
     assets = _assets(tmp_path)
     transport = _transport(tmp_path, RecordingRunner())
     prepared, receipt = _stage_responses(assets[1], assets[3])
-    prepare_command = core_assets.build_core_asset_prepare_command(BUNDLE_ID)
+    prepare_command = core_assets.build_core_asset_prepare_command(BUNDLE_ID, _runtime())
     finalize_started = threading.Event()
     allow_finalize = threading.Event()
     discard_calls: list[str] = []

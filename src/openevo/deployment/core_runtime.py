@@ -250,12 +250,13 @@ def _closed_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
 
 
 _REMOTE_SELECTION_SCRIPT = r"""
-import ctypes, errno, hashlib, json, os, pwd, shutil, signal, stat, subprocess, sys, tempfile, time
+import ctypes, errno, hashlib, io, json, os, pwd, shutil, signal, stat, subprocess, sys, tarfile, tempfile, time, urllib.error, urllib.request
 
 deadline = time.monotonic() + int(sys.argv[1])
 uid = os.geteuid()
 max_output = 4096
 max_executable = 256 * 1024 * 1024
+max_uv_archive = 64 * 1024 * 1024
 allowed = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._@%+=,-")
 current_child = None
 
@@ -497,7 +498,85 @@ for candidate in uv_candidates:
         continue
 
 if not validated_uv:
-    emit("no_supported_python")
+    uv_archives = {
+        "amd64": (
+            "https://github.com/astral-sh/uv/releases/download/0.11.28/uv-x86_64-unknown-linux-gnu.tar.gz",
+            "e490a6464492183c5d4534a5527fb4440f7f2bb2f228162ad7e4afe076dc0224",
+            "uv-x86_64-unknown-linux-gnu/uv",
+        ),
+        "x86_64": (
+            "https://github.com/astral-sh/uv/releases/download/0.11.28/uv-x86_64-unknown-linux-gnu.tar.gz",
+            "e490a6464492183c5d4534a5527fb4440f7f2bb2f228162ad7e4afe076dc0224",
+            "uv-x86_64-unknown-linux-gnu/uv",
+        ),
+        "aarch64": (
+            "https://github.com/astral-sh/uv/releases/download/0.11.28/uv-aarch64-unknown-linux-gnu.tar.gz",
+            "03e9fe0a81b0718d0bc84625de3885df6cc3f89a8b6af6121d6b9f6113fb6533",
+            "uv-aarch64-unknown-linux-gnu/uv",
+        ),
+        "arm64": (
+            "https://github.com/astral-sh/uv/releases/download/0.11.28/uv-aarch64-unknown-linux-gnu.tar.gz",
+            "03e9fe0a81b0718d0bc84625de3885df6cc3f89a8b6af6121d6b9f6113fb6533",
+            "uv-aarch64-unknown-linux-gnu/uv",
+        ),
+    }
+    archive = uv_archives.get(machine)
+    if archive is None:
+        emit("no_supported_python")
+    url, expected_archive_digest, member_name = archive
+    try:
+        request = urllib.request.Request(url, headers={"User-Agent": "OpenEvo-Desktop/1"})
+        with urllib.request.urlopen(request, timeout=remaining(60)) as response:
+            declared = response.headers.get("Content-Length")
+            if declared is not None and int(declared) > max_uv_archive:
+                raise ValueError
+            archive_bytes = response.read(max_uv_archive + 1)
+        if (len(archive_bytes) > max_uv_archive
+                or hashlib.sha256(archive_bytes).hexdigest() != expected_archive_digest):
+            raise ValueError
+        with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:gz") as bundle:
+            members = bundle.getmembers()
+            if len(members) > 16:
+                raise ValueError
+            matches = [item for item in members if item.name == member_name]
+            if (len(matches) != 1 or not matches[0].isfile()
+                    or not 0 < matches[0].size <= max_executable):
+                raise ValueError
+            extracted = bundle.extractfile(matches[0])
+            if extracted is None:
+                raise ValueError
+            uv_bytes = extracted.read(max_executable + 1)
+            if len(uv_bytes) != matches[0].size:
+                raise ValueError
+        with tempfile.TemporaryDirectory(prefix="openevo-uv-") as temporary_root:
+            temporary_path = os.path.join(temporary_root, "uv")
+            write_fd = os.open(
+                temporary_path,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+                0o700,
+            )
+            try:
+                offset = 0
+                while offset < len(uv_bytes):
+                    written = os.write(write_fd, uv_bytes[offset:])
+                    if written <= 0:
+                        raise OSError(errno.EIO, "uv bootstrap write failed")
+                    offset += written
+                os.fsync(write_fd)
+            finally:
+                os.close(write_fd)
+            read_fd = os.open(temporary_path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+            metadata = os.fstat(read_fd)
+            current = os.stat(temporary_path, follow_symlinks=False)
+            if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != uid
+                    or metadata.st_nlink != 1 or stat.S_IMODE(metadata.st_mode) != 0o700
+                    or metadata.st_size != len(uv_bytes)
+                    or (metadata.st_dev, metadata.st_ino) != (current.st_dev, current.st_ino)):
+                os.close(read_fd)
+                raise ValueError
+            validated_uv.append(("verified uv 0.11.28", read_fd))
+    except (EOFError, OSError, TimeoutError, ValueError, tarfile.TarError, urllib.error.URLError):
+        emit("python_provision_failed")
 
 provision_attempted = False
 try:
