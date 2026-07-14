@@ -84,6 +84,14 @@ enum PackagedSourceOwnerPolicy {
     RootOrEffectiveUser(u32),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TrustedDirectoryPolicy {
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    Strict,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    MacOsBundle,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct FileIdentity {
     device: u64,
@@ -284,7 +292,7 @@ enum ManagedLifecycle {
 struct ManagedSidecar {
     status: SidecarStatus,
     lifecycle: ManagedLifecycle,
-    child: Child,
+    child: Option<Child>,
     process_group: i32,
     _private_launch_dir: Option<PrivateLaunchDirectory>,
     verified_executable: Option<VerifiedExecutableFile>,
@@ -296,6 +304,10 @@ impl ManagedSidecar {
         self.lifecycle = ManagedLifecycle::CleanupPending;
         self.status.state = "cleanup_pending".to_string();
         self.status.url = None;
+    }
+
+    fn child_mut(&mut self) -> HostResult<&mut Child> {
+        self.child.as_mut().ok_or_else(sidecar_state_error)
     }
 }
 
@@ -340,12 +352,7 @@ impl<'a> StartupClaim<'a> {
         state
             .startup_in_progress
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .map_err(|_| {
-                NativeHostError::new(
-                    "sidecar_start_in_progress",
-                    "OpenEvo Desktop is already starting its local sidecar.",
-                )
-            })?;
+            .map_err(|_| sidecar_start_in_progress_error())?;
         let epoch = state.cancellation_epoch.load(Ordering::Acquire);
         Ok((
             Self {
@@ -709,18 +716,40 @@ fn open_directory_chain_no_follow(path: &Path) -> HostResult<File> {
 }
 
 fn validate_trusted_directory(identity: &FileIdentity) -> HostResult<()> {
-    validate_trusted_directory_for_user(identity, unsafe { libc::geteuid() })
+    validate_trusted_directory_for_user(
+        identity,
+        unsafe { libc::geteuid() },
+        trusted_directory_policy(),
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn trusted_directory_policy() -> TrustedDirectoryPolicy {
+    TrustedDirectoryPolicy::Strict
+}
+
+#[cfg(target_os = "macos")]
+fn trusted_directory_policy() -> TrustedDirectoryPolicy {
+    TrustedDirectoryPolicy::MacOsBundle
 }
 
 fn validate_trusted_directory_for_user(
     identity: &FileIdentity,
     effective_user: u32,
+    policy: TrustedDirectoryPolicy,
 ) -> HostResult<()> {
     let is_directory = identity.mode & libc::S_IFMT == libc::S_IFDIR;
     let trusted_owner = identity.owner == 0 || identity.owner == effective_user;
-    let writable_by_other_users = identity.mode & 0o022 != 0;
     let root_sticky_boundary = identity.owner == 0 && identity.mode & libc::S_ISVTX != 0;
-    if !is_directory || !trusted_owner || (writable_by_other_users && !root_sticky_boundary) {
+    let world_writable = identity.mode & 0o002 != 0;
+    let group_writable = identity.mode & 0o020 != 0;
+    let macos_root_group_writable =
+        policy == TrustedDirectoryPolicy::MacOsBundle && identity.owner == 0 && !world_writable;
+    if !is_directory
+        || !trusted_owner
+        || (world_writable && !root_sticky_boundary)
+        || (group_writable && !root_sticky_boundary && !macos_root_group_writable)
+    {
         return Err(packaged_path_error());
     }
     Ok(())
@@ -1134,30 +1163,28 @@ fn command_from_launch_spec(
         command.current_dir(workdir);
     }
     let listener_fd = listener_guard.as_raw_fd();
+    // Command::spawn may wait for this block; keep it allocation-free and async-signal-safe.
     unsafe {
         command.pre_exec(move || {
             if libc::setpgid(0, 0) == -1 {
-                return Err(std::io::Error::last_os_error());
+                return Err(pre_exec_error());
             }
             if libc::dup2(listener_fd, INHERITED_LISTENER_FD) == -1 {
-                return Err(std::io::Error::last_os_error());
+                return Err(pre_exec_error());
             }
             clear_close_on_exec(INHERITED_LISTENER_FD)?;
             if let (Some(source_fd), Some(expected)) = (executable_fd, expected_identity.as_ref()) {
                 if libc::dup2(source_fd, INHERITED_EXECUTABLE_FD) == -1 {
-                    return Err(std::io::Error::last_os_error());
+                    return Err(pre_exec_error());
                 }
                 clear_close_on_exec(INHERITED_EXECUTABLE_FD)?;
                 let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
                 if libc::fstat(INHERITED_EXECUTABLE_FD, stat.as_mut_ptr()) == -1 {
-                    return Err(std::io::Error::last_os_error());
+                    return Err(pre_exec_error());
                 }
                 let actual = file_identity_from_stat(&stat.assume_init());
                 if &actual != expected {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::PermissionDenied,
-                        "verified executable identity changed before exec",
-                    ));
+                    return Err(std::io::Error::from_raw_os_error(libc::EPERM));
                 }
             }
             Ok(())
@@ -1173,10 +1200,14 @@ fn command_from_launch_spec(
 unsafe fn clear_close_on_exec(fd: RawFd) -> std::io::Result<()> {
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
     if flags == -1 || unsafe { libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) } == -1 {
-        Err(std::io::Error::last_os_error())
+        Err(pre_exec_error())
     } else {
         Ok(())
     }
+}
+
+fn pre_exec_error() -> std::io::Error {
+    std::io::Error::from_raw_os_error(libc::EIO)
 }
 
 fn check_sidecar_health(port: u16, credential: &NativeInstanceCredential) -> HostResult<()> {
@@ -1247,6 +1278,7 @@ fn readiness_hmac_domain(instance_id: &str, challenge: &str) -> String {
     format!("{NATIVE_SIDECAR_PROTOCOL}\0{instance_id}\0{challenge}")
 }
 
+#[cfg(test)]
 fn wait_for_sidecar_ready(
     child: &mut Child,
     port: u16,
@@ -1254,19 +1286,55 @@ fn wait_for_sidecar_ready(
     timeout: Duration,
     is_cancelled: impl Fn() -> bool,
 ) -> HostResult<()> {
+    wait_for_sidecar_ready_with_inspection(port, credential, timeout, is_cancelled, || {
+        child
+            .try_wait()
+            .map(|status| status.is_some())
+            .map_err(|_| sidecar_inspection_error())
+    })
+}
+
+fn wait_for_state_owned_sidecar_ready<C: ProcessControl>(
+    state: &DesktopHostState,
+    control: &C,
+    port: u16,
+    credential: &NativeInstanceCredential,
+    timeout: Duration,
+    startup_epoch: u64,
+) -> HostResult<()> {
+    wait_for_sidecar_ready_with_inspection(
+        port,
+        credential,
+        timeout,
+        || startup_cancelled(state, startup_epoch),
+        || {
+            let mut sidecar = lock_sidecar_bounded(state, SIDECAR_STATE_LOCK_TIMEOUT)?;
+            let managed = sidecar.as_mut().ok_or_else(sidecar_state_error)?;
+            let child = managed.child_mut()?;
+            match control.try_wait(child) {
+                Ok(status) => Ok(status.is_some()),
+                Err(_) => {
+                    managed.mark_cleanup_pending();
+                    Err(sidecar_inspection_error())
+                }
+            }
+        },
+    )
+}
+
+fn wait_for_sidecar_ready_with_inspection(
+    port: u16,
+    credential: &NativeInstanceCredential,
+    timeout: Duration,
+    is_cancelled: impl Fn() -> bool,
+    mut child_exited: impl FnMut() -> HostResult<bool>,
+) -> HostResult<()> {
     let deadline = Instant::now() + timeout;
     loop {
         if is_cancelled() {
-            return Err(NativeHostError::new(
-                "sidecar_start_cancelled",
-                "OpenEvo Desktop cancelled sidecar startup.",
-            ));
+            return Err(sidecar_start_cancelled_error());
         }
-        if child
-            .try_wait()
-            .map_err(|_| sidecar_inspection_error())?
-            .is_some()
-        {
+        if child_exited()? {
             return Err(NativeHostError::new(
                 "sidecar_exited_during_startup",
                 "The OpenEvo Desktop sidecar exited before it became ready.",
@@ -1458,9 +1526,12 @@ fn cleanup_managed_sidecar_with_bounds<C: ProcessControl>(
     term_timeout: Duration,
     kill_timeout: Duration,
 ) -> HostResult<()> {
+    let Some(child) = managed.child.as_mut() else {
+        return Ok(());
+    };
     match terminate_process_group_with(
         control,
-        &mut managed.child,
+        child,
         managed.process_group,
         term_timeout,
         kill_timeout,
@@ -1530,7 +1601,14 @@ fn lock_sidecar_bounded(
     loop {
         match state.sidecar.try_lock() {
             Ok(sidecar) => return Ok(sidecar),
-            Err(TryLockError::Poisoned(_)) => return Err(sidecar_state_error()),
+            Err(TryLockError::Poisoned(poisoned)) => {
+                let mut sidecar = poisoned.into_inner();
+                if let Some(managed) = sidecar.as_mut() {
+                    managed.mark_cleanup_pending();
+                }
+                state.sidecar.clear_poison();
+                return Ok(sidecar);
+            }
             Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
                 thread::sleep(SIDECAR_STOP_POLL_INTERVAL);
             }
@@ -1556,6 +1634,13 @@ fn sidecar_start_cancelled_error() -> NativeHostError {
     )
 }
 
+fn sidecar_start_in_progress_error() -> NativeHostError {
+    NativeHostError::new(
+        "sidecar_start_in_progress",
+        "OpenEvo Desktop is already starting its local sidecar.",
+    )
+}
+
 fn advance_cancellation(state: &DesktopHostState) {
     advance_cancellation_with(state, || {});
 }
@@ -1573,7 +1658,16 @@ fn spawn_sidecar_gated(
     state: &DesktopHostState,
     startup_epoch: u64,
     spawn: impl FnOnce() -> std::io::Result<Child>,
-) -> HostResult<Child> {
+) -> HostResult<()> {
+    spawn_sidecar_gated_with_timeout(state, startup_epoch, SIDECAR_STATE_LOCK_TIMEOUT, spawn)
+}
+
+fn spawn_sidecar_gated_with_timeout(
+    state: &DesktopHostState,
+    startup_epoch: u64,
+    state_lock_timeout: Duration,
+    spawn: impl FnOnce() -> std::io::Result<Child>,
+) -> HostResult<()> {
     let _launch_gate = state
         .launch_gate
         .lock()
@@ -1581,63 +1675,138 @@ fn spawn_sidecar_gated(
     if startup_cancelled(state, startup_epoch) {
         return Err(sidecar_start_cancelled_error());
     }
+    let mut sidecar = lock_sidecar_bounded(state, state_lock_timeout)?;
+    let managed = sidecar.as_mut().ok_or_else(sidecar_state_error)?;
+    if managed.lifecycle != ManagedLifecycle::Starting || managed.child.is_some() {
+        return Err(sidecar_state_error());
+    }
     let child = spawn().map_err(|_| {
         NativeHostError::new(
             "sidecar_spawn_failed",
             "OpenEvo Desktop could not start its local sidecar.",
         )
     })?;
-    let process_group = i32::try_from(child.id()).expect("OS child pid fits in pid_t");
+    managed.child = Some(child);
+    let child_id = managed
+        .child
+        .as_ref()
+        .map(Child::id)
+        .ok_or_else(sidecar_state_error)?;
+    let process_group = match i32::try_from(child_id) {
+        Ok(process_group) => process_group,
+        Err(_) => {
+            managed.mark_cleanup_pending();
+            return Err(sidecar_state_error());
+        }
+    };
+    managed.status.pid = Some(child_id);
+    managed.process_group = process_group;
     state
         .emergency_process_group
         .store(process_group, Ordering::Release);
-    Ok(child)
+    Ok(())
 }
 
 fn publish_sidecar_gated(
     state: &DesktopHostState,
     startup_epoch: u64,
-    managed: ManagedSidecar,
-) -> Result<(), (NativeHostError, Box<ManagedSidecar>)> {
-    let _launch_gate = match state.launch_gate.lock() {
-        Ok(gate) => gate,
-        Err(_) => return Err((sidecar_state_error(), Box::new(managed))),
-    };
+) -> HostResult<SidecarStatus> {
+    publish_sidecar_gated_with(state, startup_epoch, SIDECAR_STATE_LOCK_TIMEOUT, || {})
+}
+
+fn publish_sidecar_gated_with(
+    state: &DesktopHostState,
+    startup_epoch: u64,
+    state_lock_timeout: Duration,
+    before_state_lock: impl FnOnce(),
+) -> HostResult<SidecarStatus> {
+    let _launch_gate = state
+        .launch_gate
+        .lock()
+        .map_err(|_| sidecar_state_error())?;
     if startup_cancelled(state, startup_epoch) {
-        return Err((sidecar_start_cancelled_error(), Box::new(managed)));
+        return Err(sidecar_start_cancelled_error());
     }
-    let mut sidecar = match state.sidecar.try_lock() {
-        Ok(sidecar) => sidecar,
-        Err(_) => return Err((sidecar_state_error(), Box::new(managed))),
-    };
+    before_state_lock();
+    let mut sidecar = lock_sidecar_bounded(state, state_lock_timeout)?;
+    let managed = sidecar.as_mut().ok_or_else(sidecar_state_error)?;
+    if managed.lifecycle != ManagedLifecycle::Starting || managed.child.is_none() {
+        return Err(sidecar_state_error());
+    }
+    managed.lifecycle = ManagedLifecycle::Running;
+    managed.status.state = "running".to_string();
+    let port = managed.status.port.ok_or_else(sidecar_state_error)?;
+    managed.status.url = Some(format!("http://127.0.0.1:{port}/openevo"));
+    Ok(managed.status.clone())
+}
+
+fn reserve_starting_sidecar(state: &DesktopHostState, managed: ManagedSidecar) -> HostResult<()> {
+    let mut sidecar = lock_sidecar_bounded(state, SIDECAR_STATE_LOCK_TIMEOUT)?;
     if sidecar.is_some() {
-        return Err((sidecar_state_error(), Box::new(managed)));
+        return Err(sidecar_start_in_progress_error());
     }
     *sidecar = Some(managed);
     Ok(())
 }
 
-fn retain_and_cleanup_unpublished_startup<C: ProcessControl>(
+fn fail_state_owned_startup<C: ProcessControl>(
     state: &DesktopHostState,
     control: &C,
-    managed: ManagedSidecar,
     startup_error: NativeHostError,
 ) -> NativeHostError {
-    let Ok(mut sidecar) = lock_sidecar_bounded(state, SIDECAR_STATE_LOCK_TIMEOUT) else {
-        return sidecar_state_error();
+    fail_state_owned_startup_with_bounds(
+        state,
+        control,
+        startup_error,
+        SIDECAR_STATE_LOCK_TIMEOUT,
+        SIDECAR_TERM_TIMEOUT,
+        SIDECAR_KILL_TIMEOUT,
+    )
+}
+
+fn fail_state_owned_startup_with_bounds<C: ProcessControl>(
+    state: &DesktopHostState,
+    control: &C,
+    startup_error: NativeHostError,
+    state_lock_timeout: Duration,
+    term_timeout: Duration,
+    kill_timeout: Duration,
+) -> NativeHostError {
+    let mut sidecar = match lock_sidecar_bounded(state, state_lock_timeout) {
+        Ok(sidecar) => sidecar,
+        Err(error) => return error,
     };
-    if sidecar.is_some() {
+    let Some(managed) = sidecar.as_mut() else {
+        return startup_error;
+    };
+    if managed.lifecycle == ManagedLifecycle::Running {
         return sidecar_state_error();
     }
-    *sidecar = Some(managed);
-    let managed = sidecar.as_mut().expect("startup failure retained sidecar");
-    match cleanup_managed_sidecar_with(control, managed) {
+    match cleanup_managed_sidecar_with_bounds(control, managed, term_timeout, kill_timeout) {
         Ok(()) => {
             remove_cleaned_sidecar(state, &mut sidecar);
             startup_error
         }
         Err(error) => error,
     }
+}
+
+fn validate_state_owned_executable(state: &DesktopHostState) -> HostResult<()> {
+    let sidecar = lock_sidecar_bounded(state, SIDECAR_STATE_LOCK_TIMEOUT)?;
+    let managed = sidecar.as_ref().ok_or_else(sidecar_state_error)?;
+    if let Some(executable) = managed.verified_executable.as_ref() {
+        executable.validate()?;
+    }
+    Ok(())
+}
+
+fn write_state_owned_credential(
+    state: &DesktopHostState,
+    credential: &NativeInstanceCredential,
+) -> HostResult<()> {
+    let mut sidecar = lock_sidecar_bounded(state, SIDECAR_STATE_LOCK_TIMEOUT)?;
+    let managed = sidecar.as_mut().ok_or_else(sidecar_state_error)?;
+    credential.write_to_child(managed.child_mut()?)
 }
 
 fn wait_for_startup_to_finish<C: ProcessControl>(
@@ -1680,7 +1849,10 @@ fn host_status_inner_with<C: ProcessControl>(
     if managed.lifecycle == ManagedLifecycle::CleanupPending {
         return Ok(managed.status.clone());
     }
-    match control.try_wait(&mut managed.child) {
+    if managed.child.is_none() {
+        return Ok(managed.status.clone());
+    }
+    match control.try_wait(managed.child_mut()?) {
         Ok(Some(_)) => {
             managed.status.state = "exited".to_string();
             managed.status.url = None;
@@ -1726,7 +1898,10 @@ fn start_sidecar_inner_with<C: ProcessControl>(
         if managed.lifecycle == ManagedLifecycle::CleanupPending {
             return Err(sidecar_stop_error());
         }
-        match control.try_wait(&mut managed.child) {
+        if managed.lifecycle == ManagedLifecycle::Starting {
+            return Err(sidecar_start_in_progress_error());
+        }
+        match control.try_wait(managed.child_mut()?) {
             Ok(None) => return Ok(managed.status.clone()),
             Ok(Some(_)) => {
                 if cleanup_managed_sidecar_with(control, managed).is_err() {
@@ -1743,62 +1918,51 @@ fn start_sidecar_inner_with<C: ProcessControl>(
     drop(sidecar);
 
     let allocated = allocate_sidecar_listener()?;
+    let port = allocated.port;
     let mut launch = sidecar_launch_spec(policy, bundled_path, allocated.port)?;
     if let Some(executable) = launch.verified_executable.as_ref() {
         executable.validate()?;
     }
     let credential = NativeInstanceCredential::generate()?;
     let mut prepared = command_from_launch_spec(&launch, &allocated.listener)?;
-    let child = spawn_sidecar_gated(state, startup_epoch, || prepared.spawn())?;
-    let process_group = i32::try_from(child.id()).expect("OS child pid fits in pid_t");
     let status = SidecarStatus {
         state: "starting".to_string(),
-        port: Some(allocated.port),
-        pid: Some(child.id()),
+        port: Some(port),
+        pid: None,
         url: None,
     };
-    let mut managed = ManagedSidecar {
+    let managed = ManagedSidecar {
         status,
         lifecycle: ManagedLifecycle::Starting,
-        child,
-        process_group,
+        child: None,
+        process_group: 0,
         _private_launch_dir: launch.private_launch_dir.take(),
         verified_executable: launch.verified_executable.take(),
         _listener: allocated.listener,
     };
-    if let Some(executable) = managed.verified_executable.as_ref() {
-        if let Err(error) = executable.validate() {
-            return Err(retain_and_cleanup_unpublished_startup(
-                state, control, managed, error,
-            ));
-        }
+    reserve_starting_sidecar(state, managed)?;
+    if let Err(error) = spawn_sidecar_gated(state, startup_epoch, || prepared.spawn()) {
+        return Err(fail_state_owned_startup(state, control, error));
     }
-    if let Err(error) = credential.write_to_child(&mut managed.child) {
-        return Err(retain_and_cleanup_unpublished_startup(
-            state, control, managed, error,
-        ));
+    if let Err(error) = validate_state_owned_executable(state) {
+        return Err(fail_state_owned_startup(state, control, error));
     }
-    if let Err(error) = wait_for_sidecar_ready(
-        &mut managed.child,
-        allocated.port,
+    if let Err(error) = write_state_owned_credential(state, &credential) {
+        return Err(fail_state_owned_startup(state, control, error));
+    }
+    if let Err(error) = wait_for_state_owned_sidecar_ready(
+        state,
+        control,
+        port,
         &credential,
         SIDECAR_STARTUP_TIMEOUT,
-        || startup_cancelled(state, startup_epoch),
+        startup_epoch,
     ) {
-        return Err(retain_and_cleanup_unpublished_startup(
-            state, control, managed, error,
-        ));
+        return Err(fail_state_owned_startup(state, control, error));
     }
-    managed.lifecycle = ManagedLifecycle::Running;
-    managed.status.state = "running".to_string();
-    managed.status.url = Some(format!("http://127.0.0.1:{}/openevo", allocated.port));
-    let status = managed.status.clone();
-    let publish_result = publish_sidecar_gated(state, startup_epoch, managed);
-    match publish_result {
-        Ok(()) => Ok(status),
-        Err((error, managed)) => Err(retain_and_cleanup_unpublished_startup(
-            state, control, *managed, error,
-        )),
+    match publish_sidecar_gated(state, startup_epoch) {
+        Ok(status) => Ok(status),
+        Err(error) => Err(fail_state_owned_startup(state, control, error)),
     }
 }
 
@@ -2130,38 +2294,96 @@ mod tests {
     }
 
     #[test]
-    fn trusted_bundle_components_reject_writable_or_foreign_directories() {
+    fn trusted_bundle_components_apply_platform_write_policy() {
         let mut identity = mock_directory_identity(0);
-        assert!(validate_trusted_directory_for_user(&identity, 501).is_ok());
+        assert!(validate_trusted_directory_for_user(
+            &identity,
+            501,
+            TrustedDirectoryPolicy::Strict
+        )
+        .is_ok());
         identity.owner = 501;
-        assert!(validate_trusted_directory_for_user(&identity, 501).is_ok());
+        assert!(validate_trusted_directory_for_user(
+            &identity,
+            501,
+            TrustedDirectoryPolicy::Strict
+        )
+        .is_ok());
 
         identity.mode = libc::S_IFDIR | 0o770;
         assert_eq!(
-            validate_trusted_directory_for_user(&identity, 501)
+            validate_trusted_directory_for_user(&identity, 501, TrustedDirectoryPolicy::Strict,)
                 .unwrap_err()
                 .code,
             "bundled_sidecar_path_untrusted"
         );
 
         identity.owner = 0;
-        identity.mode = libc::S_IFDIR | libc::S_ISVTX | 0o777;
-        assert!(validate_trusted_directory_for_user(&identity, 501).is_ok());
-        identity.mode = libc::S_IFDIR | 0o777;
+        identity.mode = libc::S_IFDIR | 0o775;
         assert_eq!(
-            validate_trusted_directory_for_user(&identity, 501)
+            validate_trusted_directory_for_user(&identity, 501, TrustedDirectoryPolicy::Strict,)
                 .unwrap_err()
                 .code,
+            "bundled_sidecar_path_untrusted"
+        );
+        assert!(validate_trusted_directory_for_user(
+            &identity,
+            501,
+            TrustedDirectoryPolicy::MacOsBundle,
+        )
+        .is_ok());
+        identity.owner = 501;
+        assert_eq!(
+            validate_trusted_directory_for_user(
+                &identity,
+                501,
+                TrustedDirectoryPolicy::MacOsBundle,
+            )
+            .unwrap_err()
+            .code,
+            "bundled_sidecar_path_untrusted"
+        );
+
+        identity.owner = 0;
+        identity.mode = libc::S_IFDIR | libc::S_ISVTX | 0o777;
+        assert!(validate_trusted_directory_for_user(
+            &identity,
+            501,
+            TrustedDirectoryPolicy::Strict,
+        )
+        .is_ok());
+        identity.mode = libc::S_IFDIR | 0o777;
+        assert_eq!(
+            validate_trusted_directory_for_user(
+                &identity,
+                501,
+                TrustedDirectoryPolicy::MacOsBundle,
+            )
+            .unwrap_err()
+            .code,
             "bundled_sidecar_path_untrusted"
         );
 
         identity.owner = 502;
         identity.mode = libc::S_IFDIR | 0o755;
         assert_eq!(
-            validate_trusted_directory_for_user(&identity, 501)
-                .unwrap_err()
-                .code,
+            validate_trusted_directory_for_user(
+                &identity,
+                501,
+                TrustedDirectoryPolicy::MacOsBundle,
+            )
+            .unwrap_err()
+            .code,
             "bundled_sidecar_path_untrusted"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_release_selects_standard_applications_directory_policy() {
+        assert_eq!(
+            trusted_directory_policy(),
+            TrustedDirectoryPolicy::MacOsBundle
         );
     }
 
@@ -2176,6 +2398,7 @@ mod tests {
             ),
             (SidecarFixture::hard_link(), "bundled_sidecar_insecure"),
             (SidecarFixture::writable(), "bundled_sidecar_insecure"),
+            (SidecarFixture::group_writable(), "bundled_sidecar_insecure"),
             (
                 SidecarFixture::through_directory_symlink(),
                 "bundled_sidecar_path_untrusted",
@@ -2580,9 +2803,171 @@ mod tests {
     }
 
     #[test]
+    fn state_lock_timeout_keeps_starting_ownership_and_blocks_restart() {
+        let state = Arc::new(DesktopHostState::default());
+        let (mut managed, private_root, listener_port) = managed_test_sidecar();
+        managed.lifecycle = ManagedLifecycle::Starting;
+        managed.status.state = "starting".to_string();
+        managed.status.url = None;
+        *state.sidecar.lock().unwrap() = Some(managed);
+        let guard = state.sidecar.lock().unwrap();
+        let failure_state = Arc::clone(&state);
+
+        let failure = thread::spawn(move || {
+            fail_state_owned_startup_with_bounds(
+                &failure_state,
+                &OsProcessControl,
+                sidecar_start_cancelled_error(),
+                Duration::from_millis(30),
+                Duration::ZERO,
+                Duration::ZERO,
+            )
+        });
+        let error = failure.join().unwrap();
+
+        assert_eq!(error.code, "sidecar_state_timeout");
+        let managed = guard.as_ref().unwrap();
+        assert_eq!(managed.lifecycle, ManagedLifecycle::Starting);
+        assert_managed_resources(managed, &private_root, listener_port);
+        drop(guard);
+
+        let error = start_sidecar_inner(&state, LaunchPolicy::Release, None).unwrap_err();
+        assert_eq!(error.code, "sidecar_start_in_progress");
+        stop_sidecar_inner(&state).unwrap();
+        assert!(!private_root.exists());
+    }
+
+    #[test]
+    fn successful_spawn_fills_the_preowned_starting_slot() {
+        let state = DesktopHostState::default();
+        let (startup_claim, startup_epoch) = StartupClaim::acquire(&state).unwrap();
+        let allocated = allocate_sidecar_listener().unwrap();
+        let port = allocated.port;
+        reserve_starting_sidecar(
+            &state,
+            ManagedSidecar {
+                status: SidecarStatus {
+                    state: "starting".to_string(),
+                    port: Some(port),
+                    pid: None,
+                    url: None,
+                },
+                lifecycle: ManagedLifecycle::Starting,
+                child: None,
+                process_group: 0,
+                _private_launch_dir: None,
+                verified_executable: None,
+                _listener: allocated.listener,
+            },
+        )
+        .unwrap();
+
+        spawn_sidecar_gated(&state, startup_epoch, || {
+            Ok(spawn_test_process_group("sleep 30"))
+        })
+        .unwrap();
+
+        {
+            let sidecar = lock_sidecar_bounded(&state, Duration::ZERO).unwrap();
+            let managed = sidecar.as_ref().unwrap();
+            assert_eq!(managed.lifecycle, ManagedLifecycle::Starting);
+            assert!(managed.child.is_some());
+            assert!(managed.process_group > 0);
+            assert_eq!(
+                managed.status.pid,
+                Some(managed.child.as_ref().unwrap().id())
+            );
+            assert_eq!(managed._listener.local_addr().unwrap().port(), port);
+        }
+        drop(startup_claim);
+        stop_sidecar_inner(&state).unwrap();
+    }
+
+    #[test]
+    fn poisoned_state_and_cleanup_failure_retain_retryable_ownership() {
+        let state = Arc::new(DesktopHostState::default());
+        let (mut managed, private_root, listener_port) = managed_test_sidecar();
+        managed.lifecycle = ManagedLifecycle::Starting;
+        managed.status.state = "starting".to_string();
+        managed.status.url = None;
+        *state.sidecar.lock().unwrap() = Some(managed);
+
+        let poison_state = Arc::clone(&state);
+        assert!(thread::spawn(move || {
+            let _guard = poison_state.sidecar.lock().unwrap();
+            panic!("inject sidecar state poison");
+        })
+        .join()
+        .is_err());
+
+        let error = fail_state_owned_startup_with_bounds(
+            &state,
+            &ScriptedProcessControl::term_failure(),
+            sidecar_start_cancelled_error(),
+            Duration::ZERO,
+            Duration::ZERO,
+            Duration::ZERO,
+        );
+
+        assert_eq!(error.code, "sidecar_stop_failed_owned");
+        {
+            let sidecar = lock_sidecar_bounded(&state, Duration::ZERO).unwrap();
+            let managed = sidecar.as_ref().unwrap();
+            assert_eq!(managed.lifecycle, ManagedLifecycle::CleanupPending);
+            assert_owned_resources(managed, &private_root, listener_port);
+        }
+        let error = start_sidecar_inner(&state, LaunchPolicy::Release, None).unwrap_err();
+        assert_eq!(error.code, "sidecar_stop_failed_owned");
+        stop_sidecar_inner(&state).unwrap();
+        assert!(!private_root.exists());
+    }
+
+    #[test]
+    fn ready_publication_waits_for_short_state_contention() {
+        let state = Arc::new(DesktopHostState::default());
+        let (startup_claim, startup_epoch) = StartupClaim::acquire(&state).unwrap();
+        let (mut managed, private_root, _) = managed_test_sidecar();
+        managed.lifecycle = ManagedLifecycle::Starting;
+        managed.status.state = "starting".to_string();
+        managed.status.url = None;
+        *state.sidecar.lock().unwrap() = Some(managed);
+        let guard = state.sidecar.lock().unwrap();
+        let before_state_lock = Arc::new(Barrier::new(2));
+        let publish_state = Arc::clone(&state);
+        let reached = Arc::clone(&before_state_lock);
+
+        let publication = thread::spawn(move || {
+            publish_sidecar_gated_with(
+                &publish_state,
+                startup_epoch,
+                Duration::from_secs(1),
+                || {
+                    reached.wait();
+                },
+            )
+        });
+        before_state_lock.wait();
+        drop(guard);
+
+        let status = publication.join().unwrap().unwrap();
+        assert_eq!(status.state, "running");
+        assert_eq!(
+            lock_sidecar_bounded(&state, Duration::ZERO)
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .lifecycle,
+            ManagedLifecycle::Running
+        );
+        drop(startup_claim);
+        stop_sidecar_inner(&state).unwrap();
+        assert!(!private_root.exists());
+    }
+
+    #[test]
     fn cancellation_gate_prevents_later_spawn_and_publish() {
         let state = Arc::new(DesktopHostState::default());
-        let (_startup_claim, startup_epoch) = StartupClaim::acquire(&state).unwrap();
+        let (startup_claim, startup_epoch) = StartupClaim::acquire(&state).unwrap();
         let cancellation_advanced = Arc::new(Barrier::new(2));
         let release_cancellation = Arc::new(Barrier::new(2));
         let spawn_attempted = Arc::new(Barrier::new(2));
@@ -2617,13 +3002,16 @@ mod tests {
         assert_eq!(error.code, "sidecar_start_cancelled");
         assert!(!spawn_called.load(Ordering::Acquire));
 
-        let (managed, private_root, _) = managed_test_sidecar();
-        let (error, managed) = publish_sidecar_gated(&state, startup_epoch, managed)
+        let (mut managed, private_root, _) = managed_test_sidecar();
+        managed.lifecycle = ManagedLifecycle::Starting;
+        managed.status.state = "starting".to_string();
+        managed.status.url = None;
+        *state.sidecar.lock().unwrap() = Some(managed);
+        let error = publish_sidecar_gated(&state, startup_epoch)
             .expect_err("cancelled startup must not publish");
         assert_eq!(error.code, "sidecar_start_cancelled");
-        let mut managed = *managed;
-        cleanup_managed_sidecar(&mut managed).unwrap();
-        drop(managed);
+        drop(startup_claim);
+        stop_sidecar_inner(&state).unwrap();
         assert!(!private_root.exists());
         assert!(state.sidecar.lock().unwrap().is_none());
     }
@@ -2653,7 +3041,16 @@ mod tests {
         assert!(guard.is_some());
         let deadline = Instant::now() + Duration::from_secs(1);
         loop {
-            if guard.as_mut().unwrap().child.try_wait().unwrap().is_some() {
+            if guard
+                .as_mut()
+                .unwrap()
+                .child
+                .as_mut()
+                .unwrap()
+                .try_wait()
+                .unwrap()
+                .is_some()
+            {
                 break;
             }
             assert!(
@@ -2908,6 +3305,10 @@ mod tests {
             Self::file(b"sidecar", 0o722)
         }
 
+        fn group_writable() -> Self {
+            Self::file(b"sidecar", 0o770)
+        }
+
         fn file(contents: &[u8], mode: u32) -> Self {
             let root = unique_test_dir();
             fs::create_dir(&root).unwrap();
@@ -3078,7 +3479,7 @@ mod tests {
                     url: Some(format!("http://127.0.0.1:{listener_port}/openevo")),
                 },
                 lifecycle: ManagedLifecycle::Running,
-                child,
+                child: Some(child),
                 process_group,
                 _private_launch_dir: Some(private_launch_dir),
                 verified_executable: Some(verified_executable),
@@ -3091,6 +3492,10 @@ mod tests {
 
     fn assert_owned_resources(managed: &ManagedSidecar, private_root: &Path, listener_port: u16) {
         assert_eq!(managed.status.state, "cleanup_pending");
+        assert_managed_resources(managed, private_root, listener_port);
+    }
+
+    fn assert_managed_resources(managed: &ManagedSidecar, private_root: &Path, listener_port: u16) {
         assert!(managed._private_launch_dir.is_some());
         assert!(private_root.exists());
         managed
@@ -3103,6 +3508,6 @@ mod tests {
             managed._listener.local_addr().unwrap().port(),
             listener_port
         );
-        assert!(managed.child.id() > 0);
+        assert!(managed.child.as_ref().unwrap().id() > 0);
     }
 }

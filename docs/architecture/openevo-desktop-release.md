@@ -59,11 +59,14 @@ wheel does not alter `src/openevo/wheels` in the checkout.
 Part of #158 establishes the first release-only native-host boundary. A release
 build derives the sidecar source path only from the current application
 executable and the `bundle.externalBin` basename. Every bundle directory
-component is opened relative to a held directory FD with `O_NOFOLLOW`, must be
-owned by root or the effective user, and must not be group/world writable. A
-root-owned sticky directory such as the system temporary directory is the only
-writable component exception. Set-user-ID execution is rejected by requiring
-the real and effective UID to match.
+component is opened relative to a held directory FD with `O_NOFOLLOW` and must
+be owned by root or the effective user. Linux rejects group/world-writable
+components except a root-owned sticky boundary such as the system temporary
+directory. macOS additionally permits a root-owned, group-writable component
+that is not world-writable; this covers the standard root:admin `0775`
+`/Applications` directory. User-owned group-writable components and every
+non-sticky world-writable component remain invalid. Set-user-ID execution is
+rejected by requiring the real and effective UID to match.
 
 Linux obtains the loaded executable vnode through `/proc/self/exe`; its owner
 must be root or the effective user, and the sidecar source owner must match it
@@ -72,10 +75,12 @@ loaded by the process. The macOS policy therefore does not claim that reopening
 `current_exe()` authenticates the loaded image: it accepts a sidecar owned by
 root or the effective user only after the no-follow component policy above.
 This explicitly supports root-owned and user-owned bundles while rejecting a
-third UID, provided every path component meets the write policy. A root-owned
-app beneath a group-writable `/Applications` directory is deliberately rejected;
-release packaging must use an installation location whose complete path
-satisfies this policy. A same-UID process remains inside this phase-one trust
+third UID, including the normal drag-to-`/Applications` installation. Allowing
+root-owned group-writable macOS components does not turn a replacement into a
+trusted file: each opened component must still be root/effective-user owned,
+the retained no-follow FDs anchor subsequent traversal, and the final source
+must independently be root/effective-user owned, link-count one, and not
+group/world writable. A same-UID process remains inside this phase-one trust
 boundary.
 
 The source must be a non-empty, link-count-one regular executable that is not
@@ -138,25 +143,42 @@ The child starts in its own process group. Explicit stop, startup failure,
 restart cleanup, and Tauri `ExitRequested`/`Exit` handling signal the complete
 group with TERM, poll for a fixed interval, escalate to KILL, and poll for a
 second fixed interval. Stop and exit first advance a cancellation epoch so an
-in-progress startup cannot publish or spawn after cancellation. A short native
+in-progress startup cannot publish or spawn after cancellation. The native
 launch gate linearizes epoch capture, spawn plus emergency process-group
-publication, cancellation advance, and running-state publication. It is not
-held during source verification or readiness polling, and the global sidecar
-state mutex is also released across those operations. Stop waits a bounded time
-for a cancelled local startup to retain or release ownership. State-lock
-acquisition is time-bounded, and no failure path performs an unbounded
-`Child::wait`. An unexpected TERM, KILL, child-wait, or group-inspection failure,
-including `try_wait` failure during status or restart inspection, moves the
-manager to `cleanup_pending`; it retains `Child`, process-group ID, private
-directory, executable FD, and listener, blocks another start, and lets explicit
-stop retry cleanup. Resources are dropped only after the child is reaped and
-the full process group is confirmed absent.
+publication, cancellation advance, and running-state publication. Before
+spawn, the manager publishes an exclusive state-owned `starting` slot holding
+the listener, private directory, and executable FD. `Command::spawn` fills that
+same slot with `Child` and process-group ownership before either lock is
+released. Readiness takes only short state locks for child inspection; credential
+I/O, network polling, and source validation do not leave process ownership in a
+local value. Running publication waits up to the bounded state-lock interval,
+so ordinary status contention cannot spuriously reject a ready child.
 
-The exit hook first updates atomically shared cancellation and process-group
-state, so it can issue TERM and KILL even while the manager mutex is busy. It
-then retries manager-owned cleanup with bounded lock access. The configured
-worst case is 250 ms emergency TERM grace, 3 seconds for state-lock access, and
-two 1-second cleanup polls: 5.25 seconds plus constant-time syscalls.
+Every post-spawn failure therefore leaves the complete slot available to status,
+restart blocking, exit cleanup, and explicit stop retry until group cleanup is
+proved. Mutex poison is recovered as fail-closed retained state; lock timeout
+leaves the slot unchanged. An unexpected TERM, KILL, child-wait, or
+group-inspection failure, including `try_wait` failure during status or restart
+inspection, moves the manager to `cleanup_pending`. Resources are dropped only
+after the child is reaped and the full process group is confirmed absent. No
+failure path performs an unbounded `Child::wait`.
+
+The launch gate is held across `Command::spawn` to preserve that ordering.
+Rust's Unix spawn path can wait for its child exec/error channel, so launch-gate
+wait is not claimed to have a strict wall-clock bound. The `pre_exec` closure is
+restricted to `setpgid`, `dup2`, `fcntl`, `fstat`, fixed-size comparisons, and
+non-allocating fixed OS-error construction; no lock, heap allocation, logging,
+or other non-async-signal-safe application work runs after `fork` and before
+`exec`.
+
+The exit hook sets the atomic shutdown flag before waiting for the launch gate.
+After acquiring that gate it advances cancellation and reads the atomically
+published process group, so it can issue TERM and KILL even while the manager
+mutex is busy. It then retries manager-owned cleanup with bounded lock access.
+The configured cleanup sequence after launch-gate acquisition is 250 ms
+emergency TERM grace, 3 seconds for state-lock access, and two 1-second cleanup
+polls: 5.25 seconds plus constant-time syscalls. This is not an end-to-end exit
+bound while another thread is inside `Command::spawn`, as described above.
 Sidecar stdout and stderr are connected to the null device. There is no native
 raw-log buffer and no `app_logs` Tauri command, so renderer JavaScript cannot
 receive child output; sidecar status also omits command, path, argv, credential,
