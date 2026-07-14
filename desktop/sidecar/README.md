@@ -222,6 +222,13 @@ The current provider implements:
   committed/startup lifecycle cleanup;
   this route is deliberately absent from the public Local API OpenAPI document.
 
+The dedicated Core bridge store commits a generation-zero `pending` identity
+before publishing its root-local marker and parent anchor, then marks the row
+`bound`. Restart completes only that exact empty, inode-bound pending bootstrap;
+unknown old state is never adopted. Durable unknown workspace finalize authority
+is replayed with its original request, ETags, and key before the bridge applies
+any newer Local project or workspace patch.
+
 Connection mutations atomically reserve idempotency capacity, two fixed terminal
 response slots for the operation and idempotency documents, profile action
 ownership, and a running operation before external SSH work. One process-wide

@@ -534,9 +534,15 @@ class FakeCore:
                 imported_patch = isinstance(
                     self.request.workspace, core_v1.ImportedWorkspaceSpecV1
                 )
+                imported_published = (
+                    imported_patch
+                    and self.upload is not None
+                    and self.upload.status is core_v1.WorkspaceUploadStatus.FINALIZED
+                )
                 patched_project = _project(
                     self.request,
-                    ready=not imported_patch,
+                    ready=not imported_patch or imported_published,
+                    imported_published=imported_published,
                     project_snapshot=self.project_snapshot,
                     task_snapshot=self.task_snapshot,
                     workspace_snapshot=self.workspace_snapshot,

@@ -433,6 +433,128 @@ def test_unknown_workspace_finalize_replays_exact_request_after_store_restart(
     reopened.close()
 
 
+@pytest.mark.parametrize("latest_change", ["workspace", "project"], ids=["workspace", "non-workspace"])
+def test_unknown_finalize_replays_before_latest_local_intent_after_restart(
+    tmp_path: Path,
+    latest_change: str,
+) -> None:
+    from tests.openevo.sidecar import test_core_bridge_v1 as bridge_tests
+
+    root = tmp_path / "state"
+    original = bridge_tests._local_project()
+    archive_a = b"\1" * 1024
+    source_a = local_v1.ProjectSourceV1(
+        kind="native_folder_snapshot",
+        display_name="Imported workspace A",
+        import_ref=local_v1.WorkspaceImportRefV1(
+            import_id="adopted-unknown-finalize-a",
+            content_sha256=hashlib.sha256(archive_a).hexdigest(),
+            byte_size=len(archive_a),
+            entry_count=0,
+            extracted_byte_size=0,
+        ),
+    )
+    imported_a = original.model_copy(
+        update={"source": source_a, "updated_at": "2026-07-14T12:40:00Z"}
+    )
+    fake_core = bridge_tests.FakeCore(original)
+    store = DesktopCoreBridgeStoreV1(root)
+    first, _, _, _ = bridge_tests._bridge(
+        original,
+        persistence=store,
+        fake_core=fake_core,
+    )
+    first.activate_project(original, idempotency_key="unknown-finalize-base-0001")
+    first.close()
+
+    fake_core.lose_finalize_after_apply_once = True
+    second, _, _, _ = bridge_tests._bridge(
+        imported_a,
+        persistence=store,
+        fake_core=fake_core,
+        archive_source=bridge_tests.FakeArchiveSource(archive_a),
+    )
+    with pytest.raises(bridge_tests.CoreClientErrorV1):
+        second.activate_project(imported_a, idempotency_key="unknown-finalize-a-0002")
+    second.close()
+
+    pending_patch = store.load_patch(LOCAL_PROJECT_ID)
+    pending_create = store.load_create(LOCAL_PROJECT_ID)
+    assert pending_patch is not None and pending_patch.state.value == "applied"
+    assert pending_create is not None and pending_create.workspace_upload_finalize is not None
+    assert pending_create.workspace_upload_finalize.state.value == "unknown"
+    first_finalize = fake_core.finalize_requests[0]
+    store.close()
+
+    archive_latest = archive_a
+    if latest_change == "workspace":
+        archive_latest = b"\2" * 1024
+        latest = imported_a.model_copy(
+            update={
+                "source": local_v1.ProjectSourceV1(
+                    kind="native_folder_snapshot",
+                    display_name="Imported workspace B",
+                    import_ref=local_v1.WorkspaceImportRefV1(
+                        import_id="adopted-unknown-finalize-b",
+                        content_sha256=hashlib.sha256(archive_latest).hexdigest(),
+                        byte_size=len(archive_latest),
+                        entry_count=0,
+                        extracted_byte_size=0,
+                    ),
+                ),
+                "updated_at": "2026-07-14T12:41:00Z",
+            }
+        )
+    else:
+        latest = imported_a.model_copy(
+            update={
+                "name": "Protein design with revised objective",
+                "task": local_v1.ProjectTaskV1(
+                    title="Revised objective",
+                    objective="Apply the latest non-workspace Local intent.",
+                ),
+                "updated_at": "2026-07-14T12:41:00Z",
+            }
+        )
+
+    reopened = DesktopCoreBridgeStoreV1(root)
+    call_start = len(fake_core.calls)
+    third, _, _, _ = bridge_tests._bridge(
+        latest,
+        persistence=reopened,
+        fake_core=fake_core,
+        archive_source=bridge_tests.FakeArchiveSource(archive_latest),
+    )
+    activation = third.activate_project(
+        latest,
+        idempotency_key="unknown-finalize-latest-0003",
+    )
+    third.close()
+
+    replay_calls = fake_core.calls[call_start:]
+    finalize_index = next(
+        index
+        for index, request in enumerate(replay_calls)
+        if request.method == "POST" and request.url.path.endswith("/finalize")
+    )
+    patch_index = next(
+        index for index, request in enumerate(replay_calls) if request.method == "PATCH"
+    )
+    assert finalize_index < patch_index
+    assert fake_core.finalize_requests[:2] == [first_finalize, first_finalize]
+    assert activation.core_project.name == latest.name
+    assert activation.core_project.workspace == map_project_create_v1(latest).workspace
+    assert reopened.load_patch(LOCAL_PROJECT_ID) is None
+    completed_create = reopened.load_create(LOCAL_PROJECT_ID)
+    assert completed_create is not None
+    assert completed_create.workspace_upload_finalize is not None
+    assert completed_create.workspace_upload_finalize.state.value == "applied"
+    completed_mapping = reopened.load_mapping(LOCAL_PROJECT_ID)
+    assert completed_mapping is not None
+    assert completed_mapping.project_create == map_project_create_v1(latest)
+    reopened.close()
+
+
 def test_create_reservation_and_every_transition_are_exact_full_row_cas(tmp_path: Path) -> None:
     store = DesktopCoreBridgeStoreV1(tmp_path / "state")
     first = store.reserve_create(_create_operation(key="activate-project-0001"))
@@ -1070,6 +1192,86 @@ def test_nonempty_store_without_identity_marker_fails_closed(tmp_path: Path) -> 
     (root / store_module.IDENTITY_MARKER_FILENAME).unlink()
 
     with pytest.raises(CoreBridgeStoreStateRootError, match="identity marker"):
+        DesktopCoreBridgeStoreV1(root)
+
+
+@pytest.mark.parametrize(
+    "failed_stage",
+    ["inner-marker", "root-anchor", "binding-commit"],
+)
+def test_fresh_pending_identity_binding_recovers_after_marker_publish_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failed_stage: str,
+) -> None:
+    root = tmp_path / "state"
+    attribute = {
+        "inner-marker": "_write_identity_marker",
+        "root-anchor": "_write_root_anchor",
+        "binding-commit": "_complete_pending_store_binding",
+    }[failed_stage]
+    original = getattr(DesktopCoreBridgeStoreV1, attribute)
+    failed = False
+
+    def fail_marker_once(
+        self: DesktopCoreBridgeStoreV1, identity: dict[str, object]
+    ) -> None:
+        nonlocal failed
+        if not failed:
+            failed = True
+            if failed_stage == "inner-marker":
+                name = store_module.IDENTITY_MARKER_FILENAME
+                dir_fd = self._root_fd
+            else:
+                name = self._anchor_name
+                dir_fd = self._anchor_parent_fd
+            descriptor = os.open(name, os.O_RDWR | os.O_NOFOLLOW, dir_fd=dir_fd)
+            try:
+                os.ftruncate(descriptor, store_module.MARKER_FILE_BYTES)
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            raise OSError("injected initial marker publication failure")
+        original(self, identity)
+
+    def fail_binding_once(
+        self: DesktopCoreBridgeStoreV1,
+        connection: sqlite3.Connection,
+    ) -> None:
+        nonlocal failed
+        if not failed:
+            failed = True
+            identity = self._identity_row(connection)
+            self._write_identity_marker(identity)
+            self._write_root_anchor(identity)
+            raise OSError("injected initial marker publication failure")
+        original(self, connection)
+
+    monkeypatch.setattr(
+        DesktopCoreBridgeStoreV1,
+        attribute,
+        fail_binding_once if failed_stage == "binding-commit" else fail_marker_once,
+    )
+    with pytest.raises(OSError, match="injected initial marker"):
+        DesktopCoreBridgeStoreV1(root)
+
+    reopened = DesktopCoreBridgeStoreV1(root)
+    assert reopened.load_create(LOCAL_PROJECT_ID) is None
+    with sqlite3.connect(reopened.database_path) as connection:
+        assert connection.execute(
+            "SELECT binding_state FROM store_identity"
+        ).fetchone() == ("bound",)
+    reopened.close()
+
+
+def test_fresh_database_does_not_claim_unknown_old_state(tmp_path: Path) -> None:
+    root = tmp_path / "state"
+    root.mkdir(mode=0o700)
+    unknown = root / "legacy-bridge-state.json"
+    unknown.write_text("{}", encoding="utf-8")
+    os.chmod(unknown, 0o600)
+
+    with pytest.raises(CoreBridgeStoreStateRootError, match="unknown managed state"):
         DesktopCoreBridgeStoreV1(root)
 
 

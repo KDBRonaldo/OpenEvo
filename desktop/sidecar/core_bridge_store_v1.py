@@ -38,7 +38,7 @@ from desktop.sidecar.core_bridge_v1 import (
 from openevo.backend.contracts.v1 import models as core_v1
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 DATABASE_FILENAME = "core-bridge-v1.sqlite3"
 JOURNAL_FILENAME = f"{DATABASE_FILENAME}-journal"
 WAL_FILENAME = f"{DATABASE_FILENAME}-wal"
@@ -97,7 +97,7 @@ _SCHEMA = (
     """
     CREATE TABLE schema_metadata (
         singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-        schema_version INTEGER NOT NULL CHECK (schema_version = 2),
+        schema_version INTEGER NOT NULL CHECK (schema_version = 3),
         schema_fingerprint TEXT NOT NULL CHECK (length(schema_fingerprint) = 64)
     ) STRICT
     """,
@@ -118,7 +118,8 @@ _SCHEMA = (
         marker_generation INTEGER NOT NULL CHECK (marker_generation >= 0),
         authority_digest TEXT NOT NULL CHECK (length(authority_digest) = 64),
         previous_marker_generation INTEGER NOT NULL CHECK (previous_marker_generation >= 0),
-        previous_authority_digest TEXT NOT NULL CHECK (length(previous_authority_digest) = 64)
+        previous_authority_digest TEXT NOT NULL CHECK (length(previous_authority_digest) = 64),
+        binding_state TEXT NOT NULL CHECK (binding_state IN ('pending', 'bound'))
     ) STRICT
     """,
     f"""
@@ -975,6 +976,7 @@ class DesktopCoreBridgeStoreV1:
         root_stat = os.fstat(self._root_fd)
         self._root_identity = (root_stat.st_dev, root_stat.st_ino)
         try:
+            self._reject_unknown_state_entries()
             self._open_anchor_parent(root.parent)
             self._ensure_empty_private_file(OWNER_LOCK_FILENAME)
             self._acquire_owner_lock()
@@ -1129,6 +1131,22 @@ class DesktopCoreBridgeStoreV1:
             raise CoreBridgeStoreStateRootError("bridge state root ownership changed")
         if stat.S_IMODE(path_stat.st_mode) != 0o700:
             raise CoreBridgeStoreStateRootError("bridge state root mode changed")
+
+    def _reject_unknown_state_entries(self) -> None:
+        allowed = frozenset((*_MANAGED_FILES, *_SQLITE_SIDE_FILES))
+        try:
+            with os.scandir(self._root_fd) as entries:
+                for entry in entries:
+                    if entry.name not in allowed:
+                        raise CoreBridgeStoreStateRootError(
+                            "bridge state root contains unknown managed state"
+                        )
+        except CoreBridgeStoreError:
+            raise
+        except OSError as exc:
+            raise CoreBridgeStoreStateRootError(
+                "bridge state root could not be enumerated"
+            ) from exc
 
     @staticmethod
     def _file_identity(value: os.stat_result) -> tuple[int, int]:
@@ -1398,16 +1416,16 @@ class DesktopCoreBridgeStoreV1:
             raise CoreBridgeStoreSchemaError("bridge schema could not be read") from exc
         if rows != _EXPECTED_SCHEMA_ROWS or digest != _EXPECTED_SCHEMA_DIGEST:
             raise CoreBridgeStoreSchemaError(
-                "bridge schema fingerprint does not match canonical private v2"
+                "bridge schema fingerprint does not match canonical private v3"
             )
         metadata = connection.execute(
             "SELECT singleton, schema_version, schema_fingerprint FROM schema_metadata"
         ).fetchall()
         if [tuple(row) for row in metadata] != [(1, SCHEMA_VERSION, _EXPECTED_SCHEMA_DIGEST)]:
-            raise CoreBridgeStoreSchemaError("bridge schema metadata does not match private v2")
+            raise CoreBridgeStoreSchemaError("bridge schema metadata does not match private v3")
         if connection.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION:
             raise CoreBridgeStoreSchemaError(
-                "bridge SQLite user_version does not match private v2"
+                "bridge SQLite user_version does not match private v3"
             )
 
     @staticmethod
@@ -1435,7 +1453,12 @@ class DesktopCoreBridgeStoreV1:
                 "bridge database store identity row is missing or duplicated"
             )
         row = dict(rows[0])
-        text_fields = ("store_id", "authority_digest", "previous_authority_digest")
+        text_fields = (
+            "store_id",
+            "authority_digest",
+            "previous_authority_digest",
+            "binding_state",
+        )
         integer_fields = (
             "root_device",
             "root_inode",
@@ -1456,8 +1479,12 @@ class DesktopCoreBridgeStoreV1:
             or any(type(row.get(field)) is not int for field in integer_fields)
         ):
             raise CoreBridgeStoreStateRootError("bridge database store identity is invalid")
-        for field in text_fields:
+        for field in ("store_id", "authority_digest", "previous_authority_digest"):
             _digest(row[field], label=f"store identity {field}")
+        if row["binding_state"] not in ("pending", "bound"):
+            raise CoreBridgeStoreStateRootError(
+                "bridge database store identity binding state is invalid"
+            )
         return row
 
     @staticmethod
@@ -1488,6 +1515,7 @@ class DesktopCoreBridgeStoreV1:
         dir_fd: int,
         expected: os.stat_result,
         label: str,
+        allow_unpublished: bool = False,
     ) -> dict[str, object] | None:
         flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
         try:
@@ -1563,6 +1591,8 @@ class DesktopCoreBridgeStoreV1:
             except (CoreBridgeStoreError, TypeError, ValueError, json.JSONDecodeError):
                 continue
         if not records:
+            if allow_unpublished and raw.rstrip(b" \0") == b"":
+                return None
             raise CoreBridgeStoreStateRootError(
                 f"bridge durable {label} has no valid slot"
             )
@@ -1576,20 +1606,26 @@ class DesktopCoreBridgeStoreV1:
             )
         return records[-1]
 
-    def _read_identity_marker(self) -> dict[str, object] | None:
+    def _read_identity_marker(
+        self, *, allow_unpublished: bool = False
+    ) -> dict[str, object] | None:
         return self._read_marker_file(
             name=IDENTITY_MARKER_FILENAME,
             dir_fd=self._root_fd,
             expected=self._verify_private_file(IDENTITY_MARKER_FILENAME),
             label="identity marker",
+            allow_unpublished=allow_unpublished,
         )
 
-    def _read_root_anchor(self) -> dict[str, object] | None:
+    def _read_root_anchor(
+        self, *, allow_unpublished: bool = False
+    ) -> dict[str, object] | None:
         return self._read_marker_file(
             name=self._anchor_name,
             dir_fd=self._anchor_parent_fd,
             expected=self._verify_anchor_file(),
             label="root identity anchor",
+            allow_unpublished=allow_unpublished,
         )
 
     def _write_marker_file(
@@ -1657,6 +1693,10 @@ class DesktopCoreBridgeStoreV1:
         recover_forward: bool,
     ) -> None:
         identity = self._identity_row(connection)
+        if identity["binding_state"] != "bound":
+            raise CoreBridgeStoreStateRootError(
+                "bridge database store identity binding is not complete"
+            )
         physical = {
             "root_device": self._root_identity[0],
             "root_inode": self._root_identity[1],
@@ -1711,6 +1751,103 @@ class DesktopCoreBridgeStoreV1:
                 f"bridge database and durable {label} authority differ"
             )
 
+    def _complete_pending_store_binding(self, connection: sqlite3.Connection) -> None:
+        identity = self._identity_row(connection)
+        if identity["binding_state"] != "pending":
+            return
+        empty_authority = self._authority_digest(connection)
+        authority_rows = sum(
+            cast(int, connection.execute(f"SELECT count(*) FROM {table}").fetchone()[0])
+            for table in (
+                "create_operations",
+                "patch_operations",
+                "mappings",
+                "mapping_history",
+            )
+        )
+        if (
+            identity["marker_generation"] != 0
+            or identity["previous_marker_generation"] != 0
+            or identity["authority_digest"] != empty_authority
+            or identity["previous_authority_digest"] != empty_authority
+            or authority_rows != 0
+        ):
+            raise CoreBridgeStoreStateRootError(
+                "pending bridge store identity does not describe a fresh empty store"
+            )
+        physical = {
+            "root_device": self._root_identity[0],
+            "root_inode": self._root_identity[1],
+            "database_device": self._managed_identities[DATABASE_FILENAME][0],
+            "database_inode": self._managed_identities[DATABASE_FILENAME][1],
+            "marker_device": self._managed_identities[IDENTITY_MARKER_FILENAME][0],
+            "marker_inode": self._managed_identities[IDENTITY_MARKER_FILENAME][1],
+            "anchor_device": self._anchor_identity[0],
+            "anchor_inode": self._anchor_identity[1],
+            "lock_device": self._managed_identities[OWNER_LOCK_FILENAME][0],
+            "lock_inode": self._managed_identities[OWNER_LOCK_FILENAME][1],
+        }
+        if any(identity[key] != value for key, value in physical.items()):
+            raise CoreBridgeStoreStateRootError(
+                "pending bridge store identity has a different physical binding"
+            )
+        expected_marker = self._marker_payload(identity)
+        marker_operations = (
+            (
+                "identity marker",
+                lambda: self._read_identity_marker(allow_unpublished=True),
+                self._write_identity_marker,
+            ),
+            (
+                "root identity anchor",
+                lambda: self._read_root_anchor(allow_unpublished=True),
+                self._write_root_anchor,
+            ),
+        )
+        for label, reader, writer in marker_operations:
+            marker = reader()
+            if marker is None:
+                writer(identity)
+                marker = reader()
+            if marker != expected_marker:
+                raise CoreBridgeStoreStateRootError(
+                    f"pending bridge durable {label} differs from store identity"
+                )
+
+        try:
+            connection.execute("BEGIN EXCLUSIVE")
+            if self._identity_row(connection) != identity:
+                raise CoreBridgeStoreStateRootError(
+                    "pending bridge store identity changed during binding"
+                )
+            if self._authority_digest(connection) != empty_authority:
+                raise CoreBridgeStoreStateRootError(
+                    "pending bridge authority changed during binding"
+                )
+            updated = connection.execute(
+                """
+                UPDATE store_identity
+                SET binding_state = 'bound'
+                WHERE singleton = 1 AND binding_state = 'pending'
+                """
+            )
+            if updated.rowcount != 1:
+                raise CoreBridgeStoreStateRootError(
+                    "pending bridge store identity could not be bound"
+                )
+            connection.commit()
+        except CoreBridgeStoreError:
+            connection.rollback()
+            raise
+        except sqlite3.DatabaseError as exc:
+            connection.rollback()
+            raise CoreBridgeStoreSchemaError(
+                "pending bridge store identity binding failed"
+            ) from exc
+        except BaseException:
+            connection.rollback()
+            raise
+
     def _initialize_schema(self, *, fresh_database: bool) -> None:
         connection = self._connection
         fresh_identity: dict[str, object] | None = None
@@ -1757,15 +1894,24 @@ class DesktopCoreBridgeStoreV1:
                     "authority_digest": authority_digest,
                     "previous_marker_generation": 0,
                     "previous_authority_digest": authority_digest,
+                    "binding_state": "pending",
                 }
                 connection.execute(
                     """
-                    INSERT INTO store_identity VALUES (
+                    INSERT INTO store_identity (
+                        singleton, store_id, root_device, root_inode,
+                        database_device, database_inode, marker_device, marker_inode,
+                        anchor_device, anchor_inode, lock_device, lock_inode,
+                        marker_generation, authority_digest,
+                        previous_marker_generation, previous_authority_digest,
+                        binding_state
+                    ) VALUES (
                         :singleton, :store_id, :root_device, :root_inode,
                         :database_device, :database_inode, :marker_device, :marker_inode,
                         :anchor_device, :anchor_inode, :lock_device, :lock_inode,
                         :marker_generation, :authority_digest,
-                        :previous_marker_generation, :previous_authority_digest
+                        :previous_marker_generation, :previous_authority_digest,
+                        :binding_state
                     )
                     """,
                     fresh_identity,
@@ -1794,9 +1940,7 @@ class DesktopCoreBridgeStoreV1:
         except BaseException:
             connection.rollback()
             raise
-        if fresh_identity is not None:
-            self._write_identity_marker(fresh_identity)
-            self._write_root_anchor(fresh_identity)
+        self._complete_pending_store_binding(connection)
         self._identity_ready = True
         self._verify_storage_files()
         self._validate_store_binding(connection, recover_forward=True)

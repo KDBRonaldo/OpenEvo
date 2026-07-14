@@ -873,6 +873,17 @@ class DesktopCoreBridgeV1:
                 lambda: self._persistence.load_patch(project.project_id),
                 label="project patch operation read",
             )
+            pending_finalize = operation.workspace_upload_finalize
+            if (
+                pending_finalize is not None
+                and pending_finalize.state is not CoreWorkspaceUploadFinalizeStateV1.APPLIED
+            ):
+                core_project, operation = self._resume_workspace_finalize(
+                    token=token,
+                    deadline=deadline,
+                    client=client,
+                    operation=operation,
+                )
             initial_revision_authority: core_v1.RevisionRefV1 | None = None
             if mapping is None:
                 authority_anchor = (

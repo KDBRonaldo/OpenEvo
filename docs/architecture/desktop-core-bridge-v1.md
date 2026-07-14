@@ -49,6 +49,16 @@ barrier. A concurrent client close rolls the restored authority back. Clearing
 the abort and stale upload binding is one create-operation CAS. Already terminal
 uploads need no abort and may be cleared after their exact identity is read.
 
+A persisted nonterminal workspace finalize is recovered before any pending
+project patch is interpreted or any patch for newer Local intent is reserved.
+The bridge first replays the original open-upload request with its exact ETags
+and idempotency key and persists the validated terminal response. It then
+commits the already-applied project intent as the next mapping generation and
+converges separately to the latest Local intent. This also applies when the
+newer edit changes only project/task fields and keeps the imported workspace;
+`patch=applied` plus `finalize=unknown` cannot strand the project or be bypassed
+by a newer workspace selection.
+
 Each Local project may also have one durable patch operation. It stores the
 canonical old and new `ProjectCreateV1` intents and digests, canonical
 `ProjectPatchV1` and digest, deterministic key, Core project identity, complete
@@ -107,7 +117,7 @@ nonblocking cross-process `flock` and process-local reentrant transaction lock
 make one connection the only writer/reader owner. Forked children reject the
 inherited store and do not explicitly unlock the parent's lease.
 
-SQLite v1 uses DELETE journaling and `synchronous=FULL`; WAL and SHM are
+SQLite private schema v3 uses DELETE journaling and `synchronous=FULL`; WAL and SHM are
 forbidden. The store enforces 1-GiB database and 2-GiB journal limits, exact
 schema rows plus a bound schema-fingerprint metadata row, SQLite integrity and
 foreign-key checks, and canonical authority-graph recovery. Recovery admits at
@@ -127,6 +137,18 @@ share one transaction; rollback preserves the prior mapping and patch. An exact
 retry recognizes the fully committed state after an ambiguous commit without
 adding another history row, but fails if a later pending patch now owns the
 project transition.
+
+Fresh identity bootstrap uses an explicit database `pending` to `bound`
+protocol. Schema, the generation-zero store identity, and empty authority are
+committed first. The inner identity marker and parent anchor are then published
+and verified before the database identity becomes `bound`. Restart may complete
+that sequence only when the pending row names the exact database, lock, root,
+marker and anchor inodes, both authority digests equal the canonical empty
+store, generation is zero, and all authority tables are empty. Either marker
+may be empty or already contain that exact pending identity. A bound store
+requires both markers. Unknown entries in a fresh dedicated state root,
+unrecognized schemas, nonempty pending authority, or mismatched marker identity
+fail closed instead of being claimed as a new store.
 
 ## Session Ownership
 
