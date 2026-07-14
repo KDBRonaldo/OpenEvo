@@ -287,11 +287,22 @@ ephemeral `SSHAuthConfig`; credential values must never enter the Local API or
 provider store. Profile proxy URLs and `no_proxy` are projected into the remote
 profile, but user information in proxy URLs is rejected by the contract.
 
-Core bootstrap/tunnel operations, activation, validation, runs, artifacts,
-services, diagnostics, maintenance, and events remain unavailable in this
-provider slice and return a closed `ApiErrorV1` with HTTP 503. They never return
-fixture data or a synthetic ready/success state. A successful SSH check reports
-Core as `offline` with `core_not_started`; it does not claim a live tunnel.
+When release composition supplies an active `DesktopCoreBridgeV1`, the provider
+forwards capability and validation reads plus Core-owned runs, timelines, logs,
+artifacts, services, diagnostics, maintenance, and operations through that
+bridge. Run admission first matches the saved Local project ETag; capability and
+validation envelopes bind the returned Core authority to the current Local
+project identity and ETag. Typed Core failures are preserved without exposing a
+Core URL or bearer. Without an injected bridge these routes remain fail-closed.
+
+Core bootstrap/tunnel composition, Local activation/doctor/repair/workspace-sync
+operations, Local operation logs/cancellation, and Desktop event aggregation
+remain unavailable in this provider slice. The advertised feature set therefore
+remains `remote_profiles` only; direct route wiring is not sufficient to claim a
+complete release feature. Unavailable routes return a closed `ApiErrorV1` with
+HTTP 503 and never fixture data or a synthetic ready/success state. A successful
+SSH check reports Core as `offline` with `core_not_started`; it does not claim a
+live tunnel.
 
 `core_bridge_v1.py` now provides the strict active-project bridge needed by the
 next provider slice. It injects a host-global `CoreHostService`, a tunnel

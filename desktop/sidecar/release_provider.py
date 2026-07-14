@@ -14,6 +14,7 @@ from typing import Literal, NoReturn, cast
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
 
+from desktop.sidecar.contracts.v1 import models as local_v1
 from desktop.sidecar.contracts.v1.canonical import DESKTOP_OPENAPI_SHA256
 from desktop.sidecar.contracts.v1.models import (
     ActiveProjectStateV1,
@@ -36,8 +37,10 @@ from desktop.sidecar.contracts.v1.models import (
     VersionV1,
     WorkspaceImportRefV1,
 )
+from desktop.sidecar.core_bridge_v1 import DesktopCoreBridgeV1
 from desktop.sidecar.provider_store import (
     DesktopProviderStore,
+    ETagConflictError,
     ProfileRuntimeActionReservation,
     ProviderStoreError,
     ResourceNotFoundError,
@@ -109,6 +112,7 @@ class DesktopReleaseProvider:
         instance_id: str,
         readiness_key: bytes,
         remote_lifecycle: DesktopRemoteLifecycle,
+        core_bridge: DesktopCoreBridgeV1 | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         if re.fullmatch(r"[0-9a-f]{32}", instance_id) is None:
@@ -118,6 +122,7 @@ class DesktopReleaseProvider:
         self._store = store
         self._workspace_import_store = workspace_import_store
         self._remote_lifecycle = remote_lifecycle
+        self._core_bridge = core_bridge
         self._connection_state_lock = Lock()
         self._connection_generation = 0
         self._connection_owner: str | None = None
@@ -154,16 +159,45 @@ class DesktopReleaseProvider:
             "getProject": self._get_project,
             "updateProject": self._update_project,
             "deleteProject": self._delete_project,
+            "getProjectCapabilities": self._get_project_capabilities,
+            "validateProject": self._validate_project,
+            "getLocalOperation": self._get_local_operation,
+            "listRuns": self._list_runs,
+            "createRun": self._create_run,
+            "getRun": self._get_run,
+            "deleteRun": self._delete_run,
+            "cancelRun": self._cancel_run,
+            "retryRun": self._retry_run,
+            "listRunTimeline": self._list_run_timeline,
+            "listRunLogs": self._list_run_logs,
+            "getRunContext": self._get_run_context,
+            "listRunArtifacts": self._list_run_artifacts,
+            "getArtifact": self._get_artifact,
+            "getArtifactContent": self._get_artifact_content,
+            "getArtifactDiff": self._get_artifact_diff,
+            "listServices": self._list_services,
+            "restartService": self._restart_service,
+            "getCoreOperation": self._get_core_operation,
+            "getCoreLogsByRef": self._get_core_logs_by_ref,
+            "listServiceLogs": self._list_service_logs,
+            "createDiagnostic": self._create_diagnostic,
+            "getDiagnostic": self._get_diagnostic,
+            "deleteDiagnostic": self._delete_diagnostic,
+            "cleanupCaches": self._cleanup_caches,
         }
 
     def close(self) -> None:
         try:
-            self._remote_lifecycle.close()
+            if self._core_bridge is not None:
+                self._core_bridge.close()
         finally:
             try:
-                self._store.close()
+                self._remote_lifecycle.close()
             finally:
-                self._workspace_import_store.close()
+                try:
+                    self._store.close()
+                finally:
+                    self._workspace_import_store.close()
 
     @property
     def workspace_import_store(self) -> WorkspaceImportStore:
@@ -374,16 +408,14 @@ class DesktopReleaseProvider:
                 displace_existing=operation_kind != "profile_disconnect",
             )
             if reservation.replayed:
-                self._reconcile_failed_profile_transport(
-                    profile_id, reservation.operation
-                )
+                self._reconcile_failed_profile_transport(profile_id, reservation.operation)
                 return self._operation_response(reservation.operation)
             owner_error: RemoteConnectionFailedError | None = None
             snapshot = self._remote_lifecycle.snapshot()
-            if (
-                operation_kind == "profile_disconnect"
-                and snapshot.profile_id not in {None, profile_id}
-            ):
+            if operation_kind == "profile_disconnect" and snapshot.profile_id not in {
+                None,
+                profile_id,
+            }:
                 generation = None
                 owner_error = RemoteConnectionFailedError(
                     "Another remote profile owns the connection."
@@ -470,9 +502,7 @@ class DesktopReleaseProvider:
                 return self._operation_response(operation)
             if operation.state != "succeeded":
                 self._disconnect_owned_transport(profile_id)
-                self._core_state = CoreConnectionStateV1(
-                    state="disconnected", active_tunnel=False
-                )
+                self._core_state = CoreConnectionStateV1(state="disconnected", active_tunnel=False)
                 return self._operation_response(operation)
             self._core_state = self._core_state_for_outcome(
                 profile_id,
@@ -799,6 +829,190 @@ class DesktopReleaseProvider:
         self._release_project_source(project.source, project_id=project_id)
         return Response(status_code=204)
 
+    def _get_project_capabilities(
+        self, arguments: Mapping[str, object]
+    ) -> local_v1.CapabilitiesEnvelopeV1:
+        project_id = cast(str, arguments["project_id"])
+        project = self._store.get_project(project_id)
+        capabilities = self._require_bridge("getProjectCapabilities").capabilities(project)
+        return local_v1.CapabilitiesEnvelopeV1(
+            project_id=project.project_id,
+            project_etag=project.etag,
+            fetched_at=self._timestamp(),
+            capabilities=capabilities,
+        )
+
+    def _validate_project(self, arguments: Mapping[str, object]) -> local_v1.ProjectValidationV1:
+        project_id = cast(str, arguments["project_id"])
+        project = self._require_project_match(
+            project_id,
+            cast(str, arguments["if_match"]),
+        )
+        validation = self._require_bridge("validateProject").validate_project(
+            project,
+            idempotency_key=cast(str, arguments["idempotency_key"]),
+        )
+        return local_v1.ProjectValidationV1(
+            project_id=project.project_id,
+            project_etag=project.etag,
+            registry_digest=validation.registry_digest,
+            valid=validation.valid,
+            checks=tuple(validation.checks),
+            validated_at=validation.validated_at,
+        )
+
+    def _get_local_operation(self, arguments: Mapping[str, object]) -> LocalOperationV1:
+        return self._store.get_local_operation(cast(str, arguments["operation_id"]))
+
+    def _list_runs(self, arguments: Mapping[str, object]) -> object:
+        return self._require_bridge("listRuns").list_runs(**self._page_arguments(arguments))
+
+    def _create_run(self, arguments: Mapping[str, object]) -> object:
+        request = cast(local_v1.RunCreateV1, arguments["request"])
+        project = self._require_project_match(
+            request.project_id,
+            cast(str, arguments["if_match"]),
+        )
+        return self._require_bridge("createRun").create_run(
+            project,
+            idempotency_key=cast(str, arguments["idempotency_key"]),
+        )
+
+    def _get_run(self, arguments: Mapping[str, object]) -> object:
+        return self._require_bridge("getRun").get_run(cast(str, arguments["run_id"]))
+
+    def _delete_run(self, arguments: Mapping[str, object]) -> Response:
+        self._require_bridge("deleteRun").delete_run(
+            cast(str, arguments["run_id"]),
+            if_match=cast(str, arguments["if_match"]),
+        )
+        return Response(status_code=204)
+
+    def _cancel_run(self, arguments: Mapping[str, object]) -> object:
+        return self._require_bridge("cancelRun").cancel_run(
+            cast(str, arguments["run_id"]),
+            if_match=cast(str, arguments["if_match"]),
+            idempotency_key=cast(str, arguments["idempotency_key"]),
+        )
+
+    def _retry_run(self, arguments: Mapping[str, object]) -> object:
+        return self._require_bridge("retryRun").retry_run(
+            cast(str, arguments["run_id"]),
+            if_match=cast(str, arguments["if_match"]),
+            idempotency_key=cast(str, arguments["idempotency_key"]),
+        )
+
+    def _list_run_timeline(self, arguments: Mapping[str, object]) -> object:
+        return self._require_bridge("listRunTimeline").run_timeline(
+            cast(str, arguments["run_id"]),
+            **self._page_arguments(arguments),
+        )
+
+    def _list_run_logs(self, arguments: Mapping[str, object]) -> object:
+        return self._require_bridge("listRunLogs").run_logs(
+            cast(str, arguments["run_id"]),
+            **self._page_arguments(arguments),
+        )
+
+    def _get_run_context(self, arguments: Mapping[str, object]) -> object:
+        return self._require_bridge("getRunContext").run_context(cast(str, arguments["run_id"]))
+
+    def _list_run_artifacts(self, arguments: Mapping[str, object]) -> object:
+        return self._require_bridge("listRunArtifacts").run_artifacts(
+            cast(str, arguments["run_id"]),
+            **self._page_arguments(arguments),
+        )
+
+    def _get_artifact(self, arguments: Mapping[str, object]) -> object:
+        return self._require_bridge("getArtifact").get_artifact(
+            cast(str, arguments["artifact_id"])
+        )
+
+    def _get_artifact_content(self, arguments: Mapping[str, object]) -> object:
+        return self._require_bridge("getArtifactContent").artifact_content(
+            cast(str, arguments["artifact_id"])
+        )
+
+    def _get_artifact_diff(self, arguments: Mapping[str, object]) -> object:
+        return self._require_bridge("getArtifactDiff").artifact_diff(
+            cast(str, arguments["artifact_id"])
+        )
+
+    def _list_services(self, arguments: Mapping[str, object]) -> object:
+        page = self._page_arguments(arguments)
+        if page["sort"] == "display_name":
+            page["sort"] = "kind"
+        return self._require_bridge("listServices").list_services(**page)
+
+    def _restart_service(self, arguments: Mapping[str, object]) -> object:
+        return self._require_bridge("restartService").restart_service(
+            cast(str, arguments["service_id"]),
+            if_match=cast(str, arguments["if_match"]),
+            idempotency_key=cast(str, arguments["idempotency_key"]),
+        )
+
+    def _get_core_operation(self, arguments: Mapping[str, object]) -> object:
+        return self._require_bridge("getCoreOperation").get_operation(
+            cast(str, arguments["operation_id"])
+        )
+
+    def _get_core_logs_by_ref(self, arguments: Mapping[str, object]) -> object:
+        return self._require_bridge("getCoreLogsByRef").logs_by_ref(
+            cast(str, arguments["logs_ref"]),
+            **self._page_arguments(arguments),
+        )
+
+    def _list_service_logs(self, arguments: Mapping[str, object]) -> object:
+        return self._require_bridge("listServiceLogs").service_logs(
+            cast(str, arguments["service_id"]),
+            **self._page_arguments(arguments),
+        )
+
+    def _create_diagnostic(self, arguments: Mapping[str, object]) -> object:
+        return self._require_bridge("createDiagnostic").create_diagnostic(
+            cast(local_v1.DiagnosticRequestV1, arguments["request"]),
+            idempotency_key=cast(str, arguments["idempotency_key"]),
+        )
+
+    def _get_diagnostic(self, arguments: Mapping[str, object]) -> object:
+        return self._require_bridge("getDiagnostic").get_diagnostic(
+            cast(str, arguments["diagnostic_id"])
+        )
+
+    def _delete_diagnostic(self, arguments: Mapping[str, object]) -> Response:
+        self._require_bridge("deleteDiagnostic").delete_diagnostic(
+            cast(str, arguments["diagnostic_id"]),
+            if_match=cast(str, arguments["if_match"]),
+            idempotency_key=cast(str, arguments["idempotency_key"]),
+        )
+        return Response(status_code=204)
+
+    def _cleanup_caches(self, arguments: Mapping[str, object]) -> object:
+        return self._require_bridge("cleanupCaches").cache_cleanup(
+            cast(local_v1.CacheCleanupRequestV1, arguments["request"]),
+            idempotency_key=cast(str, arguments["idempotency_key"]),
+        )
+
+    def _require_bridge(self, operation_id: str) -> DesktopCoreBridgeV1:
+        if self._core_bridge is None:
+            self._unavailable(operation_id)
+        return self._core_bridge
+
+    def _require_project_match(self, project_id: str, if_match: str) -> ProjectV1:
+        project = self._store.get_project(project_id)
+        if project.etag != if_match:
+            raise ETagConflictError("project", project_id, project.etag)
+        return project
+
+    @staticmethod
+    def _page_arguments(arguments: Mapping[str, object]) -> dict[str, object]:
+        return {
+            "limit": cast(int, arguments["limit"]),
+            "after": cast(str | None, arguments["after"]),
+            "sort": cast(str, arguments["sort"]),
+            "direction": cast(str, arguments["direction"]),
+        }
+
     def _timestamp(self) -> str:
         now = self._clock()
         if now.tzinfo is None or now.utcoffset() is None:
@@ -807,9 +1021,7 @@ class DesktopReleaseProvider:
             now.astimezone(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
         )
 
-    def _verify_project_source(
-        self, source: ProjectSourceV1, *, project_id: str | None
-    ) -> None:
+    def _verify_project_source(self, source: ProjectSourceV1, *, project_id: str | None) -> None:
         if source.kind != "native_folder_snapshot":
             return
         import_ref = source.import_ref
