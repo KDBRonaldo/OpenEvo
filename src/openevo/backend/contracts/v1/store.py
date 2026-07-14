@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import base64
 from collections.abc import Callable, Mapping
-from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import fcntl
@@ -189,33 +188,29 @@ class CoreControlStoreV1:
         self._mutex = threading.RLock()
         self._closed = False
         self._prepare_root()
-        self._lock_file = (self.root / "provider.lock").open("a+b")
         try:
-            fcntl.flock(self._lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError as exc:
-            self._lock_file.close()
-            raise CoreControlStoreError("Core Control provider state is already owned") from exc
-        self._connection = sqlite3.connect(
-            self.root / "provider.sqlite3",
-            isolation_level=None,
-            check_same_thread=False,
-            timeout=30,
-        )
-        self._connection.row_factory = sqlite3.Row
-        self._connection.execute("PRAGMA foreign_keys = ON")
-        self._connection.execute("PRAGMA journal_mode = WAL")
-        self._connection.execute("PRAGMA synchronous = FULL")
-        with self._transaction():
-            for statement in _SCHEMA:
-                self._connection.execute(statement)
-            self._signing_key = self._load_or_create_signing_key()
-        try:
+            self._open_lifecycle_storage()
+            self._connection = sqlite3.connect(
+                self.root / "provider.sqlite3",
+                isolation_level=None,
+                check_same_thread=False,
+                timeout=30,
+            )
+            self._connection.row_factory = sqlite3.Row
+            self._connection.execute("PRAGMA foreign_keys = ON")
+            self._connection.execute("PRAGMA journal_mode = WAL")
+            self._connection.execute("PRAGMA synchronous = FULL")
+            with self._transaction():
+                for statement in _SCHEMA:
+                    self._connection.execute(statement)
+                self._signing_key = self._load_or_create_signing_key()
             self._harden_database_files()
             self._recover_and_validate()
         except Exception:
-            self._connection.close()
-            fcntl.flock(self._lock_file.fileno(), fcntl.LOCK_UN)
-            self._lock_file.close()
+            connection = getattr(self, "_connection", None)
+            if connection is not None:
+                connection.close()
+            self._close_lifecycle_storage()
             self._closed = True
             raise
 
@@ -224,8 +219,7 @@ class CoreControlStoreV1:
             if self._closed:
                 return
             self._connection.close()
-            fcntl.flock(self._lock_file.fileno(), fcntl.LOCK_UN)
-            self._lock_file.close()
+            self._close_lifecycle_storage()
             self._closed = True
 
     def create_project(
@@ -261,6 +255,7 @@ class CoreControlStoreV1:
 
     def get_project(self, project_id: str) -> m.ProjectV1:
         with self._mutex:
+            self._verify_lifecycle_storage()
             row = self._connection.execute(
                 "SELECT document_json FROM projects WHERE project_id = ?", (project_id,)
             ).fetchone()
@@ -276,11 +271,12 @@ class CoreControlStoreV1:
         sort: Literal["created_at", "updated_at", "name"],
         direction: Literal["asc", "desc"],
     ) -> m.ProjectPageV1:
-        query_binding = f"projects:{sort}:{direction}"
-        boundary: tuple[str, str] | None = None
-        if after is not None:
-            boundary = self._decode_cursor(after, query_binding)
         with self._mutex:
+            self._verify_lifecycle_storage()
+            query_binding = f"projects:{sort}:{direction}"
+            boundary: tuple[str, str] | None = None
+            if after is not None:
+                boundary = self._decode_cursor(after, query_binding)
             rows = self._connection.execute("SELECT document_json FROM projects").fetchall()
         projects = [_validate_bytes(m.ProjectV1, row["document_json"]) for row in rows]
         projects.sort(
@@ -308,7 +304,9 @@ class CoreControlStoreV1:
             )
             for item in selected
         ]
-        return m.ProjectPageV1(items=summaries, next_cursor=next_cursor, has_more=has_more)
+        with self._mutex:
+            self._verify_lifecycle_storage()
+            return m.ProjectPageV1(items=summaries, next_cursor=next_cursor, has_more=has_more)
 
     def patch_project(
         self,
@@ -357,7 +355,7 @@ class CoreControlStoreV1:
         idempotency_key: str,
     ) -> StoredResult:
         digest = _request_digest("deleteCoreProjectV1", project_id, None, {"if-match": if_match})
-        upload_files: list[Path] = []
+        upload_files: list[str] = []
         with self._mutex, self._transaction():
             replay = self._idempotency_replay(
                 "deleteCoreProjectV1", project_id, idempotency_key, digest, None
@@ -367,7 +365,7 @@ class CoreControlStoreV1:
             _, current = self._project_row(project_id)
             self._require_etag(current.etag, if_match, "project")
             upload_files = [
-                self.upload_root / row["file_name"]
+                row["file_name"]
                 for row in self._connection.execute(
                     "SELECT file_name FROM workspace_uploads WHERE project_id = ?", (project_id,)
                 ).fetchall()
@@ -377,8 +375,14 @@ class CoreControlStoreV1:
             self._store_idempotency(
                 "deleteCoreProjectV1", project_id, idempotency_key, digest, result
             )
-        for path in upload_files:
-            path.unlink(missing_ok=True)
+        with self._mutex:
+            for path in upload_files:
+                self._verify_lifecycle_storage()
+                try:
+                    os.unlink(path, dir_fd=self._upload_root_fd)
+                except FileNotFoundError:
+                    pass
+                self._verify_lifecycle_storage()
         return result
 
     def create_upload(
@@ -430,17 +434,17 @@ class CoreControlStoreV1:
             now = self._timestamp()
             upload_id = _new_id("upload")
             file_name = f"{upload_id}.part"
-            file_path = self.upload_root / file_name
             fd = os.open(
-                file_path,
+                file_name,
                 os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
                 0o600,
+                dir_fd=self._upload_root_fd,
             )
             try:
                 os.fsync(fd)
             finally:
                 os.close(fd)
-            _fsync_directory(self.upload_root)
+            os.fsync(self._upload_root_fd)
             session_data = {
                 "id": upload_id,
                 "project_id": project_id,
@@ -454,9 +458,7 @@ class CoreControlStoreV1:
                 "created_at": now,
                 "updated_at": now,
             }
-            session = m.WorkspaceUploadSessionV1(
-                **session_data, etag=_etag(session_data, version=1)
-            )
+            session = _model_with_etag(m.WorkspaceUploadSessionV1, session_data, version=1)
             self._connection.execute(
                 "INSERT INTO workspace_uploads VALUES (?, ?, ?, 1, ?, ?, ?)",
                 (upload_id, project_id, _model_bytes(session), file_name, now, now),
@@ -492,7 +494,6 @@ class CoreControlStoreV1:
         content = base64.b64decode(request.content_base64, validate=True)
         with self._mutex:
             old_offset = 0
-            file_path: Path | None = None
             file_fd: int | None = None
             try:
                 with self._transaction():
@@ -522,17 +523,23 @@ class CoreControlStoreV1:
                             "The workspace chunk exceeds the declared archive size.",
                         )
                     old_offset = upload.accepted_offset
-                    file_path = self.upload_root / row["file_name"]
                     file_fd = os.open(
-                        file_path,
+                        row["file_name"],
                         os.O_RDWR | getattr(os, "O_NOFOLLOW", 0),
+                        dir_fd=self._upload_root_fd,
                     )
-                    _require_bound_regular_file(file_path, file_fd, expected_size=old_offset)
+                    _require_bound_regular_entry(
+                        self._upload_root_fd,
+                        row["file_name"],
+                        file_fd,
+                        expected_size=old_offset,
+                    )
                     os.lseek(file_fd, old_offset, os.SEEK_SET)
                     _write_all(file_fd, content)
                     os.fsync(file_fd)
-                    _require_bound_regular_file(
-                        file_path,
+                    _require_bound_regular_entry(
+                        self._upload_root_fd,
+                        row["file_name"],
                         file_fd,
                         expected_size=old_offset + len(content),
                     )
@@ -540,8 +547,10 @@ class CoreControlStoreV1:
                     version = int(row["resource_version"]) + 1
                     updated_data = upload.model_dump(mode="python", exclude={"etag"})
                     updated_data.update(accepted_offset=old_offset + len(content), updated_at=now)
-                    updated = m.WorkspaceUploadSessionV1(
-                        **updated_data, etag=_etag(updated_data, version=version)
+                    updated = _model_with_etag(
+                        m.WorkspaceUploadSessionV1,
+                        updated_data,
+                        version=version,
                     )
                     self._connection.execute(
                         "UPDATE workspace_uploads SET document_json = ?, resource_version = ?, "
@@ -603,7 +612,7 @@ class CoreControlStoreV1:
                     if_match=if_match,
                     if_project_match=if_project_match,
                 )
-                archive_path = self.upload_root / upload_row["file_name"]
+                archive_name = upload_row["file_name"]
 
             now = self._timestamp()
             workspace_snapshot = _snapshot(
@@ -611,9 +620,17 @@ class CoreControlStoreV1:
                 {"archive_sha256": upload.archive.content_sha256},
                 now,
             )
-            destination = self.workspace_root / workspace_snapshot.id
             try:
-                verify_and_materialize_workspace(archive_path, upload.archive, destination)
+                self._verify_lifecycle_storage()
+                verify_and_materialize_workspace(
+                    self.upload_root / archive_name,
+                    upload.archive,
+                    archive_root_fd=self._upload_root_fd,
+                    archive_name=archive_name,
+                    workspace_root_fd=self._workspace_root_fd,
+                    snapshot_name=workspace_snapshot.id,
+                )
+                self._verify_lifecycle_storage()
             except WorkspaceArchiveError as exc:
                 raise ResourceConflictError(
                     "workspace_archive_invalid", "The workspace archive is not canonical."
@@ -653,8 +670,10 @@ class CoreControlStoreV1:
                     m.SnapshotKind.PROJECT, _project_snapshot_payload(project_data), now
                 )
                 project_data["current_project_snapshot"] = project_snapshot
-                updated_project = m.ProjectV1(
-                    **project_data, etag=_etag(project_data, version=project_version)
+                updated_project = _model_with_etag(
+                    m.ProjectV1,
+                    project_data,
+                    version=project_version,
                 )
                 upload_version = int(upload_row["resource_version"]) + 1
                 upload_data = upload.model_dump(mode="python", exclude={"etag"})
@@ -663,8 +682,10 @@ class CoreControlStoreV1:
                     publication=publication,
                     updated_at=now,
                 )
-                updated_upload = m.WorkspaceUploadSessionV1(
-                    **upload_data, etag=_etag(upload_data, version=upload_version)
+                updated_upload = _model_with_etag(
+                    m.WorkspaceUploadSessionV1,
+                    upload_data,
+                    version=upload_version,
                 )
                 self._connection.execute(
                     "UPDATE projects SET document_json = ?, resource_version = ?, "
@@ -726,7 +747,7 @@ class CoreControlStoreV1:
             version = int(row["resource_version"]) + 1
             data = upload.model_dump(mode="python", exclude={"etag"})
             data.update(status=m.WorkspaceUploadStatus.ABORTED, updated_at=now)
-            updated = m.WorkspaceUploadSessionV1(**data, etag=_etag(data, version=version))
+            updated = _model_with_etag(m.WorkspaceUploadSessionV1, data, version=version)
             self._connection.execute(
                 "UPDATE workspace_uploads SET document_json = ?, resource_version = ?, "
                 "updated_at = ? WHERE upload_id = ?",
@@ -736,7 +757,13 @@ class CoreControlStoreV1:
             self._store_idempotency(
                 "abortCoreWorkspaceUploadV1", scope, idempotency_key, digest, result
             )
-        (self.upload_root / row["file_name"]).unlink(missing_ok=True)
+        with self._mutex:
+            try:
+                self._verify_lifecycle_storage()
+                os.unlink(row["file_name"], dir_fd=self._upload_root_fd)
+            except FileNotFoundError:
+                pass
+            self._verify_lifecycle_storage()
         return result
 
     def store_validation_result(
@@ -774,6 +801,7 @@ class CoreControlStoreV1:
             return None
         scope, key, digest = identity
         with self._mutex:
+            self._verify_lifecycle_storage()
             row = self._connection.execute(
                 "SELECT request_digest, error_json FROM failed_idempotency_records "
                 "WHERE operation_id = ? AND resource_scope = ? AND idempotency_key = ?",
@@ -851,6 +879,7 @@ class CoreControlStoreV1:
 
     def replay_events(self, last_event_id: str | None) -> list[dict[str, object]]:
         with self._mutex:
+            self._verify_lifecycle_storage()
             after_sequence = 0
             if last_event_id is not None:
                 after_sequence = self._decode_event_cursor(last_event_id)
@@ -875,11 +904,13 @@ class CoreControlStoreV1:
             return frames
 
     def event_cursor(self, sequence: int) -> str:
-        body = f"evt.v1.{sequence}"
-        signature = hmac.new(self._signing_key, body.encode("ascii"), hashlib.sha256).hexdigest()[
-            :24
-        ]
-        return f"{body}.{signature}"
+        with self._mutex:
+            self._verify_lifecycle_storage()
+            body = f"evt.v1.{sequence}"
+            signature = hmac.new(
+                self._signing_key, body.encode("ascii"), hashlib.sha256
+            ).hexdigest()[:24]
+            return f"{body}.{signature}"
 
     def _new_project(
         self,
@@ -928,7 +959,7 @@ class CoreControlStoreV1:
         }
         project_snapshot = _snapshot(m.SnapshotKind.PROJECT, _project_snapshot_payload(data), now)
         data["current_project_snapshot"] = project_snapshot
-        return m.ProjectV1(**data, etag=_etag(data, version=1))
+        return _model_with_etag(m.ProjectV1, data, version=1)
 
     def _patched_project(
         self,
@@ -990,7 +1021,7 @@ class CoreControlStoreV1:
         data["current_project_snapshot"] = _snapshot(
             m.SnapshotKind.PROJECT, _project_snapshot_payload(data), now
         )
-        return m.ProjectV1(**data, etag=_etag(data, version=version))
+        return _model_with_etag(m.ProjectV1, data, version=version)
 
     def _validate_finalize_preconditions(
         self,
@@ -1024,6 +1055,7 @@ class CoreControlStoreV1:
             )
 
     def _project_row(self, project_id: str) -> tuple[sqlite3.Row, m.ProjectV1]:
+        self._verify_lifecycle_storage()
         row = self._connection.execute(
             "SELECT * FROM projects WHERE project_id = ?", (project_id,)
         ).fetchone()
@@ -1034,6 +1066,7 @@ class CoreControlStoreV1:
     def _upload_row(
         self, project_id: str, upload_id: str
     ) -> tuple[sqlite3.Row, m.WorkspaceUploadSessionV1]:
+        self._verify_lifecycle_storage()
         row = self._connection.execute(
             "SELECT * FROM workspace_uploads WHERE upload_id = ? AND project_id = ?",
             (upload_id, project_id),
@@ -1253,9 +1286,7 @@ class CoreControlStoreV1:
                     if publication is None:
                         raise StoreCorruptionError("finalized workspace upload has no publication")
                     snapshot_id = publication.workspace_snapshot.id
-                    existing = snapshot_sources.setdefault(
-                        snapshot_id, (publication, file_name)
-                    )
+                    existing = snapshot_sources.setdefault(snapshot_id, (publication, file_name))
                     if existing[0] != publication:
                         raise StoreCorruptionError("workspace snapshot source is ambiguous")
             for snapshot_id, publication in project_publications.items():
@@ -1288,56 +1319,56 @@ class CoreControlStoreV1:
                 if len(row["request_digest"]) != 64:
                     raise StoreCorruptionError("failed idempotency request digest is invalid")
 
-            with self._managed_root_fd(self.upload_root) as upload_root_fd:
-                for file_name in referenced_files:
-                    row = self._connection.execute(
-                        "SELECT document_json FROM workspace_uploads WHERE file_name = ?",
-                        (file_name,),
-                    ).fetchone()
-                    if row is None:
-                        raise StoreCorruptionError("workspace upload source disappeared")
-                    upload = _validate_bytes(m.WorkspaceUploadSessionV1, row["document_json"])
-                    if upload.status is m.WorkspaceUploadStatus.OPEN:
-                        self._recover_open_upload(
+            upload_root_fd = self._upload_root_fd
+            workspace_root_fd = self._workspace_root_fd
+            for file_name in referenced_files:
+                row = self._connection.execute(
+                    "SELECT document_json FROM workspace_uploads WHERE file_name = ?",
+                    (file_name,),
+                ).fetchone()
+                if row is None:
+                    raise StoreCorruptionError("workspace upload source disappeared")
+                upload = _validate_bytes(m.WorkspaceUploadSessionV1, row["document_json"])
+                if upload.status is m.WorkspaceUploadStatus.OPEN:
+                    self._recover_open_upload(
+                        upload_root_fd,
+                        file_name,
+                        accepted_offset=upload.accepted_offset,
+                    )
+            for name in os.listdir(upload_root_fd):
+                if name not in referenced_files:
+                    _remove_entry_at(upload_root_fd, name)
+            for snapshot_id, (publication, archive_name) in snapshot_sources.items():
+                try:
+                    archive_fd = os.open(
+                        archive_name,
+                        os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                        dir_fd=upload_root_fd,
+                    )
+                    try:
+                        _require_bound_regular_entry(
                             upload_root_fd,
-                            file_name,
-                            accepted_offset=upload.accepted_offset,
+                            archive_name,
+                            archive_fd,
+                            expected_size=publication.archive.byte_size,
                         )
-                for name in os.listdir(upload_root_fd):
-                    if name not in referenced_files:
-                        _remove_entry_at(upload_root_fd, name)
-                with self._managed_root_fd(self.workspace_root) as workspace_root_fd:
-                    for snapshot_id, (publication, archive_name) in snapshot_sources.items():
-                        try:
-                            archive_fd = os.open(
-                                archive_name,
-                                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
-                                dir_fd=upload_root_fd,
-                            )
-                            try:
-                                _require_bound_regular_entry(
-                                    upload_root_fd,
-                                    archive_name,
-                                    archive_fd,
-                                    expected_size=publication.archive.byte_size,
-                                )
-                            finally:
-                                os.close(archive_fd)
-                            verify_materialized_workspace(
-                                self.upload_root / archive_name,
-                                publication.archive,
-                                archive_root_fd=upload_root_fd,
-                                archive_name=archive_name,
-                                workspace_root_fd=workspace_root_fd,
-                                snapshot_name=snapshot_id,
-                            )
-                        except (OSError, WorkspaceArchiveError) as exc:
-                            raise StoreCorruptionError(
-                                "published workspace snapshot is missing or invalid"
-                            ) from exc
-                    for name in os.listdir(workspace_root_fd):
-                        if name not in snapshot_sources:
-                            _remove_entry_at(workspace_root_fd, name)
+                    finally:
+                        os.close(archive_fd)
+                    verify_materialized_workspace(
+                        self.upload_root / archive_name,
+                        publication.archive,
+                        archive_root_fd=upload_root_fd,
+                        archive_name=archive_name,
+                        workspace_root_fd=workspace_root_fd,
+                        snapshot_name=snapshot_id,
+                    )
+                except (OSError, WorkspaceArchiveError) as exc:
+                    raise StoreCorruptionError(
+                        "published workspace snapshot is missing or invalid"
+                    ) from exc
+            for name in os.listdir(workspace_root_fd):
+                if name not in snapshot_sources:
+                    _remove_entry_at(workspace_root_fd, name)
 
     def _recover_open_upload(
         self,
@@ -1372,37 +1403,139 @@ class CoreControlStoreV1:
         finally:
             os.close(fd)
 
-    @contextmanager
-    def _managed_root_fd(self, path: Path):
+    def _open_lifecycle_storage(self) -> None:
+        directory_flags = (
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        )
         try:
-            fd = os.open(
-                path,
-                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+            self._root_fd = os.open(self.root, directory_flags)
+            root_identity = os.fstat(self._root_fd)
+            _require_private_directory_metadata(root_identity)
+            _require_path_binding(self.root, root_identity)
+            self._root_identity = root_identity
+            fcntl.flock(self._root_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            self._close_lifecycle_storage()
+            raise CoreControlStoreError("Core Control provider state is already owned") from exc
+
+        lock_created = False
+        try:
+            try:
+                self._lock_fd = os.open(
+                    "provider.lock",
+                    os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                    0o600,
+                    dir_fd=self._root_fd,
+                )
+                lock_created = True
+            except FileExistsError:
+                self._lock_fd = os.open(
+                    "provider.lock",
+                    os.O_RDWR | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=self._root_fd,
+                )
+            if lock_created:
+                os.fchmod(self._lock_fd, 0o600)
+                os.fsync(self._lock_fd)
+                os.fsync(self._root_fd)
+            lock_identity = os.fstat(self._lock_fd)
+            _require_private_regular_metadata(lock_identity)
+            _require_entry_binding(self._root_fd, "provider.lock", lock_identity)
+            try:
+                fcntl.flock(self._lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as exc:
+                raise CoreControlStoreError(
+                    "Core Control provider state is already owned"
+                ) from exc
+            self._lock_identity = lock_identity
+
+            self._upload_root_fd = os.open(
+                "workspace-uploads", directory_flags, dir_fd=self._root_fd
+            )
+            self._upload_root_identity = os.fstat(self._upload_root_fd)
+            _require_private_directory_metadata(self._upload_root_identity)
+            _require_entry_binding(self._root_fd, "workspace-uploads", self._upload_root_identity)
+
+            self._workspace_root_fd = os.open(
+                "workspace-snapshots", directory_flags, dir_fd=self._root_fd
+            )
+            self._workspace_root_identity = os.fstat(self._workspace_root_fd)
+            _require_private_directory_metadata(self._workspace_root_identity)
+            _require_entry_binding(
+                self._root_fd, "workspace-snapshots", self._workspace_root_identity
+            )
+            self._verify_lifecycle_storage()
+        except Exception:
+            self._close_lifecycle_storage()
+            raise
+
+    def _verify_lifecycle_storage(self) -> None:
+        if self._closed:
+            raise StoreCorruptionError("Core Control store is closed")
+        try:
+            root_identity = os.fstat(self._root_fd)
+            lock_identity = os.fstat(self._lock_fd)
+            upload_identity = os.fstat(self._upload_root_fd)
+            workspace_identity = os.fstat(self._workspace_root_fd)
+            _require_private_directory_metadata(root_identity)
+            _require_private_regular_metadata(lock_identity)
+            _require_private_directory_metadata(upload_identity)
+            _require_private_directory_metadata(workspace_identity)
+            _require_same_identity(root_identity, self._root_identity, "provider root")
+            _require_same_identity(lock_identity, self._lock_identity, "provider lock")
+            _require_same_identity(upload_identity, self._upload_root_identity, "upload root")
+            _require_same_identity(
+                workspace_identity, self._workspace_root_identity, "workspace root"
+            )
+            _require_path_binding(self.root, self._root_identity)
+            _require_entry_binding(self._root_fd, "provider.lock", self._lock_identity)
+            _require_entry_binding(self._root_fd, "workspace-uploads", self._upload_root_identity)
+            _require_entry_binding(
+                self._root_fd, "workspace-snapshots", self._workspace_root_identity
             )
         except OSError as exc:
-            raise StoreCorruptionError("Core Control managed root is unavailable") from exc
-        try:
-            identity = os.fstat(fd)
-            _require_private_directory_metadata(identity)
-            _require_path_binding(path, identity)
-            yield fd
-            _require_path_binding(path, identity)
-        finally:
-            os.close(fd)
+            raise StoreCorruptionError("Core Control lifecycle storage is unavailable") from exc
+
+    def _close_lifecycle_storage(self) -> None:
+        for name in ("_workspace_root_fd", "_upload_root_fd"):
+            descriptor = getattr(self, name, None)
+            if descriptor is not None:
+                os.close(descriptor)
+                delattr(self, name)
+        lock_fd = getattr(self, "_lock_fd", None)
+        if lock_fd is not None:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            finally:
+                os.close(lock_fd)
+                del self._lock_fd
+        root_fd = getattr(self, "_root_fd", None)
+        if root_fd is not None:
+            try:
+                fcntl.flock(root_fd, fcntl.LOCK_UN)
+            finally:
+                os.close(root_fd)
+                del self._root_fd
 
     def _prepare_root(self) -> None:
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
-        os.chmod(self.root, 0o700)
         metadata = self.root.stat(follow_symlinks=False)
-        if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.geteuid():
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or stat.S_IMODE(metadata.st_mode) != 0o700
+        ):
             raise CoreControlStoreError("Core Control provider root is not privately owned")
         self.upload_root.mkdir(mode=0o700, exist_ok=True)
         self.workspace_root.mkdir(mode=0o700, exist_ok=True)
         for managed_root in (self.upload_root, self.workspace_root):
             metadata = managed_root.stat(follow_symlinks=False)
-            if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.geteuid():
+            if (
+                not stat.S_ISDIR(metadata.st_mode)
+                or metadata.st_uid != os.geteuid()
+                or stat.S_IMODE(metadata.st_mode) != 0o700
+            ):
                 raise CoreControlStoreError("Core Control managed root is not privately owned")
-            os.chmod(managed_root, 0o700)
 
     def _load_or_create_signing_key(self) -> bytes:
         row = self._connection.execute(
@@ -1438,19 +1571,34 @@ class CoreControlStoreV1:
         )
 
     def _transaction(self):
-        return _Transaction(self._connection)
+        return _Transaction(self._connection, self._verify_lifecycle_storage)
 
 
 class _Transaction:
-    def __init__(self, connection: sqlite3.Connection) -> None:
+    def __init__(
+        self,
+        connection: sqlite3.Connection,
+        verify_storage: Callable[[], None],
+    ) -> None:
         self.connection = connection
+        self.verify_storage = verify_storage
 
     def __enter__(self):
+        self.verify_storage()
         self.connection.execute("BEGIN IMMEDIATE")
         return self
 
     def __exit__(self, exc_type, exc, traceback) -> bool:
-        self.connection.execute("COMMIT" if exc_type is None else "ROLLBACK")
+        if exc_type is not None:
+            self.connection.execute("ROLLBACK")
+            return False
+        try:
+            self.verify_storage()
+        except Exception:
+            self.connection.execute("ROLLBACK")
+            raise
+        self.connection.execute("COMMIT")
+        self.verify_storage()
         return False
 
 
@@ -1490,6 +1638,20 @@ def _etag(payload: object, *, version: int) -> str:
         _canonical_bytes({"resource_version": version, "resource": _json_value(payload)})
     ).hexdigest()
     return f'"{digest}"'
+
+
+def _model_with_etag(
+    model_type: type[_ModelT],
+    data: Mapping[str, Any],
+    *,
+    version: int,
+) -> _ModelT:
+    placeholder = '"' + ("0" * 64) + '"'
+    provisional = model_type.model_validate({**data, "etag": placeholder})
+    canonical_data = provisional.model_dump(mode="python", exclude={"etag"})
+    return model_type.model_validate(
+        {**canonical_data, "etag": _etag(canonical_data, version=version)}
+    )
 
 
 def _request_digest(
@@ -1584,14 +1746,6 @@ def _write_all(fd: int, content: bytes) -> None:
         view = view[written:]
 
 
-def _require_bound_regular_file(path: Path, fd: int, *, expected_size: int) -> None:
-    metadata = os.fstat(fd)
-    _require_private_regular_metadata(metadata)
-    if metadata.st_size != expected_size:
-        raise StoreCorruptionError("workspace upload file size is invalid")
-    _require_path_binding(path, metadata)
-
-
 def _require_bound_regular_entry(
     parent_fd: int,
     name: str,
@@ -1613,7 +1767,7 @@ def _require_private_regular_metadata(metadata: os.stat_result) -> None:
         or metadata.st_nlink != 1
         or stat.S_IMODE(metadata.st_mode) != 0o600
     ):
-        raise StoreCorruptionError("workspace upload file is unsafe")
+        raise StoreCorruptionError("Core Control private file is unsafe")
 
 
 def _require_private_directory_metadata(metadata: os.stat_result) -> None:
@@ -1645,6 +1799,15 @@ def _require_entry_binding(parent_fd: int, name: str, expected: os.stat_result) 
 
 def _same_identity(left: os.stat_result, right: os.stat_result) -> bool:
     return left.st_dev == right.st_dev and left.st_ino == right.st_ino
+
+
+def _require_same_identity(
+    current: os.stat_result,
+    expected: os.stat_result,
+    label: str,
+) -> None:
+    if not _same_identity(current, expected):
+        raise StoreCorruptionError(f"Core Control {label} identity changed")
 
 
 def _remove_entry_at(parent_fd: int, name: str) -> None:
@@ -1682,15 +1845,9 @@ def _remove_entry_at(parent_fd: int, name: str) -> None:
     try:
         os.rmdir(name, dir_fd=parent_fd)
     except OSError as exc:
-        raise StoreCorruptionError("Core Control managed orphan directory could not be removed") from exc
-
-
-def _fsync_directory(path: Path) -> None:
-    fd = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
+        raise StoreCorruptionError(
+            "Core Control managed orphan directory could not be removed"
+        ) from exc
 
 
 __all__ = [

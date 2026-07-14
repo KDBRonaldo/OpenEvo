@@ -64,20 +64,26 @@ The store uses full synchronous commits and WAL journaling. It does not persist
 the bearer, host paths in API resources, model credentials, commands, or open
 metadata.
 
-Startup recovery runs while the provider holds its exclusive process lock. It
-opens both managed workspace roots as owner-verified private directory FDs,
-validates every project publication against its finalized upload and the exact
-published tree, and fails startup when a referenced archive or snapshot is
-missing, replaced, or corrupt. Unreferenced upload files, temporary
+Startup recovery runs while the provider holds its exclusive process lock. The
+store retains provider-root, owner-lock, upload-root, and snapshot-root FDs for
+its full lifetime. Every related operation revalidates each held inode against
+its pathname plus the required owner, mode, type, and link count. A provider-root
+flock prevents a removed owner-lock pathname or replaced workspace root from
+admitting a second owner. Recovery reuses the held owner-verified private root
+FDs, validates every project publication against its finalized upload and the
+exact published tree, and fails startup when a referenced archive or snapshot
+is missing, replaced, or corrupt. Unreferenced upload files, temporary
 publications, and snapshots left by a crash after publish rename but before the
 SQLite commit are removed relative to those held FDs without following
 symlinks; cleanup never traverses outside the managed roots.
 
-Project and upload ETags hash canonical resource content plus an internal
-monotonic resource version. Idempotency identity binds the Core v1 principal,
-operation ID, resource scope, canonical request, and semantic CAS headers. An
-exact replay returns the original typed success or error response and ETag; a
-conflicting request returns `idempotency_key_reused`.
+Project and upload ETags hash the complete validated canonical resource model,
+including model-populated defaults, plus an internal monotonic resource version.
+The same canonical model is persisted and used by startup recovery. Idempotency
+identity binds the Core v1 principal, operation ID, resource scope, canonical
+request, and semantic CAS headers. An exact replay returns the original typed
+success or error response and ETag; a conflicting request returns
+`idempotency_key_reused`.
 
 Project creation signs Core-owned project and task snapshots. Scratch projects
 also receive an immutable empty workspace snapshot. Imported projects remain
@@ -99,19 +105,23 @@ closed.
 Finalize requires both upload `If-Match` and `If-Project-Match`. The latter must
 equal the upload's frozen project ETag and the current project ETag, and the
 frozen project snapshot must still be current. Core verifies complete size and
-SHA-256, every deterministic POSIX ustar header and checksum, NFC POSIX paths,
-parent/order rules, modes, entry and extracted-byte totals, zero padding, and
-the exact two-block terminator. Symlinks, hardlinks, devices, extensions,
+SHA-256, private archive mode `0600`, every deterministic POSIX ustar header and
+checksum, NFC POSIX paths, parent/order rules, modes, entry and extracted-byte
+totals, zero padding, and the exact two-block terminator. Symlinks, hardlinks,
+devices, extensions,
 sparse/out-of-order content, root or embedded `.`/`..` path segments, and
 trailing bytes are rejected as typed `workspace_archive_invalid` conflicts.
 
-Verified files are written under a private temporary snapshot directory,
-`fsync`ed, and renamed into the snapshot namespace. A final SQLite transaction
-rechecks both mutable resources, stores one `WorkspacePublicationV1`, signs a
-new project snapshot, updates the project and upload, and appends the project
-event. Recovery verifies the published owner, modes, link counts, exact entry
-set, sizes, and bytes against the retained canonical archive before serving
-projects. No run consumes this snapshot until the later run-owner phase.
+Archive parsing hashes the exact bytes used to create the snapshot and then
+rehashes the same held file while rechecking its inode and metadata before any
+rename. Same-inode, same-size mutation therefore fails closed. Verified files
+are written descriptor-relative under a private temporary snapshot directory,
+`fsync`ed, and renamed relative to the held snapshot-root FD. A final SQLite
+transaction rechecks both mutable resources, stores one `WorkspacePublicationV1`,
+signs a new project snapshot, updates the project and upload, and appends the
+project event. Recovery verifies the published owner, modes, link counts, exact
+entry set, sizes, and bytes against the retained canonical archive before
+serving projects. No run consumes this snapshot until the later run-owner phase.
 
 ## SSE Recovery
 
