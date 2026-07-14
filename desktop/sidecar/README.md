@@ -283,10 +283,24 @@ runtime authority under the existing recovery rule. Ordinary demote/archive
 transitions also preserve that observation, while any project intent patch
 clears both the remote projection and revision because they describe the
 previous intent. This closed projection has a separate 256 KiB per-row limit and
-16 MiB aggregate recovery limit. Startup measures both from SQLite length
-metadata before reading or parsing a projection, and project reads use a bounded
-guarded column projection rather than `SELECT *`. Oversized state fails before
-JSON decoding, and bounded noncanonical state fails during strict decoding.
+16 MiB aggregate recovery limit. Schema v4 keeps one closed
+`remote_payload_usage` authority row containing the exact non-null payload count,
+aggregate bytes, and a domain-separated HMAC sealed with the separate owner-only
+cursor key. Canonical SQLite triggers update count/bytes and invalidate the seal
+for every project insert, payload replacement/clear, and project delete; the same
+write transaction reseals it before commit, so rollback restores project and usage
+authority together. An independently edited counter or payload cannot retain a
+valid seal. Normal transactions validate this singleton in O(1) and never run a
+remote-payload aggregate scan. Project get/list validates the authority and each
+guarded row in the same SQLite read snapshot before parsing payload bytes.
+
+Startup first validates the sealed bounded counters, applies the existing
+100,000-row and recovery-byte budgets, then performs one length-only reconciliation
+of the authority against the actual project rows before any remote payload is
+selected or decoded. Migration from schema v3 performs that same bounded
+reconciliation and publishes the counters, triggers, migration row, and schema
+version in one SQLite transaction. Oversized state fails before JSON decoding,
+and bounded noncanonical state fails during strict decoding.
 
 Project intent remains editable after activation so the UI can activate once to
 obtain remote capabilities, edit evolution configuration, and activate again.
