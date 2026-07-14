@@ -194,6 +194,14 @@ class FakeCoreTransport:
             ),
             wheel_sha256=str(kwargs["wheel_sha256"]),
             framework_lock_sha256=str(kwargs["framework_lock_sha256"]),
+            wheel_size=int(kwargs["wheel_size"]),
+            framework_lock_size=int(kwargs["framework_lock_size"]),
+            bundle_device=1,
+            bundle_inode=2,
+            wheel_device=1,
+            wheel_inode=3,
+            framework_lock_device=1,
+            framework_lock_inode=4,
         )
 
     def run(

@@ -147,12 +147,20 @@ rsync on the same authenticated transport. A remote standard-library verifier
 requires an exact two-file inventory, owner/mode/link identity, both digests,
 and the closed lock-to-wheel binding. Every transfer uses a unique random
 incoming authority. Finalize copies verified bytes into an owner-only private
-candidate whose inode and pathname were never exposed to rsync, revalidates and
-fsyncs that candidate, and publishes it to the deterministic bundle directory
-with atomic no-replace rename. It then retires the incoming authority, so held
-writers or directory FDs cannot mutate the publication. An already published
-exact bundle is an idempotent retry. Remote paths are outputs of this verifier,
-never Desktop configuration or user-preplaced `/srv` inputs.
+candidate whose inode and pathname were never exposed to rsync. Members are
+created as `0400` and populated only through publisher-held writer FDs that are
+closed before rename; the directory is then sealed to `0500`. Finalize keeps the
+verified candidate FD pinned across atomic no-replace rename and final
+pathname verification. Finalize returns a receipt binding the directory and
+both member inodes, then retires the incoming authority. The SSH transport holds
+that receipt for bootstrap: under the publication lock it revalidates modes,
+identities, and digests, then substitutes a
+`/proc/<wrapper-pid>/fd/<pinned-bundle-fd>` root while the generation installer
+and its nested pip child run. Same-name replacement cannot redirect consumer
+reads, and post-consumption revalidation fails closed on mutation or pathname
+replacement. An already published exact sealed bundle is an idempotent retry.
+Remote paths are outputs of this verifier, never Desktop configuration or
+user-preplaced `/srv` inputs.
 
 The attachment keeps the bearer out of `repr` and has no general serializer or
 renderer-facing response model. Its loopback host/port, release identity, and

@@ -25,6 +25,7 @@ from pydantic import SecretStr
 from openevo.deployment.core_assets import (
     CoreBootstrapAssetSnapshotError,
     StagedCoreBootstrapAssets,
+    build_core_asset_consumer_command,
     build_core_asset_discard_command,
     build_core_asset_finalize_command,
     build_core_asset_prepare_command,
@@ -53,6 +54,8 @@ _TUNNEL_MONITOR_INTERVAL_SECONDS = 0.05
 _MAX_SUBPROCESS_CAPTURE_BYTES = 4 * 1024 * 1024
 _SUBPROCESS_CAPTURE_CHUNK_BYTES = 64 * 1024
 _SUBPROCESS_TERMINATE_GRACE_SECONDS = 1.0
+_SUBPROCESS_DESCENDANT_PIPE_GRACE_SECONDS = 0.1
+_SUBPROCESS_STATUS_INTERVAL_SECONDS = 0.05
 _ORPHANED_TUNNEL_GUARD = threading.Lock()
 _ORPHANED_TUNNELS: dict[int, "SshTunnel"] = {}
 _ORPHANED_CORE_TUNNELS: dict[int, "_CoreTunnelEndpoint"] = {}
@@ -610,6 +613,8 @@ class SshRemoteExecutorTransport:
         self._core_connection_starter = (
             core_connection_starter or _start_core_connection_subprocess
         )
+        self._core_asset_authority_lock = threading.Lock()
+        self._core_asset_authorities: dict[str, StagedCoreBootstrapAssets] = {}
 
     def run(
         self,
@@ -621,7 +626,8 @@ class SshRemoteExecutorTransport:
     ) -> RemoteCommandResult:
         invalid_request = False
         try:
-            remote_command = _remote_command(command, cwd=cwd, env=env)
+            bound_command = self._bind_core_asset_consumption(command)
+            remote_command = _remote_command(bound_command, cwd=cwd, env=env)
         except Exception:
             invalid_request = True
             remote_command = ""
@@ -788,14 +794,20 @@ class SshRemoteExecutorTransport:
                     timeout_seconds=_stage_remaining(deadline),
                     remote_failure_code=SshTransportErrorCode.CORE_ASSET_FAILED,
                 )
-                return parse_staged_core_assets(
+                staged = parse_staged_core_assets(
                     finalize_payload,
                     service_root=service_root,
                     bundle_id=bundle_id,
                     wheel_filename=snapshot.wheel_filename,
                     wheel_sha256=wheel_sha256,
+                    wheel_size=wheel_size,
                     framework_lock_sha256=framework_lock_sha256,
+                    framework_lock_size=framework_lock_size,
                 )
+                final_root = str(Path(staged.wheel_path).parent)
+                with self._core_asset_authority_lock:
+                    self._core_asset_authorities[final_root] = staged
+                return staged
         except CoreBootstrapAssetSnapshotError:
             _log_transport_failure(SshTransportErrorCode.INVALID_REQUEST)
             raise SshTransportError(SshTransportErrorCode.INVALID_REQUEST) from None
@@ -908,7 +920,8 @@ class SshRemoteExecutorTransport:
         remote_failure_code: SshTransportErrorCode,
     ) -> SecretStr:
         try:
-            remote_command = _remote_command(command, cwd=None, env=None)
+            bound_command = self._bind_core_asset_consumption(command)
+            remote_command = _remote_command(bound_command, cwd=None, env=None)
         except Exception:
             raise SshTransportError(SshTransportErrorCode.INVALID_REQUEST) from None
         completion_marker = f"__OPENEVO_REMOTE_COMPLETION_{secrets.token_hex(16)}__="
@@ -950,6 +963,19 @@ class SshRemoteExecutorTransport:
             _log_transport_failure(remote_failure_code)
             raise SshTransportError(remote_failure_code)
         return SecretStr(completed.stdout or "")
+
+    def _bind_core_asset_consumption(self, command: str) -> str:
+        with self._core_asset_authority_lock:
+            matches = [
+                assets
+                for root, assets in self._core_asset_authorities.items()
+                if root in command
+            ]
+        if not matches:
+            return command
+        if len(matches) != 1:
+            raise ValueError("Core asset consumer command has ambiguous authority")
+        return build_core_asset_consumer_command(command, matches[0])
 
     def open_tunnel(
         self,
@@ -1254,14 +1280,48 @@ def _capture_subprocess_output(
     selector = selectors.DefaultSelector()
     selector.register(process.stdout, selectors.EVENT_READ, "stdout")
     selector.register(process.stderr, selectors.EVENT_READ, "stderr")
+    leader_exited = False
+    descendant_pipe_deadline: float | None = None
+    pipe_close_deadline: float | None = None
+    group_killed = False
     try:
         while selector.get_map():
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
+            now = time.monotonic()
+            if not leader_exited and _subprocess_exited_without_reaping(process):
+                leader_exited = True
+                descendant_pipe_deadline = (
+                    now + _SUBPROCESS_DESCENDANT_PIPE_GRACE_SECONDS
+                )
+            if not leader_exited and now >= deadline:
                 raise subprocess.TimeoutExpired(argv, timeout_seconds)
-            events = selector.select(remaining)
-            if not events:
-                raise subprocess.TimeoutExpired(argv, timeout_seconds)
+            if (
+                leader_exited
+                and not group_killed
+                and descendant_pipe_deadline is not None
+                and now >= descendant_pipe_deadline
+            ):
+                _signal_owned_process_group(
+                    process,
+                    process_group_id=process_group_id,
+                    signal_number=signal.SIGKILL,
+                )
+                group_killed = True
+                pipe_close_deadline = now + _SUBPROCESS_TERMINATE_GRACE_SECONDS
+            if group_killed and pipe_close_deadline is not None and now >= pipe_close_deadline:
+                break
+            wake_at = (
+                pipe_close_deadline
+                if group_killed
+                else descendant_pipe_deadline
+                if leader_exited
+                else deadline
+            )
+            assert wake_at is not None
+            wait_seconds = min(
+                _SUBPROCESS_STATUS_INTERVAL_SECONDS,
+                max(0.0, wake_at - now),
+            )
+            events = selector.select(wait_seconds)
             for key, _mask in events:
                 read_size = min(
                     _SUBPROCESS_CAPTURE_CHUNK_BYTES,
@@ -1275,17 +1335,17 @@ def _capture_subprocess_output(
                 if captured_bytes > _MAX_SUBPROCESS_CAPTURE_BYTES:
                     raise _SubprocessCaptureLimitExceeded
                 chunks[key.data].append(chunk)
-        if not _wait_for_subprocess_exit_without_reaping(process, deadline=deadline):
+        if not leader_exited and not _wait_for_subprocess_exit_without_reaping(
+            process, deadline=deadline
+        ):
             raise subprocess.TimeoutExpired(argv, timeout_seconds)
-        _signal_owned_process_group(
-            process,
-            process_group_id=process_group_id,
-            signal_number=signal.SIGKILL,
-        )
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise subprocess.TimeoutExpired(argv, timeout_seconds)
-        process.wait(timeout=remaining)
+        if not group_killed:
+            _signal_owned_process_group(
+                process,
+                process_group_id=process_group_id,
+                signal_number=signal.SIGKILL,
+            )
+        process.wait(timeout=_SUBPROCESS_TERMINATE_GRACE_SECONDS)
     finally:
         selector.close()
     return b"".join(chunks["stdout"]), b"".join(chunks["stderr"])
@@ -1304,19 +1364,25 @@ def _wait_for_subprocess_exit_without_reaping(
     deadline: float,
 ) -> bool:
     while True:
-        if process.returncode is not None:
-            return True
-        result = os.waitid(
-            os.P_PID,
-            process.pid,
-            os.WEXITED | os.WNOHANG | os.WNOWAIT,
-        )
-        if result is not None:
+        if _subprocess_exited_without_reaping(process):
             return True
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             return False
         time.sleep(min(0.01, remaining))
+
+
+def _subprocess_exited_without_reaping(process: subprocess.Popen[bytes]) -> bool:
+    if process.returncode is not None:
+        return True
+    return (
+        os.waitid(
+            os.P_PID,
+            process.pid,
+            os.WEXITED | os.WNOHANG | os.WNOWAIT,
+        )
+        is not None
+    )
 
 
 def _signal_owned_process_group(

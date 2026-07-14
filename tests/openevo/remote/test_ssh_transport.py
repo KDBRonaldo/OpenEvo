@@ -2251,6 +2251,57 @@ def test_default_runner_timeout_terminates_and_reaps_entire_process_group(
     _assert_processes_gone(leader_id, descendant_id)
 
 
+@pytest.mark.parametrize("leader_return_code", [0, 9])
+def test_default_runner_returns_leader_result_when_descendant_inherits_pipes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    leader_return_code: int,
+) -> None:
+    pid_path = tmp_path / f"inherited-pipes-{leader_return_code}.json"
+    producer = tmp_path / f"leader-exits-{leader_return_code}.py"
+    descendant_script = (
+        "import os,time;"
+        "os.write(1,b'descendant stdout\\n');"
+        "os.write(2,b'descendant stderr\\n');"
+        "time.sleep(30)"
+    )
+    producer.write_text(
+        "\n".join(
+            (
+                "import json",
+                "import os",
+                "import subprocess",
+                "import sys",
+                f"child = subprocess.Popen([sys.executable, '-c', {descendant_script!r}])",
+                "with open(sys.argv[1], 'w', encoding='ascii') as stream:",
+                "    json.dump([os.getpid(), child.pid], stream)",
+                "    stream.flush()",
+                "    os.fsync(stream.fileno())",
+                "print('leader stdout', flush=True)",
+                "print('leader stderr', file=sys.stderr, flush=True)",
+                f"raise SystemExit({leader_return_code})",
+            )
+        ),
+        encoding="ascii",
+    )
+    monkeypatch.setattr(ssh_module, "_SUBPROCESS_TERMINATE_GRACE_SECONDS", 0.05)
+    monkeypatch.setattr(ssh_module, "_SUBPROCESS_DESCENDANT_PIPE_GRACE_SECONDS", 0.05)
+
+    started = time.monotonic()
+    completed = ssh_module._run_subprocess(
+        [sys.executable, str(producer), str(pid_path)],
+        0.4,
+    )
+    elapsed = time.monotonic() - started
+
+    assert completed.returncode == leader_return_code
+    assert set(completed.stdout.splitlines()) == {"leader stdout", "descendant stdout"}
+    assert set(completed.stderr.splitlines()) == {"leader stderr", "descendant stderr"}
+    assert elapsed < 0.4
+    leader_id, descendant_id = json.loads(pid_path.read_text(encoding="ascii"))
+    _assert_processes_gone(leader_id, descendant_id)
+
+
 def test_default_runner_cancellation_terminates_and_reaps_entire_process_group(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

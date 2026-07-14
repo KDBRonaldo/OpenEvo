@@ -36,8 +36,17 @@ class StagedCoreBootstrapAssets:
     framework_lock_path: str
     wheel_sha256: str
     framework_lock_sha256: str
+    wheel_size: int
+    framework_lock_size: int
+    bundle_device: int
+    bundle_inode: int
+    wheel_device: int
+    wheel_inode: int
+    framework_lock_device: int
+    framework_lock_inode: int
 
     def __post_init__(self) -> None:
+        wheel_parent = Path(self.wheel_path).parent
         for value in (self.service_root, self.wheel_path, self.framework_lock_path):
             _require_remote_path(value)
         if (
@@ -46,8 +55,30 @@ class StagedCoreBootstrapAssets:
             or _DIGEST.fullmatch(self.wheel_sha256) is None
             or _DIGEST.fullmatch(self.framework_lock_sha256) is None
             or Path(self.framework_lock_path).name != "framework-lock.json"
-            or Path(self.wheel_path).parent != Path(self.framework_lock_path).parent
+            or wheel_parent != Path(self.framework_lock_path).parent
+            or wheel_parent.parent != Path(self.service_root) / "assets"
+            or _BUNDLE_ID.fullmatch(wheel_parent.name) is None
             or not Path(self.wheel_path).name.endswith(".whl")
+            or type(self.wheel_size) is not int
+            or not 0 < self.wheel_size <= MAX_CORE_WHEEL_BYTES
+            or type(self.framework_lock_size) is not int
+            or not 0 < self.framework_lock_size <= MAX_FRAMEWORK_LOCK_BYTES
+            or any(
+                type(value) is not int or value < 0
+                for value in (
+                    self.bundle_device,
+                    self.wheel_device,
+                    self.framework_lock_device,
+                )
+            )
+            or any(
+                type(value) is not int or value <= 0
+                for value in (
+                    self.bundle_inode,
+                    self.wheel_inode,
+                    self.framework_lock_inode,
+                )
+            )
         ):
             raise ValueError("staged Core bootstrap asset identity is invalid")
 
@@ -248,32 +279,53 @@ def parse_staged_core_assets(
     bundle_id: str,
     wheel_filename: str,
     wheel_sha256: str,
+    wheel_size: int,
     framework_lock_sha256: str,
+    framework_lock_size: int,
 ) -> StagedCoreBootstrapAssets:
     value = _load_secret_json(payload)
     expected_fields = {
         "framework_lock_path",
         "framework_lock_sha256",
+        "framework_lock_device",
+        "framework_lock_inode",
+        "bundle_device",
+        "bundle_inode",
         "schema_version",
         "service_root",
         "wheel_path",
         "wheel_sha256",
+        "wheel_device",
+        "wheel_inode",
     }
     if not isinstance(value, dict) or set(value) != expected_fields:
         raise ValueError("Core asset finalize response is invalid")
-    if type(value.get("schema_version")) is not int:
+    identity_fields = (
+        "bundle_device",
+        "bundle_inode",
+        "wheel_device",
+        "wheel_inode",
+        "framework_lock_device",
+        "framework_lock_inode",
+    )
+    if type(value.get("schema_version")) is not int or any(
+        type(value.get(field)) is not int for field in identity_fields
+    ):
         raise ValueError("Core asset finalize response is invalid")
     expected_root = f"{service_root}/assets/{bundle_id}"
     expected_wheel = f"{expected_root}/{wheel_filename}"
     expected_lock = f"{expected_root}/framework-lock.json"
-    if value != {
+    fixed = {
         "schema_version": 1,
         "service_root": service_root,
         "wheel_path": expected_wheel,
         "framework_lock_path": expected_lock,
         "wheel_sha256": wheel_sha256,
         "framework_lock_sha256": framework_lock_sha256,
-    }:
+    }
+    if any(value.get(key) != expected for key, expected in fixed.items()) or any(
+        value[field] < (1 if field.endswith("inode") else 0) for field in identity_fields
+    ):
         raise ValueError("Core asset finalize response identity is invalid")
     return StagedCoreBootstrapAssets(
         service_root=service_root,
@@ -281,6 +333,45 @@ def parse_staged_core_assets(
         framework_lock_path=expected_lock,
         wheel_sha256=wheel_sha256,
         framework_lock_sha256=framework_lock_sha256,
+        wheel_size=wheel_size,
+        framework_lock_size=framework_lock_size,
+        bundle_device=value["bundle_device"],
+        bundle_inode=value["bundle_inode"],
+        wheel_device=value["wheel_device"],
+        wheel_inode=value["wheel_inode"],
+        framework_lock_device=value["framework_lock_device"],
+        framework_lock_inode=value["framework_lock_inode"],
+    )
+
+
+def build_core_asset_consumer_command(
+    command: str,
+    assets: StagedCoreBootstrapAssets,
+) -> str:
+    if not isinstance(command, str) or not command or "\x00" in command:
+        raise ValueError("Core asset consumer command is invalid")
+    final_root = str(Path(assets.wheel_path).parent)
+    if assets.wheel_path not in command or assets.framework_lock_path not in command:
+        raise ValueError("Core asset consumer command does not bind both release assets")
+    arguments = (
+        assets.service_root,
+        Path(final_root).name,
+        Path(assets.wheel_path).name,
+        assets.wheel_sha256,
+        str(assets.wheel_size),
+        assets.framework_lock_sha256,
+        str(assets.framework_lock_size),
+        str(assets.bundle_device),
+        str(assets.bundle_inode),
+        str(assets.wheel_device),
+        str(assets.wheel_inode),
+        str(assets.framework_lock_device),
+        str(assets.framework_lock_inode),
+        command,
+    )
+    return " ".join(
+        ["python3", "-I", "-c", shlex.quote(_REMOTE_CONSUME_SCRIPT)]
+        + [shlex.quote(value) for value in arguments]
     )
 
 
@@ -570,8 +661,11 @@ def closed_attempt_name(name, prefix):
 def clear_private_attempt(parent, attempt_name):
     fd = os.open(attempt_name, flags, dir_fd=parent)
     try:
-        require_dir(fd, 0o700)
         before = os.fstat(fd)
+        if (not stat.S_ISDIR(before.st_mode) or before.st_uid != uid
+                or stat.S_IMODE(before.st_mode) not in {0o500, 0o700}):
+            raise SystemExit(76)
+        os.fchmod(fd, 0o700)
         names = bounded_names(fd, max_staging_entries)
         for child_name in names:
             child_fd = os.open(child_name, file_flags, dir_fd=fd)
@@ -618,10 +712,23 @@ try:
             lock_fd = os.open("asset-publish.lock", os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600, dir_fd=core_fd)
             try:
                 lock_meta = os.fstat(lock_fd)
+                current_lock = os.stat(
+                    "asset-publish.lock", dir_fd=core_fd, follow_symlinks=False
+                )
                 if (not stat.S_ISREG(lock_meta.st_mode) or lock_meta.st_uid != uid
-                        or lock_meta.st_nlink != 1 or stat.S_IMODE(lock_meta.st_mode) != 0o600):
+                        or lock_meta.st_nlink != 1 or stat.S_IMODE(lock_meta.st_mode) != 0o600
+                        or (lock_meta.st_dev, lock_meta.st_ino)
+                            != (current_lock.st_dev, current_lock.st_ino)):
                     raise SystemExit(77)
                 fcntl.flock(lock_fd, fcntl.LOCK_EX)
+                current_lock = os.stat(
+                    "asset-publish.lock", dir_fd=core_fd, follow_symlinks=False
+                )
+                if (lock_meta.st_dev, lock_meta.st_ino) != (
+                    current_lock.st_dev,
+                    current_lock.st_ino,
+                ):
+                    raise SystemExit(77)
                 staging_fd = ensure(core_fd, "asset-staging")
                 assets_fd = ensure(core_fd, "assets")
                 try:
@@ -764,10 +871,23 @@ try:
     lock_fd = os.open("asset-publish.lock", os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600, dir_fd=core_fd)
     try:
         lock_meta = os.fstat(lock_fd)
+        current_lock = os.stat(
+            "asset-publish.lock", dir_fd=core_fd, follow_symlinks=False
+        )
         if (not stat.S_ISREG(lock_meta.st_mode) or lock_meta.st_uid != uid
-                or lock_meta.st_nlink != 1 or stat.S_IMODE(lock_meta.st_mode) != 0o600):
+                or lock_meta.st_nlink != 1 or stat.S_IMODE(lock_meta.st_mode) != 0o600
+                or (lock_meta.st_dev, lock_meta.st_ino)
+                    != (current_lock.st_dev, current_lock.st_ino)):
             raise SystemExit(74)
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        current_lock = os.stat(
+            "asset-publish.lock", dir_fd=core_fd, follow_symlinks=False
+        )
+        if (lock_meta.st_dev, lock_meta.st_ino) != (
+            current_lock.st_dev,
+            current_lock.st_ino,
+        ):
+            raise SystemExit(74)
         staging_fd = open_child_dir(core_fd, "asset-staging")
         try:
             incoming_name = "incoming-" + bundle + "-" + transfer
@@ -833,26 +953,26 @@ def open_absolute(path):
         os.close(fd)
         raise
 
-def require_dir(fd):
+def require_dir(fd, mode=0o700):
     meta = os.fstat(fd)
-    if not stat.S_ISDIR(meta.st_mode) or meta.st_uid != uid or stat.S_IMODE(meta.st_mode) != 0o700:
+    if not stat.S_ISDIR(meta.st_mode) or meta.st_uid != uid or stat.S_IMODE(meta.st_mode) != mode:
         raise SystemExit(73)
 
-def open_child_dir(parent, name):
+def open_child_dir(parent, name, mode=0o700):
     fd = os.open(name, dir_flags, dir_fd=parent)
-    require_dir(fd)
+    require_dir(fd, mode)
     current = os.stat(name, dir_fd=parent, follow_symlinks=False)
     if (current.st_dev, current.st_ino) != (os.fstat(fd).st_dev, os.fstat(fd).st_ino):
         raise SystemExit(74)
     return fd
 
-def verify_file(parent, name, size, digest):
+def verify_file(parent, name, size, digest, mode):
     fd = os.open(name, file_flags, dir_fd=parent)
     try:
         before = os.fstat(fd)
         current = os.stat(name, dir_fd=parent, follow_symlinks=False)
         if (not stat.S_ISREG(before.st_mode) or before.st_uid != uid or before.st_nlink != 1
-                or stat.S_IMODE(before.st_mode) != 0o600 or before.st_size != size
+                or stat.S_IMODE(before.st_mode) != mode or before.st_size != size
                 or (before.st_dev, before.st_ino) != (current.st_dev, current.st_ino)):
             raise SystemExit(75)
         value = hashlib.sha256()
@@ -875,7 +995,7 @@ def verify_file(parent, name, size, digest):
                 or (after.st_dev, after.st_ino) != (current.st_dev, current.st_ino)):
             raise SystemExit(78)
         os.fsync(fd)
-        return b"".join(chunks)
+        return b"".join(chunks), after
     finally:
         os.close(fd)
 
@@ -890,7 +1010,7 @@ def copy_verified_file(source_parent, destination_parent, name, size, digest):
                 or stat.S_IMODE(before.st_mode) != 0o600 or before.st_size != size
                 or (before.st_dev, before.st_ino) != (current.st_dev, current.st_ino)):
             raise SystemExit(75)
-        destination_fd = os.open(name, create_flags, 0o600, dir_fd=destination_parent)
+        destination_fd = os.open(name, create_flags, 0o400, dir_fd=destination_parent)
         value = hashlib.sha256()
         remaining = size
         while remaining:
@@ -909,7 +1029,7 @@ def copy_verified_file(source_parent, destination_parent, name, size, digest):
             remaining -= len(chunk)
         if os.read(source_fd, 1) or value.hexdigest() != digest:
             raise SystemExit(77)
-        os.fchmod(destination_fd, 0o600)
+        os.fchmod(destination_fd, 0o400)
         os.fsync(destination_fd)
         after = os.fstat(source_fd)
         current = os.stat(name, dir_fd=source_parent, follow_symlinks=False)
@@ -919,7 +1039,7 @@ def copy_verified_file(source_parent, destination_parent, name, size, digest):
         if (any(getattr(before, field) != getattr(after, field) for field in identity)
                 or (after.st_dev, after.st_ino) != (current.st_dev, current.st_ino)
                 or not stat.S_ISREG(destination.st_mode) or destination.st_uid != uid
-                or destination.st_nlink != 1 or stat.S_IMODE(destination.st_mode) != 0o600
+                or destination.st_nlink != 1 or stat.S_IMODE(destination.st_mode) != 0o400
                 or destination.st_size != size
                 or (destination.st_dev, destination.st_ino)
                     != (current_destination.st_dev, current_destination.st_ino)):
@@ -938,36 +1058,67 @@ def no_duplicates(pairs):
         result[key] = value
     return result
 
-def verify_bundle(parent, name):
-    fd = open_child_dir(parent, name)
+def verify_bundle_fd(fd, directory_mode, file_mode):
+    require_dir(fd, directory_mode)
+    names = []
+    with os.scandir(fd) as entries:
+        for entry in entries:
+            if len(names) >= 2:
+                raise SystemExit(79)
+            names.append(entry.name)
+    if set(names) != {wheel_name, "framework-lock.json"}:
+        raise SystemExit(79)
+    unused_wheel_bytes, wheel_meta = verify_file(
+        fd, wheel_name, wheel_size, wheel_digest, file_mode
+    )
+    lock_bytes, lock_meta = verify_file(
+        fd, "framework-lock.json", lock_size, lock_digest, file_mode
+    )
+    lock = json.loads(lock_bytes, object_pairs_hook=no_duplicates)
+    if (not isinstance(lock, dict) or set(lock) != {"schema_version", "distribution",
+            "distribution_version", "distribution_digest", "wheel_filename"}
+            or lock.get("schema_version") != "1" or lock.get("distribution") != "openevo"
+            or not isinstance(lock.get("distribution_version"), str)
+            or not lock.get("distribution_version")
+            or lock.get("distribution_digest") != wheel_digest
+            or lock.get("wheel_filename") != wheel_name):
+        raise SystemExit(80)
+    os.fsync(fd)
+    bundle_meta = os.fstat(fd)
+    return {
+        "bundle_device": bundle_meta.st_dev,
+        "bundle_inode": bundle_meta.st_ino,
+        "wheel_device": wheel_meta.st_dev,
+        "wheel_inode": wheel_meta.st_ino,
+        "framework_lock_device": lock_meta.st_dev,
+        "framework_lock_inode": lock_meta.st_ino,
+    }
+
+def verify_bundle(parent, name, directory_mode, file_mode):
+    fd = open_child_dir(parent, name, directory_mode)
     try:
-        names = []
-        with os.scandir(fd) as entries:
-            for entry in entries:
-                if len(names) >= 2:
-                    raise SystemExit(79)
-                names.append(entry.name)
-        if set(names) != {wheel_name, "framework-lock.json"}:
-            raise SystemExit(79)
-        verify_file(fd, wheel_name, wheel_size, wheel_digest)
-        lock_bytes = verify_file(fd, "framework-lock.json", lock_size, lock_digest)
-        lock = json.loads(lock_bytes, object_pairs_hook=no_duplicates)
-        if (not isinstance(lock, dict) or set(lock) != {"schema_version", "distribution",
-                "distribution_version", "distribution_digest", "wheel_filename"}
-                or lock.get("schema_version") != "1" or lock.get("distribution") != "openevo"
-                or not isinstance(lock.get("distribution_version"), str)
-                or not lock.get("distribution_version")
-                or lock.get("distribution_digest") != wheel_digest
-                or lock.get("wheel_filename") != wheel_name):
-            raise SystemExit(80)
-        os.fsync(fd)
-        return fd
+        return fd, verify_bundle_fd(fd, directory_mode, file_mode)
     except BaseException:
         os.close(fd)
         raise
 
+def seal_bundle(fd):
+    for name in (wheel_name, "framework-lock.json"):
+        child_fd = os.open(name, file_flags, dir_fd=fd)
+        try:
+            os.fchmod(child_fd, 0o400)
+            os.fsync(child_fd)
+        finally:
+            os.close(child_fd)
+    os.fchmod(fd, 0o500)
+    os.fsync(fd)
+
 def discard_private_bundle(parent, name, fd):
     before = os.fstat(fd)
+    if (not stat.S_ISDIR(before.st_mode) or before.st_uid != uid
+            or stat.S_IMODE(before.st_mode) not in {0o500, 0o700}):
+        raise SystemExit(83)
+    os.fchmod(fd, 0o700)
     names = []
     with os.scandir(fd) as entries:
         for entry in entries:
@@ -1046,10 +1197,23 @@ try:
     lock_fd = os.open("asset-publish.lock", os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600, dir_fd=core_fd)
     try:
         lock_meta = os.fstat(lock_fd)
+        current_lock = os.stat(
+            "asset-publish.lock", dir_fd=core_fd, follow_symlinks=False
+        )
         if (not stat.S_ISREG(lock_meta.st_mode) or lock_meta.st_uid != uid or lock_meta.st_nlink != 1
-                or stat.S_IMODE(lock_meta.st_mode) != 0o600):
+                or stat.S_IMODE(lock_meta.st_mode) != 0o600
+                or (lock_meta.st_dev, lock_meta.st_ino)
+                    != (current_lock.st_dev, current_lock.st_ino)):
             raise SystemExit(81)
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        current_lock = os.stat(
+            "asset-publish.lock", dir_fd=core_fd, follow_symlinks=False
+        )
+        if (lock_meta.st_dev, lock_meta.st_ino) != (
+            current_lock.st_dev,
+            current_lock.st_ino,
+        ):
+            raise SystemExit(81)
         staging_fd = open_child_dir(core_fd, "asset-staging")
         assets_fd = open_child_dir(core_fd, "assets")
         try:
@@ -1060,9 +1224,11 @@ try:
             published = False
             try:
                 try:
-                    final_fd = verify_bundle(assets_fd, bundle)
+                    final_fd, receipt = verify_bundle(assets_fd, bundle, 0o500, 0o400)
                 except FileNotFoundError:
-                    incoming_fd = verify_bundle(staging_fd, incoming_name)
+                    incoming_fd, unused_receipt = verify_bundle(
+                        staging_fd, incoming_name, 0o700, 0o600
+                    )
                     candidate_name, candidate_fd = create_private_candidate(staging_fd)
                     copy_verified_file(incoming_fd, candidate_fd, wheel_name, wheel_size, wheel_digest)
                     lock_bytes = copy_verified_file(
@@ -1081,27 +1247,41 @@ try:
                             or lock.get("distribution_digest") != wheel_digest
                             or lock.get("wheel_filename") != wheel_name):
                         raise SystemExit(80)
-                    os.fsync(candidate_fd)
-                    os.close(candidate_fd)
-                    candidate_fd = None
-                    verified_candidate = verify_bundle(staging_fd, candidate_name)
-                    os.close(verified_candidate)
+                    seal_bundle(candidate_fd)
+                    candidate_receipt = verify_bundle_fd(candidate_fd, 0o500, 0o400)
                     published = rename_noreplace(staging_fd, candidate_name, assets_fd, bundle)
                     if published:
                         os.fsync(assets_fd)
                         os.fsync(staging_fd)
+                        current = os.stat(bundle, dir_fd=assets_fd, follow_symlinks=False)
+                        if (current.st_dev, current.st_ino) != (
+                            candidate_receipt["bundle_device"],
+                            candidate_receipt["bundle_inode"],
+                        ):
+                            raise SystemExit(82)
+                        receipt = verify_bundle_fd(candidate_fd, 0o500, 0o400)
+                        if receipt != candidate_receipt:
+                            raise SystemExit(82)
+                        current = os.stat(bundle, dir_fd=assets_fd, follow_symlinks=False)
+                        if (current.st_dev, current.st_ino) != (
+                            receipt["bundle_device"],
+                            receipt["bundle_inode"],
+                        ):
+                            raise SystemExit(82)
                         candidate_name = None
-                    final_fd = verify_bundle(assets_fd, bundle)
-                try:
-                    os.fsync(final_fd)
-                finally:
-                    os.close(final_fd)
+                        final_fd = candidate_fd
+                        candidate_fd = None
+                    else:
+                        final_fd, receipt = verify_bundle(
+                            assets_fd, bundle, 0o500, 0o400
+                        )
+                os.close(final_fd)
             finally:
                 if candidate_fd is not None:
                     os.close(candidate_fd)
                 if candidate_name is not None:
                     try:
-                        private_fd = open_child_dir(staging_fd, candidate_name)
+                        private_fd = os.open(candidate_name, dir_flags, dir_fd=staging_fd)
                         try:
                             discard_private_bundle(staging_fd, candidate_name, private_fd)
                         finally:
@@ -1134,7 +1314,201 @@ print(json.dumps({
     "framework_lock_path": final_root + "/framework-lock.json",
     "wheel_sha256": wheel_digest,
     "framework_lock_sha256": lock_digest,
+    **receipt,
 }, sort_keys=True, separators=(",", ":")))
+""".strip()
+
+
+_REMOTE_CONSUME_SCRIPT = r"""
+import fcntl, hashlib, os, pwd, stat, subprocess, sys
+
+(service_root, bundle, wheel_name, wheel_digest, wheel_size, lock_digest, lock_size,
+ bundle_device, bundle_inode, wheel_device, wheel_inode, lock_device, lock_inode,
+ command) = sys.argv[1:]
+wheel_size = int(wheel_size)
+lock_size = int(lock_size)
+bundle_device = int(bundle_device)
+bundle_inode = int(bundle_inode)
+wheel_device = int(wheel_device)
+wheel_inode = int(wheel_inode)
+lock_device = int(lock_device)
+lock_inode = int(lock_inode)
+uid = os.geteuid()
+home = pwd.getpwuid(uid).pw_dir
+home_parts = home.split("/")[1:]
+allowed = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._@%+=,-")
+if (not hasattr(os, "O_NOFOLLOW") or not home_parts
+        or any(not part or part in {".", ".."} or any(c not in allowed for c in part) for part in home_parts)
+        or home != "/" + "/".join(home_parts)
+        or service_root != home + "/.openevo/core"
+        or len(bundle) != 64 or any(c not in "0123456789abcdef" for c in bundle)
+        or not wheel_name.endswith(".whl") or "/" in wheel_name or "\\" in wheel_name
+        or any(len(value) != 64 or any(c not in "0123456789abcdef" for c in value)
+               for value in (wheel_digest, lock_digest))
+        or not 0 < wheel_size <= 536870912 or not 0 < lock_size <= 65536
+        or min(bundle_device, wheel_device, lock_device) < 0
+        or min(bundle_inode, wheel_inode, lock_inode) <= 0
+        or not command or "\x00" in command):
+    raise SystemExit(70)
+
+dir_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+file_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+
+def open_absolute(path):
+    fd = os.open("/", dir_flags)
+    try:
+        for part in [item for item in path.split("/") if item]:
+            child = os.open(part, dir_flags, dir_fd=fd)
+            os.close(fd)
+            fd = child
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+def require_dir(fd, mode, identity=None):
+    meta = os.fstat(fd)
+    if (not stat.S_ISDIR(meta.st_mode) or meta.st_uid != uid
+            or stat.S_IMODE(meta.st_mode) != mode
+            or identity is not None and (meta.st_dev, meta.st_ino) != identity):
+        raise SystemExit(71)
+    return meta
+
+def open_child_dir(parent, name, mode, identity=None):
+    fd = os.open(name, dir_flags, dir_fd=parent)
+    try:
+        opened = require_dir(fd, mode, identity)
+        current = os.stat(name, dir_fd=parent, follow_symlinks=False)
+        if (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino):
+            raise SystemExit(72)
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+def open_verified_file(parent, name, size, digest, identity):
+    fd = os.open(name, file_flags, dir_fd=parent)
+    try:
+        verify_open_file(parent, name, fd, size, digest, identity)
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+def verify_open_file(parent, name, fd, size, digest, identity):
+    os.lseek(fd, 0, os.SEEK_SET)
+    before = os.fstat(fd)
+    current = os.stat(name, dir_fd=parent, follow_symlinks=False)
+    if (not stat.S_ISREG(before.st_mode) or before.st_uid != uid or before.st_nlink != 1
+            or stat.S_IMODE(before.st_mode) != 0o400 or before.st_size != size
+            or (before.st_dev, before.st_ino) != identity
+            or identity != (current.st_dev, current.st_ino)):
+        raise SystemExit(73)
+    value = hashlib.sha256()
+    remaining = size
+    while remaining:
+        chunk = os.read(fd, min(1024 * 1024, remaining))
+        if not chunk:
+            raise SystemExit(74)
+        value.update(chunk)
+        remaining -= len(chunk)
+    if os.read(fd, 1) or value.hexdigest() != digest:
+        raise SystemExit(74)
+    after = os.fstat(fd)
+    current = os.stat(name, dir_fd=parent, follow_symlinks=False)
+    identity_fields = ("st_dev", "st_ino", "st_mode", "st_uid", "st_nlink", "st_size", "st_mtime_ns", "st_ctime_ns")
+    if (any(getattr(before, field) != getattr(after, field) for field in identity_fields)
+            or (after.st_dev, after.st_ino) != (current.st_dev, current.st_ino)):
+        raise SystemExit(75)
+
+core_fd = open_absolute(service_root)
+try:
+    require_dir(core_fd, 0o700)
+    lock_fd = os.open("asset-publish.lock", os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=core_fd)
+    try:
+        lock_meta = os.fstat(lock_fd)
+        current_lock = os.stat(
+            "asset-publish.lock", dir_fd=core_fd, follow_symlinks=False
+        )
+        if (not stat.S_ISREG(lock_meta.st_mode) or lock_meta.st_uid != uid
+                or lock_meta.st_nlink != 1 or stat.S_IMODE(lock_meta.st_mode) != 0o600
+                or (lock_meta.st_dev, lock_meta.st_ino)
+                    != (current_lock.st_dev, current_lock.st_ino)):
+            raise SystemExit(76)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        current_lock = os.stat(
+            "asset-publish.lock", dir_fd=core_fd, follow_symlinks=False
+        )
+        if (lock_meta.st_dev, lock_meta.st_ino) != (
+            current_lock.st_dev,
+            current_lock.st_ino,
+        ):
+            raise SystemExit(76)
+        assets_fd = open_child_dir(core_fd, "assets", 0o700)
+        try:
+            bundle_fd = open_child_dir(
+                assets_fd, bundle, 0o500, (bundle_device, bundle_inode)
+            )
+            try:
+                names = []
+                with os.scandir(bundle_fd) as entries:
+                    for entry in entries:
+                        if len(names) >= 2:
+                            raise SystemExit(77)
+                        names.append(entry.name)
+                if set(names) != {wheel_name, "framework-lock.json"}:
+                    raise SystemExit(77)
+                wheel_fd = open_verified_file(
+                    bundle_fd, wheel_name, wheel_size, wheel_digest,
+                    (wheel_device, wheel_inode),
+                )
+                try:
+                    lock_data_fd = open_verified_file(
+                        bundle_fd, "framework-lock.json", lock_size, lock_digest,
+                        (lock_device, lock_inode),
+                    )
+                    try:
+                        final_root = service_root + "/assets/" + bundle
+                        if (final_root + "/" + wheel_name not in command
+                                or final_root + "/framework-lock.json" not in command):
+                            raise SystemExit(78)
+                        pinned_root = (
+                            "/proc/" + str(os.getpid()) + "/fd/" + str(bundle_fd)
+                        )
+                        rewritten = command.replace(final_root, pinned_root)
+                        completed = subprocess.run(
+                            rewritten,
+                            shell=True,
+                            executable="/bin/sh",
+                            close_fds=True,
+                            pass_fds=(bundle_fd,),
+                            check=False,
+                        )
+                        verify_open_file(
+                            bundle_fd, wheel_name, wheel_fd, wheel_size, wheel_digest,
+                            (wheel_device, wheel_inode),
+                        )
+                        verify_open_file(
+                            bundle_fd, "framework-lock.json", lock_data_fd, lock_size,
+                            lock_digest, (lock_device, lock_inode),
+                        )
+                        current = os.stat(bundle, dir_fd=assets_fd, follow_symlinks=False)
+                        if (current.st_dev, current.st_ino) != (bundle_device, bundle_inode):
+                            raise SystemExit(79)
+                    finally:
+                        os.close(lock_data_fd)
+                finally:
+                    os.close(wheel_fd)
+            finally:
+                os.close(bundle_fd)
+        finally:
+            os.close(assets_fd)
+    finally:
+        os.close(lock_fd)
+finally:
+    os.close(core_fd)
+
+raise SystemExit(completed.returncode)
 """.strip()
 
 
@@ -1145,6 +1519,7 @@ __all__ = (
     "MAX_FRAMEWORK_LOCK_BYTES",
     "StagedCoreBootstrapAssets",
     "build_core_asset_discard_command",
+    "build_core_asset_consumer_command",
     "build_core_asset_finalize_command",
     "build_core_asset_prepare_command",
     "parse_core_asset_prepare",

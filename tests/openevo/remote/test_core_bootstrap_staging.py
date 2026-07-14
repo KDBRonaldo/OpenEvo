@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import pwd
 import re
+import shlex
 import signal
 import struct
 import subprocess
@@ -163,6 +164,12 @@ def _stage_responses(
                     "framework_lock_path": f"{final}/framework-lock.json",
                     "wheel_sha256": wheel_digest,
                     "framework_lock_sha256": lock_digest,
+                    "bundle_device": 11,
+                    "bundle_inode": 12,
+                    "wheel_device": 13,
+                    "wheel_inode": 14,
+                    "framework_lock_device": 15,
+                    "framework_lock_inode": 16,
                 },
                 separators=(",", ":"),
                 sort_keys=True,
@@ -283,8 +290,18 @@ def test_remote_asset_scripts_prepare_an_empty_private_root_and_publish_exactly(
     assert not incoming.exists()
     assert (final_root / WHEEL_NAME).read_bytes() == assets[0].read_bytes()
     assert stat_mode(service_root) == 0o700
-    assert stat_mode(final_root) == 0o700
-    assert stat_mode(final_root / WHEEL_NAME) == 0o600
+    assert stat_mode(final_root) == 0o500
+    assert stat_mode(final_root / WHEEL_NAME) == 0o400
+    assert finalized["bundle_device"] == final_root.stat().st_dev
+    assert finalized["bundle_inode"] == final_root.stat().st_ino
+    assert finalized["wheel_device"] == (final_root / WHEEL_NAME).stat().st_dev
+    assert finalized["wheel_inode"] == (final_root / WHEEL_NAME).stat().st_ino
+    assert finalized["framework_lock_device"] == (
+        final_root / "framework-lock.json"
+    ).stat().st_dev
+    assert finalized["framework_lock_inode"] == (
+        final_root / "framework-lock.json"
+    ).stat().st_ino
 
     _execute_remote_script(
         core_assets._REMOTE_PREPARE_SCRIPT,
@@ -400,6 +417,315 @@ def test_remote_asset_publication_isolated_from_held_writer_and_incoming_dir_fd(
     assert (final_root / WHEEL_NAME).read_bytes() == assets[0].read_bytes()
 
 
+def test_remote_asset_finalize_rejects_exact_replacement_immediately_after_rename(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    assets = _assets(tmp_path)
+    _execute_remote_script(
+        core_assets._REMOTE_PREPARE_SCRIPT,
+        [BUNDLE_ID],
+        home=home,
+        monkeypatch=monkeypatch,
+    )
+    prepared = json.loads(capsys.readouterr().out)
+    service_root = home / ".openevo" / "core"
+    incoming = Path(prepared["incoming_root"])
+    for source, target in (
+        (assets[0], incoming / WHEEL_NAME),
+        (assets[2], incoming / "framework-lock.json"),
+    ):
+        target.write_bytes(source.read_bytes())
+        target.chmod(0o600)
+
+    final_root = service_root / "assets" / BUNDLE_ID
+    displaced = service_root / "assets" / f"{BUNDLE_ID}.displaced"
+    replaced = False
+    real_fsync = os.fsync
+
+    def replace_after_rename(fd: int) -> None:
+        nonlocal replaced
+        real_fsync(fd)
+        if replaced or not final_root.exists():
+            return
+        replaced = True
+        final_root.rename(displaced)
+        final_root.mkdir(mode=0o700)
+        for source, target in (
+            (assets[0], final_root / WHEEL_NAME),
+            (assets[2], final_root / "framework-lock.json"),
+        ):
+            target.write_bytes(source.read_bytes())
+            target.chmod(0o600)
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(os, "fsync", replace_after_rename)
+        with pytest.raises(SystemExit):
+            _execute_remote_script(
+                core_assets._REMOTE_FINALIZE_SCRIPT,
+                [
+                    str(service_root),
+                    BUNDLE_ID,
+                    prepared["transfer_id"],
+                    WHEEL_NAME,
+                    assets[1],
+                    str(assets[0].stat().st_size),
+                    assets[3],
+                    str(assets[2].stat().st_size),
+                ],
+                home=home,
+                monkeypatch=scoped,
+            )
+
+    assert replaced is True
+    assert (final_root / WHEEL_NAME).read_bytes() == assets[0].read_bytes()
+    assert (displaced / WHEEL_NAME).read_bytes() == assets[0].read_bytes()
+
+
+def test_remote_asset_publication_exposes_no_member_writer_during_copy_or_after_rename(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    assets = _assets(tmp_path)
+    _execute_remote_script(
+        core_assets._REMOTE_PREPARE_SCRIPT,
+        [BUNDLE_ID],
+        home=home,
+        monkeypatch=monkeypatch,
+    )
+    prepared = json.loads(capsys.readouterr().out)
+    service_root = home / ".openevo" / "core"
+    incoming = Path(prepared["incoming_root"])
+    for source, target in (
+        (assets[0], incoming / WHEEL_NAME),
+        (assets[2], incoming / "framework-lock.json"),
+    ):
+        target.write_bytes(source.read_bytes())
+        target.chmod(0o600)
+
+    staging = service_root / "asset-staging"
+    writer_fd: int | None = None
+    attempted_paths: list[Path] = []
+    real_fsync = os.fsync
+
+    def try_hold_candidate_writer(fd: int) -> None:
+        nonlocal writer_fd
+        real_fsync(fd)
+        if writer_fd is not None:
+            return
+        candidates = list(staging.glob(f"publish-{BUNDLE_ID}-*/{WHEEL_NAME}"))
+        candidates.extend((service_root / "assets").glob(f"{BUNDLE_ID}/{WHEEL_NAME}"))
+        for candidate in candidates:
+            if candidate in attempted_paths:
+                continue
+            attempted_paths.append(candidate)
+            if stat_mode(candidate) & 0o222 == 0:
+                continue
+            try:
+                writer_fd = os.open(candidate, os.O_WRONLY | os.O_CLOEXEC)
+            except PermissionError:
+                continue
+            break
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(os, "fsync", try_hold_candidate_writer)
+        _execute_remote_script(
+            core_assets._REMOTE_FINALIZE_SCRIPT,
+            [
+                str(service_root),
+                BUNDLE_ID,
+                prepared["transfer_id"],
+                WHEEL_NAME,
+                assets[1],
+                str(assets[0].stat().st_size),
+                assets[3],
+                str(assets[2].stat().st_size),
+            ],
+            home=home,
+            monkeypatch=scoped,
+        )
+    capsys.readouterr()
+
+    try:
+        assert attempted_paths
+        assert writer_fd is None
+        final_wheel = service_root / "assets" / BUNDLE_ID / WHEEL_NAME
+        assert final_wheel.read_bytes() == assets[0].read_bytes()
+    finally:
+        if writer_fd is not None:
+            os.lseek(writer_fd, 0, os.SEEK_SET)
+            os.write(writer_fd, b"X" * assets[0].stat().st_size)
+            os.close(writer_fd)
+
+
+def test_remote_asset_consumer_rejects_same_name_replacement_after_handoff(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    assets = _assets(tmp_path)
+    _execute_remote_script(
+        core_assets._REMOTE_PREPARE_SCRIPT,
+        [BUNDLE_ID],
+        home=home,
+        monkeypatch=monkeypatch,
+    )
+    prepared = json.loads(capsys.readouterr().out)
+    service_root = home / ".openevo" / "core"
+    incoming = Path(prepared["incoming_root"])
+    for source, target in (
+        (assets[0], incoming / WHEEL_NAME),
+        (assets[2], incoming / "framework-lock.json"),
+    ):
+        target.write_bytes(source.read_bytes())
+        target.chmod(0o600)
+    _execute_remote_script(
+        core_assets._REMOTE_FINALIZE_SCRIPT,
+        [
+            str(service_root),
+            BUNDLE_ID,
+            prepared["transfer_id"],
+            WHEEL_NAME,
+            assets[1],
+            str(assets[0].stat().st_size),
+            assets[3],
+            str(assets[2].stat().st_size),
+        ],
+        home=home,
+        monkeypatch=monkeypatch,
+    )
+    receipt = json.loads(capsys.readouterr().out)
+    final_root = service_root / "assets" / BUNDLE_ID
+    displaced = service_root / "assets" / f"{BUNDLE_ID}.displaced"
+    final_root.rename(displaced)
+    final_root.mkdir(mode=0o500)
+    for source, target in (
+        (assets[0], final_root / WHEEL_NAME),
+        (assets[2], final_root / "framework-lock.json"),
+    ):
+        target.write_bytes(source.read_bytes())
+        target.chmod(0o400)
+
+    with pytest.raises(SystemExit):
+        _execute_remote_script(
+            core_assets._REMOTE_CONSUME_SCRIPT,
+            [
+                str(service_root),
+                BUNDLE_ID,
+                WHEEL_NAME,
+                assets[1],
+                str(assets[0].stat().st_size),
+                assets[3],
+                str(assets[2].stat().st_size),
+                str(receipt["bundle_device"]),
+                str(receipt["bundle_inode"]),
+                str(receipt["wheel_device"]),
+                str(receipt["wheel_inode"]),
+                str(receipt["framework_lock_device"]),
+                str(receipt["framework_lock_inode"]),
+                "printf should-not-run",
+            ],
+            home=home,
+            monkeypatch=monkeypatch,
+        )
+    assert "should-not-run" not in capsys.readouterr().out
+
+
+def test_remote_asset_consumer_reads_verified_pinned_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    assets = _assets(tmp_path)
+    _execute_remote_script(
+        core_assets._REMOTE_PREPARE_SCRIPT,
+        [BUNDLE_ID],
+        home=home,
+        monkeypatch=monkeypatch,
+    )
+    prepared = json.loads(capsys.readouterr().out)
+    service_root = home / ".openevo" / "core"
+    incoming = Path(prepared["incoming_root"])
+    for source, target in (
+        (assets[0], incoming / WHEEL_NAME),
+        (assets[2], incoming / "framework-lock.json"),
+    ):
+        target.write_bytes(source.read_bytes())
+        target.chmod(0o600)
+    _execute_remote_script(
+        core_assets._REMOTE_FINALIZE_SCRIPT,
+        [
+            str(service_root),
+            BUNDLE_ID,
+            prepared["transfer_id"],
+            WHEEL_NAME,
+            assets[1],
+            str(assets[0].stat().st_size),
+            assets[3],
+            str(assets[2].stat().st_size),
+        ],
+        home=home,
+        monkeypatch=monkeypatch,
+    )
+    receipt = json.loads(capsys.readouterr().out)
+    final_root = service_root / "assets" / BUNDLE_ID
+    consumed = tmp_path / "consumed"
+    nested_reader = (
+        "import hashlib,pathlib,sys;"
+        "assert hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest()==sys.argv[3];"
+        "assert hashlib.sha256(pathlib.Path(sys.argv[2]).read_bytes()).hexdigest()==sys.argv[4]"
+    )
+    nested_launcher = (
+        "import subprocess,sys;"
+        "completed=subprocess.run([sys.executable,'-I','-c',sys.argv[1],*sys.argv[2:]],"
+        "close_fds=True);"
+        "raise SystemExit(completed.returncode)"
+    )
+    command = (
+        f"{shlex.quote(sys.executable)} -I -c {shlex.quote(nested_launcher)} "
+        f"{shlex.quote(nested_reader)} "
+        f"{final_root / WHEEL_NAME} {final_root / 'framework-lock.json'} "
+        f"{assets[1]} {assets[3]} "
+        f"&& printf consumed > {consumed}"
+    )
+
+    with pytest.raises(SystemExit) as exit_info:
+        _execute_remote_script(
+            core_assets._REMOTE_CONSUME_SCRIPT,
+            [
+                str(service_root),
+                BUNDLE_ID,
+                WHEEL_NAME,
+                assets[1],
+                str(assets[0].stat().st_size),
+                assets[3],
+                str(assets[2].stat().st_size),
+                str(receipt["bundle_device"]),
+                str(receipt["bundle_inode"]),
+                str(receipt["wheel_device"]),
+                str(receipt["wheel_inode"]),
+                str(receipt["framework_lock_device"]),
+                str(receipt["framework_lock_inode"]),
+                command,
+            ],
+            home=home,
+            monkeypatch=monkeypatch,
+        )
+
+    assert exit_info.value.code == 0
+    assert consumed.read_text(encoding="ascii") == "consumed"
+
+
 def test_remote_asset_attempts_are_unique_and_reconcile_retired_partial_uploads(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -432,6 +758,15 @@ def test_remote_asset_attempts_are_unique_and_reconcile_retired_partial_uploads(
     )
     assert not incoming.exists()
 
+    staging = home / ".openevo" / "core" / "asset-staging"
+    sealed_candidate = staging / f"publish-{BUNDLE_ID}-{SECOND_TRANSFER_ID}"
+    sealed_candidate.mkdir(mode=0o700)
+    for name in (WHEEL_NAME, "framework-lock.json"):
+        path = sealed_candidate / name
+        path.write_bytes(b"private crashed candidate")
+        path.chmod(0o400)
+    sealed_candidate.chmod(0o500)
+
     _execute_remote_script(
         core_assets._REMOTE_PREPARE_SCRIPT,
         [BUNDLE_ID],
@@ -440,7 +775,6 @@ def test_remote_asset_attempts_are_unique_and_reconcile_retired_partial_uploads(
     )
     retried = json.loads(capsys.readouterr().out)
     assert retried["transfer_id"] != prepared["transfer_id"]
-    staging = home / ".openevo" / "core" / "asset-staging"
     assert list(staging.iterdir()) == [Path(retried["incoming_root"])]
 
 
@@ -537,6 +871,18 @@ def test_stage_core_assets_prepares_fresh_host_uploads_private_snapshot_and_fina
     assert staged.service_root == "/home/alice/.openevo/core"
     assert staged.wheel_sha256 == assets[1]
     assert staged.framework_lock_sha256 == assets[3]
+    assert staged.wheel_size == assets[0].stat().st_size
+    assert staged.framework_lock_size == assets[2].stat().st_size
+    assert staged.bundle_inode == 12
+    assert staged.wheel_inode == 14
+    assert staged.framework_lock_inode == 16
+    consumer_command = (
+        f"consume {staged.wheel_path} {staged.framework_lock_path}"
+    )
+    bound_command = transport._bind_core_asset_consumption(consumer_command)
+    assert bound_command.startswith("python3 -I -c ")
+    assert shlex.quote(consumer_command) in bound_command
+    assert bound_command != consumer_command
     assert len(secret_calls) == 2
     assert all(0 < timeout <= 20 for _command, timeout in secret_calls)
     assert len(runner.calls) == 1
