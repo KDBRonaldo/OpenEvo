@@ -7,6 +7,7 @@ step.
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from collections.abc import Callable, Mapping, Sequence
 import ctypes
 from dataclasses import dataclass, field
@@ -20,6 +21,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import selectors
 import signal
 import socket
 import stat
@@ -63,7 +65,7 @@ _SECRET_KEY_PATTERN = (
     r"private[-_ ]?key|aws[-_]?secret[-_]?access[-_]?key|aws[-_]?session[-_]?token)"
 )
 _SECRET_RE = re.compile(
-    rf"(?i)(?:{_SECRET_KEY_PATTERN})\s*[:=]\s*(?:\"[^\"]*\"|'[^']*'|[^\s,;]+)"
+    rf"(?i)(?:{_SECRET_KEY_PATTERN})\s*[:=]\s*.*$"
     r"|bearer\s+[A-Za-z0-9._~+/=-]+"
 )
 _SECRET_KEY_RE = re.compile(rf"(?i)^{_SECRET_KEY_PATTERN}$")
@@ -87,11 +89,12 @@ _SAFE_STRUCTURED_LOG_KEYS = frozenset(
 )
 _URL_CREDENTIAL_RE = re.compile(r"(?i)(https?://)([^/@\s]+)@")
 _URL_QUERY_RE = re.compile(r"(?i)(https?://[^\s?#]+)[?#][^\s]+")
-_ABSOLUTE_PATH_RE = re.compile(r"(?<![A-Za-z0-9_.-])/(?:[^\s/:]+/)+[^\s,:;]+")
+_ABSOLUTE_PATH_RE = re.compile(r"(?<![A-Za-z0-9_.:/-])/(?:[^\s/:]+/)+[^\s,:;]+")
 _MAX_LEDGER_BYTES = 1 * 1024 * 1024
 _MAX_FRAMEWORK_LOCK_BYTES = 4 * 1024 * 1024
 _ROOT_MODE = 0o700
 _FILE_MODE = 0o600
+_MAX_LOG_LINE_BYTES = 16_384
 
 
 def _state_digest(value: str) -> str:
@@ -115,6 +118,11 @@ class SupervisorBusyError(SupervisorError):
 class ServiceExecutionMode(StrEnum):
     CODEX_SUBSCRIPTION_TRANSCRIPT = "codex_subscription_transcript"
     SELF_DEPLOYED = "self-deployed"
+
+
+class ServiceLaunchMode(StrEnum):
+    RELEASE = "release"
+    DEVELOPMENT_TEST = "development_test"
 
 
 class ServiceComponent(StrEnum):
@@ -216,6 +224,7 @@ class ServiceProcessSpec:
     identity_digest: str
     port: int | None
     health_probe: ServiceHealthProbe
+    cwd: str = "/"
     internal_identity: InternalServiceIdentity | None = field(
         default=None,
         repr=False,
@@ -236,6 +245,8 @@ class ServiceProcessSpec:
             _require_digest(value, name)
         if self.port is not None and not 1 <= self.port <= 65535:
             raise ValueError("service port is outside the TCP range")
+        if not os.path.isabs(self.cwd) or any(ord(char) < 0x20 for char in self.cwd):
+            raise ValueError("service cwd must be an absolute safe path")
 
 
 @dataclass(frozen=True, slots=True)
@@ -334,6 +345,8 @@ class PortProbe(Protocol):
 
 class BoundedProbeCommandRunner:
     def __init__(self, *, max_output_bytes: int = 1 * 1024 * 1024) -> None:
+        if not 1 <= max_output_bytes <= 16 * 1024 * 1024:
+            raise ValueError("probe output limit is outside the supported bounds")
         self._max_output_bytes = max_output_bytes
 
     def run(
@@ -345,6 +358,8 @@ class BoundedProbeCommandRunner:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             return ProbeCommandResult(124, b"", b"bootstrap probe deadline exceeded")
+        process: subprocess.Popen[bytes] | None = None
+        selector: selectors.BaseSelector | None = None
         try:
             process = subprocess.Popen(
                 argv,
@@ -352,34 +367,101 @@ class BoundedProbeCommandRunner:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 env=_controlled_environment(),
+                cwd="/",
                 start_new_session=True,
             )
-            while True:
+            stdout = process.stdout
+            stderr = process.stderr
+            if stdout is None or stderr is None:
+                raise OSError("bootstrap probe pipes are unavailable")
+            output = {"stdout": bytearray(), "stderr": bytearray()}
+            aggregate = 0
+            selector = selectors.DefaultSelector()
+            for name, stream in (("stdout", stdout), ("stderr", stderr)):
+                os.set_blocking(stream.fileno(), False)
+                selector.register(stream, selectors.EVENT_READ, name)
+            while selector.get_map():
                 if cancellation is not None and cancellation.is_set():
-                    os.killpg(process.pid, signal.SIGKILL)
-                    stdout, stderr = process.communicate(timeout=1)
-                    return ProbeCommandResult(130, stdout, stderr)
+                    self._kill_group_and_reap(process)
+                    return ProbeCommandResult(
+                        130, bytes(output["stdout"]), bytes(output["stderr"])
+                    )
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    os.killpg(process.pid, signal.SIGKILL)
-                    stdout, stderr = process.communicate(timeout=1)
-                    return ProbeCommandResult(124, stdout, stderr)
+                    self._kill_group_and_reap(process)
+                    return ProbeCommandResult(
+                        124, bytes(output["stdout"]), bytes(output["stderr"])
+                    )
+                for key, _events in selector.select(min(0.05, remaining)):
+                    stream = key.fileobj
+                    try:
+                        chunk = os.read(
+                            stream.fileno(),
+                            min(64 * 1024, self._max_output_bytes - aggregate + 1),
+                        )
+                    except BlockingIOError:
+                        continue
+                    if not chunk:
+                        selector.unregister(stream)
+                        stream.close()
+                        continue
+                    aggregate += len(chunk)
+                    if aggregate > self._max_output_bytes:
+                        self._kill_group_and_reap(process)
+                        return ProbeCommandResult(
+                            125,
+                            b"",
+                            b"bootstrap probe output exceeded its aggregate limit",
+                        )
+                    output[key.data].extend(chunk)
+            while True:
+                if cancellation is not None and cancellation.is_set():
+                    self._kill_group_and_reap(process)
+                    return ProbeCommandResult(
+                        130, bytes(output["stdout"]), bytes(output["stderr"])
+                    )
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    self._kill_group_and_reap(process)
+                    return ProbeCommandResult(
+                        124, bytes(output["stdout"]), bytes(output["stderr"])
+                    )
                 try:
-                    stdout, stderr = process.communicate(timeout=min(0.05, remaining))
+                    returncode = process.wait(timeout=min(0.05, remaining))
                     break
                 except subprocess.TimeoutExpired:
                     continue
-        except (OSError, subprocess.TimeoutExpired) as exc:
+            return ProbeCommandResult(returncode, bytes(output["stdout"]), bytes(output["stderr"]))
+        except OSError as exc:
+            if process is not None and process.poll() is None:
+                self._kill_group_and_reap(process)
             return ProbeCommandResult(
                 124,
                 b"",
                 str(exc).encode("utf-8", errors="replace"),
             )
-        stdout = stdout[: self._max_output_bytes + 1]
-        stderr = stderr[: self._max_output_bytes + 1]
-        if len(stdout) > self._max_output_bytes or len(stderr) > self._max_output_bytes:
-            return ProbeCommandResult(125, b"", b"bootstrap probe output exceeded its limit")
-        return ProbeCommandResult(process.returncode, stdout, stderr)
+        finally:
+            if selector is not None:
+                selector.close()
+            if process is not None:
+                for stream in (process.stdout, process.stderr):
+                    if stream is not None and not stream.closed:
+                        stream.close()
+
+    @staticmethod
+    def _kill_group_and_reap(process: subprocess.Popen[bytes]) -> None:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        try:
+            process.wait(timeout=0.75)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            try:
+                process.wait(timeout=0.2)
+            except subprocess.TimeoutExpired:
+                pass
 
 
 class LocalManagedScienceRuntimeProbe:
@@ -680,50 +762,88 @@ class _Ledger(_StrictStateModel):
 class _TrackedProcess:
     process: subprocess.Popen[bytes]
     identity: ProcessIdentity
+    callback_complete: bool = False
 
 
-class _CredentialStreamRedactor:
-    """Redact one credential across arbitrary chunks with bounded carry."""
+class _BoundedLogStreamRedactor:
+    """Sanitize complete log lines while retaining a strictly bounded carry."""
 
-    def __init__(self, credential: str) -> None:
+    def __init__(self, credential: str, *, max_line_bytes: int = _MAX_LOG_LINE_BYTES) -> None:
+        if not 1 <= max_line_bytes <= _MAX_LOG_LINE_BYTES:
+            raise ValueError("log line limit is outside the supported bounds")
         self._credential = credential.encode("utf-8")
-        self._carry = b""
+        self._max_line_bytes = max_line_bytes
+        self._carry = bytearray()
+        self._dropping_oversize = False
+
+    @property
+    def buffered_bytes(self) -> int:
+        return len(self._carry)
 
     def feed(self, payload: bytes) -> bytes:
-        pending = self._carry + payload
-        self._carry = b""
         output = bytearray()
-        while pending:
-            match = pending.find(self._credential)
-            if match >= 0:
-                output.extend(pending[:match])
-                output.extend(b"<redacted>")
-                pending = pending[match + len(self._credential) :]
+        offset = 0
+        while offset < len(payload):
+            newline = payload.find(b"\n", offset)
+            if self._dropping_oversize:
+                if newline < 0:
+                    return bytes(output)
+                output.extend(b"<redacted-oversize-line>\n")
+                self._dropping_oversize = False
+                offset = newline + 1
                 continue
-            carry_size = min(len(pending), len(self._credential) - 1)
-            while carry_size > 0 and not self._credential.startswith(pending[-carry_size:]):
-                carry_size -= 1
-            if carry_size:
-                output.extend(pending[:-carry_size])
-                self._carry = pending[-carry_size:]
-            else:
-                output.extend(pending)
-            break
+            segment_end = len(payload) if newline < 0 else newline
+            segment = payload[offset:segment_end]
+            if len(self._carry) + len(segment) > self._max_line_bytes:
+                self._carry.clear()
+                if newline < 0:
+                    self._dropping_oversize = True
+                    return bytes(output)
+                output.extend(b"<redacted-oversize-line>\n")
+                offset = newline + 1
+                continue
+            self._carry.extend(segment)
+            if newline < 0:
+                break
+            output.extend(self._sanitize_line(bytes(self._carry), eof=False))
+            self._carry.clear()
+            offset = newline + 1
         return bytes(output)
 
     def flush(self) -> bytes:
+        if self._dropping_oversize:
+            self._dropping_oversize = False
+            self._carry.clear()
+            return b"<redacted-oversize-line>\n"
         if not self._carry:
             return b""
-        self._carry = b""
-        return b"<redacted>"
+        line = bytes(self._carry)
+        self._carry.clear()
+        return self._sanitize_line(line, eof=True)
+
+    def _sanitize_line(self, line: bytes, *, eof: bool) -> bytes:
+        line = line.replace(self._credential, b"<redacted>")
+        if eof:
+            prefix_size = min(len(line), len(self._credential) - 1)
+            while prefix_size > 0 and not self._credential.startswith(line[-prefix_size:]):
+                prefix_size -= 1
+            if prefix_size:
+                line = line[:-prefix_size] + b"<redacted>"
+        safe = _sanitize(line.decode("utf-8", errors="replace"))
+        return (safe.encode("utf-8") + b"\n") if safe else b""
 
 
 class RealSubprocessBackend:
     """Controlled process-group launcher with Linux PID birth identity."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, max_tracked_processes: int = 64) -> None:
+        if not 1 <= max_tracked_processes <= 1024:
+            raise ValueError("tracked process limit is outside the supported bounds")
         self._lock = threading.RLock()
         self._tracked: dict[str, _TrackedProcess] = {}
+        self._completed: OrderedDict[str, tuple[ProcessIdentity, int]] = OrderedDict()
+        self._max_tracked_processes = max_tracked_processes
+        self._spawn_reservations = 0
 
     def spawn(
         self,
@@ -733,38 +853,52 @@ class RealSubprocessBackend:
     ) -> ProcessIdentity:
         if not sys.platform.startswith("linux"):
             raise SupervisorStateError("release process-group supervision requires Linux")
+        self._reserve_spawn_slot()
         parent_pid = os.getpid()
         child_env = dict(spec.env)
         child_env[INTERNAL_OWNERSHIP_ENV] = spec.identity_digest
         pass_fds: list[int] = []
         credential_read_fd: int | None = None
-        if spec.internal_identity is not None:
-            credential_read_fd, credential_write_fd = os.pipe2(os.O_CLOEXEC)
+        cwd_fd: int | None = None
+        process: subprocess.Popen[bytes] | None = None
+        try:
+            cwd_fd = _open_absolute_nofollow_directory(Path(spec.cwd), "service cwd")
+            pass_fds.append(cwd_fd)
+            if spec.internal_identity is not None:
+                credential_read_fd, credential_write_fd = os.pipe2(os.O_CLOEXEC)
+                try:
+                    os.write(credential_write_fd, spec.internal_identity.inherited_payload())
+                finally:
+                    os.close(credential_write_fd)
+                child_env[INTERNAL_CREDENTIAL_FD_ENV] = str(credential_read_fd)
+                pass_fds.append(credential_read_fd)
+            if spec.listen_fd is not None:
+                child_env[INTERNAL_LISTEN_FD_ENV] = str(spec.listen_fd)
+                pass_fds.append(spec.listen_fd)
             try:
-                os.write(credential_write_fd, spec.internal_identity.inherited_payload())
+                process = subprocess.Popen(
+                    spec.argv,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    env=child_env,
+                    close_fds=True,
+                    pass_fds=tuple(pass_fds),
+                    start_new_session=True,
+                    preexec_fn=_linux_child_setup(parent_pid, cwd_fd),
+                )
             finally:
-                os.close(credential_write_fd)
-            child_env[INTERNAL_CREDENTIAL_FD_ENV] = str(credential_read_fd)
-            pass_fds.append(credential_read_fd)
-        if spec.listen_fd is not None:
-            child_env[INTERNAL_LISTEN_FD_ENV] = str(spec.listen_fd)
-            pass_fds.append(spec.listen_fd)
+                if credential_read_fd is not None:
+                    os.close(credential_read_fd)
+                if cwd_fd is not None:
+                    os.close(cwd_fd)
+        except Exception:
+            if process is not None:
+                self._kill_spawned_process_group(process)
+            self._release_spawn_slot()
+            raise
         try:
-            process = subprocess.Popen(
-                spec.argv,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                env=child_env,
-                close_fds=True,
-                pass_fds=tuple(pass_fds),
-                start_new_session=True,
-                preexec_fn=_linux_parent_death_setup(parent_pid),
-            )
-        finally:
-            if credential_read_fd is not None:
-                os.close(credential_read_fd)
-        try:
+            assert process is not None
             identity = ProcessIdentity(
                 pid=process.pid,
                 birth_token=_process_birth_token(process.pid),
@@ -775,25 +909,39 @@ class RealSubprocessBackend:
             if identity.session_id != process.pid or identity.process_group_id != process.pid:
                 raise SupervisorStateError("child did not establish a dedicated process group")
         except Exception:
-            process.kill()
-            process.wait(timeout=5)
+            if process is not None:
+                self._kill_spawned_process_group(process)
+            self._release_spawn_slot()
             raise
         tracked = _TrackedProcess(process=process, identity=identity)
         with self._lock:
             self._tracked[identity.birth_token] = tracked
+            self._spawn_reservations -= 1
         output_thread = threading.Thread(
             target=self._read_output,
             args=(tracked, on_output),
             name=f"openevo-log-{spec.service_id}",
             daemon=True,
         )
-        output_thread.start()
-        threading.Thread(
+        monitor_thread = threading.Thread(
             target=self._monitor,
             args=(tracked, output_thread, on_exit),
             name=f"openevo-monitor-{spec.service_id}",
             daemon=True,
-        ).start()
+        )
+        output_started = False
+        try:
+            output_thread.start()
+            output_started = True
+            monitor_thread.start()
+        except Exception:
+            self._kill_spawned_process_group(process)
+            if output_started:
+                output_thread.join(timeout=0.5)
+            with self._lock:
+                tracked.callback_complete = True
+            self._retire_if_complete(identity)
+            raise
         return identity
 
     def is_alive(self, identity: ProcessIdentity) -> bool:
@@ -803,7 +951,10 @@ class RealSubprocessBackend:
         members = _owned_process_group_members(identity)
         if members is None:
             raise SupervisorStateError("managed process-group identity could not be verified")
-        return bool(members)
+        alive = bool(members)
+        if not alive:
+            self._retire_if_complete(identity)
+        return alive
 
     def terminate(self, identity: ProcessIdentity) -> None:
         if self.is_alive(identity):
@@ -814,9 +965,12 @@ class RealSubprocessBackend:
             os.killpg(identity.process_group_id, signal.SIGKILL)
 
     def wait(self, identity: ProcessIdentity, timeout: float | None) -> int | None:
+        completed_returncode = self._completed_returncode(identity)
+        if completed_returncode is not None:
+            return completed_returncode
         tracked = self._owned(identity)
         if tracked is None:
-            return None
+            return self._completed_returncode(identity)
         deadline = None if timeout is None else time.monotonic() + timeout
         returncode: int | None = tracked.process.poll()
         while True:
@@ -824,9 +978,17 @@ class RealSubprocessBackend:
                 returncode = tracked.process.poll()
             members = _owned_process_group_members(identity)
             if members == ():
-                return returncode if returncode is not None else 0
+                result = returncode if returncode is not None else 0
+                self._retire_if_complete(identity)
+                return result
             if members is None:
-                return None
+                completed_returncode = self._completed_returncode(identity)
+                if completed_returncode is not None:
+                    return completed_returncode
+                if deadline is None or time.monotonic() >= deadline:
+                    return None
+                time.sleep(0.01)
+                continue
             if deadline is not None and time.monotonic() >= deadline:
                 return None
             time.sleep(0.01)
@@ -869,6 +1031,73 @@ class RealSubprocessBackend:
             return None
         return tracked
 
+    def _reserve_spawn_slot(self) -> None:
+        with self._lock:
+            self._reclaim_completed_locked()
+            if len(self._tracked) + self._spawn_reservations >= self._max_tracked_processes:
+                raise SupervisorStateError("tracked process capacity is exhausted")
+            self._spawn_reservations += 1
+
+    def _release_spawn_slot(self) -> None:
+        with self._lock:
+            if self._spawn_reservations > 0:
+                self._spawn_reservations -= 1
+
+    def _reclaim_completed_locked(self) -> None:
+        for birth_token, tracked in tuple(self._tracked.items()):
+            if (
+                tracked.callback_complete
+                and tracked.process.poll() is not None
+                and _owned_process_group_members(tracked.identity) == ()
+            ):
+                self._tracked.pop(birth_token, None)
+                self._remember_completed_locked(tracked)
+
+    def _retire_if_complete(self, identity: ProcessIdentity) -> None:
+        with self._lock:
+            tracked = self._tracked.get(identity.birth_token)
+            if (
+                tracked is not None
+                and tracked.identity == identity
+                and tracked.callback_complete
+                and tracked.process.poll() is not None
+                and _owned_process_group_members(identity) == ()
+            ):
+                self._tracked.pop(identity.birth_token, None)
+                self._remember_completed_locked(tracked)
+
+    def _remember_completed_locked(self, tracked: _TrackedProcess) -> None:
+        returncode = tracked.process.poll()
+        if returncode is None:
+            return
+        self._completed[tracked.identity.birth_token] = (tracked.identity, returncode)
+        self._completed.move_to_end(tracked.identity.birth_token)
+        while len(self._completed) > self._max_tracked_processes:
+            self._completed.popitem(last=False)
+
+    def _completed_returncode(self, identity: ProcessIdentity) -> int | None:
+        with self._lock:
+            completed = self._completed.get(identity.birth_token)
+            if completed is None or completed[0] != identity:
+                return None
+            self._completed.move_to_end(identity.birth_token)
+            return completed[1]
+
+    @staticmethod
+    def _kill_spawned_process_group(process: subprocess.Popen[bytes]) -> None:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        try:
+            process.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            try:
+                process.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                pass
+
     @staticmethod
     def _read_output(
         tracked: _TrackedProcess,
@@ -883,15 +1112,22 @@ class RealSubprocessBackend:
         finally:
             stream.close()
 
-    @staticmethod
     def _monitor(
+        self,
         tracked: _TrackedProcess,
         output_thread: threading.Thread,
         on_exit: Callable[[ProcessIdentity, int], None],
     ) -> None:
         returncode = tracked.process.wait()
         output_thread.join()
-        on_exit(tracked.identity, returncode)
+        try:
+            on_exit(tracked.identity, returncode)
+        finally:
+            with self._lock:
+                current = self._tracked.get(tracked.identity.birth_token)
+                if current is tracked:
+                    tracked.callback_complete = True
+            self._retire_if_complete(tracked.identity)
 
 
 class DefaultHealthChecker:
@@ -1198,9 +1434,11 @@ class CoreServiceSupervisor:
     def __init__(
         self,
         *,
+        launch_mode: ServiceLaunchMode,
         service_root: Path,
         framework_lock: Path,
-        release_identity: ServiceReleaseIdentity,
+        release_identity: ServiceReleaseIdentity | None = None,
+        verified_registry: object | None = None,
         python_executable: str | None = None,
         process_backend: ProcessBackend | None = None,
         health_checker: HealthChecker | None = None,
@@ -1210,11 +1448,37 @@ class CoreServiceSupervisor:
         stop_timeout: float = 5.0,
         max_log_entries: int = 512,
         max_log_bytes: int = 512 * 1024,
+        max_restart_operations: int = 256,
     ) -> None:
         if startup_timeout <= 0 or stop_timeout <= 0:
             raise ValueError("supervisor timeouts must be positive")
         if not 1 <= max_log_entries <= 10_000 or not 1 <= max_log_bytes <= 1_048_576:
             raise ValueError("supervisor log limits are outside the supported bounds")
+        if not 1 <= max_restart_operations <= 4096:
+            raise ValueError("restart operation limit is outside the supported bounds")
+        launch_mode = ServiceLaunchMode(launch_mode)
+        injected_runtime_dependencies = any(
+            dependency is not None
+            for dependency in (
+                python_executable,
+                process_backend,
+                health_checker,
+                port_probe,
+                managed_runtime_probe,
+            )
+        )
+        if launch_mode is ServiceLaunchMode.RELEASE:
+            if verified_registry is None or release_identity is not None:
+                raise ValueError("release mode requires only a verified registry identity source")
+            if injected_runtime_dependencies:
+                raise ValueError("release mode rejects development runtime dependency injection")
+            resolved_release_identity = release_identity_from_verified_registry(verified_registry)
+        else:
+            if release_identity is None or verified_registry is not None:
+                raise ValueError(
+                    "development/test mode requires an explicit release identity and no registry"
+                )
+            resolved_release_identity = release_identity
         self._mutex = threading.RLock()
         self._root = _SecureServiceRoot(service_root)
         self._closed = False
@@ -1222,7 +1486,9 @@ class CoreServiceSupervisor:
             self._framework_lock_source = _VerifiedFrameworkLock(Path(framework_lock))
             self._framework_lock_digest = self._framework_lock_source.digest
             self._managed_framework_lock = self._root.path / "framework-lock.json"
-            self._release_identity = release_identity
+            self._launch_mode = launch_mode
+            self._verified_registry = verified_registry
+            self._release_identity = resolved_release_identity
             self._python = python_executable or sys.executable
             self._process_backend = process_backend or RealSubprocessBackend()
             self._health_checker = health_checker or DefaultHealthChecker()
@@ -1234,12 +1500,15 @@ class CoreServiceSupervisor:
             self._stop_timeout = stop_timeout
             self._max_log_entries = max_log_entries
             self._max_log_bytes = max_log_bytes
+            self._max_restart_operations = max_restart_operations
+            self._root.ensure_directory("child-cwd")
+            self._child_cwd = self._root.path / "child-cwd"
             self._handles: dict[str, ProcessIdentity] = {}
             self._specs: dict[str, ServiceProcessSpec] = {}
             self._output_redactors: dict[
-                tuple[str, str, ProcessIdentity], _CredentialStreamRedactor
+                tuple[str, str, ProcessIdentity], _BoundedLogStreamRedactor
             ] = {}
-            self._restart_results: dict[tuple[str, str], SupervisorServiceSummary] = {}
+            self._restart_results: dict[str, tuple[str, SupervisorServiceSummary]] = {}
             self._active_plan_key: str | None = None
             self._active_credential: str | None = None
             self._active_runtime_request: ManagedScienceRuntimeRequest | None = None
@@ -1265,6 +1534,7 @@ class CoreServiceSupervisor:
     ) -> ServiceGroupSnapshot:
         with self._mutex:
             self._require_open()
+            self._verify_release_installation()
             cancellation = threading.Event()
             self._active_cancellation = cancellation
             if total_timeout is not None and total_timeout <= 0:
@@ -1405,17 +1675,21 @@ class CoreServiceSupervisor:
                     try:
                         identity = self._process_backend.spawn(
                             spec,
-                            lambda process_identity, payload, service_id=spec.service_id: self._record_output(
-                                service_id,
-                                generation_digest,
-                                process_identity,
-                                payload,
+                            lambda process_identity, payload, service_id=spec.service_id: (
+                                self._record_output(
+                                    service_id,
+                                    generation_digest,
+                                    process_identity,
+                                    payload,
+                                )
                             ),
-                            lambda process_identity, returncode, service_id=spec.service_id: self._record_exit(
-                                service_id,
-                                generation_digest,
-                                process_identity,
-                                returncode,
+                            lambda process_identity, returncode, service_id=spec.service_id: (
+                                self._record_exit(
+                                    service_id,
+                                    generation_digest,
+                                    process_identity,
+                                    returncode,
+                                )
                             ),
                         )
                     except Exception as exc:
@@ -1464,7 +1738,9 @@ class CoreServiceSupervisor:
                 if cancellation.is_set():
                     self._rollback(
                         started,
-                        min(deadline, time.monotonic() + self._stop_timeout * max(1, len(started))),
+                        min(
+                            deadline, time.monotonic() + self._stop_timeout * max(1, len(started))
+                        ),
                     )
                 raise
             finally:
@@ -1496,12 +1772,19 @@ class CoreServiceSupervisor:
             self._require_open()
             if total_timeout is not None and total_timeout <= 0:
                 raise ValueError("total_timeout must be positive")
-            key = (service_id, operation_id)
-            if key in self._restart_results:
-                return self._restart_results[key]
+            prior = self._restart_results.get(operation_id)
+            if prior is not None:
+                prior_service_id, prior_result = prior
+                if prior_service_id != service_id:
+                    raise SupervisorStateError(
+                        "restart operation identity was reused for a different request"
+                    )
+                return prior_result
             record = self._record(service_id)
             if not record.restartable:
                 raise SupervisorStateError("service is not restartable in its current state")
+            if len(self._restart_results) >= self._max_restart_operations:
+                raise SupervisorBusyError("restart operation replay capacity is exhausted")
             runtime_request = self._active_runtime_request
             if runtime_request is None:
                 raise SupervisorStateError("subscription runtime request is unavailable")
@@ -1513,7 +1796,7 @@ class CoreServiceSupervisor:
                 total_timeout=total_timeout,
             )
             result = snapshot.service(service_id)
-            self._restart_results[key] = result
+            self._restart_results[operation_id] = (service_id, result)
             return result
 
     def logs(
@@ -1557,6 +1840,7 @@ class CoreServiceSupervisor:
                 raise SupervisorStateError(
                     "managed children remain live; supervisor ownership was retained"
                 )
+            self._restart_results.clear()
             self._closed = True
             self._framework_lock_source.close()
             self._root.close()
@@ -1631,6 +1915,7 @@ class CoreServiceSupervisor:
                 ServiceComponent.EVOLUTION_BACKEND,
                 (
                     self._python,
+                    "-I",
                     "-m",
                     "openevo.evolution.cli",
                     "serve",
@@ -1657,6 +1942,7 @@ class CoreServiceSupervisor:
                 ServiceComponent.ROLLOUT,
                 (
                     self._python,
+                    "-I",
                     "-m",
                     "openevo.rollout.server",
                     "--config",
@@ -1677,6 +1963,7 @@ class CoreServiceSupervisor:
                 ServiceComponent.GATEWAY,
                 (
                     self._python,
+                    "-I",
                     "-m",
                     "openevo.gateway.server",
                     "--config",
@@ -1698,6 +1985,7 @@ class CoreServiceSupervisor:
                 ServiceComponent.EVOLUTION_WORKER,
                 (
                     self._python,
+                    "-I",
                     "-m",
                     "openevo.evolution.cli",
                     "worker",
@@ -1734,6 +2022,7 @@ class CoreServiceSupervisor:
                 {
                     "argv_digest": argv_digest,
                     "component": component.value,
+                    "cwd": os.fspath(self._child_cwd),
                     "env_digest": env_digest,
                     "framework_lock_digest": self._framework_lock_digest,
                     "install_digest": self._release_identity.install_digest,
@@ -1759,6 +2048,7 @@ class CoreServiceSupervisor:
                     identity_digest=identity_digest,
                     port=port,
                     health_probe=health_probe,
+                    cwd=os.fspath(self._child_cwd),
                     internal_identity=internal_identity,
                     listen_fd=(
                         listeners[service_id].fileno() if service_id in listeners else None
@@ -1991,9 +2281,9 @@ class CoreServiceSupervisor:
             key = (service_id, generation_digest, identity)
             redactor = self._output_redactors.get(key)
             if redactor is None:
-                redactor = _CredentialStreamRedactor(credential)
+                redactor = _BoundedLogStreamRedactor(credential)
                 self._output_redactors[key] = redactor
-            redacted = redactor.feed(payload[:65_536])
+            redacted = redactor.feed(payload)
             self._append_output_payload(service_id, redacted)
             self._persist()
 
@@ -2391,6 +2681,18 @@ class CoreServiceSupervisor:
             raise SupervisorStateError("service supervisor is closed")
         self._root.verify()
 
+    def _verify_release_installation(self) -> None:
+        if self._launch_mode is not ServiceLaunchMode.RELEASE:
+            return
+        try:
+            current = release_identity_from_verified_registry(self._verified_registry)
+        except Exception as exc:
+            raise SupervisorStateError(
+                "verified release installation could not be revalidated"
+            ) from exc
+        if current != self._release_identity:
+            raise SupervisorStateError("verified release installation identity changed")
+
     @staticmethod
     def _raise_if_cancelled(cancellation: threading.Event) -> None:
         if cancellation.is_set():
@@ -2400,9 +2702,12 @@ class CoreServiceSupervisor:
 def release_identity_from_verified_registry(registry: object) -> ServiceReleaseIdentity:
     """Derive service identity only from a loader-sealed executable registry."""
 
-    from openevo.evolution.framework import require_verified_executable_registry
+    from openevo.evolution.framework.builtins import require_verified_executable_registry
+    from openevo.evolution.framework.loading import _reverify_distribution_inventory
 
     verified = require_verified_executable_registry(registry)  # type: ignore[arg-type]
+    for attestation in verified.distribution_attestations.values():
+        _reverify_distribution_inventory(attestation)
     installed = [
         {
             "distribution_digest": item.expectation.distribution_digest,
@@ -2418,9 +2723,11 @@ def release_identity_from_verified_registry(registry: object) -> ServiceReleaseI
 
 
 def _controlled_environment() -> dict[str, str]:
-    allowed = ("HOME", "LANG", "LC_ALL", "PATH", "PYTHONPATH", "TMPDIR", "VIRTUAL_ENV")
+    allowed = ("HOME", "LANG", "LC_ALL", "PATH", "TMPDIR")
     result = {key: os.environ[key] for key in allowed if key in os.environ}
     result.setdefault("PATH", os.defpath)
+    result["PYTHONNOUSERSITE"] = "1"
+    result["PYTHONSAFEPATH"] = "1"
     result["PYTHONUNBUFFERED"] = "1"
     return dict(sorted(result.items()))
 
@@ -2509,6 +2816,32 @@ def _open_absolute_nofollow_file(path: Path, label: str) -> int:
             raise SupervisorStateError(f"{label} cannot be opened safely") from exc
     finally:
         os.close(current)
+
+
+def _open_absolute_nofollow_directory(path: Path, label: str) -> int:
+    absolute = Path(os.path.abspath(os.fspath(path)))
+    parts = absolute.parts[1:]
+    current = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    if not parts:
+        return current
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        for index, part in enumerate(parts):
+            try:
+                next_fd = os.open(part, flags, dir_fd=current)
+            except OSError as exc:
+                if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+                    raise SupervisorStateError(f"{label} path contains a symlink") from exc
+                raise SupervisorStateError(f"{label} path is unavailable") from exc
+            os.close(current)
+            current = next_fd
+            if index < len(parts) - 1:
+                _require_safe_ancestor(os.fstat(current))
+        _require_private_directory(os.fstat(current), os.getuid(), label)
+        return current
+    except Exception:
+        os.close(current)
+        raise
 
 
 def _probe_http(spec: ServiceProcessSpec, remaining: float) -> tuple[bool, str]:
@@ -2610,13 +2943,18 @@ def _probe_rollout_registration(
         return False, _safe_message("rollout registration probe failed", exc)
 
 
-def _linux_parent_death_setup(parent_pid: int) -> Callable[[], None] | None:
+def _linux_child_setup(parent_pid: int, cwd_fd: int) -> Callable[[], None] | None:
     if not sys.platform.startswith("linux"):
         return None
     libc = ctypes.CDLL(None, use_errno=True)
     pr_set_pdeathsig = 1
 
     def setup() -> None:
+        try:
+            os.fchdir(cwd_fd)
+            os.close(cwd_fd)
+        except OSError:
+            os._exit(127)
         if libc.prctl(pr_set_pdeathsig, signal.SIGKILL, 0, 0, 0) != 0:
             os._exit(127)
         if os.getppid() != parent_pid:
@@ -2677,8 +3015,7 @@ def _owned_process_group_members(identity: ProcessIdentity) -> tuple[int, ...] |
         except (OSError, UnicodeDecodeError, ValueError, IndexError):
             continue
         if state == "Z" or (
-            process_group_id != identity.process_group_id
-            or session_id != identity.session_id
+            process_group_id != identity.process_group_id or session_id != identity.session_id
         ):
             continue
         pid = int(candidate.name)
@@ -2813,6 +3150,7 @@ __all__ = [
     "RealSubprocessBackend",
     "ServiceComponent",
     "ServiceExecutionMode",
+    "ServiceLaunchMode",
     "ServiceGroupSnapshot",
     "ServiceHealthProbe",
     "ServiceProcessSpec",

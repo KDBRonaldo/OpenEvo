@@ -52,7 +52,24 @@ Raw argv, environment values, framework-lock paths, service-root paths, tokens,
 credentials, URL userinfo/query values, and host paths are not persisted in
 observable service/log snapshots. The child environment is rebuilt from a small
 non-secret runtime allowlist instead of inheriting the complete Core daemon
-environment.
+environment. `PYTHONPATH`, `PYTHONHOME`, virtual-environment hints, and arbitrary
+parent variables are absent. Every managed Python command uses isolated `-I`
+mode. Core opens the owner-only `child-cwd` directory no-follow, verifies its
+inode and mode, and the child changes directory through that inherited FD before
+exec; neither the supervisor's caller cwd nor a replaced pathname can shadow the
+installed `openevo` package.
+
+Construction has an explicit `release` versus `development_test` boundary.
+Release accepts only a loader-sealed `VerifiedExecutableRegistry`; it rejects an
+injected digest, interpreter, process backend, health checker, port probe, or
+runtime probe. Construction and every non-replay `ensure`/`restart` re-read the
+sealed registry's exact installed distribution inventories through a private
+framework-owner helper and require the resulting install/registry identity to
+remain unchanged. The helper first checks the unforgeable registry and
+distribution seals and is not exported by the framework public API.
+`development_test` must instead be selected explicitly and is the only mode that
+accepts test identities and runtime dependency injection. It cannot alter the
+release path.
 
 Each started generation receives a new high-entropy internal credential. The
 credential is written to one child-specific pipe and inherited by FD; only the
@@ -69,12 +86,13 @@ Durable output filtering treats JSON as a closed diagnostic object. Known
 credential, authorization, cookie, API key, token, password, private-key, and
 AWS-secret fields are redacted; values under unknown structured fields are not
 persisted. Header, environment, JSON, URL, and key-value forms receive the same
-filter before bounded storage. The active generation credential additionally
-uses a per-process streaming redactor. It carries at most `len(credential) - 1`
-bytes across arbitrary stdout/stderr chunks, emits only a redaction marker
-for a complete credential, and redacts a residual credential prefix when the
-process exits or is stopped. A credential split across two or more chunks
-therefore cannot be reconstructed from ledger or log entries.
+filter before bounded storage. A per-process streaming redactor retains only one
+bounded incomplete line, so every secret form is recognized even when any token,
+JSON field, URL, or header is split across arbitrary stdout/stderr chunks. Lines
+over 16 KiB are discarded through the next newline and represented only by
+`<redacted-oversize-line>`; an unterminated oversize line receives the same marker
+at EOF. Normal residual lines are sanitized at EOF. No raw prefix is emitted
+before the complete line has passed the generic and generation-credential filters.
 
 The real subprocess backend starts a dedicated session/process group and binds
 the leader PID to `/proc` start ticks, uid, exact cmdline digest, SID, PGID, and
@@ -90,7 +108,11 @@ foreign member, unreadable identity, changed SID/PGID, or ownership mismatch
 blocks startup without signaling. A leader exit callback captures generation
 and complete process identity, so a delayed callback cannot clear a replacement
 generation. If the leader exits while a grandchild remains, the handle and group
-identity are retained for close/restart recovery.
+identity are retained for close/restart recovery. The real backend reserves from
+a fixed tracked-process capacity before spawn. It releases a live identity only
+after the exit callback completed and the full process group disappeared; a
+separately bounded completed-result tombstone preserves concurrent/repeated
+`wait` observations. Capacity exhaustion fails before creating another child.
 
 ## Supported Service Group
 
@@ -98,10 +120,10 @@ identity are retained for close/restart recovery.
 closed generation topology with prebound dynamic ports and directly launches
 these entry points in dependency order:
 
-1. `python -m openevo.evolution.cli serve` on a prebound loopback listener;
-2. `python -m openevo.rollout.server` on a prebound loopback listener;
-3. `python -m openevo.gateway.server` on a prebound loopback listener;
-4. `python -m openevo.evolution.cli worker` against the same verified framework
+1. `python -I -m openevo.evolution.cli serve` on a prebound loopback listener;
+2. `python -I -m openevo.rollout.server` on a prebound loopback listener;
+3. `python -I -m openevo.gateway.server` on a prebound loopback listener;
+4. `python -I -m openevo.evolution.cli worker` against the same verified framework
    lock and evolution artifact root.
 
 Each subscription ensure request also carries the bounded Codex model and one of
@@ -113,7 +135,10 @@ image must have a SHA-256 image ID and the
 `io.openevo.managed-runtime=true` label produced by the managed Science
 Dockerfile. It opens `~/.codex/auth.json` no-follow, requires a link-count-one
 owner-owned `0600` file, and hashes only file metadata. It never reads or
-persists auth content.
+persists auth content. Probe stdout and stderr are drained concurrently without
+`communicate()`. One hard aggregate byte budget covers both streams; crossing it
+immediately kills the complete probe process group and performs a bounded leader
+reap. Cancellation and deadline paths use the same group-wide bounded cleanup.
 
 The resulting non-secret runtime evidence digest, exact managed image tag, and
 Codex model are bound into the service generation. The Codex model is also the
@@ -155,7 +180,12 @@ is bound to dynamic loopback port zero by Core and inherited by FD, eliminating
 port availability/bind TOCTOU. One total startup deadline applies and partial
 groups roll back in reverse order.
 
-`restart` is idempotent for the same `(service_id, operation_id)`. Because auth,
+`restart` is idempotent for the same `(service_id, operation_id)`. Operation IDs
+cannot be reused for another service. The process-local replay table has a fixed
+capacity: exact completed replays remain available at capacity, while a new
+operation is rejected before changing service state. Entries live until the
+supervisor closes; eviction cannot silently turn an old replay into a new restart.
+Because auth,
 registration, and health are generation-scoped, a restart rotates the credential
 and replaces the complete four-service group rather than leaving a mixed
 generation. Child exits are monitored and persisted as failures. `close` and
@@ -240,7 +270,9 @@ preparation state.
 Provider wiring must add API authorization, durable operation records, event
 publication, pagination/cursors, and request idempotency around these internal
 objects. The supervisor's in-memory restart-operation cache is process-local and
-is not a substitute for the provider's durable mutation contract.
+is not a substitute for the provider's durable mutation contract. Its bounded
+fail-closed behavior protects this internal slice, but the provider must retain
+durable operation identity/results across Core process restarts.
 
 ## Verification And Residual Risks
 
@@ -248,10 +280,11 @@ Focused coverage is in `tests/backend/test_core_service_supervisor.py` and
 `tests/backend/test_internal_service_auth.py`. It includes total deadlines,
 prebound listeners, partial rollback, delayed exit callbacks, idempotent
 concurrent ensure/restart, lock replacement, malicious ledger/symlink rejection,
-bounded cancellation and close escalation, closed log redaction, unauthenticated
-HTTP rejection, exact worker/gateway registration, and real child-to-grandchild
-process-group termination and stale-owner recovery probes. No test downloads a
-model.
+bounded cancellation and close escalation, every-boundary generic log redaction,
+oversize-line discard, aggregate probe-output termination, release-registry
+anti-bypass/fresh-import checks, tracked/replay capacity, unauthenticated HTTP
+rejection, exact worker/gateway registration, and real child-to-grandchild
+process-group termination and stale-owner recovery probes. No test downloads a model.
 
 Residual integration risks remain explicit:
 

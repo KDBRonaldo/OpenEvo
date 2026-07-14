@@ -4,12 +4,14 @@ import json
 import os
 from pathlib import Path
 import socket
+import subprocess
 import sys
 import threading
 import time
 
 import pytest
 
+from openevo.backend import service_supervisor as supervisor_module
 from openevo.backend.contracts.v1.models import LogEntryV1, ServiceSummaryV1
 from openevo.backend.service_supervisor import (
     BoundedProbeCommandRunner,
@@ -24,6 +26,7 @@ from openevo.backend.service_supervisor import (
     ServiceComponent,
     ServiceExecutionMode,
     ServiceHealthProbe,
+    ServiceLaunchMode,
     ServiceProcessSpec,
     ServiceReleaseIdentity,
     ServiceStatus,
@@ -32,6 +35,7 @@ from openevo.backend.service_supervisor import (
 )
 from openevo.config import TopologyConfig
 from openevo.internal_auth import InternalServiceIdentity
+from tests.framework_testkit import verified_builtin_registry
 
 
 INSTALL_DIGEST = "a" * 64
@@ -69,9 +73,7 @@ class FakeProcessBackend:
             self.spawned.append(spec)
             self.identities[spec.service_id] = identity
             self.alive[spec.service_id] = True
-            self.callbacks.setdefault(spec.service_id, []).append(
-                (identity, on_output, on_exit)
-            )
+            self.callbacks.setdefault(spec.service_id, []).append((identity, on_output, on_exit))
             self._condition.notify_all()
         return identity
 
@@ -250,6 +252,7 @@ def _supervisor(
     max_log_entries: int = 100,
     max_log_bytes: int = 32_768,
     runtime_probe: FakeManagedScienceRuntimeProbe | None = None,
+    max_restart_operations: int = 256,
 ) -> tuple[
     CoreServiceSupervisor,
     FakeProcessBackend,
@@ -260,6 +263,7 @@ def _supervisor(
     health = health or FakeHealthChecker()
     runtime_probe = runtime_probe or FakeManagedScienceRuntimeProbe()
     supervisor = CoreServiceSupervisor(
+        launch_mode=ServiceLaunchMode.DEVELOPMENT_TEST,
         service_root=tmp_path / "core-services",
         framework_lock=framework_lock,
         release_identity=ServiceReleaseIdentity(
@@ -274,6 +278,7 @@ def _supervisor(
         stop_timeout=stop_timeout,
         max_log_entries=max_log_entries,
         max_log_bytes=max_log_bytes,
+        max_restart_operations=max_restart_operations,
     )
     return supervisor, backend, health, runtime_probe
 
@@ -330,12 +335,24 @@ def test_subscription_plan_is_deterministic_and_ready_requires_health_and_identi
             )
         ]
         assert all("codex" not in part.lower() for spec in backend.spawned for part in spec.argv)
+        assert all(spec.argv[1] == "-I" for spec in backend.spawned)
+        assert all("PYTHONPATH" not in spec.env for spec in backend.spawned)
+        assert all("PYTHONHOME" not in spec.env for spec in backend.spawned)
+        child_cwd = tmp_path / "core-services" / "child-cwd"
+        assert all(spec.cwd == os.fspath(child_cwd) for spec in backend.spawned)
+        assert child_cwd.stat().st_mode & 0o777 == 0o700
         credential = backend.spawned[0].internal_identity
         assert credential is not None
         assert credential.credential not in repr(backend.spawned[0])
-        assert credential.credential not in (tmp_path / "core-services" / "ledger.json").read_text()
-        assert credential.credential not in (tmp_path / "core-services" / "topology.json").read_text()
-        assert len({service.port for service in snapshot.services if service.port is not None}) == 3
+        assert (
+            credential.credential not in (tmp_path / "core-services" / "ledger.json").read_text()
+        )
+        assert (
+            credential.credential not in (tmp_path / "core-services" / "topology.json").read_text()
+        )
+        assert (
+            len({service.port for service in snapshot.services if service.port is not None}) == 3
+        )
     finally:
         supervisor.close()
 
@@ -572,6 +589,136 @@ def test_streaming_log_redaction_hides_fragmented_credentials_and_flushes_carry(
         supervisor.close()
 
 
+@pytest.mark.parametrize(
+    ("payload", "forbidden"),
+    [
+        (b"Authorization: Bearer auth-secret-value\n", b"auth-secret-value"),
+        (b"Cookie: session=cookie-secret; csrf=csrf-secret\n", b"cookie-secret"),
+        (b"X-API-Key: api-key-secret\n", b"api-key-secret"),
+        (
+            b"request https://user:pass@example.test/path?q=query-secret#fragment\n",
+            b"query-secret",
+        ),
+        (
+            b'{"message":"failed","authorization":"json-secret",'
+            b'"nested":{"api_key":"nested-secret"}}\n',
+            b"json-secret",
+        ),
+    ],
+)
+def test_generic_log_redaction_is_safe_at_every_chunk_boundary(
+    payload: bytes,
+    forbidden: bytes,
+) -> None:
+    credential = "supervisor-credential-secret"
+    for split in range(len(payload) + 1):
+        redactor = supervisor_module._BoundedLogStreamRedactor(credential)
+        rendered = redactor.feed(payload[:split])
+        rendered += redactor.feed(payload[split:])
+        rendered += redactor.flush()
+        assert forbidden not in rendered
+        assert b"<redacted>" in rendered
+
+
+def test_log_redactor_drops_oversize_line_with_bounded_carry_and_flushes_eof() -> None:
+    redactor = supervisor_module._BoundedLogStreamRedactor(
+        "supervisor-credential-secret",
+        max_line_bytes=64,
+    )
+
+    assert redactor.feed(b"Authorization: Bearer " + b"x" * 10_000) == b""
+    assert redactor.buffered_bytes <= 64
+    assert redactor.flush() == b"<redacted-oversize-line>\n"
+
+
+def test_release_mode_requires_verified_registry_and_reverifies_each_ensure(
+    tmp_path: Path,
+    framework_lock: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = verified_builtin_registry(tmp_path / "verified-registry")
+    real_identity = supervisor_module.release_identity_from_verified_registry
+    calls = 0
+
+    def observed_identity(candidate: object) -> ServiceReleaseIdentity:
+        nonlocal calls
+        calls += 1
+        return real_identity(candidate)
+
+    monkeypatch.setattr(
+        supervisor_module,
+        "release_identity_from_verified_registry",
+        observed_identity,
+    )
+    supervisor = CoreServiceSupervisor(
+        launch_mode=ServiceLaunchMode.RELEASE,
+        service_root=tmp_path / "release-services",
+        framework_lock=framework_lock,
+        verified_registry=registry,
+    )
+    try:
+        snapshot = supervisor.ensure(
+            ServiceExecutionMode.SELF_DEPLOYED,
+            model_ref="Qwen/release-probe",
+        )
+        assert snapshot.services_available is False
+        assert calls == 2
+
+        from openevo.evolution.framework import loading
+
+        def reject_inventory(_attestation: object) -> None:
+            raise RuntimeError("controlled installed inventory mismatch")
+
+        monkeypatch.setattr(loading, "_reverify_distribution_inventory", reject_inventory)
+        with pytest.raises(SupervisorStateError, match="could not be revalidated"):
+            supervisor.ensure(
+                ServiceExecutionMode.SELF_DEPLOYED,
+                model_ref="Qwen/release-probe",
+            )
+    finally:
+        supervisor.close()
+
+
+def test_release_mode_rejects_development_injection(
+    tmp_path: Path,
+    framework_lock: Path,
+) -> None:
+    with pytest.raises(ValueError, match="verified registry"):
+        CoreServiceSupervisor(
+            launch_mode=ServiceLaunchMode.RELEASE,
+            service_root=tmp_path / "release-services",
+            framework_lock=framework_lock,
+            release_identity=ServiceReleaseIdentity(INSTALL_DIGEST, REGISTRY_DIGEST),
+        )
+
+
+def test_release_registry_reverification_is_private_and_rejects_unsealed_objects(
+    tmp_path: Path,
+    framework_lock: Path,
+) -> None:
+    with pytest.raises(TypeError, match="verified registry loader"):
+        CoreServiceSupervisor(
+            launch_mode=ServiceLaunchMode.RELEASE,
+            service_root=tmp_path / "unsealed-release-services",
+            framework_lock=framework_lock,
+            verified_registry=object(),
+        )
+
+    completed = subprocess.run(
+        (
+            sys.executable,
+            "-c",
+            "import openevo.evolution.framework as framework;"
+            "assert not hasattr(framework, 'reverify_distribution_install');"
+            "assert 'reverify_distribution_install' not in framework.__all__",
+        ),
+        check=False,
+        capture_output=True,
+        timeout=10,
+    )
+    assert completed.returncode == 0, completed.stderr.decode("utf-8", errors="replace")
+
+
 def test_log_budget_is_global_across_all_services(
     tmp_path: Path,
     framework_lock: Path,
@@ -627,6 +774,7 @@ def test_root_and_ledger_fail_closed_on_symlink_and_malicious_state(
     service_root.symlink_to(outside, target_is_directory=True)
     with pytest.raises(SupervisorStateError, match="symlink"):
         CoreServiceSupervisor(
+            launch_mode=ServiceLaunchMode.DEVELOPMENT_TEST,
             service_root=service_root,
             framework_lock=framework_lock,
             release_identity=ServiceReleaseIdentity(INSTALL_DIGEST, REGISTRY_DIGEST),
@@ -639,6 +787,7 @@ def test_root_and_ledger_fail_closed_on_symlink_and_malicious_state(
     ledger.chmod(0o600)
     with pytest.raises(SupervisorStateError, match="ledger"):
         CoreServiceSupervisor(
+            launch_mode=ServiceLaunchMode.DEVELOPMENT_TEST,
             service_root=service_root,
             framework_lock=framework_lock,
             release_identity=ServiceReleaseIdentity(INSTALL_DIGEST, REGISTRY_DIGEST),
@@ -1027,6 +1176,59 @@ def test_real_probe_command_is_cancelled_and_reaped_within_bound() -> None:
     assert results and results[0].returncode == 130
 
 
+def test_probe_cancellation_remains_bounded_after_child_closes_output_pipes() -> None:
+    runner = BoundedProbeCommandRunner()
+    cancellation = threading.Event()
+    results: list[ProbeCommandResult] = []
+    thread = threading.Thread(
+        target=lambda: results.append(
+            runner.run(
+                (
+                    sys.executable,
+                    "-c",
+                    "import os,time;os.close(1);os.close(2);time.sleep(60)",
+                ),
+                time.monotonic() + 10,
+                cancellation,
+            )
+        )
+    )
+    thread.start()
+    time.sleep(0.05)
+
+    cancellation.set()
+    thread.join(timeout=1)
+
+    assert not thread.is_alive()
+    assert results and results[0].returncode == 130
+
+
+def test_probe_output_aggregate_limit_kills_and_reaps_entire_process_group(
+    tmp_path: Path,
+) -> None:
+    grandchild_pid_path = tmp_path / "probe-grandchild.pid"
+    code = (
+        "import os,pathlib,subprocess,sys,time;"
+        "child=subprocess.Popen([sys.executable,'-c','import time;time.sleep(60)']);"
+        f"pathlib.Path({str(grandchild_pid_path)!r}).write_text(str(child.pid));"
+        "os.write(1,b'o'*3000);os.write(2,b'e'*3000);time.sleep(60)"
+    )
+    runner = BoundedProbeCommandRunner(max_output_bytes=4096)
+
+    started = time.monotonic()
+    result = runner.run((sys.executable, "-c", code), time.monotonic() + 5)
+
+    assert result.returncode == 125
+    assert result.stdout == b""
+    assert result.stderr == b"bootstrap probe output exceeded its aggregate limit"
+    assert time.monotonic() - started < 1
+    grandchild_pid = int(grandchild_pid_path.read_text(encoding="ascii"))
+    deadline = time.monotonic() + 1
+    while _pid_is_live(grandchild_pid) and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert not _pid_is_live(grandchild_pid)
+
+
 def test_real_subprocess_backend_smoke_uses_pid_identity_and_bounded_stop() -> None:
     backend = RealSubprocessBackend()
     exits: list[int] = []
@@ -1067,6 +1269,62 @@ def test_real_subprocess_backend_smoke_uses_pid_identity_and_bounded_stop() -> N
         if backend.is_alive(identity):
             backend.kill(identity)
             backend.wait(identity, 1)
+
+
+@pytest.mark.parametrize("_attempt", range(3))
+def test_real_subprocess_tracked_capacity_reclaims_only_reaped_groups(_attempt: int) -> None:
+    backend = RealSubprocessBackend(max_tracked_processes=1)
+    long_running = _sleep_process_spec("capacity-live", "7" * 64, 60)
+    first = backend.spawn(long_running, lambda *_args: None, lambda *_args: None)
+    try:
+        with pytest.raises(SupervisorStateError, match="capacity"):
+            backend.spawn(
+                _sleep_process_spec("capacity-rejected", "8" * 64, 60),
+                lambda *_args: None,
+                lambda *_args: None,
+            )
+        backend.kill(first)
+        assert backend.wait(first, 1) is not None
+
+        for index in range(4):
+            exited = threading.Event()
+            identity = backend.spawn(
+                _sleep_process_spec(f"reaped-{index}", f"{index + 1:064x}", 0),
+                lambda *_args: None,
+                lambda *_args: exited.set(),
+            )
+            assert backend.wait(identity, 1) == 0
+            assert exited.wait(1)
+    finally:
+        if backend.is_alive(first):
+            backend.kill(first)
+            backend.wait(first, 1)
+
+
+def test_restart_operation_capacity_preserves_replay_and_rejects_conflicts(
+    tmp_path: Path,
+    framework_lock: Path,
+) -> None:
+    supervisor, backend, _, _ = _supervisor(
+        tmp_path,
+        framework_lock,
+        max_restart_operations=2,
+    )
+    try:
+        _ensure_subscription(supervisor)
+        first = supervisor.restart("gateway", operation_id="bounded-op-1")
+        supervisor.restart("gateway", operation_id="bounded-op-2")
+        spawn_count = len(backend.spawned)
+
+        assert supervisor.restart("gateway", operation_id="bounded-op-1") == first
+        assert len(backend.spawned) == spawn_count
+        with pytest.raises(SupervisorStateError, match="different request"):
+            supervisor.restart("rollout", operation_id="bounded-op-1")
+        with pytest.raises(SupervisorBusyError, match="capacity"):
+            supervisor.restart("gateway", operation_id="bounded-op-3")
+        assert len(backend.spawned) == spawn_count
+    finally:
+        supervisor.close()
 
 
 def test_real_process_group_reaps_child_and_grandchild() -> None:
@@ -1194,6 +1452,25 @@ def _grandchild_probe_spec(identity_digest: str) -> ServiceProcessSpec:
         display_name="Group probe",
         component=ServiceComponent.EVOLUTION_WORKER,
         argv=(sys.executable, "-c", code),
+        env={"PATH": os.environ.get("PATH", "")},
+        argv_digest="a" * 64,
+        env_digest="b" * 64,
+        identity_digest=identity_digest,
+        port=None,
+        health_probe=ServiceHealthProbe.process(),
+    )
+
+
+def _sleep_process_spec(
+    service_id: str,
+    identity_digest: str,
+    seconds: int,
+) -> ServiceProcessSpec:
+    return ServiceProcessSpec(
+        service_id=service_id,
+        display_name=service_id,
+        component=ServiceComponent.EVOLUTION_WORKER,
+        argv=(sys.executable, "-c", f"import time;time.sleep({seconds})"),
         env={"PATH": os.environ.get("PATH", "")},
         argv_digest="a" * 64,
         env_digest="b" * 64,
