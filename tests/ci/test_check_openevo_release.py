@@ -5,6 +5,7 @@ import json
 import hashlib
 from io import BytesIO
 from pathlib import Path
+import plistlib
 from zipfile import ZipFile
 
 import pytest
@@ -171,6 +172,42 @@ def test_bundle_smoke_requires_openevo_desktop_app_bundle(tmp_path: Path) -> Non
         assert "No OpenEvo Desktop.app bundle found" in str(exc)
     else:
         raise AssertionError("Expected missing OpenEvo Desktop.app bundle to fail")
+
+
+def test_bundle_smoke_launches_the_native_app_until_renderer_is_ready(tmp_path: Path) -> None:
+    smoke = _load_bundle_smoke_module()
+    app = tmp_path / "OpenEvo Desktop.app"
+    executable = app / "Contents" / "MacOS" / "openevo-desktop"
+    executable.parent.mkdir(parents=True)
+    (app / "Contents" / "Info.plist").write_bytes(
+        plistlib.dumps({"CFBundleExecutable": executable.name})
+    )
+    executable.write_text(
+        f"#!/bin/sh\nprintf '%s\\n' '{smoke.RENDERER_READY_MARKER}'\nsleep 30\n",
+        encoding="utf-8",
+    )
+    executable.chmod(0o755)
+
+    launched = smoke.smoke_native_app(app, timeout_seconds=5)
+
+    assert launched == executable
+
+
+def test_bundle_smoke_rejects_a_native_process_without_renderer_readiness(
+    tmp_path: Path,
+) -> None:
+    smoke = _load_bundle_smoke_module()
+    app = tmp_path / "OpenEvo Desktop.app"
+    executable = app / "Contents" / "MacOS" / "openevo-desktop"
+    executable.parent.mkdir(parents=True)
+    (app / "Contents" / "Info.plist").write_bytes(
+        plistlib.dumps({"CFBundleExecutable": executable.name})
+    )
+    executable.write_text("#!/bin/sh\nprintf 'renderer failed\\n'\n", encoding="utf-8")
+    executable.chmod(0o755)
+
+    with pytest.raises(smoke.SmokeFailure, match="renderer readiness"):
+        smoke.smoke_native_app(app, timeout_seconds=1)
 
 
 def test_accepts_valid_openevo_release_wheel(tmp_path: Path) -> None:
@@ -777,6 +814,7 @@ def test_desktop_candidate_workflow_builds_and_smokes_unsigned_dmg_without_publi
         "npm run tauri:build -- --ci",
         "hdiutil attach",
         "smoke_openevo_desktop_bundle.py",
+        "--native-app",
         "scripts/ci/write_sha256.py",
         "scripts/ci/check_openevo_release.py",
         "actions/upload-artifact@v4",
@@ -792,9 +830,7 @@ def test_desktop_candidate_workflow_builds_and_smokes_unsigned_dmg_without_publi
     assert "softprops/action-gh-release" not in text
     assert "tags:" not in text
 
-    desktop_checks = Path(".github/workflows/openevo-desktop.yml").read_text(
-        encoding="utf-8"
-    )
+    desktop_checks = Path(".github/workflows/openevo-desktop.yml").read_text(encoding="utf-8")
     assert '".github/workflows/openevo-desktop-candidate.yml"' in desktop_checks
 
 

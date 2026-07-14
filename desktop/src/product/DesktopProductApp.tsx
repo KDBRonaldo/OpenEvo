@@ -1239,6 +1239,7 @@ function RemoteWorkspaceDrawer({
       if (guardedClose.confirming) {
         event.preventDefault();
       } else if (event.target === event.currentTarget) {
+        event.preventDefault();
         guardedClose.requestClose();
       }
     }}>
@@ -1463,6 +1464,7 @@ function SettingsDrawer({
       if (guardedClose.confirming) {
         event.preventDefault();
       } else if (event.target === event.currentTarget) {
+        event.preventDefault();
         requestClose();
       }
     }}>

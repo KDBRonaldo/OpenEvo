@@ -32,6 +32,7 @@ const NATIVE_SIDECAR_PROTOCOL: &str = "openevo-native-sidecar-v1";
 const DESKTOP_LOCAL_API_NAME: &str = "openevo-desktop-local-api";
 const DESKTOP_LOCAL_API_OPENAPI_SHA256: &str =
     "3a86582d04dcd233096337c737ba91d75854746848aedc319025d86213a03d36";
+const RENDERER_READY_MARKER: &str = "OPENEVO_DESKTOP_RENDERER_READY_V1";
 const LEGACY_DESKTOP_SHELL_ROUTE: &str = "/openevo-api/desktop/shell";
 const NATIVE_SESSION_PROBE_ROUTE: &str = "/openevo-native/session";
 const NATIVE_WORKSPACE_IMPORT_ROUTE: &str = "/openevo-native/workspace-imports";
@@ -4411,6 +4412,26 @@ fn stop_sidecar_inner(state: &DesktopHostState) -> HostResult<HostStatus> {
     stop_sidecar_inner_with(state, &OsProcessControl, SIDECAR_STATE_LOCK_TIMEOUT)
 }
 
+fn renderer_ready_inner(state: &DesktopHostState, openapi_sha256: &str) -> HostResult<()> {
+    if openapi_sha256 != DESKTOP_LOCAL_API_OPENAPI_SHA256 {
+        return Err(sidecar_contract_incompatible_error());
+    }
+    let sidecar = lock_sidecar_bounded(state, SIDECAR_STATE_LOCK_TIMEOUT)?;
+    let managed = sidecar.as_ref().ok_or_else(sidecar_state_error)?;
+    let bootstrap = managed.bootstrap.as_ref().ok_or_else(sidecar_state_error)?;
+    if managed.lifecycle != ManagedLifecycle::Running
+        || managed.child.is_none()
+        || bootstrap.negotiated_contract.major != 1
+        || bootstrap.negotiated_contract.openapi_sha256 != openapi_sha256
+        || bootstrap.negotiated_contract.provider_kind != "desktop_sidecar"
+    {
+        return Err(sidecar_contract_incompatible_error());
+    }
+    drop(sidecar);
+    eprintln!("{RENDERER_READY_MARKER} {openapi_sha256}");
+    Ok(())
+}
+
 fn stop_sidecar_inner_with<C: ProcessControl>(
     state: &DesktopHostState,
     control: &C,
@@ -4453,6 +4474,14 @@ fn start_sidecar(
 #[tauri::command]
 fn stop_sidecar(state: tauri::State<'_, DesktopHostState>) -> HostResult<HostStatus> {
     stop_sidecar_inner(&state)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn renderer_ready(
+    state: tauri::State<'_, DesktopHostState>,
+    openapi_sha256: String,
+) -> HostResult<()> {
+    renderer_ready_inner(&state, &openapi_sha256)
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -4638,6 +4667,7 @@ fn main() {
             host_status,
             start_sidecar,
             stop_sidecar,
+            renderer_ready,
             select_project_source,
             cancel_project_source,
             settle_project_source
@@ -4787,6 +4817,30 @@ mod tests {
         );
         assert_eq!(session_token.len(), SESSION_TOKEN_BYTES * 2);
         assert_eq!(handoff_token.len(), HANDOFF_TOKEN_BYTES * 2);
+    }
+
+    #[test]
+    fn renderer_readiness_requires_a_running_sidecar_with_the_frozen_contract() {
+        let empty = DesktopHostState::default();
+        assert_eq!(
+            renderer_ready_inner(&empty, DESKTOP_LOCAL_API_OPENAPI_SHA256)
+                .unwrap_err()
+                .code,
+            "sidecar_state_unavailable"
+        );
+
+        let state = DesktopHostState::default();
+        let (managed, _, _) = managed_test_sidecar();
+        *state.sidecar.lock().unwrap() = Some(managed);
+        renderer_ready_inner(&state, DESKTOP_LOCAL_API_OPENAPI_SHA256).unwrap();
+
+        assert_eq!(
+            renderer_ready_inner(&state, &"0".repeat(64))
+                .unwrap_err()
+                .code,
+            "sidecar_contract_incompatible"
+        );
+        stop_sidecar_inner(&state).unwrap();
     }
 
     #[test]

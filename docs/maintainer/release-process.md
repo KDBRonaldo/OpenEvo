@@ -14,9 +14,12 @@ current placeholder workflows.
 Maintainers can manually dispatch `OpenEvo Desktop unsigned candidate` to get a
 14-day Actions artifact from a macOS runner. That workflow builds, mounts,
 copies, smokes, checksums, and validates the candidate DMG and exact nested Core
-wheel. It is for exhibition and packaging rehearsal only; passing it does not
-satisfy the science E2E, benchmark, security/privacy, or draft-release gates and
-does not authorize publication.
+wheel. Its packaged-app gate launches the native executable from both the build
+bundle and the copied DMG, then requires the React renderer, Tauri IPC, and
+managed sidecar to agree on the frozen Local API digest. It is for exhibition
+and packaging rehearsal only; passing it does not satisfy the remote science
+E2E, benchmark, security/privacy, or draft-release gates and does not authorize
+publication.
 
 PyPI is not part of the unsigned External Beta. The ordinary-user artifact is
 the macOS Desktop DMG; Desktop installs the descriptor-matched Core artifact on

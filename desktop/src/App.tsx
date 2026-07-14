@@ -13,6 +13,7 @@ import { DesktopProductApp } from "./product/DesktopProductApp";
 import type { DesktopProductProvider } from "./product/provider";
 import {
   createReleaseDesktopProductProvider,
+  reportReleaseDesktopReady,
   stopReleaseDesktopProductProvider,
 } from "./product/releaseProvider";
 
@@ -152,9 +153,11 @@ type ReleaseDesktopStartupState =
 export function ReleaseDesktopProductShell({
   createProvider = createReleaseDesktopProductProvider,
   stopProvider = stopReleaseDesktopProductProvider,
+  reportReady = reportReleaseDesktopReady,
 }: {
   createProvider?: () => Promise<DesktopProductProvider>;
   stopProvider?: () => Promise<void>;
+  reportReady?: () => Promise<void>;
 }) {
   const generation = useRef(0);
   const lifecycle = useRef<Promise<void>>(Promise.resolve());
@@ -188,6 +191,11 @@ export function ReleaseDesktopProductShell({
           await stopProvider();
           return;
         }
+        await reportReady();
+        if (generation.current !== requestGeneration) {
+          await stopProvider();
+          return;
+        }
         setStartup({ status: "ready", provider });
       } catch {
         try {
@@ -200,7 +208,7 @@ export function ReleaseDesktopProductShell({
         }
       }
     });
-  }, [createProvider, enqueueLifecycle, stopProvider]);
+  }, [createProvider, enqueueLifecycle, reportReady, stopProvider]);
 
   useEffect(() => {
     start();

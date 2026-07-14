@@ -69,6 +69,12 @@ export async function stopReleaseDesktopProductProvider(): Promise<void> {
   await tauriNativeBridge.stop();
 }
 
+export async function reportReleaseDesktopReady(): Promise<void> {
+  await invoke("renderer_ready", {
+    openapiSha256: DESKTOP_PRODUCT_RELEASE_CONTRACT.acceptedOpenApiDigests[0],
+  });
+}
+
 export async function createReleaseDesktopProductProvider(
   dependencies: ReleaseProviderFactoryDependencies = {},
 ): Promise<DesktopProductProvider> {

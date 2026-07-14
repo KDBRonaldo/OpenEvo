@@ -8,7 +8,10 @@ import {
   type DesktopProductReleaseContract,
 } from "./provider";
 import { DESKTOP_PRODUCT_RELEASE_CONTRACT } from "./releaseContract";
-import { createReleaseDesktopProductProvider } from "./releaseProvider";
+import {
+  createReleaseDesktopProductProvider,
+  reportReleaseDesktopReady,
+} from "./releaseProvider";
 
 const invokeMock = vi.hoisted(() => vi.fn());
 
@@ -36,6 +39,16 @@ describe("Desktop product provider boundary", () => {
     expect(DESKTOP_PRODUCT_RELEASE_CONTRACT.acceptedOpenApiDigests).toEqual([
       "3a86582d04dcd233096337c737ba91d75854746848aedc319025d86213a03d36",
     ]);
+  });
+
+  it("binds renderer readiness to the frozen Local API digest", async () => {
+    invokeMock.mockResolvedValue(undefined);
+
+    await reportReleaseDesktopReady();
+
+    expect(invokeMock).toHaveBeenCalledWith("renderer_ready", {
+      openapiSha256: DESKTOP_PRODUCT_RELEASE_CONTRACT.acceptedOpenApiDigests[0],
+    });
   });
 
   it("negotiates the native bootstrap, checked-in digest, provider kind, and feature set before exposing an adapter", async () => {

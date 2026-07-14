@@ -152,6 +152,7 @@ jobs:
         run: |
           python scripts/ci/smoke_openevo_desktop_bundle.py \
             "desktop/src-tauri/target/release/bundle/macos/OpenEvo Desktop.app" \
+            --native-app \
             --timeout-seconds 60
 
       - name: Mount, copy, detach, and smoke DMG contents
@@ -169,7 +170,9 @@ jobs:
           ditto "$mount_dir/OpenEvo Desktop.app" "$copy_dir/OpenEvo Desktop.app"
           hdiutil detach "$mount_dir" -quiet
           python scripts/ci/smoke_openevo_desktop_bundle.py \
-            "$copy_dir/OpenEvo Desktop.app" --timeout-seconds 60
+            "$copy_dir/OpenEvo Desktop.app" \
+            --native-app \
+            --timeout-seconds 60
 
       - name: Build distributable Core wheel around the exact remote wheel
         run: |

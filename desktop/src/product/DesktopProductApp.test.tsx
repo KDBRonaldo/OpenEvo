@@ -1329,7 +1329,13 @@ describe("DesktopProductApp", () => {
 
     const backdrop = document.querySelector<HTMLElement>(".drawer-backdrop");
     if (!backdrop) throw new Error("Drawer backdrop was not found.");
-    await act(async () => backdrop.dispatchEvent(new MouseEvent("mousedown", { bubbles: true })));
+    let firstBackdropAccepted = true;
+    await act(async () => {
+      firstBackdropAccepted = backdrop.dispatchEvent(
+        new MouseEvent("mousedown", { bubbles: true, cancelable: true }),
+      );
+    });
+    expect(firstBackdropAccepted).toBe(false);
     expect(document.querySelector('[role="dialog"]')).not.toBeNull();
     expect(screenText()).toContain("Discard unsaved changes?");
     const keepEditing = button("Keep editing");
@@ -1349,6 +1355,27 @@ describe("DesktopProductApp", () => {
     await clickButton("Discard changes");
     expect(document.querySelector('[role="dialog"]')).toBeNull();
     expect(document.activeElement).toBe(opener);
+  });
+
+  it("keeps first-backdrop focus inside a dirty remote workspace confirmation", async () => {
+    provider = createFixtureDesktopProductProvider({ startOnline: true });
+    root = await renderProduct(provider);
+    await clickAria("Remote workspace settings");
+    setInput("Workspace name", "Unsaved remote workspace");
+    const backdrop = document.querySelector<HTMLElement>(".drawer-backdrop");
+    if (!backdrop) throw new Error("Remote workspace backdrop was not found.");
+
+    let backdropAccepted = true;
+    await act(async () => {
+      backdropAccepted = backdrop.dispatchEvent(
+        new MouseEvent("mousedown", { bubbles: true, cancelable: true }),
+      );
+    });
+
+    expect(backdropAccepted).toBe(false);
+    expect(screenText()).toContain("Discard unsaved changes?");
+    expect(document.activeElement).toBe(button("Keep editing"));
+    await clickButton("Discard changes");
   });
 });
 
