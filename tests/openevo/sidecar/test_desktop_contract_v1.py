@@ -25,6 +25,7 @@ from desktop.sidecar.contracts.v1 import (
     HealthV1,
     LocalOperationV1,
     LogPageV1,
+    OperationV1,
     PageV1,
     ProjectCreateV1,
     ProjectPatchV1,
@@ -36,7 +37,7 @@ from desktop.sidecar.contracts.v1 import (
     RunPageV1,
     RunSummaryV1,
     RunV1,
-    ServiceActionV1,
+    ReferencedLogPageV1,
     ServicePageV1,
     SseFrameV1,
     VersionV1,
@@ -95,6 +96,8 @@ _EXPECTED_OPERATIONS = {
     ("get", "/desktop/v1/services"),
     ("post", "/desktop/v1/services/{service_id}/restart"),
     ("get", "/desktop/v1/services/{service_id}/logs"),
+    ("get", "/desktop/v1/core/operations/{operation_id}"),
+    ("get", "/desktop/v1/core/logs/{logs_ref}"),
     ("post", "/desktop/v1/diagnostics"),
     ("get", "/desktop/v1/diagnostics/{diagnostic_id}"),
     ("delete", "/desktop/v1/diagnostics/{diagnostic_id}"),
@@ -195,9 +198,9 @@ def test_only_sidecar_owned_actions_return_local_operations() -> None:
         }
 
     expected_remote = {
-        "/desktop/v1/services/{service_id}/restart": "ServiceActionV1",
+        "/desktop/v1/services/{service_id}/restart": "OperationV1",
         "/desktop/v1/diagnostics": "DiagnosticV1",
-        "/desktop/v1/maintenance/cache-cleanup": "CacheCleanupV1",
+        "/desktop/v1/maintenance/cache-cleanup": "OperationV1",
     }
     for path, model in expected_remote.items():
         response = schema["paths"][path]["post"]["responses"]["202"]
@@ -217,7 +220,8 @@ def test_core_owned_dtos_are_reused_without_sidecar_reinterpretation() -> None:
     assert ArtifactContentV1 is core_contract.ArtifactContentV1
     assert ArtifactDiffV1 is core_contract.ArtifactDiffV1
     assert ServicePageV1 is core_contract.ServicePageV1
-    assert ServiceActionV1 is core_contract.ServiceActionV1
+    assert OperationV1 is core_contract.OperationV1
+    assert ReferencedLogPageV1 is core_contract.ReferencedLogPageV1
     assert DiagnosticReportV1 is core_contract.DiagnosticV1
 
 
@@ -239,6 +243,10 @@ def test_mutations_bind_idempotency_and_etag_to_renderer_intent() -> None:
         "/desktop/v1/diagnostics/{diagnostic_id}",
     ):
         assert "If-Match" in _required_headers(schema, "delete", path)
+
+    assert "Idempotency-Key" in _required_headers(
+        schema, "delete", "/desktop/v1/diagnostics/{diagnostic_id}"
+    )
 
 
 def test_renderer_never_authors_core_admission_references() -> None:
@@ -634,7 +642,7 @@ def test_snapshots_are_canonical_and_digests_are_stable() -> None:
     openapi_digest, events_digest = verify_contract_snapshots()
     assert openapi_digest == DESKTOP_OPENAPI_SHA256
     assert events_digest == DESKTOP_EVENTS_SCHEMA_SHA256
-    assert openapi_digest == "ceadacb488b9212750cc408bf17f2358790736878e282392a4127ea5ab7ce922"
+    assert openapi_digest == "c9f2fa2cdcc2ff5cde40b9bbd007430ac0ccfdf6452844315d8e29d913f0b7a0"
     assert events_digest == "43ad2f8d2f8355a1d4227b7d26f8043cd2440cf9d35c5aa4f7a70d6717773543"
     snapshot_root = Path(__file__).parents[3] / "desktop/sidecar/contracts/v1"
     assert (snapshot_root / "openapi.json").read_bytes() == canonical_json_bytes(

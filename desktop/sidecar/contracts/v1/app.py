@@ -13,7 +13,6 @@ from .models import (
     ArtifactPageV1,
     ArtifactV1,
     CacheCleanupRequestV1,
-    CacheCleanupV1,
     CapabilitiesEnvelopeV1,
     DesktopStateV1,
     DiagnosticReportV1,
@@ -24,11 +23,13 @@ from .models import (
     LocalLogPageV1,
     LocalOperationV1,
     LogPageV1,
+    OperationV1,
     ProjectCreateV1,
     ProjectPageV1,
     ProjectPatchV1,
     ProjectV1,
     ProjectValidationV1,
+    ReferencedLogPageV1,
     RemoteProfileCreateV1,
     RemoteProfilePageV1,
     RemoteProfilePatchV1,
@@ -37,7 +38,6 @@ from .models import (
     RunContextV1,
     RunPageV1,
     RunV1,
-    ServiceActionV1,
     ServicePageV1,
     TimelinePageV1,
     VersionV1,
@@ -517,12 +517,34 @@ def create_contract_app() -> FastAPI:
     @router.post(
         "/services/{service_id}/restart",
         operation_id="restartService",
-        response_model=ServiceActionV1,
+        response_model=OperationV1,
         status_code=202,
     )
     def restart_service(
         service_id: ResourceId, idempotency_key: IdempotencyKey, if_match: IfMatch
-    ) -> ServiceActionV1:
+    ) -> OperationV1:
+        _contract_only()
+
+    @router.get(
+        "/core/operations/{operation_id}",
+        operation_id="getCoreOperation",
+        response_model=OperationV1,
+    )
+    def get_core_operation(operation_id: ResourceId) -> OperationV1:
+        _contract_only()
+
+    @router.get(
+        "/core/logs/{logs_ref}",
+        operation_id="getCoreLogsByRef",
+        response_model=ReferencedLogPageV1,
+    )
+    def get_core_logs_by_ref(
+        logs_ref: ResourceId,
+        limit: Limit = 50,
+        after: Cursor = None,
+        sort: Sort = "sequence",
+        direction: Direction = "asc",
+    ) -> ReferencedLogPageV1:
         _contract_only()
 
     @router.get(
@@ -564,18 +586,22 @@ def create_contract_app() -> FastAPI:
         status_code=204,
         response_model=None,
     )
-    def delete_diagnostic(diagnostic_id: ResourceId, if_match: IfMatch) -> None:
+    def delete_diagnostic(
+        diagnostic_id: ResourceId,
+        idempotency_key: IdempotencyKey,
+        if_match: IfMatch,
+    ) -> None:
         _contract_only()
 
     @router.post(
         "/maintenance/cache-cleanup",
         operation_id="cleanupCaches",
-        response_model=CacheCleanupV1,
+        response_model=OperationV1,
         status_code=202,
     )
     def cleanup_caches(
         request: CacheCleanupRequestV1, idempotency_key: IdempotencyKey
-    ) -> CacheCleanupV1:
+    ) -> OperationV1:
         _contract_only()
 
     @router.get(

@@ -152,6 +152,8 @@ GET    /desktop/v1/artifacts/{artifact_id}/diff
 GET    /desktop/v1/services
 POST   /desktop/v1/services/{service_id}/restart
 GET    /desktop/v1/services/{service_id}/logs
+GET    /desktop/v1/core/operations/{operation_id}
+GET    /desktop/v1/core/logs/{logs_ref}
 POST   /desktop/v1/diagnostics
 GET    /desktop/v1/diagnostics/{diagnostic_id}
 DELETE /desktop/v1/diagnostics/{diagnostic_id}
@@ -162,8 +164,12 @@ GET    /desktop/v1/events
 Only sidecar-owned connection, host-key, bootstrap, repair, activation, and
 workspace-sync actions return `LocalOperationV1`. Core-owned runs, service
 actions, diagnostics, and cleanup resources retain their Core v1 response
-shape after strict sidecar validation. The sidecar does not synthesize remote
-progress or replace authoritative Core state with a local operation.
+shape after strict sidecar validation. Service restart and cache cleanup
+return Core `OperationV1`; React observes them through the explicitly
+namespaced `/desktop/v1/core/operations/{operation_id}` endpoint and reads any
+referenced bounded logs through `/desktop/v1/core/logs/{logs_ref}`. The
+sidecar does not synthesize remote progress or replace authoritative Core
+state with a local operation.
 
 Local profile responses expose an authentication kind and an opaque native
 credential slot status, never a credential reference or secret. Network proxy
