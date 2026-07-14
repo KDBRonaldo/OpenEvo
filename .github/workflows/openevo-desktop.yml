@@ -139,10 +139,10 @@ jobs:
           test -x "$sidecar"
           echo "OPENEVO_PACKAGED_SIDECAR_PATH=$sidecar" >> "$GITHUB_ENV"
 
-      - name: Exercise macOS devfs FD execution and native lifecycle
+      - name: Exercise macOS private executable and FD handoff lifecycle
         working-directory: desktop/src-tauri
         run: |
-          cargo test --locked tests::macos_release_executes_the_inherited_fd_through_devfs -- --exact
+          cargo test --locked tests::macos_release_uses_private_path_and_keeps_the_verified_fd -- --exact
           cargo test --locked tests::packaged_external_bin_native_launch_smoke -- --ignored --exact
 
       - name: Remove generated sidecar inventory

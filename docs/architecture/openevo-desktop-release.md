@@ -118,6 +118,13 @@ direct-backend fallback. Debug builds retain a development launcher behind
 `cfg(debug_assertions)`: an optional program plus JSON string-array argv is
 passed directly to `Command` without shell parsing, and the local host and port
 arguments, inherited listener, and instance channel remain native-host owned.
+Linux executes the verified anonymous file through `/proc/self/fd`. macOS keeps
+the same digest-verified inode linked inside an owner-only `0700` launch
+directory only long enough for `exec`, passes its open descriptor to the
+FD-aware sidecar bootloader, and unlinks the private pathname immediately after
+the child is created. This avoids relying on macOS Mach-O execution through
+`/dev/fd` while preserving descriptor-bound archive reads and preventing a
+renderer-visible or reusable launch path.
 Debug-only override and source-launcher code is absent under production cfg;
 the Desktop workflow compiles, lints, and tests both debug and release cfg.
 

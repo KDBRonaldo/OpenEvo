@@ -151,6 +151,11 @@ impl PrivateLaunchDirectory {
 impl Drop for PrivateLaunchDirectory {
     fn drop(&mut self) {
         if self.validate().is_ok() {
+            #[cfg(target_os = "macos")]
+            {
+                let name = CString::new(BUNDLED_SIDECAR_BINARY).expect("constant has no NUL");
+                let _ = unsafe { libc::unlinkat(self.directory.as_raw_fd(), name.as_ptr(), 0) };
+            }
             let _ = fs::remove_dir(self.path());
         }
     }
@@ -161,7 +166,7 @@ impl VerifiedExecutableFile {
         let identity = file_identity(&self.file).map_err(|_| private_sidecar_error())?;
         let access_mode = unsafe { libc::fcntl(self.file.as_raw_fd(), libc::F_GETFL) };
         if identity != self.identity
-            || identity.links != 0
+            || identity.links > 1
             || identity.mode & 0o777 != 0o500
             || access_mode == -1
             || access_mode & libc::O_ACCMODE != libc::O_RDONLY
@@ -439,8 +444,9 @@ fn release_sidecar_launch_spec(
 ) -> HostResult<SidecarLaunchSpec> {
     let source = bundled_path.ok_or_else(bundled_sidecar_missing_error)?;
     let (verified_executable, private_launch_dir) = prepare_packaged_sidecar(source)?;
+    let program = release_execution_path(&private_launch_dir);
     Ok(SidecarLaunchSpec {
-        program: fd_execution_path(),
+        program,
         args: local_sidecar_args(port),
         current_dir: None,
         remove_env: &RELEASE_FORBIDDEN_SIDECAR_ENV,
@@ -500,19 +506,27 @@ fn prepare_packaged_sidecar_with_hooks(
     if writer_identity != reader_identity || writer_identity.links != 1 {
         return Err(private_sidecar_error());
     }
-    if unsafe { libc::unlinkat(private_directory.as_raw_fd(), private_name.as_ptr(), 0) } == -1 {
-        return Err(private_sidecar_error());
-    }
-    if source_identity_at_optional(private_directory, &private_name)?.is_some()
-        || file_identity(&writer)
-            .map_err(|_| private_sidecar_error())?
-            .links
-            != 0
-        || file_identity(&reader)
-            .map_err(|_| private_sidecar_error())?
-            .links
-            != 0
+    #[cfg(target_os = "linux")]
     {
+        if unsafe { libc::unlinkat(private_directory.as_raw_fd(), private_name.as_ptr(), 0) } == -1
+        {
+            return Err(private_sidecar_error());
+        }
+        if source_identity_at_optional(private_directory, &private_name)?.is_some()
+            || file_identity(&writer)
+                .map_err(|_| private_sidecar_error())?
+                .links
+                != 0
+            || file_identity(&reader)
+                .map_err(|_| private_sidecar_error())?
+                .links
+                != 0
+        {
+            return Err(private_sidecar_error());
+        }
+    }
+    #[cfg(target_os = "macos")]
+    if source_identity_at(private_directory, &private_name)? != writer_identity {
         return Err(private_sidecar_error());
     }
 
@@ -553,13 +567,21 @@ fn prepare_packaged_sidecar_with_hooks(
     let final_reader_identity = file_identity(&reader).map_err(|_| private_sidecar_error())?;
     let target_digest =
         hash_file_at(&reader, initial_identity.size).map_err(|_| private_sidecar_error())?;
+    #[cfg(target_os = "linux")]
+    let expected_links = 0;
+    #[cfg(target_os = "macos")]
+    let expected_links = 1;
     if final_writer_identity != final_reader_identity
-        || final_reader_identity.links != 0
+        || final_reader_identity.links != expected_links
         || final_reader_identity.owner != unsafe { libc::geteuid() }
         || final_reader_identity.size != initial_identity.size
         || final_reader_identity.mode & 0o777 != 0o500
         || target_digest != copied_digest
     {
+        return Err(private_sidecar_error());
+    }
+    #[cfg(target_os = "macos")]
+    if source_identity_at(private_directory, &private_name)? != final_reader_identity {
         return Err(private_sidecar_error());
     }
     drop(writer);
@@ -879,6 +901,64 @@ fn fd_execution_path() -> PathBuf {
 #[cfg(target_os = "macos")]
 fn fd_execution_path() -> PathBuf {
     PathBuf::from(format!("/dev/fd/{INHERITED_EXECUTABLE_FD}"))
+}
+
+#[cfg(target_os = "linux")]
+fn release_execution_path(_private_dir: &PrivateLaunchDirectory) -> PathBuf {
+    fd_execution_path()
+}
+
+#[cfg(target_os = "macos")]
+fn release_execution_path(private_dir: &PrivateLaunchDirectory) -> PathBuf {
+    private_dir.path().join(BUNDLED_SIDECAR_BINARY)
+}
+
+#[cfg(target_os = "linux")]
+fn finalize_private_executable_after_spawn(_launch: &mut SidecarLaunchSpec) -> HostResult<()> {
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn finalize_private_executable_after_spawn(launch: &mut SidecarLaunchSpec) -> HostResult<()> {
+    let private_dir = launch
+        .private_launch_dir
+        .as_ref()
+        .ok_or_else(private_sidecar_error)?;
+    let executable = launch
+        .verified_executable
+        .as_mut()
+        .ok_or_else(private_sidecar_error)?;
+    private_dir.validate()?;
+    executable.validate()?;
+    if executable.identity.links != 1 {
+        return Err(private_sidecar_error());
+    }
+    let name = CString::new(BUNDLED_SIDECAR_BINARY).expect("constant has no NUL");
+    if source_identity_at(&private_dir.directory, &name)? != executable.identity {
+        return Err(private_sidecar_error());
+    }
+    if unsafe { libc::unlinkat(private_dir.directory.as_raw_fd(), name.as_ptr(), 0) } == -1 {
+        return Err(private_sidecar_error());
+    }
+    private_dir
+        .directory
+        .sync_all()
+        .map_err(|_| private_sidecar_error())?;
+    if source_identity_at_optional(&private_dir.directory, &name)?.is_some() {
+        return Err(private_sidecar_error());
+    }
+    let unlinked = file_identity(&executable.file).map_err(|_| private_sidecar_error())?;
+    if unlinked.device != executable.identity.device
+        || unlinked.inode != executable.identity.inode
+        || unlinked.mode != executable.identity.mode
+        || unlinked.owner != executable.identity.owner
+        || unlinked.size != executable.identity.size
+        || unlinked.links != 0
+    {
+        return Err(private_sidecar_error());
+    }
+    executable.identity = unlinked;
+    executable.validate()
 }
 
 fn bundled_sidecar_missing_error() -> NativeHostError {
@@ -1563,13 +1643,26 @@ fn start_sidecar_inner(
     }
     let credential = NativeInstanceCredential::generate()?;
     let mut prepared = command_from_launch_spec(&launch, &allocated.listener)?;
-    let child = prepared.spawn().map_err(|_| {
-        NativeHostError::new(
-            "sidecar_spawn_failed",
-            "OpenEvo Desktop could not start its local sidecar.",
-        )
-    })?;
+    let mut child = match prepared.spawn() {
+        Ok(child) => child,
+        Err(_) => {
+            let _ = finalize_private_executable_after_spawn(&mut launch);
+            return Err(NativeHostError::new(
+                "sidecar_spawn_failed",
+                "OpenEvo Desktop could not start its local sidecar.",
+            ));
+        }
+    };
     let process_group = i32::try_from(child.id()).expect("OS child pid fits in pid_t");
+    if let Err(error) = finalize_private_executable_after_spawn(&mut launch) {
+        let _ = terminate_process_group(
+            &mut child,
+            process_group,
+            SIDECAR_TERM_TIMEOUT,
+            SIDECAR_KILL_TIMEOUT,
+        );
+        return Err(error);
+    }
     state
         .emergency_process_group
         .store(process_group, Ordering::Release);
@@ -1741,11 +1834,17 @@ mod tests {
         let spec = sidecar_launch_spec(LaunchPolicy::Release, Some(fixture.path()), 49152).unwrap();
         clear_sidecar_env();
 
-        assert_eq!(spec.program, fd_execution_path());
+        assert_eq!(
+            spec.program,
+            release_execution_path(spec.private_launch_dir.as_ref().unwrap())
+        );
         let executable = spec.verified_executable.as_ref().unwrap();
         executable.validate().unwrap();
         assert_eq!(read_verified_file(executable), b"packaged-sidecar-v1");
+        #[cfg(target_os = "linux")]
         assert_eq!(executable.identity.links, 0);
+        #[cfg(target_os = "macos")]
+        assert_eq!(executable.identity.links, 1);
         assert_eq!(executable.identity.mode & 0o777, 0o500);
         let private_root = spec.private_launch_dir.as_ref().unwrap().path();
         assert_eq!(
@@ -1756,7 +1855,10 @@ mod tests {
                 & 0o777,
             0o700
         );
+        #[cfg(target_os = "linux")]
         assert_eq!(fs::read_dir(private_root).unwrap().count(), 0);
+        #[cfg(target_os = "macos")]
+        assert_eq!(fs::read_dir(private_root).unwrap().count(), 1);
         assert_eq!(
             spec.args,
             vec![
@@ -1773,6 +1875,7 @@ mod tests {
         assert_eq!(spec.remove_env, RELEASE_FORBIDDEN_SIDECAR_ENV);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn unlinked_private_fd_survives_source_path_replacement_and_is_cleaned_on_drop() {
         let fixture = SidecarFixture::executable(b"trusted-bytes");
@@ -1796,6 +1899,7 @@ mod tests {
         assert!(!private_root.exists());
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn private_cleanup_never_recursively_removes_a_replacement_path() {
         let fixture = SidecarFixture::executable(b"trusted-bytes");
@@ -1819,6 +1923,7 @@ mod tests {
         fs::remove_dir(&displaced).unwrap();
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn fd_execution_uses_verified_bytes_after_source_replacement() {
         let fixture = SidecarFixture::from_existing(Path::new("/bin/sh"));
@@ -1992,8 +2097,13 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn macos_release_executes_the_inherited_fd_through_devfs() {
+    fn macos_release_uses_private_path_and_keeps_the_verified_fd() {
         assert_eq!(fd_execution_path(), PathBuf::from("/dev/fd/4"));
+        let private = PrivateLaunchDirectory::create().unwrap();
+        assert_eq!(
+            release_execution_path(&private),
+            private.path().join(BUNDLED_SIDECAR_BINARY)
+        );
     }
 
     #[cfg(debug_assertions)]
