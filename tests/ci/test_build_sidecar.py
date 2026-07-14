@@ -591,6 +591,25 @@ def test_build_sidecar_rejects_nonempty_wheel_output_without_deleting_it(
     assert existing.read_bytes() == b"existing"
 
 
+def test_build_sidecar_rejects_symlink_wheel_output_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builder = _load_builder()
+    repo = tmp_path / "repo"
+    _write_repo_skeleton(repo)
+    real_output = tmp_path / "real-output"
+    real_output.mkdir()
+    linked_output = tmp_path / "linked-output"
+    linked_output.symlink_to(real_output, target_is_directory=True)
+    monkeypatch.setattr(builder, "_repo_root", lambda: repo)
+
+    with pytest.raises(RuntimeError, match="symbolic link"):
+        builder.build_sidecar(clean=True, core_wheel_output_dir=linked_output)
+
+    assert list(real_output.iterdir()) == []
+
+
 @pytest.mark.parametrize(
     "relative_output",
     [
@@ -860,6 +879,36 @@ def test_sidecar_archive_rejects_framework_lock_for_another_wheel(
     monkeypatch.setattr(builder, "_archive_member_bytes", lambda _, name: payloads[name])
 
     with pytest.raises(RuntimeError, match="exact built wheel|identity is invalid"):
+        builder._validate_embedded_core_framework_lock(
+            executable,
+            wheel,
+            framework_lock,
+            version="0.1.0",
+        )
+
+
+def test_sidecar_archive_rejects_duplicate_core_release_input(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builder = _load_builder()
+    executable = tmp_path / "sidecar"
+    executable.write_bytes(b"sidecar")
+    wheel = tmp_path / "openevo-0.1.0-py3-none-any.whl"
+    _write_core_wheel(wheel)
+    framework_lock = builder._write_core_framework_lock(wheel, version="0.1.0")
+    wheel_member = "openevo/wheels/openevo-0.1.0-py3-none-any.whl"
+    monkeypatch.setattr(
+        builder,
+        "_archive_member_names",
+        lambda _: (
+            wheel_member,
+            wheel_member,
+            "openevo/wheels/framework-lock.json",
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="exact Core release inputs"):
         builder._validate_embedded_core_framework_lock(
             executable,
             wheel,

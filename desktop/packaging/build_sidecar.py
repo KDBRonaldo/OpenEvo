@@ -13,6 +13,7 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import tarfile
@@ -735,19 +736,84 @@ def _build_core_wheel(repo: Path, build_root: Path) -> Path:
     return wheels[0]
 
 
+def _raw_carchive_member_names(archive: object, executable: Path) -> tuple[str, ...]:
+    try:
+        cookie_length = archive._COOKIE_LENGTH
+        cookie_format = archive._COOKIE_FORMAT
+        toc_entry_length = archive._TOC_ENTRY_LENGTH
+        toc_entry_format = archive._TOC_ENTRY_FORMAT
+        with executable.open("rb") as stream:
+            cookie_offset = archive._find_magic_pattern(
+                stream,
+                archive._COOKIE_MAGIC_PATTERN,
+            )
+            if cookie_offset < 0:
+                raise RuntimeError("sidecar archive cookie is unavailable")
+            stream.seek(cookie_offset)
+            cookie = stream.read(cookie_length)
+            if len(cookie) != cookie_length:
+                raise RuntimeError("sidecar archive cookie is truncated")
+            _, archive_length, toc_offset, toc_length, _, _ = struct.unpack(
+                cookie_format,
+                cookie,
+            )
+            archive_end = cookie_offset + cookie_length
+            archive_start = archive_end - archive_length
+            toc_start = archive_start + toc_offset
+            if (
+                archive_start < 0
+                or toc_start < archive_start
+                or toc_length < 0
+                or toc_start + toc_length > cookie_offset
+            ):
+                raise RuntimeError("sidecar archive TOC bounds are invalid")
+            stream.seek(toc_start)
+            toc_payload = stream.read(toc_length)
+            if len(toc_payload) != toc_length:
+                raise RuntimeError("sidecar archive TOC is truncated")
+
+        names: list[str] = []
+        position = 0
+        while position < len(toc_payload):
+            if len(toc_payload) - position < toc_entry_length:
+                raise RuntimeError("sidecar archive TOC entry is truncated")
+            entry_length, _, _, _, _, typecode = struct.unpack(
+                toc_entry_format,
+                toc_payload[position : position + toc_entry_length],
+            )
+            if entry_length < toc_entry_length or position + entry_length > len(toc_payload):
+                raise RuntimeError("sidecar archive TOC entry bounds are invalid")
+            encoded_name = toc_payload[
+                position + toc_entry_length : position + entry_length
+            ]
+            name = encoded_name.rstrip(b"\0").decode("utf-8", errors="strict")
+            if typecode.decode("ascii", errors="strict") != "o":
+                names.append(name.replace("\\", "/"))
+            position += entry_length
+    except (AttributeError, OSError, struct.error, UnicodeError) as exc:
+        raise RuntimeError("sidecar archive TOC cannot be verified") from exc
+
+    if len(names) != len(set(names)):
+        raise RuntimeError("sidecar archive TOC contains duplicate members")
+    parsed_names = {str(name).replace("\\", "/") for name in archive.toc}
+    if set(names) != parsed_names:
+        raise RuntimeError("sidecar archive TOC parser inventory differs from raw bytes")
+    return tuple(names)
+
+
 def _archive_member_names(executable: Path) -> tuple[str, ...]:
     try:
         from PyInstaller.archive.readers import CArchiveReader, NotAnArchiveError
     except ImportError as exc:
         raise RuntimeError("PyInstaller is required to inspect the sidecar archive") from exc
     archive = CArchiveReader(str(executable))
-    names = {str(name).replace("\\", "/") for name in archive.toc}
+    names = list(_raw_carchive_member_names(archive, executable))
     for member_name in archive.toc:
         try:
             embedded = archive.open_embedded_archive(member_name)
         except NotAnArchiveError:
             continue
-        names.update(str(name).replace("\\", "/") for name in embedded.toc)
+        names.extend(str(name).replace("\\", "/") for name in embedded.toc)
     return tuple(sorted(names))
 
 
@@ -767,6 +833,8 @@ def _sha256_bytes(payload: bytes) -> str:
 
 
 def _prepare_core_wheel_output_dir(output_dir: Path) -> None:
+    if output_dir.is_symlink():
+        raise RuntimeError(f"Core wheel output must not be a symbolic link: {output_dir}")
     if output_dir.exists() and not output_dir.is_dir():
         raise RuntimeError(f"Core wheel output is not a directory: {output_dir}")
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -777,6 +845,14 @@ def _prepare_core_wheel_output_dir(output_dir: Path) -> None:
 
 def _paths_overlap(left: Path, right: Path) -> bool:
     return left == right or left.is_relative_to(right) or right.is_relative_to(left)
+
+
+def _reject_symlink_path(path: Path) -> None:
+    for candidate in (path, *path.parents):
+        if candidate.is_symlink():
+            raise RuntimeError(
+                f"Core wheel output path must not contain a symbolic link: {candidate}"
+            )
 
 
 def _copy_exclusive(source: Path, destination: Path) -> None:
@@ -1025,7 +1101,7 @@ def _validate_fd_bound_bootloader(executable: Path) -> None:
 
 
 def _validate_embedded_core_wheel(executable: Path, wheel: Path) -> str:
-    archive_members = set(_archive_member_names(executable))
+    archive_members = _archive_member_names(executable)
     benchmark_members = sorted(
         name
         for name in archive_members
@@ -1178,14 +1254,18 @@ def build_sidecar(
     static_root = packaging_root / "web"
 
     if core_wheel_output_dir is not None:
-        resolved_output = core_wheel_output_dir.resolve()
+        requested_output = Path(os.path.abspath(core_wheel_output_dir))
+        _reject_symlink_path(requested_output)
+        resolved_output = requested_output.resolve()
         if any(
             _paths_overlap(resolved_output, path.resolve())
             for path in (dist_dir, build_dir, binary_dir)
         ):
             raise RuntimeError("Core wheel output directory overlaps generated paths")
+        _prepare_core_wheel_output_dir(requested_output)
+        if requested_output.resolve(strict=True) != resolved_output:
+            raise RuntimeError("Core wheel output path changed during validation")
         core_wheel_output_dir = resolved_output
-        _prepare_core_wheel_output_dir(resolved_output)
     if clean:
         shutil.rmtree(dist_dir, ignore_errors=True)
         shutil.rmtree(build_dir, ignore_errors=True)

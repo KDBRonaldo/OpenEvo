@@ -127,7 +127,9 @@ through `openevo-core-service`, exercise the packaged sidecar through its native
 inherited-listener/credential-frame launch contract, and use a full 40-character
 `--source-commit` matching the release checkout. This CI-only smoke may replace
 and stop the current user's canonical Core service, so run it only on a
-disposable release worker. It validates the two packaged process boundaries;
+disposable release worker. Its cleanup attempts to stop that service even when
+`ensure`, attachment consumption, or capability verification fails. It
+validates the two packaged process boundaries;
 the separate remote-profile/SSH/active-project gate validates their production
 forwarding composition. A source `TestClient` or local fake capability catalog
 does not satisfy either gate.

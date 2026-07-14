@@ -42,7 +42,10 @@ The repository currently provides:
   export preserves the same two bytes. Archive inspection requires the resource
   root to be the closed set of exactly one wheel and one lock, rejects additional
   and path-escaping members, rechecks both source digests, and reloads the
-  extracted pair through the Core lock loader;
+  extracted pair through the Core lock loader. Raw CArchive TOC multiplicity is
+  verified before accepting PyInstaller's parsed inventory, and
+  `--core-wheel-output-dir` exports the pair only to an empty path with no
+  symbolic-link component;
 - source-level frontend, sidecar, Rust, and package-inventory tests;
 - Linux and macOS CI jobs that build the actual PyInstaller externalBin and
   exercise it through the production Rust native-launch path;
