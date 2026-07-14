@@ -86,7 +86,11 @@ The same canonical model is persisted and used by startup recovery. Idempotency
 identity binds the Core v1 principal, operation ID, resource scope, canonical
 request, and semantic CAS headers. An exact replay returns the original typed
 success or error response and ETag; a conflicting request returns
-`idempotency_key_reused`.
+`idempotency_key_reused`. Startup validates every persisted success before it
+reconciles failed-request audit rows. If legacy or corrupt state contains both
+outcomes for one operation, resource, and key, a valid canonical success is
+authoritative and the duplicate failed row is removed. An invalid success fails
+startup before that cleanup can commit.
 
 Project creation signs Core-owned project and task snapshots. Scratch projects
 also receive an immutable empty workspace snapshot. Imported projects remain
@@ -103,7 +107,14 @@ write as failure; the held upload FD is truncated back to the previous durable
 offset on any write, `fsync`, or pre-commit database failure. SQLite advances
 the offset only after every byte is present and `fsync`ed. A lifecycle failure
 after `COMMIT` still fails the request closed, but cannot truncate bytes or
-rewrite the offset/idempotency result that already committed. On startup, an
+rewrite the offset/idempotency result that already committed. An exception at
+the SQLite `COMMIT` boundary is treated as an unknown outcome. Core opens a new
+connection and verifies, in one read snapshot, either the exact prior upload
+row with no success record or the exact new upload and success rows; it also
+revalidates the held upload inode, size, and written chunk bytes. Durable
+success is returned without recording a failed idempotency result or truncating
+the archive. Only a proven rollback may restore the old file offset; mixed or
+unverifiable state fails closed while preserving the bytes. On startup, an
 uncommitted file tail is truncated to the durable offset; a file shorter than
 that offset fails closed.
 

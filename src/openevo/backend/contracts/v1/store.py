@@ -41,6 +41,31 @@ _IDEMPOTENCY_RESPONSE_MODELS: dict[str, type[BaseModel]] = {
         m.ProjectValidationResponseV1,
     )
 }
+_IDEMPOTENCY_OPERATION_RESPONSES: dict[str, tuple[int, str]] = {
+    "createCoreProjectV1": (201, "ProjectV1"),
+    "patchCoreProjectV1": (200, "ProjectV1"),
+    "deleteCoreProjectV1": (204, "NoContent"),
+    "createCoreWorkspaceUploadV1": (201, "WorkspaceUploadSessionV1"),
+    "putCoreWorkspaceUploadChunkV1": (200, "WorkspaceUploadSessionV1"),
+    "finalizeCoreWorkspaceUploadV1": (201, "WorkspaceUploadFinalizeResponseV1"),
+    "abortCoreWorkspaceUploadV1": (200, "WorkspaceUploadSessionV1"),
+    "validateCoreProjectV1": (200, "ProjectValidationResponseV1"),
+}
+_PROJECT_SCOPED_IDEMPOTENCY_OPERATIONS = frozenset(
+    {
+        "patchCoreProjectV1",
+        "deleteCoreProjectV1",
+        "createCoreWorkspaceUploadV1",
+        "validateCoreProjectV1",
+    }
+)
+_UPLOAD_SCOPED_IDEMPOTENCY_OPERATIONS = frozenset(
+    {
+        "putCoreWorkspaceUploadChunkV1",
+        "finalizeCoreWorkspaceUploadV1",
+        "abortCoreWorkspaceUploadV1",
+    }
+)
 
 
 class CoreControlStoreError(Exception):
@@ -53,6 +78,10 @@ class StoreCorruptionError(CoreControlStoreError):
 
 class PostCommitStoreError(StoreCorruptionError):
     """A committed transaction failed its final lifecycle verification."""
+
+
+class CommitOutcomeUnknownError(PostCommitStoreError):
+    """SQLite may have committed, so durable state must be reconciled before repair."""
 
 
 class ResourceNotFoundError(CoreControlStoreError):
@@ -104,6 +133,27 @@ class StoredResult:
     model: BaseModel | None
     etag: str | None = None
     replayed: bool = False
+
+
+@dataclass(frozen=True)
+class _WorkspaceChunkCommitExpectation:
+    operation_id: str
+    scope: str
+    idempotency_key: str
+    request_digest: str
+    project_id: str
+    upload_id: str
+    file_name: str
+    created_at: str
+    old_document_json: bytes
+    old_resource_version: int
+    old_updated_at: str
+    new_document_json: bytes
+    new_resource_version: int
+    new_updated_at: str
+    old_offset: int
+    content: bytes
+    result: StoredResult
 
 
 _SCHEMA = (
@@ -196,16 +246,7 @@ class CoreControlStoreV1:
             self._open_parent_anchor()
             self._prepare_root()
             self._open_lifecycle_storage()
-            self._connection = sqlite3.connect(
-                self.root / "provider.sqlite3",
-                isolation_level=None,
-                check_same_thread=False,
-                timeout=30,
-            )
-            self._connection.row_factory = sqlite3.Row
-            self._connection.execute("PRAGMA foreign_keys = ON")
-            self._connection.execute("PRAGMA journal_mode = WAL")
-            self._connection.execute("PRAGMA synchronous = FULL")
+            self._connection = self._open_database_connection()
             with self._transaction():
                 for statement in _SCHEMA:
                     self._connection.execute(statement)
@@ -501,6 +542,7 @@ class CoreControlStoreV1:
         with self._mutex:
             old_offset = 0
             file_fd: int | None = None
+            expectation: _WorkspaceChunkCommitExpectation | None = None
             transaction = self._transaction()
             try:
                 with transaction:
@@ -559,12 +601,32 @@ class CoreControlStoreV1:
                         updated_data,
                         version=version,
                     )
+                    updated_bytes = _model_bytes(updated)
+                    result = StoredResult(200, updated, updated.etag)
+                    expectation = _WorkspaceChunkCommitExpectation(
+                        operation_id="putCoreWorkspaceUploadChunkV1",
+                        scope=scope,
+                        idempotency_key=idempotency_key,
+                        request_digest=digest,
+                        project_id=project_id,
+                        upload_id=upload_id,
+                        file_name=row["file_name"],
+                        created_at=row["created_at"],
+                        old_document_json=bytes(row["document_json"]),
+                        old_resource_version=int(row["resource_version"]),
+                        old_updated_at=row["updated_at"],
+                        new_document_json=updated_bytes,
+                        new_resource_version=version,
+                        new_updated_at=now,
+                        old_offset=old_offset,
+                        content=content,
+                        result=result,
+                    )
                     self._connection.execute(
                         "UPDATE workspace_uploads SET document_json = ?, resource_version = ?, "
                         "updated_at = ? WHERE upload_id = ?",
-                        (_model_bytes(updated), version, now, upload_id),
+                        (updated_bytes, version, now, upload_id),
                     )
-                    result = StoredResult(200, updated, updated.etag)
                     self._store_idempotency(
                         "putCoreWorkspaceUploadChunkV1",
                         scope,
@@ -573,8 +635,22 @@ class CoreControlStoreV1:
                         result,
                     )
                     return result
+            except CommitOutcomeUnknownError as exc:
+                if file_fd is None or expectation is None:
+                    raise
+                if self._reconcile_unknown_workspace_chunk_commit(expectation, file_fd):
+                    return expectation.result
+                os.ftruncate(file_fd, old_offset)
+                os.fsync(file_fd)
+                _require_bound_regular_entry(
+                    self._upload_root_fd,
+                    expectation.file_name,
+                    file_fd,
+                    expected_size=old_offset,
+                )
+                raise CoreControlStoreError("Core Control transaction did not commit") from exc
             except Exception:
-                if file_fd is not None and not transaction.committed:
+                if file_fd is not None and transaction.outcome in {"pending", "rolled_back"}:
                     os.ftruncate(file_fd, old_offset)
                     os.fsync(file_fd)
                 raise
@@ -1308,22 +1384,37 @@ class CoreControlStoreV1:
                 frame = _validate_bytes(m.SseFrameV1, row["frame_json"])
                 if frame.id != row["event_id"] or frame.data.root.sequence != row["sequence"]:
                     raise StoreCorruptionError("event row identity is invalid")
-            for row in self._connection.execute("SELECT * FROM idempotency_records"):
-                response_type = row["response_type"]
-                response_json = row["response_json"]
-                if response_type == "NoContent":
-                    if response_json is not None or int(row["status_code"]) != 204:
-                        raise StoreCorruptionError("no-content idempotency row is invalid")
-                else:
-                    response_model = _IDEMPOTENCY_RESPONSE_MODELS.get(response_type)
-                    if response_model is None or response_json is None:
-                        raise StoreCorruptionError("idempotency response type is invalid")
-                    _validate_bytes(response_model, response_json)
-                if len(row["request_digest"]) != 64:
-                    raise StoreCorruptionError("idempotency request digest is invalid")
-            for row in self._connection.execute("SELECT * FROM failed_idempotency_records"):
+            valid_successes: set[tuple[str, str, str]] = set()
+            for row in self._connection.execute("SELECT * FROM idempotency_records").fetchall():
+                _validate_idempotency_row(row)
+                valid_successes.add(
+                    (row["operation_id"], row["resource_scope"], row["idempotency_key"])
+                )
+            for row in self._connection.execute(
+                "SELECT * FROM failed_idempotency_records"
+            ).fetchall():
+                success_scope = _success_scope_for_failed_idempotency(row)
+                if (
+                    success_scope is not None
+                    and (
+                        row["operation_id"],
+                        success_scope,
+                        row["idempotency_key"],
+                    )
+                    in valid_successes
+                ):
+                    self._connection.execute(
+                        "DELETE FROM failed_idempotency_records WHERE operation_id = ? "
+                        "AND resource_scope = ? AND idempotency_key = ?",
+                        (
+                            row["operation_id"],
+                            row["resource_scope"],
+                            row["idempotency_key"],
+                        ),
+                    )
+                    continue
                 _validate_bytes(m.ApiErrorV1, row["error_json"])
-                if len(row["request_digest"]) != 64:
+                if not _is_sha256(row["request_digest"]):
                     raise StoreCorruptionError("failed idempotency request digest is invalid")
 
             upload_root_fd = self._upload_root_fd
@@ -1409,6 +1500,138 @@ class CoreControlStoreV1:
             )
         finally:
             os.close(fd)
+
+    def _reconcile_unknown_workspace_chunk_commit(
+        self,
+        expectation: _WorkspaceChunkCommitExpectation,
+        file_fd: int,
+    ) -> bool:
+        fresh_connection: sqlite3.Connection | None = None
+        try:
+            self._verify_lifecycle_storage()
+            fresh_connection = self._open_database_connection()
+            outcome = self._workspace_chunk_commit_outcome(fresh_connection, expectation)
+            self._verify_workspace_chunk_commit_file(expectation, file_fd)
+            self._verify_lifecycle_storage()
+
+            uncertain_connection = self._connection
+            uncertain_connection.close()
+            self._connection = fresh_connection
+            fresh_connection = None
+
+            confirmed_outcome = self._workspace_chunk_commit_outcome(self._connection, expectation)
+            if confirmed_outcome != outcome:
+                raise StoreCorruptionError(
+                    "workspace chunk commit state changed during reconciliation"
+                )
+            self._verify_workspace_chunk_commit_file(expectation, file_fd)
+            self._verify_lifecycle_storage()
+            return outcome == "committed"
+        except CommitOutcomeUnknownError:
+            raise
+        except Exception as exc:
+            if fresh_connection is not None:
+                try:
+                    fresh_connection.close()
+                except Exception:
+                    pass
+            raise CommitOutcomeUnknownError(
+                "workspace chunk commit outcome could not be reconciled"
+            ) from exc
+
+    def _workspace_chunk_commit_outcome(
+        self,
+        connection: sqlite3.Connection,
+        expectation: _WorkspaceChunkCommitExpectation,
+    ) -> Literal["committed", "rolled_back"]:
+        connection.execute("BEGIN")
+        try:
+            success_row = connection.execute(
+                "SELECT * FROM idempotency_records WHERE operation_id = ? "
+                "AND resource_scope = ? AND idempotency_key = ?",
+                (
+                    expectation.operation_id,
+                    expectation.scope,
+                    expectation.idempotency_key,
+                ),
+            ).fetchone()
+            upload_row = connection.execute(
+                "SELECT * FROM workspace_uploads WHERE upload_id = ?",
+                (expectation.upload_id,),
+            ).fetchone()
+        except Exception:
+            connection.execute("ROLLBACK")
+            raise
+        connection.execute("COMMIT")
+
+        if upload_row is None:
+            raise StoreCorruptionError(
+                "workspace chunk upload disappeared during commit reconciliation"
+            )
+        common_upload_state = (
+            upload_row["upload_id"] == expectation.upload_id
+            and upload_row["project_id"] == expectation.project_id
+            and upload_row["file_name"] == expectation.file_name
+            and upload_row["created_at"] == expectation.created_at
+        )
+        old_upload_state = (
+            common_upload_state
+            and bytes(upload_row["document_json"]) == expectation.old_document_json
+            and int(upload_row["resource_version"]) == expectation.old_resource_version
+            and upload_row["updated_at"] == expectation.old_updated_at
+        )
+        new_upload_state = (
+            common_upload_state
+            and bytes(upload_row["document_json"]) == expectation.new_document_json
+            and int(upload_row["resource_version"]) == expectation.new_resource_version
+            and upload_row["updated_at"] == expectation.new_updated_at
+        )
+
+        if success_row is None:
+            if old_upload_state:
+                return "rolled_back"
+            raise StoreCorruptionError(
+                "workspace chunk commit has an ambiguous durable upload row"
+            )
+
+        _validate_idempotency_row(success_row)
+        exact_success = (
+            hmac.compare_digest(success_row["request_digest"], expectation.request_digest)
+            and int(success_row["status_code"]) == expectation.result.status_code
+            and success_row["response_type"] == m.WorkspaceUploadSessionV1.__name__
+            and bytes(success_row["response_json"]) == expectation.new_document_json
+            and success_row["etag"] == expectation.result.etag
+        )
+        if not exact_success or not new_upload_state:
+            raise StoreCorruptionError(
+                "workspace chunk committed state does not match the attempted transaction"
+            )
+        return "committed"
+
+    def _verify_workspace_chunk_commit_file(
+        self,
+        expectation: _WorkspaceChunkCommitExpectation,
+        file_fd: int,
+    ) -> None:
+        expected_size = expectation.old_offset + len(expectation.content)
+        _require_bound_regular_entry(
+            self._upload_root_fd,
+            expectation.file_name,
+            file_fd,
+            expected_size=expected_size,
+        )
+        if _pread_exact(file_fd, len(expectation.content), expectation.old_offset) != (
+            expectation.content
+        ):
+            raise StoreCorruptionError(
+                "workspace chunk bytes do not match the attempted transaction"
+            )
+        _require_bound_regular_entry(
+            self._upload_root_fd,
+            expectation.file_name,
+            file_fd,
+            expected_size=expected_size,
+        )
 
     def _open_parent_anchor(self) -> None:
         self._state_parent.mkdir(parents=True, exist_ok=True)
@@ -1595,6 +1818,23 @@ class CoreControlStoreV1:
         )
         return value
 
+    def _open_database_connection(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(
+            self.root / "provider.sqlite3",
+            isolation_level=None,
+            check_same_thread=False,
+            timeout=30,
+        )
+        try:
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute("PRAGMA journal_mode = WAL")
+            connection.execute("PRAGMA synchronous = FULL")
+        except Exception:
+            connection.close()
+            raise
+        return connection
+
     def _harden_database_files(self) -> None:
         for suffix in ("", "-wal", "-shm"):
             path = self.root / f"provider.sqlite3{suffix}"
@@ -1625,7 +1865,7 @@ class _Transaction:
     ) -> None:
         self.connection = connection
         self.verify_storage = verify_storage
-        self.committed = False
+        self.outcome: Literal["pending", "rolled_back", "committed", "unknown"] = "pending"
 
     def __enter__(self):
         self.verify_storage()
@@ -1635,14 +1875,25 @@ class _Transaction:
     def __exit__(self, exc_type, exc, traceback) -> bool:
         if exc_type is not None:
             self.connection.execute("ROLLBACK")
+            self.outcome = "rolled_back"
             return False
         try:
             self.verify_storage()
         except Exception:
             self.connection.execute("ROLLBACK")
+            self.outcome = "rolled_back"
             raise
-        self.connection.execute("COMMIT")
-        self.committed = True
+        try:
+            self.connection.execute("COMMIT")
+        except Exception as exc:
+            self.outcome = "unknown"
+            raise CommitOutcomeUnknownError(
+                "Core Control transaction commit outcome is unknown"
+            ) from exc
+        except BaseException:
+            self.outcome = "unknown"
+            raise
+        self.outcome = "committed"
         try:
             self._verify_after_commit()
         except Exception as exc:
@@ -1790,6 +2041,79 @@ def _validate_bytes(model: type[_ModelT], value: bytes) -> _ModelT:
         raise StoreCorruptionError(f"persisted {model.__name__} is invalid") from exc
 
 
+def _validate_idempotency_row(row: sqlite3.Row) -> BaseModel | None:
+    expected_response = _IDEMPOTENCY_OPERATION_RESPONSES.get(row["operation_id"])
+    if (
+        expected_response is None
+        or (int(row["status_code"]), row["response_type"]) != expected_response
+    ):
+        raise StoreCorruptionError("idempotency operation response is invalid")
+    if not _is_sha256(row["request_digest"]):
+        raise StoreCorruptionError("idempotency request digest is invalid")
+
+    response_type = row["response_type"]
+    response_json = row["response_json"]
+    if response_type == "NoContent":
+        if response_json is not None or row["etag"] is not None:
+            raise StoreCorruptionError("no-content idempotency row is invalid")
+        return None
+
+    response_model = _IDEMPOTENCY_RESPONSE_MODELS.get(response_type)
+    if response_model is None or response_json is None:
+        raise StoreCorruptionError("idempotency response type is invalid")
+    model = _validate_bytes(response_model, response_json)
+    if _model_bytes(model) != bytes(response_json):
+        raise StoreCorruptionError("idempotency response is not canonical")
+    if isinstance(model, (m.ProjectV1, m.WorkspaceUploadSessionV1)):
+        expected_etag = model.etag
+    elif isinstance(model, m.WorkspaceUploadFinalizeResponseV1):
+        expected_etag = model.upload.etag
+    else:
+        expected_etag = None
+    if row["etag"] != expected_etag:
+        raise StoreCorruptionError("idempotency response ETag is invalid")
+    return model
+
+
+def _success_scope_for_failed_idempotency(row: sqlite3.Row) -> str | None:
+    operation_id = row["operation_id"]
+    if operation_id not in _IDEMPOTENCY_OPERATION_RESPONSES:
+        return None
+    try:
+        resource_scope = json.loads(row["resource_scope"])
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise StoreCorruptionError("failed idempotency resource scope is invalid") from exc
+    if (
+        type(resource_scope) is not dict
+        or _canonical_bytes(resource_scope).decode("utf-8") != row["resource_scope"]
+    ):
+        raise StoreCorruptionError("failed idempotency resource scope is invalid")
+
+    if operation_id == "createCoreProjectV1":
+        if resource_scope:
+            raise StoreCorruptionError("failed idempotency resource scope is invalid")
+        return "projects"
+    if operation_id in _PROJECT_SCOPED_IDEMPOTENCY_OPERATIONS:
+        if set(resource_scope) != {"project_id"} or type(resource_scope["project_id"]) is not str:
+            raise StoreCorruptionError("failed idempotency resource scope is invalid")
+        return resource_scope["project_id"]
+    if operation_id in _UPLOAD_SCOPED_IDEMPOTENCY_OPERATIONS:
+        if set(resource_scope) != {"project_id", "upload_id"} or any(
+            type(resource_scope[name]) is not str for name in ("project_id", "upload_id")
+        ):
+            raise StoreCorruptionError("failed idempotency resource scope is invalid")
+        return f"{resource_scope['project_id']}:{resource_scope['upload_id']}"
+    raise StoreCorruptionError("idempotency operation scope is unsupported")
+
+
+def _is_sha256(value: object) -> bool:
+    return (
+        type(value) is str
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
 def _write_all(fd: int, content: bytes) -> None:
     view = memoryview(content)
     while view:
@@ -1797,6 +2121,16 @@ def _write_all(fd: int, content: bytes) -> None:
         if written <= 0:
             raise OSError("failed to write workspace upload")
         view = view[written:]
+
+
+def _pread_exact(fd: int, length: int, offset: int) -> bytes:
+    content = bytearray()
+    while len(content) < length:
+        chunk = os.pread(fd, length - len(content), offset + len(content))
+        if not chunk:
+            raise StoreCorruptionError("workspace upload file ended during verification")
+        content.extend(chunk)
+    return bytes(content)
 
 
 def _require_bound_regular_entry(

@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import sqlite3
 import subprocess
 import sys
 
@@ -17,7 +18,12 @@ from openevo.backend.contracts.v1 import (
     create_core_control_app,
     openapi_sha256,
 )
-from openevo.backend.contracts.v1.models import SseFrameV1, WorkspaceArchiveDeclarationV1
+from openevo.backend.contracts.v1.models import (
+    ApiErrorV1,
+    SseFrameV1,
+    WorkspaceArchiveDeclarationV1,
+    WorkspaceUploadChunkV1,
+)
 import openevo.backend.contracts.v1.store as store_module
 from openevo.backend.contracts.v1.store import (
     CoreControlStoreError,
@@ -747,6 +753,268 @@ def test_workspace_chunk_post_commit_binding_failure_preserves_committed_bytes(
         assert replay.status_code == 200, replay.text
         assert replay.json()["accepted_offset"] == len(archive)
         assert upload_path.read_bytes() == archive
+
+
+def test_workspace_chunk_reconciles_commit_that_is_durable_when_commit_raises(
+    tmp_path: Path,
+) -> None:
+    archive = _workspace_archive()
+    app = _app(tmp_path)
+    with TestClient(app, raise_server_exceptions=False) as client:
+        project, project_etag = _create_project(client, _project_create(archive=archive))
+        upload = client.post(
+            f"/v1/projects/{project['id']}/workspace-uploads",
+            headers={
+                **AUTH,
+                "Idempotency-Key": "begin-upload-unknown-commit",
+                "If-Match": project_etag,
+            },
+            json={
+                "schema_version": "1",
+                "project_snapshot": project["current_project_snapshot"],
+                "archive": project["workspace"]["archive"],
+                "base_workspace_snapshot": None,
+            },
+        )
+        provider = app.state.core_control_provider
+        real_connection = provider.store._connection
+
+        class DurableCommitRaises:
+            def __init__(self, connection) -> None:
+                self._connection = connection
+                self._raise_commit = True
+
+            def execute(self, statement, parameters=()):
+                result = self._connection.execute(statement, parameters)
+                if self._raise_commit and statement.strip().upper() == "COMMIT":
+                    self._raise_commit = False
+                    raise sqlite3.OperationalError("COMMIT result is unknown")
+                return result
+
+            def close(self) -> None:
+                self._connection.close()
+
+            def __getattr__(self, name):
+                return getattr(self._connection, name)
+
+        provider.store._connection = DurableCommitRaises(real_connection)
+        chunk_body = _chunk(archive, offset=0)
+        chunk = client.put(
+            f"/v1/projects/{project['id']}/workspace-uploads/{upload.json()['id']}/chunk",
+            headers={
+                **AUTH,
+                "Idempotency-Key": "chunk-upload-unknown-commit",
+                "If-Match": upload.headers["etag"],
+            },
+            json=chunk_body,
+        )
+        upload_path = (
+            tmp_path / "core-control-v1" / "workspace-uploads" / f"{upload.json()['id']}.part"
+        )
+
+        assert chunk.status_code == 200, chunk.text
+        assert chunk.json()["accepted_offset"] == len(archive)
+        assert upload_path.read_bytes() == archive
+        replay = client.put(
+            f"/v1/projects/{project['id']}/workspace-uploads/{upload.json()['id']}/chunk",
+            headers={
+                **AUTH,
+                "Idempotency-Key": "chunk-upload-unknown-commit",
+                "If-Match": upload.headers["etag"],
+            },
+            json=chunk_body,
+        )
+        assert replay.status_code == 200, replay.text
+        assert replay.json() == chunk.json()
+
+    with TestClient(_app(tmp_path)) as restarted:
+        recovered = restarted.get(
+            f"/v1/projects/{project['id']}/workspace-uploads/{upload.json()['id']}",
+            headers=AUTH,
+        )
+        assert recovered.status_code == 200, recovered.text
+        assert recovered.json()["accepted_offset"] == len(archive)
+
+
+def _inject_duplicate_failed_chunk(
+    tmp_path: Path,
+    *,
+    project_id: str,
+    upload_id: str,
+    upload_etag: str,
+    idempotency_key: str,
+    chunk_body: dict[str, object],
+    error_payload: dict[str, object],
+) -> None:
+    request = WorkspaceUploadChunkV1.model_validate(chunk_body)
+    arguments = {
+        "project_id": project_id,
+        "upload_id": upload_id,
+        "request": request,
+        "if_match": upload_etag,
+        "idempotency_key": idempotency_key,
+    }
+    identity = store_module._failed_idempotency_identity(
+        "putCoreWorkspaceUploadChunkV1", arguments
+    )
+    assert identity is not None
+    scope, key, digest = identity
+    error = ApiErrorV1.model_validate_json(json.dumps(error_payload))
+    now = int(datetime.now(timezone.utc).timestamp())
+    with sqlite3.connect(tmp_path / "core-control-v1" / "provider.sqlite3") as connection:
+        connection.execute(
+            "INSERT INTO failed_idempotency_records VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                "putCoreWorkspaceUploadChunkV1",
+                scope,
+                key,
+                digest,
+                store_module._model_bytes(error),
+                now,
+                now + 3600,
+            ),
+        )
+
+
+def test_startup_prefers_valid_success_over_duplicate_failed_idempotency(tmp_path: Path) -> None:
+    archive = _workspace_archive()
+    chunk_body = _chunk(archive, offset=0)
+    target_key = "chunk-upload-duplicate-success"
+    with TestClient(_app(tmp_path)) as client:
+        project, project_etag = _create_project(client, _project_create(archive=archive))
+        upload = client.post(
+            f"/v1/projects/{project['id']}/workspace-uploads",
+            headers={
+                **AUTH,
+                "Idempotency-Key": "begin-upload-duplicate-success",
+                "If-Match": project_etag,
+            },
+            json={
+                "schema_version": "1",
+                "project_snapshot": project["current_project_snapshot"],
+                "archive": project["workspace"]["archive"],
+                "base_workspace_snapshot": None,
+            },
+        )
+        stale = client.put(
+            f"/v1/projects/{project['id']}/workspace-uploads/{upload.json()['id']}/chunk",
+            headers={
+                **AUTH,
+                "Idempotency-Key": "chunk-upload-source-failure",
+                "If-Match": '"' + ("0" * 64) + '"',
+            },
+            json=chunk_body,
+        )
+        success = client.put(
+            f"/v1/projects/{project['id']}/workspace-uploads/{upload.json()['id']}/chunk",
+            headers={
+                **AUTH,
+                "Idempotency-Key": target_key,
+                "If-Match": upload.headers["etag"],
+            },
+            json=chunk_body,
+        )
+        assert stale.status_code == 412
+        assert success.status_code == 200
+
+    _inject_duplicate_failed_chunk(
+        tmp_path,
+        project_id=project["id"],
+        upload_id=upload.json()["id"],
+        upload_etag=upload.headers["etag"],
+        idempotency_key=target_key,
+        chunk_body=chunk_body,
+        error_payload=stale.json(),
+    )
+
+    with TestClient(_app(tmp_path)) as restarted:
+        replay = restarted.put(
+            f"/v1/projects/{project['id']}/workspace-uploads/{upload.json()['id']}/chunk",
+            headers={
+                **AUTH,
+                "Idempotency-Key": target_key,
+                "If-Match": upload.headers["etag"],
+            },
+            json=chunk_body,
+        )
+        assert replay.status_code == 200, replay.text
+        assert replay.json() == success.json()
+
+    with sqlite3.connect(tmp_path / "core-control-v1" / "provider.sqlite3") as connection:
+        remaining = connection.execute(
+            "SELECT count(*) FROM failed_idempotency_records "
+            "WHERE operation_id = ? AND idempotency_key = ?",
+            ("putCoreWorkspaceUploadChunkV1", target_key),
+        ).fetchone()[0]
+    assert remaining == 0
+
+
+def test_startup_keeps_failed_audit_when_duplicate_success_is_invalid(tmp_path: Path) -> None:
+    archive = _workspace_archive()
+    chunk_body = _chunk(archive, offset=0)
+    target_key = "chunk-upload-duplicate-invalid-success"
+    with TestClient(_app(tmp_path)) as client:
+        project, project_etag = _create_project(client, _project_create(archive=archive))
+        upload = client.post(
+            f"/v1/projects/{project['id']}/workspace-uploads",
+            headers={
+                **AUTH,
+                "Idempotency-Key": "begin-upload-duplicate-invalid-success",
+                "If-Match": project_etag,
+            },
+            json={
+                "schema_version": "1",
+                "project_snapshot": project["current_project_snapshot"],
+                "archive": project["workspace"]["archive"],
+                "base_workspace_snapshot": None,
+            },
+        )
+        stale = client.put(
+            f"/v1/projects/{project['id']}/workspace-uploads/{upload.json()['id']}/chunk",
+            headers={
+                **AUTH,
+                "Idempotency-Key": "chunk-upload-source-invalid-failure",
+                "If-Match": '"' + ("0" * 64) + '"',
+            },
+            json=chunk_body,
+        )
+        success = client.put(
+            f"/v1/projects/{project['id']}/workspace-uploads/{upload.json()['id']}/chunk",
+            headers={
+                **AUTH,
+                "Idempotency-Key": target_key,
+                "If-Match": upload.headers["etag"],
+            },
+            json=chunk_body,
+        )
+        assert stale.status_code == 412
+        assert success.status_code == 200
+
+    _inject_duplicate_failed_chunk(
+        tmp_path,
+        project_id=project["id"],
+        upload_id=upload.json()["id"],
+        upload_etag=upload.headers["etag"],
+        idempotency_key=target_key,
+        chunk_body=chunk_body,
+        error_payload=stale.json(),
+    )
+    with sqlite3.connect(tmp_path / "core-control-v1" / "provider.sqlite3") as connection:
+        connection.execute(
+            "UPDATE idempotency_records SET response_json = ? "
+            "WHERE operation_id = ? AND idempotency_key = ?",
+            (b"{}", "putCoreWorkspaceUploadChunkV1", target_key),
+        )
+
+    with pytest.raises(StoreCorruptionError, match="persisted WorkspaceUploadSessionV1"):
+        CoreControlStoreV1(tmp_path)
+    with sqlite3.connect(tmp_path / "core-control-v1" / "provider.sqlite3") as connection:
+        remaining = connection.execute(
+            "SELECT count(*) FROM failed_idempotency_records "
+            "WHERE operation_id = ? AND idempotency_key = ?",
+            ("putCoreWorkspaceUploadChunkV1", target_key),
+        ).fetchone()[0]
+    assert remaining == 1
 
 
 def test_workspace_finalize_rejects_same_inode_mutation_during_verification(
