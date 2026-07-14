@@ -33,6 +33,7 @@ swebench = [
 
 [project.scripts]
 openevo-backend = "openevo.backend.launcher:main"
+openevo-core-service = "openevo.backend.service:main"
 
 [dependency-groups]
 dev = [

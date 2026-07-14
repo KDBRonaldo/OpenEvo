@@ -51,6 +51,12 @@ No bootstrap path directly calls model APIs.
 
 ## Bootstrap Plan
 
+This section describes the older per-run science bootstrap scaffold. It does
+not own the formal Core Control daemon. Release integration must use the
+host-global service contract in `core-control-host-service.md`; after attach it
+must not use this scaffold to launch Core, science runs, Gateway, workers, or
+model serving over SSH.
+
 `RemoteBootstrapPlan` is a strict, frozen Pydantic model. It records:
 
 - `remote_profile_id`, `project_name`, and `task_id`;
@@ -272,11 +278,13 @@ If log tailing itself fails due to a transport exception, the logs endpoint
 still returns a `RemoteServiceLog` with sanitized diagnostic content instead of
 surfacing an unstructured server error.
 
-This facade is still command-based. It does not add systemd units, persistent
-restart policies, cross-session process ownership tracking, or a new daemon
-supervisor. The identity file binds intended argv/release/environment, but a PID
-file alone does not protect against OS PID reuse; stronger process ownership is
-still a B2 lifecycle requirement.
+This legacy per-run service facade remains command-based and its PID files do
+not protect its Gateway, rollout, worker, or model-serving processes against PID
+reuse. It is not the release Core launcher. The formal host-global Core Control
+service separately uses pidfd plus boot-ID/start-time identity, an exclusive
+lifecycle lock, pending-start recovery, and authenticated readiness as defined
+in `core-control-host-service.md`. That does not upgrade or attest the other
+legacy service processes.
 
 ## Validation
 

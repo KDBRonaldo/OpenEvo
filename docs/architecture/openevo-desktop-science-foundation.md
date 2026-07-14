@@ -452,7 +452,12 @@ Docker Compose is probed but not required for the current Desktop Science path.
 Missing Compose is rendered as a warning because OpenEvo services are started
 through the service lifecycle endpoint rather than a Compose stack.
 
-`POST /openevo-api/desktop/services` starts the remote runtime services after
+The following `/openevo-api` service flow is a historical scaffold and is not a
+release Core Control path. Formal Desktop bootstrap must not call it after Core
+attach; run and service lifecycle must go through the active tunnel and formal
+`/v1/*` operations.
+
+`POST /openevo-api/desktop/services` historically starts the remote runtime services after
 workspace and bootstrap readiness. It is available only for config-backed
 sidecar sessions and requires the same mutation token. The sidecar rebuilds the
 deterministic bootstrap plan, writes a remote service topology under

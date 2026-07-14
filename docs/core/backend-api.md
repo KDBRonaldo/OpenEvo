@@ -18,21 +18,29 @@ after bootstrap.
 
 ## Launcher
 
-Release bootstrap starts Core with the installed release artifact:
+Release bootstrap uses the internal `openevo-core-service` maintenance entry
+point after staging the exact release artifact. It supplies the canonical
+user-global root, external framework lock, and source identity; the supervisor,
+not a project/run command, chooses and pre-binds the loopback listener:
 
 ```bash
-openevo-backend serve \
-  --host 127.0.0.1 \
-  --port 8765 \
-  --state-root /home/openevo/.openevo/core-state \
-  --framework-lock /home/openevo/.openevo/core-state/wheels/framework-lock.json
+openevo-core-service ensure \
+  --service-root /home/openevo/.openevo/core \
+  --framework-lock /home/openevo/.openevo/releases/framework-lock.json \
+  --source-commit 0123456789abcdef0123456789abcdef01234567
 ```
+
+This is launcher/maintenance automation, not an ordinary-user CLI surface.
+`openevo-backend serve` is supervisor-only and requires inherited socket and
+readiness descriptors; it cannot choose a public bind address or per-run state
+root.
 
 The external framework lock names the exact installed Core wheel and pins its
 version and SHA-256. Startup fails before serving capabilities when the lock,
 wheel, installed inventory, or entry points do not match.
 
-`OPENEVO_STATE_ROOT` is the remote root for Core-owned state. The backend must
+The canonical host service root is `~/.openevo/core`; project and task state is
+owned inside that one Core instance. The backend must
 report its version, descriptor SHA256, artifact SHA256, source commit, and state
 schema through `/version` and `/v1/status`.
 
@@ -44,10 +52,11 @@ External Beta does not expose Core as a public service. The supported route is:
 OpenEvo Desktop -> localhost sidecar -> SSH tunnel -> remote localhost Core
 ```
 
-Core and sidecar bind only to `127.0.0.1` or `::1`. Binding to `0.0.0.0`, a
-LAN interface, or a public interface is a release-mode override rejection unless
-an internal maintainer-only test flag is active. `/v1/status` reports sanitized
-bind mode and never returns token values.
+The formal Core host service binds only to IPv4 `127.0.0.1` through a
+supervisor-owned socket. The kernel selects an available dynamic port, which is
+returned only in private sidecar tunnel attachment metadata. It has no release override for `0.0.0.0`, a LAN
+interface, or a public interface. Service bootstrap metadata never returns a
+public Core URL.
 
 ## Auth
 
@@ -55,9 +64,10 @@ Every Desktop mutation request to the local sidecar uses
 `X-OpenEvo-Desktop-Session: <token>`. Every request forwarded from the sidecar
 to Core uses `Authorization: Bearer <backend-api-token>`.
 
-The backend API token is created during bootstrap, stored under
-`${OPENEVO_STATE_ROOT}/backend/auth/api-token` with `0600` permissions, and
-referenced locally through Keychain-backed secret refs. Tokens are redacted from
+The Core bearer is created during bootstrap and stored at
+`~/.openevo/core/bearer-token` with `0600` permissions. It is transferred only
+in the private bootstrap attachment and retained in sidecar process memory;
+it is not a renderer response or durable Desktop resource. Tokens are redacted from
 logs, diagnostics, screenshots, timeline events, and release evidence.
 
 Core returns typed auth errors:

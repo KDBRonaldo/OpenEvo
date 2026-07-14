@@ -1,0 +1,163 @@
+from __future__ import annotations
+
+from dataclasses import asdict
+import json
+
+import pytest
+
+from openevo.deployment.core_control import (
+    CoreControlBootstrapError,
+    CoreControlBootstrapErrorCode,
+    build_core_control_bootstrap_plan,
+    execute_core_control_bootstrap,
+    open_core_control_tunnel,
+    parse_core_control_attachment,
+)
+from openevo.deployment.preflight import RemoteCommandResult
+
+
+def _attachment_json(**updates: object) -> str:
+    payload: dict[str, object] = {
+        "schema_version": 1,
+        "host": "127.0.0.1",
+        "port": 8765,
+        "release_identity": "a" * 64,
+        "registry_digest": "b" * 64,
+        "generation": "c" * 32,
+        "status_proof": "d" * 64,
+        "attached": True,
+        "bearer_token": "E" * 64,
+        "execution_mode": "subscription",
+        "capture_mode": "transcript",
+    }
+    payload.update(updates)
+    return json.dumps(payload, separators=(",", ":"), sort_keys=True)
+
+
+class FakeTransport:
+    def __init__(self, stdout: str, *, return_codes: list[int] | None = None) -> None:
+        self.stdout = stdout
+        self.return_codes = list(return_codes or [])
+        self.commands: list[str] = []
+        self.timeouts: list[float] = []
+        self.tunnel_kwargs: dict[str, object] = {}
+
+    def run(
+        self,
+        command: str,
+        *,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        timeout_seconds: float = 30.0,
+    ) -> RemoteCommandResult:
+        del cwd, env
+        self.commands.append(command)
+        self.timeouts.append(timeout_seconds)
+        return RemoteCommandResult(
+            command=command,
+            return_code=self.return_codes.pop(0) if self.return_codes else 0,
+            stdout=self.stdout,
+        )
+
+    def open_tunnel(self, **kwargs: object) -> object:
+        self.tunnel_kwargs = kwargs
+        return object()
+
+    def upload_dir(self, local_path: str, remote_path: str) -> None:
+        del local_path, remote_path
+
+
+def test_core_bootstrap_only_installs_verifies_and_ensures_daemon() -> None:
+    plan = build_core_control_bootstrap_plan(
+        wheel_path="/home/user/upload/openevo.whl",
+        framework_lock="/home/user/upload/framework-lock.json",
+        service_root="/home/user/.openevo/core",
+        source_commit="1" * 40,
+    )
+    transport = FakeTransport(_attachment_json(), return_codes=[1, 0, 0, 0])
+
+    attachment = execute_core_control_bootstrap(plan, transport)
+
+    assert plan.port == 0
+    assert attachment.remote_host == "127.0.0.1"
+    assert attachment.remote_port == 8765
+    assert attachment.execution_mode == "subscription"
+    assert attachment.capture_mode == "transcript"
+    assert attachment.bearer_token == "E" * 64
+    assert "bearer_token" not in repr(attachment)
+    assert "E" * 64 not in repr(asdict(attachment))
+    assert len(transport.commands) == 4
+    assert "load_verified_framework_registry" in transport.commands[0]
+    assert "pip install" in transport.commands[1]
+    assert "load_verified_framework_registry" in transport.commands[2]
+    assert "openevo.backend.service ensure" in transport.commands[3]
+    assert "--port 0" in transport.commands[3]
+    combined = " ".join(transport.commands)
+    assert "gateway" not in combined
+    assert "worker" not in combined
+    assert "vllm" not in combined.lower()
+    assert all(0 < timeout <= plan.deadline_seconds for timeout in transport.timeouts)
+
+
+def test_exact_installed_release_attaches_without_reinstall() -> None:
+    plan = build_core_control_bootstrap_plan(
+        wheel_path="/home/user/upload/openevo.whl",
+        framework_lock="/home/user/upload/framework-lock.json",
+        service_root="/home/user/.openevo/core",
+        source_commit="1" * 40,
+    )
+    transport = FakeTransport(_attachment_json())
+
+    execute_core_control_bootstrap(plan, transport)
+
+    assert len(transport.commands) == 2
+    assert "load_verified_framework_registry" in transport.commands[0]
+    assert "pip install" not in " ".join(transport.commands)
+    assert "openevo.backend.service ensure" in transport.commands[1]
+
+
+def test_core_bootstrap_parser_rejects_duplicate_oversized_and_bad_bearer() -> None:
+    duplicate = _attachment_json()[:-1] + ',"port":9999}'
+    for payload in (duplicate, "x" * 5000, _attachment_json(bearer_token="short")):
+        with pytest.raises(CoreControlBootstrapError) as exc_info:
+            parse_core_control_attachment(payload)
+        assert exc_info.value.code is CoreControlBootstrapErrorCode.RESPONSE_INVALID
+        assert "short" not in str(exc_info.value)
+
+
+def test_core_bootstrap_failure_does_not_expose_command_or_paths() -> None:
+    plan = build_core_control_bootstrap_plan(
+        wheel_path="/secret/upload/openevo.whl",
+        framework_lock="/secret/upload/framework-lock.json",
+        service_root="/secret/home/.openevo/core",
+        source_commit="1" * 40,
+    )
+
+    class FailingTransport(FakeTransport):
+        def run(self, command: str, **kwargs: object) -> RemoteCommandResult:
+            del kwargs
+            return RemoteCommandResult(
+                command=command,
+                return_code=1,
+                stderr="Authorization: Bearer super-secret /secret/home",
+            )
+
+    with pytest.raises(CoreControlBootstrapError) as exc_info:
+        execute_core_control_bootstrap(plan, FailingTransport(""))
+    rendered = str(exc_info.value)
+    assert "super-secret" not in rendered
+    assert "/secret" not in rendered
+    assert "pip" not in rendered
+
+
+def test_tunnel_uses_only_attachment_loopback_metadata() -> None:
+    attachment = parse_core_control_attachment(_attachment_json())
+    transport = FakeTransport("")
+    tunnel = open_core_control_tunnel(attachment, transport)
+    assert tunnel is not None
+    assert transport.tunnel_kwargs == {
+        "remote_port": 8765,
+        "remote_host": "127.0.0.1",
+        "wait_for_ready": True,
+        "timeout_seconds": 10.0,
+    }

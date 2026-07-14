@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import argparse
 import json
+import os
 from pathlib import Path
+import socket
 
 import pytest
 
 from openevo import experiments
 from openevo.backend import launcher
+from openevo.backend.runtime_identity import CoreReleaseIdentity
 from openevo.experiments.models import ExperimentConfig
 
 
@@ -172,16 +176,19 @@ def test_backend_launcher_run_dry_run_uses_dry_runner(
     monkeypatch.setattr(launcher, "load_verified_framework_registry", lambda path: registry)
     monkeypatch.setattr(launcher, "_execution_profile_for_config", lambda value: profile)
 
-    assert launcher.main(
-        [
-            "run",
-            str(config_path),
-            "--dry-run",
-            "--json",
-            "--framework-lock",
-            str(framework_lock),
-        ]
-    ) == 0
+    assert (
+        launcher.main(
+            [
+                "run",
+                str(config_path),
+                "--dry-run",
+                "--json",
+                "--framework-lock",
+                str(framework_lock),
+            ]
+        )
+        == 0
+    )
 
     assert calls == {
         "loaded_config": config,
@@ -193,47 +200,112 @@ def test_backend_launcher_run_dry_run_uses_dry_runner(
     assert json.loads(capsys.readouterr().out) == {"mode": "dry_run"}
 
 
-def test_backend_launcher_serve_starts_backend_api(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_backend_launcher_serve_requires_supervised_core_control(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[object] = []
+    monkeypatch.setattr(
+        launcher,
+        "_serve_core_control",
+        lambda args: calls.append(args) or 0,
+    )
+
+    assert (
+        launcher.main(
+            [
+                "serve",
+                "--service-root",
+                "/home/user/.openevo/core",
+                "--framework-lock",
+                "/srv/openevo/framework-lock.json",
+                "--source-commit",
+                "1" * 40,
+                "--socket-fd",
+                "3",
+                "--ready-fd",
+                "4",
+                "--expected-release-identity",
+                "2" * 64,
+                "--generation",
+                "3" * 32,
+            ]
+        )
+        == 0
+    )
+    assert len(calls) == 1
+    args = calls[0]
+    assert args.service_root == Path("/home/user/.openevo/core")
+    assert args.socket_fd == 3
+    assert args.ready_fd == 4
+
+
+def test_supervised_launcher_builds_release_core_control_app(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service_root = tmp_path / "core"
+    service_root.mkdir(mode=0o700)
+    release = CoreReleaseIdentity(
+        digest="a" * 64,
+        registry_digest="b" * 64,
+        framework_lock_sha256="c" * 64,
+        source_commit="1" * 40,
+    )
+    registry = object()
+    app = object()
     calls: dict[str, object] = {}
 
-    app = object()
+    monkeypatch.setattr(launcher, "require_host_global_service_root", lambda path: path)
+    monkeypatch.setattr(launcher, "load_verified_framework_registry", lambda path: registry)
+    monkeypatch.setattr(launcher, "compute_release_identity", lambda **kwargs: release)
 
-    registry = object()
-
-    def fake_create_backend_app(
-        *,
-        state_root: Path | None = None,
-        evolution_registry: object,
-    ) -> object:
-        calls["state_root"] = state_root
-        calls["evolution_registry"] = evolution_registry
+    def create_app(**kwargs: object) -> object:
+        calls["create"] = kwargs
         return app
 
-    def fake_uvicorn_run(app: object, **kwargs: object) -> None:
-        calls["app"] = app
-        calls.update(kwargs)
+    async def run_server(
+        received_app: object,
+        *,
+        inherited_socket: socket.socket,
+        ready_fd: int,
+        ready_payload: dict[str, object],
+    ) -> int:
+        calls["server"] = {
+            "app": received_app,
+            "socket": inherited_socket.getsockname(),
+            "ready_payload": ready_payload,
+        }
+        os.close(ready_fd)
+        return 0
 
-    monkeypatch.setattr(launcher, "create_backend_app", fake_create_backend_app)
-    monkeypatch.setattr(launcher, "load_verified_framework_registry", lambda path: registry)
-    monkeypatch.setattr("uvicorn.run", fake_uvicorn_run)
-
-    assert launcher.main(
-        [
-            "serve",
-            "--host",
-            "0.0.0.0",
-            "--port",
-            "9876",
-            "--state-root",
-            "/srv/openevo/state",
-            "--framework-lock",
-            "/srv/openevo/framework-lock.json",
-        ]
-    ) == 0
-    assert calls == {
-        "state_root": Path("/srv/openevo/state"),
-        "evolution_registry": registry,
-        "app": app,
-        "host": "0.0.0.0",
-        "port": 9876,
-    }
+    monkeypatch.setattr(launcher, "create_core_control_app", create_app)
+    monkeypatch.setattr(launcher, "_run_supervised_server", run_server)
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    read_fd, write_fd = os.pipe()
+    try:
+        result = launcher._serve_core_control(
+            argparse.Namespace(
+                service_root=service_root,
+                framework_lock=tmp_path / "framework-lock.json",
+                source_commit=release.source_commit,
+                socket_fd=listener.detach(),
+                ready_fd=write_fd,
+                expected_release_identity=release.digest,
+                generation="d" * 32,
+            )
+        )
+    finally:
+        os.close(read_fd)
+    assert result == 0
+    create = calls["create"]
+    assert create["state_root"] == service_root / "state"
+    assert create["build_channel"] == "release"
+    assert create["source_commit"] == release.source_commit
+    assert create["evolution_registry"] is registry
+    assert len(create["bearer_token"]) == 64
+    server = calls["server"]
+    assert server["app"] is app
+    assert server["socket"][0] == "127.0.0.1"
+    assert server["ready_payload"]["release_identity"] == release.digest

@@ -126,7 +126,7 @@ def test_no_legacy_polar_packages_remain() -> None:
     assert not (REPO_ROOT / "src" / "polar_evolution").exists()
 
 
-def test_only_backend_console_script_is_public() -> None:
+def test_only_backend_maintenance_scripts_are_public() -> None:
     with (REPO_ROOT / "pyproject.toml").open("rb") as handle:
         pyproject = tomllib.load(handle)
 
@@ -135,7 +135,10 @@ def test_only_backend_console_script_is_public() -> None:
     assert "polar" not in scripts
     assert "polar-evolution" not in scripts
     assert "openevo" not in scripts
-    assert scripts == {"openevo-backend": "openevo.backend.launcher:main"}
+    assert scripts == {
+        "openevo-backend": "openevo.backend.launcher:main",
+        "openevo-core-service": "openevo.backend.service:main",
+    }
 
 
 def test_no_public_polar_runtime_identity_remains() -> None:
