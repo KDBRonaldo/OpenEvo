@@ -236,7 +236,6 @@ export function DesktopProductApp({
   const displayedConnectionState = connection.state === "online" && profile && connection.profile_id !== profile.profile_id
     ? "disconnected"
     : connection.state;
-  const capabilities = readyCapabilities(snapshot, project);
   const startReason = getStartReason(snapshot, project, profile, activeRun, actionState);
   const canStart = startReason === null;
 
@@ -370,7 +369,7 @@ export function DesktopProductApp({
           project={creatingProject ? null : project}
           profileId={profile?.profile_id ?? null}
           capability={snapshot.capability}
-          capabilities={capabilities}
+          capabilities={readyCapabilities(snapshot, creatingProject ? null : project)}
           busy={actionState === "working"}
           onClose={() => {
             const pending = pendingProjectActivation.current;
@@ -694,7 +693,7 @@ function ResearchWorkspace({
           </div>
           <div className="brief-body">{project.task.objective}</div>
           <div className="brief-footer">
-            <div><span>Mode</span><strong>{project.execution.mode === "self-deployed" ? "Managed model" : "Subscription"}</strong></div>
+            <div><span>Mode</span><strong>{project.execution.mode === "self-deployed" ? "Self-deployed" : "Subscription"}</strong></div>
             <div><span>Capture</span><strong>Session transcript</strong></div>
             <div><span>Evolution</span><strong>{Object.values(project.evolution.targets).filter((target) => target.enabled).length} targets</strong></div>
           </div>
@@ -1297,7 +1296,7 @@ function SettingsDrawer({
   const [mode, setMode] = useState(project?.execution.mode ?? "codex_subscription_transcript");
   const [hfModel, setHfModel] = useState(project?.execution.hf_model ?? DEFAULT_HF_MODEL);
   const [codexModel, setCodexModel] = useState(project?.execution.codex_model ?? DEFAULT_CODEX_MODEL);
-  const [evolution, setEvolution] = useState<ProductEvolutionTargets>(project?.evolution.targets ?? defaultEvolution(capabilities));
+  const [evolution, setEvolution] = useState<ProductEvolutionTargets>(project?.evolution.targets ?? {});
   const [dirty, setDirty] = useState(false);
   const [retryingCapabilities, setRetryingCapabilities] = useState(false);
   const sourceSelectionGeneration = useRef(0);
@@ -1358,7 +1357,7 @@ function SettingsDrawer({
     setMode(project?.execution.mode ?? "codex_subscription_transcript");
     setHfModel(project?.execution.hf_model ?? DEFAULT_HF_MODEL);
     setCodexModel(project?.execution.codex_model ?? DEFAULT_CODEX_MODEL);
-    setEvolution(project?.evolution.targets ?? defaultEvolution(capabilities));
+    setEvolution(project?.evolution.targets ?? {});
     setDirty(false);
     setSourceError(null);
   };
@@ -1447,7 +1446,7 @@ function SettingsDrawer({
           </section>
           <section className="form-section">
             <h3>Model mode</h3>
-            <div className="segmented-control wide" role="tablist" aria-label="Model mode"><button type="button" role="tab" aria-selected={mode === "self-deployed"} tabIndex={mode === "self-deployed" ? 0 : -1} className={mode === "self-deployed" ? "active" : ""} onClick={() => { setMode("self-deployed"); markDirty(); }}>Managed model</button><button type="button" role="tab" aria-selected={mode === "codex_subscription_transcript"} tabIndex={mode === "codex_subscription_transcript" ? 0 : -1} className={mode === "codex_subscription_transcript" ? "active" : ""} onClick={() => { setMode("codex_subscription_transcript"); markDirty(); }}>Subscription</button></div>
+            <div className="segmented-control wide" role="tablist" aria-label="Model mode"><button type="button" role="tab" aria-selected={mode === "self-deployed"} tabIndex={mode === "self-deployed" ? 0 : -1} className={mode === "self-deployed" ? "active" : ""} onClick={() => { setMode("self-deployed"); markDirty(); }}>Self-deployed</button><button type="button" role="tab" aria-selected={mode === "codex_subscription_transcript"} tabIndex={mode === "codex_subscription_transcript" ? 0 : -1} className={mode === "codex_subscription_transcript" ? "active" : ""} onClick={() => { setMode("codex_subscription_transcript"); markDirty(); }}>Subscription</button></div>
             {mode === "self-deployed" ? <label>Hugging Face model<input value={hfModel} onChange={change(setHfModel)} placeholder="organization/model" /></label> : <label>Codex model<input value={codexModel} onChange={change(setCodexModel)} placeholder="Model name" /></label>}
             <p className="form-help">Sessions use transcript capture. Token-level metrics are unavailable in this mode.</p>
           </section>
@@ -1644,14 +1643,6 @@ function enableTarget(row: EvolutionTargetConfigRow): ProductEvolutionTargets[st
   const defaultChoice = row.choices.find((choice) => choice.id === row.capability?.effective_default_method_id && choice.kind === "method" && choice.supported);
   if (!defaultChoice?.id) return row.selection;
   return { enabled: true, method: defaultChoice.id, config: {} };
-}
-
-function defaultEvolution(capabilities: EvolutionCapabilitiesV1 | null): ProductEvolutionTargets {
-  return Object.fromEntries((capabilities?.targets ?? []).filter((target) => target.exposure === "desktop" && target.effective_default_method_id !== null).map((target) => [target.target_id, {
-    enabled: true,
-    method: target.effective_default_method_id,
-    config: {},
-  }])) as ProductEvolutionTargets;
 }
 
 function selfDeployedExecution(hfModel: string): ProjectV1["execution"] {
@@ -1921,7 +1912,12 @@ function isWorkspaceSelectionCancelled(error: unknown): boolean {
 function readyCapabilities(snapshot: DesktopProductSnapshot, project: ProjectV1 | null): EvolutionCapabilitiesV1 | null {
   const state = snapshot.capability;
   if (!project || !state || state.status !== "ready") return null;
-  return state.projectId === project.project_id && state.executionMode === project.execution.mode ? state.value.capabilities : null;
+  return state.projectId === project.project_id
+    && state.executionMode === project.execution.mode
+    && state.value.project_id === project.project_id
+    && capabilityExecutionMode(state.value.capabilities) === project.execution.mode
+    ? state.value.capabilities
+    : null;
 }
 
 function capabilityExecutionMode(capabilities: EvolutionCapabilitiesV1): ProjectV1["execution"]["mode"] {

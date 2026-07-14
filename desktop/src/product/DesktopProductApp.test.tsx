@@ -220,6 +220,47 @@ describe("DesktopProductApp", () => {
     });
   });
 
+  it("creates a subscription project without inheriting the selected self-deployed project's capabilities", async () => {
+    provider = createFixtureDesktopProductProvider({ startOnline: true });
+    const before = await provider.refresh();
+    if (before.status !== "fresh") throw new Error("Expected a fresh fixture snapshot.");
+    expect(before.snapshot.capability).toMatchObject({ status: "ready", executionMode: "self-deployed" });
+    root = await renderProduct(provider);
+
+    await clickAria("Create project");
+    expect(button("Subscription").getAttribute("aria-selected")).toBe("true");
+    expect(document.querySelectorAll(".target-toggle")).toHaveLength(0);
+    setInput("Objective", "Keep subscription defaults scoped to this new project.");
+    await clickButton("Save");
+
+    const refreshed = await provider.refresh();
+    if (refreshed.status !== "fresh") throw new Error("Expected a fresh fixture snapshot.");
+    const created = refreshed.snapshot.projects.find((project) => project.task.objective === "Keep subscription defaults scoped to this new project.");
+    expect(created?.execution).toMatchObject({ mode: "codex_subscription_transcript", codex_model: "gpt-5.5" });
+    expect(created?.evolution.targets).toEqual({});
+  });
+
+  it("does not reuse another project's same-mode capabilities after a new-project mode switch", async () => {
+    provider = createFixtureDesktopProductProvider({ startOnline: true });
+    root = await renderProduct(provider);
+
+    expect(screenText()).toContain("Self-deployed");
+    expect(screenText()).not.toContain("Managed model");
+    await clickAria("Create project");
+    await clickButton("Self-deployed");
+    expect(button("Self-deployed").getAttribute("aria-selected")).toBe("true");
+    expect(labelledControl<HTMLInputElement>("Hugging Face model", "input").value).toBe("Qwen/Qwen3-8B");
+    expect(document.querySelectorAll(".target-toggle")).toHaveLength(0);
+    setInput("Objective", "Keep self-deployed defaults scoped to this new project.");
+    await clickButton("Save");
+
+    const refreshed = await provider.refresh();
+    if (refreshed.status !== "fresh") throw new Error("Expected a fresh fixture snapshot.");
+    const created = refreshed.snapshot.projects.find((project) => project.task.objective === "Keep self-deployed defaults scoped to this new project.");
+    expect(created?.execution).toMatchObject({ mode: "self-deployed", hf_model: "Qwen/Qwen3-8B" });
+    expect(created?.evolution.targets).toEqual({});
+  });
+
   it("lets an older unsupported credential profile migrate to SSH agent", async () => {
     provider = createFixtureDesktopProductProvider();
     await provider.createProfile({
@@ -445,8 +486,13 @@ describe("DesktopProductApp", () => {
     expect(resolver?.textContent).toContain("Automatic");
   });
 
-  it("fails closed across mode changes until the saved project receives matching capabilities", async () => {
+  it("preserves explicit evolution config across mode changes without reusing old-mode capabilities", async () => {
     provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
+    provider.useEditableMethodSchemaWithPartialOverride();
+    const before = await provider.refresh();
+    if (before.status !== "fresh") throw new Error("Expected a fresh fixture snapshot.");
+    const explicitTargets = before.snapshot.projects[0]?.evolution.targets;
+    if (!explicitTargets) throw new Error("Expected an existing project with explicit evolution targets.");
     root = await renderProduct(provider);
 
     await clickAria("Project settings");
@@ -455,7 +501,10 @@ describe("DesktopProductApp", () => {
     await clickButton("Save");
 
     expect(screenText()).not.toContain("Research configuration");
-    expect(button("Start session").disabled).toBe(false);
+    expect(button("Start session").disabled).toBe(true);
+    const refreshed = await provider.refresh();
+    if (refreshed.status !== "fresh") throw new Error("Expected a fresh fixture snapshot.");
+    expect(refreshed.snapshot.projects[0]?.evolution.targets).toEqual(explicitTargets);
   });
 
   it("retries unavailable capabilities for the same project and mode without losing the draft", async () => {
