@@ -22,18 +22,35 @@ budgets, body padding, checksum, and exact terminator. Neither the archive nor a
 archive file body is buffered in full.
 
 Initialization opens every absolute ancestor component with no-follow directory
-semantics and retains stable parent/root descriptors. A separate mode-`0600`
-authentication key signs the canonical parent/root binding marker and import
-metadata. The marker binds a random store token to the parent and root inode; the
-same token is stored as a durable root xattr. Fresh creation uses a durable
-pending marker, fsyncs the new parent entry, fsyncs the root token, publishes the
-final marker, and only then removes the pending marker. Every operation reopens
-the ancestor chain and verifies the key, marker, parent, root pathname, held root
-FD, and xattr. During one process lifetime, held descriptors detect replacement
-at operation boundaries. After restart, missing keys and keys that no longer
-authenticate existing state fail closed; ancestor/root/marker/xattr replacement
-is detected while the separate key remains confidential and unmodified and the
-owner-only state directory has retained its integrity.
+semantics and retains stable parent/root descriptors. First initialization is
+serialized by a root-name-scoped private file in the parent directory; every
+process locks and revalidates that file before reading or advancing bootstrap
+state. A closed, authenticated bootstrap record temporarily holds the generated
+authentication key and store token. The separate mode-`0600` authentication key
+then signs the canonical parent/root binding marker and import metadata. The
+marker binds the store token to the parent and root inode; the same token is
+stored as a durable root xattr.
+
+The bootstrap record, authentication key, pending marker, and final marker are
+each written to a random private temporary inode, fsynced, identity-checked, and
+atomically published with a no-replace rename before the parent directory is
+fsynced. A failed pre-publish attempt cleans up only the inode identity recorded
+at creation. An interrupted process may leave an unpublished random temporary;
+later initialization neither trusts nor removes that unknown pathname. The
+authenticated bootstrap record lets a fresh store resume after key publication,
+while a key without bootstrap, authenticated pending, or final state fails
+closed. Fresh creation publishes the pending marker, fsyncs the new root parent
+entry and root token, publishes the final marker, and only then removes pending
+and bootstrap records. The existing root lock continues to serialize recovery
+and import operations after binding completes.
+
+Every operation reopens the ancestor chain and verifies the key, marker, parent,
+root pathname, held root FD, and xattr. During one process lifetime, held
+descriptors detect replacement at operation boundaries. After restart, missing
+keys and keys that no longer authenticate existing state fail closed;
+ancestor/root/marker/xattr replacement is detected while the separate key
+remains confidential and unmodified and the owner-only state directory has
+retained its integrity.
 
 The store root and import directories are mode `0700`; archive and closed
 metadata files are mode `0600` and link-count one. A random opaque import ID is

@@ -52,8 +52,13 @@ _ROOT_MARKER_PREFIX = ".openevo-workspace-import-root-"
 _ROOT_MARKER_MAX_BYTES = 2048
 _AUTH_KEY_PREFIX = ".openevo-workspace-import-auth-"
 _AUTH_KEY_BYTES = 32
+_BOOTSTRAP_PREFIX = ".openevo-workspace-import-bootstrap-"
+_CREATION_LOCK_PREFIX = ".openevo-workspace-import-creation-lock-"
+_INITIALIZATION_TEMP_PREFIX = ".openevo-workspace-import-init-tmp-"
 _ROOT_AUTH_DOMAIN = b"openevo.workspace-import.root.v2\0"
 _METADATA_AUTH_DOMAIN = b"openevo.workspace-import.metadata.v2\0"
+_BOOTSTRAP_AUTH_DOMAIN = b"openevo.workspace-import.bootstrap.v1\0"
+_CREATION_LOCK_CONTENT = b"openevo.workspace-import.creation-lock.v1\n"
 _IMPORT_ID_RE = re.compile(r"^workspace-import-[0-9a-f]{48}$")
 _DEFAULT_RECONCILE_MAX_NODES = 300_000
 _DEFAULT_RECONCILE_MAX_BYTES = 64 * 1024 * 1024 * 1024
@@ -250,6 +255,16 @@ class _RootMarker:
     authentication: str = ""
 
 
+@dataclass(frozen=True, slots=True)
+class _InitializationBootstrap:
+    store_token: str
+    authentication_key: bytes
+    root_name: str
+    parent_device: int
+    parent_inode: int
+    authentication: str = ""
+
+
 def _root_marker_payload(marker: _RootMarker) -> dict[str, object]:
     payload: dict[str, object] = {
         "parent_identity": {
@@ -301,6 +316,43 @@ def _authenticated_root_marker(marker: _RootMarker, key: bytes) -> _RootMarker:
 def _canonical_root_marker(marker: _RootMarker) -> bytes:
     payload = _root_marker_payload(marker)
     payload["authentication"] = marker.authentication
+    return _canonical_json(payload)
+
+
+def _bootstrap_payload(bootstrap: _InitializationBootstrap) -> dict[str, object]:
+    return {
+        "authentication_key": bootstrap.authentication_key.hex(),
+        "parent_identity": {
+            "device": bootstrap.parent_device,
+            "inode": bootstrap.parent_inode,
+        },
+        "root_name": bootstrap.root_name,
+        "schema_version": "1",
+        "store_token": bootstrap.store_token,
+    }
+
+
+def _authenticated_bootstrap(
+    bootstrap: _InitializationBootstrap,
+) -> _InitializationBootstrap:
+    authentication = _authentication(
+        bootstrap.authentication_key,
+        _BOOTSTRAP_AUTH_DOMAIN,
+        _canonical_json(_bootstrap_payload(bootstrap)),
+    )
+    return _InitializationBootstrap(
+        store_token=bootstrap.store_token,
+        authentication_key=bootstrap.authentication_key,
+        root_name=bootstrap.root_name,
+        parent_device=bootstrap.parent_device,
+        parent_inode=bootstrap.parent_inode,
+        authentication=authentication,
+    )
+
+
+def _canonical_bootstrap(bootstrap: _InitializationBootstrap) -> bytes:
+    payload = _bootstrap_payload(bootstrap)
+    payload["authentication"] = bootstrap.authentication
     return _canonical_json(payload)
 
 
@@ -421,6 +473,14 @@ def _after_import_publish(_root_descriptor: int, _import_id: str) -> None:
 
 def _after_fresh_root_parent_fsync(_parent_descriptor: int, _root_name: str) -> None:
     """Private fault-injection hook."""
+
+
+def _initialization_file_fault_point(
+    _kind: str,
+    _stage: str,
+    _descriptor: int,
+) -> None:
+    """Private fault-injection hook for initialization file publication."""
 
 
 def _before_snapshot_commit(_root_descriptor: int, _archive_descriptor: int) -> None:
@@ -724,6 +784,8 @@ class WorkspaceImportStore:
         self._marker_name = f"{_ROOT_MARKER_PREFIX}{marker_suffix}.json"
         self._pending_marker_name = f"{self._marker_name}.pending"
         self._auth_key_name = f"{_AUTH_KEY_PREFIX}{marker_suffix}.key"
+        self._bootstrap_name = f"{_BOOTSTRAP_PREFIX}{marker_suffix}.json"
+        self._creation_lock_name = f"{_CREATION_LOCK_PREFIX}{marker_suffix}.lock"
         self._auth_key_descriptor = -1
         self._auth_key_identity = (0, 0)
         self._auth_key = b""
@@ -846,45 +908,205 @@ class WorkspaceImportStore:
             os.close(descriptor)
             raise
 
-    def _prepare_authentication_key(self, parent_descriptor: int) -> None:
+    @staticmethod
+    def _parent_entry_exists(parent_descriptor: int, name: str) -> bool:
         try:
             os.stat(
-                self._auth_key_name,
+                name,
                 dir_fd=parent_descriptor,
                 follow_symlinks=False,
             )
         except FileNotFoundError:
+            return False
+        return True
+
+    @staticmethod
+    def _discard_created_parent_file(
+        parent_descriptor: int,
+        name: str,
+        expected_identity: tuple[int, int],
+    ) -> None:
+        try:
+            observed = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        if (observed.st_dev, observed.st_ino) != expected_identity:
+            raise WorkspaceImportStoreConfigurationError(
+                "workspace import initialization temporary changed during cleanup"
+            )
+        quarantine = f"{_QUARANTINE_PREFIX}{secrets.token_hex(24)}"
+        _quarantine_noreplace(name, quarantine, directory_fd=parent_descriptor)
+        moved = os.stat(quarantine, dir_fd=parent_descriptor, follow_symlinks=False)
+        if (moved.st_dev, moved.st_ino) != expected_identity:
+            raise WorkspaceImportStoreConfigurationError(
+                "workspace import initialization temporary changed during cleanup"
+            )
+        os.unlink(quarantine, dir_fd=parent_descriptor)
+        os.fsync(parent_descriptor)
+
+    def _publish_initialization_file(
+        self,
+        parent_descriptor: int,
+        target_name: str,
+        content: bytes,
+        *,
+        kind: str,
+        allow_existing: bool = False,
+        inject_faults: bool = True,
+    ) -> bool:
+        if len(content) > _ROOT_MARKER_MAX_BYTES:
+            raise WorkspaceImportStoreConfigurationError(
+                "workspace import initialization file exceeds its byte limit"
+            )
+        temporary_name = f"{_INITIALIZATION_TEMP_PREFIX}{secrets.token_hex(24)}"
+        descriptor = os.open(
+            temporary_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=parent_descriptor,
+        )
+        created = os.fstat(descriptor)
+        created_identity = (created.st_dev, created.st_ino)
+        published = False
+        try:
+            os.fchmod(descriptor, 0o600)
+            if inject_faults:
+                _initialization_file_fault_point(kind, "before_write", descriptor)
+            _write_all(descriptor, content)
+            if inject_faults:
+                _initialization_file_fault_point(kind, "before_file_fsync", descriptor)
+            os.fsync(descriptor)
+            written = os.fstat(descriptor)
+            self._require_private_marker(
+                written,
+                label="workspace import initialization temporary",
+            )
+            current = os.stat(
+                temporary_name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+            if (
+                (written.st_dev, written.st_ino) != created_identity
+                or not _same_inode(written, current)
+                or written.st_size != len(content)
+            ):
+                raise WorkspaceImportStoreConfigurationError(
+                    "workspace import initialization temporary changed before publication"
+                )
             try:
-                existing_root = os.stat(
-                    self._root_name,
+                _rename_noreplace(
+                    temporary_name,
+                    target_name,
+                    directory_fd=parent_descriptor,
+                )
+            except FileExistsError:
+                if not allow_existing:
+                    raise
+                return False
+            published = True
+            target = os.stat(
+                target_name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+            if not _same_inode(written, target):
+                raise WorkspaceImportStoreConfigurationError(
+                    "workspace import initialization file changed during publication"
+                )
+            if inject_faults:
+                _initialization_file_fault_point(kind, "before_parent_fsync", parent_descriptor)
+            os.fsync(parent_descriptor)
+            return True
+        finally:
+            try:
+                os.close(descriptor)
+            finally:
+                if not published:
+                    self._discard_created_parent_file(
+                        parent_descriptor,
+                        temporary_name,
+                        created_identity,
+                    )
+
+    @contextmanager
+    def _locked_parent_creation(self, parent_descriptor: int) -> Iterator[None]:
+        with _thread_lock_for(self._root):
+            self._publish_initialization_file(
+                parent_descriptor,
+                self._creation_lock_name,
+                _CREATION_LOCK_CONTENT,
+                kind="creation_lock",
+                allow_existing=True,
+                inject_faults=False,
+            )
+            try:
+                descriptor = os.open(
+                    self._creation_lock_name,
+                    _FILE_READ_FLAGS,
+                    dir_fd=parent_descriptor,
+                )
+            except OSError as exc:
+                raise WorkspaceImportStoreConfigurationError(
+                    "workspace import creation lock is unavailable"
+                ) from exc
+            locked = False
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX)
+                locked = True
+                before = os.fstat(descriptor)
+                self._require_private_marker(before, label="workspace import creation lock")
+                content = os.pread(descriptor, len(_CREATION_LOCK_CONTENT) + 1, 0)
+                after = os.fstat(descriptor)
+                current = os.stat(
+                    self._creation_lock_name,
                     dir_fd=parent_descriptor,
                     follow_symlinks=False,
                 )
-            except FileNotFoundError:
-                existing_root = None
-            if existing_root is not None:
-                self._require_private_directory(
-                    existing_root,
-                    label="workspace import root",
+                if (
+                    content != _CREATION_LOCK_CONTENT
+                    or _identity(before) != _identity(after)
+                    or not _same_inode(after, current)
+                ):
+                    raise WorkspaceImportStoreConfigurationError(
+                        "workspace import creation lock binding is invalid"
+                    )
+                yield
+                held = os.fstat(descriptor)
+                self._require_private_marker(held, label="workspace import creation lock")
+                final = os.stat(
+                    self._creation_lock_name,
+                    dir_fd=parent_descriptor,
+                    follow_symlinks=False,
                 )
-                raise WorkspaceImportStoreConfigurationError(
-                    "workspace import existing root has no authentication key"
-                )
-            for name in (self._marker_name, self._pending_marker_name):
+                if _identity(after) != _identity(held) or not _same_inode(held, final):
+                    raise WorkspaceImportStoreConfigurationError(
+                        "workspace import creation lock binding changed"
+                    )
+            finally:
                 try:
-                    os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
-                except FileNotFoundError:
-                    continue
-                raise WorkspaceImportStoreConfigurationError(
-                    "workspace import marker has no authentication key"
-                ) from None
-            self._create_private_file(
+                    if locked:
+                        fcntl.flock(descriptor, fcntl.LOCK_UN)
+                finally:
+                    os.close(descriptor)
+
+    def _prepare_authentication_key(
+        self,
+        parent_descriptor: int,
+        expected_key: bytes,
+    ) -> None:
+        if not self._parent_entry_exists(parent_descriptor, self._auth_key_name):
+            self._publish_initialization_file(
                 parent_descriptor,
                 self._auth_key_name,
-                secrets.token_bytes(_AUTH_KEY_BYTES),
+                expected_key,
+                kind="auth_key",
             )
-            os.fsync(parent_descriptor)
         self._open_authentication_key(parent_descriptor)
+        if not hmac.compare_digest(self._auth_key, expected_key):
+            raise WorkspaceImportStoreConfigurationError(
+                "workspace import authentication key conflicts with initialization record"
+            )
 
     def _read_root_marker(self, parent_descriptor: int, name: str) -> _RootMarker | None:
         try:
@@ -984,22 +1206,106 @@ class WorkspaceImportStore:
         finally:
             os.close(descriptor)
 
-    @staticmethod
-    def _create_private_file(parent_descriptor: int, name: str, content: bytes) -> None:
-        if len(content) > _ROOT_MARKER_MAX_BYTES:
-            raise WorkspaceImportStoreConfigurationError(
-                "workspace import root marker exceeds its byte limit"
-            )
-        descriptor = os.open(
-            name,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
-            0o600,
-            dir_fd=parent_descriptor,
-        )
+    def _read_bootstrap(
+        self,
+        parent_descriptor: int,
+    ) -> _InitializationBootstrap | None:
         try:
-            os.fchmod(descriptor, 0o600)
-            _write_all(descriptor, content)
-            os.fsync(descriptor)
+            descriptor = os.open(
+                self._bootstrap_name,
+                _FILE_READ_FLAGS,
+                dir_fd=parent_descriptor,
+            )
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise WorkspaceImportStoreConfigurationError(
+                "workspace import bootstrap record is unavailable"
+            ) from exc
+        try:
+            before = os.fstat(descriptor)
+            self._require_private_marker(before, label="workspace import bootstrap record")
+            if before.st_size > _ROOT_MARKER_MAX_BYTES:
+                raise WorkspaceImportStoreConfigurationError(
+                    "workspace import bootstrap record exceeds its byte limit"
+                )
+            raw = self._read_bounded_file(
+                descriptor,
+                before.st_size,
+                label="workspace import bootstrap record",
+            )
+            after = os.fstat(descriptor)
+            current = os.stat(
+                self._bootstrap_name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+            if _identity(before) != _identity(after) or not _same_inode(after, current):
+                raise WorkspaceImportStoreConfigurationError(
+                    "workspace import bootstrap record changed while reading"
+                )
+            try:
+                payload = json.loads(raw)
+                expected = {
+                    "authentication",
+                    "authentication_key",
+                    "parent_identity",
+                    "root_name",
+                    "schema_version",
+                    "store_token",
+                }
+                if (
+                    not isinstance(payload, dict)
+                    or set(payload) != expected
+                    or payload["schema_version"] != "1"
+                ):
+                    raise ValueError("bootstrap fields are not closed")
+                parent = payload["parent_identity"]
+                if not isinstance(parent, dict) or set(parent) != {"device", "inode"}:
+                    raise ValueError("bootstrap parent identity is invalid")
+                if any(
+                    isinstance(value, bool) or not isinstance(value, int) or value < 0
+                    for value in parent.values()
+                ):
+                    raise ValueError("bootstrap parent identity is invalid")
+                store_token = payload["store_token"]
+                key_hex = payload["authentication_key"]
+                authentication = payload["authentication"]
+                if (
+                    not isinstance(store_token, str)
+                    or re.fullmatch(r"[0-9a-f]{64}", store_token) is None
+                    or not isinstance(key_hex, str)
+                    or re.fullmatch(r"[0-9a-f]{64}", key_hex) is None
+                    or not isinstance(authentication, str)
+                    or re.fullmatch(r"[0-9a-f]{64}", authentication) is None
+                    or payload["root_name"] != self._root_name
+                ):
+                    raise ValueError("bootstrap values are invalid")
+                bootstrap = _InitializationBootstrap(
+                    store_token=store_token,
+                    authentication_key=bytes.fromhex(key_hex),
+                    root_name=payload["root_name"],
+                    parent_device=parent["device"],
+                    parent_inode=parent["inode"],
+                    authentication=authentication,
+                )
+            except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+                raise WorkspaceImportStoreConfigurationError(
+                    "workspace import bootstrap record is invalid"
+                ) from exc
+            if raw != _canonical_bootstrap(bootstrap):
+                raise WorkspaceImportStoreConfigurationError(
+                    "workspace import bootstrap record is not canonical"
+                )
+            authenticated = _authenticated_bootstrap(bootstrap)
+            if not hmac.compare_digest(
+                bootstrap.authentication,
+                authenticated.authentication,
+            ):
+                raise WorkspaceImportStoreConfigurationError(
+                    "workspace import bootstrap authentication failed"
+                )
+            return bootstrap
         finally:
             os.close(descriptor)
 
@@ -1048,12 +1354,12 @@ class WorkspaceImportStore:
         )
         existing = self._read_root_marker(self._parent_descriptor, self._marker_name)
         if existing is None:
-            self._create_private_file(
+            self._publish_initialization_file(
                 self._parent_descriptor,
                 self._marker_name,
                 _canonical_root_marker(final),
+                kind="final_marker",
             )
-            os.fsync(self._parent_descriptor)
         elif existing != final:
             raise WorkspaceImportStoreConfigurationError(
                 "workspace import root binding marker conflicts with recovery"
@@ -1067,7 +1373,74 @@ class WorkspaceImportStore:
         self._ancestor_identities = ancestor_identities
         parent_status = os.fstat(parent_descriptor)
         parent_identity = (parent_status.st_dev, parent_status.st_ino)
-        self._prepare_authentication_key(parent_descriptor)
+        with self._locked_parent_creation(parent_descriptor):
+            self._prepare_root_under_creation_lock(parent_identity)
+
+    def _prepare_root_under_creation_lock(
+        self,
+        parent_identity: tuple[int, int],
+    ) -> None:
+        parent_descriptor = self._parent_descriptor
+        bootstrap = self._read_bootstrap(parent_descriptor)
+        key_exists = self._parent_entry_exists(parent_descriptor, self._auth_key_name)
+        final_exists = self._parent_entry_exists(parent_descriptor, self._marker_name)
+        pending_exists = self._parent_entry_exists(
+            parent_descriptor,
+            self._pending_marker_name,
+        )
+        root_exists = self._parent_entry_exists(parent_descriptor, self._root_name)
+
+        if bootstrap is not None:
+            if (bootstrap.parent_device, bootstrap.parent_inode) != parent_identity:
+                raise WorkspaceImportStoreConfigurationError(
+                    "workspace import bootstrap parent binding changed"
+                )
+            if not key_exists and (final_exists or pending_exists or root_exists):
+                raise WorkspaceImportStoreConfigurationError(
+                    "workspace import bootstrap state is out of order"
+                )
+        elif not key_exists:
+            if root_exists:
+                existing_root = os.stat(
+                    self._root_name,
+                    dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+                self._require_private_directory(
+                    existing_root,
+                    label="workspace import root",
+                )
+                raise WorkspaceImportStoreConfigurationError(
+                    "workspace import existing root has no authentication key"
+                )
+            if final_exists or pending_exists:
+                raise WorkspaceImportStoreConfigurationError(
+                    "workspace import marker has no authentication key"
+                )
+            bootstrap = _authenticated_bootstrap(
+                _InitializationBootstrap(
+                    store_token=secrets.token_hex(32),
+                    authentication_key=secrets.token_bytes(_AUTH_KEY_BYTES),
+                    root_name=self._root_name,
+                    parent_device=parent_identity[0],
+                    parent_inode=parent_identity[1],
+                )
+            )
+            self._publish_initialization_file(
+                parent_descriptor,
+                self._bootstrap_name,
+                _canonical_bootstrap(bootstrap),
+                kind="bootstrap",
+            )
+
+        if bootstrap is not None:
+            expected_key = bootstrap.authentication_key
+        else:
+            self._open_authentication_key(parent_descriptor)
+            expected_key = self._auth_key
+        if self._auth_key_descriptor < 0:
+            self._prepare_authentication_key(parent_descriptor, expected_key)
+
         final = self._read_root_marker(parent_descriptor, self._marker_name)
         pending = self._read_root_marker(parent_descriptor, self._pending_marker_name)
         if final is not None and (final.root_device is None or final.root_inode is None):
@@ -1080,35 +1453,42 @@ class WorkspaceImportStore:
             raise WorkspaceImportStoreConfigurationError(
                 "workspace import pending root marker already has a root identity"
             )
+        if bootstrap is not None:
+            for marker in (final, pending):
+                if marker is not None and marker.store_token != bootstrap.store_token:
+                    raise WorkspaceImportStoreConfigurationError(
+                        "workspace import bootstrap conflicts with root marker"
+                    )
         if final is None and pending is None:
-            try:
+            if root_exists:
                 existing = os.stat(
                     self._root_name,
                     dir_fd=parent_descriptor,
                     follow_symlinks=False,
                 )
-            except FileNotFoundError:
-                existing = None
-            if existing is not None:
                 self._require_private_directory(existing, label="workspace import root")
                 raise WorkspaceImportStoreConfigurationError(
                     "workspace import existing root has no durable binding marker"
                 )
+            if bootstrap is None:
+                raise WorkspaceImportStoreConfigurationError(
+                    "workspace import authentication key has no initialization record"
+                )
             pending = _authenticated_root_marker(
                 _RootMarker(
-                    store_token=secrets.token_hex(32),
+                    store_token=bootstrap.store_token,
                     root_name=self._root_name,
                     parent_device=parent_identity[0],
                     parent_inode=parent_identity[1],
                 ),
                 self._auth_key,
             )
-            self._create_private_file(
+            self._publish_initialization_file(
                 parent_descriptor,
                 self._pending_marker_name,
                 _canonical_root_marker(pending),
+                kind="pending_marker",
             )
-            os.fsync(parent_descriptor)
         selected = final or pending
         assert selected is not None
         if (selected.parent_device, selected.parent_inode) != parent_identity:
@@ -1190,6 +1570,8 @@ class WorkspaceImportStore:
                 self._remove_parent_marker(self._pending_marker_name)
         self._root_identity = (root_status.st_dev, root_status.st_ino)
         self._root_marker = final
+        if bootstrap is not None:
+            self._remove_parent_marker(self._bootstrap_name)
 
     @staticmethod
     def _require_private_directory(value: os.stat_result, *, label: str) -> None:

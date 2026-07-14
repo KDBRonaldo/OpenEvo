@@ -206,6 +206,35 @@ def _process_capacity_ingest(
         results.put(("error", repr(exc)))
 
 
+def _process_initialize_store(
+    root: str,
+    results: multiprocessing.Queue[object],
+    started: multiprocessing.synchronize.Event,
+    finished: multiprocessing.synchronize.Event,
+    entered_auth_write: multiprocessing.synchronize.Event | None = None,
+    release_auth_write: multiprocessing.synchronize.Event | None = None,
+) -> None:
+    try:
+        if entered_auth_write is not None and release_auth_write is not None:
+
+            def hold_auth_write(kind: str, stage: str, _descriptor: int) -> None:
+                if kind == "auth_key" and stage == "before_write":
+                    entered_auth_write.set()
+                    if not release_auth_write.wait(timeout=10):
+                        raise TimeoutError("timed out waiting to release auth-key creation")
+
+            workspace_imports_module._initialization_file_fault_point = hold_auth_write
+        started.set()
+        store = WorkspaceImportStore(root)
+        identity = store._root_identity
+        store.close()
+        results.put(("ok", identity))
+    except BaseException as exc:
+        results.put(("error", repr(exc)))
+    finally:
+        finished.set()
+
+
 def test_ingest_returns_exact_contract_ref_and_verified_handle(tmp_path: Path) -> None:
     root = tmp_path / "imports"
     store = WorkspaceImportStore(root)
@@ -1273,6 +1302,152 @@ def test_fresh_root_marker_recovers_after_parent_entry_fsync_crash(
     import_ref = _ingest(restarted, tmp_path, _simple_archive())
     with restarted.resolve(import_ref, ownership=_ownership(import_ref)) as stream:
         assert stream.read() == _simple_archive()
+
+
+@pytest.mark.parametrize("kind", ["auth_key", "pending_marker", "final_marker"])
+@pytest.mark.parametrize(
+    "stage",
+    ["before_write", "before_file_fsync", "before_parent_fsync"],
+)
+def test_initialization_file_publication_recovers_from_write_and_fsync_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    kind: str,
+    stage: str,
+) -> None:
+    parent = tmp_path / "state"
+    root = parent / "imports"
+    parent.mkdir(mode=0o700)
+    marker_suffix = hashlib.sha256(os.fsencode(root.name)).hexdigest()[:32]
+    marker_name = f"{workspace_imports_module._ROOT_MARKER_PREFIX}{marker_suffix}.json"
+    target_names = {
+        "auth_key": f"{workspace_imports_module._AUTH_KEY_PREFIX}{marker_suffix}.key",
+        "pending_marker": f"{marker_name}.pending",
+        "final_marker": marker_name,
+    }
+    injected = False
+
+    def fail_operation(observed_kind: str, observed_stage: str, descriptor: int) -> None:
+        nonlocal injected
+        if injected or (observed_kind, observed_stage) != (kind, stage):
+            return
+        injected = True
+        if stage == "before_write":
+            os.write(descriptor, b"partial")
+        raise OSError(errno.EIO, f"injected {kind} {stage} failure")
+
+    monkeypatch.setattr(
+        workspace_imports_module,
+        "_initialization_file_fault_point",
+        fail_operation,
+    )
+    with pytest.raises(OSError, match=f"injected {kind} {stage} failure"):
+        WorkspaceImportStore(root)
+    assert injected
+
+    target = parent / target_names[kind]
+    if stage == "before_parent_fsync":
+        assert target.is_file()
+    else:
+        assert not target.exists()
+
+    monkeypatch.setattr(
+        workspace_imports_module,
+        "_initialization_file_fault_point",
+        lambda *_args: None,
+    )
+    restarted = WorkspaceImportStore(root)
+    assert restarted._root_identity == (root.stat().st_dev, root.stat().st_ino)
+    restarted.close()
+    assert not any(
+        entry.name.startswith(workspace_imports_module._INITIALIZATION_TEMP_PREFIX)
+        for entry in parent.iterdir()
+    )
+
+
+def test_concurrent_first_initialization_is_serialized_before_key_publication(
+    tmp_path: Path,
+) -> None:
+    parent = tmp_path / "state"
+    root = parent / "imports"
+    parent.mkdir(mode=0o700)
+    context = multiprocessing.get_context("fork")
+    results: multiprocessing.Queue[object] = context.Queue()
+    first_started = context.Event()
+    first_finished = context.Event()
+    entered_auth_write = context.Event()
+    release_auth_write = context.Event()
+    second_started = context.Event()
+    second_finished = context.Event()
+    first = context.Process(
+        target=_process_initialize_store,
+        args=(
+            str(root),
+            results,
+            first_started,
+            first_finished,
+            entered_auth_write,
+            release_auth_write,
+        ),
+    )
+    second = context.Process(
+        target=_process_initialize_store,
+        args=(str(root), results, second_started, second_finished),
+    )
+
+    first.start()
+    assert first_started.wait(timeout=5)
+    assert entered_auth_write.wait(timeout=5)
+    second.start()
+    assert second_started.wait(timeout=5)
+    assert not second_finished.wait(timeout=0.25)
+    release_auth_write.set()
+    first.join(timeout=10)
+    second.join(timeout=10)
+
+    assert first.exitcode == 0
+    assert second.exitcode == 0
+    observed = [results.get(timeout=2), results.get(timeout=2)]
+    assert all(result[0] == "ok" for result in observed)
+    assert observed[0][1] == observed[1][1]
+    restarted = WorkspaceImportStore(root)
+    assert restarted._root_identity == observed[0][1]
+    restarted.close()
+
+
+def test_restart_does_not_claim_an_unrecorded_authentication_key(tmp_path: Path) -> None:
+    parent = tmp_path / "state"
+    root = parent / "imports"
+    parent.mkdir(mode=0o700)
+    marker_suffix = hashlib.sha256(os.fsencode(root.name)).hexdigest()[:32]
+    key = parent / f"{workspace_imports_module._AUTH_KEY_PREFIX}{marker_suffix}.key"
+    key.write_bytes(os.urandom(workspace_imports_module._AUTH_KEY_BYTES))
+    os.chmod(key, 0o600)
+
+    with pytest.raises(
+        WorkspaceImportStoreConfigurationError,
+        match="authentication key has no initialization record",
+    ):
+        WorkspaceImportStore(root)
+    assert not root.exists()
+    assert key.is_file()
+
+
+def test_restart_preserves_unpublished_initialization_temporary_and_recovers_fresh_root(
+    tmp_path: Path,
+) -> None:
+    parent = tmp_path / "state"
+    root = parent / "imports"
+    parent.mkdir(mode=0o700)
+    interrupted = parent / f"{workspace_imports_module._INITIALIZATION_TEMP_PREFIX}unknown"
+    interrupted.write_bytes(b"partial unknown initialization state")
+    os.chmod(interrupted, 0o600)
+
+    store = WorkspaceImportStore(root)
+
+    assert interrupted.read_bytes() == b"partial unknown initialization state"
+    assert store._root_identity == (root.stat().st_dev, root.stat().st_ino)
+    store.close()
 
 
 def test_ownership_is_atomic_idempotent_and_project_scoped(tmp_path: Path) -> None:
