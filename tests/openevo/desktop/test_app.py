@@ -204,7 +204,12 @@ def test_create_desktop_app_redirects_root_to_openevo(tmp_path: Path) -> None:
     assert response.headers["location"] == "/openevo"
 
 
-def test_create_app_launcher_uses_default_config_root(tmp_path: Path) -> None:
+def test_create_app_launcher_uses_default_config_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
     app = create_app(
         static_root=_static_root(tmp_path),
         native_frame=desktop_launcher._NativeLauncherFrame(
@@ -220,6 +225,13 @@ def test_create_app_launcher_uses_default_config_root(tmp_path: Path) -> None:
         assert client.get("/openevo").status_code == 200
         assert client.get("/openevo-api/desktop/shell").status_code == 404
     assert DEFAULT_DESKTOP_CONFIG_ROOT.as_posix() == "~/.openevo/desktop"
+    assert (
+        home
+        / ".openevo"
+        / "desktop"
+        / desktop_launcher.LOCAL_API_STATE_DIRECTORY
+        / "provider.sqlite3"
+    ).is_file()
 
 
 def _native_instance_frame(
