@@ -727,14 +727,24 @@ describe("DesktopProductApp", () => {
 
     await clickAria("Project settings");
     setInput("Objective", "Keep editing after invalidating the first picker.");
-    await clickButton("Folder snapshot");
+    const folderButton = button("Folder snapshot");
+    await clickElement(folderButton);
     await clickAria("Close settings");
     expect(screenText()).toContain("Discard unsaved changes?");
+    await clickButton("Keep editing");
+
+    expect(folderButton.disabled).toBe(true);
+    await clickElement(folderButton);
+    expect(selectSource).toHaveBeenCalledTimes(1);
+    expect(screenText()).toContain("Keep editing after invalidating the first picker.");
+    expect(screenText()).toContain("New workspace");
+    expect(document.querySelector(".form-error")).toBeNull();
+
     await act(async () => first.resolve({ ...selected, display_name: "Stale research folder" }));
     await flush();
     expect(screenText()).not.toContain("Stale research folder");
 
-    await clickButton("Keep editing");
+    expect(folderButton.disabled).toBe(false);
     await clickButton("Folder snapshot");
     expect(screenText()).toContain("Current research folder");
     expect(selectSource).toHaveBeenCalledTimes(2);

@@ -1089,10 +1089,10 @@ function SettingsDrawer({
   const [retryingCapabilities, setRetryingCapabilities] = useState(false);
   const sourceSelectionGeneration = useRef(0);
   const sourceSelectionInFlight = useRef(false);
+  const sourceSelectionMounted = useRef(true);
   const invalidateSourceSelection = useCallback(() => {
+    // Invalidation suppresses state application; only the request's finally releases the physical lock.
     sourceSelectionGeneration.current += 1;
-    sourceSelectionInFlight.current = false;
-    setSelectingSource(false);
   }, []);
   const close = useCallback(() => {
     invalidateSourceSelection();
@@ -1143,15 +1143,16 @@ function SettingsDrawer({
       if (sourceSelectionGeneration.current !== generation) return;
       if (!isWorkspaceSelectionCancelled(error)) setSourceError(userMessage(error));
     } finally {
-      if (sourceSelectionGeneration.current === generation) {
-        sourceSelectionInFlight.current = false;
-        setSelectingSource(false);
-      }
+      sourceSelectionInFlight.current = false;
+      if (sourceSelectionMounted.current) setSelectingSource(false);
     }
   };
-  useEffect(() => () => {
-    sourceSelectionGeneration.current += 1;
-    sourceSelectionInFlight.current = false;
+  useEffect(() => {
+    sourceSelectionMounted.current = true;
+    return () => {
+      sourceSelectionMounted.current = false;
+      sourceSelectionGeneration.current += 1;
+    };
   }, []);
   const rows = evolutionTargetRows(modeCapabilities, evolution);
   const valid = name.trim().length > 0
