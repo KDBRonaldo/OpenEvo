@@ -12,12 +12,14 @@ class EvolutionClient:
         *,
         timeout_seconds: float = 10.0,
         transport: httpx.AsyncBaseTransport | None = None,
+        headers: dict[str, str] | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self._client = httpx.AsyncClient(
             timeout=timeout_seconds,
             trust_env=False,
             transport=transport,
+            headers=headers,
         )
 
     async def close(self) -> None:

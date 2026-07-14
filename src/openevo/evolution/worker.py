@@ -314,9 +314,15 @@ class EvolutionWorkerClient:
         base_url: str,
         *,
         transport: httpx.BaseTransport | None = None,
+        headers: dict[str, str] | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
-        self._client = httpx.Client(timeout=30.0, trust_env=False, transport=transport)
+        self._client = httpx.Client(
+            timeout=30.0,
+            trust_env=False,
+            transport=transport,
+            headers=headers,
+        )
 
     def __enter__(self) -> EvolutionWorkerClient:
         return self
@@ -354,6 +360,34 @@ class EvolutionWorkerClient:
         )
         response.raise_for_status()
         return response.json().get("job")
+
+    def register_internal_worker(
+        self,
+        *,
+        worker_id: str,
+        framework_lock_digest: str,
+        generation_digest: str,
+        registry_digest: str,
+    ) -> dict[str, str]:
+        response = self._client.post(
+            f"{self.base_url}/v1/internal/workers/register",
+            json={
+                "framework_lock_digest": framework_lock_digest,
+                "generation_digest": generation_digest,
+                "registry_digest": registry_digest,
+                "worker_id": worker_id,
+            },
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if payload != {
+            "framework_lock_digest": framework_lock_digest,
+            "generation_digest": generation_digest,
+            "registry_digest": registry_digest,
+            "worker_id": worker_id,
+        }:
+            raise RuntimeError("evolution backend returned a mismatched worker registration")
+        return payload
 
     def heartbeat(
         self,

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import socket
 import sys
 import threading
 import time
@@ -11,6 +12,7 @@ import pytest
 
 from openevo.backend.contracts.v1.models import LogEntryV1, ServiceSummaryV1
 from openevo.backend.service_supervisor import (
+    BoundedProbeCommandRunner,
     CoreServiceSupervisor,
     HealthCheckResult,
     LocalManagedScienceRuntimeProbe,
@@ -29,6 +31,7 @@ from openevo.backend.service_supervisor import (
     SupervisorStateError,
 )
 from openevo.config import TopologyConfig
+from openevo.internal_auth import InternalServiceIdentity
 
 
 INSTALL_DIGEST = "a" * 64
@@ -58,12 +61,17 @@ class FakeProcessBackend:
         identity = ProcessIdentity(
             pid=10_000 + len(self.spawned),
             birth_token=f"{len(self.spawned) + 1:064x}",
+            session_id=10_000 + len(self.spawned),
+            process_group_id=10_000 + len(self.spawned),
+            ownership_digest=spec.identity_digest,
         )
         with self._condition:
             self.spawned.append(spec)
             self.identities[spec.service_id] = identity
             self.alive[spec.service_id] = True
-            self.callbacks[spec.service_id] = (on_output, on_exit)
+            self.callbacks.setdefault(spec.service_id, []).append(
+                (identity, on_output, on_exit)
+            )
             self._condition.notify_all()
         return identity
 
@@ -96,16 +104,21 @@ class FakeProcessBackend:
                 self._condition.wait(remaining)
         return self.returncodes.get(self._service_id(identity), 0)
 
+    def recover_stale_group(self, identity: ProcessIdentity, deadline: float) -> bool:
+        del identity
+        return time.monotonic() < deadline
+
     def emit(self, service_id: str, payload: bytes) -> None:
-        self.callbacks[service_id][0](payload)
+        identity, callback, _ = self.callbacks[service_id][-1]
+        callback(identity, payload)
 
     def crash(self, service_id: str, returncode: int = 17) -> None:
         with self._condition:
             self.alive[service_id] = False
             self.returncodes[service_id] = returncode
-            callback = self.callbacks[service_id][1]
+            identity, _, callback = self.callbacks[service_id][-1]
             self._condition.notify_all()
-        callback(returncode)
+        callback(identity, returncode)
 
     def _service_id(self, identity: ProcessIdentity) -> str:
         return next(key for key, value in self.identities.items() if value == identity)
@@ -117,10 +130,19 @@ class FakeHealthChecker:
         self.checked: list[str] = []
         self.block_service: str | None = None
 
-    def wait_ready(self, spec, identity, process_backend, deadline) -> HealthCheckResult:
+    def wait_ready(
+        self,
+        spec,
+        identity,
+        process_backend,
+        deadline,
+        cancellation=None,
+    ) -> HealthCheckResult:
         self.checked.append(spec.service_id)
         if self.block_service == spec.service_id:
             while time.monotonic() < deadline:
+                if cancellation is not None and cancellation.is_set():
+                    return HealthCheckResult(ready=False, message="cancelled")
                 time.sleep(0.002)
             return HealthCheckResult(ready=False, message="readiness deadline exceeded")
         if spec.service_id in self.failed:
@@ -134,12 +156,17 @@ class FakeHealthChecker:
 class FakePortProbe:
     def __init__(self, conflicts: set[int] | None = None) -> None:
         self.conflicts = conflicts or set()
-        self.checked: list[int] = []
+        self.checked = 0
 
-    def is_available(self, host: str, port: int) -> bool:
+    def reserve(self, host: str) -> socket.socket:
         assert host == "127.0.0.1"
-        self.checked.append(port)
-        return port not in self.conflicts
+        self.checked += 1
+        if self.conflicts:
+            raise OSError("controlled listener reservation failure")
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.bind((host, 0))
+        listener.listen()
+        return listener
 
 
 class FakeManagedScienceRuntimeProbe:
@@ -147,8 +174,9 @@ class FakeManagedScienceRuntimeProbe:
         self.ready = ready
         self.requests: list[ManagedScienceRuntimeRequest] = []
 
-    def verify(self, request, deadline) -> ManagedScienceRuntimeReadiness:
+    def verify(self, request, deadline, cancellation=None) -> ManagedScienceRuntimeReadiness:
         assert time.monotonic() < deadline
+        assert cancellation is None or not cancellation.is_set()
         self.requests.append(request)
         return ManagedScienceRuntimeReadiness(
             ready=self.ready,
@@ -161,13 +189,31 @@ class FakeManagedScienceRuntimeProbe:
         )
 
 
+class BlockingManagedScienceRuntimeProbe(FakeManagedScienceRuntimeProbe):
+    def __init__(self) -> None:
+        super().__init__()
+        self.entered = threading.Event()
+
+    def verify(self, request, deadline, cancellation=None) -> ManagedScienceRuntimeReadiness:
+        self.entered.set()
+        while time.monotonic() < deadline:
+            if cancellation is not None and cancellation.wait(0.005):
+                return ManagedScienceRuntimeReadiness(
+                    ready=False,
+                    identity_digest=None,
+                    message="Managed Science runtime probe was cancelled.",
+                )
+        raise AssertionError("cancellation did not interrupt the runtime probe")
+
+
 class FakeProbeCommandRunner:
     def __init__(self, image_id: str = "1" * 64) -> None:
         self.image_id = image_id
         self.calls: list[tuple[str, ...]] = []
 
-    def run(self, argv, deadline) -> ProbeCommandResult:
+    def run(self, argv, deadline, cancellation=None) -> ProbeCommandResult:
         assert time.monotonic() < deadline
+        assert cancellation is None or not cancellation.is_set()
         self.calls.append(argv)
         if argv == ("codex", "--version"):
             return ProbeCommandResult(0, b"codex-cli 1.2.3\n", b"")
@@ -247,7 +293,9 @@ def test_subscription_plan_is_deterministic_and_ready_requires_health_and_identi
     supervisor, backend, health, runtime_probe = _supervisor(tmp_path, framework_lock)
     try:
         snapshot = _ensure_subscription(supervisor)
-        assert snapshot.ready is True
+        assert snapshot.services_available is True
+        assert snapshot.run_ready is False
+        assert snapshot.run_readiness_code == "admission_pinned_run_owner_unavailable"
         assert [service.id for service in snapshot.services] == [
             "evolution-backend",
             "rollout",
@@ -266,10 +314,10 @@ def test_subscription_plan_is_deterministic_and_ready_requires_health_and_identi
         assert all(service.identity_digest for service in snapshot.services)
         topology = json.loads((tmp_path / "core-services" / "topology.json").read_text())
         parsed_topology = TopologyConfig.load(tmp_path / "core-services" / "topology.json")
-        assert topology["evolution"]["enabled"] is True
-        assert topology["gateway"]["nodes"][0]["port"] == 8100
+        assert "evolution" not in topology
+        assert topology["gateway"]["nodes"][0]["port"] > 0
         assert topology["gateway"]["nodes"][0]["model_served"] == "gpt-5.1-codex-mini"
-        assert topology["rollout"]["port"] == 8080
+        assert topology["rollout"]["port"] > 0
         assert parsed_topology.gateway.nodes[0].default_runtime is None
         assert runtime_probe.requests == [
             ManagedScienceRuntimeRequest(
@@ -278,6 +326,12 @@ def test_subscription_plan_is_deterministic_and_ready_requires_health_and_identi
             )
         ]
         assert all("codex" not in part.lower() for spec in backend.spawned for part in spec.argv)
+        credential = backend.spawned[0].internal_identity
+        assert credential is not None
+        assert credential.credential not in repr(backend.spawned[0])
+        assert credential.credential not in (tmp_path / "core-services" / "ledger.json").read_text()
+        assert credential.credential not in (tmp_path / "core-services" / "topology.json").read_text()
+        assert len({service.port for service in snapshot.services if service.port is not None}) == 3
     finally:
         supervisor.close()
 
@@ -291,7 +345,7 @@ def test_spawn_success_without_health_is_rolled_back(
     supervisor, backend, _, _ = _supervisor(tmp_path, framework_lock, health=health)
     try:
         snapshot = _ensure_subscription(supervisor)
-        assert snapshot.ready is False
+        assert snapshot.services_available is False
         assert snapshot.service("gateway").status is ServiceStatus.FAILED
         assert backend.terminated == ["gateway", "rollout", "evolution-backend"]
         assert snapshot.service("evolution-worker").status is ServiceStatus.STOPPED
@@ -315,24 +369,23 @@ def test_total_startup_deadline_rolls_back_partial_group(
         started = time.monotonic()
         snapshot = _ensure_subscription(supervisor)
         assert time.monotonic() - started < 0.3
-        assert snapshot.ready is False
+        assert snapshot.services_available is False
         assert backend.terminated == ["rollout", "evolution-backend"]
         assert snapshot.service("rollout").error_code == "service_readiness_timeout"
     finally:
         supervisor.close()
 
 
-def test_port_conflict_prevents_any_spawn(
+def test_listener_reservation_failure_prevents_any_spawn(
     tmp_path: Path,
     framework_lock: Path,
 ) -> None:
     ports = FakePortProbe({8080})
     supervisor, backend, _, _ = _supervisor(tmp_path, framework_lock, ports=ports)
     try:
-        snapshot = _ensure_subscription(supervisor)
-        assert snapshot.ready is False
+        with pytest.raises(SupervisorStateError, match="listener reservation"):
+            _ensure_subscription(supervisor)
         assert backend.spawned == []
-        assert snapshot.service("rollout").error_code == "service_port_conflict"
     finally:
         supervisor.close()
 
@@ -346,7 +399,7 @@ def test_partial_spawn_failure_rolls_back_in_reverse_order(
     supervisor, backend, _, _ = _supervisor(tmp_path, framework_lock, backend=backend)
     try:
         snapshot = _ensure_subscription(supervisor)
-        assert snapshot.ready is False
+        assert snapshot.services_available is False
         assert backend.terminated == ["rollout", "evolution-backend"]
         assert snapshot.service("gateway").error_code == "service_spawn_failed"
     finally:
@@ -388,7 +441,7 @@ def test_child_exit_is_observed_and_restart_is_idempotent_by_operation(
 ) -> None:
     supervisor, backend, _, _ = _supervisor(tmp_path, framework_lock)
     try:
-        assert _ensure_subscription(supervisor).ready
+        assert _ensure_subscription(supervisor).services_available
         backend.crash("gateway", 23)
         deadline = time.monotonic() + 1
         while supervisor.get("gateway").status is not ServiceStatus.FAILED:
@@ -412,6 +465,30 @@ def test_child_exit_is_observed_and_restart_is_idempotent_by_operation(
         supervisor.close()
 
 
+def test_delayed_exit_callback_cannot_clear_replacement(
+    tmp_path: Path,
+    framework_lock: Path,
+) -> None:
+    supervisor, backend, _, runtime_probe = _supervisor(tmp_path, framework_lock)
+    try:
+        first = _ensure_subscription(supervisor)
+        old_identity, _, old_exit = backend.callbacks["gateway"][-1]
+        backend.crash("gateway", 23)
+        replacement = supervisor.restart("gateway", operation_id="replace-generation")
+        assert replacement.status is ServiceStatus.RUNNING
+        assert replacement.pid != old_identity.pid
+        assert len(runtime_probe.requests) == 2
+        assert supervisor._ledger.generation_digest != first.generation_digest
+
+        old_exit(old_identity, 91)
+
+        current = supervisor.get("gateway")
+        assert current.status is ServiceStatus.RUNNING
+        assert current.pid == replacement.pid
+    finally:
+        supervisor.close()
+
+
 def test_log_snapshot_is_bounded_redacted_and_maps_to_frozen_contract(
     tmp_path: Path,
     framework_lock: Path,
@@ -424,17 +501,28 @@ def test_log_snapshot_is_bounded_redacted_and_maps_to_frozen_contract(
     )
     try:
         _ensure_subscription(supervisor)
+        internal_identity = backend.spawned[0].internal_identity
+        assert internal_identity is not None
+        backend.emit("gateway", f"{internal_identity.credential}\n".encode())
         backend.emit("gateway", b"Authorization: Bearer secret-token\n")
         backend.emit("gateway", b"opened /home/alice/private/model.bin\n")
         backend.emit("gateway", b"proxy http://user:pass@example.test/path?q=secret\n")
+        backend.emit(
+            "gateway",
+            b'{"message":"request failed","AWS_SECRET_ACCESS_KEY":"aws-secret",'
+            b'"future_secret_field":"unknown-secret"}\n',
+        )
         backend.emit("gateway", b"last safe line\n")
         logs = supervisor.logs("gateway", limit=100)
         assert 1 <= len(logs) <= 3
         rendered = "\n".join(entry.message for entry in logs)
         assert "secret-token" not in rendered
+        assert internal_identity.credential not in rendered
         assert "/home/alice" not in rendered
         assert "user:pass" not in rendered
         assert "q=secret" not in rendered
+        assert "aws-secret" not in rendered
+        assert "unknown-secret" not in rendered
         assert all(isinstance(entry.to_contract(), LogEntryV1) for entry in logs)
         assert isinstance(supervisor.get("gateway").to_contract(), ServiceSummaryV1)
         ledger = (tmp_path / "core-services" / "ledger.json").read_text()
@@ -473,7 +561,8 @@ def test_self_deployed_is_typed_unavailable_and_never_claims_model_ready(
             ServiceExecutionMode.SELF_DEPLOYED,
             model_ref="Qwen/Qwen3-Coder-30B-A3B-Instruct",
         )
-        assert snapshot.ready is False
+        assert snapshot.services_available is False
+        assert snapshot.run_ready is False
         assert backend.spawned == []
         inference = snapshot.service("inference")
         assert inference.status is ServiceStatus.UNAVAILABLE
@@ -606,7 +695,7 @@ def test_identity_change_does_not_spawn_replacement_when_children_cannot_stop(
     snapshot = _ensure_subscription(supervisor, codex_model="gpt-5.2-codex")
 
     assert len(backend.spawned) == 4
-    assert snapshot.ready is False
+    assert snapshot.services_available is False
     assert all(service.error_code == "service_stop_timeout" for service in snapshot.services)
     assert all(service.pid is not None for service in snapshot.services)
     with pytest.raises(SupervisorStateError, match="ownership was retained"):
@@ -631,12 +720,101 @@ def test_failed_initialization_releases_host_global_owner(tmp_path: Path) -> Non
     framework_lock = tmp_path / "framework-lock.json"
     framework_lock.write_text("{}", encoding="utf-8")
     framework_lock.chmod(0o666)
-    with pytest.raises(SupervisorStateError, match="mode is unsafe"):
+    with pytest.raises(SupervisorStateError, match="mode 0600"):
         _supervisor(tmp_path, framework_lock)
 
     framework_lock.chmod(0o600)
     supervisor, _, _, _ = _supervisor(tmp_path, framework_lock)
     supervisor.close()
+
+
+def test_framework_lock_path_replacement_fails_before_service_stop(
+    tmp_path: Path,
+    framework_lock: Path,
+) -> None:
+    supervisor, backend, _, _ = _supervisor(tmp_path, framework_lock)
+    try:
+        assert _ensure_subscription(supervisor).services_available
+        original = framework_lock.with_suffix(".original")
+        framework_lock.rename(original)
+        framework_lock.write_bytes(original.read_bytes())
+        framework_lock.chmod(0o600)
+
+        with pytest.raises(SupervisorStateError, match="pathname binding changed"):
+            supervisor.restart("gateway", operation_id="lock-replaced")
+
+        assert backend.terminated == []
+        assert all(backend.alive.values())
+    finally:
+        original = framework_lock.with_suffix(".original")
+        if original.exists():
+            framework_lock.unlink(missing_ok=True)
+            original.rename(framework_lock)
+        supervisor.close()
+
+
+def test_cancel_interrupts_blocked_runtime_probe_within_bound(
+    tmp_path: Path,
+    framework_lock: Path,
+) -> None:
+    runtime_probe = BlockingManagedScienceRuntimeProbe()
+    supervisor, backend, _, _ = _supervisor(
+        tmp_path,
+        framework_lock,
+        runtime_probe=runtime_probe,
+        startup_timeout=10,
+        stop_timeout=0.05,
+    )
+    errors: list[BaseException] = []
+
+    def ensure() -> None:
+        try:
+            _ensure_subscription(supervisor)
+        except BaseException as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=ensure)
+    thread.start()
+    assert runtime_probe.entered.wait(timeout=1)
+    started = time.monotonic()
+    supervisor.cancel(total_timeout=0.2)
+    thread.join(timeout=1)
+
+    assert time.monotonic() - started < 0.5
+    assert not thread.is_alive()
+    assert backend.spawned == []
+    assert len(errors) == 1
+    assert isinstance(errors[0], SupervisorStateError)
+
+
+def test_cancel_interrupts_readiness_and_reaps_started_services(
+    tmp_path: Path,
+    framework_lock: Path,
+) -> None:
+    health = FakeHealthChecker()
+    health.block_service = "rollout"
+    supervisor, backend, _, _ = _supervisor(
+        tmp_path,
+        framework_lock,
+        health=health,
+        startup_timeout=10,
+        stop_timeout=0.05,
+    )
+    outcomes: list[object] = []
+    thread = threading.Thread(target=lambda: outcomes.append(_ensure_subscription(supervisor)))
+    thread.start()
+    deadline = time.monotonic() + 1
+    while "rollout" not in health.checked:
+        assert time.monotonic() < deadline
+        time.sleep(0.005)
+
+    started = time.monotonic()
+    supervisor.cancel(total_timeout=0.3)
+    thread.join(timeout=1)
+
+    assert time.monotonic() - started < 0.6
+    assert not thread.is_alive()
+    assert backend.terminated == ["rollout", "evolution-backend"]
 
 
 def test_symlinked_ledger_is_rejected_without_reading_target(
@@ -665,7 +843,7 @@ def test_subscription_runtime_bootstrap_failure_is_unavailable_without_spawn(
     )
     try:
         snapshot = _ensure_subscription(supervisor)
-        assert snapshot.ready is False
+        assert snapshot.services_available is False
         assert backend.spawned == []
         assert all(service.status is ServiceStatus.UNAVAILABLE for service in snapshot.services)
         assert snapshot.runtime_identity_digest is None
@@ -729,6 +907,30 @@ def test_local_managed_runtime_probe_rejects_symlinked_auth(
     assert "symlink" in readiness.message
 
 
+def test_real_probe_command_is_cancelled_and_reaped_within_bound() -> None:
+    runner = BoundedProbeCommandRunner()
+    cancellation = threading.Event()
+    results: list[ProbeCommandResult] = []
+    thread = threading.Thread(
+        target=lambda: results.append(
+            runner.run(
+                (sys.executable, "-c", "import time; time.sleep(60)"),
+                time.monotonic() + 10,
+                cancellation,
+            )
+        )
+    )
+    thread.start()
+    time.sleep(0.05)
+    started = time.monotonic()
+    cancellation.set()
+    thread.join(timeout=1)
+
+    assert time.monotonic() - started < 0.5
+    assert not thread.is_alive()
+    assert results and results[0].returncode == 130
+
+
 def test_real_subprocess_backend_smoke_uses_pid_identity_and_bounded_stop() -> None:
     backend = RealSubprocessBackend()
     exits: list[int] = []
@@ -749,7 +951,11 @@ def test_real_subprocess_backend_smoke_uses_pid_identity_and_bounded_stop() -> N
         port=None,
         health_probe=ServiceHealthProbe.process(),
     )
-    identity = backend.spawn(spec, output.append, exits.append)
+    identity = backend.spawn(
+        spec,
+        lambda _identity, payload: output.append(payload),
+        lambda _identity, returncode: exits.append(returncode),
+    )
     try:
         assert identity.pid > 0
         assert len(identity.birth_token) == 64
@@ -765,3 +971,154 @@ def test_real_subprocess_backend_smoke_uses_pid_identity_and_bounded_stop() -> N
         if backend.is_alive(identity):
             backend.kill(identity)
             backend.wait(identity, 1)
+
+
+def test_real_process_group_reaps_child_and_grandchild() -> None:
+    backend = RealSubprocessBackend()
+    output: list[bytes] = []
+    spec = _grandchild_probe_spec("d" * 64)
+    identity = backend.spawn(
+        spec,
+        lambda _identity, payload: output.append(payload),
+        lambda _identity, _returncode: None,
+    )
+    try:
+        grandchild_pid = _wait_for_probe_pid(output)
+        assert _pid_is_live(grandchild_pid)
+        backend.terminate(identity)
+        if backend.wait(identity, 0.5) is None:
+            backend.kill(identity)
+        assert backend.wait(identity, 1) is not None
+        assert not backend.is_alive(identity)
+        assert not _pid_is_live(grandchild_pid)
+    finally:
+        if backend.is_alive(identity):
+            backend.kill(identity)
+            backend.wait(identity, 1)
+
+
+def test_real_subprocess_inherits_credential_and_prebound_listener_fds() -> None:
+    backend = RealSubprocessBackend()
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen()
+    port = int(listener.getsockname()[1])
+    internal_identity = InternalServiceIdentity(
+        service_id="fd-probe",
+        generation_digest="1" * 64,
+        registry_digest="2" * 64,
+        framework_lock_digest="3" * 64,
+        credential="real-fd-credential-value-0123456789abcdef",
+    )
+    code = (
+        "import json,socket,time;"
+        "from openevo.internal_auth import inherited_listen_fd,read_internal_service_identity;"
+        "identity=read_internal_service_identity(required=True,expected_service_id='fd-probe');"
+        "sock=socket.socket(fileno=inherited_listen_fd());"
+        "print(json.dumps({'auth':identity.auth_digest,'port':sock.getsockname()[1]}),flush=True);"
+        "time.sleep(60)"
+    )
+    output: list[bytes] = []
+    spec = ServiceProcessSpec(
+        service_id="fd-probe",
+        display_name="FD probe",
+        component=ServiceComponent.EVOLUTION_WORKER,
+        argv=(sys.executable, "-c", code),
+        env={"PATH": os.environ.get("PATH", "")},
+        argv_digest="4" * 64,
+        env_digest="5" * 64,
+        identity_digest="6" * 64,
+        port=port,
+        health_probe=ServiceHealthProbe.process(),
+        internal_identity=internal_identity,
+        listen_fd=listener.fileno(),
+    )
+    identity = backend.spawn(
+        spec,
+        lambda _identity, payload: output.append(payload),
+        lambda _identity, _returncode: None,
+    )
+    listener.close()
+    try:
+        deadline = time.monotonic() + 1
+        while not output:
+            assert time.monotonic() < deadline
+            time.sleep(0.005)
+        observed = json.loads(output[0])
+        assert observed == {"auth": internal_identity.auth_digest, "port": port}
+        assert internal_identity.credential not in repr(spec)
+        assert internal_identity.credential not in "\0".join(spec.argv)
+        with socket.create_connection(("127.0.0.1", port), timeout=0.2):
+            pass
+    finally:
+        if backend.is_alive(identity):
+            backend.kill(identity)
+            backend.wait(identity, 1)
+
+
+def test_real_startup_recovery_reaps_recognized_stale_group() -> None:
+    original_owner = RealSubprocessBackend()
+    identity = original_owner.spawn(
+        _grandchild_probe_spec("f" * 64),
+        lambda _identity, _payload: None,
+        lambda _identity, _returncode: None,
+    )
+    recovered_owner = RealSubprocessBackend()
+    try:
+        assert recovered_owner.recover_stale_group(identity, time.monotonic() + 1.5)
+        assert not original_owner.is_alive(identity)
+    finally:
+        if original_owner.is_alive(identity):
+            original_owner.kill(identity)
+            original_owner.wait(identity, 1)
+
+
+def test_real_startup_recovery_refuses_unowned_process_group() -> None:
+    backend = RealSubprocessBackend()
+    identity = ProcessIdentity(
+        pid=os.getpid(),
+        birth_token="0" * 64,
+        session_id=os.getsid(0),
+        process_group_id=os.getpgrp(),
+        ownership_digest="1" * 64,
+    )
+
+    assert backend.recover_stale_group(identity, time.monotonic() + 0.1) is False
+    assert os.getpid() > 0
+
+
+def _grandchild_probe_spec(identity_digest: str) -> ServiceProcessSpec:
+    code = (
+        "import subprocess,sys,time;"
+        "child=subprocess.Popen([sys.executable,'-c','import time;time.sleep(60)']);"
+        "print(child.pid,flush=True);time.sleep(60)"
+    )
+    return ServiceProcessSpec(
+        service_id="group-probe",
+        display_name="Group probe",
+        component=ServiceComponent.EVOLUTION_WORKER,
+        argv=(sys.executable, "-c", code),
+        env={"PATH": os.environ.get("PATH", "")},
+        argv_digest="a" * 64,
+        env_digest="b" * 64,
+        identity_digest=identity_digest,
+        port=None,
+        health_probe=ServiceHealthProbe.process(),
+    )
+
+
+def _wait_for_probe_pid(output: list[bytes]) -> int:
+    deadline = time.monotonic() + 1
+    while not output:
+        assert time.monotonic() < deadline
+        time.sleep(0.005)
+    return int(output[0].decode("ascii").strip())
+
+
+def _pid_is_live(pid: int) -> bool:
+    try:
+        text = (Path("/proc") / str(pid) / "stat").read_text(encoding="ascii")
+    except OSError:
+        return False
+    end = text.rfind(")")
+    return text[end + 2 :].split()[0] != "Z"

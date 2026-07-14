@@ -44,6 +44,8 @@ as canonical JSON through temporary-file `fsync`, atomic rename, directory
 - verified install, framework-lock, and executable-registry digests;
 - per-service argv, environment, topology, port, and combined identity digests;
 - PID plus a Linux process birth token while the current supervisor owns it;
+- the dedicated SID/PGID and a non-secret generation ownership digest needed to
+  recognize a stale Core-owned process group;
 - typed state and bounded, redacted service log entries.
 
 Raw argv, environment values, framework-lock paths, service-root paths, tokens,
@@ -52,24 +54,48 @@ observable service/log snapshots. The child environment is rebuilt from a small
 non-secret runtime allowlist instead of inheriting the complete Core daemon
 environment.
 
-The real subprocess backend starts a dedicated process group and binds the PID
-to `/proc` start ticks, uid, and the exact cmdline digest. Signal operations are
-allowed only for handles spawned by the current supervisor and revalidate that
-birth token first. On Linux, children receive a parent-death signal. Startup
-recovery never signals a PID read from an old ledger: any residual starting,
-running, degraded, or PID-bearing row becomes `service_prior_owner_lost` with no
-PID pin. This prevents PID reuse or a modified ledger from authorizing signals
-to an unrelated process.
+Each started generation receives a new high-entropy internal credential. The
+credential is written to one child-specific pipe and inherited by FD; only the
+FD number is present in the child environment. It is never present in argv,
+topology, ledger, durable logs, dataclass repr, or health output. Evolution and
+rollout protect their complete release-owned HTTP surfaces. Gateway protects
+health, session, event, model-inventory, and admin routes while preserving the
+separate agent-facing completion/session-identity protocol. Worker traffic uses
+the same authenticated evolution client. Requests must carry the exact bearer,
+generation, and registry identity; bearer comparison is constant-time and every
+missing or mismatched value fails closed.
+
+Durable output filtering treats JSON as a closed diagnostic object. Known
+credential, authorization, cookie, API key, token, password, private-key, and
+AWS-secret fields are redacted; values under unknown structured fields are not
+persisted. Header, environment, JSON, URL, and key-value forms receive the same
+filter before bounded storage.
+
+The real subprocess backend starts a dedicated session/process group and binds
+the leader PID to `/proc` start ticks, uid, exact cmdline digest, SID, PGID, and
+the inherited non-secret ownership digest. Liveness and signal operations scan
+the complete group, including grandchildren, and fail closed if any member does
+not match owner, session, group, and generation evidence. On Linux, direct
+children also receive a parent-death signal.
+
+Startup recovery may signal only a stale group recognized by that full persisted
+identity. It sends TERM and then KILL within a bound, verifies convergence, and
+only then clears the ledger pin. An absent old group is safe; a reused PID,
+foreign member, unreadable identity, changed SID/PGID, or ownership mismatch
+blocks startup without signaling. A leader exit callback captures generation
+and complete process identity, so a delayed callback cannot clear a replacement
+generation. If the leader exits while a grandchild remains, the handle and group
+identity are retained for close/restart recovery.
 
 ## Supported Service Group
 
 `codex_subscription_transcript` is the fully implemented group. Core writes one
-deterministic topology and directly launches these existing entry points in
-dependency order:
+closed generation topology with prebound dynamic ports and directly launches
+these entry points in dependency order:
 
-1. `python -m openevo.evolution.cli serve` on loopback port `8200`;
-2. `python -m openevo.rollout.server` on loopback port `8080`;
-3. `python -m openevo.gateway.server` on loopback port `8100`;
+1. `python -m openevo.evolution.cli serve` on a prebound loopback listener;
+2. `python -m openevo.rollout.server` on a prebound loopback listener;
+3. `python -m openevo.gateway.server` on a prebound loopback listener;
 4. `python -m openevo.evolution.cli worker` against the same verified framework
    lock and evolution artifact root.
 
@@ -86,11 +112,12 @@ persists auth content.
 
 The resulting non-secret runtime evidence digest, exact managed image tag, and
 Codex model are bound into the service generation. The Codex model is also the
-topology's `model_served`, matching the existing Science services plan and
-providing the correct base-model identity to transcript/context processing.
-The topology keeps the existing evolution context and event-export settings.
-Per-task `RuntimeSpec` still comes from the compiled Science task through rollout
-and gateway; the supervisor does not duplicate or rewrite task runtime setup.
+topology's non-serving model identity. The supervisor topology deliberately has
+no evolution context, latest-promoted lookup, event-export fail-open policy, or
+runtime injection choice. Per-task `RuntimeSpec`, an admission-pinned exact
+revision, and its strict materialized context must later come from the Core run
+owner. The supervisor does not resolve, select, promote, inject, or rewrite any
+task context.
 If bootstrap evidence is unavailable, all four services report `unavailable`,
 no child is spawned, and single-service restart cannot bypass the probe.
 
@@ -100,20 +127,55 @@ cover the managed image/Codex/private-auth evidence contract. This is a
 revalidation boundary for the existing bootstrap result, not a second image
 builder or a return to Desktop-owned post-attach service commands.
 
-The Codex subscription is consumed only by the harness during a transcript-mode
-session. The supervisor does not start a Codex API client or claim token-level
-capture. HTTP components become running only after both their PID birth identity
-and health endpoint are live. The worker requires repeated live process-identity
-observations. Spawn success alone is never readiness.
+The Codex subscription is consumed only by the harness during a future
+admission-owned transcript-mode session. The supervisor does not start a Codex
+API client, expose a direct model API, or claim token-level capture. Gateway
+health explicitly reports `capture_mode=transcript`,
+`token_level_metrics_available=false`, and `direct_model_api=false`.
 
-`ensure` is serialized and generation-idempotent. It preflights all ports,
-applies one total startup deadline, and rolls a partially started group back in
-reverse order. `restart` is idempotent for the same `(service_id, operation_id)`.
-Child exits are monitored and persisted as failures. `close` and `cancel` share
-one total deadline, send `SIGTERM`, escalate owned children to `SIGKILL`, and do
-not signal unowned recovery PIDs. If an injected backend still proves a child
+HTTP components become running only after their process-group identity and an
+authenticated closed health document match service ID, generation, framework
+lock digest, and registry digest. Evolution backend and worker independently
+load and verify the copied framework lock; worker startup registers its actual
+generation/lock/registry identity. Gateway must authenticate to rollout, and
+rollout health must prove that the exact gateway node has registered and is
+schedulable. An arbitrary 2xx response is never readiness.
+
+`ensure` is serialized and generation-idempotent. Before every ensure/restart it
+re-runs Codex auth/version, managed-image, framework-lock pathname/content, and
+release inventory checks. The original framework lock remains held by stable FD;
+its exact bytes are copied to the owner-only service root, and replacement or
+in-place mutation fails before current children are stopped. Every HTTP listener
+is bound to dynamic loopback port zero by Core and inherited by FD, eliminating
+port availability/bind TOCTOU. One total startup deadline applies and partial
+groups roll back in reverse order.
+
+`restart` is idempotent for the same `(service_id, operation_id)`. Because auth,
+registration, and health are generation-scoped, a restart rotates the credential
+and replaces the complete four-service group rather than leaving a mixed
+generation. Child exits are monitored and persisted as failures. `close` and
+`cancel` share one total deadline, send `SIGTERM`, escalate owned children to
+`SIGKILL`, and do not signal unverified recovery groups. Ensure/restart publish a cancellation
+token before invoking probes or readiness; `cancel` sets it without waiting for
+the lifecycle mutex, and command/HTTP probes poll it with a short bound before
+the sole owner performs rollback. If an injected backend still proves a child
 live after escalation, close fails and retains host-global ownership; it does
 not admit a replacement supervisor beside an unkillable child.
+
+## Service Availability Versus Run Readiness
+
+`ServiceGroupSnapshot.services_available` means only that the authenticated
+internal service graph above is live. `run_ready` is always false in this slice,
+with `run_readiness_code=admission_pinned_run_owner_unavailable`. No service
+generation, promoted artifact, legacy context result, or successful health
+probe can turn that into a runnable task.
+
+A later run owner must provide and revalidate the exact admission pin, immutable
+revision, execution snapshot, materialized context, and artifact set before
+dispatch. Evolution outputs apply only to a later session after the revision
+contract commits. Provider injection, tunnel-only transport, durable operation
+records, and the run-owner admission path remain explicit downstream
+dependencies; this branch does not fabricate run success while they are absent.
 
 ## Self-Deployed Boundary
 
@@ -157,16 +219,16 @@ is not a substitute for the provider's durable mutation contract.
 ## Verification And Residual Risks
 
 Focused coverage is in `tests/backend/test_core_service_supervisor.py` and
-includes total deadlines, port conflicts, partial rollback, crash observation,
-idempotent concurrent ensure/restart, malicious ledger and symlink rejection,
-startup PID recovery, bounded redacted logs, bounded close escalation, and a
-real lightweight local subprocess smoke test that downloads no model.
+`tests/backend/test_internal_service_auth.py`. It includes total deadlines,
+prebound listeners, partial rollback, delayed exit callbacks, idempotent
+concurrent ensure/restart, lock replacement, malicious ledger/symlink rejection,
+bounded cancellation and close escalation, closed log redaction, unauthenticated
+HTTP rejection, exact worker/gateway registration, and real child-to-grandchild
+process-group termination and stale-owner recovery probes. No test downloads a
+model.
 
 Residual integration risks remain explicit:
 
-- the port preflight and child bind are separate operations; the real health
-  check detects a bind race and rolls back, but cannot reserve the port for the
-  child;
 - the existing managed image tag is bound to the locally inspected Docker image
   ID and managed-runtime label, but this slice does not add signed container
   image provenance; release bootstrap remains responsible for preparing the
@@ -175,5 +237,6 @@ Residual integration risks remain explicit:
   path; other platforms need an equivalent verified backend before support;
 - automatic crash restart is intentionally absent; Core reports failure and a
   caller performs an idempotent restart;
-- provider, run owner, revision readiness, model preparation, Desktop forwarding,
-  and release E2E are not connected by this change.
+- provider, tunnel-only transport, run owner, admission/revision readiness,
+  model preparation, Desktop forwarding, and release E2E are not connected by
+  this change.

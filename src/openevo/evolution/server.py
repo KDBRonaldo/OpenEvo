@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 
 from openevo.evolution.models import (
     ArtifactPromotionUpdateRequest,
@@ -42,6 +42,12 @@ from openevo.evolution.framework.builtins import (
     require_verified_executable_registry,
 )
 from openevo.evolution.framework.registry import RegistrySnapshot
+from openevo.internal_auth import (
+    INTERNAL_SERVICE_HEADER,
+    InternalServiceIdentity,
+    health_identity_payload,
+    install_internal_auth,
+)
 
 
 def _review_write_error(exc: ValueError) -> HTTPException:
@@ -65,6 +71,7 @@ def create_app(
     artifact_root: str | Path,
     registry_snapshot: RegistrySnapshot | None = None,
     executable_registry: VerifiedExecutableRegistry | None = None,
+    internal_identity: InternalServiceIdentity | None = None,
 ) -> FastAPI:
     verified_registry = (
         None
@@ -91,14 +98,61 @@ def create_app(
     app.state.store = store
     app.state.registry_snapshot = effective_snapshot
     app.state.evolution_registry = verified_registry
+    app.state.internal_identity = internal_identity
+    app.state.internal_workers = {}
+    install_internal_auth(app, lambda: app.state.internal_identity)
 
     @app.get("/v1/health")
     async def health() -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "status": "ok",
             "db": "ok",
-            "artifact_root": str(root),
         }
+        if internal_identity is None:
+            payload["artifact_root"] = str(root)
+        else:
+            payload["registry_digest"] = (
+                effective_snapshot.registry_digest if effective_snapshot is not None else None
+            )
+            payload["workers"] = list(app.state.internal_workers.values())
+            payload.update(health_identity_payload(internal_identity))
+        return payload
+
+    @app.post("/v1/internal/workers/register")
+    def register_internal_worker(
+        payload: dict[str, Any],
+        request: Request,
+    ) -> dict[str, str]:
+        if internal_identity is None:
+            raise HTTPException(status_code=404, detail="internal worker registration is disabled")
+        if request.headers.get(INTERNAL_SERVICE_HEADER) != "evolution-worker":
+            raise HTTPException(status_code=403, detail="worker caller identity mismatch")
+        if set(payload) != {
+            "framework_lock_digest",
+            "generation_digest",
+            "registry_digest",
+            "worker_id",
+        }:
+            raise HTTPException(status_code=422, detail="worker registration is not a closed object")
+        worker_id = payload.get("worker_id")
+        generation_digest = payload.get("generation_digest")
+        registry_digest = payload.get("registry_digest")
+        framework_lock_digest = payload.get("framework_lock_digest")
+        if (
+            worker_id != "core-reference-worker"
+            or generation_digest != internal_identity.generation_digest
+            or registry_digest != internal_identity.registry_digest
+            or framework_lock_digest != internal_identity.framework_lock_digest
+        ):
+            raise HTTPException(status_code=409, detail="worker registration identity mismatch")
+        registration = {
+            "framework_lock_digest": framework_lock_digest,
+            "generation_digest": generation_digest,
+            "registry_digest": registry_digest,
+            "worker_id": worker_id,
+        }
+        app.state.internal_workers[worker_id] = registration
+        return registration
 
     @app.post("/v1/events", response_model=EventIngestResponse)
     def ingest_event(request: EventIngestRequest) -> EventIngestResponse:
