@@ -354,9 +354,20 @@ export const modelPreparationV1Schema = z
   })
   .strict()
   .superRefine((value, context) => {
-    if (value.downloaded_bytes !== null && value.total_bytes === null) issue(context, ["downloaded_bytes"], "downloaded_bytes requires total_bytes");
+    const progressKnown = value.downloaded_bytes !== null || value.total_bytes !== null;
+    if (progressKnown && (value.downloaded_bytes === null || value.total_bytes === null)) {
+      issue(context, ["downloaded_bytes"], "downloaded_bytes and total_bytes must appear together");
+    }
     if (value.downloaded_bytes !== null && value.total_bytes !== null && value.downloaded_bytes > value.total_bytes) issue(context, ["downloaded_bytes"], "downloaded_bytes exceeds total_bytes");
     if ((value.status === "failed") !== (value.error !== null)) issue(context, ["error"], "error is required only for failed model preparation");
+    if (value.status === "unresolved" && progressKnown) issue(context, ["downloaded_bytes"], "unresolved model preparation cannot report progress");
+    if (value.status === "downloading") {
+      if (!progressKnown) issue(context, ["downloaded_bytes"], "downloading model preparation requires progress");
+      if (value.downloaded_bytes !== null && value.downloaded_bytes === value.total_bytes) issue(context, ["status"], "completed progress must use ready status");
+    }
+    if (value.status === "ready" && progressKnown && value.downloaded_bytes !== value.total_bytes) {
+      issue(context, ["downloaded_bytes"], "ready model preparation requires complete progress");
+    }
   });
 export const remoteProjectStateV1Schema = z
   .object({
@@ -673,7 +684,7 @@ export const attemptV1Schema = z
   .superRefine(validateAttempt);
 export const revisionTransitionV1Schema = z
   .object({
-    state: z.enum(["not_started", "sealing_dataset", "running_methods", "validating", "materializing", "preparing_serving", "committing", "active", "failed", "unavailable"]),
+    state: z.enum(["not_started", "sealing_dataset", "running_methods", "validating", "materializing", "preparing_serving", "committing", "active", "failed", "cancelled", "unavailable"]),
     predecessor_revision: revisionRefV1Schema,
     successor_revision: revisionRefV1Schema,
     progress_completed: z.number().int().min(0).max(10_000),
@@ -710,6 +721,7 @@ const runSummaryFields = {
   revision_transition: revisionTransitionV1Schema.nullable().default(null),
   created_at: coreUtcTimestampSchema,
   updated_at: coreUtcTimestampSchema,
+  admitted_at: coreUtcTimestampSchema.nullable().default(null),
   started_at: coreUtcTimestampSchema.nullable().default(null),
   finished_at: coreUtcTimestampSchema.nullable().default(null),
   etag: etagSchema,
@@ -792,6 +804,7 @@ export const runContextV1Schema = z
     capture_mode: z.enum(["transcript", "token_level"]),
     created_at: coreUtcTimestampSchema,
     updated_at: coreUtcTimestampSchema,
+    admitted_at: coreUtcTimestampSchema.nullable().default(null),
     started_at: coreUtcTimestampSchema.nullable().default(null),
     finished_at: coreUtcTimestampSchema.nullable().default(null),
     etag: etagSchema,
@@ -913,15 +926,63 @@ export const artifactDiffDocumentIdentityV1Schema = z
   });
 export const diffHunkV1Schema = z
   .object({
-    old_document: artifactDiffDocumentIdentityV1Schema,
-    new_document: artifactDiffDocumentIdentityV1Schema,
+    old_document: artifactDiffDocumentIdentityV1Schema.nullable().default(null),
+    new_document: artifactDiffDocumentIdentityV1Schema.nullable().default(null),
     old_start: nonNegativeSafeIntegerSchema,
     old_count: nonNegativeSafeIntegerSchema,
     new_start: nonNegativeSafeIntegerSchema,
     new_count: nonNegativeSafeIntegerSchema,
     lines: z.array(diffLineV1Schema).max(512),
   })
-  .strict();
+  .strict()
+  .superRefine((value, context) => {
+    if (value.old_document === null && value.new_document === null) issue(context, [], "a diff hunk requires an old or new document");
+    if (value.old_document === null && (value.old_start !== 0 || value.old_count !== 0)) issue(context, ["old_start"], "an added-document hunk has no old range");
+    if (value.new_document === null && (value.new_start !== 0 || value.new_count !== 0)) issue(context, ["new_start"], "a removed-document hunk has no new range");
+    const oldLines = value.lines.filter((line) => line.kind === "context" || line.kind === "removed").length;
+    const newLines = value.lines.filter((line) => line.kind === "context" || line.kind === "added").length;
+    if (oldLines !== value.old_count || newLines !== value.new_count) issue(context, ["lines"], "diff hunk ranges must match its lines");
+  });
+
+function validateDocumentChangeHunks(
+  value: { old_document?: z.infer<typeof artifactDiffDocumentIdentityV1Schema>; new_document?: z.infer<typeof artifactDiffDocumentIdentityV1Schema>; hunks: z.infer<typeof diffHunkV1Schema>[] },
+  context: z.RefinementCtx,
+): void {
+  const oldDocument = value.old_document ?? null;
+  const newDocument = value.new_document ?? null;
+  if (value.hunks.some((hunk) => !sameValue(hunk.old_document, oldDocument) || !sameValue(hunk.new_document, newDocument))) {
+    issue(context, ["hunks"], "diff hunk document identity must match its document change");
+  }
+}
+
+const addedArtifactDocumentChangeV1Schema = z
+  .object({ kind: z.literal("added"), new_document: artifactDiffDocumentIdentityV1Schema, hunks: z.array(diffHunkV1Schema).max(MAX_ARTIFACT_DIFF_HUNKS) })
+  .strict()
+  .superRefine(validateDocumentChangeHunks);
+const removedArtifactDocumentChangeV1Schema = z
+  .object({ kind: z.literal("removed"), old_document: artifactDiffDocumentIdentityV1Schema, hunks: z.array(diffHunkV1Schema).max(MAX_ARTIFACT_DIFF_HUNKS) })
+  .strict()
+  .superRefine(validateDocumentChangeHunks);
+const modifiedArtifactDocumentChangeV1Schema = z
+  .object({ kind: z.literal("modified"), old_document: artifactDiffDocumentIdentityV1Schema, new_document: artifactDiffDocumentIdentityV1Schema, hunks: z.array(diffHunkV1Schema).max(MAX_ARTIFACT_DIFF_HUNKS) })
+  .strict()
+  .superRefine((value, context) => {
+    if (value.old_document.relative_path !== value.new_document.relative_path) issue(context, ["new_document", "relative_path"], "modified document must retain its relative path");
+    validateDocumentChangeHunks(value, context);
+  });
+const renamedArtifactDocumentChangeV1Schema = z
+  .object({ kind: z.literal("renamed"), old_document: artifactDiffDocumentIdentityV1Schema, new_document: artifactDiffDocumentIdentityV1Schema, hunks: z.array(diffHunkV1Schema).max(MAX_ARTIFACT_DIFF_HUNKS) })
+  .strict()
+  .superRefine((value, context) => {
+    if (value.old_document.relative_path === value.new_document.relative_path) issue(context, ["new_document", "relative_path"], "renamed document must change its relative path");
+    validateDocumentChangeHunks(value, context);
+  });
+export const artifactDocumentChangeV1Schema = z.union([
+  addedArtifactDocumentChangeV1Schema,
+  removedArtifactDocumentChangeV1Schema,
+  modifiedArtifactDocumentChangeV1Schema,
+  renamedArtifactDocumentChangeV1Schema,
+]);
 export const artifactDiffV1Schema = z
   .object({
     schema_version: schemaVersionV1Schema,
@@ -929,29 +990,35 @@ export const artifactDiffV1Schema = z
     artifact_content_sha256: sha256DigestSchema,
     previous_artifact_id: coreOpaqueIdSchema,
     previous_artifact_content_sha256: sha256DigestSchema,
-    hunks: z.array(diffHunkV1Schema).max(MAX_ARTIFACT_DIFF_HUNKS),
+    document_changes: z.array(artifactDocumentChangeV1Schema).max(MAX_ARTIFACT_PREVIEW_DOCUMENTS),
+    total_document_changes: nonNegativeSafeIntegerSchema,
     total_hunks: nonNegativeSafeIntegerSchema,
     total_lines: nonNegativeSafeIntegerSchema,
     truncated: z.boolean(),
   })
   .strict()
   .superRefine((value, context) => {
-    for (const [index, hunk] of value.hunks.entries()) {
-      if (hunk.old_document.artifact_id !== value.previous_artifact_id
-        || hunk.old_document.artifact_content_sha256 !== value.previous_artifact_content_sha256) {
-        issue(context, ["hunks", index, "old_document"], "old document identity must match the previous artifact");
+    const hunks = value.document_changes.flatMap((change) => change.hunks);
+    for (const [index, change] of value.document_changes.entries()) {
+      const oldDocument = "old_document" in change ? change.old_document : null;
+      const newDocument = "new_document" in change ? change.new_document : null;
+      if (oldDocument !== null && (oldDocument.artifact_id !== value.previous_artifact_id
+        || oldDocument.artifact_content_sha256 !== value.previous_artifact_content_sha256)) {
+        issue(context, ["document_changes", index, "old_document"], "old document identity must match the previous artifact");
       }
-      if (hunk.new_document.artifact_id !== value.artifact_id
-        || hunk.new_document.artifact_content_sha256 !== value.artifact_content_sha256) {
-        issue(context, ["hunks", index, "new_document"], "new document identity must match the current artifact");
+      if (newDocument !== null && (newDocument.artifact_id !== value.artifact_id
+        || newDocument.artifact_content_sha256 !== value.artifact_content_sha256)) {
+        issue(context, ["document_changes", index, "new_document"], "new document identity must match the current artifact");
       }
     }
-    const lines = value.hunks.reduce((total, hunk) => total + hunk.lines.length, 0);
-    const bytes = value.hunks.reduce((total, hunk) => total + hunk.lines.reduce((subtotal, line) => subtotal + utf8ByteLength(line.text), 0), 0);
-    if (lines > MAX_ARTIFACT_DIFF_LINES) issue(context, ["hunks"], "artifact diff exceeds the line budget");
-    if (bytes > MAX_ARTIFACT_PREVIEW_BYTES) issue(context, ["hunks"], "artifact diff exceeds the UTF-8 byte budget");
-    if (value.hunks.length > value.total_hunks || lines > value.total_lines) issue(context, [], "returned diff exceeds authoritative totals");
-    if (value.truncated !== (value.hunks.length < value.total_hunks || lines < value.total_lines)) issue(context, ["truncated"], "truncated must match diff totals");
+    const lines = hunks.reduce((total, hunk) => total + hunk.lines.length, 0);
+    const bytes = hunks.reduce((total, hunk) => total + hunk.lines.reduce((subtotal, line) => subtotal + utf8ByteLength(line.text), 0), 0);
+    if (hunks.length > MAX_ARTIFACT_DIFF_HUNKS) issue(context, ["document_changes"], "artifact diff exceeds the hunk budget");
+    if (lines > MAX_ARTIFACT_DIFF_LINES) issue(context, ["document_changes"], "artifact diff exceeds the line budget");
+    if (bytes > MAX_ARTIFACT_PREVIEW_BYTES) issue(context, ["document_changes"], "artifact diff exceeds the UTF-8 byte budget");
+    if (value.document_changes.length > value.total_document_changes || hunks.length > value.total_hunks || lines > value.total_lines) issue(context, [], "returned diff exceeds authoritative totals");
+    const actuallyTruncated = value.document_changes.length < value.total_document_changes || hunks.length < value.total_hunks || lines < value.total_lines;
+    if (value.truncated !== actuallyTruncated) issue(context, ["truncated"], "truncated must match diff totals");
   });
 
 export const serviceV1Schema = z
@@ -971,7 +1038,7 @@ export const serviceV1Schema = z
   .strict()
   .superRefine((value, context) => {
     if ((value.status === "failed") !== (value.error !== null)) issue(context, ["error"], "error is required only for failed services");
-    if (value.kind !== "inference" && value.model_preparation !== null) issue(context, ["model_preparation"], "model preparation belongs only to inference services");
+    if ((value.kind === "inference") !== (value.model_preparation !== null)) issue(context, ["model_preparation"], "model preparation is required only for inference services");
   });
 const diagnosticScopeSchema = z.enum(["environment", "project", "run", "services", "registry", "storage"]);
 const diagnosticTargetV1Schema = z.discriminatedUnion("kind", [
@@ -1031,16 +1098,65 @@ export const cacheCleanupResultV1Schema = z
     reclaimed_bytes: nonNegativeSafeIntegerSchema,
   })
   .strict();
+const environmentRepairActionSchema = z.enum([
+  "retry_network",
+  "restart_container_runtime",
+  "restart_model_service",
+  "repair_registry_install",
+  "reconcile_managed_state",
+]);
+const environmentRepairRequestV1Schema = z
+  .object({
+    schema_version: schemaVersionV1Schema,
+    execution_mode: executionModeV1Schema,
+    actions: z.array(environmentRepairActionSchema).min(1).max(16),
+  })
+  .strict()
+  .refine((value) => new Set(value.actions).size === value.actions.length, { path: ["actions"], message: "repair actions must be unique" });
+const repairActionResultV1Schema = z
+  .object({ action: environmentRepairActionSchema, status: checkStatusSchema, message: descriptionSchema })
+  .strict();
+const environmentRepairResponseV1Schema = z
+  .object({
+    schema_version: schemaVersionV1Schema,
+    status: z.enum(["ok", "degraded", "needs_user_action"]),
+    results: z.array(repairActionResultV1Schema).min(1).max(16),
+    checked_at: coreUtcTimestampSchema,
+  })
+  .strict();
+const serviceRestartRequestV1Schema = z
+  .object({ schema_version: schemaVersionV1Schema, reason: z.string().min(1).max(512) })
+  .strict();
+const operationKindSchema = z.enum(["environment_repair", "service_restart", "cache_cleanup"]);
+const operationDescriptorV1Schema = z
+  .object({ kind: operationKindSchema, cancellable: z.boolean() })
+  .strict()
+  .superRefine((value, context) => {
+    if (value.cancellable !== (value.kind === "environment_repair")) issue(context, ["cancellable"], "operation cancellation policy must match its kind");
+  });
+const operationRequestV1Schema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("environment_repair"), request: environmentRepairRequestV1Schema }).strict(),
+  z.object({ kind: z.literal("service_restart"), service_id: coreOpaqueIdSchema, request: serviceRestartRequestV1Schema }).strict(),
+  z.object({ kind: z.literal("cache_cleanup"), request: cacheCleanupRequestV1Schema }).strict(),
+]);
+const operationResultV1Schema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("environment_repair"), response: environmentRepairResponseV1Schema }).strict(),
+  z.object({ kind: z.literal("service_restart"), service: serviceV1Schema }).strict(),
+  z.object({ kind: z.literal("cache_cleanup"), result: cacheCleanupResultV1Schema }).strict(),
+]);
+const operationCancellationV1Schema = z
+  .object({ reason: z.literal("user_requested"), requested_at: coreUtcTimestampSchema })
+  .strict();
 export const operationV1Schema = z
   .object({
     schema_version: schemaVersionV1Schema,
     id: coreOpaqueIdSchema,
-    kind: z.enum(["service_restart", "cache_cleanup"]),
-    status: z.enum(["queued", "running", "succeeded", "failed"]),
-    service_id: coreOpaqueIdSchema.nullable().default(null),
-    cache_scopes: z.array(cacheScopeSchema).max(8).default([]),
-    service: serviceV1Schema.nullable().default(null),
-    cache_cleanup: cacheCleanupResultV1Schema.nullable().default(null),
+    kind: operationKindSchema,
+    descriptor: operationDescriptorV1Schema,
+    status: z.enum(["queued", "running", "cancelling", "succeeded", "failed", "cancelled"]),
+    request: operationRequestV1Schema,
+    result: operationResultV1Schema.nullable().default(null),
+    cancellation: operationCancellationV1Schema.nullable().default(null),
     logs_ref: coreOpaqueIdSchema,
     created_at: coreUtcTimestampSchema,
     updated_at: coreUtcTimestampSchema,
@@ -1051,19 +1167,26 @@ export const operationV1Schema = z
   })
   .strict()
   .superRefine((value, context) => {
-    validateAsyncStatus(value, context);
+    const terminal = ["succeeded", "failed", "cancelled"].includes(value.status);
+    if (terminal !== (value.finished_at !== null)) issue(context, ["finished_at"], "finished_at is required only for terminal operations");
+    if ((value.status === "failed") !== (value.error !== null)) issue(context, ["error"], "error is required only for failed operations");
+    const cancelling = value.status === "cancelling" || value.status === "cancelled";
+    if (cancelling !== (value.cancellation !== null)) issue(context, ["cancellation"], "cancellation is required only for cancelling operations");
+    if (cancelling && !value.descriptor.cancellable) issue(context, ["descriptor", "cancellable"], "non-cancellable operation cannot enter cancellation states");
+    if (value.descriptor.kind !== value.kind || value.request.kind !== value.kind) issue(context, ["kind"], "operation descriptor and request must match its kind");
     const succeeded = value.status === "succeeded";
-    if (value.kind === "service_restart") {
-      if (value.service_id === null || value.cache_scopes.length > 0 || value.cache_cleanup !== null) issue(context, ["kind"], "service restart operation has an invalid subject");
-      if (succeeded !== (value.service !== null)) issue(context, ["service"], "successful service restart requires the service result");
-      if (value.service !== null && value.service.id !== value.service_id) issue(context, ["service"], "service result has the wrong ID");
-    } else {
-      if (value.service_id !== null || value.service !== null || value.cache_scopes.length === 0) issue(context, ["kind"], "cache cleanup operation has an invalid subject");
-      if (new Set(value.cache_scopes).size !== value.cache_scopes.length) issue(context, ["cache_scopes"], "cache cleanup scopes must be unique");
-      if (succeeded !== (value.cache_cleanup !== null)) issue(context, ["cache_cleanup"], "successful cache cleanup requires its result");
-      if (value.cache_cleanup !== null && !sameValue(value.cache_cleanup.scopes, value.cache_scopes)) issue(context, ["cache_cleanup", "scopes"], "cache cleanup result scopes must match the operation");
+    if (succeeded !== (value.result !== null)) issue(context, ["result"], "only successful operations carry a typed result");
+    if (value.result !== null && value.result.kind !== value.kind) issue(context, ["result", "kind"], "operation result must match its kind");
+    if (value.result?.kind === "environment_repair" && value.request.kind === "environment_repair") {
+      const resultActions = value.result.response.results.map((item) => item.action);
+      if (!sameValue(resultActions, value.request.request.actions)) issue(context, ["result", "response", "results"], "environment repair results must match requested actions");
     }
-    if (!succeeded && (value.service !== null || value.cache_cleanup !== null)) issue(context, [], "only successful operations carry a result");
+    if (value.result?.kind === "service_restart" && value.request.kind === "service_restart") {
+      if (value.result.service.id !== value.request.service_id) issue(context, ["result", "service", "id"], "service restart result has the wrong service ID");
+    }
+    if (value.result?.kind === "cache_cleanup" && value.request.kind === "cache_cleanup") {
+      if (!sameValue(value.result.result.scopes, value.request.request.scopes)) issue(context, ["result", "result", "scopes"], "cache cleanup result scopes must match its request");
+    }
   });
 
 const stateEventV1Schema = z.object({ kind: z.literal("state_changed"), state: desktopStateV1Schema }).strict();
@@ -1119,7 +1242,8 @@ export function pageV1Schema<T extends z.ZodTypeAny>(itemSchema: T) {
 function corePageV1Schema<T extends z.ZodTypeAny>(itemSchema: T, maxItems = 100) {
   return z
     .object({ schema_version: schemaVersionV1Schema, items: z.array(itemSchema).max(maxItems), next_cursor: z.string().min(1).max(512).nullable().default(null), has_more: z.boolean() })
-    .strict();
+    .strict()
+    .refine((value) => value.has_more === (value.next_cursor !== null), { path: ["next_cursor"], message: "cursor must agree with has_more" });
 }
 export const profilePageV1Schema = pageV1Schema(remoteProfileV1Schema);
 export const projectPageV1Schema = pageV1Schema(projectV1Schema);
@@ -1135,7 +1259,8 @@ export const referencedLogPageV1Schema = z
     has_more: z.boolean(),
     logs_ref: coreOpaqueIdSchema,
   })
-  .strict();
+  .strict()
+  .refine((value) => value.has_more === (value.next_cursor !== null), { path: ["next_cursor"], message: "cursor must agree with has_more" });
 export const artifactPageV1Schema = corePageV1Schema(artifactV1Schema);
 export const servicePageV1Schema = corePageV1Schema(serviceV1Schema, 64);
 
@@ -1222,10 +1347,12 @@ function validateRunSummary(value: RunSummaryShape, context: z.RefinementCtx): v
     if (value.current_attempt.status !== value.status) issue(context, ["current_attempt", "status"], "run and current attempt statuses must match");
   }
   if (value.pinned_revision !== null && !sameValue(value.pinned_revision, value.required_revision.revision)) issue(context, ["pinned_revision"], "run may pin only its required revision");
-  if (value.status === "queued" && value.pinned_revision !== null) issue(context, ["pinned_revision"], "queued run cannot claim a revision pin");
-  const pinRequired = ["preparing", "running", "cancelling", "succeeded", "failed"].includes(value.status)
-    || (value.status === "cancelled" && value.started_at !== null);
-  if (pinRequired && value.pinned_revision === null) issue(context, ["pinned_revision"], "admitted run requires its exact revision pin");
+  if ((value.admitted_at === null) !== (value.pinned_revision === null)) issue(context, ["admitted_at"], "admitted_at and pinned_revision must appear together");
+  const admissionRequired = ["preparing", "running", "cancelling", "succeeded", "failed"].includes(value.status);
+  if (admissionRequired && value.admitted_at === null) issue(context, ["admitted_at"], "admitted run requires its exact revision pin");
+  if (value.status === "queued" && value.queued_reason?.code === "required_revision_uncommitted" && value.admitted_at !== null) {
+    issue(context, ["admitted_at"], "run waiting for its required revision is not admitted");
+  }
   if (value.project_snapshot.kind !== "project") issue(context, ["project_snapshot", "kind"], "project snapshot has the wrong kind");
   if (value.task_snapshot.kind !== "task") issue(context, ["task_snapshot", "kind"], "task snapshot has the wrong kind");
   if (value.workspace_snapshot.kind !== "workspace") issue(context, ["workspace_snapshot", "kind"], "workspace snapshot has the wrong kind");

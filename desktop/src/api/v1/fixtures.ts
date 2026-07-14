@@ -4,7 +4,7 @@ const C = "c".repeat(64);
 const ETAG_A = `"${A}"`;
 const ETAG_B = `"${B}"`;
 const NOW = "2026-07-14T12:00:00Z";
-const OPENAPI_DIGEST = "c9f2fa2cdcc2ff5cde40b9bbd007430ac0ccfdf6452844315d8e29d913f0b7a0";
+const OPENAPI_DIGEST = "3a86582d04dcd233096337c737ba91d75854746848aedc319025d86213a03d36";
 
 const supportedAxis = {
   state: "supported",
@@ -84,6 +84,7 @@ const runSummary = {
   revision_transition: null,
   created_at: NOW,
   updated_at: NOW,
+  admitted_at: NOW,
   started_at: NOW,
   finished_at: null,
   etag: ETAG_A,
@@ -309,6 +310,7 @@ export const CONTRACT_FIXTURE_V1 = {
       relation: "successor",
     },
     revision_transition: revisionTransition,
+    admitted_at: null,
     started_at: null,
   },
   timeline: {
@@ -359,6 +361,7 @@ export const CONTRACT_FIXTURE_V1 = {
     capture_mode: "transcript",
     created_at: NOW,
     updated_at: NOW,
+    admitted_at: NOW,
     started_at: NOW,
     finished_at: null,
     etag: ETAG_A,
@@ -435,7 +438,23 @@ export const CONTRACT_FIXTURE_V1 = {
     artifact_content_sha256: A,
     previous_artifact_id: "artifact-memory-fixture-0",
     previous_artifact_content_sha256: B,
-    hunks: [
+    document_changes: [{
+      kind: "modified",
+      old_document: {
+        artifact_id: "artifact-memory-fixture-0",
+        artifact_content_sha256: B,
+        document_id: "memory",
+        relative_path: "memory.md",
+        content_sha256: B,
+      },
+      new_document: {
+        artifact_id: "artifact-memory-fixture-1",
+        artifact_content_sha256: A,
+        document_id: "memory",
+        relative_path: "memory.md",
+        content_sha256: A,
+      },
+      hunks: [
       {
         old_document: {
           artifact_id: "artifact-memory-fixture-0",
@@ -457,7 +476,9 @@ export const CONTRACT_FIXTURE_V1 = {
         new_count: 1,
         lines: [{ kind: "added", old_line_number: null, new_line_number: 1, text: "Validated behavior." }],
       },
-    ],
+      ],
+    }],
+    total_document_changes: 1,
     total_hunks: 1,
     total_lines: 1,
     truncated: false,
@@ -479,11 +500,15 @@ export const CONTRACT_FIXTURE_V1 = {
     schema_version: "1",
     id: "core-operation-service-fixture-1",
     kind: "service_restart",
+    descriptor: { kind: "service_restart", cancellable: false },
     status: "queued",
-    service_id: "service-control-fixture-1",
-    cache_scopes: [],
-    service: null,
-    cache_cleanup: null,
+    request: {
+      kind: "service_restart",
+      service_id: "service-control-fixture-1",
+      request: { schema_version: "1", reason: "Restart the control service." },
+    },
+    result: null,
+    cancellation: null,
     logs_ref: "core-logs-service-fixture-1",
     created_at: NOW,
     updated_at: NOW,
@@ -520,11 +545,11 @@ export const CONTRACT_FIXTURE_V1 = {
     schema_version: "1",
     id: "core-operation-cache-fixture-1",
     kind: "cache_cleanup",
+    descriptor: { kind: "cache_cleanup", cancellable: false },
     status: "running",
-    service_id: null,
-    cache_scopes: ["build_artifacts", "completed_runs"],
-    service: null,
-    cache_cleanup: null,
+    request: { kind: "cache_cleanup", request: { schema_version: "1", scopes: ["build_artifacts", "completed_runs"], older_than_days: 30 } },
+    result: null,
+    cancellation: null,
     logs_ref: "core-logs-cache-fixture-1",
     created_at: NOW,
     updated_at: NOW,

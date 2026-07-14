@@ -84,7 +84,24 @@ describe("Desktop Local API v1 schemas", () => {
     expect(localOperationV1Schema.parse(criticalFixture.operation_defaults.wire)).toEqual(criticalFixture.operation_defaults.normalized);
     expect(serviceV1Schema.parse(criticalFixture.service)).toEqual(criticalFixture.service);
     expect(artifactContentV1Schema.parse(criticalFixture.artifact_content).returned_utf8_bytes).toBe(29);
-    expect(artifactDiffV1Schema.parse(criticalFixture.artifact_diff).hunks[0]?.lines[0]?.text).toBe("");
+    expect(artifactDiffV1Schema.parse(criticalFixture.artifact_diff).document_changes[0]?.hunks[0]?.lines[0]?.text).toBe("");
+  });
+
+  it("mirrors Core admission, operation, diff, and pagination closure", () => {
+    expect(() => runV1Schema.parse({ ...CONTRACT_FIXTURE_V1.run, admitted_at: null })).toThrow(/admitted/i);
+    expect(() => operationV1Schema.parse({
+      ...CONTRACT_FIXTURE_V1.serviceOperation,
+      status: "cancelled",
+      cancellation: { reason: "user_requested", requested_at: CONTRACT_FIXTURE_V1.serviceOperation.updated_at },
+      finished_at: CONTRACT_FIXTURE_V1.serviceOperation.updated_at,
+    })).toThrow(/cancell/i);
+
+    const change = CONTRACT_FIXTURE_V1.artifactDiff.document_changes[0];
+    expect(() => artifactDiffV1Schema.parse({
+      ...CONTRACT_FIXTURE_V1.artifactDiff,
+      document_changes: [{ ...change, old_document: { ...change.old_document, artifact_id: "wrong-artifact" } }],
+    })).toThrow(/previous artifact/i);
+    expect(() => runPageV1Schema.parse({ ...RUN_PAGE_FIXTURE_V1, has_more: true })).toThrow(/cursor/i);
   });
 
   it("keeps ProjectTask closed and accepts only opaque native workspace imports", () => {
