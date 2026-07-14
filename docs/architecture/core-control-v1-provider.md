@@ -25,6 +25,12 @@ after FastAPI decoded a request body to a Python dictionary. Request enum
 fields now permit only their exact enum strings at that HTTP boundary. The
 OpenAPI and events snapshots and their digests are unchanged.
 
+Provider dispatch runs synchronous SQLite and workspace I/O on a dedicated
+four-worker executor. The ASGI event loop remains available for health checks
+and SSE delivery while an archive operation or transaction is blocked. SSE
+polling uses the same bounded executor, and shutdown closes the store there
+before releasing the threads.
+
 ## Endpoint Ownership
 
 | Endpoint group | Phase-one behavior |
@@ -64,6 +70,13 @@ The store uses full synchronous commits and WAL journaling. It does not persist
 the bearer, host paths in API resources, model credentials, commands, or open
 metadata.
 
+This pre-release provider state is explicitly **fresh-only** after the review
+hardening schema change. Startup creates the current schema for an empty
+database and compares every `sqlite_schema` row with a schema built from the
+same checked-in DDL. Earlier phase-one state, near-match DDL, extra
+table/index/view/trigger, or partially altered schema is rejected. Core does
+not infer or backfill missing idempotency request envelopes.
+
 Startup recovery runs while the provider holds its exclusive process lock. The
 store retains provider-root, owner-lock, upload-root, and snapshot-root FDs for
 its full lifetime. Every related operation revalidates each held inode against
@@ -80,11 +93,23 @@ publications, and snapshots left by a crash after publish rename but before the
 SQLite commit are removed relative to those held FDs without following
 symlinks; cleanup never traverses outside the managed roots.
 
+The main SQLite database, WAL, and SHM are opened no-follow relative to the
+held provider-root FD and retained for the store lifetime. Each must remain an
+owner-owned, link-count-one `0600` regular file at the same pathname and inode.
+Startup runs bounded `integrity_check(1)` and `foreign_key_check`, applies an
+exact page limit, and rejects database, WAL, startup-row, aggregate-blob,
+managed-entry, and managed-disk quota violations. Recovery reads tables in
+fixed-size rowid keyset pages: SQL byte lengths are budgeted before guarded
+blobs enter Python. Provider recovery and project listing do not use unbounded
+`fetchall()`.
+
 Project and upload ETags hash the complete validated canonical resource model,
 including model-populated defaults, plus an internal monotonic resource version.
 The same canonical model is persisted and used by startup recovery. Idempotency
 identity binds the Core v1 principal, operation ID, resource scope, canonical
-request, and semantic CAS headers. An exact replay returns the original typed
+request envelope, and semantic CAS headers. Success rows persist the canonical
+request/header bytes as well as their digest. An exact replay returns the
+original typed
 success or error response and ETag; a conflicting request returns
 `idempotency_key_reused`. Startup validates every persisted success before it
 reconciles failed-request audit rows. If legacy or corrupt state contains both
@@ -97,13 +122,24 @@ Core-generated project scope; upload chunk, finalize, and abort scopes bind both
 the parent project and upload IDs. Returned project/upload IDs, parent project,
 managed snapshot identities, upload lifecycle status, finalize publication, and
 the provider-owned validation result semantics must all match that scope and
-operation. A canonical response from another resource is therefore corruption,
-not an authoritative success.
+operation. Create, patch, upload-create, chunk, finalize, abort, and validation
+also revalidate request-to-response relations. Validation binds the requested
+registry and snapshots, chunks bind the requested final offset, and finalize
+binds both CAS headers and the requested archive digest. Replay and startup use
+the same validator. A canonical response from another resource is therefore
+corruption, not an authoritative success.
 
 Project creation signs Core-owned project and task snapshots. Scratch projects
 also receive an immutable empty workspace snapshot. Imported projects remain
 draft until their declared archive is finalized. The provider does not invent
 an active revision, so projects cannot become `ready` in this phase.
+Snapshot and publication content IDs are deterministic HMAC identities over
+their canonical digest, timestamp, and publication fields. Startup recomputes
+task, project, scratch-workspace, published-workspace, and content identities;
+project/upload rows also carry a signing-key-bound identity HMAC.
+Project validation constructs the framework execution profile from the exact
+persisted execution mode, capture mode, and harness ID; it does not substitute
+the capability endpoint's release-mode Codex/transcript projection.
 
 ## Workspace Publication
 
@@ -146,6 +182,8 @@ signs a new project snapshot, updates the project and upload, and appends the
 project event. Recovery verifies the published owner, modes, link counts, exact
 entry set, sizes, and bytes against the retained canonical archive before
 serving projects. No run consumes this snapshot until the later run-owner phase.
+Recovery additionally requires the finalized source upload to belong to the
+same project that references the publication.
 
 ## SSE Recovery
 
@@ -159,6 +197,14 @@ reloads snapshots; malformed, tampered, or future cursors return 400.
 The stream polls durable state, emits retained records in order, and persists a
 heartbeat after 15 seconds without another frame. Restarting Core preserves the
 same cursor key and replay order.
+Startup and replay require canonical frame bytes and authenticate each stored
+frame ID against its exact row sequence. A shape-valid but unsigned persisted
+cursor is store corruption.
+
+Typed conflict metadata is code-specific. Snapshot and registry races are
+retryable after an authoritative reload; malformed archive or config requests
+are non-retryable and `openevo_can_reconfigure`; storage quota exhaustion
+requires user action; detected durable-state corruption is non-retryable.
 
 ## Verification
 

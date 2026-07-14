@@ -42,6 +42,8 @@ class CoreControlApiProviderV1(Protocol):
 
     def invoke(self, operation_id: str, arguments: Mapping[str, object]) -> object: ...
 
+    async def invoke_async(self, operation_id: str, arguments: Mapping[str, object]) -> object: ...
+
 
 class CoreControlHTTPError(Exception):
     """Typed provider error rendered as the frozen ``ApiErrorV1`` shape."""
@@ -100,7 +102,7 @@ def _bind_provider(app: FastAPI, provider: CoreControlApiProviderV1) -> None:
         async def invoke_provider(
             _operation_id: str = operation_id, **arguments: object
         ) -> object:
-            return provider.invoke(_operation_id, arguments)
+            return await provider.invoke_async(_operation_id, arguments)
 
         route.endpoint = invoke_provider
         route.dependant.call = invoke_provider

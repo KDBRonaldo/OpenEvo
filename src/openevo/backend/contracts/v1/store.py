@@ -32,6 +32,14 @@ _EMPTY_WORKSPACE_DIGEST = hashlib.sha256(b"\0" * 1024).hexdigest()
 _IDEMPOTENCY_RETENTION_SECONDS = 7 * 24 * 60 * 60
 _IDEMPOTENCY_LIMIT = 10_000
 _CURSOR_TTL_SECONDS = 15 * 60
+_MAX_DATABASE_BYTES = 256 * 1024 * 1024
+_MAX_WAL_BYTES = 64 * 1024 * 1024
+_MAX_MANAGED_WORKSPACE_BYTES = 4 * 1024 * 1024 * 1024
+_MAX_STARTUP_ROWS = 50_000
+_MAX_STARTUP_BLOB_BYTES = 128 * 1024 * 1024
+_RECOVERY_PAGE_SIZE = 256
+_MAX_PROJECTS = 10_000
+_MAX_UPLOADS = 20_000
 _IDEMPOTENCY_RESPONSE_MODELS: dict[str, type[BaseModel]] = {
     model.__name__: model
     for model in (
@@ -40,6 +48,16 @@ _IDEMPOTENCY_RESPONSE_MODELS: dict[str, type[BaseModel]] = {
         m.WorkspaceUploadFinalizeResponseV1,
         m.ProjectValidationResponseV1,
     )
+}
+_IDEMPOTENCY_REQUEST_MODELS: dict[str, type[BaseModel] | None] = {
+    "createCoreProjectV1": m.ProjectCreateV1,
+    "patchCoreProjectV1": m.ProjectPatchV1,
+    "deleteCoreProjectV1": None,
+    "createCoreWorkspaceUploadV1": m.WorkspaceUploadCreateV1,
+    "putCoreWorkspaceUploadChunkV1": m.WorkspaceUploadChunkV1,
+    "finalizeCoreWorkspaceUploadV1": m.WorkspaceUploadFinalizeV1,
+    "abortCoreWorkspaceUploadV1": m.WorkspaceUploadAbortV1,
+    "validateCoreProjectV1": m.ProjectValidationRequestV1,
 }
 _IDEMPOTENCY_OPERATION_SPECS: dict[
     str, tuple[int, str, Literal["global", "project", "upload"]]
@@ -133,11 +151,20 @@ class _IdempotencyResourceScope:
 
 
 @dataclass(frozen=True)
+class _IdempotencyRequestEnvelope:
+    digest: str
+    request_json: bytes
+    semantic_headers_json: bytes
+
+
+@dataclass(frozen=True)
 class _WorkspaceChunkCommitExpectation:
     operation_id: str
     scope: str
     idempotency_key: str
     request_digest: str
+    request_json: bytes
+    semantic_headers_json: bytes
     project_id: str
     upload_id: str
     file_name: str
@@ -163,6 +190,7 @@ _SCHEMA = (
     """
     CREATE TABLE IF NOT EXISTS projects (
         project_id TEXT PRIMARY KEY,
+        identity_hmac TEXT NOT NULL,
         document_json BLOB NOT NULL,
         resource_version INTEGER NOT NULL CHECK (resource_version >= 1),
         created_at TEXT NOT NULL,
@@ -173,6 +201,7 @@ _SCHEMA = (
     CREATE TABLE IF NOT EXISTS workspace_uploads (
         upload_id TEXT PRIMARY KEY,
         project_id TEXT NOT NULL,
+        identity_hmac TEXT NOT NULL,
         document_json BLOB NOT NULL,
         resource_version INTEGER NOT NULL CHECK (resource_version >= 1),
         file_name TEXT NOT NULL,
@@ -187,6 +216,8 @@ _SCHEMA = (
         resource_scope TEXT NOT NULL,
         idempotency_key TEXT NOT NULL,
         request_digest TEXT NOT NULL,
+        request_json BLOB NOT NULL,
+        semantic_headers_json BLOB NOT NULL,
         status_code INTEGER NOT NULL,
         response_type TEXT NOT NULL,
         response_json BLOB,
@@ -239,16 +270,21 @@ class CoreControlStoreV1:
         self._event_replay_limit = event_replay_limit
         self._mutex = threading.RLock()
         self._closed = False
+        self._database_fds: dict[str, int] = {}
+        self._database_identities: dict[str, os.stat_result] = {}
         try:
             self._open_parent_anchor()
             self._prepare_root()
             self._open_lifecycle_storage()
+            self._prepare_database_authority()
             self._connection = self._open_database_connection()
             with self._transaction():
                 for statement in _SCHEMA:
                     self._connection.execute(statement)
+                self._verify_schema_fingerprint()
                 self._signing_key = self._load_or_create_signing_key()
-            self._harden_database_files()
+            self._bind_database_sidecars()
+            self._verify_database_integrity()
             self._recover_and_validate()
         except Exception:
             connection = getattr(self, "_connection", None)
@@ -273,27 +309,39 @@ class CoreControlStoreV1:
         idempotency_key: str,
         registry_digest: str | None,
     ) -> StoredResult:
-        digest = _request_digest("createCoreProjectV1", "projects", request, {})
+        envelope = _idempotency_envelope("createCoreProjectV1", "projects", request, {})
         with self._mutex, self._transaction():
             replay = self._idempotency_replay(
                 "createCoreProjectV1",
                 "projects",
                 idempotency_key,
-                digest,
+                envelope,
                 m.ProjectV1,
             )
             if replay is not None:
                 return replay
+            project_count = int(
+                self._connection.execute("SELECT COUNT(*) FROM projects").fetchone()[0]
+            )
+            if project_count >= _MAX_PROJECTS:
+                raise IdempotencyCapacityError("project capacity is exhausted")
             now = self._timestamp()
             project = self._new_project(request, now=now, registry_digest=registry_digest)
             self._connection.execute(
-                "INSERT INTO projects VALUES (?, ?, 1, ?, ?)",
-                (project.id, _model_bytes(project), now, now),
+                "INSERT INTO projects(project_id, identity_hmac, document_json, "
+                "resource_version, created_at, updated_at) VALUES (?, ?, ?, 1, ?, ?)",
+                (
+                    project.id,
+                    self._resource_identity_hmac("project", project.id),
+                    _model_bytes(project),
+                    now,
+                    now,
+                ),
             )
             self._append_project_event(project, now=now)
             result = StoredResult(201, project, project.etag)
             self._store_idempotency(
-                "createCoreProjectV1", "projects", idempotency_key, digest, result
+                "createCoreProjectV1", "projects", idempotency_key, envelope, result
             )
             return result
 
@@ -321,21 +369,31 @@ class CoreControlStoreV1:
             boundary: tuple[str, str] | None = None
             if after is not None:
                 boundary = self._decode_cursor(after, query_binding)
-            rows = self._connection.execute("SELECT document_json FROM projects").fetchall()
-        projects = [_validate_bytes(m.ProjectV1, row["document_json"]) for row in rows]
-        projects.sort(
-            key=lambda item: (str(getattr(item, sort)), item.id), reverse=direction == "desc"
-        )
-        if boundary is not None:
-            if direction == "asc":
-                projects = [
-                    item for item in projects if (str(getattr(item, sort)), item.id) > boundary
-                ]
-            else:
-                projects = [
-                    item for item in projects if (str(getattr(item, sort)), item.id) < boundary
-                ]
-        selected = projects[: limit + 1]
+            sort_expression = {
+                "created_at": "created_at",
+                "updated_at": "updated_at",
+                "name": "json_extract(CAST(document_json AS TEXT), '$.name')",
+            }[sort]
+            comparison = ">" if direction == "asc" else "<"
+            order = "ASC" if direction == "asc" else "DESC"
+            parameters: list[object] = []
+            where = ""
+            if boundary is not None:
+                where = (
+                    f"WHERE ({sort_expression} {comparison} ? OR "
+                    f"({sort_expression} = ? AND project_id {comparison} ?))"
+                )
+                parameters.extend((boundary[0], boundary[0], boundary[1]))
+            parameters.append(limit + 1)
+            cursor = self._connection.execute(
+                f"SELECT document_json FROM projects {where} "
+                f"ORDER BY {sort_expression} {order}, project_id {order} LIMIT ?",
+                parameters,
+            )
+            rows = cursor.fetchmany(limit + 1)
+            if cursor.fetchone() is not None:
+                raise StoreCorruptionError("project page query exceeded its bound")
+            selected = [_validate_bytes(m.ProjectV1, row["document_json"]) for row in rows]
         has_more = len(selected) > limit
         selected = selected[:limit]
         next_cursor = None
@@ -362,10 +420,10 @@ class CoreControlStoreV1:
         registry_digest: str | None,
     ) -> StoredResult:
         headers = {"if-match": if_match}
-        digest = _request_digest("patchCoreProjectV1", project_id, request, headers)
+        envelope = _idempotency_envelope("patchCoreProjectV1", project_id, request, headers)
         with self._mutex, self._transaction():
             replay = self._idempotency_replay(
-                "patchCoreProjectV1", project_id, idempotency_key, digest, m.ProjectV1
+                "patchCoreProjectV1", project_id, idempotency_key, envelope, m.ProjectV1
             )
             if replay is not None:
                 return replay
@@ -387,7 +445,7 @@ class CoreControlStoreV1:
             self._append_project_event(updated, now=now)
             result = StoredResult(200, updated, updated.etag)
             self._store_idempotency(
-                "patchCoreProjectV1", project_id, idempotency_key, digest, result
+                "patchCoreProjectV1", project_id, idempotency_key, envelope, result
             )
             return result
 
@@ -398,26 +456,30 @@ class CoreControlStoreV1:
         if_match: str,
         idempotency_key: str,
     ) -> StoredResult:
-        digest = _request_digest("deleteCoreProjectV1", project_id, None, {"if-match": if_match})
+        envelope = _idempotency_envelope(
+            "deleteCoreProjectV1", project_id, None, {"if-match": if_match}
+        )
         upload_files: list[str] = []
         with self._mutex, self._transaction():
             replay = self._idempotency_replay(
-                "deleteCoreProjectV1", project_id, idempotency_key, digest, None
+                "deleteCoreProjectV1", project_id, idempotency_key, envelope, None
             )
             if replay is not None:
                 return replay
             _, current = self._project_row(project_id)
             self._require_etag(current.etag, if_match, "project")
-            upload_files = [
-                row["file_name"]
-                for row in self._connection.execute(
-                    "SELECT file_name FROM workspace_uploads WHERE project_id = ?", (project_id,)
-                ).fetchall()
-            ]
+            upload_cursor = self._connection.execute(
+                "SELECT file_name FROM workspace_uploads WHERE project_id = ? "
+                "ORDER BY upload_id LIMIT ?",
+                (project_id, _MAX_UPLOADS + 1),
+            )
+            upload_files = [row["file_name"] for row in upload_cursor.fetchmany(_MAX_UPLOADS + 1)]
+            if len(upload_files) > _MAX_UPLOADS or upload_cursor.fetchone() is not None:
+                raise StoreCorruptionError("project upload cleanup quota is exceeded")
             self._connection.execute("DELETE FROM projects WHERE project_id = ?", (project_id,))
             result = StoredResult(204, None)
             self._store_idempotency(
-                "deleteCoreProjectV1", project_id, idempotency_key, digest, result
+                "deleteCoreProjectV1", project_id, idempotency_key, envelope, result
             )
         with self._mutex:
             for path in upload_files:
@@ -437,7 +499,7 @@ class CoreControlStoreV1:
         if_match: str,
         idempotency_key: str,
     ) -> StoredResult:
-        digest = _request_digest(
+        envelope = _idempotency_envelope(
             "createCoreWorkspaceUploadV1",
             project_id,
             request,
@@ -448,11 +510,27 @@ class CoreControlStoreV1:
                 "createCoreWorkspaceUploadV1",
                 project_id,
                 idempotency_key,
-                digest,
+                envelope,
                 m.WorkspaceUploadSessionV1,
             )
             if replay is not None:
                 return replay
+            upload_count = int(
+                self._connection.execute("SELECT COUNT(*) FROM workspace_uploads").fetchone()[0]
+            )
+            reserved_bytes = int(
+                self._connection.execute(
+                    "SELECT COALESCE(SUM(CAST(json_extract(CAST(document_json AS TEXT), "
+                    "'$.archive.byte_size') AS INTEGER)), 0) FROM workspace_uploads"
+                ).fetchone()[0]
+            )
+            if upload_count >= _MAX_UPLOADS:
+                raise IdempotencyCapacityError("workspace upload capacity is exhausted")
+            if reserved_bytes + request.archive.byte_size > _MAX_MANAGED_WORKSPACE_BYTES:
+                raise ResourceConflictError(
+                    "provider_storage_quota_exceeded",
+                    "The managed workspace storage quota would be exceeded.",
+                )
             _, project = self._project_row(project_id)
             self._require_etag(project.etag, if_match, "project")
             if request.project_snapshot != project.current_project_snapshot:
@@ -504,15 +582,25 @@ class CoreControlStoreV1:
             }
             session = _model_with_etag(m.WorkspaceUploadSessionV1, session_data, version=1)
             self._connection.execute(
-                "INSERT INTO workspace_uploads VALUES (?, ?, ?, 1, ?, ?, ?)",
-                (upload_id, project_id, _model_bytes(session), file_name, now, now),
+                "INSERT INTO workspace_uploads(upload_id, project_id, identity_hmac, "
+                "document_json, resource_version, file_name, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, 1, ?, ?, ?)",
+                (
+                    upload_id,
+                    project_id,
+                    self._resource_identity_hmac("upload", upload_id),
+                    _model_bytes(session),
+                    file_name,
+                    now,
+                    now,
+                ),
             )
             result = StoredResult(201, session, session.etag)
             self._store_idempotency(
                 "createCoreWorkspaceUploadV1",
                 project_id,
                 idempotency_key,
-                digest,
+                envelope,
                 result,
             )
             return result
@@ -532,7 +620,7 @@ class CoreControlStoreV1:
         idempotency_key: str,
     ) -> StoredResult:
         scope = f"{project_id}:{upload_id}"
-        digest = _request_digest(
+        envelope = _idempotency_envelope(
             "putCoreWorkspaceUploadChunkV1", scope, request, {"if-match": if_match}
         )
         content = base64.b64decode(request.content_base64, validate=True)
@@ -547,7 +635,7 @@ class CoreControlStoreV1:
                         "putCoreWorkspaceUploadChunkV1",
                         scope,
                         idempotency_key,
-                        digest,
+                        envelope,
                         m.WorkspaceUploadSessionV1,
                     )
                     if replay is not None:
@@ -604,7 +692,9 @@ class CoreControlStoreV1:
                         operation_id="putCoreWorkspaceUploadChunkV1",
                         scope=scope,
                         idempotency_key=idempotency_key,
-                        request_digest=digest,
+                        request_digest=envelope.digest,
+                        request_json=envelope.request_json,
+                        semantic_headers_json=envelope.semantic_headers_json,
                         project_id=project_id,
                         upload_id=upload_id,
                         file_name=row["file_name"],
@@ -628,7 +718,7 @@ class CoreControlStoreV1:
                         "putCoreWorkspaceUploadChunkV1",
                         scope,
                         idempotency_key,
-                        digest,
+                        envelope,
                         result,
                     )
                     return result
@@ -666,7 +756,7 @@ class CoreControlStoreV1:
         idempotency_key: str,
     ) -> StoredResult:
         scope = f"{project_id}:{upload_id}"
-        digest = _request_digest(
+        envelope = _idempotency_envelope(
             "finalizeCoreWorkspaceUploadV1",
             scope,
             request,
@@ -678,7 +768,7 @@ class CoreControlStoreV1:
                     "finalizeCoreWorkspaceUploadV1",
                     scope,
                     idempotency_key,
-                    digest,
+                    envelope,
                     m.WorkspaceUploadFinalizeResponseV1,
                 )
                 if replay is not None:
@@ -696,6 +786,7 @@ class CoreControlStoreV1:
 
             now = self._timestamp()
             workspace_snapshot = _snapshot(
+                self._signing_key,
                 m.SnapshotKind.WORKSPACE,
                 {"archive_sha256": upload.archive.content_sha256},
                 now,
@@ -727,7 +818,15 @@ class CoreControlStoreV1:
                     if_project_match=if_project_match,
                 )
                 content_ref = m.ContentRefV1(
-                    content_id=_new_id("workspace-content"),
+                    content_id=_core_owned_id(
+                        self._signing_key,
+                        "workspace-content",
+                        {
+                            "sha256": upload.archive.content_sha256,
+                            "byte_size": upload.archive.byte_size,
+                            "published_at": now,
+                        },
+                    ),
                     sha256=upload.archive.content_sha256,
                     byte_size=upload.archive.byte_size,
                 )
@@ -747,7 +846,10 @@ class CoreControlStoreV1:
                     updated_at=now,
                 )
                 project_snapshot = _snapshot(
-                    m.SnapshotKind.PROJECT, _project_snapshot_payload(project_data), now
+                    self._signing_key,
+                    m.SnapshotKind.PROJECT,
+                    _project_snapshot_payload(project_data),
+                    now,
                 )
                 project_data["current_project_snapshot"] = project_snapshot
                 updated_project = _model_with_etag(
@@ -789,7 +891,7 @@ class CoreControlStoreV1:
                     "finalizeCoreWorkspaceUploadV1",
                     scope,
                     idempotency_key,
-                    digest,
+                    envelope,
                     result,
                 )
                 return result
@@ -804,7 +906,7 @@ class CoreControlStoreV1:
         idempotency_key: str,
     ) -> StoredResult:
         scope = f"{project_id}:{upload_id}"
-        digest = _request_digest(
+        envelope = _idempotency_envelope(
             "abortCoreWorkspaceUploadV1", scope, request, {"if-match": if_match}
         )
         with self._mutex, self._transaction():
@@ -812,7 +914,7 @@ class CoreControlStoreV1:
                 "abortCoreWorkspaceUploadV1",
                 scope,
                 idempotency_key,
-                digest,
+                envelope,
                 m.WorkspaceUploadSessionV1,
             )
             if replay is not None:
@@ -835,7 +937,7 @@ class CoreControlStoreV1:
             )
             result = StoredResult(200, updated, updated.etag)
             self._store_idempotency(
-                "abortCoreWorkspaceUploadV1", scope, idempotency_key, digest, result
+                "abortCoreWorkspaceUploadV1", scope, idempotency_key, envelope, result
             )
         with self._mutex:
             try:
@@ -854,13 +956,13 @@ class CoreControlStoreV1:
         idempotency_key: str,
         response_factory: Callable[[m.ProjectV1], m.ProjectValidationResponseV1],
     ) -> StoredResult:
-        digest = _request_digest("validateCoreProjectV1", project_id, request, {})
+        envelope = _idempotency_envelope("validateCoreProjectV1", project_id, request, {})
         with self._mutex, self._transaction():
             replay = self._idempotency_replay(
                 "validateCoreProjectV1",
                 project_id,
                 idempotency_key,
-                digest,
+                envelope,
                 m.ProjectValidationResponseV1,
             )
             if replay is not None:
@@ -869,7 +971,7 @@ class CoreControlStoreV1:
             response = response_factory(project)
             result = StoredResult(200, response)
             self._store_idempotency(
-                "validateCoreProjectV1", project_id, idempotency_key, digest, result
+                "validateCoreProjectV1", project_id, idempotency_key, envelope, result
             )
             return result
 
@@ -974,9 +1076,9 @@ class CoreControlStoreV1:
                 if after_sequence < int(minimum):
                     raise EventCursorExpiredError("event cursor expired")
             rows = self._connection.execute(
-                "SELECT frame_json FROM events WHERE sequence > ? ORDER BY sequence ASC",
-                (after_sequence,),
-            ).fetchall()
+                "SELECT frame_json FROM events WHERE sequence > ? ORDER BY sequence ASC LIMIT ?",
+                (after_sequence, self._event_replay_limit),
+            ).fetchmany(self._event_replay_limit)
             frames: list[dict[str, object]] = []
             for row in rows:
                 frame = _validate_bytes(m.SseFrameV1, row["frame_json"])
@@ -1000,14 +1102,19 @@ class CoreControlStoreV1:
         registry_digest: str | None,
     ) -> m.ProjectV1:
         project_id = _new_id("project")
-        task_snapshot = _snapshot(m.SnapshotKind.TASK, request.task.model_dump(mode="json"), now)
+        task_snapshot = _snapshot(
+            self._signing_key,
+            m.SnapshotKind.TASK,
+            request.task.model_dump(mode="json"),
+            now,
+        )
         workspace_snapshot = None
         if isinstance(request.workspace, m.ScratchWorkspaceSpecV1):
-            workspace_snapshot = m.ImmutableSnapshotRefV1(
-                id=_new_id("workspace-snapshot"),
-                kind=m.SnapshotKind.WORKSPACE,
-                content_sha256=_EMPTY_WORKSPACE_DIGEST,
-                created_at=now,
+            workspace_snapshot = _snapshot_from_digest(
+                self._signing_key,
+                m.SnapshotKind.WORKSPACE,
+                _EMPTY_WORKSPACE_DIGEST,
+                now,
             )
         model_status = (
             m.ModelPreparationStatus.READY
@@ -1037,9 +1144,80 @@ class CoreControlStoreV1:
             "task": request.task,
             "workspace": request.workspace,
         }
-        project_snapshot = _snapshot(m.SnapshotKind.PROJECT, _project_snapshot_payload(data), now)
+        project_snapshot = _snapshot(
+            self._signing_key,
+            m.SnapshotKind.PROJECT,
+            _project_snapshot_payload(data),
+            now,
+        )
         data["current_project_snapshot"] = project_snapshot
         return _model_with_etag(m.ProjectV1, data, version=1)
+
+    def _validate_project_snapshot_closure(self, project: m.ProjectV1) -> None:
+        expected_task = _snapshot(
+            self._signing_key,
+            m.SnapshotKind.TASK,
+            project.task.model_dump(mode="json"),
+            project.current_task_snapshot.created_at,
+        )
+        if project.current_task_snapshot != expected_task:
+            raise StoreCorruptionError("project task snapshot binding is invalid")
+
+        if isinstance(project.workspace, m.ScratchWorkspaceSpecV1):
+            workspace = project.current_workspace_snapshot
+            if workspace is None or workspace != _snapshot_from_digest(
+                self._signing_key,
+                m.SnapshotKind.WORKSPACE,
+                _EMPTY_WORKSPACE_DIGEST,
+                workspace.created_at,
+            ):
+                raise StoreCorruptionError("scratch workspace snapshot binding is invalid")
+            if project.workspace_publication is not None:
+                raise StoreCorruptionError("scratch project has a workspace publication")
+        elif project.workspace_publication is None:
+            if project.current_workspace_snapshot is not None:
+                raise StoreCorruptionError("unpublished workspace snapshot binding is invalid")
+        else:
+            self._validate_publication_identity(project.workspace_publication)
+            if (
+                project.current_workspace_snapshot
+                != project.workspace_publication.workspace_snapshot
+            ):
+                raise StoreCorruptionError("project workspace snapshot binding is invalid")
+
+        project_payload = project.model_dump(
+            mode="python", exclude={"etag", "current_project_snapshot"}
+        )
+        expected_project = _snapshot(
+            self._signing_key,
+            m.SnapshotKind.PROJECT,
+            _project_snapshot_payload(project_payload),
+            project.current_project_snapshot.created_at,
+        )
+        if project.current_project_snapshot != expected_project:
+            raise StoreCorruptionError("project snapshot binding is invalid")
+
+    def _validate_publication_identity(self, publication: m.WorkspacePublicationV1) -> None:
+        expected_workspace = _snapshot(
+            self._signing_key,
+            m.SnapshotKind.WORKSPACE,
+            {"archive_sha256": publication.archive.content_sha256},
+            publication.workspace_snapshot.created_at,
+        )
+        expected_content_id = _core_owned_id(
+            self._signing_key,
+            "workspace-content",
+            {
+                "sha256": publication.archive.content_sha256,
+                "byte_size": publication.archive.byte_size,
+                "published_at": publication.published_at,
+            },
+        )
+        if (
+            publication.workspace_snapshot != expected_workspace
+            or publication.content_ref.content_id != expected_content_id
+        ):
+            raise StoreCorruptionError("workspace publication Core identity is invalid")
 
     def _patched_project(
         self,
@@ -1057,17 +1235,22 @@ class CoreControlStoreV1:
         assert spec is not None and task is not None and workspace is not None
         task_snapshot = current.current_task_snapshot
         if "task" in fields:
-            task_snapshot = _snapshot(m.SnapshotKind.TASK, task.model_dump(mode="json"), now)
+            task_snapshot = _snapshot(
+                self._signing_key,
+                m.SnapshotKind.TASK,
+                task.model_dump(mode="json"),
+                now,
+            )
         workspace_snapshot = current.current_workspace_snapshot
         publication = current.workspace_publication
         if "workspace" in fields and workspace != current.workspace:
             publication = None
             if isinstance(workspace, m.ScratchWorkspaceSpecV1):
-                workspace_snapshot = m.ImmutableSnapshotRefV1(
-                    id=_new_id("workspace-snapshot"),
-                    kind=m.SnapshotKind.WORKSPACE,
-                    content_sha256=_EMPTY_WORKSPACE_DIGEST,
-                    created_at=now,
+                workspace_snapshot = _snapshot_from_digest(
+                    self._signing_key,
+                    m.SnapshotKind.WORKSPACE,
+                    _EMPTY_WORKSPACE_DIGEST,
+                    now,
                 )
             else:
                 workspace_snapshot = None
@@ -1099,7 +1282,10 @@ class CoreControlStoreV1:
             updated_at=now,
         )
         data["current_project_snapshot"] = _snapshot(
-            m.SnapshotKind.PROJECT, _project_snapshot_payload(data), now
+            self._signing_key,
+            m.SnapshotKind.PROJECT,
+            _project_snapshot_payload(data),
+            now,
         )
         return _model_with_etag(m.ProjectV1, data, version=version)
 
@@ -1160,7 +1346,7 @@ class CoreControlStoreV1:
         operation_id: str,
         scope: str,
         key: str,
-        request_digest: str,
+        envelope: _IdempotencyRequestEnvelope,
         response_model: type[_ModelT] | None,
     ) -> StoredResult | None:
         row = self._connection.execute(
@@ -1170,14 +1356,17 @@ class CoreControlStoreV1:
         ).fetchone()
         if row is None:
             return None
-        if not hmac.compare_digest(row["request_digest"], request_digest):
+        _validate_idempotency_request_envelope(row)
+        if (
+            not hmac.compare_digest(row["request_digest"], envelope.digest)
+            or bytes(row["request_json"]) != envelope.request_json
+            or bytes(row["semantic_headers_json"]) != envelope.semantic_headers_json
+        ):
             raise IdempotencyConflictError("idempotency key was reused")
-        model = None
-        if response_model is not None:
-            if row["response_json"] is None or row["response_type"] != response_model.__name__:
-                raise StoreCorruptionError("idempotency response type is invalid")
-            model = _validate_bytes(response_model, row["response_json"])
-        elif row["response_json"] is not None or row["response_type"] != "NoContent":
+        model = _validate_idempotency_row(row, signing_key=self._signing_key)
+        if response_model is not None and not isinstance(model, response_model):
+            raise StoreCorruptionError("idempotency response type is invalid")
+        if response_model is None and model is not None:
             raise StoreCorruptionError("no-content idempotency response is invalid")
         return StoredResult(int(row["status_code"]), model, row["etag"], replayed=True)
 
@@ -1186,7 +1375,7 @@ class CoreControlStoreV1:
         operation_id: str,
         scope: str,
         key: str,
-        request_digest: str,
+        envelope: _IdempotencyRequestEnvelope,
         result: StoredResult,
     ) -> None:
         now = int(time.time())
@@ -1203,12 +1392,17 @@ class CoreControlStoreV1:
         )
         response_bytes = _model_bytes(result.model) if result.model is not None else None
         self._connection.execute(
-            "INSERT INTO idempotency_records VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO idempotency_records(operation_id, resource_scope, "
+            "idempotency_key, request_digest, request_json, semantic_headers_json, "
+            "status_code, response_type, response_json, etag, created_at_epoch, "
+            "expires_at_epoch) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 operation_id,
                 scope,
                 key,
-                request_digest,
+                envelope.digest,
+                envelope.request_json,
+                envelope.semantic_headers_json,
                 result.status_code,
                 response_type,
                 response_bytes,
@@ -1315,10 +1509,106 @@ class CoreControlStoreV1:
             raise CursorExpiredError("project cursor expired")
         return payload["boundary"][0], payload["boundary"][1]
 
+    def _recovery_rows(
+        self,
+        table: Literal[
+            "projects",
+            "workspace_uploads",
+            "idempotency_records",
+            "failed_idempotency_records",
+            "events",
+        ],
+        *,
+        columns: tuple[str, ...],
+        blob_columns: tuple[str, ...],
+        max_rows: int,
+    ):
+        totals = ["COUNT(*)"] + [
+            f"COALESCE(SUM(length(CAST({column} AS BLOB))), 0)" for column in blob_columns
+        ]
+        aggregate = self._connection.execute(f"SELECT {', '.join(totals)} FROM {table}").fetchone()
+        assert aggregate is not None
+        row_count = int(aggregate[0])
+        blob_bytes = sum(int(aggregate[index]) for index in range(1, len(aggregate)))
+        self._startup_scan_rows += row_count
+        self._startup_scan_bytes += blob_bytes
+        if row_count > max_rows or blob_bytes > _MAX_STARTUP_BLOB_BYTES:
+            raise StoreCorruptionError(f"Core Control {table} recovery quota is exceeded")
+        if (
+            self._startup_scan_rows > _MAX_STARTUP_ROWS
+            or self._startup_scan_bytes > _MAX_STARTUP_BLOB_BYTES
+        ):
+            raise StoreCorruptionError("Core Control aggregate startup quota is exceeded")
+        for column in blob_columns:
+            oversized = self._connection.execute(
+                f"SELECT 1 FROM {table} WHERE {column} IS NOT NULL AND "
+                f"length(CAST({column} AS BLOB)) > 16777216 LIMIT 1"
+            ).fetchone()
+            if oversized is not None:
+                raise StoreCorruptionError(f"Core Control {table} recovery quota is exceeded")
+
+        last_rowid = 0
+        guarded_columns = []
+        for column in columns:
+            if column in blob_columns:
+                guarded_columns.append(
+                    f"CASE WHEN length(CAST({column} AS BLOB)) <= 16777216 "
+                    f"THEN {column} END AS {column}"
+                )
+            else:
+                guarded_columns.append(column)
+        seen = 0
+        while True:
+            cursor = self._connection.execute(
+                f"SELECT rowid AS _recovery_rowid, {', '.join(guarded_columns)} "
+                f"FROM {table} WHERE rowid > ? ORDER BY rowid LIMIT ?",
+                (last_rowid, _RECOVERY_PAGE_SIZE),
+            )
+            page = cursor.fetchmany(_RECOVERY_PAGE_SIZE)
+            if cursor.fetchone() is not None:
+                raise StoreCorruptionError(f"Core Control {table} page exceeded its bound")
+            if not page:
+                break
+            for row in page:
+                seen += 1
+                if seen > max_rows:
+                    raise StoreCorruptionError(f"Core Control {table} recovery quota is exceeded")
+                last_rowid = int(row["_recovery_rowid"])
+                yield row
+        if seen != row_count:
+            raise StoreCorruptionError(f"Core Control {table} recovery scan changed")
+
     def _recover_and_validate(self) -> None:
         with self._mutex, self._transaction():
+            self._verify_schema_fingerprint()
+            self._verify_database_integrity()
+            self._startup_scan_rows = 0
+            self._startup_scan_bytes = 0
+            _verify_managed_disk_quota(
+                self._upload_root_fd,
+                max_entries=_MAX_UPLOADS + 256,
+                max_bytes=_MAX_MANAGED_WORKSPACE_BYTES,
+            )
+            _verify_managed_disk_quota(
+                self._workspace_root_fd,
+                max_entries=100_000 + _MAX_UPLOADS,
+                max_bytes=_MAX_MANAGED_WORKSPACE_BYTES,
+            )
             project_publications: dict[str, m.WorkspacePublicationV1] = {}
-            for row in self._connection.execute("SELECT * FROM projects"):
+            publication_projects: dict[str, str] = {}
+            for row in self._recovery_rows(
+                "projects",
+                columns=(
+                    "project_id",
+                    "identity_hmac",
+                    "document_json",
+                    "resource_version",
+                    "created_at",
+                    "updated_at",
+                ),
+                blob_columns=("document_json",),
+                max_rows=_MAX_PROJECTS,
+            ):
                 project = _validate_bytes(m.ProjectV1, row["document_json"])
                 version = int(row["resource_version"])
                 project_data = project.model_dump(mode="python", exclude={"etag"})
@@ -1327,8 +1617,13 @@ class CoreControlStoreV1:
                     or project.created_at != row["created_at"]
                     or project.updated_at != row["updated_at"]
                     or project.etag != _etag(project_data, version=version)
+                    or not hmac.compare_digest(
+                        row["identity_hmac"],
+                        self._resource_identity_hmac("project", project.id),
+                    )
                 ):
                     raise StoreCorruptionError("project row identity is invalid")
+                self._validate_project_snapshot_closure(project)
                 if project.workspace_publication is not None:
                     publication = project.workspace_publication
                     expected_digest = hashlib.sha256(
@@ -1341,9 +1636,24 @@ class CoreControlStoreV1:
                     )
                     if existing != publication:
                         raise StoreCorruptionError("workspace snapshot publication is ambiguous")
+                    publication_projects[publication.workspace_snapshot.id] = project.id
             referenced_files: set[str] = set()
-            snapshot_sources: dict[str, tuple[m.WorkspacePublicationV1, str]] = {}
-            for row in self._connection.execute("SELECT * FROM workspace_uploads"):
+            snapshot_sources: dict[str, tuple[m.WorkspacePublicationV1, str, str]] = {}
+            for row in self._recovery_rows(
+                "workspace_uploads",
+                columns=(
+                    "upload_id",
+                    "project_id",
+                    "identity_hmac",
+                    "document_json",
+                    "resource_version",
+                    "file_name",
+                    "created_at",
+                    "updated_at",
+                ),
+                blob_columns=("document_json",),
+                max_rows=_MAX_UPLOADS,
+            ):
                 upload = _validate_bytes(m.WorkspaceUploadSessionV1, row["document_json"])
                 version = int(row["resource_version"])
                 upload_data = upload.model_dump(mode="python", exclude={"etag"})
@@ -1353,8 +1663,25 @@ class CoreControlStoreV1:
                     or upload.created_at != row["created_at"]
                     or upload.updated_at != row["updated_at"]
                     or upload.etag != _etag(upload_data, version=version)
+                    or not hmac.compare_digest(
+                        row["identity_hmac"],
+                        self._resource_identity_hmac("upload", upload.id),
+                    )
                 ):
                     raise StoreCorruptionError("workspace upload row identity is invalid")
+                for snapshot in (
+                    upload.project_snapshot,
+                    upload.base_workspace_snapshot,
+                ):
+                    if snapshot is not None and snapshot != _snapshot_from_digest(
+                        self._signing_key,
+                        snapshot.kind,
+                        snapshot.content_sha256,
+                        snapshot.created_at,
+                    ):
+                        raise StoreCorruptionError(
+                            "workspace upload snapshot Core identity is invalid"
+                        )
                 file_name = row["file_name"]
                 if file_name != f"{upload.id}.part":
                     raise StoreCorruptionError("workspace upload file identity is invalid")
@@ -1366,7 +1693,10 @@ class CoreControlStoreV1:
                     if publication is None:
                         raise StoreCorruptionError("finalized workspace upload has no publication")
                     snapshot_id = publication.workspace_snapshot.id
-                    existing = snapshot_sources.setdefault(snapshot_id, (publication, file_name))
+                    self._validate_publication_identity(publication)
+                    existing = snapshot_sources.setdefault(
+                        snapshot_id, (publication, file_name, upload.project_id)
+                    )
                     if existing[0] != publication:
                         raise StoreCorruptionError("workspace snapshot source is ambiguous")
             for snapshot_id, publication in project_publications.items():
@@ -1375,21 +1705,71 @@ class CoreControlStoreV1:
                     raise StoreCorruptionError(
                         "published project workspace has no authoritative upload"
                     )
-            for row in self._connection.execute(
-                "SELECT sequence, event_id, frame_json FROM events ORDER BY sequence"
+                if source[2] != publication_projects[snapshot_id]:
+                    raise StoreCorruptionError(
+                        "workspace publication is not bound to an upload from the same project"
+                    )
+            for row in self._recovery_rows(
+                "events",
+                columns=("sequence", "event_id", "frame_json", "created_at_epoch"),
+                blob_columns=("frame_json",),
+                max_rows=self._event_replay_limit,
             ):
                 frame = _validate_bytes(m.SseFrameV1, row["frame_json"])
-                if frame.id != row["event_id"] or frame.data.root.sequence != row["sequence"]:
+                if (
+                    _model_bytes(frame) != bytes(row["frame_json"])
+                    or frame.id != row["event_id"]
+                    or frame.data.root.sequence != row["sequence"]
+                ):
                     raise StoreCorruptionError("event row identity is invalid")
+                try:
+                    cursor_sequence = self._decode_event_cursor(frame.id)
+                except EventCursorInvalidError as exc:
+                    raise StoreCorruptionError("event cursor authentication failed") from exc
+                if cursor_sequence != int(row["sequence"]):
+                    raise StoreCorruptionError("event cursor sequence is invalid")
             valid_successes: set[tuple[str, str, str]] = set()
-            for row in self._connection.execute("SELECT * FROM idempotency_records").fetchall():
-                _validate_idempotency_row(row)
+            for row in self._recovery_rows(
+                "idempotency_records",
+                columns=(
+                    "operation_id",
+                    "resource_scope",
+                    "idempotency_key",
+                    "request_digest",
+                    "request_json",
+                    "semantic_headers_json",
+                    "status_code",
+                    "response_type",
+                    "response_json",
+                    "etag",
+                    "created_at_epoch",
+                    "expires_at_epoch",
+                ),
+                blob_columns=(
+                    "request_json",
+                    "semantic_headers_json",
+                    "response_json",
+                ),
+                max_rows=_IDEMPOTENCY_LIMIT,
+            ):
+                _validate_idempotency_row(row, signing_key=self._signing_key)
                 valid_successes.add(
                     (row["operation_id"], row["resource_scope"], row["idempotency_key"])
                 )
-            for row in self._connection.execute(
-                "SELECT * FROM failed_idempotency_records"
-            ).fetchall():
+            for row in self._recovery_rows(
+                "failed_idempotency_records",
+                columns=(
+                    "operation_id",
+                    "resource_scope",
+                    "idempotency_key",
+                    "request_digest",
+                    "error_json",
+                    "created_at_epoch",
+                    "expires_at_epoch",
+                ),
+                blob_columns=("error_json",),
+                max_rows=_IDEMPOTENCY_LIMIT,
+            ):
                 success_scope = _success_scope_for_failed_idempotency(row)
                 if (
                     success_scope is not None
@@ -1430,10 +1810,10 @@ class CoreControlStoreV1:
                         file_name,
                         accepted_offset=upload.accepted_offset,
                     )
-            for name in os.listdir(upload_root_fd):
+            for name in _bounded_directory_names(upload_root_fd, _MAX_UPLOADS + 256):
                 if name not in referenced_files:
                     _remove_entry_at(upload_root_fd, name)
-            for snapshot_id, (publication, archive_name) in snapshot_sources.items():
+            for snapshot_id, (publication, archive_name, _project_id) in snapshot_sources.items():
                 try:
                     archive_fd = os.open(
                         archive_name,
@@ -1461,7 +1841,7 @@ class CoreControlStoreV1:
                     raise StoreCorruptionError(
                         "published workspace snapshot is missing or invalid"
                     ) from exc
-            for name in os.listdir(workspace_root_fd):
+            for name in _bounded_directory_names(workspace_root_fd, _MAX_UPLOADS + 256):
                 if name not in snapshot_sources:
                     _remove_entry_at(workspace_root_fd, name)
 
@@ -1594,6 +1974,8 @@ class CoreControlStoreV1:
         _validate_idempotency_row(success_row)
         exact_success = (
             hmac.compare_digest(success_row["request_digest"], expectation.request_digest)
+            and bytes(success_row["request_json"]) == expectation.request_json
+            and bytes(success_row["semantic_headers_json"]) == expectation.semantic_headers_json
             and int(success_row["status_code"]) == expectation.result.status_code
             and success_row["response_type"] == m.WorkspaceUploadSessionV1.__name__
             and bytes(success_row["response_json"]) == expectation.new_document_json
@@ -1749,10 +2131,18 @@ class CoreControlStoreV1:
             _require_entry_binding(
                 self._root_fd, "workspace-snapshots", self._workspace_root_identity
             )
+            self._verify_database_authority()
         except OSError as exc:
             raise StoreCorruptionError("Core Control lifecycle storage is unavailable") from exc
 
     def _close_lifecycle_storage(self) -> None:
+        for descriptor in self._database_fds.values():
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        self._database_fds.clear()
+        self._database_identities.clear()
         for name in ("_workspace_root_fd", "_upload_root_fd"):
             descriptor = getattr(self, name, None)
             if descriptor is not None:
@@ -1815,6 +2205,106 @@ class CoreControlStoreV1:
         )
         return value
 
+    def _prepare_database_authority(self) -> None:
+        name = "provider.sqlite3"
+        flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            fd = os.open(name, flags | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=self._root_fd)
+        except FileExistsError:
+            fd = os.open(name, flags, dir_fd=self._root_fd)
+        try:
+            metadata = os.fstat(fd)
+            _require_private_regular_metadata(metadata)
+            _require_entry_binding(self._root_fd, name, metadata)
+        except Exception:
+            os.close(fd)
+            raise
+        self._database_fds[name] = fd
+        self._database_identities[name] = metadata
+        for suffix in ("-wal", "-shm"):
+            sidecar = name + suffix
+            try:
+                sidecar_fd = os.open(sidecar, flags, dir_fd=self._root_fd)
+            except FileNotFoundError:
+                continue
+            try:
+                sidecar_metadata = os.fstat(sidecar_fd)
+                _require_private_regular_metadata(sidecar_metadata)
+                _require_entry_binding(self._root_fd, sidecar, sidecar_metadata)
+            except Exception:
+                os.close(sidecar_fd)
+                raise
+            self._database_fds[sidecar] = sidecar_fd
+            self._database_identities[sidecar] = sidecar_metadata
+
+    def _bind_database_sidecars(self) -> None:
+        for suffix in ("-wal", "-shm"):
+            name = "provider.sqlite3" + suffix
+            if name in self._database_fds:
+                continue
+            try:
+                fd = os.open(
+                    name,
+                    os.O_RDWR | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=self._root_fd,
+                )
+            except OSError as exc:
+                raise StoreCorruptionError(
+                    "Core Control SQLite sidecar is missing or unsafe"
+                ) from exc
+            try:
+                metadata = os.fstat(fd)
+                _require_private_regular_metadata(metadata)
+                _require_entry_binding(self._root_fd, name, metadata)
+            except Exception:
+                os.close(fd)
+                raise
+            self._database_fds[name] = fd
+            self._database_identities[name] = metadata
+        self._verify_database_authority()
+
+    def _verify_database_authority(self) -> None:
+        if not self._database_fds:
+            return
+        for name, fd in self._database_fds.items():
+            current = os.fstat(fd)
+            try:
+                _require_private_regular_metadata(current)
+            except StoreCorruptionError as exc:
+                raise StoreCorruptionError(f"Core Control database file {name} is unsafe") from exc
+            _require_same_identity(current, self._database_identities[name], f"database {name}")
+            _require_entry_binding(self._root_fd, name, self._database_identities[name])
+            if name.endswith("-wal") and current.st_size > _MAX_WAL_BYTES:
+                raise StoreCorruptionError("Core Control database WAL quota is exceeded")
+            if name == "provider.sqlite3" and current.st_size > _MAX_DATABASE_BYTES:
+                raise StoreCorruptionError("Core Control database size quota is exceeded")
+
+    def _verify_schema_fingerprint(self) -> None:
+        if _schema_fingerprint(self._connection) != _expected_schema_fingerprint():
+            raise StoreCorruptionError(
+                "Core Control schema fingerprint is incompatible; provider state is fresh-only"
+            )
+
+    def _verify_database_integrity(self) -> None:
+        self._verify_database_authority()
+        integrity = self._connection.execute("PRAGMA integrity_check(1)")
+        row = integrity.fetchone()
+        if row is None or row[0] != "ok" or integrity.fetchone() is not None:
+            raise StoreCorruptionError("Core Control database integrity check failed")
+        if self._connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
+            raise StoreCorruptionError("Core Control database foreign key check failed")
+        page_size = int(self._connection.execute("PRAGMA page_size").fetchone()[0])
+        page_count = int(self._connection.execute("PRAGMA page_count").fetchone()[0])
+        if page_size <= 0 or page_count * page_size > _MAX_DATABASE_BYTES:
+            raise StoreCorruptionError("Core Control database page quota is exceeded")
+
+    def _resource_identity_hmac(self, kind: str, resource_id: str) -> str:
+        return hmac.new(
+            self._signing_key,
+            f"resource.v1:{kind}:{resource_id}".encode("ascii"),
+            hashlib.sha256,
+        ).hexdigest()
+
     def _open_database_connection(self) -> sqlite3.Connection:
         connection = sqlite3.connect(
             self.root / "provider.sqlite3",
@@ -1824,19 +2314,23 @@ class CoreControlStoreV1:
         )
         try:
             connection.row_factory = sqlite3.Row
+            schema_row = connection.execute("SELECT 1 FROM sqlite_schema LIMIT 1").fetchone()
+            if (
+                schema_row is not None
+                and _schema_fingerprint(connection) != _expected_schema_fingerprint()
+            ):
+                raise StoreCorruptionError(
+                    "Core Control schema fingerprint is incompatible; provider state is fresh-only"
+                )
             connection.execute("PRAGMA foreign_keys = ON")
             connection.execute("PRAGMA journal_mode = WAL")
             connection.execute("PRAGMA synchronous = FULL")
+            page_size = int(connection.execute("PRAGMA page_size").fetchone()[0])
+            connection.execute(f"PRAGMA max_page_count = {_MAX_DATABASE_BYTES // page_size}")
         except Exception:
             connection.close()
             raise
         return connection
-
-    def _harden_database_files(self) -> None:
-        for suffix in ("", "-wal", "-shm"):
-            path = self.root / f"provider.sqlite3{suffix}"
-            if path.exists():
-                os.chmod(path, 0o600)
 
     def _require_etag(self, current: str, supplied: str, resource_type: str) -> None:
         if not hmac.compare_digest(current, supplied):
@@ -1907,13 +2401,70 @@ def _new_id(prefix: str) -> str:
     return f"{prefix}-{secrets.token_hex(16)}"
 
 
-def _snapshot(kind: m.SnapshotKind, payload: object, now: str) -> m.ImmutableSnapshotRefV1:
+def _schema_fingerprint(connection: sqlite3.Connection) -> bytes:
+    rows = connection.execute(
+        "SELECT type, name, tbl_name, sql FROM sqlite_schema ORDER BY type, name"
+    )
+    schema: list[list[object]] = []
+    while True:
+        page = rows.fetchmany(_RECOVERY_PAGE_SIZE)
+        if not page:
+            break
+        schema.extend([[row[0], row[1], row[2], row[3]] for row in page])
+        if len(schema) > 64:
+            raise StoreCorruptionError("Core Control schema fingerprint is oversized")
+    return _canonical_bytes(schema)
+
+
+def _expected_schema_fingerprint() -> bytes:
+    connection = sqlite3.connect(":memory:")
+    try:
+        for statement in _SCHEMA:
+            connection.execute(statement)
+        return _schema_fingerprint(connection)
+    finally:
+        connection.close()
+
+
+def _snapshot(
+    signing_key: bytes,
+    kind: m.SnapshotKind,
+    payload: object,
+    now: str,
+) -> m.ImmutableSnapshotRefV1:
+    return _snapshot_from_digest(
+        signing_key,
+        kind,
+        hashlib.sha256(_canonical_bytes(payload)).hexdigest(),
+        now,
+    )
+
+
+def _snapshot_from_digest(
+    signing_key: bytes,
+    kind: m.SnapshotKind,
+    content_sha256: str,
+    now: str,
+) -> m.ImmutableSnapshotRefV1:
     return m.ImmutableSnapshotRefV1(
-        id=_new_id(f"{kind.value}-snapshot"),
+        id=_core_owned_id(
+            signing_key,
+            f"{kind.value}-snapshot",
+            {"content_sha256": content_sha256, "created_at": now},
+        ),
         kind=kind,
-        content_sha256=hashlib.sha256(_canonical_bytes(payload)).hexdigest(),
+        content_sha256=content_sha256,
         created_at=now,
     )
+
+
+def _core_owned_id(signing_key: bytes, prefix: str, payload: object) -> str:
+    digest = hmac.new(
+        signing_key,
+        _canonical_bytes({"domain": f"{prefix}.v1", "payload": payload}),
+        hashlib.sha256,
+    ).hexdigest()[:32]
+    return f"{prefix}-{digest}"
 
 
 def _project_snapshot_payload(data: Mapping[str, Any]) -> dict[str, Any]:
@@ -1955,11 +2506,28 @@ def _model_with_etag(
     )
 
 
-def _request_digest(
+def _idempotency_envelope(
     operation_id: str,
     scope: str,
     request: BaseModel | None,
     semantic_headers: Mapping[str, str],
+) -> _IdempotencyRequestEnvelope:
+    request_json = _canonical_bytes(
+        request.model_dump(mode="json", exclude_unset=True) if request is not None else None
+    )
+    headers_json = _canonical_bytes(dict(sorted(semantic_headers.items())))
+    return _IdempotencyRequestEnvelope(
+        digest=_idempotency_request_digest(operation_id, scope, request_json, headers_json),
+        request_json=request_json,
+        semantic_headers_json=headers_json,
+    )
+
+
+def _idempotency_request_digest(
+    operation_id: str,
+    scope: str,
+    request_json: bytes,
+    semantic_headers_json: bytes,
 ) -> str:
     return hashlib.sha256(
         _canonical_bytes(
@@ -1967,8 +2535,8 @@ def _request_digest(
                 "principal": "core-control-v1",
                 "operation_id": operation_id,
                 "scope": scope,
-                "request": _json_value(request),
-                "semantic_headers": dict(sorted(semantic_headers.items())),
+                "request": json.loads(request_json),
+                "semantic_headers": json.loads(semantic_headers_json),
             }
         )
     ).hexdigest()
@@ -2040,6 +2608,8 @@ def _validate_bytes(model: type[_ModelT], value: bytes) -> _ModelT:
 
 def _validate_idempotency_row(
     row: sqlite3.Row | Mapping[str, Any],
+    *,
+    signing_key: bytes | None = None,
 ) -> BaseModel | None:
     operation_id = row["operation_id"]
     operation_spec = _IDEMPOTENCY_OPERATION_SPECS.get(operation_id)
@@ -2048,8 +2618,9 @@ def _validate_idempotency_row(
         or (int(row["status_code"]), row["response_type"]) != operation_spec[:2]
     ):
         raise StoreCorruptionError("idempotency operation response is invalid")
-    if not _is_sha256(row["request_digest"]):
-        raise StoreCorruptionError("idempotency request digest is invalid")
+    request, semantic_headers = _validate_idempotency_request_envelope(row)
+    if signing_key is not None:
+        _validate_request_core_owned_ids(request, signing_key)
     resource_scope = _parse_idempotency_success_scope(
         operation_id,
         row["resource_scope"],
@@ -2061,7 +2632,9 @@ def _validate_idempotency_row(
     if response_type == "NoContent":
         if response_json is not None or row["etag"] is not None:
             raise StoreCorruptionError("no-content idempotency row is invalid")
-        _validate_idempotency_response_semantics(operation_id, resource_scope, None)
+        _validate_idempotency_response_semantics(
+            operation_id, resource_scope, request, semantic_headers, None
+        )
         return None
 
     response_model = _IDEMPOTENCY_RESPONSE_MODELS.get(response_type)
@@ -2078,8 +2651,168 @@ def _validate_idempotency_row(
         expected_etag = None
     if row["etag"] != expected_etag:
         raise StoreCorruptionError("idempotency response ETag is invalid")
-    _validate_idempotency_response_semantics(operation_id, resource_scope, model)
+    if signing_key is not None:
+        _validate_response_core_owned_ids(model, signing_key)
+    _validate_idempotency_response_semantics(
+        operation_id, resource_scope, request, semantic_headers, model
+    )
     return model
+
+
+def _validate_response_core_owned_ids(model: BaseModel, signing_key: bytes) -> None:
+    snapshots: list[m.ImmutableSnapshotRefV1] = []
+    publications: list[m.WorkspacePublicationV1] = []
+    if isinstance(model, m.ProjectV1):
+        expected_task = _snapshot(
+            signing_key,
+            m.SnapshotKind.TASK,
+            model.task.model_dump(mode="json"),
+            model.current_task_snapshot.created_at,
+        )
+        project_payload = model.model_dump(
+            mode="python", exclude={"etag", "current_project_snapshot"}
+        )
+        expected_project = _snapshot(
+            signing_key,
+            m.SnapshotKind.PROJECT,
+            _project_snapshot_payload(project_payload),
+            model.current_project_snapshot.created_at,
+        )
+        if model.current_task_snapshot != expected_task or model.current_project_snapshot != (
+            expected_project
+        ):
+            raise StoreCorruptionError("idempotency project snapshot closure is invalid")
+        if isinstance(model.workspace, m.ScratchWorkspaceSpecV1):
+            workspace = model.current_workspace_snapshot
+            if workspace is None or workspace != _snapshot_from_digest(
+                signing_key,
+                m.SnapshotKind.WORKSPACE,
+                _EMPTY_WORKSPACE_DIGEST,
+                workspace.created_at,
+            ):
+                raise StoreCorruptionError("idempotency scratch snapshot closure is invalid")
+        snapshots.extend((model.current_project_snapshot, model.current_task_snapshot))
+        if model.current_workspace_snapshot is not None:
+            snapshots.append(model.current_workspace_snapshot)
+        if model.workspace_publication is not None:
+            publications.append(model.workspace_publication)
+    elif isinstance(model, m.WorkspaceUploadSessionV1):
+        snapshots.append(model.project_snapshot)
+        if model.base_workspace_snapshot is not None:
+            snapshots.append(model.base_workspace_snapshot)
+        if model.publication is not None:
+            publications.append(model.publication)
+    elif isinstance(model, m.WorkspaceUploadFinalizeResponseV1):
+        _validate_response_core_owned_ids(model.project, signing_key)
+        _validate_response_core_owned_ids(model.upload, signing_key)
+        publications.append(model.publication)
+    elif isinstance(model, m.ProjectValidationResponseV1):
+        return
+    for snapshot in snapshots:
+        if snapshot != _snapshot_from_digest(
+            signing_key,
+            snapshot.kind,
+            snapshot.content_sha256,
+            snapshot.created_at,
+        ):
+            raise StoreCorruptionError("idempotency snapshot Core identity is invalid")
+    for publication in publications:
+        expected = _snapshot(
+            signing_key,
+            m.SnapshotKind.WORKSPACE,
+            {"archive_sha256": publication.archive.content_sha256},
+            publication.workspace_snapshot.created_at,
+        )
+        content_id = _core_owned_id(
+            signing_key,
+            "workspace-content",
+            {
+                "sha256": publication.archive.content_sha256,
+                "byte_size": publication.archive.byte_size,
+                "published_at": publication.published_at,
+            },
+        )
+        if (
+            publication.workspace_snapshot != expected
+            or publication.content_ref.content_id != content_id
+        ):
+            raise StoreCorruptionError("idempotency publication Core identity is invalid")
+
+
+def _validate_request_core_owned_ids(request: BaseModel | None, signing_key: bytes) -> None:
+    snapshots: list[m.ImmutableSnapshotRefV1] = []
+    if isinstance(request, m.WorkspaceUploadCreateV1):
+        snapshots.append(request.project_snapshot)
+        if request.base_workspace_snapshot is not None:
+            snapshots.append(request.base_workspace_snapshot)
+    elif isinstance(request, m.ProjectValidationRequestV1):
+        snapshots.extend((request.project_snapshot, request.workspace_snapshot))
+    for snapshot in snapshots:
+        if snapshot != _snapshot_from_digest(
+            signing_key,
+            snapshot.kind,
+            snapshot.content_sha256,
+            snapshot.created_at,
+        ):
+            raise StoreCorruptionError("idempotency request snapshot Core identity is invalid")
+
+
+def _validate_idempotency_request_envelope(
+    row: sqlite3.Row | Mapping[str, Any],
+) -> tuple[BaseModel | None, dict[str, str]]:
+    operation_id = row["operation_id"]
+    if operation_id not in _IDEMPOTENCY_REQUEST_MODELS:
+        raise StoreCorruptionError("idempotency request operation is invalid")
+    request_model = _IDEMPOTENCY_REQUEST_MODELS[operation_id]
+    try:
+        request_json = bytes(row["request_json"])
+        headers_json = bytes(row["semantic_headers_json"])
+        request_value = json.loads(request_json)
+        header_value = json.loads(headers_json)
+    except (KeyError, TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise StoreCorruptionError("idempotency request envelope is invalid") from exc
+    if (
+        _canonical_bytes(request_value) != request_json
+        or _canonical_bytes(header_value) != headers_json
+        or type(header_value) is not dict
+        or any(
+            type(key) is not str or type(value) is not str for key, value in header_value.items()
+        )
+    ):
+        raise StoreCorruptionError("idempotency request envelope is not canonical")
+    if request_model is None:
+        if request_value is not None:
+            raise StoreCorruptionError("idempotency request envelope is invalid")
+        request = None
+    else:
+        try:
+            request = request_model.model_validate(request_value)
+        except ValidationError as exc:
+            raise StoreCorruptionError("idempotency request envelope is invalid") from exc
+        if _canonical_bytes(request.model_dump(mode="json", exclude_unset=True)) != request_json:
+            raise StoreCorruptionError("idempotency request envelope is not canonical")
+    expected_headers = {
+        "createCoreProjectV1": set(),
+        "validateCoreProjectV1": set(),
+        "patchCoreProjectV1": {"if-match"},
+        "deleteCoreProjectV1": {"if-match"},
+        "createCoreWorkspaceUploadV1": {"if-match"},
+        "putCoreWorkspaceUploadChunkV1": {"if-match"},
+        "finalizeCoreWorkspaceUploadV1": {"if-match", "if-project-match"},
+        "abortCoreWorkspaceUploadV1": {"if-match"},
+    }[operation_id]
+    if set(header_value) != expected_headers or any(
+        not _is_etag(value) for value in header_value.values()
+    ):
+        raise StoreCorruptionError("idempotency semantic headers are invalid")
+    expected_digest = _idempotency_request_digest(
+        operation_id, row["resource_scope"], request_json, headers_json
+    )
+    if not _is_sha256(row["request_digest"]) or not hmac.compare_digest(
+        row["request_digest"], expected_digest
+    ):
+        raise StoreCorruptionError("idempotency request digest is invalid")
+    return request, header_value
 
 
 def _parse_idempotency_success_scope(
@@ -2111,10 +2844,13 @@ def _parse_idempotency_success_scope(
 def _validate_idempotency_response_semantics(
     operation_id: str,
     scope: _IdempotencyResourceScope,
+    request: BaseModel | None,
+    semantic_headers: Mapping[str, str],
     model: BaseModel | None,
 ) -> None:
     valid = False
     if operation_id == "createCoreProjectV1" and isinstance(model, m.ProjectV1):
+        assert isinstance(request, m.ProjectCreateV1)
         valid = (
             scope == _IdempotencyResourceScope(project_id=None, upload_id=None)
             and _project_response_has_core_identity(model)
@@ -2127,31 +2863,59 @@ def _validate_idempotency_response_semantics(
             )
             and model.model_preparation.updated_at == model.created_at
             and model.workspace_publication is None
+            and model.name == request.name
+            and model.description == request.description
+            and model.spec == request.spec
+            and model.task == request.task
+            and model.workspace == request.workspace
         )
     elif operation_id == "patchCoreProjectV1" and isinstance(model, m.ProjectV1):
-        valid = model.id == scope.project_id and _project_response_has_core_identity(model)
+        assert isinstance(request, m.ProjectPatchV1)
+        response_values = model.model_dump(mode="python")
+        request_values = request.model_dump(mode="python", exclude_unset=True)
+        request_values.pop("schema_version", None)
+        valid = (
+            model.id == scope.project_id
+            and _project_response_has_core_identity(model)
+            and all(response_values[field] == value for field, value in request_values.items())
+            and _is_etag(semantic_headers.get("if-match"))
+        )
     elif operation_id == "deleteCoreProjectV1":
-        valid = model is None and scope.project_id is not None and scope.upload_id is None
+        valid = (
+            request is None
+            and model is None
+            and scope.project_id is not None
+            and scope.upload_id is None
+            and _is_etag(semantic_headers.get("if-match"))
+        )
     elif operation_id == "createCoreWorkspaceUploadV1" and isinstance(
         model, m.WorkspaceUploadSessionV1
     ):
+        assert isinstance(request, m.WorkspaceUploadCreateV1)
         valid = (
             _upload_response_matches_scope(model, scope, require_upload_id=False)
             and model.status is m.WorkspaceUploadStatus.OPEN
             and model.accepted_offset == 0
             and model.created_at == model.updated_at
+            and model.project_snapshot == request.project_snapshot
+            and model.archive == request.archive
+            and model.base_workspace_snapshot == request.base_workspace_snapshot
+            and model.project_etag == semantic_headers.get("if-match")
         )
     elif operation_id == "putCoreWorkspaceUploadChunkV1" and isinstance(
         model, m.WorkspaceUploadSessionV1
     ):
+        assert isinstance(request, m.WorkspaceUploadChunkV1)
         valid = (
             _upload_response_matches_scope(model, scope, require_upload_id=True)
             and model.status is m.WorkspaceUploadStatus.OPEN
-            and model.accepted_offset > 0
+            and model.accepted_offset == request.offset + request.byte_length
+            and _is_etag(semantic_headers.get("if-match"))
         )
     elif operation_id == "finalizeCoreWorkspaceUploadV1" and isinstance(
         model, m.WorkspaceUploadFinalizeResponseV1
     ):
+        assert isinstance(request, m.WorkspaceUploadFinalizeV1)
         valid = (
             model.project_id == scope.project_id
             and model.project.id == scope.project_id
@@ -2161,17 +2925,23 @@ def _validate_idempotency_response_semantics(
             and model.publication.published_at == model.upload.updated_at
             and model.project.updated_at == model.upload.updated_at
             and model.publication.workspace_snapshot.created_at == model.upload.updated_at
+            and model.publication.archive.content_sha256 == request.content_sha256
+            and model.upload.project_etag == semantic_headers.get("if-project-match")
+            and _is_etag(semantic_headers.get("if-match"))
         )
     elif operation_id == "abortCoreWorkspaceUploadV1" and isinstance(
         model, m.WorkspaceUploadSessionV1
     ):
+        assert isinstance(request, m.WorkspaceUploadAbortV1)
         valid = (
             _upload_response_matches_scope(model, scope, require_upload_id=True)
             and model.status is m.WorkspaceUploadStatus.ABORTED
+            and _is_etag(semantic_headers.get("if-match"))
         )
     elif operation_id == "validateCoreProjectV1" and isinstance(
         model, m.ProjectValidationResponseV1
     ):
+        assert isinstance(request, m.ProjectValidationRequestV1)
         valid = (
             scope.project_id is not None
             and scope.upload_id is None
@@ -2183,9 +2953,14 @@ def _validate_idempotency_response_semantics(
             == "The project is valid against the verified executable registry."
             and model.checks[0].target_id is None
             and model.checks[0].method_id is None
+            and model.registry_digest == request.expected_registry_digest
+            and _is_managed_resource_id(request.project_snapshot.id, "project-snapshot")
+            and _is_managed_resource_id(request.workspace_snapshot.id, "workspace-snapshot")
         )
     if not valid:
-        raise StoreCorruptionError("idempotency response semantic binding is invalid")
+        raise StoreCorruptionError(
+            "idempotency response semantic binding is invalid for request/response"
+        )
 
 
 def _project_response_has_core_identity(project: m.ProjectV1) -> bool:
@@ -2279,6 +3054,15 @@ def _is_sha256(value: object) -> bool:
         type(value) is str
         and len(value) == 64
         and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _is_etag(value: object) -> bool:
+    return (
+        type(value) is str
+        and len(value) == 66
+        and value[0] == value[-1] == '"'
+        and _is_sha256(value[1:-1])
     )
 
 
@@ -2397,7 +3181,7 @@ def _remove_entry_at(parent_fd: int, name: str) -> None:
     try:
         if not _same_identity(os.fstat(child_fd), metadata):
             raise StoreCorruptionError("Core Control managed orphan binding changed")
-        for child_name in os.listdir(child_fd):
+        for child_name in _bounded_directory_names(child_fd, 100_000):
             _remove_entry_at(child_fd, child_name)
         _require_entry_binding(parent_fd, name, metadata)
     finally:
@@ -2408,6 +3192,66 @@ def _remove_entry_at(parent_fd: int, name: str) -> None:
         raise StoreCorruptionError(
             "Core Control managed orphan directory could not be removed"
         ) from exc
+
+
+def _bounded_directory_names(directory_fd: int, limit: int):
+    count = 0
+    with os.scandir(directory_fd) as entries:
+        for entry in entries:
+            count += 1
+            if count > limit:
+                raise StoreCorruptionError("Core Control managed directory quota is exceeded")
+            yield entry.name
+
+
+def _verify_managed_disk_quota(
+    root_fd: int,
+    *,
+    max_entries: int,
+    max_bytes: int,
+) -> None:
+    entries_seen = 0
+    bytes_seen = 0
+
+    def visit(directory_fd: int) -> None:
+        nonlocal entries_seen, bytes_seen
+        with os.scandir(directory_fd) as entries:
+            for entry in entries:
+                entries_seen += 1
+                if entries_seen > max_entries:
+                    raise StoreCorruptionError("Core Control managed disk entry quota is exceeded")
+                metadata = os.stat(entry.name, dir_fd=directory_fd, follow_symlinks=False)
+                if metadata.st_uid != os.geteuid():
+                    raise StoreCorruptionError("Core Control managed disk owner is invalid")
+                bytes_seen += max(metadata.st_size, metadata.st_blocks * 512)
+                if bytes_seen > max_bytes:
+                    raise StoreCorruptionError("Core Control managed disk byte quota is exceeded")
+                if stat.S_ISLNK(metadata.st_mode):
+                    continue
+                if stat.S_ISREG(metadata.st_mode):
+                    if metadata.st_nlink != 1:
+                        raise StoreCorruptionError(
+                            "Core Control managed disk file has multiple links"
+                        )
+                    continue
+                if not stat.S_ISDIR(metadata.st_mode):
+                    raise StoreCorruptionError("Core Control managed disk entry type is invalid")
+                child_fd = os.open(
+                    entry.name,
+                    os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=directory_fd,
+                )
+                try:
+                    if not _same_identity(os.fstat(child_fd), metadata):
+                        raise StoreCorruptionError(
+                            "Core Control managed disk directory binding changed"
+                        )
+                    visit(child_fd)
+                    _require_entry_binding(directory_fd, entry.name, metadata)
+                finally:
+                    os.close(child_fd)
+
+    visit(root_fd)
 
 
 __all__ = [

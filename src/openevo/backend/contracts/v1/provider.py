@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable, Mapping
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 import hashlib
 import hmac
 from pathlib import Path
+import threading
 from typing import Any, NoReturn, cast
 
 from fastapi import FastAPI
@@ -15,6 +17,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from openevo import __version__
 from openevo.evolution.framework import (
     CapabilityAudience,
+    EvolutionExecutionProfile,
     build_evolution_capabilities,
     execution_profile_for_release_mode,
 )
@@ -43,6 +46,7 @@ from .store import (
     PostCommitStoreError,
     ResourceConflictError,
     ResourceNotFoundError,
+    StoreCorruptionError,
     StoredResult,
 )
 
@@ -116,6 +120,11 @@ class CoreControlProviderV1:
         if evolution_registry is not None:
             require_verified_executable_registry(evolution_registry)
         self.store = store
+        self._executor = ThreadPoolExecutor(
+            max_workers=4, thread_name_prefix="openevo-core-control"
+        )
+        self._close_lock = threading.Lock()
+        self._closed = False
         self._authorization = b"Bearer " + token_bytes
         self._registry = evolution_registry
         self._clock = clock or (lambda: datetime.now(timezone.utc))
@@ -154,7 +163,19 @@ class CoreControlProviderV1:
         }
 
     def close(self) -> None:
-        self.store.close()
+        with self._close_lock:
+            if self._closed:
+                return
+            self._closed = True
+        future = self._executor.submit(self.store.close)
+        try:
+            future.result()
+        finally:
+            self._executor.shutdown(wait=True, cancel_futures=True)
+
+    async def aclose(self) -> None:
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self.close)
 
     @property
     def operation_ids(self) -> frozenset[str]:
@@ -179,6 +200,10 @@ class CoreControlProviderV1:
         except CoreControlHTTPError as exc:
             self.store.record_failed_idempotency(operation_id, arguments, exc.error)
             raise
+
+    async def invoke_async(self, operation_id: str, arguments: Mapping[str, object]) -> object:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(self._executor, self.invoke, operation_id, arguments)
 
     def _invoke(self, operation_id: str, arguments: Mapping[str, object]) -> object:
         if operation_id in _UNAVAILABLE_OPERATIONS:
@@ -228,16 +253,7 @@ class CoreControlProviderV1:
                 next_action="Retry after retained idempotency records expire.",
             ) from exc
         except ResourceConflictError as exc:
-            raise _error(
-                409,
-                code=exc.code,
-                message=str(exc),
-                category=m.ErrorCategory.PROJECT,
-                retryable=exc.code
-                in {"workspace_chunk_out_of_order", "workspace_upload_incomplete"},
-                repair_action=m.RepairAction.OPENEVO_CAN_RETRY,
-                next_action="Reload the project and upload status before retrying.",
-            ) from exc
+            raise _resource_conflict_error(exc) from exc
         except CursorExpiredError as exc:
             raise _error(
                 410,
@@ -280,6 +296,16 @@ class CoreControlProviderV1:
             ) from exc
         except PostCommitStoreError as exc:
             raise _post_commit_error() from exc
+        except StoreCorruptionError as exc:
+            raise _error(
+                500,
+                code="core_control_store_corrupt",
+                message="Core Control durable state failed closed integrity validation.",
+                category=m.ErrorCategory.INTERNAL,
+                retryable=False,
+                repair_action=m.RepairAction.USER_ACTION_REQUIRED,
+                next_action="Stop Core and inspect or restore the provider state.",
+            ) from exc
         except CoreControlStoreError as exc:
             raise _error(
                 500,
@@ -453,8 +479,15 @@ class CoreControlProviderV1:
                         "model": project.spec.agent_model_ref,
                     },
                     registry_snapshot=registry.snapshot,
-                    execution_profile=execution_profile_for_release_mode(
-                        project.spec.execution_mode
+                    execution_profile=EvolutionExecutionProfile(
+                        execution_mode=(
+                            "subscription"
+                            if project.spec.execution_mode
+                            is m.ExecutionMode.CODEX_SUBSCRIPTION_TRANSCRIPT
+                            else "self_deployed"
+                        ),
+                        capture_mode=project.spec.capture_mode.value,
+                        harness_id=project.spec.harness_id,
                     ),
                 )
             except ProjectEvolutionValidationError as exc:
@@ -519,9 +552,15 @@ class CoreControlProviderV1:
                         yield _sse_bytes(frame)
                         last_emit = asyncio.get_running_loop().time()
                 await asyncio.sleep(1)
-                frames = self.store.replay_events(cursor)
+                loop = asyncio.get_running_loop()
+                frames = await loop.run_in_executor(
+                    self._executor, self.store.replay_events, cursor
+                )
                 if not frames and asyncio.get_running_loop().time() - last_emit >= 15:
-                    frames = [self.store.append_heartbeat()]
+                    heartbeat = await loop.run_in_executor(
+                        self._executor, self.store.append_heartbeat
+                    )
+                    frames = [heartbeat]
 
         return StreamingResponse(
             stream(),
@@ -603,6 +642,7 @@ def create_core_control_app(
     """Create a provider-backed app without adding a second route table."""
 
     store = CoreControlStoreV1(state_root, event_replay_limit=event_replay_limit)
+    provider: CoreControlProviderV1 | None = None
     try:
         provider = CoreControlProviderV1(
             store,
@@ -621,10 +661,13 @@ def create_core_control_app(
         if provider.operation_ids != contract_operation_ids:
             raise RuntimeError("Core Control provider ownership does not cover the frozen routes")
     except Exception:
-        store.close()
+        if provider is None:
+            store.close()
+        else:
+            provider.close()
         raise
     app.state.core_control_provider = provider
-    app.router.add_event_handler("shutdown", provider.close)
+    app.router.add_event_handler("shutdown", provider.aclose)
     return app
 
 
@@ -690,6 +733,70 @@ def _idempotency_conflict_error() -> CoreControlHTTPError:
         retryable=False,
         repair_action=m.RepairAction.USER_ACTION_REQUIRED,
         next_action="Use the original request or issue a new idempotency key.",
+    )
+
+
+_RETRYABLE_PROJECT_CONFLICTS = frozenset(
+    {
+        "project_snapshot_changed",
+        "workspace_base_snapshot_changed",
+        "workspace_chunk_out_of_order",
+        "workspace_upload_incomplete",
+        "evolution_registry_changed",
+        "workspace_snapshot_changed",
+    }
+)
+_RECONFIGURE_PROJECT_CONFLICTS = frozenset(
+    {
+        "workspace_upload_not_required",
+        "workspace_archive_declaration_changed",
+        "workspace_chunk_exceeds_declaration",
+        "workspace_digest_mismatch",
+        "workspace_archive_invalid",
+        "evolution_project_invalid",
+    }
+)
+
+
+def _resource_conflict_error(exc: ResourceConflictError) -> CoreControlHTTPError:
+    if exc.code == "provider_storage_quota_exceeded":
+        return _error(
+            409,
+            code=exc.code,
+            message=str(exc),
+            category=m.ErrorCategory.SERVICE,
+            retryable=False,
+            repair_action=m.RepairAction.USER_ACTION_REQUIRED,
+            next_action="Remove managed workspace state or use a smaller workspace.",
+        )
+    if exc.code in _RETRYABLE_PROJECT_CONFLICTS:
+        return _error(
+            409,
+            code=exc.code,
+            message=str(exc),
+            category=m.ErrorCategory.PROJECT,
+            retryable=True,
+            repair_action=m.RepairAction.OPENEVO_CAN_RETRY,
+            next_action="Reload the authoritative project and upload snapshots, then retry.",
+        )
+    if exc.code in _RECONFIGURE_PROJECT_CONFLICTS:
+        return _error(
+            409,
+            code=exc.code,
+            message=str(exc),
+            category=m.ErrorCategory.PROJECT,
+            retryable=False,
+            repair_action=m.RepairAction.OPENEVO_CAN_RECONFIGURE,
+            next_action="Correct the project or workspace request before retrying.",
+        )
+    return _error(
+        409,
+        code=exc.code,
+        message=str(exc),
+        category=m.ErrorCategory.PROJECT,
+        retryable=False,
+        repair_action=m.RepairAction.USER_ACTION_REQUIRED,
+        next_action="Reload the authoritative resource and choose a valid next action.",
     )
 
 

@@ -10,8 +10,11 @@ from pathlib import Path
 import sqlite3
 import subprocess
 import sys
+import threading
+import time
 
 from fastapi.testclient import TestClient
+import httpx
 import pytest
 
 from openevo.backend.contracts.v1 import (
@@ -25,6 +28,7 @@ from openevo.backend.contracts.v1.models import (
     WorkspaceUploadChunkV1,
 )
 import openevo.backend.contracts.v1.store as store_module
+import openevo.backend.contracts.v1.provider as provider_module
 from openevo.backend.contracts.v1.store import (
     CoreControlStoreError,
     CoreControlStoreV1,
@@ -122,6 +126,9 @@ def _project_create(
     archive: bytes | None = None,
     archive_entry_count: int = 2,
     extracted_byte_size: int = len(b"OpenEvo provider workspace\n"),
+    execution_mode: str = "codex_subscription_transcript",
+    capture_mode: str = "transcript",
+    harness_id: str = "codex",
 ) -> dict[str, object]:
     workspace: dict[str, object]
     if archive is None:
@@ -144,9 +151,9 @@ def _project_create(
         "name": "Protein memory",
         "description": "Provider conformance project.",
         "spec": {
-            "execution_mode": "codex_subscription_transcript",
-            "capture_mode": "transcript",
-            "harness_id": "codex",
+            "execution_mode": execution_mode,
+            "capture_mode": capture_mode,
+            "harness_id": harness_id,
             "agent_model_ref": "gpt-5.1-codex-mini",
             "evolution": {"targets": {}},
         },
@@ -551,6 +558,9 @@ def test_workspace_finalize_rejects_digest_and_stale_project_cas(tmp_path: Path)
         )
         assert bad_digest.status_code == 409
         assert bad_digest.json()["code"] == "workspace_digest_mismatch"
+        assert bad_digest.json()["category"] == "project"
+        assert bad_digest.json()["retryable"] is False
+        assert bad_digest.json()["repair_action"] == "openevo_can_reconfigure"
 
         patch = client.patch(
             f"/v1/projects/{project['id']}",
@@ -1315,11 +1325,38 @@ def test_success_idempotency_semantics_are_closed_per_operation(tmp_path: Path) 
         "upload abort status": bad_abort,
         "project validation result": bad_validation,
     }
+
+    def rewrite_request(target: str, **updates: object) -> dict[str, object]:
+        row = dict(rows[keys[target]])
+        request = json.loads(bytes(row["request_json"]))
+        request.update(updates)
+        row["request_json"] = store_module._canonical_bytes(request)
+        row["request_digest"] = store_module._idempotency_request_digest(
+            row["operation_id"],
+            row["resource_scope"],
+            row["request_json"],
+            bytes(row["semantic_headers_json"]),
+        )
+        return row
+
+    cases.update(
+        {
+            "upload chunk request relation": rewrite_request("chunk_a", offset=512),
+            "upload finalize request relation": rewrite_request(
+                "finalize_a", content_sha256="0" * 64
+            ),
+            "project validation registry relation": rewrite_request(
+                "validate_a", expected_registry_digest="0" * 64
+            ),
+        }
+    )
     for label, row in cases.items():
         try:
             store_module._validate_idempotency_row(row)
         except StoreCorruptionError as exc:
-            assert "idempotency response semantic binding" in str(exc), label
+            assert "idempotency response semantic binding" in str(
+                exc
+            ) or "idempotency request digest" in str(exc), label
         else:
             pytest.fail(f"accepted invalid {label} idempotency row")
 
@@ -1648,6 +1685,299 @@ def test_capabilities_and_project_validation_use_verified_registry(tmp_path: Pat
         )
         assert unavailable.status_code == 503
         assert unavailable.json()["code"] == "evolution_registry_unavailable"
+
+
+def test_project_validation_uses_the_exact_persisted_execution_profile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registry = verified_builtin_registry(tmp_path / "registry")
+    observed = []
+
+    def capture_profile(*args, **kwargs) -> None:
+        del args
+        observed.append(kwargs["execution_profile"])
+
+    monkeypatch.setattr(provider_module, "validate_project_evolution_selections", capture_profile)
+    payload = _project_create(
+        execution_mode="self-deployed",
+        capture_mode="token_level",
+        harness_id="openhands",
+    )
+    with TestClient(_app(tmp_path / "state", registry=registry)) as client:
+        project, _ = _create_project(client, payload)
+        validated = client.post(
+            f"/v1/projects/{project['id']}/validate",
+            headers={**AUTH, "Idempotency-Key": "validate-exact-profile"},
+            json={
+                "schema_version": "1",
+                "project_snapshot": project["current_project_snapshot"],
+                "workspace_snapshot": project["current_workspace_snapshot"],
+                "expected_registry_digest": registry.snapshot.registry_digest,
+            },
+        )
+
+    assert validated.status_code == 200, validated.text
+    assert len(observed) == 1
+    assert observed[0].execution_mode.value == "self_deployed"
+    assert observed[0].capture_mode.value == "token_level"
+    assert observed[0].harness_id == "openhands"
+
+
+def test_success_idempotency_persists_and_revalidates_canonical_request_envelope(
+    tmp_path: Path,
+) -> None:
+    with TestClient(_app(tmp_path)) as client:
+        response = client.post(
+            "/v1/projects",
+            headers={**AUTH, "Idempotency-Key": "create-envelope-binding"},
+            json=_project_create(),
+        )
+        assert response.status_code == 201
+
+    database = tmp_path / "core-control-v1" / "provider.sqlite3"
+    with sqlite3.connect(database) as connection:
+        connection.row_factory = sqlite3.Row
+        row = connection.execute(
+            "SELECT * FROM idempotency_records WHERE operation_id = ?",
+            ("createCoreProjectV1",),
+        ).fetchone()
+        assert row is not None
+        assert bytes(row["semantic_headers_json"]) == b"{}"
+        request = json.loads(bytes(row["request_json"]))
+        request["name"] = "A different canonical request"
+        request_json = store_module._canonical_bytes(request)
+        request_digest = store_module._idempotency_request_digest(
+            row["operation_id"],
+            row["resource_scope"],
+            request_json,
+            bytes(row["semantic_headers_json"]),
+        )
+        connection.execute(
+            "UPDATE idempotency_records SET request_json = ?, request_digest = ? "
+            "WHERE operation_id = ? AND idempotency_key = ?",
+            (
+                request_json,
+                request_digest,
+                "createCoreProjectV1",
+                "create-envelope-binding",
+            ),
+        )
+
+    with pytest.raises(StoreCorruptionError, match="request.*response"):
+        CoreControlStoreV1(tmp_path)
+
+
+def test_startup_recomputes_project_and_task_snapshot_bindings(tmp_path: Path) -> None:
+    with TestClient(_app(tmp_path)) as client:
+        project, _ = _create_project(client, _project_create())
+
+    database = tmp_path / "core-control-v1" / "provider.sqlite3"
+    with sqlite3.connect(database) as connection:
+        connection.row_factory = sqlite3.Row
+        row = connection.execute(
+            "SELECT * FROM projects WHERE project_id = ?", (project["id"],)
+        ).fetchone()
+        assert row is not None
+        persisted = store_module._validate_bytes(store_module.m.ProjectV1, row["document_json"])
+        data = persisted.model_dump(mode="python", exclude={"etag"})
+        data["current_task_snapshot"]["content_sha256"] = "0" * 64
+        damaged = store_module._model_with_etag(
+            store_module.m.ProjectV1, data, version=int(row["resource_version"])
+        )
+        connection.execute(
+            "UPDATE projects SET document_json = ? WHERE project_id = ?",
+            (store_module._model_bytes(damaged), project["id"]),
+        )
+
+    with pytest.raises(StoreCorruptionError, match="task snapshot"):
+        CoreControlStoreV1(tmp_path)
+
+
+def test_startup_binds_workspace_publication_to_an_upload_from_the_same_project(
+    tmp_path: Path,
+) -> None:
+    finalized = _finalize_workspace(tmp_path, _workspace_archive(), key_suffix="project-bind")
+    with TestClient(_app(tmp_path)) as client:
+        other, _ = _create_project(
+            client,
+            _project_create(),
+            idempotency_key="create-publication-other-project",
+        )
+
+    upload_id = finalized["upload"]["id"]
+    database = tmp_path / "core-control-v1" / "provider.sqlite3"
+    with sqlite3.connect(database) as connection:
+        connection.row_factory = sqlite3.Row
+        row = connection.execute(
+            "SELECT * FROM workspace_uploads WHERE upload_id = ?", (upload_id,)
+        ).fetchone()
+        assert row is not None
+        upload = store_module._validate_bytes(
+            store_module.m.WorkspaceUploadSessionV1, row["document_json"]
+        )
+        data = upload.model_dump(mode="python", exclude={"etag"})
+        data["project_id"] = other["id"]
+        damaged = store_module._model_with_etag(
+            store_module.m.WorkspaceUploadSessionV1,
+            data,
+            version=int(row["resource_version"]),
+        )
+        connection.execute(
+            "UPDATE workspace_uploads SET project_id = ?, document_json = ? WHERE upload_id = ?",
+            (other["id"], store_module._model_bytes(damaged), upload_id),
+        )
+
+    with pytest.raises(StoreCorruptionError, match="same project"):
+        CoreControlStoreV1(tmp_path)
+
+
+@pytest.mark.parametrize("damage", ["cursor", "canonical_frame"])
+def test_startup_authenticates_event_cursor_and_canonical_frame(
+    tmp_path: Path, damage: str
+) -> None:
+    with TestClient(_app(tmp_path)) as client:
+        _create_project(client, _project_create())
+
+    database = tmp_path / "core-control-v1" / "provider.sqlite3"
+    with sqlite3.connect(database) as connection:
+        connection.row_factory = sqlite3.Row
+        row = connection.execute("SELECT * FROM events ORDER BY sequence LIMIT 1").fetchone()
+        assert row is not None
+        if damage == "canonical_frame":
+            connection.execute(
+                "UPDATE events SET frame_json = ? WHERE sequence = ?",
+                (bytes(row["frame_json"]) + b" ", row["sequence"]),
+            )
+        else:
+            frame = json.loads(bytes(row["frame_json"]))
+            forged = f"evt.v1.{row['sequence']}." + ("0" * 24)
+            frame["id"] = forged
+            frame["data"]["id"] = forged
+            connection.execute(
+                "UPDATE events SET event_id = ?, frame_json = ? WHERE sequence = ?",
+                (forged, store_module._canonical_bytes(frame), row["sequence"]),
+            )
+
+    with pytest.raises(StoreCorruptionError, match="event"):
+        CoreControlStoreV1(tmp_path)
+
+
+@pytest.mark.parametrize("extra_kind", ["table", "trigger"])
+def test_startup_rejects_noncanonical_sqlite_schema(tmp_path: Path, extra_kind: str) -> None:
+    with TestClient(_app(tmp_path)) as client:
+        _create_project(client, _project_create())
+
+    database = tmp_path / "core-control-v1" / "provider.sqlite3"
+    with sqlite3.connect(database) as connection:
+        if extra_kind == "table":
+            connection.execute("CREATE TABLE injected(value TEXT)")
+        else:
+            connection.execute(
+                "CREATE TRIGGER injected AFTER INSERT ON projects BEGIN SELECT 1; END"
+            )
+
+    with pytest.raises(StoreCorruptionError, match="schema fingerprint"):
+        CoreControlStoreV1(tmp_path)
+
+
+def test_live_store_rejects_database_hardlink_alias(tmp_path: Path) -> None:
+    store = CoreControlStoreV1(tmp_path)
+    database = tmp_path / "core-control-v1" / "provider.sqlite3"
+    alias = tmp_path / "provider-alias.sqlite3"
+    try:
+        os.link(database, alias)
+        with pytest.raises(StoreCorruptionError, match="database"):
+            store.list_projects(limit=1, after=None, sort="created_at", direction="asc")
+    finally:
+        alias.unlink(missing_ok=True)
+        store.close()
+
+
+def test_startup_rejects_database_symlink_and_foreign_key_corruption(
+    tmp_path: Path,
+) -> None:
+    with TestClient(_app(tmp_path)) as client:
+        project, etag = _create_project(client, _project_create(archive=_workspace_archive()))
+        upload = client.post(
+            f"/v1/projects/{project['id']}/workspace-uploads",
+            headers={
+                **AUTH,
+                "Idempotency-Key": "begin-foreign-key-corruption",
+                "If-Match": etag,
+            },
+            json={
+                "schema_version": "1",
+                "project_snapshot": project["current_project_snapshot"],
+                "archive": project["workspace"]["archive"],
+                "base_workspace_snapshot": None,
+            },
+        )
+        assert upload.status_code == 201
+
+    database = tmp_path / "core-control-v1" / "provider.sqlite3"
+    with sqlite3.connect(database) as connection:
+        connection.execute("PRAGMA foreign_keys = OFF")
+        connection.execute(
+            "UPDATE workspace_uploads SET project_id = ? WHERE upload_id = ?",
+            ("project-" + ("0" * 32), upload.json()["id"]),
+        )
+    with pytest.raises(StoreCorruptionError, match="foreign key"):
+        CoreControlStoreV1(tmp_path)
+
+    with sqlite3.connect(database) as connection:
+        connection.execute("PRAGMA foreign_keys = OFF")
+        connection.execute(
+            "UPDATE workspace_uploads SET project_id = ? WHERE upload_id = ?",
+            (project["id"], upload.json()["id"]),
+        )
+    displaced = database.with_suffix(".real")
+    database.rename(displaced)
+    database.symlink_to(displaced.name)
+    try:
+        with pytest.raises(OSError):
+            CoreControlStoreV1(tmp_path)
+    finally:
+        database.unlink()
+        displaced.rename(database)
+
+
+def test_sync_store_work_does_not_block_health_on_the_asgi_event_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app = _app(tmp_path)
+    store = app.state.core_control_provider.store
+    original = store.list_projects
+    release = threading.Event()
+
+    def slow_list_projects(**kwargs):
+        release.wait(timeout=2)
+        return original(**kwargs)
+
+    monkeypatch.setattr(store, "list_projects", slow_list_projects)
+
+    async def exercise() -> float:
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            started = time.monotonic()
+            listing = asyncio.create_task(client.get("/v1/projects", headers=AUTH))
+            await asyncio.sleep(0)
+            health = await client.get("/health")
+            elapsed = time.monotonic() - started
+            release.set()
+            listed = await listing
+            assert health.status_code == 200
+            assert listed.status_code == 200
+            return elapsed
+
+    timer = threading.Timer(0.75, release.set)
+    timer.start()
+    try:
+        elapsed = asyncio.run(exercise())
+    finally:
+        release.set()
+        timer.cancel()
+        app.state.core_control_provider.close()
+    assert elapsed < 0.5
 
 
 def test_services_are_observed_and_unowned_actions_fail_closed(tmp_path: Path) -> None:

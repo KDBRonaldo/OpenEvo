@@ -62,6 +62,15 @@ closure and active transition state.
 `CapabilitiesResponseV1` remains the framework-owned `EvolutionCapabilitiesV1`
 type without a local copy or projection.
 
+The provider's private SQLite schema is fresh-only and exact-fingerprinted; it
+is not part of the frozen HTTP schema. Successful idempotency rows retain the
+canonical request and semantic headers and validate each operation's
+request/response relationship during replay and startup. Project validation
+constructs its framework profile from the persisted execution mode, capture
+mode, and harness ID. SQLite/workspace recovery is descriptor-bound and
+quota-limited, and synchronous store work runs on a bounded executor rather
+than the ASGI event loop.
+
 See `docs/architecture/desktop-core-contract-v1.md` for the product boundary and
 `docs/architecture/core-control-v1-provider.md` for implemented ownership. The
 provider does not implement the run owner, successor activation, service
