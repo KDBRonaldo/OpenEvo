@@ -293,7 +293,7 @@ class _CoreTunnelEndpoint:
                     expected_identity=child_identity,
                 )
                 child_stream.close()
-                if child.process is None or not _tunnel_process_is_running(child.process):
+                if child.process is None or _tunnel_child_has_exited(child):
                     raise SshTransportError(SshTransportErrorCode.CONNECTION_FAILED)
                 _require_parent_owned_stream(
                     local_stream,
@@ -378,13 +378,11 @@ class _CoreTunnelEndpoint:
             if process is None:
                 raise SshTransportError(SshTransportErrorCode.CONNECTION_FAILED)
             try:
-                return_code = process.poll()
+                exited = _tunnel_child_has_exited(child)
             except BaseException:
                 raise SshTransportError(SshTransportErrorCode.CONNECTION_FAILED) from None
-            if return_code is None:
+            if not exited:
                 continue
-            if return_code != 0:
-                raise SshTransportError(SshTransportErrorCode.CONNECTION_FAILED)
             if child.authority is not None:
                 try:
                     child.authority.cleanup()
@@ -392,6 +390,11 @@ class _CoreTunnelEndpoint:
                     raise SshTransportError(SshTransportErrorCode.CONNECTION_FAILED) from None
                 if not child.authority.released:
                     raise SshTransportError(SshTransportErrorCode.CONNECTION_FAILED)
+                return_code = process.returncode
+            else:
+                return_code = process.poll()
+            if return_code != 0:
+                raise SshTransportError(SshTransportErrorCode.CONNECTION_FAILED)
             completed.append(generation)
         for generation in completed:
             self._children.pop(generation, None)
@@ -551,22 +554,28 @@ class SshTunnel(AbstractContextManager["SshTunnel"]):
                 return
             self._close_requested = True
         probe_failure: BaseException | None = None
-        try:
-            running = _tunnel_process_is_running(self.process)
-        except BaseException as exc:
-            running = True
-            probe_failure = exc
-        if running:
+        if self._process_authority is not None:
             try:
-                if self._process_authority is None:
-                    self.process.terminate()
-                else:
-                    self._process_authority.request_group_termination()
+                self._process_authority.request_group_termination()
             except BaseException as exc:
                 self._retain_orphan()
                 _log_transport_failure(SshTransportErrorCode.CONNECTION_FAILED)
                 if not isinstance(exc, Exception):
                     raise
+        else:
+            try:
+                running = _tunnel_process_is_running(self.process)
+            except BaseException as exc:
+                running = True
+                probe_failure = exc
+            if running:
+                try:
+                    self.process.terminate()
+                except BaseException as exc:
+                    self._retain_orphan()
+                    _log_transport_failure(SshTransportErrorCode.CONNECTION_FAILED)
+                    if not isinstance(exc, Exception):
+                        raise
         if probe_failure is not None:
             _log_transport_failure(SshTransportErrorCode.CONNECTION_FAILED)
             if not isinstance(probe_failure, Exception):
@@ -603,12 +612,18 @@ class SshTunnel(AbstractContextManager["SshTunnel"]):
     def _monitor_exit(self) -> None:
         while not self._closed.wait(_TUNNEL_MONITOR_INTERVAL_SECONDS):
             try:
-                if self.process.poll() is not None:
+                if self._leader_exited():
                     self.close()
                     return
             except Exception:
                 _log_transport_failure(SshTransportErrorCode.CONNECTION_FAILED)
                 continue
+
+    def _leader_exited(self) -> bool:
+        authority = self._process_authority
+        if authority is not None:
+            return authority.leader_exited()
+        return self.process.poll() is not None
 
     def _rollback_failed_construction(self) -> None:
         try:
@@ -1460,7 +1475,6 @@ class SshRemoteExecutorTransport:
             try:
                 _wait_for_local_port(
                     tunnel,
-                    process=process,
                     timeout_seconds=timeout_seconds,
                 )
             except TimeoutError:
@@ -1691,6 +1705,11 @@ class _KnownHostsLeaseOwnership:
 
 class _NonReapingPopen(subprocess.Popen):
     """Leave wait ownership with `_OwnedSubprocessAuthority`."""
+
+    def poll(self) -> int | None:
+        if self.returncode is None:
+            raise RuntimeError("owned subprocess liveness requires its non-reaping observer")
+        return self.returncode
 
     def __del__(self) -> None:
         return
@@ -1942,12 +1961,18 @@ class _OwnedSubprocessAuthority:
                 raise RuntimeError("subprocess cleanup authority is incomplete")
             failure: BaseException | None = None
             try:
-                _terminate_and_reap_subprocess(
-                    process,
-                    process_group_id=process_group_id,
-                    exit_observer=self.exit_observer,
-                    on_group_cleanup_confirmed=self.mark_group_cleanup_confirmed,
-                )
+                if process.returncode is not None:
+                    _confirm_owned_process_group_disappeared(
+                        process_group_id=process_group_id,
+                    )
+                    self.mark_group_cleanup_confirmed()
+                else:
+                    _terminate_and_reap_subprocess(
+                        process,
+                        process_group_id=process_group_id,
+                        exit_observer=self.exit_observer,
+                        on_group_cleanup_confirmed=self.mark_group_cleanup_confirmed,
+                    )
             except BaseException as exc:
                 failure = exc
             if self._group_cleanup_confirmed and self._is_reaped():
@@ -1980,6 +2005,13 @@ class _OwnedSubprocessAuthority:
             process_group_id=process_group_id,
             signal_number=signal.SIGTERM,
         )
+
+    def leader_exited(self) -> bool:
+        process = self.process
+        observer = self.exit_observer
+        if process is None or observer is None:
+            raise RuntimeError("subprocess exit observer is unavailable")
+        return observer.exited()
 
     def retain(self) -> None:
         with _ORPHANED_SUBPROCESS_GUARD:
@@ -2024,12 +2056,7 @@ class _OwnedSubprocessAuthority:
         process = self.process
         if process is None:
             return not self._spawn_outcome_unknown
-        if process.returncode is not None:
-            return True
-        try:
-            return process.poll() is not None
-        except BaseException:
-            return False
+        return process.returncode is not None
 
 
 def _subprocess_birth_argv(argv: list[str], birth_record_fd: int) -> list[str]:
@@ -2248,8 +2275,11 @@ def _capture_subprocess_output(
             process,
             process_group_id=process_group_id,
         )
-        on_group_cleanup_confirmed()
         process.wait(timeout=_SUBPROCESS_TERMINATE_GRACE_SECONDS)
+        _confirm_owned_process_group_disappeared(
+            process_group_id=process_group_id,
+        )
+        on_group_cleanup_confirmed()
     finally:
         selector.close()
     return b"".join(chunks["stdout"]), b"".join(chunks["stderr"])
@@ -2404,6 +2434,27 @@ def _confirm_owned_process_group_terminated(
         time.sleep(min(_SUBPROCESS_STATUS_INTERVAL_SECONDS, remaining))
 
 
+def _confirm_owned_process_group_disappeared(*, process_group_id: int) -> None:
+    if process_group_id <= 1 or process_group_id == os.getpgrp():
+        raise RuntimeError("subprocess process-group ownership is invalid")
+    deadline = time.monotonic() + _SUBPROCESS_TERMINATE_GRACE_SECONDS
+    while True:
+        if os.path.isdir("/proc"):
+            states = _read_proc_process_group_states(process_group_id)
+        else:
+            states = {
+                process_id: state
+                for process_id, (group_id, state) in _read_ps_process_group_states().items()
+                if group_id == process_group_id
+            }
+        if not states:
+            return
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError("subprocess process-group disappearance could not be confirmed")
+        time.sleep(min(_SUBPROCESS_STATUS_INTERVAL_SECONDS, remaining))
+
+
 def _observe_owned_process_group_states(
     process: _OwnedSubprocessProcess,
     *,
@@ -2548,8 +2599,11 @@ def _terminate_and_reap_subprocess(
         process,
         process_group_id=process_group_id,
     )
-    on_group_cleanup_confirmed()
     process.wait(timeout=_SUBPROCESS_TERMINATE_GRACE_SECONDS)
+    _confirm_owned_process_group_disappeared(
+        process_group_id=process_group_id,
+    )
+    on_group_cleanup_confirmed()
 
 
 def _require_parent_owned_stream(
@@ -2637,6 +2691,15 @@ def _terminate_tunnel_child(
     except BaseException as exc:
         failure = exc
     return authority.released, failure
+
+
+def _tunnel_child_has_exited(child: _TunnelChild) -> bool:
+    process = child.process
+    if process is None:
+        raise RuntimeError("SSH tunnel child ownership is incomplete")
+    if child.authority is not None:
+        return child.authority.leader_exited()
+    return process.poll() is not None
 
 
 def _wait_for_tunnel_process_exit(
@@ -2773,15 +2836,13 @@ def _allocate_local_port() -> int:
 def _wait_for_local_port(
     tunnel: SshTunnel,
     *,
-    process: TunnelProcess,
     timeout_seconds: float,
 ) -> None:
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
-        return_code = process.poll()
-        if return_code is not None:
+        if tunnel._leader_exited():
             raise RuntimeError(
-                f"SSH tunnel exited before it became ready (return code {return_code})."
+                "SSH tunnel exited before it became ready."
             )
         try:
             with socket.create_connection(

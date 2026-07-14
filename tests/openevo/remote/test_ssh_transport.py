@@ -1115,6 +1115,160 @@ def test_tunnel_popen_cancellation_owns_and_reaps_entire_process_group(
                 pass
 
 
+@pytest.mark.parametrize("with_descendant", [False, True], ids=("short-lived", "descendant"))
+def test_production_tunnel_exit_observation_does_not_reap_before_group_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    with_descendant: bool,
+) -> None:
+    pid_path = tmp_path / f"production-tunnel-{with_descendant}.json"
+    tunnel_program = tmp_path / f"production-tunnel-{with_descendant}.py"
+    program_lines = ["import json", "import os", "import sys"]
+    if with_descendant:
+        program_lines.extend(
+            (
+                "import subprocess",
+                "child = subprocess.Popen([sys.executable, '-c', "
+                "'import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                "time.sleep(30)'])",
+                "process_ids = [os.getpid(), child.pid]",
+            )
+        )
+    else:
+        program_lines.append("process_ids = [os.getpid()]")
+    program_lines.extend(
+        (
+            "with open(sys.argv[1], 'w', encoding='ascii') as stream:",
+            "    json.dump(process_ids, stream)",
+            "    stream.flush()",
+            "    os.fsync(stream.fileno())",
+        )
+    )
+    tunnel_program.write_text("\n".join(program_lines), encoding="ascii")
+
+    transport = _transport(tmp_path)
+    lease_paths: list[Path] = []
+    orphan_ids = set(ssh_module._ORPHANED_SUBPROCESSES)
+
+    def local_tunnel_argv(known_hosts_file: Path) -> list[str]:
+        lease_paths.append(known_hosts_file)
+        return [sys.executable, str(tunnel_program), str(pid_path)]
+
+    monkeypatch.setattr(transport, "_ssh_base_argv", local_tunnel_argv)
+    monkeypatch.setattr(ssh_module, "_SUBPROCESS_TERMINATE_GRACE_SECONDS", 0.2)
+    tunnel = transport.open_tunnel(
+        remote_port=8765,
+        local_port=49159 if with_descendant else 49158,
+        wait_for_ready=False,
+    )
+    authority = tunnel._process_authority
+    assert authority is not None
+    process = authority.process
+    assert process is not None
+    process_ids: list[int] = []
+    try:
+        deadline = time.monotonic() + 3
+        while not tunnel.closed and time.monotonic() < deadline:
+            if pid_path.exists() and not process_ids:
+                try:
+                    process_ids = json.loads(pid_path.read_text(encoding="ascii"))
+                except json.JSONDecodeError:
+                    pass
+            time.sleep(0.01)
+
+        assert tunnel.closed is True
+        assert process.returncode is not None
+        assert authority.released is True
+        assert set(ssh_module._ORPHANED_SUBPROCESSES) == orphan_ids
+        assert len(lease_paths) == 1
+        assert not lease_paths[0].exists()
+        assert process_ids
+        _assert_processes_gone(*process_ids)
+    finally:
+        if not process_ids and pid_path.exists():
+            try:
+                process_ids = json.loads(pid_path.read_text(encoding="ascii"))
+            except json.JSONDecodeError:
+                pass
+        if not authority.released:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            try:
+                process.wait(timeout=3)
+            except (ChildProcessError, subprocess.TimeoutExpired):
+                pass
+            authority.mark_group_cleanup_confirmed()
+            authority.release()
+        for process_id in process_ids:
+            try:
+                os.kill(process_id, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+
+def test_production_tunnel_concurrent_close_releases_authority_before_restart(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tunnel_program = tmp_path / "production-tunnel-concurrent.py"
+    tunnel_program.write_text("import time\ntime.sleep(30)\n", encoding="ascii")
+    transport = _transport(tmp_path)
+    lease_paths: list[Path] = []
+    orphan_ids = set(ssh_module._ORPHANED_SUBPROCESSES)
+
+    def local_tunnel_argv(known_hosts_file: Path) -> list[str]:
+        lease_paths.append(known_hosts_file)
+        return [sys.executable, str(tunnel_program)]
+
+    monkeypatch.setattr(transport, "_ssh_base_argv", local_tunnel_argv)
+    monkeypatch.setattr(ssh_module, "_SUBPROCESS_TERMINATE_GRACE_SECONDS", 0.2)
+    tunnel = transport.open_tunnel(
+        remote_port=8765,
+        local_port=49160,
+        wait_for_ready=False,
+    )
+    authority = tunnel._process_authority
+    assert authority is not None
+    process = authority.process
+    assert process is not None
+    with pytest.raises(RuntimeError, match="non-reaping observer"):
+        process.poll()
+
+    failures: list[BaseException] = []
+
+    def close_tunnel() -> None:
+        try:
+            tunnel.close()
+        except BaseException as exc:
+            failures.append(exc)
+
+    closers = [threading.Thread(target=close_tunnel) for _ in range(4)]
+    for closer in closers:
+        closer.start()
+    for closer in closers:
+        closer.join(timeout=3)
+
+    assert all(not closer.is_alive() for closer in closers)
+    assert failures == []
+    assert tunnel.closed is True
+    assert process.returncode is not None
+    assert authority.released is True
+
+    restarted = transport.open_tunnel(
+        remote_port=8765,
+        local_port=49160,
+        wait_for_ready=False,
+    )
+    restarted.close()
+
+    assert restarted.closed is True
+    assert len(lease_paths) == 2
+    assert all(not path.exists() for path in lease_paths)
+    assert set(ssh_module._ORPHANED_SUBPROCESSES) == orphan_ids
+
+
 @pytest.mark.parametrize("tunnel_kind", ["forward", "core_connection"])
 def test_tunnel_authority_acquire_cancellation_releases_slot_and_trust_lease(
     tmp_path: Path,

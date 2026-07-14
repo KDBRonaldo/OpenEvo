@@ -93,6 +93,16 @@ temporary name, and fsyncs the directory. Existing records are immutable unless
 an explicit compare-and-swap rotation succeeds. Store paths reject whitespace,
 quoting, backslashes, and OpenSSH `%` token expansion.
 
+Each operation lock is owned by an explicit, single-use authority rather than a
+generator frame. The authority records the root and lock inode bindings, lock
+state, and exact operation FD in a bounded process registry. Unlock, close, and
+the `fstat` used to prove close are independently retryable; the registry entry
+is removed only after that FD is proven closed. The permanent lock-inode anchor
+uses a separate open-file description, so closing an operation FD still releases
+its `flock` if an explicit unlock reports failure. A retained shared-lock
+authority continues to block rotation after repeated cleanup faults, but a later
+operation retries it and allows rotation to proceed once cleanup recovers.
+
 The threat model is an owner-only trust root plus advisory locking among
 cooperating Desktop processes. This prevents non-owner modification and avoids
 accidental or concurrent mutation by cooperating processes. It does not claim
@@ -188,7 +198,9 @@ transaction. Before either the general forward or a Core connection child can
 call `Popen`, it owns a bounded registry slot, birth-record FD, and independent
 session/process group. A failure after process creation performs bounded
 whole-group TERM/observe/KILL cleanup, but unregisters the closer and releases
-the trust lease only after the group is dead or zombie and the leader is reaped.
+the trust lease only after every group member is dead or zombie, the leader is
+reaped, and a second bounded process-table scan proves that the PGID has
+disappeared.
 If cleanup cannot confirm exit, the same process authority and tunnel quarantine
 retain the registration and lease while a daemon monitor retries. Matching
 trust mutation also retries quarantined cleanup when constructor registration
@@ -346,6 +358,10 @@ retains the same bounded slot and lease fail closed. There is no semaphore to
 registry handoff and no portable waiter thread that can call `wait()` early.
 Process-group validation, `waitid`, Darwin `kqueue`, Linux
 `/proc/<pid>/stat` fallback setup, and capture all execute under that authority.
+Production tunnel readiness, exit monitoring, Core connection verification, and
+close use only this non-reaping observer. `_NonReapingPopen.poll()` rejects a
+live unreaped child, preventing an accidental `waitpid(WNOHANG)` from consuming
+the leader status before group cleanup.
 If no non-reaping observer is available, closed capture pipes or the operation
 deadline initiate cleanup conservatively. Error and cancellation cleanup keeps
 the direct child unreaped while that PID fixes the group identity, sends
@@ -353,8 +369,9 @@ the direct child unreaped while that PID fixes the group identity, sends
 cleanup confirmed. A bounded observer enumerates process state through Linux
 `/proc` or portable `ps`, requires the pinned leader to remain observable, and
 requires every member of that PGID to be dead or a zombie. Only then may the
-owner wait/reap the direct child, close its birth-record FD, remove the registry
-entry, release capacity, and close the known-host lease. Any group signal,
+owner wait/reap the direct child; it subsequently requires the exact PGID to be
+absent before closing its birth-record FD, removing the registry entry,
+releasing capacity, and closing the known-host lease. Any group signal,
 observation, reap, record removal, or lease cleanup failure retains the complete
 authority. Later command, tunnel, close, or recovery calls retry up to four retained
 entries synchronously. Full ownership capacity rejects a new command before
@@ -369,6 +386,13 @@ PID/PGID reuse from redirecting cleanup, never treats `killpg` success or
 `ESRCH` alone as group-termination proof, never signals the Desktop process
 group, and keeps a descendant from writing after an error return or trust-lease
 release.
+
+This ownership change is limited to the parent-side Python deployment SSH and
+provider known-host modules. It does not alter remote bootstrap incoming-marker
+or crash-recovery behavior. If the separate Python bootstrap branch lands first,
+these parent-side authority changes must be merged manually afterward, preserving
+that branch's marker/recovery implementation while retaining the non-reaping
+tunnel and retryable lock cleanup contracts above.
 
 `env` is injected into the remote command as POSIX assignments:
 

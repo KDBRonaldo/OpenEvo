@@ -18,7 +18,7 @@ import subprocess
 import threading
 import time
 from collections.abc import Callable
-from contextlib import AbstractContextManager, contextmanager
+from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -66,6 +66,9 @@ _TUNNEL_CLOSERS: dict[tuple[int, int, str, str], set[Callable[[], None]]] = {}
 _MAX_KNOWN_HOST_SPAWN_LEASES = 64
 _SPAWN_LEASE_REGISTRY_GUARD = threading.Lock()
 _SPAWN_LEASES: dict[int, "_KnownHostsSpawnLease"] = {}
+_MAX_STORE_LOCK_AUTHORITIES = 64
+_STORE_LOCK_REGISTRY_GUARD = threading.Lock()
+_STORE_LOCK_AUTHORITIES: dict[int, "_StoreLockAuthority"] = {}
 
 
 class HostKeyStoreErrorCode(str, Enum):
@@ -509,6 +512,160 @@ class ProviderKnownHostStore:
                         pass
 
 
+class _StoreLockAuthority(AbstractContextManager[int | None]):
+    """Own one lock descriptor until unlock and close are both proven."""
+
+    def __init__(self, anchor: _StoreAnchor, *, create: bool, exclusive: bool) -> None:
+        self._anchor = anchor
+        self._create = create
+        self._exclusive = exclusive
+        self._root_fd: int | None = None
+        self._root_identity: tuple[int, int] | None = None
+        self._lock_fd: int | None = None
+        self._lock_identity: tuple[int, int] | None = None
+        self._locked = False
+        self._slot_held = False
+        self._cleanup_requested = False
+        self._entered = False
+        self._released = False
+        self._cleanup_guard = threading.Lock()
+
+    def __enter__(self) -> int | None:
+        if self._entered or self._released:
+            raise ValueError("provider known-host store lock authority cannot be reused")
+        self._entered = True
+        self._reserve_slot()
+        try:
+            root_fd = self._anchor._get_root_fd(create=self._create)
+            if root_fd is None:
+                self._release_slot()
+                self._released = True
+                return None
+            root_stat = os.fstat(root_fd)
+            lock_fd = self._anchor._open_lock(root_fd)
+            self._lock_fd = lock_fd
+            lock_stat = os.fstat(lock_fd)
+            self._lock_identity = (lock_stat.st_dev, lock_stat.st_ino)
+            self._anchor._validate_open_lock(lock_fd)
+            self._root_fd = root_fd
+            self._root_identity = (root_stat.st_dev, root_stat.st_ino)
+            _acquire_store_lock(
+                lock_fd,
+                exclusive=self._exclusive,
+                timeout_seconds=self._anchor._lock_timeout_seconds,
+            )
+            self._locked = True
+            self._anchor._validate_ancestor_binding()
+            self._anchor._validate_root_binding()
+            self._anchor._validate_lock_binding(root_fd, lock_fd)
+            return root_fd
+        except BaseException:
+            self._cleanup_requested = True
+            try:
+                self._cleanup()
+            except BaseException:
+                pass
+            raise
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        del exc_type, exc, traceback
+        self._cleanup_requested = True
+        self._cleanup()
+
+    def _reserve_slot(self) -> None:
+        _retry_retained_store_lock_cleanup()
+        with _STORE_LOCK_REGISTRY_GUARD:
+            if len(_STORE_LOCK_AUTHORITIES) >= _MAX_STORE_LOCK_AUTHORITIES:
+                raise ValueError("provider known-host store lock cleanup capacity is exhausted")
+            _STORE_LOCK_AUTHORITIES[id(self)] = self
+            self._slot_held = True
+
+    def _cleanup(self) -> None:
+        with self._cleanup_guard:
+            if self._released:
+                return
+            failure = self._validate_owned_descriptor()
+            lock_fd = self._lock_fd
+            if lock_fd is not None and self._locked:
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                except BaseException as exc:
+                    if failure is None:
+                        failure = exc
+                else:
+                    self._locked = False
+            if lock_fd is not None:
+                try:
+                    os.close(lock_fd)
+                except BaseException as exc:
+                    if failure is None:
+                        failure = exc
+                    if self._descriptor_is_closed(lock_fd):
+                        self._lock_fd = None
+                        self._locked = False
+                else:
+                    self._lock_fd = None
+                    self._locked = False
+            if self._lock_fd is None:
+                self._released = True
+                self._release_slot()
+            if failure is not None:
+                raise ValueError("provider known-host store lock cleanup failed") from None
+            if not self._released:
+                raise ValueError("provider known-host store lock cleanup failed")
+
+    def _validate_owned_descriptor(self) -> BaseException | None:
+        lock_fd = self._lock_fd
+        if lock_fd is None:
+            return None
+        try:
+            lock_stat = os.fstat(lock_fd)
+            root_fd = self._root_fd
+            if root_fd is None:
+                raise ValueError("provider known-host store lock root authority is incomplete")
+            root_stat = os.fstat(root_fd)
+            if self._lock_identity != (lock_stat.st_dev, lock_stat.st_ino):
+                raise ValueError("provider known-host store lock FD identity changed")
+            if self._root_identity != (root_stat.st_dev, root_stat.st_ino):
+                raise ValueError("provider known-host store root FD identity changed")
+        except BaseException as exc:
+            return exc
+        return None
+
+    def _descriptor_is_closed(self, lock_fd: int) -> bool:
+        try:
+            opened = os.fstat(lock_fd)
+        except OSError as exc:
+            return exc.errno == errno.EBADF
+        except BaseException:
+            return False
+        return self._lock_identity is not None and self._lock_identity != (
+            opened.st_dev,
+            opened.st_ino,
+        )
+
+    def _release_slot(self) -> None:
+        with _STORE_LOCK_REGISTRY_GUARD:
+            if not self._slot_held:
+                return
+            _STORE_LOCK_AUTHORITIES.pop(id(self), None)
+            self._slot_held = False
+
+
+def _retry_retained_store_lock_cleanup() -> None:
+    with _STORE_LOCK_REGISTRY_GUARD:
+        retained = tuple(
+            authority
+            for authority in _STORE_LOCK_AUTHORITIES.values()
+            if authority._cleanup_requested
+        )
+    for authority in retained:
+        try:
+            authority._cleanup()
+        except BaseException:
+            continue
+
+
 class _StoreAnchor:
     """Held secure ancestor/root descriptors plus the cross-process lock namespace."""
 
@@ -529,61 +686,46 @@ class _StoreAnchor:
         ancestor_stat = os.fstat(self._ancestor_fd)
         self.registry_key = (ancestor_stat.st_dev, ancestor_stat.st_ino, root.name)
 
-    @contextmanager
-    def locked_root(self, *, create: bool, exclusive: bool):
-        root_fd = self._get_root_fd(create=create)
-        if root_fd is None:
-            yield None
-            return
-        lock_fd = self._open_lock(root_fd)
-        acquired = False
-        try:
-            _acquire_store_lock(
-                lock_fd,
-                exclusive=exclusive,
-                timeout_seconds=self._lock_timeout_seconds,
-            )
-            acquired = True
-            self._validate_ancestor_binding()
-            self._validate_root_binding()
-            self._validate_lock_binding(root_fd, lock_fd)
-            yield root_fd
-        finally:
-            cleanup_failed = False
-            if acquired:
-                try:
-                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
-                except BaseException:
-                    cleanup_failed = True
-                    try:
-                        fcntl.flock(lock_fd, fcntl.LOCK_UN)
-                    except BaseException:
-                        pass
-            try:
-                os.close(lock_fd)
-            except BaseException:
-                cleanup_failed = True
-            if cleanup_failed:
-                raise ValueError("provider known-host store lock cleanup failed")
+    def locked_root(
+        self,
+        *,
+        create: bool,
+        exclusive: bool,
+    ) -> AbstractContextManager[int | None]:
+        return _StoreLockAuthority(self, create=create, exclusive=exclusive)
 
     def _open_lock(self, root_fd: int) -> int:
         with self._guard:
             try:
-                fd = os.open(
+                if self._lock_anchor_fd is None:
+                    self._lock_anchor_fd = os.open(
+                        _LOCK_NAME,
+                        os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW,
+                        0o600,
+                        dir_fd=root_fd,
+                    )
+                anchored = os.fstat(self._lock_anchor_fd)
+                _validate_file_stat(anchored, require_single_link=True)
+            except Exception as exc:
+                raise ValueError("provider known-host store lock binding changed") from exc
+            try:
+                return os.open(
                     _LOCK_NAME,
-                    os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW,
-                    0o600,
+                    os.O_RDWR | os.O_NOFOLLOW,
                     dir_fd=root_fd,
                 )
             except OSError as exc:
                 raise ValueError(
                     "provider known-host store lock could not be opened safely"
                 ) from exc
+
+    def _validate_open_lock(self, lock_fd: int) -> None:
+        with self._guard:
             try:
-                opened = os.fstat(fd)
+                opened = os.fstat(lock_fd)
                 _validate_file_stat(opened, require_single_link=True)
                 if self._lock_anchor_fd is None:
-                    self._lock_anchor_fd = os.dup(fd)
+                    raise ValueError("provider known-host store lock anchor is unavailable")
                 anchored = os.fstat(self._lock_anchor_fd)
                 _validate_file_stat(anchored, require_single_link=True)
                 if (opened.st_dev, opened.st_ino) != (
@@ -592,9 +734,7 @@ class _StoreAnchor:
                 ):
                     raise ValueError("provider known-host store lock binding changed")
             except Exception as exc:
-                os.close(fd)
                 raise ValueError("provider known-host store lock binding changed") from exc
-            return fd
 
     def _validate_lock_binding(self, root_fd: int, lock_fd: int) -> None:
         try:

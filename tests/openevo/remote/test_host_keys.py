@@ -923,12 +923,12 @@ def test_spawn_lease_cleanup_failure_retains_exact_identity_and_shared_lock(
     original_fstat = os.fstat
     original_unlink = os.unlink
     original_rmdir = os.rmdir
-    injected = False
+    remaining_failures = 2
 
     def flaky_fstat(fd: int) -> os.stat_result:
-        nonlocal injected
-        if cleanup_failure == "fstat" and fd == directory_fd and not injected:
-            injected = True
+        nonlocal remaining_failures
+        if cleanup_failure == "fstat" and fd == directory_fd and remaining_failures:
+            remaining_failures -= 1
             raise OSError("injected lease fstat failure")
         return original_fstat(fd)
 
@@ -937,14 +937,14 @@ def test_spawn_lease_cleanup_failure_retains_exact_identity_and_shared_lock(
         *,
         dir_fd: int | None = None,
     ) -> None:
-        nonlocal injected
+        nonlocal remaining_failures
         if (
             cleanup_failure == "unlink"
             and path == "known_hosts"
             and dir_fd == directory_fd
-            and not injected
+            and remaining_failures
         ):
-            injected = True
+            remaining_failures -= 1
             raise OSError("injected lease unlink failure")
         original_unlink(path, dir_fd=dir_fd)
 
@@ -953,9 +953,9 @@ def test_spawn_lease_cleanup_failure_retains_exact_identity_and_shared_lock(
         *,
         dir_fd: int | None = None,
     ) -> None:
-        nonlocal injected
-        if cleanup_failure == "rmdir" and path == directory_name and not injected:
-            injected = True
+        nonlocal remaining_failures
+        if cleanup_failure == "rmdir" and path == directory_name and remaining_failures:
+            remaining_failures -= 1
             raise OSError("injected lease rmdir failure")
         original_rmdir(path, dir_fd=dir_fd)
 
@@ -970,8 +970,10 @@ def test_spawn_lease_cleanup_failure_retains_exact_identity_and_shared_lock(
         scoped.setattr(os, "rmdir", flaky_rmdir)
         with pytest.raises(OSError, match="injected lease"):
             lease.__exit__(None, None, None)
+        host_keys_module._retry_retained_spawn_lease_cleanup()
+        assert id(lease) in host_keys_module._SPAWN_LEASES
 
-    assert injected is True
+    assert remaining_failures == 0
     assert lease_path.parent.exists()
     with pytest.raises(HostKeyStoreError) as error:
         contender.revoke(profile, expected_fingerprint=binding.fingerprint)
@@ -981,6 +983,95 @@ def test_spawn_lease_cleanup_failure_retains_exact_identity_and_shared_lock(
 
     assert not lease_path.parent.exists()
     contender.revoke(profile, expected_fingerprint=binding.fingerprint)
+
+
+def test_spawn_lease_retries_repeated_lock_cleanup_failures_before_registry_release(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile = _profile()
+    binding = _confirmed_binding(tmp_path, profile)
+    lock_registry_ids = set(host_keys_module._STORE_LOCK_AUTHORITIES)
+    lease = binding.open_for_spawn(profile)
+    lease_path = lease.__enter__()
+    lock_authority = lease._locked
+    assert lock_authority is not None
+    contender = ProviderKnownHostStore(
+        binding.known_hosts_file.parent,
+        runner=KeyscanRunner(""),
+        lock_timeout_seconds=0.05,
+    )
+    real_flock = host_keys_module.fcntl.flock
+    real_close = os.close
+    real_fstat = os.fstat
+    lock_fd: int | None = None
+    unlock_failures = 8
+    close_failures = 8
+    fstat_failures = 8
+
+    def fail_repeated_unlock(fd: int, operation: int) -> None:
+        nonlocal lock_fd, unlock_failures
+        if operation == host_keys_module.fcntl.LOCK_UN:
+            lock_fd = fd
+            if unlock_failures:
+                unlock_failures -= 1
+                raise OSError("injected repeated unlock failure")
+        real_flock(fd, operation)
+
+    def fail_repeated_close(fd: int) -> None:
+        nonlocal close_failures
+        if fd == lock_fd and close_failures:
+            close_failures -= 1
+            raise OSError("injected repeated close failure")
+        real_close(fd)
+
+    def fail_repeated_fstat(fd: int) -> os.stat_result:
+        nonlocal fstat_failures
+        if fd == lock_fd and fstat_failures:
+            fstat_failures -= 1
+            raise OSError("injected repeated fstat failure")
+        return real_fstat(fd)
+
+    try:
+        with monkeypatch.context() as scoped:
+            scoped.setattr(host_keys_module.fcntl, "flock", fail_repeated_unlock)
+            scoped.setattr(host_keys_module.os, "close", fail_repeated_close)
+            scoped.setattr(host_keys_module.os, "fstat", fail_repeated_fstat)
+
+            with pytest.raises(ValueError, match="lock cleanup failed"):
+                lease.__exit__(None, None, None)
+            assert lock_fd is not None
+            for _ in range(2):
+                host_keys_module._retry_retained_spawn_lease_cleanup()
+                assert id(lease) in host_keys_module._SPAWN_LEASES
+                assert id(lock_authority) in host_keys_module._STORE_LOCK_AUTHORITIES
+                assert real_fstat(lock_fd).st_ino > 0
+                with pytest.raises(HostKeyStoreError) as error:
+                    contender.revoke(profile, expected_fingerprint=binding.fingerprint)
+                assert error.value.code is HostKeyStoreErrorCode.HOST_KEY_IN_USE
+
+        host_keys_module._retry_retained_spawn_lease_cleanup()
+
+        assert id(lease) not in host_keys_module._SPAWN_LEASES
+        assert set(host_keys_module._STORE_LOCK_AUTHORITIES) == lock_registry_ids
+        assert not lease_path.parent.exists()
+        assert lock_fd is not None
+        with pytest.raises(OSError) as closed:
+            real_fstat(lock_fd)
+        assert closed.value.errno == 9
+        contender.revoke(profile, expected_fingerprint=binding.fingerprint)
+    finally:
+        if id(lease) in host_keys_module._SPAWN_LEASES:
+            host_keys_module._retry_retained_spawn_lease_cleanup()
+        if lock_fd is not None:
+            try:
+                real_flock(lock_fd, host_keys_module.fcntl.LOCK_UN)
+            except OSError:
+                pass
+            try:
+                real_close(lock_fd)
+            except OSError:
+                pass
 
 
 def test_spawn_lease_retained_cleanup_capacity_fails_closed_before_new_publish(
