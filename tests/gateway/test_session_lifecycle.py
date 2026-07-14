@@ -173,7 +173,9 @@ async def test_dispatch_runs_runtime_lifecycle_and_builds_stdout_trajectory(
             }
         ]
         assert manager.storage.get_session_metadata(request.session_id) is None
-        assert list(tmp_path.iterdir()) == []
+        assert {path.name for path in tmp_path.iterdir()} == {".openevo-gateway-cleanup"}
+        assert list(manager._cleanup_journal_dir.glob("*.json")) == []
+        assert list(manager._cleanup_journal_dir.parent.glob(".*.root.json"))
     finally:
         await manager.close()
 

@@ -48,7 +48,12 @@ from openevo.runtime.managed import (
 from openevo.runtime.models import ExecInput, ExecResult, RuntimeSpec
 from openevo.runtime.models import PrepareAction
 from openevo.trajectory.builder.agent_transcript import AgentTranscriptBuilder
-from openevo.trajectory.models import CompletionRecord, CompletionSession, Trajectory
+from openevo.trajectory.models import (
+    CompletionRecord,
+    CompletionSession,
+    EvaluatorSpec,
+    Trajectory,
+)
 from openevo.trajectory.registry import default_builder_registry
 
 
@@ -1053,6 +1058,72 @@ async def test_subscription_stops_runtime_and_redacts_background_output_before_r
     assert secret not in serialized
 
 
+@pytest.mark.asyncio
+async def test_subscription_evaluator_runs_before_runtime_is_stopped(
+    tmp_path: Path,
+) -> None:
+    calls: list[str] = []
+    manager = _postrun_manager(calls=calls)
+
+    class EvaluatedRuntime(FakeRuntime):
+        stopped = False
+
+        async def stop(self) -> None:
+            self.stopped = True
+            calls.append("runtime_absent")
+
+    runtime = EvaluatedRuntime()
+    request = SessionDispatchRequest(
+        session_id="subscription-evaluator",
+        task_id="task_1",
+        instruction="Do work.",
+        remaining_timeout_seconds=60,
+        runtime=RuntimeSpec(
+            profile="managed_science",
+            image=MANAGED_RUNTIME_IMAGES["managed_science"],
+            container_user="host",
+        ),
+        agent=AgentSpec(
+            harness="codex",
+            settings={"auth_mode": "subscription", "capture_mode": "transcript"},
+        ),
+        evaluator=EvaluatorSpec(strategy="pass_at_k"),
+    )
+    managed = ManagedSession(
+        request=request,
+        timer=StageTimer(),
+        session_dir=tmp_path,
+        artifacts_dir=tmp_path / "artifacts",
+        session_root_identity=capture_session_root_identity(tmp_path),
+        runtime=runtime,
+        agent_result=AgentRunResult(status="completed", return_code=0),
+    )
+
+    async def build_result(captured: ManagedSession) -> SessionResult:
+        assert captured.runtime is runtime
+        assert runtime.stopped is False
+        calls.append("evaluate")
+        return _session_result(session_id=request.session_id)
+
+    async def finalize(
+        captured: ManagedSession,
+        *,
+        result: SessionResult | None,
+    ) -> None:
+        assert captured is managed
+        assert result is not None
+        assert captured.final_result is result
+        calls.append("finalize")
+
+    manager._build_session_result = build_result
+    manager._finalize_subscription_after_runtime_absence = finalize
+
+    await manager._handle_postrun(managed)
+
+    assert calls.index("evaluate") < calls.index("runtime_absent")
+    assert calls[-1] == "finalize"
+
+
 def test_subscription_capture_redaction_never_modifies_workspace_files(
     tmp_path: Path,
 ) -> None:
@@ -1250,6 +1321,104 @@ async def test_cleanup_ownership_persists_for_new_manager_startup_reconciliation
     ]
     assert restarted._cleanup_retries == {}
     assert list(journal_dir.glob("*.json")) == []
+
+
+def test_cleanup_journal_root_replacement_retains_displaced_records(
+    tmp_path: Path,
+) -> None:
+    journal_dir = tmp_path / "journal"
+    session_dir = tmp_path / "session"
+    session_dir.mkdir(mode=0o700)
+    managed = _managed_postrun_session(
+        session_dir,
+        _session_result(session_id="journal-root-replaced"),
+    )
+    managed.session_root_identity = capture_session_root_identity(session_dir)
+    first = _postrun_manager(calls=[])
+    first._cleanup_journal_dir = journal_dir
+    first._register_cleanup_retry(managed)
+
+    displaced = tmp_path / "journal-displaced"
+    journal_dir.rename(displaced)
+    journal_dir.mkdir(mode=0o700)
+
+    restarted = _postrun_manager(calls=[])
+    restarted._cleanup_journal_dir = journal_dir
+    with pytest.raises(RuntimeError, match="journal root identity"):
+        restarted._load_cleanup_retries()
+
+    assert len(list(displaced.glob("*.json"))) == 1
+    assert list(journal_dir.iterdir()) == []
+
+
+def test_cleanup_journal_recovery_rejects_symlinked_ancestor(
+    tmp_path: Path,
+) -> None:
+    authority_parent = tmp_path / "authority"
+    journal_dir = authority_parent / "journal"
+    session_dir = tmp_path / "session"
+    authority_parent.mkdir(mode=0o700)
+    session_dir.mkdir(mode=0o700)
+    managed = _managed_postrun_session(
+        session_dir,
+        _session_result(session_id="journal-ancestor-symlink"),
+    )
+    managed.session_root_identity = capture_session_root_identity(session_dir)
+    first = _postrun_manager(calls=[])
+    first._cleanup_journal_dir = journal_dir
+    first._register_cleanup_retry(managed)
+
+    displaced = tmp_path / "authority-displaced"
+    authority_parent.rename(displaced)
+    authority_parent.symlink_to(displaced, target_is_directory=True)
+
+    restarted = _postrun_manager(calls=[])
+    restarted._cleanup_journal_dir = journal_dir
+    with pytest.raises(RuntimeError, match="journal ancestor"):
+        restarted._load_cleanup_retries()
+
+    assert len(list((displaced / "journal").glob("*.json"))) == 1
+
+
+@pytest.mark.parametrize(
+    ("budget_name", "budget_value", "error"),
+    [
+        ("_CLEANUP_JOURNAL_MAX_ROWS", 0, "row budget"),
+        ("_CLEANUP_JOURNAL_MAX_FILENAME_BYTES", 8, "filename budget"),
+        ("_CLEANUP_JOURNAL_MAX_METADATA_BYTES", 1, "metadata budget"),
+        ("_CLEANUP_JOURNAL_MAX_TOTAL_BYTES", 1, "aggregate byte budget"),
+    ],
+)
+def test_cleanup_journal_recovery_preflights_budgets_before_record_reads(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    budget_name: str,
+    budget_value: int,
+    error: str,
+) -> None:
+    journal_dir = tmp_path / "journal"
+    session_dir = tmp_path / "session"
+    session_dir.mkdir(mode=0o700)
+    managed = _managed_postrun_session(
+        session_dir,
+        _session_result(session_id=f"journal-budget-{budget_name}"),
+    )
+    managed.session_root_identity = capture_session_root_identity(session_dir)
+    first = _postrun_manager(calls=[])
+    first._cleanup_journal_dir = journal_dir
+    first._register_cleanup_retry(managed)
+
+    restarted = _postrun_manager(calls=[])
+    restarted._cleanup_journal_dir = journal_dir
+    monkeypatch.setattr(node_module, budget_name, budget_value)
+
+    def reject_record_read(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("journal content was read before recovery preflight")
+
+    monkeypatch.setattr(restarted, "_read_cleanup_journal_record", reject_record_read)
+    with pytest.raises(RuntimeError, match=error):
+        restarted._load_cleanup_retries()
 
 
 @pytest.mark.asyncio

@@ -73,7 +73,10 @@ and evaluators behave the same on either.
 the image's declared user and is the default for benchmark automation, custom
 images, and existing experiment configs. Docker `host` starts the container
 with the Core process UID/GID and therefore keeps the bind-mounted session
-writable without recursively widening host file permissions.
+writable without recursively widening host file permissions. Because `host` is
+a material runtime override, experiment config rejects it when no explicit
+runtime image is present; it is never dropped while falling back to the rollout
+node default runtime.
 
 OpenEvo-managed Science profiles use `host`; user-supplied custom images keep
 `image`. Every `managed_science` runtime, including subscription and
@@ -157,6 +160,12 @@ export config drift retains the journal and all transcript/session roots. An
 incomplete journal update also retains a durable pending marker and blocks
 restart cleanup until the exact transition is successfully retried. Live terminal
 status/error authority changes only after that durable transition succeeds.
+An immutable marker in the journal's private parent binds its normalized path,
+no-follow ancestor identity chain, and root inode. Startup rejects a missing or
+replaced bound root and any symlinked ancestor. It also completes row, filename,
+metadata, per-file, and aggregate-byte preflight for the directory before reading
+the first journal record. The empty root and marker remain after the last record
+is cleared so a later session cannot silently establish a different authority.
 
 Subscription auth bytes are validated before `DockerRuntime` is created. Core
 uses a random `0700` staging child inside the already journaled private
@@ -190,5 +199,8 @@ That recovery rule does not make a replacement redaction authority:
 credential-bearing v5 terminal finalization still fails closed. A publication
 race, symlink, owner/mode/link mismatch, or unavailable rename primitive fails
 before agent execution.
-Workspace and artifact files are not redaction write targets; files larger than
-the Core capture scan limit retain their exact bytes.
+Credential redaction writes only to the node-private log authority. Workspace
+and artifact files are never redaction write targets. If a private captured log
+exceeds a per-file or aggregate scan budget, finalization fails explicitly and
+all original bytes remain unchanged; Core does not substitute content in the
+workspace or artifact tree.

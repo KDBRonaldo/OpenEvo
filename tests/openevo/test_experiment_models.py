@@ -119,6 +119,15 @@ def test_workspace_is_optional_for_default_runtime_tasks() -> None:
     assert config.runtime.image is None
 
 
+def test_host_container_user_requires_explicit_runtime_image() -> None:
+    payload = _minimal_payload()
+    payload["tasks"][0].pop("workspace")
+    payload["runtime"] = {"container_user": "host"}
+
+    with pytest.raises(ValidationError, match="runtime.image is required"):
+        ExperimentConfig.model_validate(payload)
+
+
 def test_subscription_agents_cannot_disable_transcript_capture() -> None:
     payload = _minimal_payload()
     payload["agent"] = {

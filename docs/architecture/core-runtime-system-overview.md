@@ -186,10 +186,11 @@ placeholder。auth source 不在 view 内，host rename source 后 mountpoint �
 command；任何 prepare/agent command 前，Core 对 stable exact container 内 adopted view/auth identity
 做精确比较。任一 mismatch 会先 stop container 再 fail closed。
 
-Subscription post-run 先结束所有仍可访问 credential 的进程，并按 `docker create` 返回的
-container ID 执行 remove + absence inspect。只有 absence proof 成功、最终 fd-relative
-递归 scan 复核每层 pathname/inode binding 后，Core 才构造 transcript trajectory 和
-`SessionResult`。Core 自己的 step stdout/stderr 不写入 agent 可写 session bind，而是在
+Subscription post-run 先完成 post-run commands。若配置 evaluator，Core 必须在 live runtime
+引用仍有效时完成 trajectory build/evaluation，再按 `docker create` 返回的 container ID 执行
+remove + absence inspect；未配置 evaluator 的 session 仍在 absence proof 后构造 trajectory。
+无论哪条路径，只有 absence proof 成功、最终 fd-relative 递归 scan 复核每层 pathname/inode
+binding 后才允许发布 `SessionResult`。Core 自己的 step stdout/stderr 不写入 agent 可写 session bind，而是在
 unmounted node-private log authority 中通过 exclusive `0600` regular inode 有界写入、无覆盖
 发布，并用同一 held-root authority 做最终 verified read；预置 symlink/FIFO/socket 不会被打开。
 Credential scan 只以该 Core log authority 为写目标，不原地修改 workspace input、workspace
@@ -207,7 +208,13 @@ backend URL、finite positive timeout、fail-open policy 及其 canonical identi
 Journal transition 使用 durable pending marker、candidate fsync、atomic replace 和 directory
 fsync；全部成功后才 copy-on-write 发布 live phase/proof。replace/fsync 失败会回滚旧 journal 并
 保留 pending marker，restart 因而不能把不确定 terminal transition 当成删除 completion/root 的
-授权，live pending status/error 也保持不变，exact retry 成功后才清 marker。Evolution export 由稳定
+授权，live pending status/error 也保持不变，exact retry 成功后才清 marker。
+journal 的 private parent 另有 immutable root marker，绑定 normalized absolute path、从 `/`
+逐组件 no-follow 获得的 ancestor device/inode identity chain 和 journal root identity。重启遇到
+root rename/replacement 或 ancestor symlink 必须保留 displaced records 并 fail closed。Recovery
+必须先对完整目录执行 row、filename、metadata、单文件和 aggregate byte budget 预检，之后才能读取
+任意 journal record 内容。
+Evolution export 由稳定
 source event identity 去重，callback 带稳定 result digest/idempotency key；响应失败或未知保持
 pending，成功 phase 必须先持久化。恢复缺 phase/authority，或当前 evolution config/client
 缺失、禁用、destination/config identity 漂移时，必须保留 transcript、event/callback authority

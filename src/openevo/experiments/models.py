@@ -370,6 +370,7 @@ def _runtime_has_non_default_overrides(runtime: RuntimeConfig) -> bool:
     return (
         runtime.kind != "docker"
         or runtime.profile is not None
+        or runtime.container_user != "image"
         or runtime.workdir != "/openevo/session/workspace"
         or bool(runtime.env)
         or bool(runtime.prepare)

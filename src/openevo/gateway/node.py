@@ -95,6 +95,14 @@ _SUBSCRIPTION_STOP_ATTEMPTS = 3
 _SUBSCRIPTION_STOP_RETRY_DELAY_SECONDS = 0.1
 _CLEANUP_RETRY_INTERVAL_SECONDS = 1.0
 _CLEANUP_JOURNAL_MAX_BYTES = 16 * 1024 * 1024
+_CLEANUP_JOURNAL_MAX_ROWS = 4096
+_CLEANUP_JOURNAL_MAX_FILENAME_BYTES = 128
+_CLEANUP_JOURNAL_MAX_METADATA_BYTES = 1024 * 1024
+_CLEANUP_JOURNAL_MAX_TOTAL_BYTES = 64 * 1024 * 1024
+_CLEANUP_JOURNAL_ROOT_MARKER_MAX_BYTES = 64 * 1024
+_CLEANUP_JOURNAL_RECORD_RE = re.compile(r"[0-9a-f]{64}\.json")
+_CLEANUP_JOURNAL_PENDING_RE = re.compile(r"[0-9a-f]{64}\.pending")
+_CLEANUP_DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
 _RECOVERY_PHASE_RUNTIME_ACTIVE = "runtime_active"
 _RECOVERY_PHASE_TERMINAL_FINALIZATION = "terminal_finalization"
 _RECOVERY_PHASE_TERMINAL_DELIVERY = "terminal_delivery"
@@ -174,6 +182,24 @@ class CleanupRetryOwnership:
     finalize_subscription: bool = False
     finalization_state: SubscriptionFinalizationState | None = None
     delivery_state: TerminalDeliveryState | None = None
+
+
+@dataclass(slots=True)
+class _CleanupJournalAuthority:
+    """Held no-follow authority for one immutable cleanup journal root."""
+
+    path: Path
+    ancestor_fds: list[int]
+    ancestor_identities: tuple[tuple[int, int, int, int], ...]
+    root_fd: int
+    root_identity: tuple[int, int, int, int]
+
+    def close(self) -> None:
+        if self.root_fd >= 0:
+            os.close(self.root_fd)
+            self.root_fd = -1
+        while self.ancestor_fds:
+            os.close(self.ancestor_fds.pop())
 
 
 async def write_evolution_context_files(
@@ -1644,6 +1670,23 @@ class GatewayNodeManager:
         result = managed.final_result
         managed.timer.mark("postrun", "started")
         await self._run_postrun_steps(managed)
+        if result is None and request.evaluator is not None:
+            try:
+                result = await self._build_session_result(managed)
+            except GatewayExecutionTimeout as exc:
+                result = self._timeout_result(request, managed.timer, str(exc))
+            except Exception as exc:
+                self._log_credential_safe_exception(
+                    managed,
+                    "Subscription evaluation failed",
+                    exc,
+                )
+                result = self._error_result(
+                    request,
+                    managed.timer,
+                    f"subscription evaluation failed: {exc}",
+                )
+            managed.final_result = result
         managed.timer.mark("teardown", "started")
         eval_runtime = await self._drain_eval_prewarm_task(managed) or managed.eval_runtime
         stop_targets = [
@@ -2783,6 +2826,269 @@ class GatewayNodeManager:
             finalization_state=finalization_state,
         )
 
+    @staticmethod
+    def _cleanup_journal_identity(state: os.stat_result) -> tuple[int, int, int, int]:
+        return (state.st_dev, state.st_ino, state.st_uid, stat.S_IFMT(state.st_mode))
+
+    @staticmethod
+    def _cleanup_journal_marker_name(path: Path) -> str:
+        digest = hashlib.sha256(str(path).encode("utf-8")).hexdigest()[:24]
+        return f".{path.name}.{digest}.root.json"
+
+    @staticmethod
+    def _write_all(descriptor: int, content: bytes, *, label: str) -> None:
+        offset = 0
+        while offset < len(content):
+            written = os.write(descriptor, content[offset:])
+            if written <= 0:
+                raise RuntimeError(f"{label} write made no progress")
+            offset += written
+
+    @classmethod
+    def _read_cleanup_journal_root_marker(
+        cls,
+        parent_fd: int,
+        marker_name: str,
+    ) -> object:
+        before = os.stat(marker_name, dir_fd=parent_fd, follow_symlinks=False)
+        descriptor = os.open(
+            marker_name,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+            dir_fd=parent_fd,
+        )
+        try:
+            opened = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or opened.st_uid != os.geteuid()
+                or opened.st_nlink != 1
+                or stat.S_IMODE(opened.st_mode) != 0o600
+                or opened.st_size <= 0
+                or opened.st_size > _CLEANUP_JOURNAL_ROOT_MARKER_MAX_BYTES
+                or cls._cleanup_journal_identity(before) != cls._cleanup_journal_identity(opened)
+            ):
+                raise RuntimeError("cleanup journal root identity marker is invalid")
+            chunks: list[bytes] = []
+            remaining = opened.st_size
+            while remaining:
+                chunk = os.read(descriptor, remaining)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            after = os.stat(marker_name, dir_fd=parent_fd, follow_symlinks=False)
+            if (
+                remaining
+                or os.read(descriptor, 1)
+                or cls._cleanup_journal_identity(after) != cls._cleanup_journal_identity(opened)
+                or after.st_size != opened.st_size
+            ):
+                raise RuntimeError("cleanup journal root identity marker changed during read")
+            try:
+                return json.loads(b"".join(chunks).decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise RuntimeError("cleanup journal root identity marker is invalid") from exc
+        finally:
+            os.close(descriptor)
+
+    def _open_cleanup_journal_authority(
+        self,
+        *,
+        initialize: bool,
+    ) -> _CleanupJournalAuthority | None:
+        path = getattr(self, "_cleanup_journal_dir", None)
+        if path is None:
+            return None
+        path = Path(path)
+        if (
+            not path.is_absolute()
+            or path != Path(os.path.normpath(path))
+            or path.name in {"", ".", ".."}
+        ):
+            raise RuntimeError("cleanup journal path must be normalized and absolute")
+
+        parts = path.parts
+        ancestor_fds: list[int] = []
+        ancestor_identities: list[tuple[int, int, int, int]] = []
+        root_fd = -1
+        try:
+            anchor_fd = os.open("/", _CLEANUP_DIRECTORY_FLAGS)
+            ancestor_fds.append(anchor_fd)
+            ancestor_identities.append(self._cleanup_journal_identity(os.fstat(anchor_fd)))
+            for component in parts[1:-1]:
+                current_fd = ancestor_fds[-1]
+                try:
+                    before = os.stat(component, dir_fd=current_fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    if not initialize:
+                        while ancestor_fds:
+                            os.close(ancestor_fds.pop())
+                        return None
+                    os.mkdir(component, mode=0o700, dir_fd=current_fd)
+                    before = os.stat(component, dir_fd=current_fd, follow_symlinks=False)
+                if not stat.S_ISDIR(before.st_mode) or stat.S_ISLNK(before.st_mode):
+                    raise RuntimeError("cleanup journal ancestor path is not a directory")
+                next_fd = os.open(component, _CLEANUP_DIRECTORY_FLAGS, dir_fd=current_fd)
+                opened = os.fstat(next_fd)
+                if self._cleanup_journal_identity(before) != self._cleanup_journal_identity(
+                    opened
+                ):
+                    os.close(next_fd)
+                    raise RuntimeError("cleanup journal ancestor identity changed")
+                ancestor_fds.append(next_fd)
+                ancestor_identities.append(self._cleanup_journal_identity(opened))
+
+            parent_fd = ancestor_fds[-1]
+            parent_opened = os.fstat(parent_fd)
+            if (
+                parent_opened.st_uid != os.geteuid()
+                or stat.S_IMODE(parent_opened.st_mode) != 0o700
+            ):
+                raise RuntimeError("cleanup journal authority parent is not private")
+            root_name = path.name
+            marker_name = self._cleanup_journal_marker_name(path)
+            try:
+                root_before = os.stat(root_name, dir_fd=parent_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                root_before = None
+            try:
+                os.stat(marker_name, dir_fd=parent_fd, follow_symlinks=False)
+                marker_exists = True
+            except FileNotFoundError:
+                marker_exists = False
+
+            if root_before is None and not marker_exists:
+                if not initialize:
+                    while ancestor_fds:
+                        os.close(ancestor_fds.pop())
+                    return None
+                os.mkdir(root_name, mode=0o700, dir_fd=parent_fd)
+                root_before = os.stat(root_name, dir_fd=parent_fd, follow_symlinks=False)
+                root_fd = os.open(root_name, _CLEANUP_DIRECTORY_FLAGS, dir_fd=parent_fd)
+                root_opened = os.fstat(root_fd)
+                root_identity = self._cleanup_journal_identity(root_opened)
+                if self._cleanup_journal_identity(root_before) != root_identity:
+                    raise RuntimeError("cleanup journal root identity changed during creation")
+                if (
+                    not stat.S_ISDIR(root_opened.st_mode)
+                    or root_opened.st_uid != os.geteuid()
+                    or stat.S_IMODE(root_opened.st_mode) != 0o700
+                ):
+                    raise RuntimeError("cleanup journal root identity is not private")
+                marker_payload = {
+                    "version": 1,
+                    "path": str(path),
+                    "ancestor_identities": [list(item) for item in ancestor_identities],
+                    "root_identity": list(root_identity),
+                }
+                marker_bytes = json.dumps(
+                    marker_payload,
+                    ensure_ascii=True,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+                if len(marker_bytes) > _CLEANUP_JOURNAL_ROOT_MARKER_MAX_BYTES:
+                    raise RuntimeError("cleanup journal root identity marker exceeds its limit")
+                marker_fd = os.open(
+                    marker_name,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+                    0o600,
+                    dir_fd=parent_fd,
+                )
+                try:
+                    self._write_all(
+                        marker_fd,
+                        marker_bytes,
+                        label="cleanup journal root identity marker",
+                    )
+                    os.fchmod(marker_fd, 0o600)
+                    os.fsync(marker_fd)
+                finally:
+                    os.close(marker_fd)
+                os.fsync(root_fd)
+                os.fsync(parent_fd)
+            elif root_before is None or not marker_exists:
+                raise RuntimeError("cleanup journal root identity authority is incomplete")
+            else:
+                marker_payload = self._read_cleanup_journal_root_marker(
+                    parent_fd,
+                    marker_name,
+                )
+                if (
+                    not isinstance(marker_payload, dict)
+                    or set(marker_payload)
+                    != {"version", "path", "ancestor_identities", "root_identity"}
+                    or marker_payload["version"] != 1
+                    or marker_payload["path"] != str(path)
+                    or marker_payload["ancestor_identities"]
+                    != [list(item) for item in ancestor_identities]
+                ):
+                    raise RuntimeError(
+                        "cleanup journal ancestor identity does not match authority"
+                    )
+                persisted_root_identity = marker_payload["root_identity"]
+                if (
+                    not isinstance(persisted_root_identity, list)
+                    or len(persisted_root_identity) != 4
+                    or any(not isinstance(item, int) for item in persisted_root_identity)
+                ):
+                    raise RuntimeError("cleanup journal root identity marker is invalid")
+                root_fd = os.open(root_name, _CLEANUP_DIRECTORY_FLAGS, dir_fd=parent_fd)
+                root_opened = os.fstat(root_fd)
+                root_identity = self._cleanup_journal_identity(root_opened)
+                if (
+                    self._cleanup_journal_identity(root_before) != root_identity
+                    or list(root_identity) != persisted_root_identity
+                ):
+                    raise RuntimeError("cleanup journal root identity does not match authority")
+                if (
+                    not stat.S_ISDIR(root_opened.st_mode)
+                    or root_opened.st_uid != os.geteuid()
+                    or stat.S_IMODE(root_opened.st_mode) != 0o700
+                ):
+                    raise RuntimeError("cleanup journal root identity is not private")
+
+            return _CleanupJournalAuthority(
+                path=path,
+                ancestor_fds=ancestor_fds,
+                ancestor_identities=tuple(ancestor_identities),
+                root_fd=root_fd,
+                root_identity=root_identity,
+            )
+        except Exception:
+            if root_fd >= 0:
+                os.close(root_fd)
+            while ancestor_fds:
+                os.close(ancestor_fds.pop())
+            raise
+
+    def _verify_cleanup_journal_authority(
+        self,
+        authority: _CleanupJournalAuthority,
+    ) -> None:
+        if any(
+            self._cleanup_journal_identity(os.fstat(descriptor)) != expected
+            for descriptor, expected in zip(
+                authority.ancestor_fds,
+                authority.ancestor_identities,
+                strict=True,
+            )
+        ):
+            raise RuntimeError("cleanup journal ancestor descriptor identity changed")
+        if self._cleanup_journal_identity(os.fstat(authority.root_fd)) != authority.root_identity:
+            raise RuntimeError("cleanup journal root descriptor identity changed")
+        reopened = self._open_cleanup_journal_authority(initialize=False)
+        if reopened is None:
+            raise RuntimeError("cleanup journal root identity authority disappeared")
+        try:
+            if (
+                reopened.ancestor_identities != authority.ancestor_identities
+                or reopened.root_identity != authority.root_identity
+            ):
+                raise RuntimeError("cleanup journal root identity authority changed")
+        finally:
+            reopened.close()
+
     def _cleanup_journal_path(self, session_id: str) -> Path:
         name = hashlib.sha256(session_id.encode("utf-8")).hexdigest()
         return self._cleanup_journal_dir / f"{name}.json"
@@ -2791,8 +3097,7 @@ class GatewayNodeManager:
         journal_dir = getattr(self, "_cleanup_journal_dir", None)
         if journal_dir is None:
             return
-        journal_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-        journal_dir.chmod(0o700)
+        journal_dir = Path(journal_dir)
         state = ownership.finalization_state
         delivery = ownership.delivery_state
         payload = {
@@ -2883,15 +3188,27 @@ class GatewayNodeManager:
         ).encode("utf-8")
         if len(encoded) > _CLEANUP_JOURNAL_MAX_BYTES:
             raise RuntimeError("cleanup ownership journal exceeds the byte limit")
+        authority = self._open_cleanup_journal_authority(initialize=True)
+        if authority is None:
+            raise RuntimeError("cleanup journal root identity authority is unavailable")
+        try:
+            self._verify_cleanup_journal_authority(authority)
+        except Exception:
+            authority.close()
+            raise
         destination = self._cleanup_journal_path(ownership.session_id)
         temporary = destination.with_name(f".{destination.name}.{os.getpid()}.{id(ownership)}.tmp")
         pending = destination.with_suffix(".pending")
         rollback = destination.with_name(f".{destination.name}.rollback.tmp")
-        previous = self._read_private_cleanup_file(
-            destination,
-            max_bytes=_CLEANUP_JOURNAL_MAX_BYTES,
-            allow_missing=True,
-        )
+        try:
+            previous = self._read_private_cleanup_file(
+                destination,
+                max_bytes=_CLEANUP_JOURNAL_MAX_BYTES,
+                allow_missing=True,
+            )
+        except Exception:
+            authority.close()
+            raise
         replaced = False
         descriptor = -1
         try:
@@ -2917,6 +3234,7 @@ class GatewayNodeManager:
             self._fsync_cleanup_journal_directory(journal_dir)
             pending.unlink()
             self._fsync_cleanup_journal_directory(journal_dir)
+            self._verify_cleanup_journal_authority(authority)
         except Exception:
             if descriptor >= 0:
                 os.close(descriptor)
@@ -2966,6 +3284,7 @@ class GatewayNodeManager:
                     leftover.unlink()
                 except FileNotFoundError:
                     pass
+            authority.close()
 
     @staticmethod
     def _fsync_cleanup_journal_directory(journal_dir: Path) -> None:
@@ -3061,54 +3380,128 @@ class GatewayNodeManager:
         finally:
             os.close(descriptor)
 
-    def _load_cleanup_retries(self) -> None:
-        journal_dir = getattr(self, "_cleanup_journal_dir", None)
-        if journal_dir is None or not journal_dir.exists():
-            return
-        directory_stat = journal_dir.stat(follow_symlinks=False)
-        if (
-            not stat.S_ISDIR(directory_stat.st_mode)
-            or directory_stat.st_uid != os.geteuid()
-            or directory_stat.st_mode & 0o077
-        ):
-            raise RuntimeError("cleanup ownership journal directory is not private")
-        if next(journal_dir.glob("*.pending"), None) is not None:
-            raise RuntimeError("cleanup ownership journal has an incomplete update")
-        for path in sorted(journal_dir.glob("*.json")):
-            opened_fd = os.open(
-                path,
-                os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+    def _read_cleanup_journal_record(
+        self,
+        authority: _CleanupJournalAuthority,
+        name: str,
+        expected: tuple[int, int, int, int, int, int],
+    ) -> bytes:
+        descriptor = os.open(
+            name,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+            dir_fd=authority.root_fd,
+        )
+        try:
+            opened = os.fstat(descriptor)
+            actual = (
+                opened.st_dev,
+                opened.st_ino,
+                opened.st_uid,
+                opened.st_mode,
+                opened.st_nlink,
+                opened.st_size,
             )
-            try:
-                opened = os.fstat(opened_fd)
+            if actual != expected:
+                raise RuntimeError("cleanup ownership journal changed before read")
+            chunks: list[bytes] = []
+            remaining = opened.st_size
+            while remaining:
+                chunk = os.read(descriptor, remaining)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            after = os.stat(name, dir_fd=authority.root_fd, follow_symlinks=False)
+            rebound = (
+                after.st_dev,
+                after.st_ino,
+                after.st_uid,
+                after.st_mode,
+                after.st_nlink,
+                after.st_size,
+            )
+            if remaining or os.read(descriptor, 1) or rebound != expected:
+                raise RuntimeError("cleanup ownership journal changed during read")
+            return b"".join(chunks)
+        finally:
+            os.close(descriptor)
+
+    def _load_cleanup_retries(self) -> None:
+        authority = self._open_cleanup_journal_authority(initialize=False)
+        if authority is None:
+            return
+        try:
+            records: list[tuple[str, tuple[int, int, int, int, int, int]]] = []
+            row_count = 0
+            metadata_bytes = 0
+            total_bytes = 0
+            with os.scandir(authority.root_fd) as entries:
+                for entry in entries:
+                    row_count += 1
+                    if row_count > _CLEANUP_JOURNAL_MAX_ROWS:
+                        raise RuntimeError("cleanup ownership journal exceeds the row budget")
+                    name = entry.name
+                    filename_bytes = os.fsencode(name)
+                    if len(filename_bytes) > _CLEANUP_JOURNAL_MAX_FILENAME_BYTES:
+                        raise RuntimeError("cleanup ownership journal exceeds the filename budget")
+                    metadata_bytes += len(filename_bytes) + 6 * 8
+                    if metadata_bytes > _CLEANUP_JOURNAL_MAX_METADATA_BYTES:
+                        raise RuntimeError("cleanup ownership journal exceeds the metadata budget")
+                    if _CLEANUP_JOURNAL_PENDING_RE.fullmatch(name) is not None:
+                        raise RuntimeError("cleanup ownership journal has an incomplete update")
+                    if _CLEANUP_JOURNAL_RECORD_RE.fullmatch(name) is None:
+                        raise RuntimeError(
+                            "cleanup ownership journal filename metadata is invalid"
+                        )
+                    opened = entry.stat(follow_symlinks=False)
+                    if (
+                        not stat.S_ISREG(opened.st_mode)
+                        or opened.st_uid != os.geteuid()
+                        or opened.st_nlink != 1
+                        or stat.S_IMODE(opened.st_mode) != 0o600
+                        or opened.st_size <= 0
+                        or opened.st_size > _CLEANUP_JOURNAL_MAX_BYTES
+                    ):
+                        raise RuntimeError("cleanup ownership journal file metadata is invalid")
+                    total_bytes += opened.st_size
+                    if total_bytes > _CLEANUP_JOURNAL_MAX_TOTAL_BYTES:
+                        raise RuntimeError(
+                            "cleanup ownership journal exceeds the aggregate byte budget"
+                        )
+                    records.append(
+                        (
+                            name,
+                            (
+                                opened.st_dev,
+                                opened.st_ino,
+                                opened.st_uid,
+                                opened.st_mode,
+                                opened.st_nlink,
+                                opened.st_size,
+                            ),
+                        )
+                    )
+
+            self._verify_cleanup_journal_authority(authority)
+            recovered: dict[str, CleanupRetryOwnership] = {}
+            for name, expected in sorted(records):
+                raw = self._read_cleanup_journal_record(authority, name, expected)
+                path = authority.path / name
+                try:
+                    payload = json.loads(raw.decode("utf-8"))
+                    ownership = self._cleanup_ownership_from_payload(payload, path)
+                except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
+                    raise RuntimeError("cleanup ownership journal is invalid") from exc
                 if (
-                    not stat.S_ISREG(opened.st_mode)
-                    or opened.st_uid != os.geteuid()
-                    or opened.st_nlink != 1
-                    or opened.st_mode & 0o077
-                    or opened.st_size <= 0
-                    or opened.st_size > _CLEANUP_JOURNAL_MAX_BYTES
+                    ownership.session_id in recovered
+                    or ownership.session_id in self._cleanup_retries
                 ):
-                    raise RuntimeError("cleanup ownership journal file is not private")
-                chunks: list[bytes] = []
-                remaining = opened.st_size
-                while remaining:
-                    chunk = os.read(opened_fd, remaining)
-                    if not chunk:
-                        break
-                    chunks.append(chunk)
-                    remaining -= len(chunk)
-                if remaining or os.read(opened_fd, 1):
-                    raise RuntimeError("cleanup ownership journal changed during read")
-                raw = b"".join(chunks)
-            finally:
-                os.close(opened_fd)
-            try:
-                payload = json.loads(raw.decode("utf-8"))
-                ownership = self._cleanup_ownership_from_payload(payload, path)
-            except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
-                raise RuntimeError("cleanup ownership journal is invalid") from exc
-            self._cleanup_retries[ownership.session_id] = ownership
+                    raise RuntimeError("cleanup ownership journal session identity is duplicated")
+                recovered[ownership.session_id] = ownership
+            self._verify_cleanup_journal_authority(authority)
+            self._cleanup_retries.update(recovered)
+        finally:
+            authority.close()
 
     @staticmethod
     def _cleanup_ownership_from_payload(
@@ -3425,18 +3818,19 @@ class GatewayNodeManager:
         )
 
     def _clear_cleanup_ownership(self, session_id: str) -> None:
-        journal_dir = getattr(self, "_cleanup_journal_dir", None)
-        if journal_dir is None:
+        authority = self._open_cleanup_journal_authority(initialize=False)
+        if authority is None:
             return
         try:
-            self._cleanup_journal_path(session_id).unlink()
-        except FileNotFoundError:
-            return
-        try:
-            journal_dir.rmdir()
-            journal_dir.parent.rmdir()
-        except OSError:
-            pass
+            name = self._cleanup_journal_path(session_id).name
+            try:
+                os.unlink(name, dir_fd=authority.root_fd)
+            except FileNotFoundError:
+                return
+            os.fsync(authority.root_fd)
+            self._verify_cleanup_journal_authority(authority)
+        finally:
+            authority.close()
 
     async def _stop_recovered_container(
         self,

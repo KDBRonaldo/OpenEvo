@@ -70,6 +70,7 @@ def test_runtime_docker_candidate_gate_requires_real_docker_and_probe_image() ->
     assert "docker pull python:3.12-slim-bookworm" in text
     assert 'OPENEVO_REQUIRE_REAL_DOCKER: "1"' in text
     assert "test_real_docker_name_collision_preserves_running_external_container" in text
+    assert "test_real_docker_credential_auth_inode_remains_pinned_after_host_replacement" in text
     assert "test_real_docker_cancel_after_cidfile_is_recoverably_owned" in text
 
 

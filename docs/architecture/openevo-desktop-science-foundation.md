@@ -148,9 +148,11 @@ string leaves. Core stdout/stderr and transcript logs live in a node-private,
 unmounted log authority rather than the host-user agent's session bind. Each
 leaf is bounded and published from an exclusive `0600`, no-follow regular inode;
 the final transcript read uses the same held-root authority and rejects links,
-FIFOs, sockets, hard links, and replacements without blocking. Workspace and artifact capture
-surfaces are scanned without following links before persistence; over-budget
-content is replaced rather than copied raw. Codex is the necessary trusted
+FIFOs, sockets, hard links, and replacements without blocking. Redaction writes
+only to this private log authority. Workspace inputs, workspace outputs, and
+artifacts are never redaction write targets. The complete private-log scan is
+preflighted before writes; a per-file or aggregate limit fails finalization and
+leaves every original byte unchanged. Codex is the necessary trusted
 credential consumer, so this boundary does not claim to prevent Codex from
 actively transforming and transmitting a secret. It does guarantee that
 OpenEvo's own sync/scanner/capture paths do not automatically copy the verified
@@ -165,9 +167,11 @@ host-user lifecycle path applies recursive `a+rwX`. Teardown uses the
 dispatch-pinned session root identity and a bounded fd-relative no-follow walk,
 so nested `000` directories converge without following symlinks; owner or root
 identity replacement fails closed. Every recursive directory pathname is
-rechecked against the opened inode after the final scan. Core constructs no
-subscription transcript trajectory or result until all credential-capable
-containers have been removed by pinned container ID and proven absent. It then
+rechecked against the opened inode after the final scan. A configured evaluator
+builds its trajectory and runs before runtime stop so it retains valid live
+runtime references; sessions without evaluators build after absence proof. Core
+never publishes a subscription result until all credential-capable containers
+have been removed by pinned container ID and proven absent. Post-absence recovery
 uses a separate bounded finalization budget to preserve transcript bytes already
 captured before execution timeout/cancel, then defensively redacts the in-memory
 result before export. A private v6 cleanup journal drives independent
@@ -184,6 +188,11 @@ race, or missing inode retains the root and journal before ordinary deletion.
 Historical publication-handoff cleanup without an auth identity scrubs every
 owned regular file in the dedicated root, while v5 terminal finalization still
 fails closed rather than trusting a replacement as redaction authority.
+The journal's private parent also stores an immutable marker binding the
+normalized journal path, no-follow ancestor identity chain, and root inode.
+Startup rejects root replacement and symlinked ancestors, and preflights row,
+filename, metadata, per-record, and aggregate-byte budgets before reading record
+content.
 
 `self-deployed` uses proxy authentication and requires `execution.hf_model`.
 The legacy config value `codex_managed_local_inference` remains accepted as an

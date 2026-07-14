@@ -118,10 +118,14 @@ limits. The final redaction scan rechecks every recursive directory pathname
 against its opened inode and then rechecks the full absolute root chain. A
 replaced root, changed nested entry, or foreign-owned object fails closed.
 
-For subscription sessions, post-run commands finish first, then every
-credential-capable container is removed and proven absent by pinned container
-ID. Only after that proof does Core perform the final scan. Core then pins the
-full absolute chain of an unmounted, node-scoped Core log authority. Step
+For subscription sessions, post-run commands finish first. If an evaluator is
+configured, Core builds the trajectory and runs that evaluator while its live
+runtime references are still valid; only that evaluator path runs before
+runtime stop. Core then removes every credential-capable container and proves
+absence by pinned container ID. Sessions without an evaluator defer trajectory
+construction until after that proof. In both cases, only after absence proof
+does Core perform the final capture scan and permit result delivery. Core pins
+the full absolute chain of an unmounted, node-scoped Core log authority. Step
 stdout/stderr is first written there through a held root descriptor into a
 bounded exclusive `0600` regular inode, then published without replacement.
 An agent-precreated symlink, FIFO, socket, hard link, or replacement therefore
@@ -132,10 +136,11 @@ link-count-one, bounded regular leaf. Root, directory, and leaf descriptor and
 pathname identities are rechecked after write and read.
 
 Verified transcript bytes are passed directly to the existing builder; it does
-not reopen the pathname. Transcript read/build uses a separate bounded
-finalization deadline after container absence, so an exhausted execution budget
-does not discard stdout captured before timeout/cancel or rewrite that terminal
-status as a finalization error. The resulting trajectory or `SessionResult` is
+not reopen the pathname. Post-absence transcript recovery/build uses a separate
+bounded finalization deadline, so an exhausted execution budget does not discard
+stdout captured before timeout/cancel or rewrite that terminal status as a
+finalization error. A configured evaluator still runs under the execution
+deadline before runtime teardown. The resulting trajectory or `SessionResult` is
 recursively redacted again before registry, evolution export, or callback
 delivery. Docker ownership records live in a node-private root outside agent and
 evaluator mounts. Startup reclaims abandoned records by exact immutable ID;
@@ -159,6 +164,14 @@ Replace/fsync failures roll back the old authority and retain the pending marker
 so restart cannot treat an uncertain transition as permission to delete storage
 or roots; live pending status/error likewise remain unchanged until persistence
 succeeds. An exact live retry can finish the transition and clear the marker.
+The journal directory has a separate immutable root marker in its private parent.
+That marker binds the normalized absolute path, every no-follow ancestor
+device/inode identity, and the journal-root identity. Restart therefore rejects a
+renamed/replaced root or symlinked ancestor while retaining displaced records.
+Recovery preflights row count, filename bytes, metadata bytes, per-record size,
+and aggregate record bytes for the complete directory before reading any record
+content. Successful cleanup removes the session record but retains the empty
+journal root and marker as the node's persistent identity authority.
 Evolution export uses the stable session source-event identity, and callbacks
 carry a result-derived `Idempotency-Key` and digest header. A failed or unknown
 response leaves that phase pending; a successful phase is fsynced before the

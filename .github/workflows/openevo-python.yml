@@ -97,6 +97,7 @@ jobs:
         run: |
           python -m pytest -q \
             tests/runtime/test_docker_runtime.py::test_real_docker_name_collision_preserves_running_external_container \
+            tests/runtime/test_docker_runtime.py::test_real_docker_credential_auth_inode_remains_pinned_after_host_replacement \
             tests/runtime/test_docker_runtime.py::test_real_docker_cancel_after_cidfile_is_recoverably_owned
 
   macos-ssh-transport:
