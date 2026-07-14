@@ -5,6 +5,7 @@ import locale
 import logging
 import os
 import re
+import select
 import selectors
 import secrets
 import shlex
@@ -1231,6 +1232,7 @@ def _run_subprocess(argv: list[str], timeout_seconds: float) -> subprocess.Compl
         start_new_session=True,
     )
     process_group_id = _owned_process_group_id(process)
+    exit_observer = _SubprocessExitObserver(process)
     assert process.stdout is not None
     assert process.stderr is not None
     try:
@@ -1239,17 +1241,20 @@ def _run_subprocess(argv: list[str], timeout_seconds: float) -> subprocess.Compl
             argv=argv,
             timeout_seconds=timeout_seconds,
             process_group_id=process_group_id,
+            exit_observer=exit_observer,
         )
     except BaseException:
         try:
             _terminate_and_reap_subprocess(
                 process,
                 process_group_id=process_group_id,
+                exit_observer=exit_observer,
             )
         except BaseException:
             pass
         raise
     finally:
+        exit_observer.close()
         process.stdout.close()
         process.stderr.close()
     encoding = locale.getpreferredencoding(False)
@@ -1271,6 +1276,7 @@ def _capture_subprocess_output(
     argv: list[str],
     timeout_seconds: float,
     process_group_id: int,
+    exit_observer: _SubprocessExitObserver,
 ) -> tuple[bytes, bytes]:
     assert process.stdout is not None
     assert process.stderr is not None
@@ -1287,7 +1293,7 @@ def _capture_subprocess_output(
     try:
         while selector.get_map():
             now = time.monotonic()
-            if not leader_exited and _subprocess_exited_without_reaping(process):
+            if not leader_exited and exit_observer.exited():
                 leader_exited = True
                 descendant_pipe_deadline = (
                     now + _SUBPROCESS_DESCENDANT_PIPE_GRACE_SECONDS
@@ -1335,9 +1341,7 @@ def _capture_subprocess_output(
                 if captured_bytes > _MAX_SUBPROCESS_CAPTURE_BYTES:
                     raise _SubprocessCaptureLimitExceeded
                 chunks[key.data].append(chunk)
-        if not leader_exited and not _wait_for_subprocess_exit_without_reaping(
-            process, deadline=deadline
-        ):
+        if not leader_exited and not exit_observer.wait_until(deadline):
             raise subprocess.TimeoutExpired(argv, timeout_seconds)
         if not group_killed:
             _signal_owned_process_group(
@@ -1358,31 +1362,96 @@ def _owned_process_group_id(process: subprocess.Popen[bytes]) -> int:
     return process_group_id
 
 
-def _wait_for_subprocess_exit_without_reaping(
-    process: subprocess.Popen[bytes],
-    *,
-    deadline: float,
-) -> bool:
-    while True:
-        if _subprocess_exited_without_reaping(process):
-            return True
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            return False
-        time.sleep(min(0.01, remaining))
+class _SubprocessExitObserver:
+    """Observe one leader exit while retaining its status for the owning Popen."""
 
-
-def _subprocess_exited_without_reaping(process: subprocess.Popen[bytes]) -> bool:
-    if process.returncode is not None:
-        return True
-    return (
-        os.waitid(
-            os.P_PID,
-            process.pid,
-            os.WEXITED | os.WNOHANG | os.WNOWAIT,
+    def __init__(self, process: subprocess.Popen[bytes]) -> None:
+        self._process = process
+        waitid = getattr(os, "waitid", None)
+        self._waitid = (
+            waitid
+            if callable(waitid)
+            and all(hasattr(os, name) for name in ("P_PID", "WEXITED", "WNOHANG", "WNOWAIT"))
+            else None
         )
-        is not None
-    )
+        self._kqueue: select.kqueue | None = None
+        self._observed = False
+        self._waiter_done = threading.Event()
+        self._waiter_failure: BaseException | None = None
+        self._waiter: threading.Thread | None = None
+        if callable(self._waitid):
+            return
+        if hasattr(select, "kqueue"):
+            try:
+                queue = select.kqueue()
+                event = select.kevent(
+                    process.pid,
+                    filter=select.KQ_FILTER_PROC,
+                    flags=select.KQ_EV_ADD | select.KQ_EV_ENABLE | select.KQ_EV_ONESHOT,
+                    fflags=select.KQ_NOTE_EXIT,
+                )
+                queue.control([event], 0, 0)
+            except OSError:
+                if "queue" in locals():
+                    queue.close()
+            else:
+                self._kqueue = queue
+                return
+        self._waiter = threading.Thread(
+            target=self._wait_for_exit,
+            name="openevo-subprocess-exit-observer",
+            daemon=True,
+        )
+        self._waiter.start()
+
+    def exited(self) -> bool:
+        if self._observed or self._process.returncode is not None:
+            self._observed = True
+            return True
+        if callable(self._waitid):
+            result = self._waitid(
+                os.P_PID,
+                self._process.pid,
+                os.WEXITED | os.WNOHANG | os.WNOWAIT,
+            )
+            self._observed = result is not None
+            return self._observed
+        if self._kqueue is not None:
+            self._observed = bool(self._kqueue.control(None, 1, 0))
+            return self._observed
+        if not self._waiter_done.is_set():
+            return False
+        if self._waiter_failure is not None:
+            raise self._waiter_failure
+        self._observed = True
+        return True
+
+    def wait_until(self, deadline: float) -> bool:
+        while True:
+            if self.exited():
+                return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            if self._waiter is not None:
+                self._waiter_done.wait(min(0.01, remaining))
+            else:
+                time.sleep(min(0.01, remaining))
+
+    def close(self) -> None:
+        if self._kqueue is not None:
+            self._kqueue.close()
+            self._kqueue = None
+        if self._waiter is not None and self._waiter_done.is_set():
+            self._waiter.join()
+
+    def _wait_for_exit(self) -> None:
+        try:
+            self._process.wait()
+        except BaseException as exc:
+            self._waiter_failure = exc
+        finally:
+            self._waiter_done.set()
 
 
 def _signal_owned_process_group(
@@ -1392,8 +1461,7 @@ def _signal_owned_process_group(
     signal_number: int,
 ) -> None:
     if (
-        process.returncode is not None
-        or process.pid != process_group_id
+        process.pid != process_group_id
         or process_group_id <= 1
         or process_group_id == os.getpgrp()
     ):
@@ -1408,10 +1476,8 @@ def _terminate_and_reap_subprocess(
     process: subprocess.Popen[bytes],
     *,
     process_group_id: int,
+    exit_observer: _SubprocessExitObserver,
 ) -> None:
-    if process.returncode is not None:
-        process.wait()
-        return
     failure: BaseException | None = None
     try:
         _signal_owned_process_group(
@@ -1422,9 +1488,8 @@ def _terminate_and_reap_subprocess(
     except BaseException as exc:
         failure = exc
     try:
-        _wait_for_subprocess_exit_without_reaping(
-            process,
-            deadline=time.monotonic() + _SUBPROCESS_TERMINATE_GRACE_SECONDS,
+        exit_observer.wait_until(
+            time.monotonic() + _SUBPROCESS_TERMINATE_GRACE_SECONDS
         )
     except BaseException as exc:
         if failure is None:

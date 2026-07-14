@@ -9,6 +9,15 @@ This component is a backend launcher and remote bootstrap primitive. It is not a
 new user-facing CLI product. It does not change the frozen Core Control OpenAPI
 document or add compatibility routes.
 
+The Desktop-side launcher and its local SSH/rsync subprocesses support both
+macOS and Linux hosts. Local leader-exit observation uses Linux
+`waitid(..., WNOWAIT)` when available and Darwin `kqueue` process-exit events
+otherwise; a waiter preserves the exact return code on platforms without either
+interface. All paths retain the 100 ms descendant-pipe drain, terminate the
+owned process group on leader exit, timeout, or cancellation, and reap the
+leader. This local portability does not extend the remote contract: the Core
+host must be Linux and the preflight rejects every other remote platform.
+
 ## Host Identity
 
 The caller explicitly supplies or resolves the canonical service root for the
@@ -80,6 +89,10 @@ already recoverable or the inherited lock still identifies the unclaimed child.
 Recovery scans `/proc/*/fd` for that exact inode, captures each holder's process
 identity, terminates it through pidfd, acquires the spawn lock as a barrier, and
 then removes the intent. Invalid or ambiguous ledgers fail closed.
+
+The `/proc/<pid>/fd` asset-consumption anchor and Linux atomic no-replace rename
+used below execute on that remote Core host. A macOS Desktop is only the local
+SSH/rsync caller; it does not replace or relax those remote Linux primitives.
 
 The current supervisor additionally requires the selected Python interpreter to
 provide callable `os.pidfd_open` and `signal.pidfd_send_signal`; kernel pidfd

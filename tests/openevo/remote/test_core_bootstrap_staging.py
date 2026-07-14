@@ -979,6 +979,28 @@ def test_core_supervisor_runtime_script_reports_missing_python_wrappers(
     assert reason == "missing_python_pidfd_api"
 
 
+def test_core_supervisor_runtime_script_rejects_non_linux_remote_host(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with monkeypatch.context() as scoped:
+        scoped.setattr(sys, "platform", "darwin")
+        scoped.setattr(sys, "version_info", (3, 11, 0))
+        exec(
+            compile(
+                core_runtime._REMOTE_PREFLIGHT_SCRIPT,
+                "<core-runtime-preflight>",
+                "exec",
+            ),
+            {"__name__": "__main__"},
+        )
+
+    reason = core_runtime.parse_core_supervisor_runtime_preflight(
+        SecretStr(capsys.readouterr().out)
+    )
+    assert reason == "unsupported_platform"
+
+
 def test_core_staging_closed_payloads_reject_boolean_numeric_aliases() -> None:
     root = "/home/alice/.openevo/core"
     with pytest.raises(ValueError):

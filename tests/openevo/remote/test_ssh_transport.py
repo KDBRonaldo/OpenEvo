@@ -2236,6 +2236,7 @@ def test_default_runner_timeout_terminates_and_reaps_entire_process_group(
         encoding="ascii",
     )
     transport = _transport(tmp_path)
+    monkeypatch.delattr(ssh_module.os, "waitid", raising=False)
     monkeypatch.setattr(ssh_module, "_SUBPROCESS_TERMINATE_GRACE_SECONDS", 0.05)
     monkeypatch.setattr(
         transport,
@@ -2251,11 +2252,13 @@ def test_default_runner_timeout_terminates_and_reaps_entire_process_group(
     _assert_processes_gone(leader_id, descendant_id)
 
 
+@pytest.mark.parametrize("without_waitid", [False, True], ids=("waitid", "portable"))
 @pytest.mark.parametrize("leader_return_code", [0, 9])
 def test_default_runner_returns_leader_result_when_descendant_inherits_pipes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     leader_return_code: int,
+    without_waitid: bool,
 ) -> None:
     pid_path = tmp_path / f"inherited-pipes-{leader_return_code}.json"
     producer = tmp_path / f"leader-exits-{leader_return_code}.py"
@@ -2284,6 +2287,8 @@ def test_default_runner_returns_leader_result_when_descendant_inherits_pipes(
         ),
         encoding="ascii",
     )
+    if without_waitid:
+        monkeypatch.delattr(ssh_module.os, "waitid", raising=False)
     monkeypatch.setattr(ssh_module, "_SUBPROCESS_TERMINATE_GRACE_SECONDS", 0.05)
     monkeypatch.setattr(ssh_module, "_SUBPROCESS_DESCENDANT_PIPE_GRACE_SECONDS", 0.05)
 
@@ -2300,6 +2305,29 @@ def test_default_runner_returns_leader_result_when_descendant_inherits_pipes(
     assert elapsed < 0.4
     leader_id, descendant_id = json.loads(pid_path.read_text(encoding="ascii"))
     _assert_processes_gone(leader_id, descendant_id)
+
+
+def test_default_runner_does_not_require_os_waitid(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pid_path = tmp_path / "no-waitid-pid"
+    producer = tmp_path / "no-waitid.py"
+    producer.write_text(
+        "import os,sys\n"
+        "open(sys.argv[1], 'w', encoding='ascii').write(str(os.getpid()))\n"
+        "raise SystemExit(23)\n",
+        encoding="ascii",
+    )
+    monkeypatch.delattr(ssh_module.os, "waitid", raising=False)
+
+    completed = ssh_module._run_subprocess(
+        [sys.executable, str(producer), str(pid_path)],
+        1,
+    )
+
+    assert completed.returncode == 23
+    _assert_processes_gone(int(pid_path.read_text(encoding="ascii")))
 
 
 def test_default_runner_cancellation_terminates_and_reaps_entire_process_group(
@@ -2333,6 +2361,7 @@ def test_default_runner_cancellation_terminates_and_reaps_entire_process_group(
             time.sleep(0.01)
         raise KeyboardInterrupt
 
+    monkeypatch.delattr(ssh_module.os, "waitid", raising=False)
     monkeypatch.setattr(ssh_module, "_SUBPROCESS_TERMINATE_GRACE_SECONDS", 0.05)
     monkeypatch.setattr(ssh_module, "_capture_subprocess_output", cancel_after_spawn)
 
