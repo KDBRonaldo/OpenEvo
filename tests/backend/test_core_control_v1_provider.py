@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 import threading
@@ -2569,6 +2570,320 @@ def test_startup_rejects_noncanonical_sqlite_schema(tmp_path: Path, extra_kind: 
 
     with pytest.raises(StoreCorruptionError, match="schema fingerprint"):
         CoreControlStoreV1(tmp_path)
+
+
+def test_store_identity_marker_is_private_durable_and_restart_bound(tmp_path: Path) -> None:
+    store = CoreControlStoreV1(tmp_path)
+    store.close()
+
+    root = tmp_path / "core-control-v1"
+    marker = root / "provider.identity"
+    database = root / "provider.sqlite3"
+    marker_metadata = marker.stat(follow_symlinks=False)
+    assert stat.S_ISREG(marker_metadata.st_mode)
+    assert stat.S_IMODE(marker_metadata.st_mode) == 0o600
+    assert marker_metadata.st_uid == os.geteuid()
+    assert marker_metadata.st_nlink == 1
+    marker_document = json.loads(marker.read_bytes())
+    with sqlite3.connect(database) as connection:
+        identity = connection.execute(
+            "SELECT store_id, binding_state, root_dev, root_ino, marker_dev, marker_ino "
+            "FROM store_identity WHERE singleton = 1"
+        ).fetchone()
+    assert identity is not None
+    assert identity[1] == "bound"
+    assert marker_document == {
+        "root_dev": identity[2],
+        "root_ino": identity[3],
+        "schema_version": "1",
+        "store_id": identity[0],
+    }
+    assert (marker_metadata.st_dev, marker_metadata.st_ino) == (identity[4], identity[5])
+
+    restarted = CoreControlStoreV1(tmp_path)
+    try:
+        assert restarted._store_id == identity[0]
+    finally:
+        restarted.close()
+
+
+def test_copied_database_cannot_claim_another_provider_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source"
+    target = tmp_path / "target"
+    CoreControlStoreV1(source).close()
+    CoreControlStoreV1(target).close()
+    target_root = target / "core-control-v1"
+    orphan = target_root / "workspace-snapshots" / "workspace-snapshot-existing"
+    orphan.mkdir(mode=0o700)
+    keep = orphan / "keep.txt"
+    keep.write_text("keep", encoding="utf-8")
+    shutil.copyfile(
+        source / "core-control-v1" / "provider.sqlite3",
+        target_root / "provider.sqlite3",
+    )
+    quota_calls = 0
+
+    def observe_quota(*args, **kwargs):
+        nonlocal quota_calls
+        del args, kwargs
+        quota_calls += 1
+
+    monkeypatch.setattr(store_module, "_verify_managed_disk_quota", observe_quota)
+    with pytest.raises(StoreCorruptionError, match="store identity"):
+        CoreControlStoreV1(target)
+    assert quota_calls == 0
+    assert keep.read_text(encoding="utf-8") == "keep"
+
+
+def test_fresh_database_cannot_claim_existing_managed_workspace(tmp_path: Path) -> None:
+    root = tmp_path / "core-control-v1"
+    upload_root = root / "workspace-uploads"
+    workspace_root = root / "workspace-snapshots"
+    upload_root.mkdir(parents=True, mode=0o700)
+    workspace_root.mkdir(mode=0o700)
+    orphan = workspace_root / "workspace-snapshot-existing"
+    orphan.mkdir(mode=0o700)
+    keep = orphan / "keep.txt"
+    keep.write_text("keep", encoding="utf-8")
+    database = root / "provider.sqlite3"
+    database.touch(mode=0o600)
+
+    with pytest.raises(StoreCorruptionError, match="unbound managed state"):
+        CoreControlStoreV1(tmp_path)
+    assert keep.read_text(encoding="utf-8") == "keep"
+    assert not (root / "provider.identity").exists()
+
+
+def test_swapped_store_identity_marker_fails_before_workspace_recovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    CoreControlStoreV1(first).close()
+    CoreControlStoreV1(second).close()
+    first_marker = first / "core-control-v1" / "provider.identity"
+    second_marker = second / "core-control-v1" / "provider.identity"
+    displaced = tmp_path / "identity.displaced"
+    first_marker.rename(displaced)
+    second_marker.rename(first_marker)
+    displaced.rename(second_marker)
+    orphan = first / "core-control-v1" / "workspace-snapshots" / "workspace-snapshot-existing"
+    orphan.mkdir(mode=0o700)
+    keep = orphan / "keep.txt"
+    keep.write_text("keep", encoding="utf-8")
+    quota_calls = 0
+
+    def observe_quota(*args, **kwargs):
+        nonlocal quota_calls
+        del args, kwargs
+        quota_calls += 1
+
+    monkeypatch.setattr(store_module, "_verify_managed_disk_quota", observe_quota)
+    with pytest.raises(StoreCorruptionError, match="store identity"):
+        CoreControlStoreV1(first)
+    assert quota_calls == 0
+    assert keep.read_text(encoding="utf-8") == "keep"
+
+
+@pytest.mark.parametrize("marker_present", [False, True])
+def test_pending_store_identity_crash_window_recovers(
+    tmp_path: Path, marker_present: bool
+) -> None:
+    CoreControlStoreV1(tmp_path).close()
+    root = tmp_path / "core-control-v1"
+    database = root / "provider.sqlite3"
+    marker = root / "provider.identity"
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE store_identity SET binding_state = 'pending', "
+            "marker_dev = NULL, marker_ino = NULL WHERE singleton = 1"
+        )
+    if not marker_present:
+        marker.unlink()
+
+    recovered = CoreControlStoreV1(tmp_path)
+    recovered.close()
+    with sqlite3.connect(database) as connection:
+        identity = connection.execute(
+            "SELECT binding_state, marker_dev, marker_ino "
+            "FROM store_identity WHERE singleton = 1"
+        ).fetchone()
+    assert identity is not None
+    assert identity[0] == "bound"
+    assert (identity[1], identity[2]) == (
+        marker.stat(follow_symlinks=False).st_dev,
+        marker.stat(follow_symlinks=False).st_ino,
+    )
+
+
+def test_pending_identity_recovers_after_unpublished_marker_temp(tmp_path: Path) -> None:
+    CoreControlStoreV1(tmp_path).close()
+    root = tmp_path / "core-control-v1"
+    database = root / "provider.sqlite3"
+    marker = root / "provider.identity"
+    stale = root / ".provider.identity.interrupted.tmp"
+    stale.write_bytes(b'{"partial":')
+    stale.chmod(0o600)
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE store_identity SET binding_state = 'pending', "
+            "marker_dev = NULL, marker_ino = NULL WHERE singleton = 1"
+        )
+    marker.unlink()
+
+    recovered = CoreControlStoreV1(tmp_path)
+    recovered.close()
+    assert marker.exists()
+    assert stale.read_bytes() == b'{"partial":'
+
+
+@pytest.mark.parametrize("failure_point", ["before_publish", "after_publish"])
+def test_fresh_identity_bootstrap_recovers_across_marker_publication_crash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_point: str,
+) -> None:
+    root = tmp_path / "core-control-v1"
+    marker = root / "provider.identity"
+    if failure_point == "before_publish":
+        real_operation = store_module._rename_noreplace
+
+        def interrupt_publish(*args, **kwargs):
+            del args, kwargs
+            raise OSError("injected pre-publication crash")
+
+        monkeypatch.setattr(store_module, "_rename_noreplace", interrupt_publish)
+    else:
+        real_operation = CoreControlStoreV1._verify_store_identity_marker
+        interrupted = False
+
+        def interrupt_after_publish(self, expected):
+            nonlocal interrupted
+            if not interrupted:
+                interrupted = True
+                raise StoreCorruptionError("injected post-publication crash")
+            return real_operation(self, expected)
+
+        monkeypatch.setattr(
+            CoreControlStoreV1,
+            "_verify_store_identity_marker",
+            interrupt_after_publish,
+        )
+
+    with pytest.raises(CoreControlStoreError):
+        CoreControlStoreV1(tmp_path)
+    database = root / "provider.sqlite3"
+    with sqlite3.connect(database) as connection:
+        assert store_module._schema_fingerprint(connection) == (
+            store_module._expected_schema_fingerprint()
+        )
+        assert connection.execute(
+            "SELECT binding_state, marker_dev, marker_ino "
+            "FROM store_identity WHERE singleton = 1"
+        ).fetchone() == ("pending", None, None)
+    assert marker.exists() is (failure_point == "after_publish")
+
+    if failure_point == "before_publish":
+        monkeypatch.setattr(store_module, "_rename_noreplace", real_operation)
+    else:
+        monkeypatch.setattr(
+            CoreControlStoreV1,
+            "_verify_store_identity_marker",
+            real_operation,
+        )
+    recovered = CoreControlStoreV1(tmp_path)
+    recovered.close()
+    with sqlite3.connect(database) as connection:
+        assert connection.execute(
+            "SELECT binding_state FROM store_identity WHERE singleton = 1"
+        ).fetchone() == ("bound",)
+
+
+def test_bound_identity_missing_marker_preserves_managed_state(tmp_path: Path) -> None:
+    CoreControlStoreV1(tmp_path).close()
+    root = tmp_path / "core-control-v1"
+    marker = root / "provider.identity"
+    orphan = root / "workspace-snapshots" / "workspace-snapshot-existing"
+    orphan.mkdir(mode=0o700)
+    keep = orphan / "keep.txt"
+    keep.write_text("keep", encoding="utf-8")
+    marker.unlink()
+
+    with pytest.raises(StoreCorruptionError, match="identity marker is missing"):
+        CoreControlStoreV1(tmp_path)
+    assert keep.read_text(encoding="utf-8") == "keep"
+
+
+@pytest.mark.parametrize("damage", ["mode", "hardlink", "symlink"])
+def test_store_identity_marker_rejects_unsafe_metadata(
+    tmp_path: Path, damage: str
+) -> None:
+    CoreControlStoreV1(tmp_path).close()
+    root = tmp_path / "core-control-v1"
+    marker = root / "provider.identity"
+    alias = tmp_path / "identity-alias"
+    if damage == "mode":
+        marker.chmod(0o644)
+    elif damage == "hardlink":
+        os.link(marker, alias)
+    else:
+        marker.rename(alias)
+        marker.symlink_to(alias)
+    try:
+        with pytest.raises(CoreControlStoreError):
+            CoreControlStoreV1(tmp_path)
+    finally:
+        alias.unlink(missing_ok=True)
+
+
+def test_empty_legacy_store_migrates_through_pending_identity(tmp_path: Path) -> None:
+    root = tmp_path / "core-control-v1"
+    root.mkdir(parents=True, mode=0o700)
+    database = root / "provider.sqlite3"
+    with sqlite3.connect(database) as connection:
+        for statement in store_module._LEGACY_SCHEMA:
+            connection.execute(statement)
+        connection.execute(
+            "INSERT INTO metadata(key, value) VALUES ('signing_key', ?)",
+            (b"l" * 32,),
+        )
+    database.chmod(0o600)
+
+    migrated = CoreControlStoreV1(tmp_path)
+    try:
+        assert migrated._signing_key == b"l" * 32
+    finally:
+        migrated.close()
+    with sqlite3.connect(database) as connection:
+        assert connection.execute(
+            "SELECT binding_state FROM store_identity WHERE singleton = 1"
+        ).fetchone() == ("bound",)
+
+
+def test_legacy_store_with_managed_state_is_not_claimed(tmp_path: Path) -> None:
+    root = tmp_path / "core-control-v1"
+    workspace_root = root / "workspace-snapshots"
+    workspace_root.mkdir(parents=True, mode=0o700)
+    orphan = workspace_root / "workspace-snapshot-existing"
+    orphan.mkdir(mode=0o700)
+    keep = orphan / "keep.txt"
+    keep.write_text("keep", encoding="utf-8")
+    database = root / "provider.sqlite3"
+    with sqlite3.connect(database) as connection:
+        for statement in store_module._LEGACY_SCHEMA:
+            connection.execute(statement)
+        connection.execute(
+            "INSERT INTO metadata(key, value) VALUES ('signing_key', ?)",
+            (b"l" * 32,),
+        )
+    database.chmod(0o600)
+
+    with pytest.raises(StoreCorruptionError, match="unbound managed state"):
+        CoreControlStoreV1(tmp_path)
+    assert keep.read_text(encoding="utf-8") == "keep"
+    assert not (root / "provider.identity").exists()
 
 
 def test_live_store_rejects_database_hardlink_alias(tmp_path: Path) -> None:

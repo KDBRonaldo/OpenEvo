@@ -59,6 +59,7 @@ The provider owns `<state-root>/core-control-v1/` with an exclusive owner lock:
 ```text
 provider.sqlite3
 provider.lock
+provider.identity
 workspace-uploads/<upload-id>.part
 workspace-snapshots/<snapshot-id>/...
 ```
@@ -71,24 +72,50 @@ The store uses full synchronous commits and WAL journaling. It does not persist
 the bearer, host paths in API resources, model credentials, commands, or open
 metadata.
 
-This pre-release provider state is explicitly **fresh-only** after the review
-hardening schema change. Startup creates the current schema for an empty
-database and compares every `sqlite_schema` row with a schema built from the
-same checked-in DDL. Earlier phase-one state, near-match DDL, extra
-table/index/view/trigger, or partially altered schema is rejected. Core does
-not infer or backfill missing idempotency request envelopes.
+The private schema is exact-fingerprinted. Startup accepts only an empty
+database, the current schema, or the one exact preceding phase-one schema.
+Near-match DDL, extra tables/indexes/views/triggers, and partially altered
+schemas are rejected. The preceding schema can migrate only when every business
+table and both managed roots are empty and no identity marker exists. Core does
+not infer or backfill missing idempotency request envelopes, and a legacy store
+with projects, uploads, events, idempotency state, or managed files requires an
+explicit offline migration rather than being claimed at startup.
+
+`store_identity` contains one closed row with a random `store_id`, the bound
+provider-root device/inode, a `pending|bound` state, and, once bound, the marker
+device/inode. `provider.identity` is canonical JSON containing that same
+`store_id` and provider-root identity. It is opened no-follow, retained by FD,
+and must remain an owner-owned, link-count-one `0600` regular file at the same
+pathname and inode. Initial creation and the allowed empty legacy migration use
+three durable phases: one SQLite transaction creates the complete schema and
+the `pending` identity row; a random private temporary marker is completely
+written and fsynced, atomically published with no-replace rename, and followed
+by a provider-root fsync; a second SQLite transaction records the published
+marker inode and changes the row to `bound`. A crash with a pending row and no
+marker republishes it; a pending row with the exact published marker completes
+the second transaction. Unpublished temporary marker inodes are conservatively
+retained instead of deleted by pathname.
 
 Startup recovery runs while the provider holds its exclusive process lock. The
-store retains provider-root, owner-lock, upload-root, and snapshot-root FDs for
-its full lifetime. Every related operation revalidates each held inode against
-its pathname plus the required owner, mode, type, and link count. Before it
-creates or opens the provider root, the store holds and exclusively locks the
-stable state-parent directory inode. The provider-root and owner-lock locks are
-additional bindings, but replacement of the complete canonical provider root
-cannot admit a second owner while the original parent-anchored owner is alive.
-Recovery reuses the held owner-verified private root FDs, validates every project
-publication against its finalized upload and the exact published tree, and fails
-startup when a referenced archive or snapshot is missing, replaced, or corrupt.
+store retains provider-root, identity-marker, owner-lock, upload-root, and
+snapshot-root FDs for its full lifetime. Every related operation revalidates
+each held inode against its pathname plus the required owner, mode, type, and
+link count. Before it creates or opens the provider root, the store holds and
+exclusively locks the stable state-parent directory inode. The provider-root and
+owner-lock locks are additional bindings, but replacement of the complete
+canonical provider root cannot admit a second owner while the original
+parent-anchored owner is alive. For a current bound store, startup attaches the
+held database authority and verifies the DB/root/marker identity before it
+creates or opens either managed root, enables WAL, traverses workspace state, or
+performs recovery mutation. Fresh and legacy bootstrap may descriptor-open an
+existing managed root only to prove that its immediate inventory is empty before
+writing any identity state; it does not traverse children or clean entries.
+Copying a legitimate `provider.sqlite3` to another root, swapping markers,
+removing a bound marker, or presenting a fresh database beside existing managed
+state therefore fails closed without orphan cleanup. Recovery then reuses the
+held owner-verified private root FDs, validates every project publication against
+its finalized upload and the exact published tree, and fails startup when a
+referenced archive or snapshot is missing, replaced, or corrupt.
 Each publication identity, workspace snapshot ID, and content ID is bound to
 exactly one project/upload pair by a signed private owner row; a second
 persisted owner is corruption regardless of row order. Owner rows remain only

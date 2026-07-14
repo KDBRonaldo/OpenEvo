@@ -50,6 +50,10 @@ _MAX_PUBLICATION_OWNERS = _MAX_UPLOADS + _IDEMPOTENCY_LIMIT
 _MAX_CLEANUP_INTENTS = _MAX_PROJECTS + (2 * _MAX_UPLOADS)
 _MAX_RECOVERY_CLEANUP_NODES = 100_000
 _MAX_RECOVERY_CLEANUP_NAME_BYTES = 16 * 1024 * 1024
+_STORE_ID_BYTES = 32
+_STORE_ID_HEX_LENGTH = _STORE_ID_BYTES * 2
+_STORE_IDENTITY_MARKER = "provider.identity"
+_MAX_STORE_IDENTITY_MARKER_BYTES = 512
 _RENAME_NOREPLACE = 1
 _IDEMPOTENCY_RESPONSE_MODELS: dict[str, type[BaseModel]] = {
     model.__name__: model
@@ -209,7 +213,7 @@ class _ManagedCleanupBudget:
         return True
 
 
-_SCHEMA = (
+_LEGACY_SCHEMA = (
     """
     CREATE TABLE IF NOT EXISTS metadata (
         key TEXT PRIMARY KEY,
@@ -319,6 +323,24 @@ _SCHEMA = (
     """,
 )
 
+_STORE_IDENTITY_SCHEMA = """
+    CREATE TABLE IF NOT EXISTS store_identity (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        store_id TEXT NOT NULL UNIQUE,
+        binding_state TEXT NOT NULL CHECK (binding_state IN ('pending', 'bound')),
+        root_dev INTEGER NOT NULL CHECK (root_dev >= 0),
+        root_ino INTEGER NOT NULL CHECK (root_ino > 0),
+        marker_dev INTEGER CHECK (marker_dev IS NULL OR marker_dev >= 0),
+        marker_ino INTEGER CHECK (marker_ino IS NULL OR marker_ino > 0),
+        CHECK (
+            (binding_state = 'pending' AND marker_dev IS NULL AND marker_ino IS NULL)
+            OR
+            (binding_state = 'bound' AND marker_dev IS NOT NULL AND marker_ino IS NOT NULL)
+        )
+    ) STRICT
+"""
+_SCHEMA = (_STORE_IDENTITY_SCHEMA, *_LEGACY_SCHEMA)
+
 
 class CoreControlStoreV1:
     """Single-owner durable state for the first Core Control v1 provider slice."""
@@ -348,9 +370,10 @@ class CoreControlStoreV1:
             self._open_lifecycle_storage()
             self._prepare_database_authority()
             self._connection = self._open_database_connection()
+            self._initialize_or_verify_store_identity()
+            self._prepare_managed_roots()
+            self._configure_database_connection()
             with self._transaction():
-                for statement in _SCHEMA:
-                    self._connection.execute(statement)
                 self._verify_schema_fingerprint()
                 self._signing_key = self._load_or_create_signing_key()
             self._bind_database_sidecars()
@@ -2889,22 +2912,7 @@ class CoreControlStoreV1:
                     "Core Control provider state is already owned"
                 ) from exc
             self._lock_identity = lock_identity
-
-            self._upload_root_fd = os.open(
-                "workspace-uploads", directory_flags, dir_fd=self._root_fd
-            )
-            self._upload_root_identity = os.fstat(self._upload_root_fd)
-            _require_private_directory_metadata(self._upload_root_identity)
-            _require_entry_binding(self._root_fd, "workspace-uploads", self._upload_root_identity)
-
-            self._workspace_root_fd = os.open(
-                "workspace-snapshots", directory_flags, dir_fd=self._root_fd
-            )
-            self._workspace_root_identity = os.fstat(self._workspace_root_fd)
-            _require_private_directory_metadata(self._workspace_root_identity)
-            _require_entry_binding(
-                self._root_fd, "workspace-snapshots", self._workspace_root_identity
-            )
+            self._open_existing_identity_marker()
             self._verify_lifecycle_storage()
         except Exception:
             self._close_lifecycle_storage()
@@ -2917,28 +2925,46 @@ class CoreControlStoreV1:
             parent_identity = os.fstat(self._parent_fd)
             root_identity = os.fstat(self._root_fd)
             lock_identity = os.fstat(self._lock_fd)
-            upload_identity = os.fstat(self._upload_root_fd)
-            workspace_identity = os.fstat(self._workspace_root_fd)
             _require_owner_directory_metadata(parent_identity, label="state parent")
             _require_private_directory_metadata(root_identity)
             _require_private_regular_metadata(lock_identity)
-            _require_private_directory_metadata(upload_identity)
-            _require_private_directory_metadata(workspace_identity)
             _require_same_identity(parent_identity, self._parent_identity, "state parent")
             _require_same_identity(root_identity, self._root_identity, "provider root")
             _require_same_identity(lock_identity, self._lock_identity, "provider lock")
-            _require_same_identity(upload_identity, self._upload_root_identity, "upload root")
-            _require_same_identity(
-                workspace_identity, self._workspace_root_identity, "workspace root"
-            )
             _require_path_binding(self._state_parent, self._parent_identity)
             _require_entry_binding(self._parent_fd, "core-control-v1", self._root_identity)
             _require_path_binding(self.root, self._root_identity)
             _require_entry_binding(self._root_fd, "provider.lock", self._lock_identity)
-            _require_entry_binding(self._root_fd, "workspace-uploads", self._upload_root_identity)
-            _require_entry_binding(
-                self._root_fd, "workspace-snapshots", self._workspace_root_identity
-            )
+            marker_fd = getattr(self, "_marker_fd", None)
+            if marker_fd is not None:
+                marker_identity = os.fstat(marker_fd)
+                _require_private_regular_metadata(marker_identity)
+                _require_same_identity(
+                    marker_identity, self._marker_identity, "store identity marker"
+                )
+                _require_entry_binding(
+                    self._root_fd, _STORE_IDENTITY_MARKER, self._marker_identity
+                )
+                expected_marker = getattr(self, "_expected_marker_bytes", None)
+                if expected_marker is not None:
+                    self._verify_store_identity_marker(expected_marker)
+            if hasattr(self, "_upload_root_fd"):
+                upload_identity = os.fstat(self._upload_root_fd)
+                workspace_identity = os.fstat(self._workspace_root_fd)
+                _require_private_directory_metadata(upload_identity)
+                _require_private_directory_metadata(workspace_identity)
+                _require_same_identity(
+                    upload_identity, self._upload_root_identity, "upload root"
+                )
+                _require_same_identity(
+                    workspace_identity, self._workspace_root_identity, "workspace root"
+                )
+                _require_entry_binding(
+                    self._root_fd, "workspace-uploads", self._upload_root_identity
+                )
+                _require_entry_binding(
+                    self._root_fd, "workspace-snapshots", self._workspace_root_identity
+                )
             self._verify_database_authority()
         except OSError as exc:
             raise StoreCorruptionError("Core Control lifecycle storage is unavailable") from exc
@@ -2959,6 +2985,13 @@ class CoreControlStoreV1:
                 except OSError:
                     pass
                 delattr(self, name)
+        marker_fd = getattr(self, "_marker_fd", None)
+        if marker_fd is not None:
+            try:
+                os.close(marker_fd)
+            except OSError:
+                pass
+            del self._marker_fd
         lock_fd = getattr(self, "_lock_fd", None)
         if lock_fd is not None:
             try:
@@ -3008,16 +3041,298 @@ class CoreControlStoreV1:
             or stat.S_IMODE(metadata.st_mode) != 0o700
         ):
             raise CoreControlStoreError("Core Control provider root is not privately owned")
-        self.upload_root.mkdir(mode=0o700, exist_ok=True)
-        self.workspace_root.mkdir(mode=0o700, exist_ok=True)
-        for managed_root in (self.upload_root, self.workspace_root):
-            metadata = managed_root.stat(follow_symlinks=False)
-            if (
-                not stat.S_ISDIR(metadata.st_mode)
-                or metadata.st_uid != os.geteuid()
-                or stat.S_IMODE(metadata.st_mode) != 0o700
-            ):
-                raise CoreControlStoreError("Core Control managed root is not privately owned")
+
+    def _open_existing_identity_marker(self) -> None:
+        try:
+            marker_fd = os.open(
+                _STORE_IDENTITY_MARKER,
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=self._root_fd,
+            )
+        except FileNotFoundError:
+            return
+        try:
+            marker_identity = os.fstat(marker_fd)
+            _require_private_regular_metadata(marker_identity)
+            if marker_identity.st_size > _MAX_STORE_IDENTITY_MARKER_BYTES:
+                raise StoreCorruptionError("Core Control store identity marker is oversized")
+            _require_entry_binding(self._root_fd, _STORE_IDENTITY_MARKER, marker_identity)
+        except Exception:
+            os.close(marker_fd)
+            raise
+        self._marker_fd = marker_fd
+        self._marker_identity = marker_identity
+
+    def _prepare_managed_roots(self) -> None:
+        directory_flags = (
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        )
+        created = False
+        for name in ("workspace-uploads", "workspace-snapshots"):
+            try:
+                os.mkdir(name, mode=0o700, dir_fd=self._root_fd)
+                created = True
+            except FileExistsError:
+                pass
+        if created:
+            os.fsync(self._root_fd)
+        try:
+            self._upload_root_fd = os.open(
+                "workspace-uploads", directory_flags, dir_fd=self._root_fd
+            )
+            self._upload_root_identity = os.fstat(self._upload_root_fd)
+            _require_private_directory_metadata(self._upload_root_identity)
+            _require_entry_binding(
+                self._root_fd, "workspace-uploads", self._upload_root_identity
+            )
+            self._workspace_root_fd = os.open(
+                "workspace-snapshots", directory_flags, dir_fd=self._root_fd
+            )
+            self._workspace_root_identity = os.fstat(self._workspace_root_fd)
+            _require_private_directory_metadata(self._workspace_root_identity)
+            _require_entry_binding(
+                self._root_fd, "workspace-snapshots", self._workspace_root_identity
+            )
+            self._verify_lifecycle_storage()
+        except Exception:
+            for attribute in ("_workspace_root_fd", "_upload_root_fd"):
+                descriptor = getattr(self, attribute, None)
+                if descriptor is not None:
+                    os.close(descriptor)
+                    delattr(self, attribute)
+            raise
+
+    def _initialize_or_verify_store_identity(self) -> None:
+        fingerprint = _schema_fingerprint(self._connection)
+        empty_fingerprint = _expected_schema_fingerprint(())
+        legacy_fingerprint = _expected_schema_fingerprint(_LEGACY_SCHEMA)
+        current_fingerprint = _expected_schema_fingerprint(_SCHEMA)
+        if fingerprint == empty_fingerprint:
+            if hasattr(self, "_marker_fd"):
+                raise StoreCorruptionError(
+                    "Core Control store identity marker has no database identity"
+                )
+            self._require_unbound_managed_roots_empty()
+            self._create_pending_store_identity(include_base_schema=True)
+        elif fingerprint == legacy_fingerprint:
+            if hasattr(self, "_marker_fd"):
+                raise StoreCorruptionError(
+                    "Core Control legacy store identity conflicts with a root marker"
+                )
+            self._verify_database_integrity()
+            self._require_legacy_migration_is_unconflicted()
+            self._require_unbound_managed_roots_empty()
+            self._create_pending_store_identity(include_base_schema=False)
+        elif fingerprint != current_fingerprint:
+            raise StoreCorruptionError(
+                "Core Control schema fingerprint is incompatible; provider state is fresh-only"
+            )
+
+        row = self._read_store_identity_row()
+        self._require_store_identity_root(row)
+        self._store_id = row["store_id"]
+        if row["binding_state"] == "pending":
+            self._require_pending_database_is_unconflicted()
+            self._require_unbound_managed_roots_empty()
+            marker_identity = self._ensure_store_identity_marker(row)
+            with self._transaction():
+                current = self._read_store_identity_row()
+                if current["binding_state"] != "pending" or current["store_id"] != self._store_id:
+                    raise StoreCorruptionError(
+                        "Core Control pending store identity changed during binding"
+                    )
+                self._connection.execute(
+                    "UPDATE store_identity SET binding_state = 'bound', marker_dev = ?, "
+                    "marker_ino = ? WHERE singleton = 1 AND binding_state = 'pending'",
+                    (marker_identity.st_dev, marker_identity.st_ino),
+                )
+            row = self._read_store_identity_row()
+        self._verify_bound_store_identity(row)
+        self._expected_marker_bytes = self._store_identity_marker_bytes(row)
+
+    def _create_pending_store_identity(self, *, include_base_schema: bool) -> None:
+        store_id = secrets.token_hex(_STORE_ID_BYTES)
+        with self._transaction():
+            statements = _SCHEMA if include_base_schema else (_STORE_IDENTITY_SCHEMA,)
+            for statement in statements:
+                self._connection.execute(statement)
+            self._connection.execute(
+                "INSERT INTO store_identity(singleton, store_id, binding_state, root_dev, "
+                "root_ino, marker_dev, marker_ino) VALUES (1, ?, 'pending', ?, ?, NULL, NULL)",
+                (store_id, self._root_identity.st_dev, self._root_identity.st_ino),
+            )
+            self._verify_schema_fingerprint()
+
+    def _read_store_identity_row(self) -> sqlite3.Row:
+        aggregate = self._connection.execute(
+            "SELECT COUNT(*), COALESCE(SUM(length(CAST(store_id AS BLOB))), 0), "
+            "COALESCE(SUM(length(CAST(binding_state AS BLOB))), 0) FROM store_identity"
+        ).fetchone()
+        if aggregate is None or int(aggregate[0]) != 1:
+            raise StoreCorruptionError("Core Control store identity row is invalid")
+        if int(aggregate[1]) != _STORE_ID_HEX_LENGTH or int(aggregate[2]) > 8:
+            raise StoreCorruptionError("Core Control store identity row is invalid")
+        row = self._connection.execute(
+            "SELECT singleton, "
+            f"CASE WHEN length(CAST(store_id AS BLOB)) = {_STORE_ID_HEX_LENGTH} "
+            "THEN store_id END AS store_id, "
+            "CASE WHEN length(CAST(binding_state AS BLOB)) <= 8 "
+            "THEN binding_state END AS binding_state, "
+            "root_dev, root_ino, marker_dev, marker_ino FROM store_identity LIMIT 2"
+        ).fetchone()
+        if (
+            row is None
+            or row["singleton"] != 1
+            or not _is_store_id(row["store_id"])
+            or row["binding_state"] not in {"pending", "bound"}
+            or not isinstance(row["root_dev"], int)
+            or row["root_dev"] < 0
+            or not isinstance(row["root_ino"], int)
+            or row["root_ino"] <= 0
+        ):
+            raise StoreCorruptionError("Core Control store identity row is invalid")
+        marker_values = (row["marker_dev"], row["marker_ino"])
+        if row["binding_state"] == "pending":
+            if marker_values != (None, None):
+                raise StoreCorruptionError("Core Control pending store identity is invalid")
+        elif (
+            not isinstance(marker_values[0], int)
+            or marker_values[0] < 0
+            or not isinstance(marker_values[1], int)
+            or marker_values[1] <= 0
+        ):
+            raise StoreCorruptionError("Core Control bound store identity is invalid")
+        return row
+
+    def _require_store_identity_root(self, row: sqlite3.Row) -> None:
+        if (row["root_dev"], row["root_ino"]) != (
+            self._root_identity.st_dev,
+            self._root_identity.st_ino,
+        ):
+            raise StoreCorruptionError(
+                "Core Control store identity is bound to a different provider root"
+            )
+
+    def _store_identity_marker_bytes(self, row: sqlite3.Row) -> bytes:
+        return _canonical_bytes(
+            {
+                "root_dev": row["root_dev"],
+                "root_ino": row["root_ino"],
+                "schema_version": "1",
+                "store_id": row["store_id"],
+            }
+        )
+
+    def _ensure_store_identity_marker(self, row: sqlite3.Row) -> os.stat_result:
+        expected = self._store_identity_marker_bytes(row)
+        if not hasattr(self, "_marker_fd"):
+            temporary_name = f".{_STORE_IDENTITY_MARKER}.{secrets.token_hex(16)}.tmp"
+            marker_fd = os.open(
+                temporary_name,
+                os.O_RDWR
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+                dir_fd=self._root_fd,
+            )
+            try:
+                os.fchmod(marker_fd, 0o600)
+                _write_all(marker_fd, expected)
+                os.fsync(marker_fd)
+                marker_identity = os.fstat(marker_fd)
+                _require_private_regular_metadata(marker_identity)
+                _require_entry_binding(
+                    self._root_fd, temporary_name, marker_identity
+                )
+                _rename_noreplace(
+                    temporary_name,
+                    _STORE_IDENTITY_MARKER,
+                    directory_fd=self._root_fd,
+                )
+                os.fsync(self._root_fd)
+                _require_entry_binding(
+                    self._root_fd, _STORE_IDENTITY_MARKER, marker_identity
+                )
+            except Exception:
+                os.close(marker_fd)
+                raise
+            self._marker_fd = marker_fd
+            self._marker_identity = marker_identity
+        self._verify_store_identity_marker(expected)
+        return self._marker_identity
+
+    def _verify_bound_store_identity(self, row: sqlite3.Row) -> None:
+        if row["binding_state"] != "bound" or not hasattr(self, "_marker_fd"):
+            raise StoreCorruptionError(
+                "Core Control bound store identity marker is missing"
+            )
+        if (row["marker_dev"], row["marker_ino"]) != (
+            self._marker_identity.st_dev,
+            self._marker_identity.st_ino,
+        ):
+            raise StoreCorruptionError(
+                "Core Control store identity marker inode does not match the database"
+            )
+        self._verify_store_identity_marker(self._store_identity_marker_bytes(row))
+
+    def _verify_store_identity_marker(self, expected: bytes) -> None:
+        marker_fd = getattr(self, "_marker_fd", None)
+        if marker_fd is None:
+            raise StoreCorruptionError("Core Control store identity marker is missing")
+        before = os.fstat(marker_fd)
+        _require_private_regular_metadata(before)
+        _require_same_identity(before, self._marker_identity, "store identity marker")
+        _require_entry_binding(self._root_fd, _STORE_IDENTITY_MARKER, self._marker_identity)
+        if before.st_size != len(expected) or os.pread(marker_fd, len(expected) + 1, 0) != expected:
+            raise StoreCorruptionError("Core Control store identity marker content is invalid")
+        after = os.fstat(marker_fd)
+        _require_same_file_state(after, before, "store identity marker")
+        _require_entry_binding(self._root_fd, _STORE_IDENTITY_MARKER, self._marker_identity)
+
+    def _require_unbound_managed_roots_empty(self) -> None:
+        directory_flags = (
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        )
+        for name in ("workspace-uploads", "workspace-snapshots"):
+            try:
+                directory_fd = os.open(name, directory_flags, dir_fd=self._root_fd)
+            except FileNotFoundError:
+                continue
+            try:
+                identity = os.fstat(directory_fd)
+                _require_private_directory_metadata(identity)
+                _require_entry_binding(self._root_fd, name, identity)
+                with os.scandir(directory_fd) as entries:
+                    if next(entries, None) is not None:
+                        raise StoreCorruptionError(
+                            "Core Control unbound managed state cannot be claimed"
+                        )
+                _require_entry_binding(self._root_fd, name, identity)
+            finally:
+                os.close(directory_fd)
+
+    def _require_legacy_migration_is_unconflicted(self) -> None:
+        self._require_database_has_no_business_rows("legacy")
+
+    def _require_pending_database_is_unconflicted(self) -> None:
+        self._require_database_has_no_business_rows("pending identity")
+
+    def _require_database_has_no_business_rows(self, label: str) -> None:
+        for table in (
+            "projects",
+            "workspace_uploads",
+            "workspace_publication_owners",
+            "idempotency_records",
+            "managed_cleanup_intents",
+            "failed_idempotency_records",
+            "events",
+        ):
+            row = self._connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()
+            if row is None or int(row[0]) != 0:
+                raise StoreCorruptionError(
+                    f"Core Control {label} has state that cannot be identity-bound"
+                )
 
     def _load_or_create_signing_key(self) -> bytes:
         aggregate = self._connection.execute(
@@ -3195,17 +3510,17 @@ class CoreControlStoreV1:
                 schema_row = connection.execute("SELECT 1 FROM sqlite_schema LIMIT 1").fetchone()
                 if (
                     schema_row is not None
-                    and _schema_fingerprint(connection) != _expected_schema_fingerprint()
+                    and _schema_fingerprint(connection)
+                    not in {
+                        _expected_schema_fingerprint(_LEGACY_SCHEMA),
+                        _expected_schema_fingerprint(_SCHEMA),
+                    }
                 ):
                     raise StoreCorruptionError(
                         "Core Control schema fingerprint is incompatible; "
                         "provider state is fresh-only"
                     )
                 connection.execute("PRAGMA foreign_keys = ON")
-                connection.execute("PRAGMA journal_mode = WAL")
-                connection.execute("PRAGMA synchronous = FULL")
-                page_size = int(connection.execute("PRAGMA page_size").fetchone()[0])
-                connection.execute(f"PRAGMA max_page_count = {_MAX_DATABASE_BYTES // page_size}")
                 self._verify_database_authority()
                 return connection
             except (_DatabaseAttachRaceError, sqlite3.Error) as exc:
@@ -3220,6 +3535,16 @@ class CoreControlStoreV1:
         raise StoreCorruptionError(
             "Core Control SQLite connection could not bind its database authority"
         ) from last_error
+
+    def _configure_database_connection(self) -> None:
+        self._verify_lifecycle_storage()
+        self._connection.execute("PRAGMA journal_mode = WAL")
+        self._connection.execute("PRAGMA synchronous = FULL")
+        page_size = int(self._connection.execute("PRAGMA page_size").fetchone()[0])
+        if page_size <= 0:
+            raise StoreCorruptionError("Core Control database page size is invalid")
+        self._connection.execute(f"PRAGMA max_page_count = {_MAX_DATABASE_BYTES // page_size}")
+        self._verify_lifecycle_storage()
 
     def _require_etag(self, current: str, supplied: str, resource_type: str) -> None:
         if not hmac.compare_digest(current, supplied):
@@ -3332,10 +3657,10 @@ def _schema_fingerprint(connection: sqlite3.Connection) -> bytes:
     return _canonical_bytes(schema)
 
 
-def _expected_schema_fingerprint() -> bytes:
+def _expected_schema_fingerprint(schema: tuple[str, ...] = _SCHEMA) -> bytes:
     connection = sqlite3.connect(":memory:")
     try:
-        for statement in _SCHEMA:
+        for statement in schema:
             connection.execute(statement)
         return _schema_fingerprint(connection)
     finally:
@@ -4039,6 +4364,14 @@ def _is_sha256(value: object) -> bool:
     )
 
 
+def _is_store_id(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == _STORE_ID_HEX_LENGTH
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
 def _is_timestamp(value: object) -> bool:
     if type(value) is not str or len(value.encode("utf-8")) > 64 or not value.endswith("Z"):
         return False
@@ -4167,6 +4500,23 @@ def _require_same_identity(
 ) -> None:
     if not _same_identity(current, expected):
         raise StoreCorruptionError(f"Core Control {label} identity changed")
+
+
+def _require_same_file_state(
+    current: os.stat_result,
+    expected: os.stat_result,
+    label: str,
+) -> None:
+    if (
+        not _same_identity(current, expected)
+        or current.st_mode != expected.st_mode
+        or current.st_uid != expected.st_uid
+        or current.st_nlink != expected.st_nlink
+        or current.st_size != expected.st_size
+        or current.st_mtime_ns != expected.st_mtime_ns
+        or current.st_ctime_ns != expected.st_ctime_ns
+    ):
+        raise StoreCorruptionError(f"Core Control {label} changed during verification")
 
 
 def _remove_bound_entry_at(
