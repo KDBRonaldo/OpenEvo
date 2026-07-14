@@ -35,6 +35,7 @@ def test_openevo_python_workflow_runs_focused_regressions() -> None:
     assert "tests/gateway" in text
     assert "tests/trajectory" in text
     assert "tests/rollout" in text
+    assert "tests/runtime" in core_job
     assert "tests/openevo/remote" in text
     assert "tests/openevo/science" in text
     assert "tests/openevo/sidecar" in text
@@ -54,6 +55,22 @@ def test_openevo_python_workflow_runs_focused_regressions() -> None:
     assert "benchmarks/terminal_bench/tests" in benchmark_job
     assert "smoke_terminal_bench_package.py" in benchmark_job
     assert "-q" in text
+
+
+def test_runtime_docker_candidate_gate_requires_real_docker_and_probe_image() -> None:
+    workflow = Path(".github/workflows/openevo-python.yml")
+
+    text = workflow.read_text(encoding="utf-8")
+
+    assert "workflow_dispatch:" in text
+    assert "require_real_docker" in text
+    assert "default: true" in text
+    assert "real-docker-runtime-probes:" in text
+    assert "docker info" in text
+    assert "docker pull python:3.12-slim-bookworm" in text
+    assert 'OPENEVO_REQUIRE_REAL_DOCKER: "1"' in text
+    assert "test_real_docker_name_collision_preserves_running_external_container" in text
+    assert "test_real_docker_cancel_after_cidfile_is_recoverably_owned" in text
 
 
 def test_openevo_desktop_workflow_runs_frontend_and_tauri_checks() -> None:

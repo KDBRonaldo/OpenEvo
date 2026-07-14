@@ -6,6 +6,7 @@ import errno
 import hashlib
 import json
 import os
+import secrets
 import stat
 from dataclasses import dataclass
 from pathlib import Path
@@ -21,6 +22,7 @@ _AUTH_JSON_MAX_SECRETS: Final[int] = 512
 _CAPTURE_REDACTION_MAX_BYTES: Final[int] = 4 * 1024 * 1024
 _CAPTURE_REDACTION_MAX_TOTAL_BYTES: Final[int] = 64 * 1024 * 1024
 _TRANSCRIPT_MAX_BYTES: Final[int] = 4 * 1024 * 1024
+EXEC_LOG_MAX_BYTES: Final[int] = _TRANSCRIPT_MAX_BYTES
 _CLEANUP_MAX_DEPTH: Final[int] = 64
 _CLEANUP_MAX_NODES: Final[int] = 100_000
 CAPTURE_REDACTION_LIMIT_MARKER: Final[str] = (
@@ -193,12 +195,246 @@ def capture_session_root_identity(session_dir: Path) -> SessionRootIdentity:
         os.close(parent_fd)
 
 
+def create_session_log_authority(
+    authority_root: Path,
+    session_id: str,
+) -> tuple[Path, SessionRootIdentity]:
+    """Create one unmounted private log root under a pinned Core authority."""
+
+    if not authority_root.is_absolute():
+        raise SessionFileSecurityError("log authority root must be absolute")
+    authority_pin = _pin_or_create_absolute_directory(authority_root)
+    session_fd = -1
+    try:
+        authority_opened = os.fstat(authority_pin.descriptor)
+        _require_owned_directory(authority_opened, label="log authority root")
+        _fchmod_stable(authority_pin.descriptor, 0o700, label="log authority root")
+        authority_pin.verify(label="log authority root")
+
+        prefix = hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:16]
+        for _ in range(32):
+            name = f"session-{prefix}-{secrets.token_hex(12)}"
+            try:
+                os.mkdir(name, mode=0o700, dir_fd=authority_pin.descriptor)
+            except FileExistsError:
+                continue
+            session_fd = os.open(name, _DIRECTORY_FLAGS, dir_fd=authority_pin.descriptor)
+            opened = os.fstat(session_fd)
+            _require_owned_directory(opened, label="session log authority")
+            os.fchmod(session_fd, 0o700)
+            opened = os.fstat(session_fd)
+            named = os.stat(
+                name,
+                dir_fd=authority_pin.descriptor,
+                follow_symlinks=False,
+            )
+            if (
+                _full_object_identity(opened) != _full_object_identity(named)
+                or stat.S_IMODE(opened.st_mode) != 0o700
+            ):
+                raise SessionFileSecurityError(
+                    "session log authority changed while it was created"
+                )
+            authority_pin.verify(label="log authority root")
+            return (
+                authority_root / name,
+                (opened.st_dev, opened.st_ino, opened.st_uid),
+            )
+        raise SessionFileSecurityError("session log authority name allocation failed")
+    except SessionFileSecurityError:
+        raise
+    except OSError as exc:
+        raise SessionFileSecurityError(
+            "session log authority could not be created safely"
+        ) from exc
+    finally:
+        if session_fd >= 0:
+            os.close(session_fd)
+        authority_pin.close()
+
+
+def write_verified_session_log(
+    session_dir: Path,
+    session_identity: SessionRootIdentity,
+    *,
+    directory_parts: tuple[str, ...],
+    leaf_name: str,
+    content: str,
+    max_bytes: int = EXEC_LOG_MAX_BYTES,
+) -> Path:
+    """Atomically publish one bounded log without following an existing entry."""
+
+    if (
+        not directory_parts
+        or any(part in {"", ".", ".."} or "/" in part for part in directory_parts)
+        or leaf_name in {"", ".", ".."}
+        or "/" in leaf_name
+    ):
+        raise SessionFileSecurityError("session log path is invalid")
+    encoded = content.encode("utf-8")
+    if max_bytes < 0 or len(encoded) > max_bytes:
+        raise SessionFileSecurityError("session log exceeds the byte limit")
+
+    root_pin = _pin_absolute_directory(session_dir)
+    directory_fds: list[int] = []
+    directory_identities: list[tuple[int, int, int, int]] = []
+    temporary_fd = -1
+    temporary_name: str | None = None
+    temporary_identity: tuple[int, int] | None = None
+    try:
+        root_pin.verify(label="session log root")
+        _require_private_log_root(
+            os.fstat(root_pin.descriptor),
+            session_identity,
+        )
+        root_fd = _open_readable_directory(root_pin.descriptor, label="session log root")
+        directory_fds.append(root_fd)
+        directory_identities.append(_full_object_identity(os.fstat(root_fd)))
+
+        for part in directory_parts:
+            parent_fd = directory_fds[-1]
+            try:
+                os.mkdir(part, mode=0o700, dir_fd=parent_fd)
+            except FileExistsError:
+                pass
+            before = os.stat(part, dir_fd=parent_fd, follow_symlinks=False)
+            if not stat.S_ISDIR(before.st_mode) or before.st_uid != session_identity[2]:
+                raise SessionFileSecurityError(
+                    "session log ancestor is not an owned directory"
+                )
+            child_fd = os.open(part, _DIRECTORY_FLAGS, dir_fd=parent_fd)
+            opened = os.fstat(child_fd)
+            if _auth_identity(before) != _auth_identity(opened):
+                os.close(child_fd)
+                raise SessionFileSecurityError(
+                    "session log ancestor changed while it was opened"
+                )
+            _fchmod_stable(child_fd, 0o700, label="session log directory")
+            directory_fds.append(child_fd)
+            directory_identities.append(_full_object_identity(os.fstat(child_fd)))
+
+        parent_fd = directory_fds[-1]
+        for _ in range(32):
+            candidate = f".{leaf_name}.{secrets.token_hex(12)}.tmp"
+            try:
+                temporary_fd = os.open(
+                    candidate,
+                    os.O_RDWR
+                    | os.O_CREAT
+                    | os.O_EXCL
+                    | os.O_CLOEXEC
+                    | os.O_NOFOLLOW
+                    | os.O_NONBLOCK,
+                    0o600,
+                    dir_fd=parent_fd,
+                )
+            except FileExistsError:
+                continue
+            temporary_name = candidate
+            break
+        if temporary_fd < 0 or temporary_name is None:
+            raise SessionFileSecurityError("session log temporary allocation failed")
+        os.fchmod(temporary_fd, 0o600)
+        temporary_opened = os.fstat(temporary_fd)
+        _require_private_log_file(
+            temporary_opened,
+            expected_owner=session_identity[2],
+            expected_size=0,
+        )
+        temporary_identity = _object_identity(temporary_opened)
+
+        offset = 0
+        while offset < len(encoded):
+            written = os.pwrite(temporary_fd, encoded[offset:], offset)
+            if written <= 0:
+                raise SessionFileSecurityError("session log write made no progress")
+            offset += written
+        os.fsync(temporary_fd)
+        written_state = os.fstat(temporary_fd)
+        _require_private_log_file(
+            written_state,
+            expected_owner=session_identity[2],
+            expected_size=len(encoded),
+        )
+        _require_path_identity(
+            parent_fd,
+            temporary_name,
+            written_state,
+            label="session log temporary",
+        )
+
+        os.link(
+            temporary_name,
+            leaf_name,
+            src_dir_fd=parent_fd,
+            dst_dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+        os.unlink(temporary_name, dir_fd=parent_fd)
+        temporary_name = None
+        final_state = os.fstat(temporary_fd)
+        _require_private_log_file(
+            final_state,
+            expected_owner=session_identity[2],
+            expected_size=len(encoded),
+        )
+        _require_path_identity(
+            parent_fd,
+            leaf_name,
+            final_state,
+            label="session log",
+        )
+        if _read_fd_exact(temporary_fd, len(encoded)) != encoded:
+            raise SessionFileSecurityError("session log bytes changed after publication")
+
+        for index, (descriptor, expected) in enumerate(
+            zip(directory_fds, directory_identities)
+        ):
+            if _full_object_identity(os.fstat(descriptor)) != expected:
+                raise SessionFileSecurityError("session log ancestor descriptor changed")
+            if index:
+                named = os.stat(
+                    directory_parts[index - 1],
+                    dir_fd=directory_fds[index - 1],
+                    follow_symlinks=False,
+                )
+                if _full_object_identity(named) != expected:
+                    raise SessionFileSecurityError("session log ancestor path changed")
+        root_pin.verify(label="session log root")
+        _require_private_log_root(
+            os.fstat(root_pin.descriptor),
+            session_identity,
+        )
+        return session_dir.joinpath(*directory_parts, leaf_name)
+    except FileExistsError as exc:
+        raise SessionFileSecurityError(
+            "session log destination already exists"
+        ) from exc
+    except SessionFileSecurityError:
+        raise
+    except OSError as exc:
+        raise SessionFileSecurityError("session log could not be written safely") from exc
+    finally:
+        if temporary_name is not None:
+            _unlink_if_same_identity(
+                directory_fds[-1] if directory_fds else -1,
+                temporary_name,
+                temporary_identity,
+            )
+        if temporary_fd >= 0:
+            os.close(temporary_fd)
+        while directory_fds:
+            os.close(directory_fds.pop())
+        root_pin.close()
+
+
 def read_verified_session_transcript(
     session_dir: Path,
     session_identity: SessionRootIdentity,
     *,
     step_index: int,
     max_bytes: int = _TRANSCRIPT_MAX_BYTES,
+    require_private_root: bool = False,
 ) -> VerifiedSessionTranscript:
     """Read one fixed agent transcript without reopening any pathname."""
 
@@ -216,7 +452,11 @@ def read_verified_session_transcript(
     leaf_fd = -1
     try:
         root_pin.verify(label="subscription transcript root")
-        _require_session_identity(os.fstat(root_pin.descriptor), session_identity)
+        root_state = os.fstat(root_pin.descriptor)
+        if require_private_root:
+            _require_private_log_root(root_state, session_identity)
+        else:
+            _require_session_identity(root_state, session_identity)
         root_fd = _open_readable_directory(root_pin.descriptor, label="session root")
         directory_fds.append(root_fd)
         directory_identities.append(_auth_identity(os.fstat(root_fd)))
@@ -309,7 +549,11 @@ def read_verified_session_transcript(
                     raise SessionFileSecurityError("subscription transcript ancestor path changed")
 
         root_pin.verify(label="subscription transcript root")
-        _require_session_identity(os.fstat(root_pin.descriptor), session_identity)
+        root_state = os.fstat(root_pin.descriptor)
+        if require_private_root:
+            _require_private_log_root(root_state, session_identity)
+        else:
+            _require_session_identity(root_state, session_identity)
         return VerifiedSessionTranscript(
             path=transcript_path,
             content=b"".join(chunks),
@@ -615,6 +859,52 @@ def _pin_absolute_directory(path: Path) -> _AbsoluteDirectoryPin:
             descriptor = os.open(part, _DIRECTORY_FLAGS, dir_fd=descriptors[-1])
             descriptors.append(descriptor)
             identities.append(_full_object_identity(os.fstat(descriptor)))
+        return _AbsoluteDirectoryPin(
+            path=path,
+            parts=tuple(parts[1:]),
+            descriptors=descriptors,
+            identities=tuple(identities),
+        )
+    except Exception:
+        while descriptors:
+            os.close(descriptors.pop())
+        raise
+
+
+def _pin_or_create_absolute_directory(path: Path) -> _AbsoluteDirectoryPin:
+    parts = path.parts
+    if not parts or parts[0] != os.sep or any(
+        part in {"", ".", ".."} for part in parts[1:]
+    ) or len(parts) < 2:
+        raise SessionFileSecurityError(
+            "private session path must be absolute and canonical"
+        )
+    descriptors = [os.open(os.sep, _DIRECTORY_FLAGS)]
+    identities = [_full_object_identity(os.fstat(descriptors[0]))]
+    try:
+        for index, part in enumerate(parts[1:]):
+            try:
+                os.mkdir(part, mode=0o700, dir_fd=descriptors[-1])
+            except FileExistsError:
+                pass
+            before = os.stat(part, dir_fd=descriptors[-1], follow_symlinks=False)
+            if not stat.S_ISDIR(before.st_mode):
+                raise SessionFileSecurityError(
+                    "private session path contains a non-directory"
+                )
+            descriptor = os.open(part, _DIRECTORY_FLAGS, dir_fd=descriptors[-1])
+            opened = os.fstat(descriptor)
+            if _full_object_identity(before) != _full_object_identity(opened):
+                os.close(descriptor)
+                raise SessionFileSecurityError(
+                    "private session path changed while it was opened"
+                )
+            if index == len(parts[1:]) - 1:
+                _require_owned_directory(opened, label="private authority root")
+                os.fchmod(descriptor, 0o700)
+                opened = os.fstat(descriptor)
+            descriptors.append(descriptor)
+            identities.append(_full_object_identity(opened))
         return _AbsoluteDirectoryPin(
             path=path,
             parts=tuple(parts[1:]),
@@ -1023,6 +1313,24 @@ def _require_private_staged_auth(
         raise SessionFileSecurityError("staged Codex auth is not a private regular file")
 
 
+def _require_private_log_file(
+    value: os.stat_result,
+    *,
+    expected_owner: int,
+    expected_size: int,
+) -> None:
+    if (
+        not stat.S_ISREG(value.st_mode)
+        or value.st_uid != expected_owner
+        or value.st_nlink != 1
+        or stat.S_IMODE(value.st_mode) != 0o600
+        or value.st_size != expected_size
+    ):
+        raise SessionFileSecurityError(
+            "session log must be a private single-link regular file"
+        )
+
+
 def _require_owned_directory(
     value: os.stat_result,
     *,
@@ -1041,6 +1349,15 @@ def _require_session_identity(
     _require_owned_directory(value, label="session root", expected_owner=expected[2])
     if (value.st_dev, value.st_ino, value.st_uid) != expected:
         raise SessionFileSecurityError("session root identity does not match its dispatch pin")
+
+
+def _require_private_log_root(
+    value: os.stat_result,
+    expected: SessionRootIdentity,
+) -> None:
+    _require_session_identity(value, expected)
+    if stat.S_IMODE(value.st_mode) != 0o700:
+        raise SessionFileSecurityError("session log authority root is not private")
 
 
 def _require_path_identity(

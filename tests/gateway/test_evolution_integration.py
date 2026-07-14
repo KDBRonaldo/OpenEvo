@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import threading
 import time
 from pathlib import Path
 from unittest.mock import Mock
@@ -216,16 +218,17 @@ async def test_gateway_rejects_subscription_before_image_user_runtime_or_auth_st
 ) -> None:
     session_dir = tmp_path / "session"
     session_dir.mkdir()
+    runtime_spec = RuntimeSpec(
+        profile="managed_science",
+        image=MANAGED_RUNTIME_IMAGES["managed_science"],
+        container_user="host",
+    )
     request = SessionDispatchRequest(
         session_id="session_1",
         task_id="task_1",
         instruction="Do work.",
         remaining_timeout_seconds=60,
-        runtime=RuntimeSpec(
-            profile="managed_science",
-            image=MANAGED_RUNTIME_IMAGES["managed_science"],
-            container_user="image",
-        ),
+        runtime=runtime_spec,
         agent=AgentSpec(
             harness="codex",
             model_name="gpt-5.5",
@@ -233,6 +236,8 @@ async def test_gateway_rejects_subscription_before_image_user_runtime_or_auth_st
         ),
         metadata={},
     )
+    assert request.runtime is not None
+    object.__setattr__(request.runtime, "container_user", "image")
     managed = ManagedSession(
         request=request,
         timer=StageTimer(),
@@ -844,8 +849,10 @@ async def test_cleanup_ownership_persists_for_new_manager_startup_reconciliation
     journal_dir = tmp_path / "cleanup-journal"
     session_dir = tmp_path / "session"
     credential_dir = tmp_path / "credentials"
+    log_authority_dir = tmp_path / "core-logs"
     session_dir.mkdir()
     credential_dir.mkdir()
+    log_authority_dir.mkdir()
 
     class JournalRuntime(FakeRuntime):
         @property
@@ -871,6 +878,8 @@ async def test_cleanup_ownership_persists_for_new_manager_startup_reconciliation
     managed.session_root_identity = capture_session_root_identity(session_dir)
     managed.credential_dir = credential_dir
     managed.credential_root_identity = capture_session_root_identity(credential_dir)
+    managed.log_authority_dir = log_authority_dir
+    managed.log_authority_identity = capture_session_root_identity(log_authority_dir)
 
     first = GatewayNodeManager.__new__(GatewayNodeManager)
     first._cleanup_retries = {}
@@ -883,6 +892,7 @@ async def test_cleanup_ownership_persists_for_new_manager_startup_reconciliation
     assert "sha256:journal-container" in journal_text
     assert "sha256:journal-eval-container" in journal_text
     assert "credential" in journal_text
+    assert "core-logs" in journal_text
     assert "access_token" not in journal_text
 
     calls: list[str] = []
@@ -904,9 +914,15 @@ async def test_cleanup_ownership_persists_for_new_manager_startup_reconciliation
         calls.append("credential")
         return True
 
+    async def remove_logs(*args, **kwargs):
+        del args, kwargs
+        calls.append("logs")
+        return True
+
     restarted._stop_recovered_container = stop_recovered
     restarted._remove_session_dir_best_effort = remove_session
     restarted._remove_credential_dir_best_effort = remove_credential
+    restarted._remove_log_authority_best_effort = remove_logs
 
     restarted._load_cleanup_retries()
     await restarted._reconcile_cleanup_retries()
@@ -916,6 +932,7 @@ async def test_cleanup_ownership_persists_for_new_manager_startup_reconciliation
         "stop:sha256:journal-container:openevo-journal-session",
         "session",
         "credential",
+        "logs",
     ]
     assert restarted._cleanup_retries == {}
     assert list(journal_dir.glob("*.json")) == []
@@ -1083,8 +1100,7 @@ async def test_write_evolution_context_files(tmp_path):
     assert runtime.uploads["/openevo/session/evolution/agent_system.md"] == (
         "Prefer repository-local conventions."
     )
-    assert (tmp_path / ".openevo" / "evolution_upload" / "context.json").is_file()
-    assert not (tmp_path / (".openevo" + ".evolution_upload")).exists()
+    assert not (tmp_path / ".openevo" / "evolution_upload").exists()
     assert runtime.uploads["/openevo/session/AGENTS.md"] == ("Prefer repository-local conventions.")
     assert (
         json.loads(runtime.uploads["/openevo/session/evolution/adapters.json"])["merge_mode"]
@@ -1096,6 +1112,37 @@ async def test_write_evolution_context_files(tmp_path):
     assert env["OPENEVO_AGENT_SYSTEM_TARGET"] == "/openevo/session/AGENTS.md"
     assert json.loads(env["OPENEVO_AGENT_SYSTEM_TARGETS"]) == ["/openevo/session/AGENTS.md"]
     assert env["OPENEVO_AGENTS_MD"] == "/openevo/session/AGENTS.md"
+
+
+@pytest.mark.asyncio
+async def test_evolution_agent_system_upload_rejects_agent_replaced_fixed_target(
+    tmp_path: Path,
+) -> None:
+    session_dir = tmp_path / "session"
+    session_dir.mkdir()
+    runtime = BindMountRuntime(session_dir)
+    outside = tmp_path / "outside-agents.md"
+    outside.write_text("outside remains", encoding="utf-8")
+    (session_dir / "AGENTS.md").symlink_to(outside)
+    context = {
+        "context_id": "ctx_1",
+        "agent_system": {
+            "rendered_text": "Use verified instructions.",
+            "target_path": "AGENTS.md",
+        },
+        "skills": [],
+        "adapter_merge_spec": {},
+    }
+
+    with pytest.raises(RuntimeError):
+        await write_evolution_context_files(
+            runtime=runtime,
+            context=context,
+            host_dir=session_dir,
+            target_dir="/openevo/session/evolution",
+        )
+
+    assert outside.read_text(encoding="utf-8") == "outside remains"
 
 
 @pytest.mark.asyncio
@@ -1713,7 +1760,7 @@ async def test_subscription_stdout_and_transcript_redact_auth_canaries(tmp_path)
     )
     managed.execution_deadline = asyncio.get_running_loop().time() + 60
 
-    await manager._run_exec_inputs(
+    agent_result = await manager._run_exec_inputs(
         runtime,
         [ExecInput(command="codex exec")],
         {},
@@ -1723,7 +1770,7 @@ async def test_subscription_stdout_and_transcript_redact_auth_canaries(tmp_path)
         session_id="session_1",
         metadata={
             "agent_result_metadata": {
-                "log_dir": str(tmp_path / "logs" / "agent"),
+                "log_dir": agent_result.metadata["log_dir"],
                 "last_step": 0,
             }
         },
@@ -1732,7 +1779,7 @@ async def test_subscription_stdout_and_transcript_redact_auth_canaries(tmp_path)
 
     persisted = "\n".join(
         path.read_text(encoding="utf-8")
-        for path in (tmp_path / "logs" / "agent").iterdir()
+        for path in (managed.log_authority_dir / "logs" / "agent").iterdir()
     ) + trajectory.model_dump_json()
     assert "access-canary" not in persisted
     assert "refresh-canary" not in persisted
@@ -1740,9 +1787,295 @@ async def test_subscription_stdout_and_transcript_redact_auth_canaries(tmp_path)
 
 
 @pytest.mark.asyncio
-async def test_codex_subscription_without_proxy_completions_builds_transcript_trajectory(
+@pytest.mark.parametrize("hostile_leaf", ["symlink", "fifo"])
+async def test_run_exec_inputs_rejects_precreated_log_leaf_without_blocking(
+    tmp_path: Path,
+    hostile_leaf: str,
+) -> None:
+    session_dir = tmp_path / "session"
+    session_log_dir = session_dir / "logs" / "agent"
+    session_log_dir.mkdir(parents=True)
+    authority_dir = tmp_path / "core-log-authority"
+    authority_log_dir = authority_dir / "logs" / "agent"
+    authority_log_dir.mkdir(parents=True)
+    outside = tmp_path / "outside.log"
+    outside.write_text("outside remains", encoding="utf-8")
+    hostile_paths = [
+        session_log_dir / "step.00.stdout.log",
+        authority_log_dir / "step.00.stdout.log",
+    ]
+    if hostile_leaf == "symlink":
+        for path in hostile_paths:
+            path.symlink_to(outside)
+        unblocker = None
+    else:
+        for path in hostile_paths:
+            os.mkfifo(path, mode=0o600)
+
+        def unblock_unsafe_writer() -> None:
+            time.sleep(0.2)
+            for path in hostile_paths:
+                descriptor = os.open(path, os.O_RDWR | os.O_NONBLOCK)
+                os.close(descriptor)
+
+        unblocker = threading.Thread(target=unblock_unsafe_writer, daemon=True)
+        unblocker.start()
+
+    runtime = BindMountRuntime(session_dir)
+    runtime.exec_results = [
+        ExecResult(return_code=0, stdout='{"type":"agent_message","text":"safe"}\n')
+    ]
+    request = SessionDispatchRequest(
+        session_id="session_1",
+        task_id="task_1",
+        instruction="Do work.",
+        remaining_timeout_seconds=60,
+        runtime=RuntimeSpec(image="runtime:latest"),
+        agent=AgentSpec(
+            harness="shell",
+            settings={"capture_mode": "transcript"},
+            custom_shell=ExecInput(command="agent"),
+        ),
+    )
+    managed_kwargs = {
+        "request": request,
+        "timer": StageTimer(),
+        "session_dir": session_dir,
+        "artifacts_dir": session_dir / "artifacts",
+        "session_root_identity": capture_session_root_identity(session_dir),
+        "runtime": runtime,
+    }
+    if "log_authority_dir" in ManagedSession.__dataclass_fields__:
+        managed_kwargs.update(
+            {
+                "log_authority_dir": authority_dir,
+                "log_authority_identity": capture_session_root_identity(authority_dir),
+            }
+        )
+    managed = ManagedSession(**managed_kwargs)
+    managed.execution_deadline = asyncio.get_running_loop().time() + 60
+    manager = GatewayNodeManager.__new__(GatewayNodeManager)
+    manager.gateway_url = "http://gateway.test"
+    started = time.monotonic()
+
+    with pytest.raises(session_files.SessionFileSecurityError):
+        await manager._run_exec_inputs(
+            runtime,
+            [ExecInput(command="agent")],
+            {},
+            managed,
+        )
+
+    elapsed = time.monotonic() - started
+    if unblocker is not None:
+        unblocker.join(timeout=1)
+    assert elapsed < 0.15
+    assert outside.read_text(encoding="utf-8") == "outside remains"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("terminal", "return_code", "expected_status", "expected_error"),
+    [
+        ("timeout", -1, SessionStatus.TIMEOUT, "timed out"),
+        ("cancel", -9, SessionStatus.ERROR, "session cancelled"),
+    ],
+)
+async def test_subscription_finalization_preserves_transcript_after_execution_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    terminal: str,
+    return_code: int,
+    expected_status: SessionStatus,
+    expected_error: str,
+) -> None:
+    session_dir = tmp_path / "session"
+    session_dir.mkdir()
+    authority_dir = tmp_path / "core-log-authority"
+    (authority_dir / "logs" / "agent").mkdir(parents=True)
+    runtime = BindMountRuntime(session_dir)
+    runtime.exec_results = [
+        ExecResult(
+            return_code=return_code,
+            stdout='{"type":"agent_message","text":"captured before terminal"}\n',
+        )
+    ]
+    request = SessionDispatchRequest(
+        session_id="session_1",
+        task_id="task_1",
+        instruction="Do work.",
+        remaining_timeout_seconds=60,
+        runtime=RuntimeSpec(
+            profile="managed_science",
+            image=MANAGED_RUNTIME_IMAGES["managed_science"],
+            container_user="host",
+        ),
+        agent=AgentSpec(
+            harness="codex",
+            settings={"auth_mode": "subscription", "capture_mode": "transcript"},
+        ),
+        builder={"strategy": "agent_transcript"},
+    )
+    managed_kwargs = {
+        "request": request,
+        "timer": StageTimer(),
+        "session_dir": session_dir,
+        "artifacts_dir": session_dir / "artifacts",
+        "session_root_identity": capture_session_root_identity(session_dir),
+        "runtime": runtime,
+    }
+    if "log_authority_dir" in ManagedSession.__dataclass_fields__:
+        managed_kwargs.update(
+            {
+                "log_authority_dir": authority_dir,
+                "log_authority_identity": capture_session_root_identity(authority_dir),
+            }
+        )
+    managed = ManagedSession(**managed_kwargs)
+    manager = GatewayNodeManager.__new__(GatewayNodeManager)
+    manager.node_id = "node-a"
+    manager.gateway_url = "http://gateway.test"
+    manager.storage = EmptyCompletionStorage()
+    manager.builders = default_builder_registry()
+    manager.session_registry = SessionRegistry()
+    manager.session_registry.register("session_1", task_id="task_1")
+    manager._cleanup_retries = {}
+    manager._clear_cleanup_ownership = Mock()
+    delivered: list[SessionResult] = []
+
+    async def capture_result(
+        captured_managed: ManagedSession,
+        result: SessionResult,
+    ) -> None:
+        assert captured_managed is managed
+        delivered.append(result)
+
+    async def retain_roots(captured_managed: ManagedSession) -> bool:
+        assert captured_managed is managed
+        return False
+
+    monkeypatch.setattr(manager, "_deliver_terminal_result", capture_result)
+    monkeypatch.setattr(manager, "_remove_owned_roots", retain_roots)
+    managed.execution_deadline = asyncio.get_running_loop().time() + 60
+    managed.agent_result = await manager._run_exec_inputs(
+        runtime,
+        [ExecInput(command="codex exec")],
+        {},
+        managed,
+    )
+    if terminal == "timeout":
+        managed.pending_status = SessionStatus.TIMEOUT
+        managed.pending_error = "step 0 timed out"
+    else:
+        managed.cancel_requested = True
+    managed.execution_deadline = asyncio.get_running_loop().time() - 1
+
+    await manager._finalize_subscription_after_runtime_absence(
+        managed,
+        result=None,
+    )
+
+    assert len(delivered) == 1
+    result = delivered[0]
+    assert result.status == expected_status
+    assert expected_error in (result.error or "")
+    assert result.trajectory.status == expected_status
+    assert result.trajectory.metadata["builder"] == "agent_transcript"
+    assert result.trajectory.metadata["capture_mode"] == "transcript"
+    assert result.trajectory.metadata["token_level_metrics_available"] is False
+    assert result.trajectory.traces[0].response_messages == [
+        {"role": "assistant", "content": "captured before terminal"}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_handle_run_postprocess_timeout_preserves_step_transcript_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class SlowPostprocessHarness(RunStepHarness):
+        async def postprocess(
+            self,
+            runtime: BaseRuntime,
+            result: AgentRunResult,
+        ) -> None:
+            del runtime, result
+            await asyncio.sleep(1)
+
+    session_dir = tmp_path / "session"
+    session_dir.mkdir()
+    runtime = BindMountRuntime(session_dir)
+    runtime.exec_results = [
+        ExecResult(
+            return_code=-1,
+            stdout='{"type":"agent_message","text":"before timeout"}\n',
+        )
+    ]
+    request = SessionDispatchRequest(
+        session_id="session_1",
+        task_id="task_1",
+        instruction="Do work.",
+        remaining_timeout_seconds=60,
+        runtime=RuntimeSpec(
+            profile="managed_science",
+            image=MANAGED_RUNTIME_IMAGES["managed_science"],
+            container_user="host",
+        ),
+        agent=AgentSpec(
+            harness="codex",
+            settings={"auth_mode": "subscription", "capture_mode": "transcript"},
+        ),
+        builder={"strategy": "agent_transcript"},
+    )
+    harness = SlowPostprocessHarness(request.agent)
+    manager = GatewayNodeManager.__new__(GatewayNodeManager)
+    manager.node_id = "node-a"
+    manager.gateway_url = "http://gateway.test"
+    manager.evolution = EvolutionConfig(enabled=False)
+    manager.evolution_client = None
+    manager.storage = EmptyCompletionStorage()
+    manager.builders = default_builder_registry()
+    manager.session_registry = SessionRegistry()
+    manager.session_registry.register("session_1", task_id="task_1")
+    monkeypatch.setattr(manager, "_resolve_agent_harness", lambda _: harness)
+    managed = ManagedSession(
+        request=request,
+        timer=StageTimer(),
+        session_dir=session_dir,
+        artifacts_dir=session_dir / "artifacts",
+        session_root_identity=capture_session_root_identity(session_dir),
+        runtime=runtime,
+    )
+    managed.execution_deadline = asyncio.get_running_loop().time() + 0.1
+
+    await manager._handle_run(managed)
+
+    assert managed.agent_result is not None
+    assert managed.agent_result.status == "timeout"
+    assert managed.agent_result.metadata["last_step"] == 0
+    assert managed.execution_deadline < asyncio.get_running_loop().time()
+    result = await manager._build_session_result(managed)
+    assert result.status == SessionStatus.TIMEOUT
+    assert result.trajectory.metadata["capture_mode"] == "transcript"
+    assert result.trajectory.metadata["token_level_metrics_available"] is False
+    assert result.trajectory.traces[0].response_messages == [
+        {"role": "assistant", "content": "before timeout"}
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "settings",
+    [
+        {"auth_mode": "subscription", "capture_mode": "transcript"},
+        {"capture_mode": "transcript"},
+    ],
+    ids=["subscription", "self-deployed"],
+)
+async def test_managed_runtime_without_proxy_completions_uses_verified_transcript_bytes(
     tmp_path,
     monkeypatch,
+    settings: dict[str, str],
 ):
     log_dir = tmp_path / "logs" / "agent"
     log_dir.mkdir(parents=True)
@@ -1766,9 +2099,14 @@ async def test_codex_subscription_without_proxy_completions_builds_transcript_tr
         task_id="task_1",
         instruction="Do work.",
         remaining_timeout_seconds=60,
+        runtime=RuntimeSpec(
+            profile="managed_science",
+            image=MANAGED_RUNTIME_IMAGES["managed_science"],
+            container_user="host",
+        ),
         agent=AgentSpec(
             harness="codex",
-            settings={"auth_mode": "subscription", "capture_mode": "transcript"},
+            settings=settings,
         ),
         metadata={},
     )
@@ -1778,6 +2116,8 @@ async def test_codex_subscription_without_proxy_completions_builds_transcript_tr
         session_dir=tmp_path,
         artifacts_dir=tmp_path / "artifacts",
         session_root_identity=capture_session_root_identity(tmp_path),
+        log_authority_dir=tmp_path,
+        log_authority_identity=capture_session_root_identity(tmp_path),
         agent_result=AgentRunResult(
             status="completed",
             return_code=0,
@@ -1809,7 +2149,7 @@ async def test_codex_subscription_without_proxy_completions_builds_transcript_tr
 
 
 @pytest.mark.asyncio
-async def test_subscription_transcript_read_is_async_and_execution_budgeted(
+async def test_subscription_transcript_read_is_async_and_finalization_budgeted(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1839,13 +2179,16 @@ async def test_subscription_transcript_read_is_async_and_execution_budgeted(
         session_dir=tmp_path,
         artifacts_dir=tmp_path / "artifacts",
         session_root_identity=capture_session_root_identity(tmp_path),
+        log_authority_dir=tmp_path,
+        log_authority_identity=capture_session_root_identity(tmp_path),
         agent_result=AgentRunResult(
             status="completed",
             return_code=0,
             metadata={"log_dir": str(log_dir), "last_step": 0},
         ),
     )
-    managed.execution_deadline = asyncio.get_running_loop().time() + 0.05
+    managed.execution_deadline = asyncio.get_running_loop().time() - 1
+    managed.finalization_deadline = asyncio.get_running_loop().time() + 0.05
 
     original_reader = session_files.read_verified_session_transcript
 
@@ -1862,7 +2205,7 @@ async def test_subscription_transcript_read_is_async_and_execution_budgeted(
 
     tick_task = asyncio.create_task(tick())
     started = asyncio.get_running_loop().time()
-    with pytest.raises(GatewayExecutionTimeout, match="execution timeout"):
+    with pytest.raises(GatewayExecutionTimeout, match="finalization timeout"):
         await manager._build_session_result(managed)
     elapsed = asyncio.get_running_loop().time() - started
     await tick_task

@@ -66,6 +66,11 @@ returns an actionable error directing the user to a managed environment or
 self-deployed execution before compilation or runtime startup.
 
 For managed profiles, users do not upload or choose a runtime image in Desktop.
+Every `managed_science` run, including `codex_subscription_transcript` and
+`self-deployed`, must reach Core as Docker + the exact canonical profile image +
+host-user execution. Runtime config, compiled `RuntimeSpec`, Core launcher, and
+Gateway admission independently enforce this binding; Apptainer, an attacker
+image, image-user execution, and custom runtime loaders/options fail closed.
 Remote bootstrap grants fallback build behavior only when the closed runtime
 profile and its image exactly match Core's profile-to-image table. A custom or
 unknown profile that reuses a managed-looking tag is pull-only or rejected and
@@ -124,7 +129,11 @@ source and credential-root absolute pathname chains are pinned component by
 component and rechecked before and after publication.
 
 Core derives a bounded exact-value redactor from the verified auth JSON and its
-string leaves. Stdout/stderr, transcript logs, workspace, and artifact capture
+string leaves. Core stdout/stderr and transcript logs live in a node-private,
+unmounted log authority rather than the host-user agent's session bind. Each
+leaf is bounded and published from an exclusive `0600`, no-follow regular inode;
+the final transcript read uses the same held-root authority and rejects links,
+FIFOs, sockets, hard links, and replacements without blocking. Workspace and artifact capture
 surfaces are scanned without following links before persistence; over-budget
 content is replaced rather than copied raw. Codex is the necessary trusted
 credential consumer, so this boundary does not claim to prevent Codex from
@@ -144,9 +153,11 @@ identity replacement fails closed. Every recursive directory pathname is
 rechecked against the opened inode after the final scan. Core constructs no
 subscription transcript trajectory or result until all credential-capable
 containers have been removed by pinned container ID and proven absent. It then
-defensively redacts the in-memory result before export. A private identity-only
-cleanup journal drives independent startup/shutdown retries; Docker kill/remove
-failure keeps the runtime retryable and both roots intact.
+uses a separate bounded finalization budget to preserve transcript bytes already
+captured before execution timeout/cancel, then defensively redacts the in-memory
+result before export. A private identity-only cleanup journal drives independent
+startup/shutdown retries; Docker kill/remove failure keeps the runtime retryable
+and the session, log, and credential roots intact.
 
 `self-deployed` uses proxy authentication and requires `execution.hf_model`.
 The legacy config value `codex_managed_local_inference` remains accepted as an

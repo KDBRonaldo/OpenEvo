@@ -51,10 +51,13 @@ the remote server.
 4. Build and clean-install the Core artifact.
 5. Run Core integration tests for Codex subscription transcript and the
    self-deployed reference profile.
-6. Build the Desktop app and run source-level tests before packaging.
-7. Build the DMG and rerun the packaged-app lifecycle and science workflow
+6. Dispatch `OpenEvo Core Backend checks` for the exact candidate with
+   `require_real_docker=true`; the required Docker ownership job must pass
+   without skips after pulling `python:3.12-slim-bookworm`.
+7. Build the Desktop app and run source-level tests before packaging.
+8. Build the DMG and rerun the packaged-app lifecycle and science workflow
    smoke against the exact Core descriptor/artifact.
-8. Run secret-canary, diagnostics redaction, privacy, identity, docs/link, and
+9. Run secret-canary, diagnostics redaction, privacy, identity, docs/link, and
    dependency checks.
 
 Any product or benchmark failure creates a new candidate after the fix.

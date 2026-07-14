@@ -23,8 +23,10 @@ from openevo.projects.evolution_defaults import default_project_evolution_target
 from openevo.runtime.managed import (
     ManagedRuntimeProfile,
     reject_managed_subscription_env,
+    require_managed_runtime_binding,
     require_managed_subscription_runtime,
 )
+from openevo.runtime.models import validate_runtime_session_target
 
 _SUBSCRIPTION_AUTH_MODES = {"subscription", "chatgpt_subscription"}
 _NATIVE_MEMORY_POLICIES = {"preserve", "clear"}
@@ -121,6 +123,10 @@ class RuntimePrepareActionConfig(_StrictModel):
         if self.type in {"upload_file", "upload_dir"}:
             if not self.source or not self.target:
                 raise ValueError(f"{self.type} requires source and target")
+            validate_runtime_session_target(
+                self.target,
+                label="runtime.prepare target",
+            )
             if self.command is not None or self.cwd is not None or self.env is not None:
                 raise ValueError(f"{self.type} must not set command, cwd, or env")
         elif self.type == "exec":
@@ -151,6 +157,16 @@ class RuntimeConfig(_StrictModel):
         if value is None:
             return None
         return _strip_non_empty(value, "runtime.image")
+
+    @model_validator(mode="after")
+    def _validate_managed_runtime_binding(self) -> RuntimeConfig:
+        require_managed_runtime_binding(
+            profile=self.profile,
+            image=self.image,
+            backend=self.kind,
+            container_user=self.container_user,
+        )
+        return self
 
 
 class RolloutConfig(_StrictModel):

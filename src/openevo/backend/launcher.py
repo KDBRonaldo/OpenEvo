@@ -22,6 +22,7 @@ from openevo.evolution.framework import (
     load_verified_framework_registry,
 )
 from openevo.harness.capture import transcript_capture_enabled
+from openevo.runtime.managed import require_managed_runtime_binding
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -210,6 +211,12 @@ def _run_experiment_command(args: argparse.Namespace) -> int:
 
 
 def _execution_profile_for_config(config) -> EvolutionExecutionProfile:
+    require_managed_runtime_binding(
+        profile=config.runtime.profile,
+        image=config.runtime.image,
+        backend=config.runtime.kind,
+        container_user=config.runtime.container_user,
+    )
     subscription = config.agent.auth in {"subscription", "chatgpt_subscription"}
     configured_capture = config.agent.settings.get("capture_mode")
     capture_mode = (

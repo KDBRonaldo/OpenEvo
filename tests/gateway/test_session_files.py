@@ -38,6 +38,45 @@ def _stage(source: Path, root: Path, identity: tuple[int, int, int]) -> Path:
     return root / "home" / ".codex" / "auth.json"
 
 
+def test_log_writer_and_reader_share_private_pinned_authority(tmp_path: Path) -> None:
+    root, identity = _session_root(tmp_path)
+
+    path = session_files.write_verified_session_log(
+        root,
+        identity,
+        directory_parts=("logs", "agent"),
+        leaf_name="step.00.stdout.log",
+        content="verified transcript\n",
+    )
+    transcript = session_files.read_verified_session_transcript(
+        root,
+        identity,
+        step_index=0,
+        require_private_root=True,
+    )
+
+    opened = path.stat(follow_symlinks=False)
+    assert opened.st_mode & 0o777 == 0o600
+    assert opened.st_nlink == 1
+    assert transcript.content == b"verified transcript\n"
+
+
+def test_log_writer_rejects_nonprivate_authority_root(tmp_path: Path) -> None:
+    root, identity = _session_root(tmp_path)
+    root.chmod(0o755)
+
+    with pytest.raises(SessionFileSecurityError, match="root is not private"):
+        session_files.write_verified_session_log(
+            root,
+            identity,
+            directory_parts=("logs", "agent"),
+            leaf_name="step.00.stdout.log",
+            content="must not publish",
+        )
+
+    assert not (root / "logs").exists()
+
+
 def test_auth_staging_uses_private_owned_files_and_directories(tmp_path: Path) -> None:
     source = _private_auth(tmp_path)
     root, identity = _session_root(tmp_path)

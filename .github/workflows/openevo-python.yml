@@ -1,6 +1,13 @@
 name: OpenEvo Core Backend checks
 
 on:
+  workflow_dispatch:
+    inputs:
+      require_real_docker:
+        description: Run required managed-runtime Docker ownership probes
+        required: true
+        default: true
+        type: boolean
   pull_request:
     types: [opened, edited, synchronize, reopened, ready_for_review]
     paths:
@@ -49,6 +56,7 @@ jobs:
             tests/backend \
             tests/evolution \
             tests/gateway \
+            tests/runtime \
             tests/trajectory \
             tests/rollout \
             tests/openevo/remote \
@@ -60,6 +68,36 @@ jobs:
             tests/openevo/test_experiment_runner.py \
             tests/openevo/test_core_capabilities.py \
             -q
+
+  real-docker-runtime-probes:
+    name: required candidate managed-runtime Docker probes
+    if: github.event_name == 'workflow_dispatch' && inputs.require_real_docker
+    runs-on: ubuntu-latest
+    env:
+      OPENEVO_REQUIRE_REAL_DOCKER: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install runtime probe dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .
+          python -m pip install pytest pytest-asyncio
+
+      - name: Require Docker daemon and probe image
+        run: |
+          docker info
+          docker pull python:3.12-slim-bookworm
+
+      - name: Run real Docker ownership probes
+        run: |
+          python -m pytest -q \
+            tests/runtime/test_docker_runtime.py::test_real_docker_name_collision_preserves_running_external_container \
+            tests/runtime/test_docker_runtime.py::test_real_docker_cancel_after_cidfile_is_recoverably_owned
 
   macos-ssh-transport:
     name: macOS anonymous Core SSH transport

@@ -179,7 +179,7 @@ def test_subscription_agent_rejects_image_user_runtime() -> None:
 
     with pytest.raises(
         ValidationError,
-        match="subscription credentials require runtime.container_user='host'",
+        match="Core-managed runtime profiles require runtime.container_user='host'",
     ):
         ExperimentConfig.model_validate(payload)
 
@@ -198,12 +198,52 @@ def test_subscription_agent_requires_exact_managed_runtime_profile_and_image() -
         ExperimentConfig.model_validate(payload)
 
     payload["runtime"]["profile"] = "managed_science"
-    with pytest.raises(ValidationError, match="exact managed runtime image"):
+    with pytest.raises(ValidationError, match="exact Core-managed image"):
         ExperimentConfig.model_validate(payload)
 
     payload["runtime"]["image"] = MANAGED_RUNTIME_IMAGES["managed_science"]
     config = ExperimentConfig.model_validate(payload)
 
+    assert config.runtime.profile == "managed_science"
+
+
+@pytest.mark.parametrize(
+    ("override", "message"),
+    [
+        ({"kind": "apptainer"}, "Docker"),
+        ({"image": "attacker:latest"}, "exact Core-managed image"),
+        ({"container_user": "image"}, "container_user='host'"),
+    ],
+)
+def test_self_deployed_managed_science_requires_exact_runtime_binding(
+    override: dict[str, str],
+    message: str,
+) -> None:
+    payload = _minimal_payload()
+    payload["runtime"] = {
+        "kind": "docker",
+        "profile": "managed_science",
+        "image": MANAGED_RUNTIME_IMAGES["managed_science"],
+        "container_user": "host",
+        **override,
+    }
+
+    with pytest.raises(ValidationError, match=message):
+        ExperimentConfig.model_validate(payload)
+
+
+def test_self_deployed_managed_science_accepts_exact_runtime_binding() -> None:
+    payload = _minimal_payload()
+    payload["runtime"] = {
+        "kind": "docker",
+        "profile": "managed_science",
+        "image": MANAGED_RUNTIME_IMAGES["managed_science"],
+        "container_user": "host",
+    }
+
+    config = ExperimentConfig.model_validate(payload)
+
+    assert config.agent.auth == "proxy"
     assert config.runtime.profile == "managed_science"
 
 

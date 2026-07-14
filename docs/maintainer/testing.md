@@ -24,6 +24,7 @@ PYTHONPATH=src:. python -m pytest \
   tests/backend \
   tests/evolution \
   tests/gateway \
+  tests/runtime \
   tests/trajectory \
   tests/rollout \
   tests/openevo/remote \
@@ -42,6 +43,18 @@ Run relevant module suites when touching shared behavior:
 ```bash
 PYTHONPATH=src:. python -m pytest tests/backend tests/evolution tests/gateway tests/trajectory tests/rollout -q
 ```
+
+`tests/runtime` is part of the deterministic Core PR gate. Its Docker CLI unit
+tests use controlled fakes; the real-daemon ownership probes remain a separate
+candidate gate so a contributor machine or ordinary PR runner without Docker
+does not fail merely because the daemon/image is unavailable.
+
+For a release candidate, manually dispatch **OpenEvo Core Backend checks** with
+`require_real_docker=true`. The `real-docker-runtime-probes` job first requires
+`docker info` and pulls `python:3.12-slim-bookworm`, then runs with
+`OPENEVO_REQUIRE_REAL_DOCKER=1`. Missing Docker, a missing image, or either
+name-collision/cancel ownership probe is a hard failure rather than a pytest
+skip. Record the job URL against the exact candidate commit.
 
 The focused productization regression boundary is indexed in
 `docs/architecture/protected-behavior.md`. It protects observable method and

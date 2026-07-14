@@ -81,6 +81,38 @@ def test_backend_launcher_builds_transcript_profile_for_science_execution_modes(
         assert config.runtime.container_user == "host"
 
 
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("kind", "apptainer", "Docker"),
+        ("image", "attacker:latest", "exact Core-managed image"),
+        ("container_user", "image", "container_user='host'"),
+    ],
+)
+def test_backend_launcher_revalidates_managed_self_deployed_runtime(
+    field: str,
+    value: str,
+    message: str,
+) -> None:
+    config = ExperimentConfig.model_validate(
+        {
+            "experiment": {"name": "science"},
+            "agent": {
+                "preset": "codex",
+                "model": "science-model",
+                "auth": "proxy",
+                "settings": {"capture_mode": "transcript"},
+            },
+            "runtime": _MANAGED_SCIENCE_RUNTIME,
+            "tasks": [{"id": "task", "instruction": "Run the task."}],
+        }
+    )
+    object.__setattr__(config.runtime, field, value)
+
+    with pytest.raises(ValueError, match=message):
+        launcher._execution_profile_for_config(config)
+
+
 def test_backend_launcher_run_invokes_experiment_runner(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

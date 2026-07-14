@@ -98,6 +98,27 @@ def require_managed_subscription_runtime(
         )
 
 
+def require_managed_runtime_binding(
+    *,
+    profile: str | None,
+    image: str | None,
+    backend: str,
+    container_user: str,
+) -> bool:
+    """Validate any explicitly selected Core-managed runtime profile."""
+
+    if profile is None:
+        return False
+    require_exact_managed_runtime_binding(profile=profile, image=image)
+    if backend != "docker":
+        raise ValueError("Core-managed runtime profiles require the Docker runtime")
+    if container_user != "host":
+        raise ValueError(
+            "Core-managed runtime profiles require runtime.container_user='host'"
+        )
+    return True
+
+
 __all__ = [
     "MANAGED_CODEX_HOME",
     "MANAGED_CODEX_BINARY",
@@ -109,5 +130,6 @@ __all__ = [
     "ManagedRuntimeProfile",
     "reject_managed_subscription_env",
     "require_exact_managed_runtime_binding",
+    "require_managed_runtime_binding",
     "require_managed_subscription_runtime",
 ]

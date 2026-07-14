@@ -66,6 +66,8 @@ class ManagedSession:
     session_dir: Path
     artifacts_dir: Path
     session_root_identity: tuple[int, int, int] | None = None
+    log_authority_dir: Path | None = None
+    log_authority_identity: tuple[int, int, int] | None = None
     credential_dir: Path | None = None
     credential_root_identity: tuple[int, int, int] | None = None
     credential_redactor: CredentialRedactor | None = None
@@ -80,6 +82,7 @@ class ManagedSession:
     cancel_requested: bool = False
     cancel_event: asyncio.Event = field(default_factory=asyncio.Event)
     execution_deadline: float | None = None
+    finalization_deadline: float | None = None
     runtime_cleanup_blocked: bool = False
     stage: SessionStage = SessionStage.INIT
     inflight: bool = False

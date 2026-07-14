@@ -6,7 +6,29 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from openevo.runtime.managed import ManagedRuntimeProfile
+from openevo.runtime.managed import (
+    ManagedRuntimeProfile,
+    require_managed_runtime_binding,
+)
+
+
+def validate_runtime_session_target(value: str, *, label: str) -> str:
+    """Require one canonical absolute target below the session bind root."""
+
+    if (
+        not isinstance(value, str)
+        or not value.startswith("/")
+        or "\x00" in value
+    ):
+        raise ValueError(f"{label} must be an absolute path under /openevo/session")
+    parts = value.split("/")
+    if (
+        parts[:3] != ["", "openevo", "session"]
+        or len(parts) < 4
+        or any(part in {"", ".", ".."} for part in parts[1:])
+    ):
+        raise ValueError(f"{label} must be canonical and remain under /openevo/session")
+    return value
 
 
 class ExecInput(BaseModel):
@@ -35,6 +57,7 @@ class PrepareAction(BaseModel):
         if self.type in ("upload_file", "upload_dir"):
             if not self.source or not self.target:
                 raise ValueError(f"{self.type} requires source and target")
+            validate_runtime_session_target(self.target, label="prepare target")
             for field_name in ("command", "cwd", "env"):
                 if getattr(self, field_name) is not None:
                     raise ValueError(f"{self.type} must not set {field_name}")
@@ -94,3 +117,17 @@ class RuntimeSpec(BaseModel):
         if not normalized:
             raise ValueError("workdir must be non-empty when provided")
         return normalized
+
+    @model_validator(mode="after")
+    def _validate_managed_runtime_binding(self) -> RuntimeSpec:
+        managed = require_managed_runtime_binding(
+            profile=self.profile,
+            image=self.image,
+            backend=self.backend,
+            container_user=self.container_user,
+        )
+        if managed and (self.import_path is not None or self.kwargs):
+            raise ValueError(
+                "Core-managed runtime profiles forbid custom runtime loaders and options"
+            )
+        return self

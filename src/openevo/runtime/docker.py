@@ -813,12 +813,9 @@ class DockerRuntime(BaseRuntime):
         return ExecResult(stdout=stdout, stderr=stderr, return_code=rc)
 
     async def upload_file(self, local_path: str, remote_path: str) -> None:
-        try:
-            if self._copy_to_bind_mount(local_path, remote_path):
-                await self._make_runtime_path_writable(remote_path, recursive=False)
-                return
-        except PermissionError:
-            pass
+        if self._copy_to_bind_mount(local_path, remote_path):
+            await self._make_runtime_path_writable(remote_path, recursive=False)
+            return
         parent = str(Path(remote_path).parent)
         await self._run_local_command(
             "docker", "exec", self._container_ref, "mkdir", "-p", parent
@@ -831,12 +828,9 @@ class DockerRuntime(BaseRuntime):
         await self._make_runtime_path_writable(remote_path, recursive=False)
 
     async def upload_dir(self, local_path: str, remote_path: str) -> None:
-        try:
-            if self._copy_to_bind_mount(local_path, remote_path):
-                await self._make_runtime_path_writable(remote_path, recursive=True)
-                return
-        except PermissionError:
-            pass
+        if self._copy_to_bind_mount(local_path, remote_path):
+            await self._make_runtime_path_writable(remote_path, recursive=True)
+            return
         await self._run_local_command(
             "docker", "exec", self._container_ref, "mkdir", "-p", remote_path
         )
@@ -867,11 +861,8 @@ class DockerRuntime(BaseRuntime):
             )
 
     async def download_file(self, remote_path: str, local_path: str) -> None:
-        try:
-            if self._copy_from_bind_mount(remote_path, Path(local_path)):
-                return
-        except PermissionError:
-            pass
+        if self._copy_from_bind_mount(remote_path, Path(local_path)):
+            return
         Path(local_path).parent.mkdir(parents=True, exist_ok=True)
         rc, _, _ = await self._run_local_command(
             "docker", "cp", f"{self._container_ref}:{remote_path}", local_path
@@ -880,11 +871,8 @@ class DockerRuntime(BaseRuntime):
             raise RuntimeError(f"docker cp download_file failed with exit code {rc}")
 
     async def download_dir(self, remote_path: str, local_path: str) -> None:
-        try:
-            if self._copy_from_bind_mount(remote_path, Path(local_path)):
-                return
-        except PermissionError:
-            pass
+        if self._copy_from_bind_mount(remote_path, Path(local_path)):
+            return
         Path(local_path).parent.mkdir(parents=True, exist_ok=True)
         rc, _, _ = await self._run_local_command(
             "docker", "cp", f"{self._container_ref}:{remote_path}", local_path

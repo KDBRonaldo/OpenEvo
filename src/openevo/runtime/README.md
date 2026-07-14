@@ -11,7 +11,7 @@ and out, then tear it down.
   stages of a session.
 - The host session directory is **bind-mounted** to a fixed in-container path,
   `/openevo/session` (`RUNTIME_SESSION_DIR`). Uploads/downloads under that path
-  are plain host-side file copies (fast); paths outside it fall back to
+  use descriptor-relative host-side copies; paths outside it fall back to
   `docker cp` / `tar` streaming.
 - Commands run in a login shell (`bash -lc`) with working directory
   `cwd or spec.workdir or /openevo/session`.
@@ -34,7 +34,9 @@ A backend implements `start`, `stop`, `exec`, `upload_file`, `upload_dir`,
 `download_file`, `download_dir` (plus `cancel`), hiding container details from
 harnesses and evaluators. Well-known in-container paths (from `base.py`) are
 `/openevo/session` and, under it, `artifacts/`, `logs/`, `logs/agent/`,
-`logs/eval/`, and `eval_artifacts/`.
+`logs/eval/`, and `eval_artifacts/`. Those container-visible log paths are
+agent/runtime workspace paths. Gateway-owned step stdout/stderr is persisted in
+a separate unmounted Core log authority and is not written through this bind.
 
 ## Prepare recipe
 
@@ -47,6 +49,15 @@ harnesses and evaluators. Well-known in-container paths (from `base.py`) are
 
 `prepare` runs before the agent. `eval_prepare` runs before evaluation — and if
 it's omitted, the eval runtime simply replays `prepare`.
+
+Upload targets must be canonical absolute descendants of `/openevo/session`.
+Gateway admission checks every main/evaluator prepare target before runtime
+construction. Bind copies then pin the absolute session root, open every source
+and target component relative to held directory descriptors with `O_NOFOLLOW`,
+reject links and special-file leaves, and recheck root, ancestor, leaf, owner,
+link count, and inode bindings after transfer. A `..` component, symlink, or
+concurrent directory replacement fails closed without falling back to a
+pathname copy.
 
 ## Docker vs Apptainer
 
@@ -65,8 +76,11 @@ with the Core process UID/GID and therefore keeps the bind-mounted session
 writable without recursively widening host file permissions.
 
 OpenEvo-managed Science profiles use `host`; user-supplied custom images keep
-`image`. Subscription admission additionally binds the profile to its exact
-Core-managed image and Docker backend. It is not a general compatibility
+`image`. Every `managed_science` runtime, including subscription and
+self-deployed execution, is bound to Docker and the profile's exact
+Core-managed image at experiment config, `RuntimeSpec`, launcher, and Gateway
+admission boundaries. Custom runtime loaders/options are forbidden for that
+profile. It is not a general compatibility
 promise that arbitrary images can run under a replaced user identity. A custom
 image, loader, option/volume, entrypoint, image-user runtime, or non-literal
 transcript capture mode is rejected before credential bytes are staged.
@@ -85,6 +99,10 @@ session root device/inode/owner at dispatch, restores only owner directory
 permissions through stable descriptors, and removes a bounded no-follow tree.
 An owner or identity mismatch fails closed rather than acting on a replacement
 path.
+
+Local Docker/Apptainer command capture drains stdout and stderr concurrently
+into fixed-size buffers. Timeout termination preserves bytes already captured
+instead of returning empty output, while still bounding final pipe drain time.
 
 Docker gives every create attempt a node-scoped Core-private authority root that
 is outside both the agent session bind and its nested evaluator bind. Each

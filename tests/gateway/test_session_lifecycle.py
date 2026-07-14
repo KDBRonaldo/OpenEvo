@@ -186,6 +186,76 @@ async def test_dispatch_runs_runtime_lifecycle_and_builds_stdout_trajectory(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("symlink_position", ["parent", "final"])
+async def test_init_rejects_prepare_target_symlink_before_runtime_start(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    symlink_position: str,
+) -> None:
+    session_dir = tmp_path / "session"
+    session_dir.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    source = tmp_path / "source.txt"
+    source.write_text("source", encoding="utf-8")
+    if symlink_position == "parent":
+        (session_dir / "workspace").symlink_to(outside, target_is_directory=True)
+        target = "/openevo/session/workspace/target.txt"
+    else:
+        (session_dir / "target.txt").symlink_to(outside / "target.txt")
+        target = "/openevo/session/target.txt"
+    request = SessionDispatchRequest(
+        session_id="prepare-admission",
+        task_id="task",
+        instruction="Do work.",
+        remaining_timeout_seconds=60,
+        runtime=RuntimeSpec(
+            image="runtime:latest",
+            prepare=[
+                PrepareAction(
+                    type="upload_file",
+                    source=str(source),
+                    target=target,
+                )
+            ],
+        ),
+        agent=AgentSpec(harness="shell", custom_shell=ExecInput(command="true")),
+    )
+    managed = ManagedSession(
+        request=request,
+        timer=StageTimer(),
+        session_dir=session_dir,
+        artifacts_dir=session_dir / "artifacts",
+        session_root_identity=(
+            session_dir.stat().st_dev,
+            session_dir.stat().st_ino,
+            session_dir.stat().st_uid,
+        ),
+    )
+    manager = GatewayNodeManager.__new__(GatewayNodeManager)
+    manager.node_id = "gateway-test"
+    manager.default_runtime = None
+    manager._docker_ownership_root = tmp_path / "docker-authority"
+    runtime_factory_called = False
+
+    def reject_runtime_factory(*args, **kwargs):
+        nonlocal runtime_factory_called
+        del args, kwargs
+        runtime_factory_called = True
+        raise AssertionError("unsafe prepare target reached runtime construction")
+
+    monkeypatch.setattr("openevo.gateway.node.create_runtime", reject_runtime_factory)
+
+    await manager._handle_init(managed)
+
+    assert runtime_factory_called is False
+    assert managed.final_result is not None
+    assert managed.final_result.status == SessionStatus.ERROR
+    assert "prepare target" in (managed.final_result.error or "")
+    assert list(outside.iterdir()) == []
+
+
+@pytest.mark.asyncio
 async def test_eval_runtime_uses_core_authority_outside_main_session_mount(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

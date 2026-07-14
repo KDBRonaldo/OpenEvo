@@ -124,7 +124,7 @@ OpenEvo Core 当前区分两类 capture：
 | 模式 | 入口 | 产物 | 适合用途 |
 |---|---|---|---|
 | OpenEvo proxy capture | agent 请求 `OPENAI_BASE_URL` / `ANTHROPIC_BASE_URL` / Gemini proxy | `CompletionSession`，包含请求、响应、token ids、logprobs | token-level RL、policy gradient、需要 loss mask 的训练 |
-| Pure-text transcript capture | `agent.settings.capture_mode="transcript"`；可配合订阅登录或其他不走 proxy 的 harness | `agent_transcript` trajectory，来自 `logs/agent/step.xx.stdout.log` | skill/memory/agent-system evolution、行为回放、非 token-level 评估 |
+| Pure-text transcript capture | `agent.settings.capture_mode="transcript"`；可配合订阅登录或其他不走 proxy 的 harness | `agent_transcript` trajectory，来自 Core 私有 log authority 下的 `logs/agent/step.xx.stdout.log` | skill/memory/agent-system evolution、行为回放、非 token-level 评估 |
 
 纯文本 transcript capture 是显式选项，而不是某个 harness 的隐式行为。Gateway
 只有在 `agent.settings.capture_mode="transcript"` 或等价 transcript capture mode
@@ -150,6 +150,14 @@ literal `capture_mode="transcript"`、exact managed runtime profile/image、Dock
 执行，并显式 unset proxy 相关环境变量。其他订阅式 harness 也应遵守同样边界：订阅负责
 auth，transcript capture 负责 evolution 可消费的行为记录。
 
+`managed_science` 的 runtime binding 不以 subscription 为条件。无论 execution mode 是
+subscription 还是 self-deployed，Experiment config、`RuntimeSpec`、Core launcher 和 Gateway
+admission 都要求 Docker、profile 对应的 exact canonical image 和 host user，并拒绝 custom
+runtime loader/options。所有 prepare/eval-prepare upload target 在 runtime 创建前必须是
+`/openevo/session` 下的 canonical absolute path；实际 bind copy 从 held session-root FD 逐级
+`openat`/no-follow，拒绝 symlink、special file、hard-linked leaf 和并发 ancestor replacement。
+Evolution context 的临时源位于 agent 不可挂载的 Core 临时目录，不在 session bind 中 staging。
+
 Codex subscription 的 `HOME`、`PATH` 和 `CODEX_HOME` 都由 Core 固定，agent、runtime
 和 action env 不能覆盖；Codex 使用镜像内固定绝对路径启动，不能被 workspace `PATH`
 shadow。Gateway 仅在 runtime prepare 完成后，才从绝对 filesystem anchor 逐组件固定并
@@ -160,8 +168,12 @@ regular、link-count-one、size/digest/identity 校验的 auth staging 到 sessi
 Subscription post-run 先结束所有仍可访问 credential 的进程，并按 `docker create` 返回的
 container ID 执行 remove + absence inspect。只有 absence proof 成功、最终 fd-relative
 递归 scan 复核每层 pathname/inode binding 后，Core 才构造 transcript trajectory 和
-`SessionResult`；结果发布前还会递归执行一次内存脱敏。失败时 private cleanup journal
-保留 runtime/container/session/credential identities，startup/shutdown reconciliation
+`SessionResult`。Core 自己的 step stdout/stderr 不写入 agent 可写 session bind，而是在
+unmounted node-private log authority 中通过 exclusive `0600` regular inode 有界写入、无覆盖
+发布，并用同一 held-root authority 做最终 verified read；预置 symlink/FIFO/socket 不会被打开。
+执行 deadline 耗尽后，transcript byte recovery/build 使用独立有界 finalization budget，保留
+timeout/cancel 前已经捕获的输出和原终态。结果发布前还会递归执行一次内存脱敏。失败时
+private cleanup journal 保留 runtime/container/session/log/credential identities，startup/shutdown reconciliation
 逐项重试，不会因一个 cancel/stop failure 跳过其他 ownership。
 
 ## 主要模块

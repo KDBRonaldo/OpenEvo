@@ -12,12 +12,19 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from openevo.runtime.base import RuntimePathSecurityError
 from openevo.runtime.docker import DockerRuntime
 from openevo.runtime.managed import MANAGED_CODEX_HOME
 from openevo.runtime.models import RuntimeSpec
 
 
 _REAL_DOCKER_IMAGE = "python:3.12-slim-bookworm"
+
+
+def _real_docker_unavailable(reason: str) -> None:
+    if os.environ.get("OPENEVO_REQUIRE_REAL_DOCKER") == "1":
+        pytest.fail(reason)
+    pytest.skip(reason)
 
 
 @pytest.fixture(autouse=True)
@@ -40,6 +47,51 @@ def _write_mock_cidfile(
     cidfile = Path(args[args.index("--cidfile") + 1])
     cidfile.write_text(container_id + "\n", encoding="ascii")
     cidfile.chmod(mode)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["upload", "download"])
+async def test_bind_copy_security_failure_never_falls_back_to_docker_cp(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+) -> None:
+    runtime = DockerRuntime(
+        RuntimeSpec(image="runtime:latest"),
+        "secure-copy-session",
+        tmp_path,
+    )
+    run_command = AsyncMock()
+    monkeypatch.setattr(runtime, "_run_local_command", run_command)
+    if operation == "upload":
+        monkeypatch.setattr(
+            runtime,
+            "_copy_to_bind_mount",
+            lambda *args: (_ for _ in ()).throw(
+                RuntimePathSecurityError("unsafe bind target")
+            ),
+        )
+        operation_call = runtime.upload_file(
+            str(tmp_path / "source.txt"),
+            "/openevo/session/target.txt",
+        )
+    else:
+        monkeypatch.setattr(
+            runtime,
+            "_copy_from_bind_mount",
+            lambda *args: (_ for _ in ()).throw(
+                RuntimePathSecurityError("unsafe bind source")
+            ),
+        )
+        operation_call = runtime.download_file(
+            "/openevo/session/source.txt",
+            str(tmp_path / "target.txt"),
+        )
+
+    with pytest.raises(RuntimePathSecurityError, match="unsafe bind"):
+        await operation_call
+
+    run_command.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -969,7 +1021,7 @@ async def test_real_docker_name_collision_preserves_running_external_container(
     tmp_path: Path,
 ) -> None:
     if shutil.which("docker") is None:
-        pytest.skip("docker CLI is unavailable")
+        _real_docker_unavailable("docker CLI is unavailable")
     info = subprocess.run(
         ["docker", "info", "--format", "{{.ServerVersion}}"],
         check=False,
@@ -977,7 +1029,7 @@ async def test_real_docker_name_collision_preserves_running_external_container(
         text=True,
     )
     if info.returncode != 0:
-        pytest.skip("docker daemon is unavailable")
+        _real_docker_unavailable("docker daemon is unavailable")
     image = subprocess.run(
         ["docker", "image", "inspect", _REAL_DOCKER_IMAGE],
         check=False,
@@ -985,7 +1037,9 @@ async def test_real_docker_name_collision_preserves_running_external_container(
         text=True,
     )
     if image.returncode != 0:
-        pytest.skip(f"required local probe image is unavailable: {_REAL_DOCKER_IMAGE}")
+        _real_docker_unavailable(
+            f"required local probe image is unavailable: {_REAL_DOCKER_IMAGE}"
+        )
 
     session_id = f"collision-{uuid.uuid4().hex[:16]}"
     container_name = f"openevo-{session_id}"
@@ -1037,7 +1091,7 @@ async def test_real_docker_cancel_after_cidfile_is_recoverably_owned(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     if shutil.which("docker") is None:
-        pytest.skip("docker CLI is unavailable")
+        _real_docker_unavailable("docker CLI is unavailable")
     info = subprocess.run(
         ["docker", "info", "--format", "{{.ServerVersion}}"],
         check=False,
@@ -1045,7 +1099,7 @@ async def test_real_docker_cancel_after_cidfile_is_recoverably_owned(
         text=True,
     )
     if info.returncode != 0:
-        pytest.skip("docker daemon is unavailable")
+        _real_docker_unavailable("docker daemon is unavailable")
     image = subprocess.run(
         ["docker", "image", "inspect", _REAL_DOCKER_IMAGE],
         check=False,
@@ -1053,7 +1107,9 @@ async def test_real_docker_cancel_after_cidfile_is_recoverably_owned(
         text=True,
     )
     if image.returncode != 0:
-        pytest.skip(f"required local probe image is unavailable: {_REAL_DOCKER_IMAGE}")
+        _real_docker_unavailable(
+            f"required local probe image is unavailable: {_REAL_DOCKER_IMAGE}"
+        )
 
     session_dir = tmp_path / "session"
     session_dir.mkdir()

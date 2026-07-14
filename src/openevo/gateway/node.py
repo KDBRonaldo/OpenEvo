@@ -13,7 +13,7 @@ import shutil
 import stat
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from tempfile import mkdtemp
+from tempfile import TemporaryDirectory, mkdtemp
 from typing import Any
 from urllib.parse import unquote, urlparse
 
@@ -32,10 +32,12 @@ from openevo.gateway.session_files import (
     SessionFileSecurityError,
     VerifiedSessionTranscript,
     capture_session_root_identity,
+    create_session_log_authority,
     read_verified_session_transcript,
     redact_session_capture_tree,
     remove_session_tree,
     stage_codex_subscription_auth,
+    write_verified_session_log,
 )
 from openevo.gateway.storage import SessionStore
 from openevo.harness.capture import transcript_capture_enabled
@@ -51,12 +53,17 @@ from openevo.rollout.models import (
     SessionStatus,
 )
 from openevo.rollout.timer import StageTimer
-from openevo.runtime.base import BaseRuntime
+from openevo.runtime.base import (
+    BaseRuntime,
+    RuntimePathSecurityError,
+    validate_session_bind_path,
+)
 from openevo.runtime.factory import create_runtime
 from openevo.runtime.docker import DockerRuntime
 from openevo.runtime.managed import (
     MANAGED_SUBSCRIPTION_ENV,
     reject_managed_subscription_env,
+    require_managed_runtime_binding,
     require_managed_subscription_runtime,
 )
 from openevo.runtime.models import ExecInput, RuntimeSpec
@@ -77,6 +84,7 @@ logger = logging.getLogger(__name__)
 
 _SAFE_SKILL_NAME_RE = re.compile(r"[^A-Za-z0-9_.-]+")
 _SUBSCRIPTION_AUTH_MODES = {"subscription", "chatgpt_subscription"}
+_FINALIZATION_BUDGET_SECONDS = 10.0
 
 
 class GatewayExecutionTimeout(TimeoutError):
@@ -90,6 +98,8 @@ class CleanupRetryOwnership:
     session_id: str
     session_dir: Path
     session_root_identity: tuple[int, int, int] | None
+    log_authority_dir: Path | None
+    log_authority_identity: tuple[int, int, int] | None
     credential_dir: Path | None
     credential_root_identity: tuple[int, int, int] | None
     runtime_id: str | None
@@ -109,55 +119,64 @@ async def write_evolution_context_files(
     host_dir: Path,
     target_dir: str,
 ) -> dict[str, str]:
-    evolution_dir = host_dir / ".openevo/evolution_upload"
-    if evolution_dir.exists():
-        shutil.rmtree(evolution_dir)
-    skills_dir = evolution_dir / "skills"
-    agent_system_targets_dir = evolution_dir / "agent_system_targets"
-    skills_dir.mkdir(parents=True, exist_ok=True)
-    agent_system_targets_dir.mkdir(parents=True, exist_ok=True)
-    context_path = evolution_dir / "context.json"
-    memory_path = evolution_dir / "memory.md"
-    agent_system_path = evolution_dir / "agent_system.md"
-    adapters_path = evolution_dir / "adapters.json"
+    del host_dir  # Staging must stay outside the agent-writable session bind.
+    with TemporaryDirectory(prefix="openevo-evolution-upload-") as temporary:
+        evolution_dir = Path(temporary)
+        skills_dir = evolution_dir / "skills"
+        agent_system_targets_dir = evolution_dir / "agent_system_targets"
+        skills_dir.mkdir(mode=0o700)
+        agent_system_targets_dir.mkdir(mode=0o700)
+        context_path = evolution_dir / "context.json"
+        memory_path = evolution_dir / "memory.md"
+        agent_system_path = evolution_dir / "agent_system.md"
+        adapters_path = evolution_dir / "adapters.json"
 
-    _stage_evolution_skill_bundles(context, skills_dir)
-    agent_system_text = _agent_system_rendered_text(context)
-    agent_system_env: dict[str, str] = {}
-    if agent_system_text:
-        agent_system_env["OPENEVO_AGENT_SYSTEM_FILE"] = f"{target_dir}/agent_system.md"
-        agent_system_env.update(
-            await _stage_evolution_agent_system(
-                runtime=runtime,
-                context=context,
-                targets_dir=agent_system_targets_dir,
-                rendered=agent_system_text,
+        _stage_evolution_skill_bundles(context, skills_dir)
+        agent_system_text = _agent_system_rendered_text(context)
+        agent_system_env: dict[str, str] = {}
+        if agent_system_text:
+            agent_system_env["OPENEVO_AGENT_SYSTEM_FILE"] = (
+                f"{target_dir}/agent_system.md"
             )
+            agent_system_env.update(
+                await _stage_evolution_agent_system(
+                    runtime=runtime,
+                    context=context,
+                    targets_dir=agent_system_targets_dir,
+                    rendered=agent_system_text,
+                )
+            )
+
+        context_path.write_text(
+            json.dumps(context, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        memory_path.write_text(
+            str((context.get("memory") or {}).get("rendered_text") or ""),
+            encoding="utf-8",
+        )
+        agent_system_path.write_text(
+            agent_system_text,
+            encoding="utf-8",
+        )
+        adapters_path.write_text(
+            json.dumps(
+                context.get("adapter_merge_spec") or {},
+                indent=2,
+                sort_keys=True,
+            ),
+            encoding="utf-8",
         )
 
-    context_path.write_text(
-        json.dumps(context, indent=2, sort_keys=True),
-        encoding="utf-8",
-    )
-    memory_path.write_text(
-        str((context.get("memory") or {}).get("rendered_text") or ""),
-        encoding="utf-8",
-    )
-    agent_system_path.write_text(
-        agent_system_text,
-        encoding="utf-8",
-    )
-    adapters_path.write_text(
-        json.dumps(context.get("adapter_merge_spec") or {}, indent=2, sort_keys=True),
-        encoding="utf-8",
-    )
-
-    await runtime.upload_file(str(context_path), f"{target_dir}/context.json")
-    await runtime.upload_file(str(memory_path), f"{target_dir}/memory.md")
-    if agent_system_text:
-        await runtime.upload_file(str(agent_system_path), f"{target_dir}/agent_system.md")
-    await runtime.upload_file(str(adapters_path), f"{target_dir}/adapters.json")
-    await runtime.upload_dir(str(skills_dir), f"{target_dir}/skills")
+        await runtime.upload_file(str(context_path), f"{target_dir}/context.json")
+        await runtime.upload_file(str(memory_path), f"{target_dir}/memory.md")
+        if agent_system_text:
+            await runtime.upload_file(
+                str(agent_system_path),
+                f"{target_dir}/agent_system.md",
+            )
+        await runtime.upload_file(str(adapters_path), f"{target_dir}/adapters.json")
+        await runtime.upload_dir(str(skills_dir), f"{target_dir}/skills")
 
     env = {
         "OPENEVO_EVOLUTION_CONTEXT": f"{target_dir}/context.json",
@@ -484,6 +503,9 @@ class GatewayNodeManager:
         self._docker_ownership_root = (
             cleanup_base / ".openevo-gateway-docker-ownership" / node_key
         )
+        self._log_authority_root = (
+            cleanup_base / ".openevo-gateway-log-authority" / node_key
+        )
 
     async def start(self) -> None:
         await DockerRuntime.recover_ownership_root(self._docker_ownership_root)
@@ -599,6 +621,8 @@ class GatewayNodeManager:
 
         session_dir: Path | None = None
         session_root_identity: tuple[int, int, int] | None = None
+        log_authority_dir: Path | None = None
+        log_authority_identity: tuple[int, int, int] | None = None
         try:
             info = self.session_registry.register(
                 session_id,
@@ -624,17 +648,24 @@ class GatewayNodeManager:
             )
             artifacts_dir = session_dir / "artifacts"
             artifacts_dir.mkdir()
-            (session_dir / "logs" / "agent").mkdir(parents=True, exist_ok=True)
             session_root_identity = capture_session_root_identity(session_dir)
-            await self._dispatcher.enqueue(
-                ManagedSession(
-                    request=request,
-                    timer=timer,
-                    session_dir=session_dir,
-                    artifacts_dir=artifacts_dir,
-                    session_root_identity=session_root_identity,
+            log_authority_dir, log_authority_identity = (
+                create_session_log_authority(
+                    self._log_authority_root,
+                    session_id,
                 )
             )
+            managed = ManagedSession(
+                request=request,
+                timer=timer,
+                session_dir=session_dir,
+                artifacts_dir=artifacts_dir,
+                session_root_identity=session_root_identity,
+                log_authority_dir=log_authority_dir,
+                log_authority_identity=log_authority_identity,
+            )
+            self._persist_cleanup_ownership(self._cleanup_ownership_for(managed))
+            await self._dispatcher.enqueue(managed)
         except Exception:
             self.storage.delete_session(session_id)
             self.session_registry.remove(session_id)
@@ -644,6 +675,13 @@ class GatewayNodeManager:
                     session_id,
                     session_root_identity,
                 )
+            if log_authority_dir is not None:
+                await self._remove_log_authority_best_effort(
+                    log_authority_dir,
+                    session_id,
+                    log_authority_identity,
+                )
+            self._clear_cleanup_ownership(session_id)
             raise
 
     async def cancel(self, session_id: str) -> bool:
@@ -677,6 +715,7 @@ class GatewayNodeManager:
         try:
             runtime_spec = self._resolve_runtime_spec(request)
             self._validate_subscription_admission(request, runtime_spec, managed.session_dir)
+            self._validate_runtime_admission(runtime_spec, managed)
             if _is_codex_subscription_agent(request.agent):
                 runtime_spec = runtime_spec.model_copy(
                     update={
@@ -697,6 +736,9 @@ class GatewayNodeManager:
                 managed.credential_root_identity = capture_session_root_identity(
                     credential_dir
                 )
+                self._persist_cleanup_ownership(
+                    self._cleanup_ownership_for(managed)
+                )
             if managed.credential_dir is None:
                 runtime = create_runtime(
                     runtime_spec,
@@ -714,10 +756,7 @@ class GatewayNodeManager:
                 )
             managed.runtime = runtime
             await self._await_with_budget(runtime.start(), managed)
-            if _is_codex_subscription_agent(request.agent):
-                self._persist_cleanup_ownership(
-                    self._cleanup_ownership_for(managed)
-                )
+            self._persist_cleanup_ownership(self._cleanup_ownership_for(managed))
             # Run ordered prepare actions
             await self._run_runtime_prepare(runtime, runtime_spec, request, managed)
             if managed.credential_dir is not None:
@@ -754,6 +793,63 @@ class GatewayNodeManager:
                 "node has no default_runtime"
             )
         return spec
+
+    @staticmethod
+    def _validate_runtime_admission(
+        runtime_spec: RuntimeSpec,
+        managed: ManagedSession,
+    ) -> None:
+        try:
+            is_managed = require_managed_runtime_binding(
+                profile=runtime_spec.profile,
+                image=runtime_spec.image,
+                backend=runtime_spec.backend,
+                container_user=runtime_spec.container_user,
+            )
+            if is_managed and (
+                runtime_spec.import_path is not None or runtime_spec.kwargs
+            ):
+                raise ValueError(
+                    "Core-managed runtime profiles forbid custom runtime loaders "
+                    "and options"
+                )
+        except ValueError as exc:
+            raise RuntimeError(f"runtime admission failed: {exc}") from exc
+
+        try:
+            root_state = managed.session_dir.stat(follow_symlinks=False)
+            expected = managed.session_root_identity
+            if expected is not None and (
+                root_state.st_dev,
+                root_state.st_ino,
+                root_state.st_uid,
+            ) != expected:
+                raise RuntimePathSecurityError("session root identity changed")
+            full_identity = (
+                root_state.st_dev,
+                root_state.st_ino,
+                root_state.st_mode,
+                root_state.st_uid,
+            )
+            for action in [
+                *runtime_spec.prepare,
+                *(runtime_spec.eval_prepare or []),
+            ]:
+                if action.type not in {"upload_file", "upload_dir"}:
+                    continue
+                if action.target is None:
+                    raise RuntimePathSecurityError("prepare target is missing")
+                resolved = validate_session_bind_path(
+                    managed.session_dir,
+                    action.target,
+                    expected_identity=full_identity,
+                )
+                if resolved is None:
+                    raise RuntimePathSecurityError(
+                        "prepare target is outside the session authority"
+                    )
+        except (OSError, RuntimePathSecurityError) as exc:
+            raise RuntimeError(f"runtime prepare target admission failed: {exc}") from exc
 
     def _stage_codex_subscription_auth(
         self,
@@ -842,10 +938,41 @@ class GatewayNodeManager:
     @staticmethod
     def _redact_session_captures(managed: ManagedSession) -> None:
         redactor = managed.credential_redactor
-        identity = managed.session_root_identity
-        if redactor is None or identity is None:
+        if redactor is None:
             return
-        redact_session_capture_tree(managed.session_dir, identity, redactor)
+        roots = [
+            (managed.session_dir, managed.session_root_identity),
+            (managed.log_authority_dir, managed.log_authority_identity),
+        ]
+        for root, identity in roots:
+            if root is not None and identity is not None:
+                redact_session_capture_tree(root, identity, redactor)
+
+    def _ensure_log_authority(self, managed: ManagedSession) -> Path:
+        if (
+            managed.log_authority_dir is not None
+            and managed.log_authority_identity is not None
+        ):
+            return managed.log_authority_dir
+        if (
+            managed.log_authority_dir is not None
+            or managed.log_authority_identity is not None
+        ):
+            raise SessionFileSecurityError("session log authority is incomplete")
+        authority_root = getattr(self, "_log_authority_root", None)
+        if authority_root is None:
+            authority_root = (
+                managed.session_dir.parent
+                / ".openevo-gateway-log-authority-direct"
+            )
+        (
+            managed.log_authority_dir,
+            managed.log_authority_identity,
+        ) = create_session_log_authority(
+            authority_root,
+            managed.session_id,
+        )
+        return managed.log_authority_dir
 
     async def _run_runtime_prepare(
         self,
@@ -876,14 +1003,12 @@ class GatewayNodeManager:
                     env=merged_env,
                     timeout_sec=self._remaining_budget(managed),
                 )
-                log_dir = managed.session_dir / "logs"
-                log_dir.mkdir(parents=True, exist_ok=True)
-                self._write_exec_log(
-                    log_dir,
+                await self._write_exec_log(
+                    managed,
+                    ("logs",),
                     f"{log_prefix}.{i:02d}",
                     result.stdout,
                     result.stderr,
-                    managed.credential_redactor,
                 )
                 if result.return_code == -1:
                     raise RuntimeError(f"{log_prefix} action {i} timed out")
@@ -926,21 +1051,30 @@ class GatewayNodeManager:
             steps = harness.run_steps(request.instruction)
             env = self._runtime_env(request, managed, include_agent_env=True)
             agent_result = await self._run_exec_inputs(runtime, steps, env, managed)
+            managed.agent_result = agent_result
 
             # Postprocess always runs so harnesses can collect artifacts from
             # failed or timed-out agent runs before post-run evaluation.
             await self._await_with_budget(harness.postprocess(runtime, agent_result), managed)
             self._redact_session_captures(managed)
-            managed.agent_result = agent_result
 
         except GatewayExecutionTimeout as exc:
             # Don't set final_result — let _handle_postrun build a partial
             # trajectory from the completions captured so far.
-            managed.agent_result = AgentRunResult(
-                status="timeout",
-                return_code=-1,
-                error=str(exc),
-            )
+            if managed.agent_result is None:
+                managed.agent_result = AgentRunResult(
+                    status="timeout",
+                    return_code=-1,
+                    error=str(exc),
+                )
+            else:
+                managed.agent_result = managed.agent_result.model_copy(
+                    update={
+                        "status": "timeout",
+                        "return_code": -1,
+                        "error": managed.agent_result.error or str(exc),
+                    }
+                )
         except Exception as exc:
             if managed.cancel_requested:
                 logger.info("Agent execution cancelled for session %s", request.session_id)
@@ -1060,8 +1194,7 @@ class GatewayNodeManager:
         managed: ManagedSession,
     ) -> AgentRunResult:
         """Execute a list of ExecInput steps and return an AgentRunResult."""
-        log_dir = managed.session_dir / "logs" / "agent"
-        log_dir.mkdir(parents=True, exist_ok=True)
+        log_dir = self._ensure_log_authority(managed) / "logs" / "agent"
 
         for i, step in enumerate(steps):
             if managed.cancel_requested:
@@ -1073,12 +1206,12 @@ class GatewayNodeManager:
                 env=merged_env,
                 timeout_sec=self._remaining_budget(managed),
             )
-            self._write_exec_log(
-                log_dir,
+            await self._write_exec_log(
+                managed,
+                ("logs", "agent"),
                 f"step.{i:02d}",
                 result.stdout,
                 result.stderr,
-                managed.credential_redactor,
             )
             if result.return_code == -1:
                 return AgentRunResult(
@@ -1216,9 +1349,15 @@ class GatewayNodeManager:
         managed.timer.mark("postrun", "started")
         try:
             if result is None:
+                if managed.agent_result is not None:
+                    result = await self._build_session_result(managed)
                 if managed.cancel_requested:
-                    result = self._cancelled_result(request, managed.timer)
-                else:
+                    result = self._terminal_result_from_base(
+                        result or self._cancelled_result(request, managed.timer),
+                        SessionStatus.ERROR,
+                        "session cancelled",
+                    )
+                elif result is None:
                     result = await self._build_session_result(managed)
         except GatewayExecutionTimeout as exc:
             result = self._timeout_result(request, managed.timer, str(exc))
@@ -1280,6 +1419,9 @@ class GatewayNodeManager:
                 roots_removed = await self._remove_owned_roots(managed)
                 if not roots_removed:
                     self._register_cleanup_retry(managed)
+                else:
+                    self._cleanup_retries.pop(request.session_id, None)
+                    self._clear_cleanup_ownership(request.session_id)
             else:
                 self._register_cleanup_retry(managed)
                 logger.error(
@@ -1338,23 +1480,33 @@ class GatewayNodeManager:
     ) -> None:
         request = managed.request
         try:
+            self._start_finalization_deadline(managed)
             self._redact_session_captures(managed)
             if result is None:
+                if managed.agent_result is not None:
+                    result = await self._build_session_result(managed)
                 if managed.cancel_requested:
-                    result = self._cancelled_result(request, managed.timer)
+                    error = "session cancelled"
+                    result = self._terminal_result_from_base(
+                        result or self._cancelled_result(request, managed.timer),
+                        SessionStatus.ERROR,
+                        error,
+                    )
                 elif managed.pending_status == SessionStatus.TIMEOUT:
-                    result = self._timeout_result(
-                        request,
-                        managed.timer,
-                        managed.pending_error or "session execution timeout",
+                    error = managed.pending_error or "session execution timeout"
+                    result = self._terminal_result_from_base(
+                        result or self._timeout_result(request, managed.timer, error),
+                        SessionStatus.TIMEOUT,
+                        error,
                     )
                 elif managed.pending_status == SessionStatus.ERROR:
-                    result = self._error_result(
-                        request,
-                        managed.timer,
-                        managed.pending_error or "session execution failed",
+                    error = managed.pending_error or "session execution failed"
+                    result = self._terminal_result_from_base(
+                        result or self._error_result(request, managed.timer, error),
+                        SessionStatus.ERROR,
+                        error,
                     )
-                else:
+                elif result is None:
                     result = await self._build_session_result(managed)
         except Exception as exc:
             logger.exception(
@@ -1414,28 +1566,47 @@ class GatewayNodeManager:
         managed.timer.mark("build", "started")
         try:
             verified_transcript: VerifiedSessionTranscript | None = None
-            verified_subscription_capture = _is_codex_subscription_agent(
-                request.agent
-            ) and transcript_capture_enabled(request.agent.settings.get("capture_mode"))
-            allow_transcript_path_open = not verified_subscription_capture
+            runtime_spec = (
+                managed.runtime.spec
+                if managed.runtime is not None
+                else request.runtime
+            )
+            verified_authority_capture = transcript_capture_enabled(
+                request.agent.settings.get("capture_mode")
+            ) and (
+                _is_codex_subscription_agent(request.agent)
+                or (runtime_spec is not None and runtime_spec.profile is not None)
+            )
+            allow_transcript_path_open = not verified_authority_capture
+            await_build = (
+                self._await_with_finalization_budget
+                if verified_authority_capture
+                else self._await_with_budget
+            )
             if not allow_transcript_path_open:
-                if managed.session_root_identity is None:
-                    raise RuntimeError("subscription transcript requires a pinned session root")
+                if (
+                    managed.log_authority_dir is None
+                    or managed.log_authority_identity is None
+                ):
+                    raise RuntimeError(
+                        "managed transcript requires a pinned log authority"
+                    )
                 step_index = _transcript_step_index(agent_result)
                 if step_index is not None:
-                    verified_transcript = await self._await_with_budget(
+                    verified_transcript = await await_build(
                         asyncio.to_thread(
                             read_verified_session_transcript,
-                            managed.session_dir,
-                            managed.session_root_identity,
+                            managed.log_authority_dir,
+                            managed.log_authority_identity,
                             step_index=step_index,
+                            require_private_root=True,
                         ),
                         managed,
                     )
             initial_agent_result = (
                 agent_result if request.builder.strategy == "agent_transcript" else None
             )
-            trajectory = await self._await_with_budget(
+            trajectory = await await_build(
                 asyncio.to_thread(
                     self._build_trajectory,
                     request,
@@ -1450,7 +1621,7 @@ class GatewayNodeManager:
                 agent_result,
                 trajectory,
             ):
-                trajectory = await self._await_with_budget(
+                trajectory = await await_build(
                     asyncio.to_thread(
                         self._build_trajectory,
                         request,
@@ -1535,7 +1706,7 @@ class GatewayNodeManager:
         ):
             if not isinstance(builder, AgentTranscriptBuilder):
                 raise RuntimeError(
-                    "subscription transcript requires the built-in verified-byte builder"
+                    "managed transcript requires the built-in verified-byte builder"
                 )
             result = builder.build_verified_transcript(
                 completion_session,
@@ -1721,21 +1892,30 @@ class GatewayNodeManager:
             **credential_env,
         }
 
-    @staticmethod
-    def _write_exec_log(
-        log_dir: Path,
+    async def _write_exec_log(
+        self,
+        managed: ManagedSession,
+        directory_parts: tuple[str, ...],
         prefix: str,
         stdout: str | None,
         stderr: str | None,
-        redactor: CredentialRedactor | None = None,
     ) -> None:
-        if stdout:
-            (log_dir / f"{prefix}.stdout.log").write_text(
-                redactor.redact(stdout) if redactor is not None else stdout
-            )
-        if stderr:
-            (log_dir / f"{prefix}.stderr.log").write_text(
-                redactor.redact(stderr) if redactor is not None else stderr
+        authority_dir = self._ensure_log_authority(managed)
+        identity = managed.log_authority_identity
+        if identity is None:
+            raise SessionFileSecurityError("session log authority is not pinned")
+        redactor = managed.credential_redactor
+        for stream_name, value in (("stdout", stdout), ("stderr", stderr)):
+            if not value:
+                continue
+            rendered = redactor.redact(value) if redactor is not None else value
+            await asyncio.to_thread(
+                write_verified_session_log,
+                authority_dir,
+                identity,
+                directory_parts=directory_parts,
+                leaf_name=f"{prefix}.{stream_name}.log",
+                content=rendered,
             )
 
     @staticmethod
@@ -1828,6 +2008,19 @@ class GatewayNodeManager:
     ) -> SessionResult:
         return self._error_result(request, timer, "session cancelled")
 
+    @staticmethod
+    def _terminal_result_from_base(
+        result: SessionResult,
+        status: SessionStatus,
+        error: str,
+    ) -> SessionResult:
+        trajectory = result.trajectory.model_copy(
+            update={"status": status, "error": error}
+        )
+        return result.model_copy(
+            update={"status": status, "trajectory": trajectory, "error": error}
+        )
+
     async def _push_result(self, callback_url: str | None, result: SessionResult) -> bool:
         """POST the terminal result to the rollout server. Return True on success."""
         if not callback_url:
@@ -1878,6 +2071,26 @@ class GatewayNodeManager:
         except asyncio.TimeoutError as exc:
             raise GatewayExecutionTimeout("session execution timeout") from exc
 
+    async def _await_with_finalization_budget(
+        self,
+        awaitable,
+        managed: ManagedSession,
+    ):
+        self._start_finalization_deadline(managed)
+        deadline = managed.finalization_deadline
+        assert deadline is not None
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            if asyncio.iscoroutine(awaitable):
+                awaitable.close()
+            raise GatewayExecutionTimeout("session transcript finalization timeout")
+        try:
+            return await asyncio.wait_for(awaitable, timeout=remaining)
+        except asyncio.TimeoutError as exc:
+            raise GatewayExecutionTimeout(
+                "session transcript finalization timeout"
+            ) from exc
+
     @staticmethod
     def _start_execution_deadline(managed: ManagedSession) -> None:
         if managed.execution_deadline is not None:
@@ -1886,11 +2099,17 @@ class GatewayNodeManager:
             asyncio.get_running_loop().time() + managed.request.remaining_timeout_seconds
         )
 
+    @staticmethod
+    def _start_finalization_deadline(managed: ManagedSession) -> None:
+        if managed.finalization_deadline is not None:
+            return
+        managed.finalization_deadline = (
+            asyncio.get_running_loop().time() + _FINALIZATION_BUDGET_SECONDS
+        )
+
     async def _run_postrun_steps(self, managed: ManagedSession) -> None:
         if not managed.postrun_steps or managed.runtime is None:
             return
-        log_dir = managed.session_dir / "logs" / "teardown"
-        log_dir.mkdir(parents=True, exist_ok=True)
         env = self._runtime_env(managed.request, managed, include_agent_env=True)
         for i, step in enumerate(managed.postrun_steps):
             try:
@@ -1901,12 +2120,12 @@ class GatewayNodeManager:
                     env=merged_env,
                     timeout_sec=self._remaining_budget(managed),
                 )
-                self._write_exec_log(
-                    log_dir,
+                await self._write_exec_log(
+                    managed,
+                    ("logs", "teardown"),
                     f"step.{i:02d}",
                     result.stdout,
                     result.stderr,
-                    managed.credential_redactor,
                 )
             except Exception:
                 logger.debug(
@@ -1976,6 +2195,14 @@ class GatewayNodeManager:
                     managed.credential_root_identity,
                 )
             )
+        if managed.log_authority_dir is not None:
+            tasks.append(
+                self._remove_log_authority_best_effort(
+                    managed.log_authority_dir,
+                    managed.session_id,
+                    managed.log_authority_identity,
+                )
+            )
         outcomes = await asyncio.gather(*tasks, return_exceptions=True)
         return all(outcome is not False and not isinstance(outcome, BaseException) for outcome in outcomes)
 
@@ -2010,6 +2237,8 @@ class GatewayNodeManager:
             session_id=managed.session_id,
             session_dir=managed.session_dir,
             session_root_identity=managed.session_root_identity,
+            log_authority_dir=managed.log_authority_dir,
+            log_authority_identity=managed.log_authority_identity,
             credential_dir=managed.credential_dir,
             credential_root_identity=managed.credential_root_identity,
             runtime_id=(str(getattr(runtime, "runtime_id", "")) or None),
@@ -2035,7 +2264,7 @@ class GatewayNodeManager:
         journal_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         journal_dir.chmod(0o700)
         payload = {
-            "version": 1,
+            "version": 2,
             "session_id": ownership.session_id,
             "runtime": {
                 "runtime_id": ownership.runtime_id,
@@ -2049,6 +2278,14 @@ class GatewayNodeManager:
                 "path": str(ownership.session_dir),
                 "identity": list(ownership.session_root_identity or ()),
             },
+            "log_root": (
+                None
+                if ownership.log_authority_dir is None
+                else {
+                    "path": str(ownership.log_authority_dir),
+                    "identity": list(ownership.log_authority_identity or ()),
+                }
+            ),
             "credential_root": (
                 None
                 if ownership.credential_dir is None
@@ -2143,16 +2380,22 @@ class GatewayNodeManager:
         payload: object,
         path: Path,
     ) -> CleanupRetryOwnership:
-        if not isinstance(payload, dict) or set(payload) != {
+        if not isinstance(payload, dict):
+            raise ValueError("cleanup ownership payload is not closed")
+        version = payload.get("version")
+        expected_keys = {
             "version",
             "session_id",
             "runtime",
             "eval_runtime",
             "session_root",
             "credential_root",
-        }:
+        }
+        if version == 2:
+            expected_keys.add("log_root")
+        if set(payload) != expected_keys:
             raise ValueError("cleanup ownership payload is not closed")
-        if payload["version"] != 1 or not isinstance(payload["session_id"], str):
+        if version not in {1, 2} or not isinstance(payload["session_id"], str):
             raise ValueError("cleanup ownership identity is invalid")
         session_id = payload["session_id"]
         expected_name = f"{hashlib.sha256(session_id.encode('utf-8')).hexdigest()}.json"
@@ -2190,6 +2433,12 @@ class GatewayNodeManager:
         runtime_id, container_id = runtime_identity(payload["runtime"])
         eval_runtime_id, eval_container_id = runtime_identity(payload["eval_runtime"])
         session_dir, session_identity = root_identity(payload["session_root"])
+        log_payload = payload.get("log_root")
+        if log_payload is None:
+            log_authority_dir = None
+            log_authority_identity = None
+        else:
+            log_authority_dir, log_authority_identity = root_identity(log_payload)
         credential_payload = payload["credential_root"]
         if credential_payload is None:
             credential_dir = None
@@ -2200,6 +2449,8 @@ class GatewayNodeManager:
             session_id=session_id,
             session_dir=session_dir,
             session_root_identity=session_identity,
+            log_authority_dir=log_authority_dir,
+            log_authority_identity=log_authority_identity,
             credential_dir=credential_dir,
             credential_root_identity=credential_identity,
             runtime_id=runtime_id,
@@ -2307,6 +2558,14 @@ class GatewayNodeManager:
                         ownership.credential_root_identity,
                     )
                 )
+            if ownership.log_authority_dir is not None:
+                root_tasks.append(
+                    self._remove_log_authority_best_effort(
+                        ownership.log_authority_dir,
+                        session_id,
+                        ownership.log_authority_identity,
+                    )
+                )
             root_outcomes = await asyncio.gather(
                 *root_tasks,
                 return_exceptions=True,
@@ -2379,6 +2638,40 @@ class GatewayNodeManager:
         except Exception:
             logger.warning(
                 "Failed to remove credential directory for session %s",
+                session_id,
+                exc_info=True,
+            )
+            return False
+
+    async def _remove_log_authority_best_effort(
+        self,
+        log_authority_dir: Path,
+        session_id: str,
+        log_authority_identity: tuple[int, int, int] | None = None,
+    ) -> bool:
+        try:
+            identity = log_authority_identity or capture_session_root_identity(
+                log_authority_dir
+            )
+            await asyncio.to_thread(
+                remove_session_tree,
+                log_authority_dir,
+                identity,
+            )
+            for parent in (
+                log_authority_dir.parent,
+                log_authority_dir.parent.parent,
+            ):
+                try:
+                    parent.rmdir()
+                except OSError:
+                    break
+            return True
+        except FileNotFoundError:
+            return True
+        except Exception:
+            logger.warning(
+                "Failed to remove log authority for session %s",
                 session_id,
                 exc_info=True,
             )
