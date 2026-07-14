@@ -90,12 +90,14 @@ ETag and `If-Match`.
 
 List routes use `limit` (maximum 100), `after`, `sort`, and `direction`, and
 return `{items, next_cursor, has_more}`. A cursor is bound to the filters and
-sort order. Invalid cursors return 400; expired cursors return 410.
+sort order. `has_more` is true if and only if `next_cursor` is non-null. Invalid
+cursors return 400; expired cursors return 410.
 
-SSE event frames include an SSE `id`, a versioned event name, and a closed
-`EventEnvelopeV1`. Providers support `Last-Event-ID`, at-least-once delivery,
-15-second heartbeats, and bounded replay. An expired event cursor returns 410;
-the renderer reloads snapshots before subscribing again.
+Core SSE uses closed `SseFrameV1` objects whose wire `id` and versioned `event`
+must exactly match `data.id` and `data.event` in the typed `EventEnvelopeV1`.
+Providers support `Last-Event-ID`, at-least-once delivery, 15-second heartbeats,
+and bounded replay. An expired event cursor returns 410; the renderer reloads
+snapshots before subscribing again.
 
 ## Desktop Local API v1
 
@@ -322,6 +324,7 @@ GET    /v1/services/{service_id}
 POST   /v1/services/{service_id}/restart
 GET    /v1/services/{service_id}/logs
 GET    /v1/operations/{operation_id}
+POST   /v1/operations/{operation_id}/cancel
 GET    /v1/logs/{logs_ref}
 POST   /v1/diagnostics
 GET    /v1/diagnostics/{diagnostic_id}
@@ -339,6 +342,10 @@ losslessly from Desktop's user-owned `hf_model`; it is not an ID in a managed
 model table. Project, model-service doctor checks, and inference services report
 that reference as `unresolved`, `downloading`, `ready`, or `failed`, including a
 typed error and observation time where applicable.
+Download progress is either wholly unknown or reports both downloaded and total
+bytes. `unresolved` carries no progress, `downloading` carries incomplete known
+progress, and known progress on `ready` must satisfy downloaded bytes equal total
+bytes. `failed` alone carries the typed error and may preserve paired progress.
 
 Project create, patch, and detail carry a closed `TaskSpecV1` with only title
 and objective. There is no task `content_ref`: a caller cannot provide a
@@ -357,13 +364,20 @@ contains only its archive SHA-256, byte size, entry count, extracted size, and
 frozen format declaration. It never contains a caller-authored Core content ID.
 Workspace handoff uses a Core-owned upload session bound to the exact project
 snapshot and project ETag observed at creation. Desktop transfers canonical
-base64 chunks at explicit bounded offsets. Finalization requires both the
-upload `If-Match` and `If-Project-Match`; Core atomically compares both mutable
-resources, verifies the archive, issues the first `ContentRefV1` and workspace
-snapshot, signs a new project snapshot, and returns the finalized upload plus
-the updated `ProjectV1`. A stale upload cannot overwrite a later project
-workspace declaration. No workspace request accepts a host path, URI, command,
-or setup script.
+base64 chunks at explicit bounded offsets. A chunk is accepted only when its
+offset equals the session's current `accepted_offset`, and `offset + byte_length`
+must not exceed 16 GiB; sparse, overlapping, and out-of-order writes fail.
+Finalization requires both the upload `If-Match` and `If-Project-Match`. The body
+contains only `content_sha256`; it does not repeat project CAS identity. Provider
+conformance requires `If-Project-Match == upload.project_etag == current
+project.etag` and requires `upload.project_snapshot` still to equal the current
+project snapshot. Core atomically compares both mutable resources, verifies the
+archive, and publishes one `WorkspacePublicationV1` binding the exact archive
+declaration, first `ContentRefV1`, and workspace snapshot. The finalized upload
+and updated `ProjectV1` persist that same publication, the project receives a new
+snapshot, and its successful ETag must differ from `upload.project_etag`. A stale
+upload cannot overwrite a later project workspace declaration. No workspace
+request accepts a host path, URI, command, or setup script.
 
 `workspace.kind=scratch` is closed during project creation: Core atomically
 creates and returns an immutable empty workspace snapshot, so scratch never
@@ -412,6 +426,9 @@ Core owns readiness and atomic activation. Mutable Core resources use strong
 ETags of the exact form `"<lowercase-sha256>"`, and the same type is used for
 `If-Match`. Read and action responses expose the ETag required by every
 conditional mutation.
+A cancelled revision has exactly a `cancelled` transition, and a cancelled
+transition cannot be attached to a queued, preparing, active, or failed revision;
+the terminal revision and transition states cannot disagree.
 
 `RunCreateV1` references Core-owned immutable project, task, and workspace
 snapshot objects, an expected capability registry digest, and a required
@@ -429,9 +446,12 @@ The run state machine is
 additional transient `cancelling` state. A queued run includes a closed reason
 with code, user-safe summary, and optional retry delay;
 `required_revision_uncommitted` means the requested next session cannot start
-yet. A run that has not passed admission has a null `pinned_revision`; Core must
-not copy the required revision into that field. A cancellation before admission
-may also remain unpinned. `required_revision` always preserves the complete
+yet. `admitted_at` records the admission boundary. Before admission both it and
+`pinned_revision` are null; Core must not copy the required revision into the pin.
+After admission both are non-null, and `preparing`, `running`, `cancelling`, and
+every post-admission terminal response retain the exact pin. A cancellation
+before admission remains unpinned. A zero-attempt run waiting on a successor may
+therefore remain queued with both values null. `required_revision` always preserves the complete
 revision, reachable-head ID, and `active|successor` relation. An active required
 revision has no successor transition, so `revision_transition` is null; a
 successor relation requires a transition whose full predecessor and successor
@@ -458,10 +478,12 @@ document-preview shape for every artifact type: at most 128 documents and 2 MiB
 of aggregate UTF-8 text, with authoritative totals and truncation state. Diff
 uses bounded structured hunks and lines instead of an unbounded unified-text
 blob.
-Each diff identifies both artifacts and their content digests. Every hunk also
-binds old and new document IDs, safe relative paths, document content digests,
-and the corresponding artifact/content identity; a hunk cannot cross-wire
-documents from another artifact version.
+Each diff identifies both artifacts and their content digests and contains a
+closed `added|removed|modified|renamed` document-change union. Empty documents
+may be added or removed with zero hunks. Every returned hunk repeats the
+applicable old and/or new document ID, safe relative path, document content
+digest, and corresponding artifact/content identity; a hunk cannot drop or
+cross-wire its document identity.
 
 Timeline and log records preserve remote sequence, attempt, and service
 identity. Service and diagnostic resources report authoritative status, typed
@@ -477,12 +499,18 @@ target. Global scopes forbid project/run IDs, project scope requires exactly a
 project ID, and run scope requires both project and run IDs. Providers still
 verify that the run belongs to the project.
 
-Environment repair is synchronous HTTP 200 in v1. Service restart and cache
-cleanup return HTTP 202 with one `OperationV1`; it is recoverable through
-`GET /v1/operations/{operation_id}`, carries a strong ETag and logs reference,
-and emits `operation.updated.v1`. Runs and diagnostics remain their own
-recoverable 202 resources. Any bounded `logs_ref` from an error, check, or
-operation is readable through paginated `GET /v1/logs/{logs_ref}`.
+Environment repair, service restart, and cache cleanup return HTTP 202 with one
+`OperationV1`. The resource is recoverable through
+`GET /v1/operations/{operation_id}`, binds a typed original request and successful
+result, carries a strong ETag and logs reference, and emits
+`operation.updated.v1`. Its descriptor fixes whether the kind is cancellable.
+`environment_repair` is cancellable and may move through
+`cancelling -> cancelled`; cancel uses `If-Match` plus `Idempotency-Key`.
+Service restart and cache cleanup are non-cancellable in v1, and cancel returns
+typed `409 operation_kind_not_cancellable` rather than implying best-effort
+cancellation. Runs and diagnostics remain their own recoverable 202 resources.
+Any bounded `logs_ref` from an error, check, or operation is readable through
+paginated `GET /v1/logs/{logs_ref}`.
 
 Core SSE adds artifact, log, operation, successor-transition, and
 revision-activated events. Every non-heartbeat event carries a replay-stable
@@ -490,7 +518,10 @@ change ID, exactly one authoritative resource ETag or content digest, and the
 applicable parent resource type/ID. Per-event validators bind those values to
 the typed payload; an event cannot cross-wire a project, run, service, artifact,
 revision, diagnostic, operation, timeline entry, or log entry.
-`Last-Event-ID` remains opaque;
+The SSE frame ID identifies a concrete stream record and is the replay cursor;
+duplicate delivery preserves it. `change_id` identifies one logical mutation and
+remains stable if that mutation is retried, replayed, or emitted in a later stream
+record with a different frame ID. `Last-Event-ID` remains opaque;
 delivery is at least once with a 10,000-event bounded replay window, and an
 expired cursor returns HTTP 410 so Desktop reloads snapshots before resuming.
 

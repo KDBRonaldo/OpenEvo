@@ -12,25 +12,34 @@ from openevo.backend.contracts.v1.app import create_core_control_contract_app
 from openevo.backend.contracts.v1.models import (
     ArtifactContentV1,
     ArtifactDiffV1,
+    ArtifactPageV1,
     CapabilitiesResponseV1,
     DiagnosticsRequestV1,
     EnvironmentCheckV1,
     EventEnvelopeV1,
     ExecutionMode,
     ImmutableSnapshotRefV1,
+    LogPageV1,
     OperationV1,
+    ModelPreparationV1,
     ParametricMemoryArtifactSummaryV1,
     ProjectCreateV1,
+    ProjectPageV1,
     ProjectSpecV1,
     ProjectV1,
     ReachableRequiredRevisionRefV1,
     RevisionV1,
+    RevisionPageV1,
     RevisionTransitionState,
     RunCreateV1,
     RunContextV1,
+    RunPageV1,
     RunSummaryV1,
+    RunTimelinePageV1,
     RunV1,
+    SseFrameV1,
     ServiceSummaryV1,
+    ServicePageV1,
     StrongETag,
     TaskSpecV1,
     WorkspaceArchiveDeclarationV1,
@@ -90,6 +99,7 @@ EXPECTED_OPERATIONS = {
     ("POST", "/v1/services/{service_id}/restart"),
     ("GET", "/v1/services/{service_id}/logs"),
     ("GET", "/v1/operations/{operation_id}"),
+    ("POST", "/v1/operations/{operation_id}/cancel"),
     ("GET", "/v1/logs/{logs_ref}"),
     ("POST", "/v1/diagnostics"),
     ("GET", "/v1/diagnostics/{diagnostic_id}"),
@@ -224,6 +234,7 @@ def _valid_run_summary() -> dict[str, Any]:
         "revision_transition": _transition(),
         "created_at": "2026-07-14T00:00:00Z",
         "updated_at": "2026-07-14T00:00:04Z",
+        "admitted_at": None,
         "started_at": None,
         "finished_at": None,
         "etag": '"' + "e" * 64 + '"',
@@ -276,7 +287,7 @@ def test_openapi_snapshot_is_exactly_rebuildable() -> None:
     rebuilt = canonical_json_bytes(build_openapi_document())
     assert OPENAPI_SNAPSHOT_PATH.read_bytes() == rebuilt
     assert hashlib.sha256(rebuilt).hexdigest() == openapi_sha256()
-    assert openapi_sha256() == ("6ebb4df8d2d80d39c343e2f4db540584fbe95da06d4d05b8bcf028091aeb978f")
+    assert openapi_sha256() == ("4d7dcbe2f0829c101a290677819c74123c8a02cc09dba5a9f8813faeb4ec8c3c")
 
 
 def test_event_schema_snapshot_is_exactly_rebuildable() -> None:
@@ -284,7 +295,7 @@ def test_event_schema_snapshot_is_exactly_rebuildable() -> None:
     assert EVENTS_SCHEMA_SNAPSHOT_PATH.read_bytes() == rebuilt
     assert hashlib.sha256(rebuilt).hexdigest() == events_schema_sha256()
     assert events_schema_sha256() == (
-        "9c698ac990bac7d82c03516777b89a59ad2f3a3832fa1a11281fd57fcd5bb20e"
+        "6c496833d3903be4f2960d1c701e28838178fa4cea1528185fd0873624ae4c4c"
     )
 
 
@@ -640,11 +651,15 @@ def test_workspace_finalize_closes_upload_and_project_cas() -> None:
     )
     assert project_match["schema"]["pattern"] == r'^"[0-9a-f]{64}"$'
     assert project_match["required"] is True
+    assert "upload.project_etag" in project_match["description"]
+    assert "upload.project_snapshot" in project_match["description"]
     assert _response_schema_name(finalize) == "WorkspaceUploadFinalizeResponseV1"
+    finalize_request = openapi["components"]["schemas"]["WorkspaceUploadFinalizeV1"]
+    assert set(finalize_request["properties"]) == {"schema_version", "content_sha256"}
     response_schema = openapi["components"]["schemas"][
         "WorkspaceUploadFinalizeResponseV1"
     ]
-    assert {"project", "upload", "content_ref", "workspace_snapshot"} <= set(
+    assert {"project", "upload", "publication"} <= set(
         response_schema["properties"]
     )
     assert WorkspaceUploadFinalizeResponseV1 is not None
@@ -654,6 +669,12 @@ def test_workspace_finalize_closes_upload_and_project_cas() -> None:
         "content_id": "content-1",
         "sha256": "c" * 64,
         "byte_size": 2560,
+    }
+    publication = {
+        "archive": _workspace_archive(),
+        "content_ref": content_ref,
+        "workspace_snapshot": workspace_snapshot,
+        "published_at": "2026-07-14T00:00:02Z",
     }
     upload = {
         "schema_version": "1",
@@ -665,8 +686,7 @@ def test_workspace_finalize_closes_upload_and_project_cas() -> None:
         "project_etag": '"' + "a" * 64 + '"',
         "archive": _workspace_archive(),
         "base_workspace_snapshot": None,
-        "content_ref": content_ref,
-        "workspace_snapshot": workspace_snapshot,
+        "publication": publication,
         "created_at": "2026-07-14T00:00:00Z",
         "updated_at": "2026-07-14T00:00:02Z",
         "etag": '"' + "b" * 64 + '"',
@@ -681,6 +701,7 @@ def test_workspace_finalize_closes_upload_and_project_cas() -> None:
         "current_project_snapshot": _snapshot_ref("project", "project-snapshot-2", "4"),
         "current_task_snapshot": _snapshot_ref("task", "task-snapshot-1", "2"),
         "current_workspace_snapshot": workspace_snapshot,
+        "workspace_publication": publication,
         "active_revision": None,
         "registry_digest": None,
         "model_preparation": {
@@ -712,8 +733,7 @@ def test_workspace_finalize_closes_upload_and_project_cas() -> None:
         "schema_version": "1",
         "project_id": "project-1",
         "upload": upload,
-        "content_ref": content_ref,
-        "workspace_snapshot": workspace_snapshot,
+        "publication": publication,
         "project": project,
     }
     assert _json_model(WorkspaceUploadFinalizeResponseV1, response).project.etag == project[
@@ -724,6 +744,18 @@ def test_workspace_finalize_closes_upload_and_project_cas() -> None:
     stale["project"]["current_project_snapshot"] = upload["project_snapshot"]
     with pytest.raises(ValidationError, match="new project snapshot"):
         _json_model(WorkspaceUploadFinalizeResponseV1, stale)
+
+    unchanged_etag = json.loads(json.dumps(response))
+    unchanged_etag["project"]["etag"] = upload["project_etag"]
+    with pytest.raises(ValidationError, match="new project ETag"):
+        _json_model(WorkspaceUploadFinalizeResponseV1, unchanged_etag)
+
+    split_publication = json.loads(json.dumps(response))
+    split_publication["project"]["workspace_publication"]["content_ref"]["content_id"] = (
+        "content-other"
+    )
+    with pytest.raises(ValidationError, match="publication"):
+        _json_model(WorkspaceUploadFinalizeResponseV1, split_publication)
 
 
 def test_revision_transition_includes_model_serving_preparation() -> None:
@@ -763,6 +795,40 @@ def test_openapi_object_models_are_closed_and_collections_are_bounded() -> None:
             stack.extend((f"{path}/{key}", item) for key, item in value.items())
         elif isinstance(value, list):
             stack.extend((f"{path}/{index}", item) for index, item in enumerate(value))
+
+
+@pytest.mark.parametrize(
+    "page_model",
+    [
+        ProjectPageV1,
+        RevisionPageV1,
+        RunPageV1,
+        RunTimelinePageV1,
+        LogPageV1,
+        ArtifactPageV1,
+        ServicePageV1,
+    ],
+)
+def test_every_page_has_more_iff_next_cursor_is_present(page_model: type[Any]) -> None:
+    assert _json_model(
+        page_model,
+        {"schema_version": "1", "items": [], "next_cursor": None, "has_more": False},
+    ).has_more is False
+    assert _json_model(
+        page_model,
+        {"schema_version": "1", "items": [], "next_cursor": "next", "has_more": True},
+    ).has_more is True
+    for next_cursor, has_more in ((None, True), ("next", False)):
+        with pytest.raises(ValidationError, match="if and only if"):
+            _json_model(
+                page_model,
+                {
+                    "schema_version": "1",
+                    "items": [],
+                    "next_cursor": next_cursor,
+                    "has_more": has_more,
+                },
+            )
 
 
 @pytest.mark.parametrize(
@@ -830,6 +896,7 @@ def test_run_state_shape_enforces_queue_and_terminal_invariants() -> None:
             "current_attempt_id": "attempt-1",
             "attempt_count": 1,
             "pinned_revision": _revision_ref(),
+            "admitted_at": "2026-07-14T00:00:01Z",
             "started_at": "2026-07-14T00:00:01Z",
         }
     )
@@ -875,6 +942,7 @@ def test_run_list_shape_contains_current_attempt_error_and_transition() -> None:
         "current_error",
         "required_revision",
         "pinned_revision",
+        "admitted_at",
         "revision_transition",
         "updated_at",
         "etag",
@@ -906,6 +974,7 @@ def test_run_detail_closes_attempt_order_status_and_revision_identity() -> None:
             },
             "attempt_count": 2,
             "pinned_revision": _revision_ref(),
+            "admitted_at": "2026-07-14T00:00:01Z",
             "started_at": "2026-07-14T00:00:01Z",
             "attempts": [
                 {
@@ -957,13 +1026,36 @@ def test_revision_resource_binds_nested_transition_identity() -> None:
         _json_model(RevisionV1, mismatched)
 
 
+def test_cancelled_revision_requires_cancelled_transition() -> None:
+    cancelled = _revision()
+    cancelled.update({"status": "cancelled", "activated_at": None})
+    cancelled["transition"].update(
+        {
+            "state": "cancelled",
+            "progress_completed": 4,
+            "message": "The successor transition was cancelled.",
+        }
+    )
+    assert _json_model(RevisionV1, cancelled).transition.state.value == "cancelled"
+
+    still_preparing = json.loads(json.dumps(cancelled))
+    still_preparing["transition"]["state"] = "materializing"
+    with pytest.raises(ValidationError, match="cancelled transition"):
+        _json_model(RevisionV1, still_preparing)
+
+    wrong_revision = _revision()
+    wrong_revision["transition"]["state"] = "cancelled"
+    with pytest.raises(ValidationError, match="only a cancelled revision"):
+        _json_model(RevisionV1, wrong_revision)
+
+
 def test_queued_run_and_context_never_fabricate_a_pinned_revision() -> None:
     run = _json_model(RunSummaryV1, _valid_run_summary())
     assert run.pinned_revision is None
 
     fabricated = _valid_run_summary()
     fabricated["pinned_revision"] = _revision_ref()
-    with pytest.raises(ValidationError, match="queued run"):
+    with pytest.raises(ValidationError, match="admitted_at"):
         _json_model(RunSummaryV1, fabricated)
 
     context = {
@@ -977,6 +1069,39 @@ def test_queued_run_and_context_never_fabricate_a_pinned_revision() -> None:
     context.pop("id")
     parsed = _json_model(RunContextV1, context)
     assert parsed.pinned_revision is None
+
+
+def test_admitted_terminal_run_and_context_retain_pin() -> None:
+    cancelled = _valid_run_summary()
+    cancelled.update(
+        {
+            "status": "cancelled",
+            "queued_reason": None,
+            "admitted_at": "2026-07-14T00:00:01Z",
+            "pinned_revision": _revision_ref(),
+            "finished_at": "2026-07-14T00:00:02Z",
+        }
+    )
+    cancelled["revision_transition"].update(
+        {"state": "active", "progress_completed": 6, "progress_total": 6}
+    )
+    parsed = _json_model(RunSummaryV1, cancelled)
+    assert parsed.pinned_revision == parsed.required_revision.revision
+
+    missing_pin = {**cancelled, "pinned_revision": None}
+    with pytest.raises(ValidationError, match="admitted_at"):
+        _json_model(RunSummaryV1, missing_pin)
+
+    context = {
+        "schema_version": "1",
+        **cancelled,
+        "run_id": "run-1",
+        "token_level_metrics_available": False,
+        "artifacts": [],
+        "adapters": [],
+    }
+    context.pop("id")
+    assert _json_model(RunContextV1, context).pinned_revision is not None
 
 
 def test_unknown_sse_fields_and_event_names_are_rejected() -> None:
@@ -998,6 +1123,39 @@ def test_unknown_sse_fields_and_event_names_are_rejected() -> None:
     event["event"] = "run.created.v1"
     with pytest.raises(ValidationError):
         EventEnvelopeV1.model_validate_json(json.dumps(event))
+
+
+def test_sse_wire_frame_binds_id_event_and_stable_change_identity() -> None:
+    data = {
+        "schema_version": "1",
+        "id": "event-1",
+        "sequence": 1,
+        "occurred_at": "2026-07-14T00:00:00Z",
+        "event": "run.updated.v1",
+        "change": {
+            "change_id": "change-1",
+            "resource_type": "run",
+            "resource_id": "run-1",
+            "parent_resource_type": "project",
+            "parent_resource_id": "project-1",
+            "resource_etag": _valid_run_summary()["etag"],
+            "content_sha256": None,
+        },
+        "payload": _valid_run_summary(),
+    }
+    frame = {"id": "event-1", "event": "run.updated.v1", "data": data}
+    assert _json_model(SseFrameV1, frame).data.root.change.change_id == "change-1"
+
+    reemitted = json.loads(json.dumps(frame))
+    reemitted["id"] = "event-2"
+    reemitted["data"]["id"] = "event-2"
+    reemitted["data"]["sequence"] = 2
+    assert _json_model(SseFrameV1, reemitted).data.root.change.change_id == "change-1"
+
+    mismatched = json.loads(json.dumps(frame))
+    mismatched["event"] = "project.updated.v1"
+    with pytest.raises(ValidationError, match="wire id and event"):
+        _json_model(SseFrameV1, mismatched)
 
 
 def test_parametric_memory_is_typed_but_cannot_be_release_enabled() -> None:
@@ -1039,14 +1197,14 @@ def test_parametric_memory_is_typed_but_cannot_be_release_enabled() -> None:
         _json_model(ParametricMemoryArtifactSummaryV1, artifact)
 
 
-def test_sse_openapi_response_uses_the_standalone_envelope_schema() -> None:
+def test_sse_openapi_response_uses_the_frozen_wire_frame_schema() -> None:
     openapi = build_openapi_document()
     operation = openapi["paths"]["/v1/events"]["get"]
     assert operation["x-sse-delivery"] == "at-least-once"
     assert operation["x-sse-heartbeat-seconds"] == 15
     assert operation["x-sse-replay"] == "bounded"
     assert operation["responses"]["200"]["content"] == {
-        "text/event-stream": {"schema": {"$ref": "#/components/schemas/EventEnvelopeV1"}}
+        "text/event-stream": {"schema": {"$ref": "#/components/schemas/SseFrameV1"}}
     }
     assert operation["x-sse-replay-max-events"] == 10_000
 
@@ -1072,6 +1230,11 @@ def test_workspace_upload_chunks_are_bounded_and_content_addressed() -> None:
     schema = build_openapi_document()["components"]["schemas"]["WorkspaceUploadChunkV1"]
     assert schema["properties"]["byte_length"]["maximum"] == 8 * 1024 * 1024
     assert schema["properties"]["offset"]["maximum"] == 16 * 1024 * 1024 * 1024
+    assert "accepted_offset" in schema["properties"]["offset"]["description"]
+
+    beyond_end = {**payload, "offset": 16 * 1024 * 1024 * 1024}
+    with pytest.raises(ValidationError, match="16 GiB"):
+        _json_model(WorkspaceUploadChunkV1, beyond_end)
 
 
 def test_artifact_content_is_one_bounded_document_preview_shape() -> None:
@@ -1108,58 +1271,132 @@ def test_artifact_content_is_one_bounded_document_preview_shape() -> None:
 
 
 def test_artifact_diff_is_bounded_structured_data() -> None:
+    old_document = {
+        "artifact_id": "artifact-1",
+        "artifact_content_sha256": "1" * 64,
+        "document_id": "doc-1",
+        "relative_path": "memory.md",
+        "content_sha256": "a" * 64,
+    }
+    new_document = {
+        "artifact_id": "artifact-2",
+        "artifact_content_sha256": "2" * 64,
+        "document_id": "doc-2",
+        "relative_path": "memory.md",
+        "content_sha256": "b" * 64,
+    }
     payload = {
         "schema_version": "1",
         "artifact_id": "artifact-2",
         "artifact_content_sha256": "2" * 64,
         "previous_artifact_id": "artifact-1",
         "previous_artifact_content_sha256": "1" * 64,
-        "hunks": [
+        "document_changes": [
             {
-                "old_document": {
-                    "artifact_id": "artifact-1",
-                    "artifact_content_sha256": "1" * 64,
-                    "document_id": "doc-1",
-                    "relative_path": "memory.md",
-                    "content_sha256": "a" * 64,
-                },
-                "new_document": {
-                    "artifact_id": "artifact-2",
-                    "artifact_content_sha256": "2" * 64,
-                    "document_id": "doc-2",
-                    "relative_path": "memory.md",
-                    "content_sha256": "b" * 64,
-                },
-                "old_start": 1,
-                "old_count": 1,
-                "new_start": 1,
-                "new_count": 1,
-                "lines": [
+                "kind": "modified",
+                "old_document": old_document,
+                "new_document": new_document,
+                "hunks": [
                     {
-                        "kind": "context",
-                        "old_line_number": 1,
-                        "new_line_number": 1,
-                        "text": "unchanged",
+                        "old_document": old_document,
+                        "new_document": new_document,
+                        "old_start": 1,
+                        "old_count": 1,
+                        "new_start": 1,
+                        "new_count": 1,
+                        "lines": [
+                            {
+                                "kind": "context",
+                                "old_line_number": 1,
+                                "new_line_number": 1,
+                                "text": "unchanged",
+                            }
+                        ],
                     }
                 ],
             }
         ],
+        "total_document_changes": 1,
         "total_hunks": 1,
         "total_lines": 1,
         "truncated": False,
     }
     diff = _json_model(ArtifactDiffV1, payload)
-    assert diff.hunks[0].lines[0].kind.value == "context"
+    assert diff.document_changes[0].hunks[0].lines[0].kind.value == "context"
 
     wrong_side = json.loads(json.dumps(payload))
-    wrong_side["hunks"][0]["old_document"]["artifact_id"] = "artifact-2"
+    wrong_side["document_changes"][0]["old_document"]["artifact_id"] = "artifact-2"
+    wrong_side["document_changes"][0]["hunks"][0]["old_document"]["artifact_id"] = (
+        "artifact-2"
+    )
     with pytest.raises(ValidationError, match="old document"):
         _json_model(ArtifactDiffV1, wrong_side)
 
     unsafe_path = json.loads(json.dumps(payload))
-    unsafe_path["hunks"][0]["new_document"]["relative_path"] = "../secret"
+    unsafe_path["document_changes"][0]["new_document"]["relative_path"] = "../secret"
     with pytest.raises(ValidationError, match="unsafe path"):
         _json_model(ArtifactDiffV1, unsafe_path)
+
+    lost_identity = json.loads(json.dumps(payload))
+    lost_hunk = lost_identity["document_changes"][0]["hunks"][0]
+    lost_hunk.update({"new_document": None, "new_start": 0, "new_count": 0})
+    lost_hunk["lines"] = [
+        {
+            "kind": "removed",
+            "old_line_number": 1,
+            "new_line_number": None,
+            "text": "removed",
+        }
+    ]
+    with pytest.raises(ValidationError, match="document identity"):
+        _json_model(ArtifactDiffV1, lost_identity)
+
+
+def test_artifact_diff_document_change_union_allows_empty_add_and_remove() -> None:
+    empty_digest = hashlib.sha256(b"").hexdigest()
+    old_document = {
+        "artifact_id": "artifact-1",
+        "artifact_content_sha256": "1" * 64,
+        "document_id": "old-empty",
+        "relative_path": "removed.md",
+        "content_sha256": empty_digest,
+    }
+    new_document = {
+        "artifact_id": "artifact-2",
+        "artifact_content_sha256": "2" * 64,
+        "document_id": "new-empty",
+        "relative_path": "added.md",
+        "content_sha256": empty_digest,
+    }
+    payload = {
+        "schema_version": "1",
+        "artifact_id": "artifact-2",
+        "artifact_content_sha256": "2" * 64,
+        "previous_artifact_id": "artifact-1",
+        "previous_artifact_content_sha256": "1" * 64,
+        "document_changes": [
+            {"kind": "removed", "old_document": old_document, "hunks": []},
+            {"kind": "added", "new_document": new_document, "hunks": []},
+        ],
+        "total_document_changes": 2,
+        "total_hunks": 0,
+        "total_lines": 0,
+        "truncated": False,
+    }
+    parsed = _json_model(ArtifactDiffV1, payload)
+    assert [change.kind.value for change in parsed.document_changes] == ["removed", "added"]
+
+    renamed = json.loads(json.dumps(payload))
+    renamed["document_changes"] = [
+        {
+            "kind": "renamed",
+            "old_document": old_document,
+            "new_document": new_document,
+            "hunks": [],
+        }
+    ]
+    renamed["total_document_changes"] = 1
+    assert _json_model(ArtifactDiffV1, renamed).document_changes[0].kind.value == "renamed"
 
 
 def test_model_preparation_is_present_iff_resource_is_model_backed() -> None:
@@ -1210,6 +1447,35 @@ def test_model_preparation_is_present_iff_resource_is_model_backed() -> None:
     check["kind"] = "network"
     with pytest.raises(ValidationError, match="model-service"):
         _json_model(EnvironmentCheckV1, check)
+
+
+def test_model_preparation_progress_is_closed_by_status() -> None:
+    base = {
+        "model_ref": "openai/gpt-oss-20b",
+        "status": "ready",
+        "downloaded_bytes": 100,
+        "total_bytes": 100,
+        "error": None,
+        "updated_at": "2026-07-14T00:00:00Z",
+    }
+    assert _json_model(ModelPreparationV1, base).status.value == "ready"
+
+    incomplete_ready = {**base, "downloaded_bytes": 99}
+    with pytest.raises(ValidationError, match="complete download"):
+        _json_model(ModelPreparationV1, incomplete_ready)
+
+    missing_downloaded = {**base, "downloaded_bytes": None}
+    with pytest.raises(ValidationError, match="appear together"):
+        _json_model(ModelPreparationV1, missing_downloaded)
+
+    downloading = {**base, "status": "downloading", "downloaded_bytes": 99}
+    assert _json_model(ModelPreparationV1, downloading).downloaded_bytes == 99
+    with pytest.raises(ValidationError, match="ready status"):
+        _json_model(ModelPreparationV1, {**downloading, "downloaded_bytes": 100})
+
+    unresolved_progress = {**base, "status": "unresolved"}
+    with pytest.raises(ValidationError, match="unresolved"):
+        _json_model(ModelPreparationV1, unresolved_progress)
 
 
 @pytest.mark.parametrize(
@@ -1430,11 +1696,15 @@ def test_each_sse_event_validator_rejects_a_mismatched_change_resource() -> None
         "schema_version": "1",
         "id": "operation-1",
         "kind": "service_restart",
+        "descriptor": {"kind": "service_restart", "cancellable": False},
         "status": "queued",
-        "service_id": "service-1",
-        "cache_scopes": [],
-        "service": None,
-        "cache_cleanup": None,
+        "request": {
+            "kind": "service_restart",
+            "service_id": "service-1",
+            "request": {"schema_version": "1", "reason": "Recover the service."},
+        },
+        "result": None,
+        "cancellation": None,
         "logs_ref": "logs-1",
         "created_at": "2026-07-14T00:00:00Z",
         "updated_at": "2026-07-14T00:00:00Z",
@@ -1553,9 +1823,10 @@ def _response_schema_name(operation: dict[str, Any]) -> str | None:
     return None
 
 
-def test_async_service_and_cache_actions_are_recoverable_operations() -> None:
+def test_async_core_actions_are_recoverable_operations() -> None:
     openapi = build_openapi_document()
     for method, path in (
+        ("post", "/v1/environment/repair"),
         ("post", "/v1/services/{service_id}/restart"),
         ("post", "/v1/maintenance/cache-cleanup"),
     ):
@@ -1570,6 +1841,113 @@ def test_async_service_and_cache_actions_are_recoverable_operations() -> None:
         "items"
     ]["maxItems"] == 100
     assert OperationV1 is not None
+
+    cancel = openapi["paths"]["/v1/operations/{operation_id}/cancel"]["post"]
+    assert _response_schema_name(cancel) == "OperationV1"
+    assert cancel["responses"]["409"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/OperationCancelConflictV1"
+    }
+    assert {parameter["name"] for parameter in cancel["parameters"]} >= {
+        "If-Match",
+        "Idempotency-Key",
+    }
+
+
+def test_environment_repair_operation_binds_request_result_and_cancellation() -> None:
+    operation = {
+        "schema_version": "1",
+        "id": "operation-1",
+        "kind": "environment_repair",
+        "descriptor": {"kind": "environment_repair", "cancellable": True},
+        "status": "queued",
+        "request": {
+            "kind": "environment_repair",
+            "request": {
+                "schema_version": "1",
+                "execution_mode": "self-deployed",
+                "actions": ["retry_network"],
+            },
+        },
+        "result": None,
+        "cancellation": None,
+        "logs_ref": "logs-1",
+        "created_at": "2026-07-14T00:00:00Z",
+        "updated_at": "2026-07-14T00:00:00Z",
+        "observed_at": "2026-07-14T00:00:00Z",
+        "finished_at": None,
+        "error": None,
+        "etag": '"' + "e" * 64 + '"',
+    }
+    assert _json_model(OperationV1, operation).logs_ref == "logs-1"
+
+    cancelling = json.loads(json.dumps(operation))
+    cancelling.update(
+        {
+            "status": "cancelling",
+            "cancellation": {
+                "reason": "user_requested",
+                "requested_at": "2026-07-14T00:00:01Z",
+            },
+        }
+    )
+    assert _json_model(OperationV1, cancelling).status.value == "cancelling"
+
+    cancelled = json.loads(json.dumps(cancelling))
+    cancelled.update(
+        {"status": "cancelled", "finished_at": "2026-07-14T00:00:02Z"}
+    )
+    assert _json_model(OperationV1, cancelled).status.value == "cancelled"
+
+    succeeded = json.loads(json.dumps(operation))
+    succeeded.update(
+        {
+            "status": "succeeded",
+            "finished_at": "2026-07-14T00:00:02Z",
+            "result": {
+                "kind": "environment_repair",
+                "response": {
+                    "schema_version": "1",
+                    "status": "ok",
+                    "results": [
+                        {
+                            "action": "retry_network",
+                            "status": "ok",
+                            "message": "Network retry completed.",
+                        }
+                    ],
+                    "checked_at": "2026-07-14T00:00:02Z",
+                },
+            },
+        }
+    )
+    assert _json_model(OperationV1, succeeded).result is not None
+
+    mismatched_result = json.loads(json.dumps(succeeded))
+    mismatched_result["result"]["response"]["results"][0]["action"] = (
+        "restart_model_service"
+    )
+    with pytest.raises(ValidationError, match="requested actions"):
+        _json_model(OperationV1, mismatched_result)
+
+    non_cancellable = {
+        **cancelling,
+        "kind": "service_restart",
+        "descriptor": {"kind": "service_restart", "cancellable": False},
+        "request": {
+            "kind": "service_restart",
+            "service_id": "service-1",
+            "request": {"schema_version": "1", "reason": "Recover."},
+        },
+    }
+    with pytest.raises(ValidationError, match="non-cancellable"):
+        _json_model(OperationV1, non_cancellable)
+
+    ambiguous_descriptor = {
+        **operation,
+        "descriptor": {"kind": "environment_repair", "cancellable": False},
+    }
+    with pytest.raises(ValidationError, match="cancellation policy"):
+        _json_model(OperationV1, ambiguous_descriptor)
 
 
 def test_every_202_response_has_a_recoverable_get_resource() -> None:
@@ -1647,6 +2025,7 @@ def test_every_if_match_resource_has_the_same_strict_etag_on_read_or_action() ->
         ("post", "/v1/runs/{run_id}/cancel"),
         ("post", "/v1/runs/{run_id}/retry"),
         ("post", "/v1/services/{service_id}/restart"),
+        ("post", "/v1/operations/{operation_id}/cancel"),
         ("delete", "/v1/diagnostics/{diagnostic_id}"),
     }
     discovered = set()
@@ -1672,7 +2051,7 @@ def test_revision_surface_is_read_only_and_mutation_status_codes_are_exact() -> 
     assert not any("activate" in path or "promote" in path for path in openapi["paths"])
 
     expected = {
-        ("post", "/v1/environment/repair"): "200",
+        ("post", "/v1/environment/repair"): "202",
         ("post", "/v1/projects"): "201",
         ("post", "/v1/projects/{project_id}/workspace-uploads"): "201",
         (
@@ -1687,6 +2066,7 @@ def test_revision_surface_is_read_only_and_mutation_status_codes_are_exact() -> 
         ("post", "/v1/runs/{run_id}/cancel"): "202",
         ("post", "/v1/runs/{run_id}/retry"): "202",
         ("post", "/v1/services/{service_id}/restart"): "202",
+        ("post", "/v1/operations/{operation_id}/cancel"): "202",
         ("post", "/v1/diagnostics"): "202",
     }
     for (method, path), status in expected.items():

@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from .app import create_core_control_contract_app
-from .models import EventEnvelopeV1
+from .models import SseFrameV1
 
 
 CONTRACT_DIRECTORY = Path(__file__).resolve().parent
@@ -44,9 +44,9 @@ def build_openapi_document() -> dict[str, Any]:
 
 
 def build_events_schema_document() -> dict[str, Any]:
-    """Rebuild the standalone closed schema for SSE data envelopes."""
+    """Rebuild the standalone closed schema for SSE wire frames."""
 
-    schema = EventEnvelopeV1.model_json_schema(
+    schema = SseFrameV1.model_json_schema(
         mode="validation",
         ref_template="#/$defs/{model}",
     )
