@@ -76,6 +76,38 @@ provider slice and return a closed `ApiErrorV1` with HTTP 503. They never return
 fixture data or a synthetic ready/success state. A successful SSH check reports
 Core as `offline` with `core_not_started`; it does not claim a live tunnel.
 
+`core_bridge_v1.py` now provides the strict active-project bridge needed by the
+next provider slice. It injects a host-global `CoreHostService`, a tunnel
+factory, an opaque adopted-archive source, and a durable persistence adapter.
+The bridge owns exactly one generation-linearized project tunnel and
+`CoreControlClientV1`; switching or closing seals the previous client before a
+new session can publish. The tunnel factory receives only the profile identity
+and remote Core port, while the bearer remains between the host service and the
+strict client.
+
+Activation negotiates version and verified capabilities, performs an exact
+idempotent Core project create only when no durable mapping exists, publishes a
+native-folder workspace through the bounded chunk protocol, validates the
+authoritative project/head, and persists the host-bound Core mapping. Scratch
+projects use Core's signed initial empty workspace. Imported projects accept
+only `WorkspaceImportRefV1` and a read-only stream from the archive source; the
+bridge contract contains no host path. A lost create response can be retried
+only with the persisted request digest and idempotency key.
+
+Run creation accepts only the active local project ID. The bridge rereads Core
+project snapshots, capabilities, validation, and revision head, chooses a
+reachable nonterminal successor before the active head, and builds Core's
+`RunCreateV1`. Other run, artifact, service, Core operation, log, diagnostic,
+maintenance, and event methods preserve the strict Core DTOs and project
+membership checks.
+
+This module is not yet wired into `DesktopReleaseProvider` or
+`DesktopProviderStore`. The store has no durable Core mapping/create-operation
+schema, and the release app has no production host-service, tunnel-factory, or
+adopted-archive adapter. Consequently the provider routes above intentionally
+remain typed 503 and the release feature flags remain unchanged. Tests use
+fake adapters and `httpx.MockTransport`; those fakes are not a release provider.
+
 ## Provider Extension
 
 `DesktopLocalApiProviderV1.invoke()` receives the canonical OpenAPI
