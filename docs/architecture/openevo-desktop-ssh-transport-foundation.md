@@ -309,7 +309,21 @@ opaque diagnostic ID. It never records raw SSH/rsync
 stdout/stderr, exception text, local paths, or usernames. Command output remains
 available only through the existing restricted result/diagnostic handling path;
 known trust paths are redacted from returned remote-command stderr as defense in
-depth.
+depth. Synchronous SSH and rsync subprocesses incrementally drain both streams
+under one 4 MiB aggregate byte cap. A timeout or cap overflow terminates and
+reaps the process before the existing typed error translation runs. Every such
+subprocess starts a new session whose leader PID is the process-group ID. Error
+and cancellation cleanup keeps the direct child unreaped while that PID fixes
+the group identity, sends `SIGTERM` and then `SIGKILL` to the complete group,
+and only then waits/reaps the direct child. Capture polls the unreaped leader at
+a bounded interval instead of treating pipe EOF as process completion. Once the
+leader exits, inherited descendant pipes receive a 100 ms drain grace; capture
+keeps bytes already delivered, kills the still-pinned process group, closes any
+remaining pipes, and returns the leader's actual exit code. This ordering avoids
+turning a successful or failed leader into a full-operation timeout, prevents
+PID/PGID reuse from redirecting cleanup, treats `ESRCH` as an already-empty
+group, never signals the Desktop process group, and keeps a descendant from
+writing after an error return or trust-lease release.
 
 `env` is injected into the remote command as POSIX assignments:
 
@@ -350,6 +364,42 @@ during preflight or workspace execution.
 The trailing slash semantics intentionally upload the contents of the local
 folder into the prepared remote workspace path.
 
+Each Core bootstrap transfer receives an unpredictable 128-bit transfer ID and
+a unique owner-only `incoming-<bundle>-<transfer>` directory. Prepare, discard,
+and finalize validate that closed authority under the same publication lock;
+concurrent or exact retries never reuse an incoming pathname or inode. Staging
+admits at most 16 live incoming attempts and scans at most 32 staging entries.
+An rsync failure discards its exact authority within the shared operation
+deadline when time remains. Timeout remnants stay private and bounded; later
+locked reconciliation only cleans retired or private publish candidates and
+never mistakes another live incoming attempt for stale state. A candidate left
+sealed at `0500` by a pre-rename crash is rebound by inode, restored privately
+to `0700`, and then cleared; arbitrary or identity-mismatched entries still fail
+closed.
+
+Finalize verifies the exact two-file incoming inventory, then digest-verifies a
+streaming copy into a random private publish candidate that was never disclosed
+to rsync. Candidate members are created as `0400`; only the publisher's already
+open `O_WRONLY` FD can populate them, and it closes every such FD before rename.
+Finalize seals the directory to `0500`, verifies and fsyncs through the
+still-pinned candidate FD, and atomically renames that inode with no-replace. The same FD
+remains open through final pathname/inode verification and issues a receipt for
+the bundle and both member inodes. Only then does finalize retire the incoming
+pathname and attempt bounded cleanup. An already published exact sealed bundle
+remains an idempotent finalize retry.
+
+The returned paths are not standalone authority. The transport retains the
+receipt and wraps the bootstrap command that first consumes both paths. Under
+the same publication lock, the wrapper reopens the final bundle no-follow,
+requires the receipt identities and exact modes/digests, and rewrites both paths
+to `/proc/<wrapper-pid>/fd/<pinned-bundle-fd>`. The wrapper stays alive across
+the bootstrap, so nested consumers that close inherited FDs (including pip)
+still read the pinned directory rather than a same-name replacement. It rechecks
+the pinned members and canonical pathname after the consumer exits. Replacement
+before handoff fails identity verification; replacement during consumption
+cannot redirect reads and makes the wrapper fail closed afterward. A stale rsync
+process or held incoming writer can mutate only an unpublishable retired inode.
+
 ## Limitations
 
 This slice does not include:
@@ -379,6 +429,7 @@ PYTHONPATH=src /home/ziyi/ProRL-Agent-Server/.venv/bin/python -m pytest tests/op
 git diff --check openevo/stable...HEAD
 ```
 
-The host-key and SSH transport tests use only Python, POSIX file APIs available
-on macOS, OpenSSH when present, and `flock`; they do not depend on Linux `/proc`,
-Linux-only namespaces, or GNU command behavior.
+The host-key and general SSH transport tests use Python, POSIX file APIs,
+OpenSSH when present, and `flock`. Core asset consumer handoff is a Linux remote
+contract and additionally requires `/proc/<pid>/fd`; startup fails closed when
+that pinned path cannot be consumed.
