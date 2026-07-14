@@ -94,14 +94,19 @@ replaced root, changed nested entry, or foreign-owned object fails closed.
 
 For subscription sessions, post-run commands finish first, then every
 credential-capable container is removed and proven absent by pinned container
-ID. Only after that proof does Core perform the final scan and construct the
-transcript trajectory or `SessionResult`; the in-memory result is recursively
-redacted again before registry, evolution export, or callback delivery. Docker
-always follows removal with an absence `inspect`, including after successful
-`rm -f`. Failures retain a private cleanup journal containing only runtime,
-container, session-root, and credential-root identities. Startup and shutdown
-reconciliation retry each journal independently, and roots are removed only
-after absence proof.
+ID. Only after that proof does Core perform the final scan. Core then pins the
+full absolute session-root chain, opens the fixed `logs/agent/step.xx.stdout.log`
+components relative to held directory descriptors with `O_NOFOLLOW`, and accepts
+only a session-owner, link-count-one, bounded regular leaf. Root, directory, and
+leaf descriptor and pathname identities are rechecked after the bounded read.
+The verified bytes are passed directly to the transcript builder; the builder
+does not reopen the pathname. The resulting trajectory or `SessionResult` is
+recursively redacted again before registry, evolution export, or callback
+delivery. Docker always follows removal with an absence `inspect`, including
+after successful `rm -f`. Failures retain a private cleanup journal containing
+only runtime, container, session-root, and credential-root identities. Startup
+and shutdown reconciliation retry each journal independently, and roots are
+removed only after absence proof.
 
 ## What it captures
 

@@ -20,6 +20,7 @@ _AUTH_JSON_MAX_NODES: Final[int] = 4096
 _AUTH_JSON_MAX_SECRETS: Final[int] = 512
 _CAPTURE_REDACTION_MAX_BYTES: Final[int] = 4 * 1024 * 1024
 _CAPTURE_REDACTION_MAX_TOTAL_BYTES: Final[int] = 64 * 1024 * 1024
+_TRANSCRIPT_MAX_BYTES: Final[int] = 4 * 1024 * 1024
 _CLEANUP_MAX_DEPTH: Final[int] = 64
 _CLEANUP_MAX_NODES: Final[int] = 100_000
 CAPTURE_REDACTION_LIMIT_MARKER: Final[str] = (
@@ -36,6 +37,14 @@ _PATH_FLAGS: Final[int] = (
 
 class SessionFileSecurityError(RuntimeError):
     """Raised when private session state cannot be handled without a path race."""
+
+
+@dataclass(frozen=True, slots=True)
+class VerifiedSessionTranscript:
+    """Exact transcript bytes read through one pinned session tree."""
+
+    path: Path
+    content: bytes
 
 
 @dataclass(slots=True)
@@ -177,6 +186,128 @@ def capture_session_root_identity(session_dir: Path) -> SessionRootIdentity:
         raise SessionFileSecurityError("session root could not be opened safely") from exc
     finally:
         os.close(parent_fd)
+
+
+def read_verified_session_transcript(
+    session_dir: Path,
+    session_identity: SessionRootIdentity,
+    *,
+    step_index: int,
+    max_bytes: int = _TRANSCRIPT_MAX_BYTES,
+) -> VerifiedSessionTranscript:
+    """Read one fixed agent transcript without reopening any pathname."""
+
+    if not isinstance(step_index, int) or isinstance(step_index, bool) or step_index < 0:
+        raise SessionFileSecurityError("transcript step index is invalid")
+    if max_bytes < 0:
+        raise SessionFileSecurityError("transcript byte limit is invalid")
+    leaf_name = f"step.{step_index:02d}.stdout.log"
+    relative_parts = ("logs", "agent")
+    transcript_path = session_dir.joinpath(*relative_parts, leaf_name)
+    root_pin = _pin_absolute_directory(session_dir)
+    directory_fds: list[int] = []
+    directory_identities: list[tuple[int, int, int, int, int, int, int, int]] = []
+    leaf_fd = -1
+    try:
+        root_pin.verify(label="subscription transcript root")
+        _require_session_identity(os.fstat(root_pin.descriptor), session_identity)
+        root_fd = _open_readable_directory(root_pin.descriptor, label="session root")
+        directory_fds.append(root_fd)
+        directory_identities.append(_auth_identity(os.fstat(root_fd)))
+
+        for part in relative_parts:
+            parent_fd = directory_fds[-1]
+            before = os.stat(part, dir_fd=parent_fd, follow_symlinks=False)
+            if not stat.S_ISDIR(before.st_mode) or before.st_uid != session_identity[2]:
+                raise SessionFileSecurityError(
+                    "subscription transcript ancestor is not an owned directory"
+                )
+            child_fd = os.open(part, _DIRECTORY_FLAGS, dir_fd=parent_fd)
+            opened = os.fstat(child_fd)
+            if _auth_identity(before) != _auth_identity(opened):
+                os.close(child_fd)
+                raise SessionFileSecurityError(
+                    "subscription transcript ancestor changed while it was opened"
+                )
+            directory_fds.append(child_fd)
+            directory_identities.append(_auth_identity(opened))
+
+        leaf_before = os.stat(
+            leaf_name,
+            dir_fd=directory_fds[-1],
+            follow_symlinks=False,
+        )
+        leaf_fd = os.open(
+            leaf_name,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            dir_fd=directory_fds[-1],
+        )
+        leaf_opened = os.fstat(leaf_fd)
+        if _auth_identity(leaf_before) != _auth_identity(leaf_opened):
+            raise SessionFileSecurityError("subscription transcript changed while it was opened")
+        if (
+            not stat.S_ISREG(leaf_opened.st_mode)
+            or leaf_opened.st_uid != session_identity[2]
+            or leaf_opened.st_nlink != 1
+            or leaf_opened.st_size < 0
+            or leaf_opened.st_size > max_bytes
+        ):
+            raise SessionFileSecurityError(
+                "subscription transcript must be an owned, single-link, bounded regular file"
+            )
+
+        remaining = leaf_opened.st_size
+        chunks: list[bytes] = []
+        while remaining:
+            chunk = os.read(leaf_fd, remaining)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        if remaining or os.read(leaf_fd, 1):
+            raise SessionFileSecurityError("subscription transcript changed while it was read")
+
+        leaf_after = os.fstat(leaf_fd)
+        named_leaf_after = os.stat(
+            leaf_name,
+            dir_fd=directory_fds[-1],
+            follow_symlinks=False,
+        )
+        if _auth_identity(leaf_opened) != _auth_identity(leaf_after) or _auth_identity(
+            leaf_opened
+        ) != _auth_identity(named_leaf_after):
+            raise SessionFileSecurityError("subscription transcript changed during verified read")
+
+        for index, (descriptor, expected) in enumerate(zip(directory_fds, directory_identities)):
+            if _auth_identity(os.fstat(descriptor)) != expected:
+                raise SessionFileSecurityError(
+                    "subscription transcript ancestor descriptor changed"
+                )
+            if index:
+                named = os.stat(
+                    relative_parts[index - 1],
+                    dir_fd=directory_fds[index - 1],
+                    follow_symlinks=False,
+                )
+                if _auth_identity(named) != expected:
+                    raise SessionFileSecurityError("subscription transcript ancestor path changed")
+
+        root_pin.verify(label="subscription transcript root")
+        _require_session_identity(os.fstat(root_pin.descriptor), session_identity)
+        return VerifiedSessionTranscript(
+            path=transcript_path,
+            content=b"".join(chunks),
+        )
+    except SessionFileSecurityError:
+        raise
+    except OSError as exc:
+        raise SessionFileSecurityError("subscription transcript could not be read safely") from exc
+    finally:
+        if leaf_fd >= 0:
+            os.close(leaf_fd)
+        while directory_fds:
+            os.close(directory_fds.pop())
+        root_pin.close()
 
 
 def stage_codex_subscription_auth(

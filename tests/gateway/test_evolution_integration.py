@@ -1740,6 +1740,7 @@ async def test_subscription_stdout_and_transcript_redact_auth_canaries(tmp_path)
 @pytest.mark.asyncio
 async def test_codex_subscription_without_proxy_completions_builds_transcript_trajectory(
     tmp_path,
+    monkeypatch,
 ):
     log_dir = tmp_path / "logs" / "agent"
     log_dir.mkdir(parents=True)
@@ -1774,6 +1775,7 @@ async def test_codex_subscription_without_proxy_completions_builds_transcript_tr
         timer=StageTimer(),
         session_dir=tmp_path,
         artifacts_dir=tmp_path / "artifacts",
+        session_root_identity=capture_session_root_identity(tmp_path),
         agent_result=AgentRunResult(
             status="completed",
             return_code=0,
@@ -1781,6 +1783,12 @@ async def test_codex_subscription_without_proxy_completions_builds_transcript_tr
         ),
     )
     managed.execution_deadline = asyncio.get_running_loop().time() + 60
+
+    def reject_path_reopen(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("subscription transcript must not be reopened by pathname")
+
+    monkeypatch.setattr(Path, "read_text", reject_path_reopen)
 
     result = await manager._build_session_result(managed)
 

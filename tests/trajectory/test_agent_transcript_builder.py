@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from pathlib import Path
 
 from openevo.trajectory.builder.agent_transcript import AgentTranscriptBuilder
 from openevo.trajectory.models import CompletionSession
@@ -213,3 +214,36 @@ def test_agent_transcript_builder_rejects_json_log_without_assistant_content(tmp
     assert trajectory.status == "ERROR"
     assert trajectory.error == "no assistant transcript"
     assert trajectory.traces == []
+
+
+def test_agent_transcript_builder_consumes_verified_bytes_without_reopening_path(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    transcript_path = tmp_path / "logs" / "agent" / "step.00.stdout.log"
+    transcript_bytes = json.dumps(
+        {"type": "agent_message", "text": "Built from verified bytes."}
+    ).encode("utf-8")
+    session = CompletionSession(
+        session_id="session_1",
+        metadata={"agent_instruction": "Do work."},
+    )
+
+    def reject_path_reopen(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("verified transcript must not be reopened by pathname")
+
+    monkeypatch.setattr(Path, "read_text", reject_path_reopen)
+
+    trajectory = asyncio.run(
+        AgentTranscriptBuilder().build_verified_transcript(
+            session,
+            transcript_bytes=transcript_bytes,
+            transcript_path=transcript_path,
+        )
+    )
+
+    assert trajectory.status == "COMPLETED"
+    assert trajectory.traces[0].response_messages == [
+        {"role": "assistant", "content": "Built from verified bytes."}
+    ]

@@ -30,7 +30,9 @@ from openevo.gateway.session import SessionRegistry
 from openevo.gateway.session_files import (
     CredentialRedactor,
     SessionFileSecurityError,
+    VerifiedSessionTranscript,
     capture_session_root_identity,
+    read_verified_session_transcript,
     redact_session_capture_tree,
     remove_session_tree,
     stage_codex_subscription_auth,
@@ -66,6 +68,7 @@ from openevo.trajectory.models import (
     Trace,
     Trajectory,
 )
+from openevo.trajectory.builder.agent_transcript import AgentTranscriptBuilder
 from openevo.trajectory.registry import StrategyRegistry
 from openevo.evolution.agent_system import normalize_agent_system_target_path
 from openevo.evolution.client import EvolutionClient
@@ -391,6 +394,15 @@ def _completion_session_with_agent_metadata(
     if agent_result is not None:
         metadata["agent_result"] = agent_result.model_dump(mode="json")
     return completion_session.model_copy(update={"metadata": metadata})
+
+
+def _transcript_step_index(agent_result: AgentRunResult) -> int | None:
+    last_step = agent_result.metadata.get("last_step", 0)
+    try:
+        step_index = int(last_step)
+    except (TypeError, ValueError):
+        return None
+    return step_index if step_index >= 0 else None
 
 
 def _is_codex_subscription_agent(agent) -> bool:
@@ -1388,6 +1400,21 @@ class GatewayNodeManager:
         self.session_registry.set_status(request.session_id, SessionStatus.BUILDING)
         managed.timer.mark("build", "started")
         try:
+            verified_transcript: VerifiedSessionTranscript | None = None
+            verified_subscription_capture = _is_codex_subscription_agent(
+                request.agent
+            ) and transcript_capture_enabled(request.agent.settings.get("capture_mode"))
+            allow_transcript_path_open = not verified_subscription_capture
+            if not allow_transcript_path_open:
+                if managed.session_root_identity is None:
+                    raise RuntimeError("subscription transcript requires a pinned session root")
+                step_index = _transcript_step_index(agent_result)
+                if step_index is not None:
+                    verified_transcript = read_verified_session_transcript(
+                        managed.session_dir,
+                        managed.session_root_identity,
+                        step_index=step_index,
+                    )
             initial_agent_result = (
                 agent_result if request.builder.strategy == "agent_transcript" else None
             )
@@ -1396,6 +1423,8 @@ class GatewayNodeManager:
                     self._build_trajectory,
                     request,
                     agent_result=initial_agent_result,
+                    verified_transcript=verified_transcript,
+                    allow_transcript_path_open=allow_transcript_path_open,
                 ),
                 managed,
             )
@@ -1410,6 +1439,8 @@ class GatewayNodeManager:
                         request,
                         agent_result=agent_result,
                         builder_spec=StrategySpec(strategy="agent_transcript"),
+                        verified_transcript=verified_transcript,
+                        allow_transcript_path_open=allow_transcript_path_open,
                     ),
                     managed,
                 )
@@ -1469,6 +1500,8 @@ class GatewayNodeManager:
         *,
         agent_result: AgentRunResult | None = None,
         builder_spec: StrategySpec | None = None,
+        verified_transcript: VerifiedSessionTranscript | None = None,
+        allow_transcript_path_open: bool = True,
     ) -> Trajectory:
         completion_session = self.storage.load_completion_session(request.session_id)
         effective_builder_spec = builder_spec or request.builder
@@ -1479,7 +1512,25 @@ class GatewayNodeManager:
                 agent_result,
             )
         builder = self.builders.create(effective_builder_spec)
-        result = builder.build(completion_session)
+        if (
+            effective_builder_spec.strategy == "agent_transcript"
+            and not allow_transcript_path_open
+        ):
+            if not isinstance(builder, AgentTranscriptBuilder):
+                raise RuntimeError(
+                    "subscription transcript requires the built-in verified-byte builder"
+                )
+            result = builder.build_verified_transcript(
+                completion_session,
+                transcript_bytes=(
+                    None if verified_transcript is None else verified_transcript.content
+                ),
+                transcript_path=(
+                    None if verified_transcript is None else verified_transcript.path
+                ),
+            )
+        else:
+            result = builder.build(completion_session)
         if asyncio.iscoroutine(result):
             trajectory = asyncio.run(result)
         else:

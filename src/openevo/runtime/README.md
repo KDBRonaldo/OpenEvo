@@ -86,9 +86,14 @@ permissions through stable descriptors, and removes a bounded no-follow tree.
 An owner or identity mismatch fails closed rather than acting on a replacement
 path.
 
-Docker records the immutable container ID returned by `docker create` and uses
-that ID for execution and cleanup. Every stop attempt, including a successful
-`rm -f`, ends with `docker container inspect <id>` and marks the runtime
-destroyed only when the response proves that exact ID absent. Gateway does not
-remove either bind root until that proof succeeds; cleanup ownership remains in
-a private startup/shutdown retry journal otherwise.
+Docker gives each create attempt a Core-private exclusive cidfile outside the
+session bind mount. A failed `docker create` establishes no ownership, so stop
+and cancel perform no operation against the diagnostic container name. A
+successful create becomes usable only after the cidfile and
+`docker container inspect --format {{.Id}} <id>` agree on the immutable ID;
+execution and cleanup use only that ID. Unreadable or unverified successful
+creates retain their ownership files and cleanup/recovery state without guessing
+by name. Every stop attempt revalidates the ID and, after `rm -f`, marks the
+runtime destroyed only when a final inspect proves that exact ID absent. Gateway
+does not remove either bind root until that proof succeeds; cleanup ownership
+remains in a private startup/shutdown retry journal otherwise.

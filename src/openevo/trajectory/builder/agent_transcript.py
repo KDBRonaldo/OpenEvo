@@ -19,39 +19,61 @@ class AgentTranscriptBuilder(BaseTrajectoryBuilder):
             return _error_trajectory(session, "no transcript")
 
         transcript_text = transcript_path.read_text(encoding="utf-8")
-        if not transcript_text.strip():
-            return _error_trajectory(session, "empty transcript", transcript_path)
-        response_text = _response_text_from_transcript(transcript_text)
-        if not response_text:
-            return _error_trajectory(session, "no assistant transcript", transcript_path)
-        trace = Trace(
-            prompt_messages=_prompt_messages(session.metadata),
-            response_messages=(
-                [{"role": "assistant", "content": response_text}] if response_text else []
-            ),
-            finish_reason="transcript",
-            metadata={
-                "capture_mode": "transcript",
-                "token_level_metrics_available": False,
-                "transcript_path": str(transcript_path),
-                "transcript": transcript_text,
-            },
-        )
-        return Trajectory(
-            status="COMPLETED",
-            metadata={
-                "builder": "agent_transcript",
-                "session_id": session.session_id,
-                "task_id": session.task_id,
-                "record_count": 0,
-                "trace_count": 1,
-                "capture_mode": "transcript",
-                "token_level_metrics_available": False,
-                "task_metadata": dict(session.metadata),
-                **_top_level_scheduler_metadata(session.metadata),
-            },
-            traces=[trace],
-        )
+        return _trajectory_from_transcript(session, transcript_text, transcript_path)
+
+    async def build_verified_transcript(
+        self,
+        session: CompletionSession,
+        *,
+        transcript_bytes: bytes | None,
+        transcript_path: Path | None,
+    ) -> Trajectory:
+        """Build from bytes already verified by the gateway input boundary."""
+
+        if transcript_bytes is None or transcript_path is None:
+            return _error_trajectory(session, "no transcript")
+        transcript_text = transcript_bytes.decode("utf-8")
+        return _trajectory_from_transcript(session, transcript_text, transcript_path)
+
+
+def _trajectory_from_transcript(
+    session: CompletionSession,
+    transcript_text: str,
+    transcript_path: Path,
+) -> Trajectory:
+    if not transcript_text.strip():
+        return _error_trajectory(session, "empty transcript", transcript_path)
+    response_text = _response_text_from_transcript(transcript_text)
+    if not response_text:
+        return _error_trajectory(session, "no assistant transcript", transcript_path)
+    trace = Trace(
+        prompt_messages=_prompt_messages(session.metadata),
+        response_messages=(
+            [{"role": "assistant", "content": response_text}] if response_text else []
+        ),
+        finish_reason="transcript",
+        metadata={
+            "capture_mode": "transcript",
+            "token_level_metrics_available": False,
+            "transcript_path": str(transcript_path),
+            "transcript": transcript_text,
+        },
+    )
+    return Trajectory(
+        status="COMPLETED",
+        metadata={
+            "builder": "agent_transcript",
+            "session_id": session.session_id,
+            "task_id": session.task_id,
+            "record_count": 0,
+            "trace_count": 1,
+            "capture_mode": "transcript",
+            "token_level_metrics_available": False,
+            "task_metadata": dict(session.metadata),
+            **_top_level_scheduler_metadata(session.metadata),
+        },
+        traces=[trace],
+    )
 
 
 def _error_trajectory(

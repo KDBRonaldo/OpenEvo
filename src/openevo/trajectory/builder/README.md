@@ -28,7 +28,11 @@ RL 代码可以过滤它，而 skill/memory evolution 仍然可以使用 transcr
 Managed subscription release admission requires the literal `transcript`
 value. Before these logs are written, Gateway applies the bounded redactor
 derived from the verified auth JSON, so the builder does not persist known raw
-auth JSON or sensitive leaf canaries into trajectory metadata or messages.
+auth JSON or sensitive leaf canaries into trajectory metadata or messages. For
+subscription finalization, Gateway reads the fixed transcript leaf through the
+pinned session-root descriptor and passes verified bytes to the builder. The
+builder applies the same parser and trajectory output logic to those in-memory
+bytes and does not reopen the transcript path.
 
 ## `per_request`
 
