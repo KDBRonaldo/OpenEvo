@@ -120,9 +120,17 @@ canary evidence for the supported release modes.
 Remote capability discovery has an additional artifact-level gate. In a clean
 environment containing the exact Core wheel, run
 `scripts/ci/smoke_openevo_remote_capabilities.py --wheel <exact-core-wheel>
---sidecar <packaged-sidecar>`. It must start Core with its external framework
-lock and exercise the packaged sidecar over a real HTTP listener; a source
-`TestClient` or local fake capability catalog does not satisfy this gate.
+--framework-lock <build-generated-framework-lock> --sidecar <packaged-sidecar>`.
+The lock must be the exact sibling artifact emitted by the sidecar build, not a
+runtime-generated substitute. The smoke must start Core with that external lock
+through `openevo-core-service`, exercise the packaged sidecar through its native
+inherited-listener/credential-frame launch contract, and use a full 40-character
+`--source-commit` matching the release checkout. This CI-only smoke may replace
+and stop the current user's canonical Core service, so run it only on a
+disposable release worker. It validates the two packaged process boundaries;
+the separate remote-profile/SSH/active-project gate validates their production
+forwarding composition. A source `TestClient` or local fake capability catalog
+does not satisfy either gate.
 
 ## Release Identity
 

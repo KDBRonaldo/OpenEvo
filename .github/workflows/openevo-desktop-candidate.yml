@@ -107,13 +107,16 @@ jobs:
       - name: Clean-install exact Core wheel and smoke packaged sidecar
         run: |
           test "$(find .candidate-remote-wheel -maxdepth 1 -name 'openevo-*.whl' | wc -l | tr -d ' ')" = 1
+          test -f .candidate-remote-wheel/framework-lock.json
           python -m venv "$RUNNER_TEMP/openevo-core-smoke"
           "$RUNNER_TEMP/openevo-core-smoke/bin/python" -m pip install --upgrade pip
           "$RUNNER_TEMP/openevo-core-smoke/bin/python" -m pip install .candidate-remote-wheel/openevo-*.whl
           PYTHONPATH= "$RUNNER_TEMP/openevo-core-smoke/bin/openevo-backend" --help
+          PYTHONPATH= "$RUNNER_TEMP/openevo-core-smoke/bin/openevo-core-service" --help
           PYTHONPATH= "$RUNNER_TEMP/openevo-core-smoke/bin/python" \
             scripts/ci/smoke_evolution_framework_wheel.py \
-            --wheel .candidate-remote-wheel/openevo-*.whl
+            --wheel .candidate-remote-wheel/openevo-*.whl \
+            --framework-lock .candidate-remote-wheel/framework-lock.json
           "$RUNNER_TEMP/openevo-core-smoke/bin/python" \
             scripts/ci/smoke_openevo_desktop_sidecar.py \
             "$OPENEVO_PACKAGED_SIDECAR_PATH" \

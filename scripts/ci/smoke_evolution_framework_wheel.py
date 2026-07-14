@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import shutil
 import tempfile
 from importlib import metadata
 from pathlib import Path
@@ -51,8 +50,9 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def smoke(wheel_path: Path) -> dict[str, object]:
+def smoke(wheel_path: Path, framework_lock_path: Path) -> dict[str, object]:
     wheel = wheel_path.resolve(strict=True)
+    framework_lock = framework_lock_path.resolve(strict=True)
     repository_src = Path(__file__).resolve().parents[2] / "src"
     import_path = Path(openevo.__file__).resolve(strict=True)
     if import_path.is_relative_to(repository_src):
@@ -70,23 +70,19 @@ def smoke(wheel_path: Path) -> dict[str, object]:
     )
 
     from openevo.evolution.framework import (
-        FrameworkDistributionLock,
+        load_framework_distribution_lock,
         load_verified_framework_registry,
     )
 
-    with tempfile.TemporaryDirectory(prefix="openevo-framework-lock-smoke-") as temp_dir:
-        locked_wheel = Path(temp_dir) / wheel.name
-        shutil.copy2(wheel, locked_wheel)
-        lock_path = Path(temp_dir) / "framework-lock.json"
-        lock_path.write_text(
-            FrameworkDistributionLock(
-                distribution_version=version,
-                distribution_digest=wheel_sha256,
-                wheel_filename=wheel.name,
-            ).model_dump_json(),
-            encoding="utf-8",
-        )
-        loaded = load_verified_framework_registry(lock_path)
+    locked_identity, locked_wheel = load_framework_distribution_lock(framework_lock)
+    if (
+        locked_wheel.resolve(strict=True) != wheel
+        or locked_identity.distribution_version != version
+        or locked_identity.distribution_digest != wheel_sha256
+        or locked_identity.wheel_filename != wheel.name
+    ):
+        raise RuntimeError("packaged framework lock does not bind the exact Core wheel")
+    loaded = load_verified_framework_registry(framework_lock)
     if set(loaded.method_handles) != EXPECTED_METHOD_IDS:
         raise RuntimeError("installed built-in method handles are incomplete")
     if set(loaded.snapshot.targets) != EXPECTED_TARGET_IDS:
@@ -171,6 +167,7 @@ def smoke(wheel_path: Path) -> dict[str, object]:
             raise RuntimeError("installed migrated store did not quarantine legacy artifact")
     return {
         "distribution": "openevo",
+        "framework_lock_sha256": _sha256(framework_lock),
         "version": version,
         "wheel_sha256": verified.expectation.distribution_digest,
         "inventory_digest": verified.inventory_digest,
@@ -187,8 +184,9 @@ def smoke(wheel_path: Path) -> dict[str, object]:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--wheel", required=True, type=Path)
+    parser.add_argument("--framework-lock", required=True, type=Path)
     args = parser.parse_args()
-    print(json.dumps(smoke(args.wheel), sort_keys=True))
+    print(json.dumps(smoke(args.wheel, args.framework_lock), sort_keys=True))
     return 0
 
 

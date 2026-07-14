@@ -109,9 +109,12 @@ jobs:
           .openevo-remote-wheel-smoke/bin/openevo-backend serve --help
           .openevo-remote-wheel-smoke/bin/openevo-backend run --help
           .openevo-remote-wheel-smoke/bin/openevo-core-service --help
-          PYTHONPATH= .openevo-remote-wheel-smoke/bin/python scripts/ci/smoke_evolution_framework_wheel.py --wheel .openevo-remote-wheel/*.whl
+          PYTHONPATH= .openevo-remote-wheel-smoke/bin/python scripts/ci/smoke_evolution_framework_wheel.py \
+            --wheel .openevo-remote-wheel/*.whl \
+            --framework-lock .openevo-remote-wheel/framework-lock.json
           PYTHONPATH= .openevo-remote-wheel-smoke/bin/python scripts/ci/smoke_openevo_remote_capabilities.py \
             --wheel .openevo-remote-wheel/*.whl \
+            --framework-lock .openevo-remote-wheel/framework-lock.json \
             --sidecar "$sidecar" \
             --source-commit "$(git rev-parse HEAD)" \
             --timeout-seconds 60
