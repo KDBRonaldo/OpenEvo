@@ -33,6 +33,14 @@ from desktop.sidecar.config import (
     load_desktop_project_config,
     save_desktop_project_config,
 )
+from desktop.sidecar.core_client_v1 import (
+    CoreClientErrorV1,
+    CoreClientLocalErrorCodeV1,
+    CoreClientLocalErrorV1,
+    CoreControlClientV1,
+    CoreSseStreamV1,
+    CoreTunnelConnectionV1,
+)
 from openevo.deployment.profile import (
     ProxySettings,
     RemoteProfileConfig,
@@ -55,6 +63,12 @@ __all__ = [
     "BackendClient",
     "BackendConnection",
     "DesktopBackendError",
+    "CoreClientErrorV1",
+    "CoreClientLocalErrorCodeV1",
+    "CoreClientLocalErrorV1",
+    "CoreControlClientV1",
+    "CoreSseStreamV1",
+    "CoreTunnelConnectionV1",
     "DesktopProjectConfigDraft",
     "DesktopProjectConfigPaths",
     "DesktopProjectConfigSummary",
