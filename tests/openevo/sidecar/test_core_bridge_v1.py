@@ -1745,13 +1745,260 @@ def _workspace_mutation_count(fake_core: FakeCore) -> int:
         [
             request
             for request in fake_core.calls
-            if request.method == "POST"
-            and (
-                request.url.path.endswith("/workspace-uploads")
-                or request.url.path.endswith("/finalize")
-            )
+            if request.method in {"POST", "PUT"}
+            and "/workspace-uploads" in request.url.path
         ]
     )
+
+
+def _prepare_initial_import_finalize_mapping_crash() -> tuple[
+    local_v1.ProjectV1,
+    bytes,
+    FakePersistence,
+    FakeCore,
+]:
+    project = _local_project(imported=True)
+    archive = b"\0" * 1024
+    persistence = FakePersistence()
+    persistence.fail_commit_once = True
+    fake_core = FakeCore(project)
+    first, _, _, _ = _bridge(
+        project,
+        persistence=persistence,
+        fake_core=fake_core,
+        archive_source=FakeArchiveSource(archive),
+    )
+
+    with pytest.raises(DesktopCoreBridgeErrorV1) as exc_info:
+        first.activate_project(project, idempotency_key="initial-finalize-crash-0001")
+
+    assert exc_info.value.error.code == "core_bridge_adapter_failed"
+    assert persistence.mapping is None
+    assert persistence.operation is not None
+    finalize_authority = persistence.operation.workspace_upload_finalize
+    assert finalize_authority is not None
+    assert finalize_authority.outcome.project.active_revision == REVISION
+    return project, archive, persistence, fake_core
+
+
+def _edited_initial_import(project: local_v1.ProjectV1) -> local_v1.ProjectV1:
+    archive = b"\1" * 1024
+    return project.model_copy(
+        update={
+            "task": local_v1.ProjectTaskV1(
+                title="Edited after initial finalize crash",
+                objective="Validate durable initial publication authority before patching.",
+            ),
+            "source": local_v1.ProjectSourceV1(
+                kind="native_folder_snapshot",
+                display_name="Edited imported workspace",
+                import_ref=local_v1.WorkspaceImportRefV1(
+                    import_id="edited-initial-finalize-import",
+                    content_sha256=hashlib.sha256(archive).hexdigest(),
+                    byte_size=len(archive),
+                    entry_count=0,
+                    extracted_byte_size=0,
+                ),
+            ),
+            "updated_at": "2026-07-14T12:44:00Z",
+        }
+    )
+
+
+def _set_current_revision(
+    fake_core: FakeCore,
+    revision: core_v1.RevisionRefV1,
+    *,
+    etag: str,
+) -> None:
+    fake_core.active_revision = revision
+    fake_core.project_etag = etag
+    fake_core.project_updated_at = "2026-07-14T12:43:00Z"
+    fake_core.head = _head(active_revision=revision, etag=etag)
+
+
+@pytest.mark.parametrize("changed_intent", [False, True], ids=["unchanged", "changed"])
+def test_initial_finalize_recovery_rejects_unproven_generation_jump_before_mutation(
+    changed_intent: bool,
+) -> None:
+    original, archive, persistence, fake_core = (
+        _prepare_initial_import_finalize_mapping_crash()
+    )
+    requested = _edited_initial_import(original) if changed_intent else original
+    requested_archive = b"\1" * 1024 if changed_intent else archive
+    jumped_revision = core_v1.RevisionRefV1(
+        id="revision-2",
+        project_id=CORE_PROJECT_ID,
+        generation=2,
+        manifest_sha256="2" * 64,
+    )
+    jumped_etag = '"' + "2" * 64 + '"'
+    _set_current_revision(fake_core, jumped_revision, etag=jumped_etag)
+    patch_count = len(fake_core.patch_requests)
+    workspace_mutations = _workspace_mutation_count(fake_core)
+    commit_count = persistence.events.count("commit_mapping")
+    recovered, _, _, _ = _bridge(
+        requested,
+        persistence=persistence,
+        fake_core=fake_core,
+        archive_source=FakeArchiveSource(requested_archive),
+    )
+
+    with pytest.raises(DesktopCoreBridgeErrorV1) as exc_info:
+        recovered.activate_project(
+            requested,
+            idempotency_key="initial-finalize-jump-recovery-0002",
+        )
+
+    assert exc_info.value.error.code == "core_project_revision_authority_mismatch"
+    assert persistence.mapping is None
+    assert len(fake_core.patch_requests) == patch_count
+    assert _workspace_mutation_count(fake_core) == workspace_mutations
+    assert persistence.events.count("commit_mapping") == commit_count
+
+
+@pytest.mark.parametrize("changed_intent", [False, True], ids=["unchanged", "changed"])
+def test_initial_finalize_recovery_accepts_direct_revision_successor(
+    changed_intent: bool,
+) -> None:
+    original, archive, persistence, fake_core = (
+        _prepare_initial_import_finalize_mapping_crash()
+    )
+    requested = _edited_initial_import(original) if changed_intent else original
+    requested_archive = b"\1" * 1024 if changed_intent else archive
+    successor_etag = '"' + "7" * 64 + '"'
+    _set_current_revision(fake_core, REVISION_1, etag=successor_etag)
+    patch_count = len(fake_core.patch_requests)
+    recovered, _, _, _ = _bridge(
+        requested,
+        persistence=persistence,
+        fake_core=fake_core,
+        archive_source=FakeArchiveSource(requested_archive),
+    )
+
+    activation = recovered.activate_project(
+        requested,
+        idempotency_key="initial-finalize-successor-recovery-0002",
+    )
+
+    assert activation.core_project.active_revision == REVISION_1
+    assert persistence.mapping is not None
+    assert persistence.mapping.active_revision == REVISION_1
+    assert len(fake_core.patch_requests) == patch_count + int(changed_intent)
+    if changed_intent:
+        assert fake_core.patch_requests[-1][1] == successor_etag
+    else:
+        assert persistence.mapping.project_etag == successor_etag
+    recovered.close()
+
+
+@pytest.mark.parametrize(
+    ("finalize_revision", "reported_revision"),
+    [
+        (REVISION_1, REVISION),
+        (
+            REVISION,
+            core_v1.RevisionRefV1(
+                id="revision-0-rewritten",
+                project_id=CORE_PROJECT_ID,
+                generation=0,
+                manifest_sha256=REVISION.manifest_sha256,
+            ),
+        ),
+        (
+            REVISION,
+            core_v1.RevisionRefV1(
+                id=REVISION.id,
+                project_id=CORE_PROJECT_ID,
+                generation=0,
+                manifest_sha256="9" * 64,
+            ),
+        ),
+    ],
+    ids=["rollback", "same-generation-id-rewrite", "same-generation-manifest-rewrite"],
+)
+def test_initial_finalize_recovery_rejects_nonmonotonic_revision_authority(
+    finalize_revision: core_v1.RevisionRefV1,
+    reported_revision: core_v1.RevisionRefV1,
+) -> None:
+    project, archive, persistence, fake_core = (
+        _prepare_initial_import_finalize_mapping_crash()
+    )
+    _replace_finalize_revision_authority(persistence, finalize_revision)
+    reported_etag = '"' + "9" * 64 + '"'
+    _set_current_revision(fake_core, reported_revision, etag=reported_etag)
+    patch_count = len(fake_core.patch_requests)
+    workspace_mutations = _workspace_mutation_count(fake_core)
+    commit_count = persistence.events.count("commit_mapping")
+    recovered, _, _, _ = _bridge(
+        project,
+        persistence=persistence,
+        fake_core=fake_core,
+        archive_source=FakeArchiveSource(archive),
+    )
+
+    with pytest.raises(DesktopCoreBridgeErrorV1) as exc_info:
+        recovered.activate_project(
+            project,
+            idempotency_key="initial-finalize-nonmonotonic-0002",
+        )
+
+    assert exc_info.value.error.code == "core_project_revision_authority_mismatch"
+    assert persistence.mapping is None
+    assert len(fake_core.patch_requests) == patch_count
+    assert _workspace_mutation_count(fake_core) == workspace_mutations
+    assert persistence.events.count("commit_mapping") == commit_count
+
+
+def test_initial_finalize_recovery_rejects_tampered_finalize_outcome() -> None:
+    project, archive, persistence, fake_core = (
+        _prepare_initial_import_finalize_mapping_crash()
+    )
+    operation = persistence.operation
+    assert operation is not None
+    authority = operation.workspace_upload_finalize
+    assert authority is not None
+    tampered_project = core_v1.ProjectV1.model_validate(
+        authority.outcome.project.model_copy(
+            update={
+                "current_project_snapshot": _snapshot(
+                    "tampered-initial-finalize-project-snapshot",
+                    core_v1.SnapshotKind.PROJECT,
+                    "9",
+                )
+            }
+        ).model_dump(),
+        strict=True,
+    )
+    tampered_outcome = core_v1.WorkspaceUploadFinalizeResponseV1.model_validate(
+        authority.outcome.model_copy(update={"project": tampered_project}).model_dump(),
+        strict=True,
+    )
+    persistence.operation = replace(
+        operation,
+        workspace_upload_finalize=replace(authority, outcome=tampered_outcome),
+    )
+    patch_count = len(fake_core.patch_requests)
+    workspace_mutations = _workspace_mutation_count(fake_core)
+    commit_count = persistence.events.count("commit_mapping")
+    recovered, _, _, _ = _bridge(
+        project,
+        persistence=persistence,
+        fake_core=fake_core,
+        archive_source=FakeArchiveSource(archive),
+    )
+
+    with pytest.raises(DesktopCoreBridgeErrorV1) as exc_info:
+        recovered.activate_project(
+            project,
+            idempotency_key="initial-finalize-tampered-0002",
+        )
+
+    assert exc_info.value.error.code == "core_project_initial_publication_mismatch"
+    assert persistence.mapping is None
+    assert len(fake_core.patch_requests) == patch_count
+    assert _workspace_mutation_count(fake_core) == workspace_mutations
+    assert persistence.events.count("commit_mapping") == commit_count
 
 
 @pytest.mark.parametrize(

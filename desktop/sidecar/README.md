@@ -107,15 +107,20 @@ and `bound`: a proven pre-transport failure may accept a new Local action key,
 unknown outcome requires exact replay, and a bound project resumes without
 another create. If mapping commit is interrupted and the Local draft is edited,
 the bound operation first verifies the original request against that Core
-project and then converges the new intent through a versioned patch.
+project and then converges the new intent through a versioned patch. For an
+initial imported workspace, the durable exact finalize outcome is the revision
+authority at the unmapped boundary. Recovery validates its project snapshots,
+publication, and every revision edge through current authority before using the
+current ETag, issuing a patch or upload, or committing the first mapping.
 
 Mapped Local edits use Core `patch_project`, the freshly read project ETag, and
 a deterministic old/new request key. The mapping records canonical mapped
 intent and immutable project/task/workspace content snapshots separately from
 mutable Core authority: project ETag, active revision, project `updated_at`, and
 registry digest. A legitimate cross-session successor may change only that
-mutable authority. Every mapped, patch-recovery, and finalize-recovery read
-validates active revision authority monotonically before using the current ETag:
+mutable authority. Every initial-publication, mapped, patch-recovery, and
+finalize-recovery read validates active revision authority monotonically before
+using the current ETag:
 the same generation must preserve the complete revision ref, while a changed ref
 must be the same-project direct successor on every proven authority edge.
 Generation rollback, identity rewrite, and unproven generation skips fail closed

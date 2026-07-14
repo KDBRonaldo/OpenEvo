@@ -842,6 +842,26 @@ class DesktopCoreBridgeV1:
                 lambda: self._persistence.load_patch(project.project_id),
                 label="project patch operation read",
             )
+            initial_revision_authority: core_v1.RevisionRefV1 | None = None
+            if mapping is None:
+                authority_anchor = (
+                    pending_patch.base_project if pending_patch is not None else core_project
+                )
+                initial_revision_authority = _ensure_initial_publication_authority(
+                    operation,
+                    authority_anchor,
+                    pending_patch=pending_patch,
+                )
+                if (
+                    pending_patch is not None
+                    and pending_patch.state is not CoreProjectPatchStateV1.APPLIED
+                ):
+                    _ensure_revision_authority_successor(
+                        pending_patch.base_project.active_revision,
+                        core_project.active_revision,
+                        project_id=operation.core_project_id,
+                        label="durable pending project patch base",
+                    )
             completed_patch: CoreProjectPatchOperationV1 | None = None
             revision_authorities: tuple[core_v1.RevisionRefV1 | None, ...] = ()
             recovered_requested_patch = False
@@ -897,6 +917,7 @@ class DesktopCoreBridgeV1:
                         core_host_identity=attachment.bearer_identity,
                         previous_mapping=mapping,
                         revision_authorities=revision_authorities,
+                        initial_revision_authority=initial_revision_authority,
                     )
                     self._adapter_external(
                         token,
@@ -950,6 +971,12 @@ class DesktopCoreBridgeV1:
                     operation=operation,
                     deadline=deadline,
                 )
+            if mapping is None and completed_patch is None:
+                initial_revision_authority = _ensure_initial_publication_authority(
+                    operation,
+                    core_project,
+                    pending_patch=None,
+                )
             self._ensure_project_ready(core_project, capabilities)
             if completed_patch is not None:
                 revision_authorities = _ensure_persisted_patch_outcome(
@@ -985,6 +1012,7 @@ class DesktopCoreBridgeV1:
                 core_host_identity=attachment.bearer_identity,
                 previous_mapping=mapping,
                 revision_authorities=revision_authorities,
+                initial_revision_authority=initial_revision_authority,
             )
             if mapping != completed_mapping:
                 self._adapter_external(
@@ -2894,6 +2922,73 @@ def _ensure_project_identity(project: core_v1.ProjectV1, request: core_v1.Projec
         )
 
 
+def _ensure_initial_publication_authority(
+    operation: CoreProjectCreateOperationV1,
+    descendant: core_v1.ProjectV1,
+    *,
+    pending_patch: CoreProjectPatchOperationV1 | None,
+) -> core_v1.RevisionRefV1 | None:
+    if (
+        operation.state is not CoreProjectCreateStateV1.BOUND
+        or operation.core_project_id is None
+        or descendant.id != operation.core_project_id
+    ):
+        raise _bridge_error(
+            "core_project_create_binding_mismatch",
+            "The durable project create binding does not own the publication authority.",
+            status=409,
+        )
+    finalize = operation.workspace_upload_finalize
+    finalized_project: core_v1.ProjectV1 | None = None
+    if finalize is not None:
+        candidate = finalize.outcome.project
+        if _project_identity_matches(candidate, operation.project_create):
+            finalized_project = candidate
+        elif not (
+            pending_patch is not None
+            and pending_patch.state is CoreProjectPatchStateV1.APPLIED
+            and _project_identity_matches(candidate, pending_patch.new_project_create)
+        ):
+            raise _bridge_error(
+                "core_project_initial_publication_mismatch",
+                "The durable workspace publication does not match a proven project intent.",
+                status=409,
+            )
+
+    authority = finalized_project.active_revision if finalized_project is not None else None
+    if finalized_project is not None:
+        same_content_authority = (
+            finalized_project.id == operation.core_project_id == descendant.id
+            and _patch_immutable_authority(descendant)
+            == _patch_immutable_authority(finalized_project)
+            and descendant.current_project_snapshot
+            == finalized_project.current_project_snapshot
+            and descendant.current_workspace_snapshot
+            == finalized_project.current_workspace_snapshot
+            and descendant.workspace_publication == finalized_project.workspace_publication
+        )
+        descendant_mutable = _patch_mutable_authority(descendant)
+        finalized_mutable = _patch_mutable_authority(finalized_project)
+        valid_mutable_descent = descendant_mutable == finalized_mutable or (
+            _utc_timestamp(descendant.updated_at) >= _utc_timestamp(finalized_project.updated_at)
+            and descendant.etag != finalized_project.etag
+        )
+        if not same_content_authority or not valid_mutable_descent:
+            raise _bridge_error(
+                "core_project_initial_publication_mismatch",
+                "Core no longer descends from the durable initial workspace publication.",
+                status=409,
+            )
+
+    _ensure_revision_authority_successor(
+        authority,
+        descendant.active_revision,
+        project_id=operation.core_project_id,
+        label="durable initial workspace publication",
+    )
+    return authority
+
+
 def _ensure_patch_signed_new_snapshots(
     previous: core_v1.ProjectV1,
     patched: core_v1.ProjectV1,
@@ -3037,6 +3132,7 @@ def _mapping_from_project(
     core_host_identity: str,
     previous_mapping: CoreProjectMappingV1 | None,
     revision_authorities: tuple[core_v1.RevisionRefV1 | None, ...] = (),
+    initial_revision_authority: core_v1.RevisionRefV1 | None = None,
 ) -> CoreProjectMappingV1:
     return _mapping_from_request(
         local_project_id=local_project.project_id,
@@ -3048,6 +3144,7 @@ def _mapping_from_project(
         core_host_identity=core_host_identity,
         previous_mapping=previous_mapping,
         revision_authorities=revision_authorities,
+        initial_revision_authority=initial_revision_authority,
     )
 
 
@@ -3062,6 +3159,7 @@ def _mapping_from_request(
     core_host_identity: str,
     previous_mapping: CoreProjectMappingV1 | None,
     revision_authorities: tuple[core_v1.RevisionRefV1 | None, ...] = (),
+    initial_revision_authority: core_v1.RevisionRefV1 | None = None,
 ) -> CoreProjectMappingV1:
     workspace_snapshot = project.current_workspace_snapshot
     active_revision = project.active_revision
@@ -3070,17 +3168,22 @@ def _mapping_from_request(
             "core_project_not_ready",
             "Core has not published the project workspace snapshot and active revision.",
         )
-    if previous_mapping is not None:
-        authorities = (
-            previous_mapping.active_revision,
-            *revision_authorities,
-            active_revision,
-        )
-        _ensure_revision_authority_chain(
-            authorities,
-            project_id=project.id,
-            labels=("previous project mapping",) * (len(authorities) - 1),
-        )
+    chain_start = (
+        previous_mapping.active_revision
+        if previous_mapping is not None
+        else initial_revision_authority
+    )
+    authorities = (chain_start, *revision_authorities, active_revision)
+    authority_label = (
+        "previous project mapping"
+        if previous_mapping is not None
+        else "initial project publication"
+    )
+    _ensure_revision_authority_chain(
+        authorities,
+        project_id=project.id,
+        labels=(authority_label,) * (len(authorities) - 1),
+    )
     if previous_mapping is None:
         mapping_generation = 1
         predecessor_request_sha256 = None
