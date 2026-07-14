@@ -354,7 +354,10 @@ bounded task-resource upload. Core signs a new immutable task snapshot on
 create and whenever the task changes. `current_task_snapshot` is therefore
 never null, and run creation must submit that exact Core-owned reference. Task
 input does not accept benchmark IDs, host paths, commands, environment, or open
-metadata.
+metadata. In `ProjectPatchV1`, `name`, `spec`, `task`, and `workspace` are
+optional but non-nullable: omission leaves the stored value unchanged and an
+explicit `null` is invalid. `description` remains nullable, so an explicit
+`description: null` clears it.
 
 Project responses return the current content-addressed project, task, and
 workspace snapshot references plus the active revision reference. Every
@@ -507,8 +510,10 @@ result, carries a strong ETag and logs reference, and emits
 `environment_repair` is cancellable and may move through
 `cancelling -> cancelled`; cancel uses `If-Match` plus `Idempotency-Key`.
 Service restart and cache cleanup are non-cancellable in v1, and cancel returns
-typed `409 operation_kind_not_cancellable` rather than implying best-effort
-cancellation. Runs and diagnostics remain their own recoverable 202 resources.
+`409 ApiErrorV1` with code `operation_kind_not_cancellable` rather than implying
+best-effort cancellation. The generic response also preserves the global
+`409 idempotency_key_reused` contract for a conflicting replay. Runs and
+diagnostics remain their own recoverable 202 resources.
 Any bounded `logs_ref` from an error, check, or operation is readable through
 paginated `GET /v1/logs/{logs_ref}`.
 
@@ -518,6 +523,10 @@ change ID, exactly one authoritative resource ETag or content digest, and the
 applicable parent resource type/ID. Per-event validators bind those values to
 the typed payload; an event cannot cross-wire a project, run, service, artifact,
 revision, diagnostic, operation, timeline entry, or log entry.
+`revision.activated.v1` carries only a revision with `status=active`. A
+non-genesis payload with a transition must retain the active transition and the
+exact predecessor/successor closure enforced by `RevisionV1`; queued, preparing,
+failed, and cancelled revisions are rejected.
 The SSE frame ID identifies a concrete stream record and is the replay cursor;
 duplicate delivery preserves it. `change_id` identifies one logical mutation and
 remains stable if that mutation is retried, replayed, or emitted in a later stream

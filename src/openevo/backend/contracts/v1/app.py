@@ -637,9 +637,10 @@ def create_core_control_contract_app() -> FastAPI:
         responses={
             **_ERROR_RESPONSES,
             409: {
-                "model": m.OperationCancelConflictV1,
+                "model": m.ApiErrorV1,
                 "description": (
-                    "The operation descriptor declares that this kind is not cancellable."
+                    "Conflict: operation_kind_not_cancellable when the descriptor forbids "
+                    "cancellation, or idempotency_key_reused for a conflicting replay."
                 ),
             },
         },

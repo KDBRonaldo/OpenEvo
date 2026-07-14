@@ -8,7 +8,7 @@ import hashlib
 import json
 import math
 from enum import StrEnum
-from typing import Annotated, Literal, TypeAlias
+from typing import Annotated, Any, Literal, TypeAlias
 
 from pydantic import (
     AfterValidator,
@@ -766,7 +766,31 @@ class ProjectCreateV1(ContractModel):
     workspace: ProjectWorkspaceSpecV1
 
 
+_NON_NULLABLE_PROJECT_PATCH_FIELDS = frozenset({"name", "spec", "task", "workspace"})
+
+
+def _project_patch_json_schema(schema: dict[str, Any]) -> None:
+    for field in _NON_NULLABLE_PROJECT_PATCH_FIELDS:
+        property_schema = schema.get("properties", {}).get(field)
+        if not isinstance(property_schema, dict):
+            continue
+        property_schema.pop("default", None)
+        any_of = property_schema.get("anyOf")
+        if not isinstance(any_of, list):
+            continue
+        non_null = [entry for entry in any_of if entry.get("type") != "null"]
+        if len(non_null) != 1 or len(non_null) == len(any_of):
+            continue
+        title = property_schema.get("title")
+        property_schema.clear()
+        property_schema.update(non_null[0])
+        if title is not None:
+            property_schema["title"] = title
+
+
 class ProjectPatchV1(ContractModel):
+    model_config = ConfigDict(json_schema_extra=_project_patch_json_schema)
+
     schema_version: Literal["1"] = "1"
     name: DisplayName | None = None
     description: Description | None = None
@@ -774,14 +798,19 @@ class ProjectPatchV1(ContractModel):
     task: TaskSpecV1 | None = None
     workspace: ProjectWorkspaceSpecV1 | None = None
 
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_non_nullable_null(cls, value: Any) -> Any:
+        if isinstance(value, dict) and any(
+            field in value and value[field] is None for field in _NON_NULLABLE_PROJECT_PATCH_FIELDS
+        ):
+            raise ValueError("name, spec, task, and workspace may be omitted but must not be null")
+        return value
+
     @model_validator(mode="after")
     def _has_change(self) -> ProjectPatchV1:
-        if (
-            self.name is None
-            and self.description is None
-            and self.spec is None
-            and self.task is None
-            and self.workspace is None
+        if not self.model_fields_set.intersection(
+            _NON_NULLABLE_PROJECT_PATCH_FIELDS | {"description"}
         ):
             raise ValueError("project patch must contain a change")
         return self
@@ -1250,6 +1279,10 @@ class RevisionV1(ContractModel):
         ):
             raise ValueError("a cancelled revision requires a cancelled transition")
         return self
+
+
+class ActivatedRevisionV1(RevisionV1):
+    status: Literal[RevisionStatus.ACTIVE]
 
 
 class RevisionPageV1(CursorPageV1):
@@ -2327,15 +2360,6 @@ class OperationCancellationV1(ContractModel):
     requested_at: UtcTimestamp
 
 
-class OperationCancelConflictV1(ApiErrorV1):
-    code: Literal["operation_kind_not_cancellable"]
-    http_status: Literal[409]
-    severity: Literal[ErrorSeverity.BLOCKING]
-    category: Literal[ErrorCategory.CONTRACT]
-    retryable: Literal[False]
-    repair_action: Literal[RepairAction.UNSUPPORTED]
-
-
 class OperationV1(ContractModel):
     schema_version: Literal["1"] = "1"
     id: OpaqueId
@@ -2621,7 +2645,7 @@ class RevisionSuccessorTransitionUpdatedEventV1(EventBaseV1):
 class RevisionActivatedEventV1(EventBaseV1):
     event: Literal["revision.activated.v1"]
     change: ResourceChangeIdentityV1
-    payload: RevisionV1
+    payload: ActivatedRevisionV1
 
     @model_validator(mode="after")
     def _change_matches_payload(self) -> RevisionActivatedEventV1:
