@@ -34,22 +34,24 @@ The current provider implements:
 
 Connection mutations atomically reserve idempotency capacity, two fixed terminal
 response slots for the operation and idempotency documents, profile action
-ownership, and a running operation before external SSH work. Replacing profile A
-with B durably disconnects A, cancels A's obsolete nonterminal operation, closes
-A's transport before resolving B's credential, and records B as the current
-failed owner if synchronous resolution fails. Disconnect is non-displacing: its
-reservation does not publish `connecting` or alter another profile, and the
-sidecar rejects a profile that does not own the process lifecycle before calling
-the transport. Success, error, and recovery cancellation finalize within the
-reserved slots without another capacity or request-ETag check. A final
-persistence error closes the successful transport and compensates the
-reservation to failed/disconnected, including the case where SQLite committed
-before reporting an error. Failed operations retain their bounded `ApiErrorV1`,
-so exact replays return the same error and do not probe, accept, connect, or
-disconnect again. Once any operation is terminal, its body and ETag are frozen;
-restart resets ephemeral profile connection authority but only cancels truly
-nonterminal reservations, updating their operation and idempotency documents in
-the same recovery transaction.
+ownership, and a running operation before external SSH work. One process-wide
+action lock serializes that full reservation, SSH invocation, and finalization
+cycle across every profile, route, and idempotency key. Replacing profile A with
+B therefore closes and durably disconnects A before invoking B. Disconnect is
+non-displacing: its reservation does not publish `connecting` or alter another
+profile, and the sidecar rejects a profile that does not own the process
+lifecycle before calling the transport. Success, error, and recovery
+cancellation finalize within the reserved slots without another capacity or
+request-ETag check. If completion reports an error before commit, the running
+reservation retains its terminal capacity until failure is durable. If commit
+succeeded before returning an error, the frozen success remains authoritative
+and its transport stays open even if concurrent CRUD consumed the released
+capacity. Failed operations retain their bounded `ApiErrorV1`, so exact replays
+return the same error and do not repeat remote work. Once any operation is
+terminal, its body and ETag are immutable; a late complete/fail call only returns
+that terminal and may close the transport owned by its own stale result. Restart
+only cancels truly nonterminal reservations, updating their operation and
+idempotency documents in the same recovery transaction.
 
 The production credential resolver currently supports `ssh_agent`. Profiles
 that select native private-key or password authentication fail closed with

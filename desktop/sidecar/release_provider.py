@@ -108,6 +108,7 @@ class DesktopReleaseProvider:
         self._connection_state_lock = Lock()
         self._connection_generation = 0
         self._connection_owner: str | None = None
+        self._connection_action_lock = Lock()
         self._connection_gate_lock = Lock()
         self._connection_gates: dict[tuple[str, str, str], _ConnectionActionGate] = {}
         self._core_state = CoreConnectionStateV1(state="disconnected", active_tunnel=False)
@@ -317,15 +318,16 @@ class DesktopReleaseProvider:
         gate_key = (route, profile_id, idempotency_key)
         gate = self._acquire_connection_gate(gate_key)
         try:
-            return self._execute_connection_action_once(
-                route=route,
-                operation_kind=operation_kind,
-                profile_id=profile_id,
-                if_match=if_match,
-                idempotency_key=idempotency_key,
-                request_body=request_body,
-                action=action,
-            )
+            with self._connection_action_lock:
+                return self._execute_connection_action_once(
+                    route=route,
+                    operation_kind=operation_kind,
+                    profile_id=profile_id,
+                    if_match=if_match,
+                    idempotency_key=idempotency_key,
+                    request_body=request_body,
+                    action=action,
+                )
         finally:
             self._release_connection_gate(gate_key, gate)
 
@@ -395,6 +397,7 @@ class DesktopReleaseProvider:
                 superseded = RemoteLifecycleSupersededError(
                     "A newer remote lifecycle operation superseded this result."
                 )
+                self._disconnect_owned_transport(profile_id)
                 operation = self._store.fail_profile_runtime_action(
                     reservation=reservation,
                     route=route,
@@ -417,7 +420,6 @@ class DesktopReleaseProvider:
                     host_key_fingerprint=outcome.host_key_fingerprint,
                 )
             except (ProviderStoreError, sqlite3.Error):
-                self._remote_lifecycle.disconnect()
                 error = self._provider_action_error(reservation)
                 operation = self._store.fail_profile_runtime_action(
                     reservation=reservation,
@@ -427,9 +429,22 @@ class DesktopReleaseProvider:
                     body=request_body,
                     if_match=if_match,
                     error=error,
-                    compensate_committed_success=True,
                 )
+                if operation.state == "succeeded":
+                    self._core_state = self._core_state_for_outcome(
+                        profile_id,
+                        operation.operation_id,
+                        outcome,
+                    )
+                    return self._operation_response(operation)
+                self._disconnect_owned_transport(profile_id)
                 self._core_state = self._local_provider_failure_state(profile_id)
+                return self._operation_response(operation)
+            if operation.state != "succeeded":
+                self._disconnect_owned_transport(profile_id)
+                self._core_state = CoreConnectionStateV1(
+                    state="disconnected", active_tunnel=False
+                )
                 return self._operation_response(operation)
             self._core_state = self._core_state_for_outcome(
                 profile_id,
@@ -469,6 +484,12 @@ class DesktopReleaseProvider:
 
     def _owns_connection_locked(self, generation: int, profile_id: str) -> bool:
         return generation == self._connection_generation and self._connection_owner == profile_id
+
+    def _disconnect_owned_transport(self, profile_id: str) -> None:
+        try:
+            self._remote_lifecycle.disconnect(profile_id)
+        except RemoteLifecycleError:
+            pass
 
     def _core_state_for_outcome(
         self,

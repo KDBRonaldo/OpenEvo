@@ -2012,7 +2012,7 @@ class DesktopProviderStore:
             operation, row = self._require_reserved_profile_action(
                 connection, identity, reservation.operation.operation_id
             )
-            if operation.state == "succeeded":
+            if operation.state in {"succeeded", "failed", "cancelled"}:
                 return operation
             if operation.state != "running":
                 raise ProviderStoreError("profile runtime action is no longer completable")
@@ -2052,7 +2052,6 @@ class DesktopProviderStore:
         body: BaseModel | Mapping[str, object],
         if_match: str,
         error: ApiErrorV1,
-        compensate_committed_success: bool = False,
     ) -> LocalOperationV1:
         """Persist a replayable failed operation and converge its owned profile state."""
 
@@ -2067,21 +2066,18 @@ class DesktopProviderStore:
             operation, row = self._require_reserved_profile_action(
                 connection, identity, reservation.operation.operation_id
             )
-            if operation.state == "failed":
+            if operation.state in {"succeeded", "failed", "cancelled"}:
                 return operation
-            if operation.state == "running" or (
-                compensate_committed_success and operation.state == "succeeded"
-            ):
-                current = self._profile_from_row(self._require_profile_row(connection, profile_id))
-                ProviderMutation(self, connection).set_profile_runtime_state(
-                    profile_id,
-                    if_match=current.etag,
-                    connection_state="disconnected",
-                    credential_slots=current.credential_slots,
-                    host_key_fingerprint=current.host_key_fingerprint,
-                )
-            elif operation.state != "cancelled":
+            if operation.state != "running":
                 raise ProviderStoreError("profile runtime action is no longer failable")
+            current = self._profile_from_row(self._require_profile_row(connection, profile_id))
+            ProviderMutation(self, connection).set_profile_runtime_state(
+                profile_id,
+                if_match=current.etag,
+                connection_state="disconnected",
+                credential_slots=current.credential_slots,
+                host_key_fingerprint=current.host_key_fingerprint,
+            )
             return self._finish_reserved_profile_action(
                 connection,
                 identity,

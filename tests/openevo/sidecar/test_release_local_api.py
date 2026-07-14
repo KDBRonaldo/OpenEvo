@@ -18,7 +18,11 @@ from desktop.sidecar.contracts.v1 import (
     create_contract_app,
 )
 import desktop.sidecar.provider_store as provider_store_module
-from desktop.sidecar.provider_store import DesktopProviderStore, ProviderDataCorruptionError
+from desktop.sidecar.provider_store import (
+    DesktopProviderStore,
+    ProviderDataCorruptionError,
+    ProviderMutation,
+)
 import desktop.sidecar.release_app as release_app_module
 from desktop.sidecar.release_app import create_release_desktop_local_api_app
 from desktop.sidecar.remote_lifecycle import (
@@ -132,6 +136,25 @@ class BlockingRemoteLifecycle(FakeRemoteLifecycle):
         assert self.release.wait(5)
         self.current = RemoteLifecycleSnapshot(profile.profile_id, "connected")
         return RemoteConnectionResult(profile.profile_id, "connected")
+
+
+class ObservedActionLock:
+    def __init__(self) -> None:
+        self._lock = Lock()
+        self._metadata_lock = Lock()
+        self._attempts = 0
+        self.second_waiting = Event()
+
+    def __enter__(self) -> ObservedActionLock:
+        with self._metadata_lock:
+            self._attempts += 1
+            if self._attempts == 2:
+                self.second_waiting.set()
+        self._lock.acquire()
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        self._lock.release()
 
 
 def _app(
@@ -456,10 +479,12 @@ def test_remote_connection_lifecycle_is_etag_bound_and_idempotent(tmp_path: Path
     assert lifecycle.closed
 
 
-def test_late_failure_cannot_overwrite_newer_profile_connection(tmp_path: Path) -> None:
+def test_cross_profile_keys_serialize_reservation_and_lifecycle_order(tmp_path: Path) -> None:
     lifecycle = RacingRemoteLifecycle()
     app = _app(tmp_path / "state", remote_lifecycle=lifecycle)
     with TestClient(app) as client:
+        action_lock = ObservedActionLock()
+        app.state.desktop_release_provider._connection_action_lock = action_lock
         first = _create_profile(client, name="A", key="profile-race-create-a").json()
         second = _create_profile(client, name="B", key="profile-race-create-b").json()
         responses: dict[str, Any] = {}
@@ -480,14 +505,21 @@ def test_late_failure_cannot_overwrite_newer_profile_connection(tmp_path: Path) 
         assert lifecycle.first_started.wait(2)
         second_thread.start()
         try:
-            assert lifecycle.second_finished.wait(2)
+            assert action_lock.second_waiting.wait(2)
+            assert not lifecycle.second_finished.is_set()
+            assert second_thread.is_alive()
         finally:
             lifecycle.release_first.set()
         first_thread.join(5)
         second_thread.join(5)
 
+        assert not first_thread.is_alive()
+        assert not second_thread.is_alive()
+        assert lifecycle.second_finished.is_set()
         assert responses["A"].status_code == 503
         assert responses["B"].status_code == 202
+        assert lifecycle.current.profile_id == second["profile_id"]
+        assert lifecycle.current.state == "connected"
         state = client.get("/desktop/v1/state", headers=SESSION_HEADERS).json()["core"]
         assert state["profile_id"] == second["profile_id"]
         assert state["failure"]["code"] == "core_not_started"
@@ -740,7 +772,7 @@ def test_succeeded_connection_replay_is_exact_across_restart(tmp_path: Path) -> 
 
 
 @pytest.mark.parametrize("failure_timing", ["before_commit", "after_commit"])
-def test_successful_ssh_is_closed_and_failed_action_is_replayed_when_commit_fails(
+def test_commit_return_failure_preserves_committed_success_or_compensates_running(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure_timing: str
 ) -> None:
     lifecycle = FakeRemoteLifecycle()
@@ -776,22 +808,158 @@ def test_successful_ssh_is_closed_and_failed_action_is_replayed_when_commit_fail
             "Idempotency-Key": "profile-commit-connect-0001",
         }
 
-        failed = client.post(
+        response = client.post(
             f"/desktop/v1/profiles/{profile['profile_id']}/connect", headers=headers
         )
         replay = client.post(
             f"/desktop/v1/profiles/{profile['profile_id']}/connect", headers=headers
         )
 
-        assert failed.status_code == replay.status_code == 503
-        assert failed.content == replay.content
-        assert failed.json()["code"] == "local_provider_unavailable"
+        assert response.content == replay.content
         assert lifecycle.connect_calls == 1
-        assert lifecycle.disconnect_calls == 1
         stored = client.get(
             f"/desktop/v1/profiles/{profile['profile_id']}", headers=SESSION_HEADERS
         ).json()
-        assert stored["connection_state"] == "disconnected"
+        if failure_timing == "before_commit":
+            assert response.status_code == replay.status_code == 503
+            assert response.json()["code"] == "local_provider_unavailable"
+            assert lifecycle.disconnect_calls == 1
+            assert stored["connection_state"] == "disconnected"
+        else:
+            assert response.status_code == replay.status_code == 202
+            assert response.json()["state"] == "succeeded"
+            assert response.headers["etag"] == replay.headers["etag"]
+            assert lifecycle.disconnect_calls == 0
+            assert lifecycle.current.profile_id == profile["profile_id"]
+            assert lifecycle.current.state == "connected"
+            assert stored["connection_state"] == "connected"
+
+
+def test_committed_success_survives_full_budget_before_commit_error_returns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lifecycle = FakeRemoteLifecycle()
+
+    def connect(profile) -> RemoteConnectionResult:
+        lifecycle.connect_calls += 1
+        lifecycle.current = RemoteLifecycleSnapshot(profile.profile_id, "connected")
+        return RemoteConnectionResult(profile.profile_id, "connected")
+
+    lifecycle.connect = connect  # type: ignore[method-assign]
+    app = _app(tmp_path / "state", remote_lifecycle=lifecycle)
+    with TestClient(app) as client:
+        profile = _create_profile(
+            client, name="Committed owner", key="profile-committed-create-0001"
+        ).json()
+        store = app.state.desktop_release_provider._store
+        original_complete = store.complete_profile_runtime_action
+        committed = Event()
+        release_error = Event()
+
+        def commit_then_raise(*args: object, **kwargs: object):
+            original_complete(*args, **kwargs)
+            committed.set()
+            assert release_error.wait(5)
+            raise sqlite3.OperationalError("injected error after committed success")
+
+        monkeypatch.setattr(store, "complete_profile_runtime_action", commit_then_raise)
+        headers = {
+            **SESSION_HEADERS,
+            "If-Match": profile["etag"],
+            "Idempotency-Key": "profile-committed-connect-0001",
+        }
+        responses: list[Any] = []
+
+        thread = Thread(
+            target=lambda: responses.append(
+                client.post(
+                    f"/desktop/v1/profiles/{profile['profile_id']}/connect", headers=headers
+                )
+            )
+        )
+        thread.start()
+        assert committed.wait(2)
+        filler = _create_profile(
+            client, name="Concurrent filler", key="profile-concurrent-filler-0001"
+        )
+        assert filler.status_code == 201
+        with store._transaction(write=False) as connection:
+            _, used_bytes = store._recovery_usage(connection)
+        monkeypatch.setattr(provider_store_module, "MAX_RECOVERY_BYTES", used_bytes)
+        release_error.set()
+        thread.join(5)
+
+        assert not thread.is_alive()
+        assert len(responses) == 1
+        response = responses[0]
+        replay = client.post(
+            f"/desktop/v1/profiles/{profile['profile_id']}/connect", headers=headers
+        )
+        assert response.status_code == replay.status_code == 202
+        assert response.content == replay.content
+        assert response.headers["etag"] == replay.headers["etag"]
+        assert response.json()["state"] == "succeeded"
+        assert lifecycle.disconnect_calls == 0
+        assert lifecycle.current.profile_id == profile["profile_id"]
+        assert client.get(
+            f"/desktop/v1/profiles/{profile['profile_id']}", headers=SESSION_HEADERS
+        ).json()["connection_state"] == "connected"
+
+
+def test_late_success_keeps_cancelled_terminal_and_closes_its_transport(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lifecycle = FakeRemoteLifecycle()
+
+    def connect(profile) -> RemoteConnectionResult:
+        lifecycle.connect_calls += 1
+        lifecycle.current = RemoteLifecycleSnapshot(profile.profile_id, "connected")
+        return RemoteConnectionResult(profile.profile_id, "connected")
+
+    lifecycle.connect = connect  # type: ignore[method-assign]
+    app = _app(tmp_path / "state", remote_lifecycle=lifecycle)
+    with TestClient(app) as client:
+        profile = _create_profile(
+            client, name="Cancelled terminal", key="profile-cancelled-create-0001"
+        ).json()
+        store = app.state.desktop_release_provider._store
+        original_complete = store.complete_profile_runtime_action
+
+        def cancel_before_complete(*args: object, **kwargs: object):
+            current = store.get_profile(profile["profile_id"])
+            with store._transaction(write=True) as connection:
+                ProviderMutation(store, connection).set_profile_runtime_state(
+                    profile["profile_id"],
+                    if_match=current.etag,
+                    connection_state="disconnected",
+                    credential_slots=current.credential_slots,
+                    host_key_fingerprint=current.host_key_fingerprint,
+                )
+            return original_complete(*args, **kwargs)
+
+        monkeypatch.setattr(store, "complete_profile_runtime_action", cancel_before_complete)
+        headers = {
+            **SESSION_HEADERS,
+            "If-Match": profile["etag"],
+            "Idempotency-Key": "profile-cancelled-connect-0001",
+        }
+        cancelled = client.post(
+            f"/desktop/v1/profiles/{profile['profile_id']}/connect", headers=headers
+        )
+        replay = client.post(
+            f"/desktop/v1/profiles/{profile['profile_id']}/connect", headers=headers
+        )
+
+        assert cancelled.status_code == replay.status_code == 202
+        assert cancelled.content == replay.content
+        assert cancelled.headers["etag"] == replay.headers["etag"]
+        assert cancelled.json()["state"] == "cancelled"
+        assert lifecycle.connect_calls == 1
+        assert lifecycle.disconnect_calls == 1
+        assert lifecycle.current.state == "disconnected"
+        assert client.get(
+            f"/desktop/v1/profiles/{profile['profile_id']}", headers=SESSION_HEADERS
+        ).json()["connection_state"] == "disconnected"
 
 
 def test_pagination_cursor_and_typed_contract_errors(tmp_path: Path) -> None:

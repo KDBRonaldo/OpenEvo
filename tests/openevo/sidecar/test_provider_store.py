@@ -844,6 +844,45 @@ def test_nonterminal_profile_reservation_is_cancelled_exactly_once_on_restart(
     ).fetchone()
     assert persisted is not None and bytes(persisted[0]) == frozen
     recovered_etag = recovered.operation.etag
+    late_success = reopened.complete_profile_runtime_action(
+        reservation=reservation,
+        route=cast(str, action["route"]),
+        profile_id=profile.profile_id,
+        key=cast(str, action["key"]),
+        body={},
+        if_match=profile.etag,
+        connection_state="connected",
+        host_key_fingerprint="SHA256:late-success-must-not-publish",
+    )
+    late_error = ApiErrorV1(
+        request_id=reservation.operation.operation_id,
+        code="connection_operation_superseded",
+        http_status=409,
+        message="A newer connection action replaced this SSH operation.",
+        severity=ErrorSeverity.BLOCKING,
+        category=ErrorCategory.AUTHENTICATION,
+        retryable=True,
+        repair_action=RepairAction.OPENEVO_CAN_RETRY,
+        next_action="Reload the connection state before retrying.",
+    )
+    late_failure = reopened.fail_profile_runtime_action(
+        reservation=reservation,
+        route=cast(str, action["route"]),
+        profile_id=profile.profile_id,
+        key=cast(str, action["key"]),
+        body={},
+        if_match=profile.etag,
+        error=late_error,
+    )
+    assert late_success == recovered.operation
+    assert late_failure == recovered.operation
+    assert reopened.get_profile(profile.profile_id).connection_state == "disconnected"
+    assert bytes(
+        reopened._connection.execute(
+            "SELECT response_bytes FROM idempotency_records WHERE idempotency_key = ?",
+            (action["key"],),
+        ).fetchone()[0]
+    ) == frozen
     reopened.close()
 
     reopened_again = DesktopProviderStore(root)
