@@ -74,7 +74,25 @@ and the pinned Codex CLI required by the Codex harness. Custom images remain
 pull-only because OpenEvo cannot infer their system dependencies. The fallback
 build fetches Debian package metadata over HTTPS and retains the distribution's
 archive signature verification; proxy or mirror failures never downgrade that
-verification.
+verification. Build proxy args come only from the selected project/profile
+(`HTTP_PROXY`, `HTTPS_PROXY`, and `NO_PROXY`, with lowercase equivalents where
+required). The launcher must not inherit stale Desktop or server shell proxy
+values; the UI-selected proxy port is passed verbatim through explicit build
+args.
+
+For this exact Core-owned Dockerfile only, fallback build uses
+`docker build --network=host` so an explicitly configured server-loopback proxy
+such as `127.0.0.1:<port>` retains host semantics inside build steps. Custom
+images remain pull-only and never receive build or host-network privileges.
+
+The managed Science build was verified on 2026-07-14 with the generated
+Dockerfile, `docker build --network=host`, and explicit host
+`HTTP(S)_PROXY=http://127.0.0.1:7890`. It produced
+`openevo/science-runtime:0.1.0` (reported digest prefix `sha256:16837a`, size
+376342787 bytes) with Codex CLI 0.121.0, Python 3.12.13, and Git 2.39.5. A
+`12345:12345` container user with `HOME=/tmp/openevo-home` could run Codex, and
+the image contained no `/root/.codex/auth.json`; credentials are supplied only
+by the later private runtime mount.
 
 ## Execution Modes
 
@@ -82,23 +100,44 @@ verification.
 `agent.settings.capture_mode="transcript"`. This produces transcript trajectory
 data for text evolution and explicitly has no token-level metrics.
 Remote preflight checks that the remote user has `codex` and
-`~/.codex/auth.json`. During each gateway runtime session, that host auth file
-is staged into `/openevo/session/home/.codex/auth.json`, the managed runtime's
-container-visible `CODEX_HOME`, so the user does not need to log in again.
+`~/.codex/auth.json`. The default subscription model is `gpt-5.5`; an explicit
+user model remains unchanged. This default was verified on 2026-07-14 with
+`codex-cli 0.144.1` and a logged-in ChatGPT account: the same minimal ephemeral,
+read-only JSON smoke succeeded with `gpt-5.5`, while `gpt-5.1-codex-mini`
+returned HTTP 400 unsupported.
+
+During each gateway runtime session, Core creates a private credential root
+outside the session tree and fixes container-visible
+`CODEX_HOME=/openevo/credentials/codex`. Workspace sync and setup complete while
+that mount is empty; only then is the host auth file staged as `auth.json`.
+`agent.env`, `runtime.env`, workspace, artifact, log, and arbitrary session
+subtrees cannot select this path.
 The source must be a private, remote-user-owned, link-count-one regular file of
 bounded size; symlinks, hard links, special files, owner mismatches, and path
 replacement are rejected. The gateway copies from a verified no-follow file
-descriptor into an exclusive `0600` target under `0700` directories and never
-logs credential contents.
+descriptor into an exclusive `0600` target under a `0700` root and rechecks
+source/target size, SHA-256 digest, identity, link count, and change times.
+
+Core derives a bounded exact-value redactor from the verified auth JSON and its
+string leaves. Stdout/stderr, transcript logs, workspace, and artifact capture
+surfaces are scanned without following links before persistence; over-budget
+content is replaced rather than copied raw. Codex is the necessary trusted
+credential consumer, so this boundary does not claim to prevent Codex from
+actively transforming and transmitting a secret. It does guarantee that
+OpenEvo's own sync/scanner/capture paths do not automatically copy the verified
+auth document or known leaf values verbatim.
 
 Managed containers use the Core process UID/GID with
 `HOME=/openevo/session/home`. The managed `PATH` still begins with
-`/home/openevo/.local/bin`, which contains the pinned Codex binary, while Codex
-state and evolution skills remain on the writable session bind mount. No
+`/home/openevo/.local/bin`, which contains the pinned Codex binary. Codex state
+remains on the dedicated credential mount, while evolution skills remain on the
+writable session bind mount. No
 host-user lifecycle path applies recursive `a+rwX`. Teardown uses the
 dispatch-pinned session root identity and a bounded fd-relative no-follow walk,
 so nested `000` directories converge without following symlinks; owner or root
-identity replacement fails closed.
+identity replacement fails closed. Session and credential cleanup starts only
+after every related container has been proven removed; Docker kill/remove
+failure keeps the runtime retryable and both roots intact.
 
 `self-deployed` uses proxy authentication and requires `execution.hf_model`.
 The legacy config value `codex_managed_local_inference` remains accepted as an

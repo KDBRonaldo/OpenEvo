@@ -126,7 +126,7 @@ def test_auth_staging_detects_source_path_exchange_and_removes_target(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    secret = "private-session-secret"
+    secret = '{"access_token":"private-session-secret"}'
     source = _private_auth(tmp_path, secret)
     root, identity = _session_root(tmp_path)
     original_copy = session_files._copy_exact
@@ -149,7 +149,7 @@ def test_auth_staging_detects_target_replacement_without_leaking_secret(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    secret = "private-session-secret"
+    secret = '{"access_token":"private-session-secret"}'
     source = _private_auth(tmp_path, secret)
     root, identity = _session_root(tmp_path)
     target = root / "home" / ".codex" / "auth.json"
@@ -168,6 +168,141 @@ def test_auth_staging_detects_target_replacement_without_leaking_secret(
 
     assert target.read_text(encoding="utf-8") == "replacement"
     assert secret not in target.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("race_target", ["source", "target"])
+def test_auth_staging_final_path_recheck_detects_new_hardlink(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    race_target: str,
+) -> None:
+    secret = '{"access_token":"canary-secret"}\n'
+    source = _private_auth(tmp_path, secret)
+    root, identity = _session_root(tmp_path)
+    target = root / "home" / ".codex" / "auth.json"
+    raced_link = (
+        source.with_name("raced-source-link.json")
+        if race_target == "source"
+        else target.with_name("raced-target-link.json")
+    )
+    original_require = session_files._require_path_identity
+    raced = False
+
+    def add_hardlink_before_recheck(
+        directory_fd: int,
+        name: str,
+        expected: os.stat_result,
+        *,
+        label: str,
+    ) -> None:
+        nonlocal raced
+        is_selected = (
+            race_target == "source" and label == "Codex subscription auth"
+        ) or (race_target == "target" and label == "staged Codex auth")
+        if is_selected and not raced:
+            raced = True
+            os.link(
+                name,
+                raced_link.name,
+                src_dir_fd=directory_fd,
+                dst_dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
+        original_require(directory_fd, name, expected, label=label)
+
+    monkeypatch.setattr(
+        session_files,
+        "_require_path_identity",
+        add_hardlink_before_recheck,
+    )
+
+    with pytest.raises(SessionFileSecurityError, match="path changed"):
+        _stage(source, root, identity)
+
+    assert not target.exists()
+    if race_target == "target":
+        assert secret not in raced_link.read_text(encoding="utf-8")
+
+
+def test_auth_staging_rejects_same_size_target_content_mismatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = _private_auth(tmp_path, '{"access_token":"canary-secret"}\n')
+    root, identity = _session_root(tmp_path)
+
+    def copy_wrong_bytes(source_fd: int, target_fd: int, expected_size: int) -> None:
+        del source_fd
+        os.write(target_fd, b"x" * expected_size)
+
+    monkeypatch.setattr(session_files, "_copy_exact", copy_wrong_bytes)
+
+    with pytest.raises(SessionFileSecurityError, match="digest"):
+        _stage(source, root, identity)
+
+
+def test_credential_redactor_redacts_auth_json_and_nested_sensitive_leaves() -> None:
+    auth = (
+        b'{"tokens":{"access_token":"access-canary",'
+        b'"refresh_token":"refresh-canary"},"account_id":"account-canary"}'
+    )
+    redactor = session_files.CredentialRedactor.from_auth_json(auth)
+    captured = (
+        f"raw={auth.decode()} access=access-canary refresh=refresh-canary "
+        "account=account-canary safe=visible"
+    )
+
+    redacted = redactor.redact(captured)
+
+    for canary in (
+        auth.decode(),
+        "access-canary",
+        "refresh-canary",
+        "account-canary",
+    ):
+        assert canary not in redacted
+    assert "safe=visible" in redacted
+
+
+def test_credential_redactor_fails_closed_for_oversized_capture() -> None:
+    redactor = session_files.CredentialRedactor.from_auth_json(
+        b'{"access_token":"access-canary"}'
+    )
+
+    redacted = redactor.redact("x" * (session_files._CAPTURE_REDACTION_MAX_BYTES + 1))
+
+    assert redacted == session_files.CAPTURE_REDACTION_LIMIT_MARKER
+
+
+def test_capture_tree_redaction_covers_workspace_artifacts_and_logs(
+    tmp_path: Path,
+) -> None:
+    auth = b'{"access_token":"access-canary","account_id":"account-canary"}'
+    redactor = session_files.CredentialRedactor.from_auth_json(auth)
+    root, identity = _session_root(tmp_path)
+    for relative in (
+        "workspace/copied-auth.json",
+        "artifacts/result.txt",
+        "logs/agent/step.00.stdout.log",
+    ):
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            f"{auth.decode()} access-canary account-canary visible",
+            encoding="utf-8",
+        )
+
+    session_files.redact_session_capture_tree(root, identity, redactor)
+
+    persisted = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in root.rglob("*")
+        if path.is_file()
+    )
+    assert "access-canary" not in persisted
+    assert "account-canary" not in persisted
+    assert auth.decode() not in persisted
+    assert "visible" in persisted
 
 
 def test_cleanup_recovers_nested_zero_modes_and_removes_staged_auth(tmp_path: Path) -> None:

@@ -51,6 +51,10 @@ token metric 的 trace。
 Subscription auth 只是某些 harness 的登录方式，不会自动开启 transcript capture。
 使用 `auth_mode="subscription"` 或 harness-specific subscription alias 时，harness
 必须同时看到 transcript capture mode，否则应拒绝运行。
+Managed subscription release admission is stricter than the generic pure-text
+aliases: it requires the literal `capture_mode="transcript"`. Gateway redacts
+the verified auth JSON and bounded sensitive leaf set before writing the log
+that this builder consumes.
 
 这个 trace 保留 `prompt_messages` / `response_messages`，但 `response_ids`、
 `loss_mask` 和 `response_logprobs` 为空。metadata 会设置

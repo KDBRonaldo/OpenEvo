@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from openevo.runtime.managed import ManagedRuntimeProfile
 
 
 class ExecInput(BaseModel):
@@ -56,7 +58,10 @@ class ExecResult(BaseModel):
 class RuntimeSpec(BaseModel):
     """Container runtime configuration for one rollout session."""
 
+    model_config = ConfigDict(extra="forbid")
+
     backend: Literal["docker", "apptainer"] = "docker"
+    profile: ManagedRuntimeProfile | None = None
     container_user: Literal["image", "host"] = "image"
     image: str
     prepare: list[PrepareAction] = Field(default_factory=list)

@@ -52,7 +52,7 @@ VALID_DRAFT = {
     "auth_method": "ssh_agent",
     "https_proxy": "http://127.0.0.1:7890",
     "huggingface_endpoint": "https://hf-mirror.com",
-    "codex_model": "gpt-5.1-codex-mini",
+    "codex_model": "gpt-5.5",
     "evolution": {"targets": EVOLUTION_TARGETS},
 }
 
@@ -68,7 +68,7 @@ def test_desktop_project_config_draft_builds_existing_models() -> None:
     assert project.task.source.type == "remote_path"
     assert project.task.source.path == "/datasets/folding-baseline"
     assert project.execution.mode == "codex_subscription_transcript"
-    assert project.execution.codex_model == "gpt-5.1-codex-mini"
+    assert project.execution.codex_model == "gpt-5.5"
     assert project.evolution.model_dump(mode="json") == {
         "targets": EVOLUTION_TARGETS
     }
@@ -89,7 +89,7 @@ def test_desktop_project_config_draft_defaults_subscription_codex_model() -> Non
     project, _profile = build_desktop_project_configs(draft)
 
     assert project.execution.mode == "codex_subscription_transcript"
-    assert project.execution.codex_model == "gpt-5.1-codex-mini"
+    assert project.execution.codex_model == "gpt-5.5"
     assert project.execution.hf_model is None
 
 

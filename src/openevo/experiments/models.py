@@ -19,8 +19,11 @@ from openevo.evolution.framework import (
     ProjectEvolutionTargetMap,
     ProjectEvolutionTargetSelection,
 )
-from openevo.harness.capture import TRANSCRIPT_CAPTURE_MODES, transcript_capture_enabled
 from openevo.projects.evolution_defaults import default_project_evolution_targets
+from openevo.runtime.managed import (
+    ManagedRuntimeProfile,
+    require_managed_subscription_runtime,
+)
 
 _SUBSCRIPTION_AUTH_MODES = {"subscription", "chatgpt_subscription"}
 _NATIVE_MEMORY_POLICIES = {"preserve", "clear"}
@@ -81,18 +84,17 @@ class AgentConfig(_StrictModel):
         ):
             raise ValueError("agent.settings.auth_mode must match agent.auth")
         capture_mode = self.settings.get("capture_mode")
-        if (
-            self.auth in _SUBSCRIPTION_AUTH_MODES
-            and (
-                capture_mode is None
-                or not transcript_capture_enabled(capture_mode)
-            )
-        ):
-            accepted = ", ".join(repr(value) for value in TRANSCRIPT_CAPTURE_MODES)
+        if self.auth in _SUBSCRIPTION_AUTH_MODES and capture_mode != "transcript":
             raise ValueError(
                 "subscription agents require transcript capture; "
-                f"settings.capture_mode must be one of: {accepted}"
+                "settings.capture_mode='transcript' is mandatory"
             )
+        if self.auth in _SUBSCRIPTION_AUTH_MODES and self.preset != "codex":
+            raise ValueError(
+                "managed subscription execution currently requires agent.preset='codex'"
+            )
+        if self.auth in _SUBSCRIPTION_AUTH_MODES and "CODEX_HOME" in self.env:
+            raise ValueError("subscription CODEX_HOME is Core-owned and must be omitted")
         if "native_memory_policy" in self.settings:
             native_memory_policy = self.settings["native_memory_policy"]
             if (
@@ -130,6 +132,7 @@ class RuntimePrepareActionConfig(_StrictModel):
 
 class RuntimeConfig(_StrictModel):
     kind: Literal["docker", "apptainer"] = "docker"
+    profile: ManagedRuntimeProfile | None = None
     container_user: Literal["image", "host"] = "image"
     workdir: str = "/openevo/session/workspace"
     image: str | None = None
@@ -265,13 +268,16 @@ class ExperimentConfig(_StrictModel):
         task_ids = [task.id for task in self.tasks]
         if len(task_ids) != len(set(task_ids)):
             raise ValueError("tasks[].id values must be unique")
-        if (
-            self.agent.auth in _SUBSCRIPTION_AUTH_MODES
-            and self.runtime.container_user != "host"
-        ):
-            raise ValueError(
-                "subscription credentials require runtime.container_user='host'; "
-                "image-user runtimes may widen bind-mount permissions"
+        if self.agent.auth in _SUBSCRIPTION_AUTH_MODES:
+            if "CODEX_HOME" in self.runtime.env:
+                raise ValueError(
+                    "subscription runtime CODEX_HOME is Core-owned and must be omitted"
+                )
+            require_managed_subscription_runtime(
+                profile=self.runtime.profile,
+                image=self.runtime.image,
+                backend=self.runtime.kind,
+                container_user=self.runtime.container_user,
             )
         if (
             self.evolution.targets.get(
@@ -340,6 +346,7 @@ def _normalize_http_url(value: str, field_name: str) -> str:
 def _runtime_has_non_default_overrides(runtime: RuntimeConfig) -> bool:
     return (
         runtime.kind != "docker"
+        or runtime.profile is not None
         or runtime.workdir != "/openevo/session/workspace"
         or bool(runtime.env)
         or bool(runtime.prepare)

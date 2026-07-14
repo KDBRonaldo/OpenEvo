@@ -3124,7 +3124,7 @@ def test_subscription_transcript_status_rejects_token_metrics() -> None:
     with pytest.raises(ValueError, match="token_metrics_available"):
         DesktopExecutionStatus(
             mode="codex_subscription_transcript",
-            model="gpt-5.1-codex-mini",
+            model="gpt-5.5",
             token_metrics_available=True,
         )
 
@@ -3217,7 +3217,7 @@ def _desktop_config_draft_payload() -> dict:
         "auth_method": "ssh_agent",
         "https_proxy": "http://127.0.0.1:7890",
         "huggingface_endpoint": "https://hf-mirror.com",
-        "codex_model": "gpt-5.1-codex-mini",
+        "codex_model": "gpt-5.5",
         "evolution": {"targets": _evolution_targets_payload()},
     }
 
@@ -3923,7 +3923,7 @@ def test_build_desktop_shell_status_from_subscription_project() -> None:
     assert status.project.source == "Remote path: /datasets/folding-baseline"
     assert status.project.evolution_targets == project.evolution.targets
     assert status.execution.mode == "codex_subscription_transcript"
-    assert status.execution.model == "gpt-5.1-codex-mini"
+    assert status.execution.model == "gpt-5.5"
     assert status.execution.token_metrics_available is False
     assert status.bootstrap.ready is False
     assert status.bootstrap.workspace_root == "/home/alice/.openevo/workspaces"

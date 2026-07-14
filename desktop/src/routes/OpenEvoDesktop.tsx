@@ -416,7 +416,7 @@ export function OpenEvoDesktop() {
       execution_mode: executionMode,
       codex_model:
         executionMode === "codex_subscription_transcript"
-          ? current.codex_model || "gpt-5.1-codex-mini"
+          ? current.codex_model || "gpt-5.5"
           : null,
       hf_model: executionMode === "self-deployed" ? current.hf_model || "" : null,
     }));

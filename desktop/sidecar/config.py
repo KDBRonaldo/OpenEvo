@@ -74,7 +74,7 @@ class DesktopProjectConfigDraft(_StrictFrozenModel):
         )
         data = data | {"execution_mode": mode}
         if mode == "codex_subscription_transcript" and "codex_model" not in data:
-            return data | {"codex_model": "gpt-5.1-codex-mini"}
+            return data | {"codex_model": "gpt-5.5"}
         return data
 
     @field_validator(

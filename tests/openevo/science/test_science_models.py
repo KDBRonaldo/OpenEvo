@@ -36,7 +36,7 @@ def test_minimal_project_defaults_to_science_subscription_transcript() -> None:
 
     assert config.environment.profile == "managed_science"
     assert config.execution.mode == "codex_subscription_transcript"
-    assert config.execution.codex_model == "gpt-5.1-codex-mini"
+    assert config.execution.codex_model == "gpt-5.5"
     assert config.evolution.model_dump(mode="json")["targets"] == {
         "text_memory": {
             "enabled": True,

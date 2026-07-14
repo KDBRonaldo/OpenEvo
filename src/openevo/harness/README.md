@@ -64,9 +64,13 @@ lines.
 
 ### Codex native memory
 
-The Codex preset stores Codex CLI state under `CODEX_HOME`, defaulting to
-`/openevo/session/.codex` inside the runtime. OpenEvo preserves that state by
-default. To start a Codex run without native Codex memory, set:
+For proxy-authenticated runs, the Codex preset stores Codex CLI state under
+`CODEX_HOME`, defaulting to `/openevo/session/.codex` inside the runtime.
+Managed subscription release runs are stricter: Core fixes
+`CODEX_HOME=/openevo/credentials/codex` to a dedicated private credential bind
+mount outside the session tree, and caller env cannot override it. OpenEvo
+preserves native Codex memory by default. To start a Codex run without native
+Codex memory, set:
 
 ```yaml
 agent:

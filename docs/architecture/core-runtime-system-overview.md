@@ -145,14 +145,16 @@ token-level RL 训练必须过滤掉 `token_level_metrics_available=false` 的 t
 或要求任务走 OpenEvo proxy 模式。
 
 如果 harness 选择 `auth_mode="subscription"` 或 harness-specific subscription
-alias，它必须同时设置 transcript capture mode。Codex subscription 模式会显式
-unset proxy 相关环境变量，并使用已有 `CODEX_HOME` 登录态运行；其中
-`config.toml` 每次 session 都由 OpenEvo 重新生成并覆盖，避免宿主机或预认证目录中的
-Codex 配置影响 OpenEvo 任务。其他订阅式 harness 也应遵守同样边界：订阅负责 auth，
-transcript capture 负责 evolution 可消费的行为记录。
-当 Codex subscription session 未显式提供容器内登录目录时，gateway 会把宿主机
-`~/.codex/auth.json` staging 到 per-session bind mount 下的默认 `CODEX_HOME`
-（`/openevo/session/.codex`），这样远端 host 登录态可以被容器内 Codex CLI 使用。
+alias，它必须同时设置 transcript capture mode。当前 managed subscription release 只接受
+literal `capture_mode="transcript"`、exact managed runtime profile/image、Docker host-user
+执行，并显式 unset proxy 相关环境变量。其他订阅式 harness 也应遵守同样边界：订阅负责
+auth，transcript capture 负责 evolution 可消费的行为记录。
+
+Codex subscription 的 `CODEX_HOME` 由 Core 固定为
+`/openevo/credentials/codex`。Gateway 仅在 runtime prepare 完成后，才把经过 no-follow、
+owner、regular、link-count-one、size/digest/identity 完整校验的宿主机
+`~/.codex/auth.json` staging 到 session tree 外的专用私有 bind mount。Workspace、artifact、
+log 和 transcript capture 不得自动复制 auth 原文或已知敏感 leaf values。
 
 ## 主要模块
 

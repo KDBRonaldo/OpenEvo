@@ -61,15 +61,14 @@ def test_subscription_project_compiles_to_transcript_experiment_config() -> None
 
     assert compiled.experiment.name == "protein-design"
     assert compiled.agent.preset == "codex"
-    assert compiled.agent.model == "gpt-5.1-codex-mini"
+    assert compiled.agent.model == "gpt-5.5"
     assert compiled.agent.auth == "subscription"
     assert compiled.agent.settings == {
         "auth_mode": "subscription",
         "capture_mode": "transcript",
     }
-    assert compiled.agent.env == {
-        "CODEX_HOME": "/openevo/session/home/.codex",
-    }
+    assert compiled.agent.env == {}
+    assert compiled.runtime.profile == "managed_science"
     assert compiled.runtime.image == MANAGED_RUNTIME_IMAGES["managed_science"]
     assert compiled.runtime.workdir == "/openevo/session/workspace"
     assert compiled.runtime.container_user == "host"
@@ -169,6 +168,7 @@ def test_custom_runtime_image_does_not_override_the_image_user() -> None:
     )
 
     assert compiled.runtime.image == "ghcr.io/example/science:latest"
+    assert compiled.runtime.profile is None
     assert compiled.runtime.container_user == "image"
     assert "HOME" not in compiled.runtime.env
     assert "PATH" not in compiled.runtime.env

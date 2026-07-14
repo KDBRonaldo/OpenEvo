@@ -56,19 +56,39 @@ statuses are `COMPLETED`, `ERROR`, or `TIMEOUT`.
 
 ## Subscription credentials and session cleanup
 
-Codex subscription sessions are admitted only with a host-user runtime. The
-gateway opens the remote user's `~/.codex/auth.json` with `O_NOFOLLOW` and a
+Codex subscription sessions are admitted only for an exact Core-managed runtime
+profile/image, Docker host-user execution, and literal `capture_mode=transcript`.
+Custom images, runtime loaders/options, entrypoints, and caller-supplied
+`CODEX_HOME` fail before credential staging. Core fixes `CODEX_HOME` to
+`/openevo/credentials/codex`, backed by a dedicated private host directory that
+is not below the session, workspace, artifact, or log tree. Runtime prepare and
+workspace upload finish while this directory is still empty.
+
+The gateway opens the remote user's `~/.codex/auth.json` with `O_NOFOLLOW` and a
 stable descriptor, then requires a user-owned, link-count-one regular file with
-private permissions and a bounded size. It creates the session copy exclusively
-as `0600` under private `0700` directories and copies from the verified source
-descriptor. Source or destination pathname replacement aborts staging without
-publishing the credential or logging its contents.
+private permissions and a bounded size. It creates `auth.json` exclusively as
+`0600` under the private `0700` credential root. Source and target size, digest,
+identity, link count, and change times are rechecked against their open file
+descriptors and final pathnames. A mismatch scrubs the staged inode before
+cleanup and aborts without logging credential contents.
+
+Verified auth JSON supplies a bounded set of exact sensitive leaf values. The
+gateway redacts those values from stdout/stderr and transcript logs and performs
+a bounded no-follow scan of session workspace, artifact, and log files before
+export; captures over the content budget are replaced by a redaction marker.
+This prevents OpenEvo's own sync, scanner, and capture paths from automatically
+copying known credential bytes. The Codex harness remains a necessary trusted
+consumer of the credential. OpenEvo cannot prevent that process from actively
+transforming or transmitting a secret; that behavior is outside this boundary.
 
 The session root is pinned by device, inode, and owner before runtime startup.
 Teardown walks only from that descriptor, never follows links, restores only
 owner access needed to enter `000` directories, and enforces depth and node
 limits. A replaced root, changed nested entry, or foreign-owned object stops
-cleanup without deleting the replacement.
+cleanup without deleting the replacement. Docker teardown marks a runtime
+destroyed only after `rm -f` succeeds or a follow-up inspect proves the
+container absent. Kill/remove failures remain retryable and retain both session
+and credential roots, so cleanup never races a live container.
 
 ## What it captures
 

@@ -438,7 +438,7 @@ def test_backend_client_redacts_project_validation_error() -> None:
             {
                 "execution_mode": "codex_subscription_transcript",
                 "expected_registry_digest": "a" * 64,
-                "agent_model": "gpt-5.1-codex-mini",
+                "agent_model": "gpt-5.5",
                 "targets": {},
             }
         )

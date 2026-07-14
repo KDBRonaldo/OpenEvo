@@ -55,7 +55,7 @@ describe("OpenEvo sidecar client", () => {
       },
       execution: {
         mode: "codex_subscription_transcript",
-        model: "gpt-5.1-codex-mini",
+        model: "gpt-5.5",
         token_metrics_available: false,
       },
       bootstrap: {
@@ -199,7 +199,7 @@ describe("OpenEvo sidecar client", () => {
         },
         execution: {
           mode: "codex_subscription_transcript",
-          model: "gpt-5.1-codex-mini",
+          model: "gpt-5.5",
           token_metrics_available: false,
         },
         bootstrap: {
@@ -1147,7 +1147,7 @@ function sidecarShellPayload(mutationToken: string) {
     },
     execution: {
       mode: "codex_subscription_transcript" as const,
-      model: "gpt-5.1-codex-mini",
+      model: "gpt-5.5",
       token_metrics_available: false,
     },
     bootstrap: {
@@ -1236,7 +1236,7 @@ function projectConfigDraft() {
     https_proxy: "http://127.0.0.1:7890",
     huggingface_endpoint: "https://hf-mirror.com",
     execution_mode: "codex_subscription_transcript" as const,
-    codex_model: "gpt-5.1-codex-mini",
+    codex_model: "gpt-5.5",
     evolution: { targets: evolutionTargets() },
   };
 }

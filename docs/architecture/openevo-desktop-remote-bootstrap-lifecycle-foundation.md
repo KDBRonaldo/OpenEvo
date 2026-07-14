@@ -112,13 +112,12 @@ actionable report instead of enabling an unauthenticated package path.
 Subscription-mode Codex auth is checked on the remote host during preflight and
 bootstrap. At gateway runtime initialization, the host `~/.codex/auth.json` is
 verified as a private user-owned, link-count-one regular file and copied through
-a stable no-follow descriptor into the per-session bind mount. Managed Science
-uses `HOME=/openevo/session/home` and
-`CODEX_HOME=/openevo/session/home/.codex`; the pinned Codex install remains on
-`PATH` at `/home/openevo/.local/bin`. Users should not need to log in inside the
-managed runtime container. Custom-image subscription projects fail validation
-because image-user permission compatibility cannot safely stage this
-credential.
+a stable no-follow descriptor into a dedicated private credential bind mount
+outside the session tree. Managed Science uses `HOME=/openevo/session/home` and
+Core-fixed `CODEX_HOME=/openevo/credentials/codex`; the pinned Codex install
+remains on `PATH` at `/home/openevo/.local/bin`. Users should not need to log in
+inside the managed runtime container. Custom-image subscription projects fail
+exact profile/image admission before credential staging.
 
 ## Execution Semantics
 
@@ -157,6 +156,16 @@ This includes standard `HTTP_PROXY`, `HTTPS_PROXY`, lowercase variants,
 `extra_env`. The live `openevo-backend run` transport call receives the same
 environment so its in-process evolution worker uses the configured mirrors,
 proxies, and extra variables rather than only applying them during bootstrap.
+Runtime image pull/build commands explicitly unset every uppercase/lowercase
+proxy variable that is absent from that profile before invoking Docker. This
+prevents stale SSH login-shell `ALL_PROXY`/HTTP(S) proxy values from becoming a
+release default while preserving explicit `NO_PROXY` and the exact UI-selected
+proxy URL and port. Managed builds pass the same explicit variables as Docker
+build args; no proxy value is embedded in the command text. The exact
+Core-owned managed Dockerfile builds with `--network=host`, allowing an
+explicit server-loopback proxy (`127.0.0.1:<port>`) to remain reachable from
+APT and npm build steps. Custom images remain pull-only and do not receive
+build or host-network privileges.
 
 The `ensure_openevo_cli` step is intentionally user-scoped. It never falls back
 to installing the latest package from PyPI. Desktop first looks for a

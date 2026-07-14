@@ -24,6 +24,7 @@ from openevo.evolution.framework.builtins import (
     _target_descriptors,
     build_builtin_registry,
 )
+from openevo.runtime.managed import MANAGED_RUNTIME_IMAGES
 
 ExperimentConfig = experiments.ExperimentConfig
 _compile_experiment = experiments.compile_experiment
@@ -187,7 +188,13 @@ def _config(**overrides: object) -> ExperimentConfig:
     }
     payload.update(overrides)
     if payload["agent"].get("auth") in {"subscription", "chatgpt_subscription"}:
-        payload["runtime"].setdefault("container_user", "host")
+        payload["runtime"].update(
+            {
+                "profile": "managed_science",
+                "image": MANAGED_RUNTIME_IMAGES["managed_science"],
+                "container_user": "host",
+            }
+        )
     return ExperimentConfig.model_validate(payload)
 
 

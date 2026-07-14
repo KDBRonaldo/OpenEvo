@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Awaitable, Callable
 
 from openevo.harness.models import AgentRunResult
+from openevo.gateway.session_files import CredentialRedactor
 from openevo.rollout.models import SessionDispatchRequest, SessionResult
 from openevo.rollout.timer import StageTimer
 from openevo.runtime.base import BaseRuntime
@@ -65,6 +66,9 @@ class ManagedSession:
     session_dir: Path
     artifacts_dir: Path
     session_root_identity: tuple[int, int, int] | None = None
+    credential_dir: Path | None = None
+    credential_root_identity: tuple[int, int, int] | None = None
+    credential_redactor: CredentialRedactor | None = None
     runtime: BaseRuntime | None = None
     agent_result: AgentRunResult | None = None
     final_result: SessionResult | None = None
@@ -73,6 +77,7 @@ class ManagedSession:
     cancel_requested: bool = False
     cancel_event: asyncio.Event = field(default_factory=asyncio.Event)
     execution_deadline: float | None = None
+    runtime_cleanup_blocked: bool = False
     stage: SessionStage = SessionStage.INIT
     inflight: bool = False
 

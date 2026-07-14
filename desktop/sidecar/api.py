@@ -1418,7 +1418,7 @@ def _execution_status(project: ScienceProjectConfig) -> DesktopExecutionStatus:
     if project.execution.mode == "codex_subscription_transcript":
         return DesktopExecutionStatus(
             mode=project.execution.mode,
-            model=project.execution.codex_model or "gpt-5.1-codex-mini",
+            model=project.execution.codex_model or "gpt-5.5",
             token_metrics_available=False,
         )
     return DesktopExecutionStatus(

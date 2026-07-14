@@ -17,7 +17,11 @@ _BUILTIN_BACKENDS: dict[str, type[BaseRuntime]] = {
 
 
 def create_runtime(
-    spec: RuntimeSpec, session_id: str, session_dir: Path
+    spec: RuntimeSpec,
+    session_id: str,
+    session_dir: Path,
+    *,
+    credential_dir: Path | None = None,
 ) -> BaseRuntime:
     """Instantiate a runtime from a RuntimeSpec.
 
@@ -25,6 +29,8 @@ def create_runtime(
     Falls back to ``spec.import_path`` for plugin runtimes.
     """
     if spec.import_path:
+        if credential_dir is not None:
+            raise ValueError("managed credentials cannot be passed to a plugin runtime")
         cls = _import_runtime_class(spec.import_path)
         runtime = cls(spec, session_id, session_dir)
         _validate_runtime_capabilities(runtime)
@@ -32,7 +38,17 @@ def create_runtime(
     cls = _BUILTIN_BACKENDS.get(spec.backend)
     if cls is None:
         raise ValueError(f"Unsupported runtime backend: {spec.backend}")
-    runtime = cls(spec, session_id, session_dir)
+    if credential_dir is not None:
+        if cls is not DockerRuntime:
+            raise ValueError("managed credentials require the Docker runtime")
+        runtime = DockerRuntime(
+            spec,
+            session_id,
+            session_dir,
+            credential_dir=credential_dir,
+        )
+    else:
+        runtime = cls(spec, session_id, session_dir)
     _validate_runtime_capabilities(runtime)
     return runtime
 

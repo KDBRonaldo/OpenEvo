@@ -37,9 +37,11 @@ _MANAGED_RUNTIME_BASE_IMAGE = "node:22-bookworm-slim"
 _MANAGED_RUNTIME_PYTHON_IMAGE = "python:3.12-slim-bookworm"
 _MANAGED_RUNTIME_CODEX_PACKAGE = "@openai/codex@0.121.0"
 _DOCKER_PROXY_BUILD_ARGS = (
+    "ALL_PROXY",
     "HTTP_PROXY",
     "HTTPS_PROXY",
     "NO_PROXY",
+    "all_proxy",
     "http_proxy",
     "https_proxy",
     "no_proxy",
@@ -361,6 +363,7 @@ def build_remote_bootstrap_plan(
                 command=_runtime_image_command(
                     runtime_image,
                     state_root=state_root,
+                    proxy_env=proxy_env,
                 ),
                 env=proxy_env,
                 timeout_seconds=900.0,
@@ -542,9 +545,20 @@ def _is_managed_runtime_image(image: str) -> bool:
     return image in _MANAGED_RUNTIME_IMAGE_SET
 
 
-def _runtime_image_command(runtime_image: str, *, state_root: str) -> str:
+def _runtime_image_command(
+    runtime_image: str,
+    *,
+    state_root: str,
+    proxy_env: Mapping[str, str],
+) -> str:
+    inherited_proxy_keys = tuple(
+        key for key in _DOCKER_PROXY_BUILD_ARGS if key not in proxy_env
+    )
+    unset_proxy = (
+        "unset " + " ".join(inherited_proxy_keys) if inherited_proxy_keys else ":"
+    )
     if not _is_managed_runtime_image(runtime_image):
-        return f"docker pull {shlex.quote(runtime_image)}"
+        return f"{unset_proxy}\ndocker pull {shlex.quote(runtime_image)}"
 
     context_dir = posixpath.join(
         state_root,
@@ -558,13 +572,14 @@ def _runtime_image_command(runtime_image: str, *, state_root: str) -> str:
     image_ref = shlex.quote(runtime_image)
     return "\n".join(
         [
+            unset_proxy,
             _write_text_command(
                 dockerfile_path,
                 _managed_runtime_dockerfile(),
             ),
             (
                 f"docker pull {image_ref} || docker build {build_args} "
-                f"--pull -t {image_ref} {shlex.quote(context_dir)}"
+                f"--network=host --pull -t {image_ref} {shlex.quote(context_dir)}"
             ),
         ]
     )

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 
@@ -23,6 +24,7 @@ from openevo.gateway.node import (
     write_evolution_context_files,
 )
 from openevo.gateway.session import SessionRegistry
+from openevo.gateway import session_files
 from openevo.gateway.session_files import capture_session_root_identity
 from openevo.rollout.models import (
     SessionDispatchRequest,
@@ -32,7 +34,9 @@ from openevo.rollout.models import (
 )
 from openevo.rollout.timer import StageTimer
 from openevo.runtime.base import BaseRuntime
+from openevo.runtime.managed import MANAGED_CODEX_HOME, MANAGED_RUNTIME_IMAGES
 from openevo.runtime.models import ExecInput, ExecResult, RuntimeSpec
+from openevo.trajectory.builder.agent_transcript import AgentTranscriptBuilder
 from openevo.trajectory.models import CompletionRecord, CompletionSession, Trajectory
 from openevo.trajectory.registry import default_builder_registry
 
@@ -142,7 +146,7 @@ def test_build_evolution_session_event_preserves_explicit_falsey_metadata():
     assert event["rollout_step"] == 0
 
 
-def test_codex_subscription_auth_is_staged_into_runtime_session(
+def test_codex_subscription_auth_is_staged_into_private_credential_root(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -170,7 +174,7 @@ def test_codex_subscription_auth_is_staged_into_runtime_session(
     manager = GatewayNodeManager.__new__(GatewayNodeManager)
     manager._stage_codex_subscription_auth(request, session_dir)
 
-    staged = session_dir / ".codex" / "auth.json"
+    staged = session_dir / "auth.json"
     assert staged.read_text(encoding="utf-8") == '{"subscription": true}\n'
     assert staged.stat().st_mode & 0o777 == 0o600
     assert staged.parent.stat().st_mode & 0o777 == 0o700
@@ -214,7 +218,11 @@ async def test_gateway_rejects_subscription_before_image_user_runtime_or_auth_st
         task_id="task_1",
         instruction="Do work.",
         remaining_timeout_seconds=60,
-        runtime=RuntimeSpec(image="custom:latest", container_user="image"),
+        runtime=RuntimeSpec(
+            profile="managed_science",
+            image=MANAGED_RUNTIME_IMAGES["managed_science"],
+            container_user="image",
+        ),
         agent=AgentSpec(
             harness="codex",
             model_name="gpt-5.5",
@@ -238,10 +246,152 @@ async def test_gateway_rejects_subscription_before_image_user_runtime_or_auth_st
     assert managed.runtime is None
     assert managed.final_result is not None
     assert managed.final_result.status == SessionStatus.ERROR
-    assert "subscription credentials require a host-user runtime" in (
+    assert "runtime.container_user='host'" in (
         managed.final_result.error or ""
     )
     assert not (session_dir / ".codex").exists()
+
+
+@pytest.mark.asyncio
+async def test_gateway_rejects_host_user_custom_image_before_auth_staging(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_dir = tmp_path / "session"
+    session_dir.mkdir()
+    request = SessionDispatchRequest(
+        session_id="session_1",
+        task_id="task_1",
+        instruction="Do work.",
+        remaining_timeout_seconds=60,
+        runtime=RuntimeSpec(image="custom:latest", container_user="host"),
+        agent=AgentSpec(
+            harness="codex",
+            model_name="gpt-5.5",
+            settings={"auth_mode": "subscription", "capture_mode": "transcript"},
+        ),
+        metadata={},
+    )
+    managed = ManagedSession(
+        request=request,
+        timer=StageTimer(),
+        session_dir=session_dir,
+        artifacts_dir=session_dir / "artifacts",
+        session_root_identity=capture_session_root_identity(session_dir),
+    )
+    manager = GatewayNodeManager.__new__(GatewayNodeManager)
+    manager.node_id = "gateway-test"
+    manager.default_runtime = None
+    stage_auth = Mock(side_effect=AssertionError("auth must not be staged"))
+    monkeypatch.setattr(manager, "_stage_codex_subscription_auth", stage_auth)
+
+    await manager._handle_init(managed)
+
+    assert managed.runtime is None
+    assert managed.final_result is not None
+    assert "managed runtime profile" in (managed.final_result.error or "")
+    stage_auth.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_gateway_rejects_non_codex_subscription_before_auth_staging(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_dir = tmp_path / "session"
+    session_dir.mkdir()
+    request = SessionDispatchRequest(
+        session_id="session_1",
+        task_id="task_1",
+        instruction="Do work.",
+        remaining_timeout_seconds=60,
+        runtime=RuntimeSpec(
+            profile="managed_science",
+            image=MANAGED_RUNTIME_IMAGES["managed_science"],
+            container_user="host",
+        ),
+        agent=AgentSpec(
+            harness="claude_code",
+            settings={"auth_mode": "subscription", "capture_mode": "transcript"},
+        ),
+    )
+    managed = ManagedSession(
+        request=request,
+        timer=StageTimer(),
+        session_dir=session_dir,
+        artifacts_dir=session_dir / "artifacts",
+        session_root_identity=capture_session_root_identity(session_dir),
+    )
+    manager = GatewayNodeManager.__new__(GatewayNodeManager)
+    manager.node_id = "gateway-test"
+    manager.default_runtime = None
+    stage_auth = Mock(side_effect=AssertionError("auth must not be staged"))
+    monkeypatch.setattr(manager, "_stage_codex_subscription_auth", stage_auth)
+
+    await manager._handle_init(managed)
+
+    assert managed.runtime is None
+    assert managed.final_result is not None
+    assert "requires the Codex harness" in (managed.final_result.error or "")
+    stage_auth.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("capture_mode", "agent_env", "error"),
+    [
+        ("pure_text", {}, "capture_mode='transcript'"),
+        (
+            "transcript",
+            {"CODEX_HOME": "/openevo/session/artifacts/.codex"},
+            "CODEX_HOME is Core-owned",
+        ),
+    ],
+)
+async def test_gateway_rejects_non_exact_subscription_contract_before_staging(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capture_mode: str,
+    agent_env: dict[str, str],
+    error: str,
+) -> None:
+    session_dir = tmp_path / "session"
+    session_dir.mkdir()
+    request = SessionDispatchRequest(
+        session_id="session_1",
+        task_id="task_1",
+        instruction="Do work.",
+        remaining_timeout_seconds=60,
+        runtime=RuntimeSpec(
+            profile="managed_science",
+            image=MANAGED_RUNTIME_IMAGES["managed_science"],
+            container_user="host",
+        ),
+        agent=AgentSpec(
+            harness="codex",
+            settings={"auth_mode": "subscription", "capture_mode": capture_mode},
+            env=agent_env,
+        ),
+    )
+    managed = ManagedSession(
+        request=request,
+        timer=StageTimer(),
+        session_dir=session_dir,
+        artifacts_dir=session_dir / "artifacts",
+        session_root_identity=capture_session_root_identity(session_dir),
+    )
+    manager = GatewayNodeManager.__new__(GatewayNodeManager)
+    manager.node_id = "gateway-test"
+    manager.default_runtime = None
+    stage_auth = Mock(side_effect=AssertionError("auth must not be staged"))
+    monkeypatch.setattr(manager, "_stage_codex_subscription_auth", stage_auth)
+
+    await manager._handle_init(managed)
+
+    assert managed.runtime is None
+    assert managed.final_result is not None
+    assert error in (managed.final_result.error or "")
+    stage_auth.assert_not_called()
 
 
 def _session_result(
@@ -501,6 +651,37 @@ async def test_handle_postrun_exports_after_set_result_before_cleanup_and_callba
 
 
 @pytest.mark.asyncio
+async def test_handle_postrun_does_not_cleanup_session_when_runtime_removal_fails(
+    tmp_path,
+):
+    calls: list[str] = []
+    manager = _postrun_manager(calls=calls)
+
+    async def stop_runtime(runtime, session_id, label):
+        del runtime, session_id, label
+        calls.append("stop_failed")
+        return False
+
+    manager._stop_runtime_best_effort = stop_runtime
+    managed = _managed_postrun_session(tmp_path, _session_result())
+    managed.runtime = FakeRuntime()
+    managed.credential_dir = tmp_path / "credentials"
+
+    async def remove_credentials(*args, **kwargs):
+        del args, kwargs
+        calls.append("remove_credentials")
+        return True
+
+    manager._remove_credential_dir_best_effort = remove_credentials
+
+    await manager._handle_postrun(managed)
+
+    assert "stop_failed" in calls
+    assert "remove_session_dir" not in calls
+    assert "remove_credentials" not in calls
+
+
+@pytest.mark.asyncio
 async def test_handle_postrun_fail_open_export_error_still_cleans_and_callbacks(
     tmp_path,
 ):
@@ -583,6 +764,7 @@ class BindMountRuntime(BaseRuntime):
         )
         self.exec_envs: list[dict[str, str]] = []
         self.exec_commands: list[str] = []
+        self.exec_results: list[ExecResult] = []
 
     @property
     def runtime_id(self) -> str:
@@ -604,6 +786,8 @@ class BindMountRuntime(BaseRuntime):
     ) -> ExecResult:
         self.exec_commands.append(command)
         self.exec_envs.append(dict(env or {}))
+        if self.exec_results:
+            return self.exec_results.pop(0)
         return ExecResult(return_code=0)
 
     async def upload_file(self, local_path: str, remote_path: str) -> None:
@@ -1200,7 +1384,6 @@ async def test_handle_run_codex_subscription_auth_mode_unsets_openevo_proxy_env(
             harness="codex",
             model_name="gpt-5.5",
             settings={"auth_mode": "subscription", "capture_mode": "transcript"},
-            env={"CODEX_HOME": "/openevo/session/preauthenticated-codex"},
         ),
         metadata={},
     )
@@ -1238,7 +1421,78 @@ async def test_handle_run_codex_subscription_auth_mode_unsets_openevo_proxy_env(
     assert "--model gpt-5.5" in command
     assert runtime.exec_envs[-1]["OPENAI_BASE_URL"] == "http://gateway.test/v1"
     assert runtime.exec_envs[-1]["OPENAI_API_KEY"] == "session_1"
-    assert runtime.exec_envs[-1]["CODEX_HOME"] == "/openevo/session/preauthenticated-codex"
+    assert runtime.exec_envs[-1]["CODEX_HOME"] == MANAGED_CODEX_HOME
+
+
+@pytest.mark.asyncio
+async def test_subscription_stdout_and_transcript_redact_auth_canaries(tmp_path) -> None:
+    auth = (
+        b'{"tokens":{"access_token":"access-canary",'
+        b'"refresh_token":"refresh-canary"}}'
+    )
+    redactor = session_files.CredentialRedactor.from_auth_json(auth)
+    runtime = BindMountRuntime(tmp_path)
+    runtime.exec_results = [
+        ExecResult(
+            return_code=0,
+            stdout=(
+                '{"type":"item.completed","item":{"type":"agent_message",'
+                '"text":"access-canary refresh-canary"}}\n'
+            ),
+            stderr=auth.decode(),
+        )
+    ]
+    manager = GatewayNodeManager.__new__(GatewayNodeManager)
+    manager.gateway_url = "http://gateway.test"
+    request = SessionDispatchRequest(
+        session_id="session_1",
+        task_id="task_1",
+        instruction="Do work.",
+        remaining_timeout_seconds=60,
+        runtime=RuntimeSpec(
+            profile="managed_science",
+            image=MANAGED_RUNTIME_IMAGES["managed_science"],
+            container_user="host",
+        ),
+        agent=AgentSpec(
+            harness="codex",
+            settings={"auth_mode": "subscription", "capture_mode": "transcript"},
+        ),
+    )
+    managed = ManagedSession(
+        request=request,
+        timer=StageTimer(),
+        session_dir=tmp_path,
+        artifacts_dir=tmp_path / "artifacts",
+        runtime=runtime,
+        credential_redactor=redactor,
+    )
+    managed.execution_deadline = asyncio.get_running_loop().time() + 60
+
+    await manager._run_exec_inputs(
+        runtime,
+        [ExecInput(command="codex exec")],
+        {},
+        managed,
+    )
+    completion = CompletionSession(
+        session_id="session_1",
+        metadata={
+            "agent_result_metadata": {
+                "log_dir": str(tmp_path / "logs" / "agent"),
+                "last_step": 0,
+            }
+        },
+    )
+    trajectory = await AgentTranscriptBuilder().build(completion)
+
+    persisted = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in (tmp_path / "logs" / "agent").iterdir()
+    ) + trajectory.model_dump_json()
+    assert "access-canary" not in persisted
+    assert "refresh-canary" not in persisted
+    assert auth.decode() not in persisted
 
 
 @pytest.mark.asyncio

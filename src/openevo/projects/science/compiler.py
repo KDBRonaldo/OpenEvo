@@ -6,12 +6,8 @@ from typing import Any
 
 from ...experiments.models import ExperimentConfig
 from openevo.projects.science.models import ScienceProjectConfig
+from openevo.runtime.managed import MANAGED_RUNTIME_IMAGES
 
-
-MANAGED_RUNTIME_IMAGES = {
-    "managed_science": "openevo/science-runtime:0.1.0",
-    "python_research": "openevo/python-research-runtime:0.1.0",
-}
 
 _WORKDIR = "/openevo/session/workspace"
 _MANAGED_HOME = "/openevo/session/home"
@@ -61,6 +57,7 @@ def _agent_payload(project: ScienceProjectConfig) -> dict[str, Any]:
     managed_env = (
         {"CODEX_HOME": _MANAGED_CODEX_HOME}
         if project.environment.profile != "custom_image"
+        and project.execution.mode != "codex_subscription_transcript"
         else {}
     )
     if project.execution.mode == "codex_subscription_transcript":
@@ -96,6 +93,11 @@ def _runtime_payload(project: ScienceProjectConfig) -> dict[str, Any]:
         env.update({"HOME": _MANAGED_HOME, "PATH": _MANAGED_PATH})
 
     return {
+        "profile": (
+            None
+            if project.environment.profile == "custom_image"
+            else project.environment.profile
+        ),
         "image": _runtime_image(project),
         "container_user": (
             "image" if project.environment.profile == "custom_image" else "host"

@@ -8,6 +8,7 @@ import yaml
 from pydantic import ValidationError
 
 from openevo import experiments
+from openevo.runtime.managed import MANAGED_CODEX_HOME, MANAGED_RUNTIME_IMAGES
 
 ExperimentConfig = experiments.ExperimentConfig
 load_experiment_config = experiments.load_experiment_config
@@ -144,7 +145,7 @@ def test_subscription_agents_must_set_capture_mode_explicitly() -> None:
 
 
 @pytest.mark.parametrize("capture_mode", ["agent_transcript", "pure_text"])
-def test_subscription_agents_accept_transcript_capture_aliases(capture_mode: str) -> None:
+def test_subscription_agents_reject_transcript_capture_aliases(capture_mode: str) -> None:
     payload = _minimal_payload()
     payload["agent"] = {
         "preset": "codex",
@@ -152,11 +153,14 @@ def test_subscription_agents_accept_transcript_capture_aliases(capture_mode: str
         "auth": "subscription",
         "settings": {"capture_mode": capture_mode},
     }
-    payload["runtime"]["container_user"] = "host"
+    payload["runtime"] = {
+        "profile": "managed_science",
+        "image": MANAGED_RUNTIME_IMAGES["managed_science"],
+        "container_user": "host",
+    }
 
-    config = ExperimentConfig.model_validate(payload)
-
-    assert config.agent.settings["capture_mode"] == capture_mode
+    with pytest.raises(ValidationError, match="capture_mode='transcript'"):
+        ExperimentConfig.model_validate(payload)
 
 
 def test_subscription_agent_rejects_image_user_runtime() -> None:
@@ -167,11 +171,67 @@ def test_subscription_agent_rejects_image_user_runtime() -> None:
         "auth": "subscription",
         "settings": {"capture_mode": "transcript"},
     }
+    payload["runtime"] = {
+        "profile": "managed_science",
+        "image": MANAGED_RUNTIME_IMAGES["managed_science"],
+        "container_user": "image",
+    }
 
     with pytest.raises(
         ValidationError,
         match="subscription credentials require runtime.container_user='host'",
     ):
+        ExperimentConfig.model_validate(payload)
+
+
+def test_subscription_agent_requires_exact_managed_runtime_profile_and_image() -> None:
+    payload = _minimal_payload()
+    payload["agent"] = {
+        "preset": "codex",
+        "model": "gpt-5.1-codex-mini",
+        "auth": "subscription",
+        "settings": {"capture_mode": "transcript"},
+    }
+    payload["runtime"]["container_user"] = "host"
+
+    with pytest.raises(ValidationError, match="managed runtime profile"):
+        ExperimentConfig.model_validate(payload)
+
+    payload["runtime"]["profile"] = "managed_science"
+    with pytest.raises(ValidationError, match="exact managed runtime image"):
+        ExperimentConfig.model_validate(payload)
+
+    payload["runtime"]["image"] = MANAGED_RUNTIME_IMAGES["managed_science"]
+    config = ExperimentConfig.model_validate(payload)
+
+    assert config.runtime.profile == "managed_science"
+
+
+@pytest.mark.parametrize(
+    "codex_home",
+    [
+        "/openevo/session/workspace/.codex",
+        "/openevo/session/artifacts/.codex",
+        "/openevo/session/logs/.codex",
+        MANAGED_CODEX_HOME,
+    ],
+)
+def test_subscription_agent_cannot_supply_codex_home(codex_home: str) -> None:
+    payload = _minimal_payload()
+    payload["agent"] = {
+        "preset": "codex",
+        "model": "gpt-5.1-codex-mini",
+        "auth": "subscription",
+        "settings": {"capture_mode": "transcript"},
+        "env": {"CODEX_HOME": codex_home},
+    }
+    payload["runtime"] = {
+        "profile": "managed_science",
+        "image": MANAGED_RUNTIME_IMAGES["managed_science"],
+        "container_user": "host",
+    }
+
+    with pytest.raises(ValidationError, match="CODEX_HOME is Core-owned"):
         ExperimentConfig.model_validate(payload)
 
 
@@ -183,7 +243,11 @@ def test_subscription_agents_cannot_enable_parametric_memory() -> None:
         "auth": "subscription",
         "settings": {"capture_mode": "transcript"},
     }
-    payload["runtime"]["container_user"] = "host"
+    payload["runtime"] = {
+        "profile": "managed_science",
+        "image": MANAGED_RUNTIME_IMAGES["managed_science"],
+        "container_user": "host",
+    }
     payload["evolution"] = {
         "targets": {
             "parametric_memory": {

@@ -8,7 +8,6 @@ import logging
 import re
 import shlex
 import shutil
-from contextlib import suppress
 from pathlib import Path, PurePosixPath
 from tempfile import mkdtemp
 from typing import Any
@@ -25,8 +24,10 @@ from openevo.gateway.dispatcher import (
 )
 from openevo.gateway.session import SessionRegistry
 from openevo.gateway.session_files import (
+    CredentialRedactor,
     SessionFileSecurityError,
     capture_session_root_identity,
+    redact_session_capture_tree,
     remove_session_tree,
     stage_codex_subscription_auth,
 )
@@ -44,8 +45,12 @@ from openevo.rollout.models import (
     SessionStatus,
 )
 from openevo.rollout.timer import StageTimer
-from openevo.runtime.base import BaseRuntime, RUNTIME_SESSION_DIR
+from openevo.runtime.base import BaseRuntime
 from openevo.runtime.factory import create_runtime
+from openevo.runtime.managed import (
+    MANAGED_CODEX_HOME,
+    require_managed_subscription_runtime,
+)
 from openevo.runtime.models import ExecInput, RuntimeSpec
 from openevo.trajectory.models import (
     CompletionSession,
@@ -364,31 +369,12 @@ def _completion_session_with_agent_metadata(
 
 
 def _is_codex_subscription_agent(agent) -> bool:
-    if agent.harness != "codex":
-        return False
+    return agent.harness == "codex" and _is_subscription_agent(agent)
+
+
+def _is_subscription_agent(agent) -> bool:
     auth_mode = agent.settings.get("auth_mode")
     return isinstance(auth_mode, str) and auth_mode in _SUBSCRIPTION_AUTH_MODES
-
-
-def _runtime_codex_home(agent) -> str:
-    codex_home = agent.env.get("CODEX_HOME")
-    if isinstance(codex_home, str) and codex_home.strip():
-        return codex_home.strip()
-    return f"{RUNTIME_SESSION_DIR}/.codex"
-
-
-def _host_path_for_runtime_session_path(
-    session_dir: Path,
-    runtime_path: str,
-) -> Path | None:
-    path = PurePosixPath(runtime_path)
-    try:
-        relative = path.relative_to(PurePosixPath(RUNTIME_SESSION_DIR))
-    except ValueError:
-        return None
-    if any(part in {"", ".", ".."} for part in relative.parts):
-        return None
-    return session_dir.joinpath(*relative.parts)
 
 
 class GatewayNodeManager:
@@ -632,23 +618,42 @@ class GatewayNodeManager:
         managed.timer.mark("init", "started")
         try:
             runtime_spec = self._resolve_runtime_spec(request)
-            if _is_codex_subscription_agent(request.agent) and (
-                runtime_spec.container_user != "host"
-            ):
-                raise RuntimeError(
-                    "Codex subscription credentials require a host-user runtime; "
-                    "choose a managed Science environment or use self-deployed execution"
+            self._validate_subscription_admission(request, runtime_spec, managed.session_dir)
+            if _is_codex_subscription_agent(request.agent):
+                credential_dir = Path(
+                    mkdtemp(
+                        prefix=f"credentials-{request.session_id[:8]}-",
+                        dir=managed.session_dir.parent,
+                    )
                 )
-            self._stage_codex_subscription_auth(
-                request,
-                managed.session_dir,
-                managed.session_root_identity,
-            )
-            runtime = create_runtime(runtime_spec, request.session_id, managed.session_dir)
+                managed.credential_dir = credential_dir
+                managed.credential_root_identity = capture_session_root_identity(
+                    credential_dir
+                )
+            if managed.credential_dir is None:
+                runtime = create_runtime(
+                    runtime_spec,
+                    request.session_id,
+                    managed.session_dir,
+                )
+            else:
+                runtime = create_runtime(
+                    runtime_spec,
+                    request.session_id,
+                    managed.session_dir,
+                    credential_dir=managed.credential_dir,
+                )
             managed.runtime = runtime
             await self._await_with_budget(runtime.start(), managed)
             # Run ordered prepare actions
             await self._run_runtime_prepare(runtime, runtime_spec, request, managed)
+            if managed.credential_dir is not None:
+                managed.credential_redactor = self._stage_codex_subscription_auth(
+                    request,
+                    managed.credential_dir,
+                    managed.credential_root_identity,
+                )
+                self._redact_session_captures(managed)
         except GatewayExecutionTimeout as exc:
             managed.final_result = self._timeout_result(request, managed.timer, str(exc))
         except Exception as exc:
@@ -676,34 +681,79 @@ class GatewayNodeManager:
     def _stage_codex_subscription_auth(
         self,
         request: SessionDispatchRequest,
-        session_dir: Path,
-        session_root_identity: tuple[int, int, int] | None = None,
-    ) -> None:
+        credential_dir: Path,
+        credential_root_identity: tuple[int, int, int] | None = None,
+    ) -> CredentialRedactor:
         if not _is_codex_subscription_agent(request.agent):
-            return
+            raise RuntimeError("credential staging requires a Codex subscription agent")
 
-        runtime_codex_home = _runtime_codex_home(request.agent)
-        target_home = _host_path_for_runtime_session_path(
-            session_dir,
-            runtime_codex_home,
+        identity = credential_root_identity or capture_session_root_identity(
+            credential_dir
         )
-        if target_home is None:
-            raise RuntimeError(
-                "Codex subscription CODEX_HOME must be under "
-                f"{RUNTIME_SESSION_DIR} so the runtime can receive auth.json"
-            )
-
-        identity = session_root_identity or capture_session_root_identity(session_dir)
-        relative_home = target_home.relative_to(session_dir)
         try:
-            stage_codex_subscription_auth(
+            return stage_codex_subscription_auth(
                 source=Path.home() / ".codex" / "auth.json",
-                session_dir=session_dir,
+                session_dir=credential_dir,
                 session_identity=identity,
-                target_home_parts=relative_home.parts,
+                target_home_parts=(),
             )
         except SessionFileSecurityError as exc:
             raise RuntimeError(str(exc)) from exc
+
+    @staticmethod
+    def _validate_subscription_admission(
+        request: SessionDispatchRequest,
+        runtime_spec: RuntimeSpec,
+        session_dir: Path,
+    ) -> None:
+        if not _is_subscription_agent(request.agent):
+            return
+        if request.agent.harness != "codex":
+            raise RuntimeError(
+                "managed subscription execution currently requires the Codex harness"
+            )
+        if request.agent.settings.get("capture_mode") != "transcript":
+            raise RuntimeError(
+                "subscription execution requires capture_mode='transcript'"
+            )
+        if "CODEX_HOME" in request.agent.env or "CODEX_HOME" in runtime_spec.env:
+            raise RuntimeError("subscription CODEX_HOME is Core-owned and must be omitted")
+        try:
+            require_managed_subscription_runtime(
+                profile=runtime_spec.profile,
+                image=runtime_spec.image,
+                backend=runtime_spec.backend,
+                container_user=runtime_spec.container_user,
+            )
+        except ValueError as exc:
+            raise RuntimeError(str(exc)) from exc
+        if runtime_spec.import_path is not None or runtime_spec.kwargs:
+            raise RuntimeError(
+                "subscription execution forbids custom runtime loaders and options"
+            )
+
+        auth_path = (Path.home() / ".codex" / "auth.json").resolve()
+        protected_paths = (auth_path, session_dir.resolve())
+        for action in runtime_spec.prepare:
+            if action.type not in {"upload_file", "upload_dir"} or not action.source:
+                continue
+            source = Path(action.source).expanduser().resolve()
+            for protected in protected_paths:
+                if source == protected or (
+                    action.type == "upload_dir" and protected.is_relative_to(source)
+                ):
+                    raise RuntimeError(
+                        "subscription workspace sync cannot include Core credential "
+                        "or session roots"
+                    )
+
+    @staticmethod
+    def _redact_session_captures(managed: ManagedSession) -> None:
+        redactor = managed.credential_redactor
+        identity = managed.session_root_identity
+        if redactor is None or identity is None:
+            return
+        redact_session_capture_tree(managed.session_dir, identity, redactor)
 
     async def _run_runtime_prepare(
         self,
@@ -737,7 +787,11 @@ class GatewayNodeManager:
                 log_dir = managed.session_dir / "logs"
                 log_dir.mkdir(parents=True, exist_ok=True)
                 self._write_exec_log(
-                    log_dir, f"{log_prefix}.{i:02d}", result.stdout, result.stderr
+                    log_dir,
+                    f"{log_prefix}.{i:02d}",
+                    result.stdout,
+                    result.stderr,
+                    managed.credential_redactor,
                 )
                 if result.return_code == -1:
                     raise RuntimeError(f"{log_prefix} action {i} timed out")
@@ -784,6 +838,7 @@ class GatewayNodeManager:
             # Postprocess always runs so harnesses can collect artifacts from
             # failed or timed-out agent runs before post-run evaluation.
             await self._await_with_budget(harness.postprocess(runtime, agent_result), managed)
+            self._redact_session_captures(managed)
             managed.agent_result = agent_result
 
         except GatewayExecutionTimeout as exc:
@@ -926,7 +981,13 @@ class GatewayNodeManager:
                 env=merged_env,
                 timeout_sec=self._remaining_budget(managed),
             )
-            self._write_exec_log(log_dir, f"step.{i:02d}", result.stdout, result.stderr)
+            self._write_exec_log(
+                log_dir,
+                f"step.{i:02d}",
+                result.stdout,
+                result.stderr,
+                managed.credential_redactor,
+            )
             if result.return_code == -1:
                 return AgentRunResult(
                     status="timeout",
@@ -987,8 +1048,10 @@ class GatewayNodeManager:
             )
             return eval_runtime
         except asyncio.CancelledError:
-            with suppress(Exception):
+            try:
                 await eval_runtime.stop()
+            except Exception:
+                managed.runtime_cleanup_blocked = True
             raise
         except Exception as exc:
             logger.warning(
@@ -996,8 +1059,10 @@ class GatewayNodeManager:
                 request.session_id,
                 exc,
             )
-            with suppress(Exception):
+            try:
                 await eval_runtime.stop()
+            except Exception:
+                managed.runtime_cleanup_blocked = True
             return None
 
     async def _acquire_prepared_eval_runtime(self, managed: ManagedSession) -> BaseRuntime | None:
@@ -1033,6 +1098,7 @@ class GatewayNodeManager:
     async def _handle_postrun(self, managed: ManagedSession) -> None:
         request = managed.request
         result: SessionResult | None = managed.final_result
+        runtimes_removed = not managed.runtime_cleanup_blocked
         managed.timer.mark("postrun", "started")
         try:
             if result is None:
@@ -1049,6 +1115,18 @@ class GatewayNodeManager:
             managed.timer.mark("postrun", "finished")
             managed.timer.mark("teardown", "started")
             await self._run_postrun_steps(managed)
+            try:
+                self._redact_session_captures(managed)
+            except Exception as exc:
+                logger.exception(
+                    "Credential capture redaction failed for session %s",
+                    request.session_id,
+                )
+                result = self._error_result(
+                    request,
+                    managed.timer,
+                    f"credential capture redaction failed: {exc}",
+                )
             stop_tasks = []
             eval_runtime = await self._drain_eval_prewarm_task(managed)
             if eval_runtime is not None:
@@ -1062,7 +1140,13 @@ class GatewayNodeManager:
                     self._stop_runtime_best_effort(managed.runtime, request.session_id, "runtime")
                 )
             if stop_tasks:
-                await asyncio.gather(*stop_tasks, return_exceptions=True)
+                stop_results = await asyncio.gather(
+                    *stop_tasks,
+                    return_exceptions=True,
+                )
+                runtimes_removed = runtimes_removed and all(
+                    outcome is True for outcome in stop_results
+                )
             managed.timer.mark("teardown", "finished")
             managed.timer.mark("return", "finished")
 
@@ -1088,11 +1172,24 @@ class GatewayNodeManager:
                 # status/task_id visible for debugging via the polling endpoint.
                 self.session_registry.clear_result_payload(request.session_id)
         finally:
-            await self._remove_session_dir_best_effort(
-                managed.session_dir,
-                request.session_id,
-                managed.session_root_identity,
-            )
+            if runtimes_removed:
+                session_removed = await self._remove_session_dir_best_effort(
+                    managed.session_dir,
+                    request.session_id,
+                    managed.session_root_identity,
+                )
+                if session_removed is not False and managed.credential_dir is not None:
+                    await self._remove_credential_dir_best_effort(
+                        managed.credential_dir,
+                        request.session_id,
+                        managed.credential_root_identity,
+                    )
+            else:
+                logger.error(
+                    "Retaining credential and session roots because a runtime "
+                    "was not proven removed for session %s",
+                    request.session_id,
+                )
 
     async def _build_session_result(self, managed: ManagedSession) -> SessionResult:
         request = managed.request
@@ -1349,6 +1446,11 @@ class GatewayNodeManager:
             agent_log_dir = runtime.runtime_agent_log_dir
             runtime_env = dict(runtime.spec.env)
         agent_env = dict(request.agent.env) if include_agent_env else {}
+        credential_env = (
+            {"CODEX_HOME": MANAGED_CODEX_HOME}
+            if _is_codex_subscription_agent(request.agent)
+            else {}
+        )
         return {
             "ANTHROPIC_BASE_URL": self.gateway_url,
             "ANTHROPIC_API_KEY": request.session_id,
@@ -1364,16 +1466,25 @@ class GatewayNodeManager:
             "AGENT_LOG_DIR": agent_log_dir,
             **{key: str(value) for key, value in runtime_env.items()},
             **{key: str(value) for key, value in agent_env.items()},
+            **credential_env,
         }
 
     @staticmethod
     def _write_exec_log(
-        log_dir: Path, prefix: str, stdout: str | None, stderr: str | None
+        log_dir: Path,
+        prefix: str,
+        stdout: str | None,
+        stderr: str | None,
+        redactor: CredentialRedactor | None = None,
     ) -> None:
         if stdout:
-            (log_dir / f"{prefix}.stdout.log").write_text(stdout)
+            (log_dir / f"{prefix}.stdout.log").write_text(
+                redactor.redact(stdout) if redactor is not None else stdout
+            )
         if stderr:
-            (log_dir / f"{prefix}.stderr.log").write_text(stderr)
+            (log_dir / f"{prefix}.stderr.log").write_text(
+                redactor.redact(stderr) if redactor is not None else stderr
+            )
 
     @staticmethod
     def _step_metadata(log_dir: Path, step_index: int, managed: ManagedSession) -> dict:
@@ -1518,6 +1629,7 @@ class GatewayNodeManager:
                     f"step.{i:02d}",
                     result.stdout,
                     result.stderr,
+                    managed.credential_redactor,
                 )
             except Exception:
                 logger.debug(
@@ -1531,9 +1643,10 @@ class GatewayNodeManager:
         runtime: BaseRuntime,
         session_id: str,
         label: str,
-    ) -> None:
+    ) -> bool:
         try:
             await runtime.stop()
+            return True
         except Exception:
             logger.warning(
                 "Failed to stop %s for session %s",
@@ -1541,21 +1654,46 @@ class GatewayNodeManager:
                 session_id,
                 exc_info=True,
             )
+            return False
 
     async def _remove_session_dir_best_effort(
         self,
         session_dir: Path,
         session_id: str,
         session_root_identity: tuple[int, int, int] | None = None,
-    ) -> None:
+    ) -> bool:
         try:
             identity = session_root_identity or capture_session_root_identity(session_dir)
             await asyncio.to_thread(remove_session_tree, session_dir, identity)
+            return True
         except FileNotFoundError:
-            return
+            return True
         except Exception:
             logger.warning(
                 "Failed to remove session directory for session %s",
                 session_id,
                 exc_info=True,
             )
+            return False
+
+    async def _remove_credential_dir_best_effort(
+        self,
+        credential_dir: Path,
+        session_id: str,
+        credential_root_identity: tuple[int, int, int] | None = None,
+    ) -> bool:
+        try:
+            identity = credential_root_identity or capture_session_root_identity(
+                credential_dir
+            )
+            await asyncio.to_thread(remove_session_tree, credential_dir, identity)
+            return True
+        except FileNotFoundError:
+            return True
+        except Exception:
+            logger.warning(
+                "Failed to remove credential directory for session %s",
+                session_id,
+                exc_info=True,
+            )
+            return False

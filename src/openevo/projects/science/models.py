@@ -155,7 +155,7 @@ class ExecutionConfig(_StrictModel):
             return data
         if mode != "codex_subscription_transcript":
             return data
-        return data | {"codex_model": "gpt-5.1-codex-mini"}
+        return data | {"codex_model": "gpt-5.5"}
 
     @model_serializer(mode="wrap")
     def _serialize_without_null_codex_model(self, serializer) -> dict[str, Any]:

@@ -8,6 +8,7 @@ import shlex
 from pathlib import Path
 
 from openevo.runtime.base import BaseRuntime
+from openevo.runtime.managed import MANAGED_CODEX_HOME
 from openevo.runtime.models import ExecResult, RuntimeSpec
 
 logger = logging.getLogger(__name__)
@@ -16,8 +17,25 @@ logger = logging.getLogger(__name__)
 class DockerRuntime(BaseRuntime):
     """Long-lived Docker container used across init, run, and post-run."""
 
-    def __init__(self, spec: RuntimeSpec, session_id: str, session_dir: Path) -> None:
+    def __init__(
+        self,
+        spec: RuntimeSpec,
+        session_id: str,
+        session_dir: Path,
+        *,
+        credential_dir: Path | None = None,
+    ) -> None:
         super().__init__(spec, session_id, session_dir)
+        if credential_dir is not None:
+            if not credential_dir.is_absolute():
+                raise ValueError("credential_dir must be absolute")
+            try:
+                credential_dir.relative_to(session_dir)
+            except ValueError:
+                pass
+            else:
+                raise ValueError("credential_dir must be outside the session tree")
+        self._credential_dir = credential_dir
         # Use enough of the session_id to preserve the "-eval" suffix used by
         # fresh evaluator runtimes, avoiding collisions with the agent runtime.
         safe_name = session_id.replace("/", "-")[:55]
@@ -63,6 +81,10 @@ class DockerRuntime(BaseRuntime):
         if self.spec.memory_mb is not None:
             create_args.extend(["--memory", f"{self.spec.memory_mb}m"])
         create_args.extend(["-v", f"{self.session_dir}:{self.runtime_session_dir}"])
+        if self._credential_dir is not None:
+            create_args.extend(
+                ["-v", f"{self._credential_dir}:{MANAGED_CODEX_HOME}"]
+            )
         # Additional volumes from kwargs (e.g., Docker socket for agents that need DinD)
         for vol in self.spec.kwargs.get("volumes", []):
             create_args.extend(["-v", vol])
@@ -100,7 +122,6 @@ class DockerRuntime(BaseRuntime):
     async def stop(self) -> None:
         if self._destroyed:
             return
-        self._destroyed = True
         # chmod is best-effort so the host can reclaim bind-mounted files.
         # Skip when UIDs match (no permission mismatch to resolve).
         if self.spec.container_user != "host" and self._chmod_needed is not False:
@@ -114,19 +135,42 @@ class DockerRuntime(BaseRuntime):
             except Exception:
                 logger.warning("chmod cleanup failed for %s", self._container_name)
         # kill first (instant SIGKILL), then rm to remove metadata.
-        await self._run_local_command(
-            "docker", "kill", self._container_name,
-            timeout=self._STOP_TIMEOUT,
-        )
-        rc, _, stderr = await self._run_local_command(
-            "docker", "rm", "-f", self._container_name,
-            timeout=self._STOP_TIMEOUT, capture=True,
-        )
-        if rc != 0:
-            logger.warning(
-                "docker rm -f failed for %s (rc=%s): %s",
-                self._container_name, rc, stderr,
+        try:
+            await self._run_local_command(
+                "docker", "kill", self._container_name,
+                timeout=self._STOP_TIMEOUT,
             )
+        except Exception:
+            logger.warning("docker kill failed for %s", self._container_name)
+        try:
+            rc, _, stderr = await self._run_local_command(
+                "docker", "rm", "-f", self._container_name,
+                timeout=self._STOP_TIMEOUT, capture=True,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"docker container {self._container_name} could not be proven removed"
+            ) from exc
+        if rc != 0:
+            inspect_rc, _, inspect_stderr = await self._run_local_command(
+                "docker",
+                "container",
+                "inspect",
+                self._container_name,
+                timeout=self._STOP_TIMEOUT,
+                capture=True,
+            )
+            absent_message = (inspect_stderr or "").lower()
+            if inspect_rc == 0 or not any(
+                marker in absent_message
+                for marker in ("no such object", "no such container")
+            ):
+                raise RuntimeError(
+                    "docker container "
+                    f"{self._container_name} could not be proven removed: "
+                    f"{stderr or inspect_stderr or rc}"
+                )
+        self._destroyed = True
 
     async def _detect_chmod_needed(self) -> bool:
         """True unless the container's effective UID matches the host's."""

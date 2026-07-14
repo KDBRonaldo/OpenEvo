@@ -292,7 +292,7 @@ def test_codex_run_steps_subscription_auth_mode_uses_existing_login_state():
     assert "harness_proxy" not in step.command
     assert "model_providers.harness_proxy" not in step.command
     assert step.env is not None
-    assert step.env["CODEX_HOME"] == "/openevo/session/preauthenticated-codex"
+    assert step.env["CODEX_HOME"] == "/openevo/credentials/codex"
 
 
 def test_codex_subscription_auth_mode_requires_transcript_capture_option():

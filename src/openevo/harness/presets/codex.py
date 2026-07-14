@@ -14,6 +14,7 @@ from openevo.harness.presets._subscription import (
     normalize_auth_mode,
 )
 from openevo.runtime.base import BaseRuntime, RUNTIME_AGENT_LOG_DIR, RUNTIME_SESSION_DIR
+from openevo.runtime.managed import MANAGED_CODEX_HOME
 from openevo.runtime.models import ExecInput
 
 
@@ -39,6 +40,11 @@ class CodexHarness(BaseHarness):
         self._codex_home = f"{RUNTIME_SESSION_DIR}/.codex"
 
     def _codex_home_path(self) -> str:
+        if self.settings.get("auth_mode") in {
+            AUTH_MODE_SUBSCRIPTION,
+            self._AUTH_MODE_CHATGPT_SUBSCRIPTION,
+        }:
+            return MANAGED_CODEX_HOME
         return _nonempty_env_path(self.env.get("CODEX_HOME")) or self._codex_home
 
     async def setup(self, runtime: BaseRuntime) -> None:

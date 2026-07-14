@@ -65,20 +65,19 @@ with the Core process UID/GID and therefore keeps the bind-mounted session
 writable without recursively widening host file permissions.
 
 OpenEvo-managed Science profiles use `host`; user-supplied custom images keep
-`image`. This distinction is required for Codex subscription sessions because
-the per-session `auth.json` remains a host-owned `0600` file. It is not a
-general compatibility promise that arbitrary images can run under a replaced
-user identity. Subscription agents are rejected unless the runtime uses
-`container_user: host`; in particular, Science `custom_image` cannot be paired
-with Codex subscription execution.
+`image`. Subscription admission additionally binds the profile to its exact
+Core-managed image and Docker backend. It is not a general compatibility
+promise that arbitrary images can run under a replaced user identity. A custom
+image, loader, option/volume, entrypoint, image-user runtime, or non-literal
+transcript capture mode is rejected before credential bytes are staged.
 
 Managed Science compiles `HOME=/openevo/session/home` and keeps
 `/home/openevo/.local/bin` first in `PATH`, where the managed image installs the
-pinned Codex binary. `CODEX_HOME` is
-`/openevo/session/home/.codex`. Docker merges `RuntimeSpec.env` into every exec,
-including harness setup, so arbitrary host UIDs can write Codex state and copy
-evolution skills to `$HOME/.agents/skills` without changing image-owned
-`/home/openevo`.
+pinned Codex binary. For subscription release sessions Core ignores caller
+choice and fixes `CODEX_HOME=/openevo/credentials/codex`, a separate private
+bind mount outside `/openevo/session`; caller `agent.env` and `runtime.env`
+cannot set it. `HOME` remains `/openevo/session/home`, so evolution skills and
+ordinary writable state do not share the credential root.
 
 Host-user startup, upload, stop, and failed-start cleanup never invoke the
 legacy recursive `a+rwX` compatibility path. Gateway teardown instead pins the
@@ -86,3 +85,6 @@ session root device/inode/owner at dispatch, restores only owner directory
 permissions through stable descriptors, and removes a bounded no-follow tree.
 An owner or identity mismatch fails closed rather than acting on a replacement
 path.
+
+Docker kill/remove failures leave `_destroyed` false and are retryable. Gateway
+does not remove either bind root until container absence is proven.

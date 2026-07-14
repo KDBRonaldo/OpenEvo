@@ -25,6 +25,11 @@ Builders convert a captured `CompletionSession` into a `Trajectory` of trainable
 `capture_mode="transcript"` 和 `token_level_metrics_available=false`，因此下游
 RL 代码可以过滤它，而 skill/memory evolution 仍然可以使用 transcript。
 
+Managed subscription release admission requires the literal `transcript`
+value. Before these logs are written, Gateway applies the bounded redactor
+derived from the verified auth JSON, so the builder does not persist known raw
+auth JSON or sensitive leaf canaries into trajectory metadata or messages.
+
 ## `per_request`
 
 The simplest strategy: each completion becomes its own trace. Use it when you

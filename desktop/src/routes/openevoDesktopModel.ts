@@ -280,7 +280,7 @@ export function toDraftPayload(
     execution_mode: executionMode,
     codex_model:
       executionMode === "codex_subscription_transcript"
-        ? model.execution.model || "gpt-5.1-codex-mini"
+        ? model.execution.model || "gpt-5.5"
         : null,
     hf_model: executionMode === "self-deployed" ? model.execution.model : null,
     evolution: {

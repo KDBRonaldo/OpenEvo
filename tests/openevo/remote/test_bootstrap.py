@@ -553,8 +553,41 @@ def test_managed_runtime_bootstrap_builds_image_when_pull_fails() -> None:
     assert "https://deb.debian.org" in docker_step.command
     assert "allow-unauthenticated" not in docker_step.command.lower()
     assert "trusted=yes" not in docker_step.command.lower()
+    assert "auth.json" not in docker_step.command
+    assert "docker build" in docker_step.command
+    assert "--network=host" in docker_step.command
+    assert "--build-arg ALL_PROXY" in docker_step.command
     assert "--build-arg HTTP_PROXY" in docker_step.command
+    assert "unset ALL_PROXY HTTP_PROXY" in docker_step.command
+    assert "HTTPS_PROXY" not in docker_step.command.splitlines()[0]
+    assert docker_step.env["HTTPS_PROXY"] not in docker_step.command
+    assert docker_step.env["HTTPS_PROXY"] not in str(docker_step.manifest)
     assert docker_step.manifest["managed_runtime"] is True
+
+
+def test_managed_runtime_bootstrap_preserves_complete_explicit_proxy_environment() -> None:
+    proxy_values = {
+        "ALL_PROXY": "socks5://127.0.0.1:7890",
+        "HTTP_PROXY": "http://127.0.0.1:7890",
+        "HTTPS_PROXY": "http://127.0.0.1:7890",
+        "NO_PROXY": "localhost,127.0.0.1",
+        "all_proxy": "socks5://127.0.0.1:7890",
+        "http_proxy": "http://127.0.0.1:7890",
+        "https_proxy": "http://127.0.0.1:7890",
+        "no_proxy": "localhost,127.0.0.1",
+    }
+    sidecar_plan = build_sidecar_science_plan(
+        _project(),
+        _profile(proxy={"extra_env": proxy_values}),
+    )
+
+    plan = build_remote_bootstrap_plan(sidecar_plan)
+    docker_step = {step.id: step for step in plan.steps}["docker_pull_runtime"]
+
+    assert docker_step.command.splitlines()[0] == ":"
+    assert docker_step.env == proxy_values
+    assert all(value not in docker_step.command for value in proxy_values.values())
+    assert all(value not in str(docker_step.manifest) for value in proxy_values.values())
 
 
 def test_python_research_runtime_bootstrap_builds_image_when_pull_fails() -> None:
@@ -587,7 +620,12 @@ def test_custom_runtime_bootstrap_remains_pull_only() -> None:
     plan = build_remote_bootstrap_plan(sidecar_plan)
     docker_step = {step.id: step for step in plan.steps}["docker_pull_runtime"]
 
-    assert docker_step.command == "docker pull ghcr.io/example/science:latest"
+    assert docker_step.command.endswith(
+        "docker pull ghcr.io/example/science:latest"
+    )
+    assert docker_step.command.startswith("unset ALL_PROXY HTTP_PROXY")
+    assert "docker build" not in docker_step.command
+    assert "--network=host" not in docker_step.command
     assert "docker build" not in docker_step.command
     assert docker_step.manifest["managed_runtime"] is False
 
