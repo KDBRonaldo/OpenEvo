@@ -1056,16 +1056,66 @@ class CoreControlClientV1:
         upload = self._require_workspace_upload(upload_id, project_id)
         if upload.status is not v1.WorkspaceUploadStatus.OPEN or if_match != upload.etag:
             _raise_local(CoreClientLocalErrorCodeV1.INVALID_REQUEST, 400)
+        return self._abort_workspace_upload_mutation(
+            upload,
+            request,
+            if_match=if_match,
+            idempotency_key=idempotency_key,
+            project_id=project_id,
+        )
+
+    @_generation_bound
+    def abort_persisted_workspace_upload(
+        self,
+        upload: v1.WorkspaceUploadSessionV1,
+        request: v1.WorkspaceUploadAbortV1,
+        *,
+        if_match: str,
+        idempotency_key: str,
+        project_id: str | None = None,
+    ) -> v1.WorkspaceUploadSessionV1:
+        """Restore and abort one exact durable open-upload representation."""
+
+        project_id = self._active_project(project_id)
+        if_match = _etag(if_match)
+        self._validate_workspace_upload_identity(upload, upload.id, project_id)
+        if (
+            upload.status is not v1.WorkspaceUploadStatus.OPEN
+            or upload.publication is not None
+            or if_match != upload.etag
+        ):
+            _raise_local(CoreClientLocalErrorCodeV1.INVALID_REQUEST, 400)
+        # Validate all caller-supplied mutation authority before introducing the
+        # persisted representation into this generation's copy-on-write cache.
+        self._mutation_headers(idempotency_key=idempotency_key, if_match=if_match)
+        self._register_workspace_upload(upload, exact_replay=True)
+        return self._abort_workspace_upload_mutation(
+            upload,
+            request,
+            if_match=if_match,
+            idempotency_key=idempotency_key,
+            project_id=project_id,
+        )
+
+    def _abort_workspace_upload_mutation(
+        self,
+        upload: v1.WorkspaceUploadSessionV1,
+        request: v1.WorkspaceUploadAbortV1,
+        *,
+        if_match: str,
+        idempotency_key: str,
+        project_id: str,
+    ) -> v1.WorkspaceUploadSessionV1:
         result = self._mutation(
             "POST",
-            f"/v1/projects/{_segment(project_id)}/workspace-uploads/{_segment(upload_id)}/abort",
+            f"/v1/projects/{_segment(project_id)}/workspace-uploads/{_segment(upload.id)}/abort",
             request,
             v1.WorkspaceUploadAbortV1,
             v1.WorkspaceUploadSessionV1,
             if_match=if_match,
             idempotency_key=idempotency_key,
         )
-        self._validate_workspace_upload_identity(result, upload_id, project_id)
+        self._validate_workspace_upload_identity(result, upload.id, project_id)
         _ensure_upload_stable(upload, result)
         if (
             result.status is not v1.WorkspaceUploadStatus.ABORTED

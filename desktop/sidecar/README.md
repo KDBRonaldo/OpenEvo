@@ -128,12 +128,18 @@ new workspace is uploaded or finalized.
 
 Project patches use a separate durable `pre_patch`/`unknown`/`applied`
 operation. It binds canonical old/new Local intent, patch digest and key, the
-pre-patch Core project/ETag/snapshots, and the validated Core outcome. Reads are
-not used to infer an unknown result; the exact mutation is replayed. Mapping CAS
+pre-patch Core project/ETag/snapshots, the validated Core outcome, and explicit
+immutable-content and mutable-publication/runtime projections covering that
+outcome. Reads are not used to infer an unknown result; the exact mutation is
+replayed. An imported patch may then be finalized without invalidating its
+durable proof: recovery requires the persisted upload's predecessor snapshot
+and ETag plus the durable exact finalize response's project/workspace snapshots
+and publication before accepting current status/ETag or later successor
+authority. Finalize authority is CAS-persisted before mapping commit. Mapping CAS
 and matching applied-operation cleanup are atomic. After an O-to-A patch whose
-mapping commit failed, a later Local B edit first commits the proven A mapping
-generation, then issues one distinct A-to-B patch without another project
-create.
+mapping commit failed, a same-A retry commits the finalized A mapping; a later
+Local B edit first commits that proven A generation, then issues one distinct
+A-to-B patch from A's latest ETag without another project create.
 
 Host, tunnel, archive open/read/close, and persistence callbacks run through a
 fixed bounded executor. A deadline stops result delivery, while any callback
@@ -312,3 +318,10 @@ response may retain its upload ETag. Chunk, abort, and finalize responses change
 upload state and therefore must issue a new upload ETag. Finalization
 independently requires the returned project ETag to differ from the upload's
 frozen project ETag.
+
+Durable stale-upload abort recovery uses the public generation-bound
+`abort_persisted_workspace_upload` client operation. Exact persisted authority
+restore, upload ETag and idempotency validation, abort transport, cache update,
+and return delivery are one copy-on-write transaction. If close seals that
+generation before delivery, neither the open authority nor the abort result is
+retained; the bridge never calls the client's private upload registration helper.

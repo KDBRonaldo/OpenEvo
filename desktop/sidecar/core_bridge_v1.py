@@ -7,6 +7,7 @@ from collections.abc import Callable
 from concurrent.futures import Future, TimeoutError as FutureTimeoutError
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, replace
+from datetime import datetime
 from enum import StrEnum
 import hashlib
 import json
@@ -321,6 +322,41 @@ class CoreWorkspaceUploadAbortOperationV1:
 
 
 @dataclass(frozen=True, slots=True)
+class CoreWorkspaceUploadFinalizeAuthorityV1:
+    upload: core_v1.WorkspaceUploadSessionV1
+    request_sha256: str
+    request: core_v1.WorkspaceUploadFinalizeV1
+    idempotency_key: str
+    outcome: core_v1.WorkspaceUploadFinalizeResponseV1
+
+    def __post_init__(self) -> None:
+        finalized = self.outcome.upload
+        if _model_digest(self.request) != self.request_sha256:
+            raise ValueError("workspace finalize request digest does not match canonical request")
+        if self.upload.status is not core_v1.WorkspaceUploadStatus.OPEN or (
+            self.upload.accepted_offset != self.upload.archive.byte_size
+            or self.request.content_sha256 != self.upload.archive.content_sha256
+            or self.outcome.project_id != self.upload.project_id
+            or finalized.id != self.upload.id
+            or finalized.project_id != self.upload.project_id
+            or finalized.status is not core_v1.WorkspaceUploadStatus.FINALIZED
+            or finalized.accepted_offset != self.upload.accepted_offset
+            or finalized.project_snapshot != self.upload.project_snapshot
+            or finalized.project_etag != self.upload.project_etag
+            or finalized.archive != self.upload.archive
+            or finalized.base_workspace_snapshot != self.upload.base_workspace_snapshot
+            or finalized.created_at != self.upload.created_at
+            or finalized.publication != self.outcome.publication
+            or finalized.etag == self.upload.etag
+            or _utc_timestamp(finalized.updated_at) < _utc_timestamp(self.upload.updated_at)
+            or self.outcome.project.workspace_publication != self.outcome.publication
+            or self.outcome.project.current_project_snapshot == self.upload.project_snapshot
+            or self.outcome.project.etag == self.upload.project_etag
+        ):
+            raise ValueError("workspace finalize authority is not an exact upload transition")
+
+
+@dataclass(frozen=True, slots=True)
 class CoreProjectCreateOperationV1:
     local_project_id: str
     profile_id: str
@@ -333,6 +369,7 @@ class CoreProjectCreateOperationV1:
     workspace_upload_id: str | None = None
     workspace_upload_project_snapshot: core_v1.ImmutableSnapshotRefV1 | None = None
     workspace_upload_abort: CoreWorkspaceUploadAbortOperationV1 | None = None
+    workspace_upload_finalize: CoreWorkspaceUploadFinalizeAuthorityV1 | None = None
 
     def __post_init__(self) -> None:
         if _model_digest(self.project_create) != self.request_sha256:
@@ -348,12 +385,51 @@ class CoreProjectCreateOperationV1:
             or self.core_project_id != self.workspace_upload_abort.upload.project_id
         ):
             raise ValueError("workspace abort authority must match the bound upload")
+        if self.workspace_upload_finalize is not None and (
+            self.workspace_upload_id != self.workspace_upload_finalize.upload.id
+            or self.workspace_upload_project_snapshot
+            != self.workspace_upload_finalize.upload.project_snapshot
+            or self.core_project_id != self.workspace_upload_finalize.upload.project_id
+            or self.workspace_upload_finalize.idempotency_key
+            != _derived_key(
+                _derived_key(
+                    self.idempotency_key,
+                    "workspace-upload-"
+                    f"{_model_digest(self.workspace_upload_finalize.upload.project_snapshot)}",
+                ),
+                "finalize",
+            )
+        ):
+            raise ValueError("workspace finalize authority must match the bound upload")
+        if self.workspace_upload_abort is not None and self.workspace_upload_finalize is not None:
+            raise ValueError("one workspace upload cannot have abort and finalize authority")
 
 
 class CoreProjectPatchStateV1(StrEnum):
     PRE_PATCH = "pre_patch"
     UNKNOWN = "unknown"
     APPLIED = "applied"
+
+
+@dataclass(frozen=True, slots=True)
+class CoreProjectPatchImmutableAuthorityV1:
+    project_id: str
+    project_create: core_v1.ProjectCreateV1
+    task_snapshot: core_v1.ImmutableSnapshotRefV1
+    created_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class CoreProjectPatchMutableAuthorityV1:
+    status: core_v1.ProjectStatus
+    project_snapshot: core_v1.ImmutableSnapshotRefV1
+    workspace_snapshot: core_v1.ImmutableSnapshotRefV1 | None
+    workspace_publication: core_v1.WorkspacePublicationV1 | None
+    active_revision: core_v1.RevisionRefV1 | None
+    registry_digest: str | None
+    model_preparation: core_v1.ModelPreparationV1
+    updated_at: str
+    etag: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -372,6 +448,8 @@ class CoreProjectPatchOperationV1:
     base_project: core_v1.ProjectV1
     state: CoreProjectPatchStateV1 = CoreProjectPatchStateV1.PRE_PATCH
     outcome: core_v1.ProjectV1 | None = None
+    outcome_immutable: CoreProjectPatchImmutableAuthorityV1 | None = None
+    outcome_mutable: CoreProjectPatchMutableAuthorityV1 | None = None
 
     def __post_init__(self) -> None:
         if _model_digest(self.old_project_create) != self.old_request_sha256:
@@ -395,14 +473,25 @@ class CoreProjectPatchOperationV1:
             raise ValueError("project patch base authority belongs to another project")
         if not _project_identity_matches(self.base_project, self.old_project_create):
             raise ValueError("project patch base authority does not match old Local intent")
-        if (self.state is CoreProjectPatchStateV1.APPLIED) != (self.outcome is not None):
-            raise ValueError("only an applied project patch has a durable outcome")
+        outcome_fields = (self.outcome, self.outcome_immutable, self.outcome_mutable)
+        has_complete_outcome = all(value is not None for value in outcome_fields)
+        has_any_outcome = any(value is not None for value in outcome_fields)
+        if (
+            (self.state is CoreProjectPatchStateV1.APPLIED) != has_complete_outcome
+            or has_any_outcome != has_complete_outcome
+        ):
+            raise ValueError("only an applied project patch has complete durable authority")
         if self.outcome is not None and self.outcome.id != self.core_project_id:
             raise ValueError("project patch outcome belongs to another project")
         if self.outcome is not None and not _project_identity_matches(
             self.outcome, self.new_project_create
         ):
             raise ValueError("project patch outcome does not match new Local intent")
+        if self.outcome is not None and (
+            self.outcome_immutable != _patch_immutable_authority(self.outcome)
+            or self.outcome_mutable != _patch_mutable_authority(self.outcome)
+        ):
+            raise ValueError("project patch outcome authority boundary is incomplete")
 
 
 @dataclass(frozen=True, slots=True)
@@ -487,6 +576,9 @@ class DesktopCoreBridgePersistence(Protocol):
         self,
         operation: CoreProjectPatchOperationV1,
         outcome: core_v1.ProjectV1,
+        *,
+        outcome_immutable: CoreProjectPatchImmutableAuthorityV1,
+        outcome_mutable: CoreProjectPatchMutableAuthorityV1,
     ) -> CoreProjectPatchOperationV1: ...
 
     def commit_mapping(
@@ -766,6 +858,7 @@ class DesktopCoreBridgeV1:
                     client=client,
                     current=core_project,
                     operation=pending_patch,
+                    workspace_authority=operation,
                 )
                 completed_patch = pending_patch
                 recovered_requested_patch = pending_patch.new_request_sha256 == request_sha256
@@ -1696,10 +1789,24 @@ class DesktopCoreBridgeV1:
         client: CoreControlClientV1,
         current: core_v1.ProjectV1,
         operation: CoreProjectPatchOperationV1,
+        workspace_authority: CoreProjectCreateOperationV1 | None = None,
     ) -> tuple[core_v1.ProjectV1, CoreProjectPatchOperationV1]:
         if operation.state is CoreProjectPatchStateV1.APPLIED:
             assert operation.outcome is not None
-            _ensure_persisted_patch_outcome(operation, current)
+            finalize_authority: CoreWorkspaceUploadFinalizeAuthorityV1 | None = None
+            if _patch_outcome_needs_workspace_finalize_proof(operation, current):
+                if workspace_authority is None:
+                    raise _bridge_error(
+                        "core_project_patch_outcome_mismatch",
+                        "The applied project patch lacks durable workspace finalize authority.",
+                        status=409,
+                    )
+                finalize_authority = workspace_authority.workspace_upload_finalize
+            _ensure_persisted_patch_outcome(
+                operation,
+                current,
+                finalize_authority=finalize_authority,
+            )
             return current, operation
         if operation.state is CoreProjectPatchStateV1.PRE_PATCH:
             expected_unknown = replace(
@@ -1736,11 +1843,18 @@ class DesktopCoreBridgeV1:
             operation,
             state=CoreProjectPatchStateV1.APPLIED,
             outcome=patched,
+            outcome_immutable=_patch_immutable_authority(patched),
+            outcome_mutable=_patch_mutable_authority(patched),
         )
         stored_applied = self._adapter_external(
             token,
             deadline,
-            lambda: self._persistence.record_patch_applied(operation, patched),
+            lambda: self._persistence.record_patch_applied(
+                operation,
+                patched,
+                outcome_immutable=expected_applied.outcome_immutable,
+                outcome_mutable=expected_applied.outcome_mutable,
+            ),
             label="project patch outcome commit",
         )
         operation = _ensure_patch_transition(
@@ -1936,6 +2050,31 @@ class DesktopCoreBridgeV1:
                 idempotency_key=_derived_key(upload_key_seed, "finalize"),
             ),
         )
+        finalize_authority = CoreWorkspaceUploadFinalizeAuthorityV1(
+            upload=upload,
+            request_sha256=_model_digest(finalize_request),
+            request=finalize_request,
+            idempotency_key=_derived_key(upload_key_seed, "finalize"),
+            outcome=finalized,
+        )
+        finalized_operation = replace(
+            operation,
+            workspace_upload_finalize=finalize_authority,
+        )
+        stored_operation = self._adapter_external(
+            token,
+            deadline,
+            lambda: self._persistence.update_create(
+                finalized_operation,
+                expected_previous=operation,
+            ),
+            label="workspace finalize authority commit",
+        )
+        operation = _ensure_create_transition(
+            stored_operation,
+            finalized_operation,
+            label="workspace-finalize-authority",
+        )
         return finalized.project, operation
 
     def _abort_stale_workspace_upload(
@@ -1970,6 +2109,7 @@ class DesktopCoreBridgeV1:
                     operation,
                     workspace_upload_id=None,
                     workspace_upload_project_snapshot=None,
+                    workspace_upload_finalize=None,
                 )
                 stored = self._adapter_external(
                     token,
@@ -2040,15 +2180,11 @@ class DesktopCoreBridgeV1:
             )
             abort = unknown_abort
 
-        # A restarted strict client has no cache entry for the superseded open
-        # upload. Restore only the exact persisted pre-abort representation so
-        # an unknown transport outcome can replay the original mutation.
-        client._register_workspace_upload(abort.upload, exact_replay=True)
         aborted = self._core_external(
             token,
             deadline,
-            lambda: client.abort_workspace_upload(
-                abort.upload.id,
+            lambda: client.abort_persisted_workspace_upload(
+                abort.upload,
                 abort.request,
                 if_match=abort.upload.etag,
                 idempotency_key=abort.idempotency_key,
@@ -2070,6 +2206,7 @@ class DesktopCoreBridgeV1:
             workspace_upload_id=None,
             workspace_upload_project_snapshot=None,
             workspace_upload_abort=None,
+            workspace_upload_finalize=None,
         )
         stored = self._adapter_external(
             token,
@@ -2472,19 +2609,145 @@ def _ensure_patch_operation_authority(
 def _ensure_persisted_patch_outcome(
     operation: CoreProjectPatchOperationV1,
     current: core_v1.ProjectV1,
+    *,
+    finalize_authority: CoreWorkspaceUploadFinalizeAuthorityV1 | None,
 ) -> None:
-    if operation.outcome != current:
+    assert operation.outcome is not None
+    assert operation.outcome_immutable is not None
+    assert operation.outcome_mutable is not None
+    if _patch_immutable_authority(current) != operation.outcome_immutable:
         raise _bridge_error(
             "core_project_patch_outcome_mismatch",
-            "Core no longer matches the durable applied project patch outcome.",
+            "Core no longer matches the immutable applied project patch authority.",
             status=409,
         )
-    _ensure_project_identity(current, operation.new_project_create)
+    _ensure_project_identity(operation.outcome, operation.new_project_create)
     _ensure_patch_signed_new_snapshots(
         operation.base_project,
-        current,
+        operation.outcome,
         operation.new_project_create,
     )
+    current_mutable = _patch_mutable_authority(current)
+    if current_mutable == operation.outcome_mutable:
+        return
+    if _utc_timestamp(current.updated_at) < _utc_timestamp(
+        operation.outcome_mutable.updated_at
+    ):
+        raise _bridge_error(
+            "core_project_patch_outcome_mismatch",
+            "Core project mutable authority moved backward after the applied patch.",
+            status=409,
+        )
+    if current.etag == operation.outcome_mutable.etag:
+        raise _bridge_error(
+            "core_project_patch_outcome_mismatch",
+            "Core changed project authority without issuing a new ETag.",
+            status=409,
+        )
+    same_content_authority = (
+        current.current_project_snapshot == operation.outcome_mutable.project_snapshot
+        and current.current_workspace_snapshot == operation.outcome_mutable.workspace_snapshot
+        and current.workspace_publication == operation.outcome_mutable.workspace_publication
+    )
+    if same_content_authority:
+        return
+    _ensure_workspace_finalize_proof(operation, current, finalize_authority)
+
+
+def _patch_outcome_needs_workspace_finalize_proof(
+    operation: CoreProjectPatchOperationV1,
+    current: core_v1.ProjectV1,
+) -> bool:
+    assert operation.outcome_mutable is not None
+    return any(
+        (
+            current.current_project_snapshot != operation.outcome_mutable.project_snapshot,
+            current.current_workspace_snapshot != operation.outcome_mutable.workspace_snapshot,
+            current.workspace_publication != operation.outcome_mutable.workspace_publication,
+        )
+    )
+
+
+def _ensure_workspace_finalize_proof(
+    operation: CoreProjectPatchOperationV1,
+    current: core_v1.ProjectV1,
+    authority: CoreWorkspaceUploadFinalizeAuthorityV1 | None,
+) -> None:
+    assert operation.outcome_mutable is not None
+    assert operation.outcome_immutable is not None
+    requested_workspace = operation.new_project_create.workspace
+    upload = authority.upload if authority is not None else None
+    finalized_project = authority.outcome.project if authority is not None else None
+    if not isinstance(requested_workspace, core_v1.ImportedWorkspaceSpecV1) or (
+        authority is None
+        or upload is None
+        or finalized_project is None
+        or upload.status is not core_v1.WorkspaceUploadStatus.OPEN
+        or upload.project_id != operation.core_project_id
+        or upload.project_snapshot != operation.outcome_mutable.project_snapshot
+        or upload.project_etag != operation.outcome_mutable.etag
+        or upload.archive != requested_workspace.archive
+        or upload.base_workspace_snapshot != operation.outcome_mutable.workspace_snapshot
+        or upload.accepted_offset != upload.archive.byte_size
+        or authority.outcome.publication != current.workspace_publication
+        or finalized_project.current_project_snapshot != current.current_project_snapshot
+        or finalized_project.current_workspace_snapshot != current.current_workspace_snapshot
+        or finalized_project.workspace_publication != current.workspace_publication
+        or _patch_immutable_authority(finalized_project) != operation.outcome_immutable
+    ):
+        raise _bridge_error(
+            "core_project_patch_outcome_mismatch",
+            "Core workspace publication does not prove the applied project patch successor.",
+            status=409,
+        )
+    finalized_mutable = _patch_mutable_authority(finalized_project)
+    current_mutable = _patch_mutable_authority(current)
+    if current_mutable != finalized_mutable and (
+        _utc_timestamp(current.updated_at) < _utc_timestamp(finalized_project.updated_at)
+        or current.etag == finalized_project.etag
+    ):
+        raise _bridge_error(
+            "core_project_patch_outcome_mismatch",
+            "Core mutable authority does not descend from the durable workspace finalize.",
+            status=409,
+        )
+
+
+def _patch_immutable_authority(
+    project: core_v1.ProjectV1,
+) -> CoreProjectPatchImmutableAuthorityV1:
+    return CoreProjectPatchImmutableAuthorityV1(
+        project_id=project.id,
+        project_create=core_v1.ProjectCreateV1(
+            name=project.name,
+            description=project.description,
+            spec=project.spec,
+            task=project.task,
+            workspace=project.workspace,
+        ),
+        task_snapshot=project.current_task_snapshot,
+        created_at=project.created_at,
+    )
+
+
+def _patch_mutable_authority(
+    project: core_v1.ProjectV1,
+) -> CoreProjectPatchMutableAuthorityV1:
+    return CoreProjectPatchMutableAuthorityV1(
+        status=project.status,
+        project_snapshot=project.current_project_snapshot,
+        workspace_snapshot=project.current_workspace_snapshot,
+        workspace_publication=project.workspace_publication,
+        active_revision=project.active_revision,
+        registry_digest=project.registry_digest,
+        model_preparation=project.model_preparation,
+        updated_at=project.updated_at,
+        etag=project.etag,
+    )
+
+
+def _utc_timestamp(value: str) -> datetime:
+    return datetime.fromisoformat(value.removesuffix("Z") + "+00:00")
 
 
 def _ensure_mapping_authority(
@@ -2781,6 +3044,8 @@ __all__ = (
     "CoreProjectCreateStateV1",
     "CoreProjectMappingV1",
     "CoreProjectPatchOperationV1",
+    "CoreProjectPatchImmutableAuthorityV1",
+    "CoreProjectPatchMutableAuthorityV1",
     "CoreProjectPatchStateV1",
     "CoreTunnelFactory",
     "CoreTunnelHandleV1",
@@ -2790,6 +3055,7 @@ __all__ = (
     "DesktopCoreBridgeV1",
     "CoreWorkspaceUploadAbortOperationV1",
     "CoreWorkspaceUploadAbortStateV1",
+    "CoreWorkspaceUploadFinalizeAuthorityV1",
     "WorkspaceArchiveSource",
     "map_project_create_v1",
 )

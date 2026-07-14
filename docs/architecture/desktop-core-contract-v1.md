@@ -400,6 +400,15 @@ A body or frame rejected by the seal cannot be returned, applied, or recorded as
 replay authority for the retired session, and `close()` need not wait for a
 stalled application thread.
 
+The sidecar may recover an unknown stale-upload abort only through the strict
+client's generation-bound persisted-upload abort transaction. That operation
+validates the durable open session, exact ETag, and idempotency key before
+transport, then restores upload authority, dispatches abort, validates the
+terminal response, and publishes cache/result delivery in the same
+copy-on-write generation barrier. A close or project-session switch that seals
+the generation rolls back both restored and returned upload authority; bridge
+code cannot seed the client's private upload cache directly.
+
 Local SSE carries Desktop state changes and resource invalidations. Every
 resource invalidation includes the authoritative ETag or content digest and
 an explicit `desktop` or `core` authority, and causes the renderer to reload

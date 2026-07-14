@@ -333,6 +333,9 @@ class FakePersistence:
         self,
         operation: CoreProjectPatchOperationV1,
         outcome: core_v1.ProjectV1,
+        *,
+        outcome_immutable: bridge_module.CoreProjectPatchImmutableAuthorityV1,
+        outcome_mutable: bridge_module.CoreProjectPatchMutableAuthorityV1,
     ) -> CoreProjectPatchOperationV1:
         self.events.append("record_patch_applied")
         assert self.patch_operation == operation
@@ -340,6 +343,8 @@ class FakePersistence:
             operation,
             state=CoreProjectPatchStateV1.APPLIED,
             outcome=outcome,
+            outcome_immutable=outcome_immutable,
+            outcome_mutable=outcome_mutable,
         )
         return self.patch_operation
 
@@ -616,6 +621,9 @@ class FakeCore:
                 task_snapshot=self.task_snapshot,
                 workspace_snapshot=self.workspace_snapshot,
                 etag=self.project_etag,
+                active_revision=self.active_revision,
+                registry_digest=self.registry_digest,
+                updated_at=self.project_updated_at,
             )
             assert published.workspace_publication is not None
             finalized_upload = self.upload.model_copy(
@@ -1514,6 +1522,172 @@ def test_patch_commit_crash_adopts_applied_a_before_patching_new_local_b() -> No
     assert persistence.mapping.project_create == map_project_create_v1(edited_b)
     assert persistence.mapping.mapping_generation == mapping_o.mapping_generation + 2
     assert persistence.patch_operation is None
+    assert [mapping.project_create for mapping in persistence.mapping_history] == [
+        map_project_create_v1(original),
+        map_project_create_v1(edited_a),
+        map_project_create_v1(edited_b),
+    ]
+
+
+def test_finalized_import_patch_recovery_commits_a_then_patches_b_from_latest_authority() -> None:
+    original = _local_project()
+    first, persistence, fake_core, _ = _bridge(original)
+    first.activate_project(original, idempotency_key="finalize-chain-o-0001")
+    first.close()
+    mapping_o = persistence.mapping
+    assert mapping_o is not None
+
+    archive_a = b"\1" * 1024
+    source_a = local_v1.ProjectSourceV1(
+        kind="native_folder_snapshot",
+        display_name="Imported workspace A",
+        import_ref=local_v1.WorkspaceImportRefV1(
+            import_id="adopted-finalize-a",
+            content_sha256=hashlib.sha256(archive_a).hexdigest(),
+            byte_size=len(archive_a),
+            entry_count=0,
+            extracted_byte_size=0,
+        ),
+    )
+    edited_a = original.model_copy(
+        update={"source": source_a, "updated_at": "2026-07-14T12:50:00Z"}
+    )
+    persistence.fail_commit_once = True
+    second, _, _, _ = _bridge(
+        edited_a,
+        persistence=persistence,
+        fake_core=fake_core,
+        archive_source=FakeArchiveSource(archive_a),
+    )
+
+    with pytest.raises(DesktopCoreBridgeErrorV1) as exc_info:
+        second.activate_project(edited_a, idempotency_key="finalize-chain-a-0002")
+
+    assert exc_info.value.error.code == "core_bridge_adapter_failed"
+    assert persistence.mapping == mapping_o
+    assert persistence.patch_operation is not None
+    assert persistence.patch_operation.state is CoreProjectPatchStateV1.APPLIED
+    assert persistence.patch_operation.outcome is not None
+    assert persistence.patch_operation.outcome.workspace_publication is None
+    assert fake_core.upload is not None
+    assert fake_core.upload.status is core_v1.WorkspaceUploadStatus.FINALIZED
+    finalized_publication = fake_core.upload.publication
+    assert finalized_publication is not None
+    assert persistence.operation is not None
+    assert persistence.operation.workspace_upload_finalize is not None
+    assert (
+        persistence.operation.workspace_upload_finalize.outcome.publication
+        == finalized_publication
+    )
+    with pytest.raises(ValueError, match="finalize authority"):
+        replace(
+            persistence.operation,
+            workspace_upload_finalize=replace(
+                persistence.operation.workspace_upload_finalize,
+                idempotency_key="tampered-workspace-finalize-key",
+            ),
+        )
+
+    finalized_project_snapshot = fake_core.project_snapshot
+    fake_core.project_snapshot = _snapshot(
+        "project-snapshot-unproven-after-finalize",
+        core_v1.SnapshotKind.PROJECT,
+        "6",
+    )
+    unproven, _, _, _ = _bridge(
+        edited_a,
+        persistence=persistence,
+        fake_core=fake_core,
+        archive_source=FakeArchiveSource(archive_a),
+    )
+    with pytest.raises(DesktopCoreBridgeErrorV1) as unproven_exc:
+        unproven.activate_project(
+            edited_a,
+            idempotency_key="finalize-chain-unproven-0003",
+        )
+    assert unproven_exc.value.error.code == "core_project_patch_outcome_mismatch"
+    fake_core.project_snapshot = finalized_project_snapshot
+
+    successor = core_v1.RevisionRefV1(
+        id="revision-after-finalize",
+        project_id=CORE_PROJECT_ID,
+        generation=1,
+        manifest_sha256="7" * 64,
+    )
+    successor_etag = '"' + "7" * 64 + '"'
+    fake_core.active_revision = successor
+    fake_core.project_etag = successor_etag
+    fake_core.registry_digest = "8" * 64
+    fake_core.project_updated_at = "2026-07-14T12:51:00Z"
+    fake_core.head = core_v1.RevisionHeadV1(
+        project_id=CORE_PROJECT_ID,
+        active_revision=successor,
+        successor_revision=None,
+        transition=None,
+        updated_at="2026-07-14T12:51:00Z",
+        etag=successor_etag,
+    )
+    third, _, _, _ = _bridge(
+        edited_a,
+        persistence=persistence,
+        fake_core=fake_core,
+        archive_source=FakeArchiveSource(archive_a),
+    )
+
+    recovered_a = third.activate_project(
+        edited_a,
+        idempotency_key="finalize-chain-a-retry-0003",
+    )
+    third.close()
+
+    mapping_a = persistence.mapping
+    assert mapping_a is not None
+    assert recovered_a.core_project.status is core_v1.ProjectStatus.READY
+    assert recovered_a.core_project.workspace_publication == finalized_publication
+    assert mapping_a.request_sha256 == bridge_module._model_digest(
+        map_project_create_v1(edited_a)
+    )
+    assert mapping_a.project_snapshot == recovered_a.core_project.current_project_snapshot
+    assert mapping_a.workspace_snapshot == finalized_publication.workspace_snapshot
+    assert mapping_a.project_etag == successor_etag
+    assert mapping_a.active_revision == successor
+    assert mapping_a.registry_digest == "8" * 64
+    assert mapping_a.mapping_generation == mapping_o.mapping_generation + 1
+    assert persistence.patch_operation is None
+
+    archive_b = b"\2" * 1024
+    source_b = local_v1.ProjectSourceV1(
+        kind="native_folder_snapshot",
+        display_name="Imported workspace B",
+        import_ref=local_v1.WorkspaceImportRefV1(
+            import_id="adopted-finalize-b",
+            content_sha256=hashlib.sha256(archive_b).hexdigest(),
+            byte_size=len(archive_b),
+            entry_count=0,
+            extracted_byte_size=0,
+        ),
+    )
+    edited_b = edited_a.model_copy(
+        update={"source": source_b, "updated_at": "2026-07-14T12:52:00Z"}
+    )
+    fourth, _, _, _ = _bridge(
+        edited_b,
+        persistence=persistence,
+        fake_core=fake_core,
+        archive_source=FakeArchiveSource(archive_b),
+    )
+    recovered_b = fourth.activate_project(
+        edited_b,
+        idempotency_key="finalize-chain-b-0004",
+    )
+
+    assert len(fake_core.patch_requests) == 2
+    assert fake_core.patch_requests[0][0].workspace == map_project_create_v1(edited_a).workspace
+    assert fake_core.patch_requests[1][0].workspace == map_project_create_v1(edited_b).workspace
+    assert fake_core.patch_requests[1][1] == successor_etag
+    assert recovered_b.core_project.workspace == map_project_create_v1(edited_b).workspace
+    assert persistence.mapping is not None
+    assert persistence.mapping.mapping_generation == mapping_o.mapping_generation + 2
     assert [mapping.project_create for mapping in persistence.mapping_history] == [
         map_project_create_v1(original),
         map_project_create_v1(edited_a),

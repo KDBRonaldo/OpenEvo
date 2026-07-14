@@ -20,7 +20,10 @@ child services over SSH.
 The persisted create operation binds local project, profile, Core host
 identity, the full canonical Core `ProjectCreateV1`, its digest, idempotency
 key, returned Core project ID, and workspace upload ID plus its owning project
-snapshot. Its state is explicit:
+snapshot. A successful workspace finalize is CAS-persisted on the same operation
+before mapping commit, including the complete pre-finalize upload, canonical
+request and key, and exact strict-client-validated finalize response. Its create
+state is explicit:
 
 - `pre_create` proves no create request has been dispatched. A deterministic
   failure in version/capability/bootstrap preparation leaves this state, so a
@@ -38,16 +41,23 @@ create operation until Core returns a terminal abort result. The operation
 stores the complete open upload authority, canonical abort request and digest,
 idempotency key, and `pre_abort`/`unknown` state. It transitions to `unknown`
 before transport. A missing response never permits a GET-based inference or a
-new abort request: recovery restores the persisted open representation to the
-strict client and replays the exact request, ETag, and key. Clearing the abort
-and stale upload binding is one create-operation CAS. Already terminal uploads
-need no abort and may be cleared after their exact identity is read.
+new abort request. Recovery calls the strict client's public
+`abort_persisted_workspace_upload` transaction, which validates the exact
+persisted open representation, ETag, and idempotency key, restores authority,
+executes abort, and commits result delivery under one client generation
+barrier. A concurrent client close rolls the restored authority back. Clearing
+the abort and stale upload binding is one create-operation CAS. Already terminal
+uploads need no abort and may be cleared after their exact identity is read.
 
 Each Local project may also have one durable patch operation. It stores the
 canonical old and new `ProjectCreateV1` intents and digests, canonical
 `ProjectPatchV1` and digest, deterministic key, Core project identity, complete
 pre-patch Core authority including ETag/snapshots, and the validated Core
-outcome. Its states are `pre_patch`, `unknown`, and `applied`. Persistence must:
+outcome. An applied row additionally persists explicit projections of that
+outcome's immutable content authority and mutable publication/runtime
+authority; the projections cover the complete `ProjectV1` rather than leaving
+fields implicitly classified. Its states are `pre_patch`, `unknown`, and
+`applied`. Persistence must:
 
 1. reserve without replacing a different pending operation;
 2. full-row CAS `pre_patch` to `unknown` before transport;
@@ -61,6 +71,16 @@ The last transaction compares the complete previous mapping. A rollback leaves
 the old mapping and applied operation intact. If Local intent advanced from A
 to B after Core applied A, recovery proves the persisted A outcome, commits A
 as the next mapping generation, then reserves a distinct A-to-B operation.
+Recovery does not require a pre-finalize imported-project outcome to equal the
+current project as a whole. A workspace finalize may legitimately advance the
+project snapshot, workspace snapshot, status, publication, ETag, readiness, and
+revision authority. In that case the durable finalize response must bind a
+predecessor project snapshot and ETag exactly matching the applied patch's
+mutable authority, plus the exact final project snapshot, workspace snapshot,
+and publication observed now. Later successor-only mutable authority must be
+ETag-visible and monotonic. Only after this proof may Desktop commit mapping A;
+a requested B then starts from A's current ETag and gets a separate mapping
+generation.
 
 The completed mapping also stores the canonical mapped request, exact
 project/task/workspace content snapshots, project ETag, active revision,
