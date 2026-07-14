@@ -15,8 +15,12 @@ macOS and Linux hosts. Local leader-exit observation uses Linux
 otherwise; a waiter preserves the exact return code on platforms without either
 interface. All paths retain the 100 ms descendant-pipe drain, terminate the
 owned process group on leader exit, timeout, or cancellation, and reap the
-leader. This local portability does not extend the remote contract: the Core
-host must be Linux and the preflight rejects every other remote platform.
+leader. Ownership capacity is reserved before `Popen`; observer construction,
+thread-start, capture, and cleanup `BaseException` paths cannot lose the PID or
+PGID. Unconfirmed cleanup remains in a bounded process-local registry for later
+command/tunnel/close recovery, and all waits and waiter joins remain bounded.
+This local portability does not extend the remote contract: the Core host must
+be Linux and the preflight rejects every other remote platform.
 
 ## Host Identity
 
@@ -178,6 +182,15 @@ identities, and digests, then substitutes a
 and its nested pip child run. Same-name replacement cannot redirect consumer
 reads, and post-consumption revalidation fails closed on mutation or pathname
 replacement. An already published exact sealed bundle is an idempotent retry.
+The transport retains each prepared transfer until confirmed publication or
+discard. Upload cleanup has an independent 10-second deadline. Once finalize
+starts, timeout, cancellation, authenticated failure, or malformed receipt first
+replays the exact finalize transaction and validates its receipt; only a
+definitive non-publication result permits incoming discard. A later staging call
+retries retained authority before prepare. Under the same publication lock,
+prepare also reclaims closed incoming attempts inactive for more than 600
+seconds, so process restart can recover proven stale capacity without touching a
+live cross-process upload or an exact published bundle.
 Remote paths are outputs of this verifier, never Desktop configuration or
 user-preplaced `/srv` inputs.
 

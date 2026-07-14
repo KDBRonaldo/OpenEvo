@@ -920,6 +920,46 @@ def test_open_tunnel_starts_ssh_local_forwarding_and_closes_process(
     assert tunnel.closed is True
 
 
+def test_open_tunnel_readiness_cancellation_closes_forward_and_trust_lease(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Cancelled(BaseException):
+        pass
+
+    profile = _profile()
+    binding = _trusted_binding(tmp_path, profile)
+    starter = RecordingTunnelStarter()
+    transport = SshRemoteExecutorTransport(
+        profile,
+        trusted_host=binding,
+        runner=RecordingRunner(),
+        tunnel_starter=starter,
+        port_allocator=lambda: 49155,
+    )
+
+    def cancel_readiness(*_args: object, **_kwargs: object) -> None:
+        raise Cancelled
+
+    monkeypatch.setattr(ssh_module, "_wait_for_local_port", cancel_readiness)
+
+    with pytest.raises(Cancelled):
+        transport.open_tunnel(remote_port=8765)
+
+    process = starter.processes[0]
+    lease_path = Path(
+        next(
+            value.removeprefix("UserKnownHostsFile=")
+            for value in starter.calls[0]
+            if value.startswith("UserKnownHostsFile=")
+        )
+    )
+    assert process.terminated is True
+    assert process.waited is True
+    assert not lease_path.exists()
+    assert all(tunnel.process is not process for tunnel in ssh_module._ORPHANED_TUNNELS.values())
+
+
 def test_core_tunnel_uses_parent_owned_socketpair_and_per_connection_ssh_child(
     tmp_path: Path,
 ) -> None:
@@ -2386,6 +2426,100 @@ def test_default_runner_cancellation_terminates_and_reaps_entire_process_group(
     assert spawned_process_ids is not None
     leader_id, descendant_id = spawned_process_ids
     _assert_processes_gone(leader_id, descendant_id)
+
+
+def test_default_runner_observer_start_cancellation_retains_spawn_ownership(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Cancelled(BaseException):
+        pass
+
+    started: list[subprocess.Popen[bytes]] = []
+    original_popen = subprocess.Popen
+
+    def recording_popen(*args: object, **kwargs: object) -> subprocess.Popen[bytes]:
+        process = original_popen(*args, **kwargs)
+        started.append(process)
+        return process
+
+    def cancel_thread_start(_self: threading.Thread) -> None:
+        raise Cancelled
+
+    monkeypatch.delattr(ssh_module.os, "waitid", raising=False)
+    monkeypatch.setattr(ssh_module.subprocess, "Popen", recording_popen)
+    monkeypatch.setattr(threading.Thread, "start", cancel_thread_start)
+
+    with pytest.raises(Cancelled):
+        ssh_module._run_subprocess(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            1,
+        )
+
+    assert len(started) == 1
+    assert started[0].poll() is not None
+    assert ssh_module._ORPHANED_SUBPROCESSES == {}
+
+
+def test_default_runner_bounds_multiple_cleanup_orphans_and_reaps_on_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Cancelled(BaseException):
+        pass
+
+    original_cleanup = ssh_module._terminate_and_reap_subprocess
+    original_popen = subprocess.Popen
+    cleanup_fails = True
+    started: list[subprocess.Popen[bytes]] = []
+
+    def recording_popen(*args: object, **kwargs: object) -> subprocess.Popen[bytes]:
+        process = original_popen(*args, **kwargs)
+        started.append(process)
+        return process
+
+    def cancel_capture(*_args: object, **_kwargs: object) -> tuple[bytes, bytes]:
+        raise Cancelled
+
+    def controlled_cleanup(*args: object, **kwargs: object) -> None:
+        if cleanup_fails:
+            raise OSError("cleanup failed")
+        original_cleanup(*args, **kwargs)
+
+    monkeypatch.setattr(
+        ssh_module,
+        "_SUBPROCESS_OWNERSHIP_SLOTS",
+        threading.BoundedSemaphore(3),
+    )
+    monkeypatch.setattr(ssh_module.subprocess, "Popen", recording_popen)
+    monkeypatch.setattr(ssh_module, "_capture_subprocess_output", cancel_capture)
+    monkeypatch.setattr(
+        ssh_module,
+        "_terminate_and_reap_subprocess",
+        controlled_cleanup,
+    )
+
+    try:
+        for _index in range(3):
+            with pytest.raises(Cancelled):
+                ssh_module._run_subprocess(
+                    [sys.executable, "-c", "import time; time.sleep(30)"],
+                    1,
+                )
+
+        assert len(ssh_module._ORPHANED_SUBPROCESSES) == 3
+        with pytest.raises(RuntimeError, match="ownership capacity"):
+            ssh_module._run_subprocess(
+                [sys.executable, "-c", "import time; time.sleep(30)"],
+                1,
+            )
+        assert len(started) == 3
+
+        cleanup_fails = False
+        ssh_module._retry_orphaned_subprocess_cleanup()
+        assert ssh_module._ORPHANED_SUBPROCESSES == {}
+        assert all(process.poll() is not None for process in started)
+    finally:
+        cleanup_fails = False
+        ssh_module._retry_orphaned_subprocess_cleanup()
 
 
 def _assert_processes_gone(*process_ids: int) -> None:

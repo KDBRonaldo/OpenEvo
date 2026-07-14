@@ -296,12 +296,8 @@ def test_remote_asset_scripts_prepare_an_empty_private_root_and_publish_exactly(
     assert finalized["bundle_inode"] == final_root.stat().st_ino
     assert finalized["wheel_device"] == (final_root / WHEEL_NAME).stat().st_dev
     assert finalized["wheel_inode"] == (final_root / WHEEL_NAME).stat().st_ino
-    assert finalized["framework_lock_device"] == (
-        final_root / "framework-lock.json"
-    ).stat().st_dev
-    assert finalized["framework_lock_inode"] == (
-        final_root / "framework-lock.json"
-    ).stat().st_ino
+    assert finalized["framework_lock_device"] == (final_root / "framework-lock.json").stat().st_dev
+    assert finalized["framework_lock_inode"] == (final_root / "framework-lock.json").stat().st_ino
 
     _execute_remote_script(
         core_assets._REMOTE_PREPARE_SCRIPT,
@@ -807,6 +803,39 @@ def test_remote_asset_prepare_bounds_concurrent_incoming_authorities(
     assert len(list(staging.iterdir())) == 16
 
 
+def test_remote_asset_prepare_recovers_sixteen_proven_stale_incoming_authorities(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    incoming: list[Path] = []
+    for _index in range(16):
+        _execute_remote_script(
+            core_assets._REMOTE_PREPARE_SCRIPT,
+            [BUNDLE_ID],
+            home=home,
+            monkeypatch=monkeypatch,
+        )
+        incoming.append(Path(json.loads(capsys.readouterr().out)["incoming_root"]))
+
+    stale_time = time.time() - 601
+    for path in incoming:
+        os.utime(path, (stale_time, stale_time), follow_symlinks=False)
+
+    _execute_remote_script(
+        core_assets._REMOTE_PREPARE_SCRIPT,
+        [BUNDLE_ID],
+        home=home,
+        monkeypatch=monkeypatch,
+    )
+    recovered = Path(json.loads(capsys.readouterr().out)["incoming_root"])
+    staging = home / ".openevo" / "core" / "asset-staging"
+    assert list(staging.iterdir()) == [recovered]
+    assert recovered not in incoming
+
+
 def stat_mode(path: Path) -> int:
     return os.stat(path, follow_symlinks=False).st_mode & 0o777
 
@@ -876,9 +905,7 @@ def test_stage_core_assets_prepares_fresh_host_uploads_private_snapshot_and_fina
     assert staged.bundle_inode == 12
     assert staged.wheel_inode == 14
     assert staged.framework_lock_inode == 16
-    consumer_command = (
-        f"consume {staged.wheel_path} {staged.framework_lock_path}"
-    )
+    consumer_command = f"consume {staged.wheel_path} {staged.framework_lock_path}"
     bound_command = transport._bind_core_asset_consumption(consumer_command)
     assert bound_command.startswith("python3 -I -c ")
     assert shlex.quote(consumer_command) in bound_command
@@ -1158,6 +1185,137 @@ def test_stage_core_assets_partial_upload_retry_converges_to_same_remote_identit
     staged = _stage(transport, assets)
     assert staged.wheel_path.endswith(f"/{BUNDLE_ID}/{WHEEL_NAME}")
     assert len(runner.calls) == 2
+
+
+def test_stage_core_assets_retries_failed_discard_with_independent_cleanup_deadline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assets = _assets(tmp_path)
+    runner = RecordingRunner([23, 0])
+    transport = _transport(tmp_path, runner)
+    first = _stage_responses(assets[1], assets[3], transfer_id=TRANSFER_ID)
+    second = _stage_responses(assets[1], assets[3], transfer_id=SECOND_TRANSFER_ID)
+    calls: list[tuple[str, float]] = []
+
+    def run_secret(
+        command: str,
+        *,
+        timeout_seconds: float,
+        remote_failure_code: SshTransportErrorCode,
+    ) -> SecretStr:
+        del remote_failure_code
+        calls.append((command, timeout_seconds))
+        if len(calls) == 1:
+            return first[0]
+        if len(calls) == 2:
+            raise SshTransportError(SshTransportErrorCode.CONNECTION_FAILED)
+        if len(calls) == 3:
+            return SecretStr("")
+        if len(calls) == 4:
+            return second[0]
+        return second[1]
+
+    monkeypatch.setattr(transport, "_run_secret_with_remote_failure", run_secret)
+
+    with pytest.raises(SshTransportError) as first_error:
+        _stage(transport, assets)
+    assert first_error.value.code is SshTransportErrorCode.RSYNC_FAILED
+    assert len(transport._core_asset_cleanup_authorities) == 1
+    assert 0 < calls[1][1] <= 10
+
+    staged = _stage(transport, assets)
+    assert staged.wheel_path.endswith(f"/{BUNDLE_ID}/{WHEEL_NAME}")
+    assert transport._core_asset_cleanup_authorities == {}
+    assert 0 < calls[2][1] <= 10
+
+
+@pytest.mark.parametrize("initial_failure", ["timeout", "parse", "remote"])
+def test_stage_core_assets_reconciles_finalize_before_discard(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    initial_failure: str,
+) -> None:
+    assets = _assets(tmp_path)
+    transport = _transport(tmp_path, RecordingRunner())
+    prepared, receipt = _stage_responses(assets[1], assets[3])
+    calls: list[tuple[str, float]] = []
+
+    def run_secret(
+        command: str,
+        *,
+        timeout_seconds: float,
+        remote_failure_code: SshTransportErrorCode,
+    ) -> SecretStr:
+        del remote_failure_code
+        calls.append((command, timeout_seconds))
+        if len(calls) == 1:
+            return prepared
+        if len(calls) == 2 and initial_failure == "timeout":
+            raise SshTransportError(SshTransportErrorCode.TIMEOUT)
+        if len(calls) == 2 and initial_failure == "parse":
+            return SecretStr('{"schema_version":1}')
+        if len(calls) in {2, 3} and initial_failure == "remote":
+            raise SshTransportError(SshTransportErrorCode.CORE_ASSET_FAILED)
+        if len(calls) == 4 and initial_failure == "remote":
+            return SecretStr("")
+        return receipt
+
+    monkeypatch.setattr(transport, "_run_secret_with_remote_failure", run_secret)
+
+    if initial_failure == "remote":
+        with pytest.raises(SshTransportError) as error:
+            _stage(transport, assets)
+        assert error.value.code is SshTransportErrorCode.CORE_ASSET_FAILED
+        assert len(calls) == 4
+    else:
+        staged = _stage(transport, assets)
+        assert staged.bundle_inode == 12
+        assert len(calls) == 3
+    assert transport._core_asset_cleanup_authorities == {}
+    assert 0 < calls[2][1] <= 10
+
+
+def test_stage_core_assets_retains_unknown_finalize_and_preserves_exact_publish(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assets = _assets(tmp_path)
+    transport = _transport(tmp_path, RecordingRunner())
+    first = _stage_responses(assets[1], assets[3], transfer_id=TRANSFER_ID)
+    second = _stage_responses(assets[1], assets[3], transfer_id=SECOND_TRANSFER_ID)
+    calls: list[str] = []
+
+    def run_secret(
+        command: str,
+        *,
+        timeout_seconds: float,
+        remote_failure_code: SshTransportErrorCode,
+    ) -> SecretStr:
+        del timeout_seconds, remote_failure_code
+        calls.append(command)
+        if len(calls) == 1:
+            return first[0]
+        if len(calls) in {2, 3}:
+            raise SshTransportError(SshTransportErrorCode.TIMEOUT)
+        if len(calls) == 4:
+            return first[1]
+        if len(calls) == 5:
+            return second[0]
+        return second[1]
+
+    monkeypatch.setattr(transport, "_run_secret_with_remote_failure", run_secret)
+
+    with pytest.raises(SshTransportError) as unknown:
+        _stage(transport, assets)
+    assert unknown.value.code is SshTransportErrorCode.TIMEOUT
+    assert len(transport._core_asset_cleanup_authorities) == 1
+
+    staged = _stage(transport, assets)
+    assert staged.bundle_inode == 12
+    assert transport._core_asset_cleanup_authorities == {}
+    assert len(calls) == 6
+    assert all(shlex.quote(core_assets._REMOTE_DISCARD_SCRIPT) not in command for command in calls)
 
 
 def test_stage_core_assets_rejects_tampered_finalize_without_leaking_paths(

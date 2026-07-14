@@ -17,6 +17,7 @@ import threading
 import time
 from collections.abc import Callable
 from contextlib import AbstractContextManager
+from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import NoReturn, Protocol
@@ -57,10 +58,48 @@ _SUBPROCESS_CAPTURE_CHUNK_BYTES = 64 * 1024
 _SUBPROCESS_TERMINATE_GRACE_SECONDS = 1.0
 _SUBPROCESS_DESCENDANT_PIPE_GRACE_SECONDS = 0.1
 _SUBPROCESS_STATUS_INTERVAL_SECONDS = 0.05
+_SUBPROCESS_OBSERVER_JOIN_SECONDS = 0.05
+_SUBPROCESS_OWNERSHIP_ACQUIRE_SECONDS = 0.1
+_MAX_OWNED_SUBPROCESSES = 32
+_MAX_SUBPROCESS_ORPHAN_RETRIES = 4
+_CORE_ASSET_CLEANUP_SECONDS = 10.0
 _ORPHANED_TUNNEL_GUARD = threading.Lock()
 _ORPHANED_TUNNELS: dict[int, "SshTunnel"] = {}
 _ORPHANED_CORE_TUNNELS: dict[int, "_CoreTunnelEndpoint"] = {}
 _ORPHANED_TRUST_LEASES: dict[int, AbstractContextManager[Path]] = {}
+_ORPHANED_SUBPROCESS_GUARD = threading.Lock()
+_ORPHANED_SUBPROCESSES: dict[int, "_OwnedSubprocessAuthority"] = {}
+_SUBPROCESS_OWNERSHIP_SLOTS = threading.BoundedSemaphore(_MAX_OWNED_SUBPROCESSES)
+
+
+@dataclass(frozen=True, slots=True)
+class _CoreAssetTransferAuthority:
+    service_root: str
+    bundle_id: str
+    transfer_id: str
+    wheel_filename: str
+    wheel_sha256: str
+    wheel_size: int
+    framework_lock_sha256: str
+    framework_lock_size: int
+    finalize_started: bool = False
+
+    @property
+    def key(self) -> tuple[str, str, str]:
+        return self.service_root, self.bundle_id, self.transfer_id
+
+    def with_finalize_started(self) -> _CoreAssetTransferAuthority:
+        return _CoreAssetTransferAuthority(
+            service_root=self.service_root,
+            bundle_id=self.bundle_id,
+            transfer_id=self.transfer_id,
+            wheel_filename=self.wheel_filename,
+            wheel_sha256=self.wheel_sha256,
+            wheel_size=self.wheel_size,
+            framework_lock_sha256=self.framework_lock_sha256,
+            framework_lock_size=self.framework_lock_size,
+            finalize_started=True,
+        )
 
 
 class SshTransportErrorCode(str, Enum):
@@ -354,6 +393,7 @@ class SshCoreTunnel(AbstractContextManager["SshCoreTunnel"]):
         return self._endpoint.open_verified_socket(timeout_seconds=timeout_seconds)
 
     def close(self) -> None:
+        _retry_orphaned_subprocess_cleanup()
         self._endpoint.close()
 
     def __enter__(self) -> SshCoreTunnel:
@@ -464,6 +504,7 @@ class SshTunnel(AbstractContextManager["SshTunnel"]):
             self.request_close()
 
     def close(self) -> None:
+        _retry_orphaned_subprocess_cleanup()
         with self._close_guard:
             self._close_once()
 
@@ -616,6 +657,10 @@ class SshRemoteExecutorTransport:
         )
         self._core_asset_authority_lock = threading.Lock()
         self._core_asset_authorities: dict[str, StagedCoreBootstrapAssets] = {}
+        self._core_asset_cleanup_authorities: dict[
+            tuple[str, str, str], _CoreAssetTransferAuthority
+        ] = {}
+        self._core_asset_active_transfers: set[tuple[str, str, str]] = set()
 
     def run(
         self,
@@ -758,6 +803,9 @@ class SshRemoteExecutorTransport:
                 framework_lock_sha256=framework_lock_sha256,
                 framework_lock_size=framework_lock_size,
             ) as snapshot:
+                self._retry_core_asset_transfer_cleanup(
+                    deadline=time.monotonic() + _CORE_ASSET_CLEANUP_SECONDS
+                )
                 prepare_payload = self._run_secret_with_remote_failure(
                     prepare_command,
                     timeout_seconds=_stage_remaining(deadline),
@@ -767,47 +815,47 @@ class SshRemoteExecutorTransport:
                     prepare_payload,
                     bundle_id=bundle_id,
                 )
-                try:
-                    self._upload_core_asset_snapshot(
-                        snapshot.root,
-                        incoming_root,
-                        deadline=deadline,
-                    )
-                except SshTransportError:
-                    self._discard_core_asset_transfer(
-                        service_root=service_root,
-                        bundle_id=bundle_id,
-                        transfer_id=transfer_id,
-                        deadline=deadline,
-                    )
-                    raise
-                finalize_payload = self._run_secret_with_remote_failure(
-                    build_core_asset_finalize_command(
-                        service_root=service_root,
-                        bundle_id=bundle_id,
-                        transfer_id=transfer_id,
-                        wheel_filename=snapshot.wheel_filename,
-                        wheel_sha256=wheel_sha256,
-                        wheel_size=wheel_size,
-                        framework_lock_sha256=framework_lock_sha256,
-                        framework_lock_size=framework_lock_size,
-                    ),
-                    timeout_seconds=_stage_remaining(deadline),
-                    remote_failure_code=SshTransportErrorCode.CORE_ASSET_FAILED,
-                )
-                staged = parse_staged_core_assets(
-                    finalize_payload,
+                authority = _CoreAssetTransferAuthority(
                     service_root=service_root,
                     bundle_id=bundle_id,
+                    transfer_id=transfer_id,
                     wheel_filename=snapshot.wheel_filename,
                     wheel_sha256=wheel_sha256,
                     wheel_size=wheel_size,
                     framework_lock_sha256=framework_lock_sha256,
                     framework_lock_size=framework_lock_size,
                 )
-                final_root = str(Path(staged.wheel_path).parent)
-                with self._core_asset_authority_lock:
-                    self._core_asset_authorities[final_root] = staged
+                self._remember_core_asset_transfer(authority, active=True)
+                try:
+                    self._upload_core_asset_snapshot(
+                        snapshot.root,
+                        incoming_root,
+                        deadline=deadline,
+                    )
+                except BaseException:
+                    self._mark_core_asset_transfer_inactive(authority)
+                    self._discard_core_asset_transfer(
+                        authority,
+                        deadline=time.monotonic() + _CORE_ASSET_CLEANUP_SECONDS,
+                    )
+                    raise
+                authority = authority.with_finalize_started()
+                self._remember_core_asset_transfer(authority)
+                try:
+                    staged = self._finalize_core_asset_transfer(
+                        authority,
+                        deadline=deadline,
+                    )
+                except BaseException as failure:
+                    self._mark_core_asset_transfer_inactive(authority)
+                    reconciled = self._reconcile_core_asset_transfer(
+                        authority,
+                        deadline=time.monotonic() + _CORE_ASSET_CLEANUP_SECONDS,
+                    )
+                    if reconciled is not None and isinstance(failure, Exception):
+                        return reconciled
+                    raise
+                self._publish_core_asset_authority(authority, staged)
                 return staged
         except CoreBootstrapAssetSnapshotError:
             _log_transport_failure(SshTransportErrorCode.INVALID_REQUEST)
@@ -839,27 +887,125 @@ class SshRemoteExecutorTransport:
             _log_transport_failure(SshTransportErrorCode.CORE_RUNTIME_UNSUPPORTED)
             raise SshTransportError(SshTransportErrorCode.CORE_RUNTIME_UNSUPPORTED)
 
+    def _remember_core_asset_transfer(
+        self,
+        authority: _CoreAssetTransferAuthority,
+        *,
+        active: bool = False,
+    ) -> None:
+        with self._core_asset_authority_lock:
+            self._core_asset_cleanup_authorities[authority.key] = authority
+            if active:
+                self._core_asset_active_transfers.add(authority.key)
+
+    def _mark_core_asset_transfer_inactive(
+        self,
+        authority: _CoreAssetTransferAuthority,
+    ) -> None:
+        with self._core_asset_authority_lock:
+            self._core_asset_active_transfers.discard(authority.key)
+
+    def _publish_core_asset_authority(
+        self,
+        authority: _CoreAssetTransferAuthority,
+        staged: StagedCoreBootstrapAssets,
+    ) -> None:
+        final_root = str(Path(staged.wheel_path).parent)
+        with self._core_asset_authority_lock:
+            self._core_asset_authorities[final_root] = staged
+            self._core_asset_cleanup_authorities.pop(authority.key, None)
+            self._core_asset_active_transfers.discard(authority.key)
+
+    def _finalize_core_asset_transfer(
+        self,
+        authority: _CoreAssetTransferAuthority,
+        *,
+        deadline: float,
+    ) -> StagedCoreBootstrapAssets:
+        finalize_payload = self._run_secret_with_remote_failure(
+            build_core_asset_finalize_command(
+                service_root=authority.service_root,
+                bundle_id=authority.bundle_id,
+                transfer_id=authority.transfer_id,
+                wheel_filename=authority.wheel_filename,
+                wheel_sha256=authority.wheel_sha256,
+                wheel_size=authority.wheel_size,
+                framework_lock_sha256=authority.framework_lock_sha256,
+                framework_lock_size=authority.framework_lock_size,
+            ),
+            timeout_seconds=_stage_remaining(deadline),
+            remote_failure_code=SshTransportErrorCode.CORE_ASSET_FAILED,
+        )
+        return parse_staged_core_assets(
+            finalize_payload,
+            service_root=authority.service_root,
+            bundle_id=authority.bundle_id,
+            wheel_filename=authority.wheel_filename,
+            wheel_sha256=authority.wheel_sha256,
+            wheel_size=authority.wheel_size,
+            framework_lock_sha256=authority.framework_lock_sha256,
+            framework_lock_size=authority.framework_lock_size,
+        )
+
+    def _reconcile_core_asset_transfer(
+        self,
+        authority: _CoreAssetTransferAuthority,
+        *,
+        deadline: float,
+    ) -> StagedCoreBootstrapAssets | None:
+        try:
+            staged = self._finalize_core_asset_transfer(authority, deadline=deadline)
+        except SshTransportError as exc:
+            if exc.code is SshTransportErrorCode.CORE_ASSET_FAILED:
+                self._discard_core_asset_transfer(authority, deadline=deadline)
+            return None
+        except BaseException as exc:
+            if not isinstance(exc, Exception):
+                raise
+            return None
+        self._publish_core_asset_authority(authority, staged)
+        return staged
+
+    def _retry_core_asset_transfer_cleanup(self, *, deadline: float) -> None:
+        with self._core_asset_authority_lock:
+            authorities = tuple(
+                authority
+                for authority in self._core_asset_cleanup_authorities.values()
+                if authority.key not in self._core_asset_active_transfers
+            )
+        for authority in authorities:
+            if time.monotonic() >= deadline:
+                return
+            if authority.finalize_started:
+                self._reconcile_core_asset_transfer(authority, deadline=deadline)
+            else:
+                self._discard_core_asset_transfer(authority, deadline=deadline)
+
     def _discard_core_asset_transfer(
         self,
+        authority: _CoreAssetTransferAuthority,
         *,
-        service_root: str,
-        bundle_id: str,
-        transfer_id: str,
         deadline: float,
-    ) -> None:
+    ) -> bool:
         try:
             timeout_seconds = _stage_remaining(deadline)
             self._run_secret_with_remote_failure(
                 build_core_asset_discard_command(
-                    service_root=service_root,
-                    bundle_id=bundle_id,
-                    transfer_id=transfer_id,
+                    service_root=authority.service_root,
+                    bundle_id=authority.bundle_id,
+                    transfer_id=authority.transfer_id,
                 ),
                 timeout_seconds=timeout_seconds,
                 remote_failure_code=SshTransportErrorCode.CORE_ASSET_FAILED,
             )
-        except Exception:
-            pass
+        except BaseException as exc:
+            if not isinstance(exc, Exception):
+                raise
+            return False
+        with self._core_asset_authority_lock:
+            self._core_asset_cleanup_authorities.pop(authority.key, None)
+            self._core_asset_active_transfers.discard(authority.key)
+        return True
 
     def _upload_core_asset_snapshot(
         self,
@@ -968,9 +1114,7 @@ class SshRemoteExecutorTransport:
     def _bind_core_asset_consumption(self, command: str) -> str:
         with self._core_asset_authority_lock:
             matches = [
-                assets
-                for root, assets in self._core_asset_authorities.items()
-                if root in command
+                assets for root, assets in self._core_asset_authorities.items() if root in command
             ]
         if not matches:
             return command
@@ -1058,13 +1202,21 @@ class SshRemoteExecutorTransport:
                 )
             except TimeoutError:
                 ready_failure = SshTransportErrorCode.TIMEOUT
-            except Exception:
+            except BaseException as exc:
+                try:
+                    tunnel.close()
+                except BaseException:
+                    tunnel._retain_orphan()
+                    _log_transport_failure(SshTransportErrorCode.CONNECTION_FAILED)
+                if not isinstance(exc, Exception):
+                    raise
                 ready_failure = SshTransportErrorCode.CONNECTION_FAILED
             if ready_failure is not None:
                 try:
                     tunnel.close()
                 except BaseException:
-                    pass
+                    tunnel._retain_orphan()
+                    _log_transport_failure(SshTransportErrorCode.CONNECTION_FAILED)
                 _log_transport_failure(ready_failure)
                 raise SshTransportError(ready_failure)
         return tunnel
@@ -1222,41 +1374,134 @@ class SshRemoteExecutorTransport:
         ]
 
 
+class _OwnedSubprocessAuthority:
+    """Retain one spawned process group until bounded cleanup confirms reaping."""
+
+    def __init__(self, process: subprocess.Popen[bytes]) -> None:
+        self.process = process
+        self.process_group_id = process.pid
+        self.exit_observer: _SubprocessExitObserver | None = None
+        self._slot_held = True
+        self._retained = False
+        self._cleanup_guard = threading.Lock()
+
+    @classmethod
+    def spawn(cls, argv: list[str]) -> _OwnedSubprocessAuthority:
+        _retry_orphaned_subprocess_cleanup()
+        if not _SUBPROCESS_OWNERSHIP_SLOTS.acquire(timeout=_SUBPROCESS_OWNERSHIP_ACQUIRE_SECONDS):
+            raise RuntimeError("subprocess ownership capacity is exhausted")
+        try:
+            process = subprocess.Popen(
+                argv,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=False,
+                start_new_session=True,
+            )
+        except BaseException:
+            _SUBPROCESS_OWNERSHIP_SLOTS.release()
+            raise
+        return cls(process)
+
+    def initialize_observer(self) -> None:
+        self.process_group_id = _owned_process_group_id(self.process)
+        self.exit_observer = _SubprocessExitObserver(self.process)
+
+    def cleanup(self) -> None:
+        with self._cleanup_guard:
+            failure: BaseException | None = None
+            try:
+                _terminate_and_reap_subprocess(
+                    self.process,
+                    process_group_id=self.process_group_id,
+                    exit_observer=self.exit_observer,
+                )
+            except BaseException as exc:
+                failure = exc
+            if self._is_reaped():
+                self.release()
+            else:
+                self.retain()
+            if failure is not None:
+                raise failure
+
+    def close_observer(self) -> None:
+        observer = self.exit_observer
+        self.exit_observer = None
+        if observer is not None:
+            observer.close()
+
+    def retain(self) -> None:
+        with _ORPHANED_SUBPROCESS_GUARD:
+            if not self._slot_held or self._retained:
+                return
+            _ORPHANED_SUBPROCESSES[id(self)] = self
+            self._retained = True
+
+    def release(self) -> None:
+        with _ORPHANED_SUBPROCESS_GUARD:
+            if not self._slot_held:
+                return
+            _ORPHANED_SUBPROCESSES.pop(id(self), None)
+            self._retained = False
+            self._slot_held = False
+        _SUBPROCESS_OWNERSHIP_SLOTS.release()
+
+    def release_if_reaped(self) -> bool:
+        if not self._is_reaped():
+            self.retain()
+            return False
+        self.release()
+        return True
+
+    def _is_reaped(self) -> bool:
+        if self.process.returncode is not None:
+            return True
+        try:
+            return self.process.poll() is not None
+        except BaseException:
+            return False
+
+
 def _run_subprocess(argv: list[str], timeout_seconds: float) -> subprocess.CompletedProcess[str]:
-    process = subprocess.Popen(
-        argv,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=False,
-        start_new_session=True,
-    )
-    process_group_id = _owned_process_group_id(process)
-    exit_observer = _SubprocessExitObserver(process)
-    assert process.stdout is not None
-    assert process.stderr is not None
+    authority = _OwnedSubprocessAuthority.spawn(argv)
+    process = authority.process
+    stdout = b""
+    stderr = b""
     try:
+        authority.initialize_observer()
+        assert process.stdout is not None
+        assert process.stderr is not None
+        assert authority.exit_observer is not None
         stdout, stderr = _capture_subprocess_output(
             process,
             argv=argv,
             timeout_seconds=timeout_seconds,
-            process_group_id=process_group_id,
-            exit_observer=exit_observer,
+            process_group_id=authority.process_group_id,
+            exit_observer=authority.exit_observer,
         )
     except BaseException:
         try:
-            _terminate_and_reap_subprocess(
-                process,
-                process_group_id=process_group_id,
-                exit_observer=exit_observer,
-            )
+            authority.cleanup()
         except BaseException:
-            pass
+            authority.retain()
+            _log_transport_failure(SshTransportErrorCode.START_FAILED)
         raise
     finally:
-        exit_observer.close()
-        process.stdout.close()
-        process.stderr.close()
+        try:
+            authority.close_observer()
+        except BaseException:
+            _log_transport_failure(SshTransportErrorCode.START_FAILED)
+        for stream in (process.stdout, process.stderr):
+            if stream is None:
+                continue
+            try:
+                stream.close()
+            except BaseException:
+                _log_transport_failure(SshTransportErrorCode.START_FAILED)
+    if not authority.release_if_reaped():
+        raise RuntimeError("subprocess exit could not be confirmed")
     encoding = locale.getpreferredencoding(False)
     return subprocess.CompletedProcess(
         argv,
@@ -1295,9 +1540,7 @@ def _capture_subprocess_output(
             now = time.monotonic()
             if not leader_exited and exit_observer.exited():
                 leader_exited = True
-                descendant_pipe_deadline = (
-                    now + _SUBPROCESS_DESCENDANT_PIPE_GRACE_SECONDS
-                )
+                descendant_pipe_deadline = now + _SUBPROCESS_DESCENDANT_PIPE_GRACE_SECONDS
             if not leader_exited and now >= deadline:
                 raise subprocess.TimeoutExpired(argv, timeout_seconds)
             if (
@@ -1382,6 +1625,7 @@ class _SubprocessExitObserver:
         if callable(self._waitid):
             return
         if hasattr(select, "kqueue"):
+            queue: select.kqueue | None = None
             try:
                 queue = select.kqueue()
                 event = select.kevent(
@@ -1391,9 +1635,11 @@ class _SubprocessExitObserver:
                     fflags=select.KQ_NOTE_EXIT,
                 )
                 queue.control([event], 0, 0)
-            except OSError:
-                if "queue" in locals():
+            except BaseException as exc:
+                if queue is not None:
                     queue.close()
+                if not isinstance(exc, OSError):
+                    raise
             else:
                 self._kqueue = queue
                 return
@@ -1443,7 +1689,7 @@ class _SubprocessExitObserver:
             self._kqueue.close()
             self._kqueue = None
         if self._waiter is not None and self._waiter_done.is_set():
-            self._waiter.join()
+            self._waiter.join(timeout=_SUBPROCESS_OBSERVER_JOIN_SECONDS)
 
     def _wait_for_exit(self) -> None:
         try:
@@ -1476,7 +1722,7 @@ def _terminate_and_reap_subprocess(
     process: subprocess.Popen[bytes],
     *,
     process_group_id: int,
-    exit_observer: _SubprocessExitObserver,
+    exit_observer: _SubprocessExitObserver | None,
 ) -> None:
     failure: BaseException | None = None
     try:
@@ -1488,9 +1734,10 @@ def _terminate_and_reap_subprocess(
     except BaseException as exc:
         failure = exc
     try:
-        exit_observer.wait_until(
-            time.monotonic() + _SUBPROCESS_TERMINATE_GRACE_SECONDS
-        )
+        if exit_observer is not None:
+            exit_observer.wait_until(time.monotonic() + _SUBPROCESS_TERMINATE_GRACE_SECONDS)
+    except subprocess.TimeoutExpired:
+        pass
     except BaseException as exc:
         if failure is None:
             failure = exc
@@ -1511,7 +1758,7 @@ def _terminate_and_reap_subprocess(
                 process.kill()
             except ProcessLookupError:
                 pass
-            process.wait()
+            process.wait(timeout=_SUBPROCESS_TERMINATE_GRACE_SECONDS)
     if failure is not None:
         raise failure
 
@@ -1636,6 +1883,7 @@ def _forget_orphaned_tunnel(tunnel: SshTunnel) -> None:
 
 
 def _retry_orphaned_tunnel_cleanup() -> None:
+    _retry_orphaned_subprocess_cleanup()
     with _ORPHANED_TUNNEL_GUARD:
         tunnels = tuple(_ORPHANED_TUNNELS.values())
         core_tunnels = tuple(_ORPHANED_CORE_TUNNELS.values())
@@ -1652,6 +1900,19 @@ def _retry_orphaned_tunnel_cleanup() -> None:
             _log_transport_failure(SshTransportErrorCode.CONNECTION_FAILED)
     for trust_lease in trust_leases:
         _release_trust_lease(trust_lease)
+
+
+def _retry_orphaned_subprocess_cleanup() -> None:
+    with _ORPHANED_SUBPROCESS_GUARD:
+        authorities = tuple(_ORPHANED_SUBPROCESSES.values())[:_MAX_SUBPROCESS_ORPHAN_RETRIES]
+    for authority in authorities:
+        try:
+            authority.cleanup()
+        except BaseException as exc:
+            authority.retain()
+            _log_transport_failure(SshTransportErrorCode.START_FAILED)
+            if not isinstance(exc, Exception):
+                raise
 
 
 def _release_trust_lease(trust_lease: AbstractContextManager[Path] | None) -> None:

@@ -592,7 +592,7 @@ def _require_bundle_id(bundle_id: str) -> None:
 
 
 _REMOTE_PREPARE_SCRIPT = r"""
-import fcntl, json, os, pwd, secrets, stat, sys
+import fcntl, json, os, pwd, secrets, stat, sys, time
 
 bundle = sys.argv[1]
 if len(bundle) != 64 or any(c not in "0123456789abcdef" for c in bundle):
@@ -610,6 +610,7 @@ flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
 file_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
 max_staging_entries = 32
 max_incoming_attempts = 16
+stale_incoming_seconds = 600
 
 def open_absolute(path):
     fd = os.open("/", flags)
@@ -696,6 +697,18 @@ def reconcile_staging(fd):
                 clear_private_attempt(fd, name)
             except FileNotFoundError:
                 pass
+    stale_before_ns = time.time_ns() - stale_incoming_seconds * 1000000000
+    names = bounded_names(fd, max_staging_entries)
+    for name in names:
+        if not closed_attempt_name(name, "incoming-"):
+            continue
+        try:
+            current = os.stat(name, dir_fd=fd, follow_symlinks=False)
+            if current.st_mtime_ns > stale_before_ns:
+                continue
+            clear_private_attempt(fd, name)
+        except FileNotFoundError:
+            pass
     remaining = bounded_names(fd, max_staging_entries)
     if any(not closed_attempt_name(name, "incoming-") for name in remaining):
         raise SystemExit(75)
