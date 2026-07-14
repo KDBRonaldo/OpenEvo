@@ -12,9 +12,14 @@ project session changes.
 The client creates its own `httpx.Client`; tests may inject only a transport.
 Environment proxy discovery and redirects are disabled. Discovery calls are
 unauthenticated, while every `/v1` request attaches the bearer only to the
-fixed origin. Mutations require their contract-declared idempotency and ETag
-precondition headers. Public list methods expose only each route's closed query
-set and runs are always filtered to the active project.
+fixed origin. The client first validates and pins one release `openevo_core`
+`/version` response whose OpenAPI digest is exactly
+`315dc90907f14347d07f7903d360009b271372302b38a1e4adca5bc14486497a`.
+Every authenticated `/v1` call fails before transport until that negotiation
+succeeds; simulator, scaffold, dry-run, development, and changed release
+identities are rejected. Mutations require their contract-declared idempotency
+and ETag precondition headers. Public list methods expose only each route's
+closed query set and runs are always filtered to the active project.
 
 Requests are exact Pydantic v1 DTOs. JSON responses and `ApiErrorV1` bodies are
 read with route-class byte limits before contract-model validation. A generic
@@ -48,25 +53,32 @@ close, including ordinary response-context exit and a response that arrives
 after sealing, is submitted outside the state lock to one process-wide bounded
 queue served by exactly four prestarted daemon workers. Creating more clients
 does not create closer or ownership threads. An uninterruptible synchronous
-close cannot exceed the caller's wait bound; accepted old resources remain on
-the bounded queue until a worker can close them. A full queue fails closed and
-the caller never executes a potentially blocking close. A closed connection
-cannot send its bearer after Desktop switches to another project session or tunnel.
+close cannot exceed the caller's wait bound. Each client transport and each
+outbound response reserves one globally bounded close-ownership slot before
+network I/O. The reservation makes the later close submission non-droppable;
+when capacity is exhausted, the next request fails before transport. Failed
+close actions permanently seal that client against new leases, and an
+unexpected failed submission remains client-owned for bounded retry. A closed
+connection cannot send its bearer after Desktop switches to another project
+session or tunnel.
 
 The close seal increments a client session generation. Each public JSON call owns
 one generation token and a copy-on-write authority/cache transaction. Network
 I/O, bounded body reads, response-model validation, nested public calls, and
 cache validation do not hold the close state lock. After all validation succeeds,
-the call crosses a dedicated delivery barrier shared with `close()`. If the seal
-starts first, the transaction rolls back and the call returns
-`core_client_closed`. After `close()` returns, no result from the sealed
-generation may be delivered.
+the generation lease exits through a dedicated delivery barrier shared with
+`close()`. Cache transaction commit and lease exit are one linearization: if the
+seal starts first, the transaction rolls back and the pending return is replaced
+with `core_client_closed`; if delivery commits first, close linearizes after it.
+`close()` need not wait for a stalled request thread, and after it returns no
+uncommitted result from the sealed generation can be delivered.
 
 SSE parsing and cache validation likewise happen outside the close state lock.
-The replay-ledger/cache transaction and frame delivery use the same delivery
-barrier and repeat the generation check immediately before `yield`. A seal that
-wins rejects the frame. `close()` returning is a hard boundary: no old frame may
-be yielded afterward.
+The stream is an explicit iterator; every `__next__` owns a generation lease and
+one replay-ledger/cache transaction whose exit uses the same delivery barrier.
+A seal that wins replaces the pending return with `core_client_closed` and rolls
+back replay authority. `close()` returning is a hard boundary: no uncommitted old
+frame may be yielded afterward.
 
 Before URL/request construction, path segments (including their decoded form),
 query values, cursors, caller-provided headers, and decoded request bodies are

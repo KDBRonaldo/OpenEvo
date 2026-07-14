@@ -57,6 +57,12 @@ Release builds reject providers that report `contract_simulator`, `scaffold`,
 connection outside the active project tunnel. Such providers may be used only
 by explicit development and test builds.
 
+The Desktop release Core client accepts only `provider_kind=openevo_core`,
+`build_channel=release`, and the frozen Core Control API v1 OpenAPI digest
+`315dc90907f14347d07f7903d360009b271372302b38a1e4adca5bc14486497a`.
+It pins the complete first accepted version response. Every bearer-authenticated
+`/v1` request requires that pin and fails before transport without it.
+
 ## Common Protocol
 
 Every JSON model is closed: unknown fields are errors. IDs are opaque UTF-8
@@ -253,22 +259,23 @@ passes; one bad late item leaves the prior cache unchanged.
 
 Client shutdown seals request admission under its state lock, but no response
 or transport `close()` runs under that lock or on a request/context-exit thread.
-Normal response completion, normal SSE context exit, active responses, and
-responses arriving after the seal all submit close ownership to a fixed-worker,
-fixed-capacity daemon closer owned by that client. `close()` waits only to its
-hard deadline; accepted late close work remains owned by that bounded closer
-and cannot consume a replacement session's workers. Queue admission and idle
-worker retirement are serialized; an idle worker rechecks the queue before it
-decrements the live-worker count. A failed first `Thread.start()` rejects that
-submission, records a typed close failure, and leaves later submissions able to
-retry worker creation. It is never reported as accepted work without a worker.
+One process-wide fixed-worker, fixed-capacity daemon closer owns all clients.
+Each client transport and each request reserve a global close slot before the
+resource can exist. The reservation follows a response through normal exit,
+late arrival, or shutdown, so queue saturation cannot discard ownership; lack
+of capacity rejects the request before transport. An unexpected failed
+submission remains bounded client-owned retry work. A close action failure
+permanently rejects new leases for that client. `close()` waits only to its hard
+deadline, and accepted old resources cannot create replacement-session threads.
 
-Sealing also advances a per-client session generation. JSON response handling
-rechecks that generation after response registration and body reads and before
-return. SSE handling rechecks it around parsing, authority/replay-ledger
-application, and yield; application and the close linearization point share the
-state lock. A body or frame released after sealing cannot be returned, applied,
-or recorded as replay authority for the retired session.
+Sealing also advances a per-client session generation. A JSON call's
+copy-on-write authority/cache transaction surrounds its generation lease. The
+lease exits through the same delivery barrier used by `close()`; a winning seal
+overrides the pending return with `core_client_closed` and rolls back the
+transaction. Core SSE is an explicit iterator whose every `__next__` uses the
+same transaction and lease-exit commit. A body or frame rejected by the seal
+cannot be returned, applied, or recorded as replay authority for the retired
+session, and `close()` need not wait for a stalled application thread.
 
 Local SSE carries Desktop state changes and resource invalidations. Every
 resource invalidation includes the authoritative ETag or content digest and

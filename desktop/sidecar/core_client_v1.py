@@ -6,7 +6,7 @@ import base64
 import binascii
 from collections.abc import Callable, Iterator, Mapping
 from concurrent.futures import Future, TimeoutError as FutureTimeoutError
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
@@ -20,6 +20,7 @@ import threading
 import time
 from typing import Any, Literal, NoReturn, ParamSpec, TypeVar
 from urllib.parse import quote, unquote, urlsplit
+import weakref
 
 import httpx
 from pydantic import BaseModel, ConfigDict, TypeAdapter, ValidationError
@@ -44,6 +45,7 @@ MAX_CORE_CLOSE_QUEUE_SIZE = 256
 CORE_CLOSE_WORKER_COUNT = 4
 CORE_BLOCKING_IO_WORKER_COUNT = 8
 MAX_CORE_REQUEST_DEADLINE_SECONDS = 300.0
+CORE_OPENAPI_SHA256 = "315dc90907f14347d07f7903d360009b271372302b38a1e4adca5bc14486497a"
 
 _BEARER = re.compile(r"[A-Za-z0-9._~+/\-]{43,510}={0,2}\Z", re.ASCII)
 _ETAG = re.compile(r'"[0-9a-f]{64}"\Z', re.ASCII)
@@ -172,7 +174,7 @@ class CoreTunnelConnectionV1:
         object.__setattr__(self, "origin", origin)
 
 
-class CoreSseStreamV1:
+class CoreSseStreamV1(Iterator[v1.SseFrameV1]):
     """Single-pass, bounded SSE adapter yielding validated contract envelopes."""
 
     def __init__(
@@ -184,6 +186,7 @@ class CoreSseStreamV1:
         declared_length: int | None,
         close_started: Callable[[], bool],
         session_guard: Callable[[], None],
+        delivery_lease: Callable[[], AbstractContextManager[None]],
         deadline: float,
     ) -> None:
         self._chunks = chunks
@@ -192,22 +195,24 @@ class CoreSseStreamV1:
         self._declared_length = declared_length
         self._close_started = close_started
         self._session_guard = session_guard
+        self._delivery_lease = delivery_lease
         self._deadline = deadline
-        self._started = False
+        self._frames = _iter_sse_frames(
+            self._chunks,
+            declared_length=self._declared_length,
+            deadline=self._deadline,
+        )
 
-    def __iter__(self) -> Iterator[v1.SseFrameV1]:
-        if self._started:
-            _raise_local(CoreClientLocalErrorCodeV1.SSE_PROTOCOL_ERROR, 502)
-        self._started = True
+    def __iter__(self) -> CoreSseStreamV1:
+        return self
+
+    def __next__(self) -> v1.SseFrameV1:
         boundary_error = False
         try:
             _check_deadline(self._deadline)
             self._session_guard()
-            for frame in _iter_sse_frames(
-                self._chunks,
-                declared_length=self._declared_length,
-                deadline=self._deadline,
-            ):
+            frame = next(self._frames)
+            with self._delivery_lease():
                 _check_deadline(self._deadline)
                 self._session_guard()
                 validated_frame = _validate_sse_frame(frame, self._private_values)
@@ -215,12 +220,20 @@ class CoreSseStreamV1:
                 self._linearize_frame_delivery(validated_frame)
                 _check_deadline(self._deadline)
                 self._session_guard()
-                yield validated_frame
-                _check_deadline(self._deadline)
-                self._session_guard()
+                return validated_frame
+        except StopIteration:
+            raise
         except CoreClientErrorV1:
             raise
-        except (httpx.HTTPError, OSError, UnicodeError, RuntimeError, ValueError, ValidationError):
+        except (
+            httpx.HTTPError,
+            OSError,
+            TypeError,
+            UnicodeError,
+            RuntimeError,
+            ValueError,
+            ValidationError,
+        ):
             boundary_error = True
         if boundary_error:
             closed = self._close_started()
@@ -265,8 +278,8 @@ def _generation_bound(method: Callable[MethodP, ResponseT]) -> Callable[MethodP,
         client = args[0]
         if not isinstance(client, CoreControlClientV1):
             raise TypeError("generation-bound method requires CoreControlClientV1")
-        with client._generation_lease() as token:
-            with client._registration_batch():
+        with client._registration_batch():
+            with client._generation_lease() as token:
                 result = method(*args, **kwargs)
                 client._linearize_generation_result(token.generation, token.deadline)
                 return result
@@ -274,30 +287,93 @@ def _generation_bound(method: Callable[MethodP, ResponseT]) -> Callable[MethodP,
     return wrapped
 
 
+class _CloseReservation:
+    """One globally bounded ownership slot for exactly one close action."""
+
+    def __init__(self, closer: _BoundedResourceCloser) -> None:
+        self._closer = closer
+        self._lock = threading.Lock()
+        self._consumed = False
+
+    def submit(self, action: Callable[[], None]) -> bool:
+        with self._lock:
+            if self._consumed:
+                return False
+            if not self._closer._submit_reserved(action):
+                return False
+            self._consumed = True
+            return True
+
+    def release(self) -> bool:
+        with self._lock:
+            if self._consumed:
+                return False
+            self._consumed = True
+        self._closer._release_reserved()
+        return True
+
+
 class _BoundedResourceCloser:
     """Process-shared fixed-size executor for close calls that may block indefinitely."""
 
-    def __init__(self) -> None:
-        self._queue: queue.Queue[Callable[[], None]] = queue.Queue(
-            maxsize=MAX_CORE_CLOSE_QUEUE_SIZE
-        )
+    def __init__(
+        self,
+        *,
+        worker_count: int = CORE_CLOSE_WORKER_COUNT,
+        capacity: int = MAX_CORE_CLOSE_QUEUE_SIZE,
+    ) -> None:
+        if worker_count <= 0 or capacity <= 0:
+            raise ValueError("closer worker count and capacity must be positive")
+        self._queue: queue.Queue[Callable[[], None]] = queue.Queue(maxsize=capacity)
+        self._capacity = capacity
+        self._lock = threading.Lock()
+        self._owned = 0
         self._workers = tuple(
             threading.Thread(
                 target=self._worker,
                 name=f"openevo-core-resource-closer-{index + 1}",
                 daemon=True,
             )
-            for index in range(CORE_CLOSE_WORKER_COUNT)
+            for index in range(worker_count)
         )
         for worker in self._workers:
             worker.start()
 
+    @property
+    def owned_count(self) -> int:
+        with self._lock:
+            return self._owned
+
+    def reserve(self) -> _CloseReservation | None:
+        with self._lock:
+            if self._owned >= self._capacity:
+                return None
+            self._owned += 1
+        return _CloseReservation(self)
+
     def submit(self, action: Callable[[], None]) -> bool:
-        try:
-            self._queue.put_nowait(action)
-        except queue.Full:
-            return False
+        reservation = self.reserve()
+        return reservation is not None and reservation.submit(action)
+
+    def _submit_reserved(self, action: Callable[[], None]) -> bool:
+        def owned_action() -> None:
+            try:
+                action()
+            finally:
+                self._release_reserved()
+
+        with self._lock:
+            try:
+                self._queue.put_nowait(owned_action)
+            except queue.Full:
+                return False
         return True
+
+    def _release_reserved(self) -> None:
+        with self._lock:
+            if self._owned <= 0:
+                raise RuntimeError("closer reservation accounting underflow")
+            self._owned -= 1
 
     def _worker(self) -> None:
         while True:
@@ -311,6 +387,14 @@ class _BoundedResourceCloser:
 
 
 _PROCESS_RESOURCE_CLOSER = _BoundedResourceCloser()
+
+
+def _finalize_reserved_close(
+    close_action: Callable[[], None],
+    reservation: _CloseReservation,
+) -> None:
+    if not reservation.submit(close_action):
+        reservation.release()
 
 
 class _BoundedBlockingIoExecutor:
@@ -378,9 +462,12 @@ class CoreControlClientV1:
         self._generation_local = threading.local()
         self._close_tasks_pending = 0
         self._close_failed = False
+        self._retained_close_actions: list[
+            tuple[Callable[[], None], _CloseReservation]
+        ] = []
         self._leases = 0
         self._lease_owners: dict[int, int] = {}
-        self._active_responses: set[httpx.Response] = set()
+        self._active_responses: dict[httpx.Response, _CloseReservation] = {}
         self._members: dict[tuple[v1.ResourceChangeType, str], _ResourceBinding] = {}
         self._log_refs: dict[str, _LogRefBinding] = {}
         self._workspace_uploads: dict[str, v1.WorkspaceUploadSessionV1] = {}
@@ -394,14 +481,32 @@ class CoreControlClientV1:
         self._diagnostics: dict[str, v1.DiagnosticV1] = {}
         self._sse_event_digests: dict[str, str] = {}
         self._capability_authority: _CapabilityAuthority | None = None
+        self._version_authority: v1.VersionResponseV1 | None = None
         self._request_deadline_seconds = request_deadline_seconds
-        self._http = httpx.Client(
-            base_url=f"{connection.origin}/",
-            transport=transport,
-            timeout=timeout,
-            trust_env=False,
-            follow_redirects=False,
-            headers={"Accept-Encoding": "identity", "User-Agent": "OpenEvo-Desktop-CoreClient/1"},
+        transport_close_reservation = _PROCESS_RESOURCE_CLOSER.reserve()
+        if transport_close_reservation is None:
+            _raise_local(CoreClientLocalErrorCodeV1.CONNECTION_FAILED, 503)
+        try:
+            self._http = httpx.Client(
+                base_url=f"{connection.origin}/",
+                transport=transport,
+                timeout=timeout,
+                trust_env=False,
+                follow_redirects=False,
+                headers={
+                    "Accept-Encoding": "identity",
+                    "User-Agent": "OpenEvo-Desktop-CoreClient/1",
+                },
+            )
+        except BaseException:
+            transport_close_reservation.release()
+            raise
+        self._transport_close_reservation = transport_close_reservation
+        self._transport_finalizer = weakref.finalize(
+            self,
+            _finalize_reserved_close,
+            self._http.close,
+            transport_close_reservation,
         )
         self._bind_resource(v1.ResourceChangeType.PROJECT, connection.project_id)
 
@@ -414,11 +519,17 @@ class CoreControlClientV1:
 
     def close(self) -> None:
         """Idempotently stop admission, cancel transports, and boundedly drain leases."""
+        self._retry_retained_closes()
         deadline = time.monotonic() + MAX_CORE_CLOSE_WAIT_SECONDS
-        close_actions: tuple[Callable[[], None], ...] = ()
+        close_actions: tuple[tuple[Callable[[], None], _CloseReservation], ...] = ()
         with self._delivery_lock:
             with self._state:
                 if self._closed:
+                    close_failed = self._close_failed
+                    if close_failed:
+                        raise _local_exception(
+                            CoreClientLocalErrorCodeV1.CLIENT_CLOSED, 503
+                        ) from None
                     return
                 if self._closing:
                     while not self._closed:
@@ -426,20 +537,27 @@ class CoreControlClientV1:
                         if remaining <= 0:
                             return
                         self._state.wait(remaining)
+                    if self._close_failed:
+                        raise _local_exception(
+                            CoreClientLocalErrorCodeV1.CLIENT_CLOSED, 503
+                        ) from None
                     return
                 self._closing = True
                 self._session_generation += 1
-                close_actions = tuple(response.close for response in self._active_responses) + (
-                    self._http.close,
+                self._transport_finalizer.detach()
+                close_actions = tuple(
+                    (response.close, reservation)
+                    for response, reservation in self._active_responses.items()
+                ) + (
+                    (self._http.close, self._transport_close_reservation),
                 )
                 self._active_responses.clear()
 
-        for close_action in close_actions:
-            self._schedule_close(close_action)
+        for close_action, reservation in close_actions:
+            self._schedule_close(close_action, reservation)
 
         with self._state:
-            caller_leases = self._lease_owners.get(threading.get_ident(), 0)
-            while self._leases > caller_leases or self._close_tasks_pending:
+            while self._close_tasks_pending:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     break
@@ -451,7 +569,18 @@ class CoreControlClientV1:
         if close_failed:
             raise _local_exception(CoreClientLocalErrorCodeV1.CLIENT_CLOSED, 503) from None
 
-    def _schedule_close(self, close_action: Callable[[], None]) -> bool:
+    def _retry_retained_closes(self) -> None:
+        with self._state:
+            retained = tuple(self._retained_close_actions)
+            self._retained_close_actions.clear()
+        for close_action, reservation in retained:
+            self._schedule_close(close_action, reservation)
+
+    def _schedule_close(
+        self,
+        close_action: Callable[[], None],
+        reservation: _CloseReservation,
+    ) -> bool:
         with self._state:
             self._close_tasks_pending += 1
 
@@ -468,17 +597,31 @@ class CoreControlClientV1:
                     self._close_tasks_pending -= 1
                     self._state.notify_all()
 
-        if not _PROCESS_RESOURCE_CLOSER.submit(tracked_close):
+        if not reservation.submit(tracked_close):
             with self._state:
                 self._close_failed = True
                 self._close_tasks_pending -= 1
+                self._retained_close_actions.append((close_action, reservation))
                 self._state.notify_all()
             return False
         return True
 
     @_generation_bound
     def version(self) -> v1.VersionResponseV1:
-        return self._json("GET", "/version", v1.VersionResponseV1, authenticated=False)
+        result = self._json("GET", "/version", v1.VersionResponseV1, authenticated=False)
+        if (
+            result.openapi_sha256 != CORE_OPENAPI_SHA256
+            or result.provider_kind is not v1.ProviderKind.OPENEVO_CORE
+            or result.build_channel is not v1.BuildChannel.RELEASE
+            or result.preferred_major != 1
+            or 1 not in result.supported_majors
+        ):
+            _raise_local(CoreClientLocalErrorCodeV1.INVALID_RESPONSE, 502)
+        with self._membership_lock:
+            if self._version_authority is not None and self._version_authority != result:
+                _raise_local(CoreClientLocalErrorCodeV1.INVALID_RESPONSE, 502)
+            self._version_authority = result
+        return result
 
     @_generation_bound
     def health(self) -> v1.HealthResponseV1:
@@ -1422,6 +1565,7 @@ class CoreControlClientV1:
     @contextmanager
     def events(self, *, last_event_id: str | None = None) -> Iterator[CoreSseStreamV1]:
         """Open the authenticated event stream; closing the context closes the response."""
+        self._require_version_authority()
         headers = self._headers(authenticated=True, accept="text/event-stream")
         if last_event_id is not None:
             cursor = _visible_ascii_header(_cursor(last_event_id))
@@ -1441,14 +1585,22 @@ class CoreControlClientV1:
             try:
                 _check_deadline(deadline)
                 request = self._http.build_request("GET", "/v1/events", headers=headers)
-                response = _call_before_deadline(
+                response_reservation = _PROCESS_RESOURCE_CLOSER.reserve()
+                if response_reservation is None:
+                    _raise_local(CoreClientLocalErrorCodeV1.CONNECTION_FAILED, 503)
+                response = _send_before_deadline(
                     lambda: self._http.send(request, stream=True, follow_redirects=False),
                     deadline,
-                    late_dispose=lambda late_response: self._schedule_close(late_response.close),
+                    response_reservation,
+                    late_dispose=lambda late_response, late_reservation: self._schedule_close(
+                        late_response.close, late_reservation
+                    ),
                 )
-                _check_deadline(deadline)
-                self._register_response(response, session_generation)
+                self._register_response(
+                    response, session_generation, response_reservation
+                )
                 registered = True
+                _check_deadline(deadline)
                 self._ensure_session_generation(session_generation)
                 self._ensure_response_origin(response)
                 if 300 <= response.status_code < 400:
@@ -1478,7 +1630,11 @@ class CoreControlClientV1:
                 )
                 self._ensure_session_generation(session_generation)
                 yield CoreSseStreamV1(
-                    _iter_response_bytes(response, deadline),
+                    _iter_response_bytes(
+                        response,
+                        deadline,
+                        invalid_code=CoreClientLocalErrorCodeV1.SSE_PROTOCOL_ERROR,
+                    ),
                     linearize_frame_delivery=lambda frame: self._linearize_sse_frame_delivery(
                         frame, session_generation
                     ),
@@ -1488,11 +1644,21 @@ class CoreControlClientV1:
                     session_guard=lambda: self._linearize_generation_result(
                         session_generation, deadline
                     ),
+                    delivery_lease=lambda: self._sse_delivery_lease(
+                        session_generation, deadline
+                    ),
                     deadline=deadline,
                 )
             except CoreClientErrorV1:
                 raise
-            except (httpx.HTTPError, OSError, UnicodeError, RuntimeError, ValueError):
+            except (
+                httpx.HTTPError,
+                OSError,
+                TypeError,
+                UnicodeError,
+                RuntimeError,
+                ValueError,
+            ):
                 transport_error = True
             finally:
                 if registered and response is not None:
@@ -1565,6 +1731,8 @@ class CoreControlClientV1:
         expected_status: int = 200,
         max_response_bytes: int = MAX_CORE_JSON_RESPONSE_BYTES,
     ) -> Any:
+        if authenticated:
+            self._require_version_authority()
         private_values = self._private_values()
         _scan_private_strings(
             (unquote(path), params or {}, headers or {}),
@@ -1597,14 +1765,22 @@ class CoreControlClientV1:
                     content=content,
                     headers=request_headers,
                 )
-                response = _call_before_deadline(
+                response_reservation = _PROCESS_RESOURCE_CLOSER.reserve()
+                if response_reservation is None:
+                    _raise_local(CoreClientLocalErrorCodeV1.CONNECTION_FAILED, 503)
+                response = _send_before_deadline(
                     lambda: self._http.send(request, stream=True, follow_redirects=False),
                     deadline,
-                    late_dispose=lambda late_response: self._schedule_close(late_response.close),
+                    response_reservation,
+                    late_dispose=lambda late_response, late_reservation: self._schedule_close(
+                        late_response.close, late_reservation
+                    ),
                 )
-                _check_deadline(deadline)
-                self._register_response(response, session_generation)
+                self._register_response(
+                    response, session_generation, response_reservation
+                )
                 registered = True
+                _check_deadline(deadline)
                 self._ensure_session_generation(session_generation)
                 self._ensure_response_origin(response)
                 if 300 <= response.status_code < 400:
@@ -1620,7 +1796,14 @@ class CoreControlClientV1:
                 content_type = response.headers.get("content-type")
             except CoreClientErrorV1:
                 raise
-            except (httpx.HTTPError, OSError, UnicodeError, RuntimeError, ValueError):
+            except (
+                httpx.HTTPError,
+                OSError,
+                TypeError,
+                UnicodeError,
+                RuntimeError,
+                ValueError,
+            ):
                 transport_error = True
             finally:
                 if registered and response is not None:
@@ -1715,31 +1898,55 @@ class CoreControlClientV1:
         return headers
 
     @contextmanager
-    def _lease(self) -> Iterator[int]:
+    def _lease(
+        self,
+        *,
+        expected_generation: int | None = None,
+        delivery: bool = False,
+    ) -> Iterator[int]:
         owner = threading.get_ident()
         with self._state:
-            if self._closing or self._closed:
+            if self._closing or self._closed or self._close_failed:
+                _raise_local(CoreClientLocalErrorCodeV1.CLIENT_CLOSED, 503)
+            if (
+                expected_generation is not None
+                and expected_generation != self._session_generation
+            ):
                 _raise_local(CoreClientLocalErrorCodeV1.CLIENT_CLOSED, 503)
             if self._close_tasks_pending + self._leases >= MAX_CORE_CLOSE_QUEUE_SIZE - 1:
                 _raise_local(CoreClientLocalErrorCodeV1.CONNECTION_FAILED, 503)
             self._leases += 1
             self._lease_owners[owner] = self._lease_owners.get(owner, 0) + 1
             session_generation = self._session_generation
+        succeeded = False
         try:
             yield session_generation
+            succeeded = True
         finally:
-            with self._state:
-                self._leases -= 1
-                remaining = self._lease_owners[owner] - 1
-                if remaining:
-                    self._lease_owners[owner] = remaining
-                else:
-                    del self._lease_owners[owner]
-                self._state.notify_all()
+            delivery_rejected = False
+            lock = self._delivery_lock if delivery and succeeded else self._state
+            with lock:
+                with self._state:
+                    if delivery and succeeded:
+                        delivery_rejected = (
+                            self._closing
+                            or self._closed
+                            or self._close_failed
+                            or session_generation != self._session_generation
+                        )
+                    self._leases -= 1
+                    remaining = self._lease_owners[owner] - 1
+                    if remaining:
+                        self._lease_owners[owner] = remaining
+                    else:
+                        del self._lease_owners[owner]
+                    self._state.notify_all()
+            if delivery_rejected:
+                _raise_local(CoreClientLocalErrorCodeV1.CLIENT_CLOSED, 503)
 
     @contextmanager
     def _generation_lease(self) -> Iterator[_GenerationLeaseToken]:
-        with self._lease() as session_generation:
+        with self._lease(delivery=True) as session_generation:
             stack = getattr(self._generation_local, "stack", None)
             if stack is None:
                 stack = []
@@ -1755,6 +1962,17 @@ class CoreControlClientV1:
                 popped = stack.pop()
                 if popped is not token:
                     raise RuntimeError("generation lease stack corrupted")
+
+    @contextmanager
+    def _sse_delivery_lease(
+        self,
+        session_generation: int,
+        deadline: float,
+    ) -> Iterator[None]:
+        _check_deadline(deadline)
+        with self._registration_batch():
+            with self._lease(expected_generation=session_generation, delivery=True):
+                yield
 
     @contextmanager
     def _json_generation_lease(self) -> Iterator[tuple[int, float]]:
@@ -1781,38 +1999,52 @@ class CoreControlClientV1:
                 if (
                     self._closing
                     or self._closed
+                    or self._close_failed
                     or session_generation != self._session_generation
                 ):
                     _raise_local(CoreClientLocalErrorCodeV1.CLIENT_CLOSED, 503)
 
-    def _register_response(self, response: httpx.Response, session_generation: int) -> None:
+    def _register_response(
+        self,
+        response: httpx.Response,
+        session_generation: int,
+        reservation: _CloseReservation,
+    ) -> None:
         close_late_response = False
         with self._state:
-            if self._closing or self._closed or session_generation != self._session_generation:
+            if (
+                self._closing
+                or self._closed
+                or self._close_failed
+                or session_generation != self._session_generation
+            ):
                 close_late_response = True
             else:
-                self._active_responses.add(response)
+                self._active_responses[response] = reservation
         if close_late_response:
-            self._schedule_close(response.close)
+            self._schedule_close(response.close, reservation)
             _raise_local(CoreClientLocalErrorCodeV1.CLIENT_CLOSED, 503)
 
     def _release_response(self, response: httpx.Response) -> bool:
-        owns_close = False
+        reservation: _CloseReservation | None = None
         with self._state:
-            if response in self._active_responses:
-                self._active_responses.remove(response)
-                owns_close = True
-        if owns_close:
-            return self._schedule_close(response.close)
+            reservation = self._active_responses.pop(response, None)
+        if reservation is not None:
+            return self._schedule_close(response.close, reservation)
         return True
 
     def _close_started(self) -> bool:
         with self._state:
-            return self._closing or self._closed
+            return self._closing or self._closed or self._close_failed
 
     def _ensure_session_generation(self, session_generation: int) -> None:
         with self._state:
-            if self._closing or self._closed or session_generation != self._session_generation:
+            if (
+                self._closing
+                or self._closed
+                or self._close_failed
+                or session_generation != self._session_generation
+            ):
                 _raise_local(CoreClientLocalErrorCodeV1.CLIENT_CLOSED, 503)
 
     def _raise_transport_error(self) -> None:
@@ -1845,6 +2077,7 @@ class CoreControlClientV1:
                 self._diagnostics,
                 self._sse_event_digests,
                 self._capability_authority,
+                self._version_authority,
             )
             self._members = self._members.copy()
             self._log_refs = self._log_refs.copy()
@@ -1874,6 +2107,7 @@ class CoreControlClientV1:
                     self._diagnostics,
                     self._sse_event_digests,
                     self._capability_authority,
+                    self._version_authority,
                 ) = original
                 raise
 
@@ -2317,6 +2551,13 @@ class CoreControlClientV1:
             _raise_local(code, 400 if request_error else 502)
         return authority
 
+    def _require_version_authority(self) -> v1.VersionResponseV1:
+        with self._membership_lock:
+            authority = self._version_authority
+        if authority is None:
+            _raise_local(CoreClientLocalErrorCodeV1.INVALID_CONNECTION, 503)
+        return authority
+
     def _ensure_active_project(self, project_id: str) -> None:
         invalid = False
         try:
@@ -2331,7 +2572,7 @@ class CoreControlClientV1:
 
     def _ensure_open(self) -> None:
         with self._state:
-            if self._closing or self._closed:
+            if self._closing or self._closed or self._close_failed:
                 _raise_local(CoreClientLocalErrorCodeV1.CLIENT_CLOSED, 503)
 
     def _ensure_response_origin(self, response: httpx.Response) -> None:
@@ -2839,17 +3080,58 @@ def _call_before_deadline(
         _raise_local(CoreClientLocalErrorCodeV1.CONNECTION_FAILED, 503)
 
 
+def _send_before_deadline(
+    action: Callable[[], ResponseT],
+    deadline: float,
+    reservation: _CloseReservation,
+    *,
+    late_dispose: Callable[[ResponseT, _CloseReservation], object],
+) -> ResponseT:
+    _check_deadline(deadline)
+    future = _PROCESS_BLOCKING_IO.submit(action)
+    if future is None:
+        reservation.release()
+        _raise_local(CoreClientLocalErrorCodeV1.CONNECTION_FAILED, 503)
+    try:
+        return future.result(timeout=max(0.0, deadline - time.monotonic()))
+    except FutureTimeoutError:
+        if future.cancel():
+            reservation.release()
+        else:
+            def dispose_completed(completed: Future[ResponseT]) -> None:
+                try:
+                    value = completed.result()
+                except BaseException:
+                    reservation.release()
+                    return
+                try:
+                    late_dispose(value, reservation)
+                except BaseException:
+                    reservation.release()
+
+            future.add_done_callback(dispose_completed)
+        _raise_local(CoreClientLocalErrorCodeV1.CONNECTION_FAILED, 503)
+    except BaseException:
+        reservation.release()
+        raise
+
+
 _END_OF_RESPONSE = object()
 
 
-def _iter_response_bytes(response: httpx.Response, deadline: float) -> Iterator[bytes]:
+def _iter_response_bytes(
+    response: httpx.Response,
+    deadline: float,
+    *,
+    invalid_code: CoreClientLocalErrorCodeV1 = CoreClientLocalErrorCodeV1.INVALID_RESPONSE,
+) -> Iterator[bytes]:
     chunks = response.iter_bytes()
     while True:
         chunk = _call_before_deadline(lambda: next(chunks, _END_OF_RESPONSE), deadline)
         if chunk is _END_OF_RESPONSE:
             return
         if not isinstance(chunk, bytes):
-            raise TypeError("response iterator returned a non-bytes chunk")
+            _raise_local(invalid_code, 502)
         yield chunk
 
 
@@ -2956,6 +3238,7 @@ def _raise_local(code: CoreClientLocalErrorCodeV1, status_code: int) -> NoReturn
 
 
 __all__ = [
+    "CORE_OPENAPI_SHA256",
     "CoreClientErrorV1",
     "CoreClientLocalErrorCodeV1",
     "CoreClientLocalErrorV1",

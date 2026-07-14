@@ -202,7 +202,7 @@
     "contract": {
       "compatible": true,
       "core_openapi_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-      "desktop_openapi_sha256": "c9f2fa2cdcc2ff5cde40b9bbd007430ac0ccfdf6452844315d8e29d913f0b7a0",
+      "desktop_openapi_sha256": "3a86582d04dcd233096337c737ba91d75854746848aedc319025d86213a03d36",
       "selected_major": 1
     },
     "core": {

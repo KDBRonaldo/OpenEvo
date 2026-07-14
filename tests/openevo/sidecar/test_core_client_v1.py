@@ -11,6 +11,7 @@ import httpx
 import pytest
 
 from desktop.sidecar.core_client_v1 import (
+    CORE_OPENAPI_SHA256,
     CoreClientErrorV1,
     CoreClientLocalErrorCodeV1,
     CoreClientLocalErrorV1,
@@ -55,11 +56,41 @@ def _client(
     handler,
     *,
     connection: CoreTunnelConnectionV1 | None = None,
+    negotiate: bool = True,
+    timeout: float | httpx.Timeout = 30.0,
 ) -> CoreControlClientV1:
-    return CoreControlClientV1(
+    def versioned_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/version":
+            return httpx.Response(200, json=_version_payload())
+        return handler(request)
+
+    client = CoreControlClientV1(
         connection or _connection(),
-        transport=httpx.MockTransport(handler),
+        transport=httpx.MockTransport(versioned_handler),
+        timeout=timeout,
     )
+    if negotiate:
+        assert client.version().openapi_sha256 == CORE_OPENAPI_SHA256
+    return client
+
+
+def _version_payload(
+    *,
+    digest: str = CORE_OPENAPI_SHA256,
+    provider_kind: str = "openevo_core",
+    build_channel: str = "release",
+) -> dict[str, object]:
+    return {
+        "schema_version": "1",
+        "preferred_major": 1,
+        "supported_majors": [1],
+        "openapi_sha256": digest,
+        "build_version": "0.1.0",
+        "source_commit": "60a06597",
+        "build_channel": build_channel,
+        "provider_kind": provider_kind,
+        "features": [],
+    }
 
 
 def _health_payload() -> dict[str, object]:
@@ -615,6 +646,86 @@ def test_client_disables_environment_transport_and_redirects() -> None:
         client.close()
 
 
+def test_authenticated_calls_require_successful_frozen_version_negotiation() -> None:
+    called = False
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal called
+        called = True
+        return httpx.Response(200, json={})
+
+    client = _client(handler, negotiate=False)
+    try:
+        with pytest.raises(CoreClientErrorV1) as exc_info:
+            client.status()
+    finally:
+        client.close()
+
+    assert called is False
+    assert exc_info.value.error.code is CoreClientLocalErrorCodeV1.INVALID_CONNECTION
+
+
+@pytest.mark.parametrize(
+    ("digest", "provider_kind", "build_channel"),
+    [
+        ("f" * 64, "openevo_core", "release"),
+        (CORE_OPENAPI_SHA256, "contract_simulator", "release"),
+        (CORE_OPENAPI_SHA256, "scaffold", "release"),
+        (CORE_OPENAPI_SHA256, "dry_run", "release"),
+        (CORE_OPENAPI_SHA256, "future_provider", "release"),
+        (CORE_OPENAPI_SHA256, "openevo_core", "development"),
+    ],
+)
+def test_version_rejects_non_release_or_non_frozen_core_provider(
+    digest: str,
+    provider_kind: str,
+    build_channel: str,
+) -> None:
+    client = CoreControlClientV1(
+        _connection(),
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(
+                200,
+                json=_version_payload(
+                    digest=digest,
+                    provider_kind=provider_kind,
+                    build_channel=build_channel,
+                ),
+            )
+        ),
+    )
+    try:
+        with pytest.raises(CoreClientErrorV1) as exc_info:
+            client.version()
+    finally:
+        client.close()
+
+    assert exc_info.value.error.code is CoreClientLocalErrorCodeV1.INVALID_RESPONSE
+
+
+def test_version_pin_rejects_a_changed_release_identity() -> None:
+    responses = iter(
+        [
+            _version_payload(),
+            {**_version_payload(), "source_commit": "abcdef01"},
+        ]
+    )
+    client = CoreControlClientV1(
+        _connection(),
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(200, json=next(responses))
+        ),
+    )
+    try:
+        assert client.version().openapi_sha256 == CORE_OPENAPI_SHA256
+        with pytest.raises(CoreClientErrorV1) as exc_info:
+            client.version()
+    finally:
+        client.close()
+
+    assert exc_info.value.error.code is CoreClientLocalErrorCodeV1.INVALID_RESPONSE
+
+
 @pytest.mark.parametrize(
     "timeout",
     [None, float("inf"), 0.0, 301.0, httpx.Timeout(None), httpx.Timeout(5.0, read=None)],
@@ -676,9 +787,7 @@ def test_total_deadline_stops_trickle_body_without_replaying_mutation() -> None:
             stream=TrickleStream(),
         )
 
-    client = CoreControlClientV1(
-        _connection(), transport=httpx.MockTransport(handler), timeout=0.06
-    )
+    client = _client(handler, timeout=0.06)
     request = v1.EnvironmentDoctorRequestV1(
         execution_mode=v1.ExecutionMode.SELF_DEPLOYED,
         checks=[v1.EnvironmentCheckKind.PYTHON],
@@ -706,15 +815,13 @@ def test_redirect_is_rejected_without_reading_a_trickle_body() -> None:
             yield b"redirect"
 
     body = UnreadRedirectBody()
-    client = CoreControlClientV1(
-        _connection(),
-        transport=httpx.MockTransport(
-            lambda _request: httpx.Response(
-                307,
-                headers={"Location": "http://127.0.0.1:48765/other"},
-                stream=body,
-            )
+    client = _client(
+        lambda _request: httpx.Response(
+            307,
+            headers={"Location": "http://127.0.0.1:48765/other"},
+            stream=body,
         ),
+        connection=_connection(),
         timeout=0.05,
     )
     started_at = time.monotonic()
@@ -831,6 +938,115 @@ def test_success_requires_exact_strict_response_dto(content: bytes) -> None:
     decoded = content.decode(errors="ignore")
     if decoded:
         assert decoded not in str(exc_info.value)
+
+
+def test_non_bytes_json_chunk_is_normalized_to_typed_response_error() -> None:
+    class NonBytesStream(httpx.SyncByteStream):
+        def __iter__(self):
+            yield "private malformed chunk"
+
+    client = _client(
+        lambda _request: httpx.Response(
+            200,
+            headers={"Content-Type": "application/json"},
+            stream=NonBytesStream(),
+        )
+    )
+    try:
+        with pytest.raises(CoreClientErrorV1) as exc_info:
+            client.health()
+    finally:
+        client.close()
+
+    assert exc_info.value.error.code is CoreClientLocalErrorCodeV1.INVALID_RESPONSE
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
+
+
+def test_non_bytes_sse_chunk_is_normalized_to_typed_protocol_error() -> None:
+    class NonBytesStream(httpx.SyncByteStream):
+        def __iter__(self):
+            yield "private malformed chunk"
+
+    client = _client(
+        lambda _request: httpx.Response(
+            200,
+            headers={"Content-Type": "text/event-stream"},
+            stream=NonBytesStream(),
+        )
+    )
+    try:
+        with client.events() as stream:
+            with pytest.raises(CoreClientErrorV1) as exc_info:
+                list(stream)
+    finally:
+        client.close()
+
+    assert exc_info.value.error.code is CoreClientLocalErrorCodeV1.SSE_PROTOCOL_ERROR
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
+
+
+@pytest.mark.parametrize("use_sse", [False, True])
+def test_response_is_owned_when_deadline_expires_immediately_after_send(
+    monkeypatch,
+    use_sse: bool,
+) -> None:
+    import desktop.sidecar.core_client_v1 as core_client_module
+
+    response_closed = threading.Event()
+
+    class TrackingBody(httpx.SyncByteStream):
+        def __iter__(self):
+            if use_sse:
+                yield b""
+            else:
+                yield json.dumps(_health_payload()).encode("utf-8")
+
+        def close(self) -> None:
+            response_closed.set()
+
+    client = _client(
+        lambda _request: httpx.Response(
+            200,
+            headers={
+                "Content-Type": (
+                    "text/event-stream" if use_sse else "application/json"
+                )
+            },
+            stream=TrackingBody(),
+        )
+    )
+    original_send = core_client_module._send_before_deadline
+    original_check = core_client_module._check_deadline
+    expire_after_send = threading.Event()
+
+    def tracked_send(*args, **kwargs):
+        response = original_send(*args, **kwargs)
+        expire_after_send.set()
+        return response
+
+    def controlled_check(deadline: float) -> None:
+        if expire_after_send.is_set():
+            core_client_module._raise_local(
+                CoreClientLocalErrorCodeV1.CONNECTION_FAILED, 503
+            )
+        original_check(deadline)
+
+    monkeypatch.setattr(core_client_module, "_send_before_deadline", tracked_send)
+    monkeypatch.setattr(core_client_module, "_check_deadline", controlled_check)
+    try:
+        with pytest.raises(CoreClientErrorV1) as exc_info:
+            if use_sse:
+                with client.events():
+                    pass
+            else:
+                client.health()
+    finally:
+        client.close()
+
+    assert exc_info.value.error.code is CoreClientLocalErrorCodeV1.CONNECTION_FAILED
+    assert response_closed.wait(1)
 
 
 def test_capabilities_accepts_standard_json_arrays_from_model_dump_json() -> None:
@@ -1719,6 +1935,49 @@ def test_close_generation_rejects_public_validation_cache_and_return(monkeypatch
     assert client._capability_authority is None
 
 
+def test_generation_lease_exit_rejects_json_after_final_delivery_check(monkeypatch) -> None:
+    import desktop.sidecar.core_client_v1 as core_client_module
+
+    monkeypatch.setattr(core_client_module, "MAX_CORE_CLOSE_WAIT_SECONDS", 0.05)
+    capabilities = _capabilities()
+    client = _client(
+        lambda _request: httpx.Response(
+            200,
+            json=capabilities.model_dump(mode="json"),
+        )
+    )
+    original_linearize = client._linearize_generation_result
+    final_check_passed = threading.Event()
+    release_return = threading.Event()
+    results: list[v1.CapabilitiesResponseV1] = []
+    errors: list[CoreClientErrorV1] = []
+
+    def pause_after_final_check(generation: int, deadline: float | None = None) -> None:
+        original_linearize(generation, deadline)
+        if deadline is not None and not final_check_passed.is_set():
+            final_check_passed.set()
+            release_return.wait(1)
+
+    def read_capabilities() -> None:
+        try:
+            results.append(client.capabilities(v1.ExecutionMode.SELF_DEPLOYED))
+        except CoreClientErrorV1 as exc:
+            errors.append(exc)
+
+    monkeypatch.setattr(client, "_linearize_generation_result", pause_after_final_check)
+    request_thread = threading.Thread(target=read_capabilities)
+    request_thread.start()
+    assert final_check_passed.wait(1)
+    client.close()
+    release_return.set()
+    request_thread.join(1)
+
+    assert not request_thread.is_alive()
+    assert results == []
+    assert errors[0].error.code is CoreClientLocalErrorCodeV1.CLIENT_CLOSED
+    assert client._capability_authority is None
+
+
 def test_nested_artifact_diff_cannot_hold_close_past_deadline(monkeypatch) -> None:
     import desktop.sidecar.core_client_v1 as core_client_module
 
@@ -1843,6 +2102,111 @@ def test_blocking_closers_share_one_process_fixed_thread_budget(monkeypatch) -> 
     while any(client._close_tasks_pending for client in clients) and time.monotonic() < deadline:
         time.sleep(0.01)
     assert all(client._close_tasks_pending == 0 for client in clients)
+
+
+def test_global_close_capacity_retains_response_ownership_and_gates_transport(
+    monkeypatch,
+) -> None:
+    import desktop.sidecar.core_client_v1 as core_client_module
+
+    closer = core_client_module._BoundedResourceCloser(worker_count=1, capacity=3)
+    monkeypatch.setattr(core_client_module, "_PROCESS_RESOURCE_CLOSER", closer)
+    blocker_started = threading.Event()
+    release_blocker = threading.Event()
+    response_closed = threading.Event()
+    non_version_requests: list[str] = []
+
+    class TrackingSse(httpx.SyncByteStream):
+        def __iter__(self):
+            yield b""
+
+        def close(self) -> None:
+            response_closed.set()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/version":
+            return httpx.Response(200, json=_version_payload())
+        non_version_requests.append(request.url.path)
+        return httpx.Response(
+            200,
+            headers={"Content-Type": "text/event-stream"},
+            stream=TrackingSse(),
+        )
+
+    client = CoreControlClientV1(
+        _connection(),
+        transport=httpx.MockTransport(handler),
+    )
+    assert client.version().openapi_sha256 == CORE_OPENAPI_SHA256
+    deadline = time.monotonic() + 1
+    while closer.owned_count != 1 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert closer.owned_count == 1
+
+    reservation = closer.reserve()
+    assert reservation is not None
+
+    def block_close() -> None:
+        blocker_started.set()
+        release_blocker.wait(1)
+
+    assert reservation.submit(block_close) is True
+    assert blocker_started.wait(1)
+
+    with client.events():
+        pass
+    assert response_closed.is_set() is False
+    assert closer.owned_count == 3
+
+    with pytest.raises(CoreClientErrorV1) as saturated:
+        client.status()
+    assert saturated.value.error.code is CoreClientLocalErrorCodeV1.CONNECTION_FAILED
+    assert non_version_requests == ["/v1/events"]
+
+    release_blocker.set()
+    assert response_closed.wait(1)
+    client.close()
+
+
+def test_close_action_failure_seals_future_lease_admission() -> None:
+    close_attempted = threading.Event()
+    post_failure_transport = False
+
+    class FailingCloseStream(httpx.SyncByteStream):
+        def __iter__(self):
+            yield b""
+
+        def close(self) -> None:
+            close_attempted.set()
+            raise TypeError("private close detail")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal post_failure_transport
+        if request.url.path == "/v1/events":
+            return httpx.Response(
+                200,
+                headers={"Content-Type": "text/event-stream"},
+                stream=FailingCloseStream(),
+            )
+        post_failure_transport = True
+        return httpx.Response(200, json=_health_payload())
+
+    client = _client(handler)
+    with client.events():
+        pass
+    assert close_attempted.wait(1)
+    deadline = time.monotonic() + 1
+    while not client._close_failed and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert client._close_failed is True
+
+    with pytest.raises(CoreClientErrorV1) as exc_info:
+        client.health()
+
+    assert post_failure_transport is False
+    assert exc_info.value.error.code is CoreClientLocalErrorCodeV1.CLIENT_CLOSED
+    with pytest.raises(CoreClientErrorV1):
+        client.close()
 
 
 def test_late_response_close_is_handed_to_bounded_closer_without_state_lock(
@@ -2127,6 +2491,118 @@ def test_sse_delivery_linearized_before_seal_is_not_yielded_after_close(monkeypa
     assert errors[0].error.code is CoreClientLocalErrorCodeV1.CLIENT_CLOSED
 
 
+def test_sse_next_exit_rejects_frame_after_final_delivery_check(monkeypatch) -> None:
+    payload = {
+        "schema_version": "1",
+        "id": "event-final-check",
+        "sequence": 1,
+        "occurred_at": "2026-07-14T12:00:00Z",
+        "event": "heartbeat.v1",
+        "payload": {"active_run_count": 0},
+    }
+    client = _client(
+        lambda _request: httpx.Response(
+            200,
+            headers={"Content-Type": "text/event-stream"},
+            content=_sse_bytes(payload),
+        )
+    )
+    original_linearize = client._linearize_generation_result
+    final_check_passed = threading.Event()
+    release_yield = threading.Event()
+    frames: list[v1.SseFrameV1] = []
+    errors: list[CoreClientErrorV1] = []
+
+    def pause_after_final_check(generation: int, deadline: float | None = None) -> None:
+        original_linearize(generation, deadline)
+        if (
+            deadline is not None
+            and "event-final-check" in client._sse_event_digests
+            and not final_check_passed.is_set()
+        ):
+            final_check_passed.set()
+            release_yield.wait(1)
+
+    monkeypatch.setattr(client, "_linearize_generation_result", pause_after_final_check)
+    with client.events() as stream:
+        def read_frame() -> None:
+            try:
+                frames.append(next(iter(stream)))
+            except CoreClientErrorV1 as exc:
+                errors.append(exc)
+
+        reader = threading.Thread(target=read_frame)
+        reader.start()
+        assert final_check_passed.wait(1)
+        client.close()
+        release_yield.set()
+        reader.join(1)
+
+    assert not reader.is_alive()
+    assert frames == []
+    assert errors[0].error.code is CoreClientLocalErrorCodeV1.CLIENT_CLOSED
+    assert "event-final-check" not in client._sse_event_digests
+
+
+def test_sse_wait_does_not_hold_the_client_cache_transaction_lock() -> None:
+    payload = {
+        "schema_version": "1",
+        "id": "event-concurrent-read",
+        "sequence": 1,
+        "occurred_at": "2026-07-14T12:00:00Z",
+        "event": "heartbeat.v1",
+        "payload": {"active_run_count": 0},
+    }
+    read_started = threading.Event()
+    release_read = threading.Event()
+    health_transport_reached = threading.Event()
+
+    class BlockingSse(httpx.SyncByteStream):
+        def __iter__(self):
+            read_started.set()
+            release_read.wait(1)
+            yield _sse_bytes(payload)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/events":
+            return httpx.Response(
+                200,
+                headers={"Content-Type": "text/event-stream"},
+                stream=BlockingSse(),
+            )
+        health_transport_reached.set()
+        return httpx.Response(200, json=_health_payload())
+
+    client = _client(handler)
+    reader: threading.Thread | None = None
+    health_reader: threading.Thread | None = None
+    frame_results: list[v1.SseFrameV1] = []
+    health_results: list[v1.HealthResponseV1] = []
+    reached_while_sse_waited = False
+    try:
+        with client.events() as stream:
+            reader = threading.Thread(target=lambda: frame_results.append(next(stream)))
+            reader.start()
+            assert read_started.wait(1)
+            health_reader = threading.Thread(target=lambda: health_results.append(client.health()))
+            health_reader.start()
+            reached_while_sse_waited = health_transport_reached.wait(0.2)
+            release_read.set()
+            reader.join(1)
+            health_reader.join(1)
+    finally:
+        release_read.set()
+        if reader is not None:
+            reader.join(1)
+        if health_reader is not None:
+            health_reader.join(1)
+        client.close()
+
+    assert reached_while_sse_waited is True
+    assert len(frame_results) == 1
+    assert len(health_results) == 1
+
+
 def test_sse_event_id_is_bound_to_canonical_payload_across_reconnects() -> None:
     first = {
         "schema_version": "1",
@@ -2321,14 +2797,11 @@ def test_sse_trickle_cannot_extend_total_deadline() -> None:
                 time.sleep(0.04)
                 yield _sse_bytes(payload)
 
-    client = CoreControlClientV1(
-        _connection(),
-        transport=httpx.MockTransport(
-            lambda _request: httpx.Response(
-                200,
-                headers={"Content-Type": "text/event-stream"},
-                stream=TrickleSse(),
-            )
+    client = _client(
+        lambda _request: httpx.Response(
+            200,
+            headers={"Content-Type": "text/event-stream"},
+            stream=TrickleSse(),
         ),
         timeout=0.06,
     )
