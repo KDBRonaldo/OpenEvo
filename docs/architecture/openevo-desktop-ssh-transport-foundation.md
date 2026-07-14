@@ -156,9 +156,13 @@ exclusive lock before replacement. There is no caller-constructible confirmed
 pending capability. Rotation fully rereads and canonical-validates its private
 temporary record before `os.replace`; successful return from `os.replace` is the
 irreversible commit point. Any directory fsync, authoritative reread, or
-canonical-validation failure after that point returns typed
-`host_key_rotation_indeterminate`. Callers must reload using the candidate
-fingerprint and must not assume that old trust remains installed.
+canonical-validation failure after that point, including shared context-manager
+unlock or lock-fd close failure, returns sanitized typed
+`host_key_rotation_indeterminate`. Lock cleanup always makes a best-effort
+unlock and fd close. The typed error identifies the confirmed candidate
+fingerprint as the authoritative reload key; callers must reload with that
+fingerprint and must not assume that old trust remains installed. Cleanup
+failure before `os.replace` remains an ordinary fail-closed operation failure.
 
 Before revoke or rotation attempts the exclusive lock, the store requests closure
 of matching tunnels registered in the current process. `SshTunnel` is a context
@@ -168,9 +172,16 @@ closed by that owner; otherwise mutation fails with `host_key_in_use` after the
 bounded lock timeout. Synchronous commands intentionally keep their shared lease
 until completion. Revoking the store record is not a general remote-session
 termination mechanism. Registration and exit-monitor startup are one constructor
-transaction: any failure after process creation unregisters the closer, performs
-bounded terminate/wait/kill cleanup, and releases the trust lease before a typed
-start failure is returned.
+transaction. A failure after process creation performs bounded
+terminate/wait/kill cleanup, but unregisters the closer and releases the trust
+lease only after `wait` or `poll` proves that the child exited. If cleanup cannot
+confirm exit, a process-local quarantine registry retains the tunnel ownership,
+registration, and lease while a daemon monitor retries. Matching trust mutation
+also retries quarantined cleanup when constructor registration succeeded; later
+tunnel creation retries every quarantined entry. Finalization is idempotent, so
+concurrent recovery paths cannot unregister or close the lease twice. Until one
+path proves exit, revoke and rotation remain blocked by the shared trust lease
+instead of leaving an unmanaged child behind.
 
 `SshRemoteExecutorTransport` requires a `TrustedKnownHostsBinding` and revalidates
 it before building every command. A release call without a binding fails closed.

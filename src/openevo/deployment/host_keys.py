@@ -73,17 +73,29 @@ class HostKeyStoreErrorCode(str, Enum):
 class HostKeyStoreError(RuntimeError):
     """A typed failure safe to surface without trust-store path details."""
 
-    def __init__(self, code: HostKeyStoreErrorCode) -> None:
+    def __init__(
+        self,
+        code: HostKeyStoreErrorCode,
+        *,
+        authoritative_fingerprint: str | None = None,
+    ) -> None:
         self.code = code
-        messages = {
-            HostKeyStoreErrorCode.HOST_KEY_IN_USE: (
+        self.authoritative_fingerprint = authoritative_fingerprint
+        if code is HostKeyStoreErrorCode.ROTATION_INDETERMINATE:
+            if authoritative_fingerprint is None:
+                raise ValueError(
+                    "indeterminate host-key rotation requires a candidate fingerprint"
+                )
+            message = (
+                "SSH host-key rotation may have committed. Authoritatively reload trust "
+                f"using the confirmed candidate fingerprint {authoritative_fingerprint} "
+                "before retrying."
+            )
+        else:
+            message = (
                 "SSH host-key trust is in use. Close the active tunnel and retry."
-            ),
-            HostKeyStoreErrorCode.ROTATION_INDETERMINATE: (
-                "SSH host-key rotation may have committed. Reload trust before retrying."
-            ),
-        }
-        super().__init__(messages[code])
+            )
+        super().__init__(message)
 
 
 @dataclass(frozen=True)
@@ -105,6 +117,11 @@ class PendingHostKeyProbe:
     candidates: tuple[HostKeyCandidate, ...]
     _store_token: object = field(repr=False, compare=False)
     _digest: str = field(repr=False, compare=False)
+
+
+@dataclass
+class _RotationCommitState:
+    committed: bool = False
 
 
 @dataclass(frozen=True)
@@ -395,22 +412,38 @@ class ProviderKnownHostStore:
         _request_tunnel_closure(self._anchor.registry_key, profile.id)
         path = self._root / _binding_filename(profile.id)
         expected = _render_binding_content(profile, selected)
-        with self._anchor.locked_root(create=False, exclusive=True) as root_fd:
-            if root_fd is None:
-                raise ValueError("trusted host key is missing")
-            content = _read_secure_file(root_fd, path.name)
-            if content is None:
-                raise ValueError("trusted host key is missing")
-            current = _binding_from_content(path, content, profile, self._anchor)
-            if current.fingerprint != expected_old_fingerprint:
-                raise ValueError("trusted host key does not match expected fingerprint")
-            return _replace_secure_file(
-                root_fd,
-                path,
-                expected,
-                profile=profile,
-                anchor=self._anchor,
+        commit_state = _RotationCommitState()
+        published_binding: TrustedKnownHostsBinding | None = None
+        post_commit_failed = False
+        try:
+            with self._anchor.locked_root(create=False, exclusive=True) as root_fd:
+                if root_fd is None:
+                    raise ValueError("trusted host key is missing")
+                content = _read_secure_file(root_fd, path.name)
+                if content is None:
+                    raise ValueError("trusted host key is missing")
+                current = _binding_from_content(path, content, profile, self._anchor)
+                if current.fingerprint != expected_old_fingerprint:
+                    raise ValueError("trusted host key does not match expected fingerprint")
+                published_binding = _replace_secure_file(
+                    root_fd,
+                    path,
+                    expected,
+                    profile=profile,
+                    anchor=self._anchor,
+                    commit_state=commit_state,
+                )
+        except BaseException:
+            if not commit_state.committed:
+                raise
+            post_commit_failed = True
+        if post_commit_failed:
+            raise HostKeyStoreError(
+                HostKeyStoreErrorCode.ROTATION_INDETERMINATE,
+                authoritative_fingerprint=selected.fingerprint,
             )
+        assert published_binding is not None
+        return published_binding
 
     def _persist(
         self,
@@ -502,19 +535,35 @@ class _StoreAnchor:
             yield None
             return
         lock_fd = self._open_lock(root_fd)
+        acquired = False
         try:
             _acquire_store_lock(
                 lock_fd,
                 exclusive=exclusive,
                 timeout_seconds=self._lock_timeout_seconds,
             )
+            acquired = True
             self._validate_ancestor_binding()
             self._validate_root_binding()
             self._validate_lock_binding(root_fd, lock_fd)
             yield root_fd
         finally:
-            fcntl.flock(lock_fd, fcntl.LOCK_UN)
-            os.close(lock_fd)
+            cleanup_failed = False
+            if acquired:
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                except BaseException:
+                    cleanup_failed = True
+                    try:
+                        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                    except BaseException:
+                        pass
+            try:
+                os.close(lock_fd)
+            except BaseException:
+                cleanup_failed = True
+            if cleanup_failed:
+                raise ValueError("provider known-host store lock cleanup failed")
 
     def _open_lock(self, root_fd: int) -> int:
         with self._guard:
@@ -1166,6 +1215,7 @@ def _replace_secure_file(
     *,
     profile: RemoteProfileConfig,
     anchor: _StoreAnchor,
+    commit_state: _RotationCommitState,
 ) -> TrustedKnownHostsBinding:
     temp_name = f".{path.name}.{secrets.token_hex(12)}.rotate"
     created = False
@@ -1178,26 +1228,18 @@ def _replace_secure_file(
         _binding_from_content(anchor.root / temp_name, prepared, profile, anchor)
 
         os.replace(temp_name, path.name, src_dir_fd=root_fd, dst_dir_fd=root_fd)
+        commit_state.committed = True
         created = False
-        post_commit_failed = False
-        published_binding: TrustedKnownHostsBinding | None = None
-        try:
-            os.fsync(root_fd)
-            published = _read_secure_file(root_fd, path.name)
-            if published != content:
-                raise ValueError("known-host rotation content changed")
-            published_binding = _binding_from_content(
-                path,
-                published,
-                profile,
-                anchor,
-            )
-        except Exception:
-            post_commit_failed = True
-        if post_commit_failed:
-            raise HostKeyStoreError(HostKeyStoreErrorCode.ROTATION_INDETERMINATE)
-        assert published_binding is not None
-        return published_binding
+        os.fsync(root_fd)
+        published = _read_secure_file(root_fd, path.name)
+        if published != content:
+            raise ValueError("known-host rotation content changed")
+        return _binding_from_content(
+            path,
+            published,
+            profile,
+            anchor,
+        )
     finally:
         if created:
             try:

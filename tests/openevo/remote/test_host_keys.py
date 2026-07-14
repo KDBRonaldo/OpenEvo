@@ -9,6 +9,7 @@ import struct
 import subprocess
 import threading
 import time
+import traceback
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
@@ -634,13 +635,139 @@ def test_rotate_post_replace_failure_is_typed_indeterminate_and_reloadable(
 
     error = exc_info.value
     assert error.code is HostKeyStoreErrorCode.ROTATION_INDETERMINATE
+    assert error.authoritative_fingerprint == replacement.fingerprint
     assert "reload" in str(error).lower()
+    assert "candidate fingerprint" in str(error).lower()
+    assert replacement.fingerprint in str(error)
     assert "SECRET_POST_REPLACE_PATH" not in str(error)
     assert error.__cause__ is None
     assert error.__context__ is None
     reloaded = store.load(profile, expected_fingerprint=replacement.fingerprint)
     assert reloaded is not None
     assert reloaded.fingerprint == replacement.fingerprint
+
+
+@pytest.mark.parametrize("cleanup_failure", ["unlock", "close"])
+def test_rotate_lock_cleanup_failure_after_replace_is_typed_and_closes_fd(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    cleanup_failure: str,
+) -> None:
+    profile = _profile()
+    old = _confirmed_binding(tmp_path, profile)
+    replacement_output = _valid_output(profile, marker=b"replacement")
+    store = ProviderKnownHostStore(
+        old.known_hosts_file.parent,
+        runner=KeyscanRunner(replacement_output),
+    )
+    pending = store.probe(profile)
+    replacement = pending.candidates[0]
+    real_replace = os.replace
+    real_flock = host_keys_module.fcntl.flock
+    real_close = os.close
+    committed = False
+    injected = False
+    lock_fd: int | None = None
+    close_attempted = False
+
+    def record_replace(*args, **kwargs) -> None:
+        nonlocal committed
+        real_replace(*args, **kwargs)
+        committed = True
+
+    def fail_unlock(fd: int, operation: int) -> None:
+        nonlocal injected, lock_fd
+        if operation & host_keys_module.fcntl.LOCK_EX:
+            lock_fd = fd
+        if (
+            cleanup_failure == "unlock"
+            and committed
+            and operation == host_keys_module.fcntl.LOCK_UN
+            and not injected
+        ):
+            injected = True
+            raise OSError("SECRET_ROTATION_UNLOCK_FAILURE")
+        real_flock(fd, operation)
+
+    def fail_close(fd: int) -> None:
+        nonlocal close_attempted, injected
+        if committed and fd == lock_fd:
+            close_attempted = True
+            if cleanup_failure == "close" and not injected:
+                injected = True
+                real_close(fd)
+                raise OSError("SECRET_ROTATION_CLOSE_FAILURE")
+        real_close(fd)
+
+    monkeypatch.setattr("openevo.deployment.host_keys.os.replace", record_replace)
+    monkeypatch.setattr("openevo.deployment.host_keys.fcntl.flock", fail_unlock)
+    monkeypatch.setattr("openevo.deployment.host_keys.os.close", fail_close)
+
+    with pytest.raises(HostKeyStoreError) as exc_info:
+        store.rotate_from_pending(
+            pending,
+            profile=profile,
+            algorithm=replacement.algorithm,
+            fingerprint=replacement.fingerprint,
+            expected_old_fingerprint=old.fingerprint,
+        )
+
+    error = exc_info.value
+    rendered = "".join(traceback.format_exception(error))
+    assert error.code is HostKeyStoreErrorCode.ROTATION_INDETERMINATE
+    assert error.authoritative_fingerprint == replacement.fingerprint
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    assert "SECRET_ROTATION_" not in str(error)
+    assert "SECRET_ROTATION_" not in rendered
+    assert injected is True
+    assert close_attempted is True
+    assert lock_fd is not None
+    with pytest.raises(OSError):
+        os.fstat(lock_fd)
+
+    reloaded = store.load(profile, expected_fingerprint=replacement.fingerprint)
+    assert reloaded is not None
+
+
+def test_rotate_lock_cleanup_failure_before_replace_stays_fail_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile = _profile()
+    old = _confirmed_binding(tmp_path, profile)
+    original = old.known_hosts_file.read_bytes()
+    replacement_output = _valid_output(profile, marker=b"replacement")
+    store = ProviderKnownHostStore(
+        old.known_hosts_file.parent,
+        runner=KeyscanRunner(replacement_output),
+    )
+    pending = store.probe(profile)
+    replacement = pending.candidates[0]
+    real_flock = host_keys_module.fcntl.flock
+    injected = False
+
+    def fail_unlock_once(fd: int, operation: int) -> None:
+        nonlocal injected
+        if operation == host_keys_module.fcntl.LOCK_UN and not injected:
+            injected = True
+            raise OSError("SECRET_PRECOMMIT_UNLOCK_FAILURE")
+        real_flock(fd, operation)
+
+    monkeypatch.setattr("openevo.deployment.host_keys.fcntl.flock", fail_unlock_once)
+
+    with pytest.raises(ValueError, match="lock cleanup failed") as exc_info:
+        store.rotate_from_pending(
+            pending,
+            profile=profile,
+            algorithm=replacement.algorithm,
+            fingerprint=replacement.fingerprint,
+            expected_old_fingerprint=replacement.fingerprint,
+        )
+
+    assert not isinstance(exc_info.value, HostKeyStoreError)
+    assert old.known_hosts_file.read_bytes() == original
+    assert store.load(profile, expected_fingerprint=old.fingerprint) is not None
 
 
 def test_concurrent_rotate_allows_only_one_first_writer(tmp_path: Path) -> None:

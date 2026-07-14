@@ -14,8 +14,11 @@ from pathlib import Path
 
 import pytest
 
+import openevo.deployment.ssh as ssh_module
 from openevo.deployment import RemoteCommandResult, RemoteExecutorTransport
 from openevo.deployment.host_keys import (
+    HostKeyStoreError,
+    HostKeyStoreErrorCode,
     ProviderKnownHostStore,
     TrustedKnownHostsBinding,
 )
@@ -836,6 +839,9 @@ def test_open_tunnel_thread_start_failure_cleans_process_registration_and_lease(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class StubbornTunnelProcess(FakeTunnelProcess):
+        def poll(self) -> int | None:
+            return 0 if self.killed else None
+
         def wait(self, timeout: float | None = None) -> int:
             self.waited = True
             if not self.killed:
@@ -894,6 +900,143 @@ def test_open_tunnel_thread_start_failure_cleans_process_registration_and_lease(
         lock_timeout_seconds=0.05,
     )
     store.revoke(profile, expected_fingerprint=binding.fingerprint)
+
+
+def test_failed_tunnel_construction_retains_lease_until_exit_is_confirmed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class RecoverableCleanupProcess(FakeTunnelProcess):
+        def __init__(self) -> None:
+            super().__init__()
+            self.cleanup_fails = True
+            self.terminate_calls = 0
+            self.wait_calls = 0
+            self.kill_calls = 0
+
+        def poll(self) -> int | None:
+            return self.return_code
+
+        def terminate(self) -> None:
+            self.terminate_calls += 1
+            if self.cleanup_fails:
+                raise OSError("SECRET_TERMINATE_FAILURE")
+            self.return_code = -15
+
+        def wait(self, timeout: float | None = None) -> int:
+            self.wait_calls += 1
+            if self.cleanup_fails:
+                raise OSError("SECRET_WAIT_FAILURE")
+            if self.return_code is None:
+                raise subprocess.TimeoutExpired("ssh", timeout)
+            return self.return_code
+
+        def kill(self) -> None:
+            self.kill_calls += 1
+            if self.cleanup_fails:
+                raise OSError("SECRET_KILL_FAILURE")
+            self.return_code = -9
+
+    class RecoverableCleanupStarter(RecordingTunnelStarter):
+        def __call__(self, argv: list[str]) -> FakeTunnelProcess:
+            self.calls.append(argv)
+            process = RecoverableCleanupProcess()
+            self.processes.append(process)
+            return process
+
+    profile = _profile()
+    binding = _trusted_binding(tmp_path, profile)
+    starter = RecoverableCleanupStarter()
+    transport = SshRemoteExecutorTransport(
+        profile,
+        trusted_host=binding,
+        runner=RecordingRunner(),
+        tunnel_starter=starter,
+        port_allocator=lambda: 49155,
+    )
+    real_release_trust_lease = ssh_module._release_trust_lease
+    release_calls = 0
+
+    def record_release_trust_lease(trust_lease) -> None:
+        nonlocal release_calls
+        release_calls += 1
+        real_release_trust_lease(trust_lease)
+
+    def fail_start(self: threading.Thread) -> None:
+        raise RuntimeError("SECRET_THREAD_START_FAILURE")
+
+    monkeypatch.setattr(ssh_module, "_release_trust_lease", record_release_trust_lease)
+    monkeypatch.setattr(threading.Thread, "start", fail_start)
+
+    with pytest.raises(SshTransportError) as exc_info:
+        transport.open_tunnel(remote_port=8765, wait_for_ready=False)
+
+    error = exc_info.value
+    process = starter.processes[0]
+    assert isinstance(process, RecoverableCleanupProcess)
+    lease_path = Path(
+        next(
+            value.removeprefix("UserKnownHostsFile=")
+            for value in starter.calls[0]
+            if value.startswith("UserKnownHostsFile=")
+        )
+    )
+    orphan = next(
+        tunnel
+        for tunnel in ssh_module._ORPHANED_TUNNELS.values()
+        if tunnel.process is process
+    )
+    assert error.code is SshTransportErrorCode.START_FAILED
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    assert "SECRET_" not in "".join(traceback.format_exception(error))
+    assert process.terminate_calls == 1
+    assert process.wait_calls == 2
+    assert process.kill_calls == 1
+    assert orphan.closed is False
+    assert lease_path.exists()
+    assert release_calls == 0
+
+    store = ProviderKnownHostStore(
+        binding.known_hosts_file.parent,
+        runner=lambda argv, timeout: subprocess.CompletedProcess(argv, 1),
+        lock_timeout_seconds=0.05,
+    )
+    with pytest.raises(HostKeyStoreError) as revoke_error:
+        store.revoke(profile, expected_fingerprint=binding.fingerprint)
+
+    assert revoke_error.value.code is HostKeyStoreErrorCode.HOST_KEY_IN_USE
+    assert orphan.closed is False
+    assert lease_path.exists()
+    assert binding.known_hosts_file.exists()
+    assert process.terminate_calls == 2
+    assert process.wait_calls == 4
+    assert process.kill_calls == 2
+    assert release_calls == 0
+
+    process.cleanup_fails = False
+    store.revoke(profile, expected_fingerprint=binding.fingerprint)
+
+    assert orphan.closed is True
+    assert not lease_path.exists()
+    assert not binding.known_hosts_file.exists()
+    assert id(orphan) not in ssh_module._ORPHANED_TUNNELS
+    assert release_calls == 1
+    assert process.terminate_calls == 3
+    assert process.wait_calls == 5
+    assert process.kill_calls == 2
+    cleanup_calls = (
+        process.terminate_calls,
+        process.wait_calls,
+        process.kill_calls,
+    )
+    ssh_module._retry_orphaned_tunnel_cleanup()
+    assert cleanup_calls == (
+        process.terminate_calls,
+        process.wait_calls,
+        process.kill_calls,
+    )
+    assert release_calls == 1
 
 
 def test_ssh_errors_do_not_expose_secret_exception_state(
