@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ipaddress
 import re
 import shlex
 import socket
@@ -10,6 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
+from openevo.deployment.host_keys import TrustedKnownHostsBinding
 from openevo.deployment.preflight import RemoteCommandResult
 from openevo.deployment.profile import RemoteProfileConfig
 
@@ -26,6 +28,7 @@ class TunnelProcess(Protocol):
     def kill(self) -> None: ...
 
     def wait(self, timeout: float | None = None) -> int: ...
+
 
 _ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _REMOTE_HOST_RE = re.compile(r"^[A-Za-z0-9._%-]+$")
@@ -57,18 +60,26 @@ class SshTunnel:
 
 
 class SshRemoteExecutorTransport:
+    """Execute SSH operations against one explicitly trusted host-key binding."""
+
     def __init__(
         self,
         profile: RemoteProfileConfig,
         *,
+        trusted_host: TrustedKnownHostsBinding | None = None,
         runner: CompletedRunner | None = None,
         tunnel_starter: TunnelStarter | None = None,
         port_allocator: PortAllocator | None = None,
     ) -> None:
         _validate_supported_auth(profile)
         _validate_remote_identity(profile.user, "user", _REMOTE_USER_RE)
-        _validate_remote_identity(profile.host, "host", _REMOTE_HOST_RE)
+        _validate_remote_host(profile.host)
+        _validate_port(profile.port, "remote profile port")
+        if trusted_host is None:
+            raise ValueError("SSH transport requires a trusted host-key binding")
+        trusted_host.validate_for(profile)
         self._profile = profile
+        self._trusted_host = trusted_host
         self._runner = runner or _run_subprocess
         self._tunnel_starter = tunnel_starter or _start_tunnel_subprocess
         self._port_allocator = port_allocator or _allocate_local_port
@@ -166,11 +177,38 @@ class SshRemoteExecutorTransport:
 
     def _ssh_base_argv(self) -> list[str]:
         profile = self._profile
+        trusted_host = self._trusted_host
+        trusted_host.validate_for(profile)
         argv = ["ssh", "-p", str(profile.port)]
         if profile.auth.method == "private_key":
             key_path = Path(str(profile.auth.private_key_path)).expanduser()
             argv.extend(["-i", str(key_path)])
-        argv.extend(["-o", "BatchMode=yes", "-l", profile.user])
+        argv.extend(
+            [
+                "-o",
+                "StrictHostKeyChecking=yes",
+                "-o",
+                f"UserKnownHostsFile={trusted_host.known_hosts_file}",
+                "-o",
+                "GlobalKnownHostsFile=/dev/null",
+                "-o",
+                "UpdateHostKeys=no",
+                "-o",
+                "CheckHostIP=no",
+                "-o",
+                "VerifyHostKeyDNS=no",
+                "-o",
+                "KnownHostsCommand=none",
+                "-o",
+                "HashKnownHosts=no",
+                "-o",
+                f"HostKeyAlgorithms={trusted_host.algorithm}",
+                "-o",
+                "BatchMode=yes",
+                "-l",
+                profile.user,
+            ]
+        )
         return argv
 
     def _rsync_argv(self, local: Path, remote_path: str) -> list[str]:
@@ -182,15 +220,11 @@ class SshRemoteExecutorTransport:
             "-e",
             ssh_command,
             _with_trailing_slash(str(local)),
-            (
-                f"{self._profile.host}:{_with_trailing_slash(remote_path)}"
-            ),
+            (f"{_rsync_host(self._profile.host)}:{_with_trailing_slash(remote_path)}"),
         ]
 
 
-def _run_subprocess(
-    argv: list[str], timeout_seconds: float
-) -> subprocess.CompletedProcess[str]:
+def _run_subprocess(argv: list[str], timeout_seconds: float) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         argv,
         check=False,
@@ -227,8 +261,7 @@ def _wait_for_local_port(
         return_code = process.poll()
         if return_code is not None:
             raise RuntimeError(
-                "SSH tunnel exited before it became ready "
-                f"(return code {return_code})."
+                f"SSH tunnel exited before it became ready (return code {return_code})."
             )
         try:
             with socket.create_connection(
@@ -254,6 +287,18 @@ def _validate_supported_auth(profile: RemoteProfileConfig) -> None:
 def _validate_remote_identity(value: str, field_name: str, pattern: re.Pattern[str]) -> None:
     if value.startswith("-") or not pattern.fullmatch(value):
         raise ValueError(f"remote profile {field_name} contains unsupported characters")
+
+
+def _validate_remote_host(value: str) -> None:
+    if ":" not in value:
+        _validate_remote_identity(value, "host", _REMOTE_HOST_RE)
+        return
+    try:
+        parsed = ipaddress.ip_address(value)
+    except ValueError as exc:
+        raise ValueError("remote profile host contains unsupported characters") from exc
+    if parsed.version != 6:
+        raise ValueError("remote profile host contains unsupported characters")
 
 
 def _validate_port(value: int, field_name: str) -> None:
@@ -300,3 +345,7 @@ def _validate_remote_absolute_path(path: str, field_name: str) -> None:
 
 def _with_trailing_slash(value: str) -> str:
     return value if value.endswith("/") else f"{value}/"
+
+
+def _rsync_host(host: str) -> str:
+    return f"[{host}]" if ":" in host else host

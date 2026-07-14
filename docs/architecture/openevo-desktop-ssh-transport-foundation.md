@@ -8,7 +8,7 @@ artifacts, and command-based service facades are superseded by
 
 # OpenEvo Desktop SSH Transport Foundation
 
-Tracked by #43.
+Tracked by #43 and hardened for the provider-owned host-key boundary in #163.
 
 This document describes the first concrete transport behind the OpenEvo Desktop
 sidecar executor contract. It lets the local Desktop sidecar run remote
@@ -60,16 +60,64 @@ environment variables, `cwd`, and rsync-created remote paths.
 The local machine running OpenEvo Desktop must have:
 
 - `ssh` available on `PATH`;
+- `ssh-keyscan` available on `PATH` for the controlled host-key probe;
 - `rsync` available on `PATH` for local-folder workspace uploads;
-- network access from the local machine to the remote SSH server;
-- a known-hosts policy configured by the user or operating system.
+- network access from the local machine to the remote SSH server.
 
-Remote `host` values in this slice support OpenSSH host aliases, DNS names, and
-IPv4-style addresses that do not contain `@` or `:`. IPv6 literal hosts are not
-supported yet because rsync destination syntax needs separate bracket handling.
+Remote `host` values support DNS names, IPv4 addresses, and IPv6 literals. IPv6
+rsync destinations use the required bracketed form. Host values that can be
+interpreted as local option or destination injection are rejected before any
+subprocess starts.
 
-The transport does not disable host-key checking. Users should configure
-`~/.ssh/known_hosts` or their OpenSSH config before first real execution.
+Desktop does not read or modify the user's `~/.ssh/known_hosts`. It also disables
+global known-host lookup for every SSH subprocess.
+
+## Provider-Owned Host-Key Trust
+
+`ProviderKnownHostStore` owns enrollment and persistence. Its root must be an
+owner-controlled, non-symlink directory with mode `0700`. Each profile is mapped
+to an opaque SHA-256 filename, and each known-host file must be a link-count-one,
+owner-controlled regular file with mode `0600`. Reads are descriptor-relative
+and no-follow. Publication writes and fsyncs a private temporary file, publishes
+it with an atomic no-replace hard link, removes the temporary name, and fsyncs
+the directory. Existing records are immutable: a different key is rejected
+rather than replaced. Store paths reject whitespace, quoting, backslashes, and
+OpenSSH `%` token expansion so `UserKnownHostsFile` always names exactly one
+provider file.
+
+A stored record contains both canonical metadata and an OpenSSH known-host line.
+The metadata binds all of:
+
+- remote profile ID;
+- exact host and port;
+- selected host-key algorithm;
+- full public key, including key type and encoded key blob;
+- independently computed `SHA256:` fingerprint.
+
+The fingerprint is not a substitute for the public key. Loading a binding
+recomputes the fingerprint from the stored key and requires the metadata and
+OpenSSH line to be byte-canonical.
+
+Enrollment is explicitly two phase:
+
+1. `probe(profile)` runs `ssh-keyscan` with an argv list and a closed request set
+   of Ed25519, NIST P-256 ECDSA, and RSA keys. It accepts only exact host/port
+   lines and rejects markers, hashed hosts, host lists, duplicate algorithms,
+   comments, extra fields, malformed key blobs, and unsupported algorithms.
+2. The caller submits an exact algorithm and fingerprint from the pending result.
+   `confirm(...)` requires the current profile ID/host/port to match, repeats the
+   probe, and requires the complete candidate set to be unchanged before it
+   persists the selected full key.
+
+RSA known-host records use the OpenSSH public-key type `ssh-rsa`; the transport
+pins `rsa-sha2-512` as the corresponding host-key signature algorithm. Probe
+results never mutate trust state, so first contact is not silent TOFU.
+
+`SshRemoteExecutorTransport` requires a `TrustedKnownHostsBinding` and revalidates
+it before building every command. A release call without a binding fails closed.
+This slice deliberately does not add a UI, native host route, contract DTO, or
+Core API for confirmation; those callers must be wired separately before release
+SSH actions can proceed.
 
 ## Supported Auth Modes
 
@@ -102,8 +150,21 @@ the SSH transport.
 `run(command, env=..., cwd=...)` builds:
 
 ```text
-ssh -p <port> [-i <key>] -o BatchMode=yes -l <user> -- <host> <remote-command>
+ssh -p <port> [-i <key>] \
+  -o StrictHostKeyChecking=yes \
+  -o UserKnownHostsFile=<provider-file> \
+  -o GlobalKnownHostsFile=/dev/null \
+  -o UpdateHostKeys=no \
+  -o CheckHostIP=no \
+  -o VerifyHostKeyDNS=no \
+  -o KnownHostsCommand=none \
+  -o HashKnownHosts=no \
+  -o HostKeyAlgorithms=<confirmed-algorithm> \
+  -o BatchMode=yes -l <user> -- <host> <remote-command>
 ```
+
+The same base argv is used for remote commands, the rsync remote shell, and SSH
+tunnels. Neither keyscan nor transport subprocesses use `shell=True`.
 
 `env` is injected into the remote command as POSIX assignments:
 
@@ -134,8 +195,10 @@ structured failure reports during preflight or workspace execution.
 1. verifies the local path exists and is a directory;
 2. verifies the remote path is absolute and uses only the SSH transport safe
    path characters;
-3. creates the remote target directory with `mkdir -p`;
-4. runs `rsync -az --delete -e "ssh ... -l <user>"` from `local_path/` to
+3. creates the remote target directory with `mkdir -p` through the trusted SSH
+   binding;
+4. runs `rsync -az --delete -e "ssh ... <provider trust options> -l <user>"`
+   from `local_path/` to
    `<host>:remote_path/`.
 
 The trailing slash semantics intentionally upload the contents of the local
@@ -147,6 +210,7 @@ This slice does not include:
 
 - password or passphrase vault integration;
 - OpenSSH config editing;
+- UI/native/sidecar contract wiring for host-key confirmation;
 - Windows-specific rsync packaging;
 - host-wide remote dependency installation or repair beyond bootstrap's
   user-site `openevo` and `huggingface_hub` installs;
