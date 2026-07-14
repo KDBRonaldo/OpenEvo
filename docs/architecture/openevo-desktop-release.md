@@ -59,11 +59,24 @@ wheel does not alter `src/openevo/wheels` in the checkout.
 Part of #158 establishes the first release-only native-host boundary. A release
 build derives the sidecar source path only from the current application
 executable and the `bundle.externalBin` basename. Every bundle directory
-component is opened relative to a held directory FD with `O_NOFOLLOW` and must
-be owned by root or the effective user. The sidecar source owner must exactly
-match the current executable owner, and that app owner must itself be root or
-the effective user. This supports both a root-owned `/Applications` install and
-a user-owned copied app while rejecting a third UID.
+component is opened relative to a held directory FD with `O_NOFOLLOW`, must be
+owned by root or the effective user, and must not be group/world writable. A
+root-owned sticky directory such as the system temporary directory is the only
+writable component exception. Set-user-ID execution is rejected by requiring
+the real and effective UID to match.
+
+Linux obtains the loaded executable vnode through `/proc/self/exe`; its owner
+must be root or the effective user, and the sidecar source owner must match it
+exactly. macOS has no equivalent interface that reopens the vnode already
+loaded by the process. The macOS policy therefore does not claim that reopening
+`current_exe()` authenticates the loaded image: it accepts a sidecar owned by
+root or the effective user only after the no-follow component policy above.
+This explicitly supports root-owned and user-owned bundles while rejecting a
+third UID, provided every path component meets the write policy. A root-owned
+app beneath a group-writable `/Applications` directory is deliberately rejected;
+release packaging must use an installation location whose complete path
+satisfies this policy. A same-UID process remains inside this phase-one trust
+boundary.
 
 The source must be a non-empty, link-count-one regular executable that is not
 group/world writable. Native code hashes the held source FD before copying,
@@ -125,13 +138,19 @@ The child starts in its own process group. Explicit stop, startup failure,
 restart cleanup, and Tauri `ExitRequested`/`Exit` handling signal the complete
 group with TERM, poll for a fixed interval, escalate to KILL, and poll for a
 second fixed interval. Stop and exit first advance a cancellation epoch so an
-in-progress startup cannot publish or spawn after cancellation, and state-lock
-acquisition is also time-bounded. No failure path performs an unbounded
-`Child::wait`. An unexpected TERM, KILL, child-wait, or group-inspection failure
-moves the manager to `cleanup_pending`; it retains `Child`, process-group ID,
-private directory, executable FD, and listener, blocks another start, and lets
-explicit stop retry cleanup. Resources are dropped only after the child is
-reaped and the full process group is confirmed absent.
+in-progress startup cannot publish or spawn after cancellation. A short native
+launch gate linearizes epoch capture, spawn plus emergency process-group
+publication, cancellation advance, and running-state publication. It is not
+held during source verification or readiness polling, and the global sidecar
+state mutex is also released across those operations. Stop waits a bounded time
+for a cancelled local startup to retain or release ownership. State-lock
+acquisition is time-bounded, and no failure path performs an unbounded
+`Child::wait`. An unexpected TERM, KILL, child-wait, or group-inspection failure,
+including `try_wait` failure during status or restart inspection, moves the
+manager to `cleanup_pending`; it retains `Child`, process-group ID, private
+directory, executable FD, and listener, blocks another start, and lets explicit
+stop retry cleanup. Resources are dropped only after the child is reaped and
+the full process group is confirmed absent.
 
 The exit hook first updates atomically shared cancellation and process-group
 state, so it can issue TERM and KILL even while the manager mutex is busy. It

@@ -568,9 +568,7 @@ def test_rejects_removed_terminal_bench_modules_in_core_wheel(tmp_path: Path) ->
 
     errors = checker.validate_wheel(wheel, expected_version="0.1.0")
 
-    boundary_error = next(
-        error for error in errors if "removed Terminal Bench modules" in error
-    )
+    boundary_error = next(error for error in errors if "removed Terminal Bench modules" in error)
     assert all(path in boundary_error for path in legacy_modules)
 
 
@@ -587,8 +585,7 @@ def test_rejects_removed_terminal_bench_modules_in_nested_core_wheel(
     errors = checker.validate_wheel(wheel, expected_version="0.1.0")
 
     assert any(
-        "openevo/wheels/openevo-0.1.0-py3-none-any.whl" in error
-        and legacy_path in error
+        "openevo/wheels/openevo-0.1.0-py3-none-any.whl" in error and legacy_path in error
         for error in errors
     )
 
