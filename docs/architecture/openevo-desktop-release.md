@@ -121,6 +121,40 @@ arguments, inherited listener, and instance channel remain native-host owned.
 Debug-only override and source-launcher code is absent under production cfg;
 the Desktop workflow compiles, lints, and tests both debug and release cfg.
 
+### Workspace import store trust boundary
+
+The private workspace import store uses a store authentication key that is a
+separate raw 256-bit file in the root's parent directory. The key is not stored
+in the root marker, archive xattr, or self-describing import metadata. A
+domain-separated HMAC authenticates the durable parent/root binding marker and
+each import's exact reference, ownership/idempotency fields, directory,
+archive, and metadata inode identities, and archive generation token. Legacy
+unauthenticated markers or
+metadata are not adopted. A missing key for existing state, an invalid MAC, or
+a replaced key that no longer authenticates the state fails closed.
+
+Each process retains no-follow descriptors for the key, parent, and root and
+checks their inode/path bindings at every locked operation. Ingest reopens and
+verifies the actual archive and authenticated metadata after both files and the
+directory have been fsynced, immediately before atomic no-replace publication,
+and again after publication before returning the reference. Resolve copies to
+an inode-bound private snapshot, reopens and hashes that snapshot, unlinks the
+verified pathname, then hashes the unlinked read-only descriptor again before
+yielding it. These checks close the previously identified replacement and
+equal-length rewrite windows at the store's verification boundaries.
+
+This is not an OS isolation boundary against an arbitrary process running as
+the same UID. Such a process can read the durable authentication key and can
+write an already-open regular-file inode despite mode `0600`; no portable file
+permission or HMAC construction can prevent that. During one sidecar process
+lifetime, held descriptors provide replacement detection at operation
+boundaries, not protection from a hostile same-UID writer between the final
+check and consumption. Across an offline/restart boundary, replacement of the
+root, marker, or xattr is detected only while the separate authentication key
+remains uncompromised; an attacker that also reads/replaces that key can forge
+the store. Stronger same-UID isolation requires a platform credential boundary
+such as a separately entitled key service and is outside this store module.
+
 The child starts in its own process group. Explicit stop, startup failure,
 restart cleanup, and Tauri `ExitRequested`/`Exit` handling signal the complete
 group with TERM, poll for a fixed interval, escalate to KILL, and poll for a

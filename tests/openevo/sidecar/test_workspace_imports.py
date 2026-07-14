@@ -681,6 +681,79 @@ def test_fault_after_publish_preserves_complete_recoverable_import(
     assert len(list(root.iterdir())) == 1
 
 
+@pytest.mark.parametrize("target", ["archive", "metadata"])
+def test_ingest_revalidates_persisted_files_immediately_before_publish(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    target: str,
+) -> None:
+    root = tmp_path / "imports"
+    store = WorkspaceImportStore(root)
+
+    def rewrite_persisted_file(*_args: object) -> None:
+        temporary = next(root.iterdir())
+        path = temporary / (
+            workspace_imports_module._ARCHIVE_NAME
+            if target == "archive"
+            else workspace_imports_module._METADATA_NAME
+        )
+        with path.open("r+b", buffering=0) as stream:
+            if target == "archive":
+                stream.seek(BLOCK)
+                stream.write(b"X")
+            else:
+                raw = stream.read()
+                offset = raw.index(b"project-test")
+                os.pwrite(stream.fileno(), b"project-best", offset)
+            stream.flush()
+            os.fsync(stream.fileno())
+
+    monkeypatch.setattr(
+        workspace_imports_module,
+        "_before_import_publish",
+        rewrite_persisted_file,
+    )
+    with pytest.raises(WorkspaceImportIntegrityError, match="digest|authentication"):
+        _ingest(store, tmp_path, _simple_archive())
+    assert list(root.iterdir()) == []
+
+
+@pytest.mark.parametrize("target", ["archive", "metadata"])
+def test_ingest_revalidates_persisted_files_after_atomic_publish(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    target: str,
+) -> None:
+    root = tmp_path / "imports"
+    store = WorkspaceImportStore(root)
+
+    def rewrite_published_file(_root_descriptor: int, import_id: str) -> None:
+        path = root / import_id / (
+            workspace_imports_module._ARCHIVE_NAME
+            if target == "archive"
+            else workspace_imports_module._METADATA_NAME
+        )
+        with path.open("r+b", buffering=0) as stream:
+            if target == "archive":
+                stream.seek(BLOCK)
+                stream.write(b"X")
+            else:
+                raw = stream.read()
+                offset = raw.index(b"project-test")
+                os.pwrite(stream.fileno(), b"project-best", offset)
+            stream.flush()
+            os.fsync(stream.fileno())
+
+    monkeypatch.setattr(
+        workspace_imports_module,
+        "_after_import_publish",
+        rewrite_published_file,
+    )
+    with pytest.raises(WorkspaceImportIntegrityError, match="digest|authentication"):
+        _ingest(store, tmp_path, _simple_archive())
+    assert list(root.iterdir()) == []
+
+
 def test_atomic_publish_failure_does_not_leave_temp(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -770,6 +843,31 @@ def test_resolve_detects_mutation_during_rehash(
     with pytest.raises(WorkspaceImportIntegrityError, match="changed"):
         with store.resolve(import_ref, ownership=_ownership(import_ref)):
             pass
+
+
+def test_resolve_rejects_equal_length_pwrite_to_snapshot_during_copy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "imports"
+    archive = _simple_archive(b"x" * (2 * 1024 * 1024))
+    store = WorkspaceImportStore(root)
+    import_ref = _ingest(store, tmp_path, archive)
+    real_write_all = workspace_imports_module._write_all
+    changed = False
+
+    def rewrite_written_snapshot(descriptor: int, data: bytes | memoryview) -> None:
+        nonlocal changed
+        real_write_all(descriptor, data)
+        if not changed and len(data) >= BLOCK + 1:
+            os.pwrite(descriptor, b"Y", BLOCK)
+            changed = True
+
+    monkeypatch.setattr(workspace_imports_module, "_write_all", rewrite_written_snapshot)
+    with pytest.raises(WorkspaceImportIntegrityError, match="snapshot.*digest"):
+        with store.resolve(import_ref, ownership=_ownership(import_ref)):
+            pass
+    assert changed
 
 
 def test_release_and_delete_require_exact_ref_and_remove_import(tmp_path: Path) -> None:
@@ -1006,6 +1104,51 @@ def test_root_identity_rejects_live_and_restart_path_replacement(tmp_path: Path)
     assert original.is_dir()
 
 
+def test_restart_rejects_forged_root_marker_and_xattr_after_offline_replacement(
+    tmp_path: Path,
+) -> None:
+    parent = tmp_path / "state"
+    root = parent / "imports"
+    parent.mkdir(mode=0o700)
+    store = WorkspaceImportStore(root)
+    _ingest(store, tmp_path, _simple_archive())
+    store.close()
+
+    marker_path = next(
+        path
+        for path in parent.iterdir()
+        if path.name.startswith(workspace_imports_module._ROOT_MARKER_PREFIX)
+        and path.name.endswith(".json")
+    )
+    marker = json.loads(marker_path.read_text(encoding="ascii"))
+    original = parent / "original-imports"
+    root.rename(original)
+    root.mkdir(mode=0o700)
+    root_status = root.stat()
+    marker["root_identity"] = {
+        "device": root_status.st_dev,
+        "inode": root_status.st_ino,
+    }
+    marker_path.write_text(
+        json.dumps(marker, ensure_ascii=True, separators=(",", ":"), sort_keys=True),
+        encoding="ascii",
+    )
+    os.chmod(marker_path, 0o600)
+    os.setxattr(
+        root,
+        workspace_imports_module._ROOT_TOKEN_XATTR,
+        bytes.fromhex(marker["store_token"]),
+    )
+
+    with pytest.raises(
+        WorkspaceImportStoreConfigurationError,
+        match="authentication",
+    ):
+        WorkspaceImportStore(root)
+    assert original.is_dir()
+    assert list(root.iterdir()) == []
+
+
 def test_ancestor_replacement_and_symlinked_ancestor_fail_closed(tmp_path: Path) -> None:
     parent = tmp_path / "state"
     root = parent / "imports"
@@ -1092,6 +1235,43 @@ def test_ownership_is_atomic_idempotent_and_project_scoped(tmp_path: Path) -> No
     store.release(first, ownership=owner)
     with store.resolve(independent, ownership=independent_owner) as stream:
         assert stream.read() == archive
+
+
+def test_canonical_metadata_rewrite_cannot_forge_ownership(tmp_path: Path) -> None:
+    root = tmp_path / "imports"
+    store = WorkspaceImportStore(root)
+    original_owner = WorkspaceImportOwnership(
+        project_id="project-a",
+        operation_id="workspace-sync-operation-a",
+        idempotency_key="workspace-sync-idempotency-a",
+    )
+    import_ref = _ingest(
+        store,
+        tmp_path,
+        _simple_archive(),
+        ownership=original_owner,
+    )
+    metadata_path = _stored_directory(root, import_ref) / "metadata.json"
+    metadata = json.loads(metadata_path.read_text(encoding="ascii"))
+    forged_owner = WorkspaceImportOwnership(
+        project_id="project-b",
+        operation_id="workspace-sync-operation-b",
+        idempotency_key="workspace-sync-idempotency-b",
+    )
+    metadata["ownership"] = {
+        "idempotency_key": forged_owner.idempotency_key,
+        "operation_id": forged_owner.operation_id,
+        "project_id": forged_owner.project_id,
+    }
+    metadata_path.write_text(
+        json.dumps(metadata, ensure_ascii=True, separators=(",", ":"), sort_keys=True),
+        encoding="ascii",
+    )
+    os.chmod(metadata_path, 0o600)
+
+    with pytest.raises(WorkspaceImportIntegrityError, match="authentication"):
+        with store.resolve(import_ref, ownership=forged_owner):
+            pass
 
 
 def test_publish_crash_is_reclaimed_by_exact_ownership_retry(
