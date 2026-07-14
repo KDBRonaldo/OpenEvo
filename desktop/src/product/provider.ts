@@ -127,6 +127,7 @@ export class ProductRefreshOrder {
 
 export interface ProjectSourceSelectionIntent extends ProductMutationIntent {
   readonly kind: "native_folder_snapshot";
+  readonly projectId?: string;
 }
 
 export interface DesktopProductProvider {

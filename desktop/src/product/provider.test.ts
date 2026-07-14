@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { FetchLike } from "../api/v1/client";
 import { CONTRACT_FIXTURE_V1 } from "../api/v1/fixtures";
 import {
@@ -10,7 +10,15 @@ import {
 import { DESKTOP_PRODUCT_RELEASE_CONTRACT } from "./releaseContract";
 import { createReleaseDesktopProductProvider } from "./releaseProvider";
 
+const invokeMock = vi.hoisted(() => vi.fn());
+
+vi.mock("@tauri-apps/api/core", () => ({ invoke: invokeMock }));
+
 describe("Desktop product provider boundary", () => {
+  beforeEach(() => {
+    invokeMock.mockReset();
+  });
+
   it("requires checked-in release digests and the native provider", () => {
     expect(() => defineDesktopProductReleaseContract({
       acceptedOpenApiDigests: [],
@@ -77,6 +85,59 @@ describe("Desktop product provider boundary", () => {
       },
     });
     expect(provider.providerKind).toBe("desktop_sidecar");
+  });
+
+  it("passes an existing project ID to the Tauri picker and omits it for a new project", async () => {
+    const digest = DESKTOP_PRODUCT_RELEASE_CONTRACT.acceptedOpenApiDigests[0];
+    const flags = [...DESKTOP_PRODUCT_RELEASE_CONTRACT.requiredFeatureFlags];
+    const source = {
+      kind: "native_folder_snapshot",
+      display_name: "Native source",
+      import_ref: {
+        import_id: "source-opaque-bridge",
+        content_sha256: "b".repeat(64),
+        byte_size: 1024,
+        entry_count: 1,
+        extracted_byte_size: 12,
+      },
+    };
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === "start_sidecar") return releaseBootstrap(digest, flags);
+      if (command === "select_project_source") return source;
+      throw new Error(`Unexpected Tauri command: ${command}`);
+    });
+
+    await createReleaseDesktopProductProvider({
+      fetch: vi.fn<FetchLike>().mockResolvedValue(jsonResponse(releaseVersion(digest, flags))),
+      adapterFactory: async ({ native }) => {
+        await native.selectProjectSource({
+          kind: "native_folder_snapshot",
+          projectId: "project-existing-1",
+          actionId: "source-action-existing",
+          streamEpoch: 7,
+        });
+        await native.selectProjectSource({
+          kind: "native_folder_snapshot",
+          actionId: "source-action-new",
+          streamEpoch: 7,
+        });
+        return unavailableDesktopProductProvider;
+      },
+    });
+
+    const selectionCalls = invokeMock.mock.calls.filter(([command]) => command === "select_project_source");
+    expect(selectionCalls).toEqual([
+      ["select_project_source", {
+        kind: "native_folder_snapshot",
+        actionId: "source-action-existing",
+        projectId: "project-existing-1",
+      }],
+      ["select_project_source", {
+        kind: "native_folder_snapshot",
+        actionId: "source-action-new",
+      }],
+    ]);
+    expect(selectionCalls[1]?.[1]).not.toHaveProperty("projectId");
   });
 
   it("rejects simulator bootstrap and missing release features without constructing an adapter", async () => {

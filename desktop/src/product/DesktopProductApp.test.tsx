@@ -3,6 +3,7 @@
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { ProjectSourceV1 } from "../api/v1/schemas";
 import { DesktopProductApp } from "./DesktopProductApp";
 import { createFixtureDesktopProductProvider, type FixtureDesktopProductProvider } from "./fixtureProvider";
 
@@ -624,10 +625,12 @@ describe("DesktopProductApp", () => {
 
   it("selects and syncs a native folder through opaque source references", async () => {
     provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
+    const selectSource = vi.spyOn(provider, "selectProjectSource");
     root = await renderProduct(provider);
 
     await clickAria("Project settings");
     await clickButton("Folder snapshot");
+    expect(selectSource).toHaveBeenCalledWith(expect.objectContaining({ projectId: "project-fixture-1" }));
     expect(screenText()).toContain("Selected research folder");
     expect(document.querySelector('input[type="file"]')).toBeNull();
     await clickButton("Save");
@@ -642,6 +645,99 @@ describe("DesktopProductApp", () => {
       display_name: "Selected research folder",
       import_ref: { import_id: "source-fixture-1" },
     });
+  });
+
+  it("keeps the source and dirty state when the native picker is cancelled", async () => {
+    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
+    const selectSource = vi.spyOn(provider, "selectProjectSource");
+    selectSource.mockRejectedValueOnce({
+      code: "workspace_selection_cancelled",
+      message: "No research folder was selected.",
+    });
+    root = await renderProduct(provider);
+
+    await clickAria("Project settings");
+    setInput("Objective", "Keep this dirty draft after cancellation.");
+    expect(button("Save").disabled).toBe(false);
+    await clickButton("Folder snapshot");
+
+    expect(screenText()).toContain("New workspace");
+    expect(screenText()).toContain("Keep this dirty draft after cancellation.");
+    expect(document.querySelector(".form-error")).toBeNull();
+    expect(button("Save").disabled).toBe(false);
+
+    selectSource.mockRejectedValueOnce({
+      code: "workspace_selection_invalid",
+      message: "workspace_selection_cancelled",
+    });
+    await clickButton("Folder snapshot");
+    expect(document.querySelector(".form-error")?.textContent).toBe("The request could not be completed.");
+  });
+
+  it("allows only one native picker request while selection is in flight", async () => {
+    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
+    const initialSource = await provider.selectProjectSource({
+      kind: "native_folder_snapshot",
+      projectId: "project-fixture-1",
+      actionId: "source-test-seed",
+      streamEpoch: 1,
+    });
+    root = await renderProduct(provider);
+    await clickAria("Project settings");
+    await clickButton("Folder snapshot");
+    await clickButton("Save");
+    await clickAria("Project settings");
+    setInput("Objective", "Keep controls locked during selection.");
+
+    const pending = deferred<ProjectSourceV1>();
+    const selectSource = vi.spyOn(provider, "selectProjectSource").mockImplementation(() => pending.promise);
+    const folderButton = button("Folder snapshot");
+    await act(async () => {
+      folderButton.click();
+      folderButton.click();
+      await Promise.resolve();
+    });
+
+    expect(selectSource).toHaveBeenCalledTimes(1);
+    expect(button("Scratch").disabled).toBe(true);
+    expect(folderButton.disabled).toBe(true);
+    expect(button("Save").disabled).toBe(true);
+    expect(button("Sync snapshot").disabled).toBe(true);
+    expect(button("Undo").disabled).toBe(true);
+
+    await act(async () => pending.resolve({ ...initialSource, display_name: "Replacement research folder" }));
+    await flush();
+    expect(screenText()).toContain("Replacement research folder");
+    expect(button("Save").disabled).toBe(false);
+  });
+
+  it("ignores a picker completion after a close request and a later selection wins", async () => {
+    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
+    const first = deferred<ProjectSourceV1>();
+    const selected = await provider.selectProjectSource({
+      kind: "native_folder_snapshot",
+      projectId: "project-fixture-1",
+      actionId: "source-test-stale",
+      streamEpoch: 1,
+    });
+    const selectSource = vi.spyOn(provider, "selectProjectSource")
+      .mockImplementationOnce(() => first.promise)
+      .mockResolvedValueOnce({ ...selected, display_name: "Current research folder" });
+    root = await renderProduct(provider);
+
+    await clickAria("Project settings");
+    setInput("Objective", "Keep editing after invalidating the first picker.");
+    await clickButton("Folder snapshot");
+    await clickAria("Close settings");
+    expect(screenText()).toContain("Discard unsaved changes?");
+    await act(async () => first.resolve({ ...selected, display_name: "Stale research folder" }));
+    await flush();
+    expect(screenText()).not.toContain("Stale research folder");
+
+    await clickButton("Keep editing");
+    await clickButton("Folder snapshot");
+    expect(screenText()).toContain("Current research folder");
+    expect(selectSource).toHaveBeenCalledTimes(2);
   });
 
   it("keeps dirty drawer drafts until Escape, overlay, or close is confirmed", async () => {
@@ -789,4 +885,18 @@ function labelledControl<T extends HTMLElement>(text: string, selector: string):
 
 function screenText(): string {
   return document.body.textContent ?? "";
+}
+
+function deferred<T>(): {
+  readonly promise: Promise<T>;
+  readonly resolve: (value: T) => void;
+  readonly reject: (reason?: unknown) => void;
+} {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
 }

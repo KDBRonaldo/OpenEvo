@@ -44,7 +44,11 @@ export interface ReleaseProviderFactoryDependencies {
 
 const tauriNativeBridge: ReleaseNativeBridge = {
   bootstrap: () => invoke<DesktopBootstrapContextV1>("start_sidecar"),
-  selectProjectSource: (intent) => invoke("select_project_source", { kind: intent.kind, actionId: intent.actionId }),
+  selectProjectSource: (intent) => invoke("select_project_source", {
+    kind: intent.kind,
+    actionId: intent.actionId,
+    ...(intent.projectId === undefined ? {} : { projectId: intent.projectId }),
+  }),
   configureCredential: (profileId, slotKind, etag, actionId) => invoke("configure_credential", {
     profileId,
     slotKind,

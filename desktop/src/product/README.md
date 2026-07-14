@@ -21,12 +21,15 @@ raw paths, and secret values are not accepted.
 
 The release adapter deliberately has no fallback for those native calls. The
 Rust host implements `select_project_source` with the operating-system folder
-picker. It canonicalizes the selected directory, sends the path only over an
-authenticated private loopback route to the process-owned sidecar, and returns
-only a validated opaque workspace-import reference to the renderer. The path is
-never part of the renderer DTO or the public Desktop Local API. The remaining
-`configure_credential` command is still a required release integration
-dependency; the provider continues to fail closed until it is implemented.
+picker. It canonicalizes the selected directory, records its device and inode,
+and sends the path plus that identity only through the authenticated private
+loopback route to the process-owned sidecar. The sidecar reopens the
+identity-bound directory with no-follow traversal and builds the canonical
+archive before returning a validated opaque workspace-import reference. Only
+that opaque reference enters the renderer DTO or public Desktop Local API. The
+remaining `configure_credential` command is still a required release
+integration dependency; the provider continues to fail closed until it is
+implemented.
 
 The remaining bootstrap-retry integration point is `App.tsx`. It currently
 replaces a failed `createReleaseDesktopProductProvider` call with the unavailable
