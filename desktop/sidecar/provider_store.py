@@ -72,6 +72,10 @@ MAX_SCHEMA_OBJECTS = 40
 MAX_SCHEMA_BYTES = 98_304
 STARTUP_OPERATION_BATCH_ROWS = 128
 MAX_STARTUP_OPERATION_ROW_BYTES = MAX_DOCUMENT_BYTES + 16_384
+# RemoteProjectStateV1 is a closed, scalar-heavy projection rather than a general
+# provider document. Keep both one observation and the recovered history small.
+MAX_REMOTE_PROJECT_STATE_BYTES = 262_144
+MAX_REMOTE_PROJECT_STATE_RECOVERY_BYTES = 16_777_216
 # Profile reservations always have empty progress/checks; this bounds their largest
 # success, cancellation, or bounded ApiErrorV1 terminal document with ample margin.
 PROFILE_RUNTIME_TERMINAL_SLOT_BYTES = 1_048_576
@@ -472,7 +476,7 @@ _SCHEMA_V3 = (
     ) STRICT
     """,
     _SCHEMA_V2[1],
-    """
+    f"""
     CREATE TABLE projects (
         project_id TEXT PRIMARY KEY,
         profile_id TEXT NOT NULL,
@@ -487,7 +491,7 @@ _SCHEMA_V3 = (
         FOREIGN KEY (profile_id) REFERENCES remote_profiles(profile_id) ON DELETE RESTRICT,
         CHECK (
             remote_state_json IS NULL OR
-            length(remote_state_json) <= 136314880
+            length(remote_state_json) <= {MAX_REMOTE_PROJECT_STATE_BYTES}
         )
     ) STRICT
     """,
@@ -669,6 +673,7 @@ class ProviderMutation:
                 raise ContractValidationError(
                     "project activation requires a ready remote project state"
                 )
+            remote_state_bytes = self._store._encode_remote_project_state(validated_remote)
             self._store._require_project_operation_reservation_available(
                 self._connection,
                 project_id,
@@ -693,7 +698,7 @@ class ProviderMutation:
                 """,
                 (
                     active_revision.id,
-                    _canonical_json_bytes(validated_remote.model_dump(mode="json")),
+                    remote_state_bytes,
                     self._store._timestamp(),
                     project_id,
                 ),
@@ -1571,6 +1576,7 @@ class DesktopProviderStore:
         try:
             connection.execute("BEGIN EXCLUSIVE")
             self._validate_schema(connection)
+            self._validate_remote_state_recovery_budget(connection)
             integrity = connection.execute("PRAGMA integrity_check(1)").fetchall()
             if [tuple(row) for row in integrity] != [("ok",)]:
                 raise ProviderDataCorruptionError("provider SQLite integrity check failed")
@@ -1580,8 +1586,13 @@ class DesktopProviderStore:
             self._validate_migration_rows(connection)
             for row in connection.execute("SELECT * FROM remote_profiles"):
                 self._validate_profile_recovery_row(cast(sqlite3.Row, row))
-            for row in connection.execute("SELECT * FROM projects"):
-                self._validate_project_recovery_row(cast(sqlite3.Row, row))
+            for identity_row in connection.execute(
+                "SELECT project_id FROM projects ORDER BY project_id"
+            ):
+                project_id = cast(str, identity_row["project_id"])
+                self._validate_project_recovery_row(
+                    self._require_project_row(connection, project_id)
+                )
             for row in connection.execute("SELECT * FROM local_operations"):
                 self._validate_operation_recovery_row(cast(sqlite3.Row, row))
             for row in connection.execute("SELECT * FROM idempotency_records"):
@@ -1641,7 +1652,7 @@ class DesktopProviderStore:
             (
                 "projects",
                 "project_id, profile_id, name, document_json, state, "
-                "current_revision_id, remote_state_json, created_at, updated_at",
+                "current_revision_id, created_at, updated_at",
             ),
             (
                 "idempotency_records",
@@ -1677,7 +1688,31 @@ class DesktopProviderStore:
         if total_rows > MAX_RECOVERY_ROWS or total_bytes > MAX_RECOVERY_BYTES:
             raise ProviderDataCorruptionError("provider recovery budget exceeded")
 
+    @staticmethod
+    def _remote_state_recovery_usage(connection: sqlite3.Connection) -> tuple[int, int]:
+        maximum_bytes, total_bytes = connection.execute(
+            """
+            SELECT coalesce(max(length(CAST(remote_state_json AS BLOB))), 0),
+                   coalesce(sum(length(CAST(remote_state_json AS BLOB))), 0)
+            FROM projects
+            WHERE remote_state_json IS NOT NULL
+            """
+        ).fetchone()
+        if type(maximum_bytes) is not int or type(total_bytes) is not int:
+            raise ProviderDataCorruptionError("remote project state recovery usage is invalid")
+        return maximum_bytes, total_bytes
+
+    @classmethod
+    def _validate_remote_state_recovery_budget(cls, connection: sqlite3.Connection) -> None:
+        maximum_bytes, total_bytes = cls._remote_state_recovery_usage(connection)
+        if (
+            maximum_bytes > MAX_REMOTE_PROJECT_STATE_BYTES
+            or total_bytes > MAX_REMOTE_PROJECT_STATE_RECOVERY_BYTES
+        ):
+            raise ProviderDataCorruptionError("remote project state recovery budget exceeded")
+
     def _validate_write_budget(self, connection: sqlite3.Connection) -> None:
+        self._validate_remote_state_recovery_budget(connection)
         total_rows, total_bytes = self._recovery_usage(connection)
         profile_reservations, project_reservations = self._validate_live_action_authorities(
             connection
@@ -1836,6 +1871,13 @@ class DesktopProviderStore:
                 "project activation requires a matching ready remote project state"
             )
         cls._validate_resource_id(remote_state.active_revision.id)
+
+    @staticmethod
+    def _encode_remote_project_state(remote_state: RemoteProjectStateV1) -> bytes:
+        encoded = _canonical_json_bytes(remote_state.model_dump(mode="json"))
+        if len(encoded) > MAX_REMOTE_PROJECT_STATE_BYTES:
+            raise ContractValidationError("remote project state exceeds its byte bound")
+        return encoded
 
     def _validate_operation_recovery_row(self, row: sqlite3.Row) -> None:
         operation = self._operation_from_row(row)
@@ -2133,17 +2175,19 @@ class DesktopProviderStore:
         """Return the bounded persisted source set used for private-store recovery."""
 
         with self._transaction(write=False) as connection:
-            rows = connection.execute(
-                "SELECT * FROM projects ORDER BY project_id ASC LIMIT ?",
+            identity_rows = connection.execute(
+                "SELECT project_id FROM projects ORDER BY project_id ASC LIMIT ?",
                 (MAX_RECOVERY_ROWS + 1,),
             ).fetchall()
-            if len(rows) > MAX_RECOVERY_ROWS:
+            if len(identity_rows) > MAX_RECOVERY_ROWS:
                 raise ProviderDataCorruptionError(
                     "project recovery row count exceeds the startup limit"
                 )
             sources = []
-            for row in rows:
-                project = self._project_from_row(row)
+            for identity_row in identity_rows:
+                project = self._project_from_row(
+                    self._require_project_row(connection, cast(str, identity_row["project_id"]))
+                )
                 if project.source.kind == "native_folder_snapshot":
                     sources.append((project.project_id, project.source))
             return tuple(sources)
@@ -2193,6 +2237,8 @@ class DesktopProviderStore:
             row = self._require_project_row(connection, project_id)
             self._require_etag("project", project_id, row, if_match)
             self._require_project_not_busy(connection, project_id)
+            if row["state"] == "active":
+                self._require_active_project_activation_authority_available(connection, project_id)
             current = _decode_json_object(bytes(row["document_json"]), label="project")
             current.update(validated_patch.model_dump(mode="json", exclude_unset=True))
             validated = _validate_json_model(ProjectCreateV1, current)
@@ -3583,13 +3629,27 @@ class DesktopProviderStore:
         return cast(sqlite3.Row, row)
 
     @staticmethod
-    def _require_project_row(connection: sqlite3.Connection, project_id: str) -> sqlite3.Row:
+    def _project_select_columns() -> str:
+        return (
+            "project_id, profile_id, name, document_json, state, current_revision_id, "
+            "CASE WHEN remote_state_json IS NULL OR "
+            f"length(CAST(remote_state_json AS BLOB)) <= {MAX_REMOTE_PROJECT_STATE_BYTES} "
+            "THEN remote_state_json ELSE NULL END AS remote_state_json, "
+            "length(CAST(remote_state_json AS BLOB)) AS remote_state_bytes, "
+            "resource_version, created_at, updated_at"
+        )
+
+    @classmethod
+    def _require_project_row(cls, connection: sqlite3.Connection, project_id: str) -> sqlite3.Row:
         row = connection.execute(
-            "SELECT * FROM projects WHERE project_id = ?", (project_id,)
+            f"SELECT {cls._project_select_columns()} FROM projects WHERE project_id = ?",
+            (project_id,),
         ).fetchone()
         if row is None:
             raise ResourceNotFoundError("project", project_id)
-        return cast(sqlite3.Row, row)
+        guarded = cast(sqlite3.Row, row)
+        cls._validate_remote_state_cell(guarded)
+        return guarded
 
     @staticmethod
     def _require_project_not_busy(
@@ -3679,22 +3739,35 @@ class DesktopProviderStore:
             return
 
         if project["state"] == "active":
-            displacing_activation = connection.execute(
-                """
-                SELECT operation_id
-                FROM local_operations
-                WHERE operation_kind = 'project_activate'
-                  AND resource_type = 'project'
-                  AND resource_id != ?
-                  AND state IN ('queued', 'running', 'cancelling')
-                  AND operation_id != ?
-                ORDER BY operation_id
-                LIMIT 1
-                """,
-                (project_id, excluded_operation_id or ""),
-            ).fetchone()
-            if displacing_activation is not None:
-                raise ResourceInUseError("project", project_id)
+            cls._require_active_project_activation_authority_available(
+                connection,
+                project_id,
+                excluded_operation_id=excluded_operation_id,
+            )
+
+    @staticmethod
+    def _require_active_project_activation_authority_available(
+        connection: sqlite3.Connection,
+        project_id: str,
+        *,
+        excluded_operation_id: str | None = None,
+    ) -> None:
+        displacing_activation = connection.execute(
+            """
+            SELECT operation_id
+            FROM local_operations
+            WHERE operation_kind = 'project_activate'
+              AND resource_type = 'project'
+              AND resource_id != ?
+              AND state IN ('queued', 'running', 'cancelling')
+              AND operation_id != ?
+            ORDER BY operation_id
+            LIMIT 1
+            """,
+            (project_id, excluded_operation_id or ""),
+        ).fetchone()
+        if displacing_activation is not None:
+            raise ResourceInUseError("project", project_id)
 
     @staticmethod
     def _require_operation_row(connection: sqlite3.Connection, operation_id: str) -> sqlite3.Row:
@@ -3783,6 +3856,27 @@ class DesktopProviderStore:
             "updated_at": row["updated_at"],
         }
         return _validate_json_model(ProjectV1, payload)
+
+    @staticmethod
+    def _validate_remote_state_cell(row: sqlite3.Row) -> None:
+        remote_state_bytes = row["remote_state_bytes"]
+        remote_state_raw = row["remote_state_json"]
+        if remote_state_bytes is None:
+            if remote_state_raw is not None:
+                raise ProviderDataCorruptionError(
+                    "stored remote project state has an invalid byte length"
+                )
+            return
+        if (
+            type(remote_state_bytes) is not int
+            or remote_state_bytes < 1
+            or remote_state_bytes > MAX_REMOTE_PROJECT_STATE_BYTES
+        ):
+            raise ProviderDataCorruptionError("stored remote project state exceeds its byte bound")
+        if type(remote_state_raw) is not bytes or len(remote_state_raw) != remote_state_bytes:
+            raise ProviderDataCorruptionError(
+                "stored remote project state changed during guarded read"
+            )
 
     def _operation_from_row(self, row: sqlite3.Row) -> LocalOperationV1:
         document = _decode_json_object(bytes(row["document_json"]), label="operation")
@@ -4222,11 +4316,15 @@ class DesktopProviderStore:
                 parameters.extend((anchor_value, anchor_value, anchor_id))
             where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
             parameters.append(limit + 1)
+            selected_columns = self._project_select_columns() if table == "projects" else "*"
             fetched = connection.execute(
-                f"SELECT * FROM {table}{where} "
+                f"SELECT {selected_columns} FROM {table}{where} "
                 f"ORDER BY {sort_column} {sql_direction}, {id_column} {sql_direction} LIMIT ?",
                 tuple(parameters),
             ).fetchall()
+            if table == "projects":
+                for row in fetched:
+                    self._validate_remote_state_cell(cast(sqlite3.Row, row))
         has_more = len(fetched) > limit
         rows = list(fetched[:limit])
         next_cursor = None

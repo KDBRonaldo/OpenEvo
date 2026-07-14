@@ -269,17 +269,24 @@ reserved, it symmetrically excludes new work on the active project and any
 competing activation. The store checks the same exclusion again in the atomic
 activation completion transaction, excluding only that activation's own
 reservation, so an authority conflict cannot be hidden by an earlier start-time
-ETag check. Activation success requires a complete ready
-`RemoteProjectStateV1` and atomically records the active project, its matching
-Core revision, the canonical remote projection, the terminal operation, and its
-idempotency replay. Other project operations cannot publish remote state or
-invent a project result. The remote projection is a durable observation carrying
+ETag check. Project intent patch uses that same global activation-authority
+check: while another project's queued/running/cancelling activation owns the
+replacement of the current active project, patch cannot demote that active
+project or clear its revision/remote projection. Activation success requires a
+complete ready `RemoteProjectStateV1` and atomically records the active project,
+its matching Core revision, the canonical remote projection, the terminal
+operation, and its idempotency replay. Other project operations cannot publish
+remote state or invent a project result. The remote projection is a durable observation carrying
 Core's `observed_at`, not proof that the SSH tunnel or Core remains live. Startup
 therefore preserves it as history while resetting local active/current-revision
 runtime authority under the existing recovery rule. Ordinary demote/archive
 transitions also preserve that observation, while any project intent patch
 clears both the remote projection and revision because they describe the
-previous intent.
+previous intent. This closed projection has a separate 256 KiB per-row limit and
+16 MiB aggregate recovery limit. Startup measures both from SQLite length
+metadata before reading or parsing a projection, and project reads use a bounded
+guarded column projection rather than `SELECT *`. Oversized state fails before
+JSON decoding, and bounded noncanonical state fails during strict decoding.
 
 Project intent remains editable after activation so the UI can activate once to
 obtain remote capabilities, edit evolution configuration, and activate again.

@@ -614,6 +614,20 @@ def test_migrates_a_canonical_v2_store_to_v3(tmp_path: Path) -> None:
             ("project-v2",),
         ).fetchone()
     ) == (None, 2)
+    schema_sql = cast(
+        str,
+        store._connection.execute(
+            "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'projects'"
+        ).fetchone()[0],
+    )
+    assert (
+        f"length(remote_state_json) <= {provider_store_module.MAX_REMOTE_PROJECT_STATE_BYTES}"
+    ) in schema_sql
+    with pytest.raises(sqlite3.IntegrityError):
+        store._connection.execute(
+            "UPDATE projects SET remote_state_json = zeroblob(?) WHERE project_id = ?",
+            (provider_store_module.MAX_REMOTE_PROJECT_STATE_BYTES + 1, "project-v2"),
+        )
 
 
 def test_v2_migration_rejects_a_noncanonical_ledger(tmp_path: Path) -> None:
@@ -962,6 +976,80 @@ def test_remote_project_projection_recovery_fails_closed(tmp_path: Path, corrupt
         DesktopProviderStore(root)
 
 
+@pytest.mark.parametrize("budget", ["per_row", "aggregate"])
+def test_remote_project_projection_budget_rejects_before_payload_read_or_parse(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    budget: str,
+) -> None:
+    root = tmp_path / "state"
+    store = DesktopProviderStore(root)
+    profile = _create_profile(store)
+    first = store.create_project(
+        _project(profile.profile_id, name="First"),
+        idempotency_key=f"remote-budget-{budget}-first",
+    )
+    if budget == "aggregate":
+        second = store.create_project(
+            _project(profile.profile_id, name="Second"),
+            idempotency_key="remote-budget-aggregate-second",
+        )
+        _activate_project(store, first, key="remote-budget-aggregate-first-activate")
+        _activate_project(store, second, key="remote-budget-aggregate-second-activate")
+    store.close()
+
+    if budget == "per_row":
+        with sqlite3.connect(root / "provider.sqlite3") as connection:
+            connection.execute("PRAGMA ignore_check_constraints = ON")
+            connection.execute(
+                "UPDATE projects SET remote_state_json = zeroblob(?) WHERE project_id = ?",
+                (provider_store_module.MAX_REMOTE_PROJECT_STATE_BYTES + 1, first.project_id),
+            )
+    else:
+        with sqlite3.connect(root / "provider.sqlite3") as connection:
+            total_bytes = cast(
+                int,
+                connection.execute(
+                    "SELECT sum(length(remote_state_json)) FROM projects"
+                ).fetchone()[0],
+            )
+        monkeypatch.setattr(
+            provider_store_module,
+            "MAX_REMOTE_PROJECT_STATE_RECOVERY_BYTES",
+            total_bytes - 1,
+        )
+
+    statements: list[str] = []
+    original_connect = sqlite3.connect
+
+    class ProbeConnection(sqlite3.Connection):
+        def execute(self, sql: str, parameters=()):
+            normalized = " ".join(sql.lower().split())
+            if normalized.startswith("select"):
+                statements.append(normalized)
+            return super().execute(sql, parameters)
+
+    def connect(*args, **kwargs):
+        kwargs["factory"] = ProbeConnection
+        return original_connect(*args, **kwargs)
+
+    original_decode = provider_store_module._decode_json_object
+
+    def decode_probe(raw: bytes, *, label: str):
+        if label == "remote project state":
+            raise AssertionError("oversized remote state reached JSON parsing")
+        return original_decode(raw, label=label)
+
+    monkeypatch.setattr(provider_store_module.sqlite3, "connect", connect)
+    monkeypatch.setattr(provider_store_module, "_decode_json_object", decode_probe)
+
+    with pytest.raises(ProviderDataCorruptionError, match="remote project state recovery"):
+        DesktopProviderStore(root)
+
+    assert not any("select * from projects" in statement for statement in statements)
+    assert not any("then remote_state_json" in statement for statement in statements)
+
+
 def test_active_project_intent_patch_invalidates_remote_and_allows_reactivation(
     tmp_path: Path,
 ) -> None:
@@ -1002,6 +1090,117 @@ def test_active_project_intent_patch_invalidates_remote_and_allows_reactivation(
         if_match=patched.etag,
     )
     assert reservation.project == patched
+
+
+@pytest.mark.parametrize("start_operation", [False, True], ids=["queued", "running"])
+def test_displacing_activation_reservation_blocks_active_project_intent_patch(
+    tmp_path: Path,
+    start_operation: bool,
+) -> None:
+    store = DesktopProviderStore(tmp_path / "state")
+    profile = _create_profile(store)
+    first = store.create_project(
+        _project(profile.profile_id, name="First"),
+        idempotency_key=f"remote-patch-authority-first-{start_operation}",
+    )
+    second = store.create_project(
+        _project(profile.profile_id, name="Second"),
+        idempotency_key=f"remote-patch-authority-second-{start_operation}",
+    )
+    _activate_project(
+        store,
+        first,
+        key=f"remote-patch-authority-first-activate-{start_operation}",
+    )
+    active = store.get_project(first.project_id)
+    action = {
+        "route": f"/desktop/v1/projects/{second.project_id}/activate",
+        "operation_kind": "project_activate",
+        "project_id": second.project_id,
+        "key": f"remote-patch-authority-second-activate-{start_operation}",
+        "body": {},
+        "if_match": second.etag,
+    }
+    reservation = store.begin_project_runtime_action(**action)
+    if start_operation:
+        store.start_project_runtime_action(reservation=reservation, **action)
+
+    with pytest.raises(ResourceInUseError) as raised:
+        store.patch_project(
+            active.project_id,
+            {"name": "Must remain active"},
+            if_match=active.etag,
+        )
+
+    assert raised.value.resource_id == active.project_id
+    assert store.get_project(active.project_id) == active
+    assert store.get_local_operation(reservation.operation.operation_id).state == (
+        "running" if start_operation else "queued"
+    )
+
+
+def test_running_activation_and_active_project_patch_are_serialized(
+    tmp_path: Path,
+) -> None:
+    store = DesktopProviderStore(tmp_path / "state")
+    profile = _create_profile(store)
+    first = store.create_project(
+        _project(profile.profile_id, name="First"),
+        idempotency_key="remote-patch-race-first",
+    )
+    second = store.create_project(
+        _project(profile.profile_id, name="Second"),
+        idempotency_key="remote-patch-race-second",
+    )
+    _activate_project(store, first, key="remote-patch-race-first-activate")
+    active = store.get_project(first.project_id)
+    action = {
+        "route": f"/desktop/v1/projects/{second.project_id}/activate",
+        "operation_kind": "project_activate",
+        "project_id": second.project_id,
+        "key": "remote-patch-race-second-activate",
+        "body": {},
+        "if_match": second.etag,
+    }
+    reservation = store.begin_project_runtime_action(**action)
+    activation_running = threading.Event()
+    patch_finished = threading.Event()
+
+    def activate() -> LocalOperationV1:
+        store.start_project_runtime_action(reservation=reservation, **action)
+        activation_running.set()
+        assert patch_finished.wait(timeout=5)
+        return store.complete_project_runtime_action(
+            reservation=reservation,
+            remote_state=_remote_project_state(second.project_id, "second-revision"),
+            **action,
+        )
+
+    def patch() -> str:
+        assert activation_running.wait(timeout=5)
+        try:
+            store.patch_project(
+                active.project_id,
+                {"name": "Must not race activation"},
+                if_match=active.etag,
+            )
+        except ResourceInUseError:
+            return "busy"
+        finally:
+            patch_finished.set()
+        return "patched"
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        activation_future = executor.submit(activate)
+        patch_future = executor.submit(patch)
+        assert patch_future.result(timeout=5) == "busy"
+        finished = activation_future.result(timeout=5)
+
+    assert finished.state == "succeeded"
+    assert store.get_project(first.project_id).state == "draft"
+    assert store.get_project(first.project_id).name == active.name
+    assert store.get_project(first.project_id).remote == active.remote
+    assert store.get_project(second.project_id).state == "active"
 
 
 def test_active_project_patch_fault_rolls_back_intent_and_remote_state(
@@ -1992,6 +2191,46 @@ def test_project_activation_requires_a_matching_ready_remote_projection(
     assert store.get_local_operation(reservation.operation.operation_id).state == "running"
 
 
+def test_project_activation_rejects_remote_projection_over_its_persistence_bound(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = DesktopProviderStore(tmp_path / "state")
+    profile = _create_profile(store)
+    project = store.create_project(
+        _project(profile.profile_id), idempotency_key="remote-write-bound-create"
+    )
+    action = {
+        "route": f"/desktop/v1/projects/{project.project_id}/activate",
+        "operation_kind": "project_activate",
+        "project_id": project.project_id,
+        "key": "remote-write-bound-activate",
+        "body": {},
+        "if_match": project.etag,
+    }
+    reservation = store.begin_project_runtime_action(**action)
+    store.start_project_runtime_action(reservation=reservation, **action)
+    remote_state = _remote_project_state(project.project_id)
+    remote_bytes = provider_store_module._canonical_json_bytes(
+        remote_state.model_dump(mode="json")
+    )
+    monkeypatch.setattr(
+        provider_store_module,
+        "MAX_REMOTE_PROJECT_STATE_BYTES",
+        len(remote_bytes) - 1,
+    )
+
+    with pytest.raises(ContractValidationError, match="remote project state exceeds"):
+        store.complete_project_runtime_action(
+            reservation=reservation,
+            remote_state=remote_state,
+            **action,
+        )
+
+    assert store.get_project(project.project_id) == project
+    assert store.get_local_operation(reservation.operation.operation_id).state == "running"
+
+
 def test_project_activation_remote_publication_rolls_back_as_one_transaction(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2422,6 +2661,85 @@ def test_restart_cancels_activation_exclusion_before_accepting_active_project_wo
         if_match=recovered_first.etag,
     )
     assert doctor.operation.state == "queued"
+
+
+def test_activation_recovery_fault_rolls_back_authority_and_active_projection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "state"
+    store = DesktopProviderStore(root)
+    profile = _create_profile(store)
+    first = store.create_project(
+        _project(profile.profile_id, name="First"),
+        idempotency_key="activation-recovery-fault-first",
+    )
+    second = store.create_project(
+        _project(profile.profile_id, name="Second"),
+        idempotency_key="activation-recovery-fault-second",
+    )
+    _activate_project(store, first, key="activation-recovery-fault-first-activate")
+    active = store.get_project(first.project_id)
+    assert active.remote is not None
+    assert active.remote.active_revision is not None
+    active_version = store._connection.execute(
+        "SELECT resource_version FROM projects WHERE project_id = ?",
+        (first.project_id,),
+    ).fetchone()[0]
+    action = {
+        "route": f"/desktop/v1/projects/{second.project_id}/activate",
+        "operation_kind": "project_activate",
+        "project_id": second.project_id,
+        "key": "activation-recovery-fault-second-activate",
+        "body": {},
+        "if_match": second.etag,
+    }
+    reservation = store.begin_project_runtime_action(**action)
+    store.close()
+
+    def fail_reconciliation(_store: DesktopProviderStore, _connection: sqlite3.Connection) -> None:
+        raise RuntimeError("injected activation recovery fault")
+
+    with monkeypatch.context() as fault:
+        fault.setattr(
+            DesktopProviderStore,
+            "_reconcile_operations_at_startup",
+            fail_reconciliation,
+        )
+        with pytest.raises(RuntimeError, match="activation recovery fault"):
+            DesktopProviderStore(root)
+
+    with sqlite3.connect(root / "provider.sqlite3") as connection:
+        project_row = connection.execute(
+            "SELECT state, current_revision_id, remote_state_json, resource_version "
+            "FROM projects WHERE project_id = ?",
+            (first.project_id,),
+        ).fetchone()
+        operation_state = connection.execute(
+            "SELECT state FROM local_operations WHERE operation_id = ?",
+            (reservation.operation.operation_id,),
+        ).fetchone()[0]
+    assert project_row is not None
+    assert project_row[0] == "active"
+    assert project_row[1] == active.remote.active_revision.id
+    assert project_row[2] is not None
+    assert project_row[3] == active_version
+    assert operation_state == "queued"
+
+    reopened = DesktopProviderStore(root)
+    recovered = reopened.get_project(first.project_id)
+    replay = reopened.begin_project_runtime_action(**action)
+    assert recovered.state == "draft"
+    assert recovered.remote == active.remote
+    assert replay.operation.state == "cancelled"
+
+    patched = reopened.patch_project(
+        recovered.project_id,
+        {"name": "Recovered intent"},
+        if_match=recovered.etag,
+    )
+    assert patched.state == "draft"
+    assert patched.remote is None
 
 
 def test_expired_live_project_action_survives_cleanup_and_can_finish(
