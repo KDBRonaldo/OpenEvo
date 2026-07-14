@@ -6,16 +6,15 @@ from typing import Any
 
 from ...experiments.models import ExperimentConfig
 from openevo.projects.science.models import ScienceProjectConfig
-from openevo.runtime.managed import MANAGED_RUNTIME_IMAGES
+from openevo.runtime.managed import (
+    MANAGED_HOME,
+    MANAGED_PATH,
+    MANAGED_RUNTIME_IMAGES,
+)
 
 
 _WORKDIR = "/openevo/session/workspace"
-_MANAGED_HOME = "/openevo/session/home"
-_MANAGED_CODEX_HOME = f"{_MANAGED_HOME}/.codex"
-_MANAGED_PATH = (
-    "/home/openevo/.local/bin:/usr/local/sbin:/usr/local/bin:"
-    "/usr/sbin:/usr/bin:/sbin:/bin"
-)
+_MANAGED_PROXY_CODEX_HOME = f"{MANAGED_HOME}/.codex"
 
 
 @dataclass(frozen=True)
@@ -55,7 +54,7 @@ def compile_science_project(
 
 def _agent_payload(project: ScienceProjectConfig) -> dict[str, Any]:
     managed_env = (
-        {"CODEX_HOME": _MANAGED_CODEX_HOME}
+        {"CODEX_HOME": _MANAGED_PROXY_CODEX_HOME}
         if project.environment.profile != "custom_image"
         and project.execution.mode != "codex_subscription_transcript"
         else {}
@@ -90,7 +89,7 @@ def _runtime_payload(project: ScienceProjectConfig) -> dict[str, Any]:
     if project.execution.mode == "self-deployed":
         env["OPENEVO_MANAGED_HF_MODEL"] = str(project.execution.hf_model)
     if project.environment.profile != "custom_image":
-        env.update({"HOME": _MANAGED_HOME, "PATH": _MANAGED_PATH})
+        env.update({"HOME": MANAGED_HOME, "PATH": MANAGED_PATH})
 
     return {
         "profile": (
@@ -125,8 +124,8 @@ def _runtime_directory_prepare_command(project: ScienceProjectConfig) -> str:
     if project.environment.profile == "custom_image":
         return f"mkdir -p {_WORKDIR}"
     return (
-        f"mkdir -p {_MANAGED_HOME}/.codex {_WORKDIR} && "
-        f"chmod 700 {_MANAGED_HOME} {_MANAGED_HOME}/.codex"
+        f"mkdir -p {MANAGED_HOME}/.codex {_WORKDIR} && "
+        f"chmod 700 {MANAGED_HOME} {MANAGED_HOME}/.codex"
     )
 
 

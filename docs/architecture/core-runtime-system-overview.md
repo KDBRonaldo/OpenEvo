@@ -150,11 +150,19 @@ literal `capture_mode="transcript"`、exact managed runtime profile/image、Dock
 执行，并显式 unset proxy 相关环境变量。其他订阅式 harness 也应遵守同样边界：订阅负责
 auth，transcript capture 负责 evolution 可消费的行为记录。
 
-Codex subscription 的 `CODEX_HOME` 由 Core 固定为
-`/openevo/credentials/codex`。Gateway 仅在 runtime prepare 完成后，才把经过 no-follow、
-owner、regular、link-count-one、size/digest/identity 完整校验的宿主机
-`~/.codex/auth.json` staging 到 session tree 外的专用私有 bind mount。Workspace、artifact、
-log 和 transcript capture 不得自动复制 auth 原文或已知敏感 leaf values。
+Codex subscription 的 `HOME`、`PATH` 和 `CODEX_HOME` 都由 Core 固定，agent、runtime
+和 action env 不能覆盖；Codex 使用镜像内固定绝对路径启动，不能被 workspace `PATH`
+shadow。Gateway 仅在 runtime prepare 完成后，才从绝对 filesystem anchor 逐组件固定并
+复核宿主机 `~/.codex/auth.json` 与私有 credential root，再把通过 no-follow、owner、
+regular、link-count-one、size/digest/identity 校验的 auth staging 到 session tree 外的
+专用 bind mount。
+
+Subscription post-run 先结束所有仍可访问 credential 的进程，并按 `docker create` 返回的
+container ID 执行 remove + absence inspect。只有 absence proof 成功、最终 fd-relative
+递归 scan 复核每层 pathname/inode binding 后，Core 才构造 transcript trajectory 和
+`SessionResult`；结果发布前还会递归执行一次内存脱敏。失败时 private cleanup journal
+保留 runtime/container/session/credential identities，startup/shutdown reconciliation
+逐项重试，不会因一个 cancel/stop failure 跳过其他 ownership。
 
 ## 主要模块
 

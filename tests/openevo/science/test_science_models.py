@@ -61,6 +61,17 @@ def test_minimal_project_defaults_to_science_subscription_transcript() -> None:
     }
 
 
+@pytest.mark.parametrize("env_name", ["HOME", "PATH", "CODEX_HOME"])
+def test_managed_environment_rejects_core_owned_environment_overrides(
+    env_name: str,
+) -> None:
+    payload = _minimal_payload()
+    payload["environment"] = {"env": {env_name: "/attacker"}}
+
+    with pytest.raises(ValidationError, match=f"{env_name} is Core-owned"):
+        ScienceProjectConfig.model_validate(payload)
+
+
 def test_custom_image_rejects_codex_subscription_with_actionable_error() -> None:
     payload = _minimal_payload() | {
         "environment": {

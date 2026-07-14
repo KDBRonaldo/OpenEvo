@@ -17,7 +17,7 @@ from typing import Awaitable, Callable
 
 from openevo.harness.models import AgentRunResult
 from openevo.gateway.session_files import CredentialRedactor
-from openevo.rollout.models import SessionDispatchRequest, SessionResult
+from openevo.rollout.models import SessionDispatchRequest, SessionResult, SessionStatus
 from openevo.rollout.timer import StageTimer
 from openevo.runtime.base import BaseRuntime
 from openevo.runtime.models import ExecInput
@@ -72,8 +72,11 @@ class ManagedSession:
     runtime: BaseRuntime | None = None
     agent_result: AgentRunResult | None = None
     final_result: SessionResult | None = None
+    pending_status: SessionStatus | None = None
+    pending_error: str | None = None
     postrun_steps: list[ExecInput] = field(default_factory=list)
     eval_prewarm_task: asyncio.Task | None = None
+    eval_runtime: BaseRuntime | None = None
     cancel_requested: bool = False
     cancel_event: asyncio.Event = field(default_factory=asyncio.Event)
     execution_deadline: float | None = None
@@ -84,6 +87,10 @@ class ManagedSession:
     @property
     def session_id(self) -> str:
         return self.request.session_id
+
+    @property
+    def has_terminal_outcome(self) -> bool:
+        return self.final_result is not None or self.pending_status is not None
 
 
 class SessionDispatcher:
@@ -124,23 +131,33 @@ class SessionDispatcher:
         ]
         self._started = True
 
-    async def stop(self) -> None:
+    async def stop(self) -> list[ManagedSession]:
         if not self._started:
-            return
+            return []
         async with self._lock:
             sessions = list(self._sessions.values())
             self._sessions.clear()
+        cancel_tasks = []
         for managed in sessions:
             managed.cancel_requested = True
             managed.cancel_event.set()
             if managed.runtime is not None:
-                await managed.runtime.cancel()
+                cancel_tasks.append(managed.runtime.cancel())
+        if cancel_tasks:
+            outcomes = await asyncio.gather(*cancel_tasks, return_exceptions=True)
+            for outcome in outcomes:
+                if isinstance(outcome, BaseException):
+                    logger.warning(
+                        "Runtime cancellation failed during dispatcher shutdown",
+                        exc_info=(type(outcome), outcome, outcome.__traceback__),
+                    )
         for task in self._workers:
             task.cancel()
         if self._workers:
             await asyncio.gather(*self._workers, return_exceptions=True)
         self._workers.clear()
         self._started = False
+        return sessions
 
     async def enqueue(self, managed: ManagedSession) -> None:
         if not self._started:
@@ -173,7 +190,14 @@ class SessionDispatcher:
                 managed.inflight = False
                 should_enqueue_postrun = True
         if managed.runtime is not None:
-            await managed.runtime.cancel()
+            try:
+                await managed.runtime.cancel()
+            except Exception:
+                logger.warning(
+                    "Runtime cancellation failed for session %s; continuing cleanup",
+                    session_id,
+                    exc_info=True,
+                )
         if should_enqueue_postrun:
             self._notify_stage_change(managed)
             await self._postrun_queue.put(session_id)
@@ -215,7 +239,7 @@ class SessionDispatcher:
             managed = await self._begin(session_id, SessionStage.INIT)
             if managed is None:
                 continue
-            if not (managed.cancel_requested or managed.final_result is not None):
+            if not (managed.cancel_requested or managed.has_terminal_outcome):
                 await self._safe_invoke(self.on_init, managed, SessionStage.INIT)
             await self._finish_init(managed)
 
@@ -228,7 +252,7 @@ class SessionDispatcher:
             managed = await self._begin(session_id, SessionStage.RUNNING, from_ready=True)
             if managed is None:
                 continue
-            if not (managed.cancel_requested or managed.final_result is not None):
+            if not (managed.cancel_requested or managed.has_terminal_outcome):
                 await self._safe_invoke(self.on_run, managed, SessionStage.RUNNING)
             await self._transition_to_postrun(managed)
 
@@ -282,7 +306,7 @@ class SessionDispatcher:
 
     async def _finish_init(self, managed: ManagedSession) -> None:
         """After INIT callback returns, move to READY (waiting a run slot) or POSTRUN."""
-        if managed.cancel_requested or managed.final_result is not None:
+        if managed.cancel_requested or managed.has_terminal_outcome:
             await self._move_to_postrun(managed)
             return
 
@@ -325,7 +349,7 @@ class SessionDispatcher:
 
     async def _acquire_ready_slot(self, managed: ManagedSession) -> bool:
         """Race the semaphore against session cancellation. Returns True on acquire."""
-        if managed.cancel_event.is_set() or managed.final_result is not None:
+        if managed.cancel_event.is_set() or managed.has_terminal_outcome:
             return False
         acquire_task = asyncio.create_task(self._ready_slots.acquire())
         cancel_task = asyncio.create_task(managed.cancel_event.wait())
@@ -341,7 +365,7 @@ class SessionDispatcher:
         # If we managed to acquire the semaphore despite cancellation, release it
         # so it doesn't leak to a later session.
         acquired = acquire_task in done and not acquire_task.cancelled() and acquire_task.exception() is None
-        if managed.cancel_event.is_set() or managed.final_result is not None:
+        if managed.cancel_event.is_set() or managed.has_terminal_outcome:
             if acquired:
                 self._ready_slots.release()
             return False

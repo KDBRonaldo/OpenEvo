@@ -59,18 +59,22 @@ statuses are `COMPLETED`, `ERROR`, or `TIMEOUT`.
 Codex subscription sessions are admitted only for an exact Core-managed runtime
 profile/image, Docker host-user execution, and literal `capture_mode=transcript`.
 Custom images, runtime loaders/options, entrypoints, and caller-supplied
-`CODEX_HOME` fail before credential staging. Core fixes `CODEX_HOME` to
-`/openevo/credentials/codex`, backed by a dedicated private host directory that
-is not below the session, workspace, artifact, or log tree. Runtime prepare and
-workspace upload finish while this directory is still empty.
+`HOME`, `PATH`, or `CODEX_HOME` fail before credential staging. Core fixes those
+values to the managed home, managed binary path, and
+`/openevo/credentials/codex`; subscription Codex is invoked as the fixed
+`/home/openevo/.local/bin/codex` absolute path. The credential mount is backed
+by a dedicated private host directory that is not below the session, workspace,
+artifact, or log tree. Runtime prepare and workspace upload finish while this
+directory is still empty.
 
-The gateway opens the remote user's `~/.codex/auth.json` with `O_NOFOLLOW` and a
-stable descriptor, then requires a user-owned, link-count-one regular file with
-private permissions and a bounded size. It creates `auth.json` exclusively as
-`0600` under the private `0700` credential root. Source and target size, digest,
-identity, link count, and change times are rechecked against their open file
-descriptors and final pathnames. A mismatch scrubs the staged inode before
-cleanup and aborts without logging credential contents.
+The gateway pins every component from the absolute filesystem anchor to the
+remote user's `~/.codex/auth.json` and the private credential root, opens the
+leaf with `O_NOFOLLOW`, and requires a user-owned, link-count-one regular file
+with private permissions and a bounded size. It creates `auth.json` exclusively
+as `0600` under the private `0700` credential root. Source and target path
+chains, size, digest, identity, link count, and change times are rechecked before
+and after publication. A mismatch scrubs the staged inode before cleanup and
+aborts without logging credential contents.
 
 Verified auth JSON supplies a bounded set of exact sensitive leaf values. The
 gateway redacts those values from stdout/stderr and transcript logs and performs
@@ -84,11 +88,20 @@ transforming or transmitting a secret; that behavior is outside this boundary.
 The session root is pinned by device, inode, and owner before runtime startup.
 Teardown walks only from that descriptor, never follows links, restores only
 owner access needed to enter `000` directories, and enforces depth and node
-limits. A replaced root, changed nested entry, or foreign-owned object stops
-cleanup without deleting the replacement. Docker teardown marks a runtime
-destroyed only after `rm -f` succeeds or a follow-up inspect proves the
-container absent. Kill/remove failures remain retryable and retain both session
-and credential roots, so cleanup never races a live container.
+limits. The final redaction scan rechecks every recursive directory pathname
+against its opened inode and then rechecks the full absolute root chain. A
+replaced root, changed nested entry, or foreign-owned object fails closed.
+
+For subscription sessions, post-run commands finish first, then every
+credential-capable container is removed and proven absent by pinned container
+ID. Only after that proof does Core perform the final scan and construct the
+transcript trajectory or `SessionResult`; the in-memory result is recursively
+redacted again before registry, evolution export, or callback delivery. Docker
+always follows removal with an absence `inspect`, including after successful
+`rm -f`. Failures retain a private cleanup journal containing only runtime,
+container, session-root, and credential-root identities. Startup and shutdown
+reconciliation retry each journal independently, and roots are removed only
+after absence proof.
 
 ## What it captures
 

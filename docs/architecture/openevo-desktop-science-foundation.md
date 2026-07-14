@@ -66,12 +66,14 @@ returns an actionable error directing the user to a managed environment or
 self-deployed execution before compilation or runtime startup.
 
 For managed profiles, users do not upload or choose a runtime image in Desktop.
-Remote bootstrap first attempts to pull the managed image. If that image is not
-available to the remote Docker daemon, bootstrap writes an OpenEvo-managed
-Dockerfile under the run state directory and builds the same image tag on the
-remote server. The generated image contains Python, Node, common build tools,
-and the pinned Codex CLI required by the Codex harness. Custom images remain
-pull-only because OpenEvo cannot infer their system dependencies. The fallback
+Remote bootstrap grants fallback build behavior only when the closed runtime
+profile and its image exactly match Core's profile-to-image table. A custom or
+unknown profile that reuses a managed-looking tag is pull-only or rejected and
+never receives build or host-network privileges. For an exact binding,
+bootstrap first attempts to pull the image and, if unavailable, writes an
+OpenEvo-managed Dockerfile under the run state directory and builds the same
+tag. The generated image contains Python, Node, common build tools, and the
+pinned Codex CLI required by the Codex harness. The fallback
 build fetches Debian package metadata over HTTPS and retains the distribution's
 archive signature verification; proxy or mirror failures never downgrade that
 verification. Build proxy args come only from the selected project/profile
@@ -110,13 +112,16 @@ During each gateway runtime session, Core creates a private credential root
 outside the session tree and fixes container-visible
 `CODEX_HOME=/openevo/credentials/codex`. Workspace sync and setup complete while
 that mount is empty; only then is the host auth file staged as `auth.json`.
-`agent.env`, `runtime.env`, workspace, artifact, log, and arbitrary session
-subtrees cannot select this path.
+`HOME`, `PATH`, and `CODEX_HOME` are Core-owned across agent, runtime, and action
+env. Subscription execution calls `/home/openevo/.local/bin/codex` directly, so
+workspace content cannot shadow the binary.
 The source must be a private, remote-user-owned, link-count-one regular file of
 bounded size; symlinks, hard links, special files, owner mismatches, and path
 replacement are rejected. The gateway copies from a verified no-follow file
 descriptor into an exclusive `0600` target under a `0700` root and rechecks
-source/target size, SHA-256 digest, identity, link count, and change times.
+source/target size, SHA-256 digest, identity, link count, and change times. Both
+source and credential-root absolute pathname chains are pinned component by
+component and rechecked before and after publication.
 
 Core derives a bounded exact-value redactor from the verified auth JSON and its
 string leaves. Stdout/stderr, transcript logs, workspace, and artifact capture
@@ -135,8 +140,12 @@ writable session bind mount. No
 host-user lifecycle path applies recursive `a+rwX`. Teardown uses the
 dispatch-pinned session root identity and a bounded fd-relative no-follow walk,
 so nested `000` directories converge without following symlinks; owner or root
-identity replacement fails closed. Session and credential cleanup starts only
-after every related container has been proven removed; Docker kill/remove
+identity replacement fails closed. Every recursive directory pathname is
+rechecked against the opened inode after the final scan. Core constructs no
+subscription transcript trajectory or result until all credential-capable
+containers have been removed by pinned container ID and proven absent. It then
+defensively redacts the in-memory result before export. A private identity-only
+cleanup journal drives independent startup/shutdown retries; Docker kill/remove
 failure keeps the runtime retryable and both roots intact.
 
 `self-deployed` uses proxy authentication and requires `execution.hf_model`.

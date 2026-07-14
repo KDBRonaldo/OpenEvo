@@ -14,7 +14,7 @@ from openevo.harness.presets._subscription import (
     normalize_auth_mode,
 )
 from openevo.runtime.base import BaseRuntime, RUNTIME_AGENT_LOG_DIR, RUNTIME_SESSION_DIR
-from openevo.runtime.managed import MANAGED_CODEX_HOME
+from openevo.runtime.managed import MANAGED_CODEX_BINARY, MANAGED_CODEX_HOME
 from openevo.runtime.models import ExecInput
 
 
@@ -134,8 +134,13 @@ class CodexHarness(BaseHarness):
                 flags.append(f"{cli}={shlex.quote(str(value))}")
 
         flags_str = " ".join(flags)
+        executable = (
+            MANAGED_CODEX_BINARY
+            if auth_mode == AUTH_MODE_SUBSCRIPTION
+            else "codex"
+        )
         command = (
-            f"codex exec {flags_str} -- {escaped} "
+            f"{executable} exec {flags_str} -- {escaped} "
             f"2>&1 </dev/null | tee {RUNTIME_AGENT_LOG_DIR}/codex.txt"
         )
         if auth_mode == AUTH_MODE_SUBSCRIPTION:

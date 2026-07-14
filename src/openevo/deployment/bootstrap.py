@@ -26,13 +26,12 @@ from openevo.deployment.preflight import (
     run_preflight,
 )
 from openevo.deployment.redaction import sanitize_remote_text
-from openevo.projects.science.compiler import MANAGED_RUNTIME_IMAGES
+from openevo.runtime.managed import require_exact_managed_runtime_binding
 
 if TYPE_CHECKING:
     from openevo.deployment.planner import SidecarSciencePlan
 
 
-_MANAGED_RUNTIME_IMAGE_SET = frozenset(MANAGED_RUNTIME_IMAGES.values())
 _MANAGED_RUNTIME_BASE_IMAGE = "node:22-bookworm-slim"
 _MANAGED_RUNTIME_PYTHON_IMAGE = "python:3.12-slim-bookworm"
 _MANAGED_RUNTIME_CODEX_PACKAGE = "@openai/codex@0.121.0"
@@ -276,6 +275,11 @@ def build_remote_bootstrap_plan(
         task_id=plan.task_id,
     )
     runtime_image = _runtime_image(experiment_snapshot)
+    runtime_profile = _runtime_profile(experiment_snapshot)
+    is_managed_runtime = require_exact_managed_runtime_binding(
+        profile=runtime_profile,
+        image=runtime_image,
+    )
     hf_model = _managed_hf_model(experiment_snapshot)
     proxy_env = dict(plan.proxy_env)
     expected_version = expected_openevo_version or OPENEVO_VERSION
@@ -355,13 +359,13 @@ def build_remote_bootstrap_plan(
         )
 
     if runtime_image is not None:
-        is_managed_runtime = _is_managed_runtime_image(runtime_image)
         steps.append(
             RemoteBootstrapStep(
                 id="docker_pull_runtime",
                 kind=RemoteBootstrapStepKind.DOCKER_PULL,
                 command=_runtime_image_command(
                     runtime_image,
+                    managed_runtime=is_managed_runtime,
                     state_root=state_root,
                     proxy_env=proxy_env,
                 ),
@@ -541,13 +545,18 @@ def _runtime_image(experiment_snapshot: Mapping[str, Any]) -> str | None:
     return image if isinstance(image, str) and image.strip() else None
 
 
-def _is_managed_runtime_image(image: str) -> bool:
-    return image in _MANAGED_RUNTIME_IMAGE_SET
+def _runtime_profile(experiment_snapshot: Mapping[str, Any]) -> str | None:
+    runtime = experiment_snapshot.get("runtime")
+    if not isinstance(runtime, Mapping):
+        return None
+    profile = runtime.get("profile")
+    return profile if isinstance(profile, str) and profile.strip() else None
 
 
 def _runtime_image_command(
     runtime_image: str,
     *,
+    managed_runtime: bool,
     state_root: str,
     proxy_env: Mapping[str, str],
 ) -> str:
@@ -557,7 +566,7 @@ def _runtime_image_command(
     unset_proxy = (
         "unset " + " ".join(inherited_proxy_keys) if inherited_proxy_keys else ":"
     )
-    if not _is_managed_runtime_image(runtime_image):
+    if not managed_runtime:
         return f"{unset_proxy}\ndocker pull {shlex.quote(runtime_image)}"
 
     context_dir = posixpath.join(

@@ -10,6 +10,7 @@ from openevo.harness.presets.claude_code import ClaudeCodeHarness
 from openevo.harness.presets.codex import CodexHarness
 from openevo.harness.presets.openhands_sdk import OpenHandsSdkHarness
 from openevo.runtime.base import BaseRuntime
+from openevo.runtime.managed import MANAGED_CODEX_BINARY
 from openevo.runtime.models import ExecResult, RuntimeSpec
 
 SUBSCRIPTION_PROXY_ENV_VARS = (
@@ -285,6 +286,7 @@ def test_codex_run_steps_subscription_auth_mode_uses_existing_login_state():
     step = steps[0]
     assert "codex exec" in step.command
     assert "--model gpt-5.5" in step.command
+    assert f"{MANAGED_CODEX_BINARY} exec " in step.command
     assert "auth.json" not in step.command
     assert step.command.startswith("env -u")
     for key in SUBSCRIPTION_PROXY_ENV_VARS:

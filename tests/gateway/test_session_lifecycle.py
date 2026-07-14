@@ -6,11 +6,13 @@ from pathlib import Path
 
 import pytest
 
+from openevo.gateway.dispatcher import ManagedSession, SessionDispatcher, SessionStage
 from openevo.gateway.node import GatewayNodeManager
 from openevo.gateway.session import SessionRegistry
 from openevo.gateway.storage import SessionStore
 from openevo.harness.models import AgentSpec
 from openevo.rollout.models import SessionDispatchRequest, SessionStatus
+from openevo.rollout.timer import StageTimer
 from openevo.runtime.base import BaseRuntime
 from openevo.runtime.models import ExecInput, ExecResult, PrepareAction, RuntimeSpec
 from openevo.trajectory.models import StrategySpec
@@ -176,3 +178,207 @@ async def test_dispatch_runs_runtime_lifecycle_and_builds_stdout_trajectory(
         "exec:run-agent",
         "stop",
     ]
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_shutdown_isolates_cancel_failures(tmp_path: Path) -> None:
+    calls: list[str] = []
+
+    class CancelRuntime:
+        def __init__(self, name: str, *, fail: bool = False) -> None:
+            self.name = name
+            self.fail = fail
+
+        async def cancel(self) -> None:
+            calls.append(self.name)
+            if self.fail:
+                raise RuntimeError("cancel failed")
+
+    def managed(session_id: str, runtime: CancelRuntime) -> ManagedSession:
+        return ManagedSession(
+            request=SessionDispatchRequest(
+                session_id=session_id,
+                task_id="task",
+                instruction="work",
+                remaining_timeout_seconds=10,
+                runtime=RuntimeSpec(image="runtime:latest"),
+                agent=AgentSpec(harness="shell", custom_shell=ExecInput(command="true")),
+            ),
+            timer=StageTimer(),
+            session_dir=tmp_path / session_id,
+            artifacts_dir=tmp_path / session_id / "artifacts",
+            runtime=runtime,  # type: ignore[arg-type]
+        )
+
+    dispatcher = SessionDispatcher(
+        max_init_workers=1,
+        max_run_workers=1,
+        max_postrun_workers=1,
+    )
+    dispatcher._started = True
+    dispatcher._sessions = {
+        "first": managed("first", CancelRuntime("first", fail=True)),
+        "second": managed("second", CancelRuntime("second")),
+    }
+
+    await dispatcher.stop()
+
+    assert calls == ["first", "second"]
+
+
+@pytest.mark.asyncio
+async def test_manager_shutdown_reconciles_session_without_created_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for name in (
+        "ALL_PROXY",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "all_proxy",
+        "http_proxy",
+        "https_proxy",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    session_dir = tmp_path / "runtime-create-failed"
+    session_dir.mkdir()
+    managed = ManagedSession(
+        request=SessionDispatchRequest(
+            session_id="runtime-create-failed",
+            task_id="task",
+            instruction="work",
+            remaining_timeout_seconds=10,
+            runtime=RuntimeSpec(image="runtime:latest"),
+            agent=AgentSpec(harness="shell", custom_shell=ExecInput(command="true")),
+        ),
+        timer=StageTimer(),
+        session_dir=session_dir,
+        artifacts_dir=session_dir / "artifacts",
+        session_root_identity=(
+            session_dir.stat().st_dev,
+            session_dir.stat().st_ino,
+            session_dir.stat().st_uid,
+        ),
+    )
+    manager = GatewayNodeManager(
+        node_id="shutdown-probe",
+        gateway_url="http://gateway.test",
+        max_init_workers=1,
+        max_run_workers=1,
+        max_postrun_workers=1,
+        storage=SessionStore(),
+        session_registry=SessionRegistry(),
+        builders=default_builder_registry(),
+        evaluators=default_evaluator_registry(),
+        session_base_dir=str(tmp_path),
+    )
+    manager._dispatcher._started = True
+    manager._dispatcher._sessions[managed.session_id] = managed
+
+    await manager.close()
+
+    assert not session_dir.exists()
+    assert manager._cleanup_retries == {}
+
+
+@pytest.mark.asyncio
+async def test_manager_shutdown_reconciles_independent_eval_prewarm_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for name in (
+        "ALL_PROXY",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "all_proxy",
+        "http_proxy",
+        "https_proxy",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    events: list[str] = []
+    session_dir = tmp_path / "eval-prewarm"
+    session_dir.mkdir()
+    eval_runtime = RecordingRuntime(
+        RuntimeSpec(image="runtime:latest"),
+        "eval-prewarm-runtime",
+        session_dir / "eval_runtime",
+        events,
+    )
+
+    async def prepared_eval_runtime() -> BaseRuntime:
+        return eval_runtime
+
+    managed = ManagedSession(
+        request=SessionDispatchRequest(
+            session_id="eval-prewarm",
+            task_id="task",
+            instruction="work",
+            remaining_timeout_seconds=10,
+            runtime=RuntimeSpec(image="runtime:latest"),
+            agent=AgentSpec(harness="shell", custom_shell=ExecInput(command="true")),
+        ),
+        timer=StageTimer(),
+        session_dir=session_dir,
+        artifacts_dir=session_dir / "artifacts",
+        session_root_identity=(
+            session_dir.stat().st_dev,
+            session_dir.stat().st_ino,
+            session_dir.stat().st_uid,
+        ),
+        eval_prewarm_task=asyncio.create_task(prepared_eval_runtime()),
+    )
+    manager = GatewayNodeManager(
+        node_id="shutdown-eval-probe",
+        gateway_url="http://gateway.test",
+        max_init_workers=1,
+        max_run_workers=1,
+        max_postrun_workers=1,
+        storage=SessionStore(),
+        session_registry=SessionRegistry(),
+        builders=default_builder_registry(),
+        evaluators=default_evaluator_registry(),
+        session_base_dir=str(tmp_path),
+    )
+    manager._dispatcher._started = True
+    manager._dispatcher._sessions[managed.session_id] = managed
+    await asyncio.sleep(0)
+
+    await manager.close()
+
+    assert events == ["stop"]
+    assert not session_dir.exists()
+    assert manager._cleanup_retries == {}
+
+
+@pytest.mark.asyncio
+async def test_ready_cancel_failure_still_enqueues_postrun_cleanup(tmp_path: Path) -> None:
+    class FailingCancelRuntime:
+        async def cancel(self) -> None:
+            raise RuntimeError("cancel failed")
+
+    dispatcher = SessionDispatcher(
+        max_init_workers=1,
+        max_run_workers=1,
+        max_postrun_workers=1,
+    )
+    dispatcher._started = True
+    managed = ManagedSession(
+        request=SessionDispatchRequest(
+            session_id="ready-session",
+            task_id="task",
+            instruction="work",
+            remaining_timeout_seconds=10,
+            runtime=RuntimeSpec(image="runtime:latest"),
+            agent=AgentSpec(harness="shell", custom_shell=ExecInput(command="true")),
+        ),
+        timer=StageTimer(),
+        session_dir=tmp_path / "ready-session",
+        artifacts_dir=tmp_path / "ready-session" / "artifacts",
+        runtime=FailingCancelRuntime(),  # type: ignore[arg-type]
+        stage=SessionStage.READY,
+    )
+    dispatcher._sessions[managed.session_id] = managed
+
+    assert await dispatcher.cancel(managed.session_id) is True
+    assert managed.stage == SessionStage.POSTRUN
+    assert await dispatcher._postrun_queue.get() == managed.session_id

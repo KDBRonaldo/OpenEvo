@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
+import os
 import re
 import shlex
 import shutil
+import stat
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from tempfile import mkdtemp
 from typing import Any
@@ -47,8 +51,10 @@ from openevo.rollout.models import (
 from openevo.rollout.timer import StageTimer
 from openevo.runtime.base import BaseRuntime
 from openevo.runtime.factory import create_runtime
+from openevo.runtime.docker import DockerRuntime
 from openevo.runtime.managed import (
-    MANAGED_CODEX_HOME,
+    MANAGED_SUBSCRIPTION_ENV,
+    reject_managed_subscription_env,
     require_managed_subscription_runtime,
 )
 from openevo.runtime.models import ExecInput, RuntimeSpec
@@ -72,6 +78,25 @@ _SUBSCRIPTION_AUTH_MODES = {"subscription", "chatgpt_subscription"}
 
 class GatewayExecutionTimeout(TimeoutError):
     """Raised when a session exhausts its shared gateway execution budget."""
+
+
+@dataclass(slots=True)
+class CleanupRetryOwnership:
+    """Reachable ownership retained until runtime absence and root cleanup succeed."""
+
+    session_id: str
+    session_dir: Path
+    session_root_identity: tuple[int, int, int] | None
+    credential_dir: Path | None
+    credential_root_identity: tuple[int, int, int] | None
+    runtime_id: str | None
+    container_id: str | None
+    eval_runtime_id: str | None
+    eval_container_id: str | None
+    runtime: BaseRuntime | None
+    eval_runtime: BaseRuntime | None = None
+    managed: ManagedSession | None = None
+    finalize_subscription: bool = False
 
 
 async def write_evolution_context_files(
@@ -436,8 +461,16 @@ class GatewayNodeManager:
         self._control_client: httpx.AsyncClient | None = None
         self._heartbeat_task: asyncio.Task[None] | None = None
         self._rollout_registered = False
+        self._cleanup_retries: dict[str, CleanupRetryOwnership] = {}
+        cleanup_base = Path(session_base_dir) if session_base_dir else Path("/tmp")
+        node_key = hashlib.sha256(node_id.encode("utf-8")).hexdigest()[:24]
+        self._cleanup_journal_dir = (
+            cleanup_base / ".openevo-gateway-cleanup" / node_key
+        )
 
     async def start(self) -> None:
+        self._load_cleanup_retries()
+        await self._reconcile_cleanup_retries()
         await self._dispatcher.start()
         if self._rollout_server_url is not None:
             self._control_client = httpx.AsyncClient(
@@ -457,7 +490,14 @@ class GatewayNodeManager:
         if self._control_client is not None:
             await self._control_client.aclose()
             self._control_client = None
-        await self._dispatcher.stop()
+        shutdown_sessions = await self._dispatcher.stop()
+        for managed in shutdown_sessions:
+            eval_runtime = await self._drain_eval_prewarm_task(managed)
+            self._register_cleanup_retry(
+                managed,
+                eval_runtime=eval_runtime or managed.eval_runtime,
+            )
+        await self._reconcile_cleanup_retries()
         if self.evolution_client is not None:
             await self.evolution_client.close()
             self.evolution_client = None
@@ -620,6 +660,15 @@ class GatewayNodeManager:
             runtime_spec = self._resolve_runtime_spec(request)
             self._validate_subscription_admission(request, runtime_spec, managed.session_dir)
             if _is_codex_subscription_agent(request.agent):
+                runtime_spec = runtime_spec.model_copy(
+                    update={
+                        "env": {
+                            **runtime_spec.env,
+                            **MANAGED_SUBSCRIPTION_ENV,
+                        }
+                    }
+                )
+            if _is_codex_subscription_agent(request.agent):
                 credential_dir = Path(
                     mkdtemp(
                         prefix=f"credentials-{request.session_id[:8]}-",
@@ -645,6 +694,10 @@ class GatewayNodeManager:
                 )
             managed.runtime = runtime
             await self._await_with_budget(runtime.start(), managed)
+            if _is_codex_subscription_agent(request.agent):
+                self._persist_cleanup_ownership(
+                    self._cleanup_ownership_for(managed)
+                )
             # Run ordered prepare actions
             await self._run_runtime_prepare(runtime, runtime_spec, request, managed)
             if managed.credential_dir is not None:
@@ -655,15 +708,19 @@ class GatewayNodeManager:
                 )
                 self._redact_session_captures(managed)
         except GatewayExecutionTimeout as exc:
-            managed.final_result = self._timeout_result(request, managed.timer, str(exc))
+            self._set_terminal_failure(
+                managed,
+                SessionStatus.TIMEOUT,
+                str(exc),
+            )
         except Exception as exc:
             if managed.cancel_requested:
                 logger.info("Initialization cancelled for session %s", request.session_id)
             else:
                 logger.exception("Initialization failed for session %s", request.session_id)
-                managed.final_result = self._error_result(
-                    request,
-                    managed.timer,
+                self._set_terminal_failure(
+                    managed,
+                    SessionStatus.ERROR,
                     f"runtime initialization failed: {exc}",
                 )
         finally:
@@ -716,8 +773,23 @@ class GatewayNodeManager:
             raise RuntimeError(
                 "subscription execution requires capture_mode='transcript'"
             )
-        if "CODEX_HOME" in request.agent.env or "CODEX_HOME" in runtime_spec.env:
-            raise RuntimeError("subscription CODEX_HOME is Core-owned and must be omitted")
+        try:
+            reject_managed_subscription_env(request.agent.env, owner="agent")
+            reject_managed_subscription_env(
+                runtime_spec.env,
+                owner="runtime",
+                allow_exact=True,
+            )
+            for action in [
+                *runtime_spec.prepare,
+                *(runtime_spec.eval_prepare or []),
+            ]:
+                reject_managed_subscription_env(
+                    action.env,
+                    owner="runtime action",
+                )
+        except ValueError as exc:
+            raise RuntimeError(str(exc)) from exc
         try:
             require_managed_subscription_runtime(
                 profile=runtime_spec.profile,
@@ -806,7 +878,7 @@ class GatewayNodeManager:
 
     async def _handle_run(self, managed: ManagedSession) -> None:
         request = managed.request
-        if managed.final_result is not None or managed.cancel_requested:
+        if managed.has_terminal_outcome or managed.cancel_requested:
             return
         managed.timer.mark("run", "started")
 
@@ -854,9 +926,9 @@ class GatewayNodeManager:
                 logger.info("Agent execution cancelled for session %s", request.session_id)
             else:
                 logger.exception("Agent execution failed for session %s", request.session_id)
-                managed.final_result = self._error_result(
-                    request,
-                    managed.timer,
+                self._set_terminal_failure(
+                    managed,
+                    SessionStatus.ERROR,
                     f"agent execution failed: {exc}",
                 )
         finally:
@@ -1031,8 +1103,16 @@ class GatewayNodeManager:
         eval_artifacts_dir.mkdir(parents=True, exist_ok=True)
 
         eval_runtime = create_runtime(runtime_spec, f"{request.session_id}-eval", eval_session_dir)
+        managed.eval_runtime = eval_runtime
         try:
             await self._await_with_budget(eval_runtime.start(), managed)
+            if _is_codex_subscription_agent(request.agent):
+                self._persist_cleanup_ownership(
+                    self._cleanup_ownership_for(
+                        managed,
+                        eval_runtime=eval_runtime,
+                    )
+                )
             eval_actions = (
                 runtime_spec.eval_prepare
                 if runtime_spec.eval_prepare is not None
@@ -1087,7 +1167,10 @@ class GatewayNodeManager:
         if not task.done():
             task.cancel()
         try:
-            return await task
+            runtime = await task
+            if runtime is not None:
+                managed.eval_runtime = runtime
+            return runtime
         except (asyncio.CancelledError, Exception):
             return None
 
@@ -1096,6 +1179,12 @@ class GatewayNodeManager:
     # ------------------------------------------------------------------
 
     async def _handle_postrun(self, managed: ManagedSession) -> None:
+        if _is_codex_subscription_agent(managed.request.agent) and managed.runtime is not None:
+            await self._handle_subscription_postrun(managed)
+            return
+        await self._handle_standard_postrun(managed)
+
+    async def _handle_standard_postrun(self, managed: ManagedSession) -> None:
         request = managed.request
         result: SessionResult | None = managed.final_result
         runtimes_removed = not managed.runtime_cleanup_blocked
@@ -1128,7 +1217,10 @@ class GatewayNodeManager:
                     f"credential capture redaction failed: {exc}",
                 )
             stop_tasks = []
-            eval_runtime = await self._drain_eval_prewarm_task(managed)
+            eval_runtime = (
+                await self._drain_eval_prewarm_task(managed)
+                or managed.eval_runtime
+            )
             if eval_runtime is not None:
                 stop_tasks.append(
                     self._stop_runtime_best_effort(
@@ -1157,39 +1249,131 @@ class GatewayNodeManager:
                 "post-run finished without producing a session result",
             )
         try:
-            normalized = result.model_copy(
-                update={
-                    "timing": managed.timer.to_session_timing(),
-                    "node_id": self.node_id,
-                    "error": result.error or result.trajectory.error,
-                }
-            )
-            self.session_registry.set_result(request.session_id, normalized)
-            await self._export_evolution_event(normalized)
-            self.storage.delete_session(request.session_id)
-            if await self._push_result(request.callback_url, normalized):
-                # Rollout server has acked; free the heavy payload but keep
-                # status/task_id visible for debugging via the polling endpoint.
-                self.session_registry.clear_result_payload(request.session_id)
+            await self._deliver_terminal_result(managed, result)
         finally:
             if runtimes_removed:
-                session_removed = await self._remove_session_dir_best_effort(
-                    managed.session_dir,
-                    request.session_id,
-                    managed.session_root_identity,
-                )
-                if session_removed is not False and managed.credential_dir is not None:
-                    await self._remove_credential_dir_best_effort(
-                        managed.credential_dir,
-                        request.session_id,
-                        managed.credential_root_identity,
-                    )
+                roots_removed = await self._remove_owned_roots(managed)
+                if not roots_removed:
+                    self._register_cleanup_retry(managed)
             else:
+                self._register_cleanup_retry(managed)
                 logger.error(
                     "Retaining credential and session roots because a runtime "
                     "was not proven removed for session %s",
                     request.session_id,
                 )
+
+    async def _handle_subscription_postrun(self, managed: ManagedSession) -> None:
+        request = managed.request
+        result = managed.final_result
+        managed.timer.mark("postrun", "started")
+        await self._run_postrun_steps(managed)
+        managed.timer.mark("teardown", "started")
+        eval_runtime = (
+            await self._drain_eval_prewarm_task(managed)
+            or managed.eval_runtime
+        )
+        stop_targets = [
+            (eval_runtime, "eval runtime"),
+            (managed.runtime, "runtime"),
+        ]
+        stop_results = await asyncio.gather(
+            *(
+                self._stop_runtime_best_effort(runtime, request.session_id, label)
+                for runtime, label in stop_targets
+                if runtime is not None
+            ),
+            return_exceptions=True,
+        )
+        runtimes_removed = (
+            not managed.runtime_cleanup_blocked
+            and all(outcome is True for outcome in stop_results)
+        )
+        managed.timer.mark("teardown", "finished")
+        if not runtimes_removed:
+            self._register_cleanup_retry(
+                managed,
+                eval_runtime=eval_runtime,
+                finalize_subscription=True,
+            )
+            logger.error(
+                "Retaining subscription cleanup ownership because runtime absence "
+                "was not proven for session %s",
+                request.session_id,
+            )
+            return
+
+        await self._finalize_subscription_after_runtime_absence(managed, result=result)
+
+    async def _finalize_subscription_after_runtime_absence(
+        self,
+        managed: ManagedSession,
+        *,
+        result: SessionResult | None,
+    ) -> None:
+        request = managed.request
+        try:
+            self._redact_session_captures(managed)
+            if result is None:
+                if managed.cancel_requested:
+                    result = self._cancelled_result(request, managed.timer)
+                elif managed.pending_status == SessionStatus.TIMEOUT:
+                    result = self._timeout_result(
+                        request,
+                        managed.timer,
+                        managed.pending_error or "session execution timeout",
+                    )
+                elif managed.pending_status == SessionStatus.ERROR:
+                    result = self._error_result(
+                        request,
+                        managed.timer,
+                        managed.pending_error or "session execution failed",
+                    )
+                else:
+                    result = await self._build_session_result(managed)
+        except Exception as exc:
+            logger.exception(
+                "Subscription finalization failed for session %s",
+                request.session_id,
+            )
+            result = self._error_result(
+                request,
+                managed.timer,
+                f"subscription finalization failed: {exc}",
+            )
+        finally:
+            managed.timer.mark("postrun", "finished")
+            managed.timer.mark("return", "finished")
+
+        try:
+            await self._deliver_terminal_result(managed, result)
+        finally:
+            roots_removed = await self._remove_owned_roots(managed)
+            if roots_removed:
+                self._cleanup_retries.pop(request.session_id, None)
+                self._clear_cleanup_ownership(request.session_id)
+            else:
+                self._register_cleanup_retry(managed)
+
+    async def _deliver_terminal_result(
+        self,
+        managed: ManagedSession,
+        result: SessionResult,
+    ) -> None:
+        request = managed.request
+        normalized = result.model_copy(
+            update={
+                "timing": managed.timer.to_session_timing(),
+                "node_id": self.node_id,
+                "error": result.error or result.trajectory.error,
+            }
+        )
+        normalized = self._redact_in_memory_result(managed, normalized)
+        self.session_registry.set_result(request.session_id, normalized)
+        await self._export_evolution_event(normalized)
+        self.storage.delete_session(request.session_id)
+        if await self._push_result(request.callback_url, normalized):
+            self.session_registry.clear_result_payload(request.session_id)
 
     async def _build_session_result(self, managed: ManagedSession) -> SessionResult:
         request = managed.request
@@ -1447,7 +1631,7 @@ class GatewayNodeManager:
             runtime_env = dict(runtime.spec.env)
         agent_env = dict(request.agent.env) if include_agent_env else {}
         credential_env = (
-            {"CODEX_HOME": MANAGED_CODEX_HOME}
+            MANAGED_SUBSCRIPTION_ENV
             if _is_codex_subscription_agent(request.agent)
             else {}
         )
@@ -1519,6 +1703,31 @@ class GatewayNodeManager:
             error=error,
             metadata=dict(request.metadata),
         )
+
+    def _set_terminal_failure(
+        self,
+        managed: ManagedSession,
+        status: SessionStatus,
+        error: str,
+    ) -> None:
+        if _is_codex_subscription_agent(managed.request.agent) and (
+            managed.runtime is not None or managed.credential_dir is not None
+        ):
+            managed.pending_status = status
+            managed.pending_error = error
+            return
+        if status == SessionStatus.TIMEOUT:
+            managed.final_result = self._timeout_result(
+                managed.request,
+                managed.timer,
+                error,
+            )
+        else:
+            managed.final_result = self._error_result(
+                managed.request,
+                managed.timer,
+                error,
+            )
 
     def _timeout_result(
         self,
@@ -1655,6 +1864,407 @@ class GatewayNodeManager:
                 exc_info=True,
             )
             return False
+
+    @staticmethod
+    def _redact_in_memory_result(
+        managed: ManagedSession,
+        result: SessionResult,
+    ) -> SessionResult:
+        redactor = managed.credential_redactor
+        if redactor is None:
+            return result
+
+        def redact(value: Any) -> Any:
+            if isinstance(value, str):
+                return redactor.redact(value)
+            if isinstance(value, list):
+                return [redact(item) for item in value]
+            if isinstance(value, tuple):
+                return tuple(redact(item) for item in value)
+            if isinstance(value, dict):
+                return {
+                    redactor.redact(str(key)): redact(item)
+                    for key, item in value.items()
+                }
+            return value
+
+        return SessionResult.model_validate(
+            redact(result.model_dump(mode="python"))
+        )
+
+    async def _remove_owned_roots(self, managed: ManagedSession) -> bool:
+        tasks = [
+            self._remove_session_dir_best_effort(
+                managed.session_dir,
+                managed.session_id,
+                managed.session_root_identity,
+            )
+        ]
+        if managed.credential_dir is not None:
+            tasks.append(
+                self._remove_credential_dir_best_effort(
+                    managed.credential_dir,
+                    managed.session_id,
+                    managed.credential_root_identity,
+                )
+            )
+        outcomes = await asyncio.gather(*tasks, return_exceptions=True)
+        return all(outcome is not False and not isinstance(outcome, BaseException) for outcome in outcomes)
+
+    def _register_cleanup_retry(
+        self,
+        managed: ManagedSession,
+        *,
+        eval_runtime: BaseRuntime | None = None,
+        finalize_subscription: bool = False,
+    ) -> None:
+        retries = getattr(self, "_cleanup_retries", None)
+        if retries is None:
+            retries = {}
+            self._cleanup_retries = retries
+        ownership = self._cleanup_ownership_for(
+            managed,
+            eval_runtime=eval_runtime,
+            finalize_subscription=finalize_subscription,
+        )
+        retries[managed.session_id] = ownership
+        self._persist_cleanup_ownership(ownership)
+
+    @staticmethod
+    def _cleanup_ownership_for(
+        managed: ManagedSession,
+        *,
+        eval_runtime: BaseRuntime | None = None,
+        finalize_subscription: bool = False,
+    ) -> CleanupRetryOwnership:
+        runtime = managed.runtime
+        return CleanupRetryOwnership(
+            session_id=managed.session_id,
+            session_dir=managed.session_dir,
+            session_root_identity=managed.session_root_identity,
+            credential_dir=managed.credential_dir,
+            credential_root_identity=managed.credential_root_identity,
+            runtime_id=(str(getattr(runtime, "runtime_id", "")) or None),
+            container_id=getattr(runtime, "container_id", None),
+            eval_runtime_id=(
+                str(getattr(eval_runtime, "runtime_id", "")) or None
+            ),
+            eval_container_id=getattr(eval_runtime, "container_id", None),
+            runtime=runtime,
+            eval_runtime=eval_runtime,
+            managed=managed,
+            finalize_subscription=finalize_subscription,
+        )
+
+    def _cleanup_journal_path(self, session_id: str) -> Path:
+        name = hashlib.sha256(session_id.encode("utf-8")).hexdigest()
+        return self._cleanup_journal_dir / f"{name}.json"
+
+    def _persist_cleanup_ownership(self, ownership: CleanupRetryOwnership) -> None:
+        journal_dir = getattr(self, "_cleanup_journal_dir", None)
+        if journal_dir is None:
+            return
+        journal_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        journal_dir.chmod(0o700)
+        payload = {
+            "version": 1,
+            "session_id": ownership.session_id,
+            "runtime": {
+                "runtime_id": ownership.runtime_id,
+                "container_id": ownership.container_id,
+            },
+            "eval_runtime": {
+                "runtime_id": ownership.eval_runtime_id,
+                "container_id": ownership.eval_container_id,
+            },
+            "session_root": {
+                "path": str(ownership.session_dir),
+                "identity": list(ownership.session_root_identity or ()),
+            },
+            "credential_root": (
+                None
+                if ownership.credential_dir is None
+                else {
+                    "path": str(ownership.credential_dir),
+                    "identity": list(ownership.credential_root_identity or ()),
+                }
+            ),
+        }
+        encoded = json.dumps(
+            payload,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        destination = self._cleanup_journal_path(ownership.session_id)
+        temporary = destination.with_name(
+            f".{destination.name}.{os.getpid()}.{id(ownership)}.tmp"
+        )
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+            0o600,
+        )
+        try:
+            offset = 0
+            while offset < len(encoded):
+                written = os.write(descriptor, encoded[offset:])
+                if written <= 0:
+                    raise RuntimeError("cleanup ownership journal write made no progress")
+                offset += written
+            os.fchmod(descriptor, 0o600)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        os.replace(temporary, destination)
+        directory_fd = os.open(journal_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+
+    def _load_cleanup_retries(self) -> None:
+        journal_dir = getattr(self, "_cleanup_journal_dir", None)
+        if journal_dir is None or not journal_dir.exists():
+            return
+        directory_stat = journal_dir.stat(follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(directory_stat.st_mode)
+            or directory_stat.st_uid != os.geteuid()
+            or directory_stat.st_mode & 0o077
+        ):
+            raise RuntimeError("cleanup ownership journal directory is not private")
+        for path in sorted(journal_dir.glob("*.json")):
+            opened_fd = os.open(
+                path,
+                os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            )
+            try:
+                opened = os.fstat(opened_fd)
+                if (
+                    not stat.S_ISREG(opened.st_mode)
+                    or opened.st_uid != os.geteuid()
+                    or opened.st_nlink != 1
+                    or opened.st_mode & 0o077
+                    or opened.st_size <= 0
+                    or opened.st_size > 16 * 1024
+                ):
+                    raise RuntimeError("cleanup ownership journal file is not private")
+                chunks: list[bytes] = []
+                remaining = opened.st_size
+                while remaining:
+                    chunk = os.read(opened_fd, remaining)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    remaining -= len(chunk)
+                if remaining or os.read(opened_fd, 1):
+                    raise RuntimeError("cleanup ownership journal changed during read")
+                raw = b"".join(chunks)
+            finally:
+                os.close(opened_fd)
+            try:
+                payload = json.loads(raw.decode("utf-8"))
+                ownership = self._cleanup_ownership_from_payload(payload, path)
+            except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+                raise RuntimeError("cleanup ownership journal is invalid") from exc
+            self._cleanup_retries[ownership.session_id] = ownership
+
+    @staticmethod
+    def _cleanup_ownership_from_payload(
+        payload: object,
+        path: Path,
+    ) -> CleanupRetryOwnership:
+        if not isinstance(payload, dict) or set(payload) != {
+            "version",
+            "session_id",
+            "runtime",
+            "eval_runtime",
+            "session_root",
+            "credential_root",
+        }:
+            raise ValueError("cleanup ownership payload is not closed")
+        if payload["version"] != 1 or not isinstance(payload["session_id"], str):
+            raise ValueError("cleanup ownership identity is invalid")
+        session_id = payload["session_id"]
+        expected_name = f"{hashlib.sha256(session_id.encode('utf-8')).hexdigest()}.json"
+        if path.name != expected_name:
+            raise ValueError("cleanup ownership filename does not match session identity")
+
+        def runtime_identity(value: object) -> tuple[str | None, str | None]:
+            if not isinstance(value, dict) or set(value) != {
+                "runtime_id",
+                "container_id",
+            }:
+                raise ValueError("cleanup runtime identity is invalid")
+            runtime_id = value["runtime_id"]
+            container_id = value["container_id"]
+            if runtime_id is not None and not isinstance(runtime_id, str):
+                raise ValueError("cleanup runtime ID is invalid")
+            if container_id is not None and not isinstance(container_id, str):
+                raise ValueError("cleanup container ID is invalid")
+            return runtime_id, container_id
+
+        def root_identity(value: object) -> tuple[Path, tuple[int, int, int]]:
+            if not isinstance(value, dict) or set(value) != {"path", "identity"}:
+                raise ValueError("cleanup root identity is invalid")
+            root_path = Path(value["path"])
+            identity = value["identity"]
+            if (
+                not root_path.is_absolute()
+                or not isinstance(identity, list)
+                or len(identity) != 3
+                or any(not isinstance(item, int) for item in identity)
+            ):
+                raise ValueError("cleanup root identity is invalid")
+            return root_path, tuple(identity)
+
+        runtime_id, container_id = runtime_identity(payload["runtime"])
+        eval_runtime_id, eval_container_id = runtime_identity(payload["eval_runtime"])
+        session_dir, session_identity = root_identity(payload["session_root"])
+        credential_payload = payload["credential_root"]
+        if credential_payload is None:
+            credential_dir = None
+            credential_identity = None
+        else:
+            credential_dir, credential_identity = root_identity(credential_payload)
+        return CleanupRetryOwnership(
+            session_id=session_id,
+            session_dir=session_dir,
+            session_root_identity=session_identity,
+            credential_dir=credential_dir,
+            credential_root_identity=credential_identity,
+            runtime_id=runtime_id,
+            container_id=container_id,
+            eval_runtime_id=eval_runtime_id,
+            eval_container_id=eval_container_id,
+            runtime=None,
+            eval_runtime=None,
+        )
+
+    def _clear_cleanup_ownership(self, session_id: str) -> None:
+        journal_dir = getattr(self, "_cleanup_journal_dir", None)
+        if journal_dir is None:
+            return
+        try:
+            self._cleanup_journal_path(session_id).unlink()
+        except FileNotFoundError:
+            return
+        try:
+            journal_dir.rmdir()
+            journal_dir.parent.rmdir()
+        except OSError:
+            pass
+
+    async def _stop_recovered_container(
+        self,
+        container_id: str,
+        runtime_id: str | None,
+    ) -> bool:
+        runtime = DockerRuntime(
+            RuntimeSpec(image="openevo-cleanup-recovery", container_user="host"),
+            runtime_id or f"recovered-{container_id[:12]}",
+            Path("/tmp"),
+        )
+        runtime._container_id = container_id
+        return await self._stop_runtime_best_effort(
+            runtime,
+            runtime_id or container_id,
+            "recovered runtime",
+        )
+
+    async def _reconcile_cleanup_retries(self) -> None:
+        retries = getattr(self, "_cleanup_retries", None)
+        if not retries:
+            return
+        for session_id, ownership in list(retries.items()):
+            try:
+                await self._reconcile_cleanup_ownership(ownership)
+            except Exception:
+                logger.warning(
+                    "Cleanup reconciliation failed for session %s",
+                    session_id,
+                    exc_info=True,
+                )
+
+    async def _reconcile_cleanup_ownership(
+        self,
+        ownership: CleanupRetryOwnership,
+    ) -> None:
+        session_id = ownership.session_id
+        retries = self._cleanup_retries
+        managed = ownership.managed
+        if managed is None:
+            recovered_targets = [
+                (ownership.eval_container_id, ownership.eval_runtime_id),
+                (ownership.container_id, ownership.runtime_id),
+            ]
+            recovered_outcomes = await asyncio.gather(
+                *(
+                    self._stop_recovered_container(container_id, runtime_id)
+                    for container_id, runtime_id in recovered_targets
+                    if container_id is not None
+                ),
+                return_exceptions=True,
+            )
+            expected_runtime_count = sum(
+                runtime_id is not None or container_id is not None
+                for container_id, runtime_id in recovered_targets
+            )
+            if (
+                len(recovered_outcomes) != expected_runtime_count
+                or not all(outcome is True for outcome in recovered_outcomes)
+            ):
+                return
+            root_tasks = [
+                self._remove_session_dir_best_effort(
+                    ownership.session_dir,
+                    session_id,
+                    ownership.session_root_identity,
+                )
+            ]
+            if ownership.credential_dir is not None:
+                root_tasks.append(
+                    self._remove_credential_dir_best_effort(
+                        ownership.credential_dir,
+                        session_id,
+                        ownership.credential_root_identity,
+                    )
+                )
+            root_outcomes = await asyncio.gather(
+                *root_tasks,
+                return_exceptions=True,
+            )
+            if all(
+                outcome is not False and not isinstance(outcome, BaseException)
+                for outcome in root_outcomes
+            ):
+                retries.pop(session_id, None)
+                self._clear_cleanup_ownership(session_id)
+            return
+        targets = [
+            (ownership.eval_runtime, "eval runtime cleanup retry"),
+            (ownership.runtime, "runtime cleanup retry"),
+        ]
+        outcomes = await asyncio.gather(
+            *(
+                self._stop_runtime_best_effort(runtime, session_id, label)
+                for runtime, label in targets
+                if runtime is not None
+            ),
+            return_exceptions=True,
+        )
+        if not all(outcome is True for outcome in outcomes):
+            return
+        if ownership.finalize_subscription:
+            await self._finalize_subscription_after_runtime_absence(
+                managed,
+                result=managed.final_result,
+            )
+            return
+        if await self._remove_owned_roots(managed):
+            retries.pop(session_id, None)
+            self._clear_cleanup_ownership(session_id)
 
     async def _remove_session_dir_best_effort(
         self,

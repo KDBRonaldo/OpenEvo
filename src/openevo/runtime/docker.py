@@ -40,6 +40,8 @@ class DockerRuntime(BaseRuntime):
         # fresh evaluator runtimes, avoiding collisions with the agent runtime.
         safe_name = session_id.replace("/", "-")[:55]
         self._container_name = f"openevo-{safe_name}"
+        self._container_id: str | None = None
+        self._absence_proven = False
         self._chmod_needed: bool | None = (
             False if spec.container_user == "host" else None
         )
@@ -47,6 +49,18 @@ class DockerRuntime(BaseRuntime):
     @property
     def runtime_id(self) -> str:
         return self._container_name
+
+    @property
+    def container_id(self) -> str | None:
+        return self._container_id
+
+    @property
+    def absence_proven(self) -> bool:
+        return self._absence_proven
+
+    @property
+    def _container_ref(self) -> str:
+        return self._container_id or self._container_name
 
     @property
     def supports_gpus(self) -> bool:
@@ -89,13 +103,20 @@ class DockerRuntime(BaseRuntime):
         for vol in self.spec.kwargs.get("volumes", []):
             create_args.extend(["-v", vol])
         create_args.extend([self.spec.image, "sleep", "infinity"])
-        rc, _, stderr = await self._run_local_command(
+        rc, stdout, stderr = await self._run_local_command(
             *create_args, capture=True, timeout=self._START_TIMEOUT,
         )
         if rc != 0:
             raise RuntimeError(f"docker create failed with exit code {rc}: {stderr}")
+        container_id = str(stdout or "").strip()
+        if not container_id or any(character.isspace() for character in container_id):
+            try:
+                await self.stop()
+            finally:
+                raise RuntimeError("docker create did not return a stable container identity")
+        self._container_id = container_id
         rc, _, stderr = await self._run_local_command(
-            "docker", "start", self._container_name,
+            "docker", "start", self._container_ref,
             capture=True, timeout=self._START_TIMEOUT,
         )
         if rc != 0:
@@ -112,7 +133,7 @@ class DockerRuntime(BaseRuntime):
         if self._chmod_needed:
             await self._run_local_command(
                 "docker", "exec", "--user", "root",
-                self._container_name, "chmod", "-R", "a+rwX", self.runtime_session_dir,
+                self._container_ref, "chmod", "-R", "a+rwX", self.runtime_session_dir,
                 timeout=self._STOP_TIMEOUT,
             )
 
@@ -128,7 +149,7 @@ class DockerRuntime(BaseRuntime):
             try:
                 await self._run_local_command(
                     "docker", "exec", "--user", "root",
-                    self._container_name, "chmod", "-R", "a+rwX",
+                    self._container_ref, "chmod", "-R", "a+rwX",
                     self.runtime_session_dir,
                     timeout=self._STOP_TIMEOUT,
                 )
@@ -137,45 +158,45 @@ class DockerRuntime(BaseRuntime):
         # kill first (instant SIGKILL), then rm to remove metadata.
         try:
             await self._run_local_command(
-                "docker", "kill", self._container_name,
+                "docker", "kill", self._container_ref,
                 timeout=self._STOP_TIMEOUT,
             )
         except Exception:
             logger.warning("docker kill failed for %s", self._container_name)
         try:
             rc, _, stderr = await self._run_local_command(
-                "docker", "rm", "-f", self._container_name,
+                "docker", "rm", "-f", self._container_ref,
                 timeout=self._STOP_TIMEOUT, capture=True,
             )
         except Exception as exc:
             raise RuntimeError(
                 f"docker container {self._container_name} could not be proven removed"
             ) from exc
-        if rc != 0:
-            inspect_rc, _, inspect_stderr = await self._run_local_command(
-                "docker",
-                "container",
-                "inspect",
-                self._container_name,
-                timeout=self._STOP_TIMEOUT,
-                capture=True,
+        inspect_rc, _, inspect_stderr = await self._run_local_command(
+            "docker",
+            "container",
+            "inspect",
+            self._container_ref,
+            timeout=self._STOP_TIMEOUT,
+            capture=True,
+        )
+        absent_message = (inspect_stderr or "").lower()
+        if inspect_rc == 0 or not any(
+            marker in absent_message
+            for marker in ("no such object", "no such container")
+        ):
+            raise RuntimeError(
+                "docker container "
+                f"{self._container_ref} could not be proven removed: "
+                f"{stderr or inspect_stderr or rc}"
             )
-            absent_message = (inspect_stderr or "").lower()
-            if inspect_rc == 0 or not any(
-                marker in absent_message
-                for marker in ("no such object", "no such container")
-            ):
-                raise RuntimeError(
-                    "docker container "
-                    f"{self._container_name} could not be proven removed: "
-                    f"{stderr or inspect_stderr or rc}"
-                )
+        self._absence_proven = True
         self._destroyed = True
 
     async def _detect_chmod_needed(self) -> bool:
         """True unless the container's effective UID matches the host's."""
         rc, stdout, _ = await self._run_local_command(
-            "docker", "exec", self._container_name, "id", "-u",
+            "docker", "exec", self._container_ref, "id", "-u",
             capture=True, timeout=self._STOP_TIMEOUT,
         )
         if rc != 0:
@@ -207,7 +228,7 @@ class DockerRuntime(BaseRuntime):
                     f"export {key}={shlex.quote(str(effective_env[key]))};"
                 )
         wrapped_command = " ".join([*shell_exports, command])
-        args.extend([self._container_name, "bash", "-lc", wrapped_command])
+        args.extend([self._container_ref, "bash", "-lc", wrapped_command])
         rc, stdout, stderr = await self._run_local_command(
             *args, timeout=timeout_sec, capture=True
         )
@@ -222,10 +243,10 @@ class DockerRuntime(BaseRuntime):
             pass
         parent = str(Path(remote_path).parent)
         await self._run_local_command(
-            "docker", "exec", self._container_name, "mkdir", "-p", parent
+            "docker", "exec", self._container_ref, "mkdir", "-p", parent
         )
         rc, _, _ = await self._run_local_command(
-            "docker", "cp", local_path, f"{self._container_name}:{remote_path}"
+            "docker", "cp", local_path, f"{self._container_ref}:{remote_path}"
         )
         if rc != 0:
             raise RuntimeError(f"docker cp upload_file failed with exit code {rc}")
@@ -239,10 +260,10 @@ class DockerRuntime(BaseRuntime):
         except PermissionError:
             pass
         await self._run_local_command(
-            "docker", "exec", self._container_name, "mkdir", "-p", remote_path
+            "docker", "exec", self._container_ref, "mkdir", "-p", remote_path
         )
         rc, _, _ = await self._run_local_command(
-            "docker", "cp", f"{local_path}/.", f"{self._container_name}:{remote_path}"
+            "docker", "cp", f"{local_path}/.", f"{self._container_ref}:{remote_path}"
         )
         if rc != 0:
             raise RuntimeError(f"docker cp upload_dir failed with exit code {rc}")
@@ -259,7 +280,7 @@ class DockerRuntime(BaseRuntime):
         chmod_args.extend(["a+rwX", remote_path])
         rc, _, stderr = await self._run_local_command(
             "docker", "exec", "--user", "root",
-            self._container_name, *chmod_args,
+            self._container_ref, *chmod_args,
             capture=True, timeout=self._STOP_TIMEOUT,
         )
         if rc != 0:
@@ -275,7 +296,7 @@ class DockerRuntime(BaseRuntime):
             pass
         Path(local_path).parent.mkdir(parents=True, exist_ok=True)
         rc, _, _ = await self._run_local_command(
-            "docker", "cp", f"{self._container_name}:{remote_path}", local_path
+            "docker", "cp", f"{self._container_ref}:{remote_path}", local_path
         )
         if rc != 0:
             raise RuntimeError(f"docker cp download_file failed with exit code {rc}")
@@ -288,7 +309,7 @@ class DockerRuntime(BaseRuntime):
             pass
         Path(local_path).parent.mkdir(parents=True, exist_ok=True)
         rc, _, _ = await self._run_local_command(
-            "docker", "cp", f"{self._container_name}:{remote_path}", local_path
+            "docker", "cp", f"{self._container_ref}:{remote_path}", local_path
         )
         if rc != 0:
             raise RuntimeError(f"docker cp download_dir failed with exit code {rc}")

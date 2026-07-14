@@ -36,6 +36,7 @@ from openevo.rollout.timer import StageTimer
 from openevo.runtime.base import BaseRuntime
 from openevo.runtime.managed import MANAGED_CODEX_HOME, MANAGED_RUNTIME_IMAGES
 from openevo.runtime.models import ExecInput, ExecResult, RuntimeSpec
+from openevo.runtime.models import PrepareAction
 from openevo.trajectory.builder.agent_transcript import AgentTranscriptBuilder
 from openevo.trajectory.models import CompletionRecord, CompletionSession, Trajectory
 from openevo.trajectory.registry import default_builder_registry
@@ -394,6 +395,44 @@ async def test_gateway_rejects_non_exact_subscription_contract_before_staging(
     stage_auth.assert_not_called()
 
 
+@pytest.mark.parametrize("env_name", ["HOME", "PATH", "CODEX_HOME"])
+@pytest.mark.parametrize("env_owner", ["agent", "runtime", "action"])
+def test_gateway_rejects_subscription_closed_environment_overrides(
+    tmp_path: Path,
+    env_name: str,
+    env_owner: str,
+) -> None:
+    agent_env = {env_name: "/attacker"} if env_owner == "agent" else {}
+    runtime_env = {env_name: "/attacker"} if env_owner == "runtime" else {}
+    prepare = (
+        [PrepareAction(type="exec", command="true", env={env_name: "/attacker"})]
+        if env_owner == "action"
+        else []
+    )
+    runtime = RuntimeSpec(
+        profile="managed_science",
+        image=MANAGED_RUNTIME_IMAGES["managed_science"],
+        container_user="host",
+        env=runtime_env,
+        prepare=prepare,
+    )
+    request = SessionDispatchRequest(
+        session_id="session_1",
+        task_id="task_1",
+        instruction="Do work.",
+        remaining_timeout_seconds=60,
+        runtime=runtime,
+        agent=AgentSpec(
+            harness="codex",
+            settings={"auth_mode": "subscription", "capture_mode": "transcript"},
+            env=agent_env,
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match=f"{env_name} is Core-owned"):
+        GatewayNodeManager._validate_subscription_admission(request, runtime, tmp_path)
+
+
 def _session_result(
     *,
     session_id: str = "ses_1",
@@ -584,6 +623,7 @@ def _postrun_manager(
     manager.evolution_client = evolution_client
     manager.session_registry = RecordingSessionRegistry(calls)
     manager.storage = RecordingStorage(calls)
+    manager._cleanup_retries = {}
 
     async def run_postrun_steps(managed):
         calls.append("postrun_steps")
@@ -599,10 +639,18 @@ def _postrun_manager(
     async def remove_session_dir(session_dir, session_id, session_root_identity=None):
         calls.append("remove_session_dir")
 
+    async def remove_credential_dir(
+        credential_dir,
+        session_id,
+        credential_root_identity=None,
+    ):
+        calls.append("remove_credential_dir")
+
     manager._run_postrun_steps = run_postrun_steps
     manager._drain_eval_prewarm_task = drain_eval_prewarm_task
     manager._push_result = push_result
     manager._remove_session_dir_best_effort = remove_session_dir
+    manager._remove_credential_dir_best_effort = remove_credential_dir
     return manager
 
 
@@ -679,6 +727,196 @@ async def test_handle_postrun_does_not_cleanup_session_when_runtime_removal_fail
     assert "stop_failed" in calls
     assert "remove_session_dir" not in calls
     assert "remove_credentials" not in calls
+    retry = manager._cleanup_retries[managed.session_id]
+    assert retry.session_id == managed.session_id
+    assert retry.runtime_id == managed.runtime.runtime_id
+    assert retry.session_dir == managed.session_dir
+    assert retry.credential_dir == managed.credential_dir
+
+
+@pytest.mark.asyncio
+async def test_subscription_stops_runtime_and_redacts_background_output_before_result(
+    tmp_path: Path,
+) -> None:
+    calls: list[str] = []
+    manager = _postrun_manager(calls=calls)
+    manager.builders = default_builder_registry()
+    manager.node_id = "node-a"
+    secret = "access-canary"
+    redactor = session_files.CredentialRedactor.from_auth_json(
+        b'{"access_token":"access-canary"}'
+    )
+    log_dir = tmp_path / "logs" / "agent"
+    log_dir.mkdir(parents=True)
+    log_path = log_dir / "step.00.stdout.log"
+    log_path.write_text("initial", encoding="utf-8")
+
+    class BackgroundRuntime(FakeRuntime):
+        @property
+        def runtime_id(self) -> str:
+            return "credential-container-id"
+
+        async def stop(self) -> None:
+            calls.append("runtime_absent")
+            log_path.write_text(f"background {secret}", encoding="utf-8")
+
+    async def build_result(managed: ManagedSession) -> SessionResult:
+        calls.append("build_result")
+        captured = log_path.read_text(encoding="utf-8")
+        return _session_result(
+            session_id=managed.session_id,
+            metadata={"captured": captured, "defensive": secret},
+        )
+
+    manager._build_session_result = build_result
+    request = SessionDispatchRequest(
+        session_id="subscription-session",
+        task_id="task_1",
+        instruction="Do work.",
+        remaining_timeout_seconds=60,
+        runtime=RuntimeSpec(
+            profile="managed_science",
+            image=MANAGED_RUNTIME_IMAGES["managed_science"],
+            container_user="host",
+        ),
+        agent=AgentSpec(
+            harness="codex",
+            model_name="gpt-5.5",
+            settings={"auth_mode": "subscription", "capture_mode": "transcript"},
+        ),
+    )
+    managed = ManagedSession(
+        request=request,
+        timer=StageTimer(),
+        session_dir=tmp_path,
+        artifacts_dir=tmp_path / "artifacts",
+        session_root_identity=capture_session_root_identity(tmp_path),
+        credential_dir=tmp_path.parent / "credentials-subscription-session",
+        credential_root_identity=(1, 2, 3),
+        credential_redactor=redactor,
+        runtime=BackgroundRuntime(),
+        agent_result=AgentRunResult(status="completed", return_code=0),
+    )
+
+    await manager._handle_postrun(managed)
+
+    assert calls.index("runtime_absent") < calls.index("build_result")
+    normalized = manager.session_registry.results[-1]
+    serialized = normalized.model_dump_json()
+    assert "background" in serialized
+    assert secret not in serialized
+
+
+@pytest.mark.asyncio
+async def test_cleanup_retry_reconciliation_retries_owned_runtime_and_roots(
+    tmp_path: Path,
+) -> None:
+    calls: list[str] = []
+    manager = _postrun_manager(calls=calls)
+    attempts = 0
+
+    async def stop_runtime(runtime, session_id, label):
+        nonlocal attempts
+        del runtime, session_id, label
+        attempts += 1
+        return attempts > 1
+
+    manager._stop_runtime_best_effort = stop_runtime
+    managed = _managed_postrun_session(tmp_path, _session_result())
+    managed.runtime = FakeRuntime()
+    managed.credential_dir = tmp_path / "credentials"
+
+    await manager._handle_postrun(managed)
+    assert managed.session_id in manager._cleanup_retries
+
+    await manager._reconcile_cleanup_retries()
+
+    assert managed.session_id not in manager._cleanup_retries
+    assert calls.count("remove_session_dir") == 1
+
+
+@pytest.mark.asyncio
+async def test_cleanup_ownership_persists_for_new_manager_startup_reconciliation(
+    tmp_path: Path,
+) -> None:
+    journal_dir = tmp_path / "cleanup-journal"
+    session_dir = tmp_path / "session"
+    credential_dir = tmp_path / "credentials"
+    session_dir.mkdir()
+    credential_dir.mkdir()
+
+    class JournalRuntime(FakeRuntime):
+        @property
+        def runtime_id(self) -> str:
+            return "openevo-journal-session"
+
+        @property
+        def container_id(self) -> str:
+            return "sha256:journal-container"
+
+    class EvalJournalRuntime(FakeRuntime):
+        @property
+        def runtime_id(self) -> str:
+            return "openevo-journal-session-eval"
+
+        @property
+        def container_id(self) -> str:
+            return "sha256:journal-eval-container"
+
+    managed = _managed_postrun_session(session_dir, _session_result(session_id="journal"))
+    managed.runtime = JournalRuntime()
+    managed.eval_runtime = EvalJournalRuntime()
+    managed.session_root_identity = capture_session_root_identity(session_dir)
+    managed.credential_dir = credential_dir
+    managed.credential_root_identity = capture_session_root_identity(credential_dir)
+
+    first = GatewayNodeManager.__new__(GatewayNodeManager)
+    first._cleanup_retries = {}
+    first._cleanup_journal_dir = journal_dir
+    first._register_cleanup_retry(managed, eval_runtime=managed.eval_runtime)
+
+    journal_files = list(journal_dir.glob("*.json"))
+    assert len(journal_files) == 1
+    journal_text = journal_files[0].read_text(encoding="utf-8")
+    assert "sha256:journal-container" in journal_text
+    assert "sha256:journal-eval-container" in journal_text
+    assert "credential" in journal_text
+    assert "access_token" not in journal_text
+
+    calls: list[str] = []
+    restarted = GatewayNodeManager.__new__(GatewayNodeManager)
+    restarted._cleanup_retries = {}
+    restarted._cleanup_journal_dir = journal_dir
+
+    async def stop_recovered(container_id: str, runtime_id: str | None) -> bool:
+        calls.append(f"stop:{container_id}:{runtime_id}")
+        return True
+
+    async def remove_session(*args, **kwargs):
+        del args, kwargs
+        calls.append("session")
+        return True
+
+    async def remove_credential(*args, **kwargs):
+        del args, kwargs
+        calls.append("credential")
+        return True
+
+    restarted._stop_recovered_container = stop_recovered
+    restarted._remove_session_dir_best_effort = remove_session
+    restarted._remove_credential_dir_best_effort = remove_credential
+
+    restarted._load_cleanup_retries()
+    await restarted._reconcile_cleanup_retries()
+
+    assert calls == [
+        "stop:sha256:journal-eval-container:openevo-journal-session-eval",
+        "stop:sha256:journal-container:openevo-journal-session",
+        "session",
+        "credential",
+    ]
+    assert restarted._cleanup_retries == {}
+    assert list(journal_dir.glob("*.json")) == []
 
 
 @pytest.mark.asyncio
@@ -743,6 +981,10 @@ class FakeRuntime:
         self.runtime_session_dir = "/openevo/session"
         self.uploads: dict[str, str] = {}
         self.exec_commands: list[str] = []
+
+    @property
+    def runtime_id(self) -> str:
+        return "fake-runtime"
 
     async def exec(self, command, **kwargs):
         self.exec_commands.append(command)

@@ -16,6 +16,7 @@ from pydantic import (
 
 from openevo.evolution.framework import ProjectEvolutionTargetMap
 from openevo.projects.evolution_defaults import default_project_evolution_targets
+from openevo.runtime.managed import reject_managed_subscription_env
 
 
 class _StrictModel(BaseModel):
@@ -124,6 +125,8 @@ class EnvironmentConfig(_StrictModel):
                 raise ValueError("environment.custom_image is required for custom_image")
         elif self.custom_image is not None:
             raise ValueError("environment.custom_image is only valid for custom_image")
+        if self.profile != "custom_image":
+            reject_managed_subscription_env(self.env, owner="environment")
         return self
 
 

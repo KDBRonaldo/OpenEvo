@@ -71,13 +71,13 @@ promise that arbitrary images can run under a replaced user identity. A custom
 image, loader, option/volume, entrypoint, image-user runtime, or non-literal
 transcript capture mode is rejected before credential bytes are staged.
 
-Managed Science compiles `HOME=/openevo/session/home` and keeps
-`/home/openevo/.local/bin` first in `PATH`, where the managed image installs the
-pinned Codex binary. For subscription release sessions Core ignores caller
-choice and fixes `CODEX_HOME=/openevo/credentials/codex`, a separate private
-bind mount outside `/openevo/session`; caller `agent.env` and `runtime.env`
-cannot set it. `HOME` remains `/openevo/session/home`, so evolution skills and
-ordinary writable state do not share the credential root.
+Managed Science fixes `HOME=/openevo/session/home` and a closed `PATH` beginning
+with `/home/openevo/.local/bin`, where the managed image installs the pinned
+Codex binary. Subscription execution invokes
+`/home/openevo/.local/bin/codex` directly, so a workspace executable cannot
+shadow it. Core also fixes `CODEX_HOME=/openevo/credentials/codex`, a separate
+private bind mount outside `/openevo/session`. Caller `agent.env`, `runtime.env`,
+and prepare-action env cannot override any of these three values.
 
 Host-user startup, upload, stop, and failed-start cleanup never invoke the
 legacy recursive `a+rwX` compatibility path. Gateway teardown instead pins the
@@ -86,5 +86,9 @@ permissions through stable descriptors, and removes a bounded no-follow tree.
 An owner or identity mismatch fails closed rather than acting on a replacement
 path.
 
-Docker kill/remove failures leave `_destroyed` false and are retryable. Gateway
-does not remove either bind root until container absence is proven.
+Docker records the immutable container ID returned by `docker create` and uses
+that ID for execution and cleanup. Every stop attempt, including a successful
+`rm -f`, ends with `docker container inspect <id>` and marks the runtime
+destroyed only when the response proves that exact ID absent. Gateway does not
+remove either bind root until that proof succeeds; cleanup ownership remains in
+a private startup/shutdown retry journal otherwise.

@@ -22,6 +22,7 @@ from openevo.evolution.framework import (
 from openevo.projects.evolution_defaults import default_project_evolution_targets
 from openevo.runtime.managed import (
     ManagedRuntimeProfile,
+    reject_managed_subscription_env,
     require_managed_subscription_runtime,
 )
 
@@ -93,8 +94,8 @@ class AgentConfig(_StrictModel):
             raise ValueError(
                 "managed subscription execution currently requires agent.preset='codex'"
             )
-        if self.auth in _SUBSCRIPTION_AUTH_MODES and "CODEX_HOME" in self.env:
-            raise ValueError("subscription CODEX_HOME is Core-owned and must be omitted")
+        if self.auth in _SUBSCRIPTION_AUTH_MODES:
+            reject_managed_subscription_env(self.env, owner="agent")
         if "native_memory_policy" in self.settings:
             native_memory_policy = self.settings["native_memory_policy"]
             if (
@@ -269,9 +270,15 @@ class ExperimentConfig(_StrictModel):
         if len(task_ids) != len(set(task_ids)):
             raise ValueError("tasks[].id values must be unique")
         if self.agent.auth in _SUBSCRIPTION_AUTH_MODES:
-            if "CODEX_HOME" in self.runtime.env:
-                raise ValueError(
-                    "subscription runtime CODEX_HOME is Core-owned and must be omitted"
+            reject_managed_subscription_env(
+                self.runtime.env,
+                owner="runtime",
+                allow_exact=True,
+            )
+            for action in self.runtime.prepare:
+                reject_managed_subscription_env(
+                    action.env,
+                    owner="runtime action",
                 )
             require_managed_subscription_runtime(
                 profile=self.runtime.profile,

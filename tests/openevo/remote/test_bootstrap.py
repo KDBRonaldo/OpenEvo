@@ -20,6 +20,7 @@ from openevo.deployment.preflight import (
 )
 from openevo.projects.science import ScienceProjectConfig
 from openevo.deployment import RemoteProfileConfig, build_sidecar_science_plan
+from openevo.deployment.planner import SidecarSciencePlan
 
 
 class RecordingTransport:
@@ -628,6 +629,37 @@ def test_custom_runtime_bootstrap_remains_pull_only() -> None:
     assert "--network=host" not in docker_step.command
     assert "docker build" not in docker_step.command
     assert docker_step.manifest["managed_runtime"] is False
+
+
+def test_custom_profile_collision_with_managed_tag_remains_pull_only() -> None:
+    original = build_sidecar_science_plan(
+        _project(
+            environment={
+                "profile": "custom_image",
+                "custom_image": "openevo/science-runtime:0.1.0",
+            },
+            execution={"mode": "self-deployed", "hf_model": "Qwen/Qwen3-8B"},
+        ),
+        _profile(),
+    )
+
+    plan = build_remote_bootstrap_plan(original)
+    docker_step = {step.id: step for step in plan.steps}["docker_pull_runtime"]
+
+    assert docker_step.command.endswith("docker pull openevo/science-runtime:0.1.0")
+    assert "docker build" not in docker_step.command
+    assert "--network=host" not in docker_step.command
+    assert docker_step.manifest["managed_runtime"] is False
+
+
+def test_unknown_profile_collision_with_managed_tag_is_rejected() -> None:
+    original = build_sidecar_science_plan(_project(), _profile())
+    payload = original.model_dump(mode="python")
+    payload["experiment"]["runtime"]["profile"] = "attacker_managed_science"
+    collided = SidecarSciencePlan(**payload)
+
+    with pytest.raises(ValueError, match="runtime profile/image binding"):
+        build_remote_bootstrap_plan(collided)
 
 
 def test_build_remote_bootstrap_plan_adds_managed_inference_hf_prefetch() -> None:

@@ -94,7 +94,7 @@ The current builder emits idempotent remote steps:
 | `ensure_openevo_cli` | Legacy run-scoped maintainer compatibility only. Its user-site package check is not the release Core host-service installer and must not be used to replace an active daemon. The Core Control product path uploads the exact wheel and sibling `framework-lock.json`, creates a fresh isolated generation under `~/.openevo/core/releases/`, verifies that generation's complete lock-declared Core distribution inventory, and only then enters controlled daemon attach/replacement. |
 | `check_codex_cli` | Subscription mode only; verifies `codex --version`. |
 | `check_codex_subscription` | Subscription mode only; verifies `~/.codex/auth.json`. |
-| `docker_pull_runtime` | For custom images, pulls the image declared by the compiled experiment. For managed OpenEvo Science images, writes a managed runtime Dockerfile under `<state_root>/runtime-images/` and runs `docker pull <image> || docker build ... -t <image> ...`. |
+| `docker_pull_runtime` | For custom images, pulls the image declared by the compiled experiment. Only an exact closed managed profile-to-image binding writes a managed runtime Dockerfile under `<state_root>/runtime-images/` and runs `docker pull <image> || docker build ... -t <image> ...`. |
 | `hf_snapshot_download` | Managed local inference only; installs `huggingface_hub` for the remote user and downloads the HF model snapshot. |
 
 `bootstrap.json` records the state root, workspace root, experiment snapshot
@@ -102,7 +102,8 @@ path, runtime image, and managed HF model name when one is present.
 
 Managed runtime fallback images are built from public Python and Node bases and
 install the pinned Codex CLI used by the existing Codex harness examples. The
-fallback is only for OpenEvo-managed image names. Developer-supplied
+fallback requires both the Core-owned profile and its exact bound image, not
+only a matching image tag. Developer-supplied
 `custom_image` profiles remain pull-only, because OpenEvo cannot infer their
 Dockerfile or system dependencies. The generated Dockerfile uses HTTPS Debian
 sources and requires valid archive signatures. A full remote filesystem,
@@ -165,7 +166,8 @@ build args; no proxy value is embedded in the command text. The exact
 Core-owned managed Dockerfile builds with `--network=host`, allowing an
 explicit server-loopback proxy (`127.0.0.1:<port>`) to remain reachable from
 APT and npm build steps. Custom images remain pull-only and do not receive
-build or host-network privileges.
+build or host-network privileges even when their tag collides with a managed
+image. Unknown non-null runtime profiles fail bootstrap planning.
 
 The `ensure_openevo_cli` step is intentionally user-scoped. It never falls back
 to installing the latest package from PyPI. Desktop first looks for a

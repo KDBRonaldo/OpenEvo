@@ -235,6 +235,37 @@ def test_subscription_agent_cannot_supply_codex_home(codex_home: str) -> None:
         ExperimentConfig.model_validate(payload)
 
 
+@pytest.mark.parametrize("env_name", ["HOME", "PATH", "CODEX_HOME"])
+@pytest.mark.parametrize("env_owner", ["agent", "runtime", "prepare"])
+def test_subscription_closed_environment_rejects_caller_overrides(
+    env_name: str,
+    env_owner: str,
+) -> None:
+    payload = _minimal_payload()
+    payload["agent"] = {
+        "preset": "codex",
+        "model": "gpt-5.5",
+        "auth": "subscription",
+        "settings": {"capture_mode": "transcript"},
+    }
+    payload["runtime"] = {
+        "profile": "managed_science",
+        "image": MANAGED_RUNTIME_IMAGES["managed_science"],
+        "container_user": "host",
+    }
+    if env_owner == "agent":
+        payload["agent"]["env"] = {env_name: "/attacker"}
+    elif env_owner == "runtime":
+        payload["runtime"]["env"] = {env_name: "/attacker"}
+    else:
+        payload["runtime"]["prepare"] = [
+            {"type": "exec", "command": "true", "env": {env_name: "/attacker"}}
+        ]
+
+    with pytest.raises(ValidationError, match=f"{env_name} is Core-owned"):
+        ExperimentConfig.model_validate(payload)
+
+
 def test_subscription_agents_cannot_enable_parametric_memory() -> None:
     payload = _minimal_payload()
     payload["agent"] = {

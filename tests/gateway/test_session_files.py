@@ -145,6 +145,61 @@ def test_auth_staging_detects_source_path_exchange_and_removes_target(
     assert not (root / "home" / ".codex" / "auth.json").exists()
 
 
+def test_auth_staging_detects_source_ancestor_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = _private_auth(tmp_path, '{"access_token":"source-secret"}')
+    source_home = tmp_path / "home"
+    displaced_home = tmp_path / "displaced-home"
+    root, identity = _session_root(tmp_path)
+    original_copy = session_files._copy_exact
+
+    def replace_ancestor_then_copy(
+        source_fd: int,
+        target_fd: int,
+        expected_size: int,
+    ) -> None:
+        source_home.rename(displaced_home)
+        replacement = source
+        replacement.parent.mkdir(parents=True)
+        replacement.write_text('{"access_token":"replacement"}', encoding="utf-8")
+        replacement.chmod(0o600)
+        original_copy(source_fd, target_fd, expected_size)
+
+    monkeypatch.setattr(session_files, "_copy_exact", replace_ancestor_then_copy)
+
+    with pytest.raises(SessionFileSecurityError, match="ancestor.*changed"):
+        _stage(source, root, identity)
+
+
+def test_auth_staging_detects_credential_root_ancestor_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = _private_auth(tmp_path, '{"access_token":"target-secret"}')
+    anchor = tmp_path / "credential-anchor"
+    root = anchor / "session"
+    root.mkdir(parents=True, mode=0o700)
+    identity = capture_session_root_identity(root)
+    displaced_anchor = tmp_path / "displaced-credential-anchor"
+    original_copy = session_files._copy_exact
+
+    def replace_ancestor_then_copy(
+        source_fd: int,
+        target_fd: int,
+        expected_size: int,
+    ) -> None:
+        anchor.rename(displaced_anchor)
+        root.mkdir(parents=True, mode=0o700)
+        original_copy(source_fd, target_fd, expected_size)
+
+    monkeypatch.setattr(session_files, "_copy_exact", replace_ancestor_then_copy)
+
+    with pytest.raises(SessionFileSecurityError, match="ancestor.*changed"):
+        _stage(source, root, identity)
+
+
 def test_auth_staging_detects_target_replacement_without_leaking_secret(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -303,6 +358,42 @@ def test_capture_tree_redaction_covers_workspace_artifacts_and_logs(
     assert "account-canary" not in persisted
     assert auth.decode() not in persisted
     assert "visible" in persisted
+
+
+def test_capture_tree_redaction_rechecks_recursive_directory_path_binding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    redactor = session_files.CredentialRedactor.from_auth_json(
+        b'{"access_token":"access-canary"}'
+    )
+    root, identity = _session_root(tmp_path)
+    nested = root / "workspace" / "nested"
+    nested.mkdir(parents=True)
+    (nested / "capture.txt").write_text("access-canary", encoding="utf-8")
+    displaced = root / "workspace" / "displaced"
+    original_replace = session_files._replace_fd_contents
+    replaced = False
+
+    def replace_directory_after_file_redaction(descriptor: int, value: bytes) -> None:
+        nonlocal replaced
+        original_replace(descriptor, value)
+        if not replaced:
+            replaced = True
+            nested.rename(displaced)
+            nested.mkdir()
+            (nested / "attacker.txt").write_text("access-canary", encoding="utf-8")
+
+    monkeypatch.setattr(
+        session_files,
+        "_replace_fd_contents",
+        replace_directory_after_file_redaction,
+    )
+
+    with pytest.raises(SessionFileSecurityError, match="directory path changed"):
+        session_files.redact_session_capture_tree(root, identity, redactor)
+
+    assert (nested / "attacker.txt").read_text(encoding="utf-8") == "access-canary"
 
 
 def test_cleanup_recovers_nested_zero_modes_and_removes_staged_auth(tmp_path: Path) -> None:

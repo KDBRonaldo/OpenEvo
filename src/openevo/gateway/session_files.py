@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import stat
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Final, TypeAlias
 
@@ -35,6 +36,51 @@ _PATH_FLAGS: Final[int] = (
 
 class SessionFileSecurityError(RuntimeError):
     """Raised when private session state cannot be handled without a path race."""
+
+
+@dataclass(slots=True)
+class _AbsoluteDirectoryPin:
+    path: Path
+    parts: tuple[str, ...]
+    descriptors: list[int]
+    identities: tuple[tuple[int, int, int, int], ...]
+
+    @property
+    def descriptor(self) -> int:
+        return self.descriptors[-1]
+
+    def verify(self, *, label: str) -> None:
+        current_fd = -1
+        try:
+            for descriptor, expected in zip(self.descriptors, self.identities):
+                if _full_object_identity(os.fstat(descriptor)) != expected:
+                    raise SessionFileSecurityError(f"{label} ancestor descriptor changed")
+
+            current_fd = os.dup(self.descriptors[0])
+            if _full_object_identity(os.fstat(current_fd)) != self.identities[0]:
+                raise SessionFileSecurityError(f"{label} absolute anchor changed")
+            for part, expected in zip(self.parts, self.identities[1:]):
+                before = os.stat(part, dir_fd=current_fd, follow_symlinks=False)
+                if _full_object_identity(before) != expected:
+                    raise SessionFileSecurityError(f"{label} ancestor path changed")
+                next_fd = os.open(part, _DIRECTORY_FLAGS, dir_fd=current_fd)
+                opened = os.fstat(next_fd)
+                if _full_object_identity(opened) != expected:
+                    os.close(next_fd)
+                    raise SessionFileSecurityError(f"{label} ancestor path changed")
+                os.close(current_fd)
+                current_fd = next_fd
+        except SessionFileSecurityError:
+            raise
+        except OSError as exc:
+            raise SessionFileSecurityError(f"{label} ancestor path changed") from exc
+        finally:
+            if current_fd >= 0:
+                os.close(current_fd)
+
+    def close(self) -> None:
+        while self.descriptors:
+            os.close(self.descriptors.pop())
 
 
 class CredentialRedactor:
@@ -149,8 +195,16 @@ def stage_codex_subscription_auth(
     target_fd = -1
     target_identity: tuple[int, int] | None = None
     redactor: CredentialRedactor | None = None
+    source_pin: _AbsoluteDirectoryPin | None = None
+    target_pin: _AbsoluteDirectoryPin | None = None
     try:
-        source_parent_fd, source_name = _open_absolute_parent(source)
+        if not source.is_absolute() or source.name in {"", ".", ".."}:
+            raise SessionFileSecurityError(
+                "Codex subscription auth source must be absolute and canonical"
+            )
+        source_pin = _pin_absolute_directory(source.parent)
+        source_pin.verify(label="Codex subscription auth source")
+        source_parent_fd = os.dup(source_pin.descriptor)
         source_before = os.stat(
             source_name,
             dir_fd=source_parent_fd,
@@ -172,24 +226,15 @@ def stage_codex_subscription_auth(
                 "Codex subscription auth changed while it was opened"
             )
 
-        root_path_fd, _parent_fd, _root_name = _open_pinned_session_root(
-            session_dir,
-            session_identity,
+        target_pin = _pin_absolute_directory(session_dir)
+        target_pin.verify(label="credential root")
+        _require_session_identity(os.fstat(target_pin.descriptor), session_identity)
+        _fchmod_stable(target_pin.descriptor, 0o700, label="session root")
+        target_parent_fd = _open_private_directories(
+            target_pin.descriptor,
+            target_home_parts,
+            expected_owner=session_identity[2],
         )
-        try:
-            _fchmod_stable(root_path_fd, 0o700, label="session root")
-            root_fd = _open_readable_directory(root_path_fd, label="session root")
-            try:
-                target_parent_fd = _open_private_directories(
-                    root_fd,
-                    target_home_parts,
-                    expected_owner=session_identity[2],
-                )
-            finally:
-                os.close(root_fd)
-        finally:
-            os.close(root_path_fd)
-            os.close(_parent_fd)
 
         target_fd = os.open(
             "auth.json",
@@ -274,6 +319,8 @@ def stage_codex_subscription_auth(
             target_final,
             label="staged Codex auth",
         )
+        source_pin.verify(label="Codex subscription auth source")
+        target_pin.verify(label="credential root")
         return redactor
     except FileNotFoundError as exc:
         _scrub_staged_auth(target_fd, target_identity)
@@ -297,6 +344,10 @@ def stage_codex_subscription_auth(
         for descriptor in (target_fd, target_parent_fd, source_fd, source_parent_fd):
             if descriptor >= 0:
                 os.close(descriptor)
+        if target_pin is not None:
+            target_pin.close()
+        if source_pin is not None:
+            source_pin.close()
 
 
 def remove_session_tree(
@@ -354,13 +405,12 @@ def redact_session_capture_tree(
 ) -> None:
     """Redact exact credential material from session-owned capture surfaces."""
 
-    root_path_fd, parent_fd, _root_name = _open_pinned_session_root(
-        session_dir,
-        session_identity,
-    )
+    root_pin = _pin_absolute_directory(session_dir)
     budget = [max_nodes, max_total_bytes]
     try:
-        root_fd = _open_readable_directory(root_path_fd, label="session root")
+        root_pin.verify(label="session capture root")
+        _require_session_identity(os.fstat(root_pin.descriptor), session_identity)
+        root_fd = _open_readable_directory(root_pin.descriptor, label="session root")
         try:
             _redact_directory_contents(
                 root_fd,
@@ -372,9 +422,10 @@ def redact_session_capture_tree(
             )
         finally:
             os.close(root_fd)
+        root_pin.verify(label="session capture root")
+        _require_session_identity(os.fstat(root_pin.descriptor), session_identity)
     finally:
-        os.close(root_path_fd)
-        os.close(parent_fd)
+        root_pin.close()
 
 
 def _open_absolute_parent(path: Path) -> tuple[int, str]:
@@ -397,6 +448,33 @@ def _open_absolute_directory(path: Path) -> int:
         return current_fd
     except Exception:
         os.close(current_fd)
+        raise
+
+
+def _pin_absolute_directory(path: Path) -> _AbsoluteDirectoryPin:
+    parts = path.parts
+    if not parts or parts[0] != os.sep or any(
+        part in {"", ".", ".."} for part in parts[1:]
+    ):
+        raise SessionFileSecurityError(
+            "private session path must be absolute and canonical"
+        )
+    descriptors = [os.open(os.sep, _DIRECTORY_FLAGS)]
+    identities = [_full_object_identity(os.fstat(descriptors[0]))]
+    try:
+        for part in parts[1:]:
+            descriptor = os.open(part, _DIRECTORY_FLAGS, dir_fd=descriptors[-1])
+            descriptors.append(descriptor)
+            identities.append(_full_object_identity(os.fstat(descriptor)))
+        return _AbsoluteDirectoryPin(
+            path=path,
+            parts=tuple(parts[1:]),
+            descriptors=descriptors,
+            identities=tuple(identities),
+        )
+    except Exception:
+        while descriptors:
+            os.close(descriptors.pop())
         raise
 
 
@@ -665,6 +743,12 @@ def _redact_directory_contents(
                     depth=depth + 1,
                     max_depth=max_depth,
                     budget=budget,
+                )
+                _require_path_identity(
+                    directory_fd,
+                    name,
+                    opened,
+                    label="credential scan directory",
                 )
             finally:
                 os.close(child_fd)
