@@ -256,6 +256,13 @@ class IdempotencyResult:
     replayed: bool
 
 
+@dataclass(frozen=True)
+class ProfileRuntimeActionReservation:
+    operation: LocalOperationV1
+    profile: RemoteProfileV1 | None
+    replayed: bool
+
+
 _ModelT = TypeVar("_ModelT", bound=BaseModel)
 _Direction = Literal["asc", "desc"]
 
@@ -671,6 +678,27 @@ class ProviderMutation:
         )
         for profile_id in profile_ids:
             self._store._reconcile_profile_operations(self._connection, profile_id)
+
+    def cancel_nonterminal_profile_operations(self, profile_id: str) -> None:
+        self._store._validate_resource_id(profile_id)
+        rows = self._connection.execute(
+            """
+            SELECT operation_id
+            FROM local_operations
+            WHERE resource_type = 'profile' AND resource_id = ?
+              AND state IN ('queued', 'running', 'cancelling')
+            ORDER BY operation_id
+            """,
+            (profile_id,),
+        ).fetchall()
+        for row in rows:
+            self._store._reconcile_operation_with_authority(
+                self._connection,
+                self._store._require_operation_row(
+                    self._connection, cast(str, row["operation_id"])
+                ),
+                force_cancel_nonterminal=True,
+            )
 
     def create_local_operation(
         self,
@@ -1848,44 +1876,302 @@ class DesktopProviderStore:
             mutation=mutation,
         )
 
-    def prepare_profile_runtime_action(
+    def begin_profile_runtime_action(
         self,
-        profile_id: str,
         *,
+        route: str,
+        operation_kind: str,
+        profile_id: str,
+        key: str,
+        body: BaseModel | Mapping[str, object],
         if_match: str,
         displace_existing: bool,
-    ) -> RemoteProfileV1:
-        """Validate action authority and persist any immediately displaced owner."""
+    ) -> ProfileRuntimeActionReservation:
+        """Atomically reserve idempotency capacity and persisted runtime ownership."""
 
         if type(displace_existing) is not bool:
             raise ContractValidationError("displace_existing must be a boolean")
+        if operation_kind not in _PROFILE_OPERATION_KINDS:
+            raise ContractValidationError("profile runtime operation kind is invalid")
+        identity = self._profile_action_identity(
+            route=route,
+            profile_id=profile_id,
+            key=key,
+            body=body,
+            if_match=if_match,
+        )
         with self._transaction(write=True) as connection:
+            now_epoch = identity[5]
+            connection.execute(
+                "DELETE FROM idempotency_records WHERE expires_at_epoch <= ?", (now_epoch,)
+            )
+            existing = self._profile_action_replay(connection, identity)
+            if existing is not None:
+                return ProfileRuntimeActionReservation(existing, None, True)
+            count = cast(
+                int, connection.execute("SELECT count(*) FROM idempotency_records").fetchone()[0]
+            )
+            if count >= self._max_idempotency_records:
+                raise IdempotencyCapacityError("live idempotency record capacity is exhausted")
+
             transaction = ProviderMutation(self, connection, if_match=if_match)
             profile = transaction.require_profile_authority(profile_id, if_match=if_match)
             if displace_existing:
                 transaction.disconnect_other_profiles(profile_id)
-            return profile
-
-    def fail_profile_runtime_action(
-        self,
-        profile_id: str,
-        *,
-        if_match: str,
-    ) -> RemoteProfileV1:
-        """Converge the current failed lifecycle owner to disconnected."""
-
-        with self._transaction(write=True) as connection:
-            transaction = ProviderMutation(self, connection, if_match=if_match)
-            profile = transaction.require_profile_authority(profile_id, if_match=if_match)
-            if profile.connection_state == "disconnected":
-                return profile
-            return transaction.set_profile_runtime_state(
+            transaction.cancel_nonterminal_profile_operations(profile_id)
+            transaction.set_profile_runtime_state(
                 profile_id,
                 if_match=if_match,
-                connection_state="disconnected",
+                connection_state="connecting",
                 credential_slots=profile.credential_slots,
                 host_key_fingerprint=profile.host_key_fingerprint,
             )
+            operation = transaction.create_local_operation(
+                operation_kind=operation_kind,
+                resource=ResourceRefV1(resource_type="profile", resource_id=profile_id),
+                state="running",
+            )
+            response_bytes = _canonical_json_bytes(operation.model_dump(mode="json"))
+            self._insert_idempotency_record(
+                connection,
+                principal=LOCAL_PRINCIPAL,
+                method=identity[0],
+                route=identity[1],
+                resource_scope=identity[2],
+                key=identity[3],
+                request_digest=identity[4],
+                response_type="LocalOperationV1",
+                status_code=202,
+                response_bytes=response_bytes,
+                now_epoch=now_epoch,
+            )
+            return ProfileRuntimeActionReservation(operation, profile, False)
+
+    def complete_profile_runtime_action(
+        self,
+        *,
+        reservation: ProfileRuntimeActionReservation,
+        route: str,
+        profile_id: str,
+        key: str,
+        body: BaseModel | Mapping[str, object],
+        if_match: str,
+        connection_state: Literal["connected", "disconnected", "host_key_required"],
+        host_key_fingerprint: str | None,
+    ) -> LocalOperationV1:
+        identity = self._profile_action_identity(
+            route=route,
+            profile_id=profile_id,
+            key=key,
+            body=body,
+            if_match=if_match,
+        )
+        with self._transaction(write=True) as connection:
+            operation, row = self._require_reserved_profile_action(
+                connection, identity, reservation.operation.operation_id
+            )
+            if operation.state == "succeeded":
+                return operation
+            if operation.state != "running":
+                raise ProviderStoreError("profile runtime action is no longer completable")
+            current = self._profile_from_row(self._require_profile_row(connection, profile_id))
+            updated = ProviderMutation(self, connection).set_profile_runtime_state(
+                profile_id,
+                if_match=current.etag,
+                connection_state=connection_state,
+                credential_slots=current.credential_slots,
+                host_key_fingerprint=host_key_fingerprint,
+            )
+            result = ConnectionOperationResultV1(
+                profile_id=profile_id,
+                connection_state=cast(
+                    Literal["connected", "disconnected", "host_key_required"],
+                    updated.connection_state,
+                ),
+            )
+            return self._finish_reserved_profile_action(
+                connection,
+                identity,
+                row,
+                operation,
+                state="succeeded",
+                status_code=202,
+                result=result,
+                error=None,
+            )
+
+    def fail_profile_runtime_action(
+        self,
+        *,
+        reservation: ProfileRuntimeActionReservation,
+        route: str,
+        profile_id: str,
+        key: str,
+        body: BaseModel | Mapping[str, object],
+        if_match: str,
+        error: ApiErrorV1,
+        compensate_committed_success: bool = False,
+    ) -> LocalOperationV1:
+        """Persist a replayable failed operation and converge its owned profile state."""
+
+        identity = self._profile_action_identity(
+            route=route,
+            profile_id=profile_id,
+            key=key,
+            body=body,
+            if_match=if_match,
+        )
+        with self._transaction(write=True) as connection:
+            operation, row = self._require_reserved_profile_action(
+                connection, identity, reservation.operation.operation_id
+            )
+            if operation.state == "failed":
+                return operation
+            if operation.state == "running" or (
+                compensate_committed_success and operation.state == "succeeded"
+            ):
+                current = self._profile_from_row(self._require_profile_row(connection, profile_id))
+                ProviderMutation(self, connection).set_profile_runtime_state(
+                    profile_id,
+                    if_match=current.etag,
+                    connection_state="disconnected",
+                    credential_slots=current.credential_slots,
+                    host_key_fingerprint=current.host_key_fingerprint,
+                )
+            elif operation.state != "cancelled":
+                raise ProviderStoreError("profile runtime action is no longer failable")
+            return self._finish_reserved_profile_action(
+                connection,
+                identity,
+                row,
+                operation,
+                state="failed",
+                status_code=error.http_status,
+                result=None,
+                error=error,
+            )
+
+    def _profile_action_identity(
+        self,
+        *,
+        route: str,
+        profile_id: str,
+        key: str,
+        body: BaseModel | Mapping[str, object],
+        if_match: str,
+    ) -> tuple[str, str, str, str, str, int]:
+        self._validate_if_match(if_match)
+        method = "POST"
+        route = self._bounded_identity("route", route, MAX_IDENTITY_BYTES)
+        profile_id = self._bounded_identity(
+            "resource_scope", profile_id, MAX_IDENTITY_BYTES
+        )
+        key = self._bounded_identity(
+            "idempotency key", key, MAX_IDEMPOTENCY_KEY_BYTES, minimum=16
+        )
+        body_value = body.model_dump(mode="json") if isinstance(body, BaseModel) else dict(body)
+        request_value = {"body": body_value, "headers": {"if-match": if_match}}
+        self._reject_credential_bearing_keys(request_value)
+        request_bytes = _canonical_json_bytes(request_value)
+        if len(request_bytes) > MAX_REQUEST_BYTES:
+            raise ContractValidationError("canonical idempotency request exceeds the byte limit")
+        return method, route, profile_id, key, sha256(request_bytes).hexdigest(), int(
+            self._now().timestamp()
+        )
+
+    def _profile_action_replay(
+        self,
+        connection: sqlite3.Connection,
+        identity: tuple[str, str, str, str, str, int],
+    ) -> LocalOperationV1 | None:
+        row = connection.execute(
+            """
+            SELECT request_digest, response_type, response_bytes
+            FROM idempotency_records
+            WHERE principal = ? AND method = ? AND route = ?
+              AND resource_scope = ? AND idempotency_key = ?
+            """,
+            (LOCAL_PRINCIPAL, *identity[:4]),
+        ).fetchone()
+        if row is None:
+            return None
+        if row["request_digest"] != identity[4]:
+            raise IdempotencyConflictError(
+                "idempotency key is already bound to a different request"
+            )
+        if row["response_type"] != "LocalOperationV1":
+            raise ProviderDataCorruptionError(
+                "profile action replay response type is not LocalOperationV1"
+            )
+        stored = self._model_from_response(LocalOperationV1, bytes(row["response_bytes"]))
+        operation = self._operation_from_row(
+            self._require_operation_row(connection, stored.operation_id)
+        )
+        if stored.operation_id != operation.operation_id:
+            raise ProviderDataCorruptionError(
+                "profile action idempotency response references another operation"
+            )
+        return operation
+
+    def _require_reserved_profile_action(
+        self,
+        connection: sqlite3.Connection,
+        identity: tuple[str, str, str, str, str, int],
+        operation_id: str,
+    ) -> tuple[LocalOperationV1, sqlite3.Row]:
+        replay = self._profile_action_replay(connection, identity)
+        if replay is None or replay.operation_id != operation_id:
+            raise ProviderStoreError("profile runtime action reservation is unavailable")
+        row = self._require_operation_row(connection, operation_id)
+        return self._operation_from_row(row), row
+
+    def _finish_reserved_profile_action(
+        self,
+        connection: sqlite3.Connection,
+        identity: tuple[str, str, str, str, str, int],
+        row: sqlite3.Row,
+        operation: LocalOperationV1,
+        *,
+        state: Literal["succeeded", "failed"],
+        status_code: int,
+        result: ConnectionOperationResultV1 | None,
+        error: ApiErrorV1 | None,
+    ) -> LocalOperationV1:
+        version = cast(int, row["resource_version"]) + 1
+        timestamp = self._timestamp()
+        finished = _validate_model(
+            LocalOperationV1,
+            {
+                **operation.model_dump(mode="python"),
+                "state": state,
+                "result": result,
+                "error": error,
+                "finished_at": timestamp,
+                "etag": self._etag("operation", operation.operation_id, version),
+            },
+        )
+        self._validate_operation_authority(connection, finished)
+        response_bytes = _canonical_json_bytes(finished.model_dump(mode="json"))
+        connection.execute(
+            """
+            UPDATE local_operations
+            SET state = ?, document_json = ?, resource_version = ?, finished_at = ?
+            WHERE operation_id = ?
+            """,
+            (state, response_bytes, version, timestamp, operation.operation_id),
+        )
+        updated = connection.execute(
+            """
+            UPDATE idempotency_records
+            SET status_code = ?, response_bytes = ?
+            WHERE principal = ? AND method = ? AND route = ?
+              AND resource_scope = ? AND idempotency_key = ? AND request_digest = ?
+            """,
+            (status_code, response_bytes, LOCAL_PRINCIPAL, *identity[:5]),
+        )
+        if updated.rowcount != 1:
+            raise ProviderStoreError("profile action idempotency reservation changed")
+        return finished
 
     def _execute_idempotent(
         self,
@@ -2367,6 +2653,8 @@ class DesktopProviderStore:
         force_cancel_nonterminal: bool,
     ) -> LocalOperationV1:
         operation = self._operation_from_row(row)
+        if operation.state == "failed":
+            return operation
         authoritative_result = self._authoritative_operation_result(connection, operation)
         nonterminal = operation.state not in {"succeeded", "failed", "cancelled"}
         if not (

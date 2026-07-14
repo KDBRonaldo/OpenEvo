@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 import hashlib
 import hmac
 import re
+import sqlite3
 from threading import Lock
 from typing import Literal, NoReturn, cast
 
@@ -15,8 +16,8 @@ from pydantic import BaseModel
 from desktop.sidecar.contracts.v1.canonical import DESKTOP_OPENAPI_SHA256
 from desktop.sidecar.contracts.v1.models import (
     ActiveProjectStateV1,
+    ApiErrorV1,
     ConnectionFailureV1,
-    ConnectionOperationResultV1,
     ContractNegotiationV1,
     CoreConnectionStateV1,
     DesktopStateV1,
@@ -30,10 +31,14 @@ from desktop.sidecar.contracts.v1.models import (
     RemoteProfileCreateV1,
     RemoteProfilePatchV1,
     RemoteProfileV1,
-    ResourceRefV1,
     VersionV1,
 )
-from desktop.sidecar.provider_store import DesktopProviderStore, ResourceInUseError
+from desktop.sidecar.provider_store import (
+    DesktopProviderStore,
+    ProfileRuntimeActionReservation,
+    ProviderStoreError,
+    ResourceInUseError,
+)
 from desktop.sidecar.remote_lifecycle import (
     DesktopRemoteLifecycle,
     RemoteConnectionFailedError,
@@ -41,6 +46,7 @@ from desktop.sidecar.remote_lifecycle import (
     RemoteLifecycleError,
     RemoteLifecycleSupersededError,
 )
+from openevo.backend.contracts.v1.models import ErrorCategory, ErrorSeverity, RepairAction
 
 
 NATIVE_SIDECAR_PROTOCOL = "openevo-native-sidecar-v1"
@@ -70,12 +76,6 @@ class _ConnectionOutcome:
 
 
 ConnectionAction = Callable[[RemoteProfileV1], _ConnectionOutcome]
-
-
-class _ConnectionActionRequired(Exception):
-    def __init__(self, profile: RemoteProfileV1) -> None:
-        super().__init__("connection action requires external execution")
-        self.profile = profile
 
 
 @dataclass
@@ -340,81 +340,84 @@ class DesktopReleaseProvider:
         request_body: BaseModel | Mapping[str, object],
         action: ConnectionAction,
     ) -> Response:
-        def preflight(transaction):
-            profile = transaction.require_profile_authority(profile_id, if_match=if_match)
-            raise _ConnectionActionRequired(profile)
-
-        try:
-            replay = self._store.execute_idempotent_action(
+        with self._connection_state_lock:
+            reservation = self._store.begin_profile_runtime_action(
                 route=route,
-                resource_scope=profile_id,
+                operation_kind=operation_kind,
+                profile_id=profile_id,
                 key=idempotency_key,
                 body=request_body,
                 if_match=if_match,
-                semantic_headers={},
-                response_model=LocalOperationV1,
-                mutation=preflight,
+                displace_existing=operation_kind != "profile_disconnect",
             )
-        except _ConnectionActionRequired as required:
-            profile = required.profile
-        else:
-            operation = LocalOperationV1.model_validate_json(replay.response_bytes)
-            return self._operation_response(operation)
-
-        with self._connection_state_lock:
+            if reservation.replayed:
+                return self._operation_response(reservation.operation)
             self._connection_generation += 1
             generation = self._connection_generation
             self._connection_owner = profile_id
-            profile = self._store.prepare_profile_runtime_action(
-                profile_id,
-                if_match=if_match,
-                displace_existing=operation_kind != "profile_disconnect",
-            )
+        profile = reservation.profile
+        if profile is None:
+            raise ProviderStoreError("new profile runtime reservation has no profile snapshot")
 
         try:
             outcome = action(profile)
         except RemoteLifecycleError as exc:
-            with self._connection_state_lock:
-                if self._owns_connection_locked(generation, profile_id):
-                    self._store.fail_profile_runtime_action(profile_id, if_match=if_match)
-                    self._core_state = self._connection_failure_state(profile_id, exc)
-            raise
-
-        def mutation(transaction):
-            current = transaction.require_profile_authority(profile_id, if_match=if_match)
-            updated = transaction.set_profile_runtime_state(
-                profile_id,
-                if_match=if_match,
-                connection_state=outcome.state,
-                credential_slots=current.credential_slots,
-                host_key_fingerprint=outcome.host_key_fingerprint,
-            )
-            return 202, transaction.create_local_operation(
-                operation_kind=operation_kind,
-                resource=ResourceRefV1(resource_type="profile", resource_id=profile_id),
-                state="succeeded",
-                result=ConnectionOperationResultV1(
-                    profile_id=profile_id,
-                    connection_state=updated.connection_state,
-                ),
-            )
-
-        with self._connection_state_lock:
-            if not self._owns_connection_locked(generation, profile_id):
-                raise RemoteLifecycleSupersededError(
-                    "A newer remote lifecycle operation superseded this result."
-                )
-            stored = self._store.execute_idempotent_action(
+            error = self._remote_action_error(reservation, exc)
+            operation = self._store.fail_profile_runtime_action(
+                reservation=reservation,
                 route=route,
-                resource_scope=profile_id,
+                profile_id=profile_id,
                 key=idempotency_key,
                 body=request_body,
                 if_match=if_match,
-                semantic_headers={},
-                response_model=LocalOperationV1,
-                mutation=mutation,
+                error=error,
             )
-            operation = LocalOperationV1.model_validate_json(stored.response_bytes)
+            with self._connection_state_lock:
+                if self._owns_connection_locked(generation, profile_id):
+                    self._core_state = self._connection_failure_state(profile_id, exc)
+            return self._operation_response(operation)
+
+        with self._connection_state_lock:
+            if not self._owns_connection_locked(generation, profile_id):
+                superseded = RemoteLifecycleSupersededError(
+                    "A newer remote lifecycle operation superseded this result."
+                )
+                operation = self._store.fail_profile_runtime_action(
+                    reservation=reservation,
+                    route=route,
+                    profile_id=profile_id,
+                    key=idempotency_key,
+                    body=request_body,
+                    if_match=if_match,
+                    error=self._remote_action_error(reservation, superseded),
+                )
+                return self._operation_response(operation)
+            try:
+                operation = self._store.complete_profile_runtime_action(
+                    reservation=reservation,
+                    route=route,
+                    profile_id=profile_id,
+                    key=idempotency_key,
+                    body=request_body,
+                    if_match=if_match,
+                    connection_state=outcome.state,
+                    host_key_fingerprint=outcome.host_key_fingerprint,
+                )
+            except (ProviderStoreError, sqlite3.Error):
+                self._remote_lifecycle.disconnect()
+                error = self._provider_action_error(reservation)
+                operation = self._store.fail_profile_runtime_action(
+                    reservation=reservation,
+                    route=route,
+                    profile_id=profile_id,
+                    key=idempotency_key,
+                    body=request_body,
+                    if_match=if_match,
+                    error=error,
+                    compensate_committed_success=True,
+                )
+                self._core_state = self._local_provider_failure_state(profile_id)
+                return self._operation_response(operation)
             self._core_state = self._core_state_for_outcome(
                 profile_id,
                 operation.operation_id,
@@ -479,10 +482,107 @@ class DesktopReleaseProvider:
 
     @staticmethod
     def _operation_response(operation: LocalOperationV1) -> JSONResponse:
+        if operation.state == "failed":
+            if operation.error is None:
+                raise ProviderStoreError("failed profile operation has no persisted API error")
+            return JSONResponse(
+                status_code=operation.error.http_status,
+                content=operation.error.model_dump(mode="json"),
+            )
         return JSONResponse(
             status_code=202,
             content=operation.model_dump(mode="json"),
             headers={"ETag": operation.etag},
+        )
+
+    @staticmethod
+    def _remote_action_error(
+        reservation: ProfileRuntimeActionReservation,
+        error: RemoteLifecycleError,
+    ) -> ApiErrorV1:
+        if isinstance(error, RemoteCredentialUnavailableError):
+            return DesktopReleaseProvider._action_error(
+                reservation,
+                status_code=409,
+                code="ssh_credential_unavailable",
+                message="The selected SSH credential is not available to OpenEvo Desktop.",
+                retryable=False,
+                repair_action=RepairAction.USER_ACTION_REQUIRED,
+                next_action=(
+                    "Choose SSH agent authentication or configure the native credential."
+                ),
+            )
+        if isinstance(error, RemoteLifecycleSupersededError):
+            return DesktopReleaseProvider._action_error(
+                reservation,
+                status_code=409,
+                code="connection_operation_superseded",
+                message="A newer connection action replaced this SSH operation.",
+                retryable=True,
+                repair_action=RepairAction.OPENEVO_CAN_RETRY,
+                next_action="Reload the connection state before retrying.",
+            )
+        return DesktopReleaseProvider._action_error(
+            reservation,
+            status_code=503,
+            code="ssh_connection_failed",
+            message="OpenEvo Desktop could not establish the SSH connection.",
+            retryable=True,
+            repair_action=RepairAction.OPENEVO_CAN_RETRY,
+            next_action="Check the server and SSH settings, then retry.",
+        )
+
+    @staticmethod
+    def _provider_action_error(
+        reservation: ProfileRuntimeActionReservation,
+    ) -> ApiErrorV1:
+        return DesktopReleaseProvider._action_error(
+            reservation,
+            status_code=503,
+            code="local_provider_unavailable",
+            message="The local Desktop provider is unavailable.",
+            retryable=False,
+            repair_action=RepairAction.UNSUPPORTED,
+            next_action="Review the error before retrying this operation.",
+            category=ErrorCategory.SERVICE,
+        )
+
+    @staticmethod
+    def _action_error(
+        reservation: ProfileRuntimeActionReservation,
+        *,
+        status_code: int,
+        code: str,
+        message: str,
+        retryable: bool,
+        repair_action: RepairAction,
+        next_action: str,
+        category: ErrorCategory = ErrorCategory.AUTHENTICATION,
+    ) -> ApiErrorV1:
+        return ApiErrorV1(
+            request_id=reservation.operation.operation_id,
+            code=code,
+            http_status=status_code,
+            message=message,
+            severity=ErrorSeverity.BLOCKING,
+            category=category,
+            retryable=retryable,
+            repair_action=repair_action,
+            next_action=next_action,
+        )
+
+    @staticmethod
+    def _local_provider_failure_state(profile_id: str) -> CoreConnectionStateV1:
+        return CoreConnectionStateV1(
+            state="offline",
+            profile_id=profile_id,
+            active_tunnel=False,
+            failure=ConnectionFailureV1(
+                code="local_provider_unavailable",
+                message="The local Desktop provider is unavailable.",
+                retryable=False,
+                next_action="Review the error before retrying this operation.",
+            ),
         )
 
     @staticmethod

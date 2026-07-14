@@ -23,6 +23,7 @@ from openevo.deployment.host_keys import (
     TrustedKnownHostsBinding,
 )
 from openevo.deployment.preflight import RemoteCommandResult
+from openevo.deployment.profile import SSHAuthConfig
 
 
 TIMESTAMP = "2026-07-14T12:00:00.000000Z"
@@ -234,6 +235,23 @@ def test_connection_deadline_cannot_consume_the_desktop_request_margin() -> None
         )
 
 
+def test_transport_validation_cannot_publish_after_the_shared_deadline() -> None:
+    now = [100.0]
+    transport = FakeTransport(advance=lambda: now.__setitem__(0, now[0] + 13.0))
+    lifecycle = DesktopRemoteLifecycle(
+        cast(object, FakeHostKeys((_candidate(),), loaded=object())),
+        transport_factory=lambda *_: transport,
+        connection_timeout_seconds=12.0,
+        monotonic=lambda: now[0],
+    )
+
+    with pytest.raises(RemoteConnectionFailedError, match="deadline expired"):
+        lifecycle.connect(_profile(fingerprint=_candidate().fingerprint))
+
+    assert lifecycle.snapshot().state == "failed"
+    assert transport.closed
+
+
 def test_existing_trust_connects_without_a_new_probe() -> None:
     binding = object()
     host_keys = FakeHostKeys((_candidate(),), loaded=binding)
@@ -255,8 +273,109 @@ def test_native_credentials_fail_closed_until_the_broker_supplies_auth() -> None
     with pytest.raises(RemoteCredentialUnavailableError):
         lifecycle.connect(_profile(authentication_kind="native_password"))
 
-    assert lifecycle.snapshot().state == "disconnected"
+    assert lifecycle.snapshot().profile_id == "profile-1"
+    assert lifecycle.snapshot().state == "failed"
     assert host_keys.probes == []
+
+
+def test_replacement_closes_active_transport_before_credential_resolution() -> None:
+    host_keys = FakeHostKeys((_candidate(),), loaded=object())
+    first_transport = FakeTransport()
+
+    def resolve_auth(profile: RemoteProfileV1) -> SSHAuthConfig:
+        if profile.profile_id == "profile-2":
+            raise RemoteCredentialUnavailableError("credential unavailable")
+        return SSHAuthConfig(method="ssh_agent")
+
+    lifecycle = DesktopRemoteLifecycle(
+        cast(object, host_keys),
+        auth_resolver=resolve_auth,
+        transport_factory=lambda *_: first_transport,
+    )
+    lifecycle.connect(_profile(fingerprint=_candidate().fingerprint))
+
+    with pytest.raises(RemoteCredentialUnavailableError):
+        lifecycle.connect(
+            _profile(
+                profile_id="profile-2",
+                fingerprint=_candidate().fingerprint,
+            )
+        )
+
+    assert first_transport.closed
+    assert lifecycle.snapshot().profile_id == "profile-2"
+    assert lifecycle.snapshot().state == "failed"
+    with pytest.raises(RemoteConnectionFailedError):
+        lifecycle.active_transport("profile-1")
+
+
+def test_host_key_persistence_and_transport_construction_share_deadline() -> None:
+    candidate = _candidate()
+    now = [100.0]
+    transport = FakeTransport()
+
+    class SlowConfirmHostKeys(FakeHostKeys):
+        def confirm(self, *args, timeout_seconds: float = 10.0, **kwargs):
+            now[0] += 7.0
+            return super().confirm(*args, timeout_seconds=timeout_seconds, **kwargs)
+
+    def slow_transport_factory(*_args: object) -> FakeTransport:
+        now[0] += 6.0
+        return transport
+
+    host_keys = SlowConfirmHostKeys((candidate,), loaded=object())
+    lifecycle = DesktopRemoteLifecycle(
+        cast(object, host_keys),
+        transport_factory=slow_transport_factory,
+        connection_timeout_seconds=12.0,
+        monotonic=lambda: now[0],
+    )
+    profile = _profile()
+    lifecycle.connect(profile)
+
+    with pytest.raises(RemoteConnectionFailedError, match="deadline expired"):
+        lifecycle.accept_host_key(
+            profile,
+            HostKeyAcceptV1(algorithm=candidate.algorithm, fingerprint=candidate.fingerprint),
+        )
+
+    assert now[0] - 100.0 == 13.0
+    assert transport.commands == []
+    assert transport.closed
+
+
+def test_expired_host_key_persistence_budget_prevents_transport_construction() -> None:
+    candidate = _candidate()
+    now = [100.0]
+    factory_calls = 0
+
+    class ExpiredConfirmHostKeys(FakeHostKeys):
+        def confirm(self, *args, timeout_seconds: float = 10.0, **kwargs):
+            now[0] += 13.0
+            return super().confirm(*args, timeout_seconds=timeout_seconds, **kwargs)
+
+    def transport_factory(*_args: object) -> FakeTransport:
+        nonlocal factory_calls
+        factory_calls += 1
+        return FakeTransport()
+
+    host_keys = ExpiredConfirmHostKeys((candidate,), loaded=object())
+    lifecycle = DesktopRemoteLifecycle(
+        cast(object, host_keys),
+        transport_factory=transport_factory,
+        connection_timeout_seconds=12.0,
+        monotonic=lambda: now[0],
+    )
+    profile = _profile()
+    lifecycle.connect(profile)
+
+    with pytest.raises(RemoteConnectionFailedError, match="deadline expired"):
+        lifecycle.accept_host_key(
+            profile,
+            HostKeyAcceptV1(algorithm=candidate.algorithm, fingerprint=candidate.fingerprint),
+        )
+
+    assert factory_calls == 0
 
 
 def test_disconnect_supersedes_a_late_connect_and_closes_its_transport() -> None:

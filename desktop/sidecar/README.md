@@ -25,21 +25,25 @@ The current provider implements:
   and restart recovery;
 - profile connect/disconnect plus explicit SSH host-key review and acceptance.
   The sidecar probes without trusting, repeats the probe before confirmation,
-  gives confirmation plus the trusted SSH check one shared 12-second deadline,
+  gives credential resolution, trust-store load/probe/confirmation, transport
+  construction, and the trusted SSH check one shared 12-second deadline,
   stores only the confirmed fingerprint in Local API resources, and owns the
   trusted known-host file under its private state root. Unconfirmed candidates
   remain only in the process-owned review state and restart recovery removes any
   candidate persisted by an older interrupted implementation.
 
-Connection mutations preflight idempotency and profile ETag authority before
-external SSH work, then commit profile and terminal-operation state under the
-same process owner generation. Replacing profile A with B durably disconnects A
-and cancels A's obsolete operation before B can become authoritative; a delayed
-A result cannot change B's profile or Core state. Replays do not probe, accept,
-connect, or disconnect again. Connect, host-key accept, and disconnect responses
-carry the operation ETag in both the frozen body and `ETag` header. SSH failures
-are returned as bounded `ApiErrorV1` values without commands, paths, or
-credentials.
+Connection mutations atomically reserve idempotency capacity, profile action
+ownership, and a running operation before external SSH work. Replacing profile A
+with B durably disconnects A, cancels A's obsolete operation, closes A's
+transport before resolving B's credential, and records B as the current failed
+owner if synchronous resolution fails. Success or failure finalizes the reserved
+operation without another capacity or request-ETag check. A final persistence
+error closes the successful transport and compensates the reservation to
+failed/disconnected, including the case where SQLite committed before reporting
+an error. Failed operations retain their bounded `ApiErrorV1`, so exact replays
+return the same error and do not probe, accept, connect, or disconnect again.
+Successful connect, host-key accept, and disconnect responses carry the
+operation ETag in both the frozen body and `ETag` header.
 
 The production credential resolver currently supports `ssh_agent`. Profiles
 that select native private-key or password authentication fail closed with

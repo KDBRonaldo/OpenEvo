@@ -166,13 +166,16 @@ class DesktopRemoteLifecycle:
 
     def connect(self, profile: RemoteProfileV1) -> RemoteConnectionResult:
         deadline = self._deadline()
-        config = remote_profile_config(profile, auth_resolver=self._auth_resolver)
         generation, displaced = self._begin(profile.profile_id)
         self._close_remote(displaced)
         try:
+            config = remote_profile_config(profile, auth_resolver=self._auth_resolver)
+            self._remaining(deadline)
             binding = self._load_binding(config, profile.host_key_fingerprint)
+            self._remaining(deadline)
             if binding is None:
                 pending = self._host_keys.probe(config, timeout_seconds=self._remaining(deadline))
+                self._remaining(deadline)
                 candidate = self._preferred_candidate(pending)
                 self._publish_pending(generation, config, pending, candidate)
                 return RemoteConnectionResult(
@@ -197,10 +200,9 @@ class DesktopRemoteLifecycle:
         request: HostKeyAcceptV1,
     ) -> RemoteConnectionResult:
         deadline = self._deadline()
-        config = remote_profile_config(profile, auth_resolver=self._auth_resolver)
         with self._lock:
             pending_entry = self._pending.get(profile.profile_id)
-            if pending_entry is None or pending_entry[0] != config:
+            if pending_entry is None or self._snapshot.profile_id != profile.profile_id:
                 raise RemoteConnectionFailedError("The pending SSH host key is no longer current.")
             self._generation += 1
             generation = self._generation
@@ -209,6 +211,12 @@ class DesktopRemoteLifecycle:
             self._snapshot = RemoteLifecycleSnapshot(profile.profile_id, "connecting")
         self._close_remote(displaced)
         try:
+            config = remote_profile_config(profile, auth_resolver=self._auth_resolver)
+            self._remaining(deadline)
+            if pending_entry[0] != config:
+                raise RemoteConnectionFailedError(
+                    "The pending SSH host key is no longer current."
+                )
             binding = self._host_keys.confirm(
                 pending_entry[1],
                 profile=config,
@@ -216,6 +224,7 @@ class DesktopRemoteLifecycle:
                 fingerprint=request.fingerprint,
                 timeout_seconds=self._remaining(deadline),
             )
+            self._remaining(deadline)
             return self._connect_with_binding(generation, config, binding, deadline=deadline)
         except RemoteLifecycleSupersededError:
             raise
@@ -297,9 +306,11 @@ class DesktopRemoteLifecycle:
         *,
         deadline: float,
     ) -> RemoteConnectionResult:
+        self._remaining(deadline)
         transport = self._transport_factory(profile, binding)
         try:
             result = transport.run("true", timeout_seconds=self._remaining(deadline))
+            self._remaining(deadline)
             if not result.ok:
                 raise RemoteConnectionFailedError("The SSH connectivity check failed.")
             active = _ActiveRemote(profile=profile, binding=binding, transport=transport)
