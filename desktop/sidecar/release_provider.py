@@ -233,7 +233,7 @@ class DesktopReleaseProvider:
         )
         self._project_session_lock = RLock()
         self._connection_state_lock = Lock()
-        self._connection_generation = 0
+        self._session_generation = 0
         self._connection_owner: str | None = None
         self._connection_action_lock = Lock()
         self._connection_gate_lock = Lock()
@@ -242,7 +242,6 @@ class DesktopReleaseProvider:
         self._closed = False
         self._project_executor = _BoundedProjectExecutor()
         self._core_state = CoreConnectionStateV1(state="disconnected", active_tunnel=False)
-        self._core_session_generation = 0
         self._core_session_binding: CoreRuntimeSessionBinding | None = None
         self._instance_id = instance_id
         self._readiness_key = readiness_key
@@ -315,7 +314,7 @@ class DesktopReleaseProvider:
         if self._core_runtime is not None:
             self._core_runtime.start(
                 active_project=self._active_project_for_runtime,
-                publish=self.publish_state_changed,
+                publish=self._publish_core_event_invalidation,
                 session_lost=self._handle_core_session_loss,
             )
 
@@ -391,6 +390,7 @@ class DesktopReleaseProvider:
                 and core_binding.project.project_id == project.project_id
                 and core_binding.project.profile_id == project.profile_id
                 and core_binding.project.etag == project.etag
+                and core_binding.generation == self._session_generation
                 and project.remote is not None
             ):
                 connection_state = "ready"
@@ -573,33 +573,34 @@ class DesktopReleaseProvider:
         request_body: BaseModel | Mapping[str, object],
         action: ConnectionAction,
     ) -> Response:
-        with self._connection_state_lock:
-            reservation = self._store.begin_profile_runtime_action(
-                route=route,
-                operation_kind=operation_kind,
-                profile_id=profile_id,
-                key=idempotency_key,
-                body=request_body,
-                if_match=if_match,
-                displace_existing=operation_kind != "profile_disconnect",
-            )
-            if reservation.replayed:
-                self._reconcile_failed_profile_transport(profile_id, reservation.operation)
-                return self._operation_response(reservation.operation)
-            owner_error: RemoteConnectionFailedError | None = None
-            snapshot = self._remote_lifecycle.snapshot()
-            if operation_kind == "profile_disconnect" and snapshot.profile_id not in {
-                None,
-                profile_id,
-            }:
-                generation = None
-                owner_error = RemoteConnectionFailedError(
-                    "Another remote profile owns the connection."
+        with self._project_session_lock:
+            with self._connection_state_lock:
+                reservation = self._store.begin_profile_runtime_action(
+                    route=route,
+                    operation_kind=operation_kind,
+                    profile_id=profile_id,
+                    key=idempotency_key,
+                    body=request_body,
+                    if_match=if_match,
+                    displace_existing=operation_kind != "profile_disconnect",
                 )
-            else:
-                self._connection_generation += 1
-                generation = self._connection_generation
-                self._connection_owner = profile_id
+                if reservation.replayed:
+                    self._reconcile_failed_profile_transport(profile_id, reservation.operation)
+                    return self._operation_response(reservation.operation)
+                owner_error: RemoteConnectionFailedError | None = None
+                snapshot = self._remote_lifecycle.snapshot()
+                if operation_kind == "profile_disconnect" and snapshot.profile_id not in {
+                    None,
+                    profile_id,
+                }:
+                    generation = None
+                    owner_error = RemoteConnectionFailedError(
+                        "Another remote profile owns the connection."
+                    )
+                else:
+                    self._session_generation += 1
+                    generation = self._session_generation
+                    self._connection_owner = profile_id
         profile = reservation.profile
         if profile is None:
             raise ProviderStoreError("new profile runtime reservation has no profile snapshot")
@@ -630,7 +631,6 @@ class DesktopReleaseProvider:
                 superseded = RemoteLifecycleSupersededError(
                     "A newer remote lifecycle operation superseded this result."
                 )
-                self._disconnect_owned_transport(profile_id)
                 operation = self._finalize_profile_runtime_failure(
                     reservation=reservation,
                     route=route,
@@ -717,7 +717,7 @@ class DesktopReleaseProvider:
             raise ResourceInUseError("profile", profile_id)
 
     def _owns_connection_locked(self, generation: int, profile_id: str) -> bool:
-        return generation == self._connection_generation and self._connection_owner == profile_id
+        return generation == self._session_generation and self._connection_owner == profile_id
 
     def _finalize_profile_runtime_failure(
         self,
@@ -768,6 +768,13 @@ class DesktopReleaseProvider:
         except ResourceNotFoundError:
             return
         if profile.connection_state != "disconnected":
+            return
+        binding = self._core_session_binding
+        if (
+            binding is not None
+            and binding.generation == self._session_generation
+            and binding.project.profile_id == profile_id
+        ):
             return
         snapshot = self._remote_lifecycle.snapshot()
         if snapshot.profile_id != profile_id or snapshot.state == "disconnected":
@@ -1061,19 +1068,21 @@ class DesktopReleaseProvider:
         project = work.reservation.project
         if project is None:
             raise ProviderStoreError("project activation reservation lost its project snapshot")
-        with self._connection_state_lock:
-            self._core_session_generation += 1
-            generation = self._core_session_generation
-            self._core_session_binding = CoreRuntimeSessionBinding(
-                project=project,
-                generation=generation,
-            )
-            self._core_state = CoreConnectionStateV1(
-                state="bootstrapping",
-                profile_id=project.profile_id,
-                active_tunnel=False,
-                operation_id=work.reservation.operation.operation_id,
-            )
+        with self._project_session_lock:
+            with self._connection_state_lock:
+                self._session_generation += 1
+                generation = self._session_generation
+                self._connection_owner = None
+                self._core_session_binding = CoreRuntimeSessionBinding(
+                    project=project,
+                    generation=generation,
+                )
+                self._core_state = CoreConnectionStateV1(
+                    state="bootstrapping",
+                    profile_id=project.profile_id,
+                    active_tunnel=False,
+                    operation_id=work.reservation.operation.operation_id,
+                )
         try:
             self.publish_state_changed()
         except (ProviderStoreError, sqlite3.Error):
@@ -1108,6 +1117,11 @@ class DesktopReleaseProvider:
             activation = bridge.activate_project(project, idempotency_key=work.key)
             self._validate_activation_identity(project, activation)
             with self._project_session_lock:
+                with self._connection_state_lock:
+                    if not self._owns_core_session_locked(session_generation, project):
+                        raise ProviderStoreError(
+                            "project activation was superseded before Local publication"
+                        )
                 operation = self._store.complete_project_runtime_action(
                     reservation=reservation,
                     route=work.route,
@@ -1123,8 +1137,7 @@ class DesktopReleaseProvider:
                 active_project = self._store.get_project(work.project_id)
                 bridge.commit_local_activation(active_project, activation=activation)
                 with self._connection_state_lock:
-                    binding = self._core_session_binding
-                    if binding is not None and binding.generation == session_generation:
+                    if self._owns_core_session_locked(session_generation, active_project):
                         self._core_session_binding = CoreRuntimeSessionBinding(
                             project=active_project,
                             generation=session_generation,
@@ -1141,7 +1154,12 @@ class DesktopReleaseProvider:
         except Exception as exc:
             error = self._project_activation_error(reservation, exc)
             operation = self._finalize_project_runtime_failure(work, error)
-            if activation is not None:
+            with self._connection_state_lock:
+                owns_session = self._owns_core_session_locked(
+                    session_generation,
+                    reservation.project,
+                )
+            if activation is not None and owns_session:
                 try:
                     with self._project_session_lock:
                         self._require_bridge("activateProject").deactivate_project(
@@ -1157,8 +1175,10 @@ class DesktopReleaseProvider:
             )
             if profile_id is not None:
                 with self._connection_state_lock:
-                    binding = self._core_session_binding
-                    if binding is not None and binding.generation == session_generation:
+                    if self._owns_core_session_locked(
+                        session_generation,
+                        reservation.project,
+                    ):
                         self._core_state = CoreConnectionStateV1(
                             state="offline",
                             profile_id=profile_id,
@@ -1285,32 +1305,49 @@ class DesktopReleaseProvider:
     def _retire_edited_project(self, project_id: str, profile_id: str) -> None:
         if self._core_bridge is None:
             return
+        with self._connection_state_lock:
+            binding = self._core_session_binding
+            self._session_generation += 1
+            retirement_generation = self._session_generation
+            self._connection_owner = None
+            if binding is not None:
+                self._core_session_binding = CoreRuntimeSessionBinding(
+                    project=binding.project,
+                    generation=retirement_generation,
+                )
         try:
             self._core_bridge.deactivate_project(project_id)
         except DesktopCoreBridgeErrorV1 as exc:
             with self._connection_state_lock:
-                self._core_state = CoreConnectionStateV1(
-                    state="offline",
-                    profile_id=profile_id,
-                    active_tunnel=False,
-                    failure=ConnectionFailureV1(
-                        code=exc.error.code,
-                        message=exc.error.message,
-                        retryable=exc.error.retryable,
-                        next_action=exc.error.next_action,
-                    ),
-                )
+                if self._owns_retirement_locked(retirement_generation, project_id):
+                    self._core_state = CoreConnectionStateV1(
+                        state="offline",
+                        profile_id=profile_id,
+                        active_tunnel=False,
+                        failure=ConnectionFailureV1(
+                            code=exc.error.code,
+                            message=exc.error.message,
+                            retryable=exc.error.retryable,
+                            next_action=exc.error.next_action,
+                        ),
+                    )
             _LOGGER.warning(
                 "local project changed after Core session retirement failed",
                 extra={"project_id": project_id, "error_code": exc.error.code},
             )
         except Exception:
             with self._connection_state_lock:
-                self._core_state = self._local_provider_failure_state(profile_id)
+                if self._owns_retirement_locked(retirement_generation, project_id):
+                    self._core_state = self._local_provider_failure_state(profile_id)
             _LOGGER.exception(
                 "local project changed after Core session retirement failed",
                 extra={"project_id": project_id},
             )
+        else:
+            with self._connection_state_lock:
+                if self._owns_retirement_locked(retirement_generation, project_id):
+                    self._core_session_binding = None
+                    self._core_state = self._core_not_started_state(profile_id)
 
     def _get_project_capabilities(
         self, arguments: Mapping[str, object]
@@ -1575,9 +1612,13 @@ class DesktopReleaseProvider:
 
         if self._event_broker is not None:
             try:
-                self._event_broker.publish(StateEventV1(state=self._get_state({})))
+                self._publish_core_event_invalidation()
             except DesktopEventBrokerError:
                 _LOGGER.warning("Desktop state event could not be published")
+
+    def _publish_core_event_invalidation(self) -> None:
+        if self._event_broker is not None:
+            self._event_broker.publish(StateEventV1(state=self._get_state({})))
 
     def _active_project_for_runtime(self) -> CoreRuntimeSessionBinding | None:
         with self._project_session_lock:
@@ -1595,6 +1636,7 @@ class DesktopReleaseProvider:
                 or binding.project.project_id != project.project_id
                 or binding.project.profile_id != project.profile_id
                 or binding.project.etag != project.etag
+                or binding.generation != self._session_generation
                 or state.state not in {"online", "degraded"}
                 or not state.active_tunnel
                 or state.profile_id != project.profile_id
@@ -1629,6 +1671,34 @@ class DesktopReleaseProvider:
             changed = True
         if changed:
             self.publish_state_changed()
+
+    def _owns_core_session_locked(
+        self,
+        generation: int,
+        project: ProjectV1 | None,
+    ) -> bool:
+        binding = self._core_session_binding
+        return (
+            project is not None
+            and generation == self._session_generation
+            and binding is not None
+            and binding.generation == generation
+            and binding.project.project_id == project.project_id
+            and binding.project.profile_id == project.profile_id
+        )
+
+    def _owns_retirement_locked(self, generation: int, project_id: str) -> bool:
+        binding = self._core_session_binding
+        return (
+            generation == self._session_generation
+            and (
+                binding is None
+                or (
+                    binding.generation == generation
+                    and binding.project.project_id == project_id
+                )
+            )
+        )
 
     def _require_bridge(self, operation_id: str) -> DesktopCoreBridgeV1:
         if self._core_bridge is None:

@@ -12,6 +12,7 @@ from fastapi.testclient import TestClient
 import pytest
 
 from desktop.sidecar.core_bridge_v1 import DesktopCoreBridgeErrorV1
+from desktop.sidecar.event_broker_v1 import DesktopEventBrokerError
 from desktop.sidecar.provider_store import DesktopProviderStore
 from desktop.sidecar.release_app import create_release_desktop_local_api_app
 from desktop.sidecar.release_runtime import (
@@ -286,3 +287,89 @@ def test_core_event_relay_reports_typed_session_loss_with_captured_authority() -
     relay.join()
 
     assert observed == [(binding, error)]
+
+
+def test_core_event_relay_commits_cursor_only_after_publication_and_replays_after_fault(
+) -> None:
+    frame_1 = SimpleNamespace(
+        id="event-1", data=SimpleNamespace(root=SimpleNamespace(sequence=1))
+    )
+    frame_2 = SimpleNamespace(
+        id="event-2", data=SimpleNamespace(root=SimpleNamespace(sequence=2))
+    )
+    frame_3 = SimpleNamespace(
+        id="event-3", data=SimpleNamespace(root=SimpleNamespace(sequence=3))
+    )
+
+    class EventContext:
+        def __init__(self, frames: tuple[object, ...], failure: BaseException | None = None):
+            self._frames = frames
+            self._failure = failure
+
+        def __enter__(self):
+            def stream():
+                yield from self._frames
+                if self._failure is not None:
+                    raise self._failure
+
+            return stream()
+
+        def __exit__(self, *_exc: object) -> None:
+            return None
+
+    class Bridge:
+        def __init__(self) -> None:
+            self.calls: list[str | None] = []
+
+        def events(self, _project: object, *, last_event_id: str | None = None):
+            self.calls.append(last_event_id)
+            if len(self.calls) == 1:
+                return EventContext((frame_1,))
+            if len(self.calls) == 2:
+                return EventContext(
+                    (frame_1, frame_1, frame_3),
+                    OSError("stream interrupted"),
+                )
+            if len(self.calls) == 3:
+                return EventContext((frame_2,), OSError("stream interrupted again"))
+            if len(self.calls) == 4:
+                return EventContext((frame_3,))
+            return EventContext(())
+
+    bridge = Bridge()
+    relay = DesktopCoreEventRelayV1(bridge)  # type: ignore[arg-type]
+    project = SimpleNamespace(project_id="project-1", etag='"' + "a" * 64 + '"')
+    binding = CoreRuntimeSessionBinding(project=project, generation=1)  # type: ignore[arg-type]
+    published: list[str] = []
+    complete = threading.Event()
+    publication_attempt = 0
+
+    def active_project():
+        return None if complete.is_set() else binding
+
+    def publish() -> None:
+        nonlocal publication_attempt
+        publication_attempt += 1
+        if publication_attempt == 1:
+            raise DesktopEventBrokerError("injected publication failure")
+        published.append(f"publication-{publication_attempt}")
+        if len(published) == 5:
+            complete.set()
+
+    relay.start(
+        active_project=active_project,
+        publish=publish,
+        session_lost=lambda _binding, _error: None,
+    )
+    assert complete.wait(timeout=5)
+    relay.request_stop()
+    relay.join()
+
+    assert published == [
+        "publication-2",
+        "publication-3",
+        "publication-4",
+        "publication-5",
+        "publication-6",
+    ]
+    assert bridge.calls[:4] == [None, None, "event-1", "event-2"]

@@ -515,13 +515,20 @@ Executor admission for project activation publishes a non-readable
 released. A rejected admission leaves the previous state untouched.
 
 The release owner binds readable state to the exact Local project ID, profile
-ID, ETag, and a process-local session generation. Ordinary Core calls and the
-event relay may invalidate that state only for closed local errors proving that
-the bound client/session no longer exists. Remote 503 responses, validation or
-capability failures, and `core_connection_failed` are not such proof; the last
-code also covers finite request deadline expiry. A matching loss atomically
-publishes `offline` with `active_tunnel=false`. A callback from an older project
-or generation cannot change the replacement session.
+ID, ETag, and a process-local session generation. SSH profile actions, project
+activation, and active-project retirement all admit against that same
+generation. Completion must revalidate it before changing Core state or
+cleaning a transport, so a late profile result cannot overwrite or disconnect
+its replacement and a stale activation cannot publish a Local active project.
+Ordinary Core calls and the event relay may invalidate readable state only for
+closed local errors proving that the bound client/session no longer exists.
+Remote 503 responses, validation or capability failures, and
+`core_connection_failed` are not such proof; the last code also covers finite
+request deadline expiry. A matching loss atomically publishes `offline` with
+`active_tunnel=false`. A callback from an older project or generation cannot
+change the replacement session. Successful edit retirement clears the binding
+and Core tunnel state atomically; failure keeps the retirement binding together
+with its typed diagnostic failure.
 
 The renderer independently requires the selected `ProjectV1` to match the
 active project ID, profile ID, and ETag and requires a ready compatible tunnel
@@ -837,6 +844,13 @@ remains stable if that mutation is retried, replayed, or emitted in a later stre
 record with a different frame ID. `Last-Event-ID` remains opaque;
 delivery is at least once with a 10,000-event bounded replay window, and an
 expired cursor returns HTTP 410 so Desktop reloads snapshots before resuming.
+The release relay treats successful Desktop invalidation publication as the
+commit point for each non-heartbeat frame. It updates its Core resume cursor
+only after publication and only for a contiguous Core event sequence; a
+broker/store/publication fault therefore reconnects with the previous
+`Last-Event-ID` and accepts replay. Duplicate or out-of-order frame delivery may
+produce duplicate invalidation, but cannot regress the cursor or advance it past
+an unpublished or missing frame.
 Within one active-tunnel client lifetime, including reconnects, the sidecar
 binds each SSE frame ID to the digest of canonical validated event bytes. The
 same ID and semantic payload may replay with different JSON formatting; the

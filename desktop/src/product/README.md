@@ -154,6 +154,13 @@ intent against the refreshed ETag. Retry activates that project instead of
 issuing another create; an unknown activation result retains its original
 action ID for exact retry.
 
+Editing a saved active project demotes it to a draft and retires its Core
+session. After a successful save, the authoritative snapshot has no active
+project binding, reports `active_tunnel=false`, and requires connection and
+activation again before `Start session` is enabled. The simulator mirrors this
+terminal provider state so UI tests cannot accidentally continue on the stale
+pre-edit tunnel.
+
 Revision generation is shown only from the authoritative
 `ProjectV1.remote.active_revision`. Core-owned runs and artifacts are associated
 through `ProjectV1.remote.core_project_id`, never the Desktop-local

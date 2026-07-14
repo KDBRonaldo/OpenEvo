@@ -19,6 +19,11 @@ from desktop.sidecar.core_bridge_v1 import (
 from desktop.sidecar.provider_store import DesktopProviderStore
 from desktop.sidecar.release_provider import DesktopReleaseProvider
 from desktop.sidecar.release_runtime import CoreRuntimeSessionBinding
+from desktop.sidecar.remote_lifecycle import (
+    RemoteConnectionFailedError,
+    RemoteConnectionResult,
+    RemoteLifecycleSnapshot,
+)
 from desktop.sidecar.workspace_imports import WorkspaceImportStore
 from openevo.backend.contracts.v1 import models as core_v1
 from openevo.evolution.framework.profiles import execution_profile_for_release_mode
@@ -53,6 +58,7 @@ def _provider(
     bridge: Mock,
     *,
     event_broker: object | None = None,
+    lifecycle: object | None = None,
 ) -> tuple[DesktopReleaseProvider, DesktopProviderStore, local_v1.ProjectV1]:
     state_root = tmp_path / "state"
     store = DesktopProviderStore(state_root)
@@ -92,7 +98,7 @@ def _provider(
         build_channel="test",
         instance_id="1" * 32,
         readiness_key=b"r" * 32,
-        remote_lifecycle=_Lifecycle(),  # type: ignore[arg-type]
+        remote_lifecycle=lifecycle or _Lifecycle(),  # type: ignore[arg-type]
         core_bridge=bridge,  # type: ignore[arg-type]
         event_broker=event_broker,  # type: ignore[arg-type]
         clock=lambda: datetime(2026, 7, 14, 12, 0, tzinfo=timezone.utc),
@@ -285,6 +291,233 @@ def test_activation_persists_typed_bridge_failure(tmp_path: Path) -> None:
         assert state.pending_operation_ids == ()
         bridge.commit_local_activation.assert_not_called()
     finally:
+        provider.close()
+
+
+@pytest.mark.parametrize("late_failure", [False, True])
+def test_stale_profile_connect_completion_cannot_replace_new_online_session(
+    tmp_path: Path,
+    late_failure: bool,
+) -> None:
+    class Lifecycle(_Lifecycle):
+        def __init__(self) -> None:
+            self.current = RemoteLifecycleSnapshot(None, "disconnected")
+            self.entered = Event()
+            self.release = Event()
+            self.disconnect_calls = 0
+
+        def snapshot(self) -> RemoteLifecycleSnapshot:
+            return self.current
+
+        def connect(self, profile: local_v1.RemoteProfileV1) -> RemoteConnectionResult:
+            self.entered.set()
+            assert self.release.wait(timeout=5)
+            if late_failure:
+                self.current = RemoteLifecycleSnapshot(
+                    profile.profile_id,
+                    "failed",
+                    failure_code="ssh_connection_failed",
+                )
+                raise RemoteConnectionFailedError("late connection failure")
+            self.current = RemoteLifecycleSnapshot(profile.profile_id, "connected")
+            return RemoteConnectionResult(profile.profile_id, "connected")
+
+        def disconnect(self, profile_id: str | None = None) -> None:
+            del profile_id
+            self.disconnect_calls += 1
+            self.current = RemoteLifecycleSnapshot(None, "disconnected")
+
+    lifecycle = Lifecycle()
+    bridge = Mock(spec=DesktopCoreBridgeV1)
+    provider, store, project = _provider(tmp_path, bridge, lifecycle=lifecycle)
+    bridge.activate_project.return_value = _activation(project)
+    profile = store.get_profile(project.profile_id)
+    responses: list[JSONResponse] = []
+    failures: list[BaseException] = []
+
+    def connect() -> None:
+        try:
+            response = provider.invoke(
+                "connectRemoteProfile",
+                {
+                    "profile_id": profile.profile_id,
+                    "if_match": profile.etag,
+                    "idempotency_key": "profile-connect-interleave-0001",
+                },
+            )
+            assert isinstance(response, JSONResponse)
+            responses.append(response)
+        except BaseException as exc:
+            failures.append(exc)
+
+    thread = Thread(target=connect)
+    thread.start()
+    try:
+        assert lifecycle.entered.wait(timeout=5)
+        activation_response = provider.invoke("activateProject", _activate_arguments(project))
+        activation_operation = local_v1.LocalOperationV1.model_validate_json(
+            activation_response.body
+        )
+        _wait_for_operation(store, activation_operation.operation_id, "succeeded")
+        assert provider.invoke("getDesktopState", {}).core.state == "online"
+        online_binding = provider._core_session_binding
+        assert online_binding is not None
+
+        lifecycle.release.set()
+        thread.join(timeout=5)
+
+        assert not thread.is_alive()
+        assert failures == []
+        assert len(responses) == 1
+        assert responses[0].status_code in {409, 503}
+        state = provider.invoke("getDesktopState", {})
+        assert state.core.state == "online"
+        assert state.core.active_tunnel is True
+        assert state.active_project is not None
+        assert state.active_project.connection_state == "ready"
+        assert provider._core_session_binding == online_binding
+        assert lifecycle.disconnect_calls == 0
+    finally:
+        lifecycle.release.set()
+        thread.join(timeout=5)
+        provider.close()
+
+
+def test_stale_profile_disconnect_completion_does_not_close_replacement_transport(
+    tmp_path: Path,
+) -> None:
+    class Lifecycle(_Lifecycle):
+        def __init__(self) -> None:
+            self.current = RemoteLifecycleSnapshot(None, "disconnected")
+            self.entered = Event()
+            self.release = Event()
+            self.disconnect_calls = 0
+
+        def snapshot(self) -> RemoteLifecycleSnapshot:
+            return self.current
+
+        def disconnect(self, profile_id: str | None = None) -> None:
+            del profile_id
+            self.disconnect_calls += 1
+            self.current = RemoteLifecycleSnapshot(None, "disconnected")
+            self.entered.set()
+            assert self.release.wait(timeout=5)
+
+    lifecycle = Lifecycle()
+    bridge = Mock(spec=DesktopCoreBridgeV1)
+    provider, store, project = _provider(tmp_path, bridge, lifecycle=lifecycle)
+    profile = store.get_profile(project.profile_id)
+    lifecycle.current = RemoteLifecycleSnapshot(profile.profile_id, "connected")
+
+    def activate(*_args: object, **_kwargs: object) -> object:
+        lifecycle.current = RemoteLifecycleSnapshot(profile.profile_id, "connected")
+        return _activation(project)
+
+    bridge.activate_project.side_effect = activate
+    responses: list[JSONResponse] = []
+
+    def disconnect() -> None:
+        response = provider.invoke(
+            "disconnectRemoteProfile",
+            {
+                "profile_id": profile.profile_id,
+                "if_match": profile.etag,
+                "idempotency_key": "profile-disconnect-interleave-0001",
+            },
+        )
+        assert isinstance(response, JSONResponse)
+        responses.append(response)
+
+    thread = Thread(target=disconnect)
+    thread.start()
+    try:
+        assert lifecycle.entered.wait(timeout=5)
+        activation_response = provider.invoke("activateProject", _activate_arguments(project))
+        activation_operation = local_v1.LocalOperationV1.model_validate_json(
+            activation_response.body
+        )
+        _wait_for_operation(store, activation_operation.operation_id, "succeeded")
+        assert provider.invoke("getDesktopState", {}).core.state == "online"
+        online_binding = provider._core_session_binding
+        assert online_binding is not None
+        assert lifecycle.current.state == "connected"
+
+        lifecycle.release.set()
+        thread.join(timeout=5)
+
+        assert not thread.is_alive()
+        assert len(responses) == 1
+        assert responses[0].status_code == 409
+        state = provider.invoke("getDesktopState", {})
+        assert state.core.state == "online"
+        assert state.core.active_tunnel is True
+        assert provider._core_session_binding == online_binding
+        assert lifecycle.current == RemoteLifecycleSnapshot(profile.profile_id, "connected")
+        assert lifecycle.disconnect_calls == 1
+    finally:
+        lifecycle.release.set()
+        thread.join(timeout=5)
+        provider.close()
+
+
+def test_newer_profile_action_prevents_stale_activation_publication(tmp_path: Path) -> None:
+    class Lifecycle(_Lifecycle):
+        def __init__(self) -> None:
+            self.current = RemoteLifecycleSnapshot(None, "disconnected")
+
+        def snapshot(self) -> RemoteLifecycleSnapshot:
+            return self.current
+
+        def connect(self, profile: local_v1.RemoteProfileV1) -> RemoteConnectionResult:
+            self.current = RemoteLifecycleSnapshot(profile.profile_id, "connected")
+            return RemoteConnectionResult(profile.profile_id, "connected")
+
+    lifecycle = Lifecycle()
+    bridge = Mock(spec=DesktopCoreBridgeV1)
+    provider, store, project = _provider(tmp_path, bridge, lifecycle=lifecycle)
+    profile = store.get_profile(project.profile_id)
+    entered = Event()
+    release = Event()
+
+    def activate(*_args: object, **_kwargs: object) -> object:
+        entered.set()
+        assert release.wait(timeout=5)
+        return _activation(project)
+
+    bridge.activate_project.side_effect = activate
+    try:
+        activation_response = provider.invoke("activateProject", _activate_arguments(project))
+        activation_operation = local_v1.LocalOperationV1.model_validate_json(
+            activation_response.body
+        )
+        assert entered.wait(timeout=5)
+
+        connect_response = provider.invoke(
+            "connectRemoteProfile",
+            {
+                "profile_id": profile.profile_id,
+                "if_match": profile.etag,
+                "idempotency_key": "profile-connect-supersedes-activation-0001",
+            },
+        )
+        assert isinstance(connect_response, JSONResponse)
+        assert connect_response.status_code == 202
+
+        release.set()
+        failed = _wait_for_operation(store, activation_operation.operation_id, "failed")
+        state = provider.invoke("getDesktopState", {})
+
+        assert failed.error is not None
+        assert failed.error.code == "project_activation_failed"
+        assert store.get_project(project.project_id).state == "draft"
+        assert state.core.state == "offline"
+        assert state.core.active_tunnel is False
+        assert state.core.failure is not None
+        assert state.core.failure.code == "core_not_started"
+        bridge.commit_local_activation.assert_not_called()
+        bridge.deactivate_project.assert_not_called()
+    finally:
+        release.set()
         provider.close()
 
 
@@ -503,6 +736,13 @@ def test_active_core_request_blocks_project_edit_until_session_is_retired(
         assert errors == []
         assert order == ["request-started", "request-finished", "session-retired"]
         assert store.get_project(active.project_id).state == "draft"
+        state = provider.invoke("getDesktopState", {})
+        assert state.active_project is None
+        assert state.core.state == "offline"
+        assert state.core.active_tunnel is False
+        assert state.core.failure is not None
+        assert state.core.failure.code == "core_not_started"
+        assert provider._core_session_binding is None
         bridge.list_runs.assert_called_once_with(
             active,
             limit=50,
@@ -517,4 +757,40 @@ def test_active_core_request_blocks_project_edit_until_session_is_retired(
             request_thread.join(timeout=5)
         if edit_thread is not None:
             edit_thread.join(timeout=5)
+        provider.close()
+
+
+def test_project_edit_retains_diagnostic_authority_when_deactivation_fails(
+    tmp_path: Path,
+) -> None:
+    bridge = Mock(spec=DesktopCoreBridgeV1)
+    provider, store, project = _provider(tmp_path, bridge)
+    bridge.activate_project.return_value = _activation(project)
+    response = provider.invoke("activateProject", _activate_arguments(project))
+    operation = local_v1.LocalOperationV1.model_validate_json(response.body)
+    _wait_for_operation(store, operation.operation_id, "succeeded")
+    active = store.get_project(project.project_id)
+    bridge.deactivate_project.side_effect = _bridge_error("core_client_closed")
+    try:
+        provider.invoke(
+            "updateProject",
+            {
+                "project_id": active.project_id,
+                "request": local_v1.ProjectPatchV1(name="Edited after failed retirement"),
+                "if_match": active.etag,
+            },
+        )
+
+        state = provider.invoke("getDesktopState", {})
+        binding = provider._core_session_binding
+        assert store.get_project(active.project_id).state == "draft"
+        assert state.active_project is None
+        assert state.core.state == "offline"
+        assert state.core.active_tunnel is False
+        assert state.core.failure is not None
+        assert state.core.failure.code == "core_client_closed"
+        assert binding is not None
+        assert binding.project.project_id == active.project_id
+        assert binding.generation == provider._session_generation
+    finally:
         provider.close()

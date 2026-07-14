@@ -327,6 +327,13 @@ the Local operation request ID; unexpected local failures are sanitized. A
 published Core session is retired whenever Local completion or acknowledgement
 fails, including when the terminal operation is already durable, so a stale
 tunnel cannot retain Local authority.
+Profile lifecycle actions, activation start gates, and project retirement share
+one process-local session generation. Admission is ordered under the
+project-session transition lock, while external work remains outside the state
+lock. Every terminal path rechecks the generation. A stale profile success or
+failure finalizes its durable operation without changing the replacement Core
+state or disconnecting its transport; a stale activation cannot publish its
+Local project projection.
 
 `pending_operation_ids()` exposes only queued, running, and cancelling operation
 IDs in stable identity order, with the same recovery-row upper bound, for
@@ -379,7 +386,11 @@ passes the same complete active project and captured session generation to the
 bridge SSE boundary. It ignores
 Core heartbeats and translates every other validated Core frame into a Desktop
 state invalidation; it does not copy, reinterpret, or persist Core event
-payloads. A typed local session-loss error is returned to the provider owner
+payloads. The relay advances the Core resume cursor only after that invalidation
+has been accepted by the Desktop broker and only across a contiguous Core event
+sequence. Publication failure reconnects from the prior cursor; duplicate and
+out-of-order records may repeat invalidation, but cannot move the cursor past an
+unpublished or missing event. A typed local session-loss error is returned to the provider owner
 through the same authority-bound callback used by ordinary calls. The renderer
 reloads authoritative resources through the frozen Local API after each
 invalidation.
@@ -692,6 +703,11 @@ this transition when editing an active project returns it to draft. Local
 activation acknowledgement uses the same transition lock, so it linearizes
 before a concurrent deactivate, close, or replacement activation, or observes
 that transition's newer generation and fails without touching the new session.
+The release provider enters retirement in the shared session generation before
+calling this method. Success clears the exact process-local binding and publishes
+`offline`/`active_tunnel=false` atomically; failure retains the retirement
+binding and publishes the typed error so the renderer can diagnose the lost
+authority without treating the tunnel as online.
 
 The renderer-facing run contract accepts only the active local project ID; the
 later release-routing adapter must load its ETag-selected saved `ProjectV1` and

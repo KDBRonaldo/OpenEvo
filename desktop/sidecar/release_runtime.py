@@ -25,7 +25,7 @@ from desktop.sidecar.core_bridge_adapters_v1 import (
 )
 from desktop.sidecar.core_bridge_store_v1 import DesktopCoreBridgeStoreV1
 from desktop.sidecar.core_bridge_v1 import DesktopCoreBridgeErrorV1, DesktopCoreBridgeV1
-from desktop.sidecar.event_broker_v1 import DesktopEventBrokerV1
+from desktop.sidecar.event_broker_v1 import DesktopEventBrokerError, DesktopEventBrokerV1
 from desktop.sidecar.provider_store import DesktopProviderStore, ProviderStoreError
 from desktop.sidecar.remote_lifecycle import DesktopRemoteLifecycle
 from desktop.sidecar.workspace_identity import ownership_for_native_import
@@ -49,6 +49,10 @@ _RELAY_MAX_BACKOFF_SECONDS = 2.0
 
 class ReleaseRuntimeConfigurationError(RuntimeError):
     """Packaged release assets or runtime ownership are invalid."""
+
+
+class _CoreEventSequenceGapError(RuntimeError):
+    """Force replay when a stream skips past the committed event sequence."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -150,6 +154,7 @@ class DesktopCoreEventRelayV1:
     def _run(self) -> None:
         identity: tuple[str, str, int] | None = None
         last_event_id: str | None = None
+        last_event_sequence: int | None = None
         backoff = _RELAY_MIN_BACKOFF_SECONDS
         while not self._stop.is_set():
             active_project = self._active_project
@@ -163,6 +168,7 @@ class DesktopCoreEventRelayV1:
                 if binding is None:
                     identity = None
                     last_event_id = None
+                    last_event_sequence = None
                     self._stop.wait(backoff)
                     backoff = min(backoff * 2, _RELAY_MAX_BACKOFF_SECONDS)
                     continue
@@ -171,21 +177,37 @@ class DesktopCoreEventRelayV1:
                 if current_identity != identity:
                     identity = current_identity
                     last_event_id = None
+                    last_event_sequence = None
                 with self._bridge.events(project, last_event_id=last_event_id) as events:
                     backoff = _RELAY_MIN_BACKOFF_SECONDS
                     for frame in events:
                         if self._stop.is_set():
                             return
-                        last_event_id = frame.id
-                        if not isinstance(frame.data.root, core_v1.HeartbeatEventV1):
+                        event = frame.data.root
+                        if not isinstance(event, core_v1.HeartbeatEventV1):
                             publish()
+                        if (
+                            last_event_sequence is None
+                            or event.sequence == last_event_sequence + 1
+                        ):
+                            last_event_id = frame.id
+                            last_event_sequence = event.sequence
+                        elif event.sequence > last_event_sequence:
+                            raise _CoreEventSequenceGapError(
+                                "Core event stream skipped the committed sequence"
+                            )
             except DesktopCoreBridgeErrorV1 as exc:
                 if binding is not None:
                     session_lost(binding, exc)
                 if self._stop.wait(backoff):
                     return
                 backoff = min(backoff * 2, _RELAY_MAX_BACKOFF_SECONDS)
-            except (ProviderStoreError, OSError):
+            except (
+                _CoreEventSequenceGapError,
+                DesktopEventBrokerError,
+                ProviderStoreError,
+                OSError,
+            ):
                 if self._stop.wait(backoff):
                     return
                 backoff = min(backoff * 2, _RELAY_MAX_BACKOFF_SECONDS)

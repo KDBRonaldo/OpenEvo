@@ -515,10 +515,16 @@ project-bound Core bridge, bounded Desktop event broker, and Core SSE relay. It
 therefore exposes the full frozen Desktop feature inventory required by the
 renderer. All Core resource routes are bound to the exact active Local project;
 project edits wait for in-flight route delivery and then retire that bridge
-generation. The relay converts non-heartbeat Core activity only into a Desktop
-state invalidation, after which the renderer reloads authoritative Core-owned
-resources. It never copies algorithm state or interprets evolution method
-events in the Desktop process.
+generation. Successful retirement clears the process-local project binding and
+publishes `active_tunnel=false` in one provider lock transition; a failed
+retirement preserves the generation-bound binding with a typed offline failure
+for diagnosis. The relay converts non-heartbeat Core activity only into a
+Desktop state invalidation, after which the renderer reloads authoritative
+Core-owned resources. Its `Last-Event-ID` advances only after that Desktop
+publication succeeds and the Core event sequence remains contiguous, so
+publication failure or a sequence gap reconnects from the prior committed
+cursor and replays the frame. It never copies algorithm state or interprets evolution
+method events in the Desktop process.
 
 The release sidecar now owns the initial SSH lifecycle behind the frozen Local
 API profile routes. A connect action atomically validates its idempotency
@@ -536,6 +542,13 @@ runs a bounded SSH connectivity check. Success, failure, and crash cancellation
 update the reserved profile, operation, and idempotency response in one
 transaction, so concurrent capacity consumption and the request's now-stale
 ETag cannot break finalization.
+Profile lifecycle admission and project activation admission share one
+process-local session generation. Each admission is ordered with project
+retirement before external work; terminal publication must still own that exact
+generation. A late connect/disconnect success or failure may finalize only its
+durable operation after replacement and cannot downgrade a newer online Core
+state, run failed-operation transport cleanup against the replacement, or
+advance the replacement binding.
 Disconnect reservations are non-displacing and do not publish `connecting`; the
 sidecar checks the process lifecycle owner before invoking disconnect, so a
 request for profile B cannot rewrite profile A or close A's transport. A
