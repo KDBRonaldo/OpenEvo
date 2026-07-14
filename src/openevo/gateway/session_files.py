@@ -743,6 +743,54 @@ def stage_codex_subscription_auth(
             source_pin.close()
 
 
+def load_staged_codex_subscription_redactor(
+    credential_dir: Path,
+    credential_identity: SessionRootIdentity,
+) -> CredentialRedactor:
+    """Rebuild a redactor from the pinned private credential authority."""
+
+    root_pin = _pin_absolute_directory(credential_dir)
+    descriptor = -1
+    try:
+        root_pin.verify(label="credential root")
+        root_stat = os.fstat(root_pin.descriptor)
+        _require_session_identity(root_stat, credential_identity)
+        descriptor = os.open(
+            "auth.json",
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+            dir_fd=root_pin.descriptor,
+        )
+        opened = os.fstat(descriptor)
+        _require_private_staged_auth(
+            opened,
+            expected_owner=credential_identity[2],
+        )
+        content = _read_fd_exact(descriptor, opened.st_size)
+        after = os.fstat(descriptor)
+        if _auth_identity(opened) != _auth_identity(after):
+            raise SessionFileSecurityError(
+                "staged Codex auth changed during recovery read"
+            )
+        _require_path_identity(
+            root_pin.descriptor,
+            "auth.json",
+            after,
+            label="staged Codex auth",
+        )
+        root_pin.verify(label="credential root")
+        return CredentialRedactor.from_auth_json(content)
+    except SessionFileSecurityError:
+        raise
+    except (OSError, ValueError) as exc:
+        raise SessionFileSecurityError(
+            "staged Codex auth could not be recovered safely"
+        ) from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        root_pin.close()
+
+
 def remove_session_tree(
     session_dir: Path,
     session_identity: SessionRootIdentity,
@@ -787,36 +835,37 @@ def remove_session_tree(
         os.close(parent_fd)
 
 
-def redact_session_capture_tree(
-    session_dir: Path,
-    session_identity: SessionRootIdentity,
+def redact_core_capture_tree(
+    capture_dir: Path,
+    capture_identity: SessionRootIdentity,
     redactor: CredentialRedactor,
     *,
     max_depth: int = _CLEANUP_MAX_DEPTH,
     max_nodes: int = _CLEANUP_MAX_NODES,
     max_total_bytes: int = _CAPTURE_REDACTION_MAX_TOTAL_BYTES,
 ) -> None:
-    """Redact exact credential material from session-owned capture surfaces."""
+    """Redact exact credential material from one Core-owned capture authority."""
 
-    root_pin = _pin_absolute_directory(session_dir)
-    budget = [max_nodes, max_total_bytes]
+    root_pin = _pin_absolute_directory(capture_dir)
     try:
         root_pin.verify(label="session capture root")
-        _require_session_identity(os.fstat(root_pin.descriptor), session_identity)
-        root_fd = _open_readable_directory(root_pin.descriptor, label="session root")
-        try:
-            _redact_directory_contents(
-                root_fd,
-                expected_owner=session_identity[2],
-                redactor=redactor,
-                depth=0,
-                max_depth=max_depth,
-                budget=budget,
-            )
-        finally:
-            os.close(root_fd)
+        _require_session_identity(os.fstat(root_pin.descriptor), capture_identity)
+        for apply_redaction in (False, True):
+            root_fd = _open_readable_directory(root_pin.descriptor, label="session root")
+            try:
+                _redact_directory_contents(
+                    root_fd,
+                    expected_owner=capture_identity[2],
+                    redactor=redactor,
+                    depth=0,
+                    max_depth=max_depth,
+                    budget=[max_nodes, max_total_bytes],
+                    apply_redaction=apply_redaction,
+                )
+            finally:
+                os.close(root_fd)
         root_pin.verify(label="session capture root")
-        _require_session_identity(os.fstat(root_pin.descriptor), session_identity)
+        _require_session_identity(os.fstat(root_pin.descriptor), capture_identity)
     finally:
         root_pin.close()
 
@@ -1138,6 +1187,7 @@ def _redact_directory_contents(
     depth: int,
     max_depth: int,
     budget: list[int],
+    apply_redaction: bool,
 ) -> None:
     if depth > max_depth:
         raise SessionFileSecurityError("credential scan exceeds the depth limit")
@@ -1182,6 +1232,7 @@ def _redact_directory_contents(
                     depth=depth + 1,
                     max_depth=max_depth,
                     budget=budget,
+                    apply_redaction=apply_redaction,
                 )
                 _require_path_identity(
                     directory_fd,
@@ -1201,7 +1252,10 @@ def _redact_directory_contents(
 
         descriptor = os.open(
             name,
-            os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+            (os.O_RDWR if apply_redaction else os.O_RDONLY)
+            | os.O_CLOEXEC
+            | os.O_NOFOLLOW
+            | os.O_NONBLOCK,
             dir_fd=directory_fd,
         )
         try:
@@ -1211,19 +1265,28 @@ def _redact_directory_contents(
                     "credential scan file changed while it was opened"
                 )
             original_size = opened.st_size
-            if (
-                original_size > _CAPTURE_REDACTION_MAX_BYTES
-                or original_size > budget[1]
-            ):
-                redacted = CAPTURE_REDACTION_LIMIT_MARKER.encode("utf-8")
-            else:
-                budget[1] -= original_size
-                redacted = redactor.redact_bytes(
-                    _read_fd_exact(descriptor, original_size)
+            if original_size > _CAPTURE_REDACTION_MAX_BYTES:
+                raise SessionFileSecurityError(
+                    "credential scan exceeds the per-file byte limit"
                 )
+            if original_size > budget[1]:
+                raise SessionFileSecurityError(
+                    "credential scan exceeds the total byte limit"
+                )
+            budget[1] -= original_size
+            if not apply_redaction:
+                _require_path_identity(
+                    directory_fd,
+                    name,
+                    opened,
+                    label="session capture file",
+                )
+                continue
+            redacted = redactor.redact_bytes(
+                _read_fd_exact(descriptor, original_size)
+            )
             if len(redacted) != original_size or (
-                original_size <= _CAPTURE_REDACTION_MAX_BYTES
-                and redacted != _read_fd_exact(descriptor, original_size)
+                redacted != _read_fd_exact(descriptor, original_size)
             ):
                 _replace_fd_contents(descriptor, redacted)
             after = os.fstat(descriptor)

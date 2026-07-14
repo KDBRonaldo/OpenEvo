@@ -368,15 +368,14 @@ def test_credential_redactor_fails_closed_for_oversized_capture() -> None:
     assert redacted == session_files.CAPTURE_REDACTION_LIMIT_MARKER
 
 
-def test_capture_tree_redaction_covers_workspace_artifacts_and_logs(
+def test_core_capture_tree_redaction_covers_owned_logs(
     tmp_path: Path,
 ) -> None:
     auth = b'{"access_token":"access-canary","account_id":"account-canary"}'
     redactor = session_files.CredentialRedactor.from_auth_json(auth)
     root, identity = _session_root(tmp_path)
     for relative in (
-        "workspace/copied-auth.json",
-        "artifacts/result.txt",
+        "logs/postrun.log",
         "logs/agent/step.00.stdout.log",
     ):
         path = root / relative
@@ -386,7 +385,7 @@ def test_capture_tree_redaction_covers_workspace_artifacts_and_logs(
             encoding="utf-8",
         )
 
-    session_files.redact_session_capture_tree(root, identity, redactor)
+    session_files.redact_core_capture_tree(root, identity, redactor)
 
     persisted = "\n".join(
         path.read_text(encoding="utf-8")
@@ -397,6 +396,49 @@ def test_capture_tree_redaction_covers_workspace_artifacts_and_logs(
     assert "account-canary" not in persisted
     assert auth.decode() not in persisted
     assert "visible" in persisted
+
+
+def test_capture_tree_redaction_rejects_oversized_file_without_changing_bytes(
+    tmp_path: Path,
+) -> None:
+    redactor = session_files.CredentialRedactor.from_auth_json(
+        b'{"access_token":"access-canary"}'
+    )
+    root, identity = _session_root(tmp_path)
+    capture = root / "workspace" / "large.bin"
+    capture.parent.mkdir()
+    original = b"access-canary\n" + b"x" * session_files._CAPTURE_REDACTION_MAX_BYTES
+    capture.write_bytes(original)
+
+    with pytest.raises(SessionFileSecurityError, match="per-file byte limit"):
+        session_files.redact_core_capture_tree(root, identity, redactor)
+
+    assert capture.read_bytes() == original
+
+
+def test_capture_tree_redaction_preflights_total_limit_before_changing_any_file(
+    tmp_path: Path,
+) -> None:
+    redactor = session_files.CredentialRedactor.from_auth_json(
+        b'{"access_token":"access-canary"}'
+    )
+    root, identity = _session_root(tmp_path)
+    first = root / "logs" / "first.log"
+    second = root / "logs" / "second.log"
+    first.parent.mkdir()
+    first.write_bytes(b"access-canary-first")
+    second.write_bytes(b"access-canary-second")
+    originals = (first.read_bytes(), second.read_bytes())
+
+    with pytest.raises(SessionFileSecurityError, match="total byte limit"):
+        session_files.redact_core_capture_tree(
+            root,
+            identity,
+            redactor,
+            max_total_bytes=len(originals[0]),
+        )
+
+    assert (first.read_bytes(), second.read_bytes()) == originals
 
 
 def test_capture_tree_redaction_rechecks_recursive_directory_path_binding(
@@ -430,7 +472,7 @@ def test_capture_tree_redaction_rechecks_recursive_directory_path_binding(
     )
 
     with pytest.raises(SessionFileSecurityError, match="directory path changed"):
-        session_files.redact_session_capture_tree(root, identity, redactor)
+        session_files.redact_core_capture_tree(root, identity, redactor)
 
     assert (nested / "attacker.txt").read_text(encoding="utf-8") == "access-canary"
 

@@ -6,7 +6,7 @@ import os
 import threading
 import time
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -28,6 +28,7 @@ from openevo.gateway.node import (
     write_evolution_context_files,
 )
 from openevo.gateway.session import SessionRegistry
+from openevo.gateway.storage import SessionStore
 from openevo.gateway import session_files
 from openevo.gateway.session_files import capture_session_root_identity
 from openevo.rollout.models import (
@@ -814,6 +815,83 @@ async def test_subscription_stops_runtime_and_redacts_background_output_before_r
     assert secret not in serialized
 
 
+def test_subscription_capture_redaction_never_modifies_workspace_files(
+    tmp_path: Path,
+) -> None:
+    secret = "access-canary"
+    session_dir = tmp_path / "session"
+    log_dir = tmp_path / "core-logs"
+    credential_dir = tmp_path / "credentials"
+    for root in (session_dir, log_dir, credential_dir):
+        root.mkdir()
+    workspace_file = session_dir / "workspace" / "research-output.bin"
+    workspace_file.parent.mkdir()
+    original = secret.encode() + b"\n" + b"x" * (
+        session_files._CAPTURE_REDACTION_MAX_BYTES + 1
+    )
+    workspace_file.write_bytes(original)
+    authority_log = log_dir / "logs" / "agent" / "step.00.stdout.log"
+    authority_log.parent.mkdir(parents=True)
+    authority_log.write_text(f"captured {secret}", encoding="utf-8")
+    managed = ManagedSession(
+        request=SessionDispatchRequest(
+            session_id="workspace-preservation",
+            task_id="task_1",
+            instruction="Do work.",
+            remaining_timeout_seconds=60,
+            agent=AgentSpec(
+                harness="codex",
+                settings={"auth_mode": "subscription", "capture_mode": "transcript"},
+            ),
+        ),
+        timer=StageTimer(),
+        session_dir=session_dir,
+        artifacts_dir=session_dir / "artifacts",
+        session_root_identity=capture_session_root_identity(session_dir),
+        log_authority_dir=log_dir,
+        log_authority_identity=capture_session_root_identity(log_dir),
+        credential_dir=credential_dir,
+        credential_root_identity=capture_session_root_identity(credential_dir),
+        credential_redactor=session_files.CredentialRedactor.from_auth_json(
+            b'{"access_token":"access-canary"}'
+        ),
+    )
+
+    GatewayNodeManager._redact_core_capture_authority(managed)
+
+    assert workspace_file.read_bytes() == original
+    assert secret not in authority_log.read_text(encoding="utf-8")
+
+
+@pytest.mark.asyncio
+async def test_subscription_postrun_retries_runtime_absence_within_a_bound(
+    tmp_path: Path,
+) -> None:
+    calls: list[str] = []
+    manager = _postrun_manager(calls=calls)
+    managed = _managed_postrun_session(tmp_path, _session_result())
+    managed.request.agent = AgentSpec(
+        harness="codex",
+        settings={"auth_mode": "subscription", "capture_mode": "transcript"},
+    )
+    managed.runtime = FakeRuntime()
+    attempts = 0
+
+    async def stop_runtime(runtime, session_id, label):
+        nonlocal attempts
+        del runtime, session_id, label
+        attempts += 1
+        return attempts == 3
+
+    manager._stop_runtime_best_effort = stop_runtime
+
+    await manager._handle_postrun(managed)
+
+    assert attempts == 3
+    assert manager.session_registry.results[-1].status == SessionStatus.COMPLETED
+    assert managed.session_id not in manager._cleanup_retries
+
+
 @pytest.mark.asyncio
 async def test_cleanup_retry_reconciliation_retries_owned_runtime_and_roots(
     tmp_path: Path,
@@ -935,6 +1013,185 @@ async def test_cleanup_ownership_persists_for_new_manager_startup_reconciliation
         "logs",
     ]
     assert restarted._cleanup_retries == {}
+    assert list(journal_dir.glob("*.json")) == []
+
+
+@pytest.mark.asyncio
+async def test_subscription_finalization_journal_recovers_terminal_result_after_restart(
+    tmp_path: Path,
+) -> None:
+    journal_dir = tmp_path / "cleanup-journal"
+    session_dir = tmp_path / "session"
+    credential_dir = tmp_path / "credentials"
+    log_authority_dir = tmp_path / "core-logs"
+    for root in (session_dir, credential_dir, log_authority_dir):
+        root.mkdir()
+    (credential_dir / "auth.json").write_text(
+        '{"access_token":"access-canary"}',
+        encoding="utf-8",
+    )
+    (credential_dir / "auth.json").chmod(0o600)
+
+    class JournalRuntime(FakeRuntime):
+        @property
+        def runtime_id(self) -> str:
+            return "openevo-recovered-subscription"
+
+        @property
+        def container_id(self) -> str:
+            return "sha256:recovered-subscription"
+
+    original = _session_result(
+        session_id="recovered-subscription",
+        metadata={"scientific_result": "42", "leaked": "access-canary"},
+    )
+    managed = _managed_postrun_session(session_dir, original)
+    managed.request.agent = AgentSpec(
+        harness="codex",
+        settings={"auth_mode": "subscription", "capture_mode": "transcript"},
+    )
+    managed.runtime = JournalRuntime()
+    managed.session_root_identity = capture_session_root_identity(session_dir)
+    managed.credential_dir = credential_dir
+    managed.credential_root_identity = capture_session_root_identity(credential_dir)
+    managed.credential_redactor = session_files.CredentialRedactor.from_auth_json(
+        b'{"access_token":"access-canary"}'
+    )
+    managed.log_authority_dir = log_authority_dir
+    managed.log_authority_identity = capture_session_root_identity(log_authority_dir)
+
+    first_calls: list[str] = []
+    first = _postrun_manager(calls=first_calls)
+    first._cleanup_journal_dir = journal_dir
+    first._stop_runtime_best_effort = AsyncMock(return_value=False)
+
+    await first._handle_postrun(managed)
+
+    assert first.session_registry.results == []
+    journal_text = next(journal_dir.glob("*.json")).read_text(encoding="utf-8")
+    assert "scientific_result" in journal_text
+    assert "access-canary" not in journal_text
+
+    recovered_calls: list[str] = []
+    restarted = _postrun_manager(calls=recovered_calls)
+    restarted._cleanup_journal_dir = journal_dir
+    restarted.session_registry = SessionRegistry()
+    restarted.storage = RecordingStorage(recovered_calls)
+    restarted._stop_recovered_container = AsyncMock(side_effect=[False, True])
+
+    restarted._load_cleanup_retries()
+    await restarted._reconcile_cleanup_retries()
+
+    assert restarted.session_registry.get(original.session_id) is None
+    assert "callback_push" not in recovered_calls
+    assert "remove_session_dir" not in recovered_calls
+    assert list(journal_dir.glob("*.json"))
+
+    await restarted._reconcile_cleanup_retries()
+
+    info = restarted.session_registry.get(original.session_id)
+    assert info is not None
+    assert info.status == SessionStatus.COMPLETED
+    assert info.result is None  # callback delivery releases only the in-memory payload
+    assert recovered_calls.index("callback_push") < recovered_calls.index(
+        "remove_session_dir"
+    )
+    assert list(journal_dir.glob("*.json")) == []
+
+
+@pytest.mark.asyncio
+async def test_subscription_finalization_rebuilds_transcript_after_restart(
+    tmp_path: Path,
+) -> None:
+    journal_dir = tmp_path / "cleanup-journal"
+    session_dir = tmp_path / "session"
+    credential_dir = tmp_path / "credentials"
+    log_authority_dir = tmp_path / "core-logs"
+    for root in (session_dir, credential_dir, log_authority_dir):
+        root.mkdir(mode=0o700)
+    (session_dir / "artifacts").mkdir()
+    auth = credential_dir / "auth.json"
+    auth.write_text('{"access_token":"access-canary"}', encoding="utf-8")
+    auth.chmod(0o600)
+    log_identity = capture_session_root_identity(log_authority_dir)
+    session_files.write_verified_session_log(
+        log_authority_dir,
+        log_identity,
+        directory_parts=("logs", "agent"),
+        leaf_name="step.00.stdout.log",
+        content=(
+            '{"type":"item.completed","item":{"type":"agent_message",'
+            '"text":"scientific answer 42 access-canary"}}\n'
+        ),
+    )
+
+    class JournalRuntime(FakeRuntime):
+        @property
+        def runtime_id(self) -> str:
+            return "openevo-rebuild-subscription"
+
+        @property
+        def container_id(self) -> str:
+            return "sha256:rebuild-subscription"
+
+    request = SessionDispatchRequest(
+        session_id="rebuild-subscription",
+        task_id="task_1",
+        instruction="Do work.",
+        remaining_timeout_seconds=60,
+        agent=AgentSpec(
+            harness="codex",
+            settings={"auth_mode": "subscription", "capture_mode": "transcript"},
+        ),
+    )
+    managed = ManagedSession(
+        request=request,
+        timer=StageTimer(),
+        session_dir=session_dir,
+        artifacts_dir=session_dir / "artifacts",
+        session_root_identity=capture_session_root_identity(session_dir),
+        log_authority_dir=log_authority_dir,
+        log_authority_identity=log_identity,
+        credential_dir=credential_dir,
+        credential_root_identity=capture_session_root_identity(credential_dir),
+        credential_redactor=session_files.CredentialRedactor.from_auth_json(
+            auth.read_bytes()
+        ),
+        runtime=JournalRuntime(),
+        agent_result=AgentRunResult(
+            status="completed",
+            return_code=0,
+            metadata={"last_step": 0, "log_dir": str(log_authority_dir / "logs" / "agent")},
+        ),
+    )
+    first = _postrun_manager(calls=[])
+    first._cleanup_journal_dir = journal_dir
+    first._stop_runtime_best_effort = AsyncMock(return_value=False)
+
+    await first._handle_postrun(managed)
+
+    delivered: list[SessionResult] = []
+    restarted = _postrun_manager(calls=[])
+    restarted._cleanup_journal_dir = journal_dir
+    restarted.session_registry = SessionRegistry()
+    restarted.storage = SessionStore()
+    restarted.builders = default_builder_registry()
+    restarted._stop_recovered_container = AsyncMock(return_value=True)
+
+    async def capture_result(callback_url, result):
+        del callback_url
+        delivered.append(result)
+        return False
+
+    restarted._push_result = capture_result
+    restarted._load_cleanup_retries()
+    await restarted._reconcile_cleanup_retries()
+
+    assert len(delivered) == 1
+    assert delivered[0].status == SessionStatus.COMPLETED
+    serialized = delivered[0].model_dump_json()
+    assert "scientific answer 42" in serialized
+    assert "access-canary" not in serialized
     assert list(journal_dir.glob("*.json")) == []
 
 

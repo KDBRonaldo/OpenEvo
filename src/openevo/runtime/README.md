@@ -128,4 +128,10 @@ by another live Core process or an incomplete/tampered record fails closed.
 Every stop attempt revalidates the ID and, after `rm -f`, marks the runtime
 destroyed only when a final inspect proves that exact ID absent. Gateway does
 not remove either bind root until that proof succeeds; cleanup ownership remains
-in the private authority root and startup/shutdown retry journal otherwise.
+in the private authority root and durable retry journal otherwise. Subscription
+post-run uses bounded immediate retries and then periodic reconciliation. Its
+private journal also carries redacted finalization state, allowing a restarted
+Gateway to publish the same terminal result (or rebuild it from the pinned Core
+transcript authority) after absence proof and only then remove owned roots.
+Workspace and artifact files are not redaction write targets; files larger than
+the Core capture scan limit retain their exact bytes.

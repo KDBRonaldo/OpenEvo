@@ -78,12 +78,15 @@ aborts without logging credential contents.
 
 Verified auth JSON supplies a bounded set of exact sensitive leaf values. The
 gateway redacts those values from stdout/stderr and transcript logs and performs
-a bounded no-follow scan of session workspace, artifact, and Core log files before
-export; captures over the content budget are replaced by a redaction marker.
-This prevents OpenEvo's own sync, scanner, and capture paths from automatically
-copying known credential bytes. The Codex harness remains a necessary trusted
-consumer of the credential. OpenEvo cannot prevent that process from actively
-transforming or transmitting a secret; that behavior is outside this boundary.
+a bounded no-follow scan only of the unmounted Core log authority before export.
+Ordinary workspace inputs, workspace outputs, and artifacts are never redaction
+write targets. The scanner preflights the complete per-file, aggregate-byte,
+node, and depth budgets before changing a Core capture; a limit breach fails
+finalization explicitly and leaves all original bytes unchanged. Result objects
+receive a separate recursive in-memory redaction before persistence or delivery.
+The Codex harness remains a necessary trusted consumer of the credential.
+OpenEvo cannot prevent that process from actively transforming or transmitting a
+secret; that behavior is outside this boundary.
 
 The session root is pinned by device, inode, and owner before runtime startup.
 Teardown walks only from that descriptor, never follows links, restores only
@@ -114,10 +117,17 @@ recursively redacted again before registry, evolution export, or callback
 delivery. Docker ownership records live in a node-private root outside agent and
 evaluator mounts. Startup reclaims abandoned records by exact immutable ID;
 Docker always follows removal with an absence `inspect`, including after
-successful `rm -f`. Failures retain a private cleanup journal containing only
-runtime, container, session-root, log-root, and credential-root identities.
-Startup and shutdown reconciliation retry each journal independently, and roots
-are removed only after absence proof.
+successful `rm -f`. Subscription teardown retries failed stop/absence checks a
+fixed number of times in the post-run worker. A still-unproven runtime is moved
+to periodic reconciliation instead of occupying that worker indefinitely.
+The private v3 cleanup journal contains runtime/container and pinned-root
+ownership plus a redacted, closed finalization authority: request identity,
+agent terminal state, optional terminal result, pending status, and timer marks.
+It does not contain auth bytes. Startup reloads that authority, re-verifies the
+staged private auth file to rebuild the redactor, proves every owned container
+absent, and resumes transcript/result publication before deleting any session,
+credential, or log root. The live retry loop handles temporary failures after
+startup; ownership remains retained while absence cannot be proved.
 
 ## What it captures
 

@@ -171,10 +171,17 @@ container ID 执行 remove + absence inspect。只有 absence proof 成功、最
 `SessionResult`。Core 自己的 step stdout/stderr 不写入 agent 可写 session bind，而是在
 unmounted node-private log authority 中通过 exclusive `0600` regular inode 有界写入、无覆盖
 发布，并用同一 held-root authority 做最终 verified read；预置 symlink/FIFO/socket 不会被打开。
+Credential scan 只以该 Core log authority 为写目标，不原地修改 workspace input、workspace
+output 或 artifact。scan 在任何写入前完成 per-file、aggregate byte、node 和 depth 预算预检；
+超过 4 MiB 的单文件或总量超限会显式终止 finalization，并保持原始 bytes，不写 marker。
 执行 deadline 耗尽后，transcript byte recovery/build 使用独立有界 finalization budget，保留
 timeout/cancel 前已经捕获的输出和原终态。结果发布前还会递归执行一次内存脱敏。失败时
-private cleanup journal 保留 runtime/container/session/log/credential identities，startup/shutdown reconciliation
-逐项重试，不会因一个 cancel/stop failure 跳过其他 ownership。
+post-run 先做固定次数的 stop/absence retry，仍失败则释放 stage worker，由运行期周期
+reconciliation 继续。private v3 cleanup journal 除 runtime/container/session/log/credential
+identities 外，还保存闭集、已脱敏的 request/agent terminal/optional result/pending status/timer
+finalization authority，不保存 auth bytes。重启从私有 credential root 重新验证并构造 redactor，
+证明容器 absent 后继续构造或发布原 terminal result，最后才删除 roots；无法证明 absence 时
+ownership 和 journal 持续保留。
 
 ## 主要模块
 

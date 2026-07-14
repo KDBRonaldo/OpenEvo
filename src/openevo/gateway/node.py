@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import shlex
@@ -33,8 +34,9 @@ from openevo.gateway.session_files import (
     VerifiedSessionTranscript,
     capture_session_root_identity,
     create_session_log_authority,
+    load_staged_codex_subscription_redactor,
     read_verified_session_transcript,
-    redact_session_capture_tree,
+    redact_core_capture_tree,
     remove_session_tree,
     stage_codex_subscription_auth,
     write_verified_session_log,
@@ -85,10 +87,27 @@ logger = logging.getLogger(__name__)
 _SAFE_SKILL_NAME_RE = re.compile(r"[^A-Za-z0-9_.-]+")
 _SUBSCRIPTION_AUTH_MODES = {"subscription", "chatgpt_subscription"}
 _FINALIZATION_BUDGET_SECONDS = 10.0
+_SUBSCRIPTION_STOP_ATTEMPTS = 3
+_SUBSCRIPTION_STOP_RETRY_DELAY_SECONDS = 0.1
+_CLEANUP_RETRY_INTERVAL_SECONDS = 1.0
+_CLEANUP_JOURNAL_MAX_BYTES = 16 * 1024 * 1024
 
 
 class GatewayExecutionTimeout(TimeoutError):
     """Raised when a session exhausts its shared gateway execution budget."""
+
+
+@dataclass(slots=True)
+class SubscriptionFinalizationState:
+    """Private redacted authority needed to resume terminal publication."""
+
+    request: SessionDispatchRequest
+    agent_result: AgentRunResult | None
+    final_result: SessionResult | None
+    pending_status: SessionStatus | None
+    pending_error: str | None
+    cancel_requested: bool
+    timer_marks: dict[str, float]
 
 
 @dataclass(slots=True)
@@ -110,6 +129,7 @@ class CleanupRetryOwnership:
     eval_runtime: BaseRuntime | None = None
     managed: ManagedSession | None = None
     finalize_subscription: bool = False
+    finalization_state: SubscriptionFinalizationState | None = None
 
 
 async def write_evolution_context_files(
@@ -492,6 +512,8 @@ class GatewayNodeManager:
         self._control_client: httpx.AsyncClient | None = None
         self._heartbeat_task: asyncio.Task[None] | None = None
         self._rollout_registered = False
+        self._cleanup_retry_task: asyncio.Task[None] | None = None
+        self._cleanup_reconcile_lock = asyncio.Lock()
         self._cleanup_retries: dict[str, CleanupRetryOwnership] = {}
         cleanup_base = (
             Path(session_base_dir).absolute() if session_base_dir else Path("/tmp")
@@ -512,6 +534,7 @@ class GatewayNodeManager:
         self._load_cleanup_retries()
         await self._reconcile_cleanup_retries()
         await self._dispatcher.start()
+        self._cleanup_retry_task = asyncio.create_task(self._cleanup_retry_loop())
         if self._rollout_server_url is not None:
             self._control_client = httpx.AsyncClient(
                 base_url=self._rollout_server_url,
@@ -523,6 +546,10 @@ class GatewayNodeManager:
             self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
 
     async def close(self) -> None:
+        if self._cleanup_retry_task is not None:
+            self._cleanup_retry_task.cancel()
+            await asyncio.gather(self._cleanup_retry_task, return_exceptions=True)
+            self._cleanup_retry_task = None
         if self._heartbeat_task is not None:
             self._heartbeat_task.cancel()
             await asyncio.gather(self._heartbeat_task, return_exceptions=True)
@@ -536,6 +563,9 @@ class GatewayNodeManager:
             self._register_cleanup_retry(
                 managed,
                 eval_runtime=eval_runtime or managed.eval_runtime,
+                finalize_subscription=_is_codex_subscription_agent(
+                    managed.request.agent
+                ),
             )
         await self._reconcile_cleanup_retries()
         if self.evolution_client is not None:
@@ -765,7 +795,7 @@ class GatewayNodeManager:
                     managed.credential_dir,
                     managed.credential_root_identity,
                 )
-                self._redact_session_captures(managed)
+                self._redact_core_capture_authority(managed)
         except GatewayExecutionTimeout as exc:
             self._set_terminal_failure(
                 managed,
@@ -936,17 +966,14 @@ class GatewayNodeManager:
                     )
 
     @staticmethod
-    def _redact_session_captures(managed: ManagedSession) -> None:
+    def _redact_core_capture_authority(managed: ManagedSession) -> None:
         redactor = managed.credential_redactor
         if redactor is None:
             return
-        roots = [
-            (managed.session_dir, managed.session_root_identity),
-            (managed.log_authority_dir, managed.log_authority_identity),
-        ]
-        for root, identity in roots:
-            if root is not None and identity is not None:
-                redact_session_capture_tree(root, identity, redactor)
+        root = managed.log_authority_dir
+        identity = managed.log_authority_identity
+        if root is not None and identity is not None:
+            redact_core_capture_tree(root, identity, redactor)
 
     def _ensure_log_authority(self, managed: ManagedSession) -> Path:
         if (
@@ -1056,7 +1083,7 @@ class GatewayNodeManager:
             # Postprocess always runs so harnesses can collect artifacts from
             # failed or timed-out agent runs before post-run evaluation.
             await self._await_with_budget(harness.postprocess(runtime, agent_result), managed)
-            self._redact_session_captures(managed)
+            self._redact_core_capture_authority(managed)
 
         except GatewayExecutionTimeout as exc:
             # Don't set final_result — let _handle_postrun build a partial
@@ -1369,7 +1396,7 @@ class GatewayNodeManager:
             managed.timer.mark("teardown", "started")
             await self._run_postrun_steps(managed)
             try:
-                self._redact_session_captures(managed)
+                self._redact_core_capture_authority(managed)
             except Exception as exc:
                 logger.exception(
                     "Credential capture redaction failed for session %s",
@@ -1444,17 +1471,12 @@ class GatewayNodeManager:
             (eval_runtime, "eval runtime"),
             (managed.runtime, "runtime"),
         ]
-        stop_results = await asyncio.gather(
-            *(
-                self._stop_runtime_best_effort(runtime, request.session_id, label)
-                for runtime, label in stop_targets
-                if runtime is not None
-            ),
-            return_exceptions=True,
-        )
         runtimes_removed = (
             not managed.runtime_cleanup_blocked
-            and all(outcome is True for outcome in stop_results)
+            and await self._stop_subscription_runtimes_with_retry(
+                stop_targets,
+                request.session_id,
+            )
         )
         managed.timer.mark("teardown", "finished")
         if not runtimes_removed:
@@ -1472,6 +1494,31 @@ class GatewayNodeManager:
 
         await self._finalize_subscription_after_runtime_absence(managed, result=result)
 
+    async def _stop_subscription_runtimes_with_retry(
+        self,
+        targets: list[tuple[BaseRuntime | None, str]],
+        session_id: str,
+    ) -> bool:
+        pending = [(runtime, label) for runtime, label in targets if runtime is not None]
+        for attempt in range(_SUBSCRIPTION_STOP_ATTEMPTS):
+            if not pending:
+                return True
+            outcomes = await asyncio.gather(
+                *(
+                    self._stop_runtime_best_effort(runtime, session_id, label)
+                    for runtime, label in pending
+                ),
+                return_exceptions=True,
+            )
+            pending = [
+                target
+                for target, outcome in zip(pending, outcomes, strict=True)
+                if outcome is not True
+            ]
+            if pending and attempt + 1 < _SUBSCRIPTION_STOP_ATTEMPTS:
+                await asyncio.sleep(_SUBSCRIPTION_STOP_RETRY_DELAY_SECONDS)
+        return not pending
+
     async def _finalize_subscription_after_runtime_absence(
         self,
         managed: ManagedSession,
@@ -1481,7 +1528,7 @@ class GatewayNodeManager:
         request = managed.request
         try:
             self._start_finalization_deadline(managed)
-            self._redact_session_captures(managed)
+            self._redact_core_capture_authority(managed)
             if result is None:
                 if managed.agent_result is not None:
                     result = await self._build_session_result(managed)
@@ -2226,6 +2273,56 @@ class GatewayNodeManager:
         self._persist_cleanup_ownership(ownership)
 
     @staticmethod
+    def _redact_finalization_value(
+        value: Any,
+        redactor: CredentialRedactor | None,
+    ) -> Any:
+        if redactor is None:
+            return value
+        if isinstance(value, str):
+            return redactor.redact(value)
+        if isinstance(value, list):
+            return [
+                GatewayNodeManager._redact_finalization_value(item, redactor)
+                for item in value
+            ]
+        if isinstance(value, dict):
+            return {
+                key: GatewayNodeManager._redact_finalization_value(item, redactor)
+                for key, item in value.items()
+            }
+        return value
+
+    @classmethod
+    def _subscription_finalization_state(
+        cls,
+        managed: ManagedSession,
+    ) -> SubscriptionFinalizationState:
+        redactor = managed.credential_redactor
+
+        def redacted_model(model, model_type):
+            if model is None:
+                return None
+            payload = cls._redact_finalization_value(
+                model.model_dump(mode="json"),
+                redactor,
+            )
+            return model_type.model_validate(payload)
+
+        pending_error = managed.pending_error
+        if pending_error is not None and redactor is not None:
+            pending_error = redactor.redact(pending_error)
+        return SubscriptionFinalizationState(
+            request=redacted_model(managed.request, SessionDispatchRequest),
+            agent_result=redacted_model(managed.agent_result, AgentRunResult),
+            final_result=redacted_model(managed.final_result, SessionResult),
+            pending_status=managed.pending_status,
+            pending_error=pending_error,
+            cancel_requested=managed.cancel_requested,
+            timer_marks=dict(managed.timer._marks),
+        )
+
+    @staticmethod
     def _cleanup_ownership_for(
         managed: ManagedSession,
         *,
@@ -2233,6 +2330,11 @@ class GatewayNodeManager:
         finalize_subscription: bool = False,
     ) -> CleanupRetryOwnership:
         runtime = managed.runtime
+        finalization_state = (
+            GatewayNodeManager._subscription_finalization_state(managed)
+            if finalize_subscription
+            else None
+        )
         return CleanupRetryOwnership(
             session_id=managed.session_id,
             session_dir=managed.session_dir,
@@ -2251,6 +2353,7 @@ class GatewayNodeManager:
             eval_runtime=eval_runtime,
             managed=managed,
             finalize_subscription=finalize_subscription,
+            finalization_state=finalization_state,
         )
 
     def _cleanup_journal_path(self, session_id: str) -> Path:
@@ -2263,8 +2366,9 @@ class GatewayNodeManager:
             return
         journal_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         journal_dir.chmod(0o700)
+        state = ownership.finalization_state
         payload = {
-            "version": 2,
+            "version": 3,
             "session_id": ownership.session_id,
             "runtime": {
                 "runtime_id": ownership.runtime_id,
@@ -2294,6 +2398,31 @@ class GatewayNodeManager:
                     "identity": list(ownership.credential_root_identity or ()),
                 }
             ),
+            "subscription_finalization": (
+                None
+                if state is None
+                else {
+                    "request": state.request.model_dump(mode="json"),
+                    "agent_result": (
+                        None
+                        if state.agent_result is None
+                        else state.agent_result.model_dump(mode="json")
+                    ),
+                    "final_result": (
+                        None
+                        if state.final_result is None
+                        else state.final_result.model_dump(mode="json")
+                    ),
+                    "pending_status": (
+                        None
+                        if state.pending_status is None
+                        else str(state.pending_status)
+                    ),
+                    "pending_error": state.pending_error,
+                    "cancel_requested": state.cancel_requested,
+                    "timer_marks": state.timer_marks,
+                }
+            ),
         }
         encoded = json.dumps(
             payload,
@@ -2301,6 +2430,8 @@ class GatewayNodeManager:
             sort_keys=True,
             separators=(",", ":"),
         ).encode("utf-8")
+        if len(encoded) > _CLEANUP_JOURNAL_MAX_BYTES:
+            raise RuntimeError("cleanup ownership journal exceeds the byte limit")
         destination = self._cleanup_journal_path(ownership.session_id)
         temporary = destination.with_name(
             f".{destination.name}.{os.getpid()}.{id(ownership)}.tmp"
@@ -2352,7 +2483,7 @@ class GatewayNodeManager:
                     or opened.st_nlink != 1
                     or opened.st_mode & 0o077
                     or opened.st_size <= 0
-                    or opened.st_size > 16 * 1024
+                    or opened.st_size > _CLEANUP_JOURNAL_MAX_BYTES
                 ):
                     raise RuntimeError("cleanup ownership journal file is not private")
                 chunks: list[bytes] = []
@@ -2391,11 +2522,13 @@ class GatewayNodeManager:
             "session_root",
             "credential_root",
         }
-        if version == 2:
+        if version in {2, 3}:
             expected_keys.add("log_root")
+        if version == 3:
+            expected_keys.add("subscription_finalization")
         if set(payload) != expected_keys:
             raise ValueError("cleanup ownership payload is not closed")
-        if version not in {1, 2} or not isinstance(payload["session_id"], str):
+        if version not in {1, 2, 3} or not isinstance(payload["session_id"], str):
             raise ValueError("cleanup ownership identity is invalid")
         session_id = payload["session_id"]
         expected_name = f"{hashlib.sha256(session_id.encode('utf-8')).hexdigest()}.json"
@@ -2445,6 +2578,79 @@ class GatewayNodeManager:
             credential_identity = None
         else:
             credential_dir, credential_identity = root_identity(credential_payload)
+        finalization_state = None
+        finalization_payload = payload.get("subscription_finalization")
+        if finalization_payload is not None:
+            finalization_keys = {
+                "request",
+                "agent_result",
+                "final_result",
+                "pending_status",
+                "pending_error",
+                "cancel_requested",
+                "timer_marks",
+            }
+            if (
+                not isinstance(finalization_payload, dict)
+                or set(finalization_payload) != finalization_keys
+                or not isinstance(finalization_payload["cancel_requested"], bool)
+                or (
+                    finalization_payload["pending_error"] is not None
+                    and not isinstance(finalization_payload["pending_error"], str)
+                )
+                or not isinstance(finalization_payload["timer_marks"], dict)
+            ):
+                raise ValueError("subscription finalization payload is invalid")
+            timer_marks = finalization_payload["timer_marks"]
+            if any(
+                not isinstance(key, str)
+                or isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                for key, value in timer_marks.items()
+            ):
+                raise ValueError("subscription finalization timer is invalid")
+            pending_status_payload = finalization_payload["pending_status"]
+            pending_status = (
+                None
+                if pending_status_payload is None
+                else SessionStatus(pending_status_payload)
+            )
+            if pending_status is not None and pending_status not in {
+                SessionStatus.ERROR,
+                SessionStatus.TIMEOUT,
+            }:
+                raise ValueError("subscription pending status is invalid")
+            request = SessionDispatchRequest.model_validate(
+                finalization_payload["request"]
+            )
+            if request.session_id != session_id or not _is_codex_subscription_agent(
+                request.agent
+            ):
+                raise ValueError("subscription finalization request is invalid")
+            agent_payload = finalization_payload["agent_result"]
+            result_payload = finalization_payload["final_result"]
+            agent_result = (
+                None
+                if agent_payload is None
+                else AgentRunResult.model_validate(agent_payload)
+            )
+            final_result = (
+                None
+                if result_payload is None
+                else SessionResult.model_validate(result_payload)
+            )
+            if final_result is not None and final_result.session_id != session_id:
+                raise ValueError("subscription terminal result identity is invalid")
+            finalization_state = SubscriptionFinalizationState(
+                request=request,
+                agent_result=agent_result,
+                final_result=final_result,
+                pending_status=pending_status,
+                pending_error=finalization_payload["pending_error"],
+                cancel_requested=finalization_payload["cancel_requested"],
+                timer_marks={key: float(value) for key, value in timer_marks.items()},
+            )
         return CleanupRetryOwnership(
             session_id=session_id,
             session_dir=session_dir,
@@ -2459,6 +2665,8 @@ class GatewayNodeManager:
             eval_container_id=eval_container_id,
             runtime=None,
             eval_runtime=None,
+            finalize_subscription=finalization_state is not None,
+            finalization_state=finalization_state,
         )
 
     def _clear_cleanup_ownership(self, session_id: str) -> None:
@@ -2500,19 +2708,75 @@ class GatewayNodeManager:
             "recovered runtime",
         )
 
+    async def _cleanup_retry_loop(self) -> None:
+        while True:
+            await asyncio.sleep(_CLEANUP_RETRY_INTERVAL_SECONDS)
+            await self._reconcile_cleanup_retries()
+
     async def _reconcile_cleanup_retries(self) -> None:
         retries = getattr(self, "_cleanup_retries", None)
         if not retries:
             return
-        for session_id, ownership in list(retries.items()):
-            try:
-                await self._reconcile_cleanup_ownership(ownership)
-            except Exception:
-                logger.warning(
-                    "Cleanup reconciliation failed for session %s",
-                    session_id,
-                    exc_info=True,
-                )
+        lock = getattr(self, "_cleanup_reconcile_lock", None)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._cleanup_reconcile_lock = lock
+        async with lock:
+            for session_id, ownership in list(retries.items()):
+                try:
+                    await self._reconcile_cleanup_ownership(ownership)
+                except Exception:
+                    logger.warning(
+                        "Cleanup reconciliation failed for session %s",
+                        session_id,
+                        exc_info=True,
+                    )
+
+    def _restore_subscription_finalization(
+        self,
+        ownership: CleanupRetryOwnership,
+    ) -> ManagedSession:
+        state = ownership.finalization_state
+        if state is None:
+            raise RuntimeError("subscription finalization authority is missing")
+        if (
+            ownership.credential_dir is None
+            or ownership.credential_root_identity is None
+        ):
+            raise RuntimeError("subscription credential authority is missing")
+        redactor = load_staged_codex_subscription_redactor(
+            ownership.credential_dir,
+            ownership.credential_root_identity,
+        )
+        timer = StageTimer()
+        timer._marks = dict(state.timer_marks)
+        managed = ManagedSession(
+            request=state.request,
+            timer=timer,
+            session_dir=ownership.session_dir,
+            artifacts_dir=ownership.session_dir / "artifacts",
+            session_root_identity=ownership.session_root_identity,
+            log_authority_dir=ownership.log_authority_dir,
+            log_authority_identity=ownership.log_authority_identity,
+            credential_dir=ownership.credential_dir,
+            credential_root_identity=ownership.credential_root_identity,
+            credential_redactor=redactor,
+            agent_result=state.agent_result,
+            final_result=state.final_result,
+            pending_status=state.pending_status,
+            pending_error=state.pending_error,
+            cancel_requested=state.cancel_requested,
+            stage=SessionStage.POSTRUN,
+        )
+        if self.session_registry.get(managed.session_id) is None:
+            self.session_registry.register(
+                managed.session_id,
+                task_id=managed.request.task_id,
+                registered=True,
+                status=SessionStatus.POST_RUN,
+                metadata=dict(managed.request.metadata),
+            )
+        return managed
 
     async def _reconcile_cleanup_ownership(
         self,
@@ -2542,6 +2806,14 @@ class GatewayNodeManager:
                 len(recovered_outcomes) != expected_runtime_count
                 or not all(outcome is True for outcome in recovered_outcomes)
             ):
+                return
+            if ownership.finalization_state is not None:
+                managed = self._restore_subscription_finalization(ownership)
+                ownership.managed = managed
+                await self._finalize_subscription_after_runtime_absence(
+                    managed,
+                    result=ownership.finalization_state.final_result,
+                )
                 return
             root_tasks = [
                 self._remove_session_dir_best_effort(
