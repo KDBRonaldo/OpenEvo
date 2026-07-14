@@ -37,6 +37,12 @@ from openevo.backend.contracts.v1.store import (
     CoreControlStoreV1,
     StoreCorruptionError,
 )
+from openevo.backend.service_supervisor import (
+    ServiceComponent,
+    ServiceStatus,
+    SupervisorError,
+    SupervisorServiceSummary,
+)
 import openevo.backend.contracts.v1.workspace as workspace_module
 from openevo.backend.contracts.v1.workspace import (
     WorkspaceArchiveError,
@@ -169,6 +175,7 @@ def _app(
     state_root: Path,
     *,
     registry=None,
+    service_supervisor=None,
     event_replay_limit: int = 10_000,
 ):
     return create_core_control_app(
@@ -178,6 +185,7 @@ def _app(
         source_commit="a" * 40,
         build_channel="test",
         evolution_registry=registry,
+        service_supervisor=service_supervisor,
         event_replay_limit=event_replay_limit,
     )
 
@@ -4405,6 +4413,68 @@ def test_services_are_observed_and_unowned_actions_fail_closed(tmp_path: Path) -
         listed = client.get("/v1/runs", headers=AUTH)
         assert listed.status_code == 503
         assert listed.json()["code"] == "provider_capability_unavailable"
+
+
+class _RecordingServiceSupervisor:
+    def __init__(self) -> None:
+        self.close_calls = 0
+        self._services = (
+            SupervisorServiceSummary(
+                id="evolution-backend",
+                display_name="Evolution backend",
+                component=ServiceComponent.EVOLUTION_BACKEND,
+                status=ServiceStatus.RUNNING,
+                restartable=True,
+                status_message="Ready.",
+                error_code=None,
+                updated_at="2026-07-14T00:00:00Z",
+                observed_at="2026-07-14T00:00:01Z",
+                identity_digest="a" * 64,
+                pid=1234,
+                port=8200,
+                etag='"' + "b" * 64 + '"',
+            ),
+        )
+
+    def list(self) -> tuple[SupervisorServiceSummary, ...]:
+        return self._services
+
+    def close(self) -> None:
+        self.close_calls += 1
+
+
+class _FailingServiceSupervisor(_RecordingServiceSupervisor):
+    def list(self) -> tuple[SupervisorServiceSummary, ...]:
+        raise SupervisorError("managed service state is unavailable")
+
+
+def test_injected_service_supervisor_is_projected_and_closed(tmp_path: Path) -> None:
+    supervisor = _RecordingServiceSupervisor()
+    app = _app(tmp_path, service_supervisor=supervisor)
+    with TestClient(app) as client:
+        services = client.get("/v1/services", headers=AUTH)
+        assert services.status_code == 200
+        assert [item["id"] for item in services.json()["items"]] == [
+            "core-control",
+            "evolution-backend",
+        ]
+        evolution = client.get("/v1/services/evolution-backend", headers=AUTH)
+        assert evolution.status_code == 200
+        assert evolution.json()["kind"] == "control"
+        assert evolution.json()["status"] == "running"
+        assert evolution.headers["etag"] == '"' + "b" * 64 + '"'
+
+    assert supervisor.close_calls == 1
+
+
+def test_service_supervisor_failure_is_typed_and_retryable(tmp_path: Path) -> None:
+    app = _app(tmp_path, service_supervisor=_FailingServiceSupervisor())
+    with TestClient(app) as client:
+        response = client.get("/v1/services", headers=AUTH)
+
+    assert response.status_code == 503
+    assert response.json()["code"] == "core_service_supervisor_failed"
+    assert response.json()["retryable"] is True
 
 
 def test_event_replay_is_ordered_durable_and_expires(tmp_path: Path) -> None:

@@ -17,6 +17,7 @@ from openevo.backend.runtime_identity import (
     require_host_global_service_root,
 )
 from openevo.backend.service import claim_core_service_spawn
+from openevo.backend.service_supervisor import CoreServiceSupervisor, ServiceLaunchMode
 from openevo.evolution.framework import (
     EvolutionExecutionProfile,
     load_verified_framework_registry,
@@ -93,13 +94,24 @@ def _serve_core_control(args: argparse.Namespace) -> int:
     with HostServiceRoot(args.service_root, create=False) as root:
         state_root = root.ensure_directory("state")
         bearer_token = load_or_create_core_bearer_token(root)
-    app = create_core_control_app(
-        state_root=state_root,
-        bearer_token=bearer_token,
-        source_commit=args.source_commit,
-        build_channel="release",
-        evolution_registry=registry,
+    service_supervisor = CoreServiceSupervisor(
+        launch_mode=ServiceLaunchMode.RELEASE,
+        service_root=args.service_root / "managed-services",
+        framework_lock=args.framework_lock,
+        verified_registry=registry,
     )
+    try:
+        app = create_core_control_app(
+            state_root=state_root,
+            bearer_token=bearer_token,
+            source_commit=args.source_commit,
+            build_channel="release",
+            evolution_registry=registry,
+            service_supervisor=service_supervisor,
+        )
+    except BaseException:
+        service_supervisor.close()
+        raise
     _bind_host_service_identity(
         app,
         generation=args.generation,

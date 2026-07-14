@@ -41,12 +41,12 @@ before releasing the threads.
 | Revision reads | Durable project-owned active revision ledger. List uses bounded signed cursors; head and revision reads return their authoritative ETags. |
 | `/v1/projects/{id}/workspace-uploads/*` | Durable begin/status/ordered chunk/finalize/abort with project and upload CAS, restart recovery, digest validation, canonical ustar verification, and extracted snapshot publication. |
 | `/v1/projects/{id}/validate` | Validates exact current project/workspace snapshots and registry digest, then delegates evolution selection validation to the existing framework compiler validator. |
-| `/v1/services`, `/v1/services/{id}` | Reports the observable `core-control` process state. No other service is inferred from files or legacy scaffold state. |
+| `/v1/services`, `/v1/services/{id}` | Reports `core-control` plus read-only summaries from the release-injected `CoreServiceSupervisor`. No service is inferred from files, Desktop commands, or legacy scaffold state. |
 | `/v1/events` | Durable ordered SSE with signed opaque record IDs, at-least-once replay, a 10,000-record maximum window, 15-second durable heartbeats, and typed 400/410 cursor errors. |
 | Environment doctor/repair | Typed 503 until a real environment owner and recoverable operation implementation are wired. |
 | Run, timeline, run log, and run context routes | Typed 503. Phase one does not create a run or synthesize admission, attempts, pins, progress, or success. |
 | Artifact routes | Typed 503 until run ownership exposes authoritative v1 artifact projections. |
-| Service restart/log routes | Typed 503. The provider does not invoke Desktop SSH lifecycle or pretend it supervises services it cannot observe. |
+| Service restart/log routes | Typed 503 until durable operation ownership is implemented. The provider never invokes Desktop SSH lifecycle or infers services it cannot observe. |
 | Operation, referenced-log, diagnostic, and cache-cleanup routes | Typed 503 until their durable business owners are implemented. |
 
 All unavailable operations use `provider_capability_unavailable`; they never

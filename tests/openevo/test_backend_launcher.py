@@ -311,11 +311,18 @@ def test_supervised_launcher_builds_release_core_control_app(
     )
     registry = object()
     app = object()
+    service_supervisor = object()
     calls: dict[str, object] = {}
 
     monkeypatch.setattr(launcher, "require_host_global_service_root", lambda path: path)
     monkeypatch.setattr(launcher, "load_verified_framework_registry", lambda path: registry)
     monkeypatch.setattr(launcher, "compute_release_identity", lambda **kwargs: release)
+
+    def build_service_supervisor(**kwargs: object) -> object:
+        calls["service_supervisor"] = kwargs
+        return service_supervisor
+
+    monkeypatch.setattr(launcher, "CoreServiceSupervisor", build_service_supervisor)
 
     def claim_spawn(**kwargs: object) -> None:
         calls["claim"] = kwargs
@@ -375,7 +382,14 @@ def test_supervised_launcher_builds_release_core_control_app(
     assert create["build_channel"] == "release"
     assert create["source_commit"] == release.source_commit
     assert create["evolution_registry"] is registry
+    assert create["service_supervisor"] is service_supervisor
     assert len(create["bearer_token"]) == 64
+    assert calls["service_supervisor"] == {
+        "launch_mode": launcher.ServiceLaunchMode.RELEASE,
+        "service_root": service_root / "managed-services",
+        "framework_lock": tmp_path / "framework-lock.json",
+        "verified_registry": registry,
+    }
     server = calls["server"]
     assert server["app"] is app
     assert server["socket"][0] == "127.0.0.1"

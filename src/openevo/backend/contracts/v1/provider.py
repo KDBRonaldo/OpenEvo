@@ -14,6 +14,7 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from openevo import __version__
+from openevo.backend.service_supervisor import CoreServiceSupervisor, SupervisorError
 from openevo.evolution.framework import (
     CapabilityAudience,
     EvolutionExecutionProfile,
@@ -105,6 +106,7 @@ class CoreControlProviderV1:
         source_commit: str,
         build_channel: m.BuildChannel | str,
         evolution_registry: VerifiedExecutableRegistry | None = None,
+        service_supervisor: CoreServiceSupervisor | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         try:
@@ -123,6 +125,7 @@ class CoreControlProviderV1:
         self._closed = False
         self._authorization = b"Bearer " + token_bytes
         self._registry = evolution_registry
+        self._service_supervisor = service_supervisor
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._started_at = self._timestamp()
         self._version = m.VersionResponseV1(
@@ -165,11 +168,12 @@ class CoreControlProviderV1:
         with self._close_lock:
             if self._closed:
                 return
-            self._closed = True
-        future = self._executor.submit(self.store.close)
-        try:
+            if self._service_supervisor is not None:
+                self._service_supervisor.close()
+                self._service_supervisor = None
+            future = self._executor.submit(self.store.close)
             future.result()
-        finally:
+            self._closed = True
             self._executor.shutdown(wait=True, cancel_futures=True)
 
     async def aclose(self) -> None:
@@ -314,6 +318,16 @@ class CoreControlProviderV1:
                 retryable=True,
                 repair_action=m.RepairAction.OPENEVO_CAN_RETRY,
                 next_action="Inspect Core diagnostics before retrying.",
+            ) from exc
+        except SupervisorError as exc:
+            raise _error(
+                503,
+                code="core_service_supervisor_failed",
+                message="Core could not inspect or control its managed services.",
+                category=m.ErrorCategory.SERVICE,
+                retryable=True,
+                repair_action=m.RepairAction.OPENEVO_CAN_RETRY,
+                next_action="Retry after Core service ownership is restored.",
             ) from exc
 
     def _version_response(self, arguments: Mapping[str, object]) -> m.VersionResponseV1:
@@ -595,7 +609,7 @@ class CoreControlProviderV1:
             "updated_at": self._started_at,
         }
         etag = '"' + hashlib.sha256(json_bytes(identity)).hexdigest() + '"'
-        return [
+        services = [
             m.ServiceSummaryV1(
                 id="core-control",
                 display_name="Core Control",
@@ -608,6 +622,11 @@ class CoreControlProviderV1:
                 etag=etag,
             )
         ]
+        if self._service_supervisor is not None:
+            services.extend(
+                service.to_contract() for service in self._service_supervisor.list()
+            )
+        return services
 
     def _require_registry(self, purpose: str) -> VerifiedExecutableRegistry:
         if self._registry is None:
@@ -654,6 +673,7 @@ def create_core_control_app(
     source_commit: str = "0" * 40,
     build_channel: m.BuildChannel | str = m.BuildChannel.DEVELOPMENT,
     evolution_registry: VerifiedExecutableRegistry | None = None,
+    service_supervisor: CoreServiceSupervisor | None = None,
     event_replay_limit: int = 10_000,
 ) -> FastAPI:
     """Create a provider-backed app without adding a second route table."""
@@ -668,6 +688,7 @@ def create_core_control_app(
             source_commit=source_commit,
             build_channel=build_channel,
             evolution_registry=evolution_registry,
+            service_supervisor=service_supervisor,
         )
         app = create_core_control_contract_app(provider)
         contract_operation_ids = frozenset(

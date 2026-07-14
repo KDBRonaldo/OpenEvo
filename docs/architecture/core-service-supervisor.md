@@ -20,11 +20,12 @@ Desktop -> tunneled frozen Core Control API -> Core provider
 
 Desktop may bootstrap and attach to the Core daemon, but it must not invoke the
 supervisor directly, construct service argv, or fall back to SSH commands for
-post-attach service mutations. The current frozen provider does **not** inject
-this supervisor yet. Its service restart/log routes therefore remain unavailable
-until a later provider slice wires the internal typed API and durable operation
-semantics. This implementation must not be described as provider, Desktop, run
-owner, or revision-ledger integration.
+post-attach service mutations. The release launcher injects this supervisor into
+the Core provider. `/v1/services` and `/v1/services/{id}` therefore project the
+supervisor's verified read-only summaries alongside `core-control`. Service
+restart/log routes remain unavailable until their frozen operations have durable
+provider ownership and idempotency semantics. Injection does not make the
+supervisor a run owner, revision ledger, Desktop component, or evolution method.
 
 ## Private State And Process Identity
 
