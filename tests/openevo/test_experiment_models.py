@@ -154,7 +154,7 @@ def test_subscription_agents_must_set_capture_mode_explicitly() -> None:
 
 
 @pytest.mark.parametrize("capture_mode", ["agent_transcript", "pure_text"])
-def test_subscription_agents_reject_transcript_capture_aliases(capture_mode: str) -> None:
+def test_subscription_agents_normalize_transcript_capture_aliases(capture_mode: str) -> None:
     payload = _minimal_payload()
     payload["agent"] = {
         "preset": "codex",
@@ -168,8 +168,9 @@ def test_subscription_agents_reject_transcript_capture_aliases(capture_mode: str
         "container_user": "host",
     }
 
-    with pytest.raises(ValidationError, match="capture_mode='transcript'"):
-        ExperimentConfig.model_validate(payload)
+    config = ExperimentConfig.model_validate(payload)
+
+    assert config.agent.settings["capture_mode"] == "transcript"
 
 
 def test_subscription_agent_rejects_image_user_runtime() -> None:

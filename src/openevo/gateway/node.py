@@ -989,8 +989,10 @@ class GatewayNodeManager:
             raise RuntimeError(
                 "managed subscription execution currently requires the Codex harness"
             )
-        if request.agent.settings.get("capture_mode") != "transcript":
-            raise RuntimeError("subscription execution requires capture_mode='transcript'")
+        capture_mode = request.agent.settings.get("capture_mode")
+        if not transcript_capture_enabled(capture_mode):
+            raise RuntimeError("subscription execution requires transcript capture")
+        request.agent.settings["capture_mode"] = "transcript"
         try:
             reject_managed_subscription_env(request.agent.env, owner="agent")
             reject_managed_subscription_env(
@@ -1668,53 +1670,73 @@ class GatewayNodeManager:
     async def _handle_subscription_postrun(self, managed: ManagedSession) -> None:
         request = managed.request
         result = managed.final_result
+        eval_runtime = managed.eval_runtime
+        runtimes_removed = False
         managed.timer.mark("postrun", "started")
-        await self._run_postrun_steps(managed)
-        if result is None and request.evaluator is not None:
+        try:
+            await self._run_postrun_steps(managed)
+            if result is None and request.evaluator is not None:
+                try:
+                    result = await self._build_session_result(managed)
+                except GatewayExecutionTimeout as exc:
+                    result = self._timeout_result(request, managed.timer, str(exc))
+                except Exception as exc:
+                    self._log_credential_safe_exception(
+                        managed,
+                        "Subscription evaluation failed",
+                        exc,
+                    )
+                    result = self._error_result(
+                        request,
+                        managed.timer,
+                        f"subscription evaluation failed: {exc}",
+                    )
+                managed.final_result = result
+        finally:
+            managed.timer.mark("teardown", "started")
             try:
-                result = await self._build_session_result(managed)
-            except GatewayExecutionTimeout as exc:
-                result = self._timeout_result(request, managed.timer, str(exc))
-            except Exception as exc:
-                self._log_credential_safe_exception(
-                    managed,
-                    "Subscription evaluation failed",
-                    exc,
-                )
-                result = self._error_result(
-                    request,
-                    managed.timer,
-                    f"subscription evaluation failed: {exc}",
-                )
-            managed.final_result = result
-        managed.timer.mark("teardown", "started")
-        eval_runtime = await self._drain_eval_prewarm_task(managed) or managed.eval_runtime
-        stop_targets = [
-            (eval_runtime, "eval runtime"),
-            (managed.runtime, "runtime"),
-        ]
-        runtimes_removed = (
-            not managed.runtime_cleanup_blocked
-            and await self._stop_subscription_runtimes_with_retry(
-                stop_targets,
-                request.session_id,
-            )
-        )
-        managed.timer.mark("teardown", "finished")
-        if not runtimes_removed:
-            self._register_cleanup_retry(
-                managed,
-                eval_runtime=eval_runtime,
-                finalize_subscription=True,
-            )
-            logger.error(
-                "Retaining subscription cleanup ownership because runtime absence "
-                "was not proven for session %s",
-                request.session_id,
-            )
-            return
+                try:
+                    eval_runtime = (
+                        await self._drain_eval_prewarm_task(managed)
+                        or managed.eval_runtime
+                    )
+                finally:
+                    try:
+                        self._register_cleanup_retry(
+                            managed,
+                            eval_runtime=eval_runtime or managed.eval_runtime,
+                            finalize_subscription=True,
+                        )
+                    finally:
+                        stop_targets = [
+                            (eval_runtime or managed.eval_runtime, "eval runtime"),
+                            (managed.runtime, "runtime"),
+                        ]
+                        runtimes_removed = (
+                            not managed.runtime_cleanup_blocked
+                            and await self._stop_subscription_runtimes_with_retry(
+                                stop_targets,
+                                request.session_id,
+                            )
+                        )
+            finally:
+                managed.timer.mark("teardown", "finished")
+                if runtimes_removed:
+                    self._record_cleanup_runtimes_absent(managed)
+                else:
+                    self._register_cleanup_retry(
+                        managed,
+                        eval_runtime=eval_runtime or managed.eval_runtime,
+                        finalize_subscription=True,
+                    )
+                    logger.error(
+                        "Retaining subscription cleanup ownership because runtime absence "
+                        "was not proven for session %s",
+                        request.session_id,
+                    )
 
-        self._record_cleanup_runtimes_absent(managed)
+        if not runtimes_removed:
+            return
         await self._finalize_subscription_after_runtime_absence(managed, result=result)
 
     async def _stop_subscription_runtimes_with_retry(
@@ -1752,32 +1774,31 @@ class GatewayNodeManager:
         try:
             self._start_finalization_deadline(managed)
             self._redact_core_capture_authority(managed)
-            if result is None:
-                if managed.agent_result is not None:
-                    result = await self._build_session_result(managed)
-                if managed.cancel_requested:
-                    error = "session cancelled"
-                    result = self._terminal_result_from_base(
-                        result or self._cancelled_result(request, managed.timer),
-                        SessionStatus.ERROR,
-                        error,
-                    )
-                elif managed.pending_status == SessionStatus.TIMEOUT:
-                    error = managed.pending_error or "session execution timeout"
-                    result = self._terminal_result_from_base(
-                        result or self._timeout_result(request, managed.timer, error),
-                        SessionStatus.TIMEOUT,
-                        error,
-                    )
-                elif managed.pending_status == SessionStatus.ERROR:
-                    error = managed.pending_error or "session execution failed"
-                    result = self._terminal_result_from_base(
-                        result or self._error_result(request, managed.timer, error),
-                        SessionStatus.ERROR,
-                        error,
-                    )
-                elif result is None:
-                    result = await self._build_session_result(managed)
+            if result is None and managed.agent_result is not None:
+                result = await self._build_session_result(managed)
+            if managed.cancel_requested:
+                error = "session cancelled"
+                result = self._terminal_result_from_base(
+                    result or self._cancelled_result(request, managed.timer),
+                    SessionStatus.ERROR,
+                    error,
+                )
+            elif managed.pending_status == SessionStatus.TIMEOUT:
+                error = managed.pending_error or "session execution timeout"
+                result = self._terminal_result_from_base(
+                    result or self._timeout_result(request, managed.timer, error),
+                    SessionStatus.TIMEOUT,
+                    error,
+                )
+            elif managed.pending_status == SessionStatus.ERROR:
+                error = managed.pending_error or "session execution failed"
+                result = self._terminal_result_from_base(
+                    result or self._error_result(request, managed.timer, error),
+                    SessionStatus.ERROR,
+                    error,
+                )
+            elif result is None:
+                result = await self._build_session_result(managed)
         except Exception as exc:
             self._log_credential_safe_exception(
                 managed,
@@ -3090,14 +3111,17 @@ class GatewayNodeManager:
             reopened.close()
 
     def _cleanup_journal_path(self, session_id: str) -> Path:
+        return self._cleanup_journal_dir / self._cleanup_journal_name(session_id)
+
+    @staticmethod
+    def _cleanup_journal_name(session_id: str) -> str:
         name = hashlib.sha256(session_id.encode("utf-8")).hexdigest()
-        return self._cleanup_journal_dir / f"{name}.json"
+        return f"{name}.json"
 
     def _persist_cleanup_ownership(self, ownership: CleanupRetryOwnership) -> None:
         journal_dir = getattr(self, "_cleanup_journal_dir", None)
         if journal_dir is None:
             return
-        journal_dir = Path(journal_dir)
         state = ownership.finalization_state
         delivery = ownership.delivery_state
         payload = {
@@ -3196,13 +3220,14 @@ class GatewayNodeManager:
         except Exception:
             authority.close()
             raise
-        destination = self._cleanup_journal_path(ownership.session_id)
-        temporary = destination.with_name(f".{destination.name}.{os.getpid()}.{id(ownership)}.tmp")
-        pending = destination.with_suffix(".pending")
-        rollback = destination.with_name(f".{destination.name}.rollback.tmp")
+        destination = self._cleanup_journal_name(ownership.session_id)
+        temporary = f".{destination}.{os.getpid()}.{id(ownership)}.tmp"
+        pending = f"{destination.removesuffix('.json')}.pending"
+        rollback = f".{destination}.rollback.tmp"
         try:
             previous = self._read_private_cleanup_file(
                 destination,
+                root_fd=authority.root_fd,
                 max_bytes=_CLEANUP_JOURNAL_MAX_BYTES,
                 allow_missing=True,
             )
@@ -3212,12 +3237,13 @@ class GatewayNodeManager:
         replaced = False
         descriptor = -1
         try:
-            self._ensure_cleanup_pending_marker(pending, journal_dir)
+            self._ensure_cleanup_pending_marker(pending, authority.root_fd)
 
             descriptor = os.open(
                 temporary,
                 os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
                 0o600,
+                dir_fd=authority.root_fd,
             )
             offset = 0
             while offset < len(encoded):
@@ -3229,11 +3255,16 @@ class GatewayNodeManager:
             os.fsync(descriptor)
             os.close(descriptor)
             descriptor = -1
-            os.replace(temporary, destination)
+            os.replace(
+                temporary,
+                destination,
+                src_dir_fd=authority.root_fd,
+                dst_dir_fd=authority.root_fd,
+            )
             replaced = True
-            self._fsync_cleanup_journal_directory(journal_dir)
-            pending.unlink()
-            self._fsync_cleanup_journal_directory(journal_dir)
+            self._fsync_cleanup_journal_directory(authority.root_fd)
+            os.unlink(pending, dir_fd=authority.root_fd)
+            self._fsync_cleanup_journal_directory(authority.root_fd)
             self._verify_cleanup_journal_authority(authority)
         except Exception:
             if descriptor >= 0:
@@ -3242,12 +3273,16 @@ class GatewayNodeManager:
             if replaced:
                 try:
                     if previous is None:
-                        destination.unlink(missing_ok=True)
+                        try:
+                            os.unlink(destination, dir_fd=authority.root_fd)
+                        except FileNotFoundError:
+                            pass
                     else:
                         rollback_fd = os.open(
                             rollback,
                             os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
                             0o600,
+                            dir_fd=authority.root_fd,
                         )
                         try:
                             offset = 0
@@ -3261,15 +3296,20 @@ class GatewayNodeManager:
                             os.fsync(rollback_fd)
                         finally:
                             os.close(rollback_fd)
-                        os.replace(rollback, destination)
-                    self._fsync_cleanup_journal_directory(journal_dir)
+                        os.replace(
+                            rollback,
+                            destination,
+                            src_dir_fd=authority.root_fd,
+                            dst_dir_fd=authority.root_fd,
+                        )
+                    self._fsync_cleanup_journal_directory(authority.root_fd)
                 except Exception:
                     logger.error(
                         "Cleanup ownership journal rollback could not be proven for %s",
                         ownership.session_id,
                     )
             try:
-                self._ensure_cleanup_pending_marker(pending, journal_dir)
+                self._ensure_cleanup_pending_marker(pending, authority.root_fd)
             except OSError:
                 logger.error(
                     "Cleanup ownership journal pending marker could not be proven for %s",
@@ -3281,27 +3321,20 @@ class GatewayNodeManager:
                 os.close(descriptor)
             for leftover in (temporary, rollback):
                 try:
-                    leftover.unlink()
+                    os.unlink(leftover, dir_fd=authority.root_fd)
                 except FileNotFoundError:
                     pass
             authority.close()
 
     @staticmethod
-    def _fsync_cleanup_journal_directory(journal_dir: Path) -> None:
-        directory_fd = os.open(
-            journal_dir,
-            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
-        )
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
+    def _fsync_cleanup_journal_directory(root_fd: int) -> None:
+        os.fsync(root_fd)
 
     @classmethod
     def _ensure_cleanup_pending_marker(
         cls,
-        pending: Path,
-        journal_dir: Path,
+        pending: str,
+        root_fd: int,
     ) -> None:
         descriptor = -1
         try:
@@ -3310,6 +3343,7 @@ class GatewayNodeManager:
                     pending,
                     os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
                     0o600,
+                    dir_fd=root_fd,
                 )
                 marker = b"pending\n"
                 if os.write(descriptor, marker) != len(marker):
@@ -3320,6 +3354,7 @@ class GatewayNodeManager:
                 descriptor = os.open(
                     pending,
                     os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+                    dir_fd=root_fd,
                 )
                 state = os.fstat(descriptor)
                 if (
@@ -3337,19 +3372,21 @@ class GatewayNodeManager:
         finally:
             if descriptor >= 0:
                 os.close(descriptor)
-        cls._fsync_cleanup_journal_directory(journal_dir)
+        cls._fsync_cleanup_journal_directory(root_fd)
 
     @staticmethod
     def _read_private_cleanup_file(
-        path: Path,
+        name: str,
         *,
+        root_fd: int,
         max_bytes: int,
         allow_missing: bool,
     ) -> bytes | None:
         try:
             descriptor = os.open(
-                path,
+                name,
                 os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+                dir_fd=root_fd,
             )
         except FileNotFoundError:
             if allow_missing:

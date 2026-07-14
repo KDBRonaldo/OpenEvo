@@ -57,7 +57,10 @@ statuses are `COMPLETED`, `ERROR`, or `TIMEOUT`.
 ## Subscription credentials and session cleanup
 
 Codex subscription sessions are admitted only for an exact Core-managed runtime
-profile/image, Docker host-user execution, and literal `capture_mode=transcript`.
+profile/image, Docker host-user execution, and a shared transcript capture mode.
+`transcript`, `agent_transcript`, and `pure_text` are accepted at experiment,
+Gateway, and harness boundaries and normalize to canonical `transcript`; token
+capture remains invalid for subscription execution.
 Custom images, runtime loaders/options, entrypoints, and caller-supplied
 `HOME`, `PATH`, or `CODEX_HOME` fail before credential staging. Core fixes those
 values to the managed home, managed binary path, and
@@ -124,7 +127,14 @@ runtime references are still valid; only that evaluator path runs before
 runtime stop. Core then removes every credential-capable container and proves
 absence by pinned container ID. Sessions without an evaluator defer trajectory
 construction until after that proof. In both cases, only after absence proof
-does Core perform the final capture scan and permit result delivery. Core pins
+does Core perform the final capture scan and permit result delivery.
+Evaluator and post-run execution are enclosed by teardown `finally` blocks, so
+`CancelledError` and other `BaseException` exits still drain evaluator prewarm
+and stop both evaluator and main runtimes. A requested cancellation remains the
+published terminal outcome even when evaluation already produced a completed
+result. The current cancel/result finalization authority is journaled before
+runtime stop so a later interruption preserves the same outcome on recovery.
+Core pins
 the full absolute chain of an unmounted, node-scoped Core log authority. Step
 stdout/stderr is first written there through a held root descriptor into a
 bounded exclusive `0600` regular inode, then published without replacement.
@@ -160,6 +170,11 @@ identity digest; the timeout must be finite and positive before entering the
 canonical journal. It does not contain auth bytes. Journal transitions are
 copy-on-write: a durable pending marker, candidate fsync, atomic replace, and
 directory fsync complete before the new phase or proof enters live memory.
+The previous record, pending marker, candidate, destination, rollback candidate,
+unlink, replace, and directory fsync operations are all relative to the same
+no-follow root descriptor acquired before the transition. A concurrent root
+rename or replacement therefore cannot receive journal bytes; pathname binding
+failure retains the displaced authority and its pending recovery marker.
 Replace/fsync failures roll back the old authority and retain the pending marker,
 so restart cannot treat an uncertain transition as permission to delete storage
 or roots; live pending status/error likewise remain unchanged until persistence

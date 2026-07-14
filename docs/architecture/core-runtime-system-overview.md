@@ -146,8 +146,10 @@ token-level RL 训练必须过滤掉 `token_level_metrics_available=false` 的 t
 
 如果 harness 选择 `auth_mode="subscription"` 或 harness-specific subscription
 alias，它必须同时设置 transcript capture mode。当前 managed subscription release 只接受
-literal `capture_mode="transcript"`、exact managed runtime profile/image、Docker host-user
-执行，并显式 unset proxy 相关环境变量。其他订阅式 harness 也应遵守同样边界：订阅负责
+共享的 transcript 类值 `transcript`、`agent_transcript`、`pure_text`，并在 experiment、
+Gateway、harness 边界统一规范成 canonical `transcript`；token capture 仍拒绝。除此之外还要求
+exact managed runtime profile/image、Docker host-user 执行，并显式 unset proxy 相关环境变量。
+其他订阅式 harness 也应遵守同样边界：订阅负责
 auth，transcript capture 负责 evolution 可消费的行为记录。
 
 `managed_science` 的 runtime binding 不以 subscription 为条件。无论 execution mode 是
@@ -189,6 +191,11 @@ command；任何 prepare/agent command 前，Core 对 stable exact container 内
 Subscription post-run 先完成 post-run commands。若配置 evaluator，Core 必须在 live runtime
 引用仍有效时完成 trajectory build/evaluation，再按 `docker create` 返回的 container ID 执行
 remove + absence inspect；未配置 evaluator 的 session 仍在 absence proof 后构造 trajectory。
+Post-run/evaluator 外层 teardown 使用 `finally`，即使收到 `CancelledError` 或其他
+`BaseException` 也必须 drain evaluator prewarm 并 stop eval/main runtime；已请求 cancel 时，
+最终发布必须保持 cancelled/error 语义，不能被先产生的 completed evaluator result 覆盖。stop
+前先 durable 刷新当前 cancel/result finalization authority，后续 interruption/recovery 也必须保持
+同一终态。
 无论哪条路径，只有 absence proof 成功、最终 fd-relative 递归 scan 复核每层 pathname/inode
 binding 后才允许发布 `SessionResult`。Core 自己的 step stdout/stderr 不写入 agent 可写 session bind，而是在
 unmounted node-private log authority 中通过 exclusive `0600` regular inode 有界写入、无覆盖
@@ -209,6 +216,10 @@ Journal transition 使用 durable pending marker、candidate fsync、atomic repl
 fsync；全部成功后才 copy-on-write 发布 live phase/proof。replace/fsync 失败会回滚旧 journal 并
 保留 pending marker，restart 因而不能把不确定 terminal transition 当成删除 completion/root 的
 授权，live pending status/error 也保持不变，exact retry 成功后才清 marker。
+previous record、pending、candidate、final、rollback、unlink、replace 和 directory fsync 全部
+相对 transition 开始时同一个 no-follow held journal-root FD 执行；过程中 root pathname 被
+rename/replacement 时，不得向 replacement 写入 journal bytes，并保留 displaced authority 与
+pending recovery marker 后 fail closed。
 journal 的 private parent 另有 immutable root marker，绑定 normalized absolute path、从 `/`
 逐组件 no-follow 获得的 ancestor device/inode identity chain 和 journal root identity。重启遇到
 root rename/replacement 或 ancestor symlink 必须保留 displaced records 并 fail closed。Recovery

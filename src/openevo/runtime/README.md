@@ -160,6 +160,11 @@ export config drift retains the journal and all transcript/session roots. An
 incomplete journal update also retains a durable pending marker and blocks
 restart cleanup until the exact transition is successfully retried. Live terminal
 status/error authority changes only after that durable transition succeeds.
+Every record read, pending/candidate/rollback write, replace, unlink, and
+directory fsync in a transition is relative to one no-follow held journal-root
+descriptor. A root pathname rename or replacement therefore fails closed while
+retaining the displaced authority and never writes journal bytes into the
+replacement.
 An immutable marker in the journal's private parent binds its normalized path,
 no-follow ancestor identity chain, and root inode. Startup rejects a missing or
 replaced bound root and any symlinked ancestor. It also completes row, filename,

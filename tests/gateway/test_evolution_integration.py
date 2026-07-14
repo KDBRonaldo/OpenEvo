@@ -359,7 +359,6 @@ async def test_gateway_rejects_non_codex_subscription_before_auth_staging(
 @pytest.mark.parametrize(
     ("capture_mode", "agent_env", "error"),
     [
-        ("pure_text", {}, "capture_mode='transcript'"),
         (
             "transcript",
             {"CODEX_HOME": "/openevo/session/artifacts/.codex"},
@@ -411,6 +410,64 @@ async def test_gateway_rejects_non_exact_subscription_contract_before_staging(
     assert managed.final_result is not None
     assert error in (managed.final_result.error or "")
     stage_auth.assert_not_called()
+
+
+@pytest.mark.parametrize("capture_mode", ["transcript", "agent_transcript", "pure_text"])
+def test_gateway_subscription_admission_accepts_transcript_capture_aliases(
+    tmp_path: Path,
+    capture_mode: str,
+) -> None:
+    session_dir = tmp_path / "session"
+    session_dir.mkdir(mode=0o700)
+    request = SessionDispatchRequest(
+        session_id="subscription-capture-alias",
+        task_id="task_1",
+        instruction="Do work.",
+        remaining_timeout_seconds=60,
+        runtime=RuntimeSpec(
+            profile="managed_science",
+            image=MANAGED_RUNTIME_IMAGES["managed_science"],
+            container_user="host",
+        ),
+        agent=AgentSpec(
+            harness="codex",
+            settings={"auth_mode": "subscription", "capture_mode": capture_mode},
+        ),
+    )
+
+    GatewayNodeManager._validate_subscription_admission(
+        request,
+        request.runtime,
+        session_dir,
+    )
+    assert request.agent.settings["capture_mode"] == "transcript"
+
+
+def test_gateway_subscription_admission_rejects_token_capture(tmp_path: Path) -> None:
+    session_dir = tmp_path / "session"
+    session_dir.mkdir(mode=0o700)
+    request = SessionDispatchRequest(
+        session_id="subscription-token-capture",
+        task_id="task_1",
+        instruction="Do work.",
+        remaining_timeout_seconds=60,
+        runtime=RuntimeSpec(
+            profile="managed_science",
+            image=MANAGED_RUNTIME_IMAGES["managed_science"],
+            container_user="host",
+        ),
+        agent=AgentSpec(
+            harness="codex",
+            settings={"auth_mode": "subscription", "capture_mode": "token"},
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="transcript capture"):
+        GatewayNodeManager._validate_subscription_admission(
+            request,
+            request.runtime,
+            session_dir,
+        )
 
 
 @pytest.mark.asyncio
@@ -1124,6 +1181,133 @@ async def test_subscription_evaluator_runs_before_runtime_is_stopped(
     assert calls[-1] == "finalize"
 
 
+class _PostrunBaseException(BaseException):
+    pass
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_stage", ["postrun", "evaluator"])
+@pytest.mark.parametrize("failure_type", [asyncio.CancelledError, _PostrunBaseException])
+async def test_subscription_postrun_base_exception_still_stops_all_runtimes(
+    tmp_path: Path,
+    failure_stage: str,
+    failure_type: type[BaseException],
+) -> None:
+    calls: list[str] = []
+    manager = _postrun_manager(calls=calls)
+    main_runtime = FakeRuntime()
+    eval_runtime = FakeRuntime()
+    stopped: list[BaseRuntime] = []
+    request = SessionDispatchRequest(
+        session_id="subscription-base-exception",
+        task_id="task_1",
+        instruction="Do work.",
+        remaining_timeout_seconds=60,
+        runtime=RuntimeSpec(
+            profile="managed_science",
+            image=MANAGED_RUNTIME_IMAGES["managed_science"],
+            container_user="host",
+        ),
+        agent=AgentSpec(
+            harness="codex",
+            settings={"auth_mode": "subscription", "capture_mode": "transcript"},
+        ),
+        evaluator=EvaluatorSpec(strategy="pass_at_k"),
+    )
+    managed = ManagedSession(
+        request=request,
+        timer=StageTimer(),
+        session_dir=tmp_path,
+        artifacts_dir=tmp_path / "artifacts",
+        session_root_identity=capture_session_root_identity(tmp_path),
+        runtime=main_runtime,
+        agent_result=AgentRunResult(status="completed", return_code=0),
+        cancel_requested=True,
+    )
+
+    async def run_postrun_steps(captured: ManagedSession) -> None:
+        assert captured is managed
+        calls.append("postrun")
+        if failure_stage == "postrun":
+            raise failure_type()
+
+    async def build_result(captured: ManagedSession) -> SessionResult:
+        assert captured is managed
+        calls.append("evaluator")
+        if failure_stage == "evaluator":
+            raise failure_type()
+        return _session_result(session_id=request.session_id)
+
+    async def drain(captured: ManagedSession) -> BaseRuntime:
+        assert captured is managed
+        calls.append("drain")
+        return eval_runtime
+
+    async def stop_runtime(
+        runtime: BaseRuntime,
+        session_id: str,
+        label: str,
+    ) -> bool:
+        assert session_id == request.session_id
+        assert label in {"eval runtime", "runtime"}
+        stopped.append(runtime)
+        return True
+
+    manager._run_postrun_steps = run_postrun_steps
+    manager._build_session_result = build_result
+    manager._drain_eval_prewarm_task = drain
+    manager._stop_runtime_best_effort = stop_runtime
+
+    with pytest.raises(failure_type):
+        await manager._handle_subscription_postrun(managed)
+
+    assert calls[-1] == "drain"
+    assert stopped == [eval_runtime, main_runtime]
+    retry = manager._cleanup_retries[managed.session_id]
+    assert retry.finalization_state is not None
+    assert retry.finalization_state.cancel_requested is True
+
+
+@pytest.mark.asyncio
+async def test_subscription_cancel_overrides_existing_evaluator_result(
+    tmp_path: Path,
+) -> None:
+    calls: list[str] = []
+    manager = _postrun_manager(calls=calls)
+    managed = _managed_postrun_session(
+        tmp_path,
+        _session_result(session_id="subscription-cancel-result"),
+    )
+    managed.request.agent = AgentSpec(
+        harness="codex",
+        settings={"auth_mode": "subscription", "capture_mode": "transcript"},
+    )
+    managed.request.evaluator = EvaluatorSpec(strategy="pass_at_k")
+    managed.runtime = FakeRuntime()
+    managed.cancel_requested = True
+    captured_results: list[SessionResult] = []
+
+    async def stop_all(targets, session_id: str) -> bool:
+        del targets, session_id
+        return True
+
+    async def deliver(captured: ManagedSession, result: SessionResult) -> bool:
+        assert captured is managed
+        captured_results.append(result)
+        return False
+
+    manager._stop_subscription_runtimes_with_retry = stop_all
+    manager._deliver_terminal_result = deliver
+
+    await manager._handle_subscription_postrun(managed)
+
+    assert len(captured_results) == 1
+    result = captured_results[0]
+    assert result is not None
+    assert result.status == SessionStatus.ERROR
+    assert result.error == "session cancelled"
+
+
 def test_subscription_capture_redaction_never_modifies_workspace_files(
     tmp_path: Path,
 ) -> None:
@@ -1349,6 +1533,52 @@ def test_cleanup_journal_root_replacement_retains_displaced_records(
 
     assert len(list(displaced.glob("*.json"))) == 1
     assert list(journal_dir.iterdir()) == []
+
+
+def test_cleanup_journal_update_uses_held_root_when_path_is_replaced(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    journal_dir = tmp_path / "journal"
+    session_dir = tmp_path / "session"
+    session_dir.mkdir(mode=0o700)
+    managed = _managed_postrun_session(
+        session_dir,
+        _session_result(session_id="journal-update-root-replaced"),
+    )
+    managed.session_root_identity = capture_session_root_identity(session_dir)
+    manager = _postrun_manager(calls=[])
+    manager._cleanup_journal_dir = journal_dir
+    manager._register_cleanup_retry(managed)
+    original_journal = next(journal_dir.glob("*.json")).read_bytes()
+    managed.final_result = None
+    displaced = tmp_path / "journal-displaced"
+    original_open = node_module.os.open
+    replaced = False
+
+    def replace_root_before_pending_open(path, flags, mode=0o777, *, dir_fd=None):
+        nonlocal replaced
+        if not replaced and os.fspath(path).endswith(".pending"):
+            replaced = True
+            journal_dir.rename(displaced)
+            journal_dir.mkdir(mode=0o700)
+        if dir_fd is None:
+            return original_open(path, flags, mode)
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(node_module.os, "open", replace_root_before_pending_open)
+
+    with pytest.raises(RuntimeError, match="journal root identity"):
+        manager._persist_cleanup_ownership(
+            manager._cleanup_retries[managed.session_id]
+        )
+
+    assert replaced is True
+    assert list(journal_dir.iterdir()) == []
+    displaced_journals = list(displaced.glob("*.json"))
+    assert len(displaced_journals) == 1
+    assert displaced_journals[0].read_bytes() == original_journal
+    assert len(list(displaced.glob("*.pending"))) == 1
 
 
 def test_cleanup_journal_recovery_rejects_symlinked_ancestor(
@@ -2110,12 +2340,12 @@ async def test_terminal_delivery_publish_failure_blocks_recovery_until_retry(
         original_replace = node_module.os.replace
         failed = False
 
-        def fail_once(source, destination):
+        def fail_once(source, destination, **kwargs):
             nonlocal failed
-            if not failed and Path(destination) == journal_path:
+            if not failed and os.fspath(destination) == journal_path.name:
                 failed = True
                 raise OSError("injected journal replace failure")
-            return original_replace(source, destination)
+            return original_replace(source, destination, **kwargs)
 
         monkeypatch.setattr(node_module.os, "replace", fail_once)
     else:
@@ -2188,10 +2418,10 @@ def test_terminal_failure_publish_is_copy_on_write(
     if fault == "replace":
         original_replace = node_module.os.replace
 
-        def fail_replace(source, destination):
-            if Path(destination) == journal_path:
+        def fail_replace(source, destination, **kwargs):
+            if os.fspath(destination) == journal_path.name:
                 raise OSError("injected terminal failure replace")
-            return original_replace(source, destination)
+            return original_replace(source, destination, **kwargs)
 
         monkeypatch.setattr(node_module.os, "replace", fail_replace)
     else:

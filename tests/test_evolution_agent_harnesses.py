@@ -309,6 +309,34 @@ def test_codex_subscription_auth_mode_requires_transcript_capture_option():
         harness.run_steps("Do work.")
 
 
+@pytest.mark.parametrize("capture_mode", ["transcript", "agent_transcript", "pure_text"])
+def test_codex_subscription_auth_mode_accepts_shared_transcript_aliases(
+    capture_mode: str,
+) -> None:
+    harness = CodexHarness(
+        AgentSpec(
+            harness="codex",
+            settings={"auth_mode": "subscription", "capture_mode": capture_mode},
+        )
+    )
+
+    step = harness.run_steps("Do work.")[0]
+
+    assert step.command.startswith("env -u")
+
+
+def test_codex_subscription_auth_mode_rejects_token_capture() -> None:
+    harness = CodexHarness(
+        AgentSpec(
+            harness="codex",
+            settings={"auth_mode": "subscription", "capture_mode": "token"},
+        )
+    )
+
+    with pytest.raises(ValueError, match="capture_mode"):
+        harness.run_steps("Do work.")
+
+
 def test_codex_run_steps_keeps_chatgpt_subscription_auth_mode_alias():
     harness = CodexHarness(
         AgentSpec(
