@@ -41,31 +41,22 @@ _IDEMPOTENCY_RESPONSE_MODELS: dict[str, type[BaseModel]] = {
         m.ProjectValidationResponseV1,
     )
 }
-_IDEMPOTENCY_OPERATION_RESPONSES: dict[str, tuple[int, str]] = {
-    "createCoreProjectV1": (201, "ProjectV1"),
-    "patchCoreProjectV1": (200, "ProjectV1"),
-    "deleteCoreProjectV1": (204, "NoContent"),
-    "createCoreWorkspaceUploadV1": (201, "WorkspaceUploadSessionV1"),
-    "putCoreWorkspaceUploadChunkV1": (200, "WorkspaceUploadSessionV1"),
-    "finalizeCoreWorkspaceUploadV1": (201, "WorkspaceUploadFinalizeResponseV1"),
-    "abortCoreWorkspaceUploadV1": (200, "WorkspaceUploadSessionV1"),
-    "validateCoreProjectV1": (200, "ProjectValidationResponseV1"),
+_IDEMPOTENCY_OPERATION_SPECS: dict[
+    str, tuple[int, str, Literal["global", "project", "upload"]]
+] = {
+    "createCoreProjectV1": (201, "ProjectV1", "global"),
+    "patchCoreProjectV1": (200, "ProjectV1", "project"),
+    "deleteCoreProjectV1": (204, "NoContent", "project"),
+    "createCoreWorkspaceUploadV1": (201, "WorkspaceUploadSessionV1", "project"),
+    "putCoreWorkspaceUploadChunkV1": (200, "WorkspaceUploadSessionV1", "upload"),
+    "finalizeCoreWorkspaceUploadV1": (
+        201,
+        "WorkspaceUploadFinalizeResponseV1",
+        "upload",
+    ),
+    "abortCoreWorkspaceUploadV1": (200, "WorkspaceUploadSessionV1", "upload"),
+    "validateCoreProjectV1": (200, "ProjectValidationResponseV1", "project"),
 }
-_PROJECT_SCOPED_IDEMPOTENCY_OPERATIONS = frozenset(
-    {
-        "patchCoreProjectV1",
-        "deleteCoreProjectV1",
-        "createCoreWorkspaceUploadV1",
-        "validateCoreProjectV1",
-    }
-)
-_UPLOAD_SCOPED_IDEMPOTENCY_OPERATIONS = frozenset(
-    {
-        "putCoreWorkspaceUploadChunkV1",
-        "finalizeCoreWorkspaceUploadV1",
-        "abortCoreWorkspaceUploadV1",
-    }
-)
 
 
 class CoreControlStoreError(Exception):
@@ -133,6 +124,12 @@ class StoredResult:
     model: BaseModel | None
     etag: str | None = None
     replayed: bool = False
+
+
+@dataclass(frozen=True)
+class _IdempotencyResourceScope:
+    project_id: str | None
+    upload_id: str | None
 
 
 @dataclass(frozen=True)
@@ -2041,21 +2038,30 @@ def _validate_bytes(model: type[_ModelT], value: bytes) -> _ModelT:
         raise StoreCorruptionError(f"persisted {model.__name__} is invalid") from exc
 
 
-def _validate_idempotency_row(row: sqlite3.Row) -> BaseModel | None:
-    expected_response = _IDEMPOTENCY_OPERATION_RESPONSES.get(row["operation_id"])
+def _validate_idempotency_row(
+    row: sqlite3.Row | Mapping[str, Any],
+) -> BaseModel | None:
+    operation_id = row["operation_id"]
+    operation_spec = _IDEMPOTENCY_OPERATION_SPECS.get(operation_id)
     if (
-        expected_response is None
-        or (int(row["status_code"]), row["response_type"]) != expected_response
+        operation_spec is None
+        or (int(row["status_code"]), row["response_type"]) != operation_spec[:2]
     ):
         raise StoreCorruptionError("idempotency operation response is invalid")
     if not _is_sha256(row["request_digest"]):
         raise StoreCorruptionError("idempotency request digest is invalid")
+    resource_scope = _parse_idempotency_success_scope(
+        operation_id,
+        row["resource_scope"],
+        operation_spec[2],
+    )
 
     response_type = row["response_type"]
     response_json = row["response_json"]
     if response_type == "NoContent":
         if response_json is not None or row["etag"] is not None:
             raise StoreCorruptionError("no-content idempotency row is invalid")
+        _validate_idempotency_response_semantics(operation_id, resource_scope, None)
         return None
 
     response_model = _IDEMPOTENCY_RESPONSE_MODELS.get(response_type)
@@ -2072,12 +2078,173 @@ def _validate_idempotency_row(row: sqlite3.Row) -> BaseModel | None:
         expected_etag = None
     if row["etag"] != expected_etag:
         raise StoreCorruptionError("idempotency response ETag is invalid")
+    _validate_idempotency_response_semantics(operation_id, resource_scope, model)
     return model
+
+
+def _parse_idempotency_success_scope(
+    operation_id: str,
+    value: object,
+    scope_kind: Literal["global", "project", "upload"],
+) -> _IdempotencyResourceScope:
+    if type(value) is not str:
+        raise StoreCorruptionError("idempotency response semantic binding is invalid")
+    if scope_kind == "global":
+        if operation_id != "createCoreProjectV1" or value != "projects":
+            raise StoreCorruptionError("idempotency response semantic binding is invalid")
+        return _IdempotencyResourceScope(project_id=None, upload_id=None)
+    if scope_kind == "project":
+        if not _is_managed_resource_id(value, "project"):
+            raise StoreCorruptionError("idempotency response semantic binding is invalid")
+        return _IdempotencyResourceScope(project_id=value, upload_id=None)
+
+    parts = value.split(":")
+    if (
+        len(parts) != 2
+        or not _is_managed_resource_id(parts[0], "project")
+        or not _is_managed_resource_id(parts[1], "upload")
+    ):
+        raise StoreCorruptionError("idempotency response semantic binding is invalid")
+    return _IdempotencyResourceScope(project_id=parts[0], upload_id=parts[1])
+
+
+def _validate_idempotency_response_semantics(
+    operation_id: str,
+    scope: _IdempotencyResourceScope,
+    model: BaseModel | None,
+) -> None:
+    valid = False
+    if operation_id == "createCoreProjectV1" and isinstance(model, m.ProjectV1):
+        valid = (
+            scope == _IdempotencyResourceScope(project_id=None, upload_id=None)
+            and _project_response_has_core_identity(model)
+            and model.created_at == model.updated_at
+            and model.current_project_snapshot.created_at == model.created_at
+            and model.current_task_snapshot.created_at == model.created_at
+            and (
+                model.current_workspace_snapshot is None
+                or model.current_workspace_snapshot.created_at == model.created_at
+            )
+            and model.model_preparation.updated_at == model.created_at
+            and model.workspace_publication is None
+        )
+    elif operation_id == "patchCoreProjectV1" and isinstance(model, m.ProjectV1):
+        valid = model.id == scope.project_id and _project_response_has_core_identity(model)
+    elif operation_id == "deleteCoreProjectV1":
+        valid = model is None and scope.project_id is not None and scope.upload_id is None
+    elif operation_id == "createCoreWorkspaceUploadV1" and isinstance(
+        model, m.WorkspaceUploadSessionV1
+    ):
+        valid = (
+            _upload_response_matches_scope(model, scope, require_upload_id=False)
+            and model.status is m.WorkspaceUploadStatus.OPEN
+            and model.accepted_offset == 0
+            and model.created_at == model.updated_at
+        )
+    elif operation_id == "putCoreWorkspaceUploadChunkV1" and isinstance(
+        model, m.WorkspaceUploadSessionV1
+    ):
+        valid = (
+            _upload_response_matches_scope(model, scope, require_upload_id=True)
+            and model.status is m.WorkspaceUploadStatus.OPEN
+            and model.accepted_offset > 0
+        )
+    elif operation_id == "finalizeCoreWorkspaceUploadV1" and isinstance(
+        model, m.WorkspaceUploadFinalizeResponseV1
+    ):
+        valid = (
+            model.project_id == scope.project_id
+            and model.project.id == scope.project_id
+            and _project_response_has_core_identity(model.project)
+            and _upload_response_matches_scope(model.upload, scope, require_upload_id=True)
+            and model.upload.status is m.WorkspaceUploadStatus.FINALIZED
+            and model.publication.published_at == model.upload.updated_at
+            and model.project.updated_at == model.upload.updated_at
+            and model.publication.workspace_snapshot.created_at == model.upload.updated_at
+        )
+    elif operation_id == "abortCoreWorkspaceUploadV1" and isinstance(
+        model, m.WorkspaceUploadSessionV1
+    ):
+        valid = (
+            _upload_response_matches_scope(model, scope, require_upload_id=True)
+            and model.status is m.WorkspaceUploadStatus.ABORTED
+        )
+    elif operation_id == "validateCoreProjectV1" and isinstance(
+        model, m.ProjectValidationResponseV1
+    ):
+        valid = (
+            scope.project_id is not None
+            and scope.upload_id is None
+            and model.valid is True
+            and len(model.checks) == 1
+            and model.checks[0].id == "verified-registry"
+            and model.checks[0].status is m.CheckStatus.OK
+            and model.checks[0].message
+            == "The project is valid against the verified executable registry."
+            and model.checks[0].target_id is None
+            and model.checks[0].method_id is None
+        )
+    if not valid:
+        raise StoreCorruptionError("idempotency response semantic binding is invalid")
+
+
+def _project_response_has_core_identity(project: m.ProjectV1) -> bool:
+    return (
+        _is_managed_resource_id(project.id, "project")
+        and project.status is m.ProjectStatus.DRAFT
+        and project.active_revision is None
+        and _is_managed_resource_id(project.current_project_snapshot.id, "project-snapshot")
+        and project.current_project_snapshot.created_at == project.updated_at
+        and _is_managed_resource_id(project.current_task_snapshot.id, "task-snapshot")
+        and (
+            project.current_workspace_snapshot is None
+            or _is_managed_resource_id(project.current_workspace_snapshot.id, "workspace-snapshot")
+        )
+        and (
+            project.workspace_publication is None
+            or _publication_has_core_identity(project.workspace_publication)
+        )
+    )
+
+
+def _upload_response_matches_scope(
+    upload: m.WorkspaceUploadSessionV1,
+    scope: _IdempotencyResourceScope,
+    *,
+    require_upload_id: bool,
+) -> bool:
+    return (
+        scope.project_id is not None
+        and upload.project_id == scope.project_id
+        and _is_managed_resource_id(upload.id, "upload")
+        and (not require_upload_id or upload.id == scope.upload_id)
+        and _is_managed_resource_id(upload.project_snapshot.id, "project-snapshot")
+        and (
+            upload.base_workspace_snapshot is None
+            or _is_managed_resource_id(upload.base_workspace_snapshot.id, "workspace-snapshot")
+        )
+        and (upload.publication is None or _publication_has_core_identity(upload.publication))
+    )
+
+
+def _publication_has_core_identity(publication: m.WorkspacePublicationV1) -> bool:
+    return _is_managed_resource_id(
+        publication.content_ref.content_id, "workspace-content"
+    ) and _is_managed_resource_id(publication.workspace_snapshot.id, "workspace-snapshot")
+
+
+def _is_managed_resource_id(value: object, prefix: str) -> bool:
+    expected_prefix = f"{prefix}-"
+    if type(value) is not str or not value.startswith(expected_prefix):
+        return False
+    suffix = value[len(expected_prefix) :]
+    return len(suffix) == 32 and all(character in "0123456789abcdef" for character in suffix)
 
 
 def _success_scope_for_failed_idempotency(row: sqlite3.Row) -> str | None:
     operation_id = row["operation_id"]
-    if operation_id not in _IDEMPOTENCY_OPERATION_RESPONSES:
+    operation_spec = _IDEMPOTENCY_OPERATION_SPECS.get(operation_id)
+    if operation_spec is None:
         return None
     try:
         resource_scope = json.loads(row["resource_scope"])
@@ -2089,15 +2256,16 @@ def _success_scope_for_failed_idempotency(row: sqlite3.Row) -> str | None:
     ):
         raise StoreCorruptionError("failed idempotency resource scope is invalid")
 
-    if operation_id == "createCoreProjectV1":
+    scope_kind = operation_spec[2]
+    if scope_kind == "global":
         if resource_scope:
             raise StoreCorruptionError("failed idempotency resource scope is invalid")
         return "projects"
-    if operation_id in _PROJECT_SCOPED_IDEMPOTENCY_OPERATIONS:
+    if scope_kind == "project":
         if set(resource_scope) != {"project_id"} or type(resource_scope["project_id"]) is not str:
             raise StoreCorruptionError("failed idempotency resource scope is invalid")
         return resource_scope["project_id"]
-    if operation_id in _UPLOAD_SCOPED_IDEMPOTENCY_OPERATIONS:
+    if scope_kind == "upload":
         if set(resource_scope) != {"project_id", "upload_id"} or any(
             type(resource_scope[name]) is not str for name in ("project_id", "upload_id")
         ):

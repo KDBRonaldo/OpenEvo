@@ -90,7 +90,15 @@ success or error response and ETag; a conflicting request returns
 reconciles failed-request audit rows. If legacy or corrupt state contains both
 outcomes for one operation, resource, and key, a valid canonical success is
 authoritative and the duplicate failed row is removed. An invalid success fails
-startup before that cleanup can commit.
+startup before that cleanup can commit. Success validation is operation-specific
+and closed: status and response type must match the operation; project creation
+uses only the global `projects` scope; project mutations and validation use a
+Core-generated project scope; upload chunk, finalize, and abort scopes bind both
+the parent project and upload IDs. Returned project/upload IDs, parent project,
+managed snapshot identities, upload lifecycle status, finalize publication, and
+the provider-owned validation result semantics must all match that scope and
+operation. A canonical response from another resource is therefore corruption,
+not an authoritative success.
 
 Project creation signs Core-owned project and task snapshots. Scratch projects
 also receive an immutable empty workspace snapshot. Imported projects remain

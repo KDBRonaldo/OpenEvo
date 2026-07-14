@@ -172,10 +172,15 @@ def _app(
     )
 
 
-def _create_project(client: TestClient, payload: dict[str, object]) -> tuple[dict, str]:
+def _create_project(
+    client: TestClient,
+    payload: dict[str, object],
+    *,
+    idempotency_key: str = "create-project-0001",
+) -> tuple[dict, str]:
     response = client.post(
         "/v1/projects",
-        headers={**AUTH, "Idempotency-Key": "create-project-0001"},
+        headers={**AUTH, "Idempotency-Key": idempotency_key},
         json=payload,
     )
     assert response.status_code == 201, response.text
@@ -1015,6 +1020,308 @@ def test_startup_keeps_failed_audit_when_duplicate_success_is_invalid(tmp_path: 
             ("putCoreWorkspaceUploadChunkV1", target_key),
         ).fetchone()[0]
     assert remaining == 1
+
+
+def test_startup_rejects_cross_upload_success_before_deleting_failed_audit(
+    tmp_path: Path,
+) -> None:
+    archive = _workspace_archive()
+    payload = _project_create(archive=archive)
+    target_key = "chunk-upload-cross-resource-target"
+    source_key = "chunk-upload-cross-resource-source"
+    with TestClient(_app(tmp_path)) as client:
+        project, project_etag = _create_project(client, payload)
+        uploads = []
+        for suffix in ("target", "source"):
+            upload = client.post(
+                f"/v1/projects/{project['id']}/workspace-uploads",
+                headers={
+                    **AUTH,
+                    "Idempotency-Key": f"begin-upload-cross-resource-{suffix}",
+                    "If-Match": project_etag,
+                },
+                json={
+                    "schema_version": "1",
+                    "project_snapshot": project["current_project_snapshot"],
+                    "archive": payload["workspace"]["archive"],
+                    "base_workspace_snapshot": None,
+                },
+            )
+            assert upload.status_code == 201, upload.text
+            uploads.append(upload)
+        target_upload, source_upload = uploads
+        chunk_body = _chunk(archive, offset=0)
+        stale = client.put(
+            f"/v1/projects/{project['id']}/workspace-uploads/{target_upload.json()['id']}/chunk",
+            headers={
+                **AUTH,
+                "Idempotency-Key": "chunk-upload-cross-resource-failure-source",
+                "If-Match": '"' + ("0" * 64) + '"',
+            },
+            json=chunk_body,
+        )
+        target = client.put(
+            f"/v1/projects/{project['id']}/workspace-uploads/{target_upload.json()['id']}/chunk",
+            headers={
+                **AUTH,
+                "Idempotency-Key": target_key,
+                "If-Match": target_upload.headers["etag"],
+            },
+            json=chunk_body,
+        )
+        source = client.put(
+            f"/v1/projects/{project['id']}/workspace-uploads/{source_upload.json()['id']}/chunk",
+            headers={
+                **AUTH,
+                "Idempotency-Key": source_key,
+                "If-Match": source_upload.headers["etag"],
+            },
+            json=chunk_body,
+        )
+        assert stale.status_code == 412
+        assert target.status_code == 200
+        assert source.status_code == 200
+
+    _inject_duplicate_failed_chunk(
+        tmp_path,
+        project_id=project["id"],
+        upload_id=target_upload.json()["id"],
+        upload_etag=target_upload.headers["etag"],
+        idempotency_key=target_key,
+        chunk_body=chunk_body,
+        error_payload=stale.json(),
+    )
+    with sqlite3.connect(tmp_path / "core-control-v1" / "provider.sqlite3") as connection:
+        source_row = connection.execute(
+            "SELECT response_json, etag FROM idempotency_records "
+            "WHERE operation_id = ? AND idempotency_key = ?",
+            ("putCoreWorkspaceUploadChunkV1", source_key),
+        ).fetchone()
+        assert source_row is not None
+        connection.execute(
+            "UPDATE idempotency_records SET response_json = ?, etag = ? "
+            "WHERE operation_id = ? AND idempotency_key = ?",
+            (
+                source_row[0],
+                source_row[1],
+                "putCoreWorkspaceUploadChunkV1",
+                target_key,
+            ),
+        )
+
+    def restart() -> None:
+        store = CoreControlStoreV1(tmp_path)
+        store.close()
+
+    with pytest.raises(StoreCorruptionError, match="idempotency response semantic binding"):
+        restart()
+    with sqlite3.connect(tmp_path / "core-control-v1" / "provider.sqlite3") as connection:
+        remaining = connection.execute(
+            "SELECT count(*) FROM failed_idempotency_records "
+            "WHERE operation_id = ? AND idempotency_key = ?",
+            ("putCoreWorkspaceUploadChunkV1", target_key),
+        ).fetchone()[0]
+    assert remaining == 1
+
+
+def test_success_idempotency_semantics_are_closed_per_operation(tmp_path: Path) -> None:
+    archive = _workspace_archive()
+    payload = _project_create(archive=archive)
+    state_root = tmp_path / "state"
+    registry = verified_builtin_registry(tmp_path / "registry")
+    keys = {
+        "create_a": "semantic-create-project-a",
+        "patch_a": "semantic-patch-project-a",
+        "begin_finalize_a": "semantic-begin-finalize-a",
+        "chunk_a": "semantic-chunk-a",
+        "finalize_a": "semantic-finalize-a",
+        "begin_abort_a": "semantic-begin-abort-a",
+        "abort_a": "semantic-abort-a",
+        "validate_a": "semantic-validate-a",
+        "create_b": "semantic-create-project-b",
+        "begin_b": "semantic-begin-b",
+        "delete_b": "semantic-delete-b",
+    }
+    with TestClient(_app(state_root, registry=registry)) as client:
+        project_a, etag_a = _create_project(client, payload, idempotency_key=keys["create_a"])
+        patched_a = client.patch(
+            f"/v1/projects/{project_a['id']}",
+            headers={
+                **AUTH,
+                "Idempotency-Key": keys["patch_a"],
+                "If-Match": etag_a,
+            },
+            json={"schema_version": "1", "name": "Semantic project A"},
+        )
+        assert patched_a.status_code == 200, patched_a.text
+        project_a = patched_a.json()
+        etag_a = patched_a.headers["etag"]
+        upload_a = client.post(
+            f"/v1/projects/{project_a['id']}/workspace-uploads",
+            headers={
+                **AUTH,
+                "Idempotency-Key": keys["begin_finalize_a"],
+                "If-Match": etag_a,
+            },
+            json={
+                "schema_version": "1",
+                "project_snapshot": project_a["current_project_snapshot"],
+                "archive": payload["workspace"]["archive"],
+                "base_workspace_snapshot": None,
+            },
+        )
+        assert upload_a.status_code == 201, upload_a.text
+        chunk_a = client.put(
+            f"/v1/projects/{project_a['id']}/workspace-uploads/{upload_a.json()['id']}/chunk",
+            headers={
+                **AUTH,
+                "Idempotency-Key": keys["chunk_a"],
+                "If-Match": upload_a.headers["etag"],
+            },
+            json=_chunk(archive, offset=0),
+        )
+        assert chunk_a.status_code == 200, chunk_a.text
+        finalized_a = client.post(
+            f"/v1/projects/{project_a['id']}/workspace-uploads/{upload_a.json()['id']}/finalize",
+            headers={
+                **AUTH,
+                "Idempotency-Key": keys["finalize_a"],
+                "If-Match": chunk_a.headers["etag"],
+                "If-Project-Match": etag_a,
+            },
+            json={
+                "schema_version": "1",
+                "content_sha256": hashlib.sha256(archive).hexdigest(),
+            },
+        )
+        assert finalized_a.status_code == 201, finalized_a.text
+        project_a = finalized_a.json()["project"]
+        etag_a = project_a["etag"]
+        abort_upload_a = client.post(
+            f"/v1/projects/{project_a['id']}/workspace-uploads",
+            headers={
+                **AUTH,
+                "Idempotency-Key": keys["begin_abort_a"],
+                "If-Match": etag_a,
+            },
+            json={
+                "schema_version": "1",
+                "project_snapshot": project_a["current_project_snapshot"],
+                "archive": payload["workspace"]["archive"],
+                "base_workspace_snapshot": project_a["current_workspace_snapshot"],
+            },
+        )
+        assert abort_upload_a.status_code == 201, abort_upload_a.text
+        aborted_a = client.post(
+            f"/v1/projects/{project_a['id']}/workspace-uploads/"
+            f"{abort_upload_a.json()['id']}/abort",
+            headers={
+                **AUTH,
+                "Idempotency-Key": keys["abort_a"],
+                "If-Match": abort_upload_a.headers["etag"],
+            },
+            json={"schema_version": "1", "reason": "semantic validator fixture"},
+        )
+        assert aborted_a.status_code == 200, aborted_a.text
+        validated_a = client.post(
+            f"/v1/projects/{project_a['id']}/validate",
+            headers={**AUTH, "Idempotency-Key": keys["validate_a"]},
+            json={
+                "schema_version": "1",
+                "project_snapshot": project_a["current_project_snapshot"],
+                "workspace_snapshot": project_a["current_workspace_snapshot"],
+                "expected_registry_digest": registry.snapshot.registry_digest,
+            },
+        )
+        assert validated_a.status_code == 200, validated_a.text
+
+        project_b, etag_b = _create_project(client, payload, idempotency_key=keys["create_b"])
+        upload_b = client.post(
+            f"/v1/projects/{project_b['id']}/workspace-uploads",
+            headers={
+                **AUTH,
+                "Idempotency-Key": keys["begin_b"],
+                "If-Match": etag_b,
+            },
+            json={
+                "schema_version": "1",
+                "project_snapshot": project_b["current_project_snapshot"],
+                "archive": payload["workspace"]["archive"],
+                "base_workspace_snapshot": None,
+            },
+        )
+        assert upload_b.status_code == 201, upload_b.text
+        deleted_b = client.delete(
+            f"/v1/projects/{project_b['id']}",
+            headers={
+                **AUTH,
+                "Idempotency-Key": keys["delete_b"],
+                "If-Match": etag_b,
+            },
+        )
+        assert deleted_b.status_code == 204, deleted_b.text
+
+    database = state_root / "core-control-v1" / "provider.sqlite3"
+    with sqlite3.connect(database) as connection:
+        connection.row_factory = sqlite3.Row
+        rows = {
+            row["idempotency_key"]: dict(row)
+            for row in connection.execute("SELECT * FROM idempotency_records").fetchall()
+        }
+
+    selected_keys = (
+        "create_a",
+        "patch_a",
+        "begin_finalize_a",
+        "chunk_a",
+        "finalize_a",
+        "abort_a",
+        "validate_a",
+        "delete_b",
+    )
+    for name in selected_keys:
+        store_module._validate_idempotency_row(rows[keys[name]])
+
+    def transplant(target: str, source: str) -> dict[str, object]:
+        row = dict(rows[keys[target]])
+        row["response_json"] = rows[keys[source]]["response_json"]
+        row["etag"] = rows[keys[source]]["etag"]
+        return row
+
+    bad_create = dict(rows[keys["create_a"]])
+    bad_create["resource_scope"] = project_a["id"]
+    bad_patch = transplant("patch_a", "create_b")
+    bad_delete = dict(rows[keys["delete_b"]])
+    bad_delete["resource_scope"] = upload_b.json()["id"]
+    bad_upload_create = transplant("begin_finalize_a", "begin_b")
+    bad_chunk = dict(rows[keys["chunk_a"]])
+    bad_chunk["resource_scope"] = f"{project_a['id']}:{abort_upload_a.json()['id']}"
+    bad_finalize = dict(rows[keys["finalize_a"]])
+    bad_finalize["resource_scope"] = f"{project_b['id']}:{upload_b.json()['id']}"
+    bad_abort = transplant("abort_a", "begin_abort_a")
+    bad_validation = dict(rows[keys["validate_a"]])
+    validation_payload = json.loads(bytes(bad_validation["response_json"]))
+    validation_payload["valid"] = False
+    validation_payload["checks"][0]["status"] = "blocking"
+    bad_validation["response_json"] = store_module._canonical_bytes(validation_payload)
+
+    cases = {
+        "project create scope": bad_create,
+        "project patch resource": bad_patch,
+        "project delete scope": bad_delete,
+        "upload create parent": bad_upload_create,
+        "upload chunk resource": bad_chunk,
+        "upload finalize resource": bad_finalize,
+        "upload abort status": bad_abort,
+        "project validation result": bad_validation,
+    }
+    for label, row in cases.items():
+        try:
+            store_module._validate_idempotency_row(row)
+        except StoreCorruptionError as exc:
+            assert "idempotency response semantic binding" in str(exc), label
+        else:
+            pytest.fail(f"accepted invalid {label} idempotency row")
 
 
 def test_workspace_finalize_rejects_same_inode_mutation_during_verification(
