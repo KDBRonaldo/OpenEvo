@@ -23,10 +23,11 @@ The System view distinguishes passing checks from completed checks that contain
 warnings or require attention. A warning state never appears as "All checks
 passed"; follow the visible repair or reconnect action before starting a run.
 
-Project and artifact mode controls support the standard tab keyboard behavior:
-arrow keys change the active choice, while Home and End select the first and
-last choice. When closing a form with unsaved changes, focus remains inside the
-confirmation until the draft is kept or discarded.
+Project and artifact mode controls use manual tab activation: Left and Right,
+or Home and End, move focus without starting an action; Enter or Space activates
+the focused choice. When closing a form with unsaved changes, the underlying
+form becomes inert and focus remains inside the confirmation until the draft is
+kept or discarded.
 
 Desktop must show setup-required or typed error states until a real sidecar and
 remote Core Backend are reachable. This document becomes a user quickstart only

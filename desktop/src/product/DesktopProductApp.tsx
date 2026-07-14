@@ -1237,8 +1237,8 @@ function RemoteWorkspaceDrawer({
   return (
     <div className="drawer-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) guardedClose.requestClose(); }}>
       <aside ref={dialogRef} className="settings-drawer" role="dialog" aria-modal="true" aria-labelledby="workspace-settings-title" tabIndex={-1}>
-        <div className="drawer-head"><div><span className="panel-kicker">Remote workspace</span><h2 id="workspace-settings-title">Server connection</h2></div><IconButton label="Close connection settings" onClick={guardedClose.requestClose}><X size={18} /></IconButton></div>
-        <div className="drawer-content">
+        <div className="drawer-head" inert={guardedClose.confirming ? true : undefined} aria-hidden={guardedClose.confirming || undefined}><div><span className="panel-kicker">Remote workspace</span><h2 id="workspace-settings-title">Server connection</h2></div><IconButton label="Close connection settings" onClick={guardedClose.requestClose}><X size={18} /></IconButton></div>
+        <div className="drawer-content" inert={guardedClose.confirming ? true : undefined} aria-hidden={guardedClose.confirming || undefined}>
           <section className="form-section">
             <h3>Server</h3>
             <label>Workspace name<input value={name} onChange={update(setName)} placeholder="Research server" /></label>
@@ -1258,7 +1258,7 @@ function RemoteWorkspaceDrawer({
           </section>
         </div>
         {guardedClose.confirming ? <DiscardChangesPrompt onKeep={guardedClose.keepEditing} onDiscard={guardedClose.discard} /> : null}
-        <div className="drawer-footer"><button className="secondary-button" type="button" onClick={guardedClose.requestClose}>Cancel</button><button className="primary-button" type="button" disabled={!valid || busy || streamEpoch === null || (profile !== null && !dirty)} title={!valid ? "Complete the required server fields" : streamEpoch === null ? "Refresh this view before saving" : profile && !dirty ? "No unsaved changes" : "Save remote workspace"} onClick={() => {
+        <div className="drawer-footer" inert={guardedClose.confirming ? true : undefined} aria-hidden={guardedClose.confirming || undefined}><button className="secondary-button" type="button" onClick={guardedClose.requestClose}>Cancel</button><button className="primary-button" type="button" disabled={!valid || busy || streamEpoch === null || (profile !== null && !dirty)} title={!valid ? "Complete the required server fields" : streamEpoch === null ? "Refresh this view before saving" : profile && !dirty ? "No unsaved changes" : "Save remote workspace"} onClick={() => {
           const input: ProfileCreateV1 = {
             name: name.trim(),
             host: host.trim(),
@@ -1455,8 +1455,8 @@ function SettingsDrawer({
   return (
     <div className="drawer-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) requestClose(); }}>
       <aside ref={dialogRef} className="settings-drawer" role="dialog" aria-modal="true" aria-labelledby="settings-title" tabIndex={-1}>
-        <div className="drawer-head"><div><span className="panel-kicker">{project ? "Project settings" : "New project"}</span><h2 id="settings-title">Research configuration</h2></div><IconButton label="Close settings" onClick={requestClose}><X size={18} /></IconButton></div>
-        <div className="drawer-content">
+        <div className="drawer-head" inert={guardedClose.confirming ? true : undefined} aria-hidden={guardedClose.confirming || undefined}><div><span className="panel-kicker">{project ? "Project settings" : "New project"}</span><h2 id="settings-title">Research configuration</h2></div><IconButton label="Close settings" onClick={requestClose}><X size={18} /></IconButton></div>
+        <div className="drawer-content" inert={guardedClose.confirming ? true : undefined} aria-hidden={guardedClose.confirming || undefined}>
           <section className="form-section">
             <h3>Project</h3>
             <label>Project name<input value={name} onChange={change(setName)} /></label>
@@ -1518,7 +1518,7 @@ function SettingsDrawer({
           </section>
         </div>
         {guardedClose.confirming ? <DiscardChangesPrompt onKeep={guardedClose.keepEditing} onDiscard={guardedClose.discard} /> : null}
-        <div className="drawer-footer"><button className="secondary-button" type="button" onClick={() => void reset()} disabled={!dirty || busy || selectingSource} title={!dirty ? "No unsaved changes" : "Undo changes"}><RotateCcw size={15} /> Undo</button><button className="primary-button" type="button" disabled={!valid || busy || selectingSource || (project !== null && !dirty)} title={!profileId ? "Add a remote workspace first" : !valid ? "Complete all required fields and valid method settings" : project && !dirty ? "No unsaved changes" : "Save project settings"} onClick={() => { invalidateSourceSelection(); const pendingActionId = pendingSourceActionId.current; void onSave({
+        <div className="drawer-footer" inert={guardedClose.confirming ? true : undefined} aria-hidden={guardedClose.confirming || undefined}><button className="secondary-button" type="button" onClick={() => void reset()} disabled={!dirty || busy || selectingSource} title={!dirty ? "No unsaved changes" : "Undo changes"}><RotateCcw size={15} /> Undo</button><button className="primary-button" type="button" disabled={!valid || busy || selectingSource || (project !== null && !dirty)} title={!profileId ? "Add a remote workspace first" : !valid ? "Complete all required fields and valid method settings" : project && !dirty ? "No unsaved changes" : "Save project settings"} onClick={() => { invalidateSourceSelection(); const pendingActionId = pendingSourceActionId.current; void onSave({
           name: name.trim(),
           task: { title: title.trim(), objective: objective.trim() },
           source,
@@ -1553,7 +1553,16 @@ function InlineNotice({ tone, title, detail, onDismiss, actionLabel, onAction }:
 function DiscardChangesPrompt({ onKeep, onDiscard }: { onKeep: () => void; onDiscard: () => void }) {
   const promptRef = useRef<HTMLDivElement | null>(null);
   const keepRef = useRef<HTMLButtonElement | null>(null);
-  useLayoutEffect(() => keepRef.current?.focus(), []);
+  useLayoutEffect(() => {
+    const keepFocusInside = (event: FocusEvent) => {
+      if (event.target instanceof Node && !promptRef.current?.contains(event.target)) {
+        keepRef.current?.focus();
+      }
+    };
+    keepRef.current?.focus();
+    document.addEventListener("focusin", keepFocusInside);
+    return () => document.removeEventListener("focusin", keepFocusInside);
+  }, []);
   const handleKeyDown = (event: React.KeyboardEvent<HTMLDivElement>) => {
     event.stopPropagation();
     if (event.key === "Escape") {
@@ -1574,10 +1583,12 @@ function DiscardChangesPrompt({ onKeep, onDiscard }: { onKeep: () => void; onDis
     }
   };
   return (
-    <div ref={promptRef} className="discard-changes-prompt" role="alertdialog" aria-modal="true" aria-labelledby="discard-title" aria-describedby="discard-detail" onKeyDown={handleKeyDown}>
-      <div><strong id="discard-title">Discard unsaved changes?</strong><span id="discard-detail">Your draft stays open until you choose to discard it.</span></div>
-      <button ref={keepRef} type="button" className="secondary-button" onClick={onKeep}>Keep editing</button>
-      <button type="button" className="danger-text-button" onClick={onDiscard}>Discard changes</button>
+    <div className="discard-changes-modal" role="presentation">
+      <div ref={promptRef} className="discard-changes-prompt" role="alertdialog" aria-modal="true" aria-labelledby="discard-title" aria-describedby="discard-detail" onKeyDown={handleKeyDown}>
+        <div><strong id="discard-title">Discard unsaved changes?</strong><span id="discard-detail">Your draft stays open until you choose to discard it.</span></div>
+        <button ref={keepRef} type="button" className="secondary-button" onClick={onKeep}>Keep editing</button>
+        <button type="button" className="danger-text-button" onClick={onDiscard}>Discard changes</button>
+      </div>
     </div>
   );
 }
@@ -2089,9 +2100,17 @@ function useGuardedDrawerClose(dirty: boolean, onClose: () => void) {
 }
 
 function handleTablistKeyDown(event: React.KeyboardEvent<HTMLElement>) {
-  const direction = event.key === "ArrowRight" || event.key === "ArrowDown"
+  if (event.key === "Enter" || event.key === " ") {
+    const active = document.activeElement;
+    if (active instanceof HTMLButtonElement && active.getAttribute("role") === "tab" && event.currentTarget.contains(active)) {
+      event.preventDefault();
+      active.click();
+    }
+    return;
+  }
+  const direction = event.key === "ArrowRight"
     ? 1
-    : event.key === "ArrowLeft" || event.key === "ArrowUp"
+    : event.key === "ArrowLeft"
       ? -1
       : 0;
   if (direction === 0 && event.key !== "Home" && event.key !== "End") return;
@@ -2105,7 +2124,6 @@ function handleTablistKeyDown(event: React.KeyboardEvent<HTMLElement>) {
       : (Math.max(0, currentIndex) + direction + tabs.length) % tabs.length;
   event.preventDefault();
   tabs[nextIndex]?.focus();
-  tabs[nextIndex]?.click();
 }
 
 function useDialogFocus(onClose: () => void) {

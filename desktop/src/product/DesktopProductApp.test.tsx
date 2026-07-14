@@ -928,6 +928,7 @@ describe("DesktopProductApp", () => {
 
   it("supports roving keyboard selection in project and artifact tabs", async () => {
     provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
+    const selectSource = vi.spyOn(provider, "selectProjectSource");
     root = await renderProduct(provider);
     await clickAria("Project settings");
 
@@ -939,14 +940,27 @@ describe("DesktopProductApp", () => {
     const scratch = sourceTabs?.querySelector<HTMLButtonElement>('[role="tab"][aria-selected="true"]');
     if (!scratch) throw new Error("Selected research source tab was not found.");
     scratch.focus();
+    await pressKey(scratch, "ArrowDown");
+    expect(document.activeElement).toBe(scratch);
     await pressKey(scratch, "ArrowRight");
+    const folder = sourceTabs?.querySelector<HTMLButtonElement>('[role="tab"]:not([aria-selected="true"])');
+    expect(document.activeElement).toBe(folder);
+    expect(sourceTabs?.querySelector('[role="tab"][aria-selected="true"]')?.textContent).toContain("Scratch");
+    expect(selectSource).not.toHaveBeenCalled();
+    if (!folder) throw new Error("Folder source tab was not found.");
+    await pressKey(folder, "Enter");
     expect(sourceTabs?.querySelector('[role="tab"][aria-selected="true"]')?.textContent).toContain("Folder snapshot");
+    expect(selectSource).toHaveBeenCalledTimes(1);
 
     const modelTabs = document.querySelector<HTMLElement>('[role="tablist"][aria-label="Model mode"]');
     const selectedModel = modelTabs?.querySelector<HTMLButtonElement>('[role="tab"][aria-selected="true"]');
     if (!selectedModel) throw new Error("Selected model tab was not found.");
     selectedModel.focus();
     await pressKey(selectedModel, "ArrowRight");
+    const nextModel = document.activeElement;
+    expect(modelTabs?.querySelector('[role="tab"][aria-selected="true"]')?.textContent).toBe(selectedModel.textContent);
+    if (!(nextModel instanceof HTMLElement)) throw new Error("Next model tab was not focused.");
+    await pressKey(nextModel, "Enter");
     expect(modelTabs?.querySelector('[role="tab"][aria-selected="true"]')?.textContent).not.toBe(selectedModel.textContent);
 
     await clickAria("Close settings");
@@ -957,6 +971,10 @@ describe("DesktopProductApp", () => {
     if (!content) throw new Error("Selected artifact tab was not found.");
     content.focus();
     await pressKey(content, "ArrowRight");
+    const changes = document.activeElement;
+    expect(artifactTabs?.querySelector('[role="tab"][aria-selected="true"]')?.textContent).toContain("Content");
+    if (!(changes instanceof HTMLElement)) throw new Error("Changes tab was not focused.");
+    await pressKey(changes, "Enter");
     expect(artifactTabs?.querySelector('[role="tab"][aria-selected="true"]')?.textContent).toContain("Changes");
   });
 
@@ -1301,7 +1319,13 @@ describe("DesktopProductApp", () => {
     const alertDialog = document.querySelector<HTMLElement>('[role="alertdialog"]');
     expect(alertDialog?.contains(document.activeElement)).toBe(true);
     expect(document.activeElement?.textContent).toContain("Keep editing");
+    const drawerContent = document.querySelector<HTMLElement>(".drawer-content");
+    expect(drawerContent?.inert).toBe(true);
+    const objective = labelledControl<HTMLTextAreaElement>("Objective", "textarea");
+    await act(async () => objective.focus());
+    expect(alertDialog?.contains(document.activeElement)).toBe(true);
     await clickButton("Keep editing");
+    expect(drawerContent?.inert).toBe(false);
 
     const backdrop = document.querySelector<HTMLElement>(".drawer-backdrop");
     if (!backdrop) throw new Error("Drawer backdrop was not found.");

@@ -1618,12 +1618,17 @@ pre.json {
   box-shadow: -10px 0 30px rgb(30 40 34 / 12%);
 }
 
-.discard-changes-prompt {
+.discard-changes-modal {
   position: absolute;
-  z-index: 2;
-  right: 14px;
-  bottom: 70px;
-  left: 14px;
+  z-index: 3;
+  inset: 0;
+  display: grid;
+  align-items: end;
+  padding: 14px 14px 70px;
+  background: rgb(25 31 27 / 18%);
+}
+
+.discard-changes-prompt {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto auto;
   align-items: center;
