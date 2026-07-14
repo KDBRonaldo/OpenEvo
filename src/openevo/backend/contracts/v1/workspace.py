@@ -45,6 +45,7 @@ def verify_and_materialize_workspace(
     )
     temporary_name = f".workspace-{uuid.uuid4().hex}.tmp"
     temporary_fd: int | None = None
+    temporary_identity: os.stat_result | None = None
     published = False
     try:
         os.mkdir(temporary_name, mode=0o700, dir_fd=workspace_root_fd)
@@ -91,8 +92,12 @@ def verify_and_materialize_workspace(
     finally:
         if temporary_fd is not None:
             os.close(temporary_fd)
-        if not published:
-            _remove_tree_at(workspace_root_fd, temporary_name)
+        if not published and temporary_identity is not None:
+            _remove_tree_at(
+                workspace_root_fd,
+                temporary_name,
+                expected_identity=temporary_identity,
+            )
         stream.close()
 
 

@@ -1966,6 +1966,103 @@ def test_workspace_finalize_rejects_same_inode_mutation_during_verification(
         assert list((tmp_path / "core-control-v1" / "workspace-snapshots").iterdir()) == []
 
 
+def test_workspace_finalize_cleanup_preserves_replaced_temporary_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    archive = _workspace_archive()
+    snapshot_root = tmp_path / "core-control-v1" / "workspace-snapshots"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    outside_file = outside / "keep.txt"
+    outside_file.write_text("keep", encoding="utf-8")
+    observed: dict[str, object] = {}
+    cleanup_calls: list[tuple[str, os.stat_result | None]] = []
+    real_validate = workspace_module._validate_directory_metadata
+    real_remove_tree = workspace_module._remove_tree_at
+
+    def replace_temporary_root(metadata: os.stat_result, *, mode: int, label: str) -> None:
+        real_validate(metadata, mode=mode, label=label)
+        if label != "temporary root":
+            return
+        temporary = next(snapshot_root.glob(".workspace-*.tmp"))
+        displaced = snapshot_root / f"{temporary.name}.displaced"
+        temporary.rename(displaced)
+        (displaced / "original.txt").write_text("original", encoding="utf-8")
+        temporary.mkdir(mode=0o700)
+        assert temporary.stat().st_uid == metadata.st_uid
+        assert (displaced.stat().st_dev, displaced.stat().st_ino) == (
+            metadata.st_dev,
+            metadata.st_ino,
+        )
+        (temporary / "replacement.txt").write_text("replacement", encoding="utf-8")
+        (temporary / "outside-link").symlink_to(outside, target_is_directory=True)
+        observed.update(temporary=temporary, displaced=displaced, identity=metadata)
+        raise WorkspaceArchiveError("injected temporary workspace failure")
+
+    def observe_cleanup(
+        parent_fd: int,
+        name: str,
+        *,
+        expected_identity: os.stat_result | None = None,
+    ) -> None:
+        cleanup_calls.append((name, expected_identity))
+        real_remove_tree(parent_fd, name, expected_identity=expected_identity)
+
+    monkeypatch.setattr(workspace_module, "_validate_directory_metadata", replace_temporary_root)
+    monkeypatch.setattr(workspace_module, "_remove_tree_at", observe_cleanup)
+
+    with TestClient(_app(tmp_path)) as client:
+        project, project_etag = _create_project(client, _project_create(archive=archive))
+        upload = client.post(
+            f"/v1/projects/{project['id']}/workspace-uploads",
+            headers={
+                **AUTH,
+                "Idempotency-Key": "begin-upload-temporary-replacement",
+                "If-Match": project_etag,
+            },
+            json={
+                "schema_version": "1",
+                "project_snapshot": project["current_project_snapshot"],
+                "archive": project["workspace"]["archive"],
+                "base_workspace_snapshot": None,
+            },
+        )
+        chunk = client.put(
+            f"/v1/projects/{project['id']}/workspace-uploads/{upload.json()['id']}/chunk",
+            headers={
+                **AUTH,
+                "Idempotency-Key": "chunk-upload-temporary-replacement",
+                "If-Match": upload.headers["etag"],
+            },
+            json=_chunk(archive, offset=0),
+        )
+        finalized = client.post(
+            f"/v1/projects/{project['id']}/workspace-uploads/{upload.json()['id']}/finalize",
+            headers={
+                **AUTH,
+                "Idempotency-Key": "finalize-upload-temporary-replacement",
+                "If-Match": chunk.headers["etag"],
+                "If-Project-Match": project_etag,
+            },
+            json={"schema_version": "1", "content_sha256": hashlib.sha256(archive).hexdigest()},
+        )
+
+        assert finalized.status_code == 409
+        assert finalized.json()["code"] == "workspace_archive_invalid"
+
+    temporary = observed["temporary"]
+    displaced = observed["displaced"]
+    identity = observed["identity"]
+    assert isinstance(temporary, Path)
+    assert isinstance(displaced, Path)
+    assert isinstance(identity, os.stat_result)
+    assert cleanup_calls == [(temporary.name, identity)]
+    assert (temporary / "replacement.txt").read_text(encoding="utf-8") == "replacement"
+    assert os.path.lexists(temporary / "outside-link")
+    assert (displaced / "original.txt").read_text(encoding="utf-8") == "original"
+    assert outside_file.read_text(encoding="utf-8") == "keep"
+
+
 def test_workspace_finalize_rejects_nonprivate_archive_mode(tmp_path: Path) -> None:
     archive = _workspace_archive()
     with TestClient(_app(tmp_path)) as client:

@@ -215,7 +215,9 @@ recovery. Cleanup first revalidates the observed inode, atomically renames it to
 a random no-replace quarantine name, `fsync`s the owning directory, revalidates
 the quarantine binding, and only then unlinks or recursively removes that
 quarantine name. It never verifies one inode and deletes the original pathname
-after a replacement race.
+after a replacement race. Failed extraction cleanup likewise passes the first
+observed temporary-root identity; a same-owner pathname replacement is preserved
+without traversal or name-based deletion for authoritative startup recovery.
 
 Abort and project-delete transactions persist signed cleanup intents tied by a
 foreign key to their successful idempotency record. Post-commit cleanup removes
