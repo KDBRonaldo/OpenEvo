@@ -106,6 +106,47 @@ describe("DesktopProductApp", () => {
     expect(screenText()).toContain("Revision 3");
   });
 
+  it("keeps Desktop project identity distinct from Core run and artifact identity", async () => {
+    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
+    const refreshed = await provider.refresh();
+    if (refreshed.status !== "fresh") throw new Error("Fixture refresh was not fresh.");
+    const project = refreshed.snapshot.projects[0];
+    if (!project?.remote) throw new Error("Fixture project did not have a remote identity.");
+
+    expect(project.project_id).not.toBe(project.remote.core_project_id);
+    expect(refreshed.snapshot.runs.every((run) => run.project_id === project.remote?.core_project_id)).toBe(true);
+    expect(refreshed.snapshot.artifacts.every((artifact) => artifact.project_id === project.remote?.core_project_id)).toBe(true);
+
+    root = await renderProduct(provider);
+    expect(screenText()).toContain("Latest session complete");
+    await clickButton("Evolution");
+    expect(document.querySelectorAll(".artifact-list-item")).toHaveLength(4);
+  });
+
+  it("clears terminal run and attempt fields when a fixture transition re-enters preparation", async () => {
+    vi.useFakeTimers();
+    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true, stepDelayMs: 20 });
+    const initial = await provider.refresh();
+    if (initial.status !== "fresh") throw new Error("Fixture refresh was not fresh.");
+    const project = initial.snapshot.projects[0];
+    if (!project) throw new Error("Fixture project was not found.");
+    const run = await provider.startRun({ projectId: project.project_id, etag: project.etag, streamEpoch: initial.snapshot.stream.epoch, actionId: "state-machine-start" });
+    await provider.cancelRun(run.id, { etag: run.etag, streamEpoch: initial.snapshot.stream.epoch, actionId: "state-machine-cancel" });
+
+    vi.advanceTimersByTime(25);
+    const transitioned = await provider.refresh();
+    if (transitioned.status !== "fresh") throw new Error("Fixture refresh was not fresh.");
+    const current = transitioned.snapshot.runs.find((candidate) => candidate.id === run.id);
+
+    expect(current?.status).toBe("preparing");
+    expect(current?.finished_at).toBeNull();
+    expect(current?.current_error).toBeNull();
+    expect(current?.current_attempt?.finished_at).toBeNull();
+    expect(current?.current_attempt?.error).toBeNull();
+    expect(current?.attempts.at(-1)?.finished_at).toBeNull();
+    expect(current?.attempts.at(-1)?.error).toBeNull();
+  });
+
   it("shows artifact content, changes, document tabs, and truncation", async () => {
     provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true, artifactTruncated: true });
     root = await renderProduct(provider);
@@ -123,6 +164,33 @@ describe("DesktopProductApp", () => {
     await clickButton("Changes");
     await flush();
     expect(screenText()).toContain("Added for Revision 2");
+  });
+
+  it("refuses content and changes cross-wired to another selected artifact", async () => {
+    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
+    provider.useCrossWiredArtifactPayloads();
+    root = await renderProduct(provider);
+
+    await clickButton("Evolution");
+    await flush();
+    expect(screenText()).toContain("Artifact content identity does not match the selected artifact.");
+    expect(document.querySelector(".artifact-document")).toBeNull();
+    await clickButton("Changes");
+    await flush();
+    expect(screenText()).toContain("Artifact change identity does not match the selected artifact.");
+    expect(document.querySelector(".diff-hunk")).toBeNull();
+  });
+
+  it("refuses a diff whose previous artifact identity is unrelated to the selection", async () => {
+    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
+    provider.useMismatchedArtifactDiffPreviousIdentity();
+    root = await renderProduct(provider);
+
+    await clickButton("Evolution");
+    await clickButton("Changes");
+    await flush();
+    expect(screenText()).toContain("Artifact change history does not match the selected artifact.");
+    expect(document.querySelector(".diff-hunk")).toBeNull();
   });
 
   it("keeps implementation and sensitive operational terms out of the product surface", async () => {
@@ -364,6 +432,30 @@ describe("DesktopProductApp", () => {
     await flush();
     expect(screenText()).toContain("Revision unknown");
     expect(button("Refetch revision").disabled).toBe(false);
+  });
+
+  it("fails closed on conflicting required and transition predecessor revision identities", async () => {
+    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
+    provider.useRequiredRevisionIdentityConflict();
+    root = await renderProduct(provider);
+    await clickButton("Evolution");
+    expect(screenText()).toContain("Revision relation is unknown");
+
+    provider.useTransitionPredecessorIdentityConflict();
+    provider.emitAuthoritativeRefresh();
+    await flush();
+    expect(screenText()).toContain("Revision relation is unknown");
+    expect(document.querySelectorAll(".artifact-list-item")).toHaveLength(0);
+  });
+
+  it("requires complete revision identity for selected artifact membership", async () => {
+    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
+    provider.useArtifactMembershipIdentityConflict();
+    root = await renderProduct(provider);
+    await clickButton("Evolution");
+
+    expect(screenText()).toContain("No evolved artifacts yet");
+    expect(document.querySelectorAll(".artifact-list-item")).toHaveLength(0);
   });
 
   it("does not present a partial paginated artifact collection as complete revision membership", async () => {

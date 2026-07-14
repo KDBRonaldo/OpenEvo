@@ -402,7 +402,17 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
   async activateProject(projectId: string, intent: ProductResourceMutationIntent): Promise<LocalOperationV1> {
     const project = this.requireProject(projectId);
     this.checkIntent(intent, `project:activate:${projectId}`, project.etag);
-    const activated = projectV1Schema.parse({ ...project, state: "active", updated_at: NOW });
+    const coreProjectId = project.remote?.core_project_id ?? this.fixtureCoreProjectId(project.project_id);
+    const activated = projectV1Schema.parse({
+      ...project,
+      state: "active",
+      remote: project.remote ?? {
+        ...structuredClone(CONTRACT_FIXTURE_V1.project.remote),
+        core_project_id: coreProjectId,
+        active_revision: this.revision(1, coreProjectId),
+      },
+      updated_at: NOW,
+    });
     this.projects = this.projects.map((item) => item.project_id === projectId ? activated : item);
     this.capabilities = this.state.core.state === "online" ? this.makeCapabilities(projectId, activated.execution.mode) : null;
     this.validation = this.capabilities ? this.makeValidation(activated, this.capabilities) : null;
@@ -463,14 +473,15 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
     if (this.state.core.state !== "online") {
       throw new Error("Reconnect the remote workspace before starting a session.");
     }
-    if (this.runs.some((run) => !isTerminal(run.status))) {
+    const coreProjectId = this.requireCoreProjectId(project);
+    if (this.runs.some((run) => run.project_id === coreProjectId && !isTerminal(run.status))) {
       throw new Error("A session is already active.");
     }
 
     const generation = this.currentGeneration(project);
     const runNumber = this.runs.length + 1;
     const runId = `run-fixture-${runNumber}`;
-    const revision = this.revision(generation, projectId);
+    const revision = this.revision(generation, coreProjectId);
     const attempt = {
       id: `attempt-fixture-${runNumber}`,
       run_id: runId,
@@ -490,7 +501,7 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
     const run = runV1Schema.parse({
       ...structuredClone(CONTRACT_FIXTURE_V1.run),
       id: runId,
-      project_id: projectId,
+      project_id: coreProjectId,
       project_snapshot: { id: `project-snapshot-${runNumber}`, kind: "project", content_sha256: A, created_at: NOW },
       task_snapshot: { id: `task-snapshot-${runNumber}`, kind: "task", content_sha256: B, created_at: NOW },
       workspace_snapshot: { id: `workspace-snapshot-${runNumber}`, kind: "workspace", content_sha256: C, created_at: NOW },
@@ -618,12 +629,14 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
   private seedCompletedRun(): void {
     const project = this.projects[0];
     if (!project) return;
-    const predecessor = this.revision(1, project.project_id);
-    const successor = this.revision(2, project.project_id);
+    const coreProjectId = this.requireCoreProjectId(project);
+    const predecessor = this.revision(1, coreProjectId);
+    const successor = this.revision(2, coreProjectId);
     const base = structuredClone(CONTRACT_FIXTURE_V1.run);
     const attempt = { ...base.attempts[0], status: "succeeded" as const, finished_at: NOW };
     const run = runV1Schema.parse({
       ...base,
+      project_id: coreProjectId,
       status: "succeeded",
       queued_reason: null,
       current_attempt: attempt,
@@ -651,6 +664,7 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
       ...project,
       remote: project.remote ? { ...project.remote, active_revision: successor, observed_at: NOW } : null,
     })];
+    this.createArtifacts(run.id, 1);
     this.createArtifacts(run.id, 2);
   }
 
@@ -674,10 +688,10 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
     });
     this.replaceRun(succeeded);
     this.projects = this.projects.map((project) =>
-      project.project_id === run.project_id
+      project.remote?.core_project_id === run.project_id
         ? projectV1Schema.parse({
             ...project,
-            remote: project.remote ? { ...project.remote, active_revision: this.revision(successorGeneration, project.project_id), observed_at: NOW } : null,
+            remote: project.remote ? { ...project.remote, active_revision: this.revision(successorGeneration, run.project_id), observed_at: NOW } : null,
             updated_at: NOW,
           })
         : project,
@@ -687,6 +701,7 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
   }
 
   private createArtifacts(runId: string, generation: number): void {
+    const run = this.requireRun(runId);
     const prior = this.artifacts;
     const variants = [
       { artifact_type: "text_memory" as const, target_id: "text_memory", display_name: "Research memory", summary: "Durable findings and constraints from this session." },
@@ -698,7 +713,7 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
     for (const variant of variants) {
       const artifactId = `artifact-${variant.target_id}-${generation}`;
       const parent = prior.find((artifact) => artifact.target_id === variant.target_id);
-      const revision = this.revision(generation);
+      const revision = this.revision(generation, run.project_id);
       const metadata = variant.artifact_type === "text_memory"
         ? { record_count: generation, source_dataset_ids: [`dataset-fixture-${generation}`] }
         : variant.artifact_type === "skill_bundle"
@@ -708,7 +723,7 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
             : { adapter_id: `adapter-fixture-${generation}`, base_model_ref: "open-models/research-model-fixture-1", adapter_format: "lora" as const };
       const artifact = artifactV1Schema.parse({
         id: artifactId,
-        project_id: this.projects[0]?.project_id ?? "project-fixture-1",
+        project_id: run.project_id,
         run_id: runId,
         target_id: variant.target_id,
         artifact_type: variant.artifact_type,
@@ -819,13 +834,24 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
     summary: string,
   ): void {
     const run = this.requireRun(runId);
+    const attempt = {
+      ...run.current_attempt!,
+      status: state,
+      queued_reason: null,
+      updated_at: NOW,
+      started_at: run.current_attempt!.started_at ?? NOW,
+      finished_at: null,
+      error: null,
+    };
     const next = runV1Schema.parse({
       ...run,
       status: state,
       queued_reason: null,
-      current_attempt: { ...run.current_attempt!, status: state, queued_reason: null, updated_at: NOW, started_at: run.current_attempt!.started_at ?? NOW },
-      attempts: [...run.attempts.slice(0, -1), { ...run.current_attempt!, status: state, queued_reason: null, updated_at: NOW, started_at: run.current_attempt!.started_at ?? NOW }],
+      current_attempt: attempt,
+      current_error: null,
+      attempts: [...run.attempts.slice(0, -1), attempt],
       started_at: run.started_at ?? NOW,
+      finished_at: null,
       updated_at: NOW,
     });
     this.replaceRun(next);
@@ -878,8 +904,17 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
   }
 
   private makeProjectFixture(): ProjectV1 {
+    const project = structuredClone(CONTRACT_FIXTURE_V1.project);
+    const coreProjectId = this.fixtureCoreProjectId(project.project_id);
     return projectV1Schema.parse({
-      ...structuredClone(CONTRACT_FIXTURE_V1.project),
+      ...project,
+      remote: project.remote ? {
+        ...project.remote,
+        core_project_id: coreProjectId,
+        active_revision: project.remote.active_revision
+          ? { ...project.remote.active_revision, project_id: coreProjectId }
+          : null,
+      } : null,
       evolution: {
         targets: {
           text_memory: { enabled: true, method: "reference_text_memory", config: {} },
@@ -1125,9 +1160,10 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
 
   private addEquivalentQueuedRun(projectId: string): void {
     const project = this.requireProject(projectId);
+    const coreProjectId = this.requireCoreProjectId(project);
     const base = structuredClone(CONTRACT_FIXTURE_V1.run);
     const id = "run-equivalent-pending";
-    const revision = this.revision(this.currentGeneration(project), projectId);
+    const revision = this.revision(this.currentGeneration(project), coreProjectId);
     const queuedReason = { code: "admission_pending" as const, summary: "The original session is already queued.", retry_after_seconds: null };
     const attempt = {
       ...base.attempts[0],
@@ -1142,7 +1178,7 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
     const run = runV1Schema.parse({
       ...base,
       id,
-      project_id: projectId,
+      project_id: coreProjectId,
       status: "queued",
       queued_reason: queuedReason,
       current_attempt_id: attempt.id,
@@ -1162,7 +1198,7 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
     this.timelines[run.id] = [this.timeline(1, "admission", "pending", "Session admitted", "The original session is already queued.", run.id)];
   }
 
-  private revision(generation: number, projectId = this.projects[0]?.project_id ?? "project-fixture-1") {
+  private revision(generation: number, projectId = this.projects[0]?.remote?.core_project_id ?? "core-project-fixture-1") {
     return {
       id: `revision-fixture-${generation}`,
       project_id: projectId,
@@ -1173,6 +1209,15 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
 
   private currentGeneration(project: ProjectV1): number {
     return project.remote?.active_revision?.generation ?? 1;
+  }
+
+  private fixtureCoreProjectId(projectId: string): string {
+    return `core-${projectId}`;
+  }
+
+  private requireCoreProjectId(project: ProjectV1): string {
+    if (!project.remote) throw new Error("Project does not have a remote Core identity.");
+    return project.remote.core_project_id;
   }
 
   private requireProfile(profileId: string): RemoteProfileV1 {
@@ -1389,7 +1434,8 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
   useRunStateReviewScenario(): void {
     const project = this.projects[0];
     if (!project) return;
-    const pinned = this.revision(2, project.project_id);
+    const coreProjectId = this.requireCoreProjectId(project);
+    const pinned = this.revision(2, coreProjectId);
     const base = structuredClone(CONTRACT_FIXTURE_V1.run);
     const makeRun = (
       id: string,
@@ -1417,7 +1463,7 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
       return runV1Schema.parse({
         ...base,
         id,
-        project_id: project.project_id,
+        project_id: coreProjectId,
         status,
         queued_reason: queuedReason,
         current_attempt_id: attempt.id,
@@ -1449,14 +1495,15 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
   useAuthoritativeArtifactOrderingScenario(): void {
     const project = this.projects[0];
     if (!project) return;
+    const coreProjectId = this.requireCoreProjectId(project);
     const runId = "run-revision-4";
     const base = structuredClone(CONTRACT_FIXTURE_V1.run);
-    const pinned = this.revision(2, project.project_id);
+    const pinned = this.revision(2, coreProjectId);
     const attempt = { ...base.attempts[0], id: "attempt-revision-4", run_id: runId, status: "succeeded" as const, finished_at: NOW };
     const run = runV1Schema.parse({
       ...base,
       id: runId,
-      project_id: project.project_id,
+      project_id: coreProjectId,
       status: "succeeded",
       queued_reason: null,
       current_attempt_id: attempt.id,
@@ -1469,7 +1516,7 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
       finished_at: NOW,
     });
     this.runs = [run, ...this.runs];
-    this.projects = [projectV1Schema.parse({ ...project, remote: project.remote ? { ...project.remote, active_revision: this.revision(4, project.project_id) } : null }), ...this.projects.slice(1)];
+    this.projects = [projectV1Schema.parse({ ...project, remote: project.remote ? { ...project.remote, active_revision: this.revision(4, coreProjectId) } : null }), ...this.projects.slice(1)];
     this.createArtifacts(runId, 4);
     const times: Record<string, string> = {
       parametric_memory: "2026-07-14T12:04:00Z",
@@ -1487,6 +1534,7 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
         id: "artifact-selected-additional-memory",
         display_name: "Additional selected memory",
         summary: "Additional selected memory",
+        lineage: { ...source.lineage, source_artifact_ids: [source.id] },
         selected: true,
         created_at: "2026-07-14T12:02:00Z",
       });
@@ -1511,6 +1559,114 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
     if (!project) return;
     this.projects = [projectV1Schema.parse({ ...project, remote: project.remote ? { ...project.remote, status: "blocked", active_revision: null } : null }), ...this.projects.slice(1)];
     this.emit();
+  }
+
+  useRequiredRevisionIdentityConflict(): void {
+    const project = this.projects[0];
+    const activeRevision = project?.remote?.active_revision;
+    const base = this.runs[0];
+    if (!project || !activeRevision || !base?.current_attempt) return;
+    const conflictingRevision = { ...activeRevision, manifest_sha256: activeRevision.manifest_sha256 === B ? C : B };
+    const queuedReason = { code: "admission_pending" as const, summary: "Admission is being reconciled.", retry_after_seconds: null };
+    const attempt = {
+      ...base.current_attempt,
+      status: "queued" as const,
+      queued_reason: queuedReason,
+      updated_at: NOW,
+      started_at: null,
+      finished_at: null,
+      error: null,
+    };
+    this.runs = [runV1Schema.parse({
+      ...base,
+      status: "queued",
+      queued_reason: queuedReason,
+      current_attempt: attempt,
+      current_error: null,
+      pinned_revision: null,
+      required_revision: { revision: conflictingRevision, reachable_from_revision_id: conflictingRevision.id, relation: "active" },
+      revision_transition: null,
+      attempts: [...base.attempts.slice(0, -1), attempt],
+      admitted_at: null,
+      started_at: null,
+      finished_at: null,
+      updated_at: NOW,
+    })];
+  }
+
+  useTransitionPredecessorIdentityConflict(): void {
+    const project = this.projects[0];
+    const activeRevision = project?.remote?.active_revision;
+    const base = this.runs[0];
+    if (!project || !activeRevision || !base?.current_attempt) return;
+    const predecessor = { ...activeRevision, manifest_sha256: activeRevision.manifest_sha256 === B ? C : B };
+    const successor = this.revision(activeRevision.generation + 1, activeRevision.project_id);
+    const queuedReason = { code: "required_revision_uncommitted" as const, summary: "The required successor is still committing.", retry_after_seconds: 1 };
+    const attempt = {
+      ...base.current_attempt,
+      status: "queued" as const,
+      queued_reason: queuedReason,
+      updated_at: NOW,
+      started_at: null,
+      finished_at: null,
+      error: null,
+    };
+    this.runs = [runV1Schema.parse({
+      ...base,
+      status: "queued",
+      queued_reason: queuedReason,
+      current_attempt: attempt,
+      current_error: null,
+      pinned_revision: null,
+      required_revision: { revision: successor, reachable_from_revision_id: predecessor.id, relation: "successor" },
+      revision_transition: {
+        state: "committing",
+        predecessor_revision: predecessor,
+        successor_revision: successor,
+        progress_completed: 3,
+        progress_total: 4,
+        message: "The successor revision is being committed.",
+        error: null,
+        updated_at: NOW,
+      },
+      attempts: [...base.attempts.slice(0, -1), attempt],
+      admitted_at: null,
+      started_at: null,
+      finished_at: null,
+      updated_at: NOW,
+    })];
+  }
+
+  useArtifactMembershipIdentityConflict(): void {
+    const activeRevision = this.projects[0]?.remote?.active_revision;
+    if (!activeRevision) return;
+    const conflictingRevision = { ...activeRevision, manifest_sha256: activeRevision.manifest_sha256 === B ? C : B };
+    this.artifacts = this.artifacts.map((artifact) => artifact.membership_revisions.some((revision) => revision.id === activeRevision.id)
+      ? artifactV1Schema.parse({
+          ...artifact,
+          membership_revisions: artifact.membership_revisions.map((revision) => revision.id === activeRevision.id ? conflictingRevision : revision),
+        })
+      : artifact);
+  }
+
+  useCrossWiredArtifactPayloads(): void {
+    const selected = this.activeSelectedArtifacts();
+    const current = selected[0];
+    const other = selected[1];
+    const otherContent = other ? this.contents.get(other.id) : null;
+    const otherDiff = other ? this.diffs.get(other.id) : null;
+    if (!current || !otherContent || !otherDiff) return;
+    this.contents.set(current.id, structuredClone(otherContent));
+    this.diffs.set(current.id, structuredClone(otherDiff));
+  }
+
+  useMismatchedArtifactDiffPreviousIdentity(): void {
+    const selected = this.activeSelectedArtifacts();
+    const current = selected[0];
+    const wrongPrevious = this.artifacts.find((artifact) => artifact.id !== current?.id && artifact.target_id !== current?.target_id);
+    if (!current || !wrongPrevious) return;
+    const generation = this.projects[0]?.remote?.active_revision?.generation ?? 1;
+    this.diffs.set(current.id, this.makeDiff(current, wrongPrevious, generation));
   }
 
   failNextProjectSaveWithStatus(status: 412): void {
@@ -1582,6 +1738,17 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
 
   runStartAttempts(): number {
     return this.runAdmissionAttempts;
+  }
+
+  private activeSelectedArtifacts(): ArtifactV1[] {
+    const activeRevision = this.projects[0]?.remote?.active_revision;
+    if (!activeRevision) return [];
+    return this.artifacts
+      .filter((artifact) => artifact.selected && artifact.membership_revisions.some((revision) => revision.id === activeRevision.id))
+      .sort((left, right) => {
+        const time = Date.parse(right.created_at) - Date.parse(left.created_at);
+        return time || left.id.localeCompare(right.id);
+      });
   }
 
   addDraftProject(): ProjectV1 {

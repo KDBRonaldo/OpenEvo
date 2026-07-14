@@ -61,6 +61,7 @@ import { MethodConfigEditor, methodConfigErrors } from "./MethodConfigEditor";
 
 type ProductEvolutionTargets = ProjectV1["evolution"]["targets"];
 type EvolutionCapabilitiesV1 = ProjectCapabilitiesV1["capabilities"];
+type RevisionRefV1 = NonNullable<NonNullable<ProjectV1["remote"]>["active_revision"]>;
 
 type Workspace = "research" | "evolution" | "system";
 type AsyncState = "idle" | "working";
@@ -164,7 +165,8 @@ export function DesktopProductApp({
   const profile = project
     ? snapshot?.profiles.find((item) => item.profile_id === project.profile_id) ?? null
     : snapshot?.profiles[0] ?? null;
-  const projectRuns = stableRunOrder(snapshot?.runs.filter((run) => run.project_id === project?.project_id) ?? []);
+  const coreProjectId = project?.remote?.core_project_id ?? null;
+  const projectRuns = stableRunOrder(snapshot?.runs.filter((run) => run.project_id === coreProjectId) ?? []);
   const activeRun = projectRuns.find((run) => !isTerminal(run.status)) ?? null;
 
   const act = useCallback(async (action: () => Promise<unknown>, conflictRecovery: ActionRecovery = null, refreshOnUnknown = false): Promise<ActionAttemptResult> => {
@@ -319,7 +321,7 @@ export function DesktopProductApp({
             <EvolutionWorkspace
               project={project}
               runs={projectRuns}
-              artifacts={snapshot.artifacts.filter((artifact) => artifact.project_id === project?.project_id)}
+              artifacts={snapshot.artifacts.filter((artifact) => artifact.project_id === coreProjectId)}
               artifactCollection={snapshot.artifactCollection}
               provider={provider}
               onRefresh={() => void refresh()}
@@ -761,7 +763,7 @@ function RunOutcomeSummary({ run, onOpenEvolution, recovery }: { run: RunV1; onO
 function EvolutionWorkspace({ project, runs, artifacts, artifactCollection, provider, onRefresh }: { project: ProjectV1 | null; runs: readonly RunV1[]; artifacts: readonly ArtifactV1[]; artifactCollection: ProductArtifactCollectionState; provider: DesktopProductProvider; onRefresh: () => void }) {
   const activeRevision = project ? authoritativeActiveRevision(project, runs) : null;
   const orderedArtifacts = activeRevision && artifactCollection.status === "complete"
-    ? selectedArtifactsForRevision(artifacts, activeRevision.id)
+    ? selectedArtifactsForRevision(artifacts, activeRevision)
     : [];
   const [selectedArtifactId, setSelectedArtifactId] = useState<string | null>(orderedArtifacts[0]?.id ?? null);
   const [view, setView] = useState<"content" | "diff">("content");
@@ -779,19 +781,29 @@ function EvolutionWorkspace({ project, runs, artifacts, artifactCollection, prov
   }, [artifacts, selectedArtifactId]);
   useEffect(() => {
     if (!selectedArtifactId) return;
+    const selectedArtifact = orderedArtifacts.find((artifact) => artifact.id === selectedArtifactId);
+    if (!selectedArtifact) return;
     let active = true;
     setLoading(true);
     setError(null);
     setContent(null);
     setDiff(null);
-    const request = view === "content" ? provider.getArtifactContent(selectedArtifactId) : provider.getArtifactDiff(selectedArtifactId);
-    void request.then((result) => {
-      if (!active) return;
-      if (view === "content") setContent(result as ArtifactContentV1);
-      else setDiff(result as ArtifactDiffV1);
-    }).catch((reason) => active && setError(userMessage(reason))).finally(() => active && setLoading(false));
+    const load = async () => {
+      if (view === "content") {
+        const result = await provider.getArtifactContent(selectedArtifact.id);
+        const identityError = artifactContentIdentityError(selectedArtifact, result);
+        if (identityError) throw new DesktopProductUserError(identityError);
+        if (active) setContent(result);
+      } else {
+        const result = await provider.getArtifactDiff(selectedArtifact.id);
+        const identityError = artifactDiffIdentityError(selectedArtifact, result, artifacts);
+        if (identityError) throw new DesktopProductUserError(identityError);
+        if (active) setDiff(result);
+      }
+    };
+    void load().catch((reason) => active && setError(userMessage(reason))).finally(() => active && setLoading(false));
     return () => { active = false; };
-  }, [provider, selectedArtifactId, view]);
+  }, [artifacts, provider, selectedArtifactId, view]);
 
   if (!project) return <EmptyState icon={Sparkles} title="No evolution history" detail="Choose a project to inspect revisions and artifacts." />;
   const selected = orderedArtifacts.find((artifact) => artifact.id === selectedArtifactId) ?? null;
@@ -1403,9 +1415,11 @@ function matchingProfile(snapshot: DesktopProductSnapshot | null, canonicalPaylo
   return snapshot?.profiles.find((profile) => canonicalProfile(profile) === canonicalPayload) ?? null;
 }
 
-function selectedArtifactsForRevision(artifacts: readonly ArtifactV1[], revisionId: string): ArtifactV1[] {
+function selectedArtifactsForRevision(artifacts: readonly ArtifactV1[], revision: RevisionRefV1): ArtifactV1[] {
   return artifacts
-    .filter((artifact) => artifact.selected && artifact.membership_revisions.some((revision) => revision.id === revisionId))
+    .filter((artifact) => artifact.selected
+      && artifact.membership_revisions.some((member) => sameRevisionRef(member, revision))
+      && !artifactRevisionRefs(artifact).some((candidate) => candidate.id === revision.id && !sameRevisionRef(candidate, revision)))
     .sort((left, right) => {
       const time = Date.parse(right.created_at) - Date.parse(left.created_at);
       return time || left.id.localeCompare(right.id);
@@ -1418,13 +1432,57 @@ function currentGeneration(project: ProjectV1, runs: readonly RunV1[]): number |
 
 function authoritativeActiveRevision(project: ProjectV1, runs: readonly RunV1[]) {
   const active = project.remote?.active_revision ?? null;
-  if (!active) return null;
-  const matchingRunRefs = runs.flatMap((run) => [
-    ...(run.pinned_revision ? [run.pinned_revision] : []),
-    ...(run.revision_transition ? [run.revision_transition.successor_revision] : []),
-  ]).filter((revision) => revision.id === active.id);
-  if (matchingRunRefs.some((revision) => revision.generation !== active.generation || revision.manifest_sha256 !== active.manifest_sha256)) return null;
+  if (!active || active.project_id !== project.remote?.core_project_id) return null;
+  const matchingRunRefs = runs.flatMap(runRevisionRefs).filter((revision) => revision.id === active.id);
+  if (matchingRunRefs.some((revision) => !sameRevisionRef(revision, active))) return null;
   return active;
+}
+
+function runRevisionRefs(run: RunV1): RevisionRefV1[] {
+  return [
+    ...(run.pinned_revision ? [run.pinned_revision] : []),
+    run.required_revision.revision,
+    ...(run.revision_transition
+      ? [run.revision_transition.predecessor_revision, run.revision_transition.successor_revision]
+      : []),
+  ];
+}
+
+function artifactRevisionRefs(artifact: ArtifactV1): RevisionRefV1[] {
+  return [artifact.produced_revision, ...artifact.membership_revisions];
+}
+
+function sameRevisionRef(left: RevisionRefV1, right: RevisionRefV1): boolean {
+  return left.id === right.id
+    && left.project_id === right.project_id
+    && left.generation === right.generation
+    && left.manifest_sha256 === right.manifest_sha256;
+}
+
+function artifactContentIdentityError(artifact: ArtifactV1, content: ArtifactContentV1): string | null {
+  return content.artifact_id === artifact.id && content.artifact_type === artifact.artifact_type
+    ? null
+    : "Artifact content identity does not match the selected artifact. Refetch before viewing it.";
+}
+
+function artifactDiffIdentityError(artifact: ArtifactV1, diff: ArtifactDiffV1, artifacts: readonly ArtifactV1[]): string | null {
+  if (diff.artifact_id !== artifact.id || diff.artifact_content_sha256 !== artifact.content_sha256) {
+    return "Artifact change identity does not match the selected artifact. Refetch before viewing it.";
+  }
+  if (!artifact.lineage.source_artifact_ids.includes(diff.previous_artifact_id)) {
+    return "Artifact change history does not match the selected artifact. Refetch before viewing it.";
+  }
+  const previousMatches = artifacts.filter((candidate) => candidate.id === diff.previous_artifact_id);
+  if (previousMatches.length !== 1) {
+    return "Artifact change history could not be verified. Refetch before viewing it.";
+  }
+  const previous = previousMatches[0];
+  return previous.content_sha256 === diff.previous_artifact_content_sha256
+    && previous.project_id === artifact.project_id
+    && previous.target_id === artifact.target_id
+    && previous.artifact_type === artifact.artifact_type
+    ? null
+    : "Artifact change history does not match the selected artifact. Refetch before viewing it.";
 }
 
 function revisionLabel(project: ProjectV1 | null, runs: readonly RunV1[]): string {
@@ -1437,6 +1495,7 @@ function getStartReason(snapshot: DesktopProductSnapshot, project: ProjectV1 | n
   if (!project) return "Create or select a project first.";
   if (snapshot.stream.status !== "fresh") return "Refresh this view before starting a session.";
   if (!profile || snapshot.state.core.state !== "online" || !snapshot.state.core.active_tunnel || snapshot.state.core.profile_id !== profile.profile_id) return "Connect this project's remote workspace before starting a session.";
+  if (!project.remote) return "Activate this project on its assigned remote workspace before starting a session.";
   const active = snapshot.state.active_project;
   if (!active || active.project_id !== project.project_id || active.profile_id !== project.profile_id || active.project_etag !== project.etag || active.connection_state !== "ready") return "Activate this project on its assigned remote workspace before starting a session.";
   if (project.state !== "active") return "Activate this project before starting a session.";
@@ -1511,13 +1570,15 @@ function canReadmitRun(
   snapshot: DesktopProductSnapshot | null,
   projectId: string,
 ): boolean {
+  const coreProjectId = snapshot?.projects.find((project) => project.project_id === projectId)?.remote?.core_project_id;
   return error.http_status === 409
     && error.category === "run"
     && error.code === "run_admission_conflict"
     && error.retryable
     && error.repair_action === "openevo_can_retry"
     && snapshot?.stream.status === "fresh"
-    && !snapshot.runs.some((run) => run.project_id === projectId && !isTerminal(run.status));
+    && coreProjectId !== undefined
+    && !snapshot.runs.some((run) => run.project_id === coreProjectId && !isTerminal(run.status));
 }
 
 function requestPreconditionChanged(

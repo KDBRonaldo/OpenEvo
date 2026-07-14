@@ -87,14 +87,20 @@ route-appropriate intent. Drafts survive reloads and require confirmation
 before Escape, overlay, or close-button dismissal.
 
 Revision generation is shown only from the authoritative
-`ProjectV1.remote.active_revision`. Any matching run revision refs must agree
-with that identity. Artifact lists use selected artifacts whose
-`membership_revisions` include the active revision, without excluding any
-authoritative discriminated-union subtype, and sort them by `created_at` and
-then `id`. This includes `parametric_memory`; multiple selected members for one
-target remain visible. Content uses the artifact subtype plus
-`content_sha256`, while changes render the `ArtifactDiffV1.document_changes`
+`ProjectV1.remote.active_revision`. Core-owned runs and artifacts are associated
+through `ProjectV1.remote.core_project_id`, never the Desktop-local
+`project_id`. Matching pinned, required, predecessor, successor, produced, and
+membership revision refs must agree on the complete revision identity. Artifact
+lists use selected artifacts whose `membership_revisions` include that exact
+active revision, without excluding any authoritative discriminated-union
+subtype, and sort them by `created_at` and then `id`. This includes
+`parametric_memory`; multiple selected members for one target remain visible.
+Content is rendered only when its artifact ID and subtype match the selection.
+Changes additionally bind the current content digest and the complete known
+previous artifact identity before rendering the `ArtifactDiffV1.document_changes`
 union. The provider marks the collection complete only after all cursor pages
 have been aggregated. Partial collections and missing or conflicting revision
-evidence are shown as unknown with a refetch action rather than inferred from
-list order or a loaded run.
+or artifact evidence are shown as unknown/unavailable with a refetch action
+rather than inferred from list order or a loaded run. The simulator keeps its
+Desktop and Core project IDs different by default so product tests exercise the
+same ownership boundary as release responses.
