@@ -20,6 +20,7 @@ from pydantic import (
 
 from openevo.evolution.framework.capabilities import EvolutionCapabilitiesV1
 from openevo.evolution.framework.plan import ProjectEvolutionTargetMap
+from openevo.evolution.framework.profiles import ReleaseExecutionMode
 
 
 MAX_CANONICAL_JSON_BYTES = 256 * 1024
@@ -255,9 +256,7 @@ class HealthResponseV1(ContractModel):
     checked_at: UtcTimestamp
 
 
-class ExecutionMode(StrEnum):
-    CODEX_SUBSCRIPTION_TRANSCRIPT = "codex_subscription_transcript"
-    SELF_DEPLOYED = "self-deployed"
+ExecutionMode = ReleaseExecutionMode
 
 
 class CaptureMode(StrEnum):

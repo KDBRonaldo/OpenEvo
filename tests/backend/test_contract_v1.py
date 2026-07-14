@@ -12,6 +12,7 @@ from openevo.backend.contracts.v1.app import create_core_control_contract_app
 from openevo.backend.contracts.v1.models import (
     CapabilitiesResponseV1,
     EventEnvelopeV1,
+    ExecutionMode,
     ParametricMemoryArtifactSummaryV1,
     ProjectSpecV1,
     RevisionTransitionState,
@@ -20,6 +21,7 @@ from openevo.backend.contracts.v1.models import (
     SkillBundleContentV1,
 )
 from openevo.evolution.framework.capabilities import EvolutionCapabilitiesV1
+from openevo.evolution.framework.profiles import ReleaseExecutionMode
 from openevo.backend.contracts.v1.snapshots import (
     EVENTS_SCHEMA_SNAPSHOT_PATH,
     OPENAPI_SNAPSHOT_PATH,
@@ -121,7 +123,7 @@ def test_openapi_snapshot_is_exactly_rebuildable() -> None:
     rebuilt = canonical_json_bytes(build_openapi_document())
     assert OPENAPI_SNAPSHOT_PATH.read_bytes() == rebuilt
     assert hashlib.sha256(rebuilt).hexdigest() == openapi_sha256()
-    assert openapi_sha256() == ("6e23280c7b32c078777006f7381dc14815cd673fd317571e4c6cccd0dfbdc4c5")
+    assert openapi_sha256() == ("558f281985d85228ec700b17b2073a6b999d4a273fb0e507bf6f93bb8076edf2")
 
 
 def test_event_schema_snapshot_is_exactly_rebuildable() -> None:
@@ -129,7 +131,7 @@ def test_event_schema_snapshot_is_exactly_rebuildable() -> None:
     assert EVENTS_SCHEMA_SNAPSHOT_PATH.read_bytes() == rebuilt
     assert hashlib.sha256(rebuilt).hexdigest() == events_schema_sha256()
     assert events_schema_sha256() == (
-        "f8b81b535450349e45c9625eb9cde45101722ec43ff8d40ce3cfb19f0c355532"
+        "1ebe99024aa3fa99683e6035b1ad93da62a912f7b8384b46b3a5ba80761eb947"
     )
 
 
@@ -179,6 +181,7 @@ def test_core_routes_declare_bearer_security_and_mutation_headers() -> None:
 
 
 def test_capability_request_is_bound_only_by_the_release_execution_mode() -> None:
+    assert ExecutionMode is ReleaseExecutionMode
     operation = build_openapi_document()["paths"]["/v1/capabilities"]["get"]
     query_parameters = {
         parameter["name"] for parameter in operation["parameters"] if parameter["in"] == "query"
