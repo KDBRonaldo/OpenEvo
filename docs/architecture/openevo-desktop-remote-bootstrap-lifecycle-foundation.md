@@ -111,9 +111,14 @@ actionable report instead of enabling an unauthenticated package path.
 
 Subscription-mode Codex auth is checked on the remote host during preflight and
 bootstrap. At gateway runtime initialization, the host `~/.codex/auth.json` is
-copied into the per-session bind mount under the runtime `CODEX_HOME`, defaulting
-to `/openevo/session/.codex`. Users should not need to log in inside the managed
-runtime container.
+verified as a private user-owned, link-count-one regular file and copied through
+a stable no-follow descriptor into the per-session bind mount. Managed Science
+uses `HOME=/openevo/session/home` and
+`CODEX_HOME=/openevo/session/home/.codex`; the pinned Codex install remains on
+`PATH` at `/home/openevo/.local/bin`. Users should not need to log in inside the
+managed runtime container. Custom-image subscription projects fail validation
+because image-user permission compatibility cannot safely stage this
+credential.
 
 ## Execution Semantics
 

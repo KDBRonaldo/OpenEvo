@@ -24,6 +24,12 @@ from openevo.gateway.dispatcher import (
     SessionStage,
 )
 from openevo.gateway.session import SessionRegistry
+from openevo.gateway.session_files import (
+    SessionFileSecurityError,
+    capture_session_root_identity,
+    remove_session_tree,
+    stage_codex_subscription_auth,
+)
 from openevo.gateway.storage import SessionStore
 from openevo.harness.capture import transcript_capture_enabled
 from openevo.harness.base import BaseHarness
@@ -548,6 +554,7 @@ class GatewayNodeManager:
             )
 
         session_dir: Path | None = None
+        session_root_identity: tuple[int, int, int] | None = None
         try:
             info = self.session_registry.register(
                 session_id,
@@ -574,19 +581,25 @@ class GatewayNodeManager:
             artifacts_dir = session_dir / "artifacts"
             artifacts_dir.mkdir()
             (session_dir / "logs" / "agent").mkdir(parents=True, exist_ok=True)
+            session_root_identity = capture_session_root_identity(session_dir)
             await self._dispatcher.enqueue(
                 ManagedSession(
                     request=request,
                     timer=timer,
                     session_dir=session_dir,
                     artifacts_dir=artifacts_dir,
+                    session_root_identity=session_root_identity,
                 )
             )
         except Exception:
             self.storage.delete_session(session_id)
             self.session_registry.remove(session_id)
             if session_dir is not None:
-                await self._remove_session_dir_best_effort(session_dir, session_id)
+                await self._remove_session_dir_best_effort(
+                    session_dir,
+                    session_id,
+                    session_root_identity,
+                )
             raise
 
     async def cancel(self, session_id: str) -> bool:
@@ -619,7 +632,18 @@ class GatewayNodeManager:
         managed.timer.mark("init", "started")
         try:
             runtime_spec = self._resolve_runtime_spec(request)
-            self._stage_codex_subscription_auth(request, managed.session_dir)
+            if _is_codex_subscription_agent(request.agent) and (
+                runtime_spec.container_user != "host"
+            ):
+                raise RuntimeError(
+                    "Codex subscription credentials require a host-user runtime; "
+                    "choose a managed Science environment or use self-deployed execution"
+                )
+            self._stage_codex_subscription_auth(
+                request,
+                managed.session_dir,
+                managed.session_root_identity,
+            )
             runtime = create_runtime(runtime_spec, request.session_id, managed.session_dir)
             managed.runtime = runtime
             await self._await_with_budget(runtime.start(), managed)
@@ -653,6 +677,7 @@ class GatewayNodeManager:
         self,
         request: SessionDispatchRequest,
         session_dir: Path,
+        session_root_identity: tuple[int, int, int] | None = None,
     ) -> None:
         if not _is_codex_subscription_agent(request.agent):
             return
@@ -668,17 +693,17 @@ class GatewayNodeManager:
                 f"{RUNTIME_SESSION_DIR} so the runtime can receive auth.json"
             )
 
-        source = Path.home() / ".codex" / "auth.json"
-        if not source.is_file():
-            raise RuntimeError(
-                "Codex subscription auth was not found at ~/.codex/auth.json"
+        identity = session_root_identity or capture_session_root_identity(session_dir)
+        relative_home = target_home.relative_to(session_dir)
+        try:
+            stage_codex_subscription_auth(
+                source=Path.home() / ".codex" / "auth.json",
+                session_dir=session_dir,
+                session_identity=identity,
+                target_home_parts=relative_home.parts,
             )
-
-        target_home.mkdir(parents=True, exist_ok=True)
-        target_home.chmod(0o700)
-        target = target_home / "auth.json"
-        shutil.copyfile(source, target)
-        target.chmod(0o600)
+        except SessionFileSecurityError as exc:
+            raise RuntimeError(str(exc)) from exc
 
     async def _run_runtime_prepare(
         self,
@@ -1063,7 +1088,11 @@ class GatewayNodeManager:
                 # status/task_id visible for debugging via the polling endpoint.
                 self.session_registry.clear_result_payload(request.session_id)
         finally:
-            await self._remove_session_dir_best_effort(managed.session_dir, request.session_id)
+            await self._remove_session_dir_best_effort(
+                managed.session_dir,
+                request.session_id,
+                managed.session_root_identity,
+            )
 
     async def _build_session_result(self, managed: ManagedSession) -> SessionResult:
         request = managed.request
@@ -1517,9 +1546,11 @@ class GatewayNodeManager:
         self,
         session_dir: Path,
         session_id: str,
+        session_root_identity: tuple[int, int, int] | None = None,
     ) -> None:
         try:
-            await asyncio.to_thread(shutil.rmtree, session_dir)
+            identity = session_root_identity or capture_session_root_identity(session_dir)
+            await asyncio.to_thread(remove_session_tree, session_dir, identity)
         except FileNotFoundError:
             return
         except Exception:

@@ -236,6 +236,15 @@ class ScienceProjectConfig(_StrictModel):
 
     @model_validator(mode="after")
     def _validate_execution_evolution_compatibility(self) -> ScienceProjectConfig:
+        if (
+            self.environment.profile == "custom_image"
+            and self.execution.mode == "codex_subscription_transcript"
+        ):
+            raise ValueError(
+                "Codex subscription is not supported with environment.profile="
+                "'custom_image' because OpenEvo cannot safely stage credentials for "
+                "an image-defined user; choose a managed environment or self-deployed execution"
+            )
         parametric_memory = self.evolution.targets.get("parametric_memory")
         if parametric_memory is not None and parametric_memory.enabled:
             raise ValueError(

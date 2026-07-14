@@ -64,6 +64,7 @@ class ManagedSession:
     timer: StageTimer
     session_dir: Path
     artifacts_dir: Path
+    session_root_identity: tuple[int, int, int] | None = None
     runtime: BaseRuntime | None = None
     agent_result: AgentRunResult | None = None
     final_result: SessionResult | None = None

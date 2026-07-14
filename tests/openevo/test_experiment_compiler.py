@@ -186,6 +186,8 @@ def _config(**overrides: object) -> ExperimentConfig:
         ],
     }
     payload.update(overrides)
+    if payload["agent"].get("auth") in {"subscription", "chatgpt_subscription"}:
+        payload["runtime"].setdefault("container_user", "host")
     return ExperimentConfig.model_validate(payload)
 
 

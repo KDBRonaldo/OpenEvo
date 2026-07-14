@@ -61,6 +61,21 @@ def test_minimal_project_defaults_to_science_subscription_transcript() -> None:
     }
 
 
+def test_custom_image_rejects_codex_subscription_with_actionable_error() -> None:
+    payload = _minimal_payload() | {
+        "environment": {
+            "profile": "custom_image",
+            "custom_image": "ghcr.io/example/science:latest",
+        }
+    }
+
+    with pytest.raises(
+        ValidationError,
+        match="Codex subscription is not supported.*custom_image.*managed environment",
+    ):
+        ScienceProjectConfig.model_validate(payload)
+
+
 def test_managed_local_inference_requires_hf_model() -> None:
     payload = _minimal_payload() | {
         "execution": {"mode": "codex_managed_local_inference"}

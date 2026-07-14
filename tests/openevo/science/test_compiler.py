@@ -67,13 +67,27 @@ def test_subscription_project_compiles_to_transcript_experiment_config() -> None
         "auth_mode": "subscription",
         "capture_mode": "transcript",
     }
+    assert compiled.agent.env == {
+        "CODEX_HOME": "/openevo/session/home/.codex",
+    }
     assert compiled.runtime.image == MANAGED_RUNTIME_IMAGES["managed_science"]
     assert compiled.runtime.workdir == "/openevo/session/workspace"
     assert compiled.runtime.container_user == "host"
+    assert compiled.runtime.env == {
+        "HOME": "/openevo/session/home",
+        "PATH": (
+            "/home/openevo/.local/bin:/usr/local/sbin:/usr/local/bin:"
+            "/usr/sbin:/usr/bin:/sbin:/bin"
+        ),
+    }
     assert [action.model_dump(mode="json") for action in compiled.runtime.prepare] == [
         {
             "type": "exec",
-            "command": "mkdir -p /openevo/session/workspace",
+            "command": (
+                "mkdir -p /openevo/session/home/.codex "
+                "/openevo/session/workspace && chmod 700 "
+                "/openevo/session/home /openevo/session/home/.codex"
+            ),
             "cwd": None,
             "env": None,
             "source": None,
@@ -129,7 +143,13 @@ def test_local_inference_compiles_to_transcript_proxy_auth_and_hf_model_metadata
     assert compiled.runtime.env == {
         "SCIENCE_DATASET": "folding",
         "OPENEVO_MANAGED_HF_MODEL": "Qwen/Qwen3-Coder-30B-A3B-Instruct",
+        "HOME": "/openevo/session/home",
+        "PATH": (
+            "/home/openevo/.local/bin:/usr/local/sbin:/usr/local/bin:"
+            "/usr/sbin:/usr/bin:/sbin:/bin"
+        ),
     }
+    assert compiled.agent.env["CODEX_HOME"] == "/openevo/session/home/.codex"
     assert compiled.runtime.container_user == "host"
     assert compiled.tasks[0].metadata["openevo"]["execution_mode"] == (
         "self-deployed"
@@ -143,12 +163,17 @@ def test_custom_runtime_image_does_not_override_the_image_user() -> None:
             environment={
                 "profile": "custom_image",
                 "custom_image": "ghcr.io/example/science:latest",
-            }
+            },
+            execution={"mode": "self-deployed", "hf_model": "Qwen/Qwen3-8B"},
         )
     )
 
     assert compiled.runtime.image == "ghcr.io/example/science:latest"
     assert compiled.runtime.container_user == "image"
+    assert "HOME" not in compiled.runtime.env
+    assert "PATH" not in compiled.runtime.env
+    assert compiled.agent.env == {}
+    assert compiled.runtime.prepare[0].command == "mkdir -p /openevo/session/workspace"
 
 
 def test_science_compiler_preserves_generic_targets_without_loss() -> None:
@@ -304,7 +329,8 @@ def test_custom_image_profile_controls_runtime_image() -> None:
             environment={
                 "profile": "custom_image",
                 "custom_image": "ghcr.io/example/science:latest",
-            }
+            },
+            execution={"mode": "self-deployed", "hf_model": "Qwen/Qwen3-8B"},
         )
     )
 
@@ -330,7 +356,11 @@ def test_scratch_source_has_no_workspace_and_keeps_runtime_and_setup_commands() 
     assert [action.model_dump(mode="json") for action in compiled.runtime.prepare] == [
         {
             "type": "exec",
-            "command": "mkdir -p /openevo/session/workspace",
+            "command": (
+                "mkdir -p /openevo/session/home/.codex "
+                "/openevo/session/workspace && chmod 700 "
+                "/openevo/session/home /openevo/session/home/.codex"
+            ),
             "cwd": None,
             "env": None,
             "source": None,
@@ -364,7 +394,11 @@ def test_experiment_compiler_uploads_workspace_before_science_prepare_actions() 
             "type": "exec",
             "source": None,
             "target": None,
-            "command": "mkdir -p /openevo/session/workspace",
+            "command": (
+                "mkdir -p /openevo/session/home/.codex "
+                "/openevo/session/workspace && chmod 700 "
+                "/openevo/session/home /openevo/session/home/.codex"
+            ),
             "cwd": None,
             "env": None,
         },

@@ -54,6 +54,22 @@ statuses are `COMPLETED`, `ERROR`, or `TIMEOUT`.
 - `completion_writer.py`: background task that persists completions to disk off
   the hot path.
 
+## Subscription credentials and session cleanup
+
+Codex subscription sessions are admitted only with a host-user runtime. The
+gateway opens the remote user's `~/.codex/auth.json` with `O_NOFOLLOW` and a
+stable descriptor, then requires a user-owned, link-count-one regular file with
+private permissions and a bounded size. It creates the session copy exclusively
+as `0600` under private `0700` directories and copies from the verified source
+descriptor. Source or destination pathname replacement aborts staging without
+publishing the credential or logging its contents.
+
+The session root is pinned by device, inode, and owner before runtime startup.
+Teardown walks only from that descriptor, never follows links, restores only
+owner access needed to enter `000` directories, and enforces depth and node
+limits. A replaced root, changed nested entry, or foreign-owned object stops
+cleanup without deleting the replacement.
+
 ## What it captures
 
 Each proxied call is stored as a `CompletionRecord` that keeps both the agent's

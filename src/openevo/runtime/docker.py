@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import shlex
 from pathlib import Path
 
 from openevo.runtime.base import BaseRuntime
@@ -21,7 +22,9 @@ class DockerRuntime(BaseRuntime):
         # fresh evaluator runtimes, avoiding collisions with the agent runtime.
         safe_name = session_id.replace("/", "-")[:55]
         self._container_name = f"openevo-{safe_name}"
-        self._chmod_needed: bool | None = None
+        self._chmod_needed: bool | None = (
+            False if spec.container_user == "host" else None
+        )
 
     @property
     def runtime_id(self) -> str:
@@ -100,7 +103,7 @@ class DockerRuntime(BaseRuntime):
         self._destroyed = True
         # chmod is best-effort so the host can reclaim bind-mounted files.
         # Skip when UIDs match (no permission mismatch to resolve).
-        if self._chmod_needed is not False:
+        if self.spec.container_user != "host" and self._chmod_needed is not False:
             try:
                 await self._run_local_command(
                     "docker", "exec", "--user", "root",
@@ -147,12 +150,20 @@ class DockerRuntime(BaseRuntime):
         timeout_sec: float | None = None,
     ) -> ExecResult:
         args = ["docker", "exec"]
+        effective_env = {**self.spec.env, **(env or {})}
         effective_workdir = cwd or self.spec.workdir or self.runtime_session_dir
         if effective_workdir:
             args.extend(["-w", effective_workdir])
-        for key, value in (env or {}).items():
+        for key, value in effective_env.items():
             args.extend(["-e", f"{key}={value}"])
-        args.extend([self._container_name, "bash", "-lc", command])
+        shell_exports = []
+        for key in ("HOME", "PATH"):
+            if key in effective_env:
+                shell_exports.append(
+                    f"export {key}={shlex.quote(str(effective_env[key]))};"
+                )
+        wrapped_command = " ".join([*shell_exports, command])
+        args.extend([self._container_name, "bash", "-lc", wrapped_command])
         rc, stdout, stderr = await self._run_local_command(
             *args, timeout=timeout_sec, capture=True
         )

@@ -68,4 +68,21 @@ OpenEvo-managed Science profiles use `host`; user-supplied custom images keep
 `image`. This distinction is required for Codex subscription sessions because
 the per-session `auth.json` remains a host-owned `0600` file. It is not a
 general compatibility promise that arbitrary images can run under a replaced
-user identity.
+user identity. Subscription agents are rejected unless the runtime uses
+`container_user: host`; in particular, Science `custom_image` cannot be paired
+with Codex subscription execution.
+
+Managed Science compiles `HOME=/openevo/session/home` and keeps
+`/home/openevo/.local/bin` first in `PATH`, where the managed image installs the
+pinned Codex binary. `CODEX_HOME` is
+`/openevo/session/home/.codex`. Docker merges `RuntimeSpec.env` into every exec,
+including harness setup, so arbitrary host UIDs can write Codex state and copy
+evolution skills to `$HOME/.agents/skills` without changing image-owned
+`/home/openevo`.
+
+Host-user startup, upload, stop, and failed-start cleanup never invoke the
+legacy recursive `a+rwX` compatibility path. Gateway teardown instead pins the
+session root device/inode/owner at dispatch, restores only owner directory
+permissions through stable descriptors, and removes a bounded no-follow tree.
+An owner or identity mismatch fails closed rather than acting on a replacement
+path.

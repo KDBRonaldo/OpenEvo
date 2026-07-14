@@ -60,7 +60,10 @@ Science environment profiles compile to runtime images:
 | `custom_image` | developer-supplied override |
 
 `custom_image` is an escape hatch for developers and advanced experiments. It is
-not the default user path.
+not the default user path. It retains the image-declared user and therefore
+cannot be combined with `codex_subscription_transcript`; project validation
+returns an actionable error directing the user to a managed environment or
+self-deployed execution before compilation or runtime startup.
 
 For managed profiles, users do not upload or choose a runtime image in Desktop.
 Remote bootstrap first attempts to pull the managed image. If that image is not
@@ -80,13 +83,22 @@ verification.
 data for text evolution and explicitly has no token-level metrics.
 Remote preflight checks that the remote user has `codex` and
 `~/.codex/auth.json`. During each gateway runtime session, that host auth file
-is staged into the container-visible `CODEX_HOME` under `/openevo/session`, so the
-user does not need to log in again inside the managed runtime image.
-The staged directory and file are forced to `0700` and `0600`. Managed Science
-containers run with the remote Core process UID/GID, so the bind mount remains
-writable without applying a recursive world-readable/world-writable permission
-fallback. Custom images retain their image-declared user and are not allowed to
-change this managed credential ownership rule implicitly.
+is staged into `/openevo/session/home/.codex/auth.json`, the managed runtime's
+container-visible `CODEX_HOME`, so the user does not need to log in again.
+The source must be a private, remote-user-owned, link-count-one regular file of
+bounded size; symlinks, hard links, special files, owner mismatches, and path
+replacement are rejected. The gateway copies from a verified no-follow file
+descriptor into an exclusive `0600` target under `0700` directories and never
+logs credential contents.
+
+Managed containers use the Core process UID/GID with
+`HOME=/openevo/session/home`. The managed `PATH` still begins with
+`/home/openevo/.local/bin`, which contains the pinned Codex binary, while Codex
+state and evolution skills remain on the writable session bind mount. No
+host-user lifecycle path applies recursive `a+rwX`. Teardown uses the
+dispatch-pinned session root identity and a bounded fd-relative no-follow walk,
+so nested `000` directories converge without following symlinks; owner or root
+identity replacement fails closed.
 
 `self-deployed` uses proxy authentication and requires `execution.hf_model`.
 The legacy config value `codex_managed_local_inference` remains accepted as an

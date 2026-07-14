@@ -266,6 +266,14 @@ class ExperimentConfig(_StrictModel):
         if len(task_ids) != len(set(task_ids)):
             raise ValueError("tasks[].id values must be unique")
         if (
+            self.agent.auth in _SUBSCRIPTION_AUTH_MODES
+            and self.runtime.container_user != "host"
+        ):
+            raise ValueError(
+                "subscription credentials require runtime.container_user='host'; "
+                "image-user runtimes may widen bind-mount permissions"
+            )
+        if (
             self.evolution.targets.get(
                 "parametric_memory",
                 ProjectEvolutionTargetSelection(enabled=False),

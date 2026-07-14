@@ -578,7 +578,8 @@ def test_custom_runtime_bootstrap_remains_pull_only() -> None:
             environment={
                 "profile": "custom_image",
                 "custom_image": "ghcr.io/example/science:latest",
-            }
+            },
+            execution={"mode": "self-deployed", "hf_model": "Qwen/Qwen3-8B"},
         ),
         _profile(),
     )

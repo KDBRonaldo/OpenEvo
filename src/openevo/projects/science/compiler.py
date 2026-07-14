@@ -14,6 +14,12 @@ MANAGED_RUNTIME_IMAGES = {
 }
 
 _WORKDIR = "/openevo/session/workspace"
+_MANAGED_HOME = "/openevo/session/home"
+_MANAGED_CODEX_HOME = f"{_MANAGED_HOME}/.codex"
+_MANAGED_PATH = (
+    "/home/openevo/.local/bin:/usr/local/sbin:/usr/local/bin:"
+    "/usr/sbin:/usr/bin:/sbin:/bin"
+)
 
 
 @dataclass(frozen=True)
@@ -52,6 +58,11 @@ def compile_science_project(
 
 
 def _agent_payload(project: ScienceProjectConfig) -> dict[str, Any]:
+    managed_env = (
+        {"CODEX_HOME": _MANAGED_CODEX_HOME}
+        if project.environment.profile != "custom_image"
+        else {}
+    )
     if project.execution.mode == "codex_subscription_transcript":
         return {
             "preset": "codex",
@@ -61,6 +72,7 @@ def _agent_payload(project: ScienceProjectConfig) -> dict[str, Any]:
                 "auth_mode": "subscription",
                 "capture_mode": "transcript",
             },
+            "env": managed_env,
         }
 
     return {
@@ -72,6 +84,7 @@ def _agent_payload(project: ScienceProjectConfig) -> dict[str, Any]:
             "auth_mode": "proxy",
             "capture_mode": "transcript",
         },
+        "env": managed_env,
     }
 
 
@@ -79,6 +92,8 @@ def _runtime_payload(project: ScienceProjectConfig) -> dict[str, Any]:
     env = dict(project.environment.env)
     if project.execution.mode == "self-deployed":
         env["OPENEVO_MANAGED_HF_MODEL"] = str(project.execution.hf_model)
+    if project.environment.profile != "custom_image":
+        env.update({"HOME": _MANAGED_HOME, "PATH": _MANAGED_PATH})
 
     return {
         "image": _runtime_image(project),
@@ -90,7 +105,7 @@ def _runtime_payload(project: ScienceProjectConfig) -> dict[str, Any]:
         "prepare": [
             {
                 "type": "exec",
-                "command": f"mkdir -p {_WORKDIR}",
+                "command": _runtime_directory_prepare_command(project),
             },
             *[
                 {
@@ -102,6 +117,15 @@ def _runtime_payload(project: ScienceProjectConfig) -> dict[str, Any]:
             ],
         ],
     }
+
+
+def _runtime_directory_prepare_command(project: ScienceProjectConfig) -> str:
+    if project.environment.profile == "custom_image":
+        return f"mkdir -p {_WORKDIR}"
+    return (
+        f"mkdir -p {_MANAGED_HOME}/.codex {_WORKDIR} && "
+        f"chmod 700 {_MANAGED_HOME} {_MANAGED_HOME}/.codex"
+    )
 
 
 def _runtime_image(project: ScienceProjectConfig) -> str:

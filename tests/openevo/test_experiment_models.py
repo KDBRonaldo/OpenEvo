@@ -152,10 +152,27 @@ def test_subscription_agents_accept_transcript_capture_aliases(capture_mode: str
         "auth": "subscription",
         "settings": {"capture_mode": capture_mode},
     }
+    payload["runtime"]["container_user"] = "host"
 
     config = ExperimentConfig.model_validate(payload)
 
     assert config.agent.settings["capture_mode"] == capture_mode
+
+
+def test_subscription_agent_rejects_image_user_runtime() -> None:
+    payload = _minimal_payload()
+    payload["agent"] = {
+        "preset": "codex",
+        "model": "gpt-5.1-codex-mini",
+        "auth": "subscription",
+        "settings": {"capture_mode": "transcript"},
+    }
+
+    with pytest.raises(
+        ValidationError,
+        match="subscription credentials require runtime.container_user='host'",
+    ):
+        ExperimentConfig.model_validate(payload)
 
 
 def test_subscription_agents_cannot_enable_parametric_memory() -> None:
@@ -166,6 +183,7 @@ def test_subscription_agents_cannot_enable_parametric_memory() -> None:
         "auth": "subscription",
         "settings": {"capture_mode": "transcript"},
     }
+    payload["runtime"]["container_user"] = "host"
     payload["evolution"] = {
         "targets": {
             "parametric_memory": {

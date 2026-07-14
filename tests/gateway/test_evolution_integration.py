@@ -23,6 +23,7 @@ from openevo.gateway.node import (
     write_evolution_context_files,
 )
 from openevo.gateway.session import SessionRegistry
+from openevo.gateway.session_files import capture_session_root_identity
 from openevo.rollout.models import (
     SessionDispatchRequest,
     SessionResult,
@@ -200,6 +201,47 @@ def test_codex_subscription_auth_staging_reports_missing_host_login(
     manager = GatewayNodeManager.__new__(GatewayNodeManager)
     with pytest.raises(RuntimeError, match="Codex subscription auth was not found"):
         manager._stage_codex_subscription_auth(request, session_dir)
+
+
+@pytest.mark.asyncio
+async def test_gateway_rejects_subscription_before_image_user_runtime_or_auth_staging(
+    tmp_path: Path,
+) -> None:
+    session_dir = tmp_path / "session"
+    session_dir.mkdir()
+    request = SessionDispatchRequest(
+        session_id="session_1",
+        task_id="task_1",
+        instruction="Do work.",
+        remaining_timeout_seconds=60,
+        runtime=RuntimeSpec(image="custom:latest", container_user="image"),
+        agent=AgentSpec(
+            harness="codex",
+            model_name="gpt-5.5",
+            settings={"auth_mode": "subscription", "capture_mode": "transcript"},
+        ),
+        metadata={},
+    )
+    managed = ManagedSession(
+        request=request,
+        timer=StageTimer(),
+        session_dir=session_dir,
+        artifacts_dir=session_dir / "artifacts",
+        session_root_identity=capture_session_root_identity(session_dir),
+    )
+    manager = GatewayNodeManager.__new__(GatewayNodeManager)
+    manager.node_id = "gateway-test"
+    manager.default_runtime = None
+
+    await manager._handle_init(managed)
+
+    assert managed.runtime is None
+    assert managed.final_result is not None
+    assert managed.final_result.status == SessionStatus.ERROR
+    assert "subscription credentials require a host-user runtime" in (
+        managed.final_result.error or ""
+    )
+    assert not (session_dir / ".codex").exists()
 
 
 def _session_result(
@@ -404,7 +446,7 @@ def _postrun_manager(
         calls.append("callback_push")
         return True
 
-    async def remove_session_dir(session_dir, session_id):
+    async def remove_session_dir(session_dir, session_id, session_root_identity=None):
         calls.append("remove_session_dir")
 
     manager._run_postrun_steps = run_postrun_steps
