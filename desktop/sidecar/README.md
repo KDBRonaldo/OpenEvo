@@ -269,16 +269,38 @@ reserved, it symmetrically excludes new work on the active project and any
 competing activation. The store checks the same exclusion again in the atomic
 activation completion transaction, excluding only that activation's own
 reservation, so an authority conflict cannot be hidden by an earlier start-time
-ETag check. Activation success atomically records the active project, the Core
-revision identity, and the matching project result; other project operations do
-not invent a project result. A typed failure keeps the project draft and is
-replayable without repeating remote work. Startup cancels every nonterminal
+ETag check. Activation success requires a complete ready
+`RemoteProjectStateV1` and atomically records the active project, its matching
+Core revision, the canonical remote projection, the terminal operation, and its
+idempotency replay. Other project operations cannot publish remote state or
+invent a project result. The remote projection is a durable observation carrying
+Core's `observed_at`, not proof that the SSH tunnel or Core remains live. Startup
+therefore preserves it as history while resetting local active/current-revision
+runtime authority under the existing recovery rule. Ordinary demote/archive
+transitions also preserve that observation, while any project intent patch
+clears both the remote projection and revision because they describe the
+previous intent.
+
+Project intent remains editable after activation so the UI can activate once to
+obtain remote capabilities, edit evolution configuration, and activate again.
+When no project operation is queued, running, or cancelling, patch commits the
+new `ProjectCreateV1` document, demotes local `active` or `blocked` state to
+`draft`, clears revision/remote state, and advances the project ETag exactly once
+in one transaction. A busy project still rejects patch. The saved draft must be
+reactivated before any prior remote projection can be used.
+
+A typed failure keeps the project draft and is replayable without repeating
+remote work. Startup cancels every nonterminal
 reservation exactly once and updates the replay in the same recovery
 transaction, releasing all direct and implicit activation exclusions before
 new work is accepted. The release provider/controller is responsible for
 putting these reservations on its bounded executor and for translating Core
 outcomes; it must not perform external SSH/Core work while a SQLite transaction
 is open.
+
+`pending_operation_ids()` exposes only queued, running, and cancelling operation
+IDs in stable identity order, with the same recovery-row upper bound, for
+assembling `DesktopStateV1` without an unbounded query.
 
 The production credential resolver currently supports `ssh_agent`. Profiles
 that select native private-key or password authentication fail closed with

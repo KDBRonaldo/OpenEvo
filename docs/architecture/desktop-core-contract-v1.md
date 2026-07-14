@@ -153,8 +153,13 @@ same OS user: such a process can race pathname checks or modify owner-readable
 state. Desktop relies on the macOS user-account boundary and the owner-only
 state directory for that threat boundary.
 
-Schema v2 has an exact canonical `sqlite_schema` fingerprint and migrates the
-canonical v1 layout transactionally. Startup performs a database-size-bounded
+Schema v3 has an exact canonical `sqlite_schema` fingerprint. Fresh stores are
+created directly in canonical v3; canonical v1 stores pass exact v1 validation
+before transactional v1 -> v2 -> v3 migration, and canonical v2 stores pass
+exact v2 schema and ledger validation before v2 -> v3 migration. Every DDL,
+ledger, project-copy, and `user_version` change is in the same crash transaction.
+Forged ledgers, near-match historical schemas, and partial migrations fail
+closed. Startup performs a database-size-bounded
 `integrity_check(1)`, `foreign_key_check`, bounded row and byte accounting, and
 complete validation of migration, resource, operation, cursor, canonical
 JSON/blob, duplicated scalar, timestamp, version, and typed idempotency rows.
@@ -164,10 +169,27 @@ before schema or resource writes and are checked again before commit, so a
 budget rejection rolls the transaction back rather than reporting failure after
 a successful commit.
 
+The v3 project row stores `RemoteProjectStateV1` canonical JSON in a nullable
+private BLOB separate from the canonical `ProjectCreateV1` intent document.
+Activation accepts only a ready projection whose active revision project matches
+its Core-owned `core_project_id` and whose revision ID matches the local
+`current_revision_id`; Local and Core project IDs remain distinct identities.
+Activation demotion, target publication, terminal operation result, and
+idempotency replay commit in one SQLite transaction. Non-activation completions
+cannot publish a remote projection.
+
 Startup atomically recovers process-owned transient state: remote profiles
-become disconnected, active project sessions return to draft with stale
+become disconnected, active project sessions return to draft with stale local
 revision pins cleared, and interrupted or now-stale local operations are
-cancelled against that authoritative resource state. Action idempotency stores
+cancelled against that authoritative resource state. The remote project value
+is retained with its `observed_at` as a historical observation, but is not live
+tunnel/Core authority; after local runtime reset it cannot authorize a run or
+revision use. Ordinary demote/archive transitions preserve the same history.
+Any project intent patch clears both revision and remote state, and demotes
+`active`/`blocked` to `draft`, in the same single-version ETag update. This lets
+Desktop activate to obtain capabilities, save edited evolution intent, and then
+require reactivation. Queued/running/cancelling project operations still block
+the patch. Action idempotency stores
 the exact `LocalOperationV1`; replay resolves its current authoritative
 operation row and cannot return an obsolete connected/active result. Resource,
 operation, and idempotency writes commit in one transaction. Local-operation
