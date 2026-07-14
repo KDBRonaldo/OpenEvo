@@ -86,14 +86,23 @@ permissions through stable descriptors, and removes a bounded no-follow tree.
 An owner or identity mismatch fails closed rather than acting on a replacement
 path.
 
-Docker gives each create attempt a Core-private exclusive cidfile outside the
-session bind mount. A failed `docker create` establishes no ownership, so stop
-and cancel perform no operation against the diagnostic container name. A
-successful create becomes usable only after the cidfile and
-`docker container inspect --format {{.Id}} <id>` agree on the immutable ID;
-execution and cleanup use only that ID. Unreadable or unverified successful
-creates retain their ownership files and cleanup/recovery state without guessing
-by name. Every stop attempt revalidates the ID and, after `rm -f`, marks the
-runtime destroyed only when a final inspect proves that exact ID absent. Gateway
-does not remove either bind root until that proof succeeds; cleanup ownership
-remains in a private startup/shutdown retry journal otherwise.
+Docker gives every create attempt a node-scoped Core-private authority root that
+is outside both the agent session bind and its nested evaluator bind. Each
+runtime has a unique `0600` lock/cidfile pair; the lock is created exclusively
+and held with a process-exclusive lock. Normal return, cancellation, timeout,
+and command exceptions all reconcile the private cidfile after the Docker CLI
+has stopped. An explicit create failure with no cidfile establishes no
+ownership, so stop and cancel perform no operation against the diagnostic
+container name. If a full 64-character container ID was written, Core retains
+it as a candidate and requires
+`docker container inspect --format {{.Id}} <id>` to agree before any operation.
+Unreadable or unverified creates retain their ownership files without using
+stdout, a name, or a partial ID as fallback.
+
+Gateway startup scans only complete private lock/cidfile pairs, acquires the
+abandoned lock, and performs bounded recovery against the exact ID. A lock held
+by another live Core process or an incomplete/tampered record fails closed.
+Every stop attempt revalidates the ID and, after `rm -f`, marks the runtime
+destroyed only when a final inspect proves that exact ID absent. Gateway does
+not remove either bind root until that proof succeeds; cleanup ownership remains
+in the private authority root and startup/shutdown retry journal otherwise.

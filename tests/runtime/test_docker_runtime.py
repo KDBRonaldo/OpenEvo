@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import shutil
 import subprocess
+import sys
 import uuid
 from pathlib import Path
 from unittest.mock import AsyncMock
@@ -17,6 +19,17 @@ from openevo.runtime.models import RuntimeSpec
 _REAL_DOCKER_IMAGE = "python:3.12-slim-bookworm"
 
 
+@pytest.fixture(autouse=True)
+def _isolate_default_ownership_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "openevo.runtime.docker._DEFAULT_OWNERSHIP_ROOT",
+        tmp_path.parent / ".docker-authority" / tmp_path.name,
+    )
+
+
 def _write_mock_cidfile(args: tuple[str, ...], container_id: str) -> None:
     cidfile = Path(args[args.index("--cidfile") + 1])
     cidfile.write_text(container_id + "\n", encoding="ascii")
@@ -29,6 +42,7 @@ async def test_host_user_mode_sets_the_container_uid_without_permission_widening
     monkeypatch: pytest.MonkeyPatch,
     host_uid: int,
 ) -> None:
+    container_id = "1" * 64
     monkeypatch.setattr(os, "getuid", lambda: host_uid)
     monkeypatch.setattr(os, "getgid", lambda: host_uid + 1)
     runtime = DockerRuntime(
@@ -49,13 +63,13 @@ async def test_host_user_mode_sets_the_container_uid_without_permission_widening
         nonlocal inspect_count
         del kwargs
         if args[1] == "create":
-            _write_mock_cidfile(args, "sha256:host-user-container")
-            return 0, "sha256:host-user-container\n", None
+            _write_mock_cidfile(args, container_id)
+            return 0, container_id + "\n", None
         if args[1:3] == ("container", "inspect"):
             inspect_count += 1
             if inspect_count < 3:
-                return 0, "sha256:host-user-container\n", None
-            return 1, None, "Error: No such object: sha256:host-user-container"
+                return 0, container_id + "\n", None
+            return 1, None, f"Error: No such object: {container_id}"
         return 0, None, None
 
     run_command = AsyncMock(side_effect=run_command_impl)
@@ -66,6 +80,12 @@ async def test_host_user_mode_sets_the_container_uid_without_permission_widening
     create = run_command.await_args_list[0].args
     assert create[:4] == ("docker", "create", "--name", "openevo-science-session")
     assert create[4] == "--cidfile"
+    volume_sources = [
+        create[index + 1].split(":", 1)[0]
+        for index, value in enumerate(create[:-1])
+        if value == "-v"
+    ]
+    assert str(runtime._ownership_dir) not in volume_sources
     assert ("--user", f"{host_uid}:{host_uid + 1}") == create[6:8]
     assert all("chmod" not in call.args for call in run_command.await_args_list)
     assert all(call.args[-2:] != ("id", "-u") for call in run_command.await_args_list)
@@ -97,6 +117,7 @@ async def test_host_user_start_failure_never_runs_world_permission_fallback(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    container_id = "2" * 64
     runtime = DockerRuntime(
         RuntimeSpec(image="managed:latest", container_user="host"),
         "science-session",
@@ -104,20 +125,20 @@ async def test_host_user_start_failure_never_runs_world_permission_fallback(
     )
     responses = iter(
         [
-            (0, "sha256:start-failure-container\n", None),
-            (0, "sha256:start-failure-container\n", None),
+            (0, container_id + "\n", None),
+            (0, container_id + "\n", None),
             (1, None, "start failed"),
-            (0, "sha256:start-failure-container\n", None),
+            (0, container_id + "\n", None),
             (1, None, None),
             (0, None, None),
-            (1, None, "Error: No such object: sha256:start-failure-container"),
+            (1, None, f"Error: No such object: {container_id}"),
         ]
     )
 
     async def run_command_impl(*args, **kwargs):
         del kwargs
         if args[1] == "create":
-            _write_mock_cidfile(args, "sha256:start-failure-container")
+            _write_mock_cidfile(args, container_id)
         return next(responses)
 
     run_command = AsyncMock(side_effect=run_command_impl)
@@ -135,6 +156,7 @@ async def test_private_credential_root_is_mounted_outside_the_session_tree(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    container_id = "3" * 64
     session_dir = tmp_path / "session"
     credential_dir = tmp_path / "credentials"
     session_dir.mkdir()
@@ -153,10 +175,10 @@ async def test_private_credential_root_is_mounted_outside_the_session_tree(
     async def run_command_impl(*args, **kwargs):
         del kwargs
         if args[1] == "create":
-            _write_mock_cidfile(args, "sha256:credential-container")
-            return 0, "sha256:credential-container\n", None
+            _write_mock_cidfile(args, container_id)
+            return 0, container_id + "\n", None
         if args[1:3] == ("container", "inspect"):
-            return 0, "sha256:credential-container\n", None
+            return 0, container_id + "\n", None
         return 0, None, None
 
     run_command = AsyncMock(side_effect=run_command_impl)
@@ -177,22 +199,23 @@ async def test_stop_is_retryable_until_container_removal_is_proven(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    container_id = "4" * 64
     runtime = DockerRuntime(
         RuntimeSpec(image="runtime:latest", container_user="host"),
         "science-session",
         tmp_path,
     )
-    runtime._container_id = "container-id"
+    runtime._container_id = container_id
     run_command = AsyncMock(
         side_effect=[
-            (0, "container-id", None),
+            (0, container_id, None),
             (1, None, "kill failed"),
             (1, None, "rm failed"),
-            (0, "container-id", None),
-            (0, "container-id", None),
+            (0, container_id, None),
+            (0, container_id, None),
             (0, None, None),
             (0, None, None),
-            (1, None, "Error: No such object: container-id"),
+            (1, None, f"Error: No such object: {container_id}"),
         ]
     )
     monkeypatch.setattr(runtime, "_run_local_command", run_command)
@@ -222,15 +245,16 @@ async def test_stop_accepts_inspect_proof_that_container_is_already_absent(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    container_id = "5" * 64
     runtime = DockerRuntime(
         RuntimeSpec(image="runtime:latest", container_user="host"),
         "science-session",
         tmp_path,
     )
-    runtime._container_id = "container-id"
+    runtime._container_id = container_id
     run_command = AsyncMock(
         side_effect=[
-            (1, None, "Error: No such object: container-id"),
+            (1, None, f"Error: No such object: {container_id}"),
         ]
     )
     monkeypatch.setattr(runtime, "_run_local_command", run_command)
@@ -241,22 +265,43 @@ async def test_stop_accepts_inspect_proof_that_container_is_already_absent(
 
 
 @pytest.mark.asyncio
-async def test_stop_requires_explicit_absence_proof_after_successful_remove(
+async def test_stop_rejects_non_immutable_container_reference_without_docker_command(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     runtime = DockerRuntime(
         RuntimeSpec(image="runtime:latest", container_user="host"),
+        "invalid-container-reference",
+        tmp_path,
+    )
+    runtime._container_id = "openevo-external-container"
+    run_command = AsyncMock()
+    monkeypatch.setattr(runtime, "_run_local_command", run_command)
+
+    with pytest.raises(RuntimeError, match="container ID is invalid"):
+        await runtime.stop()
+
+    run_command.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_stop_requires_explicit_absence_proof_after_successful_remove(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    container_id = "6" * 64
+    runtime = DockerRuntime(
+        RuntimeSpec(image="runtime:latest", container_user="host"),
         "science-session",
         tmp_path,
     )
-    runtime._container_id = "sha256:credential-container"
+    runtime._container_id = container_id
     run_command = AsyncMock(
         side_effect=[
-            (0, "sha256:credential-container", None),
+            (0, container_id, None),
             (0, None, None),
             (0, None, None),
-            (0, "sha256:credential-container", None),
+            (0, container_id, None),
         ]
     )
     monkeypatch.setattr(runtime, "_run_local_command", run_command)
@@ -272,6 +317,7 @@ async def test_runtime_pins_container_id_and_uses_it_for_cleanup(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    container_id = "7" * 64
     runtime = DockerRuntime(
         RuntimeSpec(image="runtime:latest", container_user="host"),
         "science-session",
@@ -279,20 +325,20 @@ async def test_runtime_pins_container_id_and_uses_it_for_cleanup(
     )
     responses = iter(
         [
-            (0, "sha256:credential-container\n", None),
-            (0, "sha256:credential-container\n", None),
+            (0, container_id + "\n", None),
+            (0, container_id + "\n", None),
             (0, None, None),
-            (0, "sha256:credential-container\n", None),
+            (0, container_id + "\n", None),
             (0, None, None),
             (0, None, None),
-            (1, None, "Error: No such object: sha256:credential-container"),
+            (1, None, f"Error: No such object: {container_id}"),
         ]
     )
 
     async def run_command_impl(*args, **kwargs):
         del kwargs
         if args[1] == "create":
-            _write_mock_cidfile(args, "sha256:credential-container")
+            _write_mock_cidfile(args, container_id)
         return next(responses)
 
     run_command = AsyncMock(side_effect=run_command_impl)
@@ -301,13 +347,13 @@ async def test_runtime_pins_container_id_and_uses_it_for_cleanup(
     await runtime.start()
     await runtime.stop()
 
-    assert runtime.container_id == "sha256:credential-container"
+    assert runtime.container_id == container_id
     kill_args = run_command.await_args_list[4].args
     remove_args = run_command.await_args_list[5].args
     inspect_args = run_command.await_args_list[6].args
-    assert kill_args[-1] == "sha256:credential-container"
-    assert remove_args[-1] == "sha256:credential-container"
-    assert inspect_args[-1] == "sha256:credential-container"
+    assert kill_args[-1] == container_id
+    assert remove_args[-1] == container_id
+    assert inspect_args[-1] == container_id
 
 
 @pytest.mark.asyncio
@@ -338,6 +384,381 @@ async def test_create_name_collision_never_operates_on_the_external_container(
     commands = [call.args[1] for call in run_command.await_args_list]
     assert commands == ["create"]
     assert runtime.container_id is None
+
+
+@pytest.mark.asyncio
+async def test_cancelled_create_adopts_cidfile_and_cleans_only_immutable_id(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    authority_root = tmp_path / "core-private-docker-authority"
+    runtime = DockerRuntime(
+        RuntimeSpec(image="runtime:latest", container_user="host"),
+        "cancelled-create-session",
+        tmp_path / "session",
+        ownership_root=authority_root,
+    )
+    container_id = "c" * 64
+    create_has_written_cid = asyncio.Event()
+    create_wait = asyncio.Event()
+    container_present = True
+
+    async def run_command_impl(*args, **kwargs):
+        nonlocal container_present
+        del kwargs
+        if args[1] == "create":
+            _write_mock_cidfile(args, container_id)
+            create_has_written_cid.set()
+            await create_wait.wait()
+            return 0, container_id + "\n", None
+        if args[1:3] == ("container", "inspect"):
+            if container_present:
+                return 0, container_id + "\n", None
+            return 1, None, f"Error: No such object: {container_id}"
+        if args[1] == "rm":
+            assert args[-1] == container_id
+            container_present = False
+            return 0, None, None
+        if args[1] == "kill":
+            assert args[-1] == container_id
+            return 0, None, None
+        raise AssertionError(f"unexpected docker command: {args}")
+
+    run_command = AsyncMock(side_effect=run_command_impl)
+    monkeypatch.setattr(runtime, "_run_local_command", run_command)
+
+    start_task = asyncio.create_task(runtime.start())
+    await create_has_written_cid.wait()
+    start_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await start_task
+
+    assert runtime.container_id == container_id
+    assert runtime._destroyed is False
+    assert runtime._cidfile.exists()
+    assert runtime._ownership_lock.exists()
+
+    await runtime.stop()
+
+    assert runtime.absence_proven is True
+    assert not runtime._cidfile.exists()
+    assert not runtime._ownership_lock.exists()
+    destructive = [
+        call.args for call in run_command.await_args_list if call.args[1] in {"kill", "rm"}
+    ]
+    assert destructive
+    assert all(command[-1] == container_id for command in destructive)
+
+
+@pytest.mark.asyncio
+async def test_create_exception_after_cidfile_retains_recoverable_ownership(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    authority_root = tmp_path / "core-private-docker-authority"
+    runtime = DockerRuntime(
+        RuntimeSpec(image="runtime:latest", container_user="host"),
+        "exception-create-session",
+        tmp_path / "session",
+        ownership_root=authority_root,
+    )
+    container_id = "e" * 64
+    container_present = True
+
+    async def run_command_impl(*args, **kwargs):
+        nonlocal container_present
+        del kwargs
+        if args[1] == "create":
+            _write_mock_cidfile(args, container_id)
+            raise RuntimeError("docker transport interrupted")
+        if args[1:3] == ("container", "inspect"):
+            if container_present:
+                return 0, container_id + "\n", None
+            return 1, None, f"Error: No such object: {container_id}"
+        if args[1] == "rm":
+            container_present = False
+        return 0, None, None
+
+    run_command = AsyncMock(side_effect=run_command_impl)
+    monkeypatch.setattr(runtime, "_run_local_command", run_command)
+
+    with pytest.raises(RuntimeError, match="transport interrupted"):
+        await runtime.start()
+
+    assert runtime.container_id == container_id
+    assert runtime._cidfile.exists()
+    await runtime.stop()
+    assert runtime.absence_proven is True
+
+
+@pytest.mark.asyncio
+async def test_create_timeout_after_cidfile_retains_recoverable_ownership(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    authority_root = tmp_path / "core-private-docker-authority"
+    runtime = DockerRuntime(
+        RuntimeSpec(image="runtime:latest", container_user="host"),
+        "timeout-create-session",
+        tmp_path / "session",
+        ownership_root=authority_root,
+    )
+    container_id = "8" * 64
+    container_present = True
+
+    async def run_command_impl(*args, **kwargs):
+        nonlocal container_present
+        del kwargs
+        if args[1] == "create":
+            _write_mock_cidfile(args, container_id)
+            return -1, None, None
+        if args[1:3] == ("container", "inspect"):
+            if container_present:
+                return 0, container_id + "\n", None
+            return 1, None, f"Error: No such object: {container_id}"
+        if args[1] == "rm":
+            container_present = False
+        return 0, None, None
+
+    run_command = AsyncMock(side_effect=run_command_impl)
+    monkeypatch.setattr(runtime, "_run_local_command", run_command)
+
+    with pytest.raises(RuntimeError, match="docker create failed with exit code -1"):
+        await runtime.start()
+
+    assert runtime.container_id == container_id
+    assert runtime._cidfile.exists()
+    await runtime.stop()
+    assert runtime.absence_proven is True
+
+
+@pytest.mark.asyncio
+async def test_private_authority_recovery_discovers_and_removes_owned_container(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    authority_root = tmp_path / "core-private-docker-authority"
+    runtime = DockerRuntime(
+        RuntimeSpec(image="runtime:latest", container_user="host"),
+        "crashed-create-session",
+        tmp_path / "session",
+        ownership_root=authority_root,
+    )
+    container_id = "d" * 64
+    runtime._prepare_create_ownership()
+    runtime._cidfile.write_text(container_id + "\n", encoding="ascii")
+    os.close(runtime._ownership_lock_fd)
+    runtime._ownership_lock_fd = -1
+    container_present = True
+    commands: list[tuple[str, ...]] = []
+
+    async def run_command_impl(self, *args, **kwargs):
+        nonlocal container_present
+        del self, kwargs
+        commands.append(args)
+        if args[1:3] == ("container", "inspect"):
+            if container_present:
+                return 0, container_id + "\n", None
+            return 1, None, f"Error: No such object: {container_id}"
+        if args[1] == "rm":
+            container_present = False
+        return 0, None, None
+
+    monkeypatch.setattr(DockerRuntime, "_run_local_command", run_command_impl)
+
+    await DockerRuntime.recover_ownership_root(authority_root)
+
+    assert container_present is False
+    assert authority_root.exists()
+    assert list(authority_root.iterdir()) == []
+    assert all(command[-1] == container_id for command in commands)
+
+
+@pytest.mark.asyncio
+async def test_recovery_refuses_authority_lock_held_by_live_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    authority_root = tmp_path / "core-private-docker-authority"
+    runtime = DockerRuntime(
+        RuntimeSpec(image="runtime:latest", container_user="host"),
+        "live-runtime-session",
+        tmp_path / "session",
+        ownership_root=authority_root,
+    )
+    runtime._prepare_create_ownership()
+    runtime._cidfile.write_text("9" * 64 + "\n", encoding="ascii")
+    commands: list[tuple[str, ...]] = []
+
+    async def reject_command(self, *args, **kwargs):
+        del self, kwargs
+        commands.append(args)
+        raise AssertionError("live authority must not reach recovery commands")
+
+    monkeypatch.setattr(DockerRuntime, "_run_local_command", reject_command)
+
+    with pytest.raises(RuntimeError, match="held by another process"):
+        await DockerRuntime.recover_ownership_root(authority_root)
+
+    assert commands == []
+    assert runtime._ownership_lock_fd >= 0
+    runtime._release_ownership_files()
+
+
+@pytest.mark.asyncio
+async def test_recovery_rejects_agent_replaced_cidfile_without_docker_command(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_dir = tmp_path / "session"
+    session_dir.mkdir()
+    authority_root = tmp_path / "core-private-docker-authority"
+    runtime = DockerRuntime(
+        RuntimeSpec(image="runtime:latest", container_user="host"),
+        "tampered-recovery-session",
+        session_dir,
+        ownership_root=authority_root,
+    )
+    runtime._prepare_create_ownership()
+    outside_cid = session_dir / "agent-cid"
+    outside_cid.write_text("f" * 64 + "\n", encoding="ascii")
+    runtime._cidfile.symlink_to(outside_cid)
+    os.close(runtime._ownership_lock_fd)
+    runtime._ownership_lock_fd = -1
+    commands: list[tuple[str, ...]] = []
+
+    async def reject_command(self, *args, **kwargs):
+        del self, kwargs
+        commands.append(args)
+        raise AssertionError("tampered authority must not reach Docker")
+
+    monkeypatch.setattr(DockerRuntime, "_run_local_command", reject_command)
+
+    with pytest.raises(RuntimeError):
+        await DockerRuntime.recover_ownership_root(authority_root)
+
+    assert commands == []
+    assert outside_cid.exists()
+
+
+@pytest.mark.asyncio
+async def test_authority_root_symlink_into_agent_mount_fails_before_create(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_dir = tmp_path / "session"
+    agent_controlled = session_dir / "agent-controlled-authority"
+    agent_controlled.mkdir(parents=True)
+    authority_root = tmp_path / "core-private-docker-authority"
+    authority_root.symlink_to(agent_controlled, target_is_directory=True)
+    runtime = DockerRuntime(
+        RuntimeSpec(image="runtime:latest", container_user="host"),
+        "tampered-authority-session",
+        session_dir,
+        ownership_root=authority_root,
+    )
+    run_command = AsyncMock()
+    monkeypatch.setattr(runtime, "_run_local_command", run_command)
+
+    with pytest.raises(RuntimeError, match="ownership directory is not private"):
+        await runtime.start()
+
+    run_command.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_authority_root_ancestor_symlink_into_agent_mount_fails_before_create(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_dir = tmp_path / "session"
+    agent_controlled = session_dir / "authority"
+    agent_controlled.mkdir(parents=True)
+    authority_parent = tmp_path / "authority-parent"
+    authority_parent.symlink_to(session_dir, target_is_directory=True)
+    runtime = DockerRuntime(
+        RuntimeSpec(image="runtime:latest", container_user="host"),
+        "ancestor-tampered-authority-session",
+        session_dir,
+        ownership_root=authority_parent / "authority",
+    )
+    run_command = AsyncMock()
+    monkeypatch.setattr(runtime, "_run_local_command", run_command)
+
+    with pytest.raises(RuntimeError, match="ownership directory is not private"):
+        await runtime.start()
+
+    run_command.assert_not_awaited()
+
+
+def test_agent_and_eval_runtimes_share_unmounted_root_but_have_unique_records(
+    tmp_path: Path,
+) -> None:
+    session_dir = tmp_path / "sessions" / "session"
+    eval_session_dir = session_dir / "eval_runtime"
+    authority_root = tmp_path / "core-private" / "docker-authority"
+    spec = RuntimeSpec(image="runtime:latest", container_user="host")
+
+    agent_runtime = DockerRuntime(
+        spec,
+        "shared-session",
+        session_dir,
+        ownership_root=authority_root,
+    )
+    eval_runtime = DockerRuntime(
+        spec,
+        "shared-session-eval",
+        eval_session_dir,
+        ownership_root=authority_root,
+    )
+
+    assert agent_runtime._ownership_dir == authority_root
+    assert eval_runtime._ownership_dir == authority_root
+    assert not authority_root.is_relative_to(session_dir)
+    assert agent_runtime._cidfile != eval_runtime._cidfile
+    assert str(authority_root) not in f"{session_dir}:{agent_runtime.runtime_session_dir}"
+
+
+def test_eval_runtime_rejects_authority_inside_main_session_bind(tmp_path: Path) -> None:
+    main_session_dir = tmp_path / "session"
+    eval_session_dir = main_session_dir / "eval_runtime"
+
+    with pytest.raises(ValueError, match="outside the session tree"):
+        DockerRuntime(
+            RuntimeSpec(image="runtime:latest", container_user="host"),
+            "shared-session-eval",
+            eval_session_dir,
+            ownership_root=main_session_dir,
+        )
+
+
+@pytest.mark.asyncio
+async def test_cancelled_local_command_is_killed_and_reaped(tmp_path: Path) -> None:
+    runtime = DockerRuntime(
+        RuntimeSpec(image="runtime:latest", container_user="host"),
+        "local-command-cancel",
+        tmp_path,
+    )
+    command_task = asyncio.create_task(
+        runtime._run_local_command(
+            sys.executable,
+            "-c",
+            "import time; time.sleep(30)",
+            capture=True,
+        )
+    )
+    async with asyncio.timeout(2):
+        while runtime._active_process is None:
+            await asyncio.sleep(0.01)
+    process = runtime._active_process
+    assert process is not None
+
+    command_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await command_task
+
+    assert process.returncode is not None
+    assert runtime._active_process is None
 
 
 @pytest.mark.asyncio
@@ -443,6 +864,82 @@ async def test_real_docker_name_collision_preserves_running_external_container(
             check=False,
             capture_output=True,
         )
+
+
+@pytest.mark.asyncio
+async def test_real_docker_cancel_after_cidfile_is_recoverably_owned(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if shutil.which("docker") is None:
+        pytest.skip("docker CLI is unavailable")
+    info = subprocess.run(
+        ["docker", "info", "--format", "{{.ServerVersion}}"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if info.returncode != 0:
+        pytest.skip("docker daemon is unavailable")
+    image = subprocess.run(
+        ["docker", "image", "inspect", _REAL_DOCKER_IMAGE],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if image.returncode != 0:
+        pytest.skip(f"required local probe image is unavailable: {_REAL_DOCKER_IMAGE}")
+
+    session_dir = tmp_path / "session"
+    session_dir.mkdir()
+    runtime = DockerRuntime(
+        RuntimeSpec(image=_REAL_DOCKER_IMAGE, container_user="host"),
+        f"cancel-{uuid.uuid4().hex[:16]}",
+        session_dir,
+        ownership_root=tmp_path / "core-private-docker-authority",
+    )
+    original_run_command = runtime._run_local_command
+    cidfile_written = asyncio.Event()
+    hold_create_return = asyncio.Event()
+
+    async def delayed_create_return(*args, **kwargs):
+        result = await original_run_command(*args, **kwargs)
+        if args[1] == "create" and result[0] == 0:
+            assert runtime._cidfile.exists()
+            cidfile_written.set()
+            await hold_create_return.wait()
+        return result
+
+    monkeypatch.setattr(runtime, "_run_local_command", delayed_create_return)
+    start_task = asyncio.create_task(runtime.start())
+    try:
+        await asyncio.wait_for(cidfile_written.wait(), timeout=30)
+        start_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await start_task
+
+        container_id = runtime.container_id
+        assert container_id is not None
+        assert len(container_id) == 64
+        await runtime.stop()
+
+        inspected = subprocess.run(
+            ["docker", "container", "inspect", container_id],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert inspected.returncode != 0
+    finally:
+        if not start_task.done():
+            start_task.cancel()
+            await asyncio.gather(start_task, return_exceptions=True)
+        if runtime.container_id is not None:
+            subprocess.run(
+                ["docker", "rm", "-f", runtime.container_id],
+                check=False,
+                capture_output=True,
+            )
 
 
 def test_container_user_rejects_unknown_modes(tmp_path: Path) -> None:

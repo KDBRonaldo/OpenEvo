@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -19,6 +20,7 @@ from openevo.evolution.models import (
 from openevo.evolution.store import EvolutionStore
 from openevo.gateway.dispatcher import ManagedSession
 from openevo.gateway.node import (
+    GatewayExecutionTimeout,
     GatewayNodeManager,
     build_evolution_session_event,
     write_evolution_context_files,
@@ -1804,6 +1806,69 @@ async def test_codex_subscription_without_proxy_completions_builds_transcript_tr
     assert trace.response_messages == [{"role": "assistant", "content": "Used subscription mode."}]
     assert trace.response_ids == []
     assert trace.response_logprobs is None
+
+
+@pytest.mark.asyncio
+async def test_subscription_transcript_read_is_async_and_execution_budgeted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    log_dir = tmp_path / "logs" / "agent"
+    log_dir.mkdir(parents=True)
+    transcript = log_dir / "step.00.stdout.log"
+    transcript.write_bytes(b'{"type":"agent_message","text":"late"}\n')
+    manager = GatewayNodeManager.__new__(GatewayNodeManager)
+    manager.node_id = "node-a"
+    manager.storage = EmptyCompletionStorage()
+    manager.builders = default_builder_registry()
+    manager.session_registry = SessionRegistry()
+    manager.session_registry.register("session_1", task_id="task_1")
+    request = SessionDispatchRequest(
+        session_id="session_1",
+        task_id="task_1",
+        instruction="Do work.",
+        remaining_timeout_seconds=60,
+        agent=AgentSpec(
+            harness="codex",
+            settings={"auth_mode": "subscription", "capture_mode": "transcript"},
+        ),
+    )
+    managed = ManagedSession(
+        request=request,
+        timer=StageTimer(),
+        session_dir=tmp_path,
+        artifacts_dir=tmp_path / "artifacts",
+        session_root_identity=capture_session_root_identity(tmp_path),
+        agent_result=AgentRunResult(
+            status="completed",
+            return_code=0,
+            metadata={"log_dir": str(log_dir), "last_step": 0},
+        ),
+    )
+    managed.execution_deadline = asyncio.get_running_loop().time() + 0.05
+
+    original_reader = session_files.read_verified_session_transcript
+
+    def delayed_reader(*args, **kwargs):
+        time.sleep(0.2)
+        return original_reader(*args, **kwargs)
+
+    monkeypatch.setattr("openevo.gateway.node.read_verified_session_transcript", delayed_reader)
+    event_loop_progress = asyncio.Event()
+
+    async def tick() -> None:
+        await asyncio.sleep(0.01)
+        event_loop_progress.set()
+
+    tick_task = asyncio.create_task(tick())
+    started = asyncio.get_running_loop().time()
+    with pytest.raises(GatewayExecutionTimeout, match="execution timeout"):
+        await manager._build_session_result(managed)
+    elapsed = asyncio.get_running_loop().time() - started
+    await tick_task
+
+    assert event_loop_progress.is_set()
+    assert elapsed < 0.15
 
 
 @pytest.mark.asyncio

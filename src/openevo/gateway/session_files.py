@@ -33,6 +33,11 @@ _DIRECTORY_FLAGS: Final[int] = (
 _PATH_FLAGS: Final[int] = (
     getattr(os, "O_PATH", os.O_RDONLY) | os.O_CLOEXEC | os.O_NOFOLLOW
 )
+_LEAF_PIN_FLAGS: Final[int] = (
+    getattr(os, "O_PATH", os.O_RDONLY | os.O_NONBLOCK)
+    | os.O_CLOEXEC
+    | os.O_NOFOLLOW
+)
 
 
 class SessionFileSecurityError(RuntimeError):
@@ -207,6 +212,7 @@ def read_verified_session_transcript(
     root_pin = _pin_absolute_directory(session_dir)
     directory_fds: list[int] = []
     directory_identities: list[tuple[int, int, int, int, int, int, int, int]] = []
+    leaf_pin_fd = -1
     leaf_fd = -1
     try:
         root_pin.verify(label="subscription transcript root")
@@ -237,24 +243,32 @@ def read_verified_session_transcript(
             dir_fd=directory_fds[-1],
             follow_symlinks=False,
         )
-        leaf_fd = os.open(
+        leaf_pin_fd = os.open(
             leaf_name,
-            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            _LEAF_PIN_FLAGS,
             dir_fd=directory_fds[-1],
         )
-        leaf_opened = os.fstat(leaf_fd)
-        if _auth_identity(leaf_before) != _auth_identity(leaf_opened):
-            raise SessionFileSecurityError("subscription transcript changed while it was opened")
+        leaf_pinned = os.fstat(leaf_pin_fd)
+        if _auth_identity(leaf_before) != _auth_identity(leaf_pinned):
+            raise SessionFileSecurityError("subscription transcript changed while it was pinned")
         if (
-            not stat.S_ISREG(leaf_opened.st_mode)
-            or leaf_opened.st_uid != session_identity[2]
-            or leaf_opened.st_nlink != 1
-            or leaf_opened.st_size < 0
-            or leaf_opened.st_size > max_bytes
+            not stat.S_ISREG(leaf_pinned.st_mode)
+            or leaf_pinned.st_uid != session_identity[2]
+            or leaf_pinned.st_nlink != 1
+            or leaf_pinned.st_size < 0
+            or leaf_pinned.st_size > max_bytes
         ):
             raise SessionFileSecurityError(
                 "subscription transcript must be an owned, single-link, bounded regular file"
             )
+        leaf_fd = os.open(
+            leaf_name,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+            dir_fd=directory_fds[-1],
+        )
+        leaf_opened = os.fstat(leaf_fd)
+        if _auth_identity(leaf_pinned) != _auth_identity(leaf_opened):
+            raise SessionFileSecurityError("subscription transcript changed while it was opened")
 
         remaining = leaf_opened.st_size
         chunks: list[bytes] = []
@@ -273,9 +287,11 @@ def read_verified_session_transcript(
             dir_fd=directory_fds[-1],
             follow_symlinks=False,
         )
-        if _auth_identity(leaf_opened) != _auth_identity(leaf_after) or _auth_identity(
-            leaf_opened
-        ) != _auth_identity(named_leaf_after):
+        if (
+            _auth_identity(leaf_pinned) != _auth_identity(os.fstat(leaf_pin_fd))
+            or _auth_identity(leaf_opened) != _auth_identity(leaf_after)
+            or _auth_identity(leaf_opened) != _auth_identity(named_leaf_after)
+        ):
             raise SessionFileSecurityError("subscription transcript changed during verified read")
 
         for index, (descriptor, expected) in enumerate(zip(directory_fds, directory_identities)):
@@ -305,6 +321,8 @@ def read_verified_session_transcript(
     finally:
         if leaf_fd >= 0:
             os.close(leaf_fd)
+        if leaf_pin_fd >= 0:
+            os.close(leaf_pin_fd)
         while directory_fds:
             os.close(directory_fds.pop())
         root_pin.close()

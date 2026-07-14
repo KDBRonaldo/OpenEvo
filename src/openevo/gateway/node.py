@@ -474,13 +474,19 @@ class GatewayNodeManager:
         self._heartbeat_task: asyncio.Task[None] | None = None
         self._rollout_registered = False
         self._cleanup_retries: dict[str, CleanupRetryOwnership] = {}
-        cleanup_base = Path(session_base_dir) if session_base_dir else Path("/tmp")
+        cleanup_base = (
+            Path(session_base_dir).absolute() if session_base_dir else Path("/tmp")
+        )
         node_key = hashlib.sha256(node_id.encode("utf-8")).hexdigest()[:24]
         self._cleanup_journal_dir = (
             cleanup_base / ".openevo-gateway-cleanup" / node_key
         )
+        self._docker_ownership_root = (
+            cleanup_base / ".openevo-gateway-docker-ownership" / node_key
+        )
 
     async def start(self) -> None:
+        await DockerRuntime.recover_ownership_root(self._docker_ownership_root)
         self._load_cleanup_retries()
         await self._reconcile_cleanup_retries()
         await self._dispatcher.start()
@@ -696,6 +702,7 @@ class GatewayNodeManager:
                     runtime_spec,
                     request.session_id,
                     managed.session_dir,
+                    docker_ownership_root=self._docker_ownership_root,
                 )
             else:
                 runtime = create_runtime(
@@ -703,6 +710,7 @@ class GatewayNodeManager:
                     request.session_id,
                     managed.session_dir,
                     credential_dir=managed.credential_dir,
+                    docker_ownership_root=self._docker_ownership_root,
                 )
             managed.runtime = runtime
             await self._await_with_budget(runtime.start(), managed)
@@ -1114,7 +1122,12 @@ class GatewayNodeManager:
         eval_artifacts_dir = eval_session_dir / "artifacts"
         eval_artifacts_dir.mkdir(parents=True, exist_ok=True)
 
-        eval_runtime = create_runtime(runtime_spec, f"{request.session_id}-eval", eval_session_dir)
+        eval_runtime = create_runtime(
+            runtime_spec,
+            f"{request.session_id}-eval",
+            eval_session_dir,
+            docker_ownership_root=self._docker_ownership_root,
+        )
         managed.eval_runtime = eval_runtime
         try:
             await self._await_with_budget(eval_runtime.start(), managed)
@@ -1410,10 +1423,14 @@ class GatewayNodeManager:
                     raise RuntimeError("subscription transcript requires a pinned session root")
                 step_index = _transcript_step_index(agent_result)
                 if step_index is not None:
-                    verified_transcript = read_verified_session_transcript(
-                        managed.session_dir,
-                        managed.session_root_identity,
-                        step_index=step_index,
+                    verified_transcript = await self._await_with_budget(
+                        asyncio.to_thread(
+                            read_verified_session_transcript,
+                            managed.session_dir,
+                            managed.session_root_identity,
+                            step_index=step_index,
+                        ),
+                        managed,
                     )
             initial_agent_result = (
                 agent_result if request.builder.strategy == "agent_transcript" else None
@@ -2212,12 +2229,20 @@ class GatewayNodeManager:
         container_id: str,
         runtime_id: str | None,
     ) -> bool:
+        ownership_root = getattr(self, "_docker_ownership_root", None)
+        recovery_session_dir = (
+            ownership_root.parent / ".cleanup-recovery-session"
+            if ownership_root is not None
+            else Path("/tmp/.openevo-cleanup-recovery-session")
+        )
         runtime = DockerRuntime(
             RuntimeSpec(image="openevo-cleanup-recovery", container_user="host"),
             runtime_id or f"recovered-{container_id[:12]}",
-            Path("/tmp"),
+            recovery_session_dir,
+            ownership_root=ownership_root,
         )
         runtime._container_id = container_id
+        runtime._ownership_state = "candidate"
         return await self._stop_runtime_best_effort(
             runtime,
             runtime_id or container_id,

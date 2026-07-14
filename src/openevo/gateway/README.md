@@ -96,17 +96,22 @@ For subscription sessions, post-run commands finish first, then every
 credential-capable container is removed and proven absent by pinned container
 ID. Only after that proof does Core perform the final scan. Core then pins the
 full absolute session-root chain, opens the fixed `logs/agent/step.xx.stdout.log`
-components relative to held directory descriptors with `O_NOFOLLOW`, and accepts
-only a session-owner, link-count-one, bounded regular leaf. Root, directory, and
-leaf descriptor and pathname identities are rechecked after the bounded read.
-The verified bytes are passed directly to the transcript builder; the builder
-does not reopen the pathname. The resulting trajectory or `SessionResult` is
+components relative to held directory descriptors with `O_NOFOLLOW | O_NONBLOCK`,
+and accepts only a session-owner, link-count-one, bounded regular leaf before
+consuming bytes. FIFOs, sockets, and other special files therefore fail without
+waiting for a peer. The complete verified read runs off the event-loop thread and
+inside the session's shared execution deadline. Root, directory, and leaf
+descriptor and pathname identities are rechecked after the bounded read. The
+verified bytes are passed directly to the transcript builder; the builder does
+not reopen the pathname. The resulting trajectory or `SessionResult` is
 recursively redacted again before registry, evolution export, or callback
-delivery. Docker always follows removal with an absence `inspect`, including
-after successful `rm -f`. Failures retain a private cleanup journal containing
-only runtime, container, session-root, and credential-root identities. Startup
-and shutdown reconciliation retry each journal independently, and roots are
-removed only after absence proof.
+delivery. Docker ownership records live in a node-private root outside agent and
+evaluator mounts. Startup reclaims abandoned records by exact immutable ID;
+Docker always follows removal with an absence `inspect`, including after
+successful `rm -f`. Failures retain a private cleanup journal containing only
+runtime, container, session-root, and credential-root identities. Startup and
+shutdown reconciliation retry each journal independently, and roots are removed
+only after absence proof.
 
 ## What it captures
 

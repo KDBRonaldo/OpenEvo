@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import os
+import socket
 from pathlib import Path
 
 import pytest
@@ -157,3 +159,42 @@ def test_verified_transcript_rejects_relative_ancestor_replacement_during_read(
 
     with pytest.raises(SessionFileSecurityError, match="ancestor"):
         read_verified_session_transcript(session_dir, identity, step_index=0)
+
+
+@pytest.mark.asyncio
+async def test_verified_transcript_rejects_fifo_without_blocking_gateway(
+    tmp_path: Path,
+) -> None:
+    session_dir, identity, transcript = _session_with_transcript(tmp_path)
+    transcript.unlink()
+    os.mkfifo(transcript, mode=0o600)
+
+    read_task = asyncio.create_task(
+        asyncio.to_thread(
+            read_verified_session_transcript,
+            session_dir,
+            identity,
+            step_index=0,
+        )
+    )
+    try:
+        with pytest.raises(SessionFileSecurityError, match="regular file"):
+            await asyncio.wait_for(asyncio.shield(read_task), timeout=0.25)
+    finally:
+        if not read_task.done():
+            writer = os.open(transcript, os.O_WRONLY | os.O_NONBLOCK)
+            os.close(writer)
+            with pytest.raises(SessionFileSecurityError):
+                await read_task
+
+
+def test_verified_transcript_rejects_unix_socket_leaf(tmp_path: Path) -> None:
+    session_dir, identity, transcript = _session_with_transcript(tmp_path)
+    transcript.unlink()
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        listener.bind(str(transcript))
+        with pytest.raises(SessionFileSecurityError):
+            read_verified_session_transcript(session_dir, identity, step_index=0)
+    finally:
+        listener.close()

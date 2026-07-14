@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
+import fcntl
 import logging
 import os
+import re
 import shlex
 import stat
 from hashlib import sha256
@@ -17,9 +20,19 @@ from openevo.runtime.models import ExecResult, RuntimeSpec
 logger = logging.getLogger(__name__)
 
 _CIDFILE_MAX_BYTES: Final[int] = 128
-_OWNERSHIP_DIRECTORY_NAME: Final[str] = ".openevo-docker-ownership"
 _DIRECTORY_FLAGS: Final[int] = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_DIRECTORY
-_OwnershipState = Literal["none", "candidate", "verified"]
+_DEFAULT_OWNERSHIP_ROOT: Path = Path("/tmp") / f".openevo-core-docker-ownership-{os.geteuid()}"
+_CONTAINER_ID_PATTERN: Final[re.Pattern[str]] = re.compile(r"^[0-9a-f]{64}$")
+_OWNERSHIP_KEY_PATTERN: Final[re.Pattern[str]] = re.compile(r"^[0-9a-f]{64}$")
+_OWNERSHIP_RECORD_LIMIT: Final[int] = 1024
+_OwnershipState = Literal[
+    "none",
+    "create_pending",
+    "unresolved",
+    "candidate",
+    "verified",
+    "absent",
+]
 
 
 def _object_identity(value: os.stat_result) -> tuple[int, int]:
@@ -56,6 +69,81 @@ def _unlink_if_same_identity(
         os.unlink(name, dir_fd=directory_fd)
 
 
+def _open_private_ownership_directory(path: Path) -> int:
+    parts = path.parts
+    if (
+        not parts
+        or parts[0] != os.sep
+        or any(part in {"", ".", ".."} for part in parts[1:])
+    ):
+        raise RuntimeError("docker ownership directory is not private")
+    descriptor = os.open(os.sep, _DIRECTORY_FLAGS)
+    try:
+        for part in parts[1:]:
+            before = os.stat(part, dir_fd=descriptor, follow_symlinks=False)
+            if not stat.S_ISDIR(before.st_mode):
+                raise RuntimeError("docker ownership directory is not private")
+            child_fd = os.open(part, _DIRECTORY_FLAGS, dir_fd=descriptor)
+            opened_child = os.fstat(child_fd)
+            if _object_identity(before) != _object_identity(opened_child):
+                os.close(child_fd)
+                raise RuntimeError("docker ownership directory is not private")
+            os.close(descriptor)
+            descriptor = child_fd
+
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or opened.st_uid != os.geteuid()
+            or stat.S_IMODE(opened.st_mode) != 0o700
+        ):
+            raise RuntimeError("docker ownership directory is not private")
+        result = descriptor
+        descriptor = -1
+        return result
+    except OSError as exc:
+        raise RuntimeError("docker ownership directory is not private") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _require_private_lock(value: os.stat_result) -> None:
+    if (
+        not stat.S_ISREG(value.st_mode)
+        or value.st_uid != os.geteuid()
+        or value.st_nlink != 1
+        or stat.S_IMODE(value.st_mode) != 0o600
+        or value.st_size != 0
+    ):
+        raise RuntimeError("docker ownership lock is invalid")
+
+
+def _acquire_ownership_lock(descriptor: int) -> None:
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as exc:
+        raise RuntimeError("docker ownership lock is held by another process") from exc
+
+
+def _require_container_id(container_id: str) -> None:
+    if not _CONTAINER_ID_PATTERN.fullmatch(container_id):
+        raise RuntimeError("docker ownership container ID is invalid")
+
+
+def _paths_overlap(left: Path, right: Path) -> bool:
+    try:
+        left.relative_to(right)
+        return True
+    except ValueError:
+        pass
+    try:
+        right.relative_to(left)
+        return True
+    except ValueError:
+        return False
+
+
 class DockerRuntime(BaseRuntime):
     """Long-lived Docker container used across init, run, and post-run."""
 
@@ -66,6 +154,7 @@ class DockerRuntime(BaseRuntime):
         session_dir: Path,
         *,
         credential_dir: Path | None = None,
+        ownership_root: Path | None = None,
     ) -> None:
         super().__init__(spec, session_id, session_dir)
         if credential_dir is not None:
@@ -86,10 +175,21 @@ class DockerRuntime(BaseRuntime):
         ownership_key = sha256(
             f"{session_id}\0{session_dir.absolute()}".encode("utf-8")
         ).hexdigest()
-        self._ownership_dir = session_dir.parent / _OWNERSHIP_DIRECTORY_NAME
-        self._cidfile = self._ownership_dir / f"{ownership_key}.cid"
-        self._ownership_lock = self._ownership_dir / f"{ownership_key}.lock"
+        if ownership_root is None:
+            ownership_root = _DEFAULT_OWNERSHIP_ROOT
+        if not ownership_root.is_absolute():
+            raise ValueError("ownership_root must be absolute")
+        absolute_session_dir = session_dir.absolute()
+        if _paths_overlap(ownership_root, absolute_session_dir):
+            raise ValueError("ownership_root must be outside the session tree")
+        if credential_dir is not None and _paths_overlap(ownership_root, credential_dir):
+            raise ValueError("ownership_root must be outside the credential tree")
+        self._ownership_dir = ownership_root
+        self._ownership_key = ownership_key
+        self._cidfile = self._ownership_dir / f"{self._ownership_key}.cid"
+        self._ownership_lock = self._ownership_dir / f"{self._ownership_key}.lock"
         self._ownership_lock_fd = -1
+        self._ownership_root_identity: tuple[int, int] | None = None
         self._cidfile_identity: tuple[int, int] | None = None
         self._ownership_state: _OwnershipState = "none"
         self._create_succeeded = False
@@ -161,36 +261,37 @@ class DockerRuntime(BaseRuntime):
         for vol in self.spec.kwargs.get("volumes", []):
             create_args.extend(["-v", vol])
         create_args.extend([self.spec.image, "sleep", "infinity"])
-        rc, stdout, stderr = await self._run_local_command(
-            *create_args,
-            capture=True,
-            timeout=self._START_TIMEOUT,
-        )
-        if rc != 0:
-            self._mark_no_ownership()
-            raise RuntimeError(f"docker create failed with exit code {rc}: {stderr}")
-        self._create_succeeded = True
         try:
-            container_id = self._read_created_container_id()
+            rc, _, stderr = await self._run_local_command(
+                *create_args,
+                capture=True,
+                timeout=self._START_TIMEOUT,
+            )
+        except asyncio.CancelledError:
+            await self._reconcile_create_after_interruption(explicit_failure=False)
+            raise
+        except Exception:
+            await self._reconcile_create_after_interruption(explicit_failure=False)
+            raise
+
+        self._create_succeeded = rc == 0
+        try:
+            await self._reconcile_create_ownership(explicit_failure=rc != 0)
+        except asyncio.CancelledError:
+            await self._reconcile_create_after_interruption(explicit_failure=rc != 0)
+            raise
         except Exception as exc:
             raise RuntimeError(
                 "docker create succeeded but container ownership could not be verified; "
                 "cleanup/recovery state was retained"
             ) from exc
-        self._container_id = container_id
-        self._ownership_state = "candidate"
-        if str(stdout or "").strip() != container_id:
+        if rc != 0:
+            raise RuntimeError(f"docker create failed with exit code {rc}: {stderr}")
+        if self._ownership_state != "verified":
             raise RuntimeError(
                 "docker create succeeded but container ownership could not be verified; "
                 "cleanup/recovery state was retained"
             )
-        verification = await self._verify_container_id()
-        if verification != "present":
-            raise RuntimeError(
-                "docker create succeeded but container ownership could not be verified; "
-                "cleanup/recovery state was retained"
-            )
-        self._ownership_state = "verified"
         rc, _, stderr = await self._run_local_command(
             "docker",
             "start",
@@ -223,12 +324,67 @@ class DockerRuntime(BaseRuntime):
 
     _START_TIMEOUT = 600.0  # seconds for docker create / start under high rollout load
     _STOP_TIMEOUT = 30.0  # seconds per cleanup command
+    _OWNERSHIP_RECONCILE_TIMEOUT = 35.0
+    _RECOVERY_TIMEOUT = 125.0
+
+    async def _reconcile_create_after_interruption(
+        self,
+        *,
+        explicit_failure: bool,
+    ) -> None:
+        if self._ownership_state == "create_pending":
+            self._ownership_state = "unresolved"
+        reconciliation = asyncio.create_task(
+            self._reconcile_create_ownership(explicit_failure=explicit_failure)
+        )
+        try:
+            await asyncio.wait_for(
+                reconciliation,
+                timeout=self._OWNERSHIP_RECONCILE_TIMEOUT,
+            )
+        except asyncio.CancelledError:
+            logger.warning(
+                "docker create ownership reconciliation was cancelled for %s; "
+                "private recovery state was retained",
+                self._container_name,
+            )
+        except Exception:
+            logger.warning(
+                "docker create ownership reconciliation failed for %s; "
+                "private recovery state was retained",
+                self._container_name,
+                exc_info=True,
+            )
+
+    async def _reconcile_create_ownership(self, *, explicit_failure: bool) -> None:
+        try:
+            container_id = self._read_created_container_id()
+        except FileNotFoundError:
+            if explicit_failure:
+                self._mark_no_ownership()
+            else:
+                self._ownership_state = "unresolved"
+            return
+        except Exception:
+            self._ownership_state = "unresolved"
+            raise
+
+        if self._container_id is not None and self._container_id != container_id:
+            self._ownership_state = "unresolved"
+            raise RuntimeError("docker ownership container ID changed")
+        self._container_id = container_id
+        self._ownership_state = "candidate"
+        verification = await self._verify_container_id()
+        if verification == "present":
+            self._ownership_state = "verified"
+        elif verification == "absent":
+            self._mark_owned_container_absent()
 
     async def stop(self) -> None:
         if self._destroyed:
             return
         if self._container_id is None:
-            if self._create_succeeded:
+            if self._create_succeeded or self._ownership_state != "none":
                 raise RuntimeError(
                     "docker create ownership is unresolved; cleanup/recovery state was retained"
                 )
@@ -296,18 +452,9 @@ class DockerRuntime(BaseRuntime):
         self._mark_owned_container_absent()
 
     def _prepare_create_ownership(self) -> None:
-        try:
-            self._ownership_dir.mkdir(mode=0o700)
-        except FileExistsError:
-            pass
-        directory_stat = self._ownership_dir.stat(follow_symlinks=False)
-        if (
-            not stat.S_ISDIR(directory_stat.st_mode)
-            or directory_stat.st_uid != os.geteuid()
-            or stat.S_IMODE(directory_stat.st_mode) != 0o700
-        ):
-            raise RuntimeError("docker ownership directory is not private")
-        directory_fd = os.open(self._ownership_dir, _DIRECTORY_FLAGS)
+        self._ownership_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        directory_fd = _open_private_ownership_directory(self._ownership_dir)
+        self._ownership_root_identity = _object_identity(os.fstat(directory_fd))
         try:
             self._ownership_lock_fd = os.open(
                 self._ownership_lock.name,
@@ -315,6 +462,10 @@ class DockerRuntime(BaseRuntime):
                 0o600,
                 dir_fd=directory_fd,
             )
+            os.fchmod(self._ownership_lock_fd, 0o600)
+            _require_private_lock(os.fstat(self._ownership_lock_fd))
+            _acquire_ownership_lock(self._ownership_lock_fd)
+            self._ownership_state = "create_pending"
             try:
                 os.stat(self._cidfile.name, dir_fd=directory_fd, follow_symlinks=False)
             except FileNotFoundError:
@@ -328,9 +479,15 @@ class DockerRuntime(BaseRuntime):
             os.close(directory_fd)
 
     def _read_created_container_id(self) -> str:
-        directory_fd = os.open(self._ownership_dir, _DIRECTORY_FLAGS)
+        directory_fd = _open_private_ownership_directory(self._ownership_dir)
         descriptor = -1
         try:
+            if (
+                self._ownership_root_identity is None
+                or _object_identity(os.fstat(directory_fd))
+                != self._ownership_root_identity
+            ):
+                raise RuntimeError("docker ownership directory identity changed")
             before = os.stat(
                 self._cidfile.name,
                 dir_fd=directory_fd,
@@ -338,7 +495,7 @@ class DockerRuntime(BaseRuntime):
             )
             descriptor = os.open(
                 self._cidfile.name,
-                os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
                 dir_fd=directory_fd,
             )
             opened = os.fstat(descriptor)
@@ -351,7 +508,15 @@ class DockerRuntime(BaseRuntime):
                 or _object_identity(before) != _object_identity(opened)
             ):
                 raise RuntimeError("docker ownership cidfile is invalid")
-            content = os.read(descriptor, opened.st_size + 1)
+            chunks: list[bytes] = []
+            remaining = opened.st_size
+            while remaining:
+                chunk = os.read(descriptor, remaining)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            content = b"".join(chunks)
             after = os.fstat(descriptor)
             named_after = os.stat(
                 self._cidfile.name,
@@ -359,28 +524,155 @@ class DockerRuntime(BaseRuntime):
                 follow_symlinks=False,
             )
             if (
-                len(content) > opened.st_size
+                remaining
+                or os.read(descriptor, 1)
                 or _full_file_identity(opened) != _full_file_identity(after)
                 or _full_file_identity(opened) != _full_file_identity(named_after)
             ):
                 raise RuntimeError("docker ownership cidfile changed during read")
             try:
-                container_id = content.decode("ascii").strip()
+                raw_container_id = content.decode("ascii")
             except UnicodeDecodeError as exc:
                 raise RuntimeError("docker ownership cidfile is not ASCII") from exc
-            if not container_id or any(character.isspace() for character in container_id):
-                raise RuntimeError("docker ownership cidfile has an invalid container ID")
+            container_id = (
+                raw_container_id[:-1] if raw_container_id.endswith("\n") else raw_container_id
+            )
+            _require_container_id(container_id)
             self._cidfile_identity = _object_identity(opened)
             return container_id
+        except FileNotFoundError:
+            raise
+        except OSError as exc:
+            raise RuntimeError("docker ownership cidfile is invalid") from exc
         finally:
             if descriptor >= 0:
                 os.close(descriptor)
             os.close(directory_fd)
 
+    @classmethod
+    async def recover_ownership_root(cls, ownership_root: Path) -> None:
+        """Remove containers authorized by complete private cidfile records."""
+
+        if not ownership_root.is_absolute():
+            raise ValueError("ownership_root must be absolute")
+        try:
+            os.stat(ownership_root, follow_symlinks=False)
+        except FileNotFoundError:
+            return
+
+        directory_fd = _open_private_ownership_directory(ownership_root)
+        try:
+            root_identity = _object_identity(os.fstat(directory_fd))
+            names = os.listdir(directory_fd)
+            if len(names) > _OWNERSHIP_RECORD_LIMIT * 2:
+                raise RuntimeError("docker ownership recovery exceeds the record limit")
+            records: dict[str, set[str]] = {}
+            for name in names:
+                key, separator, suffix = name.rpartition(".")
+                if (
+                    separator != "."
+                    or not _OWNERSHIP_KEY_PATTERN.fullmatch(key)
+                    or suffix not in {"cid", "lock"}
+                ):
+                    raise RuntimeError("docker ownership recovery found an invalid record")
+                records.setdefault(key, set()).add(suffix)
+            if len(records) > _OWNERSHIP_RECORD_LIMIT:
+                raise RuntimeError("docker ownership recovery exceeds the record limit")
+            incomplete = [key for key, suffixes in records.items() if suffixes != {"cid", "lock"}]
+            if incomplete:
+                raise RuntimeError("docker ownership recovery found an incomplete record")
+            named_after = os.stat(ownership_root, follow_symlinks=False)
+            if _object_identity(named_after) != root_identity:
+                raise RuntimeError("docker ownership directory changed during recovery")
+        finally:
+            os.close(directory_fd)
+
+        for ownership_key in sorted(records):
+            recovery_session_dir = (
+                ownership_root.parent / f".openevo-docker-recovery-{ownership_key}"
+            )
+            runtime = cls(
+                RuntimeSpec(
+                    image="openevo-ownership-recovery",
+                    container_user="host",
+                ),
+                f"recovered-{ownership_key[:24]}",
+                recovery_session_dir,
+                ownership_root=ownership_root,
+            )
+            runtime._set_ownership_key(ownership_key)
+            try:
+                runtime._claim_existing_ownership(expected_root_identity=root_identity)
+                await asyncio.wait_for(runtime.stop(), timeout=cls._RECOVERY_TIMEOUT)
+            finally:
+                runtime._close_ownership_lock()
+
+    def _set_ownership_key(self, ownership_key: str) -> None:
+        if not _OWNERSHIP_KEY_PATTERN.fullmatch(ownership_key):
+            raise RuntimeError("docker ownership key is invalid")
+        self._ownership_key = ownership_key
+        self._cidfile = self._ownership_dir / f"{ownership_key}.cid"
+        self._ownership_lock = self._ownership_dir / f"{ownership_key}.lock"
+
+    def _claim_existing_ownership(
+        self,
+        *,
+        expected_root_identity: tuple[int, int],
+    ) -> None:
+        directory_fd = _open_private_ownership_directory(self._ownership_dir)
+        try:
+            if _object_identity(os.fstat(directory_fd)) != expected_root_identity:
+                raise RuntimeError("docker ownership directory changed during recovery")
+            self._ownership_root_identity = expected_root_identity
+            before = os.stat(
+                self._ownership_lock.name,
+                dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
+            descriptor = os.open(
+                self._ownership_lock.name,
+                os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+                dir_fd=directory_fd,
+            )
+            try:
+                opened = os.fstat(descriptor)
+                named_after = os.stat(
+                    self._ownership_lock.name,
+                    dir_fd=directory_fd,
+                    follow_symlinks=False,
+                )
+                _require_private_lock(opened)
+                if _object_identity(before) != _object_identity(opened) or _object_identity(
+                    opened
+                ) != _object_identity(named_after):
+                    raise RuntimeError("docker ownership lock changed while it was opened")
+                _acquire_ownership_lock(descriptor)
+            except Exception:
+                os.close(descriptor)
+                raise
+            self._ownership_lock_fd = descriptor
+        finally:
+            os.close(directory_fd)
+
+        self._ownership_state = "create_pending"
+        try:
+            self._container_id = self._read_created_container_id()
+        except Exception:
+            self._ownership_state = "unresolved"
+            raise
+        self._create_succeeded = True
+        self._ownership_state = "candidate"
+
+    def _close_ownership_lock(self) -> None:
+        if self._ownership_lock_fd >= 0:
+            os.close(self._ownership_lock_fd)
+            self._ownership_lock_fd = -1
+
     async def _verify_container_id(self) -> Literal["present", "absent", "unknown"]:
         container_id = self._container_id
         if container_id is None:
             return "unknown"
+        _require_container_id(container_id)
         rc, stdout, stderr = await self._run_local_command(
             "docker",
             "container",
@@ -406,6 +698,7 @@ class DockerRuntime(BaseRuntime):
         self._release_ownership_files()
 
     def _mark_owned_container_absent(self) -> None:
+        self._ownership_state = "absent"
         self._absence_proven = True
         self._destroyed = True
         self._release_ownership_files()
@@ -414,8 +707,19 @@ class DockerRuntime(BaseRuntime):
         opened_directory_fd = directory_fd
         if opened_directory_fd is None:
             try:
-                opened_directory_fd = os.open(self._ownership_dir, _DIRECTORY_FLAGS)
+                opened_directory_fd = _open_private_ownership_directory(
+                    self._ownership_dir
+                )
+                if (
+                    self._ownership_root_identity is None
+                    or _object_identity(os.fstat(opened_directory_fd))
+                    != self._ownership_root_identity
+                ):
+                    os.close(opened_directory_fd)
+                    opened_directory_fd = -1
             except FileNotFoundError:
+                opened_directory_fd = -1
+            except RuntimeError:
                 opened_directory_fd = -1
         try:
             if opened_directory_fd >= 0:
@@ -439,10 +743,6 @@ class DockerRuntime(BaseRuntime):
                 os.close(self._ownership_lock_fd)
                 self._ownership_lock_fd = -1
             self._cidfile_identity = None
-        try:
-            self._ownership_dir.rmdir()
-        except OSError:
-            pass
 
     async def _detect_chmod_needed(self) -> bool:
         """True unless the container's effective UID matches the host's."""

@@ -14,8 +14,9 @@ from openevo.harness.models import AgentSpec
 from openevo.rollout.models import SessionDispatchRequest, SessionStatus
 from openevo.rollout.timer import StageTimer
 from openevo.runtime.base import BaseRuntime
+from openevo.runtime.docker import DockerRuntime
 from openevo.runtime.models import ExecInput, ExecResult, PrepareAction, RuntimeSpec
-from openevo.trajectory.models import StrategySpec
+from openevo.trajectory.models import EvaluatorSpec, StrategySpec
 from openevo.trajectory.registry import (
     default_builder_registry,
     default_evaluator_registry,
@@ -98,7 +99,11 @@ async def test_dispatch_runs_runtime_lifecycle_and_builds_stdout_trajectory(
         spec: RuntimeSpec,
         session_id: str,
         session_dir: Path,
+        *,
+        docker_ownership_root: Path | None = None,
     ) -> RecordingRuntime:
+        assert docker_ownership_root == manager._docker_ownership_root
+        assert not docker_ownership_root.is_relative_to(session_dir)
         events.append("factory")
         return RecordingRuntime(spec, session_id, session_dir, events)
 
@@ -178,6 +183,138 @@ async def test_dispatch_runs_runtime_lifecycle_and_builds_stdout_trajectory(
         "exec:run-agent",
         "stop",
     ]
+
+
+@pytest.mark.asyncio
+async def test_eval_runtime_uses_core_authority_outside_main_session_mount(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for name in (
+        "ALL_PROXY",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "all_proxy",
+        "http_proxy",
+        "https_proxy",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    events: list[str] = []
+    manager = GatewayNodeManager(
+        node_id="eval-authority-probe",
+        gateway_url="http://gateway.test",
+        max_init_workers=1,
+        max_run_workers=1,
+        max_postrun_workers=1,
+        storage=SessionStore(),
+        session_registry=SessionRegistry(),
+        builders=default_builder_registry(),
+        evaluators=default_evaluator_registry(),
+        session_base_dir=str(tmp_path),
+    )
+    session_dir = tmp_path / "session"
+    session_dir.mkdir()
+    runtime_spec = RuntimeSpec(image="runtime:latest")
+    request = SessionDispatchRequest(
+        session_id="eval-authority",
+        task_id="task",
+        instruction="work",
+        remaining_timeout_seconds=10,
+        runtime=runtime_spec,
+        agent=AgentSpec(harness="shell", custom_shell=ExecInput(command="true")),
+        evaluator=EvaluatorSpec(strategy="pass_at_k", refresh_runtime=True),
+    )
+    managed = ManagedSession(
+        request=request,
+        timer=StageTimer(),
+        session_dir=session_dir,
+        artifacts_dir=session_dir / "artifacts",
+    )
+    managed.execution_deadline = asyncio.get_running_loop().time() + 10
+
+    def recording_runtime_factory(
+        spec: RuntimeSpec,
+        session_id: str,
+        runtime_session_dir: Path,
+        *,
+        docker_ownership_root: Path | None = None,
+    ) -> RecordingRuntime:
+        assert docker_ownership_root == manager._docker_ownership_root
+        assert runtime_session_dir.is_relative_to(session_dir)
+        assert not docker_ownership_root.is_relative_to(session_dir)
+        return RecordingRuntime(spec, session_id, runtime_session_dir, events)
+
+    monkeypatch.setattr("openevo.gateway.node.create_runtime", recording_runtime_factory)
+    try:
+        runtime = await manager._prepare_eval_runtime(managed)
+    finally:
+        await manager._client.aclose()
+
+    assert runtime is managed.eval_runtime
+    assert events == ["start"]
+
+
+@pytest.mark.asyncio
+async def test_gateway_start_recovers_private_docker_authority_before_dispatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for name in (
+        "ALL_PROXY",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "all_proxy",
+        "http_proxy",
+        "https_proxy",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    manager = GatewayNodeManager(
+        node_id="docker-recovery-probe",
+        gateway_url="http://gateway.test",
+        max_init_workers=1,
+        max_run_workers=1,
+        max_postrun_workers=1,
+        storage=SessionStore(),
+        session_registry=SessionRegistry(),
+        builders=default_builder_registry(),
+        evaluators=default_evaluator_registry(),
+        session_base_dir=str(tmp_path),
+    )
+    crashed = DockerRuntime(
+        RuntimeSpec(image="runtime:latest", container_user="host"),
+        "crashed-gateway-runtime",
+        tmp_path / "old-session",
+        ownership_root=manager._docker_ownership_root,
+    )
+    container_id = "b" * 64
+    crashed._prepare_create_ownership()
+    crashed._cidfile.write_text(container_id + "\n", encoding="ascii")
+    crashed._close_ownership_lock()
+    container_present = True
+    commands: list[tuple[str, ...]] = []
+
+    async def run_command(self, *args, **kwargs):
+        nonlocal container_present
+        del self, kwargs
+        commands.append(args)
+        if args[1:3] == ("container", "inspect"):
+            if container_present:
+                return 0, container_id + "\n", None
+            return 1, None, f"Error: No such object: {container_id}"
+        if args[1] == "rm":
+            container_present = False
+        return 0, None, None
+
+    monkeypatch.setattr(DockerRuntime, "_run_local_command", run_command)
+    try:
+        await manager.start()
+    finally:
+        await manager.close()
+
+    assert container_present is False
+    assert commands
+    assert all(command[-1] == container_id for command in commands)
+    assert list(manager._docker_ownership_root.iterdir()) == []
 
 
 @pytest.mark.asyncio

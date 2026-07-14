@@ -71,11 +71,7 @@ class BaseRuntime(ABC):
         """Stop any in-flight command and tear the runtime down."""
         process = self._active_process
         if process is not None and process.returncode is None:
-            process.kill()
-            try:
-                await process.wait()
-            except ProcessLookupError:
-                pass
+            await self._kill_and_reap(process)
         await self.stop()
 
     @abstractmethod
@@ -168,20 +164,20 @@ class BaseRuntime(ABC):
         )
         self._active_process = process
         try:
-            if timeout is None:
-                stdout_bytes, stderr_bytes = await process.communicate()
-            else:
-                try:
+            try:
+                if timeout is None:
+                    stdout_bytes, stderr_bytes = await process.communicate()
+                else:
                     stdout_bytes, stderr_bytes = await asyncio.wait_for(
                         process.communicate(), timeout=timeout
                     )
-                except asyncio.TimeoutError:
-                    process.kill()
-                    try:
-                        await process.wait()
-                    except ProcessLookupError:
-                        pass
-                    return -1, None, None
+            except asyncio.TimeoutError:
+                await self._kill_and_reap(process)
+                return -1, None, None
+            except asyncio.CancelledError:
+                if process.returncode is None:
+                    await self._kill_and_reap(process)
+                raise
         finally:
             self._active_process = None
 
@@ -189,3 +185,14 @@ class BaseRuntime(ABC):
         stdout_str = stdout_bytes.decode(errors="replace") if stdout_bytes else None
         stderr_str = stderr_bytes.decode(errors="replace") if stderr_bytes else None
         return rc, stdout_str, stderr_str
+
+    @staticmethod
+    async def _kill_and_reap(process: asyncio.subprocess.Process) -> None:
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+        try:
+            await process.wait()
+        except ProcessLookupError:
+            pass
