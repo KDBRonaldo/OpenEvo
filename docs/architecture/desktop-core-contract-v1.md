@@ -93,36 +93,62 @@ Desktop session tokens and other credential-bearing headers are not accepted as
 principal or semantic idempotency data. Mutable resources use ETag and
 `If-Match`.
 
-The release sidecar stores Local API v1 profiles, project drafts, and bounded
-idempotency records in its versioned SQLite provider store. The private state
-root is a real owner-only `0700` directory. A non-blocking process-lifetime
-owner lock permits exactly one provider owner. The database, persistent rollback
-journal, lock, and cursor-signing key are regular owner-only `0600` files with
-pinned identities. SQLite opens the main database through `/dev/fd` (or the
-equivalent `/proc/self/fd`) for a database descriptor opened relative to the
-pinned root with no-follow semantics. Startup fails closed on platforms without
-that descriptor path. The provider uses one lifetime connection and a pinned
-`PERSIST` rollback journal; it does not enable WAL or permit unmanaged WAL/SHM
-side files.
+The release sidecar stores Local API v1 profiles, project drafts, local
+operations, bounded server-side pagination cursors, and idempotency records in
+its versioned SQLite provider store. The private state root is a real owner-only
+`0700` directory. A non-blocking process-lifetime owner lock prevents two
+cooperating sidecars from owning it concurrently. Before opening SQLite and
+before each write, the provider uses `lstat`/no-follow checks to require the main
+database and any rollback-journal side file to be owner-only, link-count-one
+regular files. WAL/SHM files are rejected. SQLite opens the canonical database
+path normally and uses the standard `DELETE` rollback-journal and `FULL`
+synchronous crash-recovery path; there is no custom VFS, `/dev/fd` database
+opening, journal inode pin, or claim that Python's `sqlite3` provides those
+properties.
 
-Schema v1 has an exact canonical `sqlite_schema` fingerprint. Startup performs
-a database-size-bounded `integrity_check(1)`, `foreign_key_check`, bounded row
-and byte accounting, and complete validation of migration, resource, canonical
+This filesystem boundary protects against accidental sharing, symlink or
+hard-link setup present at a validation point, and concurrent cooperating
+sidecars. It does not isolate the store from a malicious process running as the
+same OS user: such a process can race pathname checks or modify owner-readable
+state. Desktop relies on the macOS user-account boundary and the owner-only
+state directory for that threat boundary.
+
+Schema v2 has an exact canonical `sqlite_schema` fingerprint and migrates the
+canonical v1 layout transactionally. Startup performs a database-size-bounded
+`integrity_check(1)`, `foreign_key_check`, bounded row and byte accounting, and
+complete validation of migration, resource, operation, cursor, canonical
 JSON/blob, duplicated scalar, timestamp, version, and typed idempotency rows.
-Unknown views, triggers, indexes, or altered DDL are rejected. Startup also
-recovers process-owned transient state: remote profiles become disconnected and
-active project sessions return to draft with stale revision pins cleared.
-Resource and idempotency writes commit in one transaction. The store persists
-only closed Local API fields: it does not persist native credential references
-or secrets, host paths, commands, raw process output, Core URLs, or
-bearer/session tokens. Idempotency responses are retained for a bounded
-seven-day replay window and the live record count is bounded; exhaustion fails
-closed without evicting an unexpired replay.
+Unknown views, triggers, indexes, or altered DDL are rejected. Database and
+journal byte limits, SQLite `max_page_count`, and `journal_size_limit` are set
+before schema or resource writes and are checked again before commit, so a
+budget rejection rolls the transaction back rather than reporting failure after
+a successful commit.
+
+Startup atomically recovers process-owned transient state: remote profiles
+become disconnected, active project sessions return to draft with stale
+revision pins cleared, and interrupted or now-stale local operations are
+cancelled against that authoritative resource state. Action idempotency stores
+the exact `LocalOperationV1`; replay resolves its current authoritative
+operation row and cannot return an obsolete connected/active result. Resource,
+operation, and idempotency writes commit in one transaction.
+
+The store persists only closed Local API fields. Unknown evolution method
+config is recursively checked with case- and separator-normalized denylisted
+keys for credentials/secrets, host paths, and raw diagnostics. The only
+credential data persisted here is Keychain slot status; secret values, native
+credential references, commands, raw process output, Core URLs, and
+bearer/session tokens are not persisted in resource or idempotency data.
+Idempotency responses are retained for a bounded seven-day replay window and
+the live record count is bounded; exhaustion fails closed without evicting an
+unexpired replay. Pagination uses bounded, signed opaque tokens whose UTF-8 sort
+anchors are stored server-side, so all contract-valid names fit without
+expanding the public cursor limit.
 
 At most one project row may be active. Activation switches projects atomically.
 An active project cannot be patched in place, and a connected profile cannot
-change host, user, or authentication kind. This prevents persisted configuration
-from diverging from the process-owned session that was admitted from it.
+change host, port, user, authentication kind, or proxy settings. This prevents
+persisted configuration from diverging from the process-owned session that was
+admitted from it.
 
 Project evolution config is accepted exactly to the aggregate range currently
 accepted by `ProjectCreateV1`/`ProjectPatchV1`; the store adds no per-project
